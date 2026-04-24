@@ -325,8 +325,10 @@ class BartEncoder(nn.Module):
         config = model_config.pretrained_config
         num_layers = _bart_encoder_num_layers(config)
 
+        # HF BART uses offset=2 for the padding token, so the actual embedding
+        # table has max_position_embeddings + 2 entries.
         self.embed_positions = Embedding(
-            config.max_position_embeddings,
+            config.max_position_embeddings + 2,
             config.d_model,
             dtype=config.torch_dtype,
         )
@@ -368,7 +370,7 @@ class BartDecoder(nn.Module):
         num_layers = _bart_decoder_num_layers(config)
 
         self.embed_positions = Embedding(
-            config.max_position_embeddings,
+            config.max_position_embeddings + 2,
             config.d_model,
             dtype=config.torch_dtype,
         )
@@ -549,11 +551,21 @@ class BartForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
         return getattr(config, "max_position_embeddings", 1024)
 
     def load_weights(self, weights: Dict, **kwargs):
-        # TODO(Step 6): Implement full HF BART → TRT-LLM weight mapping.
-        raise NotImplementedError(
-            "BART weight loading is deferred to Step 6 of the porting plan "
-            "(weight-loading and architecture registration)."
-        )
+        config = self.model_config.pretrained_config
+        tllm_weights = _convert_hf_bart_weights(weights, config)
+
+        for name, module in self.named_modules():
+            if len(list(module.parameters(recurse=False))) == 0:
+                continue
+            if name not in tllm_weights:
+                continue
+            w = tllm_weights[name]
+            if hasattr(module, "load_weights"):
+                module.load_weights(weights=w)
+            else:
+                for n, p in module.named_parameters(recurse=False):
+                    if n in w[0]:
+                        p.data.copy_(w[0][n][:])
 
 
 @register_auto_model("MBartForConditionalGeneration")
@@ -561,3 +573,120 @@ class MBartForConditionalGeneration(BartForConditionalGeneration):
     """mBART reuses the BART architecture with the same weight schema."""
 
     pass
+
+
+def _convert_hf_bart_weights(
+    hf_weights: Dict[str, torch.Tensor],
+    config: BartConfig,
+) -> Dict:
+    """Map HuggingFace BART/mBART state_dict keys to TRT-LLM module-tree keys.
+
+    HF BART weight layout (prefix ``model.``):
+        model.shared.weight
+        model.encoder.embed_positions.weight
+        model.encoder.layernorm_embedding.{weight,bias}
+        model.encoder.layers.{i}.self_attn.{q_proj,k_proj,v_proj,out_proj}.{weight,bias}
+        model.encoder.layers.{i}.self_attn_layer_norm.{weight,bias}
+        model.encoder.layers.{i}.fc1.{weight,bias}
+        model.encoder.layers.{i}.fc2.{weight,bias}
+        model.encoder.layers.{i}.final_layer_norm.{weight,bias}
+        model.decoder.embed_positions.weight
+        model.decoder.layernorm_embedding.{weight,bias}
+        model.decoder.layers.{i}.self_attn.{q_proj,k_proj,v_proj,out_proj}.{weight,bias}
+        model.decoder.layers.{i}.self_attn_layer_norm.{weight,bias}
+        model.decoder.layers.{i}.encoder_attn.{q_proj,k_proj,v_proj,out_proj}.{weight,bias}
+        model.decoder.layers.{i}.encoder_attn_layer_norm.{weight,bias}
+        model.decoder.layers.{i}.fc1.{weight,bias}, fc2.{weight,bias}
+        model.decoder.layers.{i}.final_layer_norm.{weight,bias}
+        lm_head.weight
+    """
+    out: Dict[str, list] = {}
+    enc_layers = config.encoder_layers
+    dec_layers = config.decoder_layers
+
+    # HF BartForConditionalGeneration uses "model." prefix;
+    # HF BartModel does not.  Detect and normalise.
+    has_prefix = any(k.startswith("model.") for k in hf_weights)
+    p = "model." if has_prefix else ""
+
+    def _get(key: str) -> torch.Tensor:
+        if key in hf_weights:
+            return hf_weights[key]
+        raise KeyError(f"Missing expected HF weight: {key}")
+
+    def _maybe(key: str):
+        return hf_weights.get(key, None)
+
+    def _wb(prefix: str) -> dict:
+        d = {"weight": _get(f"{prefix}.weight")}
+        b = _maybe(f"{prefix}.bias")
+        if b is not None:
+            d["bias"] = b
+        return d
+
+    # Shared embedding
+    out["model.shared_embedding"] = [{"weight": _get(f"{p}shared.weight")}]
+
+    # LM head
+    if "lm_head.weight" in hf_weights:
+        out["lm_head"] = [{"weight": _get("lm_head.weight")}]
+
+    # Encoder positional embedding
+    out["model.encoder.embed_positions"] = [{"weight": _get(f"{p}encoder.embed_positions.weight")}]
+    out["model.encoder.layernorm_embedding"] = [_wb(f"{p}encoder.layernorm_embedding")]
+
+    # Encoder layers
+    for i in range(enc_layers):
+        hpfx = f"{p}encoder.layers.{i}"
+        tgt = f"model.encoder.layers.{i}"
+
+        # Self-attention (fused QKV)
+        out[f"{tgt}.self_attn.qkv_proj"] = [
+            _wb(f"{hpfx}.self_attn.q_proj"),
+            _wb(f"{hpfx}.self_attn.k_proj"),
+            _wb(f"{hpfx}.self_attn.v_proj"),
+        ]
+        out[f"{tgt}.self_attn.o_proj"] = [_wb(f"{hpfx}.self_attn.out_proj")]
+
+        out[f"{tgt}.self_attn_layer_norm"] = [_wb(f"{hpfx}.self_attn_layer_norm")]
+
+        # MLP: BART uses fc1 (up_proj) and fc2 (down_proj)
+        out[f"{tgt}.mlp.up_proj"] = [_wb(f"{hpfx}.fc1")]
+        out[f"{tgt}.mlp.down_proj"] = [_wb(f"{hpfx}.fc2")]
+
+        out[f"{tgt}.final_layer_norm"] = [_wb(f"{hpfx}.final_layer_norm")]
+
+    # Decoder positional embedding
+    out["model.decoder.embed_positions"] = [{"weight": _get(f"{p}decoder.embed_positions.weight")}]
+    out["model.decoder.layernorm_embedding"] = [_wb(f"{p}decoder.layernorm_embedding")]
+
+    # Decoder layers
+    for i in range(dec_layers):
+        hpfx = f"{p}decoder.layers.{i}"
+        tgt = f"model.decoder.layers.{i}"
+
+        # Self-attention (fused QKV)
+        out[f"{tgt}.self_attn.qkv_proj"] = [
+            _wb(f"{hpfx}.self_attn.q_proj"),
+            _wb(f"{hpfx}.self_attn.k_proj"),
+            _wb(f"{hpfx}.self_attn.v_proj"),
+        ]
+        out[f"{tgt}.self_attn.o_proj"] = [_wb(f"{hpfx}.self_attn.out_proj")]
+
+        out[f"{tgt}.self_attn_layer_norm"] = [_wb(f"{hpfx}.self_attn_layer_norm")]
+
+        # Cross-attention (separate projections)
+        out[f"{tgt}.cross_attn.q_proj"] = [_wb(f"{hpfx}.encoder_attn.q_proj")]
+        out[f"{tgt}.cross_attn.k_proj"] = [_wb(f"{hpfx}.encoder_attn.k_proj")]
+        out[f"{tgt}.cross_attn.v_proj"] = [_wb(f"{hpfx}.encoder_attn.v_proj")]
+        out[f"{tgt}.cross_attn.o_proj"] = [_wb(f"{hpfx}.encoder_attn.out_proj")]
+
+        out[f"{tgt}.cross_attn_layer_norm"] = [_wb(f"{hpfx}.encoder_attn_layer_norm")]
+
+        # MLP
+        out[f"{tgt}.mlp.up_proj"] = [_wb(f"{hpfx}.fc1")]
+        out[f"{tgt}.mlp.down_proj"] = [_wb(f"{hpfx}.fc2")]
+
+        out[f"{tgt}.final_layer_norm"] = [_wb(f"{hpfx}.final_layer_norm")]
+
+    return out

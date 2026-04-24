@@ -30,6 +30,7 @@ HF config normalization:
     ``intermediate_size`` are not — helper functions below extract them.
 """
 
+import math
 from typing import Dict, Optional
 
 import torch
@@ -102,16 +103,93 @@ def _t5_decoder_num_layers(config: T5Config) -> int:
 
 
 # ---------------------------------------------------------------------------
-# T5 Attention (self-attention, no RoPE, no positional encoding in attn)
+# T5 Relative Position Bias
+# ---------------------------------------------------------------------------
+
+
+class T5RelativePositionBias(nn.Module):
+    """Learned relative position bias for T5 attention.
+
+    Only instantiated on the first layer of each stack (encoder / decoder).
+    The computed bias is shared across all layers in the same stack.
+    """
+
+    def __init__(
+        self,
+        num_buckets: int,
+        num_heads: int,
+        max_distance: int,
+        is_decoder: bool,
+        dtype: Optional[torch.dtype] = None,
+    ):
+        super().__init__()
+        self.num_buckets = num_buckets
+        self.max_distance = max_distance
+        self.is_decoder = is_decoder
+        self.relative_attention_bias = nn.Embedding(num_buckets, num_heads, dtype=dtype)
+
+    @staticmethod
+    def _relative_position_bucket(
+        relative_position: torch.Tensor,
+        bidirectional: bool = True,
+        num_buckets: int = 32,
+        max_distance: int = 128,
+    ) -> torch.Tensor:
+        relative_buckets = 0
+        if bidirectional:
+            num_buckets //= 2
+            relative_buckets += (relative_position > 0).to(torch.long) * num_buckets
+            relative_position = torch.abs(relative_position)
+        else:
+            relative_position = -torch.min(relative_position, torch.zeros_like(relative_position))
+
+        max_exact = num_buckets // 2
+        is_small = relative_position < max_exact
+
+        relative_position_if_large = max_exact + (
+            torch.log(relative_position.float() / max_exact)
+            / math.log(max_distance / max_exact)
+            * (num_buckets - max_exact)
+        ).to(torch.long)
+        relative_position_if_large = torch.min(
+            relative_position_if_large,
+            torch.full_like(relative_position_if_large, num_buckets - 1),
+        )
+
+        relative_buckets += torch.where(is_small, relative_position, relative_position_if_large)
+        return relative_buckets
+
+    def forward(self, query_length: int, key_length: int, device: torch.device) -> torch.Tensor:
+        """Return position bias of shape ``(1, num_heads, query_length, key_length)``."""
+        context_position = torch.arange(query_length, dtype=torch.long, device=device)[:, None]
+        memory_position = torch.arange(key_length, dtype=torch.long, device=device)[None, :]
+        relative_position = memory_position - context_position
+
+        bucket_ids = self._relative_position_bucket(
+            relative_position,
+            bidirectional=not self.is_decoder,
+            num_buckets=self.num_buckets,
+            max_distance=self.max_distance,
+        )
+        values = self.relative_attention_bias(bucket_ids)
+        # (query_length, key_length, num_heads) → (1, num_heads, q, k)
+        return values.permute(2, 0, 1).unsqueeze(0)
+
+
+# ---------------------------------------------------------------------------
+# T5 Attention (self-attention with relative position bias support)
 # ---------------------------------------------------------------------------
 
 
 class T5Attention(Attention):
-    """T5-style multi-head self-attention without positional embeddings.
+    """T5-style multi-head self-attention.
 
-    T5 uses relative position bias instead of absolute position embeddings.
-    For stage-1, we omit the relative bias and rely on the base ``Attention``
-    class with ``pos_embd_params=None`` and ``q_scaling`` set per T5 convention.
+    When ``position_bias`` is provided (from a ``T5RelativePositionBias``
+    module living on layer 0), it is added to the QK^T scores before
+    softmax.  Without a KV cache the module computes SDPA directly
+    (bypassing the VANILLA backend's ``flash_attn_varlen_func`` which
+    cannot accept an additive bias).  With a KV cache (future runtime
+    steps) it falls back to the base ``Attention.forward``.
     """
 
     def __init__(
@@ -137,10 +215,73 @@ class T5Attention(Attention):
             config=model_config,
             q_scaling=1.0,
         )
+        self._is_decoder = is_decoder
+        self._head_dim = _t5_head_dim(config)
 
     def apply_rope(self, q, k, v, position_ids):
         """T5 has no RoPE — pass through unchanged."""
         return q, k, v
+
+    def forward(
+        self,
+        position_ids: Optional[torch.IntTensor] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+        attn_metadata: Optional[AttentionMetadata] = None,
+        attention_mask: Optional[PredefinedAttentionMask] = None,
+        position_bias: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        if position_bias is None or attn_metadata.kv_cache_manager is not None:
+            return super().forward(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+
+        # Manual SDPA with additive position bias (no-KV-cache path).
+        num_tokens = attn_metadata.num_tokens
+        qkv = self.qkv_proj(hidden_states)
+        q_size = self.num_heads * self._head_dim
+        kv_size = self.num_key_value_heads * self._head_dim
+        q, k, v = qkv[:num_tokens].split([q_size, kv_size, kv_size], dim=-1)
+
+        q = q.view(-1, self.num_heads, self._head_dim)
+        k = k.view(-1, self.num_key_value_heads, self._head_dim)
+        v = v.view(-1, self.num_key_value_heads, self._head_dim)
+
+        # Per-request SDPA with position bias applied to each request's scores.
+        seq_lens = attn_metadata.seq_lens
+        offset = 0
+        outputs = []
+        for seq_len in seq_lens:
+            sl = int(seq_len)
+            q_s = q[offset : offset + sl].transpose(0, 1)  # (H, S, D)
+            k_s = k[offset : offset + sl].transpose(0, 1)
+            v_s = v[offset : offset + sl].transpose(0, 1)
+
+            scores = torch.matmul(q_s, k_s.transpose(-2, -1))
+            # position_bias: (1, H, qlen, klen) — slice to this request's lengths
+            bias_slice = position_bias[:, :, :sl, :sl]
+            scores = scores + bias_slice.squeeze(0)
+
+            if self._is_decoder:
+                causal_mask = torch.triu(
+                    torch.full((sl, sl), float("-inf"), device=scores.device, dtype=scores.dtype),
+                    diagonal=1,
+                )
+                scores = scores + causal_mask
+
+            attn_weights = F.softmax(scores.float(), dim=-1).to(q.dtype)
+            out = torch.matmul(attn_weights, v_s)  # (H, S, D)
+            outputs.append(out.transpose(0, 1))  # (S, H, D)
+            offset += sl
+
+        attn_output = torch.cat(outputs, dim=0)  # (T, H, D)
+        attn_output = attn_output.reshape(num_tokens, -1)
+        attn_output = self.o_proj(attn_output)
+        return attn_output
 
 
 class T5CrossAttention(CrossAttention):
@@ -229,6 +370,7 @@ class T5EncoderLayer(EncoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         position_ids: Optional[torch.IntTensor] = None,
+        position_bias: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         residual = hidden_states
@@ -239,6 +381,7 @@ class T5EncoderLayer(EncoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             attention_mask=PredefinedAttentionMask.FULL,
+            position_bias=position_bias,
         )
         hidden_states = residual + hidden_states
 
@@ -321,6 +464,7 @@ class T5DecoderLayer(EncoderDecoderLayer):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         cross_attn_metadata: Optional[AttentionMetadata] = None,
         skip_cross_kv_projection: bool = False,
+        position_bias: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         # Self-attention (pre-norm)
@@ -331,6 +475,7 @@ class T5DecoderLayer(EncoderDecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             attention_mask=PredefinedAttentionMask.CAUSAL,
+            position_bias=position_bias,
         )
         hidden_states = residual + hidden_states
 
@@ -368,6 +513,14 @@ class T5Encoder(nn.Module):
         config = model_config.pretrained_config
         num_layers = _t5_encoder_num_layers(config)
 
+        self.relative_position_bias = T5RelativePositionBias(
+            num_buckets=config.relative_attention_num_buckets,
+            num_heads=config.num_heads,
+            max_distance=config.relative_attention_max_distance,
+            is_decoder=False,
+            dtype=config.torch_dtype,
+        )
+
         self.layers = nn.ModuleList(
             [T5EncoderLayer(model_config, layer_idx=i) for i in range(num_layers)]
         )
@@ -383,11 +536,15 @@ class T5Encoder(nn.Module):
         attn_metadata: AttentionMetadata,
         position_ids: Optional[torch.IntTensor] = None,
     ) -> torch.Tensor:
+        seq_len = hidden_states.shape[0]
+        position_bias = self.relative_position_bias(seq_len, seq_len, hidden_states.device)
+
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 position_ids=position_ids,
+                position_bias=position_bias,
             )
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states
@@ -405,6 +562,14 @@ class T5Decoder(nn.Module):
         super().__init__()
         config = model_config.pretrained_config
         num_layers = _t5_decoder_num_layers(config)
+
+        self.relative_position_bias = T5RelativePositionBias(
+            num_buckets=config.relative_attention_num_buckets,
+            num_heads=config.num_heads,
+            max_distance=config.relative_attention_max_distance,
+            is_decoder=True,
+            dtype=config.torch_dtype,
+        )
 
         self.layers = nn.ModuleList(
             [T5DecoderLayer(model_config, layer_idx=i) for i in range(num_layers)]
@@ -424,6 +589,9 @@ class T5Decoder(nn.Module):
         cross_attn_metadata: Optional[AttentionMetadata] = None,
         skip_cross_kv_projection: bool = False,
     ) -> torch.Tensor:
+        seq_len = hidden_states.shape[0]
+        position_bias = self.relative_position_bias(seq_len, seq_len, hidden_states.device)
+
         for layer in self.layers:
             hidden_states = layer(
                 position_ids=position_ids,
@@ -432,6 +600,7 @@ class T5Decoder(nn.Module):
                 encoder_hidden_states=encoder_hidden_states,
                 cross_attn_metadata=cross_attn_metadata,
                 skip_cross_kv_projection=skip_cross_kv_projection,
+                position_bias=position_bias,
             )
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states
@@ -610,10 +779,165 @@ class T5ForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
         return 512
 
     def load_weights(self, weights: Dict, **kwargs):
-        # TODO(Step 6): Implement full HF T5 → TRT-LLM weight mapping.
-        # HF T5 uses patterns like encoder.block.{i}.layer.0.SelfAttention.{q,k,v,o}.weight
-        # which need non-trivial renaming to model.encoder.layers.{i}.self_attn.qkv_proj etc.
-        raise NotImplementedError(
-            "T5 weight loading is deferred to Step 6 of the porting plan "
-            "(weight-loading and architecture registration)."
-        )
+        config = self.model_config.pretrained_config
+        tllm_weights = _convert_hf_t5_weights(weights, config)
+
+        for name, module in self.named_modules():
+            if len(list(module.parameters(recurse=False))) == 0:
+                continue
+            if name not in tllm_weights:
+                continue
+            w = tllm_weights[name]
+            if hasattr(module, "load_weights"):
+                module.load_weights(weights=w)
+            else:
+                for n, p in module.named_parameters(recurse=False):
+                    if n in w[0]:
+                        p.data.copy_(w[0][n][:])
+
+
+def _convert_hf_t5_weights(
+    hf_weights: Dict[str, torch.Tensor],
+    config: T5Config,
+) -> Dict:
+    """Map HuggingFace T5 state_dict keys to TRT-LLM module-tree keys.
+
+    Returns a dict keyed by TRT-LLM module path, where each value is a list of
+    weight dicts suitable for ``module.load_weights(weights=...)``.
+
+    HF T5 weight layout:
+        shared.weight
+        encoder.block.{i}.layer.0.SelfAttention.{q,k,v,o}.weight
+        encoder.block.{i}.layer.0.layer_norm.weight
+        encoder.block.{i}.layer.{1}.DenseReluDense.{wi,wo}.weight  (non-gated)
+        encoder.block.{i}.layer.{1}.DenseReluDense.{wi_0,wi_1,wo}.weight (gated)
+        encoder.block.{i}.layer.{1}.layer_norm.weight
+        encoder.final_layer_norm.weight
+        decoder.block.{i}.layer.0.SelfAttention.{q,k,v,o}.weight
+        decoder.block.{i}.layer.1.EncDecAttention.{q,k,v,o}.weight
+        decoder.block.{i}.layer.{0,1,2}.layer_norm.weight
+        decoder.block.{i}.layer.2.DenseReluDense.{wi,wo|wi_0,wi_1,wo}.weight
+        decoder.final_layer_norm.weight
+        lm_head.weight
+    """
+    out: Dict[str, list] = {}
+    is_gated = getattr(config, "is_gated_act", False)
+    enc_layers = config.num_layers
+    dec_layers = getattr(config, "num_decoder_layers", None) or config.num_layers
+
+    def _get(key: str) -> torch.Tensor:
+        if key in hf_weights:
+            return hf_weights[key]
+        raise KeyError(f"Missing expected HF weight: {key}")
+
+    # Shared embedding
+    out["model.shared_embedding"] = [{"weight": _get("shared.weight")}]
+
+    # LM head
+    if "lm_head.weight" in hf_weights:
+        out["lm_head"] = [{"weight": _get("lm_head.weight")}]
+
+    # Encoder
+    for i in range(enc_layers):
+        pfx = f"encoder.block.{i}"
+        tgt = f"model.encoder.layers.{i}"
+
+        # Self-attention (fused QKV in TRT-LLM)
+        out[f"{tgt}.self_attn.qkv_proj"] = [
+            {"weight": _get(f"{pfx}.layer.0.SelfAttention.q.weight")},
+            {"weight": _get(f"{pfx}.layer.0.SelfAttention.k.weight")},
+            {"weight": _get(f"{pfx}.layer.0.SelfAttention.v.weight")},
+        ]
+        out[f"{tgt}.self_attn.o_proj"] = [{"weight": _get(f"{pfx}.layer.0.SelfAttention.o.weight")}]
+
+        # Pre-attention layer norm
+        out[f"{tgt}.input_layernorm"] = [{"weight": _get(f"{pfx}.layer.0.layer_norm.weight")}]
+
+        # MLP (layer.1 for encoder)
+        if is_gated:
+            out[f"{tgt}.mlp.gate_up_proj"] = [
+                {"weight": _get(f"{pfx}.layer.1.DenseReluDense.wi_0.weight")},
+                {"weight": _get(f"{pfx}.layer.1.DenseReluDense.wi_1.weight")},
+            ]
+        else:
+            out[f"{tgt}.mlp.up_proj"] = [
+                {"weight": _get(f"{pfx}.layer.1.DenseReluDense.wi.weight")}
+            ]
+        out[f"{tgt}.mlp.down_proj"] = [{"weight": _get(f"{pfx}.layer.1.DenseReluDense.wo.weight")}]
+
+        # Post-attention (pre-MLP) layer norm
+        out[f"{tgt}.post_attention_layernorm"] = [
+            {"weight": _get(f"{pfx}.layer.1.layer_norm.weight")}
+        ]
+
+    # Encoder relative position bias (only layer 0 in HF)
+    rpb_key = "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight"
+    if rpb_key in hf_weights:
+        out["model.encoder.relative_position_bias.relative_attention_bias"] = [
+            {"weight": _get(rpb_key)}
+        ]
+
+    # Encoder final layer norm
+    out["model.encoder.final_layernorm"] = [{"weight": _get("encoder.final_layer_norm.weight")}]
+
+    # Decoder
+    for i in range(dec_layers):
+        pfx = f"decoder.block.{i}"
+        tgt = f"model.decoder.layers.{i}"
+
+        # Self-attention (fused QKV)
+        out[f"{tgt}.self_attn.qkv_proj"] = [
+            {"weight": _get(f"{pfx}.layer.0.SelfAttention.q.weight")},
+            {"weight": _get(f"{pfx}.layer.0.SelfAttention.k.weight")},
+            {"weight": _get(f"{pfx}.layer.0.SelfAttention.v.weight")},
+        ]
+        out[f"{tgt}.self_attn.o_proj"] = [{"weight": _get(f"{pfx}.layer.0.SelfAttention.o.weight")}]
+
+        # Self-attention layer norm
+        out[f"{tgt}.input_layernorm"] = [{"weight": _get(f"{pfx}.layer.0.layer_norm.weight")}]
+
+        # Cross-attention (separate projections in CrossAttention module)
+        out[f"{tgt}.cross_attn.q_proj"] = [
+            {"weight": _get(f"{pfx}.layer.1.EncDecAttention.q.weight")}
+        ]
+        out[f"{tgt}.cross_attn.k_proj"] = [
+            {"weight": _get(f"{pfx}.layer.1.EncDecAttention.k.weight")}
+        ]
+        out[f"{tgt}.cross_attn.v_proj"] = [
+            {"weight": _get(f"{pfx}.layer.1.EncDecAttention.v.weight")}
+        ]
+        out[f"{tgt}.cross_attn.o_proj"] = [
+            {"weight": _get(f"{pfx}.layer.1.EncDecAttention.o.weight")}
+        ]
+
+        # Cross-attention layer norm (post_attention_layernorm in T5DecoderLayer)
+        out[f"{tgt}.post_attention_layernorm"] = [
+            {"weight": _get(f"{pfx}.layer.1.layer_norm.weight")}
+        ]
+
+        # MLP (layer.2 for decoder)
+        if is_gated:
+            out[f"{tgt}.mlp.gate_up_proj"] = [
+                {"weight": _get(f"{pfx}.layer.2.DenseReluDense.wi_0.weight")},
+                {"weight": _get(f"{pfx}.layer.2.DenseReluDense.wi_1.weight")},
+            ]
+        else:
+            out[f"{tgt}.mlp.up_proj"] = [
+                {"weight": _get(f"{pfx}.layer.2.DenseReluDense.wi.weight")}
+            ]
+        out[f"{tgt}.mlp.down_proj"] = [{"weight": _get(f"{pfx}.layer.2.DenseReluDense.wo.weight")}]
+
+        # Pre-MLP layer norm
+        out[f"{tgt}.cross_attn_layernorm"] = [{"weight": _get(f"{pfx}.layer.2.layer_norm.weight")}]
+
+    # Decoder relative position bias (only layer 0 in HF)
+    rpb_key = "decoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight"
+    if rpb_key in hf_weights:
+        out["model.decoder.relative_position_bias.relative_attention_bias"] = [
+            {"weight": _get(rpb_key)}
+        ]
+
+    # Decoder final layer norm
+    out["model.decoder.final_layernorm"] = [{"weight": _get("decoder.final_layer_norm.weight")}]
+
+    return out
