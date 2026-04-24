@@ -1333,7 +1333,15 @@ def prefer_pinned() -> bool:
     Since input preparation relies heavily on these small H2D copies, usage of
     pageable (and not pinned) memory across the board is preferred in CC mode
     to maintain asynchronous execution.
+
+    On integrated GPU systems (e.g., DGX Spark), CPU and GPU share the same
+    physical memory pool. Pinning is counterproductive: cudaHostRegister locks
+    pages without any transfer speedup (there is no discrete device memory to
+    DMA into), and the locked pages reduce available bandwidth for the OS page
+    manager on already bandwidth-constrained unified memory (e.g., LPDDR5x).
     """
+    if is_device_integrated():
+        return False
     return not confidential_compute_enabled()
 
 
