@@ -1369,6 +1369,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype_vswa_without_reuse(self):
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
@@ -1398,6 +1399,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype_vswa_reuse(self):
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
@@ -1411,6 +1413,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype_vswa_without_reuse_disable_overlap_scheduler(self):
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
@@ -1427,6 +1430,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype_vswa_reuse_disable_overlap_scheduler(self):
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
@@ -1442,6 +1446,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype_vswa_reuse_partial_reuse(self):
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(

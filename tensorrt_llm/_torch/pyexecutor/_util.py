@@ -481,6 +481,24 @@ class KvCacheCreator:
                 f"Memory used outside torch (e.g., NCCL and CUDA graphs) in memory usage profiling: {extra_cost / (GB):.2f} GiB"
             )
 
+            # Account for worst-case logits allocation gap between warmup
+            # (context-only, few tokens) and actual inference (up to
+            # max_batch_size tokens).  Large vocabularies make this significant.
+            model_config = self._model_engine.model.model_config
+            vocab_size = model_config.pretrained_config.vocab_size
+            # .float() conversion creates a float32 copy; both tensors coexist
+            # briefly, so peak = num_tokens * vocab_size * (input_dtype + f32).
+            bytes_per_token = vocab_size * (model_config.torch_dtype.itemsize +
+                                            4)
+            extra_logits_tokens = self._max_batch_size - len(self._dummy_reqs)
+            if extra_logits_tokens > 0:
+                logits_gap = extra_logits_tokens * bytes_per_token
+                peak_memory += logits_gap
+                logger.info(
+                    f"Added logits memory correction: {logits_gap / (GB):.2f} GiB "
+                    f"(vocab_size={vocab_size}, max_batch_size={self._max_batch_size}, "
+                    f"warmup_tokens={len(self._dummy_reqs)})")
+
         else:
             peak_memory = total_used_bytes
             allocated_bytes = 0
