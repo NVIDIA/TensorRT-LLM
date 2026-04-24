@@ -324,8 +324,13 @@ def generate_srun_args(args, runtime_mode, timestamp):
 
 
 def generate_pytest_command(
-    test_prefix, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode,
-    waives_file=""
+    test_prefix,
+    work_dir,
+    config_file_base_name,
+    select_pattern,
+    runtime_mode,
+    benchmark_mode,
+    waives_file="",
 ):
     """Generate pytest command and test list."""
     # Generate test list content based on runtime_mode and benchmark_mode
@@ -567,8 +572,13 @@ def main():
 
     # Generate pytest command
     pytest_command, test_list_content, test_list_path = generate_pytest_command(
-        test_prefix, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode,
-        waives_file=args.waives_file
+        test_prefix,
+        work_dir,
+        config_file_base_name,
+        select_pattern,
+        runtime_mode,
+        benchmark_mode,
+        waives_file=args.waives_file,
     )
 
     # Write test list file
