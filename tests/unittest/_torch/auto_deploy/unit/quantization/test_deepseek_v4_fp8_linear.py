@@ -25,6 +25,7 @@ from tensorrt_llm._torch.auto_deploy.transform.library.quantization import (
     FP8LinearQuantizationFromConfig,
 )
 from tensorrt_llm._torch.auto_deploy.utils.e8m0 import e8m0_to_fp32
+from tensorrt_llm._torch.auto_deploy.utils.fp8_dequant import dequant_fp8_weight_two_dim_block_grid
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 _HAS_E8M0 = hasattr(torch, "float8_e8m0fnu")
@@ -74,6 +75,35 @@ class _GenericLinearFixture(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.ops.auto_deploy.torch_linear_simple.default(x, self.proj.weight, None)
+
+
+class _DeepSeekV4WoAFixture(nn.Module):
+    def __init__(
+        self,
+        num_groups: int = 2,
+        o_lora_rank: int = 3,
+        group_dim: int = 5,
+        include_unrelated_einsum: bool = False,
+    ) -> None:
+        super().__init__()
+        self.num_groups = num_groups
+        self.o_lora_rank = o_lora_rank
+        self.include_unrelated_einsum = include_unrelated_einsum
+        self.layers = nn.ModuleList([nn.Module()])
+        self.layers[0].attn = nn.Module()
+        self.layers[0].attn.wo_a = nn.Linear(group_dim, num_groups * o_lora_rank, bias=False)
+        if include_unrelated_einsum:
+            self.layers[0].attn.other = nn.Linear(group_dim, num_groups * o_lora_rank, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        o = x.view(x.shape[0], x.shape[1], self.num_groups, -1)
+        wo_a = self.layers[0].attn.wo_a.weight.view(self.num_groups, self.o_lora_rank, -1)
+        output = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        if not self.include_unrelated_einsum:
+            return output
+
+        other = self.layers[0].attn.other.weight.view(self.num_groups, self.o_lora_rank, -1)
+        return output, torch.einsum("bsgd,grd->bsgr", o, other)
 
 
 def _trace_with_weight_meta(module: nn.Module) -> torch.fx.GraphModule:
@@ -223,6 +253,117 @@ def test_deepseek_v4_transform_quantizes_only_dense_fp8_linear_paths() -> None:
     ]
     assert len(quantized_nodes) == 1
     assert len(plain_nodes) == 2
+
+
+def test_deepseek_v4_wo_a_grouped_transform_registers_buffer_and_loads_scale_alias() -> None:
+    model = _DeepSeekV4WoAFixture().to(torch.bfloat16)
+    gm = _trace_with_weight_meta(model)
+
+    transformed, info = _run_finegrained_transform(gm, _deepseek_v4_quant_config())
+
+    assert info.num_matches == 1
+    wo_a = transformed.get_submodule("layers.0.attn.wo_a")
+    assert wo_a.weight.dtype == torch.float8_e4m3fn
+    assert wo_a.weight_scale_inv.shape == (1, 1)
+
+    scale = torch.full((1, 1), 3.0, dtype=torch.bfloat16)
+    state_dict = {
+        "layers.0.attn.wo_a.weight": _fp8_weight((6, 5)),
+        "layers.0.attn.wo_a.scale": scale,
+    }
+
+    missing, unexpected = transformed.load_state_dict(state_dict, strict=False)
+
+    assert not missing
+    assert not unexpected
+    torch.testing.assert_close(wo_a.weight_scale_inv, scale, rtol=0, atol=0)
+
+
+def test_deepseek_v4_wo_a_grouped_transform_rewrites_only_scoped_einsum() -> None:
+    model = _DeepSeekV4WoAFixture(include_unrelated_einsum=True).to(torch.bfloat16)
+    gm = _trace_with_weight_meta(model)
+
+    transformed, info = _run_finegrained_transform(gm, _deepseek_v4_quant_config())
+
+    assert info.num_matches == 1
+    assert transformed.get_submodule("layers.0.attn.wo_a").weight.dtype == torch.float8_e4m3fn
+    assert transformed.get_submodule("layers.0.attn.other").weight.dtype == torch.bfloat16
+
+    grouped_nodes = [
+        node
+        for node in transformed.graph.nodes
+        if is_op(
+            node,
+            torch.ops.auto_deploy.torch_fake_quant_deepseek_v4_wo_a_grouped_finegrained_fp8_linear,
+        )
+    ]
+    remaining_einsum_nodes = [
+        node
+        for node in transformed.graph.nodes
+        if node.op == "call_function" and node.target in {torch.einsum, torch.functional.einsum}
+    ]
+    assert len(grouped_nodes) == 1
+    assert len(remaining_einsum_nodes) == 1
+
+
+def test_deepseek_v4_wo_a_grouped_op_matches_reference_on_ragged_blocks() -> None:
+    batch_size, seq_len, num_groups, o_lora_rank, group_dim = 1, 2, 3, 43, 130
+    weight_rows = num_groups * o_lora_rank
+    input_tensor = (
+        torch.arange(batch_size * seq_len * num_groups * group_dim, dtype=torch.float32)
+        .reshape(batch_size, seq_len, num_groups, group_dim)
+        .remainder(7)
+        .sub(3)
+        .div(8)
+    )
+    weight = (
+        torch.arange(weight_rows * group_dim, dtype=torch.float32)
+        .reshape(weight_rows, group_dim)
+        .remainder(17)
+        .sub(8)
+        .to(torch.float8_e4m3fn)
+    )
+    weight_scale = torch.tensor(
+        [[0.25, 0.5], [1.5, 2.0]],
+        dtype=torch.float32,
+    )
+
+    grouped_op = (
+        torch.ops.auto_deploy.torch_fake_quant_deepseek_v4_wo_a_grouped_finegrained_fp8_linear
+    )
+    actual = grouped_op.default(input_tensor, weight, None, [weight_scale])
+
+    scale_expanded = weight_scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    scale_expanded = scale_expanded[:weight_rows, :group_dim]
+    expected_weight = weight.to(torch.float32) * scale_expanded
+    expected = torch.einsum(
+        "bsgd,grd->bsgr",
+        input_tensor,
+        expected_weight.view(num_groups, o_lora_rank, group_dim),
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_fp8_weight_dequant_preserves_fixed_block_scale_for_ragged_shapes() -> None:
+    weight = torch.ones((129, 130), dtype=torch.float32).to(torch.float8_e4m3fn)
+    weight_scale = torch.tensor(
+        [[1.0, 2.0], [4.0, 8.0]],
+        dtype=torch.float32,
+    )
+
+    actual = dequant_fp8_weight_two_dim_block_grid(
+        weight,
+        weight_scale,
+        block_n=128,
+        block_k=128,
+        dtype=torch.float32,
+    )
+
+    assert actual[65, 0].item() == 1.0
+    assert actual[0, 128].item() == 2.0
+    assert actual[128, 0].item() == 4.0
+    assert actual[128, 128].item() == 8.0
 
 
 def test_non_deepseek_finegrained_fp8_still_uses_weight_scale_inv() -> None:

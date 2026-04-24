@@ -39,11 +39,16 @@ def dequant_fp8_weight_two_dim_block_grid(
     """
     N, K = weight_fp8.shape
     scale_n, scale_k = weight_scale.shape
-    # Ceil division so the expanded scale covers non-divisible dims (see torch_quant).
-    actual_block_n = math.ceil(N / scale_n) if scale_n > 0 else block_n
-    actual_block_k = math.ceil(K / scale_k) if scale_k > 0 else block_k
-    scale_expanded = weight_scale.repeat_interleave(actual_block_n, dim=0).repeat_interleave(
-        actual_block_k, dim=1
+    if block_n <= 0 or block_k <= 0:
+        raise ValueError(f"block sizes must be positive, got block_n={block_n}, block_k={block_k}")
+    if scale_n == 0 or scale_k == 0 or scale_n * block_n < N or scale_k * block_k < K:
+        raise ValueError(
+            f"weight_scale shape {tuple(weight_scale.shape)} with block size "
+            f"({block_n}, {block_k}) does not cover weight shape {tuple(weight_fp8.shape)}."
+        )
+
+    scale_expanded = weight_scale.repeat_interleave(block_n, dim=0).repeat_interleave(
+        block_k, dim=1
     )
     scale_expanded = scale_expanded[:N, :K]
     return weight_fp8.to(dtype) * scale_expanded.to(dtype)

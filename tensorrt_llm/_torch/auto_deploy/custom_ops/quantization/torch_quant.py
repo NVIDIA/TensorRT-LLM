@@ -30,6 +30,9 @@ from ...utils.quantization_utils import (
 e2m1_bounds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5])
 e2m1_values = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6])
 
+_FINEGRAINED_FP8_BLOCK_N = 128
+_FINEGRAINED_FP8_BLOCK_K = 128
+
 
 # ===== Helpers =====
 def _expect_single_scale(scales: List[Optional[torch.Tensor]], name: str) -> torch.Tensor:
@@ -586,6 +589,68 @@ def _torch_fake_quant_finegrained_fp8_linear_fake(
     """Fake implementation for torch.export tracing."""
     out_features = weight_quantized.shape[0]
     return torch.empty((*input.shape[:-1], out_features), dtype=input.dtype, device=input.device)
+
+
+@torch.library.custom_op(
+    "auto_deploy::torch_fake_quant_deepseek_v4_wo_a_grouped_finegrained_fp8_linear",
+    mutates_args=(),
+)
+def torch_fake_quant_deepseek_v4_wo_a_grouped_finegrained_fp8_linear(
+    input: torch.Tensor,  # [B, S, G, Dg]
+    weight_quantized: torch.Tensor,  # [G * R, Dg] float8_e4m3fn
+    bias: Optional[torch.Tensor],  # [G * R], [G, R], or None
+    weight_scale: List[torch.Tensor],  # [weight_scale_inv], shape [ceil(G*R/128), ceil(Dg/128)]
+) -> torch.Tensor:
+    """Reference DeepSeek V4 ``wo_a`` grouped FineGrainedFP8 projection.
+
+    ``wo_a`` is stored compactly as ``[G * R, Dg]`` but executed as ``G`` independent
+    ``[R, Dg]`` projections.  The fallback keeps that compact layout, dequantizes
+    with fixed 128x128 weight blocks, and contracts each group with its own block.
+    """
+    if input.dim() != 4:
+        raise ValueError(f"input must have shape [B, S, G, Dg], got {tuple(input.shape)}")
+    if weight_quantized.dtype != torch.float8_e4m3fn:
+        raise TypeError("DeepSeek V4 wo_a FineGrained FP8 path requires float8_e4m3fn weight")
+
+    weight_scale_inv = maybe_e8m0_to_fp32(_expect_single_scale(weight_scale, "weight_scale"))
+    num_groups = input.shape[-2]
+    group_dim = input.shape[-1]
+    out_rows, weight_group_dim = weight_quantized.shape
+    if weight_group_dim != group_dim:
+        raise ValueError(
+            f"weight Dg ({weight_group_dim}) must match input Dg ({group_dim}) for grouped wo_a"
+        )
+    if out_rows % num_groups != 0:
+        raise ValueError(
+            f"weight rows ({out_rows}) must be divisible by input groups ({num_groups})"
+        )
+
+    o_lora_rank = out_rows // num_groups
+    weight_dequant = _dequant_block_fp8_weight(
+        weight_quantized,
+        weight_scale_inv,
+        _FINEGRAINED_FP8_BLOCK_N,
+        _FINEGRAINED_FP8_BLOCK_K,
+        dtype=input.dtype,
+    )
+    weight_grouped = weight_dequant.view(num_groups, o_lora_rank, group_dim)
+    output = torch.einsum("bsgd,grd->bsgr", input, weight_grouped)
+    if bias is not None:
+        output = output + bias.to(output.dtype).view(num_groups, o_lora_rank)
+    return output.to(dtype=input.dtype)
+
+
+@torch_fake_quant_deepseek_v4_wo_a_grouped_finegrained_fp8_linear.register_fake
+def _torch_fake_quant_deepseek_v4_wo_a_grouped_finegrained_fp8_linear_fake(
+    input: torch.Tensor,
+    weight_quantized: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    weight_scale: List[torch.Tensor],
+) -> torch.Tensor:
+    """Fake implementation for torch.export tracing."""
+    num_groups = input.shape[-2]
+    o_lora_rank = weight_quantized.shape[0] // num_groups
+    return torch.empty((*input.shape[:-1], o_lora_rank), dtype=input.dtype, device=input.device)
 
 
 @torch.library.custom_op("auto_deploy::trtllm_finegrained_fp8_linear", mutates_args=())

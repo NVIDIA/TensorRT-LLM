@@ -27,6 +27,7 @@ from ...utils.node_utils import (
     get_quantization_params_from_linear_node,
     is_bmm_op,
     is_linear_op,
+    is_op,
 )
 from ...utils.quantization_utils import (
     fp4_global_scale,
@@ -59,6 +60,7 @@ _DEEPSEEK_V4_FINEGRAINED_FP8_LINEAR_RE = re.compile(
     r"ffn\.shared_experts\.w[123]"
     r")$"
 )
+_DEEPSEEK_V4_WO_A_WEIGHT_RE = re.compile(r"(?:^|.*\.)layers\.\d+\.attn\.wo_a\.weight$")
 
 
 def _is_deepseek_v4_finegrained_fp8_config(qcfg: Dict) -> bool:
@@ -71,6 +73,99 @@ def _is_deepseek_v4_finegrained_fp8_config(qcfg: Dict) -> bool:
 def _is_deepseek_v4_finegrained_fp8_linear_path(weight_or_module_name: str) -> bool:
     module_name = weight_or_module_name.removesuffix(".weight")
     return _DEEPSEEK_V4_FINEGRAINED_FP8_LINEAR_RE.match(module_name) is not None
+
+
+def _is_deepseek_v4_wo_a_weight_path(weight_name: str) -> bool:
+    return _DEEPSEEK_V4_WO_A_WEIGHT_RE.match(weight_name) is not None
+
+
+def _is_view_or_reshape_node(node: Node) -> bool:
+    if not isinstance(node, Node):
+        return False
+    if node.op == "call_method":
+        return node.target in {"view", "reshape"}
+    return is_op(
+        node,
+        [
+            torch.ops.aten.view,
+            torch.ops.aten.reshape,
+            torch.ops.auto_deploy.view,
+        ],
+    )
+
+
+def _view_base_and_shape(node: Node) -> Tuple[Node, Tuple[object, ...]]:
+    if node.op == "call_method":
+        base = node.args[0]
+        shape_args = node.args[1:]
+    else:
+        base = node.args[0]
+        shape_args = node.args[1:]
+    if len(shape_args) == 1 and isinstance(shape_args[0], (list, tuple)):
+        shape_args = tuple(shape_args[0])
+    return base, tuple(shape_args)
+
+
+def _is_static_dim_value(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_einsum_node(node: Node) -> bool:
+    if not isinstance(node, Node) or node.op != "call_function":
+        return False
+    return node.target in {
+        torch.einsum,
+        torch.functional.einsum,
+        torch.ops.aten.einsum.default,
+    }
+
+
+def _extract_deepseek_v4_wo_a_einsum_args(node: Node) -> Tuple[Node, Node, str] | None:
+    if not _is_einsum_node(node) or not node.args:
+        return None
+    if node.args[0] != "bsgd,grd->bsgr":
+        return None
+
+    if len(node.args) >= 3:
+        input_view = node.args[1]
+        weight_view = node.args[2]
+    elif len(node.args) >= 2 and isinstance(node.args[1], (list, tuple)):
+        operands = node.args[1]
+        if len(operands) != 2:
+            return None
+        input_view, weight_view = operands
+    else:
+        return None
+
+    if not isinstance(input_view, Node) or not isinstance(weight_view, Node):
+        return None
+    if not _is_view_or_reshape_node(input_view) or not _is_view_or_reshape_node(weight_view):
+        return None
+
+    input_base, input_shape = _view_base_and_shape(input_view)
+    weight_base, weight_shape = _view_base_and_shape(weight_view)
+    if not isinstance(input_base, Node) or not isinstance(weight_base, Node):
+        return None
+    if weight_base.op != "get_attr" or not isinstance(weight_base.target, str):
+        return None
+    weight_name = weight_base.target
+    if not _is_deepseek_v4_wo_a_weight_path(weight_name):
+        return None
+    if len(input_shape) != 4 or len(weight_shape) != 3:
+        return None
+
+    num_groups = weight_shape[0]
+    o_lora_rank = weight_shape[1]
+    if (
+        not _is_static_dim_value(num_groups)
+        or not _is_static_dim_value(o_lora_rank)
+        or input_shape[2] != num_groups
+        or input_shape[3] != -1
+        or weight_shape[2] != -1
+    ):
+        return None
+
+    return input_view, weight_base, weight_name
 
 
 def _dedupe_patterns(patterns: List[str]) -> List[str]:
@@ -915,6 +1010,12 @@ class FineGrainedFP8LinearQuantization(Quantization):
     def target_op(self):
         return torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear.default
 
+    def deepseek_v4_wo_a_grouped_target_op(self):
+        grouped_op = (
+            torch.ops.auto_deploy.torch_fake_quant_deepseek_v4_wo_a_grouped_finegrained_fp8_linear
+        )
+        return grouped_op.default
+
     def quantize_weight(self, w: torch.Tensor) -> torch.Tensor:
         return torch.empty_like(w, dtype=torch.float8_e4m3fn, device=w.device)
 
@@ -968,6 +1069,39 @@ class FineGrainedFP8LinearQuantization(Quantization):
             scale = state_dict.pop(scale_name)
         state_dict[scale_buffer_name] = _maybe_decode_e8m0_scale(scale)
 
+    def _insert_deepseek_v4_wo_a_grouped_quantized_linear(
+        self,
+        gm: GraphModule,
+        einsum_node: Node,
+        input_view: Node,
+        weight_node: Node,
+        weight_name: str,
+    ) -> None:
+        original_weight = gm.get_parameter(weight_name)
+        new_param = nn.Parameter(self.quantize_weight(original_weight), requires_grad=False)
+        modname, _, attrname = weight_name.rpartition(".")
+        submod = gm.get_submodule(modname)
+        setattr(submod, attrname, new_param)
+        weight_node.meta["val"] = new_param.detach()
+
+        for scale_name, scale in self.default_scales(original_weight.shape).items():
+            if scale_name in submod._buffers:
+                submod._buffers[scale_name] = scale
+            else:
+                submod.register_buffer(scale_name, scale)
+
+        gm._register_load_state_dict_pre_hook(partial(self.load_hook, weight_name=weight_name))
+
+        with gm.graph.inserting_before(einsum_node):
+            scale_node = gm.graph.create_node("get_attr", f"{modname}.weight_scale_inv")
+            grouped_node = gm.graph.call_function(
+                self.deepseek_v4_wo_a_grouped_target_op(),
+                args=(input_view, weight_node, None, [scale_node]),
+            )
+
+        einsum_node.replace_all_uses_with(grouped_node)
+        gm.graph.erase_node(einsum_node)
+
     def _apply(
         self,
         gm: GraphModule,
@@ -1017,6 +1151,23 @@ class FineGrainedFP8LinearQuantization(Quantization):
                     continue
                 self._insert_quantized_linear(gm, n, is_quantized_graph=False)
                 cnt += 1
+            if is_deepseek_v4:
+                for n in list(gm.graph.nodes):
+                    wo_a_match = _extract_deepseek_v4_wo_a_einsum_args(n)
+                    if wo_a_match is None:
+                        continue
+                    input_view, weight_node, weight_name = wo_a_match
+                    if should_skip_quantization(weight_name, excluded):
+                        continue
+                    self._insert_deepseek_v4_wo_a_grouped_quantized_linear(
+                        gm, n, input_view, weight_node, weight_name
+                    )
+                    cnt += 1
+
+        if cnt:
+            gm.graph.eliminate_dead_code()
+            gm.graph.lint()
+            gm.recompile()
 
         return gm, TransformInfo(
             skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=(cnt == 0)
