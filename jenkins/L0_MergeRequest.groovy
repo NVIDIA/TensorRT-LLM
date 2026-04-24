@@ -736,8 +736,9 @@ def getCbtsResult(pipeline, testFilter, globalVars)
 
     try {
         // 0. Ensure pyyaml is available on the Jenkins agent (blocks.py needs it
-        //    to parse test-db YAMLs).
-        sh "pip3 install --quiet pyyaml"
+        //    to parse test-db YAMLs). buildpack-deps has no pip3 by default,
+        //    so install the Debian python3-yaml package directly.
+        sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
 
         // 1. Ask Python for the union of needs_diff_for patterns across all rules.
         def patternsOut = sh(
