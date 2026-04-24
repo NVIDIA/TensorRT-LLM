@@ -210,18 +210,18 @@ def get_model_yaml_config(model_label: str,
                 'deepseek_r1_distill_llama_70b',
                 'llama_v3.1_nemotron_ultra_253b_fp8-bench-pytorch-float8',
                 'llama_v3.3_nemotron_super_49b_fp8-bench-pytorch-float8',
-                'llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16'
+                'llama_v3.3_nemotron_super_49b-bench-pytorch-bfloat16',
+                'qwen3_235b_a22b_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:1000,2000-con:256-ep:8-gpus:8'
             ],
             'config': {
                 # True causes hang, needs model-specific fix.
                 'enable_attention_dp': False,
             }
         },
-        # Qwen3 models with fp4 quantization on B200 and fp8 quantization on H200/H20
+        # Qwen3 models with fp4 quantization on B200
         {
             'patterns': [
                 'qwen3_235b_a22b_fp4-bench-pytorch-float4-maxbs:512-maxnt:2048-input_output_len:1000,2000-con:512-ep:4-gpus:4',
-                'qwen3_235b_a22b_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:1000,2000-con:256-ep:8-gpus:8'
             ],
             'config': {
                 'enable_attention_dp': True,

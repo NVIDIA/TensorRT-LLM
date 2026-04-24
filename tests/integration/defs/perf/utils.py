@@ -801,50 +801,50 @@ def generate_one_test_node(session, config, domain_name, test_name, test_func):
     A helper function to create a PyTest item with the specific name and specific test function.
     """
 
-    # Create the parent Item node.
-    # Pytest 8.x upgrade compatibility.
-    # We should never import Pytest internals within test-definitions.
-    # TODO: TRT-23565
-    parent = None
-    if hasattr(Item, "from_parent"):
-
-        class TrtexecItem(Item):
-
-            def __init__(self, **kwargs):
-                super().__init__(**kwargs)
-
-            def runtest(self):
-                return test_func()
-
-        parent = TrtexecItem.from_parent(session,
-                                         name=domain_name,
-                                         nodeid=domain_name)
+    # Resolve the full path relative to rootdir so conftest fixtures can be
+    # found during fixture resolution.  In pytest 9.x, _matchfactories checks
+    # ``baseid in {n.nodeid for n in node.iter_parents()}``, so we must create
+    # intermediate parent nodes whose nodeids match conftest directory baseids
+    # (e.g. "tests/integration/defs").
+    test_file = config.rootpath / "tests" / "integration" / "defs" / domain_name
+    file_exists = test_file.exists()
+    if file_exists:
+        full_domain = str(Path("tests") / "integration" / "defs" / domain_name)
     else:
-        parent = Item(name=domain_name,
-                      parent=session,
-                      config=config,
-                      session=session,
-                      nodeid=domain_name)
+        full_domain = domain_name
 
-    parent.obj = None
+    class TrtexecItem(Item):
+        obj = None
 
-    # Create the Function node for the test.
-    # For pytest 8.x compatibility
-    # TODO: TRT-23565
-    item = None
-    if hasattr(Function, "from_parent"):
-        item = Function.from_parent(parent, name=test_name, callobj=test_func)
-    else:
-        item = Function(name=test_name,
-                        parent=parent,
-                        config=config,
-                        session=session,
-                        callobj=test_func)
+        def runtest(self):
+            return test_func()
 
-    item.obj = test_func
+    # Build intermediate parent nodes for each ancestor conftest baseid so
+    # that fixtures are discoverable via iter_parents().
+    fm = session._fixturemanager
+    ancestor_baseids = set()
+    for fixturedefs in fm._arg2fixturedefs.values():
+        for fd in fixturedefs:
+            if fd.baseid and full_domain.startswith(fd.baseid):
+                ancestor_baseids.add(fd.baseid)
 
-    # This has to be set but can be random as it isn't used.
-    item.path = Path(os.getcwd())
+    current_parent = session
+    for baseid in sorted(ancestor_baseids, key=lambda x: x.count("/")):
+        current_parent = TrtexecItem.from_parent(current_parent,
+                                                 name=baseid,
+                                                 nodeid=baseid)
+
+    parent = TrtexecItem.from_parent(current_parent,
+                                     name=full_domain,
+                                     nodeid=full_domain)
+
+    # Function.__init__ calls getfixtureinfo which resolves conftest fixtures
+    # by walking iter_parents() — the intermediate nodes ensure baseids match.
+    item = Function.from_parent(parent, name=test_name, callobj=test_func)
+    item.path = test_file if file_exists else Path(os.getcwd())
+
+    # Restore the short nodeid that test-list filtering expects.
+    item._nodeid = f"{domain_name}::{test_name}"
 
     return item
 
