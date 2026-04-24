@@ -619,7 +619,7 @@ def parse_and_validate_test_list(
                                         test_prefix)
 
         output_dir = config.getoption("--output-dir")
-        if record_invalid_tests and corrections:
+        if output_dir and record_invalid_tests and corrections:
             record_invalid_tests(
                 os.path.join(output_dir, "invalid_tests.json"),
                 corrections,

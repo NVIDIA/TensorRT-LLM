@@ -22,6 +22,7 @@ import platform
 import re
 import shutil
 import subprocess as sp
+import sys
 import tempfile
 import time
 import urllib.request
@@ -29,6 +30,13 @@ import warnings
 from functools import wraps
 from pathlib import Path
 from typing import Iterable, Sequence
+
+# Ensure <repo>/tests/ is on sys.path so that test_common is importable
+# when pytest is invoked from the project root (where pyproject.toml
+# overrides the pythonpath setting in tests/integration/defs/pytest.ini).
+_tests_dir = str(Path(__file__).resolve().parent.parent.parent)
+if _tests_dir not in sys.path:
+    sys.path.insert(0, _tests_dir)
 
 import defs.ci_profiler
 import psutil

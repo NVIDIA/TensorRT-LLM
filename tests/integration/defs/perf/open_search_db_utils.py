@@ -233,8 +233,8 @@ def post_new_perf_data(new_data_dict):
     """
     Post new perf results to database.
 
-    Raises RuntimeError if the upload fails so that callers (e.g. pytest)
-    can detect and report the failure instead of silently losing data.
+    Logs a warning if the upload fails so that the perf benchmark test
+    itself is not marked as failed due to DB connectivity issues.
     """
     data_list = list(new_data_dict.values())
     if not data_list:
@@ -245,12 +245,9 @@ def post_new_perf_data(new_data_dict):
         success = OpenSearchDB.postToOpenSearchDB(data_list,
                                                   TEST_INFO_PROJECT_NAME)
         if not success:
-            raise RuntimeError(
+            print_warning(
                 f"OpenSearchDB.postToOpenSearchDB returned False for "
                 f"{TEST_INFO_PROJECT_NAME} ({len(data_list)} entries). "
                 f"Check type validation and connection settings.")
-    except RuntimeError:
-        raise
     except Exception as e:
-        raise RuntimeError(
-            f"Failed to post data to {TEST_INFO_PROJECT_NAME}: {e}") from e
+        print_warning(f"Failed to post data to {TEST_INFO_PROJECT_NAME}: {e}")

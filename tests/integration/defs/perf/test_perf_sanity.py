@@ -22,6 +22,7 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -1143,7 +1144,7 @@ class PerfSanityTestConfig:
     """Configuration for perf sanity tests."""
 
     def __init__(self, test_case_name: str, output_dir: str):
-        self._output_dir = output_dir
+        self._output_dir = output_dir if output_dir else tempfile.mkdtemp(prefix="perf_sanity_")
         self._perf_results: Dict[int, List[Dict[str, float]]] = {}
 
         # Initialize server configs
@@ -1670,7 +1671,9 @@ class PerfSanityTestConfig:
                     new_data["s_test_case_name"] = f"{server_config.name}-{client_config.name}"
 
                     for metric_name in PERF_METRIC_LOG_QUERIES:
-                        new_data[f"d_{metric_name}"] = server_perf_results[client_idx][metric_name]
+                        value = server_perf_results[client_idx][metric_name]
+                        if value is not None:
+                            new_data[f"d_{metric_name}"] = value
 
                     new_data_dict[cmd_idx] = new_data
                     cmd_idx += 1
@@ -1732,7 +1735,9 @@ class PerfSanityTestConfig:
                     new_data["s_test_case_name"] = f"{disagg_config.name}-{client_config.name}"
 
                     for metric_name in PERF_METRIC_LOG_QUERIES:
-                        new_data[f"d_{metric_name}"] = server_perf_results[client_idx][metric_name]
+                        value = server_perf_results[client_idx][metric_name]
+                        if value is not None:
+                            new_data[f"d_{metric_name}"] = value
 
                     new_data_dict[cmd_idx] = new_data
                     cmd_idx += 1
