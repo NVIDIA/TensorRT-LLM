@@ -1016,7 +1016,7 @@ def _make_fast_path_processor(**overrides):
 
     We pick IDs outside the printable-ASCII `ord(c)` range (0-127) so that
     tests which override `tokenizer.encode` with ord-based mocks (e.g. the
-    text-level fallback tests) don't produce spurious img_start/img_end IDs
+    text-level path tests) don't produce spurious img_start/img_end IDs
     from letters in frame separators like "Frame" (`ord('e') == 101`).
     """
     proc = _make_processor(**overrides)
@@ -1050,82 +1050,91 @@ def _make_fast_path_audio_processor(**overrides):
 
 
 class TestGetTextWithMMPlaceholders:
-    def test_single_image(self):
+    @pytest.mark.parametrize(
+        "mm_counts, expected",
+        [
+            pytest.param({"image": 1}, "<image>", id="single_image"),
+            pytest.param({"image": 3}, "<image><image><image>", id="multiple_images"),
+            pytest.param({"video": 1}, "<video>", id="single_video"),
+            pytest.param({}, "", id="empty"),
+        ],
+    )
+    def test_image_video_and_empty(self, mm_counts, expected):
         proc = _make_fast_path_processor()
-        assert proc.get_text_with_mm_placeholders({"image": 1}) == "<image>"
-
-    def test_multiple_images(self):
-        proc = _make_fast_path_processor()
-        assert proc.get_text_with_mm_placeholders({"image": 3}) == "<image><image><image>"
-
-    def test_single_video(self):
-        proc = _make_fast_path_processor()
-        assert proc.get_text_with_mm_placeholders({"video": 1}) == "<video>"
+        assert proc.get_text_with_mm_placeholders(mm_counts) == expected
 
     def test_single_audio(self):
+        # Kept separate: audio requires `_make_fast_path_audio_processor` (a
+        # different factory that wires up `sound_config`).
         proc = _make_fast_path_audio_processor()
-        text = proc.get_text_with_mm_placeholders({"audio": 1})
-        assert text == AUDIO_PLACEHOLDER
-
-    def test_empty(self):
-        proc = _make_fast_path_processor()
-        assert proc.get_text_with_mm_placeholders({}) == ""
+        assert proc.get_text_with_mm_placeholders({"audio": 1}) == AUDIO_PLACEHOLDER
 
 
 class TestExpandImagePlaceholders:
-    def test_single_image(self):
+    # Placeholder IDs are referenced as literals (20=img_ctx, 500/501=start/end)
+    # to keep the parametrize tables readable. See `_make_fast_path_processor`.
+    @pytest.mark.parametrize(
+        "prompt, num_mm_tokens, expected",
+        [
+            pytest.param(
+                [1, 2, 20, 3, 4],
+                [12],  # 1 (start) + 10 (context) + 1 (end)
+                [1, 2, 500] + [20] * 10 + [501, 3, 4],
+                id="single_image",
+            ),
+            pytest.param(
+                [1, 20, 2, 20, 3],
+                [7, 7],  # each: 1 start + 5 context + 1 end
+                [1, 500] + [20] * 5 + [501, 2, 500] + [20] * 5 + [501, 3],
+                id="multiple_images",
+            ),
+        ],
+    )
+    def test_happy_path(self, prompt, num_mm_tokens, expected):
         proc = _make_fast_path_processor()
-        img_ctx = proc.img_context_token_id  # 20
-        prompt = [1, 2, img_ctx, 3, 4]
-        # N = 12 total MM tokens: 1 (start) + 10 (context) + 1 (end)
-        expanded = proc._expand_image_placeholders_in_token_ids(prompt, [12])
-        assert expanded == [1, 2, 500] + [img_ctx] * 10 + [501, 3, 4]
+        assert proc._expand_image_placeholders_in_token_ids(prompt, num_mm_tokens) == expected
 
-    def test_multiple_images(self):
+    @pytest.mark.parametrize(
+        "prompt, num_mm_tokens, match",
+        [
+            pytest.param([20, 20], [5], "More image placeholder", id="more_placeholders"),
+            pytest.param([20], [5, 5], "Expected 2 image placeholders", id="fewer_placeholders"),
+        ],
+    )
+    def test_mismatch_raises(self, prompt, num_mm_tokens, match):
         proc = _make_fast_path_processor()
-        img_ctx = proc.img_context_token_id
-        prompt = [1, img_ctx, 2, img_ctx, 3]
-        # Two images: 7 tokens each (1 start + 5 context + 1 end)
-        expanded = proc._expand_image_placeholders_in_token_ids(prompt, [7, 7])
-        assert expanded == ([1, 500] + [img_ctx] * 5 + [501, 2, 500] + [img_ctx] * 5 + [501, 3])
-
-    def test_mismatch_more_placeholders_than_entries(self):
-        proc = _make_fast_path_processor()
-        img_ctx = proc.img_context_token_id
-        prompt = [img_ctx, img_ctx]
-        with pytest.raises(ValueError, match="More image placeholder"):
-            proc._expand_image_placeholders_in_token_ids(prompt, [5])
-
-    def test_mismatch_fewer_placeholders_than_entries(self):
-        proc = _make_fast_path_processor()
-        img_ctx = proc.img_context_token_id
-        prompt = [img_ctx]
-        with pytest.raises(ValueError, match="Expected 2 image placeholders"):
-            proc._expand_image_placeholders_in_token_ids(prompt, [5, 5])
+        with pytest.raises(ValueError, match=match):
+            proc._expand_image_placeholders_in_token_ids(prompt, num_mm_tokens)
 
 
 class TestExpandAudioPlaceholders:
-    def test_single_audio(self):
+    # Literals: 30=snd_ctx, 200/201=sound_start/end. See `_make_fast_path_audio_processor`.
+    @pytest.mark.parametrize(
+        "prompt, num_mm_tokens, expected",
+        [
+            pytest.param(
+                [1, 2, 30, 3],
+                [10],  # 1 start + 8 context + 1 end
+                [1, 2, 200] + [30] * 8 + [201, 3],
+                id="single_audio",
+            ),
+            pytest.param(
+                [30, 5, 30],
+                [6, 8],
+                [200] + [30] * 4 + [201, 5, 200] + [30] * 6 + [201],
+                id="multiple_audios",
+            ),
+        ],
+    )
+    def test_happy_path(self, prompt, num_mm_tokens, expected):
         proc = _make_fast_path_audio_processor()
-        snd_ctx = proc._sound_context_token_id  # 30
-        prompt = [1, 2, snd_ctx, 3]
-        # N = 10 total: 1 start + 8 context + 1 end
-        expanded = proc._expand_audio_placeholders_in_token_ids(prompt, [10])
-        assert expanded == [1, 2, 200] + [snd_ctx] * 8 + [201, 3]
-
-    def test_multiple_audios(self):
-        proc = _make_fast_path_audio_processor()
-        snd_ctx = proc._sound_context_token_id
-        prompt = [snd_ctx, 5, snd_ctx]
-        expanded = proc._expand_audio_placeholders_in_token_ids(prompt, [6, 8])
-        assert expanded == ([200] + [snd_ctx] * 4 + [201, 5, 200] + [snd_ctx] * 6 + [201])
+        assert proc._expand_audio_placeholders_in_token_ids(prompt, num_mm_tokens) == expected
 
     def test_mismatch_raises(self):
         proc = _make_fast_path_audio_processor()
         snd_ctx = proc._sound_context_token_id
-        prompt = [snd_ctx, snd_ctx]
         with pytest.raises(ValueError, match="More audio placeholder"):
-            proc._expand_audio_placeholders_in_token_ids(prompt, [5])
+            proc._expand_audio_placeholders_in_token_ids([snd_ctx, snd_ctx], [5])
 
 
 class TestExpandVideoPlaceholders:
@@ -1193,7 +1202,12 @@ class TestExpandVideoPlaceholdersMultiToken:
     tokens (e.g. [1060, 24073, 1062] for the Nemotron Nano tokenizer). This is
     what production hits — `<video>` is typically NOT registered as an added
     special token, so `video_context_token_id` is never what the tokenizer
-    produces from the user's prompt text."""
+    produces from the user's prompt text.
+
+    With length-based dispatch, `len(_video_placeholder_token_ids) > 1` always
+    goes through the text-level (decode/split/re-encode) path — token-level
+    matching is unreliable here because BPE can merge the placeholder's last
+    token with the following character."""
 
     @staticmethod
     def _make_video_processor_multi_token():
@@ -1205,44 +1219,13 @@ class TestExpandVideoPlaceholdersMultiToken:
         proc._video_placeholder_token_ids = [1060, 24073, 1062]
         return proc
 
-    def test_single_video_multi_token_pattern(self):
-        proc = self._make_video_processor_multi_token()
-        pattern = proc._video_placeholder_token_ids  # [1060, 24073, 1062]
-        img_ctx = proc.img_context_token_id
-
-        # prompt: [text..., <video>, text...] where <video> is a 3-token subseq
-        prompt = [1, 2, *pattern, 3]
-        num_frames = 2
-        frames = [Image.new("RGB", (512, 512)) for _ in range(num_frames)]
-        mm_data = {"video": [SimpleNamespace(frames=frames, metadata=None)]}
-        total_mm = num_frames * (256 + 2)
-
-        expanded, evs_ids = proc._expand_video_placeholders_in_token_ids(
-            prompt, [total_mm], mm_data
-        )
-        # No EVS -> no evs_ids.
-        assert evs_ids is None
-
-        # Leading / trailing text survives; the 3-token pattern is consumed.
-        assert expanded[:2] == [1, 2]
-        assert expanded[-1] == 3
-        # Pattern tokens must no longer appear as a contiguous subsequence.
-        found_pattern = any(
-            expanded[i : i + len(pattern)] == pattern
-            for i in range(len(expanded) - len(pattern) + 1)
-        )
-        assert not found_pattern, "Pattern should have been replaced; found leftover <video> subseq"
-        # Same MM token counts as the single-ID case.
-        assert expanded.count(img_ctx) == num_frames * 256
-        assert expanded.count(500) == num_frames  # img_start
-        assert expanded.count(501) == num_frames  # img_end
-
-    def test_text_level_fallback_when_bpe_merges_trailing_context(self):
+    def test_text_level_path_when_bpe_merges_trailing_context(self):
         """Simulate the production scenario: `<video>` tokenizes to one pattern
         in isolation (e.g. [1060, 24073, 1062]) but the tokens in the actual
         prompt end with a DIFFERENT ID (e.g. [1060, 24073, 3318]) because BPE
-        merged `>` with the following newline/whitespace. Token-level match
-        fails; the text-level fallback must still succeed."""
+        merged `>` with the following newline/whitespace. The text-level path
+        must handle this correctly (length-based dispatch routes all multi-
+        token placeholders here)."""
         proc = self._make_video_processor_multi_token()
         img_ctx = proc.img_context_token_id
 
@@ -1275,8 +1258,8 @@ class TestExpandVideoPlaceholdersMultiToken:
         proc.tokenizer.encode = mock_encode
 
         # Prompt contains the "in-context" BPE tokenization [1060, 24073, 3318],
-        # NOT the "isolation" pattern [1060, 24073, 1062]. Token-level match
-        # fails; text-level fallback must kick in.
+        # NOT the "isolation" pattern [1060, 24073, 1062]. Length-based
+        # dispatch (len > 1) routes through the text-level path regardless.
         prompt = [1, 2, 1060, 24073, 3318, 3]
         num_frames = 2
         frames = [Image.new("RGB", (512, 512)) for _ in range(num_frames)]
@@ -1289,14 +1272,14 @@ class TestExpandVideoPlaceholdersMultiToken:
         # Still no EVS -> evs_ids must be None.
         assert evs_ids is None
 
-        # MM token counts should match, regardless of which tier matched.
+        # MM token counts should match.
         assert expanded.count(img_ctx) == num_frames * 256
         assert expanded.count(500) == num_frames  # img_start
         assert expanded.count(501) == num_frames  # img_end
 
-    def test_fallback_count_mismatch_raises(self):
+    def test_text_level_count_mismatch_raises(self):
         """If the decoded text has a different number of `<video>` occurrences
-        than `mm_data["video"]`, the fallback must raise a clear error."""
+        than `mm_data["video"]`, the text-level path must raise a clear error."""
         proc = self._make_video_processor_multi_token()
         # Decoded text has zero `<video>` substrings.
         proc.tokenizer.decode = lambda ids, **kw: "no placeholder here"
@@ -1376,13 +1359,12 @@ class TestExpandVideoPlaceholdersEVS:
         assert evs_list[:2] == [1, 2]
         assert evs_list[-1] == 3
 
-    def test_evs_text_level_fallback(self):
-        """Text-level fallback path under EVS: `<video>` is absent from the
-        token stream (BPE boundary merged), decode/split/re-encode kicks in
-        and must still produce both streams."""
+    def test_evs_text_level_path(self):
+        """Text-level path under EVS: multi-token `<video>` placeholder
+        dispatches to decode/split/re-encode, which must still produce both
+        streams in parallel."""
         proc = self._make_evs_video_processor()
-        # Force a multi-token pattern that is NOT present in the real prompt,
-        # so Tier 1 fails and we fall through to Tier 2.
+        # Multi-token pattern -> dispatch routes through the text-level path.
         proc._video_placeholder_token_ids = [1060, 24073, 1062]
 
         # Mock decode/encode to simulate the BPE-merged reality.
@@ -1411,7 +1393,8 @@ class TestExpandVideoPlaceholdersEVS:
         num_frames = 3
 
         # Prompt uses the "in-context" pattern (3318), not the "isolation"
-        # pattern (1062) -> Tier 1 bails, Tier 2 handles it.
+        # pattern (1062). Length-based dispatch (len > 1) routes through
+        # the text-level path unconditionally.
         prompt = [1, 2, 1060, 24073, 3318, 3]
         frames = [Image.new("RGB", (512, 512)) for _ in range(num_frames)]
         mm_data = {"video": [SimpleNamespace(frames=frames, metadata=None)]}
@@ -1503,23 +1486,26 @@ class TestExpandPromptTokenIdsForMM:
 
 
 class TestGetNumTokensPerAudio:
-    def test_bare_array(self):
+    @pytest.mark.parametrize(
+        "wrap_with_sample_rate",
+        [
+            pytest.param(False, id="bare_array"),
+            pytest.param(True, id="tuple_with_matching_sample_rate"),
+        ],
+    )
+    def test_bare_array_and_sample_rate_tuple(self, wrap_with_sample_rate):
         proc = _make_audio_processor()
         audio = np.random.randn(16000).astype(np.float32)
-        n = proc.get_num_tokens_per_audio(audio=audio)
+        audio_input = (
+            (audio, proc._audio_extractor.sampling_rate) if wrap_with_sample_rate else audio
+        )
         expected = proc._audio_extractor.audio_token_count(16000) + 2
-        assert n == expected
-
-    def test_tuple_with_matching_sample_rate(self):
-        proc = _make_audio_processor()
-        sr = proc._audio_extractor.sampling_rate
-        audio = np.random.randn(16000).astype(np.float32)
-        n = proc.get_num_tokens_per_audio(audio=(audio, sr))
-        expected = proc._audio_extractor.audio_token_count(16000) + 2
-        assert n == expected
+        assert proc.get_num_tokens_per_audio(audio=audio_input) == expected
 
     def test_no_audio_config_raises(self):
-        proc = _make_processor()  # No sound_config
+        # Kept separate: uses `_make_processor` (no sound_config) — fundamentally
+        # different setup from the happy-path cases above.
+        proc = _make_processor()
         with pytest.raises(ValueError, match="sound_config"):
             proc.get_num_tokens_per_audio(audio=np.zeros(100))
 
@@ -1571,7 +1557,7 @@ class TestGetNumTokensPerVideoInvariants:
         w, h = frame_dims
         frames = [Image.new("RGB", (w, h)) for _ in range(num_frames)]
 
-        video_size = proc._compute_video_size_lightweight(frames)
+        video_size = proc._compute_video_shape_descriptor(frames)
         per_tubelet = proc._compute_token_numbers_per_video([video_size])[0]
         num_tubelets = len(per_tubelet)
         # `get_num_tokens_per_video` hardcodes

@@ -44,16 +44,6 @@ from .modeling_utils import register_auto_model
 
 # Set max_num_tiles to 1 for video modality, to match the training behavior.
 VIDEO_MAX_NUM_TILES = 1
-# Several video code paths (`_process_videos_frames`'s HF-processor fallback,
-# `_get_video_tokens_per_frame`'s fallback, `_compute_video_size_lightweight`,
-# and `get_num_tokens_per_video`'s EVS branch) all assume a single tile per
-# frame. Increasing this constant would require updating those paths
-# accordingly — multi-tile video expansion isn't currently supported and the
-# prompt-side MM counts would diverge from the vision encoder's output.
-# Guard against accidental change.
-assert VIDEO_MAX_NUM_TILES == 1, (
-    "NanoV2VL video paths assume a single tile per frame; see comment above."
-)
 IMAGE_PLACEHOLDER = "<image>"
 VIDEO_PLACEHOLDER = "<video>"
 AUDIO_PLACEHOLDER = "<so_embedding>"
@@ -1306,115 +1296,108 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 return True
         return False
 
+    def _expand_single_token_placeholders(
+        self,
+        prompt_token_ids: List[int],
+        num_mm_tokens_per_placeholder: List[int],
+        *,
+        context_token_id: int,
+        start_token_ids: List[int],
+        end_token_ids: List[int],
+        modality_name: str,
+    ) -> List[int]:
+        """Shared per-placeholder expansion for modalities whose in-prompt
+        marker is a single token ID (i.e. the tokenizer maps the placeholder
+        string to exactly one token).
+
+        Replaces each occurrence of `context_token_id` in `prompt_token_ids`
+        with `start_token_ids + [context_token_id] * (N - num_start - num_end) + end_token_ids`,
+        where `N = num_mm_tokens_per_placeholder[i]` is the total expanded
+        length (including start / end special tokens) reported by the
+        corresponding `get_num_tokens_per_<modality>`.
+
+        Args:
+            prompt_token_ids: Input prompt token IDs with single-token
+                placeholders of `context_token_id`.
+            num_mm_tokens_per_placeholder: One entry per placeholder;
+                total expanded length (including start / end).
+            context_token_id: Single token ID that marks each placeholder
+                in the prompt (e.g. `img_context_token_id == 18`).
+            start_token_ids: Tokens to emit before the repeated
+                `context_token_id` run (e.g. `_img_start_token_ids == [19]`).
+            end_token_ids: Tokens to emit after the repeated run
+                (e.g. `_img_end_token_ids == [20]`).
+            modality_name: Human-readable name (`"image"` / `"audio"`) used
+                in error messages.
+
+        Returns:
+            The prompt token IDs with each placeholder replaced by
+            `start + context*K + end`, where `K = N - len(start) - len(end)`.
+        """
+        num_start = len(start_token_ids)
+        num_end = len(end_token_ids)
+
+        expanded: List[int] = []
+        idx = 0
+        for tok in prompt_token_ids:
+            if tok == context_token_id:
+                if idx >= len(num_mm_tokens_per_placeholder):
+                    raise ValueError(
+                        f"More {modality_name} placeholder tokens in prompt "
+                        f"than num_mm_tokens_per_placeholder entries: found "
+                        f"{idx + 1} placeholders, "
+                        f"num_mm_tokens_per_placeholder has "
+                        f"{len(num_mm_tokens_per_placeholder)} entries."
+                    )
+                n = num_mm_tokens_per_placeholder[idx]
+                num_context = n - num_start - num_end
+                expanded.extend(start_token_ids)
+                expanded.extend([context_token_id] * num_context)
+                expanded.extend(end_token_ids)
+                idx += 1
+            else:
+                expanded.append(tok)
+
+        if idx != len(num_mm_tokens_per_placeholder):
+            raise ValueError(
+                f"Expected {len(num_mm_tokens_per_placeholder)} "
+                f"{modality_name} placeholders, found {idx}."
+            )
+        return expanded
+
     def _expand_image_placeholders_in_token_ids(
         self,
         prompt_token_ids: List[int],
         num_mm_tokens_per_placeholder: List[int],
     ) -> List[int]:
-        """Replace each `img_context_token_id` in the prompt with
-        `<img>` + `<image>` repeated N times + `</img>` at the token-ID level.
-
-        The per-placeholder count `N` comes from `get_num_tokens_per_image`
-        and already includes the two special start/end tokens, so the number
-        of repeated context tokens written is
-        `N - len(_img_start_token_ids) - len(_img_end_token_ids)`.
-
-        Args:
-            prompt_token_ids (List[int]): The input prompt token IDs with
-                `img_context_token_id` placeholders.
-            num_mm_tokens_per_placeholder (List[int]): For each image
-                placeholder in `prompt_token_ids`, the total number of MM
-                tokens (including start/end) to expand to.
-
-        Returns:
-            List[int]: The prompt token IDs with each image placeholder
-                replaced by the full `<img><image>*N</img>` token sequence.
-        """
-        num_start = len(self._img_start_token_ids)
-        num_end = len(self._img_end_token_ids)
-
-        expanded: List[int] = []
-        image_idx = 0
-        for tok in prompt_token_ids:
-            if tok == self.img_context_token_id:
-                if image_idx >= len(num_mm_tokens_per_placeholder):
-                    raise ValueError(
-                        f"More image placeholder tokens in prompt than "
-                        f"num_mm_tokens_per_placeholder entries: found "
-                        f"{image_idx + 1} placeholders, "
-                        f"num_mm_tokens_per_placeholder has "
-                        f"{len(num_mm_tokens_per_placeholder)} entries."
-                    )
-                n = num_mm_tokens_per_placeholder[image_idx]
-                num_context = n - num_start - num_end
-                expanded.extend(self._img_start_token_ids)
-                expanded.extend([self.img_context_token_id] * num_context)
-                expanded.extend(self._img_end_token_ids)
-                image_idx += 1
-            else:
-                expanded.append(tok)
-
-        if image_idx != len(num_mm_tokens_per_placeholder):
-            raise ValueError(
-                f"Expected {len(num_mm_tokens_per_placeholder)} image "
-                f"placeholders, found {image_idx}."
-            )
-        return expanded
+        """Image expansion — thin wrapper around
+        `_expand_single_token_placeholders` with image-specific tokens."""
+        return self._expand_single_token_placeholders(
+            prompt_token_ids,
+            num_mm_tokens_per_placeholder,
+            context_token_id=self.img_context_token_id,
+            start_token_ids=self._img_start_token_ids,
+            end_token_ids=self._img_end_token_ids,
+            modality_name="image",
+        )
 
     def _expand_audio_placeholders_in_token_ids(
         self,
         prompt_token_ids: List[int],
         num_mm_tokens_per_placeholder: List[int],
     ) -> List[int]:
-        """Replace each `_sound_context_token_id` in the prompt with
-        `<so_start>` + `<so_embedding>` repeated N times + `<so_end>` at the
-        token-ID level.
+        """Audio expansion — thin wrapper around
+        `_expand_single_token_placeholders` with audio-specific tokens."""
+        return self._expand_single_token_placeholders(
+            prompt_token_ids,
+            num_mm_tokens_per_placeholder,
+            context_token_id=self._sound_context_token_id,
+            start_token_ids=[self._sound_start_token_id],
+            end_token_ids=[self._sound_end_token_id],
+            modality_name="audio",
+        )
 
-        The per-placeholder count `N` comes from `get_num_tokens_per_audio`
-        and already includes the two special start/end tokens, so the number
-        of repeated context tokens written is `N - 2`.
-
-        Args:
-            prompt_token_ids (List[int]): The input prompt token IDs with
-                `_sound_context_token_id` placeholders.
-            num_mm_tokens_per_placeholder (List[int]): For each audio
-                placeholder in `prompt_token_ids`, the total number of MM
-                tokens (including start/end) to expand to.
-
-        Returns:
-            List[int]: The prompt token IDs with each audio placeholder
-                replaced by the full `<so_start><so_embedding>*N<so_end>`
-                token sequence.
-        """
-        expanded: List[int] = []
-        audio_idx = 0
-        for tok in prompt_token_ids:
-            if tok == self._sound_context_token_id:
-                if audio_idx >= len(num_mm_tokens_per_placeholder):
-                    raise ValueError(
-                        f"More audio placeholder tokens in prompt than "
-                        f"num_mm_tokens_per_placeholder entries: found "
-                        f"{audio_idx + 1} placeholders, "
-                        f"num_mm_tokens_per_placeholder has "
-                        f"{len(num_mm_tokens_per_placeholder)} entries."
-                    )
-                n = num_mm_tokens_per_placeholder[audio_idx]
-                # n includes 2 special tokens (start + end).
-                expanded.append(self._sound_start_token_id)
-                expanded.extend([self._sound_context_token_id] * (n - 2))
-                expanded.append(self._sound_end_token_id)
-                audio_idx += 1
-            else:
-                expanded.append(tok)
-
-        if audio_idx != len(num_mm_tokens_per_placeholder):
-            raise ValueError(
-                f"Expected {len(num_mm_tokens_per_placeholder)} audio "
-                f"placeholders, found {audio_idx}."
-            )
-        return expanded
-
-    def _compute_video_size_lightweight(
+    def _compute_video_shape_descriptor(
         self,
         video_frames: List[Image.Image],
     ) -> List[int]:
@@ -1543,17 +1526,22 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         video_expansions: List[List[int]] = []
         video_evs_expansions: Optional[List[List[int]]] = [] if evs_enabled else None
         for video_data in videos:
-            if hasattr(video_data, "frames"):
-                frames = video_data.frames
-                metadata = video_data.metadata
-            else:
-                frames = video_data
-                metadata = None
+            # `video_data` comes in two shapes:
+            #   - A `VideoData`-like object (with `.frames` / `.metadata`
+            #     attributes) — the production case (openai_server wraps
+            #     video inputs this way) and the unit-test case (tests use
+            #     `SimpleNamespace(frames=..., metadata=...)`).
+            #   - A plain list of frames (no metadata) — the defensive
+            #     fallback when callers pass raw frames directly, matching
+            #     the pattern in `find_mm_token_lengths` in multimodal.py.
+            # `getattr` with a default handles both uniformly.
+            frames = getattr(video_data, "frames", video_data)
+            metadata = getattr(video_data, "metadata", None)
 
-            video_size = self._compute_video_size_lightweight(frames)
+            video_size = self._compute_video_shape_descriptor(frames)
             # When EVS is enabled, `_compute_token_numbers_per_video`
             # returns the dummy pattern [K_pre_evs, 0, 0, ...] — same shape
-            # the non-fast-path uses to size `input_ids` pre-EVS-merge;
+            # the str-replacement-path uses to size `input_ids` pre-EVS-merge;
             # `merge_evs_mm_embeds` rewrites it at forward time.
             tokens_per_frame = self._compute_token_numbers_per_video([video_size])[0]
             frame_seps = self._get_frame_separators([video_size], [metadata])[0]
@@ -1581,25 +1569,21 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             if video_evs_expansions is not None and evs_expansion is not None:
                 video_evs_expansions.append(evs_expansion)
 
-        # Two-tier matching strategy (mirroring vLLM's `_apply_prompt_updates`):
+        # Dispatch by placeholder token length:
         #
-        #   1. **Token-level fast path**: scan for the pre-tokenized
-        #      `<video>` subsequence in `prompt_token_ids`. Works when the
-        #      tokenizer round-trips `<video>` as a stable BPE sequence
-        #      (e.g. when `<video>` sits at a token boundary).
+        #   - len == 1: `<video>` is a single added special token, stable
+        #     across BPE boundaries — token-level subsequence matching is
+        #     always correct, no fallback needed.
         #
-        #   2. **Text-level fallback**: when token-level matching doesn't
-        #      locate all expected occurrences (because BPE merged the
-        #      placeholder's last token with the following character — e.g.
-        #      `>` + `\n` fuses into a single different token ID), decode
-        #      `prompt_token_ids` back to text, split on the `<video>`
-        #      string, and re-encode each segment. This is the same "search
-        #      across token boundaries" escape hatch vLLM uses.
-        tier1 = self._try_token_level_video_replace(
-            prompt_token_ids, video_expansions, video_evs_expansions
-        )
-        if tier1 is not None:
-            expanded_ids, evs_ids_list = tier1
+        #   - len > 1: `<video>` decomposes into multiple BPE tokens whose
+        #     last token can merge with the following character (e.g. `>` +
+        #     `\n` fuses into a different token ID), so token-level search
+        #     is unreliable. Go straight to the text-level path: decode,
+        #     split on the literal `<video>` string, re-encode each segment.
+        if len(self._video_placeholder_token_ids) == 1:
+            expanded_ids, evs_ids_list = self._token_level_video_replace(
+                prompt_token_ids, video_expansions, video_evs_expansions
+            )
         else:
             expanded_ids, evs_ids_list = self._text_level_video_replace(
                 prompt_token_ids, video_expansions, video_evs_expansions
@@ -1610,52 +1594,54 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         )
         return expanded_ids, evs_ids_tensor
 
-    def _try_token_level_video_replace(
+    def _token_level_video_replace(
         self,
         prompt_token_ids: List[int],
         video_expansions: List[List[int]],
         video_evs_expansions: Optional[List[List[int]]] = None,
-    ) -> Optional[Tuple[List[int], Optional[List[int]]]]:
-        """Return `(expanded_ids, evs_ids_or_None)` if every `<video>`
-        occurrence is locatable as a contiguous token-ID subsequence; else
-        return `None` to signal that the text-level fallback is required.
+    ) -> Tuple[List[int], Optional[List[int]]]:
+        """Scan `prompt_token_ids` for each `<video>` placeholder as a
+        single-token match and splice in the per-video expansion(s).
+
+        Only called when `len(self._video_placeholder_token_ids) == 1`, so
+        the placeholder is a stable added special token and a plain ID
+        scan is reliable — no BPE boundary merging to worry about.
+
+        Raises `ValueError` if the number of matches doesn't equal the
+        number of videos (indicates malformed input, not a fallback case).
 
         When `video_evs_expansions` is provided (EVS), both streams are
         produced in parallel: outside MM chunks each token is copied into
-        both streams; at each matched boundary, `video_expansions[i]` goes
-        into `expanded`, `video_evs_expansions[i]` goes into `evs`.
+        both streams; at each match, `video_expansions[i]` goes into
+        `expanded` and `video_evs_expansions[i]` goes into `evs`.
         """
-        pattern = self._video_placeholder_token_ids
-        if not pattern:
-            return None
-
-        pattern_len = len(pattern)
+        placeholder_id = self._video_placeholder_token_ids[0]
         expanded: List[int] = []
         evs: Optional[List[int]] = [] if video_evs_expansions is not None else None
         video_idx = 0
-        i = 0
-        while i < len(prompt_token_ids):
-            if (
-                i + pattern_len <= len(prompt_token_ids)
-                and prompt_token_ids[i : i + pattern_len] == pattern
-            ):
+        for tok in prompt_token_ids:
+            if tok == placeholder_id:
                 if video_idx >= len(video_expansions):
-                    # More token-level matches than videos — ambiguous; bail.
-                    return None
+                    raise ValueError(
+                        f"Video expansion: prompt_token_ids contains more "
+                        f"'<video>' placeholders than videos "
+                        f"({len(video_expansions)})."
+                    )
                 expanded.extend(video_expansions[video_idx])
-                if evs is not None and video_evs_expansions is not None:
+                if evs is not None:
                     evs.extend(video_evs_expansions[video_idx])
                 video_idx += 1
-                i += pattern_len
             else:
-                tok = prompt_token_ids[i]
                 expanded.append(tok)
                 if evs is not None:
                     evs.append(tok)
-                i += 1
 
         if video_idx != len(video_expansions):
-            return None  # At least one <video> not found as a subsequence.
+            raise ValueError(
+                f"Video expansion: prompt_token_ids contains {video_idx} "
+                f"'<video>' placeholder(s), but mm_data has "
+                f"{len(video_expansions)} video(s)."
+            )
         return expanded, evs
 
     def _text_level_video_replace(
@@ -1818,6 +1804,14 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             else:
                 # Fallback: use HF image processor with VIDEO_MAX_NUM_TILES.
                 orig_max_num_tiles = self.processor.max_num_tiles
+                # Several video code paths all assume a single tile per frame.
+                # Increasing this constant would require updating those paths
+                # accordingly — multi-tile video expansion isn't currently supported and the
+                # prompt-side MM counts would diverge from the vision encoder's output.
+                # Guard against accidental change.
+                assert VIDEO_MAX_NUM_TILES == 1, (
+                    "NanoV2VL video paths assume a single tile per frame; see comment above."
+                )
                 self.processor.max_num_tiles = VIDEO_MAX_NUM_TILES
                 try:
                     processed_images = self.processor(images=video, return_tensors="pt").to(

@@ -122,7 +122,7 @@ def test_llava_next_expand_prompt_token_ids_for_mm():
         prompt_token_ids, num_mm_tokens_per_placeholder
     )
 
-    # LLaVA-Next has no auxiliary streams; mm_data_updates must be None.
+    # LLaVA-Next has no auxiliary data structures like EVS IDs; mm_data_updates must be None.
     assert mm_data_updates is None
 
     # Expected: [1, 2] + 10 * placeholder_id + [3] + 20 * placeholder_id + [4]

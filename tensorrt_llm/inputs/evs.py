@@ -7,7 +7,9 @@ import torch
 def compute_retained_tokens_from_tubelet_budget(num_tubelets: int,
                                                 tokens_per_tubelet: int,
                                                 pruning_ratio: float) -> int:
-    """Compute the number of retained tokens for a video given a precomputed per-tubelet token count.
+    """This is Nemotron Nano V3 OMNI-specific at the moment.
+
+    Compute the number of retained tokens for a video given a precomputed per-tubelet token count.
 
     Ensures that at least one tubelet's worth of tokens is always retained —
     i.e. pruning never drops the whole video.
