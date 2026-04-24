@@ -25,10 +25,12 @@ This module provides various attention implementations and backends:
 - triton_paged_attention: Triton paged attention (two-stage flash-decode) with HND layout
 - onnx_attention: Placeholder ops for ONNX export of attention mechanisms
 - deepseek_v4_attention: DeepSeek V4 sparse/HMA attention source op
+- deepseek_v4_kernels: DeepSeek V4 standalone attention kernel microfeatures
 """
 
 __all__ = [
     "deepseek_v4_attention",
+    "deepseek_v4_kernels",
     "torch_attention",
     "torch_backend_attention",
     "flashinfer_attention",
