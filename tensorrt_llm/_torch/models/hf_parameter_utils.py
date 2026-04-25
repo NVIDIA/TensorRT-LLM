@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compatibility for Hugging Face ``get_parameter_device`` / ``get_parameter_dtype``.
+"""``get_parameter_device`` / ``get_parameter_dtype`` helpers.
 
-Transformers v5 no longer exports these from ``transformers.modeling_utils``; they
-match ``ModuleUtilsMixin`` behavior for plain ``nn.Module`` stacks.
+Transformers v5 no longer exports these from ``transformers.modeling_utils``; these
+replacements match ``ModuleUtilsMixin`` behavior for plain ``nn.Module`` stacks.
 """
 
 from __future__ import annotations
@@ -24,12 +24,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-try:
-    from transformers.modeling_utils import get_parameter_device, get_parameter_dtype
-except ImportError:
 
-    def get_parameter_device(module: nn.Module) -> torch.device:
-        return next(module.parameters()).device
+def get_parameter_device(module: nn.Module) -> torch.device:
+    return next(module.parameters()).device
 
-    def get_parameter_dtype(module: nn.Module) -> torch.dtype:
-        return next(param.dtype for param in module.parameters() if param.is_floating_point())
+
+def get_parameter_dtype(module: nn.Module) -> torch.dtype:
+    return next(param.dtype for param in module.parameters() if param.is_floating_point())

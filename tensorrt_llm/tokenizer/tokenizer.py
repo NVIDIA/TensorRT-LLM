@@ -163,9 +163,7 @@ class TransformersTokenizer(TokenizerBase):
         return self.tokenizer.decode(token_ids, *args, **kwargs)
 
     def batch_encode_plus(self, texts: List[str], *args, **kwargs) -> dict:
-        # transformers 5.x removed batch_encode_plus; use __call__ instead
-        if hasattr(self.tokenizer, 'batch_encode_plus'):
-            return self.tokenizer.batch_encode_plus(texts, *args, **kwargs)
+        # transformers 5.x removed batch_encode_plus; __call__ has the same signature.
         return self.tokenizer(texts, *args, **kwargs)
 
     def get_chat_template(self,

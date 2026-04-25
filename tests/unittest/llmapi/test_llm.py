@@ -320,8 +320,6 @@ class MyTokenizer(TokenizerBase):
         return self.tokenizer.decode(token_ids, **kwargs)
 
     def batch_encode_plus(self, texts: List[str], **kwargs) -> dict:
-        if hasattr(self.tokenizer, 'batch_encode_plus'):
-            return self.tokenizer.batch_encode_plus(texts, **kwargs)
         return self.tokenizer(texts, **kwargs)
 
 

@@ -28,12 +28,10 @@ LegacyCache = Tuple[LegacyLayerKV, ...]
 def dynamic_cache_from_legacy(
     past_key_values: Optional[Union[LegacyCache, Sequence[LegacyLayerKV]]],
 ) -> DynamicCache:
-    """Match pre-v5 ``DynamicCache.from_legacy_cache`` (see transformers v4.48 ``cache_utils``)."""
-    if past_key_values is None:
-        return DynamicCache()
-    if hasattr(DynamicCache, "from_legacy_cache"):
-        return DynamicCache.from_legacy_cache(past_key_values)
+    """Build a ``DynamicCache`` from the pre-v5 tuple-of-tuples format."""
     cache = DynamicCache()
+    if past_key_values is None:
+        return cache
     for layer_idx in range(len(past_key_values)):
         key_states, value_states = past_key_values[layer_idx]
         cache.update(key_states, value_states, layer_idx)
@@ -41,9 +39,7 @@ def dynamic_cache_from_legacy(
 
 
 def dynamic_cache_to_legacy(cache: DynamicCache) -> LegacyCache:
-    """Match pre-v5 ``DynamicCache.to_legacy_cache``."""
-    if hasattr(cache, "to_legacy_cache"):
-        return cache.to_legacy_cache()
+    """Export a ``DynamicCache`` back to the pre-v5 tuple-of-tuples format."""
     layers: List[LegacyLayerKV] = []
     for layer in cache.layers:
         if not getattr(layer, "is_initialized", False):
