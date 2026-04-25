@@ -55,8 +55,7 @@ import torch
 import torch.nn as nn
 from torch.utils._pytree import tree_flatten
 
-from tensorrt_llm._torch.utils import make_weak_ref
-
+from .._compat import make_weak_ref
 from ..utils.logger import ad_logger
 
 

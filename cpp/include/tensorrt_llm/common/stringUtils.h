@@ -26,6 +26,7 @@
 #include <memory>  // std::make_unique
 #include <sstream> // std::stringstream
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 

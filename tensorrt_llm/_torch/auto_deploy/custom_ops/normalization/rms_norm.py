@@ -21,8 +21,19 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange
 
-from ....flashinfer_utils import get_env_enable_pdl
-from ....modules.mamba.layernorm_gated import _layer_norm_fwd
+try:
+    from ....flashinfer_utils import get_env_enable_pdl
+except (ModuleNotFoundError, ImportError):
+    import os
+
+    def get_env_enable_pdl() -> bool:
+        return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+
+
+try:
+    from tensorrt_llm._torch.modules.mamba.layernorm_gated import _layer_norm_fwd
+except (ModuleNotFoundError, ImportError):
+    _layer_norm_fwd = None
 from .triton_rms_norm import rms_norm
 
 

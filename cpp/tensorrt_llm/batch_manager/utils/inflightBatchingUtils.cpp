@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -394,6 +394,14 @@ void CudaGraphExecutorCache::put(BatchState const& state, std::shared_ptr<CudaGr
         mCache.pop_back();
         mMap.erase(lastState);
     }
+}
+
+void CudaGraphExecutorCache::clear()
+{
+    // Releasing the shared_ptrs runs ~CudaGraphExecutor, which calls
+    // cudaGraphExecDestroy on each cached instance.
+    mMap.clear();
+    mCache.clear();
 }
 
 } // namespace tensorrt_llm::batch_manager::utils

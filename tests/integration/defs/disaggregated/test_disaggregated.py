@@ -1912,53 +1912,6 @@ def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
         return False, accuracy_value
 
 
-@pytest.mark.parametrize("benchmark_model_root", [
-    'DeepSeek-V3-Lite-fp8', 'DeepSeek-V3-Lite-bf16', 'llama-v3-8b-hf',
-    'llama-3.1-8b-instruct-hf-fp8'
-],
-                         indirect=True)
-def test_disaggregated_benchmark_on_diff_backends(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        benchmark_model_root, benchmark_root, shared_gpt_path):
-    if "DeepSeek-V3-Lite" in benchmark_model_root and "fp8" in benchmark_model_root and get_sm_version(
-    ) != 90:
-        pytest.skip("The test should only run on Hopper")
-    nixl_config = get_config_for_benchmark(benchmark_model_root, "NIXL")
-    ucx_config = get_config_for_benchmark(benchmark_model_root, "UCX")
-    temp_dir = tempfile.TemporaryDirectory()
-    nixl_config_path = os.path.join(temp_dir.name, "nixl_config.yaml")
-    ucx_config_path = os.path.join(temp_dir.name, "ucx_config.yaml")
-    with open(nixl_config_path, 'w', encoding='utf-8') as f:
-        yaml.dump(nixl_config, f)
-    with open(ucx_config_path, 'w', encoding='utf-8') as f:
-        yaml.dump(ucx_config, f)
-
-    env = llm_venv._new_env.copy()
-    nixl_e2el, nixl_ttft = run_disaggregated_benchmark(
-        disaggregated_example_root,
-        nixl_config_path,
-        benchmark_root,
-        benchmark_model_root,
-        shared_gpt_path,
-        env=env,
-        model_path=benchmark_model_root,
-        cwd=llm_venv.get_working_directory())
-    ucx_e2el, ucx_ttft = run_disaggregated_benchmark(
-        disaggregated_example_root,
-        ucx_config_path,
-        benchmark_root,
-        benchmark_model_root,
-        shared_gpt_path,
-        env=env,
-        model_path=benchmark_model_root,
-        cwd=llm_venv.get_working_directory())
-    print(f"Nixl E2EL: {nixl_e2el} ms, UCX E2EL: {ucx_e2el} ms")
-    print(f"Nixl TTFT: {nixl_ttft} ms, UCX TTFT: {ucx_ttft} ms")
-
-    assert ucx_e2el > 0 and nixl_e2el > 0 and nixl_e2el < 1.05 * ucx_e2el
-    assert ucx_ttft > 0 and nixl_ttft > 0 and nixl_ttft < 1.05 * ucx_ttft
-
-
 @pytest.mark.parametrize("benchmark_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(

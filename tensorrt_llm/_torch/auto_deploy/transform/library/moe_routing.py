@@ -38,18 +38,19 @@ from torch.fx import GraphModule, Node
 
 # Importing this module registers the torch.ops.auto_deploy.triton_fused_topk_softmax op.
 import tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.triton_routing  # noqa: F401
-from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactory
-from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
-from tensorrt_llm._torch.auto_deploy.transform.interface import (
+
+from ...models.factory import ModelFactory
+from ...shim.interface import CachedSequenceInterface
+from ...utils._graph import eliminate_dead_code
+from ...utils.logger import ad_logger
+from ...utils.node_utils import is_op
+from ..interface import (
     BaseTransform,
     SharedConfig,
     TransformConfig,
     TransformInfo,
     TransformRegistry,
 )
-from tensorrt_llm._torch.auto_deploy.utils._graph import eliminate_dead_code
-from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 # ---------------------------------------------------------------------------
 # Pattern-detection helpers

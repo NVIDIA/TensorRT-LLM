@@ -166,6 +166,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
     - Fused QKV requirement for TRTLLM kernel
     - Metadata creation and preparation
     - No KV cache operation
+    - SageAttention per-block Q/K/V quantization (when sage params are provided)
     """
 
     def __init__(
@@ -179,6 +180,10 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         max_batch_size: int = 16,
         max_seq_len: int = 4096,
         attention_metadata_state: Optional[dict] = None,
+        sage_attn_num_elts_per_blk_q: int = 0,
+        sage_attn_num_elts_per_blk_k: int = 0,
+        sage_attn_num_elts_per_blk_v: int = 0,
+        sage_attn_qk_int8: bool = False,
     ):
         num_kv_heads = num_kv_heads or num_heads
 
@@ -189,6 +194,16 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             head_dim=head_dim,
             quant_config=quant_config,
             dtype=dtype,
+        )
+
+        self.sage_attn_num_elts_per_blk_q = sage_attn_num_elts_per_blk_q
+        self.sage_attn_num_elts_per_blk_k = sage_attn_num_elts_per_blk_k
+        self.sage_attn_num_elts_per_blk_v = sage_attn_num_elts_per_blk_v
+        self.sage_attn_qk_int8 = sage_attn_qk_int8
+        self._use_sage_attn = (
+            sage_attn_num_elts_per_blk_q > 0
+            or sage_attn_num_elts_per_blk_k > 0
+            or sage_attn_num_elts_per_blk_v > 0
         )
 
         # TRTLLM expects flat [B*S, H*D] format
@@ -240,6 +255,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         For diffusion models, expects:
         - Fused QKV: q contains [Q, K, V] stacked, k and v are None
         - OR separate Q, K, V which will be fused internally
+        - When SageAttention is enabled (sage_attn_num_elts_per_blk_* set at init),
+          separate Q, K, V must be provided and will be passed as-is (not fused).
 
         Args:
             q: Fused QKV [B, S, 3, H, D] or Query [B, S, H, D]
@@ -254,18 +271,40 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         seq_len = q.shape[1]
         kv_seq_len = k.shape[1] if k is not None else seq_len
 
-        if k is None and v is None:
-            qkv = q.reshape(batch_size * seq_len, -1)
-        else:
-            qkv = self._concat_qkv(q, k, v, batch_size, seq_len, kv_seq_len)
         prepared_metadata = self._prepare_metadata(batch_size, seq_len)
-        output = super().forward(
-            q=qkv,
-            k=None,
-            v=None,
-            metadata=prepared_metadata,
-            attention_mask=attention_mask,
-        )
+
+        if self._use_sage_attn:
+            # SageAttention: pass separate Q, K, V (not fused) so the C++ kernel
+            # can quantize them independently per-block.
+            assert k is not None and v is not None, (
+                "SageAttention requires separate Q, K, V tensors"
+            )
+            q_flat = q.reshape(batch_size * seq_len, -1)
+            k_flat = k.reshape(batch_size * kv_seq_len, -1)
+            v_flat = v.reshape(batch_size * kv_seq_len, -1)
+            output = super().forward(
+                q=q_flat,
+                k=k_flat,
+                v=v_flat,
+                metadata=prepared_metadata,
+                attention_mask=attention_mask,
+                sage_attn_num_elts_per_blk_q=self.sage_attn_num_elts_per_blk_q,
+                sage_attn_num_elts_per_blk_k=self.sage_attn_num_elts_per_blk_k,
+                sage_attn_num_elts_per_blk_v=self.sage_attn_num_elts_per_blk_v,
+                sage_attn_qk_int8=self.sage_attn_qk_int8,
+            )
+        else:
+            if k is None and v is None:
+                qkv = q.reshape(batch_size * seq_len, -1)
+            else:
+                qkv = self._concat_qkv(q, k, v, batch_size, seq_len, kv_seq_len)
+            output = super().forward(
+                q=qkv,
+                k=None,
+                v=None,
+                metadata=prepared_metadata,
+                attention_mask=attention_mask,
+            )
         output = output.view(batch_size, seq_len, -1)
         return output
 
@@ -274,6 +313,5 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         """Return the preferred tensor layout for this backend."""
         return self._preferred_layout
 
-    @classmethod
-    def support_fused_qkv(cls) -> bool:
-        return True
+    def support_fused_qkv(self) -> bool:
+        return not self._use_sage_attn

@@ -99,11 +99,95 @@ REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000"
 // GPU types that don't support dynamic driver flashing
 REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x"]
 
+// Infrastructure failure patterns that warrant automatic Slurm job retry.
+// Matched case-insensitively against exception toString() messages (including cause chain).
+SLURM_INFRA_FAILURE_PATTERNS = [
+    // Jenkins remoting channel failures
+    "channel is closing down or has closed down",
+    "ChannelClosedException",
+    "ClosedChannelException",
+    "RequestAbortedException",
+    "Connection was broken",
+    "marked offline",
+    // Jenkins agent startup failures (durable-task plugin)
+    "process apparently never started",
+    "wrapper script does not seem to be touching the log file",
+    // Slurm job externally killed (from SlurmConfig.checkJobStatus)
+    "job is no longer active",
+    // Network/SSH failures (also in SLURM_INFRA_SINGLE_RETRY_PATTERNS for retry cap)
+    "No route to host",
+    "Permission denied, please try again",
+    // K8s pod eviction (matches "Reason: Evicted" from kubelet message)
+    "Reason: Evicted",
+]
+
+// Patterns that should retry at most once (not the full SLURM_INFRA_RETRY_MAX).
+// These may indicate persistent problems where multiple retries waste resources.
+// NOTE: Entries here must also appear in SLURM_INFRA_FAILURE_PATTERNS to be
+// detected as infrastructure failures in the first place.
+SLURM_INFRA_SINGLE_RETRY_PATTERNS = [
+    "CANCELLED",
+    "DUE TO TIME LIMIT",
+    "Permission denied, please try again",
+]
+
+// Maximum number of retries for infrastructure failures (total attempts = SLURM_INFRA_RETRY_MAX + 1)
+SLURM_INFRA_RETRY_MAX = 2
+
 // ENABLE_NGC_DEVEL_IMAGE_TEST is currently disabled in the Jenkins BuildDockerImageSanityTest job config
 ENABLE_NGC_DEVEL_IMAGE_TEST = params.enableNgcDevelImageTest ?: false
 ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
 COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
+
+/**
+ * Checks if an exception represents a transient infrastructure failure
+ * that warrants retrying the Slurm job.
+ *
+ * Walks the exception cause chain to catch wrapped exceptions (e.g.,
+ * AbortException wrapping ChannelClosedException).
+ *
+ * @param ex The caught exception
+ * @return A map with keys:
+ *   - isInfraFailure (boolean): true if this is a retryable infra failure
+ *   - isSingleRetryOnly (boolean): true if this pattern should only retry once
+ *   - matchedPattern (String): the pattern that matched, for logging
+ */
+def classifyInfraFailure(Exception ex) {
+    def result = [isInfraFailure: false, isSingleRetryOnly: false, matchedPattern: ""]
+
+    // Build the full exception text by walking the cause chain
+    def exceptionText = ""
+    def current = ex
+    while (current != null) {
+        exceptionText += " " + current.toString()
+        current = current.cause
+    }
+    def lowerText = exceptionText.toLowerCase()
+
+    // Check against infrastructure failure patterns
+    for (pattern in SLURM_INFRA_FAILURE_PATTERNS) {
+        if (lowerText.contains(pattern.toLowerCase())) {
+            result.isInfraFailure = true
+            result.matchedPattern = pattern
+            break
+        }
+    }
+
+    if (!result.isInfraFailure) {
+        return result
+    }
+
+    // Check if this is a single-retry-only pattern
+    for (pattern in SLURM_INFRA_SINGLE_RETRY_PATTERNS) {
+        if (lowerText.contains(pattern.toLowerCase())) {
+            result.isSingleRetryOnly = true
+            break
+        }
+    }
+
+    return result
+}
 
 def scpFromRemoteCmd(Map remote, String remotePath, String localPath) {
     String portOpt = remote.port ? "-P ${remote.port} " : ""
@@ -113,7 +197,10 @@ def scpFromRemoteCmd(Map remote, String remotePath, String localPath) {
     return "sshpass -p '${remote.passwd}' scp ${portOpt}-r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${remotePath} ${localPath}"
 }
 
-def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, Boolean stageIsInterrupted) {
+// `postTag` uniquifies the uploaded tar filename, the Artifactory guard key and
+// the locally-staged result XMLs when the same stageName is uploaded more than
+// once in a build (e.g. SLURM infra-failure retries). First attempt passes "".
+def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, Boolean stageIsInterrupted, String postTag="") {
     CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
         def hasTimeoutTest = false
         def downloadResultSucceed = false
@@ -179,12 +266,29 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
 
             echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}, downloadPerfResultSucceed: ${downloadPerfResultSucceed}"
             if (hasTimeoutTest || downloadResultSucceed || downloadPerfResultSucceed || slurmLogFiles) {
+                // On retry attempts, rename freshly-downloaded result XMLs so that
+                // (a) the tar for this attempt is distinguishable from prior attempts
+                //     already uploaded to Artifactory, and
+                // (b) the junit() glob below picks up this attempt's results as a
+                //     separate set, keeping earlier attempts' test data visible in
+                //     the Jenkins build report rather than overwriting it.
+                if (postTag) {
+                    sh """
+                        cd ${stageName}
+                        for f in results*.xml; do
+                            [ -f "\$f" ] || continue
+                            case "\$f" in *${postTag}.xml) continue ;; esac
+                            name=\"\${f%.xml}\"
+                            mv \"\$f\" \"\${name}${postTag}.xml\" || true
+                        done
+                    """
+                }
                 sh "ls -al ${stageName}/"
                 echo "Upload test results."
-                sh "tar -czvf results-${stageName}.tar.gz ${stageName}/"
-                ensureStageResultNotUploaded(stageName)
+                sh "tar -czvf results-${stageName}${postTag}.tar.gz ${stageName}/"
+                ensureStageResultNotUploaded("${stageName}${postTag}")
                 trtllm_utils.uploadArtifacts(
-                    "results-${stageName}.tar.gz",
+                    "results-${stageName}${postTag}.tar.gz",
                     "${UPLOAD_PATH}/test-results/"
                 )
             } else {
@@ -537,7 +641,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
     }
 }
 
-def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312")
+def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312", String postTag="")
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -704,7 +808,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         } else {
             throw new Exception("Unsupported container runtime: ${cluster.containerRuntime}")
         }
-        executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
+        executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag)
     } finally {
         stage("Clean Up Slurm Resource") {
             // Workaround to handle the interruption during clean up SLURM resources
@@ -719,7 +823,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
     }
 }
 
-def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner)
+def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner, String postTag="")
 {
     runner {
         // TODO: refactor the finallyRunner to reuse within slurm or nonslurm job.
@@ -746,7 +850,7 @@ def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             // Copy CPP test result
             sh "cp ${llmSrc}/cpp/build_backup/*.xml ${stageName} || true"
             sh "ls -al ${stageName}/"
-        })
+        }, false, postTag)
     }
 }
 // End of Methods to run Slurm job with Jenkins Agent
@@ -883,7 +987,7 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
     return mounts
 }
 
-def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312")
+def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312", String postTag="")
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -1362,7 +1466,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         stageIsInterrupted = true
         throw e
     } finally {
-        uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted)
+        uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted, postTag)
         stage("Clean Up Slurm Resource") {
             // Workaround to handle the interruption during clean up SLURM resources
             retry(3) {
@@ -1379,10 +1483,69 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312")
 {
   echo "Run Slurm job with native sbatch: $runWithSbatch"
-  if (nodeCount > 1 || runWithSbatch) {
-    runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver)
-  } else {
-    runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver)
+
+  def attempt = 0
+
+  while (true) {
+    attempt++
+    try {
+      if (attempt > 1) {
+        echo "[INFRA-RETRY] ${stageName}: Starting attempt ${attempt} of ${SLURM_INFRA_RETRY_MAX + 1}"
+      }
+
+      // Each attempt uploads its own test-result artifact under a unique name so
+      // the attempt-1 tar (already in Artifactory from its finally block) is not
+      // clobbered and the ensureStageResultNotUploaded guard does not trip on
+      // the retry. First attempt keeps the canonical unsuffixed name so existing
+      // downstream consumers (dashboards, the JIRA bot, etc.) are unaffected.
+      def postTag = (attempt == 1) ? "" : "-attempt-${attempt}"
+
+      if (nodeCount > 1 || runWithSbatch) {
+        runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver, postTag)
+      } else {
+        runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver, postTag)
+      }
+
+      // Job succeeded
+      if (attempt > 1) {
+        echo "[INFRA-RETRY] ${stageName}: Succeeded on attempt ${attempt}"
+      }
+      return
+
+    } catch (InterruptedException e) {
+      // User abort / pipeline timeout -- never retry
+      throw e
+    } catch (Exception e) {
+      // FlowInterruptedException may not extend InterruptedException in all Jenkins versions
+      if (e.toString().contains("FlowInterruptedException") ||
+          e.toString().contains("AbortException: script returned exit code 143")) {
+        throw e
+      }
+
+      // Check if this is a retryable infrastructure failure
+      def classification = classifyInfraFailure(e)
+
+      if (!classification.isInfraFailure) {
+        // Not an infrastructure failure (test failure, compilation error, etc.)
+        throw e
+      }
+
+      // Determine effective max retries for this pattern
+      def effectiveMax = classification.isSingleRetryOnly ? 1 : SLURM_INFRA_RETRY_MAX
+
+      if (attempt > effectiveMax) {
+        echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${classification.matchedPattern}) " +
+             "but max retries (${effectiveMax}) exhausted after ${attempt} attempts. Failing."
+        throw e
+      }
+
+      echo "[INFRA-RETRY] ${stageName}: Infrastructure failure detected on attempt ${attempt}: " +
+           "${classification.matchedPattern}"
+      echo "[INFRA-RETRY] ${stageName}: Exception: ${e.toString()}"
+      echo "[INFRA-RETRY] ${stageName}: Will retry (attempt ${attempt + 1} of ${effectiveMax + 1}) after 60s cooldown."
+
+      sleep(60)
+    }
   }
 }
 
@@ -1396,6 +1559,23 @@ def trimForStageList(stageNameList)
         trimedList.add(stageName.trim().replaceAll('\\\\', ''))
     }
     return trimedList
+}
+
+// Check if a stage key matches a pattern.
+// Supports exact match and wildcard '*' for glob-style matching.
+// Uses Pattern.quote() to safely handle special characters in stage names.
+// Examples: "A10-PyTorch-1" (exact), "*PerfSanity*" (contains), "A10-*" (prefix).
+def stageMatchesPattern(String key, String pattern) {
+    if (!pattern.contains('*')) {
+        return key == pattern
+    }
+    def regex = '^' + pattern.split('\\*', -1).collect { java.util.regex.Pattern.quote(it) }.join('.*') + '$'
+    return key ==~ regex
+}
+
+// Check if a stage key matches any pattern in the list.
+def stageMatchesAnyPattern(String key, List patterns) {
+    return patterns.any { pattern -> stageMatchesPattern(key, pattern) }
 }
 
 // Test filter flags
@@ -3042,10 +3222,18 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false, cp
 
 def checkStageNameSet(stageNames, jobKeys, paramName) {
     echo "Validate stage names for the passed GitLab bot params [${paramName}]."
-    invalidStageName = stageNames.findAll { !(it in jobKeys) }
-    if (invalidStageName) {
+    def unmatchedNames = stageNames.findAll { pattern ->
+        if (pattern.contains('*')) {
+            // Wildcard pattern: check that it matches at least one stage
+            !jobKeys.any { key -> stageMatchesPattern(key, pattern) }
+        } else {
+            // Exact name: check that it exists
+            !(pattern in jobKeys)
+        }
+    }
+    if (unmatchedNames) {
         def sortedJobKeys = jobKeys.sort()
-        throw new Exception("Cannot find the stage names [${invalidStageName}] from the passed params [${paramName}]. Available stage names (${sortedJobKeys.size()} total):\n${sortedJobKeys.collect { "    ${it}" }.join('\n')}")
+        throw new Exception("Cannot find the stage names [${unmatchedNames}] from the passed params [${paramName}]. Available stage names (${sortedJobKeys.size()} total):\n${sortedJobKeys.collect { "    ${it}" }.join('\n')}")
     }
 }
 
@@ -3222,6 +3410,7 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H200-4_GPUs-Triton-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
         "DGX_H200-8_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
         "DGX_H200-4_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
+        "DGX_H200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200_perf_sanity", 1, 1, 8],
         // "DGX_H200-4_GPUs-TensorRT-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 3, 4],
         // "DGX_H200-4_GPUs-TensorRT-Post-Merge-2": ["dgx-h200-x4", "l0_dgx_h200", 2, 3, 4],
         // "DGX_H200-4_GPUs-TensorRT-Post-Merge-3": ["dgx-h200-x4", "l0_dgx_h200", 3, 3, 4],
@@ -3810,17 +3999,17 @@ def launchTestJobs(pipeline, testFilter)
         }
     }
 
-    // Check --stage-list, only run the stages in stage-list.
+    // Check --stage-list, only run the stages in stage-list. Supports wildcard '*'.
     if (testFilter[TEST_STAGE_LIST] != null) {
         echo "Use TEST_STAGE_LIST for filtering. Stages: ${testFilter[(TEST_STAGE_LIST)]}."
-        parallelJobsFiltered = parallelJobs.findAll {it.key in testFilter[(TEST_STAGE_LIST)]}
+        parallelJobsFiltered = parallelJobs.findAll { stageMatchesAnyPattern(it.key, testFilter[(TEST_STAGE_LIST)]) }
         println parallelJobsFiltered.keySet()
     }
 
-    // Check --extra-stage, add the stages in extra-stage.
+    // Check --extra-stage, add the stages in extra-stage. Supports wildcard '*'.
     if (testFilter[EXTRA_STAGE_LIST] != null) {
         echo "Use EXTRA_STAGE_LIST for filtering. Stages: ${testFilter[(EXTRA_STAGE_LIST)]}."
-        parallelJobsFiltered += parallelJobs.findAll {it.key in testFilter[(EXTRA_STAGE_LIST)]}
+        parallelJobsFiltered += parallelJobs.findAll { stageMatchesAnyPattern(it.key, testFilter[(EXTRA_STAGE_LIST)]) }
         println parallelJobsFiltered.keySet()
     }
 
