@@ -783,7 +783,9 @@ def find_mm_token_lengths(
                     image=item, )
                 modality_token_lengths.append(num_tokens)
             elif modality == "video":
+                video_metadata = None
                 if isinstance(item, tensorrt_llm.inputs.utils.VideoData):
+                    video_metadata = item.metadata
                     item = item.frames
                 assert isinstance(item, list), "Video must be a list of frames"
                 call_kwargs = {"video": item}
@@ -796,7 +798,13 @@ def find_mm_token_lengths(
                     call_kwargs["video_grid_thw"] = video_grid_thw_for_items[
                         idx]
                 num_tokens = input_processor.get_num_tokens_per_video(
+<<<<<<< HEAD
                     **call_kwargs)
+=======
+                    video=item,
+                    video_metadata=video_metadata,
+                )
+>>>>>>> cfc5f09533 (Support extracting audio from video)
                 modality_token_lengths.append(num_tokens)
             elif modality == "audio":
                 num_tokens = input_processor.get_num_tokens_per_audio(

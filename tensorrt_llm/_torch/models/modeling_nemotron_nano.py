@@ -1148,6 +1148,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         *,
         video: List[Union[Image.Image, torch.Tensor]],
         video_pruning_rate: Optional[float] = None,
+        video_metadata: Optional[dict] = None,
         **kwargs,
     ):
         # Use VIDEO_PRUNING_RATIO if not explicitly provided
@@ -1184,6 +1185,25 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         else:
             # No pruning: tokens_per_unit * num_tubelets + special tokens.
             num_total_tokens = num_tubelets * (tokens_per_unit + num_special_tokens_per_frame)
+
+        # If audio was extracted from this video, the prompt carries
+        # <so_start><so_embedding>*M<so_end> appended after the video frames
+        # (see _expand_video_placeholders_in_token_ids and the slow-path
+        # _extract_audio_from_video). Account for those tokens so
+        # total_mm_tokens_in_request matches the actual mm-token count in the
+        # tokenized prompt and len(mm_embed) at forward time.
+        if (
+            isinstance(video_metadata, dict)
+            and "audio_samples" in video_metadata
+            and self._audio_extractor is not None
+        ):
+            num_total_tokens += self.get_num_tokens_per_audio(
+                audio=(
+                    video_metadata["audio_samples"],
+                    video_metadata["audio_sample_rate"],
+                )
+            )
+
         return num_total_tokens
 
     # ------------------------------------------------------------------
@@ -1564,6 +1584,37 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                     evs_expansion.extend(self._img_start_token_ids)
                     evs_expansion.append(self.video_context_token_id)
                     evs_expansion.extend(self._img_end_token_ids)
+
+            # If audio was extracted from this video, append <so_start><so_embedding>*M<so_end>
+            # so the prompt has placeholder slots for audio embeddings produced by
+            # _interleave_video_audio_embeddings at forward time. Reuse
+            # get_num_tokens_per_audio (which returns M + 2) and derive M; this keeps
+            # the count consistent with get_num_tokens_per_video's accounting and avoids
+            # an unnecessary librosa.resample (we only need the resampled length, not
+            # the resampled samples themselves).
+            # Audio is NOT pruned by EVS, so both streams need identical audio slots.
+            if (
+                isinstance(metadata, dict)
+                and "audio_samples" in metadata
+                and self._audio_extractor is not None
+            ):
+                num_audio_context = (
+                    self.get_num_tokens_per_audio(
+                        audio=(
+                            metadata["audio_samples"],
+                            metadata["audio_sample_rate"],
+                        )
+                    )
+                    - 2
+                )
+                audio_ids = (
+                    [self._sound_start_token_id]
+                    + [self._sound_context_token_id] * num_audio_context
+                    + [self._sound_end_token_id]
+                )
+                expansion.extend(audio_ids)
+                if evs_expansion is not None:
+                    evs_expansion.extend(audio_ids)
 
             video_expansions.append(expansion)
             if video_evs_expansions is not None and evs_expansion is not None:
