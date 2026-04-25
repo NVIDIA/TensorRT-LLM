@@ -398,14 +398,6 @@ class OpenAIServer(_VideoRoutesMixin):
             elif self.model_config.model_type == "deepseek_v32":
                 self.tool_call_id_type = "deepseek_v32"
 
-    def _logit_bias_vocab_size(self) -> int:
-        for config in (self.model_config,
-                       getattr(self.model_config, "text_config", None)):
-            vocab_size = getattr(config, "vocab_size", None)
-            if vocab_size is not None:
-                return int(vocab_size)
-        return int(self.tokenizer.tokenizer.vocab_size)
-
         if self.generator.args.return_perf_metrics:
             set_prometheus_multiproc_dir()
             args = self.generator.args
@@ -435,6 +427,14 @@ class OpenAIServer(_VideoRoutesMixin):
             if max_perf_metrics > 0:
                 self.perf_metrics = deque(maxlen=max_perf_metrics)
                 self.perf_metrics_lock = asyncio.Lock()
+
+    def _logit_bias_vocab_size(self) -> int:
+        for config in (self.model_config,
+                       getattr(self.model_config, "text_config", None)):
+            vocab_size = getattr(config, "vocab_size", None)
+            if vocab_size is not None:
+                return int(vocab_size)
+        return int(self.tokenizer.tokenizer.vocab_size)
 
     def _log_config_info_metrics(self) -> None:
         """Extract configuration from generator args and log as Prometheus info gauges."""
