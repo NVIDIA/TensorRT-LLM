@@ -361,6 +361,9 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     async def _on_worker_event(self, worker_info: WorkerInfo, event_type: WatchEventType):
         router_map = {ServerRole.CONTEXT: self._ctx_router, ServerRole.GENERATION: self._gen_router}
+        if not worker_info.host or not worker_info.port:
+            logger.warning(f"Ignore invalid worker event: {worker_info.worker_id}")
+            return
         worker_addr = f"{worker_info.host}:{worker_info.port}"
         try:
             router = router_map[worker_info.role]

@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 import json
 import os
 import random
@@ -20,6 +21,32 @@ class WorkerInfo:
     host: str = ""
     port: int = 0
     role: ServerRole = ServerRole.CONTEXT
+
+
+def validate_worker_endpoint(host: str, port: int) -> int:
+    if not isinstance(host, str) or not host:
+        raise ValueError("worker host must be a non-empty string")
+    if any(char in host for char in ":/\\?#@") or any(char.isspace()
+                                                      for char in host):
+        raise ValueError("worker host must not include URL components")
+    try:
+        port = int(port)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("worker port must be an integer") from exc
+    if port < 1 or port > 65535:
+        raise ValueError("worker port must be in [1, 65535]")
+    if host == "localhost":
+        return port
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError as exc:
+        raise ValueError(
+            "worker host must be an IP literal or localhost") from exc
+    if ip.is_link_local or ip.is_multicast or ip.is_reserved:
+        raise ValueError(f"worker host is not allowed: {host}")
+    if not (ip.is_private or ip.is_loopback or ip.is_unspecified):
+        raise ValueError("worker host must be local or private")
+    return port
 
 
 def get_worker_key_prefix(cluster_name: str) -> str:
@@ -224,6 +251,8 @@ class DisaggClusterManager:
             try:
                 worker_info = WorkerInfo(**json.loads(event.storage_item.value))
                 worker_info.role = ServerRole(worker_info.role)
+                worker_info.port = validate_worker_endpoint(
+                    worker_info.host, worker_info.port)
                 workers = self._get_workers(worker_info.role)
                 workers[event.storage_item.key] = worker_info
 

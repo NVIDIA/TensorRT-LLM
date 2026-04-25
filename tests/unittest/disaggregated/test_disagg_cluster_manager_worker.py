@@ -13,12 +13,27 @@ from tensorrt_llm.serve.cluster_storage import (WatchEventType,
                                                 create_cluster_storage,
                                                 create_cluster_storage_client)
 from tensorrt_llm.serve.disagg_auto_scaling import (DisaggClusterManager,
-                                                    DisaggClusterWorker)
+                                                    DisaggClusterWorker,
+                                                    validate_worker_endpoint)
 
 INACTIVE_TIMEOUT = 4
 HEARTBEAT_INTERVAL = 2
 
 storage_types = ["http", "etcd"]
+
+
+def test_validate_worker_endpoint_rejects_untrusted_hosts():
+    for host in ("169.254.169.254",
+                 "169.254.169.254/latest/dynamic/instance-identity/document#",
+                 "worker.local/path", "worker.local?x=1",
+                 "worker.local#fragment", "attacker.example.com"):
+        with pytest.raises(ValueError):
+            validate_worker_endpoint(host, 8000)
+
+
+def test_validate_worker_endpoint_accepts_local_private_worker():
+    assert validate_worker_endpoint("127.0.0.1", "8001") == 8001
+    assert validate_worker_endpoint("10.1.2.3", 8002) == 8002
 
 
 def get_uri(storage_type):
