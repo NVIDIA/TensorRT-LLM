@@ -10,16 +10,24 @@ ______________________________________________________________________
 
 ## Install
 
-We don't publish wheels yet. Install with [uv](https://docs.astral.sh/uv/) directly from the latest commit using the `pip install git+…` convention:
+Install with [uv](https://docs.astral.sh/uv/) directly from the latest commit:
 
 ```bash
-uv pip install "git+<this-repo-url>.git"
+# https
+uv pip install "git+https://github.com/NVIDIA/llm-compiler.git"
+
+# ssh
+uv pip install "git+ssh://git@github.com/NVIDIA/llm-compiler.git"
 ```
 
-For development, clone this repo and do an editable install:
+For development, clone the repo and do an editable install:
 
 ```bash
-git clone <this-repo-url>.git
+# https
+git clone https://github.com/NVIDIA/llm-compiler.git
+# or ssh
+git clone git@github.com:NVIDIA/llm-compiler.git
+
 cd llm-compiler
 uv venv .venv --python 3.12
 source .venv/bin/activate
