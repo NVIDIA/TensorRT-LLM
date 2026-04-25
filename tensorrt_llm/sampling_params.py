@@ -138,7 +138,8 @@ class SamplingParams:
     Args:
         end_id (int, optional): The end token id. Defaults to None.
         pad_id (int, optional): The pad token id. Defaults to None.
-        max_tokens (int): The maximum number of tokens to generate. Defaults to 32.
+        max_tokens (int, optional): The maximum number of tokens to generate. If unset, LLMAPI deduces the largest value that
+            fits the model context window. Defaults to None.
         bad (str, List[str], optional): A string or a list of strings that redirect the generation when they are generated, so that the bad strings are excluded from the returned output. Defaults to None.
         bad_token_ids (List[int], optional): A list of token ids that redirect the generation when they are generated, so that the bad ids are excluded from the returned output. Defaults to None.
         stop (str, List[str], optional): A string or a list of strings that stop the generation when they are generated. The returned output will not contain the stop strings unless include_stop_str_in_output is True. Defaults to None.
@@ -219,7 +220,7 @@ class SamplingParams:
 
     end_id: Optional[int] = None
     pad_id: Optional[int] = None
-    max_tokens: int = 32
+    max_tokens: Optional[int] = None
     bad: Optional[Union[str, List[str]]] = None
     bad_token_ids: Optional[List[int]] = None
     _bad_word_ids: Optional[List[List[int]]] = field(default=None, init=False, repr=False)
