@@ -54,11 +54,16 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput, cached_file
 
-from tensorrt_llm.inputs.content_format import ContentFormat
-from tensorrt_llm.inputs.registry import (
-    MULTIMODAL_PLACEHOLDER_REGISTRY,
-    MultimodalPlaceholderMetadata,
-)
+try:
+    from tensorrt_llm.inputs.content_format import ContentFormat
+    from tensorrt_llm.inputs.registry import (
+        MULTIMODAL_PLACEHOLDER_REGISTRY,
+        MultimodalPlaceholderMetadata,
+    )
+except ModuleNotFoundError:
+    ContentFormat = None
+    MULTIMODAL_PLACEHOLDER_REGISTRY = None
+    MultimodalPlaceholderMetadata = None
 
 from ..._compat import ActivationType
 from ...custom_ops.semantic_mask_registry import SemanticMaskLoweringSpec, SemanticMaskRegistry
@@ -2742,10 +2747,11 @@ AutoModelForCausalLMFactory.register_custom_model_cls("Gemma4TextConfig", Gemma4
 Gemma4ForConditionalGenerationFactory.register_custom_model_cls(
     "Gemma4Config", Gemma4ForConditionalGeneration
 )
-MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
-    "gemma4",
-    MultimodalPlaceholderMetadata(
-        placeholder_map={"image": "<|image|>"},
-        content_format=ContentFormat.STRING,
-    ),
-)
+if MULTIMODAL_PLACEHOLDER_REGISTRY is not None:
+    MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
+        "gemma4",
+        MultimodalPlaceholderMetadata(
+            placeholder_map={"image": "<|image|>"},
+            content_format=ContentFormat.STRING,
+        ),
+    )
