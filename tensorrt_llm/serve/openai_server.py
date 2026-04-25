@@ -398,6 +398,14 @@ class OpenAIServer(_VideoRoutesMixin):
             elif self.model_config.model_type == "deepseek_v32":
                 self.tool_call_id_type = "deepseek_v32"
 
+    def _logit_bias_vocab_size(self) -> int:
+        for config in (self.model_config,
+                       getattr(self.model_config, "text_config", None)):
+            vocab_size = getattr(config, "vocab_size", None)
+            if vocab_size is not None:
+                return int(vocab_size)
+        return int(self.tokenizer.tokenizer.vocab_size)
+
         if self.generator.args.return_perf_metrics:
             set_prometheus_multiproc_dir()
             args = self.generator.args
@@ -1124,13 +1132,13 @@ class OpenAIServer(_VideoRoutesMixin):
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
             ]
-            # Pass the tokenizer vocabulary size so ``logit_bias`` can be
+            # Pass the model vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
             vocab_size = getattr(self.tokenizer.tokenizer,
                                  "vocab_size", None) or getattr(
                                      self.tokenizer, "vocab_size", None)
             sampling_params = request.to_sampling_params(
-                vocab_size=vocab_size,
+                vocab_size=self._logit_bias_vocab_size(),
                 gather_generation_logits=self.generator.args.
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
@@ -1473,10 +1481,10 @@ class OpenAIServer(_VideoRoutesMixin):
 
             promises: List[RequestOutput] = []
             postproc_params_collection: List[Optional[PostprocParams]] = []
-            # Pass the tokenizer vocabulary size so ``logit_bias`` can be
+            # Pass the model vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
             sampling_params = request.to_sampling_params(
-                vocab_size=self._vocab_size,
+                vocab_size=self._logit_bias_vocab_size(),
                 gather_generation_logits=self.generator.args.
                 gather_generation_logits,
                 backend=self.generator.args.backend)
@@ -1610,7 +1618,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 request.stop_token_ids = harmony_stop_tokens
 
             sampling_params = request.to_sampling_params(
-                vocab_size=self._vocab_size, reasoning_parser="gpt_oss")
+                vocab_size=self._logit_bias_vocab_size(),
+                reasoning_parser="gpt_oss")
             sampling_params.detokenize = False  # Harmony adapter handles detokenization
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
