@@ -51,7 +51,9 @@ from ...pyexecutor.dwdp import get_global_dwdp_manager
 from ...utils import (ActivationType, AuxStreamType, Fp4QuantizedTensor,
                       get_model_extra_attrs, is_gated_activation,
                       is_torch_compiling)
-from .routing import BaseMoeRoutingMethod
+from .routing import (BaseMoeRoutingMethod, RoutingMethodType,
+                      get_cached_perfect_router_logits,
+                      precompute_common_perfect_router_logits)
 
 
 class MoEWeightLoadingMode(Enum):
@@ -309,6 +311,7 @@ class MoE(nn.Module):
 
         # Override expert layout if DWDP is enabled
         self._init_dwdp_expert_layout()
+        self._init_perfect_router()
 
     def _init_dwdp_expert_layout(self):
         """Override expert layout when DWDP is enabled."""
@@ -330,6 +333,43 @@ class MoE(nn.Module):
         self.slot_end = self.slot_start + self.expert_size_per_partition
         self.initial_local_expert_ids = list(
             range(self.slot_start, self.slot_end))
+
+    def _get_perfect_router_dtype(self) -> torch.dtype:
+        if self.routing_method.routing_method_type in (
+                RoutingMethodType.DeepSeekV3, RoutingMethodType.MiniMax2):
+            return torch.float32
+        return self.dtype if self.dtype is not None else torch.float32
+
+    def _init_perfect_router(self):
+        self._enable_perfect_router = os.environ.get("ENABLE_PERFECT_ROUTER",
+                                                     "0") == "1"
+        if not self._enable_perfect_router:
+            return
+
+        precompute_common_perfect_router_logits(
+            num_experts=self.num_experts,
+            experts_per_token=self.routing_method.experts_per_token,
+            moe_ep_size=self.ep_size,
+            dtype=self._get_perfect_router_dtype(),
+            routing_method=self.routing_method,
+            ep_rank=self.ep_rank)
+
+    def _maybe_get_perfect_router_logits(
+            self,
+            router_logits: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if router_logits is None or not self._enable_perfect_router:
+            return router_logits
+
+        num_tokens, num_experts = router_logits.shape
+        return get_cached_perfect_router_logits(
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            experts_per_token=self.routing_method.experts_per_token,
+            moe_ep_size=self.ep_size,
+            ep_rank=self.ep_rank,
+            device=router_logits.device,
+            dtype=router_logits.dtype,
+            routing_method=self.routing_method)
 
     def _init_load_balancer(
         self,
@@ -768,6 +808,7 @@ class MoE(nn.Module):
         use_dp_padding: Optional[bool] = None,
         **kwargs,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        router_logits = self._maybe_get_perfect_router_logits(router_logits)
         if self.register_to_config and is_torch_compiling():
             hidden_states = x.fp4_tensor if isinstance(
                 x, Fp4QuantizedTensor) else x

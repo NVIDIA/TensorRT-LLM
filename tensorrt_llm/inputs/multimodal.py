@@ -7,7 +7,6 @@ import numpy as np
 import PIL
 import torch
 from blake3 import blake3
-from torchvision.transforms import ToPILImage
 
 import tensorrt_llm
 from tensorrt_llm._utils import maybe_pin_memory
@@ -15,6 +14,25 @@ from tensorrt_llm.logger import logger
 
 # Default hasher
 default_hasher = blake3
+
+
+def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
+    """Clear `mm_data` in place, retaining only `mrope_config.mrope_position_deltas`.
+
+    Shared primitive behind `MultimodalParams.strip_for_generation` (which applies
+    it to a detached copy, preserving its caller's dict) and the post-prefill
+    release path in `py_executor` (which applies it directly to the shared
+    `request.py_multimodal_data` to actually free pinned encoder outputs).
+    """
+    if not mm_data:
+        return
+    mrope_config = mm_data.get('mrope_config')
+    mrope_deltas = None
+    if isinstance(mrope_config, dict):
+        mrope_deltas = mrope_config.get('mrope_position_deltas')
+    mm_data.clear()
+    if mrope_deltas is not None:
+        mm_data['mrope_config'] = {'mrope_position_deltas': mrope_deltas}
 
 
 @dataclass
@@ -536,21 +554,9 @@ class MultimodalParams:
         """
         if not self.multimodal_data:
             return
-
-        # Extract mrope_position_deltas before clearing
-        mrope_position_deltas = None
-        if 'mrope_config' in self.multimodal_data:
-            mrope_config = self.multimodal_data['mrope_config']
-            if isinstance(mrope_config,
-                          dict) and 'mrope_position_deltas' in mrope_config:
-                mrope_position_deltas = mrope_config['mrope_position_deltas']
-
-        # Clear all data and restore only position deltas if they exist
-        self.multimodal_data = {}
-        if mrope_position_deltas is not None:
-            self.multimodal_data['mrope_config'] = {
-                'mrope_position_deltas': mrope_position_deltas
-            }
+        # Detach from the caller's dict, then apply the in-place primitive.
+        self.multimodal_data = dict(self.multimodal_data)
+        strip_mm_data_for_generation(self.multimodal_data)
 
     def has_content(self) -> bool:
         """Check if this object contains any multimodal data."""
@@ -770,8 +776,6 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
         modality_token_lengths = []
         for item in items:
             if modality == "image":
-                if isinstance(item, torch.Tensor):
-                    item = ToPILImage()(item)
                 num_tokens = input_processor.get_num_tokens_per_image(
                     image=item, )
                 modality_token_lengths.append(num_tokens)
@@ -779,8 +783,6 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
                 if isinstance(item, tensorrt_llm.inputs.utils.VideoData):
                     item = item.frames
                 assert isinstance(item, list), "Video must be a list of frames"
-                if isinstance(item[0], torch.Tensor):
-                    item = [ToPILImage()(frame) for frame in item]
                 num_tokens = input_processor.get_num_tokens_per_video(
                     video=item, )
                 modality_token_lengths.append(num_tokens)

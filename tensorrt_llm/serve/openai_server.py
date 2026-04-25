@@ -939,6 +939,8 @@ class OpenAIServer:
         disaggregated_params: Optional[LlmDisaggregatedParams] = None
     ) -> ChatCompletionResponse:
         await promise.aresult()
+        if promise.error is not None:
+            raise RuntimeError(f"Generation failed: {promise.error}")
         if self.postproc_worker_enabled:
             chat_response = promise.outputs[0]._postprocess_result
         else:
@@ -1265,6 +1267,8 @@ class OpenAIServer:
                 postproc_params: Optional[PostprocParams]
         ) -> CompletionResponse:
             response = await promise
+            if response.error is not None:
+                raise RuntimeError(f"Generation failed: {response.error}")
             if not self.postproc_worker_enabled:
                 post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
                 pp_result = post_processor(response, args)

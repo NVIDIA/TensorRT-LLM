@@ -261,8 +261,7 @@ To get started with TensorRT-LLM, visit our documentation:
 
 - [Quick Start Guide](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
     - [Running DeepSeek](./examples/models/core/deepseek_v3)
-- [Installation Guide for Linux](https://nvidia.github.io/TensorRT-LLM/installation/linux.html)
-- [Installation Guide for Grace Hopper](https://nvidia.github.io/TensorRT-LLM/installation/grace-hopper.html)
+- [Installation Guide](https://nvidia.github.io/TensorRT-LLM/installation/installation-guide.html)
 - [Supported Hardware, Models, and other Software](https://nvidia.github.io/TensorRT-LLM/reference/support-matrix.html)
 - [Benchmarking Performance](https://nvidia.github.io/TensorRT-LLM/performance/performance-tuning-guide/benchmarking-default-performance.html#benchmarking-with-trtllm-bench)
 - [Release Notes](https://nvidia.github.io/TensorRT-LLM/release-notes.html)

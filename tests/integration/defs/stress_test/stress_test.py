@@ -923,6 +923,11 @@ def create_aiperf_command(model_name,
     Returns:
         List of command-line arguments for aiperf
     """
+    # --no-server-metrics: trtllm-serve exposes /metrics as a JSON
+    # iteration-stats endpoint (see openai_server.get_iteration_stats),
+    # not a Prometheus exposition. aiperf's ServerMetricsManager hangs
+    # scraping it, causing PROFILE_START to exceed the 60s
+    # AIPERF_SERVICE_PROFILE_START_TIMEOUT and the benchmark to abort.
     return [
         "aiperf",
         "profile",
@@ -934,6 +939,7 @@ def create_aiperf_command(model_name,
         "completions",
         "-u",
         server_url,
+        "--no-server-metrics",
         "--random-seed",
         "123",
         "--synthetic-input-tokens-mean",
