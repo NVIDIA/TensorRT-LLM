@@ -935,18 +935,7 @@ class FineGrainedFP8LinearQuantization(Quantization):
                 state_dict[mod_prefix + ".weight_scale_inv"] = state_dict[scale_inv_name]
 
     def post_load_hook(self, module, incompatible_keys, weight_name):
-        """Post-hook: Convert FP8 weight scales to UE8M0 format for DeepGEMM on Blackwell.
-
-        Mirrors the PyTorch backend's FineGrainedFP8LinearMethod.post_load_weights
-        (tensorrt_llm/_torch/modules/linear.py). Without this, fp8_swap_ab_gemm would
-        receive raw FP32 weight scales while activation scales are already UE8M0,
-        causing double-conversion and NaN output.
-
-        For TP-sharded projections whose shard size is not a multiple of 128
-        (e.g. kv_a_proj N=72, q_a_proj N=192 at TP=8), the scale was expanded
-        to per-row during sharding. These are re-quantized with proper 128x128
-        blocks to enable DeepGEMM instead of falling back to cuBLAS.
-        """
+        """Convert FP8 weight scales to UE8M0 format for DeepGEMM on Blackwell."""
         from tensorrt_llm._utils import is_sm_100f
 
         if not is_sm_100f():
@@ -977,10 +966,8 @@ class FineGrainedFP8LinearQuantization(Quantization):
         scale_n, scale_k = scale_param.shape[-2], scale_param.shape[-1]
         if scale_n == 0 or scale_k == 0:
             return
-        block_n = N // scale_n
-        block_k = K // scale_k
 
-        if K % 128 != 0:
+        if K % 128 != 0 or N < 128:
             return
 
         if resmooth_to_fp8_e8m0 is None or transform_sf_into_required_layout is None:
@@ -991,14 +978,15 @@ class FineGrainedFP8LinearQuantization(Quantization):
             )
 
         with torch.no_grad():
-            if block_n == 128 and block_k == 128:
-                weight_new, scale_new = resmooth_to_fp8_e8m0(
-                    weight_param.data, scale_param.data.float()
-                )
-            else:
-                weight_new, scale_new = _requantize_to_128x128_ue8m0(
-                    weight_param.data, scale_param.data, block_n, block_k
-                )
+            scale_data = scale_param.data.float()
+
+            expected_block_n = math.ceil(N / 128)
+            if scale_n > expected_block_n:
+                # TP sharding expanded block scales to per-row; reduce back
+                # to per-block by sampling one row per 128-row block.
+                scale_data = scale_data[..., ::128, :]
+
+            weight_new, scale_new = resmooth_to_fp8_e8m0(weight_param.data, scale_data)
 
             N, K = weight_new.shape[-2], weight_new.shape[-1]
             transformed_scale = transform_sf_into_required_layout(

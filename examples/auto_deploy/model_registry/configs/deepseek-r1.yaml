@@ -49,5 +49,5 @@ transforms:
   gather_logits_before_lm_head:
     enabled: true
   compile_model:
-    piecewise_enabled: true
+    piecewise_enabled: false
     piecewise_num_tokens: [256, 512, 1024, 2048, 3072, 4096, 5120, 6144, 8192]
