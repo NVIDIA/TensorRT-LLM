@@ -23,7 +23,8 @@ from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.commands.utils import get_is_diffusion_model
-from tensorrt_llm.executor.utils import LlmLauncherEnvs
+from tensorrt_llm.executor.utils import (LlmLauncherEnvs,
+                                         set_spawn_proxy_process_ipc_hmac_key)
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  DynamicBatchConfig, KvCacheConfig,
@@ -1340,11 +1341,13 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     # This mimics the behavior of trtllm-llmapi-launch
     # TODO: Make the port allocation atomic
     free_ipc_addr = find_free_ipc_addr()
+    ipc_hmac_key = secrets.token_hex(32)
     os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS] = "1"
     os.environ[
         LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR.value] = free_ipc_addr
     os.environ[LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY.
-               value] = secrets.token_hex(32)
+               value] = ipc_hmac_key
+    set_spawn_proxy_process_ipc_hmac_key(ipc_hmac_key)
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT.
                value] = "1"
     os.environ[DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX] = str(instance_idx)
@@ -1363,6 +1366,8 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
     assert LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY in non_mpi_env
     assert DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX in non_mpi_env
     assert DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT in non_mpi_env
+    os.environ.pop(LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY.value,
+                   None)
 
     # Two steps:
     # 1. Run the LLM-API Proxy in a separate process for streaming performance.
