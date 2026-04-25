@@ -118,11 +118,14 @@ else:
         replay_selective_state_update, selective_state_update, causal_conv1d_update = (
             _import_mamba_kernels_fast()
         )
-    except Exception as e:
-        print(f"WARNING: Fast import failed ({e}), falling back to full import...")
-        replay_selective_state_update, selective_state_update, causal_conv1d_update = (
-            _import_mamba_kernels_full()
+    except Exception as e:  # noqa: BLE001 - exit loudly; don't hide a fast-import regression
+        print(
+            f"ERROR: fast import failed ({type(e).__name__}: {e})\n"
+            "Re-run with --full-import for the slow but stable path, "
+            "then file a bug or fix _import_mamba_kernels_fast.",
+            file=sys.stderr,
         )
+        sys.exit(1)
 
 # Model config defaults (Nemotron-3-Super-120B full model).
 # --tp-size divides nheads and ngroups to get the per-GPU slice.
@@ -967,7 +970,9 @@ class _Tee:
     """Write to both stdout and a file simultaneously."""
 
     def __init__(self, path: str):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         self._file = open(path, "w")  # noqa: SIM115
         self._stdout = sys.stdout
 

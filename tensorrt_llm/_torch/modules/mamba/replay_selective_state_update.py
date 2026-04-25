@@ -956,7 +956,9 @@ def replay_selective_state_update(
         )
 
         # --- Main kernel ---
-        grid = lambda META: (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
+        def grid(META):
+            return (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
+
         _replay_state_update_kernel[grid](
             state,
             old_x,
