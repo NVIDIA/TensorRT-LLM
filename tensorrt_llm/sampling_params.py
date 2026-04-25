@@ -11,6 +11,8 @@ from strenum import StrEnum
 from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.logger import logger
 
+_MAX_TOP_LOGPROBS = 20
+
 
 @dataclass(slots=True, kw_only=True)
 class GuidedDecodingParams:
@@ -355,8 +357,12 @@ class SamplingParams:
             self.logprobs = 0
         if self.logprobs is not None and self.logprobs < 0:
             raise ValueError("logprobs must be positive, zero or None")
+        if self.logprobs is not None and self.logprobs > _MAX_TOP_LOGPROBS:
+            raise ValueError(f"logprobs must be less than or equal to {_MAX_TOP_LOGPROBS}")
         if self.prompt_logprobs is not None and self.prompt_logprobs < 0:
             raise ValueError("prompt_logprobs must be positive, zero or None")
+        if self.prompt_logprobs is not None and self.prompt_logprobs > _MAX_TOP_LOGPROBS:
+            raise ValueError(f"prompt_logprobs must be less than or equal to {_MAX_TOP_LOGPROBS}")
 
     # NB: Static, because downstream code only holds instances of
     #     bindings.SamplingConfig (not SamplingParams).

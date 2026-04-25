@@ -3370,6 +3370,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             (req.py_num_logprobs or 0 for req in requests),
             default=0,
         )
+        if self.batch_max_topk_logprobs > self.DEFAULT_MAX_TOPK_LOGPROBS:
+            raise ValueError(
+                f"logprobs must be less than or equal to {self.DEFAULT_MAX_TOPK_LOGPROBS}"
+            )
         if self.max_topk_logprobs < self.batch_max_topk_logprobs:
             self.max_topk_logprobs = self.batch_max_topk_logprobs
             self.TOPK_LOGPROBS_SHAPE = (
