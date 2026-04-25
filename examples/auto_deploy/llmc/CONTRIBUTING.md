@@ -1,8 +1,8 @@
-# Contributing to llmc
+# Contributing to llm-compiler
 
 ## Where to send PRs
 
-The `llmc` standalone package is **generated from the AutoDeploy source tree inside [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)**. The standalone repo (`nvidia-llmc` on PyPI / the mirror repo on GitHub) is **read-only** — it is overwritten on every release by [`create_standalone_package.py`](./create_standalone_package.py).
+The `llmc` standalone package is **generated from the AutoDeploy source tree inside [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM)**. The mirror repo on GitHub is **read-only** — it is overwritten on every release by [`create_standalone_package.py`](./create_standalone_package.py).
 
 **Do not open pull requests against the standalone `llmc` repo.** Any changes pushed there will be lost the next time the package is regenerated.
 

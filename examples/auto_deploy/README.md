@@ -143,15 +143,6 @@ llm = LLM(
 )
 ```
 
-In standalone mode, you can directly use the graph transformation and compilation pipeline:
-
-```python
-# Standalone
-from auto_deploy.export import torch_export_to_gm
-from auto_deploy.transform.interface import TransformRegistry
-from auto_deploy.models.factory import ModelFactoryRegistry
-```
-
 ### Expert Configuration of LLM API
 
 For expert TensorRT LLM users, we also expose the full set of [`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py)

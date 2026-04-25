@@ -1,6 +1,6 @@
-# 🔥🚀⚡ llmc
+# 🔥🚀⚡ LLM Compiler
 
-**llmc** is the standalone, lightweight distribution of the AutoDeploy graph-transformation pipeline. It exposes the same `ModelFactory` and `InferenceOptimizer` building blocks as TensorRT-LLM's AutoDeploy backend, but with a minimal dependency footprint (PyTorch + Triton + FlashInfer), so you can prototype optimization pipelines or run inference without a full TRT-LLM install.
+**LLM Compiler** (Python package: `llmc`) is the standalone, lightweight distribution of the AutoDeploy graph-transformation pipeline. It exposes the same `ModelFactory` and `InferenceOptimizer` building blocks as TensorRT-LLM's AutoDeploy backend, but with a minimal dependency footprint (PyTorch + Triton + FlashInfer), so you can prototype optimization pipelines or run inference without a full TRT-LLM install.
 
 The `llmc` package is **generated** from the AutoDeploy source tree inside the [TensorRT-LLM repo](https://github.com/NVIDIA/TensorRT-LLM). The standalone repo is **read-only** — see [`CONTRIBUTING.md`](./CONTRIBUTING.md) for how to land changes.
 
@@ -10,40 +10,20 @@ ______________________________________________________________________
 
 ## Install
 
-From PyPI (when published):
+We don't publish wheels yet. Install with [uv](https://docs.astral.sh/uv/) directly from the latest commit using the `pip install git+…` convention:
 
 ```bash
-pip install nvidia-llmc
+uv pip install "git+<this-repo-url>.git"
 ```
 
-The distribution name is `nvidia-llmc`; the importable Python package is `llmc`.
-
-### From source (recommended for development)
-
-Generate the standalone source tree from the TRT-LLM checkout:
+For development, clone this repo and do an editable install:
 
 ```bash
-# inside the TensorRT-LLM repo
-python examples/auto_deploy/llmc/create_standalone_package.py \
-    --output-dir /path/to/llmc_pkg
-```
-
-Then install with [uv](https://docs.astral.sh/uv/):
-
-```bash
-cd /path/to/llmc_pkg
+git clone <this-repo-url>.git
+cd llm-compiler
 uv venv .venv --python 3.12
 source .venv/bin/activate
-uv pip install -e '.[dev]'
-```
-
-Or with pip:
-
-```bash
-cd /path/to/llmc_pkg
-python -m venv .venv
-source .venv/bin/activate
-pip install -e '.[dev]'
+uv pip install -e ".[dev]"
 ```
 
 ### Sanity check
@@ -161,16 +141,3 @@ print(logits.shape)
 | Configuration data classes | `llmc/transform/interface.py`, `llmc/llm_args.py` |
 
 For higher-level usage, the `llmc.LLM` class (available when running inside TRT-LLM) wraps all of the above behind a familiar generate API. In pure-standalone mode use `InferenceOptimizer` directly as shown.
-
-______________________________________________________________________
-
-## Regenerating the standalone repo
-
-The standalone source tree is regenerated from TensorRT-LLM by running:
-
-```bash
-python examples/auto_deploy/llmc/create_standalone_package.py \
-    --output-dir /path/to/llmc_repo
-```
-
-The script overwrites only its managed paths (`llmc/`, `tests/`, `pyproject.toml`, `README.md`, `CONTRIBUTING.md`, `LICENSE`, `.gitignore`); existing `.git/`, `.github/`, and any other repo-specific files are preserved, so the resulting tree can be committed and pushed directly.

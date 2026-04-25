@@ -22,32 +22,33 @@ in-package import statements.
 import ast
 import pathlib
 import sys
-from typing import List, Tuple
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 AD_ROOT = REPO_ROOT / "tensorrt_llm" / "_torch" / "auto_deploy"
 AD_PKG = "tensorrt_llm._torch.auto_deploy"
 
 
-def _file_package_parts(path: pathlib.Path) -> List[str]:
+def _file_package_parts(path: pathlib.Path) -> list[str]:
     """Return the dotted package path of the directory containing *path*."""
     rel = path.resolve().relative_to(REPO_ROOT)
     parts = list(rel.parts[:-1])  # drop filename
     return parts
 
 
-def _check_file(path: pathlib.Path) -> List[Tuple[int, str]]:
+def _check_file(path: pathlib.Path) -> list[tuple[int, str]]:
     try:
         source = path.read_text()
     except (OSError, UnicodeDecodeError):
         return []
     try:
         tree = ast.parse(source, filename=str(path))
-    except SyntaxError:
-        return []
+    except SyntaxError as exc:
+        # Treat parse failures as violations rather than silently passing —
+        # a malformed file should never sneak through the discipline check.
+        return [(exc.lineno or 1, f"failed to parse file: {exc.msg}")]
 
     pkg_parts = _file_package_parts(path)
-    violations: List[Tuple[int, str]] = []
+    violations: list[tuple[int, str]] = []
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -101,14 +102,14 @@ def _check_file(path: pathlib.Path) -> List[Tuple[int, str]]:
     return violations
 
 
-def main(argv: List[str]) -> int:
+def main(argv: list[str]) -> int:
     if len(argv) > 1:
         targets = [pathlib.Path(p).resolve() for p in argv[1:]]
     else:
         targets = sorted(AD_ROOT.rglob("*.py"))
 
     ad_root_resolved = AD_ROOT.resolve()
-    failures: List[Tuple[pathlib.Path, int, str]] = []
+    failures: list[tuple[pathlib.Path, int, str]] = []
     for path in targets:
         try:
             path.resolve().relative_to(ad_root_resolved)
