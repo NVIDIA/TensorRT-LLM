@@ -58,6 +58,7 @@ class MnnvlMemory:
     allocation_granularity: int = 0
     fabric_page_size: int = 1 << 29  # 512 MB.
     dev_id: int = None
+    _allgather_failed: bool = False
 
     # Per-class state attributes. These will be auto-initialized for each subclass
     # to avoid polluting the parent class's state. Use callable (e.g., dict) for mutable defaults.
@@ -182,6 +183,9 @@ class MnnvlMemory:
 
     @classmethod
     def open_mnnvl_memory(cls, mapping: Mapping, size: int):
+        if MnnvlMemory._allgather_failed:
+            raise RuntimeError("MNNVL allgather previously failed, skipping retry")
+
         # Ensure MnnvlMemory is initialized (for dev_id and allocation_granularity)
         MnnvlMemory.initialize()
 
@@ -196,8 +200,18 @@ class MnnvlMemory:
         comm_rank = comm.Get_rank()
         comm_size = comm.Get_size()
         all_rank_allocate_sizes = comm.allgather(size)
-        assert len(all_rank_allocate_sizes) == comm_size
-        assert all(x == size for x in all_rank_allocate_sizes), "Not all rank allocating same size."
+        if len(all_rank_allocate_sizes) != comm_size:
+            MnnvlMemory._allgather_failed = True
+            raise RuntimeError(
+                f"MNNVL allgather returned {len(all_rank_allocate_sizes)} entries, "
+                f"expected {comm_size}."
+            )
+        if not all(x == size for x in all_rank_allocate_sizes):
+            MnnvlMemory._allgather_failed = True
+            raise RuntimeError(
+                f"Not all ranks allocating same MNNVL size: "
+                f"rank {comm_rank} expected {size}, got {all_rank_allocate_sizes}"
+            )
         granularity = MnnvlMemory.get_allocation_granularity(dev_id)
         aligned_size = (size + granularity - 1) // granularity * granularity
 
