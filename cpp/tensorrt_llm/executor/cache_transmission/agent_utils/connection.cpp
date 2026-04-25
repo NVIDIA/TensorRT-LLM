@@ -18,6 +18,7 @@
 #include "connection.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
+#include <limits>
 #include <random>
 #include <string>
 #include <unistd.h>
@@ -132,7 +133,16 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
     MemoryDescs srcDescs{MemoryType::kVRAM, {srcDesc}};
     auto const& dstBaseDesc = mSenderState.activeBufferDesc();
     auto const& offsetRatio = mSenderState.activeOffsetRatio();
-    auto offset = size / offsetRatio.second * offsetRatio.first;
+    TLLM_CHECK_WITH_INFO(offsetRatio.second != 0, "AgentConnection::send offset ratio denominator cannot be 0");
+    TLLM_CHECK_WITH_INFO(size <= dstBaseDesc.getLen(), "AgentConnection::send size exceeds destination buffer");
+    auto const chunkSize = size / offsetRatio.second;
+    TLLM_CHECK_WITH_INFO(
+        offsetRatio.first == 0 || chunkSize <= std::numeric_limits<size_t>::max() / offsetRatio.first,
+        "AgentConnection::send offset calculation overflow");
+    auto const offset = chunkSize * offsetRatio.first;
+    TLLM_CHECK_WITH_INFO(offset <= dstBaseDesc.getLen() - size, "AgentConnection::send destination out of bounds");
+    TLLM_CHECK_WITH_INFO(dstBaseDesc.getAddr() <= std::numeric_limits<uintptr_t>::max() - offset,
+        "AgentConnection::send destination address overflow");
     MemoryDesc dstDesc{dstBaseDesc.getAddr() + offset, size, dstBaseDesc.getDeviceId()};
     TLLM_LOG_DEBUG(
         "send dstDesc: %p, size: %ld ,validSegmentIdx: %ld", dstDesc.getAddr(), size, mSenderState.validSegmentIdx);
