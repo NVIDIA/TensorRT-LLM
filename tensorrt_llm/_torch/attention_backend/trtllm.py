@@ -12,7 +12,8 @@ if TYPE_CHECKING:
     from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm._torch.attention_backend import trtllm_gen
-from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
+from tensorrt_llm._utils import (get_sm_version, is_sm_100f, maybe_pin_memory,
+                                 prefer_pinned)
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
@@ -30,6 +31,8 @@ from .trtllm_gen import trtllm_gen_attention
 # Enable TRTLLM-Gen attention backend via environment variable (default: off).
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1")
+
+
 
 
 @functools.cache
@@ -1224,9 +1227,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> None:
         is_fused_qkv = not metadata.is_cross and k is None
         update_kv_cache = not metadata.is_cross or k is not None
-        assert (is_fused_qkv and k is None
-                and v is None) or (not is_fused_qkv and k is not None
-                                   and v is not None)
+        assert (is_fused_qkv and k is None and v is None) or (
+            not is_fused_qkv and k is not None
+            and v is not None) or (metadata.is_cross and not is_fused_qkv
+                                   and not update_kv_cache and k is None
+                                   and v is None)
 
         attention_input_type = forward_args.attention_input_type
         if not self.is_mla_enable:
@@ -1242,7 +1247,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                     assert k.shape[1] == kv_hidden_size
                     assert v.shape[1] == kv_hidden_size
             num_tokens = q.shape[0]
-            if k is not None:
+            if k is not None and not metadata.is_cross:
                 assert k.shape[0] == num_tokens
                 assert v.shape[0] == num_tokens
         else:
@@ -1345,10 +1350,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                  metadata.max_num_tokens)
 
         helix_active = metadata.helix_position_offsets is not None
+        encoder_seq_lens_arg = (metadata.kv_lens_cuda_runtime
+                                if metadata.is_cross else None)
+        prefer_trtllm_gen = _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION or metadata.is_cross
         use_sage_attn = (forward_args.sage_attn_num_elts_per_blk_q > 0
                          or forward_args.sage_attn_num_elts_per_blk_k > 0
                          or forward_args.sage_attn_num_elts_per_blk_v > 0)
-        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not helix_active and not use_sage_attn and trtllm_gen.is_supported(
+        if prefer_trtllm_gen and not helix_active and not use_sage_attn and trtllm_gen.is_supported(
                 q=q,
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
@@ -1364,12 +1372,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 beam_width=metadata.beam_width,
                 position_shift_enabled=False,
                 sink_token_length=0,
-                cross_attention=False,
+                cross_attention=metadata.is_cross,
                 is_spec_decoding=metadata.is_spec_decoding_enabled,
                 is_mla_enable=self.is_mla_enable,
                 is_fused_qkv=is_fused_qkv,
                 update_kv_cache=update_kv_cache,
-                has_cross_kv=False,
+                has_cross_kv=metadata.is_cross and k is not None,
                 quant_config=self.quant_config,
                 kv_cache_manager=metadata.kv_cache_manager,
                 skip_softmax_threshold_scale_factor_prefill=
@@ -1461,6 +1469,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 metadata.num_contexts,
                 metadata.num_ctx_tokens,
                 global_layer_idx=self.layer_idx,
+                is_cross=metadata.is_cross,
+                encoder_seq_lens=encoder_seq_lens_arg,
             )
         else:
             thop.attention(
@@ -1577,7 +1587,17 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata,
             TrtllmAttentionMetadata,
         )
-        assert not metadata.is_cross, "TRT-LLM Attention does not support cross attention yet."
+        # Cross-attention is supported on Blackwell (SM100/SM103) via the
+        # trtllm-gen sub-path (see ``trtllm_gen.is_supported``); other archs
+        # require the legacy ``thop.attention`` C++ wrapper to be extended for
+        # cross-attention (Step 5β of the encoder-decoder porting plan).
+        if metadata.is_cross and not is_sm_100f(get_sm_version()):
+            raise NotImplementedError(
+                "TRT-LLM cross-attention is currently only supported on "
+                "Blackwell (SM100/SM103) via the trtllm-gen path. Use the "
+                "VANILLA attention backend for cross-attention on other "
+                "architectures, or extend cpp/tensorrt_llm/thop/attentionOp "
+                "and its nanobind binding (Step 5β).")
 
         use_paged_context_fmha = (
             metadata.runtime_features.chunked_prefill

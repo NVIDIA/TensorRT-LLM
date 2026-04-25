@@ -15,9 +15,9 @@
 """Unit tests for the PyTorch-flow encoder-decoder modules.
 
 Tests that modules can be constructed and run forward passes on dummy tensors.
-These tests use the VANILLA attention backend for isolated unit testing;
-the production TRTLLM backend (with KV cache) will be validated once the
-KV cache infrastructure is wired up (Steps 5-6 of the porting plan).
+Most cases use the VANILLA attention backend for isolated unit testing; the
+Blackwell-gated TRTLLM cross-attention tests also validate cached-KV
+correctness against the VANILLA reference.
 """
 
 import unittest
@@ -26,6 +26,7 @@ from copy import deepcopy
 import torch
 from transformers import BartConfig, T5Config
 
+import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_bart import BartDecoderLayer, BartEncoderLayer, BartModel
@@ -36,6 +37,7 @@ from tensorrt_llm._torch.models.modeling_t5 import (
     T5Model,
 )
 from tensorrt_llm._torch.modules.cross_attention import CrossAttention
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
 
 def _make_vanilla_metadata(seq_lens, device="cuda"):
@@ -147,6 +149,398 @@ class TestCrossAttention(unittest.TestCase):
                 skip_cross_kv_projection=False,
             )
         self.assertEqual(output.shape, (num_tokens_decoder, hidden_size))
+
+
+def _build_trtllm_cross_metadata(
+    decoder_seq_lens,
+    encoder_seq_lens,
+    *,
+    num_kv_heads,
+    head_dim,
+    dtype,
+    skip_cross_kv_projection: bool = False,
+    kv_managers=None,
+):
+    """Build a TrtllmAttentionMetadata + cross sub-metadata for CrossAttention.
+
+    Sets up a proper KV-cache-managed cross pool (CacheType.CROSS) so the
+    TRTLLM ``trtllm-gen`` backend can read paged K/V offsets. The decoder
+    self-attention metadata uses a small (unused) SELF pool just to satisfy
+    the wrapper's metadata expectations; only the cross sub-metadata is
+    used by the cross-attention forward call. When ``kv_managers`` is
+    provided, reuse the existing SELF/CROSS managers so generation tests can
+    read encoder K/V written during an earlier context pass.
+    """
+    from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+    from tensorrt_llm._torch.metadata import KVCacheParams
+    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import Mapping
+
+    metadata_cls = get_attention_backend("TRTLLM").Metadata
+    num_seqs = len(decoder_seq_lens)
+    assert len(encoder_seq_lens) == num_seqs
+
+    if dtype == torch.bfloat16:
+        kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
+    elif dtype == torch.float16:
+        kv_cache_dtype = tensorrt_llm.bindings.DataType.HALF
+    else:
+        raise ValueError(f"Unsupported KV cache dtype: {dtype}")
+
+    page_size = 32
+    max_encoder_len = max(int(x) for x in encoder_seq_lens)
+    max_decoder_len = max(int(x) for x in decoder_seq_lens)
+    blocks_per_seq = max(1, (max_encoder_len + page_size - 1) // page_size)
+    cross_max_seq_len = blocks_per_seq * page_size
+
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    cross_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.CROSS
+    self_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
+
+    request_ids = list(range(num_seqs))
+    if kv_managers is None:
+        enc_dec_kv_cache_manager = KVCacheManagerV2(
+            KvCacheConfig(max_tokens=num_seqs * cross_max_seq_len),
+            cross_cache_type,
+            num_layers=1,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            tokens_per_block=page_size,
+            max_seq_len=cross_max_seq_len,
+            max_batch_size=num_seqs,
+            mapping=mapping,
+            dtype=kv_cache_dtype,
+        )
+        self_kv_cache_manager = KVCacheManagerV2(
+            KvCacheConfig(max_tokens=num_seqs * page_size),
+            self_cache_type,
+            num_layers=1,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            tokens_per_block=page_size,
+            max_seq_len=page_size,
+            max_batch_size=num_seqs,
+            mapping=mapping,
+            dtype=kv_cache_dtype,
+        )
+
+        enc_dec_kv_cache_manager.add_dummy_requests(request_ids, [int(x) for x in encoder_seq_lens])
+        self_kv_cache_manager.add_dummy_requests(request_ids, [int(x) for x in decoder_seq_lens])
+    else:
+        self_kv_cache_manager, enc_dec_kv_cache_manager = kv_managers
+
+    decoder_seq_lens_tensor = torch.tensor([int(x) for x in decoder_seq_lens], dtype=torch.int32)
+    encoder_seq_lens_tensor = torch.tensor([int(x) for x in encoder_seq_lens], dtype=torch.int32)
+
+    metadata = metadata_cls(
+        max_num_requests=num_seqs,
+        max_num_tokens=sum(int(x) for x in decoder_seq_lens),
+        kv_cache_manager=self_kv_cache_manager,
+        request_ids=request_ids,
+        prompt_lens=[int(x) for x in decoder_seq_lens],
+        seq_lens=decoder_seq_lens_tensor,
+        num_contexts=0 if skip_cross_kv_projection else num_seqs,
+        kv_cache_params=KVCacheParams(
+            use_cache=True,
+            num_cached_tokens_per_seq=[0] * num_seqs,
+        ),
+    )
+    metadata.max_seq_len = max(max_decoder_len, page_size)
+    metadata.prepare()
+
+    encoder_cached = (
+        [int(x) for x in encoder_seq_lens] if skip_cross_kv_projection else [0] * num_seqs
+    )
+    cross_metadata = metadata.create_cross_metadata(
+        encoder_seq_lens=encoder_seq_lens_tensor,
+        enc_dec_kv_cache_manager=enc_dec_kv_cache_manager,
+        encoder_num_cached_tokens_per_seq=encoder_cached,
+    )
+    cross_metadata.prepare()
+    return metadata, cross_metadata, (self_kv_cache_manager, enc_dec_kv_cache_manager)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+@unittest.skipUnless(
+    torch.cuda.is_available() and is_sm_100f(get_sm_version()),
+    "TRTLLM cross-attention requires Blackwell (SM100/SM103); see Step 5\u03b1 "
+    "of encoder_decoder_porting_guide.md",
+)
+class TestCrossAttentionTrtllmBackend(unittest.TestCase):
+    """Validate Step 5\u03b1: CrossAttention on the TRTLLM backend (Blackwell)."""
+
+    def setUp(self):
+        torch.random.manual_seed(42)
+
+    def _make_cross_attn(self, hidden_size, num_heads, head_dim, dtype, *, backend="TRTLLM"):
+        t5_cfg = deepcopy(SMALL_T5_CONFIG)
+        t5_cfg["d_model"] = hidden_size
+        t5_cfg["num_heads"] = num_heads
+        t5_cfg["d_kv"] = head_dim
+        t5_cfg["torch_dtype"] = "bfloat16" if dtype == torch.bfloat16 else "float16"
+        pretrained_config = T5Config.from_dict(t5_cfg)
+        pretrained_config.head_dim = head_dim
+        config = ModelConfig(
+            pretrained_config=pretrained_config,
+            attn_backend=backend,
+        )
+        cross_attn = CrossAttention(
+            hidden_size=hidden_size,
+            num_attention_heads=num_heads,
+            num_key_value_heads=num_heads,
+            encoder_hidden_size=hidden_size,
+            bias=False,
+            layer_idx=0,
+            dtype=dtype,
+            config=config,
+        )
+        # ``Linear.create_weights`` allocates ``torch.empty`` parameters.
+        # The unit test never calls ``load_weights``, so initialise the
+        # projection weights with a small Gaussian so the forward pass
+        # exercises real arithmetic instead of uninitialised memory.
+        for proj in (cross_attn.q_proj, cross_attn.k_proj, cross_attn.v_proj, cross_attn.o_proj):
+            torch.nn.init.normal_(proj.weight, mean=0.0, std=0.02)
+        return cross_attn
+
+    def _make_cross_attn_pair(self, hidden_size, num_heads, head_dim, dtype, device):
+        trtllm_cross_attn = self._make_cross_attn(
+            hidden_size,
+            num_heads,
+            head_dim,
+            dtype,
+            backend="TRTLLM",
+        )
+        vanilla_cross_attn = self._make_cross_attn(
+            hidden_size,
+            num_heads,
+            head_dim,
+            dtype,
+            backend="VANILLA",
+        )
+        vanilla_cross_attn.load_state_dict(trtllm_cross_attn.state_dict())
+        return trtllm_cross_attn.to(device), vanilla_cross_attn.to(device)
+
+    def _assert_matches_vanilla_reference(
+        self, trtllm_output, vanilla_output, *, max_abs_tol, mean_abs_tol
+    ):
+        self.assertEqual(trtllm_output.shape, vanilla_output.shape)
+        self.assertTrue(torch.isfinite(trtllm_output).all())
+        self.assertTrue(torch.isfinite(vanilla_output).all())
+        abs_diff = (trtllm_output.float() - vanilla_output.float()).abs()
+        max_abs_diff = abs_diff.max().item()
+        mean_abs_diff = abs_diff.mean().item()
+        self.assertLess(
+            max_abs_diff,
+            max_abs_tol,
+            f"max abs diff {max_abs_diff} exceeded tolerance {max_abs_tol}",
+        )
+        self.assertLess(
+            mean_abs_diff,
+            mean_abs_tol,
+            f"mean abs diff {mean_abs_diff} exceeded tolerance {mean_abs_tol}",
+        )
+
+    def _make_vanilla_cross_metadata(self, decoder_seq_lens, encoder_seq_lens, device):
+        vanilla_metadata = _make_vanilla_metadata(decoder_seq_lens, device)
+        vanilla_cross_metadata = vanilla_metadata.create_cross_metadata(
+            encoder_seq_lens=torch.tensor([int(x) for x in encoder_seq_lens], dtype=torch.int32),
+            enc_dec_kv_cache_manager=None,
+        )
+        vanilla_cross_metadata.prepare()
+        return vanilla_metadata, vanilla_cross_metadata
+
+    def test_attn_backend_selection(self):
+        """On Blackwell, CrossAttention picks TRTLLM when configured."""
+        cross_attn = self._make_cross_attn(64, 8, 8, torch.bfloat16)
+        self.assertEqual(type(cross_attn.attn).__name__, "TrtllmAttention")
+
+    def test_cross_attention_context_runs(self):
+        """Context phase: project K/V from encoder, write to cross pool, run FMHA.
+
+        ``head_dim`` is constrained to ``{32, 64, 72, 128, 256}`` by the
+        cross-attention KV-cache-update kernel (see
+        ``invokeUpdateKvCacheForCrossAttention`` in
+        ``cpp/tensorrt_llm/kernels/unfusedAttentionKernels``); we pick 64.
+        """
+        device = torch.device("cuda")
+        dtype = torch.bfloat16
+        num_heads = 8
+        head_dim = 64
+        hidden_size = num_heads * head_dim
+        decoder_seq_lens = [4]
+        encoder_seq_lens = [8]
+
+        cross_attn = self._make_cross_attn(hidden_size, num_heads, head_dim, dtype).to(device)
+        decoder_hs = torch.randn(sum(decoder_seq_lens), hidden_size, device=device, dtype=dtype)
+        encoder_hs = torch.randn(sum(encoder_seq_lens), hidden_size, device=device, dtype=dtype)
+
+        metadata, cross_metadata, kv_managers = _build_trtllm_cross_metadata(
+            decoder_seq_lens,
+            encoder_seq_lens,
+            num_kv_heads=num_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+        )
+
+        try:
+            with torch.inference_mode():
+                output = cross_attn(
+                    hidden_states=decoder_hs,
+                    encoder_hidden_states=encoder_hs,
+                    attn_metadata=metadata,
+                    cross_attn_metadata=cross_metadata,
+                    skip_cross_kv_projection=False,
+                )
+        finally:
+            for mgr in kv_managers:
+                mgr.shutdown()
+
+        self.assertEqual(output.shape, (sum(decoder_seq_lens), hidden_size))
+        self.assertTrue(
+            torch.isfinite(output).all(), "TRTLLM cross-attn output has non-finite values"
+        )
+
+    def test_cross_attention_context_matches_vanilla_reference(self):
+        """Context phase matches the VANILLA reference within a tight BF16 band."""
+        device = torch.device("cuda")
+        dtype = torch.bfloat16
+        num_heads = 2
+        head_dim = 64
+        hidden_size = num_heads * head_dim
+        # Cross-attention should support asymmetric Q/KV lengths. Keep the
+        # decoder and encoder lengths intentionally different across requests.
+        decoder_seq_lens = [4, 3]
+        encoder_seq_lens = [8, 5]
+
+        trtllm_cross_attn, vanilla_cross_attn = self._make_cross_attn_pair(
+            hidden_size,
+            num_heads,
+            head_dim,
+            dtype,
+            device,
+        )
+        decoder_hs = torch.randn(sum(decoder_seq_lens), hidden_size, device=device, dtype=dtype)
+        encoder_hs = torch.randn(sum(encoder_seq_lens), hidden_size, device=device, dtype=dtype)
+        vanilla_metadata, vanilla_cross_metadata = self._make_vanilla_cross_metadata(
+            decoder_seq_lens, encoder_seq_lens, device
+        )
+        trtllm_metadata, trtllm_cross_metadata, kv_managers = _build_trtllm_cross_metadata(
+            decoder_seq_lens,
+            encoder_seq_lens,
+            num_kv_heads=num_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+        )
+
+        try:
+            with torch.inference_mode():
+                trtllm_output = trtllm_cross_attn(
+                    hidden_states=decoder_hs,
+                    encoder_hidden_states=encoder_hs,
+                    attn_metadata=trtllm_metadata,
+                    cross_attn_metadata=trtllm_cross_metadata,
+                    skip_cross_kv_projection=False,
+                )
+                vanilla_output = vanilla_cross_attn(
+                    hidden_states=decoder_hs,
+                    encoder_hidden_states=encoder_hs,
+                    attn_metadata=vanilla_metadata,
+                    cross_attn_metadata=vanilla_cross_metadata,
+                    skip_cross_kv_projection=False,
+                )
+        finally:
+            for mgr in kv_managers:
+                mgr.shutdown()
+
+        self._assert_matches_vanilla_reference(
+            trtllm_output,
+            vanilla_output,
+            max_abs_tol=0.06,
+            mean_abs_tol=0.01,
+        )
+
+    def test_cross_attention_generation_matches_vanilla_reference(self):
+        """Generation matches VANILLA when reading encoder K/V from cache."""
+        device = torch.device("cuda")
+        dtype = torch.bfloat16
+        num_heads = 2
+        head_dim = 64
+        hidden_size = num_heads * head_dim
+        context_decoder_seq_lens = [4, 3]
+        generation_decoder_seq_lens = [1, 1]
+        encoder_seq_lens = [8, 5]
+
+        trtllm_cross_attn, vanilla_cross_attn = self._make_cross_attn_pair(
+            hidden_size,
+            num_heads,
+            head_dim,
+            dtype,
+            device,
+        )
+        context_decoder_hs = torch.randn(
+            sum(context_decoder_seq_lens), hidden_size, device=device, dtype=dtype
+        )
+        generation_decoder_hs = torch.randn(
+            sum(generation_decoder_seq_lens), hidden_size, device=device, dtype=dtype
+        )
+        encoder_hs = torch.randn(sum(encoder_seq_lens), hidden_size, device=device, dtype=dtype)
+        vanilla_metadata, vanilla_cross_metadata = self._make_vanilla_cross_metadata(
+            generation_decoder_seq_lens, encoder_seq_lens, device
+        )
+        context_metadata, context_cross_metadata, kv_managers = _build_trtllm_cross_metadata(
+            context_decoder_seq_lens,
+            encoder_seq_lens,
+            num_kv_heads=num_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+        )
+
+        try:
+            with torch.inference_mode():
+                _ = trtllm_cross_attn(
+                    hidden_states=context_decoder_hs,
+                    encoder_hidden_states=encoder_hs,
+                    attn_metadata=context_metadata,
+                    cross_attn_metadata=context_cross_metadata,
+                    skip_cross_kv_projection=False,
+                )
+
+            generation_metadata, generation_cross_metadata, _ = _build_trtllm_cross_metadata(
+                generation_decoder_seq_lens,
+                encoder_seq_lens,
+                num_kv_heads=num_heads,
+                head_dim=head_dim,
+                dtype=dtype,
+                skip_cross_kv_projection=True,
+                kv_managers=kv_managers,
+            )
+
+            with torch.inference_mode():
+                trtllm_output = trtllm_cross_attn(
+                    hidden_states=generation_decoder_hs,
+                    encoder_hidden_states=None,
+                    attn_metadata=generation_metadata,
+                    cross_attn_metadata=generation_cross_metadata,
+                    skip_cross_kv_projection=True,
+                )
+                vanilla_output = vanilla_cross_attn(
+                    hidden_states=generation_decoder_hs,
+                    encoder_hidden_states=encoder_hs,
+                    attn_metadata=vanilla_metadata,
+                    cross_attn_metadata=vanilla_cross_metadata,
+                    skip_cross_kv_projection=False,
+                )
+        finally:
+            for mgr in kv_managers:
+                mgr.shutdown()
+
+        self._assert_matches_vanilla_reference(
+            trtllm_output,
+            vanilla_output,
+            max_abs_tol=0.04,
+            mean_abs_tol=0.01,
+        )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")

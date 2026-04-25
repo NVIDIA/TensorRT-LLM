@@ -318,11 +318,18 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             **kwargs) -> torch.Tensor:
         """Perform attention without kv cache.
 
+        Supports both self-attention (Q and K/V have matching per-request
+        lengths) and cross-attention (Q-side lengths from
+        ``metadata.seq_lens``, K/V-side lengths from ``metadata.seq_lens_kv``,
+        i.e. ``metadata.is_cross is True``).
+
         Args:
-            q: Query tensor, shape ``(seq_len, num_heads * head_dim)``
-                or ``(seq_len, (num_heads + 2*num_kv_heads) * head_dim)``.
-            k: Key tensor, shape ``(seq_len, num_heads * head_dim)`` or None.
-            v: Value tensor, shape ``(seq_len, num_heads * head_dim)`` or None.
+            q: Query tensor, shape ``(seq_len_q, num_heads * head_dim)``
+                or ``(seq_len_q, (num_heads + 2*num_kv_heads) * head_dim)``.
+            k: Key tensor, shape ``(seq_len_kv, num_kv_heads * head_dim)`` or
+                None (fused QKV input).
+            v: Value tensor, shape ``(seq_len_kv, num_kv_heads * head_dim)``
+                or None (fused QKV input).
         """
         head_dim = q.shape[-1]
         is_fused_qkv = False
@@ -345,12 +352,34 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         assert q.dim() == 3
         assert k.dim() == 3
         assert v.dim() == 3
-        seqlens_in_batch = metadata.seq_lens
-        assert seqlens_in_batch is not None, "seq_len can not be None for remove padding inputs attention!"
-        max_seqlen_in_batch = seqlens_in_batch.max().item()
-        cu_seqlens = F.pad(
-            torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32),
-            (1, 0)).to(q.device)
+        seqlens_q = metadata.seq_lens
+        assert seqlens_q is not None, "seq_len can not be None for remove padding inputs attention!"
+        seqlens_kv = metadata.seq_lens_kv
+        # In cross-attention the K/V-side lengths differ from the Q-side
+        # lengths and must be tracked separately for cu_seqlens.
+        is_cross = metadata.is_cross
+        if is_fused_qkv and is_cross:
+            raise ValueError(
+                "Cross-attention with fused QKV input is not supported: pass "
+                "Q, K, V as separate tensors when metadata.is_cross is True.")
+        max_seqlen_q = int(seqlens_q.max().item())
+        cu_seqlens_q = F.pad(torch.cumsum(seqlens_q, dim=0, dtype=torch.int32),
+                             (1, 0)).to(q.device)
+        if is_cross:
+            assert seqlens_kv is not None, (
+                "metadata.seq_lens_kv must be set for cross-attention "
+                "(no_kv_cache_forward). Got None.")
+            assert seqlens_kv.sum().item() == k.size(0), (
+                "K tensor token count does not match metadata.seq_lens_kv: "
+                f"k.shape[0]={k.size(0)} vs sum(seq_lens_kv)="
+                f"{seqlens_kv.sum().item()}.")
+            max_seqlen_k = int(seqlens_kv.max().item())
+            cu_seqlens_k = F.pad(
+                torch.cumsum(seqlens_kv, dim=0, dtype=torch.int32),
+                (1, 0)).to(q.device)
+        else:
+            max_seqlen_k = max_seqlen_q
+            cu_seqlens_k = cu_seqlens_q
 
         # flash-attn only supports fp16/bf16; fall back to PyTorch SDPA for
         # other dtypes (e.g. float32), mirroring the TRT backend's behaviour
@@ -358,14 +387,12 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         if q.dtype not in (torch.float16, torch.bfloat16):
             return self._no_kv_cache_sdpa_fallback(q, k, v, num_heads,
                                                    num_kv_heads, head_dim,
-                                                   seqlens_in_batch, cu_seqlens,
-                                                   max_seqlen_in_batch,
-                                                   attention_mask)
+                                                   seqlens_q, cu_seqlens_q,
+                                                   max_seqlen_q, attention_mask,
+                                                   seqlens_kv, cu_seqlens_k,
+                                                   max_seqlen_k)
 
         from flash_attn.flash_attn_interface import flash_attn_varlen_func
-
-        max_seqlen_q = max_seqlen_k = max_seqlen_in_batch
-        cu_seqlens_q = cu_seqlens_k = cu_seqlens
 
         attn_output_unpad = flash_attn_varlen_func(
             q,
@@ -386,22 +413,43 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         return attn_output_unpad.reshape(attn_output_unpad.size(0), -1)
 
     def _no_kv_cache_sdpa_fallback(
-            self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-            num_heads: int, num_kv_heads: int, head_dim: int,
-            seqlens_in_batch: torch.Tensor, cu_seqlens: torch.Tensor,
-            max_seqlen: int, attention_mask: AttentionMask) -> torch.Tensor:
-        """PyTorch SDPA fallback for dtypes not supported by flash-attn."""
+            self,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            num_heads: int,
+            num_kv_heads: int,
+            head_dim: int,
+            seqlens_q: torch.Tensor,
+            cu_seqlens_q: torch.Tensor,
+            max_seqlen_q: int,
+            attention_mask: AttentionMask,
+            seqlens_kv: Optional[torch.Tensor] = None,
+            cu_seqlens_k: Optional[torch.Tensor] = None,
+            max_seqlen_k: Optional[int] = None) -> torch.Tensor:
+        """PyTorch SDPA fallback for dtypes not supported by flash-attn.
+
+        When ``seqlens_kv`` / ``cu_seqlens_k`` are provided, K/V are sliced
+        independently of Q (cross-attention path).
+        """
+        del max_seqlen_q, max_seqlen_k  # only seqlens / cu_seqlens are used
         is_causal = (attention_mask == PredefinedAttentionMask.CAUSAL)
         num_kv_groups = num_heads // num_kv_heads
-        num_requests = seqlens_in_batch.numel()
+        num_requests = seqlens_q.numel()
+
+        if seqlens_kv is None or cu_seqlens_k is None:
+            seqlens_kv = seqlens_q
+            cu_seqlens_k = cu_seqlens_q
 
         outputs = []
         for i in range(num_requests):
-            start = cu_seqlens[i].item()
-            end = cu_seqlens[i + 1].item()
-            q_s = q[start:end].transpose(0, 1).unsqueeze(0)
-            k_s = k[start:end].transpose(0, 1).unsqueeze(0)
-            v_s = v[start:end].transpose(0, 1).unsqueeze(0)
+            start_q = cu_seqlens_q[i].item()
+            end_q = cu_seqlens_q[i + 1].item()
+            start_k = cu_seqlens_k[i].item()
+            end_k = cu_seqlens_k[i + 1].item()
+            q_s = q[start_q:end_q].transpose(0, 1).unsqueeze(0)
+            k_s = k[start_k:end_k].transpose(0, 1).unsqueeze(0)
+            v_s = v[start_k:end_k].transpose(0, 1).unsqueeze(0)
             k_s = repeat_kv(k_s, num_kv_groups)
             v_s = repeat_kv(v_s, num_kv_groups)
 
@@ -409,10 +457,15 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             if self.q_scaling is not None:
                 qk_scale = 1 / (math.sqrt(head_dim) * self.q_scaling)
 
+            # SDPA's is_causal flag implies square attention. For
+            # cross-attention (different Q/K lengths) we never apply a causal
+            # mask: the decoder Q attends to all encoder K/V tokens.
+            sdpa_is_causal = is_causal and (end_q - start_q) == (end_k -
+                                                                 start_k)
             out = F.scaled_dot_product_attention(q_s,
                                                  k_s,
                                                  v_s,
-                                                 is_causal=is_causal,
+                                                 is_causal=sdpa_is_causal,
                                                  scale=qk_scale)
             outputs.append(out.squeeze(0).transpose(0, 1))
 
