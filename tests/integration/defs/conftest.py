@@ -35,7 +35,6 @@ import psutil
 import pytest
 import torch
 import tqdm
-import yaml
 from _pytest.mark import ParameterSet
 
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -1439,17 +1438,6 @@ def llm_mathstral_model_root(llm_venv):
 
 
 @pytest.fixture(scope="module")
-@cached_in_llm_models_root("LongAlpaca-7B", True)
-def llm_long_alpaca_model_root(llm_venv):
-    "return long alpaca model root"
-
-    workspace = llm_venv.get_working_directory()
-    long_alpaca_model_root = os.path.join(workspace, "LongAlpaca-7B")
-
-    return long_alpaca_model_root
-
-
-@pytest.fixture(scope="module")
 @cached_in_llm_models_root("gpt-neox-20b", True)
 def llm_gptneox_model_root(llm_venv):
     "return gptneox model root"
@@ -2513,25 +2501,6 @@ def all_pytest_items():
 @pytest.fixture(scope="session")
 def test_root():
     return os.path.dirname(os.path.dirname(__file__))
-
-
-@pytest.fixture(scope="function")
-def test_case(request, llm_root):
-    "get test case"
-    test_cases_file = "tests/integration/defs/test_cases.yml"
-    input_file_dir = "tests/integration/test_input_files"
-    test_cases_file_path = os.path.join(llm_root, test_cases_file)
-    case_name = request.param
-
-    with open(test_cases_file_path, "r", encoding="UTF-8") as file:
-        test_cases = yaml.safe_load(file)
-
-    case = test_cases["test_cases"][case_name]
-    input_file = case["input_file"]
-
-    case["input_file"] = os.path.join(llm_root, input_file_dir, input_file)
-
-    return case
 
 
 def check_nvlink():
