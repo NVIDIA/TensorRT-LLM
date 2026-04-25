@@ -15,6 +15,7 @@ from tensorrt_llm._torch.auto_deploy.models.factory import (
     ModelFactory,
     SubModuleExportInfo,
 )
+from tensorrt_llm._torch.auto_deploy.models.quant_config_reader import HFQuantConfigReader
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp8_scale, pack_int4_in_uint8
@@ -160,6 +161,66 @@ def test_finegrained_fp8_quantization():
 
     assert not torch.allclose(model(x), gm_transformed(x))
     torch_export_to_gm(gm_transformed, args=(x,))
+
+
+def test_finegrained_fp8_quantization_honors_exclude_modules():
+    """HF quant configs use exclude_modules; keep BF16 heads out of FP8 conversion."""
+
+    class ModelWithHead(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.body = nn.Linear(128, 128, bias=False)
+            self.lm_head = nn.Linear(128, 128, bias=False)
+
+        def forward(self, x):
+            return self.lm_head(self.body(x))
+
+    model = ModelWithHead()
+    x = torch.randn(3, 128)
+    quant_config = {
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+        "exclude_modules": ["lm_head"],
+    }
+    quant_op = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_transformed = InferenceOptimizer(
+        DummyFactory(quant_config),
+        {
+            "quantize_finegrained_fp8_linear_from_config": {
+                "stage": "pattern_matcher",
+            },
+        },
+    )(None, gm)
+
+    quantized_nodes = [n for n in gm_transformed.graph.nodes if is_op(n, quant_op)]
+    assert len(quantized_nodes) == 1
+    assert gm_transformed.body.weight.dtype == torch.float8_e4m3fn
+    assert gm_transformed.lm_head.weight.dtype == model.lm_head.weight.dtype
+
+
+def test_hf_quant_reader_adds_deepseek_v4_fp8_excludes():
+    """DeepSeek V4 has BF16/FP32 linears without FP8 scale tensors."""
+    reader = HFQuantConfigReader()
+    reader.read_config(
+        {
+            "model_type": "deepseek_v4",
+            "quantization_config": {
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+            },
+        }
+    )
+
+    excluded = set(reader.get_config()["exclude_modules"])
+    assert "lm_head" in excluded
+    assert "model.embed_tokens" in excluded
+    assert "model.layers.*.attn.compressor.wkv" in excluded
+    assert "model.layers.*.attn.indexer.weights_proj" in excluded
+    assert "model.layers.*.attn.indexer.compressor.wgate" in excluded
+    assert "model.layers.*.attn.wo_a" in excluded
+    assert "model.layers.*.ffn.gate" in excluded
 
 
 @pytest.mark.parametrize(

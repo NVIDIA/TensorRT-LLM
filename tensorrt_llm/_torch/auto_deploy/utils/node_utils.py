@@ -657,12 +657,21 @@ def is_any_conv_op(node: Node) -> bool:
 
 
 def is_any_attention_op(node: Node) -> bool:
+    ops = [
+        torch.ops.auto_deploy.torch_attention_sdpa,
+        torch.ops.auto_deploy.torch_attention,
+    ]
+    deepseek_v4_sparse_attn = getattr(torch.ops.auto_deploy, "torch_deepseek_v4_sparse_attn", None)
+    deepseek_v4_sparse_attn_with_cache = getattr(
+        torch.ops.auto_deploy, "torch_deepseek_v4_sparse_attn_with_cache", None
+    )
+    if deepseek_v4_sparse_attn is not None:
+        ops.append(deepseek_v4_sparse_attn)
+    if deepseek_v4_sparse_attn_with_cache is not None:
+        ops.append(deepseek_v4_sparse_attn_with_cache)
     return is_op(
         node,
-        ops=[
-            torch.ops.auto_deploy.torch_attention_sdpa,
-            torch.ops.auto_deploy.torch_attention,
-        ],
+        ops=ops,
     )
 
 
@@ -1463,6 +1472,9 @@ def get_layer_after_linear_node(
         for n in set(backward_subgraph).union(forward_subgraph)
         if n not in set(opening_linear_nodes).union([terminating_linear_node])
     ]
+    if enforce_strict_linear_history:
+        closed_linear_nodes = set(linear_nodes[: terminating_indices[-1] + 1])
+        interior_nodes = [n for n in interior_nodes if n not in closed_linear_nodes]
     ssm_nodes = list(filtered_nodes(interior_nodes, is_any_ssm_op))
     delta_nodes = list(filtered_nodes(interior_nodes, is_any_delta_op))
     attention_nodes = list(filtered_nodes(interior_nodes, is_any_attention_op))

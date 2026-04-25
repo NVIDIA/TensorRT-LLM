@@ -22,6 +22,7 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention import (  # noqa: F401
 )
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention.deepseek_v4_sparse_attention import (
     _apply_interleaved_rope,
+    _fake_fp8_act_quant,
 )
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
     DeepseekV4Attention,
@@ -56,7 +57,7 @@ def _small_cfg(ratio: int) -> DeepseekV4Config:
         hc_mult=2,
         hc_sinkhorn_iters=2,
         hc_eps=1e-6,
-        max_position_embeddings=64,
+        max_position_embeddings=max(64, ratio * 2),
         rope_theta=10000.0,
         compress_rope_theta=10000.0,
         rope_scaling=None,
@@ -78,6 +79,8 @@ def _pack_op_qkv_args(
     qr: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
+    cos_anchor: torch.Tensor,
+    sin_anchor: torch.Tensor,
 ) -> tuple:
     if attn.indexer is not None:
         indexer_args = (
@@ -97,6 +100,8 @@ def _pack_op_qkv_args(
         qr,
         cos,
         sin,
+        cos_anchor,
+        sin_anchor,
         attn.attn_sink,
         attn.compressor.wkv.weight,
         attn.compressor.wgate.weight,
@@ -109,6 +114,7 @@ def _pack_op_qkv_args(
 def _pack_op_constants(cfg: DeepseekV4Config, attn: DeepseekV4Attention) -> tuple:
     index_n_heads = attn.indexer.index_n_heads if attn.indexer is not None else 0
     index_head_dim = attn.indexer.index_head_dim if attn.indexer is not None else 0
+    index_topk = attn.indexer.index_topk if attn.indexer is not None else 0
     return (
         attn.softmax_scale,
         attn.window_size,
@@ -117,6 +123,7 @@ def _pack_op_constants(cfg: DeepseekV4Config, attn: DeepseekV4Attention) -> tupl
         attn.head_dim,
         index_n_heads,
         index_head_dim,
+        index_topk,
         cfg.rms_norm_eps,
     )
 
@@ -139,6 +146,7 @@ def _prepare_qkv(
     kv = attn.kv_norm(attn.wkv(x)).view(B, S, 1, attn.head_dim)
     kv_nope, kv_pe = torch.split(kv, [attn.head_dim - rd, rd], dim=-1)
     kv_pe = _apply_interleaved_rope(kv_pe, cos.unsqueeze(2), sin.unsqueeze(2))
+    kv_nope = _fake_fp8_act_quant(kv_nope, block_size=64)
     kv = torch.cat([kv_nope, kv_pe], dim=-1)
     return q, kv, qr
 
@@ -194,7 +202,7 @@ def test_cached_prefill_matches_stateless_prefill(ratio: int) -> None:
         attn.indexer.compressor.ape.data.normal_(std=0.02)
     attn.attn_sink.data.normal_(std=0.1)
 
-    B, S = 1, 8
+    B, S = (1, 8) if ratio == 4 else (1, 256)
     x = torch.randn(B, S, cfg.hidden_size)
     position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
     cos_tbl, sin_tbl = _build_freqs_cis(
@@ -211,7 +219,7 @@ def test_cached_prefill_matches_stateless_prefill(ratio: int) -> None:
     q, kv, qr = _prepare_qkv(attn, x, cos, sin)
 
     # Stateless op — reference.
-    qkv_args = _pack_op_qkv_args(attn, q, kv, x, qr, cos, sin)
+    qkv_args = _pack_op_qkv_args(attn, q, kv, x, qr, cos, sin, cos_tbl, sin_tbl)
     constants = _pack_op_constants(cfg, attn)
     y_stateless = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attn(
         *qkv_args, *constants, 0, "mha_sparse"
@@ -232,26 +240,7 @@ def test_cached_prefill_matches_stateless_prefill(ratio: int) -> None:
     torch.testing.assert_close(y_stateless, y_cached, rtol=1e-4, atol=1e-4)
 
 
-@pytest.mark.parametrize(
-    "ratio",
-    [
-        pytest.param(
-            4,
-            marks=pytest.mark.xfail(
-                reason=(
-                    "Ratio-4 (indexer) decode: the compressed token emitted at a compression "
-                    "event must have RoPE applied at position (pos+1-ratio), i.e. the chunk-start "
-                    "position, not the current decode position. The cached op currently uses "
-                    "the current-step cos/sin, which drifts for ratio-4 layers because the "
-                    "Indexer's top-k selection scores against those compressed tokens. Fix "
-                    "requires plumbing the full cos/sin table (or anchor cos/sin) through the "
-                    "op signature — tracked as a follow-up."
-                )
-            ),
-        ),
-        128,
-    ],
-)
+@pytest.mark.parametrize("ratio", [4, 128])
 def test_decode_matches_fresh_prefill_last_token(ratio: int) -> None:
     """Decoding M tokens via the cached op matches a fresh prefill of length N+M.
 
@@ -266,8 +255,7 @@ def test_decode_matches_fresh_prefill_last_token(ratio: int) -> None:
     attn.attn_sink.data.normal_(std=0.1)
 
     B = 1
-    prefill_len = 4
-    decode_steps = 4
+    prefill_len, decode_steps = (5, 3) if ratio == 4 else (130, 126)
     total_len = prefill_len + decode_steps
     x_full = torch.randn(B, total_len, cfg.hidden_size)
     position_ids_full = torch.arange(total_len).unsqueeze(0).expand(B, -1)
@@ -286,7 +274,9 @@ def test_decode_matches_fresh_prefill_last_token(ratio: int) -> None:
 
     # Reference: single prefill of length total_len.
     constants = _pack_op_constants(cfg, attn)
-    qkv_ref = _pack_op_qkv_args(attn, q_full, kv_full, x_full, qr_full, cos_full, sin_full)
+    qkv_ref = _pack_op_qkv_args(
+        attn, q_full, kv_full, x_full, qr_full, cos_full, sin_full, cos_tbl, sin_tbl
+    )
     y_ref_full = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attn(
         *qkv_ref, *constants, 0, "mha_sparse"
     )
@@ -307,11 +297,28 @@ def test_decode_matches_fresh_prefill_last_token(ratio: int) -> None:
         torch.tensor([0, prefill_len], dtype=torch.int32),
     )
     qkv_prefill = _pack_op_qkv_args(
-        attn, q_prefill, kv_prefill, x_prefill, qr_prefill, cos_prefill, sin_prefill
+        attn,
+        q_prefill,
+        kv_prefill,
+        x_prefill,
+        qr_prefill,
+        cos_prefill,
+        sin_prefill,
+        cos_tbl,
+        sin_tbl,
     )
     torch.ops.auto_deploy.torch_deepseek_v4_sparse_attn_with_cache(
         *qkv_prefill, *meta_prefill, *caches, *constants
     )
+    # Decode must ignore unpopulated rows in overallocated compressed caches.
+    # E2E runs can allocate these caches to max_seq_len; attending over the
+    # whole allocation is both incorrect and can explode memory.
+    initial_num_compressed = prefill_len // ratio
+    compressed_kv_cache = caches[1]
+    compressed_kv_cache[:, initial_num_compressed:] = torch.nan
+    if attn.indexer is not None:
+        indexer_compressed_kv_cache = caches[4]
+        indexer_compressed_kv_cache[:, initial_num_compressed:] = torch.nan
 
     # Step 2: decode M tokens one at a time.
     y_last_decoded = None
@@ -330,7 +337,9 @@ def test_decode_matches_fresh_prefill_last_token(ratio: int) -> None:
             torch.tensor([0], dtype=torch.int32),
             torch.tensor([0, 1], dtype=torch.int32),
         )
-        qkv_step = _pack_op_qkv_args(attn, q_step, kv_step, x_step, qr_step, cos_step, sin_step)
+        qkv_step = _pack_op_qkv_args(
+            attn, q_step, kv_step, x_step, qr_step, cos_step, sin_step, cos_tbl, sin_tbl
+        )
         y_last_decoded = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attn_with_cache(
             *qkv_step, *meta_step, *caches, *constants
         )

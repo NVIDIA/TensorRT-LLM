@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from _model_test_utils import assert_rmse_close
 from torch import nn
 from torch.export import Dim
+from torch.fx import Node
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
@@ -36,6 +37,9 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
     DeepseekV4RMSNorm,
     _build_freqs_cis,
     _build_sparse_attn_mask,
+    _fake_fp4_act_quant,
+    _fake_fp8_act_quant,
+    _hadamard_rotate,
     _hc_split_sinkhorn,
     _remap_deepseek_v4_checkpoint_keys,
     _window_topk_idxs,
@@ -57,15 +61,20 @@ _EXPECTED_FLASH_BASE_INDEX_KEYS = {
     "hc_head_fn",
     "hc_head_scale",
     "layers.0.attn.wq_a.weight",
+    "layers.0.attn.wq_a.scale",
     "layers.0.ffn.experts.0.w1.weight",
+    "layers.0.ffn.experts.0.w1.scale",
     "layers.0.ffn.experts.0.w2.weight",
     "layers.0.ffn.experts.0.w3.weight",
     "layers.0.ffn.gate.tid2eid",
     "layers.0.ffn.shared_experts.w1.weight",
+    "layers.0.ffn.shared_experts.w1.scale",
     "layers.0.ffn.shared_experts.w2.weight",
     "layers.0.ffn.shared_experts.w3.weight",
     "layers.2.attn.compressor.wkv.weight",
+    "layers.2.attn.compressor.wkv.scale",
     "layers.2.attn.indexer.wq_b.weight",
+    "layers.2.attn.indexer.wq_b.scale",
     "norm.weight",
 }
 
@@ -254,7 +263,12 @@ def _ref_compressor_forward(
     kv = compressor.norm(kv.to(dtype))
     rd = compressor.rope_head_dim
     rotated = _apply_rotary_emb_ref(kv[..., -rd:], freqs_cis[:cutoff:ratio])
-    return torch.cat([kv[..., :-rd], rotated], dim=-1)
+    kv = torch.cat([kv[..., :-rd], rotated], dim=-1)
+    if compressor.rotate:
+        return _fake_fp4_act_quant(_hadamard_rotate(kv), block_size=32)
+
+    nope, pe = torch.split(kv, [compressor.head_dim - rd, rd], dim=-1)
+    return torch.cat([_fake_fp8_act_quant(nope, block_size=64), pe], dim=-1)
 
 
 def _ref_indexer_forward(
@@ -264,7 +278,7 @@ def _ref_indexer_forward(
     freqs_cis: torch.Tensor,
     offset: int,
 ) -> torch.Tensor:
-    """Faithful prefill ``start_pos == 0`` reference for HF Indexer without FP4 simulation."""
+    """Faithful prefill ``start_pos == 0`` reference for HF Indexer."""
     bsz, seqlen, _ = hidden_states.shape
     ratio = indexer.compress_ratio
     n_compressed = seqlen // ratio
@@ -277,6 +291,7 @@ def _ref_indexer_forward(
     )
     q_rot = _apply_rotary_emb_ref(q[..., -rd:], freqs_cis)
     q = torch.cat([q[..., :-rd], q_rot], dim=-1)
+    q = _fake_fp4_act_quant(_hadamard_rotate(q), block_size=32)
     index_k = _ref_compressor_forward(indexer.compressor, hidden_states, freqs_cis)
     weights = F.linear(hidden_states, indexer.weights_proj.weight)
     weights = weights * (indexer.softmax_scale * indexer.index_n_heads**-0.5)
@@ -372,7 +387,7 @@ class _RefAttention(nn.Module):
         q_rope_part = _apply_rotary_emb_ref(q[..., -rd:], freqs_cis)
         kv_rope_part = _apply_rotary_emb_ref(kv[..., -rd:], freqs_cis)
         q = torch.cat([q[..., :-rd], q_rope_part], dim=-1)
-        kv = torch.cat([kv[..., :-rd], kv_rope_part], dim=-1)
+        kv = torch.cat([_fake_fp8_act_quant(kv[..., :-rd], block_size=64), kv_rope_part], dim=-1)
 
         o = _sliding_window_sink_attn(q, kv, self.attn_sink, self.softmax_scale, self.window_size)
         # Inverse RoPE on output's last rd dims
@@ -689,6 +704,7 @@ def test_moe_gate_equivalence_score_routing():
 def test_moe_equivalence():
     """Full MoE block: gate + routed experts via torch_moe + shared expert."""
     cfg = _small_config()
+    cfg.swiglu_limit = 0.5
     moe = DeepseekV4MoE(cfg, layer_idx=cfg.num_hash_layers)
     # Randomize gate weights (they're zero-init by default isn't the case here but
     # DeepseekV4MoEGate uses torch.empty via nn.Parameter directly; in practice _init_weights
@@ -711,7 +727,7 @@ def test_moe_equivalence():
 
     ref_experts = nn.ModuleList(
         [
-            _RefExpert(cfg.hidden_size, cfg.moe_intermediate_size)
+            _RefExpert(cfg.hidden_size, cfg.moe_intermediate_size, swiglu_limit=cfg.swiglu_limit)
             for _ in range(cfg.n_routed_experts)
         ]
     )
@@ -726,7 +742,7 @@ def test_moe_equivalence():
     ref_shared.w2.weight.data.copy_(moe.shared_experts.down_proj.weight.data)
 
     B, S, H = 2, 8, cfg.hidden_size
-    x = torch.randn(B, S, H)
+    x = torch.randn(B, S, H) * 4.0
     input_ids = torch.randint(0, cfg.vocab_size, (B, S))
     y_custom = moe(x, input_ids)
 
@@ -781,7 +797,7 @@ def test_attention_equivalence():
     sin = sin_tbl[position_ids]
     freqs_cis_ref = _freqs_cis_from_cos_sin(cos[0], sin[0])  # [S, rd/2] for ref
 
-    y_custom = custom(x, cos, sin, cos, sin)
+    y_custom = custom(x, cos, sin, cos, sin, cos_tbl, sin_tbl)
     y_ref = ref(x, freqs_cis_ref)
     assert_rmse_close(y_custom, y_ref, rmse_ratio_tol=0.10, msg="Attention equivalence: ")
 
@@ -846,7 +862,7 @@ def test_attention_compressed_prefill_equivalence():
     sin = sin_tbl[position_ids]
     freqs_cis_ref = _freqs_cis_from_cos_sin(cos[0], sin[0])
 
-    y_custom = custom(x, cos, sin, cos, sin)
+    y_custom = custom(x, cos, sin, cos, sin, cos_tbl, sin_tbl)
 
     rd = cfg.qk_rope_head_dim
     q_lora = custom.q_norm(custom.wq_a(x))
@@ -854,7 +870,13 @@ def test_attention_compressed_prefill_equivalence():
     q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + cfg.rms_norm_eps).to(q.dtype)
     q = torch.cat([q[..., :-rd], _apply_rotary_emb_ref(q[..., -rd:], freqs_cis_ref)], dim=-1)
     kv = custom.kv_norm(custom.wkv(x))
-    kv = torch.cat([kv[..., :-rd], _apply_rotary_emb_ref(kv[..., -rd:], freqs_cis_ref)], dim=-1)
+    kv = torch.cat(
+        [
+            _fake_fp8_act_quant(kv[..., :-rd], block_size=64),
+            _apply_rotary_emb_ref(kv[..., -rd:], freqs_cis_ref),
+        ],
+        dim=-1,
+    )
     kv = kv.view(B, S, 1, cfg.head_dim)
     kv_comp = _ref_compressor_forward(custom.compressor, x, freqs_cis_ref).view(
         B, -1, 1, cfg.head_dim
@@ -928,15 +950,41 @@ def test_flash_base_checkpoint_index_matches_expected_layout():
     assert "lm_head.weight" in state_dict
     assert "model.norm.weight" in state_dict
     assert "model.hc_head_fn" in state_dict
+    assert "model.hc_head_scale" in state_dict
     assert "model.layers.0.attn.wq_a.weight" in state_dict
+    assert "model.layers.0.attn.wq_a.weight_scale_inv" in state_dict
     assert "model.layers.0.ffn.experts.0.gate_proj.weight" in state_dict
+    assert "model.layers.0.ffn.experts.0.gate_proj.weight_scale_inv" in state_dict
     assert "model.layers.0.ffn.experts.0.up_proj.weight" in state_dict
     assert "model.layers.0.ffn.experts.0.down_proj.weight" in state_dict
     assert "model.layers.0.ffn.shared_experts.gate_proj.weight" in state_dict
+    assert "model.layers.0.ffn.shared_experts.gate_proj.weight_scale_inv" in state_dict
     assert "model.layers.0.ffn.shared_experts.up_proj.weight" in state_dict
     assert "model.layers.0.ffn.shared_experts.down_proj.weight" in state_dict
     assert "model.layers.2.attn.compressor.wkv.weight" in state_dict
+    assert "model.layers.2.attn.compressor.wkv.weight_scale_inv" in state_dict
     assert "model.layers.2.attn.indexer.wq_b.weight" in state_dict
+    assert "model.layers.2.attn.indexer.wq_b.weight_scale_inv" in state_dict
+
+
+@pytest.mark.skipif(not hasattr(torch, "float8_e4m3fn"), reason="requires torch float8")
+def test_remap_dequantizes_wo_a_fp8_checkpoint_weight():
+    """HF inference dequantizes grouped wo_a weights during checkpoint conversion."""
+    scale = torch.full((1, 1), 0.25, dtype=torch.float32)
+    weight_fp32 = torch.linspace(-8.0, 8.0, 128 * 128, dtype=torch.float32).view(128, 128)
+    weight_fp8 = (weight_fp32 / scale).to(torch.float8_e4m3fn)
+    expected = (weight_fp8.float() * scale).bfloat16()
+
+    state_dict = {
+        "layers.0.attn.wo_a.weight": weight_fp8,
+        "layers.0.attn.wo_a.scale": scale,
+    }
+    _remap_deepseek_v4_checkpoint_keys(state_dict)
+
+    assert "model.layers.0.attn.wo_a.weight" in state_dict
+    assert "model.layers.0.attn.wo_a.weight_scale_inv" not in state_dict
+    assert state_dict["model.layers.0.attn.wo_a.weight"].dtype == torch.bfloat16
+    torch.testing.assert_close(state_dict["model.layers.0.attn.wo_a.weight"], expected)
 
 
 def test_load_state_dict_accepts_hf_checkpoint_layout():
@@ -1165,7 +1213,7 @@ def test_sparse_prefill_op_matches_inline_math():
         sin = sin_tbl[position_ids]
 
         # Reference: full DeepseekV4Attention forward — emits the op internally.
-        y_ref = custom(x, cos, sin, cos, sin)
+        y_ref = custom(x, cos, sin, cos, sin, cos_tbl, sin_tbl)
 
         # Explicit invocation of the op with manually prepared inputs
         rd = cfg.qk_rope_head_dim
@@ -1185,6 +1233,7 @@ def test_sparse_prefill_op_matches_inline_math():
         kv = custom.kv_norm(custom.wkv(x)).view(B, S, 1, cfg.head_dim)
         kv_nope, kv_pe = torch.split(kv, [cfg.head_dim - rd, rd], dim=-1)
         kv_pe = _apply_interleaved_rope(kv_pe, cos.unsqueeze(2), sin.unsqueeze(2))
+        kv_nope = _fake_fp8_act_quant(kv_nope, block_size=64)
         kv = torch.cat([kv_nope, kv_pe], dim=-1)
 
         if custom.indexer is not None:
@@ -1210,6 +1259,8 @@ def test_sparse_prefill_op_matches_inline_math():
             qr,
             cos,
             sin,
+            cos_tbl,
+            sin_tbl,
             custom.attn_sink,
             custom.compressor.wkv.weight,
             custom.compressor.wgate.weight,
@@ -1223,6 +1274,7 @@ def test_sparse_prefill_op_matches_inline_math():
             custom.head_dim,
             index_n_heads,
             index_head_dim,
+            custom.indexer.index_topk if custom.indexer is not None else 0,
             cfg.rms_norm_eps,
             0,  # layer_idx
             "mha_sparse",
@@ -1295,13 +1347,286 @@ def test_exported_graph_has_sparse_and_dense_attention_nodes():
         layer_idx, layer_type = extract_op_args(n, "layer_idx", "layer_type")
         assert layer_type == "mha_sparse"
         seen_sparse_layer_idxs.add(layer_idx)
-        scale, window_size, compress_ratio = extract_op_args(
-            n, "scale", "window_size", "compress_ratio"
+        scale, window_size, compress_ratio, index_topk = extract_op_args(
+            n, "scale", "window_size", "compress_ratio", "index_topk"
         )
         assert compress_ratio in (4, 128)
         assert window_size == cfg.sliding_window
         assert scale == cfg.head_dim**-0.5
+        if compress_ratio == 4:
+            assert index_topk == cfg.index_topk
+        else:
+            assert index_topk == 0
     assert seen_sparse_layer_idxs == {1, 2}
+
+
+def test_sparse_cache_transform_replaces_sparse_attention_nodes():
+    """KV-cache transform replaces sparse source nodes with cached sparse op nodes."""
+    cfg = _small_config()
+    cfg.num_hidden_layers = 3
+    cfg.compress_ratios = [0, 4, 128]
+    model = DeepseekV4ForCausalLM(cfg).eval()
+
+    B, S = 2, 4
+    input_ids = torch.randint(0, cfg.vocab_size, (B, S))
+    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    dynamic_shapes = (
+        {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+        {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+    )
+    gm = torch_export_to_gm(
+        model,
+        args=tuple(),
+        kwargs={"input_ids": input_ids, "position_ids": position_ids},
+        dynamic_shapes=dynamic_shapes,
+    )
+
+    from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
+    from tensorrt_llm._torch.auto_deploy.transform.interface import Stages
+    from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import (
+        InsertCachedDeepseekV4SparseAttention,
+    )
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+
+    cm = CachedSequenceInterface(
+        max_seq_len=cfg.max_position_embeddings,
+        max_batch_size=B,
+        max_num_tokens=B * cfg.max_position_embeddings,
+        device="cpu",
+        kv_cache_config=KvCacheConfig(dtype="bfloat16", free_gpu_memory_fraction=0.0),
+    )
+    transform = InsertCachedDeepseekV4SparseAttention.from_kwargs(stage=Stages.CACHE_INIT)
+    gm, info = transform._apply(gm, cm, factory=None, shared_config=None)
+
+    source_op = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attn.default
+    cached_op = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attn_with_cache.default
+    source_nodes = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is source_op]
+    cached_nodes = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is cached_op]
+
+    assert info.num_matches == 2
+    assert source_nodes == []
+    assert len(cached_nodes) == 2
+    assert len(cm._resource_lookup) == 14
+    # 19 source tensor args + 5 standard metadata args + 7 caches + 9 constants.
+    assert all(len(n.args) == 40 for n in cached_nodes)
+
+
+def test_exported_hc_mixes_use_fp32_matmul_not_linear_ops():
+    """HC mixers must not be exported as quantizable linear ops.
+
+    DeepSeek V4 HC parameters are fp32 routing/mixing parameters, not model
+    projection weights. Keeping them as explicit fp32 matmuls prevents the
+    fine-grained FP8 linear rewrite from consuming them.
+    """
+    cfg = _small_config()
+    cfg.num_hidden_layers = 1
+    cfg.compress_ratios = [0]
+    model = DeepseekV4ForCausalLM(cfg).eval()
+
+    B, S = 2, 2
+    input_ids = torch.randint(0, cfg.vocab_size, (B, S))
+    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    dynamic_shapes = (
+        {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+        {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+    )
+    gm = torch_export_to_gm(
+        model,
+        args=tuple(),
+        kwargs={"input_ids": input_ids, "position_ids": position_ids},
+        dynamic_shapes=dynamic_shapes,
+    )
+
+    hc_fn_nodes = {
+        n
+        for n in gm.graph.nodes
+        if n.op == "get_attr" and str(n.target).endswith(("hc_attn_fn", "hc_ffn_fn", "hc_head_fn"))
+    }
+    assert len(hc_fn_nodes) == 3
+
+    def node_depends_on_hc_fn(node: Node) -> bool:
+        seen: set[Node] = set()
+        stack: list[Node] = [node]
+        while stack:
+            current = stack.pop()
+            if current in hc_fn_nodes:
+                return True
+            if current in seen:
+                continue
+            seen.add(current)
+            for arg in current.all_input_nodes:
+                stack.append(arg)
+        return False
+
+    def arg_depends_on_hc_fn(arg) -> bool:
+        if isinstance(arg, Node):
+            return node_depends_on_hc_fn(arg)
+        if isinstance(arg, (tuple, list)):
+            return any(arg_depends_on_hc_fn(item) for item in arg)
+        return False
+
+    linear_targets = {
+        torch.ops.aten.linear.default,
+        torch.ops.auto_deploy.torch_linear_simple.default,
+    }
+    hc_linear_nodes = [
+        n
+        for n in gm.graph.nodes
+        if n.op == "call_function"
+        and n.target in linear_targets
+        and len(n.args) > 1
+        and arg_depends_on_hc_fn(n.args[1])
+    ]
+    assert not hc_linear_nodes
+
+    hc_matmul_nodes = [
+        n
+        for n in gm.graph.nodes
+        if n.op == "call_function"
+        and n.target == torch.ops.aten.matmul.default
+        and len(n.args) > 1
+        and arg_depends_on_hc_fn(n.args[1])
+    ]
+    assert len(hc_matmul_nodes) == 3
+
+
+def test_sparse_layers_do_not_break_tp_sharding_detection():
+    """Sparse attention's hidden-state input must not pull previous layers into TP analysis."""
+    cfg = _small_config()
+    cfg.num_hidden_layers = 3
+    cfg.compress_ratios = [0, 4, 128]
+    model = DeepseekV4ForCausalLM(cfg).eval()
+
+    B, S = 2, 4
+    input_ids = torch.randint(0, cfg.vocab_size, (B, S))
+    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    dynamic_shapes = (
+        {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+        {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+    )
+    gm = torch_export_to_gm(
+        model,
+        args=tuple(),
+        kwargs={"input_ids": input_ids, "position_ids": position_ids},
+        dynamic_shapes=dynamic_shapes,
+    )
+
+    from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
+
+    optimizer = InferenceOptimizer(
+        None,
+        {
+            "detect_sharding": {
+                "stage": "sharding",
+                "sharding_dims": ["tp", "ep", "bmm"],
+                "sharding_source": ["heuristic"],
+                "shard_all_unprocessed": False,
+            },
+        },
+    )
+    optimizer.shared_config.local_rank = 0
+    optimizer.shared_config.world_size = 2
+    optimizer(None, gm)
+
+    container = gm._sharding_transform_container
+    sharded_by_target = {t.target_node: t for t in container.weight_sharding_transforms}
+
+    from tensorrt_llm._torch.auto_deploy.transform.library.sharding import SplitDimension
+    from tensorrt_llm._torch.auto_deploy.utils.node_utils import LayerType
+
+    for layer_idx in (1, 2):
+        for projection_name in ("wq_a", "wq_b", "wkv", "wo_b"):
+            matches = [
+                t
+                for name, t in sharded_by_target.items()
+                if f"model_layers_{layer_idx}_attn_{projection_name}" in name
+            ]
+            assert len(matches) == 1
+            transform = matches[0]
+            assert transform.split_dim == SplitDimension.COLUMN
+            assert transform.dist_op == "all_gather"
+            assert transform.layer_type == LayerType.UNKNOWN
+
+        assert not any(f"model_layers_{layer_idx}_attn_wo_a" in name for name in sharded_by_target)
+
+    assert len(container.ep_transforms) == cfg.num_hidden_layers
+
+
+def test_sharded_sparse_layers_still_rewrite_to_cached_sparse_attention():
+    """Sharding executor must compose with sparse attention cache insertion."""
+    cfg = _small_config()
+    cfg.num_hidden_layers = 3
+    cfg.compress_ratios = [0, 4, 128]
+    model = DeepseekV4ForCausalLM(cfg).eval()
+
+    B, S = 2, 4
+    input_ids = torch.randint(0, cfg.vocab_size, (B, S))
+    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    dynamic_shapes = (
+        {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+        {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+    )
+    gm = torch_export_to_gm(
+        model,
+        args=tuple(),
+        kwargs={"input_ids": input_ids, "position_ids": position_ids},
+        dynamic_shapes=dynamic_shapes,
+    )
+
+    from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
+    from tensorrt_llm._torch.auto_deploy.transform.interface import Stages
+    from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import (
+        InsertCachedDeepseekV4SparseAttention,
+    )
+    from tensorrt_llm._torch.auto_deploy.transform.library.sharding import ShardingTransformExecutor
+    from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+
+    optimizer = InferenceOptimizer(
+        None,
+        {
+            "detect_sharding": {
+                "stage": "sharding",
+                "sharding_dims": ["tp", "ep", "bmm"],
+                "sharding_source": ["heuristic"],
+                "shard_all_unprocessed": False,
+            },
+        },
+    )
+    optimizer.shared_config.local_rank = 0
+    optimizer.shared_config.world_size = 2
+    optimizer(None, gm)
+
+    executor = ShardingTransformExecutor.from_kwargs(
+        stage=Stages.SHARDING,
+        run_graph_cleanup=False,
+        requires_clean_graph=False,
+    )
+    gm, shard_info = executor._apply(gm, cm=None, factory=None, shared_config=None)
+    assert shard_info.num_matches > 0
+
+    cm = CachedSequenceInterface(
+        max_seq_len=cfg.max_position_embeddings,
+        max_batch_size=B,
+        max_num_tokens=B * cfg.max_position_embeddings,
+        device="cpu",
+        kv_cache_config=KvCacheConfig(dtype="bfloat16", free_gpu_memory_fraction=0.0),
+    )
+    cache_transform = InsertCachedDeepseekV4SparseAttention.from_kwargs(
+        stage=Stages.CACHE_INIT,
+        run_graph_cleanup=False,
+        requires_clean_graph=False,
+    )
+    gm, cache_info = cache_transform._apply(gm, cm, factory=None, shared_config=None)
+
+    source_op = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attn.default
+    cached_op = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attn_with_cache.default
+    source_nodes = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is source_op]
+    cached_nodes = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is cached_op]
+
+    assert cache_info.num_matches == 2
+    assert source_nodes == []
+    assert len(cached_nodes) == 2
 
 
 def test_sparse_descriptor_resource_handler_shapes():
@@ -1340,6 +1665,7 @@ def test_sparse_descriptor_resource_handler_shapes():
     sparse_op = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attn.default
     sparse_nodes = [n for n in gm.graph.nodes if n.op == "call_function" and n.target is sparse_op]
     assert sparse_nodes, "Expected at least one sparse attention node"
+    assert DeepseekV4SparseAttentionDescriptor.get_num_qkv_args() == 19
 
     cache_config = KvCacheConfig(dtype="bfloat16")
     handlers = DeepseekV4SparseAttentionDescriptor.get_cache_initializers(

@@ -195,6 +195,15 @@ class HFQuantConfigReader(QuantConfigReader):
     """
 
     _ALWAYS_EXCLUDE = ("lm_head", "model.embed_tokens")
+    _DEEPSEEK_V4_FP8_EXCLUDE = (
+        "model.layers.*.attn.compressor.wkv",
+        "model.layers.*.attn.compressor.wgate",
+        "model.layers.*.attn.indexer.weights_proj",
+        "model.layers.*.attn.indexer.compressor.wkv",
+        "model.layers.*.attn.indexer.compressor.wgate",
+        "model.layers.*.attn.wo_a",
+        "model.layers.*.ffn.gate",
+    )
     _SUPPORTED_QUANT_METHODS = ("mxfp4", "gptq", "fp8")
 
     def __init__(self):
@@ -210,6 +219,13 @@ class HFQuantConfigReader(QuantConfigReader):
         # Inject default exclusion, add "model.embed_tokens" for "tie_word_embedding:true" case
         excludes = qconf.get("exclude_modules", [])
         qconf["exclude_modules"] = excludes + [n for n in self._ALWAYS_EXCLUDE if n not in excludes]
+        if (
+            config.get("model_type") == "deepseek_v4"
+            and str(qconf.get("quant_method", "")).lower() == "fp8"
+        ):
+            qconf["exclude_modules"].extend(
+                n for n in self._DEEPSEEK_V4_FP8_EXCLUDE if n not in qconf["exclude_modules"]
+            )
 
         self._quant_config = qconf
         from transformers.quantizers import AutoHfQuantizer

@@ -189,6 +189,18 @@ def _resolve_torch_fn(act_fn: ActivationType) -> Callable[[torch.Tensor], torch.
     return torch_fn
 
 
+def _gated_mlp_product(
+    gate_out: torch.Tensor,
+    up_out: torch.Tensor,
+    torch_act_fn: Callable[[torch.Tensor], torch.Tensor],
+    swiglu_limit: float,
+) -> torch.Tensor:
+    if swiglu_limit > 0.0:
+        gate_out = gate_out.clamp(max=swiglu_limit)
+        up_out = up_out.clamp(min=-swiglu_limit, max=swiglu_limit)
+    return torch_act_fn(gate_out) * up_out
+
+
 def _template_moe(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
@@ -283,6 +295,7 @@ def torch_moe(
     w3_weight: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    swiglu_limit: float = 0.0,
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
@@ -325,7 +338,13 @@ def torch_moe(
             W2 = w2_weight[i]  # (H, I)
             W3 = w3_weight[i]  # (I, H)
             return lambda inp: F.linear(
-                torch_act_fn(F.linear(inp.to(W1.dtype), W1)) * F.linear(inp.to(W3.dtype), W3), W2
+                _gated_mlp_product(
+                    F.linear(inp.to(W1.dtype), W1),
+                    F.linear(inp.to(W3.dtype), W3),
+                    torch_act_fn,
+                    swiglu_limit,
+                ),
+                W2,
             )
 
         mlps = [make_mlp(i) for i in range(len(w1_weight))]
@@ -360,6 +379,7 @@ def torch_moe_fake(
     w3_weight: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    swiglu_limit: float = 0.0,
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
@@ -450,6 +470,7 @@ def torch_quant_fp8_moe(
     w3_weight_scale: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    swiglu_limit: float = 0.0,
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
@@ -507,7 +528,7 @@ def torch_quant_fp8_moe(
                     input_scale=w3_input_scale[i],
                     weight_scale=w3_weight_scale[i],
                 )
-                prod = torch_act_fn(gate_out) * up_out
+                prod = _gated_mlp_product(gate_out, up_out, torch_act_fn, swiglu_limit)
                 return torch.ops.auto_deploy.torch_quant_fp8_linear(
                     prod,
                     w2_weight[i],
@@ -570,6 +591,7 @@ def torch_quant_fp8_moe_fake(
     w3_weight_scale: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    swiglu_limit: float = 0.0,
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
@@ -597,6 +619,7 @@ def torch_quant_nvfp4_moe(
     w3_alpha: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    swiglu_limit: float = 0.0,
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
@@ -662,7 +685,7 @@ def torch_quant_nvfp4_moe(
                     weight_scale=w3_weight_scale[i],
                     alpha=w3_alpha[i],
                 )
-                prod = torch_act_fn(gate_out) * up_out
+                prod = _gated_mlp_product(gate_out, up_out, torch_act_fn, swiglu_limit)
                 return torch.ops.auto_deploy.torch_quant_nvfp4_linear(
                     prod,
                     w2_weight[i],
@@ -733,6 +756,7 @@ def torch_quant_nvfp4_moe_fake(
     w3_alpha: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    swiglu_limit: float = 0.0,
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
@@ -804,6 +828,7 @@ def torch_quant_finegrained_fp8_moe(
     w3_weight_scale_inv: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    swiglu_limit: float = 0.0,
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
@@ -852,7 +877,7 @@ def torch_quant_finegrained_fp8_moe(
                     input_zp=[],
                     weight_zp=[],
                 )
-                prod = torch_act_fn(gate_out) * up_out
+                prod = _gated_mlp_product(gate_out, up_out, torch_act_fn, swiglu_limit)
                 return torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear(
                     prod,
                     w2_weight[i],
@@ -918,6 +943,7 @@ def torch_quant_finegrained_fp8_moe_fake(
     w3_weight_scale_inv: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    swiglu_limit: float = 0.0,
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,

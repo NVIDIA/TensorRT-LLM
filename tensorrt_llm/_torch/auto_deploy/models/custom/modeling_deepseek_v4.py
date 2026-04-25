@@ -14,7 +14,9 @@ This implementation differs from the original in the following ways:
 * Sparse attention is expressed as ``torch_attention`` plus an explicit top-k mask
 * Compressed-KV token path is implemented for prefill only
 * No MTP blocks
-* No FP4/FP8 quantization in the forward graph (handled by AD transforms at load time)
+* Weight FP4/FP8 quantization is handled by AD transforms at load time; activation
+  fake-quantization in the attention KV/indexer paths is preserved because it is
+  part of the reference inference math.
 
 Key architectural features preserved:
 * Hyper-Connections (HC): hc_mult copies of hidden state between blocks with learnable
@@ -174,6 +176,7 @@ _CHECKPOINT_KEY_REPLACEMENTS = (
     (r"\.ffn\.shared_experts\.w1\.", ".ffn.shared_experts.gate_proj."),
     (r"\.ffn\.shared_experts\.w3\.", ".ffn.shared_experts.up_proj."),
     (r"\.ffn\.shared_experts\.w2\.", ".ffn.shared_experts.down_proj."),
+    (r"\.scale$", ".weight_scale_inv"),
 )
 
 
@@ -225,6 +228,32 @@ def _unstack_deepseek_v4_expert_tensors(state_dict: dict[str, torch.Tensor]) -> 
                 )
 
 
+def _dequantize_deepseek_v4_wo_a(state_dict: dict[str, torch.Tensor]) -> None:
+    """Dequantize grouped ``wo_a`` FP8 weights the same way HF ``convert.py`` does."""
+    fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+    if fp8_dtype is None:
+        return
+
+    for weight_key in list(state_dict.keys()):
+        if not re.match(r"^(?:model\.)?layers\.\d+\.attn\.wo_a\.weight$", weight_key):
+            continue
+        scale_key = weight_key.removesuffix(".weight") + ".weight_scale_inv"
+        if scale_key not in state_dict:
+            continue
+        weight = state_dict[weight_key]
+        scale = state_dict[scale_key]
+        if weight.dtype != fp8_dtype:
+            continue
+
+        if weight.shape[0] % 128 != 0 or weight.shape[1] % 128 != 0:
+            continue
+
+        weight = weight.unflatten(0, (-1, 128)).unflatten(-1, (-1, 128))
+        weight = weight.float() * scale[:, None, :, None].float()
+        state_dict[weight_key] = weight.flatten(2, 3).flatten(0, 1).bfloat16()
+        del state_dict[scale_key]
+
+
 def _remap_deepseek_v4_checkpoint_keys(state_dict: dict[str, torch.Tensor]) -> None:
     _unstack_deepseek_v4_expert_tensors(state_dict)
     for key in list(state_dict.keys()):
@@ -232,6 +261,7 @@ def _remap_deepseek_v4_checkpoint_keys(state_dict: dict[str, torch.Tensor]) -> N
         if new_key != key:
             state_dict[new_key] = state_dict.pop(key)
     _unstack_deepseek_v4_expert_tensors(state_dict)
+    _dequantize_deepseek_v4_wo_a(state_dict)
 
 
 class DeepseekV4RMSNorm(nn.Module):
@@ -316,6 +346,62 @@ def _apply_interleaved_rope(
     out_a = a * cos - b * sin
     out_b = a * sin + b * cos
     return torch.stack([out_a, out_b], dim=-1).flatten(-2).type_as(x)
+
+
+def _ceil_pow2_scale(amax: torch.Tensor, max_value: float, min_value: float) -> torch.Tensor:
+    amax = amax.clamp_min(min_value)
+    return torch.pow(2.0, torch.ceil(torch.log2(amax / max_value)))
+
+
+def _fake_fp8_act_quant(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
+    """Reference in-place ``act_quant`` approximation for DeepSeek V4 KV tensors."""
+    dim = x.shape[-1]
+    if dim == 0 or dim % block_size != 0:
+        return x
+
+    dtype = x.dtype
+    x_float = x.float()
+    grouped = x_float.reshape(*x_float.shape[:-1], dim // block_size, block_size)
+    scale = _ceil_pow2_scale(grouped.abs().amax(dim=-1, keepdim=True), 448.0, 1.0e-4)
+    quant = torch.clamp(grouped / scale, -448.0, 448.0).to(dtype).float()
+    return (quant * scale).reshape_as(x_float).to(dtype)
+
+
+def _fake_fp4_act_quant(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+    """Reference in-place ``fp4_act_quant`` approximation for DeepSeek V4 indexer tensors."""
+    dim = x.shape[-1]
+    if dim == 0 or dim % block_size != 0:
+        return x
+
+    dtype = x.dtype
+    x_float = x.float()
+    grouped = x_float.reshape(*x_float.shape[:-1], dim // block_size, block_size)
+    scale = _ceil_pow2_scale(grouped.abs().amax(dim=-1, keepdim=True), 6.0, 6.0 * 2.0**-126)
+    normalized = torch.clamp(grouped / scale, -6.0, 6.0)
+    levels = normalized.new_tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    level_idx = (normalized.abs().unsqueeze(-1) - levels).abs().argmin(dim=-1)
+    quant = levels[level_idx] * normalized.sign()
+    return (quant * scale).reshape_as(x_float).to(dtype)
+
+
+def _hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
+    """Hadamard rotation used before FP4 simulation in the DeepSeek V4 indexer."""
+    dim = x.shape[-1]
+    if dim <= 1:
+        return x
+    if dim & (dim - 1):
+        raise ValueError(f"Hadamard rotation requires power-of-two dimension, got {dim}.")
+
+    orig_shape = x.shape
+    y = x.float()
+    width = 1
+    while width < dim:
+        y = y.reshape(*y.shape[:-1], dim // (2 * width), 2, width)
+        left = y[..., 0, :]
+        right = y[..., 1, :]
+        y = torch.cat([left + right, left - right], dim=-1).reshape(orig_shape)
+        width *= 2
+    return (y * (dim**-0.5)).to(x.dtype)
 
 
 class DeepseekV4RotaryEmbedding(nn.Module):
@@ -506,6 +592,7 @@ class DeepseekV4MoE(nn.Module):
 
     def __init__(self, config: DeepseekV4Config, layer_idx: int):
         super().__init__()
+        self.swiglu_limit = config.swiglu_limit
         self.experts = nn.ModuleList(
             [
                 DeepseekV4MLP(
@@ -534,6 +621,7 @@ class DeepseekV4MoE(nn.Module):
             w3_weight=[e.up_proj.weight for e in self.experts],
             is_gated_mlp=True,
             act_fn=int(ActivationType.Silu),
+            swiglu_limit=self.swiglu_limit,
         )
         return routed.view(*orig_shape) + self.shared_experts(hidden_states)
 
@@ -620,7 +708,7 @@ def _manual_attention_with_sinks(
     scores = scores + attn_mask.float()
 
     sink_logits = sinks.float().reshape(1, n_heads, 1, 1).expand(bsz, n_heads, seqlen, 1)
-    logits_max = scores.max(dim=-1, keepdim=True).values
+    logits_max = torch.maximum(scores.max(dim=-1, keepdim=True).values, sink_logits)
     exp_scores = torch.exp(scores - logits_max)
     exp_sinks = torch.exp(sink_logits - logits_max)
     attn = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sinks)
@@ -653,12 +741,14 @@ class DeepseekV4Compressor(nn.Module):
         config: DeepseekV4Config,
         compress_ratio: int,
         head_dim: int,
+        rotate: bool = False,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.head_dim = head_dim
         self.rope_head_dim = config.qk_rope_head_dim
         self.compress_ratio = compress_ratio
+        self.rotate = rotate
         self.overlap = compress_ratio == 4
         coff = 1 + int(self.overlap)
 
@@ -703,6 +793,12 @@ class DeepseekV4Compressor(nn.Module):
         sin_comp = sin[:, chunk_start]
         nope, pe = torch.split(compressed, [self.head_dim - rd, rd], dim=-1)
         pe = _apply_interleaved_rope(pe, cos_comp, sin_comp)
+        compressed = torch.cat([nope, pe], dim=-1)
+        if self.rotate:
+            return _fake_fp4_act_quant(_hadamard_rotate(compressed), block_size=32)
+
+        nope, pe = torch.split(compressed, [self.head_dim - rd, rd], dim=-1)
+        nope = _fake_fp8_act_quant(nope, block_size=64)
         return torch.cat([nope, pe], dim=-1)
 
 
@@ -722,7 +818,9 @@ class DeepseekV4Indexer(nn.Module):
             config.q_lora_rank, config.index_n_heads * config.index_head_dim, bias=False
         )
         self.weights_proj = nn.Linear(config.hidden_size, config.index_n_heads, bias=False)
-        self.compressor = DeepseekV4Compressor(config, compress_ratio, self.index_head_dim)
+        self.compressor = DeepseekV4Compressor(
+            config, compress_ratio, self.index_head_dim, rotate=True
+        )
 
     def forward(
         self,
@@ -740,6 +838,7 @@ class DeepseekV4Indexer(nn.Module):
         q_nope, q_pe = torch.split(q, [self.index_head_dim - rd, rd], dim=-1)
         q_pe = _apply_interleaved_rope(q_pe, cos.unsqueeze(2), sin.unsqueeze(2))
         q = torch.cat([q_nope, q_pe], dim=-1)
+        q = _fake_fp4_act_quant(_hadamard_rotate(q), block_size=32)
 
         index_k = self.compressor(hidden_states, cos, sin)
         weights = self.weights_proj(hidden_states).float() * (
@@ -749,15 +848,36 @@ class DeepseekV4Indexer(nn.Module):
         index_score = torch.einsum("bshd,btd->bsht", q, index_k).float()
         index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
 
-        compressed_positions = torch.arange(seqlen, device=hidden_states.device)
+        num_compressed = seqlen // ratio
+        if self.index_topk == 0:
+            return torch.empty(bsz, seqlen, 0, device=hidden_states.device, dtype=torch.int64)
+        if num_compressed == 0:
+            return torch.full(
+                (bsz, seqlen, self.index_topk),
+                -1,
+                device=hidden_states.device,
+                dtype=torch.int64,
+            )
+
+        index_score = index_score[..., :num_compressed]
+        compressed_positions = torch.arange(num_compressed, device=hidden_states.device)
         valid_count = torch.arange(1, seqlen + 1, device=hidden_states.device).unsqueeze(1) // ratio
         future_mask = compressed_positions.unsqueeze(0) >= valid_count
-        valid = ~future_mask
         index_score = index_score.masked_fill(future_mask.unsqueeze(0), -1.0e20)
 
-        sorted_idxs = index_score.argsort(dim=-1, descending=True)
-        sorted_valid = valid.unsqueeze(0).expand(bsz, -1, -1).gather(-1, sorted_idxs)
-        return torch.where(sorted_valid, sorted_idxs + offset, -1)
+        k = min(self.index_topk, num_compressed)
+        topk_idxs = index_score.topk(k, dim=-1).indices
+        invalid = topk_idxs >= valid_count.unsqueeze(0)
+        topk_idxs = torch.where(invalid, -1, topk_idxs + offset)
+        if k < self.index_topk:
+            pad = torch.full(
+                (bsz, seqlen, self.index_topk - k),
+                -1,
+                device=hidden_states.device,
+                dtype=topk_idxs.dtype,
+            )
+            topk_idxs = torch.cat([topk_idxs, pad], dim=-1)
+        return topk_idxs.to(torch.int64)
 
 
 class DeepseekV4Attention(nn.Module):
@@ -821,6 +941,8 @@ class DeepseekV4Attention(nn.Module):
         sin_base: torch.Tensor,
         cos_compress: torch.Tensor,
         sin_compress: torch.Tensor,
+        cos_compress_table: Optional[torch.Tensor] = None,
+        sin_compress_table: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         bsz, seqlen, _ = hidden_states.shape
 
@@ -845,6 +967,7 @@ class DeepseekV4Attention(nn.Module):
         kv_nope, kv_pe = torch.split(kv, [self.nope_head_dim, self.rope_head_dim], dim=-1)
         q_pe = _apply_interleaved_rope(q_pe, cos, sin)
         kv_pe = _apply_interleaved_rope(kv_pe, cos, sin)
+        kv_nope = _fake_fp8_act_quant(kv_nope, block_size=64)
         q = torch.cat([q_nope, q_pe], dim=-1)
         kv = torch.cat([kv_nope, kv_pe], dim=-1)
 
@@ -852,6 +975,8 @@ class DeepseekV4Attention(nn.Module):
             # Sparse compressed attention: emit a dedicated custom op so the KV-cache
             # transform can recognise and replace it with a cached variant. The op
             # owns the Compressor/Indexer math internally; we forward their weights.
+            assert cos_compress_table is not None
+            assert sin_compress_table is not None
             cos_flat = cos.squeeze(2)
             sin_flat = sin.squeeze(2)
             if self.indexer is not None:
@@ -875,6 +1000,8 @@ class DeepseekV4Attention(nn.Module):
                 qr,
                 cos_flat,
                 sin_flat,
+                cos_compress_table,
+                sin_compress_table,
                 self.attn_sink,
                 self.compressor.wkv.weight,
                 self.compressor.wgate.weight,
@@ -893,6 +1020,7 @@ class DeepseekV4Attention(nn.Module):
                 self.head_dim,
                 self.indexer.index_n_heads if self.indexer is not None else 0,
                 self.indexer.index_head_dim if self.indexer is not None else 0,
+                self.indexer.index_topk if self.indexer is not None else 0,
                 self.rms_eps,
                 self.layer_idx,
                 "mha_sparse",
@@ -975,7 +1103,7 @@ class DeepseekV4Block(nn.Module):
         x_flat = x.flatten(2)
         x_norm = x_flat.float()
         rsqrt = torch.rsqrt(x_norm.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(x_flat, hc_fn).float() * rsqrt
+        mixes = torch.matmul(x_norm, hc_fn.float().transpose(0, 1)) * rsqrt
         pre, post, comb = _hc_split_sinkhorn(
             mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps
         )
@@ -1003,6 +1131,8 @@ class DeepseekV4Block(nn.Module):
         sin_base: torch.Tensor,
         cos_compress: torch.Tensor,
         sin_compress: torch.Tensor,
+        cos_compress_table: Optional[torch.Tensor] = None,
+        sin_compress_table: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Attention sub-layer
         residual = hidden_states
@@ -1010,7 +1140,15 @@ class DeepseekV4Block(nn.Module):
             hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         x = self.attn_norm(x)
-        x = self.attn(x, cos_base, sin_base, cos_compress, sin_compress)
+        x = self.attn(
+            x,
+            cos_base,
+            sin_base,
+            cos_compress,
+            sin_compress,
+            cos_compress_table,
+            sin_compress_table,
+        )
         hidden_states = self._hc_post(x, residual, post, comb)
 
         # FFN (MoE) sub-layer
@@ -1097,7 +1235,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         x_flat = x.flatten(2)
         x_norm = x_flat.float()
         rsqrt = torch.rsqrt(x_norm.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(x_flat, self.hc_head_fn).float() * rsqrt
+        mixes = torch.matmul(x_norm, self.hc_head_fn.float().transpose(0, 1)) * rsqrt
         pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.hc_eps
         y = torch.sum(pre.unsqueeze(-1) * x_norm.view(shape), dim=2)
         return y.to(dtype)
@@ -1138,7 +1276,16 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         sin_compress = sin_compress_table[position_ids]
 
         for layer in self.layers:
-            h = layer(h, input_ids, cos_base, sin_base, cos_compress, sin_compress)
+            h = layer(
+                h,
+                input_ids,
+                cos_base,
+                sin_base,
+                cos_compress,
+                sin_compress,
+                cos_compress_table,
+                sin_compress_table,
+            )
 
         # HC head collapse -> final RMSNorm
         h = self._hc_head_collapse(h)

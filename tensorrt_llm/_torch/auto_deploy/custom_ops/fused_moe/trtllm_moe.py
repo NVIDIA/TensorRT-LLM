@@ -44,6 +44,14 @@ def _check_moe_alltoall(mapping_config: str, max_num_tokens: int) -> Tuple[Mappi
     return mapping, enable_alltoall
 
 
+def _swiglu_limit_tensor(
+    x: torch.Tensor, swiglu_limit: float, num_experts_on_rank: int
+) -> torch.Tensor | None:
+    if swiglu_limit <= 0.0:
+        return None
+    return torch.full((num_experts_on_rank,), swiglu_limit, device=x.device, dtype=torch.float32)
+
+
 def _run_moe_with_alltoall(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
@@ -61,6 +69,7 @@ def _run_moe_with_alltoall(
     use_deepseek_fp8_block_scale: bool = False,
     finegrained_fp8_block_scales: Tuple[torch.Tensor, torch.Tensor] | None = None,
     is_gated_mlp: bool = True,
+    swiglu_limit: float = 0.0,
 ) -> torch.Tensor:
     """
     Execute MoE with all-to-all dispatch/combine pattern.
@@ -104,6 +113,7 @@ def _run_moe_with_alltoall(
             ``use_deepseek_fp8_block_scale`` internally.
         is_gated_mlp: Whether gated MLP is used. Needed by the Blackwell finegrained
             FP8 path to compute ``intermediate_size``.
+        swiglu_limit: Optional DeepSeek-style clamp for the gate/up branches.
 
     Returns:
         2-D output tensor ``(num_tokens, hidden_size)`` — the caller reshapes to the
@@ -255,6 +265,7 @@ def _run_moe_with_alltoall(
             tuner_top_k=top_k,
             activation_type=activation_type,
             use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+            swiglu_limit=_swiglu_limit_tensor(dispatched_x, swiglu_limit, local_num_experts),
             use_w4_group_scaling=False,
             use_int8_woq_per_channel=False,
             use_mxfp8_act_scaling=False,
@@ -385,6 +396,7 @@ def trtllm_moe_fused(
     w2_stacked_weight: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    swiglu_limit: float = 0.0,
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
@@ -433,6 +445,7 @@ def trtllm_moe_fused(
             activation_type=activation_type,
             mapping=mapping,
             max_num_tokens=max_num_tokens,
+            swiglu_limit=swiglu_limit,
         ).view(x_shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates (from sharding.py),
@@ -447,6 +460,7 @@ def trtllm_moe_fused(
         fc2_expert_biases=None,
         output_dtype=x.dtype,
         quant_scales=quant_scales,
+        swiglu_limit=_swiglu_limit_tensor(x, swiglu_limit, w3_w1_stacked_weight.shape[0]),
         activation_type=activation_type,
     )[0].view(x_shape)
 
@@ -460,6 +474,7 @@ def trtllm_moe_fused_fake(
     w2_stacked_weight: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    swiglu_limit: float = 0.0,
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
@@ -499,6 +514,7 @@ def trtllm_quant_fp8_moe_fused(
     fc2_dequant_scale: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    swiglu_limit: float = 0.0,
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
@@ -579,6 +595,7 @@ def trtllm_quant_fp8_moe_fused(
             activation_type=act_fn,
             mapping=mapping,
             max_num_tokens=max_num_tokens,
+            swiglu_limit=swiglu_limit,
         ).view(x_shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates.
@@ -593,6 +610,7 @@ def trtllm_quant_fp8_moe_fused(
         fc2_expert_biases=None,
         output_dtype=x.dtype,
         quant_scales=quant_scales,
+        swiglu_limit=_swiglu_limit_tensor(x_q_fp8, swiglu_limit, fc1_expert_weights.shape[0]),
         activation_type=act_fn,
     )
 
@@ -613,6 +631,7 @@ def trtllm_quant_fp8_moe_fused_fake(
     fc2_dequant_scale: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    swiglu_limit: float = 0.0,
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
@@ -636,6 +655,7 @@ def trtllm_quant_nvfp4_moe_fused(
     fc2_alpha: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    swiglu_limit: float = 0.0,
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
@@ -708,6 +728,7 @@ def trtllm_quant_nvfp4_moe_fused(
             mapping=mapping,
             max_num_tokens=max_num_tokens,
             nvfp4_act_global_scale=fc1_act_global_scale,
+            swiglu_limit=swiglu_limit,
         ).view(x.shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates.
@@ -732,6 +753,7 @@ def trtllm_quant_nvfp4_moe_fused(
         output_dtype=x.dtype,
         quant_scales=quant_scales,
         input_sf=input_blockscale,
+        swiglu_limit=_swiglu_limit_tensor(x_q_fp4, swiglu_limit, fc1_expert_weights_fp4.shape[0]),
         activation_type=act_fn,
     )[0].view(x.shape)
 
@@ -751,6 +773,7 @@ def trtllm_quant_nvfp4_moe_fused_fake(
     fc2_alpha: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    swiglu_limit: float = 0.0,
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
@@ -769,6 +792,7 @@ def trtllm_quant_finegrained_fp8_moe_fused(
     fc2_weight_scale: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    swiglu_limit: float = 0.0,
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
@@ -834,6 +858,7 @@ def trtllm_quant_finegrained_fp8_moe_fused(
             max_num_tokens=max_num_tokens,
             finegrained_fp8_block_scales=(fc1_weight_scale, fc2_weight_scale),
             is_gated_mlp=is_gated_mlp,
+            swiglu_limit=swiglu_limit,
         ).view(x_shape)
 
     # EP WITH ALL-REDUCE PATH: Expert IDs are in LOCAL coordinates (from sharding.py),
@@ -901,6 +926,7 @@ def trtllm_quant_finegrained_fp8_moe_fused(
             output_dtype=x.dtype,
             quant_scales=quant_scales,
             activation_type=act_fn,
+            swiglu_limit=_swiglu_limit_tensor(x2d, swiglu_limit, fc1_expert_weights.shape[0]),
             use_deepseek_fp8_block_scale=True,
         )
 
@@ -918,6 +944,7 @@ def trtllm_quant_finegrained_fp8_moe_fused_fake(
     fc2_weight_scale: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    swiglu_limit: float = 0.0,
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
@@ -941,11 +968,14 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
     fc2_alpha: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    swiglu_limit: float = 0.0,
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
+    if swiglu_limit > 0.0:
+        raise NotImplementedError("TRTLLM-Gen NVFP4 MoE does not support swiglu_limit.")
     if act_fn in (ActivationType.Gelu, ActivationType.Geglu):
         raise ValueError(
             f"NVFP4 TRTLLM-Gen MoE does not support activation "
@@ -1052,6 +1082,7 @@ def trtllm_nvfp4_trtllm_gen_moe_fused_fake(
     fc2_alpha: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    swiglu_limit: float = 0.0,
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,

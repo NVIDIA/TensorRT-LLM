@@ -76,6 +76,62 @@ def _apply_interleaved_rope(
     return torch.stack([out_a, out_b], dim=-1).flatten(-2).type_as(x)
 
 
+def _ceil_pow2_scale(amax: torch.Tensor, max_value: float, min_value: float) -> torch.Tensor:
+    amax = amax.clamp_min(min_value)
+    return torch.pow(2.0, torch.ceil(torch.log2(amax / max_value)))
+
+
+def _fake_fp8_act_quant(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
+    """Reference in-place ``act_quant`` approximation for DeepSeek V4 KV tensors."""
+    dim = x.shape[-1]
+    if dim == 0 or dim % block_size != 0:
+        return x
+
+    dtype = x.dtype
+    x_float = x.float()
+    grouped = x_float.reshape(*x_float.shape[:-1], dim // block_size, block_size)
+    scale = _ceil_pow2_scale(grouped.abs().amax(dim=-1, keepdim=True), 448.0, 1.0e-4)
+    quant = torch.clamp(grouped / scale, -448.0, 448.0).to(dtype).float()
+    return (quant * scale).reshape_as(x_float).to(dtype)
+
+
+def _fake_fp4_act_quant(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+    """Reference in-place ``fp4_act_quant`` approximation for DeepSeek V4 indexer tensors."""
+    dim = x.shape[-1]
+    if dim == 0 or dim % block_size != 0:
+        return x
+
+    dtype = x.dtype
+    x_float = x.float()
+    grouped = x_float.reshape(*x_float.shape[:-1], dim // block_size, block_size)
+    scale = _ceil_pow2_scale(grouped.abs().amax(dim=-1, keepdim=True), 6.0, 6.0 * 2.0**-126)
+    normalized = torch.clamp(grouped / scale, -6.0, 6.0)
+    levels = normalized.new_tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    level_idx = (normalized.abs().unsqueeze(-1) - levels).abs().argmin(dim=-1)
+    quant = levels[level_idx] * normalized.sign()
+    return (quant * scale).reshape_as(x_float).to(dtype)
+
+
+def _hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
+    """Hadamard rotation used before FP4 simulation in the DeepSeek V4 indexer."""
+    dim = x.shape[-1]
+    if dim <= 1:
+        return x
+    if dim & (dim - 1):
+        raise ValueError(f"Hadamard rotation requires power-of-two dimension, got {dim}.")
+
+    orig_shape = x.shape
+    y = x.float()
+    width = 1
+    while width < dim:
+        y = y.reshape(*y.shape[:-1], dim // (2 * width), 2, width)
+        left = y[..., 0, :]
+        right = y[..., 1, :]
+        y = torch.cat([left + right, left - right], dim=-1).reshape(orig_shape)
+        width *= 2
+    return (y * (dim**-0.5)).to(x.dtype)
+
+
 def _overlap_transform(tensor: torch.Tensor, head_dim: int, value: float = 0.0) -> torch.Tensor:
     """HF DeepSeek V4 overlap transform used by ratio-4 compression."""
     bsz, _, ratio, _ = tensor.shape
@@ -163,7 +219,7 @@ def _manual_attention_with_sinks(
     scores = scores + attn_mask.float()
 
     sink_logits = sinks.float().reshape(1, n_heads, 1, 1).expand(bsz, n_heads, seqlen, 1)
-    logits_max = scores.max(dim=-1, keepdim=True).values
+    logits_max = torch.maximum(scores.max(dim=-1, keepdim=True).values, sink_logits)
     exp_scores = torch.exp(scores - logits_max)
     exp_sinks = torch.exp(sink_logits - logits_max)
     attn = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sinks)
@@ -189,6 +245,7 @@ def _sparse_compressor(
     rope_head_dim: int,
     compress_ratio: int,
     rms_norm_eps: float,
+    rotate: bool = False,
 ) -> torch.Tensor:
     """Stateless equivalent of DeepseekV4Compressor.forward (prefill only)."""
     bsz, seqlen, _ = hidden_states.shape
@@ -229,6 +286,12 @@ def _sparse_compressor(
     sin_comp = sin[:, chunk_start]
     nope, pe = torch.split(compressed, [head_dim - rope_head_dim, rope_head_dim], dim=-1)
     pe = _apply_interleaved_rope(pe, cos_comp, sin_comp)
+    compressed = torch.cat([nope, pe], dim=-1)
+    if rotate:
+        return _fake_fp4_act_quant(_hadamard_rotate(compressed), block_size=32)
+
+    nope, pe = torch.split(compressed, [head_dim - rope_head_dim, rope_head_dim], dim=-1)
+    nope = _fake_fp8_act_quant(nope, block_size=64)
     return torch.cat([nope, pe], dim=-1)
 
 
@@ -247,6 +310,7 @@ def _sparse_indexer(
     *,
     index_n_heads: int,
     index_head_dim: int,
+    index_topk: int,
     rope_head_dim: int,
     compress_ratio: int,
     rms_norm_eps: float,
@@ -260,6 +324,7 @@ def _sparse_indexer(
     q_nope, q_pe = torch.split(q, [index_head_dim - rd, rd], dim=-1)
     q_pe = _apply_interleaved_rope(q_pe, cos.unsqueeze(2), sin.unsqueeze(2))
     q = torch.cat([q_nope, q_pe], dim=-1)
+    q = _fake_fp4_act_quant(_hadamard_rotate(q), block_size=32)
 
     index_k = _sparse_compressor(
         hidden_states,
@@ -273,23 +338,41 @@ def _sparse_indexer(
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
         rms_norm_eps=rms_norm_eps,
+        rotate=True,
     )
+    num_compressed = seqlen // compress_ratio
+    if index_topk == 0:
+        return torch.empty(bsz, seqlen, 0, device=hidden_states.device, dtype=torch.int64)
+    if num_compressed == 0:
+        return torch.full(
+            (bsz, seqlen, index_topk), -1, device=hidden_states.device, dtype=torch.int64
+        )
+    index_k = index_k[:, :num_compressed]
     weights = F.linear(hidden_states, weights_proj).float() * (softmax_scale * index_n_heads**-0.5)
 
     index_score = torch.einsum("bshd,btd->bsht", q, index_k).float()
     index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
 
-    compressed_positions = torch.arange(seqlen, device=hidden_states.device)
+    compressed_positions = torch.arange(num_compressed, device=hidden_states.device)
     valid_count = (
         torch.arange(1, seqlen + 1, device=hidden_states.device).unsqueeze(1) // compress_ratio
     )
     future_mask = compressed_positions.unsqueeze(0) >= valid_count
-    valid = ~future_mask
     index_score = index_score.masked_fill(future_mask.unsqueeze(0), -1.0e20)
 
-    sorted_idxs = index_score.argsort(dim=-1, descending=True)
-    sorted_valid = valid.unsqueeze(0).expand(bsz, -1, -1).gather(-1, sorted_idxs)
-    return torch.where(sorted_valid, sorted_idxs + offset, -1)
+    k = min(index_topk, num_compressed)
+    topk_idxs = index_score.topk(k, dim=-1).indices
+    invalid = topk_idxs >= valid_count.unsqueeze(0)
+    topk_idxs = torch.where(invalid, -1, topk_idxs + offset)
+    if k < index_topk:
+        pad = torch.full(
+            (bsz, seqlen, index_topk - k),
+            -1,
+            device=hidden_states.device,
+            dtype=topk_idxs.dtype,
+        )
+        topk_idxs = torch.cat([topk_idxs, pad], dim=-1)
+    return topk_idxs.to(torch.int64)
 
 
 def _sparse_attn_prefill_body(
@@ -299,6 +382,8 @@ def _sparse_attn_prefill_body(
     q_lora: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
+    cos_anchor: torch.Tensor,
+    sin_anchor: torch.Tensor,
     attn_sink: torch.Tensor,
     compressor_wkv: torch.Tensor,
     compressor_wgate: torch.Tensor,
@@ -318,6 +403,7 @@ def _sparse_attn_prefill_body(
     head_dim: int,
     index_n_heads: int,
     index_head_dim: int,
+    index_topk: int,
     rms_norm_eps: float,
 ) -> torch.Tensor:
     """Shared prefill attention body reused by the exported op and equivalence tests."""
@@ -352,6 +438,7 @@ def _sparse_attn_prefill_body(
             compressor_norm_weight=indexer_compressor_norm_weight,
             index_n_heads=index_n_heads,
             index_head_dim=index_head_dim,
+            index_topk=index_topk,
             rope_head_dim=rope_head_dim,
             compress_ratio=compress_ratio,
             rms_norm_eps=rms_norm_eps,
@@ -381,6 +468,8 @@ def torch_deepseek_v4_sparse_attn(
     q_lora: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
+    cos_anchor: torch.Tensor,
+    sin_anchor: torch.Tensor,
     attn_sink: torch.Tensor,
     compressor_wkv: torch.Tensor,
     compressor_wgate: torch.Tensor,
@@ -399,6 +488,7 @@ def torch_deepseek_v4_sparse_attn(
     head_dim: int,
     index_n_heads: int,
     index_head_dim: int,
+    index_topk: int,
     rms_norm_eps: float,
     layer_idx: Optional[int] = None,
     layer_type: str = "mha_sparse",
@@ -409,7 +499,7 @@ def torch_deepseek_v4_sparse_attn(
     inversion on the output happens outside this op to keep the op
     boundary clean.
     """
-    del layer_idx, layer_type  # metadata only — read by AttentionDescriptor
+    del layer_idx, layer_type
     return _sparse_attn_prefill_body(
         q,
         kv,
@@ -417,6 +507,8 @@ def torch_deepseek_v4_sparse_attn(
         q_lora,
         cos,
         sin,
+        cos_anchor,
+        sin_anchor,
         attn_sink,
         compressor_wkv,
         compressor_wgate,
@@ -435,6 +527,7 @@ def torch_deepseek_v4_sparse_attn(
         head_dim=head_dim,
         index_n_heads=index_n_heads,
         index_head_dim=index_head_dim,
+        index_topk=index_topk,
         rms_norm_eps=rms_norm_eps,
     )
 
@@ -447,6 +540,8 @@ def torch_deepseek_v4_sparse_attn_fake(
     q_lora: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
+    cos_anchor: torch.Tensor,
+    sin_anchor: torch.Tensor,
     attn_sink: torch.Tensor,
     compressor_wkv: torch.Tensor,
     compressor_wgate: torch.Tensor,
@@ -465,6 +560,7 @@ def torch_deepseek_v4_sparse_attn_fake(
     head_dim: int,
     index_n_heads: int,
     index_head_dim: int,
+    index_topk: int,
     rms_norm_eps: float,
     layer_idx: Optional[int] = None,
     layer_type: str = "mha_sparse",
@@ -530,8 +626,8 @@ def _seed_compressor_state(
 
 def _decode_compressor_step(
     hidden_states: torch.Tensor,  # [1, 1, hidden]
-    cos_last: torch.Tensor,  # [1, 1, rd/2]
-    sin_last: torch.Tensor,  # [1, 1, rd/2]
+    cos_anchor_table: torch.Tensor,  # [max_seq_len, rd/2]
+    sin_anchor_table: torch.Tensor,  # [max_seq_len, rd/2]
     kv_state: torch.Tensor,  # [max_batch, coff*ratio, coff*head_dim]
     score_state: torch.Tensor,  # [max_batch, coff*ratio, coff*head_dim]
     compressed_kv_cache: torch.Tensor,  # [max_batch, max_compressed, head_dim]
@@ -545,6 +641,7 @@ def _decode_compressor_step(
     head_dim: int,
     rope_head_dim: int,
     rms_norm_eps: float,
+    rotate: bool = False,
 ) -> None:
     """One decode step's Compressor update. Writes to state + (maybe) compressed_kv_cache.
 
@@ -602,15 +699,17 @@ def _decode_compressor_step(
         hidden_states.dtype
     )
     nope, pe = torch.split(compressed, [head_dim - rope_head_dim, rope_head_dim], dim=-1)
-    # TODO(ds-v4 cached): use cos/sin at position ``input_pos+1-compress_ratio``
-    # (chunk-start anchor) instead of ``cos_last``/``sin_last`` (current decode
-    # step). Fresh prefill rotates each compressed token by the freqs at its
-    # chunk's starting position; using the current-step freqs causes the
-    # ratio-4 Indexer's top-k to drift from the prefill result. Fix requires
-    # plumbing either the full cos/sin table or the anchor cos/sin through the
-    # op signature.
-    pe = _apply_interleaved_rope(pe, cos_last, sin_last)
+    anchor_pos = input_pos + 1 - compress_ratio
+    cos_anchor = cos_anchor_table[anchor_pos].view(1, 1, -1)
+    sin_anchor = sin_anchor_table[anchor_pos].view(1, 1, -1)
+    pe = _apply_interleaved_rope(pe, cos_anchor, sin_anchor)
     compressed = torch.cat([nope, pe], dim=-1)
+    if rotate:
+        compressed = _fake_fp4_act_quant(_hadamard_rotate(compressed), block_size=32)
+    else:
+        nope, pe = torch.split(compressed, [head_dim - rope_head_dim, rope_head_dim], dim=-1)
+        nope = _fake_fp8_act_quant(nope, block_size=64)
+        compressed = torch.cat([nope, pe], dim=-1)
 
     write_idx = input_pos // compress_ratio
     compressed_kv_cache[slot, write_idx] = compressed.squeeze(0).squeeze(0)
@@ -634,6 +733,8 @@ def _decode_indexer_step(
     offset: int,
 ) -> torch.Tensor:
     """Compute compressed-KV top-k indices at decode for one token."""
+    if index_topk == 0:
+        return torch.empty(1, 1, 0, device=hidden_states.device, dtype=torch.int64)
     num_compressed = (input_pos + 1) // compress_ratio
     if num_compressed == 0:
         # No compressed tokens yet — return empty-by-padding (all -1) matching prefill output.
@@ -644,6 +745,7 @@ def _decode_indexer_step(
     q_nope, q_pe = torch.split(q, [index_head_dim - rd, rd], dim=-1)
     q_pe = _apply_interleaved_rope(q_pe, cos_last.unsqueeze(2), sin_last.unsqueeze(2))
     q = torch.cat([q_nope, q_pe], dim=-1)
+    q = _fake_fp4_act_quant(_hadamard_rotate(q), block_size=32)
 
     weights = F.linear(hidden_states, weights_proj).float() * (
         softmax_scale * index_n_heads**-0.5
@@ -695,6 +797,7 @@ def _seed_indexer_compressed_cache(
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
         rms_norm_eps=rms_norm_eps,
+        rotate=True,
     )  # [1, seqlen, index_head_dim]
     # Zero full slot first — UnpagedResourceHandler.allocate() uses torch.empty()
     # so unused entries contain uninitialized memory that would propagate NaN
@@ -715,6 +818,25 @@ def _seed_indexer_compressed_cache(
     )
 
 
+def _seed_window_cache(
+    kv: torch.Tensor,
+    window_cache: torch.Tensor,
+    slot: int,
+    window_size: int,
+) -> None:
+    """Seed the decode ring buffer exactly as HF ``Attention.forward(start_pos=0)``."""
+    seqlen = kv.shape[1]
+    window_cache[slot].zero_()
+    if seqlen <= window_size:
+        window_cache[slot, :seqlen] = kv[0, :seqlen, 0, :]
+        return
+
+    cutoff = seqlen % window_size
+    recent = kv[0, -window_size:, 0, :]
+    window_cache[slot, cutoff:window_size] = recent[: window_size - cutoff]
+    window_cache[slot, :cutoff] = recent[window_size - cutoff :]
+
+
 def _decode_sparse_attn_step(
     q: torch.Tensor,  # [1, 1, H, D]
     kv_new: torch.Tensor,  # [1, 1, 1, D]
@@ -725,6 +847,7 @@ def _decode_sparse_attn_step(
     slot: int,
     input_pos: int,
     window_size: int,
+    compress_ratio: int,
     scale: float,
     head_dim: int,
 ) -> torch.Tensor:
@@ -746,8 +869,13 @@ def _decode_sparse_attn_step(
     if visible_window < window_size:
         pad = window_cache.new_zeros(window_size - visible_window, head_dim)
         gathered_window = torch.cat([gathered_window, pad], dim=0)
-    # Build full concat(window, compressed) along token axis.
-    kv_all = torch.cat([gathered_window, compressed_kv_cache[slot]], dim=0)  # [window + max_c, D]
+    # Only materialize compressed rows that are visible to this decode step.
+    # ``compressed_kv_cache`` is allocated against max_seq_len, not the current
+    # prefix length; using the full allocation would make attention scale with
+    # max_seq_len and can allocate hundreds of GiB for long-context models.
+    num_compressed = min((input_pos + 1) // compress_ratio, compressed_kv_cache.shape[1])
+    visible_compressed = compressed_kv_cache[slot, :num_compressed]
+    kv_all = torch.cat([gathered_window, visible_compressed], dim=0)
     # Window top-k indices are just [0..visible_window-1]; entries beyond are -1.
     window_topk = torch.full((1, 1, window_size), -1, device=device, dtype=compress_topk.dtype)
     window_topk[0, 0, :visible_window] = torch.arange(visible_window, device=device)
@@ -773,13 +901,15 @@ _CACHE_NAMES = (
     "auto_deploy::torch_deepseek_v4_sparse_attn_with_cache", mutates_args=_CACHE_NAMES
 )
 def torch_deepseek_v4_sparse_attn_with_cache(
-    # --- Source-op tensor args (17). Order MUST match the prefill op's qkv arg layout. ---
+    # --- Source-op tensor args (19). Order MUST match the prefill op's qkv arg layout. ---
     q: torch.Tensor,
     kv: torch.Tensor,
     hidden_states: torch.Tensor,
     q_lora: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
+    cos_anchor: torch.Tensor,
+    sin_anchor: torch.Tensor,
     attn_sink: torch.Tensor,
     compressor_wkv: torch.Tensor,
     compressor_wgate: torch.Tensor,
@@ -805,7 +935,7 @@ def torch_deepseek_v4_sparse_attn_with_cache(
     indexer_compressed_kv_cache: torch.Tensor,
     indexer_kv_state: torch.Tensor,
     indexer_score_state: torch.Tensor,
-    # --- Constants (8). Returned by AttentionDescriptor.get_constants. ---
+    # --- Constants (9). Returned by AttentionDescriptor.get_constants. ---
     scale: float,
     window_size: int,
     compress_ratio: int,
@@ -813,6 +943,7 @@ def torch_deepseek_v4_sparse_attn_with_cache(
     head_dim: int,
     index_n_heads: int,
     index_head_dim: int,
+    index_topk: int,
     rms_norm_eps: float,
 ) -> torch.Tensor:
     """DeepSeek V4 sparse attention with KV cache (prefill seeds, decode updates).
@@ -821,23 +952,12 @@ def torch_deepseek_v4_sparse_attn_with_cache(
     processed independently and its KV caches are seeded using the corresponding
     slot from ``slot_idx[b]``.
 
-    Decode (``s == 1``) still requires ``B == 1``.  Multi-sequence decode via
-    ``cu_seqlen`` is a follow-up.
+    Decode (``s == 1``) supports ``B >= 1`` by processing each batch element's
+    sequence slot independently.
     """
     del batch_info_host, cu_seqlen
     bsz, s, _, _ = q.shape
     has_indexer = indexer_wq_b is not None
-
-    # KNOWN-ISSUE (DS-V4 E2E decode):
-    # On the first decode step after an 8-GPU TP prefill with the reduced
-    # 5-layer registry fixture, layer-3 (ratio=128) decode output contains
-    # NaN that cascades forward and ultimately trips the sampler's
-    # ``_flashinfer_check_nans`` async CUDA assert. Bandaids that zero NaN at
-    # this op boundary do not fix the problem — so the NaN source is upstream
-    # (likely trtllm_finegrained_fp8_linear or the HC-Sinkhorn chain) and
-    # resists localisation without per-step logit dumping. Prefill works end
-    # to end; all-dense decode works end to end; numerics-of-sparse-decode is
-    # tracked as a follow-up.
 
     if s > 1:
         # --- Prefill: run the stateless body and seed caches per batch element. ---
@@ -849,6 +969,8 @@ def torch_deepseek_v4_sparse_attn_with_cache(
                 q_lora,
                 cos,
                 sin,
+                cos_anchor,
+                sin_anchor,
                 attn_sink,
                 compressor_wkv,
                 compressor_wgate,
@@ -867,6 +989,7 @@ def torch_deepseek_v4_sparse_attn_with_cache(
                 head_dim=head_dim,
                 index_n_heads=index_n_heads,
                 index_head_dim=index_head_dim,
+                index_topk=index_topk,
                 rms_norm_eps=rms_norm_eps,
             )
             slot = int(slot_idx[0].item())
@@ -876,9 +999,7 @@ def torch_deepseek_v4_sparse_attn_with_cache(
             # we don't zero out the padding, kv_all = cat(window, compressed) at
             # decode time contains NaN garbage, ``q @ kv_all.T`` propagates NaN
             # into even the attention-masked positions, and logits NaN out.
-            window_cache[slot].zero_()
-            fill = min(s, window_size)
-            window_cache[slot, :fill] = kv[0, s - fill : s, 0, :]
+            _seed_window_cache(kv, window_cache, slot, window_size)
             # Seed the compressed KV cache by re-running the stateless compressor.
             compressed = _sparse_compressor(
                 hidden_states,
@@ -925,11 +1046,6 @@ def torch_deepseek_v4_sparse_attn_with_cache(
                     rope_head_dim,
                     rms_norm_eps,
                 )
-            # Bandaid: zero out any non-finite slots so downstream layers don't
-            # see NaN.  TODO: fix the underlying numerics (likely sinks + very
-            # negative masked scores overflowing in fp32 exp for layers where
-            # visible kv count is tiny relative to total masked kv length).
-            out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
             return out
         else:
             # Batched prefill (B > 1): process each sequence independently and
@@ -950,6 +1066,8 @@ def torch_deepseek_v4_sparse_attn_with_cache(
                     ql_b,
                     cos_b,
                     sin_b,
+                    cos_anchor,
+                    sin_anchor,
                     attn_sink,
                     compressor_wkv,
                     compressor_wgate,
@@ -968,14 +1086,13 @@ def torch_deepseek_v4_sparse_attn_with_cache(
                     head_dim=head_dim,
                     index_n_heads=index_n_heads,
                     index_head_dim=index_head_dim,
+                    index_topk=index_topk,
                     rms_norm_eps=rms_norm_eps,
                 )
                 # Zero full slot first to prevent uninitialized memory (from
                 # torch.empty() in the resource handler) from leaking NaN into
                 # attention at decode; see also the B==1 branch above.
-                window_cache[slot_b].zero_()
-                fill = min(s, window_size)
-                window_cache[slot_b, :fill] = kv_b[0, s - fill : s, 0, :]
+                _seed_window_cache(kv_b, window_cache, slot_b, window_size)
                 compressed = _sparse_compressor(
                     hs_b,
                     cos_b,
@@ -1022,9 +1139,7 @@ def torch_deepseek_v4_sparse_attn_with_cache(
                         rms_norm_eps,
                     )
                 outs.append(out_b)
-            cat = torch.cat(outs, dim=0)
-            cat = torch.nan_to_num(cat, nan=0.0, posinf=0.0, neginf=0.0)
-            return cat
+            return torch.cat(outs, dim=0)
 
     # --- Decode step: s == 1. ---
     # Supports bsz >= 1: each batch element is processed independently using its
@@ -1037,8 +1152,8 @@ def torch_deepseek_v4_sparse_attn_with_cache(
         sin_last = sin
         _decode_compressor_step(
             hidden_states,
-            cos_last,
-            sin_last,
+            cos_anchor,
+            sin_anchor,
             compressor_kv_state,
             compressor_score_state,
             compressed_kv_cache,
@@ -1058,8 +1173,8 @@ def torch_deepseek_v4_sparse_attn_with_cache(
         if has_indexer:
             _decode_compressor_step(
                 hidden_states,
-                cos_last,
-                sin_last,
+                cos_anchor,
+                sin_anchor,
                 indexer_kv_state,
                 indexer_score_state,
                 indexer_compressed_kv_cache,
@@ -1073,6 +1188,7 @@ def torch_deepseek_v4_sparse_attn_with_cache(
                 index_head_dim,
                 rope_head_dim,
                 rms_norm_eps,
+                rotate=True,
             )
             compress_topk = _decode_indexer_step(
                 q_lora,
@@ -1088,17 +1204,13 @@ def torch_deepseek_v4_sparse_attn_with_cache(
                 index_n_heads,
                 index_head_dim,
                 rope_head_dim,
-                # index_topk from the pre-allocated buffer's width
-                indexer_compressed_kv_cache.shape[1]
-                if indexer_compressed_kv_cache.shape[1] > 0
-                else 0,
+                index_topk,
                 offset=window_size,
             )
         else:
             # Deterministic compress top-k: positions 0, 1, ..., (pos+1)//ratio - 1.
-            num_compressed = (pos + 1) // compress_ratio
-            max_c = compressed_kv_cache.shape[1]
-            full = torch.full((1, 1, max_c), -1, device=q.device, dtype=torch.int64)
+            num_compressed = min((pos + 1) // compress_ratio, compressed_kv_cache.shape[1])
+            full = torch.full((1, 1, num_compressed), -1, device=q.device, dtype=torch.int64)
             if num_compressed > 0:
                 full[0, 0, :num_compressed] = (
                     torch.arange(num_compressed, device=q.device) + window_size
@@ -1116,10 +1228,10 @@ def torch_deepseek_v4_sparse_attn_with_cache(
             slot,
             pos,
             window_size,
+            compress_ratio,
             scale,
             head_dim,
         )
-        out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
         return out
     else:
         # Batched decode (bsz > 1): process each sequence independently and stack.
@@ -1135,8 +1247,8 @@ def torch_deepseek_v4_sparse_attn_with_cache(
             sin_b = sin[b : b + 1] if sin.shape[0] == bsz else sin
             _decode_compressor_step(
                 hs_b,
-                cos_b,
-                sin_b,
+                cos_anchor,
+                sin_anchor,
                 compressor_kv_state,
                 compressor_score_state,
                 compressed_kv_cache,
@@ -1154,8 +1266,8 @@ def torch_deepseek_v4_sparse_attn_with_cache(
             if has_indexer:
                 _decode_compressor_step(
                     hs_b,
-                    cos_b,
-                    sin_b,
+                    cos_anchor,
+                    sin_anchor,
                     indexer_kv_state,
                     indexer_score_state,
                     indexer_compressed_kv_cache,
@@ -1169,6 +1281,7 @@ def torch_deepseek_v4_sparse_attn_with_cache(
                     index_head_dim,
                     rope_head_dim,
                     rms_norm_eps,
+                    rotate=True,
                 )
                 compress_topk_b = _decode_indexer_step(
                     ql_b,
@@ -1184,15 +1297,14 @@ def torch_deepseek_v4_sparse_attn_with_cache(
                     index_n_heads,
                     index_head_dim,
                     rope_head_dim,
-                    indexer_compressed_kv_cache.shape[1]
-                    if indexer_compressed_kv_cache.shape[1] > 0
-                    else 0,
+                    index_topk,
                     offset=window_size,
                 )
             else:
-                num_compressed_b = (pos_b + 1) // compress_ratio
-                max_c = compressed_kv_cache.shape[1]
-                full_b = torch.full((1, 1, max_c), -1, device=q.device, dtype=torch.int64)
+                num_compressed_b = min((pos_b + 1) // compress_ratio, compressed_kv_cache.shape[1])
+                full_b = torch.full(
+                    (1, 1, num_compressed_b), -1, device=q.device, dtype=torch.int64
+                )
                 if num_compressed_b > 0:
                     full_b[0, 0, :num_compressed_b] = (
                         torch.arange(num_compressed_b, device=q.device) + window_size
@@ -1208,10 +1320,10 @@ def torch_deepseek_v4_sparse_attn_with_cache(
                 slot_b,
                 pos_b,
                 window_size,
+                compress_ratio,
                 scale,
                 head_dim,
             )
-            out_b = torch.nan_to_num(out_b, nan=0.0, posinf=0.0, neginf=0.0)
             outs.append(out_b)
         return torch.cat(outs, dim=0)
 
@@ -1224,6 +1336,8 @@ def torch_deepseek_v4_sparse_attn_with_cache_fake(
     q_lora: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
+    cos_anchor: torch.Tensor,
+    sin_anchor: torch.Tensor,
     attn_sink: torch.Tensor,
     compressor_wkv: torch.Tensor,
     compressor_wgate: torch.Tensor,
@@ -1254,6 +1368,7 @@ def torch_deepseek_v4_sparse_attn_with_cache_fake(
     head_dim: int,
     index_n_heads: int,
     index_head_dim: int,
+    index_topk: int,
     rms_norm_eps: float,
 ) -> torch.Tensor:
     return torch.empty_like(q)
@@ -1277,7 +1392,7 @@ class DeepseekV4SparseAttentionDescriptor(AttentionDescriptor):
     """AttentionDescriptor for the DeepSeek V4 sparse (compress_ratio != 0) layers.
 
     The cached-op signature is:
-        (*qkv_args_17, *std_metadata_5, *caches_7, *constants_8)
+        (*qkv_args_19, *std_metadata_5, *caches_7, *constants_9)
 
     which matches ``_InsertCachedOperator`` 's expected node-replacement contract.
     """
@@ -1288,9 +1403,9 @@ class DeepseekV4SparseAttentionDescriptor(AttentionDescriptor):
 
     @classmethod
     def get_num_qkv_args(cls) -> int:
-        # q, kv, hidden_states, q_lora, cos, sin, attn_sink,
-        # + 4 compressor weights + 6 (optional) indexer weights = 17
-        return 17
+        # q, kv, hidden_states, q_lora, cos, sin, cos_anchor, sin_anchor, attn_sink,
+        # + 4 compressor weights + 6 (optional) indexer weights = 19
+        return 19
 
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
@@ -1307,7 +1422,7 @@ class DeepseekV4SparseAttentionDescriptor(AttentionDescriptor):
     @classmethod
     def _extract_constants(
         cls, source_attn_node: Node
-    ) -> Tuple[float, int, int, int, int, int, int, float]:
+    ) -> Tuple[float, int, int, int, int, int, int, int, float]:
         (
             scale,
             window_size,
@@ -1316,6 +1431,7 @@ class DeepseekV4SparseAttentionDescriptor(AttentionDescriptor):
             head_dim,
             index_n_heads,
             index_head_dim,
+            index_topk,
             rms_norm_eps,
         ) = extract_op_args(
             source_attn_node,
@@ -1326,6 +1442,7 @@ class DeepseekV4SparseAttentionDescriptor(AttentionDescriptor):
             "head_dim",
             "index_n_heads",
             "index_head_dim",
+            "index_topk",
             "rms_norm_eps",
         )
         return (
@@ -1336,6 +1453,7 @@ class DeepseekV4SparseAttentionDescriptor(AttentionDescriptor):
             head_dim,
             index_n_heads,
             index_head_dim,
+            index_topk,
             rms_norm_eps,
         )
 
@@ -1351,6 +1469,7 @@ class DeepseekV4SparseAttentionDescriptor(AttentionDescriptor):
             head_dim,
             index_n_heads,
             index_head_dim,
+            _index_topk,
             _rms_norm_eps,
         ) = cls._extract_constants(source_attn_node)
         # Fallback dtypes from the KV fake tensor.
