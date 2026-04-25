@@ -15,3 +15,7 @@ transforms:
     enabled: true
   fuse_rmsnorm_quant_fp8:
     enabled: true
+  fuse_gemms_mixed_children:
+    enabled: true
+  fuse_rope_into_trtllm_attention:
+    enabled: true

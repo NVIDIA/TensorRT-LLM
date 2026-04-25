@@ -2322,6 +2322,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
                                         enable_block_reuse=kv_cache_reuse)
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler, )
+        if quant_dtype == "fp8" and is_sm_100f():
+            pytorch_config["moe_config"] = MoeConfig(backend="DEEPGEMM")
         mtp_config = None
 
         if quant_dtype == "none":
@@ -3093,15 +3095,19 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,mtp_nextn,overlap_scheduler,max_batch_size,host_cache_size_gb",
+        "tp_size,pp_size,ep_size,mtp_nextn,overlap_scheduler,max_batch_size,host_cache_size_gb,attention_dp",
         [
-            (8, 1, 8, 0, True, 24, 10),
-            (8, 1, 8, 1, True, 24, 10),
+            (8, 1, 8, 0, True, 24, 10, True),
+            (8, 1, 8, 1, True, 24, 10, True),
+            (8, 1, 8, 3, True, 32, 10, False),
         ],
-        ids=["host_cache_offload", "host_cache_offload_mtp1"])
+        ids=[
+            "host_cache_offload", "host_cache_offload_mtp1",
+            "host_cache_offload_mtp3_no_adp"
+        ])
     def test_dsa_host_cache_offload(self, tp_size, pp_size, ep_size, mtp_nextn,
                                     overlap_scheduler, max_batch_size,
-                                    host_cache_size_gb):
+                                    host_cache_size_gb, attention_dp):
         """Validate DSA host-offloading for both pools (MLA KV cache + indexer-K cache)."""
         if get_sm_version() == 100 or get_sm_version() == 103:
             moe_config = MoeConfig(backend="DEEPGEMM", max_num_tokens=16384)
@@ -3134,7 +3140,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                  moe_expert_parallel_size=ep_size,
                  kv_cache_config=kv_cache_config,
                  **pytorch_config,
-                 enable_attention_dp=True,
+                 enable_attention_dp=attention_dp,
                  speculative_config=mtp_config,
                  sparse_attention_config=dsa_config) as llm:
             task = MMLU(self.MODEL_NAME)
@@ -4306,9 +4312,24 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     def test_dummy_load_format(self):
+        # On Blackwell datacenter GPUs (SM 100/103) the default CUTLASS MoE
+        # backend routes the FP8 block-scales GEMM through DeepGEMM, which
+        # only supports Hopper (SM90). Use the TRTLLM MoE backend there to
+        # bypass DeepGEMM. SM 120/121 is excluded because TRTLLM MoE is
+        # unsupported on those architectures (see other tests in this file).
+        sm_version = get_sm_version()
+        if sm_version in (120, 121):
+            pytest.skip(
+                "FP8 block-scales MoE has no supported backend on SM 120/121")
+        # TorchLlmArgs.moe_config is non-Optional with a default factory, so
+        # only forward an explicit override on architectures that need it.
+        llm_kwargs = {}
+        if sm_version in (100, 103):
+            llm_kwargs["moe_config"] = MoeConfig(backend="TRTLLM")
         llm = LLM(
             f"{llm_models_root()}/Qwen3/Qwen3-30B-A3B-FP8",
             load_format="dummy",
+            **llm_kwargs,
         )
         with llm:
             task = GSM8K(self.MODEL_NAME)

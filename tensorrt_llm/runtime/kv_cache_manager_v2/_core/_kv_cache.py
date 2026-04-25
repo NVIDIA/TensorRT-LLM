@@ -892,7 +892,7 @@ class _KVCache:
             seq_block.tree_block = tree_block
             assert self._get_tree_block(ordinal) is tree_block
             self._num_committed_blocks = BlockOrdinal(ordinal + 1)
-        elif tree_block.is_full and self.manager.allow_seq_rebasing:
+        elif tree_block.is_full and self.manager.allow_seq_rebasing and is_full:
             # Happens when a concurrent request committed the same tokens before us.
             # Try to replace our pages with pages from the existing block to save memory.
             reuse_list = list[tuple[LifeCycleId, CommittedPage]]()
