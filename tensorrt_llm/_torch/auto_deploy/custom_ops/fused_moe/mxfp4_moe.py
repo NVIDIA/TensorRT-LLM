@@ -15,6 +15,7 @@
 
 # Triton-kernels-based MXFP4 MoE ops (GPT-OSS style) with routing, swizzling, and fused activation
 
+import weakref
 from typing import Callable, Tuple
 
 import torch
@@ -47,6 +48,107 @@ def _swizzle_mxfp4(w, w_scale):
 
 
 RouteFn = Callable[[torch.Tensor], Tuple[RoutingData, GatherIndx, ScatterIndx]]
+
+_TensorCacheKey = tuple[
+    int,
+    int,
+    int,
+    int,
+    tuple[int, ...],
+    tuple[int, ...],
+    torch.dtype,
+    str,
+    int | None,
+    torch.layout,
+    int | None,
+]
+_PrepareCacheKey = tuple[int, _TensorCacheKey, _TensorCacheKey, _TensorCacheKey, _TensorCacheKey]
+_PreparedWeightsScales = tuple[object, object, object, object]
+_TensorRef = weakref.ReferenceType[torch.Tensor] | None
+_PrepareCacheEntry = tuple[
+    tuple[_TensorRef, _TensorRef, _TensorRef, _TensorRef], _PreparedWeightsScales
+]
+_PREPARED_WEIGHTS_SCALES_CACHE: dict[_PrepareCacheKey, _PrepareCacheEntry] = {}
+_INFERENCE_TENSOR_VERSION_ERROR = "Inference tensors do not track version counter."
+
+
+def _tensor_version(tensor: torch.Tensor) -> int | None:
+    try:
+        return tensor._version
+    except RuntimeError as error:
+        if str(error) == _INFERENCE_TENSOR_VERSION_ERROR:
+            return None
+        raise
+
+
+def _tensor_cache_key(tensor: torch.Tensor) -> _TensorCacheKey:
+    storage = tensor.untyped_storage()
+    device = tensor.device
+    return (
+        id(tensor),
+        storage.data_ptr(),
+        storage.nbytes(),
+        tensor.storage_offset(),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        tensor.dtype,
+        device.type,
+        device.index,
+        tensor.layout,
+        _tensor_version(tensor),
+    )
+
+
+def _prepare_cache_key(
+    hidden_size: int,
+    gate_up_blocks: torch.Tensor,
+    gate_up_scales: torch.Tensor,
+    down_blocks: torch.Tensor,
+    down_scales: torch.Tensor,
+) -> _PrepareCacheKey:
+    return (
+        hidden_size,
+        _tensor_cache_key(gate_up_blocks),
+        _tensor_cache_key(gate_up_scales),
+        _tensor_cache_key(down_blocks),
+        _tensor_cache_key(down_scales),
+    )
+
+
+def _make_tensor_ref(tensor: torch.Tensor) -> _TensorRef:
+    try:
+        return weakref.ref(tensor)
+    except TypeError:
+        return None
+
+
+def _cache_entry_matches(
+    tensor_refs: tuple[_TensorRef, _TensorRef, _TensorRef, _TensorRef],
+    tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> bool:
+    return all(
+        tensor_ref is None or tensor_ref() is tensor
+        for tensor_ref, tensor in zip(tensor_refs, tensors)
+    )
+
+
+def _remove_prepare_cache_entry(cache_key: _PrepareCacheKey) -> None:
+    _PREPARED_WEIGHTS_SCALES_CACHE.pop(cache_key, None)
+
+
+def _register_cache_finalizers(
+    cache_key: _PrepareCacheKey,
+    tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
+    for tensor in tensors:
+        try:
+            weakref.finalize(tensor, _remove_prepare_cache_entry, cache_key)
+        except TypeError:
+            pass
+
+
+def _clear_mxfp4_weights_scales_cache() -> None:
+    _PREPARED_WEIGHTS_SCALES_CACHE.clear()
 
 
 def _routing_from_precomputed(
@@ -89,7 +191,18 @@ def _prepare_weights_scales(
     gate_up_scales: torch.Tensor,  # [E_local, 2I, H//32] in unit8
     down_blocks: torch.Tensor,  # [E_local, H, I//32, 16] in uint8
     down_scales: torch.Tensor,  # [E_local, H, I//32] in uint8
-):
+) -> _PreparedWeightsScales:
+    cache_tensors = (gate_up_blocks, gate_up_scales, down_blocks, down_scales)
+    cache_key = _prepare_cache_key(
+        hidden_size, gate_up_blocks, gate_up_scales, down_blocks, down_scales
+    )
+    cache_entry = _PREPARED_WEIGHTS_SCALES_CACHE.get(cache_key)
+    if cache_entry is not None:
+        tensor_refs, cached_weights_scales = cache_entry
+        if _cache_entry_matches(tensor_refs, cache_tensors):
+            return cached_weights_scales
+        del _PREPARED_WEIGHTS_SCALES_CACHE[cache_key]
+
     local_experts = gate_up_blocks.size(0)
     intermediate_size = gate_up_blocks.shape[1] // 2
 
@@ -106,12 +219,18 @@ def _prepare_weights_scales(
     )
     triton_down_w.shape = torch.Size([local_experts, intermediate_size, hidden_size])
 
-    return (
+    prepared_weights_scales = (
         triton_gate_up_w,
         gate_up_w_scale_raw,
         triton_down_w,
         down_w_scale_raw,
     )
+    _PREPARED_WEIGHTS_SCALES_CACHE[cache_key] = (
+        tuple(_make_tensor_ref(tensor) for tensor in cache_tensors),
+        prepared_weights_scales,
+    )
+    _register_cache_finalizers(cache_key, cache_tensors)
+    return prepared_weights_scales
 
 
 def _run_mxfp4_mlp_core(

@@ -32,6 +32,7 @@ from torch import nn
 from torch.export import Dim
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 -- register ops
+import tensorrt_llm._torch.auto_deploy.transform.library  # noqa: F401 -- register transforms
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
     DeepseekV4AutoModelForCausalLMFactory,
@@ -39,6 +40,9 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
     DeepseekV4ForCausalLM,
     DeepseekV4RMSNorm,
 )
+from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig
+from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
+from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
 
 
 def assert_rmse_close(
@@ -98,6 +102,58 @@ def _small_config(**overrides) -> DeepseekV4Config:
     )
     values.update(overrides)
     return DeepseekV4Config(**values)
+
+
+def test_factory_rope_cache_override_updates_default_compressor_capacity(tmp_path):
+    base_config = _small_config(
+        num_hidden_layers=5,
+        compress_ratios=(0, 0, 4, 128, 4),
+        max_position_embeddings=1048576,
+    )
+    base_config.save_pretrained(tmp_path)
+
+    factory = DeepseekV4AutoModelForCausalLMFactory(
+        model=str(tmp_path),
+        model_kwargs={"ad_rope_cache_len": 8192, "num_hidden_layers": 5},
+        max_seq_len=8192,
+        skip_loading_weights=True,
+    )
+
+    config, _ = factory._get_model_config()
+    assert config.ad_rope_cache_len == 8192
+    assert config.ad_compress_max_seq_len == 8192
+
+    model = DeepseekV4ForCausalLM(config)
+    assert model.layers[2].attn.compressor.max_compressed_tokens == 8192
+    assert model.layers[3].attn.compressor.max_compressed_tokens == 8192
+
+
+def test_factory_respects_explicit_compressor_capacity_override(tmp_path):
+    base_config = _small_config(
+        num_hidden_layers=5,
+        compress_ratios=(0, 0, 4, 128, 4),
+        max_position_embeddings=1048576,
+    )
+    base_config.save_pretrained(tmp_path)
+
+    factory = DeepseekV4AutoModelForCausalLMFactory(
+        model=str(tmp_path),
+        model_kwargs={
+            "ad_rope_cache_len": 8192,
+            "ad_compress_max_seq_len": 4096,
+            "num_hidden_layers": 5,
+        },
+        max_seq_len=8192,
+        skip_loading_weights=True,
+    )
+
+    config, _ = factory._get_model_config()
+    assert config.ad_rope_cache_len == 8192
+    assert config.ad_compress_max_seq_len == 4096
+
+    model = DeepseekV4ForCausalLM(config)
+    assert model.layers[2].attn.compressor.max_compressed_tokens == 4096
+    assert model.layers[3].attn.compressor.max_compressed_tokens == 4096
 
 
 _DEEPSEEK_V4_CHECKPOINT_SAMPLE_KEYS = {
@@ -810,6 +866,71 @@ def test_export_emits_canonical_deepseek_v4_ops():
     assert torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2.default in targets
     assert torch.ops.auto_deploy.torch_deepseek_v4_moe.default in targets
     assert torch.ops.auto_deploy.torch_moe.default not in targets
+
+
+def test_moe_only_ir_sharding_slices_deepseek_v4_mxfp4_experts():
+    config = _small_config(
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        head_dim=16,
+        q_lora_rank=16,
+        qk_rope_head_dim=8,
+        o_lora_rank=16,
+        compress_ratios=(0,),
+        moe_intermediate_size=32,
+        n_routed_experts=8,
+        num_hash_layers=0,
+        swiglu_limit=10.0,
+    )
+    model = DeepseekV4ForCausalLM(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (2, 4))
+    pos = _position_ids(2, 4, input_ids.device)
+    gm = torch_export_to_gm(
+        model,
+        args=(input_ids,),
+        kwargs={"position_ids": pos},
+        dynamic_shapes={
+            "input_ids": {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+            "position_ids": {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+        },
+        num_moe_experts_for_export=2,
+    )
+
+    opt = InferenceOptimizer(
+        None,
+        {
+            "lower_deepseek_v4_moe": {"stage": "pattern_matcher"},
+            "apply_sharding_hints": {
+                "enabled": True,
+                "stage": "sharding",
+                "run_shape_prop": True,
+                "shard_layers": ["moe"],
+            },
+        },
+    )
+    opt.shared_config = SharedConfig(
+        local_rank=0,
+        world_size=8,
+        dist_config=DistConfig(
+            world_size=8,
+            rank=0,
+            tp_size=8,
+            moe_ep_size=8,
+            moe_tp_size=1,
+        ),
+    )
+
+    gm = opt(None, gm)
+    ffn = gm.get_submodule("layers.0.ffn")
+
+    assert tuple(ffn.mxfp4_gate_up_blocks.shape) == (1, 64, 1, 16)
+    assert tuple(ffn.mxfp4_gate_up_scales.shape) == (1, 64, 1)
+    assert tuple(ffn.mxfp4_down_blocks.shape) == (1, 32, 1, 16)
+    assert tuple(ffn.mxfp4_down_scales.shape) == (1, 32, 1)
+    assert tuple(ffn.shared_experts.w1.weight.shape) == (4, 32)
+    assert tuple(ffn.shared_experts.w2.weight.shape) == (32, 4)
+    assert gm.meta["_autodeploy"]["transform_history"]["apply_sharding_hints"].num_matches == 5
 
 
 def test_load_state_dict_skips_mtp_and_loads_normal_layers_and_tid2eid():

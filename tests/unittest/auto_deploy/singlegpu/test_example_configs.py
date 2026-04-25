@@ -28,13 +28,14 @@ from pydantic import ValidationError
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 
 # Root directory for the example configs
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[4]
 _AD_EXAMPLES_DIR = _REPO_ROOT / "examples" / "auto_deploy"
 
 # Files that are not LlmArgs configs and should be excluded from validation
 _EXCLUDED_FILES = {
     "models.yaml",  # model registry index, not an LlmArgs config
     "flux_transforms.yaml",  # for build_and_run_flux.py, different schema
+    "nemotron_fp8_ir_test.yaml",  # build_and_run_ad ExperimentConfig, not an LlmArgs config
 }
 
 # Dummy model name used during validation (model path is not resolved during construction)
@@ -95,3 +96,52 @@ def test_config_yaml_dry_run_ingestion(config_yaml_path):
     except ValidationError as e:
         if not _is_cross_validation_error(e):
             raise
+
+
+def test_functional_single_request_cuda_graph_overrides_deepseek_v4_dashboard_config():
+    """Functional gates can stack a final config to avoid capturing dashboard batch sizes."""
+    config_dir = _AD_EXAMPLES_DIR / "model_registry" / "configs"
+    args = LlmArgs(
+        model=_DUMMY_MODEL,
+        yaml_extra=[
+            str(config_dir / "dashboard_default.yaml"),
+            str(config_dir / "world_size_8.yaml"),
+            str(config_dir / "deepseek_v4_flash.yaml"),
+            str(config_dir / "num_hidden_layers_5.yaml"),
+            str(config_dir / "functional_single_request_cuda_graph.yaml"),
+        ],
+    )
+
+    assert args.model_kwargs["num_hidden_layers"] == 5
+    assert args.max_batch_size == 1
+    assert args.cuda_graph_config is not None
+    assert args.cuda_graph_config.max_batch_size == 1
+    assert args.cuda_graph_config.batch_sizes == [1]
+    assert args.transforms["compile_model"]["cuda_graph_batch_sizes"] == [1]
+
+
+def test_deepseek_v4_flash_uses_attention_and_moe_ir_sharding_for_full_model_config():
+    """Full DeepSeek V4 runs shard attention and packed MoE weights before checkpoint load."""
+    config_dir = _AD_EXAMPLES_DIR / "model_registry" / "configs"
+    args = LlmArgs(
+        model=_DUMMY_MODEL,
+        yaml_extra=[
+            str(config_dir / "dashboard_default.yaml"),
+            str(config_dir / "world_size_8.yaml"),
+            str(config_dir / "deepseek_v4_flash.yaml"),
+            str(config_dir / "functional_single_request_cuda_graph.yaml"),
+        ],
+    )
+
+    assert args.world_size == 8
+    assert args.transforms["detect_sharding"]["enabled"] is False
+    assert args.transforms["sharding_transform_executor"]["enabled"] is False
+    assert args.transforms["apply_sharding_hints"]["enabled"] is True
+    assert args.transforms["apply_sharding_hints"]["dist_mapping"] == {
+        "tp": 8,
+        "moe_ep": 8,
+        "moe_tp": 1,
+        "moe_cluster": 1,
+    }
+    assert args.transforms["apply_sharding_hints"]["enable_attention_dp"] is False
+    assert args.transforms["apply_sharding_hints"]["shard_layers"] == ["mla", "moe"]

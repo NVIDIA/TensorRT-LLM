@@ -22,6 +22,9 @@ import torch
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401
 from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention import (
+    deepseek_v4_attention as dsv4_attention,
+)
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention.deepseek_v4_attention import (
     _build_full_compressed_kv,
 )
@@ -475,6 +478,91 @@ def test_attention_sink_takes_probability_mass_without_value_vector():
     assert high_sink_output.norm() < output.norm()
 
 
+def test_chunked_sparse_attention_matches_reference_with_masked_duplicates(monkeypatch):
+    monkeypatch.setattr(dsv4_attention, "_SPARSE_ATTENTION_MAX_CHUNK_TOKENS", 2)
+    torch.manual_seed(23)
+    q = torch.randn(1, 5, 3, 4)
+    kv = torch.randn(1, 7, 4)
+    attn_sink = torch.tensor([-0.5, 0.0, 0.75])
+    topk_idxs = torch.tensor(
+        [[[0, 1, -1, 1], [2, 2, 3, -1], [4, -1, -1, 5], [6, 0, 6, 1], [3, 2, 1, 0]]],
+        dtype=torch.int32,
+    )
+    softmax_scale = 0.625
+
+    actual = _run_sparse_attention(q, kv, attn_sink, topk_idxs, softmax_scale)
+    expected = _sparse_attention_reference(q, kv, attn_sink, topk_idxs, softmax_scale)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_sparse_attention_large_resize_shape_is_chunked():
+    num_tokens = 8192
+    num_heads = 64
+    head_dim = 512
+    k_select = 2176
+
+    chunk_size = dsv4_attention._sparse_attention_query_chunk_size(
+        num_tokens,
+        num_heads,
+        head_dim,
+        k_select,
+        torch.float32,
+    )
+
+    full_logits_bytes = num_tokens * num_heads * k_select * 4
+    chunk_logits_bytes = chunk_size * num_heads * k_select * 4
+    full_selected_kv_bytes = num_tokens * k_select * head_dim * 4
+    chunk_selected_kv_bytes = chunk_size * k_select * head_dim * 4
+
+    assert full_logits_bytes == 4_563_402_752
+    assert chunk_size < num_tokens
+    assert chunk_logits_bytes < full_logits_bytes
+    assert chunk_selected_kv_bytes < full_selected_kv_bytes
+    assert chunk_logits_bytes <= dsv4_attention._SPARSE_ATTENTION_CHUNK_TARGET_BYTES
+
+
+def test_sparse_attention_does_not_materialize_full_selected_kv_or_logits(monkeypatch):
+    monkeypatch.setattr(dsv4_attention, "_SPARSE_ATTENTION_MAX_CHUNK_TOKENS", 2)
+    torch.manual_seed(29)
+    q = torch.randn(1, 5, 2, 4)
+    kv = torch.randn(1, 8, 4)
+    attn_sink = torch.randn(2)
+    topk_idxs = torch.tensor(
+        [[[0, 1, 2], [2, 3, 4], [4, 5, -1], [6, 6, 7], [1, -1, 0]]],
+        dtype=torch.int64,
+    )
+    expected = _sparse_attention_reference(q, kv, attn_sink, topk_idxs, 0.5)
+    original_gather_selected_kv = dsv4_attention._gather_selected_kv
+    original_einsum = torch.einsum
+    gather_shapes = []
+    einsum_shapes = []
+
+    def recording_gather_selected_kv(
+        kv_arg: torch.Tensor,
+        topk_arg: torch.Tensor,
+        batch_idxs: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        gather_shapes.append(tuple(topk_arg.shape))
+        return original_gather_selected_kv(kv_arg, topk_arg, batch_idxs)
+
+    def recording_einsum(equation: str, *operands: torch.Tensor) -> torch.Tensor:
+        einsum_shapes.append((equation, tuple(tuple(operand.shape) for operand in operands)))
+        return original_einsum(equation, *operands)
+
+    monkeypatch.setattr(dsv4_attention, "_gather_selected_kv", recording_gather_selected_kv)
+    monkeypatch.setattr(torch, "einsum", recording_einsum)
+
+    actual = _run_sparse_attention(q, kv, attn_sink, topk_idxs, 0.5)
+
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+    assert gather_shapes
+    assert all(shape[0] <= 2 for shape in gather_shapes)
+    assert (5, 3) not in gather_shapes
+    assert einsum_shapes
+    assert all(operand_shapes[0][0] <= 2 for _, operand_shapes in einsum_shapes)
+
+
 def test_out_buffer_contract_for_piecewise_dynamic_op():
     q = torch.randn(1, 3, 2, 4)
     kv = torch.randn(1, 5, 4)
@@ -622,6 +710,67 @@ def test_cached_ratio_zero_prefill_and_decode_match_full_local_window_reference(
     )
     torch.testing.assert_close(actual_decode, expected_decode, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(swa_cache[1, 1, 0, 0], kv_decode[0, 0])
+
+
+def test_cached_ratio_zero_decode_uses_managed_nhd_page_size_for_swa_cache():
+    torch.manual_seed(17)
+    prefix_len = 4
+    window_size = 3
+    block_size = 32
+    num_pages = 4
+    num_heads = 2
+    head_dim = 4
+    softmax_scale = 0.5
+
+    q_decode = torch.randn(1, 1, num_heads, head_dim)
+    kv_prefix = torch.randn(1, prefix_len, head_dim)
+    kv_decode = torch.randn(1, 1, head_dim)
+    attn_sink = torch.tensor([0.25, -0.5], dtype=torch.float32)
+    cache_loc = torch.arange(num_pages, dtype=torch.int)
+    cu_num_pages = torch.tensor([0, num_pages], dtype=torch.int)
+    swa_cache = torch.zeros(num_pages, 1, block_size, 1, head_dim)
+    swa_cache[0, 0, :prefix_len, 0].copy_(kv_prefix[0])
+
+    actual = _run_cached_sparse_attention_v2(
+        q_decode,
+        kv_decode,
+        attn_sink,
+        torch.zeros(1, 1, window_size, dtype=torch.int32),
+        torch.empty(1, 1, 0),
+        torch.empty(1, 1, 0),
+        torch.empty(0, 0),
+        torch.empty(0),
+        _freqs_cis_table(8, 2),
+        torch.tensor([[prefix_len]], dtype=torch.int),
+        _batch_info(num_prefill=0, num_prefill_tokens=0, num_decode=1),
+        torch.tensor([1], dtype=torch.int),
+        torch.tensor([prefix_len], dtype=torch.int),
+        torch.tensor([0, 1], dtype=torch.int),
+        cache_loc,
+        cu_num_pages,
+        (
+            swa_cache,
+            torch.empty(num_pages, 1, block_size, 1, head_dim),
+            torch.empty(num_pages, 1, block_size, 1, head_dim),
+            torch.empty(num_pages, 1, block_size, 1, head_dim),
+        ),
+        0,
+        0,
+        window_size,
+        2,
+        softmax_scale,
+    )
+
+    full_kv = torch.cat([kv_prefix, kv_decode], dim=1)
+    expected = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention(
+        q_decode,
+        full_kv,
+        attn_sink,
+        torch.tensor([[[prefix_len - window_size + 1, prefix_len - 1, prefix_len]]]),
+        softmax_scale,
+    )
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(swa_cache[0, 0, prefix_len, 0], kv_decode[0, 0])
 
 
 @pytest.mark.parametrize(

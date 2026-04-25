@@ -35,7 +35,7 @@ Differences from the reference implementation:
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -496,7 +496,12 @@ class DeepseekV4Attention(nn.Module):
 
         qr = self.q_norm(self.wq_a(x, layer_type="mla"))
         q = self.wq_b(qr, tp_mode="colwise", layer_type="mla")
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        q = torch.ops.auto_deploy.view(
+            q,
+            [batch_size, seq_len, self.num_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mla",
+        )
         q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
         q_rope = _apply_rope(q[..., -self.rope_head_dim :], freqs_cis)
         q = torch.cat([q[..., : -self.rope_head_dim], q_rope], dim=-1)
@@ -537,6 +542,8 @@ class DeepseekV4Attention(nn.Module):
             freqs_cis_table,
             position_ids,
             self.softmax_scale,
+            enable_sharding=True,
+            layer_type="mla",
             layer_idx=self.layer_idx,
             window_size=self.window_size,
             compress_ratio=self.compress_ratio,
@@ -547,10 +554,16 @@ class DeepseekV4Attention(nn.Module):
         )
         o_rope = _apply_rope(o[..., -self.rope_head_dim :], freqs_cis, inverse=True)
         o = torch.cat([o[..., : -self.rope_head_dim], o_rope], dim=-1)
-        o = o.view(batch_size, seq_len, self.num_groups, -1)
+        o = torch.ops.auto_deploy.view(
+            o,
+            [batch_size, seq_len, self.num_groups, -1],
+            tp_scaled_dim=2,
+            layer_type="mla",
+        )
         wo_a = self.wo_a.weight.view(self.num_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
-        return self.wo_b(o.flatten(2), tp_mode="rowwise", layer_type="mla")
+        o = self.wo_b(o.flatten(2), tp_mode="rowwise", layer_type="mla")
+        return torch.ops.auto_deploy.all_reduce(o, layer_type="mla")
 
 
 class DeepseekV4Gate(nn.Module):
@@ -891,6 +904,17 @@ AutoModelForCausalLMFactory.register_custom_model_cls("DeepseekV4Config", Deepse
 
 @ModelFactoryRegistry.register("DeepseekV4AutoModelForCausalLM")
 class DeepseekV4AutoModelForCausalLMFactory(AutoModelForCausalLMFactory):
+    def _get_model_config(self) -> Tuple[PretrainedConfig, Dict[str, Any]]:
+        model_config, unused_kwargs = super()._get_model_config()
+        if (
+            "ad_rope_cache_len" in self.model_kwargs
+            and "ad_compress_max_seq_len" not in self.model_kwargs
+            and hasattr(model_config, "ad_rope_cache_len")
+            and hasattr(model_config, "ad_compress_max_seq_len")
+        ):
+            model_config.ad_compress_max_seq_len = model_config.ad_rope_cache_len
+        return model_config, unused_kwargs
+
     def get_example_inputs(self) -> Dict[str, torch.Tensor]:
         model_config, _ = self._get_model_config()
         ratios = tuple(getattr(model_config, "compress_ratios", ()))

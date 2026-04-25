@@ -33,6 +33,9 @@ from ..attention_interface import (
     ResourceHandlerDict,
 )
 
+_SPARSE_ATTENTION_CHUNK_TARGET_BYTES = 512 * 1024 * 1024
+_SPARSE_ATTENTION_MAX_CHUNK_TOKENS = 64
+
 
 def _validate_rank(name: str, tensor: torch.Tensor, rank: int) -> None:
     if tensor.dim() != rank:
@@ -92,13 +95,42 @@ def _validate_deepseek_v4_sparse_attention_inputs(
             raise ValueError(f"out must be on {q.device}, got {out.device}")
 
 
-def _gather_selected_kv(kv: torch.Tensor, topk_idxs: torch.Tensor) -> torch.Tensor:
+def _gather_selected_kv(
+    kv: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    batch_idxs: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    gather_topk_idxs = topk_idxs.to(torch.long).clamp(min=0)
+    if batch_idxs is not None:
+        return kv[batch_idxs.to(torch.long).unsqueeze(1), gather_topk_idxs]
+
     batch_size, seq_len, k_select = topk_idxs.shape
     head_dim = kv.shape[-1]
-    gather_topk_idxs = topk_idxs.to(torch.long).clamp(min=0)
     gather_idx = gather_topk_idxs.unsqueeze(-1).expand(batch_size, seq_len, k_select, head_dim)
     expanded_kv = kv.unsqueeze(1).expand(batch_size, seq_len, kv.shape[1], head_dim)
     return torch.gather(expanded_kv, dim=2, index=gather_idx)
+
+
+def _sparse_attention_query_chunk_size(
+    num_tokens: int,
+    num_heads: int,
+    head_dim: int,
+    k_select: int,
+    compute_dtype: torch.dtype,
+) -> int:
+    compute_element_size = torch.empty((), dtype=compute_dtype).element_size()
+    logits_element_size = torch.empty((), dtype=torch.float32).element_size()
+    bytes_per_token = (
+        k_select * head_dim * compute_element_size
+        + 3 * num_heads * (k_select + 1) * logits_element_size
+        + num_heads * head_dim * compute_element_size
+    )
+    if bytes_per_token <= 0:
+        return 1
+    chunk_size = _SPARSE_ATTENTION_CHUNK_TARGET_BYTES // bytes_per_token
+    chunk_size = max(1, int(chunk_size))
+    chunk_size = min(chunk_size, _SPARSE_ATTENTION_MAX_CHUNK_TOKENS)
+    return min(num_tokens, chunk_size)
 
 
 @torch.library.custom_op("auto_deploy::torch_deepseek_v4_sparse_attention", mutates_args=())
@@ -150,22 +182,46 @@ def torch_deepseek_v4_sparse_attention(
     _validate_deepseek_v4_sparse_attention_inputs(q, kv, attn_sink, topk_idxs, out)
 
     compute_dtype = torch.float32 if q.dtype in (torch.float16, torch.bfloat16) else q.dtype
-    selected_kv = _gather_selected_kv(kv, topk_idxs)
-    q_compute = q.to(compute_dtype)
-    selected_kv_compute = selected_kv.to(compute_dtype)
+    batch_size, seq_len, num_heads, q_head_dim = q.shape
+    _, _, k_select = topk_idxs.shape
+    num_tokens = batch_size * seq_len
+    output = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    if num_tokens == 0:
+        if out is not None:
+            out.copy_(output)
+            return out.new_empty(0)
+        return output
 
-    logits = torch.einsum("bshd,bskd->bshk", q_compute, selected_kv_compute)
-    logits = logits * softmax_scale
-    invalid = topk_idxs < 0
-    logits = logits.masked_fill(invalid.unsqueeze(2), float("-inf"))
-    sink_logits = attn_sink.to(dtype=compute_dtype).reshape(1, 1, -1, 1)
-    sink_logits = sink_logits.expand(q.shape[0], q.shape[1], q.shape[2], 1)
-    logits_with_sink = torch.cat([logits, sink_logits], dim=-1)
+    chunk_size = _sparse_attention_query_chunk_size(
+        num_tokens, num_heads, q_head_dim, k_select, compute_dtype
+    )
 
-    weights_with_sink = torch.softmax(logits_with_sink, dim=-1, dtype=torch.float32)
-    weights = weights_with_sink[..., :-1].to(compute_dtype)
-    output = torch.einsum("bshk,bskd->bshd", weights, selected_kv_compute)
-    output = output.to(q.dtype).contiguous()
+    q_flat = q.reshape(num_tokens, num_heads, q_head_dim)
+    topk_flat = topk_idxs.reshape(num_tokens, k_select)
+    batch_idxs = torch.arange(batch_size, device=q.device).view(batch_size, 1)
+    batch_idxs = batch_idxs.expand(batch_size, seq_len).reshape(num_tokens)
+    output_flat = output.reshape(num_tokens, num_heads, q_head_dim)
+    sink_logits = attn_sink.to(dtype=compute_dtype).reshape(1, num_heads, 1)
+
+    for start in range(0, num_tokens, chunk_size):
+        end = min(start + chunk_size, num_tokens)
+        topk_chunk = topk_flat[start:end]
+        selected_kv_compute = _gather_selected_kv(kv, topk_chunk, batch_idxs[start:end]).to(
+            compute_dtype
+        )
+        q_compute = q_flat[start:end].to(compute_dtype)
+
+        logits = torch.einsum("thd,tkd->thk", q_compute, selected_kv_compute)
+        logits = logits * softmax_scale
+        logits = logits.masked_fill((topk_chunk < 0).unsqueeze(1), float("-inf"))
+        chunk_sink_logits = sink_logits.expand(end - start, num_heads, 1)
+        logits_with_sink = torch.cat([logits, chunk_sink_logits], dim=-1)
+
+        weights_with_sink = torch.softmax(logits_with_sink, dim=-1, dtype=torch.float32)
+        weights = weights_with_sink[..., :-1].to(compute_dtype)
+        chunk_output = torch.einsum("thk,tkd->thd", weights, selected_kv_compute)
+        output_flat[start:end].copy_(chunk_output.to(q.dtype))
+
     if out is not None:
         out.copy_(output)
         return out.new_empty(0)
@@ -217,8 +273,15 @@ def _to_host_long(tensor: torch.Tensor, length: int) -> torch.Tensor:
 def _cache_token_view(cache: torch.Tensor, page_idx: int, token_offset: int) -> torch.Tensor:
     """Return a mutable view for one DeepSeek V4 SWA cache row."""
     if cache.dim() == 5:
-        # KVPagedResourceHandler with NHD layout:
-        # [num_pages, tokens_per_block, kv_factor, num_kv_heads, head_dim].
+        if int(cache.shape[1]) <= 2:
+            # KVCacheManager.get_buffers(..., kv_layout="NHD"):
+            # [num_pages, kv_factor, tokens_per_block, num_kv_heads, head_dim].
+            if int(cache.shape[2]) >= int(cache.shape[3]):
+                return cache[page_idx, 0, token_offset, 0]
+            # KVCacheManager.get_buffers(..., kv_layout="HND"):
+            # [num_pages, kv_factor, num_kv_heads, tokens_per_block, head_dim].
+            return cache[page_idx, 0, 0, token_offset]
+        # Local unit tests use [num_pages, tokens_per_block, kv_factor, num_kv_heads, head_dim].
         return cache[page_idx, token_offset, 0, 0]
     if cache.dim() == 4:
         # Local unit tests often use [num_pages, tokens_per_block, num_heads, head_dim].
@@ -231,6 +294,8 @@ def _cache_token_view(cache: torch.Tensor, page_idx: int, token_offset: int) -> 
 def _cache_tokens_per_block(cache: torch.Tensor) -> int:
     if cache.dim() not in (3, 4, 5):
         raise ValueError(f"swa_cache must have rank 3, 4, or 5, got rank {cache.dim()}")
+    if cache.dim() == 5 and int(cache.shape[1]) <= 2:
+        return int(cache.shape[2] if int(cache.shape[2]) >= int(cache.shape[3]) else cache.shape[3])
     return int(cache.shape[1])
 
 

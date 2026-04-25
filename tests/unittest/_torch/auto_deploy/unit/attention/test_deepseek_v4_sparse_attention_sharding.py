@@ -19,9 +19,9 @@ import torch.nn as nn
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import DeepseekV4Config
-from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4_ir import (
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
     DeepseekV4Attention,
+    DeepseekV4Config,
 )
 from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig, Stages
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir import ApplyShardingHints
@@ -186,7 +186,7 @@ def test_deepseek_v4_sparse_attention_shards_attn_sink_without_collective(
     )
 
 
-def test_deepseek_v4_ir_attention_emits_head_group_views_and_sparse_attention_hint() -> None:
+def test_deepseek_v4_attention_emits_head_group_views_and_sparse_attention_hint() -> None:
     config = DeepseekV4Config(
         vocab_size=16,
         hidden_size=16,

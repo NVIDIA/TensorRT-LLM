@@ -479,20 +479,30 @@ class DeepSeekV4SparseAttentionShardableNode(ShardableNode):
     """DeepSeek V4 sparse attention: shard head-owned parameters, not activations."""
 
     def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
-        [enable_sharding, attn_sink] = extract_op_args(
+        [enable_sharding, attn_sink, q] = extract_op_args(
             self.node,
             "enable_sharding",
             "attn_sink",
+            "q",
         )
         if not enable_sharding or dc.tp_size <= 1:
             return 0
 
         sink_name, sink_tensor = _get_attr_tensor(gm, attn_sink, "attn_sink")
+        full_heads = int(sink_tensor.shape[0])
         _assert_divisible(
-            int(sink_tensor.shape[0]),
+            full_heads,
             dc.tp_size,
             "DeepSeek V4 attention heads",
         )
+        local_heads = full_heads // dc.tp_size
+        q_shape = shape(q)
+        if q_shape is not None:
+            q_heads = int(q_shape[-2])
+            assert q_heads in (local_heads, full_heads), (
+                "DeepSeek V4 sparse attention q head count must match either local "
+                f"heads ({local_heads}) or pre-shard metadata heads ({full_heads}), got {q_heads}"
+            )
         shard_weight_tensor(
             gm=gm,
             weight_tensor=sink_tensor,

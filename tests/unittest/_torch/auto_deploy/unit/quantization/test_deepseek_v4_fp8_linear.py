@@ -20,9 +20,9 @@ import torch.nn.functional as F
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import DeepseekV4Config
-from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4_ir import (
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
     DeepseekV4Attention,
+    DeepseekV4Config,
 )
 from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig, Stages
 from tensorrt_llm._torch.auto_deploy.transform.library.quantization import (
@@ -155,6 +155,7 @@ class _DeepSeekV4WoAShardingFixture(nn.Module):
             self.layers[0].attn.wo_a.weight,
             None,
             [self.layers[0].attn.wo_a.weight_scale_inv],
+            layer_type="mla",
         )
 
 
@@ -171,6 +172,7 @@ class _DeepSeekV4WoALocalViewShardingFixture(_DeepSeekV4WoAShardingFixture):
             self.layers[0].attn.wo_a.weight,
             None,
             [self.layers[0].attn.wo_a.weight_scale_inv],
+            layer_type="mla",
         )
 
 
@@ -213,8 +215,10 @@ def _run_ir_sharding(
     *,
     rank: int,
     world_size: int,
+    shard_layers: list[str] | None = None,
 ) -> tuple[torch.fx.GraphModule, object]:
     transform = ApplyShardingHints.from_kwargs(stage=Stages.SHARDING)
+    transform.config.shard_layers = shard_layers
     shared_config = SharedConfig(
         local_rank=rank,
         world_size=world_size,
@@ -259,6 +263,36 @@ def _run_finegrained_transform(
 def _load_finegrained_state_dict(state_dict: dict[str, torch.Tensor], weight_name: str) -> None:
     transform = FineGrainedFP8LinearQuantization.from_kwargs(stage=Stages.PATTERN_MATCHER)
     transform.load_hook(state_dict, "", weight_name=weight_name)
+
+
+def _depends_on(node: torch.fx.Node, target: torch.fx.Node) -> bool:
+    def _node_args(value):
+        if isinstance(value, torch.fx.Node):
+            return [value]
+        if isinstance(value, (list, tuple)):
+            nodes = []
+            for item in value:
+                nodes.extend(_node_args(item))
+            return nodes
+        if isinstance(value, dict):
+            nodes = []
+            for item in value.values():
+                nodes.extend(_node_args(item))
+            return nodes
+        return []
+
+    pending = [node]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if current is target:
+            return True
+        if current in seen:
+            continue
+        seen.add(current)
+        pending.extend(_node_args(current.args))
+        pending.extend(_node_args(current.kwargs))
+    return False
 
 
 def _fp8_weight(shape: tuple[int, int]) -> torch.Tensor:
@@ -415,6 +449,7 @@ def test_deepseek_v4_wo_a_grouped_transform_rewrites_only_scoped_einsum() -> Non
         if node.op == "call_function" and node.target in {torch.einsum, torch.functional.einsum}
     ]
     assert len(grouped_nodes) == 1
+    assert grouped_nodes[0].kwargs["layer_type"] == "mla"
     assert len(remaining_einsum_nodes) == 1
 
 
@@ -443,7 +478,7 @@ def test_deepseek_v4_wo_a_grouped_op_matches_reference_on_ragged_blocks() -> Non
     grouped_op = (
         torch.ops.auto_deploy.torch_fake_quant_deepseek_v4_wo_a_grouped_finegrained_fp8_linear
     )
-    actual = grouped_op.default(input_tensor, weight, None, [weight_scale])
+    actual = grouped_op.default(input_tensor, weight, None, [weight_scale], layer_type="mla")
 
     scale_expanded = weight_scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
     scale_expanded = scale_expanded[:weight_rows, :group_dim]
@@ -589,17 +624,40 @@ def test_deepseek_v4_attention_wo_a_sharding_feeds_rowwise_wo_b_local_features()
     )
 
     quantized, quant_info = _run_finegrained_transform(gm, _deepseek_v4_quant_config())
-    transformed, shard_info = _run_ir_sharding(quantized, rank=1, world_size=8)
+    transformed, shard_info = _run_ir_sharding(
+        quantized,
+        rank=1,
+        world_size=8,
+        shard_layers=["mla"],
+    )
 
     assert quant_info.num_matches == 5
     assert shard_info.num_matches >= 6
+    wq_b = transformed.get_submodule("layers.0.attn.wq_b")
     wo_a = transformed.get_submodule("layers.0.attn.wo_a")
     wo_b = transformed.get_submodule("layers.0.attn.wo_b")
+    assert wq_b.weight.shape == (16, 32)
+    assert wq_b.weight_scale_inv.shape == (1, 1)
     assert wo_a.weight.dtype == torch.float8_e4m3fn
     assert wo_a.weight.shape == (128, 16)
     assert wo_a.weight_scale_inv.shape == (1, 1)
     assert wo_b.weight.shape == (128, 128)
     assert wo_b.weight_scale_inv.shape == (1, 1)
+    assert transformed.get_parameter("layers.0.attn.attn_sink").shape == (1,)
+
+    q_view_node = next(
+        node
+        for node in transformed.graph.nodes
+        if is_op(node, torch.ops.auto_deploy.view)
+        and node.args[1][-1] == model.layers[0].attn.head_dim
+    )
+    assert q_view_node.args[1] == [1, 4, -1, 16]
+    sparse_node = next(
+        node
+        for node in transformed.graph.nodes
+        if is_op(node, torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2)
+    )
+    assert _depends_on(sparse_node.args[0], q_view_node)
 
     grouped_node = next(
         node
@@ -619,6 +677,12 @@ def test_deepseek_v4_attention_wo_a_sharding_feeds_rowwise_wo_b_local_features()
     )
     assert wo_b_node.args[0].args[0] is grouped_node
     assert wo_a.weight.shape[0] // local_group_view.args[1][2] == wo_b.weight.shape[1]
+    assert any(
+        node.op == "call_function"
+        and "dist_all_reduce" in str(node.target)
+        and node.args[0] is wo_b_node
+        for node in transformed.graph.nodes
+    )
 
 
 def test_fp8_weight_dequant_preserves_fixed_block_scale_for_ragged_shapes() -> None:

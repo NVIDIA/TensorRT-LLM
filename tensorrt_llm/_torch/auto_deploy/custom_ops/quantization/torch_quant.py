@@ -600,6 +600,7 @@ def torch_fake_quant_deepseek_v4_wo_a_grouped_finegrained_fp8_linear(
     weight_quantized: torch.Tensor,  # [G * R, Dg] float8_e4m3fn
     bias: Optional[torch.Tensor],  # [G * R], [G, R], or None
     weight_scale: List[torch.Tensor],  # [weight_scale_inv], shape [ceil(G*R/128), ceil(Dg/128)]
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Reference DeepSeek V4 ``wo_a`` grouped FineGrainedFP8 projection.
 
@@ -607,6 +608,7 @@ def torch_fake_quant_deepseek_v4_wo_a_grouped_finegrained_fp8_linear(
     ``[R, Dg]`` projections.  The fallback keeps that compact layout, dequantizes
     with fixed 128x128 weight blocks, and contracts each group with its own block.
     """
+    del layer_type
     if input.dim() != 4:
         raise ValueError(f"input must have shape [B, S, G, Dg], got {tuple(input.shape)}")
     if weight_quantized.dtype != torch.float8_e4m3fn:
@@ -646,8 +648,10 @@ def _torch_fake_quant_deepseek_v4_wo_a_grouped_finegrained_fp8_linear_fake(
     weight_quantized: torch.Tensor,
     bias: Optional[torch.Tensor],
     weight_scale: List[torch.Tensor],
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Fake implementation for torch.export tracing."""
+    del bias, weight_scale, layer_type
     num_groups = input.shape[-2]
     o_lora_rank = weight_quantized.shape[0] // num_groups
     return torch.empty((*input.shape[:-1], o_lora_rank), dtype=input.dtype, device=input.device)

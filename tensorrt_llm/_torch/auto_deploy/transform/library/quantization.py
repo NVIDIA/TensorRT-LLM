@@ -1105,6 +1105,7 @@ class FineGrainedFP8LinearQuantization(Quantization):
             grouped_node = gm.graph.call_function(
                 self.deepseek_v4_wo_a_grouped_target_op(),
                 args=(input_view, weight_node, None, [scale_node]),
+                kwargs={"layer_type": "mla"},
             )
 
         einsum_node.replace_all_uses_with(grouped_node)
