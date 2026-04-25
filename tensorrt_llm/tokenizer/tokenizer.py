@@ -60,8 +60,8 @@ def _tokenizer_json_uses_byte_level(pretrained_model_dir: str) -> bool:
     return False
 
 
-def _maybe_fix_byte_level_tokenizer(tokenizer, pretrained_model_dir: str,
-                                    **kwargs):
+def maybe_fix_byte_level_tokenizer(tokenizer, pretrained_model_dir: str,
+                                   **kwargs):
     """Work around Transformers 5.x LlamaTokenizer overriding tokenizer.json.
 
     Some model repos (e.g. DeepSeek-V3) declare ``tokenizer_class:
@@ -186,9 +186,9 @@ class TransformersTokenizer(TokenizerBase):
     def from_pretrained(cls, pretrained_model_dir: str, **kwargs):
         tokenizer = AutoTokenizer.from_pretrained(pretrained_model_dir,
                                                   **kwargs)
-        tokenizer = _maybe_fix_byte_level_tokenizer(tokenizer,
-                                                    pretrained_model_dir,
-                                                    **kwargs)
+        tokenizer = maybe_fix_byte_level_tokenizer(tokenizer,
+                                                   pretrained_model_dir,
+                                                   **kwargs)
         return cls(tokenizer)
 
     def save_pretrained(self, pretrained_model_dir: str, **kwargs):
