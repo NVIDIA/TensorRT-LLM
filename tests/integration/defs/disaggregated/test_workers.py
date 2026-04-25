@@ -406,9 +406,8 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
             gen_server_prev = gen_server
             response = await self.send_disagg_request(session, ctx_server,
                                                       gen_server, request)
-            await asyncio.gather(
-                self.ctx_router.finish_request(openai_request, session),
-                self.gen_router.finish_request(openai_request, session))
+            await asyncio.gather(self.ctx_router.finish_request(openai_request),
+                                 self.gen_router.finish_request(openai_request))
             logger.info(
                 f"Received response {i}: {repr(response['choices'][0]['text'])}"
             )
