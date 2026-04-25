@@ -7024,7 +7024,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                                                   enable_padding=True),
                 disable_overlap_scheduler=False,
                 moe_config=MoeConfig(backend="CUTLASS"),
-                speculative_config=mtp_config,
+                decoding_config=mtp_config,
         ) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
