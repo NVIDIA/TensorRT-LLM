@@ -420,3 +420,7 @@ unittest/_torch/visual_gen/multi_gpu/test_ulysses_sage_attention.py::TestSageUly
 unittest/_torch/visual_gen/multi_gpu/test_ulysses_sage_attention.py::TestSageUlyssesAttention::test_sage_ulysses_vs_reference[False-1] SKIP (https://nvbugs/6111076)
 unittest/_torch/visual_gen/multi_gpu/test_ulysses_sage_attention.py::TestSageUlyssesAttention::test_sage_ulysses_vs_reference[True-16] SKIP (https://nvbugs/6111076)
 unittest/_torch/visual_gen/multi_gpu/test_ulysses_sage_attention.py::TestSageUlyssesAttention::test_sage_ulysses_vs_reference[True-4] SKIP (https://nvbugs/6111076)
+disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-deepseek_r1_v2_fp4_stress] SKIP (https://nvbugs/6112508)
+disaggregated/test_disaggregated.py::test_disaggregated_stress_test[input8k-output1k-conc512-gpt_oss_120b_stress] SKIP (https://nvbugs/6112508)
+stress_test/stress_test.py::stress_test::test_run_stress_test[DeepSeek-V3_tp8-stress_time_3600s_timeout_10800s-GUARANTEED_NO_EVICT-pytorch-stress-test-with-accuracy] SKIP (https://nvbugs/6112510)
+stress_test/stress_test.py::stress_test::test_run_stress_test[DeepSeek-V3_tp8-stress_time_3600s_timeout_10800s-MAX_UTILIZATION-pytorch-stress-test-with-accuracy] SKIP (https://nvbugs/6112510)
