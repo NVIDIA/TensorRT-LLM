@@ -379,13 +379,8 @@ class TestExplicitTeaCacheCoefficientsRequired:
             with patch(
                 "tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan.register_extractor_from_config"
             ):
-                with patch.object(
-                    WanPipeline,
-                    "_apply_teacache_coefficients",
-                    lambda self, coefficients: None,
-                ):
-                    with pytest.raises(ValueError, match="Wan 2.2 TeaCache requires explicit"):
-                        WanPipeline.post_load_weights(pipe)
+                with pytest.raises(ValueError, match="Wan 2.2 TeaCache requires explicit"):
+                    WanPipeline.post_load_weights(pipe)
 
     def test_wan22_i2v_raises_when_teacache_enabled_without_both_coefficient_lists(self):
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v import (
@@ -410,13 +405,8 @@ class TestExplicitTeaCacheCoefficientsRequired:
             with patch(
                 "tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v.register_extractor_from_config"
             ):
-                with patch.object(
-                    WanImageToVideoPipeline,
-                    "_apply_teacache_coefficients",
-                    lambda self, coefficients: None,
-                ):
-                    with pytest.raises(ValueError, match="Wan 2.2 TeaCache requires explicit"):
-                        WanImageToVideoPipeline.post_load_weights(pipe)
+                with pytest.raises(ValueError, match="Wan 2.2 TeaCache requires explicit"):
+                    WanImageToVideoPipeline.post_load_weights(pipe)
 
     def test_wan22_t2v_installs_two_teacache_backends_when_coefficients_provided(self):
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
@@ -452,3 +442,67 @@ class TestExplicitTeaCacheCoefficientsRequired:
         assert pipe.transformer_cache_backend is pipe.cache_backend
         assert pipe.transformer_2_cache_backend is not None
         assert pipe.transformer_2_cache_backend is not pipe.cache_backend
+
+    def test_wan22_t2v_transformer_gets_coefficients_and_transformer_2_gets_coefficients_2(self):
+        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
+
+        pipe = object.__new__(WanPipeline)
+        pipe.transformer = MagicMock()
+        pipe.transformer_2 = MagicMock()
+        pipe.is_wan22 = True
+        pipe.model_config = DiffusionModelConfig(
+            pretrained_config=SimpleNamespace(_name_or_path="/wan/snapshot", boundary_ratio=0.2),
+            cache=TeaCacheConfig(
+                coefficients=[1.0, 2.0],
+                coefficients_2=[3.0, 4.0],
+            ),
+            skip_create_weights_in_init=True,
+        )
+        with patch.object(BasePipeline, "post_load_weights", lambda self: None):
+            with patch(
+                "tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan.register_extractor_from_config"
+            ):
+                with patch(
+                    "tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan.TeaCacheBackend"
+                ) as TB:
+                    TB.return_value = MagicMock()
+                    WanPipeline.post_load_weights(pipe)
+
+        assert TB.call_count == 2
+        cfg_high = TB.call_args_list[0][0][0]
+        cfg_low = TB.call_args_list[1][0][0]
+        assert cfg_high.coefficients == [1.0, 2.0]
+        assert cfg_low.coefficients == [3.0, 4.0]
+
+    def test_wan22_i2v_transformer_gets_coefficients_and_transformer_2_gets_coefficients_2(self):
+        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v import (
+            WanImageToVideoPipeline,
+        )
+
+        pipe = object.__new__(WanImageToVideoPipeline)
+        pipe.transformer = MagicMock()
+        pipe.transformer_2 = MagicMock()
+        pipe.is_wan22 = True
+        pipe.model_config = DiffusionModelConfig(
+            pretrained_config=SimpleNamespace(_name_or_path="/wan/snapshot", boundary_ratio=0.2),
+            cache=TeaCacheConfig(
+                coefficients=[5.0, 6.0],
+                coefficients_2=[7.0, 8.0],
+            ),
+            skip_create_weights_in_init=True,
+        )
+        with patch.object(BasePipeline, "post_load_weights", lambda self: None):
+            with patch(
+                "tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v.register_extractor_from_config"
+            ):
+                with patch(
+                    "tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v.TeaCacheBackend"
+                ) as TB:
+                    TB.return_value = MagicMock()
+                    WanImageToVideoPipeline.post_load_weights(pipe)
+
+        assert TB.call_count == 2
+        cfg_high = TB.call_args_list[0][0][0]
+        cfg_low = TB.call_args_list[1][0][0]
+        assert cfg_high.coefficients == [5.0, 6.0]
+        assert cfg_low.coefficients == [7.0, 8.0]
