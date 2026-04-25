@@ -957,7 +957,8 @@ def test_eagle3_lora(use_cuda_graph: bool):
 @skip_blackwell
 @with_mocked_hf_download_for_single_gpu
 def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
-                                   disable_overlap_scheduler: bool):
+                                   disable_overlap_scheduler: bool,
+                                   enforce_single_worker):
     """Test EAGLE3 dynamic tree speculative decoding with one-model architecture."""
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
@@ -971,7 +972,9 @@ def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
     max_draft_len = 6
     dynamic_tree_max_topK = 10
     max_total_draft_tokens = 60
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=8192)
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                    max_tokens=2048,
+                                    free_gpu_memory_fraction=0.5)
     cuda_graph_config = CudaGraphConfig(
         batch_sizes=[i for i in range(1, max_batch_size +
                                       1)]) if use_cuda_graph else None
@@ -983,7 +986,7 @@ def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
         cuda_graph_config=cuda_graph_config,
         max_batch_size=max_batch_size,
         kv_cache_config=kv_cache_config,
-        max_seq_len=8192,
+        max_seq_len=2048,
     )
 
     spec_config = Eagle3DecodingConfig(
