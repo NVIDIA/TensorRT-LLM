@@ -28,6 +28,33 @@ _BACKEND_OPS = {
 }
 
 
+def _get_node_dtype(node: Node | object) -> torch.dtype | None:
+    if not isinstance(node, Node):
+        return getattr(node, "dtype", None)
+
+    val = node.meta.get("val")
+    if val is not None and hasattr(val, "dtype"):
+        return val.dtype
+
+    tensor_meta = node.meta.get("tensor_meta")
+    if tensor_meta is not None and hasattr(tensor_meta, "dtype"):
+        return tensor_meta.dtype
+
+    return None
+
+
+def _set_cast_node_metadata(node: Node, source: Node, dtype: torch.dtype) -> None:
+    node.meta.update(source.meta)
+
+    val = node.meta.get("val")
+    if val is not None and hasattr(val, "to"):
+        node.meta["val"] = val.to(dtype=dtype)
+
+    tensor_meta = node.meta.get("tensor_meta")
+    if tensor_meta is not None and hasattr(tensor_meta, "_replace"):
+        node.meta["tensor_meta"] = tensor_meta._replace(dtype=dtype)
+
+
 def _rms_norm_pattern(data: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Implements the RMSNorm pattern for pattern matching.
 
@@ -358,11 +385,32 @@ class FuseRMSNorm(BaseTransform):
         # Replace torch_rmsnorm ops with the selected backend
         for node in list(graph.nodes):
             if is_op(node, torch.ops.auto_deploy.torch_rmsnorm):
+                new_args = node.args
+                insertion_anchor = node
+                if backend == "flashinfer":
+                    data, weight, *rest = node.args
+                    data_dtype = _get_node_dtype(data)
+                    weight_dtype = _get_node_dtype(weight)
+                    if (
+                        data_dtype is not None
+                        and weight_dtype is not None
+                        and data_dtype != weight_dtype
+                    ):
+                        with graph.inserting_after(node):
+                            weight = graph.call_function(
+                                torch.ops.aten.to.dtype,
+                                args=(weight, data_dtype),
+                            )
+                        insertion_anchor = weight
+                        if isinstance(node.args[1], Node):
+                            _set_cast_node_metadata(weight, node.args[1], data_dtype)
+                        new_args = (data, weight, *rest)
+
                 # Replace with the selected backend op
-                with graph.inserting_after(node):
+                with graph.inserting_after(insertion_anchor):
                     new_node: Node = graph.call_function(
                         target_op,
-                        args=node.args,
+                        args=new_args,
                         kwargs=node.kwargs,
                     )
                     # Preserve metadata (including val/tensor_meta) for downstream transforms.

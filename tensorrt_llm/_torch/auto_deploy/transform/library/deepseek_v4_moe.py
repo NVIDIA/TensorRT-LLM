@@ -224,13 +224,23 @@ def _set_parameter(
     setattr(module, attr_name, nn.Parameter(value, requires_grad=requires_grad))
 
 
-def _register_buffer(gm: GraphModule, full_name: str, value: torch.Tensor) -> None:
+def _register_buffer(
+    gm: GraphModule,
+    full_name: str,
+    value: torch.Tensor,
+    *,
+    persistent: bool = True,
+) -> None:
     module_name, _, attr_name = full_name.rpartition(".")
     module = gm.get_submodule(module_name) if module_name else gm
     if attr_name in module._buffers:
         module._buffers[attr_name] = value
+        if persistent:
+            module._non_persistent_buffers_set.discard(attr_name)
+        else:
+            module._non_persistent_buffers_set.add(attr_name)
     else:
-        module.register_buffer(attr_name, value)
+        module.register_buffer(attr_name, value, persistent=persistent)
 
 
 def _create_get_attr_with_meta(gm: GraphModule, graph: torch.fx.Graph, full_name: str) -> Node:
@@ -241,6 +251,13 @@ def _create_get_attr_with_meta(gm: GraphModule, graph: torch.fx.Graph, full_name
     if isinstance(value, torch.Tensor):
         node.meta["val"] = value.detach()
     return node
+
+
+def _delete_attr(gm: GraphModule, full_name: str) -> None:
+    module_name, _, attr_name = full_name.rpartition(".")
+    module = gm.get_submodule(module_name) if module_name else gm
+    if hasattr(module, attr_name):
+        delattr(module, attr_name)
 
 
 def _fp8_scale_shape(weight_shape: torch.Size) -> tuple[int, int]:
@@ -476,15 +493,17 @@ def _lower_to_mxfp4_bridge(gm: GraphModule, node: Node) -> _MoEBridge:
 
     gate_up_bias_name = f"{info.ffn_path}.mxfp4_gate_up_bias"
     down_bias_name = f"{info.ffn_path}.mxfp4_down_bias"
-    _set_parameter(
+    _register_buffer(
         gm,
         gate_up_bias_name,
         torch.zeros((info.num_experts, 2 * info.intermediate_size), dtype=torch.float32),
+        persistent=False,
     )
-    _set_parameter(
+    _register_buffer(
         gm,
         down_bias_name,
         torch.zeros((info.num_experts, info.hidden_size), dtype=torch.float32),
+        persistent=False,
     )
 
     with graph.inserting_before(node):
@@ -552,6 +571,13 @@ def _lower_to_mxfp4_bridge(gm: GraphModule, node: Node) -> _MoEBridge:
 
     node.replace_all_uses_with(output)
     graph.erase_node(node)
+    graph.eliminate_dead_code()
+    for expert_idx in range(bridge.num_experts):
+        for proj in ("w1", "w2", "w3"):
+            _delete_attr(
+                gm,
+                f"layers.{bridge.layer_idx}.ffn.experts.{expert_idx}.{proj}.weight",
+            )
     return bridge
 
 

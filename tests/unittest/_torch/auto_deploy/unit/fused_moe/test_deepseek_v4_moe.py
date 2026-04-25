@@ -13,7 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import operator
+import os
+from pathlib import Path
 
 import pytest
 import torch
@@ -41,11 +44,20 @@ from tensorrt_llm._torch.auto_deploy.transform.library.deepseek_v4_moe import (
     DeepSeekV4MoELoweringError,
 )
 from tensorrt_llm._torch.auto_deploy.transform.library.deepseek_v4_mxfp4 import (
+    DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
+    DEEPSEEK_V4_MXFP4_BYTES_PER_BLOCK,
     load_deepseek_v4_mxfp4_experts,
 )
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir import ApplyShardingHints
 from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
+from tensorrt_llm._torch.auto_deploy.utils.e8m0 import e8m0_to_fp32, e8m0_to_uint8
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_op_args, is_op
+
+_DEEPSEEK_V4_REAL_CKPT_ENV = "DEEPSEEK_V4_FLASH_CHECKPOINT"
+_DEFAULT_DEEPSEEK_V4_REAL_CKPT = Path(
+    "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/"
+    "bmarimuthu/dev/hf_home/manual/deepseek-ai__DeepSeek-V4-Flash"
+)
 
 
 def _expert_mlp(
@@ -163,6 +175,157 @@ def _run_ir_sharding(
         ),
     )
     return transform._apply(gm, None, None, shared_config)
+
+
+def _deepseek_v4_real_checkpoint_path() -> Path:
+    checkpoint_path = Path(
+        os.environ.get(_DEEPSEEK_V4_REAL_CKPT_ENV, _DEFAULT_DEEPSEEK_V4_REAL_CKPT)
+    )
+    if not checkpoint_path.exists():
+        pytest.skip(
+            f"DeepSeek V4 real checkpoint not found at {checkpoint_path}; set "
+            f"{_DEEPSEEK_V4_REAL_CKPT_ENV} to run this coverage."
+        )
+    index_path = checkpoint_path / "model.safetensors.index.json"
+    if not index_path.exists():
+        pytest.skip(f"DeepSeek V4 safetensors index not found at {index_path}.")
+    return checkpoint_path
+
+
+def _load_real_checkpoint_tensors(
+    checkpoint_path: Path,
+    tensor_names: list[str],
+) -> dict[str, torch.Tensor]:
+    safetensors = pytest.importorskip("safetensors")
+    index_path = checkpoint_path / "model.safetensors.index.json"
+    weight_map = json.loads(index_path.read_text(encoding="utf-8"))["weight_map"]
+    missing = [name for name in tensor_names if name not in weight_map]
+    assert missing == []
+
+    by_file: dict[str, list[str]] = {}
+    for name in tensor_names:
+        by_file.setdefault(weight_map[name], []).append(name)
+
+    tensors: dict[str, torch.Tensor] = {}
+    for filename, file_tensor_names in by_file.items():
+        with safetensors.safe_open(
+            checkpoint_path / filename,
+            framework="pt",
+            device="cpu",
+        ) as handle:
+            for name in file_tensor_names:
+                tensors[name] = handle.get_tensor(name)
+    return tensors
+
+
+def _real_mxfp4_weight_blocks(
+    tensor: torch.Tensor,
+    *,
+    rows: int,
+    logical_cols: int,
+) -> torch.Tensor:
+    assert tensor.dtype in (torch.int8, torch.uint8)
+    assert tensor.shape == (
+        rows,
+        logical_cols // 2,
+    )
+    return (
+        tensor.view(torch.uint8)
+        .contiguous()
+        .view(
+            rows,
+            logical_cols // DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
+            DEEPSEEK_V4_MXFP4_BYTES_PER_BLOCK,
+        )
+    )
+
+
+def _real_mxfp4_scale_bytes(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.dtype == torch.uint8:
+        return tensor.contiguous()
+    return e8m0_to_uint8(tensor).contiguous()
+
+
+def _assert_layout_matches_real_checkpoint(
+    layout,
+    state_dict: dict[str, torch.Tensor],
+    *,
+    layer_idx: int,
+    expert_indices: tuple[int, ...],
+    hidden_size: int,
+    intermediate_size: int,
+) -> None:
+    assert layout.expert_indices == expert_indices
+    assert layout.gate_up_blocks.shape == (
+        len(expert_indices),
+        2 * intermediate_size,
+        hidden_size // DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
+        DEEPSEEK_V4_MXFP4_BYTES_PER_BLOCK,
+    )
+    assert layout.gate_up_scales.shape == (
+        len(expert_indices),
+        2 * intermediate_size,
+        hidden_size // DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
+    )
+    assert layout.down_blocks.shape == (
+        len(expert_indices),
+        hidden_size,
+        intermediate_size // DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
+        DEEPSEEK_V4_MXFP4_BYTES_PER_BLOCK,
+    )
+    assert layout.down_scales.shape == (
+        len(expert_indices),
+        hidden_size,
+        intermediate_size // DEEPSEEK_V4_MXFP4_BLOCK_SIZE,
+    )
+
+    for local_idx, expert_idx in enumerate(expert_indices):
+        prefix = f"layers.{layer_idx}.ffn.experts.{expert_idx}"
+        w3_blocks = _real_mxfp4_weight_blocks(
+            state_dict[f"{prefix}.w3.weight"],
+            rows=intermediate_size,
+            logical_cols=hidden_size,
+        )
+        w1_blocks = _real_mxfp4_weight_blocks(
+            state_dict[f"{prefix}.w1.weight"],
+            rows=intermediate_size,
+            logical_cols=hidden_size,
+        )
+        w2_blocks = _real_mxfp4_weight_blocks(
+            state_dict[f"{prefix}.w2.weight"],
+            rows=hidden_size,
+            logical_cols=intermediate_size,
+        )
+        w3_scales = _real_mxfp4_scale_bytes(state_dict[f"{prefix}.w3.scale"])
+        w1_scales = _real_mxfp4_scale_bytes(state_dict[f"{prefix}.w1.scale"])
+        w2_scales = _real_mxfp4_scale_bytes(state_dict[f"{prefix}.w2.scale"])
+
+        torch.testing.assert_close(
+            layout.gate_up_blocks[local_idx, :intermediate_size],
+            w3_blocks,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            layout.gate_up_blocks[local_idx, intermediate_size:],
+            w1_blocks,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(layout.down_blocks[local_idx], w2_blocks, rtol=0, atol=0)
+        torch.testing.assert_close(
+            layout.gate_up_scales[local_idx, :intermediate_size],
+            w3_scales,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            layout.gate_up_scales[local_idx, intermediate_size:],
+            w1_scales,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(layout.down_scales[local_idx], w2_scales, rtol=0, atol=0)
 
 
 def test_from_routing_matches_tiny_bf16_reference_with_precomputed_routing() -> None:
@@ -984,6 +1147,138 @@ def _packed_checkpoint_state() -> dict[str, torch.Tensor]:
     return state
 
 
+def test_mxfp4_loader_matches_real_deepseek_v4_checkpoint_layout() -> None:
+    checkpoint_path = _deepseek_v4_real_checkpoint_path()
+    hidden_size = 4096
+    intermediate_size = 2048
+
+    for layer_idx, expert_indices in ((0, (0, 1, 255)), (42, (0, 255))):
+        tensor_names = [
+            f"layers.{layer_idx}.ffn.experts.{expert_idx}.{proj}.{suffix}"
+            for expert_idx in expert_indices
+            for proj in ("w1", "w2", "w3")
+            for suffix in ("weight", "scale")
+        ]
+        state_dict = _load_real_checkpoint_tensors(checkpoint_path, tensor_names)
+
+        layout = load_deepseek_v4_mxfp4_experts(
+            state_dict,
+            layer_idx=layer_idx,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            expert_indices=expert_indices,
+        )
+
+        _assert_layout_matches_real_checkpoint(
+            layout,
+            state_dict,
+            layer_idx=layer_idx,
+            expert_indices=expert_indices,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
+
+
+def test_lowering_bridge_loads_real_deepseek_v4_mxfp4_checkpoint_block() -> None:
+    checkpoint_path = _deepseek_v4_real_checkpoint_path()
+    hidden_size = 4096
+    intermediate_size = 2048
+    layer_idx = 0
+    expert_indices = (0, 1)
+    tensor_names = [
+        f"layers.{layer_idx}.ffn.experts.{expert_idx}.{proj}.{suffix}"
+        for expert_idx in expert_indices
+        for proj in ("w1", "w2", "w3")
+        for suffix in ("weight", "scale")
+    ]
+    tensor_names.extend(
+        f"layers.{layer_idx}.ffn.shared_experts.{proj}.{suffix}"
+        for proj in ("w1", "w2", "w3")
+        for suffix in ("weight", "scale")
+    )
+    real_state = _load_real_checkpoint_tensors(checkpoint_path, tensor_names)
+    model = _LayeredMoEModel(hidden_size=hidden_size, moe_intermediate_size=intermediate_size)
+    gm = torch_export_to_gm(
+        model,
+        args=(torch.randn(1, 1, hidden_size), torch.ones(1, 1, dtype=torch.long)),
+    )
+    transform = DeepSeekV4MoELowering.from_kwargs(stage=Stages.PATTERN_MATCHER)
+
+    lowered, info = transform._apply(gm, None, None, SharedConfig())
+
+    assert info.num_matches == 1
+    assert not any(
+        name.startswith("layers.0.ffn.experts.") for name, _ in lowered.named_parameters()
+    )
+
+    state_dict = {
+        name: tensor.detach().clone()
+        for name, tensor in lowered.state_dict().items()
+        if not name.startswith("layers.0.ffn.mxfp4_") and not name.endswith(".weight_scale_inv")
+    }
+    state_dict.update(real_state)
+    load_result = lowered.load_state_dict(state_dict, strict=False)
+    expected_layout = load_deepseek_v4_mxfp4_experts(
+        real_state,
+        layer_idx=layer_idx,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=len(expert_indices),
+    )
+
+    assert load_result.missing_keys == []
+    assert load_result.unexpected_keys == []
+    _assert_layout_matches_real_checkpoint(
+        expected_layout,
+        real_state,
+        layer_idx=layer_idx,
+        expert_indices=expert_indices,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    torch.testing.assert_close(
+        lowered.get_parameter("layers.0.ffn.mxfp4_gate_up_blocks"),
+        expected_layout.gate_up_blocks,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        lowered.get_parameter("layers.0.ffn.mxfp4_gate_up_scales"),
+        expected_layout.gate_up_scales,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        lowered.get_parameter("layers.0.ffn.mxfp4_down_blocks"),
+        expected_layout.down_blocks,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        lowered.get_parameter("layers.0.ffn.mxfp4_down_scales"),
+        expected_layout.down_scales,
+        rtol=0,
+        atol=0,
+    )
+
+    for proj in ("w1", "w2", "w3"):
+        weight_name = f"layers.0.ffn.shared_experts.{proj}.weight"
+        scale_name = f"layers.0.ffn.shared_experts.{proj}.scale"
+        scale_buffer_name = f"layers.0.ffn.shared_experts.{proj}.weight_scale_inv"
+        torch.testing.assert_close(
+            lowered.get_parameter(weight_name).float(),
+            real_state[weight_name].float(),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            lowered.get_buffer(scale_buffer_name),
+            e8m0_to_fp32(real_state[scale_name]),
+            rtol=0,
+            atol=0,
+        )
+
+
 def test_lowering_bridge_loads_packed_mxfp4_checkpoint_without_dense_shape_mismatch() -> None:
     model = _LayeredMoEModel()
     gm = torch_export_to_gm(
@@ -1003,7 +1298,12 @@ def test_lowering_bridge_loads_packed_mxfp4_checkpoint_without_dense_shape_misma
         is_op(node, torch.ops.auto_deploy.torch_deepseek_v4_moe) for node in lowered.graph.nodes
     )
 
-    state_dict = _packed_checkpoint_state()
+    state_dict = {
+        name: tensor.detach().clone()
+        for name, tensor in lowered.state_dict().items()
+        if not name.startswith("layers.0.ffn.mxfp4_") and not name.endswith(".weight_scale_inv")
+    }
+    state_dict.update(_packed_checkpoint_state())
     load_result = lowered.load_state_dict(state_dict, strict=False)
     expected_layout = load_deepseek_v4_mxfp4_experts(
         _packed_checkpoint_state(),
@@ -1013,7 +1313,22 @@ def test_lowering_bridge_loads_packed_mxfp4_checkpoint_without_dense_shape_misma
         num_experts=2,
     )
 
+    assert load_result.missing_keys == []
     assert load_result.unexpected_keys == []
+    assert "layers.0.ffn.mxfp4_gate_up_bias" not in lowered.state_dict()
+    assert "layers.0.ffn.mxfp4_down_bias" not in lowered.state_dict()
+    torch.testing.assert_close(
+        lowered.get_buffer("layers.0.ffn.mxfp4_gate_up_bias"),
+        torch.zeros((2, 64), dtype=torch.float32),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        lowered.get_buffer("layers.0.ffn.mxfp4_down_bias"),
+        torch.zeros((2, 64), dtype=torch.float32),
+        rtol=0,
+        atol=0,
+    )
     torch.testing.assert_close(
         lowered.get_parameter("layers.0.ffn.mxfp4_gate_up_blocks"),
         expected_layout.gate_up_blocks,

@@ -22,9 +22,11 @@ from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
     DeepseekV4Attention,
     DeepseekV4Config,
+    _fake_fp4_activation_quant_dequant,
 )
 from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig, Stages
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir import ApplyShardingHints
+from tensorrt_llm._torch.auto_deploy.utils._graph import run_shape_prop
 from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_op_args, is_op
 
@@ -90,6 +92,23 @@ class _SparseAttentionV2ShardingFixture(nn.Module):
         )
 
 
+class _IndexerFp4ViewShapePropFixture(nn.Module):
+    def __init__(self, num_heads: int = 64, head_dim: int = 128) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+
+    def forward(self, q: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = q.shape
+        q = torch.ops.auto_deploy.view(
+            q,
+            [batch_size, seq_len, self.num_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mla",
+        )
+        return _fake_fp4_activation_quant_dequant(q)
+
+
 def _trace_with_meta(module: nn.Module) -> torch.fx.GraphModule:
     gm = torch.fx.symbolic_trace(module)
     params_and_buffers = dict(gm.named_parameters())
@@ -143,6 +162,18 @@ def _run_ir_sharding(
         ),
     )
     return transform._apply(gm, None, None, shared_config)
+
+
+def _set_placeholder_meta(gm: torch.fx.GraphModule, target: str, value: torch.Tensor) -> None:
+    for node in gm.graph.nodes:
+        if node.op != "placeholder" or node.target != target:
+            continue
+        fake_mode = getattr(node.meta.get("val"), "fake_mode", None)
+        node.meta["val"] = (
+            fake_mode.from_tensor(value, static_shapes=True) if fake_mode is not None else value
+        )
+        return
+    raise AssertionError(f"placeholder {target!r} not found")
 
 
 @pytest.mark.parametrize(
@@ -221,3 +252,60 @@ def test_deepseek_v4_attention_emits_head_group_views_and_sparse_attention_hint(
     assert any(extract_op_args(node, "tp_scaled_dim")[0] == 2 for node in view_nodes)
     assert extract_op_args(sparse_node, "enable_sharding")[0] is True
     assert any(is_op(node, torch.ops.auto_deploy.all_reduce) for node in gm.graph.nodes)
+
+
+def test_deepseek_v4_indexer_fp4_shape_prop_after_tp_sharding() -> None:
+    config = DeepseekV4Config(
+        vocab_size=16,
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        head_dim=4,
+        q_lora_rank=8,
+        qk_rope_head_dim=2,
+        o_groups=2,
+        o_lora_rank=4,
+        sliding_window=2,
+        compress_ratios=(4,),
+        index_n_heads=4,
+        index_head_dim=32,
+        index_topk=2,
+        ad_rope_cache_len=8,
+        ad_compress_max_seq_len=8,
+    )
+    attention = DeepseekV4Attention(config, layer_idx=0)
+    gm = torch_export_to_gm(
+        attention,
+        args=(
+            torch.randn(1, 8, 16, dtype=torch.bfloat16),
+            torch.arange(8, dtype=torch.long).unsqueeze(0),
+        ),
+    )
+
+    transformed, info = _run_ir_sharding(gm, rank=1, world_size=2)
+
+    assert info.num_matches > 0
+    assert transformed.get_parameter("indexer.wq_b.weight").shape == (64, 8)
+
+
+def test_deepseek_v4_indexer_fp4_quant_uses_local_shape_after_tp_sharding() -> None:
+    batch_size = 1
+    seq_len = 8
+    full_heads = 64
+    head_dim = 128
+    tp_size = 8
+    local_heads = full_heads // tp_size
+    fixture = _IndexerFp4ViewShapePropFixture(full_heads, head_dim)
+    gm = torch_export_to_gm(
+        fixture,
+        args=(torch.randn(batch_size, seq_len, full_heads * head_dim, dtype=torch.bfloat16),),
+    )
+
+    transformed, info = _run_ir_sharding(gm, rank=1, world_size=tp_size)
+    local_q = torch.randn(batch_size, seq_len, local_heads * head_dim, dtype=torch.bfloat16)
+    _set_placeholder_meta(transformed, "q", local_q)
+
+    assert info.num_matches == 1
+    run_shape_prop(transformed)
+    transformed.recompile()
+    assert transformed(local_q).shape == (batch_size, seq_len, local_heads, head_dim)

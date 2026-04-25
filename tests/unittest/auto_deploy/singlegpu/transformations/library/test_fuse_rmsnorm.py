@@ -54,6 +54,18 @@ class TestModel(torch.nn.Module):
         return x
 
 
+class TorchRMSNormFP32WeightModel(torch.nn.Module):
+    def __init__(self, hidden_size: int = 4096, eps: float = 1e-6):
+        super().__init__()
+        self.weight = torch.nn.Parameter(
+            torch.linspace(0.5, 1.5, hidden_size, device="cuda", dtype=torch.float32)
+        )
+        self.eps = eps
+
+    def forward(self, x):
+        return torch.ops.auto_deploy.torch_rmsnorm(x, self.weight, self.eps)
+
+
 def _run_test(model, op, variant):
     def checker(gm):
         return any(is_op(n, op) for n in gm.graph.nodes)
@@ -134,3 +146,36 @@ def test_fuse_rmsnorm_preserves_node_metadata():
     ]
     assert len(rms_nodes) >= 1
     assert all("val" in n.meta and hasattr(n.meta["val"], "dtype") for n in rms_nodes)
+
+
+def test_fuse_rmsnorm_flashinfer_casts_fp32_weight_to_activation_dtype():
+    model = TorchRMSNormFP32WeightModel().eval()
+    x = torch.randn(2, 8, 4096, device="cuda", dtype=torch.bfloat16)
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "fuse_rmsnorm": {
+                "stage": "post_load_fusion",
+                "gated_rmsnorm_backend": "triton",
+                "rmsnorm_backend": "flashinfer",
+            },
+        },
+    )(None, gm)
+
+    rms_nodes = [
+        n for n in gm_transformed.graph.nodes if is_op(n, torch.ops.auto_deploy.flashinfer_rms_norm)
+    ]
+    assert len(rms_nodes) == 1
+    weight_arg = rms_nodes[0].args[1]
+    assert is_op(weight_arg, torch.ops.aten.to.dtype)
+    assert weight_arg.args[1] == x.dtype
+    assert "val" in rms_nodes[0].meta and rms_nodes[0].meta["val"].dtype == x.dtype
+
+    torch.testing.assert_close(
+        gm_transformed(x),
+        model(x),
+        atol=1e-2,
+        rtol=1e-2,
+    )

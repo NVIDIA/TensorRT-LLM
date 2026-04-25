@@ -10,6 +10,7 @@ import os
 import re
 import types
 from abc import abstractmethod
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
@@ -51,6 +52,355 @@ from .factory import (
     SubModuleExportInfo,
 )
 from .quant_config_reader import QuantConfigReader, autodetect_quant_config_reader
+
+_WEIGHT_LOADING_DEBUG_ENV = "AD_DEBUG_WEIGHT_LOADING"
+_WEIGHT_LOADING_DEBUG_SAMPLE_LIMIT_ENV = "AD_DEBUG_WEIGHT_LOADING_SAMPLE_LIMIT"
+
+
+def _debug_weight_loading_enabled() -> bool:
+    value = os.environ.get(_WEIGHT_LOADING_DEBUG_ENV, "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_weight_loading_sample_limit() -> int:
+    value = os.environ.get(_WEIGHT_LOADING_DEBUG_SAMPLE_LIMIT_ENV)
+    if value is None:
+        return 20
+    try:
+        return max(0, int(value))
+    except ValueError:
+        ad_logger.warning(f"Invalid {_WEIGHT_LOADING_DEBUG_SAMPLE_LIMIT_ENV}={value!r}; using 20.")
+        return 20
+
+
+def _debug_weight_loading_prefix(device: DeviceLikeType) -> str:
+    rank = (
+        os.environ.get("RANK")
+        or os.environ.get("LOCAL_RANK")
+        or os.environ.get("PMI_RANK")
+        or os.environ.get("OMPI_COMM_WORLD_RANK")
+        or "unknown"
+    )
+    return f"[weight-load-debug rank={rank} device={device}]"
+
+
+def _is_uninitialized_tensor(value: object) -> bool:
+    uninitialized_types = []
+    for type_name in ("UninitializedParameter", "UninitializedBuffer"):
+        uninitialized_type = getattr(torch.nn.parameter, type_name, None)
+        if uninitialized_type is not None:
+            uninitialized_types.append(uninitialized_type)
+    return bool(uninitialized_types) and isinstance(value, tuple(uninitialized_types))
+
+
+def _tensor_debug_metadata(tensor: torch.Tensor) -> str:
+    dtype = getattr(tensor, "dtype", "<unknown>")
+    device = getattr(tensor, "device", "<unknown>")
+    if _is_uninitialized_tensor(tensor):
+        return f"dtype={dtype} shape=<uninitialized> device={device}"
+    try:
+        shape = tuple(tensor.shape)
+    except RuntimeError:
+        shape = "<unavailable>"
+    return f"dtype={dtype} shape={shape} device={device}"
+
+
+def _tensor_debug_fingerprint(tensor: torch.Tensor) -> tuple[Any, ...]:
+    if _is_uninitialized_tensor(tensor):
+        return ("uninitialized",)
+    if tensor.device.type == "meta":
+        return ("meta",)
+    try:
+        numel = tensor.numel()
+        shape = tuple(tensor.shape)
+    except RuntimeError as exc:
+        return ("metadata-error", type(exc).__name__, str(exc)[:120])
+    if numel == 0:
+        return ("empty",)
+
+    if len(shape) == 0:
+        indices = [()]
+    else:
+        candidate_indices = [
+            tuple(0 for _ in shape),
+            tuple(dim // 2 for dim in shape),
+            tuple(dim - 1 for dim in shape),
+        ]
+        indices = []
+        for index in candidate_indices:
+            if index not in indices:
+                indices.append(index)
+
+    values = []
+    try:
+        with torch.no_grad():
+            detached = tensor.detach()
+            for index in indices:
+                value = detached[index] if index else detached
+                if value.is_complex():
+                    value_cpu = value.detach().to("cpu")
+                    values.append(float(value_cpu.real.float().item()))
+                    values.append(float(value_cpu.imag.float().item()))
+                else:
+                    values.append(float(value.detach().to("cpu").float().item()))
+    except (RuntimeError, TypeError, ValueError) as exc:
+        return ("sample-error", type(exc).__name__, str(exc)[:120])
+
+    return ("data", *values)
+
+
+def _sample_debug_names(names: object, limit: int) -> list[str]:
+    if limit <= 0:
+        return []
+    return sorted(str(name) for name in names)[:limit]
+
+
+def _collect_weight_loading_debug_state(
+    model: nn.Module, collect_fingerprints: bool
+) -> dict[str, Any]:
+    state_dict = model.state_dict()
+    metadata = {}
+    fingerprints = {}
+    meta_keys = []
+    uninitialized_keys = []
+
+    for name, tensor in state_dict.items():
+        metadata[name] = _tensor_debug_metadata(tensor)
+        if _is_uninitialized_tensor(tensor):
+            uninitialized_keys.append(name)
+        elif tensor.device.type == "meta":
+            meta_keys.append(name)
+        if collect_fingerprints:
+            fingerprints[name] = _tensor_debug_fingerprint(tensor)
+
+    return {
+        "keys": set(state_dict.keys()),
+        "metadata": metadata,
+        "fingerprints": fingerprints,
+        "meta_keys": set(meta_keys),
+        "uninitialized_keys": set(uninitialized_keys),
+    }
+
+
+def _log_weight_loading_key_details(
+    prefix: str,
+    label: str,
+    names: object,
+    before_debug: dict[str, Any],
+    after_debug: dict[str, Any],
+    limit: int,
+) -> None:
+    samples = _sample_debug_names(names, limit)
+    if not samples:
+        return
+
+    before_metadata = before_debug.get("metadata", {})
+    after_metadata = after_debug.get("metadata", {})
+    before_fingerprints = before_debug.get("fingerprints", {})
+    after_fingerprints = after_debug.get("fingerprints", {})
+
+    details = []
+    for name in samples:
+        metadata = after_metadata.get(name) or before_metadata.get(name) or "<not in model>"
+        before_fingerprint = before_fingerprints.get(name, "<missing>")
+        after_fingerprint = after_fingerprints.get(name, "<missing>")
+        details.append(
+            f"{name} ({metadata}, before={before_fingerprint}, after={after_fingerprint})"
+        )
+    ad_logger.warning(f"{prefix} {label}: {details}")
+
+
+def _begin_weight_loading_debug(
+    model: nn.Module,
+    raw_state_dict: dict[str, torch.Tensor],
+    device: DeviceLikeType,
+) -> dict[str, Any]:
+    limit = _debug_weight_loading_sample_limit()
+    prefix = _debug_weight_loading_prefix(device)
+    before_debug = _collect_weight_loading_debug_state(model, collect_fingerprints=True)
+    expected_keys = before_debug["keys"]
+    raw_keys = set(raw_state_dict.keys())
+
+    ad_logger.info(
+        f"{prefix} raw checkpoint keys: count={len(raw_keys)} "
+        f"sample={_sample_debug_names(raw_keys, limit)}"
+    )
+    ad_logger.info(
+        f"{prefix} expected model state_dict keys before load: count={len(expected_keys)} "
+        f"meta={len(before_debug['meta_keys'])} "
+        f"uninitialized={len(before_debug['uninitialized_keys'])} "
+        f"sample={_sample_debug_names(expected_keys, limit)}"
+    )
+    ad_logger.info(
+        f"{prefix} raw checkpoint vs expected before root pre-hooks: "
+        f"missing={len(expected_keys - raw_keys)} unexpected={len(raw_keys - expected_keys)}"
+    )
+
+    return {
+        "limit": limit,
+        "prefix": prefix,
+        "before": before_debug,
+        "raw_keys": raw_keys,
+    }
+
+
+def _make_weight_loading_debug_pre_hook(debug_info: dict[str, Any]) -> Callable[..., None]:
+    def _debug_pre_hook(
+        module: nn.Module,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        *args,
+    ) -> None:
+        del module, args
+        if prefix:
+            return
+
+        transformed_keys = set(state_dict.keys())
+        expected_keys = debug_info["before"]["keys"]
+        missing_keys = expected_keys - transformed_keys
+        unexpected_keys = transformed_keys - expected_keys
+        debug_info["transformed_keys"] = transformed_keys
+        debug_info["root_missing_keys"] = missing_keys
+        debug_info["root_unexpected_keys"] = unexpected_keys
+
+        log_prefix = debug_info["prefix"]
+        limit = debug_info["limit"]
+        ad_logger.info(
+            f"{log_prefix} transformed state_dict keys after root pre-load hooks: "
+            f"count={len(transformed_keys)} missing_vs_expected={len(missing_keys)} "
+            f"unexpected_vs_expected={len(unexpected_keys)} "
+            f"sample={_sample_debug_names(transformed_keys, limit)}"
+        )
+        if missing_keys:
+            ad_logger.warning(
+                f"{log_prefix} sample keys missing after root pre-load hooks: "
+                f"{_sample_debug_names(missing_keys, limit)}"
+            )
+        if unexpected_keys:
+            ad_logger.warning(
+                f"{log_prefix} sample unexpected keys after root pre-load hooks: "
+                f"{_sample_debug_names(unexpected_keys, limit)}"
+            )
+
+    return _debug_pre_hook
+
+
+def _finish_weight_loading_debug(
+    model: nn.Module,
+    incompatible_keys: object,
+    debug_info: dict[str, Any],
+) -> None:
+    prefix = debug_info["prefix"]
+    limit = debug_info["limit"]
+    before_debug = debug_info["before"]
+    after_debug = _collect_weight_loading_debug_state(model, collect_fingerprints=True)
+
+    load_missing_keys = set(getattr(incompatible_keys, "missing_keys", []))
+    load_unexpected_keys = set(getattr(incompatible_keys, "unexpected_keys", []))
+    transformed_keys = debug_info.get("transformed_keys")
+    root_missing_keys = debug_info.get("root_missing_keys", set())
+    root_unexpected_keys = debug_info.get("root_unexpected_keys", set())
+
+    if transformed_keys is None:
+        ad_logger.warning(f"{prefix} debug pre-hook did not observe the root state_dict.")
+        transformed_keys = set()
+
+    before_keys = before_debug["keys"]
+    after_keys = after_debug["keys"]
+    common_keys = before_keys & after_keys
+    before_fingerprints = before_debug["fingerprints"]
+    after_fingerprints = after_debug["fingerprints"]
+    unchanged_keys = {
+        key
+        for key in common_keys
+        if before_fingerprints.get(key) == after_fingerprints.get(key)
+        and before_fingerprints.get(key, ("",))[0] == "data"
+    }
+    unchanged_missing_keys = unchanged_keys & (load_missing_keys | root_missing_keys)
+    unchanged_transformed_keys = unchanged_keys & transformed_keys - unchanged_missing_keys
+
+    ad_logger.info(
+        f"{prefix} load_state_dict result: missing={len(load_missing_keys)} "
+        f"unexpected={len(load_unexpected_keys)}"
+    )
+    if load_missing_keys:
+        ad_logger.warning(
+            f"{prefix} sample load_state_dict missing keys: "
+            f"{_sample_debug_names(load_missing_keys, limit)}"
+        )
+    if load_unexpected_keys:
+        ad_logger.warning(
+            f"{prefix} sample load_state_dict unexpected keys: "
+            f"{_sample_debug_names(load_unexpected_keys, limit)}"
+        )
+
+    ad_logger.info(
+        f"{prefix} post-load model state_dict keys: count={len(after_keys)} "
+        f"lost_vs_before={len(before_keys - after_keys)} "
+        f"added_vs_before={len(after_keys - before_keys)} "
+        f"meta={len(after_debug['meta_keys'])} "
+        f"uninitialized={len(after_debug['uninitialized_keys'])}"
+    )
+    ad_logger.info(
+        f"{prefix} unchanged sampled fingerprints after load: "
+        f"total={len(unchanged_keys)} "
+        f"missing_or_absent={len(unchanged_missing_keys)} "
+        f"present_after_root_pre_hooks={len(unchanged_transformed_keys)}"
+    )
+
+    _log_weight_loading_key_details(
+        prefix,
+        "post-load meta tensors",
+        after_debug["meta_keys"],
+        before_debug,
+        after_debug,
+        limit,
+    )
+    _log_weight_loading_key_details(
+        prefix,
+        "post-load uninitialized tensors",
+        after_debug["uninitialized_keys"],
+        before_debug,
+        after_debug,
+        limit,
+    )
+    _log_weight_loading_key_details(
+        prefix,
+        "load_state_dict missing key details",
+        load_missing_keys,
+        before_debug,
+        after_debug,
+        limit,
+    )
+    _log_weight_loading_key_details(
+        prefix,
+        "root pre-hook missing key details",
+        root_missing_keys,
+        before_debug,
+        after_debug,
+        limit,
+    )
+    _log_weight_loading_key_details(
+        prefix,
+        "unchanged missing/absent key details",
+        unchanged_missing_keys,
+        before_debug,
+        after_debug,
+        limit,
+    )
+    _log_weight_loading_key_details(
+        prefix,
+        "unchanged transformed key details",
+        unchanged_transformed_keys,
+        before_debug,
+        after_debug,
+        limit,
+    )
+    if root_unexpected_keys:
+        ad_logger.warning(
+            f"{prefix} root pre-hook unexpected key count={len(root_unexpected_keys)} "
+            f"sample={_sample_debug_names(root_unexpected_keys, limit)}"
+        )
 
 
 @contextmanager
@@ -513,8 +863,24 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
     ):
         all_weights = self._load_full_checkpoint_to_cpu(ckpt_file)
 
+        debug_info = None
+        debug_handle = None
+        if _debug_weight_loading_enabled():
+            debug_info = _begin_weight_loading_debug(model, all_weights, device)
+            debug_handle = model.register_load_state_dict_pre_hook(
+                _make_weight_loading_debug_pre_hook(debug_info)
+            )
+            model._load_state_dict_pre_hooks.move_to_end(key=debug_handle.id, last=True)
+
         ad_logger.info(f"Loading weights into model (device: {device})...")
-        model.load_state_dict(all_weights, strict=False)
+        try:
+            incompatible_keys = model.load_state_dict(all_weights, strict=False)
+        finally:
+            if debug_handle is not None:
+                debug_handle.remove()
+
+        if debug_info is not None:
+            _finish_weight_loading_debug(model, incompatible_keys, debug_info)
 
         ad_logger.info("Checkpoint loading completed")
 

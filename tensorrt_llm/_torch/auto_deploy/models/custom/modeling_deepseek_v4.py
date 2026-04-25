@@ -28,6 +28,8 @@ Differences from the reference implementation:
 * returns logits for all sequence positions instead of only the final token
 * uses AutoDeploy canonical ops where they exist: RMSNorm, RoPE, linear, sparse
   attention, MoE
+* implements the ratio-4 learned sparse-attention indexer so checkpoint indexer
+  tensors are loaded and used for compressed-row selection
 * keeps V4-specific hyper-connections as PyTorch reference math because no
   canonical AutoDeploy op currently covers those operations
 * omits decode caches and MTP blocks from the exported path
@@ -244,6 +246,46 @@ def _apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False)
     return x_out
 
 
+def _hadamard_transform(x: torch.Tensor) -> torch.Tensor:
+    last_dim = int(x.shape[-1])
+    if last_dim <= 0 or last_dim & (last_dim - 1):
+        raise ValueError(f"Hadamard transform requires a positive power-of-two dim, got {last_dim}")
+
+    out = x.float().reshape(-1, last_dim)
+    h = 1
+    while h < last_dim:
+        out = out.reshape(-1, 2, h)
+        left, right = out.unbind(dim=-2)
+        out = torch.stack((left + right, left - right), dim=-2).reshape(-1, last_dim)
+        h *= 2
+    return (out * (last_dim**-0.5)).to(x.dtype).reshape_as(x)
+
+
+def _fake_fp4_activation_quant_dequant(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+    last_dim = int(x.shape[-1])
+    if last_dim % block_size != 0:
+        return x
+
+    original_dtype = x.dtype
+    x_blocks = x.contiguous().float().reshape(-1, last_dim)
+    x_blocks = x_blocks.reshape(-1, last_dim // block_size, block_size)
+    amax = x_blocks.abs().amax(dim=-1, keepdim=True).clamp_min(6.0 * (2.0**-126))
+    scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 6.0)))
+    scaled = (x_blocks / scale).clamp(-6.0, 6.0)
+
+    abs_scaled = scaled.abs()
+    quantized = torch.zeros_like(abs_scaled)
+    quantized = torch.where(abs_scaled > 0.25, torch.full_like(quantized, 0.5), quantized)
+    quantized = torch.where(abs_scaled >= 0.75, torch.full_like(quantized, 1.0), quantized)
+    quantized = torch.where(abs_scaled > 1.25, torch.full_like(quantized, 1.5), quantized)
+    quantized = torch.where(abs_scaled >= 1.75, torch.full_like(quantized, 2.0), quantized)
+    quantized = torch.where(abs_scaled > 2.5, torch.full_like(quantized, 3.0), quantized)
+    quantized = torch.where(abs_scaled >= 3.5, torch.full_like(quantized, 4.0), quantized)
+    quantized = torch.where(abs_scaled > 5.0, torch.full_like(quantized, 6.0), quantized)
+    quantized = torch.where(scaled < 0, -quantized, quantized)
+    return (quantized * scale).to(original_dtype).reshape_as(x)
+
+
 def _window_topk_idxs(window_size: int, batch_size: int, seq_len: int, device) -> torch.Tensor:
     positions = torch.arange(seq_len, device=device)
     offsets = torch.arange(window_size, device=device)
@@ -406,6 +448,7 @@ class DeepseekV4Compressor(nn.Module):
         score: torch.Tensor,
         position_ids: torch.Tensor,
         freqs_cis_table: torch.Tensor,
+        norm_dtype: torch.dtype,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = kv.shape
         ratio = self.compress_ratio
@@ -418,6 +461,7 @@ class DeepseekV4Compressor(nn.Module):
             kv = self._overlap_transform(kv, 0)
             score = self._overlap_transform(score, float("-inf"))
         kv = (kv * score.softmax(dim=2)).sum(dim=2)
+        kv = kv.to(norm_dtype)
         kv = self.norm(kv)
 
         row_idx = torch.arange(self.max_compressed_len, device=kv.device) * ratio
@@ -432,7 +476,72 @@ class DeepseekV4Compressor(nn.Module):
         self, x: torch.Tensor, position_ids: torch.Tensor, freqs_cis_table: torch.Tensor
     ) -> torch.Tensor:
         kv, score = self.project(x)
-        return self.pool_norm_rope(kv, score, position_ids, freqs_cis_table)
+        return self.pool_norm_rope(kv, score, position_ids, freqs_cis_table, kv.dtype)
+
+
+class DeepseekV4Indexer(nn.Module):
+    def __init__(self, config: PretrainedConfig, compress_ratio: int) -> None:
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.index_n_heads
+        self.head_dim = config.index_head_dim
+        self.rope_head_dim = config.qk_rope_head_dim
+        self.index_topk = config.index_topk
+        self.q_lora_rank = config.q_lora_rank
+        self.compress_ratio = compress_ratio
+        self.softmax_scale = self.head_dim**-0.5
+
+        self.wq_b = DeepseekV4Linear(self.q_lora_rank, self.num_heads * self.head_dim)
+        self.weights_proj = DeepseekV4Linear(self.hidden_size, self.num_heads)
+        self.compressor = DeepseekV4Compressor(config, compress_ratio, self.head_dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        position_ids: torch.Tensor,
+        freqs_cis_table: torch.Tensor,
+        offset: int,
+    ) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+        freqs_cis = freqs_cis_table[position_ids]
+
+        q = self.wq_b(qr, tp_mode="colwise", layer_type="mla")
+        q = torch.ops.auto_deploy.view(
+            q,
+            [batch_size, seq_len, self.num_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mla",
+        )
+        q_rope = _apply_rope(q[..., -self.rope_head_dim :], freqs_cis)
+        q = torch.cat([q[..., : -self.rope_head_dim], q_rope], dim=-1)
+        q = _hadamard_transform(q)
+        q = _fake_fp4_activation_quant_dequant(q)
+
+        compressed_kv = self.compressor(x, position_ids, freqs_cis_table)
+        compressed_kv = _hadamard_transform(compressed_kv)
+        compressed_kv = _fake_fp4_activation_quant_dequant(compressed_kv)
+        weights = self.weights_proj(x, tp_mode="colwise", layer_type="mla")
+        weights = weights * (self.softmax_scale * self.num_heads**-0.5)
+
+        index_score = torch.einsum("bshd,btd->bsht", q.float(), compressed_kv.float())
+        index_score = (index_score.relu() * weights.float().unsqueeze(-1)).sum(dim=2)
+        index_score = torch.ops.auto_deploy.all_reduce(index_score, layer_type="mla")
+
+        compressed_positions = torch.arange(self.compressor.max_compressed_len, device=x.device)
+        valid_lengths = torch.arange(1, seq_len + 1, device=x.device).unsqueeze(1)
+        valid_lengths = valid_lengths // self.compress_ratio
+        invalid = compressed_positions.unsqueeze(0) >= valid_lengths
+        index_score = torch.where(
+            invalid.unsqueeze(0),
+            torch.full_like(index_score, float("-inf")),
+            index_score,
+        )
+
+        topk_count = min(self.index_topk, self.compressor.max_compressed_len)
+        topk_idxs = index_score.topk(topk_count, dim=-1)[1]
+        valid_topk = topk_idxs < valid_lengths.unsqueeze(0)
+        return torch.where(valid_topk, topk_idxs + offset, -1)
 
 
 class DeepseekV4Attention(nn.Module):
@@ -462,8 +571,11 @@ class DeepseekV4Attention(nn.Module):
             self.num_groups * self.o_lora_rank,
         )
         self.wo_b = DeepseekV4Linear(self.num_groups * self.o_lora_rank, self.hidden_size)
+        self.indexer = None
         if self.compress_ratio:
             self.compressor = DeepseekV4Compressor(config, self.compress_ratio, self.head_dim)
+            if self.compress_ratio == 4:
+                self.indexer = DeepseekV4Indexer(config, self.compress_ratio)
 
         if self.compress_ratio:
             self.rope_original_seq_len = _rope_scaling_value(
@@ -517,14 +629,17 @@ class DeepseekV4Attention(nn.Module):
         compressor_norm_weight = x.new_empty(0)
         if self.compress_ratio:
             compressor_kv, compressor_gate = self.compressor.project(x)
-            compressed_idxs = _compress_topk_idxs(
-                self.compress_ratio,
-                batch_size,
-                seq_len,
-                seq_len,
-                x.device,
-                self.compressor.max_compressed_len,
-            )
+            if self.indexer is not None:
+                compressed_idxs = self.indexer(x, qr, position_ids, freqs_cis_table, seq_len)
+            else:
+                compressed_idxs = _compress_topk_idxs(
+                    self.compress_ratio,
+                    batch_size,
+                    seq_len,
+                    seq_len,
+                    x.device,
+                    self.compressor.max_compressed_len,
+                )
             topk_idxs = torch.cat([topk_idxs, compressed_idxs], dim=-1)
             compressor_ape = self.compressor.ape
             compressor_norm_weight = self.compressor.norm.weight

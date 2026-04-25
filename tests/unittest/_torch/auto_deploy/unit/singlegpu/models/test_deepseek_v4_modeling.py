@@ -33,12 +33,18 @@ from torch.export import Dim
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 -- register ops
 import tensorrt_llm._torch.auto_deploy.transform.library  # noqa: F401 -- register transforms
+from examples import deepseek_v4_5layer_forward as demo_dsv4
+from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import (
+    _cast_fp4,
+    e2m1_values,
+)
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
     DeepseekV4AutoModelForCausalLMFactory,
     DeepseekV4Config,
     DeepseekV4ForCausalLM,
     DeepseekV4RMSNorm,
+    _fake_fp4_activation_quant_dequant,
 )
 from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
@@ -79,6 +85,9 @@ def _small_config(**overrides) -> DeepseekV4Config:
         sliding_window=4,
         compress_ratios=(0, 4),
         compress_rope_theta=10000.0,
+        index_n_heads=2,
+        index_head_dim=8,
+        index_topk=4,
         moe_intermediate_size=8,
         n_routed_experts=4,
         n_shared_experts=1,
@@ -166,6 +175,12 @@ _DEEPSEEK_V4_CHECKPOINT_SAMPLE_KEYS = {
     "layers.0.attn.wq_a.weight",
     "layers.0.attn.wq_b.weight",
     "layers.0.attn.wkv.weight",
+    "layers.1.attn.indexer.compressor.ape",
+    "layers.1.attn.indexer.compressor.norm.weight",
+    "layers.1.attn.indexer.compressor.wgate.weight",
+    "layers.1.attn.indexer.compressor.wkv.weight",
+    "layers.1.attn.indexer.weights_proj.weight",
+    "layers.1.attn.indexer.wq_b.weight",
     "layers.0.ffn.experts.0.w1.weight",
     "layers.0.ffn.experts.0.w2.weight",
     "layers.0.ffn.experts.0.w3.weight",
@@ -263,6 +278,18 @@ def _ref_apply_rope(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = Fa
     else:
         freqs = freqs.view(x.shape[0], x.shape[1], 1, -1)
     return torch.view_as_real(y * freqs).flatten(-2).to(x.dtype)
+
+
+def _ref_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
+    last_dim = int(x.shape[-1])
+    out = x.float().reshape(-1, last_dim)
+    h = 1
+    while h < last_dim:
+        out = out.reshape(-1, 2, h)
+        left, right = out.unbind(dim=-2)
+        out = torch.stack((left + right, left - right), dim=-2).reshape(-1, last_dim)
+        h *= 2
+    return (out * (last_dim**-0.5)).to(x.dtype).reshape_as(x)
 
 
 def _ref_window_topk(window_size: int, batch_size: int, seq_len: int, device):
@@ -368,6 +395,56 @@ class _RefCompressor(nn.Module):
         return torch.cat([kv[..., : -self.rope_head_dim], rope], dim=-1)
 
 
+class _RefIndexer(nn.Module):
+    def __init__(self, config, compress_ratio):
+        super().__init__()
+        self.num_heads = config.index_n_heads
+        self.head_dim = config.index_head_dim
+        self.rope_head_dim = config.qk_rope_head_dim
+        self.index_topk = config.index_topk
+        self.compress_ratio = compress_ratio
+        self.softmax_scale = self.head_dim**-0.5
+        self.wq_b = _RefLinear(config.q_lora_rank, self.num_heads * self.head_dim)
+        self.weights_proj = _RefLinear(config.hidden_size, self.num_heads)
+        self.compressor = _RefCompressor(config, compress_ratio, self.head_dim)
+
+    def forward(self, x, qr, freqs_cis, offset):
+        batch_size, seq_len, _ = x.shape
+        q = self.wq_b(qr).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        q = torch.cat(
+            [
+                q[..., : -self.rope_head_dim],
+                _ref_apply_rope(q[..., -self.rope_head_dim :], freqs_cis),
+            ],
+            dim=-1,
+        )
+        q = _ref_hadamard_transform(q)
+        q = _fake_fp4_activation_quant_dequant(q)
+        compressed_kv = _ref_hadamard_transform(self.compressor(x, freqs_cis))
+        compressed_kv = _fake_fp4_activation_quant_dequant(compressed_kv)
+        weights = self.weights_proj(x) * (self.softmax_scale * self.num_heads**-0.5)
+
+        compressed_len = compressed_kv.shape[1]
+        if compressed_len == 0:
+            return torch.empty(batch_size, seq_len, 0, dtype=torch.long, device=x.device)
+
+        index_score = torch.einsum("bshd,btd->bsht", q.float(), compressed_kv.float())
+        index_score = (index_score.relu() * weights.float().unsqueeze(-1)).sum(dim=2)
+        compressed_positions = torch.arange(compressed_len, device=x.device)
+        valid_lengths = torch.arange(1, seq_len + 1, device=x.device).unsqueeze(1)
+        valid_lengths = valid_lengths // self.compress_ratio
+        invalid = compressed_positions.unsqueeze(0) >= valid_lengths
+        index_score = torch.where(
+            invalid.unsqueeze(0),
+            torch.full_like(index_score, float("-inf")),
+            index_score,
+        )
+
+        topk_idxs = index_score.topk(min(self.index_topk, compressed_len), dim=-1)[1]
+        valid_topk = topk_idxs < valid_lengths.unsqueeze(0)
+        return torch.where(valid_topk, topk_idxs + offset, -1)
+
+
 class _RefAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -393,9 +470,14 @@ class _RefAttention(nn.Module):
         self.wo_b = _RefLinear(self.num_groups * self.o_lora_rank, config.hidden_size)
         if self.compress_ratio:
             self.compressor = _RefCompressor(config, self.compress_ratio, self.head_dim)
+            if self.compress_ratio == 4:
+                self.indexer = _RefIndexer(config, self.compress_ratio)
+            else:
+                self.indexer = None
             self.rope_original_seq_len = config.rope_scaling["original_max_position_embeddings"]
             self.rope_base = config.compress_rope_theta
         else:
+            self.indexer = None
             self.rope_original_seq_len = 0
             self.rope_base = config.rope_theta
         self.rope_factor = config.rope_scaling["factor"]
@@ -437,9 +519,12 @@ class _RefAttention(nn.Module):
         topk_idxs = _ref_window_topk(self.window_size, batch_size, seq_len, x.device)
         if self.compress_ratio:
             compressed = self.compressor(x, freqs_cis)
-            compressed_idxs = _ref_compress_topk(
-                self.compress_ratio, batch_size, seq_len, seq_len, x.device
-            )
+            if self.indexer is not None:
+                compressed_idxs = self.indexer(x, qr, freqs_cis, seq_len)
+            else:
+                compressed_idxs = _ref_compress_topk(
+                    self.compress_ratio, batch_size, seq_len, seq_len, x.device
+                )
             topk_idxs = torch.cat([topk_idxs, compressed_idxs], dim=-1)
             kv = torch.cat([kv, compressed], dim=1)
         o = _ref_sparse_attention(q, kv, self.attn_sink, topk_idxs.int(), self.softmax_scale)
@@ -683,6 +768,125 @@ def test_rmsnorm_matches_reference():
     torch.testing.assert_close(ad(x), expected, rtol=1e-6, atol=1e-6)
 
 
+def test_indexer_fp4_activation_quant_dequant_matches_checkpoint_reference():
+    scale_one_block = torch.tensor(
+        [
+            -6.0,
+            -5.0,
+            -3.5,
+            -2.5,
+            -1.75,
+            -1.25,
+            -0.75,
+            -0.25,
+            0.0,
+            0.25,
+            0.251953125,
+            0.75,
+            1.25,
+            1.2578125,
+            1.75,
+            2.5,
+            2.515625,
+            3.5,
+            5.0,
+            5.03125,
+            6.0,
+            -0.251953125,
+            -1.2578125,
+            -2.515625,
+            -5.03125,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            -4.0,
+        ],
+        dtype=torch.bfloat16,
+    )
+    scale_half_block = scale_one_block * 0.5
+    x = torch.stack([scale_one_block, scale_half_block], dim=0).reshape(1, 2, 32)
+
+    actual = _fake_fp4_activation_quant_dequant(x, block_size=32)
+    expected, expected_scale = demo_dsv4._fake_quant_dequant_fp4_activation(x, block_size=32)
+
+    torch.testing.assert_close(expected_scale, torch.tensor([[[1.0], [0.5]]]), rtol=0, atol=0)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_indexer_fp4_activation_quant_dequant_matches_existing_fp4_cast_oracle():
+    threshold_block = torch.tensor(
+        [
+            -6.0,
+            -5.0,
+            -3.5,
+            -2.5,
+            -1.75,
+            -1.25,
+            -0.75,
+            -0.25,
+            0.0,
+            0.25,
+            0.2509765625,
+            0.75,
+            1.25,
+            1.2509765625,
+            1.75,
+            2.5,
+            2.501953125,
+            3.5,
+            5.0,
+            5.03125,
+            6.0,
+            -0.2509765625,
+            -1.2509765625,
+            -2.501953125,
+            -5.03125,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            3.0,
+            4.0,
+            -4.0,
+        ],
+        dtype=torch.bfloat16,
+    )
+    scale_half_block = threshold_block * 0.5
+    scale_rounds_up_block = threshold_block * (3.01 / 6.0)
+    scale_rounds_to_two_block = threshold_block * (6.25 / 6.0)
+    x = torch.stack(
+        [
+            threshold_block,
+            scale_half_block,
+            scale_rounds_up_block,
+            scale_rounds_to_two_block,
+        ],
+        dim=0,
+    ).reshape(1, 4, 32)
+
+    actual = _fake_fp4_activation_quant_dequant(x, block_size=32)
+    x_blocks = x.float().reshape(-1, 1, 32)
+    scale = torch.pow(
+        2.0,
+        torch.ceil(
+            torch.log2(x_blocks.abs().amax(dim=-1, keepdim=True).clamp_min(6.0 * (2.0**-126)) / 6.0)
+        ),
+    )
+    indices = _cast_fp4(torch.clamp(x_blocks / scale, min=-6.0, max=6.0))
+    expected = (e2m1_values.to(x.device)[indices.long()] * scale).reshape_as(x).to(x.dtype)
+
+    torch.testing.assert_close(
+        scale.squeeze(-1),
+        torch.tensor([[1.0], [0.5], [1.0], [2.0]]),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_attention_matches_reference():
     torch.manual_seed(1)
     config = _small_config(num_hidden_layers=2, compress_ratios=(0, 4))
@@ -703,23 +907,36 @@ def test_compressor_accepts_bfloat16_checkpoint_weights():
     torch.manual_seed(7)
     config = _small_config(
         num_hidden_layers=1,
-        compress_ratios=(128,),
+        compress_ratios=(4,),
         max_position_embeddings=256,
         ad_rope_cache_len=256,
     )
     attn = DeepseekV4ForCausalLM(config).layers[0].attn.eval().cuda()
-    compressor = attn.compressor
-    compressor.wkv.weight.data = compressor.wkv.weight.data.to(torch.bfloat16)
-    compressor.wgate.weight.data = compressor.wgate.weight.data.to(torch.bfloat16)
-    x = torch.randn(1, 256, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(1, 256, config.hidden_size, device="cuda", dtype=torch.float32)
     pos = _position_ids(1, 256, x.device)
 
-    with torch.no_grad():
-        actual = compressor(x, pos, attn.rotary_emb())
+    compressors = [
+        (attn.compressor, config.head_dim),
+        (attn.indexer.compressor, config.index_head_dim),
+    ]
+    for compressor, head_dim in compressors:
+        compressor.wkv.weight.data = compressor.wkv.weight.data.to(torch.bfloat16)
+        compressor.wgate.weight.data = compressor.wgate.weight.data.to(torch.bfloat16)
+        norm_input_dtypes = []
+        handle = compressor.norm.register_forward_pre_hook(
+            lambda _module, args: norm_input_dtypes.append(args[0].dtype)
+        )
 
-    assert actual.dtype == torch.bfloat16
-    assert actual.shape == (1, compressor.max_compressed_len, config.head_dim)
-    assert torch.isfinite(actual).all()
+        try:
+            with torch.no_grad():
+                actual = compressor(x, pos, attn.rotary_emb())
+        finally:
+            handle.remove()
+
+        assert norm_input_dtypes == [torch.bfloat16]
+        assert actual.dtype == torch.bfloat16
+        assert actual.shape == (1, compressor.max_compressed_len, head_dim)
+        assert torch.isfinite(actual).all()
 
 
 def test_moe_with_swiglu_limit_matches_reference():

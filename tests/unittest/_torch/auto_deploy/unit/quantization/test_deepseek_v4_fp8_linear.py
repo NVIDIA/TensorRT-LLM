@@ -13,6 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn as nn
@@ -40,6 +44,11 @@ _requires_e8m0 = pytest.mark.skipif(
     not _HAS_E8M0,
     reason="torch.float8_e8m0fnu is not available in this PyTorch build",
 )
+_DEEPSEEK_V4_REAL_CKPT_ENV = "DEEPSEEK_V4_FLASH_CHECKPOINT"
+_DEFAULT_DEEPSEEK_V4_REAL_CKPT = Path(
+    "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/"
+    "bmarimuthu/dev/hf_home/manual/deepseek-ai__DeepSeek-V4-Flash"
+)
 
 
 class _DummyFactory:
@@ -56,15 +65,22 @@ class _DeepSeekV4LinearFixture(nn.Module):
         self.layers = nn.ModuleList([nn.Module()])
         self.layers[0].attn = nn.Module()
         self.layers[0].attn.wq_a = nn.Linear(16, 8, bias=False)
+        self.layers[0].attn.indexer = nn.Module()
+        self.layers[0].attn.indexer.wq_b = nn.Linear(16, 8, bias=False)
         self.layers[0].attn.compressor = nn.Module()
         self.layers[0].attn.compressor.wkv = nn.Linear(16, 8, bias=False)
         self.layers[0].ffn = nn.Module()
         self.layers[0].ffn.gate = nn.Linear(16, 4, bias=False)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return (
             torch.ops.auto_deploy.torch_linear_simple.default(
                 x, self.layers[0].attn.wq_a.weight, None
+            ),
+            torch.ops.auto_deploy.torch_linear_simple.default(
+                x, self.layers[0].attn.indexer.wq_b.weight, None
             ),
             torch.ops.auto_deploy.torch_linear_simple.default(
                 x, self.layers[0].attn.compressor.wkv.weight, None
@@ -265,6 +281,48 @@ def _load_finegrained_state_dict(state_dict: dict[str, torch.Tensor], weight_nam
     transform.load_hook(state_dict, "", weight_name=weight_name)
 
 
+def _deepseek_v4_real_checkpoint_path() -> Path:
+    checkpoint_path = Path(
+        os.environ.get(_DEEPSEEK_V4_REAL_CKPT_ENV, _DEFAULT_DEEPSEEK_V4_REAL_CKPT)
+    )
+    if not checkpoint_path.exists():
+        pytest.skip(
+            f"DeepSeek V4 real checkpoint not found at {checkpoint_path}; set "
+            f"{_DEEPSEEK_V4_REAL_CKPT_ENV} to run this coverage."
+        )
+    index_path = checkpoint_path / "model.safetensors.index.json"
+    if not index_path.exists():
+        pytest.skip(f"DeepSeek V4 safetensors index not found at {index_path}.")
+    return checkpoint_path
+
+
+def _load_real_checkpoint_tensors(
+    checkpoint_path: Path,
+    tensor_names: list[str],
+) -> dict[str, torch.Tensor]:
+    safetensors = pytest.importorskip("safetensors")
+    weight_map = json.loads(
+        (checkpoint_path / "model.safetensors.index.json").read_text(encoding="utf-8")
+    )["weight_map"]
+    missing = [name for name in tensor_names if name not in weight_map]
+    assert missing == []
+
+    by_file: dict[str, list[str]] = {}
+    for name in tensor_names:
+        by_file.setdefault(weight_map[name], []).append(name)
+
+    tensors: dict[str, torch.Tensor] = {}
+    for filename, file_tensor_names in by_file.items():
+        with safetensors.safe_open(
+            checkpoint_path / filename,
+            framework="pt",
+            device="cpu",
+        ) as handle:
+            for name in file_tensor_names:
+                tensors[name] = handle.get_tensor(name)
+    return tensors
+
+
 def _depends_on(node: torch.fx.Node, target: torch.fx.Node) -> bool:
     def _node_args(value):
         if isinstance(value, torch.fx.Node):
@@ -335,6 +393,23 @@ def test_deepseek_v4_scale_alias_loads_into_weight_scale_inv() -> None:
     assert state_dict[scale_buffer].shape == (8, 32)
 
 
+def test_deepseek_v4_indexer_wq_b_scale_alias_loads_into_weight_scale_inv() -> None:
+    weight_name = "layers.10.attn.indexer.wq_b.weight"
+    scale_alias = "layers.10.attn.indexer.wq_b.scale"
+    scale_buffer = "layers.10.attn.indexer.wq_b.weight_scale_inv"
+    scale = torch.ones((64, 8), dtype=torch.bfloat16, device="cpu")
+    state_dict = {
+        weight_name: _fp8_weight((8192, 1024)),
+        scale_alias: scale,
+    }
+
+    _load_finegrained_state_dict(state_dict, weight_name)
+
+    assert scale_alias not in state_dict
+    assert state_dict[scale_buffer] is scale
+    assert state_dict[scale_buffer].shape == (64, 8)
+
+
 @_requires_e8m0
 def test_deepseek_v4_e8m0_scale_alias_decodes_to_fp32() -> None:
     weight_name = "layers.0.attn.wq_a.weight"
@@ -350,6 +425,23 @@ def test_deepseek_v4_e8m0_scale_alias_decodes_to_fp32() -> None:
     actual = state_dict["layers.0.attn.wq_a.weight_scale_inv"]
     assert actual.dtype == torch.float32
     torch.testing.assert_close(actual, e8m0_to_fp32(scale), rtol=0, atol=0)
+
+
+@_requires_e8m0
+def test_deepseek_v4_real_indexer_wq_b_scale_alias_decodes_to_fp32() -> None:
+    checkpoint_path = _deepseek_v4_real_checkpoint_path()
+    weight_name = "layers.10.attn.indexer.wq_b.weight"
+    scale_alias = "layers.10.attn.indexer.wq_b.scale"
+    state_dict = _load_real_checkpoint_tensors(checkpoint_path, [weight_name, scale_alias])
+    expected_scale = e8m0_to_fp32(state_dict[scale_alias])
+
+    _load_finegrained_state_dict(state_dict, weight_name)
+
+    assert scale_alias not in state_dict
+    actual = state_dict["layers.10.attn.indexer.wq_b.weight_scale_inv"]
+    assert actual.dtype == torch.float32
+    assert actual.shape == (64, 8)
+    torch.testing.assert_close(actual, expected_scale, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -391,9 +483,16 @@ def test_deepseek_v4_transform_quantizes_only_dense_fp8_linear_paths() -> None:
 
     transformed, info = _run_finegrained_transform(gm, _deepseek_v4_quant_config())
 
-    assert info.num_matches == 1
+    assert info.num_matches == 2
     assert transformed.get_submodule("layers.0.attn.wq_a").weight.dtype == torch.float8_e4m3fn
     assert transformed.get_submodule("layers.0.attn.wq_a").weight_scale_inv.shape == (1, 1)
+    assert (
+        transformed.get_submodule("layers.0.attn.indexer.wq_b").weight.dtype == torch.float8_e4m3fn
+    )
+    assert transformed.get_submodule("layers.0.attn.indexer.wq_b").weight_scale_inv.shape == (
+        1,
+        1,
+    )
     assert transformed.get_submodule("layers.0.ffn.gate").weight.dtype == torch.bfloat16
     assert transformed.get_submodule("layers.0.attn.compressor.wkv").weight.dtype == torch.bfloat16
 
@@ -407,7 +506,7 @@ def test_deepseek_v4_transform_quantizes_only_dense_fp8_linear_paths() -> None:
         for node in transformed.graph.nodes
         if is_op(node, torch.ops.auto_deploy.torch_linear_simple)
     ]
-    assert len(quantized_nodes) == 1
+    assert len(quantized_nodes) == 2
     assert len(plain_nodes) == 2
 
 

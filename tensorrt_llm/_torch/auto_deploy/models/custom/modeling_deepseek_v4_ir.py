@@ -72,14 +72,17 @@ class DeepseekV4Attention(_BaseDeepseekV4Attention):
         compressor_norm_weight = x.new_empty(0)
         if self.compress_ratio:
             compressor_kv, compressor_gate = self.compressor.project(x)
-            compressed_idxs = _compress_topk_idxs(
-                self.compress_ratio,
-                batch_size,
-                seq_len,
-                seq_len,
-                x.device,
-                self.compressor.max_compressed_len,
-            )
+            if self.indexer is not None:
+                compressed_idxs = self.indexer(x, qr, position_ids, freqs_cis_table, seq_len)
+            else:
+                compressed_idxs = _compress_topk_idxs(
+                    self.compress_ratio,
+                    batch_size,
+                    seq_len,
+                    seq_len,
+                    x.device,
+                    self.compressor.max_compressed_len,
+                )
             topk_idxs = torch.cat([topk_idxs, compressed_idxs], dim=-1)
             compressor_ape = self.compressor.ape
             compressor_norm_weight = self.compressor.norm.weight
