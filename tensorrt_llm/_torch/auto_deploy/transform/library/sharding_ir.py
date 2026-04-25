@@ -141,6 +141,115 @@ def _is_tp_local_group_view(node: Node, group_dim: int) -> bool:
     return tp_scaled_dim == group_dim
 
 
+def _view_base_and_shape(node: Node) -> Tuple[Optional[Node], Optional[List[Any]]]:
+    if not isinstance(node, Node):
+        return None, None
+    if node.op == "call_method" and node.target in {"view", "reshape"}:
+        shape_args = node.args[1:]
+    elif is_op(node, torch.ops.auto_deploy.view):
+        shape_args = (node.args[1],)
+    elif is_op(node, (torch.ops.aten.view, torch.ops.aten.reshape)):
+        shape_args = node.args[1:]
+    else:
+        return None, None
+
+    if len(shape_args) == 1 and isinstance(shape_args[0], (list, tuple)):
+        view_shape = list(shape_args[0])
+    else:
+        view_shape = list(shape_args)
+    return node.args[0], view_shape
+
+
+def _set_view_shape(node: Node, view_shape: List[Any]) -> None:
+    if is_op(node, torch.ops.auto_deploy.view):
+        set_op_args(node, shape=view_shape)
+    elif node.op == "call_method" and node.target in {"view", "reshape"}:
+        node.args = (node.args[0], *view_shape)
+    else:
+        node.args = (node.args[0], view_shape)
+
+
+def _is_aten_view_or_reshape(node: Node) -> bool:
+    return isinstance(node, Node) and (
+        (node.op == "call_method" and node.target in {"view", "reshape"})
+        or is_op(node, (torch.ops.aten.view, torch.ops.aten.reshape))
+    )
+
+
+def _scale_view_shape_dim(node: Node, dim: int, dc: DistConfig, reason: str) -> bool:
+    _, view_shape = _view_base_and_shape(node)
+    if view_shape is None:
+        return False
+    if dim < 0:
+        dim = len(view_shape) + dim
+    if dim >= len(view_shape) or not isinstance(view_shape[dim], int):
+        return False
+
+    scaled_size = view_shape[dim]
+    if scaled_size == -1:
+        return False
+    if -1 in view_shape:
+        _assert_divisible(scaled_size, dc.tp_size, reason)
+        view_shape[dim] = scaled_size // dc.tp_size
+    else:
+        view_shape[dim] = -1
+    _set_view_shape(node, view_shape)
+    ad_logger.debug(f"  recovered DeepSeek V4 view shape at dim {dim}: {view_shape}")
+    return True
+
+
+def _node_depends_on(node: Node, target: Node) -> bool:
+    def _child_nodes(value):
+        if isinstance(value, Node):
+            return [value]
+        if isinstance(value, (list, tuple)):
+            nodes = []
+            for item in value:
+                nodes.extend(_child_nodes(item))
+            return nodes
+        if isinstance(value, dict):
+            nodes = []
+            for item in value.values():
+                nodes.extend(_child_nodes(item))
+            return nodes
+        return []
+
+    pending = [node]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if current is target:
+            return True
+        if current in seen:
+            continue
+        seen.add(current)
+        pending.extend(_child_nodes(current.args))
+        pending.extend(_child_nodes(current.kwargs))
+    return False
+
+
+def _is_recovered_tp_local_group_view(
+    node: Node,
+    group_dim: int,
+    *,
+    num_groups: int,
+    dc: DistConfig,
+) -> bool:
+    if _is_tp_local_group_view(node, group_dim):
+        return True
+    if not _is_aten_view_or_reshape(node):
+        return False
+
+    _, view_shape = _view_base_and_shape(node)
+    if view_shape is None:
+        return False
+    if group_dim < 0:
+        group_dim = len(view_shape) + group_dim
+    if group_dim >= len(view_shape):
+        return False
+    return view_shape[group_dim] == num_groups // dc.tp_size
+
+
 def _get_attr_tensor(gm: GraphModule, node: Node, arg_name: str) -> Tuple[str, torch.Tensor]:
     assert isinstance(node, Node) and node.op == "get_attr" and isinstance(node.target, str), (
         f"Expected {arg_name} to be a get_attr node, got {node!r}"
@@ -459,7 +568,12 @@ class DeepSeekV4GroupedWoAShardableNode(ShardableNode):
         scale_weight_node = _weight_node_from_attr(gm, scale_node, scale_tensor)
         _shard_scale_and_hook(gm, scale_weight_node, scale_split(scale_tensor), scale_split)
 
-        if isinstance(input_node, Node) and not _is_tp_local_group_view(input_node, group_dim):
+        if isinstance(input_node, Node) and not _is_recovered_tp_local_group_view(
+            input_node,
+            group_dim,
+            num_groups=num_groups,
+            dc=dc,
+        ):
             with gm.graph.inserting_before(self.node):
                 local_input = gm.graph.call_function(
                     torch.ops.aten.slice.Tensor,
@@ -1326,6 +1440,84 @@ def _apply_simple_shard(gm: GraphModule, dc: DistConfig) -> int:
     return num_updates
 
 
+def _recover_deepseek_v4_sparse_q_aten_views(gm: GraphModule, dc: DistConfig) -> int:
+    num_updates = 0
+    sparse_ops = (
+        torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention,
+        torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2,
+    )
+    for sparse_node in list(gm.graph.nodes):
+        if not is_op(sparse_node, sparse_ops):
+            continue
+        [enable_sharding, attn_sink, q] = extract_op_args(
+            sparse_node,
+            "enable_sharding",
+            "attn_sink",
+            "q",
+        )
+        if not enable_sharding or not isinstance(attn_sink, Node) or not isinstance(q, Node):
+            continue
+
+        _, sink_tensor = _get_attr_tensor(gm, attn_sink, "attn_sink")
+        full_heads = int(sink_tensor.shape[0])
+        _assert_divisible(full_heads, dc.tp_size, "DeepSeek V4 attention heads")
+
+        for view_node in list(gm.graph.nodes):
+            if not _is_aten_view_or_reshape(view_node) or not _node_depends_on(q, view_node):
+                continue
+            _, view_shape = _view_base_and_shape(view_node)
+            if (
+                view_shape is not None
+                and len(view_shape) == 4
+                and view_shape[2] == full_heads
+                and _scale_view_shape_dim(
+                    view_node,
+                    2,
+                    dc,
+                    "DeepSeek V4 sparse attention q heads",
+                )
+            ):
+                num_updates += 1
+                break
+    return num_updates
+
+
+def _recover_deepseek_v4_wo_a_group_aten_views(gm: GraphModule, dc: DistConfig) -> int:
+    num_updates = 0
+    grouped_op = (
+        torch.ops.auto_deploy.torch_fake_quant_deepseek_v4_wo_a_grouped_finegrained_fp8_linear
+    )
+    for grouped_node in list(gm.graph.nodes):
+        if not is_op(grouped_node, grouped_op):
+            continue
+        [input_node] = extract_op_args(grouped_node, "input")
+        if not _is_aten_view_or_reshape(input_node):
+            continue
+
+        _, view_shape = _view_base_and_shape(input_node)
+        if view_shape is None or len(view_shape) < 2:
+            continue
+        group_dim = len(view_shape) - 2
+        if view_shape[group_dim] != -1 and _scale_view_shape_dim(
+            input_node,
+            group_dim,
+            dc,
+            "DeepSeek V4 wo_a output groups",
+        ):
+            num_updates += 1
+    return num_updates
+
+
+def _recover_deepseek_v4_aten_view_sharding(gm: GraphModule, dc: DistConfig) -> int:
+    """Recover DSV4 view hints when export lowered ``auto_deploy.view`` to aten."""
+    if dc.tp_size <= 1:
+        return 0
+    return _recover_deepseek_v4_sparse_q_aten_views(
+        gm,
+        dc,
+    ) + _recover_deepseek_v4_wo_a_group_aten_views(gm, dc)
+
+
 # =============================================================================
 # Transform classes
 # =============================================================================
@@ -1425,6 +1617,9 @@ class ApplyShardingHints(BaseTransform):
             all_dead_nodes = []
 
             with WeightBiasInfoCache():
+                if shard_layers is None or "mla" in shard_layers:
+                    num_updates += _recover_deepseek_v4_aten_view_sharding(gm, dc)
+
                 for node in list(gm.graph.nodes):
                     shardable_node = ShardableNode.from_node(node)
                     if shardable_node is None:

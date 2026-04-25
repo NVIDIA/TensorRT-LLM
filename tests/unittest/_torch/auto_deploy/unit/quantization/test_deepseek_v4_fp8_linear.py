@@ -295,6 +295,16 @@ def _depends_on(node: torch.fx.Node, target: torch.fx.Node) -> bool:
     return False
 
 
+def _lower_sharding_views_to_aten(gm: torch.fx.GraphModule) -> None:
+    for node in gm.graph.nodes:
+        if is_op(node, torch.ops.auto_deploy.view):
+            node.target = torch.ops.aten.view.default
+            node.args = (node.args[0], node.args[1])
+            node.kwargs = {}
+    gm.graph.lint()
+    gm.recompile()
+
+
 def _fp8_weight(shape: tuple[int, int]) -> torch.Tensor:
     return torch.empty(shape, dtype=torch.float8_e4m3fn, device="cpu")
 
@@ -613,7 +623,14 @@ def test_deepseek_v4_wo_a_grouped_sharding_skips_input_slice_after_local_group_v
     )
 
 
-def test_deepseek_v4_attention_wo_a_sharding_feeds_rowwise_wo_b_local_features() -> None:
+@pytest.mark.parametrize(
+    "lower_views_to_aten",
+    [False, True],
+    ids=["auto-deploy-view", "aten-view"],
+)
+def test_deepseek_v4_attention_wo_a_sharding_feeds_rowwise_wo_b_local_features(
+    lower_views_to_aten: bool,
+) -> None:
     model = _DeepSeekV4AttentionWoBShardingFixture().to(torch.bfloat16)
     gm = torch_export_to_gm(
         model,
@@ -622,6 +639,8 @@ def test_deepseek_v4_attention_wo_a_sharding_feeds_rowwise_wo_b_local_features()
             torch.arange(4, dtype=torch.long).unsqueeze(0),
         ),
     )
+    if lower_views_to_aten:
+        _lower_sharding_views_to_aten(gm)
 
     quantized, quant_info = _run_finegrained_transform(gm, _deepseek_v4_quant_config())
     transformed, shard_info = _run_ir_sharding(
@@ -648,7 +667,10 @@ def test_deepseek_v4_attention_wo_a_sharding_feeds_rowwise_wo_b_local_features()
     q_view_node = next(
         node
         for node in transformed.graph.nodes
-        if is_op(node, torch.ops.auto_deploy.view)
+        if (
+            is_op(node, (torch.ops.auto_deploy.view, torch.ops.aten.view))
+            or node.target == torch.ops.aten.view.default
+        )
         and node.args[1][-1] == model.layers[0].attn.head_dim
     )
     assert q_view_node.args[1] == [1, 4, -1, 16]

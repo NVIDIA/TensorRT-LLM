@@ -20,11 +20,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe import mxfp4_moe
 from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.deepseek_v4_moe import (
     deepseek_v4_limited_swiglu,
     deepseek_v4_moe_reference,
 )
-from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.mxfp4_moe import _routing_from_precomputed
+from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.mxfp4_moe import (
+    _deepseek_v4_swiglu_torch,
+    _interleave_deepseek_v4_gate_up,
+    _routing_from_precomputed,
+)
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
     DeepseekV4Config,
@@ -223,6 +228,77 @@ def test_limited_swiglu_limit_ten_clamps_gate_and_up() -> None:
     expected = F.silu(torch.tensor([[10.0, -20.0]])) * torch.tensor([[10.0, -10.0]])
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_deepseek_v4_mxfp4_swiglu_matches_reference_without_gptoss_offset() -> None:
+    gate_up_interleaved = torch.tensor([[20.0, 15.0, -20.0, -15.0]], dtype=torch.float32)
+
+    actual = _deepseek_v4_swiglu_torch(gate_up_interleaved, alpha=1.0, limit=10.0)
+
+    expected_gate = torch.tensor([[10.0, -20.0]], dtype=torch.float32)
+    expected_up = torch.tensor([[10.0, -10.0]], dtype=torch.float32)
+    expected = F.silu(expected_gate) * expected_up
+    gptoss_style = F.silu(expected_gate) * (expected_up + 1)
+
+    torch.testing.assert_close(actual, expected)
+    assert not torch.allclose(actual, gptoss_style)
+
+
+def test_deepseek_v4_mxfp4_interleaves_checkpoint_gate_up_order() -> None:
+    checkpoint_order = torch.tensor([[30, 31, 32, 10, 11, 12]], dtype=torch.uint8)
+
+    actual = _interleave_deepseek_v4_gate_up(checkpoint_order)
+
+    expected = torch.tensor([[10, 30, 11, 31, 12, 32]], dtype=torch.uint8)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_prepare_weights_scales_interleaves_deepseek_gate_up_before_swizzle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeSwizzledTensor:
+        shape: torch.Size | None = None
+
+    swizzle_calls = []
+
+    def _fake_swizzle_mxfp4(
+        weight: torch.Tensor, weight_scale: torch.Tensor
+    ) -> tuple[_FakeSwizzledTensor, _FakeSwizzledTensor]:
+        swizzle_calls.append((weight.clone(), weight_scale.clone()))
+        return _FakeSwizzledTensor(), _FakeSwizzledTensor()
+
+    monkeypatch.setattr(mxfp4_moe, "_swizzle_mxfp4", _fake_swizzle_mxfp4)
+    mxfp4_moe._clear_mxfp4_weights_scales_cache()
+    hidden_size = 64
+    intermediate_size = 32
+    gate_up_blocks = (
+        torch.arange(2 * intermediate_size, dtype=torch.uint8)
+        .view(1, 2 * intermediate_size, 1, 1)
+        .expand(1, 2 * intermediate_size, hidden_size // 32, 16)
+        .contiguous()
+    )
+    gate_up_scales = (
+        torch.arange(2 * intermediate_size, dtype=torch.uint8)
+        .view(1, 2 * intermediate_size, 1)
+        .expand(1, 2 * intermediate_size, hidden_size // 32)
+        .contiguous()
+    )
+    down_blocks = torch.zeros((1, hidden_size, intermediate_size // 32, 16), dtype=torch.uint8)
+    down_scales = torch.zeros((1, hidden_size, intermediate_size // 32), dtype=torch.uint8)
+
+    mxfp4_moe._prepare_weights_scales(
+        hidden_size,
+        gate_up_blocks,
+        gate_up_scales,
+        down_blocks,
+        down_scales,
+        interleave_gate_up=True,
+    )
+
+    gate_up_weight, gate_up_scale = swizzle_calls[0]
+    expected_prefix = torch.tensor([32, 0, 33, 1, 34, 2, 35, 3], dtype=torch.uint8)
+    torch.testing.assert_close(gate_up_weight[0, 0, :8], expected_prefix, rtol=0, atol=0)
+    torch.testing.assert_close(gate_up_scale[0, 0, :8], expected_prefix, rtol=0, atol=0)
 
 
 def test_from_routing_limit_zero_zeroes_routed_output_without_shared_expert() -> None:
@@ -464,31 +540,31 @@ def _uint8_pattern(shape: tuple[int, ...], offset: int) -> torch.Tensor:
 
 
 class _MXFP4FromRoutingShardingModule(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, num_experts: int = 4) -> None:
         super().__init__()
         self.ffn = nn.Module()
         self.ffn.gate_up_blocks = nn.Parameter(
-            _uint8_pattern((4, 8, 2, 16), 1),
+            _uint8_pattern((num_experts, 8, 2, 16), 1),
             requires_grad=False,
         )
         self.ffn.gate_up_bias = nn.Parameter(
-            torch.arange(4 * 8, dtype=torch.float32).reshape(4, 8),
+            torch.arange(num_experts * 8, dtype=torch.float32).reshape(num_experts, 8),
             requires_grad=False,
         )
         self.ffn.gate_up_scales = nn.Parameter(
-            _uint8_pattern((4, 8, 2), 11),
+            _uint8_pattern((num_experts, 8, 2), 11),
             requires_grad=False,
         )
         self.ffn.down_blocks = nn.Parameter(
-            _uint8_pattern((4, 4, 2, 16), 23),
+            _uint8_pattern((num_experts, 4, 2, 16), 23),
             requires_grad=False,
         )
         self.ffn.down_bias = nn.Parameter(
-            torch.arange(4 * 4, dtype=torch.float32).reshape(4, 4).add(100),
+            torch.arange(num_experts * 4, dtype=torch.float32).reshape(num_experts, 4).add(100),
             requires_grad=False,
         )
         self.ffn.down_scales = nn.Parameter(
-            _uint8_pattern((4, 4, 2), 37),
+            _uint8_pattern((num_experts, 4, 2), 37),
             requires_grad=False,
         )
 
@@ -514,8 +590,8 @@ class _MXFP4FromRoutingShardingModule(nn.Module):
         )
 
 
-def _trace_mxfp4_from_routing_sharding_module() -> torch.fx.GraphModule:
-    gm = torch.fx.symbolic_trace(_MXFP4FromRoutingShardingModule())
+def _trace_mxfp4_from_routing_sharding_module(num_experts: int = 4) -> torch.fx.GraphModule:
+    gm = torch.fx.symbolic_trace(_MXFP4FromRoutingShardingModule(num_experts))
     params_and_buffers = dict(gm.named_parameters())
     params_and_buffers.update(dict(gm.named_buffers()))
     for node in gm.graph.nodes:
@@ -590,6 +666,43 @@ def test_deepseek_v4_mxfp4_from_routing_shards_experts_and_localizes_ids() -> No
             rtol=0,
             atol=0,
         )
+
+
+def test_deepseek_v4_mxfp4_from_routing_ep8_localizes_rank7_global_ids() -> None:
+    gm = _trace_mxfp4_from_routing_sharding_module(num_experts=16)
+    full_state = {name: tensor.detach().clone() for name, tensor in gm.named_parameters()}
+
+    transformed, info = _run_ir_sharding(gm, rank=7, world_size=8)
+
+    assert info.num_matches == 1
+    for name, full_tensor in full_state.items():
+        local_tensor = transformed.get_parameter(name)
+        assert local_tensor.shape[0] == 2
+        torch.testing.assert_close(local_tensor, full_tensor[14:16], rtol=0, atol=0)
+
+    moe_node = next(
+        node
+        for node in transformed.graph.nodes
+        if is_op(
+            node,
+            torch.ops.auto_deploy.triton_deepseek_v4_mxfp4_moe_from_routing,
+        )
+    )
+    selected_local = moe_node.args[1]
+    routing_local = moe_node.args[2]
+    assert selected_local.target == operator.mul
+    assert routing_local.target == operator.mul
+    assert selected_local.args[1] is routing_local.args[1]
+    local_ids = selected_local.args[0]
+    assert local_ids.target == operator.sub
+    assert local_ids.args[1] == 14
+    rank_mask = selected_local.args[1]
+    ge_lower, lt_upper = rank_mask.args
+    assert rank_mask.target == torch.logical_and
+    assert ge_lower.target == torch.ge
+    assert ge_lower.args[1] == 14
+    assert lt_upper.target == torch.lt
+    assert lt_upper.args[1] == 16
 
 
 class _CanonicalMoEModule(nn.Module):

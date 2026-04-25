@@ -774,6 +774,32 @@ def test_cached_ratio_zero_decode_uses_managed_nhd_page_size_for_swa_cache():
 
 
 @pytest.mark.parametrize(
+    "cache_shape,expected_last_row_index",
+    [
+        pytest.param((2, 2, 1, 1, 3), (1, 1, 0, 0), id="local-unit"),
+        pytest.param((2, 1, 2, 1, 3), (1, 0, 1, 0), id="managed-nhd"),
+        pytest.param((2, 1, 1, 2, 3), (1, 0, 0, 1), id="managed-hnd"),
+    ],
+)
+def test_swa_cache_page_addressing_for_supported_5d_layouts(
+    cache_shape: tuple[int, int, int, int, int],
+    expected_last_row_index: tuple[int, int, int, int],
+) -> None:
+    rows = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    cache = torch.zeros(cache_shape, dtype=torch.float32)
+    cache_loc = torch.tensor([0, 1], dtype=torch.int)
+    cu_num_pages = torch.tensor([0, 2], dtype=torch.int)
+
+    dsv4_attention._write_swa_cache(rows, cache, cache_loc, cu_num_pages, 0, 0)
+    gathered = dsv4_attention._gather_swa_rows(
+        cache, cache_loc, cu_num_pages, 0, 0, 4, torch.float32
+    )
+
+    torch.testing.assert_close(gathered, rows)
+    torch.testing.assert_close(cache[expected_last_row_index], rows[-1])
+
+
+@pytest.mark.parametrize(
     "ratio,prefix_len,total_len",
     [
         pytest.param(4, 3, 9, id="ratio4-boundary-and-overlap"),

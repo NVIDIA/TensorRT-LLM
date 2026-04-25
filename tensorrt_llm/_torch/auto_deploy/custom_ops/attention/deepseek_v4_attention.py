@@ -273,7 +273,7 @@ def _to_host_long(tensor: torch.Tensor, length: int) -> torch.Tensor:
 def _cache_token_view(cache: torch.Tensor, page_idx: int, token_offset: int) -> torch.Tensor:
     """Return a mutable view for one DeepSeek V4 SWA cache row."""
     if cache.dim() == 5:
-        if int(cache.shape[1]) <= 2:
+        if int(cache.shape[1]) == 1:
             # KVCacheManager.get_buffers(..., kv_layout="NHD"):
             # [num_pages, kv_factor, tokens_per_block, num_kv_heads, head_dim].
             if int(cache.shape[2]) >= int(cache.shape[3]):
@@ -294,7 +294,7 @@ def _cache_token_view(cache: torch.Tensor, page_idx: int, token_offset: int) -> 
 def _cache_tokens_per_block(cache: torch.Tensor) -> int:
     if cache.dim() not in (3, 4, 5):
         raise ValueError(f"swa_cache must have rank 3, 4, or 5, got rank {cache.dim()}")
-    if cache.dim() == 5 and int(cache.shape[1]) <= 2:
+    if cache.dim() == 5 and int(cache.shape[1]) == 1:
         return int(cache.shape[2] if int(cache.shape[2]) >= int(cache.shape[3]) else cache.shape[3])
     return int(cache.shape[1])
 

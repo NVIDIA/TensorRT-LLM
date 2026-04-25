@@ -20,6 +20,8 @@ from typing import Callable, Tuple
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from triton_kernels.matmul_ogs import (
     FlexCtx,
     FnSpecs,
@@ -47,6 +49,38 @@ def _swizzle_mxfp4(w, w_scale):
     return w, w_scale
 
 
+@triton.jit
+def _deepseek_v4_swiglu_fn(input, alpha, limit):
+    gate, up = tl.split(tl.reshape(input, (input.shape[0], input.shape[1] // 2, 2)))
+    gate = gate.to(tl.float32)
+    up = up.to(tl.float32)
+    if limit is not None:
+        gate = tl.minimum(gate, limit)
+        up = tl.clamp(up, -limit, limit)
+    return gate / (1 + tl.exp(-alpha * gate)) * up
+
+
+def _deepseek_v4_swiglu_torch(input: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
+    gate = input[..., 0::2].float()
+    up = input[..., 1::2].float()
+    gate = torch.clamp(gate, max=limit)
+    up = torch.clamp(up, min=-limit, max=limit)
+    return (gate * torch.sigmoid(alpha * gate) * up).to(input.dtype)
+
+
+def _interleave_deepseek_v4_gate_up(tensor: torch.Tensor) -> torch.Tensor:
+    """Convert DeepSeek checkpoint order [w3, w1] to activation lane order [w1, w3]."""
+    if tensor.dim() < 2:
+        raise ValueError(f"gate/up tensor must have rank at least 2, got rank {tensor.dim()}")
+    if tensor.shape[1] % 2 != 0:
+        raise ValueError(f"gate/up dimension must be even, got {tensor.shape[1]}")
+
+    intermediate_size = tensor.shape[1] // 2
+    up = tensor[:, :intermediate_size]
+    gate = tensor[:, intermediate_size:]
+    return torch.stack((gate, up), dim=2).flatten(1, 2).contiguous()
+
+
 RouteFn = Callable[[torch.Tensor], Tuple[RoutingData, GatherIndx, ScatterIndx]]
 
 _TensorCacheKey = tuple[
@@ -62,7 +96,9 @@ _TensorCacheKey = tuple[
     torch.layout,
     int | None,
 ]
-_PrepareCacheKey = tuple[int, _TensorCacheKey, _TensorCacheKey, _TensorCacheKey, _TensorCacheKey]
+_PrepareCacheKey = tuple[
+    int, bool, _TensorCacheKey, _TensorCacheKey, _TensorCacheKey, _TensorCacheKey
+]
 _PreparedWeightsScales = tuple[object, object, object, object]
 _TensorRef = weakref.ReferenceType[torch.Tensor] | None
 _PrepareCacheEntry = tuple[
@@ -101,6 +137,7 @@ def _tensor_cache_key(tensor: torch.Tensor) -> _TensorCacheKey:
 
 def _prepare_cache_key(
     hidden_size: int,
+    interleave_gate_up: bool,
     gate_up_blocks: torch.Tensor,
     gate_up_scales: torch.Tensor,
     down_blocks: torch.Tensor,
@@ -108,6 +145,7 @@ def _prepare_cache_key(
 ) -> _PrepareCacheKey:
     return (
         hidden_size,
+        interleave_gate_up,
         _tensor_cache_key(gate_up_blocks),
         _tensor_cache_key(gate_up_scales),
         _tensor_cache_key(down_blocks),
@@ -191,10 +229,17 @@ def _prepare_weights_scales(
     gate_up_scales: torch.Tensor,  # [E_local, 2I, H//32] in unit8
     down_blocks: torch.Tensor,  # [E_local, H, I//32, 16] in uint8
     down_scales: torch.Tensor,  # [E_local, H, I//32] in uint8
+    *,
+    interleave_gate_up: bool = False,
 ) -> _PreparedWeightsScales:
     cache_tensors = (gate_up_blocks, gate_up_scales, down_blocks, down_scales)
     cache_key = _prepare_cache_key(
-        hidden_size, gate_up_blocks, gate_up_scales, down_blocks, down_scales
+        hidden_size,
+        interleave_gate_up,
+        gate_up_blocks,
+        gate_up_scales,
+        down_blocks,
+        down_scales,
     )
     cache_entry = _PREPARED_WEIGHTS_SCALES_CACHE.get(cache_key)
     if cache_entry is not None:
@@ -205,6 +250,9 @@ def _prepare_weights_scales(
 
     local_experts = gate_up_blocks.size(0)
     intermediate_size = gate_up_blocks.shape[1] // 2
+    if interleave_gate_up:
+        gate_up_blocks = _interleave_deepseek_v4_gate_up(gate_up_blocks)
+        gate_up_scales = _interleave_deepseek_v4_gate_up(gate_up_scales)
 
     # canon shapes for swizzling (use last two dims as [K, N] style)
     gate_up_blocks = gate_up_blocks.view(local_experts, intermediate_size * 2, -1)
@@ -287,6 +335,10 @@ def _run_mxfp4_mlp_core_from_routing(
     routing_data: RoutingData,
     gather_idx: GatherIndx,
     scatter_idx: ScatterIndx,
+    *,
+    activation_fn=swiglu_fn,
+    activation_name: str = "swiglu",
+    interleave_gate_up: bool = False,
 ) -> torch.Tensor:
     leading_shape = hidden_states.shape[:-1]
     hidden_size = hidden_states.shape[-1]
@@ -298,8 +350,15 @@ def _run_mxfp4_mlp_core_from_routing(
         triton_down_w,
         down_w_scale_raw,
     ) = _prepare_weights_scales(
-        hidden_size, gate_up_blocks, gate_up_scales, down_blocks, down_scales
+        hidden_size,
+        gate_up_blocks,
+        gate_up_scales,
+        down_blocks,
+        down_scales,
+        interleave_gate_up=interleave_gate_up,
     )
+    if interleave_gate_up:
+        gate_up_bias = _interleave_deepseek_v4_gate_up(gate_up_bias)
 
     gate_pc = PrecisionConfig(
         weight_scale=gate_up_w_scale_raw, flex_ctx=FlexCtx(rhs_data=InFlexData())
@@ -309,7 +368,7 @@ def _run_mxfp4_mlp_core_from_routing(
     )
 
     act = FusedActivation(
-        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit"), reduction_n=2),
+        FnSpecs(activation_name, activation_fn, ("alpha", "limit"), reduction_n=2),
         (float(alpha), float(limit)),
     )
 
@@ -434,6 +493,9 @@ def triton_deepseek_v4_mxfp4_moe_from_routing(
         routing_data,
         gather_idx,
         scatter_idx,
+        activation_fn=_deepseek_v4_swiglu_fn,
+        activation_name="deepseek_v4_swiglu",
+        interleave_gate_up=True,
     )
 
 
