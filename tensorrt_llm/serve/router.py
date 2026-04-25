@@ -55,6 +55,8 @@ class ServerState:
             session_provider: Optional[Callable[[],
                                                 aiohttp.ClientSession]] = None):
         self._server = server
+        self._base_url = server if server.startswith(
+            "http") else f"http://{server}"
         self._num_active_requests = 0
         self._num_active_tokens = 0
         self._use_tokens = use_tokens
@@ -80,7 +82,7 @@ class ServerState:
     async def is_healthy(self) -> bool:
         try:
             async with self._session.get(
-                    f"http://{self._server}/health") as response:
+                    f"{self._base_url}/health") as response:
                 return response.status == 200
         except Exception:
             return False
@@ -123,7 +125,7 @@ class KvCacheAwareServerState(ServerState):
 
     async def poll_events(self, session: aiohttp.ClientSession):
         async with session.post(
-                f"http://{self._server}/kv_cache_events") as response:
+                f"{self._base_url}/kv_cache_events") as response:
             events_raw = await response.json()
         return events_raw
 
@@ -147,11 +149,15 @@ class KvCacheAwareServerState(ServerState):
 
     async def poll_and_update(self):
         """Poll KV cache events and update block table. Called outside the critical path."""
-        assert self._session is not None, "session must be set on KvCacheAwareServerState"
-        events_raw = await self.poll_events(self._session)
-        async with self._lock:
-            if events_raw is not None:
-                self.update_with_events(events_raw)
+        try:
+            assert self._session is not None, "session must be set on KvCacheAwareServerState"
+            events_raw = await self.poll_events(self._session)
+            async with self._lock:
+                if events_raw is not None:
+                    self.update_with_events(events_raw)
+        except Exception as e:
+            logger.warning(
+                f"Failed to poll KV cache events from {self._server}: {e}")
 
     def num_active_tokens(self):
         return self._num_active_tokens
@@ -275,9 +281,14 @@ class Router(ABC):
     def servers(self) -> List[str]:
         return self._servers
 
+    @staticmethod
+    def _ensure_url(server: str) -> str:
+        return server if server.startswith("http") else f"http://{server}"
+
     async def _fetch_server_info(self, server: str, timeout: float) -> dict:
         try:
-            async with self.session.get(f"http://{server}/server_info",
+            url = self._ensure_url(server)
+            async with self.session.get(f"{url}/server_info",
                                         timeout=timeout) as response:
                 return await response.json()
         except Exception as e:
@@ -811,9 +822,8 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             server = self._req_routing_table.pop(id(request), None)
             if server is not None and server in self._server_state:
                 await self._server_state[server].decrement_load(request)
-        # Fire poll_and_update in background — does not block the caller
         if server is not None and server in self._server_state:
-            asyncio.create_task(self._server_state[server].poll_and_update())
+            await self._server_state[server].poll_and_update()
 
     def _on_servers_updated(self, old_servers, new_servers):
         new_state = {}
