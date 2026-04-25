@@ -63,7 +63,7 @@ def _small_cfg(ratio: int) -> DeepseekV4Config:
         rope_scaling=None,
         compress_ratios=[ratio],
         index_n_heads=4,
-        index_head_dim=16,
+        index_head_dim=32,
         index_topk=2,
         swiglu_limit=0.0,
         norm_topk_prob=True,
@@ -350,3 +350,119 @@ def test_decode_matches_fresh_prefill_last_token(ratio: int) -> None:
     # Tolerances are a bit loose because the decode path uses a different computation order
     # (rolling-state updates vs one-shot softmax) which introduces bfloat16-scale drift.
     torch.testing.assert_close(y_ref_last, y_last_decoded, rtol=5e-2, atol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture requires CUDA")
+@pytest.mark.parametrize("ratio", [4, 128])
+def test_decode_cuda_graph_matches_fresh_prefill_last_token(ratio: int) -> None:
+    """Captured decode replay matches a fresh prefill and crosses a compression boundary."""
+    device = torch.device("cuda")
+    cfg = _small_cfg(ratio)
+    attn = DeepseekV4Attention(cfg, layer_idx=0).eval().to(device)
+    attn.compressor.ape.data.normal_(std=0.02)
+    if attn.indexer is not None:
+        attn.indexer.compressor.ape.data.normal_(std=0.02)
+    attn.attn_sink.data.normal_(std=0.1)
+
+    B = 1
+    prefill_len, decode_steps = (5, 3) if ratio == 4 else (130, 126)
+    total_len = prefill_len + decode_steps
+    x_full = torch.randn(B, total_len, cfg.hidden_size, device=device)
+    position_ids_full = torch.arange(total_len, device=device).unsqueeze(0).expand(B, -1)
+    cos_tbl, sin_tbl = _build_freqs_cis(
+        cfg.qk_rope_head_dim,
+        cfg.max_position_embeddings,
+        cfg.compress_rope_theta,
+        0,
+        1.0,
+        32,
+        1,
+    )
+    cos_tbl = cos_tbl.to(device)
+    sin_tbl = sin_tbl.to(device)
+    cos_full = cos_tbl[position_ids_full]
+    sin_full = sin_tbl[position_ids_full]
+    q_full, kv_full, qr_full = _prepare_qkv(attn, x_full, cos_full, sin_full)
+
+    constants = _pack_op_constants(cfg, attn)
+    qkv_ref = _pack_op_qkv_args(
+        attn, q_full, kv_full, x_full, qr_full, cos_full, sin_full, cos_tbl, sin_tbl
+    )
+    y_ref_full = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attn(
+        *qkv_ref, *constants, 0, "mha_sparse"
+    )
+
+    caches = tuple(t.to(device) for t in _make_caches(cfg, attn))
+    meta_prefill = (
+        torch.zeros(1, dtype=torch.int64, device=device),
+        torch.tensor([prefill_len], dtype=torch.int32, device=device),
+        torch.tensor([0], dtype=torch.int32, device=device),
+        torch.tensor([0], dtype=torch.int64, device=device),
+        torch.tensor([0, prefill_len], dtype=torch.int32, device=device),
+    )
+    qkv_prefill = _pack_op_qkv_args(
+        attn,
+        q_full[:, :prefill_len],
+        kv_full[:, :prefill_len],
+        x_full[:, :prefill_len],
+        qr_full[:, :prefill_len],
+        cos_full[:, :prefill_len],
+        sin_full[:, :prefill_len],
+        cos_tbl,
+        sin_tbl,
+    )
+    torch.ops.auto_deploy.torch_deepseek_v4_sparse_attn_with_cache(
+        *qkv_prefill, *meta_prefill, *caches, *constants
+    )
+    initial_num_compressed = prefill_len // ratio
+    boundary_row = initial_num_compressed
+    caches[1][:, initial_num_compressed:] = torch.nan
+    if attn.indexer is not None:
+        caches[4][:, initial_num_compressed:] = torch.nan
+
+    q_step = q_full[:, prefill_len : prefill_len + 1].clone()
+    kv_step = kv_full[:, prefill_len : prefill_len + 1].clone()
+    x_step = x_full[:, prefill_len : prefill_len + 1].clone()
+    qr_step = qr_full[:, prefill_len : prefill_len + 1].clone()
+    cos_step = cos_full[:, prefill_len : prefill_len + 1].clone()
+    sin_step = sin_full[:, prefill_len : prefill_len + 1].clone()
+    meta_step = (
+        torch.zeros(1, dtype=torch.int64, device=device),
+        torch.tensor([1], dtype=torch.int32, device=device),
+        torch.tensor([prefill_len], dtype=torch.int32, device=device),
+        torch.tensor([0], dtype=torch.int64, device=device),
+        torch.tensor([0, 1], dtype=torch.int32, device=device),
+    )
+    qkv_step = _pack_op_qkv_args(
+        attn, q_step, kv_step, x_step, qr_step, cos_step, sin_step, cos_tbl, sin_tbl
+    )
+
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        y_last_decoded = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attn_with_cache(
+            *qkv_step, *meta_step, *caches, *constants
+        )
+
+    graph.replay()
+    assert torch.isfinite(y_last_decoded).all().item()
+    assert torch.isnan(caches[1][0, boundary_row]).all().item()
+    if attn.indexer is not None:
+        assert torch.isnan(caches[4][0, boundary_row]).all().item()
+    for step in range(1, decode_steps):
+        pos = prefill_len + step
+        q_step.copy_(q_full[:, pos : pos + 1])
+        kv_step.copy_(kv_full[:, pos : pos + 1])
+        x_step.copy_(x_full[:, pos : pos + 1])
+        qr_step.copy_(qr_full[:, pos : pos + 1])
+        cos_step.copy_(cos_full[:, pos : pos + 1])
+        sin_step.copy_(sin_full[:, pos : pos + 1])
+        meta_step[2].fill_(pos)
+        graph.replay()
+
+    torch.cuda.synchronize()
+    assert torch.isfinite(y_last_decoded).all().item()
+    assert torch.isfinite(caches[1][0, boundary_row]).all().item()
+    if attn.indexer is not None:
+        assert torch.isfinite(caches[4][0, boundary_row]).all().item()
+    torch.testing.assert_close(y_ref_full[:, -1:], y_last_decoded, rtol=5e-2, atol=5e-2)

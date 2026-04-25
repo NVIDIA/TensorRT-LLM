@@ -1411,6 +1411,101 @@ def test_sparse_cache_transform_replaces_sparse_attention_nodes():
     assert all(len(n.args) == 40 for n in cached_nodes)
 
 
+def test_dense_cache_transform_routes_dense_layers_to_triton_paged_only():
+    """Dense DS-V4 layers route to triton_paged while sparse layers stay sparse."""
+    cfg = _small_config()
+    cfg.num_hidden_layers = 3
+    cfg.compress_ratios = [0, 4, 128]
+    model = DeepseekV4ForCausalLM(cfg).eval()
+
+    B, S = 2, 4
+    input_ids = torch.randint(0, cfg.vocab_size, (B, S))
+    position_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
+    dynamic_shapes = (
+        {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+        {0: Dim.DYNAMIC, 1: Dim.DYNAMIC},
+    )
+    gm = torch_export_to_gm(
+        model,
+        args=tuple(),
+        kwargs={"input_ids": input_ids, "position_ids": position_ids},
+        dynamic_shapes=dynamic_shapes,
+    )
+
+    from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
+    from tensorrt_llm._torch.auto_deploy.transform.interface import Stages
+    from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import (
+        InsertCachedAttention,
+        InsertCachedDeepseekV4SparseAttention,
+    )
+    from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_op_args
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+
+    dense_source_op = torch.ops.auto_deploy.torch_attention.default
+    sparse_source_op = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attn.default
+    dense_nodes = [
+        n for n in gm.graph.nodes if n.op == "call_function" and n.target is dense_source_op
+    ]
+    assert len(dense_nodes) == 1
+    dense_sink_arg = extract_op_args(dense_nodes[0], "sinks")[0]
+
+    cm = CachedSequenceInterface(
+        max_seq_len=cfg.max_position_embeddings,
+        max_batch_size=B,
+        max_num_tokens=B * cfg.max_position_embeddings,
+        device="cpu",
+        kv_cache_config=KvCacheConfig(
+            dtype="bfloat16", free_gpu_memory_fraction=0.0, tokens_per_block=64
+        ),
+    )
+    transform = InsertCachedAttention.from_kwargs(stage=Stages.CACHE_INIT, backend="triton_paged")
+    gm, info = transform._apply(gm, cm, factory=None, shared_config=None)
+
+    dense_cached_op = torch.ops.auto_deploy.triton_paged_mha_with_cache.default
+    sparse_cached_op = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attn_with_cache.default
+    dense_source_nodes = [
+        n for n in gm.graph.nodes if n.op == "call_function" and n.target is dense_source_op
+    ]
+    dense_cached_nodes = [
+        n for n in gm.graph.nodes if n.op == "call_function" and n.target is dense_cached_op
+    ]
+    sparse_source_nodes = [
+        n for n in gm.graph.nodes if n.op == "call_function" and n.target is sparse_source_op
+    ]
+    sparse_cached_nodes = [
+        n for n in gm.graph.nodes if n.op == "call_function" and n.target is sparse_cached_op
+    ]
+
+    assert info.num_matches == 1
+    assert dense_source_nodes == []
+    assert len(dense_cached_nodes) == 1
+    assert len(sparse_source_nodes) == 2
+    assert sparse_cached_nodes == []
+
+    cached_node = dense_cached_nodes[0]
+    assert cached_node.args[-3] == cfg.head_dim**-0.5
+    assert cached_node.args[-2] == cfg.sliding_window
+    assert cached_node.args[-1] is dense_sink_arg
+
+    sparse_transform = InsertCachedDeepseekV4SparseAttention.from_kwargs(stage=Stages.CACHE_INIT)
+    gm, sparse_info = sparse_transform._apply(gm, cm, factory=None, shared_config=None)
+
+    dense_cached_nodes = [
+        n for n in gm.graph.nodes if n.op == "call_function" and n.target is dense_cached_op
+    ]
+    sparse_source_nodes = [
+        n for n in gm.graph.nodes if n.op == "call_function" and n.target is sparse_source_op
+    ]
+    sparse_cached_nodes = [
+        n for n in gm.graph.nodes if n.op == "call_function" and n.target is sparse_cached_op
+    ]
+
+    assert sparse_info.num_matches == 2
+    assert len(dense_cached_nodes) == 1
+    assert sparse_source_nodes == []
+    assert len(sparse_cached_nodes) == 2
+
+
 def test_exported_hc_mixes_use_fp32_matmul_not_linear_ops():
     """HC mixers must not be exported as quantizable linear ops.
 

@@ -106,9 +106,15 @@ def _fake_fp4_act_quant(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
     grouped = x_float.reshape(*x_float.shape[:-1], dim // block_size, block_size)
     scale = _ceil_pow2_scale(grouped.abs().amax(dim=-1, keepdim=True), 6.0, 6.0 * 2.0**-126)
     normalized = torch.clamp(grouped / scale, -6.0, 6.0)
-    levels = normalized.new_tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-    level_idx = (normalized.abs().unsqueeze(-1) - levels).abs().argmin(dim=-1)
-    quant = levels[level_idx] * normalized.sign()
+    abs_normalized = normalized.abs()
+    quant_abs = torch.where(abs_normalized > 0.25, 0.5, torch.zeros_like(abs_normalized))
+    quant_abs = torch.where(abs_normalized > 0.75, 1.0, quant_abs)
+    quant_abs = torch.where(abs_normalized > 1.25, 1.5, quant_abs)
+    quant_abs = torch.where(abs_normalized > 1.75, 2.0, quant_abs)
+    quant_abs = torch.where(abs_normalized > 2.5, 3.0, quant_abs)
+    quant_abs = torch.where(abs_normalized > 3.5, 4.0, quant_abs)
+    quant_abs = torch.where(abs_normalized > 5.0, 6.0, quant_abs)
+    quant = quant_abs * normalized.sign()
     return (quant * scale).reshape_as(x_float).to(dtype)
 
 
@@ -886,6 +892,341 @@ def _decode_sparse_attn_step(
     return _manual_attention_with_sinks(q, kv_all, kv_all, attn_mask, scale, attn_sink)
 
 
+def _decode_compressor_step_static_cuda(
+    hidden_states: torch.Tensor,
+    cos_anchor_table: torch.Tensor,
+    sin_anchor_table: torch.Tensor,
+    kv_state: torch.Tensor,
+    score_state: torch.Tensor,
+    compressed_kv_cache: torch.Tensor,
+    wkv: torch.Tensor,
+    wgate: torch.Tensor,
+    ape: torch.Tensor,
+    norm_weight: torch.Tensor,
+    slot_idx: torch.Tensor,
+    input_pos: torch.Tensor,
+    compress_ratio: int,
+    head_dim: int,
+    rope_head_dim: int,
+    rms_norm_eps: float,
+    rotate: bool = False,
+) -> None:
+    """Capture-safe B=1 decode compressor update with fixed-shape tensor work."""
+    overlap = compress_ratio == 4
+    used_slots = (2 if overlap else 1) * compress_ratio
+    slot = slot_idx[:1].to(torch.long)
+    pos = input_pos[:1].to(torch.long)
+    pos_mod = torch.remainder(pos, compress_ratio)
+
+    kv = F.linear(hidden_states, wkv).float()  # [1, 1, coff*head_dim]
+    score = F.linear(hidden_states, wgate).float()
+    score = score + ape.index_select(0, pos_mod).view(1, 1, -1)
+
+    state_idx = pos_mod + (compress_ratio if overlap else 0)
+    kv_state.index_put_((slot, state_idx), kv.view(1, -1), accumulate=False)
+    score_state.index_put_((slot, state_idx), score.view(1, -1), accumulate=False)
+
+    kv_slot = kv_state.index_select(0, slot)[:, :used_slots, :]
+    score_slot = score_state.index_select(0, slot)[:, :used_slots, :]
+    if overlap:
+        kv_full = torch.cat(
+            [
+                kv_slot[:, :compress_ratio, :head_dim],
+                kv_slot[:, compress_ratio:used_slots, head_dim:],
+            ],
+            dim=1,
+        )
+        score_full = torch.cat(
+            [
+                score_slot[:, :compress_ratio, :head_dim],
+                score_slot[:, compress_ratio:used_slots, head_dim:],
+            ],
+            dim=1,
+        )
+    else:
+        kv_full = kv_slot
+        score_full = score_slot
+
+    compressed = (kv_full * score_full.softmax(dim=1)).sum(dim=1)
+    compressed = compressed.view(1, 1, head_dim).to(hidden_states.dtype)
+    compressed = torch.ops.auto_deploy.torch_rmsnorm(compressed, norm_weight, rms_norm_eps).to(
+        hidden_states.dtype
+    )
+    nope, pe = torch.split(compressed, [head_dim - rope_head_dim, rope_head_dim], dim=-1)
+    anchor_pos = torch.clamp(pos + 1 - compress_ratio, min=0, max=cos_anchor_table.shape[0] - 1)
+    cos_anchor = cos_anchor_table.index_select(0, anchor_pos).view(1, 1, -1)
+    sin_anchor = sin_anchor_table.index_select(0, anchor_pos).view(1, 1, -1)
+    pe = _apply_interleaved_rope(pe, cos_anchor, sin_anchor)
+    compressed = torch.cat([nope, pe], dim=-1)
+    if rotate:
+        compressed = _fake_fp4_act_quant(_hadamard_rotate(compressed), block_size=32)
+    else:
+        nope, pe = torch.split(compressed, [head_dim - rope_head_dim, rope_head_dim], dim=-1)
+        nope = _fake_fp8_act_quant(nope, block_size=64)
+        compressed = torch.cat([nope, pe], dim=-1)
+
+    should_compress = torch.eq(torch.remainder(pos + 1, compress_ratio), 0).view(1, 1, 1)
+    write_idx = torch.div(pos, compress_ratio, rounding_mode="floor")
+    write_idx = torch.clamp(write_idx, min=0, max=compressed_kv_cache.shape[1] - 1)
+    existing_compressed = (
+        compressed_kv_cache.index_select(0, slot).squeeze(0).index_select(0, write_idx)
+    )
+    compressed_to_store = torch.where(
+        should_compress.view(1, 1), compressed.view(1, head_dim), existing_compressed
+    )
+    compressed_kv_cache.index_put_((slot, write_idx), compressed_to_store, accumulate=False)
+
+    if overlap:
+        reset_kv = torch.zeros_like(kv_slot[:, compress_ratio:used_slots, :])
+        reset_score = torch.full_like(score_slot[:, compress_ratio:used_slots, :], -1.0e20)
+        kv_after_compress = torch.cat([kv_slot[:, compress_ratio:used_slots, :], reset_kv], dim=1)
+        score_after_compress = torch.cat(
+            [score_slot[:, compress_ratio:used_slots, :], reset_score], dim=1
+        )
+    else:
+        kv_after_compress = torch.zeros_like(kv_slot)
+        score_after_compress = torch.full_like(score_slot, -1.0e20)
+
+    kv_state.index_copy_(0, slot, torch.where(should_compress, kv_after_compress, kv_slot))
+    score_state.index_copy_(0, slot, torch.where(should_compress, score_after_compress, score_slot))
+
+
+def _decode_indexer_step_static_cuda(
+    q_lora: torch.Tensor,
+    cos_last: torch.Tensor,
+    sin_last: torch.Tensor,
+    wq_b: torch.Tensor,
+    weights_proj: torch.Tensor,
+    indexer_compressed_kv_cache: torch.Tensor,
+    slot_idx: torch.Tensor,
+    input_pos: torch.Tensor,
+    hidden_states: torch.Tensor,
+    compress_ratio: int,
+    index_n_heads: int,
+    index_head_dim: int,
+    rope_head_dim: int,
+    index_topk: int,
+    offset: int,
+) -> torch.Tensor:
+    """Capture-safe B=1 indexer top-k with a static output width."""
+    if index_topk == 0:
+        return torch.empty(1, 1, 0, device=hidden_states.device, dtype=torch.int64)
+
+    slot = slot_idx[:1].to(torch.long)
+    pos = input_pos[:1].to(torch.long)
+    max_compressed = indexer_compressed_kv_cache.shape[1]
+    softmax_scale = index_head_dim**-0.5
+
+    q = F.linear(q_lora, wq_b).view(1, 1, index_n_heads, index_head_dim)
+    q_nope, q_pe = torch.split(q, [index_head_dim - rope_head_dim, rope_head_dim], dim=-1)
+    q_pe = _apply_interleaved_rope(q_pe, cos_last.unsqueeze(2), sin_last.unsqueeze(2))
+    q = torch.cat([q_nope, q_pe], dim=-1)
+    q = _fake_fp4_act_quant(_hadamard_rotate(q), block_size=32)
+
+    weights = F.linear(hidden_states, weights_proj).float() * (softmax_scale * index_n_heads**-0.5)
+    index_k = indexer_compressed_kv_cache.index_select(0, slot)
+    num_compressed = torch.div(pos + 1, compress_ratio, rounding_mode="floor")
+    num_compressed = torch.clamp(num_compressed, min=0, max=max_compressed)
+    compressed_positions = torch.arange(
+        max_compressed, device=hidden_states.device, dtype=torch.long
+    )
+    invalid = compressed_positions.view(1, 1, -1) >= num_compressed.view(1, 1, 1)
+    index_k = torch.where(~invalid.transpose(1, 2), index_k, torch.zeros_like(index_k))
+    index_score = torch.einsum("bshd,btd->bsht", q, index_k).float()
+    index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
+    index_score = index_score.masked_fill(invalid, -1.0e20)
+
+    k = min(index_topk, max_compressed)
+    topk = index_score.topk(k, dim=-1).indices
+    topk = torch.where(topk >= num_compressed.view(1, 1, 1), -1, topk + offset)
+    if k < index_topk:
+        pad = torch.full((1, 1, index_topk - k), -1, device=hidden_states.device, dtype=topk.dtype)
+        topk = torch.cat([topk, pad], dim=-1)
+    return topk.to(torch.int64)
+
+
+def _decode_sparse_attn_step_static_cuda(
+    q: torch.Tensor,
+    kv_new: torch.Tensor,
+    attn_sink: torch.Tensor,
+    window_cache: torch.Tensor,
+    compressed_kv_cache: torch.Tensor,
+    compress_topk: Optional[torch.Tensor],
+    slot_idx: torch.Tensor,
+    input_pos: torch.Tensor,
+    window_size: int,
+    compress_ratio: int,
+    scale: float,
+    head_dim: int,
+) -> torch.Tensor:
+    """Capture-safe B=1 sparse decode attention over fixed masked candidate sets."""
+    slot = slot_idx[:1].to(torch.long)
+    pos = input_pos[:1].to(torch.long)
+    window_pos = torch.remainder(pos, window_size)
+    window_cache.index_put_(
+        (slot, window_pos), kv_new.squeeze(0).squeeze(0).squeeze(0).view(1, head_dim)
+    )
+
+    window_offsets = torch.arange(window_size, device=q.device, dtype=torch.long)
+    visible_window = torch.clamp(pos + 1, min=0, max=window_size)
+    first_window_pos = pos + 1 - visible_window
+    window_indices = torch.remainder(window_offsets + first_window_pos, window_size)
+    window_slot = window_cache.index_select(0, slot).squeeze(0)
+    gathered_window = window_slot.index_select(0, window_indices)
+    window_valid = window_offsets < visible_window
+    gathered_window = torch.where(
+        window_valid.view(-1, 1), gathered_window, torch.zeros_like(gathered_window)
+    )
+
+    compressed_slot = compressed_kv_cache.index_select(0, slot).squeeze(0)
+    max_compressed = compressed_kv_cache.shape[1]
+    if compress_topk is not None:
+        topk = compress_topk.view(-1)
+        compressed_indices = torch.clamp(topk - window_size, min=0, max=max_compressed - 1)
+        gathered_compressed = compressed_slot.index_select(0, compressed_indices)
+        compressed_valid = topk >= window_size
+    else:
+        compressed_offsets = torch.arange(max_compressed, device=q.device, dtype=torch.long)
+        num_compressed = torch.div(pos + 1, compress_ratio, rounding_mode="floor")
+        num_compressed = torch.clamp(num_compressed, min=0, max=max_compressed)
+        gathered_compressed = compressed_slot
+        compressed_valid = compressed_offsets < num_compressed
+    gathered_compressed = torch.where(
+        compressed_valid.view(-1, 1),
+        gathered_compressed,
+        torch.zeros_like(gathered_compressed),
+    )
+
+    kv_all = torch.cat([gathered_window, gathered_compressed], dim=0)
+    valid = torch.cat([window_valid, compressed_valid], dim=0)
+    q_heads = q.squeeze(0).squeeze(0).float()
+    kv_float = kv_all.float()
+    scores = torch.matmul(q_heads, kv_float.transpose(0, 1)) * scale
+    scores = scores.masked_fill(~valid.view(1, -1), -10000.0)
+
+    sink_logits = attn_sink.float().view(-1, 1)
+    logits_max = torch.maximum(scores.max(dim=-1, keepdim=True).values, sink_logits)
+    exp_scores = torch.exp(scores - logits_max)
+    exp_sinks = torch.exp(sink_logits - logits_max)
+    attn = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sinks)
+    out = torch.matmul(attn, kv_float)
+    return out.view(1, 1, q.shape[2], head_dim).to(q.dtype)
+
+
+def _decode_sparse_attn_cuda_graph_step(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    hidden_states: torch.Tensor,
+    q_lora: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    cos_anchor: torch.Tensor,
+    sin_anchor: torch.Tensor,
+    attn_sink: torch.Tensor,
+    compressor_wkv: torch.Tensor,
+    compressor_wgate: torch.Tensor,
+    compressor_ape: torch.Tensor,
+    compressor_norm_weight: torch.Tensor,
+    indexer_wq_b: Optional[torch.Tensor],
+    indexer_weights_proj: Optional[torch.Tensor],
+    indexer_compressor_wkv: Optional[torch.Tensor],
+    indexer_compressor_wgate: Optional[torch.Tensor],
+    indexer_compressor_ape: Optional[torch.Tensor],
+    indexer_compressor_norm_weight: Optional[torch.Tensor],
+    input_pos: torch.Tensor,
+    slot_idx: torch.Tensor,
+    window_cache: torch.Tensor,
+    compressed_kv_cache: torch.Tensor,
+    compressor_kv_state: torch.Tensor,
+    compressor_score_state: torch.Tensor,
+    indexer_compressed_kv_cache: torch.Tensor,
+    indexer_kv_state: torch.Tensor,
+    indexer_score_state: torch.Tensor,
+    scale: float,
+    window_size: int,
+    compress_ratio: int,
+    rope_head_dim: int,
+    head_dim: int,
+    index_n_heads: int,
+    index_head_dim: int,
+    index_topk: int,
+    rms_norm_eps: float,
+) -> torch.Tensor:
+    """B=1 CUDA decode path that avoids host sync and dynamic-shape tensors."""
+    _decode_compressor_step_static_cuda(
+        hidden_states,
+        cos_anchor,
+        sin_anchor,
+        compressor_kv_state,
+        compressor_score_state,
+        compressed_kv_cache,
+        compressor_wkv,
+        compressor_wgate,
+        compressor_ape,
+        compressor_norm_weight,
+        slot_idx,
+        input_pos,
+        compress_ratio,
+        head_dim,
+        rope_head_dim,
+        rms_norm_eps,
+    )
+
+    compress_topk = None
+    if indexer_wq_b is not None:
+        _decode_compressor_step_static_cuda(
+            hidden_states,
+            cos_anchor,
+            sin_anchor,
+            indexer_kv_state,
+            indexer_score_state,
+            indexer_compressed_kv_cache,
+            indexer_compressor_wkv,
+            indexer_compressor_wgate,
+            indexer_compressor_ape,
+            indexer_compressor_norm_weight,
+            slot_idx,
+            input_pos,
+            compress_ratio,
+            index_head_dim,
+            rope_head_dim,
+            rms_norm_eps,
+            rotate=True,
+        )
+        compress_topk = _decode_indexer_step_static_cuda(
+            q_lora,
+            cos,
+            sin,
+            indexer_wq_b,
+            indexer_weights_proj,
+            indexer_compressed_kv_cache,
+            slot_idx,
+            input_pos,
+            hidden_states,
+            compress_ratio,
+            index_n_heads,
+            index_head_dim,
+            rope_head_dim,
+            index_topk,
+            offset=window_size,
+        )
+
+    return _decode_sparse_attn_step_static_cuda(
+        q,
+        kv,
+        attn_sink,
+        window_cache,
+        compressed_kv_cache,
+        compress_topk,
+        slot_idx,
+        input_pos,
+        window_size,
+        compress_ratio,
+        scale,
+        head_dim,
+    )
+
+
 _CACHE_NAMES = (
     "window_cache",
     "compressed_kv_cache",
@@ -1145,6 +1486,46 @@ def torch_deepseek_v4_sparse_attn_with_cache(
     # Supports bsz >= 1: each batch element is processed independently using its
     # own slot_idx[b] and input_pos[b].  Results are stacked along dim 0.
     if bsz == 1:
+        if q.is_cuda:
+            return _decode_sparse_attn_cuda_graph_step(
+                q,
+                kv,
+                hidden_states,
+                q_lora,
+                cos,
+                sin,
+                cos_anchor,
+                sin_anchor,
+                attn_sink,
+                compressor_wkv,
+                compressor_wgate,
+                compressor_ape,
+                compressor_norm_weight,
+                indexer_wq_b,
+                indexer_weights_proj,
+                indexer_compressor_wkv,
+                indexer_compressor_wgate,
+                indexer_compressor_ape,
+                indexer_compressor_norm_weight,
+                input_pos,
+                slot_idx,
+                window_cache,
+                compressed_kv_cache,
+                compressor_kv_state,
+                compressor_score_state,
+                indexer_compressed_kv_cache,
+                indexer_kv_state,
+                indexer_score_state,
+                scale,
+                window_size,
+                compress_ratio,
+                rope_head_dim,
+                head_dim,
+                index_n_heads,
+                index_head_dim,
+                index_topk,
+                rms_norm_eps,
+            )
         slot = int(slot_idx[0].item())
         pos = int(input_pos[0].item())
         # Compressor rolling update (may or may not produce a new compressed token).
