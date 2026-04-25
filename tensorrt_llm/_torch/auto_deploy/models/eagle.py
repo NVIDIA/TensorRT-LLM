@@ -32,7 +32,8 @@ from torch._prims_common import DeviceLikeType
 from torch.export import Dim
 from torch.fx import GraphModule
 
-from ....llmapi.llm_args import MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
 from ..utils.logger import ad_logger
 from .custom.modeling_eagle import (
     EagleConfig,

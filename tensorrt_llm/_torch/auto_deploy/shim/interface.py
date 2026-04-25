@@ -10,14 +10,13 @@ from .._compat import TRTLLM_AVAILABLE, KvCacheConfig
 
 if TRTLLM_AVAILABLE:
     import tensorrt_llm.bindings
-    from tensorrt_llm.mapping import Mapping
-
-    from ...._utils import torch_dtype_to_binding
-    from ...pyexecutor.mamba_cache_manager import (
+    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
         MambaHybridCacheManager,
         MixedMambaHybridCacheManager,
     )
-    from ...pyexecutor.resource_manager import KVCacheManager
+    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+    from tensorrt_llm._utils import torch_dtype_to_binding
+    from tensorrt_llm.mapping import Mapping
 
     CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
     DataType = tensorrt_llm.bindings.DataType
@@ -27,6 +26,7 @@ else:
     # but initialize_resources() and other cache-manager methods will raise.
     KVCacheManager = None
     MambaHybridCacheManager = None
+    MixedMambaHybridCacheManager = None
     CacheTypeCpp = None
     DataType = None
     Mapping = None
