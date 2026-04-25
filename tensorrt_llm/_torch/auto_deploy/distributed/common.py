@@ -10,8 +10,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tensorrt_llm._utils import get_free_port
-
+from .._compat import get_free_port
 from ..utils.logger import ad_logger
 
 # TODO: check to what extend we can reuse _torch/distributed.py

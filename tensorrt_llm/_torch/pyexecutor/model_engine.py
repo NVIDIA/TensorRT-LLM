@@ -770,9 +770,11 @@ class PyTorchModelEngine(ModelEngine):
         # is decode-only and runs into issues with autotuner warmup.
         if not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
-        self._run_cuda_graph_warmup(resource_manager)
+        with self.cuda_graph_runner.allow_capture():
+            self._run_cuda_graph_warmup(resource_manager)
         if can_run_general_warmup:
-            # Pre-populate the memory pool with max-shape allocations to reduce fragmentation at runtime.
+            # Pre-populate the memory pool with max-shape allocations to reduce
+            # fragmentation at runtime.
             warmup_requests_configs = self._get_max_shape_warmup_requests(
                 resource_manager)
             self._general_warmup(resource_manager, warmup_requests_configs)
@@ -784,6 +786,14 @@ class PyTorchModelEngine(ModelEngine):
 
         Serves both torch.compile graph specialization and memory pool pre-population.
         """
+        # Disable CUDA graph replay during general warmup to avoid replaying
+        # graphs with stale KV cache block offsets from capture time.
+        with self.no_cuda_graph():
+            self._general_warmup_impl(resource_manager, warmup_requests_configs)
+
+    def _general_warmup_impl(
+            self, resource_manager: ResourceManager,
+            warmup_requests_configs: List[Tuple[int, int]]) -> None:
 
         for num_tokens, num_gen_tokens in warmup_requests_configs:
             # Helix CP does not support warmup with context requests.
@@ -1211,6 +1221,8 @@ class PyTorchModelEngine(ModelEngine):
             if gen_requests is None:
                 for r in ctx_requests:
                     kv_cache_manager.free_resources(r)
+                    if draft_kv_cache_manager is not None:
+                        draft_kv_cache_manager.free_resources(r)
                 return None
 
             if spec_resource_manager is not None:
@@ -1305,6 +1317,8 @@ class PyTorchModelEngine(ModelEngine):
         if max_seq_len_request is None:
             for r in requests:
                 kv_cache_manager.free_resources(r)
+                if draft_kv_cache_manager is not None:
+                    draft_kv_cache_manager.free_resources(r)
             return None
         else:
             max_seq_len_request = max_seq_len_request[0]

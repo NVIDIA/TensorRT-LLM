@@ -1611,12 +1611,12 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@skip_pre_hopper
 class TestQwen3_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-8B"
     MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8"
 
     @pytest.mark.skip_less_device(2)
-    @skip_no_hopper
     def test_nixl_backend(self):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
@@ -1647,7 +1647,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
-    @skip_pre_hopper
     @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     @pytest.mark.parametrize("enable_partial_reuse", [True, False])
@@ -1733,7 +1732,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
 
-    @skip_pre_hopper
     @pytest.mark.skip_less_device(2)
     def test_chunked_prefill(self):
         self._test_chunked_prefill_helper(ctx_pp=1)
