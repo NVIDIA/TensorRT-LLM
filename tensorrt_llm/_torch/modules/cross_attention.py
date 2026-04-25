@@ -24,6 +24,8 @@ from typing import Optional
 import torch
 from torch import nn
 
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
+
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import AttentionBackend, PredefinedAttentionMask
 from ..attention_backend.utils import create_attention
@@ -41,9 +43,27 @@ class CrossAttention(nn.Module):
     subsequent generation steps, K/V are read from the cache without
     re-projection.
 
-    The cross-attention backend is initialized with the ``VANILLA`` backend
-    by default since the ``TRTLLM`` backend does not yet support cross-attention.
-    Step 3 of the porting plan will wire a cross-capable backend.
+    The cross-attention sub-layer is currently initialized with the
+    ``VANILLA`` backend regardless of ``ModelConfig.attn_backend``. Per the
+    encoder-decoder porting guide (Step 5), enabling the production ``TRTLLM``
+    backend for cross-attention has two unblock surfaces:
+
+    * **5α (Blackwell, Python only)**: drop the top-level
+      ``assert not metadata.is_cross`` in ``trtllm.py``, plumb
+      ``metadata.is_cross`` into the ``trtllm_gen.is_supported`` call site,
+      remove the ``cross_attention`` early-out in ``trtllm_gen.is_supported``,
+      and thread cross-pool block tables / ``encoder_seq_lens`` into the
+      already-named ``cross_kv_input`` / ``encoder_seq_lens`` /
+      ``cross_attention`` slots of ``torch.ops.trtllm.qkv_preprocessing``.
+    * **5β (all archs)**: also extend ``cpp/tensorrt_llm/thop/attentionOp.cpp``
+      and the nanobind ``m.def("attention", ...)`` to forward
+      ``encoder_input_lengths`` / ``cross_kv`` / ``cross_attention`` into
+      ``EnqueueContextParams``, so the legacy compute path covers Hopper /
+      Ampere.
+
+    Encoder and decoder *self*-attention can already use any backend
+    configured on ``ModelConfig``; only the cross-attention sub-layer is
+    pinned to ``VANILLA`` until 5α / 5β land.
     """
 
     def __init__(
@@ -134,9 +154,18 @@ class CrossAttention(nn.Module):
             reduce_output=True,
         )
 
-        # Stage-1: use VANILLA backend for cross-attention.
-        # Step 3 of the porting plan will enable the TRTLLM backend for cross.
+        # Cross-attention backend selection. Step 5α enables ``TRTLLM`` on
+        # Blackwell (SM100/SM103) via the ``trtllm_gen`` sub-path. Step 5β
+        # (extends the legacy ``thop.attention`` C++ wrapper + nanobind
+        # binding to forward ``encoder_input_lengths`` / ``cross_kv`` /
+        # ``cross_attention``) is required for Hopper / Ampere; until then,
+        # cross-attention on those archs falls back to ``VANILLA``. See the
+        # Step 5 entry of ``encoder_decoder_porting_guide.md`` for details.
+        # Encoder / decoder self-attention is unaffected and continues to use
+        # ``ModelConfig.attn_backend``.
         attn_backend = "VANILLA"
+        if config.attn_backend == "TRTLLM" and is_sm_100f(get_sm_version()):
+            attn_backend = "TRTLLM"
         self.attn: AttentionBackend = create_attention(
             attn_backend,
             layer_idx,
@@ -154,6 +183,32 @@ class CrossAttention(nn.Module):
         self.k_proj.create_weights()
         self.v_proj.create_weights()
         self.o_proj.create_weights()
+
+    @staticmethod
+    def _infer_encoder_seq_lens(
+        encoder_hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        """Infer per-request encoder lengths from ``encoder_hidden_states``.
+
+        Used as a fallback when ``cross_attn_metadata`` is not provided.
+        Only single-request batches are unambiguous; multi-request batches
+        require the caller to supply ``cross_attn_metadata`` with explicit
+        ``seq_lens_kv``.
+        """
+        num_encoder_tokens = encoder_hidden_states.shape[0]
+        num_requests = int(attn_metadata.seq_lens.numel())
+        if num_requests == 1:
+            return torch.tensor([num_encoder_tokens], dtype=torch.int32)
+        if num_encoder_tokens % num_requests != 0:
+            raise ValueError(
+                "Cannot infer encoder_seq_lens from encoder_hidden_states for "
+                f"a multi-request batch (num_requests={num_requests}, "
+                f"num_encoder_tokens={num_encoder_tokens}). "
+                "Pass an explicit cross_attn_metadata with seq_lens_kv set."
+            )
+        per_request = num_encoder_tokens // num_requests
+        return torch.full((num_requests,), per_request, dtype=torch.int32)
 
     def forward(
         self,
@@ -173,19 +228,53 @@ class CrossAttention(nn.Module):
                 decoder context step (when ``skip_cross_kv_projection`` is
                 ``False``). ``None`` for generation steps.
             attn_metadata: Decoder-side attention metadata (Q-side lengths).
-            cross_attn_metadata: Cross-attention metadata carrying
-                ``encoder_seq_lens``, cross-KV block tables, etc. Falls back
-                to ``attn_metadata`` if ``None``.
+            cross_attn_metadata: Cross-attention metadata carrying encoder
+                K/V-side lengths, cross-pool block tables, etc. Must satisfy
+                ``cross_attn_metadata.is_cross is True`` (i.e. the K/V-side
+                ``seq_lens_kv`` differs from the Q-side ``seq_lens``). When
+                ``None``, the module auto-builds a stateless cross metadata
+                from ``attn_metadata`` and the inferred encoder lengths
+                (single-request batches only — see
+                :meth:`_infer_encoder_seq_lens`).
             skip_cross_kv_projection: When ``True``, K/V are read from the
-                cross-KV cache without re-projection (generation steps). When
-                ``False``, K/V are projected from ``encoder_hidden_states``
-                and written into the cache (first context step).
+                cross-KV cache without re-projection (decoder generation
+                steps). When ``False``, K/V are projected from
+                ``encoder_hidden_states`` and written into the cache (first
+                decoder context step).
             all_reduce_params: AllReduce parameters for TP output projection.
 
         Returns:
             Output tensor ``[num_tokens, hidden_size]``.
         """
-        metadata = cross_attn_metadata if cross_attn_metadata is not None else attn_metadata
+        # Resolve / build the cross-attention metadata. We require that the
+        # backend sees ``metadata.is_cross is True`` so that the no-KV-cache
+        # path uses the encoder-side cu_seqlens, and so that the with-KV-cache
+        # path uses the cross pool.
+        metadata = cross_attn_metadata
+        if metadata is None:
+            if skip_cross_kv_projection:
+                raise ValueError(
+                    "cross_attn_metadata is required when "
+                    "skip_cross_kv_projection=True: the module needs the "
+                    "cross-pool block tables and cached encoder lengths to "
+                    "read K/V from the cache."
+                )
+            assert encoder_hidden_states is not None, (
+                "encoder_hidden_states is required when cross-KV projection "
+                "is not skipped (first decoder context step)."
+            )
+            encoder_seq_lens = self._infer_encoder_seq_lens(encoder_hidden_states, attn_metadata)
+            metadata = attn_metadata.create_cross_metadata(
+                encoder_seq_lens=encoder_seq_lens,
+                cross_kv_cache_manager=None,
+            )
+        else:
+            assert metadata.is_cross, (
+                "cross_attn_metadata.is_cross must be True. Build it via "
+                "attn_metadata.create_cross_metadata(encoder_seq_lens, "
+                "cross_kv_cache_manager) so seq_lens_kv differs from "
+                "seq_lens."
+            )
 
         q = self.q_proj(hidden_states)
 
@@ -197,13 +286,15 @@ class CrossAttention(nn.Module):
             k = self.k_proj(encoder_hidden_states)
             v = self.v_proj(encoder_hidden_states)
         else:
-            # Step 3/5 of the porting plan will wire a cross-capable attention
-            # backend with KV cache support. Until then, the generation-step
-            # path (read cross-KV from cache, skip projection) is not usable.
-            raise NotImplementedError(
-                "skip_cross_kv_projection=True requires a cross-attention "
-                "backend with KV cache support (Step 3/5 of the porting plan)."
+            # Generation step: skip projection, K/V are already in the
+            # cross-KV cache (written during the first decoder context step).
+            # The backend reads them from ``metadata.kv_cache_manager``.
+            assert metadata.kv_cache_manager is not None, (
+                "skip_cross_kv_projection=True requires a populated "
+                "cross-KV cache manager on cross_attn_metadata."
             )
+            k = None
+            v = None
 
         num_tokens = attn_metadata.num_tokens
         q = q[:num_tokens, :]

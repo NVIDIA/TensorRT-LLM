@@ -161,10 +161,10 @@ class TrtllmGenSupportChecker:
             return False, "Sparse attention is not supported by trtllm-gen backend."
         if is_mla_enable and not is_fused_qkv:
             return False, "MLA context (separate Q/K/V) falls back to thop."
-        if not update_kv_cache:
+        # Cross-attention generation steps legitimately need
+        # update_kv_cache=False (encoder K/V are already cached).
+        if not update_kv_cache and not cross_attention:
             return False, "KV cache update cannot be disabled now."
-        if cross_attention:
-            return False, "Cross attention is not supported by trtllm-gen backend."
 
         has_fp4_kv = (
             quant_config.layer_quant_mode.has_fp4_kv_cache()
@@ -859,6 +859,13 @@ class EnqueueParams:
     q_scaling: float = 1.0
     latent_cache: Optional[torch.Tensor] = None
     num_layers: int = 0
+    # Cross-attention parameters (used when cross_attention=True)
+    # cross_kv_input: packed [num_encoder_tokens, 2 * num_kv_heads * head_size]
+    #   K and V projected from encoder hidden states (context phase only).
+    # encoder_seq_lens: per-request encoder lengths (int32 device tensor),
+    #   used by qkv_preprocessing to write encoder K/V into the cross-pool.
+    cross_kv_input: Optional[torch.Tensor] = None
+    encoder_seq_lens: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -1005,6 +1012,13 @@ class FlashInferTrtllmGenAttention:
             fp8_context_fmha=params.fp8_context_fmha,
         )
 
+        # Cross-attention: K/V live on the encoder side, so cu_kv_seqlens must
+        # be a prefix-sum of encoder_seq_lens (not decoder sequence_lengths) so
+        # FMHA reads the right K/V tokens. seq_q_lengths stays on the decoder
+        # Q side. encoder_padding_offsets stays None (remove_padding=True).
+        seq_kv_lengths_arg = (
+            params.encoder_seq_lens if params.cross_attention else params.sequence_lengths
+        )
         torch.ops.trtllm.build_decoder_info(
             seq_q_offsets=ctx_ws.cu_q_seqlens,
             seq_kv_offsets=ctx_ws.cu_kv_seqlens,
@@ -1015,7 +1029,7 @@ class FlashInferTrtllmGenAttention:
             seq_cp_partial_offsets=None,
             attention_mask=None,
             seq_q_lengths=params.context_lengths,
-            seq_kv_lengths=params.sequence_lengths,
+            seq_kv_lengths=seq_kv_lengths_arg,
             fmha_tile_counter=ctx_ws.fmha_tile_counter,
             dequant_scale_qkv=params.kv_scale_quant_orig,
             quant_scale_o=params.attention_output_orig_quant,
@@ -1043,9 +1057,19 @@ class FlashInferTrtllmGenAttention:
 
         separate_q_kv_output = params.paged_context_fmha or params.cross_attention
 
+        # Cross-attention context phase: K/V come from cross_kv_input
+        # (projected encoder hidden states), and `cache_seq_lens` must equal
+        # the decoder Q-side lengths so the kernel's `store_encoder_kv_cache`
+        # gate (decoder_seq_len == decoder_cache_seq_len) opens. 5α does not
+        # support chunked cross-attention context.
+        if params.cross_attention:
+            cache_seq_lens_arg = params.context_lengths
+        else:
+            cache_seq_lens_arg = params.sequence_lengths
+
         ctx_qkv_args = dict(
             qkv_input=params.qkv_input,
-            cross_kv_input=None,
+            cross_kv_input=params.cross_kv_input,
             quantized_qkv_output=None,
             q_output=ctx_ws.q_buf,
             kv_cache_block_offsets=params.kv_cache_block_offsets,
@@ -1061,8 +1085,8 @@ class FlashInferTrtllmGenAttention:
             logn_scaling=None,
             tokens_info=ctx_ws.tokens_info,
             seq_lens=params.context_lengths,
-            cache_seq_lens=params.sequence_lengths,
-            encoder_seq_lens=None,
+            cache_seq_lens=cache_seq_lens_arg,
+            encoder_seq_lens=params.encoder_seq_lens,
             cu_seq_lens=ctx_ws.cu_q_seqlens,
             cu_kv_seq_lens=ctx_ws.cu_kv_seqlens,
             sparse_kv_offsets=None,
@@ -1249,7 +1273,7 @@ class FlashInferTrtllmGenAttention:
             tokens_info=(gen_ws.tokens_info if is_multi_token_gen else None),
             seq_lens=(params.spec_decoding_generation_lengths if is_multi_token_gen else None),
             cache_seq_lens=params.sequence_lengths,
-            encoder_seq_lens=None,
+            encoder_seq_lens=params.encoder_seq_lens,
             cu_seq_lens=cu_seqlens,
             cu_kv_seq_lens=cu_kv_seqlens,
             sparse_kv_offsets=None,
@@ -1622,6 +1646,8 @@ def trtllm_gen_attention(
     num_contexts: int,
     num_ctx_tokens: int,
     global_layer_idx: Optional[int] = None,
+    is_cross: bool = False,
+    encoder_seq_lens: Optional[torch.Tensor] = None,
 ) -> None:
     """
     TrtLLM-Gen attention using flashinfer backend.
@@ -1843,7 +1869,7 @@ def trtllm_gen_attention(
         or is_fp4_out
         or (kv_cache_quant_mode.has_fp8_kv_cache() and use_paged_context_fmha),
         remove_padding=True,
-        cross_attention=False,
+        cross_attention=is_cross,
         position_shift_enabled=False,
         paged_context_fmha=use_paged_context_fmha,
         attention_sinks=attention_sinks,
@@ -1857,7 +1883,19 @@ def trtllm_gen_attention(
         num_layers=host_kv_cache_pool_mapping.size(0)
         if host_kv_cache_pool_mapping is not None
         else 0,
+        encoder_seq_lens=encoder_seq_lens,
     )
+
+    # Cross-attention: pack K, V (encoder hidden states) into cross_kv_input
+    # with layout [num_encoder_tokens, 2 * num_kv_heads * head_size] (K then V
+    # along dim 1), matching the C++ qkv_preprocessing expectation. Used only
+    # by the context phase; generation reads K/V from the cross-KV pool.
+    cross_kv_input = None
+    if is_cross and k is not None and v is not None:
+        kv_hidden_size = num_kv_heads * head_size
+        k_flat = k.contiguous().view(-1, kv_hidden_size)
+        v_flat = v.contiguous().view(-1, kv_hidden_size)
+        cross_kv_input = torch.cat([k_flat, v_flat], dim=1).contiguous()
 
     # Context Phase
     if num_contexts > 0 and attn_input_type != AttentionInputType.generation_only:
@@ -1881,6 +1919,7 @@ def trtllm_gen_attention(
             input_seq_length=max_context_q_len,
             batch_size=num_seqs,
             mrope_rotary_cos_sin=mrope_rotary_cos_sin,
+            cross_kv_input=cross_kv_input,
         )
         backend.run_context(ctx_params)
 
