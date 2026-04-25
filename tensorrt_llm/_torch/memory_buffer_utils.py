@@ -35,6 +35,33 @@ class Buffers:
     def __init__(self):
         self.buffers: dict[str, list[BufferBlock]] = {}
 
+    def bytes_by_name(self) -> dict[str, int]:
+        bytes_by_name = {}
+        for name, blocks in self.buffers.items():
+            total = 0
+            for block in blocks:
+                buffer = getattr(block, "buffer", None)
+                if buffer is not None:
+                    total += int(buffer.numel()) * int(buffer.element_size())
+            if total:
+                bytes_by_name[name] = total
+        return bytes_by_name
+
+    def clear(self) -> tuple[int, int]:
+        released_bytes = 0
+        released_buffers = 0
+        for blocks in self.buffers.values():
+            for block in blocks:
+                buffer = getattr(block, "buffer", None)
+                if buffer is None:
+                    continue
+                released_bytes += int(buffer.numel()) * int(
+                    buffer.element_size())
+                released_buffers += 1
+                del block.buffer
+        self.buffers.clear()
+        return released_buffers, released_bytes
+
     @staticmethod
     def _view_as(buffer: torch.Tensor, target_shape: list[int],
                  target_dtype: torch.dtype) -> torch.Tensor:
