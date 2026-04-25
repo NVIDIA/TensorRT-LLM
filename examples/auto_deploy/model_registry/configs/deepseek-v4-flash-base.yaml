@@ -21,5 +21,4 @@ kv_cache_config:
   tokens_per_block: 64
 model_kwargs:
   torch_dtype: bfloat16
-  num_hidden_layers: 5
   compress_ratios: [0, 0, 4, 128, 4]
