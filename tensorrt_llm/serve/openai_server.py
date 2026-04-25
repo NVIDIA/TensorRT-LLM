@@ -882,9 +882,9 @@ class OpenAIServer:
     async def get_kv_cache_events(self) -> JSONResponse:
         events = []
         try:
-            async for event in self.generator.get_kv_cache_events_async(2):
+            async for event in self.generator.get_kv_cache_events_async(0):
                 events.append(event)
-        except IndexError:
+        except (IndexError, asyncio.QueueEmpty):
             # queue is empty, no more events
             pass
         return JSONResponse(content=events)
