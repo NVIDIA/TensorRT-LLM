@@ -53,8 +53,16 @@ TRTLLM_REQUIREMENTS = os.path.join(REPO_ROOT, "requirements.txt")
 TRTLLM_DEV_REQUIREMENTS = os.path.join(REPO_ROOT, "requirements-dev.txt")
 TRTLLM_LICENSE = os.path.join(REPO_ROOT, "LICENSE")
 TRTLLM_GITIGNORE = os.path.join(REPO_ROOT, ".gitignore")
+TRTLLM_EDITORCONFIG = os.path.join(REPO_ROOT, ".editorconfig")
+TRTLLM_CODE_OF_CONDUCT = os.path.join(REPO_ROOT, "CODE_OF_CONDUCT.md")
+TRTLLM_SECURITY = os.path.join(REPO_ROOT, "SECURITY.md")
+TRTLLM_ATTRIBUTIONS_PYTHON = os.path.join(REPO_ROOT, "ATTRIBUTIONS-Python.md")
 LLMC_README = os.path.join(SCRIPT_DIR, "README.md")
 LLMC_CONTRIBUTING = os.path.join(SCRIPT_DIR, "CONTRIBUTING.md")
+# Source-of-truth for the standalone repo's .github/ tree (issue/PR templates).
+# Stored under a non-".github" name so it does not interfere with TRT-LLM's own
+# .github/. Copied to ".github/" in the standalone output.
+LLMC_GITHUB_DIR = os.path.join(SCRIPT_DIR, ".github_for_llmc")
 
 # Test source directories
 AD_TESTS_DIR = os.path.join(REPO_ROOT, "tests", "unittest", "auto_deploy")
@@ -177,6 +185,11 @@ _MANAGED_PATHS = [
     "LICENSE",
     "CONTRIBUTING.md",
     ".gitignore",
+    ".editorconfig",
+    "CODE_OF_CONDUCT.md",
+    "SECURITY.md",
+    "ATTRIBUTIONS-Python.md",
+    ".github",
 ]
 
 
@@ -518,6 +531,27 @@ def create_standalone_package(output_dir: str) -> None:
     if os.path.exists(TRTLLM_GITIGNORE):
         shutil.copy2(TRTLLM_GITIGNORE, os.path.join(output_dir, ".gitignore"))
         print("  Copied .gitignore")
+
+    # 8. Copy .editorconfig
+    if os.path.exists(TRTLLM_EDITORCONFIG):
+        shutil.copy2(TRTLLM_EDITORCONFIG, os.path.join(output_dir, ".editorconfig"))
+        print("  Copied .editorconfig")
+
+    # 9. Copy OSS compliance files (CODE_OF_CONDUCT, SECURITY, ATTRIBUTIONS-Python)
+    for src, name in (
+        (TRTLLM_CODE_OF_CONDUCT, "CODE_OF_CONDUCT.md"),
+        (TRTLLM_SECURITY, "SECURITY.md"),
+        (TRTLLM_ATTRIBUTIONS_PYTHON, "ATTRIBUTIONS-Python.md"),
+    ):
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(output_dir, name))
+            print(f"  Copied {name}")
+
+    # 10. Copy .github/ tree (issue/PR templates) from .github_for_llmc/
+    if os.path.isdir(LLMC_GITHUB_DIR):
+        github_dst = os.path.join(output_dir, ".github")
+        github_count = _copy_tree(LLMC_GITHUB_DIR, github_dst)
+        print(f"  Copied {github_count} .github/ files")
 
     print(f"\nStandalone package created at: {output_dir}")
     print("\nTo install:")
