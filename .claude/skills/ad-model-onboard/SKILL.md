@@ -105,7 +105,7 @@ Available canonical ops (see `tensorrt_llm/_torch/auto_deploy/custom_ops/README.
 The custom model's forward signature must follow these rules:
 
 1. **Always `input_ids`** — The top-level model always receives `input_ids`. A submodule graph may internally receive `inputs_embeds` (e.g., after the embedding layer), but the exported entry point takes token IDs.
-2. **Always `position_ids`** — Vanilla sequential `position_ids` are always provided. **Assert `position_ids is not None`** at the top of the forward method — it is a required input, never optional. Do not include fallback logic to generate `position_ids` from `input_ids` (HF models often do this; strip it). If the model uses a non-standard RoPE variant or custom position encoding, the model must compute it internally on top of the provided vanilla `position_ids`.
+2. **Always `position_ids`** — Vanilla sequential `position_ids` are always provided. **Assert `position_ids is not None`** at the top of the forward method — it is a required input, never optional. Do not include fallback logic to generate `position_ids` from `input_ids` (HF models often do this; strip it). If the model uses a non-standard RoPE variant or custom position encoding, the model must compute it internally on top of the provided vanilla `position_ids`. **IR-port exception:** when porting an existing custom model to its `_ir.py` variant (see "Sharding-aware IR model porting" section), the input contract is dictated by the non-IR base — do NOT add asserts or remove fallbacks that change it (see Step 0 — IR delta contract, rule F2).
 3. **Multi-modal inputs** — If the model supports vision/audio/etc., those additional inputs are passed during prefill alongside `input_ids`.
 4. **No attention mask, no cache inputs, no HF-runtime features** — Do not accept `attention_mask`, `past_key_values`, `use_cache`, or similar HF-runtime arguments. AD manages masking and caching via its own transforms and runtime.
 
@@ -346,7 +346,38 @@ Use this when porting an existing AutoDeploy custom model (`tensorrt_llm/_torch/
 
 **Argument reference:** Do not duplicate operator tables here. Refer to the custom op docstrings in `tensorrt_llm/_torch/auto_deploy/custom_ops/` for the complete argument reference (including sharding hints, `tp_mode`, `layer_type`, and which ops accept hints).
 
+### Step 0 — IR delta contract (READ FIRST)
+
+An IR port is a **mechanical, structural transform** of `modeling_<name>.py`, NOT a rewrite. The non-IR file at the target branch HEAD is the AUTHORITATIVE source of model logic. Any existing `modeling_<name>_ir.py` is a reference for SHARDING-HINT PATTERNS ONLY (and may be stale wrt logic — older IR files were correct when written, but the non-IR sources have evolved since).
+
+You MAY introduce ONLY the following changes:
+
+**ALLOWED:**
+
+- **A1. Op substitutions:**
+  - `nn.Linear(...)` / `F.linear(...)` → `torch.ops.auto_deploy.torch_linear_simple(...)`
+  - `tensor.view(...)` / `tensor.reshape(...)` → `torch.ops.auto_deploy.view(...)` (only when the shape contains a TP-scaled dim)
+  - `torch.split(...)` / `torch.split_with_sizes(...)` → `torch.ops.auto_deploy.split_with_sizes(...)`
+- **A2. Sharding-hint kwargs added** to call sites of: `torch_moe`, `torch_ssm`, `torch_gated_delta_rule`, `torch_causal_conv1d`, `torch_rmsnorm_gated`, `torch_mla`, `torch_linear_simple`, `auto_deploy.split_with_sizes`, `auto_deploy.view`. Allowed kwargs: `tp_mode`, `layer_type`, `output_sizes`, `tp_min_local_shape`, `tp_scaled_dim`, `shardable`, `enable_sharding`.
+- **A3. Inserting `torch.ops.auto_deploy.all_reduce(..., layer_type=...)`** after rowwise projections / at MoE merge points (single all_reduce after routed + shared sums).
+- **A4. The registration block** at the bottom (`AutoModelForCausalLMFactory.register_custom_model_cls`) plus an `import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401` side-effect at the top.
+- **A5. The module docstring update** describing the sharding strategy.
+
+**FORBIDDEN (everything else, including but not limited to):**
+
+- **F1. Replacing ANY `torch.ops.trtllm.*` op with vanilla PyTorch** (e.g. `noaux_tc_op`, `dsv3_router_gemm_op`, fused norm/MLP kernels). The router gate is TP-replicated; there is nothing to shard. AD has no fusion pass that recovers these kernels from a vanilla rewrite — keep the call site verbatim.
+- **F2. Changing the input contract** of `forward()` — adding/removing/changing `assert` or `if` statements that change what the caller must pass (e.g. asserting `position_ids is not None` if the non-IR base silently fabricated it from `arange`). The IR port preserves the base's contract.
+- **F3. Adding/removing/renaming `nn.Module` subclasses, parameters, buffers**, or `register_load_state_dict_pre_hook` registrations. Module hierarchy and state_dict keys must remain identical to the base.
+- **F4. Changing dtype handling, scaling factors, normalization order, mask fill values** (e.g. `0.0` vs `-inf` in `masked_fill`), or any other numerical-semantics detail.
+- **F5. Renaming methods, changing return types, changing forward signatures**, or reordering operations.
+- **F6. "Cleanup" of allegedly unused code paths** from the non-IR base. If it is in the source file, it stays.
+- **F7. Adding code that does not appear in the non-IR base** "because the IR reference has it" — the IR reference may be stale or wrong.
+
+If a change is required that falls outside the allowlist, **STOP and report it to the parent** for explicit human approval BEFORE writing it. Never silently rewrite logic.
+
 ### Reference examples (study before porting)
+
+The non-IR `modeling_<name>.py` at the current branch HEAD is the AUTHORITATIVE SOURCE for model logic. The `modeling_<name>_ir.py` files below are REFERENCES for SHARDING-HINT PATTERNS ONLY — they may be stale wrt logic because the corresponding non-IR file has evolved since. **Never copy logic from the IR reference; copy logic only from the non-IR source.** Use the IR reference solely to see how `tp_mode`, `layer_type`, `output_sizes`, `tp_scaled_dim`, `shardable`, `all_reduce`, etc. were placed for similar layer types.
 
 | Original | IR / sharding-aware | Layer types |
 |----------|---------------------|-------------|
@@ -443,6 +474,44 @@ Do not report success until a run completes successfully.
 
 **Layer type strings** (for `layer_type` / `shard_layers`): use `"mha"`, `"mla"`, `"mlp"`, `"moe"`, `"ssm"`, `"delta"`, or `"unknown"` (default; skipped when `shard_layers` is set). Match the conventions used in `apply_sharding_hints` and project enums.
 
+#### Step 12 — Pre-finalization self-audit (MANDATORY)
+
+Before reporting the IR file as done, you MUST run:
+
+```bash
+diff -u tensorrt_llm/_torch/auto_deploy/models/custom/modeling_<name>.py \
+        tensorrt_llm/_torch/auto_deploy/models/custom/modeling_<name>_ir.py
+```
+
+Then classify every hunk into one of the following categories (defined in Step 0 — IR delta contract):
+
+| Category | Allowed? | Description |
+|---|---|---|
+| **A1** | yes | Op substitution (`linear` / `view` / `split`) |
+| **A2** | yes | Sharding-hint kwarg added (`tp_mode`, `layer_type`, `output_sizes`, `tp_min_local_shape`, `tp_scaled_dim`, `shardable`, `enable_sharding`) |
+| **A3** | yes | `auto_deploy.all_reduce` insertion |
+| **A4** | yes | Registration / `custom_ops` side-effect import |
+| **A5** | yes | Module docstring update describing sharding strategy |
+| **F1** | NO | `torch.ops.trtllm.*` replaced with vanilla PyTorch |
+| **F2** | NO | Input contract change (asserts, fallbacks added/removed) |
+| **F3** | NO | Module hierarchy / parameter / buffer / load-hook change |
+| **F4** | NO | Numerical-semantics change (dtype, scale, mask fill, order) |
+| **F5** | NO | Method rename / signature change / op reorder |
+| **F6** | NO | Removal of allegedly unused base code |
+| **F7** | NO | Code added because the IR reference had it (and the non-IR base did not) |
+
+**If you find any F# hunk, REVERT it to the non-IR source verbatim before reporting done.** Report the full diff classification table back to the parent agent in your final message, with one row per hunk:
+
+```
+| Hunk lines (in IR file) | Summary of change | Category | Verdict |
+|---|---|---|---|
+| 234-240                 | F.linear → torch_linear_simple, tp_mode="colwise" | A1 + A2 | OK |
+| 264-340                 | noaux_tc_op replaced with vanilla PyTorch         | F1      | REVERTED to base |
+| ...                     | ...                                               | ...     | ... |
+```
+
+You are NOT done until every row in the table is a yes-allowed category.
+
 ### Layer-specific sharding patterns
 
 **MHA (standard or gated):** `layer_type="mha"`: q/k/v colwise (GQA: `tp_min_local_shape`), `view` with `tp_scaled_dim` for head dim, o rowwise + `all_reduce`. Fused Q+gate interleaved per head: colwise without `output_sizes`; contiguous Q|K|V fused blocks need `output_sizes`.
@@ -486,6 +555,6 @@ Do not report success until a run completes successfully.
 - **Self-contained files only**: Never import from other AD custom models. Each `modeling_{name}.py` is a standalone translation from HF source.
 - **RoPE cos/sin: slice ONCE, not per layer.** `_ad_` prefix for RoPE buffers. `RotaryEmbedding.forward(x, position_ids)` MUST slice by `position_ids` once and return pre-sliced `(cos, sin)`. Pass those tensors to all layers. NEVER pass `position_ids` through to each layer/attention forward to re-index — that is redundant compute that bloats the exported graph. See Phase 2 for the full pattern.
 - MoE weights: use `nn.ModuleList` per-expert for checkpoint compatibility. Write test-only state_dict converters for HF stacked format.
-- `noaux_tc` routers (DeepSeek-V3 style): use vanilla PyTorch (sigmoid + bias + group topk + normalize + scale). AD transforms can replace with fused `trtllm` kernels at deployment time.
+- `noaux_tc` routers (DeepSeek-V3 style, e.g. DeepSeek-V3, NemotronH, GLM4-MoE-Lite, Kimi-K2): KEEP `torch.ops.trtllm.noaux_tc_op` and `torch.ops.trtllm.dsv3_router_gemm_op` exactly as written in the non-IR base. The router gate is TP-REPLICATED — no sharding hints apply. AD has no transform that recognizes a vanilla `sigmoid + bias + group-topk + normalize + scale` pattern; a vanilla replacement loses ~17x kernel-launch overhead and the FP8-friendly router GEMM with no recovery path. If the non-IR base uses a vanilla implementation (e.g. `modeling_kimi_k2.py`), copy it verbatim — do NOT introduce vanilla code that was not in the source.
 - Vision towers are typically **not** exported. Keep vision logic in eager PyTorch and export only the text path unless explicitly requested otherwise.
 - Model code and tests must run on CPU. Use only `torch_*` prefixed reference ops in AutoDeploy — never `triton_*`, `flashinfer_*`, or `trtllm_*`.
