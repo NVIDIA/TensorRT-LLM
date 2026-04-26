@@ -163,6 +163,31 @@ def low_memory_overrides(config,
     return config
 
 
+def reduced_model_kwargs(num_hidden_layers: int,
+                         model_path: str | None = None) -> dict:
+    """Return model_kwargs to cap a model at ``num_hidden_layers`` layers.
+
+    Reduces peak memory so large models fit on a single GPU for pre-merge
+    smoke testing. The rest of the architecture (attention, MoE, SSM) is
+    preserved; only the layer count is truncated.
+
+    For models whose config derives layer count from a list attribute (e.g.
+    ``layers_block_type`` in NemotronH), pass ``model_path`` so the list
+    is also truncated — otherwise the ``num_hidden_layers`` override has
+    no effect.
+    """
+    overrides = {"num_hidden_layers": num_hidden_layers}
+    if model_path is not None:
+        from transformers import AutoConfig
+        hf_config = AutoConfig.from_pretrained(model_path,
+                                               trust_remote_code=True)
+        for attr in ("layers_block_type", ):
+            val = getattr(hf_config, attr, None)
+            if val is not None:
+                overrides[attr] = val[:num_hidden_layers]
+    return {"model_kwargs": overrides}
+
+
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B"
     MODEL_PATH = hf_id_to_local_model_dir(MODEL_NAME)
@@ -621,6 +646,33 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
         print_memory_usage("after evaluation")
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(40000)
+    @pytest.mark.parametrize("dtype", ["bf16", "fp8"])
+    def test_functional_small(self, dtype):
+        """Single-GPU smoke test using a layer-reduced model.
+
+        Overrides num_hidden_layers so the 120B model fits on one GPU,
+        enabling pre-merge coverage of the full kernel dispatch path
+        (attention, MoE, SSM) without requiring a multi-GPU machine.
+        No accuracy threshold is checked — the truncated model is not
+        expected to produce meaningful text.
+        """
+        model_path = self.MODEL_PATHS[dtype]
+        kwargs = {}
+        kwargs.update(
+            reduced_model_kwargs(num_hidden_layers=16, model_path=model_path))
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
+                           world_size=1,
+                           yaml_extra=[self.CONFIG_YAML],
+                           trust_remote_code=True,
+                           **kwargs) as llm:
+            outputs = llm.generate(
+                ["Hello, how are you?"],
+                sampling_params=SamplingParams(max_tokens=10))
+            assert len(outputs) == 1
 
     @pytest.mark.skip_less_device_memory(180000)
     @pytest.mark.parametrize("world_size", [4, 8])

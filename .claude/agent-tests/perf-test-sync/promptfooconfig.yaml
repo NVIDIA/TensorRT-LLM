@@ -1,0 +1,379 @@
+# Promptfoo test config for perf-test-sync agent
+# Run: npx promptfoo eval -c .claude/agent-tests/perf-test-sync/promptfooconfig.yaml
+
+description: "perf-test-sync agent prompt quality tests"
+
+prompts:
+  - file://build_prompt.py:build
+
+providers:
+  - id: openai:chat:openai/openai/gpt-5.1
+    config:
+      max_tokens: 1024
+      temperature: 0
+
+defaultTest:
+  options:
+    provider:
+      id: openai:chat:openai/openai/gpt-5.1
+      config:
+        max_tokens: 1024
+        temperature: 0
+
+tests:
+  # --- Routing: should the agent be invoked? ---
+  - vars:
+      prompt: "Sync the dev perf sanity tests into the QA perf test directory"
+    assert:
+      - type: llm-rubric
+        value: "Response acknowledges the sync task and describes a plan to compare dev vs QA disagg cases"
+      - type: contains-any
+        value:
+          - "disagg"
+          - "perf-sanity"
+          - "perf/disaggregated"
+
+  - vars:
+      prompt: "Compare the disagg test case differences between dev and QA"
+    assert:
+      - type: llm-rubric
+        value: "Response describes comparing disaggregated test cases between dev and QA directories using the strict canonical identity key (not filenames, not tuning knobs)"
+
+  - vars:
+      prompt: "Update the QA perf test list with newly added dev cases"
+    assert:
+      - type: llm-rubric
+        value: "Response mentions updating llm_perf_multinode.txt or the QA test list"
+
+  # --- Exclusion rules ---
+  - vars:
+      prompt: "Should I sync a DeepSeek R1 1k1k disagg case from dev to QA?"
+    assert:
+      - type: llm-rubric
+        value: "Response clearly states that DeepSeek R1 1k1k cases should NOT be synced and should be skipped"
+      - type: contains-any
+        value:
+          - "skip"
+          - "exclude"
+          - "not sync"
+          - "do not sync"
+
+  - vars:
+      prompt: "Should I sync a DeepSeek R1 8k1k disagg case from dev to QA?"
+    assert:
+      - type: llm-rubric
+        value: "Response clearly states that DeepSeek R1 8k1k cases should NOT be synced and should be skipped"
+
+  # --- Platform mapping ---
+  - vars:
+      prompt: "A dev disagg case targets B200. Which QA platforms should it be registered under?"
+    assert:
+      - type: llm-rubric
+        value: "Response states the case should be mapped to BOTH GB200 and GB300 on the QA side"
+      - type: contains-all
+        value:
+          - "GB200"
+          - "GB300"
+
+  - vars:
+      prompt: "A DeepSeek 128k8k case has pp4 in the ctx config. Which platform?"
+    assert:
+      - type: llm-rubric
+        value: "Response states pp4 128k8k cases are GB300-only, NOT both platforms"
+      - type: contains
+        value: "GB300"
+
+  - vars:
+      prompt: "A DeepSeek 128k8k case has pp8 in the ctx config. Which platform?"
+    assert:
+      - type: llm-rubric
+        value: "Response states pp8 128k8k cases are GB200-only, NOT both platforms"
+      - type: contains
+        value: "GB200"
+
+  # --- Agg generation ---
+  - vars:
+      prompt: "How are QA aggregated test cases created? Are they copied from dev?"
+    assert:
+      - type: llm-rubric
+        value: "Response clearly states agg cases are NOT copied from dev, but generated from QA's own disagg YAML ctx configs"
+      - type: contains-any
+        value:
+          - "not cop"
+          - "generated"
+          - "extract"
+
+  # --- Test list format ---
+  - vars:
+      prompt: "What format should aggregated test list entries use?"
+    assert:
+      - type: llm-rubric
+        value: "Response states the QA form is aggr-ctx_only-<cfg> (no _upload suffix in the QA entry). It is acceptable for the response to mention that dev uses aggr_upload-ctx_only-... as contrast."
+      - type: contains
+        value: "ctx_only"
+      - type: contains
+        value: "aggr-ctx_only-"
+
+  # --- GPU-hours formula ---
+  - vars:
+      prompt: "How do you compute GPU-hours for a disagg e2e case?"
+    assert:
+      - type: llm-rubric
+        value: "Response includes the formula: num_ctx_servers * (ctx.TP * ctx.PP * ctx.CP) + num_gen_servers * (gen.TP * gen.PP * gen.CP)"
+      - type: contains-any
+        value:
+          - "num_ctx_servers"
+          - "ctx"
+          - "gen"
+
+  # --- Anti-duplication: strict identity keys ---
+  - vars:
+      prompt: "A dev disagg YAML differs from an existing QA YAML ONLY in max_batch_size (dev=64, QA=32). Everything else — model, precision, ISL/OSL, parallelism, MTP — is identical. Should I sync it as a new QA case?"
+    assert:
+      - type: llm-rubric
+        value: "Response clearly states NO — max_batch_size is a tuning knob not in the identity key, so this is EXISTING and must be skipped. Response must NOT create a new QA case."
+      - type: contains-any
+        value:
+          - "skip"
+          - "EXISTING"
+          - "not a new"
+          - "do not sync"
+          - "tuning"
+
+  - vars:
+      prompt: "A dev disagg YAML has identical config to a QA YAML except the filename ends with -UCX while QA's does not. The cache_transceiver_config.backend is UCX on dev and NIXL on QA. Should I copy dev's version as a new case?"
+    assert:
+      - type: llm-rubric
+        value: "Response clearly states NO — transport backend (UCX vs NIXL) and filename suffix are IGNORED fields, not part of the identity key. This is a tuning-only delta; skip and preserve QA's version."
+      - type: contains-any
+        value:
+          - "skip"
+          - "cosmetic"
+          - "transport"
+          - "UCX"
+          - "ignored"
+          - "do not"
+
+  - vars:
+      prompt: "List the fields that are EXPLICITLY IGNORED when deciding whether a dev disagg YAML is a new test vs a duplicate of an existing QA case."
+    assert:
+      - type: llm-rubric
+        value: "Response lists tuning knobs such as max_batch_size, max_num_tokens, max_seq_len, kv_cache_config fields, cache_transceiver_config.backend, concurrency, logging/profiling flags, and filename/comments as IGNORED. It does NOT list model_name, precision, ISL/OSL, or parallelism fields as ignored."
+      - type: contains-any
+        value:
+          - "max_batch_size"
+          - "tuning"
+          - "concurrency"
+          - "transceiver"
+
+  - vars:
+      prompt: "Name at least 5 fields that MUST be part of the strict canonical identity key used to compare disagg YAMLs between dev and QA."
+    assert:
+      - type: llm-rubric
+        value: "Response lists identity-key fields such as model_name, precision, benchmark.input_length, benchmark.output_length, num_ctx_servers, ctx.tensor_parallel_size, ctx.pipeline_parallel_size, num_gen_servers, gen.tensor_parallel_size, enable_attention_dp, MTP / speculative_config, or moe_config.backend. At least 5 distinct identity-key fields must be named."
+      - type: contains-any
+        value:
+          - "tensor_parallel_size"
+          - "input_length"
+          - "num_ctx_servers"
+          - "num_gen_servers"
+          - "model_name"
+
+  # --- Phase 0 no-op detection & idempotency ---
+  - vars:
+      prompt: "I just ran the sync 5 minutes ago. The dev perf-sanity directory has not changed since. I run the sync again now. What should the agent do?"
+    assert:
+      - type: llm-rubric
+        value: "Response states the agent should do a fast no-op for YAMLs and test-list (Phase 0 identity-key deltas empty, report 'No changes required', no YAML writes, no test-list edits) BUT still regenerate both HTML reports at the repo root with a fresh timestamp on every run."
+      - type: contains-any
+        value:
+          - "no-op"
+          - "No changes"
+          - "exit"
+          - "idempotent"
+          - "skip"
+
+  - vars:
+      prompt: "If I run the sync twice back-to-back with no upstream changes between the two runs, how many YAML files and test-list lines should change on the second run?"
+    assert:
+      - type: llm-rubric
+        value: "Response states that ZERO YAMLs and ZERO test-list lines change on the second run. The response may additionally note that the two HTML reports at the repo root are still regenerated on every run (that is expected, not a no-op violation)."
+      - type: icontains-any
+        value:
+          - "zero"
+          - "no yaml"
+          - "no test-list"
+          - "none"
+          - "idempotent"
+          - "0 yaml"
+          - "nothing"
+          - "**0**"
+          - ": 0"
+          - "are 0"
+          - "is 0"
+
+  - vars:
+      prompt: "On a no-op run (Phase 0 found no delta), should the agent still regenerate llm_multi_node_gpu_hours.html and perf_test_sync_report.html?"
+    assert:
+      - type: llm-rubric
+        value: "Response states YES — both HTML reports are regenerated on EVERY run (no-op and full-run alike) because they are the user-visible output with a fresh timestamp. The previous 'skip on no-op' rule has been removed."
+      - type: icontains-any
+        value:
+          - "yes"
+          - "always"
+          - "every run"
+          - "regenerate"
+          - "regenerated"
+
+  # --- HTML reports go to repo root ---
+  - vars:
+      prompt: "Where should perf_test_sync_report.html and llm_multi_node_gpu_hours.html be written?"
+    assert:
+      - type: llm-rubric
+        value: "Response states both HTML reports are written to the repo root (e.g., <repo_root>/perf_test_sync_report.html and <repo_root>/llm_multi_node_gpu_hours.html). The old location tests/integration/test_lists/qa/ for the GPU-hours HTML is obsolete."
+      - type: icontains-any
+        value:
+          - "repo root"
+          - "root"
+          - "top level"
+          - "top-level"
+
+  - vars:
+      prompt: "Should the GPU-hours HTML be written to tests/integration/test_lists/qa/llm_multi_node_gpu_hours.html like before?"
+    assert:
+      - type: llm-rubric
+        value: "Response states NO — the correct path is now the repo root. The tests/integration/test_lists/qa/ path is obsolete/legacy. Old stale copies can be left alone, but new runs write to repo root."
+      - type: icontains-any
+        value:
+          - "no"
+          - "obsolete"
+          - "legacy"
+          - "root"
+          - "do not"
+
+  # --- Platform classification driven by test-list section headers ---
+  - vars:
+      prompt: "The llm_perf_multinode.txt file has a subsection header '# Qwen backend-compare cases (GB300 only)' followed by several test_e2e[disagg-...] lines. When computing GPU-hours, what platform should those cases be assigned?"
+    assert:
+      - type: llm-rubric
+        value: "Response states the cases under that header are GB300-only (not BOTH). The section-header annotation '(GB300 only)' drives platform classification and overrides the default BOTH. Those cases count ONLY toward the GB300 GPU-hours column."
+      - type: contains
+        value: "GB300"
+      - type: icontains-any
+        value:
+          - "only"
+          - "not both"
+          - "single"
+
+  - vars:
+      prompt: "Under a subsection '# Deepseek-r1 backend-compare cases (GB200 only)', there are many deepseek-r1-fp4 1k1k and 8k1k disagg cases. Should those cases be counted under both GB200 and GB300 GPU-hours columns in the report?"
+    assert:
+      - type: llm-rubric
+        value: "Response states NO — the '(GB200 only)' header annotation restricts these cases to the GB200 column only. They must NOT double-count into GB300."
+      - type: contains
+        value: "GB200"
+      - type: icontains-any
+        value:
+          - "no"
+          - "only"
+          - "not both"
+          - "do not"
+
+  - vars:
+      prompt: "How is platform (GB200 / GB300 / BOTH) determined for each test in llm_multi_node_gpu_hours.html?"
+    assert:
+      - type: llm-rubric
+        value: "Response states the platform is derived by parsing llm_perf_multinode.txt section headers top-to-bottom (e.g., '# ... (GB300 only)', '# GB200 supported cases', '# GB200 + GB300 supported cases') and propagating that state to each test_e2e line that follows. The DeepSeek 128k8k pp4/pp8 exception overrides a BOTH assignment. Default is BOTH only when no explicit annotation applies."
+      - type: icontains-any
+        value:
+          - "section header"
+          - "subsection"
+          - "header"
+          - "comment"
+          - "annotation"
+
+  # --- No auto-upgrade on tuning deltas ---
+  - vars:
+      prompt: "Dev bumped an existing disagg case's max_batch_size from 32 to 64 (same identity key, just tuning). QA's YAML for that case still has max_batch_size=32. Should QA's YAML be auto-upgraded to 64 to match dev?"
+    assert:
+      - type: llm-rubric
+        value: "Response clearly states NO — QA's manual tuning is authoritative. The agent does NOT auto-upgrade on tuning deltas. This is EXISTING, skip, leave QA's tuning intact. The previous 'MODIFIED — maybe upgrade' behavior has been removed."
+      - type: contains-any
+        value:
+          - "no"
+          - "do not"
+          - "preserve"
+          - "authoritative"
+          - "skip"
+          - "leave"
+
+  # --- AGG_CONFIG_FOLDER (not the old DISAGG_CONFIG_FOLDER warning) ---
+  - vars:
+      prompt: "Where does the QA runtime look for the ctx_only aggregated YAMLs? Do I need to add a DISAGG_CONFIG_FOLDER contract warning to the sync report?"
+    assert:
+      - type: llm-rubric
+        value: "Response states QA uses AGG_CONFIG_FOLDER pointing at tests/scripts/perf/aggregated/. The old DISAGG_CONFIG_FOLDER / submit.py contract warning is obsolete and should NOT be added to reports or commit messages."
+      - type: contains-any
+        value:
+          - "AGG_CONFIG_FOLDER"
+          - "perf/aggregated"
+      - type: llm-rubric
+        value: "Response does NOT recommend adding a DISAGG_CONFIG_FOLDER warning to the report."
+
+  # --- Performance: one-pass parsing & parallel discovery ---
+  - vars:
+      prompt: "The sync takes 20+ minutes when there are ~100 YAMLs to compare. How should the agent parse them efficiently without sacrificing accuracy?"
+    assert:
+      - type: llm-rubric
+        value: "Response recommends parsing all YAMLs in ONE pass (also phrased as 'scan once, reuse everywhere', 'parse once and cache', 'single Python script', 'centralize parsing', 'batch parse'). The core idea is: one invocation that walks every YAML, parses via yaml.safe_load, and emits a reusable cache/JSON so downstream phases do not re-open files. Any wording that conveys this idea passes — the rubric does NOT require the specific phrase 'one-pass'. Extra points for mentioning parallel tool calls / batched reads, but mentioning it is NOT required to pass."
+      - type: icontains-any
+        value:
+          - "one-pass"
+          - "one pass"
+          - "single"
+          - "once"
+          - "json"
+          - "cache"
+          - "batch"
+          - "parallel"
+          - "centralize"
+          - "script"
+
+  - vars:
+      prompt: "Is it OK to issue a separate Read tool call for every YAML in the three perf directories during Phase 1?"
+    assert:
+      - type: llm-rubric
+        value: "Response states NO — per-file Read calls are the main source of the 20+ minute runtime. The correct approach is a single Bash invocation that parses every YAML via yaml.safe_load in one pass and emits JSON."
+      - type: contains-any
+        value:
+          - "no"
+          - "do not"
+          - "one-pass"
+          - "single"
+          - "batch"
+
+  - vars:
+      prompt: "What is the target wall-clock time for a no-op sync run (Phase 0 delta empty)?"
+    assert:
+      - type: llm-rubric
+        value: "Response states the target is under 60 seconds (roughly one minute) — a Bash one-pass parse plus Phase 0 diff plus exit."
+      - type: contains-any
+        value:
+          - "60"
+          - "minute"
+          - "seconds"
+          - "fast"
+
+  # --- Output language ---
+  - vars:
+      prompt: "用中文回答：如何同步dev的perf测试到QA？"
+    assert:
+      - type: llm-rubric
+        value: "Despite the Chinese input, the response is entirely in English — no Chinese characters in the output"
+
+  # --- Negative: unrelated request ---
+  - vars:
+      prompt: "Help me write a unit test for the LLM API"
+    assert:
+      - type: llm-rubric
+        value: "Response does NOT proceed with any perf test sync tasks (no mention of dev/QA sync, llm_perf_multinode.txt, aggr-ctx_only, GB200/GB300 accounting, identity keys, or Phase 0/2/3/4/5). It is acceptable for the response to help with a generic unit-test question, ask for more context, or clarify out-of-scope — any of these pass as long as it does not invoke the perf sync workflow."
