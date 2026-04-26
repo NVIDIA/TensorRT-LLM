@@ -4170,6 +4170,26 @@ class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(80000)
+class TestNemotronHNvFP4Marlin(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nemotron-super-rl-021126-nvfp4_aggressive_fp8_kv_notunified"
+    MODEL_PATH = f"/lustre/fsw/coreai_comparch_trtllm/shuyix/models/nemotron-super-rl-021126-nvfp4_aggressive_fp8_kv_notunified"
+
+    def test_nvfp4_marlin(self):
+        MMLU.EVALUATOR_KWARGS = dict(random_seed=0)
+
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+        with LLM(self.MODEL_PATH,
+                 moe_config=MoeConfig(backend="MARLIN"),
+                 kv_cache_config=kv_cache_config,
+                 max_batch_size=8,
+                 nvfp4_gemm_config={"allowed_backends": ["marlin"]}) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestQwen3_4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-4B"
 
