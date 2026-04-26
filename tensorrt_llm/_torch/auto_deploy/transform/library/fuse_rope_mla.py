@@ -66,7 +66,7 @@ def _trace_rope_node(mla_node: Node) -> Optional[Tuple[Node, Node, Node, Node]]:
     q_is_getitem = is_op(q_pe_node, operator.getitem)
     k_is_getitem = is_op(kpe_node, operator.getitem)
     if not (q_is_getitem and k_is_getitem):
-        ad_logger.warning(
+        ad_logger.debug(
             f"_trace_rope_node: q_pe is getitem={q_is_getitem} (op={getattr(q_pe_node, 'op', '?')}, "
             f"target={getattr(q_pe_node, 'target', '?')}), "
             f"kpe is getitem={k_is_getitem} (op={getattr(kpe_node, 'op', '?')}, "
@@ -78,7 +78,7 @@ def _trace_rope_node(mla_node: Node) -> Optional[Tuple[Node, Node, Node, Node]]:
     rope_from_k, k_idx = kpe_node.args
 
     if rope_from_q is not rope_from_k:
-        ad_logger.warning(
+        ad_logger.debug(
             f"_trace_rope_node: q_pe and kpe come from different nodes: "
             f"q_pe_src={rope_from_q.name} ({getattr(rope_from_q, 'target', '?')}), "
             f"kpe_src={rope_from_k.name} ({getattr(rope_from_k, 'target', '?')})"
@@ -88,7 +88,7 @@ def _trace_rope_node(mla_node: Node) -> Optional[Tuple[Node, Node, Node, Node]]:
     rope_node = rope_from_q
 
     if not any(is_op(rope_node, target) for target in _ROPE_OP_TARGETS):
-        ad_logger.warning(
+        ad_logger.debug(
             f"_trace_rope_node: source node {rope_node.name} is not a known RoPE op "
             f"(op={rope_node.op}, target={getattr(rope_node, 'target', '?')}). "
             f"Known targets: {[str(t) for t in _ROPE_OP_TARGETS]}"
@@ -97,7 +97,7 @@ def _trace_rope_node(mla_node: Node) -> Optional[Tuple[Node, Node, Node, Node]]:
 
     # torch_rope returns (q_rot, k_rot) at indices (0, 1)
     if not ({q_idx, k_idx} == {0, 1}):
-        ad_logger.warning(
+        ad_logger.debug(
             f"_trace_rope_node: unexpected getitem indices q_idx={q_idx}, k_idx={k_idx}"
         )
         return None
@@ -221,7 +221,7 @@ def _compute_rotary_cos_sin_from_config(
     try:
         model_config, _ = factory._get_model_config()
     except Exception:
-        ad_logger.warning("Could not get model config for rotary_cos_sin computation")
+        ad_logger.debug("Could not get model config for rotary_cos_sin computation")
         return None
 
     rope_theta = getattr(model_config, "rope_theta", 10000.0)
@@ -308,23 +308,23 @@ def _undo_rope_deinterleave(
 
     Returns the number of weight tensors modified.
     """
+    config_error_msg = "Could not get model config; skipping weight re-interleave."
     try:
         model_config, _ = factory._get_model_config()
-    except Exception:
-        ad_logger.warning("Could not get model config; skipping weight re-interleave.")
-        return 0
+    except (AttributeError, AssertionError, KeyError, OSError, ValueError) as e:
+        raise RuntimeError(config_error_msg) from e
 
     qk_rope_head_dim = getattr(model_config, "qk_rope_head_dim", None)
     qk_nope_head_dim = getattr(model_config, "qk_nope_head_dim", None)
     kv_lora_rank = getattr(model_config, "kv_lora_rank", None)
     num_heads = getattr(model_config, "num_attention_heads", None)
     if any(v is None for v in (qk_rope_head_dim, qk_nope_head_dim, kv_lora_rank, num_heads)):
-        ad_logger.warning(
+        missing_attrs_msg = (
             "Missing MLA config attrs for weight re-interleave; skipping. "
             f"qk_rope_head_dim={qk_rope_head_dim}, qk_nope_head_dim={qk_nope_head_dim}, "
             f"kv_lora_rank={kv_lora_rank}, num_heads={num_heads}"
         )
-        return 0
+        raise RuntimeError(missing_attrs_msg)
 
     d = qk_rope_head_dim
     # The load hook applied: perm = [0, 2, 4, ..., 62, 1, 3, 5, ..., 63]
@@ -439,7 +439,7 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
         # Try to trace the RoPE pattern from the first MLA node.
         trace_result = _trace_rope_node(mla_nodes[0])
         if trace_result is None:
-            ad_logger.warning("Could not trace RoPE node from torch_mla; skipping fusion.")
+            ad_logger.debug("Could not trace RoPE node from torch_mla; skipping fusion.")
             return gm, TransformInfo(skipped=True, detail="no rope pattern")
 
         rope_node, _, _, _ = trace_result
@@ -447,14 +447,15 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
         # Build the rotary_cos_sin tensor from the model's RoPE buffers.
         rotary_cos_sin = _build_rotary_cos_sin_from_buffers(gm, rope_node, factory)
         if rotary_cos_sin is None:
-            ad_logger.warning("Could not construct rotary_cos_sin; skipping fusion.")
+            ad_logger.debug("Could not construct rotary_cos_sin; skipping fusion.")
             return gm, TransformInfo(skipped=True, detail="no rotary_cos_sin")
 
         replaced = 0
+        rewired_mla_nodes = []
         for mla_node in mla_nodes:
             result = _trace_rope_node(mla_node)
             if result is None:
-                ad_logger.warning(f"Skipping MLA node {mla_node.name}: no rope pattern")
+                ad_logger.debug(f"Skipping MLA node {mla_node.name}: no rope pattern")
                 continue
 
             rope_node_i, q_pe_pre, kpe_pre, _ = result
@@ -467,14 +468,11 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
             old_args[3] = kpe_pre
             mla_node.args = tuple(old_args)
 
+            rewired_mla_nodes.append(mla_node)
             replaced += 1
 
-        # Stash rope metadata on ALL rewired MLA nodes for cache_init.
-        for mla_node in mla_nodes:
-            if mla_node.meta.get(_TRTLLM_MLA_ROPE_INFO_KEY) is None:
-                # Only stash if we actually rewired this node (check if args changed)
-                # Use presence of rope_info as the indicator
-                pass
+        # Stash rope metadata on rewired MLA nodes for cache_init.
+        for mla_node in rewired_mla_nodes:
             mla_node.meta[_TRTLLM_MLA_ROPE_INFO_KEY] = {
                 "cos_sin_tensor": rotary_cos_sin,
                 "is_neox": True,

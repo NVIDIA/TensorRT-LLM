@@ -1117,10 +1117,10 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
             {
                 "transforms": {
                     "insert_cached_mla_attention": {
-                        "backend": "trtllm_mla"
+                        "backend": "flashinfer_mla"
                     },
                     "fuse_rope_into_trtllm_mla": {
-                        "enabled": True
+                        "enabled": False
                     },
                 },
             },
@@ -1130,7 +1130,7 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                 pytest.mark.skip_less_device(8),
                 pytest.mark.skip_less_device_memory(120000),
             ),
-            id="deepseek-ai_DeepSeek-R1-0528-trtllm_mla",
+            id="deepseek-ai_DeepSeek-R1-0528-flashinfer_mla",
         ),
     ]
 
