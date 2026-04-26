@@ -71,6 +71,7 @@ from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             derive_attention_dp_per_rank_request_cap,
+                            build_no_fitting_reqs_diagnostic,
                             get_from_waiting_queue, merge_requests)
 from .resource_manager import (KVCacheManagerV2, ResourceManager,
                                ResourceManagerType, request_context)
@@ -482,6 +483,12 @@ class PyExecutor:
         # loop avoids the mismatch.
         self._pending_transfer_responses: List[Tuple[int, LlmResponse]] = []
 
+        # ADP dummy role for _pad_attention_dp_dummy_request; locked to
+        # this worker's disagg role on first observation. Default is_gen=True.
+        self._adp_dummy_is_gen: bool = True
+        self._adp_dummy_role_locked: bool = False
+        # TODO: Remove the condition on the PP size once disagg support from KVCache reuse
+        # path is fixed.
         self.async_transfer_manager = AsyncTransferManager(
             self.resource_manager,
             should_store_blocks=self.enable_partial_reuse_for_disagg
@@ -2067,8 +2074,9 @@ class PyExecutor:
                     if any_need_check > 0:
                         if local_need_check and not all_gen_first:
                             logger.warning(
-                                "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
-                            )
+                                build_no_fitting_reqs_diagnostic(
+                                    self.active_requests,
+                                    self.kv_cache_manager))
                             self._check_disagg_ctx_cache_transfer_status(1)
                         else:
                             self._check_disagg_ctx_cache_transfer_status(0)
@@ -2649,10 +2657,8 @@ class PyExecutor:
             if any_need_check > 0:
                 if local_need_check and not all_gen_first:
                     logger.warning(
-                        "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
-                    )
-                    # Local conditions warrant a blocking wait for at least one
-                    # in-flight transfer to complete so KV blocks can be freed.
+                        build_no_fitting_reqs_diagnostic(
+                            self.active_requests, self.kv_cache_manager))
                     self._check_disagg_ctx_cache_transfer_status(1)
                 else:
                     # Either (a) a peer rank needed the call but we didn't, or
@@ -3858,6 +3864,20 @@ class PyExecutor:
             if not _respond_if_invalid(request)
         ]
 
+        # Lock the ADP dummy role to match this worker's disagg role.
+        if (self.enable_attention_dp and self.kv_cache_transceiver is not None
+                and not self._adp_dummy_role_locked):
+            for request in validated_requests:
+                rt = getattr(request, "llm_request_type", None)
+                if rt == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY:
+                    self._adp_dummy_is_gen = False
+                    self._adp_dummy_role_locked = True
+                    break
+                if rt == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
+                    self._adp_dummy_is_gen = True
+                    self._adp_dummy_role_locked = True
+                    break
+
         self.active_requests.extend(validated_requests)
         return validated_requests
 
@@ -4178,9 +4198,17 @@ class PyExecutor:
         # it can participate in collective operations during the forward pass.
         if num_active_request == 0 and self.expected_num_active_requests > 0:
             dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
+            # Pad CTX-type dummies to max_num_tokens so the MoE all-to-all
+            # sees a comparable token count across ranks.
+            token_nums = None
+            if (not self._adp_dummy_is_gen
+                    and self.kv_cache_transceiver is not None
+                    and self.max_num_tokens is not None):
+                token_nums = [self.max_num_tokens]
             llm_request = self.kv_cache_manager.add_dummy_requests(
                 request_ids=dummy_request_ids,
-                is_gen=True,
+                token_nums=token_nums,
+                is_gen=self._adp_dummy_is_gen,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
             )[0]
