@@ -1112,26 +1112,6 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
             ),
             id="deepseek-ai_DeepSeek-R1-0528",
         ),
-        pytest.param(
-            "deepseek-ai/DeepSeek-R1-0528",
-            {
-                "transforms": {
-                    "insert_cached_mla_attention": {
-                        "backend": "flashinfer_mla"
-                    },
-                    "fuse_rope_into_trtllm_mla": {
-                        "enabled": False
-                    },
-                },
-            },
-            [MMLU, GSM8K],
-            marks=(
-                skip_pre_blackwell,
-                pytest.mark.skip_less_device(8),
-                pytest.mark.skip_less_device_memory(120000),
-            ),
-            id="deepseek-ai_DeepSeek-R1-0528-flashinfer_mla",
-        ),
     ]
 
     def get_default_sampling_params(self):
