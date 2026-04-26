@@ -33,8 +33,13 @@ import tensorrt_llm._torch.auto_deploy  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.custom_ops.mla.trtllm_mla import _GlobalTrtllmMLAPlanner
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability(0) < (8, 0),
-    reason="TRT-LLM MLA tests require GPU with compute capability >= 8.0",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability(0) < (9, 0),
+    reason=(
+        "TRT-LLM MLA tests require GPU with compute capability >= 9.0; the "
+        "MLA prefill FMHA kernel (separate_q_k_v, headSize=192/headSizeV=128) "
+        "is only available on Hopper+ — earlier SMs fall back to unfused MHA "
+        "and abort during AttentionOp::initialize."
+    ),
 )
 
 _MLA_TOKENS_PER_BLOCK = 32
