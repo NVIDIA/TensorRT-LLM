@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 from tensorrt_llm._utils import get_hf_rope_theta, maybe_pin_memory
 from tensorrt_llm.functional import (PositionEmbeddingType, RopeEmbeddingUtils,
                                      RotaryScalingType)
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -488,8 +489,15 @@ class RopeParams:
                 # Per-layer-type RoPE config (e.g. Gemma3 in transformers 5.x).
                 # Pick "full_attention" as the default; callers override theta
                 # for sliding-window layers independently.
-                flat = hf_rope_parameters.get(
-                    "full_attention", next(iter(hf_rope_parameters.values())))
+                if "full_attention" in hf_rope_parameters:
+                    flat = hf_rope_parameters["full_attention"]
+                else:
+                    fallback_key = next(iter(hf_rope_parameters))
+                    logger.warning(
+                        f"Per-layer-type rope_parameters has no 'full_attention' entry; "
+                        f"falling back to '{fallback_key}'. Available layer types: "
+                        f"{list(hf_rope_parameters.keys())}.")
+                    flat = hf_rope_parameters[fallback_key]
                 config.update(flat)
             else:
                 config.update(hf_rope_parameters)

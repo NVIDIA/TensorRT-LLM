@@ -4,6 +4,8 @@ from typing import Optional
 
 import transformers
 
+from tensorrt_llm.logger import logger
+
 
 def is_hybrid_linear(config):
     return is_nemotron_hybrid(config) or is_qwen3_hybrid(config)
@@ -304,6 +306,25 @@ def load_pretrained_config(model_name_or_path: str,
         has_real_scaling = any(k for k in rope_scaling
                                if k not in ("rope_type", "type", "rope_theta"))
         if rope_type == "default" and not has_real_scaling:
+            # Preserve rope_theta before clearing, since rope_parameters
+            # (which rope_scaling delegates to) will also become None and
+            # rope_theta may only exist there in transformers 5.x.
+            # When rope_theta is missing from rope_scaling, no preservation is
+            # needed — model_config.rope_theta (if any) is already canonical.
+            rope_theta = rope_scaling.get("rope_theta")
+            if rope_theta is not None:
+                existing = getattr(model_config, "rope_theta", None)
+                if existing is None:
+                    model_config.rope_theta = rope_theta
+                elif existing != rope_theta:
+                    # Both values are set but disagree. Keep the top-level value
+                    # (canonical in transformers 4.x and 5.x), but warn loudly
+                    # so that any future transformers upgrade that breaks this
+                    # invariant is easy to spot.
+                    logger.warning(
+                        f"rope_scaling.rope_theta ({rope_theta}) differs from "
+                        f"model_config.rope_theta ({existing}); keeping the "
+                        f"top-level value.")
             model_config.rope_scaling = None
 
     return model_config
