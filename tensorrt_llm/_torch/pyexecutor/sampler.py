@@ -3939,6 +3939,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             r.py_min_length and (r.max_beam_num_tokens - r.py_orig_prompt_len) < r.py_min_length[0]
             for r in requests
         ):
+            neg_inf_tensor = torch.full((), float("-inf"), dtype=logits.dtype, device=logits.device)
             current_offset = 0
             for index, r in enumerate(requests):
                 if r.py_min_length:
@@ -3955,9 +3956,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                                     # This introduces a pageable HtoD transfer, which wreaks havoc on TPOT (up to ~20%)
                                     # Instead, we create a little tensor on device, then assign to that.
                                     # This way, we avoid the pageable transfer.
-                                    neg_inf_tensor = torch.full(
-                                        (), float("-inf"), device=logits.device
-                                    )
                                     logits[
                                         current_offset + num_steps[index] * beam_idx + step, end_id
                                     ] = neg_inf_tensor
