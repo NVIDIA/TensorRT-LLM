@@ -26,7 +26,11 @@ from typing import List, Optional, Tuple
 import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory
-from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import buffer_pool, deep_ep_installed
+from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import (
+    buffer_pool,
+    check_cuda_p2p_access,
+    deep_ep_installed,
+)
 from tensorrt_llm._utils import local_mpi_size
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -119,9 +123,10 @@ class DeepEP(Communication):
         Check if DeepEP is supported on the current platform.
 
         DeepEP requires NVLink connectivity between all GPUs
-        (NUM_MAX_NVL_PEERS=8 hardcoded in upstream configs.cuh).
+        (NUM_MAX_NVL_PEERS=8 hardcoded in upstream configs.cuh)
+        and actual CUDA P2P access (needed by NVSHMEM).
         """
-        return deep_ep_installed and MnnvlMemory.supports_mnnvl()
+        return deep_ep_installed and MnnvlMemory.supports_mnnvl() and check_cuda_p2p_access()
 
     @staticmethod
     def _is_deepep_feasible(num_ranks: int) -> bool:

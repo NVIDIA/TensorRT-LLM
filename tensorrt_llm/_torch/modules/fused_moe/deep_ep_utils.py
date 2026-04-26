@@ -16,6 +16,22 @@ except ImportError:
     deep_ep_installed = False
 
 
+def check_cuda_p2p_access() -> bool:
+    """Check if CUDA P2P access is available between all local GPUs.
+
+    NVSHMEM (used by DeepEP) fatally exits the process when P2P access is
+    unavailable, instead of raising a catchable exception.  This check lets
+    callers avoid triggering nvshmem init on incompatible hardware so the
+    communication factory can fall back gracefully.
+    """
+    current = torch.cuda.current_device()
+    num_devices = torch.cuda.device_count()
+    for i in range(num_devices):
+        if i != current and not torch.cuda.can_device_access_peer(current, i):
+            return False
+    return True
+
+
 class VariableLengthBuffer:
     """ A wrapper of deep_ep.Buffer that accepts future size change
     """
