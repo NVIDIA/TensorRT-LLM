@@ -63,7 +63,8 @@ def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
 
 def _set_quant_config(llm, model_id: str) -> None:
     """Set quant_config on *llm* based on *model_id* so the accuracy harness
-    can resolve the correct thresholds."""
+    can resolve the correct thresholds.
+    """
     QUANT_ALGO_BY_MODEL_ID = {
         "fp8": {
             "weights": QuantAlgo.FP8,
@@ -187,7 +188,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             },
         },
         "torch": {
-            "max_batch_size": 128,
+            "max_batch_size": 32,
             "max_seq_len": 2048,
             "compile_backend": "torch-simple",
         },
@@ -203,6 +204,13 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
                            attn_backend="flashinfer"):
         backend_cfg = self.ATTN_BACKEND_CONFIGS[attn_backend]
 
+        # Filter cuda graph batch sizes to those <= max_batch_size; the LlmArgs
+        # validator requires cuda_graph_config.max_batch_size <= max_batch_size.
+        cuda_graph_batch_sizes = [
+            size for size in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+            if size <= backend_cfg["max_batch_size"]
+        ]
+
         config = {
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
@@ -217,12 +225,12 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.7
             },
+            "cuda_graph_config": {
+                "batch_sizes": cuda_graph_batch_sizes,
+            },
             "transforms": {
                 "compile_model": {
-                    "backend":
-                    backend_cfg["compile_backend"],
-                    "cuda_graph_batch_sizes":
-                    [1, 2, 4, 8, 16, 32, 64, 128, 256, 512],
+                    "backend": backend_cfg["compile_backend"],
                 },
                 "fuse_silu_mul": {
                     "enabled": True,
@@ -243,15 +251,22 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
                               n=beam_width,
                               use_beam_search=beam_width > 1)
 
-    def check_acceptance_rate(self, llm, min_acceptance_rate: float):
-        """Check speculative decoding acceptance rate for the current run."""
-        _check_acceptance_rate_stats(llm.get_stats(), min_acceptance_rate)
-
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("world_size", [1, 2, 4])
     @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
-    @pytest.mark.parametrize("attn_backend",
-                             ["flashinfer", "trtllm", "torch", "triton_paged"])
+    @pytest.mark.parametrize(
+        "attn_backend",
+        [
+            "flashinfer",
+            "trtllm",
+            # Torch attention is unpaged.
+            # Unpaged KV = (batch_size + 1) slots * 2048 tokens * 32 layers * 2 KV * 8 KV heads * 128 dim * 2 bytes.
+            # For batch_size=32: 8.25 GiB KV + ~15 GiB weights ~= 23.3 GiB.
+            # If batch size is increased, this parameterization must be gated at a higher memory threshold.
+            "torch",
+            "triton_paged",
+        ],
+    )
     def test_auto_dtype(self, world_size, enable_chunked_prefill, attn_backend):
         kwargs = self.get_default_kwargs(enable_chunked_prefill, attn_backend)
         sampling_params = self.get_default_sampling_params()

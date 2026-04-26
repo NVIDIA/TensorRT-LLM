@@ -53,7 +53,7 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
 COPY constraints.txt /tmp/constraints.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     # WAR: uninstall dependencies that has vulnerability
-    pip3 uninstall -y tornado black nbconvert || true && \
+    pip3 uninstall -y tornado black nbconvert pillow || true && \
     pip3 install --ignore-installed --no-cache-dir -r /tmp/constraints.txt && \
     rm /tmp/constraints.txt
 
