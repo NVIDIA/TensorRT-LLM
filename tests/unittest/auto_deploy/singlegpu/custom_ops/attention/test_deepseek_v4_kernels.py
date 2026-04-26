@@ -15,28 +15,63 @@
 
 """Tests for standalone DeepSeek V4 attention kernel microfeatures."""
 
+from typing import NoReturn
+
 import pytest
 import torch
+import torch.nn as nn
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention import deepseek_v4_kernels as dsv4_kernels
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention.deepseek_v4_kernels import (
     FP8_E4M3_DTYPE,
     deepseek_v4_compressor_pool_norm_rope_ref,
     deepseek_v4_fp8_block_dequant_ref,
+    deepseek_v4_indexer_fp4_quant_dequant_ref,
     deepseek_v4_indexer_q_rope_quant_ref,
     deepseek_v4_inverse_rope_fp8_output_quant_ref,
+    deepseek_v4_kv_rmsnorm_rope_bf16_cache_insert_ref,
     deepseek_v4_kv_rmsnorm_rope_ref,
     deepseek_v4_local_window_topk_idxs,
     deepseek_v4_q_rmsnorm_rope_ref,
+    deepseek_v4_ratio4_indexer_build_topk_ref,
+    deepseek_v4_ratio4_indexer_compressed_kv_ref,
+    deepseek_v4_ratio4_indexer_q_ref,
+    deepseek_v4_ratio4_indexer_scores_ref,
+    deepseek_v4_ratio4_indexer_topk_ref,
+    deepseek_v4_ratio4_overlap_compress_ref,
     deepseek_v4_sparse_attention_microkernel_ref,
 )
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.utils.e8m0 import e8m0_to_uint8, maybe_e8m0_to_fp32
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
+
+DSV4_LOCAL_HEADS = 8
+DSV4_HEAD_DIM = 512
+DSV4_ROPE_DIM = 64
+
+
+class _DisabledReferenceError(RuntimeError):
+    pass
+
+
+def _disabled_ref(*args: object, **kwargs: object) -> NoReturn:
+    del args, kwargs
+    raise _DisabledReferenceError("reference helper disabled by readiness test")
 
 
 def _freqs(batch_size: int, seq_len: int, rope_dim: int, device: str | torch.device = "cpu"):
     phases = torch.randn(batch_size, seq_len, rope_dim // 2, dtype=torch.float32, device=device)
     return torch.polar(torch.ones_like(phases), phases)
+
+
+def _batch_info(num_prefill: int, num_prefill_tokens: int, num_decode: int) -> torch.Tensor:
+    batch_info = BatchInfo()
+    batch_info.update([num_prefill, num_prefill_tokens, 0, 0, num_decode, num_decode])
+    batch_info.update_tokens_gather_info(num_prefill_tokens + num_decode, False)
+    return batch_info.serialize()
 
 
 def _manual_rms_norm(
@@ -84,6 +119,80 @@ def test_q_rmsnorm_rope_matches_manual_reference():
         rtol=0,
         atol=0,
     )
+
+
+def test_triton_q_rmsnorm_rope_matches_observed_shape_reference_and_out():
+    torch.manual_seed(11)
+    batch_size, seq_len = 2, 3
+    q = (
+        torch.randn(batch_size, seq_len, DSV4_LOCAL_HEADS, DSV4_HEAD_DIM, dtype=torch.float32)
+        * 0.125
+    ).to(torch.bfloat16)
+    weight = torch.linspace(0.5, 1.25, DSV4_HEAD_DIM, dtype=torch.float32)
+    freqs = _freqs(batch_size, seq_len, DSV4_ROPE_DIM)
+    eps = 1e-6
+
+    actual = torch.ops.auto_deploy.triton_deepseek_v4_q_rmsnorm_rope(
+        q, weight, freqs, eps, DSV4_ROPE_DIM
+    )
+    expected = deepseek_v4_q_rmsnorm_rope_ref(q, weight, freqs, eps, DSV4_ROPE_DIM)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    out = torch.empty_like(q)
+    sentinel = torch.ops.auto_deploy.triton_deepseek_v4_q_rmsnorm_rope(
+        q, weight, freqs, eps, DSV4_ROPE_DIM, out=out
+    )
+    assert sentinel.numel() == 0
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+def test_triton_q_rmsnorm_rope_rejects_non_observed_head_count():
+    q = torch.randn(1, 1, 4, DSV4_HEAD_DIM, dtype=torch.float32).to(torch.bfloat16)
+    freqs = _freqs(1, 1, DSV4_ROPE_DIM)
+
+    with pytest.raises(ValueError, match="local head count"):
+        torch.ops.auto_deploy.triton_deepseek_v4_q_rmsnorm_rope(q, None, freqs, 1e-6, DSV4_ROPE_DIM)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for DSV4 Triton Q readiness"
+)
+def test_triton_q_rmsnorm_rope_readiness_survives_disabled_ref(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(1101)
+    device = torch.device("cuda")
+    batch_size, seq_len = 1, 2
+    q = (
+        torch.randn(
+            batch_size,
+            seq_len,
+            DSV4_LOCAL_HEADS,
+            DSV4_HEAD_DIM,
+            dtype=torch.float32,
+            device=device,
+        )
+        * 0.125
+    ).to(torch.bfloat16)
+    weight = torch.linspace(0.5, 1.25, DSV4_HEAD_DIM, dtype=torch.float32, device=device)
+    freqs = _freqs(batch_size, seq_len, DSV4_ROPE_DIM, device=device)
+    expected = deepseek_v4_q_rmsnorm_rope_ref(q, weight, freqs, 1e-6, DSV4_ROPE_DIM)
+
+    monkeypatch.setattr(dsv4_kernels, "deepseek_v4_q_rmsnorm_rope_ref", _disabled_ref)
+
+    actual = torch.ops.auto_deploy.triton_deepseek_v4_q_rmsnorm_rope(
+        q, weight, freqs, 1e-6, DSV4_ROPE_DIM
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    out = torch.empty_like(q)
+    sentinel = torch.ops.auto_deploy.triton_deepseek_v4_q_rmsnorm_rope(
+        q, weight, freqs, 1e-6, DSV4_ROPE_DIM, out=out
+    )
+    assert sentinel.numel() == 0
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 def test_kv_rmsnorm_rope_cache_insert_quantizes_nope_and_preserves_rope():
@@ -150,6 +259,208 @@ def test_kv_rmsnorm_rope_cache_insert_quantizes_nope_and_preserves_rope():
     )
 
 
+def test_triton_kv_norm_rope_cache_insert_writes_bf16_swa_pages():
+    torch.manual_seed(12)
+    batch_size, seq_len, block_size = 2, 5, 4
+    kv = (torch.randn(batch_size, seq_len, DSV4_HEAD_DIM, dtype=torch.float32) * 0.125).to(
+        torch.bfloat16
+    )
+    weight = torch.linspace(0.75, 1.5, DSV4_HEAD_DIM, dtype=torch.float32)
+    freqs = _freqs(batch_size, seq_len, DSV4_ROPE_DIM)
+    batch_info = _batch_info(num_prefill=2, num_prefill_tokens=8, num_decode=0)
+    seq_len_host = torch.tensor([5, 3], dtype=torch.int32)
+    input_pos_host = torch.tensor([2, 0], dtype=torch.int32)
+    cu_seqlen_host = torch.tensor([0, 5, 8], dtype=torch.int32)
+    cache_loc_host = torch.tensor([1, 0, 2], dtype=torch.int32)
+    cu_num_pages_host = torch.tensor([0, 2, 3], dtype=torch.int32)
+    sentinel_value = -7.0
+    swa_cache = torch.full(
+        (3, 1, block_size, 1, DSV4_HEAD_DIM),
+        sentinel_value,
+        dtype=torch.bfloat16,
+    )
+
+    actual = torch.ops.auto_deploy.triton_deepseek_v4_kv_norm_rope_cache_insert(
+        kv,
+        weight,
+        freqs,
+        batch_info,
+        seq_len_host,
+        input_pos_host,
+        cu_seqlen_host,
+        cache_loc_host,
+        cu_num_pages_host,
+        swa_cache,
+        1e-6,
+        DSV4_ROPE_DIM,
+    )
+
+    expected_kv = deepseek_v4_kv_rmsnorm_rope_ref(kv, weight, freqs, 1e-6, DSV4_ROPE_DIM)
+    expected_flat = expected_kv.reshape(-1, DSV4_HEAD_DIM)
+    expected_output_flat = torch.zeros_like(expected_flat)
+    expected_output_flat[:8].copy_(expected_flat[:8])
+
+    torch.testing.assert_close(
+        actual.reshape(-1, DSV4_HEAD_DIM),
+        expected_output_flat,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(swa_cache[1, 0, 2, 0], expected_flat[0], rtol=0, atol=0)
+    torch.testing.assert_close(swa_cache[1, 0, 3, 0], expected_flat[1], rtol=0, atol=0)
+    torch.testing.assert_close(swa_cache[0, 0, 0, 0], expected_flat[2], rtol=0, atol=0)
+    torch.testing.assert_close(swa_cache[0, 0, 1, 0], expected_flat[3], rtol=0, atol=0)
+    torch.testing.assert_close(swa_cache[0, 0, 2, 0], expected_flat[4], rtol=0, atol=0)
+    torch.testing.assert_close(swa_cache[2, 0, 0, 0], expected_flat[5], rtol=0, atol=0)
+    torch.testing.assert_close(swa_cache[2, 0, 1, 0], expected_flat[6], rtol=0, atol=0)
+    torch.testing.assert_close(swa_cache[2, 0, 2, 0], expected_flat[7], rtol=0, atol=0)
+    assert torch.all(swa_cache[0, 0, 3, 0] == sentinel_value)
+    assert torch.all(swa_cache[2, 0, 3, 0] == sentinel_value)
+
+
+def test_triton_kv_norm_rope_cache_insert_matches_reference_and_out():
+    torch.manual_seed(13)
+    batch_size, seq_len, block_size = 1, 3, 2
+    kv = (torch.randn(batch_size, seq_len, DSV4_HEAD_DIM, dtype=torch.float32) * 0.125).to(
+        torch.bfloat16
+    )
+    freqs = _freqs(batch_size, seq_len, DSV4_ROPE_DIM)
+    batch_info = _batch_info(num_prefill=1, num_prefill_tokens=3, num_decode=0)
+    seq_len_host = torch.tensor([3], dtype=torch.int32)
+    input_pos_host = torch.tensor([1], dtype=torch.int32)
+    cu_seqlen_host = torch.tensor([0, 3], dtype=torch.int32)
+    cache_loc_host = torch.tensor([1, 0], dtype=torch.int32)
+    cu_num_pages_host = torch.tensor([0, 2], dtype=torch.int32)
+    cache_actual = torch.zeros(2, 1, block_size, 1, DSV4_HEAD_DIM, dtype=torch.bfloat16)
+    cache_expected = torch.zeros_like(cache_actual)
+
+    out = torch.empty_like(kv)
+    sentinel = torch.ops.auto_deploy.triton_deepseek_v4_kv_norm_rope_cache_insert(
+        kv,
+        None,
+        freqs,
+        batch_info,
+        seq_len_host,
+        input_pos_host,
+        cu_seqlen_host,
+        cache_loc_host,
+        cu_num_pages_host,
+        cache_actual,
+        1e-6,
+        DSV4_ROPE_DIM,
+        out=out,
+    )
+    expected = deepseek_v4_kv_rmsnorm_rope_bf16_cache_insert_ref(
+        kv,
+        None,
+        freqs,
+        batch_info,
+        seq_len_host,
+        input_pos_host,
+        cu_seqlen_host,
+        cache_loc_host,
+        cu_num_pages_host,
+        cache_expected,
+        1e-6,
+        DSV4_ROPE_DIM,
+    )
+
+    assert sentinel.numel() == 0
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    torch.testing.assert_close(cache_actual, cache_expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for DSV4 Triton KV readiness"
+)
+def test_triton_kv_norm_rope_cache_insert_readiness_survives_disabled_ref(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(1102)
+    device = torch.device("cuda")
+    batch_size, seq_len, block_size = 1, 3, 2
+    kv = (
+        torch.randn(batch_size, seq_len, DSV4_HEAD_DIM, dtype=torch.float32, device=device) * 0.125
+    ).to(torch.bfloat16)
+    weight = torch.linspace(0.75, 1.5, DSV4_HEAD_DIM, dtype=torch.float32, device=device)
+    freqs = _freqs(batch_size, seq_len, DSV4_ROPE_DIM, device=device)
+    batch_info = _batch_info(num_prefill=1, num_prefill_tokens=3, num_decode=0).to(device)
+    seq_len_host = torch.tensor([3], dtype=torch.int32, device=device)
+    input_pos_host = torch.tensor([1], dtype=torch.int32, device=device)
+    cu_seqlen_host = torch.tensor([0, 3], dtype=torch.int32, device=device)
+    cache_loc_host = torch.tensor([1, 0], dtype=torch.int32, device=device)
+    cu_num_pages_host = torch.tensor([0, 2], dtype=torch.int32, device=device)
+    cache_actual = torch.zeros(
+        2,
+        1,
+        block_size,
+        1,
+        DSV4_HEAD_DIM,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    cache_expected = torch.zeros_like(cache_actual)
+    expected = deepseek_v4_kv_rmsnorm_rope_bf16_cache_insert_ref(
+        kv,
+        weight,
+        freqs,
+        batch_info,
+        seq_len_host,
+        input_pos_host,
+        cu_seqlen_host,
+        cache_loc_host,
+        cu_num_pages_host,
+        cache_expected,
+        1e-6,
+        DSV4_ROPE_DIM,
+    )
+
+    monkeypatch.setattr(
+        dsv4_kernels,
+        "deepseek_v4_kv_rmsnorm_rope_bf16_cache_insert_ref",
+        _disabled_ref,
+    )
+
+    actual = torch.ops.auto_deploy.triton_deepseek_v4_kv_norm_rope_cache_insert(
+        kv,
+        weight,
+        freqs,
+        batch_info,
+        seq_len_host,
+        input_pos_host,
+        cu_seqlen_host,
+        cache_loc_host,
+        cu_num_pages_host,
+        cache_actual,
+        1e-6,
+        DSV4_ROPE_DIM,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(cache_actual, cache_expected, rtol=0, atol=0)
+
+    cache_actual_out = torch.zeros_like(cache_actual)
+    out = torch.empty_like(kv)
+    sentinel = torch.ops.auto_deploy.triton_deepseek_v4_kv_norm_rope_cache_insert(
+        kv,
+        weight,
+        freqs,
+        batch_info,
+        seq_len_host,
+        input_pos_host,
+        cu_seqlen_host,
+        cache_loc_host,
+        cu_num_pages_host,
+        cache_actual_out,
+        1e-6,
+        DSV4_ROPE_DIM,
+        out=out,
+    )
+    assert sentinel.numel() == 0
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    torch.testing.assert_close(cache_actual_out, cache_expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     "compress_ratio,overlap,seq_len",
     [
@@ -180,6 +491,396 @@ def test_compressor_pool_norm_rope_matches_reference(
 
     assert actual.shape == (batch_size, seq_len // compress_ratio, head_dim)
     torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_ratio4_overlap_compress_matches_existing_reference_for_complete_rows():
+    torch.manual_seed(14)
+    batch_size, seq_len, indexer_head_dim, rope_dim = 1, 8, 128, DSV4_ROPE_DIM
+    state_dim = 2 * indexer_head_dim
+    kv = torch.randn(batch_size, seq_len, state_dim, dtype=torch.float32) * 0.1
+    gate = torch.randn_like(kv)
+    ape = torch.randn(4, state_dim, dtype=torch.float32) * 0.01
+    weight = torch.linspace(0.75, 1.25, indexer_head_dim)
+    freqs = _freqs(batch_size, seq_len, rope_dim)
+
+    actual = deepseek_v4_ratio4_overlap_compress_ref(
+        kv, gate, ape, weight, freqs, 1e-6, rope_dim, max_compressed_len=2
+    )
+    expected = deepseek_v4_compressor_pool_norm_rope_ref(
+        kv, gate, ape, weight, freqs, 1e-6, rope_dim, 4, True
+    )
+
+    assert actual.shape == (batch_size, 2, indexer_head_dim)
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_ratio4_indexer_scores_match_manual_score_assembly():
+    torch.manual_seed(15)
+    batch_size, seq_len, max_compressed_len = 1, 8, 2
+    q = torch.randn(batch_size, seq_len, 8, 128, dtype=torch.float32) * 0.125
+    compressor_kv = torch.randn(batch_size, seq_len, 256, dtype=torch.float32) * 0.125
+    compressor_gate = torch.randn_like(compressor_kv)
+    compressor_ape = torch.randn(4, 256, dtype=torch.float32) * 0.01
+    compressor_norm_weight = torch.linspace(0.75, 1.25, 128)
+    weights = torch.randn(batch_size, seq_len, 8, dtype=torch.float32)
+    freqs = _freqs(batch_size, seq_len, DSV4_ROPE_DIM)
+
+    actual = torch.ops.auto_deploy.torch_deepseek_v4_ratio4_indexer_scores(
+        q,
+        compressor_kv,
+        compressor_gate,
+        compressor_ape,
+        compressor_norm_weight,
+        weights,
+        freqs,
+        1e-6,
+        DSV4_ROPE_DIM,
+        max_compressed_len,
+        32,
+        False,
+    )
+    q_indexer = deepseek_v4_ratio4_indexer_q_ref(q, freqs, DSV4_ROPE_DIM, 32)
+    compressed = deepseek_v4_ratio4_indexer_compressed_kv_ref(
+        compressor_kv,
+        compressor_gate,
+        compressor_ape,
+        compressor_norm_weight,
+        freqs,
+        1e-6,
+        DSV4_ROPE_DIM,
+        max_compressed_len,
+        32,
+    )
+    scaled_weights = weights.float() * (128**-0.5 * 8**-0.5)
+    expected = (
+        torch.einsum("bshd,btd->bsht", q_indexer.float(), compressed.float()).relu()
+        * scaled_weights.unsqueeze(-1)
+    ).sum(dim=2)
+
+    torch.testing.assert_close(
+        actual,
+        deepseek_v4_ratio4_indexer_scores_ref(
+            q,
+            compressor_kv,
+            compressor_gate,
+            compressor_ape,
+            compressor_norm_weight,
+            weights,
+            freqs,
+            1e-6,
+            DSV4_ROPE_DIM,
+            max_compressed_len,
+            32,
+        ),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_triton_ratio4_indexer_scores_cpu_fallback_uses_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(1103)
+    batch_size, seq_len, max_compressed_len = 1, 4, 2048
+    q = (torch.randn(batch_size, seq_len, 8, 128, dtype=torch.float32) * 0.125).to(torch.bfloat16)
+    compressor_kv = (torch.randn(batch_size, seq_len, 256, dtype=torch.float32) * 0.125).to(
+        torch.bfloat16
+    )
+    compressor_gate = (torch.randn(batch_size, seq_len, 256, dtype=torch.float32) * 0.125).to(
+        torch.bfloat16
+    )
+    compressor_ape = (torch.randn(4, 256, dtype=torch.float32) * 0.01).to(torch.bfloat16)
+    compressor_norm_weight = torch.linspace(0.75, 1.25, 128, dtype=torch.float32)
+    weights = (torch.randn(batch_size, seq_len, 8, dtype=torch.float32) * 0.125).to(torch.bfloat16)
+    freqs = _freqs(batch_size, seq_len, DSV4_ROPE_DIM)
+
+    monkeypatch.setattr(dsv4_kernels, "deepseek_v4_ratio4_indexer_scores_ref", _disabled_ref)
+
+    with pytest.raises(_DisabledReferenceError, match="reference helper disabled"):
+        torch.ops.auto_deploy.triton_deepseek_v4_ratio4_indexer_scores(
+            q,
+            compressor_kv,
+            compressor_gate,
+            compressor_ape,
+            compressor_norm_weight,
+            weights,
+            freqs,
+            1e-6,
+            DSV4_ROPE_DIM,
+            max_compressed_len,
+            32,
+            False,
+        )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for DSV4 ratio-4 score readiness"
+)
+def test_triton_ratio4_indexer_scores_readiness_survives_disabled_ref(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(1103)
+    device = torch.device("cuda")
+    batch_size, seq_len, max_compressed_len = 1, 4, 2048
+    q = (torch.randn(batch_size, seq_len, 8, 128, dtype=torch.float32, device=device) * 0.125).to(
+        torch.bfloat16
+    )
+    compressor_kv = (
+        torch.randn(batch_size, seq_len, 256, dtype=torch.float32, device=device) * 0.125
+    ).to(torch.bfloat16)
+    compressor_gate = (
+        torch.randn(batch_size, seq_len, 256, dtype=torch.float32, device=device) * 0.125
+    ).to(torch.bfloat16)
+    compressor_ape = (torch.randn(4, 256, dtype=torch.float32, device=device) * 0.01).to(
+        torch.bfloat16
+    )
+    compressor_norm_weight = torch.linspace(0.75, 1.25, 128, dtype=torch.float32, device=device)
+    weights = (torch.randn(batch_size, seq_len, 8, dtype=torch.float32, device=device) * 0.125).to(
+        torch.bfloat16
+    )
+    freqs = _freqs(batch_size, seq_len, DSV4_ROPE_DIM, device=device)
+    expected = deepseek_v4_ratio4_indexer_scores_ref(
+        q,
+        compressor_kv,
+        compressor_gate,
+        compressor_ape,
+        compressor_norm_weight,
+        weights,
+        freqs,
+        1e-6,
+        DSV4_ROPE_DIM,
+        max_compressed_len,
+        32,
+    )
+
+    monkeypatch.setattr(dsv4_kernels, "deepseek_v4_ratio4_indexer_scores_ref", _disabled_ref)
+
+    actual = torch.ops.auto_deploy.triton_deepseek_v4_ratio4_indexer_scores(
+        q,
+        compressor_kv,
+        compressor_gate,
+        compressor_ape,
+        compressor_norm_weight,
+        weights,
+        freqs,
+        1e-6,
+        DSV4_ROPE_DIM,
+        max_compressed_len,
+        32,
+        False,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    out = torch.empty_like(actual)
+    sentinel = torch.ops.auto_deploy.triton_deepseek_v4_ratio4_indexer_scores(
+        q,
+        compressor_kv,
+        compressor_gate,
+        compressor_ape,
+        compressor_norm_weight,
+        weights,
+        freqs,
+        1e-6,
+        DSV4_ROPE_DIM,
+        max_compressed_len,
+        32,
+        False,
+        out=out,
+    )
+    assert sentinel.numel() == 0
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+def test_ratio4_indexer_topk_respects_decode_continuation_visibility():
+    index_score = torch.tensor(
+        [
+            [
+                [0.0, 9.0, 5.0, 1.0],
+                [1.0, 8.0, 7.0, 6.0],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    source_seq_lens = torch.tensor([9], dtype=torch.int32)
+
+    partial = deepseek_v4_ratio4_indexer_topk_ref(
+        index_score, source_seq_lens, torch.tensor([3], dtype=torch.int32), topk_count=3
+    )
+    continued = deepseek_v4_ratio4_indexer_topk_ref(
+        index_score, source_seq_lens, torch.tensor([7], dtype=torch.int32), topk_count=3
+    )
+
+    torch.testing.assert_close(
+        partial,
+        torch.tensor([[[9, -1, -1], [9, -1, -1]]], dtype=torch.int32),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        continued,
+        torch.tensor([[[10, 9, -1], [10, 9, -1]]], dtype=torch.int32),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_triton_ratio4_indexer_topk_builds_observed_width640_and_out():
+    batch_size, seq_len, max_compressed_len = 1, 5, 2048
+    index_score = torch.full((batch_size, seq_len, max_compressed_len), -10.0)
+    index_score[0, 3, 0] = 5.0
+    index_score[0, 3, 1] = 50.0
+    source_seq_lens = torch.tensor([seq_len], dtype=torch.int32)
+    input_pos = torch.tensor([0], dtype=torch.int32)
+
+    actual = torch.ops.auto_deploy.triton_deepseek_v4_ratio4_indexer_topk(
+        index_score, source_seq_lens, input_pos
+    )
+    expected = deepseek_v4_ratio4_indexer_build_topk_ref(index_score, source_seq_lens, input_pos)
+
+    assert actual.shape == (batch_size, seq_len, 640)
+    assert actual.dtype == torch.int32
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual[0, 0, 0].item() == 0
+    assert torch.all(actual[0, 0, 1:128] == -1)
+    assert actual[0, 3, 128].item() == seq_len
+    assert torch.all(actual[0, 3, 129:] == -1)
+
+    out = torch.empty_like(actual)
+    sentinel = torch.ops.auto_deploy.triton_deepseek_v4_ratio4_indexer_topk(
+        index_score, source_seq_lens, input_pos, out=out
+    )
+    assert sentinel.numel() == 0
+    torch.testing.assert_close(out, actual, rtol=0, atol=0)
+
+
+def test_triton_ratio4_indexer_topk_cpu_fallback_uses_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch_size, seq_len, max_compressed_len = 1, 5, 2048
+    index_score = torch.full((batch_size, seq_len, max_compressed_len), -10.0)
+    source_seq_lens = torch.tensor([seq_len], dtype=torch.int32)
+    input_pos = torch.tensor([0], dtype=torch.int32)
+
+    monkeypatch.setattr(dsv4_kernels, "deepseek_v4_ratio4_indexer_build_topk_ref", _disabled_ref)
+
+    with pytest.raises(_DisabledReferenceError, match="reference helper disabled"):
+        torch.ops.auto_deploy.triton_deepseek_v4_ratio4_indexer_topk(
+            index_score, source_seq_lens, input_pos
+        )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA required for DSV4 ratio-4 top-k readiness"
+)
+def test_triton_ratio4_indexer_topk_readiness_survives_disabled_ref(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = torch.device("cuda")
+    batch_size, seq_len, max_compressed_len = 1, 5, 2048
+    index_score = torch.full((batch_size, seq_len, max_compressed_len), -10.0, device=device)
+    index_score[0, 3, 0] = 5.0
+    index_score[0, 3, 1] = 50.0
+    source_seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
+    input_pos = torch.tensor([0], dtype=torch.int32, device=device)
+    expected = deepseek_v4_ratio4_indexer_build_topk_ref(index_score, source_seq_lens, input_pos)
+
+    monkeypatch.setattr(dsv4_kernels, "deepseek_v4_ratio4_indexer_build_topk_ref", _disabled_ref)
+
+    actual = torch.ops.auto_deploy.triton_deepseek_v4_ratio4_indexer_topk(
+        index_score, source_seq_lens, input_pos
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    out = torch.empty_like(actual)
+    sentinel = torch.ops.auto_deploy.triton_deepseek_v4_ratio4_indexer_topk(
+        index_score, source_seq_lens, input_pos, out=out
+    )
+    assert sentinel.numel() == 0
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+def test_ratio4_indexer_fp4_quant_dequant_uses_four_groups_per_row():
+    row = torch.arange(128, dtype=torch.float32).view(1, 1, 1, 128) / 16.0
+    actual = deepseek_v4_indexer_fp4_quant_dequant_ref(row, block_size=32)
+    group0 = deepseek_v4_indexer_fp4_quant_dequant_ref(row[..., :32], block_size=32)
+    group1 = deepseek_v4_indexer_fp4_quant_dequant_ref(row[..., 32:64], block_size=32)
+    group2 = deepseek_v4_indexer_fp4_quant_dequant_ref(row[..., 64:96], block_size=32)
+    group3 = deepseek_v4_indexer_fp4_quant_dequant_ref(row[..., 96:128], block_size=32)
+    expected = torch.cat([group0, group1, group2, group3], dim=-1)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+class _Ratio4IndexerAllReduceFixture(nn.Module):
+    def forward(
+        self,
+        q: torch.Tensor,
+        compressor_kv: torch.Tensor,
+        compressor_gate: torch.Tensor,
+        compressor_ape: torch.Tensor,
+        compressor_norm_weight: torch.Tensor,
+        weights: torch.Tensor,
+        freqs: torch.Tensor,
+        source_seq_lens: torch.Tensor,
+        input_pos: torch.Tensor,
+    ) -> torch.Tensor:
+        score = torch.ops.auto_deploy.triton_deepseek_v4_ratio4_indexer_scores(
+            q,
+            compressor_kv,
+            compressor_gate,
+            compressor_ape,
+            compressor_norm_weight,
+            weights,
+            freqs,
+            1e-6,
+            DSV4_ROPE_DIM,
+            2048,
+            32,
+            False,
+        )
+        score = torch.ops.auto_deploy.all_reduce(score, layer_type="mla")
+        return torch.ops.auto_deploy.triton_deepseek_v4_ratio4_indexer_topk(
+            score, source_seq_lens, input_pos
+        )
+
+
+def test_ratio4_indexer_graph_places_all_reduce_before_topk():
+    torch.manual_seed(16)
+    batch_size, seq_len = 1, 4
+    gm = torch_export_to_gm(
+        _Ratio4IndexerAllReduceFixture(),
+        args=(
+            torch.randn(batch_size, seq_len, 8, 128, dtype=torch.bfloat16),
+            torch.randn(batch_size, seq_len, 256, dtype=torch.bfloat16),
+            torch.randn(batch_size, seq_len, 256, dtype=torch.bfloat16),
+            torch.randn(4, 256, dtype=torch.bfloat16),
+            torch.ones(128, dtype=torch.float32),
+            torch.randn(batch_size, seq_len, 8, dtype=torch.bfloat16),
+            _freqs(batch_size, seq_len, DSV4_ROPE_DIM),
+            torch.full((batch_size,), seq_len, dtype=torch.int32),
+            torch.zeros(batch_size, dtype=torch.int32),
+        ),
+    )
+
+    score_node = next(
+        node
+        for node in gm.graph.nodes
+        if is_op(node, torch.ops.auto_deploy.triton_deepseek_v4_ratio4_indexer_scores)
+    )
+    all_reduce_node = next(
+        node for node in gm.graph.nodes if is_op(node, torch.ops.auto_deploy.all_reduce)
+    )
+    topk_node = next(
+        node
+        for node in gm.graph.nodes
+        if is_op(node, torch.ops.auto_deploy.triton_deepseek_v4_ratio4_indexer_topk)
+    )
+
+    assert all_reduce_node.args[0] is score_node
+    assert topk_node.args[0] is all_reduce_node
 
 
 def test_indexer_q_rope_quant_uses_fp8_with_e8m0_scales():
@@ -309,6 +1010,75 @@ def test_fake_implementations_return_expected_shapes_and_dtypes():
     assert indexer_scale.shape == (*q.shape[:-1], 1)
     assert kv_fp8.dtype == FP8_E4M3_DTYPE
     assert indexer_fp8.dtype == FP8_E4M3_DTYPE
+
+
+def test_triton_fake_implementations_return_expected_shapes_and_out_sentinels():
+    with FakeTensorMode():
+        batch_size, seq_len, block_size = 2, 3, 4
+        q = torch.empty(
+            batch_size,
+            seq_len,
+            DSV4_LOCAL_HEADS,
+            DSV4_HEAD_DIM,
+            dtype=torch.bfloat16,
+        )
+        kv = torch.empty(batch_size, seq_len, DSV4_HEAD_DIM, dtype=torch.bfloat16)
+        freqs = torch.empty(batch_size, seq_len, DSV4_ROPE_DIM // 2, dtype=torch.complex64)
+        batch_info = torch.empty(12, dtype=torch.int32)
+        seq_len_host = torch.empty(batch_size, dtype=torch.int32)
+        input_pos_host = torch.empty(batch_size, dtype=torch.int32)
+        cu_seqlen_host = torch.empty(batch_size + 1, dtype=torch.int32)
+        cache_loc_host = torch.empty(batch_size, dtype=torch.int32)
+        cu_num_pages_host = torch.empty(batch_size + 1, dtype=torch.int32)
+        swa_cache = torch.empty(
+            batch_size,
+            1,
+            block_size,
+            1,
+            DSV4_HEAD_DIM,
+            dtype=torch.bfloat16,
+        )
+
+        q_out = torch.ops.auto_deploy.triton_deepseek_v4_q_rmsnorm_rope(
+            q, None, freqs, 1e-6, DSV4_ROPE_DIM
+        )
+        q_sentinel = torch.ops.auto_deploy.triton_deepseek_v4_q_rmsnorm_rope(
+            q, None, freqs, 1e-6, DSV4_ROPE_DIM, out=torch.empty_like(q)
+        )
+        kv_out = torch.ops.auto_deploy.triton_deepseek_v4_kv_norm_rope_cache_insert(
+            kv,
+            None,
+            freqs,
+            batch_info,
+            seq_len_host,
+            input_pos_host,
+            cu_seqlen_host,
+            cache_loc_host,
+            cu_num_pages_host,
+            swa_cache,
+            1e-6,
+            DSV4_ROPE_DIM,
+        )
+        kv_sentinel = torch.ops.auto_deploy.triton_deepseek_v4_kv_norm_rope_cache_insert(
+            kv,
+            None,
+            freqs,
+            batch_info,
+            seq_len_host,
+            input_pos_host,
+            cu_seqlen_host,
+            cache_loc_host,
+            cu_num_pages_host,
+            swa_cache,
+            1e-6,
+            DSV4_ROPE_DIM,
+            out=torch.empty_like(kv),
+        )
+
+    assert q_out.shape == q.shape
+    assert kv_out.shape == kv.shape
+    assert q_sentinel.numel() == 0
+    assert kv_sentinel.numel() == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay requires CUDA")

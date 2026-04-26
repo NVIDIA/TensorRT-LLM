@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Compile backend with cudagraph.
 
 1. Monolithic CUDA graph: captures entire model as one graph for decode-only.
@@ -308,6 +323,14 @@ class PiecewiseCapturedGraph(nn.Module):
     Metadata-prep ops are wrapped in MetadataWrapper to keep their output
     addresses stable across capture and replay (prevents CUDA graph crashes).
     Inplace dynamic ops (see _INPLACE_DYNAMIC_OPS) run eagerly without wrapping.
+
+    DSV4 kernel contract:
+    - attention-like kernels that produce hidden states accept caller-owned out=
+      buffers and return a dummy tensor when out= is provided;
+    - metadata-prep and workspace tensors are caller-owned graph inputs, sized
+      for the captured bucket and interpreted through real token counts;
+    - cache resources such as swa_cache, mhc_cache, compressor_kv_cache, and
+      compressor_gate_cache stay graph inputs and are never allocated here.
     """
 
     def __init__(
@@ -721,6 +744,8 @@ class DualModeCapturedGraph(nn.Module):
       The tail beyond total_num_tokens is zeroed via reset_val=0 in nest_sequences
       to prevent stale values from leaking into the padding region during graph replay.
     - batch_info reflects real counts so dynamic ops process only real tokens.
+    - Dynamic kernels must zero or ignore padded slots before updating caller-owned
+      cache resources.
     - Output logits are truncated to total_num_tokens in forward().
     """
 

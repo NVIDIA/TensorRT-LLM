@@ -205,6 +205,7 @@ def _run_cached_sparse_attention_v2(
     window_size: int,
     rope_dim: int,
     softmax_scale: float,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2_with_cache(
         q,
@@ -230,6 +231,7 @@ def _run_cached_sparse_attention_v2(
         max_compressed_len,
         1e-6,
         rope_dim,
+        out=out,
     )
 
 
@@ -638,6 +640,17 @@ def test_deepseek_v4_sparse_backend_is_registered():
     )
     assert (
         descriptor.get_cached_attention_op()
+        == torch.ops.auto_deploy.triton_deepseek_v4_sparse_attention_v2_with_cache.default
+    )
+
+
+def test_deepseek_v4_sparse_backend_debug_switch_uses_torch_reference(monkeypatch):
+    descriptor = AttentionRegistry.get("deepseek_v4_sparse")
+
+    monkeypatch.setenv(dsv4_attention._DSV4_FORCE_TORCH_REFERENCE_ENV, "1")
+
+    assert (
+        descriptor.get_cached_attention_op()
         == torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2_with_cache.default
     )
 
@@ -897,6 +910,137 @@ def test_cached_ratio128_emits_row_at_compression_boundary():
     )
 
 
+def test_cached_ratio128_second_block_close_matches_full_source_and_out_buffer():
+    fixture = _prefill_decode_fixture(ratio=128, prefix_len=255, total_len=256)
+    _, mhc_cache, _, _ = fixture["caches"]
+
+    expected_compressed = _expected_compressed_kv(fixture)
+
+    torch.testing.assert_close(
+        mhc_cache[0, 0, 0, 0],
+        expected_compressed[0, 0],
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    torch.testing.assert_close(
+        mhc_cache[0, 1, 0, 0],
+        expected_compressed[0, 1],
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    torch.testing.assert_close(
+        fixture["decode"],
+        fixture["full"][:, 255:],
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+    replay_caches = tuple(cache.clone() for cache in fixture["caches"])
+    out = torch.empty_like(fixture["q"][:, 255:256])
+    sentinel = _run_cached_sparse_attention_v2(
+        fixture["q"][:, 255:256],
+        fixture["kv"][:, 255:256],
+        torch.tensor([-0.2, 0.35]),
+        torch.zeros(1, 1, fixture["window_size"], dtype=torch.int32),
+        fixture["compressor_kv"][:, 255:256],
+        fixture["compressor_gate"][:, 255:256],
+        fixture["compressor_ape"],
+        fixture["compressor_norm_weight"],
+        fixture["freqs_cis_table"],
+        fixture["position_ids"][:, 255:256],
+        _batch_info(num_prefill=0, num_prefill_tokens=0, num_decode=1),
+        torch.tensor([1], dtype=torch.int),
+        torch.tensor([255], dtype=torch.int),
+        torch.tensor([0, 1], dtype=torch.int),
+        fixture["cache_loc"],
+        fixture["cu_num_pages"],
+        replay_caches,
+        128,
+        fixture["max_compressed_len"],
+        fixture["window_size"],
+        fixture["rope_dim"],
+        fixture["softmax_scale"],
+        out=out,
+    )
+
+    assert sentinel.numel() == 0
+    torch.testing.assert_close(out, fixture["full"][:, 255:256], rtol=1e-5, atol=1e-5)
+
+
+def test_cached_ratio128_visibility_is_capped_by_max_compressed_len():
+    head_dim = 4
+    window_size = 3
+    block_size = 128
+    ratio = 128
+    max_compressed_len = 1
+    softmax_scale = 0.5
+
+    cache_loc, cu_num_pages, swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = (
+        _compressed_caches(256, block_size, head_dim, head_dim)
+    )
+    swa_cache = swa_cache.to(torch.bfloat16)
+    mhc_cache = mhc_cache.to(torch.bfloat16)
+    caches = (swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache)
+
+    row_253 = torch.tensor([0.25, -0.5, 0.75, 0.0], dtype=torch.bfloat16)
+    row_254 = torch.tensor([-0.25, 0.5, 0.25, 1.0], dtype=torch.bfloat16)
+    compressed_row_0 = torch.tensor([0.0, 2.0, 0.0, -0.5], dtype=torch.bfloat16)
+    poison_row = torch.full((head_dim,), 1000.0, dtype=torch.bfloat16)
+    swa_cache[1, 125, 0, 0].copy_(row_253)
+    swa_cache[1, 126, 0, 0].copy_(row_254)
+    mhc_cache[0, 0, 0, 0].copy_(compressed_row_0)
+    mhc_cache[0, 1, 0, 0].copy_(poison_row)
+
+    q = torch.tensor([[[[1.0, 0.5, -0.25, 0.125]]]], dtype=torch.bfloat16)
+    kv = torch.tensor([[[1.0, 0.0, -1.0, 0.5]]], dtype=torch.bfloat16)
+    attn_sink = torch.tensor([-3.0], dtype=torch.float32)
+    topk_idxs = torch.zeros(1, 1, 192, dtype=torch.int32)
+    compressor_kv = torch.full((1, 1, head_dim), 5.0, dtype=torch.bfloat16)
+    compressor_gate = torch.zeros_like(compressor_kv)
+    compressor_ape = torch.zeros(ratio, head_dim, dtype=torch.bfloat16)
+    compressor_norm_weight = torch.ones(head_dim, dtype=torch.float32)
+    freqs_cis_table = _freqs_cis_table(256 + ratio, rope_dim=0)
+    position_ids = torch.tensor([[255]], dtype=torch.int)
+
+    actual = _run_cached_sparse_attention_v2(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        compressor_kv,
+        compressor_gate,
+        compressor_ape,
+        compressor_norm_weight,
+        freqs_cis_table,
+        position_ids,
+        _batch_info(num_prefill=0, num_prefill_tokens=0, num_decode=1),
+        torch.tensor([1], dtype=torch.int),
+        torch.tensor([255], dtype=torch.int),
+        torch.tensor([0, 1], dtype=torch.int),
+        cache_loc,
+        cu_num_pages,
+        caches,
+        ratio,
+        max_compressed_len,
+        window_size,
+        0,
+        softmax_scale,
+    )
+
+    expected_kv = torch.stack([row_253, row_254, kv[0, 0], compressed_row_0]).unsqueeze(0)
+    expected_topk = torch.tensor([[[0, 1, 2, 3]]], dtype=torch.int32)
+    expected = torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention(
+        q,
+        expected_kv,
+        attn_sink,
+        expected_topk,
+        softmax_scale,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(mhc_cache[0, 1, 0, 0], poison_row, rtol=0, atol=0)
+
+
 def test_cached_compressed_decode_masks_future_compressed_rows_before_boundary():
     fixture = _prefill_decode_fixture(ratio=4, prefix_len=2, total_len=3)
     swa_cache, mhc_cache, _, _ = fixture["caches"]
@@ -1037,7 +1181,7 @@ def test_cache_insertion_replaces_compressed_v2_source_with_cached_op():
     cached_node = next(
         node
         for node in transformed.graph.nodes
-        if is_op(node, torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2_with_cache)
+        if is_op(node, torch.ops.auto_deploy.triton_deepseek_v4_sparse_attention_v2_with_cache)
     )
     window_size, compress_ratio, max_compressed_len, rms_norm_eps, rope_dim = extract_op_args(
         cached_node,
@@ -1049,7 +1193,9 @@ def test_cache_insertion_replaces_compressed_v2_source_with_cached_op():
     )
     assert info.num_matches == 1
     assert torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2.default not in targets
-    assert torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2_with_cache.default in targets
+    assert (
+        torch.ops.auto_deploy.triton_deepseek_v4_sparse_attention_v2_with_cache.default in targets
+    )
     assert window_size == 3
     assert compress_ratio == 4
     assert max_compressed_len == 2

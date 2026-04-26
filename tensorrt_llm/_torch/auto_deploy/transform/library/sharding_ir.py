@@ -128,6 +128,56 @@ def _split_flattened_groups(
     return grouped[group_lo:group_hi].reshape(-1, *tensor.shape[1:]).contiguous()
 
 
+def _assert_deepseek_v4_wo_a_tp_supported(num_groups: int, tp_size: int) -> None:
+    assert num_groups >= tp_size, (
+        "DeepSeek V4 grouped wo_a requires o_groups >= tp_size because sharding "
+        f"assigns whole output groups to ranks; got o_groups={num_groups}, tp_size={tp_size}"
+    )
+    _assert_divisible(num_groups, tp_size, "DeepSeek V4 wo_a output groups (o_groups)")
+
+
+def _infer_deepseek_v4_wo_a_global_groups(
+    weight_tensor: torch.Tensor,
+    scale_tensor: torch.Tensor,
+    output_shape: Optional[Tuple[int, ...]],
+) -> int:
+    if (
+        output_shape is not None
+        and len(output_shape) > 0
+        and isinstance(output_shape[-1], int)
+        and output_shape[-1] > 0
+    ):
+        o_lora_rank = int(output_shape[-1])
+        _assert_divisible(
+            int(weight_tensor.shape[0]),
+            o_lora_rank,
+            "DeepSeek V4 wo_a weight rows",
+        )
+        num_groups = int(weight_tensor.shape[0]) // o_lora_rank
+    else:
+        num_groups = int(scale_tensor.shape[0])
+
+    _assert_divisible(
+        int(scale_tensor.shape[0]),
+        num_groups,
+        "DeepSeek V4 wo_a scale rows",
+    )
+    return num_groups
+
+
+def _assert_deepseek_v4_wo_a_observed_groups(
+    observed_groups: int,
+    global_groups: int,
+    dc: DistConfig,
+    source: str,
+) -> None:
+    local_groups = global_groups // dc.tp_size
+    assert observed_groups in (global_groups, local_groups), (
+        f"DeepSeek V4 wo_a {source} group count must be global o_groups "
+        f"({global_groups}) or TP-local groups ({local_groups}), got {observed_groups}"
+    )
+
+
 def _slice_group_range(tensor: torch.Tensor, group_lo: int, group_hi: int) -> torch.Tensor:
     return tensor[group_lo:group_hi].contiguous()
 
@@ -169,6 +219,43 @@ def _set_view_shape(node: Node, view_shape: List[Any]) -> None:
         node.args = (node.args[0], view_shape)
 
 
+def _scaled_view_meta_shape(
+    node: Node,
+    view_shape: List[Any],
+    scaled_dim: int,
+    local_size: int,
+) -> Optional[Tuple[int, ...]]:
+    old_shape = shape(node)
+    if old_shape is None or len(old_shape) != len(view_shape):
+        return None
+
+    meta_shape = []
+    for idx, dim_size in enumerate(view_shape):
+        if idx == scaled_dim:
+            meta_shape.append(local_size)
+        elif isinstance(dim_size, int) and dim_size == -1:
+            meta_shape.append(int(old_shape[idx]))
+        elif isinstance(dim_size, int):
+            meta_shape.append(dim_size)
+        else:
+            return None
+    return tuple(meta_shape)
+
+
+def _set_node_meta_shape(node: Node, meta_shape: Optional[Tuple[int, ...]]) -> None:
+    if meta_shape is None or shape(node) == meta_shape:
+        return
+
+    meta_val = node.meta.get("val")
+    if meta_val is None:
+        return
+    try:
+        node.meta["val"] = meta_val.new_empty(meta_shape)
+    except (AttributeError, RuntimeError, TypeError):
+        dtype = getattr(meta_val, "dtype", torch.float32)
+        node.meta["val"] = torch.empty(meta_shape, dtype=dtype, device="meta")
+
+
 def _is_aten_view_or_reshape(node: Node) -> bool:
     return isinstance(node, Node) and (
         (node.op == "call_method" and node.target in {"view", "reshape"})
@@ -188,12 +275,15 @@ def _scale_view_shape_dim(node: Node, dim: int, dc: DistConfig, reason: str) -> 
     scaled_size = view_shape[dim]
     if scaled_size == -1:
         return False
+    _assert_divisible(scaled_size, dc.tp_size, reason)
+    local_size = scaled_size // dc.tp_size
+    meta_shape = _scaled_view_meta_shape(node, view_shape, dim, local_size)
     if -1 in view_shape:
-        _assert_divisible(scaled_size, dc.tp_size, reason)
-        view_shape[dim] = scaled_size // dc.tp_size
+        view_shape[dim] = local_size
     else:
         view_shape[dim] = -1
     _set_view_shape(node, view_shape)
+    _set_node_meta_shape(node, meta_shape)
     ad_logger.debug(f"  recovered DeepSeek V4 view shape at dim {dim}: {view_shape}")
     return True
 
@@ -501,22 +591,45 @@ class DeepSeekV4GroupedWoAShardableNode(ShardableNode):
         [input_node, weight_node, bias_node, weight_scale] = extract_op_args(
             self.node, "input", "weight_quantized", "bias", "weight_scale"
         )
+        assert isinstance(weight_scale, (list, tuple)) and len(weight_scale) == 1, (
+            "DeepSeek V4 wo_a expects a single weight_scale_inv tensor."
+        )
+        scale_node = weight_scale[0]
+        weight_name, weight_tensor = _get_attr_tensor(gm, weight_node, "weight_quantized")
+        _, scale_tensor = _get_attr_tensor(gm, scale_node, "weight_scale")
         input_shape = shape(input_node)
         output_shape = shape(self.node)
+        num_groups = _infer_deepseek_v4_wo_a_global_groups(
+            weight_tensor,
+            scale_tensor,
+            output_shape,
+        )
+        _assert_deepseek_v4_wo_a_tp_supported(num_groups, dc.tp_size)
+        local_groups = num_groups // dc.tp_size
         if input_shape is not None:
-            num_groups = int(input_shape[-2])
+            observed_groups = int(input_shape[-2])
             group_dim = len(input_shape) - 2
+            _assert_deepseek_v4_wo_a_observed_groups(
+                observed_groups,
+                num_groups,
+                dc,
+                "input",
+            )
         elif output_shape is not None:
-            num_groups = int(output_shape[-2])
+            observed_groups = int(output_shape[-2])
             group_dim = len(output_shape) - 2
+            _assert_deepseek_v4_wo_a_observed_groups(
+                observed_groups,
+                num_groups,
+                dc,
+                "output",
+            )
         else:
             raise AssertionError(
                 f"Cannot determine DeepSeek V4 wo_a group count for node {self.node.name}."
             )
-        _assert_divisible(num_groups, dc.tp_size, "DeepSeek V4 wo_a output groups")
         group_lo, group_hi = _contiguous_partition(num_groups, dc.tp_size, dc.tp_rank)
 
-        weight_name, weight_tensor = _get_attr_tensor(gm, weight_node, "weight_quantized")
         split_groups = partial(
             _split_flattened_groups,
             num_groups=num_groups,
@@ -549,16 +662,6 @@ class DeepSeekV4GroupedWoAShardableNode(ShardableNode):
                 custom_shard_fn=bias_split,
             )
 
-        assert isinstance(weight_scale, (list, tuple)) and len(weight_scale) == 1, (
-            "DeepSeek V4 wo_a expects a single weight_scale_inv tensor."
-        )
-        scale_node = weight_scale[0]
-        _, scale_tensor = _get_attr_tensor(gm, scale_node, "weight_scale")
-        _assert_divisible(
-            int(scale_tensor.shape[0]),
-            num_groups,
-            "DeepSeek V4 wo_a scale rows",
-        )
         scale_split = partial(
             _split_flattened_groups,
             num_groups=num_groups,
@@ -568,12 +671,16 @@ class DeepSeekV4GroupedWoAShardableNode(ShardableNode):
         scale_weight_node = _weight_node_from_attr(gm, scale_node, scale_tensor)
         _shard_scale_and_hook(gm, scale_weight_node, scale_split(scale_tensor), scale_split)
 
-        if isinstance(input_node, Node) and not _is_recovered_tp_local_group_view(
-            input_node,
-            group_dim,
-            num_groups=num_groups,
-            dc=dc,
-        ):
+        input_is_local = observed_groups == local_groups or (
+            isinstance(input_node, Node)
+            and _is_recovered_tp_local_group_view(
+                input_node,
+                group_dim,
+                num_groups=num_groups,
+                dc=dc,
+            )
+        )
+        if isinstance(input_node, Node) and not input_is_local:
             with gm.graph.inserting_before(self.node):
                 local_input = gm.graph.call_function(
                     torch.ops.aten.slice.Tensor,
@@ -617,6 +724,11 @@ class DeepSeekV4SparseAttentionShardableNode(ShardableNode):
                 "DeepSeek V4 sparse attention q head count must match either local "
                 f"heads ({local_heads}) or pre-shard metadata heads ({full_heads}), got {q_heads}"
             )
+            if q_heads == full_heads:
+                local_q_shape = list(q_shape)
+                local_q_shape[-2] = local_heads
+                _set_node_meta_shape(q, tuple(local_q_shape))
+                _set_node_meta_shape(self.node, tuple(local_q_shape))
         shard_weight_tensor(
             gm=gm,
             weight_tensor=sink_tensor,
@@ -679,12 +791,20 @@ class ViewShardableNode(ShardableNode):
             scaled_size = view_shape[tp_scaled_dim]
             if scaled_size == -1:
                 return 0
+            _assert_divisible(scaled_size, dc.tp_size, "view shape dimension")
+            local_size = scaled_size // dc.tp_size
+            meta_shape = _scaled_view_meta_shape(
+                self.node,
+                view_shape,
+                tp_scaled_dim,
+                local_size,
+            )
             if -1 in view_shape:
-                _assert_divisible(scaled_size, dc.tp_size, "view shape dimension")
-                view_shape[tp_scaled_dim] = scaled_size // dc.tp_size
+                view_shape[tp_scaled_dim] = local_size
             else:
                 view_shape[tp_scaled_dim] = -1
             set_op_args(self.node, shape=view_shape)
+            _set_node_meta_shape(self.node, meta_shape)
             ad_logger.debug(f"  updated view shape at dim {tp_scaled_dim}: {view_shape}")
             return 1
         return 0
@@ -1113,6 +1233,15 @@ class DeepSeekV4MXFP4FromRoutingShardableNode(ShardableNode):
         "down_bias",
         "down_scales",
     )
+    _ROUTE_METADATA_ARG_NAMES = (
+        "sorted_routing_weights",
+        "expert_histogram",
+        "sorted_route_indices",
+        "inverse_route_indices",
+        "expert_offsets",
+        "expert_block_offsets",
+        "expert_block_schedule",
+    )
 
     def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
         ep_size = dc.moe_ep_size
@@ -1161,12 +1290,18 @@ class DeepSeekV4MXFP4FromRoutingShardableNode(ShardableNode):
                 world_size=ep_size,
             )
 
-        self._localize_expert_indices(
+        selected_experts_local, routing_weights_local = self._localize_expert_indices(
             gm,
             selected_experts,
             routing_weights,
             expert_lo,
             expert_hi,
+        )
+        self._insert_route_metadata(
+            gm,
+            selected_experts_local,
+            routing_weights_local,
+            expert_hi - expert_lo,
         )
         self._insert_all_reduce(gm, dc)
 
@@ -1183,7 +1318,7 @@ class DeepSeekV4MXFP4FromRoutingShardableNode(ShardableNode):
         routing_weights: Node,
         expert_lo: int,
         expert_hi: int,
-    ) -> None:
+    ) -> Tuple[Node, Node]:
         with gm.graph.inserting_before(self.node):
             local_ids = gm.graph.create_node(
                 "call_function",
@@ -1211,6 +1346,25 @@ class DeepSeekV4MXFP4FromRoutingShardableNode(ShardableNode):
             selected_experts=selected_experts_local,
             routing_weights=routing_weights_local,
         )
+        return selected_experts_local, routing_weights_local
+
+    def _insert_route_metadata(
+        self,
+        gm: GraphModule,
+        selected_experts: Node,
+        routing_weights: Node,
+        num_local_experts: int,
+    ) -> None:
+        with gm.graph.inserting_before(self.node):
+            route_metadata = gm.graph.call_function(
+                torch.ops.auto_deploy.torch_deepseek_v4_mxfp4_route_metadata.default,
+                args=(selected_experts, routing_weights, int(num_local_experts)),
+            )
+            metadata_tensors = tuple(
+                gm.graph.call_function(operator.getitem, args=(route_metadata, idx))
+                for idx in range(len(self._ROUTE_METADATA_ARG_NAMES))
+            )
+        set_op_args(self.node, **dict(zip(self._ROUTE_METADATA_ARG_NAMES, metadata_tensors)))
 
     def _insert_all_reduce(self, gm: GraphModule, dc: DistConfig) -> None:
         _, all_reduce_op = _get_dist_ops("auto")
@@ -1490,15 +1644,42 @@ def _recover_deepseek_v4_wo_a_group_aten_views(gm: GraphModule, dc: DistConfig) 
     for grouped_node in list(gm.graph.nodes):
         if not is_op(grouped_node, grouped_op):
             continue
-        [input_node] = extract_op_args(grouped_node, "input")
+        [input_node, weight_node, weight_scale] = extract_op_args(
+            grouped_node,
+            "input",
+            "weight_quantized",
+            "weight_scale",
+        )
         if not _is_aten_view_or_reshape(input_node):
             continue
 
         _, view_shape = _view_base_and_shape(input_node)
         if view_shape is None or len(view_shape) < 2:
             continue
+        assert isinstance(weight_scale, (list, tuple)) and len(weight_scale) == 1, (
+            "DeepSeek V4 wo_a expects a single weight_scale_inv tensor."
+        )
+        _, weight_tensor = _get_attr_tensor(gm, weight_node, "weight_quantized")
+        _, scale_tensor = _get_attr_tensor(gm, weight_scale[0], "weight_scale")
+        num_groups = _infer_deepseek_v4_wo_a_global_groups(
+            weight_tensor,
+            scale_tensor,
+            shape(grouped_node),
+        )
+        _assert_deepseek_v4_wo_a_tp_supported(num_groups, dc.tp_size)
+        local_groups = num_groups // dc.tp_size
         group_dim = len(view_shape) - 2
-        if view_shape[group_dim] != -1 and _scale_view_shape_dim(
+        view_groups = view_shape[group_dim]
+        if isinstance(view_groups, int) and view_groups != -1:
+            _assert_deepseek_v4_wo_a_observed_groups(
+                view_groups,
+                num_groups,
+                dc,
+                "view",
+            )
+            if view_groups == local_groups:
+                continue
+        if view_groups != -1 and _scale_view_shape_dim(
             input_node,
             group_dim,
             dc,

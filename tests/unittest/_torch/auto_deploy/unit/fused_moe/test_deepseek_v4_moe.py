@@ -31,7 +31,11 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.deepseek_v4_moe import
 from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.mxfp4_moe import (
     _deepseek_v4_swiglu_torch,
     _interleave_deepseek_v4_gate_up,
+    _routing_from_prebuilt_metadata,
     _routing_from_precomputed,
+    localize_deepseek_v4_routes_for_mxfp4,
+    prepare_deepseek_v4_route_metadata,
+    prepare_deepseek_v4_route_metadata_tensors,
 )
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
@@ -57,6 +61,15 @@ _DEEPSEEK_V4_REAL_CKPT_ENV = "DEEPSEEK_V4_FLASH_CHECKPOINT"
 _DEFAULT_DEEPSEEK_V4_REAL_CKPT = Path(
     "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/users/"
     "bmarimuthu/dev/hf_home/manual/deepseek-ai__DeepSeek-V4-Flash"
+)
+_ROUTE_METADATA_ARG_NAMES = (
+    "sorted_routing_weights",
+    "expert_histogram",
+    "sorted_route_indices",
+    "inverse_route_indices",
+    "expert_offsets",
+    "expert_block_offsets",
+    "expert_block_schedule",
 )
 
 
@@ -598,6 +611,418 @@ def test_from_routing_fake_returns_meta_output_shape() -> None:
     assert actual.device.type == "meta"
 
 
+def test_deepseek_v4_route_metadata_prepares_sort_histogram_and_indices() -> None:
+    selected_experts = torch.tensor([[2, 0, 2], [1, 0, 3]], dtype=torch.int64)
+    routing_weights = torch.tensor(
+        [[0.2, 0.1, 0.3], [0.4, 0.5, 0.6]],
+        dtype=torch.float32,
+    )
+
+    route_metadata = prepare_deepseek_v4_route_metadata(
+        selected_experts,
+        routing_weights,
+        num_experts=4,
+    )
+    metadata_tensors = prepare_deepseek_v4_route_metadata_tensors(
+        selected_experts,
+        routing_weights,
+        num_experts=4,
+    )
+
+    expected_sorted = torch.tensor([1, 4, 3, 0, 2, 5], dtype=torch.int32)
+    expected_inverse = torch.tensor([3, 0, 4, 2, 1, 5], dtype=torch.int32)
+    expected_histogram = torch.tensor([2, 1, 2, 1], dtype=torch.int32)
+    expected_offsets = torch.tensor([0, 2, 3, 5, 6], dtype=torch.int32)
+
+    assert route_metadata.num_experts == 4
+    assert route_metadata.top_k == 3
+    assert route_metadata.num_routes == 6
+    torch.testing.assert_close(
+        route_metadata.flat_expert_ids,
+        selected_experts.reshape(-1),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(route_metadata.sorted_route_indices, expected_sorted)
+    torch.testing.assert_close(route_metadata.inverse_route_indices, expected_inverse)
+    torch.testing.assert_close(route_metadata.expert_histogram, expected_histogram)
+    torch.testing.assert_close(
+        route_metadata.sorted_routing_weights,
+        routing_weights.reshape(-1)[expected_sorted.to(torch.int64)],
+    )
+    torch.testing.assert_close(metadata_tensors.expert_offsets, expected_offsets)
+    torch.testing.assert_close(metadata_tensors.expert_histogram, expected_histogram)
+    torch.testing.assert_close(metadata_tensors.sorted_route_indices, expected_sorted)
+    torch.testing.assert_close(metadata_tensors.inverse_route_indices, expected_inverse)
+
+
+def _assert_routing_bridge_matches(
+    actual: tuple[object, object, object],
+    expected: tuple[object, object, object],
+) -> None:
+    actual_routing, actual_gather, actual_scatter = actual
+    expected_routing, expected_gather, expected_scatter = expected
+
+    assert actual_routing.n_expts_tot == expected_routing.n_expts_tot
+    assert actual_routing.n_expts_act == expected_routing.n_expts_act
+    torch.testing.assert_close(actual_routing.gate_scal, expected_routing.gate_scal)
+    torch.testing.assert_close(actual_routing.expt_hist, expected_routing.expt_hist)
+    torch.testing.assert_close(
+        actual_routing.expt_data.slice_sizes,
+        expected_routing.expt_data.slice_sizes,
+    )
+    torch.testing.assert_close(
+        actual_routing.expt_data.slice_offs,
+        expected_routing.expt_data.slice_offs,
+    )
+    torch.testing.assert_close(
+        actual_routing.expt_data.block_offs_data,
+        expected_routing.expt_data.block_offs_data,
+    )
+    torch.testing.assert_close(
+        actual_routing.expt_data.block_schedule_data,
+        expected_routing.expt_data.block_schedule_data,
+    )
+    torch.testing.assert_close(actual_gather.src_indx, expected_gather.src_indx)
+    torch.testing.assert_close(actual_gather.dst_indx, expected_gather.dst_indx)
+    torch.testing.assert_close(actual_scatter.src_indx, expected_scatter.src_indx)
+    torch.testing.assert_close(actual_scatter.dst_indx, expected_scatter.dst_indx)
+
+
+def _assert_prebuilt_metadata_matches_precomputed(
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    num_experts: int,
+) -> None:
+    metadata_tensors = prepare_deepseek_v4_route_metadata_tensors(
+        selected_experts,
+        routing_weights,
+        num_experts,
+    )
+    actual = _routing_from_prebuilt_metadata(
+        *metadata_tensors.as_tuple(),
+        num_experts=num_experts,
+        top_k=selected_experts.shape[1],
+    )
+    expected = _routing_from_precomputed(selected_experts, routing_weights, num_experts)
+
+    _assert_routing_bridge_matches(actual, expected)
+
+
+def test_deepseek_v4_prebuilt_route_metadata_matches_precomputed_bridge() -> None:
+    selected_experts = torch.tensor(
+        [
+            [2, 0, 2, 7, 1, 0],
+            [1, 0, 3, 7, 4, 4],
+            [6, 2, 5, 3, 1, 0],
+        ],
+        dtype=torch.int64,
+    )
+    routing_weights = torch.arange(1, 19, dtype=torch.float32).view(3, 6).div(19.0)
+
+    _assert_prebuilt_metadata_matches_precomputed(
+        selected_experts,
+        routing_weights,
+        num_experts=8,
+    )
+
+
+def test_deepseek_v4_prebuilt_route_metadata_handles_all_routes_to_one_expert() -> None:
+    selected_experts = torch.full((5, 6), 17, dtype=torch.int64)
+    routing_weights = torch.linspace(0.05, 1.5, 30, dtype=torch.float32).view(5, 6)
+    metadata_tensors = prepare_deepseek_v4_route_metadata_tensors(
+        selected_experts,
+        routing_weights,
+        num_experts=32,
+    )
+
+    expected_histogram = torch.zeros(32, dtype=torch.int32)
+    expected_histogram[17] = selected_experts.numel()
+
+    torch.testing.assert_close(metadata_tensors.expert_histogram, expected_histogram)
+    torch.testing.assert_close(
+        metadata_tensors.sorted_route_indices,
+        torch.arange(selected_experts.numel(), dtype=torch.int32),
+    )
+    _assert_prebuilt_metadata_matches_precomputed(
+        selected_experts,
+        routing_weights,
+        num_experts=32,
+    )
+
+
+def test_deepseek_v4_prebuilt_route_metadata_handles_sparse_experts_32_topk6() -> None:
+    selected_experts = torch.tensor(
+        [
+            [0, 31, 0, 31, 7, 7],
+            [7, 0, 31, 7, 0, 31],
+            [31, 31, 7, 0, 7, 0],
+        ],
+        dtype=torch.int64,
+    )
+    routing_weights = torch.arange(1, 19, dtype=torch.float32).view(3, 6).div(18.0)
+
+    metadata_tensors = prepare_deepseek_v4_route_metadata_tensors(
+        selected_experts,
+        routing_weights,
+        num_experts=32,
+    )
+
+    expected_histogram = torch.zeros(32, dtype=torch.int32)
+    expected_histogram[0] = 6
+    expected_histogram[7] = 6
+    expected_histogram[31] = 6
+    expected_sorted = torch.argsort(selected_experts.reshape(-1), stable=True).to(torch.int32)
+    expected_offsets = torch.cumsum(
+        torch.cat((torch.zeros(1, dtype=torch.int32), expected_histogram)),
+        dim=0,
+    ).to(torch.int32)
+
+    torch.testing.assert_close(metadata_tensors.expert_histogram, expected_histogram)
+    torch.testing.assert_close(metadata_tensors.sorted_route_indices, expected_sorted)
+    torch.testing.assert_close(metadata_tensors.expert_offsets, expected_offsets)
+    torch.testing.assert_close(
+        metadata_tensors.sorted_routing_weights,
+        routing_weights.reshape(-1)[expected_sorted.to(torch.int64)],
+    )
+    _assert_prebuilt_metadata_matches_precomputed(
+        selected_experts,
+        routing_weights,
+        num_experts=32,
+    )
+
+
+def test_deepseek_v4_prebuilt_route_metadata_uses_32_local_experts_topk6_shape() -> None:
+    selected_experts = torch.arange(30, dtype=torch.int64).view(5, 6).mul(7).add(3).remainder(32)
+    routing_weights = torch.arange(1, 31, dtype=torch.float32).view(5, 6).div(31.0)
+
+    metadata_tensors = prepare_deepseek_v4_route_metadata_tensors(
+        selected_experts,
+        routing_weights,
+        num_experts=32,
+    )
+
+    assert metadata_tensors.sorted_routing_weights.shape == (30,)
+    assert metadata_tensors.expert_histogram.shape == (32,)
+    assert metadata_tensors.sorted_route_indices.shape == (30,)
+    assert metadata_tensors.inverse_route_indices.shape == (30,)
+    assert metadata_tensors.expert_offsets.shape == (33,)
+    assert metadata_tensors.expert_block_offsets.shape[1] == 33
+    assert metadata_tensors.expert_block_schedule.shape[1] == 30
+    _assert_prebuilt_metadata_matches_precomputed(
+        selected_experts,
+        routing_weights,
+        num_experts=32,
+    )
+
+
+def test_deepseek_v4_route_metadata_custom_op_fake_uses_32_experts_topk6_shape() -> None:
+    selected_experts = torch.empty((7, 6), dtype=torch.int64, device="meta")
+    routing_weights = torch.empty((7, 6), dtype=torch.float32, device="meta")
+
+    (
+        sorted_routing_weights,
+        expert_histogram,
+        sorted_route_indices,
+        inverse_route_indices,
+        expert_offsets,
+        expert_block_offsets,
+        expert_block_schedule,
+    ) = torch.ops.auto_deploy.torch_deepseek_v4_mxfp4_route_metadata.default(
+        selected_experts,
+        routing_weights,
+        32,
+    )
+
+    assert sorted_routing_weights.shape == (42,)
+    assert sorted_routing_weights.dtype == torch.float32
+    assert expert_histogram.shape == (32,)
+    assert sorted_route_indices.shape == (42,)
+    assert inverse_route_indices.shape == (42,)
+    assert expert_offsets.shape == (33,)
+    assert expert_block_offsets.shape[1] == 33
+    assert expert_block_schedule.shape[1] == 32
+
+
+def test_deepseek_v4_route_metadata_localizes_observed_ep8_rank_slice() -> None:
+    selected_experts = torch.tensor([[0, 31, 32, 63, 64, 95, 224, 255]], dtype=torch.int64)
+    routing_weights = torch.arange(1, 9, dtype=torch.float32).view(1, 8)
+
+    ep_metadata = localize_deepseek_v4_routes_for_mxfp4(
+        selected_experts,
+        routing_weights,
+        moe_ep_size=8,
+        moe_ep_rank=7,
+        num_global_experts=256,
+    )
+    route_metadata = prepare_deepseek_v4_route_metadata(
+        ep_metadata.selected_experts_local,
+        ep_metadata.routing_weights_local,
+        num_experts=ep_metadata.experts_per_rank,
+    )
+
+    expected_mask = torch.tensor([[False, False, False, False, False, False, True, True]])
+    expected_local = torch.tensor([[0, 0, 0, 0, 0, 0, 0, 31]], dtype=torch.int64)
+    expected_weights = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 7.0, 8.0]])
+    expected_histogram = torch.zeros(32, dtype=torch.int32)
+    expected_histogram[0] = 7
+    expected_histogram[31] = 1
+
+    assert ep_metadata.local_expert_start == 224
+    assert ep_metadata.local_expert_end == 256
+    assert ep_metadata.experts_per_rank == 32
+    assert torch.equal(ep_metadata.rank_mask, expected_mask)
+    torch.testing.assert_close(ep_metadata.selected_experts_local, expected_local)
+    torch.testing.assert_close(ep_metadata.routing_weights_local, expected_weights)
+    torch.testing.assert_close(route_metadata.expert_histogram, expected_histogram)
+    _assert_prebuilt_metadata_matches_precomputed(
+        ep_metadata.selected_experts_local,
+        ep_metadata.routing_weights_local,
+        num_experts=ep_metadata.experts_per_rank,
+    )
+
+
+def test_deepseek_v4_route_metadata_localizes_ep8_rank3_topk6_nonlocal_routes() -> None:
+    selected_experts = torch.tensor(
+        [
+            [95, 96, 101, 127, 128, 255],
+            [0, 100, 121, 190, 97, 32],
+        ],
+        dtype=torch.int64,
+    )
+    routing_weights = torch.arange(1, 13, dtype=torch.float32).view(2, 6)
+
+    ep_metadata = localize_deepseek_v4_routes_for_mxfp4(
+        selected_experts,
+        routing_weights,
+        moe_ep_size=8,
+        moe_ep_rank=3,
+        num_global_experts=256,
+    )
+    route_metadata = prepare_deepseek_v4_route_metadata(
+        ep_metadata.selected_experts_local,
+        ep_metadata.routing_weights_local,
+        num_experts=ep_metadata.experts_per_rank,
+    )
+
+    expected_mask = torch.tensor(
+        [
+            [False, True, True, True, False, False],
+            [False, True, True, False, True, False],
+        ]
+    )
+    expected_local = torch.tensor(
+        [
+            [0, 0, 5, 31, 0, 0],
+            [0, 4, 25, 0, 1, 0],
+        ],
+        dtype=torch.int64,
+    )
+    expected_weights = torch.tensor(
+        [
+            [0.0, 2.0, 3.0, 4.0, 0.0, 0.0],
+            [0.0, 8.0, 9.0, 0.0, 11.0, 0.0],
+        ]
+    )
+    expected_histogram = torch.zeros(32, dtype=torch.int32)
+    expected_histogram[0] = 7
+    expected_histogram[1] = 1
+    expected_histogram[4] = 1
+    expected_histogram[5] = 1
+    expected_histogram[25] = 1
+    expected_histogram[31] = 1
+
+    assert ep_metadata.local_expert_start == 96
+    assert ep_metadata.local_expert_end == 128
+    assert ep_metadata.experts_per_rank == 32
+    assert torch.equal(ep_metadata.rank_mask, expected_mask)
+    torch.testing.assert_close(ep_metadata.selected_experts_local, expected_local)
+    torch.testing.assert_close(ep_metadata.routing_weights_local, expected_weights)
+    torch.testing.assert_close(route_metadata.expert_histogram, expected_histogram)
+    _assert_prebuilt_metadata_matches_precomputed(
+        ep_metadata.selected_experts_local,
+        ep_metadata.routing_weights_local,
+        num_experts=ep_metadata.experts_per_rank,
+    )
+
+
+def test_mxfp4_from_routing_uses_prebuilt_metadata_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hidden_states = torch.randn(2, 4, dtype=torch.bfloat16)
+    selected_experts = torch.tensor([[1, 0], [0, 1]], dtype=torch.int64)
+    routing_weights = torch.tensor([[0.25, 0.75], [0.5, 0.5]], dtype=torch.float32)
+    metadata_tensors = prepare_deepseek_v4_route_metadata_tensors(
+        selected_experts,
+        routing_weights,
+        num_experts=2,
+    )
+    captured = {}
+
+    def _fail_precomputed(*args, **kwargs):
+        raise AssertionError("precomputed route metadata path should not run")
+
+    def _fake_core_from_routing(
+        hidden_states: torch.Tensor,
+        gate_up_blocks: torch.Tensor,
+        gate_up_bias: torch.Tensor,
+        gate_up_scales: torch.Tensor,
+        alpha: float,
+        limit: float,
+        down_blocks: torch.Tensor,
+        down_bias: torch.Tensor,
+        down_scales: torch.Tensor,
+        routing_data,
+        gather_idx,
+        scatter_idx,
+        **kwargs,
+    ) -> torch.Tensor:
+        del (
+            gate_up_blocks,
+            gate_up_bias,
+            gate_up_scales,
+            alpha,
+            limit,
+            down_blocks,
+            down_bias,
+            down_scales,
+            kwargs,
+        )
+        captured["routing"] = (routing_data, gather_idx, scatter_idx)
+        return torch.full_like(hidden_states, 3)
+
+    monkeypatch.setattr(mxfp4_moe, "_routing_from_precomputed", _fail_precomputed)
+    monkeypatch.setattr(
+        mxfp4_moe,
+        "_run_mxfp4_mlp_core_from_routing",
+        _fake_core_from_routing,
+    )
+
+    actual = torch.ops.auto_deploy.triton_deepseek_v4_mxfp4_moe_from_routing.default(
+        hidden_states,
+        selected_experts,
+        routing_weights,
+        torch.empty((2, 8, 2, 16), dtype=torch.uint8),
+        torch.empty((2, 8), dtype=torch.float32),
+        torch.empty((2, 8, 2), dtype=torch.uint8),
+        1.0,
+        10.0,
+        torch.empty((2, 4, 2, 16), dtype=torch.uint8),
+        torch.empty((2, 4), dtype=torch.float32),
+        torch.empty((2, 4, 2), dtype=torch.uint8),
+        "moe",
+        *metadata_tensors.as_tuple(),
+    )
+    expected_routing = _routing_from_prebuilt_metadata(
+        *metadata_tensors.as_tuple(),
+        num_experts=2,
+        top_k=2,
+    )
+
+    torch.testing.assert_close(actual, torch.full_like(hidden_states, 3))
+    _assert_routing_bridge_matches(captured["routing"], expected_routing)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_mxfp4_precomputed_routing_accepts_non_power_of_two_topk() -> None:
     selected_experts = torch.tensor(
@@ -652,6 +1077,39 @@ def test_mxfp4_precomputed_routing_accepts_non_power_of_two_topk() -> None:
         captured_routing_data.gate_scal,
         routing_weights.reshape(-1)[expected_order.to(torch.int64)],
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_deepseek_v4_route_metadata_custom_op_replays_in_cuda_graph_32_topk6() -> None:
+    selected_experts = torch.tensor(
+        [
+            [31, 0, 17, 17, 3, 31],
+            [8, 3, 0, 24, 24, 17],
+            [31, 8, 8, 3, 0, 24],
+        ],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    routing_weights = torch.arange(1, 19, dtype=torch.float32, device="cuda").view(3, 6).div(19.0)
+
+    expected = torch.ops.auto_deploy.torch_deepseek_v4_mxfp4_route_metadata.default(
+        selected_experts,
+        routing_weights,
+        32,
+    )
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = torch.ops.auto_deploy.torch_deepseek_v4_mxfp4_route_metadata.default(
+            selected_experts,
+            routing_weights,
+            32,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    for actual, expected_tensor in zip(captured, expected):
+        torch.testing.assert_close(actual, expected_tensor)
 
 
 class _FromRoutingExportModule(nn.Module):
@@ -753,7 +1211,23 @@ class _MXFP4FromRoutingShardingModule(nn.Module):
         )
 
 
-def _trace_mxfp4_from_routing_sharding_module(num_experts: int = 4) -> torch.fx.GraphModule:
+def test_triton_mxfp4_from_routing_custom_op_exports() -> None:
+    module = _MXFP4FromRoutingShardingModule(num_experts=2)
+    hidden_states = torch.randn(3, 4, dtype=torch.bfloat16)
+    selected_experts = torch.tensor([[1, 0], [0, 1], [1, 0]], dtype=torch.int64)
+    routing_weights = torch.full((3, 2), 0.5, dtype=torch.float32)
+
+    exported = torch.export.export(module, (hidden_states, selected_experts, routing_weights))
+    targets = [node.target for node in exported.graph_module.graph.nodes]
+
+    assert torch.ops.auto_deploy.triton_deepseek_v4_mxfp4_moe_from_routing.default in targets
+    assert torch.ops.auto_deploy.torch_deepseek_v4_moe_from_routing.default not in targets
+
+
+def _trace_mxfp4_from_routing_sharding_module(
+    num_experts: int = 4,
+    top_k: int = 2,
+) -> torch.fx.GraphModule:
     gm = torch.fx.symbolic_trace(_MXFP4FromRoutingShardingModule(num_experts))
     params_and_buffers = dict(gm.named_parameters())
     params_and_buffers.update(dict(gm.named_buffers()))
@@ -762,9 +1236,9 @@ def _trace_mxfp4_from_routing_sharding_module(num_experts: int = 4) -> torch.fx.
             if node.target == "hidden_states":
                 node.meta["val"] = torch.empty((3, 4), dtype=torch.bfloat16)
             elif node.target == "selected_experts":
-                node.meta["val"] = torch.empty((3, 2), dtype=torch.int64)
+                node.meta["val"] = torch.empty((3, top_k), dtype=torch.int64)
             elif node.target == "routing_weights":
-                node.meta["val"] = torch.empty((3, 2), dtype=torch.float32)
+                node.meta["val"] = torch.empty((3, top_k), dtype=torch.float32)
         elif node.op == "get_attr" and node.target in params_and_buffers:
             node.meta["val"] = params_and_buffers[node.target].detach()
         elif is_op(
@@ -775,10 +1249,187 @@ def _trace_mxfp4_from_routing_sharding_module(num_experts: int = 4) -> torch.fx.
     return gm
 
 
+def _meta_parameter(shape: tuple[int, ...], dtype: torch.dtype) -> nn.Parameter:
+    return nn.Parameter(torch.empty(shape, dtype=dtype, device="meta"), requires_grad=False)
+
+
+class _LoweredDeepSeekV4EP8ShapeRoot(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList([nn.Module()])
+        self.layers[0].ffn = nn.Module()
+        ffn = self.layers[0].ffn
+        ffn.mxfp4_gate_up_blocks = _meta_parameter((256, 4096, 128, 16), torch.uint8)
+        ffn.register_buffer(
+            "mxfp4_gate_up_bias",
+            torch.empty((256, 4096), dtype=torch.float32, device="meta"),
+            persistent=False,
+        )
+        ffn.mxfp4_gate_up_scales = _meta_parameter((256, 4096, 128), torch.uint8)
+        ffn.mxfp4_down_blocks = _meta_parameter((256, 4096, 64, 16), torch.uint8)
+        ffn.register_buffer(
+            "mxfp4_down_bias",
+            torch.empty((256, 4096), dtype=torch.float32, device="meta"),
+            persistent=False,
+        )
+        ffn.mxfp4_down_scales = _meta_parameter((256, 4096, 64), torch.uint8)
+        ffn.shared_experts = nn.Module()
+        for proj, weight_shape, scale_shape in (
+            ("w1", (2048, 4096), (16, 32)),
+            ("w2", (4096, 2048), (32, 16)),
+            ("w3", (2048, 4096), (16, 32)),
+        ):
+            linear = nn.Module()
+            linear.weight = _meta_parameter(weight_shape, torch.float8_e4m3fn)
+            linear.register_buffer(
+                "weight_scale_inv",
+                torch.empty(scale_shape, dtype=torch.float32, device="meta"),
+            )
+            setattr(ffn.shared_experts, proj, linear)
+
+
+def _nested_attr(module: nn.Module, name: str) -> torch.Tensor:
+    value: object = module
+    for part in name.split("."):
+        value = getattr(value, part)
+    assert isinstance(value, torch.Tensor)
+    return value
+
+
+def _get_attr_with_meta(graph: torch.fx.Graph, root: nn.Module, name: str) -> torch.fx.Node:
+    node = graph.create_node("get_attr", name)
+    node.meta["val"] = _nested_attr(root, name).detach()
+    return node
+
+
+def _call_fp8_linear_with_meta(
+    graph: torch.fx.Graph,
+    input_node: torch.fx.Node,
+    input_shape: tuple[int, int],
+    weight_node: torch.fx.Node,
+    scale_node: torch.fx.Node,
+    tp_mode: str,
+) -> torch.fx.Node:
+    output_features = int(weight_node.meta["val"].shape[0])
+    if tp_mode == "rowwise":
+        output_features = int(weight_node.meta["val"].shape[0])
+    node = graph.call_function(
+        torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear.default,
+        args=(input_node, weight_node, None, [], [scale_node], [], [], tp_mode, None, 1, "moe"),
+    )
+    node.meta["val"] = torch.empty(
+        (*input_shape[:-1], output_features),
+        dtype=torch.bfloat16,
+        device="meta",
+    )
+    return node
+
+
+def _make_lowered_deepseek_v4_ep8_shape_graph() -> torch.fx.GraphModule:
+    root = _LoweredDeepSeekV4EP8ShapeRoot()
+    graph = torch.fx.Graph()
+    hidden_states = graph.placeholder("hidden_states")
+    hidden_states.meta["val"] = torch.empty((2, 4096), dtype=torch.bfloat16, device="meta")
+    selected_experts = graph.placeholder("selected_experts")
+    selected_experts.meta["val"] = torch.empty((2, 6), dtype=torch.int64, device="meta")
+    routing_weights = graph.placeholder("routing_weights")
+    routing_weights.meta["val"] = torch.empty((2, 6), dtype=torch.float32, device="meta")
+
+    gate_up_blocks = _get_attr_with_meta(graph, root, "layers.0.ffn.mxfp4_gate_up_blocks")
+    gate_up_bias = _get_attr_with_meta(graph, root, "layers.0.ffn.mxfp4_gate_up_bias")
+    gate_up_scales = _get_attr_with_meta(graph, root, "layers.0.ffn.mxfp4_gate_up_scales")
+    down_blocks = _get_attr_with_meta(graph, root, "layers.0.ffn.mxfp4_down_blocks")
+    down_bias = _get_attr_with_meta(graph, root, "layers.0.ffn.mxfp4_down_bias")
+    down_scales = _get_attr_with_meta(graph, root, "layers.0.ffn.mxfp4_down_scales")
+    routed = graph.call_function(
+        torch.ops.auto_deploy.triton_deepseek_v4_mxfp4_moe_from_routing.default,
+        args=(
+            hidden_states,
+            selected_experts,
+            routing_weights,
+            gate_up_blocks,
+            gate_up_bias,
+            gate_up_scales,
+            1.0,
+            10.0,
+            down_blocks,
+            down_bias,
+            down_scales,
+            "moe",
+        ),
+    )
+    routed.meta["val"] = torch.empty((2, 4096), dtype=torch.bfloat16, device="meta")
+
+    shared_w1 = _get_attr_with_meta(graph, root, "layers.0.ffn.shared_experts.w1.weight")
+    shared_w1_scale = _get_attr_with_meta(
+        graph,
+        root,
+        "layers.0.ffn.shared_experts.w1.weight_scale_inv",
+    )
+    shared_w2 = _get_attr_with_meta(graph, root, "layers.0.ffn.shared_experts.w2.weight")
+    shared_w2_scale = _get_attr_with_meta(
+        graph,
+        root,
+        "layers.0.ffn.shared_experts.w2.weight_scale_inv",
+    )
+    shared_w3 = _get_attr_with_meta(graph, root, "layers.0.ffn.shared_experts.w3.weight")
+    shared_w3_scale = _get_attr_with_meta(
+        graph,
+        root,
+        "layers.0.ffn.shared_experts.w3.weight_scale_inv",
+    )
+    shared_gate = _call_fp8_linear_with_meta(
+        graph, hidden_states, (2, 4096), shared_w1, shared_w1_scale, "colwise"
+    )
+    shared_up = _call_fp8_linear_with_meta(
+        graph, hidden_states, (2, 4096), shared_w3, shared_w3_scale, "colwise"
+    )
+    shared_act = graph.call_function(torch.ops.aten.silu.default, args=(shared_gate,))
+    shared_act.meta["val"] = torch.empty((2, 2048), dtype=torch.bfloat16, device="meta")
+    shared_hidden = graph.call_function(torch.ops.aten.mul.Tensor, args=(shared_act, shared_up))
+    shared_hidden.meta["val"] = torch.empty((2, 2048), dtype=torch.bfloat16, device="meta")
+    shared = _call_fp8_linear_with_meta(
+        graph, shared_hidden, (2, 2048), shared_w2, shared_w2_scale, "rowwise"
+    )
+    shared_reduced = graph.call_function(
+        torch.ops.auto_deploy.all_reduce.default,
+        args=(shared,),
+        kwargs={"layer_type": "moe"},
+    )
+    shared_reduced.meta["val"] = torch.empty((2, 4096), dtype=torch.bfloat16, device="meta")
+    output = graph.call_function(torch.ops.aten.add.Tensor, args=(routed, shared_reduced))
+    output.meta["val"] = torch.empty((2, 4096), dtype=torch.bfloat16, device="meta")
+    graph.output(output)
+    return torch.fx.GraphModule(root, graph)
+
+
 def _shift_state_value(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.dtype == torch.uint8:
         return tensor.to(torch.int64).add(19).remainder(251).to(torch.uint8)
     return tensor + 19
+
+
+def _is_all_reduce_node(node: torch.fx.Node) -> bool:
+    return node.op == "call_function" and "all_reduce" in str(node.target)
+
+
+def _assert_mxfp4_node_uses_local_route_metadata(
+    moe_node: torch.fx.Node,
+    selected_local: torch.fx.Node,
+    routing_local: torch.fx.Node,
+    num_local_experts: int,
+) -> None:
+    assert is_op(
+        moe_node,
+        torch.ops.auto_deploy.triton_deepseek_v4_mxfp4_moe_from_routing,
+    )
+    metadata_nodes = extract_op_args(moe_node, *_ROUTE_METADATA_ARG_NAMES)
+    assert len(metadata_nodes) == len(_ROUTE_METADATA_ARG_NAMES)
+    assert all(isinstance(node, torch.fx.Node) for node in metadata_nodes)
+    route_metadata = metadata_nodes[0].args[0]
+    assert all(node.args[0] is route_metadata for node in metadata_nodes)
+    assert is_op(route_metadata, torch.ops.auto_deploy.torch_deepseek_v4_mxfp4_route_metadata)
+    assert route_metadata.args == (selected_local, routing_local, num_local_experts)
 
 
 def test_deepseek_v4_mxfp4_from_routing_shards_experts_and_localizes_ids() -> None:
@@ -809,11 +1460,14 @@ def test_deepseek_v4_mxfp4_from_routing_shards_experts_and_localizes_ids() -> No
     assert selected_local.args[0].target == operator.sub
     assert selected_local.args[0].args[1] == 2
     assert selected_local.args[1].target == torch.logical_and
+    _assert_mxfp4_node_uses_local_route_metadata(
+        moe_node,
+        selected_local,
+        routing_local,
+        num_local_experts=2,
+    )
     assert any(
-        node.op == "call_function"
-        and node.args
-        and node.args[0] is moe_node
-        and "all_reduce" in str(node.target)
+        node.args and node.args[0] is moe_node and _is_all_reduce_node(node)
         for node in transformed.graph.nodes
     )
 
@@ -866,6 +1520,105 @@ def test_deepseek_v4_mxfp4_from_routing_ep8_localizes_rank7_global_ids() -> None
     assert ge_lower.args[1] == 14
     assert lt_upper.target == torch.lt
     assert lt_upper.args[1] == 16
+    _assert_mxfp4_node_uses_local_route_metadata(
+        moe_node,
+        selected_local,
+        routing_local,
+        num_local_experts=2,
+    )
+
+
+def test_deepseek_v4_mxfp4_from_routing_ep8_uses_32_local_experts_topk6_metadata() -> None:
+    gm = _trace_mxfp4_from_routing_sharding_module(num_experts=256, top_k=6)
+    full_state = {name: tensor.detach().clone() for name, tensor in gm.named_parameters()}
+
+    transformed, info = _run_ir_sharding(gm, rank=5, world_size=8)
+
+    assert info.num_matches == 1
+    for name, full_tensor in full_state.items():
+        local_tensor = transformed.get_parameter(name)
+        assert local_tensor.shape[0] == 32
+        torch.testing.assert_close(local_tensor, full_tensor[160:192], rtol=0, atol=0)
+
+    moe_node = next(
+        node
+        for node in transformed.graph.nodes
+        if is_op(
+            node,
+            torch.ops.auto_deploy.triton_deepseek_v4_mxfp4_moe_from_routing,
+        )
+    )
+    selected_local = moe_node.args[1]
+    routing_local = moe_node.args[2]
+    assert moe_node.args[6] == 1.0
+    assert moe_node.args[7] == 10.0
+    assert selected_local.args[0].target == operator.sub
+    assert selected_local.args[0].args[1] == 160
+    _assert_mxfp4_node_uses_local_route_metadata(
+        moe_node,
+        selected_local,
+        routing_local,
+        num_local_experts=32,
+    )
+    assert any(
+        node.args and node.args[0] is moe_node and _is_all_reduce_node(node)
+        for node in transformed.graph.nodes
+    )
+
+
+def test_lowered_deepseek_v4_ep8_exact_local_shapes_metadata_and_collectives() -> None:
+    gm = _make_lowered_deepseek_v4_ep8_shape_graph()
+
+    transformed, info = _run_ir_sharding(gm, rank=6, world_size=8)
+
+    assert info.num_matches == 5
+    ffn = transformed.get_submodule("layers.0.ffn")
+    assert tuple(ffn.mxfp4_gate_up_blocks.shape) == (32, 4096, 128, 16)
+    assert tuple(ffn.mxfp4_gate_up_bias.shape) == (32, 4096)
+    assert tuple(ffn.mxfp4_gate_up_scales.shape) == (32, 4096, 128)
+    assert tuple(ffn.mxfp4_down_blocks.shape) == (32, 4096, 64, 16)
+    assert tuple(ffn.mxfp4_down_bias.shape) == (32, 4096)
+    assert tuple(ffn.mxfp4_down_scales.shape) == (32, 4096, 64)
+    assert tuple(ffn.shared_experts.w1.weight.shape) == (256, 4096)
+    assert tuple(ffn.shared_experts.w2.weight.shape) == (4096, 256)
+    assert tuple(ffn.shared_experts.w3.weight.shape) == (256, 4096)
+
+    moe_node = next(
+        node
+        for node in transformed.graph.nodes
+        if is_op(
+            node,
+            torch.ops.auto_deploy.triton_deepseek_v4_mxfp4_moe_from_routing,
+        )
+    )
+    selected_local = moe_node.args[1]
+    routing_local = moe_node.args[2]
+    assert moe_node.args[6] == 1.0
+    assert moe_node.args[7] == 10.0
+    assert selected_local.args[0].target == operator.sub
+    assert selected_local.args[0].args[1] == 192
+    _assert_mxfp4_node_uses_local_route_metadata(
+        moe_node,
+        selected_local,
+        routing_local,
+        num_local_experts=32,
+    )
+
+    all_reduce_nodes = [node for node in transformed.graph.nodes if _is_all_reduce_node(node)]
+    shared_w2_node = _shared_fp8_linear_nodes(transformed)["layers.0.ffn.shared_experts.w2.weight"]
+    routed_reduces = [node for node in all_reduce_nodes if node.args[0] is moe_node]
+    shared_reduces = [node for node in all_reduce_nodes if node.args[0] is shared_w2_node]
+    assert len(routed_reduces) == 1
+    assert len(shared_reduces) == 1
+    add_node = next(
+        node for node in transformed.graph.nodes if node.target == torch.ops.aten.add.Tensor
+    )
+    assert add_node.args == (routed_reduces[0], shared_reduces[0])
+    assert not any(
+        is_op(node, torch.ops.auto_deploy.torch_deepseek_v4_moe_from_routing)
+        or is_op(node, torch.ops.auto_deploy.torch_deepseek_v4_moe)
+        for node in transformed.graph.nodes
+    )
 
 
 class _CanonicalMoEModule(nn.Module):
@@ -937,6 +1690,144 @@ def test_lowering_skeleton_can_opt_into_reference_graph_for_tests() -> None:
     torch.testing.assert_close(lowered(hidden_states), module(hidden_states))
 
 
+@pytest.mark.parametrize(
+    ("num_hash_layers", "expected_is_hash_layer"),
+    [(0, False), (1, True)],
+)
+def test_lowering_bridge_production_uses_triton_router_source_op(
+    num_hash_layers: int,
+    expected_is_hash_layer: bool,
+) -> None:
+    lowered, info = _lower_layered_moe_model(num_hash_layers=num_hash_layers)
+
+    assert info.num_matches == 1
+    torch_router_nodes = [
+        node
+        for node in lowered.graph.nodes
+        if is_op(node, torch.ops.auto_deploy.torch_deepseek_v4_router)
+    ]
+    triton_router_nodes = [
+        node
+        for node in lowered.graph.nodes
+        if is_op(node, torch.ops.auto_deploy.triton_deepseek_v4_router)
+    ]
+    assert torch_router_nodes == []
+    assert len(triton_router_nodes) == 1
+
+    router_node = triton_router_nodes[0]
+    assert router_node.args[7] == expected_is_hash_layer
+    if expected_is_hash_layer:
+        assert router_node.args[3] is None
+        assert isinstance(router_node.args[4], torch.fx.Node)
+    else:
+        assert isinstance(router_node.args[3], torch.fx.Node)
+        assert router_node.args[4] is None
+    mxfp4_node = next(
+        node
+        for node in lowered.graph.nodes
+        if is_op(
+            node,
+            torch.ops.auto_deploy.triton_deepseek_v4_mxfp4_moe_from_routing,
+        )
+    )
+    selected_experts = mxfp4_node.args[1]
+    routing_weights = mxfp4_node.args[2]
+
+    assert selected_experts.target == operator.getitem
+    assert selected_experts.args == (router_node, 0)
+    assert routing_weights.target == operator.getitem
+    assert routing_weights.args == (router_node, 1)
+    assert torch.ops.auto_deploy.torch_deepseek_v4_moe_from_routing.default not in [
+        node.target for node in lowered.graph.nodes
+    ]
+
+
+def test_lowering_bridge_ep8_production_uses_triton_router_packed_mxfp4_and_collectives() -> None:
+    lowered, lowering_info = _lower_layered_moe_model(
+        n_routed_experts=256,
+        num_experts_per_tok=6,
+        num_hash_layers=1,
+    )
+
+    transformed, sharding_info = _run_ir_sharding(lowered, rank=6, world_size=8)
+
+    assert lowering_info.num_matches == 1
+    assert sharding_info.num_matches >= 5
+    assert not any(
+        is_op(node, torch.ops.auto_deploy.torch_deepseek_v4_router)
+        or is_op(node, torch.ops.auto_deploy.torch_deepseek_v4_moe_from_routing)
+        or is_op(node, torch.ops.auto_deploy.torch_deepseek_v4_moe)
+        for node in transformed.graph.nodes
+    )
+
+    router_nodes = [
+        node
+        for node in transformed.graph.nodes
+        if is_op(node, torch.ops.auto_deploy.triton_deepseek_v4_router)
+    ]
+    assert len(router_nodes) == 1
+    router_node = router_nodes[0]
+    assert router_node.args[7] is True
+
+    mxfp4_node = next(
+        node
+        for node in transformed.graph.nodes
+        if is_op(
+            node,
+            torch.ops.auto_deploy.triton_deepseek_v4_mxfp4_moe_from_routing,
+        )
+    )
+    selected_local = mxfp4_node.args[1]
+    routing_local = mxfp4_node.args[2]
+    selected_global = selected_local.args[0].args[0]
+    routing_global = routing_local.args[0]
+
+    assert selected_local.args[0].target == operator.sub
+    assert selected_local.args[0].args[1] == 192
+    assert selected_global.target == operator.getitem
+    assert selected_global.args == (router_node, 0)
+    assert routing_global.target == operator.getitem
+    assert routing_global.args == (router_node, 1)
+    _assert_mxfp4_node_uses_local_route_metadata(
+        mxfp4_node,
+        selected_local,
+        routing_local,
+        num_local_experts=32,
+    )
+
+    ffn = transformed.get_submodule("layers.0.ffn")
+    assert tuple(ffn.mxfp4_gate_up_blocks.shape) == (32, 64, 2, 16)
+    assert tuple(ffn.mxfp4_gate_up_bias.shape) == (32, 64)
+    assert tuple(ffn.mxfp4_gate_up_scales.shape) == (32, 64, 2)
+    assert tuple(ffn.mxfp4_down_blocks.shape) == (32, 64, 1, 16)
+    assert tuple(ffn.mxfp4_down_bias.shape) == (32, 64)
+    assert tuple(ffn.mxfp4_down_scales.shape) == (32, 64, 1)
+
+    fp8_nodes = _shared_fp8_linear_nodes(transformed)
+    expected_modes = {
+        "layers.0.ffn.shared_experts.w1.weight": "colwise",
+        "layers.0.ffn.shared_experts.w2.weight": "rowwise",
+        "layers.0.ffn.shared_experts.w3.weight": "colwise",
+    }
+    assert {
+        weight_name: extract_op_args(node, "tp_mode")[0]
+        for weight_name, node in fp8_nodes.items()
+        if weight_name in expected_modes
+    } == expected_modes
+
+    all_reduce_nodes = [node for node in transformed.graph.nodes if _is_all_reduce_node(node)]
+    shared_w2_node = fp8_nodes["layers.0.ffn.shared_experts.w2.weight"]
+    routed_reduces = [node for node in all_reduce_nodes if node.args[0] is mxfp4_node]
+    shared_reduces = [node for node in all_reduce_nodes if node.args[0] is shared_w2_node]
+    assert len(routed_reduces) == 1
+    assert len(shared_reduces) == 1
+    assert any(
+        node.target == torch.ops.aten.add.Tensor
+        and node.args == (routed_reduces[0], shared_reduces[0])
+        for node in transformed.graph.nodes
+    )
+
+
 class _LayeredMoEBlock(nn.Module):
     def __init__(self, config: DeepseekV4Config) -> None:
         super().__init__()
@@ -947,16 +1838,23 @@ class _LayeredMoEBlock(nn.Module):
 
 
 class _LayeredMoEModel(nn.Module):
-    def __init__(self, hidden_size: int = 64, moe_intermediate_size: int = 32) -> None:
+    def __init__(
+        self,
+        hidden_size: int = 64,
+        moe_intermediate_size: int = 32,
+        num_hash_layers: int = 0,
+        n_routed_experts: int = 2,
+        num_experts_per_tok: int = 1,
+    ) -> None:
         super().__init__()
         config = DeepseekV4Config(
             vocab_size=16,
             hidden_size=hidden_size,
             moe_intermediate_size=moe_intermediate_size,
-            n_routed_experts=2,
+            n_routed_experts=n_routed_experts,
             n_shared_experts=1,
-            num_experts_per_tok=1,
-            num_hash_layers=0,
+            num_experts_per_tok=num_experts_per_tok,
+            num_hash_layers=num_hash_layers,
             scoring_func="sqrtsoftplus",
             routed_scaling_factor=1.0,
             swiglu_limit=10.0,
@@ -970,8 +1868,17 @@ class _LayeredMoEModel(nn.Module):
 def _lower_layered_moe_model(
     hidden_size: int = 64,
     moe_intermediate_size: int = 32,
+    num_hash_layers: int = 0,
+    n_routed_experts: int = 2,
+    num_experts_per_tok: int = 1,
 ) -> tuple[torch.fx.GraphModule, object]:
-    model = _LayeredMoEModel(hidden_size, moe_intermediate_size)
+    model = _LayeredMoEModel(
+        hidden_size,
+        moe_intermediate_size,
+        num_hash_layers,
+        n_routed_experts,
+        num_experts_per_tok,
+    )
     gm = torch_export_to_gm(
         model,
         args=(torch.randn(1, 2, hidden_size), torch.ones(1, 2, dtype=torch.long)),
@@ -1040,14 +1947,21 @@ def test_lowering_bridge_shared_fp8_linears_shard_weights_and_scales() -> None:
     assert shared_w1.weight_scale_inv.shape == (1, 2)
     assert shared_w2.weight_scale_inv.shape == (2, 1)
     assert shared_w3.weight_scale_inv.shape == (1, 2)
-    all_reduce_nodes = [
-        node
-        for node in transformed.graph.nodes
-        if node.op == "call_function" and "all_reduce" in str(node.target)
-    ]
+    all_reduce_nodes = [node for node in transformed.graph.nodes if _is_all_reduce_node(node)]
     assert all_reduce_nodes
     assert all(node.kwargs == {} for node in all_reduce_nodes)
     assert all(len(node.args) == 2 for node in all_reduce_nodes)
+    mxfp4_node = next(
+        node
+        for node in transformed.graph.nodes
+        if is_op(
+            node,
+            torch.ops.auto_deploy.triton_deepseek_v4_mxfp4_moe_from_routing,
+        )
+    )
+    shared_w2_node = _shared_fp8_linear_nodes(transformed)["layers.0.ffn.shared_experts.w2.weight"]
+    assert any(node.args[0] is mxfp4_node for node in all_reduce_nodes)
+    assert any(node.args[0] is shared_w2_node for node in all_reduce_nodes)
 
     full_state = {
         "layers.0.ffn.shared_experts.w1.weight": _fp8_pattern((256, 256), 1),
@@ -1291,9 +2205,9 @@ def test_lowering_bridge_loads_packed_mxfp4_checkpoint_without_dense_shape_misma
     targets = [node.target for node in lowered.graph.nodes]
 
     assert info.num_matches == 1
-    assert torch.ops.auto_deploy.torch_deepseek_v4_router.default in targets
     assert torch.ops.auto_deploy.triton_deepseek_v4_mxfp4_moe_from_routing.default in targets
     assert torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear.default in targets
+    assert torch.ops.auto_deploy.torch_deepseek_v4_moe_from_routing.default not in targets
     assert not any(
         is_op(node, torch.ops.auto_deploy.torch_deepseek_v4_moe) for node in lowered.graph.nodes
     )

@@ -23,6 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.quantization import torch_quant
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
     DeepseekV4Attention,
@@ -43,6 +44,10 @@ _HAS_E8M0 = hasattr(torch, "float8_e8m0fnu")
 _requires_e8m0 = pytest.mark.skipif(
     not _HAS_E8M0,
     reason="torch.float8_e8m0fnu is not available in this PyTorch build",
+)
+_requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA is required for the grouped wo_a Triton path",
 )
 _DEEPSEEK_V4_REAL_CKPT_ENV = "DEEPSEEK_V4_FLASH_CHECKPOINT"
 _DEFAULT_DEEPSEEK_V4_REAL_CKPT = Path(
@@ -376,6 +381,86 @@ def _e8m0_from_bytes(raw_bytes: list[int], shape: tuple[int, ...]) -> torch.Tens
     )
 
 
+def _deepseek_v4_wo_a_supported_tensors(
+    num_groups: int,
+    *,
+    token_count: int,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    group_dim = 4096
+    o_lora_rank = 1024
+    input_tensor = (
+        torch.arange(
+            token_count * num_groups * group_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        .reshape(1, token_count, num_groups, group_dim)
+        .remainder(13)
+        .sub(6)
+        .div(32)
+        .to(torch.bfloat16)
+        .contiguous()
+    )
+    weight = (
+        torch.arange(
+            num_groups * o_lora_rank * group_dim,
+            dtype=torch.float32,
+            device=device,
+        )
+        .reshape(num_groups * o_lora_rank, group_dim)
+        .remainder(17)
+        .sub(8)
+        .div(32)
+        .to(torch.float8_e4m3fn)
+        .contiguous()
+    )
+    weight_scale = (
+        torch.arange(
+            num_groups * (o_lora_rank // 128) * (group_dim // 128),
+            dtype=torch.float32,
+            device=device,
+        )
+        .reshape(num_groups * (o_lora_rank // 128), group_dim // 128)
+        .remainder(3)
+        .sub(1)
+    )
+    weight_scale = torch.pow(torch.full_like(weight_scale, 2.0), weight_scale).contiguous()
+    return input_tensor, weight, weight_scale
+
+
+def _deepseek_v4_wo_a_grouped_reference(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    num_groups = input_tensor.shape[-2]
+    o_lora_rank = weight.shape[0] // num_groups
+    group_dim = input_tensor.shape[-1]
+    weight_dequant = dequant_fp8_weight_two_dim_block_grid(
+        weight,
+        weight_scale,
+        block_n=128,
+        block_k=128,
+        dtype=input_tensor.dtype,
+    )
+    return torch.einsum(
+        "bsgd,grd->bsgr",
+        input_tensor,
+        weight_dequant.view(num_groups, o_lora_rank, group_dim),
+    ).to(input_tensor.dtype)
+
+
+def _fail_if_grouped_wo_a_reference_fallback_runs(*args: object, **kwargs: object) -> None:
+    del args, kwargs
+    raise AssertionError("grouped wo_a reference fallback unexpectedly ran")
+
+
+def _fail_if_grouped_wo_a_triton_runs(*args: object, **kwargs: object) -> None:
+    del args, kwargs
+    raise AssertionError("grouped wo_a Triton path unexpectedly ran")
+
+
 def test_deepseek_v4_scale_alias_loads_into_weight_scale_inv() -> None:
     weight_name = "layers.0.attn.wq_a.weight"
     scale_alias = "layers.0.attn.wq_a.scale"
@@ -587,6 +672,11 @@ def test_deepseek_v4_wo_a_grouped_op_matches_reference_on_ragged_blocks() -> Non
     grouped_op = (
         torch.ops.auto_deploy.torch_fake_quant_deepseek_v4_wo_a_grouped_finegrained_fp8_linear
     )
+    assert not torch_quant._is_deepseek_v4_wo_a_grouped_fp8_triton_shape_supported(
+        input_tensor,
+        weight,
+        weight_scale,
+    )
     actual = grouped_op.default(input_tensor, weight, None, [weight_scale], layer_type="mla")
 
     scale_expanded = weight_scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
@@ -599,6 +689,160 @@ def test_deepseek_v4_wo_a_grouped_op_matches_reference_on_ragged_blocks() -> Non
     )
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_deepseek_v4_wo_a_grouped_triton_shape_guard_covers_observed_shapes() -> None:
+    for num_groups in (1, 8):
+        input_tensor, weight, weight_scale = _deepseek_v4_wo_a_supported_tensors(
+            num_groups,
+            token_count=2,
+            device="cpu",
+        )
+
+        assert torch_quant._is_deepseek_v4_wo_a_grouped_fp8_triton_shape_supported(
+            input_tensor,
+            weight,
+            weight_scale,
+        )
+
+
+def test_deepseek_v4_wo_a_grouped_unsupported_shape_keeps_reference_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_tensor = torch.ones((1, 2, 1, 130), dtype=torch.bfloat16)
+    weight = torch.ones((128, 130), dtype=torch.float32).to(torch.float8_e4m3fn)
+    weight_scale = torch.ones((1, 2), dtype=torch.float32)
+
+    assert not torch_quant._is_deepseek_v4_wo_a_grouped_fp8_triton_shape_supported(
+        input_tensor,
+        weight,
+        weight_scale,
+    )
+    monkeypatch.setattr(
+        torch_quant,
+        "_deepseek_v4_wo_a_grouped_fp8_triton",
+        _fail_if_grouped_wo_a_triton_runs,
+    )
+
+    actual = torch.ops.auto_deploy.torch_fake_quant_deepseek_v4_wo_a_grouped_finegrained_fp8_linear.default(
+        input_tensor,
+        weight,
+        None,
+        [weight_scale],
+        layer_type="mla",
+    )
+    expected = _deepseek_v4_wo_a_grouped_reference(input_tensor, weight, weight_scale)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@_requires_cuda
+@pytest.mark.parametrize("num_groups", [1, 8], ids=["tp8-g1", "unsharded-g8"])
+def test_deepseek_v4_wo_a_grouped_triton_matches_reference_for_supported_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+    num_groups: int,
+) -> None:
+    input_tensor, weight, weight_scale = _deepseek_v4_wo_a_supported_tensors(
+        num_groups,
+        token_count=2 if num_groups == 1 else 1,
+        device="cuda",
+    )
+    expected = _deepseek_v4_wo_a_grouped_reference(input_tensor, weight, weight_scale)
+    monkeypatch.setattr(
+        torch_quant,
+        "_deepseek_v4_wo_a_grouped_reference",
+        _fail_if_grouped_wo_a_reference_fallback_runs,
+    )
+
+    actual = torch.ops.auto_deploy.torch_fake_quant_deepseek_v4_wo_a_grouped_finegrained_fp8_linear.default(
+        input_tensor,
+        weight,
+        None,
+        [weight_scale],
+        layer_type="mla",
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=5e-1)
+
+
+@_requires_cuda
+@_requires_e8m0
+def test_deepseek_v4_wo_a_grouped_triton_decodes_raw_e8m0_scale_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_tensor, weight, weight_scale_fp32 = _deepseek_v4_wo_a_supported_tensors(
+        1,
+        token_count=2,
+        device="cuda",
+    )
+    raw_scale = (
+        torch.log2(weight_scale_fp32)
+        .add(127)
+        .to(torch.uint8)
+        .contiguous()
+        .view(torch.float8_e8m0fnu)
+    )
+    expected = _deepseek_v4_wo_a_grouped_reference(
+        input_tensor,
+        weight,
+        e8m0_to_fp32(raw_scale),
+    )
+    monkeypatch.setattr(
+        torch_quant,
+        "_deepseek_v4_wo_a_grouped_reference",
+        _fail_if_grouped_wo_a_reference_fallback_runs,
+    )
+
+    actual = torch.ops.auto_deploy.torch_fake_quant_deepseek_v4_wo_a_grouped_finegrained_fp8_linear.default(
+        input_tensor,
+        weight,
+        None,
+        [raw_scale],
+        layer_type="mla",
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=5e-1)
+
+
+@_requires_cuda
+def test_deepseek_v4_wo_a_grouped_triton_cuda_graph_replays_fixed_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_tensor, weight, weight_scale = _deepseek_v4_wo_a_supported_tensors(
+        1,
+        token_count=2,
+        device="cuda",
+    )
+    replay_input = input_tensor.neg().contiguous()
+    expected = _deepseek_v4_wo_a_grouped_reference(replay_input, weight, weight_scale)
+
+    grouped_op = (
+        torch.ops.auto_deploy.torch_fake_quant_deepseek_v4_wo_a_grouped_finegrained_fp8_linear
+    )
+    for _ in range(3):
+        grouped_op.default(input_tensor, weight, None, [weight_scale], layer_type="mla")
+    torch.cuda.synchronize()
+
+    monkeypatch.setattr(
+        torch_quant,
+        "_deepseek_v4_wo_a_grouped_reference",
+        _fail_if_grouped_wo_a_reference_fallback_runs,
+    )
+    static_input = input_tensor.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_output = grouped_op.default(
+            static_input,
+            weight,
+            None,
+            [weight_scale],
+            layer_type="mla",
+        )
+
+    static_input.copy_(replay_input)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(static_output, expected, rtol=2e-2, atol=5e-1)
 
 
 def test_deepseek_v4_wo_a_grouped_sharding_splits_by_output_group_and_scale_rows() -> None:

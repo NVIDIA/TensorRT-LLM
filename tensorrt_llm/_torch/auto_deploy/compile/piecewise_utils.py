@@ -25,7 +25,7 @@ This module provides the logic to:
 
 import operator
 from dataclasses import dataclass, field
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 import torch.nn as nn
 from torch.fx import GraphModule, Node
@@ -38,6 +38,69 @@ from ..utils.logger import ad_logger
 # mixed/prefill batches because they have data-dependent control flow or
 # dynamic kernel configurations.
 # ---------------------------------------------------------------------------
+
+DEEPSEEK_V4_CUDA_GRAPH_METADATA_ARG_NAMES = (
+    "batch_info_host",
+    "seq_len_host",
+    "input_pos_host",
+    "cu_seqlen_host",
+    "cache_loc_host",
+    "cu_num_pages_host",
+)
+
+DEEPSEEK_V4_CUDA_GRAPH_CACHE_RESOURCE_ARG_NAMES = (
+    "swa_cache",
+    "mhc_cache",
+    "compressor_kv_cache",
+    "compressor_gate_cache",
+)
+
+DEEPSEEK_V4_CUDA_GRAPH_WORKSPACE_ARG_NAME = "workspace"
+DEEPSEEK_V4_CUDA_GRAPH_WORKSPACE_SIZE_ARG_NAME = "workspace_size_bytes"
+
+DEEPSEEK_V4_CUDA_GRAPH_PADDED_SLOT_RULE = (
+    "Kernels must read real token/sequence counts from metadata tensors, zero any padded "
+    "output rows they materialize, and ignore padded slots for cache/resource updates."
+)
+
+
+@dataclass(frozen=True)
+class CudaGraphKernelContract:
+    """CUDA graph contract shared by dynamic DeepSeek V4 custom kernels.
+
+    ``out=`` buffers and workspace tensors are caller-owned. Dynamic kernels may
+    mutate those buffers but must not allocate replacement outputs/resources
+    during CUDA graph replay.
+    """
+
+    uses_out_buffer: bool
+    workspace_arg_name: Optional[str]
+    workspace_size_arg_name: Optional[str]
+    metadata_arg_names: tuple[str, ...] = ()
+    cache_resource_arg_names: tuple[str, ...] = ()
+    padded_slot_rule: str = DEEPSEEK_V4_CUDA_GRAPH_PADDED_SLOT_RULE
+
+
+DEEPSEEK_V4_ATTENTION_CUDA_GRAPH_CONTRACT = CudaGraphKernelContract(
+    uses_out_buffer=True,
+    workspace_arg_name=DEEPSEEK_V4_CUDA_GRAPH_WORKSPACE_ARG_NAME,
+    workspace_size_arg_name=DEEPSEEK_V4_CUDA_GRAPH_WORKSPACE_SIZE_ARG_NAME,
+    metadata_arg_names=DEEPSEEK_V4_CUDA_GRAPH_METADATA_ARG_NAMES,
+    cache_resource_arg_names=DEEPSEEK_V4_CUDA_GRAPH_CACHE_RESOURCE_ARG_NAMES,
+)
+
+DEEPSEEK_V4_METADATA_PREP_CUDA_GRAPH_CONTRACT = CudaGraphKernelContract(
+    uses_out_buffer=False,
+    workspace_arg_name=DEEPSEEK_V4_CUDA_GRAPH_WORKSPACE_ARG_NAME,
+    workspace_size_arg_name=DEEPSEEK_V4_CUDA_GRAPH_WORKSPACE_SIZE_ARG_NAME,
+    metadata_arg_names=DEEPSEEK_V4_CUDA_GRAPH_METADATA_ARG_NAMES,
+)
+
+DEEPSEEK_V4_ROUTE_METADATA_CUDA_GRAPH_CONTRACT = CudaGraphKernelContract(
+    uses_out_buffer=False,
+    workspace_arg_name=DEEPSEEK_V4_CUDA_GRAPH_WORKSPACE_ARG_NAME,
+    workspace_size_arg_name=DEEPSEEK_V4_CUDA_GRAPH_WORKSPACE_SIZE_ARG_NAME,
+)
 
 # Cached attention ops (grid depends on per-sequence lengths)
 _CACHED_ATTENTION_OPS = [
@@ -77,6 +140,7 @@ _DEEPSEEK_V4_ATTENTION_OPS = [
     "auto_deploy::torch_deepseek_v4_sparse_attention_v2",
     "auto_deploy::torch_deepseek_v4_sparse_attention_v2_with_cache",
     "auto_deploy::triton_deepseek_v4_sparse_attention_with_cache",
+    "auto_deploy::triton_deepseek_v4_sparse_attention_v2_with_cache",
 ]
 
 _DEEPSEEK_V4_MOE_OPS = [
@@ -89,6 +153,12 @@ _DEEPSEEK_V4_METADATA_PREP_OPS = [
     "auto_deploy::deepseek_v4_prepare_cache_metadata",
     "auto_deploy::torch_deepseek_v4_prepare_cache_metadata",
     "auto_deploy::triton_deepseek_v4_prepare_cache_metadata",
+    "auto_deploy::deepseek_v4_prepare_indexer_metadata",
+    "auto_deploy::torch_deepseek_v4_prepare_indexer_metadata",
+    "auto_deploy::triton_deepseek_v4_prepare_indexer_metadata",
+    "auto_deploy::deepseek_v4_prepare_route_metadata",
+    "auto_deploy::torch_deepseek_v4_prepare_route_metadata",
+    "auto_deploy::triton_deepseek_v4_prepare_route_metadata",
 ]
 
 # Metadata preparation ops (branch on batch_info_host, do CPU math on CUDA tensors)
@@ -137,6 +207,55 @@ _STREAM_SWITCH_FUNCTION_NAMES = frozenset(
 )
 
 
+def _op_target_name(node: Node) -> str:
+    target = node.target
+    if hasattr(target, "name"):
+        return target.name()
+    if hasattr(target, "__qualname__"):
+        return target.__qualname__
+    return str(target)
+
+
+def _matches_registered_op_name(op_name: str, registered_ops: list[str]) -> bool:
+    for registered_op in registered_ops:
+        if registered_op in op_name:
+            return True
+        base_name = registered_op.split("::")[-1] if "::" in registered_op else registered_op
+        if base_name in op_name:
+            return True
+    return False
+
+
+def _is_deepseek_v4_metadata_prep_op_name(op_name: str) -> bool:
+    if _matches_registered_op_name(op_name, _DEEPSEEK_V4_METADATA_PREP_OPS):
+        return True
+
+    base_name = op_name.split("::")[-1].split(".")[0].lower()
+    if "deepseek_v4" not in base_name or "metadata" not in base_name:
+        return False
+    return "prepare" in base_name or "prep" in base_name
+
+
+def get_deepseek_v4_cuda_graph_kernel_contract(
+    op_name: str,
+) -> Optional[CudaGraphKernelContract]:
+    """Return the DeepSeek V4 CUDA graph contract for a registered op name.
+
+    Workspace convention: kernels that need scratch memory take a caller-owned
+    tensor named ``workspace`` and a size/count argument named
+    ``workspace_size_bytes``. The size is for the captured bucket, and kernels
+    use metadata counts to ignore padded slots at runtime.
+    """
+    if _matches_registered_op_name(op_name, _DEEPSEEK_V4_ATTENTION_OPS):
+        return DEEPSEEK_V4_ATTENTION_CUDA_GRAPH_CONTRACT
+    if _is_deepseek_v4_metadata_prep_op_name(op_name):
+        base_name = op_name.split("::")[-1].lower()
+        if "route" in base_name or "routing" in base_name or "moe" in base_name:
+            return DEEPSEEK_V4_ROUTE_METADATA_CUDA_GRAPH_CONTRACT
+        return DEEPSEEK_V4_METADATA_PREP_CUDA_GRAPH_CONTRACT
+    return None
+
+
 def _get_all_dynamic_op_names() -> Set[str]:
     """Return the full set of dynamic op qualified names."""
     return set(
@@ -161,28 +280,15 @@ def is_dynamic_cached_op(node: Node) -> bool:
     if node.op != "call_function":
         return False
 
-    target = node.target
-    # Handle OpOverload: get the qualified name
-    if hasattr(target, "name"):
-        # torch._ops.OpOverload has .name() method
-        op_name = target.name()
-    elif hasattr(target, "__qualname__"):
-        op_name = target.__qualname__
-    else:
-        op_name = str(target)
+    op_name = _op_target_name(node)
+
+    if _is_deepseek_v4_metadata_prep_op_name(op_name):
+        return True
 
     # Strip the ".default" suffix if present for matching
     dynamic_ops = _get_all_dynamic_op_names()
     # Check with namespace::name format AND base name (for wrapper functions
-    for dyn_op in dynamic_ops:
-        if dyn_op in op_name:
-            return True
-        # Also check by base op name without namespace prefix
-        base_name = dyn_op.split("::")[-1] if "::" in dyn_op else dyn_op
-        if base_name in op_name:
-            return True
-
-    return False
+    return _matches_registered_op_name(op_name, list(dynamic_ops))
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +364,9 @@ def needs_out_buffer(submod: nn.Module) -> bool:
 
     for node in submod.graph.nodes:
         if node.op == "call_function" and is_dynamic_cached_op(node):
-            op_name = node.target.name() if hasattr(node.target, "name") else str(node.target)
+            op_name = _op_target_name(node)
+            if _is_deepseek_v4_metadata_prep_op_name(op_name):
+                return False
             for skip_op in _SKIP_OUT_DYNAMIC_OPS:
                 if skip_op in op_name:
                     return False
@@ -275,7 +383,9 @@ def is_metadata_prep(submod: nn.Module) -> bool:
 
     for node in submod.graph.nodes:
         if node.op == "call_function" and is_dynamic_cached_op(node):
-            op_name = node.target.name() if hasattr(node.target, "name") else str(node.target)
+            op_name = _op_target_name(node)
+            if _is_deepseek_v4_metadata_prep_op_name(op_name):
+                return True
             for prep_op in _METADATA_PREP_OPS:
                 if prep_op in op_name:
                     return True

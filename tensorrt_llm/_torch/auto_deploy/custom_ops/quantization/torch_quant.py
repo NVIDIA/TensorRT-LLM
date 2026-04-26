@@ -32,6 +32,7 @@ e2m1_values = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -
 
 _FINEGRAINED_FP8_BLOCK_N = 128
 _FINEGRAINED_FP8_BLOCK_K = 128
+_DEEPSEEK_V4_WO_A_BLOCK_M = 32
 
 
 # ===== Helpers =====
@@ -498,6 +499,56 @@ def _act_quant_kernel(x_ptr, y_ptr, s_ptr, BLOCK_SIZE: tl.constexpr):
     tl.store(s_ptr + pid, s)
 
 
+@triton.jit
+def _deepseek_v4_wo_a_grouped_fp8_kernel(
+    input_ptr,
+    weight_ptr,
+    weight_scale_ptr,
+    output_ptr,
+    M: tl.constexpr,
+    G: tl.constexpr,
+    R: tl.constexpr,
+    K: tl.constexpr,
+    SCALE_K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    pid_g = tl.program_id(axis=2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    weight_rows = pid_g * R + offs_n
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k_start in range(0, K, BLOCK_K):
+        k_offsets = k_start + offs_k
+        a = tl.load(
+            input_ptr + (offs_m[:, None] * G + pid_g) * K + k_offsets[None, :],
+            mask=offs_m[:, None] < M,
+            other=0.0,
+        )
+        b = tl.load(
+            weight_ptr + weight_rows[:, None] * K + k_offsets[None, :],
+            mask=offs_n[:, None] < R,
+            other=0.0,
+        )
+        scale_row = (pid_g * R + pid_n * BLOCK_N) // BLOCK_N
+        scale_col = k_start // BLOCK_K
+        weight_scale = tl.load(weight_scale_ptr + scale_row * SCALE_K + scale_col).to(tl.float32)
+        b_dequant = (b.to(tl.float32) * weight_scale).to(a.dtype)
+        acc += tl.dot(a, tl.trans(b_dequant))
+
+    tl.store(
+        output_ptr + (offs_m[:, None] * G + pid_g) * R + offs_n[None, :],
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < R),
+    )
+
+
 def _safe_act_quant(x: torch.Tensor, block_size: int = 128) -> tuple:
     """Block-wise FP8 activation quantization (CUDA-graph safe).
 
@@ -523,6 +574,124 @@ def _dequant_block_fp8_weight(weight_fp8, weight_scale, block_n, block_k, dtype=
     return dequant_fp8_weight_two_dim_block_grid(
         weight_fp8, weight_scale, block_n, block_k, dtype=dtype
     )
+
+
+def _is_deepseek_v4_wo_a_grouped_fp8_triton_shape_supported(
+    input: torch.Tensor,
+    weight_quantized: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+) -> bool:
+    if input.dim() != 4 or weight_quantized.dim() != 2 or weight_scale_inv.dim() != 2:
+        return False
+    if weight_quantized.dtype != torch.float8_e4m3fn:
+        return False
+
+    num_groups = input.shape[-2]
+    group_dim = input.shape[-1]
+    out_rows, weight_group_dim = weight_quantized.shape
+    if num_groups <= 0 or group_dim <= 0 or weight_group_dim != group_dim:
+        return False
+    if out_rows % num_groups != 0:
+        return False
+
+    o_lora_rank = out_rows // num_groups
+    if group_dim % _FINEGRAINED_FP8_BLOCK_K != 0:
+        return False
+    if o_lora_rank % _FINEGRAINED_FP8_BLOCK_N != 0:
+        return False
+
+    expected_scale_shape = (
+        out_rows // _FINEGRAINED_FP8_BLOCK_N,
+        group_dim // _FINEGRAINED_FP8_BLOCK_K,
+    )
+    return tuple(weight_scale_inv.shape) == expected_scale_shape
+
+
+def _can_use_deepseek_v4_wo_a_grouped_fp8_triton(
+    input: torch.Tensor,
+    weight_quantized: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    weight_scale_inv: torch.Tensor,
+) -> bool:
+    if bias is not None:
+        return False
+    if input.dtype not in (torch.bfloat16, torch.float16):
+        return False
+    if not _is_deepseek_v4_wo_a_grouped_fp8_triton_shape_supported(
+        input, weight_quantized, weight_scale_inv
+    ):
+        return False
+    return (
+        input.is_cuda
+        and weight_quantized.is_cuda
+        and weight_scale_inv.is_cuda
+        and input.is_contiguous()
+        and weight_quantized.is_contiguous()
+        and weight_scale_inv.is_contiguous()
+        and input.numel() > 0
+    )
+
+
+def _deepseek_v4_wo_a_grouped_fp8_triton(
+    input: torch.Tensor,
+    weight_quantized: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+) -> torch.Tensor:
+    input_shape = input.shape
+    num_groups = input_shape[-2]
+    group_dim = input_shape[-1]
+    out_rows = weight_quantized.shape[0]
+    o_lora_rank = out_rows // num_groups
+    input_3d = input.reshape(-1, num_groups, group_dim)
+    output = torch.empty(
+        (*input_3d.shape[:-1], o_lora_rank),
+        dtype=input.dtype,
+        device=input.device,
+    )
+
+    grid = (
+        triton.cdiv(input_3d.shape[0], _DEEPSEEK_V4_WO_A_BLOCK_M),
+        triton.cdiv(o_lora_rank, _FINEGRAINED_FP8_BLOCK_N),
+        num_groups,
+    )
+    _deepseek_v4_wo_a_grouped_fp8_kernel[grid](
+        input_3d,
+        weight_quantized,
+        weight_scale_inv,
+        output,
+        input_3d.shape[0],
+        num_groups,
+        o_lora_rank,
+        group_dim,
+        weight_scale_inv.shape[1],
+        BLOCK_M=_DEEPSEEK_V4_WO_A_BLOCK_M,
+        BLOCK_N=_FINEGRAINED_FP8_BLOCK_N,
+        BLOCK_K=_FINEGRAINED_FP8_BLOCK_K,
+    )
+    return output.reshape(*input_shape[:-1], o_lora_rank)
+
+
+def _deepseek_v4_wo_a_grouped_reference(
+    input: torch.Tensor,
+    weight_quantized: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    weight_scale_inv: torch.Tensor,
+    num_groups: int,
+    o_lora_rank: int,
+    group_dim: int,
+) -> torch.Tensor:
+    weight_dequant = _dequant_block_fp8_weight(
+        weight_quantized,
+        weight_scale_inv,
+        _FINEGRAINED_FP8_BLOCK_N,
+        _FINEGRAINED_FP8_BLOCK_K,
+        dtype=input.dtype,
+    )
+    weight_grouped = weight_dequant.view(num_groups, o_lora_rank, group_dim)
+    output = torch.einsum("bsgd,grd->bsgr", input, weight_grouped)
+    if bias is not None:
+        output = output + bias.to(output.dtype).view(num_groups, o_lora_rank)
+    return output.to(dtype=input.dtype)
 
 
 @torch.library.custom_op("auto_deploy::torch_fake_quant_finegrained_fp8_linear", mutates_args=())
@@ -602,11 +771,12 @@ def torch_fake_quant_deepseek_v4_wo_a_grouped_finegrained_fp8_linear(
     weight_scale: List[torch.Tensor],  # [weight_scale_inv], shape [ceil(G*R/128), ceil(Dg/128)]
     layer_type: str = "unknown",
 ) -> torch.Tensor:
-    """Reference DeepSeek V4 ``wo_a`` grouped FineGrainedFP8 projection.
+    """DeepSeek V4 ``wo_a`` grouped FineGrainedFP8 projection.
 
     ``wo_a`` is stored compactly as ``[G * R, Dg]`` but executed as ``G`` independent
-    ``[R, Dg]`` projections.  The fallback keeps that compact layout, dequantizes
-    with fixed 128x128 weight blocks, and contracts each group with its own block.
+    ``[R, Dg]`` projections.  Supported CUDA shapes use a Triton path that consumes
+    the compact FP8 weight and 128x128 scales directly; other cases use the
+    reference BF16 dequantization fallback.
     """
     del layer_type
     if input.dim() != 4:
@@ -628,18 +798,24 @@ def torch_fake_quant_deepseek_v4_wo_a_grouped_finegrained_fp8_linear(
         )
 
     o_lora_rank = out_rows // num_groups
-    weight_dequant = _dequant_block_fp8_weight(
+    if _can_use_deepseek_v4_wo_a_grouped_fp8_triton(
+        input, weight_quantized, bias, weight_scale_inv
+    ):
+        return _deepseek_v4_wo_a_grouped_fp8_triton(
+            input,
+            weight_quantized,
+            weight_scale_inv,
+        )
+
+    return _deepseek_v4_wo_a_grouped_reference(
+        input,
         weight_quantized,
+        bias,
         weight_scale_inv,
-        _FINEGRAINED_FP8_BLOCK_N,
-        _FINEGRAINED_FP8_BLOCK_K,
-        dtype=input.dtype,
+        num_groups,
+        o_lora_rank,
+        group_dim,
     )
-    weight_grouped = weight_dequant.view(num_groups, o_lora_rank, group_dim)
-    output = torch.einsum("bsgd,grd->bsgr", input, weight_grouped)
-    if bias is not None:
-        output = output + bias.to(output.dtype).view(num_groups, o_lora_rank)
-    return output.to(dtype=input.dtype)
 
 
 @torch_fake_quant_deepseek_v4_wo_a_grouped_finegrained_fp8_linear.register_fake

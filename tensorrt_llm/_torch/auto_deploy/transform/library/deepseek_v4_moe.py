@@ -39,7 +39,10 @@ from ...custom_ops.fused_moe.deepseek_v4_moe import (  # noqa: F401
     torch_deepseek_v4_moe,
     torch_deepseek_v4_moe_from_routing,
 )
-from ...custom_ops.fused_moe.deepseek_v4_router import torch_deepseek_v4_router  # noqa: F401
+from ...custom_ops.fused_moe.deepseek_v4_router import (  # noqa: F401
+    torch_deepseek_v4_router,
+    triton_deepseek_v4_router,
+)
 from ...custom_ops.fused_moe.mxfp4_moe import (  # noqa: F401
     triton_deepseek_v4_mxfp4_moe_from_routing,
 )
@@ -508,7 +511,7 @@ def _lower_to_mxfp4_bridge(gm: GraphModule, node: Node) -> _MoEBridge:
 
     with graph.inserting_before(node):
         router_node = graph.call_function(
-            torch.ops.auto_deploy.torch_deepseek_v4_router.default,
+            torch.ops.auto_deploy.triton_deepseek_v4_router.default,
             args=(
                 hidden_states,
                 input_ids,
