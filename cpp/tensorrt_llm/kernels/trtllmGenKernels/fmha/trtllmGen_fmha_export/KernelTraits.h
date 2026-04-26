@@ -134,13 +134,9 @@ struct KernelConfig : public KernelConfigBase {
     }
 
     // Set numStagesQ for headDim > 128 kernels.
-    bool const isGenerationSkipSoftmax =
-      options.mSkipsSoftmaxWhenPossible && !isContextKernel(options.mFmhaKernelType);
-    if (mNumInstsQ * mNumInstsKv == 1 && !isGenerationSkipSoftmax) {
+    if (mNumInstsQ * mNumInstsKv == 1) {
       TLLM_CHECK_INFO(mTileSizeQ == 64 || (mHeadDimQk > 128 && mHeadDimV > 128),
                       "Consider using numInstsQ = 2 for better performance.");
-    }
-    if (mNumInstsQ * mNumInstsKv == 1) {
       // There is no enough shared memory for 2 stages when the headDim is not split into multiple
       // stages.
       if (mHeadDimPerStageKv == 0 && keepsMmaAbForDsMlaGen) {
@@ -223,6 +219,12 @@ struct KernelConfig : public KernelConfigBase {
         int32_t totalNumKBSmemQ = numHeadDimBytes * mTileSizeQ / 1024;
         // The maximum buffer size for smemKv (at most 144KB for KV, and at most 218KB for Qkv).
         int32_t maxBufferSizeKBForSmemKv = std::min(144, 218 - totalNumKBSmemQ * mNumStagesQ);
+        // SwapsMmaAb CGA-reduction kernels allocate the reduction buffer in addition to smemKv.
+        // For DS MLA Q32, the generic 144KB KV budget exceeds the Blackwell 228KB smem cap.
+        if (mSwapsMmaAb && isCgaSmemReduction(mMultiCtasKvMode) && mIsMlaGen && mHeadDimQk == 576 &&
+            mHeadDimV == 512 && mTileSizeQ == 32) {
+          maxBufferSizeKBForSmemKv = std::min(maxBufferSizeKBForSmemKv, 136);
+        }
         // Calculate the number of stages for smemKv.
         mNumStagesKv = calculateNumStagesKv(maxBufferSizeKBForSmemKv);
       }

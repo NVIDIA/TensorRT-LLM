@@ -159,6 +159,42 @@ async def test_send_disagg_request(monkeypatch, stream, schedule_style):
             )
 
 
+class TestVerifyCtxResponseDiagnostics:
+    """Test enriched error messages in _verify_ctx_response (TRTLLM-11123)."""
+
+    @pytest.mark.asyncio
+    async def test_missing_disagg_params_includes_finish_reason(self):
+        svc = _make_service("context_first")
+        resp = _make_completion_response("", finish_reason="error", disagg_request_id=1)
+        resp.choices[0].disaggregated_params = None
+        with pytest.raises(ValueError, match="finish_reason='error'"):
+            await svc._verify_ctx_response(resp)
+
+    @pytest.mark.asyncio
+    async def test_missing_ctx_request_id_includes_disagg_id(self):
+        svc = _make_service("context_first")
+        resp = _make_completion_response("", finish_reason="length", disagg_request_id=999)
+        resp.choices[0].disaggregated_params.ctx_request_id = None
+        with pytest.raises(ValueError, match=r"ctx_request_id is None.*999"):
+            await svc._verify_ctx_response(resp)
+
+    @pytest.mark.asyncio
+    async def test_missing_disagg_request_id_includes_ctx_id(self):
+        svc = _make_service("context_first")
+        resp = _make_completion_response("", finish_reason="stop", disagg_request_id=555)
+        resp.choices[0].disaggregated_params.disagg_request_id = None
+        resp.choices[0].disaggregated_params.ctx_request_id = 555
+        with pytest.raises(ValueError, match=r"disagg_request_id is None.*555"):
+            await svc._verify_ctx_response(resp)
+
+    @pytest.mark.asyncio
+    async def test_valid_response_passes(self):
+        svc = _make_service("context_first")
+        resp = _make_completion_response("ok", finish_reason="stop", disagg_request_id=42)
+        result = await svc._verify_ctx_response(resp)
+        assert result is resp
+
+
 class TestFirstGenLogProbsSerializeRoundtrip:
     """Roundtrip tests for _serialize/_deserialize_first_gen_log_probs."""
 

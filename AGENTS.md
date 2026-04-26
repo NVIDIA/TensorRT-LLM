@@ -32,9 +32,9 @@ Python and C++ codebase supporting TensorRT engine-based and PyTorch-based execu
 ### Installation & Build
 
 Building TensorRT-LLM requires Docker and may involve compiling C++ components.
-See [build from source](docs/source/installation/build-from-source-linux.md) for full instructions,
-or [pip install](docs/source/installation/linux.md) for pre-built wheels.
-For container images, see [NGC containers](docs/source/installation/containers.md).
+See the [Installation Guide](docs/source/installation/installation-guide.md) for pre-built release containers and pip install,
+[build from source](docs/source/installation/build-from-source.md) for development builds,
+and [Container Images](docs/source/installation/containers.md) for information about the container images.
 
 ### Reference Configs
 
@@ -157,6 +157,10 @@ For a full list of up-to-date bot commands, post `/bot help` as a PR comment and
 ### Retrieving CI Test Failures from a PR
 
 See the CI failure retrieval skill (`.claude/skills/ci-failure-retrieval/SKILL.md`) for step-by-step scripts to query Jenkins test results via the API.
+
+### Trouble Shooting
+
+- Use `TLLM_LOG_LEVEL_BY_MODULE` to enable per-module log filtering (e.g., `"debug:_torch,runtime;info:serve"`); see [Module-Level Logging](docs/source/developer-guide/overview.md#module-level-logging) for details.
 
 ## Key Documentation
 

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -380,13 +380,23 @@ class OpenAIDisaggregatedService(OpenAIService):
                 raise ValueError(
                     f"Context server returned {len(ctx_response.choices)} choices, expecting 1."
                 )
-            if ctx_response.choices[0].disaggregated_params is None:
-                raise ValueError("Context server did not return disaggregated params")
-            if ctx_response.choices[0].disaggregated_params.ctx_request_id is None:
-                raise ValueError("Invalid disaggregated params in context phase response.")
-            if ctx_response.choices[0].disaggregated_params.disagg_request_id is None:
+            choice = ctx_response.choices[0]
+            if choice.disaggregated_params is None:
                 raise ValueError(
-                    "Invalid disaggregated params in context phase response. disagg_request_id is None"
+                    f"Context server did not return disaggregated params."
+                    f" finish_reason={choice.finish_reason!r}"
+                )
+            if choice.disaggregated_params.ctx_request_id is None:
+                raise ValueError(
+                    f"Invalid disaggregated params: ctx_request_id is None."
+                    f" finish_reason={choice.finish_reason!r},"
+                    f" disagg_request_id={choice.disaggregated_params.disagg_request_id!r}"
+                )
+            if choice.disaggregated_params.disagg_request_id is None:
+                raise ValueError(
+                    f"Invalid disaggregated params: disagg_request_id is None."
+                    f" finish_reason={choice.finish_reason!r},"
+                    f" ctx_request_id={choice.disaggregated_params.ctx_request_id!r}"
                 )
             return ctx_response
 

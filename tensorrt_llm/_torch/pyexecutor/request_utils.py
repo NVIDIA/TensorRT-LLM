@@ -521,6 +521,9 @@ class RequestBroadcaster:
         """Broadcast requests across pipeline stages."""
         payloads = (new_requests, py_request_objects)
 
+        if self.dist.world_size == 1:
+            return payloads
+
         if not self.dist.has_pp:
             return self.dist.broadcast(payloads, root=0)
 

@@ -31,6 +31,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
+from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
@@ -118,6 +119,20 @@ def _load_iteration_indexes(env_var: str):
                 ) from None
 
     return frozenset(starts), frozenset(stops)
+
+
+def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
+    """Drop pinned encoder cache and raw pre-encoder tensors after prefill completes.
+
+    Wraps `strip_mm_data_for_generation` and mutates the shared `request.py_multimodal_data`
+    in-place so the `LlmRequest`'s multimodal tensors actually get freed (unlike
+    `MultimodalParams.strip_for_generation`, which rebinds a per-forward-call wrapper's attribute
+    and leaves the request's dict untouched).
+    """
+    mm_data = getattr(request, "py_multimodal_data", None)
+    if not mm_data:
+        return
+    strip_mm_data_for_generation(mm_data)
 
 
 @dataclasses.dataclass
@@ -2100,9 +2115,10 @@ class PyExecutor:
                             with torch.cuda.stream(self.execution_stream):
                                 self.drafter.prepare_draft_tokens(
                                     scheduled_batch, self.resource_manager)
-                                # Pad draft tokens to the max draft length. This is for CUDA graph compatibility.
+                                # Pad draft tokens to the max draft length and extend KV cache
+                                # capacity to match. This is for CUDA graph compatibility.
                                 self.drafter.pad_draft_tokens_for_cuda_graph(
-                                    scheduled_batch)
+                                    scheduled_batch, self.resource_manager)
                             torch.cuda.current_stream().wait_stream(
                                 self.execution_stream)
                         # add_batch must be called again to restore to target requests with updated draft tokens.
@@ -3431,6 +3447,12 @@ class PyExecutor:
                     request.context_chunk_size)
                 request.move_to_next_context_chunk()
             if request.context_remaining_length == 0:
+                # Prefill is done for this request; drop pinned encoder outputs
+                # (multimodal_embedding) and raw pre-encoder tensors that multimodal models stashed
+                # on `py_multimodal_data`. Without this, encoder inputs and outputs for multi-modal
+                # requests stay pinned on GPU through the full decode lifetime and can lead to OOMs
+                # at high concurrency.
+                _strip_py_multimodal_data_post_prefill(request)
                 if not self.disable_overlap_scheduler and request.will_complete_next_iteration(
                 ):
                     request.set_exclude_last_generation_logits(False)
