@@ -129,16 +129,25 @@ struct BlockKey
 //! \return One BlockKey per element in blockedUniqueTokens, in the same order.
 std::vector<BlockKey> buildBlockKeys(std::list<VecUniqueTokens>& blockedUniqueTokens, LlmRequest const& llmRequest);
 
-//! \brief Compute the chained block hashes for all currently storable KV blocks in \p llmRequest.
+//! \brief Compute the chained block hashes for currently storable KV blocks in \p llmRequest.
 //! \details Uses the same hash construction as KV cache stored/removed events by:
 //!   1. using beam 0 unique tokens,
 //!   2. hashing all currently available unique tokens, and
 //!   3. hashing only full blocks of size \p tokensPerBlock.
 //! This may front-run the corresponding KV cache event emission slightly.
+//!
+//! Hashing is incremental: only blocks at indices >= \p startBlockIdx are returned, chained from
+//! \p parentHash so callers can cache previously-computed hashes and only request new ones each
+//! scheduler step.
 //! \param llmRequest Request whose token stream is being hashed.
 //! \param tokensPerBlock KV cache block size.
-//! \return Ordered list of block hashes where the parent hash of block `i` is block `i - 1`.
-std::vector<HashIdType> getStoredBlockHashes(LlmRequest const& llmRequest, SizeType32 tokensPerBlock);
+//! \param startBlockIdx Index of the first full block to hash. Blocks `[0, startBlockIdx)` are
+//!     assumed to already be hashed by the caller.
+//! \param parentHash Hash of block `startBlockIdx - 1` (0 if \p startBlockIdx is 0).
+//! \return Ordered list of block hashes for full blocks at indices `[startBlockIdx, numFullBlocks)`,
+//!     chained so the parent hash of block `i` is block `i - 1`.
+std::vector<HashIdType> getStoredBlockHashes(
+    LlmRequest const& llmRequest, SizeType32 tokensPerBlock, SizeType32 startBlockIdx = 0, HashIdType parentHash = 0);
 
 // Implement hash functor for BlockKey.
 // This allows us to use unordered_map with BlockKey as key.

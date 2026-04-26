@@ -45,9 +45,8 @@ from tensorrt_llm._utils import mpi_allgather, mpi_broadcast, mpi_rank
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.internal.batch_manager import (
     KvCacheConnectorManager as KvCacheConnectorManagerCpp,
-    get_stored_block_hashes,
 )
-from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
+from tensorrt_llm.bindings.internal.batch_manager import LlmRequest, get_stored_block_hashes
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 from ..llm_request import get_draft_token_length
@@ -55,6 +54,7 @@ from ..scheduler import ScheduledRequests
 
 if TYPE_CHECKING:
     from ..resource_manager import KVCacheManager
+
 
 # Used to store data for a single inflight request.
 @dataclass
@@ -309,12 +309,23 @@ class KvCacheConnectorSchedulerOutputRequest:
     def __init__(self):
         self.block_ids = []
         self.tokens = []
+        # Cumulative block-hash chain for this request. Hashes are deterministic
+        # and only ever extended (full blocks are never rewound), so we cache
+        # them across scheduler steps and only hash newly completed blocks.
+        self.block_hashes: List[int] = []
 
     def update_and_build_data(self, req: LlmRequest, kv_cache_manager: "KVCacheManager"):
         block_ids = kv_cache_manager.get_cache_indices(req)
         tokens = req.get_tokens(0)
-        block_hashes = list(
-            get_stored_block_hashes(req, kv_cache_manager.tokens_per_block))
+
+        parent_hash = self.block_hashes[-1] if self.block_hashes else 0
+        new_block_hashes = get_stored_block_hashes(
+            req,
+            kv_cache_manager.tokens_per_block,
+            len(self.block_hashes),
+            parent_hash,
+        )
+        self.block_hashes.extend(new_block_hashes)
 
         new_block_ids = block_ids[len(self.block_ids) :]
         new_tokens = tokens[len(self.tokens) :]
@@ -348,7 +359,7 @@ class KvCacheConnectorSchedulerOutputRequest:
             new_block_ids,
             computed_position,
             num_scheduled_tokens,
-            block_hashes=block_hashes,
+            block_hashes=list(self.block_hashes),
             priorities=priorities,
         )
 

@@ -111,39 +111,35 @@ std::vector<BlockKey> buildBlockKeys(
     return blockKeys;
 }
 
-std::vector<HashIdType> getStoredBlockHashes(LlmRequest const& llmRequest, SizeType32 tokensPerBlock)
+std::vector<HashIdType> getStoredBlockHashes(
+    LlmRequest const& llmRequest, SizeType32 tokensPerBlock, SizeType32 startBlockIdx, HashIdType parentHash)
 {
     TLLM_CHECK_WITH_INFO(tokensPerBlock > 0, "tokensPerBlock must be > 0.");
+    TLLM_CHECK_WITH_INFO(startBlockIdx >= 0, "startBlockIdx must be >= 0.");
     TLLM_CHECK_WITH_INFO(
         llmRequest.getTokens().size() == 1, "getStoredBlockHashes only supports beam width 1 requests.");
 
     auto const& uniqueTokens = llmRequest.getUniqueTokens(0);
-    if (uniqueTokens.empty())
+    auto const numFullBlocks = static_cast<SizeType32>(uniqueTokens.size()) / tokensPerBlock;
+    if (startBlockIdx >= numFullBlocks)
     {
         return {};
     }
 
-    auto const usableSize = static_cast<SizeType32>(uniqueTokens.size());
-    auto const vecEnd = uniqueTokens.begin() + usableSize;
-
-    std::list<VecUniqueTokens> blockedUniqueTokens;
-    for (auto begin = uniqueTokens.begin(); begin < vecEnd; begin += tokensPerBlock)
-    {
-        auto const blockSize = std::min(tokensPerBlock, static_cast<SizeType32>(std::distance(begin, vecEnd)));
-        if (blockSize == tokensPerBlock)
-        {
-            blockedUniqueTokens.emplace_back(begin, begin + blockSize);
-        }
-    }
-
-    auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
+    bool const usesExtraIds = llmRequest.getInputTokensExtraIds().has_value();
+    auto const loraTaskId = llmRequest.getLoraTaskId();
+    auto const cacheSaltID = llmRequest.getCacheSaltID();
 
     std::vector<HashIdType> blockHashes;
-    blockHashes.reserve(blockKeys.size());
+    blockHashes.reserve(static_cast<size_t>(numFullBlocks - startBlockIdx));
 
-    HashIdType parentHash = 0;
-    for (auto const& blockKey : blockKeys)
+    for (SizeType32 b = startBlockIdx; b < numFullBlocks; ++b)
     {
+        SizeType32 const tokenStart = b * tokensPerBlock;
+        SizeType32 const tokenEnd = tokenStart + tokensPerBlock;
+        auto extraKeys = generateBlockHashExtraKeys(llmRequest, tokenStart, tokenEnd);
+        VecUniqueTokens blockTokens(uniqueTokens.begin() + tokenStart, uniqueTokens.begin() + tokenEnd);
+        BlockKey const blockKey(usesExtraIds, loraTaskId, std::move(blockTokens), std::move(extraKeys), cacheSaltID);
         auto const blockHash = static_cast<HashIdType>(BlockKeyHasher::hash(blockKey, parentHash));
         blockHashes.push_back(blockHash);
         parentHash = blockHash;
