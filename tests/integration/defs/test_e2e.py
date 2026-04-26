@@ -2624,3 +2624,59 @@ def test_get_ci_container_port():
     assert container_port_start > 0
     assert container_port_num > 0
     assert container_port_start + container_port_num <= 60000
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("model_name", ["meta/Meta-Llama-3.1-8B"],
+                         ids=["llama3_1-8b"])
+@pytest.mark.parametrize("model_subdir", ["llama-3.1-model/Meta-Llama-3.1-8B"],
+                         ids=["llama_v3_1"])
+def test_trtllm_bench_mig_launch(llm_root, llm_venv, model_name, model_subdir):
+    """Run benchmark in MIG mode, check if throughput increases with concurrency."""
+    results = {}
+    concurrency_list = [1, 32, 64, 128]
+
+    for concurrency in concurrency_list:
+        num_requests = concurrency * 10
+        runner = BenchRunner(llm_root=llm_root,
+                             llm_venv=llm_venv,
+                             model_name=model_name,
+                             model_subdir=model_subdir,
+                             streaming=False,
+                             use_pytorch_backend=True,
+                             use_mpirun=False,
+                             tp_size=1,
+                             concurrency=concurrency,
+                             num_requests=num_requests)
+
+        output = runner()
+        results[concurrency] = output
+
+    print(f"\n=== Benchmark Results Comparison ===")
+    print(f"Model: {model_name}")
+    print(
+        f"{'Concurrency':<15} {'Throughput':<15} {'Latency':<15} {'Num Requests':<15}"
+    )
+    print("-" * 60)
+
+    for idx, val in enumerate(concurrency_list):
+        metrics = results.get(val)
+        if not isinstance(metrics, dict):
+            pytest.fail(
+                f"Unexpected benchmark result type for concurrency {val}: {type(metrics)}"
+            )
+        try:
+            throughput = float(metrics.get('throughput', 0))
+            latency = float(metrics.get('latency', 0))
+            num_requests = int(metrics.get('num_requests', 0))
+        except (ValueError, TypeError) as e:
+            pytest.fail(
+                f"Failed to parse benchmark results for concurrency {val}: {e}")
+        assert throughput > 0, f"Throughput is 0 for concurrency {val}"
+        assert latency > 0, f"Latency is 0 for concurrency {val}"
+        print(f"{val:<15} {throughput:<15} {latency:<15} {num_requests:<15}")
+        if idx > 0:
+            prev_throughput = float(results[concurrency_list[idx - 1]].get(
+                'throughput', 0))
+            assert throughput > prev_throughput * 1.3, f"Throughput is not increasing for concurrency {concurrency_list[idx]}"
