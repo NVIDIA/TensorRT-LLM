@@ -134,6 +134,7 @@ def test_deepseek_v4_flash_uses_attention_and_moe_ir_sharding_for_full_model_con
     )
 
     assert args.world_size == 8
+    assert args.attn_backend == "deepseek_v4_sparse"
     assert args.transforms["detect_sharding"]["enabled"] is False
     assert args.transforms["sharding_transform_executor"]["enabled"] is False
     assert args.transforms["apply_sharding_hints"]["enabled"] is True
@@ -145,3 +146,4 @@ def test_deepseek_v4_flash_uses_attention_and_moe_ir_sharding_for_full_model_con
     }
     assert args.transforms["apply_sharding_hints"]["enable_attention_dp"] is False
     assert args.transforms["apply_sharding_hints"]["shard_layers"] == ["mla", "moe"]
+    assert args.transforms["insert_cached_attention"]["backend"] == "deepseek_v4_sparse"
