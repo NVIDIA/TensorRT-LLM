@@ -748,6 +748,12 @@ def create_py_executor(
         logger.info(
             f"Initializing kv connector with config: {kv_connector_config}")
 
+        if max_beam_width is not None and max_beam_width > 1:
+            raise NotImplementedError(
+                f"KV connector is not supported with beam search "
+                f"(max_beam_width={max_beam_width}). The block-hash chain passed "
+                f"to the connector only covers beam 0.")
+
         if scheduler_config.capacity_scheduler_policy != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
             raise NotImplementedError(
                 "KV connector is only supported with guaranteed no evict scheduler policy."
