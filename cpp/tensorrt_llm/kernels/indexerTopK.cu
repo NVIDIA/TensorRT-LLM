@@ -676,11 +676,37 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     int const preIdxCount, float* heuristicScratch, cudaStream_t const stream)
 {
 
+    // INVARIANT: kSortingAlgorithmThreshold is the ORIGINAL TRT-LLM Radix-path
+    // internal boundary (Insertion vs Radix-radix). v1.2.X dispatcher leaves it
+    // at 12288 — the GVR Heuristic axis (kSeqSmall, see below) is INDEPENDENT,
+    // so when canUseHeuristic is false (e.g. preIdx missing, BS too large, or
+    // numColumns < kSeqSmall), this function falls back to BYTE-IDENTICAL
+    // original radix dispatcher behavior. Do not touch this constant.
     constexpr int kSortingAlgorithmThreshold = 12288;
     constexpr int kDefaultSplitWorkThreshold = 200 * 1000;
     constexpr int kNumThreadsPerBlock = 512;
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
 
+    // ========================================================================
+    // Scheme X v1.2 (2026-04-25): adds small-N dispatch axis.
+    //
+    // GVR Heuristic Top-K has a *fixed* per-launch overhead from Phase-1
+    // (preIdx stats reduction over M=2048) and Phase-4 (2048-bin histogram
+    // snap), totaling ~11 µs regardless of N. For small N (≤16K), this
+    // fixed cost dominates and the kernel loses to TRT-LLM's own
+    // insertion-sort/radix path. Empirically (random data, B200 BS=1):
+    //   N=8192   : Heuristic 16.5 µs vs Radix 11.2 µs (radix 1.47× faster)
+    //   N=16384  : Heuristic 21.9 µs vs Radix 22.0 µs (parity)
+    //   N=32768  : Heuristic 26.1 µs vs Radix 32.9 µs (heuristic 1.26× faster)
+    //   N=131072 : Heuristic 43.4 µs vs Radix 76.1 µs (heuristic 1.75× faster)
+    //
+    // We therefore route N < kSeqSmall to the existing Radix/Insertion path
+    // (which itself splits at kSortingAlgorithmThreshold=12288), giving the
+    // best of both worlds. kSeqSmall is set at the empirical crossover point.
+    //
+    // See ablation_study/gvr_phase_timing/05_scheme_x_production/v1.2_smallN_dispatch/
+    // for the full N-scaling sweep and per-layer validation.
+    //
     // ========================================================================
     // Scheme X v1.1 (2026-04-23): architecture-derived BS-threshold dispatch,
     // now jointly bounded by occupancy AND L2 cache capacity.
@@ -726,9 +752,34 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         : kBsWave;
     int const kBsLarge = std::min(kBsWave, kBsL2 > 0 ? kBsL2 : kBsWave);
 
+    // v1.2: small-N lower bound — set to kSortingAlgorithmThreshold (12288) so
+    // the Heuristic axis takes over wherever the original Radix-radix branch
+    // would have triggered. Random-data benchmarks suggested 16384, but real
+    // SWE-Bench workloads see Heuristic ~6.3 us faster than random (preIdx-vs-
+    // logits ~99% correlated → P1 stats accurate → P2 secant 1-2 iter), shifting
+    // the real crossover into the [12288, 16384] band. Below 12288 the Insertion
+    // path is still used (canUseHeuristic gating + dispatcher fallback both
+    // route there). Configurable via TRTLLM_HEURISTIC_NMIN env (>=1024).
+    static int sCachedNMin = 0;
+    if (sCachedNMin == 0)
+    {
+        constexpr int kSeqSmallDefault = 12288;
+        char const* env = std::getenv("TRTLLM_HEURISTIC_NMIN");
+        if (env != nullptr)
+        {
+            int const v = std::atoi(env);
+            sCachedNMin = (v >= 1024 && v <= 200000) ? v : kSeqSmallDefault;
+        }
+        else
+        {
+            sCachedNMin = kSeqSmallDefault;
+        }
+    }
+    int const kSeqSmall = sCachedNMin;
+
     bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && topK == kHeuristicTopK
         && preIdxCount == kHeuristicSize && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold
-        && heuristicScratch != nullptr && numRows < kBsLarge;
+        && numColumns >= kSeqSmall && heuristicScratch != nullptr && numRows < kBsLarge;
 
     // Optional env-gated dispatch trace (set TRTLLM_SCHEMEX_DEBUG=1 to enable)
     {
@@ -743,10 +794,11 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         if (sDebug)
         {
             fprintf(stderr,
-                "[Scheme X v1.1] numRows=%d numColumns=%d kBsWave=%d kBsL2=%d kBsLarge=%d smCount=%d L2=%dMB -> %s "
-                "path\n",
-                numRows, numColumns, kBsWave, kBsL2, kBsLarge, sCachedSmCount, sCachedL2Bytes / (1024 * 1024),
-                canUseHeuristic ? "Heuristic" : "Radix");
+                "[Scheme X v1.2] numRows=%d numColumns=%d kBsWave=%d kBsL2=%d kBsLarge=%d kSeqSmall=%d smCount=%d "
+                "L2=%dMB -> %s path%s\n",
+                numRows, numColumns, kBsWave, kBsL2, kBsLarge, kSeqSmall, sCachedSmCount,
+                sCachedL2Bytes / (1024 * 1024), canUseHeuristic ? "Heuristic" : "Radix",
+                (numColumns < kSeqSmall) ? " (small-N route)" : "");
         }
     }
 
