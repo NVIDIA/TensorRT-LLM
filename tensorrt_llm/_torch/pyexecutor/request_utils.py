@@ -13,7 +13,12 @@ from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
 from .hang_detector import HangDetector
-from .llm_request import ExecutorRequest, LlmRequest, executor_request_to_llm_request
+from .llm_request import (
+    ExecutorRequest,
+    LlmRequest,
+    LlmRequestState,
+    executor_request_to_llm_request,
+)
 
 # Type alias for request queue items (to avoid circular import)
 # The actual RequestQueueItem class is defined in executor_request_queue.py
@@ -68,6 +73,46 @@ def attach_py_objects_to_requests(requests: List, py_request_objects: Tuple) -> 
                 py_obj = req_obj_dict.get(item.id)
                 if py_obj is not None:
                     setattr(item.request, attr_name, py_obj)
+
+
+def build_no_fitting_reqs_diagnostic(active_requests, kv_cache_manager) -> str:
+    """Diagnostic for the no-fitting-reqs case: active state distribution
+    plus KV pool / IndexMapper occupancy."""
+    state_counts: Dict[str, int] = {}
+    for req in active_requests:
+        try:
+            name = LlmRequestState(req.state_value).name
+        except Exception:
+            name = f"state={req.state_value}"
+        state_counts[name] = state_counts.get(name, 0) + 1
+    state_str = ", ".join(f"{k}={v}" for k, v in sorted(state_counts.items()))
+
+    kv_info = ""
+    # IndexMapper slot info (V2 only).
+    idx_mapper = getattr(kv_cache_manager, "index_mapper", None)
+    if idx_mapper is not None:
+        try:
+            free = idx_mapper.num_free_slots()
+            in_use = idx_mapper.size()
+            kv_info += f", indexmapper_free={free}, indexmapper_in_use={in_use}"
+        except Exception:
+            pass
+    # Pool block info — best-effort, skip if accessor not callable here.
+    try:
+        free_blocks = kv_cache_manager.get_num_free_blocks()
+        kv_info += f", free_blocks={free_blocks}"
+    except Exception:
+        pass
+
+    return (
+        "Scheduler could not fit any request this iteration. "
+        f"active_requests={len(active_requests)} "
+        f"({state_str}){kv_info}. Likely causes: KV cache pool full, "
+        "no free IndexMapper slots, or all active requests are blocked "
+        "on KV transfer (DISAGG_GENERATION_TRANS_IN_PROGRESS). "
+        "If this persists, increase free_gpu_memory_fraction or "
+        "reduce max_seq_len / concurrent batch size."
+    )
 
 
 def can_process_attention_dp_request(
