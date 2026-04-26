@@ -689,8 +689,8 @@ def _handle_prefill_thop(
         None,  # quant_q_buffer
         None,  # flash_mla_tile_scheduler_metadata
         None,  # flash_mla_num_splits
-        pf,  # num_contexts
-        num_tokens,  # num_ctx_tokens
+        num_contexts=pf,
+        num_ctx_tokens=num_tokens,
     )
 
     return output
@@ -931,8 +931,8 @@ def _handle_decode_impl(
         quant_q,  # quant_q_buffer
         flash_mla_meta,  # flash_mla_tile_scheduler_metadata
         flash_mla_splits,  # flash_mla_num_splits
-        num_prefill,  # num_contexts (leading context entries in the full batch)
-        0,  # num_ctx_tokens (ignored when attention_input_type=generation_only)
+        num_contexts=num_prefill,
+        num_ctx_tokens=0,  # ignored when attention_input_type=generation_only
     )
 
     output_reshaped = output_latent.view(num_tokens, num_heads, kv_lora_rank)
