@@ -228,12 +228,10 @@ def _rewrite_imports_in_file(filepath: str) -> int:
     relative imports (enforced by the ``auto-deploy-import-discipline``
     pre-commit hook), so no rewriting is needed for them. Tests, however,
     are written against the canonical absolute path
-    ``tensorrt_llm._torch.auto_deploy`` and need to be rewritten.
-
-    Handles:
-    - tensorrt_llm._torch.auto_deploy.X -> llmc.X
-    - from tensorrt_llm.llmapi.llm_args import KvCacheConfig -> from llmc._compat import KvCacheConfig
-    - from tensorrt_llm._torch.utils import ActivationType -> from llmc._compat import ActivationType
+    ``tensorrt_llm._torch.auto_deploy`` and need to be rewritten to
+    ``llmc``. Cross-package types (e.g. ``KvCacheConfig``,
+    ``ActivationType``) are sourced via ``..._torch.auto_deploy._compat``,
+    so the primary rewrite handles them too.
 
     Returns the number of line-level changes made.
     """
@@ -241,18 +239,7 @@ def _rewrite_imports_in_file(filepath: str) -> int:
         content = f.read()
 
     original = content
-    # Primary rewrite: tensorrt_llm._torch.auto_deploy -> llmc
     content = content.replace(_IMPORT_REWRITE, _IMPORT_TARGET)
-    # Test files that import KvCacheConfig from tensorrt_llm.llmapi
-    content = content.replace(
-        "from tensorrt_llm.llmapi.llm_args import KvCacheConfig",
-        "from llmc._compat import KvCacheConfig",
-    )
-    # Test files that import ActivationType from tensorrt_llm._torch.utils
-    content = content.replace(
-        "from tensorrt_llm._torch.utils import ActivationType",
-        "from llmc._compat import ActivationType",
-    )
 
     replacements = sum(1 for a, b in zip(original, content) if a != b)  # rough count
     if content != original:

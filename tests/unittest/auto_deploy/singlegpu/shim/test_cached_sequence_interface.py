@@ -10,6 +10,7 @@ import pytest
 import torch
 from _model_test_utils import default_max_num_tokens
 
+from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import (
     CausalConvResourceHandler,
     KVPagedResourceHandler,
@@ -24,7 +25,6 @@ from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterfa
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.llmapi import DraftTargetDecodingConfig
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 # =============================================================================
 # Fixtures
