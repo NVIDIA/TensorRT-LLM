@@ -249,14 +249,12 @@ class PythonMambaCacheManager(BaseResourceManager):
         # check that can be partitioned
         assert nheads % tp_size == 0, "nheads must be divisible by tp_size"
         assert conv_dim % tp_size == 0, "conv_dim must be divisible by tp_size"
-        assert n_groups % tp_size == 0, "n_groups must be divisible by tp_size"
 
         # partition conv_dim and nheads
         d_inner_local = d_inner // tp_size
         ng_ds_local = n_groups * d_state // tp_size
         conv_dim = conv_dim // tp_size
         nheads = nheads // tp_size
-        n_groups = n_groups // tp_size
         d_inner = d_inner // tp_size
 
         # Per-section dims for conv_state.
@@ -314,6 +312,10 @@ class PythonMambaCacheManager(BaseResourceManager):
             # SSM speculative cache — path-specific tensors
             spec_kwargs = {}
             if self._use_replay_state_update:
+                assert n_groups % tp_size == 0, \
+                    "replay state update requires n_groups divisible by tp_size"
+                n_groups_per_rank = n_groups // tp_size
+
                 # Compact replay cache.
                 # old_x is single-buffered (written by main kernel after replay).
                 # old_B, old_dt, old_dA_cumsum are double-buffered (written by
@@ -334,7 +336,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                                                    max_batch_size,
                                                    2,
                                                    T,
-                                                   n_groups,
+                                                   n_groups_per_rank,
                                                    d_state,
                                                    dtype=dtype,
                                                    device=device)
