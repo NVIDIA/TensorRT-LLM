@@ -63,6 +63,7 @@ from .mamba_cache_manager import MambaHybridCacheManager
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
+                            build_no_fitting_reqs_diagnostic,
                             get_from_waiting_queue, merge_requests)
 from .resource_manager import (KVCacheManagerV2, ResourceManager,
                                ResourceManagerType, request_context)
@@ -410,6 +411,10 @@ class PyExecutor:
         self.max_num_active_requests = model_engine.get_max_num_sequences()
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
+        # ADP dummy role for _pad_attention_dp_dummy_request; locked to
+        # this worker's disagg role on first observation. Default is_gen=True.
+        self._adp_dummy_is_gen: bool = True
+        self._adp_dummy_role_locked: bool = False
         # TODO: Remove PP size == 1 gate for disagg + block reuse with PP > 1.
         # Buffer for responses generated inside _end_transfer_and_maybe_terminate.
         # With ADP, _enqueue_responses does a tp_gather collective.  When called
@@ -1539,8 +1544,9 @@ class PyExecutor:
                     if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
                         if not all_gen_first:
                             logger.warning(
-                                "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
-                            )
+                                build_no_fitting_reqs_diagnostic(
+                                    self.active_requests,
+                                    self.kv_cache_manager))
                             self._check_disagg_ctx_cache_transfer_status(1)
                         elif self.async_transfer_manager.has_any_inflight_requests(
                         ):
@@ -2040,8 +2046,8 @@ class PyExecutor:
             if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
                 if not all_gen_first:
                     logger.warning(
-                        "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
-                    )
+                        build_no_fitting_reqs_diagnostic(
+                            self.active_requests, self.kv_cache_manager))
                     self._check_disagg_ctx_cache_transfer_status(1)
                 elif self.async_transfer_manager.has_any_inflight_requests():
                     # Non-blocking cleanup of completed/timed-out transfers
@@ -2986,6 +2992,20 @@ class PyExecutor:
             if not _respond_if_invalid(request)
         ]
 
+        # Lock the ADP dummy role to match this worker's disagg role.
+        if (self.enable_attention_dp and self.kv_cache_transceiver is not None
+                and not self._adp_dummy_role_locked):
+            for request in validated_requests:
+                rt = getattr(request, "llm_request_type", None)
+                if rt == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY:
+                    self._adp_dummy_is_gen = False
+                    self._adp_dummy_role_locked = True
+                    break
+                if rt == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
+                    self._adp_dummy_is_gen = True
+                    self._adp_dummy_role_locked = True
+                    break
+
         self.active_requests.extend(validated_requests)
         return validated_requests
 
@@ -3220,26 +3240,27 @@ class PyExecutor:
             gen_first_ctx_requests)
 
     def _count_schedulable_active_requests(self) -> int:
-        """Count active requests that are ready for scheduling.
+        """Count active requests eligible for scheduling.
 
-        In non-disaggregated mode, all active requests are schedulable.
-        In disaggregated mode, requests still waiting for KV cache
-        transfer (in INIT or transmission-in-progress state) are
-        excluded because they cannot participate in the forward pass
-        until transfer completes.
-
-        Returns:
-            The number of active requests eligible for scheduling.
+        Excludes GENERATION_TO_COMPLETE (V2 scheduler skips state
+        >= GENERATION_TO_COMPLETE) and, in disaggregated mode, requests
+        still awaiting KV cache transfer.
         """
+
+        def _is_to_complete(req) -> bool:
+            return req.state == LlmRequestState.GENERATION_TO_COMPLETE
+
         if self.kv_cache_transceiver is None:
-            return len(self.active_requests)
+            return sum(1 for req in self.active_requests
+                       if not _is_to_complete(req))
 
         def _is_awaiting_kv_transfer(req) -> bool:
             return (req.is_disagg_generation_init_state
                     or req.is_disagg_generation_transmission_in_progress)
 
-        return sum(1 for req in self.active_requests
-                   if not _is_awaiting_kv_transfer(req))
+        return sum(
+            1 for req in self.active_requests
+            if not _is_awaiting_kv_transfer(req) and not _is_to_complete(req))
 
     def _should_skip_dummy_for_benchmark_disagg(
             self, num_schedulable_requests: int) -> bool:
@@ -3289,9 +3310,17 @@ class PyExecutor:
         # Other ranks have work but this rank is idle — insert a dummy so
         # it can participate in collective operations during the forward pass.
         if num_active_request == 0 and self.expected_num_active_requests > 0:
+            # Pad CTX-type dummies to max_num_tokens so the MoE all-to-all
+            # sees a comparable token count across ranks.
+            token_nums = None
+            if (not self._adp_dummy_is_gen
+                    and self.kv_cache_transceiver is not None
+                    and self.max_num_tokens is not None):
+                token_nums = [self.max_num_tokens]
             llm_request = self.kv_cache_manager.add_dummy_requests(
                 request_ids=[0],
-                is_gen=True,
+                token_nums=token_nums,
+                is_gen=self._adp_dummy_is_gen,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
             )[0]
