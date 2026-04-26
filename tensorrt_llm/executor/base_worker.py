@@ -659,6 +659,16 @@ class BaseWorker(GenerationExecutor):
             return {}
         return self.engine.kv_cache_transceiver.get_disaggregated_params()
 
+    def get_cache_transceiver(self):
+        if self.engine is None:
+            return None
+        return self.engine.kv_cache_transceiver
+
+    def get_data_transceiver_state(self) -> bytes:
+        if self.engine is None or self.engine.kv_cache_transceiver is None:
+            return b""
+        return self.engine.kv_cache_transceiver.get_data_transceiver_state()
+
     # Define a Callable to join iteration and request stats
     @staticmethod
     def _stats_serializer(stats) -> str:

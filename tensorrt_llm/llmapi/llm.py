@@ -299,6 +299,17 @@ class BaseLLM:
 
         return self._llm_id
 
+    @set_api_status("prototype")
+    def get_data_transceiver_state(self) -> bytes:
+        """Get the serialized DataTransceiverState for arbitrary KV cache transfer.
+
+        Returns:
+            bytes: Serialized DataTransceiverState, or empty bytes if no transceiver is configured.
+        """
+        if self._executor is None:
+            return b""
+        return self._executor.get_data_transceiver_state()
+
     @property
     @set_api_status("beta")
     def disaggregated_params(self) -> dict:
@@ -717,7 +728,7 @@ class BaseLLM:
 
     @set_api_status("beta")
     def get_stats(self, timeout: Optional[float] = 2) -> List[dict]:
-        '''Get iteration statistics from the runtime.
+        """Get iteration statistics from the runtime.
         To collect statistics, call this function after prompts have been submitted with LLM().generate().
 
         Args:
@@ -726,7 +737,7 @@ class BaseLLM:
         Returns:
             List[dict]: A list of runtime stats as dicts.
                 e.g., [{"cpuMemUsage": ..., "iter": 0, ...}, {"cpuMemUsage": ..., "iter": 1, ...}]
-        '''
+        """
         return self._executor.get_stats(timeout=timeout)
 
     @set_api_status("beta")

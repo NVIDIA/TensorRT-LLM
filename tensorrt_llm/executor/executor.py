@@ -367,6 +367,12 @@ class GenerationExecutor(ABC):
     def get_disaggregated_params(self) -> dict:
         return {}
 
+    def get_cache_transceiver(self):
+        return None
+
+    def get_data_transceiver_state(self) -> bytes:
+        return b""
+
     @staticmethod
     def _create_ray_executor(
         worker_kwargs: Dict,

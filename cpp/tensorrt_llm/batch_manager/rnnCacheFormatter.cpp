@@ -44,7 +44,9 @@ void RnnCacheFormatter::format(TransferSession& session)
     NVTX3_SCOPED_RANGE(RnnCacheFormatter_format);
     session.setTime(TransferSession::kTimeFormatter);
 
-    auto const& llmRequest = session.getLlmRequest();
+    auto llmRequestOpt = session.getLlmRequest();
+    TLLM_CHECK_WITH_INFO(llmRequestOpt.has_value(), "LlmRequest required for RNN state transfer");
+    auto const& llmRequest = **llmRequestOpt;
     TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "Start sending RNN state for request ID: %ld.", llmRequest.mRequestId);
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");
@@ -203,7 +205,9 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     NVTX3_SCOPED_RANGE(RnnCacheFormatter_unformat);
     session.setTime(TransferSession::kTimeFormatter);
 
-    auto& llmRequest = session.getLlmRequest();
+    auto llmRequestOpt = session.getLlmRequest();
+    TLLM_CHECK_WITH_INFO(llmRequestOpt.has_value(), "LlmRequest required for RNN state transfer");
+    auto const& llmRequest = **llmRequestOpt;
     TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "Start receiving RNN state for request ID: %ld.", llmRequest.mRequestId);
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");

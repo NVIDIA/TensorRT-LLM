@@ -176,7 +176,7 @@ void sendAllBuffers(TransferSession& session, int deviceId,
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
+BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, std::optional<LlmRequest const*> llmRequest,
     BlockKey const& lastBlockKey, int32_t indexFromEnd, bool recvSideHasCP, SizeType32 ppSize)
 {
     auto poolNum = cacheManager->getBlockManager().getNumPools(
@@ -190,9 +190,11 @@ BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest 
         || lastBlockKey.uniqueTokens.size() == 0 || recvSideHasCP || ppSize > 1)
     {
         // disable reuse path, and vwsa don't support reuse.
+        // This path requires an LlmRequest with an active sequence in the cache manager.
+        TLLM_CHECK_WITH_INFO(llmRequest.has_value(), "LlmRequest required for non-reuse-tree transfer path");
         bool needSendAllForWindow = common::getEnvKVCacheTransferAllBlocksForWindow();
 
-        auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId);
+        auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, (*llmRequest)->mRequestId);
 
         auto const& windowsMetadata = cacheManager->getBlockManager().getWindowSizesMetadata();
 
@@ -344,11 +346,15 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
 {
     NVTX3_SCOPED_RANGE(CacheFormatter_format);
     session.setTime(TransferSession::kTimeFormatter);
-    auto const& llmRequest = session.getLlmRequest();
-    TLLM_LOG_DEBUG(
-        mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: %ld.", llmRequest.mRequestId);
+    auto llmRequest = session.getLlmRequest();
+    if (llmRequest.has_value())
+    {
+        TLLM_LOG_DEBUG(
+            mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: %ld.", (*llmRequest)->mRequestId);
+        TLLM_CHECK_WITH_INFO(
+            (*llmRequest)->mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");
+    }
 
-    TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently, only beam width 1 is supported.");
     auto const& connections = session.getConnections();
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
@@ -366,7 +372,6 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     size_t targetNum = pickUpConnections.size();
     if (targetNum == 0)
     {
-        TLLM_LOG_DEBUG("No targets to send KV cache to for request ID: %ld", llmRequest.mRequestId);
         return;
     }
 
@@ -383,7 +388,8 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     bool layerWise = common::getEnvDisaggLayerwise() && numPools == 1;
     if (layerWise)
     {
-        auto& progress = llmRequest.getContextProgress();
+        TLLM_CHECK_WITH_INFO(llmRequest.has_value(), "LlmRequest required for layer-wise transfer");
+        auto& progress = (*llmRequest)->getContextProgress();
         SizeType32 const numLayers = blockManager.getNumLayers();
         runtime::ITensor::Shape offset = runtime::ITensor::makeShape({0, 0});
         for (SizeType32 layerIdx = 0; layerIdx < numLayers; layerIdx++)
@@ -480,8 +486,11 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                     }
                 }
             }
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.",
-                llmRequest.mRequestId);
+            if (llmRequest.has_value())
+            {
+                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.",
+                    (*llmRequest)->mRequestId);
+            }
 
             return;
         }
@@ -581,15 +590,20 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         mCacheTransBufferManager->freeBufferIndexForSend(cacheBufferId);
         session.setTime(TransferSession::kTimePostprocess);
     }
-    TLLM_LOG_DEBUG(
-        mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID:%ld ", llmRequest.mRequestId);
+    if (llmRequest.has_value())
+    {
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID:%ld ",
+            (*llmRequest)->mRequestId);
+    }
 }
 
 void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(CacheFormatter_unformat);
     session.setTime(TransferSession::kTimeFormatter);
-    auto const& llmRequest = session.getLlmRequest();
+    auto llmRequestOpt = session.getLlmRequest();
+    TLLM_CHECK_WITH_INFO(llmRequestOpt.has_value(), "LlmRequest required for receiving KV cache");
+    auto const& llmRequest = **llmRequestOpt;
     auto const ctxReqId = llmRequest.getContextPhaseParams().value().getReqId();
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "Start receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId, ctxReqId);

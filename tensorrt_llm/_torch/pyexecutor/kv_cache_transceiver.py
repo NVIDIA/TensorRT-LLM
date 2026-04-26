@@ -140,6 +140,10 @@ class KvCacheTransceiver(ABC):
         """
         ...
 
+    def get_data_transceiver_state(self) -> bytes:
+        """Get the serialized DataTransceiverState (CacheState + CommState)."""
+        return b""
+
     def shutdown(self):
         """Shut down the transceiver and release registered resources."""
 
@@ -208,6 +212,9 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
     def prepare_context_requests(self, requests: List[LlmRequest]):
         # not implemented, an empty placeholder to allow being invoked unconditionally
         ...
+
+    def get_data_transceiver_state(self) -> bytes:
+        return self.impl.get_serialized_data_transceiver_state()
 
     def get_disaggregated_params(self):
         # Cpp kv cache transceiver will set the disaggregated params to context response
