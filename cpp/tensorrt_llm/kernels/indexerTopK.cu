@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 
 namespace cg = cooperative_groups;
 using namespace tensorrt_llm::common;
@@ -737,15 +738,21 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     // See ablation_study/gvr_phase_timing/optM_unified/Scheme_X_Report_20260422.md
     // §9 for the full N-scaling analysis.
     // ========================================================================
+    // Hardware-attribute cache (sm count, L2 capacity). std::call_once keeps
+    // the first concurrent caller from racing on cudaDeviceGetAttribute and
+    // ensures every later caller observes the populated values without an
+    // atomic compare-exchange of its own.
+    static std::once_flag sHwOnceFlag;
     static int sCachedSmCount = 0;
     static int sCachedL2Bytes = 0;
-    if (sCachedSmCount == 0 || sCachedL2Bytes == 0)
-    {
-        int dev = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&sCachedSmCount, cudaDevAttrMultiProcessorCount, dev);
-        cudaDeviceGetAttribute(&sCachedL2Bytes, cudaDevAttrL2CacheSize, dev);
-    }
+    std::call_once(sHwOnceFlag,
+        []()
+        {
+            int dev = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&sCachedSmCount, cudaDevAttrMultiProcessorCount, dev);
+            cudaDeviceGetAttribute(&sCachedL2Bytes, cudaDevAttrL2CacheSize, dev);
+        });
     int const kBsWave = (sCachedSmCount > 0) ? (sCachedSmCount * 3 - sCachedSmCount / 8) : 426;
     int const kBsL2 = (sCachedL2Bytes > 0 && numColumns > 0)
         ? (int) ((int64_t) sCachedL2Bytes * 9 / 10 / ((int64_t) numColumns * 4))
@@ -760,21 +767,23 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     // the real crossover into the [12288, 16384] band. Below 12288 the Insertion
     // path is still used (canUseHeuristic gating + dispatcher fallback both
     // route there). Configurable via TRTLLM_HEURISTIC_NMIN env (>=1024).
+    static std::once_flag sNMinOnceFlag;
     static int sCachedNMin = 0;
-    if (sCachedNMin == 0)
-    {
-        constexpr int kSeqSmallDefault = 12288;
-        char const* env = std::getenv("TRTLLM_HEURISTIC_NMIN");
-        if (env != nullptr)
+    std::call_once(sNMinOnceFlag,
+        []()
         {
-            int const v = std::atoi(env);
-            sCachedNMin = (v >= 1024 && v <= 200000) ? v : kSeqSmallDefault;
-        }
-        else
-        {
-            sCachedNMin = kSeqSmallDefault;
-        }
-    }
+            constexpr int kSeqSmallDefault = 12288;
+            char const* env = std::getenv("TRTLLM_HEURISTIC_NMIN");
+            if (env != nullptr)
+            {
+                int const v = std::atoi(env);
+                sCachedNMin = (v >= 1024 && v <= 200000) ? v : kSeqSmallDefault;
+            }
+            else
+            {
+                sCachedNMin = kSeqSmallDefault;
+            }
+        });
     int const kSeqSmall = sCachedNMin;
 
     bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && topK == kHeuristicTopK
@@ -783,14 +792,14 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
 
     // Optional env-gated dispatch trace (set TRTLLM_SCHEMEX_DEBUG=1 to enable)
     {
-        static bool sDebugChecked = false;
+        static std::once_flag sDebugOnceFlag;
         static bool sDebug = false;
-        if (!sDebugChecked)
-        {
-            char const* env = std::getenv("TRTLLM_SCHEMEX_DEBUG");
-            sDebug = (env != nullptr && env[0] == '1');
-            sDebugChecked = true;
-        }
+        std::call_once(sDebugOnceFlag,
+            []()
+            {
+                char const* env = std::getenv("TRTLLM_SCHEMEX_DEBUG");
+                sDebug = (env != nullptr && env[0] == '1');
+            });
         if (sDebug)
         {
             fprintf(stderr,

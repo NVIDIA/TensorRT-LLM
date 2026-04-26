@@ -43,7 +43,8 @@
 
 #include <cfloat>
 #include <cstdint>
-#include <cstdio> // for snap convergence warning printf
+#include <cstdio>  // for snap convergence warning printf
+#include <cstdlib> // for std::getenv (PDL launcher env-gate)
 #include <cuda_runtime.h>
 
 namespace heuristic_topk
@@ -802,8 +803,33 @@ cudaError_t launchHeuristicTopK(T const* input, int N, IdxT const* preIdx, int M
         cudaFuncSetAttribute(gvrTopKKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smemSize));
     }
 
-    gvrTopKKernel<<<1, BLOCK_SIZE, smemSize, stream>>>(
-        input, N, preIdx, M, topK, outputValues, outputIndices, thresholdPos);
+    // Use cudaLaunchKernelEx with PDL attribute so the kernel epilogue's
+    // cudaTriggerProgrammaticLaunchCompletion() takes effect on Hopper+. The
+    // attribute is a no-op on pre-Hopper architectures. Honor the standard
+    // TRTLLM_ENABLE_PDL env var (default on; set "0" to disable) without
+    // depending on TRT-LLM common headers, since this launcher is also reused
+    // by the standalone JIT-compiled PyTorch extension under
+    // ablation_study/gvr_phase_timing/.
+    bool enablePDL = true;
+    if (char const* env = std::getenv("TRTLLM_ENABLE_PDL"))
+    {
+        if (env[0] == '0' && env[1] == '\0')
+            enablePDL = false;
+    }
+
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(1);
+    config.blockDim = dim3(BLOCK_SIZE);
+    config.dynamicSmemBytes = smemSize;
+    config.stream = stream;
+
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = enablePDL ? 1 : 0;
+    config.attrs = attrs;
+    config.numAttrs = 1;
+
+    cudaLaunchKernelEx(&config, gvrTopKKernel, input, N, preIdx, M, topK, outputValues, outputIndices, thresholdPos);
 
     return cudaGetLastError();
 }
