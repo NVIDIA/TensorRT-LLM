@@ -276,7 +276,7 @@ def test_scheduler_output_block_hashes_incremental_matches_from_scratch():
 
     # A fresh manager seeing the same tokens for the first time must build the
     # same cumulative chain as the incremental one cached up to that step.
-    for tokens, observed in zip(token_growths, per_step_chains):
+    for tokens, observed in zip(token_growths, per_step_chains, strict=True):
         fresh_manager = KvCacheConnectorSchedulerOutputManager()
         fresh_req = MagicMock()
         fresh_req.request_id = 100
