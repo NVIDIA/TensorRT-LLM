@@ -3094,15 +3094,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             reusePassedTestResults(llmSrc, stageName, "${llmSrc}/tests/integration/test_lists/waives.txt")
         }
 
-        // NOTE: CBTS intentionally does NOT filter testDBList here. Layer 2 has
-        // already narrowed stages to those whose mako matches an affected block's
-        // condition; within each such stage we run the FULL rendered testDBList
-        // (all blocks matching the stage's mako) rather than restricting to the
-        // specific changed test ids. This over-includes by design: if a waive is
-        // wrong (e.g. depends on other tests, or the node id has a typo), running
-        // only the single changed test would not surface the problem. The extra
-        // per-stage test time is accepted as the cost of CI robustness.
-
         // Process shard test list and create separate files for regular and isolate tests
         def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, perfMode)
 

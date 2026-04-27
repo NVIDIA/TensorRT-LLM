@@ -43,16 +43,21 @@ jenkins/scripts/cbts/
 
 ## When CBTS activates
 
-Bare `/bot run`. The following stage-selection flags make `getCbtsResult`
-return `null` and let the existing filter chain take over: `--stage-list`,
-`--extra-stage`, `--gpu-type`, `--backend-mode`, `--skip-test`,
-`--add-multi-gpu-test`, `--only-multi-gpu-test`, `--disable-multi-gpu-test`.
+CBTS narrows test selection in **two usages only**:
 
-**Compatible** (CBTS still activates):
-- `--reuse-test` / `--reuse-stage-list` — auto-populated by the bot on re-runs.
-- `--debug` / `--detailed-log` — logging only, orthogonal.
-- `--post-merge` — Layer 2 narrows the affected set to post-merge hits only.
-  No post-merge hit → no-op (no fallback to full post-merge baseline).
+- `/bot run` — full pre-merge with CBTS narrowing.
+- `/bot run --post-merge` — post-merge with CBTS narrowing. Layer 2 keeps
+  only post-merge hits; no post-merge hit → no-op (no fallback to full
+  post-merge baseline).
+
+Any other **stage-selection** flag makes `getCbtsResult` return `null` and
+the existing filter chain takes over: `--stage-list`, `--extra-stage`,
+`--gpu-type`, `--test-backend`, `--skip-test`, `--add-multi-gpu-test`,
+`--only-multi-gpu-test`, `--disable-multi-gpu-test`.
+
+**Orthogonal** flags don't change stage selection and don't affect CBTS:
+`--reuse-test`, `--disable-reuse-test`, `--debug`, `--detailed-log`,
+`--disable-fail-fast`, `--high-priority`.
 
 ## How it's invoked (CI)
 

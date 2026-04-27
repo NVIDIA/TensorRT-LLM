@@ -803,41 +803,23 @@ def _cbtsMatchesAnyPattern(String filePath, List patterns)
     return patterns.any { _cbtsAntPathMatcher.match(it, filePath) }
 }
 
-// Return a list of stage-selection flags the user set via `/bot run` (empty
-// list means bare run). CBTS defers entirely when this is non-empty.
-// Excluded on purpose (match the convention used by `enableUpdateGitlabStatus`
-// above):
-//   - REUSE_TEST / REUSE_STAGE_LIST: retry semantics, auto-populated by the
-//     bot on re-runs; compose fine with CBTS.
-//   - DEBUG_MODE / DETAILED_LOG: logging verbosity, orthogonal to selection.
+// CBTS only activates on `/bot run` and `/bot run --post-merge`. Any other
+// stage-selection flag makes it defer to the user's explicit choice.
+// Orthogonal flags (REUSE_*, DEBUG_MODE, DETAILED_LOG) and IS_POST_MERGE are
+// intentionally not in this list — they either don't affect stage selection
+// or are handled specially in Layer 2. Adding a new stage-selection flag in
+// the future means adding one entry here; nothing else changes.
+//
+// All defer flags default to falsy (false / null), so a single truthy check
+// captures both boolean and list-typed flags.
 def _cbtsTriggeredUserFlags(testFilter)
 {
-    def flags = []
-    if (testFilter[(ENABLE_SKIP_TEST)]) {
-        flags << "ENABLE_SKIP_TEST=${testFilter[(ENABLE_SKIP_TEST)]}"
-    }
-    if (testFilter[(TEST_STAGE_LIST)] != null) {
-        flags << "TEST_STAGE_LIST=${testFilter[(TEST_STAGE_LIST)]}"
-    }
-    if (testFilter[(EXTRA_STAGE_LIST)] != null) {
-        flags << "EXTRA_STAGE_LIST=${testFilter[(EXTRA_STAGE_LIST)]}"
-    }
-    if (testFilter[(GPU_TYPE_LIST)] != null) {
-        flags << "GPU_TYPE_LIST=${testFilter[(GPU_TYPE_LIST)]}"
-    }
-    if (testFilter[(TEST_BACKEND)] != null) {
-        flags << "TEST_BACKEND=${testFilter[(TEST_BACKEND)]}"
-    }
-    if (testFilter[(ADD_MULTI_GPU_TEST)]) {
-        flags << "ADD_MULTI_GPU_TEST=${testFilter[(ADD_MULTI_GPU_TEST)]}"
-    }
-    if (testFilter[(ONLY_MULTI_GPU_TEST)]) {
-        flags << "ONLY_MULTI_GPU_TEST=${testFilter[(ONLY_MULTI_GPU_TEST)]}"
-    }
-    if (testFilter[(DISABLE_MULTI_GPU_TEST)]) {
-        flags << "DISABLE_MULTI_GPU_TEST=${testFilter[(DISABLE_MULTI_GPU_TEST)]}"
-    }
-    return flags
+    def deferFlags = [
+        ENABLE_SKIP_TEST, TEST_STAGE_LIST, EXTRA_STAGE_LIST, GPU_TYPE_LIST,
+        TEST_BACKEND, ADD_MULTI_GPU_TEST, ONLY_MULTI_GPU_TEST, DISABLE_MULTI_GPU_TEST,
+    ]
+    return deferFlags.findAll { testFilter[it] }
+                     .collect { "${it}=${testFilter[it]}" }
 }
 
 // Parse CBTS JSON stdout into the shape consumed by Layer 1/2/3. Always
