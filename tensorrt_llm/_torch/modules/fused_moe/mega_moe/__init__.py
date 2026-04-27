@@ -20,6 +20,6 @@ Targets the W4A8_MXFP4_MXFP8 quant configuration already supported by
 fed to both backends produce numerically-aligned outputs.
 """
 
-from .backend import MegaMoEFusedMoE
+from .backend import MegaMoEDeepGemmFusedMoE
 
-__all__ = ["MegaMoEFusedMoE"]
+__all__ = ["MegaMoEDeepGemmFusedMoE"]

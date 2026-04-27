@@ -81,8 +81,8 @@ def get_moe_cls(
         return WideEPMoE
     elif moe_backend.upper() == "TRITON":
         return TritonFusedMoE
-    elif moe_backend.upper() == "MEGAMOE":
-        # MegaMoE: DeepGEMM fp8_fp4_mega_moe fused kernel. Accepts
+    elif moe_backend.upper() == "MEGAMOE_DEEPGEMM":
+        # MegaMoE (DeepGEMM): DeepGEMM fp8_fp4_mega_moe fused kernel. Accepts
         # W4A8_MXFP4_MXFP8 MXFP4 weights (same byte layout as TRTLLMGen
         # input), runs the fused dispatch+GEMM+act+GEMM+combine kernel.
         # Mirrors the TRTLLM/CUTEDSL pattern: fall back to CutlassFusedMoE
@@ -92,7 +92,7 @@ def get_moe_cls(
         if quant_config is None or not quant_config.quant_mode.has_w4a8_mxfp4_mxfp8(
         ):
             logger.warning(
-                "MegaMoEFusedMoE only supports W4A8_MXFP4_MXFP8. "
+                "MegaMoEDeepGemmFusedMoE only supports W4A8_MXFP4_MXFP8. "
                 f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
             )
             return CutlassFusedMoE
@@ -100,9 +100,9 @@ def get_moe_cls(
         # surface. ``can_implement`` already does this full check; call it
         # with ``swiglu_gptoss_style=False`` (MegaMoE rejects that anyway,
         # and the create path doesn't know the model's SwiGLU flavor yet).
-        from .mega_moe import MegaMoEFusedMoE
+        from .mega_moe import MegaMoEDeepGemmFusedMoE
         pretrained = model_config.pretrained_config
-        ok, reason = MegaMoEFusedMoE.can_implement(
+        ok, reason = MegaMoEDeepGemmFusedMoE.can_implement(
             QuantAlgo.W4A8_MXFP4_MXFP8,
             dtype_activation=torch.bfloat16,
             swiglu_gptoss_style=False,
@@ -111,10 +111,10 @@ def get_moe_cls(
         )
         if not ok:
             logger.warning(
-                f"MegaMoEFusedMoE rejected current environment: {reason}. "
+                f"MegaMoEDeepGemmFusedMoE rejected current environment: {reason}. "
                 "Falling back to CutlassFusedMoE.")
             return CutlassFusedMoE
-        return MegaMoEFusedMoE
+        return MegaMoEDeepGemmFusedMoE
     else:
         raise ValueError(f"Unsupported moe backend: {moe_backend}")
 
@@ -361,8 +361,8 @@ def create_moe_backend(
         # Mega MoE fall-through: new backend not in the hard-coded chain.
         # Import lazily to avoid pulling DG at module import time on boxes
         # that don't use this backend.
-        from .mega_moe import MegaMoEFusedMoE
-        if moe_cls is MegaMoEFusedMoE:
+        from .mega_moe import MegaMoEDeepGemmFusedMoE
+        if moe_cls is MegaMoEDeepGemmFusedMoE:
             return moe_cls(
                 routing_method=routing_method,
                 num_experts=num_experts,
