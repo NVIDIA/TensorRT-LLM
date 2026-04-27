@@ -238,12 +238,22 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if not do_finalize:
             return final_hidden_states
 
-        final_hidden_states = final_hidden_states + shared_expert_output
-
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
+            if isinstance(shared_expert_output, torch.Tensor):
+                output_tensor, _ = torch.ops.trtllm.allocate_output(
+                    final_hidden_states, self.allreduce.output_buffer_kind,
+                    self.mapping.tp_group)
+                final_hidden_states = torch.add(
+                    final_hidden_states,
+                    shared_expert_output,
+                    out=output_tensor,
+                )
+            else:
+                final_hidden_states = final_hidden_states + shared_expert_output
             final_hidden_states = self.allreduce(
                 final_hidden_states, all_reduce_params=all_reduce_params)
-
+        else:
+            final_hidden_states = final_hidden_states + shared_expert_output
         return final_hidden_states.view(orig_shape)
 
 

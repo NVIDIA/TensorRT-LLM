@@ -436,13 +436,23 @@ def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes,
         hybrid_cache_manager_gen.get_buffers(0),
         hybrid_cache_manager_ctx.get_buffers(0)), "different kv-cache values"
 
-    assert torch.equal(hybrid_cache_manager_gen.get_conv_states(1),
-                       hybrid_cache_manager_ctx.get_conv_states(
-                           1)), "different mamba conv states"
+    # The transceiver copies a single request's state between
+    # independently-allocated slots on each side, so we check the
+    # request's own slot instead of the full state buffer (which has
+    # extra padding-dummy slots that only the ctx side touched).
+    slot_ctx = hybrid_cache_manager_ctx._impl.mamba_impl.get_cache_index(
+        ctx_request.py_request_id)
+    slot_gen = hybrid_cache_manager_gen._impl.mamba_impl.get_cache_index(
+        gen_request.py_request_id)
+    assert torch.equal(
+        hybrid_cache_manager_gen.get_conv_states(1)[slot_gen],
+        hybrid_cache_manager_ctx.get_conv_states(1)[slot_ctx]), (
+            "different mamba conv states")
 
-    assert torch.equal(hybrid_cache_manager_gen.get_ssm_states(1),
-                       hybrid_cache_manager_ctx.get_ssm_states(
-                           1)), "different mamba ssm states"
+    assert torch.equal(
+        hybrid_cache_manager_gen.get_ssm_states(1)[slot_gen],
+        hybrid_cache_manager_ctx.get_ssm_states(1)[slot_ctx]), (
+            "different mamba ssm states")
 
 
 @pytest.mark.timeout(120)
