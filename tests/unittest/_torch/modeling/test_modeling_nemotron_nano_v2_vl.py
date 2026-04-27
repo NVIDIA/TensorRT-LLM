@@ -683,12 +683,13 @@ class TestChunkedPrefillCaching:
 
     def _make_param_with_runtime(self, modality_type, num_tokens, **extra):
         """Build a real MultimodalParams with runtime data for caching."""
+        # Single contiguous mm block of `num_tokens` tokens, none cached yet:
+        # mask = all-True over the chunk, cumsum = [1, 2, ..., num_tokens].
+        embed_mask_cumsum = torch.ones(num_tokens, dtype=torch.bool).to(torch.int64).cumsum(0)
         runtime = MultimodalRuntimeData(
             past_seen_token_num=0,
-            mm_token_lengths=[num_tokens],
-            mm_token_positions=[0],
             chunk_end_pos=num_tokens,
-            special_token_offsets=[],
+            embed_mask_cumsum=embed_mask_cumsum,
         )
         # Mirror the nested shape produced by the input processor: a dict
         # keyed by `modality_type` holds per-modality side-channel data.
