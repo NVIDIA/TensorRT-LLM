@@ -1424,6 +1424,11 @@ pipeline {
 <main id="md"></main>
 <script id="md-source" type="application/json">${jsonAnalysis}</script>
 <script>
+  // Disable marked's strikethrough tokenizer: CI failure-analysis text routinely
+  // contains literal tildes (~/path, ~50ms, regex anchors, etc.) that should not
+  // be interpreted as markup. Other GFM extensions (tables, fences, autolinks,
+  // task lists) stay enabled.
+  marked.use({ tokenizer: { del() { return false; } } });
   const src = JSON.parse(document.getElementById('md-source').textContent);
   document.getElementById('md').innerHTML = DOMPurify.sanitize(marked.parse(src));
 </script>
