@@ -104,6 +104,7 @@ EXCLUDE_TEST_FILES = {
     "test_trtllm_attention_op.py",
     "test_fla_cached_gated_delta_rule.py",
     "test_flashinfer_trtllm_mla_op.py",
+    "test_trtllm_mla_op.py",
     "test_fuse_trtllm_attention_quant_fp8.py",
     "test_fuse_relu2_quant_nvfp4.py",
     "test_moe_fusion.py",
