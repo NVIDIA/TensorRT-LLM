@@ -205,6 +205,12 @@ class PyTorchModelEngine(ModelEngine):
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
+        # Multimodal encoder runtime sizes; fall back to LLM-side values when
+        # the encoder-specific knobs are unset.
+        (
+            self.encoder_batch_size,
+            self.encoder_max_num_tokens,
+        ) = llm_args.get_encoder_runtime_sizes()
 
         if checkpoint_loader is None:
             checkpoint_loader = _construct_checkpoint_loader(
@@ -1491,17 +1497,20 @@ class PyTorchModelEngine(ModelEngine):
 
     def _set_up_mm_encoder_attn_metadata(self) -> None:
         """Construct AttentionMetadata for any multimodal encoders inside the
-        loaded model, using the engine's runtime sizes.
+        loaded model, using the engine's encoder runtime sizes
+        (`encoder_max_batch_size` / `encoder_max_num_tokens`, falling back to
+        the LLM-side `max_batch_size` / `max_num_tokens`).
 
         Mirrors `_set_up_attn_metadata` for the LLM backbone: encoders opt in
         by inheriting `MmEncoderMixin`, and the engine drives the construction
-        so the sizes match ``llm_args.get_runtime_sizes()`` rather than being
-        hardcoded inside each encoder's ``__init__``.
+        so the sizes match ``llm_args.get_encoder_runtime_sizes()`` rather
+        than being hardcoded inside each encoder's ``__init__``.
         """
         for module in self.model.modules():
             if isinstance(module, MmEncoderMixin):
-                module.setup_attn_metadata(max_num_requests=self.batch_size,
-                                           max_num_tokens=self.max_num_tokens)
+                module.setup_attn_metadata(
+                    max_num_requests=self.encoder_batch_size,
+                    max_num_tokens=self.encoder_max_num_tokens)
 
     def _set_up_spec_metadata(
             self,

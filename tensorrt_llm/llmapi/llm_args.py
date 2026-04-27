@@ -195,8 +195,9 @@ class CudaGraphConfig(StrictBaseModel):
     @staticmethod
     def _merge_schedule_keys(batch_sizes: List[int],
                              schedule: dict[int, int]) -> List[int]:
-        """Merge draft_len_schedule keys into batch_sizes so that each
-        schedule threshold has a corresponding CUDA graph.
+        """Merge draft_len_schedule keys into batch_sizes.
+
+        Each schedule threshold has a corresponding CUDA graph.
 
         e.g. draft_len_schedule={100:4, 200:3, 300:2} adds 100, 200, 300
         into batch_sizes.
@@ -266,6 +267,8 @@ class BaseSparseAttentionConfig(StrictBaseModel):
 
     def supports_backend(self, backend: str) -> bool:
         """
+        Sparse-attention backend compatibility hook.
+
         Override if the sparse attention algorithm does not support
         a subset of the possible backends.
         """
@@ -276,10 +279,12 @@ class BaseSparseAttentionConfig(StrictBaseModel):
 
     def needs_separate_short_long_cuda_graphs(self) -> bool:
         """
-        Determines whether to capture a dedicated CUDA graph for batches consisting entirely of short sequences.
-        If True, capture distinct graphs for short-only batches and general cases (e.g., long or mixed batches).
-        If False, capture a single unified CUDA graph for all sequences regardless of length.
-        The seq_len_threshold parameter defines the cutoff boundary between short and long sequences.
+        Whether to capture a dedicated CUDA graph for short-sequence-only batches.
+
+        If True, capture distinct graphs for short-only batches and general cases
+        (e.g., long or mixed batches). If False, capture a single unified CUDA graph
+        for all sequences regardless of length. The seq_len_threshold parameter
+        defines the cutoff boundary between short and long sequences.
         """
         return False
 
@@ -398,7 +403,9 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
     def needs_separate_short_long_cuda_graphs(self) -> bool:
         """
         Whether to capture separate CUDA graphs for short and long sequences.
-        Use seq_len_threshold to determine the threshold for separating short and long sequences.
+
+        Use seq_len_threshold to determine the threshold for separating short and
+        long sequences.
         """
         self.seq_len_threshold = self.index_topk
         return self.skip_indexer_for_short_seqs
@@ -507,7 +514,8 @@ class MoeLoadBalancerConfig(StrictBaseModel):
 
     def setup(self, ep_rank: int, ep_size: int) -> None:
         """
-        Initializes the runtime state of the configuration.
+        Initialize the runtime state of the configuration.
+
         This must be called before accessing properties like `num_local_slots`.
         """
         self._ep_rank = ep_rank
@@ -1015,6 +1023,8 @@ class DecodingBaseConfig(StrictBaseModel):
 
     def supports_backend(self, backend: str) -> bool:
         """
+        Speculative-decoding backend compatibility hook.
+
         Override if the speculation algorithm does not support
         a subset of the possible backends.
         """
@@ -1326,7 +1336,8 @@ class EagleDecodingConfig(DecodingBaseConfig):
     @functools.cached_property
     def num_capture_layers(self) -> int:
         """
-        Returns the number of layers to capture of the target model.
+        Return the number of layers to capture from the target model.
+
         If eagle3_layers_to_capture is not None, return the length of the set.
         Otherwise, assume Eagle3 base set and return 3.
         """
@@ -1443,7 +1454,8 @@ class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
     @functools.cached_property
     def num_capture_layers(self):
         """
-        Returns the number of layers to save.
+        Return the number of layers whose hidden states are saved.
+
         The following hidden states are saved:
         - If eagle3_layers_to_capture is None, save the eagle3 base set plus
         the post norm last hidden state.
@@ -1924,6 +1936,7 @@ class PrometheusMetricsConfig(StrictBaseModel):
 class RayPlacementConfig(StrictBaseModel):
     """
     Configuration for Ray GPU workers placement.
+
     Currently, this config is only used with AsyncLLM for RL scenarios.
     """
     defer_workers_init: bool = Field(
@@ -2112,9 +2125,7 @@ class SleepConfig(StrictBaseModel):
 
 
 class PybindMirror(ABC):
-    ''' A class containing the utilities for mirroring Python classes to
-    pybind classes.
-    '''
+    """Utilities for mirroring Python classes to pybind classes."""
 
     @abstractmethod
     def _to_pybind(self):
@@ -3086,6 +3097,20 @@ class BaseLlmArgs(StrictBaseModel):
     max_num_tokens: Optional[int] = Field(
         default=8192, description="The maximum number of tokens.")
 
+    encoder_max_batch_size: Optional[int] = Field(
+        default=None,
+        description=(
+            "Maximum batch size for the multimodal encoder's AttentionMetadata. "
+            "Falls back to `max_batch_size` when unset."),
+        status="prototype")
+
+    encoder_max_num_tokens: Optional[int] = Field(
+        default=None,
+        description=(
+            "Maximum number of tokens for the multimodal encoder's "
+            "AttentionMetadata. Falls back to `max_num_tokens` when unset."),
+        status="prototype")
+
     gather_generation_logits: bool = Field(
         default=False,
         description="Gather generation logits.",
@@ -3356,6 +3381,18 @@ class BaseLlmArgs(StrictBaseModel):
             self.max_num_tokens,
             self.max_seq_len,
             self.max_batch_size,
+        )
+
+    def get_encoder_runtime_sizes(self) -> Tuple[int, int]:
+        """Return encoder runtime batch and token limits.
+
+        Returns `(encoder_max_batch_size, encoder_max_num_tokens)`, falling
+        back to the LLM-side `max_batch_size` / `max_num_tokens` when the
+        encoder-specific knobs are not set.
+        """
+        return (
+            self.encoder_max_batch_size or self.max_batch_size,
+            self.encoder_max_num_tokens or self.max_num_tokens,
         )
 
 
