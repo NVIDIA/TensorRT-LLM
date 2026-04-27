@@ -496,11 +496,11 @@ class ConfigurableMoE(MoE):
         # needs to slice off ADP padding. EPLB is also rejected here as
         # a hard check (``validate_backend`` enforces this at __init__,
         # but keep the assert defensively in case LB state changes).
-        from .mega_moe import MegaMoEFusedMoE
+        from .mega_moe import MegaMoEDeepGemmFusedMoE
 
-        if isinstance(self.backend, MegaMoEFusedMoE):
+        if isinstance(self.backend, MegaMoEDeepGemmFusedMoE):
             assert not self._using_load_balancer(), (
-                "MegaMoEFusedMoE does not support EPLB; disable the load "
+                "MegaMoEDeepGemmFusedMoE does not support EPLB; disable the load "
                 "balancer or pick a different backend."
             )
             return self._forward_chunk_mega_impl(
@@ -649,7 +649,7 @@ class ConfigurableMoE(MoE):
         use_dp_padding: Optional[bool],
         do_finalize: bool,
     ) -> torch.Tensor:
-        """Run ``MegaMoEFusedMoE`` by the separated-routing-and-quant path.
+        """Run ``MegaMoEDeepGemmFusedMoE`` by the separated-routing-and-quant path.
 
         Mirrors the CUTLASS / CUTEDSL pipeline: compute routing + BF16→FP8
         pre-quant once in ConfigurableMoE, then hand the pre-quantized
@@ -666,11 +666,11 @@ class ConfigurableMoE(MoE):
         decomposes into collapse to a single Inductor-generated Triton
         kernel.
 
-        Phase 1: EPLB disabled (see ``MegaMoEFusedMoE._supports_load_balancer``);
+        Phase 1: EPLB disabled (see ``MegaMoEDeepGemmFusedMoE._supports_load_balancer``);
         ``apply_router_weight_on_input`` also rejected at backend init.
         """
         assert not self.apply_router_weight_on_input, (
-            "ConfigurableMoE with MegaMoEFusedMoE does not support apply_router_weight_on_input"
+            "ConfigurableMoE with MegaMoEDeepGemmFusedMoE does not support apply_router_weight_on_input"
         )
         assert do_finalize, (
             "MegaMoE's fused kernel always finalizes — do_finalize=False is not supported"

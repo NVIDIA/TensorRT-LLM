@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MegaMoEFusedMoE — DeepGEMM fp8_fp4_mega_moe as a first-class MoE backend.
+"""MegaMoEDeepGemmFusedMoE — DeepGEMM fp8_fp4_mega_moe as a first-class MoE backend.
 
 Quantization scheme
 -------------------
@@ -68,7 +68,7 @@ from ....utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
 from ..interface import MoE, MoEWeightLoadingMode
 from ..routing import BaseMoeRoutingMethod
 
-__all__ = ["MegaMoEFusedMoE"]
+__all__ = ["MegaMoEDeepGemmFusedMoE"]
 
 
 # Process-level cache: one DG SymmBuffer shared across all MegaMoE layers.
@@ -203,7 +203,7 @@ def _quantize_bf16_to_fp8_ue8m0(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Te
     return _FUSED_PER_TOKEN_CAST(x)
 
 
-class MegaMoEFusedMoE(MoE):
+class MegaMoEDeepGemmFusedMoE(MoE):
     """MoE backend wrapping DeepGEMM's fused ``fp8_fp4_mega_moe`` kernel."""
 
     _SUPPORTED_ACTIVATION_DTYPES = {torch.bfloat16}
@@ -223,18 +223,20 @@ class MegaMoEFusedMoE(MoE):
         sm = get_sm_version()
         if sm != 100:
             return False, (
-                f"MegaMoEFusedMoE requires SM100 (only arch with "
+                f"MegaMoEDeepGemmFusedMoE requires SM100 (only arch with "
                 f"sm100_fp8_fp4_mega_moe.cuh in DeepGEMM); got SM{sm}"
             )
         if dtype_activation not in cls._SUPPORTED_ACTIVATION_DTYPES:
             return False, (
-                f"MegaMoEFusedMoE supports activations in "
+                f"MegaMoEDeepGemmFusedMoE supports activations in "
                 f"{cls._SUPPORTED_ACTIVATION_DTYPES}, got {dtype_activation}"
             )
         if swiglu_gptoss_style:
-            return False, "MegaMoEFusedMoE does not support swiglu_gptoss_style"
+            return False, "MegaMoEDeepGemmFusedMoE does not support swiglu_gptoss_style"
         if quant_algo != QuantAlgo.W4A8_MXFP4_MXFP8:
-            return False, (f"MegaMoEFusedMoE supports W4A8_MXFP4_MXFP8 only, got {quant_algo}")
+            return False, (
+                f"MegaMoEDeepGemmFusedMoE supports W4A8_MXFP4_MXFP8 only, got {quant_algo}"
+            )
         # Packed-UE8M0 per-token SF layout: 4 u8 scales reinterpreted as
         # int32 per 128-element row stride, so hidden/intermediate must be
         # divisible by 128. Divisible-by-32 shapes like ``hidden=2880``
@@ -243,12 +245,12 @@ class MegaMoEFusedMoE(MoE):
         # fall back cleanly.
         if hidden_size is not None and hidden_size % 128 != 0:
             return False, (
-                f"MegaMoEFusedMoE requires hidden_size % 128 == 0 "
+                f"MegaMoEDeepGemmFusedMoE requires hidden_size % 128 == 0 "
                 f"(packed-UE8M0 int32 SF stride); got hidden_size={hidden_size}"
             )
         if intermediate_size is not None and intermediate_size % 128 != 0:
             return False, (
-                f"MegaMoEFusedMoE requires intermediate_size % 128 == 0 "
+                f"MegaMoEDeepGemmFusedMoE requires intermediate_size % 128 == 0 "
                 f"(packed-UE8M0 int32 SF stride); got intermediate_size="
                 f"{intermediate_size}"
             )
@@ -301,10 +303,10 @@ class MegaMoEFusedMoE(MoE):
 
         # Phase 1 — assert supported topologies early.
         assert self.tp_size == 1, (
-            f"MegaMoEFusedMoE Phase 1 is EP-only (moe_tp_size=1); got tp_size={self.tp_size}"
+            f"MegaMoEDeepGemmFusedMoE Phase 1 is EP-only (moe_tp_size=1); got tp_size={self.tp_size}"
         )
         assert self.cluster_size == 1, (
-            f"MegaMoEFusedMoE Phase 1 assumes cluster_size=1; got cluster_size={self.cluster_size}"
+            f"MegaMoEDeepGemmFusedMoE Phase 1 assumes cluster_size=1; got cluster_size={self.cluster_size}"
         )
         assert num_experts % max(self.ep_size, 1) == 0
 
@@ -319,7 +321,7 @@ class MegaMoEFusedMoE(MoE):
         # is not yet supported.
         if self.use_dp and self.parallel_size > 1:
             assert self.ep_size == self.parallel_size, (
-                f"MegaMoEFusedMoE with enable_attention_dp=True requires "
+                f"MegaMoEDeepGemmFusedMoE with enable_attention_dp=True requires "
                 f"ep_size == parallel_size (got ep_size={self.ep_size}, "
                 f"parallel_size={self.parallel_size}). Configurations "
                 f"with ADP > EP are not yet supported; add the standard "
@@ -334,7 +336,7 @@ class MegaMoEFusedMoE(MoE):
         # fallback would break llama-min-latency-style paths that set
         # this flag to True and assume top-1 semantics.
         assert not apply_router_weight_on_input, (
-            "MegaMoEFusedMoE does not support apply_router_weight_on_input. "
+            "MegaMoEDeepGemmFusedMoE does not support apply_router_weight_on_input. "
             "DG's fp8_fp4_mega_moe applies routing weights on the MoE "
             "output, not by pre-scaling the input — the two paths are "
             "not equivalent. Use a different MoE backend for models that "
@@ -391,7 +393,7 @@ class MegaMoEFusedMoE(MoE):
         """
         if not dist.is_initialized():
             raise RuntimeError(
-                "MegaMoEFusedMoE requires torch.distributed to be "
+                "MegaMoEDeepGemmFusedMoE requires torch.distributed to be "
                 "initialized before module construction (mpirun or Ray)."
             )
         # Preferred: reuse the existing PG from the mapping (Ray / DeviceMesh).
@@ -412,7 +414,7 @@ class MegaMoEFusedMoE(MoE):
             )
             return dist.group.WORLD
         raise RuntimeError(
-            f"MegaMoEFusedMoE: cannot resolve EP ProcessGroup. The current "
+            f"MegaMoEDeepGemmFusedMoE: cannot resolve EP ProcessGroup. The current "
             f"mapping does not expose ``moe_ep_group_pg`` and EP "
             f"({self.ep_size}) is a strict subset of world "
             f"({world_size}). Use DeviceMeshTopology (TLLM_DISABLE_MPI=1) "
@@ -432,7 +434,7 @@ class MegaMoEFusedMoE(MoE):
         # ``H/128`` int32 values per row, so H/32 must be a multiple of 4.
         # ``can_implement`` rejects before we get here under the factory
         # path, but keep the asserts as defensive dev checks for direct
-        # MegaMoEFusedMoE construction.
+        # MegaMoEDeepGemmFusedMoE construction.
         assert H % 128 == 0, f"hidden {H} must be divisible by 128"
         assert inter % 128 == 0, f"intermediate {inter} must be divisible by 128"
 
