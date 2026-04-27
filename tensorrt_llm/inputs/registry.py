@@ -19,7 +19,7 @@ from ..logger import logger
 from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
 from .data import TextPrompt
-from .multimodal import (MultimodalInput, _as_tensor, _compute_mm_masks,
+from .multimodal import (MultimodalInput, _as_cpu_tensor, _compute_mm_masks,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
                          default_hasher, find_mm_token_lengths,
                          hexdigest_to_int32, validate_mm_inputs)
@@ -793,7 +793,7 @@ def maybe_compute_mm_embed_cumsum(
             "vocab_size nor mm_token_ids — skipping cumsum computation.")
         return
 
-    input_ids = _as_tensor(prompt_token_ids)
+    input_ids = _as_cpu_tensor(prompt_token_ids)
     _, embed_mask, _ = _compute_mm_masks(
         input_ids,
         vocab_size=vocab_size,
@@ -940,7 +940,7 @@ def create_input_processor_with_hash(
         # cumsum is stashed into extra_processed_inputs so the wrapper's
         # subsequent maybe_compute_mm_embed_cumsum call short-circuits via
         # its idempotency guard, avoiding a second full-sequence isin pass.
-        input_ids_tensor = _as_tensor(prompt_token_ids)
+        input_ids_tensor = _as_cpu_tensor(prompt_token_ids)
         if input_ids_tensor.numel() == 0:
             start_positions, start_special_token_positions = [], []
         else:

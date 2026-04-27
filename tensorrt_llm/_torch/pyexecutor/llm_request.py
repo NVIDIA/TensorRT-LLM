@@ -389,12 +389,12 @@ class PyResult:
         Args:
             mm_embeddings: Concatenated multimodal embeddings tensor of shape
                 [total_tokens, hidden_dim].
-            multimodal_lengths: Current per-item embedding row lengths.
+            multimodal_lengths: Current per-item split lengths.
         """
-        # TODO(TRTLLM-12175): rename this argument or pass separate embed
-        # lengths once prompt-side multimodal_lengths can differ from encoder
-        # output rows because of MM specials.
-        # Split the concatenated tensor by lengths to get per-item embeddings
+        # TODO(TRTLLM-12175): callers currently pass request.multimodal_lengths,
+        # a prompt-side MM-token count that may include non-embedding
+        # special/framing tokens. This split needs per-item encoder-output
+        # embedding lengths instead.
         split_embeddings = torch.split(mm_embeddings, multimodal_lengths, dim=0)
 
         # Create a SharedTensorContainer handle for each split

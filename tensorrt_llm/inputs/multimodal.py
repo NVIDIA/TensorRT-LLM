@@ -749,11 +749,6 @@ def find_mm_token_lengths(
     multimodal content tokens. This mm_token_lengths represents the full chunk from beginning
     to end, not just pure image/video/audio tokens.
 
-    When `multimodal_data["video"]["video_grid_thw"]` is present and its row
-    count matches the number of videos in `mm_data`, each row is forwarded
-    to `input_processor.get_num_tokens_per_video` as a kwarg. Processors are
-    free to use it for a faster token-count computation or to ignore it;
-    falls back to calling the method without the kwarg on mismatch / absence.
     """
     mm_items = {
         modality: items if isinstance(items, list) else [items]
@@ -770,10 +765,10 @@ def find_mm_token_lengths(
                 f"Input processor {type(input_processor).__name__} does not have 'get_num_tokens_per_{modality}' method required for multimodal hashing."
             )
 
-        fast_path_vgt = None
+        video_grid_thw_for_items = None
         if modality == "video" and video_grid_thw is not None:
             if len(video_grid_thw) == len(items):
-                fast_path_vgt = video_grid_thw
+                video_grid_thw_for_items = video_grid_thw
             else:
                 logger.warning(
                     "find_mm_token_lengths: video_grid_thw row count "
@@ -792,12 +787,14 @@ def find_mm_token_lengths(
                     item = item.frames
                 assert isinstance(item, list), "Video must be a list of frames"
                 call_kwargs = {"video": item}
-                if fast_path_vgt is not None:
-                    # Note: forwarding video_grid_thw does not guarantee the
-                    # processor uses it; get_num_tokens_per_video is
-                    # processor-dependent. Qwen3-VL consumes it (fast path);
-                    # other processors may ignore it via **kwargs.
-                    call_kwargs["video_grid_thw"] = fast_path_vgt[idx]
+                if video_grid_thw_for_items is not None:
+                    # TODO(TRTLLM-11951): Replace this Qwen-VL-specific
+                    # metadata wiring with a generic per-item processed
+                    # metadata route. Keep this for now: Qwen3-VL needs the
+                    # processor-produced video_grid_thw for correct video token
+                    # counts.
+                    call_kwargs["video_grid_thw"] = video_grid_thw_for_items[
+                        idx]
                 num_tokens = input_processor.get_num_tokens_per_video(
                     **call_kwargs)
                 modality_token_lengths.append(num_tokens)
@@ -893,20 +890,14 @@ def check_mm_embed_cumsum_if_needed(
     )
 
 
-def _as_tensor(
+def _as_cpu_tensor(
         input_ids: Union[torch.Tensor, List[int], np.ndarray]) -> torch.Tensor:
-    """Coerce input_ids to a torch.Tensor without copying when possible.
-
-    Does NOT reshape to 1D or cast to long — callers are responsible for
-    those invariants if they matter. Equivalent to `torch.as_tensor` for
-    tensor/ndarray inputs; falls back to `torch.tensor` for list inputs
-    (which defaults to `torch.long` for Python ints).
-    """
-    if isinstance(input_ids, torch.Tensor):
-        return input_ids
-    if isinstance(input_ids, np.ndarray):
-        return torch.from_numpy(input_ids)
-    return torch.tensor(input_ids)
+    """Coerce input_ids to a CPU torch.Tensor without copying when possible."""
+    input_ids_tensor = torch.as_tensor(input_ids)
+    if input_ids_tensor.device.type != "cpu":
+        raise ValueError("prompt_token_ids must be CPU-resident when computing "
+                         f"multimodal metadata, got {input_ids_tensor.device}.")
+    return input_ids_tensor
 
 
 def _compute_mm_masks(

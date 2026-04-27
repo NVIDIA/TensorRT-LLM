@@ -7,8 +7,8 @@ import torch
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     find_input_mm_embeds, get_multimodal_embeddings)
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
-                                            MultimodalRuntimeData, _as_tensor,
-                                            _compute_mm_masks,
+                                            MultimodalRuntimeData,
+                                            _as_cpu_tensor, _compute_mm_masks,
                                             _find_mm_token_start_pos_from_masks)
 from tensorrt_llm.inputs.registry import maybe_compute_mm_embed_cumsum
 
@@ -650,7 +650,7 @@ def _find_mm_token_start_positions(input_ids,
     for purposes other than just position-finding (e.g., stashing the embed
     mask), so a single-purpose wrapper would be strictly worse for them.
     """
-    ids = _as_tensor(input_ids)
+    ids = _as_cpu_tensor(input_ids)
     if ids.numel() == 0:
         return [], []
     mm_mask, _, special_mask = _compute_mm_masks(ids, vocab_size, mm_token_ids,
