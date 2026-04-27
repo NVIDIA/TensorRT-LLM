@@ -229,7 +229,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     yaml_index = YAMLIndex.load(test_db_dir)
-    stages = parse_stages_from_groovy(groovy_path)
+    # Include post-merge stages so waives on post-merge-only tests resolve.
+    # Layer 2 in L0_Test.groovy decides what to run with the post-merge
+    # subset based on the user's --post-merge flag.
+    stages = parse_stages_from_groovy(groovy_path, include_post_merge=True)
     pr = _load_pr_inputs(input_path)
     rules = build_rules(yaml_index, stages)
     result = Selector(stages).run(pr, rules)
