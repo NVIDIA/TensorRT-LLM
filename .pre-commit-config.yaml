@@ -2846,6 +2846,11 @@ repos:
         entry: ./scripts/check_test_list.py --check-duplicate-waives
         language: script
         pass_filenames: false
+    -   id: validate-test-lists
+        name: Validate test list entries exist in source files (AST)
+        entry: ./scripts/check_test_list.py --validate
+        language: script
+        pass_filenames: false
     -   id: DCO check
         name: Checks the commit message for a developer certificate of origin signature
         entry: ./scripts/dco_check.py
