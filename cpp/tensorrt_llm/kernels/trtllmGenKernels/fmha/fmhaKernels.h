@@ -306,10 +306,12 @@ public:
 
         // Any caller that selects MultiCtasKvMode must supply the partial-reduction scratch pool
         // and per-CTA counter; fail fast here instead of silently falling back to Disabled.
-        if (options.mMultiCtasKvMode != tensorrt_llm::kernels::MultiCtasKvMode::Disabled)
+        if (options.mMultiCtasKvMode == tensorrt_llm::kernels::MultiCtasKvMode::GmemReduction
+            || options.mMultiCtasKvMode == tensorrt_llm::kernels::MultiCtasKvMode::GmemReductionWithSeparateKernel)
         {
             TLLM_CHECK_WITH_INFO(params.multiCtasKvScratchPtr != nullptr && params.multiCtasKvCounterPtr != nullptr,
-                "MultiCtasKvScratchPtr/MultiCtasKvCounterPtr must be non-null when MultiCtasKvMode is not Disabled. "
+                "MultiCtasKvScratchPtr/MultiCtasKvCounterPtr must be non-null when fmha kernel uses gmem-based "
+                "multi-CTA reduction. "
                 "The dispatcher must allocate and pass these buffers.");
         }
 
