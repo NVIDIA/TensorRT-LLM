@@ -192,6 +192,49 @@ model_kwargs:
         assert llm_args.model_kwargs['num_hidden_layers'] == 2
 
 
+@pytest.mark.parametrize("llm_args_cls", [TrtLlmArgs, TorchLlmArgs])
+class TestEncoderRuntimeSizes:
+    """Cover encoder runtime size fields and fallback to LLM limits.
+
+    `encoder_max_batch_size` / `encoder_max_num_tokens` are user-facing
+    knobs that size multimodal encoder AttentionMetadata; when unset they
+    fall back to the LLM-side `max_batch_size` / `max_num_tokens`.
+    """
+
+    def test_defaults_are_none(self, llm_args_cls):
+        llm_args = llm_args_cls(model=llama_model_path)
+        assert llm_args.encoder_max_batch_size is None
+        assert llm_args.encoder_max_num_tokens is None
+
+    def test_fallback_when_unset(self, llm_args_cls):
+        llm_args = llm_args_cls(model=llama_model_path,
+                                max_batch_size=64,
+                                max_num_tokens=2048)
+        assert llm_args.get_encoder_runtime_sizes() == (64, 2048)
+
+    def test_only_encoder_batch_size_overrides(self, llm_args_cls):
+        llm_args = llm_args_cls(model=llama_model_path,
+                                max_batch_size=64,
+                                max_num_tokens=2048,
+                                encoder_max_batch_size=512)
+        assert llm_args.get_encoder_runtime_sizes() == (512, 2048)
+
+    def test_only_encoder_num_tokens_overrides(self, llm_args_cls):
+        llm_args = llm_args_cls(model=llama_model_path,
+                                max_batch_size=64,
+                                max_num_tokens=2048,
+                                encoder_max_num_tokens=32768)
+        assert llm_args.get_encoder_runtime_sizes() == (64, 32768)
+
+    def test_both_encoder_knobs_override(self, llm_args_cls):
+        llm_args = llm_args_cls(model=llama_model_path,
+                                max_batch_size=64,
+                                max_num_tokens=2048,
+                                encoder_max_batch_size=512,
+                                encoder_max_num_tokens=32768)
+        assert llm_args.get_encoder_runtime_sizes() == (512, 32768)
+
+
 def test_decoding_type_eagle3_parses_to_eagle3_decoding_config():
     adapter = TypeAdapter(SpeculativeConfig)
     spec_cfg = adapter.validate_python(
