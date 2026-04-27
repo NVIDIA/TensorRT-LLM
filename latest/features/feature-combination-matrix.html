@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=7f76b32a3354e82990f2" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=7f76b32a3354e82990f2" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=55c26ed414f5f8a31ebb" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=55c26ed414f5f8a31ebb" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=7f76b32a3354e82990f2"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=55c26ed414f5f8a31ebb"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=7f76b32a3354e82990f2" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=7f76b32a3354e82990f2" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=55c26ed414f5f8a31ebb" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=55c26ed414f5f8a31ebb" />
 
 
 
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'features/feature-combination-matrix';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.17.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.17.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc12';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc13';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc12" />
+  <meta name="docsearch:version" content="1.3.0rc13" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -102,7 +102,9 @@
   
   <button type="button" class="btn rounded-pill" id="pst-back-to-top">
     <i class="fa-solid fa-arrow-up"></i>Back to top</button>
-
+  
+  
+  
   
   <dialog id="pst-search-dialog">
     
@@ -332,9 +334,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../installation/containers.html">Pre-built release container images on NGC</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
-<li class="toctree-l2"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../installation/containers.html">Container Images</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../supported-hardware.html">Supported Hardware</a></li>
@@ -554,7 +556,8 @@
 <th class="head"><p>Disaggregated Serving</p></th>
 <th class="head"><p>Chunked Prefill</p></th>
 <th class="head"><p>MTP</p></th>
-<th class="head"><p>EAGLE-3(One Model Engine)</p></th>
+<th class="head"><p>EAGLE-3(One Model Engine) — Linear</p></th>
+<th class="head"><p>EAGLE-3(One Model Engine) — Dynamic</p></th>
 <th class="head"><p>EAGLE-3(Two Model Engine)</p></th>
 <th class="head"><p>Torch Sampler</p></th>
 <th class="head"><p>TLLM C++ Sampler</p></th>
@@ -568,6 +571,7 @@
 <tbody>
 <tr class="row-even"><td><p>Overlap Scheduler</p></td>
 <td><p>—</p></td>
+<td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -607,11 +611,13 @@
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-even"><td><p>Tensor Parallelism</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>—</p></td>
+<td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -649,6 +655,7 @@
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-even"><td><p>Expert Parallelism</p></td>
 <td><p>Yes</p></td>
@@ -656,6 +663,7 @@
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>—</p></td>
+<td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -691,6 +699,7 @@
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-even"><td><p>Attention Data Parallelism</p></td>
 <td><p>Yes</p></td>
@@ -700,6 +709,7 @@
 <td><p>Yes</p></td>
 <td><p>Known issues</p></td>
 <td><p>—</p></td>
+<td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -733,6 +743,7 @@
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
+<td><p></p></td>
 </tr>
 <tr class="row-even"><td><p>Chunked Prefill</p></td>
 <td><p>Yes</p></td>
@@ -744,6 +755,7 @@
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>—</p></td>
+<td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
@@ -775,8 +787,9 @@
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
+<td><p></p></td>
 </tr>
-<tr class="row-even"><td><p>EAGLE-3(One Model Engine)</p></td>
+<tr class="row-even"><td><p>EAGLE-3(One Model Engine) — Linear</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -796,8 +809,9 @@
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
+<td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p>EAGLE-3(Two Model Engine)</p></td>
+<tr class="row-odd"><td><p>EAGLE-3(One Model Engine) — Dynamic</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -817,8 +831,32 @@
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
+<td><p></p></td>
 </tr>
-<tr class="row-even"><td><p>Torch Sampler</p></td>
+<tr class="row-even"><td><p>EAGLE-3(Two Model Engine)</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+<td><p>—</p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p>Torch Sampler</p></td>
+<td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -839,7 +877,7 @@
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p>TLLM C++ Sampler</p></td>
+<tr class="row-even"><td><p>TLLM C++ Sampler</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -849,6 +887,7 @@
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
@@ -860,7 +899,8 @@
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p>KV Cache Reuse</p></td>
+<tr class="row-odd"><td><p>KV Cache Reuse</p></td>
+<td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -881,7 +921,7 @@
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p>Sliding Window Attention</p></td>
+<tr class="row-even"><td><p>Sliding Window Attention</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -897,12 +937,13 @@
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>Yes</p></td>
 <td><p>—</p></td>
 <td><p></p></td>
 <td><p></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p>Logits Post Processor</p></td>
+<tr class="row-odd"><td><p>Logits Post Processor</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -915,36 +956,38 @@
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>—</p></td>
-<td><p></p></td>
-<td><p></p></td>
-</tr>
-<tr class="row-odd"><td><p>Guided Decoding</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
+<td><p>No</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>—</p></td>
 <td><p></p></td>
+<td><p></p></td>
 </tr>
-<tr class="row-even"><td><p>LoRA</p></td>
+<tr class="row-even"><td><p>Guided Decoding</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>—</p></td>
+<td><p></p></td>
+</tr>
+<tr class="row-odd"><td><p>LoRA</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -954,6 +997,7 @@
 <td><p>Untested</p></td>
 <td><p>Untested</p></td>
 <td><p>Yes</p></td>
+<td><p>Untested</p></td>
 <td><p>Untested</p></td>
 <td><p>Untested</p></td>
 <td><p>Untested</p></td>
@@ -1022,8 +1066,8 @@
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=7f76b32a3354e82990f2"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=7f76b32a3354e82990f2"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=55c26ed414f5f8a31ebb"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=55c26ed414f5f8a31ebb"></script>
 
 
   <footer class="bd-footer">
@@ -1095,9 +1139,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on April 16, 2026.</p>
+  <p>Last updated on April 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/61cef21">61cef21</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b9ce4b6">b9ce4b6</a>.</p>
   
 </div></div>
       
