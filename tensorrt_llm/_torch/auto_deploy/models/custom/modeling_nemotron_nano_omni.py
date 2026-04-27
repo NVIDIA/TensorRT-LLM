@@ -21,8 +21,9 @@ Source checkpoint:
 This is a multimodal model (vision + audio + text) whose LLM backbone is
 NemotronH, a hybrid Mamba/Attention/MoE architecture. The outer wrapper
 remains eager so it can run Nemotron's vision merge path, while only the inner
-text model is exported by AutoDeploy. Audio remains intentionally unsupported
-in the current AD path and is dropped at load time.
+text model is exported by AutoDeploy. The multimodal wrapper keeps Nemotron's
+vision and audio towers eager and injects their projected embeddings into the
+text model inputs.
 
 The NemotronH backbone is translated fresh from the HuggingFace source into a
 lean prefill-only implementation using AutoDeploy canonical ops for SSM,
@@ -47,13 +48,16 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_audio_encoder import (
+    NemotronAudioEncoder,
+)
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
 from tensorrt_llm._torch.auto_deploy.models.hf import (
     AutoModelForCausalLMFactory,
     AutoModelForImageTextToTextFactory,
 )
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_parakeet import ParakeetExtractor, ProjectedParakeet
+from tensorrt_llm._torch.models.modeling_parakeet import ParakeetExtractor
 from tensorrt_llm._torch.models.modeling_radio import RADIOVisionModel
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.inputs.content_format import ContentFormat
@@ -732,7 +736,7 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
             self.mlp1 = nn.Module()
 
         if self._audio_enabled:
-            self.sound_encoder = ProjectedParakeet(
+            self.sound_encoder = NemotronAudioEncoder(
                 config.sound_config,
                 llm_hidden_size=config.llm_config.hidden_size,
                 dtype=getattr(config, "torch_dtype", None),
@@ -799,6 +803,7 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
 
     def _restore_video_embedder_loaded_flag(self, module, incompatible_keys) -> None:
         del module
+        self._zero_missing_sound_conv_biases(incompatible_keys.missing_keys)
         pending_key = self._pending_video_embedder_weight_key
         self._pending_video_embedder_weight_key = None
         if pending_key is None:
@@ -817,6 +822,22 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
         )
         if getattr(patch_generator, "video_embedder", None) is not None:
             patch_generator._video_embedder_loaded = True
+
+    def _zero_missing_sound_conv_biases(self, missing_keys: Sequence[str]) -> None:
+        if not self._audio_enabled or not hasattr(self.sound_encoder, "encoder"):
+            return
+
+        params = dict(self.named_parameters())
+        for key in missing_keys:
+            if not key.startswith("sound_encoder.encoder.layers."):
+                continue
+            if ".conv." not in key or not key.endswith(".bias"):
+                continue
+            param = params.get(key)
+            if param is None:
+                continue
+            with torch.no_grad():
+                param.zero_()
 
     @staticmethod
     def _remap_vision_weight_keys(state_dict: Dict[str, torch.Tensor], prefix: str) -> None:
@@ -973,7 +994,7 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
         feature_attention_mask: torch.Tensor,
         audio_num_clips: Optional[torch.Tensor],
     ) -> List[torch.Tensor]:
-        if not self._audio_enabled or not isinstance(self.sound_encoder, ProjectedParakeet):
+        if not self._audio_enabled or not hasattr(self.sound_encoder, "encoder"):
             raise ValueError("Nemotron audio tower is not initialized")
 
         sound_param = next(self.sound_encoder.parameters(), None)
@@ -983,10 +1004,9 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
             )
             feature_attention_mask = feature_attention_mask.to(device=sound_param.device)
 
-        sound_embeds = self.sound_encoder(input_audio_features, feature_attention_mask)
-        valid_input_lens = feature_attention_mask.sum(dim=1)
-        valid_output_lens = self.sound_encoder.encoder._get_subsampling_output_length(
-            valid_input_lens
+        sound_embeds, valid_output_lens = self.sound_encoder(
+            input_audio_features,
+            feature_attention_mask,
         )
 
         clip_embeds = [
@@ -994,16 +1014,35 @@ class NemotronNanoOmniForConditionalGeneration(NemotronNanoOmniPreTrainedModel, 
             for i in range(sound_embeds.shape[0])
         ]
         if audio_num_clips is None:
-            return clip_embeds
+            return [torch.cat(clip_embeds, dim=0)]
 
         audio_embeds = []
         clip_offset = 0
-        for num_clips in audio_num_clips.tolist():
+        clip_count = len(clip_embeds)
+        for audio_idx, num_clips in enumerate(audio_num_clips.tolist()):
             num_clips = int(num_clips)
-            audio_embeds.append(
-                torch.cat(clip_embeds[clip_offset : clip_offset + num_clips], dim=0)
+            if num_clips <= 0:
+                raise ValueError(
+                    "Nemotron audio_num_clips must contain positive clip counts; "
+                    f"audio_idx={audio_idx}, num_clips={num_clips}"
+                )
+
+            next_clip_offset = clip_offset + num_clips
+            if next_clip_offset > clip_count:
+                raise ValueError(
+                    "Nemotron audio_num_clips exceeds available encoded audio clips: "
+                    f"audio_idx={audio_idx}, requested={num_clips}, "
+                    f"available_remaining={clip_count - clip_offset}"
+                )
+
+            audio_embeds.append(torch.cat(clip_embeds[clip_offset:next_clip_offset], dim=0))
+            clip_offset = next_clip_offset
+
+        if clip_offset != clip_count:
+            raise ValueError(
+                "Nemotron audio_num_clips did not consume all encoded audio clips: "
+                f"consumed={clip_offset}, available={clip_count}"
             )
-            clip_offset += num_clips
         return audio_embeds
 
     @staticmethod
@@ -1509,11 +1548,18 @@ class NemotronNanoOmniADInputProcessor:
             raise ValueError(f"Nemotron video content item is missing a video source: {part}")
         if isinstance(video, (VideoData, list)):
             return video
+        extract_audio = part.get("extract_audio", False)
+        if not isinstance(extract_audio, bool):
+            raise TypeError(
+                "Nemotron video content item field `extract_audio` must be a bool, "
+                f"got {type(extract_audio)}"
+            )
+        # Keep path/URL video loading PyAV-free unless embedded audio is requested explicitly.
         return load_video(
             video,
             num_frames=self.video_num_frames,
             format="pil",
-            extract_audio=self._audio_extractor is not None,
+            extract_audio=extract_audio,
         )
 
     def _load_message_audio(self, part: Dict[str, Any]) -> Tuple[np.ndarray, int]:
@@ -1918,10 +1964,10 @@ class NemotronNanoOmniADInputProcessor:
                 text_prompt, video_metadatas
             )
 
-        if audios and videos:
+        if audios and extracted_audios:
             raise ValueError(
-                "Nemotron AutoDeploy currently supports explicit audio as audio-only, "
-                "or audio extracted from video metadata."
+                "Nemotron AutoDeploy cannot mix explicit audio with audio extracted from video "
+                "metadata because both sources use the same audio placeholder stream."
             )
         normalized_audios = list(audios or [])
         if extracted_audios:
@@ -2195,6 +2241,12 @@ class NemotronNanoOmniADInputProcessor:
 @ModelFactoryRegistry.register("NemotronNanoOmniForConditionalGeneration")
 class NemotronNanoOmniFactory(AutoModelForImageTextToTextFactory):
     """Factory for Nemotron Nano Omni that keeps only the inner text model exported."""
+
+    _model_defaults = {
+        "llm_config": {
+            "use_cache": False,
+        },
+    }
 
     def init_tokenizer(self) -> Optional[Any]:
         if self.tokenizer is None:

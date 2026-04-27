@@ -21,6 +21,7 @@ from torch.export import Dim
 from transformers import PretrainedConfig
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 — register all ops
+import tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_nano_omni as nemotron_omni
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_nano_omni import (
     NemotronHAttention,
@@ -33,6 +34,7 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_nano_omni i
     NemotronHRMSNorm,
     NemotronHTopkRouter,
     NemotronNanoOmniADInputProcessor,
+    NemotronNanoOmniFactory,
     NemotronNanoOmniForConditionalGeneration,
 )
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
@@ -178,6 +180,14 @@ class _OmniConfig(PretrainedConfig):
         self.llm_config = llm_config
 
 
+class _ReadOnlyTextOmniConfig(_OmniConfig):
+    """Mirror HF Omni configs whose text_config property aliases llm_config."""
+
+    @property
+    def text_config(self):
+        return self.llm_config
+
+
 def _small_config() -> _NemotronHConfig:
     """Small NemotronH config: M(amba) + E(MoE) + *(Attention) = 3 layers."""
     return _NemotronHConfig(
@@ -292,6 +302,197 @@ def _make_fake_multimodal_wrapper() -> NemotronNanoOmniForConditionalGeneration:
     model.sound_context_token_id = 5
     model.video_temporal_patch_size = 1
     return model
+
+
+class _FakeMultimodalTokenizer:
+    """Tiny tokenizer that preserves Nemotron multimodal special tokens."""
+
+    def __init__(self, sound_context_token_id: int = 27):
+        self._token_ids = {
+            "<img>": 90,
+            "</img>": 91,
+            "<so_start>": 92,
+            "<so_end>": 93,
+            "<image>": 7,
+            "<video>": 8,
+            "<so_embedding>": sound_context_token_id,
+        }
+        self._tokens = tuple(self._token_ids)
+
+    def encode(self, text, add_special_tokens=False):
+        del add_special_tokens
+        result = []
+        i = 0
+        while i < len(text):
+            matched_token = None
+            for token in self._tokens:
+                if text.startswith(token, i):
+                    matched_token = token
+                    break
+            if matched_token is not None:
+                result.append(self._token_ids[matched_token])
+                i += len(matched_token)
+                continue
+
+            next_special = len(text)
+            for token in self._tokens:
+                candidate = text.find(token, i)
+                if candidate != -1:
+                    next_special = min(next_special, candidate)
+            result.append(17)
+            i = next_special if next_special > i else i + 1
+        return result
+
+
+class _FakeCountingImageProcessor:
+    def __init__(self, max_num_tiles: int = 1):
+        self.max_num_tiles = max_num_tiles
+        self.calls = []
+
+    def __call__(self, images, return_tensors="pt"):
+        del return_tensors
+        num_patches = int(self.max_num_tiles)
+        self.calls.append((num_patches, len(images)))
+        return {
+            "pixel_values": torch.zeros(len(images) * num_patches, 3, 8, 8),
+            "num_patches": torch.full((len(images),), num_patches, dtype=torch.int32),
+        }
+
+
+class _FakeBaseProcessor:
+    def __init__(
+        self,
+        sound_context_token_id: int = 27,
+        fallback_message: str = "multimodal request should not fall back to base processor",
+    ):
+        self.tokenizer = SimpleNamespace(
+            tokenizer=_FakeMultimodalTokenizer(sound_context_token_id=sound_context_token_id)
+        )
+        self.called = False
+        self._fallback_message = fallback_message
+
+    def __call__(self, inputs, sampling_params):
+        del inputs
+        del sampling_params
+        self.called = True
+        raise AssertionError(self._fallback_message)
+
+
+class _FakeChatProcessor:
+    def __init__(self, max_num_tiles: int = 1):
+        self.image_processor = _FakeCountingImageProcessor(max_num_tiles=max_num_tiles)
+        self.chat_templates = []
+
+    def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=False):
+        del tokenize
+        self.chat_templates.append(messages)
+        rendered = []
+        for message in messages:
+            parts = []
+            image_idx = 0
+            video_idx = 0
+            audio_idx = 0
+            for part in message["content"]:
+                part_type = part["type"]
+                if part_type == "audio":
+                    audio_idx += 1
+                    parts.append(f"<audio {audio_idx}><so_embedding>")
+                elif part_type == "image":
+                    image_idx += 1
+                    parts.append(f"<image {image_idx}><image>")
+                elif part_type == "video":
+                    video_idx += 1
+                    parts.append(f"<video {video_idx}><video>")
+                elif part_type == "text":
+                    parts.append(part["text"])
+            rendered.append(" ".join(parts))
+        if add_generation_prompt:
+            rendered.append("assistant:")
+        return "\n".join(rendered)
+
+
+def _fake_sound_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        num_mel_bins=8,
+        sampling_rate=16000,
+        subsampling_factor=8,
+        subsampling_conv_kernel_size=3,
+        subsampling_conv_stride=2,
+    )
+
+
+def _fake_multimodal_processor_config(
+    *, sound_context_token_id: int = 27, include_sound_config: bool = True
+) -> SimpleNamespace:
+    config = SimpleNamespace(
+        torch_dtype=torch.float32,
+        force_image_size=8,
+        patch_size=4,
+        downsample_ratio=0.5,
+        img_context_token="<image>",
+        img_context_token_id=7,
+        video_context_token="<video>",
+        video_context_token_id=8,
+        img_start_token="<img>",
+        img_end_token="</img>",
+        sound_context_token="<so_embedding>",
+        sound_context_token_id=sound_context_token_id,
+        llm_config=SimpleNamespace(vocab_size=256),
+        vision_config=SimpleNamespace(video_temporal_patch_size=1, num_frames=2),
+    )
+    if include_sound_config:
+        config.sound_config = _fake_sound_config()
+    return config
+
+
+def _install_fake_audio_feature_stubs(input_processor: NemotronNanoOmniADInputProcessor) -> None:
+    input_processor.get_num_tokens_per_audio = lambda *, audio, **kwargs: 4
+    input_processor._prepare_audio_features = lambda audios: {
+        "input_audio_features": torch.zeros(len(audios), 4, 8),
+        "feature_attention_mask": torch.ones(len(audios), 4, dtype=torch.int32),
+        "audio_num_clips": torch.ones(len(audios), dtype=torch.int32),
+    }
+
+
+def _make_fake_multimodal_input_processor(
+    *,
+    max_num_tiles: int = 1,
+    sound_context_token_id: int = 27,
+    include_sound_config: bool = True,
+    install_audio_feature_stubs: bool = True,
+    fallback_message: str = "multimodal request should not fall back to base processor",
+):
+    base_processor = _FakeBaseProcessor(
+        sound_context_token_id=sound_context_token_id,
+        fallback_message=fallback_message,
+    )
+    processor = _FakeChatProcessor(max_num_tiles=max_num_tiles)
+    config = _fake_multimodal_processor_config(
+        sound_context_token_id=sound_context_token_id,
+        include_sound_config=include_sound_config,
+    )
+    input_processor = NemotronNanoOmniADInputProcessor(base_processor, processor, config)
+    if install_audio_feature_stubs:
+        _install_fake_audio_feature_stubs(input_processor)
+    return input_processor, processor, base_processor
+
+
+def _make_fake_audio_layout_input_processor() -> NemotronNanoOmniADInputProcessor:
+    input_processor, _, _ = _make_fake_multimodal_input_processor(
+        sound_context_token_id=5,
+        fallback_message="audio layout request should not fall back to base processor",
+    )
+    return input_processor
+
+
+def _build_fake_audio_layout_payload():
+    return _make_fake_audio_layout_input_processor()(
+        {
+            "prompt": "hear <so_embedding> now",
+            "multi_modal_data": {"audio": [(np.zeros(800, dtype=np.float32), 16000)]},
+        },
+        sampling_params=None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -635,6 +836,81 @@ def test_wrapper_audio_embedding_injection():
 
 
 @torch.no_grad()
+def test_wrapper_get_audio_features_groups_multiple_clips_per_audio():
+    """Audio helper output should be truncated per clip and regrouped per audio item."""
+
+    class _FakeSoundEncoder(nn.Module):
+        def __init__(self, sound_embeds: torch.Tensor, valid_output_lens: torch.Tensor):
+            super().__init__()
+            self.encoder = nn.Identity()
+            self._param = nn.Parameter(torch.zeros((), dtype=sound_embeds.dtype))
+            self.sound_embeds = sound_embeds
+            self.valid_output_lens = valid_output_lens
+            self.seen_feature_dtype = None
+
+        def forward(
+            self,
+            input_audio_features: torch.Tensor,
+            feature_attention_mask: torch.Tensor,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            self.seen_feature_dtype = input_audio_features.dtype
+            assert feature_attention_mask.device == input_audio_features.device
+            return (
+                self.sound_embeds.to(input_audio_features.device),
+                self.valid_output_lens.to(input_audio_features.device),
+            )
+
+    model = _make_fake_multimodal_wrapper()
+    hidden_size = model.language_model.config.hidden_size
+    sound_embeds = torch.arange(3 * 4 * hidden_size, dtype=torch.float32).view(3, 4, hidden_size)
+    valid_output_lens = torch.tensor([2, 3, 1], dtype=torch.int32)
+    fake_sound_encoder = _FakeSoundEncoder(sound_embeds, valid_output_lens)
+    model.sound_encoder = fake_sound_encoder
+
+    audio_embeds = model.get_audio_features(
+        input_audio_features=torch.zeros(3, 8, 4, dtype=torch.float64),
+        feature_attention_mask=torch.ones(3, 8, dtype=torch.int32),
+        audio_num_clips=torch.tensor([2, 1], dtype=torch.int32),
+    )
+
+    assert fake_sound_encoder.seen_feature_dtype == torch.float32
+    assert len(audio_embeds) == 2
+    expected_flat = torch.cat([sound_embeds[0, :2], sound_embeds[1, :3], sound_embeds[2, :1]])
+    torch.testing.assert_close(audio_embeds[0], expected_flat[:5])
+    torch.testing.assert_close(audio_embeds[1], sound_embeds[2, :1])
+
+    ungrouped_audio_embeds = model.get_audio_features(
+        input_audio_features=torch.zeros(3, 8, 4, dtype=torch.float64),
+        feature_attention_mask=torch.ones(3, 8, dtype=torch.int32),
+        audio_num_clips=None,
+    )
+
+    assert len(ungrouped_audio_embeds) == 1
+    torch.testing.assert_close(ungrouped_audio_embeds[0], expected_flat)
+
+    with pytest.raises(ValueError, match="did not consume all encoded audio clips"):
+        model.get_audio_features(
+            input_audio_features=torch.zeros(3, 8, 4, dtype=torch.float64),
+            feature_attention_mask=torch.ones(3, 8, dtype=torch.int32),
+            audio_num_clips=torch.tensor([1], dtype=torch.int32),
+        )
+
+    with pytest.raises(ValueError, match="exceeds available encoded audio clips"):
+        model.get_audio_features(
+            input_audio_features=torch.zeros(3, 8, 4, dtype=torch.float64),
+            feature_attention_mask=torch.ones(3, 8, dtype=torch.int32),
+            audio_num_clips=torch.tensor([4], dtype=torch.int32),
+        )
+
+    with pytest.raises(ValueError, match="positive clip counts"):
+        model.get_audio_features(
+            input_audio_features=torch.zeros(3, 8, 4, dtype=torch.float64),
+            feature_attention_mask=torch.ones(3, 8, dtype=torch.int32),
+            audio_num_clips=torch.tensor([0, 3], dtype=torch.int32),
+        )
+
+
+@torch.no_grad()
 def test_wrapper_chunked_multimodal_embedding_selection():
     """Wrapper selects only the visible multimodal embedding rows for a chunked batch."""
     model = _make_fake_multimodal_wrapper()
@@ -704,6 +980,76 @@ def test_wrapper_chunked_audio_embedding_selection():
 
 
 @torch.no_grad()
+def test_wrapper_prefill_audio_merge_matches_processor_layout_metadata():
+    """Processor audio span metadata should line up exactly with wrapper prefill merge."""
+    token_ids, payload = _build_fake_audio_layout_payload()
+
+    model = _make_fake_multimodal_wrapper()
+    hidden_size = model.language_model.config.hidden_size
+    audio_embeds = torch.arange(1, hidden_size * 2 + 1, dtype=torch.float32).view(2, hidden_size)
+    model.get_audio_features = (
+        lambda input_audio_features, feature_attention_mask, audio_num_clips: [audio_embeds]
+    )
+
+    input_ids = torch.tensor([token_ids], dtype=torch.long)
+    position_ids = torch.arange(input_ids.shape[1]).unsqueeze(0)
+    base_embeds = model.get_input_embeddings()(input_ids)
+    layout_metadata = payload["multimodal_data"]["layout_metadata"]
+    multimodal_input = payload["multimodal_input"]
+
+    out = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        input_audio_features=payload["multimodal_data"]["input_audio_features"],
+        feature_attention_mask=payload["multimodal_data"]["feature_attention_mask"],
+        audio_num_clips=payload["multimodal_data"]["audio_num_clips"],
+        seq_len=torch.tensor([input_ids.shape[1]], dtype=torch.int32),
+        mm_item_cu_seqlen=torch.tensor([0, 1], dtype=torch.int32),
+        mm_item_types=layout_metadata["item_types"],
+        mm_token_positions=torch.tensor(multimodal_input.multimodal_positions, dtype=torch.int32),
+        mm_token_lengths=torch.tensor(multimodal_input.multimodal_lengths, dtype=torch.int32),
+        mm_special_offsets_cu_seqlen=torch.tensor(
+            [0, layout_metadata["special_token_offsets"].numel()], dtype=torch.int32
+        ),
+        mm_special_offsets=layout_metadata["special_token_offsets"],
+    )
+
+    sound_positions = (
+        (input_ids[0] == model.sound_context_token_id).nonzero(as_tuple=False).view(-1)
+    )
+    torch.testing.assert_close(out.logits[0, sound_positions], audio_embeds)
+    torch.testing.assert_close(out.logits[0, 0], base_embeds[0, 0].float())
+    torch.testing.assert_close(out.logits[0, -1], base_embeds[0, -1].float())
+
+
+@torch.no_grad()
+def test_wrapper_chunked_audio_merge_matches_processor_layout_metadata():
+    """Processor audio metadata should let chunked merge select only visible sound rows."""
+    token_ids, payload = _build_fake_audio_layout_payload()
+    del token_ids
+
+    model = _make_fake_multimodal_wrapper()
+    hidden_size = model.language_model.config.hidden_size
+    audio_embeds = torch.arange(1, hidden_size * 2 + 1, dtype=torch.float32).view(2, hidden_size)
+    layout_metadata = payload["multimodal_data"]["layout_metadata"]
+    multimodal_input = payload["multimodal_input"]
+
+    selected = model._select_request_chunk_multimodal_embeds(
+        req_input_pos=1,
+        req_seq_len=2,
+        req_mm_item_types=layout_metadata["item_types"].tolist(),
+        req_mm_positions=multimodal_input.multimodal_positions,
+        req_mm_lengths=multimodal_input.multimodal_lengths,
+        req_special_offsets=layout_metadata["special_token_offsets"].tolist(),
+        image_embeds_list=None,
+        video_embeds_list=None,
+        audio_embeds_list=[audio_embeds],
+    )
+
+    torch.testing.assert_close(selected, audio_embeds[0:1])
+
+
+@torch.no_grad()
 def test_wrapper_interleaved_multimodal_selection_preserves_prompt_order():
     """Chunk selection should preserve interleaved video/image/video prompt order."""
     model = _make_fake_multimodal_wrapper()
@@ -725,6 +1071,32 @@ def test_wrapper_interleaved_multimodal_selection_preserves_prompt_order():
     )
 
     expected = torch.cat([first_video_embed, image_embed, second_video_embed], dim=0)
+    torch.testing.assert_close(selected, expected)
+
+
+@torch.no_grad()
+def test_wrapper_interleaved_image_audio_video_selection_preserves_prompt_order():
+    """Chunk selection should preserve prompt order when audio is mixed with vision."""
+    model = _make_fake_multimodal_wrapper()
+    hidden_size = model.language_model.config.hidden_size
+
+    image_embed = torch.full((1, hidden_size), 2.5)
+    audio_embeds = torch.arange(1, hidden_size * 2 + 1, dtype=torch.float32).view(2, hidden_size)
+    video_embed = torch.full((1, hidden_size), -4.0)
+
+    selected = model._select_request_chunk_multimodal_embeds(
+        req_input_pos=0,
+        req_seq_len=10,
+        req_mm_item_types=[0, 2, 1],
+        req_mm_positions=[0, 3, 7],
+        req_mm_lengths=[3, 4, 3],
+        req_special_offsets=[0, 2, 3, 6, 7, 9],
+        image_embeds_list=[image_embed],
+        video_embeds_list=[video_embed],
+        audio_embeds_list=[audio_embeds],
+    )
+
+    expected = torch.cat([image_embed, audio_embeds, video_embed], dim=0)
     torch.testing.assert_close(selected, expected)
 
 
@@ -778,6 +1150,60 @@ def test_wrapper_keeps_audio_weights_when_enabled():
         model.sound_encoder.projection.weight,
         torch.full_like(model.sound_encoder.projection.weight, -1.25),
     )
+
+
+def test_wrapper_zeros_missing_sound_conv_biases():
+    """Missing Parakeet conv biases should be reset to zero after meta-style checkpoint load."""
+
+    class _FakeConvModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.depthwise_conv = nn.Linear(2, 2)
+            self.pointwise_conv1 = nn.Linear(2, 2)
+            self.pointwise_conv2 = nn.Linear(2, 2)
+
+    class _FakeLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = _FakeConvModule()
+
+    class _FakeEncoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([_FakeLayer()])
+
+    class _FakeSoundEncoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = _FakeEncoder()
+            self.projection = nn.Linear(2, 2, bias=False)
+
+    llm_config = _small_config()
+    config = _OmniConfig(llm_config)
+    model = NemotronNanoOmniForConditionalGeneration(config)
+    model.sound_encoder = _FakeSoundEncoder()
+    model._audio_enabled = True
+
+    for name, param in model.sound_encoder.named_parameters():
+        if ".conv." in name and name.endswith(".bias"):
+            param.data.fill_(7.0)
+
+    state_dict = model.state_dict()
+    dropped_bias_keys = [
+        "sound_encoder.encoder.layers.0.conv.depthwise_conv.bias",
+        "sound_encoder.encoder.layers.0.conv.pointwise_conv1.bias",
+        "sound_encoder.encoder.layers.0.conv.pointwise_conv2.bias",
+    ]
+    for key in dropped_bias_keys:
+        state_dict.pop(key)
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+    assert unexpected == []
+    assert set(dropped_bias_keys).issubset(set(missing))
+    for key in dropped_bias_keys:
+        bias = dict(model.named_parameters())[key]
+        torch.testing.assert_close(bias, torch.zeros_like(bias))
 
 
 def test_wrapper_keeps_vision_weights_when_enabled():
@@ -958,6 +1384,23 @@ def test_wrapper_text_config_alias():
     NemotronNanoOmniForConditionalGeneration(config)
     assert hasattr(config, "text_config")
     assert config.text_config is llm_config
+
+
+def test_factory_updates_read_only_text_config_alias_via_llm_config():
+    """Factory defaults must target the writable llm_config, not read-only text_config."""
+    llm_config = _small_config()
+    llm_config.use_cache = True
+    config = _ReadOnlyTextOmniConfig(llm_config)
+    factory = NemotronNanoOmniFactory(model="dummy")
+
+    assert factory.model_kwargs == {"llm_config": {"use_cache": False}}
+
+    updated_config, unused_kwargs = factory._recursive_update_config(config, factory.model_kwargs)
+
+    assert updated_config is config
+    assert unused_kwargs == {}
+    assert config.text_config is llm_config
+    assert config.llm_config.use_cache is False
 
 
 def test_wrapper_get_input_embeddings():
@@ -1506,77 +1949,9 @@ def test_input_processor_handles_mixed_image_and_video_prompt():
 
 def test_input_processor_handles_audio_prompt():
     """Audio prompts should expand sound placeholders and emit audio layout metadata."""
-
-    class _FakeTokenizer:
-        def encode(self, text, add_special_tokens=False):
-            del add_special_tokens
-            result = []
-            i = 0
-            while i < len(text):
-                if text.startswith("<img>", i):
-                    result.append(90)
-                    i += len("<img>")
-                elif text.startswith("</img>", i):
-                    result.append(91)
-                    i += len("</img>")
-                elif text.startswith("<so_start>", i):
-                    result.append(92)
-                    i += len("<so_start>")
-                elif text.startswith("<so_end>", i):
-                    result.append(93)
-                    i += len("<so_end>")
-                elif text.startswith("<so_embedding>", i):
-                    result.append(27)
-                    i += len("<so_embedding>")
-                else:
-                    next_special = len(text)
-                    for token in (
-                        "<img>",
-                        "</img>",
-                        "<so_start>",
-                        "<so_end>",
-                        "<so_embedding>",
-                    ):
-                        candidate = text.find(token, i)
-                        if candidate != -1:
-                            next_special = min(next_special, candidate)
-                    result.append(17)
-                    i = next_special if next_special > i else i + 1
-            return result
-
-    base_processor = SimpleNamespace(tokenizer=SimpleNamespace(tokenizer=_FakeTokenizer()))
-    processor = SimpleNamespace(image_processor=SimpleNamespace(max_num_tiles=1))
-    sound_config = SimpleNamespace(
-        num_mel_bins=8,
-        sampling_rate=16000,
-        subsampling_factor=8,
-        subsampling_conv_kernel_size=3,
-        subsampling_conv_stride=2,
+    input_processor, _, _ = _make_fake_multimodal_input_processor(
+        fallback_message="audio prompt should not fall back to base processor",
     )
-    config = SimpleNamespace(
-        torch_dtype=torch.float32,
-        force_image_size=8,
-        patch_size=4,
-        downsample_ratio=0.5,
-        img_context_token="<image>",
-        img_context_token_id=7,
-        video_context_token="<video>",
-        video_context_token_id=8,
-        img_start_token="<img>",
-        img_end_token="</img>",
-        sound_context_token="<so_embedding>",
-        sound_context_token_id=27,
-        sound_config=sound_config,
-        llm_config=SimpleNamespace(vocab_size=256),
-        vision_config=SimpleNamespace(video_temporal_patch_size=1, num_frames=2),
-    )
-    input_processor = NemotronNanoOmniADInputProcessor(base_processor, processor, config)
-    input_processor.get_num_tokens_per_audio = lambda *, audio, **kwargs: 4
-    input_processor._prepare_audio_features = lambda audios: {
-        "input_audio_features": torch.zeros(len(audios), 4, 8),
-        "feature_attention_mask": torch.ones(len(audios), 4, dtype=torch.int32),
-        "audio_num_clips": torch.ones(len(audios), dtype=torch.int32),
-    }
 
     token_ids, payload = input_processor(
         {
@@ -1595,98 +1970,76 @@ def test_input_processor_handles_audio_prompt():
     assert token_ids == [17, 92, 27, 27, 93]
 
 
+def test_input_processor_handles_explicit_audio_with_video_prompt():
+    """Explicit audio can be mixed with video when video metadata has no audio sidecar."""
+    input_processor, processor, _ = _make_fake_multimodal_input_processor(
+        fallback_message="explicit audio+video prompt should not fall back to base processor",
+    )
+
+    token_ids, payload = input_processor(
+        {
+            "prompt": "hear <so_embedding> then watch <video>",
+            "multi_modal_data": {
+                "audio": [(np.zeros(800, dtype=np.float32), 16000)],
+                "video": [
+                    [Image.new("RGB", (8, 8), color="red"), Image.new("RGB", (8, 8), color="blue")]
+                ],
+            },
+        },
+        sampling_params=None,
+    )
+
+    assert processor.image_processor.calls == [(1, 2)]
+    assert tuple(payload["multimodal_data"]["pixel_values_videos"].shape) == (2, 3, 8, 8)
+    assert "input_audio_features" in payload["multimodal_data"]
+    assert payload["multimodal_data"]["layout_metadata"]["item_types"].tolist() == [2, 1, 1]
+    assert payload["multimodal_data"]["layout_metadata"]["special_token_offsets"].tolist() == [
+        0,
+        3,
+        4,
+        6,
+        7,
+        9,
+    ]
+    assert payload["multimodal_input"].multimodal_lengths == [4, 3, 3]
+    assert token_ids.count(27) == 2
+    assert token_ids.count(7) == 2
+
+
+def test_input_processor_rejects_explicit_audio_with_video_metadata_audio():
+    """Explicit audio plus video-side audio remains ambiguous and should fail fast."""
+    input_processor, _, _ = _make_fake_multimodal_input_processor(
+        fallback_message="explicit audio+metadata-audio prompt should not fall back",
+    )
+
+    video = VideoData(
+        frames=[Image.new("RGB", (8, 8), color="red"), Image.new("RGB", (8, 8), color="blue")],
+        metadata={
+            "fps": 30,
+            "frames_indices": [0, 1],
+            "audio_samples": np.zeros(800, dtype=np.float32),
+            "audio_sample_rate": 16000,
+        },
+    )
+
+    with pytest.raises(ValueError, match="cannot mix explicit audio"):
+        input_processor(
+            {
+                "prompt": "hear <so_embedding> then watch <video>",
+                "multi_modal_data": {
+                    "audio": [(np.zeros(800, dtype=np.float32), 16000)],
+                    "video": [video],
+                },
+            },
+            sampling_params=None,
+        )
+
+
 def test_input_processor_extracts_audio_from_video_metadata():
     """Video metadata audio should become a separate ordered audio span after video spans."""
-
-    class _FakeTokenizer:
-        def encode(self, text, add_special_tokens=False):
-            del add_special_tokens
-            result = []
-            i = 0
-            while i < len(text):
-                if text.startswith("<img>", i):
-                    result.append(90)
-                    i += len("<img>")
-                elif text.startswith("</img>", i):
-                    result.append(91)
-                    i += len("</img>")
-                elif text.startswith("<so_start>", i):
-                    result.append(92)
-                    i += len("<so_start>")
-                elif text.startswith("<so_end>", i):
-                    result.append(93)
-                    i += len("<so_end>")
-                elif text.startswith("<image>", i):
-                    result.append(7)
-                    i += len("<image>")
-                elif text.startswith("<video>", i):
-                    result.append(8)
-                    i += len("<video>")
-                elif text.startswith("<so_embedding>", i):
-                    result.append(27)
-                    i += len("<so_embedding>")
-                else:
-                    next_special = len(text)
-                    for token in (
-                        "<img>",
-                        "</img>",
-                        "<so_start>",
-                        "<so_end>",
-                        "<image>",
-                        "<video>",
-                        "<so_embedding>",
-                    ):
-                        candidate = text.find(token, i)
-                        if candidate != -1:
-                            next_special = min(next_special, candidate)
-                    result.append(17)
-                    i = next_special if next_special > i else i + 1
-            return result
-
-    class _FakeImageProcessor:
-        def __init__(self):
-            self.max_num_tiles = 1
-
-        def __call__(self, images, return_tensors="pt"):
-            del return_tensors
-            return {
-                "pixel_values": torch.zeros(len(images), 3, 8, 8),
-                "num_patches": torch.ones(len(images), dtype=torch.int32),
-            }
-
-    base_processor = SimpleNamespace(tokenizer=SimpleNamespace(tokenizer=_FakeTokenizer()))
-    processor = SimpleNamespace(image_processor=_FakeImageProcessor())
-    sound_config = SimpleNamespace(
-        num_mel_bins=8,
-        sampling_rate=16000,
-        subsampling_factor=8,
-        subsampling_conv_kernel_size=3,
-        subsampling_conv_stride=2,
+    input_processor, _, _ = _make_fake_multimodal_input_processor(
+        fallback_message="video metadata audio prompt should not fall back to base processor",
     )
-    config = SimpleNamespace(
-        torch_dtype=torch.float32,
-        force_image_size=8,
-        patch_size=4,
-        downsample_ratio=0.5,
-        img_context_token="<image>",
-        img_context_token_id=7,
-        video_context_token="<video>",
-        video_context_token_id=8,
-        img_start_token="<img>",
-        img_end_token="</img>",
-        sound_context_token="<so_embedding>",
-        sound_context_token_id=27,
-        sound_config=sound_config,
-        llm_config=SimpleNamespace(vocab_size=256),
-        vision_config=SimpleNamespace(video_temporal_patch_size=1, num_frames=2),
-    )
-    input_processor = NemotronNanoOmniADInputProcessor(base_processor, processor, config)
-    input_processor.get_num_tokens_per_audio = lambda *, audio, **kwargs: 4
-    input_processor._prepare_audio_features = lambda audios: {
-        "input_audio_features": torch.zeros(len(audios), 4, 8),
-        "feature_attention_mask": torch.ones(len(audios), 4, dtype=torch.int32),
-        "audio_num_clips": torch.ones(len(audios), dtype=torch.int32),
-    }
 
     video = VideoData(
         frames=[Image.new("RGB", (8, 8), color="red"), Image.new("RGB", (8, 8), color="blue")],
@@ -1712,103 +2065,169 @@ def test_input_processor_extracts_audio_from_video_metadata():
     assert token_ids.count(27) == 2
 
 
+def test_input_processor_message_video_path_does_not_extract_audio_by_default(monkeypatch):
+    """Path/URL video loading should not require PyAV unless embedded audio is requested."""
+    input_processor, processor, base_processor = _make_fake_multimodal_input_processor(
+        fallback_message="video path message should not fall back to base processor",
+    )
+    calls = []
+
+    def fake_load_video(video, *, num_frames, format, extract_audio):
+        calls.append(
+            {
+                "video": video,
+                "num_frames": num_frames,
+                "format": format,
+                "extract_audio": extract_audio,
+            }
+        )
+        return [Image.new("RGB", (8, 8), color="red"), Image.new("RGB", (8, 8), color="blue")]
+
+    monkeypatch.setattr(nemotron_omni, "load_video", fake_load_video)
+
+    token_ids, payload = input_processor(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video", "video": "/tmp/example.mp4"},
+                        {"type": "text", "text": "Describe this video."},
+                    ],
+                }
+            ]
+        },
+        sampling_params=None,
+    )
+
+    assert not base_processor.called
+    assert calls == [
+        {
+            "video": "/tmp/example.mp4",
+            "num_frames": input_processor.video_num_frames,
+            "format": "pil",
+            "extract_audio": False,
+        }
+    ]
+    assert processor.image_processor.calls == [(1, 2)]
+    assert tuple(payload["multimodal_data"]["pixel_values_videos"].shape) == (2, 3, 8, 8)
+    assert "input_audio_features" not in payload["multimodal_data"]
+    assert payload["multimodal_data"]["layout_metadata"]["item_types"].tolist() == [1, 1]
+    assert token_ids.count(7) == 2
+
+
+def test_input_processor_message_video_path_can_opt_in_to_extract_audio(monkeypatch):
+    """Path/URL video loading should preserve explicit embedded-audio opt-in."""
+    input_processor, processor, base_processor = _make_fake_multimodal_input_processor(
+        fallback_message="video path audio opt-in should not fall back to base processor",
+    )
+    calls = []
+
+    def fake_load_video(video, *, num_frames, format, extract_audio):
+        calls.append(
+            {
+                "video": video,
+                "num_frames": num_frames,
+                "format": format,
+                "extract_audio": extract_audio,
+            }
+        )
+        return VideoData(
+            frames=[
+                Image.new("RGB", (8, 8), color="red"),
+                Image.new("RGB", (8, 8), color="blue"),
+            ],
+            metadata={
+                "fps": 30,
+                "frames_indices": [0, 1],
+                "audio_samples": np.zeros(800, dtype=np.float32),
+                "audio_sample_rate": 16000,
+            },
+        )
+
+    monkeypatch.setattr(nemotron_omni, "load_video", fake_load_video)
+
+    token_ids, payload = input_processor(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "video",
+                            "video": "/tmp/example.mp4",
+                            "extract_audio": True,
+                        },
+                        {"type": "text", "text": "Describe this video."},
+                    ],
+                }
+            ]
+        },
+        sampling_params=None,
+    )
+
+    assert not base_processor.called
+    assert calls == [
+        {
+            "video": "/tmp/example.mp4",
+            "num_frames": input_processor.video_num_frames,
+            "format": "pil",
+            "extract_audio": True,
+        }
+    ]
+    assert processor.image_processor.calls == [(1, 2)]
+    assert tuple(payload["multimodal_data"]["pixel_values_videos"].shape) == (2, 3, 8, 8)
+    assert "input_audio_features" in payload["multimodal_data"]
+    assert payload["multimodal_data"]["layout_metadata"]["item_types"].tolist() == [1, 1, 2]
+    assert payload["multimodal_input"].multimodal_lengths == [3, 3, 4]
+    assert token_ids.count(27) == 2
+    assert token_ids.count(7) == 2
+
+
+def test_input_processor_message_video_extract_audio_requires_bool(monkeypatch):
+    """Non-bool extract_audio values should fail before video loading."""
+    input_processor, _, _ = _make_fake_multimodal_input_processor(
+        fallback_message="invalid video extract_audio should not fall back to base processor",
+    )
+    calls = []
+
+    def fake_load_video(video, *, num_frames, format, extract_audio):
+        calls.append((video, num_frames, format, extract_audio))
+        return [Image.new("RGB", (8, 8), color="red")]
+
+    monkeypatch.setattr(nemotron_omni, "load_video", fake_load_video)
+
+    with pytest.raises(TypeError, match="extract_audio.*bool"):
+        input_processor(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "video",
+                                "video": "/tmp/example.mp4",
+                                "extract_audio": "false",
+                            },
+                            {"type": "text", "text": "Describe this video."},
+                        ],
+                    }
+                ]
+            },
+            sampling_params=None,
+        )
+
+    assert calls == []
+
+
 def test_input_processor_handles_messages_with_interleaved_image_and_video():
     """Mixed image+video messages should preserve multimodal span order after chat templating."""
-
-    class _FakeTokenizer:
-        def encode(self, text, add_special_tokens=False):
-            del add_special_tokens
-            result = []
-            i = 0
-            while i < len(text):
-                if text.startswith("<img>", i):
-                    result.append(90)
-                    i += len("<img>")
-                elif text.startswith("</img>", i):
-                    result.append(91)
-                    i += len("</img>")
-                elif text.startswith("<image>", i):
-                    result.append(7)
-                    i += len("<image>")
-                else:
-                    next_special = len(text)
-                    for token in ("<img>", "</img>", "<image>"):
-                        candidate = text.find(token, i)
-                        if candidate != -1:
-                            next_special = min(next_special, candidate)
-                    result.append(17)
-                    i = next_special if next_special > i else i + 1
-            return result
-
-    class _BaseProcessor:
-        def __init__(self):
-            self.tokenizer = SimpleNamespace(tokenizer=_FakeTokenizer())
-            self.called = False
-
-        def __call__(self, inputs, sampling_params):
-            del inputs
-            del sampling_params
-            self.called = True
-            raise AssertionError("mixed multimodal messages should not fall back to base processor")
-
-    class _FakeImageProcessor:
-        def __init__(self):
-            self.max_num_tiles = 4
-            self.calls = []
-
-        def __call__(self, images, return_tensors="pt"):
-            del return_tensors
-            self.calls.append((self.max_num_tiles, len(images)))
-            num_tiles = self.max_num_tiles
-            return {
-                "pixel_values": torch.zeros(len(images) * num_tiles, 3, 8, 8),
-                "num_patches": torch.full((len(images),), num_tiles, dtype=torch.int32),
-            }
-
-    class _FakeProcessor:
-        def __init__(self):
-            self.image_processor = _FakeImageProcessor()
-            self.chat_templates = []
-
-        def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=False):
-            del tokenize
-            self.chat_templates.append(messages)
-            rendered = []
-            for message in messages:
-                parts = []
-                image_idx = 0
-                video_idx = 0
-                for part in message["content"]:
-                    if part["type"] == "image":
-                        image_idx += 1
-                        parts.append(f"<image {image_idx}><image>")
-                    elif part["type"] == "video":
-                        video_idx += 1
-                        parts.append(f"<video {video_idx}><video>")
-                    elif part["type"] == "text":
-                        parts.append(part["text"])
-                rendered.append(" ".join(parts))
-            if add_generation_prompt:
-                rendered.append("assistant:")
-            return "\n".join(rendered)
-
-    base_processor = _BaseProcessor()
-    processor = _FakeProcessor()
-    config = SimpleNamespace(
-        torch_dtype=torch.float32,
-        force_image_size=8,
-        patch_size=4,
-        downsample_ratio=0.5,
-        img_context_token="<image>",
-        img_context_token_id=7,
-        video_context_token="<video>",
-        video_context_token_id=8,
-        img_start_token="<img>",
-        img_end_token="</img>",
-        llm_config=SimpleNamespace(vocab_size=256),
-        vision_config=SimpleNamespace(video_temporal_patch_size=1, num_frames=2),
+    input_processor, processor, base_processor = _make_fake_multimodal_input_processor(
+        max_num_tiles=4,
+        include_sound_config=False,
+        install_audio_feature_stubs=False,
+        fallback_message="mixed multimodal messages should not fall back to base processor",
     )
-    input_processor = NemotronNanoOmniADInputProcessor(base_processor, processor, config)
 
     video_frames = [Image.new("RGB", (8, 8), color="red"), Image.new("RGB", (8, 8), color="blue")]
     token_ids, payload = input_processor(
@@ -1834,6 +2253,91 @@ def test_input_processor_handles_messages_with_interleaved_image_and_video():
     assert payload["multimodal_data"]["layout_metadata"]["item_types"].tolist() == [0, 1, 1]
     assert payload["multimodal_input"].multimodal_lengths == [6, 3, 3]
     assert token_ids.count(7) == 6
+
+
+def test_input_processor_handles_messages_with_interleaved_audio_and_image():
+    """Mixed audio+image messages should preserve ordered audio/image span metadata."""
+    input_processor, processor, base_processor = _make_fake_multimodal_input_processor(
+        max_num_tiles=2,
+        fallback_message="mixed audio+image messages should not fall back to base processor",
+    )
+
+    token_ids, payload = input_processor(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "audio", "audio": (np.zeros(800, dtype=np.float32), 16000)},
+                        {"type": "text", "text": "Compare this with"},
+                        {"type": "image", "image": Image.new("RGB", (8, 8), color="green")},
+                    ],
+                }
+            ]
+        },
+        sampling_params=None,
+    )
+
+    assert not base_processor.called
+    assert processor.image_processor.calls == [(2, 1)]
+    assert processor.chat_templates[0][0]["content"][0]["type"] == "audio"
+    assert processor.chat_templates[0][0]["content"][2]["type"] == "image"
+    assert tuple(payload["multimodal_data"]["pixel_values"].shape) == (2, 3, 8, 8)
+    assert payload["multimodal_data"]["image_num_patches"].tolist() == [2]
+    assert "input_audio_features" in payload["multimodal_data"]
+    assert payload["multimodal_data"]["layout_metadata"]["item_types"].tolist() == [2, 0]
+    assert payload["multimodal_data"]["layout_metadata"]["special_token_offsets"].tolist() == [
+        0,
+        3,
+        4,
+        7,
+    ]
+    assert payload["multimodal_input"].multimodal_lengths == [4, 4]
+    assert token_ids.count(27) == 2
+    assert token_ids.count(7) == 2
+
+
+def test_input_processor_handles_messages_with_interleaved_audio_and_video():
+    """Mixed audio+video messages should preserve ordered audio/video span metadata."""
+    input_processor, processor, base_processor = _make_fake_multimodal_input_processor(
+        fallback_message="mixed audio+video messages should not fall back to base processor",
+    )
+
+    video_frames = [Image.new("RGB", (8, 8), color="red"), Image.new("RGB", (8, 8), color="blue")]
+    token_ids, payload = input_processor(
+        {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "audio", "audio": (np.zeros(800, dtype=np.float32), 16000)},
+                        {"type": "text", "text": "Compare this with"},
+                        {"type": "video", "video": video_frames},
+                    ],
+                }
+            ]
+        },
+        sampling_params=None,
+    )
+
+    assert not base_processor.called
+    assert processor.image_processor.calls == [(1, 2)]
+    assert processor.chat_templates[0][0]["content"][0]["type"] == "audio"
+    assert processor.chat_templates[0][0]["content"][2]["type"] == "video"
+    assert tuple(payload["multimodal_data"]["pixel_values_videos"].shape) == (2, 3, 8, 8)
+    assert "input_audio_features" in payload["multimodal_data"]
+    assert payload["multimodal_data"]["layout_metadata"]["item_types"].tolist() == [2, 1, 1]
+    assert payload["multimodal_data"]["layout_metadata"]["special_token_offsets"].tolist() == [
+        0,
+        3,
+        4,
+        6,
+        7,
+        9,
+    ]
+    assert payload["multimodal_input"].multimodal_lengths == [4, 3, 3]
+    assert token_ids.count(27) == 2
+    assert token_ids.count(7) == 2
 
 
 # ---------------------------------------------------------------------------
