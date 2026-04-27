@@ -4416,9 +4416,10 @@ def launchTestJobs(pipeline, testFilter)
 
     // CBTS Layer 2: stage-level short-circuit override. Runs AFTER all
     // existing filter rules so that unknown / no-decision paths fall through
-    // naturally. See jenkins/scripts/cbts/README.md for the two-layer model.
+    // naturally. Scope-agnostic: any non-null cbts result with affected_stages
+    // is treated as actionable. See jenkins/scripts/cbts/README.md.
     def cbts = testFilter[(CBTS_RESULT)]
-    if (cbts?.scope == "waiveonly" && cbts.affected_stages) {
+    if (cbts != null && cbts.affected_stages) {
         def affectedSet = cbts.affected_stages as Set
         parallelJobsFiltered = parallelJobs.findAll { key, _ -> affectedSet.contains(key) }
         // Under `/bot run --post-merge`, keep only post-merge hits; if none,
@@ -4427,9 +4428,9 @@ def launchTestJobs(pipeline, testFilter)
         // there, so reading it here is equivalent to "user passed --post-merge".
         if (testFilter[(IS_POST_MERGE)]) {
             parallelJobsFiltered = parallelJobsFiltered.findAll { it.key.contains("Post-Merge") }
-            echo "CBTS waiveonly (--post-merge): keeping ${parallelJobsFiltered.size()} affected post-merge stages"
+            echo "CBTS [${cbts.scope}] (--post-merge): keeping ${parallelJobsFiltered.size()} affected post-merge stages"
         } else {
-            echo "CBTS waiveonly: limiting to ${parallelJobsFiltered.size()} affected stages"
+            echo "CBTS [${cbts.scope}]: limiting to ${parallelJobsFiltered.size()} affected stages"
         }
     }
 

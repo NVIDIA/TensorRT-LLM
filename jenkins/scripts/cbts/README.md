@@ -128,16 +128,18 @@ Python stdout is a JSON blob:
    - Add the class to `RULE_CLASSES` (used by `--list-needed-diffs`).
    - Add an instance to `build_rules()` with its dependencies.
 
-3. **Decide Layer 1 / 2 behavior for your scope in Groovy**. Each layer's
-   consumer checks `cbts.scope == "waiveonly"` explicitly. For a new scope:
-   - Add an `if (cbts.scope == "myscope")` branch in `L0_Test.groovy`
-     Layer 2 override (or leave unspecified → behaves as fallback / full run).
-   - Similarly decide Layer 1 (arch track skip).
-   - If your scope genuinely needs within-stage test filtering, add that
-     logic at `L0_Test.groovy:2674` (currently only a comment; `waiveonly`
-     deliberately skips this, see the rationale in the first section).
-   - **Defaults are conservative**: without explicit branches, new scope
-     paths fall through to the existing filter chain, which is safe.
+3. **No Groovy changes needed**. Layer 1 (arch track skip) and Layer 2
+   (stage filter) consume `affected_cpu_arch` / `affected_stages`
+   regardless of `scope` — the label is propagated to logs but does not
+   gate behavior. Empty `affected_stages` falls through to the existing
+   filter chain (safe default).
+
+   Exceptions that still require Groovy edits:
+   - **Within-stage test filtering**: if your rule needs to drop
+     individual tests inside a stage rather than dropping whole stages,
+     add that logic at `L0_Test.groovy:2674` (currently only a comment).
+     `waiveonly` deliberately skips this — see the first section for the
+     rationale.
 
 Rule ordering doesn't matter. Rules independently decide whether they apply;
 `Selector` combines their `affected_stages` via union and their scopes via

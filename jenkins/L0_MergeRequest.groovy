@@ -1234,10 +1234,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         },
         "x86_64-Linux": {
             script {
-                // CBTS Layer 1: skip entire x86 track when no x86 stages are affected
+                // CBTS Layer 1: skip entire x86 track when no x86 stages are affected.
+                // Scope-agnostic: any non-null cbts result means CBTS produced a decision;
+                // we trust its affected_cpu_arch regardless of which rule fired.
                 def cbts = testFilter[(CBTS_RESULT)]
-                if (cbts?.scope == "waiveonly" && !("x86" in cbts.affected_cpu_arch)) {
-                    echo "CBTS waiveonly: no x86 stages affected, skipping x86_64-Linux track"
+                if (cbts != null && !("x86" in cbts.affected_cpu_arch)) {
+                    echo "CBTS [${cbts.scope}]: no x86 stages affected, skipping x86_64-Linux track"
                     return
                 }
                 def testStageName = "[Build-x86_64] Remote Run"
@@ -1351,10 +1353,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
                     return
                 }
-                // CBTS Layer 1: skip entire SBSA track when no sbsa stages are affected
+                // CBTS Layer 1: skip entire SBSA track when no sbsa stages are affected.
+                // Scope-agnostic — see x86 track above for the rationale.
                 def cbts = testFilter[(CBTS_RESULT)]
-                if (cbts?.scope == "waiveonly" && !("sbsa" in cbts.affected_cpu_arch)) {
-                    echo "CBTS waiveonly: no sbsa stages affected, skipping SBSA-Linux track"
+                if (cbts != null && !("sbsa" in cbts.affected_cpu_arch)) {
+                    echo "CBTS [${cbts.scope}]: no sbsa stages affected, skipping SBSA-Linux track"
                     return
                 }
 
