@@ -106,6 +106,7 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[sampler_async_worker=True-eagle3_one_model=True-overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard[overlap_scheduler=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_pard[overlap_scheduler=False]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_dflash
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp=disable-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp=eagle-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales[mtp=vanilla-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=True]
@@ -129,6 +130,8 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=False-enable_chunked_prefill=True-enable_max_concurrency=False-enable_draft_len_schedule=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=False-enable_max_concurrency=False-enable_draft_len_schedule=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=False-enable_max_concurrency=True-enable_draft_len_schedule=False]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dflash
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dflash
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_cuda_graph_padding[mtp_nextn=0]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_cuda_graph_padding[mtp_nextn=2]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano::test_fp8

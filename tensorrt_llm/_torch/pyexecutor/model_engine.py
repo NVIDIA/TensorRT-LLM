@@ -362,9 +362,9 @@ class PyTorchModelEngine(ModelEngine):
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             ) or self.model_is_wrapped
             self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
-            # PARD uses 2K tokens per gen request (K accepted + K masks), so
-            # its per-request draft buffer width is 2K-1 = max_total_draft_tokens.
-            if spec_config.spec_dec_mode.is_pard():
+            # PARD/DFlash use 2K tokens per gen request (K accepted + K masks), so
+            # their per-request draft buffer width is 2K-1 = max_total_draft_tokens.
+            if spec_config.spec_dec_mode.is_parallel_draft():
                 self.max_draft_len = self.max_total_draft_tokens
             else:
                 self.max_draft_len = spec_config.max_draft_len
@@ -3820,10 +3820,10 @@ class PyTorchModelEngine(ModelEngine):
             # to spec_metadata so downstream code (eagle3, interface, trtllm) can read it.
             spec_metadata.runtime_draft_len = self.runtime_draft_len
 
-            # PARD has 2K tokens per gen request, not K+1.  Pass 2K-1
+            # PARD/DFlash have 2K tokens per gen request, not K+1.  Pass 2K-1
             # so generation_lengths = 2K and the XQA kernel computes
             # the correct past_kv_len.
-            if spec_metadata.spec_dec_mode.is_pard():
+            if spec_metadata.spec_dec_mode.is_parallel_draft():
                 sd_max_draft_len = self.original_max_total_draft_tokens
                 sd_max_total = self.original_max_total_draft_tokens
             else:

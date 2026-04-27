@@ -16,6 +16,8 @@ meta-llama/Llama-3.1-8B-Instruct:
   - spec_dec_algo: PARD
     extra_acc_spec: use_sa_spec
     accuracy: 74.20
+  - spec_dec_algo: DFlash
+    accuracy: 74.20
   - quant_algo: FP8
     accuracy: 74.30
   - quant_algo: FP8
@@ -148,6 +150,8 @@ Qwen3/Qwen3-8B:
   - spec_dec_algo: Eagle
     accuracy: 87.1114
   - spec_dec_algo: Eagle3
+    accuracy: 87.1114
+  - spec_dec_algo: DFlash
     accuracy: 87.1114
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
@@ -326,12 +330,20 @@ GPT-OSS/120B-MXFP4:
     accuracy: 90.3
 GPT-OSS/20B-MXFP4:
   - accuracy: 85.0
+  - spec_dec_algo: DFlash
+    accuracy: 85.0
+  - quant_algo: W4A8_MXFP4_MXFP8
+    spec_dec_algo: DFlash
+    accuracy: 85.0
   - quant_algo: W4A8_MXFP4_MXFP8
     accuracy: 85.0
   - quant_algo: W4A8_MXFP4_MXFP8
     kv_cache_quant_algo: FP8
     accuracy: 85.0
   - quant_algo: W4A16_MXFP4
+    accuracy: 85.0
+  - quant_algo: W4A16_MXFP4
+    spec_dec_algo: DFlash
     accuracy: 85.0
   - quant_algo: W4A16_MXFP4
     kv_cache_quant_algo: FP8

@@ -1169,13 +1169,13 @@ class BaseLLM:
         """Check if the LLM is healthy.
 
         Returns:
-            bool: True if the executor is running and not shutdown, False otherwise.
+            bool: True if the executor is running and healthy, False otherwise.
         """
         if self._encode_only:
             return (hasattr(self, "_encoder_executor")
                     and self._encoder_executor is not None)
         if hasattr(self, "_executor") and self._executor is not None:
-            return not self._executor.is_shutdown()
+            return self._executor.check_health()
 
         return False
 

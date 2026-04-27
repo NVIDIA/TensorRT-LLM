@@ -1655,6 +1655,56 @@ class PARDDecodingConfig(DecodingBaseConfig):
         return TorchSpeculativeDecodingMode.PARD
 
 
+class DFlashDecodingConfig(DecodingBaseConfig):
+    """Configuration for DFlash speculative decoding.
+
+    DFlash is a target-dependent speculative decoding method that uses
+    hidden states from specific target model layers as cross-attention
+    context in the draft model to predict multiple draft tokens in parallel.
+
+    Key features:
+    - Target-dependent: uses hidden states from target model layers
+    - Parallel prediction: all K draft tokens in one forward pass
+    - Cross-attention: draft model attends to target hidden states
+
+    Reference: https://arxiv.org/pdf/2602.06036
+    """
+    mask_token_id: Optional[int] = Field(
+        default=None,
+        description=
+        "The token ID used as a mask token for parallel draft prediction. "
+        "If None, it will be read from the draft model config (dflash_config.mask_token_id)."
+    )
+
+    target_layer_ids: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "List of target model layer indices whose hidden states are captured "
+        "for cross-attention in the draft model. If None, read from the draft "
+        "model config (dflash_config.target_layer_ids).")
+
+    decoding_type: Literal["DFlash"] = "DFlash"
+
+    @model_validator(mode="after")
+    def set_max_total_draft_tokens(self):
+        self.max_total_draft_tokens = self.max_draft_len
+        return self
+
+    @property
+    def tokens_per_gen_step(self) -> int:
+        """DFlash needs 2K tokens per gen request: K+1 accepted + K-1 masks."""
+        return 2 * self.max_draft_len
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    @functools.cached_property
+    def spec_dec_mode(self):
+        from tensorrt_llm._torch.speculative.interface import \
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        return TorchSpeculativeDecodingMode.DFLASH
+
+
 class AutoDecodingConfig(DecodingBaseConfig):
     """
     Configuration for auto speculative decoding.
@@ -2312,6 +2362,7 @@ SpeculativeConfig: TypeAlias = Annotated[
         UserProvidedDecodingConfig,
         SaveHiddenStatesDecodingConfig,
         PARDDecodingConfig,
+        DFlashDecodingConfig,
         AutoDecodingConfig,
     ],
     Field(discriminator="decoding_type"),
@@ -3299,6 +3350,10 @@ class TrtLlmArgs(BaseLlmArgs):
                 raise ValueError(
                     "speculative_config.decoding_type 'PARD' is only supported on the PyTorch backend."
                 )
+            elif isinstance(self.speculative_config, DFlashDecodingConfig):
+                raise ValueError(
+                    "speculative_config.decoding_type 'DFlash' is only supported on the PyTorch backend."
+                )
             else:
                 raise ValueError(
                     f"Unrecognized speculative config type {type(self.speculative_config)}"
@@ -3867,6 +3922,29 @@ class TorchLlmArgs(BaseLlmArgs):
 
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
+
+            if isinstance(self.speculative_config, DFlashDecodingConfig):
+                assert self.speculative_config.max_draft_len > 0, "DFlash max_draft_len must be > 0"
+                # Resolve target_layer_ids and mask_token_id from draft model config if not set
+                needs_target_layer_ids = self.speculative_config.target_layer_ids is None
+                needs_mask_token_id = self.speculative_config.mask_token_id is None
+                if (needs_target_layer_ids or needs_mask_token_id
+                    ) and self.speculative_config.speculative_model is not None:
+                    draft_config_path = os.path.join(
+                        self.speculative_config.speculative_model,
+                        "config.json")
+                    if os.path.exists(draft_config_path):
+                        with open(draft_config_path) as f:
+                            draft_cfg = json.load(f)
+                        dflash_cfg = draft_cfg.get("dflash_config", {})
+                        if needs_target_layer_ids:
+                            layer_ids = dflash_cfg.get("target_layer_ids")
+                            if layer_ids is not None:
+                                self.speculative_config.target_layer_ids = layer_ids
+                        if needs_mask_token_id:
+                            mask_id = dflash_cfg.get("mask_token_id")
+                            if mask_id is not None:
+                                self.speculative_config.mask_token_id = mask_id
 
             if isinstance(self.speculative_config, SADecodingConfig):
                 pool_size = self.speculative_config.global_pool_size
