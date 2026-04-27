@@ -52,7 +52,7 @@ class Rule(ABC):
     """
 
     name: str = ""
-    needs_diff_for: list[str] = []
+    needs_diff_for: tuple[str, ...] = ()
 
     @abstractmethod
     def apply(self, pr: PRInputs) -> Optional[RuleResult]: ...
