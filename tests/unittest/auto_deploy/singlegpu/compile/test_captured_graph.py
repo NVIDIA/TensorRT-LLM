@@ -559,6 +559,35 @@ class TestPiecewiseCapturedGraphStaticInputBuffers:
         assert copied is not static_buffer
         assert torch.equal(copied, src)
 
+    def test_copy_to_static_buffers_pads_to_piecewise_bucket(self):
+        pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[8])
+        static_buffer = torch.full((1, 8, 2), fill_value=-1.0)
+        src = torch.arange(6, dtype=torch.float32).reshape(1, 3, 2)
+        pcg._static_input_buffers["inputs_embeds"] = (static_buffer, 1)
+        kwargs = {"inputs_embeds": src}
+
+        pcg._copy_to_static_buffers(kwargs, target_num_tokens=8)
+
+        copied = kwargs["inputs_embeds"]
+        assert copied.shape == (1, 8, 2)
+        assert copied.data_ptr() == static_buffer.data_ptr()
+        assert torch.equal(copied[:, :3, :], src)
+        assert torch.count_nonzero(copied[:, 3:, :]) == 0
+
+    def test_copy_to_static_buffers_preserves_non_token_dynamic_shape(self):
+        pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[8])
+        static_buffer = torch.full((2,), fill_value=-1, dtype=torch.int32)
+        src = torch.tensor([3], dtype=torch.int32)
+        pcg._static_input_buffers["seq_len"] = (static_buffer, 0)
+        kwargs = {"seq_len": src}
+
+        pcg._copy_to_static_buffers(kwargs, target_num_tokens=8)
+
+        copied = kwargs["seq_len"]
+        assert copied.shape == src.shape
+        assert copied.data_ptr() == static_buffer.data_ptr()
+        assert torch.equal(copied, src)
+
     def test_allocate_static_input_buffers_handles_static_shape_unstable_kwarg(self):
         pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[8])
 
@@ -579,6 +608,28 @@ class TestPiecewiseCapturedGraphStaticInputBuffers:
         assert copied.data_ptr() == static_buffer.data_ptr()
         assert copied is static_buffer
         assert torch.equal(copied, src)
+
+    def test_allocate_static_input_buffers_handles_stable_dynamic_shape_kwarg(self):
+        pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[8])
+        backing = torch.arange(8, dtype=torch.float32)
+
+        def get_args_kwargs(num_tokens):
+            return (), {"input_ids": backing[:num_tokens]}
+
+        pcg._allocate_static_input_buffers(get_args_kwargs)
+
+        static_buffer, dyn_dim = pcg._static_input_buffers["input_ids"]
+        assert dyn_dim == 0
+        assert static_buffer.shape == (8,)
+
+        kwargs = {"input_ids": backing[:3]}
+        pcg._copy_to_static_buffers(kwargs, target_num_tokens=8)
+
+        copied = kwargs["input_ids"]
+        assert copied.shape == (8,)
+        assert copied.data_ptr() == static_buffer.data_ptr()
+        assert torch.equal(copied[:3], backing[:3])
+        assert torch.count_nonzero(copied[3:]) == 0
 
 
 # ============================================================================

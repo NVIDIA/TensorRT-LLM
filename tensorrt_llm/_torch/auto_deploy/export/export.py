@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Main export functionality with utilities for torch.export."""
 
 import re
@@ -413,6 +428,34 @@ def _deduplicate_params_and_buffers(gm: fx.GraphModule) -> None:
     canonicalize_graph(gm)
 
 
+def _build_aliasing_load_pre_hook(aliased_groups: List[List[str]]) -> Callable:
+    """Build a load hook that applies one state-dict value to every name in an alias group."""
+
+    def _find_valid_param_value(
+        state_dict: Dict[str, torch.Tensor], param_names: List[str]
+    ) -> Optional[torch.Tensor]:
+        value = None
+        for name in param_names:
+            if name in state_dict:
+                value = state_dict[name]
+                if value.device.type != "meta":
+                    return value
+        return value
+
+    def aliasing_load_pre_hook(state_dict: Dict[str, torch.Tensor], prefix: str, *args, **kwargs):
+        """Load hook that ensures aliased parameters get the same value."""
+        del prefix, args, kwargs
+        for group in aliased_groups:
+            value = _find_valid_param_value(state_dict, group)
+            if value is None:
+                continue
+            for name in group:
+                state_dict[name] = value
+            ad_logger.debug(f"Applied value from {group[0]} to aliased parameters: {group}")
+
+    return aliasing_load_pre_hook
+
+
 def _add_missing_load_hooks(gm: fx.GraphModule, model: nn.Module) -> None:
     """Adds back the state dict load hooks stripped away during export."""
     pre_hooks = {
@@ -457,41 +500,6 @@ def _add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module) -> N
         model: The source model containing the original parameter aliases
     """
 
-    def find_valid_param_value(
-        state_dict: Dict[str, torch.Tensor], param_names: List[str]
-    ) -> Optional[torch.Tensor]:
-        """Find a valid parameter value from state dict for a group of aliased parameters.
-
-        Args:
-            state_dict: The state dict being loaded
-            param_names: List of parameter names that are aliases of each other
-
-        Returns:
-            A valid tensor value if found, None otherwise
-        """
-        # First try to find a non-meta tensor value
-        value = None
-        for name in param_names:
-            if name in state_dict:
-                value = state_dict[name]
-                if value.device.type != "meta":
-                    return value
-
-        return value
-
-    def aliasing_load_pre_hook(state_dict: Dict[str, torch.Tensor], prefix: str, *args, **kwargs):
-        """Load hook that ensures aliased parameters get the same value."""
-        for group in aliased_groups:
-            # Find a valid value for this group of aliases
-            value = find_valid_param_value(state_dict, group)
-
-            if value is not None:
-                # Apply the value to all aliases
-                for name in group:
-                    state_dict[name] = value
-
-                ad_logger.debug(f"Applied value from {group[0]} to aliased parameters: {group}")
-
     # Find all parameter aliases in the source model
     param_to_names = defaultdict(list)
     for name, param in model.named_parameters(remove_duplicate=False):
@@ -504,7 +512,7 @@ def _add_load_hook_for_aliased_params(gm: fx.GraphModule, model: nn.Module) -> N
         return
 
     # Register the hook
-    gm._register_load_state_dict_pre_hook(aliasing_load_pre_hook)
+    gm._register_load_state_dict_pre_hook(_build_aliasing_load_pre_hook(aliased_groups))
 
 
 def _rename_nodes_with_module_hierarchy(gm: fx.GraphModule) -> None:
@@ -581,6 +589,34 @@ def _clean_up_assertions_and_guards(gm: fx.GraphModule):
         delattr(gm, "_guards_fn")
     if removed:
         canonicalize_graph(gm)
+
+
+def _is_export_input_constraint_hook(hook: Any) -> bool:
+    hook_fn = hook.hook if hasattr(hook, "hook") else hook
+    return (
+        getattr(hook_fn, "__module__", None) == "torch.export._unlift"
+        and getattr(hook_fn, "__name__", None) == "_check_input_constraints_pre_hook"
+    )
+
+
+def _clean_up_export_input_constraint_hooks(gm: fx.GraphModule):
+    """Remove torch.export input guards that remain as module forward pre-hooks."""
+    removed = 0
+    for mod in gm.modules():
+        forward_pre_hooks = getattr(mod, "_forward_pre_hooks", None)
+        if not forward_pre_hooks:
+            continue
+        for hook_id, hook in list(forward_pre_hooks.items()):
+            if not _is_export_input_constraint_hook(hook):
+                continue
+            del forward_pre_hooks[hook_id]
+            with_kwargs = getattr(mod, "_forward_pre_hooks_with_kwargs", None)
+            if with_kwargs is not None:
+                with_kwargs.pop(hook_id, None)
+            removed += 1
+
+    if removed:
+        ad_logger.debug(f"Removed {removed} torch.export input constraint forward pre-hook(s)")
 
 
 def run_forward_for_capture(
@@ -722,6 +758,7 @@ def torch_export_to_gm(
 
     # clean up checks --> generally the sanity checks are overly conservative and we can remove them
     _clean_up_assertions_and_guards(egm)
+    _clean_up_export_input_constraint_hooks(egm)
 
     # Rename nodes to reflect module hierarchy for better debuggability
     _rename_nodes_with_module_hierarchy(egm)

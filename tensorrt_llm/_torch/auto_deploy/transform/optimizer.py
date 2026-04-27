@@ -2,7 +2,7 @@
 
 import gc
 import time
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -32,6 +32,7 @@ class InferenceOptimizer:
     ):
         self.factory = factory
         self.config = self._clean_config(config)
+        self._cache_key_config = self._copy_config(self.config)
         if not dist.is_initialized():
             local_rank, world_size = 0, 1
         else:
@@ -41,6 +42,7 @@ class InferenceOptimizer:
             local_rank=local_rank,
             world_size=world_size,
             dist_config=dist_config,
+            transform_config=self._cache_key_config,
         )
 
     def _clean_config(self, config: InferenceOptimizerConfig) -> StrictInferenceOptimizerConfig:
@@ -58,6 +60,12 @@ class InferenceOptimizer:
         # return strict config
         return strict_config
 
+    def _copy_config(
+        self, config: StrictInferenceOptimizerConfig
+    ) -> StrictInferenceOptimizerConfig:
+        """Return a deep copy used for stable cache keys across mutating transforms."""
+        return {k: v.model_copy(deep=True) for k, v in config.items()}
+
     def __call__(self, cm: CachedSequenceInterface, mod: Optional[nn.Module] = None) -> nn.Module:
         """Transform a model into an optimized inference model.
 
@@ -72,13 +80,21 @@ class InferenceOptimizer:
         # RUN THROUGH CONFIGURED TRANSFORMATIONS
         ############################################################################################
 
+        can_restore_from_prefix = mod is None
+
         # start with an empty model if not provided
         if mod is None:
             mod = nn.Module()
 
-        # iterate over all transforms sorted by stage in the config
         start_time = time.time()
-        for idx, (t_name, t_config) in enumerate(self.config.items()):
+        start_idx = 0
+        if can_restore_from_prefix:
+            restored_mod, start_idx = self._maybe_restore_from_cache(cm)
+            if restored_mod is not None:
+                mod = restored_mod
+
+        # iterate over all transforms sorted by stage in the config
+        for idx, (t_name, t_config) in enumerate(list(self.config.items())[start_idx:], start_idx):
             # instantiate transform
             transform = TransformRegistry.get(t_name)(t_config)
             # run transform
@@ -92,3 +108,22 @@ class InferenceOptimizer:
         torch.cuda.empty_cache()
         gc.collect()
         return mod
+
+    def _maybe_restore_from_cache(
+        self, cm: CachedSequenceInterface
+    ) -> Tuple[Optional[nn.Module], int]:
+        """Ask cache transforms for a restore before running their prefix."""
+        for idx, (t_name, t_config) in reversed(list(enumerate(self._cache_key_config.items()))):
+            transform_cls = TransformRegistry.get(t_name)
+            if not callable(getattr(transform_cls, "maybe_restore", None)):
+                continue
+            transform = transform_cls(t_config)
+            maybe_restore = getattr(transform, "maybe_restore", None)
+            if not callable(maybe_restore):
+                continue
+            restored_mod = maybe_restore(
+                cm, self.factory, self.shared_config, idx, self._cache_key_config
+            )
+            if restored_mod is not None:
+                return restored_mod, idx + 1
+        return None, 0

@@ -319,8 +319,9 @@ class PiecewiseCapturedGraph(nn.Module):
         self._is_prepared = False
         self._wrapped_dynamic_indices: Set[int] = set()
         # Pre-allocated static buffers for kwargs whose addresses change between
-        # calls.  Allocated during warmup_and_capture, used at runtime to ensure
-        # CUDA graph replay sees stable addresses.
+        # calls or whose token dimension needs to be widened to a piecewise
+        # bucket. Allocated during warmup_and_capture, used at runtime to ensure
+        # CUDA graph replay sees stable addresses and bucket-shaped residuals.
         # Format: {kwarg_name: (static_buffer, dynamic_dim_or_none)}
         self._static_input_buffers: Dict[str, Tuple[torch.Tensor, Optional[int]]] = {}
         # Output tree spec for reconstructing structured outputs (e.g.
@@ -549,8 +550,9 @@ class PiecewiseCapturedGraph(nn.Module):
 
         Calls `get_args_kwargs` twice with the largest bucket to check address
         stability (data_ptr), and once with a different size to detect the
-        dynamic dimension by shape comparison.  Any kwarg with unstable
-        addresses gets a pre-allocated static buffer.
+        dynamic dimension by shape comparison. Any kwarg with unstable
+        addresses or a dynamic token dimension gets a pre-allocated static
+        buffer.
         """
         max_bucket = max(self.piecewise_num_tokens)
         _, kw1 = get_args_kwargs(max_bucket)
@@ -559,31 +561,43 @@ class PiecewiseCapturedGraph(nn.Module):
 
         for key in kw1:
             v1, v2 = kw1.get(key), kw2.get(key)
+            v_probe = kw_probe.get(key)
             if (
                 isinstance(v1, torch.Tensor)
                 and isinstance(v2, torch.Tensor)
                 and v1.data_ptr() != v2.data_ptr()
             ):
-                v_probe = kw_probe.get(key)
                 dyn_dim = None
                 if isinstance(v_probe, torch.Tensor):
                     for d in range(v1.ndim):
                         if v1.shape[d] != v_probe.shape[d]:
                             dyn_dim = d
                             break
-                if dyn_dim is not None or (
-                    isinstance(v_probe, torch.Tensor) and v_probe.shape == v1.shape
-                ):
+                if dyn_dim is not None:
+                    self._static_input_buffers[key] = (torch.empty_like(v1), dyn_dim)
+                elif isinstance(v_probe, torch.Tensor) and v_probe.shape == v1.shape:
                     # Static-shape kwargs still need buffering when their addresses
                     # change across calls. In that case dyn_dim stays None and we
                     # copy the full buffer at runtime.
-                    self._static_input_buffers[key] = (torch.empty_like(v1), dyn_dim)
+                    self._static_input_buffers[key] = (torch.empty_like(v1), None)
                 else:
                     ad_logger.warning(
                         "PiecewiseCapturedGraph: kwarg '%s' has unstable address but "
                         "no dynamic dim found; leaving it unbuffered",
                         key,
                     )
+            elif (
+                isinstance(v1, torch.Tensor)
+                and isinstance(v_probe, torch.Tensor)
+                and v1.shape != v_probe.shape
+            ):
+                dyn_dim = None
+                for d in range(v1.ndim):
+                    if v1.shape[d] != v_probe.shape[d]:
+                        dyn_dim = d
+                        break
+                if dyn_dim is not None:
+                    self._static_input_buffers[key] = (torch.empty_like(v1), dyn_dim)
 
         if self._static_input_buffers:
             ad_logger.info(
@@ -592,7 +606,9 @@ class PiecewiseCapturedGraph(nn.Module):
                 {k: (v[0].shape, f"dyn_dim={v[1]}") for k, v in self._static_input_buffers.items()},
             )
 
-    def _copy_to_static_buffers(self, kwargs: Dict[str, Any]) -> None:
+    def _copy_to_static_buffers(
+        self, kwargs: Dict[str, Any], target_num_tokens: Optional[int] = None
+    ) -> None:
         """Copy kwargs into pre-allocated static buffers for address stability."""
         for key, (buf, dyn_dim) in self._static_input_buffers.items():
             src = kwargs.get(key)
@@ -601,8 +617,24 @@ class PiecewiseCapturedGraph(nn.Module):
                     buf.copy_(src)
                     kwargs[key] = buf
                 else:
-                    buf_view = buf.narrow(dyn_dim, 0, src.shape[dyn_dim])
-                    buf_view.copy_(src)
+                    max_bucket = (
+                        max(self.piecewise_num_tokens) if self.piecewise_num_tokens else None
+                    )
+                    is_token_dim = max_bucket is not None and buf.shape[dyn_dim] == max_bucket
+                    target_size = src.shape[dyn_dim]
+                    if target_num_tokens is not None and is_token_dim:
+                        target_size = target_num_tokens
+                    if target_size > buf.shape[dyn_dim]:
+                        raise ValueError(
+                            f"PiecewiseCapturedGraph: target size {target_size} for kwarg "
+                            f"{key!r} exceeds static buffer shape {tuple(buf.shape)} "
+                            f"on dim {dyn_dim}."
+                        )
+                    buf_view = buf.narrow(dyn_dim, 0, target_size)
+                    if src.shape[dyn_dim] < target_size:
+                        buf_view.zero_()
+                    copy_view = buf.narrow(dyn_dim, 0, src.shape[dyn_dim])
+                    copy_view.copy_(src)
                     kwargs[key] = buf_view
 
     def warmup_and_capture(
@@ -623,8 +655,9 @@ class PiecewiseCapturedGraph(nn.Module):
           5. Cleanup: gc.collect() + empty_cache() between buckets.
 
         Before the per-bucket loop, calls get_args_kwargs twice to detect any
-        kwargs whose tensor addresses are unstable.  Those kwargs are copied
-        into static buffers for both capture and runtime replay.
+        kwargs whose tensor addresses are unstable or whose token dimension
+        needs bucket padding. Those kwargs are copied into static buffers for
+        both capture and runtime replay.
         """
         if not self._is_prepared:
             self.prepare()
@@ -638,7 +671,7 @@ class PiecewiseCapturedGraph(nn.Module):
         for nt in num_tokens_list:
             ad_logger.info(f"PiecewiseCapturedGraph: warming up for num_tokens={nt}")
             args, kwargs = get_args_kwargs(nt)
-            self._copy_to_static_buffers(kwargs)
+            self._copy_to_static_buffers(kwargs, target_num_tokens=nt)
 
             ADPiecewiseRunner.set_current_num_tokens(nt)
 
@@ -684,7 +717,7 @@ class PiecewiseCapturedGraph(nn.Module):
     def forward(self, *args, num_tokens: Optional[int] = None, **kwargs) -> Any:
         """Forward pass: static segments replay graphs, dynamic segments run eagerly."""
         if self.split_gm is not None:
-            self._copy_to_static_buffers(kwargs)
+            self._copy_to_static_buffers(kwargs, target_num_tokens=num_tokens)
             ADPiecewiseRunner.set_current_num_tokens(num_tokens)
             try:
                 result = self.split_gm(*args, **kwargs)

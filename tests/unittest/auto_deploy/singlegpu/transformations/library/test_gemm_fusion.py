@@ -13,10 +13,23 @@ from _model_test_utils import FakeFP8Linear
 from _torch_test_utils import all_close, fp8_compatible, reset_parameters
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.transform.library.fusion import _insert_fused_gemm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
 
 torch.manual_seed(0)
+
+
+def test_fuse_gemms_skips_linear_without_parameter_weight():
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    weight = graph.placeholder("weight")
+    first = graph.call_function(F.linear, args=(x, weight, None))
+    second = graph.call_function(F.linear, args=(x, weight, None))
+    graph.output((first, second))
+    gm = torch.fx.GraphModule({}, graph)
+
+    assert not _insert_fused_gemm(gm, 0, x, [first, second])
 
 
 class TestModel(nn.Module):

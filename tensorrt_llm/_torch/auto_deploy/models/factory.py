@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,8 +17,12 @@
 """The model factory interface used by auto-deploy to build custom models."""
 
 import copy
+import hashlib
+import os
 from abc import ABC, abstractmethod
+from collections.abc import Iterable, Mapping
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Type, final
 
 import torch
@@ -143,6 +147,102 @@ class ModelFactory(ABC):
     def tokenizer(self) -> Optional[str]:
         """The tokenizer path."""
         return self._prefetched_tokenizer_path or self._tokenizer or self.model
+
+    def get_pipeline_cache_model_identifier(
+        self,
+        non_prefix_transform_names: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Any]:
+        """Return graph-producing model identity fields for the pipeline cache key.
+
+        The pipeline cache snapshots the pre-weight graph at the configured
+        boundary. Transform configs at or after the cache boundary may be
+        carried through generic factory kwargs in some flows, but they must not
+        invalidate this cache because they run after restore.
+        """
+        return {
+            "factory_type": f"{type(self).__module__}.{type(self).__qualname__}",
+            "model": self._model,
+            "model_kwargs": self._pipeline_cache_structural_model_kwargs(
+                non_prefix_transform_names
+            ),
+            "tokenizer": self._tokenizer or self._model,
+            "tokenizer_kwargs": copy.deepcopy(self.tokenizer_kwargs),
+        }
+
+    def _pipeline_cache_structural_model_kwargs(
+        self,
+        non_prefix_transform_names: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Any]:
+        """Return only model kwargs that can affect factory-built graph structure."""
+        ignored_transform_names = set(non_prefix_transform_names or ())
+        structural_kwargs = {}
+        for key, value in self.model_kwargs.items():
+            if key in ignored_transform_names:
+                continue
+            if key == "transforms" and isinstance(value, Mapping):
+                filtered_transforms = {
+                    transform_name: copy.deepcopy(transform_config)
+                    for transform_name, transform_config in value.items()
+                    if transform_name not in ignored_transform_names
+                }
+                if filtered_transforms:
+                    structural_kwargs[key] = filtered_transforms
+                continue
+            structural_kwargs[key] = copy.deepcopy(value)
+        return structural_kwargs
+
+    def get_pipeline_cache_checkpoint_fingerprint(self) -> Dict[str, Any]:
+        """Return a checkpoint fingerprint used by the AutoDeploy pipeline cache key."""
+        self.prefetch_checkpoint(skip_loading_weights=True)
+        model = self.model
+        if not model:
+            return {"model": None}
+        path = Path(model)
+        if not path.exists():
+            return {"model": model}
+        return {
+            "model": model,
+            "metadata_hash": self._pipeline_cache_path_metadata_hash(path),
+        }
+
+    @staticmethod
+    def _pipeline_cache_path_metadata_hash(path: Path) -> str:
+        snapshot_sha = ModelFactory._extract_hf_snapshot_sha(path)
+        if snapshot_sha is not None:
+            return f"hf_snapshot:{snapshot_sha}"
+
+        weight_suffixes = (".safetensors", ".bin", ".pt", ".pth", ".gguf")
+        digest = hashlib.sha256()
+        if path.is_file():
+            paths = [path]
+            root = path.parent
+        else:
+            paths = sorted(item for item in path.rglob("*") if item.is_file())
+            root = path
+        for item in paths:
+            rel_path = os.fspath(item.relative_to(root)).replace(os.sep, "/")
+            if item.name.endswith(weight_suffixes):
+                digest.update(f"shard:{rel_path}:{item.stat().st_size}\n".encode("utf-8"))
+                continue
+            digest.update(f"file:{rel_path}\n".encode("utf-8"))
+            with open(item, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _extract_hf_snapshot_sha(path: Path) -> Optional[str]:
+        parts = path.resolve().parts
+        try:
+            snapshots_idx = parts.index("snapshots")
+        except ValueError:
+            return None
+        if snapshots_idx + 1 >= len(parts):
+            return None
+        sha = parts[snapshots_idx + 1]
+        if len(sha) >= 7 and all(char in "0123456789abcdef" for char in sha.lower()):
+            return sha
+        return None
 
     @property
     @abstractmethod
