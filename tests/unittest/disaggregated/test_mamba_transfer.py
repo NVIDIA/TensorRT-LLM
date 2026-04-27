@@ -25,7 +25,7 @@ import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MixedMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
@@ -180,7 +180,7 @@ def _create_transceivers(tp, managers, config):
 
 
 def _create_managers(tp):
-    """Create MambaHybridCacheManagers for all TP ranks (PP=1).
+    """Create MixedMambaHybridCacheManagers for all TP ranks (PP=1).
 
     Layer 0 is a dummy attention layer required by page table infrastructure.
     Layers 1..NUM_MAMBA_LAYERS are mamba layers under test.
@@ -188,7 +188,7 @@ def _create_managers(tp):
     managers = []
     for rank in range(tp):
         mapping = Mapping(world_size=tp, rank=rank, tp_size=tp, pp_size=1)
-        mgr = MambaHybridCacheManager(
+        mgr = MixedMambaHybridCacheManager(
             mamba_d_state=MAMBA_D_STATE,
             mamba_d_conv=MAMBA_D_CONV,
             mamba_num_heads=MAMBA_NUM_HEADS,

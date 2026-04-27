@@ -47,7 +47,7 @@ trtllm-refit --checkpoint_dir ${CHECKPOINT_DIR} --engine_dir ${ENGINE_DIR}
 
 ## Prerequisites
 
-Install [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/README.md) either through [pip](https://github.com/NVIDIA/TensorRT-LLM/blob/main/README.md#installation) or [from the source](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/installation/build-from-source-linux.md).
+Install [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/README.md) either through [pip](https://github.com/NVIDIA/TensorRT-LLM/blob/main/README.md#installation) or [from the source](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/installation/build-from-source.md).
 
 ## Weight-Stripping Workflow Example
 
@@ -255,7 +255,7 @@ Building an engine from a pruned checkpoint will also allow the engine to be [re
 
 #### Pruning a TensorRT LLM Checkpoint
 
-1. Install [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/README.md) either through [pip](https://github.com/NVIDIA/TensorRT-LLM/blob/main/README.md#installation) or [from the source](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/installation/build-from-source-linux.md).
+1. Install [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/README.md) either through [pip](https://github.com/NVIDIA/TensorRT-LLM/blob/main/README.md#installation) or [from the source](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/installation/build-from-source.md).
 2. Download a model of your choice and convert it to a TensorRT LLM checkpoint ([llama instructions](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/models/core/llama/README.md#usage)).
 3. (Optional) Run the `trtllm-prune` command.
 ```bash

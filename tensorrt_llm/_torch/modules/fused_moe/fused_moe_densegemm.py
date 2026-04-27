@@ -442,7 +442,6 @@ class DenseGEMMFusedMoE(MoE):
                 self.w2_weight_scale.view(torch.uint8),
                 self.fc2_alpha_max,
                 torch.bfloat16,
-                to_userbuffers=False,
                 allowed_backends="cutlass,cublaslt,cutedsl,cuda_core",
             )
         else:

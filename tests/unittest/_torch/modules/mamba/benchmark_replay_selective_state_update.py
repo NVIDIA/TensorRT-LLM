@@ -61,10 +61,37 @@ from einops import repeat
 
 def _import_mamba_kernels_fast():
     """Load kernel modules directly (~40s faster than a full tensorrt_llm init).
-    Use --full-import as the fallback if module dependencies change."""
-    mamba_pkg = "tensorrt_llm._torch.modules.mamba"
+    Use --full-import as the fallback if module dependencies change.
+
+    Strategy: stub the parent packages (tensorrt_llm, tensorrt_llm._torch,
+    tensorrt_llm._torch.modules) in sys.modules with __path__ set, but do
+    NOT execute their __init__.py.  Then load the leaf kernel modules.
+    When a kernel body imports e.g. tensorrt_llm._utils.get_sm_version,
+    Python's machinery resolves it against our stub's __path__ and loads
+    only _utils.py — skipping the heavy tensorrt_llm package init.
+    """
+    import types
+
     repo_root = Path(__file__).resolve().parents[5]
-    mamba_dir = repo_root / "tensorrt_llm" / "_torch" / "modules" / "mamba"
+    trtllm_dir = repo_root / "tensorrt_llm"
+    mamba_pkg = "tensorrt_llm._torch.modules.mamba"
+    mamba_dir = trtllm_dir / "_torch" / "modules" / "mamba"
+
+    def _stub_pkg(fqn: str, pkg_dir: Path):
+        """Register a stub package in sys.modules without running its
+        __init__.py.  Sets __path__ so Python can resolve submodule imports
+        against the real directory on disk."""
+        if fqn in sys.modules:
+            return
+        stub = types.ModuleType(fqn)
+        stub.__path__ = [str(pkg_dir)]
+        sys.modules[fqn] = stub
+
+    # Stub the parent chain so `from tensorrt_llm._utils import ...` (and
+    # similar) work without triggering tensorrt_llm/__init__.py.
+    _stub_pkg("tensorrt_llm", trtllm_dir)
+    _stub_pkg("tensorrt_llm._torch", trtllm_dir / "_torch")
+    _stub_pkg("tensorrt_llm._torch.modules", trtllm_dir / "_torch" / "modules")
 
     def _load(mod_name: str, file_name: str):
         fqn = f"{mamba_pkg}.{mod_name}" if mod_name else mamba_pkg

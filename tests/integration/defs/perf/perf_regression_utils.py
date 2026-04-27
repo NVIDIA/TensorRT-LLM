@@ -21,6 +21,7 @@ different test scripts (perf sanity, module perf, accuracy, etc.).
 import json
 import os
 import re
+import socket
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -38,7 +39,7 @@ _URM_BASE = "https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifact
 def get_job_info():
     """Get job info from environment variables."""
     # Read environment variables
-    host_node_name = os.getenv("HOST_NODE_NAME", "")
+    host_node_name = os.getenv("HOST_NODE_NAME", "") or socket.gethostname()
     build_id = os.getenv("BUILD_ID", "")
     build_url = os.getenv("BUILD_URL", "")
     job_name = os.getenv("JOB_NAME", "")

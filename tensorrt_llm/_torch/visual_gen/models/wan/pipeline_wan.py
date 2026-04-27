@@ -325,19 +325,19 @@ class WanPipeline(BasePipeline):
 
     def infer(self, req):
         """Run inference with request parameters."""
-        extra = req.extra_params or {}
+        extra = req.params.extra_params or {}
         return self.forward(
             prompt=req.prompt,
-            negative_prompt=req.negative_prompt,
-            height=req.height,
-            width=req.width,
-            num_frames=req.num_frames,
-            num_inference_steps=req.num_inference_steps,
-            guidance_scale=req.guidance_scale,
+            negative_prompt=req.params.negative_prompt,
+            height=req.params.height,
+            width=req.params.width,
+            num_frames=req.params.num_frames,
+            num_inference_steps=req.params.num_inference_steps,
+            guidance_scale=req.params.guidance_scale,
             guidance_scale_2=extra.get("guidance_scale_2"),
             boundary_ratio=extra.get("boundary_ratio"),
-            seed=req.seed,
-            max_sequence_length=req.max_sequence_length,
+            seed=req.params.seed,
+            max_sequence_length=req.params.max_sequence_length,
         )
 
     @nvtx_range("WanPipeline.forward")

@@ -25,8 +25,7 @@ from typing import Tuple
 import torch
 from torch.fx import GraphModule
 
-from tensorrt_llm._torch.auto_deploy.utils._graph import get_lm_head_node
-
+from ...utils._graph import get_lm_head_node
 from ...utils.node_utils import is_linear_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
