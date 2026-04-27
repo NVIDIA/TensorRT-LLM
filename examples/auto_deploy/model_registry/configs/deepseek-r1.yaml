@@ -39,6 +39,8 @@ transforms:
   multi_stream_mla_attn:
     stage: compile
     enabled: true
+  fuse_allreduce_residual_rmsnorm:
+    enabled: true
   detect_sharding:
     allreduce_strategy: SYMM_MEM
     allgather_strategy: SYMM_MEM
