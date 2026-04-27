@@ -1,36 +1,32 @@
 # CBTS — Change-Based Testing Selection
 
 Pre-merge CI test-selection tool. Looks at what the PR changed and narrows the
-set of Jenkins stages that actually need to run.
+set of Jenkins stages that actually need to run. **Adding new rules is
+Python-only — Layer 1/2 in Groovy are scope-agnostic and consume the data
+directly.**
 
 ---
 
-## What it does — two layers
+## Two consumption layers
 
-Given a PR, CBTS produces a decision that gets consumed at two points in the
-Jenkins pipeline:
-
-| Layer | Where consumed | Action |
+| Layer | Where | Action |
 |---|---|---|
-| **1. Arch track** | `L0_MergeRequest.groovy::launchStages` (each track entry) | Skip whole x86 / SBSA track (build + all tests) when no stage on that arch is affected |
+| **1. Arch track** | `L0_MergeRequest.groovy::launchStages` | Skip x86 / SBSA track when no stage on that arch is affected |
 | **2. Stage** | `L0_Test.groovy::launchTestJobs` (end of filter chain) | Replace `parallelJobsFiltered` with the CBTS-selected subset |
 
-Anything CBTS can't confidently narrow → **fallback to the existing full filter
-chain**. CBTS never adds stages; it only subtracts.
+CBTS only **subtracts** stages, never adds. Anything it can't narrow → full
+fallback to the existing filter chain.
 
-**No within-stage test filtering by design.** Once Layer 2 picks the affected
-stages, each stage runs its full rendered testDBList (all blocks matching the
-stage's mako). Running the whole block, not just the single changed test id,
-is deliberately over-inclusive — if a waive is wrong (depends on another test,
-or the node id has a typo that silently matches nothing), running only the
-changed test would not surface the problem. The extra per-stage test time is
-accepted as the cost of CI robustness.
+**No within-stage test filtering by design.** Each picked stage runs its full
+testDBList. Filtering down to just the changed test would mask wrong waives
+(broken deps, typo'd node ids silently matching nothing) — the extra per-stage
+time buys robustness.
 
 ## v0 scope
 
-- **Only handles** `tests/integration/test_lists/waives.txt` changes
-- Any other changed file → CBTS returns `scope: none` → full run
-- Scope label for this case: `waiveonly`
+- **Only handles** `tests/integration/test_lists/waives.txt` changes (`scope: waiveonly`).
+- Anything else → `scope: none` → full run.
+- **v1+ rules can be added in Python alone** (no Groovy edits).
 
 ## File map
 
@@ -38,49 +34,34 @@ accepted as the cost of CI robustness.
 jenkins/scripts/cbts/
 ├── README.md              this file
 ├── main.py                CLI entry + Selector + SelectionResult
-├── blocks.py              YAML loading + stage parsing from groovy + condition matching
+├── blocks.py              YAML loading + stage parsing + test-id normalization
 └── rules/
-    ├── README.md          per-rule logic summary (scope, triggers, matching)
+    ├── README.md          per-rule logic summary
     ├── base.py            Rule ABC + PRInputs + RuleResult
     └── waives_rule.py     v0's only rule
 ```
 
 ## When CBTS activates
 
-CBTS activates when the user runs `/bot run` without a stage-selection
-flag. If the user provides any of `--stage-list`, `--extra-stage`,
-`--gpu-type`, `--backend-mode`, `--skip-test`, `--add-multi-gpu-test`,
-`--only-multi-gpu-test`, or `--disable-multi-gpu-test`, `getCbtsResult`
-returns `null` immediately and the existing filter chain drives test
-selection exactly as before.
+Bare `/bot run`. The following stage-selection flags make `getCbtsResult`
+return `null` and let the existing filter chain take over: `--stage-list`,
+`--extra-stage`, `--gpu-type`, `--backend-mode`, `--skip-test`,
+`--add-multi-gpu-test`, `--only-multi-gpu-test`, `--disable-multi-gpu-test`.
 
-**Not considered user flags** (CBTS still activates):
-- `--reuse-test` / `--reuse-stage-list` — retry semantics; the bot
-  auto-populates these on re-runs of the same PR. They compose fine with
-  CBTS (CBTS picks stages, reuse further skips stages that already passed).
-- `--debug` / `--detailed-log` — logging verbosity; orthogonal.
-- `--post-merge` — scopes the run to post-merge stages. CBTS still
-  activates; Layer 2 then narrows the affected set to post-merge hits
-  only. If no post-merge stage is hit, the run is a no-op (no fallback
-  to the full post-merge baseline).
-
-This matches the convention already used by `enableUpdateGitlabStatus` in
-`L0_MergeRequest.groovy` for distinguishing "default run" from
-"user-customized run".
+**Compatible** (CBTS still activates):
+- `--reuse-test` / `--reuse-stage-list` — auto-populated by the bot on re-runs.
+- `--debug` / `--detailed-log` — logging only, orthogonal.
+- `--post-merge` — Layer 2 narrows the affected set to post-merge hits only.
+  No post-merge hit → no-op (no fallback to full post-merge baseline).
 
 ## How it's invoked (CI)
 
-`L0_MergeRequest.groovy::getCbtsResult` orchestrates two calls to `main.py`:
+`getCbtsResult` calls `main.py` twice:
 
-1. `python3 main.py --list-needed-diffs` — returns `needs_diff_for` patterns
-   so Groovy knows which changed files to fetch diffs for (via the existing
-   `getMergeRequestOneFileChanges` API helper).
-2. `python3 main.py cbts_input.json` — returns the decision on stdout.
-
-The decision is cached in `testFilter[CBTS_RESULT]` and serialized into the
-child job's `testFilter` param alongside the existing filter flags.
-
-Python stdout is a JSON blob:
+1. `main.py --list-needed-diffs` → patterns whose diffs Groovy fetches.
+   Patterns are **Ant-style globs** (`tests/**/*.py`, `cpp/kernels/**`, exact
+   paths), matched via `hudson.util.AntPathMatcher`.
+2. `main.py cbts_input.json` → decision JSON on stdout:
 
 ```json
 {
@@ -92,7 +73,8 @@ Python stdout is a JSON blob:
 }
 ```
 
-`scope: null` means "no decision, fall back to the existing filter chain".
+`scope: null` → no decision, full fallback. Groovy doesn't gate on the scope
+value — it's metadata for logs and multi-rule combining only.
 
 ## Adding a new rule
 
@@ -105,62 +87,49 @@ Python stdout is a JSON blob:
 
    class MyRule(Rule):
        name = "myrule"
-       needs_diff_for = ["path/or/glob/**/*.py"]  # files whose diffs you need
+       needs_diff_for = ("tests/**/*.py",)   # Ant globs; tuple per RUF012
 
        def __init__(self, yaml_index: YAMLIndex, stages: dict[str, Stage]):
            self.yaml_index = yaml_index
            self.stages = stages
 
        def apply(self, pr: PRInputs) -> Optional[RuleResult]:
-           # Return None if the rule doesn't apply to this PR.
-           # Return a RuleResult otherwise.
            ...
            return RuleResult(
-               handled_files={...},      # files you claim
-               tests={...},              # changed test ids (logged; not filtered at stage time)
-               affected_stages={...},    # Layer 2 stage set
-               scope="myscope",          # your scope label
-               reason="why this was picked",
+               handled_files={...},
+               tests={...},
+               affected_stages={...},
+               scope="myscope",
+               reason="why this fired",
            )
    ```
 
-2. **Register in `main.py`**:
-   - Add the class to `RULE_CLASSES` (used by `--list-needed-diffs`).
-   - Add an instance to `build_rules()` with its dependencies.
+2. **Register in `main.py`**: add to `RULE_CLASSES` and `build_rules()`.
 
-3. **No Groovy changes needed**. Layer 1 (arch track skip) and Layer 2
-   (stage filter) consume `affected_cpu_arch` / `affected_stages`
-   regardless of `scope` — the label is propagated to logs but does not
-   gate behavior. Empty `affected_stages` falls through to the existing
-   filter chain (safe default).
+3. **No Groovy edits needed.** Exception: if your rule needs to drop
+   *individual tests inside* a stage (vs whole stages), add the hook at
+   `L0_Test.groovy:2674` — but `waiveonly` deliberately skips this, see
+   the "no within-stage filtering" note above.
 
-   Exceptions that still require Groovy edits:
-   - **Within-stage test filtering**: if your rule needs to drop
-     individual tests inside a stage rather than dropping whole stages,
-     add that logic at `L0_Test.groovy:2674` (currently only a comment).
-     `waiveonly` deliberately skips this — see the first section for the
-     rationale.
+Rule order is irrelevant. `Selector` unions `affected_stages`; scopes are
+combined via `_combine_scopes` (all-agree → that scope; disagreement → `None`).
 
-Rule ordering doesn't matter. Rules independently decide whether they apply;
-`Selector` combines their `affected_stages` via union and their scopes via
-`_combine_scopes` (agreement → that scope; disagreement → `None`).
+## Fallback paths
 
-## Fallback / safety paths
-
-CBTS falls back to the existing filter chain (as if it weren't there) when:
+CBTS falls back to the existing filter chain when:
 
 - PostMerge job / `alternativeTRT` set
 - `changed_files` is empty
 - `main.py` throws / stdout is unparsable
-- `scope == none` (Python's explicit "no decision" output)
-- Groovy sees an unknown scope value (forward compatibility)
+- Python returns `scope: null` ("no decision")
+- `affected_stages` is empty (Layer 2 no-op)
 
-No silent failures: every fallback logs an `echo` line in the CI console.
+Every fallback logs an `echo` line — no silent failures.
 
 ## Keep-in-sync notes
 
 `blocks.py::derive_mako_from_stage` mirrors the Groovy
-`getMakoArgsFromStageName` (in `jenkins/L0_Test.groovy` ~line 2079) and
-`parseTaskConfigFromStageName` (~line 2066). When new backends /
-orchestrators / stage-name conventions are added on the Groovy side, update
-the Python constants here too. The file comments flag this explicitly.
+`getMakoArgsFromStageName` (`L0_Test.groovy` ~line 2079) and
+`parseTaskConfigFromStageName` (~line 2066). New backends / orchestrators /
+stage-name conventions on the Groovy side need a matching Python update —
+file comments flag this.
