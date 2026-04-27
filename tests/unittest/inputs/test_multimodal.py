@@ -8,10 +8,10 @@ import pytest
 import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData, find_mm_token_lengths
-from tensorrt_llm.inputs.registry import compute_mm_embed_cumsum_if_absent
+from tensorrt_llm.inputs.registry import maybe_compute_mm_embed_cumsum
 
 
-def test_compute_mm_embed_cumsum_if_absent_populates_py_multimodal_data():
+def test_maybe_compute_mm_embed_cumsum_populates_py_multimodal_data():
     """Producer writes a flat int64 cumsum tensor at py_multimodal_data[multimodal_embed_mask_cumsum]."""
 
     class FakeProcessor:
@@ -27,7 +27,7 @@ def test_compute_mm_embed_cumsum_if_absent_populates_py_multimodal_data():
     # [text, img, img, special, img, img, img, text]
     prompt_token_ids = [10, 1001, 1002, 2000, 1003, 1004, 1005, 20]
     extra = {"multimodal_data": {}}
-    compute_mm_embed_cumsum_if_absent(prompt_token_ids, extra, FakeProcessor())
+    maybe_compute_mm_embed_cumsum(prompt_token_ids, extra, FakeProcessor())
 
     cumsum = extra["multimodal_data"]["multimodal_embed_mask_cumsum"]
     assert torch.equal(
