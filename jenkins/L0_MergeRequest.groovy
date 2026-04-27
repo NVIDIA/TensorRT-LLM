@@ -787,20 +787,37 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     }
 }
 
-// Match a changed file path against a rule's needs_diff_for patterns using
-// Ant-style globs (hudson.util.AntPathMatcher). Examples:
-//   "tests/integration/test_lists/waives.txt"  - exact path
-//   "tests/integration/defs/**/*.py"           - all py files under defs/
-//   "cpp/tensorrt_llm/kernels/**"              - any file under kernels/
-// Exact paths are still valid Ant patterns (matcher.match returns true on
-// equal strings), so existing rules with literal-path needs_diff_for keep
+// Translate an Ant-style glob to a regex.
+//   **/   zero or more path segments
+//   **    any chars (including /)
+//   *     any chars except /
+//   ?     single char except /
+// Implemented in pure Groovy — `hudson.util.AntPathMatcher` is not visible
+// to the Jenkins script sandbox classpath. Exact paths (no glob meta) round-
+// trip to a literal regex, so existing rules with literal needs_diff_for keep
 // working without changes.
-@Field
-def _cbtsAntPathMatcher = new hudson.util.AntPathMatcher()
+def _cbtsGlobToRegex(String glob)
+{
+    // 1. Escape regex specials, except glob metas (* and ?) which we handle below.
+    def escaped = glob.collect { c ->
+        (c == '*' || c == '?') ? c
+            : ('.+()[]{}|^$\\'.contains(c) ? '\\' + c : c)
+    }.join('')
+    // 2. Translate glob metas. Use unambiguous text sentinels so cascading
+    //    replaces don't double-match (Jenkins sandbox struggles with \u-escaped
+    //    control chars in some Groovy versions).
+    return '^' + escaped
+        .replace('**/', '__CBTSDOUBLESLASH__')
+        .replace('**',  '__CBTSDOUBLESTAR__')
+        .replace('*',   '[^/]*')
+        .replace('?',   '[^/]')
+        .replace('__CBTSDOUBLESLASH__', '(?:.*/)?')
+        .replace('__CBTSDOUBLESTAR__',  '.*') + '$'
+}
 
 def _cbtsMatchesAnyPattern(String filePath, List patterns)
 {
-    return patterns.any { _cbtsAntPathMatcher.match(it, filePath) }
+    return patterns.any { filePath ==~ _cbtsGlobToRegex(it) }
 }
 
 // CBTS only activates on `/bot run` and `/bot run --post-merge`. Any other
