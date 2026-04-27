@@ -52,6 +52,8 @@ def get_draft_model_prompt(spec_dec_mode: SpeculativeDecodingMode,
 class ModelDrafter(Drafter):
     """Model-based drafter that uses a draft model to generate draft tokens."""
 
+    _needs_padding_kv_extension = True
+
     def __init__(
         self,
         spec_config: "DecodingBaseConfig",
@@ -744,7 +746,8 @@ class ModelDrafter(Drafter):
         return outputs, sample_state
 
     @nvtx_range("_process_previous_draft_results")
-    def _process_previous_draft_results(self) -> None:
+    def _process_previous_draft_results(
+            self, resource_manager: Optional[ResourceManager] = None) -> None:
         """
         Process the previous draft batch results.
         This should be called after the current draft forward to enable overlap scheduling.
@@ -774,7 +777,8 @@ class ModelDrafter(Drafter):
         self.req_id_to_old_request = current_req_id_to_old_request
 
         # Pad draft tokens to the max draft length for CUDA graph compatibility
-        self.pad_draft_tokens_for_cuda_graph(self.previous_scheduled_batch)
+        self.pad_draft_tokens_for_cuda_graph(self.previous_scheduled_batch,
+                                             resource_manager)
 
     def cleanup_previous_draft_resources(self) -> None:
         if self.previous_draft_batch is None:
@@ -893,7 +897,7 @@ class ModelDrafter(Drafter):
 
         # Process previous draft results after current forward pass
         # This enables overlap scheduling: process old batch while new batch is prepared
-        self._process_previous_draft_results()
+        self._process_previous_draft_results(resource_manager)
 
         num_draft_reqs = len(draft_batch.all_requests())
         if self.use_static_draft_loop:

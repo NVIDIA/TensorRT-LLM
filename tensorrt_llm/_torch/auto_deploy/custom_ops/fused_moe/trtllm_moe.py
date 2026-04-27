@@ -17,15 +17,13 @@ from typing import List, Tuple
 
 import torch
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import (
-    TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
-)
-from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.modules.fused_moe.routing import RoutingMethodType
-from tensorrt_llm._torch.utils import ActivationType
-from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.mapping import Mapping
+
+from ..._compat import ActivationType, is_sm_100f
+from ...utils.dist_config import DistConfig
+from ..quantization.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 
 
 def _check_moe_alltoall(mapping_config: str, max_num_tokens: int) -> Tuple[Mapping | None, bool]:
