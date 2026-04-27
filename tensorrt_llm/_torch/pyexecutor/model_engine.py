@@ -953,9 +953,11 @@ class PyTorchModelEngine(ModelEngine):
         # Case 3: Target model (two-model) or one-model without dynamic draft
         # Match the runtime_draft_len semantics enforced in _prepare_tp_inputs:
         # logical K for linear-tree modes, total tree tokens for tree decoding.
+        # spec_config is None for non-spec models — fall back to max_draft_len (= 0).
         draft_lengths = [
-            self.max_draft_len
-            if self.spec_config.is_linear_tree else self.max_total_draft_tokens
+            self.max_draft_len if
+            (self.spec_config is None or self.spec_config.is_linear_tree) else
+            self.max_total_draft_tokens
         ]
         should_capture_no_spec = (
             self.max_total_draft_tokens > 0
