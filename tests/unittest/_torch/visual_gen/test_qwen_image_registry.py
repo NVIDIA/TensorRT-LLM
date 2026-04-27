@@ -1,12 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Phase 0 registry smoke tests for Qwen-Image.
+"""Registry smoke tests for Qwen-Image.
 
-These tests do NOT exercise the transformer forward pass -- the point of
-Phase 0 is to make sure Qwen-Image checkpoints route through VisualGen's
-``AutoPipeline`` and emit a clear NotImplementedError from the stub
-instead of ``Unknown pipeline: ''`` from registry detection.
+These tests make sure Qwen-Image checkpoints route through VisualGen's
+``AutoPipeline`` instead of failing with ``Unknown pipeline: ''`` from
+registry detection.
 """
 
 import json
@@ -57,8 +56,7 @@ def test_auto_pipeline_routes_qwen_image_variants(tmp_path, variant_class_name):
 
     Matches the behaviour of the Wan and Flux branches in
     ``pipeline_registry.py``: anything containing ``Qwen`` + ``Image`` in
-    its class name falls through to the base pipeline, letting Phase 1
-    decide whether to implement a dedicated subclass or share the base.
+    its class name falls through to the base pipeline.
     """
     (tmp_path / "model_index.json").write_text(
         json.dumps({"_class_name": variant_class_name})
@@ -70,7 +68,7 @@ def test_auto_pipeline_routes_qwen_image_variants(tmp_path, variant_class_name):
 
 
 def test_transformer_constructs_with_defaults():
-    """M6: the full transformer instantiates with the documented defaults.
+    """The full transformer instantiates with the documented defaults.
 
     Doesn't touch real weights -- just verifies that the class graph is
     buildable and exposes the expected public attributes.

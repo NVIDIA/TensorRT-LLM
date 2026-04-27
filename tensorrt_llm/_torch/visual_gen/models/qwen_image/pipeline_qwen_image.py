@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Qwen-Image text-to-image pipeline (Phase 1).
+"""Qwen-Image text-to-image pipeline.
 
 Ports the denoise loop, Qwen2.5-VL text encoding, FlowMatchEuler
 sampling, and VAE decode from ``diffusers.QwenImagePipeline`` onto the
 TensorRT-LLM VisualGen executor. The transformer backbone is our port
-from ``transformer_qwen_image.py`` (see PHASE1_PLAN.md M2..M6).
+from ``transformer_qwen_image.py``.
 
 Non-transformer components (VAE, text encoder, tokenizer, scheduler)
 are loaded directly from the HF checkpoint using diffusers/transformers.

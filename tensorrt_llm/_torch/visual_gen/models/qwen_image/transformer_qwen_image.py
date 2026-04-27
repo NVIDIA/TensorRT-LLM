@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Qwen-Image MMDiT transformer (Phase 1).
+"""Qwen-Image MMDiT transformer.
 
 Pure-PyTorch port of the reference implementation in
 ``diffusers.models.transformers.transformer_qwenimage`` at commit
@@ -9,23 +9,10 @@ matching diffusers 0.37.1. Module and attribute names mirror the
 diffusers reference exactly so the HuggingFace checkpoint's
 ``transformer/*.safetensors`` state_dict can be loaded verbatim.
 
-Milestones completed so far (see
-``/home/scratch.asteiner/trtllm-qwen-image/PHASE1_PLAN.md``):
-
-- M2: timestep embedding modules, parity-tested.
-- M3: QwenEmbedRope (3D rope), parity-tested (bit-exact in fp32).
-- M4: pre/post-block modules (img_in, txt_in, txt_norm, norm_out,
-  proj_out), parity-tested.
-- M5: QwenImageTransformerBlock + joint attention, parity-tested.
-- M6: full ``QwenImageTransformer2DModel``, parity-tested on a single
-  timestep forward against diffusers with real checkpoint weights.
-
-Phase 2 optimisations (FP8/NVFP4 quant, CUDA graph, Ulysses/CFG parallel,
-TeaCache) are deliberately deferred. The Linear/attention code paths
-use plain ``torch.nn.Linear`` and ``F.scaled_dot_product_attention``
-today for numerical parity; swapping to ``tensorrt_llm._torch.modules.
-linear.Linear`` and the visual-gen attention backend is the Phase 2
-entry point.
+The current implementation prioritizes checkpoint compatibility and
+diffusers parity. Performance-oriented swaps to TensorRT-LLM modules can
+be made incrementally while preserving the public module names used by
+checkpoint loading.
 """
 
 from __future__ import annotations
@@ -44,7 +31,7 @@ if TYPE_CHECKING:
 
 
 # ===========================================================================
-# Sinusoidal timestep embedding utilities (M2).
+# Sinusoidal timestep embedding utilities.
 # ===========================================================================
 
 
@@ -326,7 +313,7 @@ class FeedForward(nn.Module):
 
 
 # ===========================================================================
-# 3D rotary position embedding (M3).
+# 3D rotary position embedding.
 # ===========================================================================
 
 
