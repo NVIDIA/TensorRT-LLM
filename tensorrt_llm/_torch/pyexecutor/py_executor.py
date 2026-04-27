@@ -2937,12 +2937,21 @@ class PyExecutor:
             if (SleepConfig.GMS_WEIGHTS_TAG in sleep_tags
                     and self._should_park_gms_weight_mappings()):
                 parked_gms = self._park_gms_weight_mappings()
+                log_sleep_phases = os.environ.get(
+                    "TRTLLM_GMS_LOG_SLEEP_PHASES", "0").lower()
+                if log_sleep_phases in {"1", "true", "yes", "on"}:
+                    self._log_gpu_memory_snapshot(
+                        "sleep/after_gms_park",
+                        sleep_tags,
+                        gms_mapping_bytes=parked_gms,
+                    )
             vmm_tags = [
                 tag for tag in sleep_tags
                 if tag not in ("moe_comm", SleepConfig.GMS_WEIGHTS_TAG)
             ]
             released_blobs = 0
             released_pools = 0
+            release_tag_stats = []
             if not vmm_tags:
                 cleared_buffers, cleared_buffer_bytes = (
                     self._clear_memory_buffers_for_sleep())
@@ -2961,6 +2970,7 @@ class PyExecutor:
                     "released_blobs": 0,
                     "released_moe_modules": released_moe,
                     "released_pools": 0,
+                    "release_tag_stats": release_tag_stats,
                     "released_cuda_graphs": released_graphs,
                     "cleared_memory_buffers": cleared_buffers,
                     "cleared_memory_buffer_bytes": cleared_buffer_bytes,
@@ -2968,8 +2978,56 @@ class PyExecutor:
                     "before": before_snapshot,
                     "after": after_snapshot,
                 }
-            released_blobs = release_with_tag(*vmm_tags)
-            released_pools = self._release_virtual_memory_pool_caches(vmm_tags)
+            per_tag_release = os.environ.get(
+                "TRTLLM_GMS_LOG_PER_TAG_SLEEP_RELEASE", "0").lower()
+            if per_tag_release in {"1", "true", "yes", "on"}:
+                for tag in vmm_tags:
+                    tag_started_at = time.monotonic()
+                    before_current, _ = self._nvml_gpu_memory_bytes()
+                    before_reserved = int(torch.cuda.memory_reserved())
+                    tag_blobs = release_with_tag(tag)
+                    tag_pools = self._release_virtual_memory_pool_caches([tag])
+                    self._flush_cuda_allocator_after_sleep([tag], tag_blobs,
+                                                           tag_pools)
+                    after_current, _ = self._nvml_gpu_memory_bytes()
+                    after_reserved = int(torch.cuda.memory_reserved())
+                    stat = {
+                        "tag": tag,
+                        "released_blobs": tag_blobs,
+                        "released_pools": tag_pools,
+                        "elapsed_s": time.monotonic() - tag_started_at,
+                        "before_current": before_current,
+                        "after_current": after_current,
+                        "delta_current": (
+                            after_current - before_current
+                            if after_current is not None
+                            and before_current is not None else None),
+                        "before_reserved": before_reserved,
+                        "after_reserved": after_reserved,
+                        "delta_reserved":
+                        after_reserved - before_reserved,
+                    }
+                    release_tag_stats.append(stat)
+                    logger.info(
+                        "GMS shadow sleep tag release: rank=%s tag=%s "
+                        "blobs=%s pools=%s elapsed=%.3fs current_delta=%s "
+                        "reserved_delta=%s before_current=%s after_current=%s",
+                        getattr(self.dist, "rank", None),
+                        tag,
+                        tag_blobs,
+                        tag_pools,
+                        stat["elapsed_s"],
+                        self._fmt_gib(stat["delta_current"]),
+                        self._fmt_gib(stat["delta_reserved"]),
+                        self._fmt_gib(before_current),
+                        self._fmt_gib(after_current),
+                    )
+                    released_blobs += tag_blobs
+                    released_pools += tag_pools
+            else:
+                released_blobs = release_with_tag(*vmm_tags)
+                released_pools = self._release_virtual_memory_pool_caches(
+                    vmm_tags)
             cleared_buffers, cleared_buffer_bytes = (
                 self._clear_memory_buffers_for_sleep())
             self._flush_cuda_allocator_after_sleep(
@@ -2989,6 +3047,7 @@ class PyExecutor:
                 "released_blobs": released_blobs,
                 "released_moe_modules": released_moe,
                 "released_pools": released_pools,
+                "release_tag_stats": release_tag_stats,
                 "released_cuda_graphs": released_graphs,
                 "cleared_memory_buffers": cleared_buffers,
                 "cleared_memory_buffer_bytes": cleared_buffer_bytes,
@@ -3000,30 +3059,64 @@ class PyExecutor:
         if action == "wakeup":
             from tensorrt_llm._torch.virtual_memory import materialize_with_tag
 
+            total_started_at = time.monotonic()
+            timings = {}
             wakeup_tags = SleepConfig.expand_sleep_tags(
                 args[0] if args else kwargs.get("wakeup_tags", []))
+            step_started_at = time.monotonic()
             before_snapshot = self._log_gpu_memory_snapshot(
                 "wakeup/before", wakeup_tags)
+            timings["before_snapshot_s"] = time.monotonic() - step_started_at
             reset_kv_cache = "kv_cache" in wakeup_tags
             restored_gms = 0
             if SleepConfig.GMS_WEIGHTS_TAG in wakeup_tags:
+                step_started_at = time.monotonic()
                 restored_gms = self._restore_gms_weight_mappings()
+                timings["restore_gms_weights_s"] = (
+                    time.monotonic() - step_started_at)
             vmm_tags = [
                 tag for tag in wakeup_tags
                 if tag not in ("moe_comm", SleepConfig.GMS_WEIGHTS_TAG)
             ]
+            step_started_at = time.monotonic()
             result = materialize_with_tag(*vmm_tags) if vmm_tags else 0
+            timings["materialize_vmm_s"] = time.monotonic() - step_started_at
             if reset_kv_cache:
+                step_started_at = time.monotonic()
                 self.reset_prefix_cache()
+                timings["reset_prefix_cache_s"] = (
+                    time.monotonic() - step_started_at)
             if "executor_extra" in wakeup_tags or "moe_comm" in wakeup_tags:
+                step_started_at = time.monotonic()
                 restored_moe = self._restore_moe_communication()
+                timings["restore_moe_s"] = time.monotonic() - step_started_at
             else:
                 restored_moe = 0
+                timings["restore_moe_s"] = 0.0
+            step_started_at = time.monotonic()
             after_snapshot = self._log_gpu_memory_snapshot(
                 "wakeup/after",
                 wakeup_tags,
                 blobs=result,
                 gms_mapping_bytes=restored_gms,
+            )
+            timings["after_snapshot_s"] = time.monotonic() - step_started_at
+            timings["total_rank_action_s"] = (
+                time.monotonic() - total_started_at)
+            logger.info(
+                "GMS shadow wakeup timings: rank=%s tags=%s "
+                "before_snapshot=%.3fs restore_gms_weights=%.3fs "
+                "materialize_vmm=%.3fs reset_prefix_cache=%.3fs "
+                "restore_moe=%.3fs after_snapshot=%.3fs total=%.3fs",
+                getattr(self.dist, "rank", None),
+                wakeup_tags,
+                timings.get("before_snapshot_s", 0.0),
+                timings.get("restore_gms_weights_s", 0.0),
+                timings.get("materialize_vmm_s", 0.0),
+                timings.get("reset_prefix_cache_s", 0.0),
+                timings.get("restore_moe_s", 0.0),
+                timings.get("after_snapshot_s", 0.0),
+                timings.get("total_rank_action_s", 0.0),
             )
             return {
                 "action": "wakeup",
@@ -3032,6 +3125,7 @@ class PyExecutor:
                 "materialized_blobs": result,
                 "restored_moe_modules": restored_moe,
                 "gms_mapping_bytes": restored_gms,
+                "timings": timings,
                 "before": before_snapshot,
                 "after": after_snapshot,
             }
