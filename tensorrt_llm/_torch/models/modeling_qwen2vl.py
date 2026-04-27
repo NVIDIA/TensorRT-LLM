@@ -67,9 +67,9 @@ from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_multimodal_utils import (
-    _install_processor_output_validation_filter, find_input_mm_embeds,
-    fuse_input_embeds, get_attached_multimodal_embeddings,
-    get_multimodal_embeddings)
+    MmEncoderMixin, _install_processor_output_validation_filter,
+    find_input_mm_embeds, fuse_input_embeds,
+    get_attached_multimodal_embeddings, get_multimodal_embeddings)
 from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
                              filter_weights, register_auto_model,
                              register_vision_encoder)
@@ -1053,7 +1053,7 @@ class Qwen2_5_VLPatchMerger(torch.nn.Module):
         return hidden_states
 
 
-class Qwen2_5_VisionModel(torch.nn.Module):
+class Qwen2_5_VisionModel(torch.nn.Module, MmEncoderMixin):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()
@@ -1095,9 +1095,18 @@ class Qwen2_5_VisionModel(torch.nn.Module):
         self.merger = Qwen2_5_VLPatchMerger(self.model_config, )
         self.metadata_cls = get_attention_backend(
             self.model_config.attn_backend).Metadata
-
         self.full_attn_metadata: Optional[AttentionMetadata] = None
         self.window_attn_metadata: Optional[AttentionMetadata] = None
+
+    def setup_attn_metadata(self, max_num_requests: int,
+                            max_num_tokens: int) -> None:
+        # Override: Qwen2/2.5-VL uses two metadata objects (full + window
+        # attention) instead of the mixin's single `attn_metadata`.
+        kwargs = dict(max_num_requests=max_num_requests,
+                      max_num_tokens=max_num_tokens,
+                      kv_cache_manager=None)
+        self.full_attn_metadata = self.metadata_cls(**kwargs)
+        self.window_attn_metadata = self.metadata_cls(**kwargs)
 
     def get_rotary_pos_emb_window_data(
         self, grid_rows: List[List[int]]

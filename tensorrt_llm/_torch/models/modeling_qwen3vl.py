@@ -45,6 +45,7 @@ from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_multimodal_utils import (
+    MmEncoderMixin,
     filter_mm_token_from_input_ids,
     find_input_mm_embeds,
     fuse_input_embeds,
@@ -629,7 +630,7 @@ def _triton_pos_embed_interpolate(
     return output
 
 
-class Qwen3VisionModel(torch.nn.Module):
+class Qwen3VisionModel(torch.nn.Module, MmEncoderMixin):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()
         self.model_config = model_config
@@ -716,6 +717,9 @@ class Qwen3VisionModel(torch.nn.Module):
     @property
     def device(self) -> torch.device:
         return self.patch_embed.proj.weight.device
+
+    def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        merge_size = self.spatial_merge_size
 
     @staticmethod
     @lru_cache(maxsize=1024)
