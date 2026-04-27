@@ -12,7 +12,13 @@
 import flashinfer
 import torch
 
-from ....flashinfer_utils import get_env_enable_pdl
+try:
+    from ....flashinfer_utils import get_env_enable_pdl
+except (ModuleNotFoundError, ImportError):
+    import os
+
+    def get_env_enable_pdl() -> bool:
+        return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
 
 
 @torch.library.custom_op(

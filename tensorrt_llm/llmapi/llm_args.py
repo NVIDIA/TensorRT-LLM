@@ -27,6 +27,7 @@ try:
 except ImportError:
     PlacementGroup = None
 
+from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 
@@ -168,21 +169,24 @@ class CudaGraphConfig(StrictBaseModel):
             List of batch sizes to create CUDA graphs for
         """
         if enable_padding:
+            # Start with [1, 2, 4, 8, 16, 24, ..., 128] (multiples of 8)
             batch_sizes = [1, 2, 4] + [i * 8 for i in range(1, 17)]
+            # Sliding 64: extend by increments of 64 up to max_batch_size
+            while batch_sizes[-1] + 64 <= max_batch_size:
+                batch_sizes.append(batch_sizes[-1] + 64)
         else:
             batch_sizes = list(range(1, 32)) + [32, 64, 128]
+            # Add powers of 2 up to max_batch_size
+            batch_sizes += [
+                2**i for i in range(8, math.ceil(math.log(max_batch_size, 2)))
+            ]
 
-        # Add powers of 2 up to max_batch_size
-        batch_sizes += [
-            2**i for i in range(8, math.ceil(math.log(max_batch_size, 2)))
-        ]
-
-        # Filter and sort batch sizes
+        # Filter and sort batch sizes for both branches
         batch_sizes = sorted(
             [size for size in batch_sizes if size <= max_batch_size])
 
         # Add max_batch_size if not already included
-        if max_batch_size != batch_sizes[-1]:
+        if not batch_sizes or max_batch_size != batch_sizes[-1]:
             batch_sizes.append(max_batch_size)
 
         return batch_sizes
@@ -2337,7 +2341,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "The maximum number of tokens that should be stored in the KV cache. If both `max_tokens` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be used."
     )
-    max_attention_window: Optional[List[PositiveInt]] = Field(
+    max_attention_window: Optional[List[int]] = Field(
         default=None,
         min_length=1,
         description=
@@ -2439,6 +2443,12 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
 
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    mamba_state_cache_interval: PositiveInt = Field(
+        default=256,
+        description=
+        "The number of tokens between cache steps in the Mamba prefix cache.")
+
     use_kv_cache_manager_v2: bool = Field(
         default=False,
         status="prototype",
@@ -2517,9 +2527,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 raise ValueError(
                     "kv_cache_config.max_attention_window must contain only integers"
                 )
-            if i <= 0:
+            if i <= 0 and i not in [LinearCacheType.RECURRENT_STATES.value]:
                 raise ValueError(
-                    "kv_cache_config.max_attention_window values must be positive"
+                    "kv_cache_config.max_attention_window values must be positive or LinearCacheType.RECURRENT_STATES.value"
                 )
         return v
 
@@ -2668,6 +2678,12 @@ class DwdpConfig(StrictBaseModel):
         default=0, description="The number of experts per worker.")
     num_prefetch_experts: int = Field(
         default=0, description="The number of prefetch experts per worker.")
+    contention_opt: bool = Field(
+        default=False,
+        description=
+        "Enable limited-contention prefetch optimization. Uses batched "
+        "memcpy with round-robin slice ordering across peers and a 2 MiB "
+        "slice granularity to reduce NVLink contention.")
 
 
 class BaseLlmArgs(StrictBaseModel):
@@ -3698,6 +3714,18 @@ class TorchLlmArgs(BaseLlmArgs):
         default=False,
         description=
         "Only load/execute the vision encoder part of the full model. Defaults to False.",
+        status="prototype",
+    )
+
+    encode_only: bool = Field(
+        default=False,
+        description=
+        "Set to True to use the batch-forward encode() path, which runs a "
+        "single forward pass and returns the model output directly, bypassing "
+        "the scheduler and autoregressive loop. Works for encoder-only "
+        "models (BERT, RoBERTa, reward models) and decoder models used in "
+        "single-prefill mode (e.g., extracting embeddings). When False "
+        "(default), uses the standard generate() path.",
         status="prototype",
     )
 

@@ -256,8 +256,8 @@ class BasePipeline(nn.Module):
     def default_generation_params(self) -> dict:
         """Model-specific defaults for ``None`` fields in ``VisualGenParams``.
 
-        Keys should match ``DiffusionRequest`` field names.  The executor
-        merges these into the request before calling ``infer()``.
+        Keys should match ``VisualGenParams`` field names.  The executor
+        merges these into ``request.params`` before calling ``infer()``.
         """
         return {}
 

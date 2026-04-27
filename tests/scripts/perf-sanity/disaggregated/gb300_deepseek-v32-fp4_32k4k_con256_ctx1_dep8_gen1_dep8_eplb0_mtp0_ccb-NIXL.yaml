@@ -1,0 +1,101 @@
+metadata:
+  model_name: deepseek_v32_fp4
+  precision: fp4
+  model_dir_name: DeepSeek-V3.2-Exp-FP4-v2
+  supported_gpus:
+  - GB300
+  script_file: disaggr_torch.slurm
+  benchmark_type: 32k4k
+  # Mirror of the Dynamo disagg-kv-router DSv3.2 FP4 recipe:
+  # https://github.com/ai-dynamo/dynamo/tree/main/recipes/deepseek-v32-fp4/trtllm/disagg-kv-router
+slurm:
+  script_file: disaggr_torch.slurm
+  partition: <partition>
+  account: <account>
+  job_time: 02:00:00
+  job_name: unified-benchmark
+  extra_args: "--gres=gpu:4"
+  numa_bind: true
+benchmark:
+  mode: e2e
+  use_nv_sa_benchmark: false
+  multi_round: 10
+  benchmark_ratio: 0.0
+  streaming: true
+  concurrency_list: '256'
+  input_length: 32768
+  output_length: 4096
+  dataset_file: datasets/perf-ci/deepseek_v32-32k4k-20480-ratio-1_for_serve.json
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 1
+  num_gen_servers: 1
+environment:
+  container_mount: <container_mount>
+  container_image: <container_image>
+  model_path: <model_path>
+  trtllm_repo: ''
+  build_wheel: false
+  work_dir: <full_path_to_work_dir>
+  # Env vars taken from the Dynamo deploy.yaml (NCCL MNNVL/CUMEM/NVLS, UCX MNNVL
+  # IPC, MoE all-to-all without all-gather, PDL, GC disable) so the perf test
+  # exercises the same code paths as the production deployment.
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1 NCCL_NVLS_ENABLE=1 NVIDIA_GDRCOPY=1 UCX_CUDA_IPC_ENABLE_MNNVL=1 NCCL_GRAPH_MIXING_SUPPORT=0 TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1 TRTLLM_FORCE_COMM_METHOD=NVLINK_TWO_SIDED ENABLE_CONFIGURABLE_MOE=1"
+  server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
+profiling:
+  nsys_on: false
+accuracy:
+  enable_accuracy_test: false
+worker_config:
+  gen:
+    print_iter_log: true
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    pipeline_parallel_size: 1
+    context_parallel_size: 1
+    enable_attention_dp: true
+    max_batch_size: 8
+    max_num_tokens: 8192
+    max_seq_len: 121000
+    allreduce_strategy: MNNVL
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 8
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.9
+      dtype: fp8
+      tokens_per_block: 64
+    moe_config:
+      backend: CUTEDSL
+      use_low_precision_moe_combine: true
+    cache_transceiver_config:
+      max_tokens_in_buffer: 120000
+      backend: NIXL
+    num_postprocess_workers: 8
+    stream_interval: 10
+  ctx:
+    print_iter_log: true
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    pipeline_parallel_size: 1
+    context_parallel_size: 1
+    enable_attention_dp: true
+    max_batch_size: 32
+    max_num_tokens: 8192
+    max_seq_len: 121000
+    enable_chunked_prefill: true
+    disable_overlap_scheduler: true
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 32
+    kv_cache_config:
+      enable_block_reuse: true
+      free_gpu_memory_fraction: 0.9
+      dtype: fp8
+      tokens_per_block: 64
+    moe_config:
+      backend: TRTLLM
+    cache_transceiver_config:
+      max_tokens_in_buffer: 120000
+      backend: NIXL

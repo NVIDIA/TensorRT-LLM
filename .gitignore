@@ -1,4 +1,5 @@
 __pycache__/
+.mypy_cache/
 .vscode
 .cursor
 *.engine
@@ -104,3 +105,8 @@ enroot/tensorrt_llm.devel.sqsh
 
 # MacOSX Files
 .DS_Store
+
+# Agent related files
+.claude/agent-memory/
+.claude/agent-tests/perf-test-sync/report.html
+.claude/agent-tests/perf-test-sync/results.json

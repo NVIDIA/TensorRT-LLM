@@ -1025,10 +1025,12 @@ class EagleWrapper(nn.Module):
         kv_cache_manager = csi.kv_cache_manager
         if num_extend > 0 and isinstance(kv_cache_manager, MambaHybridCacheManager):
             if kv_cache_manager.is_speculative():
+                state_indices = csi.get_arg("slot_idx", truncate=True)
                 _ctx = SimpleNamespace(num_seqs=num_sequences, num_contexts=num_prefill)
                 kv_cache_manager.update_mamba_states(
                     attn_metadata=_ctx,
                     num_accepted_tokens=new_tokens_lens,
+                    state_indices=state_indices,
                 )
 
         # compute the cache and position offset based on the number of new tokens compared to the

@@ -19,12 +19,10 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
+from ...utils.fp8_dequant import dequant_fp8_weight_two_dim_block_grid
+from ...utils.quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
     unpack_uint8_to_int4_weight_2d,
-)
-from tensorrt_llm.quantization.utils.fp8_matrix_weight_dequant import (
-    dequant_fp8_weight_two_dim_block_grid,
 )
 
 # FP4 tables (E2M1)
@@ -607,7 +605,7 @@ def trtllm_finegrained_fp8_linear(
     - Input is dynamically quantized using fp8_quantize_1x128
     - Assumes 128x128 block size (standard for DeepSeek/MiniMax style FP8)
     """
-    from tensorrt_llm._utils import get_sm_version
+    from ..._compat import get_sm_version
 
     # Ensure input is bfloat16 for the optimized kernel
     if input.dtype == torch.float8_e4m3fn:

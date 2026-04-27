@@ -18,7 +18,7 @@ from typing import List, Optional
 import torch
 from torch.fx import Node
 
-from .....llmapi.llm_args import KvCacheConfig
+from ..._compat import KvCacheConfig
 from ..attention_interface import AttentionRegistry, BatchInfo, MHACallable, ResourceHandlerDict
 from .mamba_backend_common import (
     BaseBackendSSM,
