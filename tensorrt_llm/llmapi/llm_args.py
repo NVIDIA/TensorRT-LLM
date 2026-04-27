@@ -3772,6 +3772,20 @@ class BaseLlmArgs(StrictBaseModel):
     max_num_tokens: Optional[int] = Field(
         default=8192, description="The maximum number of tokens.")
 
+    encoder_max_batch_size: Optional[int] = Field(
+        default=None,
+        description=(
+            "Maximum batch size for the multimodal encoder's AttentionMetadata. "
+            "Falls back to `max_batch_size` when unset."),
+        status="prototype")
+
+    encoder_max_num_tokens: Optional[int] = Field(
+        default=None,
+        description=(
+            "Maximum number of tokens for the multimodal encoder's "
+            "AttentionMetadata. Falls back to `max_num_tokens` when unset."),
+        status="prototype")
+
     gather_generation_logits: bool = Field(
         default=False,
         description="Gather generation logits.",
@@ -4064,6 +4078,18 @@ class BaseLlmArgs(StrictBaseModel):
             self.max_num_tokens,
             self.max_seq_len,
             self.max_batch_size,
+        )
+
+    def get_encoder_runtime_sizes(self) -> Tuple[int, int]:
+        """Return encoder runtime batch and token limits.
+
+        Returns `(encoder_max_batch_size, encoder_max_num_tokens)`, falling
+        back to the LLM-side `max_batch_size` / `max_num_tokens` when the
+        encoder-specific knobs are not set.
+        """
+        return (
+            self.encoder_max_batch_size or self.max_batch_size,
+            self.encoder_max_num_tokens or self.max_num_tokens,
         )
 
 
