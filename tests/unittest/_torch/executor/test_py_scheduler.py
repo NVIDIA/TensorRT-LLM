@@ -2198,7 +2198,7 @@ class TestPyCapacitySchedulerLora:
         r0 = _make_request(0, lora_task_id=1)
         r1 = _make_request(1, lora_task_id=2)
         r2 = _make_request(2, lora_task_id=3)
-        fitting, disagg, paused = scheduler.schedule_request([r0, r1, r2])
+        fitting, _disagg, _paused = scheduler.schedule_request([r0, r1, r2])
         # 2 tasks x 10 pages = 20 <= 25; 3rd task would push to 30 > 25
         assert len(fitting) == 2
 
