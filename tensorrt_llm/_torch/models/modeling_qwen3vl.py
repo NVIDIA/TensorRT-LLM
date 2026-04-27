@@ -43,6 +43,7 @@ from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (
+    MmEncoderMixin,
     bypass_processor_output_validation,
     find_input_mm_embeds,
     fuse_input_embeds,
@@ -677,7 +678,7 @@ def pos_embed_interpolate_native(
     return repeated.to(dtype=dtype)
 
 
-class Qwen3VisionModel(torch.nn.Module):
+class Qwen3VisionModel(torch.nn.Module, MmEncoderMixin):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()
         self.model_config = model_config
@@ -733,15 +734,12 @@ class Qwen3VisionModel(torch.nn.Module):
         )
         self.metadata_cls = get_attention_backend(self.model_config.attn_backend).Metadata
 
-        self.attn_metadata = self.metadata_cls(
-            max_num_requests=8192,  # TODO: Make this dynamic
-            max_num_tokens=8192,  # TODO: Make this dynamic
-            kv_cache_manager=None,
-        )
-
     @property
     def device(self) -> torch.device:
         return self.patch_embed.proj.weight.device
+
+    def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        merge_size = self.spatial_merge_size
 
     @staticmethod
     @lru_cache(maxsize=1024)

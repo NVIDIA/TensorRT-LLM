@@ -21,6 +21,7 @@ from tensorrt_llm._torch.attention_backend import \
     interface as attention_interface
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
+from tensorrt_llm._torch.models.modeling_multimodal_utils import MmEncoderMixin
 from tensorrt_llm._torch.modules import attention as trtllm_attention
 from tensorrt_llm._torch.modules import mlp as trtllm_mlp
 from tensorrt_llm._utils import prefer_pinned
@@ -550,7 +551,7 @@ class Block(nn.Module):
         return x
 
 
-class VisionTransformer(nn.Module):
+class VisionTransformer(nn.Module, MmEncoderMixin):
     """ Vision Transformer.
 
     Modified from https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py.
@@ -745,17 +746,21 @@ class VisionTransformer(nn.Module):
 
         self.metadata_cls = attention_utils.get_attention_backend(
             model_config.attn_backend).Metadata
+        self._attn_backend = model_config.attn_backend
+
+    def setup_attn_metadata(self, max_num_requests: int,
+                            max_num_tokens: int) -> None:
+        # Override the default to add `kv_layout="NHD"` for FlashInfer.
+        # FlashInfer's original default is "NHD"; TRT-LLM switched the default
+        # to "HND" for paged KV cache paths (see PR #6917). Ragged prefill
+        # (kv_cache_manager=None) computes k/v directly from input, which is
+        # always in NHD format ([tokens, heads, dim]).
         metadata_kwargs = dict(
-            max_num_requests=8192,  # TODO: Make this dynamic
-            max_num_tokens=model_config.max_num_tokens,
+            max_num_requests=max_num_requests,
+            max_num_tokens=max_num_tokens,
             kv_cache_manager=None,
         )
-        if model_config.attn_backend == "FLASHINFER":
-            # FlashInfer's original default kv_layout is "NHD". TRT-LLM changed
-            # the default to "HND" for paged KV cache paths (see PR #6917).
-            # For ModelingRadio ragged prefill (kv_cache_manager=None), we
-            # explicitly use "NHD" because ragged k/v tensors computed directly
-            # from input are always in NHD format ([tokens, heads, dim]).
+        if self._attn_backend == "FLASHINFER":
             metadata_kwargs["kv_layout"] = "NHD"
         self.attn_metadata = self.metadata_cls(**metadata_kwargs)
 
