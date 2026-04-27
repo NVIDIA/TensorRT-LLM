@@ -1085,8 +1085,7 @@ def _create_kv_cache_manager(
         dtype: Optional[torch.dtype] = None,
         is_draft: Optional[bool] = None,
         layer_mask: Optional[List[bool]] = None,
-        num_layers: Optional[int] = None,
-        is_disagg: bool = False) -> KVCacheManager:
+        num_layers: Optional[int] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
