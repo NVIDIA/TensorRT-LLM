@@ -53,16 +53,17 @@ class MultimodalInput:
     multimodal_lengths: List[int]
     """Per logical unit count of prompt-side MM tokens.
 
-    This counts prompt positions where `mm_mask = embed_mask | special_mask`
-    is true. It includes MM special/framing tokens and excludes ordinary
-    interleaved text, so it is not a bounding-box span for sparse layouts and
-    is not always the number of encoder-output embedding vectors produced for
-    this item.
+    Counts every prompt position belonging to this MM unit — both the
+    encoder-bound placeholder slots and any model-specific framing tokens
+    (e.g. Mistral's image_break/image_end inside an image). Ordinary
+    interleaved text is excluded, so the value is not a bounding-box span
+    for sparse layouts and is not always the number of encoder-output
+    embedding vectors produced for this item.
 
-    Current consumers overload this value: encoder-only split paths use it as
-    an encoder-output embedding count, the C++ KV hasher treats
-    `start + length` as a contiguous prompt span, and AutoDeploy forwards it
-    as VLM layout metadata.
+    Current consumers overload this value: encoder-only split paths use it
+    as an encoder-output embedding count, the C++ KV hasher treats
+    `start + length` as a contiguous prompt span, and AutoDeploy forwards
+    it as VLM layout metadata.
     """
     # TODO(TRTLLM-12175): split this into explicit layout fields — per-item
     # MM-token offsets/lengths, per-item encoder-output embedding counts, and
@@ -158,17 +159,17 @@ class MultimodalRuntimeData:
 
     Constructed from `py_multimodal_data["multimodal_embed_mask_cumsum"]`
     (int64 CPU cumsum populated by the producer); counts are derived via
-    three O(1) cumsum lookups. Handles non-contiguous embed positions
+    three O(1) cumsum lookups. Handles non-contiguous embedding positions
     (inline specials, interleaved text) natively.
 
     Attributes:
         past_seen_token_num: Total tokens already processed in previous iterations (cached)
         chunk_end_pos: End position of the current chunk for chunked prefill
-        embed_mask_cumsum: int64 prefix sum of the flat embed mask
+        embed_mask_cumsum: int64 prefix sum of the flat embedding-slot mask
 
-        num_cached_mm_tokens: Number of embeds already cached (computed)
-        num_mm_tokens_in_chunk: Number of embeds in the current chunk (computed)
-        total_embeds_in_request: Total embeds (computed)
+        num_cached_mm_tokens: Number of embeddings already cached (computed)
+        num_mm_tokens_in_chunk: Number of embeddings in the current chunk (computed)
+        total_embeds_in_request: Total embeddings in the request (computed)
     """
     past_seen_token_num: int
     chunk_end_pos: int
@@ -846,21 +847,21 @@ def check_mm_embed_cumsum_if_needed(
     end_compute: int,
     prompt_len: int,
 ) -> None:
-    """Raise iff this iteration is partial AND MM data is present without embed cumsum.
+    """Raise iff chunked prefill or KV-cache reuse is in effect AND MM data is present without embed cumsum.
 
-    "Partial" covers the two cases where the scheduler advances less than the
+    Triggers on the two cases where the scheduler advances less than the
     whole prompt in one step:
       * `begin_compute > 0` — KV-cache reuse: a prefix was served from cache, OR
       * `end_compute < prompt_len` — chunked prefill: the scheduler split the
         remaining tokens across iterations.
 
     Both cases require `multimodal_embed_mask_cumsum` to derive per-chunk
-    embed counts in `MultimodalRuntimeData`. Full-prefill, no-reuse
+    embedding counts in `MultimodalRuntimeData`. Full-prefill, no-reuse
     iterations don't: `MultimodalRuntimeData` stays `None` and
     `find_input_mm_embeds` handles the full payload.
 
-    When the cumsum is missing on a non-partial iteration, log a one-shot
-    warning via `logger.warning_once` and proceed.
+    When the cumsum is missing outside the chunked-prefill / KV-reuse cases,
+    log a one-shot warning via `logger.warning_once` and proceed.
     """
     assert 0 <= begin_compute <= end_compute <= prompt_len, (
         f"invalid window: {begin_compute}..{end_compute}/{prompt_len}")
@@ -869,16 +870,17 @@ def check_mm_embed_cumsum_if_needed(
     if py_multimodal_data.get("multimodal_embed_mask_cumsum") is not None:
         return
 
-    is_partial = (begin_compute > 0) or (end_compute < prompt_len)
+    is_chunked_or_reused = (begin_compute > 0) or (end_compute < prompt_len)
     mm_keys = set(py_multimodal_data.keys()) - _MM_METADATA_ONLY_KEYS
 
-    if is_partial:
+    if is_chunked_or_reused:
         raise ValueError(
-            f"Request requires multimodal_embed_mask_cumsum for partial iteration "
-            f"(begin_compute={begin_compute}, end_compute={end_compute}, "
-            f"prompt_len={prompt_len}) but py_multimodal_data has keys "
-            f"{mm_keys} with no cumsum. The input processor may be missing a "
-            f"discriminator (override get_mm_token_ids or ensure get_vocab_size "
+            f"Request requires multimodal_embed_mask_cumsum for chunked prefill "
+            f"or KV-cache reuse (begin_compute={begin_compute}, "
+            f"end_compute={end_compute}, prompt_len={prompt_len}) but "
+            f"py_multimodal_data has keys {mm_keys} with no cumsum. The input "
+            f"processor may be missing a discriminator (override "
+            f"get_mm_token_ids or ensure get_vocab_size "
             f"resolves).")
 
     logger.warning_once(
@@ -956,12 +958,11 @@ def _compute_mm_masks(
         if mm_token_ids.ndim != 1:
             raise ValueError("mm_token_ids must be a 1D tensor")
         embed_mask = torch.isin(input_ids, mm_token_ids)
-        if special_mask is not None:
-            embed_mask = embed_mask & ~special_mask
     else:
         embed_mask = input_ids >= vocab_size
-        if special_mask is not None:
-            embed_mask = embed_mask & ~special_mask
+
+    if special_mask is not None:
+        embed_mask &= ~special_mask
 
     mm_mask = embed_mask if special_mask is None else embed_mask | special_mask
     return mm_mask, embed_mask, special_mask
