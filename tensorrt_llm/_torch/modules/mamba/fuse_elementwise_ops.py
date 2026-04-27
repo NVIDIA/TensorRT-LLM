@@ -196,3 +196,113 @@ def fused_split_rearrange_after_conv1d(
         B_flat.view(1, num_prefill_tokens, n_groups, d_state),
         C_flat.view(1, num_prefill_tokens, n_groups, d_state),
     )
+
+
+@triton.jit
+def _ssd_output_transpose_kernel(
+    src_ptr,
+    dst_ptr,
+    num_prefill_tokens,
+    H,
+    D,
+    NC,
+    CS,
+    stride_h,
+    stride_d,
+    stride_nc,
+    HD,
+    BLOCK_L: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+):
+    # Reshape (B=1, H, D, NC, CS) contiguous -> (L, H*D) contiguous.
+    # L = NC*CS, hd = h*D + d.  dst[l, hd] = src[0, h, d, l // CS, l % CS].
+    # Inner stride on the CS axis is 1, so when BLOCK_L divides CS each tile
+    # reads one contiguous BLOCK_L run per (h, d) pair.
+    pid_l = tl.program_id(0)
+    pid_hd = tl.program_id(1)
+
+    l_offs = pid_l * BLOCK_L + tl.arange(0, BLOCK_L)
+    hd_offs = pid_hd * BLOCK_HD + tl.arange(0, BLOCK_HD)
+
+    l_mask = l_offs < num_prefill_tokens
+    hd_mask = hd_offs < HD
+
+    nc = l_offs // CS
+    cs = l_offs % CS
+    h = hd_offs // D
+    d = hd_offs % D
+
+    # int64 offsets: H*D*NC*CS can exceed INT32_MAX for long seqlens.
+    src_off = (
+        h.to(tl.int64)[None, :] * stride_h
+        + d.to(tl.int64)[None, :] * stride_d
+        + nc.to(tl.int64)[:, None] * stride_nc
+        + cs.to(tl.int64)[:, None]
+    )
+    mask = l_mask[:, None] & hd_mask[None, :]
+    data = tl.load(src_ptr + src_off, mask=mask, other=0.0)
+
+    dst_off = l_offs.to(tl.int64)[:, None] * HD + hd_offs[None, :]
+    tl.store(dst_ptr + dst_off, data, mask=mask)
+
+
+# Tuned for ultra-v3 CTX shape (H=32, D=64, CS=256, HD=2048) on B200.
+# BLOCK_L=128 divides CS=256 so a tile stays within one chunk; BLOCK_HD=64 == D
+# so each tile reads from a single head. num_warps=4 yields ~4.9 TB/s (~5x torch).
+_SSD_TR_BLOCK_L = 128
+_SSD_TR_BLOCK_HD = 64
+_SSD_TR_NUM_WARPS = 4
+
+
+def ssd_output_transpose(
+    out_contig: torch.Tensor,
+    dst: torch.Tensor,
+    num_prefill_tokens: int,
+) -> None:
+    """Transpose FlashInfer SSD output to the prefill output layout.
+
+    Input:  out_contig (1, H, D, NC, CS) contiguous bf16
+    Output: dst        (num_prefill_tokens, H*D) contiguous bf16 (written in place)
+
+    Replaces ``dst.view(1, L_p, H, D).copy_(out_contig.permute(0,3,4,1,2)
+    .reshape(1, NC*CS, H, D)[:, :L_p])`` which runs at ~1 TB/s via PyTorch
+    generic direct_copy.
+    """
+    assert out_contig.is_contiguous(), "out_contig must be contiguous in (B, H, D, NC, CS)"
+    assert out_contig.ndim == 5 and out_contig.shape[0] == 1, (
+        f"expected (1, H, D, NC, CS), got {tuple(out_contig.shape)}"
+    )
+    _, H, D, NC, CS = out_contig.shape
+    HD = H * D
+    assert dst.is_contiguous()
+    assert dst.numel() == num_prefill_tokens * HD, (
+        f"dst numel {dst.numel()} != L_p*H*D = {num_prefill_tokens}*{HD}"
+    )
+    assert NC * CS >= num_prefill_tokens, (
+        f"padded seqlen {NC * CS} < num_prefill_tokens {num_prefill_tokens}"
+    )
+    assert CS % _SSD_TR_BLOCK_L == 0, (
+        f"chunk_size {CS} must be a multiple of BLOCK_L={_SSD_TR_BLOCK_L}"
+    )
+
+    stride_h = D * NC * CS
+    stride_d = NC * CS
+    stride_nc = CS
+
+    grid = (triton.cdiv(num_prefill_tokens, _SSD_TR_BLOCK_L), triton.cdiv(HD, _SSD_TR_BLOCK_HD))
+    _ssd_output_transpose_kernel[grid](
+        out_contig,
+        dst,
+        num_prefill_tokens,
+        H,
+        D,
+        NC,
+        CS,
+        stride_h,
+        stride_d,
+        stride_nc,
+        HD,
+        BLOCK_L=_SSD_TR_BLOCK_L,
+        BLOCK_HD=_SSD_TR_BLOCK_HD,
+        num_warps=_SSD_TR_NUM_WARPS,
+    )

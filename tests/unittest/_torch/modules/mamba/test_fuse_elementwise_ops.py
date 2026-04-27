@@ -20,6 +20,7 @@ import torch
 from tensorrt_llm._torch.modules.mamba.fuse_elementwise_ops import (
     extract_transpose_xbc_prefill,
     fused_split_rearrange_after_conv1d,
+    ssd_output_transpose,
 )
 
 skip_no_cuda = pytest.mark.skipif(
@@ -151,3 +152,96 @@ def test_extract_transpose_large_input_no_overflow(dtype):
 
     assert out_fused.shape == out_ref.shape, f"Shape mismatch: {out_fused.shape} vs {out_ref.shape}"
     torch.testing.assert_close(out_fused, out_ref, rtol=1e-3, atol=1e-3)
+
+
+def ssd_output_transpose_ref(
+    out_contig: torch.Tensor,
+    num_prefill_tokens: int,
+) -> torch.Tensor:
+    """Reference implementation: permute+reshape+slice."""
+    B, H, D, NC, CS = out_contig.shape
+    seqlen = NC * CS
+    out_view = out_contig.permute(0, 3, 4, 1, 2).reshape(B, seqlen, H, D)
+    dst = out_view[:, :num_prefill_tokens].contiguous().view(num_prefill_tokens, H * D)
+    return dst
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    "H,D,CS,num_prefill_tokens",
+    [
+        (32, 64, 256, 1),
+        (32, 64, 256, 128),
+        (32, 64, 256, 1024),
+        (32, 64, 256, 4096),
+        (32, 64, 256, 50176),  # exact multiple of CS
+        (32, 64, 256, 50224),  # trailing padding (ultra-v3 CTX)
+        (16, 64, 128, 8192),
+        (64, 64, 256, 16384),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_ssd_output_transpose(H, D, CS, num_prefill_tokens, dtype):
+    """Test ssd_output_transpose matches permute+reshape+slice."""
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+
+    NC = (num_prefill_tokens + CS - 1) // CS
+    out_contig = torch.randn(1, H, D, NC, CS, dtype=dtype, device=device)
+
+    dst_ref = ssd_output_transpose_ref(out_contig, num_prefill_tokens)
+    dst = torch.empty(num_prefill_tokens, H * D, dtype=dtype, device=device)
+    ssd_output_transpose(out_contig, dst, num_prefill_tokens)
+
+    assert dst.shape == dst_ref.shape
+    # Pure data movement — must be bit-exact.
+    torch.testing.assert_close(dst, dst_ref, rtol=0, atol=0)
+
+
+@skip_no_cuda
+def test_ssd_output_transpose_benchmark():
+    """Benchmark ssd_output_transpose on the ultra-v3 CTX shape."""
+    import time
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    # Typical ultra-v3 CTX iter (per rank): H=32, D=64, CS=256, L_p=50224.
+    H, D, CS = 32, 64, 256
+    num_prefill_tokens = 50224
+    NC = (num_prefill_tokens + CS - 1) // CS
+
+    out_contig = torch.randn(1, H, D, NC, CS, dtype=torch.bfloat16, device=device)
+    dst = torch.empty(num_prefill_tokens, H * D, dtype=torch.bfloat16, device=device)
+
+    # Warm up.
+    for _ in range(10):
+        ssd_output_transpose(out_contig, dst, num_prefill_tokens)
+        ssd_output_transpose_ref(out_contig, num_prefill_tokens)
+    torch.cuda.synchronize()
+
+    iters = 50
+
+    s = torch.cuda.Event(enable_timing=True)
+    e = torch.cuda.Event(enable_timing=True)
+
+    s.record()
+    for _ in range(iters):
+        ssd_output_transpose(out_contig, dst, num_prefill_tokens)
+    e.record()
+    torch.cuda.synchronize()
+    t_tri_ms = s.elapsed_time(e) / iters
+
+    s.record()
+    for _ in range(iters):
+        ssd_output_transpose_ref(out_contig, num_prefill_tokens)
+    e.record()
+    torch.cuda.synchronize()
+    t_ref_ms = s.elapsed_time(e) / iters
+
+    print(f"\nssd_output_transpose (L_p={num_prefill_tokens}, H={H}, D={D}, NC={NC}, CS={CS}):")
+    print(f"  triton:   {t_tri_ms * 1000:7.2f} us")
+    print(f"  pytorch:  {t_ref_ms * 1000:7.2f} us")
+    print(f"  speedup:  {t_ref_ms / t_tri_ms:.2f}x")
+    # Sanity: we expect > 2x speedup on B200.
+    assert t_ref_ms / t_tri_ms > 1.5, f"unexpectedly low speedup {t_ref_ms / t_tri_ms:.2f}x"
+    _ = time  # silence linter

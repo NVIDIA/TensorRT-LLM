@@ -24,6 +24,7 @@ from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import pad_up
 
+from .fuse_elementwise_ops import ssd_output_transpose
 from .ssd_bmm import _bmm_chunk_fwd
 from .ssd_chunk_scan import _chunk_scan_fwd
 from .ssd_chunk_state import (_chunk_cumsum_fwd, _chunk_state_fwd,
@@ -34,9 +35,15 @@ from .ssd_state_passing import _state_passing_fwd
 _flashinfer_ssd_cache: dict = {}
 
 
-def _get_flashinfer_ssd(chunk_size, nheads, headdim, dstate, ngroups):
-    """Get or compile a cached FlashInfer SSDCombined kernel instance."""
-    key = (chunk_size, nheads, headdim, dstate, ngroups)
+def _get_flashinfer_ssd(chunk_size, nheads, headdim, dstate, ngroups,
+                        has_varlen):
+    """Get or compile a cached FlashInfer SSDCombined kernel instance.
+
+    has_varlen is part of the cache key because flashinfer specializes the
+    kernel for varlen vs non-varlen modes; mixing them in one cache entry
+    would silently use the wrong layout.
+    """
+    key = (chunk_size, nheads, headdim, dstate, ngroups, has_varlen)
     if key not in _flashinfer_ssd_cache:
         from flashinfer.mamba import SSDCombined
         _flashinfer_ssd_cache[key] = SSDCombined(
@@ -50,12 +57,14 @@ def _get_flashinfer_ssd(chunk_size, nheads, headdim, dstate, ngroups):
             has_d=True,
             d_has_hdim=False,
             has_initial_states=True,
-            has_varlen=True,
+            has_varlen=has_varlen,
             has_z=False,
             seq_idx_dtype=torch.int32,
         )
-        logger.info_once("Using FlashInfer fused SSD kernel for Mamba2 prefill",
-                         key="flashinfer_ssd_prefill")
+        logger.info_once(
+            f"Using FlashInfer fused SSD kernel for Mamba2 prefill "
+            f"(has_varlen={has_varlen})",
+            key=f"flashinfer_ssd_prefill_{has_varlen}")
     return _flashinfer_ssd_cache[key]
 
 
@@ -79,13 +88,22 @@ def _mamba_chunk_scan_flashinfer_fwd(
     return_final_states=False,
     state_dtype=None,
 ):
-    """FlashInfer fused SSD forward using a single CUTLASS persistent kernel."""
-    _, seqlen, nheads, headdim = x.shape
+    """FlashInfer fused SSD forward using a single CUTLASS persistent kernel.
+
+    Supports both modes:
+      * varlen     (cu_seqlens != None): packed batch=1 with N sequences;
+                   fstate shape (num_seqs, nheads, headdim, dstate).
+      * non-varlen (cu_seqlens == None): standard (batch, seqlen) input;
+                   fstate shape (batch,    nheads, headdim, dstate).
+    """
+    batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
     io_dtype = torch.bfloat16
+    has_varlen = cu_seqlens is not None
 
-    ssd = _get_flashinfer_ssd(chunk_size, nheads, headdim, dstate, ngroups)
-    num_seqs = cu_seqlens.shape[0] - 1
+    ssd = _get_flashinfer_ssd(chunk_size, nheads, headdim, dstate, ngroups,
+                              has_varlen)
+    num_seqs = cu_seqlens.shape[0] - 1 if has_varlen else batch
 
     # Pad seqlen to chunk_size boundary — padded tokens use dt=-100
     # so softplus ≈ 0, contributing nothing to state or output.
@@ -116,12 +134,35 @@ def _mamba_chunk_scan_flashinfer_fwd(
                                         dstate,
                                         dtype=io_dtype)
 
-    if chunk_indices is None or chunk_offsets is None:
+    if has_varlen and (chunk_indices is None or chunk_offsets is None):
         from .mamba2_metadata import cu_seqlens_to_chunk_indices_offsets_triton
         chunk_indices, chunk_offsets = (
             cu_seqlens_to_chunk_indices_offsets_triton(cu_seqlens,
                                                        chunk_size,
                                                        total_seqlens=seqlen))
+    elif not has_varlen:
+        # Non-varlen mode: kernel does not consume seq_idx / chunk_indices /
+        # chunk_offsets. Pass None so flashinfer dispatches the right path.
+        seq_idx = None
+        chunk_indices = None
+        chunk_offsets = None
+
+    # Pre-allocate the SSD output in its native contiguous layout
+    # (B, H, D, NC, CS) so FlashInfer writes directly into it. We then
+    # fuse the transpose-to-(L_p, H*D) into a single Triton kernel, saving
+    # ~3.5 ms/layer vs PyTorch's generic strided direct_copy.
+    padded_seqlen = x.shape[1]
+    nchunks = padded_seqlen // chunk_size
+    if out is not None:
+        raw_out = torch.empty(batch,
+                              nheads,
+                              headdim,
+                              nchunks,
+                              chunk_size,
+                              dtype=io_dtype,
+                              device=x.device)
+    else:
+        raw_out = None
 
     out_view, fstate = ssd.run(
         x,
@@ -137,17 +178,31 @@ def _mamba_chunk_scan_flashinfer_fwd(
         seq_idx=seq_idx,
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
+        out=raw_out,
         return_final_states=True,
     )
 
     if out is not None:
-        out.copy_(out_view[:, :seqlen])
+        # Tier 1.1 fast-transpose path expects packed (batch=1) layout.
+        # Non-varlen / multi-batch falls back to the strided PyTorch copy.
+        if has_varlen and batch == 1:
+            num_prefill_tokens = out.shape[1]
+            dst = out.view(num_prefill_tokens, nheads * headdim)
+            ssd_output_transpose(raw_out, dst, num_prefill_tokens)
+        else:
+            out.copy_(out_view[:, :seqlen])
 
     if state_dtype is not None and fstate.dtype != state_dtype:
         fstate = fstate.to(state_dtype)
 
-    # Both final_states and varlen_states are per-sequence in FlashInfer.
-    return (fstate, fstate) if return_final_states else fstate
+    # Match Triton wrapper's return shape:
+    #   varlen mode:    fstate has per-sequence shape; final_states and
+    #                   varlen_states are interchangeable for batch=1 packed.
+    #   non-varlen:     fstate is per-batch final_states only.
+    if has_varlen:
+        return (fstate, fstate) if return_final_states else fstate
+    else:
+        return fstate if return_final_states else None
 
 
 def is_int_pow_2(n):
@@ -361,7 +416,12 @@ def mamba_chunk_scan_combined(
                 ), "cu_seqlens must be provided if return_varlen_states is True"
 
     # Dispatch to FlashInfer fused CUTLASS kernel on Blackwell (SM100+).
-    if (return_varlen_states and z is None and is_sm_100f()):
+    # FlashInfer SSD supports both varlen (cu_seqlens != None, fstate shape
+    # (num_seqs, H, D, N)) and non-varlen (cu_seqlens == None, fstate shape
+    # (batch, H, D, N)) modes via the `has_varlen` constructor flag — we pick
+    # the right cache entry based on whether cu_seqlens is provided.
+    # dstate=96 padding is not handled by the flashinfer kernel, so skip.
+    if (z is None and is_sm_100f() and B.shape[-1] != 96):
         return _mamba_chunk_scan_flashinfer_fwd(
             x,
             dt,
