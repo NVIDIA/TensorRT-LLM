@@ -18,19 +18,10 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from utils.util import getSMVersion  # isort: skip
 
-# fmt: off
-# TODO: Remove this once we have a proper transformers package
-from tensorrt_llm._torch.models.modeling_exaone_moe import ExaoneMoEConfig  # isort: skip
-
-SKIP_EXAONE_MOE_HF_ACCURACY_TEST = False
-try:
-    from transformers.models.exaone_moe.modeling_exaone_moe import (
-        ExaoneMoEForCausalLM as HFExaoneMoEForCausalLM,
-    )
-except ImportError:
-    # TODO: Remove this once we have a proper config for EXAONE-MoE
-    SKIP_EXAONE_MOE_HF_ACCURACY_TEST = True
-# fmt: on
+from transformers import ExaoneMoeConfig
+from transformers.models.exaone_moe.modeling_exaone_moe import (
+    ExaoneMoeForCausalLM as HFExaoneMoeForCausalLM,
+)
 
 WINDOW_SIZE = 4
 NUM_HIDDEN_LAYERS = 4
@@ -103,7 +94,7 @@ class TestExaoneMoe(unittest.TestCase):
         """Test basic EXAONE-MoE model forward pass with optional quantization."""
 
         config_dict = deepcopy(EXAONE_MOE_CONFIG)
-        exaone_moe_config = ExaoneMoEConfig.from_dict(config_dict)
+        exaone_moe_config = ExaoneMoeConfig.from_dict(config_dict)
 
         if quant_algo:
             quant_config = QuantConfig(quant_algo=quant_algo)
@@ -207,7 +198,7 @@ class TestExaoneMoe(unittest.TestCase):
     def test_exaone_moe_moe_layer_config(self):
         """Test that MoE layers are correctly configured."""
         config_dict = deepcopy(EXAONE_MOE_CONFIG)
-        exaone_moe_config = ExaoneMoEConfig.from_dict(config_dict)
+        exaone_moe_config = ExaoneMoeConfig.from_dict(config_dict)
 
         device = torch.device("cuda")
         model_config = ModelConfig(pretrained_config=exaone_moe_config)
@@ -233,19 +224,16 @@ class TestExaoneMoe(unittest.TestCase):
     @torch.no_grad()
     def test_exaone_moe_allclose_to_hf(self, scenario: Scenario) -> None:
         """Compare output to HuggingFace implementation."""
-        if SKIP_EXAONE_MOE_HF_ACCURACY_TEST:
-            self.skipTest("EXAONE-MoE HF model is not available in this environment")
-
         attention_backend = scenario.attention_backend
         metadata_cls = get_attention_backend(attention_backend).Metadata
 
         torch.random.manual_seed(0)
         config_dict = deepcopy(EXAONE_MOE_CONFIG)
-        exaone_moe_config = ExaoneMoEConfig.from_dict(config_dict)
+        exaone_moe_config = ExaoneMoeConfig.from_dict(config_dict)
         dtype = exaone_moe_config.torch_dtype
         device = torch.device("cuda")
 
-        hf_exaone_moe = HFExaoneMoEForCausalLM(exaone_moe_config).to(dtype).to(device).eval()
+        hf_exaone_moe = HFExaoneMoeForCausalLM(exaone_moe_config).to(dtype).to(device).eval()
 
         model_config = ModelConfig(
             pretrained_config=exaone_moe_config, attn_backend=attention_backend
