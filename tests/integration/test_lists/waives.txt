@@ -427,8 +427,6 @@ accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-trtl
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_tp4] SKIP (https://nvbugs/6110074)
 accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-4-trtllm] SKIP (https://nvbugs/6112500)
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[pp4-attn_backend=TRTLLM-torch_compile=False] SKIP (https://nvbugs/6112497)
-accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_fp8_prequantized[torch_compile=False] SKIP (https://nvbugs/6087946)
-accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_fp8_prequantized[torch_compile=True] SKIP (https://nvbugs/6087946)
 disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2_genpp2[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6114140)
 accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy SKIP (https://nvbugs/6094102)
 disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4-TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/6114142)
@@ -445,3 +443,4 @@ test_e2e.py::test_multi_nodes_eval[nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1
 test_e2e.py::test_multi_nodes_eval[Qwen3/Qwen3-235B-A22B-tp16-mmlu] SKIP (https://nvbugs/6115560)
 accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[tp1-cutlass] SKIP (https://nvbugs/6116088)
 test_e2e.py::test_openai_disagg_multi_nodes_completion_service_discovery[http] SKIP (https://nvbugs/6115562)
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_scheduler[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-enable_chunked_prefill=False] SKIP (https://nvbugs/5981122)
