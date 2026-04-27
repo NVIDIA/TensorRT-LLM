@@ -23,10 +23,10 @@ from typing import List, Optional
 
 import torch
 
-# use trtllm distributed ops to improve TP performance if possible
-from .....mapping import Mapping
-from ....distributed import AllReduce, allgather
-from ....modules.linear import AllReduceFusionOp, AllReduceParams, AllReduceStrategy
+from tensorrt_llm._torch.distributed import AllReduce, allgather
+from tensorrt_llm._torch.modules.linear import AllReduceFusionOp, AllReduceParams, AllReduceStrategy
+from tensorrt_llm.mapping import Mapping
+
 from ...distributed.common import ReduceOp, get_rank_world_size, get_world_size, is_ompi
 
 # Cache AllReduce modules to avoid recreating on every call

@@ -21,7 +21,7 @@ import torch
 from torch._ops import OpOverloadPacket
 from torch.fx import GraphModule, Node
 
-from .....llmapi.llm_args import KvCacheConfig
+from ..._compat import KvCacheConfig
 from ...custom_ops.attention_interface import (
     AttentionDescriptor,
     AttentionLayout,

@@ -565,22 +565,22 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
     # ------------------------------------------------------------------
 
     def infer(self, req):
-        extra = req.extra_params or {}
+        extra = req.params.extra_params or {}
         return self.forward(
             prompt=req.prompt,
-            negative_prompt=req.negative_prompt,
-            height=req.height,
-            width=req.width,
-            num_frames=req.num_frames,
-            frame_rate=req.frame_rate,
-            num_inference_steps=req.num_inference_steps,
-            guidance_scale=req.guidance_scale,
-            seed=req.seed,
+            negative_prompt=req.params.negative_prompt,
+            height=req.params.height,
+            width=req.params.width,
+            num_frames=req.params.num_frames,
+            frame_rate=req.params.frame_rate,
+            num_inference_steps=req.params.num_inference_steps,
+            guidance_scale=req.params.guidance_scale,
+            seed=req.params.seed,
             output_type=extra["output_type"],
             guidance_rescale=extra["guidance_rescale"],
-            max_sequence_length=req.max_sequence_length,
-            image=req.image,
-            image_cond_strength=req.image_cond_strength,
+            max_sequence_length=req.params.max_sequence_length,
+            image=req.params.image,
+            image_cond_strength=req.params.image_cond_strength,
             stg_scale=extra["stg_scale"],
             stg_blocks=extra["stg_blocks"],
             modality_scale=extra["modality_scale"],

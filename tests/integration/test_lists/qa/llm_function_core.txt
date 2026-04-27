@@ -135,6 +135,8 @@ accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[fp8-4-at
 accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[nvfp4-1-attn_dp_off-trtllm]
 accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[nvfp4-4-attn_dp_on-trtllm]
 accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_mtp[4]
+accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_functional_small[bf16]
+accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_functional_small[fp8]
 accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[False]
 accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[True]
 accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_fp8[True]
@@ -162,6 +164,7 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus_chunked_
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus_corner_case
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_dsa_host_cache_offload[host_cache_offload]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_dsa_host_cache_offload[host_cache_offload_mtp1]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_dsa_host_cache_offload[host_cache_offload_mtp3_no_adp]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[baseline]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[baseline_fp8kv]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[baseline_mtp1]
@@ -723,7 +726,8 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_sof
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.9-fp8kv=True]
 accuracy/test_llm_api_pytorch.py::TestQwen3_4B::test_eagle3
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16
-accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8
+accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=False]
+accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=True]
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[adp4_cutedsl]
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[adp4_trtllm]
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[tep4_cutedsl]
@@ -777,10 +781,6 @@ disaggregated/test_auto_scaling.py::test_worker_restart[http-kv_cache_aware]
 disaggregated/test_auto_scaling.py::test_worker_restart[http-load_balancing]
 disaggregated/test_auto_scaling.py::test_worker_restart[http-round_robin]
 disaggregated/test_disaggregated.py::test_disaggregated_benchmark_gen_only_insufficient_kv[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[DeepSeek-V3-Lite-bf16]
-disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[DeepSeek-V3-Lite-fp8]
-disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-3.1-8b-instruct-hf-fp8]
-disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-v3-8b-hf]
 disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_cancel_large_context_requests[DeepSeek-V3-Lite-bf16]
 disaggregated/test_disaggregated.py::test_disaggregated_chat_completion_tool_calls[TinyLlama-1.1B-Chat-v1.0]
@@ -858,6 +858,7 @@ disaggregated/test_workers.py::test_workers_kv_cache_aware_router[TinyLlama-1.1B
 disaggregated/test_workers.py::test_workers_kv_cache_aware_router_deepseek_v3_lite_bf16[DeepSeek-V3-Lite-bf16]
 disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_workers.py::test_workers_kv_cache_events[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_workers.py::test_workers_conversation_router[TinyLlama-1.1B-Chat-v1.0]
 llmapi/test_llm_examples.py::test_llmapi_server_example
 test_e2e.py::test_eagle3_output_repetition_4gpus[modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8-EAGLE3-LLaMA3.3-Instruct-70B]
 test_e2e.py::test_eagle3_output_repetition_4gpus[Qwen3/Qwen3-30B-A3B-Qwen3/Qwen3-30B-eagle3]
