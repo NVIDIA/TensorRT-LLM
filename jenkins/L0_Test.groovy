@@ -1701,7 +1701,13 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                       value: "compute,utility"
             """
         }
-
+        if (type.contains("dgx-h100")) {
+            selectors = """
+                    kubernetes.io/arch: ${arch}
+                    kubernetes.io/os: linux
+                    nvidia.com/gpu_type: ${gpuType}
+                    nvidia.com/hostname: viking-prod-208.ipp2u1.colossus"""
+        }
         // The following GPU types doesn't support dynamic driver flashing.
         if (REQUIRED_NO_DRIVER_TYPES.any { type.contains(it) }) {
             if (type.contains("gb10x")) {
