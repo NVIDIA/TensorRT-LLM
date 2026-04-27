@@ -14,8 +14,7 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._torch.attention_backend import trtllm_gen
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import (get_sm_version, is_sm_100f, maybe_pin_memory,
-                                 prefer_pinned)
+from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
@@ -545,10 +544,14 @@ class TrtllmAttentionWrapper:
         out_scale = self.out_scale_sf if self.use_nvfp4_output else self.out_scale
 
         helix_active = self.helix_position_offsets is not None
-        # Cross-attention currently only flows through the trtllm-gen sub-path
-        # on Blackwell (Step 5α). When is_cross is True, force that sub-path
-        # even if the env var is off — the fallback to thop.attention does not
-        # yet expose cross-KV inputs (Step 5β).
+        # Cross-attention is supported on two sub-paths:
+        #   * trtllm-gen on Blackwell (SM100/SM103) — Step 5α.
+        #   * legacy ``thop.attention`` on every other arch — Step 5β.
+        # We always *prefer* the trtllm-gen path for cross-attn so Blackwell
+        # keeps using the kernels we validated in 5α; on other archs
+        # ``trtllm_gen.is_supported(...)`` returns False and execution falls
+        # through to the ``thop.attention`` branch, which now accepts
+        # ``cross_attention``/``cross_kv``/``encoder_input_lengths`` (Step 5β).
         prefer_trtllm_gen = _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION or is_cross
         if prefer_trtllm_gen and not helix_active and trtllm_gen.is_supported(
                 q=q,
@@ -666,10 +669,30 @@ class TrtllmAttentionWrapper:
                 encoder_seq_lens=encoder_seq_lens,
             )
         else:
+            # Cross-attention legacy sub-path (Step 5β). Pack the encoder K/V
+            # projections produced on the Python side into a single
+            # ``[num_encoder_tokens, 2 * num_kv_heads * head_size]`` tensor so
+            # the C++ qkv_preprocessing kernel can lay them out into the
+            # cross-KV pool (mirrors the trtllm_gen sub-path). For the
+            # generation step k and v are None (KV is already cached) and
+            # cross_kv is therefore also None; the kernel reads encoder K/V
+            # straight from the paged cross pool.
+            cross_kv_input = None
+            if is_cross and k is not None and v is not None:
+                k_flat = k.contiguous().view(k.shape[0], -1)
+                v_flat = v.contiguous().view(v.shape[0], -1)
+                cross_kv_input = torch.cat([k_flat, v_flat], dim=1).contiguous()
+            # Encoder K/V live on the encoder seq dim, which has a different
+            # token count from the decoder Q. The C++ Runner slices ``k``/``v``
+            # by decoder ``token_offset`` so passing them through would index
+            # out of bounds. Drop them — cross_kv carries the data — and tell
+            # the C++ side via the new ``cross_attention`` flag.
+            k_arg = None if is_cross else k
+            v_arg = None if is_cross else v
             thop.attention(
                 q,
-                k,
-                v,
+                k_arg,
+                v_arg,
                 output,
                 output_sf,
                 self.workspace,
@@ -749,6 +772,9 @@ class TrtllmAttentionWrapper:
                 self.flash_mla_num_splits,
                 num_contexts=num_contexts,
                 num_ctx_tokens=num_ctx_tokens,
+                cross_attention=is_cross,
+                cross_kv=cross_kv_input,
+                encoder_input_lengths=encoder_seq_lens,
             )
 
         if self.print_skip_softmax_stat:
@@ -1927,16 +1953,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             TrtllmAttentionMetadata,
         )
         # Cross-attention is supported on Blackwell (SM100/SM103) via the
-        # trtllm-gen sub-path (see ``trtllm_gen.is_supported``); other archs
-        # require the legacy ``thop.attention`` C++ wrapper to be extended for
-        # cross-attention (Step 5β of the encoder-decoder porting plan).
-        if metadata.is_cross and not is_sm_100f(get_sm_version()):
-            raise NotImplementedError(
-                "TRT-LLM cross-attention is currently only supported on "
-                "Blackwell (SM100/SM103) via the trtllm-gen path. Use the "
-                "VANILLA attention backend for cross-attention on other "
-                "architectures, or extend cpp/tensorrt_llm/thop/attentionOp "
-                "and its nanobind binding (Step 5β).")
+        # trtllm-gen sub-path (see ``trtllm_gen.is_supported``) and on all
+        # earlier architectures via the legacy ``thop.attention`` C++ wrapper
+        # (Step 5β of the encoder-decoder porting plan). The wrapper.run()
+        # call below dispatches to the right sub-path based on architecture.
 
         use_paged_context_fmha = (
             metadata.runtime_features.chunked_prefill

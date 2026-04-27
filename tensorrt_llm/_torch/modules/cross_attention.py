@@ -24,8 +24,6 @@ from typing import Optional
 import torch
 from torch import nn
 
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
-
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import AttentionBackend, PredefinedAttentionMask
 from ..attention_backend.utils import create_attention
@@ -43,27 +41,20 @@ class CrossAttention(nn.Module):
     subsequent generation steps, K/V are read from the cache without
     re-projection.
 
-    The cross-attention sub-layer is currently initialized with the
-    ``VANILLA`` backend regardless of ``ModelConfig.attn_backend``. Per the
-    encoder-decoder porting guide (Step 5), enabling the production ``TRTLLM``
-    backend for cross-attention has two unblock surfaces:
+    The cross-attention sub-layer honors ``ModelConfig.attn_backend``: when
+    set to ``"TRTLLM"`` it dispatches through the production C++ attention op
+    on every supported architecture. Two sub-paths are wired in:
 
-    * **5α (Blackwell, Python only)**: drop the top-level
-      ``assert not metadata.is_cross`` in ``trtllm.py``, plumb
-      ``metadata.is_cross`` into the ``trtllm_gen.is_supported`` call site,
-      remove the ``cross_attention`` early-out in ``trtllm_gen.is_supported``,
-      and thread cross-pool block tables / ``encoder_seq_lens`` into the
-      already-named ``cross_kv_input`` / ``encoder_seq_lens`` /
-      ``cross_attention`` slots of ``torch.ops.trtllm.qkv_preprocessing``.
-    * **5β (all archs)**: also extend ``cpp/tensorrt_llm/thop/attentionOp.cpp``
-      and the nanobind ``m.def("attention", ...)`` to forward
-      ``encoder_input_lengths`` / ``cross_kv`` / ``cross_attention`` into
-      ``EnqueueContextParams``, so the legacy compute path covers Hopper /
-      Ampere.
+    * **5α (Blackwell, SM100/SM103)**: ``trtllm_gen`` kernels via
+      ``torch.ops.trtllm.qkv_preprocessing`` + ``torch.ops.trtllm.attention``
+      with ``cross_attention=True``.
+    * **5β (Hopper / Ampere / earlier)**: legacy ``thop.attention`` C++
+      wrapper, extended in ``cpp/tensorrt_llm/thop/attentionOp.cpp`` to
+      forward ``encoder_input_lengths`` / ``cross_kv`` / ``cross_attention``
+      into ``EnqueueContextParams``.
 
-    Encoder and decoder *self*-attention can already use any backend
-    configured on ``ModelConfig``; only the cross-attention sub-layer is
-    pinned to ``VANILLA`` until 5α / 5β land.
+    Encoder and decoder self-attention are unaffected and continue to use
+    whatever backend ``ModelConfig.attn_backend`` selects.
     """
 
     def __init__(
@@ -154,20 +145,14 @@ class CrossAttention(nn.Module):
             reduce_output=True,
         )
 
-        # Cross-attention backend selection. Step 5α enables ``TRTLLM`` on
-        # Blackwell (SM100/SM103) via the ``trtllm_gen`` sub-path. Step 5β
-        # (extends the legacy ``thop.attention`` C++ wrapper + nanobind
-        # binding to forward ``encoder_input_lengths`` / ``cross_kv`` /
-        # ``cross_attention``) is required for Hopper / Ampere; until then,
-        # cross-attention on those archs falls back to ``VANILLA``. See the
-        # Step 5 entry of ``encoder_decoder_porting_guide.md`` for details.
-        # Encoder / decoder self-attention is unaffected and continues to use
-        # ``ModelConfig.attn_backend``.
-        attn_backend = "VANILLA"
-        if config.attn_backend == "TRTLLM" and is_sm_100f(get_sm_version()):
-            attn_backend = "TRTLLM"
+        # Cross-attention backend selection. After Step 5β the ``TRTLLM``
+        # backend supports cross-attention on every architecture: Blackwell
+        # uses the ``trtllm_gen`` sub-path (Step 5α), Hopper / Ampere /
+        # earlier use the legacy ``thop.attention`` sub-path. We therefore
+        # honor ``ModelConfig.attn_backend`` directly, mirroring the behavior
+        # of self-attention.
         self.attn: AttentionBackend = create_attention(
-            attn_backend,
+            config.attn_backend,
             layer_idx,
             self.num_heads,
             self.head_dim,

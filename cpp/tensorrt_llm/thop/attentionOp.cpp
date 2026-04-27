@@ -95,7 +95,8 @@ public:
         std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> fmha_scheduler_counter,
         std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
         std::optional<torch::Tensor> quant_q_buffer, std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
-        std::optional<torch::Tensor> flash_mla_num_splits) const
+        std::optional<torch::Tensor> flash_mla_num_splits, bool const cross_attention,
+        std::optional<torch::Tensor> cross_kv, std::optional<torch::Tensor> encoder_input_lengths) const
         = 0;
 };
 
@@ -156,7 +157,8 @@ public:
         std::optional<torch::Tensor> cu_kv_seqlens, std::optional<torch::Tensor> fmha_scheduler_counter,
         std::optional<torch::Tensor> mla_bmm1_scale, std::optional<torch::Tensor> mla_bmm2_scale,
         std::optional<torch::Tensor> quant_q_buffer, std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata,
-        std::optional<torch::Tensor> flash_mla_num_splits) const override
+        std::optional<torch::Tensor> flash_mla_num_splits, bool const cross_attention,
+        std::optional<torch::Tensor> cross_kv, std::optional<torch::Tensor> encoder_input_lengths) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -407,6 +409,19 @@ public:
         common_enqueue_params.context_lengths = context_lengths_ptr;
         common_enqueue_params.host_context_lengths = host_context_lengths.data_ptr<int32_t>();
         common_enqueue_params.workspace = workspace_ptr;
+        // Cross-attention plumbing (Step 5β). On a cross-attention layer
+        // ``encoder_input_lengths`` carries the per-request encoder token
+        // counts (== K/V-side lengths). The op's ``mCrossAttention`` flag is
+        // set on the wrapper-level ``op->mCrossAttention`` (see ``attention``
+        // below) and selects the cross-attention compute path inside
+        // ``enqueueContext`` / ``enqueueGeneration``.
+        if (cross_attention && encoder_input_lengths.has_value())
+        {
+            // Slice to this micro-batch in the same way as
+            // ``context_lengths`` / ``sequence_lengths`` above.
+            common_enqueue_params.encoder_input_lengths
+                = encoder_input_lengths.value().slice(0, seq_offset).data_ptr<int>();
+        }
         if (softmax_stats_tensor.has_value())
         {
             TLLM_CHECK_WITH_INFO(softmax_stats_tensor.value().scalar_type() == at::ScalarType::Float,
@@ -447,6 +462,24 @@ public:
             enqueue_params.batch_size = num_seqs;
             enqueue_params.k_ptr = k_ptr;
             enqueue_params.v_ptr = v_ptr;
+
+            // Cross-attention context plumbing (Step 5β). ``cross_kv`` is the
+            // packed encoder K/V projection of shape
+            // ``[num_encoder_tokens, 2 * num_kv_heads * head_size]`` (built on
+            // the Python side from k / v); ``cross_kv_length`` is the per-batch
+            // max encoder length used to size kernel buffers; and
+            // ``num_encoder_tokens`` is the total number of encoder tokens
+            // across the batch. Mirrors gptAttentionPlugin's cross-attention
+            // setup (see plugins/gptAttentionPlugin/gptAttentionPlugin.cpp).
+            if (cross_attention && cross_kv.has_value() && encoder_input_lengths.has_value())
+            {
+                auto const& cross_kv_tensor = cross_kv.value();
+                auto const& enc_lens = encoder_input_lengths.value();
+                enqueue_params.cross_kv = static_cast<T const*>(cross_kv_tensor.data_ptr());
+                enqueue_params.num_encoder_tokens = static_cast<int32_t>(cross_kv_tensor.size(0));
+                enqueue_params.cross_kv_length
+                    = enc_lens.slice(0, seq_offset, seq_offset + num_seqs).max().item<int32_t>();
+            }
 
             if (op.isMLAEnabled())
             {
@@ -628,22 +661,31 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
     std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
     std::optional<torch::Tensor> flash_mla_tile_scheduler_metadata, std::optional<torch::Tensor> flash_mla_num_splits,
-    int64_t num_contexts, int64_t num_ctx_tokens)
+    int64_t num_contexts, int64_t num_ctx_tokens, bool const cross_attention, std::optional<torch::Tensor> cross_kv,
+    std::optional<torch::Tensor> encoder_input_lengths)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
     bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_pool_pointers.has_value()
         && host_kv_cache_pool_mapping.has_value();
 
-    TLLM_CHECK_WITH_INFO(is_mla_enable || is_fused_qkv, "Only fused QKV is supported for non-MLA attention now");
-    TLLM_CHECK_WITH_INFO(update_kv_cache, "KV cache update cannot be disabled now");
+    // Cross-attention layers (Step 5β) carry only Q via ``q``; encoder K/V is
+    // delivered through the dedicated ``cross_kv`` argument and lives in the
+    // paged cross-KV cache. Hence neither ``is_fused_qkv`` nor
+    // ``update_kv_cache`` are required to be true for cross-attention: during
+    // the decoder context step we still write the (separately-projected)
+    // encoder K/V into the cross pool via ``cross_kv``, and during decoder
+    // generation we only read from that pool, so ``update_kv_cache`` is False.
+    TLLM_CHECK_WITH_INFO(is_mla_enable || is_fused_qkv || cross_attention,
+        "Only fused QKV is supported for non-MLA non-cross attention now");
+    TLLM_CHECK_WITH_INFO(update_kv_cache || cross_attention, "KV cache update cannot be disabled now");
     auto qkv_or_q = q;
     if (is_fused_qkv)
     {
         TLLM_CHECK_WITH_INFO(!k.has_value(), "The k tensor should be null if using fused QKV");
         TLLM_CHECK_WITH_INFO(!v.has_value(), "The v tensor should be null if using fused QKV");
     }
-    if (!is_fused_qkv && update_kv_cache)
+    if (!is_fused_qkv && update_kv_cache && !cross_attention)
     {
         TLLM_CHECK_WITH_INFO(k.has_value(), "The k tensor should be provided if updating KV cache with unfused K/V");
         TLLM_CHECK_WITH_INFO(v.has_value(), "The v tensor should be provided if updating KV cache with unfused K/V");
@@ -736,6 +778,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mFP8ContextFMHA = is_fp8_out || is_fp4_out || (op->mKVCacheQuantMode.hasFp8KvCache() && use_paged_context_fmha);
     op->mFP8AttenOutput = is_fp8_out;
     op->mPagedContextFMHA = use_paged_context_fmha;
+    // Step 5β: enable cross-attention compute path inside enqueueContext /
+    // enqueueGeneration when this layer is a decoder cross-attention layer.
+    op->mCrossAttention = cross_attention;
 
     op->mAttentionChunkSize = attention_chunk_size;
     op->mSkipSoftmaxThresholdScaleFactorPrefill
@@ -893,7 +938,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             spec_decoding_tensor_params, attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices,
             sparse_attn_offsets, sparse_attn_indices_block_size, num_sparse_topk_value, cu_q_seqlens, cu_kv_seqlens,
             fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata,
-            flash_mla_num_splits);
+            flash_mla_num_splits, cross_attention, cross_kv, encoder_input_lengths);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -912,7 +957,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             spec_decoding_tensor_params, attention_sinks, sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices,
             sparse_attn_offsets, sparse_attn_indices_block_size, num_sparse_topk_value, cu_q_seqlens, cu_kv_seqlens,
             fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale, quant_q_buffer, flash_mla_tile_scheduler_metadata,
-            flash_mla_num_splits);
+            flash_mla_num_splits, cross_attention, cross_kv, encoder_input_lengths);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);
