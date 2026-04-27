@@ -564,6 +564,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  speculative_config=pard_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm, extra_acc_spec="use_sa_spec")
+
     def test_dflash(self):
         pytorch_config = dict(
             max_batch_size=8,
