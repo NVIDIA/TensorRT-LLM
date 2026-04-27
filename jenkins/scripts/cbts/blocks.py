@@ -49,6 +49,29 @@ class Block:
     tests: list[str]
 
 
+# Strip trailing ` SKIP ...` / ` TIMEOUT ...` annotations from a test id.
+# YAML entries can carry `TIMEOUT (n)`, waives.txt entries can carry both;
+# the lookup must hit either form so we normalize on both sides.
+_TEST_ID_SUFFIX_RE = re.compile(r"\s+(SKIP|TIMEOUT)\b.*$")
+
+# Strip leading `full:<gpu>/` platform prefix used in waives.txt.
+_TEST_ID_PREFIX_RE = re.compile(r"^full:[^/]+/")
+
+
+def normalize_test_id(test_id: str) -> str:
+    """Canonical form for cross-referencing test-db YAML and waives.txt.
+
+    Strips trailing `SKIP`/`TIMEOUT` annotations, trailing `# comment`, and
+    leading `full:<gpu>/` prefix. `YAMLIndex` indexes both the raw and the
+    normalized form; `rules.waives_rule` looks up by this normalization.
+    """
+    s = test_id.strip()
+    s = _TEST_ID_SUFFIX_RE.sub("", s).strip()
+    if "#" in s:
+        s = s.split("#", 1)[0].strip()
+    return _TEST_ID_PREFIX_RE.sub("", s)
+
+
 class YAMLIndex:
     """Index of all blocks across test-db YAMLs, with reverse lookup by test id."""
 
@@ -78,12 +101,14 @@ class YAMLIndex:
                 tests=list(tests),
             )
             self.blocks.append(block)
+            # Index each test under both its raw YAML string (which may carry
+            # ` -m "gpu2"`, ` TIMEOUT (90)`, etc.) and its normalized form, so
+            # waives.txt lookups — which strip SKIP/TIMEOUT — still resolve.
             for test in tests:
-                # Tests are raw YAML strings; they may carry trailing options
-                # like ` -m "gpu2"` or ` TIMEOUT (90)`. Use the full string as
-                # the match key so downstream test_id extraction can match
-                # either the bare node_id or the options-suffixed form.
                 self._test_to_blocks.setdefault(test, []).append(block)
+                normalized = normalize_test_id(test)
+                if normalized and normalized != test:
+                    self._test_to_blocks.setdefault(normalized, []).append(block)
 
     def blocks_containing_test(self, test_id: str) -> list[Block]:
         return list(self._test_to_blocks.get(test_id, []))

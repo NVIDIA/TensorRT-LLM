@@ -15,58 +15,35 @@
 
 from __future__ import annotations
 
-import re
 from typing import Optional
 
-from blocks import Stage, YAMLIndex, block_matches_stage
+from blocks import Stage, YAMLIndex, block_matches_stage, normalize_test_id
 
 from .base import PRInputs, Rule, RuleResult
 
 WAIVES_FILE = "tests/integration/test_lists/waives.txt"
 
-# Strip GPU/platform prefixes like "full:GH200/" or "full:sm100/" at the start.
-_PREFIX_RE = re.compile(r"^full:[^/]+/")
-
-# Split trailing annotations (SKIP / TIMEOUT / comments) from the test id.
-# A waive line typically looks like:
-#   <test_id> SKIP (reason)
-#   <test_id> SKIP # url
-#   <test_id> # just a comment
-#   <test_id> -k "expr" SKIP (reason)
-# We keep the whole "<test_id> [-m/-k ...]" portion as the identifier, since
-# YAML entries can include the same -m/-k suffixes.
-_SUFFIX_RE = re.compile(r"\s+(SKIP|TIMEOUT)\b.*$")
-
 
 def _extract_test_id(line: str) -> Optional[str]:
-    """Extract the test identifier from a waives.txt line.
+    """Extract the normalized test identifier from a waives.txt line.
 
-    Returns None if the line doesn't look like a waive entry (empty, pure
-    comment, etc).
+    Returns None if the line doesn't look like a waive entry (empty / pure
+    comment line). Trailing `SKIP`/`TIMEOUT` annotations, `# comment`s, and
+    leading `full:<gpu>/` prefix are stripped via `normalize_test_id` so the
+    result matches the same key used by `YAMLIndex`.
     """
     s = line.strip()
     if not s or s.startswith("#"):
         return None
-    # Drop the "SKIP ..." / "TIMEOUT ..." trailing annotation if present.
-    s = _SUFFIX_RE.sub("", s).strip()
-    # Drop trailing " # comment" if any.
-    if "#" in s:
-        s = s.split("#", 1)[0].strip()
-    if not s:
-        return None
-    return s
-
-
-def _strip_prefix(test_id: str) -> str:
-    """Strip leading "full:<gpu>/" prefix if any."""
-    return _PREFIX_RE.sub("", test_id)
+    s = normalize_test_id(s)
+    return s or None
 
 
 def parse_waives_diff(diff: str) -> tuple[set[str], set[str]]:
     """Parse a unified diff of waives.txt.
 
-    Returns (added, removed) sets of test identifiers, with "full:..." prefixes
-    stripped so they can match YAML entries directly.
+    Returns (added, removed) sets of normalized test identifiers ready to look
+    up against `YAMLIndex.blocks_containing_test`.
     """
     added: set[str] = set()
     removed: set[str] = set()
@@ -79,7 +56,6 @@ def parse_waives_diff(diff: str) -> tuple[set[str], set[str]]:
         tid = _extract_test_id(body)
         if tid is None:
             continue
-        tid = _strip_prefix(tid)
         (added if sign == "+" else removed).add(tid)
     return added, removed
 
