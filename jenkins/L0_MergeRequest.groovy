@@ -804,8 +804,8 @@ def _cbtsGlobToRegex(String glob)
             : ('.+()[]{}|^$\\'.contains(c) ? '\\' + c : c)
     }.join('')
     // 2. Translate glob metas. Use unambiguous text sentinels so cascading
-    //    replaces don't double-match (Jenkins sandbox struggles with \u-escaped
-    //    control chars in some Groovy versions).
+    //    replaces don't double-match. Avoid unicode-escape placeholders
+    //    because the Groovy lexer expands those even inside string literals.
     return '^' + escaped
         .replace('**/', '__CBTSDOUBLESLASH__')
         .replace('**',  '__CBTSDOUBLESTAR__')
