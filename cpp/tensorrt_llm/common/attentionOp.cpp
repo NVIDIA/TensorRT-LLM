@@ -1117,6 +1117,8 @@ int AttentionOp::mlaGeneration(
         // CUDA graph warmup and avoids the eager-mode JIT miss/recompile. This is safe for
         // PagedKv on this path because the strides do not depend on mMaxSeqLenKv, and extra
         // KV CTAs exit early through seqLensKvPtr.
+        // TODO: mirror the is_swa + W+1 logic from xqaDispatcher.cpp when MLA gains SWA
+        // support (also requires adding Sliding cubins to the MLA gen kernel set).
         tllmRunnerParams.mMaxSeqLenKv = generation_params.max_attention_window_size;
         tllmRunnerParams.mSumOfSeqLensQ = int(batch_beam * tllmRunnerParams.mMaxSeqLenQ);
         // Not used in the generation kernels as contiguous_kv or paged_kv layouts are used.

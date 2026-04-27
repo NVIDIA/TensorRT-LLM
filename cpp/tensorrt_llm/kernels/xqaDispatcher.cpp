@@ -496,14 +496,15 @@ void XqaDispatcher::runImpl(
         // It is used to construct contiguous kv cache TMA descriptors.
         tllmRunnerParams.mMaxSeqLenCacheKv = params.max_attention_window_size;
         tllmRunnerParams.mMaxSeqLenQ = params.generation_input_length;
-        // Override mMaxSeqLenKv with the max cache capacity so FMHA picks the same kernel as
-        // CUDA graph warmup and avoids the eager-mode JIT miss/recompile. This is safe for
-        // PagedKv because its strides do not depend on mMaxSeqLenKv and extra KV CTAs exit
-        // early through seqLensKvPtr. ContiguousKv keeps the runtime value because its
-        // strides depend on it.
-        tllmRunnerParams.mMaxSeqLenKv = (tllmRunnerParams.mQkvLayout == QkvLayout::PagedKv)
-            ? params.max_attention_window_size
-            : params.max_past_kv_length;
+        // Pin mMaxSeqLenKv to a static per-layer value so warmup and runtime pick the same
+        // FMHA kernel (no JIT miss). Safe for PagedKv since strides are independent of it.
+        // SWA layers add +1 to trigger the SlidingOrChunkedCausal mask upgrade in the
+        // autotuner.
+        bool const is_swa = params.max_attention_window_size < params.rotary_embedding_max_positions;
+        int32_t const paged_kv_max_seq_len_kv
+            = is_swa ? params.max_attention_window_size + 1 : params.max_attention_window_size;
+        tllmRunnerParams.mMaxSeqLenKv
+            = (tllmRunnerParams.mQkvLayout == QkvLayout::PagedKv) ? paged_kv_max_seq_len_kv : params.max_past_kv_length;
         tllmRunnerParams.mSumOfSeqLensQ = int(params.batch_size * beam_width * tllmRunnerParams.mMaxSeqLenQ);
         // The sliding window attention size.
         tllmRunnerParams.mAttentionWindowSize = params.cyclic_attention_window_size;
