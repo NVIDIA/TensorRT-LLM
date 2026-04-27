@@ -26,6 +26,7 @@ def calc_engine_setting(
     target_input_len: int,
     target_output_len: int,
     kv_cache_gpu_mem_fraction: float = 0.95,
+    enable_attention_dp: bool = False,
 ) -> Tuple[int, int]:
     """ Calculate the engine build settings (max batch size and max num tokens)
         for a specific model + parallelism mapping + dataset configuration.
@@ -44,6 +45,9 @@ def calc_engine_setting(
         target_output_len (int): Target output length to compile the engine.
         kv_cache_gpu_mem_fraction (float): Fraction of free memory to allocate
             for KV cache.
+        enable_attention_dp (bool): Whether attention data parallelism is
+            enabled. When True, each TP rank independently manages its own
+            KV cache and batch, so max_batch_size is computed per-rank.
 
     Raises:
         RuntimeError: When the number of GPUs or amount of KV cache is unable to
@@ -67,9 +71,22 @@ def calc_engine_setting(
 
     # Number of GPU used for this run.
     n_gpus = tp_size * pp_size
-    # Total engine size.
-    engine_size = model_config.param_count * byte_per_elem / (1024**3)
-    total_gpu_memory = get_device_memory() * n_gpus
+    # Use checkpoint size from safetensors metadata for accurate estimation.
+    # This is critical for quantized models (e.g. NVFP4) where different
+    # tensors have different dtypes.
+    if model_config.checkpoint_size_in_gb > 0:
+        engine_size = model_config.checkpoint_size_in_gb
+    else:
+        # Fallback to param_count-based estimation for backward compatibility.
+        engine_size = model_config.param_count * byte_per_elem / (1024**3)
+    # With attention DP, each TP rank independently manages its own KV cache
+    # and holds a TP shard of the model weights. Compute per-rank available
+    # memory: single GPU memory minus per-rank engine size.
+    if enable_attention_dp:
+        total_gpu_memory = get_device_memory() * pp_size
+        engine_size = engine_size / tp_size
+    else:
+        total_gpu_memory = get_device_memory() * n_gpus
     # Available memory to allocate KV cache.
     available_memory = total_gpu_memory - engine_size
     logger.info(f"Estimated engine size: {engine_size:.2f} GB")

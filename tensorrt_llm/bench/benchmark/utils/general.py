@@ -79,6 +79,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     """
     extra_llm_api_options = params.get("extra_llm_api_options")
     enable_chunked_prefill = params.get("enable_chunked_prefill", False)
+    enable_attention_dp = False
 
     kv_cache_dtype = "auto"
     mamba_ssm_cache_dtype = params.get("mamba_ssm_cache_dtype", "auto")
@@ -95,6 +96,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
 
         enable_chunked_prefill = llm_args_dict.get("enable_chunked_prefill",
                                                    enable_chunked_prefill)
+        enable_attention_dp = llm_args_dict.get("enable_attention_dp", False)
 
     mapping = {
         "pp_size": params.get("pp"),
@@ -137,6 +139,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             dataset_metadata.avg_isl,
             dataset_metadata.avg_osl,
             params.get("kv_cache_free_gpu_mem_fraction"),
+            enable_attention_dp=enable_attention_dp,
         )
 
         logger.info(
