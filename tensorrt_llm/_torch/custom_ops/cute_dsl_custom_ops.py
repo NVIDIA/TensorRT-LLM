@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
+from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.logger import logger
 
 from ..._utils import get_sm_version, is_sm_100f
@@ -364,7 +365,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         def __init__(self,
                      output_dtype: torch.dtype,
-                     to_userbuffers: bool = False,
+                     output_buffer_kind: int = int(BufferKind.DEFAULT),
+                     group: Optional[List[int]] = None,
                      use_tvm_ffi: bool = True):
             super().__init__()
 
@@ -373,11 +375,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"CuteDSL NVFP4 only supports bfloat16 output, got {output_dtype}"
                 )
             self.output_dtype = output_dtype
-            self.to_userbuffers = to_userbuffers
+            self.output_buffer_kind = int(output_buffer_kind)
+            self.group = group
             self.use_tvm_ffi = use_tvm_ffi
 
         def unique_id(self):
-            return (self.output_dtype, self.to_userbuffers, self.use_tvm_ffi)
+            return (
+                self.output_dtype,
+                self.output_buffer_kind,
+                tuple(self.group) if self.group is not None else None,
+                self.use_tvm_ffi,
+            )
 
         def get_valid_tactics(
             self,
@@ -562,14 +570,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, alpha_tensor = inputs
             m, k, n = a_tensor.shape[0], a_tensor.shape[1], b_tensor.shape[0]
 
-            # Allocate output tensor from UserBuffers or regular CUDA memory
-            if self.to_userbuffers:
-                c_tensor = torch.ops.trtllm.create_userbuffers_tensor(
-                    [m, n], self.output_dtype)
-            else:
-                c_tensor = torch.empty(*(m, n),
-                                       dtype=self.output_dtype,
-                                       device="cuda")
+            # Allocate output tensor based on output_buffer_kind.
+            # allocate_output returns the actual BufferKind used (may fall back
+            # to Default if NcclWindow allocation fails); we discard it here.
+            c_tensor, _ = torch.ops.trtllm.allocate_output(
+                a_tensor, self.output_buffer_kind, self.group, [m, n],
+                self.output_dtype)
 
             if swap_ab:
                 c_tensor = c_tensor.permute(1, 0)
@@ -773,7 +779,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         weight_scale: torch.Tensor,
         alpha: torch.Tensor,
         output_dtype: torch.dtype,
-        to_userbuffers: bool = False,
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
+        group: Optional[List[int]] = None,
         use_tvm_ffi: bool = True,
     ) -> torch.Tensor:
         """CuteDSL-based NVFP4 GEMM optimized for Blackwell.
@@ -785,7 +792,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             weight_scale: Weight scale factors
             alpha: Scaling factor
             output_dtype: Output data type (must be bfloat16)
-            to_userbuffers: Whether to allocate output from UserBuffers pool
+            output_buffer_kind: Output buffer allocation strategy (DEFAULT, USERBUFFERS, or NCCL_WINDOW)
+            group: NCCL process group ranks (required when output_buffer_kind=NCCL_WINDOW)
             use_tvm_ffi: Whether to use TVM-FFI to call the kernel. Enable this option could help reduce the kernel host launch overhead.
 
         Note:
@@ -802,8 +810,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         tuner = AutoTuner.get()
 
-        runner = CuteDSLNVFP4BlackwellRunner(output_dtype, to_userbuffers,
-                                             use_tvm_ffi)
+        runner = CuteDSLNVFP4BlackwellRunner(output_dtype, output_buffer_kind,
+                                             group, use_tvm_ffi)
         inputs = [input, weight, input_scale, weight_scale, alpha]
         _, best_tactic = tuner.choose_one(
             "trtllm::cute_dsl_nvfp4_gemm_blackwell",
@@ -823,7 +831,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         weight_scale: torch.Tensor,
         alpha: torch.Tensor,  # Match custom op signature
         output_dtype: torch.dtype,
-        to_userbuffers: bool = False,
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
+        group: Optional[List[int]] = None,
         use_tvm_ffi: bool = True,
     ):
         # [m, k]

@@ -1,0 +1,39 @@
+# Dynamo-replica: agg Kimi K2.5 FP4 TRT-LLM deployment (NVIDIA recipe variant).
+#
+# Source (upstream Dynamo recipe):
+#   https://github.com/ai-dynamo/dynamo/tree/main/recipes/kimi-k2.5/trtllm/agg/nvidia
+
+metadata:
+  model_name: k25_thinking_fp4
+  supported_gpus:
+  - B200
+hardware:
+  gpus_per_node: 8
+server_configs:
+  - name: "k25_thinking_fp4_tep8_adp_2k1k"
+    model_name: "k25_thinking_fp4"
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    pipeline_parallel_size: 1
+    max_batch_size: 128
+    max_num_tokens: 8448
+    max_seq_len: 8212
+    attn_backend: "TRTLLM"
+    enable_attention_dp: true
+    trust_remote_code: true
+    print_iter_log: true
+    kv_cache_config:
+      dtype: 'fp8'
+      free_gpu_memory_fraction: 0.75
+    cache_transceiver_config:
+      backend: UCX
+      max_tokens_in_buffer: 8448
+    client_configs:
+      - name: "con128_iter10_2k1k"
+        concurrency: 128
+        iterations: 10
+        isl: 2048
+        osl: 1024
+        backend: "openai"
+        trust_remote_code: true
+        dataset_file: <dataset_file>

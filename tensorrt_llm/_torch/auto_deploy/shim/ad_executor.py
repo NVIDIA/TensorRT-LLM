@@ -51,7 +51,7 @@ from tensorrt_llm.llmapi.tokenizer import TokenizerBase
 from ...._utils import get_free_port, mpi_rank, mpi_world_size
 from ....mapping import Mapping
 from ...distributed import Distributed
-from ...pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from ...pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 from ...pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
 from ...pyexecutor.py_executor import PyExecutor
 from ...pyexecutor.resource_manager import (
@@ -293,7 +293,7 @@ def _generate_dummy_request(
     )
 
     # check if it's a hybrid kv-cache manager
-    is_hybrid_cache = isinstance(kv_cache_manager, MambaHybridCacheManager)
+    is_hybrid_cache = isinstance(kv_cache_manager, BaseMambaCacheManager)
 
     # check if we have a free page and free state available
     if not kv_cache_manager.get_num_free_blocks():
@@ -304,15 +304,6 @@ def _generate_dummy_request(
     # generate a dummy request
     dummy_request = kv_cache_manager.add_dummy_requests([request_id], **request_kwargs)[0]
     dummy_request.is_cuda_graph_dummy = True
-
-    # generate a dummy scheduled requests object
-    dummy_scheduled_requests = ScheduledRequests()
-    dummy_scheduled_requests.generation_requests.append(dummy_request)
-
-    # if it's a hybrid kv-cache manager, we need to manually call prepare_resources again (not done
-    # in add_dummy_requests)
-    if is_hybrid_cache:
-        kv_cache_manager.prepare_resources(dummy_scheduled_requests)
 
     # add to spec resource manager
     if spec_res_mgr:

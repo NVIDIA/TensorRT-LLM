@@ -9,22 +9,18 @@ from .interface import MoE, MoEWeightLoadingMode
 from .moe_load_balancer import (MoeLoadBalancer,
                                 moe_load_balancer_set_repeated_for_next_layer)
 from .quantization import FusedMoEQuantScalesFP8
-# yapf: disable
 from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
                       DefaultMoeRoutingMethod,
                       Llama4RenormalizeMoeRoutingMethod,
                       LoadBalancedMoeRoutingMethod, MiniMaxM2MoeRoutingMethod,
                       RenormalizeMoeRoutingMethod,
                       RenormalizeNaiveMoeRoutingMethod, RoutingMethodType,
-                      SigmoidRenormMoeRoutingMethod,
                       SparseMixerMoeRoutingMethod, StaticMoeRoutingMethod,
-                      create_renormalize_expert_load_balanced_logits)
-
-# yapf: enable
+                      create_load_balanced_logits)
 
 __all__ = [
     "BaseMoeRoutingMethod",
-    "create_renormalize_expert_load_balanced_logits",
+    "create_load_balanced_logits",
     "create_moe",
     "CuteDslFusedMoE",
     "CutlassFusedMoE",
@@ -40,7 +36,6 @@ __all__ = [
     "MoEWeightLoadingMode",
     "MiniMaxM2MoeRoutingMethod",
     "RenormalizeMoeRoutingMethod",
-    "SigmoidRenormMoeRoutingMethod",
     "RenormalizeNaiveMoeRoutingMethod",
     "RoutingMethodType",
     "SparseMixerMoeRoutingMethod",

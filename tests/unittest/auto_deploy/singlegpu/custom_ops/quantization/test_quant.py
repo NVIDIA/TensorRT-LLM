@@ -20,7 +20,10 @@ INT4_BLOCK_SIZE = 128
 @pytest.mark.parametrize("N", [18, 28, 30, 32])
 @pytest.mark.parametrize("K", [16, 32])
 @pytest.mark.parametrize("bias", [True, False])
-@pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
+@pytest.mark.skipif(
+    not (fp8_compatible() and trtllm_ops_available()),
+    reason="Requires fp8 support and TRT-LLM ops",
+)
 def test_fp8_linear(M, N, K, bias):
     if N % 16 != 0 or K % 16 != 0:
         pytest.skip("https://github.com/NVIDIA/TensorRT-LLM/issues/8811")
@@ -82,7 +85,11 @@ def test_fp4_linear():
 
 @pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("mat2_dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
+@pytest.mark.skipif(
+    not (fp8_compatible() and trtllm_ops_available()),
+    reason="Requires fp8 support and TRT-LLM ops (flashinfer bmm_fp8 cublasLt path "
+    "is only validated against the TRT-LLM torch build)",
+)
 def test_fp8_bmm(input_dtype, mat2_dtype):
     # Create test tensors: (B, M, K) and (B, K, N)
     batch_size, M, K, N = 2, 32, 64, 80

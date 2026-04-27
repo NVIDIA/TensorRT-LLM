@@ -21,7 +21,6 @@ import torch
 import torchvision
 import transformers
 from einops import rearrange
-from PIL import Image
 from torchvision.transforms.functional import get_image_size, pad, resize
 from transformers.image_processing_utils import BatchFeature
 from transformers.image_utils import (ImageInput, is_pil_image,
@@ -823,7 +822,7 @@ class Phi4MMInputProcessor(BaseMultimodalInputProcessor,
     def get_num_tokens_per_image(
         self,
         *,
-        image: Image.Image,
+        image: torch.Tensor,
         **kwargs,
     ):
         images = [image]
