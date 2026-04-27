@@ -650,6 +650,10 @@ class QKVAttentionModel(TestModel):
     def num_gemms_after_fusion(self) -> int:
         return 2  # 1 fused QKV + 1 o_proj
 
+    @property
+    def expected_narrow_count(self) -> int:
+        return 3  # Q, K, V slices
+
     def forward(self, x):
         b, s, _ = x.shape
         q = self.q_proj(x).view(b, s, self.num_heads, self.head_dim)
@@ -697,6 +701,10 @@ class SwiGLUModel(TestModel):
     @property
     def num_gemms_after_fusion(self) -> int:
         return 2  # 1 fused gate+up + 1 down_proj
+
+    @property
+    def expected_narrow_count(self) -> int:
+        return 2  # gate, up slices
 
     def forward(self, x):
         gate = F.silu(self.gate_proj(x))
@@ -812,7 +820,9 @@ def test_fuse_qkv_and_mlp_projections(model_cls, model_kwargs, dtype: str):
     )
 
     narrow_count = _count_split_output_views(gm_transformed)
-    assert narrow_count == 3, f"Expected 3 narrow nodes for QKV/gate+up, got {narrow_count}"
+    assert narrow_count == model.expected_narrow_count, (
+        f"Expected {model.expected_narrow_count} narrow nodes, got {narrow_count}"
+    )
 
     y_transformed = gm_transformed(x)
     assert all_close(y_model, y_transformed, atol=1e-3, rtol=1e-3)
