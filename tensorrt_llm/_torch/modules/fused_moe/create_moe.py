@@ -466,7 +466,8 @@ def create_moe(
                               DenseGEMMFusedMoE)
     if model_config.moe_backend.upper() == "MEGAMOE_DEEPGEMM":
         from .mega_moe import MegaMoEDeepGemmFusedMoE
-        configurable_supported = configurable_supported + (MegaMoEDeepGemmFusedMoE,)
+        configurable_supported = configurable_supported + (
+            MegaMoEDeepGemmFusedMoE, )
     if enable_configurable_moe or moe_cls == CuteDslFusedMoE:
         if moe_cls in configurable_supported:
             return ConfigurableMoE(
