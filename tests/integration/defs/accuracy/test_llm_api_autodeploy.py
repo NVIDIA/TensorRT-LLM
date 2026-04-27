@@ -1047,7 +1047,7 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
             "max_num_tokens": self.MAX_SEQ_LEN,
             "enable_chunked_prefill": True,
             "cuda_graph_config": {
-                "batch_sizes": [1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 320, 384]
+                "batch_sizes": [1, 2, 4, 8, 16, 24, 32, 64]
             },
             "model_kwargs": {
                 "torch_dtype": "bfloat16",
