@@ -510,6 +510,11 @@ class ModelDrafter(Drafter):
             return False
         for request in scheduled_batch.context_requests:
             if request.is_first_context_chunk:
+                # DFlash needs the spec worker forward() to run during first-chunk
+                # prefill so _store_prefill_context can project and store the
+                # captured target hidden states as cross-attention context.
+                if self.spec_config.spec_dec_mode.is_dflash():
+                    return True
                 continue
             return True
 

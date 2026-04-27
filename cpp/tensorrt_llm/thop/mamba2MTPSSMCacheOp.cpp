@@ -55,7 +55,12 @@ void mamba2_mtp_ssm_cache_update(th::Tensor ssm, th::Tensor x, th::Tensor dt, th
     int const head_dim = ssm.size(2);
     int const ssm_dim = ssm.size(3);
 
-    TORCH_CHECK(intermediate_states.dim() == 5 && intermediate_states.size(0) == ssm.size(0)
+    // ssm.size(0) is the Mamba cache capacity — independent of the
+    // current batch (may include parked requests or reserved dummy
+    // slots). intermediate_states is per-step scratch indexed by
+    // intermediate_states_indices in [0, bs), so it only needs to
+    // fit the forward batch.
+    TORCH_CHECK(intermediate_states.dim() == 5 && intermediate_states.size(0) >= bs
             && intermediate_states.size(1) == cache_steps && intermediate_states.size(2) == nheads
             && intermediate_states.size(3) == head_dim && intermediate_states.size(4) == ssm_dim,
         "intermediate_states shape check failed");

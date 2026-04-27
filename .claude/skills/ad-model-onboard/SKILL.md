@@ -1,6 +1,8 @@
 ---
 name: ad-model-onboard
-description: Translates a HuggingFace model into a prefill-only AutoDeploy custom model using reference custom ops, validates with hierarchical equivalence tests.
+description: >
+  Translates a HuggingFace model into a prefill-only AutoDeploy custom model
+  using reference custom ops, validates with hierarchical equivalence tests.
 license: Apache-2.0
 metadata:
   author: NVIDIA Corporation
@@ -436,7 +438,7 @@ Do not report success until a run completes successfully.
 
 1. Prefer `python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry` after adding/updating the registry entry and composable YAMLs (Phase 8–9 style).
 2. `apply_sharding_hints` logs should show **`N nodes processed` with N > 0**.
-3. If validation fails with infrastructure limits (e.g. head count not divisible by `world_size`), document the assert and compatible sizes; do not “fix” core `sharding.py` / custom op schemas without owner review.
+3. If validation fails with infrastructure limits (e.g. head count not divisible by `world_size`), document the assert and compatible sizes; do not "fix" core `sharding.py` / custom op schemas without owner review.
 4. If blocked by missing infrastructure support, rename artifacts to `broken_modeling_*_ir.py` / broken YAML and file a short error report for humans (do not silently patch core transforms).
 
 **Layer type strings** (for `layer_type` / `shard_layers`): use `"mha"`, `"mla"`, `"mlp"`, `"moe"`, `"ssm"`, `"delta"`, or `"unknown"` (default; skipped when `shard_layers` is set). Match the conventions used in `apply_sharding_hints` and project enums.
