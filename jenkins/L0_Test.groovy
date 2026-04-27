@@ -134,6 +134,37 @@ SLURM_INFRA_SINGLE_RETRY_PATTERNS = [
 // Maximum number of retries for infrastructure failures (total attempts = SLURM_INFRA_RETRY_MAX + 1)
 SLURM_INFRA_RETRY_MAX = 2
 
+// Infrastructure failure patterns specific to K8s test pods (the path that does
+// not go through SLURM). Passed as `extraInfraPatterns` to classifyInfraFailure
+// from the runLLMTestlistOnPlatform retry loop. SLURM_INFRA_FAILURE_PATTERNS
+// already covers shared symptoms (ChannelClosedException, marked offline,
+// Reason: Evicted, etc.) and is always checked first.
+K8S_INFRA_FAILURE_PATTERNS = [
+    // Image pull / pod startup
+    "ImagePullBackOff",
+    "ErrImagePull",
+    // Container runtime hiccups
+    "OCI runtime exec failed",
+    // Pod / node lifecycle
+    "OOMKilled",
+    "node status is not ready",
+    // JNLP agent disconnect (trailing space narrows the match)
+    "Cannot contact ",
+    // JNLP / HTTP-handshake transient (broad string -- single-retry-only below)
+    "Connection failed",
+]
+
+// K8s patterns capped at a single retry. Mirrors the SLURM list's caveat:
+// every entry here must also appear in K8S_INFRA_FAILURE_PATTERNS.
+K8S_INFRA_SINGLE_RETRY_PATTERNS = [
+    "OOMKilled",        // resource shortage; multi-retry rarely helps
+    "Connection failed", // short string; cap to bound false-positive cost
+]
+
+// Kept distinct from SLURM_INFRA_RETRY_MAX so the two paths can be tuned
+// independently as production telemetry comes in.
+K8S_INFRA_RETRY_MAX = 2
+
 // ENABLE_NGC_DEVEL_IMAGE_TEST is currently disabled in the Jenkins BuildDockerImageSanityTest job config
 ENABLE_NGC_DEVEL_IMAGE_TEST = params.enableNgcDevelImageTest ?: false
 ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
@@ -142,18 +173,24 @@ COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/nul
 
 /**
  * Checks if an exception represents a transient infrastructure failure
- * that warrants retrying the Slurm job.
+ * that warrants retrying.
  *
  * Walks the exception cause chain to catch wrapped exceptions (e.g.,
  * AbortException wrapping ChannelClosedException).
  *
+ * Callers may pass additional pattern lists (e.g., K8S_INFRA_FAILURE_PATTERNS)
+ * to extend classification for path-specific symptoms without disturbing the
+ * SLURM defaults.
+ *
  * @param ex The caught exception
+ * @param extraInfraPatterns Additional patterns appended to the infra-failure list
+ * @param extraSingleRetryPatterns Additional patterns appended to the single-retry list
  * @return A map with keys:
  *   - isInfraFailure (boolean): true if this is a retryable infra failure
  *   - isSingleRetryOnly (boolean): true if this pattern should only retry once
  *   - matchedPattern (String): the pattern that matched, for logging
  */
-def classifyInfraFailure(Exception ex) {
+def classifyInfraFailure(Exception ex, List extraInfraPatterns=[], List extraSingleRetryPatterns=[]) {
     def result = [isInfraFailure: false, isSingleRetryOnly: false, matchedPattern: ""]
 
     // Build the full exception text by walking the cause chain
@@ -165,8 +202,8 @@ def classifyInfraFailure(Exception ex) {
     }
     def lowerText = exceptionText.toLowerCase()
 
-    // Check against infrastructure failure patterns
-    for (pattern in SLURM_INFRA_FAILURE_PATTERNS) {
+    // Check against infrastructure failure patterns (SLURM defaults + caller extras)
+    for (pattern in (SLURM_INFRA_FAILURE_PATTERNS + extraInfraPatterns)) {
         if (lowerText.contains(pattern.toLowerCase())) {
             result.isInfraFailure = true
             result.matchedPattern = pattern
@@ -179,7 +216,7 @@ def classifyInfraFailure(Exception ex) {
     }
 
     // Check if this is a single-retry-only pattern
-    for (pattern in SLURM_INFRA_SINGLE_RETRY_PATTERNS) {
+    for (pattern in (SLURM_INFRA_SINGLE_RETRY_PATTERNS + extraSingleRetryPatterns)) {
         if (lowerText.contains(pattern.toLowerCase())) {
             result.isSingleRetryOnly = true
             break
@@ -3027,45 +3064,115 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
 def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", typeCheck=false)
 {
-    cacheErrorAndUploadResult(stageName, {
-        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, typeCheck)
-    }, {
-        if (testFilter[(DEBUG_MODE)]) {
-            try {
-                timeout(time: 2, unit: 'HOURS') {
-                    input message: "Pause 2 hours for Post-Debug. Please press the button to proceed when you finish debugging."
+    // One full attempt of the K8s test path. The retry loop below calls this
+    // with `effectivePostTag = postTag + attemptTag` so each attempt's tar and
+    // ensureStageResultNotUploaded guard key are unique. The two closures below
+    // are unchanged from the pre-retry implementation; they simply now run
+    // under a retry-aware caller.
+    def runOnce = { String effectivePostTag ->
+        cacheErrorAndUploadResult(stageName, {
+            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, typeCheck)
+        }, {
+            if (testFilter[(DEBUG_MODE)]) {
+                try {
+                    timeout(time: 2, unit: 'HOURS') {
+                        input message: "Pause 2 hours for Post-Debug. Please press the button to proceed when you finish debugging."
+                    }
+                } catch (InterruptedException e) {
+                    echo "Post-debug session was interrupted by user or timeout"
+                    currentBuild.result = 'ABORTED'
+                    error("Pipeline aborted during post-debug session")
+                } catch (Exception e) {
+                    echo "An error occurred during post-debug session: ${e.message}"
+                    currentBuild.result = 'FAILURE'
+                    error("Error in post-debug session: ${e.message}")
                 }
-            } catch (InterruptedException e) {
-                echo "Post-debug session was interrupted by user or timeout"
-                currentBuild.result = 'ABORTED'
-                error("Pipeline aborted during post-debug session")
-            } catch (Exception e) {
-                echo "An error occurred during post-debug session: ${e.message}"
-                currentBuild.result = 'FAILURE'
-                error("Error in post-debug session: ${e.message}")
             }
+            // If the execution test list is null, remove the test result xml
+            sh """
+                ls -all ${stageName}/
+                if ! grep -q '<testcase' ${stageName}/results.xml; then
+                    rm ${stageName}/results.xml || true
+                fi
+            """
+            def llmPath = sh (script: "realpath .", returnStdout: true).trim()
+            def llmSrc = "${llmPath}/${LLM_ROOT}${config}/TensorRT-LLM/src"
+            // CPP tests will generate test result in ${llmSrc}/cpp/build_backup/, move these files to job result folder
+            sh "ls -all ${llmSrc}/cpp/build_backup/ || true"
+            sh "ls -all ${llmSrc}/cpp/build/ || true"
+            // Sed for CPP test result
+            sh "cd ${llmSrc}/cpp/build_backup/ && sed -i 's/\" classname=\"/\" classname=\"${stageName}./g' *.xml || true"
+            sh "cd ${llmSrc}/cpp/build_backup/ && sed -i 's/testsuite name=\"[^\"]*\"/testsuite name=\"${stageName}\"/g' *.xml || true"
+            // Sed for Pytest result
+            sh "cd ${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' *.xml || true"
+            // Copy CPP test result
+            sh "cp ${llmSrc}/cpp/build_backup/*.xml ${stageName} || true"
+            sh "ls -al ${stageName}/"
+        }, false, effectivePostTag)
+    }
+
+    // DEBUG_MODE is opt-in for human inspection of a failed pod. The 2-hour
+    // input prompt inside the finallyRunner above is the inspection point;
+    // auto-retrying would either fire that prompt repeatedly or silently
+    // discard the human's debug session. Take a single shot only.
+    if (testFilter[(DEBUG_MODE)]) {
+        runOnce(postTag)
+        return
+    }
+
+    def attempt = 0
+    while (true) {
+        attempt++
+        try {
+            if (attempt > 1) {
+                echo "[INFRA-RETRY] ${stageName}: Starting attempt ${attempt} of ${K8S_INFRA_RETRY_MAX + 1}"
+            }
+            // Attempt 1 keeps the caller-supplied postTag verbatim so the
+            // canonical artifact name is unchanged for downstream consumers.
+            // Retries append "-attempt-N" to dodge the upload-once guard and
+            // preserve every attempt's tarball in Artifactory.
+            def attemptTag = (attempt == 1) ? "" : "-attempt-${attempt}"
+            def effectivePostTag = postTag + attemptTag
+
+            runOnce(effectivePostTag)
+
+            if (attempt > 1) {
+                echo "[INFRA-RETRY] ${stageName}: Succeeded on attempt ${attempt}"
+            }
+            return
+        } catch (InterruptedException e) {
+            // User abort / pipeline timeout -- never retry
+            throw e
+        } catch (Exception e) {
+            // FlowInterruptedException may not extend InterruptedException in all Jenkins versions
+            if (e.toString().contains("FlowInterruptedException") ||
+                e.toString().contains("AbortException: script returned exit code 143")) {
+                throw e
+            }
+
+            def classification = classifyInfraFailure(e, K8S_INFRA_FAILURE_PATTERNS, K8S_INFRA_SINGLE_RETRY_PATTERNS)
+
+            if (!classification.isInfraFailure) {
+                // Not an infrastructure failure (test failure, compilation error, etc.)
+                throw e
+            }
+
+            def effectiveMax = classification.isSingleRetryOnly ? 1 : K8S_INFRA_RETRY_MAX
+
+            if (attempt > effectiveMax) {
+                echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${classification.matchedPattern}) " +
+                     "but max retries (${effectiveMax}) exhausted after ${attempt} attempts. Failing."
+                throw e
+            }
+
+            echo "[INFRA-RETRY] ${stageName}: Infrastructure failure detected on attempt ${attempt}: " +
+                 "${classification.matchedPattern}"
+            echo "[INFRA-RETRY] ${stageName}: Exception: ${e.toString()}"
+            echo "[INFRA-RETRY] ${stageName}: Will retry (attempt ${attempt + 1} of ${effectiveMax + 1}) after 60s cooldown."
+
+            sleep(60)
         }
-        // If the execution test list is null, remove the test result xml
-        sh """
-            ls -all ${stageName}/
-            if ! grep -q '<testcase' ${stageName}/results.xml; then
-                rm ${stageName}/results.xml || true
-            fi
-        """
-        def llmPath = sh (script: "realpath .", returnStdout: true).trim()
-        def llmSrc = "${llmPath}/${LLM_ROOT}${config}/TensorRT-LLM/src"
-        // CPP tests will generate test result in ${llmSrc}/cpp/build_backup/, move these files to job result folder
-        sh "ls -all ${llmSrc}/cpp/build_backup/ || true"
-        sh "ls -all ${llmSrc}/cpp/build/ || true"
-        // Sed for CPP test result
-        sh "cd ${llmSrc}/cpp/build_backup/ && sed -i 's/\" classname=\"/\" classname=\"${stageName}./g' *.xml || true"
-        sh "cd ${llmSrc}/cpp/build_backup/ && sed -i 's/testsuite name=\"[^\"]*\"/testsuite name=\"${stageName}\"/g' *.xml || true"
-        // Sed for Pytest result
-        sh "cd ${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' *.xml || true"
-        // Copy CPP test result
-        sh "cp ${llmSrc}/cpp/build_backup/*.xml ${stageName} || true"
-        sh "ls -al ${stageName}/"
-    }, false, postTag)
+    }
 }
 
 
