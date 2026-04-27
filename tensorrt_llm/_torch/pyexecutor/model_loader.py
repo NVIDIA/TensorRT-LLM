@@ -97,12 +97,14 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
 
 def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
                                              kv_cache_config) -> None:
-    """Validate encoder-decoder KV-cache requirements for the PyTorch runtime."""
+    """Validate encoder-decoder KV-cache requirements for the PyTorch runtime.
+
+    Both V1 (``KVCacheManager``, default and production target) and V2
+    (``KVCacheManagerV2``, additive secondary path) are supported for
+    encoder-decoder models.  Both paths require ``cross_kv_cache_fraction``
+    so the cross-attention pool can be sized.
+    """
     if model_config.is_encoder_decoder:
-        if not kv_cache_config.use_kv_cache_manager_v2:
-            raise ValueError(
-                "Encoder-decoder models require kv_cache_config.use_kv_cache_manager_v2=True."
-            )
         if kv_cache_config.cross_kv_cache_fraction is None:
             raise ValueError(
                 "Encoder-decoder models require kv_cache_config.cross_kv_cache_fraction to be set."

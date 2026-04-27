@@ -143,7 +143,14 @@ def test_model_config_sets_is_encoder_decoder_from_pretrained_config():
     assert model_config.is_encoder_decoder is True
 
 
-def test_validate_encoder_decoder_kv_cache_config_requires_v2():
+def test_validate_encoder_decoder_kv_cache_config_accepts_v1_enc_dec():
+    """V1 KVCacheManager is the default and production target for enc-dec models.
+
+    The historical V2-only assertion has been removed in Step 5 of the
+    encoder-decoder porting work; both V1 (default) and V2 (additive
+    secondary path) are now accepted as long as ``cross_kv_cache_fraction``
+    is set.
+    """
     model_config = ModelConfig(
         pretrained_config=make_pretrained_config(
             head_dim=4,
@@ -151,11 +158,10 @@ def test_validate_encoder_decoder_kv_cache_config_requires_v2():
         )
     )
 
-    with pytest.raises(ValueError, match="use_kv_cache_manager_v2=True"):
-        validate_encoder_decoder_kv_cache_config(
-            model_config,
-            _make_kv_cache_config(cross_kv_cache_fraction=0.5),
-        )
+    validate_encoder_decoder_kv_cache_config(
+        model_config,
+        _make_kv_cache_config(use_kv_cache_manager_v2=False, cross_kv_cache_fraction=0.5),
+    )
 
 
 def test_validate_encoder_decoder_kv_cache_config_requires_cross_fraction():
