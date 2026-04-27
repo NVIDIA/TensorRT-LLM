@@ -609,6 +609,15 @@ def trtllm_mha_with_cache(
         _GlobalTrtllmPlanner.get_layer_tensors(kv_cache, kv_scale_orig_quant, kv_scale_quant_orig)
     )
 
+    # When FP8 KV cache is active but no out_scale was provided by the graph
+    # transform, force FP8 output so the FMHA kernel selects compatible cubins.
+    # Some architectures (e.g. sm_89) lack cubins for the mixed
+    # E4M3-input / BF16-output paged-KV configuration.  After the kernel call
+    # the output is cast back to the original dtype.
+    _dequant_output = kv_cache.dtype == torch.float8_e4m3fn and out_scale is None
+    if _dequant_output:
+        out_scale = kv_scale_oq
+
     # Fused-QKV mode: when ``fuse_rope_into_trtllm_attention`` traces back to a
     # single fused QKV GEMM output, ``q`` is the flat ``(B, S, total_qkv_dim)``
     # tensor and the K/V args are aliases of it; skip split + reshape + cat.
@@ -764,6 +773,10 @@ def trtllm_mha_with_cache(
         if total_padded_tokens > num_tokens:
             out_flat[num_tokens:].zero_()
         return out.new_empty(0)
+
+    # Cast forced-FP8 output back to the caller's expected dtype.
+    if _dequant_output:
+        output = output.to(q.dtype)
 
     return output.view(*q_shape_og)
 
