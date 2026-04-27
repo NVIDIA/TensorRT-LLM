@@ -206,25 +206,44 @@ class BindCapacityScheduler(CapacityScheduler):
         kv_cache_manager,
         peft_cache_manager: tb_internal.batch_manager.PeftCacheManager | None,
         scheduler_policy: CapacitySchedulerPolicy = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+        *,
+        cross_kv_cache_manager=None,
         two_step_lookahead: bool = False,
+        no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
     ):
+        """C++-bound capacity scheduler wrapper.
+
+        ``cross_kv_cache_manager`` enables encoder-decoder dual-pool
+        scheduling (V1 path).  When provided, callers should also pass
+        ``no_schedule_until_state=LlmRequestState.ENCODER_INIT`` so the
+        scheduler admits requests already in ``ENCODER_INIT`` for the
+        encoder loop.  The C++ ``CapacityScheduler`` already accepts a
+        cross manager in its ``__call__`` (legacy enc-dec relies on this);
+        the Python wrapper just widens its signature to expose it.
+        """
         super(BindCapacityScheduler, self).__init__()
         self.kv_cache_manager = kv_cache_manager
         self.peft_cache_manager = peft_cache_manager
+        self.cross_kv_cache_manager = cross_kv_cache_manager
 
         self.impl = tb_internal.algorithms.CapacityScheduler(
             max_num_requests=max_num_requests,
             capacity_scheduler_policy=scheduler_policy._to_pybind(),
             has_kv_cache_manager=kv_cache_manager is not None,
             two_step_lookahead=two_step_lookahead,
-            no_schedule_until_state=LlmRequestState.CONTEXT_INIT,
+            no_schedule_until_state=no_schedule_until_state,
             no_schedule_after_state=LlmRequestState.GENERATION_COMPLETE,
         )
 
     def schedule_request(
         self, active_requests: RequestList
     ) -> tuple[list[LlmRequest], list[LlmRequest], list[LlmRequest]]:
-        return self.impl(active_requests, self.kv_cache_manager, self.peft_cache_manager)
+        return self.impl(
+            active_requests,
+            self.kv_cache_manager,
+            self.peft_cache_manager,
+            self.cross_kv_cache_manager,
+        )
 
 
 class MicroBatchScheduler(ABC):
@@ -1468,6 +1487,7 @@ class SimpleUnifiedScheduler(RequestScheduler):
         cross_kv_cache_manager=None,
         two_step_lookahead: bool = False,
         scheduler_capacity: Optional[int] = None,
+        no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
     ):
         # Use scheduler_capacity if provided, otherwise fall back to max_batch_size
         # scheduler_capacity may differ from max_batch_size (e.g., adjusted for attention_dp + disagg)
@@ -1482,6 +1502,7 @@ class SimpleUnifiedScheduler(RequestScheduler):
             scheduler_policy=scheduler_policy,
             cross_kv_cache_manager=cross_kv_cache_manager,
             two_step_lookahead=two_step_lookahead,
+            no_schedule_until_state=no_schedule_until_state,
         )
 
         # 2. Initialize Python MicroBatch Scheduler
@@ -1505,6 +1526,7 @@ class SimpleUnifiedScheduler(RequestScheduler):
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
             ctx_chunk_config=py_chunk_config,
+            no_schedule_until_state=no_schedule_until_state,
         )
 
     def schedule_request(

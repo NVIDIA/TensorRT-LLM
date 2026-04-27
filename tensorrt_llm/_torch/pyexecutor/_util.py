@@ -35,7 +35,7 @@ from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
-from .llm_request import ExecutorResponse
+from .llm_request import ExecutorResponse, LlmRequestState
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
@@ -897,19 +897,24 @@ class KvCacheCreator:
         cross_kv_cache_config: KvCacheConfig,
         estimating_kv_cache: bool = False,
     ) -> KVCacheManager:
-        """Create a KVCacheManagerV2 for the cross-attention pool.
+        """Create a KV cache manager for the cross-attention pool.
 
         The cross pool stores encoder K/V projections that are written once
         during the first decoder context step and read on every subsequent
         decoder generation step. It uses ``CacheType.CROSS`` with decoder
         layer count but encoder-side KV geometry.
+
+        The manager class mirrors the self pool (``KVCacheManager`` for V1,
+        ``KVCacheManagerV2`` for V2) so that both pools share the same
+        runtime ABI and scheduler integration. V1 is the default and the
+        production target for encoder-decoder models.
         """
         (num_layers, num_kv_heads, head_dim,
          max_seq_len) = self._get_cross_kv_cache_layout()
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         return _create_kv_cache_manager(
             model_engine=self._model_engine,
-            kv_cache_manager_cls=KVCacheManagerV2,
+            kv_cache_manager_cls=self._kv_cache_manager_cls,
             mapping=self._mapping,
             kv_cache_config=cross_kv_cache_config,
             tokens_per_block=self._tokens_per_block,
@@ -1546,6 +1551,14 @@ def create_py_executor_instance(
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
 
+    # For encoder-decoder models, requests start in ENCODER_INIT and the
+    # capacity scheduler must admit them already at that state so the
+    # encoder loop can run. Decoder-only deployments keep the default
+    # CONTEXT_INIT gating.
+    no_schedule_until_state = (LlmRequestState.ENCODER_INIT
+                               if cross_kv_cache_manager is not None else
+                               LlmRequestState.CONTEXT_INIT)
+
     if isinstance(kv_cache_manager, KVCacheManagerV2):
         # V2: interleaved scheduler handles both capacity and budget
         draft_kv_cache_manager = resources.get(
@@ -1576,15 +1589,21 @@ def create_py_executor_instance(
             if peft_cache_manager is not None else None,
             scheduler_policy=scheduler_config.capacity_scheduler_policy,
             ctx_chunk_config=ctx_chunk_config,
+            cross_kv_cache_manager=cross_kv_cache_manager.impl
+            if cross_kv_cache_manager is not None else None,
             two_step_lookahead=mapping.has_pp(),
-            scheduler_capacity=scheduler_capacity)
+            scheduler_capacity=scheduler_capacity,
+            no_schedule_until_state=no_schedule_until_state)
     else:
         capacity_scheduler = BindCapacityScheduler(
             scheduler_capacity,
             kv_cache_manager.impl if kv_cache_manager is not None else None,
             peft_cache_manager.impl if peft_cache_manager is not None else None,
             scheduler_config.capacity_scheduler_policy,
-            two_step_lookahead=mapping.has_pp())
+            cross_kv_cache_manager=cross_kv_cache_manager.impl
+            if cross_kv_cache_manager is not None else None,
+            two_step_lookahead=mapping.has_pp(),
+            no_schedule_until_state=no_schedule_until_state)
 
         mb_scheduler = BindMicroBatchScheduler(max_batch_size, max_num_tokens,
                                                ctx_chunk_config)
