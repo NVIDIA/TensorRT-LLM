@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # yapf: disable
 from .minimax_m3 import (MiniMaxM3SparseAttention,
                          MiniMaxM3SparseAttentionMetadata,
@@ -8,10 +11,10 @@ from .minimax_m3 import (MiniMaxM3SparseAttention,
                          get_minimax_m3_kv_cache_manager_cls,
                          minimax_m3_sparse_decode, minimax_m3_sparse_prefill)
 # yapf: enable
-from .utils import (get_flashinfer_sparse_attn_attention_backend,
-                    get_sparse_attn_kv_cache_manager,
-                    get_trtllm_sparse_attn_attention_backend,
-                    get_vanilla_sparse_attn_attention_backend)
+from .registry import (get_flashinfer_sparse_attn_attention_backend,
+                       get_sparse_attn_kv_cache_manager,
+                       get_trtllm_sparse_attn_attention_backend,
+                       get_vanilla_sparse_attn_attention_backend)
 
 __all__ = [
     "get_sparse_attn_kv_cache_manager",

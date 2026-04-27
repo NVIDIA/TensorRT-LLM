@@ -137,8 +137,8 @@ KV eviction are tracked as future work.
 subclasses override:
 
 ```python
-sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(q, k, metadata, **kwargs)
-sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(q, k, metadata, **kwargs)
+sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(q, k, metadata, forward_args)
+sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(q, k, metadata, forward_args)
 ```
 
 Different KV heads are allowed to emit different sparse index sets; Q
@@ -147,9 +147,14 @@ heads that map to the same KV head share the KV head's sparse pattern.
 Algorithm implementations live under
 `tensorrt_llm/_torch/attention_backend/sparse/`:
 
-- `rocket.py`, `dsa.py` — concrete algorithms.
-- `kernel.py` — custom Triton kernels (importance scoring, Top-K).
-- `utils.py` — dispatch helpers.
+- `rocket/` — RocketKV backend, metadata, cache manager, parameters, and kernels.
+- `dsa/` — DSA backend, indexer, metadata, cache manager, parameters, custom ops, and kernels.
+- `deepseek_v4/` — DeepSeek-V4 sparse MLA modules and index conversion kernels.
+- `skip_softmax/` — SkipSoftmax parameter parsing and runtime scheduler.
+- `kernels/` — kernels shared by multiple sparse algorithms (importance scoring, Top-K).
+- `prediction.py` — common prediction-hook orchestration and payload construction.
+- `registry.py` — backend, metadata, and cache-manager dispatch helpers.
+- `mla.py` — sparse MLA phase dispatch shared by DSA and DeepSeek-V4.
 
 ### AttentionOp behavior
 
@@ -231,7 +236,7 @@ Create a new backend class inheriting from `TrtllmAttention` (or
 `tensorrt_llm/_torch/attention_backend/sparse/`. Override one or both
 prediction methods.
 
-**`sparse_kv_predict(self, q, k, metadata, **kwargs)`**
+**`sparse_kv_predict(self, q, k, metadata, forward_args)`**
 
 - **Behavior**: return the indices of tokens to retain in the KV cache.
 - **Outputs**:
@@ -245,7 +250,7 @@ prediction methods.
   in-place gather (`updateSparseKvCacheAfterFmha`) is safe. The sort
   cost buys compatibility with chunked prefill and similar features.
 
-**`sparse_attn_predict(self, q, k, metadata, **kwargs)`**
+**`sparse_attn_predict(self, q, k, metadata, forward_args)`**
 
 - **Behavior**: return the sparse indices used by the generation-phase
   attention computation.
@@ -285,7 +290,7 @@ If the algorithm needs extra tensors beyond the main KV cache:
 ### 4. Registration and dispatch
 
 - Register the new config + backend in
-  `tensorrt_llm/_torch/attention_backend/sparse/utils.py` and
+  `tensorrt_llm/_torch/attention_backend/sparse/registry.py` and
   `tensorrt_llm/_torch/pyexecutor/_util.py` so the runtime routes
   requests to your backend when the config is present.
 - If your algorithm exposes new C++ parameters, plumb them through
@@ -318,5 +323,6 @@ for the kernel-side specifics.
   eviction as a compromise that keeps KV cache flexibility manageable.
 - **Unified auxiliary memory management** — let custom auxiliary pools
   inherit KV-cache features (reuse, offloading) by default.
-- **Code refactoring** — as more algorithms land, unify the
-  framework-level scaffolding for maintainability.
+- **Additional shared contracts** — continue moving only genuinely common
+  payload and lifecycle behavior into the sparse framework while keeping
+  algorithm-specific module orchestration inside each algorithm package.

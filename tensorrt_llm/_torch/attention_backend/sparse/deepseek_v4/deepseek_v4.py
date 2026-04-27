@@ -44,8 +44,8 @@ from ..dsa import (
     Indexer,
     rotate_activation,
 )
-from ..kernel import deepseek_v4_local_to_global_indices
 from .compressor import Compressor, KVCacheDtype, resolve_kv_cache_dtype
+from .kernels import deepseek_v4_local_to_global_indices
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig

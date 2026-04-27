@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # --------------------------------------------------
 # Portions of this code were derived from DeepSeek‑V3:
 #   https://github.com/deepseek-ai/DeepSeek-V3
@@ -816,8 +819,6 @@ class DeepseekV32Attention(MLA):
                          aux_stream=aux_stream,
                          mapping_with_cp=mapping_with_cp,
                          reduce_output=reduce_output)
-
-        self.indexer = self.mqa.indexer
 
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,

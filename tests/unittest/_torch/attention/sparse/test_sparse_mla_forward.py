@@ -31,6 +31,8 @@ from tensorrt_llm._torch.attention_backend.interface import (
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
     DeepseekV4CacheManager, make_deepseek_v4_sparse_metadata_params)
 from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
+from tensorrt_llm._torch.attention_backend.sparse.mla import (
+    forward_context_sparse_mla, forward_generation_sparse_mla)
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -1436,7 +1438,8 @@ def mla_forward_impl_with_dsa_wo_linear(mla, attn_metadata, q, qr,
         # Transform context indices from local to global
         ctx_topk_local = topk_indices_local[:num_ctx_tokens]
 
-        mla.forward_context_sparse_mla(
+        forward_context_sparse_mla(
+            mla,
             q=q[:num_ctx_tokens],
             compressed_kv=compressed_kv[:num_ctx_tokens],
             k_pe=k_pe[:num_ctx_tokens],
@@ -1453,7 +1456,8 @@ def mla_forward_impl_with_dsa_wo_linear(mla, attn_metadata, q, qr,
         # Transform generation indices from local to global
         gen_topk_local = topk_indices_local[num_ctx_tokens:num_ctx_tokens +
                                             num_gen_tokens]
-        mla.forward_generation_sparse_mla(
+        forward_generation_sparse_mla(
+            mla,
             q=q[num_ctx_tokens:],
             compressed_kv=compressed_kv[num_ctx_tokens:],
             k_pe=k_pe[num_ctx_tokens:],
@@ -1530,7 +1534,8 @@ def mla_forward_impl_with_deepseek_v4_wo_linear(mla,
     if num_contexts > 0:
         ctx_topk_local = topk_indices_for_forward[:num_ctx_tokens]
 
-        mla.forward_context_sparse_mla(
+        forward_context_sparse_mla(
+            mla,
             q=q[:num_ctx_tokens],
             compressed_kv=compressed_kv[:num_ctx_tokens],
             k_pe=k_pe[:num_ctx_tokens],
@@ -1548,7 +1553,8 @@ def mla_forward_impl_with_deepseek_v4_wo_linear(mla,
     if num_generations > 0:
         gen_topk_local = topk_indices_for_forward[num_ctx_tokens:num_tokens]
 
-        mla.forward_generation_sparse_mla(
+        forward_generation_sparse_mla(
+            mla,
             q=q[num_ctx_tokens:],
             compressed_kv=compressed_kv[num_ctx_tokens:],
             k_pe=k_pe[num_ctx_tokens:],

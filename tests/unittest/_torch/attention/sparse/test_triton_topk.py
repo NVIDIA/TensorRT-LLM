@@ -1,7 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.kernel import triton_topk
+from tensorrt_llm._torch.attention_backend.sparse.kernels import triton_topk
 
 
 def pytorch_reference_topk(

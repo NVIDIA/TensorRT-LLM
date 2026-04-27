@@ -266,13 +266,13 @@ The same pattern (`@torch.library.custom_op("trtllm::...")`, `register_fake`, co
 
 - **The kernel.** [`cpp/tensorrt_llm/kernels/IndexerKCacheScatter.h`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/IndexerKCacheScatter.h) declares `invokeIndexerKCacheScatter(...)`; [`cpp/tensorrt_llm/kernels/indexerKCacheScatter.cu`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/kernels/indexerKCacheScatter.cu) defines the `__global__` kernel and the host launcher. Picked up automatically by the `*.cu` glob in `cpp/tensorrt_llm/kernels/CMakeLists.txt`.  
 - **The binding.** [`cpp/tensorrt_llm/thop/IndexerKCacheScatterOp.cpp`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/thop/IndexerKCacheScatterOp.cpp) validates inputs, fetches the stream, and calls the launcher; registers the op via `TORCH_LIBRARY_FRAGMENT(trtllm, m)` and `TORCH_LIBRARY_IMPL(trtllm, CUDA, m)`. A one-line addition to [`cpp/tensorrt_llm/thop/CMakeLists.txt`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/tensorrt_llm/thop/CMakeLists.txt) wires it into `th_common` (this directory is not globbed).  
-- **The integration.** In [`tensorrt_llm/_torch/attention_backend/sparse/dsa.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/attention_backend/sparse/dsa.py), `_update_k_cache` calls `torch.ops.trtllm.indexer_k_cache_scatter_op(...)` in place of the prior Python scatter loop.  
+- **The integration.** In [`tensorrt_llm/_torch/attention_backend/sparse/dsa/indexer.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/attention_backend/sparse/dsa/indexer.py), `_update_k_cache` calls `torch.ops.trtllm.indexer_k_cache_scatter_op(...)` in place of the prior Python scatter loop.
 - **The tests.** [`tests/unittest/_torch/attention/sparse/test_dsa_indexer.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/unittest/_torch/attention/sparse/test_dsa_indexer.py) — `test_indexer_k_cache_scatter_custom_op` runs the CUDA op against a PyTorch reference on two layers of the same cache pool and asserts the outputs match.
 
 The full call chain is three lines:
 
 ```py
-# tensorrt_llm/_torch/attention_backend/sparse/dsa.py
+# tensorrt_llm/_torch/attention_backend/sparse/dsa/indexer.py
 torch.ops.trtllm.indexer_k_cache_scatter_op(
     k_fp8, k_scale, k_cache,
     metadata.slot_mapping_fp8, metadata.slot_mapping_scale,

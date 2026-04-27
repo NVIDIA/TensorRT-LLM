@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 from typing import Callable, List, Union
 
@@ -71,9 +74,6 @@ def inplace_info():
             2: "output_sf"
         },
         torch.ops.trtllm.mla_custom_op_inplace.default: {
-            1: "output"
-        },
-        torch.ops.trtllm.mla_dsa_attn_inplace.default: {
             1: "output"
         },
         torch.ops.trtllm.fused_qk_norm_rope.default: {
@@ -170,6 +170,11 @@ def inplace_info():
             7: "acceptToken"
         }
     }
+    # DSA custom op is only registered when the DSA backend is loaded.
+    if hasattr(torch.ops.trtllm, "mla_dsa_attn_inplace"):
+        inplace_map[torch.ops.trtllm.mla_dsa_attn_inplace.default] = {
+            1: "output"
+        }
     if IS_CUDA_TILE_AVAILABLE:
         # cuda.tile availability depends on GPU capability thus runtime check.
         inplace_map[
