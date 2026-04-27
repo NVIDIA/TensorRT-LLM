@@ -500,9 +500,6 @@ l0_h100:
   - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_fp8[True]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[bf16-1-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-trtllm]
-  - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[draft_target]
-  - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[eagle3]
-  - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_acceptance_rate
   - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_one_model_acceptance_rate[trtllm-torch-cudagraph]
   - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_one_model_acceptance_rate[flashinfer-torch-simple]
   - examples/test_ad_speculative_decoding.py::test_eagle_model_with_weights

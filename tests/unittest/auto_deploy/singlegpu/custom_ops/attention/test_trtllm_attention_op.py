@@ -792,7 +792,7 @@ class TestTrtllmAttentionMetadata:
         _nest_prefill(info, context_length=8)
         _prepare_from_sequence_info(info)
 
-        assert not _GlobalTrtllmPlanner.is_spec_decoding_enabled
+        assert not _GlobalTrtllmPlanner.is_spec_dec_active
         assert _GlobalTrtllmPlanner.spec_decoding_generation_lengths is None
         assert _GlobalTrtllmPlanner.spec_decoding_position_offsets is None
         assert _GlobalTrtllmPlanner.spec_decoding_packed_mask is None
@@ -802,11 +802,7 @@ class TestTrtllmAttentionMetadata:
         _nest_prefill(info, context_length=8)
         _prepare_from_sequence_info(info, spec_config=_DummySpecConfig(max_draft_len=3))
 
-        assert _GlobalTrtllmPlanner.is_spec_decoding_enabled
-        assert _GlobalTrtllmPlanner.spec_decoding_bool_params[0] is True
-
-        # [1] defaults to True to match the PyTorch backend.
-        assert _GlobalTrtllmPlanner.spec_decoding_bool_params[1] is True
+        assert _GlobalTrtllmPlanner.is_spec_dec_active
 
         assert _GlobalTrtllmPlanner.spec_decoding_generation_lengths is not None
         assert _GlobalTrtllmPlanner.spec_decoding_position_offsets is not None

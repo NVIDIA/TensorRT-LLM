@@ -102,6 +102,19 @@ class _TrtllmPlanner:
         ] = {}
         # Spec-dec state for Eagle linear chain.
         # Initialized once in prepare_trtllm_metadata_host when spec_config is provided.
+        #
+        # Two flags with distinct semantics:
+        #   - ``is_spec_dec_active``: spec-dec has been initialized for this planner.
+        #     Used as the idempotency guard for ``init_spec_decoding`` and gates
+        #     planner-level per-graph work (see use sites for why).
+        #   - ``is_spec_decoding_enabled``: the attention kernel uses spec-dec mode (i.e.
+        #     ``spec_decoding_bool_params[0]`` is True). Mirrors the PyTorch backend's
+        #     ``is_spec_decoding_enabled`` (see ``tensorrt_llm/_torch/attention_backend/
+        #     trtllm.py:1567-1570``). Forced False on Blackwell (SM100+, except 120/121)
+        #     because thop.attention routes through a trtllm-Gen FMHA spec-dec branch
+        #     (``cpp/tensorrt_llm/thop/attentionOp.cpp:499-526``) that requires extra
+        #     bl_tree mask tensors AutoDeploy does not produce for Eagle linear chains.
+        self.is_spec_dec_active: bool = False
         self.is_spec_decoding_enabled: bool = False
         self.spec_decoding_generation_lengths: Optional[torch.Tensor] = None
         self.spec_decoding_position_offsets: Optional[torch.Tensor] = None
@@ -112,7 +125,7 @@ class _TrtllmPlanner:
         # per-layer list-building overhead.
         #
         # spec_decoding_bool_params:
-        #   [0] is_spec_decoding_enabled: runtime supports spec-dec (True if spec-dec configured)
+        #   [0] is_spec_decoding_enabled: kernel enters spec-dec branch (False on Blackwell)
         #   [1] use_spec_decoding: use spec-dec THIS forward
         #   [2] is_spec_dec_tree: draft is a tree structure (False for linear Eagle chain)
         #
@@ -158,9 +171,9 @@ class _TrtllmPlanner:
         # Blackwell+ SMs (excluding 120/121 consumer variants) expect an extended spec-dec tensor
         # list with three trailing tree-mask Nones. Size the list accordingly. Contents stay as
         # Nones until init_spec_decoding populates the first three entries.
-        sm_version = get_sm_version()
-        needs_tree_mask_slots = not (sm_version < 100 or sm_version in (120, 121))
-        self.spec_decoding_tensor_params = [None] * (6 if needs_tree_mask_slots else 3)
+        self.spec_decoding_tensor_params = [None] * (
+            6 if _is_blackwell_trtllm_gen_kernel(get_sm_version()) else 3
+        )
 
     def init_spec_decoding(self, max_batch: int, max_draft_len: int) -> None:
         """Initialize persistent spec-decoding tensors once when configured.
@@ -169,11 +182,15 @@ class _TrtllmPlanner:
         via ``BatchInfo.get_max_draft_len() > 0``); this method is idempotent
         and no-ops on subsequent calls.
         """
-        if self.is_spec_decoding_enabled:
+        if self.is_spec_dec_active:
             return
 
         draft_len = max_draft_len
-        self.is_spec_decoding_enabled = True
+        self.is_spec_dec_active = True
+        # Mirror PyTorch backend's ``trtllm.py:1567-1570``: kernel-level spec-dec
+        # is unsupported on Blackwell SMs that route through the trtllm-Gen FMHA
+        # spec-dec branch.
+        self.is_spec_decoding_enabled = not _is_blackwell_trtllm_gen_kernel(get_sm_version())
 
         assert self.block_offsets is not None, (
             "self.block_offsets should be initialized before _scratch_block_offsets."
@@ -187,18 +204,19 @@ class _TrtllmPlanner:
         )
         self.spec_decoding_packed_mask = _generate_spec_decoding_packed_mask(max_batch, draft_len)
 
-        # Populate the pre-packed spec-dec params (static references).
-        #
-        # spec_decoding_bool_params[0] is the required static
-        # "spec-dec configured" flag.
-        # spec_decoding_bool_params[1] is set to True during target model forward to match the PyTorch
-        # backend.
-        self.spec_decoding_bool_params[0] = True
-        self.spec_decoding_bool_params[1] = True
+        # Populate the pre-packed spec-dec params (static references). Only do this when
+        # the kernel actually enters the spec-dec branch; on Blackwell we leave the bools
+        # False and the tensor slots None so attentionOp.cpp's spec-dec block is skipped.
+        if self.is_spec_decoding_enabled:
+            # spec_decoding_bool_params[0] gates the C++ spec-dec branch.
+            # spec_decoding_bool_params[1] is set to True during target model forward to
+            # match the PyTorch backend.
+            self.spec_decoding_bool_params[0] = True
+            self.spec_decoding_bool_params[1] = True
 
-        self.spec_decoding_tensor_params[0] = self.spec_decoding_generation_lengths
-        self.spec_decoding_tensor_params[1] = self.spec_decoding_position_offsets
-        self.spec_decoding_tensor_params[2] = self.spec_decoding_packed_mask
+            self.spec_decoding_tensor_params[0] = self.spec_decoding_generation_lengths
+            self.spec_decoding_tensor_params[1] = self.spec_decoding_position_offsets
+            self.spec_decoding_tensor_params[2] = self.spec_decoding_packed_mask
 
     def get_layer_tensors(
         self,
@@ -338,6 +356,12 @@ def get_trtllm_rope_info(attn_node: Node) -> Optional[dict]:
     return attn_node.meta.get(_TRTLLM_ROPE_INFO_KEY)
 
 
+# Mirrors tensorrt_llm/_torch/attention_backend/trtllm.py::TrtllmAttention.is_sm_version_trtllm_gen_kernel
+def _is_blackwell_trtllm_gen_kernel(sm: int) -> bool:
+    """Whether thop.attention routes through the trtllm-Gen FMHA kernel on this SM."""
+    return not (sm < 100 or sm in (120, 121))
+
+
 # Adapted from tensorrt_llm/_torch/attention_backend/trtllm.py::generate_spec_decoding_position_offsets
 def _generate_spec_decoding_position_offsets(max_num_requests: int, draft_len: int) -> torch.Tensor:
     width = draft_len + 1
@@ -441,13 +465,19 @@ def prepare_trtllm_metadata(
     creating an explicit data dependency.
     """
     batch_info = BatchInfo(batch_info_host)
-    # Refresh all per-graph state that depends on batch_info. Eagle mutates
-    # batch_info in-place between target verification and the draft loop (switch_to_generate_),
-    # so filling these during host-prepare alone would be stale by the time draft-loop layers run.
-
-    if _GlobalTrtllmPlanner.is_spec_decoding_enabled:
+    # Refresh all per-graph state that depends on batch_info. Eagle mutates batch_info
+    # in-place between target verification and the draft loop (switch_to_generate_),
+    # so filling these during host-prepare alone would be stale by the time draft-loop
+    # layers run. We refresh per captured graph because AutoDeploy currently has no
+    # explicit hook at the target<->draft transition; if such a hook is added later, we
+    # could narrow this to fire only on that transition (closer to the PyTorch backend),
+    # but per-graph refresh is the only correct option for the current design.
+    if _GlobalTrtllmPlanner.is_spec_dec_active:
         _GlobalTrtllmPlanner.refresh_batch_state(batch_info)
-        _GlobalTrtllmPlanner.spec_decoding_bool_params[1] = batch_info.get_num_sequences()[2] == 0
+        if _GlobalTrtllmPlanner.is_spec_decoding_enabled:
+            _GlobalTrtllmPlanner.spec_decoding_bool_params[1] = (
+                batch_info.get_num_sequences()[2] == 0
+            )
     block_offset_multiplier = batch_info.get_block_offset_multiplier()
 
     _GlobalTrtllmPlanner.plan_device(
@@ -588,7 +618,7 @@ def trtllm_mha_with_cache(
     # For Llama + Eagle3 + torch-cudagraph, we observe a crash without the following
     # use of _scratch_block_offsets. See:
     # https://github.com/NVIDIA/TensorRT-LLM/issues/13100
-    if _GlobalTrtllmPlanner.is_spec_decoding_enabled:
+    if _GlobalTrtllmPlanner.is_spec_dec_active:
         scratch = _GlobalTrtllmPlanner._scratch_block_offsets
         scratch[0, :num_seq, :, :] = kv_cache_block_offsets[0, :num_seq, :, :]
         kv_cache_block_offsets = scratch
