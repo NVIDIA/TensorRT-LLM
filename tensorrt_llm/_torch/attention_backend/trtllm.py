@@ -17,7 +17,7 @@ import functools
 import math
 import os
 import weakref
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -42,6 +42,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
 from .sparse.params import SparseParams
+from .sparse.prediction import prepare_sparse_prediction
 from .sparse.skip_softmax import SkipSoftmaxParams
 
 
@@ -1602,23 +1603,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 seq_start=num_ctx,
             )
 
-        # RocketKV and DSA predict which blocks to keep, so build their sparse
-        # index tensors here. Skip-softmax needs no prediction.
-        sparse_params = self.sparse_params
-        if (sparse_params is not None
-                and not isinstance(sparse_params, SkipSoftmaxParams)):
-            kv_idx, kv_off = self.sparse_kv_predict(q, k, metadata,
-                                                    forward_args)
-            at_idx, at_off = self.sparse_attn_predict(q, k, metadata,
-                                                      forward_args)
-            forward_args.sparse_prediction = replace(
-                forward_args.sparse_prediction,
-                sparse_kv_indices=kv_idx,
-                sparse_kv_offsets=kv_off,
-                sparse_attn_indices=at_idx,
-                sparse_attn_offsets=at_off,
-                sparse_attn_indices_block_size=sparse_params.indices_block_size,
-            )
+        forward_args.sparse_prediction = prepare_sparse_prediction(
+            self, q, k, metadata, forward_args)
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is reset in prepare_flash_mla() and update_for_spec_dec() to trigger
@@ -1974,10 +1960,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-            Predict sparse kv indices. It's implemented in the derived class.
-        """
-        raise NotImplementedError
+        """Predict sparse KV indices when required by an algorithm."""
+        return None, None
 
     def sparse_attn_predict(
         self,
@@ -1986,10 +1970,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         metadata: TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-            Predict sparse attn indices. It's implemented in the derived class.
-        """
-        raise NotImplementedError
+        """Predict sparse attention indices when required by an algorithm."""
+        return None, None
 
     def mla_rope_generation(
         self,

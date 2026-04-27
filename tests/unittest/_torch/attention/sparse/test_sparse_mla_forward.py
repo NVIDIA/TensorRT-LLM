@@ -32,6 +32,8 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
     DeepseekV4CacheManager, make_deepseek_v4_sparse_metadata_params)
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (HAS_FAST_HADAMARD,
                                                               DSACacheManager)
+from tensorrt_llm._torch.attention_backend.sparse.mla import (
+    forward_context_sparse_mla, forward_generation_sparse_mla)
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -1521,7 +1523,8 @@ def mla_forward_impl_with_dsa_wo_linear(mla, attn_metadata, q, qr,
         # Transform context indices from local to global
         ctx_topk_local = topk_indices_local[:num_ctx_tokens]
 
-        mla.forward_context_sparse_mla(
+        forward_context_sparse_mla(
+            mla,
             q=q[:num_ctx_tokens],
             compressed_kv=compressed_kv[:num_ctx_tokens],
             k_pe=k_pe[:num_ctx_tokens],
@@ -1538,7 +1541,8 @@ def mla_forward_impl_with_dsa_wo_linear(mla, attn_metadata, q, qr,
         # Transform generation indices from local to global
         gen_topk_local = topk_indices_local[num_ctx_tokens:num_ctx_tokens +
                                             num_gen_tokens]
-        mla.forward_generation_sparse_mla(
+        forward_generation_sparse_mla(
+            mla,
             q=q[num_ctx_tokens:],
             compressed_kv=compressed_kv[num_ctx_tokens:],
             k_pe=k_pe[num_ctx_tokens:],
@@ -1615,7 +1619,8 @@ def mla_forward_impl_with_deepseek_v4_wo_linear(mla,
     if num_contexts > 0:
         ctx_topk_local = topk_indices_for_forward[:num_ctx_tokens]
 
-        mla.forward_context_sparse_mla(
+        forward_context_sparse_mla(
+            mla,
             q=q[:num_ctx_tokens],
             compressed_kv=compressed_kv[:num_ctx_tokens],
             k_pe=k_pe[:num_ctx_tokens],
@@ -1633,7 +1638,8 @@ def mla_forward_impl_with_deepseek_v4_wo_linear(mla,
     if num_generations > 0:
         gen_topk_local = topk_indices_for_forward[num_ctx_tokens:num_tokens]
 
-        mla.forward_generation_sparse_mla(
+        forward_generation_sparse_mla(
+            mla,
             q=q[num_ctx_tokens:],
             compressed_kv=compressed_kv[num_ctx_tokens:],
             k_pe=k_pe[num_ctx_tokens:],
@@ -2356,8 +2362,10 @@ def test_forward_sparse_mla_unified_fused_q_fp8(monkeypatch, batch_name):
     """
     monkeypatch.setenv("TRTLLM_DISABLE_FUSED_Q_FP8_QUANT", "0")
 
-    from tensorrt_llm._torch.modules.mla import MLA
-    original_fwd = MLA.forward_context_sparse_mla
+    from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
+        module as deepseek_v4_module
+
+    original_fwd = deepseek_v4_module.forward_context_sparse_mla
 
     def patched_fwd(self, q, compressed_kv, k_pe, attn_metadata, output,
                     **kwargs):
@@ -2385,7 +2393,8 @@ def test_forward_sparse_mla_unified_fused_q_fp8(monkeypatch, batch_name):
         return original_fwd(self, q, compressed_kv, k_pe, attn_metadata, output,
                             **kwargs)
 
-    monkeypatch.setattr(MLA, 'forward_context_sparse_mla', patched_fwd)
+    monkeypatch.setattr(deepseek_v4_module, 'forward_context_sparse_mla',
+                        patched_fwd)
     test_forward_sparse_mla_unified(batch_name=batch_name,
                                     kv_cache_dtype="fp8",
                                     sparse_attn_algo="deepseek_v4")

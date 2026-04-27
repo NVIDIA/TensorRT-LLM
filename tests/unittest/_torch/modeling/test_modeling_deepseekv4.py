@@ -371,11 +371,15 @@ def test_deepseek_v4_q_b_layernorm_differs_from_joint_flat_rms():
 
 
 def test_deepseek_v4_mla_q_b_layernorm_init_and_forward_shape():
+    from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import (
+        deepseek_v4_q_b_layernorm,
+        forward_impl_with_deepseek_v4,
+    )
     from tensorrt_llm._torch.modules.mla import MLA
 
     init_src = inspect.getsource(MLA.__init__)
-    helper_src = inspect.getsource(MLA._deepseek_v4_q_b_layernorm)
-    forward_src = inspect.getsource(MLA.forward_impl_with_deepseek_v4)
+    helper_src = inspect.getsource(deepseek_v4_q_b_layernorm)
+    forward_src = inspect.getsource(forward_impl_with_deepseek_v4)
     init_src_no_ws = "".join(init_src.split())
 
     assert "self.q_b_layernorm=RMSNorm(hidden_size=self.qk_head_dim" in init_src_no_ws
@@ -391,7 +395,7 @@ def test_deepseek_v4_mla_q_b_layernorm_init_and_forward_shape():
     assert "q.dtype" not in helper_src
     assert "total_rows" not in helper_src
     assert "self.q_b_layernorm(" not in helper_src
-    assert "self._deepseek_v4_q_b_layernorm(q_proj)" in _source_calls(forward_src)
+    assert "deepseek_v4_q_b_layernorm(self, q_proj)" in _source_calls(forward_src)
 
 
 def test_deepseek_v4_compressor_rotate_and_indexer_rope_contracts():

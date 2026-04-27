@@ -17,7 +17,7 @@ except ImportError:
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
                         PredefinedAttentionMask, merge_attention_forward_args)
-from .sparse.kernel import triton_index_gather
+from .sparse.kernels.common import triton_index_gather
 from .sparse.params import SparseParams
 
 

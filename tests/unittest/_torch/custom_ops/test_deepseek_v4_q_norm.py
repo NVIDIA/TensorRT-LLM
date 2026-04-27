@@ -211,7 +211,9 @@ def test_deepseek_v4_q_b_layernorm_fused_fp8_returns_3d_q_pe(num_tokens):
     import types
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch.modules.mla import MLA
+    from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import (
+        deepseek_v4_q_b_layernorm_fused_fp8,
+    )
 
     num_heads = 16
     qk_head_dim = 512
@@ -223,7 +225,7 @@ def test_deepseek_v4_q_b_layernorm_fused_fp8_returns_3d_q_pe(num_tokens):
         kv_lora_rank=kv_lora_rank,
         q_b_layernorm=SimpleNamespace(variance_epsilon=1e-6),
     )
-    fused = types.MethodType(MLA._deepseek_v4_q_b_layernorm_fused_fp8, stub)
+    fused = types.MethodType(deepseek_v4_q_b_layernorm_fused_fp8, stub)
     q_proj = torch.randn(
         num_tokens, num_heads * qk_head_dim, dtype=torch.bfloat16, device="cuda"
     ).contiguous()
