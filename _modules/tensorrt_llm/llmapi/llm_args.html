@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../../_static/styles/theme.css?digest=7f76b32a3354e82990f2" rel="stylesheet" />
-<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=7f76b32a3354e82990f2" rel="stylesheet" />
+  <link href="../../../_static/styles/theme.css?digest=55c26ed414f5f8a31ebb" rel="stylesheet" />
+<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=55c26ed414f5f8a31ebb" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../../_static/scripts/fontawesome.js?digest=7f76b32a3354e82990f2"></script>
+  <script defer src="../../../_static/scripts/fontawesome.js?digest=55c26ed414f5f8a31ebb"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=7f76b32a3354e82990f2" />
-<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=7f76b32a3354e82990f2" />
+  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=55c26ed414f5f8a31ebb" />
+<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=55c26ed414f5f8a31ebb" />
 
 
 
@@ -496,9 +496,9 @@ window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
     <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/llmapi/llm_args';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.17.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.17.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc12';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc13';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +512,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc12" />
+  <meta name="docsearch:version" content="1.3.0rc13" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -535,7 +535,9 @@ window.runMermaid = runMermaid;</script>
   
   <button type="button" class="btn rounded-pill" id="pst-back-to-top">
     <i class="fa-solid fa-arrow-up"></i>Back to top</button>
-
+  
+  
+  
   
   <dialog id="pst-search-dialog">
     
@@ -765,9 +767,9 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../overview.html">Overview</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../quick-start-guide.html">Quick Start Guide</a></li>
 <li class="toctree-l1 has-children"><a class="reference internal" href="../../../installation/index.html">Installation</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../../../installation/containers.html">Pre-built release container images on NGC</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
-<li class="toctree-l2"><a class="reference internal" href="../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../installation/installation-guide.html">Installation Guide</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../installation/build-from-source.html">Build from Source</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../installation/containers.html">Container Images</a></li>
 </ul>
 </details></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../supported-hardware.html">Supported Hardware</a></li>
@@ -1151,21 +1153,24 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">            List of batch sizes to create CUDA graphs for</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">if</span> <span class="n">enable_padding</span><span class="p">:</span>
+            <span class="c1"># Start with [1, 2, 4, 8, 16, 24, ..., 128] (multiples of 8)</span>
             <span class="n">batch_sizes</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">]</span> <span class="o">+</span> <span class="p">[</span><span class="n">i</span> <span class="o">*</span> <span class="mi">8</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">17</span><span class="p">)]</span>
+            <span class="c1"># Sliding 64: extend by increments of 64 up to max_batch_size</span>
+            <span class="k">while</span> <span class="n">batch_sizes</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="mi">64</span> <span class="o">&lt;=</span> <span class="n">max_batch_size</span><span class="p">:</span>
+                <span class="n">batch_sizes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">batch_sizes</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="mi">64</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">batch_sizes</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">32</span><span class="p">))</span> <span class="o">+</span> <span class="p">[</span><span class="mi">32</span><span class="p">,</span> <span class="mi">64</span><span class="p">,</span> <span class="mi">128</span><span class="p">]</span>
+            <span class="c1"># Add powers of 2 up to max_batch_size</span>
+            <span class="n">batch_sizes</span> <span class="o">+=</span> <span class="p">[</span>
+                <span class="mi">2</span><span class="o">**</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="n">math</span><span class="o">.</span><span class="n">ceil</span><span class="p">(</span><span class="n">math</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">max_batch_size</span><span class="p">,</span> <span class="mi">2</span><span class="p">)))</span>
+            <span class="p">]</span>
 
-        <span class="c1"># Add powers of 2 up to max_batch_size</span>
-        <span class="n">batch_sizes</span> <span class="o">+=</span> <span class="p">[</span>
-            <span class="mi">2</span><span class="o">**</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="n">math</span><span class="o">.</span><span class="n">ceil</span><span class="p">(</span><span class="n">math</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">max_batch_size</span><span class="p">,</span> <span class="mi">2</span><span class="p">)))</span>
-        <span class="p">]</span>
-
-        <span class="c1"># Filter and sort batch sizes</span>
+        <span class="c1"># Filter and sort batch sizes for both branches</span>
         <span class="n">batch_sizes</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span>
             <span class="p">[</span><span class="n">size</span> <span class="k">for</span> <span class="n">size</span> <span class="ow">in</span> <span class="n">batch_sizes</span> <span class="k">if</span> <span class="n">size</span> <span class="o">&lt;=</span> <span class="n">max_batch_size</span><span class="p">])</span>
 
         <span class="c1"># Add max_batch_size if not already included</span>
-        <span class="k">if</span> <span class="n">max_batch_size</span> <span class="o">!=</span> <span class="n">batch_sizes</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]:</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">batch_sizes</span> <span class="ow">or</span> <span class="n">max_batch_size</span> <span class="o">!=</span> <span class="n">batch_sizes</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]:</span>
             <span class="n">batch_sizes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">max_batch_size</span><span class="p">)</span>
 
         <span class="k">return</span> <span class="n">batch_sizes</span>
@@ -1590,6 +1595,13 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="n">Nvfp4Backend</span> <span class="o">=</span> <span class="n">Literal</span><span class="p">[</span><span class="s1">&#39;cutlass&#39;</span><span class="p">,</span> <span class="s1">&#39;cublaslt&#39;</span><span class="p">,</span> <span class="s1">&#39;cutedsl&#39;</span><span class="p">,</span> <span class="s1">&#39;cuda_core&#39;</span><span class="p">]</span>
+
+<span class="c1"># Short aliases for built-in custom tokenizers.</span>
+<span class="c1"># Maps alias → full import path (module.ClassName).</span>
+<span class="n">TOKENIZER_ALIASES</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s1">&#39;deepseek_v32&#39;</span><span class="p">:</span> <span class="s1">&#39;tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer&#39;</span><span class="p">,</span>
+    <span class="s1">&#39;glm_moe_dsa&#39;</span><span class="p">:</span> <span class="s1">&#39;tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer&#39;</span><span class="p">,</span>
+<span class="p">}</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">Nvfp4GemmConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
@@ -2166,7 +2178,6 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>  <span class="c1"># If using linear-tree, the max_total_draft_tokens is the same as max_draft_len</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">eagle3_model_arch</span> <span class="o">==</span> <span class="s2">&quot;mistral_large3&quot;</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">eagle3_layers_to_capture</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="c1"># FIXME find a better way to setup it.</span>
@@ -2195,7 +2206,8 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">eagle_choices</span><span class="p">)</span>
 
         <span class="c1"># Dynamic tree logic</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_dynamic_tree</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_dynamic_tree</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">dynamic_tree_max_topK</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">use_dynamic_tree</span> <span class="o">=</span> <span class="kc">True</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">eagle_choices</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                     <span class="s2">&quot;If use_dynamic_tree is True, eagle_choices should be None&quot;</span><span class="p">)</span>
@@ -2207,10 +2219,28 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                     <span class="s2">&quot;dynamic_tree_max_topK should be provided, which indicates the number of nodes to expand each time&quot;</span>
                 <span class="p">)</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
-                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                    <span class="s2">&quot;max_total_draft_tokens should be provided, which indicates the total nodes of the final draft tree. (exclude the root node)&quot;</span>
+
+            <span class="n">default_max_total_draft_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dynamic_tree_max_topK</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>
+
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">=</span> <span class="n">default_max_total_draft_tokens</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;max_total_draft_tokens is not provided, use the default value </span><span class="si">{</span><span class="n">default_max_total_draft_tokens</span><span class="si">}</span><span class="s2"> (default_max_total_draft_tokens = dynamic_tree_max_topK * max_draft_len)&quot;</span>
                 <span class="p">)</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">&quot;max_total_draft_tokens (</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span><span class="si">}</span><span class="s2">) should be &gt;= max_draft_len (</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span><span class="si">}</span><span class="s2">)&quot;</span>
+                    <span class="p">)</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">dynamic_tree_max_topK</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">&quot;max_total_draft_tokens (</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span><span class="si">}</span><span class="s2">) should be &lt;= &quot;</span>
+                        <span class="sa">f</span><span class="s2">&quot;dynamic_tree_max_topK * max_draft_len (</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">dynamic_tree_max_topK</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span><span class="si">}</span><span class="s2">)&quot;</span>
+                    <span class="p">)</span>
+
+        <span class="c1"># Linear tree</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>
 
         <span class="k">return</span> <span class="bp">self</span></div>
 
@@ -2303,6 +2333,11 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Eagle3DecodingConfig</span><span class="p">(</span><span class="n">EagleDecodingConfig</span><span class="p">):</span>
     <span class="n">decoding_type</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;Eagle3&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;Eagle3&quot;</span>
+
+    <span class="n">max_batch_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Max batch size for pre-allocating dynamic tree buffers. &quot;</span>
+        <span class="s2">&quot;Required when use_dynamic_tree=True.&quot;</span><span class="p">)</span>
 
     <span class="n">sa_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">SAEnhancerConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -3423,8 +3458,8 @@ window.runMermaid = runMermaid;</script>
 <span class="n">SpeculativeConfig</span><span class="p">:</span> <span class="n">TypeAlias</span> <span class="o">=</span> <span class="n">Annotated</span><span class="p">[</span>
     <span class="n">Union</span><span class="p">[</span>
         <span class="n">DraftTargetDecodingConfig</span><span class="p">,</span>
+        <span class="n">Eagle3DecodingConfig</span><span class="p">,</span>  <span class="c1"># Must be before EagleDecodingConfig since it&#39;s a subclass</span>
         <span class="n">EagleDecodingConfig</span><span class="p">,</span>
-        <span class="n">Eagle3DecodingConfig</span><span class="p">,</span>
         <span class="n">LookaheadDecodingConfig</span><span class="p">,</span>
         <span class="n">MedusaDecodingConfig</span><span class="p">,</span>
         <span class="n">MTPDecodingConfig</span><span class="p">,</span>
@@ -3581,7 +3616,7 @@ window.runMermaid = runMermaid;</script>
     <span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_to_pybind</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="k">return</span> <span class="n">_KvCacheConfig</span><span class="p">(</span>
+        <span class="n">config</span> <span class="o">=</span> <span class="n">_KvCacheConfig</span><span class="p">(</span>
             <span class="n">enable_block_reuse</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_block_reuse</span><span class="p">,</span>
             <span class="n">max_tokens</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_tokens</span><span class="p">,</span>
             <span class="n">max_attention_window</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_attention_window</span><span class="p">,</span>
@@ -3597,6 +3632,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">attention_dp_events_gather_period_ms</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span>
             <span class="n">attention_dp_events_gather_period_ms</span><span class="p">,</span>
             <span class="n">max_gpu_total_bytes</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_gpu_total_bytes</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">config</span>
 
 <div class="viewcode-block" id="KvCacheConfig.validate_free_gpu_memory_fraction">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_free_gpu_memory_fraction">[docs]</a>
@@ -3816,6 +3852,12 @@ window.runMermaid = runMermaid;</script>
         <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The number of experts per worker.&quot;</span><span class="p">)</span>
     <span class="n">num_prefetch_experts</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The number of prefetch experts per worker.&quot;</span><span class="p">)</span>
+    <span class="n">contention_opt</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Enable limited-contention prefetch optimization. Uses batched &quot;</span>
+        <span class="s2">&quot;memcpy with round-robin slice ordering across peers and a 2 MiB &quot;</span>
+        <span class="s2">&quot;slice granularity to reduce NVLink contention.&quot;</span><span class="p">)</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">BaseLlmArgs</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
@@ -5389,8 +5431,8 @@ window.runMermaid = runMermaid;</script>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../../_static/scripts/bootstrap.js?digest=7f76b32a3354e82990f2"></script>
-<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=7f76b32a3354e82990f2"></script>
+  <script defer src="../../../_static/scripts/bootstrap.js?digest=55c26ed414f5f8a31ebb"></script>
+<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=55c26ed414f5f8a31ebb"></script>
 
 
   <footer class="bd-footer">
@@ -5462,9 +5504,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on April 16, 2026.</p>
+  <p>Last updated on April 26, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/61cef21">61cef21</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b9ce4b6">b9ce4b6</a>.</p>
   
 </div></div>
       
