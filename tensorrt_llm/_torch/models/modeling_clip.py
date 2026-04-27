@@ -16,19 +16,8 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.mlp import MLP
 from .hf_parameter_utils import get_parameter_device, get_parameter_dtype
+from .modeling_multimodal_utils import MmEncoderMixin
 from .modeling_utils import _load_weights_impl, register_auto_model
-
-try:
-    # Available in transformers<5
-    from transformers.modeling_utils import (get_parameter_device,
-                                             get_parameter_dtype)
-except ImportError:
-    # Removed in transformers>=5
-    def get_parameter_device(module):
-        return next(module.parameters()).device
-
-    def get_parameter_dtype(module):
-        return next(module.parameters()).dtype
 
 
 class CLIPAttention(Attention):
@@ -188,7 +177,7 @@ class CLIPVisionTransformer(nn.Module):
 
 
 @register_auto_model("CLIPVisionModel")
-class CLIPVisionModel(nn.Module):
+class CLIPVisionModel(nn.Module, MmEncoderMixin):
 
     def __init__(self, model_config: ModelConfig[CLIPVisionConfig]):
         super().__init__()
@@ -202,12 +191,6 @@ class CLIPVisionModel(nn.Module):
 
         self.metadata_cls = get_attention_backend(
             model_config.attn_backend).Metadata
-        self.attn_metadata = self.metadata_cls(
-            max_num_requests=
-            8192,  #TODO(yechank-nvidia): Make this along with the LLM's max_num_requests
-            max_num_tokens=model_config.max_num_tokens,
-            kv_cache_manager=None,
-        )
 
     def prepare_attn_metadata(self, batch_size):
         """
