@@ -420,7 +420,7 @@ def _create_mock_metadata(request_ids,
             self.num_generations = num_generations
             self._num_seqs = num_contexts + num_generations
             self.max_draft_tokens = max_draft_tokens
-            self.sparse_mla_topk = index_topk
+            self.num_sparse_topk = index_topk
             self.enable_indexer_skip = enable_indexer_skip
             # Keep seq_lens on CPU for split_prefill_chunks and other CPU operations
             # CUDA kernels will convert to CUDA as needed
@@ -595,13 +595,13 @@ def _create_mock_metadata(request_ids,
 
             # Add skip indexer attributes
             self.topk_indices_buffer = torch.zeros(
-                (num_tokens, self.sparse_mla_topk),
+                (num_tokens, self.num_sparse_topk),
                 device='cuda',
                 dtype=torch.int32)
 
             if self.num_contexts > 0 and self.enable_indexer_skip:
                 self.skip_indexer_for_ctx_reqs = kv_lens[:self.num_contexts].max(
-                ).item() <= self.sparse_mla_topk
+                ).item() <= self.num_sparse_topk
             else:
                 self.skip_indexer_for_ctx_reqs = False
 
@@ -609,7 +609,7 @@ def _create_mock_metadata(request_ids,
                 self.max_draft_tokens + 1
                 self.skip_indexer_for_gen_reqs = kv_lens[
                     self.num_contexts:self.num_seqs].max().item(
-                    ) <= self.sparse_mla_topk
+                    ) <= self.num_sparse_topk
             else:
                 self.skip_indexer_for_gen_reqs = False
             self.prepare_dense_topk_indices(self.kv_lens_cuda_runtime,
@@ -716,7 +716,7 @@ def test_indexer_k_cache_scatter_custom_op():
                              dtype=torch.bfloat16)
     k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k_original)
 
-    # Prepare byte-level data
+    # Prepare byte-level data for the Python reference path
     scale_size = k_scale.shape[1] * 4
     k_fp8_bytes = k_fp8.view(-1).view(torch.uint8).view(num_tokens, head_dim)
     k_scale_flat = k_scale.view(-1)
@@ -755,9 +755,10 @@ def test_indexer_k_cache_scatter_custom_op():
 
     # ========== Path 1: CUDA Kernel ==========
     print("\n=== Path 1: CUDA Kernel ===")
-    torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp8_bytes, k_scale_bytes,
-                                                k_cache_cuda, flat_indices_fp8,
-                                                flat_indices_scale)
+    torch.ops.trtllm.indexer_k_cache_scatter_op(k_fp8, k_scale, k_cache_cuda,
+                                                metadata.slot_mapping_fp8,
+                                                metadata.slot_mapping_scale,
+                                                num_tokens)
     torch.cuda.synchronize()
     print("✓ CUDA kernel completed")
 

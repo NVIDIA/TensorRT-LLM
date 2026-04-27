@@ -161,6 +161,17 @@ def begin_aux_stream_passthrough(
     main_event.record(caller_stream)
     # Switch the thread-local current stream to aux.
     aux_stream = cuda_stream_manager.get_stream(device, cuda_stream_manager.AUX_STREAM_NAME)
+    # Tell the caching allocator that x is also live on aux_stream.  Without
+    # this, MLIR/Triton kernels that produced x on the main stream can cause
+    # the allocator to recycle x's backing storage before aux-stream work
+    # has consumed it, leading to silent data corruption or illegal accesses.
+    # record_stream is the idiomatic PyTorch solution for this cross-stream
+    # liveness problem: it is a CPU-only allocator hint, never a GPU sync,
+    # so it cannot deadlock with in-flight NCCL collectives.
+    # NOTE: skip during CUDA graph capture — passthrough partitions are
+    # reclassified as dynamic and won't be captured anyway.
+    if not torch.cuda.is_current_stream_capturing():
+        x.record_stream(aux_stream)
     torch.cuda.set_stream(aux_stream)
     # Make aux wait for the main-stream event before executing any work.
     aux_stream.wait_event(main_event)

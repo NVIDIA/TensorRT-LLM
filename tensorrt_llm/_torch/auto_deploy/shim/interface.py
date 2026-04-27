@@ -6,13 +6,32 @@ import torch
 import torch.nn as nn
 from torch._prims_common import DeviceLikeType
 
-import tensorrt_llm.bindings
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-from tensorrt_llm.mapping import Mapping
+from .._compat import TRTLLM_AVAILABLE, KvCacheConfig
 
-from ...._utils import torch_dtype_to_binding
-from ...pyexecutor.mamba_cache_manager import MambaHybridCacheManager
-from ...pyexecutor.resource_manager import KVCacheManager
+if TRTLLM_AVAILABLE:
+    import tensorrt_llm.bindings
+    from tensorrt_llm.mapping import Mapping
+
+    from ...._utils import torch_dtype_to_binding
+    from ...pyexecutor.mamba_cache_manager import (
+        MambaHybridCacheManager,
+        MixedMambaHybridCacheManager,
+    )
+    from ...pyexecutor.resource_manager import KVCacheManager
+
+    CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
+    DataType = tensorrt_llm.bindings.DataType
+else:
+    # Standalone mode: cache-manager infrastructure not available.
+    # CachedSequenceInterface can still be instantiated and used for transforms,
+    # but initialize_resources() and other cache-manager methods will raise.
+    KVCacheManager = None
+    MambaHybridCacheManager = None
+    CacheTypeCpp = None
+    DataType = None
+    Mapping = None
+    torch_dtype_to_binding = None
+
 from ..custom_ops.attention_interface import (
     CausalConvResourceHandler,
     KVPagedResourceHandler,
@@ -28,9 +47,6 @@ from ..distributed.common import all_gather_object, get_world_size
 from ..distributed.common import is_initialized as is_distributed_initialized
 from ..utils.cuda_mem_tracker import bytes_to, get_mem_info
 from ..utils.logger import ad_logger
-
-CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
-DataType = tensorrt_llm.bindings.DataType
 
 
 def with_pre_callback(method, callback):
@@ -57,9 +73,9 @@ class CachedSequenceInterface:
         self,
         max_seq_len: int,
         max_batch_size: int,
+        max_num_tokens: int,
         device: Optional[DeviceLikeType] = None,
         kv_cache_config: Optional[KvCacheConfig] = None,
-        max_num_tokens: Optional[int] = None,
         vocab_size_padded: Optional[int] = None,
         spec_config=None,
     ) -> None:
@@ -68,10 +84,9 @@ class CachedSequenceInterface:
         Args:
             max_seq_len: Maximum sequence length including input and generated tokens.
             max_batch_size: Maximum number of sequences (requests) that can be processed.
+            max_num_tokens: Maximum total tokens across all sequences.
             device: Target device for tensors. Defaults to "cuda".
             kv_cache_config: KV cache configuration. If None, uses default KvCacheConfig.
-            max_num_tokens: Maximum total tokens across all sequences. If None, computed from
-                max_seq_len and max_batch_size.
             vocab_size_padded: Padded vocabulary size of the model.
             spec_config: Speculative decoding configuration. Used to set num_extra_kv_tokens,
                 max_draft_len, max_total_draft_tokens on KVCacheManager after creation.
@@ -511,7 +526,7 @@ class CachedSequenceInterface:
         num_managed_mamba_layers = mamba_params["mamba_num_layers"]
 
         # Create the hybrid cache manager
-        manager = MambaHybridCacheManager(
+        manager = MixedMambaHybridCacheManager(
             **mamba_params,
             **kv_cache_kwargs,
         )

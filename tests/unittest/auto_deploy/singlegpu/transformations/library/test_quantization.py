@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from _graph_test_helpers import run_test_transformed_gm
 from _model_test_utils import MLP, BMMDynamicModel, BMMModel
-from _torch_test_utils import fp4_compatible, fp8_compatible
+from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_available
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.factory import (
@@ -171,7 +171,10 @@ def test_finegrained_fp8_quantization():
             5e-1,
             lambda num_p_og: num_p_og,
             BMMModel,
-            marks=pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support"),
+            marks=pytest.mark.skipif(
+                not (fp8_compatible() and trtllm_ops_available()),
+                reason="Requires fp8 support and TRT-LLM ops",
+            ),
         ),
         pytest.param(
             {"quant_algo": "FP8"},
@@ -179,7 +182,10 @@ def test_finegrained_fp8_quantization():
             5e-1,
             lambda num_p_og: num_p_og,
             BMMDynamicModel,
-            marks=pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support"),
+            marks=pytest.mark.skipif(
+                not (fp8_compatible() and trtllm_ops_available()),
+                reason="Requires fp8 support and TRT-LLM ops",
+            ),
         ),
     ],
 )

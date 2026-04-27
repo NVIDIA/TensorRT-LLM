@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -132,7 +132,6 @@ protected:
         auto constexpr sizePerHead = 1;
         auto const maxNumBlocks = tc::divUp(maxNumTokens, tokensPerBlock);
         auto const kvDtype = nvinfer1::DataType::kHALF;
-        bool onboardBlocks = true;
         CudaStreamPtr streamPtr = std::make_shared<tensorrt_llm::runtime::CudaStream>();
 
         using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
@@ -141,7 +140,7 @@ protected:
         // init KV cache block manager
         return std::make_shared<kv_cache_manager::KVCacheManager>(numLayers, nbKvHeads, sizePerHead, tokensPerBlock,
             blocksPerWindow, maxNumRequests, 1, std::vector<SizeType32>{maxNumTokensPerSeq}, std::nullopt, kvDtype,
-            sinkTokenLength, streamPtr, maxNumTokensPerSeq, enableReuse, onboardBlocks, cacheType);
+            sinkTokenLength, streamPtr, maxNumTokensPerSeq, enableReuse, cacheType);
     }
 
     static std::shared_ptr<BasePeftCacheManager> getPeftCacheManager()
@@ -362,8 +361,9 @@ int runTest(CapacityScheduler& capacityScheduler,
         {
             if (llmReq->isDisaggGenerationInitState())
             {
-                kvCacheManager->addSequence(
-                    llmReq->mRequestId, llmReq->mPromptLen, llmReq->mSamplingConfig.beamWidth, llmReq);
+                kvCacheManager->addSequenceBatch(
+                    {{{llmReq->mRequestId, llmReq->mPromptLen, llmReq->mSamplingConfig.beamWidth}}},
+                    {std::ref(*llmReq)});
                 llmReq->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
                 llmReq->setContextCurrentPosition(llmReq->mPromptLen);
                 llmReq->setDecodingIter(1);
@@ -386,12 +386,13 @@ int runTest(CapacityScheduler& capacityScheduler,
                 if (llmReq->isFirstContextChunk())
                 {
                     // We need to perform initialization work for the first context chunk.
-                    kvCacheManager->addSequence(
-                        llmReq->mRequestId, promptLen, llmReq->mSamplingConfig.beamWidth, llmReq);
+                    kvCacheManager->addSequenceBatch(
+                        {{{llmReq->mRequestId, promptLen, llmReq->mSamplingConfig.beamWidth}}}, {std::ref(*llmReq)});
                     if (crossKvCacheManager)
                     {
-                        crossKvCacheManager->addSequence(llmReq->mRequestId, llmReq->getEncoderOutputLen(),
-                            llmReq->mSamplingConfig.beamWidth, llmReq);
+                        crossKvCacheManager->addSequenceBatch(
+                            {{{llmReq->mRequestId, llmReq->getEncoderOutputLen(), llmReq->mSamplingConfig.beamWidth}}},
+                            {std::ref(*llmReq)});
                     }
                 }
                 auto preContextLength = llmReq->getContextChunkSize();

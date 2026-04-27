@@ -3,8 +3,7 @@
 import torch
 import torch.nn as nn
 
-from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
-
+from ...utils.logger import ad_logger
 from ..compiler import CompileBackendRegistry, CompilerBackend
 
 

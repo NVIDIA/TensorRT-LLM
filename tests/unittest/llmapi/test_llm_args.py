@@ -317,7 +317,6 @@ def test_KvCacheConfig_declaration():
                            sink_token_length=32,
                            free_gpu_memory_fraction=0.5,
                            host_cache_size=1024,
-                           onboard_blocks=True,
                            cross_kv_cache_fraction=0.5,
                            secondary_offload_min_priority=1,
                            event_buffer_max_size=0,
@@ -332,7 +331,6 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.sink_token_length == 32
     assert pybind_config.free_gpu_memory_fraction == 0.5
     assert pybind_config.host_cache_size == 1024
-    assert pybind_config.onboard_blocks == True
     assert pybind_config.cross_kv_cache_fraction == 0.5
     assert pybind_config.secondary_offload_min_priority == 1
     assert pybind_config.event_buffer_max_size == 0
@@ -713,6 +711,16 @@ class TestTorchLlmArgsCudaGraphSettings:
         assert args.cuda_graph_config.batch_sizes == CudaGraphConfig._generate_cuda_graph_batch_sizes(
             128, True)
         assert args.cuda_graph_config.max_batch_size == 128
+
+    @pytest.mark.parametrize("max_batch_size", [64, 129, 320])
+    def test_generate_cuda_graph_batch_sizes_padding_edge_cases(
+            self, max_batch_size):
+        # All sizes must be <= max_batch_size, sorted, and include max_batch_size
+        batch_sizes = CudaGraphConfig._generate_cuda_graph_batch_sizes(
+            max_batch_size, enable_padding=True)
+        assert all(s <= max_batch_size for s in batch_sizes)
+        assert batch_sizes == sorted(batch_sizes)
+        assert max_batch_size in batch_sizes
 
 
 class TestTrtLlmArgs:

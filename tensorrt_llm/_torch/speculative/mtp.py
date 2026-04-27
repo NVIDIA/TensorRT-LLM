@@ -1169,7 +1169,8 @@ class MTPEagleWorker(MTPWorker):
         if num_gens > 0 and self._is_mamba_hybrid_cache:
             attn_metadata.kv_cache_manager.update_mamba_states(
                 attn_metadata=attn_metadata,
-                num_accepted_tokens=num_accepted_tokens)
+                num_accepted_tokens=num_accepted_tokens,
+                state_indices=attn_metadata.mamba_metadata.state_indices)
 
         # Save the old attn_metadata and spec_metadata
         self._prepare_attn_metadata_for_spec_dec(attn_metadata)

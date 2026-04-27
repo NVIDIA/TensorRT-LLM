@@ -19,6 +19,7 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 @triton.heuristics({
     "USE_G": lambda args: args["g"] is not None,
     "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
+    "USE_INDEXED_STATE": lambda args: args["h0_i"] is not None,
     "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
     "SAVE_NEW_VALUE": lambda args: args["v_new"] is not None,
     "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
@@ -42,10 +43,12 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     g,
     h,
     h0,
+    h0_i,
     ht,
     cu_seqlens,
     chunk_offsets,
     T,
+    stride_h0,
     H: tl.constexpr,
     Hg: tl.constexpr,
     K: tl.constexpr,
@@ -54,6 +57,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
+    USE_INDEXED_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
@@ -91,10 +95,16 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     stride_h = H * K * V
     stride_k = Hg * K
     stride_w = H * K
+    if USE_INDEXED_STATE:
+        state_index = tl.load(h0_i + i_n).to(tl.int64)
+        h0 = h0 + state_index * stride_h0
+        ht = h0
     if USE_INITIAL_STATE:
-        h0 = h0 + i_nh * K * V
+        h0 = h0 + ((i_h if USE_INDEXED_STATE else i_nh) * K * V)
     if STORE_FINAL_STATE:
         ht = ht + i_nh * K * V
+    elif USE_INDEXED_STATE:
+        ht = ht + i_h * K * V
 
     # load initial state
     if USE_INITIAL_STATE:
@@ -209,7 +219,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             b_h4 += tl.dot(b_k, b_v_new)
 
     # epilogue
-    if STORE_FINAL_STATE:
+    if STORE_FINAL_STATE or USE_INDEXED_STATE:
         p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (0, i_v * BV), (64, BV),
                                  (1, 0))
         tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
@@ -239,7 +249,9 @@ def chunk_gated_delta_rule_fwd_h(
     u: torch.Tensor,
     g: Optional[torch.Tensor] = None,
     initial_state: Optional[torch.Tensor] = None,
+    initial_state_indices: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
+    inplace_indexed_state_update: bool = False,
     chunk_size: int = 64,  # SY: remove this argument and force chunk size 64?
     save_new_value: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
@@ -262,8 +274,14 @@ def chunk_gated_delta_rule_fwd_h(
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
     h = k.new_empty(B, NT, H, K, V)
+    use_indexed_state = initial_state is not None and initial_state_indices is not None
+    if use_indexed_state and not inplace_indexed_state_update:
+        raise ValueError(
+            "Indexed chunk state updates require inplace_indexed_state_update=True."
+        )
+    store_final_state_in_kernel = output_final_state and not use_indexed_state
     final_state = (k.new_empty(N, H, K, V, dtype=torch.float32)
-                   if output_final_state else None)
+                   if store_final_state_in_kernel else None)
 
     v_new = torch.empty_like(u) if save_new_value else None
 
@@ -278,10 +296,12 @@ def chunk_gated_delta_rule_fwd_h(
         g=g,
         h=h,
         h0=initial_state,
+        h0_i=initial_state_indices,
         ht=final_state,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
+        stride_h0=initial_state.stride(0) if initial_state is not None else 0,
         H=H,
         Hg=Hg,
         K=K,
@@ -291,4 +311,9 @@ def chunk_gated_delta_rule_fwd_h(
         num_warps=4,
         num_stages=2,
     )
+    if output_final_state and use_indexed_state:
+        # The indexed kernel path updates h0 in-place, so returning
+        # the final state means gathering those updated slots back out.
+        final_state = initial_state.index_select(
+            0, initial_state_indices.to(torch.long))
     return h, v_new, final_state

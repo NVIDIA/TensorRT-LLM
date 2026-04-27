@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@
 
 #include "cuda_runtime_api.h"
 #include "tensorrt_llm/common/config.h"
+#include <cfloat>
 #include <cstring>
 #include <filesystem>
 #include <linux/limits.h>
@@ -125,15 +126,21 @@ public:
     using KernelParams = fmha::KernelParams;
 
     // Ctor.
-    TllmGenFmhaKernel(KernelMeta const* pMetaStart, unsigned int nMetaCount, Data_type dtypeQ, Data_type dtypeKv,
-        Data_type dtypeOut, unsigned int smArch)
+    TllmGenFmhaKernel(KernelMeta const* pMetaStart, unsigned int nMetaCount, Data_type dtypeQ, Data_type dtypeK,
+        Data_type dtypeV, Data_type dtypeOut, unsigned int smArch, int numEltsPerSageAttnBlkQ = 0,
+        int numEltsPerSageAttnBlkK = 0, int numEltsPerSageAttnBlkP = 0, int numEltsPerSageAttnBlkV = 0)
         : mDtypeQ(dtypeQ)
-        , mDtypeKv(dtypeKv)
+        , mDtypeK(dtypeK)
+        , mDtypeV(dtypeV)
         , mDtypeOut(dtypeOut)
         , mDriver(tensorrt_llm::common::CUDADriverWrapper::getInstance())
         , mKernelMeta(pMetaStart)
         , mKernelMetaCount(nMetaCount)
         , mSM(smArch)
+        , mNumEltsPerSageAttnBlkQ(numEltsPerSageAttnBlkQ)
+        , mNumEltsPerSageAttnBlkK(numEltsPerSageAttnBlkK)
+        , mNumEltsPerSageAttnBlkP(numEltsPerSageAttnBlkP)
+        , mNumEltsPerSageAttnBlkV(numEltsPerSageAttnBlkV)
     {
     }
 
@@ -144,7 +151,11 @@ public:
         {
             auto const& kernelMeta = mKernelMeta[i];
             if (isSMCompatible(mSM, kernelMeta.mSM) && kernelMeta.mDataTypeQ == mDtypeQ
-                && kernelMeta.mDataTypeKv == mDtypeKv && kernelMeta.mDataTypeO == mDtypeOut)
+                && kernelMeta.mDataTypeK == mDtypeK && kernelMeta.mDataTypeV == mDtypeV
+                && kernelMeta.mDataTypeO == mDtypeOut && kernelMeta.mNumEltsPerSageAttnBlkQ == mNumEltsPerSageAttnBlkQ
+                && kernelMeta.mNumEltsPerSageAttnBlkK == mNumEltsPerSageAttnBlkK
+                && kernelMeta.mNumEltsPerSageAttnBlkP == mNumEltsPerSageAttnBlkP
+                && kernelMeta.mNumEltsPerSageAttnBlkV == mNumEltsPerSageAttnBlkV)
             {
                 // Load CUmodules
                 CUmodule hmod{0};
@@ -164,8 +175,20 @@ public:
                 TLLM_CU_CHECK(mDriver->cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
                 if (kernelMeta.mSharedMemBytes >= 48 * 1024)
                 {
-                    TLLM_CU_CHECK(mDriver->cuFuncSetAttribute(funcInfo.mDeviceFunction,
-                        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, kernelMeta.mSharedMemBytes));
+                    auto const result = mDriver->cuFuncSetAttribute(funcInfo.mDeviceFunction,
+                        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, kernelMeta.mSharedMemBytes);
+                    if (result != CUDA_SUCCESS)
+                    {
+                        char const* errorName = nullptr;
+                        char const* errorString = nullptr;
+                        mDriver->cuGetErrorName(result, &errorName);
+                        mDriver->cuGetErrorString(result, &errorString);
+                        TLLM_LOG_WARNING("Skipping FMHA kernel due to cuFuncSetAttribute failure: "
+                            + std::string(kernelMeta.mFuncName) + ", smem=" + std::to_string(kernelMeta.mSharedMemBytes)
+                            + ", error=" + std::string(errorName != nullptr ? errorName : "unknown") + ": "
+                            + std::string(errorString != nullptr ? errorString : "unknown"));
+                        continue;
+                    }
                 }
                 // Make sure the hashIds are not duplicated.
                 // Except for the case where we have both family version and specific version of the same config.
@@ -220,6 +243,18 @@ public:
         checkFmhaOptions(options, optionsFromArgs);
         // Update the options if needed.
         updateFmhaOptions(options, optionsFromArgs);
+        // HOTFIX: FmhaDispatcher path may leave multiCtasKvCounter/Scratch null when use GmemReduction. Force Disabled
+        // here so as to avoid crashing.
+        // TODO: add scratch allocation and re-enable GmemReduction.
+        if (options.mMultiCtasKvMode == tensorrt_llm::kernels::MultiCtasKvMode::GmemReduction)
+        {
+            if (params.multiCtasKvScratchPtr == nullptr || params.multiCtasKvCounterPtr == nullptr)
+            {
+                TLLM_LOG_DEBUG(
+                    "MultiCtasKvScratchPtr/MultiCtasKvCounterPtr is null, forcing MultiCtasKvMode to Disabled");
+                options.mMultiCtasKvMode = tensorrt_llm::kernels::MultiCtasKvMode::Disabled;
+            }
+        }
         // The number of CtasQ and CtasKv per sequence, Ctas in the Y dimension, and Ctas in the Z
         // dimension.
         computeNumCtas(options, params.mMultiProcessorCount);
@@ -269,6 +304,20 @@ public:
         updateFmhaOptions(options, optionsFromArgs);
         // The number of CtasQ and CtasKv per sequence, Ctas in the Y dimension, and Ctas in the Z
         // dimension.
+
+        // HOTFIX: FmhaDispatcher path may leave multiCtasKvCounter/Scratch null when use GmemReduction. Force Disabled
+        // here so as to avoid crashing.
+        // TODO: add scratch allocation and re-enable GmemReduction.
+        if (options.mMultiCtasKvMode == tensorrt_llm::kernels::MultiCtasKvMode::GmemReduction)
+        {
+            if (params.multiCtasKvScratchPtr == nullptr || params.multiCtasKvCounterPtr == nullptr)
+            {
+                TLLM_LOG_DEBUG(
+                    "MultiCtasKvScratchPtr/MultiCtasKvCounterPtr is null, forcing MultiCtasKvMode to Disabled");
+                options.mMultiCtasKvMode = tensorrt_llm::kernels::MultiCtasKvMode::Disabled;
+            }
+        }
+
         auto [numCtasX, numCtasY, numCtasZ] = computeNumCtas(options, params.mMultiProcessorCount);
 
         // Set the launch grid size.
@@ -286,10 +335,11 @@ public:
         FmhaData fmhaData;
         setFmhaData(params, options, fmhaData);
         bool isLlama70bFp4Tp4 = options.mHeadDimQk == 128 && options.mHeadDimV == 128
-            && options.mDtypeKv == tg::Dtype::E4m3 && options.mNumHeadsQ == 16 && options.mNumHeadsQPerKv == 8;
+            && options.mDtypeK == tg::Dtype::E4m3 && options.mNumHeadsQ == 16 && options.mNumHeadsQPerKv == 8;
 
         bool shouldUseNvrtc = options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration && !options.mIsMlaGen
-            && options.mDtypeKv != tg::Dtype::E2m1 && options.mHeadDimQk != 64 && !isLlama70bFp4Tp4;
+            && options.mDtypeK != tg::Dtype::E2m1 && options.mHeadDimQk != 64 && !isLlama70bFp4Tp4
+            && !isTokenSparse(options.mSparseType);
 
         if (shouldUseNvrtc)
         {
@@ -350,7 +400,7 @@ public:
 private:
     inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler, int multiCtasKvMode,
         int headDimPerCtaV, int headDimQk, int headDimV, int tileSizeQ, int tileSizeKv, int numTokensPerPage,
-        bool reuseSmemKForV, bool uses2CtaMma, bool sparseMla, bool skipsSoftmax) const
+        bool reuseSmemKForV, bool uses2CtaMma, int sparseAttention, bool skipsSoftmax) const
     {
         TLLM_CHECK_WITH_INFO((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) && (headDimPerCtaV <= 1024)
                 && (headDimQk <= 1024) && (headDimV <= 1024),
@@ -378,8 +428,8 @@ private:
         // Bit 49 - 52: (log2(tileSizeQ)).
         // Bit 53 - 53: reuseSmemKForV.
         // Bit 54 - 54: uses2CtaMma.
-        // Bit 55 - 55: sparseMla.
-        // Bit 56 - 56: skipsSoftmax.
+        // Bit 55 - 56: sparseAttention.
+        // Bit 57 - 57: skipsSoftmax.
         return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4)
             | (static_cast<uint64_t>(kernelType) << 8) | (static_cast<uint64_t>(scheduler) << 12)
             | (static_cast<uint64_t>(multiCtasKvMode) << 16) | (static_cast<uint64_t>(headDimPerCtaV >> 3) << 18)
@@ -387,8 +437,8 @@ private:
             | (static_cast<uint64_t>(tileSizeKv >> 6) << 42)
             | (static_cast<uint64_t>(numTokensPerPage > 0 ? static_cast<int>(log2(numTokensPerPage)) : 0) << 44)
             | (static_cast<uint64_t>(log2(tileSizeQ)) << 49) | (static_cast<uint64_t>(reuseSmemKForV) << 53)
-            | (static_cast<uint64_t>(uses2CtaMma) << 54) | (static_cast<uint64_t>(sparseMla) << 55)
-            | (static_cast<uint64_t>(skipsSoftmax) << 56);
+            | (static_cast<uint64_t>(uses2CtaMma) << 54) | (static_cast<uint64_t>(sparseAttention) << 55)
+            | (static_cast<uint64_t>(skipsSoftmax) << 57);
     }
 
     uint64_t hashID(KernelMeta const& kernelMeta) const
@@ -396,7 +446,7 @@ private:
         return hashID(kernelMeta.mQkvLayout, kernelMeta.mMaskType, kernelMeta.mKernelType, kernelMeta.mTileScheduler,
             kernelMeta.mMultiCtasKvMode, kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
             kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage, kernelMeta.mReuseSmemKForV,
-            kernelMeta.m2CtaMma, kernelMeta.mSparseMla, kernelMeta.mSkipsSoftmaxWhenPossible);
+            kernelMeta.m2CtaMma, kernelMeta.mSparseAttn, kernelMeta.mSkipsSoftmaxWhenPossible);
     }
 
     std::pair<uint64_t, std::string> hashFromFmhaOptions(FmhaOptions const& options) const
@@ -406,9 +456,14 @@ private:
         // so options.mClusterDimX here is the unscaled value from the autotuner.
         bool uses2CtaMma = (options.mClusterDimX == 2);
         // Debug info.
-        std::string info = "dtypeQ=" + std::to_string(static_cast<int>(mDtypeQ)) + ", dtypeKv="
-            + std::to_string(static_cast<int>(mDtypeKv)) + ", dtypeOut=" + std::to_string(static_cast<int>(mDtypeOut))
-            + ", sm=" + std::to_string(mSM) + ", qkvLayout=" + std::to_string(static_cast<int>(options.mQkvLayout))
+        std::string info = "dtypeQ=" + std::to_string(static_cast<int>(mDtypeQ)) + ", dtypeK="
+            + std::to_string(static_cast<int>(mDtypeK)) + ", dtypeV=" + std::to_string(static_cast<int>(mDtypeV))
+            + ", dtypeOut=" + std::to_string(static_cast<int>(mDtypeOut)) + ", sm=" + std::to_string(mSM)
+            + ", mNumEltsPerSageAttnBlkQ=" + std::to_string(mNumEltsPerSageAttnBlkQ)
+            + ", mNumEltsPerSageAttnBlkK=" + std::to_string(mNumEltsPerSageAttnBlkK)
+            + ", mNumEltsPerSageAttnBlkP=" + std::to_string(mNumEltsPerSageAttnBlkP)
+            + ", mNumEltsPerSageAttnBlkV=" + std::to_string(mNumEltsPerSageAttnBlkV)
+            + ", qkvLayout=" + std::to_string(static_cast<int>(options.mQkvLayout))
             + ", maskType=" + std::to_string(static_cast<int>(options.mMaskType))
             + ", kernelType=" + std::to_string(static_cast<int>(options.mFmhaKernelType))
             + ", tileScheduler=" + std::to_string(static_cast<int>(options.mTileScheduler))
@@ -417,7 +472,8 @@ private:
             + ", headDimV=" + std::to_string(options.mHeadDimV) + ", tileSizeQ=" + std::to_string(options.mTileSizeQ)
             + ", tileSizeKv=" + std::to_string(options.mTileSizeKv) + ", numTokensPerPage="
             + std::to_string(options.mNumTokensPerPage) + ", reuseSmemKForV=" + std::to_string(options.mReuseSmemKForV)
-            + ", uses2CtaMma=" + std::to_string(uses2CtaMma) + ", sparseMla=" + std::to_string(options.mIsSparseMla)
+            + ", uses2CtaMma=" + std::to_string(uses2CtaMma)
+            + ", sparseType=" + std::to_string(static_cast<int>(options.mSparseType))
             + ", skipsSoftmax=" + std::to_string(options.mSkipsSoftmaxWhenPossible);
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
@@ -427,7 +483,7 @@ private:
                                   static_cast<int>(options.mHeadDimQk), static_cast<int>(options.mHeadDimV),
                                   static_cast<int>(options.mTileSizeQ), static_cast<int>(options.mTileSizeKv),
                                   static_cast<int>(options.mNumTokensPerPage), options.mReuseSmemKForV, uses2CtaMma,
-                                  options.mIsSparseMla, options.mSkipsSoftmaxWhenPossible),
+                                  static_cast<int>(options.mSparseType), options.mSkipsSoftmaxWhenPossible),
             info);
     }
 
@@ -621,11 +677,11 @@ private:
         fmhaData.mScales.outputScaleD = params.outputScalePtr;
         fmhaData.mScales.kvSfScaleD = params.kvSfScalePtr;
         fmhaData.mScales.oSfScaleD = params.oSfScalePtr;
-        // Sage Attention scaling factors (set to nullptr if not available)
-        fmhaData.mScales.sageAttnSfsQPtrD = nullptr;
-        fmhaData.mScales.sageAttnSfsKPtrD = nullptr;
-        fmhaData.mScales.sageAttnSfsPPtrD = nullptr;
-        fmhaData.mScales.sageAttnSfsVPtrD = nullptr;
+        // Sage Attention scaling factors
+        fmhaData.mScales.sageAttnSfsQPtrD = params.sageAttnSfsQPtr;
+        fmhaData.mScales.sageAttnSfsKPtrD = params.sageAttnSfsKPtr;
+        fmhaData.mScales.sageAttnSfsPPtrD = params.sageAttnSfsPPtr;
+        fmhaData.mScales.sageAttnSfsVPtrD = params.sageAttnSfsVPtr;
         // Host-side scale values (from params)
         TLLM_CHECK_WITH_INFO(params.mScaleQ != 0.f, "mScaleQ must not be zero (used as divisor in softmaxScale).");
         fmhaData.mScales.softmaxScale
@@ -636,7 +692,7 @@ private:
         fmhaData.mScales.oSfPtrD = params.oSfPtr;
 
         // Get qkv pointers.
-        auto [qPtr, kPtr, vPtr] = getDevicePtrs(params, tg::dtypeGetNumBits(options.mDtypeKv));
+        auto [qPtr, kPtr, vPtr] = getDevicePtrs(params, tg::dtypeGetNumBits(options.mDtypeK));
         // Fill InputBuffers
         fmhaData.mInputBuffers.qBasePtr = qPtr;
         fmhaData.mInputBuffers.kBasePtr = kPtr;
@@ -731,9 +787,9 @@ private:
         options.mAttentionWindowSize = params.mAttentionWindowSize;
         options.mChunkedAttentionSize = params.mChunkedAttentionSize == INT_MAX ? 0 : params.mChunkedAttentionSize;
 
-        // Sparse MLA
-        options.mIsSparseMla = params.mSparseMla;
-        options.mSparseMlaTopK = params.mSparseMlaTopK;
+        // Sparse attention (MLA / MQA / GQA)
+        options.mSparseType = params.mSparseAttention;
+        options.mSparseAttnTopK = params.mSparseTopK;
 
         // Softmax optimization
         options.mSkipSoftmaxThresholdScaleFactor = params.mSkipSoftmaxThresholdScaleFactor;
@@ -747,8 +803,14 @@ private:
         options.mEnablesAutoTuner = true;
         options.mIsMlaGen = isMlaGenKernel(params);
         options.mDtypeQ = dataTypeToDtype(mDtypeQ);
-        options.mDtypeKv = dataTypeToDtype(mDtypeKv);
+        options.mDtypeKv = dataTypeToDtype(mDtypeK);
+        options.mDtypeK = dataTypeToDtype(mDtypeK);
+        options.mDtypeV = dataTypeToDtype(mDtypeV);
         options.mDtypeOut = dataTypeToDtype(mDtypeOut);
+        options.mNumEltsPerSageAttnBlkQ = mNumEltsPerSageAttnBlkQ;
+        options.mNumEltsPerSageAttnBlkK = mNumEltsPerSageAttnBlkK;
+        options.mNumEltsPerSageAttnBlkP = mNumEltsPerSageAttnBlkP;
+        options.mNumEltsPerSageAttnBlkV = mNumEltsPerSageAttnBlkV;
         options.mSupportsVarSeqLens = true;
         if (options.mQkvLayout != QkvLayout::PackedQkv)
         {
@@ -909,9 +971,14 @@ private:
     {
 
         // Debug info.
-        std::string info = "dtypeQ=" + std::to_string(static_cast<int>(mDtypeQ)) + ", dtypeKv="
-            + std::to_string(static_cast<int>(mDtypeKv)) + ", dtypeOut=" + std::to_string(static_cast<int>(mDtypeOut))
-            + ", sm=" + std::to_string(mSM) + ", qkvLayout=" + std::to_string(static_cast<int>(params.mQkvLayout))
+        std::string info = "dtypeQ=" + std::to_string(static_cast<int>(mDtypeQ)) + ", dtypeK="
+            + std::to_string(static_cast<int>(mDtypeK)) + ", dtypeV=" + std::to_string(static_cast<int>(mDtypeV))
+            + ", dtypeOut=" + std::to_string(static_cast<int>(mDtypeOut)) + ", sm=" + std::to_string(mSM)
+            + ", mNumEltsPerSageAttnBlkQ=" + std::to_string(mNumEltsPerSageAttnBlkQ)
+            + ", mNumEltsPerSageAttnBlkK=" + std::to_string(mNumEltsPerSageAttnBlkK)
+            + ", mNumEltsPerSageAttnBlkP=" + std::to_string(mNumEltsPerSageAttnBlkP)
+            + ", mNumEltsPerSageAttnBlkV=" + std::to_string(mNumEltsPerSageAttnBlkV)
+            + ", qkvLayout=" + std::to_string(static_cast<int>(params.mQkvLayout))
             + ", maskType=" + std::to_string(static_cast<int>(selectKernelParams.mMaskType))
             + ", kernelType=" + std::to_string(static_cast<int>(selectKernelParams.mKernelType))
             + ", tileScheduler=" + std::to_string(static_cast<int>(selectKernelParams.mTileScheduler))
@@ -921,8 +988,9 @@ private:
             + ", tileSizeQ=" + std::to_string(selectKernelParams.mTileSizeQ)
             + ", tileSizeKv=" + std::to_string(selectKernelParams.mTileSizeKv)
             + ", numTokensPerPage=" + std::to_string(selectKernelParams.mNumTokensPerPage)
-            + ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV) + ", uses2CtaMma="
-            + std::to_string(selectKernelParams.mUses2CtaMma) + ", sparseMla=" + std::to_string(params.mSparseMla)
+            + ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV)
+            + ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma)
+            + ", sparseAttention=" + std::to_string(static_cast<int>(params.mSparseAttention))
             + ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible);
 
         TLLM_LOG_DEBUG("Searching for kernel traits: " + info);
@@ -933,7 +1001,8 @@ private:
                 static_cast<int>(selectKernelParams.mMultiCtasKvMode), selectKernelParams.mHeadDimPerCtaV,
                 params.mHeadDimQk, params.mHeadDimV, selectKernelParams.mTileSizeQ, selectKernelParams.mTileSizeKv,
                 selectKernelParams.mNumTokensPerPage, selectKernelParams.mReuseSmemKForV,
-                selectKernelParams.mUses2CtaMma, params.mSparseMla, selectKernelParams.mSkipsSoftmaxWhenPossible),
+                selectKernelParams.mUses2CtaMma, static_cast<int>(params.mSparseAttention),
+                selectKernelParams.mSkipsSoftmaxWhenPossible),
             info);
     }
 
@@ -969,11 +1038,15 @@ private:
     // Compute the number of CTAs in X, Y and Z dimension and the cluster size in the X dimension.
     using CtaInfo = std::tuple<int, int, int, int, int, int>;
 
-    Data_type mDtypeQ, mDtypeKv, mDtypeOut;
+    Data_type mDtypeQ, mDtypeK, mDtypeV, mDtypeOut;
     std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> mDriver;
     KernelMeta const* mKernelMeta;
     unsigned int mKernelMetaCount;
     unsigned int mSM;
+    int mNumEltsPerSageAttnBlkQ;
+    int mNumEltsPerSageAttnBlkK;
+    int mNumEltsPerSageAttnBlkP;
+    int mNumEltsPerSageAttnBlkV;
     std::unordered_map<unsigned char const*, CUmodule> mModules;
 
     struct KernelInfo
@@ -995,16 +1068,22 @@ public:
     using KernelType = TllmGenFmhaKernel;
 
     KernelType* getKernels(const typename KernelType::KernelMeta* pKernelList, unsigned int nbKernels, Data_type dtypeQ,
-        Data_type dtypeKv, Data_type dtypeOut, unsigned int sm)
+        Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut, unsigned int sm, int numEltsPerSageAttnBlkQ = 0,
+        int numEltsPerSageAttnBlkK = 0, int numEltsPerSageAttnBlkP = 0, int numEltsPerSageAttnBlkV = 0)
     {
         static std::mutex s_mutex;
         std::lock_guard<std::mutex> lg(s_mutex);
+        TLLM_CHECK_WITH_INFO(numEltsPerSageAttnBlkQ <= 64 && numEltsPerSageAttnBlkK <= 64
+                && numEltsPerSageAttnBlkP <= 64 && numEltsPerSageAttnBlkV <= 64,
+            "SageAttention allows numEltsPerSageAttnBlk up to 64.");
 
-        auto const id = hashID(dtypeQ, dtypeKv, dtypeOut, sm);
+        auto const id = hashID(dtypeQ, dtypeK, dtypeV, dtypeOut, sm, numEltsPerSageAttnBlkQ, numEltsPerSageAttnBlkK,
+            numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV);
         auto const findIter = mKernels.find(id);
         if (findIter == mKernels.end())
         {
-            KernelType* newKernel = new KernelType{pKernelList, nbKernels, dtypeQ, dtypeKv, dtypeOut, sm};
+            KernelType* newKernel = new KernelType{pKernelList, nbKernels, dtypeQ, dtypeK, dtypeV, dtypeOut, sm,
+                numEltsPerSageAttnBlkQ, numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV};
             newKernel->loadKernels();
             mKernels.insert(std::make_pair(id, std::unique_ptr<KernelType>(newKernel)));
             return newKernel;
@@ -1027,21 +1106,49 @@ public:
 private:
     TllmFmhaKernelFactory() = default;
 
-    inline uint64_t hashID(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut, unsigned int sm) const
+    inline uint64_t hashID(Data_type dtypeQ, Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut, unsigned int sm,
+        int numEltsPerSageAttnBlkQ, int numEltsPerSageAttnBlkK, int numEltsPerSageAttnBlkP,
+        int numEltsPerSageAttnBlkV) const
     {
-        return static_cast<uint64_t>(sm) | static_cast<uint64_t>(dtypeQ) << 16 | static_cast<uint64_t>(dtypeKv) << 20
-            | static_cast<uint64_t>(dtypeOut) << 24;
+        auto const computeLog2BlockSizePlus1 = [](int blockSize) -> int
+        {
+            if (blockSize <= 0)
+            {
+                return 0;
+            }
+            TLLM_CHECK_WITH_INFO((blockSize & (blockSize - 1)) == 0, "SageAttn block size must be a power of 2.");
+            return __builtin_ctz(static_cast<unsigned int>(blockSize)) + 1;
+        };
+        // Format of the hash key:
+        // Bit 0  - 15: smVer
+        // Bit 16 - 19: dtypeQ
+        // Bit 20 - 23: dtypeK
+        // Bit 24 - 27: dtypeV
+        // Bit 28 - 31: dtypeOut
+        // Bit 32 - 34: log2NumEltsPerSageAttnBlkQ + 1 -- 0 for non-sage, max numEltsPerSageAttnBlkQ is 64.
+        // Bit 35 - 37: log2NumEltsPerSageAttnBlkK + 1 -- 0 for non-sage, max numEltsPerSageAttnBlkK is 64.
+        // Bit 38 - 40: log2NumEltsPerSageAttnBlkP + 1 -- 0 for non-sage, max numEltsPerSageAttnBlkP is 64.
+        // Bit 41 - 43: log2NumEltsPerSageAttnBlkV + 1 -- 0 for non-sage, max numEltsPerSageAttnBlkV is 64.
+        return static_cast<uint64_t>(sm) | static_cast<uint64_t>(dtypeQ) << 16 | static_cast<uint64_t>(dtypeK) << 20
+            | static_cast<uint64_t>(dtypeV) << 24 | static_cast<uint64_t>(dtypeOut) << 28
+            | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkQ)) << 32)
+            | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkK)) << 35)
+            | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkP)) << 38)
+            | (static_cast<uint64_t>(computeLog2BlockSizePlus1(numEltsPerSageAttnBlkV)) << 41);
     }
 
     std::unordered_map<uint64_t, const std::unique_ptr<KernelType>> mKernels;
 };
 
-inline TllmGenFmhaKernel* getTllmFmhaKernels(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut, unsigned int sm)
+inline TllmGenFmhaKernel* getTllmFmhaKernels(Data_type dtypeQ, Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut,
+    unsigned int sm, int numEltsPerSageAttnBlkQ = 0, int numEltsPerSageAttnBlkK = 0, int numEltsPerSageAttnBlkP = 0,
+    int numEltsPerSageAttnBlkV = 0)
 {
 
 #ifndef EXCLUDE_SM_100F
     return TllmFmhaKernelFactory::Get().getKernels(sTllmGenFmhaKernelMetaInfos,
-        sizeof(sTllmGenFmhaKernelMetaInfos) / sizeof(sTllmGenFmhaKernelMetaInfos[0]), dtypeQ, dtypeKv, dtypeOut, sm);
+        sizeof(sTllmGenFmhaKernelMetaInfos) / sizeof(sTllmGenFmhaKernelMetaInfos[0]), dtypeQ, dtypeK, dtypeV, dtypeOut,
+        sm, numEltsPerSageAttnBlkQ, numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV);
 #else
     return nullptr;
 #endif // EXCLUDE_SM_100F

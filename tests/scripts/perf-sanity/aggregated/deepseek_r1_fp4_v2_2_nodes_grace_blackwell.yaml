@@ -5,7 +5,7 @@ metadata:
 hardware:
   gpus_per_node: 4
 server_configs:
-  # 1k1k configs - DEP8 with CUTLASS, MTP1
+  # 1k1k configs - DEP8 with CUTEDSL, MTP1
   - name: "r1_fp4_v2_dep8_mtp1_1k1k"
     model_name: "deepseek_r1_0528_fp4_v2"
     trust_remote_code: true
@@ -21,7 +21,8 @@ server_configs:
       enable_balance: true
       timeout_iters: 60
     moe_config:
-      backend: 'CUTLASS'
+      backend: 'CUTEDSL'
+      use_low_precision_moe_combine: true
     cuda_graph_config:
       enable_padding: true
       max_batch_size: 512
@@ -41,7 +42,7 @@ server_configs:
         backend: "openai"
         dataset_file: datasets/perf-ci/deepseek_r1-1k1k-20480-ratio-1_for_serve.json
 
-  # 8k1k configs - DEP8 with CUTLASS, MTP1
+  # 8k1k configs - DEP8 with CUTEDSL, MTP1
   - name: "r1_fp4_v2_dep8_mtp1_8k1k"
     model_name: "deepseek_r1_0528_fp4_v2"
     trust_remote_code: true
@@ -57,7 +58,8 @@ server_configs:
       enable_balance: true
       timeout_iters: 60
     moe_config:
-      backend: 'CUTLASS'
+      backend: 'CUTEDSL'
+      use_low_precision_moe_combine: true
     cuda_graph_config:
       enable_padding: true
       max_batch_size: 512

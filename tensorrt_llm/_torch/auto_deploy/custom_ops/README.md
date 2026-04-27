@@ -29,6 +29,7 @@ The table below lists the operators grouped by category.
 | `torch.ops.auto_deploy.torch_mla` | Multi-head Latent Attention (MLA) implementation |
 | `torch.ops.auto_deploy.torch_cached_mla_with_cache` | PyTorch backend cached MLA with KV cache |
 | `torch.ops.auto_deploy.flashinfer_mla_with_cache` | FlashInfer MLA with cache |
+| `torch.ops.auto_deploy.flashinfer_trtllm_mla_with_cache` | FlashInfer TRTLLM-gen MLA with paged cache |
 | `torch.ops.auto_deploy.flashinfer_mla_prepare_metadata` | FlashInfer MLA metadata preparation |
 
 #### RoPE (Rotary Position Embedding)

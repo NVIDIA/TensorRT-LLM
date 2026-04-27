@@ -14,11 +14,20 @@ from tensorrt_llm._torch.utils import get_model_extra_attrs
 from tensorrt_llm._utils import mpi_comm, mpi_disabled
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
+from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy, MoEAllReduceParams)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
+
+# Feature flag: GEMM→NCCL-window zero-copy (writes GEMM output directly into
+# the window buffer so the allreduce needs no extra copy).  Off by default
+# (0); set TLLM_NCCL_SYMMETRIC_ZERO_COPY=1 to enable.
+# Evaluated once at import — O(1) module-global lookup on every call,
+# equivalent to a C++ static-bool cached env var.
+_NCCL_SYMMETRIC_ZERO_COPY: bool = (os.environ.get(
+    "TLLM_NCCL_SYMMETRIC_ZERO_COPY", "0") == "1")
 
 _thread_local = threading.local()
 
@@ -769,6 +778,30 @@ class AllReduce(nn.Module):
                     )
                     self.mnnvl_allreduce = None
 
+    def uses_nccl_symmetric_memory_window(self) -> bool:
+        """Return True if this allreduce can use an NCCL window output buffer.
+
+        Requires TLLM_NCCL_SYMMETRIC_ZERO_COPY=1 AND NCCL_SYMMETRIC/NCCL/AUTO
+        strategy AND tp_size > 1 AND MPI not disabled.
+        """
+        return (_NCCL_SYMMETRIC_ZERO_COPY and self.strategy
+                in (AllReduceStrategy.NCCL_SYMMETRIC, AllReduceStrategy.NCCL,
+                    AllReduceStrategy.AUTO) and self.mapping.tp_size > 1
+                and not self._disable_mpi)
+
+    @property
+    def output_buffer_kind(self) -> int:
+        """Buffer kind callers should use when allocating the tensor that will
+        be passed into this allreduce.
+
+        Returns int(BufferKind.NCCL_WINDOW) when zero-copy window output is
+        active, int(BufferKind.DEFAULT) otherwise.  The value depends solely on
+        compile-time constants so it is safe to branch on inside torch.compile.
+        """
+        return (int(BufferKind.NCCL_WINDOW)
+                if self.uses_nccl_symmetric_memory_window() else int(
+                    BufferKind.DEFAULT))
+
     def forward(
         self,
         input: torch.Tensor,
@@ -1178,3 +1211,36 @@ def all_to_all_5d(
         gathered_heads = heads * world_size
         return out.reshape(batch, sharded_seq, qkv_count, gathered_heads,
                            head_dim)
+
+
+class MiniMaxAllReduceRMS(nn.Module):
+
+    def __init__(self, mapping: Mapping):
+        super().__init__()
+        self.mapping = mapping
+        self.workspace = get_allreduce_workspace(self.mapping)
+
+    def forward(self, input: torch.Tensor, rms_weights: torch.Tensor,
+                eps: float):
+        return torch.ops.trtllm.minimax_allreduce_rms(input, rms_weights,
+                                                      self.workspace,
+                                                      self.mapping.tp_rank,
+                                                      self.mapping.tp_size, eps,
+                                                      True)
+
+    def forward_qk(self, q: torch.Tensor, k: torch.Tensor,
+                   rms_weights_q: torch.Tensor, rms_weights_k: torch.Tensor,
+                   eps: float):
+        """Fused Q+K RMS norm with allreduce. Returns (q_out, k_out)."""
+        out_list = torch.ops.trtllm.minimax_allreduce_rms_qk(
+            q,
+            k,
+            rms_weights_q,
+            rms_weights_k,
+            self.workspace,
+            self.mapping.tp_rank,
+            self.mapping.tp_size,
+            eps,
+            True,
+        )
+        return (out_list[0], out_list[1])

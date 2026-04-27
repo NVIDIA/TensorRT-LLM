@@ -588,7 +588,7 @@ def worker_fn(
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Gather block data from all ranks to local_rank 0, then verify on world rank 0.
 
-        All ranks have all requests' block data (via add_sequence), so gather is simple.
+        All ranks have all requests' block data (via add_sequence_batch), so gather is simple.
         In DP mode, merge_block_data knows which ranks have valid (transferred) data.
         """
         blocks = kv_cache_manager.get_batch_cache_indices([request.py_request_id])[0]
@@ -682,9 +682,11 @@ def worker_fn(
             # Generation DP: only handle if request_index % gen_tp == tp_rank
             should_handle = i % gen_tp == tp_rank
 
-        # All ranks add_sequence so they have block data for verification
+        # All ranks add_sequence_batch so they have block data for verification
         # But only ranks that should_handle will submit to transceiver
-        kv_cache_manager.impl.add_sequence(request.py_request_id, request.prompt_len, 1, request)
+        kv_cache_manager.impl.add_sequence_batch(
+            [(request.py_request_id, request.prompt_len, 1)], [request]
+        )
 
         if should_handle:
             my_requests.append((i, request))  # Store index and request for transfer
@@ -700,6 +702,10 @@ def worker_fn(
         _run_gen_first1_transfer(rank, is_ctx, transceiver, my_requests)
     elif ctx_gen_workflow == "gen_first2":
         _run_gen_first2_transfer(rank, is_ctx, transceiver, my_requests)
+    elif ctx_gen_workflow == "ctx_first_sync":
+        _run_ctx_first_sync_transfer(
+            rank, is_ctx, transceiver, my_requests, ctx_enable_dp, gen_enable_dp
+        )
     else:
         _run_ctx_first_transfer(
             rank, is_ctx, transceiver, my_requests, ctx_enable_dp, gen_enable_dp
@@ -884,6 +890,55 @@ def _wait_ctx_request_ready(transceiver, my_requests):
     if not all_ready:
         raise TimeoutError("Timeout waiting for context requests to be ready")
     return all_ready
+
+
+def _run_ctx_first_sync_transfer(
+    rank, is_ctx, transceiver, my_requests, ctx_enable_dp, gen_enable_dp
+):
+    """Context-first transfer using synchronous receive (request_and_receive_sync)."""
+    do_warmup = not ctx_enable_dp and not gen_enable_dp and len(my_requests) > 0
+    if do_warmup:
+        warmup_idx, warmup_request = my_requests[0]
+        remaining_requests = my_requests[1:]
+
+        if is_ctx:
+            print(f"[Rank {rank}] CTX: Submitting warmup request {warmup_idx}...", flush=True)
+            transceiver.respond_and_send_async(warmup_request)
+
+        print(f"[Rank {rank}] Before warmup barrier", flush=True)
+        dist.barrier()
+        print(f"[Rank {rank}] After warmup barrier", flush=True)
+
+        if not is_ctx:
+            print(f"[Rank {rank}] GEN: Sync-receiving warmup request {warmup_idx}...", flush=True)
+            transceiver.request_and_receive_sync(warmup_request)
+            print(f"[Rank {rank}] GEN: Warmup completed (sync)", flush=True)
+
+        if is_ctx:
+            transceiver.check_context_transfer_status(None)
+            print(f"[Rank {rank}] CTX: Warmup completed", flush=True)
+
+        print(f"[Rank {rank}] Before post-warmup barrier", flush=True)
+        dist.barrier()
+        print(f"[Rank {rank}] After post-warmup barrier", flush=True)
+    else:
+        remaining_requests = my_requests
+
+    if is_ctx:
+        for req_idx, request in remaining_requests:
+            print(f"[Rank {rank}] CTX: Submitting request {req_idx}...", flush=True)
+            transceiver.respond_and_send_async(request)
+        print(f"[Rank {rank}] CTX: Submitted {len(remaining_requests)} send requests", flush=True)
+
+    print(f"[Rank {rank}] Before phase2 barrier", flush=True)
+    dist.barrier()
+    print(f"[Rank {rank}] After phase2 barrier", flush=True)
+
+    if not is_ctx:
+        for req_idx, request in remaining_requests:
+            print(f"[Rank {rank}] GEN: Sync-receiving request {req_idx}...", flush=True)
+            transceiver.request_and_receive_sync(request)
+        print(f"[Rank {rank}] GEN: Sync-received {len(remaining_requests)} requests", flush=True)
 
 
 def _run_gen_first1_transfer(rank, is_ctx, transceiver, my_requests):
@@ -1073,7 +1128,10 @@ MP_TEST_CONFIGS = [
     [(c[0], c[1], c[2], c[3], c[4], c[5], c[6]) for c in MP_TEST_CONFIGS],
     ids=[c[7] for c in MP_TEST_CONFIGS],
 )
-@pytest.mark.parametrize("workflow", ["ctx_first", "gen_first1", "gen_first2"])
+@pytest.mark.parametrize(
+    "workflow",
+    ["ctx_first", "ctx_first_sync", "gen_first1", "gen_first2"],
+)
 def test_v2_transceiver_mp(
     ctx_tp, ctx_pp, gen_tp, gen_pp, ctx_enable_dp, gen_enable_dp, is_mla, workflow
 ):

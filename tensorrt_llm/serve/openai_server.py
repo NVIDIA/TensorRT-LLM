@@ -33,7 +33,7 @@ from tensorrt_llm._utils import EnergyMonitor
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
-from tensorrt_llm.inputs.data import TokensPrompt, visual_gen_inputs
+from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
@@ -168,6 +168,18 @@ def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
     resp_format = ResponseFormat(type="structural_tag", format=stag_format)
     return GuidedDecodingParams(structural_tag=resp_format.model_dump_json(
         by_alias=True, exclude_none=True))
+
+
+def _normalize_image_output(image) -> list:
+    """Normalize image output to a list of individual images.
+
+    Handles single tensors, batched 4D tensors, and lists.
+    """
+    if isinstance(image, list):
+        return image
+    if hasattr(image, "dim") and image.dim() == 4:
+        return [image[i] for i in range(image.shape[0])]
+    return [image]
 
 
 class OpenAIServer:
@@ -369,14 +381,122 @@ class OpenAIServer:
 
         if self.generator.args.return_perf_metrics:
             set_prometheus_multiproc_dir()
-            self.metrics_collector = MetricsCollector({
-                "model_name": "undefined",
-                "engine_type": "undefined"
-            })
+            args = self.generator.args
+            pmc = getattr(args, "prometheus_metrics_config", None)
+            self.metrics_collector = MetricsCollector(
+                {
+                    "model_name": self.model,
+                    "engine_type": args.backend or "unknown"
+                },
+                e2e_request_latency_buckets=(pmc.e2e_request_latency_buckets
+                                             if pmc else None),
+                time_to_first_token_buckets=(pmc.time_to_first_token_buckets
+                                             if pmc else None),
+                time_per_output_token_buckets=(pmc.time_per_output_token_buckets
+                                               if pmc else None),
+                request_queue_time_buckets=(pmc.request_queue_time_buckets
+                                            if pmc else None),
+                request_prefill_time_buckets=(pmc.request_prefill_time_buckets
+                                              if pmc else None),
+                request_decode_time_buckets=(pmc.request_decode_time_buckets
+                                             if pmc else None),
+                request_inference_time_buckets=(
+                    pmc.request_inference_time_buckets if pmc else None),
+            )
+            self._log_config_info_metrics()
             max_perf_metrics = self.generator.args.perf_metrics_max_requests
             if max_perf_metrics > 0:
                 self.perf_metrics = deque(maxlen=max_perf_metrics)
                 self.perf_metrics_lock = asyncio.Lock()
+
+    def _log_config_info_metrics(self) -> None:
+        """Extract configuration from generator args and log as Prometheus info gauges."""
+        args = self.generator.args
+
+        # Model config
+        model_config = {
+            "model": str(args.model),
+            "served_model_name": self.model,
+            "dtype": str(args.dtype),
+        }
+        quant_config = getattr(args, "quant_config", None)
+        if quant_config is not None:
+            quant_algo = getattr(quant_config, "quant_algo", None)
+            model_config["quantization"] = str(
+                quant_algo) if quant_algo else "none"
+        else:
+            model_config["quantization"] = "none"
+        max_seq_len = getattr(args, "max_seq_len", None)
+        if max_seq_len is not None:
+            model_config["max_model_len"] = str(max_seq_len)
+        try:
+            import torch
+            if torch.cuda.is_available():
+                model_config["gpu_type"] = torch.cuda.get_device_name(0)
+        except (ImportError, RuntimeError) as e:
+            logger.debug("Could not detect GPU type for config metrics: %s", e)
+
+        # Parallel config — prefer parallel_config from generator args
+        # for accurate values including cp_size and world_size.
+        par_cfg = getattr(args, "parallel_config", None)
+        if par_cfg is not None:
+            tp_size = getattr(par_cfg, "tp_size", 1) or 1
+            pp_size = getattr(par_cfg, "pp_size", 1) or 1
+            cp_size = getattr(par_cfg, "cp_size", 1) or 1
+            world_size = getattr(par_cfg, "world_size",
+                                 tp_size * pp_size * cp_size)
+        else:
+            tp_size = getattr(args, "tensor_parallel_size", 1) or 1
+            pp_size = getattr(args, "pipeline_parallel_size", 1) or 1
+            cp_size = 1
+            world_size = tp_size * pp_size * cp_size
+        parallel_config = {
+            "tensor_parallel_size": str(tp_size),
+            "pipeline_parallel_size": str(pp_size),
+            "context_parallel_size": str(cp_size),
+            "gpu_count": str(world_size),
+        }
+        ep_size = getattr(par_cfg, "moe_ep_size", None) if par_cfg else \
+            getattr(args, "moe_expert_parallel_size", None)
+        if ep_size is not None and ep_size > 0:
+            parallel_config["expert_parallel_size"] = str(ep_size)
+
+        # Speculative decoding config
+        spec_config_obj = getattr(args, "speculative_config", None) or getattr(
+            args, "decoding_config", None)
+        speculative_config = None
+        if spec_config_obj is not None:
+            speculative_config = {"spec_enabled": "true"}
+            decoding_type = getattr(spec_config_obj, "decoding_type", None)
+            if decoding_type is not None:
+                speculative_config["spec_method"] = str(decoding_type)
+            max_draft_len = getattr(spec_config_obj, "max_draft_len", None)
+            if max_draft_len is not None:
+                speculative_config["spec_num_tokens"] = str(max_draft_len)
+            draft_model = getattr(spec_config_obj, "speculative_model", None)
+            if draft_model is not None:
+                speculative_config["spec_draft_model"] = str(draft_model)
+
+        # KV cache config
+        kv_cache_config_obj = getattr(args, "kv_cache_config", None)
+        kv_cache_config = None
+        if kv_cache_config_obj is not None:
+            kv_cache_config = {}
+            for field in ("page_size", "enable_block_reuse",
+                          "enable_partial_reuse", "free_gpu_memory_fraction"):
+                val = getattr(kv_cache_config_obj, field, None)
+                if val is not None:
+                    kv_cache_config[field] = str(val)
+            kv_dtype = getattr(kv_cache_config_obj, "dtype", None)
+            if kv_dtype is not None:
+                kv_cache_config["cache_dtype"] = str(kv_dtype)
+
+        self.metrics_collector.log_config_info(
+            model_config=model_config,
+            parallel_config=parallel_config,
+            speculative_config=speculative_config,
+            kv_cache_config=kv_cache_config if kv_cache_config else None,
+        )
 
     async def await_disconnected(self, raw_request: Request, promise):
         if raw_request is None:
@@ -585,6 +705,21 @@ class OpenAIServer:
         if self._check_health():
             return Response(status_code=200)
         else:
+            # If the engine has a fatal error, trigger server shutdown so the
+            # pod doesn't linger as a zombie that accepts connections but never
+            # produces tokens.  Uses SIGINT (not SIGTERM) to match the
+            # existing CppExecutorError handlers and let uvicorn perform
+            # its graceful shutdown sequence.  The doing_shutdown guard
+            # ensures we only send SIGINT once — repeated health probes
+            # won't stack signals during an in-progress teardown.
+            executor = getattr(self.generator, '_executor', None)
+            if executor is not None and getattr(executor, '_fatal_error',
+                                                None) is not None:
+                if not getattr(executor, 'doing_shutdown', True):
+                    logger.error(
+                        "Health check detected fatal engine error, initiating "
+                        f"server shutdown: {executor._fatal_error}")
+                    signal.raise_signal(signal.SIGINT)
             return Response(
                 status_code=503,
                 content=
@@ -762,9 +897,9 @@ class OpenAIServer:
     async def get_kv_cache_events(self) -> JSONResponse:
         events = []
         try:
-            async for event in self.generator.get_kv_cache_events_async(2):
+            async for event in self.generator.get_kv_cache_events_async(0):
                 events.append(event)
-        except IndexError:
+        except (IndexError, asyncio.QueueEmpty):
             # queue is empty, no more events
             pass
         return JSONResponse(content=events)
@@ -773,7 +908,14 @@ class OpenAIServer:
         if not res.finished:
             return
         if self.metrics_collector:
-            self.metrics_collector.log_request_metrics_dict(res.metrics_dict)
+            if res.candidate_metrics:
+                for candidate_m in res.candidate_metrics:
+                    self.metrics_collector.log_request_metrics_dict(candidate_m)
+            elif res.metrics_dict:
+                # Fallback for paths that populate metrics_dict directly
+                # (e.g. PostprocWorker).
+                self.metrics_collector.log_request_metrics_dict(
+                    res.metrics_dict)
             # Note: Iteration stats are collected by the background _iteration_stats_collector_loop task
             # Wake up the stats collector to drain iteration stats
             if getattr(self.generator.args, "enable_iter_perf_stats", True):
@@ -812,6 +954,8 @@ class OpenAIServer:
         disaggregated_params: Optional[LlmDisaggregatedParams] = None
     ) -> ChatCompletionResponse:
         await promise.aresult()
+        if promise.error is not None:
+            raise RuntimeError(f"Generation failed: {promise.error}")
         if self.postproc_worker_enabled:
             chat_response = promise.outputs[0]._postprocess_result
         else:
@@ -1083,13 +1227,15 @@ class OpenAIServer:
 
             try:
                 conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
-                    request.messages, self.model_config)
+                    request.messages, self.model_config,
+                    self.multimodal_server_config)
             except ValidationError:
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
                 raw_body = await raw_request.json()
                 raw_messages = raw_body.get("messages", [])
                 conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
-                    raw_messages, self.model_config)
+                    raw_messages, self.model_config,
+                    self.multimodal_server_config)
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
@@ -1136,6 +1282,8 @@ class OpenAIServer:
                 postproc_params: Optional[PostprocParams]
         ) -> CompletionResponse:
             response = await promise
+            if response.error is not None:
+                raise RuntimeError(f"Generation failed: {response.error}")
             if not self.postproc_worker_enabled:
                 post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
                 pp_result = post_processor(response, args)
@@ -1642,21 +1790,13 @@ class OpenAIServer:
         """
         try:
             image_id = f"image_{uuid.uuid4().hex}"
-            params = parse_visual_gen_params(request, image_id)
+            params = parse_visual_gen_params(request, image_id, self.generator)
             logger.info(
                 f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
             )
 
-            if request.negative_prompt is not None:
-                inputs = visual_gen_inputs({
-                    "prompt":
-                    request.prompt,
-                    "negative_prompt":
-                    request.negative_prompt
-                })
-            else:
-                inputs = visual_gen_inputs(request.prompt)
-            output = self.generator.generate(inputs=inputs, params=params)
+            output = self.generator.generate(inputs=request.prompt,
+                                             params=params)
             if output.image is None:
                 return self.create_error_response(
                     message="Image generation failed",
@@ -1665,22 +1805,16 @@ class OpenAIServer:
                 )
 
             # Build response
-            output_images = output.image
-            MediaStorage.save_image(
-                output_images,
-                self.media_storage_path / f"{image_id}.png",
-            )
-
-            if not isinstance(output_images, list):
-                output_images = [output_images]
+            output_images = _normalize_image_output(output.image)
 
             if request.response_format == "b64_json":
                 data = [
-                    ImageObject(b64_json=base64.b64encode(
-                        MediaStorage.convert_image_to_bytes(image)).decode(
-                            'utf-8'),
-                                revised_prompt=request.prompt)
-                    for image in output_images
+                    ImageObject(
+                        b64_json=base64.b64encode(
+                            MediaStorage.convert_image_to_bytes(image)).decode(
+                                'utf-8'),
+                        revised_prompt=request.prompt,
+                    ) for image in output_images
                 ]
 
                 response = ImageGenerationResponse(
@@ -1690,6 +1824,10 @@ class OpenAIServer:
                 )
 
             elif request.response_format == "url":
+                MediaStorage.save_image(
+                    output_images[0],
+                    self.media_storage_path / f"{image_id}.png",
+                )
                 # TODO: Support URL mode
                 return self._create_not_supported_error(
                     "URL mode is not supported for image generation")
@@ -1709,21 +1847,13 @@ class OpenAIServer:
         """
         try:
             image_id = f"image_{uuid.uuid4().hex}"
-            params = parse_visual_gen_params(request, image_id)
+            params = parse_visual_gen_params(request, image_id, self.generator)
             logger.info(
                 f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
             )
 
-            if request.negative_prompt is not None:
-                inputs = visual_gen_inputs({
-                    "prompt":
-                    request.prompt,
-                    "negative_prompt":
-                    request.negative_prompt
-                })
-            else:
-                inputs = visual_gen_inputs(request.prompt)
-            output = self.generator.generate(inputs=inputs, params=params)
+            output = self.generator.generate(inputs=request.prompt,
+                                             params=params)
             if output.image is None:
                 return self.create_error_response(
                     message="Image editing failed",
@@ -1732,23 +1862,17 @@ class OpenAIServer:
                 )
 
             # Build response
-            output_images = output.image
-            MediaStorage.save_image(
-                output_images,
-                self.media_storage_path / f"{image_id}.png",
-            )
-
-            if not isinstance(output_images, list):
-                output_images = [output_images]
+            output_images = _normalize_image_output(output.image)
 
             response = ImageGenerationResponse(
                 created=int(time.time()),
                 data=[
-                    ImageObject(b64_json=base64.b64encode(
-                        MediaStorage.convert_image_to_bytes(image)).decode(
-                            'utf-8'),
-                                revised_prompt=request.prompt)
-                    for image in output_images
+                    ImageObject(
+                        b64_json=base64.b64encode(
+                            MediaStorage.convert_image_to_bytes(image)).decode(
+                                'utf-8'),
+                        revised_prompt=request.prompt,
+                    ) for image in output_images
                 ],
                 size=f"{params.width}x{params.height}",
             )
@@ -1784,22 +1908,15 @@ class OpenAIServer:
             video_id = f"video_{uuid.uuid4().hex}"
             params = parse_visual_gen_params(request,
                                              video_id,
+                                             self.generator,
                                              media_storage_path=str(
                                                  self.media_storage_path))
             logger.info(
                 f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}"
             )
 
-            if request.negative_prompt is not None:
-                inputs = visual_gen_inputs({
-                    "prompt":
-                    request.prompt,
-                    "negative_prompt":
-                    request.negative_prompt
-                })
-            else:
-                inputs = visual_gen_inputs(request.prompt)
-            output = self.generator.generate(inputs=inputs, params=params)
+            output = self.generator.generate(inputs=request.prompt,
+                                             params=params)
             if output.video is None:
                 return self.create_error_response(
                     message="Video generation failed",
@@ -1918,6 +2035,7 @@ class OpenAIServer:
             video_id = f"video_{uuid.uuid4().hex}"
             params = parse_visual_gen_params(request,
                                              video_id,
+                                             self.generator,
                                              media_storage_path=str(
                                                  self.media_storage_path))
             logger.info(
@@ -1966,16 +2084,8 @@ class OpenAIServer:
             resolved_fmt, resolved_ext = resolve_video_format(
                 request.output_format)
 
-            if request.negative_prompt is not None:
-                inputs = visual_gen_inputs({
-                    "prompt":
-                    request.prompt,
-                    "negative_prompt":
-                    request.negative_prompt
-                })
-            else:
-                inputs = visual_gen_inputs(request.prompt)
-            future = self.generator.generate_async(inputs=inputs, params=params)
+            future = self.generator.generate_async(inputs=request.prompt,
+                                                   params=params)
             output = await future.result()
 
             if output.video is None:

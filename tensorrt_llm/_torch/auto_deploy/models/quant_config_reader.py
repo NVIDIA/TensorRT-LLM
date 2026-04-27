@@ -11,7 +11,7 @@ import os
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional, Tuple, Type
 
-from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
+from ..utils.logger import ad_logger
 
 
 class QuantConfigReader(ABC):
@@ -85,7 +85,13 @@ class QuantConfigReaderRegistry:
 
 @QuantConfigReaderRegistry.register("modelopt")
 class ModelOPTQuantConfigReader(QuantConfigReader):
-    _ALWAYS_EXCLUDE = ("lm_head", "model.embed_tokens", "*.mixer.gate*", "*.mlp.gate")
+    _ALWAYS_EXCLUDE = (
+        "lm_head",
+        "model.embed_tokens",
+        "*.embed_tokens",
+        "*.mixer.gate*",
+        "*.mlp.gate",
+    )
     DEFAULT_TORCH_DTYPE = "float16"
     DEFAULT_KV_CACHE_DTYPE = "fp8"
 

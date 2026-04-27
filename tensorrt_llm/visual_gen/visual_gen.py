@@ -22,7 +22,6 @@ import threading
 import time
 import traceback
 import weakref
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
 
@@ -32,11 +31,20 @@ import zmq
 from tensorrt_llm._torch.visual_gen import DiffusionRequest, DiffusionResponse
 from tensorrt_llm._torch.visual_gen.executor import run_diffusion_worker
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
+from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
 from tensorrt_llm.visual_gen.args import VisualGenArgs
+from tensorrt_llm.visual_gen.params import VisualGenParams
 
-__all__ = ["VisualGen", "VisualGenParams", "MediaOutput", "VisualGenError", "VisualGenResult"]
+__all__ = [
+    "VisualGen",
+    "VisualGenParams",
+    "ExtraParamSchema",
+    "MediaOutput",
+    "VisualGenError",
+    "VisualGenParamsError",
+    "VisualGenResult",
+]
 from tensorrt_llm.executor.ipc import ZeroMqQueue
-from tensorrt_llm.inputs.data import VisualGenInputs
 from tensorrt_llm.llmapi.utils import set_api_status
 from tensorrt_llm.logger import logger
 
@@ -65,8 +73,20 @@ def get_ip_address() -> str:
         s.close()
 
 
+@set_api_status("prototype")
 class VisualGenError(RuntimeError):
     """Base exception for all VisualGen operations."""
+
+
+@set_api_status("prototype")
+class VisualGenParamsError(ValueError):
+    """Raised when request parameters fail validation.
+
+    This covers unknown parameter keys, unsupported universal fields
+    for the loaded pipeline, type mismatches, and out-of-range values.
+    Caught by the executor so it returns an error response rather than
+    crashing the server.
+    """
 
 
 class DiffusionRemoteClient:
@@ -115,6 +135,10 @@ class DiffusionRemoteClient:
 
         # Wait for the background thread to initialize the event loop
         self.event_loop_ready.wait()
+
+        # Pipeline metadata — populated by _wait_ready from the READY signal.
+        self.default_generation_params: Dict = {}
+        self.extra_param_specs: Dict = {}
 
         # Launch workers (VisualGenArgs is pickled via mp.Process spawn context)
         n_workers = self.n_workers
@@ -368,7 +392,14 @@ class DiffusionRemoteClient:
         while True:
             async with self.lock:
                 if -1 in self.completed_responses:
-                    self.completed_responses.pop(-1)
+                    ready_resp = self.completed_responses.pop(-1)
+                    # Extract pipeline metadata from the READY payload.
+                    payload = ready_resp.output
+                    if isinstance(payload, dict):
+                        self.default_generation_params = payload.get(
+                            "default_generation_params", {}
+                        )
+                        self.extra_param_specs = payload.get("extra_param_specs", {})
                     elapsed = time.time() - start_time
                     logger.info(f"DiffusionClient: Workers ready ({elapsed:.1f}s)")
                     return
@@ -389,6 +420,7 @@ class DiffusionRemoteClient:
             self.response_event.clear()
 
 
+@set_api_status("prototype")
 class VisualGenResult:
     """Future-like object for async generation."""
 
@@ -447,69 +479,6 @@ class VisualGenResult:
         raise NotImplementedError("Cancel request (not yet implemented).")
 
 
-@dataclass
-@set_api_status("prototype")
-class VisualGenParams:
-    """Parameters for visual generation.
-
-    Attributes:
-        height: Output height in pixels
-        width: Output width in pixels
-        num_inference_steps: Number of denoising steps
-        guidance_scale: Classifier-free guidance scale
-        max_sequence_length: Maximum sequence length for text encoding
-        seed: Random seed for reproducibility
-
-        # Video-specific parameters
-        num_frames: Number of video frames to generate
-        frame_rate: Frame rate for video output in fps
-
-        # Image-specific parameters
-        num_images_per_prompt: Number of images to generate per prompt (for image models)
-
-        # Advanced parameters
-        guidance_rescale: Guidance rescale factor (for some models)
-        output_type: Output type ("pt" for PyTorch tensors, "pil" for PIL images)
-    """
-
-    height: int = 720
-    width: int = 1280
-    num_inference_steps: int = 50
-    guidance_scale: float = 5.0
-    max_sequence_length: int = 512
-    seed: int = 42
-
-    # Video-specific parameters
-    num_frames: int = 81
-    frame_rate: float = 24.0
-    input_reference: Optional[str] = None
-    image_cond_strength: float = 1.0
-
-    # Image-specific parameters
-    num_images_per_prompt: int = 1
-
-    # Image edit parameters
-    image: Optional[List[str]] = None
-    mask: Optional[str] = None
-
-    # Advanced parameters
-    guidance_rescale: float = 0.0
-    output_type: str = "pt"
-
-    # LTX-2 multi-modal guidance (STG / modality guidance)
-    stg_scale: float = 0.0
-    stg_blocks: Optional[List[int]] = None
-    modality_scale: float = 1.0
-    rescale_scale: float = 0.0
-    guidance_skip_step: int = 0
-    enhance_prompt: bool = False
-
-    # Wan-specific parameters
-    guidance_scale_2: Optional[float] = None
-    boundary_ratio: Optional[float] = None
-    last_image: Optional[str] = None
-
-
 class VisualGen:
     """High-level API for visual generation."""
 
@@ -529,16 +498,53 @@ class VisualGen:
 
         atexit.register(VisualGen._atexit_shutdown, weakref.ref(self))
 
+    @property
+    def extra_param_specs(self) -> Dict[str, "ExtraParamSchema"]:
+        """Returns extra param specs for the loaded pipeline.
+
+        Use this to discover types, ranges, and descriptions of
+        model-specific parameters passed via ``extra_params``.
+        """
+        return self.executor.extra_param_specs
+
+    @property
+    def default_params(self) -> "VisualGenParams":
+        """Returns a ``VisualGenParams`` with all defaults resolved for the loaded pipeline.
+
+        Universal fields (height, width, etc.) are filled from the
+        pipeline's defaults.  All declared ``extra_params`` keys are
+        included with their defaults (``None`` for params without one).
+
+        Use this to inspect what the model will use, then modify and
+        pass to ``generate()``::
+
+            params = visual_gen.default_params
+            params.extra_params["stg_scale"] = 0.5
+            params.height = 1024
+            output = visual_gen.generate(inputs="a cat", params=params)
+        """
+        kwargs = dict(self.executor.default_generation_params)
+        extra = {}
+
+        for key, spec in self.executor.extra_param_specs.items():
+            extra[key] = spec.default
+
+        if extra:
+            kwargs["extra_params"] = extra
+
+        return VisualGenParams(**kwargs)
+
     @set_api_status("prototype")
     def generate(
         self,
-        inputs: VisualGenInputs,
-        params: VisualGenParams,
+        inputs: Union[str, List[str]],
+        params: Optional[VisualGenParams] = None,
     ) -> MediaOutput:
         """Synchronous generation. Blocks until complete.
 
         Args:
-            params: Generation parameters.
+            inputs: Text prompt string or list of prompt strings.
+            params: Generation parameters (optional; uses model defaults when None).
 
         Returns:
             MediaOutput: Generated media with model-specific fields populated:
@@ -560,80 +566,38 @@ class VisualGen:
     @set_api_status("prototype")
     def generate_async(
         self,
-        inputs: VisualGenInputs,
-        params: VisualGenParams,
+        inputs: Union[str, List[str]],
+        params: Optional[VisualGenParams] = None,
     ) -> VisualGenResult:
         """Async generation. Returns immediately with future-like object.
 
         Args:
-            params: Generation parameters.
+            inputs: Text prompt string or list of prompt strings.
+            params: Generation parameters (optional; uses model defaults when None).
 
         Returns:
             VisualGenResult: Call result() to get output dict.
         """
         req_id = next(self._req_counter)
 
-        # Normalize inputs to (prompt: List[str], negative_prompt: Optional[str])
-        # so DiffusionRequest.prompt is always a list.
-        if isinstance(inputs, dict):
-            prompt = [inputs.get("prompt")]
-            negative_prompt = inputs.get("negative_prompt", None)
-        elif isinstance(inputs, str):
+        # Normalize to List[str] for DiffusionRequest.prompt
+        if isinstance(inputs, str):
             prompt = [inputs]
-            negative_prompt = None
         elif isinstance(inputs, (list, tuple)):
-            # Batch generation: list of prompts
             if not inputs:
                 raise ValueError("Batch inputs must contain at least one item")
-
-            prompt = []
-            negative_prompts = []
-            for idx, inp in enumerate(inputs):
-                if isinstance(inp, str):
-                    prompt.append(inp)
-                    negative_prompts.append(None)
-                elif isinstance(inp, dict):
-                    item_prompt = inp.get("prompt")
-                    if item_prompt is None:
-                        raise ValueError(f"Batch input at index {idx} is missing 'prompt'")
-                    prompt.append(item_prompt)
-                    negative_prompts.append(inp.get("negative_prompt"))
-                else:
-                    raise ValueError(f"Invalid batch item type at index {idx}: {type(inp)}")
-
-            unique_negatives = {p for p in negative_prompts if p is not None}
-            if len(unique_negatives) > 1:
-                raise ValueError("Per-item negative_prompt is not supported for batch inputs")
-            negative_prompt = next(iter(unique_negatives), None)
+            if not all(isinstance(item, str) for item in inputs):
+                raise ValueError("Batch inputs must contain only strings (prompt text)")
+            prompt = list(inputs)
         else:
             raise ValueError(f"Invalid inputs type: {type(inputs)}")
 
+        # Snapshot caller-provided params so later mutations don't affect
+        # the queued request (the dispatcher thread serializes it lazily).
         request = DiffusionRequest(
             request_id=req_id,
             prompt=prompt,
-            negative_prompt=negative_prompt,
-            height=params.height,
-            width=params.width,
-            num_inference_steps=params.num_inference_steps,
-            guidance_scale=params.guidance_scale,
-            max_sequence_length=params.max_sequence_length,
-            seed=params.seed,
-            num_frames=params.num_frames,
-            frame_rate=params.frame_rate,
-            num_images_per_prompt=params.num_images_per_prompt,
-            guidance_rescale=params.guidance_rescale,
-            output_type=params.output_type,
-            stg_scale=params.stg_scale,
-            stg_blocks=params.stg_blocks,
-            modality_scale=params.modality_scale,
-            rescale_scale=params.rescale_scale,
-            guidance_skip_step=params.guidance_skip_step,
-            enhance_prompt=params.enhance_prompt,
-            image=params.input_reference,
-            image_cond_strength=params.image_cond_strength,
-            guidance_scale_2=params.guidance_scale_2,
-            boundary_ratio=params.boundary_ratio,
-            last_image=params.last_image,
+            params=params.model_copy(deep=True) if params is not None else None,
         )
 
         self.executor.enqueue_requests([request])

@@ -1,8 +1,9 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 # Note: The code is to extract image embedding from RADIO model, to support Nano v2 VLM.
 # TODO: Check and add more compatible logic for the full-series RADIO model.
 
 import copy
+import dataclasses
 import math
 from collections import namedtuple
 from typing import (Dict, Iterable, List, Literal, NamedTuple, Optional, Tuple,
@@ -114,6 +115,8 @@ class ViTPatchGenerator(nn.Module):
         register_multiple: Optional[int] = None,
         num_registers: Optional[int] = None,
         patch_bias: bool = False,
+        temporal_patch_size: int = 1,
+        separate_video_embedder: bool = True,
     ):
         super().__init__()
 
@@ -133,6 +136,7 @@ class ViTPatchGenerator(nn.Module):
         self.patch_size = patch_size
         self.abs_pos = abs_pos
         self.embed_dim = embed_dim
+        self.temporal_patch_size = temporal_patch_size
         self.num_rows = max_input_dims[0] // patch_size
         self.num_cols = max_input_dims[1] // patch_size
         self.input_dims = tuple(d // patch_size for d in input_dims)
@@ -141,6 +145,20 @@ class ViTPatchGenerator(nn.Module):
 
         self.im_to_patches = Im2Patches(patch_size)
         self.embedder = ViTPatchLinear(patch_size, embed_dim, bias=patch_bias)
+
+        if temporal_patch_size > 1:
+            if not separate_video_embedder:
+                raise NotImplementedError(
+                    "Only separate_video_embedder=True is supported for "
+                    "temporal compression (temporal_patch_size > 1).")
+            self.video_embedder = ViTPatchLinear(
+                patch_size,
+                embed_dim,
+                bias=patch_bias,
+                temporal_patch_size=temporal_patch_size,
+            )
+        self._video_embedder_loaded = False
+
         self.pos_embed = None
         if abs_pos:
             scale = embed_dim**-0.5
@@ -156,7 +174,15 @@ class ViTPatchGenerator(nn.Module):
         self.patch_normalizer = nn.LayerNorm(
             embed_dim) if normalize_patches else nn.Identity()
 
-    def forward(
+    def forward(self,
+                x: torch.Tensor,
+                image_sizes: Optional[List[Tuple[int, int]]] = None,
+                num_frames: Optional[int] = None) -> torch.Tensor:
+        if num_frames is not None and self.temporal_patch_size > 1:
+            return self.forward_video(x)
+        return self.forward_image(x, image_sizes=image_sizes)
+
+    def forward_image(
             self,
             x: torch.Tensor,
             image_sizes: Optional[List[Tuple[int,
@@ -171,6 +197,54 @@ class ViTPatchGenerator(nn.Module):
             patches, pos_enc = self.apply_pos_enc(patches,
                                                   input_size=x.shape[2:])
             patches = self.cls_token(patches)
+        patches = self.patch_normalizer(patches)
+        return patches
+
+    def forward_video(self, x: torch.Tensor) -> torch.Tensor:
+        """Process video frames with temporal compression.
+
+        Groups T consecutive frames into tubelets before embedding.
+
+        Args:
+            x: [num_frames, 3, H, W] tensor of video frames.
+
+        Returns:
+            Embedded patches with temporal compression applied,
+            shape [num_tubelets, seq_per_tubelet, embed_dim].
+        """
+        if not self._video_embedder_loaded:
+            raise ValueError(
+                "Temporal compression (video_temporal_patch_size > 1) requires "
+                "video_embedder weights, but they were never loaded. "
+                "Ensure the checkpoint was trained with temporal compression.")
+        T = self.temporal_patch_size
+        input_size = x.shape[2:]
+
+        patches = self.im_to_patches(x)  # [N, num_patches, 3*P*P]
+        num_frames, num_spatial, feat_dim = patches.shape
+
+        # Pad to a multiple of T by repeating the last frame.
+        num_pad_frames = (-num_frames) % T
+        if num_pad_frames > 0:
+            last_frame_dup = patches[-1:].expand(num_pad_frames, -1, -1)
+            patches = torch.cat([patches, last_frame_dup], dim=0)
+
+        # Group T frames per tubelet: concatenate features across T consecutive
+        # frames for each spatial position (matches Megatron training order).
+        num_frames_padded = patches.shape[0]
+        num_tubelets = num_frames_padded // T
+        patches = rearrange(
+            patches,
+            '(tubelets frames) spatial feat -> tubelets spatial (frames feat)',
+            tubelets=num_tubelets,
+            frames=T,
+            spatial=num_spatial,
+            feat=feat_dim,
+        )
+
+        patches = self.video_embedder(patches)
+        patches, _ = self.apply_pos_enc(patches, input_size=input_size)
+        patches = self.cls_token(patches)
         patches = self.patch_normalizer(patches)
         return patches
 
@@ -288,7 +362,7 @@ class ViTPatchGenerator(nn.Module):
             max_dim = max(input_dims)
             pos_embed = F.interpolate(pos_embed.float(),
                                       size=(max_dim, max_dim),
-                                      align_corners=True,
+                                      align_corners=False,
                                       mode='bilinear').to(pos_embed.dtype)
             pos_embed = window_select(pos_embed)
         else:
@@ -297,7 +371,7 @@ class ViTPatchGenerator(nn.Module):
         if pos_embed.shape[-2:] != input_dims:
             pos_embed = F.interpolate(pos_embed.float(),
                                       size=input_dims,
-                                      align_corners=True,
+                                      align_corners=False,
                                       mode='bilinear').to(pos_embed.dtype)
 
         pos_embed = pos_embed.flatten(2).permute(0, 2, 1)
@@ -338,9 +412,13 @@ class ViTPatchLinear(nn.Linear):
         patch_size: int,
         embed_dim: int,
         bias: bool = False,
+        temporal_patch_size: int = 1,
     ):
-        super().__init__(3 * (patch_size**2), embed_dim, bias=bias)
+        super().__init__(3 * temporal_patch_size * (patch_size**2),
+                         embed_dim,
+                         bias=bias)
         self.patch_size = patch_size
+        self.temporal_patch_size = temporal_patch_size
 
 
 class Block(nn.Module):
@@ -629,6 +707,12 @@ class VisionTransformer(nn.Module):
         register_multiple = getattr(special_args, 'register_multiple', None)
         num_registers = getattr(special_args, 'cpe_num_registers', None)
 
+        # Temporal compression config (for video).
+        self.temporal_patch_size = getattr(self.config,
+                                           'video_temporal_patch_size', 1)
+        separate_video_embedder = getattr(self.config,
+                                          'separate_video_embedder', True)
+
         self.patch_generator = ViTPatchGenerator(
             patch_size=patch_size,
             embed_dim=embed_dim,
@@ -640,6 +724,8 @@ class VisionTransformer(nn.Module):
             num_cls_tokens=num_cls_tokens,
             register_multiple=register_multiple,
             num_registers=num_registers,
+            temporal_patch_size=self.temporal_patch_size,
+            separate_video_embedder=separate_video_embedder,
         )
         self.patch_embed = None
         self.cls_token = None
@@ -659,11 +745,19 @@ class VisionTransformer(nn.Module):
 
         self.metadata_cls = attention_utils.get_attention_backend(
             model_config.attn_backend).Metadata
-        self.attn_metadata = self.metadata_cls(
+        metadata_kwargs = dict(
             max_num_requests=8192,  # TODO: Make this dynamic
             max_num_tokens=model_config.max_num_tokens,
             kv_cache_manager=None,
         )
+        if model_config.attn_backend == "FLASHINFER":
+            # FlashInfer's original default kv_layout is "NHD". TRT-LLM changed
+            # the default to "HND" for paged KV cache paths (see PR #6917).
+            # For ModelingRadio ragged prefill (kv_cache_manager=None), we
+            # explicitly use "NHD" because ragged k/v tensors computed directly
+            # from input are always in NHD format ([tokens, heads, dim]).
+            metadata_kwargs["kv_layout"] = "NHD"
+        self.attn_metadata = self.metadata_cls(**metadata_kwargs)
 
     def prepare_attn_metadata(self, batch_size: int, seq_lengths: List[int],
                               attn_metadata: AttentionMetadata):
@@ -673,7 +767,7 @@ class VisionTransformer(nn.Module):
         """
         prompt_lens = seq_lengths
         seq_lens = torch.tensor(seq_lengths,
-                                dtype=torch.int,
+                                dtype=torch.int32,
                                 pin_memory=prefer_pinned())
         request_ids = list(range(1, batch_size + 1))
 
@@ -688,15 +782,32 @@ class VisionTransformer(nn.Module):
         attn_metadata.prepare()
         return attn_metadata
 
-    def forward_features(
-            self,
-            x: torch.Tensor,
-            image_sizes: Optional[List[Tuple[int,
-                                             int]]] = None) -> torch.Tensor:
-        """Forward pass through feature layers (embeddings, transformer blocks, post-transformer norm)."""
-        x = self.patch_generator(x, image_sizes=image_sizes)
+    def forward_features(self,
+                         x: torch.Tensor,
+                         image_sizes: Optional[List[Tuple[int, int]]] = None,
+                         num_frames: Optional[int] = None) -> torch.Tensor:
+        """Forward pass through feature layers (embeddings, transformer blocks, post-transformer norm).
 
-        if image_sizes is not None:
+        Args:
+            x: Input pixel values.
+            image_sizes: Per-image pixel sizes for dynamic resolution.
+            num_frames: Number of video frames. When provided with
+                temporal_patch_size > 1, enables temporal compression.
+        """
+        T = self.temporal_patch_size
+        packed_batch_size = None  # set when we pack tubelets
+
+        x = self.patch_generator(x,
+                                 image_sizes=image_sizes,
+                                 num_frames=num_frames)
+
+        if num_frames is not None and T > 1:
+            packed_batch_size, seq_per_tubelet, hidden_size = x.shape
+            # Pack all tubelets into one sequence for attention.
+            x = x.reshape(1, -1, hidden_size)
+            seq_lengths = [seq_per_tubelet] * packed_batch_size
+            batch_size = packed_batch_size
+        elif image_sizes is not None:
             # Dynamic resolution: each image is a separate "context".
             num_skip = self.patch_generator.num_skip
             seq_lengths = [
@@ -717,7 +828,10 @@ class VisionTransformer(nn.Module):
         for block in self.blocks:
             x = block(x, attn_metadata=attn_metadata)
 
-        if image_sizes is not None:
+        # Reshape back from flattened.
+        if packed_batch_size is not None:
+            x = x.reshape(packed_batch_size, seq_per_tubelet, hidden_size)
+        elif image_sizes is not None:
             x = x.reshape(1, -1, hidden_size)
         else:
             x = x.reshape(batch_size, seq_lengths[0], hidden_size)
@@ -824,12 +938,11 @@ class RADIOVisionModelBase(nn.Module):
         width = max(width, self.min_resolution_step)
         return Resolution(height=height, width=width)
 
-    def forward(
-            self,
-            x: torch.Tensor,
-            feature_fmt: str = 'NLC',
-            image_sizes: Optional[List[Tuple[int,
-                                             int]]] = None) -> torch.Tensor:
+    def forward(self,
+                x: torch.Tensor,
+                feature_fmt: str = 'NLC',
+                image_sizes: Optional[List[Tuple[int, int]]] = None,
+                num_frames: Optional[int] = None) -> torch.Tensor:
         if image_sizes is None:
             res_step = self.min_resolution_step
             if res_step is not None and (x.shape[-2] % res_step != 0
@@ -840,7 +953,9 @@ class RADIOVisionModelBase(nn.Module):
                     f'Input: {x.shape[-2:]}, Nearest: {self.get_nearest_supported_resolution(*x.shape[-2:])}'
                 )
             x = self.input_conditioner(x)
-        y = self.model.forward_features(x, image_sizes=image_sizes)
+        y = self.model.forward_features(x,
+                                        image_sizes=image_sizes,
+                                        num_frames=num_frames)
         ret = self._extract_final(x,
                                   y,
                                   feature_fmt=feature_fmt,
@@ -902,12 +1017,14 @@ class RADIOVisionModel(PreTrainedModel):
 
     def __init__(self,
                  model_config: model_config_lib.ModelConfig,
-                 disable_quantization: bool = True):
+                 disable_quantization: bool = True,
+                 vision_attn_backend: Optional[str] = "FLASHINFER"):
         """
         Args:
             model_config: Model configuration.
             disable_quantization: Disable quantization for RADIO model.
                 Since the radio model is for vision only, we can disable quantization for it by default.
+            vision_attn_backend: Attention backend to use for the vision tower. Defaults to "FLASHINFER".
         """
         config = model_config.pretrained_config
         super().__init__(config)
@@ -915,10 +1032,14 @@ class RADIOVisionModel(PreTrainedModel):
         self.model_config = copy.deepcopy(model_config)
         if self.model_config.quant_config is not None:
             if disable_quantization:
-                # The basic method `apply_quant_config_exclude_modules` in DecoderModelForCausalLM keeps the kv_cache_quant_algo so we also keep it here.
-                self.model_config.quant_config = QuantConfig(
-                    kv_cache_quant_algo=self.model_config.quant_config.
-                    kv_cache_quant_algo)
+                # Vision encoder runs with kv_cache_manager=None, so there is no KV cache to
+                # quantize. Keeping kv_cache_quant_algo would make FlashInfer raise:
+                # "FP8 KV cache is not supported without a KV cache manager" for FP8 LLM checkpoints
+                # that specify FP8 KV Cache.
+                self.model_config.quant_config = QuantConfig()
+
+        self.model_config = dataclasses.replace(
+            self.model_config, attn_backend=vision_attn_backend)
 
         self.config = config
 
@@ -1012,10 +1133,23 @@ class RADIOVisionModel(PreTrainedModel):
             if not m.startswith('model.blocks.'):
                 raise ValueError(f"Missing key: {m}")
         for u in unexpected_keys:
-            # TODO(TRTLLM-11269): Add support for the conv3d layer.
-            if not u.startswith(
-                ('model.blocks.', 'model.patch_generator.video_embedder')):
+            # model.blocks weights are loaded separately below via
+            # _load_weights_impl (to handle qkv splitting).
+            # video_embedder is only unexpected when temporal_patch_size==1
+            # (model doesn't have the submodule).
+            if not u.startswith((
+                    'model.blocks.',
+                    'model.patch_generator.video_embedder',
+            )):
                 raise ValueError(f"Unexpected key: {u}")
+
+        # Mark video_embedder as loaded only when the submodule exists and its weights were actually
+        # present in the checkpoint (i.e. not reported as unexpected).
+        patch_gen = self.radio_model.model.patch_generator
+        if (getattr(patch_gen, 'video_embedder', None) is not None
+                and 'model.patch_generator.video_embedder.weight'
+                not in unexpected_keys):
+            patch_gen._video_embedder_loaded = True
 
         # Load weights for vision transformer module.
         model_weights = {
@@ -1047,5 +1181,8 @@ class RADIOVisionModel(PreTrainedModel):
 
     def forward(self,
                 x: torch.Tensor,
-                image_sizes: Optional[List[Tuple[int, int]]] = None):
-        return self.radio_model.forward(x, image_sizes=image_sizes)
+                image_sizes: Optional[List[Tuple[int, int]]] = None,
+                num_frames: Optional[int] = None):
+        return self.radio_model.forward(x,
+                                        image_sizes=image_sizes,
+                                        num_frames=num_frames)

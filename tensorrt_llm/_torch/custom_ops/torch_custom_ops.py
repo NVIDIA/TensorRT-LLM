@@ -1,4 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import enum
 import threading
+from dataclasses import replace
 from functools import lru_cache
 from typing import ClassVar, List, Mapping, Optional, Tuple, Union
 
@@ -18,6 +35,11 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          TuningConfig)
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+from .fast_custom_op import fast_custom_op
+
+if IS_FLASHINFER_AVAILABLE:
+    from flashinfer.fp4_quantization import nvfp4_quantize as _flashinfer_nvfp4_quantize
 from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.swiglu import silu_and_mul_kernel
 from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
@@ -29,6 +51,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
         CuteDSLNVFP4BlackwellRunner
 
+# BufferKind is bound from C++; see cpp/tensorrt_llm/thop/outputTensor.h (torch_ext::BufferKind).
+from tensorrt_llm.bindings.internal.thop import BufferKind
+
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
 @torch.library.custom_op("trtllm::bmm_out", mutates_args=("out", ))
@@ -39,6 +64,18 @@ def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
 class MoERunner(TunableRunner):
     # avoid overhead of creating a new runner in forward pass
     runner_dict = dict()
+
+    @staticmethod
+    def clear_all_workspaces():
+        """Release internal GPU workspace buffers from all cached MoE runners.
+
+        Call this to reclaim GPU memory held by the C++ FusedMoeRunner
+        instances. Workspaces are re-allocated automatically on the next
+        run_moe or run_gemm_profile call.
+        """
+        for runner in MoERunner.runner_dict.values():
+            runner.clear_workspaces()
+
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, get_last_power_of_2_num_tokens_buckets,
@@ -354,11 +391,13 @@ class FP8RowwiseGemmRunner(TunableRunner):
 
     def __init__(
         self,
-        to_userbuffers: bool,
+        output_buffer_kind: int,
         output_dtype: torch.dtype,
+        group: Optional[List[int]] = None,
     ):
-        self.to_userbuffers = to_userbuffers
+        self.output_buffer_kind = int(output_buffer_kind)
         self.output_dtype = output_dtype
+        self.group = group
         instance_key = (output_dtype, )
         if instance_key not in FP8RowwiseGemmRunner.runner_dict:
             FP8RowwiseGemmRunner.runner_dict[
@@ -369,8 +408,9 @@ class FP8RowwiseGemmRunner(TunableRunner):
 
     def unique_id(self):
         return (
-            self.to_userbuffers,
+            self.output_buffer_kind,
             self.output_dtype,
+            tuple(self.group) if self.group is not None else None,
         )
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
@@ -388,8 +428,9 @@ class FP8RowwiseGemmRunner(TunableRunner):
             mat2,
             mat1_scale,
             mat2_scale,
-            self.to_userbuffers,
+            self.output_buffer_kind,
             tactic,
+            self.group,
         )
 
 
@@ -400,13 +441,16 @@ def fp8_rowwise_gemm(
     act_scale: torch.Tensor,
     weight_scale: torch.Tensor,
     output_dtype: torch.dtype,
-    to_userbuffers: bool = False,
+    output_buffer_kind: int = int(BufferKind.DEFAULT),
+    group: Optional[List[int]] = None,
 ) -> torch.Tensor:
 
     tuner = AutoTuner.get()
 
     # allocate workspace for profiling
-    fp8_rowwise_gemm_runner = FP8RowwiseGemmRunner(to_userbuffers, output_dtype)
+    fp8_rowwise_gemm_runner = FP8RowwiseGemmRunner(output_buffer_kind,
+                                                   output_dtype,
+                                                   group=group)
 
     _, best_tactic = tuner.choose_one(
         "trtllm::fp8_rowwise_gemm::gemm",
@@ -426,7 +470,8 @@ def _(
     act_scale: torch.Tensor,
     weight_scale: torch.Tensor,
     output_dtype: torch.dtype,
-    to_userbuffers: bool = False,
+    output_buffer_kind: int = int(BufferKind.DEFAULT),
+    group: Optional[List[int]] = None,
 ) -> torch.Tensor:
     return act.new_empty((act.size(0), weight.size(0)), dtype=output_dtype)
 
@@ -442,12 +487,14 @@ class FP4GemmRunner(TunableRunner):
     def __init__(
         self,
         fp4_gemm_type: fp4_utils.FP4GemmType,
-        to_userbuffers: bool,
+        output_buffer_kind: int,
         output_dtype: torch.dtype,
+        group: Optional[List[int]] = None,
     ):
         self.fp4_gemm_type = fp4_gemm_type
         self.output_dtype = output_dtype
-        self.to_userbuffers = to_userbuffers
+        self.output_buffer_kind = int(output_buffer_kind)
+        self.group = group
         instance_key = (output_dtype, int(fp4_gemm_type))
         if instance_key not in FP4GemmRunner.runner_dict:
             FP4GemmRunner.runner_dict[
@@ -457,7 +504,7 @@ class FP4GemmRunner(TunableRunner):
 
     def unique_id(self):
         return (
-            self.to_userbuffers,
+            self.output_buffer_kind,
             self.output_dtype,
         )
 
@@ -477,8 +524,9 @@ class FP4GemmRunner(TunableRunner):
             mat1_scale,
             mat2_scale,
             global_scale,
-            self.to_userbuffers,
+            self.output_buffer_kind,
             tactic,
+            self.group,
         )
 
 
@@ -496,11 +544,13 @@ class CublasLtFP4GemmRunner(TunableRunner):
 
     def __init__(
         self,
-        to_userbuffers: bool,
+        output_buffer_kind: int,
         output_dtype: torch.dtype,
+        group: Optional[List[int]] = None,
     ):
         self.output_dtype = output_dtype
-        self.to_userbuffers = to_userbuffers
+        self.output_buffer_kind = int(output_buffer_kind)
+        self.group = group
         instance_key = (output_dtype, )
 
         if instance_key not in CublasLtFP4GemmRunner.runner_dict:
@@ -512,7 +562,7 @@ class CublasLtFP4GemmRunner(TunableRunner):
 
     def unique_id(self):
         return (
-            self.to_userbuffers,
+            self.output_buffer_kind,
             self.output_dtype,
         )
 
@@ -537,8 +587,9 @@ class CublasLtFP4GemmRunner(TunableRunner):
             mat1_scale,
             mat2_scale,
             alpha,
-            self.to_userbuffers,
+            self.output_buffer_kind,
             tactic,
+            self.group,
         )
         return result
 
@@ -560,10 +611,14 @@ class CudaCoreNVFP4Runner(TunableRunner):
     # Maximum M dimension (from cudaCoreGemmTemplateMaxM in C++ kernel)
     MAX_M_DIMENSION = 8
 
-    def __init__(self, to_userbuffers: bool, output_dtype: torch.dtype):
+    def __init__(self,
+                 output_buffer_kind: int,
+                 output_dtype: torch.dtype,
+                 group: Optional[List[int]] = None):
         super().__init__()
-        self.to_userbuffers = to_userbuffers
+        self.output_buffer_kind = int(output_buffer_kind)
         self.output_dtype = output_dtype
+        self.group = group
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile, **kwargs) -> List[int]:
@@ -609,20 +664,21 @@ class CudaCoreNVFP4Runner(TunableRunner):
             alpha=alpha,
             bias=None,
             out_dtype=self.output_dtype,
-            to_userbuffers=self.to_userbuffers,
+            output_buffer_kind=self.output_buffer_kind,
+            group=self.group,
         )
         return result
 
 
 @torch.library.custom_op("trtllm::nvfp4_gemm_cublaslt", mutates_args=())
 def nvfp4_gemm_cublaslt(
-    act_fp4: torch.Tensor,
-    weight: torch.Tensor,
-    act_sf: torch.Tensor,
-    weight_scale: torch.Tensor,
-    alpha: torch.Tensor,
-    output_dtype: torch.dtype,
-    to_userbuffers: bool = False,
+        act_fp4: torch.Tensor,
+        weight: torch.Tensor,
+        act_sf: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        output_dtype: torch.dtype,
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
 ) -> torch.Tensor:
     """cuBLASLt-based NVFP4 GEMM with heuristic-based auto-tuning.
 
@@ -634,7 +690,7 @@ def nvfp4_gemm_cublaslt(
     tuner = AutoTuner.get()
 
     # Use CublasLt runner with heuristic-based tuning
-    nvfp4_gemm_runner = CublasLtFP4GemmRunner(to_userbuffers, output_dtype)
+    nvfp4_gemm_runner = CublasLtFP4GemmRunner(output_buffer_kind, output_dtype)
 
     runner_type = type(nvfp4_gemm_runner).__name__
     op_key = f"trtllm::fp4_gemm_cublaslt::gemm::{runner_type}"
@@ -655,13 +711,13 @@ def nvfp4_gemm_cublaslt(
 
 @nvfp4_gemm_cublaslt.register_fake
 def _(
-    act_fp4: torch.Tensor,
-    weight: torch.Tensor,
-    act_sf: torch.Tensor,
-    weight_scale: torch.Tensor,
-    alpha: torch.Tensor,
-    output_dtype: torch.dtype,
-    to_userbuffers: bool = False,
+        act_fp4: torch.Tensor,
+        weight: torch.Tensor,
+        act_sf: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        output_dtype: torch.dtype,
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
 ) -> torch.Tensor:
     return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
                              dtype=output_dtype)
@@ -669,13 +725,13 @@ def _(
 
 @torch.library.custom_op("trtllm::nvfp4_gemm_cutlass", mutates_args=())
 def nvfp4_gemm_cutlass(
-    act_fp4: torch.Tensor,
-    weight: torch.Tensor,
-    act_sf: torch.Tensor,
-    weight_scale: torch.Tensor,
-    alpha: torch.Tensor,
-    output_dtype: torch.dtype,
-    to_userbuffers: bool = False,
+        act_fp4: torch.Tensor,
+        weight: torch.Tensor,
+        act_sf: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        output_dtype: torch.dtype,
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
 ) -> torch.Tensor:
     """CUTLASS-based NVFP4 GEMM with auto-tuning.
 
@@ -688,7 +744,7 @@ def nvfp4_gemm_cutlass(
 
     # Use Cutlass runner with predefined configs
     nvfp4_gemm_runner = FP4GemmRunner(fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
-                                      to_userbuffers, output_dtype)
+                                      output_buffer_kind, output_dtype)
 
     runner_type = type(nvfp4_gemm_runner).__name__
     _, best_tactic = tuner.choose_one(
@@ -705,13 +761,13 @@ def nvfp4_gemm_cutlass(
 
 @nvfp4_gemm_cutlass.register_fake
 def _(
-    act_fp4: torch.Tensor,
-    weight: torch.Tensor,
-    act_sf: torch.Tensor,
-    weight_scale: torch.Tensor,
-    alpha: torch.Tensor,
-    output_dtype: torch.dtype,
-    to_userbuffers: bool = False,
+        act_fp4: torch.Tensor,
+        weight: torch.Tensor,
+        act_sf: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        output_dtype: torch.dtype,
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
 ) -> torch.Tensor:
     return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
                              dtype=output_dtype)
@@ -727,18 +783,22 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
     )
 
-    def __init__(self, to_userbuffers: bool, output_dtype: torch.dtype,
-                 allowed_backends: List[str]):
+    def __init__(self,
+                 output_buffer_kind: int,
+                 output_dtype: torch.dtype,
+                 allowed_backends: List[str],
+                 group: Optional[List[int]] = None):
         super().__init__()
-        self.to_userbuffers = to_userbuffers
+        self.output_buffer_kind = int(output_buffer_kind)
         self.output_dtype = output_dtype
         self.allowed_backends = allowed_backends
+        self.group = group
 
     def unique_id(self):
         """Include allowed_backends in cache key to avoid sharing cache across different backend configs."""
         # Convert list to tuple for hashability
         allowed_tuple = tuple(self.allowed_backends)
-        return (self.to_userbuffers, self.output_dtype, allowed_tuple)
+        return (self.output_buffer_kind, self.output_dtype, allowed_tuple)
 
     def _is_backend_allowed(self, backend_name: str) -> bool:
         """Check if a backend is allowed based on allowed_backends list."""
@@ -771,8 +831,9 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                     and m <= CudaCoreNVFP4Runner.MAX_M_DIMENSION)
 
             if is_cuda_core_supported:
-                cuda_core_runner = CudaCoreNVFP4Runner(self.to_userbuffers,
-                                                       self.output_dtype)
+                cuda_core_runner = CudaCoreNVFP4Runner(self.output_buffer_kind,
+                                                       self.output_dtype,
+                                                       group=self.group)
                 cuda_core_tactics = cuda_core_runner.get_valid_tactics(
                     inputs, profile)
                 tactics.extend([("cuda_core", tactic)
@@ -787,16 +848,19 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
         # Add CUTLASS tactics if available
         if self._is_backend_allowed("cutlass"):
             cutlass_runner = FP4GemmRunner(
-                fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4, self.to_userbuffers,
-                self.output_dtype)
+                fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
+                self.output_buffer_kind,
+                self.output_dtype,
+                group=self.group)
             cutlass_tactics = cutlass_runner.get_valid_tactics(inputs, profile)
             tactics.extend([("cutlass", tactic) for tactic in cutlass_tactics])
 
         # Add cuBLASLt tactics if available
         if self._is_backend_allowed("cublaslt"):
             if IS_CUBLASLT_AVAILABLE:
-                cublaslt_runner = CublasLtFP4GemmRunner(self.to_userbuffers,
-                                                        self.output_dtype)
+                cublaslt_runner = CublasLtFP4GemmRunner(self.output_buffer_kind,
+                                                        self.output_dtype,
+                                                        group=self.group)
                 cublaslt_tactics = cublaslt_runner.get_valid_tactics(
                     inputs, profile)
                 tactics.extend([("cublaslt", tactic)
@@ -868,26 +932,30 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
 
         backend, sub_tactic = tactic
         if backend == "cuda_core":
-            return CudaCoreNVFP4Runner(self.to_userbuffers,
-                                       self.output_dtype)(inputs,
-                                                          tactic=sub_tactic)
+            return CudaCoreNVFP4Runner(self.output_buffer_kind,
+                                       self.output_dtype,
+                                       group=self.group)(inputs,
+                                                         tactic=sub_tactic)
         elif backend == "cutlass":
             return FP4GemmRunner(fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
-                                 self.to_userbuffers,
-                                 self.output_dtype)(inputs, tactic=sub_tactic)
+                                 self.output_buffer_kind,
+                                 self.output_dtype,
+                                 group=self.group)(inputs, tactic=sub_tactic)
         elif backend == "cublaslt":
-            return CublasLtFP4GemmRunner(self.to_userbuffers,
-                                         self.output_dtype)(inputs,
-                                                            tactic=sub_tactic)
+            return CublasLtFP4GemmRunner(self.output_buffer_kind,
+                                         self.output_dtype,
+                                         group=self.group)(inputs,
+                                                           tactic=sub_tactic)
         elif backend == "cutedsl":
-            return CuteDSLNVFP4BlackwellRunner(
-                self.output_dtype, self.to_userbuffers)(inputs,
-                                                        tactic=sub_tactic)
+            return CuteDSLNVFP4BlackwellRunner(self.output_dtype,
+                                               self.output_buffer_kind,
+                                               self.group)(inputs,
+                                                           tactic=sub_tactic)
         else:
             raise ValueError(f"Invalid tactic: {tactic}")
 
 
-@torch.library.custom_op("trtllm::nvfp4_gemm", mutates_args=())
+@fast_custom_op("trtllm::nvfp4_gemm", mutates_args=())
 def nvfp4_gemm(
     act_fp4: torch.Tensor,
     weight: torch.Tensor,
@@ -895,8 +963,9 @@ def nvfp4_gemm(
     weight_scale: torch.Tensor,
     alpha: torch.Tensor,
     output_dtype: torch.dtype,
-    to_userbuffers: bool = False,
+    output_buffer_kind: int = int(BufferKind.DEFAULT),
     allowed_backends: str = "cutlass,cublaslt,cuda_core",
+    group: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """Unified NVFP4 GEMM with automatic backend selection.
 
@@ -917,7 +986,7 @@ def nvfp4_gemm(
         weight_scale: Weight scale factors
         alpha: Scaling factor (as torch.Tensor for CUTLASS/cuBLASLt compatibility)
         output_dtype: Output data type
-        to_userbuffers: Whether to use user buffers (CUTLASS/cuBLASLt only)
+        output_buffer_kind: Output buffer allocation kind (default/userbuffers/nccl_window)
         allowed_backends: Comma-separated list of backends to consider for auto-selection.
             Default: "cutlass,cublaslt,cuda_core" (excludes cutedsl for faster build)
             Add 'cutedsl' for extreme performance at the cost of longer build time.
@@ -949,7 +1018,10 @@ def nvfp4_gemm(
             f"Valid backends are: {sorted(valid_individual_backends)}.")
 
     # Build runner with allowed backends
-    runner = NVFP4GemmUnifiedRunner(to_userbuffers, output_dtype, backends_list)
+    runner = NVFP4GemmUnifiedRunner(output_buffer_kind,
+                                    output_dtype,
+                                    backends_list,
+                                    group=group)
 
     # Use AutoTuner to select best runner and tactic
     # - For 'auto' mode: compare across all backends, find global optimum
@@ -988,8 +1060,9 @@ def _(
     weight_scale: torch.Tensor,
     alpha: torch.Tensor,
     output_dtype: torch.dtype,
-    to_userbuffers: bool = False,
+    output_buffer_kind: int = int(BufferKind.DEFAULT),
     allowed_backends: str = "cutlass,cublaslt,cuda_core",
+    group: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile support."""
     return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
@@ -1203,20 +1276,21 @@ def _(
 
 @torch.library.custom_op("trtllm::w4a8_mxfp4_fp8_gemm", mutates_args=())
 def w4a8_mxfp4_fp8_gemm(
-    act_fp8: torch.Tensor,
-    weight: torch.Tensor,
-    act_sf: torch.Tensor,
-    weight_scale: torch.Tensor,
-    alpha: torch.Tensor,
-    output_dtype: torch.dtype,
-    to_userbuffers: bool = False,
+        act_fp8: torch.Tensor,
+        weight: torch.Tensor,
+        act_sf: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        output_dtype: torch.dtype,
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
 ) -> torch.Tensor:
 
     tuner = AutoTuner.get()
 
     # allocate workspace for profiling
     w4a8_mxfp4_fp8_gemm_runner = FP4GemmRunner(
-        fp4_utils.FP4GemmType.W4A8_MXFP4_MXFP8, to_userbuffers, output_dtype)
+        fp4_utils.FP4GemmType.W4A8_MXFP4_MXFP8, output_buffer_kind,
+        output_dtype)
 
     _, best_tactic = tuner.choose_one(
         "trtllm::w4a8_mxfp4_fp8_gemm::gemm",
@@ -1232,15 +1306,15 @@ def w4a8_mxfp4_fp8_gemm(
 
 @w4a8_mxfp4_fp8_gemm.register_fake
 def _(
-    act_fp4: torch.Tensor,
-    weight: torch.Tensor,
-    act_sf: torch.Tensor,
-    weight_scale: torch.Tensor,
-    alpha: torch.Tensor,
-    output_dtype: torch.dtype,
-    to_userbuffers: bool = False,
+        act_fp4: torch.Tensor,
+        weight: torch.Tensor,
+        act_sf: torch.Tensor,
+        weight_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        output_dtype: torch.dtype,
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
 ) -> torch.Tensor:
-    return act_fp8.new_empty((act_fp8.size(0), weight.size(0)),
+    return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
                              dtype=output_dtype)
 
 
@@ -1251,14 +1325,14 @@ class WeightOnlyQuantGemmRunner(TunableRunner):
                           last_positive_power_of_2), ))
 
     def __init__(
-        self,
-        activation_dtype: torch.dtype,
-        weight_dtype: torch.dtype,
-        output_dtype: torch.dtype,
-        to_userbuffers: bool,
+            self,
+            activation_dtype: torch.dtype,
+            weight_dtype: torch.dtype,
+            output_dtype: torch.dtype,
+            output_buffer_kind: int = int(BufferKind.DEFAULT),
     ):
         self.output_dtype = output_dtype
-        self.to_userbuffers = to_userbuffers
+        self.output_buffer_kind = output_buffer_kind
         instance_key = (activation_dtype, weight_dtype)
         if instance_key not in WeightOnlyQuantGemmRunner.runner_dict:
             WeightOnlyQuantGemmRunner.runner_dict[
@@ -1270,7 +1344,7 @@ class WeightOnlyQuantGemmRunner(TunableRunner):
     def unique_id(self):
         return (
             self.output_dtype,
-            self.to_userbuffers,
+            self.output_buffer_kind,
         )
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
@@ -1288,26 +1362,26 @@ class WeightOnlyQuantGemmRunner(TunableRunner):
             weight,
             weight_scale,
             tactic,
-            self.to_userbuffers,
+            self.output_buffer_kind,
             self.output_dtype,
         )
 
 
 @torch.library.custom_op("trtllm::weight_only_quant_gemm", mutates_args=())
 def weight_only_quant_gemm(
-    activation: torch.Tensor,
-    weight: torch.Tensor,
-    weight_dtype: torch.dtype,
-    weight_scale: torch.Tensor,
-    output_dtype: torch.dtype,
-    to_userbuffers: bool = False,
+        activation: torch.Tensor,
+        weight: torch.Tensor,
+        weight_dtype: torch.dtype,
+        weight_scale: torch.Tensor,
+        output_dtype: torch.dtype,
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
 ) -> torch.Tensor:
 
     tuner = AutoTuner.get()
 
     # allocate workspace for profiling
     weight_only_quant_gemm_runner = WeightOnlyQuantGemmRunner(
-        activation.dtype, weight_dtype, output_dtype, to_userbuffers)
+        activation.dtype, weight_dtype, output_dtype, output_buffer_kind)
 
     _, best_tactic = tuner.choose_one(
         "trtllm::weight_only_quant_gemm::gemm",
@@ -1322,12 +1396,12 @@ def weight_only_quant_gemm(
 
 @weight_only_quant_gemm.register_fake
 def _(
-    activation: torch.Tensor,
-    weight: torch.Tensor,
-    weight_type: torch.dtype,
-    weight_scale: torch.Tensor,
-    output_dtype: torch.dtype = None,
-    to_userbuffers: bool = False,
+        activation: torch.Tensor,
+        weight: torch.Tensor,
+        weight_type: torch.dtype,
+        weight_scale: torch.Tensor,
+        output_dtype: torch.dtype = None,
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
 ) -> torch.Tensor:
     dtype = output_dtype if output_dtype is not None else activation.dtype
     return activation.new_empty((activation.size(0), weight.size(1)),
@@ -1902,10 +1976,31 @@ def tunable_allreduce(
         trigger_completion_at_end,
     )
 
+    def _inputs_pre_hook_register_nccl_symmetric_memory_window(
+            inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        if not inputs:
+            return inputs
+        input_tensor = inputs[0]
+        if not isinstance(input_tensor,
+                          torch.Tensor) or not input_tensor.is_cuda:
+            return inputs
+        nccl_symmetric_memory_window_tensor, actual_kind = torch.ops.trtllm.allocate_output(
+            input_tensor, int(BufferKind.NCCL_WINDOW), list(group))
+        if actual_kind != int(BufferKind.NCCL_WINDOW):
+            return inputs
+        nccl_symmetric_memory_window_tensor.copy_(input_tensor)
+        new_inputs = list(inputs)
+        new_inputs[0] = nccl_symmetric_memory_window_tensor
+        return new_inputs
+
+    tuning_config = replace(
+        AllReduceRunner.tuning_config,
+        inputs_pre_hook=_inputs_pre_hook_register_nccl_symmetric_memory_window)
+
     _, best_tactic = tuner.choose_one(
         "trtllm::tunable_allreduce::allreduce",
         [allreduce_runner],
-        AllReduceRunner.tuning_config,
+        tuning_config,
         [input, residual, norm_weight, scale, bias, workspace],
     )
 
@@ -2244,3 +2339,166 @@ def _(input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         input.new_empty(input.shape, dtype=torch.float8_e4m3fn),
         input.new_empty(scale_shape, dtype=input.dtype),
     )
+
+
+# =============================================================================
+# Tunable FP4 Quantization: selects between TRTLLM and FlashInfer kernels
+# =============================================================================
+
+
+class Fp4QuantTactic(enum.IntEnum):
+    """FP4 quantization backend selection."""
+
+    TRTLLM = -1
+    FLASHINFER = 1
+
+
+def _fp4_quantize_dispatch(input: torch.Tensor, input_scale: torch.Tensor,
+                           scaling_vector_size: int,
+                           is_sf_swizzled_layout: bool,
+                           tactic: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dispatch FP4 quantization to TRTLLM or FlashInfer kernel."""
+    if tactic == Fp4QuantTactic.FLASHINFER and IS_FLASHINFER_AVAILABLE:
+        act_fp4, act_sf = _flashinfer_nvfp4_quantize(
+            input,
+            input_scale,
+            do_shuffle=is_sf_swizzled_layout,
+            sf_vec_size=scaling_vector_size,
+            enable_pdl=get_env_enable_pdl(),
+        )
+        # FlashInfer returns 2D act_sf [M_padded, sf_cols] but downstream
+        # (nvfp4_gemm) and the TRTLLM kernel expect 1D flat. Reshape to match.
+        # Use swizzled_layout=True since the C++ kernel always pads M to 128.
+        _, expected_sf_shape = fp4_utils.get_fp4_shape(input.shape,
+                                                       scaling_vector_size,
+                                                       True)
+        act_sf = act_sf.reshape(expected_sf_shape)
+        return act_fp4, act_sf
+    else:
+        return torch.ops.trtllm.fp4_quantize(input, input_scale,
+                                             scaling_vector_size,
+                                             is_sf_swizzled_layout)
+
+
+class Fp4QuantKernelRunner(TunableRunner):
+    """Profiles FP4 quantization kernels: TRTLLM vs FlashInfer.
+
+    Selects between TRTLLM CUDA and FlashInfer quantization backends.
+    Uses empty gen_tuning_buckets so only actual M values are profiled.
+    CUDA graph is disabled for profiling because the FlashInfer TMA
+    kernel may cache internal state (e.g. TMA descriptors) that references
+    memory from the graph pool; after graph destruction, this stale state
+    causes TMA encoding failures on the subsequent real call.
+    """
+
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, ()), ),
+        use_cuda_graph=False,
+    )
+
+    def __init__(self,
+                 scaling_vector_size: int = 16,
+                 is_sf_swizzled_layout: bool = False):
+        self.scaling_vector_size = scaling_vector_size
+        self.is_sf_swizzled_layout = is_sf_swizzled_layout
+
+    def unique_id(self):
+        return (self.scaling_vector_size, self.is_sf_swizzled_layout)
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[int]:
+        tactics = [Fp4QuantTactic.TRTLLM]
+        if IS_FLASHINFER_AVAILABLE:
+            tactics.append(Fp4QuantTactic.FLASHINFER)
+        return tactics
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = Fp4QuantTactic.TRTLLM,
+    ) -> torch.Tensor:
+        input, input_scale = inputs
+        act_fp4, act_sf = _fp4_quantize_dispatch(input, input_scale,
+                                                 self.scaling_vector_size,
+                                                 self.is_sf_swizzled_layout,
+                                                 tactic)
+        return act_fp4
+
+
+@fast_custom_op("trtllm::tunable_fp4_quantize", mutates_args=())
+def tunable_fp4_quantize(
+    input: torch.Tensor,
+    input_scale: torch.Tensor,
+    scaling_vector_size: int = 16,
+    is_sf_swizzled_layout: bool = False,
+) -> List[torch.Tensor]:
+    """FP4 quantization with autotuning between TRTLLM and FlashInfer kernels.
+
+    During warmup, the AutoTuner profiles both backends and caches the
+    fastest one per input shape. Subsequent calls use the cached selection
+    with zero overhead.
+
+    Args:
+        input: Activation tensor [M, K] in bf16/fp16
+        input_scale: Global scale factor tensor
+        scaling_vector_size: Block size for scale factors (default: 16)
+        is_sf_swizzled_layout: Whether to use swizzled layout for scales
+
+    Returns:
+        List of [act_fp4, act_sf] - quantized activation and scale factors
+    """
+    tuner = AutoTuner.get()
+
+    quant_runner = Fp4QuantKernelRunner(scaling_vector_size,
+                                        is_sf_swizzled_layout)
+
+    _, best_tactic = tuner.choose_one(
+        "trtllm::fp4_quantize_tactic",
+        [quant_runner],
+        Fp4QuantKernelRunner.tuning_config,
+        [input, input_scale],
+    )
+
+    try:
+        act_fp4, act_sf = _fp4_quantize_dispatch(input, input_scale,
+                                                 scaling_vector_size,
+                                                 is_sf_swizzled_layout,
+                                                 best_tactic)
+    except Exception:
+        if best_tactic != Fp4QuantTactic.TRTLLM:
+            logger.warning(f"FlashInfer FP4 quantize failed for input shape "
+                           f"{input.shape}, falling back to TRTLLM kernel.")
+            act_fp4, act_sf = _fp4_quantize_dispatch(input, input_scale,
+                                                     scaling_vector_size,
+                                                     is_sf_swizzled_layout,
+                                                     Fp4QuantTactic.TRTLLM)
+        else:
+            raise
+    return [act_fp4, act_sf]
+
+
+@tunable_fp4_quantize.register_fake
+def _(
+    input: torch.Tensor,
+    input_scale: torch.Tensor,
+    scaling_vector_size: int = 16,
+    is_sf_swizzled_layout: bool = False,
+) -> List[torch.Tensor]:
+    """Fake implementation for torch.compile support.
+
+    Note: The underlying TRTLLM C++ kernel always pads M to 128 for scale
+    factors regardless of the swizzled_layout flag, so we use
+    swizzled_layout=True in get_fp4_shape to match the actual output size.
+    We also reshape FlashInfer's output to match in _fp4_quantize_dispatch.
+    """
+    output_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape,
+                                                        scaling_vector_size,
+                                                        True)
+
+    return [
+        input.new_empty(output_shape, dtype=torch.uint8),
+        input_scale.new_empty(scale_shape, dtype=torch.uint8),
+    ]

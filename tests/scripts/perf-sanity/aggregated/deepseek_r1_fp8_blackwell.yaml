@@ -52,6 +52,7 @@ server_configs:
       timeout_iters: 60
     moe_config:
       backend: 'DEEPGEMM'
+      use_low_precision_moe_combine: true
     cuda_graph_config:
       enable_padding: true
       max_batch_size: 128
@@ -118,6 +119,7 @@ server_configs:
       timeout_iters: 60
     moe_config:
       backend: 'DEEPGEMM'
+      use_low_precision_moe_combine: true
     cuda_graph_config:
       enable_padding: true
       max_batch_size: 32

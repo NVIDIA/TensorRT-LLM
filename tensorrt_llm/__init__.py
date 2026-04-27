@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -132,8 +132,9 @@ from .parameter import Parameter
 from .python_plugin import PluginBase
 from .sampling_params import SamplingParams
 from .version import __version__
-from .visual_gen import (VisualGen, VisualGenArgs, VisualGenError,
-                         VisualGenParams, VisualGenResult)
+from .visual_gen import (ExtraParamSchema, VisualGen, VisualGenArgs,
+                         VisualGenError, VisualGenParams, VisualGenParamsError,
+                         VisualGenResult)
 
 __all__ = [
     'AutoConfig',
@@ -182,7 +183,9 @@ __all__ = [
     'TrtLlmArgs',
     'SamplingParams',
     'VisualGenArgs',
+    'ExtraParamSchema',
     'VisualGenError',
+    'VisualGenParamsError',
     'VisualGenResult',
     'DisaggregatedParams',
     'KvCacheConfig',

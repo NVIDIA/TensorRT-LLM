@@ -43,7 +43,6 @@ class KvCacheConfigV2:
     sink_token_length: Optional[int] = None
     free_gpu_memory_fraction: Optional[float] = None
     host_cache_size: Optional[int] = None
-    onboard_blocks: bool = True
     cross_kv_cache_fraction: Optional[float] = None
     secondary_offload_min_priority: Optional[int] = None
     event_buffer_max_size: int = 0
@@ -626,8 +625,8 @@ def add_and_verify_request(
             ctx_kv_caches.append(kv_cache)
     else:
         for ctx_kv_cache_manager in valid_ctx_kv_cache_managers:
-            ctx_kv_cache_manager.impl.add_sequence(
-                ctx_request.py_request_id, ctx_request.prompt_len, 1, ctx_request
+            ctx_kv_cache_manager.impl.add_sequence_batch(
+                [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request]
             )
 
     gen_request = LlmRequest(
@@ -657,8 +656,8 @@ def add_and_verify_request(
             gen_kv_caches.append(kv_cache)
     else:
         for gen_kv_cache_manager in valid_gen_kv_cache_managers:
-            gen_kv_cache_manager.impl.add_sequence(
-                gen_request.py_request_id, gen_request.prompt_len, 1, gen_request
+            gen_kv_cache_manager.impl.add_sequence_batch(
+                [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request]
             )
 
     # Get block_ids per layer_group with window_size filtering

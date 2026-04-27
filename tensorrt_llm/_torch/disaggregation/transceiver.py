@@ -310,8 +310,37 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         )
         self._send_reqs[rid] = req
 
+    @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
     def request_and_receive_sync(self, req: LlmRequest):
-        raise NotImplementedError("request_and_receive_sync is not implemented")
+        rid = get_unique_rid(req)
+        if rid in self._recv_sessions:
+            logger.warning(
+                f"request_and_receive_sync: rid={rid} already has a recv session, skipping"
+            )
+            return
+        req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        session = None
+        try:
+            session = self._transfer_worker.create_rx_session(req)
+            self._recv_sessions[rid] = session
+            self._recv_reqs[rid] = req
+            session.receive(self._create_kv_slice(req))
+            result = session.wait_complete(blocking=True)
+
+            if result == WaitResult.COMPLETED:
+                if self._need_aux_transfer(req):
+                    self._apply_aux(session, req)
+                req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+            else:
+                req.state = LlmRequestState.DISAGG_TRANS_ERROR
+        except Exception:
+            req.state = LlmRequestState.DISAGG_TRANS_ERROR
+            raise
+        finally:
+            if session is not None:
+                session.close()
+            self._recv_sessions.pop(rid, None)
+            self._recv_reqs.pop(rid, None)
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_async")
     def request_and_receive_async(self, req: LlmRequest):

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -62,8 +62,8 @@ TEST_F(BlockIteratorTest, BasicTest)
     auto end = range.end();
     auto allEqualTo = [](tr::ITensor const& tensor, auto x) -> bool
     {
-        const auto* begin = tr::bufferCast<decltype(x)>(tensor);
-        const auto* end = begin + tensor.getSize();
+        auto const* begin = tr::bufferCast<decltype(x)>(tensor);
+        auto const* end = begin + tensor.getSize();
         return std::all_of(begin, end, [x](auto n) { return n == x; });
     };
     DataType cnt{0};
@@ -87,7 +87,6 @@ TEST_F(BlockIteratorTest, CacheManagerTest)
     auto constexpr maxAttentionWindow = tokensPerBlock * maxBlocksPerSeq;
 
     auto const stream = std::make_shared<tr::CudaStream>();
-    auto constexpr onboardBlocks = true;
 
     // TODO: Support and add coverage for beamWidth > 1
     auto constexpr beamWidth = 1;
@@ -96,12 +95,12 @@ TEST_F(BlockIteratorTest, CacheManagerTest)
     auto const maxAttentionWindowVec = std::vector<BlockManager::SizeType32>{maxAttentionWindow};
 
     using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
-    const BlocksPerWindow blocksPerWindow
+    BlocksPerWindow const blocksPerWindow
         = {{maxAttentionWindow, std::make_tuple(blocksInPrimaryPool, blocksInSecondaryPool)}};
 
     BlockManager blockManager(std::vector<BlockManager::SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock,
         blocksPerWindow, maxNumSequences, stream, maxSequenceLength, beamWidth, maxAttentionWindowVec, std::nullopt,
-        dataType, 0, onboardBlocks);
+        dataType, 0);
     blockManager.allocatePools(false);
 
     EXPECT_EQ(blockManager.getTokensPerBlock(), tokensPerBlock);
@@ -122,7 +121,9 @@ TEST_F(BlockIteratorTest, CacheManagerTest)
     auto constexpr beamIdx = 0;
     auto promptLen0 = llmRequest0->getNumTokens(beamIdx);
     auto numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
-    blockManager.addSequence(seq0, promptLen0, numContextBlocks0, *llmRequest0, maxAttentionWindow);
+    auto const batchSeqStats = blockManager.addSequenceBatch({&seq0}, {promptLen0}, {numContextBlocks0},
+        {std::ref(*llmRequest0)}, maxAttentionWindow, /*isEnableBlockReuse=*/true);
+    ASSERT_THAT(batchSeqStats, ::testing::SizeIs(1));
 
     auto const blockIds = seq0.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
     EXPECT_THAT(blockIds, ::testing::ElementsAreArray({0, 1, 2}));

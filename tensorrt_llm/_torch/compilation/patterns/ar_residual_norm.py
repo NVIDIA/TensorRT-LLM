@@ -8,6 +8,7 @@ from torch._inductor.pattern_matcher import (MULTIPLE, CallFunction, Ignored,
                                              PatternMatcherPass, fwd_only,
                                              register_replacement)
 
+from ...custom_ops.torch_custom_ops import BufferKind
 from ...distributed import AllReduceFusionOp, AllReduceStrategy
 
 aten = torch.ops.aten
@@ -532,7 +533,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
             weight_scale_key = KeywordArg('weight_scale')
             alpha_key = KeywordArg('alpha')
             output_dtype_key = KeywordArg('output_dtype')
-            to_userbuffers_key = KeywordArg('to_userbuffers')
+            output_buffer_kind_key = KeywordArg('output_buffer_kind')
             allowed_backends_key = KeywordArg('allowed_backends')
             trtllm_nvfp4_gemm_default = CallFunction(
                 torch.ops.trtllm.nvfp4_gemm.default,
@@ -542,7 +543,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
                 weight_scale_key,
                 alpha_key,
                 output_dtype_key,
-                to_userbuffers=to_userbuffers_key,
+                output_buffer_kind=output_buffer_kind_key,
                 allowed_backends=allowed_backends_key)
             ub_copy = CallFunction(torch.ops.trtllm.copy_to_userbuffers,
                                    trtllm_nvfp4_gemm_default)
@@ -554,7 +555,7 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
                 weight_scale: torch.Tensor,
                 alpha: torch.Tensor,
                 output_dtype: torch.dtype,
-                to_userbuffers: bool,
+                output_buffer_kind: int,
                 allowed_backends: str,
             ):
                 return
@@ -566,12 +567,12 @@ def register_ub_patterns(custom_passes: List[PatternMatcherPass],
                 weight_scale: torch.Tensor,
                 alpha: torch.Tensor,
                 output_dtype: torch.dtype,
-                to_userbuffers: bool,
+                output_buffer_kind: int,
                 allowed_backends: str,
             ):
                 nvfp4_gemm_output = torch.ops.trtllm.nvfp4_gemm(
                     act_fp4, weight, act_sf, weight_scale, alpha, output_dtype,
-                    True, allowed_backends)
+                    int(BufferKind.USERBUFFERS), allowed_backends)
                 return nvfp4_gemm_output
 
             def extra_check(match: Match) -> bool:

@@ -453,14 +453,6 @@ class BaseWorker(GenerationExecutor):
                 context_phase_params = request.disaggregated_params.get_context_phase_params(
                 )
 
-        if self._is_pytorch_backend and not self.llm_args.disable_overlap_scheduler \
-                and self.llm_args.kv_cache_config.enable_block_reuse \
-                and self.engine.kv_cache_transceiver is not None \
-                and request_type == tllm.RequestType.REQUEST_TYPE_CONTEXT_ONLY:
-            raise ValueError(
-                "Context only requests are not supported in pytorch backend when overlap is enabled with block reuse."
-            )
-
         assert request.id is not None
 
         def _deduce_max_tokens(request: GenerationRequest,
@@ -672,7 +664,15 @@ class BaseWorker(GenerationExecutor):
     def _stats_serializer(stats) -> str:
         iteration_stats, req_stats = stats[0], stats[1]
         kv_iter_stats = stats[2] if len(stats) > 2 else None
+
         stats_dict = json.loads(iteration_stats.to_json_str())
+        # Tag with dp_rank=0 so Dynamo's adapter can always read
+        # stat["attentionDpRank"] without a missing-key branch. Attention-DP
+        # per-rank emission is a follow-up; today FPM only flows under
+        # non-attention-DP.
+        # TODO(https://jirasw.nvidia.com/browse/TRTLLM-12123): implement
+        # per-rank IterationStats delivery under attention-DP.
+        stats_dict.setdefault("attentionDpRank", 0)
 
         if req_stats is not None and len(req_stats) > 0:
             stats_dict["requestStats"] = []
