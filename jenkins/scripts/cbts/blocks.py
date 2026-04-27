@@ -242,9 +242,10 @@ def parse_stages_from_groovy(
     for line in groovy_path.read_text().splitlines():
         open_match = _MAP_OPEN_RE.search(line.rstrip())
         if open_match:
-            detected = _classify_map_var(open_match.group("var"))
-            if detected is not None:
-                current_arch = detected
+            # Reset on every map opening — including unfamiliar ones — so a
+            # later map between classified sections can't inherit a stale
+            # arch. Unknown maps fall back to the stage-name heuristic below.
+            current_arch = _classify_map_var(open_match.group("var"))
 
         m = _STAGE_ENTRY_RE.search(line)
         if not m:
