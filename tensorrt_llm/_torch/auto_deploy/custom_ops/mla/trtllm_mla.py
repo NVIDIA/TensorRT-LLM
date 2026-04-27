@@ -242,15 +242,16 @@ class _TrtllmMLAPlanner:
         )
         # Cached-KV prefill cumulative-length scratch.  Device tensors are
         # consumed by ``mla_rope_append_paged_kv_assign_q`` and
-        # ``load_paged_kv_cache_for_mla``; the host shadows hold the values
+        # ``load_paged_kv_cache_for_mla`` — both ops require int64 (see
+        # mlaPreprocessOp.cpp:120 / :314).  The host shadows hold the values
         # before they are copied to device in ``plan_host``.
-        self.cu_ctx_cached_kv_lens = torch.zeros(max_batch + 1, dtype=torch.int32, device=device)
-        self.cu_seq_lens_prefill = torch.zeros(max_batch + 1, dtype=torch.int32, device=device)
+        self.cu_ctx_cached_kv_lens = torch.zeros(max_batch + 1, dtype=torch.int64, device=device)
+        self.cu_seq_lens_prefill = torch.zeros(max_batch + 1, dtype=torch.int64, device=device)
         self._cu_ctx_cached_kv_lens_host = torch.zeros(
-            max_batch + 1, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+            max_batch + 1, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
         )
         self._cu_seq_lens_prefill_host = torch.zeros(
-            max_batch + 1, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+            max_batch + 1, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
         )
         self.block_ids_per_seq = torch.zeros(
             max_batch, max_blocks_per_seq, dtype=torch.int32, device=device
@@ -394,9 +395,9 @@ class _TrtllmMLAPlanner:
                 cu_past_host = self._cu_ctx_cached_kv_lens_host
                 cu_full_host = self._cu_seq_lens_prefill_host
                 cu_past_host[0] = 0
-                cu_past_host[1 : num_prefill + 1] = past_pf.cumsum(0).int()
+                cu_past_host[1 : num_prefill + 1] = past_pf.cumsum(0).long()
                 cu_full_host[0] = 0
-                cu_full_host[1 : num_prefill + 1] = full_pf.cumsum(0).int()
+                cu_full_host[1 : num_prefill + 1] = full_pf.cumsum(0).long()
                 self.cu_ctx_cached_kv_lens[: num_prefill + 1].copy_(
                     cu_past_host[: num_prefill + 1], non_blocking=True
                 )
@@ -894,10 +895,17 @@ def _handle_prefill_thop_cached_kv(
     # Final output (only for new Q positions).
     output = torch.empty(num_tokens, num_heads * v_head_dim, dtype=dtype, device=device)
 
-    # Build q [num_tokens, num_heads, qk_head_dim].
-    # ``mla_rope_append_paged_kv_assign_q`` writes RoPE'd q_pe back into the
-    # rope slice of this tensor, so it must own its storage (not a view).
-    q_3d = torch.cat([q_nope_flat, q_pe_flat], dim=-1).contiguous()
+    # Build q [num_tokens, num_heads * qk_head_dim].
+    # ``mla_rope_append_paged_kv_assign_q`` (mlaPreprocessOp.cpp:306) requires
+    # q.dim() == 2 — the kernel internally indexes per-head with a fixed
+    # stride of ``num_heads * qk_head_dim``.  ``q.contiguous()`` ensures the
+    # tensor owns its storage so the kernel's in-place RoPE write to the
+    # rope slice is observed by the subsequent ``thop.attention`` call.
+    q_2d = (
+        torch.cat([q_nope_flat, q_pe_flat], dim=-1)
+        .contiguous()
+        .view(num_tokens, num_heads * qk_head_dim)
+    )
 
     # cos_sin selection: model's table when fused_rope=True (q_pe / k_pe are
     # pre-RoPE), identity table otherwise (post-RoPE inputs — identity makes
@@ -910,7 +918,7 @@ def _handle_prefill_thop_cached_kv(
     # Step 1: RoPE the new tokens' q_pe in-place and append the (RoPE'd)
     # compressed_kv + k_pe to the paged cache at offset ``past_kv`` per seq.
     torch.ops.trtllm.mla_rope_append_paged_kv_assign_q(
-        q_3d,
+        q_2d,
         latent_cache,
         pf,
         planner.cu_ctx_cached_kv_lens[: pf + 1],
@@ -991,9 +999,8 @@ def _handle_prefill_thop_cached_kv(
 
     # Step 4: thop.attention over full K/V with latent_cache=None.  The kernel
     # skips ``invokeMLARopeContext`` (already done in step 1) and runs FMHA
-    # over [past + new] K/V for the new Q positions.
-    q_2d = q_3d.view(num_tokens, num_heads * qk_head_dim)
-
+    # over [past + new] K/V for the new Q positions.  ``q_2d`` already has the
+    # RoPE'd q_pe written into its rope slice by the step-1 kernel.
     sm_version = get_sm_version()
     rotary_embedding_scales = [1.0, 1.0, 1.0]
     rotary_embedding_max_position_info = [max_context_length, max_context_length]
