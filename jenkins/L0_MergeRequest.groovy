@@ -787,12 +787,20 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     }
 }
 
-// v0 needs_diff_for entries are exact file paths. When a future rule adds
-// a real glob (e.g. "tests/integration/defs/**/*.py"), extend this to use
-// Ant-style matching (hudson.util.AntPathMatcher).
+// Match a changed file path against a rule's needs_diff_for patterns using
+// Ant-style globs (hudson.util.AntPathMatcher). Examples:
+//   "tests/integration/test_lists/waives.txt"  - exact path
+//   "tests/integration/defs/**/*.py"           - all py files under defs/
+//   "cpp/tensorrt_llm/kernels/**"              - any file under kernels/
+// Exact paths are still valid Ant patterns (matcher.match returns true on
+// equal strings), so existing rules with literal-path needs_diff_for keep
+// working without changes.
+@Field
+def _cbtsAntPathMatcher = new hudson.util.AntPathMatcher()
+
 def _cbtsMatchesAnyPattern(String filePath, List patterns)
 {
-    return patterns.contains(filePath)
+    return patterns.any { _cbtsAntPathMatcher.match(it, filePath) }
 }
 
 // Return a list of stage-selection flags the user set via `/bot run` (empty
