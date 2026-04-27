@@ -33,7 +33,7 @@ python examples/scaffolding/mcp/coder/coder_mcp.py \
 ```bash
 python examples/scaffolding/contrib/iter_research/run_iter_research.py \
   --config examples/scaffolding/contrib/iter_research/config.yaml \
-  --enable_tracing
+  --enable_tracing --enable_statistics
 ```
 
 Use `--question "…"` to override the default prompt. Outputs and traces depend on the flags you pass.

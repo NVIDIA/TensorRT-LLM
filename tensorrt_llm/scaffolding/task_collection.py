@@ -266,6 +266,8 @@ class TaskMetricsCollector(TaskCollection):
                 task.enable_token_counting = True
                 if self.capture_messages:
                     self.pre_message_count_map[task_id] = len(task.messages)
+            if self.enable_print:
+                self._print_task_start(task)
 
     def after_yield(self, tasks: List[Task]):
         for task in tasks:
@@ -370,6 +372,29 @@ class TaskMetricsCollector(TaskCollection):
             if fr is not None:
                 result["finish_reason"] = fr
         return result
+
+    def _print_task_start(self, task: Task):
+        """Print a compact preview before the task is sent to a worker."""
+        log_parts = [
+            f"[{self.controller_name}]",
+            f"{type(task).__name__}",
+            "START",
+        ]
+
+        if isinstance(task, ChatTask):
+            content_chars = sum(
+                len(str(getattr(message, "content", "") or ""))
+                for message in task.messages)
+            tool_count = len(task.tools) if task.tools is not None else 0
+            log_parts.append(
+                f"messages={len(task.messages)} content_chars={content_chars} tools={tool_count}"
+            )
+        elif isinstance(task, MCPCallTask):
+            log_parts.append(
+                f"tool={task.tool_name!r} id={task.tool_call_id!r} "
+                f"args={TaskMetricsCollector._serialize_mcp_args(task.args)!r}")
+
+        print(" | ".join(log_parts))
 
     def _print_task_info(self, task_info: Dict[str, Any]):
         log_parts = [

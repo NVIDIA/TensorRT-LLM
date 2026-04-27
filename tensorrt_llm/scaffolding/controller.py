@@ -1,7 +1,7 @@
 import copy
 from abc import ABC
 from enum import Enum
-from typing import Any, List, Mapping, Tuple
+from typing import Any, Generator, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 from torch.nn import functional as F
@@ -35,14 +35,45 @@ class Controller(ABC):
 
 class ParallelProcess:
 
-    def __init__(self, controllers: List[Controller],
-                 tasks_list: List[List[Task]], kwargs_list: List[Mapping[str,
-                                                                         Any]]):
+    def __init__(self,
+                 controllers: List[Controller],
+                 tasks_list: List[List[Task]],
+                 kwargs_list: List[Mapping[str, Any]],
+                 branch_paths: Optional[Sequence[Sequence[int]]] = None):
         self.sub_gens = []
         for controller, tasks, kwargs in zip(controllers, tasks_list,
                                              kwargs_list):
             gen = controller.process(tasks, **kwargs)
             self.sub_gens.append(gen)
+        self.branch_paths = self._normalize_branch_paths(branch_paths)
+        self._validate_branch_paths()
+
+    # updated for tree_of_thought branching tracing
+    @classmethod
+    def from_generators(
+        cls,
+        sub_gens: Sequence[Generator],
+        branch_paths: Optional[Sequence[Sequence[int]]] = None,
+    ) -> "ParallelProcess":
+        obj = cls.__new__(cls)
+        obj.sub_gens = list(sub_gens)
+        obj.branch_paths = cls._normalize_branch_paths(branch_paths)
+        obj._validate_branch_paths()
+        return obj
+
+    @staticmethod
+    def _normalize_branch_paths(
+        branch_paths: Optional[Sequence[Sequence[int]]],
+    ) -> Optional[List[Tuple[int, ...]]]:
+        if branch_paths is None:
+            return None
+        return [tuple(branch_path) for branch_path in branch_paths]
+
+    def _validate_branch_paths(self):
+        if self.branch_paths is not None and len(self.branch_paths) != len(
+                self.sub_gens):
+            raise ValueError(
+                "branch_paths must match the number of parallel branches")
 
 
 # Controller runs multiple generation tasks.

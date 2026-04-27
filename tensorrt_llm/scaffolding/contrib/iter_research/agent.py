@@ -1,12 +1,20 @@
 import json
 from enum import Enum
-from typing import List
+from typing import Any, Dict, List
 
+from examples.scaffolding.mcp.fetch_webpage import VisitController, VisitTask
+from examples.scaffolding.mcp.tavily_search import TavilyController, TavilyTask
 from tensorrt_llm.logger import logger
-from tensorrt_llm.scaffolding.contrib.mcp.fetch_webpage import VisitController, VisitTask
 from tensorrt_llm.scaffolding.controller import Controller, NativeGenerationController
 from tensorrt_llm.scaffolding.scaffolding_llm import ScaffoldingLlm
-from tensorrt_llm.scaffolding.task import ChatTask, MCPCallTask, SystemMessage, Task, UserMessage
+from tensorrt_llm.scaffolding.task import (
+    AssistantMessage,
+    ChatTask,
+    MCPCallTask,
+    SystemMessage,
+    Task,
+    UserMessage,
+)
 from tensorrt_llm.scaffolding.task_collection import (
     DropKVCacheWorkerTag,
     TaskMetricsCollector,
@@ -26,6 +34,7 @@ from .prompts import (
     OBSERVATION_PROMPT,
 )
 from .utils import (
+    TOOLS,
     check_report_action,
     extract_tags,
     get_tool_definitions,
@@ -36,6 +45,34 @@ from .utils import (
 _TOOL_NAME_TO_MCP = {
     "PythonInterpreter": "python_interpreter",
 }
+
+
+def _parse_tool_arguments(arguments: Any) -> Dict[str, Any]:
+    if isinstance(arguments, dict):
+        return arguments
+    if not isinstance(arguments, str) or not arguments.strip():
+        return {}
+
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError:
+        logger.warning("IterResearch: failed to parse native tool arguments: %s", arguments[:200])
+        return {}
+
+    if not isinstance(parsed, dict):
+        logger.warning("IterResearch: native tool arguments must be a JSON object")
+        return {}
+    return parsed
+
+
+def _render_tool_call(tool_name: str, tool_args: Dict[str, Any]) -> str:
+    return json.dumps(
+        {
+            "name": tool_name,
+            "arguments": tool_args,
+        },
+        ensure_ascii=False,
+    )
 
 
 @sub_request_node("iter_research", is_top_level=True)
@@ -50,6 +87,7 @@ class IterResearchController(Controller):
         self,
         generation_controller: Controller,
         visit_controller: VisitController,
+        tavily_controller: TavilyController,
         max_turn: int = 25,
         max_format_retries: int = 5,
         max_observation_length: int = 128000,
@@ -57,6 +95,7 @@ class IterResearchController(Controller):
         super().__init__()
         self.generation_controller = generation_controller
         self.visit_controller = visit_controller
+        self.tavily_controller = tavily_controller
         self.max_turn = max_turn
         self.max_format_retries = max_format_retries
         self.max_observation_length = max_observation_length
@@ -65,6 +104,7 @@ class IterResearchController(Controller):
         return IterResearchController(
             generation_controller=self.generation_controller.clone(),
             visit_controller=self.visit_controller.clone(),
+            tavily_controller=self.tavily_controller.clone(),
             max_turn=self.max_turn,
             max_format_retries=self.max_format_retries,
             max_observation_length=self.max_observation_length,
@@ -75,7 +115,8 @@ class IterResearchController(Controller):
         chat_task = ChatTask.create_from_messages(
             [
                 UserMessage(prompt_text),
-            ]
+            ],
+            tools=TOOLS,
         )
         yield from self.generation_controller.process([chat_task])
         return chat_task
@@ -96,14 +137,26 @@ class IterResearchController(Controller):
             [
                 SystemMessage(INITIAL_SYSTEM_PROMPT),
                 UserMessage(initial_input),
-            ]
+            ],
+            tools=TOOLS,
         )
 
         content = ""
+        last_report = ""
+        response_message = None
         for _retry in range(self.max_format_retries):
             yield from self.generation_controller.process([chat_task])
-            content = chat_task.messages[-1].content if chat_task.messages else ""
-            is_valid, reason = check_report_action(content)
+            response_message = chat_task.messages[-1] if chat_task.messages else None
+            if not isinstance(response_message, AssistantMessage):
+                reason = "Assistant message not found!"
+                is_valid = False
+            else:
+                content = response_message.content or ""
+                is_valid, reason = check_report_action(
+                    response_message,
+                    require_tool_call=True,
+                    allow_tool_call_without_report=True,
+                )
             if is_valid:
                 break
             logger.warning(
@@ -114,9 +167,17 @@ class IterResearchController(Controller):
                 chat_task.messages.pop()
 
         for turn in range(self.max_turn):
-            report = extract_tags(content, "report")
-            tool_call_str = extract_tags(content, "tool_call")
+            if not isinstance(response_message, AssistantMessage):
+                tasks[0].output_str = content
+                tasks[0].output_tokens = tasks[0].output_tokens or []
+                return
+
+            current_report = extract_tags(content, "report")
+            if current_report:
+                last_report = current_report
+            report = current_report or last_report
             answer = extract_tags(content, "answer")
+            tool_calls = response_message.tool_calls or []
 
             if answer:
                 logger.info(f"IterResearch turn {turn + 1}: found answer")
@@ -124,23 +185,16 @@ class IterResearchController(Controller):
                 tasks[0].output_tokens = tasks[0].output_tokens or []
                 return
 
-            tool_call = None
-            if tool_call_str:
-                try:
-                    tool_call = json.loads(tool_call_str)
-                except json.JSONDecodeError:
-                    logger.warning(
-                        f"IterResearch turn {turn}: failed to parse tool_call "
-                        f"JSON: {tool_call_str[:200]}"
-                    )
-
-            if not tool_call:
+            if not tool_calls:
                 tasks[0].output_str = report or content
                 tasks[0].output_tokens = tasks[0].output_tokens or []
                 return
 
-            tool_name = tool_call.get("name", "unknown")
-            tool_args = tool_call.get("arguments", {})
+            tool_call = tool_calls[0]
+            tool_name = tool_call.function.name
+            tool_args = _parse_tool_arguments(tool_call.function.arguments)
+            tool_call_id = tool_call.id or str(turn)
+            tool_call_str = _render_tool_call(tool_name, tool_args)
             logger.info(f"IterResearch turn {turn + 1}: calling tool '{tool_name}'")
 
             if tool_name == "Visit":
@@ -154,10 +208,21 @@ class IterResearchController(Controller):
                 )
                 yield from self.visit_controller.process([visit_task])
                 observation = visit_task.result_str or ""
+            elif tool_name == "tavily_search":
+                queries = tool_args.get("query", [])
+                if isinstance(queries, str):
+                    queries = [queries]
+                tavily_task = TavilyTask(query=queries or [], goal=question)
+                yield from self.tavily_controller.process([tavily_task])
+                observation = tavily_task.result_str or ""
+                if tavily_task.result_stdout:
+                    observation += f"\nstdout:\n{tavily_task.result_stdout}"
+                if tavily_task.result_stderr:
+                    observation += f"\nstderr:\n{tavily_task.result_stderr}"
             else:
                 mcp_name = _TOOL_NAME_TO_MCP.get(tool_name, tool_name)
                 mcp_task = MCPCallTask.create_mcptask(
-                    tool_call_id=str(turn),
+                    tool_call_id=tool_call_id,
                     tool_name=mcp_name,
                     args=json.dumps(tool_args),
                     worker_tag=self.WorkerTag.TOOL_CALL,
@@ -183,14 +248,25 @@ class IterResearchController(Controller):
             chat_task = ChatTask.create_from_messages(
                 [
                     UserMessage(new_prompt),
-                ]
+                ],
+                tools=None if is_last else TOOLS,
             )
 
             content = ""
+            response_message = None
             for _retry in range(self.max_format_retries):
                 yield from self.generation_controller.process([chat_task])
-                content = chat_task.messages[-1].content if chat_task.messages else ""
-                is_valid, reason = check_report_action(content)
+                response_message = chat_task.messages[-1] if chat_task.messages else None
+                if not isinstance(response_message, AssistantMessage):
+                    reason = "Assistant message not found!"
+                    is_valid = False
+                else:
+                    content = response_message.content or ""
+                    is_valid, reason = check_report_action(
+                        response_message,
+                        allow_tool_call=not is_last,
+                        allow_tool_call_without_report=not is_last,
+                    )
                 if is_valid:
                     break
                 logger.warning(
@@ -217,6 +293,7 @@ def create_iter_research_controller(
     max_format_retries: int = 5,
     max_observation_length: int = 128000,
     max_webpage_tokens: int = 48000,
+    max_tavily_search_chars: int = 6000,
     enable_statistics: bool = False,
     enable_tracing: bool = False,
 ) -> Controller:
@@ -230,6 +307,10 @@ def create_iter_research_controller(
     visit_controller = VisitController(
         generation_controller=generation_controller,
         max_webpage_tokens=max_webpage_tokens,
+    )
+    tavily_controller = TavilyController(
+        generation_controller=generation_controller,
+        compress_threshold_chars=max_tavily_search_chars,
     )
 
     controller_type = IterResearchController
@@ -255,6 +336,7 @@ def create_iter_research_controller(
     return controller_type(
         generation_controller=generation_controller,
         visit_controller=visit_controller,
+        tavily_controller=tavily_controller,
         max_turn=max_turn,
         max_format_retries=max_format_retries,
         max_observation_length=max_observation_length,
@@ -269,6 +351,7 @@ def create_iter_research_scaffolding_llm(
     max_format_retries: int = 5,
     max_observation_length: int = 128000,
     max_webpage_tokens: int = 48000,
+    max_tavily_search_chars: int = 6000,
     max_parallel_requests: int = 1024,
     enable_statistics: bool = False,
     enable_tracing: bool = False,
@@ -279,6 +362,7 @@ def create_iter_research_scaffolding_llm(
         max_format_retries=max_format_retries,
         max_observation_length=max_observation_length,
         max_webpage_tokens=max_webpage_tokens,
+        max_tavily_search_chars=max_tavily_search_chars,
         enable_statistics=enable_statistics,
         enable_tracing=enable_tracing,
     )
@@ -287,6 +371,7 @@ def create_iter_research_scaffolding_llm(
         NativeGenerationController.WorkerTag.GENERATION: generation_worker,
         IterResearchController.WorkerTag.TOOL_CALL: mcp_worker,
         VisitController.WorkerTag.TOOL_CALL: mcp_worker,
+        TavilyController.WorkerTag.TOOL_CALL: mcp_worker,
         DropKVCacheWorkerTag.DROP_KV_CACHE: generation_worker,
     }
     if enable_tracing:

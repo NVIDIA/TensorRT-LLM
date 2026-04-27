@@ -25,9 +25,9 @@ mcp_tools:
   # google_search:
   #   host: "0.0.0.0"
   #   port: 8083
-  google_scholar:
-    host: "0.0.0.0"
-    port: 8084
+  # google_scholar:
+  #   host: "0.0.0.0"
+  #   port: 8084
   fetch_webpage:
     host: "0.0.0.0"
     port: 8085

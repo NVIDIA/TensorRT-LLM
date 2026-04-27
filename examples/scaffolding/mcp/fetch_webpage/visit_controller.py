@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -21,12 +22,32 @@ from typing import List, Optional
 from tensorrt_llm.scaffolding.controller import Controller
 from tensorrt_llm.scaffolding.task import ChatTask, MCPCallTask, Task, UserMessage
 
-from ...iter_research.prompts import VISIT_EXTRACTOR_PROMPT
+_VISIT_MAX_PROMPT_CHARS = 15000
+_VISIT_PDF_MAX_PROMPT_CHARS = 10000
+_VISIT_PDF_MAX_LINES = 200
+_VISIT_MAX_RESULT_CHARS = 2000
+_VISIT_EXTRACTOR_PROMPT = """Please process the following webpage content and user goal to extract relevant information:
 
-_VISIT_MAX_PROMPT_CHARS = 32000
-_VISIT_PDF_MAX_PROMPT_CHARS = 12000
-_VISIT_PDF_MAX_LINES = 240
-_VISIT_MAX_RESULT_CHARS = 12000
+## **Webpage Content**
+{webpage_content}
+
+## **User Goal**
+{goal}
+
+## **Task Guidelines**
+1. **Content Scanning for Rational**:
+    Locate the **specific sections/data** directly related to the user's goal within the webpage content
+2. **Key Extraction for Evidence**:
+    Identify and extract the **most relevant information** from the content, you never miss any important information,
+    output the **full original context** of the content as far as possible, it can be more than three paragraphs.
+3. **Summary Output for Summary**:
+    Organize into a concise paragraph with logical flow,
+    prioritizing clarity and judge the contribution of the information to the goal.
+
+**Final Output Format using JSON format has "rational", "evidence", "summary" fields**
+"""
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _looks_like_raw_pdf(content: str) -> bool:
@@ -157,6 +178,12 @@ class VisitController(Controller):
             "VisitController only supports a single VisitTask"
         )
         visit_task = tasks[0]
+        LOGGER.warning(
+            "[visit] fetch_webpage start: url_count=%d parse_type=%s max_webpage_tokens=%d",
+            len(visit_task.urls or []),
+            visit_task.parse_type,
+            self.max_webpage_tokens,
+        )
 
         mcp_task = MCPCallTask.create_mcptask(
             tool_call_id="visit_fetch",
@@ -172,6 +199,11 @@ class VisitController(Controller):
         yield [mcp_task]
 
         raw_content = mcp_task.result_str or ""
+        LOGGER.warning(
+            "[visit] fetch_webpage raw result: chars=%d parse_type=%s",
+            len(raw_content),
+            visit_task.parse_type,
+        )
         if not raw_content:
             visit_task.result_str = "[visit] Failed to fetch webpage content."
             return
@@ -181,13 +213,25 @@ class VisitController(Controller):
             visit_task.parse_type,
             self.max_webpage_tokens,
         )
+        LOGGER.warning(
+            "[visit] prepared webpage content: raw_chars=%d prepared_chars=%d parse_type=%s",
+            len(raw_content),
+            len(prepared_content),
+            visit_task.parse_type,
+        )
         if not prepared_content.strip():
             visit_task.result_str = "[visit] Failed to prepare webpage content for summarization."
             return
 
-        extractor_prompt = VISIT_EXTRACTOR_PROMPT.format(
+        extractor_prompt = _VISIT_EXTRACTOR_PROMPT.format(
             webpage_content=prepared_content,
             goal=visit_task.goal,
+        )
+        LOGGER.warning(
+            "[visit] extractor prompt: chars=%d goal_chars=%d prepared_chars=%d",
+            len(extractor_prompt),
+            len(visit_task.goal or ""),
+            len(prepared_content),
         )
         chat_task = ChatTask.create_from_messages(
             [

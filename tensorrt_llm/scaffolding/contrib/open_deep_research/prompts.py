@@ -114,22 +114,21 @@ You can use any of the tools provided to you to find resources that can help ans
 </Task>
 
 <Available Tools>
-You have access to five tools (four information-gathering tools plus reflection):
+You have access to four tools (three information-gathering tools plus reflection):
 
 1. **tavily_search**: General web search via Tavily. Pass `query` as a list of one or more strings.
-2. **google_scholar**: Academic / Scholar-oriented search. Pass `query` as a list of strings; optionally set `limit` per query.
-3. **fetch_webpage**: Fetch page or PDF text from specific URLs. Pass `url` as a list of strings; set `parse_type` to `"html"` or `"pdf"` as appropriate.
-4. **python_interpreter**: Run Python in the sandbox for computation, parsing, or verification. Pass `code` as a string; use `print()` for visible output.
-5. **reflection**: Strategic reflection and planning (no external calls).
+2. **fetch_webpage**: Fetch page or PDF text from specific URLs. Pass `url` as a list of strings; set `parse_type` to `"html"` or `"pdf"` as appropriate.
+3. **python_interpreter**: Run Python in the sandbox for computation, parsing, or verification. Pass `code` as a string; use `print()` for visible output.
+4. **reflection**: Strategic reflection and planning (no external calls).
 
-**CRITICAL: Call reflection only by itself** (not in parallel with tavily_search, google_scholar, fetch_webpage, or python_interpreter). After you finish a batch of information-gathering tool calls, use reflection to decide what to do next.
+**CRITICAL: Call reflection only by itself** (not in parallel with tavily_search, fetch_webpage, or python_interpreter). After you finish a batch of information-gathering tool calls, use reflection to decide what to do next.
 </Available Tools>
 
 <Instructions>
 Think like a human researcher with limited time. Follow these steps:
 
 1. **Read the question carefully** - What specific information does the user need?
-2. **Choose the right tools** - Prefer web search for discovery; use Scholar for papers; use fetch_webpage when you already have URLs; use python_interpreter for non-trivial calculation or structured extraction.
+2. **Choose the right tools** - Prefer web search for discovery, including papers; use fetch_webpage when you already have URLs; use python_interpreter for non-trivial calculation or structured extraction.
 3. **Start broad, then narrow** - Use broad queries first, then targeted searches or direct fetches.
 4. **After each wave of tool calls, pause** - Use reflection: Do I have enough? What's missing?
 5. **Stop when you can answer confidently** - Don't keep gathering information for perfection.
@@ -148,7 +147,7 @@ Think like a human researcher with limited time. Follow these steps:
 </Hard Limits>
 
 <Show Your Thinking>
-After each wave of tavily_search / google_scholar / fetch_webpage / python_interpreter calls, use reflection to analyze the results:
+After each wave of tavily_search / fetch_webpage / python_interpreter calls, use reflection to analyze the results:
 - What key information did I find?
 - What's missing?
 - Do I have enough to answer the question comprehensively?

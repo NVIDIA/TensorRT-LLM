@@ -15,7 +15,7 @@
 
 import contextvars
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -51,6 +51,13 @@ class ExecutionScope:
         return ExecutionScope(
             request_id=self.request_id,
             branch_path=self.branch_path + (branch_index,),
+        )
+
+    def with_branch_path(self, branch_path: Sequence[int]) -> "ExecutionScope":
+        """Create a scope with an explicit branch path for logical trees."""
+        return ExecutionScope(
+            request_id=self.request_id,
+            branch_path=tuple(branch_path),
         )
 
     @property

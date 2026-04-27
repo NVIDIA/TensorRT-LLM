@@ -62,9 +62,10 @@ Override `--prompt` for your own question. Add `--enable_tracing` or `--enable_q
 python examples/scaffolding/contrib/open_deep_research/run_open_deep_research.py \
   --config examples/scaffolding/contrib/open_deep_research/config.yaml \
   --base_url http://localhost:8000/v1 \
-  --model Qwen3/Qwen3-30B-A3B \
+  --model Qwen3/Qwen3-235B-A22B \
   --enable_tracing \
-  --trace_output_dir ./open_deep_research_trace_manual
+  --trace_output_dir ./open_deep_research_trace_manual \
+  --enable_statistics
 ```
 
 ## Trace replay

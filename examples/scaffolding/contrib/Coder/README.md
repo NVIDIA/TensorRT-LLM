@@ -134,7 +134,8 @@ python examples/scaffolding/contrib/Coder/run_coder.py \
     --mcp_url http://127.0.0.1:8083/sse \
     --image ubuntu:22.04 \
     --prompt "Implement a thread-safe LRU cache in Python" \
-    --max_iterations 50
+    --max_iterations 50 \
+    --enable_tracing
 ```
 
 The runner registers `--image` with the Apiary daemon on startup (via `AsyncApiary`) and only dispatches the request once the image is loaded.

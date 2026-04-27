@@ -104,10 +104,21 @@ class ScaffoldingLlm:
         parent_scope = current_scope.get()
         async_tasks = [
             asyncio.create_task(
-                self._handle_branch(sub_gen, request, parent_scope.child(idx)))
-            for idx, sub_gen in enumerate(tasks.sub_gens)
+                self._handle_branch(
+                    sub_gen,
+                    request,
+                    self._get_parallel_branch_scope(tasks, parent_scope, idx),
+                )) for idx, sub_gen in enumerate(tasks.sub_gens)
         ]
         await asyncio.gather(*async_tasks)
+
+    @staticmethod
+    def _get_parallel_branch_scope(tasks: ParallelProcess,
+                                   parent_scope: ExecutionScope,
+                                   branch_index: int) -> ExecutionScope:
+        if tasks.branch_paths is None:
+            return parent_scope.child(branch_index)
+        return parent_scope.with_branch_path(tasks.branch_paths[branch_index])
 
     async def _handle_branch(self, gen: Generator, request: ScaffoldingRequest,
                              scope: ExecutionScope):

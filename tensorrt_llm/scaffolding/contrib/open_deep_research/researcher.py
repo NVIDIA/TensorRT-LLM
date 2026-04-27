@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List
 
+from examples.scaffolding.mcp.fetch_webpage import VisitController, VisitTask
+from examples.scaffolding.mcp.tavily_search import TavilyController, TavilyTask
 from tensorrt_llm.logger import logger
 from tensorrt_llm.scaffolding import (
     AssistantMessage,
@@ -28,7 +30,6 @@ from tensorrt_llm.scaffolding import (
     Task,
     UserMessage,
 )
-from tensorrt_llm.scaffolding.contrib.mcp.fetch_webpage import VisitController, VisitTask
 from tensorrt_llm.scaffolding.controller import ChatWithMCPController
 from tensorrt_llm.scaffolding.task import ToolMessage
 from tensorrt_llm.scaffolding.task_collection import sub_request_node
@@ -36,7 +37,7 @@ from tensorrt_llm.scaffolding.task_collection import sub_request_node
 from .prompts import RESEARCHER_SYSTEM_PROMPT
 from .tools import (
     fetch_webpage_tool,
-    google_scholar_tool,
+    # google_scholar_tool,
     python_interpreter_tool,
     reflection_tool,
     tavily_search_tool,
@@ -111,8 +112,10 @@ def _parse_tool_arguments(arguments: Any) -> dict:
 
 
 class ResearchChatWithMCPController(ChatWithMCPController):
-    """Dispatches ``fetch_webpage`` through :class:`VisitController` (fetch + LLM summary).
+    """Dispatches large retrieval tools through compression controllers.
 
+    ``fetch_webpage`` uses :class:`VisitController` for fetch + LLM summary.
+    ``tavily_search`` uses :class:`TavilyController` for search + optional LLM summary.
     Other MCP tools keep the same batching behavior as :class:`ChatWithMCPController`.
     """
 
@@ -120,6 +123,7 @@ class ResearchChatWithMCPController(ChatWithMCPController):
         self,
         generation_controller: Controller,
         visit_controller: VisitController,
+        tavily_controller: TavilyController,
         system_prompts: Any = None,
         max_iterations: int = 3,
         tools: Any = None,
@@ -131,11 +135,13 @@ class ResearchChatWithMCPController(ChatWithMCPController):
             tools=tools,
         )
         self.visit_controller = visit_controller
+        self.tavily_controller = tavily_controller
 
     def clone(self) -> ResearchChatWithMCPController:
         return ResearchChatWithMCPController(
             generation_controller=self.generation_controller.clone(),
             visit_controller=self.visit_controller.clone(),
+            tavily_controller=self.tavily_controller.clone(),
             system_prompts=self.system_prompts,
             max_iterations=self.max_iterations,
             tools=self.tools,
@@ -162,59 +168,66 @@ class ResearchChatWithMCPController(ChatWithMCPController):
             if response_message.tool_calls:
                 tool_calls = response_message.tool_calls
 
-                index_to_payload: Dict[int, Tuple[str, Optional[str], Optional[str]]] = {}
-
-                mcp_tasks: List[MCPCallTask] = []
-                mcp_tool_indices: List[int] = []
+                tool_results = {}
+                mcp_tasks = []
+                mcp_indices = []
                 for i, tool_call in enumerate(tool_calls):
-                    if tool_call.function.name != "fetch_webpage":
-                        mcp_tasks.append(
-                            MCPCallTask.create_mcptask(
-                                tool_call.id,
-                                tool_call.function.name,
-                                tool_call.function.arguments,
-                                self.WorkerTag.TOOLCALL,
-                            )
+                    if tool_call.function.name in ("fetch_webpage", "tavily_search"):
+                        continue
+                    mcp_tasks.append(
+                        MCPCallTask.create_mcptask(
+                            tool_call.id,
+                            tool_call.function.name,
+                            tool_call.function.arguments,
+                            self.WorkerTag.TOOLCALL,
                         )
-                        mcp_tool_indices.append(i)
+                    )
+                    mcp_indices.append(i)
 
                 if mcp_tasks:
                     yield mcp_tasks
-
-                for batch_j, call_i in enumerate(mcp_tool_indices):
-                    mt = mcp_tasks[batch_j]
-                    if mt.result_str is not None:
-                        index_to_payload[call_i] = (
-                            mt.result_str,
-                            mt.result_stdout,
-                            mt.result_stderr,
-                        )
-
-                for i, tool_call in enumerate(tool_calls):
-                    if tool_call.function.name != "fetch_webpage":
+                for i, mcp_task in zip(mcp_indices, mcp_tasks):
+                    if mcp_task.result_str is None:
                         continue
-                    args = _parse_tool_arguments(tool_call.function.arguments)
-                    urls = args.get("url", [])
-                    if isinstance(urls, str):
-                        urls = [urls]
-                    visit_task = VisitTask(
-                        urls=urls or [],
-                        goal=goal,
-                        parse_type=args.get("parse_type", "html"),
+                    tool_results[i] = (
+                        mcp_task.result_str,
+                        mcp_task.result_stdout,
+                        mcp_task.result_stderr,
                     )
-                    yield from self.visit_controller.process([visit_task])
-                    if visit_task.result_str is not None:
-                        index_to_payload[i] = (
-                            visit_task.result_str,
-                            None,
-                            None,
-                        )
 
                 for i, tool_call in enumerate(tool_calls):
-                    payload = index_to_payload.get(i)
-                    if payload is None:
+                    tool_name = tool_call.function.name
+                    if tool_name == "fetch_webpage":
+                        args = _parse_tool_arguments(tool_call.function.arguments)
+                        urls = args.get("url", [])
+                        if isinstance(urls, str):
+                            urls = [urls]
+                        visit_task = VisitTask(
+                            urls=urls or [],
+                            goal=goal,
+                            parse_type=args.get("parse_type", "html"),
+                        )
+                        yield from self.visit_controller.process([visit_task])
+                        if visit_task.result_str is not None:
+                            tool_results[i] = (visit_task.result_str, None, None)
+                    elif tool_name == "tavily_search":
+                        args = _parse_tool_arguments(tool_call.function.arguments)
+                        queries = args.get("query", [])
+                        if isinstance(queries, str):
+                            queries = [queries]
+                        tavily_task = TavilyTask(query=queries or [], goal=goal)
+                        yield from self.tavily_controller.process([tavily_task])
+                        if tavily_task.result_str is not None:
+                            tool_results[i] = (
+                                tavily_task.result_str,
+                                tavily_task.result_stdout,
+                                tavily_task.result_stderr,
+                            )
+
+                for i, tool_call in enumerate(tool_calls):
+                    if i not in tool_results:
                         continue
-                    body, out, err = payload
+                    body, out, err = tool_results[i]
                     chat_task.add_message(
                         ToolMessage(body, tool_call.id, trace_stdout=out, trace_stderr=err)
                     )
@@ -229,7 +242,7 @@ class ResearchChatWithMCPController(ChatWithMCPController):
 class Researcher(Controller):
     tools = [
         tavily_search_tool,
-        google_scholar_tool,
+        # google_scholar_tool,
         fetch_webpage_tool,
         python_interpreter_tool,
         reflection_tool,

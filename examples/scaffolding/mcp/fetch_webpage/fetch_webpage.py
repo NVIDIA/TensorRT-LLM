@@ -128,12 +128,26 @@ def _parse_pdf(pdf_path: str) -> str:
 
 
 async def _fetch_single_url(client: httpx.AsyncClient, url: str, parse_type: str) -> str:
+    LOGGER.info("[fetch_webpage] start url=%s parse_type=%s", url, parse_type)
     content_type, content = await _fetch_via_scraper(client, url)
+    LOGGER.info(
+        "[fetch_webpage] scraper result url=%s content_type=%s chars=%d",
+        url,
+        content_type,
+        len(content),
+    )
     if content_type == "pdf":
-        return await asyncio.to_thread(_parse_pdf, content)
+        parsed_content = await asyncio.to_thread(_parse_pdf, content)
+        LOGGER.info(
+            "[fetch_webpage] parsed pdf url=%s chars=%d",
+            url,
+            len(parsed_content),
+        )
+        return parsed_content
     if content_type == "html" and content:
         return content
     content = await _fetch_via_jina(client, url)
+    LOGGER.info("[fetch_webpage] jina result url=%s chars=%d", url, len(content))
     if content:
         return content
     return f"[fetch_webpage] Failed to fetch: {url}"
@@ -142,10 +156,18 @@ async def _fetch_single_url(client: httpx.AsyncClient, url: str, parse_type: str
 @mcp.tool()
 async def fetch_webpage(url: list[str], parse_type: str = "html") -> str:
     """Fetch raw webpage/PDF content via Jina Reader / ScraperAPI."""
+    LOGGER.info("[fetch_webpage] request url_count=%d parse_type=%s", len(url), parse_type)
     async with httpx.AsyncClient() as client:
         tasks = [_fetch_single_url(client, u, parse_type) for u in url]
         results = await asyncio.gather(*tasks)
-    return "\n=======\n".join(results)
+    joined_result = "\n=======\n".join(results)
+    LOGGER.info(
+        "[fetch_webpage] response url_count=%d result_chars=%d per_url_chars=%s",
+        len(url),
+        len(joined_result),
+        [len(result) for result in results],
+    )
+    return joined_result
 
 
 def create_starlette_app(mcp_server: Server, *, debug: bool = False) -> Starlette:

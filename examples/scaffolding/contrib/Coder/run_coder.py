@@ -1,17 +1,19 @@
 import argparse
 import asyncio
+import io
 import logging
 import os
+from contextlib import redirect_stdout
+from datetime import datetime
+from pathlib import Path
 
 from apiary_client import AsyncApiary
 from openai import AsyncOpenAI
 
 from tensorrt_llm.scaffolding import (
     ApiaryMCPWorker,
-    ChatTokenCounter,
     QueryCollector,
     TaskMetricsCollector,
-    TaskTimer,
     TRTOpenaiWorker,
 )
 from tensorrt_llm.scaffolding.contrib.Coder import create_coder_scaffolding_llm
@@ -74,16 +76,32 @@ def parse_arguments():
         default=50,
         help="Maximum tool-calling iterations",
     )
-    parser.add_argument("--enable_statistics", action="store_true")
     parser.add_argument("--enable_query_collector", action="store_true")
+    parser.add_argument(
+        "--enable_statistics",
+        action="store_true",
+        help="Print live task metrics and save the final summary as text. Does not write metrics JSON.",
+    )
     parser.add_argument("--enable_tracing", action="store_true")
     parser.add_argument(
-        "--trace_output",
+        "--trace_output_dir",
         type=str,
-        default="execution_trace.json",
-        help="Output path for the execution trace",
+        default=None,
+        help="Directory for trace outputs when --enable_tracing is set",
     )
     return parser.parse_args()
+
+
+def _dump_task_metrics_summary(output_dir: Path) -> None:
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        TaskMetricsCollector.print_summary()
+    summary = buf.getvalue()
+    print(summary, end="")
+
+    summary_path = output_dir / "coder.metrics.txt"
+    summary_path.write_text(summary, encoding="utf-8")
+    print(f"Task metrics summary saved to {summary_path}")
 
 
 async def register_image(image: str, apiary_url: str, apiary_token: str | None) -> None:
@@ -126,6 +144,14 @@ async def main():
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     args = parse_arguments()
+    trace_output_dir: Path | None = None
+    if args.enable_tracing or args.enable_statistics:
+        if args.trace_output_dir:
+            trace_output_dir = Path(args.trace_output_dir)
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            trace_output_dir = Path(f"coder_trace_{timestamp}")
+        trace_output_dir.mkdir(parents=True, exist_ok=True)
 
     await register_image(args.image, args.apiary_url, args.apiary_token)
 
@@ -137,6 +163,14 @@ async def main():
         args.mcp_url,
         max_connections=args.max_mcp_connections,
     )
+
+    if args.enable_statistics:
+        TaskMetricsCollector.reset()
+        print(
+            "Statistics enabled: "
+            f"model={args.model}, base_url={args.base_url}, max_iterations={args.max_iterations}, "
+            f"max_tokens={args.max_tokens}"
+        )
 
     llm = create_coder_scaffolding_llm(
         generation_worker,
@@ -153,36 +187,41 @@ async def main():
         prompt = "Implement a collective communication library in C++"
 
     print(f"Running Coder agent with prompt:\n{prompt}\n")
+    if trace_output_dir is not None:
+        print(f"Trace output directory: {trace_output_dir}")
     print("-" * 50)
 
-    future = llm.generate_async(prompt)
-    mcp_worker.set_scope_params(future.id, image=args.image)
-    result = await future.aresult()
+    try:
+        future = llm.generate_async(prompt)
+        mcp_worker.set_scope_params(future.id, image=args.image)
+        result = await future.aresult()
 
-    assert result.outputs[0].text is not None
-    print("\nFinal output:\n" + result.outputs[0].text)
+        assert result.outputs[0].text is not None
+        print("\nFinal output:\n" + result.outputs[0].text)
 
-    if args.enable_statistics:
-        token_counting_info = ChatTokenCounter.get_global_info()
-        print("\nToken counting info: " + str(token_counting_info))
-        timer_info = TaskTimer.get_global_info()
-        print("Timer info: " + str(timer_info))
-        TaskMetricsCollector.export_to_json("coder_task_metrics.json")
+        if args.enable_query_collector:
+            QueryCollector.get_global_info()
+            print("Query info dumped to query_result.json!")
 
-    if args.enable_query_collector:
-        QueryCollector.get_global_info()
-        print("Query info dumped to query_result.json!")
+        if args.enable_tracing and result.task_collections:
+            tracer = result.task_collections.get("execution_tracer")
+            if tracer:
+                trace = tracer.export_trace()
+                assert trace_output_dir is not None
+                trace_path = trace_output_dir / "coder.trace.json"
+                full_trace_path = trace_output_dir / "coder.full.trace.json"
+                trace.save(str(trace_path))
+                trace.save(str(full_trace_path), full=True)
+                print(f"Execution trace saved to {trace_path}")
+                print(f"Full execution trace saved to {full_trace_path}")
+    finally:
+        if args.enable_statistics:
+            assert trace_output_dir is not None
+            _dump_task_metrics_summary(trace_output_dir)
 
-    if result.task_collections:
-        tracer = result.task_collections.get("execution_tracer")
-        if tracer:
-            trace = tracer.export_trace()
-            trace.save(args.trace_output)
-            print(f"Execution trace saved to {args.trace_output}")
-
-    await mcp_worker.async_shutdown()
-    llm.shutdown()
-    generation_worker.shutdown()
+        await mcp_worker.async_shutdown()
+        llm.shutdown()
+        generation_worker.shutdown()
 
 
 if __name__ == "__main__":

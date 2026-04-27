@@ -1,4 +1,5 @@
-from ..mcp.fetch_webpage import VisitController
+from examples.scaffolding.mcp.fetch_webpage import VisitController
+
 from .agent import (
     IterResearchController,
     create_iter_research_controller,

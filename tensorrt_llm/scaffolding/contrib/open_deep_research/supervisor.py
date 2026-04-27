@@ -16,7 +16,8 @@ import copy
 import json
 from typing import List
 
-from tensorrt_llm.scaffolding.contrib.mcp.fetch_webpage import VisitController
+from examples.scaffolding.mcp.fetch_webpage import VisitController
+from examples.scaffolding.mcp.tavily_search import TavilyController
 from tensorrt_llm.scaffolding.controller import (
     ChatWithMCPController,
     Controller,
@@ -215,6 +216,7 @@ class FinalReportController(NativeGenerationController):
 def create_open_deep_research_controller(
     max_tokens: int = 16384,
     max_webpage_tokens: int = 48000,
+    max_tavily_search_chars: int = 6000,
     enable_statistics: bool = False,
     enable_query_collector: bool = False,
     enable_tracing: bool = False,
@@ -228,6 +230,10 @@ def create_open_deep_research_controller(
     visit_controller = VisitController(
         generation_controller=gerneration_controller,
         max_webpage_tokens=max_webpage_tokens,
+    )
+    tavily_controller = TavilyController(
+        generation_controller=gerneration_controller,
+        compress_threshold_chars=max_tavily_search_chars,
     )
 
     supervisor_type = Supervisor
@@ -273,6 +279,7 @@ def create_open_deep_research_controller(
     research_chat_with_tools_controller = chat_with_mcp_type(
         gerneration_controller,
         visit_controller,
+        tavily_controller,
         max_iterations=12,
     )
     research_compress_controller = compressor_type(
@@ -302,6 +309,7 @@ def create_open_deep_research_scaffolding_llm(
     mcp_worker: Worker,
     max_tokens: int = 16384,
     max_webpage_tokens: int = 48000,
+    max_tavily_search_chars: int = 6000,
     max_parallel_requests: int = 1024,
     enable_statistics: bool = False,
     enable_query_collector: bool = False,
@@ -310,6 +318,7 @@ def create_open_deep_research_scaffolding_llm(
     supervisor_controller = create_open_deep_research_controller(
         max_tokens=max_tokens,
         max_webpage_tokens=max_webpage_tokens,
+        max_tavily_search_chars=max_tavily_search_chars,
         enable_statistics=enable_statistics,
         enable_query_collector=enable_query_collector,
         enable_tracing=enable_tracing,
@@ -319,6 +328,7 @@ def create_open_deep_research_scaffolding_llm(
         NativeGenerationController.WorkerTag.GENERATION: generation_worker,
         ChatWithMCPController.WorkerTag.TOOLCALL: mcp_worker,
         VisitController.WorkerTag.TOOL_CALL: mcp_worker,
+        TavilyController.WorkerTag.TOOL_CALL: mcp_worker,
         DropKVCacheWorkerTag.DROP_KV_CACHE: generation_worker,
     }
     if enable_tracing:

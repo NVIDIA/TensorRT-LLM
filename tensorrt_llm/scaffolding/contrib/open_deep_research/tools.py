@@ -35,28 +35,28 @@ tavily_search_tool = OpenAIToolDescription(
     },
 )
 
-google_scholar_tool = OpenAIToolDescription(
-    name="google_scholar",
-    description=(
-        "Search Google Scholar (and optional web via Custom Search) for academic "
-        "papers and related sources. Accepts one or more queries in a single call."
-    ),
-    parameters={
-        "query": {
-            "type": "array",
-            "items": {
-                "type": "string",
-                "description": "A search query.",
-            },
-            "minItems": 1,
-            "description": "List of search queries (one or more strings).",
-        },
-        "limit": {
-            "type": "integer",
-            "description": "Optional cap on results per query (server default if omitted).",
-        },
-    },
-)
+# google_scholar_tool = OpenAIToolDescription(
+#     name="google_scholar",
+#     description=(
+#         "Search Google Scholar (and optional web via Custom Search) for academic "
+#         "papers and related sources. Accepts one or more queries in a single call."
+#     ),
+#     parameters={
+#         "query": {
+#             "type": "array",
+#             "items": {
+#                 "type": "string",
+#                 "description": "A search query.",
+#             },
+#             "minItems": 1,
+#             "description": "List of search queries (one or more strings).",
+#         },
+#         "limit": {
+#             "type": "integer",
+#             "description": "Optional cap on results per query (server default if omitted).",
+#         },
+#     },
+# )
 
 fetch_webpage_tool = OpenAIToolDescription(
     name="fetch_webpage",

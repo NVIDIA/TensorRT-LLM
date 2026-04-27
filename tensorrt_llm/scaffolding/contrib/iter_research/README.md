@@ -133,10 +133,10 @@ The following steps start **after** you are inside a TensorRT-LLM dev or inferen
 
    ```bash
    python examples/scaffolding/contrib/iter_research/run_iter_research.py \
-       --config examples/scaffolding/contrib/iter_research/config.yaml --enable_statistics --enable_tracing
+       --config examples/scaffolding/contrib/iter_research/config.yaml --enable_tracing
    ```
 
-   Optional flags: `--enable_statistics`, `--enable_tracing`, `--question "..."`; see `run_iter_research.py --help`.
+   Optional flags: `--enable_tracing`, `--question "..."`; see `run_iter_research.py --help`.
 
 ## Configuration (summary)
 
