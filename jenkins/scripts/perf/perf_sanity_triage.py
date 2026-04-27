@@ -205,9 +205,7 @@ def post_perf_data(data_list, project_name):
 def main():
     parser = argparse.ArgumentParser(description="Perf Sanity Data Update Script")
     parser.add_argument("--project_name", type=str, required=True, help="OpenSearch project name")
-    parser.add_argument(
-        "--commands", type=str, required=True, help="UPDATE commands, one per line"
-    )
+    parser.add_argument("--commands", type=str, required=True, help="UPDATE commands, one per line")
 
     args = parser.parse_args()
 
