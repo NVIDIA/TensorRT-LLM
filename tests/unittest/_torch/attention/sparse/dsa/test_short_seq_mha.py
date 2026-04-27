@@ -36,6 +36,8 @@ from tensorrt_llm._torch.attention_backend.interface import (
     RopeParams,
 )
 from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
+from tensorrt_llm._torch.attention_backend.sparse.dsa.module import should_use_short_mha
+from tensorrt_llm._torch.attention_backend.sparse.mla import forward_context_sparse_mla
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -388,7 +390,8 @@ def _run_forward(
 ):
     """Run forward_context_sparse_mla on cloned inputs and return the output tensor."""
     output = torch.empty(q.shape[0], NUM_HEADS * V_HEAD_DIM, dtype=q.dtype, device=q.device)
-    mla.forward_context_sparse_mla(
+    forward_context_sparse_mla(
+        mla,
         q=q.clone(),
         compressed_kv=compressed_kv.clone(),
         k_pe=k_pe.clone(),
@@ -665,10 +668,10 @@ def test_chunked_context_rejects_when_kv_exceeds_threshold():
     pos_c2 = torch.arange(cached_per_seq[0], total_per_seq[0], device=device, dtype=torch.int32)
 
     # max_ctx_kv_len (96) > threshold (80) -> short MHA should NOT be used.
-    assert not mla._should_use_short_mha(meta_c2, pos_c2)
+    assert not should_use_short_mha(mla, meta_c2, pos_c2)
 
     # With threshold large enough for the full KV -> short MHA IS used.
     mla.short_seq_mha_threshold = total_per_seq[0] + 100
-    assert mla._should_use_short_mha(meta_c2, pos_c2)
+    assert should_use_short_mha(mla, meta_c2, pos_c2)
 
     kv_mgr.shutdown()

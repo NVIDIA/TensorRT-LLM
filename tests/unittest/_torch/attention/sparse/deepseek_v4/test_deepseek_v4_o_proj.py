@@ -25,6 +25,7 @@ from _torch.helpers import per_block_cast_to_fp8_e8m0, per_token_cast_to_fp8_e8m
 from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.module import deepseek_v4_o_proj
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import weight_dequant
 from tensorrt_llm._torch.modules.mla import MLA
@@ -271,7 +272,7 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
 
     # Call the deepseek_v4 output projection (mla_rope_inplace modifies attn_out_latent
     # in-place, so clone before passing to preserve original for reference)
-    output = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
+    output = deepseek_v4_o_proj(mla, attn_out_latent.clone(), position_ids)
 
     # Calculate reference output
     if dtype_str == "bf16":

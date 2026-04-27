@@ -148,7 +148,7 @@ managers stay model-scope and consume the user-facing config directly.
 Sparse metadata consumes `SparseMetadataParams`, derived independently from the
 same user-facing config.
 
-Sparse registrations are defined in `attention_backend/sparse/utils.py`. Check
+Sparse registrations are defined in `attention_backend/sparse/registry.py`. Check
 that file for the current supported combinations, as they may change over time.
 
 ### 2.3 Backend contract

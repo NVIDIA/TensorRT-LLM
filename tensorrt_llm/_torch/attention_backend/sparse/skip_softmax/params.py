@@ -31,7 +31,7 @@ from pydantic import Field as PydanticField
 
 from tensorrt_llm.llmapi.utils import StrictBaseModel
 
-from .params import SkipSoftmaxKernelParams, SparseParams
+from ..params import SkipSoftmaxKernelParams, SparseParams
 
 _RESERVED_FORMULA_KEYS = frozenset({"formula", "target_sparsity"})
 _SKIP_SOFTMAX_ALGORITHMS = frozenset({"skip_softmax", "softmax_skip"})
