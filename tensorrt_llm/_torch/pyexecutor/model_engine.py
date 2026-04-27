@@ -937,8 +937,8 @@ class PyTorchModelEngine(ModelEngine):
         AutoTuner.get()
 
         can_run_general_warmup = (
-            not self.is_draft_model and not self.mapping.has_cp_helix()
-            and self.guided_decoder is None
+            self._torch_compile_enabled and not self.is_draft_model
+            and not self.mapping.has_cp_helix() and self.guided_decoder is None
             and not isinstance(kv_cache_manager, MambaHybridCacheManager))
 
         self._run_attention_warmup(resource_manager, can_run_general_warmup)
