@@ -143,10 +143,15 @@ class GenerationRequest:
                 raise TypeError(
                     f"cache_salt must be str or None, got {type(cache_salt).__name__}"
                 )
-            if len(cache_salt) > self.MAX_CACHE_SALT_LEN:
+            # The C++ side validates against UTF-8 byte length, so do the same here
+            # (Python `len()` would count Unicode code points, which can pass this
+            # guard but fail at C++ dispatch for non-ASCII salts).
+            cache_salt_byte_len = len(cache_salt.encode("utf-8"))
+            if cache_salt_byte_len > self.MAX_CACHE_SALT_LEN:
                 raise ValueError(
-                    f"cache_salt length ({len(cache_salt)}) exceeds the maximum "
-                    f"supported length ({self.MAX_CACHE_SALT_LEN}).")
+                    f"cache_salt UTF-8 byte length ({cache_salt_byte_len}) "
+                    f"exceeds the maximum supported length "
+                    f"({self.MAX_CACHE_SALT_LEN}).")
         self.cache_salt = cache_salt
         self.arrival_time = arrival_time
         if not (0.0 <= priority <= 1.0):

@@ -822,6 +822,60 @@ def test_cache_salt_in_stored_events():
     assert found_stored, "No stored events found"
 
 
+def test_cache_salt_max_length_validation():
+    """cache_salt longer than MAX_CACHE_SALT_LEN UTF-8 bytes is rejected."""
+    from tensorrt_llm.executor.request import GenerationRequest
+
+    max_len = GenerationRequest.MAX_CACHE_SALT_LEN
+    sampling_params = SamplingParams()
+
+    # ASCII salt at the limit is accepted.
+    GenerationRequest(prompt_token_ids=[1, 2, 3],
+                      sampling_params=sampling_params,
+                      cache_salt="a" * max_len)
+
+    # ASCII salt one byte over the limit is rejected.
+    with pytest.raises(ValueError, match="cache_salt UTF-8 byte length"):
+        GenerationRequest(prompt_token_ids=[1, 2, 3],
+                          sampling_params=sampling_params,
+                          cache_salt="a" * (max_len + 1))
+
+    # Non-ASCII salt: each character is 3 UTF-8 bytes. A salt whose
+    # `len()` is below the limit but whose UTF-8 byte count exceeds it
+    # must be rejected (this is the case Python's len()-based check missed).
+    char_count = (max_len // 3) + 1  # len() is well below max_len
+    salt = "中" * char_count  # Chinese character, 3 UTF-8 bytes each
+    assert len(salt) <= max_len
+    assert len(salt.encode("utf-8")) > max_len
+    with pytest.raises(ValueError, match="cache_salt UTF-8 byte length"):
+        GenerationRequest(prompt_token_ids=[1, 2, 3],
+                          sampling_params=sampling_params,
+                          cache_salt=salt)
+
+
+def test_non_ascii_cache_salt_in_stored_events():
+    """Test that a non-ASCII cache_salt string is preserved in stored block events."""
+    llm = create_llm()
+    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+    prompt = "Hello, my name is"
+    salt = "tenant-中文"  # mixed ASCII + Chinese
+
+    _ = llm.generate(prompt,
+                     sampling_params=sampling_params,
+                     cache_salt=salt)
+
+    events = llm.get_kv_cache_events(5)
+
+    found_stored = False
+    for event in events:
+        if event and event["data"]["type"] == "stored":
+            found_stored = True
+            for block in event["data"]["blocks"]:
+                assert block.get("cache_salt") == salt
+
+    assert found_stored, "No stored events found"
+
+
 def test_expected_kv_cache_events():
     llm = create_llm()
     sampling_params = SamplingParams(max_tokens=6, temperature=0.01)

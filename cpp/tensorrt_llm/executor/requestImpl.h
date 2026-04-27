@@ -37,7 +37,7 @@ public:
     //! the number of blocks.
     static constexpr std::size_t kMaxCacheSaltLength{256};
 
-    static std::optional<std::string> normalizeCacheSalt(std::optional<std::string> cacheSalt)
+    static std::optional<std::string> validateCacheSalt(std::optional<std::string> cacheSalt)
     {
         if (cacheSalt.has_value() && cacheSalt->size() > kMaxCacheSaltLength)
         {
@@ -102,7 +102,7 @@ public:
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
         , mCacheSaltID(cacheSaltID)
-        , mCacheSalt(normalizeCacheSalt(std::move(cacheSalt)))
+        , mCacheSalt(validateCacheSalt(std::move(cacheSalt)))
         , mDisaggRequestId(disaggRequestId)
     {
         validate();
@@ -511,7 +511,7 @@ public:
 
     void setCacheSalt(std::optional<std::string> cacheSalt)
     {
-        mCacheSalt = normalizeCacheSalt(std::move(cacheSalt));
+        mCacheSalt = validateCacheSalt(std::move(cacheSalt));
     }
 
     void setDisaggRequestId(IdType disaggRequestId)

@@ -182,6 +182,8 @@ class GenerationExecutor(ABC):
         prompt_adapter_request: Optional[Union[
             PromptAdapterRequest, List[PromptAdapterRequest]]] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
+        cache_salt_id: Optional[Union[int, List[Optional[int]]]] = None,
+        cache_salt: Optional[Union[str, List[Optional[str]]]] = None,
     ) -> Union[GenerationResult, List[GenerationResult]]:
         """Generate output for the given prompt token ids in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -207,6 +209,9 @@ class GenerationExecutor(ABC):
                 pa_req = prompt_adapter_request[i]
             else:
                 pa_req = prompt_adapter_request
+            cs_id = cache_salt_id[i] if isinstance(cache_salt_id,
+                                                   list) else cache_salt_id
+            cs = cache_salt[i] if isinstance(cache_salt, list) else cache_salt
             future = self.generate_async(
                 p,
                 sampling_params=sp,
@@ -214,7 +219,9 @@ class GenerationExecutor(ABC):
                 lora_request=lora_req,
                 prompt_adapter_request=pa_req,
                 streaming=False,
-                disaggregated_params=disaggregated_params)
+                disaggregated_params=disaggregated_params,
+                cache_salt_id=cs_id,
+                cache_salt=cs)
             futures.append(future)
 
         for future in futures:
