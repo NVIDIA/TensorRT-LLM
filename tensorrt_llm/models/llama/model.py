@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -410,21 +410,16 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                                            config.mapping.tp_size)
         if config.mapping.is_last_pp_rank():
             if config.architecture == "LlamaForSequenceClassification":
-                lm_head = ColumnLinear(config.hidden_size,
-                                       config.num_labels,
-                                       bias=False,
-                                       dtype=config.dtype,
-                                       tp_group=config.mapping.tp_group,
-                                       tp_size=config.mapping.tp_size,
-                                       gather_output=True)
+                lm_head_output_size = config.num_labels
             else:
-                lm_head = ColumnLinear(config.hidden_size,
-                                       vocab_size_padded,
-                                       bias=False,
-                                       dtype=config.dtype,
-                                       tp_group=config.mapping.tp_group,
-                                       tp_size=config.mapping.tp_size,
-                                       gather_output=True)
+                lm_head_output_size = vocab_size_padded
+            lm_head = ColumnLinear(config.hidden_size,
+                                   lm_head_output_size,
+                                   bias=False,
+                                   dtype=config.dtype,
+                                   tp_group=config.mapping.tp_group,
+                                   tp_size=config.mapping.tp_size,
+                                   gather_output=True)
         else:
             lm_head = None
         self.quant_mode = config.quant_mode

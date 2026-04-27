@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -471,7 +471,7 @@ def load_hf_llama(model_dir: str, load_model_on_cpu: bool = False):
 
     hf_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
     model_cls = AutoModelForCausalLM
-    if hf_config.architectures == ["LlamaForSequenceClassification"]:
+    if "LlamaForSequenceClassification" in (hf_config.architectures or []):
         from transformers import AutoModelForSequenceClassification
         model_cls = AutoModelForSequenceClassification
     if hf_config.model_type == "llava":
