@@ -860,9 +860,7 @@ def test_non_ascii_cache_salt_in_stored_events():
     prompt = "Hello, my name is"
     salt = "tenant-中文"  # mixed ASCII + Chinese
 
-    _ = llm.generate(prompt,
-                     sampling_params=sampling_params,
-                     cache_salt=salt)
+    _ = llm.generate(prompt, sampling_params=sampling_params, cache_salt=salt)
 
     events = llm.get_kv_cache_events(5)
 
