@@ -1396,9 +1396,23 @@ pipeline {
                     def analysis = trtllm_utils.analyzePipelineFailureWithAgent(
                         this, env.JOB_NAME, env.BUILD_NUMBER, prNumber)
                     if (analysis) {
-                        writeFile file: 'ci_agent_analysis.txt', text: analysis
                         def bucket = 'sw-tensorrt-ci-analysis'
-                        def key = "${env.JOB_NAME}/${env.BUILD_NUMBER}/failure_analysis.txt"
+                        def key = "${env.JOB_NAME}/${env.BUILD_NUMBER}/failure_analysis.html"
+                        def htmlUrl = "https://pbss.s8k.io/v1/AUTH_svc_tensorrt/${bucket}/${key}"
+                        // Self-rendering HTML: marked.js parses the embedded analysis at page load.
+                        // The analysis is JSON-encoded so backticks/quotes/newlines are JS-safe.
+                        def htmlDoc = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>CI Failure Analysis &middot; ${env.JOB_NAME} #${env.BUILD_NUMBER}</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>body{font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:900px;margin:2em auto;padding:0 1em;color:#24292e}h1,h2,h3{border-bottom:1px solid #eaecef;padding-bottom:.3em}pre{background:#f6f8fa;padding:1em;overflow:auto;border-radius:6px}code{background:#f6f8fa;padding:.2em .4em;border-radius:3px}pre code{background:none;padding:0}a{color:#0366d6}blockquote{border-left:4px solid #dfe2e5;padding:0 1em;color:#6a737d}table{border-collapse:collapse}th,td{border:1px solid #dfe2e5;padding:6px 13px}header{margin-bottom:1.5em;color:#586069}</style>
+</head><body>
+<header><a href="${env.BUILD_URL}">${env.JOB_NAME} #${env.BUILD_NUMBER}</a></header>
+<main id="md"></main>
+<script>document.getElementById('md').innerHTML = marked.parse(${groovy.json.JsonOutput.toJson(analysis)});</script>
+</body></html>
+"""
+                        writeFile file: 'failure_analysis.html', text: htmlDoc
                         container("alpine") {
                             trtllm_utils.llmExecStepWithRetry(this, script: 'apk add --no-cache aws-cli')
                             // Alpine's musl libc fires A and AAAA queries in parallel; pbss.s8k.io's AAAA
@@ -1416,11 +1430,18 @@ pipeline {
                                     credentialsId: 'svc_tensorrt-swift-stack-key',
                                     variable: 'AWS_SECRET_ACCESS_KEY')]) {
                                 trtllm_utils.llmExecStepWithRetry(this, script:
-                                    "AWS_ACCESS_KEY_ID=svc_tensorrt aws s3 cp ci_agent_analysis.txt" +
-                                    " s3://${bucket}/${key} --endpoint-url https://pbss.s8k.io")
+                                    "AWS_ACCESS_KEY_ID=svc_tensorrt aws s3 cp failure_analysis.html" +
+                                    " s3://${bucket}/${key} --endpoint-url https://pbss.s8k.io" +
+                                    " --content-type text/html")
                             }
                         }
-                        echo "CI Agent Failure Analysis: https://pbss.s8k.io/${bucket}/${key}"
+                        // Surface the URL via currentBuild.description so the upstream PR_Github
+                        // wrapper can extract it and include it in the GitHub PR comment.
+                        def existingDesc = currentBuild.description ?: ""
+                        currentBuild.description = existingDesc +
+                            (existingDesc ? "<br/>" : "") +
+                            "<a href='${htmlUrl}'>CI Agent Failure Analysis</a>"
+                        echo "CI Agent Failure Analysis: ${htmlUrl}"
                     }
                 } catch (Exception e) {
                     // Analysis is best-effort; do not fail the pipeline
