@@ -1,7 +1,9 @@
+import asyncio
 import copy
 import threading
 from unittest import mock
 
+import aiohttp
 import pytest
 
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
@@ -11,6 +13,31 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
 from tensorrt_llm.serve.router import (ConversationRouter, KvCacheAwareRouter,
                                        LoadBalancingRouter, RoundRobinRouter,
                                        create_router)
+
+
+def _make_mock_aiohttp_session(return_value=None):
+    """Create a mock aiohttp.ClientSession whose .post() returns canned JSON."""
+    if return_value is None:
+        return_value = []
+    mock_response = mock.AsyncMock()
+    mock_response.json = mock.AsyncMock(return_value=return_value)
+    mock_ctx = mock.AsyncMock()
+    mock_ctx.__aenter__ = mock.AsyncMock(return_value=mock_response)
+    mock_ctx.__aexit__ = mock.AsyncMock(return_value=False)
+    mock_session = mock.MagicMock(spec=aiohttp.ClientSession)
+    mock_session.post = mock.MagicMock(return_value=mock_ctx)
+    mock_session.get = mock.MagicMock(return_value=mock_ctx)
+    mock_session.close = mock.AsyncMock()
+    return mock_session
+
+
+@pytest.fixture(autouse=True)
+def mock_aiohttp_session(request):
+    """Auto-mock aiohttp.ClientSession so poll_events doesn't make real HTTP calls."""
+    mock_session = _make_mock_aiohttp_session()
+    with mock.patch('tensorrt_llm.serve.router.aiohttp.ClientSession',
+                    return_value=mock_session):
+        yield mock_session
 
 
 # Mock class for metadata server
@@ -227,7 +254,7 @@ async def test_gen_tokens_balancing_router(servers, requests_fixture, request):
 
 
 @pytest.mark.asyncio
-async def test_kv_cache_aware_router(servers):
+async def test_kv_cache_aware_router(servers, mock_aiohttp_session):
     # create tokenized requests to skip tokenization
     # req0: [1000]*100, req1: [1000]*50+[1001]*150, req2: [1002]*300
     requests = [
@@ -330,7 +357,8 @@ async def test_kv_cache_aware_router(servers):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("api_type", ["completion", "chat"])
-async def test_kv_cache_aware_router_multi_turn_conversation(api_type):
+async def test_kv_cache_aware_router_multi_turn_conversation(
+        api_type, mock_aiohttp_session):
     """Test that consecutive turns of a multi-turn conversation route to the same server due to KV cache prefix hits.
 
     Verifies that consecutive turns route to the same server.
@@ -787,6 +815,43 @@ async def test_conversation_router_hash_skip_count():
     await r2.finish_request(req_a2)
     await r2.finish_request(req_b2)
     assert sb2 != sa2, "With skip, different content should not match"
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_polls_kv_cache_events(
+        servers, mock_aiohttp_session):
+    """finish_request must POST /kv_cache_events and apply returned events."""
+    # Reconfigure the mock session to return a stored-block event.
+    stored_event = [{"type": "stored", "blocks": [{"block_hash": 99999}]}]
+    mock_response = mock.AsyncMock()
+    mock_response.json = mock.AsyncMock(return_value=stored_event)
+    mock_ctx = mock.AsyncMock()
+    mock_ctx.__aenter__ = mock.AsyncMock(return_value=mock_response)
+    mock_ctx.__aexit__ = mock.AsyncMock(return_value=False)
+    mock_aiohttp_session.post = mock.MagicMock(return_value=mock_ctx)
+
+    router = KvCacheAwareRouter(
+        server_role=None,
+        servers=servers,
+        use_tokens=False,
+        max_batch_size=32,
+        tokens_per_block=32,
+    )
+
+    request = CompletionRequest(model="TinyLlama", prompt=[[1000] * 100])
+    server, _ = await router.get_next_server(request)
+
+    mock_aiohttp_session.post.reset_mock()
+    await router.finish_request(request)
+    # poll_and_update runs as a background task; yield to let it complete
+    await asyncio.sleep(0)
+
+    # /kv_cache_events was queried on the correct server
+    mock_aiohttp_session.post.assert_called_once_with("http://" + server +
+                                                      "/kv_cache_events")
+
+    # Returned events were applied to the server state
+    assert 99999 in router._server_state[server]._kv_cache_block_table
 
 
 def test_create_router_conversation():

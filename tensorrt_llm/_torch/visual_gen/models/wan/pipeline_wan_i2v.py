@@ -393,11 +393,11 @@ class WanImageToVideoPipeline(BasePipeline):
     def infer(self, req):
         """Run inference with request parameters."""
         # Extract image from request (can be path, PIL Image, or torch.Tensor)
-        if req.image is None:
+        if req.params.image is None:
             raise ValueError("I2V pipeline requires 'image' parameter")
 
-        image = req.image[0] if isinstance(req.image, list) else req.image
-        extra = req.extra_params or {}
+        image = req.params.image[0] if isinstance(req.params.image, list) else req.params.image
+        extra = req.params.extra_params or {}
         last_image = extra.get("last_image")
 
         if last_image is not None and isinstance(last_image, list):
@@ -406,16 +406,16 @@ class WanImageToVideoPipeline(BasePipeline):
         return self.forward(
             image=image,
             prompt=req.prompt,
-            negative_prompt=req.negative_prompt,
-            height=req.height,
-            width=req.width,
-            num_frames=req.num_frames,
-            num_inference_steps=req.num_inference_steps,
-            guidance_scale=req.guidance_scale,
+            negative_prompt=req.params.negative_prompt,
+            height=req.params.height,
+            width=req.params.width,
+            num_frames=req.params.num_frames,
+            num_inference_steps=req.params.num_inference_steps,
+            guidance_scale=req.params.guidance_scale,
             guidance_scale_2=extra.get("guidance_scale_2"),
             boundary_ratio=extra.get("boundary_ratio"),
-            seed=req.seed,
-            max_sequence_length=req.max_sequence_length,
+            seed=req.params.seed,
+            max_sequence_length=req.params.max_sequence_length,
             last_image=last_image,
         )
 
