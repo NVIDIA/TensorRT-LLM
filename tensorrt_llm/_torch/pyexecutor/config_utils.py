@@ -5,6 +5,10 @@ from typing import Optional
 import transformers
 
 
+def is_hybrid_linear(config):
+    return is_nemotron_hybrid(config) or is_qwen3_hybrid(config)
+
+
 def is_nemotron_hybrid(config):
     if hasattr(config, "hybrid_override_pattern"
                ) and config.hybrid_override_pattern is not None and len(

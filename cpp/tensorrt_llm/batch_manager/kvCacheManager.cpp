@@ -494,34 +494,9 @@ void KVCacheBlock::detachDescendantsFromLookupTree()
     }
 }
 
-void KVCacheBlock::detachPreviousPlaceholdersFromLookupTree() const
-{
-    BlockPtr current = getPrevBlock();
-    while (current != nullptr && current->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
-    {
-        if (!current->isPlaceholder())
-        {
-            return;
-        }
-        auto siblings = current->getNextBlocks();
-        for (auto const& [key, block] : siblings)
-        {
-            if (!block->isPlaceholder() && block.get() != this)
-            {
-                return;
-            }
-        }
-        BlockPtr prev = current->getPrevBlock();
-        current->detachFromLookupNode();
-        current->setPrevBlockInSeq(nullptr);
-        current = prev;
-    }
-}
-
 void KVCacheBlock::freeBlockAndAllDescendants()
 {
     detachDescendantsFromLookupTree();
-    detachPreviousPlaceholdersFromLookupTree();
     detachFromLookupNode();
 }
 

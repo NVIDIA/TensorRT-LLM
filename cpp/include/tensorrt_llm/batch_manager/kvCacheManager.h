@@ -393,10 +393,7 @@ public:
     static BlockPtr createPlaceholder(IdType blockId, SizeType32 windowSize);
 
     void detachDescendantsFromLookupTree();
-    //! \brief Detach all placeholder blocks in the previous-block chain from the lookup tree.
-    //! \details Walks upward via getPrevBlock() and calls detachFromLookupNode() on each
-    //! block that is a placeholder. Stops at the root (kCachedBlocksRootId).
-    void detachPreviousPlaceholdersFromLookupTree() const;
+
     void freeBlockAndAllDescendants();
 
     //! \brief Find block matching blockKey. If allowPartial is true, the returned block may match only a prefix of

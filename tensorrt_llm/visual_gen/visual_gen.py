@@ -45,7 +45,6 @@ __all__ = [
     "VisualGenResult",
 ]
 from tensorrt_llm.executor.ipc import ZeroMqQueue
-from tensorrt_llm.inputs.data import VisualGenInputs
 from tensorrt_llm.llmapi.utils import set_api_status
 from tensorrt_llm.logger import logger
 
@@ -538,13 +537,14 @@ class VisualGen:
     @set_api_status("prototype")
     def generate(
         self,
-        inputs: VisualGenInputs,
-        params: VisualGenParams,
+        inputs: Union[str, List[str]],
+        params: Optional[VisualGenParams] = None,
     ) -> MediaOutput:
         """Synchronous generation. Blocks until complete.
 
         Args:
-            params: Generation parameters.
+            inputs: Text prompt string or list of prompt strings.
+            params: Generation parameters (optional; uses model defaults when None).
 
         Returns:
             MediaOutput: Generated media with model-specific fields populated:
@@ -566,70 +566,38 @@ class VisualGen:
     @set_api_status("prototype")
     def generate_async(
         self,
-        inputs: VisualGenInputs,
-        params: VisualGenParams,
+        inputs: Union[str, List[str]],
+        params: Optional[VisualGenParams] = None,
     ) -> VisualGenResult:
         """Async generation. Returns immediately with future-like object.
 
         Args:
-            params: Generation parameters.
+            inputs: Text prompt string or list of prompt strings.
+            params: Generation parameters (optional; uses model defaults when None).
 
         Returns:
             VisualGenResult: Call result() to get output dict.
         """
         req_id = next(self._req_counter)
 
-        # Normalize inputs to (prompt: List[str], negative_prompt: Optional[str])
-        # so DiffusionRequest.prompt is always a list.
-        if isinstance(inputs, dict):
-            prompt = [inputs.get("prompt")]
-            negative_prompt = inputs.get("negative_prompt", None)
-        elif isinstance(inputs, str):
+        # Normalize to List[str] for DiffusionRequest.prompt
+        if isinstance(inputs, str):
             prompt = [inputs]
-            negative_prompt = None
         elif isinstance(inputs, (list, tuple)):
-            # Batch generation: list of prompts
             if not inputs:
                 raise ValueError("Batch inputs must contain at least one item")
-
-            prompt = []
-            negative_prompts = []
-            for idx, inp in enumerate(inputs):
-                if isinstance(inp, str):
-                    prompt.append(inp)
-                    negative_prompts.append(None)
-                elif isinstance(inp, dict):
-                    item_prompt = inp.get("prompt")
-                    if item_prompt is None:
-                        raise ValueError(f"Batch input at index {idx} is missing 'prompt'")
-                    prompt.append(item_prompt)
-                    negative_prompts.append(inp.get("negative_prompt"))
-                else:
-                    raise ValueError(f"Invalid batch item type at index {idx}: {type(inp)}")
-
-            unique_negatives = {p for p in negative_prompts if p is not None}
-            if len(unique_negatives) > 1:
-                raise ValueError("Per-item negative_prompt is not supported for batch inputs")
-            negative_prompt = next(iter(unique_negatives), None)
+            if not all(isinstance(item, str) for item in inputs):
+                raise ValueError("Batch inputs must contain only strings (prompt text)")
+            prompt = list(inputs)
         else:
             raise ValueError(f"Invalid inputs type: {type(inputs)}")
 
+        # Snapshot caller-provided params so later mutations don't affect
+        # the queued request (the dispatcher thread serializes it lazily).
         request = DiffusionRequest(
             request_id=req_id,
             prompt=prompt,
-            negative_prompt=negative_prompt,
-            height=params.height,
-            width=params.width,
-            num_inference_steps=params.num_inference_steps,
-            guidance_scale=params.guidance_scale,
-            max_sequence_length=params.max_sequence_length,
-            seed=params.seed,
-            num_frames=params.num_frames,
-            frame_rate=params.frame_rate,
-            num_images_per_prompt=params.num_images_per_prompt,
-            image=params.image,
-            image_cond_strength=params.image_cond_strength,
-            extra_params=params.extra_params,
+            params=params.model_copy(deep=True) if params is not None else None,
         )
 
         self.executor.enqueue_requests([request])

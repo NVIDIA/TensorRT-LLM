@@ -108,6 +108,8 @@ EXCLUDE_TEST_FILES = {
     "test_fuse_relu2_quant_nvfp4.py",
     "test_moe_fusion.py",
     "test_trtllm_gen_diag.py",
+    # QKV fusion → trtllm cache insertion (TRT-LLM attention backend only)
+    "test_gemm_fusion_trtllm.py",
     # Require TRT-LLM LlmArgs / runtime
     "test_eagle.py",
     "test_modeling_nemotron_h.py",
