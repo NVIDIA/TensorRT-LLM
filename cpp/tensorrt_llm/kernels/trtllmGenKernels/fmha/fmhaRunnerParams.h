@@ -71,6 +71,8 @@ enum class FmhaKernelType
     SwapsMmaAbForGeneration,
     // Keep tensor A and tensor B of Mma.
     KeepsMmaAbForGeneration,
+    // Speculative decoding (Medusa and Eagle) generation-phase attention kernels, where seqLenQ > 1.
+    SpecDecodingGeneration
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -87,8 +89,9 @@ FMHA_KERNEL_TYPE_FUNCTION(Context)
 FMHA_KERNEL_TYPE_FUNCTION(Generation)
 FMHA_KERNEL_TYPE_FUNCTION(SwapsMmaAbForGeneration)
 FMHA_KERNEL_TYPE_FUNCTION(KeepsMmaAbForGeneration)
+FMHA_KERNEL_TYPE_FUNCTION(SpecDecodingGeneration)
 
-#undef FMHA_KERNEL_TYPE_FUNCTION
+#undef QKV_LAYOUT_FUNCTION
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -241,7 +244,7 @@ struct TllmGenFmhaRunnerParams
     // The output scaling factor buffer.
     void* oSfPtr;
     // The sequence lengths for Q.
-    int const* seqLensQPtr;
+    int const* seqlensQPtr;
 
     // Head dimension for Q and K.
     int mHeadDimQk;

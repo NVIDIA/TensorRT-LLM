@@ -21,7 +21,6 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/heuristicTopKDecode.h"
 #include "tensorrt_llm/kernels/noAuxTcKernels.h"
-#include <cfloat>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 

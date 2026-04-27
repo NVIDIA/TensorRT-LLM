@@ -15,7 +15,6 @@
  */
 
 #include "fmhaReduction.h"
-#include "fmhaRunnerParams.h"
 #include "kernelUtils.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -33,8 +32,8 @@ namespace kernels
 
 template <int32_t TileSizePerCtaQ, int32_t HeadDim, int32_t HeadDimPerCta, bool IsE4m3Bmm, typename DtypeO,
     typename DtypePartialO>
-__global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha::KernelParams const params,
-    bool sparseMla, int32_t numCtasForReduction, int32_t numCtasForAllHeads, int32_t numHeadDimCtasV)
+__global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(KernelParams const params, bool sparseMla,
+    int32_t numCtasForReduction, int32_t numCtasForAllHeads, int32_t numHeadDimCtasV)
 {
 
     // clang-format off
@@ -311,7 +310,7 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2) fmhaReductionKernel(fmha:
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, fmha::KernelParams const& params,
+void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams const& params,
     int32_t multiProcessorCount, cudaStream_t stream)
 {
 
@@ -373,7 +372,7 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, fmha::KernelP
     config.numAttrs = 1;
 
     // Select the kernel function pointer.
-    void (*kernel)(fmha::KernelParams const, bool, int32_t, int32_t, int32_t) = nullptr;
+    void (*kernel)(KernelParams const, bool, int32_t, int32_t, int32_t) = nullptr;
     if (headDimPerCtaV == 128)
     {
         SELECT_FMHA_REDUCTION_KERNEL(128);
