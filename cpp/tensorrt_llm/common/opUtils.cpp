@@ -161,7 +161,9 @@ std::shared_ptr<ncclComm_t> getComm(std::set<int> const& group)
     setenv("NCCL_RUNTIME_CONNECT", "0", 0);
     setenv("NCCL_GRAPH_REGISTER", "0", 0);
 #endif // _WIN32
-    NCCLCHECK_THROW(ncclCommInitRank(ncclComm.get(), group.size(), id, groupRank));
+    ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
+    config.graphUsageMode = 1;
+    NCCLCHECK_THROW(ncclCommInitRankConfig(ncclComm.get(), group.size(), id, groupRank, &config));
     commMap[group] = ncclComm;
     TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, rank);
     return ncclComm;
