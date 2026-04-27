@@ -288,6 +288,14 @@ public:
     virtual ~TransferStatus() = default;
     [[nodiscard]] virtual bool isCompleted() const = 0;
     virtual TransferState wait(int64_t timeout_ms = -1) const = 0;
+    /// Release the backend transfer request. If the request is still active,
+    /// backends may attempt to cancel it. A true return only means the backend
+    /// accepted release of the transfer handle; callers must still treat remote
+    /// memory quiescence as backend-specific.
+    [[nodiscard]] virtual bool release()
+    {
+        return false;
+    }
 };
 
 struct BaseAgentConfig

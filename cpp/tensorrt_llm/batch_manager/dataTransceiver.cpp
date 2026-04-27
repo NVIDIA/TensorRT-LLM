@@ -607,13 +607,16 @@ private:
             {
                 // TODO: if the generation does not require the kv cache, the request will
                 // not be removed from mCancelledRequests. This should be handled by timeout.
-                auto it = mReadyResponses.find(mCurrentRequest.value());
-                TLLM_CHECK(it != mReadyResponses.end());
+                auto cancelledRequestId = mCurrentRequest.value();
+                Response cancelledResponse;
                 {
                     std::scoped_lock lkResp(mSenderMutex);
+                    auto it = mReadyResponses.find(cancelledRequestId);
+                    TLLM_CHECK(it != mReadyResponses.end());
+                    cancelledResponse = std::move(it->second);
                     mReadyResponses.erase(it);
-                    mCancelledRequests.erase(mCurrentRequest.value());
-                    mRemainSendCount.erase(mCurrentRequest.value());
+                    mCancelledRequests.erase(cancelledRequestId);
+                    mRemainSendCount.erase(cancelledRequestId);
                 }
                 mCurrentRequest = std::nullopt;
 
@@ -622,6 +625,9 @@ private:
                     std::unique_lock lk(mCondMutex);
                     mAnyReady = false;
                 }
+                cancelledResponse.mPromise.set_exception(std::make_exception_ptr(TLLM_REQUEST_EXCEPTION(
+                    cancelledRequestId, common::RequestErrorCode::kNETWORK_ERROR,
+                    "KV cache transfer for request %zu was cancelled", cancelledRequestId)));
             }
         }
         mCurrentRequest = std::nullopt;

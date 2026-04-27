@@ -51,6 +51,13 @@ This branch has started the plan with the pieces that are local and low risk:
   not free active request resources in-process.
 - C++ worker/future paths now have catch-all handling for unknown exceptions and
   convert them into promise/future errors.
+- `TransferStatus` now has a `release()` hook. The NIXL implementation calls
+  `nixlAgent::releaseXferReq()`, so sender-side cancellation and object
+  destruction use NIXL's intended transfer-handle release path instead of
+  leaking backend request handles.
+- Agent notification waits now report whether they ended because the expected
+  notification arrived or because the transfer was terminated. A terminated
+  receive no longer looks like a successful data/sync notification.
 
 Still remaining:
 
@@ -59,6 +66,10 @@ Still remaining:
   health directly rather than surfacing errors through Python futures.
 - If graceful in-process recovery is required later, add real generation receive
   transfer tracking instead of relying on fail-closed restart.
+- NIXL/UCX cancellation is still backend-specific: `releaseXferReq()` releases
+  the handle and may request cancellation, but this branch does not treat it as
+  proof that a peer can immediately recycle remote KV memory after an ambiguous
+  one-sided RMA transfer.
 
 ## 1. RAII BufferIndexHolder
 
