@@ -33,7 +33,7 @@ from tensorrt_llm._utils import EnergyMonitor
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
-from tensorrt_llm.inputs.data import TokensPrompt, visual_gen_inputs
+from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
@@ -1775,21 +1775,13 @@ class OpenAIServer:
         """
         try:
             image_id = f"image_{uuid.uuid4().hex}"
-            params = parse_visual_gen_params(request, image_id)
+            params = parse_visual_gen_params(request, image_id, self.generator)
             logger.info(
                 f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
             )
 
-            if request.negative_prompt is not None:
-                inputs = visual_gen_inputs({
-                    "prompt":
-                    request.prompt,
-                    "negative_prompt":
-                    request.negative_prompt
-                })
-            else:
-                inputs = visual_gen_inputs(request.prompt)
-            output = self.generator.generate(inputs=inputs, params=params)
+            output = self.generator.generate(inputs=request.prompt,
+                                             params=params)
             if output.image is None:
                 return self.create_error_response(
                     message="Image generation failed",
@@ -1840,21 +1832,13 @@ class OpenAIServer:
         """
         try:
             image_id = f"image_{uuid.uuid4().hex}"
-            params = parse_visual_gen_params(request, image_id)
+            params = parse_visual_gen_params(request, image_id, self.generator)
             logger.info(
                 f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
             )
 
-            if request.negative_prompt is not None:
-                inputs = visual_gen_inputs({
-                    "prompt":
-                    request.prompt,
-                    "negative_prompt":
-                    request.negative_prompt
-                })
-            else:
-                inputs = visual_gen_inputs(request.prompt)
-            output = self.generator.generate(inputs=inputs, params=params)
+            output = self.generator.generate(inputs=request.prompt,
+                                             params=params)
             if output.image is None:
                 return self.create_error_response(
                     message="Image editing failed",
@@ -1909,22 +1893,15 @@ class OpenAIServer:
             video_id = f"video_{uuid.uuid4().hex}"
             params = parse_visual_gen_params(request,
                                              video_id,
+                                             self.generator,
                                              media_storage_path=str(
                                                  self.media_storage_path))
             logger.info(
                 f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}"
             )
 
-            if request.negative_prompt is not None:
-                inputs = visual_gen_inputs({
-                    "prompt":
-                    request.prompt,
-                    "negative_prompt":
-                    request.negative_prompt
-                })
-            else:
-                inputs = visual_gen_inputs(request.prompt)
-            output = self.generator.generate(inputs=inputs, params=params)
+            output = self.generator.generate(inputs=request.prompt,
+                                             params=params)
             if output.video is None:
                 return self.create_error_response(
                     message="Video generation failed",
@@ -2043,6 +2020,7 @@ class OpenAIServer:
             video_id = f"video_{uuid.uuid4().hex}"
             params = parse_visual_gen_params(request,
                                              video_id,
+                                             self.generator,
                                              media_storage_path=str(
                                                  self.media_storage_path))
             logger.info(
@@ -2091,16 +2069,8 @@ class OpenAIServer:
             resolved_fmt, resolved_ext = resolve_video_format(
                 request.output_format)
 
-            if request.negative_prompt is not None:
-                inputs = visual_gen_inputs({
-                    "prompt":
-                    request.prompt,
-                    "negative_prompt":
-                    request.negative_prompt
-                })
-            else:
-                inputs = visual_gen_inputs(request.prompt)
-            future = self.generator.generate_async(inputs=inputs, params=params)
+            future = self.generator.generate_async(inputs=request.prompt,
+                                                   params=params)
             output = await future.result()
 
             if output.video is None:

@@ -1750,7 +1750,14 @@ class PerfSanityTestConfig:
                         if num_ctx_servers > 0:
                             match_keys.extend(add_list_prefix(ctx_config.to_match_keys(), "ctx"))
                         if num_gen_servers > 0:
-                            match_keys.extend(add_list_prefix(gen_config.to_match_keys(), "gen"))
+                            gen_match_keys = add_list_prefix(gen_config.to_match_keys(), "gen")
+                            if disagg_config.benchmark_mode == "gen_only":
+                                gen_match_keys = [
+                                    k
+                                    for k in gen_match_keys
+                                    if k != "gen_s_cache_transceiver_backend"
+                                ]
+                            match_keys.extend(gen_match_keys)
                         match_keys.extend(client_config.to_match_keys())
         else:
             return

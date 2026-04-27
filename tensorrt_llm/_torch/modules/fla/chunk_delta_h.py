@@ -48,6 +48,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     cu_seqlens,
     chunk_offsets,
     T,
+    stride_h0,
     H: tl.constexpr,
     Hg: tl.constexpr,
     K: tl.constexpr,
@@ -96,7 +97,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     stride_w = H * K
     if USE_INDEXED_STATE:
         state_index = tl.load(h0_i + i_n).to(tl.int64)
-        h0 = h0 + state_index * stride_h
+        h0 = h0 + state_index * stride_h0
         ht = h0
     if USE_INITIAL_STATE:
         h0 = h0 + ((i_h if USE_INDEXED_STATE else i_nh) * K * V)
@@ -300,6 +301,7 @@ def chunk_gated_delta_rule_fwd_h(
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
         T=T,
+        stride_h0=initial_state.stride(0) if initial_state is not None else 0,
         H=H,
         Hg=Hg,
         K=K,
