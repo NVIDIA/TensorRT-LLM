@@ -505,7 +505,6 @@ class ConfigurableMoE(MoE):
                 router_logits,
                 output_dtype=output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens,
-                use_dp_padding=use_dp_padding,
                 do_finalize=do_finalize,
             )
 
@@ -639,7 +638,6 @@ class ConfigurableMoE(MoE):
         *,
         output_dtype: Optional[torch.dtype],
         all_rank_num_tokens: Optional[List[int]],
-        use_dp_padding: Optional[bool],
         do_finalize: bool,
     ) -> torch.Tensor:
         """Run ``MegaMoEDeepGemmFusedMoE`` by the separated-routing-and-quant path.
@@ -674,8 +672,10 @@ class ConfigurableMoE(MoE):
         # even on zero-token ranks, so we *don't* short-circuit when
         # num_tokens == 0 — we still run quant/route on the empty slice
         # (cheap) and let the kernel launch proceed.
+        # ``all_rank_num_tokens`` is one entry per EP rank (Phase 1
+        # asserts ``ep_size == parallel_size``), so index by ``moe_ep_rank``.
         if all_rank_num_tokens is not None:
-            num_tokens = int(all_rank_num_tokens[self.mapping.tp_rank])
+            num_tokens = int(all_rank_num_tokens[self.mapping.moe_ep_rank])
         else:
             num_tokens = x.shape[0]
         assert num_tokens <= x.shape[0]
@@ -688,7 +688,7 @@ class ConfigurableMoE(MoE):
         # ``backend.forward_impl``; hoisting them up collapses the Python
         # call stack by two frames and — more importantly — lets the
         # backend's ``run_with_prequant`` match DG's ``run_fused`` shape
-        # contract exactly (4 × buf.copy_ + kernel).
+        # contract exactly (4 x buf.copy_ + kernel).
         x_real = x[:num_tokens]
         router_logits_real = router_logits[:num_tokens]
 
@@ -700,9 +700,12 @@ class ConfigurableMoE(MoE):
         else:
             # Zero-token rank: fabricate empty tensors so
             # ``run_with_prequant`` still takes the same shape contract.
+            # x_sf is (m, hidden_size // 128) int32 — packed UE8M0 stores
+            # 4 u8 scales per int32 over a 32-element block, i.e. 128
+            # input elements per int32 stride.
             device = x.device
             x_fp8 = torch.empty((0, self.hidden_size), dtype=torch.float8_e4m3fn, device=device)
-            x_sf = torch.empty((0, 0), dtype=torch.int32, device=device)
+            x_sf = torch.empty((0, self.hidden_size // 128), dtype=torch.int32, device=device)
             topk_idx = torch.empty(
                 (0, self.routing_method.experts_per_token), dtype=torch.int64, device=device
             )

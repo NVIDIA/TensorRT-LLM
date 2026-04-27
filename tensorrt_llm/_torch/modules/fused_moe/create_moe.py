@@ -102,12 +102,20 @@ def get_moe_cls(
         # and the create path doesn't know the model's SwiGLU flavor yet).
         from .mega_moe import MegaMoEDeepGemmFusedMoE
         pretrained = model_config.pretrained_config
+        # Resolve dtype + intermediate_size from pretrained_config so the
+        # capability check matches the values create_moe will use to
+        # actually instantiate the backend (mirrors create_moe's logic
+        # below: prefer moe_intermediate_size for MoE models).
+        pretrained_dtype = getattr(pretrained, "torch_dtype", torch.bfloat16)
+        pretrained_inter = getattr(pretrained, "moe_intermediate_size", None)
+        if pretrained_inter is None:
+            pretrained_inter = getattr(pretrained, "intermediate_size", None)
         ok, reason = MegaMoEDeepGemmFusedMoE.can_implement(
             QuantAlgo.W4A8_MXFP4_MXFP8,
-            dtype_activation=torch.bfloat16,
+            dtype_activation=pretrained_dtype,
             swiglu_gptoss_style=False,
             hidden_size=getattr(pretrained, "hidden_size", None),
-            intermediate_size=getattr(pretrained, "intermediate_size", None),
+            intermediate_size=pretrained_inter,
         )
         if not ok:
             logger.warning(
@@ -439,9 +447,16 @@ def create_moe(
 
     enable_configurable_moe = os.environ.get("ENABLE_CONFIGURABLE_MOE",
                                              "1") == "1"
+    # Build the ConfigurableMoE-supported set lazily so non-MegaMoE
+    # callers don't have to import DeepGEMM at module load time.
+    configurable_supported = (DeepGemmFusedMoE, TRTLLMGenFusedMoE,
+                              CuteDslFusedMoE, CutlassFusedMoE,
+                              DenseGEMMFusedMoE)
+    if model_config.moe_backend.upper() == "MEGAMOE_DEEPGEMM":
+        from .mega_moe import MegaMoEDeepGemmFusedMoE
+        configurable_supported = configurable_supported + (MegaMoEDeepGemmFusedMoE,)
     if enable_configurable_moe or moe_cls == CuteDslFusedMoE:
-        if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
-                       CutlassFusedMoE, DenseGEMMFusedMoE):
+        if moe_cls in configurable_supported:
             return ConfigurableMoE(
                 routing_method=routing_method,
                 num_experts=num_experts,

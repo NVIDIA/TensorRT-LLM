@@ -127,19 +127,23 @@ def _import_deep_gemm():
 
 
 def _import_dg_fp8_cast():
-    """Return ``per_token_cast_to_fp8`` from the same bundled module the
-    kernel lives in. Only this cast is used on the hot path; we do NOT
-    require ``per_token_cast_to_fp4`` since the backend consumes MXFP4
-    weights that are already pre-quantized by the caller (see
-    ``load_weights``) and the transform runs on those raw bytes."""
+    """Return ``per_token_cast_to_fp8`` from the same bundled module the kernel lives in.
+
+    Only this cast is used on the hot path; we do NOT require
+    ``per_token_cast_to_fp4`` since the backend consumes MXFP4 weights
+    that are already pre-quantized by the caller (see ``load_weights``)
+    and the transform runs on those raw bytes.
+    """
     dg = _import_deep_gemm()
     return dg.per_token_cast_to_fp8
 
 
 class _MegaMoEUnavailable(RuntimeError):
-    """Signals that the bundled DeepGEMM doesn't expose the full mega_moe
-    API. ``can_implement`` converts this into a clean ``(False, reason)``
-    instead of a hard import error."""
+    """Signals that the bundled DeepGEMM doesn't expose the full mega_moe API.
+
+    ``can_implement`` converts this into a clean ``(False, reason)``
+    instead of a hard import error.
+    """
 
 
 def _ue8m0_uint8_to_fp32(sf_uint8: torch.Tensor) -> torch.Tensor:
@@ -181,8 +185,17 @@ def _trtllm_mxfp8_quantize_available() -> bool:
 
 def _quantize_bf16_to_fp8_ue8m0(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return (x_fp8, x_sf) in DG mega_moe's expected layout (packed int32)."""
+    m, n = x.shape
+    # Packed-UE8M0 stores 4 u8 scales per int32 over a 32-element block,
+    # so n must be a multiple of 128 for the int32 view below to land on
+    # an integer last-dim. Misaligned shapes would otherwise fail with a
+    # cryptic reshape/view error; surface a clear contract here instead.
+    if n % 128 != 0:
+        raise ValueError(
+            f"_quantize_bf16_to_fp8_ue8m0 requires hidden_size % 128 == 0 "
+            f"(packed-UE8M0 int32 SF stride); got hidden_size={n}"
+        )
     if _trtllm_mxfp8_quantize_available():
-        m, n = x.shape
         # ``is_sf_swizzled_layout=False`` → flat row-major uint8 SF, one
         # byte per 32-element group. ``alignment=32`` → MXFP8 block size.
         x_fp8, x_sf_u8 = torch.ops.trtllm.mxfp8_quantize(x, False, alignment=32)
@@ -206,7 +219,7 @@ def _quantize_bf16_to_fp8_ue8m0(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Te
 class MegaMoEDeepGemmFusedMoE(MoE):
     """MoE backend wrapping DeepGEMM's fused ``fp8_fp4_mega_moe`` kernel."""
 
-    _SUPPORTED_ACTIVATION_DTYPES = {torch.bfloat16}
+    _SUPPORTED_ACTIVATION_DTYPES = frozenset({torch.bfloat16})
 
     # ------------------------------------------------------------------
     # Capability gating
@@ -463,8 +476,11 @@ class MegaMoEDeepGemmFusedMoE(MoE):
 
     # ----- Per-loading-mode weight unpacking helpers -------------------
     def _iter_vanilla_expert_weights(self, w: Dict, expert_id: int):
-        """Return (w1, w3, w2, w1_sf, w3_sf, w2_sf) as CPU uint8 tensors
-        for VANILLA / W4A8_CUSTOM key schema ``{eid}.w*.weight[_scale]``."""
+        """Return (w1, w3, w2, w1_sf, w3_sf, w2_sf) as CPU uint8 tensors.
+
+        Used for VANILLA / W4A8_CUSTOM key schema
+        ``{eid}.w*.weight[_scale]``.
+        """
         return (
             w[f"{expert_id}.w1.weight"],
             w[f"{expert_id}.w3.weight"],
@@ -535,8 +551,10 @@ class MegaMoEDeepGemmFusedMoE(MoE):
         self._weights_loaded = True
 
     def post_load_weights(self) -> None:
-        """Finalize: allocate DG SymmBuffer (collective rendezvous) and
-        run ``transform_weights_for_mega_moe`` on this rank's weights.
+        """Finalize loaded weights for the MegaMoE hot path.
+
+        Allocates the DG SymmBuffer (collective rendezvous) and runs
+        ``transform_weights_for_mega_moe`` on this rank's weights.
 
         Both operations happen here because (a) rendezvous is collective
         and must run at a globally-synchronous time (post-load is), and
@@ -658,9 +676,10 @@ class MegaMoEDeepGemmFusedMoE(MoE):
         num_tokens: int,
         output_dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Kernel-only path: 4 × ``buf.copy_()`` + empty-alloc +
-        ``fp8_fp4_mega_moe`` launch. Matches DG's own ``run_fused`` shape
-        contract so the GPU work here is exactly what DG benchmarks report.
+        """Kernel-only path: 4 x ``buf.copy_()`` + empty-alloc + kernel launch.
+
+        Matches DG's own ``run_fused`` shape contract so the GPU work
+        here is exactly what DG benchmarks report.
 
         Caller is responsible for:
           * slicing ``x_real`` / ``router_logits_real`` to ``num_tokens``
@@ -722,11 +741,13 @@ class MegaMoEDeepGemmFusedMoE(MoE):
 
         # ----- Resolve real (unpadded) token count -----------------------
         # MoE.forward_fake contract: return shape [num_tokens_real, H]
-        # where num_tokens_real = all_rank_num_tokens[tp_rank] when
+        # where num_tokens_real = all_rank_num_tokens[moe_ep_rank] when
         # provided (attention-DP padding case). x.shape[0] may be larger
         # than num_tokens_real under ``use_dp_padding=True``.
+        # Phase 1 asserts ``ep_size == parallel_size`` so the per-EP-rank
+        # entry is also the per-DP-rank entry.
         if all_rank_num_tokens is not None:
-            num_tokens = int(all_rank_num_tokens[self.mapping.tp_rank])
+            num_tokens = int(all_rank_num_tokens[self.mapping.moe_ep_rank])
         else:
             num_tokens = x.shape[0]
         assert num_tokens <= x.shape[0], f"num_tokens ({num_tokens}) > x.shape[0] ({x.shape[0]})"
