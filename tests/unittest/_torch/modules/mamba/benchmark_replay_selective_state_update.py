@@ -52,6 +52,7 @@ import itertools
 import os
 import statistics
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -415,6 +416,59 @@ def _time_kernel(args, run_fn, reset_fn, tag: str) -> tuple[float, float, float]
 # Per-config benchmark (consolidated baseline + replay)
 
 
+def _parallel_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtypes,
+                           baseline_fn, max_workers: int) -> None:
+    """Run each config once in parallel to compile + cache Triton kernels.
+
+    Triton's ``compile()`` releases the GIL, so a ThreadPoolExecutor
+    fans out shape compilations across CPU cores in one shared CUDA
+    context.  Compiled binaries land in Triton's on-disk cache (default
+    ``~/.triton/cache``) and the subsequent sequential measurement
+    phase loads them with no compile cost.
+
+    Parallel measurement would race for GPU time and skew numbers, so
+    only the warmup is parallelized; timing stays serial.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    configs = []
+    for batch in batch_sizes:
+        for mtp_len in mtp_lengths:
+            prev_ks = sorted(
+                set(min(mtp_len, max(0, round(f * mtp_len))) for f in args.prev_tokens_fracs)
+            )
+            for state_dtype in state_dtypes:
+                for act_dtype in act_dtypes:
+                    configs.append((batch, mtp_len, prev_ks, state_dtype, act_dtype))
+
+    print(f"[parallel-warmup] {len(configs)} configs across {max_workers} threads")
+    t0 = time.perf_counter()
+
+    def _warm(cfg):
+        batch, mtp_len, prev_ks, state_dtype, act_dtype = cfg
+        _bench_config(
+            args, batch, mtp_len, prev_ks, state_dtype, act_dtype, baseline_fn,
+            warmup_only=True,
+        )
+
+    errors = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_warm, cfg) for cfg in configs]
+        for cfg, fut in zip(configs, futures):
+            try:
+                fut.result()
+            except Exception as e:
+                errors.append((cfg, e))
+
+    if errors:
+        for cfg, e in errors:
+            print(f"[parallel-warmup] FAILED config {cfg}: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+        raise errors[0][1]
+
+    print(f"[parallel-warmup] done in {time.perf_counter() - t0:.1f}s")
+
+
 def _bench_config(
     args,
     batch: int,
@@ -423,6 +477,7 @@ def _bench_config(
     state_dtype: torch.dtype,
     act_dtype: torch.dtype,
     baseline_fn,
+    warmup_only: bool = False,
 ) -> None:
     """
     Benchmark one (batch, mtp_len, dtype) configuration.
@@ -430,6 +485,11 @@ def _bench_config(
     Runs the baseline kernel (if baseline_fn is not None) followed by the
     replay kernel for each prev_k value.  Tensors are built once and
     shared across all runs in this config.
+
+    When ``warmup_only`` is True, calls each kernel exactly once instead of
+    timing it.  Used by the parallel-warmup phase to populate Triton's
+    persistent compile cache across all configs concurrently.  No timing
+    output is produced.
     """
     state_dtype_name = str(state_dtype).split(".")[-1]
     act_dtype_name = str(act_dtype).split(".")[-1]
@@ -600,20 +660,25 @@ def _bench_config(
                 )
 
         reset_fn = _reset_conv1d_realistic if with_conv1d else _reset
-        median_us, p95_us, p99_us = _time_kernel(args, _run_baseline, reset_fn, tag)
+        if warmup_only:
+            reset_fn()
+            _run_baseline()
+            torch.cuda.synchronize()
+        else:
+            median_us, p95_us, p99_us = _time_kernel(args, _run_baseline, reset_fn, tag)
 
-        _print_row(
-            show_kernel_col,
-            args.baseline,
-            batch,
-            mtp_len,
-            "N/A",
-            state_dtype_name,
-            act_dtype_name,
-            median_us,
-            p95_us,
-            p99_us,
-        )
+            _print_row(
+                show_kernel_col,
+                args.baseline,
+                batch,
+                mtp_len,
+                "N/A",
+                state_dtype_name,
+                act_dtype_name,
+                median_us,
+                p95_us,
+                p99_us,
+            )
 
     # --- Sweep parameter parsing (invariant across prev_k) ---
     def _parse_sweep(val):
@@ -712,21 +777,26 @@ def _bench_config(
             sweep_tag = tag + sweep_suffix.replace(" ", "_").replace(",", "_")
 
             reset_fn = _reset_conv1d_realistic if with_conv1d else _reset
-            median_us, p95_us, p99_us = _time_kernel(args, _run_incr, reset_fn, sweep_tag)
+            if warmup_only:
+                reset_fn()
+                _run_incr()
+                torch.cuda.synchronize()
+            else:
+                median_us, p95_us, p99_us = _time_kernel(args, _run_incr, reset_fn, sweep_tag)
 
-            _print_row(
-                show_kernel_col,
-                "replay",
-                batch,
-                mtp_len,
-                prev_k,
-                state_dtype_name,
-                act_dtype_name,
-                median_us,
-                p95_us,
-                p99_us,
-                sweep_suffix,
-            )
+                _print_row(
+                    show_kernel_col,
+                    "replay",
+                    batch,
+                    mtp_len,
+                    prev_k,
+                    state_dtype_name,
+                    act_dtype_name,
+                    median_us,
+                    p95_us,
+                    p99_us,
+                    sweep_suffix,
+                )
 
 
 def _print_row(
@@ -786,6 +856,12 @@ def _run_benchmark(args) -> None:
         _init_l2_flush()  # still needed for the realistic reset's flush step
     elif args.l2_flush:
         _init_l2_flush()
+
+    if args.parallel_warmup > 0:
+        _parallel_warmup_phase(
+            args, batch_sizes, mtp_lengths, state_dtypes, act_dtypes,
+            baseline_fn, max_workers=args.parallel_warmup,
+        )
 
     if args.profile:
         torch.cuda.cudart().cudaProfilerStart()
@@ -877,6 +953,16 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--warmup", type=int, default=20, help="Number of warmup iterations")
     parser.add_argument("--iters", type=int, default=100, help="Number of timed iterations")
+    parser.add_argument(
+        "--parallel-warmup",
+        type=int,
+        default=0,
+        help="Run a parallel-warmup phase that calls each (batch, mtp_len, "
+        "prev_k, dtype, sweep) config once across N threads before the "
+        "sequential timed phase.  Triton compile releases the GIL so threads "
+        "compile in parallel, populating the persistent cache for free hits "
+        "during measurement.  0 disables the phase.  Try 8 on a multi-core box.",
+    )
     parser.add_argument(
         "--profile",
         action="store_true",
