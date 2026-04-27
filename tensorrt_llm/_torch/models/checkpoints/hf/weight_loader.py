@@ -34,6 +34,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 
+@register_checkpoint_weight_loader("MX")
 @register_checkpoint_weight_loader("mistral")
 @register_checkpoint_weight_loader("HF")
 class HfWeightLoader(BaseWeightLoader):
@@ -59,8 +60,8 @@ class HfWeightLoader(BaseWeightLoader):
                                               op=_MPI.MIN)
         return available_host_memory
 
-    def load_weights(self, checkpoint_dir: str,
-                     mapping: Mapping) -> dict[str, Any]:
+    def load_weights(self, checkpoint_dir: str, mapping: Mapping,
+                     **kwargs) -> dict[str, Any]:
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
         # Some model checkpoint directories contain not only the sharded safetensors, but one
         # consolidated tensor. In the presence of both, we favor the former, as there really is no need

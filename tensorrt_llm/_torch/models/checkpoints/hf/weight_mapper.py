@@ -7,6 +7,7 @@ from tensorrt_llm._torch.modules.linear import W4A16_AWQ_LinearMethod
 from ..base_weight_mapper import BaseWeightMapper
 
 
+@register_mapper("MX")
 @register_mapper("HF")
 class HfWeightMapper(BaseWeightMapper):
 

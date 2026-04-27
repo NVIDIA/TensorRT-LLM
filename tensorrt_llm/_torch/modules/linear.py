@@ -2578,6 +2578,11 @@ class Linear(nn.Module):
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
         self.disable_deep_gemm = disable_deep_gemm
         self.fused_weight_shard_indices_mapping = fused_weight_shard_indices_mapping
+        # MX P2P can write already-sharded local weights directly into
+        # parameter buffers. The marker is set by ModelLoader after a
+        # successful MX transfer; this first MX-only slice does not route it
+        # back through the standard load_weight_shard helpers.
+        self._weights_presharded = False
 
         # Store NVFP4 GEMM allowed backends configuration
         # Read from model_extra_attrs if not explicitly provided (allows config via llm_api_options)
