@@ -802,6 +802,7 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     if (remoteMapping == nullptr)
     {
         // ---- Pure NIXL path ----
+        mPureNixlCount.fetch_add(1, std::memory_order_relaxed);
         return submitNixlTransferInternal(request.getOp(), request.getSrcDescs(), request.getDstDescs(),
             request.getRemoteName(), request.getSyncMessage());
     }
@@ -857,6 +858,7 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
         // If any segment missed, push the ENTIRE request through NIXL.
         TLLM_LOG_WARNING("P2pTransfer: mapping incomplete for '%s' and mixed-mode disabled -> full NIXL fallback",
             request.getRemoteName().c_str());
+        mPureNixlCount.fetch_add(1, std::memory_order_relaxed);
         return submitNixlTransferInternal(request.getOp(), request.getSrcDescs(), request.getDstDescs(),
             request.getRemoteName(), request.getSyncMessage());
     }
@@ -873,11 +875,13 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
         auto& ctx = mP2pAgent->contextForCurrentThread();
         if (avgSegmentSize < thresholdBytes)
         {
+            mCubSubmitCount.fetch_add(1, std::memory_order_relaxed);
             TLLM_LOG_DEBUG("P2pTransfer: cub path %zu/%zu segs avgSize=%zuB total=%zuB to %s (op=%s)",
                 p2pSrcPtrs.size(), numSegments, avgSegmentSize, p2pBytes, request.getRemoteName().c_str(),
                 isWrite ? "WRITE" : "READ");
             return ctx.submitWithCubBatched(p2pSrcPtrs, p2pDstPtrs, p2pSizes);
         }
+        mMemcpyBatchSubmitCount.fetch_add(1, std::memory_order_relaxed);
         TLLM_LOG_DEBUG("P2pTransfer: memcpyBatch path %zu/%zu segs avgSize=%zuB total=%zuB to %s (op=%s)",
             p2pSrcPtrs.size(), numSegments, avgSegmentSize, p2pBytes, request.getRemoteName().c_str(),
             isWrite ? "WRITE" : "READ");
@@ -887,6 +891,7 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     // ---- Case A: every segment mapped -> P2P only (same as old fast path). ----
     if (!havePartialFallback)
     {
+        mPureP2pCount.fetch_add(1, std::memory_order_relaxed);
         return submitP2pHalf();
     }
 
@@ -896,6 +901,7 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     // on the unmapped side). Equivalent to the pre-mixed fallback branch.
     if (p2pSrcPtrs.empty())
     {
+        mPureNixlCount.fetch_add(1, std::memory_order_relaxed);
         return submitNixlTransferInternal(request.getOp(), request.getSrcDescs(), request.getDstDescs(),
             request.getRemoteName(), request.getSyncMessage());
     }
@@ -903,6 +909,7 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     // ---- Case C: mixed -> submit both halves, return a composite status. ----
     // NIXL side uses only the unmapped subset. Submit P2P FIRST so its CUDA stream is
     // launched ASAP (any host-side overhead of createXferReq runs while the GPU works).
+    mMixedCount.fetch_add(1, std::memory_order_relaxed);
     TLLM_LOG_DEBUG("P2pTransfer: mixed path for '%s' — P2P %zu segs, NIXL %zu segs", request.getRemoteName().c_str(),
         p2pSrcPtrs.size(), nixlSrcVec.size());
 
@@ -914,6 +921,28 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
         request.getOp(), nixlSrcDescs, nixlDstDescs, request.getRemoteName(), request.getSyncMessage());
 
     return std::make_unique<MixedTransferStatus>(std::move(p2pStatus), std::move(nixlStatus));
+}
+
+PathCounterSnapshot NixlTransferAgent::getPathCounters() const noexcept
+{
+    PathCounterSnapshot snap{};
+    snap.pureP2p = mPureP2pCount.load(std::memory_order_relaxed);
+    snap.mixed = mMixedCount.load(std::memory_order_relaxed);
+    snap.pureNixl = mPureNixlCount.load(std::memory_order_relaxed);
+    snap.cubSubmit = mCubSubmitCount.load(std::memory_order_relaxed);
+    snap.memcpyBatchSubmit = mMemcpyBatchSubmitCount.load(std::memory_order_relaxed);
+    if (mP2pAgent)
+    {
+        auto p2pSnap = mP2pAgent->getCountersSnapshot();
+        snap.memcpyBatchSingleThread = p2pSnap.memcpyBatchSingleThread;
+        snap.memcpyBatchMultiThread = p2pSnap.memcpyBatchMultiThread;
+    }
+    else
+    {
+        snap.memcpyBatchSingleThread = 0;
+        snap.memcpyBatchMultiThread = 0;
+    }
+    return snap;
 }
 
 void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage const& syncMessage)

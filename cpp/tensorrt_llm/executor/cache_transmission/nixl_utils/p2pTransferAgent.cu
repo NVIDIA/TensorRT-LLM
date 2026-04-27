@@ -520,10 +520,30 @@ TransferState P2pTransferStatus::wait(int64_t timeout_ms) const
         return TransferState::kSUCCESS;
     }
 
+    auto const startTime = std::chrono::steady_clock::now();
+    auto timedOut = [&]()
+    {
+        if (timeout_ms < 0)
+        {
+            return false;
+        }
+        auto elapsed
+            = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime)
+                  .count();
+        return elapsed >= timeout_ms;
+    };
+
     if (mBatchPending)
     {
+        // Phase 1: wait until every worker has recorded its completionEvent (batchPending hits 0).
+        // batchPending is decremented with release ordering after cudaEventRecord, so an acquire load
+        // of 0 here guarantees every event is visible for query/sync below.
         while (mBatchPending->load(std::memory_order_acquire) > 0)
         {
+            if (timedOut())
+            {
+                return TransferState::kIN_PROGRESS;
+            }
             std::this_thread::yield();
         }
 
@@ -537,7 +557,6 @@ TransferState P2pTransferStatus::wait(int64_t timeout_ms) const
             return TransferState::kSUCCESS;
         }
 
-        auto startTime = std::chrono::steady_clock::now();
         while (true)
         {
             bool allDone = true;
@@ -562,10 +581,7 @@ TransferState P2pTransferStatus::wait(int64_t timeout_ms) const
                 return TransferState::kSUCCESS;
             }
 
-            auto elapsed
-                = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime)
-                      .count();
-            if (elapsed >= timeout_ms)
+            if (timedOut())
             {
                 return TransferState::kIN_PROGRESS;
             }
@@ -580,7 +596,6 @@ TransferState P2pTransferStatus::wait(int64_t timeout_ms) const
         return TransferState::kSUCCESS;
     }
 
-    auto startTime = std::chrono::steady_clock::now();
     while (true)
     {
         auto result = cudaEventQuery(mCompletionEvent->get());
@@ -595,10 +610,7 @@ TransferState P2pTransferStatus::wait(int64_t timeout_ms) const
                 cudaGetErrorString(result));
             return TransferState::kFAILURE;
         }
-        auto elapsed
-            = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime)
-                  .count();
-        if (elapsed >= timeout_ms)
+        if (timedOut())
         {
             return TransferState::kIN_PROGRESS;
         }
@@ -1093,6 +1105,16 @@ void P2pHandleExporter::removeHandles(RegisterDescs const& descs)
 void P2pHandleExporter::startUdsServer()
 {
     if (mExportedFds.empty())
+    {
+        return;
+    }
+
+    // Idempotent: exportHandles() runs this on every successful registerMemory call,
+    // but the server only needs to be started once per exporter. Reassigning the
+    // std::thread while the previous one is still joinable would trigger std::terminate.
+    // The already-running server reads mExportedFds under mExportedFdsMutex, so new FDs
+    // added by a later registerMemory are served automatically — no restart required.
+    if (mUdsServerRunning.load(std::memory_order_acquire))
     {
         return;
     }
@@ -1609,12 +1631,13 @@ void* P2pRemoteMappingRegistry::translate(RemoteP2pMapping const& mapping, uintp
 // ============================================================================
 
 P2pTransferContext::P2pTransferContext(CUdevice localDevice, std::shared_ptr<CudaEventPool> eventPool,
-    int batchCopyThreads, size_t multiThreadMinOps, bool cubZeroCopy)
+    int batchCopyThreads, size_t multiThreadMinOps, bool cubZeroCopy, std::shared_ptr<P2pAgentCounters> counters)
     : mLocalDevice(localDevice)
     , mCubZeroCopy(cubZeroCopy)
     , mBatchCopyThreads(batchCopyThreads)
     , mMultiThreadMinOps(multiThreadMinOps)
     , mEventPool(std::move(eventPool))
+    , mCounters(std::move(counters))
 {
     // This may be called from a background thread where the device is not yet set.
     TLLM_CUDA_CHECK(cudaSetDevice(static_cast<int>(mLocalDevice)));
@@ -1754,6 +1777,10 @@ std::unique_ptr<TransferStatus> P2pTransferContext::submitWithMemcpyBatch(
     // own mSubmitStream — no worker pool is constructed, no cross-caller contention.
     if (mBatchCopyThreads <= 1 || numOps < mMultiThreadMinOps || numOps < static_cast<size_t>(mBatchCopyThreads))
     {
+        if (mCounters)
+        {
+            mCounters->memcpyBatchSingleThread.fetch_add(1, std::memory_order_relaxed);
+        }
         cudaMemcpyAttributes attr{};
         attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
         attr.flags = cudaMemcpyFlagPreferOverlapWithCompute;
@@ -1769,6 +1796,10 @@ std::unique_ptr<TransferStatus> P2pTransferContext::submitWithMemcpyBatch(
 
     // Multi-thread path — lazily construct this caller's own worker pool + streams.
     // Each caller thread thus drives N independent workers with no cross-caller queue contention.
+    if (mCounters)
+    {
+        mCounters->memcpyBatchMultiThread.fetch_add(1, std::memory_order_relaxed);
+    }
     ensureWorkerPoolAndStreams();
 
     int numWorkers = mBatchCopyThreads;
@@ -1805,12 +1836,13 @@ std::unique_ptr<TransferStatus> P2pTransferContext::submitWithMemcpyBatch(
 // ============================================================================
 
 P2pTransferContextPool::P2pTransferContextPool(CUdevice localDevice, std::shared_ptr<CudaEventPool> eventPool,
-    int batchCopyThreads, size_t multiThreadMinOps, bool cubZeroCopy)
+    int batchCopyThreads, size_t multiThreadMinOps, bool cubZeroCopy, std::shared_ptr<P2pAgentCounters> counters)
     : mLocalDevice(localDevice)
     , mEventPool(std::move(eventPool))
     , mBatchCopyThreads(batchCopyThreads)
     , mMultiThreadMinOps(multiThreadMinOps)
     , mCubZeroCopy(cubZeroCopy)
+    , mCounters(std::move(counters))
 {
 }
 
@@ -1828,7 +1860,7 @@ P2pTransferContext& P2pTransferContextPool::contextForCurrentThread()
         return *it->second;
     }
     auto ctx = std::make_unique<P2pTransferContext>(
-        mLocalDevice, mEventPool, mBatchCopyThreads, mMultiThreadMinOps, mCubZeroCopy);
+        mLocalDevice, mEventPool, mBatchCopyThreads, mMultiThreadMinOps, mCubZeroCopy, mCounters);
     P2pTransferContext* raw = ctx.get();
     mContexts[tid] = std::move(ctx);
     return *raw;
@@ -1858,9 +1890,10 @@ P2pTransferAgent::P2pTransferAgent()
     , mBatchCopyThreads(std::max(1, common::getEnvKvTransferP2pBatchCopyThreads()))
     , mMultiThreadMinOps(common::getEnvKvTransferP2pBatchCopyMinOps())
     , mCubZeroCopy(common::getEnvKvTransferP2pCubZeroCopy())
+    , mCounters(std::make_shared<P2pAgentCounters>())
     , mExporter(mLocalDevice)
     , mRegistry(mLocalDevice)
-    , mContextPool(mLocalDevice, mEventPool, mBatchCopyThreads, mMultiThreadMinOps, mCubZeroCopy)
+    , mContextPool(mLocalDevice, mEventPool, mBatchCopyThreads, mMultiThreadMinOps, mCubZeroCopy, mCounters)
 {
     if (mBatchCopyThreads > 1)
     {

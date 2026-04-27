@@ -136,6 +136,35 @@ struct RemoteP2pMapping
 };
 
 // ============================================================================
+// P2pAgentCounters — test-only observability for submit sub-paths
+// ============================================================================
+
+/// @brief Atomic counters that track which internal path P2pTransferContext takes when
+/// submitting a cudaMemcpyBatchAsync request. Single-thread vs multi-thread-worker-pool
+/// is a runtime decision inside submitWithMemcpyBatch; no other way to observe it from
+/// outside the class exists today. Used by agent-level E2E tests to assert that env
+/// flags and batch sizes actually route through the intended branch, rather than silently
+/// falling through to the "easy" path. Incrementing two atomics per submit is negligible
+/// relative to the CUDA work that follows.
+struct P2pAgentCounters
+{
+    std::atomic<uint64_t> memcpyBatchSingleThread{0};
+    std::atomic<uint64_t> memcpyBatchMultiThread{0};
+
+    struct Snapshot
+    {
+        uint64_t memcpyBatchSingleThread;
+        uint64_t memcpyBatchMultiThread;
+    };
+
+    [[nodiscard]] Snapshot snapshot() const noexcept
+    {
+        return {memcpyBatchSingleThread.load(std::memory_order_relaxed),
+            memcpyBatchMultiThread.load(std::memory_order_relaxed)};
+    }
+};
+
+// ============================================================================
 // BatchCopyWorkerPool — shared worker pool for parallel cudaMemcpyBatchAsync
 // ============================================================================
 
@@ -365,7 +394,7 @@ class P2pTransferContext
 {
 public:
     P2pTransferContext(CUdevice localDevice, std::shared_ptr<CudaEventPool> eventPool, int batchCopyThreads,
-        size_t multiThreadMinOps, bool cubZeroCopy);
+        size_t multiThreadMinOps, bool cubZeroCopy, std::shared_ptr<P2pAgentCounters> counters = nullptr);
 
     ~P2pTransferContext() = default;
 
@@ -392,6 +421,7 @@ private:
     std::shared_ptr<runtime::CudaStream> mSubmitStream;
     std::shared_ptr<runtime::BufferManager> mBufferManager;
     std::shared_ptr<CudaEventPool> mEventPool;
+    std::shared_ptr<P2pAgentCounters> mCounters; ///< nullable; only populated when owned by a P2pTransferAgent
 
     // Per-Context worker pool + per-worker streams. Lazily constructed on the first call
     // that actually needs the multi-thread path (numOps >= mMultiThreadMinOps).
@@ -417,7 +447,7 @@ class P2pTransferContextPool
 {
 public:
     P2pTransferContextPool(CUdevice localDevice, std::shared_ptr<CudaEventPool> eventPool, int batchCopyThreads,
-        size_t multiThreadMinOps, bool cubZeroCopy);
+        size_t multiThreadMinOps, bool cubZeroCopy, std::shared_ptr<P2pAgentCounters> counters = nullptr);
 
     P2pTransferContextPool(P2pTransferContextPool const&) = delete;
     P2pTransferContextPool& operator=(P2pTransferContextPool const&) = delete;
@@ -431,6 +461,7 @@ private:
     int mBatchCopyThreads;
     size_t mMultiThreadMinOps;
     bool mCubZeroCopy;
+    std::shared_ptr<P2pAgentCounters> mCounters;
 
     std::mutex mMutex;
     std::unordered_map<std::thread::id, std::unique_ptr<P2pTransferContext>> mContexts;
@@ -480,12 +511,19 @@ public:
         return mExporter.isSupported();
     }
 
+    /// @brief Test-only read of single/multi-thread memcpyBatch counters.
+    [[nodiscard]] P2pAgentCounters::Snapshot getCountersSnapshot() const noexcept
+    {
+        return mCounters ? mCounters->snapshot() : P2pAgentCounters::Snapshot{0, 0};
+    }
+
 private:
     CUdevice mLocalDevice{0};
     std::shared_ptr<CudaEventPool> mEventPool;
     int mBatchCopyThreads{1};
     size_t mMultiThreadMinOps{0};
     bool mCubZeroCopy{false};
+    std::shared_ptr<P2pAgentCounters> mCounters;
 
     P2pHandleExporter mExporter;
     P2pRemoteMappingRegistry mRegistry;

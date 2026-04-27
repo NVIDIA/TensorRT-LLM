@@ -72,6 +72,26 @@ private:
 // keeping it out of this NIXL-dependent header lets unit tests compose it without
 // pulling in nixl.h.
 
+/// @brief Test-only aggregate of every path-decision counter in NixlTransferAgent::submitTransferRequests.
+/// Used to assert that eligibility short-circuits, cub-vs-memcpyBatch thresholds, and single-vs-
+/// multi-thread batch-copy thresholds actually route through the intended branch instead of silently
+/// falling through. See NixlTransferAgent::getPathCounters().
+struct PathCounterSnapshot
+{
+    /// NixlTransferAgent-level terminal branches (sum equals total submit count).
+    uint64_t pureP2p;  ///< Case A — every segment mapped, no NIXL half.
+    uint64_t mixed;    ///< Case C — partial mapping; returns MixedTransferStatus.
+    uint64_t pureNixl; ///< P2P disabled / non-VRAM / sync-message / no remote mapping / full fallback.
+
+    /// P2P submit path selection (sum equals pureP2p + mixed).
+    uint64_t cubSubmit;         ///< avgSegmentSize < threshold, routes to cub::DeviceMemcpy::Batched.
+    uint64_t memcpyBatchSubmit; ///< avgSegmentSize >= threshold, routes to cudaMemcpyBatchAsync.
+
+    /// cudaMemcpyBatchAsync sub-path (sum equals memcpyBatchSubmit; forwarded from P2pAgentCounters).
+    uint64_t memcpyBatchSingleThread;
+    uint64_t memcpyBatchMultiThread;
+};
+
 class NixlTransferAgent final : public BaseTransferAgent
 {
 public:
@@ -110,6 +130,9 @@ public:
 
     bool checkRemoteDescs(std::string const& name, MemoryDescs const& memoryDescs) override;
 
+    /// @brief Test-only snapshot of path counters. Reads relaxed atomics; safe to call any time.
+    [[nodiscard]] PathCounterSnapshot getPathCounters() const noexcept;
+
 private:
     /// @brief Build and post a NIXL xfer request for the given descs + optional sync message.
     /// Extracted so both the full-NIXL path and the mixed path (which only sends unmapped
@@ -138,6 +161,17 @@ private:
     /// and shared batch-copy worker pool / event pool. When unset or when a remote agent's
     /// import failed, submitTransferRequests falls back to the NIXL path below.
     std::unique_ptr<P2pTransferAgent> mP2pAgent;
+
+    /// @brief Test-only atomic counters for submitTransferRequests path selection.
+    /// Five counters live here (three terminal branches + cub/memcpyBatch decision); the
+    /// two sub-counters inside P2pTransferContext::submitWithMemcpyBatch live on P2pAgentCounters
+    /// and are forwarded by getPathCounters(). One atomic fetch_add per submit is negligible
+    /// relative to the NIXL/CUDA work that follows.
+    mutable std::atomic<uint64_t> mPureP2pCount{0};
+    mutable std::atomic<uint64_t> mMixedCount{0};
+    mutable std::atomic<uint64_t> mPureNixlCount{0};
+    mutable std::atomic<uint64_t> mCubSubmitCount{0};
+    mutable std::atomic<uint64_t> mMemcpyBatchSubmitCount{0};
 };
 
 class NixlLoopbackAgent final : public BaseLoopbackAgent
