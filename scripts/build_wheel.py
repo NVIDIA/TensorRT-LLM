@@ -404,8 +404,11 @@ def generate_python_stubs_linux(venv_python: Path, deep_ep: bool,
     try:
         build_run(f"\"{venv_python}\" -m nanobind.stubgen -m bindings -r -O .",
                   env=env_stub_gen)
+        # Pre-import torch so deep_gemm_cpp_tllm's FP4 scalar-type registration
+        # succeeds; CLI args after `-c ...` land in sys.argv[1:] for argparse.
         build_run(
-            f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
+            f"\"{venv_python}\" -c 'import torch; from pybind11_stubgen import main; main()' "
+            "-o . deep_gemm_cpp_tllm --exit-code",
             env=env_stub_gen)
         if flash_mla:
             build_run(
