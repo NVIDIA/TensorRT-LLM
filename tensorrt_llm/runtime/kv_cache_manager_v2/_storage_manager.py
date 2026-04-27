@@ -27,6 +27,7 @@ from ._common import (
     Address,
     CacheLevel,
     CacheTier,
+    CudaStream,
     LayerId,
     MemAddress,
     PageStatus,
@@ -166,6 +167,7 @@ class StorageManager:
         "_slot_desc_list",
         "_levels",
         "_min_slots",
+        "_execution_stream",
         "__rawref__",
     )
     _life_cycles: LifeCycleRegistry
@@ -187,6 +189,7 @@ class StorageManager:
         constraints: list[BatchDesc] | None = None,
     ) -> None:
         self.__rawref__ = rawref.NULL
+        self._execution_stream: CudaStream | None = None
         assert config.cache_tiers[GPU_LEVEL].tier == CacheTier.GPU_MEM, (
             "The first cache tier must be GPU memory"
         )
@@ -487,6 +490,14 @@ class StorageManager:
         try:
             assert len(dst_slots) == num_slots
             prior_events: set[CachedCudaEvent] = set()
+            # Like V1's syncWithBufferManager(): record a fresh event on
+            # execution_stream so the copy stream waits for all prior
+            # forward-pass work, not just the (potentially stale) page
+            # ready_events.  This is the V2 equivalent of the explicit
+            # two-way sync that V1 performs between its BufferManager
+            # stream and offload/onboard streams.
+            if self._execution_stream is not None and not defrag:
+                prior_events.add(CachedCudaEvent(self._execution_stream))
             tasks_per_pool: TypedIndexList[PoolIndex, list[CopyTask]] = make_typed(
                 lambda _: list[CopyTask](), num_pools
             )
