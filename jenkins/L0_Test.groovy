@@ -4421,7 +4421,16 @@ def launchTestJobs(pipeline, testFilter)
     if (cbts?.scope == "waiveonly" && cbts.affected_stages) {
         def affectedSet = cbts.affected_stages as Set
         parallelJobsFiltered = parallelJobs.findAll { key, _ -> affectedSet.contains(key) }
-        echo "CBTS waiveonly: limiting to ${parallelJobsFiltered.size()} affected stages"
+        // Under `/bot run --post-merge`, keep only post-merge hits; if none,
+        // no-op (no fallback to full post-merge). IS_POST_MERGE is also true
+        // for the official PostMerge pipeline, but getCbtsResult() defers
+        // there, so reading it here is equivalent to "user passed --post-merge".
+        if (testFilter[(IS_POST_MERGE)]) {
+            parallelJobsFiltered = parallelJobsFiltered.findAll { it.key.contains("Post-Merge") }
+            echo "CBTS waiveonly (--post-merge): keeping ${parallelJobsFiltered.size()} affected post-merge stages"
+        } else {
+            echo "CBTS waiveonly: limiting to ${parallelJobsFiltered.size()} affected stages"
+        }
     }
 
     echo "Check the passed GitLab bot testFilter parameters."

@@ -59,6 +59,10 @@ selection exactly as before.
   auto-populates these on re-runs of the same PR. They compose fine with
   CBTS (CBTS picks stages, reuse further skips stages that already passed).
 - `--debug` / `--detailed-log` — logging verbosity; orthogonal.
+- `--post-merge` — scopes the run to post-merge stages. CBTS still
+  activates; Layer 2 then narrows the affected set to post-merge hits
+  only. If no post-merge stage is hit, the run is a no-op (no fallback
+  to the full post-merge baseline).
 
 This matches the convention already used by `enableUpdateGitlabStatus` in
 `L0_MergeRequest.groovy` for distinguishing "default run" from
