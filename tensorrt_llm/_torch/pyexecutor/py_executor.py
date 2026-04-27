@@ -2779,7 +2779,14 @@ class PyExecutor:
             f"vmm_pools={snapshot['vmm_pools']}")
         return snapshot
 
-    def _release_cuda_graphs_for_sleep(self) -> int:
+    def _release_cuda_graphs_for_sleep(
+        self, sleep_tags: Optional[List[str]] = None
+    ) -> int:
+        if sleep_tags is not None and "gms_weights" in sleep_tags:
+            # GMS failover sleep preserves VA ranges; dropping graphs here
+            # pushes graph recapture onto the promoted shadow's first request.
+            return 0
+
         release_graphs = os.environ.get(
             "TRTLLM_RELEASE_CUDA_GRAPHS_ON_SLEEP", "1").lower()
         if release_graphs in {"0", "false", "no", "off"}:
@@ -2929,7 +2936,7 @@ class PyExecutor:
                 args[0] if args else kwargs.get("sleep_tags", []))
             before_snapshot = self._log_gpu_memory_snapshot(
                 "sleep/before", sleep_tags)
-            released_graphs = self._release_cuda_graphs_for_sleep()
+            released_graphs = self._release_cuda_graphs_for_sleep(sleep_tags)
             released_moe = 0
             if "executor_extra" in sleep_tags or "moe_comm" in sleep_tags:
                 released_moe = self._release_moe_communication()
