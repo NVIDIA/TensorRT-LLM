@@ -121,12 +121,6 @@ public:
         NB_OVERRIDE_PURE(getTokenCount, requestId);
     }
 
-    void addSequence(tb::LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
-        tensorrt_llm::common::OptionalRef<tb::LlmRequest> llmRequest = std::nullopt) override
-    {
-        NB_OVERRIDE_PURE(addSequence, requestId, inputLength, beamWidth, llmRequest);
-    }
-
     void addSequenceBatch(
         std::vector<std::tuple<tb::LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
         std::vector<std::reference_wrapper<tb::LlmRequest>> const& llmRequests) override
@@ -434,7 +428,6 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("window_size"), nb::arg("cached_summary") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def("add_token", &BaseKVCacheManager::addToken, nb::call_guard<nb::gil_scoped_release>())
         .def("get_token_count", &BaseKVCacheManager::getTokenCount, nb::arg("request_id"))
-        .def("add_sequence", &BaseKVCacheManager::addSequence, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "add_sequence_batch",
             [](tbk::BaseKVCacheManager& self, nb::list requestInfosList, nb::list llmRequestsList)

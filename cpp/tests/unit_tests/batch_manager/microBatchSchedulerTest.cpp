@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -1301,8 +1301,8 @@ TEST_F(CombinedSchedulerTest, CapacitySchedulerSetsReusableTokensForMicroBatch)
     // Request 0 should be scheduled
     ASSERT_GE(scheduled0.size(), 1u);
 
-    // Process request 0: addSequence → complete context → store blocks
-    kvCacheManager->addSequence(req0->mRequestId, promptLen, /*beamWidth=*/1, req0);
+    // Process request 0: addSequenceBatch → complete context → store blocks
+    kvCacheManager->addSequenceBatch({{{req0->mRequestId, promptLen, /*beamWidth=*/1}}}, {std::ref(*req0)});
     req0->moveToNextContextChunk();
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req0);
     kvCacheManager->storeContextBlocks(*req0);
@@ -1403,7 +1403,7 @@ TEST_F(CombinedSchedulerTest, CapacitySchedulerReusableTokensWithChunkedMicroBat
     auto [scheduled0, disaggInit0, paused0]
         = capacityScheduler(activeList, *kvCacheManager, /*peftCacheManager=*/std::nullopt);
 
-    kvCacheManager->addSequence(req0->mRequestId, promptLen, /*beamWidth=*/1, req0);
+    kvCacheManager->addSequenceBatch({{{req0->mRequestId, promptLen, /*beamWidth=*/1}}}, {std::ref(*req0)});
     req0->moveToNextContextChunk();
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req0);
     kvCacheManager->storeContextBlocks(*req0);

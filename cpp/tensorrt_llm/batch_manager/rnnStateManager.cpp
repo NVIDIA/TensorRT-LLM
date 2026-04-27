@@ -20,8 +20,6 @@
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include "tensorrt_llm/runtime/utils/runtimeUtils.h"
 
-#include <unordered_set>
-
 using namespace tensorrt_llm::runtime;
 
 namespace tensorrt_llm::batch_manager::rnn_state_manager
@@ -258,40 +256,16 @@ std::vector<RnnStateManager::SizeType32> RnnStateManager::getStateIndices(
     std::vector<RequestIdType> const& requestIds, std::vector<bool> const& isPadding)
 {
     TLLM_CHECK_WITH_INFO(requestIds.size() == isPadding.size(), "requestIds and isPadding must have the same size");
-
-    std::unordered_set<SizeType32> availableSlots;
-    availableSlots.reserve(mMaxNumSequences);
-    for (SizeType32 i = 0; i < mMaxNumSequences; ++i)
-    {
-        availableSlots.insert(i);
-    }
-
-    for (size_t i = 0; i < requestIds.size(); ++i)
-    {
-        if (!isPadding[i])
-        {
-            availableSlots.erase(getCacheIndex(requestIds[i]));
-        }
-    }
-
+    // Every id (real or CUDA-graph padding sentinel) has a permanent slot
+    // allocated by allocateCacheBlocks; padding entries all share their
+    // sentinel's slot, so they never alias a live request and never
+    // consume free-pool slots.
     std::vector<SizeType32> result;
     result.reserve(requestIds.size());
-    auto availableIt = availableSlots.begin();
-
-    for (size_t i = 0; i < requestIds.size(); ++i)
+    for (auto const& rid : requestIds)
     {
-        if (isPadding[i])
-        {
-            TLLM_CHECK_WITH_INFO(availableIt != availableSlots.end(), "Run out of available slots for padding");
-            result.push_back(*availableIt);
-            ++availableIt;
-        }
-        else
-        {
-            result.push_back(getCacheIndex(requestIds[i]));
-        }
+        result.push_back(getCacheIndex(rid));
     }
-
     return result;
 }
 

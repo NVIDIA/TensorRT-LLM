@@ -191,6 +191,96 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         kv_cache_manager.shutdown()
 
+    def test_pad_batch_strips_cudagraph_dummies_on_clean_exit(self) -> None:
+        # Regression guard for the invariant that CUDAGraphRunner.pad_batch's
+        # `finally` strips every is_cuda_graph_dummy=True entry from
+        # scheduled_requests.generation_requests before the `with` block
+        # exits. Downstream consumers of scheduled_batch.generation_requests
+        # — including the per-iteration stats populate block in
+        # PyExecutor._update_iter_stats — rely on never observing
+        # cudagraph dummies.
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        # batch_size=5 rounds up to 8 (nearest captured graph size in the
+        # fixture config) -> padding_size=3, deterministically.
+        real_batch_size = 5
+        max_seq_len = 1
+        real_requests = [
+            _create_request(max_seq_len, i) for i in range(real_batch_size)
+        ]
+        real_ids = [id(r) for r in real_requests]
+
+        batch = ScheduledRequests()
+        batch.generation_requests = list(real_requests)
+
+        with model_engine.cuda_graph_runner.pad_batch(
+                batch, resource_manager) as padded_batch:
+            # Positive assertion that padding actually fired — guards
+            # against a vacuous pass where padding was a no-op.
+            self.assertGreater(
+                len(padded_batch.generation_requests), real_batch_size,
+                "padding did not fire; fixture config may have drifted "
+                "so that 5 no longer rounds up to 8")
+            # Every appended entry past the original count is a
+            # cudagraph-flagged dummy.
+            for req in padded_batch.generation_requests[real_batch_size:]:
+                self.assertTrue(
+                    getattr(req, "is_cuda_graph_dummy", False),
+                    "pad_batch appended a request without "
+                    "is_cuda_graph_dummy=True")
+            # Real requests' identities and order are untouched.
+            self.assertEqual([
+                id(r)
+                for r in padded_batch.generation_requests[:real_batch_size]
+            ], real_ids)
+
+        # After the with-block: finally must have sliced off the padding.
+        self.assertEqual(
+            len(batch.generation_requests), real_batch_size,
+            "pad_batch.finally did not strip cudagraph dummies — "
+            "downstream consumers of scheduled_batch.generation_requests "
+            "would observe the leaked dummies")
+        for req in batch.generation_requests:
+            self.assertFalse(
+                getattr(req, "is_cuda_graph_dummy", False),
+                "cudagraph dummy leaked out of pad_batch's finally")
+
+        kv_cache_manager.shutdown()
+
+    def test_pad_batch_strips_cudagraph_dummies_on_exception(self) -> None:
+        # The strip must fire even when the body raises. This is the
+        # critical property of `finally` vs. a plain trailing statement —
+        # it guards the invariant on the error path. A refactor that
+        # accidentally dropped the `finally` would be caught here but not
+        # by the clean-exit variant.
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        real_batch_size = 5
+        real_requests = [_create_request(1, i) for i in range(real_batch_size)]
+
+        batch = ScheduledRequests()
+        batch.generation_requests = list(real_requests)
+
+        class _ForwardBoom(Exception):
+            pass
+
+        with self.assertRaises(_ForwardBoom):
+            with model_engine.cuda_graph_runner.pad_batch(
+                    batch, resource_manager) as padded_batch:
+                self.assertGreater(len(padded_batch.generation_requests),
+                                   real_batch_size)
+                raise _ForwardBoom()
+
+        self.assertEqual(len(batch.generation_requests), real_batch_size)
+        for req in batch.generation_requests:
+            self.assertFalse(getattr(req, "is_cuda_graph_dummy", False))
+
+        kv_cache_manager.shutdown()
+
     def test_position_id_preparation(self):
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()
         resource_manager = ResourceManager(

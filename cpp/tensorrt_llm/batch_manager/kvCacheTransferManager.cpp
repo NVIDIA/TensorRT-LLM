@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -265,7 +265,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
 // to a block. When a new block copy is scheduled, we wait for all writes to the source
 // block and all reads and writes to a destination block.
 //
-// As before, syncTransfers() must be called after last call to KVCacheManager::addSequence.
+// As before, syncTransfers() must be called after the last call to KVCacheManager::addSequenceBatch.
 // Failing to do so will lead to corrupted blocks eventually.
 //
 
