@@ -291,6 +291,39 @@ TEST_F(P2pTransferAgentTest, StatusMultiEventTimedWait)
     EXPECT_EQ(result, TransferState::kSUCCESS);
 }
 
+// Regression: wait(timeout_ms > 0) must NOT block indefinitely when batchPending has
+// not yet dropped to 0. Previously the batchPending spin loop had no timeout check, so
+// a caller that polled with a short timeout would hang here forever whenever the worker
+// pool was still draining. Also asserts that startTime is sampled from function entry,
+// so the wait does not silently overshoot the caller's deadline.
+TEST_F(P2pTransferAgentTest, StatusMultiEventTimeoutRespectsBatchPending)
+{
+    // Leave batchPending at its initial value (1) and never decrement — simulates a worker
+    // that has been queued but hasn't yet recorded its event.
+    auto batchPending = std::make_shared<std::atomic<int>>(1);
+    auto event = std::make_shared<runtime::CudaEvent>();
+    P2pTransferStatus status(batchPending, {event});
+
+    constexpr int64_t kTimeoutMs = 50;
+    auto start = std::chrono::steady_clock::now();
+    auto result = status.wait(kTimeoutMs);
+    auto elapsedMs
+        = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+
+    EXPECT_EQ(result, TransferState::kIN_PROGRESS);
+    // Must return near the deadline, not block forever. Upper bound is generous to tolerate
+    // yield()-based spin jitter on loaded CI machines.
+    EXPECT_GE(elapsedMs, kTimeoutMs);
+    EXPECT_LT(elapsedMs, kTimeoutMs + 500) << "wait() did not honor timeout_ms (batchPending spin blocked)";
+
+    // Sanity: once batchPending hits 0 and the event is recorded, the same status transitions
+    // to SUCCESS under a long-enough wait. Use a fresh stream+event so the record is valid.
+    auto stream = std::make_shared<runtime::CudaStream>();
+    stream->record(*event);
+    batchPending->store(0, std::memory_order_release);
+    EXPECT_EQ(status.wait(-1), TransferState::kSUCCESS);
+}
+
 // ============================================================================
 // P2pTransferContext::submitWithMemcpyBatch
 // ============================================================================
