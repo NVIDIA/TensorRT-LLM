@@ -967,7 +967,14 @@ class FineGrainedFP8LinearQuantization(Quantization):
         if scale_n == 0 or scale_k == 0:
             return
 
-        if K % 128 != 0 or N < 128:
+        # Skip DeepGEMM for TP-misaligned projections (N not a multiple of 128).
+        # Misalignment requires re-quantization to 128x128 UE8M0 blocks
+        # (_requantize_to_128x128_ue8m0), which introduces precision loss from
+        # power-of-2 scale rounding.  Empirically observed on DeepSeek-R1
+        # (q_a N=192, kv_a N=72 at TP=8): MMLU 82.31 → 84.16 when these fall
+        # back to cuBLAS with float32 scales.  Aligned projections (q_b N=3072,
+        # kv_b N=1024, MoE etc.) keep DeepGEMM — no re-quant, no precision loss.
+        if K % 128 != 0 or N % 128 != 0:
             return
 
         if resmooth_to_fp8_e8m0 is None or transform_sf_into_required_layout is None:
