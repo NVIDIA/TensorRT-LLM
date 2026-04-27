@@ -705,6 +705,21 @@ class OpenAIServer:
         if self._check_health():
             return Response(status_code=200)
         else:
+            # If the engine has a fatal error, trigger server shutdown so the
+            # pod doesn't linger as a zombie that accepts connections but never
+            # produces tokens.  Uses SIGINT (not SIGTERM) to match the
+            # existing CppExecutorError handlers and let uvicorn perform
+            # its graceful shutdown sequence.  The doing_shutdown guard
+            # ensures we only send SIGINT once — repeated health probes
+            # won't stack signals during an in-progress teardown.
+            executor = getattr(self.generator, '_executor', None)
+            if executor is not None and getattr(executor, '_fatal_error',
+                                                None) is not None:
+                if not getattr(executor, 'doing_shutdown', True):
+                    logger.error(
+                        "Health check detected fatal engine error, initiating "
+                        f"server shutdown: {executor._fatal_error}")
+                    signal.raise_signal(signal.SIGINT)
             return Response(
                 status_code=503,
                 content=
