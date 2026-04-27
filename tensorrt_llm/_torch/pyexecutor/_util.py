@@ -886,6 +886,21 @@ class KvCacheCreator:
         self._kv_cache_config.pool_ratio = self._pool_ratio_in
         self._kv_cache_config.avg_seq_len = self._avg_seq_len_in
 
+        # Reserve headroom for dynamic activation memory (e.g., MoE permute
+        # buffers, MLA KV projections, attention workspace).  Profiling
+        # measures activations with a small dummy request, but runtime
+        # activations at full batch size can be significantly larger —
+        # causing OOM under sustained load.  We reserve 2x the profiled
+        # activations to cover peak concurrent allocations.
+        if activation_bytes > 0:
+            reservation = 2 * activation_bytes
+            kv_cache_max_memory = max(0, kv_cache_max_memory - reservation)
+            logger.info(
+                f"Reserved {reservation / (GB):.2f} GiB for activation memory "
+                f"(2x profiled {activation_bytes / (GB):.2f} GiB). "
+                f"Adjusted KV cache max memory: {kv_cache_max_memory / (GB):.2f} GiB"
+            )
+
         # NOTE:
         # For KVCacheManager, KvCacheCreator currently controls capacity using two parameters in KVCacheConfig:
         #   • max_tokens
