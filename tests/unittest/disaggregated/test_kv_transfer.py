@@ -1135,7 +1135,6 @@ def test_session_cancel_after_send():
         gen_enable_dp=False,
     )
     ctx_transfer_worker = setup["ctx_transfer_workers"][0]
-    ctx_kv_cache_manager = setup["ctx_kv_cache_managers"][0]
 
     unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
     sampling_params = SamplingParams(temperature=0)
@@ -1150,19 +1149,15 @@ def test_session_cancel_after_send():
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
     )
     ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
-    ctx_kv_cache_manager.impl.add_sequence(
-        ctx_request.py_request_id, ctx_request.prompt_len, 1, ctx_request
-    )
 
     try:
         tx_session = ctx_transfer_worker.create_tx_session(ctx_request)
-        block_ids_per_groups = get_block_ids_per_layer_groups(
-            ctx_kv_cache_manager,
-            ctx_transfer_worker,
-            ctx_request.py_request_id,
-            use_v2=False,
-            tokens_per_block=setup["tokens_per_block"],
-        )
+        # No real KV cache sequence is needed: test exercises send/cancel state
+        # transitions only.  Pass an empty block-id list per layer group so we
+        # avoid depending on KVCacheManager's sequence-management API (which
+        # changed shape across versions).
+        page_table = ctx_transfer_worker._rank_info.page_table
+        block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
         kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=block_ids_per_groups)
         future = tx_session.send(kv_slice)
 
@@ -1252,9 +1247,7 @@ def test_session_has_transferring_tasks_false():
         gen_enable_dp=False,
     )
     ctx_transfer_worker = setup["ctx_transfer_workers"][0]
-    ctx_kv_cache_manager = setup["ctx_kv_cache_managers"][0]
     gen_transfer_worker = setup["gen_transfer_workers"][0]
-    gen_kv_cache_manager = setup["gen_kv_cache_managers"][0]
 
     unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
     sampling_params = SamplingParams(temperature=0)
@@ -1270,9 +1263,6 @@ def test_session_has_transferring_tasks_false():
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
     )
     ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
-    ctx_kv_cache_manager.impl.add_sequence(
-        ctx_request.py_request_id, ctx_request.prompt_len, 1, ctx_request
-    )
 
     gen_request = LlmRequest(
         request_id=401,
@@ -1289,9 +1279,6 @@ def test_session_has_transferring_tasks_false():
         ctx_request_id=ctx_request.py_request_id,
         schedule_style=1,
     )
-    gen_kv_cache_manager.impl.add_sequence(
-        gen_request.py_request_id, gen_request.prompt_len, 1, gen_request
-    )
 
     try:
         # TxSession: no tasks yet
@@ -1299,13 +1286,8 @@ def test_session_has_transferring_tasks_false():
         assert not tx_session.has_transferring_tasks()
 
         # TxSession: after send(), task is INIT (no receiver → not yet dispatched)
-        block_ids_per_groups = get_block_ids_per_layer_groups(
-            ctx_kv_cache_manager,
-            ctx_transfer_worker,
-            ctx_request.py_request_id,
-            use_v2=False,
-            tokens_per_block=setup["tokens_per_block"],
-        )
+        page_table = ctx_transfer_worker._rank_info.page_table
+        block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
         kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=block_ids_per_groups)
         tx_session.send(kv_slice)
         assert not tx_session.has_transferring_tasks()

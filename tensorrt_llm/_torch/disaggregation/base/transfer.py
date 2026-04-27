@@ -96,11 +96,11 @@ class SessionArgsBase:
 
 
 def get_unique_rid(request: LlmRequest) -> Optional[int]:
-    return (
-        request.py_disaggregated_params.disagg_request_id
-        if request.py_disaggregated_params
-        else request.request_id
-    )
+    if request.py_disaggregated_params:
+        rid = request.py_disaggregated_params.disagg_request_id
+        if rid is not None:
+            return rid
+    return request.request_id
 
 
 class SenderBase(ABC):

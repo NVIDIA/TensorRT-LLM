@@ -10,6 +10,7 @@ from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     KVSlice,
     RxSessionBase,
+    SessionStatus,
     TokenRange,
     TxSessionBase,
     WaitResult,
@@ -250,6 +251,71 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         all_ranks = self._gen_allgather(local_ids) if self._gen_need_sync else [local_ids]
         return _find_consensus_request_ids(all_ranks, sync_size)
 
+    @staticmethod
+    def _allgather_or_passthrough(
+        local_ids, allgather: Callable, need_sync: bool
+    ) -> List[List[int]]:
+        if not need_sync:
+            return [list(local_ids)]
+        return list(allgather(list(local_ids)))
+
+    @staticmethod
+    def _union(all_lists: List[List[int]]) -> set:
+        merged: set = set()
+        for ids in all_lists:
+            merged.update(ids)
+        return merged
+
+    @staticmethod
+    def _intersection(all_lists: List[List[int]], n_ranks: int) -> set:
+        if n_ranks == 0:
+            return set()
+        cnt: Dict[int, int] = defaultdict(int)
+        for ids in all_lists:
+            for rid in set(ids):
+                cnt[rid] += 1
+        return {rid for rid, c in cnt.items() if c == n_ranks}
+
+    def _consensus_outcome(
+        self, to_process, cancelled, failed, completed, allgather: Callable, need_sync: bool
+    ):
+        # CANCELLED/FAILED on any rank → global; COMPLETED only when ALL ranks agree.
+        all_c = self._allgather_or_passthrough(cancelled, allgather, need_sync)
+        all_f = self._allgather_or_passthrough(failed, allgather, need_sync)
+        all_done = self._allgather_or_passthrough(completed, allgather, need_sync)
+        n = len(all_c)
+        global_cancelled = self._union(all_c)
+        global_failed = self._union(all_f)
+        global_completed = self._intersection(all_done, n)
+        new_cancelled = [rid for rid in to_process if rid in global_cancelled]
+        cancel_set = set(new_cancelled)
+        new_failed = [rid for rid in to_process if rid in global_failed and rid not in cancel_set]
+        terminal = cancel_set | set(new_failed)
+        new_completed = [
+            rid for rid in to_process if rid in global_completed and rid not in terminal
+        ]
+        return new_cancelled, new_failed, new_completed
+
+    def _gen_consensus_outcome(self, to_process, cancelled, failed, completed):
+        return self._consensus_outcome(
+            to_process, cancelled, failed, completed, self._gen_allgather, self._gen_need_sync
+        )
+
+    def _ctx_consensus_outcome(self, to_process, cancelled, failed, completed, timed_out):
+        # TP first, then PP.  timed_out is local-only (back-off signal).
+        c, f, d = self._consensus_outcome(
+            to_process,
+            cancelled,
+            failed,
+            completed,
+            self._dist.tp_allgather,
+            self._ctx_need_tp_sync,
+        )
+        if self._ctx_need_pp_sync:
+            pp_allgather: Callable = getattr(self._dist, "pp_allgather")
+            c, f, d = self._consensus_outcome(to_process, c, f, d, pp_allgather, True)
+        return c, f, d, timed_out
+
     def _collect_done(self, sessions: dict, reqs: dict):
         """Scan sessions and return (completed_rids, failed_rids)."""
         completed, failed = [], []
@@ -390,11 +456,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             block_all,
         )
 
-        completed, timed_out, failed = [], [], []
+        completed, timed_out, failed, cancelled = [], [], [], []
         for rid in to_process:
             session = self._send_sessions[rid]
             result = session.wait_complete()
-            if result == WaitResult.COMPLETED:
+            if session.status == SessionStatus.CANCELLED:
+                cancelled.append(rid)
+            elif result == WaitResult.COMPLETED:
                 completed.append(rid)
             elif result == WaitResult.TIMEOUT:
                 logger.warning(
@@ -404,6 +472,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else:
                 logger.warning(f"TxSession rid={session.disagg_request_id} failed")
                 failed.append(rid)
+
+        # All ranks must agree on per-rid outcome to avoid req.state divergence.
+        cancelled, failed, completed, timed_out = self._ctx_consensus_outcome(
+            to_process, cancelled, failed, completed, timed_out
+        )
+
+        for rid in cancelled:
+            self._send_sessions[rid].close()
+            del self._send_reqs[rid]
+            del self._send_sessions[rid]
 
         for rid in completed:
             if mark_complete:
@@ -427,14 +505,33 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             block_all,
         )
 
-        completed, failed = [], []
+        completed, failed, cancelled = [], [], []
         for rid in to_process:
-            result = self._recv_sessions[rid].wait_complete(blocking=block_all)
-            if result == WaitResult.COMPLETED:
+            session = self._recv_sessions[rid]
+            result = session.wait_complete(blocking=block_all)
+            if session.status == SessionStatus.CANCELLED:
+                # Session cancelled — either by local cancel_request() (user
+                # cancel) or by a remote CANCEL_SESSION message (e.g. CTX
+                # server timeout).  Return the req objects so the caller can
+                # distinguish the two cases and set the appropriate state.
+                cancelled.append(rid)
+            elif result == WaitResult.COMPLETED:
                 completed.append(rid)
             elif result == WaitResult.FAILED:
                 failed.append(rid)
             # else: None — KV done but aux still in flight; re-poll next cycle
+
+        # All ranks must agree on per-rid outcome to avoid req.state divergence.
+        cancelled, failed, completed = self._gen_consensus_outcome(
+            to_process, cancelled, failed, completed
+        )
+
+        cancelled_reqs = []
+        for rid in cancelled:
+            cancelled_reqs.append(self._recv_reqs[rid])
+            self._recv_sessions[rid].close()
+            del self._recv_reqs[rid]
+            del self._recv_sessions[rid]
 
         for rid in completed:
             session = self._recv_sessions[rid]
@@ -447,7 +544,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             del self._recv_sessions[rid]
         self._close_failed_sessions(self._recv_sessions, self._recv_reqs, failed)
 
-        return completed, failed
+        return completed, failed, cancelled_reqs
 
     def check_gen_transfer_complete(self):
         return len(self._recv_sessions) == 0
@@ -470,14 +567,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if self._send_sessions[rid].has_transferring_tasks():
                 has_transferring = True
             else:
-                self._close_failed_sessions(self._send_sessions, self._send_reqs, [rid])
+                self._send_sessions[rid].close()
+                del self._send_reqs[rid]
+                del self._send_sessions[rid]
 
         if rid in self._recv_sessions:
             self._recv_sessions[rid].cancel()
             if self._recv_sessions[rid].has_transferring_tasks():
                 has_transferring = True
             else:
-                self._close_failed_sessions(self._recv_sessions, self._recv_reqs, [rid])
+                self._recv_sessions[rid].close()
+                del self._recv_reqs[rid]
+                del self._recv_sessions[rid]
 
         if has_transferring:
             return False  # mid-write; caller must retry

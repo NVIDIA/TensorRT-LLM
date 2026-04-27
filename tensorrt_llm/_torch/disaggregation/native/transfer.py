@@ -158,8 +158,7 @@ class SendTaskBase:
         self._event = threading.Event()
         self._exception: Optional[Exception] = None
         self._params = params
-        assert params.disagg_request_id is not None
-        self._unique_rid: int = params.disagg_request_id
+        self._unique_rid: Optional[int] = params.disagg_request_id
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
 
     def fail(self, exc: Exception) -> None:
@@ -974,6 +973,18 @@ class TxSession(TxSessionBase):
         self._sender.setup_session(self)
 
     @property
+    def disagg_request_id(self) -> int:
+        params = self._base_args.params
+        if params.disagg_request_id is not None:
+            return params.disagg_request_id
+        # ctx_request_id is set on gen-side requests to the ctx server's request ID,
+        # which matches the key the ctx TxSession registered under.  Fall back to
+        # the local request_id only when neither field is available.
+        if params.ctx_request_id is not None:
+            return params.ctx_request_id
+        return self.request_id
+
+    @property
     def status(self) -> SessionStatus:
         if self._terminal_status is not None:
             return self._terminal_status
@@ -993,6 +1004,7 @@ class TxSession(TxSessionBase):
             params = self._base_args.params
             slice_id = len(self.kv_tasks)
             task = KVSendTask(slice, params, slice_id)
+            task._unique_rid = self.disagg_request_id
             self.kv_tasks.append(task)
             req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
         self._sender.dispatch_task(task, req_info_snapshot)
@@ -1001,6 +1013,7 @@ class TxSession(TxSessionBase):
         with self.lock:
             params = self._base_args.params
             task = AuxSendTask(params, self.aux_slot)
+            task._unique_rid = self.disagg_request_id
             self.aux_task = task
             req_info_snapshot = dict(self._sender._get_req_info(task._unique_rid) or {})
         self._sender.dispatch_task(task, req_info_snapshot)
@@ -1451,6 +1464,18 @@ class RxSession(RxSessionBase):
         self._receiver.setup_session(self)
 
     @property
+    def disagg_request_id(self) -> int:
+        params = self._base_args.params
+        if params.disagg_request_id is not None:
+            return params.disagg_request_id
+        # ctx_request_id is set on gen-side requests to the ctx server's request ID,
+        # which matches the key the ctx TxSession registered under.  Fall back to
+        # the local request_id only when neither field is available.
+        if params.ctx_request_id is not None:
+            return params.ctx_request_id
+        return self.request_id
+
+    @property
     def status(self) -> SessionStatus:
         if self._terminal_status is not None:
             return self._terminal_status
@@ -1472,7 +1497,7 @@ class RxSession(RxSessionBase):
         params = self._base_args.params
         slice_id = len(self._kv_tasks)
         task = KVRecvTask(
-            params.disagg_request_id,
+            self.disagg_request_id,
             slice,
             slice_id,
             params,
@@ -1602,16 +1627,29 @@ class RxSession(RxSessionBase):
     def wait_complete(self, blocking: bool = False) -> Optional[WaitResult]:
         """Poll or block until transfer completes.
 
-        With blocking=False (default): returns None if KV is done but transfer
-        not fully complete — caller should re-poll next cycle.
-        With blocking=True: waits until fully complete.
-        Returns WaitResult.COMPLETED on full success, WaitResult.FAILED on error.
+        With blocking=False (default): polls non-blockingly; returns None if
+        any KV task or aux is not yet done — caller should re-poll next cycle.
+        With blocking=True: waits up to _timeout_s for each task.
+        Returns WaitResult.COMPLETED on full success, WaitResult.FAILED on error/timeout.
         """
-        for task in self._kv_tasks:
-            if not task.wait(timeout=self._timeout_s):
-                return WaitResult.FAILED  # timeout
-            if task.status == TaskStatus.ERROR:
-                return WaitResult.FAILED
+        if not blocking:
+            # Use task.status instead of task.wait(timeout=0): task.complete()
+            # sets status before event, so a GIL switch between the two steps
+            # can cause asymmetric TP-rank completion and an allgather deadlock.
+            for task in self._kv_tasks:
+                if task.status == TaskStatus.TRANSFERRED:
+                    continue
+                if task.status == TaskStatus.ERROR:
+                    return WaitResult.FAILED
+                return None  # task not yet done; re-poll next cycle
+        else:
+            timeout = self._timeout_s
+            for task in self._kv_tasks:
+                done = task.wait(timeout=timeout)
+                if not done:
+                    return WaitResult.FAILED  # timeout
+                if task.status == TaskStatus.ERROR:
+                    return WaitResult.FAILED
         if self._need_aux:
             while True:
                 status = self.status

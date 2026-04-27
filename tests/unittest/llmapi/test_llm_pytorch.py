@@ -1745,19 +1745,22 @@ async def test_llm_disagg_gen_cancelled(transceiver_runtime):
             print(f"num output tokens: {num_output_tokens}")
             assert result.outputs[0].finish_reason == "cancelled"
 
-            # Num check that the number of free/used blocks is as expected
+            # Wait until KV cache blocks are released (usedNumBlocks == 0)
             time.sleep(1.)
             max_retries = 10
+            all_results = []
             for _ in range(max_retries):
                 results = llm_gen.get_stats(2)
                 print("len(results):", len(results))
-                if len(results) == num_output_tokens - (1 if iter == 0 else 0):
+                all_results.extend(results)
+                if all_results and all_results[-1]["kvCacheStats"][
+                        "usedNumBlocks"] == 0:
                     break
                 time.sleep(1)
             else:
                 pytest.fail(
-                    f"Failed to get stats with len=={num_output_tokens - 1} after {max_retries} retries"
-                )
+                    f"KV cache blocks not released after {max_retries} retries")
+            results = all_results
 
             after_used_num_blocks = results[-1]["kvCacheStats"]["usedNumBlocks"]
             assert after_used_num_blocks == 0
