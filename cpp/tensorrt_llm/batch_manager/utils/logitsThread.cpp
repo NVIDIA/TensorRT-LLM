@@ -36,7 +36,7 @@ enum class FastLogitsMpiId : uint64_t
 
 void draftModelSendLogitsThread(int device, std::atomic<bool>* draftModelThreadShouldExit,
     RequestVector* draftRequestsWaitingToSendLogits, RequestVector* draftRequestsDoneSendingLogits,
-    std::mutex* draftRequestsDoneMtx)
+    std::mutex* draftRequestsMtx)
 {
 #if ENABLE_MULTI_DEVICE
     TLLM_CUDA_CHECK(cudaSetDevice(device));
@@ -95,7 +95,11 @@ void draftModelSendLogitsThread(int device, std::atomic<bool>* draftModelThreadS
             return nullptr;
         };
 
-        std::shared_ptr<LlmRequest> draftRequest = findDraftRequest();
+        std::shared_ptr<LlmRequest> draftRequest;
+        {
+            std::lock_guard<std::mutex> lk(*draftRequestsMtx);
+            draftRequest = findDraftRequest();
+        }
         TLLM_CHECK(draftRequest != nullptr);
 
         auto draftLogits = runtime::ITensor::slice(draftRequest->getGenerationLogitsHost(), {0, 0});
@@ -112,7 +116,7 @@ void draftModelSendLogitsThread(int device, std::atomic<bool>* draftModelThreadS
 
         // Defer termination to the main thread to avoid racing on mSequences.
         {
-            std::lock_guard<std::mutex> lk(*draftRequestsDoneMtx);
+            std::lock_guard<std::mutex> lk(*draftRequestsMtx);
             draftRequestsDoneSendingLogits->push_back(draftRequest);
         }
     }

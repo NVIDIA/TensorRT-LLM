@@ -487,7 +487,7 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     {
         mDraftModelSendLogitsThread
             = std::make_unique<std::thread>(&utils::draftModelSendLogitsThread, mDevice, &mDraftModelThreadShouldExit,
-                &mDraftRequestsWaitingToSendLogits, &mDraftRequestsDoneSendingLogits, &mDraftRequestsDoneMtx);
+                &mDraftRequestsWaitingToSendLogits, &mDraftRequestsDoneSendingLogits, &mDraftRequestsMtx);
     }
 
     mCreateNewDecoderRequests = std::make_unique<CreateNewDecoderRequests>(
@@ -908,7 +908,7 @@ void TrtGptModelInflightBatching::forwardSync()
         {
             RequestVector doneSending;
             {
-                std::lock_guard<std::mutex> lk(mDraftRequestsDoneMtx);
+                std::lock_guard<std::mutex> lk(mDraftRequestsMtx);
                 doneSending.swap(mDraftRequestsDoneSendingLogits);
             }
             for (auto const& llmReq : doneSending)
@@ -2537,6 +2537,7 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
             {
                 if (llmReq->getReturnGenerationLogits() && mSpeculativeDecodingFastLogits && mIsLeaderInOrchMode)
                 {
+                    std::lock_guard<std::mutex> lk(mDraftRequestsMtx);
                     mDraftRequestsWaitingToSendLogits.push_back(llmReq);
                 }
                 else

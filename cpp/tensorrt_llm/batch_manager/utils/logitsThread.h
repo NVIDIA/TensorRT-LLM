@@ -39,11 +39,11 @@ namespace tensorrt_llm::batch_manager::utils
 {
 
 /// Background thread that sends draft model logits to the target model via MPI.
-/// After sending, completed requests are pushed to \p draftRequestsDoneSendingLogits
-/// (guarded by \p draftRequestsDoneMtx) so the main thread can terminate them.
+/// Both \p draftRequestsWaitingToSendLogits (consumed here) and \p draftRequestsDoneSendingLogits
+/// (produced here for the main thread to drain) are guarded by \p draftRequestsMtx.
 void draftModelSendLogitsThread(int device, std::atomic<bool>* draftModelThreadShouldExit,
     RequestVector* draftRequestsWaitingToSendLogits, RequestVector* draftRequestsDoneSendingLogits,
-    std::mutex* draftRequestsDoneMtx);
+    std::mutex* draftRequestsMtx);
 
 void targetModelReceiveLogits(runtime::ITensor::SharedPtr& draftLogitsHost,
     executor::SpeculativeDecodingFastLogitsInfo const& fastLogitsInfo, nvinfer1::DataType logitsDtype);
