@@ -458,6 +458,12 @@ class PythonMambaCacheManager(BaseResourceManager):
         # mamba cache index, maps request_id -> state indices
         self.mamba_cache_index: Dict[int, int] = {}
 
+        # Permanent slot shared by every CUDA-graph padding sentinel id
+        # (CUDA_GRAPH_DUMMY_REQUEST_ID - runtime_draft_len, one per
+        # draft length). Pool sizing must include +1 headroom for this;
+        # see MixedMambaHybridCacheManager.
+        self._padding_slot: int = self.mamba_cache_free_blocks.pop()
+
         # save intermediate state indices for requests
         self.intermediate_state_indices = torch.arange(max_batch_size,
                                                        dtype=torch.int32,
@@ -513,36 +519,44 @@ class PythonMambaCacheManager(BaseResourceManager):
         request_ids = context_ids + generation_ids
         self._prepare_mamba_cache_blocks(request_ids)
 
+    def _is_padding_sentinel(self, request_id: int) -> bool:
+        # cuda_graph_runner caches one dummy per runtime_draft_len value
+        # (see _get_padded_batch), so any id in the range of dummy request IDs
+        # may be live concurrently.
+        from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
+            CUDA_GRAPH_DUMMY_REQUEST_ID
+        max_dl = self.speculative_num_draft_tokens or 0
+        return (CUDA_GRAPH_DUMMY_REQUEST_ID - max_dl <= request_id <=
+                CUDA_GRAPH_DUMMY_REQUEST_ID)
+
     def add_dummy_requests(self, request_ids: List[int], **kwargs):
-        # Allocate a permanent slot for every dummy request ID, including
-        # the CUDA-graph padding sentinel. Padding entries in a batch all
-        # reference the same dummy request ID, so they share one slot via
-        # mamba_cache_index lookup in get_state_indices. This mirrors how
-        # MTP's per-draft-len padding dummies already behave (they use
-        # CUDA_GRAPH_DUMMY_REQUEST_ID - draft_len, which was never
-        # filtered here) and keeps padding writes off every live
-        # request's slot, even under the overlap scheduler where a prior
-        # batch's completed requests linger in mamba_cache_index until
-        # _process_previous_batch runs.
-        if request_ids:
-            for r in request_ids:
-                if r not in self.mamba_cache_index:
-                    if len(self.mamba_cache_free_blocks) == 0:
-                        raise RuntimeError("run out of mamba cache blocks")
-                    block = self.mamba_cache_free_blocks.pop()
-                    self.mamba_cache_index[r] = block
+        # Sentinels alias to the shared _padding_slot; non-sentinel
+        # dummies (warmup, attention-DP idle padding) get their own
+        # slot and are freed individually.
+        if not request_ids:
+            return
+        for r in request_ids:
+            if r in self.mamba_cache_index:
+                continue
+            if self._is_padding_sentinel(r):
+                self.mamba_cache_index[r] = self._padding_slot
+            else:
+                if len(self.mamba_cache_free_blocks) == 0:
+                    raise RuntimeError("run out of mamba cache blocks")
+                block = self.mamba_cache_free_blocks.pop()
+                self.mamba_cache_index[r] = block
 
     def free_resources(self, request: LlmRequest):
         request_id = request.py_request_id
-        if request_id in self.mamba_cache_index:
-            block = self.mamba_cache_index.pop(request_id)
+        if request_id not in self.mamba_cache_index:
+            return
+        block = self.mamba_cache_index.pop(request_id)
+        # _padding_slot stays reserved; only non-sentinel blocks return.
+        if not self._is_padding_sentinel(request_id):
             self.mamba_cache_free_blocks.append(block)
 
     def get_state_indices(self, request_ids: List[int],
                           is_padding: List[bool]) -> List[int]:
-        # Padding entries reuse the slot pre-allocated by their dummy
-        # request in add_dummy_requests; see that method for the
-        # overlap-scheduler rationale.
         return [self.mamba_cache_index[rid] for rid in request_ids]
 
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
@@ -857,12 +871,10 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
         assert not kv_cache_config.enable_block_reuse, "mamba hybrid cache requires block reuse to be disabled in KV cache config"
 
-        # Reserve one Mamba slot per possible CUDA-graph padding dummy
-        # (one per runtime_draft_len in 0..max_draft_len) so a full
-        # max_batch_size of real requests still leaves room for padding.
-        max_draft_len = (spec_config.max_draft_len
-                         if spec_config is not None else 0)
-        pool_size = max_batch_size + max_draft_len + 1
+        # +1 headroom for PythonMambaCacheManager._padding_slot, which
+        # is shared by every CUDA-graph padding sentinel regardless of
+        # max_draft_len.
+        pool_size = max_batch_size + 1
 
         MambaCacheManager.__init__(
             self,
