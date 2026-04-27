@@ -283,6 +283,36 @@ class NVLinkOneSided(Communication):
         """
         return MnnvlMemory.supports_mnnvl()
 
+    @classmethod
+    def release_workspace(cls) -> int:
+        workspace = cls._WORKSPACE
+        if workspace is None:
+            return 0
+
+        workspace_size = int(workspace.get("workspace_size_per_rank", 0))
+        mnnvl_mem = workspace.get("mnnvl_mem")
+        cls._WORKSPACE = None
+
+        torch.cuda.synchronize()
+        if mnnvl_mem is not None and hasattr(mnnvl_mem, "ptr"):
+            type(mnnvl_mem).close_mnnvl_memory(mnnvl_mem.ptr)
+            delattr(mnnvl_mem, "ptr")
+        workspace.clear()
+
+        if workspace_size:
+            tllm_logger.info(
+                "NVLinkOneSided: Released workspace with size %d bytes.",
+                workspace_size,
+            )
+        return workspace_size
+
+    def destroy(self):
+        self.release_workspace()
+        self.mnnvl_mem = None
+        self.workspace = None
+        self.moe_a2a_metainfo = None
+        self._dispatch_state = {"phase": "destroyed"}
+
     def supports_post_quant_dispatch(self) -> bool:
         """
         NVLINK one-sided comm supports post-quant dispatch.

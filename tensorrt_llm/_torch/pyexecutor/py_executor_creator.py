@@ -32,7 +32,8 @@ from ..attention_backend.trtllm import TrtllmAttention
 from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
-from ..virtual_memory import scope as virtual_memory_scope
+from ..virtual_memory import (run_with_oom_retry,
+                              scope as virtual_memory_scope)
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
@@ -43,6 +44,31 @@ from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
+
+
+def _flush_cuda_allocator_after_kv_estimation() -> None:
+    if not torch.cuda.is_available():
+        return
+
+    gc.collect()
+    try:
+        free_before, total = torch.cuda.mem_get_info()
+    except Exception:
+        free_before, total = None, None
+
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
+    if free_before is None or total is None:
+        return
+
+    free_after, _ = torch.cuda.mem_get_info()
+    reclaimed = max(free_after - free_before, 0)
+    if reclaimed:
+        logger.info(
+            "Released %.2f GiB from the CUDA caching allocator after KV cache estimation teardown",
+            reclaimed / (1024**3),
+        )
 
 
 class _ExecutorMemoryMonitor:
@@ -204,6 +230,22 @@ def update_sampler_max_seq_len(max_seq_len, sampler):
     if isinstance(sampler, TRTLLMSampler):
         assert hasattr(sampler, "max_seq_len")
         sampler.max_seq_len = max_seq_len
+
+
+def _build_kv_cache_managers(
+    kv_cache_creator: KvCacheCreator,
+    resources,
+    *,
+    estimating_kv_cache: bool,
+    enable_sleep: bool,
+) -> None:
+    if enable_sleep and not estimating_kv_cache:
+        run_with_oom_retry(
+            lambda: kv_cache_creator.build_managers(resources, False),
+            description="Building KV cache managers")
+        return
+
+    kv_cache_creator.build_managers(resources, estimating_kv_cache)
 
 
 def get_guided_decoding_config(guided_decoding_backend: str,
@@ -830,7 +872,12 @@ def create_py_executor(
         with allocation_scope(
                 ExecutorMemoryType.INIT_KV_CACHE
                 if estimating_kv_cache else ExecutorMemoryType.KV_CACHE):
-            kv_cache_creator.build_managers(resources, estimating_kv_cache)
+            _build_kv_cache_managers(
+                kv_cache_creator,
+                resources,
+                estimating_kv_cache=estimating_kv_cache,
+                enable_sleep=enable_sleep,
+            )
             # Originally, max_seq_len might be mutated inside build_managers as field of executor config.
             # Since now, we are changing kv_cache_creator._max_seq_len instead. Restore max_seq_len here.
             max_seq_len = kv_cache_creator._max_seq_len
@@ -920,14 +967,19 @@ def create_py_executor(
                 eng.attn_metadata = None
 
         del py_executor  # free before constructing new
-        gc.collect()
+        _flush_cuda_allocator_after_kv_estimation()
 
         with allocation_scope(ExecutorMemoryType.KV_CACHE):
             # Before estimating KV cache size, a minimal KV cache has been allocated using
             # create_kv_cache_manager above, which caps kv_cache_creator.max_seq_len. Restoring
             # the original value before creating the final KV cache.
             kv_cache_creator._max_seq_len = model_engine_max_seq_len
-            kv_cache_creator.build_managers(resources, False)
+            _build_kv_cache_managers(
+                kv_cache_creator,
+                resources,
+                estimating_kv_cache=False,
+                enable_sleep=enable_sleep,
+            )
             # Originally, max_seq_len might be mutated inside build_managers as field of executor config.
             # Since now, we are changing kv_cache_creator._max_seq_len instead. Restore max_seq_len here.
             max_seq_len = kv_cache_creator._max_seq_len
@@ -968,6 +1020,21 @@ def create_py_executor(
 
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
+
+    for engine_name, engine in (("main", model_engine), ("draft", draft_model_engine)):
+        if engine is None:
+            continue
+        model_loader = getattr(engine, 'model_loader', None)
+        if model_loader is None:
+            continue
+
+        committed_bytes = model_loader.finalize_pending_gms_write()
+        if committed_bytes:
+            logger.info(
+                "Finalized delayed GMS publish for %s model before start_worker: %.2f GiB",
+                engine_name,
+                committed_bytes / (1 << 30),
+            )
 
     py_executor.start_worker()
 

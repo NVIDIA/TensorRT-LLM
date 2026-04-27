@@ -27,6 +27,19 @@ if ENABLE_MULTI_DEVICE:
 T = TypeVar("T")
 
 
+def _is_mpi_pool_env_key(key: str) -> bool:
+    return (key.startswith("TRTLLM") or key.startswith("TLLM")
+            or key.startswith("GMS_")
+            or key in {"ENGINE_ID", "FAILOVER_LOCK_PATH"})
+
+
+def _get_mpi_pool_env() -> Dict[str, str]:
+    return {
+        key: value
+        for key, value in os.environ.items() if _is_mpi_pool_env_key(key)
+    }
+
+
 class MPINodeState:
     ''' MPINodeState acts as a central global state shares between tasks on MPI node.
 
@@ -170,11 +183,7 @@ class MpiPoolSession(MpiSession):
     def _start_mpi_pool(self):
         assert not self.mpi_pool, 'MPI session already started'
 
-        env = {
-            key: value
-            for key, value in os.environ.items()
-            if key.startswith("TRTLLM") or key.startswith("TLLM")
-        }
+        env = _get_mpi_pool_env()
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
                                         env=env)

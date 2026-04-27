@@ -295,6 +295,8 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
             logger.info(f"Wakeup: {tags}")
             torch.cuda.synchronize()
             materialize_with_tag(*tags)
+            if ExecutorMemoryType.KV_CACHE in tags:
+                self.engine.reset_prefix_cache()
             torch.cuda.synchronize()
         except Exception as e:
             logger.error(f"Encountered an error in wakeup")

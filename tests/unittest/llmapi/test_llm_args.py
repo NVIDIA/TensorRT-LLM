@@ -1,3 +1,4 @@
+import pickle
 import tempfile
 from collections import defaultdict
 from dataclasses import is_dataclass
@@ -34,11 +35,12 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           ExecutorMemoryType,
                                           ExtendedRuntimePerfKnobConfig,
                                           KvCacheConfig,
-                                          LookaheadDecodingConfig, MoeConfig,
-                                          PeftCacheConfig, PybindMirror,
-                                          RayPlacementConfig, SleepConfig,
-                                          SpeculativeConfig, StrictBaseModel,
-                                          TorchCompileConfig, TorchLlmArgs,
+                                          LoadFormat, LookaheadDecodingConfig,
+                                          MoeConfig, PeftCacheConfig,
+                                          PybindMirror, RayPlacementConfig,
+                                          SleepConfig, SpeculativeConfig,
+                                          StrictBaseModel, TorchCompileConfig,
+                                          TorchLlmArgs,
                                           TrtLlmArgs,
                                           UserProvidedDecodingConfig,
                                           update_llm_args_with_extra_dict)
@@ -379,6 +381,58 @@ def test_SleepConfig_restore_modes_normalized_from_defaultdict():
         ExecutorMemoryType.MODEL_WEIGHTS_MAIN] == RestoreMode.PINNED
     assert sleep_config.restore_modes[
         ExecutorMemoryType.SAMPLER] == RestoreMode.CPU
+
+
+def test_SleepConfig_default_restore_modes_pickle_roundtrip():
+    sleep_config = SleepConfig()
+
+    restored = pickle.loads(pickle.dumps(sleep_config))
+
+    assert isinstance(restored.restore_modes, dict)
+    assert not isinstance(restored.restore_modes, defaultdict)
+    assert restored.restore_modes == sleep_config.restore_modes
+
+
+def test_SleepConfig_shadow_failover_preset_expands_to_runtime_tags():
+    tags = SleepConfig.expand_sleep_tags([SleepConfig.SHADOW_FAILOVER_PRESET])
+
+    assert tags == list(SleepConfig.shadow_failover_tags())
+    assert ExecutorMemoryType.KV_CACHE.value in tags
+    assert ExecutorMemoryType.MODEL_ENGINE_MAIN.value in tags
+    assert ExecutorMemoryType.EXTRA_RESOURCES.value in tags
+    assert "moe_comm" in tags
+    assert ExecutorMemoryType.MODEL_WEIGHTS_MAIN.value not in tags
+    assert ExecutorMemoryType.MODEL_WEIGHTS_DRAFT.value not in tags
+
+
+def test_SleepConfig_expand_sleep_tags_preserves_custom_overrides():
+    tags = SleepConfig.expand_sleep_tags(
+        [ExecutorMemoryType.KV_CACHE.value, SleepConfig.SHADOW_FAILOVER_PRESET])
+
+    assert tags[0] == ExecutorMemoryType.KV_CACHE.value
+    assert tags.count(ExecutorMemoryType.KV_CACHE.value) == 1
+    assert "moe_comm" in tags
+
+
+def test_TorchLlmArgs_with_sleep_config_pickle_roundtrip():
+    llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                            sleep_config=SleepConfig())
+
+    restored = pickle.loads(pickle.dumps(llm_args))
+
+    assert isinstance(restored.sleep_config, SleepConfig)
+    assert restored.sleep_config.restore_modes == llm_args.sleep_config.restore_modes
+
+
+@pytest.mark.parametrize("load_format",
+                         [LoadFormat.GMS, "GMS", "gms", "LoadFormat.GMS", 3])
+def test_TorchLlmArgs_gms_load_format_roundtrip(load_format):
+    llm_args = TorchLlmArgs(model="/tmp/dummy_model", load_format=load_format)
+
+    assert llm_args.load_format == LoadFormat.GMS
+    assert pickle.loads(pickle.dumps(llm_args)).load_format == LoadFormat.GMS
+    assert TorchLlmArgs.model_validate(
+        llm_args.model_dump()).load_format == LoadFormat.GMS
 
 
 def test_DynamicBatchConfig_declaration():

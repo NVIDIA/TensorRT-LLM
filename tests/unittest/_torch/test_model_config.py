@@ -1,9 +1,10 @@
+import errno
 import types
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.model_config import ModelConfig, config_file_lock
 from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_kv_cache_quant
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -116,3 +117,76 @@ def test_validate_and_set_kv_cache_quant_rejects_invalid_dtype():
     model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)
     with pytest.raises(ValueError, match="Accepted types are"):
         validate_and_set_kv_cache_quant(model_config, "invalid_dtype")
+
+
+def test_config_file_lock_falls_back_on_stale_file_handle(monkeypatch):
+    calls = []
+
+    class FakeLock:
+        def __init__(self, path, timeout):
+            self.path = path
+            calls.append(path)
+
+        def __enter__(self):
+            if len(calls) == 1:
+                raise OSError(errno.ESTALE, "Stale file handle")
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.model_config.filelock.FileLock",
+        FakeLock,
+    )
+
+    with config_file_lock():
+        pass
+
+    assert len(calls) == 2
+
+
+def test_config_file_lock_proceeds_without_lock_when_tempdir_lock_fails(monkeypatch):
+    calls = []
+
+    class FakeLock:
+        def __init__(self, path, timeout):
+            self.path = path
+            calls.append(path)
+
+        def __enter__(self):
+            raise OSError(errno.ENOLCK, "No locks available")
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.model_config.filelock.FileLock",
+        FakeLock,
+    )
+
+    with config_file_lock():
+        pass
+
+    assert len(calls) == 2
+
+
+def test_config_file_lock_reraises_unexpected_oserror(monkeypatch):
+    class FakeLock:
+        def __init__(self, path, timeout):
+            self.path = path
+
+        def __enter__(self):
+            raise OSError(errno.EIO, "I/O error")
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.model_config.filelock.FileLock",
+        FakeLock,
+    )
+
+    with pytest.raises(OSError, match="I/O error"):
+        with config_file_lock():
+            pass

@@ -295,11 +295,15 @@ size_t CudaVirtualMemoryManager::materializeWithTag(std::string const& tag)
     }
     catch (...)
     {
-        for (auto itRollback = begin; itRollback != it;)
+        auto rollbackMemory = [this](auto entryIt)
         {
-            auto const handle = itRollback->second->first;
-            auto& memory = itRollback->second->second.mMemory;
-            ++itRollback;
+            auto const handle = entryIt->second->first;
+            auto& memory = entryIt->second->second.mMemory;
+            if (memory.status() == CUDAVirtualMemoryChunk::RELEASED)
+            {
+                return;
+            }
+
             try
             {
                 memory.release();
@@ -310,10 +314,15 @@ size_t CudaVirtualMemoryManager::materializeWithTag(std::string const& tag)
                 unsafeRemove(handle);
                 TLLM_LOG_ERROR("Additional exception thrown during rollback of materializeWithTag: %s", e.what());
             }
+        };
+
+        for (auto itRollback = begin; itRollback != it;)
+        {
+            auto current = itRollback++;
+            rollbackMemory(current);
         }
 
-        addBadHandle(it->second->first);
-        unsafeRemove(it->second->first);
+        rollbackMemory(it);
 
         throw;
     }

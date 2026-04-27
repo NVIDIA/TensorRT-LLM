@@ -1,7 +1,10 @@
 import contextlib
 import functools
+import gc
+import os
+import time
 from contextlib import contextmanager
-from typing import Generator
+from typing import Callable, Generator, TypeVar
 
 import torch
 
@@ -10,11 +13,15 @@ from tensorrt_llm.bindings.internal.runtime import \
 from tensorrt_llm.bindings.internal.runtime import (
     get_virtual_memory_manager, pop_virtual_memory_allocator,
     push_virtual_memory_allocator)
+from tensorrt_llm.logger import logger
 
 __all__ = [
     "RestoreMode", "maybe_scope", "scope", "release_with_tag",
-    "materialize_with_tag"
+    "materialize_with_tag", "run_with_oom_retry"
 ]
+
+T = TypeVar("T")
+_OOM_RETRY_INTERVAL_SECONDS = 0.05
 
 
 @functools.cache
@@ -42,6 +49,11 @@ class _MultiPoolProxy:
 
     def _add(self, pool: torch.cuda.MemPool):
         self._pools.append(pool)
+
+    def release_cached_blocks(self) -> int:
+        released_pools = len(self._pools)
+        self._pools.clear()
+        return released_pools
 
     def __del__(self):
         self._pools.clear()
@@ -128,6 +140,42 @@ def release_with_tag(*tags: str) -> int:
     return released_blobs
 
 
+def _is_oom_error(error: Exception) -> bool:
+    return isinstance(error, torch.OutOfMemoryError) or "out of memory" in str(
+        error).lower()
+
+
+def _cleanup_after_oom() -> None:
+    for cleanup in (torch.cuda.synchronize, gc.collect, torch.cuda.empty_cache):
+        try:
+            cleanup()
+        except Exception as cleanup_error:
+            logger.debug("OOM cleanup step failed: %s", cleanup_error)
+
+
+def run_with_oom_retry(action: Callable[[], T], *, description: str) -> T:
+    retries = 0
+    retry_interval = float(
+        os.environ.get("TLLM_VMM_OOM_RETRY_INTERVAL_SECONDS",
+                       str(_OOM_RETRY_INTERVAL_SECONDS)))
+    while True:
+        try:
+            result = action()
+            if retries:
+                logger.info(f"{description} succeeded after {retries} retries")
+            return result
+        except Exception as error:
+            if not _is_oom_error(error):
+                raise
+
+            retries += 1
+            logger.warning(
+                f"{description} hit OOM, waiting for capacity before "
+                f"retry {retries}: {error}")
+            _cleanup_after_oom()
+            time.sleep(retry_interval)
+
+
 def materialize_with_tag(*tags: str) -> int:
     """Materialize virtual memory allocated with given tags
 
@@ -135,5 +183,9 @@ def materialize_with_tag(*tags: str) -> int:
     :return: Number of memory blobs materialized
     """
     manager = get_virtual_memory_manager()
-    materialized_blobs = sum(manager.materialize_with_tag(tag) for tag in tags)
+    materialized_blobs = 0
+    for tag in tags:
+        materialized_blobs += run_with_oom_retry(
+            lambda tag=tag: manager.materialize_with_tag(tag),
+            description=f"Materializing virtual memory for tag {tag}")
     return materialized_blobs

@@ -266,6 +266,12 @@ class GenerationExecutorProxy(GenerationExecutor):
         # send back a finished result.
         self.request_queue.put(CancellingRequest(request_id))
 
+    def sleep(self, sleep_tags: List[str]):
+        return self.rpc_client.sleep(sleep_tags).remote(need_response=True)
+
+    def wakeup(self, wakeup_tags: List[str]):
+        return self.rpc_client.wakeup(wakeup_tags).remote(need_response=True)
+
     def dispatch_result_task(self) -> bool:
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
         # benefit from zmq.asyncio.Context

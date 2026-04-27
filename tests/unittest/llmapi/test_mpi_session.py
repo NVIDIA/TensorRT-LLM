@@ -12,6 +12,7 @@ import pytest
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.llmapi.mpi_session import (MPINodeState, MpiPoolSession,
                                              RemoteMpiCommSessionClient,
+                                             _get_mpi_pool_env,
                                              split_mpi_env)
 
 # isort: off
@@ -115,6 +116,24 @@ def task1():
 def test_split_mpi_env():
     session = MpiPoolSession(n_workers=4)
     session.submit_sync(task1)
+
+
+def test_mpi_pool_forwards_gms_failover_env(monkeypatch):
+    monkeypatch.setenv("TRTLLM_FOO", "trtllm")
+    monkeypatch.setenv("TLLM_BAR", "tllm")
+    monkeypatch.setenv("GMS_SOCKET_DIR", "/tmp/gms")
+    monkeypatch.setenv("ENGINE_ID", "1")
+    monkeypatch.setenv("FAILOVER_LOCK_PATH", "/tmp/gms/failover.lock")
+    monkeypatch.setenv("UNRELATED_ENV", "ignore-me")
+
+    env = _get_mpi_pool_env()
+
+    assert env["TRTLLM_FOO"] == "trtllm"
+    assert env["TLLM_BAR"] == "tllm"
+    assert env["GMS_SOCKET_DIR"] == "/tmp/gms"
+    assert env["ENGINE_ID"] == "1"
+    assert env["FAILOVER_LOCK_PATH"] == "/tmp/gms/failover.lock"
+    assert "UNRELATED_ENV" not in env
 
 
 @skip_single_gpu

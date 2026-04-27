@@ -156,6 +156,7 @@ class MoeAlltoAll:
         # Initialize or reuse workspace
         MnnvlMemory.initialize()
 
+        self.mapping = mapping
         self.workspace_size_per_rank = workspace_size_per_rank
         self.max_num_tokens = max_num_tokens
         self.ep_size = mapping.moe_ep_size
@@ -177,17 +178,53 @@ class MoeAlltoAll:
         self.enable_eplb = num_experts is not None
         self.eplb_stats_num_experts = num_experts
 
+        self._state: _A2AState = _A2AState()
+        self.restore_workspace()
+
+    @classmethod
+    def release_workspace(cls) -> int:
+        workspace = cls._WORKSPACE
+        if workspace is None:
+            return 0
+
+        workspace_size = int(workspace.get("workspace_size_per_rank", 0))
+        mnnvl_mem = workspace.get("mnnvl_mem")
+        cls._WORKSPACE = None
+
+        torch.cuda.synchronize()
+        if mnnvl_mem is not None and hasattr(mnnvl_mem, "ptr"):
+            type(mnnvl_mem).close_mnnvl_memory(mnnvl_mem.ptr)
+            delattr(mnnvl_mem, "ptr")
+        workspace.clear()
+
+        if workspace_size:
+            tllm_logger.info(
+                "NVLinkOneSided AlltoAll: Released workspace with size %d bytes.",
+                workspace_size,
+            )
+        return workspace_size
+
+    def release(self) -> int:
+        released_size = self.release_workspace()
+        self.mnnvl_mem = None
+        self.workspace = None
+        self.metainfo = None
+        self._state = _A2AState()
+        return released_size
+
+    def restore_workspace(self) -> None:
         if self._WORKSPACE is None:
             tllm_logger.info(
-                f"NVLinkOneSided AlltoAll: Allocating workspace with size {workspace_size_per_rank} bytes. ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, max_num_tokens: {self.max_num_tokens}"
+                f"NVLinkOneSided AlltoAll: Allocating workspace with size {self.workspace_size_per_rank} bytes. ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, max_num_tokens: {self.max_num_tokens}"
             )
-            mnnvl_mem = MnnvlMemory(mapping, workspace_size_per_rank)
+            mnnvl_mem = MnnvlMemory(self.mapping,
+                                    self.workspace_size_per_rank)
             workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
             metainfo = torch.ops.trtllm.moe_a2a_initialize(
                 workspace, self.ep_rank, self.ep_size, self.max_num_tokens,
                 self.eplb_stats_num_experts)
             MoeAlltoAll._WORKSPACE = {
-                "workspace_size_per_rank": workspace_size_per_rank,
+                "workspace_size_per_rank": self.workspace_size_per_rank,
                 "max_num_tokens": self.max_num_tokens,
                 "ep_rank": self.ep_rank,
                 "ep_size": self.ep_size,
@@ -198,7 +235,7 @@ class MoeAlltoAll:
             }
         else:
             assert self._WORKSPACE[
-                "workspace_size_per_rank"] == workspace_size_per_rank, "mistakenly reusing workspace with different workspace_size_per_rank"
+                "workspace_size_per_rank"] == self.workspace_size_per_rank, "mistakenly reusing workspace with different workspace_size_per_rank"
             assert self._WORKSPACE[
                 "max_num_tokens"] == self.max_num_tokens, "mistakenly reusing workspace with different max_num_tokens"
             assert self._WORKSPACE[
@@ -212,7 +249,6 @@ class MoeAlltoAll:
         self.mnnvl_mem = self._WORKSPACE["mnnvl_mem"]
         self.workspace = self._WORKSPACE["workspace"]
         self.metainfo = self._WORKSPACE["metainfo"]
-        # Internal state
         self._state: _A2AState = _A2AState()
 
     def dispatch(self,

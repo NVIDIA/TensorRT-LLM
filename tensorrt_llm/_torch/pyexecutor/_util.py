@@ -15,7 +15,7 @@ from tensorrt_llm.bindings.executor import DecodingMode
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
-    KvCacheConfig, MTPDecodingConfig, PeftCacheConfig, SamplerType,
+    KvCacheConfig, LoadFormat, MTPDecodingConfig, PeftCacheConfig, SamplerType,
     SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs,
     WaitingQueuePolicy)
 # isort: on
@@ -105,6 +105,8 @@ class KvCacheCreator:
         self._mapping = mapping
         self._kv_cache_config = kv_cache_config
         self._max_kv_tokens_in = self._kv_cache_config.max_tokens
+        self._max_gpu_total_bytes_in = self._kv_cache_config.max_gpu_total_bytes
+        self._gms_shadow_torch_activation_reserve_bytes = 0
         self._max_num_tokens = max_num_tokens
         self._max_beam_width = max_beam_width
         self._kv_connector_manager = kv_connector_manager
@@ -194,6 +196,190 @@ class KvCacheCreator:
             f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB, "
             f"fraction is set {fraction}, kv size per token is {kv_size_per_token}. device total memory {total_gpu_memory / (GB):.2f} GiB, "
             f"temporary kv cache memory during profiling {allocated_bytes / (GB):.2f} GiB"
+        )
+        return int(available_kv_mem)
+
+    def _same_gms_engine_process(self, pid: int) -> bool:
+        current_engine_id = self._llm_env("ENGINE_ID")
+        current_socket_dir = self._llm_env("GMS_SOCKET_DIR")
+        if current_engine_id is None:
+            return False
+
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as env_file:
+                entries = env_file.read().split(b"\0")
+        except OSError:
+            return False
+
+        process_env = {}
+        for entry in entries:
+            if b"=" not in entry:
+                continue
+            key, value = entry.split(b"=", 1)
+            try:
+                process_env[key.decode()] = value.decode()
+            except UnicodeDecodeError:
+                continue
+
+        if process_env.get("ENGINE_ID") != current_engine_id:
+            return False
+        if current_socket_dir is not None:
+            return process_env.get("GMS_SOCKET_DIR") == current_socket_dir
+        return True
+
+    def _current_process_gpu_memory(self) -> Optional[int]:
+        try:
+            import pynvml
+        except ImportError:
+            logger.debug("pynvml is not available for process-local memory accounting")
+            return None
+
+        try:
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(
+                torch.cuda.current_device())
+            current_pid = os.getpid()
+            used_bytes = 0
+            for proc in pynvml.nvmlDeviceGetComputeRunningProcesses(handle):
+                proc_pid = int(proc.pid)
+                if (proc_pid == current_pid
+                        or self._same_gms_engine_process(proc_pid)):
+                    used_bytes += int(proc.usedGpuMemory or 0)
+            return used_bytes if used_bytes > 0 else None
+        except Exception as exc:
+            logger.debug(
+                f"Unable to query process-local GPU memory with NVML: {exc}")
+            return None
+
+    def _gms_weight_bytes(self) -> int:
+        total = 0
+        for engine in (self._model_engine, self._draft_model_engine):
+            if engine is None:
+                continue
+            model_loader = getattr(engine, "model_loader", None)
+            if model_loader is None:
+                continue
+            total += int(model_loader.gms_weight_bytes())
+        return total
+
+    def _moe_workspace_bytes(self) -> int:
+        total = 0
+        try:
+            from tensorrt_llm._mnnvl_utils import MnnvlMoe
+        except ImportError:
+            pass
+        else:
+            total += MnnvlMoe.workspace_bytes()
+
+        seen_workspace_owners: set[type] = set()
+        try:
+            from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
+            from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import \
+                NVLinkOneSided
+        except ImportError:
+            return 0
+
+        for engine in (self._model_engine, self._draft_model_engine):
+            model = getattr(engine, "model", None)
+            if model is None:
+                continue
+            for module in model.modules():
+                for candidate in (
+                        getattr(module, "moe_a2a", None),
+                        getattr(module, "comm", None),
+                ):
+                    if not isinstance(candidate, (MoeAlltoAll, NVLinkOneSided)):
+                        continue
+                    owner = type(candidate)
+                    if owner in seen_workspace_owners:
+                        continue
+                    seen_workspace_owners.add(owner)
+
+                    workspace = getattr(owner, "_WORKSPACE", None)
+                    if workspace is not None:
+                        total += int(workspace.get("workspace_size_per_rank", 0))
+                    else:
+                        total += int(
+                            getattr(candidate, "workspace_size_per_rank", 0)
+                            or 0)
+        return total
+
+    def _llm_env(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        value = os.environ.get(key)
+        if value is not None:
+            return value
+
+        env_overrides = getattr(self._llm_args, "env_overrides", None)
+        if isinstance(env_overrides, dict):
+            return env_overrides.get(key, default)
+        return default
+
+    def _use_gms_shadow_kv_calibration(self) -> bool:
+        raw_value = str(
+            self._llm_env("TRTLLM_GMS_SHADOW_MEMORY_CALIBRATION", "1"))
+        if raw_value.lower() in {"0", "false", "no", "off"}:
+            return False
+        gms_mode = str(getattr(self._llm_args, "gms_mode", "")).lower()
+        if gms_mode == "rw":
+            return False
+        engine_id = self._llm_env("ENGINE_ID", "0")
+        if (self._llm_env("GMS_SOCKET_DIR") and engine_id != "0"):
+            return True
+
+        load_format = self._llm_args.load_format
+        load_format_name = getattr(load_format, "name", str(load_format)).upper()
+        load_format_value = getattr(load_format, "value", str(load_format))
+        load_format_text = str(load_format)
+        is_gms_load = (
+            load_format == LoadFormat.GMS
+            or load_format_name == LoadFormat.GMS.name
+            or str(load_format_value).lower() == LoadFormat.GMS.name.lower()
+            or load_format_text.lower() == LoadFormat.GMS.name.lower()
+            or load_format_text.lower().endswith(
+                f".{LoadFormat.GMS.name.lower()}")
+            or str(load_format_value) == str(LoadFormat.GMS.value))
+        if not is_gms_load:
+            return False
+        if gms_mode == "ro":
+            return True
+        return engine_id != "0"
+
+    def _cal_gms_shadow_max_memory(
+        self,
+        *,
+        torch_peak_memory: int,
+        model_bytes: int,
+        total_gpu_memory: int,
+        fraction: float,
+        temporary_kv_bytes: int,
+        non_torch_extra_bytes: int = 0,
+        min_torch_activation_bytes: int = 0,
+    ) -> int:
+        gms_weight_bytes = self._gms_weight_bytes()
+        moe_workspace_bytes = self._moe_workspace_bytes()
+        # non_torch_extra_bytes is process-local.  RO GMS weight mappings are
+        # not charged to the process by NVML, so count them separately.
+        local_extra_bytes = max(non_torch_extra_bytes - moe_workspace_bytes, 0)
+        torch_activation_bytes = max(torch_peak_memory - model_bytes,
+                                     min_torch_activation_bytes, 0)
+        local_non_kv_memory = (
+            model_bytes + torch_activation_bytes + gms_weight_bytes +
+            moe_workspace_bytes + local_extra_bytes)
+        available_kv_mem = max(total_gpu_memory - local_non_kv_memory, 0) * fraction
+        logger.info(
+            "GMS shadow KV calibration: available KV cache memory "
+            f"{available_kv_mem / GB:.2f} GiB (total={total_gpu_memory / GB:.2f} GiB, "
+            f"local_non_kv={local_non_kv_memory / GB:.2f} GiB, "
+            f"torch_peak={torch_peak_memory / GB:.2f} GiB, "
+            f"torch_activation={torch_activation_bytes / GB:.2f} GiB, "
+            f"torch_activation_reserve={min_torch_activation_bytes / GB:.2f} GiB, "
+            f"model_bytes={model_bytes / GB:.2f} GiB, "
+            f"gms_weights={gms_weight_bytes / GB:.2f} GiB, "
+            f"moe_workspace={moe_workspace_bytes / GB:.2f} GiB, "
+            f"temporary_kv={temporary_kv_bytes / GB:.2f} GiB, "
+            f"non_torch_extra={non_torch_extra_bytes / GB:.2f} GiB, "
+            f"local_non_torch_extra={local_extra_bytes / GB:.2f} GiB, "
+            f"fraction={fraction}). Other engines' active KV is intentionally ignored."
         )
         return int(available_kv_mem)
 
@@ -417,12 +603,23 @@ class KvCacheCreator:
         end, total_gpu_memory = torch.cuda.mem_get_info()
         total_used_bytes = total_gpu_memory - end
         model_bytes = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        global_non_torch_bytes_after_load = max(
+            total_used_bytes - model_bytes, 0)
+        process_gpu_memory = self._current_process_gpu_memory()
+        non_torch_bytes_after_load = (
+            max(process_gpu_memory - model_bytes, 0)
+            if process_gpu_memory is not None else
+            max(global_non_torch_bytes_after_load - self._gms_weight_bytes(), 0))
         logger.info(
             f"Memory used after loading model weights (inside torch) in memory usage profiling: {model_bytes / (GB):.2f} GiB"
         )
         logger.info(
-            f"Memory used after loading model weights (outside torch) in memory usage profiling: {((total_used_bytes - model_bytes) if total_used_bytes > model_bytes else 0) / (GB):.2f} GiB"
+            f"Memory used after loading model weights (outside torch, all processes) in memory usage profiling: {global_non_torch_bytes_after_load / (GB):.2f} GiB"
         )
+        logger.info(
+            f"Memory used after loading model weights (outside torch, current process) in memory usage profiling: {non_torch_bytes_after_load / (GB):.2f} GiB"
+        )
+        kv_cache_max_memory = None
 
         if py_executor is not None and not self._skip_est:
             py_executor.set_gather_responses(True)
@@ -475,23 +672,58 @@ class KvCacheCreator:
             total_used_bytes = total_gpu_memory - end
             activation_bytes = torch_peak_memory - model_bytes
             extra_cost = max(total_used_bytes - torch_used_bytes, 0)
+            process_gpu_memory = self._current_process_gpu_memory()
+            local_extra_cost = (
+                max(process_gpu_memory - torch_used_bytes, 0)
+                if process_gpu_memory is not None else
+                max(extra_cost - self._gms_weight_bytes(), 0))
             peak_memory = torch_peak_memory + extra_cost
             logger.info(
                 f"Memory dynamically allocated during inference (inside torch) in memory usage profiling: {activation_bytes / (GB):.2f} GiB"
             )
             logger.info(
-                f"Memory used outside torch (e.g., NCCL and CUDA graphs) in memory usage profiling: {extra_cost / (GB):.2f} GiB"
+                f"Memory used outside torch (e.g., NCCL and CUDA graphs, all processes) in memory usage profiling: {extra_cost / (GB):.2f} GiB"
             )
+            logger.info(
+                f"Memory used outside torch (e.g., NCCL and CUDA graphs, current process) in memory usage profiling: {local_extra_cost / (GB):.2f} GiB"
+            )
+            if self._use_gms_shadow_kv_calibration():
+                self._gms_shadow_torch_activation_reserve_bytes = max(
+                    getattr(self, "_gms_shadow_torch_activation_reserve_bytes",
+                            0), activation_bytes)
+                kv_cache_max_memory = self._cal_gms_shadow_max_memory(
+                    torch_peak_memory=torch_peak_memory,
+                    model_bytes=model_bytes,
+                    total_gpu_memory=total_gpu_memory,
+                    fraction=fraction,
+                    temporary_kv_bytes=allocated_bytes,
+                    non_torch_extra_bytes=local_extra_cost,
+                    min_torch_activation_bytes=getattr(
+                        self, "_gms_shadow_torch_activation_reserve_bytes", 0),
+                )
 
         else:
             peak_memory = total_used_bytes
             allocated_bytes = 0
             activation_bytes = 0
+            if self._use_gms_shadow_kv_calibration():
+                kv_cache_max_memory = self._cal_gms_shadow_max_memory(
+                    torch_peak_memory=model_bytes,
+                    model_bytes=model_bytes,
+                    total_gpu_memory=total_gpu_memory,
+                    fraction=fraction,
+                    temporary_kv_bytes=allocated_bytes,
+                    non_torch_extra_bytes=non_torch_bytes_after_load,
+                    min_torch_activation_bytes=getattr(
+                        self, "_gms_shadow_torch_activation_reserve_bytes", 0),
+                )
 
         # calculate max memory from peak memory and free gpu memory fraction
-        kv_cache_max_memory = self._cal_max_memory(peak_memory,
-                                                   total_gpu_memory, fraction,
-                                                   allocated_bytes)
+        if kv_cache_max_memory is None:
+            kv_cache_max_memory = self._cal_max_memory(peak_memory,
+                                                       total_gpu_memory,
+                                                       fraction,
+                                                       allocated_bytes)
 
         # NOTE:
         # For KVCacheManager, KvCacheCreator currently controls capacity using two parameters in KVCacheConfig:
@@ -531,11 +763,11 @@ class KvCacheCreator:
 
         # ---------------------------handle max_gpu_total_bytes---------------------------------
         # if user provided max_gpu_total_bytes, set max memory from max_gpu_total_bytes
-        if self._kv_cache_config.max_gpu_total_bytes > 0:
+        if self._max_gpu_total_bytes_in > 0:
             kv_cache_max_memory = min(kv_cache_max_memory,
-                                      self._kv_cache_config.max_gpu_total_bytes)
+                                      self._max_gpu_total_bytes_in)
             logger.info(
-                f"max_gpu_total_bytes={self._kv_cache_config.max_gpu_total_bytes / (GB):.2f} GiB is provided. New max memory is {kv_cache_max_memory / (GB):.2f} GiB"
+                f"max_gpu_total_bytes={self._max_gpu_total_bytes_in / (GB):.2f} GiB is provided. New max memory is {kv_cache_max_memory / (GB):.2f} GiB"
             )
 
         logger.info(
@@ -771,7 +1003,22 @@ class KvCacheCreator:
                        resources: Dict,
                        estimating_kv_cache: bool = False) -> None:
         """Construct KV caches for model and draft model (if applicable)."""
-        if self._skip_est:
+        use_gms_shadow_kv_calibration = self._use_gms_shadow_kv_calibration()
+        use_gms_shadow_final_calibration = (
+            not estimating_kv_cache and use_gms_shadow_kv_calibration)
+        if use_gms_shadow_final_calibration:
+            logger.info(
+                f"Using GMS shadow final KV calibration (load_format={self._llm_args.load_format}, "
+                f"gms_mode={self._llm_args.gms_mode}, engine_id={self._llm_env('ENGINE_ID', '0')})."
+            )
+        if (use_gms_shadow_final_calibration
+                and self._max_gpu_total_bytes_in <= 0):
+            # The warmup estimate runs while previously parked engines still
+            # have local runtime state on the GPU.  Recompute the final shadow
+            # KV budget with GMS-aware accounting instead of preserving that
+            # lower estimate as if it were a user cap.
+            self._kv_cache_config.max_gpu_total_bytes = 0
+        if self._skip_est or use_gms_shadow_final_calibration:
             self.configure_kv_cache_capacity()
 
         # For V2 with separate one-model draft KV cache, split the total budget

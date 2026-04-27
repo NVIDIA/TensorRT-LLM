@@ -1030,18 +1030,32 @@ class KVCacheManager(BaseResourceManager):
 
         cache_size_bytes_per_token = self.get_cache_bytes_per_token()
 
-        free_mem, total_mem = torch.cuda.mem_get_info()
-
         assert free_mem_fraction < 1.0, f"Invalid freeMemFraction, freeMemFraction {free_mem_fraction} must be smaller than 1.0"
-        max_tokens = free_mem_fraction * free_mem / cache_size_bytes_per_token
+        if kv_cache_config.max_gpu_total_bytes > 0:
+            max_tokens = (kv_cache_config.max_gpu_total_bytes /
+                          cache_size_bytes_per_token)
+            logger.info(
+                "max_gpu_total_bytes is set by "
+                "kv_cache_config.max_gpu_total_bytes: "
+                f"{kv_cache_config.max_gpu_total_bytes / (1 << 30)}GiB"
+            )
+        else:
+            free_mem, total_mem = torch.cuda.mem_get_info()
+            max_tokens = free_mem_fraction * free_mem / cache_size_bytes_per_token
 
         # If user specified a number of tokens
         if kv_cache_config.max_tokens is not None:
             # If user also specified a free gpu memory fraction, take the min
-            if kv_cache_config.free_gpu_memory_fraction is not None:
+            if (kv_cache_config.free_gpu_memory_fraction is not None
+                    and kv_cache_config.max_gpu_total_bytes <= 0):
                 max_tokens = min(kv_cache_config.max_tokens, max_tokens)
                 logger.warning(
                     f'Both free_gpu_memory_fraction and max_tokens are set (to {free_mem_fraction} and {max_tokens} with free memory {free_mem / (1 << 30)}GiB of total memory {total_mem / (1<<30)}GiB, respectively). The smaller value will be used.'
+                )
+            elif kv_cache_config.max_gpu_total_bytes > 0:
+                max_tokens = min(kv_cache_config.max_tokens, max_tokens)
+                logger.info(
+                    f"max_tokens is set by kv_cache_config.max_tokens: {kv_cache_config.max_tokens}"
                 )
             else:
                 max_tokens = kv_cache_config.max_tokens

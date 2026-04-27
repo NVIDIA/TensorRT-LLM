@@ -105,7 +105,16 @@ def load_weight_shard(
     tensor_parallel_mode: Optional[TensorParallelMode] = None,
     device: torch.device = torch.device('cpu'),
     return_slice_indices: bool = False,
+    *,
+    module: Optional[nn.Module] = None,
 ) -> torch.Tensor:
+    # If the caller's module already holds presharded weights (e.g. zero-copy
+    # imported from GMS RO), skip re-sharding. This preserves correctness for
+    # any later `module.load_weights(...)` or `ModelLoader.reload(...)` path
+    # that reaches this function after materialization.
+    if module is not None and getattr(module, '_weights_presharded', False):
+        tensor_parallel_size = 1
+        tensor_parallel_rank = 0
     # Skip device transfers on integrated GPUs to conserve shared memory
     if weight.device.type != device.type and is_device_integrated():
         # For integrated GPU systems (e.g., DGX Spark), CPU and GPU share limited physical memory.
@@ -187,7 +196,7 @@ def load_weights_vanilla_helper(module: Linear,
 
     weight = load_weight_shard(weights[0]['weight'], module.tp_size,
                                module.tp_rank, module.tp_mode,
-                               device) if "weight" in weights[0] else None
+                               device, module=module) if "weight" in weights[0] else None
 
     if weight is not None:
         if module.has_weight_only_quant:
@@ -204,7 +213,7 @@ def load_weights_vanilla_helper(module: Linear,
     if module.bias is not None:
         bias = load_weight_shard(weights[0]['bias'], module.tp_size,
                                  module.tp_rank, module.tp_mode,
-                                 device) if "bias" in weights[0] else None
+                                 device, module=module) if "bias" in weights[0] else None
         if bias is not None:
             copy_weight(module.bias, bias_transform(bias))
 
@@ -228,24 +237,24 @@ def load_weights_fused_qkv_helper(
 
     q_weight = load_weight_shard(weights[0]['weight'], module.tp_size,
                                  module.tp_rank, module.tp_mode,
-                                 device) if "weight" in weights[0] else None
+                                 device, module=module) if "weight" in weights[0] else None
     k_weight = load_weight_shard(weights[1]['weight'], module.tp_size,
                                  module.tp_rank, module.tp_mode,
-                                 device) if "weight" in weights[1] else None
+                                 device, module=module) if "weight" in weights[1] else None
     v_weight = load_weight_shard(weights[2]['weight'], module.tp_size,
                                  module.tp_rank, module.tp_mode,
-                                 device) if "weight" in weights[2] else None
+                                 device, module=module) if "weight" in weights[2] else None
 
     if module.bias is not None:
         q_bias = load_weight_shard(weights[0]['bias'], module.tp_size,
                                    module.tp_rank, module.tp_mode,
-                                   device) if "bias" in weights[0] else None
+                                   device, module=module) if "bias" in weights[0] else None
         k_bias = load_weight_shard(weights[1]['bias'], module.tp_size,
                                    module.tp_rank, module.tp_mode,
-                                   device) if "bias" in weights[1] else None
+                                   device, module=module) if "bias" in weights[1] else None
         v_bias = load_weight_shard(weights[2]['bias'], module.tp_size,
                                    module.tp_rank, module.tp_mode,
-                                   device) if "bias" in weights[2] else None
+                                   device, module=module) if "bias" in weights[2] else None
         if not allow_partial_loading:
             copy_weight(module.bias,
                         bias_transform(torch.cat((q_bias, k_bias, v_bias))))
@@ -281,17 +290,17 @@ def load_weights_fused_gate_up_helper(
 
     gate_weight = load_weight_shard(weights[0]['weight'], module.tp_size,
                                     module.tp_rank, module.tp_mode,
-                                    device) if "weight" in weights[0] else None
+                                    device, module=module) if "weight" in weights[0] else None
     up_weight = load_weight_shard(weights[1]['weight'], module.tp_size,
                                   module.tp_rank, module.tp_mode,
-                                  device) if "weight" in weights[1] else None
+                                  device, module=module) if "weight" in weights[1] else None
     if module.bias is not None:
         gate_bias = load_weight_shard(weights[0]['bias'], module.tp_size,
                                       module.tp_rank, module.tp_mode,
-                                      device) if "bias" in weights[0] else None
+                                      device, module=module) if "bias" in weights[0] else None
         up_bias = load_weight_shard(weights[1]['bias'], module.tp_size,
                                     module.tp_rank, module.tp_mode,
-                                    device) if "bias" in weights[1] else None
+                                    device, module=module) if "bias" in weights[1] else None
         if not allow_partial_loading:
             copy_weight(module.bias,
                         bias_transform(torch.cat((gate_bias, up_bias))))
@@ -2578,6 +2587,7 @@ class Linear(nn.Module):
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
         self.disable_deep_gemm = disable_deep_gemm
         self.fused_weight_shard_indices_mapping = fused_weight_shard_indices_mapping
+        self._weights_presharded = False
 
         # Store NVFP4 GEMM allowed backends configuration
         # Read from model_extra_attrs if not explicitly provided (allows config via llm_api_options)

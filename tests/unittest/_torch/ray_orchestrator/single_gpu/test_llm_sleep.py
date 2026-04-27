@@ -133,3 +133,41 @@ def test_llm_sleep_discard_weights(process_gpu_memory_info_available):
         # Can generate something without crashing
         outputs = llm.generate(prompts, sampling_params)
         assert all(output.outputs[0] is not None for output in outputs)
+
+
+def test_llm_sleep_kv_cache_wakeup_resets_prefix_cache():
+    llama_model_path = str(llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+    kv_cache_config = KvCacheConfig(enable_block_reuse=True, max_tokens=16384)
+
+    llm = LLM(
+        model=llama_model_path,
+        sleep_config=SleepConfig(),
+        kv_cache_config=kv_cache_config,
+    )
+
+    prompt = "The capital of France is"
+    sampling_params = SamplingParams(temperature=0)
+
+    with llm:
+        before = llm.generate([prompt], sampling_params)[0].outputs[0].text
+
+        llm._collective_rpc(
+            "sleep",
+            (
+                [
+                    ExecutorMemoryType.KV_CACHE,
+                ],
+            ),
+        )
+        llm._collective_rpc(
+            "wakeup",
+            (
+                [
+                    ExecutorMemoryType.KV_CACHE,
+                ],
+            ),
+        )
+
+        after = llm.generate([prompt], sampling_params)[0].outputs[0].text
+
+    assert before == after

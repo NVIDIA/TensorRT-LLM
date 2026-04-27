@@ -29,6 +29,13 @@ from tensorrt_llm.mapping import Mapping
 PP_COMM_TAG_AUTOTUNING = 30000
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
 class DistributedTuningStrategy(enum.Enum):
     """
     Strategy for distributed tuning.
@@ -1165,6 +1172,8 @@ class AutoTuner:
             to get an average execution time. Stream synchronization and delays
             are used to ensure accurate timing.
         """
+        use_cuda_graph = _env_bool("TLLM_AUTOTUNER_USE_CUDA_GRAPH",
+                                   use_cuda_graph)
         input_tensor_batches = self._prepare_input_tensors_with_batches(
             inputs, tuning_config)
 

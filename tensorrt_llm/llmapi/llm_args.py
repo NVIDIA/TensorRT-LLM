@@ -1910,6 +1910,38 @@ class SleepConfig(StrictBaseModel):
     DEFAULT_RESTORE_MODES: ClassVar[dict[str, str]] = {
         ExecutorMemoryType.KV_CACHE: "NONE",
     }
+    SHADOW_FAILOVER_PRESET: ClassVar[str] = "shadow_failover"
+    GMS_WEIGHTS_TAG: ClassVar[str] = "gms_weights"
+    SHADOW_FAILOVER_TAGS: ClassVar[tuple[str, ...]] = (
+        ExecutorMemoryType.KV_CACHE.value,
+        ExecutorMemoryType.MODEL_ENGINE_MAIN.value,
+        ExecutorMemoryType.MODEL_ENGINE_DRAFT.value,
+        ExecutorMemoryType.MODEL_EXTRA.value,
+        ExecutorMemoryType.EXTRA_RESOURCES.value,
+        GMS_WEIGHTS_TAG,
+        "moe_comm",
+        ExecutorMemoryType.SPEC_RESOURCES.value,
+        ExecutorMemoryType.DRAFTER.value,
+        ExecutorMemoryType.SAMPLER.value,
+        ExecutorMemoryType.GUIDED_DECODER.value,
+    )
+
+    @classmethod
+    def shadow_failover_tags(cls) -> tuple[str, ...]:
+        return cls.SHADOW_FAILOVER_TAGS
+
+    @classmethod
+    def expand_sleep_tags(cls, tags: list[str] | tuple[str, ...] | None) -> list[str]:
+        expanded: list[str] = []
+        for tag in tags or ():
+            if tag == cls.SHADOW_FAILOVER_PRESET:
+                candidates = cls.SHADOW_FAILOVER_TAGS
+            else:
+                candidates = (tag,)
+            for candidate in candidates:
+                if candidate not in expanded:
+                    expanded.append(candidate)
+        return expanded
 
     @staticmethod
     def _normalize_restore_mode(
@@ -1952,7 +1984,7 @@ class SleepConfig(StrictBaseModel):
                              str | _VirtualMemoryRestoreMode]] = None,
         *,
         default_mode: Optional[_VirtualMemoryRestoreMode] = None
-    ) -> defaultdict[ExecutorMemoryType, _VirtualMemoryRestoreMode]:
+    ) -> dict[ExecutorMemoryType, _VirtualMemoryRestoreMode]:
         from tensorrt_llm._torch.virtual_memory import RestoreMode
         default_mode: _VirtualMemoryRestoreMode = default_mode or (
             RestoreMode.PINNED if prefer_pinned() else RestoreMode.CPU)
@@ -1964,7 +1996,10 @@ class SleepConfig(StrictBaseModel):
             cls._normalize_restore_mode(value)
             for key, value in cases.items()
         }
-        return defaultdict(lambda: default_mode, normalized_cases)
+        return {
+            memory_type: normalized_cases.get(memory_type, default_mode)
+            for memory_type in ExecutorMemoryType
+        }
 
     @field_validator('restore_modes', mode='plain')
     @classmethod
@@ -3528,6 +3563,8 @@ class LoadFormat(Enum):
     DUMMY = 1
     # Only load the multimodal(vision) encoder weights
     VISION_ONLY = 2
+    # Load weights from GPU Memory Service.
+    GMS = 3
 
 
 class SamplerType(StrEnum):
@@ -3759,6 +3796,27 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    gms_socket_path: Optional[str] = Field(
+        default=None,
+        description="Unix domain socket path of the GPU Memory Service. "
+        "Only used when load_format='GMS'.",
+        status="prototype",
+    )
+
+    gms_mode: Optional[str] = Field(
+        default="auto",
+        description="GMS operating mode: 'auto', 'rw', or 'ro'. "
+        "Only used when load_format='GMS'.",
+        status="prototype",
+    )
+
+    gms_tag: str = Field(
+        default="weights",
+        description="Logical tag for the GMS weight set. Defaults to 'weights'. "
+        "Only used when load_format='GMS'.",
+        status="prototype",
+    )
+
     kv_connector_config: Optional[KvCacheConnectorConfig] = Field(
         default=None,
         description="The config for KV cache connector.",
@@ -3874,6 +3932,10 @@ class TorchLlmArgs(BaseLlmArgs):
     def convert_load_format(cls, v):
         if isinstance(v, LoadFormat):
             return v
+        if isinstance(v, int):
+            return LoadFormat(v)
+        if isinstance(v, str) and v.startswith(f"{LoadFormat.__name__}."):
+            v = v.split(".", 1)[1]
         load_format = v.upper()
         if load_format not in LoadFormat.__members__:
             raise ValueError(f"Invalid LoadFormat: {v}")
@@ -4003,6 +4065,22 @@ class TorchLlmArgs(BaseLlmArgs):
                 "neither checkpoint_format nor checkpoint_loader were provided, "
                 "checkpoint_format will be set to HF.")
             self.checkpoint_format = "HF"
+
+        return self
+
+    @model_validator(mode="after")
+    def validate_gms_config(self) -> 'TorchLlmArgs':
+        if self.load_format == LoadFormat.GMS and self.gms_mode not in (
+                "auto", "rw", "ro"):
+            raise ValueError(
+                f"gms_mode must be 'auto', 'rw', or 'ro', got '{self.gms_mode}'."
+            )
+
+        if self.gms_socket_path is not None and self.load_format != LoadFormat.GMS:
+            logger.warning(
+                "gms_socket_path is set but load_format is '%s', not 'GMS'. "
+                "The gms_socket_path will be ignored. Set load_format='GMS' "
+                "to enable GPU Memory Service.", self.load_format.name)
 
         return self
 

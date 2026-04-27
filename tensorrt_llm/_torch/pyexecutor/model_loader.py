@@ -199,6 +199,31 @@ def _apply_to_buffers_only(model: torch.nn.Module, fn):
                 module._buffers[key] = fn(buf)
 
 
+def _prebind_shared_draft_submodules(model: torch.nn.Module) -> None:
+    """Bind draft shared submodules before GMS RO materialization.
+
+    One-model speculative configs can leave draft embed/lm_head pointers unset
+    until the normal disk-load path wires them to the target model. The GMS RO
+    path skips disk loading, so bind the shared module references first.
+    """
+    draft = getattr(model, 'draft_model', None)
+    if draft is None:
+        return
+
+    target_inner = getattr(model, 'model', None)
+    draft_inner = getattr(draft, 'model', draft)
+    if target_inner is None or draft_inner is None:
+        return
+
+    target_embed = getattr(target_inner, 'embed_tokens', None)
+    if target_embed is not None and getattr(draft_inner, 'embed_tokens', None) is None:
+        draft_inner.embed_tokens = target_embed
+
+    target_lm_head = getattr(model, 'lm_head', None)
+    if target_lm_head is not None and getattr(draft, 'lm_head', None) is None:
+        draft.lm_head = target_lm_head
+
+
 class ModelLoader:
     """
     Handles the loading, configuration, and weight initialization of a PyTorch model.
@@ -238,9 +263,11 @@ class ModelLoader:
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
         self.lora_config = lora_config
+        self.weight_mapper = None
         self.model_weights_memory_tag = model_weights_memory_tag
         self.model_weights_restore_mode = model_weights_restore_mode
         self._weight_pool_proxy = None
+        self._gms_backend = None
 
     @staticmethod
     def load_config_and_apply_defaults(
@@ -312,8 +339,56 @@ class ModelLoader:
                 is_meta_init = False
 
             memo = dict()
+            gms_backend = None
+            post_load_done = False
 
-            if self.model_weights_memory_tag is not None:
+            if load_format == LoadFormat.GMS:
+                from tensorrt_llm._torch.memory import GMSBackend
+
+                gms_backend = GMSBackend(
+                    socket_path=self.llm_args.gms_socket_path,
+                    mapping=self.mapping,
+                    mode=self.llm_args.gms_mode or "auto",
+                    tag=self.llm_args.gms_tag or GMSBackend.DEFAULT_TAG,
+                )
+                if not gms_backend.connect():
+                    raise RuntimeError("Failed to connect to GMS")
+                self._gms_backend = gms_backend
+
+            if load_format == LoadFormat.GMS and gms_backend is not None and gms_backend.is_rw:
+
+                def allocate_buffer_on_cuda(t: torch.Tensor):
+                    if t not in memo:
+                        if t.device == torch.device('meta'):
+                            cuda_t = torch.empty_like(t, device='cuda')
+                        else:
+                            cuda_t = t.cuda()
+                        memo[t] = cuda_t
+                        memo[cuda_t] = cuda_t
+                    return memo[t]
+
+                _apply_to_buffers_only(model, allocate_buffer_on_cuda)
+
+                need_initialized_weights = load_format not in (
+                    LoadFormat.AUTO,
+                    LoadFormat.DUMMY,
+                )
+
+                def allocate_weights_on_cuda(t: torch.Tensor):
+                    if t not in memo:
+                        cuda_t = torch.empty_like(t, device='cuda')
+                        if t.device != torch.device('meta') and (
+                                need_initialized_weights or is_meta_init):
+                            cuda_t.copy_(t)
+                        memo[t] = cuda_t
+                        memo[cuda_t] = cuda_t
+                    return memo[t]
+
+                with gms_backend.mem_pool_scope(torch.device('cuda')):
+                    model._apply(allocate_weights_on_cuda)
+                model.to('cuda')
+
+            elif self.model_weights_memory_tag is not None and load_format != LoadFormat.GMS:
                 # Allocate buffers to the outer virtual_memory_scope,
                 # but parameters (weights) to the dedicated inner virtual_memory_scope.
 
@@ -329,8 +404,11 @@ class ModelLoader:
 
                 _apply_to_buffers_only(model, allocate_buffer_on_cuda)
 
-                need_initialized_weights = load_format not in (LoadFormat.AUTO,
-                                                               LoadFormat.DUMMY)
+                need_initialized_weights = load_format not in (
+                    LoadFormat.AUTO,
+                    LoadFormat.DUMMY,
+                    LoadFormat.GMS,
+                )
 
                 def allocate_weights_on_cuda(t: torch.Tensor):
                     if t not in memo:
@@ -360,7 +438,7 @@ class ModelLoader:
                         self.model_weights_restore_mode) as pool:
                     model._apply(allocate_weights_on_cuda)
                 self._weight_pool_proxy = pool
-            elif is_meta_init:
+            elif is_meta_init and load_format != LoadFormat.GMS:
 
                 def init_meta_tensor(t: torch.Tensor):
                     if t.device != torch.device('meta'):
@@ -374,7 +452,8 @@ class ModelLoader:
 
             # Ensure everything is at least on CUDA
             # No-op if worked as expected
-            model.to("cuda")
+            if load_format != LoadFormat.GMS:
+                model.to("cuda")
             del memo
 
             rank_model_storage = get_rank_model_storage(model)
@@ -418,6 +497,71 @@ class ModelLoader:
                 ):
                     model.draft_model.load_weights_from_target_model(model)
 
+            elif load_format == LoadFormat.GMS:
+                assert gms_backend is not None
+
+                if gms_backend.is_rw:
+                    if hasattr(model, 'llm_checkpoint_dir'):
+                        weights = checkpoint_loader.load_weights(
+                            model.llm_checkpoint_dir, mapping=self.mapping)
+                    else:
+                        weights = checkpoint_loader.load_weights(
+                            checkpoint_dir, mapping=self.mapping)
+
+                    self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
+                        model, config)
+                    self._call_load_weights(model.load_weights, weights,
+                                            self.weight_mapper)
+
+                    # Mirror the AUTO path: one-model speculative configs (e.g.
+                    # Kimi K2.5 + Eagle3) keep draft weights in a separate
+                    # checkpoint dir. `model.load_weights` explicitly skips
+                    # `draft_model.*` tensors, so we must load them here, or
+                    # the published RW snapshot has uninitialized draft weights
+                    # and RO clients see garbage with no surfaced error.
+                    if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
+                    ):
+                        draft_weights = checkpoint_loader.load_weights(
+                            self.spec_config.speculative_model,
+                            mapping=self.mapping)
+
+                        draft_model_arch = model.draft_config.pretrained_config.architectures[
+                            0]
+                        draft_weight_mapper = AutoCheckpointMapper.get(
+                            checkpoint_loader.checkpoint_format, draft_model_arch)
+                        draft_weight_mapper.init_model_and_config(
+                            model.draft_model, model.draft_config)
+
+                        self._call_load_weights(model.load_draft_weights,
+                                                draft_weights,
+                                                draft_weight_mapper)
+
+                    for module in model.modules():
+                        if hasattr(module, 'post_load_weights') and not getattr(
+                                module, '_weights_removed', False):
+                            module.post_load_weights()
+                    post_load_done = True
+
+                    gms_backend.move_untracked_params(model)
+                    torch.cuda.empty_cache()
+                    gms_backend.defer_finalize_write(model)
+                    logger.info(
+                        "LoadFormat.GMS (RW): delaying weight publish until final executor start_worker")
+                else:
+                    if hasattr(model, 'post_load_weights'):
+                        model.post_load_weights()
+                    _prebind_shared_draft_submodules(model)
+                    gms_backend.materialize_module(model)
+
+                    for module in model.modules():
+                        if hasattr(module, 'post_load_weights') and not getattr(
+                                module, '_weights_removed', False):
+                            module.post_load_weights()
+                    post_load_done = True
+
+                    logger.info(
+                        "LoadFormat.GMS (RO): zero-copy materialized weights")
+
             elif load_format == LoadFormat.VISION_ONLY:
                 # Vision weights are already loaded within the model.
                 logger.info(
@@ -428,10 +572,11 @@ class ModelLoader:
                 raise NotImplementedError(
                     f"No load support for load format: {load_format}")
 
-            for module in model.modules():
-                if hasattr(module, 'post_load_weights') and not getattr(
-                        module, '_weights_removed', False):
-                    module.post_load_weights()
+            if not post_load_done:
+                for module in model.modules():
+                    if hasattr(module, 'post_load_weights') and not getattr(
+                            module, '_weights_removed', False):
+                        module.post_load_weights()
 
             if isinstance(moe_load_balancer, MoeLoadBalancer):
                 moe_load_balancer.register_weight_slots_after_to_cuda()
@@ -447,11 +592,39 @@ class ModelLoader:
                model: DecoderModelForCausalLM,
                weights: dict,
                allow_partial_loading: bool = False):
+        if self.weight_mapper is None:
+            raise RuntimeError(
+                "Cannot reload weights: weight_mapper was not initialized.")
         self._call_load_weights(model.load_weights,
                                 weights,
                                 self.weight_mapper,
                                 allow_partial_loading=allow_partial_loading)
         torch.cuda.current_stream().synchronize()
+
+    def cleanup(self) -> None:
+        if self._gms_backend is not None:
+            self._gms_backend.cleanup()
+            self._gms_backend = None
+
+    def finalize_pending_gms_write(self) -> int:
+        if self._gms_backend is None:
+            return 0
+        return self._gms_backend.finalize_pending_write()
+
+    def gms_weight_bytes(self) -> int:
+        if self._gms_backend is None:
+            return 0
+        return self._gms_backend.total_bytes()
+
+    def park_gms_weights(self) -> int:
+        if self._gms_backend is None:
+            return 0
+        return self._gms_backend.park_weights()
+
+    def restore_gms_weights(self) -> int:
+        if self._gms_backend is None:
+            return 0
+        return self._gms_backend.restore_weights()
 
     def _load_and_validate_config(
             self, checkpoint_dir: str,

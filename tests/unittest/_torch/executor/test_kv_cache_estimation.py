@@ -12,6 +12,9 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
+                                                              ResourceManagerType)
+from tensorrt_llm.llmapi.llm_args import LoadFormat
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -145,3 +148,304 @@ def test_regression_without_fix_would_overcount():
     wrong = tp * 3 * tpb  # 768  (all duplicates summed)
     assert result == correct
     assert result != wrong
+
+
+def test_gms_shadow_calibration_accounts_resident_weights_and_local_overhead():
+    gib = 1 << 30
+    creator = object.__new__(KvCacheCreator)
+    creator._gms_weight_bytes = Mock(return_value=6 * gib)
+    creator._moe_workspace_bytes = Mock(return_value=4 * gib)
+
+    available = creator._cal_gms_shadow_max_memory(
+        torch_peak_memory=14 * gib,
+        model_bytes=10 * gib,
+        total_gpu_memory=100 * gib,
+        fraction=0.85,
+        temporary_kv_bytes=2 * gib,
+        non_torch_extra_bytes=20 * gib,
+    )
+
+    # non_torch_extra is process-local; RO GMS weight mappings are not part of
+    # that NVML number.  Only subtract MoE workspace to avoid double counting it.
+    # local_non_kv = model 10 + activation 4 + GMS weights 6
+    #              + MoE workspace 4 + other native extra 16 = 40 GiB.
+    assert available == int((100 - 40) * gib * 0.85)
+
+
+def test_gms_shadow_calibration_reserves_warmup_activation_with_vmm_kv():
+    gib = 1 << 30
+    creator = object.__new__(KvCacheCreator)
+    creator._gms_weight_bytes = Mock(return_value=74 * gib)
+    creator._moe_workspace_bytes = Mock(return_value=0)
+
+    available = creator._cal_gms_shadow_max_memory(
+        torch_peak_memory=3 * gib,
+        model_bytes=1 * gib,
+        total_gpu_memory=180 * gib,
+        fraction=0.85,
+        temporary_kv_bytes=9 * gib,
+        non_torch_extra_bytes=13 * gib,
+    )
+
+    # VMM KV allocation is not reflected in torch's peak allocator stats, so
+    # the 2 GiB torch activation peak must still be reserved for full-size KV.
+    assert available == int((180 - 90) * gib * 0.85)
+
+
+def test_gms_shadow_calibration_counts_local_extra_smaller_than_gms_weights():
+    gib = 1 << 30
+    creator = object.__new__(KvCacheCreator)
+    creator._gms_weight_bytes = Mock(return_value=74 * gib)
+    creator._moe_workspace_bytes = Mock(return_value=0)
+
+    available = creator._cal_gms_shadow_max_memory(
+        torch_peak_memory=1 * gib,
+        model_bytes=1 * gib,
+        total_gpu_memory=180 * gib,
+        fraction=0.85,
+        temporary_kv_bytes=0,
+        non_torch_extra_bytes=13 * gib,
+    )
+
+    assert available == int((180 - 88) * gib * 0.85)
+
+
+def test_gms_shadow_final_calibration_uses_process_local_non_torch_memory():
+    gib = 1 << 30
+    creator = object.__new__(KvCacheCreator)
+    creator._mapping = Mock(cp_config={})
+    creator._kv_cache_config = Mock(free_gpu_memory_fraction=0.85,
+                                    max_gpu_total_bytes=0)
+    creator._skip_est = False
+    creator._profiling_stage_data = None
+    creator._kv_cache_manager_cls = KVCacheManager
+    creator._max_kv_tokens_in = None
+    creator._max_gpu_total_bytes_in = 0
+    creator._gms_shadow_torch_activation_reserve_bytes = 0
+    creator._use_gms_shadow_kv_calibration = Mock(return_value=True)
+    creator._cal_gms_shadow_max_memory = Mock(return_value=64 * gib)
+    creator._get_kv_size_per_token = Mock(return_value=gib)
+    creator._current_process_gpu_memory = Mock(return_value=25 * gib)
+
+    with (
+            patch("torch.cuda.empty_cache"),
+            patch("torch.cuda.reset_peak_memory_stats"),
+            patch("torch.cuda.mem_get_info", return_value=(80 * gib, 100 * gib)),
+            patch("torch.cuda.memory_stats",
+                  return_value={"allocated_bytes.all.current": 8 * gib}),
+    ):
+        creator.configure_kv_cache_capacity(py_executor=None)
+
+    creator._cal_gms_shadow_max_memory.assert_called_once_with(
+        torch_peak_memory=8 * gib,
+        model_bytes=8 * gib,
+        total_gpu_memory=100 * gib,
+        fraction=0.85,
+        temporary_kv_bytes=0,
+        non_torch_extra_bytes=17 * gib,
+        min_torch_activation_bytes=0,
+    )
+    assert creator._kv_cache_config.max_gpu_total_bytes == 64 * gib
+    assert creator._kv_cache_config.max_tokens == 64
+
+
+def test_gms_shadow_final_calibration_reuses_warmup_activation_reserve():
+    gib = 1 << 30
+    creator = object.__new__(KvCacheCreator)
+    creator._mapping = Mock(cp_config={})
+    creator._kv_cache_config = Mock(free_gpu_memory_fraction=0.85,
+                                    max_gpu_total_bytes=0)
+    creator._skip_est = False
+    creator._profiling_stage_data = None
+    creator._kv_cache_manager_cls = KVCacheManager
+    creator._max_kv_tokens_in = None
+    creator._max_gpu_total_bytes_in = 0
+    creator._gms_shadow_torch_activation_reserve_bytes = 3 * gib
+    creator._use_gms_shadow_kv_calibration = Mock(return_value=True)
+    creator._cal_gms_shadow_max_memory = Mock(return_value=64 * gib)
+    creator._get_kv_size_per_token = Mock(return_value=gib)
+    creator._current_process_gpu_memory = Mock(return_value=25 * gib)
+
+    with (
+            patch("torch.cuda.empty_cache"),
+            patch("torch.cuda.reset_peak_memory_stats"),
+            patch("torch.cuda.mem_get_info", return_value=(80 * gib, 100 * gib)),
+            patch("torch.cuda.memory_stats",
+                  return_value={"allocated_bytes.all.current": 8 * gib}),
+    ):
+        creator.configure_kv_cache_capacity(py_executor=None)
+
+    creator._cal_gms_shadow_max_memory.assert_called_once_with(
+        torch_peak_memory=8 * gib,
+        model_bytes=8 * gib,
+        total_gpu_memory=100 * gib,
+        fraction=0.85,
+        temporary_kv_bytes=0,
+        non_torch_extra_bytes=17 * gib,
+        min_torch_activation_bytes=3 * gib,
+    )
+    assert creator._kv_cache_config.max_gpu_total_bytes == 64 * gib
+    assert creator._kv_cache_config.max_tokens == 64
+
+
+@pytest.mark.parametrize(
+    ("gms_mode", "engine_id", "expected"),
+    [("ro", "0", True), ("rw", "1", False), ("", "0", False), ("", "1", True)],
+)
+@pytest.mark.parametrize("load_format",
+                         [LoadFormat.GMS, "GMS", "gms", "LoadFormat.GMS", 3])
+def test_gms_shadow_calibration_only_applies_to_ro_or_non_primary_engine(
+    monkeypatch, load_format, gms_mode, engine_id, expected
+):
+    creator = object.__new__(KvCacheCreator)
+    creator._llm_args = Mock(load_format=load_format, gms_mode=gms_mode)
+
+    monkeypatch.setenv("ENGINE_ID", engine_id)
+    monkeypatch.delenv("TRTLLM_GMS_SHADOW_MEMORY_CALIBRATION", raising=False)
+
+    assert creator._use_gms_shadow_kv_calibration() is expected
+
+
+def test_gms_shadow_calibration_can_be_disabled(monkeypatch):
+    creator = object.__new__(KvCacheCreator)
+    creator._llm_args = Mock(load_format=LoadFormat.GMS, gms_mode="ro")
+
+    monkeypatch.setenv("TRTLLM_GMS_SHADOW_MEMORY_CALIBRATION", "0")
+
+    assert creator._use_gms_shadow_kv_calibration() is False
+
+
+def test_gms_shadow_calibration_uses_mpi_worker_environment(monkeypatch):
+    creator = object.__new__(KvCacheCreator)
+    creator._llm_args = Mock(load_format="auto", gms_mode="auto")
+
+    monkeypatch.setenv("ENGINE_ID", "1")
+    monkeypatch.setenv("GMS_SOCKET_DIR", "/tmp/gms")
+    monkeypatch.delenv("TRTLLM_GMS_SHADOW_MEMORY_CALIBRATION", raising=False)
+
+    assert creator._use_gms_shadow_kv_calibration() is True
+
+
+def test_gms_shadow_calibration_uses_llm_env_overrides(monkeypatch):
+    creator = object.__new__(KvCacheCreator)
+    creator._llm_args = Mock(load_format="auto",
+                             gms_mode="auto",
+                             env_overrides={
+                                 "ENGINE_ID": "1",
+                                 "GMS_SOCKET_DIR": "/tmp/gms",
+                             })
+
+    monkeypatch.delenv("ENGINE_ID", raising=False)
+    monkeypatch.delenv("GMS_SOCKET_DIR", raising=False)
+    monkeypatch.delenv("TRTLLM_GMS_SHADOW_MEMORY_CALIBRATION", raising=False)
+
+    assert creator._use_gms_shadow_kv_calibration() is True
+
+
+def test_gms_shadow_calibration_env_overrides_do_not_override_rw(monkeypatch):
+    creator = object.__new__(KvCacheCreator)
+    creator._llm_args = Mock(load_format=LoadFormat.GMS,
+                             gms_mode="rw",
+                             env_overrides={
+                                 "ENGINE_ID": "1",
+                                 "GMS_SOCKET_DIR": "/tmp/gms",
+                             })
+
+    monkeypatch.delenv("ENGINE_ID", raising=False)
+    monkeypatch.delenv("GMS_SOCKET_DIR", raising=False)
+    monkeypatch.delenv("TRTLLM_GMS_SHADOW_MEMORY_CALIBRATION", raising=False)
+
+    assert creator._use_gms_shadow_kv_calibration() is False
+
+
+def test_gms_shadow_calibration_worker_environment_does_not_override_rw(
+        monkeypatch):
+    creator = object.__new__(KvCacheCreator)
+    creator._llm_args = Mock(load_format=LoadFormat.GMS, gms_mode="rw")
+
+    monkeypatch.setenv("ENGINE_ID", "1")
+    monkeypatch.setenv("GMS_SOCKET_DIR", "/tmp/gms")
+    monkeypatch.delenv("TRTLLM_GMS_SHADOW_MEMORY_CALIBRATION", raising=False)
+
+    assert creator._use_gms_shadow_kv_calibration() is False
+
+
+def test_legacy_kv_manager_trusts_calibrated_max_gpu_total_bytes(monkeypatch):
+    manager = object.__new__(KVCacheManager)
+    monkeypatch.setattr(KVCacheManager, "get_cache_bytes_per_token",
+                        lambda _: 1024)
+    kv_cache_config = Mock(
+        free_gpu_memory_fraction=0.85,
+        host_cache_size=0,
+        max_gpu_total_bytes=80 * 1024,
+        max_tokens=None,
+    )
+    mapping = Mock(world_size=1)
+
+    with patch("torch.cuda.mem_get_info",
+               return_value=(10 * 1024, 100 * 1024)) as mem_get_info:
+        blocks, secondary_blocks = manager.calculate_max_num_blocks(
+            kv_cache_config,
+            head_dim=0,
+            tokens_per_block=16,
+            mapping=mapping,
+            dtype=None,
+        )
+
+    mem_get_info.assert_not_called()
+    assert blocks == 5
+    assert secondary_blocks == 0
+
+
+def test_gms_shadow_calibration_runs_when_estimation_is_disabled():
+    creator = object.__new__(KvCacheCreator)
+    creator._skip_est = False
+    creator._max_gpu_total_bytes_in = 0
+    creator._kv_cache_config = Mock(max_gpu_total_bytes=0)
+    creator._llm_args = Mock(load_format=LoadFormat.GMS,
+                             gms_mode="ro",
+                             env_overrides={"ENGINE_ID": "1"})
+    creator._use_gms_shadow_kv_calibration = Mock(return_value=True)
+    creator.configure_kv_cache_capacity = Mock()
+    creator._should_create_separate_draft_kv_cache = Mock(return_value=False)
+    creator._create_kv_cache_manager = Mock(return_value="kv")
+    creator._model_engine = Mock()
+    creator._kv_connector_manager = None
+    creator._draft_model_engine = None
+    resources = {}
+
+    creator.build_managers(resources, estimating_kv_cache=False)
+
+    creator.configure_kv_cache_capacity.assert_called_once_with()
+    assert resources[ResourceManagerType.KV_CACHE_MANAGER] == "kv"
+    assert resources[ResourceManagerType.DRAFT_KV_CACHE_MANAGER] is None
+
+
+def test_gms_shadow_final_calibration_discards_warmup_derived_cap():
+    creator = object.__new__(KvCacheCreator)
+    creator._skip_est = False
+    creator._max_gpu_total_bytes_in = 0
+    creator._kv_cache_config = Mock(max_gpu_total_bytes=32)
+    creator._llm_args = Mock(load_format=LoadFormat.GMS,
+                             gms_mode="ro",
+                             env_overrides={"ENGINE_ID": "1"})
+    creator._use_gms_shadow_kv_calibration = Mock(return_value=True)
+
+    def configure_kv_cache_capacity():
+        assert creator._kv_cache_config.max_gpu_total_bytes == 0
+        creator._kv_cache_config.max_gpu_total_bytes = 96
+
+    creator.configure_kv_cache_capacity = Mock(side_effect=configure_kv_cache_capacity)
+    creator._should_create_separate_draft_kv_cache = Mock(return_value=False)
+    creator._create_kv_cache_manager = Mock(return_value="kv")
+    creator._model_engine = Mock()
+    creator._kv_connector_manager = None
+    creator._draft_model_engine = None
+    resources = {}
+
+    creator.build_managers(resources, estimating_kv_cache=False)
+
+    creator.configure_kv_cache_capacity.assert_called_once_with()
+    assert creator._kv_cache_config.max_gpu_total_bytes == 96
+    assert resources[ResourceManagerType.KV_CACHE_MANAGER] == "kv"
+    assert resources[ResourceManagerType.DRAFT_KV_CACHE_MANAGER] is None

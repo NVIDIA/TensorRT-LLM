@@ -444,6 +444,72 @@ class MnnvlMoe:
     moe_mapping: Mapping = None
 
     @staticmethod
+    def _workspace_bytes(workspace: Optional[MnnvlMemory]) -> int:
+        if workspace is None or not hasattr(workspace, "ptr"):
+            return 0
+        allocation = type(workspace).allocated_map.get(workspace.ptr)
+        if allocation is not None:
+            return int(allocation[1])
+        return int(getattr(workspace, "segment_size", 0) or 0)
+
+    @staticmethod
+    def workspace_bytes() -> int:
+        return sum(
+            MnnvlMoe._workspace_bytes(workspace) for workspace in (
+                MnnvlMoe.moe_workspace,
+                MnnvlMoe.moe_prepare_workspace,
+            ))
+
+    @staticmethod
+    def release_workspaces() -> int:
+        released_bytes = MnnvlMoe.workspace_bytes()
+        if released_bytes == 0:
+            return 0
+
+        comm = None
+        for workspace in (MnnvlMoe.moe_workspace,
+                          MnnvlMoe.moe_prepare_workspace):
+            if workspace is not None:
+                comm = type(workspace).get_comm(workspace.mapping)
+                break
+
+        if comm is not None:
+            comm.barrier()
+        torch.cuda.synchronize()
+
+        for attr in ("moe_workspace", "moe_prepare_workspace"):
+            workspace = getattr(MnnvlMoe, attr)
+            if workspace is None:
+                continue
+            if hasattr(workspace, "ptr"):
+                type(workspace).close_mnnvl_memory(workspace.ptr)
+                delattr(workspace, "ptr")
+            setattr(MnnvlMoe, attr, None)
+
+        MnnvlMoe.moe_workspace_tensor = None
+        MnnvlMoe.moe_prepare_workspace_tensor = None
+
+        if comm is not None:
+            comm.barrier()
+        torch.cuda.synchronize()
+        return released_bytes
+
+    @staticmethod
+    def restore_workspaces(mapping: Optional[Mapping] = None) -> int:
+        mapping = mapping or MnnvlMoe.moe_mapping
+        if mapping is None:
+            return 0
+
+        before_bytes = MnnvlMoe.workspace_bytes()
+        if MnnvlMoe.moe_workspace is None:
+            MnnvlMoe.get_moe_workspaces(mapping)
+        if MnnvlMoe.moe_prepare_workspace is None:
+            MnnvlMoe.get_moe_prepare_workspace(mapping)
+
+        torch.cuda.synchronize()
+        return max(MnnvlMoe.workspace_bytes() - before_bytes, 0)
+
+    @staticmethod
     def get_moe_workspaces(mapping: Mapping):
         if MnnvlMoe.moe_workspace is not None:
             assert mapping == MnnvlMoe.moe_mapping, "only one moe mapping supported now"

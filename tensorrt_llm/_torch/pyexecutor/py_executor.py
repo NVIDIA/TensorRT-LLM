@@ -1,6 +1,7 @@
 import dataclasses
 import datetime
 import functools
+import gc
 import os
 import threading
 import time
@@ -531,6 +532,8 @@ class PyExecutor:
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
+        self.control_action_error: Optional[BaseException] = None
+        self.control_action_result = None
 
         self.stats_lock = threading.Lock()
         self.stats = []
@@ -2351,7 +2354,55 @@ class PyExecutor:
                 f"but found {len(self.control_requests)} control requests. "
                 f"This may indicate a race condition or improper control request handling."
             )
-            self.control_requests.pop(0)
+            control_request = self.control_requests.pop(0)
+            if control_request.control_action is not None:
+                action, args, kwargs = control_request.control_action
+                error_summary = None
+                try:
+                    self.control_action_result = self._run_control_request_action(
+                        action, args, kwargs)
+                    self.control_action_error = None
+                except BaseException as error:
+                    self.control_action_result = None
+                    self.control_action_error = error
+                    error_summary = f"{type(error).__name__}: {error}"
+                    logger.error(
+                        f"Control action {action!r} failed on rank {self.dist.rank}"
+                    )
+                    logger.error(traceback.format_exc())
+
+                rank_errors = self.dist.allgather(
+                    (self.dist.rank, error_summary))
+                rank_results = self.dist.allgather(
+                    (self.dist.rank, self.control_action_result))
+                if self.dist.rank == 0:
+                    failed_ranks = [
+                        f"rank {rank}: {message}"
+                        for rank, message in rank_errors if message is not None
+                    ]
+                    if failed_ranks:
+                        logger.error(
+                            "Control action %r failed across ranks: %s",
+                            action,
+                            "; ".join(failed_ranks),
+                        )
+                        self.control_action_error = RuntimeError(
+                            f"Control action {action!r} failed on "
+                            f"{len(failed_ranks)} rank(s): "
+                            + "; ".join(failed_ranks))
+                    else:
+                        self.control_action_result = [
+                            result
+                            for _, result in sorted(rank_results,
+                                                    key=lambda item: item[0])
+                        ]
+
+                self.dist.barrier()
+                self.control_request_barrier.set()
+                if self.dist.rank != 0:
+                    self.control_request_barrier.clear()
+                return
+
             self.control_request_barrier.set()
             self.control_action_done.wait()
             self.control_action_done.clear()
@@ -2382,6 +2433,961 @@ class PyExecutor:
             # Cleanup: signal worker to resume
             self.control_action_done.set()
             self.control_request_barrier.clear()
+
+    def _iter_configurable_moe_modules(self):
+        from tensorrt_llm._torch.modules.fused_moe.configurable_moe import \
+            ConfigurableMoE
+
+        for engine in (self.model_engine, self.draft_model_engine):
+            model = getattr(engine, "model", None)
+            if model is None:
+                continue
+            for module in model.modules():
+                if isinstance(module, ConfigurableMoE):
+                    yield module
+
+    def _iter_moe_alltoall_instances(self):
+        from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
+
+        seen: set[int] = set()
+        for engine in (self.model_engine, self.draft_model_engine):
+            model = getattr(engine, "model", None)
+            if model is None:
+                continue
+            for module in model.modules():
+                moe_a2a = getattr(module, "moe_a2a", None)
+                if not isinstance(moe_a2a, MoeAlltoAll):
+                    continue
+                instance_id = id(moe_a2a)
+                if instance_id in seen:
+                    continue
+                seen.add(instance_id)
+                yield moe_a2a
+
+    def _iter_legacy_mnnvl_moe_modules(self):
+        seen: set[int] = set()
+        for engine in (self.model_engine, self.draft_model_engine):
+            model = getattr(engine, "model", None)
+            if model is None:
+                continue
+            for module in model.modules():
+                module_id = id(module)
+                if module_id in seen:
+                    continue
+                has_workspace = (getattr(module, "alltoall_workspace", None)
+                                 is not None or getattr(
+                                     module, "alltoall_prepare_workspace", None)
+                                 is not None)
+                was_released = getattr(module,
+                                       "_trtllm_gms_released_mnnvl_moe",
+                                       False)
+                if not has_workspace and not was_released:
+                    continue
+                seen.add(module_id)
+                yield module
+
+    def _release_legacy_mnnvl_moe_workspaces(self) -> tuple[int, int]:
+        from tensorrt_llm._mnnvl_utils import MnnvlMoe
+
+        modules = list(self._iter_legacy_mnnvl_moe_modules())
+        if not modules and MnnvlMoe.workspace_bytes() == 0:
+            return 0, 0
+
+        for module in modules:
+            if (getattr(module, "alltoall_workspace", None) is None
+                    and getattr(module, "alltoall_prepare_workspace", None)
+                    is None):
+                continue
+            module._trtllm_gms_released_mnnvl_moe = True
+            if hasattr(module, "alltoall_workspace"):
+                module.alltoall_workspace = None
+            if hasattr(module, "alltoall_prepare_workspace"):
+                module.alltoall_prepare_workspace = None
+
+        released_bytes = MnnvlMoe.release_workspaces()
+        if released_bytes:
+            logger.info(
+                "Released %.2f GiB of legacy MNNVL MoE workspace for %d modules.",
+                released_bytes / (1024**3), len(modules))
+        return len(modules), released_bytes
+
+    def _restore_legacy_mnnvl_moe_workspaces(self) -> tuple[int, int]:
+        from tensorrt_llm._mnnvl_utils import MnnvlMoe
+
+        modules = list(self._iter_legacy_mnnvl_moe_modules())
+        if not modules:
+            return 0, 0
+
+        mapping = MnnvlMoe.moe_mapping
+        for module in modules:
+            module_mapping = getattr(module, "mapping", None)
+            if module_mapping is not None:
+                mapping = module_mapping
+                break
+
+        restored_bytes = MnnvlMoe.restore_workspaces(mapping)
+        for module in modules:
+            if not getattr(module, "_trtllm_gms_released_mnnvl_moe", False):
+                continue
+            if hasattr(module, "alltoall_workspace"):
+                module.alltoall_workspace = MnnvlMoe.moe_workspace_tensor
+            if hasattr(module, "alltoall_prepare_workspace"):
+                module.alltoall_prepare_workspace = (
+                    MnnvlMoe.moe_prepare_workspace_tensor)
+            delattr(module, "_trtllm_gms_released_mnnvl_moe")
+
+        if restored_bytes:
+            logger.info(
+                "Restored %.2f GiB of legacy MNNVL MoE workspace for %d modules.",
+                restored_bytes / (1024**3), len(modules))
+        return len(modules), restored_bytes
+
+    def _release_moe_communication(self) -> int:
+        released = 0
+        for module in self._iter_configurable_moe_modules():
+            if module.comm is None:
+                continue
+            module.destroy()
+            released += 1
+
+        legacy_released_bytes = 0
+        for moe_a2a in self._iter_moe_alltoall_instances():
+            legacy_released_bytes += moe_a2a.release()
+            released += 1
+
+        legacy_mnnvl_modules, legacy_mnnvl_bytes = (
+            self._release_legacy_mnnvl_moe_workspaces())
+        legacy_released_bytes += legacy_mnnvl_bytes
+        released += legacy_mnnvl_modules
+
+        if released:
+            torch.cuda.synchronize()
+            logger.info("Released MoE communication resources for %d modules.",
+                        released)
+        else:
+            logger.info("No MoE communication resources to release.")
+        if legacy_released_bytes:
+            logger.info("Released %.2f GiB of legacy MoE AllToAll workspace.",
+                        legacy_released_bytes / (1024**3))
+        return released
+
+    def _restore_moe_communication(self) -> int:
+        restored = 0
+        for module in self._iter_configurable_moe_modules():
+            if module.comm is not None:
+                continue
+            module.comm = module._create_comm_strategy_auto()
+            if module.comm is not None:
+                restored += 1
+
+        for moe_a2a in self._iter_moe_alltoall_instances():
+            if moe_a2a.workspace is not None:
+                continue
+            moe_a2a.restore_workspace()
+            restored += 1
+
+        legacy_mnnvl_modules, _ = self._restore_legacy_mnnvl_moe_workspaces()
+        restored += legacy_mnnvl_modules
+
+        if restored:
+            torch.cuda.synchronize()
+            logger.info("Restored MoE communication resources for %d modules.",
+                        restored)
+        else:
+            logger.info("No MoE communication resources to restore.")
+        return restored
+
+    @staticmethod
+    def _fmt_gib(value: Optional[int]) -> str:
+        if value is None:
+            return "n/a"
+        return f"{value / (1024**3):.2f} GiB"
+
+    @staticmethod
+    def _tensor_storage_bytes(value: object, seen_storages: set[int]) -> int:
+        if not isinstance(value, torch.Tensor):
+            return 0
+        try:
+            storage = value.untyped_storage()
+            data_ptr = int(storage.data_ptr())
+            if data_ptr in seen_storages:
+                return 0
+            seen_storages.add(data_ptr)
+            return int(storage.nbytes())
+        except Exception:
+            return int(value.numel() * value.element_size())
+
+    def _nested_tensor_bytes(self, value: object, seen_storages: set[int]) -> int:
+        total = self._tensor_storage_bytes(value, seen_storages)
+        if total:
+            return total
+        if isinstance(value, dict):
+            return sum(
+                self._nested_tensor_bytes(entry, seen_storages)
+                for entry in value.values())
+        if isinstance(value, (list, tuple, set)):
+            return sum(
+                self._nested_tensor_bytes(entry, seen_storages)
+                for entry in value)
+        return 0
+
+    def _same_gms_engine_process(self, pid: int) -> bool:
+        current_engine_id = os.environ.get("ENGINE_ID")
+        current_socket_dir = os.environ.get("GMS_SOCKET_DIR")
+        if current_engine_id is None:
+            return False
+
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as env_file:
+                entries = env_file.read().split(b"\0")
+        except OSError:
+            return False
+
+        process_env = {}
+        for entry in entries:
+            if b"=" not in entry:
+                continue
+            key, value = entry.split(b"=", 1)
+            try:
+                process_env[key.decode()] = value.decode()
+            except UnicodeDecodeError:
+                continue
+
+        if process_env.get("ENGINE_ID") != current_engine_id:
+            return False
+        if current_socket_dir is not None:
+            return process_env.get("GMS_SOCKET_DIR") == current_socket_dir
+        return True
+
+    def _nvml_gpu_memory_bytes(self) -> tuple[Optional[int], Optional[int]]:
+        try:
+            import pynvml
+        except ImportError:
+            return None, None
+
+        try:
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(
+                torch.cuda.current_device())
+            current_pid = os.getpid()
+            current_process_bytes = 0
+            same_engine_gms_bytes = 0
+            for proc in pynvml.nvmlDeviceGetComputeRunningProcesses(handle):
+                proc_pid = int(proc.pid)
+                used_bytes = int(proc.usedGpuMemory or 0)
+                if proc_pid == current_pid:
+                    current_process_bytes += used_bytes
+                elif self._same_gms_engine_process(proc_pid):
+                    same_engine_gms_bytes += used_bytes
+            return (current_process_bytes
+                    or None), (same_engine_gms_bytes or None)
+        except Exception as error:
+            logger.debug("Unable to query GPU memory with NVML: %s", error)
+            return None, None
+
+    def _gms_weight_bytes(self) -> int:
+        total = 0
+        for engine in (self.model_engine, self.draft_model_engine):
+            model_loader = getattr(engine, "model_loader", None)
+            if model_loader is None:
+                continue
+            gms_weight_bytes = getattr(model_loader, "gms_weight_bytes", None)
+            if callable(gms_weight_bytes):
+                total += int(gms_weight_bytes())
+        return total
+
+    def _moe_workspace_bytes(self) -> int:
+        total = 0
+        try:
+            from tensorrt_llm._mnnvl_utils import MnnvlMoe
+        except ImportError:
+            pass
+        else:
+            total += int(MnnvlMoe.workspace_bytes())
+
+        try:
+            from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
+            from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import \
+                NVLinkOneSided
+        except ImportError:
+            return total
+
+        seen_workspace_owners: set[type] = set()
+        for engine in (self.model_engine, self.draft_model_engine):
+            model = getattr(engine, "model", None)
+            if model is None:
+                continue
+            for module in model.modules():
+                for candidate in (
+                        getattr(module, "moe_a2a", None),
+                        getattr(module, "comm", None),
+                ):
+                    if not isinstance(candidate, (MoeAlltoAll, NVLinkOneSided)):
+                        continue
+                    owner = type(candidate)
+                    if owner in seen_workspace_owners:
+                        continue
+                    seen_workspace_owners.add(owner)
+                    workspace = getattr(owner, "_WORKSPACE", None)
+                    if workspace is not None:
+                        total += int(workspace.get("workspace_size_per_rank", 0)
+                                     or 0)
+                    else:
+                        total += int(
+                            getattr(candidate, "workspace_size_per_rank", 0)
+                            or 0)
+        return total
+
+    def _allreduce_workspace_bytes(self) -> int:
+        try:
+            from tensorrt_llm._torch.distributed import ops as distributed_ops
+        except ImportError:
+            return 0
+
+        seen_storages: set[int] = set()
+        total = 0
+        thread_local_values = vars(distributed_ops._thread_local)
+        for name, value in thread_local_values.items():
+            if (name.startswith("allreduce_workspaces")
+                    or name == "lowprecision_allreduce_workspaces"):
+                total += self._nested_tensor_bytes(value, seen_storages)
+
+        for workspace in distributed_ops.MNNVLAllReduce.allreduce_mnnvl_workspaces.values(
+        ):
+            explicit_bytes = 0
+            if isinstance(workspace, dict):
+                explicit_bytes = int(workspace.get("buffer_size_bytes", 0)
+                                     or 0) * 3
+            tensor_bytes = self._nested_tensor_bytes(workspace, seen_storages)
+            total += max(explicit_bytes, tensor_bytes)
+        return total
+
+    def _virtual_memory_pool_summary(self) -> str:
+        if self.virtual_memory_pools is None:
+            return "none"
+
+        parts = []
+        for tag, pool_proxy in sorted(self.virtual_memory_pools.items()):
+            pools = getattr(pool_proxy, "_pools", None)
+            if pools is None:
+                parts.append(f"{tag}:unknown")
+            else:
+                parts.append(f"{tag}:{len(pools)}")
+        return ",".join(parts) if parts else "empty"
+
+    def _torch_memory_stats_snapshot(self) -> dict:
+        try:
+            stats = torch.cuda.memory_stats()
+        except Exception as error:
+            logger.debug("Unable to query torch CUDA memory stats: %s", error)
+            return {}
+
+        keys = (
+            "active_bytes.all.current",
+            "allocated_bytes.all.current",
+            "inactive_split_bytes.all.current",
+            "reserved_bytes.all.current",
+        )
+        return {key: int(stats.get(key, 0)) for key in keys}
+
+    def _memory_buffer_bytes_by_name(self) -> dict[str, int]:
+        try:
+            from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
+
+            buffers = get_memory_buffers()
+            bytes_by_name = getattr(buffers, "bytes_by_name", None)
+            if callable(bytes_by_name):
+                return {
+                    str(name): int(size)
+                    for name, size in bytes_by_name().items()
+                    if int(size) > 0
+                }
+        except Exception as error:
+            logger.debug("Unable to query TRTLLM memory buffers: %s", error)
+        return {}
+
+    def _memory_buffer_summary(self, bytes_by_name: dict[str, int]) -> str:
+        if not bytes_by_name:
+            return "empty"
+        return ",".join(
+            f"{name}:{self._fmt_gib(size)}"
+            for name, size in sorted(bytes_by_name.items(),
+                                     key=lambda item: item[1],
+                                     reverse=True)[:8])
+
+    def _gms_clients(self) -> list:
+        clients = []
+        for engine in (self.model_engine, self.draft_model_engine):
+            model_loader = getattr(engine, "model_loader", None)
+            gms_backend = getattr(model_loader, "_gms_backend", None)
+            client = getattr(gms_backend, "_client", None)
+            if client is not None:
+                clients.append(client)
+        return clients
+
+    def _tensor_in_gms_mappings(self, tensor: torch.Tensor) -> bool:
+        try:
+            ptr = int(tensor.data_ptr())
+        except Exception:
+            return False
+
+        for client in self._gms_clients():
+            mappings = getattr(client, "mappings", None)
+            if not mappings:
+                mappings = getattr(client, "_mappings", None)
+            if not mappings:
+                continue
+            for mapping in mappings.values():
+                base = int(getattr(mapping, "va", 0))
+                size = int(
+                    getattr(mapping, "aligned_size",
+                            getattr(mapping, "size", 0)) or 0)
+                if base and size and base <= ptr < base + size:
+                    return True
+        return False
+
+    def _iter_model_cuda_tensors(self):
+        try:
+            from gpu_memory_service.client.torch.module import _iter_module_tensors
+        except ImportError:
+            return
+
+        for engine_name, engine in (
+            ("model", self.model_engine),
+            ("draft_model", self.draft_model_engine),
+        ):
+            model = getattr(engine, "model", None)
+            if model is None:
+                continue
+            for name, tensor, tensor_type in _iter_module_tensors(model):
+                if tensor is None or not tensor.is_cuda:
+                    continue
+                yield engine_name, model, name, tensor, tensor_type
+
+    def _model_cuda_tensor_summary(self) -> tuple[int, dict[str, int], str]:
+        totals: dict[str, int] = {}
+        top_local_tensors: list[tuple[int, str]] = []
+        seen_storages: set[int] = set()
+
+        for engine_name, _model, name, tensor, tensor_type in self._iter_model_cuda_tensors(
+        ):
+            try:
+                storage = tensor.untyped_storage()
+                storage_ptr = int(storage.data_ptr())
+                nbytes = int(storage.nbytes())
+            except Exception:
+                storage_ptr = int(tensor.data_ptr())
+                nbytes = int(tensor.numel() * tensor.element_size())
+
+            if storage_ptr in seen_storages:
+                continue
+            seen_storages.add(storage_ptr)
+
+            locality = "gms" if self._tensor_in_gms_mappings(
+                tensor) else "local"
+            key = f"{tensor_type}_{locality}"
+            totals[key] = totals.get(key, 0) + nbytes
+            if locality == "local":
+                top_local_tensors.append(
+                    (nbytes, f"{engine_name}.{tensor_type}.{name}"))
+
+        local_bytes = sum(size for key, size in totals.items()
+                          if key.endswith("_local"))
+        top_summary = ",".join(
+            f"{name}:{self._fmt_gib(size)}"
+            for size, name in sorted(top_local_tensors, reverse=True)[:8])
+        return local_bytes, totals, top_summary or "empty"
+
+    def _log_gpu_memory_snapshot(self,
+                                 label: str,
+                                 tags: Optional[List[str]] = None,
+                                 *,
+                                 blobs: int = 0,
+                                 moe_modules: int = 0,
+                                 pools: int = 0,
+                                 gms_mapping_bytes: int = 0) -> dict:
+        try:
+            torch.cuda.synchronize()
+        except Exception as error:
+            logger.debug("Unable to synchronize before memory snapshot: %s",
+                         error)
+
+        try:
+            torch_allocated = int(torch.cuda.memory_allocated())
+            torch_reserved = int(torch.cuda.memory_reserved())
+            driver_free, driver_total = torch.cuda.mem_get_info()
+            driver_used = int(driver_total - driver_free)
+        except Exception as error:
+            logger.debug("Unable to query torch CUDA memory snapshot: %s", error)
+            torch_allocated = torch_reserved = 0
+            driver_free = driver_total = driver_used = None
+
+        nvml_current, nvml_same_engine_gms = self._nvml_gpu_memory_bytes()
+        non_torch_vs_reserved = (
+            max(nvml_current - torch_reserved, 0)
+            if nvml_current is not None else None)
+        non_torch_vs_allocated = (
+            max(nvml_current - torch_allocated, 0)
+            if nvml_current is not None else None)
+        torch_cached = max(torch_reserved - torch_allocated, 0)
+        torch_stats = self._torch_memory_stats_snapshot()
+        buffer_bytes_by_name = self._memory_buffer_bytes_by_name()
+        buffer_bytes = sum(buffer_bytes_by_name.values())
+        model_local_tensor_bytes, model_tensor_bytes_by_type, model_local_tensors = (
+            self._model_cuda_tensor_summary())
+        snapshot = {
+            "label": label,
+            "rank": getattr(self.dist, "rank", None),
+            "pid": os.getpid(),
+            "device": torch.cuda.current_device(),
+            "gms_mode": getattr(self.llm_args, "gms_mode", None),
+            "tags": tags or [],
+            "action_blobs": blobs,
+            "action_moe_modules": moe_modules,
+            "action_pools": pools,
+            "action_gms_mapping_bytes": gms_mapping_bytes,
+            "torch_allocated": torch_allocated,
+            "torch_reserved": torch_reserved,
+            "torch_cached": torch_cached,
+            "torch_active_bytes": int(
+                torch_stats.get("active_bytes.all.current", 0)),
+            "torch_inactive_split_bytes": int(
+                torch_stats.get("inactive_split_bytes.all.current", 0)),
+            "nvml_current_process": nvml_current,
+            "nvml_same_engine_gms": nvml_same_engine_gms,
+            "non_torch_current_vs_reserved": non_torch_vs_reserved,
+            "non_torch_current_vs_allocated": non_torch_vs_allocated,
+            "driver_used": driver_used,
+            "driver_free": driver_free,
+            "driver_total": driver_total,
+            "gms_weight_bytes": self._gms_weight_bytes(),
+            "moe_workspace": self._moe_workspace_bytes(),
+            "allreduce_workspace": self._allreduce_workspace_bytes(),
+            "memory_buffer_bytes": buffer_bytes,
+            "memory_buffer_bytes_by_name": buffer_bytes_by_name,
+            "model_local_tensor_bytes": model_local_tensor_bytes,
+            "model_tensor_bytes_by_type": model_tensor_bytes_by_type,
+            "model_local_tensors": model_local_tensors,
+            "vmm_pools": self._virtual_memory_pool_summary(),
+        }
+
+        logger.info(
+            "GMS shadow memory snapshot: "
+            f"label={snapshot['label']} rank={snapshot['rank']} "
+            f"pid={snapshot['pid']} device={snapshot['device']} "
+            f"gms_mode={snapshot['gms_mode']} tags={snapshot['tags']} "
+            f"action_blobs={snapshot['action_blobs']} "
+            f"action_moe_modules={snapshot['action_moe_modules']} "
+            f"action_pools={snapshot['action_pools']} "
+            f"action_gms_mapping={self._fmt_gib(snapshot['action_gms_mapping_bytes'])} "
+            f"torch_allocated={self._fmt_gib(snapshot['torch_allocated'])} "
+            f"torch_reserved={self._fmt_gib(snapshot['torch_reserved'])} "
+            f"torch_cached={self._fmt_gib(snapshot['torch_cached'])} "
+            f"torch_active={self._fmt_gib(snapshot['torch_active_bytes'])} "
+            f"torch_inactive_split={self._fmt_gib(snapshot['torch_inactive_split_bytes'])} "
+            f"nvml_current_process={self._fmt_gib(snapshot['nvml_current_process'])} "
+            f"nvml_same_engine_gms={self._fmt_gib(snapshot['nvml_same_engine_gms'])} "
+            f"non_torch_current_vs_reserved={self._fmt_gib(snapshot['non_torch_current_vs_reserved'])} "
+            f"non_torch_current_vs_allocated={self._fmt_gib(snapshot['non_torch_current_vs_allocated'])} "
+            f"driver_used={self._fmt_gib(snapshot['driver_used'])} "
+            f"driver_free={self._fmt_gib(snapshot['driver_free'])} "
+            f"driver_total={self._fmt_gib(snapshot['driver_total'])} "
+            f"gms_weight_bytes={self._fmt_gib(snapshot['gms_weight_bytes'])} "
+            f"moe_workspace={self._fmt_gib(snapshot['moe_workspace'])} "
+            f"allreduce_workspace={self._fmt_gib(snapshot['allreduce_workspace'])} "
+            f"memory_buffers={self._fmt_gib(snapshot['memory_buffer_bytes'])} "
+            f"memory_buffers_by_name={self._memory_buffer_summary(buffer_bytes_by_name)} "
+            f"model_local_tensors={self._fmt_gib(snapshot['model_local_tensor_bytes'])} "
+            f"model_tensor_bytes_by_type={snapshot['model_tensor_bytes_by_type']} "
+            f"model_local_tensors_by_name={snapshot['model_local_tensors']} "
+            f"vmm_pools={snapshot['vmm_pools']}")
+        return snapshot
+
+    def _release_cuda_graphs_for_sleep(
+        self, sleep_tags: Optional[List[str]] = None
+    ) -> int:
+        if sleep_tags is not None and "gms_weights" in sleep_tags:
+            # GMS failover sleep preserves VA ranges; dropping graphs here
+            # pushes graph recapture onto the promoted shadow's first request.
+            return 0
+
+        release_graphs = os.environ.get(
+            "TRTLLM_RELEASE_CUDA_GRAPHS_ON_SLEEP", "1").lower()
+        if release_graphs in {"0", "false", "no", "off"}:
+            return 0
+
+        released = 0
+        for engine in (self.model_engine, self.draft_model_engine):
+            if engine is None or not hasattr(engine, "_release_cuda_graphs"):
+                continue
+            cuda_graph_runner = getattr(engine, "cuda_graph_runner", None)
+            graph_count = len(getattr(cuda_graph_runner, "graphs", {}) or {})
+            engine._release_cuda_graphs()
+            released += graph_count
+        if released and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return released
+
+    def _clear_memory_buffers_for_sleep(self) -> tuple[int, int]:
+        clear_buffers = os.environ.get("TRTLLM_CLEAR_MEMORY_BUFFERS_ON_SLEEP",
+                                       "1").lower()
+        if clear_buffers in {"0", "false", "no", "off"}:
+            return 0, 0
+
+        try:
+            from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
+
+            buffers = get_memory_buffers()
+            clear = getattr(buffers, "clear", None)
+            if callable(clear):
+                return clear()
+        except Exception as error:
+            logger.debug("Unable to clear TRTLLM memory buffers: %s", error)
+        return 0, 0
+
+    def _flush_cuda_allocator_after_sleep(self, sleep_tags: List[str],
+                                          released_blobs: int,
+                                          released_pools: int) -> None:
+        try:
+            allocated_before = torch.cuda.memory_allocated()
+            reserved_before = torch.cuda.memory_reserved()
+            free_before, total = torch.cuda.mem_get_info()
+        except Exception as error:
+            logger.debug("Failed to sample CUDA memory before sleep cleanup: %s",
+                         error)
+            allocated_before = reserved_before = free_before = total = 0
+
+        for cleanup in (torch.cuda.synchronize, gc.collect,
+                        torch.cuda.empty_cache, torch.cuda.synchronize):
+            try:
+                cleanup()
+            except Exception as error:
+                logger.debug("Sleep cleanup step failed: %s", error)
+
+        try:
+            allocated_after = torch.cuda.memory_allocated()
+            reserved_after = torch.cuda.memory_reserved()
+            free_after, total_after = torch.cuda.mem_get_info()
+            logger.info(
+                f"Sleep cleanup for tags={sleep_tags} "
+                f"released_blobs={released_blobs} released_pools={released_pools}, "
+                f"allocated {allocated_before / (1024**3):.2f}->"
+                f"{allocated_after / (1024**3):.2f} GiB, reserved "
+                f"{reserved_before / (1024**3):.2f}->"
+                f"{reserved_after / (1024**3):.2f} GiB, driver free "
+                f"{free_before / (1024**3):.2f}->"
+                f"{free_after / (1024**3):.2f} GiB of "
+                f"{total_after / (1024**3):.2f} GiB.")
+        except Exception as error:
+            logger.debug("Failed to sample CUDA memory after sleep cleanup: %s",
+                         error)
+
+    def _release_virtual_memory_pool_caches(self, tags: List[str]) -> int:
+        if self.virtual_memory_pools is None:
+            return 0
+
+        released_pools = 0
+        for tag in tags:
+            pool_proxy = self.virtual_memory_pools.pop(tag, None)
+            if pool_proxy is None:
+                continue
+
+            release_cached_blocks = getattr(pool_proxy,
+                                            "release_cached_blocks", None)
+            if callable(release_cached_blocks):
+                released_pools += release_cached_blocks()
+                continue
+
+            pools = getattr(pool_proxy, "_pools", None)
+            if pools is None:
+                continue
+            released_pools += len(pools)
+            pools.clear()
+
+        return released_pools
+
+    def _park_gms_weight_mappings(self) -> int:
+        parked_bytes = 0
+        for engine in (self.model_engine, self.draft_model_engine):
+            model_loader = getattr(engine, "model_loader", None)
+            if model_loader is None:
+                continue
+            park_gms_weights = getattr(model_loader, "park_gms_weights", None)
+            if callable(park_gms_weights):
+                parked_bytes += int(park_gms_weights())
+        return parked_bytes
+
+    def _restore_gms_weight_mappings(self) -> int:
+        restored_bytes = 0
+        for engine in (self.model_engine, self.draft_model_engine):
+            model_loader = getattr(engine, "model_loader", None)
+            if model_loader is None:
+                continue
+            restore_gms_weights = getattr(model_loader, "restore_gms_weights",
+                                          None)
+            if callable(restore_gms_weights):
+                restored_bytes += int(restore_gms_weights())
+        return restored_bytes
+
+    def _should_park_gms_weight_mappings(self) -> bool:
+        release_policy = os.environ.get("TRTLLM_GMS_RELEASE_WEIGHTS_ON_SLEEP",
+                                        "all").lower()
+        if release_policy in {"0", "false", "no", "off", "none"}:
+            return False
+        if release_policy in {"1", "true", "yes", "on", "all", "always"}:
+            return True
+
+        gms_mode = str(getattr(self.llm_args, "gms_mode", "")).lower()
+        if release_policy in {"primary", "rw", "writer"}:
+            return gms_mode != "ro"
+        if release_policy in {"shadow", "ro", "standby"}:
+            return gms_mode == "ro"
+
+        logger.warning(
+            "Unknown TRTLLM_GMS_RELEASE_WEIGHTS_ON_SLEEP=%r; defaulting to "
+            "all GMS weight parking",
+            release_policy,
+        )
+        return True
+
+    def _run_control_request_action(self, action: str, args: tuple, kwargs: dict):
+        from tensorrt_llm.llmapi.llm_args import SleepConfig
+
+        if action == "sleep":
+            from tensorrt_llm._torch.virtual_memory import release_with_tag
+
+            sleep_tags = SleepConfig.expand_sleep_tags(
+                args[0] if args else kwargs.get("sleep_tags", []))
+            before_snapshot = self._log_gpu_memory_snapshot(
+                "sleep/before", sleep_tags)
+            released_graphs = self._release_cuda_graphs_for_sleep(sleep_tags)
+            released_moe = 0
+            if "executor_extra" in sleep_tags or "moe_comm" in sleep_tags:
+                released_moe = self._release_moe_communication()
+            parked_gms = 0
+            if (SleepConfig.GMS_WEIGHTS_TAG in sleep_tags
+                    and self._should_park_gms_weight_mappings()):
+                parked_gms = self._park_gms_weight_mappings()
+                log_sleep_phases = os.environ.get(
+                    "TRTLLM_GMS_LOG_SLEEP_PHASES", "0").lower()
+                if log_sleep_phases in {"1", "true", "yes", "on"}:
+                    self._log_gpu_memory_snapshot(
+                        "sleep/after_gms_park",
+                        sleep_tags,
+                        gms_mapping_bytes=parked_gms,
+                    )
+            vmm_tags = [
+                tag for tag in sleep_tags
+                if tag not in ("moe_comm", SleepConfig.GMS_WEIGHTS_TAG)
+            ]
+            released_blobs = 0
+            released_pools = 0
+            release_tag_stats = []
+            if not vmm_tags:
+                cleared_buffers, cleared_buffer_bytes = (
+                    self._clear_memory_buffers_for_sleep())
+                self._flush_cuda_allocator_after_sleep(sleep_tags, released_moe,
+                                                       0)
+                after_snapshot = self._log_gpu_memory_snapshot(
+                    "sleep/after",
+                    sleep_tags,
+                    moe_modules=released_moe,
+                    gms_mapping_bytes=parked_gms,
+                )
+                return {
+                    "action": "sleep",
+                    "tags": sleep_tags,
+                    "result": 0,
+                    "released_blobs": 0,
+                    "released_moe_modules": released_moe,
+                    "released_pools": 0,
+                    "release_tag_stats": release_tag_stats,
+                    "released_cuda_graphs": released_graphs,
+                    "cleared_memory_buffers": cleared_buffers,
+                    "cleared_memory_buffer_bytes": cleared_buffer_bytes,
+                    "gms_mapping_bytes": parked_gms,
+                    "before": before_snapshot,
+                    "after": after_snapshot,
+                }
+            per_tag_release = os.environ.get(
+                "TRTLLM_GMS_LOG_PER_TAG_SLEEP_RELEASE", "0").lower()
+            if per_tag_release in {"1", "true", "yes", "on"}:
+                for tag in vmm_tags:
+                    tag_started_at = time.monotonic()
+                    before_current, _ = self._nvml_gpu_memory_bytes()
+                    before_reserved = int(torch.cuda.memory_reserved())
+                    tag_blobs = release_with_tag(tag)
+                    tag_pools = self._release_virtual_memory_pool_caches([tag])
+                    self._flush_cuda_allocator_after_sleep([tag], tag_blobs,
+                                                           tag_pools)
+                    after_current, _ = self._nvml_gpu_memory_bytes()
+                    after_reserved = int(torch.cuda.memory_reserved())
+                    stat = {
+                        "tag": tag,
+                        "released_blobs": tag_blobs,
+                        "released_pools": tag_pools,
+                        "elapsed_s": time.monotonic() - tag_started_at,
+                        "before_current": before_current,
+                        "after_current": after_current,
+                        "delta_current": (
+                            after_current - before_current
+                            if after_current is not None
+                            and before_current is not None else None),
+                        "before_reserved": before_reserved,
+                        "after_reserved": after_reserved,
+                        "delta_reserved":
+                        after_reserved - before_reserved,
+                    }
+                    release_tag_stats.append(stat)
+                    logger.info(
+                        "GMS shadow sleep tag release: rank=%s tag=%s "
+                        "blobs=%s pools=%s elapsed=%.3fs current_delta=%s "
+                        "reserved_delta=%s before_current=%s after_current=%s",
+                        getattr(self.dist, "rank", None),
+                        tag,
+                        tag_blobs,
+                        tag_pools,
+                        stat["elapsed_s"],
+                        self._fmt_gib(stat["delta_current"]),
+                        self._fmt_gib(stat["delta_reserved"]),
+                        self._fmt_gib(before_current),
+                        self._fmt_gib(after_current),
+                    )
+                    released_blobs += tag_blobs
+                    released_pools += tag_pools
+            else:
+                released_blobs = release_with_tag(*vmm_tags)
+                released_pools = self._release_virtual_memory_pool_caches(
+                    vmm_tags)
+            cleared_buffers, cleared_buffer_bytes = (
+                self._clear_memory_buffers_for_sleep())
+            self._flush_cuda_allocator_after_sleep(
+                sleep_tags, released_blobs + released_moe, released_pools)
+            after_snapshot = self._log_gpu_memory_snapshot(
+                "sleep/after",
+                sleep_tags,
+                blobs=released_blobs,
+                moe_modules=released_moe,
+                pools=released_pools,
+                gms_mapping_bytes=parked_gms,
+            )
+            return {
+                "action": "sleep",
+                "tags": sleep_tags,
+                "result": released_blobs,
+                "released_blobs": released_blobs,
+                "released_moe_modules": released_moe,
+                "released_pools": released_pools,
+                "release_tag_stats": release_tag_stats,
+                "released_cuda_graphs": released_graphs,
+                "cleared_memory_buffers": cleared_buffers,
+                "cleared_memory_buffer_bytes": cleared_buffer_bytes,
+                "gms_mapping_bytes": parked_gms,
+                "before": before_snapshot,
+                "after": after_snapshot,
+            }
+
+        if action == "wakeup":
+            from tensorrt_llm._torch.virtual_memory import materialize_with_tag
+
+            total_started_at = time.monotonic()
+            timings = {}
+            wakeup_tags = SleepConfig.expand_sleep_tags(
+                args[0] if args else kwargs.get("wakeup_tags", []))
+            step_started_at = time.monotonic()
+            before_snapshot = self._log_gpu_memory_snapshot(
+                "wakeup/before", wakeup_tags)
+            timings["before_snapshot_s"] = time.monotonic() - step_started_at
+            reset_kv_cache = "kv_cache" in wakeup_tags
+            restored_gms = 0
+            if SleepConfig.GMS_WEIGHTS_TAG in wakeup_tags:
+                step_started_at = time.monotonic()
+                restored_gms = self._restore_gms_weight_mappings()
+                timings["restore_gms_weights_s"] = (
+                    time.monotonic() - step_started_at)
+            vmm_tags = [
+                tag for tag in wakeup_tags
+                if tag not in ("moe_comm", SleepConfig.GMS_WEIGHTS_TAG)
+            ]
+            step_started_at = time.monotonic()
+            result = materialize_with_tag(*vmm_tags) if vmm_tags else 0
+            timings["materialize_vmm_s"] = time.monotonic() - step_started_at
+            if reset_kv_cache:
+                step_started_at = time.monotonic()
+                self.reset_prefix_cache()
+                timings["reset_prefix_cache_s"] = (
+                    time.monotonic() - step_started_at)
+            if "executor_extra" in wakeup_tags or "moe_comm" in wakeup_tags:
+                step_started_at = time.monotonic()
+                restored_moe = self._restore_moe_communication()
+                timings["restore_moe_s"] = time.monotonic() - step_started_at
+            else:
+                restored_moe = 0
+                timings["restore_moe_s"] = 0.0
+            step_started_at = time.monotonic()
+            after_snapshot = self._log_gpu_memory_snapshot(
+                "wakeup/after",
+                wakeup_tags,
+                blobs=result,
+                gms_mapping_bytes=restored_gms,
+            )
+            timings["after_snapshot_s"] = time.monotonic() - step_started_at
+            timings["total_rank_action_s"] = (
+                time.monotonic() - total_started_at)
+            logger.info(
+                "GMS shadow wakeup timings: rank=%s tags=%s "
+                "before_snapshot=%.3fs restore_gms_weights=%.3fs "
+                "materialize_vmm=%.3fs reset_prefix_cache=%.3fs "
+                "restore_moe=%.3fs after_snapshot=%.3fs total=%.3fs",
+                getattr(self.dist, "rank", None),
+                wakeup_tags,
+                timings.get("before_snapshot_s", 0.0),
+                timings.get("restore_gms_weights_s", 0.0),
+                timings.get("materialize_vmm_s", 0.0),
+                timings.get("reset_prefix_cache_s", 0.0),
+                timings.get("restore_moe_s", 0.0),
+                timings.get("after_snapshot_s", 0.0),
+                timings.get("total_rank_action_s", 0.0),
+            )
+            return {
+                "action": "wakeup",
+                "tags": wakeup_tags,
+                "result": result,
+                "materialized_blobs": result,
+                "restored_moe_modules": restored_moe,
+                "gms_mapping_bytes": restored_gms,
+                "timings": timings,
+                "before": before_snapshot,
+                "after": after_snapshot,
+            }
+
+        raise ValueError(f"Unknown control action: {action}")
+
+    def _run_distributed_control_action(self, action: str, tags: List[str]):
+        if self.dist.rank != 0:
+            raise RuntimeError(
+                f"{action} control actions must be submitted from rank 0")
+
+        self.control_action_error = None
+        self.control_action_result = None
+        self.executor_request_queue.enqueue_control_request(action=action,
+                                                            args=(tags, ))
+        self.control_request_barrier.wait()
+        try:
+            if self.control_action_error is not None:
+                raise RuntimeError(
+                    f"Control action {action!r} failed") from self.control_action_error
+            return self.control_action_result
+        finally:
+            self.control_action_error = None
+            self.control_action_result = None
+            self.control_request_barrier.clear()
+
+    def sleep(self, sleep_tags: List[str]):
+        return self._run_distributed_control_action("sleep", sleep_tags)
+
+    def wakeup(self, wakeup_tags: List[str]):
+        return self._run_distributed_control_action("wakeup", wakeup_tags)
 
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
