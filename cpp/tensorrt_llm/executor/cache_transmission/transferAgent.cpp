@@ -169,14 +169,15 @@ std::pair<MemoryDescs, MemoryDescs> VmmDescSplitter::splitTransferDescsWithRegio
     for (size_t i = 0; i < srcVec.size(); ++i)
     {
         auto [srcChunkSize, srcBase] = lookupChunkInfo(srcVec[i].getAddr(), localRegionMap);
-        if (srcChunkSize == 0)
+        auto [dstChunkSize, dstBase] = lookupChunkInfo(dstVec[i].getAddr(), remoteRegionMap);
+
+        // If neither side is multi-chunk VMM, no splitting is needed.
+        if (srcChunkSize == 0 && dstChunkSize == 0)
         {
             splitSrc.push_back(srcVec[i]);
             splitDst.push_back(dstVec[i]);
             continue;
         }
-
-        auto [dstChunkSize, dstBase] = lookupChunkInfo(dstVec[i].getAddr(), remoteRegionMap);
 
         uintptr_t srcAddr = srcVec[i].getAddr();
         uintptr_t dstAddr = dstVec[i].getAddr();
@@ -184,8 +185,12 @@ std::pair<MemoryDescs, MemoryDescs> VmmDescSplitter::splitTransferDescsWithRegio
 
         while (remaining > 0)
         {
-            size_t srcOffsetInChunk = static_cast<size_t>((srcAddr - srcBase) % srcChunkSize);
-            size_t srcPieceSize = srcChunkSize - srcOffsetInChunk;
+            size_t srcPieceSize = remaining;
+            if (srcChunkSize > 0)
+            {
+                size_t srcOffsetInChunk = static_cast<size_t>((srcAddr - srcBase) % srcChunkSize);
+                srcPieceSize = srcChunkSize - srcOffsetInChunk;
+            }
 
             size_t dstPieceSize = remaining;
             if (dstChunkSize > 0)
