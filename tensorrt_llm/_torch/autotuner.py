@@ -782,10 +782,12 @@ class AutoTuner:
         # Last captured choose_one() contexts
         self._last_capture: Optional['AutoTuner.TacticsCapture'] = None
 
-        # Fast-path cache for choose_one() during inference.
-        # Maps (custom_op, *bucketed_dynamic_dim_values) -> (runner_id, tactic).
-        # Avoids the full search_cache → get_cache_key → _find_nearest_profile
-        # chain on repeated calls with the same bucketed input shapes.
+        # Inference fast-path cache for choose_one().
+        # Maps (custom_op, runner_ids, *bucketed_dims) -> (runner_id, tactic).
+        # On cache hit, resolves the runner via runners[runner_id] from the
+        # caller's list — never caches runner instances directly.
+        # Skips the full search_cache → _find_nearest_profile chain on
+        # repeated calls.
         self._choose_one_cache: dict = {}
 
         # Dsitributed tuning state
@@ -918,16 +920,15 @@ class AutoTuner:
 
         # ---- NON-TUNING PATH: fast-key cache ----
         if not self.is_tuning_mode and self._active_capture is None:
-            fast_key = self._make_fast_key(custom_op, tuning_config, inputs)
+            fast_key = self._make_fast_key(custom_op, runners, tuning_config,
+                                           inputs)
             cached = self._choose_one_cache.get(fast_key)
             if cached is not None:
                 best_runner_id, best_tactic = cached
                 return (runners[best_runner_id], best_tactic)
 
             # Cache miss — full resolution via search_cache
-            input_shapes = tuple(
-                t.size() if isinstance(t, torch.Tensor) else torch.Size((0, ))
-                for t in inputs)
+            input_shapes = tuple(self._get_input_sizes(inputs))
             is_cache_hit, best_runner_id, best_tactic, min_time = \
                 self.profiling_cache.search_cache(
                     custom_op, runners, input_shapes, tuning_config,
@@ -989,27 +990,13 @@ class AutoTuner:
             })
 
         input_shapes = tuple(self._get_input_sizes(inputs))
-        is_cache_hit, best_runner_id, best_tactic, min_time = self.profiling_cache.search_cache(
-            custom_op,
-            runners,
-            input_shapes,
-            tuning_config,
-            apply_map_to_tuning_buckets=True)
+        is_cache_hit, best_runner_id, best_tactic, min_time = \
+            self.profiling_cache.search_cache(
+                custom_op, runners, input_shapes, tuning_config,
+                apply_map_to_tuning_buckets=True)
 
-        # Early return if it's not tuning, use cache found one or fallback one
-        if not self.is_tuning_mode:
-            best_runner = runners[best_runner_id]
-            # TODO: check the stored runner and tactic can implement this shape here
-            # Log the cache miss. Expect no cache miss in inference.
-            if not is_cache_hit:
-                logger.warning_once(
-                    f"[AutoTuner] {custom_op} using the fallback tactic, due to cache miss on input shapes={input_shapes}",
-                    key=(custom_op, "warning_autotuning_cache_miss_fallback"))
-
-            return (best_runner, best_tactic)
-
-        # If it's tuning mode and cache hit, return the best runner and tactic to avoid redundant profiling.
-        if self.is_tuning_mode and is_cache_hit:
+        # Cache hit — skip profiling (avoids redundant work during tuning/capture).
+        if is_cache_hit:
             return (runners[best_runner_id], best_tactic)
 
         # PP rank does not have cache hit, so we try to receive the cache from the previous rank
@@ -1084,19 +1071,20 @@ class AutoTuner:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _make_fast_key(custom_op, tuning_config, inputs):
-        """Build a minimal cache key from bucketed dynamic dimensions only.
+    def _make_fast_key(custom_op, runners, tuning_config, inputs):
+        """Build a minimal cache key from runner identity + bucketed dynamic dims.
 
-        Instead of constructing the full ``input_shapes`` tuple (one
-        ``t.size()`` per input, O(N)) and running ``_find_nearest_profile``
-        (list↔tuple conversion), we extract only the 1–2 integer values
-        that actually vary at inference time (e.g. batch size) and bucket
-        them.  This gives an O(K) key where K = len(dynamic_tensor_specs),
-        typically 1.
+        Includes each runner's ``_cache_key_prefix`` (class name + unique_id)
+        so that different runner configurations for the same ``custom_op``
+        do not collide.  For the dynamic dimensions we extract only the 1–2
+        integer values that actually vary at inference time (e.g. batch size)
+        and bucket them.  This gives an O(R + K) key where R = len(runners)
+        (typically 1–3) and K = len(dynamic_tensor_specs) (typically 1).
         """
+        runner_ids = tuple(r._cache_key_prefix for r in runners)
         dynamic_specs = tuning_config.dynamic_tensor_specs
         if not dynamic_specs:
-            return (custom_op, )
+            return (custom_op, runner_ids)
         max_tokens = tuning_config.tune_max_num_tokens
         dyn_vals = []
         for spec in dynamic_specs:
@@ -1108,7 +1096,7 @@ class AutoTuner:
             if max_tokens is not None:
                 v = min(v, max_tokens)
             dyn_vals.append(v)
-        return (custom_op, *dyn_vals)
+        return (custom_op, runner_ids, *dyn_vals)
 
     def _profile_runners(
         self,
