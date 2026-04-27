@@ -868,7 +868,10 @@ def create_input_processor_with_hash(
 
         # Merge any model-specific auxiliary streams (e.g. video evs_ids for
         # EVS-enabled runs) into extra_processed_inputs["multimodal_data"].
-        # `merge_evs_mm_embeds` will pick them up at LLM forward time.
+        # The dummy-placeholder pass above produced these against the synthetic
+        # placeholder text, so they're stale w.r.t. the real prompt; overwrite
+        # them with the values rebuilt from `prompt_token_ids` here so
+        # `merge_evs_mm_embeds` picks up the correct stream at LLM forward time.
         if mm_data_updates:
             mm_container = extra_processed_inputs.setdefault(
                 "multimodal_data", {})
