@@ -20,8 +20,6 @@ server_configs:
         enable_parallel_vae: true
         dit_cfg_size: 2
         dit_ulysses_size: 4
-      teacache:
-        enable_teacache: false
       cuda_graph:
         enable_cuda_graph: false
     client_configs:

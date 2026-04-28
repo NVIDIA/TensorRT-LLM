@@ -164,9 +164,8 @@ def build_visual_gen_db_entry(
         "s_extra_visual_gen_options_path": str(extra_visual_gen_options_path),
         "s_attn_backend": str(_get_nested_value(server_config, "attention.backend", "")),
         "s_quant_algo": str(_get_nested_value(server_config, "quant_config.quant_algo", "")),
-        "b_enable_teacache": bool(
-            _get_nested_value(server_config, "teacache.enable_teacache", False)
-        ),
+        "b_enable_teacache": _get_nested_value(server_config, "cache.cache_backend", "")
+        == "teacache",
         "b_enable_cuda_graph": bool(
             _get_nested_value(server_config, "cuda_graph.enable_cuda_graph", False)
         ),
