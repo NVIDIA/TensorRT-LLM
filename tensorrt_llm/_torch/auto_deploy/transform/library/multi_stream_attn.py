@@ -12,6 +12,14 @@ heavier Q path (GEMM + AllGather + LayerNorm + Q_b_proj) on main.
 This eliminates the narrow→contiguous copies that fused GEMMs require and
 gives better overlap since both KV GEMM and KV AllGather run on aux.
 
+Match (in the original FX graph — any of the 5 ops in _ALL_GATHER_OPS):
+    fork_point → Q_a_proj → ... (Q chain)
+              → KV_a_proj → <any AllGather op> → ...
+
+Rewrite (the matched AllGather is always replaced with
+symm_mem_all_gather_aux, which uses a dedicated workspace so it does not
+clash with a concurrent main-stream symm_mem_all_gather):
+
                        fork_point (input layernorm out)
                                   │
                   ┌───────────────┴───────────────┐
@@ -29,7 +37,7 @@ gives better overlap since both KV GEMM and KV AllGather run on aux.
 
 GPU timeline:
     Main: [Q_GEMM] → [Q_AllGather] → [Q_LayerNorm] → [Q_b_proj] → [wait_aux]
-    Aux:  [KV_GEMM] → [KV_AllGather_symm_mem] → done
+    Aux:  [KV_GEMM] → [KV_AllGather_aux] → done
 
 **Case 1 — Projection overlap (fallback for non-quantized graphs)**:
 
