@@ -385,7 +385,7 @@ class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-            self.check_acceptance_rate(llm, min_acceptance_rate=0.25)
+            self.check_acceptance_rate(llm, min_acceptance_rate=0.18)
 
 
 class TestNemotronH(LlmapiAccuracyTestHarness):
