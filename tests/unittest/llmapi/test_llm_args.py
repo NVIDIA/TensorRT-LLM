@@ -712,6 +712,16 @@ class TestTorchLlmArgsCudaGraphSettings:
             128, True)
         assert args.cuda_graph_config.max_batch_size == 128
 
+    @pytest.mark.parametrize("max_batch_size", [64, 129, 320])
+    def test_generate_cuda_graph_batch_sizes_padding_edge_cases(
+            self, max_batch_size):
+        # All sizes must be <= max_batch_size, sorted, and include max_batch_size
+        batch_sizes = CudaGraphConfig._generate_cuda_graph_batch_sizes(
+            max_batch_size, enable_padding=True)
+        assert all(s <= max_batch_size for s in batch_sizes)
+        assert batch_sizes == sorted(batch_sizes)
+        assert max_batch_size in batch_sizes
+
 
 class TestTrtLlmArgs:
 

@@ -226,8 +226,9 @@ set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
 find_library(RT_LIB rt)
 
 if(ENABLE_MULTI_DEVICE)
-  # NCCL dependencies
-  find_package(NCCL 2 REQUIRED)
+  # NCCL dependencies NCCL >= 2.29 is required for NCCLWindowAllocator used
+  # unconditionally in allreduceOp.cpp
+  find_package(NCCL 2.29 REQUIRED)
   set(NCCL_LIB NCCL::nccl)
 endif()
 
@@ -322,15 +323,16 @@ if(UNIX)
   set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -fno-inline")
 endif()
 
-# Note: The following are desirable settings that should be enabled if we
-# decrease shared library size. See e.g.
-# https://github.com/rapidsai/cudf/pull/6134 for a similar issue in another
-# project.
-
-# set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO}
-# --generate-line-info")
-
-# set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G")
+# Emit CUDA line info for Debug and RelWithDebInfo so nsys/ncu can map samples
+# back to source, and emit full device debug info (-G) for Debug so cuda-gdb can
+# step through kernels. These flags inflate section sizes significantly, so
+# building these configurations for all CUDA architectures at once will fail to
+# link -- build_wheel.py enforces that a specific --cuda_architectures must be
+# passed in that case.
+# cmake-format: off
+set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} --generate-line-info")
+set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} --generate-line-info -G")
+# cmake-format: on
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss ")
 

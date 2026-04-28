@@ -103,6 +103,10 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      encode_only:
+        annotation: bool
+        default: False
+        status: prototype
       disable_overlap_scheduler:
         annotation: bool
         default: False
@@ -307,6 +311,20 @@ methods:
         default: 0.5
         status: prototype
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
+  encode:
+    parameters:
+      inputs:
+        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt,
+          Sequence[Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt]]]
+        default: inspect._empty
+      add_special_tokens:
+        annotation: bool
+        default: True
+      model_kwargs:
+        annotation: Any
+        default: inspect._empty
+    return_annotation: Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput]]
+    status: prototype
   preprocess:
     parameters:
       inputs:

@@ -19,9 +19,9 @@ from typing import Callable, List
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.auto_deploy.distributed import common as dist_common
-from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
-from tensorrt_llm._torch.utils import ActivationType
+from ..._compat import ActivationType
+from ...distributed import common as dist_common
+from ...utils.dist_config import DistConfig
 
 
 def _template_moe_alltoall(

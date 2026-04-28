@@ -160,6 +160,8 @@ class NGramPoolManager(BaseResourceManager):
 
 class NGramDrafter(Drafter):
 
+    _needs_padding_kv_extension = True
+
     def __init__(
         self,
         spec_config: NGramDecodingConfig,
