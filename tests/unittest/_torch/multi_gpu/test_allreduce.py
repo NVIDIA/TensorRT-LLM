@@ -26,10 +26,15 @@ from utils.util import check_accuracy, skip_pre_blackwell
 
 import tensorrt_llm
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
-from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             AllReduceParams, AllReduceStrategy,
-                                             MiniMaxAllReduceRMS, MoEAllReduce,
-                                             MoEAllReduceParams)
+from tensorrt_llm._torch.distributed import (
+    AllReduce,
+    AllReduceFusionOp,
+    AllReduceParams,
+    AllReduceStrategy,
+    MiniMaxAllReduceRMS,
+    MoEAllReduce,
+    MoEAllReduceParams,
+)
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.mapping import Mapping
