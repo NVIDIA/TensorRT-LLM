@@ -164,9 +164,7 @@ def _load_config(path: pathlib.Path) -> dict[str, Any]:
     if loaded is None:
         loaded = {}
     if not isinstance(loaded, dict):
-        raise ValueError(
-            f"Expected top-level mapping in {path}, got {type(loaded).__name__}."
-        )
+        raise ValueError(f"Expected top-level mapping in {path}, got {type(loaded).__name__}.")
     return loaded
 
 
@@ -227,24 +225,6 @@ def _prepare_run_config(
             params["num_inference_steps"] = params["steps"]
         params.pop("steps")
 
-    model_path = cli_args.model_path or _get_first_present(
-        raw_config,
-        ("model_path", "model", "checkpoint_path"),
-    )
-    if model_path is not None:
-        visual_gen_args["checkpoint_path"] = str(model_path)
-    if "checkpoint_path" not in visual_gen_args or not visual_gen_args["checkpoint_path"]:
-        raise ValueError(
-            "Missing FLUX checkpoint. Set model_path/checkpoint_path in config "
-            "or pass --model-path."
-        )
-
-    prompt = cli_args.prompt or raw_config.get("prompt")
-    if prompt is not None:
-        params["prompt"] = prompt
-    if "prompt" not in params or params["prompt"] is None:
-        raise ValueError("Missing generation prompt. Set params.prompt or pass --prompt.")
-
     golden_image = cli_args.golden_image or raw_config.get("golden_image", raw_config.get("image"))
     if golden_image is None:
         raise ValueError("Missing golden image. Set golden_image in config or pass --golden-image.")
@@ -266,6 +246,28 @@ def _prepare_run_config(
     if generated_image_path is not None and not generated_image_path.exists():
         raise ValueError(f"Generated image does not exist: {generated_image_path}")
 
+    generate = generated_image_path is None
+
+    model_path = cli_args.model_path or _get_first_present(
+        raw_config,
+        ("model_path", "model", "checkpoint_path"),
+    )
+    if model_path is not None:
+        visual_gen_args["checkpoint_path"] = str(model_path)
+
+    prompt = cli_args.prompt or raw_config.get("prompt")
+    if prompt is not None:
+        params["prompt"] = prompt
+
+    if generate:
+        if "checkpoint_path" not in visual_gen_args or not visual_gen_args["checkpoint_path"]:
+            raise ValueError(
+                "Missing FLUX checkpoint. Set model_path/checkpoint_path in config "
+                "or pass --model-path."
+            )
+        if "prompt" not in params or params["prompt"] is None:
+            raise ValueError("Missing generation prompt. Set params.prompt or pass --prompt.")
+
     threshold = cli_args.threshold
     if threshold is None:
         threshold = raw_config.get("lpips_threshold", raw_config.get("threshold"))
@@ -273,8 +275,8 @@ def _prepare_run_config(
         threshold = float(threshold)
 
     lpips_net = cli_args.lpips_net or raw_config.get("lpips_net", "alex")
-    lpips_device = cli_args.device or raw_config.get("lpips_device") or visual_gen_args.get(
-        "device", "cuda"
+    lpips_device = (
+        cli_args.device or raw_config.get("lpips_device") or visual_gen_args.get("device", "cuda")
     )
     return (
         visual_gen_args,
@@ -448,8 +450,8 @@ def main() -> int:
         "golden_image": str(golden_image_path),
         "generated_image": str(output_image_path) if output_image_path is not None else None,
         "generation_time_sec": generation_time_sec,
-        "checkpoint_path": visual_gen_args["checkpoint_path"],
-        "prompt": params["prompt"],
+        "checkpoint_path": visual_gen_args.get("checkpoint_path"),
+        "prompt": params.get("prompt"),
     }
 
     if cli_args.output_json is not None:

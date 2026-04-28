@@ -216,7 +216,7 @@ class TestFluxPipelineLoading:
             skip_components=SKIP_COMPONENTS,
         )
 
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         assert pipeline is not None
         assert hasattr(pipeline, "transformer")
@@ -887,8 +887,7 @@ class TestFluxLPIPSRegression:
 
         print(f"\n[E2E FLUX.1 LPIPS] score: {lpips_score:.6f}")
         assert lpips_score < FLUX1_LPIPS_THRESHOLD, (
-            f"LPIPS too high: {lpips_score:.6f} "
-            f"(expected < {FLUX1_LPIPS_THRESHOLD:.6f})"
+            f"LPIPS too high: {lpips_score:.6f} (expected < {FLUX1_LPIPS_THRESHOLD:.6f})"
         )
 
         del lpips_model
@@ -935,8 +934,7 @@ class TestFluxLPIPSRegression:
 
         print(f"\n[E2E FLUX.2 LPIPS] score: {lpips_score:.6f}")
         assert lpips_score < FLUX2_LPIPS_THRESHOLD, (
-            f"LPIPS too high: {lpips_score:.6f} "
-            f"(expected < {FLUX2_LPIPS_THRESHOLD:.6f})"
+            f"LPIPS too high: {lpips_score:.6f} (expected < {FLUX2_LPIPS_THRESHOLD:.6f})"
         )
 
         del lpips_model
