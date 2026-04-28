@@ -98,6 +98,14 @@ public:
     bool verifyQueueIntegrity() override;
 
 private:
+    //! \brief Add block to free block queue. Records all info needed to remove block from queue
+    void addToFreeBlockQueue(BlockPtr block, bool toFront);
+
+    //! \brief Remove block from free block queue, using info stored when block was added. It is always safe to call
+    //! this method \param block The block to be removed from free blocks queue. NOOP if block is not currently in queue
+    //! \return True if block was removed from free queue.
+    [[nodiscard]] bool removeFromFreeBlockQueue(BlockPtr block);
+
     /// @brief A fixed-size container supporting both non-negative and negative indexing.
     ///        Non-negative IDs index directly into positive.
     ///        Negative IDs index into negative by absolute value, i.e. -1 → 1, -2 → 2, etc.
@@ -116,8 +124,10 @@ private:
     // Queues of available leaf blocks, split by level and priority: [level][priorityIdx]
     // Levels 0,1 = primary,secondary (real cache); level 2 = placeholder
     std::vector<std::vector<FreeBlocksQueue>> mFreeQueues;
-    // Iterators to block entries in mFreeQueues, indexed by block ID
-    BidirectionalVector<std::optional<FreeBlocksQueue::iterator>> mFreeBlockIterators;
+    // Iterators to block entries in mFreeQueues, indexed by block ID. Holds ALL arguments needed to remove block from
+    // free queue
+    BidirectionalVector<std::optional<std::tuple<SizeType32, SizeType32, FreeBlocksQueue::iterator>>>
+        mFreeBlockIterators;
     // Amount of free blocks at each level
     std::vector<SizeType32> mNumFreeBlocksPerLevel;
     // Secondary offload threshold. Blocks below this priority won't be offloaded.
