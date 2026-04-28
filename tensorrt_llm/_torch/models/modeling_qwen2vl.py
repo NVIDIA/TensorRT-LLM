@@ -53,8 +53,8 @@ if IS_FLASHINFER_AVAILABLE:
 from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import (MmEncoderMixin,
-                                        bypass_processor_output_validation,
+from .modeling_multimodal_encoder import MmEncoderMixin
+from .modeling_multimodal_utils import (bypass_processor_output_validation,
                                         find_input_mm_embeds, fuse_input_embeds,
                                         get_multimodal_embeddings)
 from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
