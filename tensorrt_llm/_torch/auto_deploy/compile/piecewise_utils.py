@@ -254,6 +254,16 @@ def is_metadata_prep(submod: nn.Module) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _submod_has_stream_switch(submod: GraphModule) -> bool:
+    """Return True if *submod* contains a multi-stream passthrough function."""
+    for node in submod.graph.nodes:
+        if node.op == "call_function":
+            func_name = getattr(node.target, "__name__", "")
+            if func_name in _STREAM_SWITCH_FUNCTION_NAMES:
+                return True
+    return False
+
+
 @dataclass
 class SplitInfo:
     """Metadata about a split GraphModule."""
@@ -291,10 +301,6 @@ def split_graph_at_dynamic_ops(gm: GraphModule) -> SplitInfo:
     dynamic_partitions: Set[int] = set()
 
     # First pass: identify dynamic nodes and assign them unique partitions.
-    # Multi-stream passthrough nodes are intentionally NOT split out here:
-    # they are no-oped at runtime by ``disable_multi_stream()`` (wrapped
-    # around piecewise warmup/capture/forward in ``PiecewiseCapturedGraph``)
-    # so they capture safely as no-ops inside static partitions.
     for node in gm.graph.nodes:
         if node.op in ("placeholder", "output"):
             continue
