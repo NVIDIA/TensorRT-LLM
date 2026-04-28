@@ -16,7 +16,7 @@ import pytest
 import torch
 import transformers
 import yaml
-from annotated_types import Ge, Gt
+from annotated_types import Gt
 from pydantic import BaseModel
 
 import tensorrt_llm
