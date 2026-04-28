@@ -695,7 +695,9 @@ class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoe
         skip_modules: Optional[List[str]] = None,
         allow_partial_loading: bool = False,
     ):
-        assert isinstance(weight_mapper, ExaoneMoeWeightMapper)
+        if weight_mapper is None:
+            weight_mapper = ExaoneMoeWeightMapper()
+        weight_mapper.init_model_and_config(self, self.model_config)
 
         if self.draft_model is not None:
             weight_mapper.preprocess_weights(weights)
