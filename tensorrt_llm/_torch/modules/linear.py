@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import enum
-import inspect
 import math
 import os
 from abc import ABC, abstractmethod
@@ -373,7 +372,8 @@ class LinearMethodBase(ABC):
             raise ValueError(f'unsupported weight mode: {weight_mode}')
 
         kargs = {}
-        if "allow_partial_loading" in inspect.getfullargspec(load_fn).args:
+        if isinstance(self, (UnquantizedLinearMethod,
+                             FP8BlockScalesLinearMethod, NVFP4LinearMethod)):
             kargs['allow_partial_loading'] = allow_partial_loading
         load_fn(module, weights, **kargs)
 
@@ -2951,6 +2951,12 @@ class Linear(nn.Module):
         assert self._weights_created
 
         weight_mode = self.weights_loading_config.weight_mode
+        if not isinstance(self.quant_method,
+                          (UnquantizedLinearMethod, FP8BlockScalesLinearMethod,
+                           NVFP4LinearMethod)):
+            assert allow_partial_loading is False, (
+                f"{type(self.quant_method).__name__} does not support "
+                "allow_partial_loading")
         self.quant_method.load_weights(
             self,
             weights,

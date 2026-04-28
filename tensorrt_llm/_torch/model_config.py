@@ -454,7 +454,7 @@ class ModelConfig(Generic[TConfig]):
             # Merge HF config's modules_to_not_convert with default exclude_modules
             if hf_exclude_modules is not None:
                 quant_config.exclude_modules = list(
-                    set(hf_exclude_modules + default_exclude))
+                    dict.fromkeys(hf_exclude_modules + default_exclude))
             else:
                 quant_config.exclude_modules = default_exclude
         return quant_config, layer_quant_config
