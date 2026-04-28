@@ -248,6 +248,11 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
 - name: nvidia/DeepSeek-V3.2-NVFP4
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
+# --- DeepSeek V4 (Apr 2026) ---
+- name: deepseek-ai/DeepSeek-V4-Flash-Base
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek-v4-flash-base.yaml']
+- name: deepseek-ai/DeepSeek-V4-Pro
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek-v4-pro.yaml']
 # --- GLM-4.6 (Sep 2025) ---
 - name: zai-org/GLM-4.6
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']

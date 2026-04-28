@@ -915,7 +915,10 @@ class FineGrainedFP8LinearQuantization(Quantization):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        excluded = qcfg.get("modules_to_not_convert", [])
+        excluded = list(qcfg.get("modules_to_not_convert") or [])
+        for pattern in qcfg.get("exclude_modules", []):
+            if pattern not in excluded:
+                excluded.append(pattern)
 
         cnt = 0
         with WeightBiasInfoCache():

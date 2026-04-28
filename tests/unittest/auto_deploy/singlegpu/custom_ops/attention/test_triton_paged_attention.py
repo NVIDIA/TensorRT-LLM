@@ -768,6 +768,193 @@ class TestSlidingWindow:
         torch.testing.assert_close(out_none, out_zero)
 
 
+class TestSinks:
+    """Tests for attention sink support in Triton paged kernels."""
+
+    @staticmethod
+    def _attention_with_sinks_reference(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        sm_scale: float,
+        sinks: torch.Tensor,
+        sliding_window: int | None = None,
+        causal: bool = False,
+    ) -> torch.Tensor:
+        """Compute attention where sinks affect only the softmax denominator."""
+        q = q.float()
+        k = k.float()
+        v = v.float()
+        attn = torch.matmul(q, k.transpose(-2, -1)) * sm_scale
+
+        s_q = q.shape[2]
+        s_k = k.shape[2]
+        q_pos = torch.arange(s_k - s_q, s_k, device=q.device)
+        k_pos = torch.arange(s_k, device=q.device)
+        pos_diff = q_pos.unsqueeze(1) - k_pos.unsqueeze(0)
+
+        if causal:
+            attn = attn.masked_fill(pos_diff.unsqueeze(0).unsqueeze(0) < 0, float("-inf"))
+        if sliding_window is not None and sliding_window > 0:
+            attn = attn.masked_fill(
+                (pos_diff >= sliding_window).unsqueeze(0).unsqueeze(0), float("-inf")
+            )
+
+        sinks = sinks.float().reshape(1, -1, 1, 1)
+        logits_max = torch.maximum(attn.max(dim=-1, keepdim=True).values, sinks)
+        unnormalized = torch.exp(attn - logits_max)
+        sink_weight = torch.exp(sinks - logits_max)
+        weights = unnormalized / (unnormalized.sum(dim=-1, keepdim=True) + sink_weight)
+        return torch.matmul(weights, v)
+
+    def test_decode_sinks_with_sliding_window(self):
+        """Decode sinks match reference and compose with sliding window masking."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            triton_paged_decode,
+            update_paged_kv_cache,
+        )
+
+        batch_size, n_heads, n_kv_heads, head_dim = 2, 8, 2, 64
+        seq_len, page_size, sliding_window = 96, 16, 32
+        num_pages_per_seq = (seq_len + page_size - 1) // page_size
+        num_blocks = batch_size * num_pages_per_seq + 5
+
+        q = torch.randn(batch_size, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(
+            batch_size, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+        v = torch.randn(
+            batch_size, seq_len, n_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+        )
+        sinks = torch.randn(n_heads, dtype=torch.float32, device="cuda")
+
+        batch_indices = torch.repeat_interleave(
+            torch.arange(batch_size, device="cuda", dtype=torch.int32), seq_len
+        )
+        positions = torch.tile(
+            torch.arange(seq_len, device="cuda", dtype=torch.int32), (batch_size,)
+        )
+        kv_indptr = torch.arange(
+            0,
+            (batch_size + 1) * num_pages_per_seq,
+            num_pages_per_seq,
+            dtype=torch.int32,
+            device="cuda",
+        )[: batch_size + 1]
+        kv_indices = torch.arange(
+            0, batch_size * num_pages_per_seq, dtype=torch.int32, device="cuda"
+        )
+        kv_last_page_len = torch.full((batch_size,), page_size, dtype=torch.int32, device="cuda")
+
+        kv_cache = create_paged_kv_cache(num_blocks, page_size, n_kv_heads, head_dim)
+        update_paged_kv_cache(
+            k.reshape(batch_size * seq_len, n_kv_heads, head_dim),
+            v.reshape(batch_size * seq_len, n_kv_heads, head_dim),
+            batch_indices,
+            positions,
+            kv_cache,
+            kv_indices,
+            kv_indptr,
+        )
+
+        sm_scale = 1.0 / math.sqrt(head_dim)
+        output = triton_paged_decode(
+            q,
+            kv_cache,
+            kv_indices,
+            kv_indptr,
+            kv_last_page_len,
+            sm_scale,
+            sliding_window=sliding_window,
+            sinks=sinks,
+        )
+
+        head_ratio = n_heads // n_kv_heads
+        k_ref = k[:, -sliding_window:].transpose(1, 2).repeat_interleave(head_ratio, dim=1)
+        v_ref = v[:, -sliding_window:].transpose(1, 2).repeat_interleave(head_ratio, dim=1)
+        ref = self._attention_with_sinks_reference(
+            q.unsqueeze(2), k_ref, v_ref, sm_scale, sinks
+        ).squeeze(2)
+
+        torch.testing.assert_close(output.float(), ref.float(), rtol=2e-2, atol=2e-2)
+
+    def test_context_sinks_with_sliding_window(self):
+        """Prefill sinks match reference and compose with causal sliding windows."""
+        from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+            triton_paged_context,
+            update_paged_kv_cache,
+        )
+
+        batch_size, n_heads, n_kv_heads, head_dim = 2, 8, 2, 64
+        seq_len, page_size, sliding_window = 64, 16, 32
+        total_tokens = batch_size * seq_len
+        num_pages_per_seq = (seq_len + page_size - 1) // page_size
+        num_blocks = batch_size * num_pages_per_seq + 5
+
+        q = torch.randn(total_tokens, n_heads, head_dim, dtype=torch.float16, device="cuda")
+        k = torch.randn(total_tokens, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        v = torch.randn(total_tokens, n_kv_heads, head_dim, dtype=torch.float16, device="cuda")
+        sinks = torch.randn(n_heads, dtype=torch.float32, device="cuda")
+
+        qo_indptr = torch.arange(
+            0, (batch_size + 1) * seq_len, seq_len, dtype=torch.int32, device="cuda"
+        )[: batch_size + 1]
+        kv_indptr = torch.arange(
+            0,
+            (batch_size + 1) * num_pages_per_seq,
+            num_pages_per_seq,
+            dtype=torch.int32,
+            device="cuda",
+        )[: batch_size + 1]
+        kv_indices = torch.arange(
+            0, batch_size * num_pages_per_seq, dtype=torch.int32, device="cuda"
+        )
+        kv_last_page_len = torch.full((batch_size,), page_size, dtype=torch.int32, device="cuda")
+        seq_len_with_cache = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cuda")
+        batch_indices = torch.repeat_interleave(
+            torch.arange(batch_size, device="cuda", dtype=torch.int32), seq_len
+        )
+        positions = torch.tile(
+            torch.arange(seq_len, device="cuda", dtype=torch.int32), (batch_size,)
+        )
+
+        kv_cache = create_paged_kv_cache(num_blocks, page_size, n_kv_heads, head_dim)
+        update_paged_kv_cache(k, v, batch_indices, positions, kv_cache, kv_indices, kv_indptr)
+
+        sm_scale = 1.0 / math.sqrt(head_dim)
+        output = triton_paged_context(
+            q,
+            kv_cache,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_len,
+            seq_len_with_cache,
+            sm_scale,
+            sliding_window=sliding_window,
+            sinks=sinks,
+        )
+
+        head_ratio = n_heads // n_kv_heads
+        q_ref = q.view(batch_size, seq_len, n_heads, head_dim).transpose(1, 2)
+        k_ref = (
+            k.view(batch_size, seq_len, n_kv_heads, head_dim)
+            .transpose(1, 2)
+            .repeat_interleave(head_ratio, dim=1)
+        )
+        v_ref = (
+            v.view(batch_size, seq_len, n_kv_heads, head_dim)
+            .transpose(1, 2)
+            .repeat_interleave(head_ratio, dim=1)
+        )
+        ref = self._attention_with_sinks_reference(
+            q_ref, k_ref, v_ref, sm_scale, sinks, sliding_window=sliding_window, causal=True
+        )
+        ref = ref.transpose(1, 2).reshape(total_tokens, n_heads, head_dim)
+
+        torch.testing.assert_close(output.float(), ref.float(), rtol=2e-2, atol=2e-2)
+
+
 class TestFlashInferComparison:
     """Tests comparing Triton implementation against FlashInfer."""
 

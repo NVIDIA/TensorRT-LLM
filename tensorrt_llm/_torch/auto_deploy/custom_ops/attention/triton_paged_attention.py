@@ -64,6 +64,25 @@ def _get_sm_scale(head_dim: int, scale: Optional[float]) -> float:
     return scale if scale is not None else 1.0 / math.sqrt(head_dim)
 
 
+def _flatten_sinks(
+    sinks: Optional[torch.Tensor], batch_size: int, n_heads: int
+) -> tuple[Optional[torch.Tensor], int, int]:
+    """Return sinks as a flat tensor plus batch/head strides."""
+    if sinks is None:
+        return None, 0, 0
+
+    sinks_flat = sinks if sinks.ndim == 1 else sinks.reshape(-1)
+    if sinks_flat.numel() == n_heads:
+        return sinks_flat, 0, 1
+    if sinks_flat.numel() == batch_size * n_heads:
+        return sinks_flat, n_heads, 1
+
+    raise ValueError(
+        f"Expected sinks to have {n_heads} or {batch_size * n_heads} values, "
+        f"got {sinks_flat.numel()}."
+    )
+
+
 @triton.jit
 def _update_paged_kv_cache_kernel(
     # Input K, V
@@ -404,6 +423,8 @@ def _flash_decode_stage2_kernel(
     partial_lse_ptr,
     # Final output
     o_ptr,
+    # Optional sinks
+    sinks_ptr,
     # Partial output strides: [batch, n_heads, num_splits, head_dim]
     po_stride_batch: tl.constexpr,
     po_stride_head: tl.constexpr,
@@ -418,6 +439,9 @@ def _flash_decode_stage2_kernel(
     # Constants
     HEAD_DIM: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
+    HAS_SINKS: tl.constexpr,
+    SINKS_STRIDE_BATCH: tl.constexpr,
+    SINKS_STRIDE_HEAD: tl.constexpr,
 ):
     """
     Each program combines results from all splits for one (batch, head) pair.
@@ -436,6 +460,11 @@ def _flash_decode_stage2_kernel(
         lse = tl.load(partial_lse_ptr + plse_offset)
         global_max_lse = tl.maximum(global_max_lse, lse)
 
+    sinks_val = 0.0
+    if HAS_SINKS:
+        sinks_val = tl.load(sinks_ptr + batch_id * SINKS_STRIDE_BATCH + head_id * SINKS_STRIDE_HEAD)
+        global_max_lse = tl.maximum(global_max_lse, sinks_val)
+
     # Guard: if all splits had -inf LSE (empty sequence), output zeros
     o_offset = batch_id * o_stride_batch + head_id * o_stride_head + dhead_offsets
     if global_max_lse == float("-inf"):
@@ -445,6 +474,8 @@ def _flash_decode_stage2_kernel(
     # Weighted combination: weight_i = exp(lse_i - global_max)
     acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
     total_weight = 0.0
+    if HAS_SINKS:
+        total_weight += tl.exp(sinks_val - global_max_lse)
 
     for split_id in range(NUM_SPLITS):
         plse_offset = (
@@ -474,6 +505,7 @@ def triton_paged_decode(
     sm_scale: float,
     sliding_window: Optional[int] = None,
     out: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Optimized paged decode with GQA batching + FlashDecoding + page-aligned iteration.
 
@@ -486,6 +518,8 @@ def triton_paged_decode(
         sm_scale: Softmax scale factor
         sliding_window: If set, only attend to the last sliding_window tokens
         out: Optional output tensor [batch_size, n_heads, head_dim]
+        sinks: Optional per-head sink logits. Sinks contribute to the softmax
+            denominator but have no value vectors.
 
     Returns:
         Output tensor [batch_size, n_heads, head_dim]
@@ -525,6 +559,7 @@ def triton_paged_decode(
         dtype=torch.float32,
         device=q.device,
     )
+    sinks_flat, sinks_stride_batch, sinks_stride_head = _flatten_sinks(sinks, batch_size, n_heads)
 
     # Stage 1: GQA-batched parallel KV processing
     _flash_decode_stage1_kernel[(batch_size, n_kv_heads, num_splits)](
@@ -568,6 +603,7 @@ def triton_paged_decode(
         partial_o,
         partial_lse,
         output,
+        sinks_flat if sinks_flat is not None else q,
         # Partial output strides
         partial_o.stride(0),
         partial_o.stride(1),
@@ -582,6 +618,9 @@ def triton_paged_decode(
         # Constants
         HEAD_DIM=head_dim,
         NUM_SPLITS=num_splits,
+        HAS_SINKS=sinks_flat is not None,
+        SINKS_STRIDE_BATCH=sinks_stride_batch,
+        SINKS_STRIDE_HEAD=sinks_stride_head,
     )
 
     return output
@@ -614,6 +653,8 @@ def _paged_context_kernel(
     seq_len_with_cache_ptr,
     # Output
     o_ptr,
+    # Optional sinks
+    sinks_ptr,
     # Strides
     q_stride_token: tl.constexpr,
     q_stride_head: tl.constexpr,
@@ -632,6 +673,9 @@ def _paged_context_kernel(
     HEAD_DIM: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     SLIDING_WINDOW: tl.constexpr = 0,
+    HAS_SINKS: tl.constexpr = False,
+    SINKS_STRIDE_BATCH: tl.constexpr = 0,
+    SINKS_STRIDE_HEAD: tl.constexpr = 0,
 ):
     """Context/prefill attention with paged KV cache, causal skip, and page-aligned iteration.
 
@@ -821,6 +865,14 @@ def _paged_context_kernel(
             l_i = l_i * alpha + tl.sum(p, axis=1)
             m_i = m_i_new
 
+    if HAS_SINKS:
+        sinks_val = tl.load(sinks_ptr + batch_id * SINKS_STRIDE_BATCH + head_id * SINKS_STRIDE_HEAD)
+        m_sinks = tl.maximum(m_i, sinks_val)
+        acc_scale = tl.exp(m_i - m_sinks)
+        acc = acc * acc_scale[:, None]
+        l_i = l_i * acc_scale + tl.exp(sinks_val - m_sinks)
+        m_i = m_sinks
+
     l_i = tl.where(l_i == 0.0, 1.0, l_i)
     o = acc / l_i[:, None]
     o_store_offsets = (
@@ -901,6 +953,7 @@ def triton_paged_context(
     sm_scale: float,
     sliding_window: Optional[int] = None,
     out: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Context/prefill attention with paged KV cache."""
     total_tokens, n_heads, head_dim = q.shape
@@ -911,6 +964,8 @@ def triton_paged_context(
 
     if num_seq == 0 or total_tokens == 0:
         return output
+
+    sinks_flat, sinks_stride_batch, sinks_stride_head = _flatten_sinks(sinks, num_seq, n_heads)
 
     # Compute max_q_len without GPU sync for single-sequence batches (most common
     # in serving). For multi-sequence batches, we must use .item() because
@@ -949,6 +1004,7 @@ def triton_paged_context(
         and max_pages > 0
         and pages_uniform
         and all_same_q_len
+        and sinks is None
         and sw == 0  # SDPA doesn't support sliding window natively
     )
 
@@ -1016,6 +1072,7 @@ def triton_paged_context(
             kv_last_page_len,
             seq_len_with_cache,
             output,
+            sinks_flat if sinks_flat is not None else q,
             q.stride(0),
             q.stride(1),
             output.stride(0),
@@ -1030,6 +1087,9 @@ def triton_paged_context(
             HEAD_DIM=head_dim,
             PAGE_SIZE=page_size,
             SLIDING_WINDOW=sw,
+            HAS_SINKS=sinks_flat is not None,
+            SINKS_STRIDE_BATCH=sinks_stride_batch,
+            SINKS_STRIDE_HEAD=sinks_stride_head,
         )
 
     return output
@@ -1096,6 +1156,7 @@ def triton_paged_mha_with_cache(
     # CONSTANTS
     scale: Optional[float],
     sliding_window: Optional[int] = None,
+    sinks: Optional[torch.Tensor] = None,
     # OPTIONAL PRE-ALLOCATED OUTPUT
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -1148,6 +1209,7 @@ def triton_paged_mha_with_cache(
             sm_scale,
             sliding_window=sliding_window,
             out=y[:num_prefill_tokens],
+            sinks=sinks,
         )
 
     # Process decode tokens if any
@@ -1161,6 +1223,7 @@ def triton_paged_mha_with_cache(
             sm_scale,
             sliding_window=sliding_window,
             out=y[num_prefill_tokens:num_total_tokens],
+            sinks=sinks,
         )
 
     if out is not None:
@@ -1194,6 +1257,7 @@ def triton_paged_mha_with_cache_fake(
     kv_cache: torch.Tensor,
     scale: Optional[float],
     sliding_window: Optional[int] = None,
+    sinks: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if out is not None:
@@ -1293,5 +1357,6 @@ class TritonPagedAttention(AttentionDescriptor):
             scale = None
 
         sliding_window = extract_op_args(source_attn_node, "sliding_window")[0]
+        sinks = extract_op_args(source_attn_node, "sinks")[0]
 
-        return [scale, sliding_window]
+        return [scale, sliding_window, sinks]

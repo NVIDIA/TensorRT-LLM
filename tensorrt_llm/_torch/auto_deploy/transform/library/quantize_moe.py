@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -112,6 +112,7 @@ def _quantize_moe_node(
     # These can be in args[6:] or in kwargs
     is_gated_mlp = True  # default
     act_fn = ActivationType.Silu  # default
+    swiglu_limit = 0.0
 
     if len(node.args) > 6:
         is_gated_mlp = node.args[6]
@@ -123,11 +124,20 @@ def _quantize_moe_node(
     elif "act_fn" in node.kwargs:
         act_fn = node.kwargs["act_fn"]
 
+    if len(node.args) > 8:
+        swiglu_limit = node.args[8]
+    elif "swiglu_limit" in node.kwargs:
+        swiglu_limit = node.kwargs["swiglu_limit"]
+
     # Prepare kwargs for the quantized op
     kwargs = {
         "is_gated_mlp": is_gated_mlp,
         "act_fn": act_fn,
+        "swiglu_limit": swiglu_limit,
     }
+    for name in ("mapping_config", "max_num_tokens", "apply_routing_on_input", "layer_type"):
+        if name in node.kwargs:
+            kwargs[name] = node.kwargs[name]
 
     # Replace the current node with the quantized version
     with gm.graph.inserting_after(node):

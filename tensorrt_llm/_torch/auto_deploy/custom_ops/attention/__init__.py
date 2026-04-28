@@ -24,6 +24,7 @@ This module provides various attention implementations and backends:
 - triton_attention_with_kv_cache: Triton attention with KV cache support
 - triton_paged_attention: Triton paged attention (two-stage flash-decode) with HND layout
 - onnx_attention: Placeholder ops for ONNX export of attention mechanisms
+- deepseek_v4_sparse_attention: DeepSeek-V4 sparse (compress_ratio != 0) attention op
 """
 
 __all__ = [
@@ -36,4 +37,5 @@ __all__ = [
     "triton_attention_with_paged_kv_cache",
     "triton_paged_attention",
     "onnx_attention",
+    "deepseek_v4_sparse_attention",
 ]
