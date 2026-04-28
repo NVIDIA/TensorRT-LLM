@@ -821,3 +821,288 @@ TEST(RadixBlockTreeTest, GetNextBlocksUnattachedReturnsEmpty)
     auto nextBlocks = block->getNextBlocks();
     EXPECT_TRUE(nextBlocks.empty());
 }
+
+// ===========================================================================
+// Group I: NVBugs 6104831 — cascade-prune assertion regression
+//
+// Background:
+//   Production failure (Dynamo 1P1D disagg deployment, TRT-LLM 1.3.0rc11)
+//   wedges with `templatedTrie.h:249  cascade prune: parent did not find
+//   this node as a child` on the prefill-worker call path
+//     KVCacheManager::addSequence
+//       -> WindowBlockManager::addSequence
+//         -> loadOrAllocateBlocks
+//           -> getFreeBlock
+//             -> KVCacheBlock::freeBlockAndAllDescendants
+//               -> detachDescendantsFromLookupTree.
+//
+// Trie-invariant fix:
+//   `KVCacheBlock::removeNextBlock(blockKey)` (kvCacheManager.cpp ~L437) maps
+//   to `mLookupNode->clearNode(blockKey)`, which erases the child entry from
+//   the parent's `mNextNodes` map. The erased child node's `mPrevNode` weak
+//   back-pointer must also be detached; otherwise, if the child block (or any
+//   of its descendants) is later detached from its lookup node and becomes
+//   empty, cascade-prune calls `parent->clearNode(child.mKey)` on the parent
+//   that no longer holds the entry — firing the assertion.
+//
+//   The only production caller of `removeNextBlock` is
+//   `WindowBlockManager::storeBlocks` (kvCacheManager.cpp ~L2290), which uses
+//   the pattern
+//     block->getPrevBlock()->removeNextBlock(block->getBlockKey());  // (1)
+//     ... // setBlockKey / setPrevBlockInSeq
+//     searchRoot->addNextBlock(blockKey, block);                     // (2)
+//   Step (2) calls `attachToLookupNode` on the new child node, which first
+//   does `oldLookupNode->clearValue(W)` on the orphaned old node. If the old
+//   node has no remaining values or children, the cascade fires the
+//   assertion.
+//
+// The four tests below isolate the regression at three layers:
+//   30. Minimal direct repro (one block, no descendants).
+//   31. Same root cause through `freeBlockAndAllDescendants`, matching the
+//       bug-report stack trace literally.
+//   32. Production storeBlocks-style re-keying via removeNextBlock +
+//       addNextBlock.
+//   33. Stress loop on prefix-overlapping sequences mirroring the disagg
+//       insert/evict workload.
+//
+// These tests are regression nets for the fixed behavior: orphaned child
+// subtrees become cascade-prune roots, so detach/re-key/eviction paths must not
+// throw the cascade-prune assertion.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 30. Minimal direct regression for the cascade-prune assertion.
+//
+// Setup:
+//   root.lookupNode -> nodeA (keyed by keyA, value at W = blockA)
+//
+// Trigger:
+//   root->removeNextBlock(keyA)  // (1) erases keyA from root.mNextNodes
+//                                //     and detaches nodeA.mPrevNode.
+//   blockA->detachFromLookupNode()
+//      -> nodeA.clearValue(W)   // (2) nodeA becomes empty (no value, no
+//                               //     children) but now behaves as a root,
+//                               //     so cascade-prune stops there.
+// ---------------------------------------------------------------------------
+
+TEST(RadixBlockTreeTest, Regression_NVBugs6104831_DetachOrphanedBlockDoesNotFireAssertion)
+{
+    constexpr int kWindowSize = 64;
+    auto [root, tree] = makeRootedTree(kWindowSize);
+
+    auto blockA = makeBlock(0);
+    BlockKey keyA = makeKey({1, 2, 3});
+    root->addNextBlock(keyA, blockA);
+
+    ASSERT_EQ(tree->countNumberOfNodes(), 1);
+    ASSERT_TRUE(blockA->isShared());
+
+    // (1) Orphan blockA's lookup node from the trie root.
+    root->removeNextBlock(keyA);
+
+    // The trie root no longer references blockA's node, but blockA still
+    // owns the detached lookup node.
+    EXPECT_EQ(tree->countNumberOfNodes(), 0);
+    EXPECT_TRUE(blockA->isShared()); // blockA still owns its (now-orphaned) lookup node
+    EXPECT_EQ(blockA->getPrevBlock(), nullptr);
+
+    // (2) Detaching blockA must stop cascade-prune at the detached node instead
+    //     of walking back to the old root.
+    EXPECT_NO_THROW(blockA->detachFromLookupNode());
+    EXPECT_FALSE(blockA->isShared());
+    EXPECT_EQ(tree->countNumberOfNodes(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// 31. Same root cause via the bug-report call path
+//     `freeBlockAndAllDescendants -> detachDescendantsFromLookupTree`.
+//
+// Setup:
+//   root.lookupNode -> nodeA (value blockA) -> nodeB (value blockB)
+//
+// Trigger:
+//   root->removeNextBlock(keyA)  // orphan A; B is still A's child
+//   blockA->freeBlockAndAllDescendants()
+//      -> detachDescendantsFromLookupTree() // detaches B; cascade stops at A
+//                                           // (A still owns blockA's value)
+//      -> detachFromLookupNode()            // removes A's value -> A is now
+//                                           // empty, but A behaves as a root
+//                                           // and cascade-prune stops there.
+// ---------------------------------------------------------------------------
+
+TEST(RadixBlockTreeTest, Regression_NVBugs6104831_FreeBlockAndAllDescendantsOnOrphanedSubtreeDoesNotFireAssertion)
+{
+    constexpr int kWindowSize = 64;
+    auto [root, tree] = makeRootedTree(kWindowSize);
+
+    auto blockA = makeBlock(0);
+    auto blockB = makeBlock(1);
+    BlockKey keyA = makeKey({1, 2, 3});
+    BlockKey keyB = makeKey({4, 5, 6});
+
+    root->addNextBlock(keyA, blockA);
+    blockA->addNextBlock(keyB, blockB);
+    ASSERT_EQ(tree->countNumberOfNodes(), 2);
+
+    // Orphan blockA's subtree from root (this is what storeBlocks line ~2290
+    // does when re-keying a block whose previous-block is the eviction
+    // policy's claimed block).
+    root->removeNextBlock(keyA);
+
+    // The trie root no longer reaches A or B, but blockA/blockB still own
+    // their lookup nodes via mLookupNode shared_ptrs. The full chain
+    // root.lookupNode <- nodeA <- nodeB is alive but disconnected from root.
+    EXPECT_EQ(tree->countNumberOfNodes(), 0);
+    EXPECT_TRUE(blockA->isShared());
+    EXPECT_TRUE(blockB->isShared());
+    EXPECT_EQ(blockA->getPrevBlock(), nullptr);
+
+    // Mirror the production stack trace verbatim.
+    EXPECT_NO_THROW(blockA->freeBlockAndAllDescendants());
+    EXPECT_FALSE(blockA->isShared());
+    EXPECT_FALSE(blockB->isShared());
+    EXPECT_EQ(tree->countNumberOfNodes(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// 32. Reproduce the exact `WindowBlockManager::storeBlocks` re-keying pattern
+//     (kvCacheManager.cpp ~L2290-L2296):
+//
+//       if (block->getPrevBlock() != nullptr) {
+//           block->getPrevBlock()->removeNextBlock(block->getBlockKey()); // (a)
+//       }
+//       block->setBlockKey(newKey, ...);                                  // (b)
+//       block->setPrevBlockInSeq(searchRoot);
+//       searchRoot->addNextBlock(newKey, block);                          // (c)
+//
+// Step (a) orphans blockA's lookup node from its previous block (P) and
+// detaches the old lookup node's parent pointer. Step (c) re-attaches blockA
+// under a different parent. attachToLookupNode first does
+// `oldLookupNode->clearValue(W)` on the orphaned node; cascade-prune must stop
+// there instead of walking back to P.
+// ---------------------------------------------------------------------------
+
+TEST(RadixBlockTreeTest, Regression_NVBugs6104831_StoreBlocksRekeyDoesNotTriggerAssertion)
+{
+    constexpr int kWindowSize = 64;
+    auto [root, tree] = makeRootedTree(kWindowSize);
+
+    // Build a chain: root -> P -> A. P plays the role of `block->getPrevBlock()`,
+    // A plays the role of `block` in the storeBlocks loop.
+    auto blockP = makeBlock(0);
+    auto blockA = makeBlock(1);
+    BlockKey keyP = makeKey({1, 2, 3});
+    BlockKey keyA_old = makeKey({4, 5, 6});
+    BlockKey keyA_new = makeKey({7, 8, 9});
+
+    root->addNextBlock(keyP, blockP);
+    blockP->addNextBlock(keyA_old, blockA);
+    blockA->setBlockKey(keyA_old, /*isFull=*/true);
+    ASSERT_EQ(tree->countNumberOfNodes(), 2);
+    ASSERT_EQ(blockA->getPrevBlock(), blockP);
+
+    // Sanity: the storeBlocks pattern looks up `block->getPrevBlock()` and
+    // calls `removeNextBlock(block->getBlockKey())`.
+    auto prev = blockA->getPrevBlock();
+    ASSERT_NE(prev, nullptr);
+
+    // (a) orphan blockA's lookup node from blockP.
+    prev->removeNextBlock(blockA->getBlockKey());
+    ASSERT_EQ(blockA->getPrevBlock(), nullptr);
+    EXPECT_EQ(tree->countNumberOfNodes(), 1);
+
+    // (b) re-key blockA. setBlockKey only updates the in-block field; it
+    //     does not move blockA in the lookup tree.
+    blockA->setBlockKey(keyA_new, /*isFull=*/true);
+
+    // (c) re-attach blockA under root with the new key.
+    EXPECT_NO_THROW(root->addNextBlock(keyA_new, blockA));
+    EXPECT_EQ(blockA->getPrevBlock(), root);
+    EXPECT_EQ(tree->countNumberOfNodes(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// 33. Stress mirror of the disagg workload.
+//
+// Pattern (per the bug report's loadgen):
+//   - One shared "system prompt" prefix.
+//   - Many short user prefixes branching off the shared prefix (concurrency
+//     16/48/128 in the repro).
+//   - Each request is finalized with a storeBlocks-style re-key pass.
+//   - Blocks are then evicted/reused for the next burst.
+//
+// The loop below builds prefix-overlapping sequences, runs the storeBlocks
+// re-key step on each, and on a subset also calls
+// `freeBlockAndAllDescendants` to mimic the eviction path. The sequences
+// share a 2-block "system" prefix and have a 1-block per-request suffix.
+//
+// Every run-through of either re-key or eviction must complete without
+// throwing the cascade-prune assertion.
+// ---------------------------------------------------------------------------
+
+TEST(RadixBlockTreeTest, Regression_NVBugs6104831_StressPrefixOverlappingInsertEvictReuseLoop)
+{
+    constexpr int kWindowSize = 64;
+    constexpr int kNumIterations = 16;
+
+    auto [root, tree] = makeRootedTree(kWindowSize);
+
+    // Shared system-prompt blocks (kept alive across iterations to mimic the
+    // pinned reusable prefix).
+    auto sysBlock0 = makeBlock(1000);
+    auto sysBlock1 = makeBlock(1001);
+    BlockKey sysKey0 = makeKey({1, 2, 3});
+    BlockKey sysKey1 = makeKey({4, 5, 6});
+    root->addNextBlock(sysKey0, sysBlock0);
+    sysBlock0->addNextBlock(sysKey1, sysBlock1);
+
+    int blockIdCounter = 0;
+
+    // Each iteration:
+    //   1. Allocate a leaf "user-suffix" block under sysBlock1, record its
+    //      key in suffix->mBlockKey (mirrors how the production allocation
+    //      path leaves blocks with mBlockKey set).
+    //   2. Re-key the suffix via the storeBlocks pattern (removeNextBlock +
+    //      addNextBlock with a different key under sysBlock0). This is the
+    //      same shape as production: take the block out of one parent's
+    //      mNextNodes, then re-attach it elsewhere.
+    //   3. Every fourth iteration, call freeBlockAndAllDescendants on a
+    //      previously-retained block to mirror the getFreeBlock eviction
+    //      path.
+    std::vector<BlockPtr> retained;
+    for (int it = 0; it < kNumIterations; ++it)
+    {
+        auto suffix = makeBlock(blockIdCounter++);
+        BlockKey suffixOldKey = makeKey({100 + it, 200 + it, 300 + it});
+        BlockKey suffixNewKey = makeKey({400 + it, 500 + it, 600 + it});
+
+        sysBlock1->addNextBlock(suffixOldKey, suffix);
+        // Production allocation paths leave block.mBlockKey set to the
+        // current trie key. Mirror that here: addNextBlock places the
+        // block under suffixOldKey but does not touch suffix->mBlockKey,
+        // so we set it explicitly before the storeBlocks re-key step
+        // reads block->getBlockKey().
+        suffix->setBlockKey(suffixOldKey, /*isFull=*/true);
+        ASSERT_EQ(suffix->getPrevBlock(), sysBlock1);
+
+        // storeBlocks-style re-key: remove from old parent then add to a
+        // different parent under a new key. This mirrors
+        // WindowBlockManager::storeBlocks ~L2290-L2296 verbatim.
+        EXPECT_NO_THROW(suffix->getPrevBlock()->removeNextBlock(suffix->getBlockKey()));
+        EXPECT_EQ(suffix->getPrevBlock(), nullptr);
+        suffix->setBlockKey(suffixNewKey, /*isFull=*/true);
+        EXPECT_NO_THROW(sysBlock0->addNextBlock(suffixNewKey, suffix));
+
+        retained.push_back(suffix);
+
+        if ((it % 4) == 3 && !retained.empty())
+        {
+            // Evict the oldest retained block via the same path the
+            // production code uses (getFreeBlock -> freeChildren ->
+            // freeBlockAndAllDescendants).
+            auto victim = retained.front();
+            retained.erase(retained.begin());
+            EXPECT_NO_THROW(victim->freeBlockAndAllDescendants());
+        }
+    }
+}
