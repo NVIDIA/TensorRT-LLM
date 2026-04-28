@@ -523,9 +523,12 @@ class TestTwoStageLoRAHelpers:
         delta = torch.randn(64, 64, device=device) * 0.01
         deltas = {"weight": delta}
 
-        applied, saved_state = _apply_lora_deltas(linear, deltas, sign=1.0)
+        applied, saved_state, snapshot_required = _apply_lora_deltas(
+            linear, deltas, sign=1.0
+        )
         assert applied == 1, "Expected one parameter to be modified"
         assert saved_state == {}, "Dense BF16 weights should not be snapshotted"
+        assert snapshot_required == 0
         assert not torch.allclose(linear.weight.data, original_weight), (
             "Weights should have changed after applying delta"
         )
@@ -546,8 +549,9 @@ class TestTwoStageLoRAHelpers:
         original_weight = linear.weight.data.clone()
 
         deltas = {"nonexistent_param.weight": torch.randn(8, 8, device=device)}
-        applied, _ = _apply_lora_deltas(linear, deltas, sign=1.0)
+        applied, _, snapshot_required = _apply_lora_deltas(linear, deltas, sign=1.0)
         assert applied == 0
+        assert snapshot_required == 0
         assert torch.allclose(linear.weight.data, original_weight)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -565,8 +569,11 @@ class TestTwoStageLoRAHelpers:
         deltas = {"weight": torch.randn(64, 64, device=device) * 0.01}
         rounds = 10
         for _ in range(rounds):
-            _, saved_state = _apply_lora_deltas(model, deltas, sign=1.0)
+            _, saved_state, snapshot_required = _apply_lora_deltas(
+                model, deltas, sign=1.0
+            )
             assert saved_state == {}, "Dense BF16 weights should not be snapshotted"
+            assert snapshot_required == 0
             _subtract_dense_lora_deltas(model, deltas, saved_state)
 
         drift = (model.weight.data.float() - original.float()).abs().max().item()
@@ -585,9 +592,12 @@ class TestTwoStageLoRAHelpers:
         original_weight = linear.weight.data.clone()
 
         deltas = {"weight": torch.randn(32, 32, device=device) * 0.1}
-        _, saved_state = _apply_lora_deltas(linear, deltas, sign=1.0)
+        _, saved_state, snapshot_required = _apply_lora_deltas(
+            linear, deltas, sign=1.0
+        )
 
         assert saved_state == {}, "Dense FP32 weights should not be snapshotted"
+        assert snapshot_required == 0
         assert not torch.allclose(linear.weight.data, original_weight)
 
         removed = _subtract_dense_lora_deltas(linear, deltas, saved_state)
@@ -963,7 +973,7 @@ class TestLTX2TwoStagePipelineLoading:
 
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         try:
-            applied, saved_state = _apply_lora_deltas(
+            applied, saved_state, snapshot_required = _apply_lora_deltas(
                 pipeline.transformer,
                 pipeline._distilled_lora_deltas,
                 sign=1.0,
@@ -975,6 +985,7 @@ class TestLTX2TwoStagePipelineLoading:
             assert match_rate > 99.0, f"Expected >99% LoRA match rate, got {match_rate:.1f}%"
 
             assert saved_state == {}, "BF16 checkpoint should not snapshot dense weights"
+            assert snapshot_required == 0
 
             # Verify dense unmerge by subtraction
             removed = _subtract_dense_lora_deltas(
