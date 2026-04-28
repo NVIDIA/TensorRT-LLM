@@ -985,15 +985,9 @@ class FineGrainedFP8LinearQuantization(Quantization):
             )
 
         with torch.no_grad():
-            scale_data = scale_param.data.float()
-
-            expected_block_n = math.ceil(N / 128)
-            if scale_n > expected_block_n:
-                # TP sharding expanded block scales to per-row; reduce back
-                # to per-block by sampling one row per 128-row block.
-                scale_data = scale_data[..., ::128, :]
-
-            weight_new, scale_new = resmooth_to_fp8_e8m0(weight_param.data, scale_data)
+            weight_new, scale_new = resmooth_to_fp8_e8m0(
+                weight_param.data, scale_param.data.float()
+            )
 
             N, K = weight_new.shape[-2], weight_new.shape[-1]
             transformed_scale = transform_sf_into_required_layout(
