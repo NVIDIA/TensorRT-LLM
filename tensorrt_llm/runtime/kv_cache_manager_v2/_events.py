@@ -12,6 +12,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""KV cache event manager for KVCacheManagerV2.
+
+This module mirrors the external v1 event contract while using v2 mutation
+hooks as the event source:
+
+- ``Created``, ``Stored``, ``Removed``, and ``Updated(cache_level)`` use
+  dataclass names that the existing ``KVCacheEventSerializer`` recognizes.
+- Removed events are coalesced per window and flushed before the next Stored
+  event for the same window.
+- Blocks are tracked per ``(window_size, block_key)`` so a single v2 radix
+  block can produce independent full-attention and sliding-window event
+  streams.
+- ``flush_iteration_events()`` drains the per-iteration queue and, when
+  attention DP is enabled, synchronously gathers events through an injected
+  gather function.  It intentionally avoids a background Python collective on
+  the model communicator.
+"""
 
 from collections import deque
 from dataclasses import dataclass, field
@@ -203,6 +220,7 @@ class KVCacheEventManager:
                 self._mark_unknown_in_window(key, resolved_window_size)
                 self._block_life_cycle_levels.pop((resolved_window_size, key), None)
                 self._block_logical_levels.pop((resolved_window_size, key), None)
+                self._drop_block_cache_if_unknown(key)
 
     def on_block_updated(
         self,
@@ -453,6 +471,12 @@ class KVCacheEventManager:
         windows.discard(window_size)
         if not windows:
             self._known_block_windows.pop(key, None)
+
+    def _drop_block_cache_if_unknown(self, key: bytes) -> None:
+        if key in self._known_block_windows:
+            return
+        self._block_hash_by_key.pop(key, None)
+        self._v1_hash_compatible_keys.discard(key)
 
     @staticmethod
     def _hash_block_key(

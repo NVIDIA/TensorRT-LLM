@@ -14,7 +14,10 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
+
+import pytest
 
 from tensorrt_llm._utils import KVCacheEventSerializer
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -38,8 +41,13 @@ class _Page:
     priority: int = 35
 
 
+Token = int | bytes
+
+
 class _Block:
-    def __init__(self, key: bytes, tokens: list[int], prev: _Root | "_Block", storage: list[_Page]):
+    def __init__(
+        self, key: bytes, tokens: list[Token], prev: _Root | "_Block", storage: list[_Page]
+    ):
         self.key = key
         self.tokens = tokens
         self.prev = prev
@@ -47,11 +55,44 @@ class _Block:
 
 
 def _block(
-    byte: int, tokens: list[int], prev: _Root | _Block, cache_levels: list[int] | None = None
+    byte: int, tokens: list[Token], prev: _Root | _Block, cache_levels: list[int] | None = None
 ) -> _Block:
     return _Block(
         bytes([byte]) * 32, tokens, prev, [_Page(level) for level in (cache_levels or [0, 0])]
     )
+
+
+def test_v2_event_manager_requires_positive_buffer_size():
+    with pytest.raises(ValueError, match="max_kv_event_entries"):
+        KVCacheEventManager(0)
+
+
+def test_v2_default_window_size_resolves_unspecified_window():
+    event_manager = KVCacheEventManager(1024, default_window_size=4096)
+
+    event_manager.enqueue_created_event([8, 2])
+    event_manager.flush()
+
+    events = event_manager.get_latest_events()
+    assert len(events) == 1
+    assert events[0].window_size == 4096
+
+
+def test_v2_get_latest_events_blocks_until_event_arrives():
+    event_manager = KVCacheEventManager(1024)
+    received = []
+
+    def reader():
+        received.extend(event_manager.get_latest_events(timeout_ms=2000))
+
+    thread = threading.Thread(target=reader)
+    thread.start()
+    event_manager.enqueue_created_event([1])
+    event_manager.flush()
+    thread.join(timeout=3)
+
+    assert not thread.is_alive()
+    assert len(received) == 1
 
 
 def test_v2_events_serialize_with_v1_type_names():
@@ -113,6 +154,21 @@ def test_v2_text_block_hash_matches_v1_algorithm():
 
     assert stored.blocks[0].block_hash == 944812140882783
     assert stored.blocks[1].block_hash == 12460730416951841444
+
+
+def test_v2_bytes_token_uses_token_extra_id():
+    event_manager = KVCacheEventManager(1024)
+    root = _Root(b"root")
+    digest = b"\x01\x02\x03\x04\x05\x06\x07\x08\x09"
+    block = _block(1, [digest], root, cache_levels=[0])
+
+    event_manager.on_blocks_stored([block])
+    event_manager.flush()
+
+    stored = event_manager.get_latest_events()[0].data
+    token = stored.blocks[0].tokens[0]
+    assert token.token_id == 0
+    assert token.token_extra_id == int.from_bytes(digest[:8], "little")
 
 
 def test_v2_removed_events_are_coalesced():
@@ -234,6 +290,23 @@ def test_v2_event_buffer_drops_oldest_events():
     assert [event.event_id for event in events] == [1, 2]
 
 
+def test_v2_event_ids_are_monotonic():
+    event_manager = KVCacheEventManager(1024)
+    root = _Root(b"root")
+    old_block = _block(1, [1, 2, 3, 4], root)
+    new_block = _block(2, [5, 6, 7, 8], root)
+
+    event_manager.enqueue_created_event([1])
+    event_manager.on_blocks_stored([old_block])
+    event_manager.on_block_removed(old_block)
+    event_manager.on_blocks_stored([new_block])
+    event_manager.flush()
+
+    event_ids = [event.event_id for event in event_manager.get_latest_events()]
+    assert event_ids == sorted(event_ids)
+    assert len(set(event_ids)) == len(event_ids)
+
+
 def test_v2_cache_level_updates_are_logical_block_events():
     event_manager = KVCacheEventManager(1024)
     root = _Root(b"root")
@@ -285,6 +358,24 @@ def test_v2_cache_level_updates_use_lifecycle_window():
     assert type(events[0].data).__name__ == "KVCacheUpdatedData"
     assert events[0].data.cache_level.old_value == 0
     assert events[0].data.cache_level.new_value == 1
+
+
+def test_v2_block_hash_cache_drops_after_last_known_window_removed():
+    event_manager = KVCacheEventManager(1024, default_window_size=16)
+    event_manager.set_life_cycle_window_sizes({0: None, 1: 8})
+    root = _Root(b"root")
+    block = _block(1, [1, 2, 3, 4], root)
+    key = bytes(block.key)
+
+    event_manager.on_blocks_stored([block])
+    assert key in event_manager._block_hash_by_key
+
+    event_manager.on_block_removed(block, life_cycle=LifeCycleId(0))
+    assert key in event_manager._block_hash_by_key
+
+    event_manager.on_block_removed(block, life_cycle=LifeCycleId(1))
+    assert key not in event_manager._block_hash_by_key
+    assert key not in event_manager._v1_hash_compatible_keys
 
 
 def test_v2_attention_dp_flush_gathers_events_to_rank_zero():
