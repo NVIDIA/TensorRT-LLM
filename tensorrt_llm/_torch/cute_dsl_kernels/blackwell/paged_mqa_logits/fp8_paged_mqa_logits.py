@@ -62,7 +62,6 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
-import torch
 from cutlass import Float16, Int32
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, nvvm, vector
@@ -1707,60 +1706,3 @@ class FP8MQALogitsKernel:
 
         else:
             cute.arch.warpgroup_reg_dealloc(24)
-
-
-def cdiv(a, b):
-    return (a + b - 1) // b
-
-
-def compute_schedule_metadata(context_lens, block_kv, num_ctas):
-    """Compute schedule metadata: [num_ctas+1, 2] int32.
-
-    Each row stores (q_idx, kv_idx / kNumMathWarpGroups) marking CTA boundaries.
-    Metadata format:
-      - schedule[i] = start boundary for CTA i
-      - schedule[i+1] = end boundary for CTA i (= start of CTA i+1)
-      - schedule[num_ctas] = past-the-end sentinel (batch_size, 0)
-
-    The kernel multiplies the second column by kNumMathWarpGroups (=2) to get
-    the actual kv_idx in units of KV blocks.
-    """
-    batch_size = context_lens.shape[0]
-    splits_per_seq = []
-    total_splits = 0
-    for b in range(batch_size):
-        ctx = context_lens[b].item()
-        num_kv = cdiv(ctx, block_kv)
-        ns = cdiv(num_kv, 2)
-        splits_per_seq.append(ns)
-        total_splits += ns
-
-    # Balanced distribution
-    q_div = total_splits // num_ctas
-    r_mod = total_splits % num_ctas
-
-    schedule = torch.zeros((num_ctas + 1, 2), dtype=torch.int32)
-
-    # For each CTA boundary, find (q_idx, kv_half_idx)
-    cum = 0
-    seq_idx = 0
-    seq_offset = 0
-    for i in range(num_ctas + 1):
-        target = i * q_div + min(i, r_mod)
-        while seq_idx < batch_size and cum + (splits_per_seq[seq_idx] - seq_offset) <= target:
-            cum += splits_per_seq[seq_idx] - seq_offset
-            seq_idx += 1
-            seq_offset = 0
-            if seq_idx >= batch_size:
-                break
-        if seq_idx >= batch_size:
-            # Past-the-end: (batch_size, 0) — matches DeepGEMM's end sentinel.
-            # When the scheduler wraps past the last batch, it reaches
-            # (batch_size, 0), and the end check (q==end_q and kv==end_kv)
-            # correctly terminates.
-            schedule[i] = torch.tensor([batch_size, 0], dtype=torch.int32)
-        else:
-            local_split = target - cum + seq_offset
-            schedule[i] = torch.tensor([seq_idx, local_split], dtype=torch.int32)
-
-    return schedule

@@ -19,22 +19,12 @@ Test CuTe DSL fp8_paged_mqa_logits kernel against C++ DeepGEMM reference.
 import pytest
 import torch
 
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._utils import get_sm_version
 
 skip_not_sm100 = pytest.mark.skipif(
     get_sm_version() not in (100, 103),
     reason=f"CuTe DSL FP8 Paged MQA Logits only supports SM 100/103, got SM {get_sm_version()}",
 )
-
-
-def has_deep_gemm():
-    try:
-        from tensorrt_llm import deep_gemm
-
-        return deep_gemm is not None
-    except Exception:
-        return False
 
 
 def _ceil_to_ue8m0(x: torch.Tensor):
@@ -229,11 +219,6 @@ def _generate_test_data(
     }
 
 
-skip_if_unsupported = pytest.mark.skipif(
-    not (has_deep_gemm() and IS_CUTLASS_DSL_AVAILABLE), reason="Requires DeepGEMM and CuTe DSL"
-)
-
-
 @skip_not_sm100
 @pytest.mark.parametrize("batch_size", [1, 4, 32])
 @pytest.mark.parametrize("next_n", [1, 2, 3, 4])
@@ -244,10 +229,8 @@ skip_if_unsupported = pytest.mark.skipif(
 def test_cute_dsl_fp8_paged_mqa_logits(
     batch_size, next_n, num_heads, avg_ctx, output_dtype, fix_length
 ):
-    """Compare CuTe DSL kernel output against reference.
+    """Compare CuTe DSL kernel output against a pure PyTorch reference.
 
-    Uses C++ DeepGEMM as reference when available (next_n in {1,2,4}),
-    falls back to pure PyTorch reference otherwise (e.g. next_n=3).
     Tests both fp32 and fp16 epi/acc/output paths.
     """
     head_dim = 128
