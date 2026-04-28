@@ -48,7 +48,7 @@ def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None):
         PoolView(pool_idx=pi, buffer_entries=buffer_entries) for pi in range(len(pool_ptrs))
     ]
     physical_pools = [
-        PhysicalPool(base_address=ptr, slot_bytes=bs, num_slots=128)
+        PhysicalPool(base_address=ptr, slot_stride=bs, data_bytes=bs, num_slots=128)
         for ptr, bs in zip(pool_ptrs, block_bytes)
     ]
 
@@ -62,8 +62,12 @@ def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None):
     mamba_lg = MambaLayerGroup(
         pool_group_idx=1,
         mamba_layer_offsets={100: 0, 101: 1},
-        conv_states=PhysicalPool(base_address=0xA000, slot_bytes=2048, num_slots=128),
-        ssm_states=PhysicalPool(base_address=0xB000, slot_bytes=4096, num_slots=128),
+        conv_states=PhysicalPool(
+            base_address=0xA000, slot_stride=2048, data_bytes=2048, num_slots=128
+        ),
+        ssm_states=PhysicalPool(
+            base_address=0xB000, slot_stride=4096, data_bytes=4096, num_slots=128
+        ),
         conv_section_bytes=[512, 256, 256],
         ssm_bytes_per_head=64,
     )

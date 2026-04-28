@@ -255,8 +255,8 @@ class PeerRegistrar:
             peer_layer_offset=peer_layer_offset,
             self_pool_num_layers=self_num_layers,
             peer_pool_num_layers=peer_num_layers,
-            self_pool_slot_bytes=self_phys.slot_bytes,
-            peer_pool_slot_bytes=peer_phys.slot_bytes,
+            self_pool_slot_bytes=self_phys.slot_stride,
+            peer_pool_slot_bytes=peer_phys.slot_stride,
         )
 
         self._kv_map_cache[cache_key] = mapper

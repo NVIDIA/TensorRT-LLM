@@ -23,18 +23,20 @@ def _make_buffer_entries():
 
 
 def test_physical_pool_construction():
-    pool = PhysicalPool(base_address=0x10000, slot_bytes=256, num_slots=4)
+    pool = PhysicalPool(base_address=0x10000, slot_stride=256, data_bytes=256, num_slots=4)
     assert pool.base_address == 0x10000
-    assert pool.slot_bytes == 256
+    assert pool.slot_stride == 256
+    assert pool.data_bytes == 256
     assert pool.num_slots == 4
 
 
 def test_physical_pool_roundtrip():
-    pool = PhysicalPool(base_address=0x10000, slot_bytes=256, num_slots=4)
+    pool = PhysicalPool(base_address=0x10000, slot_stride=256, data_bytes=256, num_slots=4)
     d = pool.to_dict()
     restored = PhysicalPool.from_dict(d)
     assert restored.base_address == pool.base_address
-    assert restored.slot_bytes == pool.slot_bytes
+    assert restored.slot_stride == pool.slot_stride
+    assert restored.data_bytes == pool.data_bytes
     assert restored.num_slots == pool.num_slots
 
 
@@ -90,7 +92,9 @@ def test_kv_cache_page_table_roundtrip():
         ],
         pool_groups=[
             PhysicalPoolGroup(
-                pools=[PhysicalPool(base_address=0x10000, slot_bytes=256, num_slots=4)]
+                pools=[
+                    PhysicalPool(base_address=0x10000, slot_stride=256, data_bytes=256, num_slots=4)
+                ]
             )
         ],
     )
