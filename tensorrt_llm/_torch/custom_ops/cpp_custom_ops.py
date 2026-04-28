@@ -127,7 +127,8 @@ def _register_fake():
         scale_b: torch.Tensor,
         bias,
         out_dtype,
-        userbuffers_id=False,
+        output_buffer_kind: int = 0,
+        group: Optional[List[int]] = None,
     ):
         shape = [i for i in mat_a.shape]
         shape[-1] = mat_b.shape[-1]
@@ -142,7 +143,8 @@ def _register_fake():
         scale_b: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
         out_dtype: Optional[torch.dtype] = None,
-        userbuffers_id: bool = False,
+        output_buffer_kind: int = 0,
+        group: Optional[List[int]] = None,
     ):
         shape = [i for i in mat_a.shape]
         shape[-1] = mat_b.shape[-1]
@@ -150,7 +152,12 @@ def _register_fake():
         return ret
 
     @torch.library.register_fake("trtllm::cublas_mm")
-    def _(mat_a, mat_b, bias, out_dtype):
+    def _(mat_a,
+          mat_b,
+          bias,
+          out_dtype,
+          output_buffer_kind: int = 0,
+          group: Optional[List[int]] = None):
         shape = list(mat_a.shape)
         shape[-1] = mat_b.shape[-1]
         ret = mat_a.new_empty(
@@ -1019,7 +1026,8 @@ def _register_fake():
           alpha: torch.Tensor,
           bias: Optional[torch.Tensor],
           out_dtype: Optional[torch.dtype],
-          to_userbuffers: bool = False):
+          output_buffer_kind: int = 0,
+          group: Optional[List[int]] = None):
         # mat_a: [M, K/2], mat_b: [N, K/2]
         # Output should be [M, N] with dtype=out_dtype
         m = mat_a.shape[0]
@@ -1156,3 +1164,13 @@ def _register_fake():
         k_fp8 = k_cache.new_empty([num_tokens, 128], dtype=torch.float8_e4m3fn)
         k_scale = k_cache.new_empty([num_tokens, 1], dtype=torch.float32)
         return k_fp8, k_scale
+
+    @torch.library.register_fake("trtllm::allocate_output")
+    def _(like: torch.Tensor,
+          output_buffer_kind: int,
+          group: Optional[List[int]],
+          shape: Optional[List[int]] = None,
+          out_dtype: Optional[torch.dtype] = None):
+        out_shape = shape if shape is not None else list(like.shape)
+        dtype = out_dtype if out_dtype is not None else like.dtype
+        return like.new_empty(out_shape, dtype=dtype), output_buffer_kind

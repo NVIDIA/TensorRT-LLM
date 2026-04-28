@@ -661,7 +661,7 @@ class KVCacheManager(BaseResourceManager):
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
 
-            # Collect first-chunk requests eligible for batch add_sequence.
+            # Collect first-chunk requests eligible for add_sequence_batch.
             # When block reuse is enabled, addSequenceBatch uses a two-phase
             # claim-then-onboard strategy that prevents host offloading from
             # evicting reusable blocks in the radix tree.
@@ -709,7 +709,8 @@ class KVCacheManager(BaseResourceManager):
                         self.kv_connector_manager.update_state_after_alloc(
                             req, block_ids)
 
-            # A request may change from `context_requests_chunking` to `context_requests_last_chunk` in `add_sequence` due to KV cache reuse, so we rebuild the context request lists here.
+            # A request may change from `context_requests_chunking` to `context_requests_last_chunk` in
+            # `add_sequence_batch` due to KV cache reuse, so we rebuild the context request lists here.
             scheduled_batch.reset_context_requests()
 
             for req in scheduled_batch.generation_requests:
@@ -827,7 +828,7 @@ class KVCacheManager(BaseResourceManager):
                         "mrope_position_deltas"] = dummy_mrope_position_deltas
             requests.append(req)
 
-        # Batch add_sequence for all dummy requests, then add extra tokens.
+        # Use add_sequence_batch for all dummy requests, then add extra tokens.
         # This must happen before is_gen state modifications below, which may
         # set prompt_len to 0 and trigger assertion in setPrepopulatedPromptLen.
         if batch_request_infos:
@@ -846,7 +847,7 @@ class KVCacheManager(BaseResourceManager):
                 for _ in range(self.num_extra_kv_tokens):
                     draft_kv_cache_manager.impl.add_token(req_id)
 
-        # Set is_gen state after batch add_sequence to avoid modifying
+        # Set is_gen state after add_sequence_batch to avoid modifying
         # prompt_len before the C++ side reads it.
         if is_gen:
             for i, req in enumerate(requests):

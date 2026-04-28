@@ -20,6 +20,7 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
+from ..modules.rotary_embedding import RotaryEmbedding
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
@@ -781,6 +782,430 @@ class PARDForCausalLM(nn.Module):
         return hidden_states_out, hidden_states_out
 
 
+class DFlashForCausalLM(nn.Module):
+    """Draft model wrapper for DFlash speculative decoding.
+
+    DFlash uses cross-attention where Q comes from noise/query tokens and K/V
+    come from the concatenation of target hidden states and noise hidden states.
+    The target_hidden stays CONSTANT across all layers (no input_layernorm applied).
+
+    Reference: https://arxiv.org/pdf/2602.06036
+    """
+
+    def __init__(self, draft_config):
+        super().__init__()
+
+        # DFlash draft models may use custom architecture names (e.g. "DFlashDraftModel")
+        # that are not registered in MODEL_CLASS_MAPPING. Fall back to model_type-based
+        # architecture name (e.g. "qwen3" -> "Qwen3ForCausalLM").
+        pretrained_cfg = draft_config.pretrained_config
+        try:
+            DraftModelClass, _ = get_model_architecture(pretrained_cfg)
+        except RuntimeError:
+            model_type = pretrained_cfg.model_type
+            arch_name = "".join(w.capitalize()
+                                for w in model_type.split("_")) + "ForCausalLM"
+            logger.info(
+                f"DFlash: architecture {pretrained_cfg.architectures} not found, "
+                f"falling back to {arch_name} based on model_type={model_type}")
+            original_archs = pretrained_cfg.architectures
+            try:
+                pretrained_cfg.architectures = [arch_name]
+                DraftModelClass, _ = get_model_architecture(pretrained_cfg)
+            finally:
+                pretrained_cfg.architectures = original_archs
+
+        # Remove spec_config to prevent recursive spec-dec initialization
+        draft_config_no_spec = replace(draft_config, spec_config=None)
+
+        # Weights will be loaded later by ModelLoader.load_draft_weights()
+        self.draft_model_full = DraftModelClass(draft_config_no_spec)
+        self.model = self.draft_model_full.model
+        self.lm_head = self.draft_model_full.lm_head
+
+        # Required by weight mappers
+        self.model_config = draft_config_no_spec
+        self.config = draft_config_no_spec.pretrained_config
+
+        # Get mask_token_id from dflash_config
+        pretrained_config = draft_config.pretrained_config
+        dflash_config = getattr(pretrained_config, 'dflash_config', {})
+        self.mask_token_id = dflash_config.get(
+            'mask_token_id',
+            getattr(pretrained_config, 'mask_token_id',
+                    pretrained_config.vocab_size))
+
+        self.target_layer_ids = dflash_config.get('target_layer_ids', None)
+        self.block_size = getattr(pretrained_config, 'block_size', None)
+        logger.info(
+            f"DFlash draft model initialized with mask_token_id: {self.mask_token_id}, "
+            f"target_layer_ids: {self.target_layer_ids}, block_size: {self.block_size}"
+        )
+
+        self.logits_processor = None  # Set by caller after construction
+
+        # RoPE - lazily initialized from draft model's attention module
+        self._rope_initialized = False
+        self._rotary_cos_sin = None
+        self._is_neox = True
+
+        # FlashAttention KV buffer - lazily initialized on first dflash_forward
+        self._kv_buf_k = None
+        self._kv_buf_v = None
+        self._cache_seqlens = None
+        self._block_offsets = None
+
+    def _init_rope(self):
+        """Initialize RoPE from the draft model's attention configuration.
+
+        Reuses the existing RotaryEmbedding infrastructure which correctly
+        handles all RoPE variants (standard, YaRN, scaled, etc.).
+        """
+        attn0 = self.model.layers[0].self_attn
+
+        if attn0.rotary_emb is not None:
+            self._rotary_cos_sin = attn0.rotary_emb.rotary_cos_sin
+            self._is_neox = attn0.rotary_emb.is_neox
+        elif attn0.pos_embd_params is not None:
+            rope_emb = RotaryEmbedding(
+                attn0.pos_embd_params.rope,
+                head_dim=attn0.head_dim,
+                is_neox=attn0.pos_embd_params.is_neox,
+            )
+            self._rotary_cos_sin = rope_emb.rotary_cos_sin
+            self._is_neox = rope_emb.is_neox
+        else:
+            # Fallback: basic NeoX-style RoPE
+            config = self.config
+            head_dim = getattr(config, 'head_dim',
+                               config.hidden_size // config.num_attention_heads)
+            rope_theta = getattr(config, 'rope_theta', 1000000.0)
+            max_pos = getattr(config, 'max_position_embeddings', 32768)
+
+            inv_freq = 1.0 / (rope_theta**(torch.arange(
+                0, head_dim, 2, dtype=torch.float32, device='cuda') / head_dim))
+            positions = torch.arange(max_pos,
+                                     dtype=torch.float32,
+                                     device='cuda')
+            freqs = torch.outer(positions, inv_freq)
+            rope_cos = freqs.cos().to(config.torch_dtype)
+            rope_sin = freqs.sin().to(config.torch_dtype)
+            # [max_pos, 2, rot_dim//2] to match RotaryEmbedding format
+            self._rotary_cos_sin = torch.stack([rope_cos, rope_sin], dim=1)
+            self._is_neox = True
+
+        self._rope_initialized = True
+
+    def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
+        """Load weights into the DFlash draft model.
+
+        DFlash checkpoints differ from standard HF format:
+        - Layer weights lack the 'model.' prefix (e.g., 'layers.0...' not 'model.layers.0...')
+        - Extra DFlash-specific weights: 'fc.weight', 'hidden_norm.weight'
+        - Missing embed_tokens and lm_head (shared with target model)
+        """
+        # Remap: add 'model.' prefix where needed, and extract DFlash-specific weights
+        remapped = {}
+        for key, value in weights.items():
+            if key in ('fc.weight', 'hidden_norm.weight'):
+                # DFlash-specific projection weights - store directly
+                remapped[key] = value
+            elif key == 'norm.weight':
+                remapped['model.norm.weight'] = value
+            elif not key.startswith('model.'):
+                remapped[f'model.{key}'] = value
+            else:
+                remapped[key] = value
+
+        # Load DFlash-specific weights directly
+        if 'fc.weight' in remapped:
+            self.fc = nn.Linear(remapped['fc.weight'].shape[1],
+                                remapped['fc.weight'].shape[0],
+                                bias=False,
+                                device='cuda',
+                                dtype=remapped['fc.weight'].dtype)
+            self.fc.weight.data.copy_(remapped['fc.weight'])
+            del remapped['fc.weight']
+
+        if 'hidden_norm.weight' in remapped:
+            rms_norm_eps = getattr(self.config, 'rms_norm_eps', 1e-6)
+            self.hidden_norm = nn.RMSNorm(
+                remapped['hidden_norm.weight'].shape[0],
+                eps=rms_norm_eps,
+                device='cuda',
+                elementwise_affine=True,
+                dtype=remapped['hidden_norm.weight'].dtype)
+            self.hidden_norm.weight.data.copy_(remapped['hidden_norm.weight'])
+            del remapped['hidden_norm.weight']
+
+        # Load remaining weights into the draft model.
+        # DFlash checkpoints don't include embed_tokens or lm_head, so allow partial loading
+        # since those modules won't find matching weights.
+        self.draft_model_full.load_weights(weights=remapped,
+                                           weight_mapper=weight_mapper,
+                                           allow_partial_loading=True)
+
+    def load_weights_from_target_model(self,
+                                       target_model: torch.nn.Module) -> None:
+        """Share embed_tokens and lm_head from the target model."""
+        self.draft_model_full.model.embed_tokens = target_model.model.embed_tokens
+        self.draft_model_full.lm_head = target_model.lm_head
+        self.lm_head = target_model.lm_head
+
+    def _get_rope_cos_sin(self, positions, dtype=None):
+        """Get cos/sin for given positions, suitable for apply_rotary_pos_emb.
+
+        Args:
+            positions: [B, seq_len]
+            dtype: target dtype for cos/sin (default: keep original)
+        Returns:
+            rope_cos: [B, seq, rot_dim//2] (broadcastable with unsqueeze_dim=1)
+            rope_sin: [B, seq, rot_dim//2]
+        """
+        if not self._rope_initialized:
+            self._init_rope()
+
+        # rotary_cos_sin: [max_pos, 2, rot_dim//2]
+        rope_cache = self._rotary_cos_sin[positions]  # [B, seq, 2, rot_dim//2]
+        rope_cos = rope_cache[..., 0, :]  # [B, seq, rot_dim//2]
+        rope_sin = rope_cache[..., 1, :]
+        if dtype is not None:
+            rope_cos = rope_cos.to(dtype)
+            rope_sin = rope_sin.to(dtype)
+        return rope_cos, rope_sin
+
+    def dflash_forward(
+        self,
+        noise_embedding: torch.Tensor,
+        target_hidden: torch.Tensor,
+        query_positions: torch.Tensor,
+        context_positions: torch.Tensor,
+        num_ctx_per_req: torch.Tensor,
+    ) -> torch.Tensor:
+        """Custom DFlash forward with batched cross-attention.
+
+        All operations use fixed-shape padded tensors for CUDA graph
+        compatibility. Padding in target_hidden is masked via attention mask.
+
+        In each layer:
+        - Q from input_layernorm(hidden_states) via q_proj
+        - K/V from concat(target_hidden, input_layernorm(hidden_states)) via k_proj/v_proj
+        - target_hidden does NOT go through input_layernorm (stays constant)
+        - Non-causal attention via flash_attn_with_kvcache
+
+        Args:
+            noise_embedding: [B, block_size, hidden_size] - token embeddings
+            target_hidden: [B, max_ctx, hidden_size] - padded projected target features
+            query_positions: [B, block_size] - positions for query tokens
+            context_positions: [B, max_ctx] - positions for context tokens (padded)
+            num_ctx_per_req: [B] - actual context length per request
+        Returns:
+            hidden_states: [B * block_size, hidden_size]
+        """
+        import torch.nn.functional as F
+
+        layer0 = self.model.layers[0]
+        attn0 = layer0.self_attn
+        q_size = attn0.q_size
+        kv_size = attn0.kv_size
+        head_dim = attn0.head_dim
+        num_heads_per_rank = attn0.num_heads
+        num_kv_heads_per_rank = attn0.num_key_value_heads
+        has_qk_norm = hasattr(attn0, 'q_norm') and hasattr(attn0, 'k_norm')
+
+        B = noise_embedding.shape[0]
+        block_size = noise_embedding.shape[1]
+        max_ctx = target_hidden.shape[1]
+        kv_len = max_ctx + block_size
+
+        hidden_states = noise_embedding  # [B, block_size, hidden]
+
+        # Lazy-init pre-allocated KV buffers for flash_attn_with_kvcache.
+        # Re-allocate if B grows (warmup uses increasing batch sizes
+        # before CUDA graph capture locks in the final padded size).
+        if self._kv_buf_k is None or B > self._kv_buf_k.shape[0]:
+            assert self._kv_buf_k is None or \
+                kv_len == self._kv_buf_k.shape[1], \
+                f"kv_len changed: {self._kv_buf_k.shape[1]} -> {kv_len}"
+            self._kv_buf_k = torch.zeros(B,
+                                         kv_len,
+                                         num_kv_heads_per_rank,
+                                         head_dim,
+                                         dtype=hidden_states.dtype,
+                                         device='cuda')
+            self._kv_buf_v = torch.zeros(B,
+                                         kv_len,
+                                         num_kv_heads_per_rank,
+                                         head_dim,
+                                         dtype=hidden_states.dtype,
+                                         device='cuda')
+            self._cache_seqlens = torch.zeros(B,
+                                              dtype=torch.int32,
+                                              device='cuda')
+            self._block_offsets = torch.arange(block_size, device='cuda')
+        # Actual KV length per request: context + noise tokens
+        self._cache_seqlens[:B] = num_ctx_per_req + block_size
+
+        # Scatter indices for noise placement: place noise right after
+        # each request's valid context so cache_seqlens covers
+        # [valid_ctx | noise] contiguously without padding gaps.
+        noise_pos = num_ctx_per_req[:B].unsqueeze(1) + self._block_offsets
+        noise_scatter_idx = noise_pos.unsqueeze(-1).unsqueeze(-1).expand(
+            -1, -1, num_kv_heads_per_rank, head_dim)
+
+        # Precompute RoPE cos/sin (positions are constant across layers)
+        rope_dtype = hidden_states.dtype
+        q_rope_cos, q_rope_sin = self._get_rope_cos_sin(query_positions,
+                                                        dtype=rope_dtype)
+        ctx_rope_cos, ctx_rope_sin = self._get_rope_cos_sin(context_positions,
+                                                            dtype=rope_dtype)
+        _rope = RotaryEmbedding.apply_rotary_pos_emb
+
+        residual = None
+
+        for layer_idx, layer in enumerate(self.model.layers):
+            attn_mod = layer.self_attn
+
+            # Apply input_layernorm (flatten to 2D for norm, reshape back)
+            hs_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+            if residual is None:
+                residual = hidden_states.clone()
+                hs_normed = layer.input_layernorm(hs_flat).reshape(
+                    B, block_size, -1)
+            else:
+                res_flat = residual.reshape(-1, residual.shape[-1])
+                hs_normed_flat, res_flat = layer.input_layernorm(
+                    hs_flat, res_flat)
+                hs_normed = hs_normed_flat.reshape(B, block_size, -1)
+                residual = res_flat.reshape(B, block_size, -1)
+
+            # QKV projection on normed query tokens
+            qkv_query = attn_mod.qkv_proj(
+                hs_normed.reshape(-1, hs_normed.shape[-1]))
+            qkv_query = qkv_query.reshape(B, block_size, -1)
+            q_all = qkv_query[..., :q_size]
+            k_noise_all = qkv_query[..., q_size:q_size + kv_size]
+            v_noise_all = qkv_query[..., q_size + kv_size:]
+
+            # K/V from target_hidden (NO input_layernorm!)
+            # Combined K+V projection in a single GEMM for efficiency
+            qkv_weight = attn_mod.qkv_proj.weight
+            kv_weight = qkv_weight[q_size:]  # [2*kv_size, hidden]
+            qkv_bias = getattr(attn_mod.qkv_proj, 'bias', None)
+            kv_bias = qkv_bias[q_size:] if qkv_bias is not None else None
+
+            # Context K/V via single GEMM: [B*max_ctx, 2*kv_size]
+            th_flat = target_hidden.reshape(-1, target_hidden.shape[-1])
+            kv_ctx = F.linear(th_flat, kv_weight,
+                              kv_bias).reshape(B, max_ctx, 2 * kv_size)
+            k_ctx_all = kv_ctx[..., :kv_size]
+            v_ctx_all = kv_ctx[..., kv_size:]
+
+            # QK norm (only for architectures that use it, e.g. Qwen3)
+            if has_qk_norm:
+                q_for_rope = attn_mod.q_norm(q_all.reshape(
+                    -1, head_dim)).reshape(B, block_size, q_size)
+                k_noise_for_rope = attn_mod.k_norm(
+                    k_noise_all.reshape(-1, head_dim)).reshape(
+                        B, block_size, kv_size)
+                k_ctx_for_rope = attn_mod.k_norm(k_ctx_all.reshape(
+                    -1, head_dim)).reshape(B, max_ctx, kv_size)
+            else:
+                q_for_rope = q_all
+                k_noise_for_rope = k_noise_all
+                k_ctx_for_rope = k_ctx_all
+
+            # Apply RoPE using precomputed cos/sin
+            Q = _rope(q_for_rope.reshape(B, block_size, num_heads_per_rank,
+                                         head_dim).transpose(1, 2),
+                      q_rope_cos,
+                      q_rope_sin,
+                      unsqueeze_dim=1,
+                      is_neox=self._is_neox)
+            k_noise_rope = _rope(k_noise_for_rope.reshape(
+                B, block_size, num_kv_heads_per_rank, head_dim).transpose(1, 2),
+                                 q_rope_cos,
+                                 q_rope_sin,
+                                 unsqueeze_dim=1,
+                                 is_neox=self._is_neox)
+
+            k_ctx_rope = _rope(k_ctx_for_rope.reshape(B, max_ctx,
+                                                      num_kv_heads_per_rank,
+                                                      head_dim).transpose(1, 2),
+                               ctx_rope_cos,
+                               ctx_rope_sin,
+                               unsqueeze_dim=1,
+                               is_neox=self._is_neox)
+
+            # Fill KV buffer: [B, seq, nkv, hd] layout for flash_attn.
+            # Context fills [0, max_ctx), noise is scattered right after
+            # each request's valid context via noise_scatter_idx so
+            # cache_seqlens covers [valid_ctx | noise] contiguously.
+            self._kv_buf_k[:B, :max_ctx] = k_ctx_rope.transpose(1, 2)
+            self._kv_buf_k[:B].scatter_(1, noise_scatter_idx,
+                                        k_noise_rope.transpose(1, 2))
+            self._kv_buf_v[:B, :max_ctx] = v_ctx_all.reshape(
+                B, max_ctx, num_kv_heads_per_rank, head_dim)
+            self._kv_buf_v[:B].scatter_(
+                1, noise_scatter_idx,
+                v_noise_all.reshape(B, block_size, num_kv_heads_per_rank,
+                                    head_dim))
+
+            # Q: [B, heads, block_size, hd] -> [B, block_size, heads, hd]
+            Q_bshd = Q.transpose(1, 2)
+
+            from flash_attn import flash_attn_with_kvcache
+            out = flash_attn_with_kvcache(
+                q=Q_bshd,
+                k_cache=self._kv_buf_k[:B],
+                v_cache=self._kv_buf_v[:B],
+                cache_seqlens=self._cache_seqlens[:B],
+                causal=False,
+            )
+            # [B, block_size, heads, hd] -> [B*block_size, q_size]
+            attn_output = out.reshape(B * block_size, q_size)
+
+            # o_proj (flat 2D, handles all-reduce internally)
+            hidden_out = attn_mod.o_proj(attn_output)
+
+            # Post-attention layernorm + MLP (flat 2D)
+            res_flat = residual.reshape(-1, residual.shape[-1])
+            hidden_out, res_flat = layer.post_attention_layernorm(
+                hidden_out, res_flat)
+            hidden_out = layer.mlp(hidden_out)
+
+            hidden_states = hidden_out.reshape(B, block_size, -1)
+            residual = res_flat.reshape(B, block_size, -1)
+
+        # Final norm
+        hidden_states_out, _ = self.model.norm(
+            hidden_states.reshape(-1, hidden_states.shape[-1]),
+            residual.reshape(-1, residual.shape[-1]))
+        return hidden_states_out
+
+    def forward(
+        self,
+        attn_metadata,
+        input_ids: torch.LongTensor = None,
+        position_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        return_context_logits: bool = False,
+        spec_metadata=None,
+        hidden_states: torch.Tensor | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states_out = self.model(
+            input_ids=input_ids,
+            attn_metadata=attn_metadata,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            spec_metadata=spec_metadata,
+            **kwargs,
+        )
+
+        return hidden_states_out, hidden_states_out
+
+
 class MTPForCausalLM(nn.Module):
 
     def __init__(
@@ -1004,6 +1429,8 @@ def get_draft_model(model_config, draft_config, lm_head, model):
         return MTPDraftModelForCausalLM(model_config)
     elif spec_dec_mode.is_pard():
         return PARDForCausalLM(draft_config)
+    elif spec_dec_mode.is_dflash():
+        return DFlashForCausalLM(draft_config)
     elif spec_dec_mode.is_draft_target_one_model():
         return AutoModelForCausalLM.from_config(draft_config)
     else:
@@ -1082,8 +1509,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                                    self.lm_head, self.model)
                 if self.draft_model is not None:
                     self.epilogue.append(self.draft_model)
-                if spec_config.spec_dec_mode.is_pard(
-                ) and self.draft_model is not None:
+                if (spec_config.spec_dec_mode.is_parallel_draft()
+                    ) and self.draft_model is not None:
                     self.draft_model.logits_processor = self.logits_processor
 
             # spec_worker is created for all one-engine modes (MTP, Eagle3, SA)
@@ -1182,8 +1609,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         else:
             self.draft_model.load_weights(weights=weights)
 
-        if self.spec_config and not self.spec_config.spec_dec_mode.is_external_drafter(
-        ):
+        if self.spec_config and (
+                not self.spec_config.spec_dec_mode.is_external_drafter()
+                or self.spec_config.spec_dec_mode.is_dflash()):
             self.draft_model.load_weights_from_target_model(self)
 
     def set_guided_decoder(self,
