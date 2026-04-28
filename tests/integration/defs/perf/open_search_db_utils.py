@@ -131,7 +131,9 @@ def get_history_data(new_data_dict, match_keys, common_values_dict):
             key=lambda x: parse_timestamp(x.get("@timestamp", 0)),
             reverse=True)
         for entry in sorted_data:
-            if any(k.startswith("d_baseline_") or k.startswith("d_threshold_") for k in entry):
+            if any(
+                    k.startswith("d_baseline_") or k.startswith("d_threshold_")
+                    for k in entry):
                 return {
                     k: v
                     for k, v in entry.items() if k.startswith("d_baseline_")
