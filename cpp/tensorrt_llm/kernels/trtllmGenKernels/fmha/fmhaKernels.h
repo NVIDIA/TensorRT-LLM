@@ -175,8 +175,20 @@ public:
                 TLLM_CU_CHECK(mDriver->cuModuleGetFunction(&funcInfo.mDeviceFunction, hmod, kernelMeta.mFuncName));
                 if (kernelMeta.mSharedMemBytes >= 48 * 1024)
                 {
-                    TLLM_CU_CHECK(mDriver->cuFuncSetAttribute(funcInfo.mDeviceFunction,
-                        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, kernelMeta.mSharedMemBytes));
+                    auto const result = mDriver->cuFuncSetAttribute(funcInfo.mDeviceFunction,
+                        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, kernelMeta.mSharedMemBytes);
+                    if (result != CUDA_SUCCESS)
+                    {
+                        char const* errorName = nullptr;
+                        char const* errorString = nullptr;
+                        mDriver->cuGetErrorName(result, &errorName);
+                        mDriver->cuGetErrorString(result, &errorString);
+                        TLLM_LOG_WARNING("Skipping FMHA kernel due to cuFuncSetAttribute failure: "
+                            + std::string(kernelMeta.mFuncName) + ", smem=" + std::to_string(kernelMeta.mSharedMemBytes)
+                            + ", error=" + std::string(errorName != nullptr ? errorName : "unknown") + ": "
+                            + std::string(errorString != nullptr ? errorString : "unknown"));
+                        continue;
+                    }
                 }
                 // Make sure the hashIds are not duplicated.
                 // Except for the case where we have both family version and specific version of the same config.
@@ -231,6 +243,18 @@ public:
         checkFmhaOptions(options, optionsFromArgs);
         // Update the options if needed.
         updateFmhaOptions(options, optionsFromArgs);
+        // HOTFIX: FmhaDispatcher path may leave multiCtasKvCounter/Scratch null when use GmemReduction. Force Disabled
+        // here so as to avoid crashing.
+        // TODO: add scratch allocation and re-enable GmemReduction.
+        if (options.mMultiCtasKvMode == tensorrt_llm::kernels::MultiCtasKvMode::GmemReduction)
+        {
+            if (params.multiCtasKvScratchPtr == nullptr || params.multiCtasKvCounterPtr == nullptr)
+            {
+                TLLM_LOG_DEBUG(
+                    "MultiCtasKvScratchPtr/MultiCtasKvCounterPtr is null, forcing MultiCtasKvMode to Disabled");
+                options.mMultiCtasKvMode = tensorrt_llm::kernels::MultiCtasKvMode::Disabled;
+            }
+        }
         // The number of CtasQ and CtasKv per sequence, Ctas in the Y dimension, and Ctas in the Z
         // dimension.
         computeNumCtas(options, params.mMultiProcessorCount);
@@ -280,6 +304,20 @@ public:
         updateFmhaOptions(options, optionsFromArgs);
         // The number of CtasQ and CtasKv per sequence, Ctas in the Y dimension, and Ctas in the Z
         // dimension.
+
+        // HOTFIX: FmhaDispatcher path may leave multiCtasKvCounter/Scratch null when use GmemReduction. Force Disabled
+        // here so as to avoid crashing.
+        // TODO: add scratch allocation and re-enable GmemReduction.
+        if (options.mMultiCtasKvMode == tensorrt_llm::kernels::MultiCtasKvMode::GmemReduction)
+        {
+            if (params.multiCtasKvScratchPtr == nullptr || params.multiCtasKvCounterPtr == nullptr)
+            {
+                TLLM_LOG_DEBUG(
+                    "MultiCtasKvScratchPtr/MultiCtasKvCounterPtr is null, forcing MultiCtasKvMode to Disabled");
+                options.mMultiCtasKvMode = tensorrt_llm::kernels::MultiCtasKvMode::Disabled;
+            }
+        }
+
         auto [numCtasX, numCtasY, numCtasZ] = computeNumCtas(options, params.mMultiProcessorCount);
 
         // Set the launch grid size.

@@ -321,6 +321,35 @@ struct InflightBatchingStats
     SizeType32 microBatchId;
     /// @brief Average number of tokens decoded per request per iteration
     float avgNumDecodedTokensPerIter;
+    /// @brief Context tokens for scheduled context requests that are read from
+    /// KV cache rather than computed this iteration. Covers prefix-cache hits
+    /// and previously-chunked tokens for chunked-prefill continuations.
+    /// Complements @ref numCtxTokens (tokens computed this iteration).
+    SizeType32 numCtxKvTokens;
+    /// @brief Total KV context length (prompt + generated-so-far) summed
+    /// across scheduled generation (decode) requests.
+    SizeType32 numGenKvTokens;
+    /// @brief Number of context (prefill) requests waiting in the executor
+    /// request queue — submitted but not yet scheduled. Excludes non-normal
+    /// control items (shutdown/cancel) and requests without a payload.
+    SizeType32 numQueuedContextRequests;
+    /// @brief Sum of prompt-token counts across queued context requests (the
+    /// requests counted in @ref numQueuedContextRequests).
+    SizeType32 numQueuedCtxTokens;
+    /// @brief Number of generation-only requests waiting in the executor
+    /// request queue. On a disaggregated-decode engine these are requests
+    /// that have completed prefill elsewhere and are awaiting KV-cache
+    /// transfer before they can start decoding. Always 0 on a
+    /// non-disaggregated or disaggregated-prefill engine.
+    SizeType32 numQueuedGenRequests;
+    /// @brief Sum of prompt-token counts across queued generation-only
+    /// requests (the requests counted in @ref numQueuedGenRequests). Acts
+    /// as the KV-budget these requests will need once their KV transfer
+    /// completes.
+    SizeType32 numQueuedGenKvTokens;
+    /// @brief Total KV context length summed across paused (preempted-decode)
+    /// requests. Complements @ref numPausedRequests (count).
+    SizeType32 numPausedKvTokens;
 };
 
 /// @brief Struct that holds speculative decoding stats

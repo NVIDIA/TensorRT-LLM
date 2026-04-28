@@ -88,14 +88,26 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
             'slot_mapping_scale':
             m.slot_mapping_scale.clone(),
         }
-        block_ids_per_seq = draft_kv_cache_manager.get_block_ids_per_seq(
-            m.request_ids)
-        num_blocks = block_ids_per_seq.shape[1]
-        m.host_indexer_k_cache_block_offsets[:len(
-            block_ids_per_seq), :num_blocks].copy_(block_ids_per_seq)
+        # Derive pool indices from the draft manager's encoded block
+        # offsets (via _get_pool_block_indices) instead of using raw block
+        # IDs.  With host cache offload, block IDs can exceed
+        # blocks_in_primary_pool after offload swaps (the block keeps its
+        # original high ID even though its memory now lives in the primary
+        # GPU pool).  Using raw block IDs as pool indices causes OOB access
+        # in the indexer k-cache buffers.  _get_pool_block_indices correctly
+        # decodes memPoolBlockIndex from the C++ encoded offsets.
+        # Note: kv_cache_manager was already swapped to draft above (line 67).
+        pool_indices = m._get_pool_block_indices()
+        num_blocks = pool_indices.shape[1]
+        m.host_indexer_k_cache_block_offsets[:m.num_seqs, :num_blocks].copy_(
+            pool_indices)
         m.indexer_k_cache_block_offsets[:m.num_seqs].copy_(
             m.host_indexer_k_cache_block_offsets[:m.num_seqs],
             non_blocking=True)
+        # Safety clamp: sanitize stale padding entries beyond num_seqs
+        # that may contain negative or out-of-range values, matching the
+        # regular DSA prepare() flow.
+        m.indexer_k_cache_block_offsets.clamp_(min=0)
         Indexer.recompute_slot_mappings(m)
     return saved
 
@@ -152,6 +164,7 @@ class SpeculativeDecodingMode(IntEnum):
     USER_PROVIDED = auto()
     SAVE_HIDDEN_STATES = auto()
     PARD = auto()
+    DFLASH = auto()
     NONE = auto()
     AUTO = auto()
 
@@ -180,6 +193,12 @@ class SpeculativeDecodingMode(IntEnum):
     def is_pard(self):
         return self == SpeculativeDecodingMode.PARD
 
+    def is_dflash(self):
+        return self == SpeculativeDecodingMode.DFLASH
+
+    def is_parallel_draft(self):
+        return self.is_pard() or self.is_dflash()
+
     def is_ngram(self):
         return self == SpeculativeDecodingMode.NGRAM
 
@@ -202,7 +221,7 @@ class SpeculativeDecodingMode(IntEnum):
         return self == SpeculativeDecodingMode.SAVE_HIDDEN_STATES
 
     def is_external_drafter(self):
-        return self.is_pard() or self.is_draft_target_one_model()
+        return self.is_parallel_draft() or self.is_draft_target_one_model()
 
     def without_logits(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(

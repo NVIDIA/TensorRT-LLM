@@ -99,7 +99,6 @@ These tests ensure that the full AutoDeploy pipeline works correctly for various
 - `test_ad_trtllm_bench.py` - Benchmarking functionality
 - `test_ad_trtllm_serve.py` - Serving functionality
 - `test_ad_speculative_decoding.py` - Speculative decoding
-- `test_ad_export_onnx.py` - ONNX export functionality
 
 ### Execution
 

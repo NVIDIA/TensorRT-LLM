@@ -29,8 +29,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.utils import ActivationType  # noqa: F401
-
+from ..._compat import ActivationType  # noqa: F401
 from ...utils.logger import ad_logger
 
 

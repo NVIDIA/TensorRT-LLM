@@ -37,7 +37,7 @@ l0_a30:
       - '*a30*'
       linux_distribution_name: ubuntu*
     terms:
-      stage: pre_merge
+      stage: post_merge
       backend: cpp
   tests:
   # ------------- CPP tests ---------------
@@ -52,21 +52,7 @@ l0_a30:
   - cpp/test_e2e.py::test_model[-gpt_executor-80]
   - cpp/test_e2e.py::test_model[-gpt_tests-80]
   - cpp/test_e2e.py::test_model[-gpt-80]
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 1
-        lte: 1
-    wildcards:
-      gpu:
-      - '*a30*'
-      linux_distribution_name: ubuntu*
-    terms:
-      stage: pre_merge
-      backend: triton
-  tests:
-  - triton_server/test_triton_llm.py::test_llmapi_backend[1-0-disableDecoupleMode-tensorrt_llm]
-  - triton_server/test_triton_llm.py::test_llmapi_backend[1-0-enableDecoupleMode-tensorrt_llm]
+  - cpp/test_e2e.py::test_benchmarks[gpt-80] TIMEOUT (90)
 - condition:
     ranges:
       system_gpu_count:
@@ -170,20 +156,6 @@ l0_a30:
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
-      backend: cpp
-  tests:
-  - cpp/test_e2e.py::test_benchmarks[gpt-80] TIMEOUT (90)
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 1
-        lte: 1
-    wildcards:
-      gpu:
-      - '*a30*'
-      linux_distribution_name: ubuntu*
-    terms:
-      stage: post_merge
       backend: triton
   tests:
   - triton_server/test_triton.py::test_gpt[gpt]
@@ -232,6 +204,8 @@ l0_a30:
   - triton_server/test_triton_llm.py::test_tiny_llama_ifb_token_counts[tensorrtllm-both-False-1---False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--guaranteed_no_evict---1-1-1-False-tensorrt_llm_bls]
   - triton_server/test_triton_llm.py::test_tiny_llama_ifb_token_counts[tensorrtllm-both-False-1---False-True-False-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--guaranteed_no_evict---1-1-1-False-ensemble]
   - triton_server/test_triton_llm.py::test_tiny_llama_ifb_token_counts[tensorrtllm-both-False-1---False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--guaranteed_no_evict---1-1-1-False-tensorrt_llm_bls]
+  - triton_server/test_triton_llm.py::test_llmapi_backend[1-0-disableDecoupleMode-tensorrt_llm]
+  - triton_server/test_triton_llm.py::test_llmapi_backend[1-0-enableDecoupleMode-tensorrt_llm]
 # ------------- AutoDeploy Backend Stages ---------------
 - condition:
     ranges:

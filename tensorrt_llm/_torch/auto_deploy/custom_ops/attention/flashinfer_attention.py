@@ -22,8 +22,17 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import Node
 
-from .....llmapi.llm_args import KvCacheConfig
-from ....flashinfer_utils import get_env_enable_pdl
+from ..._compat import KvCacheConfig
+
+try:
+    from ....flashinfer_utils import get_env_enable_pdl
+except (ModuleNotFoundError, ImportError):
+    import os
+
+    def get_env_enable_pdl() -> bool:
+        return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+
+
 from ...utils.cuda_graph import cuda_graph_state
 from ...utils.logger import ad_logger
 from ...utils.node_utils import extract_op_args
