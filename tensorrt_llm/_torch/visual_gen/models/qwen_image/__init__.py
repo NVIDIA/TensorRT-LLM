@@ -12,7 +12,6 @@ from .pipeline_qwen_image import QwenImagePipeline
 from .transformer_qwen_image import (
     AdaLayerNormContinuous,
     FeedForward,
-    GELU,
     QwenEmbedRope,
     QwenImageTransformer2DModel,
     QwenImageTransformerBlock,
@@ -28,7 +27,6 @@ from .transformer_qwen_image import (
 __all__ = [
     "AdaLayerNormContinuous",
     "FeedForward",
-    "GELU",
     "QwenEmbedRope",
     "QwenImagePipeline",
     "QwenImageTransformer2DModel",

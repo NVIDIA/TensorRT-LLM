@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Per-module parity tests for Qwen-Image Phase 1 port.
+"""Per-module parity tests for Qwen-Image.
 
 Each test pulls the corresponding module from
 ``diffusers.models.transformers.transformer_qwenimage`` (the reference)
@@ -9,8 +9,8 @@ and from our port, loads the same slice of the real Qwen-Image
 ``transformer`` state_dict into both, runs them on identical inputs, and
 asserts cosine similarity above a per-module threshold.
 
-Tests are skipped automatically unless the real checkpoint is available
-locally; set ``QWEN_IMAGE_CKPT`` to override the default location.
+Tests are skipped automatically unless ``QWEN_IMAGE_CKPT`` points to a
+local Qwen-Image checkpoint.
 """
 
 import json
@@ -20,12 +20,14 @@ from pathlib import Path
 import pytest
 import torch
 
-_DEFAULT_CKPT = "/home/scratch.asteiner/trtllm-qwen-image/models/qwen-image"
 _CKPT_ENV = "QWEN_IMAGE_CKPT"
 
 
 def _ckpt_path() -> Path | None:
-    path = Path(os.environ.get(_CKPT_ENV, _DEFAULT_CKPT))
+    ckpt = os.environ.get(_CKPT_ENV)
+    if not ckpt:
+        return None
+    path = Path(ckpt)
     if not (path / "transformer" / "config.json").is_file():
         return None
     return path
@@ -49,9 +51,9 @@ def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
 requires_ckpt = pytest.mark.skipif(
     _ckpt_path() is None,
     reason=(
-        f"Qwen-Image checkpoint not found at ${_CKPT_ENV} "
-        f"(default: {_DEFAULT_CKPT}). Download Qwen/Qwen-Image from "
-        "HuggingFace to enable parity tests."
+        f"Qwen-Image checkpoint not found at ${_CKPT_ENV}. "
+        "Set QWEN_IMAGE_CKPT to a local Qwen/Qwen-Image checkpoint "
+        "to enable parity tests."
     ),
 )
 
@@ -76,7 +78,7 @@ def transformer_config() -> dict:
 
 
 # ===========================================================================
-# M2: timestep embedding (already validated; kept here for regression).
+# Timestep embedding.
 # ===========================================================================
 
 
@@ -143,7 +145,7 @@ def test_get_timestep_embedding_matches_diffusers():
 
 
 # ===========================================================================
-# M3: 3D RoPE (bit-exact in fp32).
+# 3D RoPE (bit-exact in fp32).
 # ===========================================================================
 
 
@@ -204,7 +206,7 @@ def test_apply_rotary_emb_qwen_parity():
 
 
 # ===========================================================================
-# M4: pre/post-block modules (img_in, txt_in, txt_norm, norm_out, proj_out).
+# Pre/post-block modules (img_in, txt_in, txt_norm, norm_out, proj_out).
 # ===========================================================================
 
 
@@ -302,7 +304,7 @@ def test_pre_post_block_modules_parity(transformer_state_dict, transformer_confi
 
 
 # ===========================================================================
-# M5: MMDiT block (one block with real weights vs diffusers).
+# MMDiT block (one block with real weights vs diffusers).
 # ===========================================================================
 
 
@@ -323,6 +325,9 @@ def test_qwen_image_transformer_block_parity(transformer_state_dict, transformer
     from tensorrt_llm._torch.visual_gen.models.qwen_image import (
         QwenEmbedRope,
         QwenImageTransformerBlock,
+    )
+    from tensorrt_llm._torch.visual_gen.models.qwen_image.transformer_qwen_image import (
+        _remap_checkpoint_keys,
     )
 
     device = torch.device("cuda")
@@ -354,7 +359,9 @@ def test_qwen_image_transformer_block_parity(transformer_state_dict, transformer
     _m_ref, _u_ref = ref_block.load_state_dict(block0_sd, strict=False)
     # Silently ignore missing keys on diffusers side: its Attention has
     # some optional norm/head_dim params we don't need to set.
-    _m_our, _u_our = our_block.load_state_dict(block0_sd, strict=False)
+    _m_our, _u_our = our_block.load_state_dict(
+        _remap_checkpoint_keys(block0_sd), strict=False
+    )
     assert not _u_our, f"unexpected keys in our block: {_u_our[:3]}"
     # Diffusers' extra (ignored) keys are OK; missing on our side must
     # be 0 because we mirror the state_dict structure.
@@ -370,7 +377,7 @@ def test_qwen_image_transformer_block_parity(transformer_state_dict, transformer
     txt = torch.randn(B, txt_seq, inner_dim, dtype=dtype, device=device)
     temb = torch.randn(B, inner_dim, dtype=dtype, device=device)
 
-    # Same RoPE on both sides (bit-exact, see M3).
+    # Same RoPE on both sides.
     ref_rope = RefRope(theta=10000, axes_dim=[16, 56, 56], scale_rope=True).to(device)
     our_rope = QwenEmbedRope(theta=10000, axes_dim=[16, 56, 56], scale_rope=True).to(device)
     ref_vid, ref_txt = ref_rope((frame, h, w), max_txt_seq_len=txt_seq, device=device)
@@ -404,7 +411,7 @@ def test_qwen_image_transformer_block_parity(transformer_state_dict, transformer
 
 
 # ===========================================================================
-# M6: full transformer single-step (the expensive one).
+# Full transformer single-step (the expensive one).
 # ===========================================================================
 
 

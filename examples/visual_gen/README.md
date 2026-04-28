@@ -322,7 +322,7 @@ python visual_gen_ltx2.py \
 | `--model_path` | ✓ | ✓ | ✓ | ✓ | — | Path to model checkpoint directory |
 | `--text_encoder_path` | — | — | — | ✓ | — | Path to Gemma3 text encoder |
 | `--prompt` | ✓ | ✓ | ✓ | ✓ | — | Text prompt for generation |
-| `--negative_prompt` | — | ✓ | ✓ | *(built-in)* | — | Negative prompt |
+| `--negative_prompt` | — | ✓ | ✓ | ✓ | *(built-in)* | Negative prompt |
 | `--height` | ✓ | ✓ | ✓ | ✓ | 1024 / 1328 / 720 | Output height |
 | `--width` | ✓ | ✓ | ✓ | ✓ | 1024 / 1328 / 1280 | Output width |
 | `--num_frames` | — | — | ✓ | ✓ | 81 / 121 | Number of frames |
@@ -349,7 +349,7 @@ python visual_gen_ltx2.py \
 | `--modality_scale` | — | — | — | ✓ | 1.0 | Cross-modal guidance scale |
 | `--rescale_scale` | — | — | — | ✓ | 0.0 | Variance-preserving rescale factor |
 
-[^qi]: Qwen-Image uses `--true_cfg_scale` (real classifier-free guidance) instead of FLUX's embedded `--guidance_scale`. FP8/NVFP4 quantization (`--linear_type`) is a Phase 2 follow-up; the Phase 1 reference implementation is BF16-only.
+[^qi]: Qwen-Image uses `--true_cfg_scale` (real classifier-free guidance) instead of FLUX's embedded `--guidance_scale`. FP8/NVFP4 quantization (`--linear_type`) is a follow-up; the reference implementation is BF16-only.
 
 ## Troubleshooting
 

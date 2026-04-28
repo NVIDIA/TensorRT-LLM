@@ -394,11 +394,18 @@ class QwenImagePipeline(BasePipeline):
         # images in a single batched forward. Qwen-Image supports this
         # naturally via the batch dim of its transformer.
         num_per = getattr(req, "num_images_per_prompt", 1) or 1
-        prompts = req.prompt if isinstance(req.prompt, list) else [req.prompt]
-        prompts = [p for p in prompts for _ in range(num_per)]
+        base_prompts = req.prompt if isinstance(req.prompt, list) else [req.prompt]
+        prompts = [p for p in base_prompts for _ in range(num_per)]
         negative = getattr(req, "negative_prompt", None)
         if negative is not None:
             negatives = negative if isinstance(negative, list) else [negative]
+            if len(negatives) == 1:
+                negatives = negatives * len(base_prompts)
+            elif len(negatives) != len(base_prompts):
+                raise ValueError(
+                    "negative_prompt must be a string, a singleton list, "
+                    "or a list with the same length as prompt"
+                )
             negative = [n for n in negatives for _ in range(num_per)]
 
         return self.forward(
@@ -532,7 +539,7 @@ class QwenImagePipeline(BasePipeline):
         logger.info("Decoding...")
         image = self._decode_latents(latents, height, width)
 
-        if self.rank == 0:
+        if getattr(self, "rank", 0) == 0:
             logger.info("Pipeline total: %.2fs", time.time() - pipeline_start)
 
         return MediaOutput(image=image)

@@ -90,5 +90,5 @@ def test_transformer_constructs_with_defaults():
 def test_transformer_load_weights_detects_mismatch():
     """load_weights should surface a clear RuntimeError on a bad dict."""
     model = QwenImageTransformer2DModel(model_config=None, num_layers=2)
-    with pytest.raises(RuntimeError, match="Missing keys|Unexpected keys"):
+    with pytest.raises(RuntimeError, match=r"Missing keys|Unexpected keys"):
         model.load_weights({})

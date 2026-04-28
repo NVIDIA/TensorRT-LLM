@@ -20,14 +20,33 @@ from __future__ import annotations
 import functools
 import math
 import numbers
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-if TYPE_CHECKING:
-    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.mlp import MLP
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
+from tensorrt_llm._torch.visual_gen.quantization.loader import \
+    DynamicLinearWeightLoader
+
+_WEIGHT_KEY_REMAPS = [
+    (".net.0.proj.", ".up_proj."),
+    (".net.2.", ".down_proj."),
+]
+
+
+def _remap_checkpoint_keys(weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    remapped = {}
+    for key, value in weights.items():
+        new_key = key
+        for old, new in _WEIGHT_KEY_REMAPS:
+            new_key = new_key.replace(old, new)
+        remapped[new_key] = value
+    return remapped
 
 
 # ===========================================================================
@@ -44,7 +63,8 @@ def get_timestep_embedding(
     max_period: int = 10000,
 ) -> torch.Tensor:
     """Sinusoidal positional embedding, bit-exact port of diffusers."""
-    assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
+    if len(timesteps.shape) != 1:
+        raise ValueError("Timesteps should be a 1d-array")
 
     half_dim = embedding_dim // 2
     exponent = -math.log(max_period) * torch.arange(
@@ -153,7 +173,7 @@ class QwenTimestepProjEmbeddings(nn.Module):
 
 
 # ===========================================================================
-# Norm primitives (M4 support).
+# Norm primitives.
 # ===========================================================================
 
 
@@ -223,8 +243,10 @@ class AdaLayerNormContinuous(nn.Module):
     ):
         super().__init__()
         self.silu = nn.SiLU()
-        self.linear = nn.Linear(
-            conditioning_embedding_dim, embedding_dim * 2, bias=bias
+        self.linear = Linear(
+            conditioning_embedding_dim,
+            embedding_dim * 2,
+            bias=bias,
         )
         if norm_type == "layer_norm":
             self.norm = nn.LayerNorm(
@@ -245,36 +267,17 @@ class AdaLayerNormContinuous(nn.Module):
 
 
 # ===========================================================================
-# Feed-forward (M5 support).
+# Feed-forward.
 # ===========================================================================
 
 
-class GELU(nn.Module):
-    """Linear followed by gelu. ``approximate='tanh'`` for Qwen-Image."""
-
-    def __init__(
-        self,
-        dim_in: int,
-        dim_out: int,
-        approximate: str = "none",
-        bias: bool = True,
-    ):
-        super().__init__()
-        self.proj = nn.Linear(dim_in, dim_out, bias=bias)
-        self.approximate = approximate
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.proj(hidden_states)
-        return F.gelu(hidden_states, approximate=self.approximate)
+@torch.compiler.disable
+def _gelu_tanh_eager(x: torch.Tensor) -> torch.Tensor:
+    return F.gelu(x, approximate="tanh")
 
 
-class FeedForward(nn.Module):
-    """MLP with gelu-approximate activation, mult=4, no dropout.
-
-    Matches diffusers' ``FeedForward`` for Qwen-Image: ``nn.ModuleList`` of
-    ``[GELU(proj), Dropout(0), Linear]`` so state_dict keys are
-    ``net.0.proj.{weight,bias}`` and ``net.2.{weight,bias}``.
-    """
+class FeedForward(MLP):
+    """TRT-LLM MLP with Qwen-Image GELU activation."""
 
     def __init__(
         self,
@@ -283,33 +286,31 @@ class FeedForward(nn.Module):
         mult: int = 4,
         activation_fn: str = "gelu-approximate",
         bias: bool = True,
+        dtype: Optional[torch.dtype] = None,
+        config: Optional[DiffusionModelConfig] = None,
+        layer_idx: Optional[int] = None,
     ):
-        super().__init__()
         inner_dim = int(dim * mult)
         dim_out = dim_out if dim_out is not None else dim
-
         if activation_fn == "gelu-approximate":
-            act_fn = GELU(dim, inner_dim, approximate="tanh", bias=bias)
+            activation = _gelu_tanh_eager
         elif activation_fn == "gelu":
-            act_fn = GELU(dim, inner_dim, approximate="none", bias=bias)
+            activation = F.gelu
         else:
             raise ValueError(
                 f"Unsupported activation_fn={activation_fn} in Qwen-Image "
                 "FeedForward; only gelu / gelu-approximate needed."
             )
-
-        self.net = nn.ModuleList(
-            [
-                act_fn,
-                nn.Dropout(0.0),
-                nn.Linear(inner_dim, dim_out, bias=bias),
-            ]
-        )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        for module in self.net:
-            hidden_states = module(hidden_states)
-        return hidden_states
+        if dim_out != dim:
+            raise ValueError("TRT-LLM MLP FeedForward requires dim_out == dim")
+        super().__init__(hidden_size=dim,
+                         intermediate_size=inner_dim,
+                         bias=bias,
+                         activation=activation,
+                         dtype=dtype,
+                         config=config,
+                         layer_idx=layer_idx,
+                         reduce_output=False)
 
 
 # ===========================================================================
@@ -472,20 +473,20 @@ class QwenEmbedRope(nn.Module):
 
 
 # ===========================================================================
-# Joint self-attention for MMDiT (M5).
+# Joint self-attention for MMDiT.
 # ===========================================================================
 
 
-class QwenJointAttention(nn.Module):
+class QwenJointAttention(Attention):
     """Double-stream joint attention.
 
     Holds the image-stream (to_q/k/v), text-stream (add_q/k/v_proj),
     per-stream QK-norms, and the two output projections (to_out.0 for
     image, to_add_out for text) as direct submodules so the HF state_dict
-    loads with ``strict=True``. The attention math itself uses
-    ``F.scaled_dot_product_attention`` -- same backend diffusers uses by
-    default -- which gives bit-for-bit equivalent output in fp32 and
-    cosine >= 0.9999 in bf16.
+    loads with the checkpoint remapping in ``load_weights``. The common
+    unmasked path uses the VisualGen attention backend; the masked path
+    falls back to torch SDPA because VisualGen's backend mask contract is
+    currently limited to predefined masks.
     """
 
     def __init__(
@@ -494,34 +495,75 @@ class QwenJointAttention(nn.Module):
         num_attention_heads: int,
         attention_head_dim: int,
         eps: float = 1e-6,
+        dtype: Optional[torch.dtype] = None,
+        config: Optional[DiffusionModelConfig] = None,
+        layer_idx: int = 0,
     ):
-        super().__init__()
+        config = config or DiffusionModelConfig()
+        super().__init__(
+            hidden_size=dim,
+            num_attention_heads=num_attention_heads,
+            head_dim=attention_head_dim,
+            qkv_mode=QKVMode.SEPARATE_QKV,
+            qk_norm=True,
+            qk_norm_mode="per_head",
+            eps=eps,
+            bias=True,
+            fuse_qk_norm_rope=False,
+            config=config,
+            layer_idx=layer_idx,
+        )
         self.heads = num_attention_heads
         self.head_dim = attention_head_dim
 
-        # Image-stream QKV.
-        self.to_q = nn.Linear(dim, dim, bias=True)
-        self.to_k = nn.Linear(dim, dim, bias=True)
-        self.to_v = nn.Linear(dim, dim, bias=True)
-
         # Text-stream QKV (diffusers names).
-        self.add_q_proj = nn.Linear(dim, dim, bias=True)
-        self.add_k_proj = nn.Linear(dim, dim, bias=True)
-        self.add_v_proj = nn.Linear(dim, dim, bias=True)
+        self.add_q_proj = Linear(
+            dim,
+            dim,
+            bias=True,
+            dtype=dtype,
+            mapping=self.mapping,
+            quant_config=self.quant_config,
+            skip_create_weights_in_init=self.skip_create_weights_in_init,
+            force_dynamic_quantization=self.force_dynamic_quantization,
+        )
+        self.add_k_proj = Linear(
+            dim,
+            dim,
+            bias=True,
+            dtype=dtype,
+            mapping=self.mapping,
+            quant_config=self.quant_config,
+            skip_create_weights_in_init=self.skip_create_weights_in_init,
+            force_dynamic_quantization=self.force_dynamic_quantization,
+        )
+        self.add_v_proj = Linear(
+            dim,
+            dim,
+            bias=True,
+            dtype=dtype,
+            mapping=self.mapping,
+            quant_config=self.quant_config,
+            skip_create_weights_in_init=self.skip_create_weights_in_init,
+            force_dynamic_quantization=self.force_dynamic_quantization,
+        )
 
         # QK-norms, applied per-head on the head_dim.
         self.norm_q = RMSNorm(attention_head_dim, eps=eps)
         self.norm_k = RMSNorm(attention_head_dim, eps=eps)
         self.norm_added_q = RMSNorm(attention_head_dim, eps=eps)
         self.norm_added_k = RMSNorm(attention_head_dim, eps=eps)
-
-        # Image output projection is kept as a ModuleList so the
-        # state_dict key ``to_out.0.weight`` round-trips.
-        self.to_out = nn.ModuleList(
-            [nn.Linear(dim, dim, bias=True), nn.Dropout(0.0)]
-        )
         # Text output projection.
-        self.to_add_out = nn.Linear(dim, dim, bias=True)
+        self.to_add_out = Linear(
+            dim,
+            dim,
+            bias=True,
+            dtype=dtype,
+            mapping=self.mapping,
+            quant_config=self.quant_config,
+            skip_create_weights_in_init=self.skip_create_weights_in_init,
+            force_dynamic_quantization=self.force_dynamic_quantization,
+        )
 
     def forward(
         self,
@@ -533,9 +575,7 @@ class QwenJointAttention(nn.Module):
         seq_txt = encoder_hidden_states.shape[1]
 
         # Image QKV.
-        img_q = self.to_q(hidden_states)
-        img_k = self.to_k(hidden_states)
-        img_v = self.to_v(hidden_states)
+        img_q, img_k, img_v = self.get_qkv(hidden_states)
         # Text QKV.
         txt_q = self.add_q_proj(encoder_hidden_states)
         txt_k = self.add_k_proj(encoder_hidden_states)
@@ -580,24 +620,30 @@ class QwenJointAttention(nn.Module):
             # (B, 1, 1, Sjoint) so SDPA broadcasts over (H, Sq).
             attn_mask = attention_mask[:, None, None, :]
 
-        out = F.scaled_dot_product_attention(
-            joint_q, joint_k, joint_v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
-        )
-        # Back to (B, S, H, D) -> (B, S, H*D).
-        out = out.transpose(1, 2).flatten(2, 3).to(joint_q.dtype)
+        if attn_mask is None:
+            out = self._attn_impl(joint_q.transpose(1, 2).flatten(2),
+                                  joint_k.transpose(1, 2).flatten(2),
+                                  joint_v.transpose(1, 2).flatten(2))
+        else:
+            out = F.scaled_dot_product_attention(joint_q,
+                                                 joint_k,
+                                                 joint_v,
+                                                 attn_mask=attn_mask,
+                                                 dropout_p=0.0,
+                                                 is_causal=False)
+            out = out.transpose(1, 2).flatten(2, 3).to(joint_q.dtype)
 
         txt_attn_output = out[:, :seq_txt, :]
         img_attn_output = out[:, seq_txt:, :]
 
         img_attn_output = self.to_out[0](img_attn_output.contiguous())
-        img_attn_output = self.to_out[1](img_attn_output)  # Dropout(p=0.0) no-op
         txt_attn_output = self.to_add_out(txt_attn_output.contiguous())
 
         return img_attn_output, txt_attn_output
 
 
 # ===========================================================================
-# MMDiT double-stream block (M5).
+# MMDiT double-stream block.
 # ===========================================================================
 
 
@@ -610,13 +656,23 @@ class QwenImageTransformerBlock(nn.Module):
         num_attention_heads: int,
         attention_head_dim: int,
         eps: float = 1e-6,
+        dtype: Optional[torch.dtype] = None,
+        config: Optional[DiffusionModelConfig] = None,
+        layer_idx: int = 0,
     ):
         super().__init__()
+        config = config or DiffusionModelConfig()
 
         # Image stream.
         self.img_mod = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(dim, 6 * dim, bias=True),
+            Linear(dim,
+                   6 * dim,
+                   bias=True,
+                   dtype=dtype,
+                   quant_config=config.get_quant_config(),
+                   skip_create_weights_in_init=config.skip_create_weights_in_init,
+                   force_dynamic_quantization=config.force_dynamic_quantization),
         )
         self.img_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.attn = QwenJointAttention(
@@ -624,18 +680,37 @@ class QwenImageTransformerBlock(nn.Module):
             num_attention_heads=num_attention_heads,
             attention_head_dim=attention_head_dim,
             eps=eps,
+            dtype=dtype,
+            config=config,
+            layer_idx=layer_idx,
         )
         self.img_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.img_mlp = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
+        self.img_mlp = FeedForward(dim=dim,
+                                   dim_out=dim,
+                                   activation_fn="gelu-approximate",
+                                   dtype=dtype,
+                                   config=config,
+                                   layer_idx=layer_idx)
 
         # Text stream (shares attention with image stream).
         self.txt_mod = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(dim, 6 * dim, bias=True),
+            Linear(dim,
+                   6 * dim,
+                   bias=True,
+                   dtype=dtype,
+                   quant_config=config.get_quant_config(),
+                   skip_create_weights_in_init=config.skip_create_weights_in_init,
+                   force_dynamic_quantization=config.force_dynamic_quantization),
         )
         self.txt_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.txt_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.txt_mlp = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
+        self.txt_mlp = FeedForward(dim=dim,
+                                   dim_out=dim,
+                                   activation_fn="gelu-approximate",
+                                   dtype=dtype,
+                                   config=config,
+                                   layer_idx=layer_idx)
 
     @staticmethod
     def _modulate(
@@ -699,7 +774,7 @@ class QwenImageTransformerBlock(nn.Module):
 
 
 # ===========================================================================
-# Top-level transformer (M6).
+# Top-level transformer.
 # ===========================================================================
 
 
@@ -726,7 +801,7 @@ class QwenImageTransformer2DModel(nn.Module):
         attn_backend: str = "sdpa",
     ):
         super().__init__()
-        self.model_config = model_config
+        self.model_config = model_config or DiffusionModelConfig()
         self.attn_backend = attn_backend
 
         self.patch_size = patch_size
@@ -743,8 +818,20 @@ class QwenImageTransformer2DModel(nn.Module):
         )
         self.time_text_embed = QwenTimestepProjEmbeddings(embedding_dim=self.inner_dim)
         self.txt_norm = RMSNorm(joint_attention_dim, eps=1e-6)
-        self.img_in = nn.Linear(in_channels, self.inner_dim)
-        self.txt_in = nn.Linear(joint_attention_dim, self.inner_dim)
+        linear_kwargs = {
+            "dtype": self.model_config.torch_dtype,
+            "quant_config": self.model_config.get_quant_config(),
+            "skip_create_weights_in_init": self.model_config.skip_create_weights_in_init,
+            "force_dynamic_quantization": self.model_config.force_dynamic_quantization,
+        }
+        self.img_in = Linear(in_channels,
+                             self.inner_dim,
+                             bias=True,
+                             **linear_kwargs)
+        self.txt_in = Linear(joint_attention_dim,
+                             self.inner_dim,
+                             bias=True,
+                             **linear_kwargs)
 
         self.transformer_blocks = nn.ModuleList(
             [
@@ -752,16 +839,22 @@ class QwenImageTransformer2DModel(nn.Module):
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
+                    dtype=self.model_config.torch_dtype,
+                    config=self.model_config,
+                    layer_idx=layer_idx,
                 )
-                for _ in range(num_layers)
+                for layer_idx in range(num_layers)
             ]
         )
 
         self.norm_out = AdaLayerNormContinuous(
             self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6
         )
-        self.proj_out = nn.Linear(
-            self.inner_dim, patch_size * patch_size * self.out_channels, bias=True
+        self.proj_out = Linear(
+            self.inner_dim,
+            patch_size * patch_size * self.out_channels,
+            bias=True,
+            **linear_kwargs,
         )
 
     @property
@@ -786,18 +879,19 @@ class QwenImageTransformer2DModel(nn.Module):
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
         """Load HF ``transformer/*.safetensors`` state_dict.
 
-        The module attribute structure mirrors diffusers exactly so the
-        keys match 1:1. ``strict=False`` tolerates any extra non-persistent
-        buffers that diffusers may register but that our pure-python port
-        does not need.
+        Feed-forward weights are remapped from diffusers' ``net.0`` /
+        ``net.2`` names into the TRT-LLM ``MLP`` layout.
         """
-        missing, unexpected = self.load_state_dict(weights, strict=False)
-        # Only count missing weights that actually need learnable params
-        # (layernorms with elementwise_affine=False have no weight/bias).
-        missing = [
-            k for k in missing
-            if not k.endswith((".running_mean", ".running_var", ".num_batches_tracked"))
-        ]
+        weights = _remap_checkpoint_keys(weights)
+
+        for _, module in self.named_modules():
+            if callable(getattr(module, "create_weights", None)):
+                module.create_weights()
+
+        expected = {name for name, _ in self.named_parameters()}
+        provided = set(weights)
+        missing = sorted(expected - provided)
+        unexpected = sorted(provided - expected)
         if missing:
             raise RuntimeError(f"Missing keys when loading transformer: {missing[:5]}...")
         if unexpected:
@@ -805,8 +899,22 @@ class QwenImageTransformer2DModel(nn.Module):
                 f"Unexpected keys when loading transformer: {unexpected[:5]}..."
             )
 
-    def post_load_weights(self) -> None:  # pragma: no cover - no-op
-        return None
+        loader = DynamicLinearWeightLoader(self.model_config)
+        for name, module in self.named_modules():
+            if isinstance(module, Linear):
+                weight_dicts = loader.get_linear_weights(module, name, weights)
+                if weight_dicts:
+                    loader.load_linear_weights(module, name, weight_dicts)
+            else:
+                module_weights = loader.filter_weights(name, weights)
+                for param_name, param in module._parameters.items():
+                    if param is not None and param_name in module_weights:
+                        param.data.copy_(module_weights[param_name].to(param.dtype))
+
+    def post_load_weights(self) -> None:
+        for _, module in self.named_modules():
+            if isinstance(module, Linear):
+                module.post_load_weights()
 
     def forward(
         self,
@@ -820,6 +928,13 @@ class QwenImageTransformer2DModel(nn.Module):
         **kwargs,
     ):
         del kwargs, txt_seq_lens  # Only kept for diffusers API compat.
+        missing = []
+        if timestep is None:
+            missing.append("timestep")
+        if img_shapes is None:
+            missing.append("img_shapes")
+        if missing:
+            raise ValueError(f"Missing required argument(s): {', '.join(missing)}")
 
         # Project image tokens into model space.
         hidden_states = self.img_in(hidden_states)

@@ -4,7 +4,7 @@
 
 """Qwen-Image text-to-image generation example using TensorRT-LLM VisualGen.
 
-Phase 1 supports the native BF16 reference path -- FP8 / NVFP4 / CUDA
+This example supports the native BF16 reference path. FP8 / NVFP4 / CUDA
 graph / CFG+Ulysses / TeaCache are scheduled for follow-up PRs (see the
 feature matrix row in ``docs/source/models/visual-generation.md``).
 
@@ -100,18 +100,18 @@ def parse_args():
         type=str,
         default="VANILLA",
         choices=["VANILLA", "TRTLLM"],
-        help="Attention backend (Phase 1 defaults to VANILLA / torch SDPA)",
+        help="Attention backend (defaults to VANILLA / torch SDPA)",
     )
     parser.add_argument(
         "--ulysses_size",
         type=int,
         default=1,
-        help="Ulysses sequence-parallel size (Phase 2; keep at 1 today)",
+        help="Ulysses sequence-parallel size (keep at 1 today)",
     )
     parser.add_argument(
         "--disable_torch_compile",
         action="store_true",
-        help="Disable torch.compile (recommended during Phase 1 bring-up)",
+        help="Disable torch.compile during debugging",
     )
     parser.add_argument(
         "--disable_autotune",
@@ -138,7 +138,11 @@ def parse_args():
 
 def load_prompts(prompts_file, num_prompts=None):
     with open(prompts_file) as f:
-        prompts = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+        prompts = []
+        for line in f:
+            stripped_line = line.strip()
+            if stripped_line and not stripped_line.startswith("#"):
+                prompts.append(stripped_line)
     if num_prompts is not None:
         prompts = prompts[:num_prompts]
     return prompts
@@ -178,6 +182,8 @@ def main():
     try:
         if args.prompts_file:
             prompts = load_prompts(args.prompts_file, args.num_prompts)
+            if not prompts:
+                raise ValueError(f"No prompts found in {args.prompts_file}")
             os.makedirs(args.output_dir, exist_ok=True)
             logger.info(
                 f"Batch mode: {len(prompts)} prompts -> {args.output_dir} "
@@ -222,7 +228,8 @@ def main():
                 )
             logger.info(
                 f"Batch complete: {len(prompts)} images in {total_elapsed:.1f}s "
-                f"(avg {round(sum(times) / len(times), 2)}s/image); timing -> {timing_path}"
+                f"(avg {round(sum(times) / len(times), 2) if times else 0.0}s/image); "
+                f"timing -> {timing_path}"
             )
         else:
             logger.info(f"Generating image for prompt: {args.prompt!r}")
