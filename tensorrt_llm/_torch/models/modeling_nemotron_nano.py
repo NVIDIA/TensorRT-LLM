@@ -997,7 +997,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         ids = list(self._img_start_token_ids) + list(self._img_end_token_ids)
         if self._sound_start_token_id is not None:
             ids.extend([self._sound_start_token_id, self._sound_end_token_id])
-        return torch.tensor(sorted(set(ids)))
+        return torch.tensor(ids)
 
     def get_mm_token_ids(self):
         ids = [self.img_context_token_id]
@@ -1009,9 +1009,6 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         """Return minimal placeholder text for the given multimodal item counts,
         so that the HF processor can be called with (dummy_text, mm_data)
         without error. Used when processing tokenized prompt + MM data.
-
-        NanoV2VL currently accepts only one modality per request, so at most
-        one of `image`, `video`, or `audio` will be non-zero in `mm_counts`.
 
         Args:
             mm_counts (Dict[str, int]): A mapping of each multimodal modality
