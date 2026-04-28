@@ -10,23 +10,25 @@ from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData,
                                             _as_cpu_tensor, _compute_mm_masks,
                                             _find_mm_token_start_pos_from_masks)
-from tensorrt_llm.inputs.registry import maybe_compute_mm_embed_cumsum
+from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
+                                          maybe_compute_mm_embed_cumsum)
 
 # Embedding dim kept small — functions under test only index along dim 0.
 _EMBED_DIM = 4
 
 
-def _make_mock_runtime(
+def _make_runtime(
     num_cached_mm_tokens: int,
     num_mm_tokens_in_chunk: int,
     mm_token_lengths: List[int],
-) -> Mock:
-    """Build a Mock(spec=MultimodalRuntimeData) with the given counters."""
-    runtime = Mock(spec=MultimodalRuntimeData)
-    runtime.num_cached_mm_tokens = num_cached_mm_tokens
-    runtime.num_mm_tokens_in_chunk = num_mm_tokens_in_chunk
-    runtime.total_embeds_in_request = sum(mm_token_lengths)
-    return runtime
+) -> MultimodalRuntimeData:
+    """Build real runtime data with dense MM-token positions."""
+    total_embeds = sum(mm_token_lengths)
+    return MultimodalRuntimeData(
+        past_seen_token_num=num_cached_mm_tokens,
+        chunk_end_pos=num_cached_mm_tokens + num_mm_tokens_in_chunk,
+        embed_mask_cumsum=torch.arange(1, total_embeds + 1, dtype=torch.int64),
+    )
 
 
 def _make_multimodal_params(
@@ -34,9 +36,9 @@ def _make_multimodal_params(
     num_mm_tokens_in_chunk: int,
     mm_token_lengths: List[int],
 ) -> MultimodalParams:
-    """Build a MultimodalParams wrapping a mock runtime."""
-    runtime = _make_mock_runtime(num_cached_mm_tokens, num_mm_tokens_in_chunk,
-                                 mm_token_lengths)
+    """Build a MultimodalParams wrapping runtime data."""
+    runtime = _make_runtime(num_cached_mm_tokens, num_mm_tokens_in_chunk,
+                            mm_token_lengths)
     return MultimodalParams(multimodal_runtime=runtime)
 
 
@@ -46,9 +48,9 @@ class TestFindInputMmEmbed:
     def test_mm_embed_not_batched(self):
         """Individual batching: len(mm_embeds) == len(multimodal_params) > 1."""
         mm_embeds = [
-            torch.randn(10, _EMBED_DIM),
-            torch.randn(15, _EMBED_DIM),
-            torch.randn(8, _EMBED_DIM),
+            torch.randn(10, _EMBED_DIM),  # Batch 1: 10 tokens
+            torch.randn(15, _EMBED_DIM),  # Batch 2: 15 tokens
+            torch.randn(8, _EMBED_DIM),  # Batch 3: 8 tokens
         ]
         multimodal_params = [
             _make_multimodal_params(3, 7, [5, 5]),
@@ -68,7 +70,9 @@ class TestFindInputMmEmbed:
 
     def test_mm_embed_batched(self):
         """Batched: len(mm_embeds) == 1, slicing from concatenated tensor."""
-        mm_embeds = [torch.randn(33, _EMBED_DIM)]
+        mm_embeds = [
+            torch.randn(33, _EMBED_DIM)  # Pre-concatenated: 10 + 13 + 10 tokens
+        ]
         multimodal_params = [
             _make_multimodal_params(4, 6, [10]),  # 4 cached, 6 in current chunk
             _make_multimodal_params(7, 6,
@@ -122,7 +126,9 @@ class TestFindInputMmEmbed:
 
     def test_all_batches_fully_unseen(self):
         """All cached, 0 in chunk → empty result."""
-        mm_embeds = [torch.randn(30, _EMBED_DIM)]
+        mm_embeds = [
+            torch.randn(30, _EMBED_DIM)  # Pre-concatenated: 10 + 10 + 10 tokens
+        ]
         multimodal_params = [
             _make_multimodal_params(10, 0, [10]),
             _make_multimodal_params(10, 0, [10]),
@@ -133,7 +139,9 @@ class TestFindInputMmEmbed:
 
     def test_no_batches_cached(self):
         """0 cached, all in chunk → returns full tensor."""
-        mm_embeds = [torch.randn(30, _EMBED_DIM)]
+        mm_embeds = [
+            torch.randn(30, _EMBED_DIM)  # Pre-concatenated: 10 + 10 + 10 tokens
+        ]
         multimodal_params = [
             _make_multimodal_params(0, 10, [10]),
             _make_multimodal_params(0, 10, [10]),
@@ -718,26 +726,23 @@ class TestFindMmTokenStartPositions:
         assert start_pos == [1]
         assert special_pos == [2, 4]
 
-    def test_non_contiguous_single_unit(self):
-        """One unit with interleaved non-MM text — start is the first MM
-        position; num_mm_tokens stays the encoder-row count."""
-        input_ids = torch.tensor([1, 100, 100, 2, 3, 100, 100, 100, 4])
+    @pytest.mark.parametrize(
+        "input_ids,num_mm_tokens,expected_start_positions",
+        [
+            ([1, 100, 100, 2, 3, 100, 100, 100, 4], [5], [1]),
+            ([0, 100, 100, 0, 0, 100, 0, 0, 100, 100, 0], [3, 2], [1, 8]),
+        ],
+        ids=["single_unit", "multiple_items"],
+    )
+    def test_non_contiguous_tokens(self, input_ids, num_mm_tokens,
+                                   expected_start_positions):
+        """Non-contiguous MM positions still start at each item's first MM token."""
         start_pos, _ = _find_mm_token_start_positions(
-            input_ids=input_ids,
-            num_mm_tokens=[5],
+            input_ids=torch.tensor(input_ids),
+            num_mm_tokens=num_mm_tokens,
             vocab_size=10,
         )
-        assert start_pos == [1]
-
-    def test_non_contiguous_multiple_items(self):
-        """Multiple items with non-contiguous MM positions."""
-        input_ids = torch.tensor([0, 100, 100, 0, 0, 100, 0, 0, 100, 100, 0])
-        start_pos, _ = _find_mm_token_start_positions(
-            input_ids=input_ids,
-            num_mm_tokens=[3, 2],
-            vocab_size=10,
-        )
-        assert start_pos == [1, 8]
+        assert start_pos == expected_start_positions
 
     def test_raises_without_vocab_size_or_mm_token_ids(self):
         """Should raise ValueError when neither vocab_size nor mm_token_ids provided."""
@@ -749,8 +754,8 @@ class TestFindMmTokenStartPositions:
             )
 
 
-class _MockProcessor:
-    """Minimal mock of BaseMultimodalInputProcessor for maybe_compute_mm_embed_cumsum tests."""
+class _FakeMultimodalInputProcessor(BaseMultimodalInputProcessor):
+    """Concrete test fake for maybe_compute_mm_embed_cumsum."""
 
     def __init__(self,
                  vocab_size=100,
@@ -759,6 +764,25 @@ class _MockProcessor:
         self._vocab_size = vocab_size
         self._mm_token_ids = mm_token_ids
         self._mm_special_token_ids = mm_special_token_ids
+
+    @property
+    def processor(self):
+        return None
+
+    @property
+    def tokenizer(self):
+        return None
+
+    @property
+    def config(self):
+        return None
+
+    @property
+    def dtype(self):
+        return torch.float32
+
+    def __call__(self, inputs, sampling_params):
+        raise NotImplementedError("This fake only supports token queries.")
 
     def get_vocab_size(self):
         return self._vocab_size
@@ -776,12 +800,14 @@ class TestMaybeComputeMmEmbedCumsum:
 
     def test_none_extra_is_noop(self):
         """No crash when extra_processed_inputs is None."""
-        maybe_compute_mm_embed_cumsum([1, 2, 3], None, _MockProcessor())
+        maybe_compute_mm_embed_cumsum([1, 2, 3], None,
+                                      _FakeMultimodalInputProcessor())
 
     def test_no_multimodal_data_key_is_noop(self):
         """No crash when multimodal_data key is absent."""
         extra = {"some_other_key": {}}
-        maybe_compute_mm_embed_cumsum([1, 2, 3], extra, _MockProcessor())
+        maybe_compute_mm_embed_cumsum([1, 2, 3], extra,
+                                      _FakeMultimodalInputProcessor())
         assert "multimodal_embed_mask_cumsum" not in extra
 
     def test_already_present_is_idempotent(self):
@@ -792,8 +818,9 @@ class TestMaybeComputeMmEmbedCumsum:
                 "multimodal_embed_mask_cumsum": original_cumsum
             }
         }
-        maybe_compute_mm_embed_cumsum([100, 101, 102, 103, 104], extra,
-                                      _MockProcessor(vocab_size=100))
+        maybe_compute_mm_embed_cumsum(
+            [100, 101, 102, 103, 104], extra,
+            _FakeMultimodalInputProcessor(vocab_size=100))
         assert (extra["multimodal_data"]["multimodal_embed_mask_cumsum"]
                 is original_cumsum)
 
@@ -802,36 +829,51 @@ class TestMaybeComputeMmEmbedCumsum:
         extra = {"multimodal_data": {"multimodal_embedding": "placeholder"}}
         # input: [1, 100, 101, 2, 102] → ids >= vocab_size=100 are mm.
         # bool mask: [F, T, T, F, T] → cumsum: [0, 1, 2, 2, 3]
-        maybe_compute_mm_embed_cumsum([1, 100, 101, 2, 102], extra,
-                                      _MockProcessor(vocab_size=100))
+        maybe_compute_mm_embed_cumsum(
+            [1, 100, 101, 2, 102], extra,
+            _FakeMultimodalInputProcessor(vocab_size=100))
         cumsum = extra["multimodal_data"]["multimodal_embed_mask_cumsum"]
-        assert torch.equal(cumsum,
-                           torch.tensor([0, 1, 2, 2, 3], dtype=torch.int64))
+        torch.testing.assert_close(
+            cumsum,
+            torch.tensor([0, 1, 2, 2, 3], dtype=torch.int64),
+            rtol=0,
+            atol=0,
+        )
 
     def test_no_mm_tokens_stores_all_false(self):
         """When no MM tokens match, stores an all-zero flat cumsum."""
         extra = {"multimodal_data": {"some_key": "value"}}
-        maybe_compute_mm_embed_cumsum([1, 2, 3], extra,
-                                      _MockProcessor(vocab_size=100))
+        maybe_compute_mm_embed_cumsum(
+            [1, 2, 3], extra, _FakeMultimodalInputProcessor(vocab_size=100))
         cumsum = extra["multimodal_data"]["multimodal_embed_mask_cumsum"]
-        assert torch.equal(cumsum, torch.tensor([0, 0, 0], dtype=torch.int64))
+        torch.testing.assert_close(
+            cumsum,
+            torch.tensor([0, 0, 0], dtype=torch.int64),
+            rtol=0,
+            atol=0,
+        )
 
     def test_mask_excludes_special_tokens(self):
         """Specials do not increment the cumsum."""
-        proc = _MockProcessor(vocab_size=None,
-                              mm_token_ids=torch.tensor([50, 60]),
-                              mm_special_token_ids=torch.tensor([60]))
+        proc = _FakeMultimodalInputProcessor(
+            vocab_size=None,
+            mm_token_ids=torch.tensor([50, 60]),
+            mm_special_token_ids=torch.tensor([60]))
         extra = {"multimodal_data": {"embed": "x"}}
         # input: [1, 50, 60, 50, 2] → mm at positions 1,3; special at 2.
         # bool mask: [F, T, F, T, F] → cumsum: [0, 1, 1, 2, 2]
         maybe_compute_mm_embed_cumsum([1, 50, 60, 50, 2], extra, proc)
         cumsum = extra["multimodal_data"]["multimodal_embed_mask_cumsum"]
-        assert torch.equal(cumsum,
-                           torch.tensor([0, 1, 1, 2, 2], dtype=torch.int64))
+        torch.testing.assert_close(
+            cumsum,
+            torch.tensor([0, 1, 1, 2, 2], dtype=torch.int64),
+            rtol=0,
+            atol=0,
+        )
 
     def test_no_vocab_and_no_mm_ids_is_noop(self):
         """When processor provides neither vocab_size nor mm_token_ids, no crash."""
-        proc = _MockProcessor(vocab_size=None, mm_token_ids=None)
+        proc = _FakeMultimodalInputProcessor(vocab_size=None, mm_token_ids=None)
         extra = {"multimodal_data": {"embed": "x"}}
         maybe_compute_mm_embed_cumsum([100, 101], extra, proc)
         # Should not have set the cumsum since we can't identify MM tokens

@@ -376,8 +376,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             seq_lens = torch.tensor([input_ids.size(-1)], dtype=torch.int, pin_memory=True)
             num_contexts = 1
             position_ids = [torch.arange(0, input_ids.size(-1), dtype=torch.int32)]
-            if multimodal_params_list[0].multimodal_input is not None:
-                mi = multimodal_params_list[0].multimodal_input
+            if (mi := multimodal_params_list[0].multimodal_input) is not None:
                 prompt_len = (
                     total_prompt_len
                     if total_prompt_len is not None
@@ -391,7 +390,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
                     # (tests here don't model inline specials).
                     full_mask[pos : pos + length] = True
                 multimodal_runtime = MultimodalRuntimeData(
-                    embed_mask_cumsum=full_mask.to(torch.int64).cumsum(0),
+                    embed_mask_cumsum=full_mask.cumsum(0, dtype=torch.int64),
                     past_seen_token_num=num_cached_tokens_per_seq[0],
                     chunk_end_pos=(num_cached_tokens_per_seq[0] + input_ids.size(-1)),
                 )

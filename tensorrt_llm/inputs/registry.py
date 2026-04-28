@@ -801,8 +801,8 @@ def maybe_compute_mm_embed_cumsum(
         mm_special_token_ids=input_processor.get_mm_special_token_ids(),
     )
     # Cache the int64 cumsum; request-invariant, read once per chunk.
-    mm_data["multimodal_embed_mask_cumsum"] = embed_mask.to(
-        torch.int64).cumsum(0)
+    mm_data["multimodal_embed_mask_cumsum"] = embed_mask.cumsum(
+        0, dtype=torch.int64)
 
 
 def create_input_processor_with_hash(
@@ -952,7 +952,7 @@ def create_input_processor_with_hash(
             )
             extra_processed_inputs["multimodal_data"].setdefault(
                 "multimodal_embed_mask_cumsum",
-                embed_mask.to(torch.int64).cumsum(0))
+                embed_mask.cumsum(0, dtype=torch.int64))
             start_positions, start_special_token_positions = (
                 _find_mm_token_start_pos_from_masks(mm_mask, special_mask,
                                                     num_mm_tokens))
@@ -973,74 +973,86 @@ def create_input_processor_with_hash(
                 mm_hashes_int32, start_positions, num_mm_tokens, mm_uuid_list)
         return prompt_token_ids, extra_processed_inputs
 
+    def process_tokenized_prompt_maybe_hash(
+        inputs: TextPrompt, sampling_params: SamplingParams
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        try:
+            return tokenized_multimodal_process(inputs, sampling_params)
+        except Exception as e:
+            logger.warning(f"Tokenized+MM path failed: {e}")
+            raise
+
+    def process_prompt_maybe_hash(
+        inputs: TextPrompt, sampling_params: SamplingParams
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        try_multimodal_hashing = False  # only used for first time
+        use_multimodal_hashing = False  # used for subsequent calls
+        modalities = list(set(inputs['multi_modal_data'].keys())
+                          ) if 'multi_modal_data' in inputs else []
+        if len(modalities) > 0:
+            # TODO: support multimodal hashing for multiple modalities within the same request.
+            if len(modalities) == 1 and modalities[0] in [
+                    'image', 'video', 'audio'
+            ]:
+                # only try multimodal hashing if the inputs only contain a single modality.
+                if input_processor.multimodal_hashing_supported is not None:
+                    use_multimodal_hashing = input_processor.multimodal_hashing_supported
+                else:
+                    # we need to try the multimodal hashing for the first time to determine if it is supported
+                    try_multimodal_hashing = True
+
+        if try_multimodal_hashing or use_multimodal_hashing:
+            try:
+                prompt_token_ids, extra_processed_inputs = multimodal_hashing_process(
+                    inputs, sampling_params)
+                if try_multimodal_hashing:
+                    # if trying for first time, set the flag to True
+                    input_processor.multimodal_hashing_supported = True
+            except Exception as e:
+                logger.warning(f"Multimodal hashing failed: {e}.")
+                if try_multimodal_hashing:
+                    # if trying for first time, fall back to basic input processor
+                    # and set the flag to False so that we don't try again
+                    input_processor.multimodal_hashing_supported = False
+                    logger.warning("Falling back to basic input processor.")
+                    try:
+                        prompt_token_ids, extra_processed_inputs = input_processor(
+                            inputs, sampling_params)
+                    except Exception as e2:
+                        logger.warning(f"Basic input processor failed: {e}.")
+                        logger.debug(traceback.format_exc())
+                        raise e2
+                else:
+                    raise e
+        else:
+            try:
+                prompt_token_ids, extra_processed_inputs = input_processor(
+                    inputs, sampling_params)
+            except Exception as e:
+                logger.warning(f"Basic input processor failed: {e}.")
+                logger.debug(traceback.format_exc())
+                raise e
+
+        return prompt_token_ids, extra_processed_inputs
+
     def input_processor_wrapper(
         inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        # Tokenized prompt + multi_modal_data fast path: requires the optional
-        # hooks. If the processor lacks them, fall through to hashing/basic.
-        is_tokenized_fast_path = (
+        # Tokenized prompt + multi_modal_data path: requires the optional hooks.
+        # If the processor lacks them, fall through to the regular prompt path.
+        has_tokenized_multimodal_prompt = (
             inputs.get("prompt_token_ids") is not None
             and inputs.get("multi_modal_data") is not None
             and inputs.get("prompt") is None
             and hasattr(input_processor, "get_text_with_mm_placeholders")
             and hasattr(input_processor, "expand_prompt_token_ids_for_mm"))
 
-        if is_tokenized_fast_path:
-            try:
-                prompt_token_ids, extra_processed_inputs = (
-                    tokenized_multimodal_process(inputs, sampling_params))
-            except Exception as e:
-                logger.warning(f"Tokenized+MM path failed: {e}")
-                raise
+        if has_tokenized_multimodal_prompt:
+            prompt_token_ids, extra_processed_inputs = (
+                process_tokenized_prompt_maybe_hash(inputs, sampling_params))
         else:
-            try_multimodal_hashing = False  # only used for first time
-            use_multimodal_hashing = False  # used for subsequent calls
-            modalities = list(set(inputs['multi_modal_data'].keys())
-                              ) if 'multi_modal_data' in inputs else []
-            if len(modalities) > 0:
-                # TODO: support multimodal hashing for multiple modalities within the same request.
-                if len(modalities) == 1 and modalities[0] in [
-                        'image', 'video', 'audio'
-                ]:
-                    # only try multimodal hashing if the inputs only contain a single modality.
-                    if input_processor.multimodal_hashing_supported is not None:
-                        use_multimodal_hashing = input_processor.multimodal_hashing_supported
-                    else:
-                        # we need to try the multimodal hashing for the first time to determine if it is supported
-                        try_multimodal_hashing = True
-
-            if try_multimodal_hashing or use_multimodal_hashing:
-                try:
-                    prompt_token_ids, extra_processed_inputs = multimodal_hashing_process(
-                        inputs, sampling_params)
-                    if try_multimodal_hashing:
-                        # if trying for first time, set the flag to True
-                        input_processor.multimodal_hashing_supported = True
-                except Exception as e:
-                    logger.warning(f"Multimodal hashing failed: {e}.")
-                    if try_multimodal_hashing:
-                        # if trying for first time, fall back to basic input processor
-                        # and set the flag to False so that we don't try again
-                        input_processor.multimodal_hashing_supported = False
-                        logger.warning("Falling back to basic input processor.")
-                        try:
-                            prompt_token_ids, extra_processed_inputs = input_processor(
-                                inputs, sampling_params)
-                        except Exception as e2:
-                            logger.warning(
-                                f"Basic input processor failed: {e}.")
-                            logger.debug(traceback.format_exc())
-                            raise e2
-                    else:
-                        raise e
-            else:
-                try:
-                    prompt_token_ids, extra_processed_inputs = input_processor(
-                        inputs, sampling_params)
-                except Exception as e:
-                    logger.warning(f"Basic input processor failed: {e}.")
-                    logger.debug(traceback.format_exc())
-                    raise e
+            prompt_token_ids, extra_processed_inputs = (
+                process_prompt_maybe_hash(inputs, sampling_params))
 
         maybe_compute_mm_embed_cumsum(prompt_token_ids, extra_processed_inputs,
                                       input_processor)
