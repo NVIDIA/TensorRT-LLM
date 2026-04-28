@@ -470,9 +470,6 @@ def test_philox_rounding_unbiased():
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("T", [6, 16, 32], ids=["T6", "T16", "T32"])
 @pytest.mark.parametrize("heads_per_block", [2, 4], ids=["HPB2", "HPB4"])
-@pytest.mark.parametrize("launch_with_pdl", [False, True], ids=["no_ext_pdl", "ext_pdl"])
-@pytest.mark.parametrize("use_internal_pdl", [False, True], ids=["no_int_pdl", "int_pdl"])
-@pytest.mark.parametrize("batch", [1, 2, 8, 16], ids=["B1", "B2", "B8", "B16"])
 def test_checkpointing_heads_per_block(
     nheads,
     head_dim,
@@ -481,10 +478,11 @@ def test_checkpointing_heads_per_block(
     state_dtype,
     T,
     heads_per_block,
-    launch_with_pdl,
-    use_internal_pdl,
-    batch,
 ):
+    # PDL flags use wrapper defaults; trimming the parametrize keeps this
+    # suite fast.  Coverage of {launch_with_pdl, use_internal_pdl} variations
+    # lives in the dedicated correctness tests above (test_checkpointing_state_update).
+    batch = 8
     """
     Verify checkpointing_state_update produces correct results when
     _heads_per_block > 1, exercising the precompute kernel's two-loop
@@ -605,8 +603,6 @@ def test_checkpointing_heads_per_block(
         dt_softplus=True,
         state_batch_indices=None,
         _heads_per_block=heads_per_block,
-        launch_with_pdl=launch_with_pdl,
-        use_internal_pdl=use_internal_pdl,
     )
 
     torch.testing.assert_close(
