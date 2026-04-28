@@ -34,9 +34,11 @@ block.
 
 from __future__ import annotations
 
+import threading
 import types
 from unittest.mock import MagicMock, patch
 
+from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankState
 from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats
 
 
@@ -123,7 +125,7 @@ class _StubQueueItem:
         self.id = _StubQueueItem._next_id
 
 
-def _build_fake_self(queued_items, iter_states):
+def _build_fake_self(queued_items, iter_states, *, enable_attention_dp=False):
     """Minimal 'self' for ``PyExecutor._update_iter_stats(self, ...)``.
 
     Stubs only the ``self.*`` attributes the method actually reads:
@@ -155,10 +157,13 @@ def _build_fake_self(queued_items, iter_states):
     fake.resource_manager.resource_managers.get.return_value = None
     fake.drafter = None
     fake.model_engine = types.SimpleNamespace(iter_states=iter_states)
+    fake.enable_attention_dp = enable_attention_dp
     return fake
 
 
-def _invoke_update_iter_stats(scheduled_batch, queued_items, *, num_ctx_tokens):
+def _invoke_update_iter_stats(
+    scheduled_batch, queued_items, *, num_ctx_tokens, enable_attention_dp=False
+):
     """Call real ``PyExecutor._update_iter_stats`` unbound; return the stats.
 
     Patches ``torch.cuda.mem_get_info`` so the method can run on hosts
@@ -180,7 +185,9 @@ def _invoke_update_iter_stats(scheduled_batch, queued_items, *, num_ctx_tokens):
 
     iter_states = None if num_ctx_tokens is None else {"num_ctx_tokens": num_ctx_tokens}
 
-    fake_self = _build_fake_self(queued_items, iter_states)
+    fake_self = _build_fake_self(
+        queued_items, iter_states, enable_attention_dp=enable_attention_dp
+    )
 
     stats = IterationStats()
     # The method reads ``stats.inflight_batching_stats.*`` unconditionally;
@@ -405,6 +412,42 @@ def test_attention_dp_dummy_filtering_on_kv_token_fields():
     assert ifb.num_paused_kv_tokens == 0  # dummy paused filtered
 
 
+def test_attention_dp_dummy_filtering_on_count_fields():
+    # Under attention-DP, the rank-local payload that will be summed across
+    # ranks must exclude dummy padding from request counts too.
+    ctx = [
+        _StubRequest(
+            context_chunk_size=100,
+            context_current_position=0,
+            is_attention_dp_dummy=True,
+        ),
+        _StubRequest(context_chunk_size=200, context_current_position=50),
+    ]
+    gen = [
+        _StubRequest(num_tokens=1024, is_attention_dp_dummy=True),
+        _StubRequest(num_tokens=2048),
+    ]
+    paused = [
+        _StubRequest(num_tokens=500, is_attention_dp_dummy=True),
+        _StubRequest(num_tokens=700),
+    ]
+
+    stats = _invoke_update_iter_stats(
+        _StubScheduledBatch(context_reqs=ctx, gen_reqs=gen, paused_reqs=paused),
+        [],
+        num_ctx_tokens=300,
+        enable_attention_dp=True,
+    )
+    ifb = stats.inflight_batching_stats
+    assert ifb.num_context_requests == 1
+    assert ifb.num_gen_requests == 1
+    assert ifb.num_paused_requests == 1
+    assert ifb.num_scheduled_requests == 2
+    assert ifb.num_ctx_kv_tokens == 50
+    assert ifb.num_gen_kv_tokens == 2048
+    assert ifb.num_paused_kv_tokens == 700
+
+
 def test_full_mixed_iteration():
     # Realistic scenario: 3 prefill (1 fresh, 2 continuing chunks), 4 decode,
     # 2 preempted, 3 queued.
@@ -455,6 +498,160 @@ def test_num_ctx_kv_tokens_ignores_iter_states_side_channel():
     ifb = stats.inflight_batching_stats
     assert ifb.num_context_requests == 1
     assert ifb.num_ctx_kv_tokens == 256
+
+
+# ---------------------------------------------------------------------------
+# Attention-DP aggregation tests: completed rank-local payloads are carried
+# by the next ADP allgather, then rank 0 appends one engine-wide aggregate.
+# ---------------------------------------------------------------------------
+
+
+class _AdpStatsHarness:
+    pass
+
+
+def _make_adp_iteration_stats(
+    *,
+    iter_id=7,
+    num_context_requests=0,
+    num_ctx_tokens=0,
+    num_ctx_kv_tokens=0,
+    num_gen_requests=0,
+    num_gen_kv_tokens=0,
+    num_paused_requests=0,
+    num_paused_kv_tokens=0,
+    num_queued_context_requests=0,
+    num_queued_ctx_tokens=0,
+    num_queued_gen_requests=0,
+    num_queued_gen_kv_tokens=0,
+):
+    ifb = InflightBatchingStats()
+    ifb.num_context_requests = num_context_requests
+    ifb.num_ctx_tokens = num_ctx_tokens
+    ifb.num_ctx_kv_tokens = num_ctx_kv_tokens
+    ifb.num_gen_requests = num_gen_requests
+    ifb.num_gen_kv_tokens = num_gen_kv_tokens
+    ifb.num_paused_requests = num_paused_requests
+    ifb.num_paused_kv_tokens = num_paused_kv_tokens
+    ifb.num_scheduled_requests = num_context_requests + num_gen_requests
+    ifb.num_queued_context_requests = num_queued_context_requests
+    ifb.num_queued_ctx_tokens = num_queued_ctx_tokens
+    ifb.num_queued_gen_requests = num_queued_gen_requests
+    ifb.num_queued_gen_kv_tokens = num_queued_gen_kv_tokens
+
+    stats = IterationStats()
+    stats.iter = iter_id
+    stats.inflight_batching_stats = ifb
+    return stats
+
+
+def _build_adp_stats_harness(pending_stats, *, rank=0, tp_rank=0):
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    harness = _AdpStatsHarness()
+    harness.dist = types.SimpleNamespace(rank=rank, tp_rank=tp_rank)
+    harness.stats_lock = threading.Lock()
+    harness.stats = []
+    harness.max_stats_len = 64
+    harness._latest_kv_iter_stats = "current-kv"
+    harness._pending_adp_iter_stats = pending_stats if rank == 0 else None
+    harness._pending_adp_req_stats = ["req-stats"] if rank == 0 else None
+    harness._pending_adp_kv_iter_stats = "pending-kv" if rank == 0 else None
+    harness._pending_adp_iter_stats_state = PyExecutor._make_adp_iter_stats_rank_state(
+        harness, pending_stats
+    )
+
+    for method_name in (
+        "_aggregate_adp_iter_stats",
+        "_append_iter_stats",
+        "_clear_pending_adp_iter_stats",
+        "_finalize_pending_adp_iter_stats",
+    ):
+        setattr(
+            harness,
+            method_name,
+            getattr(PyExecutor, method_name).__get__(harness, _AdpStatsHarness),
+        )
+
+    return harness
+
+
+def test_attention_dp_aggregation_sums_rank_local_fields_only():
+    rank0_stats = _make_adp_iteration_stats(
+        iter_id=9,
+        num_context_requests=1,
+        num_ctx_tokens=100,
+        num_ctx_kv_tokens=10,
+        num_gen_requests=2,
+        num_gen_kv_tokens=20,
+        num_paused_requests=1,
+        num_paused_kv_tokens=5,
+        num_queued_context_requests=7,
+        num_queued_ctx_tokens=700,
+        num_queued_gen_requests=8,
+        num_queued_gen_kv_tokens=800,
+    )
+    harness = _build_adp_stats_harness(rank0_stats)
+    rank0_state = harness._pending_adp_iter_stats_state
+    rank1_state = RankState(
+        rank=1,
+        has_iter_stats=1,
+        iter_stats_iter=9,
+        num_context_requests=3,
+        num_ctx_tokens=300,
+        num_ctx_kv_tokens=30,
+        num_gen_requests=4,
+        num_gen_kv_tokens=40,
+        num_paused_requests=2,
+        num_paused_kv_tokens=25,
+    )
+
+    harness._finalize_pending_adp_iter_stats([rank0_state, rank1_state])
+
+    assert len(harness.stats) == 1
+    appended_stats, req_stats, kv_iter_stats = harness.stats[0]
+    ifb = appended_stats.inflight_batching_stats
+    assert ifb.num_context_requests == 4
+    assert ifb.num_ctx_tokens == 400
+    assert ifb.num_ctx_kv_tokens == 40
+    assert ifb.num_gen_requests == 6
+    assert ifb.num_gen_kv_tokens == 60
+    assert ifb.num_paused_requests == 3
+    assert ifb.num_paused_kv_tokens == 30
+    assert ifb.num_scheduled_requests == 10
+
+    # Queued fields are engine-global on rank 0 and must not be summed.
+    assert ifb.num_queued_context_requests == 7
+    assert ifb.num_queued_ctx_tokens == 700
+    assert ifb.num_queued_gen_requests == 8
+    assert ifb.num_queued_gen_kv_tokens == 800
+    assert req_stats == ["req-stats"]
+    assert kv_iter_stats == "pending-kv"
+    assert harness._pending_adp_iter_stats_state is None
+
+
+def test_attention_dp_aggregation_waits_for_complete_matching_payloads():
+    rank0_stats = _make_adp_iteration_stats(iter_id=9, num_context_requests=1)
+    harness = _build_adp_stats_harness(rank0_stats)
+    rank0_state = harness._pending_adp_iter_stats_state
+    missing_rank1_state = RankState(rank=1)
+
+    harness._finalize_pending_adp_iter_stats([rank0_state, missing_rank1_state])
+
+    assert harness.stats == []
+    assert harness._pending_adp_iter_stats_state is rank0_state
+
+    mismatched_rank1_state = RankState(
+        rank=1,
+        has_iter_stats=1,
+        iter_stats_iter=8,
+        num_context_requests=2,
+    )
+
+    harness._finalize_pending_adp_iter_stats([rank0_state, mismatched_rank1_state])
+
+    assert harness.stats == []
+    assert harness._pending_adp_iter_stats_state is rank0_state
 
 
 # ---------------------------------------------------------------------------

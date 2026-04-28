@@ -20,7 +20,7 @@ from __future__ import annotations
 import heapq
 from abc import ABC, abstractmethod
 from collections import namedtuple
-from dataclasses import astuple, dataclass
+from dataclasses import MISSING, astuple, dataclass, fields
 from typing import TYPE_CHECKING, Dict, List, Tuple
 
 if TYPE_CHECKING:
@@ -30,6 +30,18 @@ if TYPE_CHECKING:
     from ..executor_request_queue import RequestQueueItem
 
 HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
+
+_ITER_STATS_RANK_STATE_FIELDS = (
+    "has_iter_stats",
+    "iter_stats_iter",
+    "num_context_requests",
+    "num_ctx_tokens",
+    "num_ctx_kv_tokens",
+    "num_gen_requests",
+    "num_gen_kv_tokens",
+    "num_paused_requests",
+    "num_paused_kv_tokens",
+)
 
 
 @dataclass
@@ -44,6 +56,21 @@ class RankState:
     rank: int
     num_active_requests: int = 0
     num_active_tokens: int = 0
+    has_iter_stats: int = 0
+    iter_stats_iter: int = -1
+    num_context_requests: int = 0
+    num_ctx_tokens: int = 0
+    num_ctx_kv_tokens: int = 0
+    num_gen_requests: int = 0
+    num_gen_kv_tokens: int = 0
+    num_paused_requests: int = 0
+    num_paused_kv_tokens: int = 0
+
+    def copy_iter_stats_from(self, iter_stats_state: RankState | None) -> None:
+        if iter_stats_state is None:
+            return
+        for field_name in _ITER_STATS_RANK_STATE_FIELDS:
+            setattr(self, field_name, getattr(iter_stats_state, field_name))
 
     def serialize(self) -> list[int]:
         """Serialize to a flat list for allgather transport."""
@@ -52,7 +79,23 @@ class RankState:
     @classmethod
     def deserialize(cls, data: list[int]) -> RankState:
         """Deserialize from a flat list received via allgather."""
-        return cls(*data)
+        values = list(data)
+        rank_state_fields = fields(cls)
+        if len(values) > len(rank_state_fields):
+            raise ValueError(
+                f"RankState payload has {len(values)} fields, expected at most "
+                f"{len(rank_state_fields)}"
+            )
+        for field_info in rank_state_fields[len(values) :]:
+            if field_info.default is not MISSING:
+                values.append(field_info.default)
+            elif field_info.default_factory is not MISSING:
+                values.append(field_info.default_factory())
+            else:
+                raise ValueError(
+                    f"RankState payload is missing required field {field_info.name}"
+                )
+        return cls(*values)
 
 
 class ADPRouter(ABC):
@@ -128,6 +171,7 @@ class ADPRouter(ABC):
         self,
         active_requests: list[LlmRequest],
         new_requests: list[RequestQueueItem] | None = None,
+        iter_stats_state: RankState | None = None,
     ) -> list[RankState]:
         """Build local RankState, allgather across DP ranks, return all states.
 
@@ -136,8 +180,11 @@ class ADPRouter(ABC):
             new_requests: New requests popped from the waiting queue.
                 Currently unused; reserved for future routers that need
                 new-request info (e.g. KV-cache-aware routing).
+            iter_stats_state: Completed previous-iteration stats payload to
+                piggyback on this allgather, if one is pending.
         """
         local_state = self.create_rank_state(active_requests, new_requests or [])
+        local_state.copy_iter_stats_from(iter_stats_state)
         responses = self.dist.tp_allgather(local_state.serialize())
         return [RankState.deserialize(data=resp) for resp in responses]
 

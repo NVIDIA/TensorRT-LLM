@@ -181,6 +181,32 @@ def test_single_chat_session(client: openai.OpenAI, model_name: str):
         assert logprob.top_logprobs is None
 
 
+def test_chat_completion_without_max_tokens_does_not_finish_length(
+        client: openai.OpenAI, model_name: str, backend: str):
+    if backend != "trt":
+        pytest.skip("This test covers TRT-LLM max_tokens deduction")
+
+    messages = [{
+        "role": "system",
+        "content": "you are a helpful assistant"
+    }, {
+        "role":
+        "user",
+        "content":
+        "Write the word test exactly 45 times separated by spaces, then write a period. Do not write punctuation before the final period.",
+    }]
+
+    chat_completion = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        temperature=0.0,
+        stop=".",
+        extra_body={"min_tokens": 40},
+    )
+
+    assert chat_completion.choices[0].finish_reason != "length"
+
+
 def test_multi_turn_dialogue(client: openai.OpenAI, model_name: str):
     # test multi-turn dialogue
     messages = [{
