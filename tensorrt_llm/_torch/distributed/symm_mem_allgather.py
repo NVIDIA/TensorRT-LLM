@@ -7,8 +7,9 @@ This module provides PyTorch Symmetric Memory-based allgather operations,
 leveraging MULTIMEM hardware instructions (multimem_all_gather_out) for
 low-latency allgather on NVSwitch-connected GPUs.
 
-CUDA Graph compatible: workspace is pre-allocated during init so no
-allocations occur during graph capture/replay.
+CUDA Graph compatible: the symm_mem workspace is acquired once during init
+and reused on every forward, so no allocations occur during graph
+capture/replay.
 """
 
 from typing import Optional
@@ -40,24 +41,36 @@ class SymmetricMemoryAllGather(nn.Module):
 
     The gathered output lives inside a pre-allocated symmetric-memory
     workspace so the op is safe to use inside CUDA Graph capture.
+
+    Supported configurations (world_size):
+    - SM 9.0: 4, 6, 8 GPUs
+    - SM 10.0: 6, 8 GPUs
+
+    Only dim-0 gather is served; other dims return ``None`` so the caller
+    falls back to NCCL (the transpose+contiguous copies that a generic-dim
+    path would need erode the MULTIMEM latency advantage).
     """
 
     MiB = 1024 * 1024
 
+    # World sizes that actually have MULTIMEM hardware support; mirrors
+    # SymmetricMemoryAllReduce so the two ops gate identically.
+    _WORLD_SIZES_MULTIMEM = {
+        "9.0": [4, 6, 8],
+        "10.0": [6, 8],
+    }
+
     # Max workspace sizes (bytes) per device capability and world size.
-    # These mirror SymmetricMemoryAllReduce limits; the allgather output
-    # buffer lives in the *same* p2p workspace pool so we stay within HW
-    # multicast limits.
+    # Only MULTIMEM-capable world sizes are listed; entries match
+    # SymmetricMemoryAllReduce's limits but the workspace is independent
+    # (allocated through get_symm_mem_workspace, not the AllReduce buffer).
     _MAX_SIZES = {
         "9.0": {
-            2: 64 * MiB,
             4: 32 * MiB,
             6: 64 * MiB,
             8: 64 * MiB,
         },
         "10.0": {
-            2: 8 * MiB,
-            4: 32 * MiB,
             6: 128 * MiB,
             8: 128 * MiB,
         },
@@ -76,6 +89,7 @@ class SymmetricMemoryAllGather(nn.Module):
         self.dtype = dtype
         self.world_size = mapping.tp_size
         self.group_name_str: Optional[str] = None
+        self._symm_mem = None
 
         if not SYMM_MEM_AVAILABLE:
             logger.warning("SymmetricMemoryAllGather: PyTorch symm_mem not available")
@@ -96,6 +110,14 @@ class SymmetricMemoryAllGather(nn.Module):
             )
             return
 
+        # Gate by MULTIMEM-supported world sizes (mirrors AllReduce).
+        if self.world_size not in self._WORLD_SIZES_MULTIMEM.get(self.device_capability, []):
+            logger.info(
+                f"SymmetricMemoryAllGather: MULTIMEM not supported for "
+                f"world_size={self.world_size}, SM={self.device_capability}"
+            )
+            return
+
         if self.world_size not in self._MAX_SIZES[self.device_capability]:
             logger.info(
                 f"SymmetricMemoryAllGather: World size {self.world_size} not supported "
@@ -105,7 +127,10 @@ class SymmetricMemoryAllGather(nn.Module):
 
         self.max_size = self._MAX_SIZES[self.device_capability][self.world_size]
 
-        # Process group
+        # Process group. NOTE: a group created here is left alive for the
+        # module's lifetime — torch does not provide a cheap, safe way to
+        # tear it down on partial init failure, and the cache in
+        # auto_deploy/.../trtllm_dist.py keeps this module long-lived.
         self.group = group
         if self.group is None:
             if not dist.is_initialized():
@@ -129,13 +154,23 @@ class SymmetricMemoryAllGather(nn.Module):
             )
             return
 
-        # Pre-allocate workspace so CUDA Graph capture won't trigger allocation.
-        # The workspace must hold the *full* gathered output (world_size x shard).
+        # Acquire the workspace once and verify MULTIMEM is actually
+        # available. Holding the handle as a member guarantees forward()
+        # never re-enters get_symm_mem_workspace(), so there is no chance
+        # of reallocation during CUDA Graph capture.
         try:
-            torch_symm_mem.get_symm_mem_workspace(
+            self._symm_mem = torch_symm_mem.get_symm_mem_workspace(
                 self.group_name_str,
                 min_size=self.max_size,
             )
+            if getattr(self._symm_mem, "multicast_ptr", 0) == 0:
+                logger.warning(
+                    "SymmetricMemoryAllGather: MULTIMEM not available "
+                    "(multicast_ptr is 0) — disabling"
+                )
+                self._symm_mem = None
+                return
+
             self.disabled = False
             logger.info(
                 f"SymmetricMemoryAllGather (MULTIMEM) initialized: "
@@ -144,7 +179,7 @@ class SymmetricMemoryAllGather(nn.Module):
                 f"SM={self.device_capability}"
             )
         except Exception as e:
-            logger.warning(f"SymmetricMemoryAllGather workspace pre-allocation failed: {e}")
+            logger.warning(f"SymmetricMemoryAllGather: workspace pre-allocation failed: {e}")
 
     def can_use_symm_mem(self, inp: torch.Tensor, dim: int = 0) -> bool:
         """Check whether this tensor can be gathered with symm_mem."""
@@ -158,9 +193,17 @@ class SymmetricMemoryAllGather(nn.Module):
             dim = ndim + dim
         if dim < 0 or dim >= ndim:
             return False
-        # Output = world_size * inp (gathered along the specified dim).
-        out_bytes = inp.numel() * self.world_size * inp.element_size()
-        if out_bytes > self.max_size:
+        # Only dim-0 is served; other dims fall back to NCCL.
+        if dim != 0:
+            return False
+        # multimem_all_gather_out requires 4B-aligned input.
+        inp_bytes = inp.numel() * inp.element_size()
+        if inp_bytes % 4 != 0:
+            return False
+        # Output = world_size * inp; must fit in pre-allocated workspace.
+        # Use >= to match SymmetricMemoryAllReduce's bound.
+        out_bytes = inp_bytes * self.world_size
+        if out_bytes >= self.max_size:
             return False
         return True
 
@@ -169,16 +212,14 @@ class SymmetricMemoryAllGather(nn.Module):
         out_shape = list(inp.shape)
         out_shape[0] = inp.shape[0] * self.world_size
 
-        symm_mem = torch_symm_mem.get_symm_mem_workspace(
-            self.group_name_str,
-            min_size=inp.numel() * self.world_size * inp.element_size(),
-        )
-        out = symm_mem.get_buffer(
-            symm_mem.rank,
+        out = self._symm_mem.get_buffer(
+            self._symm_mem.rank,
             torch.Size(out_shape),
             inp.dtype,
         )
         torch.ops.symm_mem.multimem_all_gather_out(inp.contiguous(), self.group_name_str, out)
+        # Clone so the caller can safely outlive the next forward (which
+        # would otherwise overwrite this same workspace slice).
         return out.clone()
 
     def forward(
@@ -187,24 +228,13 @@ class SymmetricMemoryAllGather(nn.Module):
         dim: int = 0,
     ) -> Optional[torch.Tensor]:
         """
-        Perform allgather using multimem_all_gather_out.
+        Perform allgather using multimem_all_gather_out along dim 0.
 
-        Supports any gather dimension by transposing to dim-0 internally.
         Returns the gathered tensor, or ``None`` if this call cannot be
-        served by symm_mem (caller should fall back to NCCL).
+        served by symm_mem (caller should fall back to NCCL). Non-zero
+        gather dims are deliberately rejected — see class docstring.
         """
         if not self.can_use_symm_mem(inp, dim):
             return None
 
-        # Normalize dim.
-        if dim < 0:
-            dim = inp.ndim + dim
-
-        if dim == 0:
-            return self._allgather_dim0(inp)
-
-        # For dim != 0: move the gather dim to position 0,
-        # allgather along dim-0, then move it back.
-        inp_t = inp.transpose(0, dim).contiguous()
-        gathered = self._allgather_dim0(inp_t)
-        return gathered.transpose(0, dim).contiguous()
+        return self._allgather_dim0(inp)
