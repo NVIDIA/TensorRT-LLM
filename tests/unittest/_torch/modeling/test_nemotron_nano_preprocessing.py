@@ -23,7 +23,7 @@ from tensorrt_llm._torch.models.modeling_nemotron_nano import (
     get_video_target_size_and_feature_size,
     video_to_pixel_values,
 )
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import MultimodalParams, find_mm_token_positions
 
 
 def make_tiler(**overrides):
@@ -249,6 +249,19 @@ def _make_nano_processor(*, sound_config, **overrides):
     proc._img_end_token_ids = [501]
     proc.image_start_token_id = 500
     proc.image_end_token_id = 501
+
+    # When sound_config is None, the constructor still runs
+    # `self._sound_context_token_id = getattr(config, "sound_context_token_id", None)`
+    # against the Mock config, which returns a Mock instead of None. That
+    # would later sneak into get_mm_token_ids / get_mm_special_token_ids and
+    # raise "Mock object cannot be interpreted as an integer" inside
+    # torch.tensor. Force the audio attributes to None to match the real
+    # no-audio case. (When sound_config is provided, __init__ overwrites
+    # these from the tokenizer, so the audio path is unaffected.)
+    if sound_config is None:
+        proc._sound_context_token_id = None
+        proc._sound_start_token_id = None
+        proc._sound_end_token_id = None
 
     return proc
 
@@ -1588,6 +1601,85 @@ class TestGetNumTokensPerVideoInvariants:
             f"maintain_aspect_ratio={maintain_aspect_ratio}, "
             f"frame_dims={frame_dims})"
         )
+
+
+class TestMultiTokenWrappersConsistency:
+    """End-to-end regression for multi-token BPE wrappers (`<img>`, `</img>`).
+
+    `get_num_tokens_per_image` adds `len(_img_start_token_ids) +
+    len(_img_end_token_ids)` so multi-token BPE wrappers are correctly counted.
+    For that count to line up at the assertion in `find_mm_token_positions`
+    (`len(mm_positions) == sum(num_mm_tokens)`), `get_mm_special_token_ids`
+    must include **every** ID in those wrapper lists — not just the [0]
+    aliases. Otherwise trailing wrapper tokens are seen as plain text and the
+    counts diverge.
+    """
+
+    @staticmethod
+    def _make_multi_token_wrapper_processor():
+        """Processor whose <img>/</img> tokenize to multi-element BPE lists.
+
+        Real production tokenizers usually register these as single added
+        special tokens, but this exercises the BPE-fallback case the class
+        explicitly accounts for in __init__ ("These may be multi-token under
+        BPE, so we store the full ID list.").
+        """
+        proc = _make_processor()
+        # Multi-token BPE encodings — chosen to be distinct from
+        # img_context_token_id (20), video_context_token_id (21), and any
+        # plausible mock-tokenizer text-encoding range.
+        proc._img_start_token_ids = [9100, 9101, 9102]
+        proc._img_end_token_ids = [9200, 9201]
+        proc.image_start_token_id = proc._img_start_token_ids[0]
+        proc.image_end_token_id = proc._img_end_token_ids[0]
+        return proc
+
+    def test_get_mm_special_token_ids_includes_all_wrapper_tokens(self):
+        proc = self._make_multi_token_wrapper_processor()
+        special_ids = set(proc.get_mm_special_token_ids().tolist())
+        # Every BPE token in the wrapper lists must be present.
+        for tok in proc._img_start_token_ids + proc._img_end_token_ids:
+            assert tok in special_ids, (
+                f"get_mm_special_token_ids missing wrapper token {tok}; "
+                f"returned={sorted(special_ids)}"
+            )
+        # The single-ID alias is no longer authoritative on its own, but it
+        # must remain present (it's a member of the full list anyway).
+        assert proc.image_start_token_id in special_ids
+        assert proc.image_end_token_id in special_ids
+
+    def test_find_mm_token_positions_matches_get_num_tokens_per_image(self):
+        """End-to-end invariant: with multi-token wrappers, the count
+        reported by get_num_tokens_per_image must equal the number of mm
+        positions find_mm_token_positions extracts from the expanded prompt.
+        Before the get_mm_special_token_ids fix, only the first BPE token of
+        each wrapper was masked as special and this assertion was off by
+        `(len(start) - 1) + (len(end) - 1)` per image."""
+        proc = self._make_multi_token_wrapper_processor()
+        img_ctx = proc.img_context_token_id  # 20
+
+        # Build a single-image prompt: [text..., <image>, text...]
+        prompt = [1, 2, img_ctx, 3]
+
+        # Use the real per-image count (includes feature tokens + wrappers).
+        num_per_image = proc.get_num_tokens_per_image(image=Image.new("RGB", (320, 320)))
+        expanded = proc._expand_image_placeholders_in_token_ids(prompt, [num_per_image])
+
+        # Mirror the fast path's call to find_mm_token_positions.
+        start_positions, _ = find_mm_token_positions(
+            input_ids=expanded,
+            num_mm_tokens=[num_per_image],
+            mm_token_ids=proc.get_mm_token_ids(),
+            mm_special_token_ids=proc.get_mm_special_token_ids(),
+        )
+
+        # find_mm_token_positions internally asserts
+        #   len(mm_positions) == sum(num_mm_tokens)
+        # so reaching here without an exception is the regression check. Also
+        # sanity-check the start position lands at the expected offset.
+        assert len(start_positions) == 1
+        # The image expansion starts after the two leading prompt tokens.
+        assert start_positions[0] == 2
 
 
 @pytest.mark.skipif(not importlib.util.find_spec("librosa"), reason="librosa not installed")

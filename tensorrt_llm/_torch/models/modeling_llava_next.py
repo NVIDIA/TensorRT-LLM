@@ -155,6 +155,7 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         prompt_token_ids: List[int],
         num_mm_tokens_per_placeholder: List[int],
         hf_processor_mm_kwargs: Optional[Dict[str, Any]] = None,
+        **kwargs,
     ) -> Tuple[List[int], Optional[Dict[str, Dict[str, Any]]]]:
         """
         Expands MM placeholder tokens in `prompt_token_ids` so that each single placeholder

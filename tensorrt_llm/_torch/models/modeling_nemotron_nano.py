@@ -994,10 +994,10 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
     def get_mm_special_token_ids(self) -> torch.Tensor:
         "Return multimodal special token ids for NanoV2VL."
-        ids = [self.image_start_token_id, self.image_end_token_id]
+        ids = list(self._img_start_token_ids) + list(self._img_end_token_ids)
         if self._sound_start_token_id is not None:
             ids.extend([self._sound_start_token_id, self._sound_end_token_id])
-        return torch.tensor(ids)
+        return torch.tensor(sorted(set(ids)))
 
     def get_mm_token_ids(self):
         ids = [self.img_context_token_id]
