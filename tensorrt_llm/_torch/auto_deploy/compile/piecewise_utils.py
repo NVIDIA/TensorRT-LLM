@@ -249,59 +249,17 @@ def is_metadata_prep(submod: nn.Module) -> bool:
     return False
 
 
-def is_aux_compute_submod(submod: nn.Module) -> bool:
-    """Return True if this dynamic submodule contains an _aux compute op.
-
-    _aux compute ops (e.g. trtllm_dist_all_gather_aux) produce new output
-    tensors and need stable output addresses for downstream CUDA graphs.
-    Pure passthrough stream-switch ops (begin/end/wait_aux_stream) are excluded.
-    """
-    if not isinstance(submod, GraphModule):
-        return False
-
-    for node in submod.graph.nodes:
-        if node.op != "call_function":
-            continue
-        func_name = getattr(node.target, "__name__", "")
-        if func_name in _STREAM_SWITCH_FUNCTION_NAMES:
-            continue
-        target = node.target
-        if hasattr(target, "name") and callable(target.name):
-            op_name = target.name()
-        elif hasattr(target, "__qualname__"):
-            op_name = target.__qualname__
-        else:
-            op_name = str(target)
-        if "_aux" in op_name:
-            return True
-    return False
-
-
 # ---------------------------------------------------------------------------
 # Graph splitting
 # ---------------------------------------------------------------------------
 
 
 def _is_stream_switch_node(node: Node) -> bool:
-    """Return True if *node* is a multi-stream passthrough or aux-stream op."""
+    """Return True if *node* is a multi-stream passthrough function."""
     if node.op != "call_function":
         return False
     func_name = getattr(node.target, "__name__", "")
-    if func_name in _STREAM_SWITCH_FUNCTION_NAMES:
-        return True
-    # Ops with _aux suffix run on the aux CUDA stream and cannot be captured
-    # in a CUDA graph on the main stream. Check multiple name resolution paths
-    # since node.target can be OpOverload, OpOverloadPacket, or plain function.
-    target = node.target
-    if hasattr(target, "name") and callable(target.name):
-        op_name = target.name()
-    elif hasattr(target, "__qualname__"):
-        op_name = target.__qualname__
-    else:
-        op_name = str(target)
-    if "_aux" in op_name:
-        return True
-    return False
+    return func_name in _STREAM_SWITCH_FUNCTION_NAMES
 
 
 def _submod_has_stream_switch(submod: GraphModule) -> bool:
