@@ -21,7 +21,8 @@ from tensorrt_llm._torch.attention_backend import \
     interface as attention_interface
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_utils
-from tensorrt_llm._torch.models.modeling_multimodal_utils import MmEncoderMixin
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import \
+    MmEncoderMixin
 from tensorrt_llm._torch.models.multimodal_encoder_graph import (
     EncoderGraphKey, EncoderGraphTensorSpec, EncoderMetadataProvider,
     MultimodalEncoderGraphRunner)

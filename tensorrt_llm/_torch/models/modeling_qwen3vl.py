@@ -43,9 +43,9 @@ from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_multimodal_encoder import MmEncoderMixin
 from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_multimodal_utils import (
-    MmEncoderMixin,
     filter_mm_token_from_input_ids,
     find_input_mm_embeds,
     fuse_input_embeds,

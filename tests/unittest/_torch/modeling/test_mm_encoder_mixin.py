@@ -9,7 +9,7 @@ backend (and any GPU/CUDA dependency).
 
 import torch.nn as nn
 
-from tensorrt_llm._torch.models.modeling_multimodal_utils import MmEncoderMixin
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import MmEncoderMixin
 
 
 class _StubMetadata:

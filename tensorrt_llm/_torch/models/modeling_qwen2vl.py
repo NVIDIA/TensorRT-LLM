@@ -65,11 +65,12 @@ except ImportError:
 from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding, RotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_multimodal_encoder import MmEncoderMixin
 from .modeling_multimodal_mixin import MultimodalModelMixin
 from .modeling_multimodal_utils import (
-    MmEncoderMixin, _install_processor_output_validation_filter,
-    find_input_mm_embeds, fuse_input_embeds,
-    get_attached_multimodal_embeddings, get_multimodal_embeddings)
+    _install_processor_output_validation_filter, find_input_mm_embeds,
+    fuse_input_embeds, get_attached_multimodal_embeddings,
+    get_multimodal_embeddings)
 from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
                              filter_weights, register_auto_model,
                              register_vision_encoder)
