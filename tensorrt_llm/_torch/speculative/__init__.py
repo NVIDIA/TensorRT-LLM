@@ -1,4 +1,5 @@
 from .auto_heuristic import suggest_spec_config
+from .dflash import DFlashSpecMetadata, DFlashWorker
 from .draft_target import (DraftTargetOneModelSpecMetadata,
                            DraftTargetOneModelWorker)
 from .eagle3 import Eagle3SpecMetadata
@@ -23,6 +24,8 @@ from .utils import (get_draft_kv_cache_manager, get_num_extra_kv_tokens,
                     get_spec_worker, update_spec_config_from_model_config)
 
 __all__ = [
+    "DFlashSpecMetadata",
+    "DFlashWorker",
     "DraftTargetOneModelSpecMetadata",
     "DraftTargetOneModelWorker",
     "Eagle3SpecMetadata",
