@@ -4768,7 +4768,8 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-30B-A3B-Instruct-2507"
     MODEL_PATH = f"{llm_models_root()}/{MODEL_NAME}"
 
-    @skip_pre_hopper
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(140000)
     @parametrize_with_ids("fp8kv", [False, True])
     @pytest.mark.parametrize(
         "target_sparsity,thr_prefill,thr_decode",
