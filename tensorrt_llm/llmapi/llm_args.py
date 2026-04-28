@@ -601,6 +601,14 @@ class MoeConfig(StrictBaseModel):
 
 Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core']
 
+# Short aliases for built-in custom tokenizers.
+# Maps alias → full import path (module.ClassName).
+TOKENIZER_ALIASES = {
+    'deepseek_v32': 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
+    'deepseek_v4': 'tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer',
+    'glm_moe_dsa': 'tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer',
+}
+
 
 class Nvfp4GemmConfig(StrictBaseModel):
     """
@@ -2918,16 +2926,7 @@ class BaseLlmArgs(StrictBaseModel):
                     "Please specify a tokenizer path or leave it as None to load from model path."
                 )
 
-            # Support short aliases for built-in tokenizers
-            TOKENIZER_ALIASES = {
-                'deepseek_v32':
-                'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
-                'deepseek_v4':
-                'tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer',
-                'glm_moe_dsa':
-                'tensorrt_llm.tokenizer.glm_moe_dsa.GlmMoeDsaTokenizer',
-            }
-
+            # Resolve short aliases via the module-level TOKENIZER_ALIASES.
             tokenizer_path = TOKENIZER_ALIASES.get(self.custom_tokenizer,
                                                    self.custom_tokenizer)
 
