@@ -183,8 +183,8 @@ MODEL_PATH_DICT = {
     "nemotron_3_super_120b_nvfp4_mtp":
     "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
     "kimi_k2_nvfp4": "Kimi-K2-Thinking-NVFP4",
-    # MiniMax M2.5 (BF16, ~230B MoE)
-    "minimax_m2.5": "MiniMax-M2.5",
+    # MiniMax M2.5 (FP8 block-scale, ~230B MoE)
+    "minimax_m2.5_fp8": "MiniMax-M2.5",
     # Qwen3.5 dense + MoE
     "qwen3.5_9b": "Qwen3.5-9B",
     "qwen3.5_27b": "Qwen3.5-27B",
@@ -1009,12 +1009,25 @@ class PerfTestConfig:
                 ), f"gpt_350m and bloom_560m with small BS are very unstable! Please increase to at least 32."
 
         try:
-            available_gpus = get_device_count()
+            local_gpus = get_device_count()
         except Exception:
-            available_gpus = None
-        if available_gpus is not None and self.num_gpus > available_gpus:
+            local_gpus = None
+
+        # In multi-node runs num_gpus is the total across all nodes, but
+        # get_device_count() only sees GPUs on the current node. Use SLURM
+        # env vars (set by the launcher) to compute the cluster total; fall
+        # back to the local count for single-node runs.
+        nnodes = int(
+            os.environ.get("SLURM_JOB_NUM_NODES")
+            or os.environ.get("SLURM_NNODES") or 1)
+        gpus_per_node = int(os.environ.get("SLURM_GPUS_ON_NODE")
+                            or 0) or local_gpus
+        total_gpus = (nnodes * gpus_per_node) if gpus_per_node else local_gpus
+
+        if total_gpus is not None and self.num_gpus > total_gpus:
             pytest.skip(
-                f"Test requires {self.num_gpus} GPUs but only {available_gpus} available"
+                f"Test requires {self.num_gpus} GPUs but only {total_gpus} available "
+                f"(local={local_gpus}, nnodes={nnodes}, gpus_per_node={gpus_per_node})"
             )
 
     def get_model_family(self) -> str:
