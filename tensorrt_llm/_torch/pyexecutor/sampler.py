@@ -3935,36 +3935,42 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         Returns:
             The logits with min length penalty applied
         """
-        if any(
+        if not any(
             r.py_min_length and (r.max_beam_num_tokens - r.py_orig_prompt_len) < r.py_min_length[0]
             for r in requests
         ):
-            current_offset = 0
-            for index, r in enumerate(requests):
-                if r.py_min_length:
-                    # Use the original end_id (before ignore_eos override)
-                    # so we suppress the real EOS token, not token -1.
-                    end_id = getattr(r, "py_original_end_id", r.py_end_id)
-                    if end_id is not None and end_id > -1:
-                        for beam_idx in range(num_beams[index]):
-                            for step in range(num_steps[index]):
-                                if (
-                                    r.get_num_tokens(beam_idx) - r.py_orig_prompt_len
-                                ) + step < r.py_min_length[0]:
-                                    # NOTE(jthomson04): We can NOT just assign logits[...] = float("-inf").
-                                    # This introduces a pageable HtoD transfer, which wreaks havoc on TPOT (up to ~20%)
-                                    # Instead, we create a little tensor on device, then assign to that.
-                                    # This way, we avoid the pageable transfer.
-                                    neg_inf_tensor = torch.full(
-                                        (), float("-inf"), device=logits.device
-                                    )
-                                    logits[
-                                        current_offset + num_steps[index] * beam_idx + step, end_id
-                                    ] = neg_inf_tensor
+            return logits
+
+        rows: list[int] = []
+        cols: list[int] = []
+        current_offset = 0
+        for index, r in enumerate(requests):
+            if r.py_min_length:
+                # Use the original end_id (before ignore_eos override)
+                # so we suppress the real EOS token, not token -1.
+                end_id = getattr(r, "py_original_end_id", r.py_end_id)
+                if end_id is not None and end_id > -1:
+                    for beam_idx in range(num_beams[index]):
+                        for step in range(num_steps[index]):
+                            if (
+                                r.get_num_tokens(beam_idx) - r.py_orig_prompt_len
+                            ) + step < r.py_min_length[0]:
+                                rows.append(current_offset + num_steps[index] * beam_idx + step)
+                                cols.append(end_id)
                             else:
-                                # early exit
                                 break
-                current_offset += num_steps[index] * num_beams[index]
+            current_offset += num_steps[index] * num_beams[index]
+
+        if rows:
+            neg_inf = torch.full((), float("-inf"), dtype=logits.dtype, device=logits.device)
+            row_idx = torch.tensor(rows, dtype=torch.long, pin_memory=prefer_pinned()).to(
+                logits.device, non_blocking=True
+            )
+            col_idx = torch.tensor(cols, dtype=torch.long, pin_memory=prefer_pinned()).to(
+                logits.device, non_blocking=True
+            )
+            logits.index_put_((row_idx, col_idx), neg_inf, accumulate=False)
+
         return logits
 
     @staticmethod
