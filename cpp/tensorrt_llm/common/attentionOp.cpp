@@ -723,6 +723,26 @@ int AttentionOp::getHeadSize(bool checkInit) const
     return mHeadSize;
 }
 
+size_t AttentionOp::getContextFmhaMultiCtasKvScratchSize() const noexcept
+{
+    if (!useTllmGenSparseAttention())
+    {
+        return 0;
+    }
+
+    static constexpr size_t kMultiCtasKvRowsPerCta = 256;
+    static constexpr size_t kMultiCtasKvStatsPerRow = 2;
+    static constexpr size_t kMultiCtasKvPartialOElementSize = 2; // We always bfloat16 for partial O
+
+    size_t const headDim
+        = useSparseMLA() ? static_cast<size_t>(mMLAParams.kv_lora_rank) : static_cast<size_t>(getHeadSize());
+    size_t const maxRows = kMultiCtasKvRowsPerCta * static_cast<size_t>(mMultiProcessorCount);
+    size_t const partialStatsSize = sizeof(float) * kMultiCtasKvStatsPerRow * maxRows;
+    size_t const partialOSize = kMultiCtasKvPartialOElementSize * maxRows * headDim;
+
+    return partialStatsSize + partialOSize;
+}
+
 size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t max_num_seq, int32_t input_seq_length,
     int32_t cross_kv_length, int32_t max_num_tokens) const noexcept
 {
@@ -837,16 +857,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
         ? 0
         : (2 * size * cpMaxPaddedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads) + cu_seqlens_size);
 
-    // Single scratch pool [partialStats | partialO] for trtllm-gen MultiCtasKv mode when the
-    // sparse context path picks a GmemReduction cubin.
-    bool const sparseContextNeedsMultiCtasKv = useTllmGenSparseAttention();
-    size_t const sparse_max_head_dim = useSparseMLA()
-        ? static_cast<size_t>(mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim)
-        : static_cast<size_t>(getHeadSize());
-    size_t const fmha_multi_ctas_kv_scratch_size = sparseContextNeedsMultiCtasKv
-        ? (sizeof(float) * 2 * 256 * static_cast<size_t>(mMultiProcessorCount)
-            + size * 256 * static_cast<size_t>(mMultiProcessorCount) * sparse_max_head_dim)
-        : 0;
+    size_t const fmha_multi_ctas_kv_scratch_size = getContextFmhaMultiCtasKvScratchSize();
 
     int const NUM_BUFFERS = 27;
     size_t workspaces[NUM_BUFFERS];
@@ -1512,14 +1523,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     size_t const cpWorkspaceSize
         = mCpSize == 1 ? 0 : 2 * sizeof(T) * cpMaxPadedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads);
 
-    // Single scratch pool for trtllm-gen MultiCtasKv mode.
-    size_t const sparse_max_head_dim = useSparseMLA()
-        ? static_cast<size_t>(mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim)
-        : static_cast<size_t>(getHeadSize());
-    size_t const fmha_multi_ctas_kv_scratch_size = useTllmGenSparseAttention()
-        ? (sizeof(float) * 2 * 256 * static_cast<size_t>(mMultiProcessorCount)
-            + sizeof(T) * 256 * static_cast<size_t>(mMultiProcessorCount) * sparse_max_head_dim)
-        : 0;
+    size_t const fmha_multi_ctas_kv_scratch_size = getContextFmhaMultiCtasKvScratchSize();
 
     bool const is_qk_buf_float_ = true;
 
