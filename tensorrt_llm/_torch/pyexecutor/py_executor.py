@@ -3110,6 +3110,19 @@ class PyExecutor:
 
         max_new_requests = total_max - total_num_active_requests
 
+        # Benchmark disagg fill-phase admission control. Without this cap, the
+        # executor can admit up to `total_max` requests in a single iteration as
+        # soon as the benchmark queue is preloaded, which spikes peak KV-cache
+        # reservations + recv-buffer reservations and can OOM-kill the GEN
+        # server before any KV transfer drains.  The `tp_size` cap restores the
+        # conservative per-rank rate that PR #12091 had in its blocking fill
+        # loop: one new request per rank per executor iteration.  It is scoped
+        # to the initial fill only; once the gate fires, normal admission
+        # resumes.
+        if (self.is_benchmark_disagg and self._benchmark_fill_phase_active
+                and not self.is_warmup):
+            max_new_requests = min(max_new_requests, self.dist.tp_size)
+
         return get_from_waiting_queue(
             waiting_queue,
             max_new_requests,

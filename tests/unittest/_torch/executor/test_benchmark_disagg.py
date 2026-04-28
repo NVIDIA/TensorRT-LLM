@@ -529,6 +529,79 @@ class TestPrepareAndScheduleBatchNoBlock:
 
 
 # ---------------------------------------------------------------------------
+# Benchmark fill admission flow control
+# ---------------------------------------------------------------------------
+
+
+class TestBenchmarkFillAdmissionFlowControl:
+    """Verify benchmark disagg fill admits requests gradually.
+
+    The failing wide-EP Kimi case has ``benchmark_req_queues_size`` equal to
+    ``tp_size * max_batch_size``.  Without an explicit fill-phase cap, GEN can
+    admit the entire benchmark queue in one iteration, prepare too many KV
+    receives before the first forward pass, and hit process-level memory
+    pressure.  The desired invariant is non-blocking flow control: each
+    executor iteration should still return to the outer loop, but it should
+    only admit a small bounded number of new requests during the fill phase.
+    """
+
+    @staticmethod
+    def _make_executor(tp_size: int = 4, fill_phase_active: bool = True):
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+        ex = object.__new__(PyExecutor)
+        ex.enable_attention_dp = True
+        ex.is_benchmark_disagg = True
+        ex._benchmark_fill_phase_active = fill_phase_active
+        ex.benchmark_req_queues_size = 32
+        ex.num_fetch_requests = 0
+        ex.max_num_active_requests = 8
+
+        ex.dist = Mock()
+        ex.dist.tp_size = tp_size
+        return ex
+
+    @pytest.mark.parametrize("tp_size", [1, 4, 32])
+    @patch("tensorrt_llm._torch.pyexecutor.py_executor.get_from_waiting_queue")
+    def test_fill_phase_caps_admission_to_tp_size(self, mock_get_from_waiting_queue, tp_size):
+        ex = self._make_executor(tp_size=tp_size)
+        waiting_queue = Mock()
+        all_ranks_num_active_requests = [0] * tp_size
+
+        ex._pop_from_waiting_queue(
+            waiting_queue,
+            total_num_active_requests=0,
+            all_ranks_num_active_requests=all_ranks_num_active_requests,
+        )
+
+        mock_get_from_waiting_queue.assert_called_once()
+        _, max_new_requests = mock_get_from_waiting_queue.call_args.args[:2]
+
+        assert max_new_requests == ex.dist.tp_size, (
+            "Benchmark disagg fill should admit at most tp_size requests per "
+            "executor iteration.  Using full global capacity would admit "
+            "tp_size * max_batch_size requests at once and recreate the "
+            "fill-phase memory-pressure failure."
+        )
+
+    @patch("tensorrt_llm._torch.pyexecutor.py_executor.get_from_waiting_queue")
+    def test_no_fill_phase_uses_full_available_capacity(self, mock_get_from_waiting_queue):
+        ex = self._make_executor(fill_phase_active=False)
+        waiting_queue = Mock()
+        all_ranks_num_active_requests = [0, 0, 0, 0]
+
+        ex._pop_from_waiting_queue(
+            waiting_queue,
+            total_num_active_requests=0,
+            all_ranks_num_active_requests=all_ranks_num_active_requests,
+        )
+
+        _, max_new_requests = mock_get_from_waiting_queue.call_args.args[:2]
+
+        assert max_new_requests == ex.dist.tp_size * ex.max_num_active_requests
+
+
+# ---------------------------------------------------------------------------
 # ADP router per-rank cap  (prevents overflow that caused nvbug 6071070)
 # ---------------------------------------------------------------------------
 
@@ -810,6 +883,7 @@ class TestFillPhaseEndToEnd:
         ex._benchmark_fill_phase_active = True
         ex.enable_attention_dp = True
         ex.num_fetch_requests = 0
+        ex.max_num_active_requests = self.MAX_BATCH_SIZE
         ex.dist = Mock(rank=0, tp_size=self.TP_SIZE)
         ex.is_shutdown = False
         ex._is_warmup = False
@@ -839,6 +913,21 @@ class TestFillPhaseEndToEnd:
     def test_full_lifecycle(self):
         """Simulate the fill → gate-open → post-fill lifecycle."""
         ex = self._make_executor()
+
+        # Phase 0: Fill-phase admission uses the real waiting-queue path and
+        # pulls only tp_size requests per iteration, rather than the full
+        # tp_size * max_batch_size queue.
+        with patch(
+            "tensorrt_llm._torch.pyexecutor.py_executor.get_from_waiting_queue"
+        ) as mock_get_from_waiting_queue:
+            ex._pop_from_waiting_queue(
+                waiting_queue=Mock(),
+                total_num_active_requests=0,
+                all_ranks_num_active_requests=[0] * self.TP_SIZE,
+            )
+
+        _, max_new_requests = mock_get_from_waiting_queue.call_args.args[:2]
+        assert max_new_requests == self.TP_SIZE
 
         # Phase 1: Fetching requests (gate should not open)
         ex.num_fetch_requests = 4
