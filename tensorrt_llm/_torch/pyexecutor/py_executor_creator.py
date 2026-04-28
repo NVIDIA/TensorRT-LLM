@@ -726,6 +726,11 @@ def create_py_executor(
                 "KV connector is not supported with VSWA (Variable Sliding Window Attention)."
             )
 
+        if mapping.enable_attention_dp:
+            raise NotImplementedError(
+                "KV connector is not supported with attention data parallelism (enable_attention_dp=True)."
+            )
+
         try:
             module = importlib.import_module(
                 kv_connector_config.connector_module)
