@@ -42,7 +42,10 @@ def temp_extra_llm_api_options_file():
             },
             # Disable CUDA graph
             # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-            "cuda_graph_config": None
+            "cuda_graph_config": None,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5
+            },
         }
 
         with open(temp_file_path, 'w') as f:

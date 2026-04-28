@@ -300,7 +300,7 @@ def create_py_executor(
         A fully initialized PyExecutor instance.
     """
 
-    skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
+    skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '1') == '1'
     llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
         llm_args, checkpoint_dir)
 
