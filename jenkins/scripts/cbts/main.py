@@ -133,6 +133,21 @@ class Selector:
             affected_stages |= r.affected_stages
             tests |= r.tests
 
+        # Safety net: if rules fired but no Jenkins stages resolved (waive ids
+        # missed both exact and parent-chain lookups in the YAML index), fall
+        # back to baseline. Returning a non-None scope with empty stages would
+        # let Layer 1 in Groovy mistake `affected_cpu_arch=∅` for "no arch
+        # needed" and silently skip both x86 and SBSA tracks.
+        if not affected_stages:
+            return SelectionResult(
+                scope=None,
+                reasons=reasons
+                + [
+                    "Rules fired but no stages resolved (likely YAML/waive "
+                    "granularity mismatch); falling back to baseline."
+                ],
+            )
+
         affected_cpu_arch = {
             self.stages[name].cpu_arch for name in affected_stages if name in self.stages
         }

@@ -72,6 +72,51 @@ def normalize_test_id(test_id: str) -> str:
     return _TEST_ID_PREFIX_RE.sub("", s)
 
 
+# Detect a pytest-style option flag (e.g. ` -k`, ` -m`) inside a YAML target
+# spec. Used to peel `-k "..."` / `-m "..."` off so the bare path/node-id can
+# be indexed as an additional lookup key — that lets a fine-grained waive id
+# match a coarse YAML entry like `dir/x.py -k "deepseek"`.
+_PYTEST_OPTION_RE = re.compile(r"\s+-[a-zA-Z]\b")
+
+
+def _strip_pytest_options(s: str) -> str:
+    """Return `s` with any pytest option flag (and everything after it) removed.
+
+    `dir/x.py -k "deepseek"`        -> `dir/x.py`
+    `x.py::test_y -m "gpu1"`        -> `x.py::test_y`
+    `x.py`                          -> `x.py`  (unchanged)
+    """
+    m = _PYTEST_OPTION_RE.search(s)
+    return s[: m.start()].rstrip() if m else s
+
+
+def _iter_parent_ids(test_id: str):
+    """Yield ancestor forms of a pytest target id, most-specific to least.
+
+    `dir/x.py::TestC::test_m[a-b]` yields:
+        `dir/x.py::TestC::test_m`     (strip `[params]`)
+        `dir/x.py::TestC`             (strip `::test_m`)
+        `dir/x.py`                    (strip `::TestC`)
+        `dir`                         (strip `/x.py`)
+
+    Lets `blocks_containing_test` match coarser YAML entries (file, class,
+    directory) when the waive id is finer-grained.
+    """
+    s = test_id
+    if "[" in s:
+        s = s.rsplit("[", 1)[0]
+        if s:
+            yield s
+    while "::" in s:
+        s = s.rsplit("::", 1)[0]
+        if s:
+            yield s
+    while "/" in s:
+        s = s.rsplit("/", 1)[0]
+        if s:
+            yield s
+
+
 class YAMLIndex:
     """Index of all blocks across test-db YAMLs, with reverse lookup by test id."""
 
@@ -101,17 +146,37 @@ class YAMLIndex:
                 tests=list(tests),
             )
             self.blocks.append(block)
-            # Index each test under both its raw YAML string (which may carry
-            # ` -m "gpu2"`, ` TIMEOUT (90)`, etc.) and its normalized form, so
-            # waives.txt lookups — which strip SKIP/TIMEOUT — still resolve.
+            # Index each test under up to three keys so a waive id can match
+            # YAML entries written at any granularity:
+            #   1. raw YAML string    (with TIMEOUT/markers as written)
+            #   2. normalized form    (SKIP/TIMEOUT/full:gpu prefix stripped)
+            #   3. target-only form   (pytest options like `-k "..."` stripped)
+            # Waive-side lookup walks the pytest node-id parent chain, so a
+            # coarse YAML entry (file / dir / `dir/x.py -k "kw"`) matches a
+            # fine-grained waive (`dir/x.py::TestC::test_m[params]`).
             for test in tests:
-                self._test_to_blocks.setdefault(test, []).append(block)
-                normalized = normalize_test_id(test)
-                if normalized and normalized != test:
-                    self._test_to_blocks.setdefault(normalized, []).append(block)
+                seen: set[str] = set()
+                for key in (
+                    test,
+                    normalize_test_id(test),
+                    _strip_pytest_options(normalize_test_id(test)),
+                ):
+                    if key and key not in seen:
+                        seen.add(key)
+                        self._test_to_blocks.setdefault(key, []).append(block)
 
     def blocks_containing_test(self, test_id: str) -> list[Block]:
-        return list(self._test_to_blocks.get(test_id, []))
+        # Exact match first, then walk the pytest node-id parent chain to
+        # also catch coarser YAML entries (file / class / directory).
+        blocks = list(self._test_to_blocks.get(test_id, []))
+        seen_block_keys = {(b.yaml_stem, b.block_index) for b in blocks}
+        for parent in _iter_parent_ids(test_id):
+            for b in self._test_to_blocks.get(parent, []):
+                key = (b.yaml_stem, b.block_index)
+                if key not in seen_block_keys:
+                    seen_block_keys.add(key)
+                    blocks.append(b)
+        return blocks
 
     def all_test_ids(self) -> Iterable[str]:
         return self._test_to_blocks.keys()
