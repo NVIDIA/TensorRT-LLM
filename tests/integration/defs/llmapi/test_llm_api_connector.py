@@ -543,6 +543,20 @@ def test_connector_priorities_default(enforce_single_worker,
 
 
 @pytest.mark.threadleak(enabled=False)
+def test_connector_rejects_host_offloading(enforce_single_worker,
+                                           model_with_connector):
+    # The connector worker is only registered with the primary (GPU) pool, so
+    # combining it with host offloading would silently mishandle blocks that
+    # have been evicted to the secondary pool. Until that's wired up, the
+    # combination must fail loudly at construction time.
+    model_fn, _, _ = model_with_connector
+
+    with pytest.raises(NotImplementedError, match="host"):
+        model_fn(kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1,
+                                               host_cache_size=1024**3))
+
+
+@pytest.mark.threadleak(enabled=False)
 def test_connector_e2e_persistent_cache(enforce_single_worker):
     """Test e2e KV cache connector using PersistentKvCacheConnector from examples.
 

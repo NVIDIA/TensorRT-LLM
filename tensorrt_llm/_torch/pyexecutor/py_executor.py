@@ -647,6 +647,17 @@ class PyExecutor:
                     "KV Cache Connector is not supported with pipeline parallelism."
                 )
 
+            kv_cache_config = getattr(self.llm_args, 'kv_cache_config', None)
+            if kv_cache_config is not None and kv_cache_config.host_cache_size:
+                raise NotImplementedError(
+                    "KV Cache Connector is not supported with KV cache host "
+                    "offloading (KvCacheConfig.host_cache_size). The connector "
+                    "worker is only registered with the primary (GPU) pool and "
+                    "cannot read or write blocks that have been evicted to the "
+                    "secondary (host) pool, and the connector's load/save "
+                    "streams are not synchronized with the internal "
+                    "onboard/offload streams.")
+
             if self.kv_cache_manager is None:
                 raise ValueError(
                     "KV Cache Connector requires a KV Cache Manager.")
