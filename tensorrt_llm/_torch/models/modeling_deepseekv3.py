@@ -42,6 +42,7 @@ from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     ConsumableWeightsDict
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -61,10 +62,7 @@ from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, MoE,
 from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 
 # isort: off
-from ..modules.fused_moe.routing import (Deepseekv3RoutingImpl,
-                                         get_cached_perfect_router_logits,
-                                         precompute_common_perfect_router_logits
-                                         )
+from ..modules.fused_moe.routing import Deepseekv3RoutingImpl
 # isort: on
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
@@ -137,10 +135,13 @@ def weight_dequant(x: torch.Tensor,
 
 
 @torch.compile(dynamic=True)
-def moe_reduce_add_shared_output(routed_output, shared_output):
-    routed_output = torch.sum(routed_output, dim=1, keepdim=False)
+def moe_reduce_add_shared_output(routed_output, shared_output, out=None):
+    routed_reduced = torch.sum(routed_output, dim=1, keepdim=False)
+    if out is not None:
+        torch.add(shared_output, routed_reduced, out=out)
+        return out
     # In-place add to avoid allocating a temporary tensor, reducing peak memory
-    return shared_output.add_(routed_output)
+    return shared_output.add_(routed_reduced)
 
 
 class DeepseekV3WeightLoader:
@@ -981,18 +982,6 @@ class Deepseekv3MoE(nn.Module):
             for key in [EventType.Main, EventType.MoeShared]
         }
 
-        # Store config values for perfect routing.
-        self.model_config = model_config
-        self.dtype = dtype
-
-        # Perfect router caching - precompute common logits if enabled.
-        if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
-            precompute_common_perfect_router_logits(
-                num_experts=num_experts,
-                experts_per_token=top_k,
-                moe_ep_size=model_config.mapping.moe_ep_size,
-                dtype=torch.float32)
-
     def _compute_shared_expert_tp_size(
             self, intermediate_size: int,
             block_size: int) -> tuple[int, float | None]:
@@ -1038,22 +1027,6 @@ class Deepseekv3MoE(nn.Module):
             return model_config.quant_config
         return model_config.quant_config_dict.get(
             f"model.layers.{layer_idx}.mlp.experts", model_config.quant_config)
-
-    def _create_ideal_expert_load_balanced_logits(
-            self, num_tokens: int, num_experts: int,
-            device: torch.device) -> torch.Tensor:
-        """
-        Create ideal logits that produce GPU-aware load balanced expert assignment.
-        This method uses the global cache to access precomputed logits to optimize performance.
-        """
-        # Use global cached logits.
-        return get_cached_perfect_router_logits(
-            num_tokens=num_tokens,
-            num_experts=num_experts,
-            experts_per_token=self.top_k,
-            moe_ep_size=self.model_config.mapping.moe_ep_size,
-            device=device,
-            dtype=torch.float32)
 
     @staticmethod
     def _get_shared_experts_quant_config(model_config,
@@ -1101,17 +1074,6 @@ class Deepseekv3MoE(nn.Module):
                 (0, 0, 0, max(all_rank_num_tokens) - hidden_states.shape[0]))
 
         router_logits = self.gate(hidden_states)
-
-        # Use ideal load balanced logits if enabled, otherwise use gate output.
-        if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
-            # WARNING: This discards the learned gate output and uses ideal logits for perfect load balancing.
-            # Only use this for testing load balancing strategies, not for actual inference.
-            # The gate is still computed to maintain realistic performance measurement.
-            num_tokens, num_experts = router_logits.shape
-            router_logits = self._create_ideal_expert_load_balanced_logits(
-                num_tokens=num_tokens,
-                num_experts=num_experts,
-                device=hidden_states.device)
 
         routed_output = self.experts(
             hidden_states_fp4
@@ -1169,17 +1131,36 @@ class Deepseekv3MoE(nn.Module):
         if not do_finalize:
             return [shared_output, *routed_output]
         else:
+            if not isinstance(shared_output, torch.Tensor):
+                final_hidden_states = shared_output + routed_output
+                if not self.use_dp and self.mapping.tp_size > 1:
+                    final_hidden_states = self.allreduce(
+                        final_hidden_states,
+                        all_reduce_params=final_all_reduce_params)
+                return final_hidden_states
+            output_tensor = None
+            if not self.use_dp and self.mapping.tp_size > 1:
+                w, actual_kind = torch.ops.trtllm.allocate_output(
+                    shared_output, self.allreduce.output_buffer_kind,
+                    self.mapping.tp_group)
+                if actual_kind == int(BufferKind.NCCL_WINDOW):
+                    output_tensor = w
             if routed_output.dim() == 3:
                 assert shared_output.numel(
                 ) * self.top_k == routed_output.numel(
                 ), 'unmatched tensor shape'
                 final_hidden_states = moe_reduce_add_shared_output(
-                    routed_output, shared_output)
+                    routed_output, shared_output, out=output_tensor)
             else:
                 assert shared_output.size() == routed_output.size(
                 ), 'unmatched tensor shape'
-                # In-place add to avoid allocating a temporary tensor, reducing peak memory
-                final_hidden_states = shared_output.add_(routed_output)
+                if output_tensor is not None:
+                    final_hidden_states = torch.add(shared_output,
+                                                    routed_output,
+                                                    out=output_tensor)
+                else:
+                    # In-place add to avoid allocating a temporary tensor, reducing peak memory
+                    final_hidden_states = shared_output.add_(routed_output)
 
             if not self.use_dp and self.mapping.tp_size > 1:
                 final_hidden_states = self.allreduce(

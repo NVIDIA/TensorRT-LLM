@@ -23,7 +23,7 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import Node
 
-from .....llmapi.llm_args import KvCacheConfig
+from ..._compat import KvCacheConfig
 from ...utils.logger import ad_logger
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (

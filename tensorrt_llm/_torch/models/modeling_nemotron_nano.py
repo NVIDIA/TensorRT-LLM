@@ -1772,21 +1772,25 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         self.model_config = model_config
         llm_model_config = copy.deepcopy(model_config)
-        vision_model_config = copy.deepcopy(model_config)
         if hasattr(self, "llm"):
             return
 
-        if not _is_disagg():
-            self.vision_encoder = NanoV2VLVisionEncoder(vision_model_config).eval()
-
+        # Vision and sound encoders are constructed lazily in load_weights(),
+        # after MetaInitMode has exited, because their HuggingFace-based
+        # submodules (RADIO's nn.LayerNorm, HFParakeetEncoder, ...) use
+        # deterministic init ops (ones_, zeros_, fill_, .to(dtype=...),
+        # .detach()) that raise MetaInitException on meta tensors and would
+        # otherwise force the entire model onto the slow fallback path.
+        # Vision+sound weights are only ~2GB combined, so allocating them
+        # on CPU first is cheap, and the LLM's fast meta-init path is kept
+        # intact.
+        #
+        # Snapshot the multimodal ModelConfig now — self.post_config() below
+        # reassigns self.model_config.pretrained_config to the LLM-only
+        # NemotronHConfig, which loses vision_config / sound_config / etc.
+        self._mm_model_config = copy.deepcopy(model_config)
+        self.vision_encoder: Optional[NanoV2VLVisionEncoder] = None
         self.sound_encoder: ProjectedParakeet | None = None
-        sound_config = getattr(config, "sound_config", None)
-        if sound_config is not None:
-            self.sound_encoder = ProjectedParakeet(
-                sound_config,
-                llm_hidden_size=config.llm_config.hidden_size,
-                dtype=getattr(config, "torch_dtype", torch.bfloat16),
-            ).eval()
 
         llm_model_config.pretrained_config = llm_model_config.pretrained_config.llm_config
         self._update_config_for_quantization(llm_model_config)
@@ -1806,12 +1810,45 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         )
 
     def load_weights(self, weights):
+        # Construct vision/sound encoders here (outside MetaInitMode) so their
+        # HF-based submodules allocate regular CPU tensors. Then move them to
+        # CUDA since model.to("cuda") in model_loader already ran for the LLM.
+        # Use the snapshot of the multimodal ModelConfig taken in __init__ —
+        # self.model_config.pretrained_config was overwritten by post_config()
+        # to be the LLM-only config and no longer has vision_config /
+        # sound_config / force_image_size / etc.
+        mm_pretrained = self._mm_model_config.pretrained_config
+        if self.vision_encoder is None and not _is_disagg():
+            self.vision_encoder = NanoV2VLVisionEncoder(self._mm_model_config).eval().to("cuda")
+        sound_config = getattr(mm_pretrained, "sound_config", None)
+        if self.sound_encoder is None and sound_config is not None:
+            self.sound_encoder = (
+                ProjectedParakeet(
+                    sound_config,
+                    llm_hidden_size=mm_pretrained.llm_config.hidden_size,
+                    dtype=getattr(mm_pretrained, "torch_dtype", torch.bfloat16),
+                )
+                .eval()
+                .to("cuda")
+            )
+
         # Load vision encoder weights.
-        self.vision_encoder.load_weights(weights)
+        if self.vision_encoder is not None:
+            self.vision_encoder.load_weights(weights)
+
+        # Free vision encoder weights from the dict so the backing mmap pages can be released.
+        if hasattr(weights, "mark_consumed"):
+            weights.mark_consumed("vision_model")
+            weights.mark_consumed("mlp1")
 
         # Load sound encoder weights.
         if self.sound_encoder is not None:
             self.sound_encoder.load_weights(weights)
+
+        # Free sound encoder weights (whether loaded or not) to allow shard 1 mmap to be released.
+        if hasattr(weights, "mark_consumed"):
+            weights.mark_consumed("sound_encoder")
+            weights.mark_consumed("sound_projection")
 
         # Load language model weights.
         filtered_weights = {
@@ -1822,6 +1859,10 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         weight_mapper = NemotronHHfWeightMapper()
         weight_mapper.init_model_and_config(self.llm, self.model_config)
         self.llm.load_weights(filtered_weights, weight_mapper=weight_mapper)
+
+        # Free LLM weights from the dict to release the backing mmap pages for shards 2-17.
+        if hasattr(weights, "mark_consumed"):
+            weights.mark_consumed("language_model")
 
     @property
     def vocab_size_padded(self) -> int:

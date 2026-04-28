@@ -20,7 +20,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.config import (
+    AttentionConfig,
+    DiffusionModelConfig,
+    create_attention_metadata_state,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -103,6 +107,7 @@ class TestFluxAttentionBackend(unittest.TestCase):
 
         torch.manual_seed(42)
         config = self._create_config("TRTLLM")
+        config.attention_metadata_state = create_attention_metadata_state()
 
         attn = (
             FluxJointAttention(
@@ -175,6 +180,7 @@ class TestFluxAttentionBackend(unittest.TestCase):
                 p.normal_(0, 0.02)
 
         config = self._create_config("TRTLLM")
+        config.attention_metadata_state = create_attention_metadata_state()
         trtllm_attn = (
             FluxJointAttention(
                 hidden_size=dim,

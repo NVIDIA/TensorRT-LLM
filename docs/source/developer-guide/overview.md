@@ -77,3 +77,49 @@ This approach effectively reduces GPU idle time and improves overall hardware oc
 ## Visual Generation
 
 For diffusion-based visual generation (image/video), TensorRT-LLM provides a separate `VisualGen` API and `DiffusionExecutor` with its own pipeline architecture. See the [Visual Generation](../models/visual-generation.md) feature documentation.
+
+## Module-Level Logging
+
+TensorRT-LLM log messages include a fixed-width module tag that identifies which subsystem produced the message:
+
+```txt
+[TRT-LLM] [I] [runtime ] Loading model weights...
+[TRT-LLM] [W] [_torch  ] FlashAttention not available, falling back to default
+[TRT-LLM] [I] [serve   ] Server listening on port 8000
+```
+
+### Module Abbreviation Table
+
+Module names longer than 8 characters are abbreviated to fit the fixed-width tag:
+
+| Module Name | Display Tag |
+|-------------|-------------|
+| `_torch` | `_torch  ` |
+| `batch_manager` | `batchmgr` |
+| `common` | `common  ` |
+| `cutlass_extensions` | `cutl_ext` |
+| `deep_ep` | `deep_ep ` |
+| `deep_gemm` | `deepgemm` |
+| `executor` | `executor` |
+| `executor_worker` | `exec_wkr` |
+| `flash_mla` | `flashmla` |
+| `kernels` | `kernels ` |
+| `layers` | `layers  ` |
+| `runtime` | `runtime ` |
+| `serve` | `serve   ` |
+| `quantization` | `quantize` |
+| `scaffolding` | `scaffold` |
+| `auto_parallel` | `autoprll` |
+| `visual_gen` | `vis_gen ` |
+
+### Per-Module Log Level Filtering
+
+Use `TLLM_LOG_LEVEL_BY_MODULE` to set different log levels per module, overriding the global `TLLM_LOG_LEVEL`:
+
+```bash
+# Format: "level:module1,module2;level:module3"
+export TLLM_LOG_LEVEL=warning
+export TLLM_LOG_LEVEL_BY_MODULE="debug:_torch,runtime;info:serve"
+```
+
+This example sets the global level to `warning` but enables `debug` output for `_torch` and `runtime` modules, and `info` for `serve`. Valid levels: `trace`, `debug`, `verbose`, `info`, `warning`, `error`, `internal_error`.

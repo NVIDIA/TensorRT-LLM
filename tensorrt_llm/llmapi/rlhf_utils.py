@@ -146,6 +146,10 @@ class WorkerExtension:
             logger.error("Encountered an error in update_weights")
             raise e
 
+    def reset_prefix_cache(self) -> None:
+        """Invalidate the KV cache prefix reuse state after weight updates."""
+        self.engine.reset_prefix_cache()
+
     def check_weights_updated(self) -> bool:
         """Check if the weights are updated to 0."""
         weights_updated = True

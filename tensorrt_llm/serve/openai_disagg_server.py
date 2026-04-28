@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,7 +33,8 @@ from tensorrt_llm.executor.executor import CppExecutorError
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole,
-                                              get_ctx_gen_server_addrs)
+                                              get_ctx_gen_server_addrs,
+                                              get_global_disagg_request_id)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.cluster_storage import (HttpClusterStorageServer,
                                                 create_cluster_storage)
@@ -141,7 +142,10 @@ class OpenAIDisaggServer:
         self.register_routes()
 
     def _create_client(self, router: Router, role: ServerRole, max_retries: int = 1) -> OpenAIClient:
-        client = OpenAIHttpClient(router, role, self._req_timeout_secs, max_retries)
+        node_id = self._config.node_id
+        client = OpenAIHttpClient(
+            router, role, self._req_timeout_secs, max_retries,
+            disagg_id_generator=lambda: get_global_disagg_request_id(node_id))
         self._perf_metrics_collector.add_client(client)
         return client
 

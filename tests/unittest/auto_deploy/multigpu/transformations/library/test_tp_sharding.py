@@ -125,11 +125,11 @@ class FP8MLP(nn.Module):
         pytest.param(576, 4, 128, id="non_aligned_uneven_n-N576-ws4"),
     ],
 )
-def test_finegrained_fp8_expand_scale_per_row(weight_original_n, world_size, block_n):
-    """Tests _compute_shard_bounds and _expand_scale_per_row for all shard boundary cases.
+def test_finegrained_fp8_get_sharded_scale(weight_original_n, world_size, block_n):
+    """Tests FineGrained FP8 scale sharding for all shard boundary cases.
 
-    Verifies that _compute_shard_bounds matches torch.tensor_split semantics and that
-    _expand_scale_per_row assigns the correct scale block to every weight row:
+    Verifies that _get_sharded_scale assigns the correct scale block to every
+    weight row:
     - Aligned shards: compact scale slice with block_n preserved for the FP8 GEMM kernel.
     - Non-aligned shards: per-row expansion so each weight row gets its correct block index.
     - N not divisible by block_n: clamp to last scale row avoids out-of-bounds indexing.
@@ -139,23 +139,18 @@ def test_finegrained_fp8_expand_scale_per_row(weight_original_n, world_size, blo
     chunks = torch.tensor_split(torch.arange(weight_original_n), world_size)
 
     for rank in range(world_size):
-        row_start, n_shard = FineGrainedFP8WeightShardingInfo._compute_shard_bounds(
-            weight_original_n, rank, world_size
-        )
-        # _compute_shard_bounds must match torch.tensor_split
-        assert n_shard == len(chunks[rank]), (
-            f"rank={rank}: n_shard={n_shard} != {len(chunks[rank])}"
-        )
-        if len(chunks[rank]) > 0:
-            assert row_start == int(chunks[rank][0]), (
-                f"rank={rank}: row_start={row_start} != {int(chunks[rank][0])}"
-            )
-
+        shard_rows = chunks[rank]
+        n_shard = len(shard_rows)
         if n_shard == 0:
             continue
+        row_start = int(shard_rows[0])
 
-        sharded = FineGrainedFP8WeightShardingInfo._expand_scale_per_row(
-            scale, dim=0, row_start=row_start, n_shard=n_shard
+        sharded = FineGrainedFP8WeightShardingInfo._get_sharded_scale(
+            scale,
+            weight_original_n=weight_original_n,
+            dim=0,
+            rank=rank,
+            world_size=world_size,
         )
 
         aligned = (row_start % block_n == 0) and (n_shard % block_n == 0)
@@ -885,7 +880,7 @@ def _run_pattern_detection_job(
                             config=config,
                             dist_op=dist_op,
                             min_local_shape=min_local_shape,
-                            layer_type=LayerType.ATTENTION,
+                            layer_type=LayerType.MHA,
                         )
                     )
         elif model_cls == MLP:
