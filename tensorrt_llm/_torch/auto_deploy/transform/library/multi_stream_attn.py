@@ -215,8 +215,15 @@ def _execute_kv_path_in_aux_stream(gm: GraphModule, world_size: int) -> Tuple[Gr
                     q_linear.prepend(arg)
 
         # --- Build new KV path BEFORE q_linear in graph order ---
+        # The aux path contains a collective; mark begin/end/wait_aux so
+        # they are bypassed in piecewise mode.
+        kv_kwargs = {"aux_has_collective": True}
         with graph.inserting_before(q_linear):
-            begin_node = graph.call_function(begin_aux_stream_passthrough, args=(fork_point,))
+            begin_node = graph.call_function(
+                begin_aux_stream_passthrough,
+                args=(fork_point,),
+                kwargs=kv_kwargs,
+            )
             begin_node.meta["val"] = fork_point.meta.get("val")
 
             new_kv_args = tuple(begin_node if arg is fork_point else arg for arg in kv_linear.args)
@@ -233,7 +240,11 @@ def _execute_kv_path_in_aux_stream(gm: GraphModule, world_size: int) -> Tuple[Gr
             for k, v in kv_ag.meta.items():
                 new_kv_ag.meta[k] = v
 
-            end_node = graph.call_function(end_aux_stream_passthrough, args=(new_kv_ag,))
+            end_node = graph.call_function(
+                end_aux_stream_passthrough,
+                args=(new_kv_ag,),
+                kwargs=kv_kwargs,
+            )
             end_node.meta["val"] = kv_ag.meta.get("val")
 
         # --- Insert wait_aux before the earliest consumer of old kv_ag ---
@@ -244,7 +255,11 @@ def _execute_kv_path_in_aux_stream(gm: GraphModule, world_size: int) -> Tuple[Gr
         if kv_ag_users:
             earliest_user = kv_ag_users[0]
             with graph.inserting_before(earliest_user):
-                wait_node = graph.call_function(wait_aux_stream_passthrough, args=(end_node,))
+                wait_node = graph.call_function(
+                    wait_aux_stream_passthrough,
+                    args=(end_node,),
+                    kwargs=kv_kwargs,
+                )
                 wait_node.meta["val"] = end_node.meta.get("val")
             kv_ag.replace_all_uses_with(wait_node)
         else:

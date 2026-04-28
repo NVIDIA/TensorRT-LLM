@@ -94,12 +94,17 @@ class CudaStreamManager(metaclass=_Singleton):
 # Every device will have a singleton instance of CudaStreamManager.
 cuda_stream_manager = CudaStreamManager()
 
-# When True, stream-switch passthrough functions become identity (no-op).
-# The piecewise orchestrator sets this to avoid the costly per-layer
-# caller_stream.synchronize() during prefill.  Multi-stream overlap is
-# preserved for monolithic (decode) CUDA graphs where the ops are captured
-# inside torch.cuda.graph() and the sync is unnecessary.
-piecewise_no_stream_switch = False
+# Set to True by the piecewise orchestrator at the start of warmup/capture.
+# Combined with each passthrough's ``aux_has_collective`` kwarg, this gates
+# whether a given stream-switch becomes a no-op in the piecewise (prefill)
+# path.  Aux paths that contain a collective (e.g. MLA Phase 0's
+# ``symm_mem_all_gather_aux``) are skipped during prefill to avoid
+# NCCL/symm_mem stream binding crashes and the costly per-layer
+# ``caller_stream.synchronize()``.  Aux paths without collectives (e.g.
+# ``multi_stream_moe`` shared-expert overlap) keep multi-stream behaviour
+# in piecewise.  Monolithic (decode) capture sets ``aux_has_collective``
+# irrelevant since this flag stays False there.
+disable_aux_stream_switch = False
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +153,7 @@ def begin_aux_stream_passthrough(
     x: torch.Tensor,
     *,
     device: int = -1,
+    aux_has_collective: bool = False,
 ) -> torch.Tensor:
     """Record a CUDA event on the main stream, switch to aux, and wait for it.
 
@@ -155,8 +161,15 @@ def begin_aux_stream_passthrough(
     auxiliary stream.  All subsequent GPU ops dispatched by the FX graph
     interpreter will be recorded on aux until ``end_aux_stream_passthrough``
     switches back to main.
+
+    When ``aux_has_collective=True`` and ``disable_aux_stream_switch`` is set
+    (piecewise/prefill mode), this becomes a no-op so the aux path runs on
+    the caller stream instead.  Use this for aux paths containing NCCL or
+    symm_mem collectives, which crash when invoked on a non-capture aux
+    stream and which trigger the costly per-layer
+    ``caller_stream.synchronize()`` for memory-pool race protection.
     """
-    if piecewise_no_stream_switch:
+    if aux_has_collective and disable_aux_stream_switch:
         return x
     if device < 0:
         device = torch.cuda.current_device()
@@ -188,6 +201,7 @@ def end_aux_stream_passthrough(
     x: torch.Tensor,
     *,
     device: int = -1,
+    aux_has_collective: bool = False,
 ) -> torch.Tensor:
     """Record a CUDA event on the aux stream and switch back to the caller's stream.
 
@@ -195,8 +209,12 @@ def end_aux_stream_passthrough(
     insert ``wait_aux_stream_passthrough`` at the point where both branches
     need to be synchronised (typically right before the ``add`` that merges
     shared-expert and routed-expert outputs).
+
+    Pass ``aux_has_collective=True`` to match the corresponding
+    ``begin_aux_stream_passthrough`` so this end-marker is also bypassed in
+    piecewise mode.
     """
-    if piecewise_no_stream_switch:
+    if aux_has_collective and disable_aux_stream_switch:
         return x
     if device < 0:
         device = torch.cuda.current_device()
@@ -221,6 +239,7 @@ def wait_aux_stream_passthrough(
     x: torch.Tensor,
     *,
     device: int = -1,
+    aux_has_collective: bool = False,
 ) -> torch.Tensor:
     """Make the current stream wait for the auxiliary stream's last recorded event.
 
@@ -230,8 +249,12 @@ def wait_aux_stream_passthrough(
 
     Uses ``torch.cuda.current_stream()`` rather than the stored default stream
     so that the correct stream is waited on during CUDA graph capture.
+
+    Pass ``aux_has_collective=True`` to match the corresponding
+    ``begin_aux_stream_passthrough`` so this wait is also bypassed in
+    piecewise mode.
     """
-    if piecewise_no_stream_switch:
+    if aux_has_collective and disable_aux_stream_switch:
         return x
     if device < 0:
         device = torch.cuda.current_device()
