@@ -2,7 +2,6 @@ import copy
 import enum
 import math
 import os
-import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
@@ -3137,7 +3136,8 @@ class PeftCacheManager(BaseResourceManager):
                  lora_config: LoraConfig,
                  model_config: ModelConfigCpp,
                  world_config: WorldConfig | None = None,
-                 execution_stream: Optional[torch.cuda.Stream] = None):
+                 execution_stream: Optional[torch.cuda.Stream] = None,
+                 lora_target_modules: Optional[List[str]] = None):
         import tensorrt_llm.bindings as _tb
 
         peft_cache_config = peft_cache_config._to_pybind()
@@ -3174,6 +3174,7 @@ class PeftCacheManager(BaseResourceManager):
                                         buffer_manager=buffer_manager)
         self._lora_config = lora_config
         self._lora_model_config = LoraModelConfig(
+            lora_target_modules if lora_target_modules is not None else
             lora_config.lora_target_modules,
             lora_config.trtllm_modules_to_hf_modules, model_config.hidden_size,
             binding_to_str_dtype(model_config.data_type),
@@ -3199,53 +3200,29 @@ class PeftCacheManager(BaseResourceManager):
     def add_request_peft(self, request: LlmRequest):
         if request.lora_task_id is not None:
             is_task_cached = self.impl.is_task_cached(request.lora_task_id)
-            logger.info(
-                f"[PEFT_TIMER] add_request_peft task_id={request.lora_task_id} "
-                f"is_cached={is_task_cached} "
-                f"has_weights={request.lora_weights is not None} "
-                f"has_path={bool(getattr(request, 'py_lora_path', None))}")
             if is_task_cached:
-                # Task already in C++ PEFT cache — skip impl.add_request_peft
-                # to avoid "can't move a processing task" error when called
-                # from both _fetch_and_activate_new_requests and prepare_resources.
-                # Do NOT call request.remove_lora_tensors() here: the async put
-                # worker in PeftCacheManager reads request.lora_weights /
-                # lora_config lazily when it runs, and clears them itself after
-                # loadWeights completes. Clearing them here races with the put
-                # worker: if the worker runs after this clear, loadWeights is
-                # skipped, the task stays in PROCESSING state, and
-                # ensure_batch_map_task_id throws "can't move a processing task".
-                return
+                # PeftCacheManager::addRequestPeft in CPP doesn't allow having only one of [config tensor, weights
+                # tensor] without the other. Since there's no need for any of them when the LoRA adapter is already
+                # cached, we can safely remove both from the request.
+                request.remove_lora_tensors()
             elif request.lora_weights is None and request.py_lora_path:
-                _t0 = time.perf_counter()
                 self._lora_manager.load_from_ckpt(
                     [request.py_lora_path],
                     model_config=self._lora_model_config,
                     uids=[request.lora_task_id],
                     ckpt_source=self._lora_config.lora_ckpt_source)
-                logger.info(
-                    f"[PEFT_TIMER] load_from_ckpt task_id={request.lora_task_id} "
-                    f"took {time.perf_counter() - _t0:.3f}s")
                 uid = request.lora_task_id
                 request.lora_weights = self._lora_manager.cpp_lora_weights[uid]
                 if request.lora_config is None:
                     request.lora_config = self._lora_manager.cpp_lora_config[
                         uid]
 
-            # PeftCacheManager CPP implementation expects an extra dim at index 0.
-            # Guard against double-unsqueeze on retried requests (e.g. after a
-            # deferred "Cache is full" add_request_peft).
-            if request.lora_weights is not None and request.lora_weights.dim(
-            ) == 2:
+            # PeftCacheManager CPP implementation expects an extra dim at index 0
+            if request.lora_weights is not None:
                 request.lora_weights = request.lora_weights.unsqueeze(0)
-            if request.lora_config is not None and request.lora_config.dim(
-            ) == 2:
+            if request.lora_config is not None:
                 request.lora_config = request.lora_config.unsqueeze(0)
-        _t0 = time.perf_counter()
         self.impl.add_request_peft(request, True)
-        logger.info(
-            f"[PEFT_TIMER] impl.add_request_peft task_id={request.lora_task_id} "
-            f"took {time.perf_counter() - _t0:.3f}s")
 
     def ensure_batch(self,
                      context_batch: List[LlmRequest],

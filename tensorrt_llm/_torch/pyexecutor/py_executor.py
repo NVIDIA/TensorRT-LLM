@@ -2822,16 +2822,8 @@ class PyExecutor:
                 # Reset timeout to 0 to avoid hanging when no new requests are available
                 timeout = datetime.timedelta(0)
             with self.hang_detector.pause():
-                _t0 = time.perf_counter()
-                _fetched = self.executor_request_queue.get_from_request_queue(
-                    timeout)
-                _elapsed = time.perf_counter() - _t0
-                logger.info(
-                    f"[PEFT_TIMER] get_from_request_queue: {_elapsed:.3f}s "
-                    f"timeout={timeout} idle={idle} "
-                    f"deferred={len(self.peft_deferred_requests)} fetched={len(_fetched)}"
-                )
-                new_requests.extend(_fetched)
+                new_requests.extend(
+                    self.executor_request_queue.get_from_request_queue(timeout))
 
         # Broadcast requests and handle Python objects
         new_requests, py_request_objects = self.request_broadcaster.broadcast(
