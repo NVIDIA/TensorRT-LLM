@@ -1104,13 +1104,13 @@ cu13 = ["cuda-bindings[all] (==13.*)"]
 
 [[package]]
 name = "cuda-pathfinder"
-version = "1.5.3"
+version = "1.5.4"
 description = "Pathfinder for CUDA components"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "cuda_pathfinder-1.5.3-py3-none-any.whl", hash = "sha256:dff021123aedbb4117cc7ec81717bbfe198fb4e8b5f1ee57e0e084fec5c8577d"},
+    {file = "cuda_pathfinder-1.5.4-py3-none-any.whl", hash = "sha256:9563d3175ce1828531acf4b94e1c1c7d67208c347ca002493e2654878b26f4b7"},
 ]
 
 [[package]]
@@ -5061,14 +5061,14 @@ cli = ["click (>=5.0)"]
 
 [[package]]
 name = "python-multipart"
-version = "0.0.26"
+version = "0.0.27"
 description = "A streaming multipart parser for Python"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "python_multipart-0.0.26-py3-none-any.whl", hash = "sha256:c0b169f8c4484c13b0dcf2ef0ec3a4adb255c4b7d18d8e420477d2b1dd03f185"},
-    {file = "python_multipart-0.0.26.tar.gz", hash = "sha256:08fadc45918cd615e26846437f50c5d6d23304da32c341f289a617127b081f17"},
+    {file = "python_multipart-0.0.27-py3-none-any.whl", hash = "sha256:6fccfad17a27334bd0193681b369f476eda3409f17381a2d65aa7df3f7275645"},
+    {file = "python_multipart-0.0.27.tar.gz", hash = "sha256:9870a6a8c5a20a5bf4f07c017bd1489006ff8836cff097b6933355ee2b49b602"},
 ]
 
 [[package]]
@@ -5885,14 +5885,14 @@ files = [
 
 [[package]]
 name = "smg-grpc-proto"
-version = "0.4.6"
-description = "SMG gRPC proto definitions for SGLang, vLLM, and TRT-LLM"
+version = "0.4.7"
+description = "SMG gRPC proto definitions for SGLang, vLLM, TRT-LLM, and MLX"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "smg_grpc_proto-0.4.6-py3-none-any.whl", hash = "sha256:d79788ccadc53f446959da2fb2cfae58bb22d6b11ea03e2eb4b04ecffb03b97c"},
-    {file = "smg_grpc_proto-0.4.6.tar.gz", hash = "sha256:3c8b2bf27efcf241fda166dffae8f0b986fcfc8e82836c12c86ed663827e3339"},
+    {file = "smg_grpc_proto-0.4.7-py3-none-any.whl", hash = "sha256:74cf326a58f1c9166fbcccc09580b875e654b47e8b0169903d2982a1213a664e"},
+    {file = "smg_grpc_proto-0.4.7.tar.gz", hash = "sha256:5a7754f532ccea434c21a5730f91e5a9b3e0af1e9eb26191eec0a6d25dc351d8"},
 ]
 
 [package.dependencies]
@@ -7085,4 +7085,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "a38fb8e4c50451eb4ec0c3ee2efd8f0f6d5c52875e82f6fa396b4f8ab91d3265"
+content-hash = "6c7ff3347423d965324bef67a23b4c1b3944ade8b30156344a8d64e3f3207299"

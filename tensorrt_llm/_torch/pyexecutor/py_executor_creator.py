@@ -225,6 +225,57 @@ def get_guided_decoding_config(guided_decoding_backend: str,
     return guided_decoding_config
 
 
+def _load_config_and_create_checkpoint_loader(
+        llm_args: TorchLlmArgs, checkpoint_dir: Optional[str] = None):
+    torch.cuda.set_per_process_memory_fraction(1.0)
+    checkpoint_loader = _construct_checkpoint_loader(llm_args.backend,
+                                                     llm_args.checkpoint_loader,
+                                                     llm_args.checkpoint_format)
+    llm_args = ModelLoader.load_config_and_apply_defaults(
+        checkpoint_dir, llm_args, checkpoint_loader)
+    return llm_args, checkpoint_loader
+
+
+def create_encoder_executor(
+    llm_args: TorchLlmArgs,
+    checkpoint_dir: Optional[str] = None,
+):
+    """Create an EncoderExecutor for models using the encode-only path.
+
+    Handles model loading and model_engine creation, then wraps in a
+    lightweight EncoderExecutor. Skips all decoder infrastructure
+    (KV cache, scheduler, sampler, drafter, speculative decoding).
+
+    Args:
+        llm_args: Configuration arguments.
+        checkpoint_dir: Path to model checkpoint.
+
+    Returns:
+        An EncoderExecutor instance ready for batch_forward() calls.
+    """
+    from .encoder_executor import EncoderExecutor
+
+    llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
+        llm_args, checkpoint_dir)
+
+    mapping = _get_mapping(llm_args.parallel_config.to_mapping())
+    dist = Distributed.get(mapping)
+
+    model_engine = PyTorchModelEngine(
+        model_path=checkpoint_dir,
+        llm_args=llm_args,
+        mapping=mapping,
+        dist=dist,
+        spec_config=None,
+        checkpoint_loader=checkpoint_loader,
+    )
+
+    return EncoderExecutor(
+        model_engine=model_engine,
+        dist=dist,
+    )
+
+
 def create_py_executor(
     llm_args: TorchLlmArgs,
     checkpoint_dir: Optional[str] = None,
@@ -250,13 +301,8 @@ def create_py_executor(
     """
 
     skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
-    torch.cuda.set_per_process_memory_fraction(1.0)
-    # Apply model-specific defaults early, before destructuring llm_args fields
-    checkpoint_loader = _construct_checkpoint_loader(llm_args.backend,
-                                                     llm_args.checkpoint_loader,
-                                                     llm_args.checkpoint_format)
-    llm_args = ModelLoader.load_config_and_apply_defaults(
-        checkpoint_dir, llm_args, checkpoint_loader)
+    llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
+        llm_args, checkpoint_dir)
 
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config
@@ -680,6 +726,11 @@ def create_py_executor(
                 "KV connector is not supported with VSWA (Variable Sliding Window Attention)."
             )
 
+        if mapping.enable_attention_dp:
+            raise NotImplementedError(
+                "KV connector is not supported with attention data parallelism (enable_attention_dp=True)."
+            )
+
         try:
             module = importlib.import_module(
                 kv_connector_config.connector_module)
@@ -858,6 +909,16 @@ def create_py_executor(
                 py_executor.kv_cache_transceiver.shutdown()
         finally:
             kv_cache_creator.teardown_managers(resources)
+
+        # Release Phase-1 CUDA graph pools before final KV allocation to avoid overshoot.
+        for eng in [model_engine, draft_model_engine]:
+            if eng is None:
+                continue
+            if eng.attn_metadata is not None:
+                if llm_args.cuda_graph_config is not None:
+                    eng._release_cuda_graphs()
+                eng.attn_metadata = None
+
         del py_executor  # free before constructing new
         gc.collect()
 
@@ -872,13 +933,6 @@ def create_py_executor(
             max_seq_len = kv_cache_creator._max_seq_len
             update_sampler_max_seq_len(max_seq_len, sampler)
 
-            for eng in [model_engine, draft_model_engine]:
-                if eng is None:
-                    continue
-                if eng.attn_metadata is not None:
-                    if llm_args.cuda_graph_config is not None:
-                        eng._release_cuda_graphs()
-                    eng.attn_metadata = None
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
 
             # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture

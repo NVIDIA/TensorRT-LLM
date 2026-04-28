@@ -17,6 +17,7 @@ l0_a100:
     - unittest/llmapi/test_llm_pytorch.py -m "part1"
     - unittest/llmapi/test_llm_pytorch.py -m "part2"
     - unittest/llmapi/test_llm_pytorch.py -m "part3"
+    - unittest/llmapi/test_llm_encode.py
     - unittest/llmapi/test_mpi_session.py ISOLATION
     - unittest/llmapi/test_memory_profiling.py::test_profile_kvcache # profile kvcache for vision encoder
     - unittest/llmapi/test_memory_profiling.py::test_pyexecutor_and_kvcache_share_execution_stream # test that PyExecutor and KVCacheManager share the same execution_stream
@@ -25,6 +26,15 @@ l0_a100:
     - unittest/executor/test_base_worker.py ISOLATION
     - unittest/executor/test_rpc_proxy.py
     - unittest/executor/test_rpc_worker.py
+    # llm.encode() accuracy
+    - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encode_matches_huggingface_classification[bert-yelp]
+    - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_encode_matches_huggingface_per_token_reward[qwen2.5-prm-7b]
+    - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_encode_matches_huggingface[tinyllama-1.1b]
+    - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_encode_matches_huggingface[gemma-3-1b]
+    - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_encode_matches_huggingface[phi-4-mini]
+    - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_encode_matches_huggingface[qwen2-7b]
+    - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_encode_matches_huggingface[qwen3-0.6b]
+    - accuracy/test_llm_api_pytorch_encode.py::TestDecoderEncode::test_encode_matches_huggingface[starcoder2-3b]
 - condition:
     ranges:
       system_gpu_count:
