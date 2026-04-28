@@ -105,7 +105,6 @@ def sanitize_top_k(top_k: torch.Tensor, vocab_size: int) -> torch.Tensor:
     return torch.where(top_k > 0, top_k, torch.full_like(top_k, vocab_size)).clamp(max=vocab_size)
 
 
-@torch.compile(options={"max-autotune": True})
 def sampling_batch_spec_dec_one_model(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
@@ -116,11 +115,14 @@ def sampling_batch_spec_dec_one_model(
     offset: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    CUDA-graph compatible sampling. Supports mixed sampling params.
+    Sampling for speculative decoding. Supports mixed sampling params.
 
-    We can't do dynamic kernel selection inside graphs, so this might
-    be slower than a torch.argmax for greedy requests. This is why advanced
-    sampling is opt-in for now.
+    NOTE: torch.compile is intentionally omitted.  With TP > 1 each rank
+    runs in a separate process; compiled sampling can produce slightly
+    different results across ranks (e.g. different Triton kernel selections).
+    In spec dec, sampled tokens determine acceptance counts and therefore
+    the batch shape of subsequent draft-model NCCL collectives — divergent
+    tokens cause a deadlock.
     """
     top_k = sanitize_top_k(top_k, logits.shape[-1])
     logits = apply_temperature(logits, temperatures)
