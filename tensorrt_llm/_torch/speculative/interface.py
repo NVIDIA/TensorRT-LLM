@@ -137,7 +137,14 @@ def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
 
 def get_force_num_accepted_tokens() -> int:
     """
-    Read and parse the TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS environment variable.
+    Read and parse the TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS environment
+    variable as an integer.
+
+    Used by speculative decoding paths that operate on Python lists/slices and
+    therefore require an integer count (e.g. the two-model path in
+    ``TorchSampler``). For the one-model path, see
+    :func:`get_force_num_accepted_tokens_float`, which supports fractional
+    synthetic acceptance rates.
 
     Returns:
         int: The forced number of accepted tokens, or 0 if not set or invalid.
@@ -150,6 +157,31 @@ def get_force_num_accepted_tokens() -> int:
             f"{FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR} must be a valid integer, "
             f"got '{env_value}'. Using default value 0.")
         return 0
+
+
+def get_force_num_accepted_tokens_float() -> float:
+    """
+    Read and parse the TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS environment
+    variable as a (possibly fractional) float.
+
+    Used by the one-model speculative decoding path to synthesize non-integer
+    acceptance rates: the integer part is the number of draft tokens accepted
+    on every iteration, and the fractional part is the probability of
+    accepting one additional draft token. For example, "2.6" means always
+    accept 2 draft tokens and accept one more with probability 0.6.
+
+    Returns:
+        float: The forced (possibly fractional) number of accepted draft
+        tokens, or 0.0 if not set or invalid.
+    """
+    env_value = os.environ.get(FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR, "0")
+    try:
+        return float(env_value)
+    except ValueError:
+        logger.warning(
+            f"{FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR} must be a valid number "
+            f"(int or float), got '{env_value}'. Using default value 0.0.")
+        return 0.0
 
 
 class SpeculativeDecodingMode(IntEnum):
@@ -517,7 +549,8 @@ class SpecWorkerBase(nn.Module, ABC):
     def __init__(self, use_separate_draft_kv_cache: bool = False):
         super().__init__()
         self.guided_decoder: Optional["CapturableGuidedDecoder"] = None
-        self.force_num_accepted_tokens = get_force_num_accepted_tokens()
+        self.force_num_accepted_tokens: float = get_force_num_accepted_tokens_float(
+        )
         self.use_flashinfer = IS_FLASHINFER_AVAILABLE and Version(
             flashinfer.__version__) >= Version("0.6.4")
         self.seed: Optional[torch.Tensor] = None
@@ -634,22 +667,65 @@ class SpecWorkerBase(nn.Module, ABC):
     def _apply_force_accepted_tokens(self, num_accepted_tokens, num_contexts,
                                      runtime_draft_len: int):
         """
-        Apply forced number of accepted tokens if environment variable is set.
-        This is used for testing and debugging.
+        Apply a forced (synthetic) number of accepted draft tokens if the
+        ``TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS`` environment variable is
+        set. This is used for testing and debugging speculative decoding.
+
+        The forced value supports fractional synthetic acceptance rates: the
+        integer part is the number of draft tokens accepted on every
+        generation iteration, and the fractional part is the probability of
+        accepting one additional draft token on that iteration. For example,
+        a value of ``2.6`` means: always accept 2 draft tokens, and accept
+        one more with probability 0.6 (per generation request).
+
+        The implementation is CUDA-graph-compatible: only tensor ops with
+        statically-known shapes are used, and per-iteration randomness is
+        produced by ``torch.rand`` against the default CUDA generator, whose
+        Philox state is captured/replayed in graph-safe mode by PyTorch's
+        ``torch.cuda.graph`` context.
 
         Args:
-            num_accepted_tokens: Tensor of shape [batch_size] with current accepted counts
-            num_contexts: Number of context (prefill) requests
+            num_accepted_tokens: Tensor of shape [batch_size] with current
+                accepted counts (target token + accepted draft tokens).
+            num_contexts: Number of context (prefill) requests in the batch.
             runtime_draft_len: The draft length for the current iteration.
 
         Returns:
-            Modified num_accepted_tokens tensor
+            Modified num_accepted_tokens tensor.
         """
-        if self.force_num_accepted_tokens != 0:
-            # total tokens per iteration = accepted draft tokens + 1 target token
-            force_total_tokens = min(self.force_num_accepted_tokens + 1,
-                                     runtime_draft_len + 1)
+        if self.force_num_accepted_tokens == 0.0:
+            return num_accepted_tokens
+
+        # Decompose into a deterministic integer part (always accepted) and a
+        # probabilistic fractional part. ``int(...)`` truncates toward zero,
+        # which matches floor for the supported non-negative range.
+        int_part = int(self.force_num_accepted_tokens)
+        frac_part = self.force_num_accepted_tokens - int_part
+
+        # ``num_accepted_tokens`` counts the target token + accepted draft
+        # tokens, so the maximum reachable value is ``runtime_draft_len + 1``.
+        max_total = runtime_draft_len + 1
+        base_total = min(int_part + 1, max_total)
+
+        if frac_part > 0.0 and base_total < max_total:
+            # Sample one Bernoulli per generation request: with probability
+            # ``frac_part`` accept one additional draft token. ``num_gens``
+            # is fixed at CUDA-graph capture time (graphs are captured for a
+            # specific batch shape with ``num_contexts`` typically 0), so
+            # ``torch.rand`` allocates a static-shape tensor that is safely
+            # captured and replayed.
+            num_gens = num_accepted_tokens.shape[0] - num_contexts
+            rand = torch.rand(num_gens,
+                              device=num_accepted_tokens.device,
+                              dtype=torch.float32)
+            extra = (rand < frac_part).to(num_accepted_tokens.dtype)
+            # ``base_total + extra`` is at most ``int_part + 2``; clamp so we
+            # never exceed the available draft slots.
+            force_total_tokens = (base_total + extra).clamp_(max=max_total)
             num_accepted_tokens[num_contexts:] = force_total_tokens
+        else:
+            num_accepted_tokens[num_contexts:] = base_total
+
         return num_accepted_tokens
 
     def _sample_and_accept_draft_tokens_base(
