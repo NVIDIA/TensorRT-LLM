@@ -404,11 +404,11 @@ public:
 
     //! \brief Create a placeholder KVCacheBlock with no GPU memory (SWA on-demand form).
     //! \details Used by WindowBlockManager::detachFrontBlock when an out-of-window block is
-    //! swapped out of a sequence's allocated-blocks list. mIsPlaceholder is set so that
-    //! getCacheBlockIndices returns a nil index and the eviction pool ignores it. The block
-    //! ID is set to kPlaceholderBlockId to ensure any accidental mAllBlocksById[id] lookup
-    //! produces an obvious out-of-range failure. No windowSize is needed because SWA
-    //! placeholders are never attached to the lookup tree (they only occupy sequence slots).
+    //! swapped out of a sequence's allocated-blocks list. mIsPlaceholder is set and
+    //! WindowBlockManager::setOffsets maps kPlaceholderBlockId to a nil index. The block
+    //! ID is set to kPlaceholderBlockId so getBlockById can distinguish it from pooled
+    //! linear-attention placeholders. No windowSize is needed because SWA placeholders are
+    //! never attached to the lookup tree.
     static BlockPtr createPlaceholder();
 
     void detachDescendantsFromLookupTree();
@@ -818,11 +818,12 @@ public:
     {
         struct ClaimedBlock
         {
-            BlockPtr block;
-            SizeType32 numMatchedTokens; //!< tokens matched in this block
-            bool isPartialMatch;
-            bool needsCopy;     //!< partial match on block with refs or non-leaf (needs getFreeBlock + copy in Phase 2)
-            bool isPlaceholder; //!< placeholder block (linear attention recurrent states)
+            BlockPtr block{nullptr};
+            SizeType32 numMatchedTokens{0}; //!< tokens matched in this block
+            bool isPartialMatch{false};
+            bool needsCopy{false};       //!< partial match on block with refs or non-leaf (needs getFreeBlock + copy)
+            bool isPlaceholder{false};   //!< placeholder block (linear attention recurrent states)
+            bool isTraversalOnly{false}; //!< SWA OOW anchor with a trie node but no cache block value
             bool shouldReleaseCopySource{false}; //!< last copier releases the claimed source after copy
         };
 
@@ -1090,8 +1091,7 @@ public:
     //! \param blockKeys Key of each block.
     //! \param blocks Block pointers (beam 0 only). OOW slots contain placeholder blocks
     //!        (isPlaceholder()==true); storeBlocks advances past them via a trie lookup
-    //!        rather than re-inserting, and continues (not breaks) past evicted placeholders
-    //!        so that trailing still-present blocks remain reusable.
+    //!        when the anchor still exists, and continues past missing SWA anchors.
     //! \param pinBlocks If true, increment ref count for blocks while storing.
     //! \return Pair of (num blocks stored for reuse, vector of pinned block IDs).
     [[nodiscard]] std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> storeBlocks(
@@ -1149,8 +1149,29 @@ public:
     }
 
 private:
-    //! \brief Walk the reuse tree with precomputed per-block keys (no lock; callers must hold mCachedBlocksRootMutex).
+    //! \brief Walk the reuse tree with precomputed per-block keys (no lock; callers must hold mLookupTree->getMutex()).
     [[nodiscard]] std::shared_ptr<KVCacheBlock> searchReuseTree(std::vector<BlockKey> const& blockKeys);
+
+    struct ReuseMatch
+    {
+        BlockPtr block;
+        SizeType32 numMatchedTokens{0};
+        bool isPartialMatch{false};
+        bool isTraversalOnly{false};
+    };
+
+    struct ReuseMatchResult
+    {
+        std::vector<ReuseMatch> matches;
+        SizeType32 totalMatchedTokens{0};
+        std::optional<BlockKey> firstNewBlock{std::nullopt};
+    };
+
+    //! \brief Find the reusable prefix, including SWA traversal-only anchors.
+    //! \details Value-less exact nodes are only accepted for SWA when enough later tokens
+    //!          are matched to place the missing anchor outside the attention window.
+    [[nodiscard]] ReuseMatchResult findReusableBlockMatches(std::vector<BlockKey> const& blockKeys,
+        bool enablePartialReuse, bool copyOnPartialReuse, SizeType32 maxMatchedTokens) const;
 
     bool tryAllocatePlaceholderForLinearAttention(GenerationRequest& sequence, bool shareAmongBeams);
 
