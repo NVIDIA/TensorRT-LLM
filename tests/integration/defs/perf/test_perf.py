@@ -27,6 +27,8 @@ import yaml
 from defs.trt_test_alternative import (is_linux, is_windows, print_info,
                                        print_warning)
 
+from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
+
 from ..conftest import (get_device_count, get_llm_root, llm_models_root,
                         trt_environment)
 from .pytorch_model_config import get_model_yaml_config
@@ -271,6 +273,7 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "kimi_k2_nvfp4",
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
+    "glm_5_fp8",
 }
 
 # Spec-dec models real dataset in serve perf tests.
@@ -1008,26 +1011,28 @@ class PerfTestConfig:
                     [b >= 32 for b in self.batch_sizes]
                 ), f"gpt_350m and bloom_560m with small BS are very unstable! Please increase to at least 32."
 
+        # Mirror the skip_less_mpi_world_size fixture: when mpi_world_size == 1
+        # we are on a single node (workers spawn within the test) so use the
+        # local device count; otherwise the launcher already sized the world
+        # across nodes, so trust mpi_world_size as the cluster total.
         try:
-            local_gpus = get_device_count()
+            mpi_world_size = get_mpi_world_size()
         except Exception:
-            local_gpus = None
+            mpi_world_size = 1
+        try:
+            device_count = get_device_count()
+        except Exception:
+            device_count = None
 
-        # In multi-node runs num_gpus is the total across all nodes, but
-        # get_device_count() only sees GPUs on the current node. Use SLURM
-        # env vars (set by the launcher) to compute the cluster total; fall
-        # back to the local count for single-node runs.
-        nnodes = int(
-            os.environ.get("SLURM_JOB_NUM_NODES")
-            or os.environ.get("SLURM_NNODES") or 1)
-        gpus_per_node = int(os.environ.get("SLURM_GPUS_ON_NODE")
-                            or 0) or local_gpus
-        total_gpus = (nnodes * gpus_per_node) if gpus_per_node else local_gpus
+        if mpi_world_size == 1:
+            total_gpus = device_count
+        else:
+            total_gpus = mpi_world_size
 
         if total_gpus is not None and self.num_gpus > total_gpus:
             pytest.skip(
                 f"Test requires {self.num_gpus} GPUs but only {total_gpus} available "
-                f"(local={local_gpus}, nnodes={nnodes}, gpus_per_node={gpus_per_node})"
+                f"(mpi_world_size={mpi_world_size}, device_count={device_count})"
             )
 
     def get_model_family(self) -> str:
