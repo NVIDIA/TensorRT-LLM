@@ -2,7 +2,7 @@
 
 Applies up to two optimizations, tried in priority order:
 
-**Case 0 — Full KV path overlap (unfused GEMMs)**:
+**Pattern 0 — Full KV path overlap (unfused GEMMs)**:
 
 When Q_a and KV_a projections are separate GEMMs (fuse_gemms_mixed_children
 disabled), the ENTIRE KV path (GEMM + AllGather) is placed on the auxiliary
@@ -39,7 +39,7 @@ GPU timeline:
     Main: [Q_GEMM] → [Q_AllGather] → [Q_LayerNorm] → [Q_b_proj] → [wait_aux]
     Aux:  [KV_GEMM] → [KV_AllGather_aux] → done
 
-**Case 1 — Projection overlap (fallback for non-quantized graphs)**:
+**Pattern 1 — Projection-only overlap**:
 
 Moves only the KV projection linear onto the auxiliary CUDA stream; the rest
 of the KV chain (split, rms_norm, view) stays on main.  The aux variant is
@@ -174,7 +174,7 @@ def _find_downstream_node(
 
 
 # ===========================================================================
-# Case 0: Full KV path on aux stream (unfused GEMMs)
+# Pattern 0: Full KV path on aux stream (unfused GEMMs)
 # ===========================================================================
 
 
@@ -239,7 +239,7 @@ def _execute_kv_path_in_aux_stream(gm: GraphModule, world_size: int) -> Tuple[Gr
         ag_dim = kv_ag.args[1] if len(kv_ag.args) > 1 else -1
 
         ad_logger.info(
-            f"Multi-stream MLA case 0 (unfused): "
+            f"Multi-stream MLA pattern 0 (unfused): "
             f"Q={q_linear.name} (dim={_get_output_feature_dim(q_linear)}), "
             f"KV={kv_linear.name} (dim={_get_output_feature_dim(kv_linear)}), "
             f"KV_AG={kv_ag.name} (fork={fork_point.name})"
@@ -319,7 +319,7 @@ def _execute_kv_path_in_aux_stream(gm: GraphModule, world_size: int) -> Tuple[Gr
 
 
 # ===========================================================================
-# Case 1: Projection overlap (fallback)
+# Pattern 1: Projection overlap (fallback)
 # ===========================================================================
 
 
@@ -436,11 +436,11 @@ def _execute_kv_proj_in_aux_stream(gm: GraphModule) -> Tuple[GraphModule, int]:
 class MultiStreamMLAAttn(BaseTransform):
     """Multi-stream Q/KV parallelism for MLA attention blocks.
 
-    Case 0: Full KV path overlap for unfused Q/KV GEMMs (begin/end aux).
-    Case 1: Overlaps KV projection linear with Q projection chain (fallback).
+    Pattern 0: Full KV path overlap for unfused Q/KV GEMMs (begin/end aux).
+    Pattern 1: Overlaps KV projection linear with Q projection chain (fallback).
 
-    Case 0 is tried first; if it matches (unfused graph), case 1 is skipped.
-    If case 0 finds nothing (fused graph), case 1 runs as fallback.
+    Pattern 0 is tried first; if it matches (unfused graph), pattern 1 is skipped.
+    If pattern 0 finds nothing (fused graph), pattern 1 runs as fallback.
     """
 
     def _apply(
@@ -452,16 +452,16 @@ class MultiStreamMLAAttn(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         cuda_stream_manager.add_device(torch.cuda.current_device())
 
-        # Case 0: full KV path on aux (unfused GEMMs)
+        # Pattern 0: full KV path on aux (unfused GEMMs)
         gm, n_unfused = _execute_kv_path_in_aux_stream(gm, shared_config.world_size)
-        ad_logger.info(f"Multi-stream MLA case 0 (unfused KV path): {n_unfused} matches")
+        ad_logger.info(f"Multi-stream MLA pattern 0 (unfused KV path): {n_unfused} matches")
 
         if n_unfused > 0:
             total = n_unfused
         else:
-            # Fallback: Case 1 (projection overlap)
+            # Fallback: Pattern 1 (projection overlap)
             gm, n_proj = _execute_kv_proj_in_aux_stream(gm)
-            ad_logger.info(f"Multi-stream MLA case 1 (projection): {n_proj} matches")
+            ad_logger.info(f"Multi-stream MLA pattern 1 (projection): {n_proj} matches")
             total = n_proj
 
         info = TransformInfo(
