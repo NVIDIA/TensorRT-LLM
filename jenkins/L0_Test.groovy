@@ -1821,10 +1821,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                         requiredDuringSchedulingIgnoredDuringExecution:
                             nodeSelectorTerms:
                             - matchExpressions:
-                              - key: "tensorrt/taints"
-                                operator: In
-                                values:
-                                - "nvbugs6084946"
                               - key: "tensorrt/affinity"
                                 operator: NotIn
                                 values:
