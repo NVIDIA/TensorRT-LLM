@@ -158,22 +158,19 @@ class TestStandalonePackage:
         )
         assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
 
-    def _run_singlegpu_tests(self, standalone_package, pytest_targets, subprocess_timeout):
-        """Run a subset of the standalone package's singlegpu tests in its venv.
+    def test_run_unit_tests(self, standalone_package):
+        """Run the copied unit tests from the standalone package's tests/ dir.
 
-        ``pytest_targets`` is a list of CLI args appended after the common pytest
-        flags (paths, ``--ignore=`` markers, etc.). The module-scoped
-        ``standalone_package`` fixture is reused, so the venv install is paid
-        once across all callers.
+        Tests have been import-rewritten to use `auto_deploy` instead of
+        `tensorrt_llm._torch.auto_deploy`, so they run directly against the
+        standalone package.
         """
         python = standalone_package["python"]
         pkg_dir = standalone_package["pkg_dir"]
         tests_dir = os.path.join(pkg_dir, "tests")
 
-        # Per-bucket targets are validated by the ``num_passed > 0`` check below;
-        # only skip if the package produced no tests/ tree at all.
         if not os.path.isdir(tests_dir):
-            pytest.skip("No tests/ directory in standalone package")
+            pytest.skip("No tests directory in standalone package")
 
         # Pass through the host env but override PYTHONPATH to use standalone tests.
         # The venv's pip install already put auto_deploy in the venv's site-packages,
@@ -191,19 +188,17 @@ class TestStandalonePackage:
             python,
             "-m",
             "pytest",
+            os.path.join(tests_dir, "singlegpu"),
             "-q",
-            "--timeout=300",
             # Parallelize across CPU workers; pytest-xdist is in [dev] extras.
             "-n",
             "4",
-            *pytest_targets,
         ]
 
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=subprocess_timeout,
             cwd=pkg_dir,
             env=standalone_env,
         )
@@ -213,7 +208,7 @@ class TestStandalonePackage:
         summary_str = summary[-1] if summary else "no summary"
 
         # Print summary for visibility
-        print(f"Standalone test results ({' '.join(pytest_targets)}): {summary_str}")
+        print(f"Standalone test results: {summary_str}")
 
         # Extract counts from pytest summary like "3 failed, 100 passed, 5 skipped"
         import re
@@ -244,30 +239,7 @@ class TestStandalonePackage:
             + f"\n\nStderr:\n{result.stderr[-2000:]}"
         )
 
-        # Completeness: a trivially-empty collection (e.g., a missing target
-        # directory in the generated standalone package) would silently satisfy
-        # the ``num_failed == 0`` check above, so require at least one pass.
-        assert num_passed > 0, (
-            f"No tests passed; standalone collection likely broken.\n"
-            f"Summary: {summary_str}\n"
-            f"Stderr:\n{result.stderr[-3000:]}"
+        # Sanity: at least some tests should have passed
+        assert num_passed > 100, (
+            f"Too few tests passed ({num_passed}). Something is wrong.\nSummary: {summary_str}"
         )
-
-    def test_run_unit_tests_models(self, standalone_package):
-        """Run the standalone copy of singlegpu/models/ tests.
-
-        Split from the rest of singlegpu so we can keep onboarding models
-        (and their per-model unit tests) without bumping into the timeout
-        budget for the structural ``others`` bucket.
-        """
-        pkg_dir = standalone_package["pkg_dir"]
-        models_dir = os.path.join(pkg_dir, "tests", "singlegpu", "models")
-        self._run_singlegpu_tests(standalone_package, [models_dir], subprocess_timeout=900)
-
-    def test_run_unit_tests_others(self, standalone_package):
-        """Run all standalone-copy singlegpu tests *except* models/."""
-        pkg_dir = standalone_package["pkg_dir"]
-        singlegpu_dir = os.path.join(pkg_dir, "tests", "singlegpu")
-        models_dir = os.path.join(singlegpu_dir, "models")
-        targets = [singlegpu_dir, f"--ignore={models_dir}"]
-        self._run_singlegpu_tests(standalone_package, targets, subprocess_timeout=900)
