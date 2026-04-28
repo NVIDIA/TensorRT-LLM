@@ -4529,8 +4529,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
         free_gpu_memory_fraction = 0.6 if attention_dp else 0.3
         kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=free_gpu_memory_fraction)
-        with mock.patch.dict(os.environ,
-                             {"TRTLLM_DEEP_EP_TOKEN_LIMIT": "256"}):
+        with mock.patch.dict(os.environ, {"TRTLLM_DEEP_EP_TOKEN_LIMIT": "256"}):
             with LLM(
                     f"{llm_models_root()}/Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",
                     tensor_parallel_size=tp_size,
