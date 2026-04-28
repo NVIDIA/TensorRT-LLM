@@ -97,7 +97,7 @@ cuda_stream_manager = CudaStreamManager()
 # Set to True by the piecewise orchestrator at the start of warmup/capture.
 # Combined with each passthrough's ``aux_has_collective`` kwarg, this gates
 # whether a given stream-switch becomes a no-op in the piecewise (prefill)
-# path.  Aux paths that contain a collective (e.g. MLA Phase 0's
+# path.  Aux paths that contain a collective (e.g. MLA case 0's
 # ``symm_mem_all_gather_aux``) are skipped during prefill to avoid
 # NCCL/symm_mem stream binding crashes and the costly per-layer
 # ``caller_stream.synchronize()``.  Aux paths without collectives (e.g.
