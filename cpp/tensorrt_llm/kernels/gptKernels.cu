@@ -195,7 +195,7 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
     int batchIdx = blockIdx.x;
 
     // Compute the padding offsets.
-    auto compute_padding_offset = [&](int* smem_offset, int maxSeqLength, int* paddingOffsets)
+    auto compute_padding_offset = [&](int* smem_offset, int maxSeqLength, int* paddingOffsets, int paddingOffsetsCapacity)
     {
         // Block x dimension is the batch dimension, while threads iterate all tokens in the sequence.
         int seqBegin = smem_offset[batchIdx];
@@ -206,21 +206,27 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         // The number of padded tokens in the previous sequences.
         int paddingOffset = batchIdx * maxSeqLength - seqBegin;
 
-        // Iterate over the tokens to update the number of padded elements.
+        // Iterate over the tokens. Bound the write to the buffer's allocated capacity so a
+        // mismatched seqQLengths sum cannot scribble past the [numTokens]-sized allocation.
         for (int tokenIdx = threadIdx.x; tokenIdx < seqLength; tokenIdx += blockDim.x)
         {
-            paddingOffsets[seqBegin + tokenIdx] = paddingOffset;
+            int const idx = seqBegin + tokenIdx;
+            if (idx < paddingOffsetsCapacity)
+            {
+                paddingOffsets[idx] = paddingOffset;
+            }
         }
     };
 
     if (params.paddingOffsets != nullptr)
     {
-        compute_padding_offset(smemSeqQOffsets, params.maxQSeqLength, params.paddingOffsets);
+        compute_padding_offset(smemSeqQOffsets, params.maxQSeqLength, params.paddingOffsets, params.numTokens);
     }
 
     if (need_encoder_padding_offsets)
     {
-        compute_padding_offset(smemEncoderSeqQOffsets, params.maxEncoderQSeqLength, params.encoderPaddingOffsets);
+        compute_padding_offset(
+            smemEncoderSeqQOffsets, params.maxEncoderQSeqLength, params.encoderPaddingOffsets, params.numTokens);
     }
 
     // Compute tokens Info (batchIdx, tokenIdxInSeq).
