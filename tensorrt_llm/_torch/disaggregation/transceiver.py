@@ -76,7 +76,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # large multiplier is cheap.
                 max_concurrent_sessions=max(1, int(kv_cache_manager.max_batch_size)) * 20000,
                 tx_timeout_s=self._sender_future_timeout_ms / 1000.0,
-                rx_timeout_s=self.kv_transfer_timeout_ms / 1000.0,
+                rx_timeout_s=self._sender_future_timeout_ms / 1000.0,
             )
         )
         self._dp_rank = mapping.tp_rank if mapping.enable_attention_dp else 0
@@ -414,6 +414,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 completed.append(rid)
             elif result == WaitResult.FAILED:
                 failed.append(rid)
+            elif result == WaitResult.TIMEOUT:
+                # Keep the request for retry on the next iteration instead of
+                # marking it as a terminal error immediately.  The overall
+                # kv_transfer_timeout_ms will eventually clean it up.
+                logger.warning(f"RxSession rid={rid} timed out waiting for gen KV transfer")
             # else: None — KV done but aux still in flight; re-poll next cycle
 
         for rid in completed:

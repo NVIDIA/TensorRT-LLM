@@ -1320,11 +1320,12 @@ class RxSession(RxSessionBase):
         With blocking=False (default): returns None if KV is done but transfer
         not fully complete — caller should re-poll next cycle.
         With blocking=True: spins until fully complete.
-        Returns WaitResult.COMPLETED on full success, WaitResult.FAILED on error.
+        Returns WaitResult.COMPLETED on full success, WaitResult.TIMEOUT on
+        timeout, or WaitResult.FAILED on error.
         """
         try:
             for task in self._kv_tasks:
-                kv_status = task.future.result()
+                kv_status = task.future.result(timeout=self._timeout_s)
                 if kv_status != AgentResult.SUCCESS:
                     return WaitResult.FAILED
             if self._need_aux:
@@ -1339,7 +1340,7 @@ class RxSession(RxSessionBase):
                     time.sleep(0.001)
             return WaitResult.COMPLETED
         except TimeoutError:
-            return WaitResult.FAILED
+            return WaitResult.TIMEOUT
         except Exception:
             return WaitResult.FAILED
 
