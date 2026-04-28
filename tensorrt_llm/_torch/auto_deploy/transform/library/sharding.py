@@ -1453,62 +1453,37 @@ def validate_allreduce_strategy(v):
     return v  # Let Pydantic handle other types
 
 
-def _get_dist_ops(backend: str, allgather_strategy: AllGatherStrategy = AllGatherStrategy.AUTO):
-    """Get the appropriate distributed ops based on backend availability.
+def _get_dist_ops(backend: str):
+    """Get the (all_gather, all_reduce) op pair for *backend*.
 
-    Args:
-        backend: The distributed backend to use. Can be 'auto', 'trtllm', or 'torch'.
-                 'auto' will automatically select based on availability.
-        allgather_strategy: AllGather strategy. SYMM_MEM uses symmetric memory with
-                            multimem_all_gather_out (falls back to NCCL internally).
-
-    Returns tuple of (all_gather_op, all_reduce_op) for the current backend.
+    backend may be 'auto', 'trtllm', or 'torch'. 'auto' resolves to TRT-LLM
+    ops when available, else PyTorch distributed ops. Strategies (allgather
+    SYMM_MEM, allreduce NCCL/etc.) are passed as op arguments at the call
+    site, not selected here.
     """
-    # Handle DistBackend enum or string
     if hasattr(backend, "value"):
         backend = backend.value
 
-    # Handle AllGatherStrategy enum or string
-    use_symm_mem_ag = False
-    if hasattr(allgather_strategy, "value"):
-        use_symm_mem_ag = allgather_strategy.value == "SYMM_MEM"
-    elif isinstance(allgather_strategy, str):
-        use_symm_mem_ag = allgather_strategy.upper() == "SYMM_MEM"
-
     if backend == "trtllm":
-        # Force TRT-LLM ops
-        ag_op = (
-            torch.ops.auto_deploy.symm_mem_all_gather.default
-            if use_symm_mem_ag
-            else torch.ops.auto_deploy.trtllm_dist_all_gather.default
+        return (
+            torch.ops.auto_deploy.trtllm_dist_all_gather.default,
+            torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
         )
-        return (ag_op, torch.ops.auto_deploy.trtllm_dist_all_reduce.default)
-    elif backend == "torch":
-        # Force PyTorch distributed ops
-        ag_op = (
-            torch.ops.auto_deploy.symm_mem_all_gather_torch.default
-            if use_symm_mem_ag
-            else torch.ops.auto_deploy.torch_dist_all_gather.default
+    if backend == "torch":
+        return (
+            torch.ops.auto_deploy.torch_dist_all_gather.default,
+            torch.ops.auto_deploy.torch_dist_all_reduce.default,
         )
-        return (ag_op, torch.ops.auto_deploy.torch_dist_all_reduce.default)
-    else:  # auto
-        # Automatically select based on availability
-        if is_trtllm_op_available():
-            # Use TRT-LLM optimized ops in MPI mode
-            ag_op = (
-                torch.ops.auto_deploy.symm_mem_all_gather.default
-                if use_symm_mem_ag
-                else torch.ops.auto_deploy.trtllm_dist_all_gather.default
-            )
-            return (ag_op, torch.ops.auto_deploy.trtllm_dist_all_reduce.default)
-        else:
-            # Use PyTorch distributed ops in demollm mode
-            ag_op = (
-                torch.ops.auto_deploy.symm_mem_all_gather_torch.default
-                if use_symm_mem_ag
-                else torch.ops.auto_deploy.torch_dist_all_gather.default
-            )
-            return (ag_op, torch.ops.auto_deploy.torch_dist_all_reduce.default)
+    # auto
+    if is_trtllm_op_available():
+        return (
+            torch.ops.auto_deploy.trtllm_dist_all_gather.default,
+            torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
+        )
+    return (
+        torch.ops.auto_deploy.torch_dist_all_gather.default,
+        torch.ops.auto_deploy.torch_dist_all_reduce.default,
+    )
 
 
 def _validate_sharded_shapes(
@@ -1837,12 +1812,11 @@ def _shard_parameter_node(
     if not add_dist:
         return
 
-    # figure out the right dist op (backend-aware)
-    all_gather_op, all_reduce_op = _get_dist_ops(
-        config.dist_backend, allgather_strategy=config.allgather_strategy
-    )
+    # figure out the right dist op (backend-aware) — strategies flow as op args
+    all_gather_op, all_reduce_op = _get_dist_ops(config.dist_backend)
+    allgather_strategy = config.allgather_strategy.name
     dist_lookup = {
-        0: (all_gather_op, -1),
+        0: (all_gather_op, -1, None, allgather_strategy),
         1: (all_reduce_op, allreduce_strategy),
     }
     fn_dist, *dist_args = dist_lookup[dim]

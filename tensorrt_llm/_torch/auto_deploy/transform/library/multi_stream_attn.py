@@ -16,10 +16,9 @@ Match (in the original FX graph — any op in all_gather_ops()):
     fork_point → Q_a_proj → ... (Q chain)
               → KV_a_proj → <any AllGather op> → ...
 
-Rewrite (the matched AllGather is replaced with the aux variant returned by
-``_aux_variant_of``: ``symm_mem_all_gather`` pairs with
-``symm_mem_all_gather_aux`` for a separate workspace; NCCL variants are
-reused as-is since they do not share a workspace):
+Rewrite (the matched AllGather is rebuilt on the aux stream with
+``workspace_id=_AUX_WORKSPACE_ID``; symm-mem strategies use a distinct
+workspace via this id, NCCL strategies just ignore it):
 
                        fork_point (input layernorm out)
                                   │
@@ -29,7 +28,7 @@ reused as-is since they do not share a workspace):
               ───────────                    ──────────
               Q_a_proj                       begin_aux
               Q_AllGather                    KV_a_proj
-              Q_LayerNorm                    symm_mem_all_gather_aux
+              Q_LayerNorm                    KV_AllGather (workspace_id=1)
               Q_b_proj                       end_aux
                   │                               │
                   └──────────► wait_aux ◄─────────┘
@@ -38,7 +37,7 @@ reused as-is since they do not share a workspace):
 
 GPU timeline:
     Main: [Q_GEMM] → [Q_AllGather] → [Q_LayerNorm] → [Q_b_proj] → [wait_aux]
-    Aux:  [KV_GEMM] → [KV_AllGather_aux] → done
+    Aux:  [KV_GEMM] → [KV_AllGather (aux ws)] → done
 
 **Pattern 1 — Projection-only overlap**:
 
@@ -104,16 +103,11 @@ _LINEAR_OPS: List[Callable] = [
 ]
 
 
-def _aux_variant_of(main_ag_op) -> Callable:
-    """Return the aux-stream AllGather op that pairs with *main_ag_op*.
-
-    Symm-mem main-stream AG must be paired with ``symm_mem_all_gather_aux`` so
-    the two streams use distinct workspace buffers. NCCL-based all-gathers
-    do not share a workspace, so the same op is reused on the aux stream.
-    """
-    if main_ag_op == torch.ops.auto_deploy.symm_mem_all_gather:
-        return torch.ops.auto_deploy.symm_mem_all_gather_aux
-    return main_ag_op
+# Distinct symm-mem workspace slot for the aux KV path. The unified
+# *_dist_all_gather op routes workspace_id != 0 to a separate ProcessGroup
+# (and therefore a separate symm_mem workspace), so a concurrent main-stream
+# allgather on workspace_id=0 cannot clobber its buffer.
+_AUX_WORKSPACE_ID = 1
 
 
 def _is_linear(node: Node) -> bool:
@@ -219,9 +213,10 @@ def _execute_kv_path_in_aux_stream(gm: GraphModule, world_size: int) -> Tuple[Gr
 
     When Q and KV projections are separate (unfused) GEMMs, this places the
     entire KV path on the aux stream via begin/end_aux_stream_passthrough,
-    overlapping with the heavier Q path on main.  The KV AllGather uses
-    symm_mem_all_gather_aux (a separate symm_mem workspace) to avoid
-    buffer conflicts with symm_mem_all_gather on main.
+    overlapping with the heavier Q path on main.  The KV AllGather is
+    re-emitted with ``workspace_id=_AUX_WORKSPACE_ID`` so symm-mem strategies
+    use a distinct ProcessGroup/workspace and do not conflict with the
+    main-stream AllGather.
 
     Returns ``(gm, num_matches)``.
     """
@@ -284,10 +279,11 @@ def _execute_kv_path_in_aux_stream(gm: GraphModule, world_size: int) -> Tuple[Gr
             for k, v in kv_linear.meta.items():
                 new_kv_gemm.meta[k] = v
 
-            aux_ag_target = _aux_variant_of(kv_ag.target)
+            ag_sizes = kv_ag.args[2] if len(kv_ag.args) > 2 else None
+            ag_strategy = kv_ag.args[3] if len(kv_ag.args) > 3 else "AUTO"
             new_kv_ag = graph.call_function(
-                aux_ag_target,
-                args=(new_kv_gemm, ag_dim),
+                kv_ag.target,
+                args=(new_kv_gemm, ag_dim, ag_sizes, ag_strategy, _AUX_WORKSPACE_ID),
             )
             for k, v in kv_ag.meta.items():
                 new_kv_ag.meta[k] = v

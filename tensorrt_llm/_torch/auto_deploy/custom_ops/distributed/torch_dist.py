@@ -26,7 +26,8 @@ import torch
 from ....distributed.symm_mem_allgather import SymmetricMemoryAllGather
 from ...distributed import common as dist
 
-# Cache SymmetricMemoryAllGather module for CUDA Graph safety
+# SymmetricMemoryAllGather instances keyed on (rank, world_size, workspace_id).
+# See trtllm_dist.py for the workspace_id contract.
 _symm_mem_allgather_cache = {}
 
 # ============================================================================
@@ -34,63 +35,68 @@ _symm_mem_allgather_cache = {}
 # ============================================================================
 
 
-@torch.library.custom_op("auto_deploy::torch_dist_all_gather", mutates_args=(), device_types="cuda")
-def torch_dist_all_gather(
-    tensor: torch.Tensor, dim: int = 0, sizes: Optional[List[int]] = None
-) -> torch.Tensor:
-    """All gather using PyTorch distributed backend.
-
-    This op always uses torch.distributed.all_gather and is used in demollm mode.
-    """
+def _torch_allgather_fallback(tensor, dim, sizes=None):
+    """Plain torch.distributed all_gather with concat along *dim*."""
     tl = [torch.zeros_like(tensor) for _ in range(dist.get_world_size())]
     dist.all_gather(tl, tensor)
     return torch.cat(tl, dim=dim)
 
 
-@torch_dist_all_gather.register_fake
-def torch_dist_all_gather_fake(tensor, dim=0, sizes=None):
-    return torch.cat([torch.empty_like(tensor) for _ in range(dist.get_world_size())], dim=dim)
+def _get_symm_mem_allgather_torch(workspace_id: int):
+    """Get or create a cached SymmetricMemoryAllGather instance for *workspace_id*."""
+    import torch.distributed as torch_dist
 
-
-def _get_symm_mem_allgather_torch():
-    """Get or create a cached SymmetricMemoryAllGather instance for torch.distributed mode."""
     from .....mapping import Mapping
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    cache_key = (rank, world_size)
+    cache_key = (rank, world_size, workspace_id)
     if cache_key not in _symm_mem_allgather_cache:
         p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
+        if workspace_id == 0:
+            group = None  # constructor will create the default symm-mem group
+        else:
+            group = torch_dist.new_group(p_config.tp_group)
         _symm_mem_allgather_cache[cache_key] = SymmetricMemoryAllGather(
-            mapping=p_config, dtype=torch.bfloat16
+            mapping=p_config, dtype=torch.bfloat16, group=group
         )
     return _symm_mem_allgather_cache[cache_key]
 
 
-@torch.library.custom_op(
-    "auto_deploy::symm_mem_all_gather_torch", mutates_args=(), device_types="cuda"
-)
-def symm_mem_all_gather_torch(
-    tensor: torch.Tensor, dim: int = 0, sizes: Optional[List[int]] = None
-) -> torch.Tensor:
-    """AllGather using symmetric memory for demollm (torch.distributed) mode.
-
-    Falls back to NCCL for unsupported cases.
-    """
+def _torch_symm_mem_allgather_impl(tensor, dim, sizes, workspace_id):
+    """Symm-mem allgather with torch.distributed fallback."""
     if sizes is None:
-        ag_module = _get_symm_mem_allgather_torch()
+        ag_module = _get_symm_mem_allgather_torch(workspace_id)
         result = ag_module(tensor, dim=dim)
         if result is not None:
             return result
-
-    # Fallback: standard torch.distributed all_gather
-    tl = [torch.zeros_like(tensor) for _ in range(dist.get_world_size())]
-    dist.all_gather(tl, tensor)
-    return torch.cat(tl, dim=dim)
+    return _torch_allgather_fallback(tensor, dim, sizes=sizes)
 
 
-@symm_mem_all_gather_torch.register_fake
-def symm_mem_all_gather_torch_fake(tensor, dim=0, sizes=None):
+@torch.library.custom_op("auto_deploy::torch_dist_all_gather", mutates_args=(), device_types="cuda")
+def torch_dist_all_gather(
+    tensor: torch.Tensor,
+    dim: int = 0,
+    sizes: Optional[List[int]] = None,
+    strategy: str = "AUTO",
+    workspace_id: int = 0,
+) -> torch.Tensor:
+    """AllGather via torch.distributed backend (demollm mode).
+
+    Strategy:
+        AUTO     — torch.distributed.all_gather.
+        SYMM_MEM — symmetric memory (multimem_all_gather_out) with
+                   torch.distributed fallback.
+
+    See trtllm_dist_all_gather for the workspace_id contract.
+    """
+    if strategy == "SYMM_MEM":
+        return _torch_symm_mem_allgather_impl(tensor, dim, sizes, workspace_id)
+    return _torch_allgather_fallback(tensor, dim, sizes=sizes)
+
+
+@torch_dist_all_gather.register_fake
+def torch_dist_all_gather_fake(tensor, dim=0, sizes=None, strategy="AUTO", workspace_id=0):
     return torch.cat([torch.empty_like(tensor) for _ in range(dist.get_world_size())], dim=dim)
 
 

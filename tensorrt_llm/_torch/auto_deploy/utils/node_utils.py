@@ -738,17 +738,14 @@ def all_gather_ops() -> frozenset:
     registered as a side effect of importing the distributed custom_ops
     package, which may not have happened yet at the time this module is
     first imported.
+
+    Strategy (AUTO/SYMM_MEM) and workspace_id (for symm-mem ProcessGroup
+    selection) flow through as op arguments, not as separate op identities.
     """
     return frozenset(
         {
-            # NCCL all-gather (TRT-LLM optimized + torch.distributed)
             torch.ops.auto_deploy.trtllm_dist_all_gather,
             torch.ops.auto_deploy.torch_dist_all_gather,
-            # Symmetric-memory variants (multimem_all_gather_out)
-            torch.ops.auto_deploy.symm_mem_all_gather,
-            torch.ops.auto_deploy.symm_mem_all_gather_torch,
-            # Aux-stream symm-mem (separate workspace, used when overlapping all-gathers)
-            torch.ops.auto_deploy.symm_mem_all_gather_aux,
         }
     )
 
