@@ -4,7 +4,8 @@ import time
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
-                                 CudaGraphConfig, DraftTargetDecodingConfig,
+                                 CudaGraphConfig, DFlashDecodingConfig,
+                                 DraftTargetDecodingConfig,
                                  Eagle3DecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
                                  TorchCompileConfig)
@@ -297,6 +298,10 @@ def setup_llm(args, **kwargs):
             eagle3_model_arch=args.eagle3_model_arch,
             max_total_draft_tokens=args.max_total_draft_tokens,
             max_batch_size=args.max_batch_size)
+    elif spec_decode_algo == "DFLASH":
+        spec_config = DFlashDecodingConfig(
+            max_draft_len=args.spec_decode_max_draft_len,
+            speculative_model=args.draft_model_dir)
     elif spec_decode_algo == "DRAFT_TARGET":
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
