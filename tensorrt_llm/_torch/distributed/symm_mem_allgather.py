@@ -99,9 +99,10 @@ class SymmetricMemoryAllGather(nn.Module):
             logger.warning("SymmetricMemoryAllGather: CUDA not available")
             return
 
-        # Device capability
-        device = torch.device(f"cuda:{mapping.tp_rank}")
-        capability = torch.cuda.get_device_capability(device)
+        # The executor has already pinned this process to the right GPU
+        # via torch.cuda.set_device(); use that rather than re-deriving an
+        # ordinal from the TP/local rank (which breaks on multi-node).
+        capability = torch.cuda.get_device_capability(torch.cuda.current_device())
         self.device_capability = f"{capability[0]}.{capability[1]}"
 
         if self.device_capability not in self._MAX_SIZES:
