@@ -37,13 +37,26 @@ shared perf regression pipeline. It is responsible for:
 VisualGen currently uses these match keys:
 
 ```
-s_gpu_type  s_runtime  s_model_name  l_gpus
-s_attn_backend  s_quant_algo
-b_enable_teacache  b_enable_cuda_graph  b_enable_torch_compile
-b_enable_two_stage  b_enable_parallel_vae
-l_cfg_size  l_ulysses_size
-s_generation_mode  s_backend  s_size
-l_num_frames  l_fps  l_num_inference_steps  l_max_concurrency
+s_gpu_type
+s_runtime
+s_model_name
+l_gpus
+s_attn_backend
+s_quant_algo
+b_enable_teacache
+b_enable_cuda_graph
+b_enable_torch_compile
+b_enable_two_stage
+b_enable_parallel_vae
+l_cfg_size
+l_ulysses_size
+s_generation_mode
+s_backend
+s_size
+l_num_frames
+l_fps
+l_num_inference_steps
+l_max_concurrency
 ```
 
 Two fields are derived instead of copied directly:
@@ -180,6 +193,20 @@ same hardware tier, they live in a single test-db file. When the case count
 grows or pre-merge coverage is needed, add a new `pre_merge` block to the same
 file or introduce a separate test-db file and a new Jenkins stage entry.
 
+### Triggering CI
+
+To run only the VisualGen perf sanity stage (without the full L0 suite):
+
+```
+/bot run --stage-list "DGX_B200-1_GPU-PyTorch-VisualGen-PerfSanity-1"
+```
+
+To include the VisualGen perf sanity stage alongside the standard L0 suite:
+
+```
+/bot run --extra-stage "DGX_B200-1_GPU-PyTorch-VisualGen-PerfSanity-1"
+```
+
 Model assets are read from `LLM_MODELS_ROOT` (defaults to
 `/home/scratch.trt_llm_data_ci/llm-models/`). The `model_path` in a YAML may
 use the HuggingFace `org/model` format (e.g. `Wan-AI/Wan2.1-T2V-14B-Diffusers`)
@@ -220,6 +247,18 @@ Important:
    ```bash
    pytest perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg-{config_base}-{server_name}]
    ```
+
+6. **Verify uploaded results** after a `vg_upload` run by opening the
+   VisualGen OpenSearch data explorer:
+
+   ```
+   https://gpuwa.nvidia.com/os-dashboards/app/data-explorer/discover?security_tenant=TRT-LLM-Infra#?_a=(discover:(columns:!(_source),isDirty:!f,sort:!()),metadata:(indexPattern:'6b689e00-e52e-11f0-ae33-a57c903184a7',view:discover))&_g=(filters:!(),refreshInterval:(pause:!t,value:0),time:(from:'2026-04-24T04:00:00.000Z',to:'2026-04-25T04:00:00.000Z'))&_q=(filters:!(('$state':(store:appState),meta:(alias:!n,disabled:!f,index:'6b689e00-e52e-11f0-ae33-a57c903184a7',key:s_runtime,negate:!f,params:(query:visual_gen),type:phrase),query:(match_phrase:(s_runtime:visual_gen)))),query:(language:kuery,query:''))
+   ```
+
+   The link pre-filters to `s_runtime: visual_gen`. To find a specific run,
+   search for the server config name (e.g. `s_server_name:
+   wan21_14b_nvfp4_trtllm_cfg2_ulysses4_teacache_on`) or narrow the time range
+   to match the CI run timestamp.
 
 ## How to Add or Change a Match Key
 
