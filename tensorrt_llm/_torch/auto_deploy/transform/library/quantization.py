@@ -839,44 +839,6 @@ class INT4GPTQLinearQuantizationFromConfig(Quantization):
         del state_dict[qweight_ckpt]
 
 
-def _requantize_to_128x128_ue8m0(weight_fp8, scale, block_n, block_k):
-    """Re-quantize misaligned FP8 weight to 128x128 block UE8M0 format for DeepGEMM.
-
-    After TP sharding, projections whose shard size is not a multiple of 128
-    (e.g. kv_a_proj N=72, q_a_proj N=192 at TP=8) get per-row scales because
-    the shard boundary cuts through a 128-row block. This dequantizes and
-    re-quantizes with proper 128x128 blocks so DeepGEMM can be used instead
-    of the BF16 dequant + cuBLAS fallback.
-    """
-    from .....quantization.utils.fp8_matrix_weight_dequant import (
-        dequant_fp8_weight_two_dim_block_grid,
-    )
-
-    N, K = weight_fp8.shape[-2], weight_fp8.shape[-1]
-
-    w_dequant = dequant_fp8_weight_two_dim_block_grid(
-        weight_fp8, scale.float(), block_n, block_k, dtype=torch.float32
-    )
-
-    BLOCK = 128
-    nb_n = math.ceil(N / BLOCK)
-    nb_k = K // BLOCK
-
-    if N % BLOCK != 0:
-        w_padded = torch.nn.functional.pad(w_dequant, (0, 0, 0, nb_n * BLOCK - N))
-    else:
-        w_padded = w_dequant
-
-    w_blocks = w_padded.reshape(nb_n, BLOCK, nb_k, BLOCK)
-    block_amax = w_blocks.abs().float().amax(dim=(1, 3)).clamp(min=1e-4)
-    scale_ue8m0 = torch.pow(2.0, torch.ceil(torch.log2(block_amax / 448.0)))
-
-    w_requant = w_blocks.float() * (1.0 / scale_ue8m0[:, None, :, None])
-    w_requant = w_requant.to(torch.float8_e4m3fn).reshape(nb_n * BLOCK, K)[:N]
-
-    return w_requant.reshape(weight_fp8.shape), scale_ue8m0
-
-
 @TransformRegistry.register("quantize_finegrained_fp8_linear_from_config")
 class FineGrainedFP8LinearQuantization(Quantization):
     """Quantization transform for FineGrainedFP8 (block-wise FP8) models.
@@ -968,12 +930,12 @@ class FineGrainedFP8LinearQuantization(Quantization):
             return
 
         # Skip DeepGEMM for TP-misaligned projections (N not a multiple of 128).
-        # Misalignment requires re-quantization to 128x128 UE8M0 blocks
-        # (_requantize_to_128x128_ue8m0), which introduces precision loss from
-        # power-of-2 scale rounding.  Empirically observed on DeepSeek-R1
-        # (q_a N=192, kv_a N=72 at TP=8): MMLU 82.31 → 84.16 when these fall
-        # back to cuBLAS with float32 scales.  Aligned projections (q_b N=3072,
-        # kv_b N=1024, MoE etc.) keep DeepGEMM — no re-quant, no precision loss.
+        # Misalignment would require re-quantizing the weight to 128x128 UE8M0
+        # blocks, which introduces precision loss from power-of-2 scale
+        # rounding.  Empirically observed on DeepSeek-R1 (q_a N=192, kv_a N=72
+        # at TP=8): MMLU 82.31 → 84.16 when these fall back to cuBLAS with
+        # float32 scales.  Aligned projections (q_b N=3072, kv_b N=1024, MoE
+        # etc.) keep DeepGEMM — no re-quant, no precision loss.
         if K % 128 != 0 or N % 128 != 0:
             return
 
