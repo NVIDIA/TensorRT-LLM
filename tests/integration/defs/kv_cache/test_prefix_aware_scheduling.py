@@ -47,16 +47,10 @@ from ..trt_test_alternative import popen, print_error, print_info
 MODEL_PATH = f"{llm_models_root()}/Qwen2-0.5B"
 MODEL_NAME = "Qwen2-0.5B"
 
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
-LMBENCHMARK_DIR = os.environ.get("LMBENCHMARK_DIR", os.path.join(_REPO_ROOT, "LMBenchmark"))
 # c1e05a70 "add timeout, skip-ssl-verify, gap-between-requests, itl/throughput
 # metrics to real multi-round qa (#36)" by Ziwen Ning, 2026-01-28.
 LMBENCHMARK_SHA = "c1e05a708a5a1fd04a9ec09d215edbdcccdf92cb"
-_LMBENCHMARK_SCRIPT_ENV = os.environ.get("LMBENCHMARK_SCRIPT")
-LMBENCHMARK_SCRIPT = os.environ.get(
-    "LMBENCHMARK_SCRIPT",
-    os.path.join(LMBENCHMARK_DIR, "synthetic-multi-round-qa", "multi-round-qa.py"),
-)
+LMBENCHMARK_SCRIPT = ""
 _LMBENCHMARK_PACKAGE = "benchmark"
 _LMBENCHMARK_SCRIPT_IN_PACKAGE = "synthetic-multi-round-qa/multi-round-qa.py"
 
@@ -572,71 +566,47 @@ def _run_and_assert_stage(
 # ---------------------------------------------------------------------------
 
 
-def _find_installed_lmbenchmark_script() -> str | None:
-    """Return the LMBenchmark script from the pinned installed package, if present."""
+def _resolve_lmbenchmark_script() -> str:
+    """Return the benchmark script from the pinned installed LMBenchmark package."""
     try:
         dist = importlib.metadata.distribution(_LMBENCHMARK_PACKAGE)
     except importlib.metadata.PackageNotFoundError:
-        return None
+        pytest.fail(
+            "LMBenchmark package is not installed. Install requirements-dev.txt "
+            f"to provision {_LMBENCHMARK_SCRIPT_IN_PACKAGE} at commit {LMBENCHMARK_SHA}."
+        )
 
     direct_url = dist.read_text("direct_url.json")
     if direct_url is None:
-        return None
+        pytest.fail("LMBenchmark package is missing direct_url.json provenance.")
 
     try:
         direct_url_data = json.loads(direct_url)
-    except json.JSONDecodeError:
-        return None
+    except json.JSONDecodeError as exc:
+        pytest.fail(f"LMBenchmark direct_url.json is not valid JSON: {exc}")
 
     vcs_info = direct_url_data.get("vcs_info", {})
     recorded_revisions = (vcs_info.get("commit_id"), vcs_info.get("requested_revision"))
     if LMBENCHMARK_SHA not in recorded_revisions:
-        return None
+        pytest.fail(
+            f"LMBenchmark package revision {recorded_revisions} does not match "
+            f"expected {LMBENCHMARK_SHA}."
+        )
 
     script = os.fspath(dist.locate_file(_LMBENCHMARK_SCRIPT_IN_PACKAGE))
-    return script if os.path.exists(script) else None
+    if not os.path.exists(script):
+        pytest.fail(
+            f"LMBenchmark package installed, but {_LMBENCHMARK_SCRIPT_IN_PACKAGE} was not found."
+        )
+    return script
 
 
 @pytest.fixture(scope="module")
-def ensure_lmbenchmark():
-    """Resolve the pinned LMBenchmark script from env, package install, or checkout."""
+def ensure_lmbenchmark() -> None:
+    """Resolve the pinned LMBenchmark script used by this module."""
     global LMBENCHMARK_SCRIPT
 
-    if not os.path.exists(LMBENCHMARK_SCRIPT):
-        installed_script = _find_installed_lmbenchmark_script()
-        if installed_script is not None:
-            LMBENCHMARK_SCRIPT = installed_script
-            return
-        if _LMBENCHMARK_SCRIPT_ENV:
-            pytest.skip(f"LMBENCHMARK_SCRIPT does not exist: {LMBENCHMARK_SCRIPT}")
-    if _LMBENCHMARK_SCRIPT_ENV:
-        return
-
-    installed_script = _find_installed_lmbenchmark_script()
-    if installed_script is not None:
-        LMBENCHMARK_SCRIPT = installed_script
-        return
-
-    if not os.path.exists(LMBENCHMARK_SCRIPT):
-        pytest.skip(
-            "LMBenchmark script not found. Install requirements.txt, provision "
-            f"the pinned checkout at {LMBENCHMARK_DIR}, or set LMBENCHMARK_SCRIPT "
-            f"to the CI-provided multi-round-qa.py artifact for commit {LMBENCHMARK_SHA}."
-        )
-
-    if not os.path.exists(os.path.join(LMBENCHMARK_DIR, ".git")):
-        pytest.skip(
-            "Default LMBENCHMARK_DIR is not a git checkout. Set LMBENCHMARK_SCRIPT "
-            f"to a pinned CI-provided artifact for commit {LMBENCHMARK_SHA}."
-        )
-    current = subprocess.check_output(
-        ["git", "-C", LMBENCHMARK_DIR, "rev-parse", "HEAD"], text=True
-    ).strip()
-    if current != LMBENCHMARK_SHA:
-        pytest.skip(
-            f"LMBenchmark checkout is at {current}, expected {LMBENCHMARK_SHA}. "
-            "Provision the pinned checkout or set LMBENCHMARK_SCRIPT to a pinned artifact."
-        )
+    LMBENCHMARK_SCRIPT = _resolve_lmbenchmark_script()
 
 
 # ---------------------------------------------------------------------------

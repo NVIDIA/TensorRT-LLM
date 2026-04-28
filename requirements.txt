@@ -65,9 +65,6 @@ nvtx
 matplotlib # FIXME: this is added to make nvtx happy
 meson
 ninja
-# Provides synthetic-multi-round-qa/multi-round-qa.py for prefix-aware
-# scheduling integration tests.
-benchmark @ git+https://github.com/LMCache/LMBenchmark.git@c1e05a708a5a1fd04a9ec09d215edbdcccdf92cb
 blake3
 soundfile
 triton==3.6.0 # NOTE: if you update this, you must also run scripts/vendor_triton_kernels.py to vendor the new version of triton_kernels
