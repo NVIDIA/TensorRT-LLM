@@ -290,6 +290,29 @@ def get_model_yaml_config(model_label: str,
                 }
             }
         },
+        # GPT-OSS 20B (NVBug 5720470: MMHA vs XQA kernel regression)
+        {
+            'patterns': [
+                'gpt_oss_20b_fp4-bench-pytorch-float4',
+            ],
+            'config': {
+                'cuda_graph_config': {
+                    'max_batch_size': 512,
+                    'enable_padding': True,
+                },
+                'enable_chunked_prefill': False,
+                'enable_attention_dp': False,
+                'disable_overlap_scheduler': False,
+                'kv_cache_config': {
+                    'enable_block_reuse': False,
+                    'free_gpu_memory_fraction': 0.9,
+                },
+                'moe_config': {
+                    'backend': 'TRITON'
+                },
+                'print_iter_log': True,
+            }
+        },
         # GPT-OSS 120B max throughput test
         {
             'patterns': [

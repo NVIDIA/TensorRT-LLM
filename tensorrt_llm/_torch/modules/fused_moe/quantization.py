@@ -2202,10 +2202,10 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
         # Load pre_quant_scale if it exists (for NVFP4_AWQ)
         if has_pre_quant_scale:
+
             assert module.is_gated_activation, (
                 "pre_quant_scale (NVFP4_AWQ) is not supported with non-gated activations"
             )
-            from ..linear import TensorParallelMode, load_weight_shard
 
             device = module.fc31_act_scale.device
             # Load fc31 (w3/w1) pre_quant_scales
