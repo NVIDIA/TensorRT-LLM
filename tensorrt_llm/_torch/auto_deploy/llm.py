@@ -181,6 +181,15 @@ class DemoLLM(LLM):
     def __init__(self, **kwargs):
         self.args: LlmArgs = LlmArgs(**kwargs)
 
+        if self.args.encode_only:
+            raise NotImplementedError(
+                "encode_only=True is not supported by DemoLLM (AutoDeploy debug path). "
+                "Use the standard LLM class with backend='pytorch' for encoder-only mode."
+            )
+        # set encode_only and encoder_executor to BaseLLM's default values
+        self._encode_only = False
+        self._encoder_executor = None
+
         self.mpi_session = None
         self.runtime_context = None
 

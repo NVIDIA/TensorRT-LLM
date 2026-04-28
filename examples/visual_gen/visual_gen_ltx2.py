@@ -383,8 +383,6 @@ def main():
 
         start_time = time.time()
 
-        inputs = {"prompt": args.prompt}
-
         extra_params = {
             "guidance_rescale": args.guidance_rescale,
             "stg_scale": args.stg_scale,
@@ -411,7 +409,7 @@ def main():
             extra_params=extra_params,
         )
 
-        output = visual_gen.generate(inputs=inputs, params=params)
+        output = visual_gen.generate(inputs=args.prompt, params=params)
 
         end_time = time.time()
         logger.info(f"Generation completed in {end_time - start_time:.2f}s")

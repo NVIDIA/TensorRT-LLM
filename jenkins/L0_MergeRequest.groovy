@@ -720,12 +720,17 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/kernels/communicationKernels/",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.cu",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.h",
+        "cpp/tensorrt_llm/kernels/fmhaDispatcher.cpp",
+        "cpp/tensorrt_llm/kernels/fmhaDispatcher.h",
         "cpp/tensorrt_llm/kernels/gptKernels.cu",
         "cpp/tensorrt_llm/kernels/gptKernels.h",
         "cpp/tensorrt_llm/kernels/moe",
+        "cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/",
         "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.cu",
         "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.h",
         "cpp/tensorrt_llm/kernels/userbuffers/",
+        "cpp/tensorrt_llm/kernels/xqaDispatcher.cpp",
+        "cpp/tensorrt_llm/kernels/xqaDispatcher.h",
         "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.cpp",
         "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.h",
         "cpp/tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.cpp",
@@ -822,7 +827,8 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
         return ""
     }
     def groupFileMap = [
-        "Docs": [ // TODO: Add more docs path to the list, e.g. *.md files in other directories
+        "Docs": [
+            // Matched by prefix here, plus any "*.md" file anywhere in the repo (handled below).
             "docs/",
         ],
         "PyTorch": [
@@ -853,17 +859,20 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
 
     for (group in groupFileMap.keySet()) {
         def groupPrefixes = groupFileMap[group]
-        def allFilesInGroup = changedFileList.every { file ->
-            groupPrefixes.any { prefix -> file.startsWith(prefix) }
+        def matchesGroup = { file ->
+            // Any *.md file, anywhere in the repo, counts as Docs-only.
+            if (group == "Docs" && file.endsWith(".md")) {
+                return true
+            }
+            return groupPrefixes.any { prefix -> file.startsWith(prefix) }
         }
+        def allFilesInGroup = changedFileList.every(matchesGroup)
 
         if (allFilesInGroup) {
             pipeline.echo("Only ${group} files changed.")
             return group
         } else {
-            def nonGroupFile = changedFileList.find { file ->
-                !groupPrefixes.any { prefix -> file.startsWith(prefix) }
-            }
+            def nonGroupFile = changedFileList.find { file -> !matchesGroup(file) }
             if (nonGroupFile != null) {
                 pipeline.echo("Found non-${group} file: ${nonGroupFile}")
             }
@@ -1387,7 +1396,31 @@ pipeline {
                     def analysis = trtllm_utils.analyzePipelineFailureWithAgent(
                         this, env.JOB_NAME, env.BUILD_NUMBER, prNumber)
                     if (analysis) {
-                        echo "=== CI Agent Failure Analysis ===\n${analysis}"
+                        writeFile file: 'ci_agent_analysis.txt', text: analysis
+                        def bucket = 'sw-tensorrt-ci-analysis'
+                        def key = "${env.JOB_NAME}/${env.BUILD_NUMBER}/failure_analysis.txt"
+                        container("alpine") {
+                            trtllm_utils.llmExecStepWithRetry(this, script: 'apk add --no-cache aws-cli')
+                            // Alpine's musl libc fires A and AAAA queries in parallel; pbss.s8k.io's AAAA
+                            // returns SERVFAIL and musl treats that as a fatal lookup failure (glibc would
+                            // not). Pin the A-record IP in /etc/hosts so getaddrinfo resolves from files.
+                            trtllm_utils.llmExecStepWithRetry(this, script: '''
+                                if ! grep -q 'pbss.s8k.io' /etc/hosts; then
+                                    ip=$(nslookup -type=A pbss.s8k.io 2>/dev/null | awk '/^Address[: ]/ && $NF !~ /:53$/ && $NF !~ /#53$/ { print $NF; exit }')
+                                    if [ -n "$ip" ]; then
+                                        printf '%s\\n' "$ip pbss.s8k.io" >> /etc/hosts
+                                    fi
+                                fi
+                            ''')
+                            withCredentials([string(
+                                    credentialsId: 'svc_tensorrt-swift-stack-key',
+                                    variable: 'AWS_SECRET_ACCESS_KEY')]) {
+                                trtllm_utils.llmExecStepWithRetry(this, script:
+                                    "AWS_ACCESS_KEY_ID=svc_tensorrt aws s3 cp ci_agent_analysis.txt" +
+                                    " s3://${bucket}/${key} --endpoint-url https://pbss.s8k.io")
+                            }
+                        }
+                        echo "CI Agent Failure Analysis: https://pbss.s8k.io/${bucket}/${key}"
                     }
                 } catch (Exception e) {
                     // Analysis is best-effort; do not fail the pipeline

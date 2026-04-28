@@ -33,7 +33,7 @@ from tensorrt_llm._utils import EnergyMonitor
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
-from tensorrt_llm.inputs.data import TokensPrompt, visual_gen_inputs
+from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
@@ -705,6 +705,21 @@ class OpenAIServer:
         if self._check_health():
             return Response(status_code=200)
         else:
+            # If the engine has a fatal error, trigger server shutdown so the
+            # pod doesn't linger as a zombie that accepts connections but never
+            # produces tokens.  Uses SIGINT (not SIGTERM) to match the
+            # existing CppExecutorError handlers and let uvicorn perform
+            # its graceful shutdown sequence.  The doing_shutdown guard
+            # ensures we only send SIGINT once — repeated health probes
+            # won't stack signals during an in-progress teardown.
+            executor = getattr(self.generator, '_executor', None)
+            if executor is not None and getattr(executor, '_fatal_error',
+                                                None) is not None:
+                if not getattr(executor, 'doing_shutdown', True):
+                    logger.error(
+                        "Health check detected fatal engine error, initiating "
+                        f"server shutdown: {executor._fatal_error}")
+                    signal.raise_signal(signal.SIGINT)
             return Response(
                 status_code=503,
                 content=
@@ -882,9 +897,9 @@ class OpenAIServer:
     async def get_kv_cache_events(self) -> JSONResponse:
         events = []
         try:
-            async for event in self.generator.get_kv_cache_events_async(2):
+            async for event in self.generator.get_kv_cache_events_async(0):
                 events.append(event)
-        except IndexError:
+        except (IndexError, asyncio.QueueEmpty):
             # queue is empty, no more events
             pass
         return JSONResponse(content=events)
@@ -939,6 +954,8 @@ class OpenAIServer:
         disaggregated_params: Optional[LlmDisaggregatedParams] = None
     ) -> ChatCompletionResponse:
         await promise.aresult()
+        if promise.error is not None:
+            raise RuntimeError(f"Generation failed: {promise.error}")
         if self.postproc_worker_enabled:
             chat_response = promise.outputs[0]._postprocess_result
         else:
@@ -1265,6 +1282,8 @@ class OpenAIServer:
                 postproc_params: Optional[PostprocParams]
         ) -> CompletionResponse:
             response = await promise
+            if response.error is not None:
+                raise RuntimeError(f"Generation failed: {response.error}")
             if not self.postproc_worker_enabled:
                 post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
                 pp_result = post_processor(response, args)
@@ -1771,21 +1790,13 @@ class OpenAIServer:
         """
         try:
             image_id = f"image_{uuid.uuid4().hex}"
-            params = parse_visual_gen_params(request, image_id)
+            params = parse_visual_gen_params(request, image_id, self.generator)
             logger.info(
                 f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
             )
 
-            if request.negative_prompt is not None:
-                inputs = visual_gen_inputs({
-                    "prompt":
-                    request.prompt,
-                    "negative_prompt":
-                    request.negative_prompt
-                })
-            else:
-                inputs = visual_gen_inputs(request.prompt)
-            output = self.generator.generate(inputs=inputs, params=params)
+            output = self.generator.generate(inputs=request.prompt,
+                                             params=params)
             if output.image is None:
                 return self.create_error_response(
                     message="Image generation failed",
@@ -1836,21 +1847,13 @@ class OpenAIServer:
         """
         try:
             image_id = f"image_{uuid.uuid4().hex}"
-            params = parse_visual_gen_params(request, image_id)
+            params = parse_visual_gen_params(request, image_id, self.generator)
             logger.info(
                 f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
             )
 
-            if request.negative_prompt is not None:
-                inputs = visual_gen_inputs({
-                    "prompt":
-                    request.prompt,
-                    "negative_prompt":
-                    request.negative_prompt
-                })
-            else:
-                inputs = visual_gen_inputs(request.prompt)
-            output = self.generator.generate(inputs=inputs, params=params)
+            output = self.generator.generate(inputs=request.prompt,
+                                             params=params)
             if output.image is None:
                 return self.create_error_response(
                     message="Image editing failed",
@@ -1905,22 +1908,15 @@ class OpenAIServer:
             video_id = f"video_{uuid.uuid4().hex}"
             params = parse_visual_gen_params(request,
                                              video_id,
+                                             self.generator,
                                              media_storage_path=str(
                                                  self.media_storage_path))
             logger.info(
                 f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}"
             )
 
-            if request.negative_prompt is not None:
-                inputs = visual_gen_inputs({
-                    "prompt":
-                    request.prompt,
-                    "negative_prompt":
-                    request.negative_prompt
-                })
-            else:
-                inputs = visual_gen_inputs(request.prompt)
-            output = self.generator.generate(inputs=inputs, params=params)
+            output = self.generator.generate(inputs=request.prompt,
+                                             params=params)
             if output.video is None:
                 return self.create_error_response(
                     message="Video generation failed",
@@ -2039,6 +2035,7 @@ class OpenAIServer:
             video_id = f"video_{uuid.uuid4().hex}"
             params = parse_visual_gen_params(request,
                                              video_id,
+                                             self.generator,
                                              media_storage_path=str(
                                                  self.media_storage_path))
             logger.info(
@@ -2087,16 +2084,8 @@ class OpenAIServer:
             resolved_fmt, resolved_ext = resolve_video_format(
                 request.output_format)
 
-            if request.negative_prompt is not None:
-                inputs = visual_gen_inputs({
-                    "prompt":
-                    request.prompt,
-                    "negative_prompt":
-                    request.negative_prompt
-                })
-            else:
-                inputs = visual_gen_inputs(request.prompt)
-            future = self.generator.generate_async(inputs=inputs, params=params)
+            future = self.generator.generate_async(inputs=request.prompt,
+                                                   params=params)
             output = await future.result()
 
             if output.video is None:
