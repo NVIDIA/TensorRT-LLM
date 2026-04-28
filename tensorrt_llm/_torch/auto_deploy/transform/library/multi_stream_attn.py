@@ -12,13 +12,14 @@ heavier Q path (GEMM + AllGather + LayerNorm + Q_b_proj) on main.
 This eliminates the narrow→contiguous copies that fused GEMMs require and
 gives better overlap since both KV GEMM and KV AllGather run on aux.
 
-Match (in the original FX graph — any of the 5 ops in _ALL_GATHER_OPS):
+Match (in the original FX graph — any op in all_gather_ops()):
     fork_point → Q_a_proj → ... (Q chain)
               → KV_a_proj → <any AllGather op> → ...
 
-Rewrite (the matched AllGather is always replaced with
-symm_mem_all_gather_aux, which uses a dedicated workspace so it does not
-clash with a concurrent main-stream symm_mem_all_gather):
+Rewrite (the matched AllGather is replaced with the aux variant returned by
+``_aux_variant_of``: ``symm_mem_all_gather`` pairs with
+``symm_mem_all_gather_aux`` for a separate workspace; NCCL variants are
+reused as-is since they do not share a workspace):
 
                        fork_point (input layernorm out)
                                   │
@@ -85,7 +86,12 @@ from ...utils.multi_stream_utils import (
     record_event_passthrough,
     wait_aux_stream_passthrough,
 )
-from ...utils.node_utils import is_fake_quantized_linear_op, is_finegrained_fp8_linear_op, is_op
+from ...utils.node_utils import (
+    all_gather_ops,
+    is_fake_quantized_linear_op,
+    is_finegrained_fp8_linear_op,
+    is_op,
+)
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 # ===========================================================================
@@ -97,13 +103,17 @@ _LINEAR_OPS: List[Callable] = [
     torch.ops.aten.linear,
 ]
 
-_ALL_GATHER_OPS = {
-    torch.ops.auto_deploy.symm_mem_all_gather,
-    torch.ops.auto_deploy.symm_mem_all_gather_aux,
-    torch.ops.auto_deploy.trtllm_dist_all_gather,
-    torch.ops.auto_deploy.torch_dist_all_gather,
-    torch.ops.auto_deploy.symm_mem_all_gather_torch,
-}
+
+def _aux_variant_of(main_ag_op) -> Callable:
+    """Return the aux-stream AllGather op that pairs with *main_ag_op*.
+
+    Symm-mem main-stream AG must be paired with ``symm_mem_all_gather_aux`` so
+    the two streams use distinct workspace buffers. NCCL-based all-gathers
+    do not share a workspace, so the same op is reused on the aux stream.
+    """
+    if main_ag_op == torch.ops.auto_deploy.symm_mem_all_gather:
+        return torch.ops.auto_deploy.symm_mem_all_gather_aux
+    return main_ag_op
 
 
 def _is_linear(node: Node) -> bool:
@@ -229,7 +239,7 @@ def _execute_kv_path_in_aux_stream(gm: GraphModule, world_size: int) -> Tuple[Gr
     for fork_point, q_linear, kv_linear in triples:
         kv_ag = _find_downstream_node(
             kv_linear,
-            lambda n: is_op(n, _ALL_GATHER_OPS),
+            lambda n: is_op(n, all_gather_ops()),
             max_depth=2,
         )
         if kv_ag is None:
@@ -274,8 +284,9 @@ def _execute_kv_path_in_aux_stream(gm: GraphModule, world_size: int) -> Tuple[Gr
             for k, v in kv_linear.meta.items():
                 new_kv_gemm.meta[k] = v
 
+            aux_ag_target = _aux_variant_of(kv_ag.target)
             new_kv_ag = graph.call_function(
-                torch.ops.auto_deploy.symm_mem_all_gather_aux,
+                aux_ag_target,
                 args=(new_kv_gemm, ag_dim),
             )
             for k, v in kv_ag.meta.items():
