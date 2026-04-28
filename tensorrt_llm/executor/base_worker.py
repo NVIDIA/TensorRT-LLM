@@ -399,10 +399,11 @@ class BaseWorker(GenerationExecutor):
                 # Pre-load on rank 0 to warm the LoRA manager cache so that
                 # add_request_peft finds the adapter already loaded.
                 self._load_lora_adapter(request.lora_request)
+                uid = str(request.lora_request.adapter_id)
                 lora_config = tllm.LoraConfig(
                     task_id=request.lora_request.adapter_id,
                     weights=None,
-                    config=None)
+                    config=self._lora_manager.cpp_lora_config[uid])
             else:
                 adapter_in_cache = self._lora_manager.is_adapter_in_cpu_cache(
                     request.lora_request.adapter_id)
