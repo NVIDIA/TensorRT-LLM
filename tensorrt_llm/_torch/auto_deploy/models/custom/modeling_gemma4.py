@@ -48,9 +48,9 @@ from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput, cached_file
 
-from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
-from tensorrt_llm._torch.utils import ActivationType
+from ..._compat import ActivationType
+from ..factory import ModelFactoryRegistry
+from ..hf import AutoModelForCausalLMFactory
 
 # ---------------------------------------------------------------------------
 # Bundled config classes — enables loading on transformers <5.3 where

@@ -17,6 +17,7 @@ l0_a10:
   - unittest/_torch/sampler/test_torch_sampler.py
   - unittest/_torch/sampler/test_torch_multi_arange.py
   - unittest/utils/test_util.py
+  - unittest/utils/test_logger.py
   - unittest/_torch/test_model_config.py
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
@@ -113,6 +114,7 @@ l0_a10:
   # executor
   - unittest/executor/test_rpc.py
   - unittest/executor/test_ipc.py
+  - unittest/executor/test_fatal_error_health_check.py
   # trtllm-serve CPU-only
   - unittest/llmapi/apps/test_chat_utils.py
   - unittest/llmapi/apps/test_tool_parsers.py

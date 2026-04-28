@@ -117,9 +117,8 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
             disagg_request_id=uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF)
         ctx_request.py_disaggregated_params = disaggregated_params
 
-    kv_cache_manager_ctx.impl.add_sequence(ctx_request.py_request_id,
-                                           ctx_request.prompt_len, 1,
-                                           ctx_request)
+    kv_cache_manager_ctx.impl.add_sequence_batch(
+        [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request])
     # send ctx request
     kv_cache_transceiver_ctx.respond_and_send_async(ctx_request)
 
@@ -148,9 +147,8 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
 
         gen_request.py_disaggregated_params = disaggregated_params
 
-    kv_cache_manager_gen.impl.add_sequence(gen_request.py_request_id,
-                                           gen_request.prompt_len, 1,
-                                           gen_request)
+    kv_cache_manager_gen.impl.add_sequence_batch(
+        [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request])
     # send gen request
     kv_cache_transceiver_gen.request_and_receive_async(gen_request)
 
@@ -198,9 +196,8 @@ def test_cancel_request_in_transmission(attention_type):
         is_streaming=False,
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
 
-    kv_cache_manager_ctx.impl.add_sequence(ctx_request.py_request_id,
-                                           ctx_request.prompt_len, 1,
-                                           ctx_request)
+    kv_cache_manager_ctx.impl.add_sequence_batch(
+        [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request])
     # send ctx request
     kv_cache_transceiver_ctx.respond_and_send_async(ctx_request)
 
@@ -222,9 +219,8 @@ def test_cancel_request_in_transmission(attention_type):
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
         context_phase_params=ctx_request.context_phase_params)
 
-    kv_cache_manager_gen.impl.add_sequence(gen_request.py_request_id,
-                                           gen_request.prompt_len, 1,
-                                           gen_request)
+    kv_cache_manager_gen.impl.add_sequence_batch(
+        [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request])
     # send gen request
     kv_cache_transceiver_gen.request_and_receive_async(gen_request)
 
@@ -440,13 +436,23 @@ def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes,
         hybrid_cache_manager_gen.get_buffers(0),
         hybrid_cache_manager_ctx.get_buffers(0)), "different kv-cache values"
 
-    assert torch.equal(hybrid_cache_manager_gen.get_conv_states(1),
-                       hybrid_cache_manager_ctx.get_conv_states(
-                           1)), "different mamba conv states"
+    # The transceiver copies a single request's state between
+    # independently-allocated slots on each side, so we check the
+    # request's own slot instead of the full state buffer (which has
+    # extra padding-dummy slots that only the ctx side touched).
+    slot_ctx = hybrid_cache_manager_ctx._impl.mamba_impl.get_cache_index(
+        ctx_request.py_request_id)
+    slot_gen = hybrid_cache_manager_gen._impl.mamba_impl.get_cache_index(
+        gen_request.py_request_id)
+    assert torch.equal(
+        hybrid_cache_manager_gen.get_conv_states(1)[slot_gen],
+        hybrid_cache_manager_ctx.get_conv_states(1)[slot_ctx]), (
+            "different mamba conv states")
 
-    assert torch.equal(hybrid_cache_manager_gen.get_ssm_states(1),
-                       hybrid_cache_manager_ctx.get_ssm_states(
-                           1)), "different mamba ssm states"
+    assert torch.equal(
+        hybrid_cache_manager_gen.get_ssm_states(1)[slot_gen],
+        hybrid_cache_manager_ctx.get_ssm_states(1)[slot_ctx]), (
+            "different mamba ssm states")
 
 
 @pytest.mark.timeout(120)
