@@ -17,12 +17,14 @@ import gc
 import os
 from pathlib import Path
 
+import lpips
 import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+from PIL import Image
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import (
@@ -58,6 +60,17 @@ FLUX2_CHECKPOINT_PATH = os.environ.get(
     os.path.join(_llm_models_root(), "FLUX.2-dev"),
 )
 SKIP_COMPONENTS = ["text_encoder", "text_encoder_2", "vae", "tokenizer", "tokenizer_2", "scheduler"]
+
+FLUX_LPIPS_PROMPT = "a tiny astronaut hatching from an egg on the moon"
+FLUX_LPIPS_HEIGHT = 256
+FLUX_LPIPS_WIDTH = 256
+FLUX_LPIPS_NUM_INFERENCE_STEPS = 4
+FLUX_LPIPS_GUIDANCE_SCALE = 3.5
+FLUX_LPIPS_SEED = 42
+FLUX1_LPIPS_GOLDEN_PATH = Path(__file__).with_name("golden") / "flux1_lpips_golden.png"
+FLUX2_LPIPS_GOLDEN_PATH = Path(__file__).with_name("golden") / "flux2_lpips_golden.png"
+FLUX1_LPIPS_THRESHOLD = 0.05
+FLUX2_LPIPS_THRESHOLD = 0.05
 
 
 def _get_flux_transformer_inputs(transformer, device="cuda", dtype=torch.bfloat16):
@@ -104,6 +117,41 @@ def _extract_transformer_output(output):
     if isinstance(output, tuple):
         return output[0]
     return output
+
+
+def _to_lpips_tensor(image, device):
+    """Convert an RGB image-like object to LPIPS input: NCHW float in [-1, 1]."""
+    if isinstance(image, Image.Image):
+        tensor = torch.from_numpy(np.array(image.convert("RGB")))
+    elif isinstance(image, np.ndarray):
+        tensor = torch.from_numpy(image)
+    elif isinstance(image, torch.Tensor):
+        tensor = image.detach().cpu()
+    else:
+        raise TypeError(f"Unsupported image type for LPIPS: {type(image)}")
+
+    if tensor.dim() == 4:
+        tensor = tensor[0]
+    if tensor.dim() != 3:
+        raise ValueError(f"Expected 3D image tensor, got shape {tuple(tensor.shape)}")
+
+    if tensor.shape[0] == 3 and tensor.shape[-1] != 3:
+        tensor = tensor.permute(1, 2, 0)
+    if tensor.shape[-1] != 3:
+        raise ValueError(f"Expected RGB image with 3 channels, got shape {tuple(tensor.shape)}")
+
+    tensor = tensor.to(device=device, dtype=torch.float32)
+    if tensor.max() > 2.0:
+        tensor = tensor / 255.0
+    tensor = tensor.permute(2, 0, 1).unsqueeze(0)
+    return tensor * 2.0 - 1.0
+
+
+def _load_lpips_model(device):
+    try:
+        return lpips.LPIPS(net="alex", verbose=False).to(device).eval()
+    except Exception as exc:
+        pytest.fail(f"LPIPS model could not be loaded: {exc}")
 
 
 def _find_first_quantizable_linear(transformer):
@@ -168,7 +216,7 @@ class TestFluxPipelineLoading:
             skip_components=SKIP_COMPONENTS,
         )
 
-        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        pipeline = PipelineLoader(args).load()
 
         assert pipeline is not None
         assert hasattr(pipeline, "transformer")
@@ -792,6 +840,106 @@ class TestFluxE2E:
         assert psnr > 20.0, f"PSNR too low: {psnr:.2f} dB (expected >20 dB)"
 
         del pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+class TestFluxLPIPSRegression:
+    """End-to-end FLUX image regression against TRT-LLM golden image."""
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_flux1_lpips_against_golden(self, flux1_checkpoint_exists):
+        """Full FLUX.1 generation remains perceptually close to the stored TRT-LLM golden."""
+        if not FLUX1_LPIPS_GOLDEN_PATH.exists():
+            pytest.fail(f"Missing FLUX.1 LPIPS golden image: {FLUX1_LPIPS_GOLDEN_PATH}")
+
+        args = VisualGenArgs(
+            checkpoint_path=FLUX1_CHECKPOINT_PATH,
+            device="cuda",
+            dtype="bfloat16",
+            pipeline=PipelineConfig(),
+        )
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
+
+        try:
+            result = pipeline.forward(
+                prompt=FLUX_LPIPS_PROMPT,
+                height=FLUX_LPIPS_HEIGHT,
+                width=FLUX_LPIPS_WIDTH,
+                num_inference_steps=FLUX_LPIPS_NUM_INFERENCE_STEPS,
+                guidance_scale=FLUX_LPIPS_GUIDANCE_SCALE,
+                seed=FLUX_LPIPS_SEED,
+            )
+            generated_image = result.image[0].detach().cpu()
+        finally:
+            del pipeline
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        with Image.open(FLUX1_LPIPS_GOLDEN_PATH) as golden_image:
+            golden_image = golden_image.convert("RGB")
+        lpips_model = _load_lpips_model("cuda")
+        generated_tensor = _to_lpips_tensor(generated_image, "cuda")
+        golden_tensor = _to_lpips_tensor(golden_image, "cuda")
+
+        with torch.no_grad():
+            lpips_score = lpips_model(generated_tensor, golden_tensor).item()
+
+        print(f"\n[E2E FLUX.1 LPIPS] score: {lpips_score:.6f}")
+        assert lpips_score < FLUX1_LPIPS_THRESHOLD, (
+            f"LPIPS too high: {lpips_score:.6f} "
+            f"(expected < {FLUX1_LPIPS_THRESHOLD:.6f})"
+        )
+
+        del lpips_model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_flux2_lpips_against_golden(self, flux2_checkpoint_exists):
+        """Full FLUX.2 generation remains perceptually close to the stored TRT-LLM golden."""
+        if not FLUX2_LPIPS_GOLDEN_PATH.exists():
+            pytest.fail(f"Missing FLUX.2 LPIPS golden image: {FLUX2_LPIPS_GOLDEN_PATH}")
+
+        args = VisualGenArgs(
+            checkpoint_path=FLUX2_CHECKPOINT_PATH,
+            device="cuda",
+            dtype="bfloat16",
+            pipeline=PipelineConfig(),
+        )
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
+
+        try:
+            result = pipeline.forward(
+                prompt=FLUX_LPIPS_PROMPT,
+                height=FLUX_LPIPS_HEIGHT,
+                width=FLUX_LPIPS_WIDTH,
+                num_inference_steps=FLUX_LPIPS_NUM_INFERENCE_STEPS,
+                guidance_scale=FLUX_LPIPS_GUIDANCE_SCALE,
+                seed=FLUX_LPIPS_SEED,
+            )
+            generated_image = result.image[0].detach().cpu()
+        finally:
+            del pipeline
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        with Image.open(FLUX2_LPIPS_GOLDEN_PATH) as golden_image:
+            golden_image = golden_image.convert("RGB")
+        lpips_model = _load_lpips_model("cuda")
+        generated_tensor = _to_lpips_tensor(generated_image, "cuda")
+        golden_tensor = _to_lpips_tensor(golden_image, "cuda")
+
+        with torch.no_grad():
+            lpips_score = lpips_model(generated_tensor, golden_tensor).item()
+
+        print(f"\n[E2E FLUX.2 LPIPS] score: {lpips_score:.6f}")
+        assert lpips_score < FLUX2_LPIPS_THRESHOLD, (
+            f"LPIPS too high: {lpips_score:.6f} "
+            f"(expected < {FLUX2_LPIPS_THRESHOLD:.6f})"
+        )
+
+        del lpips_model
         gc.collect()
         torch.cuda.empty_cache()
 
