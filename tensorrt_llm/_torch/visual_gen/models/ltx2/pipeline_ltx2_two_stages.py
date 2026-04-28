@@ -38,6 +38,7 @@ from .ltx2_core.video_vae import TilingConfig
 from .pipeline_ltx2 import LTX2Pipeline, _assert_resolution, _find_safetensors_files
 
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +341,8 @@ def _apply_lora_deltas(
 ) -> tuple:
     """Add (sign=+1) or remove (sign=-1) pre-computed LoRA deltas.
 
-    For standard (BF16/FP16) weights the delta is added directly.
+    For standard (BF16/FP16) weights the delta is added directly and
+    later removed by subtracting the same delta.
     For FP8-quantized weights (same shape, float8 dtype), we
     dequantize → apply → requantize.  FP4 weights are handled through
     the packed-FP4 branch because the current static and dynamic NVFP4
@@ -348,15 +350,17 @@ def _apply_lora_deltas(
     applied.  For packed FP4, merged weights are kept in BF16 for stage 2
     inference.  The parent ``Linear`` module's ``quant_method`` is swapped
     to ``UnquantizedLinearMethod`` so inference runs with plain
-    ``F.linear``.  The original tensors and ``quant_method`` are saved so
-    that ``_restore_lora_state`` can fully restore the original state
-    afterwards.
+    ``F.linear``.  The quantized original tensors and ``quant_method`` are
+    saved so that ``_restore_lora_state`` can fully restore the original
+    state afterwards.
 
     Returns ``(applied_count, saved_lora_state)`` where
-    *saved_lora_state* maps each touched parameter name to its original
-    tensor.  For packed FP4 it also stores the parent ``quant_method`` so
-    that stage 2 can run with BF16 weights and then restore the exact
-    original FP4 state without another quantization round trip.
+    *saved_lora_state* maps each touched quantized parameter name to its
+    original tensor.  For packed FP4 it also stores the parent
+    ``quant_method`` so that stage 2 can run with BF16 weights and then
+    restore the exact original FP4 state without another quantization round
+    trip.  Dense BF16/FP16/FP32 weights are not stored in
+    *saved_lora_state*.
     """
     applied = 0
     saved_state: Dict[str, Any] = {}
@@ -376,8 +380,6 @@ def _apply_lora_deltas(
     for raw_name, mod in module.named_modules():
         clean = raw_name.replace("._orig_mod.", ".")
         module_dict[clean] = mod
-
-    _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
     for name, delta in deltas.items():
         param_name = name if name in state else f"{name}.weight"
@@ -419,8 +421,8 @@ def _apply_lora_deltas(
                 param.data.copy_(qw)
                 ws_param.data.copy_(new_scale)
             else:
-                # BF16/FP16/FP32 — direct in-place addition
-                saved_state[param_name] = param.data.clone()
+                # BF16/FP16/FP32: direct in-place addition. These are
+                # restored by subtracting the same delta after stage 2.
                 param.data.add_(
                     delta.to(param.device, param.dtype),
                     alpha=sign,
@@ -479,6 +481,43 @@ def _apply_lora_deltas(
                 f"Skipping."
             )
     return applied, saved_state
+
+
+def _subtract_dense_lora_deltas(
+    module: torch.nn.Module,
+    deltas: Dict[str, torch.Tensor],
+    saved_state: Dict[str, Any],
+) -> int:
+    """Remove LoRA deltas from dense floating-point weights.
+
+    Quantized weights are skipped here because FP8 and FP4 are restored from
+    exact snapshots in ``saved_state``.
+    """
+    restored = 0
+    state: Dict[str, torch.nn.Parameter] = {}
+    for raw_name, param in module.named_parameters():
+        clean = raw_name.replace("._orig_mod.", ".")
+        state[clean] = param
+
+    for name, delta in deltas.items():
+        param_name = name if name in state else f"{name}.weight"
+        if param_name not in state or param_name in saved_state:
+            continue
+
+        param = state[param_name]
+        if param.shape != delta.shape or param.dtype in _FP8_DTYPES:
+            continue
+
+        if not param.data.is_floating_point():
+            continue
+
+        param.data.add_(
+            delta.to(param.device, param.dtype),
+            alpha=-1.0,
+        )
+        restored += 1
+
+    return restored
 
 
 def _restore_lora_state(
@@ -774,13 +813,11 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 # Restore every LoRA-touched parameter from its snapshot. Packed
                 # FP4 also restores the original quant_method.
                 _restore_lora_state(self.transformer, saved_lora_state)
-            else:
-                # Fallback for the unexpected case where no snapshot was recorded.
-                _apply_lora_deltas(
-                    self.transformer,
-                    self._distilled_lora_deltas,
-                    sign=-1.0,
-                )
+            _subtract_dense_lora_deltas(
+                self.transformer,
+                self._distilled_lora_deltas,
+                saved_lora_state,
+            )
             logger.info("Un-merged distilled LoRA after stage 2")
 
         # ================================================================
