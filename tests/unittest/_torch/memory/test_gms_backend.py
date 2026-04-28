@@ -154,6 +154,48 @@ class TestTotalBytes:
         assert backend.total_bytes() == 5678
 
 
+class TestSleepWake:
+
+    def test_release_read_only_mappings_unmaps_and_drops_session(self):
+        backend = _make_backend()
+        backend._client = MagicMock(total_bytes=2 * (1 << 30),
+                                    is_unmapped=False)
+        backend._is_rw = False
+
+        assert backend.release_read_only_mappings() == 2 * (1 << 30)
+
+        backend._client.unmap_all_vas.assert_called_once()
+        backend._client.abort.assert_called_once()
+        assert backend._is_rw is None
+
+    def test_release_read_only_mappings_skips_rw_client(self):
+        backend = _make_backend()
+        backend._client = MagicMock(total_bytes=2 * (1 << 30),
+                                    is_unmapped=False)
+        backend._is_rw = True
+
+        assert backend.release_read_only_mappings() == 0
+
+        backend._client.unmap_all_vas.assert_not_called()
+        backend._client.abort.assert_not_called()
+        assert backend._is_rw is True
+
+    def test_restore_read_only_mappings_reconnects_ro_and_remaps(self):
+        backend = _make_backend()
+        backend._client = MagicMock(total_bytes=3 * (1 << 30),
+                                    is_unmapped=True)
+        backend._is_rw = None
+        fake_gms = _build_fake_gms_success()
+
+        with _install_fake_gms(fake_gms):
+            assert backend.restore_read_only_mappings() == 3 * (1 << 30)
+
+        backend._client.connect.assert_called_once_with(
+            fake_gms.common.locks.RequestedLockType.RO, timeout_ms=30000)
+        backend._client.remap_all_vas.assert_called_once()
+        assert backend._is_rw is False
+
+
 class TestPtrInGms:
 
     def test_returns_false_when_no_mappings_attr(self):

@@ -21,7 +21,7 @@ __all__ = [
 ]
 
 T = TypeVar("T")
-_OOM_RETRY_INTERVAL_SECONDS = 0.05
+_OOM_RETRY_INTERVAL_SECONDS = 0.2
 
 
 @functools.cache
