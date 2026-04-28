@@ -3772,14 +3772,14 @@ class BaseLlmArgs(StrictBaseModel):
     max_num_tokens: Optional[int] = Field(
         default=8192, description="The maximum number of tokens.")
 
-    encoder_max_batch_size: Optional[int] = Field(
+    encoder_max_batch_size: Optional[PositiveInt] = Field(
         default=None,
         description=(
             "Maximum batch size for the multimodal encoder's AttentionMetadata. "
             "Falls back to `max_batch_size` when unset."),
         status="prototype")
 
-    encoder_max_num_tokens: Optional[int] = Field(
+    encoder_max_num_tokens: Optional[PositiveInt] = Field(
         default=None,
         description=(
             "Maximum number of tokens for the multimodal encoder's "
@@ -4088,8 +4088,10 @@ class BaseLlmArgs(StrictBaseModel):
         encoder-specific knobs are not set.
         """
         return (
-            self.encoder_max_batch_size or self.max_batch_size,
-            self.encoder_max_num_tokens or self.max_num_tokens,
+            self.encoder_max_batch_size
+            if self.encoder_max_batch_size is not None else self.max_batch_size,
+            self.encoder_max_num_tokens
+            if self.encoder_max_num_tokens is not None else self.max_num_tokens,
         )
 
 

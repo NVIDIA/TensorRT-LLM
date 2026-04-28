@@ -120,11 +120,11 @@ methods:
         default: False
         status: prototype
       encoder_max_batch_size:
-        annotation: Optional[int]
+        annotation: Optional[Annotated[int, Gt(gt=0)]]
         default: null
         status: prototype
       encoder_max_num_tokens:
-        annotation: Optional[int]
+        annotation: Optional[Annotated[int, Gt(gt=0)]]
         default: null
         status: prototype
       disable_overlap_scheduler:
