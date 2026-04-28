@@ -723,22 +723,17 @@ int AttentionOp::getHeadSize(bool checkInit) const
     return mHeadSize;
 }
 
-size_t AttentionOp::getContextFmhaMultiCtasKvScratchSize() const noexcept
+size_t AttentionOp::getFmhaMultiCtasKvScratchSize() const noexcept
 {
-    if (!useTllmGenSparseAttention())
-    {
-        return 0;
-    }
-
     static constexpr size_t kMultiCtasKvRowsPerCta = 256;
     static constexpr size_t kMultiCtasKvStatsPerRow = 2;
-    static constexpr size_t kMultiCtasKvPartialOElementSize = 2; // We always bfloat16 for partial O
+    static constexpr size_t kMultiCtasKvPartialOElementSize = 2;
 
-    size_t const headDim
-        = useSparseMLA() ? static_cast<size_t>(mMLAParams.kv_lora_rank) : static_cast<size_t>(getHeadSize());
+    size_t const headDimV
+        = mIsMLAEnabled ? static_cast<size_t>(mMLAParams.kv_lora_rank) : static_cast<size_t>(getHeadSize());
     size_t const maxRows = kMultiCtasKvRowsPerCta * static_cast<size_t>(mMultiProcessorCount);
     size_t const partialStatsSize = sizeof(float) * kMultiCtasKvStatsPerRow * maxRows;
-    size_t const partialOSize = kMultiCtasKvPartialOElementSize * maxRows * headDim;
+    size_t const partialOSize = kMultiCtasKvPartialOElementSize * maxRows * headDimV;
 
     return partialStatsSize + partialOSize;
 }
@@ -857,7 +852,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
         ? 0
         : (2 * size * cpMaxPaddedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads) + cu_seqlens_size);
 
-    size_t const fmha_multi_ctas_kv_scratch_size = getContextFmhaMultiCtasKvScratchSize();
+    size_t const fmha_multi_ctas_kv_scratch_size = useTllmGenSparseAttention() ? getFmhaMultiCtasKvScratchSize() : 0;
 
     int const NUM_BUFFERS = 27;
     size_t workspaces[NUM_BUFFERS];
@@ -937,23 +932,17 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
             flash_mla_workspace_size = tc::calculateTotalWorkspaceSize(flash_mla_workspaces, FLASH_MLA_NUM_BUFFERS);
         }
 
-        size_t cu_seqlens_size = sizeof(int) * (max_num_seq + 1);
-        size_t fmha_scheduler_counter = sizeof(uint32_t);
-        size_t headDim = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
+        size_t const cu_seqlens_size = sizeof(int) * (max_num_seq + 1);
+        size_t const fmha_scheduler_counter = sizeof(uint32_t);
+        size_t const fmha_multi_ctas_kv_scratch_size = getFmhaMultiCtasKvScratchSize();
 
-        int const NUM_BUFFERS = 7;
+        int const NUM_BUFFERS = 5;
         size_t workspaces[NUM_BUFFERS];
         workspaces[0] = mIsGenerationMLA ? 0 : cu_seqlens_size; // cu_q_len
         workspaces[1] = mIsGenerationMLA ? 0 : cu_seqlens_size; // cu_kv_len
         workspaces[2] = mIsGenerationMLA ? 0 : fmha_scheduler_counter;
-        // The multiCtasKvMode buffers. Each CTA at most handles 256 rows.
-        // And the seqLenKv is split into at most mMultiProcessorCount tiles.
-        workspaces[3] = size * 256 * mMultiProcessorCount * headDim;
-        // The partialSum size.
-        workspaces[4] = sizeof(float) * 256 * mMultiProcessorCount;
-        // The partialMax size.
-        workspaces[5] = sizeof(float) * 256 * mMultiProcessorCount;
-        workspaces[6] = flash_mla_workspace_size;
+        workspaces[3] = fmha_multi_ctas_kv_scratch_size;
+        workspaces[4] = flash_mla_workspace_size;
 
         fmha_v2_mla_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
     }
@@ -1523,7 +1512,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     size_t const cpWorkspaceSize
         = mCpSize == 1 ? 0 : 2 * sizeof(T) * cpMaxPadedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads);
 
-    size_t const fmha_multi_ctas_kv_scratch_size = getContextFmhaMultiCtasKvScratchSize();
+    size_t const fmha_multi_ctas_kv_scratch_size = useTllmGenSparseAttention() ? getFmhaMultiCtasKvScratchSize() : 0;
 
     bool const is_qk_buf_float_ = true;
 
