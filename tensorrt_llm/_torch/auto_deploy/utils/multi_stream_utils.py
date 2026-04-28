@@ -95,15 +95,17 @@ class CudaStreamManager(metaclass=_Singleton):
 cuda_stream_manager = CudaStreamManager()
 
 # Set to True by the piecewise orchestrator at the start of warmup/capture.
-# Combined with each passthrough's ``aux_has_collective`` kwarg, this gates
-# whether a given stream-switch becomes a no-op in the piecewise (prefill)
-# path.  Aux paths that contain a collective (e.g. MLA pattern 0's
-# ``symm_mem_all_gather_aux``) are skipped during prefill to avoid
-# NCCL/symm_mem stream binding crashes and the costly per-layer
-# ``caller_stream.synchronize()``.  Aux paths without collectives (e.g.
-# ``multi_stream_moe`` shared-expert overlap) keep multi-stream behaviour
-# in piecewise.  Monolithic (decode) capture sets ``aux_has_collective``
-# irrelevant since this flag stays False there.
+# When True, every stream-switch passthrough becomes a no-op so all aux-path
+# work runs on the caller stream.  This is required in piecewise/prefill
+# because the per-submodule CUDA graphs share one memory pool: replaying a
+# main-stream graph and an aux-stream graph concurrently against that pool
+# races and corrupts pooled buffers (manifests as illegal-memory-access on
+# the first decode forward).  The ``aux_has_collective`` kwarg on each
+# passthrough is preserved for documentation but is intentionally ignored
+# by the bypass — even non-collective aux paths (e.g. ``multi_stream_moe``
+# shared-expert overlap) must run on the caller stream during piecewise.
+# Monolithic (decode) capture leaves this flag False so full multi-stream
+# overlap is captured into the decode CUDA graph.
 disable_aux_stream_switch = False
 
 
@@ -162,14 +164,16 @@ def begin_aux_stream_passthrough(
     interpreter will be recorded on aux until ``end_aux_stream_passthrough``
     switches back to main.
 
-    When ``aux_has_collective=True`` and ``disable_aux_stream_switch`` is set
-    (piecewise/prefill mode), this becomes a no-op so the aux path runs on
-    the caller stream instead.  Use this for aux paths containing NCCL or
-    symm_mem collectives, which crash when invoked on a non-capture aux
-    stream and which trigger the costly per-layer
-    ``caller_stream.synchronize()`` for memory-pool race protection.
+    When ``disable_aux_stream_switch`` is set (piecewise/prefill mode),
+    this becomes a no-op so the aux path runs on the caller stream.  This
+    is mandatory regardless of ``aux_has_collective``: piecewise CUDA
+    graphs share a memory pool, and concurrent main/aux replays on that
+    shared pool race and corrupt buffers.  ``aux_has_collective`` is kept
+    for documentation (it flags paths whose collective also hits the
+    NCCL/symm_mem aux-stream binding crash) but does not influence the
+    bypass.
     """
-    if aux_has_collective and disable_aux_stream_switch:
+    if disable_aux_stream_switch:
         return x
     if device < 0:
         device = torch.cuda.current_device()
@@ -210,11 +214,10 @@ def end_aux_stream_passthrough(
     need to be synchronised (typically right before the ``add`` that merges
     shared-expert and routed-expert outputs).
 
-    Pass ``aux_has_collective=True`` to match the corresponding
-    ``begin_aux_stream_passthrough`` so this end-marker is also bypassed in
-    piecewise mode.
+    Bypassed in piecewise mode (``disable_aux_stream_switch=True``)
+    regardless of ``aux_has_collective`` — see module-level note.
     """
-    if aux_has_collective and disable_aux_stream_switch:
+    if disable_aux_stream_switch:
         return x
     if device < 0:
         device = torch.cuda.current_device()
@@ -250,11 +253,10 @@ def wait_aux_stream_passthrough(
     Uses ``torch.cuda.current_stream()`` rather than the stored default stream
     so that the correct stream is waited on during CUDA graph capture.
 
-    Pass ``aux_has_collective=True`` to match the corresponding
-    ``begin_aux_stream_passthrough`` so this wait is also bypassed in
-    piecewise mode.
+    Bypassed in piecewise mode (``disable_aux_stream_switch=True``)
+    regardless of ``aux_has_collective`` — see module-level note.
     """
-    if aux_has_collective and disable_aux_stream_switch:
+    if disable_aux_stream_switch:
         return x
     if device < 0:
         device = torch.cuda.current_device()
