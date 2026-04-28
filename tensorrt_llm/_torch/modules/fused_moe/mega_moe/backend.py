@@ -533,17 +533,24 @@ class MegaMoEDeepGemmFusedMoE(MoE):
         for slot_id, expert_id in enumerate(local_ids):
             w1, w3, w2, w1_sf, w3_sf, w2_sf = get_expert(w, expert_id)
 
-            # Stack [w3 | w1] along intermediate dim to match the standard
-            # Cutlass / TRTLLMGen layout. DG's _interleave_l1_weights
-            # consumes [first_half=gate | second_half=up]; per TRT-LLM's
-            # triton swiglu kernel (swiglu.py) the first half is gate, so
-            # with ``silu(gate)*up`` convention ``w3 = gate`` and
-            # ``w1 = up``. Therefore [w3 | w1] is already [gate | up].
+            # Stack [w1 | w3] along intermediate dim. DG's
+            # ``_interleave_l1_weights`` (deep_gemm/mega/__init__.py:78)
+            # interprets the first half of the L1 weight as gate and the
+            # second half as up. TRT-LLM's MoE convention (consistent
+            # across ``modeling_gpt_oss.py`` and the ``FUSED_GATE_UP_PROJ``
+            # loader at ``quantization.py:362-365``) maps
+            # ``w1 = gate_proj``, ``w3 = up_proj`` (HF ``gate_up_proj``
+            # is ``[gate | up]`` along out_dim, ``chunk(2)[0]`` -> w1,
+            # ``chunk(2)[1]`` -> w3). Therefore the right cat order is
+            # ``[w1 | w3]`` so DG sees ``[gate | up]`` and computes
+            # ``silu(gate) * up`` correctly. The earlier ``[w3, w1]``
+            # order silently swapped which side the silu was applied to,
+            # producing ``silu(up) * gate`` and ~94% mismatch vs reference.
             self.w3_w1_weight.data[slot_id].copy_(
-                torch.cat([_to_u8(w3), _to_u8(w1)], dim=0), non_blocking=True
+                torch.cat([_to_u8(w1), _to_u8(w3)], dim=0), non_blocking=True
             )
             self.w3_w1_weight_scale.data[slot_id].copy_(
-                torch.cat([_to_u8(w3_sf), _to_u8(w1_sf)], dim=0), non_blocking=True
+                torch.cat([_to_u8(w1_sf), _to_u8(w3_sf)], dim=0), non_blocking=True
             )
             self.w2_weight.data[slot_id].copy_(_to_u8(w2), non_blocking=True)
             self.w2_weight_scale.data[slot_id].copy_(_to_u8(w2_sf), non_blocking=True)
