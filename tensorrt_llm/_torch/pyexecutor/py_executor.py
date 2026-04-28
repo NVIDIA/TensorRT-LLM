@@ -2926,48 +2926,6 @@ class PyExecutor:
         )
         return True
 
-    def _run_deferred_warmups_after_wakeup(self) -> tuple[int, int]:
-        pending_warmup_engines = []
-        pending_graph_engines = []
-        for engine in (self.model_engine, self.draft_model_engine):
-            if engine is None:
-                continue
-            has_deferred_warmup = getattr(engine, "has_deferred_warmup", None)
-            if callable(has_deferred_warmup) and has_deferred_warmup():
-                pending_warmup_engines.append(engine)
-                continue
-
-            has_deferred = getattr(engine, "has_deferred_cuda_graph_warmup",
-                                   None)
-            if callable(has_deferred) and has_deferred():
-                pending_graph_engines.append(engine)
-
-        if not pending_warmup_engines and not pending_graph_engines:
-            return 0, 0
-
-        captured_graphs = 0
-        warmed_engines = 0
-        was_warmup = self.is_warmup
-        self.is_warmup = True
-        self.execution_stream.wait_stream(torch.cuda.current_stream())
-        try:
-            with torch.cuda.stream(self.execution_stream):
-                for engine in pending_warmup_engines:
-                    captured_graphs += engine.run_deferred_warmup(
-                        self.resource_manager)
-                    warmed_engines += 1
-                for engine in pending_graph_engines:
-                    captured_graphs += engine.capture_deferred_cuda_graphs(
-                        self.resource_manager)
-        finally:
-            torch.cuda.current_stream().wait_stream(self.execution_stream)
-            self.is_warmup = was_warmup
-
-        logger.info(
-            f"Ran {warmed_engines} deferred warmups and captured "
-            f"{captured_graphs} deferred CUDA graphs after GMS shadow wakeup")
-        return warmed_engines, captured_graphs
-
     def _run_control_request_action(self, action: str, args: tuple, kwargs: dict):
         from tensorrt_llm.llmapi.llm_args import SleepConfig
 
@@ -3138,11 +3096,6 @@ class PyExecutor:
                 restored_moe = 0
                 timings["restore_moe_s"] = 0.0
             step_started_at = time.monotonic()
-            warmed_engines, captured_graphs = (
-                self._run_deferred_warmups_after_wakeup())
-            timings["run_deferred_warmups_s"] = (
-                time.monotonic() - step_started_at)
-            step_started_at = time.monotonic()
             after_snapshot = self._log_gpu_memory_snapshot(
                 "wakeup/after",
                 wakeup_tags,
@@ -3160,7 +3113,6 @@ class PyExecutor:
                 f"materialize_vmm={timings.get('materialize_vmm_s', 0.0):.3f}s "
                 f"reset_prefix_cache={timings.get('reset_prefix_cache_s', 0.0):.3f}s "
                 f"restore_moe={timings.get('restore_moe_s', 0.0):.3f}s "
-                f"deferred_warmups={timings.get('run_deferred_warmups_s', 0.0):.3f}s "
                 f"after_snapshot={timings.get('after_snapshot_s', 0.0):.3f}s "
                 f"total={timings.get('total_rank_action_s', 0.0):.3f}s")
             return {
@@ -3169,8 +3121,6 @@ class PyExecutor:
                 "result": result,
                 "materialized_blobs": result,
                 "restored_moe_modules": restored_moe,
-                "deferred_warmup_engines": warmed_engines,
-                "captured_cuda_graphs": captured_graphs,
                 "gms_mapping_bytes": restored_gms,
                 "timings": timings,
                 "before": before_snapshot,

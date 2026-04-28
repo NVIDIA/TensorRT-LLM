@@ -12,11 +12,6 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
-from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
-    _should_defer_gms_shadow_cuda_graph_capture,
-    _should_defer_gms_shadow_startup_warmup,
-)
 from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
                                                               ResourceManagerType)
 from tensorrt_llm.llmapi.llm_args import LoadFormat
@@ -213,6 +208,27 @@ def test_gms_shadow_calibration_counts_local_extra_smaller_than_gms_weights():
     )
 
     assert available == int((180 - 88) * gib * 0.85)
+
+
+def test_gms_shadow_calibration_reserves_parked_peer_memory(monkeypatch):
+    gib = 1 << 30
+    creator = object.__new__(KvCacheCreator)
+    creator._gms_weight_bytes = Mock(return_value=74 * gib)
+    creator._moe_workspace_bytes = Mock(return_value=0)
+    monkeypatch.setenv("TRTLLM_GMS_SHADOW_PEER_MEMORY_RESERVE_GIB", "10")
+
+    available = creator._cal_gms_shadow_max_memory(
+        torch_peak_memory=1 * gib,
+        model_bytes=1 * gib,
+        total_gpu_memory=180 * gib,
+        fraction=0.85,
+        temporary_kv_bytes=0,
+        non_torch_extra_bytes=13 * gib,
+    )
+
+    # The reserve represents already-parked peers whose pre-captured graphs and
+    # runtime state remain physically resident during the next engine startup.
+    assert available == int((180 - 98) * gib * 0.85)
 
 
 def test_gms_shadow_final_calibration_uses_process_local_non_torch_memory():
@@ -454,107 +470,3 @@ def test_gms_shadow_final_calibration_discards_warmup_derived_cap():
     assert creator._kv_cache_config.max_gpu_total_bytes == 96
     assert resources[ResourceManagerType.KV_CACHE_MANAGER] == "kv"
     assert resources[ResourceManagerType.DRAFT_KV_CACHE_MANAGER] is None
-
-
-def test_gms_shadow_deferred_cuda_graph_capture_enabled_for_ro_shadow(
-        monkeypatch):
-    llm_args = Mock(load_format=LoadFormat.GMS,
-                    gms_mode="ro",
-                    cuda_graph_config=Mock(),
-                    sleep_config=Mock())
-
-    monkeypatch.delenv("TRTLLM_GMS_DEFER_SHADOW_CUDA_GRAPH_CAPTURE",
-                       raising=False)
-
-    assert _should_defer_gms_shadow_cuda_graph_capture(
-        llm_args, estimating_kv_cache=True) is True
-
-
-def test_gms_shadow_deferred_cuda_graph_capture_requires_estimation():
-    llm_args = Mock(load_format=LoadFormat.GMS,
-                    gms_mode="ro",
-                    cuda_graph_config=Mock(),
-                    sleep_config=Mock())
-
-    assert _should_defer_gms_shadow_cuda_graph_capture(
-        llm_args, estimating_kv_cache=False) is False
-
-
-def test_gms_shadow_deferred_cuda_graph_capture_can_be_disabled(monkeypatch):
-    llm_args = Mock(load_format=LoadFormat.GMS,
-                    gms_mode="ro",
-                    cuda_graph_config=Mock(),
-                    sleep_config=Mock())
-
-    monkeypatch.setenv("TRTLLM_GMS_DEFER_SHADOW_CUDA_GRAPH_CAPTURE", "0")
-
-    assert _should_defer_gms_shadow_cuda_graph_capture(
-        llm_args, estimating_kv_cache=True) is False
-
-
-def test_gms_shadow_deferred_cuda_graph_capture_does_not_apply_to_rw():
-    llm_args = Mock(load_format=LoadFormat.GMS,
-                    gms_mode="rw",
-                    cuda_graph_config=Mock(),
-                    sleep_config=Mock(),
-                    env_overrides={
-                        "ENGINE_ID": "1",
-                        "GMS_SOCKET_DIR": "/tmp/gms",
-                    })
-
-    assert _should_defer_gms_shadow_cuda_graph_capture(
-        llm_args, estimating_kv_cache=True) is False
-
-
-def test_gms_shadow_deferred_startup_warmup_enabled_for_ro_shadow(
-        monkeypatch):
-    llm_args = Mock(load_format=LoadFormat.GMS,
-                    gms_mode="ro",
-                    cuda_graph_config=Mock(),
-                    sleep_config=Mock())
-
-    monkeypatch.delenv("TRTLLM_GMS_DEFER_SHADOW_STARTUP_WARMUP",
-                       raising=False)
-
-    assert _should_defer_gms_shadow_startup_warmup(
-        llm_args, estimating_kv_cache=True) is True
-
-
-def test_gms_shadow_deferred_startup_warmup_can_be_disabled(monkeypatch):
-    llm_args = Mock(load_format=LoadFormat.GMS,
-                    gms_mode="ro",
-                    cuda_graph_config=Mock(),
-                    sleep_config=Mock())
-
-    monkeypatch.setenv("TRTLLM_GMS_DEFER_SHADOW_STARTUP_WARMUP", "0")
-
-    assert _should_defer_gms_shadow_startup_warmup(
-        llm_args, estimating_kv_cache=True) is False
-
-
-def test_deferred_warmup_skips_invalid_kv_cleanup_once():
-    class DummyEngine:
-        kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
-
-    engine = DummyEngine()
-    kv_cache_manager = Mock()
-    kv_cache_manager.check_invalid_values_in_kv_cache.return_value = False
-    resource_manager = Mock()
-    resource_manager.get_resource_manager.return_value = kv_cache_manager
-
-    @PyTorchModelEngine.warmup_with_kv_cache_cleanup
-    def deferred_warmup(self, resource_manager):
-        self._skip_warmup_kv_cache_cleanup_once = True
-
-    deferred_warmup(engine, resource_manager)
-
-    kv_cache_manager.check_invalid_values_in_kv_cache.assert_not_called()
-    assert not engine._skip_warmup_kv_cache_cleanup_once
-
-    @PyTorchModelEngine.warmup_with_kv_cache_cleanup
-    def real_warmup(self, resource_manager):
-        return "warmed"
-
-    assert real_warmup(engine, resource_manager) == "warmed"
-    kv_cache_manager.check_invalid_values_in_kv_cache.assert_called_once_with(
-        fill_with_zero=True)

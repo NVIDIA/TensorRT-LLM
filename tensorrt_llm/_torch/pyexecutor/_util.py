@@ -181,14 +181,17 @@ class KvCacheCreator:
         NOTE: `allocated_bytes` is the total KV-cache memory that must be pre-allocated during the estimation phase (for both the main and draft models) so the estimation run can complete successfully. When computing `available_kv_mem`, add this amount back in.
         """
         kv_size_per_token = self._get_kv_size_per_token()
+        peer_memory_reserve_bytes = self._gms_shadow_peer_memory_reserve_bytes()
 
-        available_kv_mem = (total_gpu_memory - peak_memory +
+        available_kv_mem = (total_gpu_memory - peak_memory -
+                            peer_memory_reserve_bytes +
                             allocated_bytes) * fraction
         logger.info(
             f"Peak memory during memory usage profiling (torch + non-torch): {peak_memory / (GB):.2f} GiB, "
             f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB, "
             f"fraction is set {fraction}, kv size per token is {kv_size_per_token}. device total memory {total_gpu_memory / (GB):.2f} GiB, "
-            f"temporary kv cache memory during profiling {allocated_bytes / (GB):.2f} GiB"
+            f"temporary kv cache memory during profiling {allocated_bytes / (GB):.2f} GiB, "
+            f"GMS peer memory reserve {peer_memory_reserve_bytes / (GB):.2f} GiB"
         )
         return int(available_kv_mem)
 
@@ -254,6 +257,38 @@ class KvCacheCreator:
                 continue
             total += int(model_loader.gms_weight_bytes())
         return total
+
+    def _gms_shadow_peer_memory_reserve_bytes(self) -> int:
+        def _env_value(key: str) -> Optional[str]:
+            value = os.environ.get(key)
+            if value is not None:
+                return value
+
+            env_overrides = getattr(getattr(self, "_llm_args", None),
+                                    "env_overrides", None)
+            if isinstance(env_overrides, dict):
+                return env_overrides.get(key)
+            return None
+
+        raw_bytes = _env_value("TRTLLM_GMS_SHADOW_PEER_MEMORY_RESERVE_BYTES")
+        if raw_bytes is not None:
+            try:
+                return max(int(raw_bytes), 0)
+            except ValueError:
+                logger.warning(
+                    "Ignoring invalid TRTLLM_GMS_SHADOW_PEER_MEMORY_RESERVE_BYTES=%r",
+                    raw_bytes)
+                return 0
+
+        raw_gib = _env_value("TRTLLM_GMS_SHADOW_PEER_MEMORY_RESERVE_GIB")
+        if raw_gib is not None:
+            try:
+                return max(int(float(raw_gib) * GB), 0)
+            except ValueError:
+                logger.warning(
+                    "Ignoring invalid TRTLLM_GMS_SHADOW_PEER_MEMORY_RESERVE_GIB=%r",
+                    raw_gib)
+        return 0
 
     def _moe_workspace_bytes(self) -> int:
         total = 0
@@ -350,6 +385,7 @@ class KvCacheCreator:
     ) -> int:
         gms_weight_bytes = self._gms_weight_bytes()
         moe_workspace_bytes = self._moe_workspace_bytes()
+        peer_memory_reserve_bytes = self._gms_shadow_peer_memory_reserve_bytes()
         # non_torch_extra_bytes is process-local.  RO GMS weight mappings are
         # not charged to the process by NVML, so count them separately.
         local_extra_bytes = max(non_torch_extra_bytes - moe_workspace_bytes, 0)
@@ -357,7 +393,8 @@ class KvCacheCreator:
                                      min_torch_activation_bytes, 0)
         local_non_kv_memory = (
             model_bytes + torch_activation_bytes + gms_weight_bytes +
-            moe_workspace_bytes + local_extra_bytes)
+            moe_workspace_bytes + local_extra_bytes +
+            peer_memory_reserve_bytes)
         available_kv_mem = max(total_gpu_memory - local_non_kv_memory, 0) * fraction
         logger.info(
             "GMS shadow KV calibration: available KV cache memory "
@@ -372,6 +409,7 @@ class KvCacheCreator:
             f"temporary_kv={temporary_kv_bytes / GB:.2f} GiB, "
             f"non_torch_extra={non_torch_extra_bytes / GB:.2f} GiB, "
             f"local_non_torch_extra={local_extra_bytes / GB:.2f} GiB, "
+            f"peer_memory_reserve={peer_memory_reserve_bytes / GB:.2f} GiB, "
             f"fraction={fraction}). Other engines' active KV is intentionally ignored."
         )
         return int(available_kv_mem)

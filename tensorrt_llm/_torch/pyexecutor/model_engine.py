@@ -638,6 +638,46 @@ class PyTorchModelEngine(ModelEngine):
         finally:
             self.cuda_graph_runner.enabled = _run_cuda_graphs
 
+    def _is_gms_runtime(self) -> bool:
+        gms_mode = str(getattr(self.llm_args, "gms_mode", "")).lower()
+        if gms_mode in {"ro", "rw"}:
+            return True
+
+        load_format = getattr(self.llm_args, "load_format", None)
+        load_format_values = {
+            str(load_format).lower(),
+            str(getattr(load_format, "name", "")).lower(),
+            str(getattr(load_format, "value", "")).lower(),
+        }
+        if "gms" in load_format_values or any(
+                value.endswith(".gms") for value in load_format_values):
+            return True
+
+        env_overrides = getattr(self.llm_args, "env_overrides", None)
+        if isinstance(env_overrides, dict) and env_overrides.get(
+                "GMS_SOCKET_DIR"):
+            return True
+        return bool(os.environ.get("GMS_SOCKET_DIR"))
+
+    def _can_capture_cuda_graph_now(self, key: Tuple[int, int, bool,
+                                                    bool]) -> bool:
+        if self.is_warmup or not self._is_gms_runtime():
+            return True
+
+        warned_keys = getattr(self, "_runtime_cuda_graph_capture_warned",
+                              set())
+        if key not in warned_keys:
+            warned_keys.add(key)
+            self._runtime_cuda_graph_capture_warned = warned_keys
+            logger.warning(
+                "Skipping runtime CUDA graph capture for missing key=%s in "
+                "GMS mode; falling back to eager execution. GMS shadow "
+                "failover requires CUDA graphs to be captured during startup "
+                "warmup, not during promotion or serving.",
+                key,
+            )
+        return False
+
     @staticmethod
     def warmup_with_kv_cache_cleanup(method):
         """
@@ -657,10 +697,6 @@ class PyTorchModelEngine(ModelEngine):
         @functools.wraps(method)
         def wrapper(self, resource_manager: ResourceManager, *args, **kwargs):
             result = method(self, resource_manager, *args, **kwargs)
-            if getattr(self, "_skip_warmup_kv_cache_cleanup_once", False):
-                self._skip_warmup_kv_cache_cleanup_once = False
-                return result
-
             kv_cache_manager = resource_manager.get_resource_manager(
                 self.kv_cache_manager_key)
             if kv_cache_manager is not None:
@@ -688,15 +724,6 @@ class PyTorchModelEngine(ModelEngine):
             logger.info("Skipping warm up as no KV Cache manager allocated.")
             return
 
-        if self._should_defer_warmup_once():
-            logger.info(
-                f"Deferring model engine warmup until wakeup: "
-                f"{getattr(self, '_defer_warmup_reason', '')}")
-            self._defer_warmup_once = False
-            self._deferred_warmup_pending = True
-            self._skip_warmup_kv_cache_cleanup_once = True
-            return
-
         # The lifetime of model engine and kv cache manager can be different.
         # Reset the global cuda graph dummy requests in warmup.
         self.cuda_graph_runner.padding_dummy_requests = {}
@@ -714,67 +741,12 @@ class PyTorchModelEngine(ModelEngine):
         # is decode-only and runs into issues with autotuner warmup.
         if not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
-        if self._should_defer_cuda_graph_warmup_once():
-            logger.info(
-                f"Deferring CUDA graph warmup for this engine until wakeup: "
-                f"{getattr(self, '_defer_cuda_graph_warmup_reason', '')}")
-            self._defer_cuda_graph_warmup_once = False
-            self._deferred_cuda_graph_warmup_pending = True
-        else:
-            self._run_cuda_graph_warmup(resource_manager)
+        self._run_cuda_graph_warmup(resource_manager)
         if not self.is_draft_model and not self.mapping.has_cp_helix(
         ) and self.guided_decoder is None and not isinstance(
                 kv_cache_manager, MambaHybridCacheManager):
             # Run extra general warmup to warmup memory pool before running real requests to reduce memory fragmentation.
             self._general_warmup(resource_manager, reverse=True)
-
-    def defer_warmup_once(self, reason: str = "") -> None:
-        self._defer_warmup_once = True
-        self._defer_warmup_reason = reason
-
-    def has_deferred_warmup(self) -> bool:
-        return bool(getattr(self, "_deferred_warmup_pending", False))
-
-    def _should_defer_warmup_once(self) -> bool:
-        return bool(getattr(self, "_defer_warmup_once", False))
-
-    def run_deferred_warmup(self, resource_manager: ResourceManager) -> int:
-        if not self.has_deferred_warmup():
-            return 0
-
-        before = len(self.cuda_graph_runner.graphs)
-        logger.info("Running deferred model engine warmup after wakeup.")
-        try:
-            self.warmup(resource_manager)
-        except Exception:
-            self._deferred_warmup_pending = True
-            raise
-        self._deferred_warmup_pending = False
-        return len(self.cuda_graph_runner.graphs) - before
-
-    def defer_cuda_graph_warmup_once(self, reason: str = "") -> None:
-        self._defer_cuda_graph_warmup_once = True
-        self._defer_cuda_graph_warmup_reason = reason
-
-    def has_deferred_cuda_graph_warmup(self) -> bool:
-        return bool(getattr(self, "_deferred_cuda_graph_warmup_pending", False))
-
-    def _should_defer_cuda_graph_warmup_once(self) -> bool:
-        return bool(getattr(self, "_defer_cuda_graph_warmup_once", False)
-                    and self.cuda_graph_runner.enabled)
-
-    @warmup_with_kv_cache_cleanup
-    def capture_deferred_cuda_graphs(self,
-                                     resource_manager: ResourceManager) -> int:
-        if not self.has_deferred_cuda_graph_warmup():
-            return 0
-
-        before = len(self.cuda_graph_runner.graphs)
-        logger.info("Capturing deferred CUDA graphs after wakeup.")
-        with self.set_warmup_flag():
-            self._run_cuda_graph_warmup(resource_manager)
-        self._deferred_cuda_graph_warmup_pending = False
-        return len(self.cuda_graph_runner.graphs) - before
 
     def _general_warmup(self,
                         resource_manager: ResourceManager,
@@ -3805,6 +3777,11 @@ class PyTorchModelEngine(ModelEngine):
             )
 
             can_run_graph = key is not None
+            if (can_run_graph and self.cuda_graph_runner.needs_capture(key)
+                    and not self._can_capture_cuda_graph_now(key)):
+                can_run_graph = False
+                key = None
+
             if can_run_graph:
                 attn_metadata = maybe_attn_metadata
                 spec_metadata = maybe_spec_metadata

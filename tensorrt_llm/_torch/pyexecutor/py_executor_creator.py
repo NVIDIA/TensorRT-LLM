@@ -32,8 +32,7 @@ from ..attention_backend.trtllm import TrtllmAttention
 from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
-from ..virtual_memory import (release_with_tag, run_with_oom_retry,
-                              scope as virtual_memory_scope)
+from ..virtual_memory import run_with_oom_retry, scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
                     validate_feature_combination)
@@ -69,145 +68,6 @@ def _flush_cuda_allocator_after_kv_estimation() -> None:
             "Released %.2f GiB from the CUDA caching allocator after KV cache estimation teardown",
             reclaimed / (1024**3),
         )
-
-
-def _llm_env(llm_args: TorchLlmArgs,
-             key: str,
-             default: Optional[str] = None) -> Optional[str]:
-    value = os.environ.get(key)
-    if value is not None:
-        return value
-
-    env_overrides = getattr(llm_args, "env_overrides", None)
-    if isinstance(env_overrides, dict):
-        return env_overrides.get(key, default)
-    return default
-
-
-def _false_env(value: Optional[str]) -> bool:
-    return str(value).lower() in {"0", "false", "no", "off"}
-
-
-def _is_gms_load_format(llm_args: TorchLlmArgs) -> bool:
-    load_format = getattr(llm_args, "load_format", None)
-    load_format_name = getattr(load_format, "name", str(load_format)).upper()
-    load_format_value = getattr(load_format, "value", str(load_format))
-    load_format_text = str(load_format)
-    return (load_format == LoadFormat.GMS
-            or load_format_name == LoadFormat.GMS.name
-            or str(load_format_value).lower() == LoadFormat.GMS.name.lower()
-            or load_format_text.lower() == LoadFormat.GMS.name.lower()
-            or load_format_text.lower().endswith(
-                f".{LoadFormat.GMS.name.lower()}")
-            or str(load_format_value) == str(LoadFormat.GMS.value))
-
-
-def _should_defer_gms_shadow_cuda_graph_capture(
-        llm_args: TorchLlmArgs, *, estimating_kv_cache: bool) -> bool:
-    if not estimating_kv_cache:
-        return False
-    if getattr(llm_args, "cuda_graph_config", None) is None:
-        return False
-    if getattr(llm_args, "sleep_config", None) is None:
-        return False
-    if _false_env(
-            _llm_env(llm_args, "TRTLLM_GMS_DEFER_SHADOW_CUDA_GRAPH_CAPTURE",
-                     "1")):
-        return False
-
-    gms_mode = str(getattr(llm_args, "gms_mode", "")).lower()
-    if gms_mode == "rw":
-        return False
-    if gms_mode == "ro":
-        return True
-
-    engine_id = _llm_env(llm_args, "ENGINE_ID", "0")
-    if _llm_env(llm_args, "GMS_SOCKET_DIR") and engine_id != "0":
-        return True
-
-    return _is_gms_load_format(llm_args) and engine_id != "0"
-
-
-def _should_defer_gms_shadow_startup_warmup(
-        llm_args: TorchLlmArgs, *, estimating_kv_cache: bool) -> bool:
-    if _false_env(
-            _llm_env(llm_args, "TRTLLM_GMS_DEFER_SHADOW_STARTUP_WARMUP",
-                     "1")):
-        return False
-    return _should_defer_gms_shadow_cuda_graph_capture(
-        llm_args, estimating_kv_cache=estimating_kv_cache)
-
-
-def _release_virtual_memory_pool_caches(vm_pools: dict,
-                                        tags: tuple[str, ...]) -> int:
-    released_pools = 0
-    for tag in tags:
-        pool_proxy = vm_pools.pop(tag, None)
-        if pool_proxy is None:
-            continue
-
-        release_cached_blocks = getattr(pool_proxy, "release_cached_blocks",
-                                        None)
-        if callable(release_cached_blocks):
-            released_pools += release_cached_blocks()
-            continue
-
-        pools = getattr(pool_proxy, "_pools", None)
-        if pools is None:
-            continue
-        released_pools += len(pools)
-        pools.clear()
-    return released_pools
-
-
-def _prepare_gms_shadow_parked_startup(
-        model_engine: PyTorchModelEngine,
-        draft_model_engine: Optional[PyTorchModelEngine],
-        llm_args: TorchLlmArgs,
-        vm_pools: dict,
-        *,
-        estimating_kv_cache: bool,
-) -> bool:
-    if not _should_defer_gms_shadow_startup_warmup(
-            llm_args, estimating_kv_cache=estimating_kv_cache):
-        return False
-
-    reason = (
-        "GMS shadow final startup defers full warmup until wakeup and "
-        "parks full KV physical memory so active replicas keep maximum KV "
-        "capacity without startup-time peer memory pressure")
-    for engine in (model_engine, draft_model_engine):
-        if engine is not None:
-            engine.defer_warmup_once(reason)
-
-    released_blobs = release_with_tag(ExecutorMemoryType.KV_CACHE.value)
-    released_pools = _release_virtual_memory_pool_caches(
-        vm_pools, (ExecutorMemoryType.KV_CACHE.value, ))
-    _flush_cuda_allocator_after_kv_estimation()
-    logger.info(
-        f"{reason}: released_kv_blobs={released_blobs} "
-        f"released_kv_pools={released_pools}")
-    return True
-
-
-def _defer_gms_shadow_cuda_graph_capture(
-        model_engine: PyTorchModelEngine,
-        draft_model_engine: Optional[PyTorchModelEngine],
-        llm_args: TorchLlmArgs,
-        *,
-        estimating_kv_cache: bool,
-) -> None:
-    if not _should_defer_gms_shadow_cuda_graph_capture(
-            llm_args, estimating_kv_cache=estimating_kv_cache):
-        return
-
-    reason = (
-        "GMS shadow final startup defers full-KV CUDA graph capture until "
-        "wakeup so parked peers do not consume graph-capture headroom")
-    for engine in (model_engine, draft_model_engine):
-        if engine is not None:
-            engine.defer_cuda_graph_warmup_once(reason)
-    logger.info(reason)
 
 
 class _ExecutorMemoryMonitor:
@@ -1052,20 +912,6 @@ def create_py_executor(
                         eng._release_cuda_graphs()
                     eng.attn_metadata = None
 
-            prepared_parked_shadow = _prepare_gms_shadow_parked_startup(
-                model_engine,
-                draft_model_engine,
-                llm_args,
-                vm_pools,
-                estimating_kv_cache=estimating_kv_cache,
-            )
-            if not prepared_parked_shadow:
-                _defer_gms_shadow_cuda_graph_capture(
-                    model_engine,
-                    draft_model_engine,
-                    llm_args,
-                    estimating_kv_cache=estimating_kv_cache,
-                )
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
 
             # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture

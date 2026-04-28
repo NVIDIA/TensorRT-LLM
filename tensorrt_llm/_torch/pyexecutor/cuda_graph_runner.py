@@ -1,10 +1,13 @@
 import bisect
 import contextlib
+import os
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple, TypeAlias
 
 import torch
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.llmapi.llm_args import (BaseSparseAttentionConfig,
                                           DecodingBaseConfig)
 from tensorrt_llm.mapping import Mapping
@@ -27,6 +30,17 @@ from .scheduler import ScheduledRequests
 # A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
 KeyType: TypeAlias = Tuple[int, int, bool, bool]
+GB = 1024**3
+
+
+def _truthy_env(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).lower() in {"1", "true", "yes", "on"}
+
+
+def _fmt_gib(value: Optional[int]) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value / GB:.2f} GiB"
 
 
 @dataclass
@@ -297,6 +311,84 @@ class CUDAGraphRunner:
         """
         return self.memory_pool
 
+    def _cuda_graph_memory_snapshot(self) -> Optional[dict]:
+        if not _truthy_env("TRTLLM_CUDA_GRAPH_MEMORY_SNAPSHOTS"):
+            return None
+
+        if _truthy_env("TRTLLM_CUDA_GRAPH_MEMORY_SYNC", "1"):
+            try:
+                torch.cuda.synchronize()
+            except Exception as error:
+                logger.debug(
+                    "Unable to synchronize before CUDA graph memory snapshot: %s",
+                    error)
+
+        try:
+            free, total = torch.cuda.mem_get_info()
+            stats = torch.cuda.memory_stats()
+            return {
+                "allocated":
+                int(torch.cuda.memory_allocated()),
+                "reserved":
+                int(torch.cuda.memory_reserved()),
+                "active":
+                int(stats.get("active_bytes.all.current", 0)),
+                "inactive_split":
+                int(stats.get("inactive_split_bytes.all.current", 0)),
+                "private_pool_allocated":
+                int(stats.get("allocated_bytes.private_pool.current", 0)),
+                "private_pool_reserved":
+                int(stats.get("reserved_bytes.private_pool.current", 0)),
+                "segment_current":
+                int(stats.get("segment.all.current", 0)),
+                "driver_free":
+                int(free),
+                "driver_total":
+                int(total),
+            }
+        except Exception as error:
+            logger.debug("Unable to query CUDA graph memory snapshot: %s",
+                         error)
+            return None
+
+    def _log_cuda_graph_memory_snapshot(self,
+                                        label: str,
+                                        key: KeyType,
+                                        elapsed_s: Optional[float] = None,
+                                        previous: Optional[dict] = None
+                                        ) -> Optional[dict]:
+        snapshot = self._cuda_graph_memory_snapshot()
+        if snapshot is None:
+            return None
+
+        def delta(field: str) -> Optional[int]:
+            if previous is None:
+                return None
+            return snapshot.get(field, 0) - previous.get(field, 0)
+
+        logger.info(
+            "CUDA graph memory snapshot: "
+            f"label={label} key={key} graphs={len(self.graphs)} "
+            f"pool_set={self.memory_pool is not None} "
+            f"elapsed={elapsed_s if elapsed_s is not None else 0.0:.3f}s "
+            f"allocated={_fmt_gib(snapshot['allocated'])} "
+            f"reserved={_fmt_gib(snapshot['reserved'])} "
+            f"active={_fmt_gib(snapshot['active'])} "
+            f"inactive_split={_fmt_gib(snapshot['inactive_split'])} "
+            f"private_pool_allocated={_fmt_gib(snapshot['private_pool_allocated'])} "
+            f"private_pool_reserved={_fmt_gib(snapshot['private_pool_reserved'])} "
+            f"segments={snapshot['segment_current']} "
+            f"driver_free={_fmt_gib(snapshot['driver_free'])} "
+            f"driver_total={_fmt_gib(snapshot['driver_total'])} "
+            f"delta_allocated={_fmt_gib(delta('allocated'))} "
+            f"delta_reserved={_fmt_gib(delta('reserved'))} "
+            f"delta_active={_fmt_gib(delta('active'))} "
+            f"delta_inactive_split={_fmt_gib(delta('inactive_split'))} "
+            f"delta_private_pool_allocated={_fmt_gib(delta('private_pool_allocated'))} "
+            f"delta_private_pool_reserved={_fmt_gib(delta('private_pool_reserved'))} "
+            f"delta_driver_free={_fmt_gib(delta('driver_free'))}")
+        return snapshot
+
     def capture(self,
                 key: KeyType,
                 forward_fn: Callable,
@@ -348,23 +440,49 @@ class CUDAGraphRunner:
         # internal states according to the docs:
         # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
         # This also lets us initialize states in the attn_metadata.
+        capture_started_at = time.monotonic()
+        last_snapshot = self._log_cuda_graph_memory_snapshot(
+            "capture/before", key)
         graph = torch.cuda.CUDAGraph()
         with with_multi_stream(True), piecewise_cuda_graph(False):
+            step_started_at = time.monotonic()
             for _ in range(self.WARMUP_STEPS):
                 _setup_spec_decoding_and_forward(key, forward_fn,
                                                  capture_inputs)
                 if postprocess_fn is not None:
                     postprocess_fn(capture_inputs)
+            last_snapshot = self._log_cuda_graph_memory_snapshot(
+                "capture/after_eager_warmup",
+                key,
+                elapsed_s=time.monotonic() - step_started_at,
+                previous=last_snapshot)
 
+            step_started_at = time.monotonic()
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = _setup_spec_decoding_and_forward(
                     key, forward_fn, capture_inputs)
+            last_snapshot = self._log_cuda_graph_memory_snapshot(
+                "capture/after_cuda_graph",
+                key,
+                elapsed_s=time.monotonic() - step_started_at,
+                previous=last_snapshot)
             if postprocess_fn is not None:
+                step_started_at = time.monotonic()
                 postprocess_fn(capture_inputs)
+                last_snapshot = self._log_cuda_graph_memory_snapshot(
+                    "capture/after_postprocess",
+                    key,
+                    elapsed_s=time.monotonic() - step_started_at,
+                    previous=last_snapshot)
 
         self.graphs[key] = graph
         self.graph_outputs[key] = make_weak_ref(output)
         self.memory_pool = graph.pool()
+        self._log_cuda_graph_memory_snapshot(
+            "capture/after_store",
+            key,
+            elapsed_s=time.monotonic() - capture_started_at,
+            previous=last_snapshot)
 
     def replay(self, key: KeyType,
                current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
