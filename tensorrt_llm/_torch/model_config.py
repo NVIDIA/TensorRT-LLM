@@ -444,6 +444,31 @@ class ModelConfig(Generic[TConfig]):
                     "Supported: 8.")
 
             quant_config.exclude_modules = hf_quant_config.get("ignore", [])
+        # NOTE: This is for modelopt quantized checkpoints where
+        # hf_quant_config.json is missing but quantization_config is
+        # present in config.json (modelopt >= 0.43.0 format).
+        elif hf_quant_config.get("quant_method") == "modelopt":
+            quant_algo = hf_quant_config.get("quant_algo", None)
+            if quant_algo is not None:
+                if quant_algo == "fp8_pb_wo":
+                    quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                else:
+                    quant_algo = QuantAlgo(quant_algo)
+                quant_config.quant_algo = quant_algo
+
+            kv_cache_quant_algo = hf_quant_config.get("kv_cache_quant_algo",
+                                                      None)
+            if kv_cache_quant_algo is not None:
+                quant_config.kv_cache_quant_algo = QuantAlgo(
+                    kv_cache_quant_algo)
+
+            group_size = hf_quant_config.get("group_size", None)
+            if group_size is not None:
+                quant_config.group_size = group_size
+
+            exclude_modules = hf_quant_config.get("exclude_modules", None)
+            if exclude_modules is not None:
+                quant_config.exclude_modules = exclude_modules
         return quant_config, layer_quant_config
 
     @staticmethod
