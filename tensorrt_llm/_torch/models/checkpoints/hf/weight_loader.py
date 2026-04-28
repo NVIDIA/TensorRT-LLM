@@ -51,8 +51,12 @@ class HfWeightLoader(BaseWeightLoader):
                     f"Prefetching {prefetch_size / (1024**3):.2f}GB checkpoint files."
                 )
                 self.prefetch_files(weight_files)
-                # Ensure that all local ranks have finished prefetching before loading weights
-                local_mpi_barrier()
+            # Sync all local ranks unconditionally. `enable_prefetch` depends on
+            # `psutil.virtual_memory().available`, a per-rank volatile value, so
+            # different ranks may take different branches; gating the barrier on
+            # it would deadlock between ranks that prefetched and ranks that
+            # skipped. Ranks that didn't prefetch reach the barrier immediately.
+            local_mpi_barrier()
 
             return self._load_weights_in_parallel(
                 weight_files, self._load_safetensors_file,
