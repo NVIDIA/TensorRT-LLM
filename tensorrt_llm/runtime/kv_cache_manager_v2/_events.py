@@ -30,6 +30,7 @@ hooks as the event source:
   the model communicator.
 """
 
+import logging
 from collections import deque
 from dataclasses import dataclass, field
 from threading import Condition
@@ -45,6 +46,7 @@ _HASH64_CONST_1 = 0xBF58476D1CE4E5B9
 _HASH64_CONST_2 = 0x94D049BB133111EB
 _HASH_COMBINE_CONST = 0x9E3779B9
 _PARENT_HASH_CONST = 0xBF58476D1CE4E5B9
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True, frozen=True)
@@ -114,7 +116,7 @@ class KVCacheEventManager:
         attention_dp_gather_rank: int | None = None,
         attention_dp_size: int | None = None,
         attention_dp_gather_fn: AttentionDpGatherFn | None = None,
-        default_window_size: int = 0,
+        default_window_size: int | None = None,
     ) -> None:
         if max_kv_event_entries <= 0:
             raise ValueError("max_kv_event_entries must be positive")
@@ -145,6 +147,8 @@ class KVCacheEventManager:
         self._condition = Condition()
 
     def set_default_window_size(self, window_size: int) -> None:
+        if window_size <= 0:
+            raise ValueError("default_window_size must be positive")
         self._default_window_size = window_size
 
     def set_life_cycle_window_sizes(self, life_cycle_window_sizes: dict[int, int | None]) -> None:
@@ -306,7 +310,24 @@ class KVCacheEventManager:
             local_events = list(self._events)
             self._events.clear()
 
-        gathered_events = self._attention_dp_gather_fn(local_events)
+        # Do not hold the condition across the collective. A tight polling
+        # consumer can observe an empty list while the gather is in flight, but
+        # the next poll sees the gathered batch once rank 0 publishes it.
+        try:
+            gathered_events = self._attention_dp_gather_fn(local_events)
+        except Exception as exc:
+            with self._condition:
+                if self._attention_dp_gather_rank == 0 and local_events:
+                    self._publish_events_locked(local_events)
+                self._condition.notify_all()
+            _LOGGER.warning(
+                "KV cache event attention-DP gather failed on rank %s; %s %d local events: %s",
+                self._attention_dp_rank,
+                "kept" if self._attention_dp_gather_rank == 0 else "dropped",
+                len(local_events),
+                exc,
+            )
+            return
 
         with self._condition:
             if self._attention_dp_gather_rank == 0:
@@ -427,7 +448,10 @@ class KVCacheEventManager:
         if self._has_text_tokens(block) and parent_is_v1_compatible:
             parent_hash = self._block_hash(parent) if parent_is_block else 0
             block_hash = self._hash_block_key(
-                getattr(block, "tokens"), parent_hash, self._lora_task_id(block)
+                getattr(block, "tokens"),
+                parent_hash,
+                self._lora_task_id(block),
+                self._cache_salt_id(block),
             )
             self._v1_hash_compatible_keys.add(key)
         else:
@@ -455,8 +479,18 @@ class KVCacheEventManager:
         root = getattr(current, "prev")
         return getattr(root, "lora_task_id", None)
 
+    def _cache_salt_id(self, block: object) -> int | None:
+        current = block
+        while self._is_block(getattr(current, "prev")):
+            current = getattr(current, "prev")
+        root = getattr(current, "prev")
+        return getattr(root, "cache_salt_id", None)
+
     def _resolve_window_size(self, window_size: int | None) -> int:
-        return self._default_window_size if window_size is None else window_size
+        resolved_window_size = self._default_window_size if window_size is None else window_size
+        if resolved_window_size is None or resolved_window_size <= 0:
+            raise ValueError("default_window_size must be set before emitting KV cache events")
+        return resolved_window_size
 
     def _is_known_in_window(self, key: bytes, window_size: int) -> bool:
         return window_size in self._known_block_windows.get(key, set())
@@ -483,10 +517,14 @@ class KVCacheEventManager:
         tokens: Sequence[TokenIdExt],
         parent_hash: int,
         lora_task_id: int | None,
+        cache_salt_id: int | None,
     ) -> int:
         seed = (len(tokens) ^ ((parent_hash * _PARENT_HASH_CONST) & _UINT64_MASK)) & _UINT64_MASK
+        if parent_hash == 0 and cache_salt_id is not None:
+            seed = KVCacheEventManager._hash64_mix(cache_salt_id, seed)
         for token in tokens:
-            assert type(token) is int, "v1-compatible hashing only supports text tokens"
+            if type(token) is not int:
+                raise ValueError("v1-compatible hashing only supports text tokens")
             seed = KVCacheEventManager._hash32_mix(int(token) & _UINT32_MASK, seed)
         if lora_task_id is not None:
             seed = KVCacheEventManager._hash64_mix(lora_task_id, seed)

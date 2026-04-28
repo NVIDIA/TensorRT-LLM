@@ -33,6 +33,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
 class _Root:
     key: bytes
     lora_task_id: int | None = None
+    cache_salt_id: int | None = None
 
 
 @dataclass
@@ -62,9 +63,29 @@ def _block(
     )
 
 
+def _event_manager(
+    max_kv_event_entries: int = 1024,
+    *,
+    default_window_size: int = 16,
+    **kwargs,
+) -> KVCacheEventManager:
+    return KVCacheEventManager(
+        max_kv_event_entries,
+        default_window_size=default_window_size,
+        **kwargs,
+    )
+
+
 def test_v2_event_manager_requires_positive_buffer_size():
     with pytest.raises(ValueError, match="max_kv_event_entries"):
         KVCacheEventManager(0)
+
+
+def test_v2_default_window_size_must_be_set_for_unspecified_window():
+    event_manager = KVCacheEventManager(1024)
+
+    with pytest.raises(ValueError, match="default_window_size"):
+        event_manager.enqueue_created_event([1])
 
 
 def test_v2_default_window_size_resolves_unspecified_window():
@@ -79,7 +100,7 @@ def test_v2_default_window_size_resolves_unspecified_window():
 
 
 def test_v2_get_latest_events_blocks_until_event_arrives():
-    event_manager = KVCacheEventManager(1024)
+    event_manager = _event_manager()
     received = []
 
     def reader():
@@ -142,7 +163,7 @@ def test_v2_events_serialize_with_v1_type_names():
 
 
 def test_v2_text_block_hash_matches_v1_algorithm():
-    event_manager = KVCacheEventManager(1024)
+    event_manager = _event_manager()
     root = _Root(b"root")
     block0 = _block(1, [1, 2, 3, 4], root)
     block1 = _block(2, [5, 6], block0)
@@ -156,8 +177,23 @@ def test_v2_text_block_hash_matches_v1_algorithm():
     assert stored.blocks[1].block_hash == 12460730416951841444
 
 
+def test_v2_text_block_hash_mixes_cache_salt_on_first_block():
+    event_manager = _event_manager()
+    root = _Root(b"root", cache_salt_id=123)
+    block0 = _block(1, [1, 2, 3, 4], root)
+    block1 = _block(2, [5, 6], block0)
+
+    event_manager.on_blocks_stored([block0, block1])
+    event_manager.flush()
+
+    stored = event_manager.get_latest_events()[0].data
+
+    assert stored.blocks[0].block_hash == 6269282712567672529
+    assert stored.blocks[1].block_hash == 9075042320698884212
+
+
 def test_v2_bytes_token_uses_token_extra_id():
-    event_manager = KVCacheEventManager(1024)
+    event_manager = _event_manager()
     root = _Root(b"root")
     digest = b"\x01\x02\x03\x04\x05\x06\x07\x08\x09"
     block = _block(1, [digest], root, cache_levels=[0])
@@ -171,8 +207,13 @@ def test_v2_bytes_token_uses_token_extra_id():
     assert token.token_extra_id == int.from_bytes(digest[:8], "little")
 
 
+def test_v2_hash_block_key_rejects_non_text_tokens():
+    with pytest.raises(ValueError, match="text tokens"):
+        KVCacheEventManager._hash_block_key([b"digest"], 0, None, None)
+
+
 def test_v2_removed_events_are_coalesced():
-    event_manager = KVCacheEventManager(1024)
+    event_manager = _event_manager()
     root = _Root(b"root")
     block0 = _block(1, [1, 2, 3, 4], root)
     block1 = _block(2, [5, 6, 7, 8], block0)
@@ -195,7 +236,7 @@ def test_v2_removed_events_are_coalesced():
 
 
 def test_v2_stored_event_flushes_pending_removed_event_first():
-    event_manager = KVCacheEventManager(1024)
+    event_manager = _event_manager()
     root = _Root(b"root")
     old_block = _block(1, [1, 2, 3, 4], root)
     new_block = _block(3, [9, 10, 11, 12], root)
@@ -216,7 +257,7 @@ def test_v2_stored_event_flushes_pending_removed_event_first():
 
 
 def test_v2_stored_event_only_flushes_same_window_removed_event():
-    event_manager = KVCacheEventManager(1024)
+    event_manager = _event_manager()
     root = _Root(b"root")
     old_block = _block(1, [1, 2, 3, 4], root)
     new_block = _block(3, [9, 10, 11, 12], root)
@@ -278,8 +319,27 @@ def test_v2_removed_events_can_target_lifecycle_window():
     assert events[0].window_size == 8
 
 
+def test_v2_tree_scoped_removed_events_cover_all_known_windows():
+    event_manager = _event_manager()
+    event_manager.set_life_cycle_window_sizes({0: None, 1: 8})
+    root = _Root(b"root")
+    block = _block(1, [1, 2, 3, 4], root)
+
+    event_manager.on_blocks_stored([block])
+    event_manager.flush()
+    event_manager.get_latest_events()
+
+    event_manager.on_block_removed(block)
+    event_manager.flush()
+
+    events = event_manager.get_latest_events()
+    assert len(events) == 2
+    assert sorted(event.window_size for event in events) == [8, 16]
+    assert all(type(event.data).__name__ == "KVCacheRemovedData" for event in events)
+
+
 def test_v2_event_buffer_drops_oldest_events():
-    event_manager = KVCacheEventManager(2)
+    event_manager = _event_manager(2)
 
     event_manager.enqueue_created_event([1])
     event_manager.enqueue_created_event([2])
@@ -291,7 +351,7 @@ def test_v2_event_buffer_drops_oldest_events():
 
 
 def test_v2_event_ids_are_monotonic():
-    event_manager = KVCacheEventManager(1024)
+    event_manager = _event_manager()
     root = _Root(b"root")
     old_block = _block(1, [1, 2, 3, 4], root)
     new_block = _block(2, [5, 6, 7, 8], root)
@@ -308,7 +368,7 @@ def test_v2_event_ids_are_monotonic():
 
 
 def test_v2_cache_level_updates_are_logical_block_events():
-    event_manager = KVCacheEventManager(1024)
+    event_manager = _event_manager()
     root = _Root(b"root")
     block = _block(1, [1, 2, 3, 4], root, cache_levels=[0, 0])
 
@@ -412,6 +472,47 @@ def test_v2_attention_dp_flush_gathers_events_to_rank_zero():
 def test_v2_attention_dp_flush_clears_nonzero_rank_events():
     def gather(local_events):
         return [[], local_events]
+
+    event_manager = KVCacheEventManager(
+        1024,
+        attention_dp_rank=1,
+        attention_dp_gather_rank=1,
+        attention_dp_size=2,
+        attention_dp_gather_fn=gather,
+        default_window_size=16,
+    )
+
+    event_manager.enqueue_created_event([1])
+    event_manager.flush_iteration_events()
+
+    assert event_manager.get_latest_events() == []
+
+
+def test_v2_attention_dp_gather_failure_keeps_rank_zero_local_events():
+    def gather(local_events):
+        raise RuntimeError("simulated gather failure")
+
+    event_manager = KVCacheEventManager(
+        1024,
+        attention_dp_rank=0,
+        attention_dp_gather_rank=0,
+        attention_dp_size=2,
+        attention_dp_gather_fn=gather,
+        default_window_size=16,
+    )
+
+    event_manager.enqueue_created_event([1])
+    event_manager.flush_iteration_events()
+
+    events = event_manager.get_latest_events()
+    assert len(events) == 1
+    assert events[0].attention_dp_rank == 0
+    assert events[0].data.num_blocks_per_cache_level == [1]
+
+
+def test_v2_attention_dp_gather_failure_drops_nonzero_rank_local_events():
+    def gather(local_events):
+        raise RuntimeError("simulated gather failure")
 
     event_manager = KVCacheEventManager(
         1024,

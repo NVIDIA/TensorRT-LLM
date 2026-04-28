@@ -172,7 +172,7 @@ class KVCacheEventManager:
         attention_dp_gather_rank: int | None = None,
         attention_dp_size: int | None = None,
         attention_dp_gather_fn: AttentionDpGatherFn | None = None,
-        default_window_size: int = 0,
+        default_window_size: int | None = None,
     ) -> None: ...
     def set_default_window_size(self, window_size: int) -> None: ...
     def set_life_cycle_window_sizes(
@@ -338,6 +338,8 @@ class KVCacheManager:
         input_tokens: Sequence[TokenIdExt] | None = None,
         id: Any = None,
         custom_priority_callback: Callable[[int, Any], Priority] = ...,
+        *,
+        cache_salt_id: int | None = None,
     ) -> _KVCache: ...
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool: ...
     def get_quota(self, cache_level: CacheLevel) -> int: ...
