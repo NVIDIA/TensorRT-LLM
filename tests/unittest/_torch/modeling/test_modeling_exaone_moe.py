@@ -10,6 +10,7 @@ import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.hf.exaone_moe_weight_mapper import ExaoneMoeWeightMapper
 from tensorrt_llm._torch.models.modeling_exaone_moe import ExaoneMoeForCausalLM
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -239,7 +240,9 @@ class TestExaoneMoe(unittest.TestCase):
             pretrained_config=exaone_moe_config, attn_backend=attention_backend
         )
         exaone_moe = ExaoneMoeForCausalLM(model_config).to(dtype).to(device)
-        exaone_moe.load_weights(hf_exaone_moe.state_dict())
+        weight_mapper = ExaoneMoeWeightMapper()
+        weight_mapper.init_model_and_config(exaone_moe, model_config)
+        exaone_moe.load_weights(hf_exaone_moe.state_dict(), weight_mapper)
         exaone_moe.post_load_weights()
 
         num_blocks = 1
