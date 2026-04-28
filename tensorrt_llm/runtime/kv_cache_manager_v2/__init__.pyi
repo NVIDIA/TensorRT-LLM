@@ -115,6 +115,88 @@ class KVCacheManagerConfig:
     max_util_for_resume: float = ...
     helix_config: HelixConfig | None = None
 
+# From _events.py
+@dataclass(slots=True, frozen=True)
+class KVCacheEventDiffInt:
+    old_value: int
+    new_value: int
+
+@dataclass(slots=True, frozen=True)
+class KVCacheUniqueToken:
+    token_id: int
+    token_extra_id: int
+
+@dataclass(slots=True, frozen=True)
+class KVCacheCreatedData:
+    num_blocks_per_cache_level: list[int]
+
+@dataclass(slots=True, frozen=True)
+class KVCacheStoredBlockData:
+    block_hash: int
+    tokens: list[KVCacheUniqueToken]
+    lora_id: int | None
+    cache_level: int
+    priority: int
+    mm_keys: list[tuple[bytes, int, str | None]] = ...
+
+@dataclass(slots=True, frozen=True)
+class KVCacheStoredData:
+    parent_hash: int | None
+    blocks: list[KVCacheStoredBlockData]
+
+@dataclass(slots=True, frozen=True)
+class KVCacheRemovedData:
+    block_hashes: list[int]
+
+@dataclass(slots=True, frozen=True)
+class KVCacheUpdatedData:
+    block_hash: int
+    cache_level: KVCacheEventDiffInt | None = None
+    priority: KVCacheEventDiffInt | None = None
+
+@dataclass(slots=True, frozen=True)
+class KVCacheEvent:
+    event_id: int
+    data: KVCacheCreatedData | KVCacheStoredData | KVCacheRemovedData | KVCacheUpdatedData
+    window_size: int
+    attention_dp_rank: int | None = None
+
+AttentionDpGatherFn: TypeAlias = Callable[[list[KVCacheEvent]], Sequence[Sequence[KVCacheEvent]]]
+
+class KVCacheEventManager:
+    def __init__(
+        self,
+        max_kv_event_entries: int,
+        *,
+        attention_dp_rank: int | None = None,
+        attention_dp_gather_rank: int | None = None,
+        attention_dp_size: int | None = None,
+        attention_dp_gather_fn: AttentionDpGatherFn | None = None,
+        default_window_size: int = 0,
+    ) -> None: ...
+    def set_default_window_size(self, window_size: int) -> None: ...
+    def set_life_cycle_window_sizes(
+        self, life_cycle_window_sizes: dict[int, int | None]
+    ) -> None: ...
+    def enqueue_created_event(
+        self, num_blocks_per_cache_level: list[int], window_size: int | None = None
+    ) -> None: ...
+    def on_blocks_stored(
+        self, blocks: Sequence[object], window_size: int | None = None
+    ) -> None: ...
+    def on_block_removed(self, block: object, window_size: int | None = None) -> None: ...
+    def on_block_updated(
+        self,
+        block: object | None,
+        life_cycle: LifeCycleId,
+        old_level: CacheLevel,
+        new_level: CacheLevel,
+        window_size: int | None = None,
+    ) -> None: ...
+    def flush_iteration_events(self) -> None: ...
+    def flush(self) -> None: ...
+    def get_latest_events(self, timeout_ms: float | None = 0) -> list[KVCacheEvent]: ...
+
 # From _block_radix_tree.py
 def gen_multi_modal_tokens(
     id_offset: int, multi_modal_data_digest: bytes, num_tokens: int
@@ -237,7 +319,9 @@ class PageIndexConverter:
     def __call__(self, base_index: int) -> Iterator[int]: ...
 
 class KVCacheManager:
-    def __init__(self, config: KVCacheManagerConfig) -> None: ...
+    def __init__(
+        self, config: KVCacheManagerConfig, event_manager: KVCacheEventManager | None = None
+    ) -> None: ...
     def __del__(self) -> None: ...
     def shutdown(self) -> None: ...
     def clear_reusable_blocks(self) -> None: ...
@@ -257,6 +341,10 @@ class KVCacheManager:
     ) -> _KVCache: ...
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool: ...
     def get_quota(self, cache_level: CacheLevel) -> int: ...
+    def get_num_blocks_per_cache_level(self) -> list[int]: ...
+    def get_num_blocks_per_cache_level_by_window(
+        self, default_window_size: int
+    ) -> dict[int, list[int]]: ...
     @property
     def cache_tier_list(self) -> Sequence[CacheTier]: ...
     @property

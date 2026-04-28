@@ -737,6 +737,7 @@ class _KVCache:
 
         assert tree_block.tokens_per_block == tokens_per_block
         ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        stored_block = False
         if is_new:
             # We are the only writer to padding. Other _KVCache reusing it should make copies.
             skip_lcs = {ssm_lc_id} if ssm_lc_id is not None else None
@@ -754,6 +755,7 @@ class _KVCache:
             # SSM pages are never committed to the radix tree
             if ssm_lc_id is not None:
                 tree_block.storage[ssm_lc_id] = None
+            stored_block = True
             seq_block.tree_block = tree_block
             assert self._get_tree_block(ordinal) is tree_block
             self._num_committed_blocks = BlockOrdinal(ordinal + 1)
@@ -772,6 +774,7 @@ class _KVCache:
                     page = cast(UncommittedPage, cast(_SharedPageLock, beam_block[lc]).page)
                     beam_block[lc] = None
                     p = page.convert_to_committed(tree_block)
+                    stored_block = True
                     # The page comes from uncommitted page of self, so safe to skip wait.
                     beam_block[lc] = (
                         p.lock(self, beam_idx, ordinal, lc, skip_wait=True) if locked else p.hold()
@@ -794,6 +797,9 @@ class _KVCache:
         else:
             # We can't commit and can't reuse existing block. Just stop committing.
             self._commit_state = self.CommitState.VIRTUAL_STOP
+
+        if stored_block and self.manager._event_manager is not None:
+            self.manager._event_manager.on_blocks_stored([tree_block])
 
         if is_last or self._commit_state == self.CommitState.VIRTUAL_STOP:
             self._commit_state = self.CommitState.USER_STOP

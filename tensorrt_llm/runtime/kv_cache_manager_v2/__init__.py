@@ -40,6 +40,17 @@ from ._config import (
     SsmLayerConfig,
 )
 from ._core import DEFAULT_BEAM_INDEX, AggregatedPageDesc, BeamIndex, KVCacheManager, _KVCache
+from ._events import (
+    KVCacheCreatedData,
+    KVCacheEvent,
+    KVCacheEventDiffInt,
+    KVCacheEventManager,
+    KVCacheRemovedData,
+    KVCacheStoredBlockData,
+    KVCacheStoredData,
+    KVCacheUniqueToken,
+    KVCacheUpdatedData,
+)
 from ._life_cycle_registry import LayerGroupId, LifeCycleId
 from ._storage import BufferId
 
@@ -50,6 +61,15 @@ __all__ = [
     "TokenIdExt",
     "KVCacheManager",
     "_KVCache",
+    "KVCacheCreatedData",
+    "KVCacheEvent",
+    "KVCacheEventDiffInt",
+    "KVCacheEventManager",
+    "KVCacheRemovedData",
+    "KVCacheStoredBlockData",
+    "KVCacheStoredData",
+    "KVCacheUniqueToken",
+    "KVCacheUpdatedData",
     "BeamIndex",
     "DEFAULT_BEAM_INDEX",
     "LayerId",

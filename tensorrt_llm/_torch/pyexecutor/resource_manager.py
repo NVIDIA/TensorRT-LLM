@@ -31,6 +31,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     GpuCacheTierConfig, HostCacheTierConfig)
 # isort: on
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
+    KVCacheEventManager as KVCacheEventManagerPy
+from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManager as KVCacheManagerPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManagerConfig as KVCacheManagerConfigPy
@@ -1655,8 +1657,21 @@ class KVCacheManagerV2(BaseResourceManager):
         self.max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
 
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
-
-        assert self.event_buffer_max_size == 0, "event_buffer_max_size must be 0"
+        self.event_manager = None
+        if self.event_buffer_max_size > 0:
+            if mapping.enable_attention_dp:
+                dist = Distributed.get(mapping)
+                attention_dp_gather_fn = dist.tp_allgather if mapping.tp_size > 1 else None
+                self.event_manager = KVCacheEventManagerPy(
+                    max_kv_event_entries=self.event_buffer_max_size,
+                    attention_dp_rank=mapping.rank,
+                    attention_dp_gather_rank=mapping.tp_rank,
+                    attention_dp_size=mapping.tp_size,
+                    attention_dp_gather_fn=attention_dp_gather_fn,
+                )
+            elif mpi_rank() == 0:
+                self.event_manager = KVCacheEventManagerPy(
+                    max_kv_event_entries=self.event_buffer_max_size)
 
         self._stream = execution_stream if execution_stream is not None else torch.cuda.current_stream(
         )
@@ -1763,7 +1778,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_manager_py_config = config
 
-        self.impl = KVCacheManagerPy(config)
+        self.impl = KVCacheManagerPy(config, event_manager=self.event_manager)
 
         self.num_pools = len(self.impl.layer_grouping)
 
@@ -1805,6 +1820,15 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
+
+        if self.event_manager is not None:
+            self.event_manager.set_default_window_size(self.max_seq_len)
+            blocks_per_window = self.impl.get_num_blocks_per_cache_level_by_window(
+                self.max_seq_len)
+            for window_size, num_blocks_per_cache_level in blocks_per_window.items(
+            ):
+                self.event_manager.enqueue_created_event(
+                    num_blocks_per_cache_level, window_size)
 
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
@@ -2729,6 +2753,15 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def reset_reuse_state(self):
         self.impl.clear_reusable_blocks()
+
+    def flush_iteration_events(self):
+        if self.event_manager is not None:
+            self.event_manager.flush_iteration_events()
+
+    def get_latest_events(self, timeout_ms: Optional[float] = 0):
+        if self.event_manager is None:
+            return []
+        return self.event_manager.get_latest_events(timeout_ms)
 
 
 class SlotManager:

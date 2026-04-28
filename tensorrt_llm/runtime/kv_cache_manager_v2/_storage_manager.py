@@ -102,16 +102,14 @@ class CacheLevelManager:
     @staticmethod
     def cache_tier_granularity(tier: CacheTier, quota: int) -> int:
         """Compute pool size granularity for a given cache tier and quota."""
-        match tier:
-            case CacheTier.GPU_MEM:
-                page_size = 2 << 20
-                return page_size << min(4, max(0, int(math.log(quota / (page_size * 512), 2))))
-            case CacheTier.HOST_MEM:
-                return HostCacheLevelStorage.POOL_SIZE_GRANULARITY
-            case CacheTier.DISK:
-                return DiskCacheLevelStorage.POOL_SIZE_GRANULARITY
-            case _:
-                raise ValueError(f"Invalid cache tier: {tier}")
+        if tier == CacheTier.GPU_MEM:
+            page_size = 2 << 20
+            return page_size << min(4, max(0, int(math.log(quota / (page_size * 512), 2))))
+        if tier == CacheTier.HOST_MEM:
+            return HostCacheLevelStorage.POOL_SIZE_GRANULARITY
+        if tier == CacheTier.DISK:
+            return DiskCacheLevelStorage.POOL_SIZE_GRANULARITY
+        raise ValueError(f"Invalid cache tier: {tier}")
 
     @staticmethod
     def _create_cache_level_storage(
@@ -119,23 +117,19 @@ class CacheLevelManager:
         slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
         slot_count_list: TypedIndexList[PoolGroupIndex, int],
     ) -> CacheLevelStorage:
-        match config.tier:
-            case CacheTier.GPU_MEM:
-                granularity = CacheLevelManager.cache_tier_granularity(
-                    CacheTier.GPU_MEM, config.quota
-                )
-                return GpuCacheLevelStorage(slot_size_lists, slot_count_list, granularity)
-            case CacheTier.HOST_MEM:
-                return HostCacheLevelStorage(slot_size_lists, slot_count_list)
-            case CacheTier.DISK:
-                assert isinstance(config, DiskCacheTierConfig)
-                assert os.path.isdir(config.path), (
-                    f"Disk path {config.path} does not exist or is not a directory"
-                )
-                filename_template = os.path.join(config.path, "g{}p{}.bin")
-                return DiskCacheLevelStorage(slot_size_lists, slot_count_list, filename_template)
-            case _:
-                raise ValueError(f"Invalid cache tier: {config.tier}")
+        if config.tier == CacheTier.GPU_MEM:
+            granularity = CacheLevelManager.cache_tier_granularity(CacheTier.GPU_MEM, config.quota)
+            return GpuCacheLevelStorage(slot_size_lists, slot_count_list, granularity)
+        if config.tier == CacheTier.HOST_MEM:
+            return HostCacheLevelStorage(slot_size_lists, slot_count_list)
+        if config.tier == CacheTier.DISK:
+            assert isinstance(config, DiskCacheTierConfig)
+            assert os.path.isdir(config.path), (
+                f"Disk path {config.path} does not exist or is not a directory"
+            )
+            filename_template = os.path.join(config.path, "g{}p{}.bin")
+            return DiskCacheLevelStorage(slot_size_lists, slot_count_list, filename_template)
+        raise ValueError(f"Invalid cache tier: {config.tier}")
 
 
 @dataclass(slots=True, frozen=True)
@@ -166,6 +160,7 @@ class StorageManager:
         "_slot_desc_list",
         "_levels",
         "_min_slots",
+        "_event_manager",
         "__rawref__",
     )
     _life_cycles: LifeCycleRegistry
@@ -176,6 +171,7 @@ class StorageManager:
     _slot_desc_list: TypedIndexList[PoolGroupIndex, SlotDesc]
     _levels: TypedIndexList[CacheLevel, CacheLevelManager]
     _min_slots: TypedIndexList[PoolGroupIndex, int]
+    _event_manager: object | None
     __rawref__: rawref.ref["StorageManager"]
 
     def __init__(
@@ -185,8 +181,10 @@ class StorageManager:
         tokens_per_block: int,
         typical_batch: BatchDesc | None = None,
         constraints: list[BatchDesc] | None = None,
+        event_manager: object | None = None,
     ) -> None:
         self.__rawref__ = rawref.NULL
+        self._event_manager = event_manager
         assert config.cache_tiers[GPU_LEVEL].tier == CacheTier.GPU_MEM, (
             "The first cache tier must be GPU memory"
         )
@@ -507,6 +505,7 @@ class StorageManager:
                     batched_copy(dst_tier, src_tier, slot_sizes[pool_idx], tasks, stream.get())
             finish_event = stream.take_finish_event()
             for src, dst in zip(src_pages, dst_slots):
+                old_cache_level = src.cache_level
                 dst.ready_event = finish_event
                 src.ready_event = (
                     finish_event  # compulsory for the next owner getting this slot from the pool.
@@ -518,6 +517,12 @@ class StorageManager:
                     src_pool_group.release(src)
                     src.set_slot(dst)
                     src.cache_level = dst_level
+                    if self._event_manager is not None and src.is_committed():
+                        block_ref = getattr(src, "block")
+                        block = block_ref() if callable(block_ref) else None
+                        getattr(self._event_manager, "on_block_updated")(
+                            block, src.life_cycle, old_cache_level, dst_level
+                        )
                     if scheduled_for_eviction:
                         self.schedule_for_eviction(src)
             return None if update_src else dst_slots

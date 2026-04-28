@@ -95,6 +95,12 @@ def get_tree(block: "RootBlock | Block") -> "BlockRadixTree":
     return node
 
 
+def _notify_block_removed(block: "Block", life_cycle: LifeCycleId | None = None) -> None:
+    event_manager = get_tree(block).event_manager
+    if event_manager is not None:
+        getattr(event_manager, "on_block_removed")(block, life_cycle=life_cycle)
+
+
 def remove_subtree(root: "RootBlock | Block") -> list[rawref.ref["CommittedPage"]]:
     # taking O(1) space
     # remove leaf blocks one by one, in post-order
@@ -105,6 +111,7 @@ def remove_subtree(root: "RootBlock | Block") -> list[rawref.ref["CommittedPage"
             block = next(iter(block.next.values()))
         else:
             if isinstance(block, Block):
+                _notify_block_removed(block)
                 ret.extend(p for p in block.storage if p is not None)
                 block.storage = filled_list(None, block.num_life_cycles)
             assert isinstance(block, RootBlock) or all(page is None for page in block.storage), (
@@ -283,7 +290,9 @@ class Block:
                 assert NDEBUG or (not b.is_full and b is not self and b.key == k and not b.next)
                 to_remove.append(k)
         for k in to_remove:
-            b = prev.next.pop(k)
+            b = prev.next[k]
+            _notify_block_removed(b)
+            prev.next.pop(k)
             assert b.is_orphan  # _KVCache may still hold it.
         # prev.next keeps a strong ref to this _Block, so no need to remove self from prev.next in __del__().
         prev.next[self.key] = self
@@ -340,6 +349,7 @@ class Block:
             and curr._prev() is not None
         ):
             if curr.key in curr.prev.next:
+                _notify_block_removed(curr, lc_idx)
                 curr.prev.next.pop(curr.key)
             curr = curr.prev
 
@@ -359,15 +369,21 @@ class Block:
 
 
 class BlockRadixTree:
-    __slots__ = ("_life_cycles", "_tokens_per_block", "next", "__rawref__")
+    __slots__ = ("_life_cycles", "_tokens_per_block", "_event_manager", "next", "__rawref__")
     _life_cycles: LifeCycleRegistry
     _tokens_per_block: int
     next: Children[RootBlock]
     __rawref__: rawref.ref["BlockRadixTree"]
 
-    def __init__(self, life_cycles: LifeCycleRegistry, tokens_per_block: int) -> None:
+    def __init__(
+        self,
+        life_cycles: LifeCycleRegistry,
+        tokens_per_block: int,
+        event_manager: object | None = None,
+    ) -> None:
         self._life_cycles = life_cycles
         self._tokens_per_block = tokens_per_block
+        self._event_manager = event_manager
         self.next = {}
         self.__rawref__ = rawref.NULL
 
@@ -387,6 +403,10 @@ class BlockRadixTree:
     @property
     def life_cycles(self) -> LifeCycleRegistry:
         return self._life_cycles
+
+    @property
+    def event_manager(self) -> object | None:
+        return self._event_manager
 
     @property
     def num_life_cycles(self) -> LifeCycleId:

@@ -37,6 +37,7 @@ from .._common import (
     TokenIdExt,
 )
 from .._config import DataRole, KVCacheManagerConfig
+from .._events import KVCacheEventManager
 from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._page import Page, _PageHolder
 from .._storage._config import BufferId, create_storage_config
@@ -121,6 +122,7 @@ class PageIndexConverter:
 class KVCacheManager:
     __slots__ = (
         "_init_config",
+        "_event_manager",
         "_life_cycles",
         "_radix_tree",
         "_storage",
@@ -136,6 +138,7 @@ class KVCacheManager:
         "_last_update_num_closed_requests",
     )
     _init_config: KVCacheManagerConfig
+    _event_manager: KVCacheEventManager | None
     _life_cycles: LifeCycleRegistry
     _radix_tree: BlockRadixTree
     _storage: StorageManager
@@ -157,12 +160,24 @@ class KVCacheManager:
     _last_adjustment_time: float
     _last_update_num_closed_requests: int
 
-    def __init__(self, config: KVCacheManagerConfig) -> None:
+    def __init__(
+        self,
+        config: KVCacheManagerConfig,
+        event_manager: KVCacheEventManager | None = None,
+    ) -> None:
         init_cuda_once()
         config = deepcopy(config)
         self._init_config = config
+        self._event_manager = event_manager
         self._life_cycles = LifeCycleRegistry(config)
-        self._radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block)
+        if event_manager is not None:
+            event_manager.set_life_cycle_window_sizes(
+                {
+                    int(lc_id): lc.window_size
+                    for lc_id, lc in self._life_cycles.attention_life_cycles()
+                }
+            )
+        self._radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block, event_manager)
         storage_config = create_storage_config(config)
         self._storage = StorageManager(
             self._life_cycles,
@@ -170,6 +185,7 @@ class KVCacheManager:
             config.tokens_per_block,
             typical_batch=config.typical_step,
             constraints=config.constraints,
+            event_manager=event_manager,
         )
         self._living_kv_caches = set[rawref.ref[_KVCache]]()
         decay = 0.9999
@@ -299,6 +315,33 @@ class KVCacheManager:
 
     def get_quota(self, cache_level: CacheLevel) -> int:
         return self._storage._levels[cache_level].storage.total_quota
+
+    def get_num_blocks_per_cache_level(self) -> list[int]:
+        storage = self._storage
+        return [
+            min(storage.num_slots(pg_idx, level) for pg_idx in typed_range(storage.num_pool_groups))
+            for level in typed_range(storage.num_cache_levels)
+        ]
+
+    def get_num_blocks_per_cache_level_by_window(
+        self, default_window_size: int
+    ) -> dict[int, list[int]]:
+        storage = self._storage
+        pool_groups_by_window: dict[int, set[PoolGroupIndex]] = defaultdict(set)
+        for lc_id, lc in self._life_cycles.attention_life_cycles():
+            window_size = default_window_size if lc.window_size is None else lc.window_size
+            pool_groups_by_window[window_size].add(storage.get_pool_group_index(lc_id))
+
+        if not pool_groups_by_window:
+            return {default_window_size: self.get_num_blocks_per_cache_level()}
+
+        return {
+            window_size: [
+                min(storage.num_slots(pg_idx, level) for pg_idx in pool_groups)
+                for level in typed_range(storage.num_cache_levels)
+            ]
+            for window_size, pool_groups in pool_groups_by_window.items()
+        }
 
     # sorted by CacheLevel from warm to cold
     @property
