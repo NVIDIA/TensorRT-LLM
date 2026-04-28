@@ -249,9 +249,17 @@ class DefaultADPRouter(ADPRouter):
 
         num_new_requests_all_ranks = len(remaining_unscheduled)
         total_num_active_requests = sum(all_ranks_num_active_requests)
-        expected_num_active_requests = max(
-            (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1) // tp_size,
-            max(all_ranks_num_active_requests),
+        # Cap at max_num_active_requests to prevent the balancer from
+        # assigning more requests than a rank can physically schedule.
+        # Without this cap, bulk arrivals (e.g. benchmark disagg mode)
+        # can push expected above max_batch_size, leaving excess requests
+        # permanently stuck in INIT state (nvbug 6071070).
+        expected_num_active_requests = min(
+            max(
+                (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1) // tp_size,
+                max(all_ranks_num_active_requests),
+            ),
+            max_num_active_requests,
         )
 
         all_ranks_new_requests = self._balance_requests_across_ranks(
@@ -536,15 +544,22 @@ class KVCacheAwareADPRouter(ADPRouter):
 
         # Loose cap at fair_share_multiplier * ceil(total / tp_size): safety
         # net against runaway concentration, still loose enough that cache
-        # affinity wins in the common case.
+        # affinity wins in the common case.  Hard-cap additionally at
+        # max_num_active_requests — same guard as DefaultADPRouter
+        # (nvbug 6071070); critical for benchmark disagg fill where bulk
+        # arrivals would otherwise leave excess requests permanently stuck
+        # in INIT state.
         num_new_requests_all_ranks = len(remaining_unscheduled)
         total_num_active_requests = sum(all_ranks_num_active_requests)
         fair_share = (
             total_num_active_requests + num_new_requests_all_ranks + tp_size - 1
         ) // tp_size
-        expected_num_active_requests = max(
-            math.ceil(self.fair_share_multiplier * fair_share),
-            max(all_ranks_num_active_requests),
+        expected_num_active_requests = min(
+            max(
+                math.ceil(self.fair_share_multiplier * fair_share),
+                max(all_ranks_num_active_requests),
+            ),
+            max_num_active_requests,
         )
         eligible_ranks = [
             rank

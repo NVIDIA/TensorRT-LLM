@@ -2220,7 +2220,14 @@ class PyExecutor:
             # scheduler could not allocate KV for any of them, the benchmark
             # will hang forever because in-progress generation requests won't
             # release their KV cache.
+            #
+            # Suppress during the fill phase: INIT requests are expected
+            # while KV transfers are still in progress.  The state-based
+            # gate (_is_benchmark_disagg_fill_complete) will open once all
+            # transfers complete; only after that does a stuck INIT request
+            # indicate genuine KV insufficiency.
             if (self.benchmark_req_queues_size > 0 and not self.is_warmup
+                    and not self._benchmark_fill_phase_active
                     and not fitting_disagg_gen_init_requests):
                 stuck_init_requests = [
                     req for req in self.active_requests
@@ -2273,42 +2280,88 @@ class PyExecutor:
 
     def _is_benchmark_disagg_fill_complete(
             self, scheduled_batch: ScheduledRequests) -> bool:
-        """Check whether all benchmark disagg requests have completed KV transfer.
+        """State-based fill-complete predicate for benchmark disagg mode.
 
-        With ADP, generation requests are distributed across TP ranks, so an
-        allgather is needed to obtain the global count.  Without ADP every
-        request is local, and we can compare directly.
+        The gate opens when all three conditions hold globally:
+
+        (A) The executor has fetched at least ``benchmark_req_queues_size``
+            requests cumulatively.
+        (B) Every request in ``active_requests`` on this rank is past the
+            KV-transfer phase (not in INIT or TRANS_IN_PROGRESS).
+        (C) The KV cache transceiver has no pending receive sessions
+            (no transfers about to complete that would change state).
+
+        For ADP, (B) and (C) are AND-ed across TP ranks via allgather.
+
+        This predicate is immune to ADP router distribution skew: it asks
+        "are all admitted requests ready for generation?" not "did the
+        router put >= threshold/tp_size on every rank?"
 
         This method must only be called when ``is_benchmark_disagg`` is True.
 
         Args:
-            scheduled_batch: The current iteration's scheduled requests,
-                used to count generation requests that have completed
-                KV transfer.
+            scheduled_batch: Passed for API compatibility with callers
+                but no longer used by this predicate.
 
         Returns:
-            True when the total number of generation-ready requests
-            reaches ``benchmark_req_queues_size``.
+            True when the fill phase is complete and the first forward
+            pass can proceed.
         """
         if not self.is_benchmark_disagg:
             raise RuntimeError(
-                "_is_benchmark_disagg_fill_complete() should not be called outside benchmark "
-                "disagg mode.  This is an unexpected error.")
-        local_gen_count = sum(1 for req in scheduled_batch.generation_requests
-                              if not req.is_attention_dp_dummy)
-        if self.enable_attention_dp:
-            total_gen_count = sum(self.dist.tp_allgather(local_gen_count))
-        else:
-            total_gen_count = local_gen_count
+                "_is_benchmark_disagg_fill_complete() should not be called "
+                "outside benchmark disagg mode.")
 
-        if total_gen_count >= self.benchmark_req_queues_size:
-            return True
-        if self.dist.rank == 0:
+        # (A) All benchmark requests have been fetched from the queue.
+        if self.num_fetch_requests < self.benchmark_req_queues_size:
+            if self.dist.rank == 0:
+                logger.debug(
+                    f"Benchmark disagg fill: fetching "
+                    f"{self.num_fetch_requests}/{self.benchmark_req_queues_size}"
+                )
+            return False
+
+        # (B) Every active request on this rank is past KV-transfer states.
+        local_all_past_transfer = not any(
+            req.is_disagg_generation_init_state
+            or req.is_disagg_generation_transmission_in_progress
+            for req in self.active_requests)
+
+        # (C) No pending receive sessions on the transceiver.
+        local_no_inflight = (
+            self.kv_cache_transceiver is None
+            or self.kv_cache_transceiver.check_gen_transfer_complete())
+
+        local_ok = int(local_all_past_transfer and local_no_inflight)
+
+        if self.enable_attention_dp:
+            all_ranks_ok = self.dist.tp_allgather(local_ok)
+            global_ok = min(all_ranks_ok) == 1
+        else:
+            all_ranks_ok = None
+            global_ok = bool(local_ok)
+
+        if not global_ok and self.dist.rank == 0:
+            blocked_ranks = [
+                rank for rank, ok in enumerate(all_ranks_ok or [local_ok])
+                if not ok
+            ]
+            num_init = sum(1 for req in self.active_requests
+                           if req.is_disagg_generation_init_state)
+            num_in_progress = sum(
+                1 for req in self.active_requests
+                if req.is_disagg_generation_transmission_in_progress)
             logger.debug(
-                f"Benchmark disagg fill in progress: "
-                f"num_fetched={self.num_fetch_requests}, "
-                f"total_gen_count={total_gen_count} (local={local_gen_count})")
-        return False
+                f"Benchmark disagg fill: blocked on ranks {blocked_ranks} "
+                f"(rank {self.dist.rank} local: {num_init} INIT, "
+                f"{num_in_progress} in-progress, "
+                f"inflight={not local_no_inflight})"
+            )
+        if global_ok and self.dist.rank == 0:
+            logger.info(f"Benchmark disagg fill complete: "
+                        f"{len(self.active_requests)} active requests ready, "
+                        f"gate opening.")
+        return global_ok
 
     def _check_benchmark_disagg_gate(self, scheduled_batch: ScheduledRequests,
                                      can_forward: bool) -> tuple[bool, bool]:
