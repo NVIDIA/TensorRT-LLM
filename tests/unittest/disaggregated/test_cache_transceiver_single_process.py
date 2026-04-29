@@ -438,7 +438,7 @@ def _add_sequence(mgr, request_id: int, prompt_len: int, use_v2: bool):
         kv_cache.resize(prompt_len)
         return kv_cache
     else:
-        # V1: create a dummy LlmRequest for add_sequence
+        # V1: create a dummy LlmRequest for add_sequence_batch
         sampling_params = SamplingParams()
         dummy_request = LlmRequest(
             request_id=request_id,
@@ -450,7 +450,7 @@ def _add_sequence(mgr, request_id: int, prompt_len: int, use_v2: bool):
             is_streaming=False,
             llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
         )
-        mgr.impl.add_sequence(request_id, prompt_len, 1, dummy_request)
+        mgr.impl.add_sequence_batch([(request_id, prompt_len, 1)], [dummy_request])
         return None
 
 
