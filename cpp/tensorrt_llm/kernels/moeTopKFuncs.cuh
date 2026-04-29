@@ -1,6 +1,6 @@
 
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -264,16 +264,14 @@ __forceinline__ __device__ void reduceTopK(cg::thread_block_tile<kWARP_SIZE> con
                 inIdx[i] = idx[start + i];
             }
             reduceTopKFunc<K, Type, 4>(warp, topKValue, topKIdx, inValue, inIdx, minValue, actualK);
-            int inOffset = laneIdx % K;
-            if (laneIdx >= loop * K && laneIdx < (loop + 1) * K)
+            for (int resultIdx = 0; resultIdx < numResults; ++resultIdx)
             {
-                topKBufferValue[0] = topKValue[inOffset];
-                topKBufferIdx[0] = topKIdx[inOffset];
-            }
-            if (loop == numLoops - 1 && (laneIdx < (numLoops * K - kWARP_SIZE)))
-            {
-                topKBufferValue[1] = topKValue[inOffset];
-                topKBufferIdx[1] = topKIdx[inOffset];
+                int const candidateIdx = resultIdx * kWARP_SIZE + laneIdx - loop * K;
+                if (candidateIdx >= 0 && candidateIdx < K)
+                {
+                    topKBufferValue[resultIdx] = topKValue[candidateIdx];
+                    topKBufferIdx[resultIdx] = topKIdx[candidateIdx];
+                }
             }
         }
 
