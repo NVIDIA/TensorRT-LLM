@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import math
 from typing import Dict, Optional
 
@@ -46,7 +61,7 @@ class Gemma2ScaledWordEmbedding(Embedding):
             tensor_parallel_mode=tensor_parallel_mode,
             gather_output=gather_output,
         )
-        self.embed_scale = torch.sqrt(torch.tensor(hidden_size)).to(self.dtype)
+        self.embed_scale = math.sqrt(hidden_size)
 
     @inference_mode_unless_compiling
     def forward(self, input_ids):
@@ -288,8 +303,11 @@ class Gemma2ForCausalLM(DecoderModelForCausalLM[Gemma2TextModel,
             attn_metadata,
             return_context_logits,
         )
-        if self._final_logit_softcap:
+        if self._final_logit_softcap is not None:
             cap = float(self._final_logit_softcap)
+            if cap <= 0:
+                raise ValueError(
+                    f"final_logit_softcapping must be > 0, got {cap}.")
             logits = logits * (1.0 / cap)
             logits = torch.tanh(logits) * cap
         return logits

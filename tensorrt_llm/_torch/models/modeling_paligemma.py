@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 import dataclasses
 import os
@@ -24,7 +39,7 @@ from ..modules.linear import Linear
 from .modeling_gemma2 import Gemma2ForCausalLM
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_siglip import SiglipVisionModel
-from .modeling_utils import ModelConfig, filter_weights, register_auto_model
+from .modeling_utils import filter_weights, register_auto_model
 
 _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
 
@@ -33,8 +48,10 @@ def _is_disagg() -> bool:
     return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
 
 
-class PaliGemmaInputProcessor(BaseMultimodalInputProcessor,
-                               BaseMultimodalDummyInputsBuilder):
+class PaliGemmaInputProcessor(
+    BaseMultimodalInputProcessor,
+    BaseMultimodalDummyInputsBuilder,
+):
     """Input processor for PaliGemma models (v1 and v2)."""
 
     def __init__(
@@ -96,10 +113,12 @@ class PaliGemmaInputProcessor(BaseMultimodalInputProcessor,
             images=images,
             do_rescale=do_rescale,
             return_tensors="pt",
-        ).to(dtype=self.dtype)
+        )
 
         input_ids = processor_output["input_ids"]
         pixel_values = processor_output.get("pixel_values")
+        if pixel_values is not None:
+            pixel_values = pixel_values.to(dtype=self.dtype)
 
         return input_ids, pixel_values
 
@@ -231,8 +250,10 @@ class PaliGemmaForConditionalGeneration(PreTrainedModel):
         self.mm_projector.load_weights(mm_projector_weights)
 
     def post_config(self):
-        self.config = self.llm.config
-        self.model_config.pretrained_config = self.llm.config
+        # Keep the top-level PaliGemmaConfig intact (preserves vision_config,
+        # image_token_index, etc.) and only update the text sub-config so that
+        # external callers can still inspect model.config.vision_config.
+        self.model_config.pretrained_config.text_config = self.llm.config
 
     @property
     def vocab_size_padded(self) -> int:

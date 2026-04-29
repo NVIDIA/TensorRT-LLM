@@ -379,6 +379,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             max_sequence_kv=max_key_value_tokens_per_sequence,
             v_indptr=key_value_element_indptr,
             o_indptr=query_output_element_indptr,
+            logits_soft_cap=plan_params.logits_soft_cap or 0.0,
         )
 
     def prepare(self) -> None:
