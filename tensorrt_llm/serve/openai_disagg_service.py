@@ -15,7 +15,8 @@
 import asyncio
 import json
 import os
-from typing import Any, AsyncGenerator, Callable, Dict, Optional
+from collections.abc import AsyncIterator
+from typing import Any, Callable, Dict, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import (
     ConditionalDisaggConfig,
@@ -120,59 +121,6 @@ class OpenAIDisaggregatedService(OpenAIService):
             raise RuntimeError("Cluster is not ready")
         return await self._send_disagg_request(request, hooks)
 
-    @staticmethod
-    def _get_ctx_cached_tokens(ctx_response: UCompletionResponse) -> Optional[int]:
-        """Extract cached_tokens from CTX response (real prefix cache reuse).
-
-        In disagg mode the GEN worker reports cached_tokens == prompt_tokens
-        because all tokens arrive via KV cache transfer. The CTX worker knows
-        the actual prefix cache hit count which is what callers care about.
-        """
-        if ctx_response and ctx_response.usage:
-            details = ctx_response.usage.prompt_tokens_details
-            if details is not None:
-                return details.cached_tokens
-        return None
-
-    @staticmethod
-    async def _patch_stream_cached_tokens(
-        gen_stream: AsyncGenerator, ctx_cached_tokens: int
-    ) -> AsyncGenerator:
-        """Wrap a GEN streaming response to replace cached_tokens with CTX value.
-
-        The final SSE chunk in a streaming response carries a ``usage`` object.
-        This wrapper intercepts that chunk and overwrites
-        ``prompt_tokens_details.cached_tokens`` with the value reported by the
-        CTX worker so that clients see actual prefix-cache reuse instead of the
-        GEN worker's inflated count.
-        """
-        async for chunk in gen_stream:
-            if isinstance(chunk, bytes):
-                try:
-                    text = chunk.decode("utf-8", errors="replace")
-                    lines = text.split("\n")
-                    patched_lines = []
-                    for line in lines:
-                        if line.startswith("data: ") and "prompt_tokens_details" in line:
-                            data_str = line[len("data: ") :]
-                            data = json.loads(data_str)
-                            if "usage" in data and data["usage"]:
-                                if "prompt_tokens_details" not in data["usage"]:
-                                    data["usage"]["prompt_tokens_details"] = {}
-                                data["usage"]["prompt_tokens_details"]["cached_tokens"] = (
-                                    ctx_cached_tokens
-                                )
-                                patched_lines.append("data: " + json.dumps(data))
-                            else:
-                                patched_lines.append(line)
-                        else:
-                            patched_lines.append(line)
-                    yield "\n".join(patched_lines).encode("utf-8")
-                except Exception:
-                    yield chunk
-            else:
-                yield chunk
-
     async def _send_disagg_request_ctx_first(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
@@ -217,28 +165,138 @@ class OpenAIDisaggregatedService(OpenAIService):
                 gen_server, _ = await self._gen_router.get_next_server(
                     gen_req, exclude_server=ctx_server
                 )
-            gen_result = await self._gen_client.send_request(
+            gen_response = await self._gen_client.send_request(
                 gen_req, server=gen_server, hooks=hooks
             )
-            # Replace GEN worker's cached_tokens with CTX worker's real
-            # prefix-cache reuse count.  The GEN worker always reports
-            # cached_tokens == prompt_tokens (everything came via KV transfer),
-            # which is misleading.
-            ctx_cached_tokens = self._get_ctx_cached_tokens(ctx_response)
-            if ctx_cached_tokens is not None:
-                if hasattr(gen_result, "__aiter__"):
-                    return self._patch_stream_cached_tokens(gen_result, ctx_cached_tokens)
-                elif hasattr(gen_result, "usage") and gen_result.usage:
-                    if gen_result.usage.prompt_tokens_details is None:
-                        gen_result.usage.prompt_tokens_details = PromptTokensDetails()
-                    gen_result.usage.prompt_tokens_details.cached_tokens = ctx_cached_tokens
-            return gen_result
+            return self._rewrite_disagg_usage(gen_response, ctx_response)
         else:
             if request.stream:
                 # ctx client will never return a generator when streaming is requested
                 # make up for this by returning a done generator
                 return done_generator()
             return ctx_response
+
+    def _ctx_usage_for_client(
+        self, ctx_response: Optional[UCompletionResponse]
+    ) -> tuple[Optional[int], int]:
+        if ctx_response is None or ctx_response.usage is None:
+            return None, 0
+
+        prompt_tokens = ctx_response.usage.prompt_tokens
+        cached_tokens = 0
+        prompt_tokens_details = ctx_response.usage.prompt_tokens_details
+        if prompt_tokens_details is not None:
+            cached_tokens = prompt_tokens_details.cached_tokens
+        return prompt_tokens, cached_tokens
+
+    def _rewrite_usage_payload_from_ctx(
+        self,
+        usage: dict[str, Any],
+        ctx_response: Optional[UCompletionResponse],
+    ) -> None:
+        prompt_tokens, cached_tokens = self._ctx_usage_for_client(ctx_response)
+        if prompt_tokens is None:
+            return
+
+        usage["prompt_tokens"] = prompt_tokens
+        usage["total_tokens"] = prompt_tokens + (usage.get("completion_tokens") or 0)
+        prompt_tokens_details = usage.get("prompt_tokens_details")
+        if not isinstance(prompt_tokens_details, dict):
+            prompt_tokens_details = {}
+            usage["prompt_tokens_details"] = prompt_tokens_details
+        prompt_tokens_details["cached_tokens"] = cached_tokens
+
+    def _rewrite_usage_response_from_ctx(
+        self,
+        response: UCompletionResponse,
+        ctx_response: Optional[UCompletionResponse],
+    ) -> UCompletionResponse:
+        prompt_tokens, cached_tokens = self._ctx_usage_for_client(ctx_response)
+        if prompt_tokens is None or response.usage is None:
+            return response
+
+        response.usage.prompt_tokens = prompt_tokens
+        response.usage.total_tokens = prompt_tokens + (response.usage.completion_tokens or 0)
+        response.usage.prompt_tokens_details = PromptTokensDetails(cached_tokens=cached_tokens)
+        return response
+
+    @staticmethod
+    def _sse_separator_index(data: bytes) -> tuple[int, bytes] | None:
+        indexes = [(data.find(sep), sep) for sep in (b"\n\n", b"\r\n\r\n")]
+        indexes = [(idx, sep) for idx, sep in indexes if idx >= 0]
+        if not indexes:
+            return None
+        return min(indexes, key=lambda item: item[0])
+
+    def _rewrite_usage_sse_event_from_ctx(
+        self,
+        event: bytes,
+        ctx_response: Optional[UCompletionResponse],
+    ) -> bytes:
+        separator_match = self._sse_separator_index(event)
+        separator = separator_match[1] if separator_match else b""
+        event_body = event[: -len(separator)] if separator else event
+        data_lines = [
+            line.removeprefix(b"data:").strip()
+            for line in event_body.splitlines()
+            if line.startswith(b"data:")
+        ]
+        if len(data_lines) != 1 or data_lines[0] == b"[DONE]":
+            return event
+
+        try:
+            payload = json.loads(data_lines[0])
+        except json.JSONDecodeError:
+            return event
+
+        usage = payload.get("usage") if isinstance(payload, dict) else None
+        if not isinstance(usage, dict):
+            return event
+
+        self._rewrite_usage_payload_from_ctx(usage, ctx_response)
+        return b"data: " + json.dumps(payload, separators=(",", ":")).encode("utf-8") + separator
+
+    async def _rewrite_streaming_usage_from_ctx(
+        self,
+        response: AsyncIterator[Any],
+        ctx_response: Optional[UCompletionResponse],
+    ) -> AsyncIterator[Any]:
+        pending = b""
+        pending_is_str = False
+        async for chunk in response:
+            is_str = isinstance(chunk, str)
+            chunk_bytes = chunk.encode("utf-8") if is_str else chunk
+            if not isinstance(chunk_bytes, bytes):
+                yield chunk
+                continue
+
+            if not pending:
+                pending_is_str = is_str
+            pending += chunk_bytes
+            while separator_match := self._sse_separator_index(pending):
+                separator_index, separator = separator_match
+                event_end = separator_index + len(separator)
+                event = pending[:event_end]
+                pending = pending[event_end:]
+                event = self._rewrite_usage_sse_event_from_ctx(event, ctx_response)
+                yield event.decode("utf-8") if pending_is_str else event
+                if not pending:
+                    pending_is_str = False
+
+        if pending:
+            event = self._rewrite_usage_sse_event_from_ctx(pending, ctx_response)
+            yield event.decode("utf-8") if pending_is_str else event
+
+    def _rewrite_disagg_usage(
+        self,
+        response: UCompletionResponseOrGenerator,
+        ctx_response: Optional[UCompletionResponse],
+    ) -> UCompletionResponseOrGenerator:
+        if ctx_response is None:
+            return response
+        if hasattr(response, "__aiter__"):
+            return self._rewrite_streaming_usage_from_ctx(response, ctx_response)
+        return self._rewrite_usage_response_from_ctx(response, ctx_response)
 
     def _need_gen(self, response: UCompletionResponse) -> bool:
         if response and response.choices[0].finish_reason not in ["length", "not_finished"]:
@@ -537,11 +595,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                     except asyncio.CancelledError:
                         pass
 
-            stream = _yield_from_queue()
-            ctx_cached_tokens = self._get_ctx_cached_tokens(ctx_response)
-            if ctx_cached_tokens is not None:
-                return self._patch_stream_cached_tokens(stream, ctx_cached_tokens)
-            return stream
+            return self._rewrite_disagg_usage(_yield_from_queue(), ctx_response)
         else:
             # Non-streaming or no ctx needed: both HTTP POSTs fire eagerly
             # through generator consumption, so asyncio.gather works fine.
@@ -558,16 +612,5 @@ class OpenAIDisaggregatedService(OpenAIService):
                 )
             )
             responses = await asyncio.gather(*tasks)
-            gen_result = responses[-1]
-            # Patch cached_tokens from CTX response (same logic as ctx_first)
-            if need_ctx and len(responses) > 1:
-                ctx_response = responses[0]
-                ctx_cached_tokens = self._get_ctx_cached_tokens(ctx_response)
-                if ctx_cached_tokens is not None:
-                    if hasattr(gen_result, "__aiter__"):
-                        return self._patch_stream_cached_tokens(gen_result, ctx_cached_tokens)
-                    elif hasattr(gen_result, "usage") and gen_result.usage:
-                        if gen_result.usage.prompt_tokens_details is None:
-                            gen_result.usage.prompt_tokens_details = PromptTokensDetails()
-                        gen_result.usage.prompt_tokens_details.cached_tokens = ctx_cached_tokens
-            return gen_result
+            ctx_response = responses[0] if need_ctx else None
+            return self._rewrite_disagg_usage(responses[-1], ctx_response)
