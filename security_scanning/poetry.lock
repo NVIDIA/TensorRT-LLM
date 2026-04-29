@@ -3822,54 +3822,15 @@ numpy = "*"
 onnx = ">=1.14.0"
 
 [[package]]
-name = "onnx-ir"
-version = "0.2.1"
-description = "Efficient in-memory representation for ONNX"
-optional = false
-python-versions = ">=3.9"
-groups = ["main"]
-files = [
-    {file = "onnx_ir-0.2.1-py3-none-any.whl", hash = "sha256:c7285da889312f91882de2092e298a9eeeefbfc1d1951c49d983992967eb09a7"},
-    {file = "onnx_ir-0.2.1.tar.gz", hash = "sha256:8b8b10a93f43e65962104de6070c43c5dacb0e3cdfefc7c8059dd83c9db64f35"},
-]
-
-[package.dependencies]
-ml_dtypes = ">=0.5.0"
-numpy = "*"
-onnx = ">=1.16"
-sympy = ">=1.13"
-typing_extensions = ">=4.10"
-
-[[package]]
-name = "onnxscript"
-version = "0.5.4"
-description = "Naturally author ONNX functions and models using a subset of Python"
-optional = false
-python-versions = ">=3.9"
-groups = ["main"]
-files = [
-    {file = "onnxscript-0.5.4-py3-none-any.whl", hash = "sha256:640d2aa55364b9b0d66c280cc4b22cd2c918fde9a1a72c2460d2fbe24b9181dc"},
-    {file = "onnxscript-0.5.4.tar.gz", hash = "sha256:311e08ce513484a1fadfc19f3ad28f83ed41a8ce73eca4d038cd3623f6f52104"},
-]
-
-[package.dependencies]
-ml_dtypes = "*"
-numpy = "*"
-onnx = ">=1.16"
-onnx_ir = ">=0.1.10,<2"
-packaging = "*"
-typing_extensions = ">=4.10"
-
-[[package]]
 name = "openai"
-version = "2.32.0"
+version = "2.33.0"
 description = "The official Python library for the openai API"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "openai-2.32.0-py3-none-any.whl", hash = "sha256:4dcc9badeb4bf54ad0d187453742f290226d30150890b7890711bda4f32f192f"},
-    {file = "openai-2.32.0.tar.gz", hash = "sha256:c54b27a9e4cb8d51f0dd94972ffd1a04437efeb259a9e60d8922b8bd26fe55e0"},
+    {file = "openai-2.33.0-py3-none-any.whl", hash = "sha256:03ac37d70e8c9e3a8124214e3afa785e2cbc12e627fbd98177a086ef2fd87ad5"},
+    {file = "openai-2.33.0.tar.gz", hash = "sha256:f850c435e2a4685bba3295bd54912dd26315d9c1b7733068186134d6e0599f9a"},
 ]
 
 [package.dependencies]
@@ -7085,4 +7046,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "6c7ff3347423d965324bef67a23b4c1b3944ade8b30156344a8d64e3f3207299"
+content-hash = "8adbd9db17f12261e68e8582f07011d0ff3911db28ee9a2a3f7b3b2af4664048"

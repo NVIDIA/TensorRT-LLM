@@ -299,7 +299,7 @@ class DefaultMoeRoutingMethod(BaseMoeRoutingMethod):
     def apply(self,
               router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         num_experts = router_logits.shape[-1]
-        if self.force_enable_pytorch_op or num_experts > 128 or self.top_k > 8:
+        if self.force_enable_pytorch_op or num_experts > 512 or self.top_k > 16:
             return self.apply_pytorch(router_logits)
         else:
             return torch.ops.trtllm.default_moe_routing_op(
@@ -551,7 +551,7 @@ class RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
     def apply(self,
               router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         num_experts = router_logits.shape[-1]
-        if self.force_enable_pytorch_op or num_experts > 128 or self.top_k > 8:
+        if self.force_enable_pytorch_op or num_experts > 512 or self.top_k > 16:
             return self.apply_pytorch(router_logits)
         else:
             return torch.ops.trtllm.renorm_moe_routing_op(

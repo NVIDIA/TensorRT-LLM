@@ -189,7 +189,7 @@ def gen_unique_logits(num_tokens, num_experts, dtype):
 @pytest.mark.parametrize("top_k", [2, 8])
 @pytest.mark.parametrize("dtype",
                          [torch.bfloat16, torch.float32, torch.float16])
-@pytest.mark.parametrize("num_experts", [8, 67, 128])
+@pytest.mark.parametrize("num_experts", [8, 67, 128, 512])
 def test_customized_renormalize_moe_routing(num_tokens, top_k, num_experts,
                                             dtype):
 
@@ -204,8 +204,51 @@ def test_customized_renormalize_moe_routing(num_tokens, top_k, num_experts,
                                               force_enable_pytorch_op=True)
     reference_indices, reference_scales = ref_routing.apply(router_logits)
 
+    # Compare top-k as a set: when router_logits contain ties (e.g. bf16 +
+    # num_experts>256 collapses many randperm values to the same bf16 number),
+    # the kernel and the reference may legitimately break ties in different
+    # orders. Sort each row by indices before comparing, and align scales by
+    # the same permutation.
+    idx_sorted, perm = torch.sort(indices, dim=1)
+    ref_idx_sorted, ref_perm = torch.sort(reference_indices, dim=1)
+    assert torch.equal(idx_sorted, ref_idx_sorted)
+
+    scales_sorted = torch.gather(scales, 1, perm)
+    ref_scales_sorted = torch.gather(reference_scales, 1, ref_perm)
+    assert torch.allclose(scales_sorted, ref_scales_sorted)
+
+
+@pytest.mark.parametrize("routing_cls",
+                         [DefaultMoeRoutingMethod, RenormalizeMoeRoutingMethod])
+@pytest.mark.parametrize("dtype",
+                         [torch.bfloat16, torch.float32, torch.float16])
+def test_customized_moe_routing_512_experts_topk10_middle_block(
+        routing_cls, dtype):
+    num_tokens = 4
+    num_experts = 512
+    top_k = 10
+    router_logits = torch.full((num_tokens, num_experts),
+                               -20,
+                               dtype=torch.float32,
+                               device="cuda")
+    expected_topk_indices = torch.arange(256,
+                                         256 + top_k,
+                                         device="cuda",
+                                         dtype=torch.int32)
+
+    for token_idx in range(num_tokens):
+        router_logits[token_idx, expected_topk_indices.long()] = torch.arange(
+            top_k, 0, -1, dtype=torch.float32, device="cuda") + token_idx
+    router_logits = router_logits.to(dtype)
+
+    routing = routing_cls(top_k=top_k, force_enable_pytorch_op=False)
+    indices, scales = routing.apply(router_logits)
+
+    ref_routing = routing_cls(top_k=top_k, force_enable_pytorch_op=True)
+    reference_indices, reference_scales = ref_routing.apply(router_logits)
+
     assert torch.equal(indices, reference_indices)
-    assert torch.allclose(scales, reference_scales)
+    assert torch.allclose(scales, reference_scales, atol=1e-3, rtol=1e-3)
 
 
 def test_sparse_mixer_reference():

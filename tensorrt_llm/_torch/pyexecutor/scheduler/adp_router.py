@@ -18,10 +18,14 @@ Includes:
 from __future__ import annotations
 
 import heapq
+import math
+import random
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from dataclasses import astuple, dataclass
 from typing import TYPE_CHECKING, Dict, List, Tuple
+
+from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.distributed.communicator import Distributed
@@ -79,7 +83,11 @@ class ADPRouter(ABC):
 
     @classmethod
     def create(
-        cls, dist: "Distributed", kv_cache_manager=None, attention_dp_config=None
+        cls,
+        dist: "Distributed",
+        kv_cache_manager=None,
+        attention_dp_config=None,
+        async_transfer_manager=None,
     ) -> "ADPRouter":
         """Factory method to create the appropriate ADP router.
 
@@ -87,6 +95,9 @@ class ADPRouter(ABC):
             dist: Distributed communicator.
             kv_cache_manager: KV cache manager instance (may be None).
             attention_dp_config: AttentionDpConfig instance (may be None).
+            async_transfer_manager: PyExecutor's AsyncTransferManager, used by
+                KVCacheAwareADPRouter to account for KV-transfer-in-progress
+                requests in per-rank load.  Ignored by DefaultADPRouter.
 
         Returns:
             A KVCacheAwareADPRouter if config requests it and the
@@ -103,6 +114,9 @@ class ADPRouter(ABC):
                 dist=dist,
                 kv_cache_manager=kv_cache_manager,
                 load_balance_weight=attention_dp_config.kv_cache_routing_load_balance_weight,
+                match_rate_threshold=attention_dp_config.kv_cache_routing_match_rate_threshold,
+                fair_share_multiplier=attention_dp_config.kv_cache_routing_fair_share_multiplier,
+                async_transfer_manager=async_transfer_manager,
             )
 
         return DefaultADPRouter(dist=dist)
@@ -343,24 +357,51 @@ class KVCacheAwareADPRouter(ADPRouter):
 
     needs_prefix_matches: bool = True
 
-    def __init__(self, dist: "Distributed", kv_cache_manager, load_balance_weight: float = 1.0):
+    def __init__(
+        self,
+        dist: "Distributed",
+        kv_cache_manager,
+        load_balance_weight: float = 1.0,
+        match_rate_threshold: float = 0.1,
+        fair_share_multiplier: float = 2.0,
+        async_transfer_manager=None,
+    ):
         super().__init__(dist)
         self.kv_cache_manager = kv_cache_manager
         self.load_balance_weight = load_balance_weight
+        self.match_rate_threshold = match_rate_threshold
+        self.fair_share_multiplier = fair_share_multiplier
         self._all_ranks_prefix_matches: List[Dict[int, int]] = []
+        # Requests still sending KV to GEN are invisible in active_requests;
+        # fold them back in via the transfer manager (see create_rank_state).
+        self.async_transfer_manager = async_transfer_manager
 
     def create_rank_state(
         self,
         active_requests: list[LlmRequest],
         new_requests: list[RequestQueueItem],
     ) -> RankState:
-        if self.dist.has_cp_helix:
-            num_active_tokens = sum(req.total_input_len_cp for req in active_requests)
-        else:
-            num_active_tokens = sum(req.py_orig_prompt_len for req in active_requests)
+        # Remaining-to-compute tokens for a live request (net of KV cache
+        # hits), matching the (req_tokens - match_len) scale used by
+        # route_requests scoring.
+        def _active_tokens(req) -> int:
+            if self.dist.has_cp_helix:
+                return max(req.total_input_len_cp - req.cached_tokens, 0)
+            return max(req.py_orig_prompt_len - req.cached_tokens, 0)
+
+        num_active_tokens = sum(_active_tokens(req) for req in active_requests)
+        n_active_for_state = len(active_requests)
+
+        # Fold in requests mid KV-transfer to GEN; they are removed from
+        # active_requests but still counted as per-rank load.
+        if self.async_transfer_manager is not None:
+            in_transfer = self.async_transfer_manager.requests_in_transfer()
+            num_active_tokens += sum(_active_tokens(r) for r in in_transfer.values())
+            n_active_for_state += len(in_transfer)
+
         return RankState(
             rank=self.dist.tp_rank,
-            num_active_requests=len(active_requests),
+            num_active_requests=n_active_for_state,
             num_active_tokens=num_active_tokens,
         )
 
@@ -430,6 +471,16 @@ class KVCacheAwareADPRouter(ADPRouter):
             return ()
         return tuple(token_ids[:num_tokens])
 
+    @staticmethod
+    def _req_tokens(req_item) -> int:
+        if req_item.request is None:
+            return 0
+        return len(getattr(req_item.request, "input_token_ids", []))
+
+    def _match_len(self, rank: int, req_id: int) -> int:
+        matches = self._all_ranks_prefix_matches
+        return matches[rank].get(req_id, 0) if rank < len(matches) else 0
+
     def route_requests(
         self,
         all_rank_states: list[RankState],
@@ -462,82 +513,108 @@ class KVCacheAwareADPRouter(ADPRouter):
                     and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
                 ):
                     all_ranks_num_active_requests[target_dp_rank] += 1
+                    # Keep token tally in sync with the soft-balancing phase.
+                    effective = max(
+                        self._req_tokens(req_item) - self._match_len(target_dp_rank, req_item.id),
+                        0,
+                    )
+                    all_ranks_num_active_tokens[target_dp_rank] += effective
                     scheduled = True
                     all_ranks_new_requests[target_dp_rank].append(req_item)
 
             if not scheduled:
                 remaining_unscheduled.append(req_item)
 
-        num_new_requests_all_ranks = len(remaining_unscheduled)
-        total_num_active_requests = sum(all_ranks_num_active_requests)
-        expected_num_active_requests = max(
-            (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1) // tp_size,
-            max(all_ranks_num_active_requests),
-        )
-
-        # --- Prefix-affinity sorting ---
-        # Sort by prefix fingerprint first (group related requests together),
-        # then by ISL descending within each group.  This ensures that when
-        # request A (conv X, turn 5) is routed to rank R, request B (conv X,
-        # turn 3) is processed next and the load tracker still favours rank R.
+        # Group requests by prefix fingerprint so related turns of the same
+        # conversation see each other's load-tracker updates; longer ISL
+        # first within a group.
         def _sort_key(req_item):
             tokens = getattr(req_item.request, "input_token_ids", []) if req_item.request else []
-            fp = self._prefix_fingerprint(tokens)
-            # Negate length so longer requests come first within each group
-            return (fp, -len(tokens))
+            return (self._prefix_fingerprint(tokens), -len(tokens))
 
         remaining_unscheduled = sorted(remaining_unscheduled, key=_sort_key)
 
+        # Loose cap at fair_share_multiplier * ceil(total / tp_size): safety
+        # net against runaway concentration, still loose enough that cache
+        # affinity wins in the common case.
+        num_new_requests_all_ranks = len(remaining_unscheduled)
+        total_num_active_requests = sum(all_ranks_num_active_requests)
+        fair_share = (
+            total_num_active_requests + num_new_requests_all_ranks + tp_size - 1
+        ) // tp_size
+        expected_num_active_requests = max(
+            math.ceil(self.fair_share_multiplier * fair_share),
+            max(all_ranks_num_active_requests),
+        )
         eligible_ranks = [
             rank
             for rank in range(tp_size)
             if all_ranks_num_active_requests[rank] < expected_num_active_requests
         ]
 
-        prefix_matches = self._all_ranks_prefix_matches
-
         for req_item in remaining_unscheduled:
             if not eligible_ranks:
                 break
 
-            req_tokens = (
-                len(getattr(req_item.request, "input_token_ids", [])) if req_item.request else 0
-            )
+            req_tokens = self._req_tokens(req_item)
             req_id = req_item.id
 
-            best_rank = eligible_ranks[0]
+            # Shuffle eligible ranks per decision so score ties fall to a
+            # uniform random pick instead of "lowest index wins" (which
+            # starves high-index ranks during cold start).  Seed with
+            # req_id so every TP rank produces the same permutation --
+            # route_requests runs locally on every rank with no broadcast,
+            # so divergence would deadlock the distributed protocol.
+            iter_ranks = list(eligible_ranks)
+            random.Random(req_id).shuffle(iter_ranks)
+            best_rank = iter_ranks[0]
             best_score = float("inf")
 
-            # --- Normalize load term ---
-            # Normalize each rank's active_tokens by the total load across all
-            # eligible ranks (floored to req_tokens to avoid dividing by ~0).
-            # This makes the load term scale-invariant: a rank carrying 2x the
-            # average load gets a normalized penalty of ~req_tokens regardless
-            # of whether total load is 100 tokens or 100 000 tokens.
-            # Using load_range (max-min) instead caused the penalty to blow up
-            # when all ranks were near-idle (small range, large relative fraction).
+            # Normalize per-rank active_tokens by the total load across
+            # eligible ranks (floored to req_tokens to avoid ~0 division),
+            # so the load penalty is scale-invariant.
             total_load = sum(all_ranks_num_active_tokens[r] for r in eligible_ranks)
             load_denom = max(total_load, float(req_tokens))
 
-            for rank in eligible_ranks:
-                match_len = prefix_matches[rank].get(req_id, 0) if rank < len(prefix_matches) else 0
+            # Per-rank prefix match lengths, reused by gate + scoring +
+            # post-decision bookkeeping.
+            match_lens = {r: self._match_len(r, req_id) for r in eligible_ranks}
+
+            # Cache-affinity gate: below the threshold, zero out match_len
+            # so routing is driven purely by load.
+            max_match_for_req = max(match_lens.values(), default=0)
+            cache_affinity_active = (
+                max_match_for_req / max(req_tokens, 1)
+            ) > self.match_rate_threshold
+
+            for rank in iter_ranks:
+                match_len = match_lens[rank] if cache_affinity_active else 0
                 score = self._score_rank(
                     req_tokens, match_len, all_ranks_num_active_tokens[rank], load_denom
                 )
-                if score < best_score:
+                # Tie-break on active_tokens to spread traffic when scores
+                # collide; cache-affinity wins are unaffected (lower score).
+                if (score, all_ranks_num_active_tokens[rank]) < (
+                    best_score,
+                    all_ranks_num_active_tokens[best_rank],
+                ):
                     best_score = score
                     best_rank = rank
 
             all_ranks_new_requests[best_rank].append(req_item)
             all_ranks_num_active_requests[best_rank] += 1
 
-            match_len = (
-                prefix_matches[best_rank].get(req_id, 0) if best_rank < len(prefix_matches) else 0
-            )
-            effective_added = req_tokens - match_len
+            effective_added = max(req_tokens - match_lens[best_rank], 0)
             all_ranks_num_active_tokens[best_rank] += effective_added
 
+            # Progressive eviction: rank leaves eligibility once it hits
+            # the cap for the rest of this batch.
             if all_ranks_num_active_requests[best_rank] >= expected_num_active_requests:
                 eligible_ranks.remove(best_rank)
+
+        logger.debug(
+            f"[adp_router] new_reqs_per_rank="
+            f"{[len(all_ranks_new_requests[r]) for r in range(tp_size)]}"
+        )
 
         return all_ranks_new_requests, expected_num_active_requests

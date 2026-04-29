@@ -1374,7 +1374,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         STATUS=\$(sacct -j \$jobId --format=State -Pn --allocations)
 
                         if [[ -z \$STATUS || \$STATUS == "RUNNING" || \$STATUS == "PENDING" || \$STATUS == "CONFIGURING" ]]; then
-                            echo "Slurm job \$jobId is still running"
+                            echo "Slurm job \$jobId state: \${STATUS:-UNKNOWN}"
                             sleep 300
                         else
                             echo "Slurm job \$jobId finished with state: \$STATUS"
