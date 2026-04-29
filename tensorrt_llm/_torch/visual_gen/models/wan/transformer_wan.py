@@ -128,6 +128,7 @@ class WanImageEmbedding(nn.Module):
             force_dynamic_quantization=model_config.force_dynamic_quantization
             if model_config
             else False,
+            reduce_output=False,
         )
         self.ff_out = Linear(
             in_features,
@@ -142,6 +143,7 @@ class WanImageEmbedding(nn.Module):
             force_dynamic_quantization=model_config.force_dynamic_quantization
             if model_config
             else False,
+            reduce_output=False,
         )
 
         self.norm2 = LayerNorm(
@@ -200,6 +202,7 @@ class WanTimeTextImageEmbedding(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            reduce_output=False,
         )
         self.text_embedder = PixArtAlphaTextProjection(text_embed_dim, dim, act_fn="gelu_tanh")
 
@@ -329,7 +332,7 @@ class WanBlock(nn.Module):
             dtype=dtype,
             config=model_config,
             layer_idx=_layer_idx,
-            reduce_output=False,
+            reduce_output=(model_config.mapping.tp_size != 1),
         )
 
         # I2V: Additional K/V projections for image embeddings
@@ -344,6 +347,7 @@ class WanBlock(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=skip_create_weights,
                 force_dynamic_quantization=force_dynamic_quant,
+                reduce_output=False,
             )
             self.add_v_proj = Linear(
                 added_kv_proj_dim,
@@ -353,6 +357,7 @@ class WanBlock(nn.Module):
                 quant_config=quant_config,
                 skip_create_weights_in_init=skip_create_weights,
                 force_dynamic_quantization=force_dynamic_quant,
+                reduce_output=False,
             )
             self.norm_added_k = RMSNorm(
                 hidden_size=hidden_size, eps=eps, dtype=dtype, has_weights=True
@@ -468,7 +473,7 @@ class WanTransformer3DModel(nn.Module):
 
         vgm = model_config.visual_gen_mapping
         if vgm is not None and vgm.tp_size > 1:
-            raise ValueError(f"WAN does not support tensor parallelism. Got tp_size={vgm.tp_size}")
+            logger.info(f"WAN tensor parallelism is a WIP. Got tp_size={vgm.tp_size}")
 
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 12)
         attn2d_row_size = vgm.attn2d_row_size if vgm else 1
@@ -596,6 +601,7 @@ class WanTransformer3DModel(nn.Module):
             quant_config=quant_config,
             skip_create_weights_in_init=skip_create_weights,
             force_dynamic_quantization=force_dynamic_quant,
+            reduce_output=False,
         )
         # Use torch.empty().normal_(std=...) instead of torch.randn()/scale for MetaInitMode compatibility
         self.scale_shift_table = nn.Parameter(

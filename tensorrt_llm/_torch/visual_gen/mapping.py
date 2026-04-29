@@ -150,11 +150,13 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         if cls.device_mesh is not None:
             return
 
-        shape = tuple(self._dim_sizes[d] for d in self._dim_names)
+        dims = ("pp",) + (self._dim_names) + ("cp",)
+        shape = (1,) + tuple(self._dim_sizes[d] for d in self._dim_names) + (1,)
+
         cls.device_mesh = init_device_mesh(
             "cuda",
             mesh_shape=shape,
-            mesh_dim_names=self._dim_names,
+            mesh_dim_names=dims,
         )
         logger.debug(
             f"VisualGenMapping.build_mesh: dims={self._dim_names}, "
