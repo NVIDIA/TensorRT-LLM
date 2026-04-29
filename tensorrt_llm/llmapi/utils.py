@@ -172,7 +172,7 @@ def get_gpu_arch(device: int = 0) -> int:
 
 
 class ContextManager:
-    ''' A helper to create a context manager for a resource. '''
+    """A helper to create a context manager for a resource."""
 
     def __init__(self, resource):
         self.resource = resource
@@ -277,7 +277,7 @@ def download_hf_pretrained_config(model: str,
 
 
 def append_docstring(docstring: str):
-    ''' A decorator to append a docstring to a function. '''
+    """A decorator to append a docstring to a function."""
 
     def decorator(fn):
         fn.__doc__ = (fn.__doc__ or '') + docstring
@@ -287,7 +287,7 @@ def append_docstring(docstring: str):
 
 
 def set_docstring(docstring: str):
-    ''' A decorator to set a docstring to a function. '''
+    """A decorator to set a docstring to a function."""
 
     def decorator(fn):
         fn.__doc__ = docstring
@@ -365,7 +365,7 @@ _enable_llm_debug_ = None
 
 
 def enable_llm_debug() -> bool:
-    ''' Tell whether to enable the debug mode for LLM class.  '''
+    """Tell whether to enable the debug mode for LLM class."""
     global _enable_llm_debug_
     if _enable_llm_debug_ is None:
         _enable_llm_debug_ = os.environ.get("TLLM_LLM_ENABLE_DEBUG", "0") == "1"
@@ -384,8 +384,9 @@ def enable_llmapi_debug() -> bool:
 
 
 def enable_worker_single_process_for_tp1() -> bool:
-    ''' Tell whether to make worker use single process for TP1.
-    This is helpful for return-logits performance and debugging. '''
+    """Tell whether to make worker use single process for TP1.
+    This is helpful for return-logits performance and debugging.
+    """
     return os.environ.get("TLLM_WORKER_USE_SINGLE_PROCESS", "0") == "1"
 
 
@@ -547,7 +548,7 @@ class _SyncQueue:
 
 
 def get_numa_aware_cpu_affinity(device_id):
-    '''Query NVML for NUMA-aware CPU affinity for the specified CUDA device.
+    """Query NVML for NUMA-aware CPU affinity for the specified CUDA device.
 
     Args:
         device_id: The CUDA device ID to query for optimal CPU affinity.
@@ -557,7 +558,7 @@ def get_numa_aware_cpu_affinity(device_id):
 
     Raises:
         pynvml.NVMLError: If NVML operations fail or device_id is invalid.
-    '''
+    """
     cpu_count = psutil.cpu_count()
 
     # If this is not a NUMA system, or we hit an exception, default to
@@ -597,6 +598,56 @@ def get_numa_aware_cpu_affinity(device_id):
             pass  # Ignore shutdown errors
 
     return cpu_affinity
+
+
+def configure_cpu_affinity(device_id: int) -> None:
+    """Probe and configure the CPU affinity of the calling process based on NUMA topology.
+
+    Args:
+        device_id: The CUDA device ID to determine optimal CPU affinity.
+
+    Note:
+        If the process already has constrained affinity, a warning is logged.
+        Configuration is handled as follows:
+            TLLM_NUMA_AWARE_WORKER_AFFINITY = <unset>
+                -> Affinity is automatically configured if it is unconstrained,
+                   and deleted if it is constrained externally by the user.
+            TLLM_NUMA_AWARE_WORKER_AFFINITY = 1
+                -> Affinity is unconditionally auto-configured.
+            TLLM_NUMA_AWARE_WORKER_AFFINITY = 0 or any other value
+                -> Affinity is unconditionally _not_ auto-configured.
+    """
+    pid = os.getpid()
+    process = psutil.Process(pid)
+    cpu_affinity = process.cpu_affinity()
+
+    all_cpus = list(range(psutil.cpu_count()))
+
+    constrained_affinity = (cpu_affinity != all_cpus)
+    numa_aware_affinity = os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY")
+
+    # If affinity is constrained but the user hasn't explicitly
+    # requested NUMA-aware affinity, remove the constraints.
+    if constrained_affinity:
+        logger.warning(
+            f"Worker process {pid} is affined to run on the following CPUs: "
+            f"{cpu_affinity} (subset of all logical CPUs). This may harm "
+            f"performance if set incorrectly.")
+        if numa_aware_affinity is None:
+            logger.warning(f"Worker process {pid} has constrained CPU affinity "
+                           f"but `TLLM_NUMA_AWARE_WORKER_AFFINITY` is not set. "
+                           f"Removing CPU affinity constraints.")
+            process.cpu_affinity(all_cpus)
+
+    # If affinity is unconstrained and the user hasn't explicitly
+    # prohibited it or the user has explicitly requested it, choose the
+    # optimal affinity based upon the NUMA topology
+    if ((numa_aware_affinity is None and not constrained_affinity)
+            or (numa_aware_affinity == "1")):
+        process.cpu_affinity(get_numa_aware_cpu_affinity(device_id))
+        logger.info(
+            f"Worker process {pid} CPU affinity set to "
+            f"{process.cpu_affinity()} for optimal NUMA-aware scheduling.")
 
 
 def generate_api_docs_as_docstring(model: Type[BaseModel],
@@ -703,9 +754,10 @@ LABEL_STABLE_APIS: bool = True
 
 
 class ApiParamTagger:
-    ''' A helper to tag the api doc according to the status of the fields.
+    """A helper to tag the api doc according to the status of the fields.
+
     The status is set in the json_schema_extra of the field.
-    '''
+    """
 
     def __call__(self, cls: Type[BaseModel]) -> None:
         """ The main entry point to tag the api doc. """
@@ -749,7 +801,7 @@ def tag_llm_params():
 
 
 class ApiStatusRegistry:
-    ''' A registry to store the status of the api.
+    """A registry to store the status of the api.
 
     usage:
 
@@ -761,7 +813,7 @@ class ApiStatusRegistry:
         @ApiStatusRegistry.set_api_status("beta")
         def my_method(self, *args, **kwargs):
             pass
-    '''
+    """
     method_to_status = {}
 
     @classmethod
