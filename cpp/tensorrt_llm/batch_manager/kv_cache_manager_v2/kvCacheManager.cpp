@@ -33,6 +33,14 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
+static double nowSeconds()
+{
+    return static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+                                   .count())
+        / 1e6;
+}
+
 // ---------------------------------------------------------------------------
 // PageIndexConverter
 // ---------------------------------------------------------------------------
@@ -74,10 +82,7 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config)
     mTargetRatioListGpu = _currentGpuRatio();
     mTargetRatioListOther = _currentOtherRatios();
 
-    mLastAdjustmentTime = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
-                              std::chrono::steady_clock::now().time_since_epoch())
-                                                  .count())
-        / 1e6;
+    mLastAdjustmentTime = nowSeconds();
 }
 
 KvCacheManager::~KvCacheManager()
@@ -408,9 +413,14 @@ std::vector<float> KvCacheManager::_currentOtherRatios() const
 
 // ---- needAdjustment / adjust -----------------------------------------------
 
+std::vector<float> const& KvCacheManager::_getTargetRatioList(CacheLevel level) const
+{
+    return (level == kGpuLevel) ? mTargetRatioListGpu : mTargetRatioListOther;
+}
+
 bool KvCacheManager::_needAdjustment(CacheLevel level) const
 {
-    auto const& target = (level == kGpuLevel) ? mTargetRatioListGpu : mTargetRatioListOther;
+    auto const& target = _getTargetRatioList(level);
     auto current = (level == kGpuLevel) ? _currentGpuRatio() : _currentOtherRatios();
     constexpr float kThreshold = 1.25f;
     for (size_t i = 0; i < target.size() && i < current.size(); ++i)
@@ -428,10 +438,7 @@ bool KvCacheManager::needAdjustment() const
 {
     if (mNumClosedKvCaches < 2000)
         return false;
-    double now = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
-                     std::chrono::steady_clock::now().time_since_epoch())
-                                         .count())
-        / 1e6;
+    double now = nowSeconds();
     if (now - mLastAdjustmentTime < 120.0)
         return false;
     CacheLevel lastLevel = static_cast<CacheLevel>(mStorage->numCacheLevels() - 1);
@@ -450,10 +457,7 @@ void KvCacheManager::adjust()
         if (_needAdjustment(level))
             _adjustLevel(level, getQuota(level));
     }
-    mLastAdjustmentTime = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(
-                              std::chrono::steady_clock::now().time_since_epoch())
-                                                  .count())
-        / 1e6;
+    mLastAdjustmentTime = nowSeconds();
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

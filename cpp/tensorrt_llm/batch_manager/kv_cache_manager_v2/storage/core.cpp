@@ -648,18 +648,13 @@ std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(
 // Mirrors Python CacheLevelStorage._grains_to_slots.
 // ---------------------------------------------------------------------------
 
-static int divUpLocal(int a, int b)
-{
-    return (a + b - 1) / b;
-}
-
 std::pair<int, int64_t> CacheLevelStorage::grainsToSlots(
     int64_t pgGrains, std::vector<int> const& slotSizeList, int granularity)
 {
     int numPools = static_cast<int>(slotSizeList.size());
     std::vector<int64_t> minPoolGrains(static_cast<size_t>(numPools));
     for (int p = 0; p < numPools; ++p)
-        minPoolGrains[p] = divUpLocal(slotSizeList[p], granularity);
+        minPoolGrains[p] = divUp(slotSizeList[p], granularity);
 
     int64_t minTotal = 0;
     for (auto g : minPoolGrains)
@@ -703,7 +698,7 @@ int64_t CacheLevelStorage::grainsForSlots(int numSlots, std::vector<int> const& 
 {
     int64_t total = 0;
     for (auto s : slotSizeList)
-        total += divUpLocal(numSlots * s, granularity);
+        total += divUp(numSlots * s, granularity);
     return total;
 }
 

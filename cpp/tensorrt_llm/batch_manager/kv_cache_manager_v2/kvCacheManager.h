@@ -205,6 +205,7 @@ public:
 private:
     void _adjustLevel(CacheLevel level, size_t quota);
     bool _needAdjustment(CacheLevel level) const;
+    std::vector<float> const& _getTargetRatioList(CacheLevel level) const;
     std::vector<std::vector<std::shared_ptr<Page>>> _gatherPersistentPages() const;
 
     // Current per-pool-group GPU utilization ratios.
