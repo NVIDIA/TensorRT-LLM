@@ -1411,7 +1411,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         STATUS=\$(sacct -j \$jobId --format=State -Pn --allocations)
 
                         if [[ -z \$STATUS || \$STATUS == "RUNNING" || \$STATUS == "PENDING" || \$STATUS == "CONFIGURING" ]]; then
-                            echo "Slurm job \$jobId is still running"
+                            echo "Slurm job \$jobId state: \${STATUS:-UNKNOWN}"
                             sleep 300
                         else
                             echo "Slurm job \$jobId finished with state: \$STATUS"
@@ -3471,19 +3471,11 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 2],
         "A10-PyTorch-2": ["a10", "l0_a10", 2, 2],
-        "A10-CPP-1": ["a10", "l0_a10", 1, 1],
-        "A10-TensorRT-1": ["a10", "l0_a10", 1, 5],
-        "A10-TensorRT-2": ["a10", "l0_a10", 2, 5],
-        "A10-TensorRT-3": ["a10", "l0_a10", 3, 5],
-        "A10-TensorRT-4": ["a10", "l0_a10", 4, 5],
-        "A10-TensorRT-5": ["a10", "l0_a10", 5, 5],
-        "A30-Triton-1": ["a30", "l0_a30", 1, 1],
+        "A10-TensorRT-1": ["a10", "l0_a10", 1, 1],
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
+        "A10-CPP-1": ["a10", "l0_a10", 1, 1],
         "A30-AutoDeploy-1": ["a30", "l0_a30", 1, 1],
-        "A30-CPP-1": ["a30", "l0_a30", 1, 3],
-        "A30-CPP-2": ["a30", "l0_a30", 2, 3],
-        "A30-CPP-3": ["a30", "l0_a30", 3, 3],
         "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
         "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 2],
         "L40S-PyTorch-2": ["l40s", "l0_l40s", 2, 2],
@@ -3497,8 +3489,9 @@ def launchTestJobs(pipeline, testFilter)
         // Currently post-merge test stages only run tests with "stage: post_merge" mako
         // in the test-db. This behavior may change in the future.
         "A10-PyTorch-Post-Merge-1": ["a10", "l0_a10", 1, 1],
-        // "A10-TensorRT-Post-Merge-1": ["a10", "l0_a10", 1, 2],
-        // "A10-TensorRT-Post-Merge-2": ["a10", "l0_a10", 2, 2],
+        "A10-TensorRT-Post-Merge-1": ["a10", "l0_a10", 1, 3],
+        "A10-TensorRT-Post-Merge-2": ["a10", "l0_a10", 2, 3],
+        "A10-TensorRT-Post-Merge-3": ["a10", "l0_a10", 3, 3],
         "A10-FMHA-Post-Merge-1": ["a10", "l0_a10", 1, 1],
         // "A30-TensorRT-Post-Merge-1": ["a30", "l0_a30", 1, 6],
         // "A30-TensorRT-Post-Merge-2": ["a30", "l0_a30", 2, 6],
@@ -3506,7 +3499,8 @@ def launchTestJobs(pipeline, testFilter)
         // "A30-TensorRT-Post-Merge-4": ["a30", "l0_a30", 4, 6],
         // "A30-TensorRT-Post-Merge-5": ["a30", "l0_a30", 5, 6],
         // "A30-TensorRT-Post-Merge-6": ["a30", "l0_a30", 6, 6],
-        "A30-CPP-Post-Merge-1": ["a30", "l0_a30", 1, 1],
+        "A30-CPP-Post-Merge-1": ["a30", "l0_a30", 1, 2],
+        "A30-CPP-Post-Merge-2": ["a30", "l0_a30", 2, 2],
         "A30-Triton-Post-Merge-1": ["a30", "l0_a30", 1, 2],
         "A30-Triton-Post-Merge-2": ["a30", "l0_a30", 2, 2],
         // "A100X-TensorRT-Post-Merge-1": ["a100x", "l0_a100", 1, 6],

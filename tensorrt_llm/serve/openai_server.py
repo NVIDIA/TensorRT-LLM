@@ -516,6 +516,12 @@ class OpenAIServer:
 
         return True if self.generator.args.num_postprocess_workers > 0 else False
 
+    @property
+    def _vocab_size(self) -> Optional[int]:
+        if self.tokenizer is not None and self.tokenizer.tokenizer is not None:
+            return self.tokenizer.tokenizer.vocab_size
+        return None
+
     @staticmethod
     def create_error_response(
             message: str,
@@ -1060,7 +1066,7 @@ class OpenAIServer:
             # Pass the tokenizer vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
             sampling_params = request.to_sampling_params(
-                vocab_size=self.tokenizer.tokenizer.vocab_size,
+                vocab_size=self._vocab_size,
                 gather_generation_logits=self.generator.args.
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
@@ -1394,7 +1400,7 @@ class OpenAIServer:
             # Pass the tokenizer vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
             sampling_params = request.to_sampling_params(
-                vocab_size=self.tokenizer.tokenizer.vocab_size,
+                vocab_size=self._vocab_size,
                 gather_generation_logits=self.generator.args.
                 gather_generation_logits,
                 backend=self.generator.args.backend)
@@ -1529,8 +1535,7 @@ class OpenAIServer:
                 request.stop_token_ids = harmony_stop_tokens
 
             sampling_params = request.to_sampling_params(
-                vocab_size=self.tokenizer.tokenizer.vocab_size,
-                reasoning_parser="gpt_oss")
+                vocab_size=self._vocab_size, reasoning_parser="gpt_oss")
             sampling_params.detokenize = False  # Harmony adapter handles detokenization
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
