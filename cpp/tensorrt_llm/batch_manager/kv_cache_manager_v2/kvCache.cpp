@@ -1304,18 +1304,13 @@ void KvCache::_resizePageIndexBuffers(int newNumBlocks)
             }
             else
             {
+                // Span<int>: caller-provided buffer must be large enough,
+                // and tail beyond active blocks must already be BAD
+                // (lock destructors set indices via updateBasePageIndex).
                 auto& ext = std::get<Span<int>>(buf);
-                if (newNumBlocks > ext.len)
-                {
-                    // Growing: caller-provided buffer must already be large enough.
-                    assert(ext.len >= newNumBlocks);
-                }
-                else
-                {
-                    // Shrinking: fill the tail with BAD_PAGE_INDEX (mirrors Python memoryview path).
-                    for (int i = newNumBlocks; i < ext.len; ++i)
-                        ext[i] = kBadPageIndex;
-                }
+                assert(ext.len >= newNumBlocks);
+                for (int i = newNumBlocks; i < ext.len; ++i)
+                    assert(ext[i] == kBadPageIndex);
             }
         }
     }
