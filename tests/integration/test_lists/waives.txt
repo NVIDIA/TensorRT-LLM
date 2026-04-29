@@ -434,3 +434,4 @@ test_e2e.py::test_multi_nodes_eval[Qwen3/Qwen3-235B-A22B-tp16-mmlu] SKIP (https:
 accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[tp1-cutlass] SKIP (https://nvbugs/6116088)
 test_e2e.py::test_openai_disagg_multi_nodes_completion_service_discovery[http] SKIP (https://nvbugs/6115562)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_scheduler[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-enable_chunked_prefill=False] SKIP (https://nvbugs/5981122)
+unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1] SKIP (https://nvbugs/6127669)
