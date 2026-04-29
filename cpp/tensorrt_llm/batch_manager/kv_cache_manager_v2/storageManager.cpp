@@ -106,6 +106,18 @@ std::vector<std::vector<int>> computeSlotToPageIndices(StorageConfig const& conf
 // StorageManager
 // ---------------------------------------------------------------------------
 
+// Normalize a vector of values to a ratio vector summing to 1.0.
+template <typename T>
+static std::vector<float> normalizeToRatio(std::vector<T> const& values)
+{
+    auto total = std::accumulate(values.begin(), values.end(), static_cast<T>(0));
+    assert(total > 0);
+    std::vector<float> ratio(values.size());
+    for (size_t i = 0; i < values.size(); ++i)
+        ratio[i] = static_cast<float>(values[i]) / static_cast<float>(total);
+    return ratio;
+}
+
 StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfig const& config, int tokensPerBlock,
     std::optional<BatchDesc> const& typicalBatch, std::vector<BatchDesc> const& constraints)
     : mLifeCycles(lifeCycles)
@@ -151,12 +163,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     {
         // Use the constraint slot counts as the ratio basis.
         auto minBytes = slotsToBytes(mMinSlots, gpuGranularity);
-        float total = 0.f;
-        for (auto b : minBytes)
-            total += static_cast<float>(b);
-        initRatio.resize(static_cast<size_t>(numPoolGroups()));
-        for (int i = 0; i < numPoolGroups(); ++i)
-            initRatio[i] = static_cast<float>(minBytes[i]) / total;
+        initRatio = normalizeToRatio(minBytes);
     }
     else
     {
@@ -806,7 +813,7 @@ std::vector<float> StorageManager::getRatioList(CacheLevel level) const
 std::vector<float> StorageManager::ratioFromLength(int tokensPerBlock, int historyLength, int capacity) const
 {
     int numBlocks = divUp(capacity, tokensPerBlock);
-    std::vector<float> numBytes(static_cast<size_t>(numPoolGroups()), 0.f);
+    std::vector<size_t> numBytes(static_cast<size_t>(numPoolGroups()), 0);
     auto ssmLcId = mLifeCycles.ssmLifeCycleId();
     auto const& lifecycles = mLifeCycles.getAll();
     for (int lcIdx = 0; lcIdx < numLifeCycles(); ++lcIdx)
@@ -826,15 +833,10 @@ std::vector<float> StorageManager::ratioFromLength(int tokensPerBlock, int histo
             auto stale = getStaleRange(lifecycles[lcIdx], historyLength, tokensPerBlock);
             numRequiredBlocks = numBlocks - stale.length();
         }
-        numBytes[static_cast<size_t>(pgIdx)] += static_cast<float>(numRequiredBlocks) * slotSizeSum;
+        numBytes[static_cast<size_t>(pgIdx)]
+            += static_cast<size_t>(numRequiredBlocks) * static_cast<size_t>(slotSizeSum);
     }
-    float total = 0.f;
-    for (auto b : numBytes)
-        total += b;
-    assert(total > 0.f);
-    for (auto& b : numBytes)
-        b /= total;
-    return numBytes;
+    return normalizeToRatio(numBytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -845,14 +847,7 @@ std::vector<float> StorageManager::ratioFromBatch(BatchDesc const& batch, int to
 {
     auto numSlots = computeSlotsForBatch(batch, tokensPerBlock);
     auto numBytes = slotsToBytes(numSlots, granularity);
-    float total = 0.f;
-    for (auto b : numBytes)
-        total += static_cast<float>(b);
-    assert(total > 0.f);
-    std::vector<float> ratio(static_cast<size_t>(numPoolGroups()));
-    for (int i = 0; i < numPoolGroups(); ++i)
-        ratio[i] = static_cast<float>(numBytes[i]) / total;
-    return ratio;
+    return normalizeToRatio(numBytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -977,14 +972,7 @@ std::vector<float> StorageManager::constrainRatio(std::vector<float> const& rati
     int granularity = gpuStorage.poolSizeGranularity();
     auto slotCountList = gpuStorage.computeSlotCountList(ratio, mMinSlots);
     auto numBytes = slotsToBytes(slotCountList, granularity);
-    float total = 0.f;
-    for (auto b : numBytes)
-        total += static_cast<float>(b);
-    assert(total > 0.f);
-    std::vector<float> result(static_cast<size_t>(numPoolGroups()));
-    for (int i = 0; i < numPoolGroups(); ++i)
-        result[i] = static_cast<float>(numBytes[i]) / total;
-    return result;
+    return normalizeToRatio(numBytes);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
