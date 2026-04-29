@@ -1,3 +1,5 @@
+COMMA := ,
+
 # Default base image for the docker build as defined in Dockerfile.multi
 BASE_IMAGE         ?= $(shell grep '^ARG BASE_IMAGE=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
 BASE_TAG           ?= $(shell grep '^ARG BASE_TAG=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
@@ -108,6 +110,7 @@ base_pull:
 		$(if $(SH_ENV), --build-arg SH_ENV="$(SH_ENV)") \
 		$(if $(BASH_ENV), --build-arg BASH_ENV="$(BASH_ENV)") \
 		$(if $(STAGE), --target $(STAGE)) \
+		$(if $(GITLAB_TOKEN), --secret id=GITLAB_TOKEN$(COMMA)env=GITLAB_TOKEN) \
 		--file Dockerfile.multi \
 		--tag $(IMAGE_WITH_TAG) \
 		..

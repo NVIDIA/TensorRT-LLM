@@ -403,9 +403,6 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     withCredentials([string(credentialsId: 'svc_tensorrt_llm_oss_gitlab_token_secret', variable: 'GITLAB_TOKEN')]) {
         sh "cd ${LLM_ROOT} && python3 scripts/generate_cpp_dependency_json.py --deps-dir cpp/build/_deps --output-dir ./ --token ${GITLAB_TOKEN}"
     }
-    //withCredentials([gitLabApiToken(credentialsId: 'svc_tensorrt_llm_oss_gitlab_token', apiTokenVariable: 'GITLAB_TOKEN')]) {
-        //sh "cd ${LLM_ROOT} && python3 scripts/generate_cpp_dependency_json.py --deps-dir cpp/build/_deps --output-dir ./"
-    //}
     if (is_linux_x86_64) {
         sh "cd ${LLM_ROOT} && python3 scripts/build_cpp_examples.py"
     }

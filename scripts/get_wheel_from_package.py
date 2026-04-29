@@ -99,6 +99,12 @@ def get_wheel_from_package(arch, artifact_path, timeout):
         else:
             print(f"Warning: Benchmark file not found: {src_path}")
 
+    third_party_sources = tmp_dir / "third-party-sources.json"
+    if third_party_sources.exists():
+        shutil.copy2(third_party_sources,
+                     build_dir / "third-party-sources.json")
+        print(f"Copied third-party-sources.json -> {build_dir}")
+
     shutil.rmtree(tmp_dir)
 
     if os.path.exists(tarfile_name):

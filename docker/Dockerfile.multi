@@ -50,7 +50,6 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
          --tensorrt --polygraphy --mpi4py --pytorch --opencv
 
 # Copy the CMake fetched dependencies' source link files
-COPY third-party-sources.json third-party-sources.json
 
 # Install constraints after install.sh so cleanup() doesn't delete the file mid-RUN
 COPY constraints.txt /tmp/constraints.txt
@@ -116,8 +115,14 @@ ENV CCACHE_DIR=/root/.cache/ccache
 ARG GITHUB_MIRROR=""
 ARG BUILD_WHEEL_ARGS="--clean --benchmarks"
 ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
+ARG PREPARE_WHEEL_FROM_BUILD_STAGE=""
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACHE_DIR} \
-    GITHUB_MIRROR=$GITHUB_MIRROR python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
+    --mount=type=secret,id=GITLAB_TOKEN \
+    GITHUB_MIRROR=$GITHUB_MIRROR python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS} && \
+    if [ "${PREPARE_WHEEL_FROM_BUILD_STAGE}" != "true" ]; then \
+        GITLAB_TOKEN=$(cat /run/secrets/GITLAB_TOKEN 2>/dev/null) \
+        python3 scripts/generate_cpp_dependency_json.py --deps-dir cpp/build/_deps --output-dir ./; \
+    fi
 
 FROM ${DEVEL_IMAGE} AS release
 
@@ -127,6 +132,7 @@ RUN --mount=type=cache,target=/root/.cache/pip --mount=type=bind,from=wheel,sour
 
 COPY README.md ./
 COPY --from=wheel /src/tensorrt_llm/build/tensorrt_llm*.whl ./
+COPY --from=wheel /src/tensorrt_llm/third-party-sources.json ./
 COPY docs docs
 COPY cpp/include include
 
