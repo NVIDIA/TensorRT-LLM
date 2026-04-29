@@ -315,8 +315,10 @@ def _range_in(val_str: str | None, gte, lte) -> bool:
 # Matches a single entry like:
 #   "A10-PyTorch-1": ["a10", "l0_a10", 1, 2],
 #   "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+#   "DGX_B200-PyTorch-1": ["auto:dgx-b200-flex", "l0_b200", 1, 3, 1, 1, true],
 # Same shape as scripts/test_to_stage_mapping.py::_STAGE_RE, extended to
-# capture split_id / total_splits / gpu_count.
+# capture split_id / total_splits / gpu_count and tolerate any number of
+# trailing positional args (e.g. SLURM configs append a boolean flag).
 _STAGE_ENTRY_RE = re.compile(
     r'"(?P<stage>[^"]+)"\s*:\s*\['
     r'\s*"(?P<platform>[^"]+)"\s*,'
@@ -324,6 +326,7 @@ _STAGE_ENTRY_RE = re.compile(
     r"(?:\s*,\s*(?P<split_id>\d+))?"
     r"(?:\s*,\s*(?P<total_splits>\d+))?"
     r"(?:\s*,\s*(?P<gpu_count>\d+))?"
+    r"(?:\s*,[^\]]*)?"  # tolerate trailing positional args before `]`
     r"\s*\]"
 )
 
