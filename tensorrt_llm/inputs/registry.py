@@ -277,41 +277,48 @@ class BaseMultimodalInputProcessor(ABC):
     def get_num_tokens_per_image(
         self,
         *,
-        image: Image.Image,
+        image: Union[Image.Image, torch.Tensor],
         **kwargs,
     ):
         """
         Calculate the number of tokens generated for an image.
 
         This (default) method delegates to the Hugging Face processor's '_get_num_multimodal_tokens' method.
-        Returns the token count for the given image.
+        Accepts either a PIL Image or a CHW ``torch.Tensor`` — the hashing path
+        in ``find_mm_token_lengths`` feeds tensors directly to avoid a costly
+        ToPIL round-trip, while existing direct callers may still pass PIL.
 
         Subclasses can override this method to provide custom logic to calculate the number of tokens.
         """
-        image_height = image.height
-        image_width = image.width
-        image_size = (image_height, image_width)
+        if isinstance(image, torch.Tensor):
+            image_size = tuple(image.shape[-2:])
+        else:
+            image_size = (image.height, image.width)
         return self.get_num_multimodal_tokens([image_size],
                                               **kwargs)["num_image_tokens"][0]
 
     def get_num_tokens_per_video(
         self,
         *,
-        video: List[Image.Image],
+        video: List[Union[Image.Image, torch.Tensor]],
         **kwargs,
     ):
         """
         Calculate the number of tokens generated for a video.
 
         This (default) method delegates to the Hugging Face processor's '_get_num_multimodal_tokens' method.
-        Returns the token count for the given video.
+        Accepts a list of PIL Images or CHW ``torch.Tensor`` frames.
 
         Subclasses can override this method to provide custom logic to calculate the number of tokens.
         """
-        video_width = video[0].width
-        video_height = video[0].height
         num_frames = len(video)
-        video_size = (num_frames, video_height, video_width)
+        first_frame = video[0]
+        if isinstance(first_frame, torch.Tensor):
+            frame_h = int(first_frame.shape[-2])
+            frame_w = int(first_frame.shape[-1])
+        else:
+            frame_h, frame_w = first_frame.height, first_frame.width
+        video_size = (num_frames, frame_h, frame_w)
         try:
             num_video_tokens = self.get_num_multimodal_tokens(
                 video_sizes=[video_size], **kwargs)["num_video_tokens"][0]
@@ -892,10 +899,11 @@ def create_input_processor_with_hash(
         modalities = list(set(inputs['multi_modal_data'].keys())
                           ) if 'multi_modal_data' in inputs else []
         if len(modalities) > 0:
-            # TODO: support multimodal hashing for multiple modalities within the same request
-            # TODO: add audio support
-            if len(modalities) == 1 and modalities[0] in ['image', 'video']:
-                # only try multimodal hashing if the inputs only contain image data
+            # TODO: support multimodal hashing for multiple modalities within the same request.
+            if len(modalities) == 1 and modalities[0] in [
+                    'image', 'video', 'audio'
+            ]:
+                # only try multimodal hashing if the inputs only contain a single modality.
                 if input_processor.multimodal_hashing_supported is not None:
                     use_multimodal_hashing = input_processor.multimodal_hashing_supported
                 else:

@@ -36,7 +36,7 @@ server_configs:
         backend: "openai"
         dataset_file: datasets/perf-ci/deepseek_v32-1k1k-20480-ratio-1_for_serve.json
 
-  # 1k1k configs - DEP4 with CUTLASS, MTP1
+  # 1k1k configs - DEP4 with CUTEDSL, MTP1
   - name: "v32_fp4_dep4_mtp1_1k1k"
     model_name: "deepseek_v32_fp4"
     tensor_parallel_size: 4
@@ -51,7 +51,7 @@ server_configs:
       enable_balance: true
       timeout_iters: 60
     moe_config:
-      backend: 'CUTLASS'
+      backend: 'CUTEDSL'
       use_low_precision_moe_combine: true
     cuda_graph_config:
       enable_padding: true
@@ -103,7 +103,7 @@ server_configs:
         backend: "openai"
         dataset_file: datasets/perf-ci/deepseek_v32-8k1k-20480-ratio-1_for_serve.json
 
-  # 8k1k configs - DEP4 with CUTLASS, MTP1
+  # 8k1k configs - DEP4 with CUTEDSL, MTP1
   - name: "v32_fp4_dep4_mtp1_8k1k"
     model_name: "deepseek_v32_fp4"
     tensor_parallel_size: 4
@@ -118,7 +118,7 @@ server_configs:
       enable_balance: true
       timeout_iters: 60
     moe_config:
-      backend: 'CUTLASS'
+      backend: 'CUTEDSL'
       use_low_precision_moe_combine: true
     cuda_graph_config:
       enable_padding: true

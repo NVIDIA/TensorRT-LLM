@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -8,9 +8,7 @@ from ...modules.linear import Linear, WeightMode, WeightsLoadingConfig
 from ...modules.rms_norm import RMSNorm
 from ..attention_backend.interface import AttentionTensorLayout
 from ..attention_backend.utils import create_attention
-
-if TYPE_CHECKING:
-    from ..config import DiffusionModelConfig
+from ..config import DiffusionModelConfig
 
 
 class QKVMode(str, Enum):
@@ -49,7 +47,7 @@ class Attention(nn.Module):
         bias: bool = True,
         interleave: bool = True,
         fuse_qk_norm_rope: Optional[bool] = None,
-        config: Optional["DiffusionModelConfig"] = None,
+        config: Optional[DiffusionModelConfig] = None,
         layer_idx: Optional[int] = None,
     ):
         super().__init__()
@@ -97,6 +95,8 @@ class Attention(nn.Module):
 
         self._init_qkv_proj()
 
+        attention_metadata_state = getattr(config, "attention_metadata_state", None)
+
         if self.qk_norm:
             # "full": norm over all heads combined (e.g. WAN, dim=q_dim)
             # "per_head": norm over each head independently (e.g. FLUX, dim=head_dim)
@@ -143,6 +143,8 @@ class Attention(nn.Module):
             num_kv_heads=backend_num_kv_heads,
             quant_config=self.quant_config,
             dtype=self.dtype,
+            attention_config=config.attention,
+            attention_metadata_state=attention_metadata_state,
         )
 
         # Wrap with parallelism strategies (orthogonal to backend choice)

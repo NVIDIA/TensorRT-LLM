@@ -33,12 +33,11 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import GraphModule, Node
 
-from tensorrt_llm._utils import get_sm_version, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.quantization import QuantMode
 
-from .....llmapi.llm_args import KvCacheConfig
+from ..._compat import KvCacheConfig, get_sm_version, prefer_pinned
 from ...utils.cuda_graph import cuda_graph_state
 from ...utils.logger import ad_logger
 from ...utils.node_utils import extract_op_args
@@ -218,6 +217,7 @@ class _TrtllmPlanner:
 _GlobalTrtllmPlanner = _TrtllmPlanner()
 _TRTLLM_ATTN_FP8_INPUT_SCALE_KEY = "trtllm_attention_input_scale"
 _TRTLLM_ATTN_OUT_SCALE_KEY = "trtllm_attention_out_scale"
+_TRTLLM_ROPE_INFO_KEY = "_trtllm_rope_info"
 
 
 def set_trtllm_attention_fp8_input_scale(attn_node: Node, input_scale: Node) -> None:
@@ -231,6 +231,11 @@ def get_trtllm_attention_fp8_input_scale(attn_node: Node) -> Optional[Node]:
 
 def clear_trtllm_attention_fp8_input_scale(attn_node: Node) -> None:
     attn_node.meta.pop(_TRTLLM_ATTN_FP8_INPUT_SCALE_KEY, None)
+
+
+def get_trtllm_rope_info(attn_node: Node) -> Optional[dict]:
+    """Retrieve RoPE fusion info stored on an attention node, if any."""
+    return attn_node.meta.get(_TRTLLM_ROPE_INFO_KEY)
 
 
 # =============================================================================
@@ -342,6 +347,9 @@ def trtllm_mha_with_cache(
     kv_scale_quant_orig: float = 1.0,
     out_scale: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    rotary_cos_sin: Optional[torch.Tensor] = None,
+    position_embedding_type: int = 0,
+    rotary_embedding_dim: int = 0,
 ) -> torch.Tensor:
     """TRT-LLM attention with paged KV cache for Auto-Deploy.
 
@@ -391,6 +399,7 @@ def trtllm_mha_with_cache(
     q_flat = q.reshape(-1, num_heads * head_dim)[:num_tokens]
     k_flat = k.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
     v_flat = v.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
+
     qkv_fused = torch.cat([q_flat, k_flat, v_flat], dim=-1).contiguous()
 
     # Prepare output: if caller provided an `out` buffer, write directly into it
@@ -450,7 +459,7 @@ def trtllm_mha_with_cache(
         kv_scale_qo,  # kv_scale_quant_orig
         out_scale,  # out_scale
         None,  # rotary_inv_freq
-        None,  # rotary_cos_sin
+        rotary_cos_sin,  # rotary_cos_sin
         None,  # latent_cache (MLA)
         None,  # q_pe (MLA)
         None,  # block_ids_per_seq
@@ -471,8 +480,8 @@ def trtllm_mha_with_cache(
         int(AttentionMaskType.causal),  # mask_type
         quant_mode,  # quant_mode
         scale * math.sqrt(head_dim) if scale is not None else 1.0,  # q_scaling
-        0,  # position_embedding_type
-        0,  # rotary_embedding_dim
+        position_embedding_type,  # position_embedding_type
+        rotary_embedding_dim,  # rotary_embedding_dim
         10000.0,  # rotary_embedding_base
         0,  # rotary_embedding_scale_type
         rotary_embedding_scales,  # rotary_embedding_scales
@@ -498,7 +507,7 @@ def trtllm_mha_with_cache(
         None,  # sparse_attn_indices
         None,  # sparse_attn_offsets
         1,  # sparse_attn_indices_block_size
-        0,  # sparse_mla_topk
+        0,  # num_sparse_topk
         None,  # skip_softmax_threshold_scale_factor_prefill
         None,  # skip_softmax_threshold_scale_factor_decode
         None,  # skip_softmax_stat
@@ -536,13 +545,16 @@ def trtllm_mha_with_cache_fake(
     kv_cache_block_offsets: torch.Tensor,
     # CACHE
     kv_cache: torch.Tensor,
-    # CONSTANTS (only truly un-inferable values)
+    # CONSTANTS
     scale: Optional[float],
     sliding_window: Optional[int] = None,
     kv_scale_orig_quant: float = 1.0,
     kv_scale_quant_orig: float = 1.0,
     out_scale: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
+    rotary_cos_sin: Optional[torch.Tensor] = None,
+    position_embedding_type: int = 0,
+    rotary_embedding_dim: int = 0,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile tracing."""
     if out is not None:
@@ -625,21 +637,43 @@ class TrtllmAttention(AttentionDescriptor):
 
     @classmethod
     def prepare_node_for_cache_insertion(cls, gm: GraphModule, attn_node: Node) -> None:
-        """Materialize optional out_scale node for FP8 output path if contract exists."""
+        """Materialize optional out_scale and rope cos_sin nodes before cache insertion."""
+        # FP8 output scale
         input_scale = get_trtllm_attention_fp8_input_scale(attn_node)
-        if input_scale is None:
+        if input_scale is not None:
+            existing_out_scale = attn_node.meta.get(_TRTLLM_ATTN_OUT_SCALE_KEY)
+            if not isinstance(existing_out_scale, Node):
+                with gm.graph.inserting_before(attn_node):
+                    out_scale = gm.graph.call_function(
+                        torch.ops.aten.reciprocal.default, args=(input_scale,)
+                    )
+                attn_node.meta[_TRTLLM_ATTN_OUT_SCALE_KEY] = out_scale
+        else:
             attn_node.meta.pop(_TRTLLM_ATTN_OUT_SCALE_KEY, None)
-            return
 
-        existing_out_scale = attn_node.meta.get(_TRTLLM_ATTN_OUT_SCALE_KEY)
-        if isinstance(existing_out_scale, Node):
-            return
+        # RoPE cos_sin: FuseRopeIntoTrtllmAttention (at post_load_fusion) already
+        # computed the thop-format cos_sin_tensor.  Materialize it as a get_attr node.
+        rope_info = get_trtllm_rope_info(attn_node)
+        if rope_info is not None and "cos_sin_tensor" in rope_info:
+            cos_sin_tensor = rope_info["cos_sin_tensor"]
+            attr_name = "_trtllm_rope_cos_sin"
+            counter = 0
+            # Find a free attr name, or reuse one that already points to the same tensor.
+            # The else clause runs only when the loop exits without break (no match found),
+            # meaning we need to register a new buffer.
+            while hasattr(gm, attr_name):
+                existing = getattr(gm, attr_name)
+                if existing.data_ptr() == cos_sin_tensor.data_ptr():
+                    break
+                counter += 1
+                attr_name = f"_trtllm_rope_cos_sin_{counter}"
+            else:
+                gm.register_buffer(attr_name, cos_sin_tensor, persistent=False)
 
-        with gm.graph.inserting_before(attn_node):
-            out_scale = gm.graph.call_function(
-                torch.ops.aten.reciprocal.default, args=(input_scale,)
-            )
-        attn_node.meta[_TRTLLM_ATTN_OUT_SCALE_KEY] = out_scale
+            with gm.graph.inserting_before(attn_node):
+                cos_sin_node = gm.graph.create_node("get_attr", attr_name)
+            cos_sin_node.meta["val"] = cos_sin_tensor
+            rope_info["cos_sin_node"] = cos_sin_node
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
@@ -681,10 +715,25 @@ class TrtllmAttention(AttentionDescriptor):
         if not isinstance(out_scale, Node):
             out_scale = None
 
+        # RoPE fusion info (set by FuseRopeIntoTrtllmAttention transform)
+        rope_info = get_trtllm_rope_info(source_attn_node)
+        if rope_info is not None:
+            rope_cos_sin = rope_info["cos_sin_node"]
+            pos_emb_type = rope_info["position_embedding_type"]
+            rot_emb_dim = rope_info["rotary_embedding_dim"]
+        else:
+            rope_cos_sin = None
+            pos_emb_type = 0
+            rot_emb_dim = 0
+
         return [
             scale,
             sliding_window,
             1.0,  # kv_scale_orig_quant (hard-coded, same as FlashInfer)
             1.0,  # kv_scale_quant_orig (hard-coded, same as FlashInfer)
             out_scale,
+            None,  # out (pre-allocated output buffer, not used here)
+            rope_cos_sin,
+            pos_emb_type,
+            rot_emb_dim,
         ]

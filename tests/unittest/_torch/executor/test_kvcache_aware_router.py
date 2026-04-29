@@ -94,8 +94,8 @@ class TestKVCacheAwareADPRouter:
         mgr = _mock_kv_cache_manager()
         router = KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr)
 
-        req1 = Mock(py_orig_prompt_len=100)
-        req2 = Mock(py_orig_prompt_len=200)
+        req1 = Mock(py_orig_prompt_len=100, cached_tokens=0)
+        req2 = Mock(py_orig_prompt_len=200, cached_tokens=0)
         state = router.create_rank_state([req1, req2], [])
         assert state.rank == 0
         assert state.num_active_requests == 2
@@ -106,7 +106,7 @@ class TestKVCacheAwareADPRouter:
         mgr = _mock_kv_cache_manager()
         router = KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr)
 
-        req1 = Mock(total_input_len_cp=150)
+        req1 = Mock(total_input_len_cp=150, cached_tokens=0)
         state = router.create_rank_state([req1], [])
         assert state.rank == 1
         assert state.num_active_tokens == 150
@@ -269,7 +269,11 @@ class TestKVCacheAwareADPRouter:
         """
         dist = _mock_dist(tp_rank=0, tp_size=2)
         mgr = _mock_kv_cache_manager()
-        router = KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr)
+        # Pin fair_share_multiplier=1.0 so the cap equals fair_share (2).
+        # This test isolates the effective-token bookkeeping from the
+        # cap-relaxation behavior covered separately in
+        # test_fair_share_multiplier_caps_per_rank.
+        router = KVCacheAwareADPRouter(dist=dist, kv_cache_manager=mgr, fair_share_multiplier=1.0)
 
         # Requests 1,2 have cache on rank 0; requests 3,4 have no cache
         router._all_ranks_prefix_matches = [
@@ -410,8 +414,8 @@ class TestProbeOnV1KVCacheManager:
 
         result = KVCacheManager.probe_prefix_match_length(mgr, input_tokens=[1, 2, 3])
         assert result == 0
-        # count_reusable_blocks should NOT be called (would crash)
-        mgr.impl.count_reusable_blocks.assert_not_called()
+        # analyze_prefix_reuse should NOT be called (would crash)
+        mgr.impl.analyze_prefix_reuse.assert_not_called()
 
     def test_empty_tokens_returns_zero(self):
         from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -432,7 +436,9 @@ class TestProbeOnV1KVCacheManager:
         mgr.enable_block_reuse = True
         mgr.impl = Mock()
         mgr.impl.is_variable_window = False
-        mgr.impl.count_reusable_blocks = Mock(return_value=3)
+        mock_summary = Mock()
+        mock_summary.reusable_blocks_all = 3
+        mgr.impl.analyze_prefix_reuse = Mock(return_value=mock_summary)
         mgr.tokens_per_block = 64
 
         result = KVCacheManager.probe_prefix_match_length(mgr, input_tokens=list(range(200)))

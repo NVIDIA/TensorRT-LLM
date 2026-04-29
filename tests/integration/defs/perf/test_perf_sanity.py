@@ -49,7 +49,9 @@ MODEL_PATH_DICT = {
     "k25_thinking_fp4": "Kimi-K2.5-NVFP4",
     "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",  # Qwen3-235B-A22B-FP4
     "super_nvfp4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",  # Super (Nemotron-H SSM+MoE) NvFP4
+    "super_fp8": "NVIDIA-Nemotron-3-Super-120B-A12B-FP8",
     "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",  # Qwen3-235B-A22B-FP8
+    "qwen3_32b_fp8": "Qwen3/Qwen3-32B-FP8",
     "llama_v3.3_70b_instruct_fp4": "llama-3.3-models/Llama-3.3-70B-Instruct-FP4",
     "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
     "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
@@ -362,15 +364,8 @@ class ServerConfig:
             "l_cp",
             "l_gpus_per_node",
             "l_max_batch_size",
-            "b_disable_overlap_scheduler",
-            "b_enable_chunked_prefill",
             "b_enable_attention_dp",
-            "b_enable_lm_head_tp_in_adp",
             "s_serving_backend",
-            # attention_dp_config
-            "b_attention_dp_balance",
-            # cuda_graph_config
-            "b_enable_cuda_graph",
             # kv_cache_config
             "s_kv_cache_dtype",
             # cache_transceiver_config
@@ -1391,7 +1386,9 @@ class PerfSanityTestConfig:
         for concurrency in concurrency_values:
             client_config_data = {
                 "concurrency": concurrency,
-                "iterations": benchmark.get("multi_round", 1),
+                "iterations": 1
+                if benchmark_mode == "gen_only"
+                else benchmark.get("multi_round", 1),
                 "isl": benchmark.get("input_length", 1024),
                 "osl": osl,
                 "random_range_ratio": benchmark.get("benchmark_ratio", 0.0),
@@ -1753,7 +1750,14 @@ class PerfSanityTestConfig:
                         if num_ctx_servers > 0:
                             match_keys.extend(add_list_prefix(ctx_config.to_match_keys(), "ctx"))
                         if num_gen_servers > 0:
-                            match_keys.extend(add_list_prefix(gen_config.to_match_keys(), "gen"))
+                            gen_match_keys = add_list_prefix(gen_config.to_match_keys(), "gen")
+                            if disagg_config.benchmark_mode == "gen_only":
+                                gen_match_keys = [
+                                    k
+                                    for k in gen_match_keys
+                                    if k != "gen_s_cache_transceiver_backend"
+                                ]
+                            match_keys.extend(gen_match_keys)
                         match_keys.extend(client_config.to_match_keys())
         else:
             return

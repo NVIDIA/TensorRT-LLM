@@ -52,7 +52,8 @@ STAGE_CHOICE_NORMAL = "normal"
 STAGE_CHOICE_SKIP = "skip"
 STAGE_CHOICE_IGNORE = "ignore"
 
-RELESE_CHECK_CHOICE = env.releaseCheckChoice ? env.releaseCheckChoice : STAGE_CHOICE_NORMAL
+RELEASE_CHECK_CHOICE = env.releaseCheckChoice ? env.releaseCheckChoice : STAGE_CHOICE_NORMAL
+BUILD_CHECK_CHOICE = env.buildCheckChoice ? env.buildCheckChoice : STAGE_CHOICE_NORMAL
 X86_TEST_CHOICE = env.x86TestChoice ? env.x86TestChoice : STAGE_CHOICE_NORMAL
 SBSA_TEST_CHOICE = env.SBSATestChoice ? env.SBSATestChoice : STAGE_CHOICE_NORMAL
 
@@ -437,10 +438,14 @@ def launchReleaseCheck(pipeline, globalVars)
                 sh "cd ${LLM_ROOT} && confidentiality-scan \$(find . -type f ${ignoreList.collect { "-not -path \"${it}\"" }.join(' ')}) 2>&1 | tee scan.log"
                 def lastLine = sh(script: "tail -n 1 ${LLM_ROOT}/scan.log", returnStdout: true).trim()
                 if (lastLine.toLowerCase().contains("error")) {
-                    error "Guardwords Scan Failed."
+                    error "GUARDWORDS_WARN: Guardwords Scan Failed."
                 }
-            } catch (Exception e) {
+            } catch (InterruptedException e) {
                 throw e
+            } catch (Exception e) {
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    error "Release Check failed (warn-only): ${e.getMessage()}"
+                }
             } finally {
                 trtllm_utils.uploadArtifacts("${LLM_ROOT}/scan.log", "${UPLOAD_PATH}/guardwords-scan-results/")
                 echo "Guardwords Scan Results: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/guardwords-scan-results/scan.log"
@@ -488,7 +493,7 @@ def launchReleaseCheck(pipeline, globalVars)
     stageName = "Release-Check"
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
         stage("[${stageName}] Run") {
-            if (RELESE_CHECK_CHOICE == STAGE_CHOICE_SKIP) {
+            if (RELEASE_CHECK_CHOICE == STAGE_CHOICE_SKIP) {
                 echo "Release Check job is skipped due to Jenkins configuration"
                 return
             }
@@ -498,7 +503,7 @@ def launchReleaseCheck(pipeline, globalVars)
             } catch (InterruptedException e) {
                 throw e
             } catch (Exception e) {
-                if (RELESE_CHECK_CHOICE == STAGE_CHOICE_IGNORE) {
+                if (RELEASE_CHECK_CHOICE == STAGE_CHOICE_IGNORE) {
                     catchError(
                         buildResult: 'SUCCESS',
                         stageResult: 'FAILURE') {
@@ -715,12 +720,17 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/kernels/communicationKernels/",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.cu",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.h",
+        "cpp/tensorrt_llm/kernels/fmhaDispatcher.cpp",
+        "cpp/tensorrt_llm/kernels/fmhaDispatcher.h",
         "cpp/tensorrt_llm/kernels/gptKernels.cu",
         "cpp/tensorrt_llm/kernels/gptKernels.h",
         "cpp/tensorrt_llm/kernels/moe",
+        "cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/",
         "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.cu",
         "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.h",
         "cpp/tensorrt_llm/kernels/userbuffers/",
+        "cpp/tensorrt_llm/kernels/xqaDispatcher.cpp",
+        "cpp/tensorrt_llm/kernels/xqaDispatcher.h",
         "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.cpp",
         "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.h",
         "cpp/tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.cpp",
@@ -817,7 +827,8 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
         return ""
     }
     def groupFileMap = [
-        "Docs": [ // TODO: Add more docs path to the list, e.g. *.md files in other directories
+        "Docs": [
+            // Matched by prefix here, plus any "*.md" file anywhere in the repo (handled below).
             "docs/",
         ],
         "PyTorch": [
@@ -848,17 +859,20 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
 
     for (group in groupFileMap.keySet()) {
         def groupPrefixes = groupFileMap[group]
-        def allFilesInGroup = changedFileList.every { file ->
-            groupPrefixes.any { prefix -> file.startsWith(prefix) }
+        def matchesGroup = { file ->
+            // Any *.md file, anywhere in the repo, counts as Docs-only.
+            if (group == "Docs" && file.endsWith(".md")) {
+                return true
+            }
+            return groupPrefixes.any { prefix -> file.startsWith(prefix) }
         }
+        def allFilesInGroup = changedFileList.every(matchesGroup)
 
         if (allFilesInGroup) {
             pipeline.echo("Only ${group} files changed.")
             return group
         } else {
-            def nonGroupFile = changedFileList.find { file ->
-                !groupPrefixes.any { prefix -> file.startsWith(prefix) }
-            }
+            def nonGroupFile = changedFileList.find { file -> !matchesGroup(file) }
             if (nonGroupFile != null) {
                 pipeline.echo("Found non-${group} file: ${nonGroupFile}")
             }
@@ -1275,19 +1289,33 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             script {
                 def testStageName = "[Build-Docker-Images] Remote Run"
                 stage(testStageName) {
-                    def branch = env.gitlabBranch ? env.gitlabBranch : "main"
-                    if (globalVars[GITHUB_PR_API_URL]) {
-                        branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
+                    try {
+                        def branch = env.gitlabBranch ? env.gitlabBranch : "main"
+                        if (globalVars[GITHUB_PR_API_URL]) {
+                            branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
+                        }
+
+                        def additionalParameters = [
+                            'branch': branch,
+                            'action': "push",
+                            'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
+                            'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/ ? true : false,
+                        ]
+
+                        launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        if (BUILD_CHECK_CHOICE == STAGE_CHOICE_IGNORE) {
+                            catchError(
+                                buildResult: 'SUCCESS',
+                                stageResult: 'FAILURE') {
+                                error "Build-Docker-Images job failed but ignored due to Jenkins configuration"
+                            }
+                        } else {
+                            throw e
+                        }
                     }
-
-                    def additionalParameters = [
-                        'branch': branch,
-                        'action': "push",
-                        'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
-                        'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/ ? true : false,
-                    ]
-
-                    launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                 }
             }
         }
@@ -1358,9 +1386,84 @@ pipeline {
         failure {
             script {
                 try {
-                    def analysis = trtllm_utils.analyzePipelineFailureWithAgent(this, env.JOB_NAME, env.BUILD_NUMBER)
+                    def prNumber = null
+                    if (globalVars[GITHUB_PR_API_URL]) {
+                        def prMatch = (globalVars[GITHUB_PR_API_URL] =~ /\/pulls?\/(\d+)/)
+                        if (prMatch) {
+                            prNumber = prMatch[0][1]
+                        }
+                    }
+                    def analysis = trtllm_utils.analyzePipelineFailureWithAgent(
+                        this, env.JOB_NAME, env.BUILD_NUMBER, prNumber)
                     if (analysis) {
-                        echo "=== CI Agent Failure Analysis ===\n${analysis}"
+                        def bucket = 'sw-tensorrt-ci-analysis'
+                        def key = "${env.JOB_NAME}/${env.BUILD_NUMBER}/failure_analysis.html"
+                        def htmlUrl = "https://pbss.s8k.io/v1/AUTH_svc_tensorrt/${bucket}/${key}"
+                        // Self-rendering HTML page: marked.js parses the analysis at page load
+                        // and DOMPurify sanitises the result before injection into the DOM. The
+                        // analysis text comes from the CI agent which consumes build logs (which
+                        // can include attacker-controlled PR content), so we treat it as untrusted.
+                        // Hardening:
+                        //   1. CDN scripts pinned to specific versions and protected with SRI.
+                        //   2. Analysis embedded in a `<script type="application/json">` data
+                        //      block read via textContent + JSON.parse — never inlined into
+                        //      executable JS source. Every `<` in the JSON is rewritten to its
+                        //      JSON unicode escape so a payload cannot smuggle a `</script>`
+                        //      and break out of the data block.
+                        //   3. marked output is run through DOMPurify before innerHTML assignment
+                        //      to strip event-handler attributes and other XSS vectors.
+                        def jsonAnalysis = groovy.json.JsonOutput.toJson(analysis).replace("<", "\\u003c")
+                        def htmlDoc = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>CI Failure Analysis &middot; ${env.JOB_NAME} #${env.BUILD_NUMBER}</title>
+<script src="https://cdn.jsdelivr.net/npm/marked@14.1.4/marked.min.js" integrity="sha384-lqPzN0kmFw9t2syAMwVPM4VbAyqsz/lPyYWbb2Xt6nSPM0WPNrpSWCUBgdcAdgnC" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js" integrity="sha384-eEu5CTj3qGvu9PdJuS+YlkNi7d2XxQROAFYOr59zgObtlcux1ae1Il3u7jvdCSWu" crossorigin="anonymous"></script>
+<style>body{font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:900px;margin:2em auto;padding:0 1em;color:#24292e}h1,h2,h3{border-bottom:1px solid #eaecef;padding-bottom:.3em}pre{background:#f6f8fa;padding:1em;overflow:auto;border-radius:6px}code{background:#f6f8fa;padding:.2em .4em;border-radius:3px}pre code{background:none;padding:0}a{color:#0366d6}blockquote{border-left:4px solid #dfe2e5;padding:0 1em;color:#6a737d}table{border-collapse:collapse}th,td{border:1px solid #dfe2e5;padding:6px 13px}header{margin-bottom:1.5em;color:#586069}</style>
+</head><body>
+<header><a href="${env.BUILD_URL}">${env.JOB_NAME} #${env.BUILD_NUMBER}</a></header>
+<main id="md"></main>
+<script id="md-source" type="application/json">${jsonAnalysis}</script>
+<script>
+  // Disable marked's strikethrough tokenizer: CI failure-analysis text routinely
+  // contains literal tildes (~/path, ~50ms, regex anchors, etc.) that should not
+  // be interpreted as markup. Other GFM extensions (tables, fences, autolinks,
+  // task lists) stay enabled.
+  marked.use({ tokenizer: { del() { return false; } } });
+  const src = JSON.parse(document.getElementById('md-source').textContent);
+  document.getElementById('md').innerHTML = DOMPurify.sanitize(marked.parse(src));
+</script>
+</body></html>
+"""
+                        writeFile file: 'failure_analysis.html', text: htmlDoc
+                        container("alpine") {
+                            trtllm_utils.llmExecStepWithRetry(this, script: 'apk add --no-cache aws-cli')
+                            // Alpine's musl libc fires A and AAAA queries in parallel; pbss.s8k.io's AAAA
+                            // returns SERVFAIL and musl treats that as a fatal lookup failure (glibc would
+                            // not). Pin the A-record IP in /etc/hosts so getaddrinfo resolves from files.
+                            trtllm_utils.llmExecStepWithRetry(this, script: '''
+                                if ! grep -q 'pbss.s8k.io' /etc/hosts; then
+                                    ip=$(nslookup -type=A pbss.s8k.io 2>/dev/null | awk '/^Address[: ]/ && $NF !~ /:53$/ && $NF !~ /#53$/ { print $NF; exit }')
+                                    if [ -n "$ip" ]; then
+                                        printf '%s\\n' "$ip pbss.s8k.io" >> /etc/hosts
+                                    fi
+                                fi
+                            ''')
+                            withCredentials([string(
+                                    credentialsId: 'svc_tensorrt-swift-stack-key',
+                                    variable: 'AWS_SECRET_ACCESS_KEY')]) {
+                                trtllm_utils.llmExecStepWithRetry(this, script:
+                                    "AWS_ACCESS_KEY_ID=svc_tensorrt aws s3 cp failure_analysis.html" +
+                                    " 's3://${bucket}/${key}' --endpoint-url https://pbss.s8k.io" +
+                                    " --content-type text/html")
+                            }
+                        }
+                        // Surface the URL via currentBuild.description so the upstream PR_Github
+                        // wrapper can extract it and include it in the GitHub PR comment.
+                        def existingDesc = currentBuild.description ?: ""
+                        currentBuild.description = existingDesc +
+                            (existingDesc ? "<br/>" : "") +
+                            "<a href='${htmlUrl}'>CI Agent Failure Analysis</a>"
+                        echo "CI Agent Failure Analysis: ${htmlUrl}"
                     }
                 } catch (Exception e) {
                     // Analysis is best-effort; do not fail the pipeline

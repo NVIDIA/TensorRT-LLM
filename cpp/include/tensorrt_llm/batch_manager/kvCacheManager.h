@@ -393,10 +393,7 @@ public:
     static BlockPtr createPlaceholder(IdType blockId, SizeType32 windowSize);
 
     void detachDescendantsFromLookupTree();
-    //! \brief Detach all placeholder blocks in the previous-block chain from the lookup tree.
-    //! \details Walks upward via getPrevBlock() and calls detachFromLookupNode() on each
-    //! block that is a placeholder. Stops at the root (kCachedBlocksRootId).
-    void detachPreviousPlaceholdersFromLookupTree() const;
+
     void freeBlockAndAllDescendants();
 
     //! \brief Find block matching blockKey. If allowPartial is true, the returned block may match only a prefix of
@@ -630,7 +627,7 @@ public:
         TLLM_CHECK_WITH_INFO(currentPrepopulatedPromptLen <= mCurrentPrepopulatedPromptLen,
             "currentPrepopulatedPromptLen must be updated non-increasingly due to the "
             "assumption that smaller window sizes have shorter or equal"
-            "currentPrepopulatedPromptLen in WindowSizeManager::loadOrAllocateBlocks.");
+            " currentPrepopulatedPromptLen during multi-window batch allocation.");
         mCurrentPrepopulatedPromptLen = currentPrepopulatedPromptLen;
     }
 
@@ -698,6 +695,28 @@ public:
     }
 };
 
+/// \brief Result of a single radix tree walk that collects all prefix reuse information.
+/// \details Replaces separate findNewContextBlock() + countReusableBlocks(true) +
+///          countReusableBlocks(false) calls with a single walk, reducing 2-3 walks to 1.
+struct PrefixReuseSummary
+{
+    using SizeType32 = tensorrt_llm::runtime::SizeType32;
+
+    /// Number of prefix blocks already allocated (refCount > 0).
+    /// Used by the block budget to avoid double-counting with the eviction free count.
+    SizeType32 reusableBlocksAllocated{0};
+
+    /// Total number of prefix blocks cached (allocated or free-cached).
+    /// Used by the token budget (NoEvict) since all cached tokens avoid recompute.
+    SizeType32 reusableBlocksAll{0};
+
+    /// First block key NOT found in the radix tree. std::nullopt means either all full
+    /// prefix blocks matched (full prefix hit) or the request has no full block key to
+    /// probe yet; a concrete BlockKey identifies the first missing full block.
+    /// Used by the capacity scheduler's skip-check logic to decide whether to defer a request.
+    std::optional<BlockKey> firstNewBlock{std::nullopt};
+};
+
 // The WindowBlockManager manages the metadata of KVCacheBlocks.
 // It manages multiple arrays of cache blocks called pools.
 // Layers with the same number of kv heads are grouped under the same pool.
@@ -763,10 +782,71 @@ public:
 
     void startScheduling();
 
-    //! \brief Assign blocks for new sequence
-    //! \return The number of tokens that were matched/prepopulated from cache (prepopulatedPromptLen)
-    [[nodiscard]] SizeType32 addSequence(GenerationRequest& sequence, SizeType32 inputLength,
-        SizeType32 numContextBlocks, LlmRequest& llmRequest, bool isEnableBlockReuse);
+    //! \brief Per-request block allocation statistics from batch addSequence.
+    struct BatchSeqStats
+    {
+        SizeType32 prepopulatedLen{0};
+        SizeType32 allocTotalDelta{0};
+        SizeType32 allocNewDelta{0};
+        SizeType32 reusedDelta{0};
+        SizeType32 missedDelta{0};
+    };
+
+    //! \brief Result of Phase 1 (claim-only) of batch addSequence.
+    //! \details Holds matched blocks and prepared data so Phase 2 can proceed without
+    //!          re-traversing the radix tree.
+    struct ClaimResult
+    {
+        struct ClaimedBlock
+        {
+            BlockPtr block;
+            SizeType32 numMatchedTokens; //!< tokens matched in this block
+            bool isPartialMatch;
+            bool needsCopy;     //!< partial match on block with refs or non-leaf (needs getFreeBlock + copy in Phase 2)
+            bool isPlaceholder; //!< placeholder block (linear attention recurrent states)
+            bool shouldReleaseCopySource{false}; //!< last copier releases the claimed source after copy
+        };
+
+        std::vector<ClaimedBlock> claimedBlocks;
+        SizeType32 totalMatchedTokens{0};
+        SizeType32 latestMatchingNonPlaceholderBlockIdx{-1};
+        SizeType32 numSharedContextBlocks{0};
+        SizeType32 numContextBlocks{0};
+        bool shareLastContextBlockAmongBeams{true};
+        std::vector<BlockKey> blockKeys;
+        std::vector<executor::RetentionPriorityAndDuration> perBlockRetentions;
+        executor::KvCacheTransferMode mode{executor::KvCacheTransferMode::DRAM};
+        std::string directory;
+    };
+
+    //! \brief Tracks which request currently "owns" a partially-matched leaf block across
+    //!        the batch Phase 1 loop, so that at most one request reuses the block in-place
+    //!        while all others copy.
+    struct PartialClaimTracker
+    {
+        struct Entry
+        {
+            size_t requestIdx; //!< index of the request that currently owns the reuse
+            size_t claimedIdx; //!< index into that request's claimedBlocks vector
+            bool fullyMatched; //!< true once any request fully matches this block
+        };
+
+        //! Keyed by block ID.
+        std::unordered_map<KVCacheBlock::IdType, Entry> map;
+    };
+
+    //! \brief Batch add sequences with two-phase claim-then-onboard under a single lock.
+    //! \details Phase 1 claims all matching blocks across all requests (protecting from eviction).
+    //!          Phase 2 onboards host blocks and allocates non-matching blocks.
+    //!          The mCachedBlocksRootMutex is held for the entire operation.
+    //! \param sequences  Per-request GenerationRequest references (parallel with other vectors).
+    //! \param inputLengths  Per-request effective input length.
+    //! \param numContextBlocksVec  Per-request number of context blocks.
+    //! \param llmRequests  Per-request LlmRequest references.
+    //! \return Per-request prepopulatedPromptLen.
+    [[nodiscard]] std::vector<BatchSeqStats> addSequenceBatch(std::vector<GenerationRequest*> const& sequences,
+        std::vector<SizeType32> const& inputLengths, std::vector<SizeType32> const& numContextBlocksVec,
+        std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, bool isEnableBlockReuse);
 
     //! \brief Allocate new block for each beam of the sequence.
     //! \details Might free cached blocks if no free blocks are available.
@@ -964,22 +1044,9 @@ public:
     void offloadBlock(BlockPtr const& block, executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM,
         std::string const& directory = "");
 
-    //! \brief Find first new block that must be allocated for context phase and return it's concatenated token vectors.
-    //! \details Only full blocks are considered.
-    [[nodiscard]] std::optional<BlockKey> findNewContextBlock(
+    //! \brief Combined prefix reuse analysis — single radix tree walk.
+    [[nodiscard]] PrefixReuseSummary analyzePrefixReuse(
         VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const;
-
-    //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
-    //! \details Traverses the radix tree to count how many consecutive blocks from the beginning
-    //!          of the request's context are already cached.
-    //! \param uniqueTokens The unique tokens representing the request's context.
-    //! \param llmRequest The request to check for reusable blocks.
-    //! \param onlyAllocated If true, only count blocks that have active references (already allocated
-    //!        to another sequence). Free cached blocks are excluded because they are already counted
-    //!        in the eviction policy's free count.
-    //! \return The number of full blocks that can be reused.
-    [[nodiscard]] SizeType32 countReusableBlocks(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const;
 
     [[nodiscard]] runtime::BufferManager const& getBufferManager() const
     {
@@ -1036,6 +1103,9 @@ public:
 
     [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey);
 
+    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(
+        std::vector<BlockKey> const& blockKeys);
+
     //! \brief Unpin blocks by block ids directly
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
@@ -1069,6 +1139,9 @@ public:
     }
 
 private:
+    //! \brief Walk the reuse tree with precomputed per-block keys (no lock; callers must hold mCachedBlocksRootMutex).
+    [[nodiscard]] std::shared_ptr<KVCacheBlock> searchReuseTree(std::vector<BlockKey> const& blockKeys);
+
     bool tryAllocatePlaceholderForLinearAttention(GenerationRequest& sequence, bool shareAmongBeams);
 
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
@@ -1077,15 +1150,24 @@ private:
     //! \brief Add single block to all beams of sequence.
     void addBlockToAllBeams(BlockPtr const& block, GenerationRequest& sequence);
 
-    //! \brief Try to load blocks from cache. Allocate new blocks if necessary.
-    //! \param blockKeys Key of each block.
-    //! \param sequence Sequence to which blocks are assigned.
-    //! \return Number of matched tokens from loaded blocks.
-    SizeType32 loadOrAllocateBlocks(std::vector<BlockKey> const& blockKeys, SizeType32 inputLength,
-        SizeType32 numContextBlocks, GenerationRequest& sequence,
-        std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions,
-        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "",
-        bool isEnableBlockReuse = false);
+    //! \brief Phase 1: Walk radix tree and claim matching blocks.
+    //! \details Caller must hold mCachedBlocksRootMutex.
+    //!          Uses \p tracker to coordinate partial-match ownership across requests in
+    //!          the same batch. \p claimResults is the full vector so that a previous
+    //!          request's ClaimedBlock can be retroactively marked needsCopy.
+    [[nodiscard]] ClaimResult claimMatchingBlocks(GenerationRequest& sequence, SizeType32 inputLength,
+        SizeType32 numContextBlocks, LlmRequest& llmRequest, size_t requestIdx, PartialClaimTracker& tracker,
+        std::vector<ClaimResult>& claimResults);
+
+    //! \brief Build ClaimResult metadata without walking the radix tree.
+    //! \details Used for non-reuse path where all blocks are freshly allocated.
+    [[nodiscard]] ClaimResult buildClaimResultMetadata(
+        GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest);
+
+    //! \brief Phase 2: Onboard claimed host blocks and allocate non-matching blocks.
+    //! \details Caller must hold mCachedBlocksRootMutex.
+    [[nodiscard]] SizeType32 onboardAndAllocateBlocks(
+        GenerationRequest& sequence, LlmRequest& llmRequest, ClaimResult& claimResult, bool isEnableBlockReuse);
 
     //! \brief Free block and all it's descendants. This makes block a claimed leaf block.
     void freeChildren(BlockPtr const& block);
@@ -1282,9 +1364,12 @@ public:
 
     void allocatePools(bool useUvm);
 
-    //! \return The number of tokens that were matched/prepopulated from cache (prepopulatedPromptLen)
-    [[nodiscard]] SizeType32 addSequence(GenerationRequest& sequence, SizeType32 inputLength,
-        SizeType32 numContextBlocks, LlmRequest& llmRequest, SizeType32 windowSize, bool isEnableBlockReuse);
+    //! \brief Batch add sequences forwarding to WindowBlockManager::addSequenceBatch.
+    [[nodiscard]] std::vector<WindowBlockManager::BatchSeqStats> addSequenceBatch(
+        std::vector<GenerationRequest*> const& sequences, std::vector<SizeType32> const& inputLengths,
+        std::vector<SizeType32> const& numContextBlocksVec,
+        std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, SizeType32 windowSize,
+        bool isEnableBlockReuse);
 
     void allocateBlock(GenerationRequest& sequence, SizeType32 windowSize);
 
@@ -1313,14 +1398,10 @@ public:
     void setOffsets(kernels::KVCacheIndex* offsetsPtr, nvinfer1::Dims const& offsetsShape, SizeType32 beamIdx,
         SizeType32 blockIdx, KVCacheBlock::IdType blockId, SizeType32 windowSize) const;
 
-    // WILL NOT WORK FOR VARIABLE WINDOW ATTENTION
-    [[nodiscard]] std::optional<BlockKey> findNewContextBlock(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const;
-
-    //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
+    //! \brief Combined prefix reuse analysis — single radix tree walk.
     //! \details WILL NOT WORK FOR VARIABLE WINDOW ATTENTION.
-    [[nodiscard]] SizeType32 countReusableBlocks(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const;
+    [[nodiscard]] PrefixReuseSummary analyzePrefixReuse(
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const;
 
     //! \brief Bring block from primary to secondary memory for window size.
     //! \details Does nothing if block is already in primary memory.
@@ -1550,6 +1631,12 @@ public:
         return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKey(blockKey);
     }
 
+    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(
+        std::vector<BlockKey> const& blockKeys, SizeType32 windowSize)
+    {
+        return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKeys(blockKeys);
+    }
+
     [[nodiscard]] SizeType32 getNumPrimaryBlocks() const
     {
         return sumWindows([](auto const& manager) { return manager.getNumPrimaryBlocks(); });
@@ -1758,18 +1845,21 @@ public:
     [[nodiscard]] virtual BlockManager const& getBlockManager() const = 0;
 
     /// @brief  Function that computes the number of KV cache blocks needed to advance a request by one or two
-    /// iterations
+    /// iterations.
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
+    /// @param cachedSummary Optional pre-computed PrefixReuseSummary to avoid redundant radix tree walks.
     /// @return  The number of blocks
-    [[nodiscard]] virtual SizeType32 getNeededBlocksOneStep(
-        LlmRequest const& req, bool twoStepsLookAhead, SizeType32 windowSize) const
+    [[nodiscard]] virtual SizeType32 getNeededBlocksOneStep(LlmRequest const& req, bool twoStepsLookAhead,
+        SizeType32 windowSize, std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt) const
         = 0;
 
     /// @brief  Function that computes the number of KV cache blocks needed to advance a request to completion (i.e. for
-    /// maxNewTokens)
+    /// maxNewTokens).
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
+    /// @param cachedSummary Optional pre-computed PrefixReuseSummary to avoid redundant radix tree walks.
     /// @return  The number of blocks
-    [[nodiscard]] virtual SizeType32 getRemainingBlocksToCompletion(LlmRequest const& req, SizeType32 windowSize) const
+    [[nodiscard]] virtual SizeType32 getRemainingBlocksToCompletion(LlmRequest const& req, SizeType32 windowSize,
+        std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt) const
         = 0;
 
     /// @brief Pin blocks associated with a request to prevent eviction.
@@ -1783,14 +1873,16 @@ public:
     /// LlmRequest::getNumTokens.
     [[nodiscard]] virtual SizeType32 getTokenCount(LlmRequest::RequestIdType requestId) const = 0;
 
-    /// @brief Add new request to the KV cache manager.
-    /// @param inputLength Input length for which KV cache need to be allocated.
-    /// @param beamWidth Beam width for which KV cache need to be allocated.
-    /// @param llmRequest Optional request to use for KV cache lookup.
-    /// @details If llmRequest is supplied and KV cache reuse is enabled, try to recover KV cache blocks for
-    /// inputLength - 1 tokens and populate prepopulatedPromptLen.
-    virtual void addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
-        OptionalRef<LlmRequest> llmRequest = std::nullopt)
+    //! \brief Batch add sequences with two-phase claim-then-onboard strategy.
+    //! \details For each attention window, when block reuse is enabled, Phase 1 claims all matching
+    //!          blocks across all requests (protecting them from eviction via PartialClaimTracker),
+    //!          then Phase 2 onboards host blocks and allocates non-matching blocks. When block reuse
+    //!          is disabled, buildClaimResultMetadata() prepares ClaimResult metadata without radix
+    //!          tree traversal, and Phase 2 performs fresh allocation only. Supports variable sliding
+    //!          window attention (VSWA) by iterating over all window sizes.
+    virtual void addSequenceBatch(
+        std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
+        std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests)
         = 0;
 
     [[nodiscard]] virtual std::optional<KVCacheBlock::IdType> removeSequence(LlmRequest::RequestIdType requestId,
@@ -1830,21 +1922,10 @@ public:
 
     [[nodiscard]] virtual bool isCrossKv() const = 0;
 
-    //! \brief Find first new block that must be allocated for context phase and return it's concatenated token vector.
-    //! \details Only full blocks are considered.
-    [[nodiscard]] virtual std::optional<BlockKey> findNewContextBlock(
+    //! \brief Combined prefix reuse analysis — single radix tree walk.
+    //! \details Collects firstNewBlock + reusableBlocksAllocated + reusableBlocksAll in one pass.
+    [[nodiscard]] virtual PrefixReuseSummary analyzePrefixReuse(
         VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
-        = 0;
-
-    //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
-    //! \details Traverses the radix tree to count how many consecutive blocks from the beginning
-    //!          of the request's context are already cached.
-    //! \param uniqueTokens The unique tokens representing the request's context.
-    //! \param llmRequest The request to check for reusable blocks.
-    //! \param onlyAllocated If true, only count blocks that have active references.
-    //! \return The number of full blocks that can be reused.
-    [[nodiscard]] virtual SizeType32 countReusableBlocks(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const
         = 0;
 
     //! \brief Store full context blocks contributed by llmRequest.
@@ -1956,6 +2037,10 @@ public:
 
     [[nodiscard]] virtual std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
         BlockKey const& blockKey, SizeType32 windowSize)
+        = 0;
+
+    [[nodiscard]] virtual std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(
+        std::vector<BlockKey> const& blockKeys, SizeType32 windowSize)
         = 0;
 
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
@@ -2138,15 +2223,15 @@ public:
     /// iterations
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
     /// @return  The number of blocks
-    [[nodiscard]] SizeType32 getNeededBlocksOneStep(
-        LlmRequest const& req, bool twoStepsLookAhead, SizeType32 windowSize) const override;
+    [[nodiscard]] SizeType32 getNeededBlocksOneStep(LlmRequest const& req, bool twoStepsLookAhead,
+        SizeType32 windowSize, std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt) const override;
 
     /// @brief  Function that computes the number of KV cache blocks remaining to advance a request to completion (i.e.
     /// for maxNewTokens); the allocated blocks are excluded
     /// @param req The request for which we need to calculate the number of needed KV cache blocks
     /// @return  The number of blocks
-    [[nodiscard]] SizeType32 getRemainingBlocksToCompletion(
-        LlmRequest const& req, SizeType32 windowSize) const override;
+    [[nodiscard]] SizeType32 getRemainingBlocksToCompletion(LlmRequest const& req, SizeType32 windowSize,
+        std::optional<PrefixReuseSummary> const& cachedSummary = std::nullopt) const override;
 
     /// @brief Increase size for request with requestId. Allocate new KV cache block(s) if needed.
     void addToken(LlmRequest::RequestIdType requestId) override;
@@ -2159,14 +2244,9 @@ public:
     //! the placeholder block). It should be called before every forward step, after adding new tokens.
     void copyLinearAttentionBlock(LlmRequest const& llmRequest);
 
-    /// @brief Add new request to the KV cache manager.
-    /// @param inputLength Input length for which KV cache need to be allocated.
-    /// @param beamWidth Beam width for which KV cache need to be allocated.
-    /// @param llmRequest Optional request to use for KV cache lookup.
-    /// @details If llmRequest is supplied and KV cache reuse is enabled, try to recover KV cache blocks for
-    /// inputLength - 1 tokens and populate prepopulatedPromptLen.
-    void addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
-        OptionalRef<LlmRequest> llmRequest = std::nullopt) override;
+    void addSequenceBatch(
+        std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
+        std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests) override;
 
     [[nodiscard]] std::optional<KVCacheBlock::IdType> removeSequence(LlmRequest::RequestIdType requestId,
         OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinOnRelease = false) override;
@@ -2237,14 +2317,9 @@ public:
         return mBlockManager.getCacheType();
     }
 
-    //! \brief Find first new block that must be allocated for context phase and return it's concatenated token vector.
-    //! \details Only full blocks are considered.
-    [[nodiscard]] std::optional<BlockKey> findNewContextBlock(
+    //! \brief Combined prefix reuse analysis — single radix tree walk.
+    [[nodiscard]] PrefixReuseSummary analyzePrefixReuse(
         VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const override;
-
-    //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
-    [[nodiscard]] SizeType32 countReusableBlocks(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const override;
 
     //! \brief Store full context blocks contributed by llmRequest.
     //! \details These blocks become reusable from next step.
@@ -2331,6 +2406,12 @@ public:
         BlockKey const& blockKey, SizeType32 windowSize) override
     {
         return mBlockManager.findBlocksInReuseTreeByBlockKey(blockKey, windowSize);
+    }
+
+    std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(
+        std::vector<BlockKey> const& blockKeys, SizeType32 windowSize) override
+    {
+        return mBlockManager.findBlocksInReuseTreeByBlockKeys(blockKeys, windowSize);
     }
 
     void resetReuseState() override

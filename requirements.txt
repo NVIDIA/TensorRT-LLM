@@ -5,12 +5,12 @@ build
 colored
 cuda-python>=13
 diffusers>=0.27.0
+ftfy
 lark
 mpi4py
 numpy>=2.0.0,<2.4 # numba 0.63.1 requires numpy<2.4
 onnx>=1.18.0,<1.20.0
 onnx_graphsurgeon>=0.5.2
-onnxscript==0.5.4
 graphviz
 openai
 polygraphy
@@ -86,3 +86,4 @@ nvidia-cuda-tileiras>=13.1,<13.2
 etcd-sdk-python==0.0.7
 python-multipart
 smg-grpc-proto>=0.4.2
+cache-dit>=1.3.5

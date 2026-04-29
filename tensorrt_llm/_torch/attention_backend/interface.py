@@ -10,7 +10,7 @@ import torch
 from typing_extensions import Self
 
 if TYPE_CHECKING:
-    from ..speculative.utils import SpecDecodingTensor
+    from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
@@ -22,7 +22,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..memory_buffer_utils import Buffers
 from ..metadata import KVCacheParams
-from ..pyexecutor.mamba_cache_manager import MambaCacheManager
+from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 from ..pyexecutor.resource_manager import KVCacheManager, KVCacheManagerV2
 from ..utils import get_model_extra_attrs
 
@@ -65,9 +65,9 @@ class AttentionMetadata:
     # The max number of sequences in a single batch.
     max_num_sequences: Optional[int] = None
     # The KV cache manager.
-    kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2]
+    kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
     # Draft KV cache manager for one-model speculative decoding with separate KV cache layouts
-    draft_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2] = None
+    draft_kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2, None] = None
     mapping: Optional[Mapping] = None
 
     enable_flash_mla: bool = False
@@ -305,8 +305,7 @@ class AttentionMetadata:
             return
 
         if self.mamba_metadata is None:
-            if (self.kv_cache_manager is not None
-                    and isinstance(self.kv_cache_manager, MambaCacheManager)):
+            if isinstance(self.kv_cache_manager, BaseMambaCacheManager):
                 from ..modules.mamba.mamba2_metadata import Mamba2Metadata
                 self.mamba_metadata = Mamba2Metadata(self.max_num_requests,
                                                      self.mamba_chunk_size)
@@ -383,8 +382,7 @@ class AttentionMetadata:
             max_total_draft_tokens,
             model_is_wrapped: bool = False,
             spec_metadata: Optional['SpecMetadata'] = None,
-            spec_tree_manager: Optional['SpecTreeManager'] = None,
-            spec_decoding_tensor: Optional['SpecDecodingTensor'] = None):
+            spec_tree_manager: Optional['SpecTreeManager'] = None):
         """
         Hook to be called when using TRTLLM attention backend in spec-dec mode.
         """

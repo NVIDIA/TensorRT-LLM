@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -333,7 +333,8 @@ protected:
     {
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
-        mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
+        mManager->addSequenceBatch(
+            {{{llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*llmRequest)});
         if (isSender)
         {
             auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
@@ -447,13 +448,11 @@ struct CPMetaData
         mTotalNumBlocksAcrossCPRanks = (totalSeqLen + numTokensPerBlock - 1) / numTokensPerBlock;
         mNumBlocksThisCPRank = tensorrt_llm::executor::kv_cache::getBlockNumAccountingForCP(
             cpRank, cpSize, mTotalNumBlocksAcrossCPRanks);
-        mSeqLenOnThisCPRank = totalSeqLen;
+        // For round-robin distribution of blocks among CP ranks, the last block (which may have padded tokens)
+        // belongs to the CP rank with index (mTotalNumBlocksAcrossCPRanks - 1) % cpSize.
         int numPaddedTokensLastBlock = 0;
-        TLLM_CHECK_WITH_INFO(!tensorrt_llm::common::getEnvUseRoundRobinBlockDistForCP(),
-            "Round-robin block distribution for CP needs further adjustments.");
-        // If there are any padded tokens, they will be on the last block on last CP rank for contiguous distribution of
-        // blocks.
-        if (cpRank == cpSize - 1 && totalSeqLen % numTokensPerBlock != 0)
+        int const lastBlockOwnerCPRank = (mTotalNumBlocksAcrossCPRanks - 1) % cpSize;
+        if (cpRank == lastBlockOwnerCPRank && totalSeqLen % numTokensPerBlock != 0)
         {
             numPaddedTokensLastBlock = numTokensPerBlock - (totalSeqLen % numTokensPerBlock);
         }
@@ -461,8 +460,8 @@ struct CPMetaData
         mGlobalBlockIds = std::vector<int>(mNumBlocksThisCPRank);
         for (int i = 0; i < mNumBlocksThisCPRank; i++)
         {
-            mGlobalBlockIds[i] = tensorrt_llm::executor::kv_cache::getGlobalBlockIdAccountingForCP(
-                i, cpSize, cpRank, mTotalNumBlocksAcrossCPRanks);
+            // Round-robin distribution: localBlockIdx i on cpRank maps to global blockId (i * cpSize + cpRank).
+            mGlobalBlockIds[i] = i * cpSize + cpRank;
         }
     }
 };
@@ -929,7 +928,8 @@ protected:
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
         auto& llmRequest = request->mLlmRequest;
-        mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
+        mManager->addSequenceBatch(
+            {{{llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*llmRequest)});
         auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
 
         int const numPools = mManager->getBlockManager().getNumPools(
@@ -981,7 +981,8 @@ protected:
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
         auto& llmRequest = request->mLlmRequest;
-        mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
+        mManager->addSequenceBatch(
+            {{{llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth}}}, {std::ref(*llmRequest)});
         return mRequester->receiveAsync(*llmRequest);
     }
 

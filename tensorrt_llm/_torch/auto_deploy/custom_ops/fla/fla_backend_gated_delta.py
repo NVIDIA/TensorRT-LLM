@@ -33,9 +33,12 @@ import torch.nn.functional as F
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
-from .....llmapi.llm_args import KvCacheConfig
-from ....modules.fla.chunk import chunk_gated_delta_rule
-from ....modules.fla.fused_sigmoid_gating_recurrent import fused_sigmoid_gating_delta_rule_update
+from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
+from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
+    fused_sigmoid_gating_delta_rule_update,
+)
+
+from ..._compat import KvCacheConfig
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,

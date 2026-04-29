@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -63,12 +63,13 @@ public:
     //! \brief Synchronize internal streams with bufferManager stream.
     //! \details The buffer manager uses the same stream as the prefill and decode kernels. This method ensures that the
     //! internal kernels used for offloading and onboarding will wait for prefill and decode kernels before performing
-    //! any block copies. This method must be called before the first call to KVCacheManager::addSequence in every step.
+    //! any block copies. This method must be called before the first call to
+    //! KVCacheManager::addSequenceBatch in every step.
     void syncWithBufferManager();
 
     //! \brief Synchronize bufferManager stream with internal streams. This method ensures that prefill and decode
     //! kernels for next step will wait for offloading and onboarding work that has already been scheduled. This method
-    //! must be called after last call to KVCacheManager::addSequence in every step.
+    //! must be called after the last call to KVCacheManager::addSequenceBatch in every step.
     void syncTransfers();
 
     //! \brief Get transfer stats accumulated since last call, and reset the counters.

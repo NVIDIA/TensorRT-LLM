@@ -15,12 +15,12 @@ import torch.distributed as dist
 from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
 from tensorrt_llm._torch.utils import make_weak_ref
+from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline, ExtraParamSchema
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
-from tensorrt_llm._torch.visual_gen.teacache import CacheContext
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
@@ -202,12 +202,16 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
     """CUDAGraphRunner extended for LTX-2's ``Modality``-based transformer.
 
     The base runner derives graph keys from flat ``torch.Tensor`` args.
-    LTX-2's transformer takes ``Modality`` dataclasses (bundles of tensors)
-    and optional ``BatchedPerturbationConfig`` objects that affect control flow.
+    LTX-2's transformer takes ``Modality`` dataclasses (bundles of tensors),
+    optional ``BatchedPerturbationConfig``, and a ``TextCache`` kwarg.
 
     This subclass overrides key derivation, capture, and replay so that
     ``Modality`` tensors are included in the graph key, cloned into static
     buffers at capture time, and copied in-place at replay time.
+
+    ``TextCache`` is step-invariant (constant across the denoise loop),
+    so it is excluded from the graph key and passed through without
+    cloning or copying.
     """
 
     @staticmethod
@@ -227,7 +231,18 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
 
     def _key_parts_for(self, prefix, v):
         """Yield ``(label, shape_or_tag)`` pairs for a single argument."""
-        if isinstance(v, torch.Tensor):
+        from .text_cache import TextCache
+
+        if isinstance(v, TextCache):
+            # Step-invariant contents, but shape must still drive graph key:
+            # warmup and denoise may use different context lengths, which
+            # would otherwise silently reuse the wrong graph.
+            if v.video_context is not None:
+                yield (f"{prefix}.vctx", tuple(v.video_context.shape))
+            if v.audio_context is not None:
+                yield (f"{prefix}.actx", tuple(v.audio_context.shape))
+            return
+        elif isinstance(v, torch.Tensor):
             yield (prefix, tuple(v.shape))
         elif isinstance(v, Modality):
             yield (f"{prefix}.latent", tuple(v.latent.shape))
@@ -253,7 +268,35 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
     # -- clone / copy helpers ------------------------------------------------
 
     @staticmethod
+    def _clone_tensor_pair(pair):
+        return (pair[0].clone(), pair[1].clone()) if pair is not None else None
+
+    @staticmethod
+    def _copy_tensor_pair(dst, src):
+        if dst is None or src is None:
+            return
+        dst[0].copy_(src[0])
+        dst[1].copy_(src[1])
+
+    @staticmethod
     def _clone_value(v):
+        from .text_cache import TextCache
+
+        if isinstance(v, TextCache):
+            # Clone every tensor into static buffers — replay copies into these.
+            clone_pair = _LTX2CUDAGraphRunner._clone_tensor_pair
+            return TextCache(
+                video_context=v.video_context.clone() if v.video_context is not None else None,
+                video_mask=v.video_mask.clone() if v.video_mask is not None else None,
+                video_pe=clone_pair(v.video_pe),
+                video_cross_pe=clone_pair(v.video_cross_pe),
+                video_kv=[clone_pair(kv) for kv in v.video_kv] if v.video_kv is not None else None,
+                audio_context=v.audio_context.clone() if v.audio_context is not None else None,
+                audio_mask=v.audio_mask.clone() if v.audio_mask is not None else None,
+                audio_pe=clone_pair(v.audio_pe),
+                audio_cross_pe=clone_pair(v.audio_cross_pe),
+                audio_kv=[clone_pair(kv) for kv in v.audio_kv] if v.audio_kv is not None else None,
+            )
         if isinstance(v, torch.Tensor):
             return v.clone()
         if isinstance(v, Modality):
@@ -271,6 +314,29 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
     @staticmethod
     def _copy_value(dst, src):
         """Copy data from *src* into *dst* static buffer in-place."""
+        from .text_cache import TextCache
+
+        if isinstance(src, TextCache) and isinstance(dst, TextCache):
+            copy_pair = _LTX2CUDAGraphRunner._copy_tensor_pair
+            if dst.video_context is not None and src.video_context is not None:
+                dst.video_context.copy_(src.video_context)
+            if dst.video_mask is not None and src.video_mask is not None:
+                dst.video_mask.copy_(src.video_mask)
+            copy_pair(dst.video_pe, src.video_pe)
+            copy_pair(dst.video_cross_pe, src.video_cross_pe)
+            if dst.video_kv is not None and src.video_kv is not None:
+                for d, s in zip(dst.video_kv, src.video_kv):
+                    copy_pair(d, s)
+            if dst.audio_context is not None and src.audio_context is not None:
+                dst.audio_context.copy_(src.audio_context)
+            if dst.audio_mask is not None and src.audio_mask is not None:
+                dst.audio_mask.copy_(src.audio_mask)
+            copy_pair(dst.audio_pe, src.audio_pe)
+            copy_pair(dst.audio_cross_pe, src.audio_cross_pe)
+            if dst.audio_kv is not None and src.audio_kv is not None:
+                for d, s in zip(dst.audio_kv, src.audio_kv):
+                    copy_pair(d, s)
+            return dst
         if isinstance(src, torch.Tensor) and isinstance(dst, torch.Tensor):
             dst.copy_(src)
             return dst
@@ -788,7 +854,7 @@ class LTX2Pipeline(BasePipeline):
     # ------------------------------------------------------------------
 
     def post_load_weights(self) -> None:
-        """Finalize after weight loading: TeaCache, derived attributes."""
+        """Finalize after weight loading: TeaCache, Cache-DiT, derived attributes."""
         super().post_load_weights()
 
         # TODO: TeaCache disabled: LTX2_TEACACHE_COEFFICIENTS are unverified.
@@ -798,6 +864,10 @@ class LTX2Pipeline(BasePipeline):
         #     LTX2TeaCacheExtractor(self._compute_ltx2_timestep_embedding),
         # )
         # self._setup_teacache(self.transformer, coefficients=LTX2_TEACACHE_COEFFICIENTS)
+
+        # Cache-DiT
+        if self.transformer is not None and self.model_config.cache_backend == "cache_dit":
+            self._setup_cache_acceleration(self.transformer, coefficients=None)
 
         # Compression ratios from native scale factors
         self.vae_spatial_compression_ratio = VIDEO_SCALE_FACTORS.width
@@ -1040,78 +1110,82 @@ class LTX2Pipeline(BasePipeline):
     # Inference
     # ------------------------------------------------------------------
 
-    DEFAULT_GENERATION_PARAMS = {
-        "height": 512,
-        "width": 768,
-        "num_inference_steps": 40,
-        "guidance_scale": 4.0,
-        "max_sequence_length": 1024,
-        "num_frames": 121,
-        "frame_rate": 24.0,
-        "image_cond_strength": 1.0,
-    }
+    @property
+    def default_generation_params(self):
+        return {
+            "height": 512,
+            "width": 768,
+            "num_inference_steps": 40,
+            "guidance_scale": 4.0,
+            "max_sequence_length": 1024,
+            "num_frames": 121,
+            "frame_rate": 24.0,
+            "image_cond_strength": 1.0,
+        }
 
-    EXTRA_PARAM_SPECS = {
-        "output_type": ExtraParamSchema(
-            type="str",
-            default="pt",
-            description="Output type: 'pt' for PyTorch tensors, 'pil' for PIL images.",
-        ),
-        "guidance_rescale": ExtraParamSchema(
-            type="float",
-            default=0.0,
-            description="Guidance rescale factor to prevent overexposure.",
-        ),
-        "stg_scale": ExtraParamSchema(
-            type="float",
-            default=0.0,
-            description="Spatiotemporal guidance scale for multi-modal guidance.",
-        ),
-        "stg_blocks": ExtraParamSchema(
-            type="list",
-            description="Transformer block indices for STG perturbation.",
-        ),
-        "modality_scale": ExtraParamSchema(
-            type="float",
-            default=1.0,
-            description="Modality guidance scale for multi-modal generation.",
-        ),
-        "rescale_scale": ExtraParamSchema(
-            type="float",
-            default=0.0,
-            range=(0.0, 1.0),
-            description="CFG rescale factor for multi-modal guidance.",
-        ),
-        "guidance_skip_step": ExtraParamSchema(
-            type="int",
-            default=0,
-            description="Number of initial denoising steps to skip guidance.",
-        ),
-        "enhance_prompt": ExtraParamSchema(
-            type="bool",
-            default=False,
-            description="Use Gemma3 LLM to enhance the prompt before generation.",
-        ),
-    }
+    @property
+    def extra_param_specs(self):
+        return {
+            "output_type": ExtraParamSchema(
+                type="str",
+                default="pt",
+                description="Output type: 'pt' for PyTorch tensors, 'pil' for PIL images.",
+            ),
+            "guidance_rescale": ExtraParamSchema(
+                type="float",
+                default=0.0,
+                description="Guidance rescale factor to prevent overexposure.",
+            ),
+            "stg_scale": ExtraParamSchema(
+                type="float",
+                default=0.0,
+                description="Spatiotemporal guidance scale for multi-modal guidance.",
+            ),
+            "stg_blocks": ExtraParamSchema(
+                type="list",
+                description="Transformer block indices for STG perturbation.",
+            ),
+            "modality_scale": ExtraParamSchema(
+                type="float",
+                default=1.0,
+                description="Modality guidance scale for multi-modal generation.",
+            ),
+            "rescale_scale": ExtraParamSchema(
+                type="float",
+                default=0.0,
+                range=(0.0, 1.0),
+                description="CFG rescale factor for multi-modal guidance.",
+            ),
+            "guidance_skip_step": ExtraParamSchema(
+                type="int",
+                default=0,
+                description="Number of initial denoising steps to skip guidance.",
+            ),
+            "enhance_prompt": ExtraParamSchema(
+                type="bool",
+                default=False,
+                description="Use Gemma3 LLM to enhance the prompt before generation.",
+            ),
+        }
 
     def infer(self, req):
         """Run inference with request parameters."""
-        extra = req.extra_params or {}
+        extra = req.params.extra_params or {}
         return self.forward(
             prompt=req.prompt,
-            negative_prompt=req.negative_prompt,
-            height=req.height,
-            width=req.width,
-            num_frames=req.num_frames,
-            frame_rate=req.frame_rate,
-            num_inference_steps=req.num_inference_steps,
-            guidance_scale=req.guidance_scale,
-            seed=req.seed,
+            negative_prompt=req.params.negative_prompt,
+            height=req.params.height,
+            width=req.params.width,
+            num_frames=req.params.num_frames,
+            frame_rate=req.params.frame_rate,
+            num_inference_steps=req.params.num_inference_steps,
+            guidance_scale=req.params.guidance_scale,
+            seed=req.params.seed,
             output_type=extra["output_type"],
             guidance_rescale=extra["guidance_rescale"],
-            max_sequence_length=req.max_sequence_length,
-            image=req.image,
-            image_cond_strength=req.image_cond_strength,
+            max_sequence_length=req.params.max_sequence_length,
+            image=req.params.image,
+            image_cond_strength=req.params.image_cond_strength,
             stg_scale=extra["stg_scale"],
             stg_blocks=extra["stg_blocks"],
             modality_scale=extra["modality_scale"],
@@ -1418,7 +1492,66 @@ class LTX2Pipeline(BasePipeline):
         if do_stg and stg_blocks:
             stg_perturbation = build_stg_perturbation_config(stg_blocks)
 
-        # ---- 8. Denoising loop ------------------------------------------
+        # ---- 8. Pre-compute text cache(s) for the denoise loop ---------------
+        # Determine which text context this rank needs:
+        #   batched CFG (1 GPU, no multi-modal guidance): cat([neg, cond]) batch=2
+        #   CFG parallel rank 1: neg context only
+        #   everything else: cond context only
+        has_audio = audio_latents is not None
+        batched_cfg = do_cfg and cfg_size < 2 and not use_multi_modal_guidance
+        is_uncond_rank = cfg_size >= 2 and cfg_rank != 0 and do_cfg
+
+        if batched_cfg:
+            v_ctx = torch.cat([neg_video_embeds, video_embeds])
+            v_mask = (
+                torch.cat([neg_connector_mask, connector_mask])
+                if connector_mask is not None
+                else None
+            )
+            a_ctx = torch.cat([neg_audio_embeds, audio_embeds]) if has_audio else None
+            a_mask = (
+                torch.cat([neg_connector_mask, connector_mask])
+                if has_audio and connector_mask is not None
+                else None
+            )
+        elif is_uncond_rank:
+            v_ctx, v_mask = neg_video_embeds, neg_connector_mask
+            a_ctx = neg_audio_embeds if has_audio else None
+            a_mask = neg_connector_mask if has_audio else None
+        else:
+            v_ctx, v_mask = video_embeds, connector_mask
+            a_ctx = audio_embeds if has_audio else None
+            a_mask = connector_mask if has_audio else None
+
+        _text_cache = self.transformer.prepare_text_cache(
+            video_context=v_ctx,
+            video_context_mask=v_mask,
+            video_positions=video_positions,
+            audio_context=a_ctx,
+            audio_context_mask=a_mask,
+            audio_positions=audio_positions if has_audio else None,
+            dtype=self.dtype,
+        )
+
+        # Uncond cache — only when multi-modal guidance runs separate uncond passes.
+        _text_cache_uncond = (
+            self.transformer.prepare_text_cache(
+                video_context=neg_video_embeds,
+                video_context_mask=neg_connector_mask,
+                video_positions=video_positions,
+                audio_context=neg_audio_embeds if has_audio else None,
+                audio_context_mask=neg_connector_mask if has_audio else None,
+                audio_positions=audio_positions if has_audio else None,
+                dtype=self.dtype,
+            )
+            if use_multi_modal_guidance and do_cfg
+            else None
+        )
+
+        # Cache encoder output for two-stage Stage 2 reuse.
+        self._cached_encoder_output = (video_embeds, audio_embeds, connector_mask)
+
+        # ---- 9. Denoising loop ------------------------------------------
         def _run_transformer(
             v_latents,
             a_latents,
@@ -1427,6 +1560,8 @@ class LTX2Pipeline(BasePipeline):
             a_context,
             mask,
             perturbations=None,
+            *,
+            text_cache,
         ):
             """Single transformer pass → (denoised_video, denoised_audio).
 
@@ -1476,6 +1611,7 @@ class LTX2Pipeline(BasePipeline):
                 video=video_mod,
                 audio=audio_mod,
                 perturbations=perturbations,
+                text_cache=text_cache,
             )
 
             dn_v = None
@@ -1519,6 +1655,7 @@ class LTX2Pipeline(BasePipeline):
                     encoder_hidden_states,
                     extra_tensors.get("audio_embeds", audio_embeds),
                     extra_tensors.get("attention_mask", connector_mask),
+                    text_cache=_text_cache,
                 )
                 return dn_v, {"audio": dn_a}
 
@@ -1534,6 +1671,7 @@ class LTX2Pipeline(BasePipeline):
                         video_embeds,
                         audio_embeds,
                         connector_mask,
+                        text_cache=_text_cache,
                     )
                 else:
                     local_v, local_a = _run_transformer(
@@ -1543,6 +1681,7 @@ class LTX2Pipeline(BasePipeline):
                         neg_video_embeds,
                         neg_audio_embeds,
                         neg_connector_mask,
+                        text_cache=_text_cache_uncond,
                     )
 
                 local_v = local_v.contiguous()
@@ -1568,6 +1707,7 @@ class LTX2Pipeline(BasePipeline):
                     video_embeds,
                     audio_embeds,
                     connector_mask,
+                    text_cache=_text_cache,
                 )
                 uncond_v = 0.0
                 uncond_a = 0.0
@@ -1579,6 +1719,7 @@ class LTX2Pipeline(BasePipeline):
                         neg_video_embeds,
                         neg_audio_embeds,
                         neg_connector_mask,
+                        text_cache=_text_cache_uncond,
                     )
 
             # STG: perturbed attention pass
@@ -1596,6 +1737,7 @@ class LTX2Pipeline(BasePipeline):
                     audio_embeds,
                     connector_mask,
                     perturbations=batched,
+                    text_cache=_text_cache,
                 )
 
             # Modality guidance: disable cross-modal attention
@@ -1609,6 +1751,7 @@ class LTX2Pipeline(BasePipeline):
                     video_embeds,
                     None,
                     connector_mask,
+                    text_cache=_text_cache,
                 )
                 if audio_latents_in is not None:
                     _, iso_a = _run_transformer(
@@ -1618,6 +1761,7 @@ class LTX2Pipeline(BasePipeline):
                         None,
                         audio_embeds,
                         connector_mask,
+                        text_cache=_text_cache,
                     )
 
             guided_v = video_guider.calculate(cond_v, uncond_v, perturbed_v, iso_v)

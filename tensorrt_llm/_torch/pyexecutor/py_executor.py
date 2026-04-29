@@ -27,10 +27,11 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
                                             RequestStage, RequestStats,
-                                            SpecDecodingStats,
+                                            RequestType, SpecDecodingStats,
                                             StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
+from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
@@ -49,6 +50,7 @@ from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
+from .error_classification import ErrorBudget
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
@@ -118,6 +120,20 @@ def _load_iteration_indexes(env_var: str):
                 ) from None
 
     return frozenset(starts), frozenset(stops)
+
+
+def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
+    """Drop pinned encoder cache and raw pre-encoder tensors after prefill completes.
+
+    Wraps `strip_mm_data_for_generation` and mutates the shared `request.py_multimodal_data`
+    in-place so the `LlmRequest`'s multimodal tensors actually get freed (unlike
+    `MultimodalParams.strip_for_generation`, which rebinds a per-forward-call wrapper's attribute
+    and leaves the request's dict untouched).
+    """
+    mm_data = getattr(request, "py_multimodal_data", None)
+    if not mm_data:
+        return
+    strip_mm_data_for_generation(mm_data)
 
 
 @dataclasses.dataclass
@@ -388,12 +404,6 @@ class PyExecutor:
             self.enable_kv_cache_reuse
             and self.kv_cache_manager.enable_partial_reuse)
 
-        self.adp_router: ADPRouter = ADPRouter.create(
-            dist=self.dist,
-            kv_cache_manager=self.kv_cache_manager,
-            attention_dp_config=self.llm_args.attention_dp_config,
-        )
-
         self.max_input_len = max_input_len
         # _executor_loop private data
         self.max_num_active_requests = model_engine.get_max_num_sequences()
@@ -405,6 +415,16 @@ class PyExecutor:
             self.resource_manager,
             should_store_blocks=self.enable_partial_reuse_for_disagg
             and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1)
+
+        # Router is built after async_transfer_manager so KVCacheAwareADPRouter
+        # can receive the transfer-manager reference at construction time.
+        self.adp_router: ADPRouter = ADPRouter.create(
+            dist=self.dist,
+            kv_cache_manager=self.kv_cache_manager,
+            attention_dp_config=self.llm_args.attention_dp_config,
+            async_transfer_manager=self.async_transfer_manager,
+        )
+
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
@@ -462,6 +482,8 @@ class PyExecutor:
             self.kv_cache_manager.snapshot_warmup_baseline()
 
         self.is_shutdown = False
+        self._fatal_error: Optional[BaseException] = None
+        self._error_budget = ErrorBudget()
         self.max_batch_size = max_batch_size
         self.adp_ctx_waiting_iters_count = 0
         self.adp_ctx_batching_wait_iters_count = 0
@@ -1183,6 +1205,108 @@ class PyExecutor:
             # Calculate draft overhead
             stats.specdec_stats.draft_overhead = 0.0 if iter_latency_ms <= 0.0 else float(
                 draft_latency_ms) / float(iter_latency_ms)
+
+        # Extra per-iteration request-aggregate counters attached to
+        # inflight_batching_stats. These complement the existing
+        # num_context_requests / num_gen_requests / num_ctx_tokens /
+        # num_paused_requests members with token-weighted counts and
+        # queue/paused KV accounting.
+
+        # Tokens read from prior state (prefix-cache hits and
+        # previously-chunked tokens) summed across scheduled context
+        # requests; complements num_ctx_tokens (tokens computed this
+        # iteration). Read from py_last_context_chunk, a Python-side
+        # cache set by _update_request_states before state mutation — it
+        # stays valid after the request transitions to
+        # GENERATION_IN_PROGRESS, unlike the C++ getContextChunkSize() /
+        # getContextCurrentPosition() accessors that would raise
+        # RuntimeError on a mutated request.
+        num_ctx_kv_tokens = 0
+        for req in scheduled_batch.context_requests:
+            if getattr(req, "is_attention_dp_dummy", False):
+                continue
+            last_chunk = getattr(req, "py_last_context_chunk", None)
+            if last_chunk is not None and last_chunk[0] is not None:
+                start, _end = last_chunk
+                num_ctx_kv_tokens += start
+            else:
+                try:
+                    num_ctx_kv_tokens += \
+                        req.context_current_position
+                except RuntimeError:
+                    pass
+
+        # Total KV context length (prompt + tokens generated so far)
+        # summed across scheduled generation requests.
+        num_gen_kv_tokens = 0
+        for req in scheduled_batch.generation_requests:
+            if getattr(req, "is_attention_dp_dummy", False):
+                continue
+            try:
+                num_gen_kv_tokens += req.get_num_tokens(0)
+            except RuntimeError:
+                pass
+
+        # Normal requests waiting in the executor_request_queue that have
+        # never been scheduled. Excludes non-normal control items
+        # (shutdown/cancel) and items with a missing payload. Each queued
+        # item is a RequestQueueItem wrapping an ExecutorRequest
+        # (tle::Request). Requests are routed by request_type:
+        #   - CONTEXT_AND_GENERATION (default) and CONTEXT_ONLY
+        #     (disagg-prefill side) -> queued-context counters.
+        #   - GENERATION_ONLY (disagg-decode side, awaiting KV transfer
+        #     before they can start decoding) -> queued-gen counters.
+        # On a non-disagg engine all items land in the context counters;
+        # on a disagg-decode engine all items land in the gen counters.
+        num_queued_context_requests = 0
+        num_queued_ctx_tokens = 0
+        num_queued_gen_requests = 0
+        num_queued_gen_kv_tokens = 0
+        for item in list(self.executor_request_queue.get_request_queue().queue):
+            if not item.is_normal_request:
+                continue
+            if item.request is None:
+                continue
+            try:
+                token_count = len(item.request.input_token_ids)
+            except (AttributeError, TypeError) as e:
+                # Unusual request shape with no usable token payload;
+                # exclude from all queued counters so downstream consumers
+                # see consistent per-request averages. Not expected on the
+                # current API (ExecutorRequest construction requires a
+                # non-empty input_token_ids), logged so future API drift
+                # surfaces instead of being silently dropped.
+                logger.warning(f"Excluding queued item {item.id} from queued "
+                               f"counters: input_token_ids not readable "
+                               f"({type(e).__name__})")
+                continue
+            if item.request.request_type == RequestType.REQUEST_TYPE_GENERATION_ONLY:
+                num_queued_gen_requests += 1
+                num_queued_gen_kv_tokens += token_count
+            else:
+                num_queued_context_requests += 1
+                num_queued_ctx_tokens += token_count
+
+        # Total KV context length summed across paused (preempted-decode)
+        # requests — were decoding but got evicted back to the waiting
+        # pool for this iteration.
+        num_paused_kv_tokens = 0
+        for req in scheduled_batch.paused_requests:
+            if getattr(req, "is_attention_dp_dummy", False):
+                continue
+            try:
+                num_paused_kv_tokens += req.get_num_tokens(0)
+            except RuntimeError:
+                pass
+
+        stats.inflight_batching_stats.num_ctx_kv_tokens = num_ctx_kv_tokens
+        stats.inflight_batching_stats.num_gen_kv_tokens = num_gen_kv_tokens
+        stats.inflight_batching_stats.num_queued_context_requests = num_queued_context_requests
+        stats.inflight_batching_stats.num_queued_ctx_tokens = num_queued_ctx_tokens
+        stats.inflight_batching_stats.num_queued_gen_requests = num_queued_gen_requests
+        stats.inflight_batching_stats.num_queued_gen_kv_tokens = num_queued_gen_kv_tokens
+        stats.inflight_batching_stats.num_paused_kv_tokens = num_paused_kv_tokens
+
         return stats
 
     def _append_iter_stats(self,
@@ -1397,6 +1521,7 @@ class PyExecutor:
 
                 can_queue, _ = self._can_queue(scheduled_batch)
                 if not can_queue:
+                    self._revert_gen_alloc(scheduled_batch)
                     logger.debug(
                         f"microbatch {microbatch_id} cannot be queued, skipping"
                     )
@@ -1623,13 +1748,6 @@ class PyExecutor:
             if executed_batch is None:
                 break
             self._ring_broadcast_sample_state(executed_batch)
-            # Flush the last isend before this thread goes idle on
-            # queue.get() — otherwise no MPI call will be made to drive
-            # progress and the non-blocking send data will never reach
-            # the receiver, causing a deadlock.
-            if self.executed_batch_queue.empty():
-                self.wait_on_pp_send_handles(self.send_handles,
-                                             executed_batch.microbatch_id)
         set_thread_local_mpi_comm(None)
         new_mpi_comm.Free()
 
@@ -1771,7 +1889,7 @@ class PyExecutor:
 
             self.model_engine.runtime_draft_len = runtime_draft_len
         else:
-            self.model_engine.runtime_draft_len = self.model_engine.max_draft_len
+            self.model_engine.runtime_draft_len = self.model_engine.max_total_draft_tokens
 
     def _can_queue(self, scheduled_batch):
 
@@ -1786,6 +1904,24 @@ class PyExecutor:
             can_queue = can_queue_this_rank = scheduled_batch.batch_size > 0
 
         return can_queue, can_queue_this_rank
+
+    def _revert_gen_alloc(self, scheduled_batch):
+        """Revert KV cache capacity growth when the batch is skipped.
+
+        With attention DP, can_queue=False means another rank has an empty
+        batch so no forward pass will run.  The V2 scheduler already grew
+        each generation request's KV cache capacity during scheduling;
+        revert that growth so it does not accumulate across skipped
+        iterations and overflow the host page-index buffer.
+
+        Only applies to KV cache manager V2 + scheduler V2, because the V2
+        scheduler allocates KV cache capacity during scheduling, before the
+        can_queue check.  V1 allocates in prepare_resources() after the
+        can_queue check, so no revert is needed.
+        """
+        if self._scheduler_manages_kv_suspend:
+            for req in scheduled_batch.generation_requests:
+                self.kv_cache_manager.revert_allocate_generation(req)
 
     def _prepare_and_schedule_batch(self):
         new_requests = self._fetch_and_activate_new_requests()
@@ -2059,6 +2195,9 @@ class PyExecutor:
                 if self.kv_connector_manager:
                     can_queue, _ = self._can_queue(scheduled_batch)
 
+                if not can_queue:
+                    self._revert_gen_alloc(scheduled_batch)
+
                 if can_queue:
                     # init_disagg_gen_requests must be before drafter loop, otherwise draft requests do not have initialized matchers.
                     # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
@@ -2078,9 +2217,10 @@ class PyExecutor:
                             with torch.cuda.stream(self.execution_stream):
                                 self.drafter.prepare_draft_tokens(
                                     scheduled_batch, self.resource_manager)
-                                # Pad draft tokens to the max draft length. This is for CUDA graph compatibility.
+                                # Pad draft tokens to the max draft length and extend KV cache
+                                # capacity to match. This is for CUDA graph compatibility.
                                 self.drafter.pad_draft_tokens_for_cuda_graph(
-                                    scheduled_batch)
+                                    scheduled_batch, self.resource_manager)
                             torch.cuda.current_stream().wait_stream(
                                 self.execution_stream)
                         # add_batch must be called again to restore to target requests with updated draft tokens.
@@ -2309,6 +2449,9 @@ class PyExecutor:
                 if self.kv_connector_manager:
                     can_queue, can_queue_this_rank = self._can_queue(
                         scheduled_batch)
+
+                if not can_queue:
+                    self._revert_gen_alloc(scheduled_batch)
 
                 # If the batch is not empty on this rank, but empty on other ranks,
                 # we need to delay the update of the previous batch's sample state,
@@ -2686,6 +2829,7 @@ class PyExecutor:
             # extra allgather. When introducing new router implementations
             # (e.g. KV-cache-aware) that need new_requests to gather additional
             # info, the allgather position may need to be revisited.
+
             all_rank_states = self.adp_router.gather_all_rank_states(
                 active_requests)
             all_ranks_num_active_requests = [
@@ -2784,7 +2928,9 @@ class PyExecutor:
                 self._validate_request(request)
                 return False
             except Exception as e:
-                self._handle_errors(str(e), requests=[request])
+                self._handle_errors(str(e),
+                                    requests=[request],
+                                    charge_budget=False)
                 return True
 
         new_requests_cur_rank = self._fetch_new_requests(
@@ -2859,6 +3005,50 @@ class PyExecutor:
                     balanced_context_requests = context_requests
         return balanced_context_requests
 
+    @staticmethod
+    def _compute_scheduled_tokens(context_requests, generation_requests):
+        """Compute the total number of scheduled tokens for batch waiting decisions.
+
+        For context requests, we estimate the actual compute tokens for this
+        iteration (excluding tokens served from KV cache).
+
+        For generation requests, each contributes 1 + num_draft_tokens.
+
+        Note on reusable token handling:
+        estimated_reusable_tokens is an absolute count from position 0.
+        Depending on the scheduler, context_current_position may or may not
+        have been advanced past the reusable prefix by the time this method
+        is called:
+        - V1 scheduler: prepare_context runs after scheduling, so
+          context_current_position is still 0.
+        - V2 scheduler: prepare_context runs during scheduling, so
+          context_current_position is already advanced to the reused offset.
+        To handle both correctly, the reusable credit applied to the current
+        chunk is max(0, reusable - context_current_position), i.e. only the
+        portion of the reusable range that falls within this chunk's span.
+        """
+        num_scheduled_ctx_tokens = 0
+        for ctx_req in context_requests:
+            reusable = (ctx_req.estimated_reusable_tokens
+                        if ctx_req.is_first_context_chunk else 0)
+            # Credit only the reusable tokens that overlap with the current
+            # chunk: if context_current_position has already been advanced past
+            # the reusable prefix (V2), the credit is 0; if not (V1), the full
+            # reusable count is subtracted.
+            reusable_in_chunk = max(0,
+                                    reusable - ctx_req.context_current_position)
+            remaining = ctx_req.context_remaining_length
+            if reusable_in_chunk <= 0:
+                compute = ctx_req.context_chunk_size
+            elif reusable_in_chunk + ctx_req.context_chunk_size < remaining:
+                compute = ctx_req.context_chunk_size
+            else:
+                compute = max(1, remaining - reusable_in_chunk)
+            num_scheduled_ctx_tokens += compute
+        num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
+                                       for gen_req in generation_requests)
+        return num_scheduled_ctx_tokens + num_scheduled_gen_tokens
+
     def _waiting_requests(self, context_requests: list[LlmRequest],
                           generation_requests: list[LlmRequest]):
         """
@@ -2868,11 +3058,8 @@ class PyExecutor:
         - The number of waiting iterations is smaller than `self.batch_wait_timeout_iters`.
         """
 
-        num_scheduled_ctx_tokens = sum(
-            len(ctx_req.get_tokens(0)) for ctx_req in context_requests)
-        num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
-                                       for gen_req in generation_requests)
-        num_scheduled_tokens = num_scheduled_ctx_tokens + num_scheduled_gen_tokens
+        num_scheduled_tokens = self._compute_scheduled_tokens(
+            context_requests, generation_requests)
 
         should_waiting = self.batch_wait_iters_count < self.batch_wait_timeout_iters and num_scheduled_tokens < self.batch_wait_max_tokens_ratio * self.max_num_tokens
         if should_waiting:
@@ -3237,7 +3424,8 @@ class PyExecutor:
         if error_requests:
             self._handle_errors(
                 f"Error in kv cache transfer for {error_msg_prefix}",
-                requests=error_requests)
+                requests=error_requests,
+                charge_budget=False)
 
     @nvtx_range("_check_disagg_ctx_cache_transfer_status")
     def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):
@@ -3365,6 +3553,12 @@ class PyExecutor:
                     request.context_chunk_size)
                 request.move_to_next_context_chunk()
             if request.context_remaining_length == 0:
+                # Prefill is done for this request; drop pinned encoder outputs
+                # (multimodal_embedding) and raw pre-encoder tensors that multimodal models stashed
+                # on `py_multimodal_data`. Without this, encoder inputs and outputs for multi-modal
+                # requests stay pinned on GPU through the full decode lifetime and can lead to OOMs
+                # at high concurrency.
+                _strip_py_multimodal_data_post_prefill(request)
                 if not self.disable_overlap_scheduler and request.will_complete_next_iteration(
                 ):
                     request.set_exclude_last_generation_logits(False)
@@ -3458,10 +3652,101 @@ class PyExecutor:
     def _handle_errors(self,
                        error_msg: Optional[str] = None,
                        *,
-                       requests: Optional[List[LlmRequest]] = None):
+                       requests: Optional[List[LlmRequest]] = None,
+                       charge_budget: bool = True) -> None:
+        """Fail requests and optionally initiate shutdown on fatal errors.
+
+        When ``charge_budget`` is True (the default), classifies the error
+        via the error budget.  If deemed fatal (immediate-fatal pattern or
+        budget exhausted), **all** active requests are failed and a shutdown
+        is enqueued.  Otherwise only the requests in *requests* are failed.
+
+        When ``charge_budget`` is False, the error is treated as a
+        per-request failure: only the specified requests are failed, the
+        error budget is not consumed, and shutdown is never triggered.
+        Use this for request-scoped errors (validation, KV-transfer
+        timeout, guided-decoder) that should not affect server health.
+
+        .. note::
+            The ``charge_budget=False`` path reuses the full
+            ``_handle_errors`` machinery (queue drain, response
+            enqueue, terminate) even though it only needs to fail a
+            single request.  A future improvement would be to extract
+            a lightweight ``_fail_request(request, error_msg)`` helper
+            for request-scoped failures, keeping ``_handle_errors``
+            focused on system-level errors that may crash the engine.
+
+        Args:
+            error_msg: Human-readable error description.  Defaults to
+                ``"error"`` when ``None``.
+            requests: Subset of active requests to fail.  When ``None``
+                (or when the error is fatal), all ``active_requests`` are
+                failed.
+            charge_budget: Whether to consume the error budget.  Set to
+                False for request-scoped errors that should not affect
+                server health.
+        """
         error_responses: Dict[int, LlmResponse] = {}
         error_msg = error_msg or "error"
-        failed_requests = requests if requests is not None else self.active_requests
+
+        is_fatal = (self._error_budget.consume(error_msg)
+                    if charge_budget else False)
+        if is_fatal and self._error_budget.budget < 1e-9:
+            logger.error(f"Error budget exhausted "
+                         f"(budget={self._error_budget.budget:.3f}), "
+                         "treating as fatal")
+
+        if is_fatal:
+            self._fatal_error = RuntimeError(f"Fatal error: {error_msg}")
+            self.is_shutdown = True
+            logger.error(
+                f"Fatal error detected, initiating shutdown: {error_msg}")
+            requests = None
+
+            # Drain waiting_queue so that queued-but-not-yet-activated
+            # requests don't get picked up on the next iteration.
+            # These are RequestQueueItems (not yet LlmRequests), so we
+            # fail them via error responses.  Buffer all responses and
+            # call _enqueue_responses once after the loop so every rank
+            # enters the same number of collectives (attention-DP /
+            # gather-all modes use collective gathers internally).
+            waiting_responses: List[Tuple[int, LlmResponse]] = []
+            while self.waiting_queue:
+                item = self.waiting_queue.pop_request()
+                if (self.gather_all_responses
+                        or self.dist.rank == 0) and item.request is not None:
+                    waiting_responses.append(
+                        (item.id,
+                         LlmResponse(request_id=item.id,
+                                     error_msg=error_msg,
+                                     client_id=getattr(item.request,
+                                                       'client_id', None))))
+            # Also drain executor_request_queue so items already queued
+            # but not yet fetched by the main loop are not scheduled
+            # after the CUDA context is corrupted.  Safe to use empty()
+            # here because is_shutdown is True and the queue's active
+            # flag is about to be set False, so no new items arrive.
+            raw_queue = self.executor_request_queue.get_request_queue()
+            while not raw_queue.empty():
+                item = raw_queue.get_nowait()
+                if item.is_shutdown_request:
+                    continue
+                if ((self.gather_all_responses or self.dist.rank == 0)
+                        and item.request is not None):
+                    waiting_responses.append(
+                        (item.id,
+                         LlmResponse(request_id=item.id,
+                                     error_msg=error_msg,
+                                     client_id=getattr(item.request,
+                                                       'client_id', None))))
+
+            if waiting_responses:
+                self._enqueue_responses(waiting_responses)
+                logger.info(f"Drained {len(waiting_responses)} queued requests "
+                            "on fatal error")
+
+        failed_requests = (list(self.active_requests)
+                           if requests is None else requests)
         for request in failed_requests:
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
@@ -3479,6 +3764,9 @@ class PyExecutor:
         self._enqueue_responses(list(error_responses.items()))
         for request in failed_requests:
             self._terminate_request(request)
+
+        if self._fatal_error is not None:
+            self.executor_request_queue.enqueue_shutdown_request()
 
     def _terminate_request(self, request: LlmRequest):
         # Dummy requests don't participate in disagg KV cache transfers,
@@ -3645,7 +3933,8 @@ class PyExecutor:
                 if is_cancelled:
                     self._handle_errors(
                         error_msg=f"Request {request.py_request_id} timed out",
-                        requests=[request])
+                        requests=[request],
+                        charge_budget=False)
                 continue
 
             if request.is_generation_only_request() and not request.is_finished:
@@ -3853,7 +4142,9 @@ class PyExecutor:
             if request.py_request_id not in failed_req_id_to_err:
                 continue
             error_msg = failed_req_id_to_err[request.py_request_id]
-            self._handle_errors(error_msg, requests=[request])
+            self._handle_errors(error_msg,
+                                requests=[request],
+                                charge_budget=False)
 
 
 class DisaggPPTerminationHandler:

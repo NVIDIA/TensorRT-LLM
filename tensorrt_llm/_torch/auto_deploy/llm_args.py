@@ -17,6 +17,7 @@ from ...llmapi.llm_args import (
 )
 from .models import ModelFactory, ModelFactoryRegistry
 from .utils._config import DynamicYamlMixInForSettings
+from .utils.dist_config import DistConfig
 from .utils.logger import ad_logger
 
 PathLike = Union[str, Path]
@@ -228,7 +229,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     )
 
     ### INFERENCE OPTIMIZER CONFIG #################################################################
-    mode: Literal["graph", "transformers", "export_edgellm_onnx"] = Field(
+    mode: Literal["graph", "transformers"] = Field(
         default="graph",
         description="The mode to use for the inference optimizer. Currently, we "
         "support only the 'graph' and 'transformers' modes, i.e., full-graph capture + optimization"
@@ -382,28 +383,38 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     def is_cuda_graph_enabled(self) -> bool:
         return self.compile_backend in ["torch-cudagraph", "torch-opt"]
 
-    def init_mapping_from_config(self, rank: int, world_size: int) -> Mapping:
-        sharding_config = self.transforms.get("detect_sharding", {})
+    def init_dist_config(self, rank: int, world_size: int) -> DistConfig:
+        """Build DistConfig from YAML transform config and runtime MPI info.
+
+        Reads ``dist_mapping`` from ``apply_sharding_hints`` (preferred) or
+        ``detect_sharding`` (fallback).  Runtime ``rank`` and ``world_size``
+        come from MPI, not from YAML.
+
+        Note: AutoDeploy blocks direct parallelism fields (tensor_parallel_size,
+        etc.) via ``ensure_no_custom_parallel_config``.  Users configure MoE
+        topology exclusively through YAML ``dist_mapping`` blocks.  If that
+        restriction is lifted in the future, a Tier-1 path deriving DistConfig
+        from ``self.parallel_config.to_mapping()`` should be added here.
+        """
+        ash = self.transforms.get("apply_sharding_hints", {})
+        sharding_config = (
+            ash if ash.get("enabled", False) else self.transforms.get("detect_sharding", {})
+        )
         dist_mapping_config = sharding_config.get("dist_mapping", {})
         enable_attention_dp = sharding_config.get("enable_attention_dp", False)
 
-        # Determine MoE parallelism dimensions
         if enable_attention_dp:
-            # EP + TP 2D parallelism is currently NOT supported with attention-DP.
-            # EP-only: experts sharded across GPUs, use all-to-all dispatch/combine
             moe_ep_size = self.world_size
             moe_tp_size = 1
             ad_logger.info(
                 f"Attention-DP with EP-only MoE: moe_ep_size={moe_ep_size}, moe_tp_size={moe_tp_size}"
             )
         else:
-            # No attention-DP: use dist_mapping config or defaults
             moe_tp_size = dist_mapping_config.get("moe_tp", 1)
             moe_ep_size = dist_mapping_config.get("moe_ep", self.world_size)
 
-        # Create Mapping with proper distributed configuration
         try:
-            mapping = Mapping(
+            dc = DistConfig(
                 world_size=world_size,
                 rank=rank,
                 tp_size=dist_mapping_config.get("tp", self.world_size),
@@ -418,7 +429,11 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
                 f"Please check your dist_mapping configuration: {dist_mapping_config}"
             ) from e
 
-        return mapping
+        return dc
+
+    def init_mapping_from_config(self, rank: int, world_size: int) -> Mapping:
+        """Build a Mapping for external APIs that still require it."""
+        return self.init_dist_config(rank, world_size).to_mapping()
 
     ### PRIVATE METHODS ############################################################################
     @classmethod
@@ -427,6 +442,5 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         mapping = {
             "graph": str(config_path / "default.yaml"),
             "transformers": str(config_path / "transformers.yaml"),
-            "export_edgellm_onnx": str(config_path / "export_edgellm_onnx.yaml"),
         }
         return mapping.get(mode)

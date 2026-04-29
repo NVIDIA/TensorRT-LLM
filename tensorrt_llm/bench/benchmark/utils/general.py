@@ -11,7 +11,8 @@ from tensorrt_llm._torch.pyexecutor.model_loader import \
     validate_and_set_kv_cache_quant
 from tensorrt_llm.bench.build.build import (get_benchmark_engine_settings,
                                             get_model_config)
-from tensorrt_llm.bench.build.dataclasses import NemotronHybridConfig
+from tensorrt_llm.bench.build.dataclasses import (NemotronHybridConfig,
+                                                  Qwen3HybridConfig)
 from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
                                                     InferenceRequest)
 from tensorrt_llm.logger import logger
@@ -111,7 +112,9 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     else:
         model_config = get_model_config(model, model_path)
 
-        if isinstance(model_config, NemotronHybridConfig):
+        if isinstance(model_config,
+                      (NemotronHybridConfig, Qwen3HybridConfig
+                       )) and mamba_ssm_cache_dtype not in (None, "auto"):
             model_config.set_mamba_ssm_cache_dtype(mamba_ssm_cache_dtype)
 
         from tensorrt_llm._torch.model_config import ModelConfig
