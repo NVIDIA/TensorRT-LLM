@@ -117,7 +117,7 @@ public:
 
     // Convert this UncommittedPage into a CommittedPage and attach to `block`.
     // The UncommittedPage becomes invalid (slot transferred to CommittedPage).
-    std::shared_ptr<CommittedPage> convertToCommitted(std::shared_ptr<Block> block);
+    std::shared_ptr<CommittedPage> convertToCommitted(std::shared_ptr<Block> block, CachedCudaEvent readyEvent);
 };
 
 // ---------------------------------------------------------------------------
@@ -160,6 +160,9 @@ public:
         KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal ordinal, LifeCycleId lifeCycle, bool skipWait);
 
     std::shared_ptr<Page> const& page() const;
+
+    // Append a finish event, merging when count exceeds 32 to prevent unbounded growth.
+    void notifyFinish(CachedCudaEvent event);
 
     std::shared_ptr<PageHolder> holder;
     std::vector<CachedCudaEvent> finishEvents;

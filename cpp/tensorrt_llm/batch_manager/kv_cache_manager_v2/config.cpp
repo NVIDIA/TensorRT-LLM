@@ -66,6 +66,28 @@ void KVCacheManagerConfig::validate() const
             },
             layer);
     }
+
+    // SSM-specific validation.
+    bool hasSSM = false;
+    for (auto const& layer : layers)
+    {
+        if (std::holds_alternative<SsmLayerConfig>(layer))
+        {
+            hasSSM = true;
+            break;
+        }
+    }
+    if (hasSSM)
+    {
+        if (ssmReuseInterval <= 0)
+            throw std::invalid_argument("KVCacheManagerConfig: ssm_reuse_interval must be positive");
+        if (ssmReuseInterval % tokensPerBlock != 0)
+            throw std::invalid_argument(
+                "KVCacheManagerConfig: ssm_reuse_interval must be a multiple of tokens_per_block");
+        if (enablePartialReuse)
+            throw std::invalid_argument(
+                "KVCacheManagerConfig: enable_partial_reuse must be false when SSM layers are present");
+    }
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
