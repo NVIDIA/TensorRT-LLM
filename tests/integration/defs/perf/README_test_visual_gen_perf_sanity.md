@@ -198,7 +198,7 @@ file or introduce a separate test-db file and a new Jenkins stage entry.
 To run only the VisualGen perf sanity stage (without the full L0 suite):
 
 ```
-/bot run --stage-list "DGX_B200-1_GPU-PyTorch-VisualGen-PerfSanity-1"
+/bot run --post-merge --stage-list "DGX_B200-8_GPUs-PyTorch-VisualGen-PerfSanity-Post-Merge-1"
 ```
 
 To include the VisualGen perf sanity stage alongside the standard L0 suite:
