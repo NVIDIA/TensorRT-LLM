@@ -1207,8 +1207,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             for (uint32_t c = 0; c < HC_MULT3; ++c)
                 y_local[c] = y_row[c];
 
-            // Reference bigfuse divides by HIDDEN (per-head count), matching Path A.
-            float const rstd = rsqrtf(r_val / static_cast<float>(HIDDEN) + rms_eps);
+            float const rstd = rsqrtf(r_val / static_cast<float>(HC_MULT * HIDDEN) + rms_eps);
             float const s0 = hc_scale[0];
             float const s1 = hc_scale[1];
             float const s2 = hc_scale[2];
