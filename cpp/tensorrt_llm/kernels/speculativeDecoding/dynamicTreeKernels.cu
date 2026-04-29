@@ -305,6 +305,11 @@ namespace
 {
 constexpr double kGreedyTempThreshold = 1e-4;
 
+bool isTopPEnabled(torch::optional<torch::Tensor> const& topP)
+{
+    return topP.has_value() && topP->defined();
+}
+
 torch::Tensor computeSoftmaxForProbOp(torch::Tensor logits)
 {
     TORCH_CHECK(logits.is_cuda(), "logits must be a CUDA tensor");
@@ -343,7 +348,7 @@ torch::Tensor applyTopKTopPForProbOp(torch::Tensor logits, torch::optional<torch
     torch::optional<torch::Tensor> const& topP, int32_t kMax)
 {
     bool const hasTopK = topK.has_value() && topK->defined();
-    bool const hasTopP = topP.has_value() && topP->defined();
+    bool const hasTopP = isTopPEnabled(topP);
 
     if (!hasTopK && !hasTopP)
     {
@@ -459,6 +464,7 @@ torch::Tensor computeProbsFromLogits(torch::Tensor const& logits, torch::Tensor 
         = (skipTemperature ? logits : logits.div(safeTemperatures.unsqueeze(1))).contiguous().to(torch::kFloat32);
 
     bool const hasTopK = topK.has_value() && topK->defined();
+    bool const hasTopP = isTopPEnabled(topP);
     int64_t const vocabSize = scaledLogits.size(1);
     int64_t const nRows = scaledLogits.size(0);
 
@@ -467,11 +473,12 @@ torch::Tensor computeProbsFromLogits(torch::Tensor const& logits, torch::Tensor 
     {
         // Two-stage CUDA top-k/top-p masking (mirrors invokeBatchTopKSampling).
         maskedLogits = torch::empty_like(scaledLogits);
+        auto topKForKernel = topK->to(torch::kInt32).contiguous();
+        auto topPForKernel = hasTopP ? topP->to(torch::kFloat32).contiguous() : torch::Tensor();
         auto stream = at::cuda::getCurrentCUDAStream(scaledLogits.device().index());
         invokeTopKTopPMaskingForProbs<float>(scaledLogits.data_ptr<float>(), maskedLogits.data_ptr<float>(),
-            topK->to(torch::kInt32).contiguous().data_ptr<int32_t>(),
-            (topP.has_value() && topP->defined()) ? topP->to(torch::kFloat32).contiguous().data_ptr<float>() : nullptr,
-            kMax, static_cast<int32_t>(nRows), static_cast<int32_t>(vocabSize), stream);
+            topKForKernel.data_ptr<int32_t>(), hasTopP ? topPForKernel.data_ptr<float>() : nullptr, kMax,
+            static_cast<int32_t>(nRows), static_cast<int32_t>(vocabSize), stream);
     }
     else
     {
@@ -528,9 +535,8 @@ torch::Tensor computeDraftProbsForDynamicTreeRejection(torch::Tensor const& draf
     auto draftTopK = topK.has_value() && topK->defined()
         ? torch::optional<torch::Tensor>(topK->repeat_interleave(numDraftProbRows))
         : torch::optional<torch::Tensor>();
-    auto draftTopP = topP.has_value() && topP->defined()
-        ? torch::optional<torch::Tensor>(topP->repeat_interleave(numDraftProbRows))
-        : torch::optional<torch::Tensor>();
+    auto draftTopP = isTopPEnabled(topP) ? torch::optional<torch::Tensor>(topP->repeat_interleave(numDraftProbRows))
+                                         : torch::optional<torch::Tensor>();
 
     auto draftProbs = computeProbsFromLogits(draftLogits, draftTemps, draftTopK, draftTopP, skipTemperature, kMax)
                           .reshape({batchSize, numDraftProbRows, draftVocabSize});
@@ -595,12 +601,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> computeTargetProbsForDyn
     auto targetTopK = topK.has_value() && topK->defined()
         ? torch::optional<torch::Tensor>(topK->repeat_interleave(numDraftTokens))
         : torch::optional<torch::Tensor>();
-    auto targetTopP = topP.has_value() && topP->defined()
-        ? torch::optional<torch::Tensor>(topP->repeat_interleave(numDraftTokens))
-        : torch::optional<torch::Tensor>();
+    auto targetTopP = isTopPEnabled(topP) ? torch::optional<torch::Tensor>(topP->repeat_interleave(numDraftTokens))
+                                          : torch::optional<torch::Tensor>();
 
     bool const hasTopK = targetTopK.has_value() && targetTopK->defined();
-    bool const hasTopP = targetTopP.has_value() && targetTopP->defined();
+    bool const hasTopP = isTopPEnabled(targetTopP);
     bool const hasFiltering = hasTopK || hasTopP;
     torch::Tensor effectiveTargetTopK;
     bool hasDisabledTopKRows = false;
@@ -637,10 +642,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> computeTargetProbsForDyn
     {
         // Fast two-stage CUDA path for masked logits.
         maskedTargetLogits = torch::empty_like(scaledTargetLogits);
+        auto topKForKernel = effectiveTargetTopK.to(torch::kInt32).contiguous();
+        auto topPForKernel = hasTopP ? targetTopP->to(torch::kFloat32).contiguous() : torch::Tensor();
         auto stream = at::cuda::getCurrentCUDAStream(scaledTargetLogits.device().index());
         invokeTopKTopPMaskingForProbs<float>(scaledTargetLogits.data_ptr<float>(), maskedTargetLogits.data_ptr<float>(),
-            effectiveTargetTopK.to(torch::kInt32).contiguous().data_ptr<int32_t>(),
-            hasTopP ? targetTopP->to(torch::kFloat32).contiguous().data_ptr<float>() : nullptr, kMax,
+            topKForKernel.data_ptr<int32_t>(), hasTopP ? topPForKernel.data_ptr<float>() : nullptr, kMax,
             static_cast<int32_t>(nRows), static_cast<int32_t>(targetVocabSize), stream);
 
         // Extract support indices: the finite positions after masking (at most kMax per row).
@@ -1140,43 +1146,68 @@ void invokeVerifyDynamicTreeGreedy(int64_t* predicts, int64_t* acceptIndex, int6
 
 #include <curand_kernel.h>
 
+/// Map curand_uniform (0, 1] to [0, 1) so that cumulative-sum sampling
+/// never falls off the end of a probability distribution due to float32
+/// rounding.  1.0 is mapped to 0.0 (probability mass epsilon).
+__device__ __forceinline__ float curand_uniform_open_right(curandStatePhilox4_32_10_t& state)
+{
+    float u = curand_uniform(&state); // (0, 1]
+    return u < 1.0f ? u : 0.0f;      // [0, 1)
+}
+
 __device__ int64_t sampleFromDistribution(curandStatePhilox4_32_10_t& state, float const* probs, uint32_t vocabSize)
 {
-    float r = curand_uniform(&state);
+    float r = curand_uniform_open_right(state); // [0, 1)
     float cumsum = 0.0f;
-    int64_t sampledTok = static_cast<int64_t>(vocabSize) - 1; // fallback: last vocab token
+    int64_t sampledTok = 0;
 
     for (uint32_t v = 0; v < vocabSize; ++v)
     {
         cumsum += probs[v];
-        if (r <= cumsum)
+        if (r < cumsum)
         {
             sampledTok = static_cast<int64_t>(v);
-            break;
+            return sampledTok;
         }
     }
 
-    return sampledTok;
+    // Float32 cumsum may not reach 1.0 for large vocabs.
+    // Fall back to the last token with positive probability.
+    for (int64_t v = static_cast<int64_t>(vocabSize) - 1; v >= 0; --v)
+    {
+        if (probs[v] > 0.0f)
+        {
+            return v;
+        }
+    }
+    return static_cast<int64_t>(vocabSize) - 1;
 }
 
 __device__ int64_t sampleFromIndexedDistribution(curandStatePhilox4_32_10_t& state, float const* probs,
     int32_t const* supportIndices, uint32_t supportSize, uint32_t vocabSize)
 {
-    float r = curand_uniform(&state);
+    float r = curand_uniform_open_right(state); // [0, 1)
     float cumsum = 0.0f;
-    int64_t sampledTok = static_cast<int64_t>(vocabSize) - 1; // fallback: last vocab token
+    int64_t sampledTok = static_cast<int64_t>(vocabSize) - 1;
 
     for (uint32_t i = 0; i < supportSize; ++i)
     {
         int32_t const tok = supportIndices[i];
         cumsum += probs[tok];
-        if (r <= cumsum)
+        if (r < cumsum)
         {
-            sampledTok = static_cast<int64_t>(tok);
-            break;
+            return static_cast<int64_t>(tok);
         }
     }
 
+    // Fallback: last support token with positive probability.
+    for (int64_t i = static_cast<int64_t>(supportSize) - 1; i >= 0; --i)
+    {
+        if (probs[supportIndices[i]] > 0.0f)
+        {
+            return static_cast<int64_t>(supportIndices[i]);
+        }
+    }
     return sampledTok;
 }
 
@@ -1192,6 +1223,7 @@ __device__ int64_t sampleFromIndexedDistribution(curandStatePhilox4_32_10_t& sta
 //! \param draftProbIndices     [in]  tree position -> draftProbs row [bs, numDraftTokens], root unused. int32.
 //! \param retrieveNextToken    [in]  first-child pointer [bs, numDraftTokens], -1=none. int32.
 //! \param retrieveNextSibling  [in]  next-sibling pointer [bs, numDraftTokens], -1=none. int32.
+//! \param treeValid            [in]  per-request tree validity flag [bs]. bool.
 //! \param batchSize            batch size.
 //! \param numDraftProbRows     unique draft-prob rows per request.
 //! \param maxTargetSupportSize support-array width. Zero when targetSupportIndices is null.
@@ -1205,9 +1237,9 @@ template <int32_t BLOCK_SIZE>
 __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* acceptTokenNum, int64_t* acceptToken,
     int64_t const* candidates, float const* draftProbs, float const* targetProbs, int32_t const* targetSupportIndices,
     int32_t const* targetSupportLengths, int32_t const* draftProbIndices, int32_t const* retrieveNextToken,
-    int32_t const* retrieveNextSibling, uint32_t batchSize, uint32_t numDraftProbRows, uint32_t maxTargetSupportSize,
-    uint32_t numSpeculativeTokens, uint32_t numDraftTokens, uint32_t vocabSize, int64_t const* seed,
-    int64_t const* offset)
+    int32_t const* retrieveNextSibling, bool const* treeValid, uint32_t batchSize, uint32_t numDraftProbRows,
+    uint32_t maxTargetSupportSize, uint32_t numSpeculativeTokens, uint32_t numDraftTokens, uint32_t vocabSize,
+    int64_t const* seed, int64_t const* offset)
 {
     uint32_t bx = blockIdx.x;
     int32_t const tid = static_cast<int32_t>(threadIdx.x);
@@ -1227,15 +1259,21 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
 
     __shared__ int32_t sLastAcceptedLocalIdx;
     __shared__ uint32_t sNumAcceptedTokens;
-    __shared__ int32_t sCurIndex;
     __shared__ int32_t sFirstChild;
     __shared__ bool sHasTerminalToken;
-    __shared__ bool sAcceptedSibling;
     __shared__ float sDiffSum;
     __shared__ float sTargetMass;
     __shared__ float sPrefixBase;
     __shared__ int32_t sWinnerIndex;
     __shared__ int64_t sSampledToken;
+
+    // Independent sibling testing: collect all accepted siblings at each depth,
+    // then select one weighted by target probability to remove ordering bias.
+    static constexpr int32_t kMaxSiblingsPerDepth = 64;
+    __shared__ int32_t sAccSibIdx[kMaxSiblingsPerDepth];
+    __shared__ int64_t sAccSibTok[kMaxSiblingsPerDepth];
+    __shared__ float sAccSibQProb[kMaxSiblingsPerDepth];
+    __shared__ int32_t sNumAccSiblings;
 
     uint32_t batchOffset = bx * numDraftTokens;
 
@@ -1246,6 +1284,33 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
             static_cast<uint64_t>(seed[0]), static_cast<uint64_t>(bx), static_cast<uint64_t>(offset[0]), &state);
     }
     __syncthreads();
+    bool const hasCompactTargetSupport = targetSupportIndices != nullptr && targetSupportLengths != nullptr;
+
+    // First-gen or dummy request: no valid tree exists yet. Sample directly
+    // from the target distribution at the root and skip tree traversal.
+    if (treeValid != nullptr && !treeValid[bx])
+    {
+        if (tid == 0)
+        {
+            float const* tProbs = targetProbs + static_cast<uint64_t>(bx) * numDraftTokens * vocabSize;
+            int64_t sampledToken;
+            if (hasCompactTargetSupport)
+            {
+                uint32_t const supportOffset = static_cast<uint64_t>(bx) * numDraftTokens * maxTargetSupportSize;
+                uint32_t const supportSize = static_cast<uint32_t>(targetSupportLengths[batchOffset]);
+                sampledToken = sampleFromIndexedDistribution(
+                    state, tProbs, targetSupportIndices + supportOffset, supportSize, vocabSize);
+            }
+            else
+            {
+                sampledToken = sampleFromDistribution(state, tProbs, vocabSize);
+            }
+            acceptIndex[bx * numSpeculativeTokens] = 0;
+            acceptTokenNum[bx] = 0;
+            acceptToken[bx * numSpeculativeTokens] = sampledToken;
+        }
+        return;
+    }
 
     // Root (depth 0): initialize path state at tree position 0.
     //
@@ -1278,33 +1343,59 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
         sLastAcceptedLocalIdx = 0;
         acceptIndex[bx * numSpeculativeTokens] = sLastAcceptedLocalIdx;
         sNumAcceptedTokens = 0;
-        sCurIndex = 0;
         sHasTerminalToken = false;
     }
     __syncthreads();
-    bool const hasCompactTargetSupport = targetSupportIndices != nullptr && targetSupportLengths != nullptr;
-
     for (uint32_t j = 1; j < numSpeculativeTokens; ++j)
     {
-        // Advance to the first child of the last accepted node.
-        // Continuing the example above:
-        //   j = 1, curIndex = 0 (E)  -> firstChild = F1
-        //   j = 2, curIndex = 1 (F1) -> firstChild = G1
+        // Get first child of the last accepted node.
         if (tid == 0)
         {
             sFirstChild = retrieveNextToken[batchOffset + sLastAcceptedLocalIdx];
-            sCurIndex = sFirstChild;
-            sAcceptedSibling = false;
         }
         __syncthreads();
 
-        while (sCurIndex != -1 && !sAcceptedSibling)
+        // Leaf node: no children at this depth.
+        // Emit bonus token from the target distribution at the last accepted position.
+        if (sFirstChild == -1)
         {
             if (tid == 0)
             {
-                int32_t const draftLocalIdx = sCurIndex; // retrieveIndex is identity: draftLocalIdx == curIndex
-                int64_t const draftTokenId = candidates[batchOffset + sCurIndex];
-                int32_t const draftProbRow = draftProbIndices[batchOffset + sCurIndex];
+                float const* tProbs = targetProbs
+                    + (static_cast<uint64_t>(bx) * numDraftTokens + sLastAcceptedLocalIdx) * vocabSize;
+                if (hasCompactTargetSupport)
+                {
+                    uint32_t const supportOffset
+                        = (static_cast<uint64_t>(bx) * numDraftTokens + sLastAcceptedLocalIdx) * maxTargetSupportSize;
+                    uint32_t const supportSize
+                        = static_cast<uint32_t>(targetSupportLengths[batchOffset + sLastAcceptedLocalIdx]);
+                    acceptToken[bx * numSpeculativeTokens + sNumAcceptedTokens] = sampleFromIndexedDistribution(
+                        state, tProbs, targetSupportIndices + supportOffset, supportSize, vocabSize);
+                }
+                else
+                {
+                    acceptToken[bx * numSpeculativeTokens + sNumAcceptedTokens]
+                        = sampleFromDistribution(state, tProbs, vocabSize);
+                }
+                sHasTerminalToken = true;
+            }
+            __syncthreads();
+            break;
+        }
+
+        // ---- Phase 1: Independently test ALL siblings with Bernoulli rejection ----
+        // Unlike sequential testing which accepts the first passing sibling
+        // (creating ordering bias), we test every sibling and collect all that
+        // pass.  This removes the systematic preference for earlier siblings in
+        // the linked list and produces output closer to the target distribution.
+        if (tid == 0)
+        {
+            sNumAccSiblings = 0;
+            int32_t childIdx = sFirstChild;
+            while (childIdx != -1 && sNumAccSiblings < kMaxSiblingsPerDepth)
+            {
+                int64_t const draftTokenId = candidates[batchOffset + childIdx];
+                int32_t const draftProbRow = draftProbIndices[batchOffset + childIdx];
                 float const pDraft
                     = draftProbs[(static_cast<uint64_t>(bx) * numDraftProbRows + draftProbRow) * vocabSize
                         + draftTokenId];
@@ -1313,56 +1404,60 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
                         + draftTokenId];
 
                 float const acceptProb = fminf(1.0f, pTarget / (pDraft + 1e-10f));
-                float const u = curand_uniform(&state);
+                float const u = curand_uniform_open_right(state);
 
                 if (u < acceptProb)
                 {
-                    acceptToken[bx * numSpeculativeTokens + sNumAcceptedTokens] = draftTokenId;
-                    ++sNumAcceptedTokens;
-                    acceptIndex[bx * numSpeculativeTokens + sNumAcceptedTokens] = draftLocalIdx;
-                    sLastAcceptedLocalIdx = draftLocalIdx;
-                    sAcceptedSibling = true;
+                    int32_t const idx = sNumAccSiblings++;
+                    sAccSibIdx[idx] = childIdx;
+                    sAccSibTok[idx] = draftTokenId;
+                    sAccSibQProb[idx] = pTarget;
                 }
-                else
+                childIdx = retrieveNextSibling[batchOffset + childIdx];
+            }
+        }
+        __syncthreads();
+
+        // ---- Phase 2: Select among accepted siblings or emit correction ----
+        if (sNumAccSiblings > 0)
+        {
+            // At least one sibling accepted.  Select one weighted by target
+            // probability q(ci) so that the choice follows the target distribution.
+            if (tid == 0)
+            {
+                int32_t selectedIdx = 0;
+                if (sNumAccSiblings > 1)
                 {
-                    sCurIndex = retrieveNextSibling[batchOffset + sCurIndex];
+                    float totalQ = 0.0f;
+                    for (int32_t i = 0; i < sNumAccSiblings; ++i)
+                    {
+                        totalQ += sAccSibQProb[i];
+                    }
+                    float const r = curand_uniform_open_right(state) * totalQ;
+                    float cumsum = 0.0f;
+                    selectedIdx = sNumAccSiblings - 1; // fallback
+                    for (int32_t i = 0; i < sNumAccSiblings; ++i)
+                    {
+                        cumsum += sAccSibQProb[i];
+                        if (r < cumsum)
+                        {
+                            selectedIdx = i;
+                            break;
+                        }
+                    }
                 }
+
+                int32_t const childIdx = sAccSibIdx[selectedIdx];
+                acceptToken[bx * numSpeculativeTokens + sNumAcceptedTokens] = sAccSibTok[selectedIdx];
+                ++sNumAcceptedTokens;
+                acceptIndex[bx * numSpeculativeTokens + sNumAcceptedTokens] = childIdx;
+                sLastAcceptedLocalIdx = childIdx;
             }
             __syncthreads();
         }
-
-        if (sCurIndex == -1)
+        else
         {
-            // All siblings exhausted. Two sub-cases:
-            // (a) firstChild == -1: leaf node, no draft tokens at this depth.
-            //     Emit the final bonus token sampled from q(.|lastAcceptedLocalIdx).
-            // (b) firstChild != -1: every sibling was rejected -> sample correction token
-            //     from relu(q - p) at firstChild's position to restore the target distribution.
-            if (sFirstChild == -1)
-            {
-                if (tid == 0)
-                {
-                    float const* tProbs = targetProbs
-                        + (static_cast<uint64_t>(bx) * numDraftTokens + sLastAcceptedLocalIdx) * vocabSize;
-                    if (hasCompactTargetSupport)
-                    {
-                        uint32_t const supportOffset
-                            = (static_cast<uint64_t>(bx) * numDraftTokens + sLastAcceptedLocalIdx)
-                            * maxTargetSupportSize;
-                        uint32_t const supportSize
-                            = static_cast<uint32_t>(targetSupportLengths[batchOffset + sLastAcceptedLocalIdx]);
-                        acceptToken[bx * numSpeculativeTokens + sNumAcceptedTokens] = sampleFromIndexedDistribution(
-                            state, tProbs, targetSupportIndices + supportOffset, supportSize, vocabSize);
-                    }
-                    else
-                    {
-                        acceptToken[bx * numSpeculativeTokens + sNumAcceptedTokens]
-                            = sampleFromDistribution(state, tProbs, vocabSize);
-                    }
-                    sHasTerminalToken = true;
-                }
-            }
-            else
+            // All siblings rejected -> sample correction token from relu(q - p).
             {
                 int32_t const draftProbRow = draftProbIndices[batchOffset + sFirstChild];
                 float const* tProbs
@@ -1400,7 +1495,7 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
 
                         if (useDiff)
                         {
-                            float const r = curand_uniform(&state);
+                            float const r = curand_uniform_open_right(state);
                             float cumsum = 0.0f;
                             for (uint32_t i = 0; i < targetSupportSize; ++i)
                             {
@@ -1445,7 +1540,7 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
                         sSampledToken = static_cast<int64_t>(vocabSize) - 1;
                         if (diffSum > 1e-10f)
                         {
-                            sTargetMass = curand_uniform(&state) * diffSum;
+                            sTargetMass = curand_uniform_open_right(state) * diffSum;
                         }
                         else
                         {
@@ -1541,7 +1636,7 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
 void invokeVerifyDynamicTreeRejection(int64_t* acceptIndex, int64_t* acceptTokenNum, int64_t* acceptToken,
     int64_t const* candidates, float const* draftProbs, float const* targetProbs, int32_t const* targetSupportIndices,
     int32_t const* targetSupportLengths, int32_t const* draftProbIndices, int32_t const* retrieveNextToken,
-    int32_t const* retrieveNextSibling, SizeType32 batchSize, SizeType32 numDraftProbRows,
+    int32_t const* retrieveNextSibling, bool const* treeValid, SizeType32 batchSize, SizeType32 numDraftProbRows,
     SizeType32 maxTargetSupportSize, SizeType32 numDraftTokens, SizeType32 numSpecStep, SizeType32 vocabSize,
     int64_t const* seed, int64_t const* offset, cudaStream_t stream)
 {
@@ -1551,8 +1646,8 @@ void invokeVerifyDynamicTreeRejection(int64_t* acceptIndex, int64_t* acceptToken
 
     verifyDynamicTreeRejectionKernel<kVerifyDynamicTreeRejectionBlockSize><<<grid, block, 0, stream>>>(acceptIndex,
         acceptTokenNum, acceptToken, candidates, draftProbs, targetProbs, targetSupportIndices, targetSupportLengths,
-        draftProbIndices, retrieveNextToken, retrieveNextSibling, batchSize, numDraftProbRows, maxTargetSupportSize,
-        numSpecStep, numDraftTokens, vocabSize, seed, offset);
+        draftProbIndices, retrieveNextToken, retrieveNextSibling, treeValid, batchSize, numDraftProbRows,
+        maxTargetSupportSize, numSpecStep, numDraftTokens, vocabSize, seed, offset);
 
     sync_check_cuda_error(stream);
 }

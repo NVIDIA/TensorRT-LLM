@@ -710,8 +710,10 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         # Rejection sampling needs to map each final draft token back to its history
         # buffer index to retrieve the corresponding draft logits. Greedy verification
         # doesn't need this mapping since it only compares token IDs.
+        # Only save the gen rows (skip context rows) so that
+        # _build_draft_prob_indices can read them back at [:num_gens].
         if spec_metadata.use_rejection_sampling:
-            self._topk_score_indices_buf[:batch_size].copy_(topk_score_indices)
+            self._topk_score_indices_buf[:num_gens].copy_(topk_score_indices[num_contexts:])
 
         if spec_tree_manager is not None:
             # Gen-only; spec-dec batch is [:num_gens] (not num_contexts-offset).
@@ -827,6 +829,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                         draft_prob_indices,
                         spec_tree_manager.retrieve_next_token[:num_gens],
                         spec_tree_manager.retrieve_next_sibling[:num_gens],
+                        tree_valid,
                         temps,
                         top_ks,
                         top_ps,

@@ -126,6 +126,7 @@ void invokeVerifyDynamicTreeGreedy(int64_t* predicts, int64_t* acceptIndex, int6
 //!        corresponding row in draftProbs. Root is unused.
 //! \param retrieveNextToken   [batchSize, numDraftTokens] int32 first-child pointer, -1=none.
 //! \param retrieveNextSibling [batchSize, numDraftTokens] int32 next-sibling pointer, -1=none.
+//! \param treeValid      [batchSize] bool; false means no valid tree exists for this request.
 //! \param batchSize      runtime::SizeType32.
 //! \param numDraftProbRows runtime::SizeType32. Number of unique draft-prob rows per request.
 //! \param maxTargetSupportSize runtime::SizeType32. Third dim of targetSupportIndices. Can be zero.
@@ -138,9 +139,10 @@ void invokeVerifyDynamicTreeGreedy(int64_t* predicts, int64_t* acceptIndex, int6
 void invokeVerifyDynamicTreeRejection(int64_t* acceptIndex, int64_t* acceptTokenNum, int64_t* acceptToken,
     int64_t const* candidates, float const* draftProbs, float const* targetProbs, int32_t const* targetSupportIndices,
     int32_t const* targetSupportLengths, int32_t const* draftProbIndices, int32_t const* retrieveNextToken,
-    int32_t const* retrieveNextSibling, runtime::SizeType32 batchSize, runtime::SizeType32 numDraftProbRows,
-    runtime::SizeType32 maxTargetSupportSize, runtime::SizeType32 numDraftTokens, runtime::SizeType32 numSpecStep,
-    runtime::SizeType32 vocabSize, int64_t const* seed, int64_t const* offset, cudaStream_t stream);
+    int32_t const* retrieveNextSibling, bool const* treeValid, runtime::SizeType32 batchSize,
+    runtime::SizeType32 numDraftProbRows, runtime::SizeType32 maxTargetSupportSize, runtime::SizeType32 numDraftTokens,
+    runtime::SizeType32 numSpecStep, runtime::SizeType32 vocabSize, int64_t const* seed, int64_t const* offset,
+    cudaStream_t stream);
 
 //! \brief Compute draft probabilities for dynamic-tree rejection sampling from logits.
 //! \param draftLogits [batchSize * numDraftProbRows, draftVocabSize], on GPU.

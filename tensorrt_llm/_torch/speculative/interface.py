@@ -1024,7 +1024,7 @@ class SpecWorkerBase(nn.Module, ABC):
 
         temperatures = spec_metadata.temperatures[:num_target_tokens]
         top_ks = spec_metadata.top_ks[:num_target_tokens]
-        top_ps = spec_metadata.top_ps[:num_target_tokens]
+        top_ps = None if spec_metadata.skip_top_p else spec_metadata.top_ps[:num_target_tokens]
 
         target_probs_flat = compute_probs_from_logits(logits.clone(),
                                                       temperatures, top_ks,
@@ -1123,9 +1123,9 @@ class SpecWorkerBase(nn.Module, ABC):
             draft_top_ks = spec_metadata.request_top_ks[:batch_size].repeat_interleave(
                 draft_tokens_per_request
             ) if spec_metadata.request_top_ks is not None else None
-            draft_top_ps = spec_metadata.request_top_ps[:batch_size].repeat_interleave(
-                draft_tokens_per_request
-            ) if spec_metadata.request_top_ps is not None else None
+            draft_top_ps = (spec_metadata.request_top_ps[:batch_size].repeat_interleave(
+                draft_tokens_per_request) if not spec_metadata.skip_top_p
+                            and spec_metadata.request_top_ps is not None else None)
         else:
             draft_temps = torch.ones(num_draft_tokens, device=device)
             draft_top_ks = None

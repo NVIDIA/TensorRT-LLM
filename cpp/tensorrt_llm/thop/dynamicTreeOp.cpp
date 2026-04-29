@@ -215,8 +215,8 @@ void verify_dynamic_tree_greedy_out_op(th::Tensor& candidates, th::Tensor& retri
 //! Accepts draft tokens by rejection sampling at each depth using pre-computed probabilities.
 void verify_dynamic_tree_rejection_out_op(th::Tensor& candidates, th::Tensor& draftProbs, th::Tensor& targetProbs,
     th::Tensor& targetSupportIndices, th::Tensor& targetSupportLengths, th::Tensor& draftProbIndices,
-    th::Tensor& retrieveNextToken, th::Tensor& retrieveNextSibling, th::Tensor& acceptIndex, th::Tensor& acceptTokenNum,
-    th::Tensor& acceptToken, int64_t numSpecStep, th::Tensor& seed, th::Tensor& offset)
+    th::Tensor& retrieveNextToken, th::Tensor& retrieveNextSibling, th::Tensor& treeValid, th::Tensor& acceptIndex,
+    th::Tensor& acceptTokenNum, th::Tensor& acceptToken, int64_t numSpecStep, th::Tensor& seed, th::Tensor& offset)
 {
     TORCH_CHECK(candidates.dim() == 2, "candidates must be 2D tensor");
     TORCH_CHECK(draftProbs.dim() == 3, "draftProbs must be 3D tensor");
@@ -228,18 +228,21 @@ void verify_dynamic_tree_rejection_out_op(th::Tensor& candidates, th::Tensor& dr
     TORCH_CHECK(draftProbIndices.dim() == 2, "draftProbIndices must be 2D tensor");
     TORCH_CHECK(retrieveNextToken.dim() == 2, "retrieveNextToken must be 2D tensor");
     TORCH_CHECK(retrieveNextSibling.dim() == 2, "retrieveNextSibling must be 2D tensor");
+    TORCH_CHECK(treeValid.dim() == 1, "treeValid must be 1D tensor");
     TORCH_CHECK(candidates.scalar_type() == torch::kInt64, "candidates must be int64 tensor");
     TORCH_CHECK(draftProbs.scalar_type() == torch::kFloat32, "draftProbs must be float32 tensor");
     TORCH_CHECK(targetProbs.scalar_type() == torch::kFloat32, "targetProbs must be float32 tensor");
     TORCH_CHECK(targetSupportIndices.scalar_type() == torch::kInt32, "targetSupportIndices must be int32 tensor");
     TORCH_CHECK(targetSupportLengths.scalar_type() == torch::kInt32, "targetSupportLengths must be int32 tensor");
     TORCH_CHECK(draftProbIndices.scalar_type() == torch::kInt32, "draftProbIndices must be int32 tensor");
+    TORCH_CHECK(treeValid.scalar_type() == torch::kBool, "treeValid must be bool tensor");
     TORCH_CHECK(candidates.is_cuda(), "candidates must be a CUDA tensor");
     TORCH_CHECK(draftProbs.is_cuda(), "draftProbs must be a CUDA tensor");
     TORCH_CHECK(targetProbs.is_cuda(), "targetProbs must be a CUDA tensor");
     TORCH_CHECK(draftProbIndices.is_cuda(), "draftProbIndices must be a CUDA tensor");
     TORCH_CHECK(retrieveNextToken.is_cuda(), "retrieveNextToken must be a CUDA tensor");
     TORCH_CHECK(retrieveNextSibling.is_cuda(), "retrieveNextSibling must be a CUDA tensor");
+    TORCH_CHECK(treeValid.is_cuda(), "treeValid must be a CUDA tensor");
     TORCH_CHECK(acceptIndex.is_cuda(), "acceptIndex must be a CUDA tensor");
     TORCH_CHECK(acceptTokenNum.is_cuda(), "acceptTokenNum must be a CUDA tensor");
     TORCH_CHECK(acceptToken.is_cuda(), "acceptToken must be a CUDA tensor");
@@ -280,6 +283,7 @@ void verify_dynamic_tree_rejection_out_op(th::Tensor& candidates, th::Tensor& dr
     TORCH_CHECK(retrieveNextToken.size(1) == numDraftTokens, "retrieveNextToken size mismatch");
     TORCH_CHECK(retrieveNextSibling.size(0) == batchSize, "retrieveNextSibling batch size mismatch");
     TORCH_CHECK(retrieveNextSibling.size(1) == numDraftTokens, "retrieveNextSibling size mismatch");
+    TORCH_CHECK(treeValid.size(0) >= batchSize, "treeValid buffer too small");
     TORCH_CHECK(draftProbs.device() == candidates.device(), "draftProbs must be on the same device as candidates");
     TORCH_CHECK(targetProbs.device() == candidates.device(), "targetProbs must be on the same device as candidates");
     TORCH_CHECK(
@@ -288,6 +292,7 @@ void verify_dynamic_tree_rejection_out_op(th::Tensor& candidates, th::Tensor& dr
         "retrieveNextToken must be on the same device as candidates");
     TORCH_CHECK(retrieveNextSibling.device() == candidates.device(),
         "retrieveNextSibling must be on the same device as candidates");
+    TORCH_CHECK(treeValid.device() == candidates.device(), "treeValid must be on the same device as candidates");
     TORCH_CHECK(acceptIndex.scalar_type() == torch::kInt64, "acceptIndex must be int64 tensor");
     TORCH_CHECK(acceptTokenNum.scalar_type() == torch::kInt64, "acceptTokenNum must be int64 tensor");
     TORCH_CHECK(acceptToken.scalar_type() == torch::kInt64, "acceptToken must be int64 tensor");
@@ -319,8 +324,9 @@ void verify_dynamic_tree_rejection_out_op(th::Tensor& candidates, th::Tensor& dr
         targetSupportIndices.numel() > 0 ? targetSupportIndices.data_ptr<int32_t>() : nullptr,
         targetSupportLengths.numel() > 0 ? targetSupportLengths.data_ptr<int32_t>() : nullptr,
         draftProbIndices.data_ptr<int32_t>(), retrieveNextToken.data_ptr<int32_t>(),
-        retrieveNextSibling.data_ptr<int32_t>(), batchSize, numDraftProbRows, maxTargetSupportSize, numDraftTokens,
-        numSpecStep, vocabSize, seed.data_ptr<int64_t>(), offset.data_ptr<int64_t>(), stream);
+        retrieveNextSibling.data_ptr<int32_t>(), treeValid.data_ptr<bool>(), batchSize, numDraftProbRows,
+        maxTargetSupportSize, numDraftTokens, numSpecStep, vocabSize, seed.data_ptr<int64_t>(),
+        offset.data_ptr<int64_t>(), stream);
 }
 
 th::Tensor compute_draft_probs_for_dynamic_tree_rejection_op(th::Tensor draftLogits, th::Tensor temperatures,
@@ -430,7 +436,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "verify_dynamic_tree_rejection_out_op("
         "Tensor candidates, Tensor draftProbs, Tensor targetProbs, Tensor targetSupportIndices, "
         "Tensor targetSupportLengths, Tensor draftProbIndices, "
-        "Tensor retrieveNextToken, Tensor retrieveNextSibling, "
+        "Tensor retrieveNextToken, Tensor retrieveNextSibling, Tensor treeValid, "
         "Tensor(a!) acceptIndex, Tensor(b!) acceptTokenNum, Tensor(c!) acceptToken, "
         "int numSpecStep, Tensor seed, Tensor offset) -> ()");
 }

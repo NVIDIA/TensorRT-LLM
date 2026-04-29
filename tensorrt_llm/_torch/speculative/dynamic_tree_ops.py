@@ -239,6 +239,7 @@ class DynamicTreeOpsConverter:
         draft_prob_indices: torch.Tensor,
         retrieve_next_token: torch.Tensor,
         retrieve_next_sibling: torch.Tensor,
+        tree_valid: torch.Tensor,
         temperatures: torch.Tensor,
         top_k: torch.Tensor | None,
         top_p: torch.Tensor | None,
@@ -254,7 +255,8 @@ class DynamicTreeOpsConverter:
         This path keeps draft/target logits as inputs, computes unique draft
         and target probabilities with separate CUDA ops, then runs the tree
         rejection kernel as a third CUDA op. `draft_prob_indices` maps each
-        tree position to its shared draft-prob row.
+        tree position to its shared draft-prob row. `tree_valid` guards
+        first-gen and dummy requests that do not have a usable tree yet.
         """
         accept_index = self._rej_accept_index_buf[:num_gens]
         accept_token = self._rej_accept_token_buf[:num_gens]
@@ -264,6 +266,10 @@ class DynamicTreeOpsConverter:
         num_draft_tokens = candidates.shape[1]
         num_draft_prob_rows = draft_logits_tree.shape[0] // num_gens
         target_vocab_size = target_logits_tree.shape[-1]
+
+        if tree_valid is None:
+            tree_valid = torch.ones(num_gens, dtype=torch.bool, device=candidates.device)
+        tree_valid = tree_valid.contiguous()
 
         if top_k is None:
             top_k_max = 0
@@ -307,6 +313,7 @@ class DynamicTreeOpsConverter:
                 draft_prob_indices,
                 retrieve_next_token,
                 retrieve_next_sibling,
+                tree_valid,
                 accept_index,
                 accept_tok_num,
                 accept_token,
