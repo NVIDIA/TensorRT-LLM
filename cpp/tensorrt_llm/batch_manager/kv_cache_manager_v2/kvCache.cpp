@@ -641,7 +641,7 @@ void KvCache::_increaseCapacity(int newNumBlocks, int newHistoryLength)
 
     // Create SeqBlocks for the new ordinals.
     std::vector<size_t> slotCounters(static_cast<size_t>(numLc), 0);
-    _growPageIndexBuffers(newNumBlocks);
+    _resizePageIndexBuffers(newNumBlocks);
     for (int ord = curNumBlocks; ord < newNumBlocks; ++ord)
     {
         SeqBlock sb;
@@ -672,7 +672,7 @@ void KvCache::_increaseCapacity(int newNumBlocks, int newHistoryLength)
 
 void KvCache::_decreaseCapacity(int newNumBlocks)
 {
-    _shrinkPageIndexBuffers(newNumBlocks);
+    _resizePageIndexBuffers(newNumBlocks);
     while (static_cast<int>(mBlocks.size()) > newNumBlocks)
     {
         auto& sb = mBlocks.back();
@@ -1228,7 +1228,7 @@ void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
 
     // --- Build blocks with stale range handling ---
 
-    _growPageIndexBuffers(static_cast<int>(matched.size()));
+    _resizePageIndexBuffers(static_cast<int>(matched.size()));
 
     for (size_t i = 0; i < matched.size(); ++i)
     {
@@ -1290,7 +1290,7 @@ void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
 // Page index tables
 // ---------------------------------------------------------------------------
 
-void KvCache::_growPageIndexBuffers(int newNumBlocks)
+void KvCache::_resizePageIndexBuffers(int newNumBlocks)
 {
     for (int bi = 0; bi < mBeamWidth; ++bi)
     {
@@ -1299,35 +1299,23 @@ void KvCache::_growPageIndexBuffers(int newNumBlocks)
             auto& buf = mBasePageIndices[bi][lc];
             if (auto* vec = std::get_if<std::vector<int>>(&buf))
             {
+                // Growing fills new entries with kBadPageIndex; shrinking truncates.
                 vec->resize(static_cast<size_t>(newNumBlocks), kBadPageIndex);
             }
             else
             {
-                // Span<int>: caller-provided buffer must already be large enough.
-                assert(std::get<Span<int>>(buf).len >= newNumBlocks);
-            }
-        }
-    }
-}
-
-void KvCache::_shrinkPageIndexBuffers(int numBlocks)
-{
-    for (int bi = 0; bi < mBeamWidth; ++bi)
-    {
-        for (int lc = 0; lc < static_cast<int>(mBasePageIndices[bi].size()); ++lc)
-        {
-            auto& buf = mBasePageIndices[bi][lc];
-            if (auto* vec = std::get_if<std::vector<int>>(&buf))
-            {
-                if (static_cast<int>(vec->size()) > numBlocks)
-                    vec->resize(static_cast<size_t>(numBlocks));
-            }
-            else
-            {
-                // Span<int>: fill the tail with BAD_PAGE_INDEX (mirrors Python memoryview path).
                 auto& ext = std::get<Span<int>>(buf);
-                for (int i = numBlocks; i < ext.len; ++i)
-                    ext[i] = kBadPageIndex;
+                if (newNumBlocks > ext.len)
+                {
+                    // Growing: caller-provided buffer must already be large enough.
+                    assert(ext.len >= newNumBlocks);
+                }
+                else
+                {
+                    // Shrinking: fill the tail with BAD_PAGE_INDEX (mirrors Python memoryview path).
+                    for (int i = newNumBlocks; i < ext.len; ++i)
+                        ext[i] = kBadPageIndex;
+                }
             }
         }
     }
@@ -1408,24 +1396,22 @@ void KvCache::setBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t*
     }
 
     // Copy current indices into the external buffer (mirrors Python: buf[:length] = old_indices[:length]).
-    if (auto const* vec = std::get_if<std::vector<int>>(&slot))
+    int const* oldData = nullptr;
+    int oldLen = 0;
+    if (auto* vec = std::get_if<std::vector<int>>(&slot))
     {
-        int n = static_cast<int>(vec->size());
-        int copy = std::min(n, len);
-        for (int i = 0; i < copy; ++i)
-            buf[i] = (*vec)[i];
-        for (int i = copy; i < len; ++i)
-            buf[i] = kBadPageIndex;
+        oldData = vec->data();
+        oldLen = static_cast<int>(vec->size());
     }
     else
     {
-        auto const& oldExt = std::get<Span<int>>(slot);
-        int copy = std::min(static_cast<int>(oldExt.len), len);
-        for (int i = 0; i < copy; ++i)
-            buf[i] = oldExt[i];
-        for (int i = copy; i < len; ++i)
-            buf[i] = kBadPageIndex;
+        auto& span = std::get<Span<int>>(slot);
+        oldData = span.data();
+        oldLen = span.len;
     }
+    int copyLen = std::min(oldLen, len);
+    std::copy(oldData, oldData + copyLen, buf);
+    std::fill(buf + copyLen, buf + len, kBadPageIndex);
     slot = Span<int>{buf, len};
 }
 

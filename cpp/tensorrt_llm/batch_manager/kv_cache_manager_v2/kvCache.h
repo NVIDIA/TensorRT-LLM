@@ -396,8 +396,7 @@ private:
 
     // Page index table management.
     // _basePageIndices[beamIdx][lcId][blockOrdinal] = slotId or BAD
-    void _growPageIndexBuffers(int newNumBlocks);
-    void _shrinkPageIndexBuffers(int numBlocks);
+    void _resizePageIndexBuffers(int newNumBlocks);
 
     KvCacheManager* mManager;
     std::optional<int64_t> mLoraTaskId;
