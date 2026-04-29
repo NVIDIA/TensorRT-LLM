@@ -23,14 +23,14 @@ from transformers import AutoTokenizer
 
 from ..tokenizer import TransformersTokenizer
 
-BOS_TOKEN = "<｜begin▁of▁sentence｜>"
-EOS_TOKEN = "<｜end▁of▁sentence｜>"
-USER_TOKEN = "<｜User｜>"
-ASSISTANT_TOKEN = "<｜Assistant｜>"
-LATEST_REMINDER_TOKEN = "<｜latest_reminder｜>"
-THINKING_START_TOKEN = "<think>"
-THINKING_END_TOKEN = "</think>"
-DSML_TOKEN = "｜DSML｜"
+BOS_TOKEN = "<｜begin▁of▁sentence｜>"  # nosec B105
+EOS_TOKEN = "<｜end▁of▁sentence｜>"  # nosec B105
+USER_TOKEN = "<｜User｜>"  # nosec B105
+ASSISTANT_TOKEN = "<｜Assistant｜>"  # nosec B105
+LATEST_REMINDER_TOKEN = "<｜latest_reminder｜>"  # nosec B105
+THINKING_START_TOKEN = "<think>"  # nosec B105
+THINKING_END_TOKEN = "</think>"  # nosec B105
+DSML_TOKEN = "｜DSML｜"  # nosec B105
 
 TOOL_CALLS_BLOCK_NAME = "tool_calls"
 VALID_TASKS = {
