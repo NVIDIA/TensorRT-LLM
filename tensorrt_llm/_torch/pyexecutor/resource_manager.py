@@ -2860,6 +2860,9 @@ class KVCacheManagerV2(BaseResourceManager):
         This method shrinks capacity back to undo that spurious growth
         so it does not accumulate across iterations and overflow the
         host page-index buffer.
+
+        Mirror the effective draft length used in _required_gen_capacity
+        so disagg-gen-trans-complete revert stays symmetric.
         """
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None or not kv_cache.is_active:
