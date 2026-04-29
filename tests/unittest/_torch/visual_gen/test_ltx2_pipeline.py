@@ -22,7 +22,6 @@ from test_common.llm_data import llm_models_root
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import (
     AttentionConfig,
-    CacheDiTConfig,
     DiffusionModelConfig,
     PipelineComponent,
     VisualGenArgs,
@@ -827,33 +826,6 @@ class TestLTX2OneStagePipelineConfig:
             spatial_upsampler_path="/fake/upsampler.safetensors",
             distilled_lora_path="/fake/lora.safetensors",
             one_stage_pipeline=True,
-        )
-        config = DiffusionModelConfig.from_pretrained(str(checkpoint_path), args=args)
-
-        assert config.extra_attrs["one_stage_pipeline"] is True
-        assert "spatial_upsampler_path" not in config.extra_attrs
-        assert "distilled_lora_path" not in config.extra_attrs
-
-    def test_cache_dit_disables_auxiliary_discovery(self, tmp_path):
-        checkpoint_path = _write_minimal_ltx2_diffusers_checkpoint(tmp_path)
-        (checkpoint_path / "ltx-2-spatial-upscaler-x2-1.0.safetensors").touch()
-        (checkpoint_path / "ltx-2-19b-distilled-lora-384.safetensors").touch()
-
-        args = VisualGenArgs(checkpoint_path=str(checkpoint_path), cache=CacheDiTConfig())
-        config = DiffusionModelConfig.from_pretrained(str(checkpoint_path), args=args)
-
-        assert config.extra_attrs["one_stage_pipeline"] is True
-        assert "spatial_upsampler_path" not in config.extra_attrs
-        assert "distilled_lora_path" not in config.extra_attrs
-
-    def test_cache_dit_ignores_explicit_auxiliary_paths(self, tmp_path):
-        checkpoint_path = _write_minimal_ltx2_diffusers_checkpoint(tmp_path)
-
-        args = VisualGenArgs(
-            checkpoint_path=str(checkpoint_path),
-            spatial_upsampler_path="/fake/upsampler.safetensors",
-            distilled_lora_path="/fake/lora.safetensors",
-            cache=CacheDiTConfig(),
         )
         config = DiffusionModelConfig.from_pretrained(str(checkpoint_path), args=args)
 

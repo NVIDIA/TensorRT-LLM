@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 """LTX2 Text/Image-to-Video generation using TensorRT-LLM Visual Generation."""
 
 import argparse
@@ -371,7 +368,7 @@ def _build_diffusion_args(args) -> VisualGenArgs:
         pipeline={
             "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
         },
-        one_stage_pipeline=args.one_stage_pipeline,
+        one_stage_pipeline=args.one_stage_pipeline or args.enable_cache_dit,
     )
     if args.spatial_upsampler_path:
         kwargs["spatial_upsampler_path"] = args.spatial_upsampler_path
