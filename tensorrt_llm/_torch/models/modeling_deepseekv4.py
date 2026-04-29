@@ -63,7 +63,16 @@ from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.engram import Engram, EngramConfig, EngramHashProvider
-from ..modules.fused_moe import DeepSeekV4MoeRoutingMethod, MoE, MoEWeightLoadingMode, create_moe
+from ..modules.fused_moe import (
+    CutlassFusedMoE,
+    DeepSeekV4MoeRoutingMethod,
+    MoE,
+    MoEWeightLoadingMode,
+    TritonFusedMoE,
+    TRTLLMGenFusedMoE,
+    create_moe,
+    get_moe_cls,
+)
 from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from ..modules.linear import Linear
 from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
@@ -1386,17 +1395,16 @@ class DeepseekV4MoE(nn.Module):
         swiglu_limit = getattr(config, "swiglu_limit", None)
         moe_swiglu_limit = None
         if swiglu_limit is not None:
-            supports_swiglu_limit = True
-            if (model_config.moe_backend or "").upper() == "TRTLLM":
-                supports_swiglu_limit = False
-                if experts_quant_config is not None:
-                    mode = experts_quant_config.layer_quant_mode
-                    supports_swiglu_limit = (
-                        mode.has_nvfp4()
-                        or mode.has_w4a16_mxfp4()
-                        or mode.has_w4a8_mxfp4_fp8()
-                        or mode.has_w4a8_mxfp4_mxfp8()
-                    )
+            # `create_moe` only accepts swiglu_limit for these MoE classes;
+            # resolve via get_moe_cls so backend-string fallbacks (e.g.
+            # TRTLLM/CUTEDSL/DENSEGEMM dropping back to CutlassFusedMoE on
+            # unsupported quant) are handled correctly.
+            moe_cls = get_moe_cls(model_config, override_quant_config=experts_quant_config)
+            supports_swiglu_limit = moe_cls in (
+                CutlassFusedMoE,
+                TritonFusedMoE,
+                TRTLLMGenFusedMoE,
+            )
             if supports_swiglu_limit:
                 moe_load_balancer_config = getattr(model_config, "moe_load_balancer", None)
                 num_slots = (

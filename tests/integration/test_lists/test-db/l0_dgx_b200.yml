@@ -173,6 +173,10 @@ l0_dgx_b200:
   - accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype[mtp_nextn=0-block_reuse=False-use_py_transceiver=True] TIMEOUT (60)
   - accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype[mtp_nextn=3-block_reuse=True-use_py_transceiver=False] TIMEOUT (60)
   - accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype[mtp_nextn=0-block_reuse=False-use_py_transceiver=False] TIMEOUT (60)
+  # DeepSeek-V4 EPLB pre-merge sanity (uncomment once DeepSeek-V4-Flash/Flash-Base
+  # checkpoints are staged under llm_models_root()).
+  # - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_nvfp4_8gpus_static_eplb[moe_backend=WIDEEP] TIMEOUT (120)
+  # - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_fp8_8gpus_static_eplb[moe_backend=WIDEEP] TIMEOUT (120)
   - accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_ctx_dp2_gen_tp4 TIMEOUT (60)
   - accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=True] TIMEOUT (60)
   - accuracy/test_disaggregated_serving.py::TestQwen3NextInstruct::test_auto_dtype[use_py_transceiver=False] TIMEOUT (60)
