@@ -31,6 +31,20 @@ protected:
         hashBytes.fill(fill);
         return MmKey{hashBytes, startOffset};
     }
+
+    static std::array<uint8_t, 32> makeHashBytes(std::vector<SizeType32> const& hashParts)
+    {
+        std::array<uint8_t, 32> hashBytes{};
+        for (size_t partIdx = 0; partIdx < hashParts.size(); ++partIdx)
+        {
+            for (uint8_t byteIdx = 0; byteIdx < 4; ++byteIdx)
+            {
+                hashBytes[partIdx * 4 + byteIdx]
+                    = static_cast<uint8_t>((hashParts[partIdx] >> (24 - byteIdx * 8)) & 0xFF);
+            }
+        }
+        return hashBytes;
+    }
 };
 
 TEST_F(BlockKeyTest, PartialMatch)
@@ -167,6 +181,31 @@ TEST_F(BlockKeyTest, HashWithExtraKeys)
     BlockKey bk0(false, std::nullopt, {{1, 0}}, {makeMmKey(0xAA, 0)});
     BlockKey bk1(false, std::nullopt, {{1, 0}}, {makeMmKey(0xBB, 0)});
     EXPECT_FALSE(BlockKeyHasher::hash(bk0) == BlockKeyHasher::hash(bk1));
+}
+
+TEST_F(BlockKeyTest, MultimodalExtraKeysRespectSparsePromptPositions)
+{
+    using LlmRequest = tensorrt_llm::batch_manager::LlmRequest;
+
+    auto const hashParts = std::vector<SizeType32>{
+        0x01020304, 0x05060708, 0x11121314, 0x15161718, 0x21222324, 0x25262728, 0x31323334, 0x35363738};
+
+    // Sparse semantic layout: MM tokens at prompt positions {1, 3}; position 2 is text/framing.
+    // Current fields can only approximate this as one contiguous span: position=1, length=2.
+    // Desired hashing behavior must follow the sparse MM prompt positions, not the approximation.
+    auto const request = LlmRequest(0, 1, std::vector<TokenIdType>{11, 999, 77, 999, 12},
+        tensorrt_llm::runtime::SamplingConfig{1}, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::vector<std::vector<SizeType32>>{hashParts},
+        std::vector<SizeType32>{1}, std::vector<SizeType32>{2});
+    auto const expectedHash = makeHashBytes(hashParts);
+
+    auto const textGapKeys = generateBlockHashExtraKeys(request, 2, 3);
+    EXPECT_TRUE(textGapKeys.empty()) << "Text/framing tokens must not inherit the multimodal content hash.";
+
+    auto const secondSparseMmTokenKeys = generateBlockHashExtraKeys(request, 3, 4);
+    ASSERT_EQ(secondSparseMmTokenKeys.size(), 1);
+    EXPECT_EQ(secondSparseMmTokenKeys.front().hash, expectedHash);
+    EXPECT_EQ(secondSparseMmTokenKeys.front().startOffset, 0);
 }
 
 // ---------------------------------------------------------------------------
