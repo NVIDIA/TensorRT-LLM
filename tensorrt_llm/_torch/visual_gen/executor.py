@@ -335,12 +335,13 @@ def run_diffusion_worker(
     world_size: int,
     master_addr: str,
     master_port: int,
-    request_queue_addr: str,
-    response_queue_addr: str,
+    request_queue_addr: Optional[str],
+    response_queue_addr: Optional[str],
     diffusion_args: "VisualGenArgs",
     log_level: str = "info",
     req_hmac_key: Optional[bytes] = None,
     resp_hmac_key: Optional[bytes] = None,
+    local_rank: Optional[int] = None,
 ):
     """Entry point for worker process."""
     try:
@@ -354,8 +355,17 @@ def run_diffusion_worker(
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
 
-        # Calculate device_id before init_process_group
-        device_id = rank % torch.cuda.device_count() if torch.cuda.is_available() else 0
+        # Determine local_rank: explicit arg > LOCAL_RANK env > global rank.
+        # In multi-node runs (torchrun / srun --ntasks-per-node) SLURM/torchelastic
+        # sets LOCAL_RANK; in single-node mp.Process mode it equals the global rank.
+        _local_rank = (
+            local_rank if local_rank is not None else int(os.environ.get("LOCAL_RANK", rank))
+        )
+        os.environ["LOCAL_RANK"] = str(_local_rank)
+
+        # Use local_rank for device assignment so that each node's ranks map to
+        # GPUs 0..gpus_per_node-1 rather than wrapping the global rank.
+        device_id = _local_rank % torch.cuda.device_count() if torch.cuda.is_available() else 0
         if torch.cuda.is_available():
             torch.cuda.set_device(device_id)
 
