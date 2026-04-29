@@ -2364,17 +2364,21 @@ class FP4RowLinear(RowLinear):
                 fp4_x, act_per_block_scale = quantize_to_fp4_tensor(
                     x, div(1.0, self.activation_global_scaling_factor.value))
             else:
-                # WAR for FP8 output attention: dequantize to self.dtype before
-                # FP4 quantization.  The NVFP4 activation scale is calibrated in
-                # a different range from the FP8 E4M3 scale, so we rescale by 6
-                # to convert between them before dequantization.
+                # WAR for FP8 output attention: dequantize to FP32 before FP4
+                # quantization (same as original behavior).  The NVFP4
+                # activation scale is calibrated in a different range from the
+                # FP8 E4M3 scale, so we rescale by 6 to convert between them.
                 if x.dtype == trt.fp8:
                     new_scale_factor = constant(
                         self.activation_global_scaling_factor.raw_value * 6)
-                    lora_hidden_state = dequantize(
-                        x, new_scale_factor, 0,
-                        self.dtype) if lora_runtime_params is not None else None
-                    x = dequantize(x, new_scale_factor, 0, self.dtype)
+                    # Dequantize to FP32 (new_scale_factor.dtype) to preserve
+                    # the original accuracy for the FP4 re-quantization step.
+                    x = dequantize(x, new_scale_factor, 0,
+                                   new_scale_factor.dtype)
+                    # LoRA adapter expects FP16/BF16, so cast after dequantize.
+                    lora_hidden_state = cast(
+                        x, self.dtype
+                    ) if lora_runtime_params is not None else None
                 else:
                     lora_hidden_state = x if lora_runtime_params is not None else None
                 fp4_x, act_per_block_scale = dynamic_quantize(
