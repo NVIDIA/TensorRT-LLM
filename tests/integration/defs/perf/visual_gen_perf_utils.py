@@ -181,12 +181,12 @@ def build_visual_gen_db_entry(
         "l_cfg_size": int(_get_nested_value(server_config, "parallel.dit_cfg_size", 1)),
         "l_ulysses_size": int(_get_nested_value(server_config, "parallel.dit_ulysses_size", 1)),
         "s_generation_mode": _infer_generation_mode(client_config),
-        "s_backend": str(client_config["backend"]),
-        "s_size": str(client_config["size"]),
-        "l_num_frames": int(client_config["num_frames"]),
-        "l_fps": int(client_config["fps"]),
-        "l_num_inference_steps": int(client_config["num_inference_steps"]),
-        "l_max_concurrency": int(client_config["max_concurrency"]),
+        "s_backend": str(client_config.get("backend")),
+        "s_size": str(client_config.get("size")),
+        "l_num_frames": int(client_config.get("num_frames")),
+        "l_fps": int(client_config.get("fps")),
+        "l_num_inference_steps": int(client_config.get("num_inference_steps")),
+        "l_max_concurrency": int(client_config.get("max_concurrency")),
         "s_test_case_name": f"{server_name}-{client_name}",
     }
     entry.update(extract_visual_gen_metrics(result_data))
