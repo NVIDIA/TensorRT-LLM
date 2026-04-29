@@ -313,31 +313,22 @@ l0_b200:
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[nvfp4-1-attn_dp_off-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_functional_small[bf16]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_functional_small[fp8]
-  - unittest/auto_deploy/singlegpu/compile
-  # singlegpu/custom_ops: keep only files with NVFP4/FP4 tests (SM100+ gated). The other
-  # ~35 files are HW-agnostic (attention/MLA/mamba/rope/normalization/utils) or pure FP8
-  # (Hopper covers); all run in the singlegpu/custom_ops directory entry on l0_h100.yml.
+  # ------------- AutoDeploy unit tests ---------------
+  # B-tier keeps only Blackwell-meaningful tests (NVFP4 / FP4 / TRTLLM-Gen /
+  # SM100+-gated). HW-agnostic tests (compile, models, shim, utils, plus most
+  # custom_ops, smoke, transformations files) and pure-FP8 tests are covered
+  # on Hopper (l0_h100.yml) and not duplicated here.
   - unittest/auto_deploy/singlegpu/custom_ops/moe/test_ad_moe_op.py
   - unittest/auto_deploy/singlegpu/custom_ops/moe/test_trtllm_moe.py
   - unittest/auto_deploy/singlegpu/custom_ops/quantization/test_quant.py
-  # singlegpu/models and singlegpu/shim are AutoDeploy Python/glue-layer correctness
-  # tests (HF modeling parity, LlmArgs validation, executor/engine wiring) with no
-  # SM-specific paths and no quant references; covered on Hopper (l0_h100.yml).
-  # B-tier only runs the FP8 build smoke (FP8 block-scaling GEMM is SM-specific).
-  # All other singlegpu/smoke variants are bf16/HW-agnostic and covered on Hopper (l0_h100.yml).
   - unittest/auto_deploy/singlegpu/smoke/test_ad_build_small_single.py -k "Nemotron-3-Nano-30B-A3B-FP8"
-  # singlegpu/transformations: keep only files with SM100+ gating (NVFP4 / TRTLLM-Gen) or
-  # mixed quant variants where Blackwell exercises distinct kernels. The remaining ~21
-  # HW-agnostic graph-transform files (attention_matcher, rope, rmsnorm fusion, kv_cache,
-  # export, etc.) are covered on Hopper (l0_h100.yml).
-  - unittest/auto_deploy/singlegpu/transformations/library/test_trtllm_gen_diag.py
   - unittest/auto_deploy/singlegpu/transformations/library/test_fuse_relu2_quant_nvfp4.py
+  - unittest/auto_deploy/singlegpu/transformations/library/test_moe_fusion.py
   - unittest/auto_deploy/singlegpu/transformations/library/test_nvfp4_swiglu.py
-  - unittest/auto_deploy/singlegpu/transformations/library/test_quantization.py
   - unittest/auto_deploy/singlegpu/transformations/library/test_quant_fusion.py
   - unittest/auto_deploy/singlegpu/transformations/library/test_quant_moe.py
-  - unittest/auto_deploy/singlegpu/transformations/library/test_moe_fusion.py
-  - unittest/auto_deploy/singlegpu/utils
+  - unittest/auto_deploy/singlegpu/transformations/library/test_quantization.py
+  - unittest/auto_deploy/singlegpu/transformations/library/test_trtllm_gen_diag.py
   # ------------- AutoDeploy Perf Sanity ---------------
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-super_ad_blackwell-super_ad_ws1_1k1k] TIMEOUT (120)
 
