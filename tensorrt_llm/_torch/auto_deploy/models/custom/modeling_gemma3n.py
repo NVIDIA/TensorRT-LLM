@@ -23,12 +23,17 @@ vision/audio tower weights at load time. The forward path intentionally
 supports only text-only export.
 """
 
+import copy
+import json
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from pathlib import Path
+from typing import Any, Optional, Tuple
 
 import torch
+from tokenizers import Tokenizer
 from torch import nn
+from transformers import PreTrainedTokenizerFast
 from transformers.activations import ACT2FN
 from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
@@ -38,8 +43,9 @@ from transformers.models.gemma3n.configuration_gemma3n import (
     Gemma3nTextConfig,
     Gemma3nVisionConfig,
 )
-from transformers.utils import ModelOutput
+from transformers.utils import ModelOutput, cached_file
 
+from ..factory import ModelFactoryRegistry
 from ..hf import AutoModelForCausalLMFactory
 
 
@@ -875,7 +881,94 @@ class Gemma3nForConditionalGeneration(Gemma3nPreTrainedModel, GenerationMixin):
         return Gemma3nConditionalOutput(logits=logits)
 
 
+# ---------------------------------------------------------------------------
+# Wrapper tokenizer for Gemma 3n
+#
+# The upstream HF checkpoint ships ``extra_special_tokens`` as a *list* in
+# tokenizer_config.json, which is incompatible with transformers <5.3.
+# This thin wrapper loads the tokenizer assets directly, bypassing the
+# problematic codepath.
+# ---------------------------------------------------------------------------
+
+_TOKENIZER_CONFIG_FILE = "tokenizer_config.json"
+_CHAT_TEMPLATE_FILE = "chat_template.jinja"
+_TOKENIZER_FILE = "tokenizer.json"
+
+
+class ADGemma3nTokenizer(PreTrainedTokenizerFast):
+    """Wrapper that loads the upstream Gemma 3n tokenizer on current transformers."""
+
+    vocab_files_names = {"tokenizer_file": _TOKENIZER_FILE}
+    model_input_names = ["input_ids", "attention_mask"]
+    slow_tokenizer_class = None
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str | Path,
+        *inputs,
+        **kwargs,
+    ) -> "ADGemma3nTokenizer":
+        del inputs
+        for k in ("_from_auto", "_commit_hash", "trust_remote_code"):
+            kwargs.pop(k, None)
+
+        config_path = cached_file(pretrained_model_name_or_path, _TOKENIZER_CONFIG_FILE, **kwargs)
+        assert config_path is not None
+        config = json.loads(Path(config_path).read_text())
+
+        tokenizer_file = cached_file(pretrained_model_name_or_path, _TOKENIZER_FILE, **kwargs)
+        assert tokenizer_file is not None
+
+        # ``extra_special_tokens`` is a list in the upstream config; map it to
+        # the standard ``additional_special_tokens`` field.
+        extra = config.get("extra_special_tokens", [])
+        if isinstance(extra, list):
+            additional = extra
+        else:
+            additional = list(extra.keys()) if isinstance(extra, dict) else []
+
+        tokenizer = cls(
+            tokenizer_object=Tokenizer.from_file(tokenizer_file),
+            name_or_path=str(pretrained_model_name_or_path),
+            bos_token=config.get("bos_token"),
+            eos_token=config.get("eos_token"),
+            unk_token=config.get("unk_token"),
+            pad_token=config.get("pad_token"),
+            additional_special_tokens=additional,
+            clean_up_tokenization_spaces=config.get("clean_up_tokenization_spaces", False),
+            model_max_length=config.get("model_max_length"),
+            padding_side=config.get("padding_side", "left"),
+            truncation_side=config.get("truncation_side", "left"),
+        )
+
+        template_path = cached_file(
+            pretrained_model_name_or_path,
+            _CHAT_TEMPLATE_FILE,
+            _raise_exceptions_for_missing_entries=False,
+            **kwargs,
+        )
+        if template_path is not None:
+            tokenizer.chat_template = Path(template_path).read_text()
+
+        return tokenizer
+
+
+@ModelFactoryRegistry.register("Gemma3nForConditionalGeneration")
+class Gemma3nForConditionalGenerationFactory(AutoModelForCausalLMFactory):
+    """Factory that wires the wrapper tokenizer for Gemma 3n."""
+
+    def init_tokenizer(self) -> Optional[Any]:
+        if self.tokenizer is None:
+            return None
+        return ADGemma3nTokenizer.from_pretrained(self.tokenizer)
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
 AutoModelForCausalLMFactory.register_custom_model_cls("Gemma3nTextConfig", Gemma3nForCausalLM)
-AutoModelForCausalLMFactory.register_custom_model_cls(
+Gemma3nForConditionalGenerationFactory.register_custom_model_cls(
     "Gemma3nConfig", Gemma3nForConditionalGeneration
 )
