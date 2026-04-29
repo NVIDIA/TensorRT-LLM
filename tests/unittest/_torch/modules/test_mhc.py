@@ -196,6 +196,43 @@ def generate_pre_data(
     }
 
 
+def generate_realistic_pre_data(
+    n: int,
+    hc_mult: int,
+    hidden_size: int,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+) -> dict[str, torch.Tensor | float]:
+    """Generate real-scale mHC data to catch RMS denominator regressions."""
+    torch.random.manual_seed(123)
+
+    hc_mult2 = hc_mult * hc_mult
+    hc_mult3 = hc_mult * 2 + hc_mult2
+    device = "cuda"
+
+    residual = torch.randn((n, hc_mult, hidden_size), dtype=torch.float, device=device).bfloat16()
+    fn = (
+        torch.randn((hc_mult3, hc_mult, hidden_size), dtype=torch.float, device=device) * 0.05
+    ).flatten(1, 2)
+    hc_scale = torch.tensor([0.10, 0.10, 0.30], dtype=torch.float, device=device)
+    hc_base = torch.randn((hc_mult3,), dtype=torch.float, device=device) * 2.0
+
+    return {
+        "residual": residual,
+        "fn": fn,
+        "hc_scale": hc_scale,
+        "hc_base": hc_base,
+        "rms_eps": rms_eps,
+        "hc_pre_eps": hc_pre_eps,
+        "hc_sinkhorn_eps": hc_sinkhorn_eps,
+        "hc_post_mult_value": hc_post_mult_value,
+        "sinkhorn_repeat": sinkhorn_repeat,
+    }
+
+
 def generate_post_data(
     n: int,
     hidden_size: int,
@@ -609,6 +646,80 @@ def test_mhc_fused_hc_backends(n: int, hidden_size: int, hc_mult: int):
             **bf16_tol,
             msg=f"[vs {gold}] backend={backend} n={n} layer_input mismatch",
         )
+
+
+@pytest.mark.parametrize(
+    "tactic",
+    [
+        ("fused_half_mma", 0, 1, 256, 1),
+        ("fused_half_fma", 2, 1, 256, 1),
+        ("fused_all_mma", 0, 1, 0, 1),
+        ("fused_all_fma", 2, 1, 0, 1),
+    ],
+)
+def test_mhc_fused_hc_realistic_scale_regression(tactic):
+    """Real-scale mHC data catches fused_hc RMS normalization regressions."""
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
+
+    n = 16
+    hc_mult = 4
+    hidden_size = 4096
+    pre_data = generate_realistic_pre_data(n=n, hc_mult=hc_mult, hidden_size=hidden_size)
+
+    torch.random.manual_seed(17)
+    device = "cuda"
+    x_prev = torch.randn((n, hidden_size), dtype=torch.float, device=device).bfloat16()
+    residual_prev = torch.randn(
+        (n, hc_mult, hidden_size), dtype=torch.float, device=device
+    ).bfloat16()
+    post_mix_prev = torch.randn((n, hc_mult, 1), dtype=torch.float32, device=device) * 0.1
+    comb_mix_prev = torch.randn((n, hc_mult, hc_mult), dtype=torch.float32, device=device) * 0.1
+
+    cur_module = mHC(
+        mult=hc_mult,
+        hidden_size=hidden_size,
+        sinkhorn_iters=pre_data["sinkhorn_repeat"],
+        dtype=None,
+        eps=pre_data["hc_pre_eps"],
+        norm_eps=pre_data["rms_eps"],
+        post_mult_value=pre_data["hc_post_mult_value"],
+    ).cuda()
+    cur_module.fn.copy_(pre_data["fn"])
+    cur_module.scale.copy_(pre_data["hc_scale"])
+    cur_module.base.copy_(pre_data["hc_base"])
+
+    residual_cur_ref = cur_module.post_mapping(x_prev, residual_prev, post_mix_prev, comb_mix_prev)
+    post_mix_ref, comb_mix_ref, layer_input_ref = cur_module.pre_mapping(residual_cur_ref)
+
+    runner = MhcFusedHcRunner(
+        n=hc_mult,
+        hidden_size=hidden_size,
+        rms_eps=pre_data["rms_eps"],
+        hc_pre_eps=pre_data["hc_pre_eps"],
+        hc_sinkhorn_eps=pre_data["hc_sinkhorn_eps"],
+        hc_post_mult_value=pre_data["hc_post_mult_value"],
+        sinkhorn_repeat=pre_data["sinkhorn_repeat"],
+    )
+
+    residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur = runner(
+        inputs=[
+            x_prev.contiguous(),
+            residual_prev.contiguous(),
+            post_mix_prev.view(n, hc_mult).contiguous(),
+            comb_mix_prev.contiguous(),
+            cur_module.fn.detach().contiguous(),
+            cur_module.scale.detach().contiguous(),
+            cur_module.base.detach().contiguous(),
+        ],
+        tactic=tactic,
+    )
+
+    torch.testing.assert_close(residual_cur_ref, residual_cur, rtol=1e-2, atol=2e-2)
+    torch.testing.assert_close(post_mix_ref, post_mix_cur.view(n, hc_mult, 1), rtol=3e-3, atol=5e-3)
+    torch.testing.assert_close(
+        comb_mix_ref, comb_mix_cur.view(n, hc_mult, hc_mult), rtol=3e-3, atol=5e-3
+    )
+    torch.testing.assert_close(layer_input_ref, layer_input_cur, rtol=1e-2, atol=2e-2)
 
 
 @pytest.mark.parametrize("n", [128, 2048])
