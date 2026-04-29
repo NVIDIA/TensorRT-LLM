@@ -1019,7 +1019,6 @@ common-files: &common_files |
         tests/unittest/_torch/speculative/test_draft_token_tree_verification.py |
         tests/unittest/_torch/speculative/test_dynamic_spec_decode.py |
         tests/unittest/_torch/speculative/test_eagle3.py |
-        tests/unittest/_torch/speculative/test_force_accepted_tokens.py |
         tests/unittest/_torch/speculative/test_kv_cache_reuse.py |
         tests/unittest/_torch/speculative/test_mtp.py |
         tests/unittest/_torch/speculative/test_ngram.py |
@@ -2376,7 +2375,6 @@ legacy-files: &legacy_files |
         tests/unittest/_torch/speculative/test_draft_token_tree_verification.py |
         tests/unittest/_torch/speculative/test_dynamic_spec_decode.py |
         tests/unittest/_torch/speculative/test_eagle3.py |
-        tests/unittest/_torch/speculative/test_force_accepted_tokens.py |
         tests/unittest/_torch/speculative/test_kv_cache_reuse.py |
         tests/unittest/_torch/speculative/test_mtp.py |
         tests/unittest/_torch/speculative/test_ngram.py |
