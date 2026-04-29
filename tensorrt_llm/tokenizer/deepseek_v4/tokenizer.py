@@ -20,11 +20,11 @@ from transformers import AutoTokenizer
 
 from ..tokenizer import TransformersTokenizer
 
-BOS_TOKEN = "<｜begin▁of▁sentence｜>"
-EOS_TOKEN = "<｜end▁of▁sentence｜>"
-USER_TOKEN = "<｜User｜>"
-ASSISTANT_TOKEN = "<｜Assistant｜>"
-THINKING_END_TOKEN = "</think>"
+BOS_TOKEN = "<｜begin▁of▁sentence｜>"  # nosec
+EOS_TOKEN = "<｜end▁of▁sentence｜>"  # nosec
+USER_TOKEN = "<｜User｜>"  # nosec
+ASSISTANT_TOKEN = "<｜Assistant｜>"  # nosec
+THINKING_END_TOKEN = "</think>"  # nosec
 
 
 def _message_content_to_text(content: Any) -> str:
