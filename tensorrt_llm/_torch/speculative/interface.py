@@ -28,6 +28,20 @@ if IS_FLASHINFER_AVAILABLE:
 # Environment variable name for forcing the number of accepted tokens in speculative decoding
 FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS"
 
+# RNG pool configuration for the fractional (probabilistic) component of the
+# synthetic acceptance rate. Pool size MUST be a power of two so we can use
+# a bitmask (`& (pool_size - 1)`) for wrap-around — this stays cheap and
+# keeps tensor shapes static for CUDA graph capture. The fixed seed is what
+# guarantees identical random draws on every TP rank (so all ranks accept the
+# same number of tokens per iteration and downstream collectives stay in
+# lock-step). The two stride primes mix the per-call counter with the
+# per-slot index so consecutive calls / consecutive slots map to decorrelated
+# pool entries.
+_FORCE_ACCEPT_RNG_POOL_SIZE = 1 << 16  # 65536 entries (256 KiB float32)
+_FORCE_ACCEPT_RNG_SEED = 0xACCE9D
+_FORCE_ACCEPT_RNG_COUNTER_STRIDE = 6007
+_FORCE_ACCEPT_RNG_SLOT_STRIDE = 1009
+
 
 def should_use_separate_draft_kv_cache(spec_config) -> bool:
     """
@@ -556,6 +570,13 @@ class SpecWorkerBase(nn.Module, ABC):
         self.seed: Optional[torch.Tensor] = None
         self.offset: Optional[torch.Tensor] = None
         self.use_separate_draft_kv_cache = use_separate_draft_kv_cache
+        # Lazily-initialized state for the fractional synthetic acceptance
+        # rate. The pool is a fixed-seed, rank-independent table of uniform
+        # [0, 1) values; the counter is a device-side int64 advanced in-place
+        # inside captured CUDA graphs (mirroring the existing flashinfer
+        # seed/offset pattern in `_sample_tokens_for_batch`).
+        self._force_accept_rng_pool: Optional[torch.Tensor] = None
+        self._force_accept_rng_counter: Optional[torch.Tensor] = None
 
     @property
     @abstractmethod
@@ -664,6 +685,33 @@ class SpecWorkerBase(nn.Module, ABC):
         attn_metadata.restore_from_spec_dec()
         attn_metadata.on_update()
 
+    def _ensure_force_accept_rng_state(self, device: torch.device) -> None:
+        """
+        Lazily build the deterministic RNG state used by
+        :meth:`_apply_force_accepted_tokens` for fractional synthetic
+        acceptance rates.
+
+        The pool is filled from a CPU generator with a fixed seed so that
+        every tensor-parallel rank produces the bit-for-bit identical pool
+        (TP ranks must agree on the per-iteration accepted-token count, or
+        downstream collectives expecting identical shapes will hang).
+
+        First-call allocation must happen during eager warmup — never inside
+        a captured CUDA graph. The CUDA-graph runner already runs warmup
+        forwards before capture, which satisfies this in practice.
+        """
+        if self._force_accept_rng_pool is not None:
+            return
+        cpu_gen = torch.Generator(device="cpu")
+        cpu_gen.manual_seed(_FORCE_ACCEPT_RNG_SEED)
+        pool_cpu = torch.rand(_FORCE_ACCEPT_RNG_POOL_SIZE,
+                              dtype=torch.float32,
+                              generator=cpu_gen)
+        self._force_accept_rng_pool = pool_cpu.to(device=device)
+        self._force_accept_rng_counter = torch.zeros(1,
+                                                     dtype=torch.int64,
+                                                     device=device)
+
     def _apply_force_accepted_tokens(self, num_accepted_tokens, num_contexts,
                                      runtime_draft_len: int):
         """
@@ -678,11 +726,14 @@ class SpecWorkerBase(nn.Module, ABC):
         a value of ``2.6`` means: always accept 2 draft tokens, and accept
         one more with probability 0.6 (per generation request).
 
-        The implementation is CUDA-graph-compatible: only tensor ops with
-        statically-known shapes are used, and per-iteration randomness is
-        produced by ``torch.rand`` against the default CUDA generator, whose
-        Philox state is captured/replayed in graph-safe mode by PyTorch's
-        ``torch.cuda.graph`` context.
+        The implementation is CUDA-graph-compatible AND tensor-parallel
+        deterministic. Randomness is sourced from a fixed-seed lookup pool
+        plus a device-side counter that is advanced in place each call —
+        the same pattern as the flashinfer seed/offset state used by
+        :meth:`_sample_tokens_for_batch`. Because every rank seeds the pool
+        identically and increments the counter on the same captured ops,
+        every rank draws the same uniform values and therefore agrees on the
+        accepted-token count for every request in every iteration.
 
         Args:
             num_accepted_tokens: Tensor of shape [batch_size] with current
@@ -708,16 +759,30 @@ class SpecWorkerBase(nn.Module, ABC):
         base_total = min(int_part + 1, max_total)
 
         if frac_part > 0.0 and base_total < max_total:
-            # Sample one Bernoulli per generation request: with probability
-            # ``frac_part`` accept one additional draft token. ``num_gens``
-            # is fixed at CUDA-graph capture time (graphs are captured for a
-            # specific batch shape with ``num_contexts`` typically 0), so
-            # ``torch.rand`` allocates a static-shape tensor that is safely
-            # captured and replayed.
+            self._ensure_force_accept_rng_state(num_accepted_tokens.device)
+
+            # ``num_gens`` is fixed at CUDA-graph capture time (graphs are
+            # captured for a specific batch shape with ``num_contexts``
+            # typically 0), so all of the ops below have static shapes.
             num_gens = num_accepted_tokens.shape[0] - num_contexts
-            rand = torch.rand(num_gens,
-                              device=num_accepted_tokens.device,
-                              dtype=torch.float32)
+
+            # In-place counter bump is captured by the graph and replayed on
+            # every iteration, so each replay yields fresh draws from the
+            # pool. All TP ranks bump in lock-step → identical indices.
+            self._force_accept_rng_counter += 1
+
+            slot_ids = torch.arange(num_gens,
+                                    device=num_accepted_tokens.device,
+                                    dtype=torch.int64)
+            # Hash (counter, slot) → pool index. ``& (pool_size - 1)`` is a
+            # cheap power-of-two modulo. The two stride primes are coprime
+            # to ``pool_size`` so consecutive calls and consecutive slots
+            # land on decorrelated pool entries.
+            indices = (self._force_accept_rng_counter *
+                       _FORCE_ACCEPT_RNG_COUNTER_STRIDE +
+                       slot_ids * _FORCE_ACCEPT_RNG_SLOT_STRIDE) & (
+                           _FORCE_ACCEPT_RNG_POOL_SIZE - 1)
+            rand = self._force_accept_rng_pool[indices]
             extra = (rand < frac_part).to(num_accepted_tokens.dtype)
             # ``base_total + extra`` is at most ``int_part + 2``; clamp so we
             # never exceed the available draft slots.
