@@ -46,6 +46,9 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import (BAD_PAGE_INDEX,
                                                               GPU_LEVEL)
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
+from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import CuError
+from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import \
+    OutOfMemoryError as KVCacheOutOfMemoryError
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (exact_div,
                                                              typed_range)
 from tensorrt_llm.sampling_params import SamplingParams
@@ -2519,7 +2522,7 @@ class KVCacheManagerV2(BaseResourceManager):
             f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
         cache_tiers: List[CacheTierConfig] = [GpuCacheTierConfig(quota=quota)]
-        if kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size > 0:
+        if kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size >= 0:
             host_quota = kv_cache_config.host_cache_size
         else:
             # The V2 MAX_UTILIZATION scheduler relies on suspend/resume to
@@ -2530,13 +2533,25 @@ class KVCacheManagerV2(BaseResourceManager):
             #
             # Automatically provision a host tier matching the GPU quota so
             # suspend/resume works out of the box.  Cap at available host
-            # memory to avoid allocation failures.
+            # memory and pinnable memory limit to avoid allocation failures.
+            import resource
             try:
                 mem_available = os.sysconf('SC_PAGE_SIZE') * os.sysconf(
                     'SC_AVPHYS_PAGES')
             except (ValueError, OSError):
                 mem_available = float('inf')
-            host_quota = min(quota, int(mem_available * 0.5))
+            try:
+                _soft, _hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+                memlock_limit = _soft if _soft != resource.RLIM_INFINITY else float(
+                    'inf')
+            except (ValueError, OSError):
+                memlock_limit = float('inf')
+            candidates = [quota]
+            if mem_available != float('inf'):
+                candidates.append(int(mem_available * 0.5))
+            if memlock_limit != float('inf'):
+                candidates.append(int(memlock_limit * 0.8))
+            host_quota = min(candidates)
             if host_quota <= 0:
                 host_quota = quota
         if host_quota > 0:
@@ -2566,8 +2581,27 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_manager_py_config = config
 
-        self.impl = KVCacheManagerPy(config)
-
+        try:
+            self.impl = KVCacheManagerPy(config)
+        except (CuError, KVCacheOutOfMemoryError):
+            if len(cache_tiers) > 1:
+                logger.warning(
+                    "Failed to initialize KV cache manager with host cache "
+                    "tier (cuMemHostRegister may have failed). "
+                    "Retrying without host cache tier.")
+                cache_tiers_gpu_only = [
+                    t for t in cache_tiers if isinstance(t, GpuCacheTierConfig)
+                ]
+                config = self._build_cache_config(
+                    kv_cache_config,
+                    tokens_per_block=tokens_per_block,
+                    vocab_size=vocab_size,
+                    cache_tiers=cache_tiers_gpu_only,
+                )
+                self.kv_cache_manager_py_config = config
+                self.impl = KVCacheManagerPy(config)
+            else:
+                raise
         self.num_pools = len(self.impl.layer_grouping)
 
         num_layers = len(config.layers)
