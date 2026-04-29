@@ -8,6 +8,15 @@ from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import is_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
+# Positional argument indices for aten.to.dtype:
+#   to.dtype(Tensor self, ScalarType dtype, bool non_blocking=False,
+#            bool copy=False, MemoryFormat? memory_format=None)
+_TO_DTYPE_ARG_SELF = 0
+_TO_DTYPE_ARG_DTYPE = 1
+_TO_DTYPE_ARG_NON_BLOCKING = 2
+_TO_DTYPE_ARG_COPY = 3
+_TO_DTYPE_ARG_MEMORY_FORMAT = 4
+
 
 @TransformRegistry.register("cleanup_identity_dtype_cast")
 class CleanupIdentityDtypeCast(BaseTransform):
@@ -32,17 +41,33 @@ class CleanupIdentityDtypeCast(BaseTransform):
             if not is_op(node, torch.ops.aten.to.dtype):
                 continue
 
-            if len(node.args) < 2:
+            if len(node.args) < _TO_DTYPE_ARG_DTYPE + 1:
                 continue
 
-            input_node = node.args[0]
-            target_dtype = node.args[1]
+            input_node = node.args[_TO_DTYPE_ARG_SELF]
+            target_dtype = node.args[_TO_DTYPE_ARG_DTYPE]
 
             input_meta = input_node.meta.get("val", None)
             if input_meta is None:
                 continue
 
             if not hasattr(input_meta, "dtype"):
+                continue
+
+            # `copy=True` forces a materialized copy and `memory_format` may
+            # change the tensor's stride layout, both of which are observable
+            # even when the source and target dtypes match. Skip elimination
+            # in those cases to preserve semantics.
+            copy = node.kwargs.get("copy", False)
+            if len(node.args) > _TO_DTYPE_ARG_COPY:
+                copy = node.args[_TO_DTYPE_ARG_COPY]
+            if copy:
+                continue
+
+            memory_format = node.kwargs.get("memory_format", None)
+            if len(node.args) > _TO_DTYPE_ARG_MEMORY_FORMAT:
+                memory_format = node.args[_TO_DTYPE_ARG_MEMORY_FORMAT]
+            if memory_format is not None:
                 continue
 
             if input_meta.dtype == target_dtype:

@@ -300,7 +300,7 @@ def split_graph_at_dynamic_ops(gm: GraphModule) -> SplitInfo:
     node_to_partition: Dict[Node, int] = {}
     dynamic_partitions: Set[int] = set()
 
-    # First pass: identify dynamic nodes and assign them unique partitions.
+    # First pass: identify dynamic nodes and assign them unique partitions
     for node in gm.graph.nodes:
         if node.op in ("placeholder", "output"):
             continue
