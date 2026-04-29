@@ -28,7 +28,8 @@ from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..conftest import get_device_count, llm_models_root, skip_pre_blackwell
-from .accuracy_core import GSM8K, MMLU, CnnDailymail, LlmapiAccuracyTestHarness
+from .accuracy_core import (GSM8K, MMLU, MMMU, CnnDailymail,
+                            LlmapiAccuracyTestHarness)
 
 _AD_CONFIGS_DIR = (Path(get_llm_root()) / 'examples' / 'auto_deploy' /
                    'model_registry' / 'configs')
