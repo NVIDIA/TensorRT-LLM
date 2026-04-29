@@ -82,12 +82,8 @@ You MUST strictly follow the above defined tool name and parameter schemas to in
 RESPONSE_FORMAT_TEMPLATE = (
     "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{schema}"
 )
-TOOL_CALL_TEMPLATE = (
-    '<{dsml_token}invoke name="{name}">\n{arguments}\n</{dsml_token}invoke>'
-)
-TOOL_CALLS_TEMPLATE = (
-    "<{dsml_token}{block_name}>\n{tool_calls}\n</{dsml_token}{block_name}>"
-)
+TOOL_CALL_TEMPLATE = '<{dsml_token}invoke name="{name}">\n{arguments}\n</{dsml_token}invoke>'
+TOOL_CALLS_TEMPLATE = "<{dsml_token}{block_name}>\n{tool_calls}\n</{dsml_token}{block_name}>"
 TOOL_OUTPUT_TEMPLATE = "<tool_result>{content}</tool_result>"
 
 
@@ -213,9 +209,7 @@ def _sort_tool_results_by_call_order(messages: list[dict[str, Any]]) -> list[dic
                     last_tool_call_order[tool_call_id] = index
         elif message.get("role") == "user" and message.get("content_blocks"):
             tool_blocks = [
-                block
-                for block in message["content_blocks"]
-                if block.get("type") == "tool_result"
+                block for block in message["content_blocks"] if block.get("type") == "tool_result"
             ]
             if len(tool_blocks) > 1 and last_tool_call_order:
                 sorted_blocks = sorted(
@@ -457,9 +451,7 @@ class DeepseekV4Tokenizer(TransformersTokenizer):
 
         if tokenize:
             tokenizer_kwargs = {
-                key: kwargs[key]
-                for key in ("truncation", "max_length")
-                if key in kwargs
+                key: kwargs[key] for key in ("truncation", "max_length") if key in kwargs
             }
             return self.encode(rendered, add_special_tokens=False, **tokenizer_kwargs)
         return rendered

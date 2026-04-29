@@ -117,9 +117,7 @@ def test_deepseek_v4_chat_template_matches_vllm_add_generation_prompt_behavior()
         add_generation_prompt=False,
     )
 
-    assert prompt == (
-        "<｜begin▁of▁sentence｜><｜User｜>hello<｜Assistant｜></think>"
-    )
+    assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>hello<｜Assistant｜></think>")
 
 
 def test_deepseek_v4_chat_template_accepts_openai_reasoning_effort_values():
@@ -157,9 +155,7 @@ def test_deepseek_v4_chat_template_preserves_reference_max_reasoning_effort():
         reasoning_effort="max",
     )
 
-    assert prompt.startswith(
-        "<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum"
-    )
+    assert prompt.startswith("<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum")
     assert prompt.endswith("<｜User｜>hello<｜Assistant｜><think>")
 
 
@@ -281,9 +277,7 @@ def test_deepseek_v4_chat_template_renders_developer_tools_and_latest_reminder()
         enable_thinking=True,
     )
 
-    assert prompt.startswith(
-        "<｜begin▁of▁sentence｜>sys<｜latest_reminder｜>today<｜User｜>dev"
-    )
+    assert prompt.startswith("<｜begin▁of▁sentence｜>sys<｜latest_reminder｜>today<｜User｜>dev")
     assert "## Tools" in prompt
     assert '<｜DSML｜invoke name="search">' in prompt
     assert "need search</think>" in prompt

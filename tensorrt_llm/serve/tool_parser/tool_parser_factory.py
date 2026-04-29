@@ -4,9 +4,9 @@ from typing import Optional, Type
 
 from .base_tool_parser import BaseToolParser
 from .deepseekv3_parser import DeepSeekV3Parser
+from .deepseekv4_parser import DeepSeekV4Parser
 from .deepseekv31_parser import DeepSeekV31Parser
 from .deepseekv32_parser import DeepSeekV32Parser
-from .deepseekv4_parser import DeepSeekV4Parser
 from .glm4_parser import Glm4ToolParser
 from .kimi_k2_tool_parser import KimiK2ToolParser
 from .minimax_m2_parser import MiniMaxM2ToolParser
