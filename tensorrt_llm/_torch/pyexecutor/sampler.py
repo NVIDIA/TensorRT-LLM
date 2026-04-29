@@ -71,7 +71,7 @@ from tensorrt_llm.bindings.internal.runtime import (
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.sampling_params import LogprobMode, SamplingParams
+from tensorrt_llm.sampling_params import MAX_TOP_LOGPROBS, LogprobMode, SamplingParams
 
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..speculative.interface import get_force_num_accepted_tokens
@@ -1154,7 +1154,7 @@ class AsyncWorkerMixin:
 
 
 class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
-    DEFAULT_MAX_TOPK_LOGPROBS = 20
+    DEFAULT_MAX_TOPK_LOGPROBS = MAX_TOP_LOGPROBS
     DEFAULT_MAX_STOP_WORD_LENGTH = 20
     DEFAULT_MAX_STOP_WORDS = 10
 

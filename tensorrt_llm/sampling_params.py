@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import json
 import os
 from abc import ABC, abstractmethod
@@ -11,7 +25,7 @@ from strenum import StrEnum
 from tensorrt_llm.bindings import executor as tllme
 from tensorrt_llm.logger import logger
 
-_MAX_TOP_LOGPROBS = 20
+MAX_TOP_LOGPROBS = 20
 
 
 @dataclass(slots=True, kw_only=True)
@@ -357,12 +371,12 @@ class SamplingParams:
             self.logprobs = 0
         if self.logprobs is not None and self.logprobs < 0:
             raise ValueError("logprobs must be positive, zero or None")
-        if self.logprobs is not None and self.logprobs > _MAX_TOP_LOGPROBS:
-            raise ValueError(f"logprobs must be less than or equal to {_MAX_TOP_LOGPROBS}")
+        if self.logprobs is not None and self.logprobs > MAX_TOP_LOGPROBS:
+            raise ValueError(f"logprobs must be less than or equal to {MAX_TOP_LOGPROBS}")
         if self.prompt_logprobs is not None and self.prompt_logprobs < 0:
             raise ValueError("prompt_logprobs must be positive, zero or None")
-        if self.prompt_logprobs is not None and self.prompt_logprobs > _MAX_TOP_LOGPROBS:
-            raise ValueError(f"prompt_logprobs must be less than or equal to {_MAX_TOP_LOGPROBS}")
+        if self.prompt_logprobs is not None and self.prompt_logprobs > MAX_TOP_LOGPROBS:
+            raise ValueError(f"prompt_logprobs must be less than or equal to {MAX_TOP_LOGPROBS}")
 
     # NB: Static, because downstream code only holds instances of
     #     bindings.SamplingConfig (not SamplingParams).
