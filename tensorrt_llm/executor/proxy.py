@@ -172,6 +172,11 @@ class GenerationExecutorProxy(GenerationExecutor):
             nonlocal event_loop
             nonlocal async_queues
 
+            if client_id not in self._results:
+                # ADP dummy requests have client_id=None and are not tracked
+                # in _results; silently discard their results.
+                return
+
             queue = self._results[client_id].queue
             if isinstance(queue, _SyncQueue):
                 queue.put_nowait(res)

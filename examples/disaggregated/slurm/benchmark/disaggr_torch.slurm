@@ -138,6 +138,25 @@ else
     echo "TensorRT-LLM environment variables saved to ${full_logdir}/env_vars.json"
 fi
 
+# Patch lm_eval bug: 'outputs' referenced before assignment in error handler (UnboundLocalError)
+# Must run on ALL nodes since each node has its own container filesystem
+echo "Patching lm_eval api_models.py on all nodes..."
+srun --container-name=${container_name} \
+    --container-mounts=${container_mount} --no-container-mount-home \
+    --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
+    python3 -c "
+import lm_eval.models.api_models as m, inspect
+path = inspect.getfile(m)
+with open(path) as f: c = f.read()
+old = 'eval_logger.error(f\"Exception:{repr(e)}, {outputs}, retrying.\")'
+new = 'eval_logger.error(f\"Exception:{repr(e)}, retrying.\")'
+if old in c:
+    with open(path, 'w') as f: f.write(c.replace(old, new))
+    print('Patched lm_eval:', path)
+else:
+    print('lm_eval already patched or different version, skipping')
+" || echo "lm_eval patch step failed (non-fatal, continuing)"
+
 # Get node lists and replace the placeholder with the actual node names
 echo "SLURM_NODELIST: ${SLURM_NODELIST}"
 all_nodes=($(scontrol show hostname $SLURM_NODELIST | sort))

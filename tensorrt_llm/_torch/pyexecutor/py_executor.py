@@ -3012,16 +3012,8 @@ class PyExecutor:
             return
 
         if self.expected_num_active_requests - num_active_request > 0 and num_active_request == 0:
-            # Pad CTX-type dummies to max_num_tokens so the MoE all-to-all
-            # sees a comparable token count across ranks.
-            token_nums = None
-            if (not self._adp_dummy_is_gen
-                    and self.kv_cache_transceiver is not None
-                    and self.max_num_tokens is not None):
-                token_nums = [self.max_num_tokens]
             llm_request = self.kv_cache_manager.add_dummy_requests(
                 request_ids=[0],
-                token_nums=token_nums,
                 is_gen=self._adp_dummy_is_gen,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
