@@ -2567,11 +2567,12 @@ def renderTestDB(testContext, llmSrc, stageName, preDefinedMakoOpts=null) {
     }
 
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
-    // CBTS Layer 3: use the narrowed test-db when CBTS provides one;
-    // perf stages keep the source test-db for stable baselines.
+    // CBTS Layer 3: use the narrowed test-db when CBTS provides one.
+    // Perf stages are excluded at Layer 2 (launchTestJobs) and never
+    // reach this path with cbts != null, so no perfMode guard is needed here.
     def cbts = testFilter[(CBTS_RESULT)]
     def testDBPath = "${llmSrc}/tests/integration/test_lists/test-db"
-    if (cbts != null && cbts.test_db_dir_override && !perfMode) {
+    if (cbts != null && cbts.test_db_dir_override) {
         testDBPath = "${llmSrc}/${cbts.test_db_dir_override}"
         echo "CBTS [${cbts.scope}]: rendering test list from filtered test-db at ${testDBPath}"
     }
