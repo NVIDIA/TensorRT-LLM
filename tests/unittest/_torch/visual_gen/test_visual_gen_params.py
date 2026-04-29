@@ -300,8 +300,9 @@ class TestDefaultMerging:
 
     def _make_request(self, **kwargs):
         from tensorrt_llm._torch.visual_gen.executor import DiffusionRequest
+        from tensorrt_llm.visual_gen.params import VisualGenParams
 
-        return DiffusionRequest(request_id=0, prompt=["test"], **kwargs)
+        return DiffusionRequest(request_id=0, prompt=["test"], params=VisualGenParams(**kwargs))
 
     def _merge(self, executor, req):
         from tensorrt_llm._torch.visual_gen.executor import DiffusionExecutor
@@ -313,12 +314,12 @@ class TestDefaultMerging:
 
         executor = self._make_mock_executor(WanPipeline, _wan_mock(is_wan22=False, num_heads=12))
         req = self._make_request()
-        assert req.height is None
+        assert req.params.height is None
 
         self._merge(executor, req)
-        assert req.height == 480
-        assert req.width == 832
-        assert req.num_inference_steps == 50
+        assert req.params.height == 480
+        assert req.params.width == 832
+        assert req.params.num_inference_steps == 50
 
     def test_user_values_not_overwritten(self):
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
@@ -327,9 +328,9 @@ class TestDefaultMerging:
         req = self._make_request(height=1080, width=1920)
 
         self._merge(executor, req)
-        assert req.height == 1080  # User value preserved
-        assert req.width == 1920
-        assert req.num_inference_steps == 50  # Default filled
+        assert req.params.height == 1080  # User value preserved
+        assert req.params.width == 1920
+        assert req.params.num_inference_steps == 50  # Default filled
 
     def test_extra_params_defaults_merged(self):
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
@@ -338,12 +339,12 @@ class TestDefaultMerging:
         req = self._make_request()
 
         self._merge(executor, req)
-        assert req.extra_params is not None
-        assert req.extra_params["stg_scale"] == 0.0
-        assert req.extra_params["output_type"] == "pt"
-        assert req.extra_params["enhance_prompt"] is False
+        assert req.params.extra_params is not None
+        assert req.params.extra_params["stg_scale"] == 0.0
+        assert req.params.extra_params["output_type"] == "pt"
+        assert req.params.extra_params["enhance_prompt"] is False
         # None defaults are also filled
-        assert req.extra_params["stg_blocks"] is None
+        assert req.params.extra_params["stg_blocks"] is None
 
     def test_user_extra_params_not_overwritten(self):
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
@@ -352,8 +353,8 @@ class TestDefaultMerging:
         req = self._make_request(extra_params={"stg_scale": 0.5})
 
         self._merge(executor, req)
-        assert req.extra_params["stg_scale"] == 0.5  # User value preserved
-        assert req.extra_params["output_type"] == "pt"  # Default filled
+        assert req.params.extra_params["stg_scale"] == 0.5  # User value preserved
+        assert req.params.extra_params["output_type"] == "pt"  # Default filled
 
     def test_no_extra_params_for_flux(self):
         from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux import FluxPipeline
@@ -362,7 +363,7 @@ class TestDefaultMerging:
         req = self._make_request()
 
         self._merge(executor, req)
-        assert req.extra_params is None  # Flux has no extra specs
+        assert req.params.extra_params is None  # Flux has no extra specs
 
     def test_all_declared_keys_present_after_merge(self):
         """After merge, all extra_param_specs keys are in extra_params."""
@@ -374,7 +375,30 @@ class TestDefaultMerging:
         self._merge(executor, req)
         ltx2_specs = LTX2Pipeline.extra_param_specs.fget(None)
         for key in ltx2_specs:
-            assert key in req.extra_params, f"Missing key: {key}"
+            assert key in req.params.extra_params, f"Missing key: {key}"
+
+    def test_params_none_materializes_defaults(self):
+        """req.params=None is the default path from generate_async(params=None);
+        _merge_defaults should materialize a VisualGenParams from pipeline defaults."""
+        from tensorrt_llm._torch.visual_gen.executor import DiffusionRequest
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+        from tensorrt_llm.visual_gen.params import VisualGenParams
+
+        executor = self._make_mock_executor(LTX2Pipeline)
+        req = DiffusionRequest(request_id=0, prompt=["test"], params=None)
+
+        self._merge(executor, req)
+
+        assert isinstance(req.params, VisualGenParams)
+        # Universal defaults are filled from the pipeline
+        assert req.params.height == 512
+        assert req.params.width == 768
+        assert req.params.num_inference_steps == 40
+        # Extra-param defaults are filled for all declared keys
+        assert req.params.extra_params is not None
+        assert req.params.extra_params["stg_scale"] == 0.0
+        assert req.params.extra_params["output_type"] == "pt"
+        assert "stg_blocks" in req.params.extra_params
 
 
 # =============================================================================
@@ -658,8 +682,9 @@ class TestRequestValidation:
 
     def _make_request(self, **kwargs):
         from tensorrt_llm._torch.visual_gen.executor import DiffusionRequest
+        from tensorrt_llm.visual_gen.params import VisualGenParams
 
-        return DiffusionRequest(request_id=0, prompt=["test"], **kwargs)
+        return DiffusionRequest(request_id=0, prompt=["test"], params=VisualGenParams(**kwargs))
 
     def _validate(self, executor, req):
         from tensorrt_llm._torch.visual_gen.executor import DiffusionExecutor
@@ -756,6 +781,22 @@ class TestRequestValidation:
         executor = self._make_mock_executor(FluxPipeline)
         req = self._make_request()  # all None
         self._merge_and_validate(executor, req)
+
+    def test_params_none_merge_and_validate_ok(self):
+        """req.params=None must merge + validate cleanly (VisualGen.generate_async
+        defaults to params=None, so this is the canonical call path)."""
+        from tensorrt_llm._torch.visual_gen.executor import DiffusionRequest
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+        from tensorrt_llm.visual_gen.params import VisualGenParams
+
+        executor = self._make_mock_executor(LTX2Pipeline)
+        req = DiffusionRequest(request_id=0, prompt=["test"], params=None)
+
+        self._merge_and_validate(executor, req)  # should not raise
+
+        assert isinstance(req.params, VisualGenParams)
+        assert req.params.height == 512
+        assert req.params.extra_params["stg_scale"] == 0.0
 
     # --- type validation on extra_params ---
 

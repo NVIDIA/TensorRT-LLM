@@ -13,7 +13,10 @@ if TRTLLM_AVAILABLE:
     from tensorrt_llm.mapping import Mapping
 
     from ...._utils import torch_dtype_to_binding
-    from ...pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+    from ...pyexecutor.mamba_cache_manager import (
+        MambaHybridCacheManager,
+        MixedMambaHybridCacheManager,
+    )
     from ...pyexecutor.resource_manager import KVCacheManager
 
     CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
@@ -523,7 +526,7 @@ class CachedSequenceInterface:
         num_managed_mamba_layers = mamba_params["mamba_num_layers"]
 
         # Create the hybrid cache manager
-        manager = MambaHybridCacheManager(
+        manager = MixedMambaHybridCacheManager(
             **mamba_params,
             **kv_cache_kwargs,
         )
