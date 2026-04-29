@@ -3086,6 +3086,7 @@ class PyExecutor:
                 scheduler_output.generation_requests)
 
         num_fitting = scheduler_output.num_fitting_requests
+        #TODO(TRTLLM-12359): remove the WAR when PythonMambaCacheManager is deprecated.
         if isinstance(self.kv_cache_manager,
                       MambaHybridCacheManager) and self.kv_cache_transceiver:
             if len(scheduled_context_requests) > 0:
