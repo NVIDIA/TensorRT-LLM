@@ -204,7 +204,7 @@ To run only the VisualGen perf sanity stage (without the full L0 suite):
 To include the VisualGen perf sanity stage alongside the standard L0 suite:
 
 ```
-/bot run --extra-stage "DGX_B200-1_GPU-PyTorch-VisualGen-PerfSanity-1"
+/bot run --extra-stage "DGX_B200-8_GPUs-PyTorch-VisualGen-PerfSanity-Post-Merge-1"
 ```
 
 Model assets are read from `LLM_MODELS_ROOT` (defaults to
