@@ -20,11 +20,11 @@ from transformers import AutoTokenizer
 
 from ..tokenizer import TransformersTokenizer
 
-BOS_TOKEN = "<｜begin▁of▁sentence｜>"
-EOS_TOKEN = "<｜end▁of▁sentence｜>"
-USER_TOKEN = "<｜User｜>"
-ASSISTANT_TOKEN = "<｜Assistant｜>"
-THINKING_END_TOKEN = "</think>"
+BOS_TOKEN = "<｜begin▁of▁sentence｜>"  # nosec B105
+EOS_TOKEN = "<｜end▁of▁sentence｜>"  # nosec B105
+USER_TOKEN = "<｜User｜>"  # nosec B105
+ASSISTANT_TOKEN = "<｜Assistant｜>"  # nosec B105
+THINKING_END_TOKEN = "</think>"  # nosec B105
 
 
 def _message_content_to_text(content: Any) -> str:
@@ -66,8 +66,7 @@ class DeepseekV4Tokenizer(TransformersTokenizer):
 
     def apply_chat_template(self, messages, tools=None, **kwargs):
         if tools:
-            raise NotImplementedError(
-                "DeepSeek-V4 tool-call chat formatting is not supported yet.")
+            raise NotImplementedError("DeepSeek-V4 tool-call chat formatting is not supported yet.")
 
         add_generation_prompt = kwargs.get("add_generation_prompt", True)
         tokenize = kwargs.get("tokenize", False)
@@ -76,21 +75,18 @@ class DeepseekV4Tokenizer(TransformersTokenizer):
         for idx, message in enumerate(messages):
             role = message.get("role")
             content = _message_content_to_text(message.get("content"))
-            next_role = (messages[idx + 1].get("role")
-                         if idx + 1 < len(messages) else None)
+            next_role = messages[idx + 1].get("role") if idx + 1 < len(messages) else None
 
             if role == "system":
                 rendered += content
             elif role in ("user", "developer"):
                 rendered += USER_TOKEN + content
-                if next_role == "assistant" or (next_role is None
-                                                 and add_generation_prompt):
+                if next_role == "assistant" or (next_role is None and add_generation_prompt):
                     rendered += ASSISTANT_TOKEN + THINKING_END_TOKEN
             elif role == "assistant":
                 rendered += content + EOS_TOKEN
             else:
-                raise NotImplementedError(
-                    f"Unsupported DeepSeek-V4 message role: {role}")
+                raise NotImplementedError(f"Unsupported DeepSeek-V4 message role: {role}")
 
         if tokenize:
             return self.encode(rendered, add_special_tokens=False)
