@@ -813,8 +813,14 @@ class FuseFineGrainedFP8SwiGLU(BaseTransform):
     """Fuses torch_finegrained_fp8_swiglu_mlp ops by concatenating gate and up FP8 weights.
 
     This transform runs in the post_load_fusion stage and replaces
-    torch_finegrained_fp8_swiglu_mlp ops with fused_finegrained_fp8_swiglu_mlp ops
-    that use a single concatenated gate+up weight matrix.
+    torch_finegrained_fp8_swiglu_mlp ops with one of:
+      * ``fused_finegrained_fp8_swiglu_mlp`` — default FP32 per-block scale path
+        using ``trtllm_finegrained_fp8_linear`` internally.
+      * ``fused_finegrained_fp8_deepgemm_swiglu_mlp`` — Blackwell (SM100f)
+        UE8M0 path using ``trtllm_fp8_deepgemm`` internally. Selected at
+        compile time when the concatenated gate+up and down weight scales are
+        UE8M0 packed int (set by
+        ``FineGrainedFP8LinearQuantization.post_load_hook``).
 
     FP8 weight fusion:
     - gate+up FP8 weights are concatenated along dim=0: [N, K] -> [2N, K]
@@ -880,10 +886,27 @@ class FuseFineGrainedFP8SwiGLU(BaseTransform):
                 fused_gate_up_weight_node = graph.get_attr(f"{prefix}_gate_up_weight")
                 fused_gate_up_weight_scale_node = graph.get_attr(f"{prefix}_gate_up_weight_scale")
 
-            # Create the fused_finegrained_fp8_swiglu_mlp node
+            # Compile-time dispatch to the SM100f/UE8M0 DeepGEMM variant when
+            # the concatenated scale is UE8M0 packed int (set by
+            # FineGrainedFP8LinearQuantization.post_load_hook on Blackwell).
+            # down_weight_scale comes from the same post_load_hook so its dtype
+            # should match; prefer the new op only when both scales are int.
+            down_weight_scale_tensor = get_attr_by_name(gm, down_weight_scale_node.target)
+            use_deepgemm = (
+                gate_up_weight_scale.dtype == torch.int
+                and down_weight_scale_tensor is not None
+                and down_weight_scale_tensor.dtype == torch.int
+            )
+            target_op = (
+                torch.ops.auto_deploy.fused_finegrained_fp8_deepgemm_swiglu_mlp.default
+                if use_deepgemm
+                else torch.ops.auto_deploy.fused_finegrained_fp8_swiglu_mlp.default
+            )
+
+            # Create the fused swiglu node (op chosen above).
             with graph.inserting_after(node):
                 fused_node: Node = graph.call_function(
-                    torch.ops.auto_deploy.fused_finegrained_fp8_swiglu_mlp.default,
+                    target_op,
                     args=(
                         input_node,
                         fused_gate_up_weight_node,

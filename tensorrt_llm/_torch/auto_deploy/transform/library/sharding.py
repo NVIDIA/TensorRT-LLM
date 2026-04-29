@@ -1563,6 +1563,10 @@ TP_SHARDING_RULES = [
         lambda n: is_op(n, torch.ops.auto_deploy.trtllm_finegrained_fp8_linear),
         FineGrainedFP8WeightShardingInfo,
     ),
+    (
+        lambda n: is_op(n, torch.ops.auto_deploy.trtllm_fp8_deepgemm),
+        FineGrainedFP8WeightShardingInfo,
+    ),
 ]
 
 

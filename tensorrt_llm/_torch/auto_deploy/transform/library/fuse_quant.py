@@ -1,11 +1,12 @@
-from typing import Tuple, Type
+from typing import Optional, Tuple, Type
 
 import torch
 from pydantic import Field
-from torch.fx import GraphModule
+from torch.fx import GraphModule, Node
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils.node_utils import is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import (
     BaseTransform,
@@ -459,13 +460,88 @@ class FuseFineGrainedFP8LinearConfig(TransformConfig):
     )
 
 
+# Positional index of weight_scale in trtllm_finegrained_fp8_linear signature:
+#   (input, weight, bias, weight_scale, tp_mode=..., ...)
+_TRTLLM_FG_FP8_WEIGHT_SCALE_ARG = 3
+
+
+def _resolve_attr_tensor(gm: GraphModule, attr_node: Node) -> Optional[torch.Tensor]:
+    """Resolve a get_attr node's target to the live tensor on `gm`, or None.
+
+    The `weight_scale` arg may be either a registered buffer (common) or a
+    parameter. We fall back to a plain getattr walk to remain tolerant of both.
+    """
+    if not isinstance(attr_node, Node) or attr_node.op != "get_attr":
+        return None
+    target = attr_node.target
+    if not isinstance(target, str):
+        return None
+    try:
+        return gm.get_buffer(target)
+    except AttributeError:
+        pass
+    try:
+        return gm.get_parameter(target)
+    except AttributeError:
+        pass
+    obj = gm
+    for name in target.split("."):
+        obj = getattr(obj, name, None)
+        if obj is None:
+            return None
+    return obj if isinstance(obj, torch.Tensor) else None
+
+
+def _dispatch_trtllm_finegrained_fp8_to_deepgemm(gm: GraphModule) -> int:
+    """Compile-time dispatch: route UE8M0 weight_scale to the DeepGEMM op.
+
+    After `fuse_finegrained_fp8_linear`'s pattern matcher has produced
+    `trtllm_finegrained_fp8_linear` nodes, this pass prefers the dedicated
+    `trtllm_fp8_deepgemm` op whenever the weight_scale buffer has been
+    converted to UE8M0 packed int by FineGrainedFP8LinearQuantization's
+    post_load_hook (which only fires on SM100f).
+
+    Returns the number of rewritten nodes.
+    """
+    src_op = torch.ops.auto_deploy.trtllm_finegrained_fp8_linear
+    dst_op = getattr(torch.ops.auto_deploy, "trtllm_fp8_deepgemm", None)
+    if dst_op is None:
+        return 0
+
+    num_rewrites = 0
+    for node in gm.graph.nodes:
+        if not is_op(node, src_op):
+            continue
+
+        if len(node.args) <= _TRTLLM_FG_FP8_WEIGHT_SCALE_ARG:
+            continue
+        weight_scale_arg = node.args[_TRTLLM_FG_FP8_WEIGHT_SCALE_ARG]
+
+        scale_tensor = _resolve_attr_tensor(gm, weight_scale_arg)
+        if scale_tensor is None or scale_tensor.dtype != torch.int:
+            continue
+
+        # Signatures match positionally; swap the call target in place.
+        node.target = dst_op.default
+        num_rewrites += 1
+
+    return num_rewrites
+
+
 @TransformRegistry.register("fuse_finegrained_fp8_linear")
 class FuseFineGrainedFP8Linear(BaseTransform):
     """Matches and replaces FineGrained FP8 fake quantized linear ops with TRT-LLM ops.
 
-    This transform replaces torch_fake_quant_finegrained_fp8_linear (which uses HuggingFace's
-    triton kernel) with trtllm_finegrained_fp8_linear (which uses TRT-LLM's optimized
-    fp8_block_scaling_gemm kernel).
+    Two-stage pipeline:
+      1. Pattern matcher rewrites ``torch_fake_quant_finegrained_fp8_linear``
+         (HuggingFace triton kernel) to ``trtllm_finegrained_fp8_linear``
+         (TRT-LLM ``fp8_block_scaling_gemm`` with FP32 per-block scales).
+      2. A compile-time dispatch pass further rewrites any nodes whose
+         ``weight_scale`` buffer is UE8M0 packed int (produced by
+         ``FineGrainedFP8LinearQuantization.post_load_hook`` on SM100f) to
+         the dedicated ``trtllm_fp8_deepgemm`` op. Keeping the SM100f/UE8M0
+         path in a separate op avoids per-call hardware / dtype branching
+         inside the runtime op.
 
     Used for models like MiniMax M2 and DeepSeek that use HuggingFace's FineGrained FP8
     quantization format with 128x128 block sizes.
@@ -490,6 +566,10 @@ class FuseFineGrainedFP8Linear(BaseTransform):
         patterns = ADPatternMatcherPass()
         _register_finegrained_fp8_linear_patterns(patterns)
         cnt = patterns.apply(gm.graph)
+
+        # Compile-time dispatch to the UE8M0 fast-path op. Counts toward
+        # num_matches so downstream graph invariants get re-checked.
+        cnt += _dispatch_trtllm_finegrained_fp8_to_deepgemm(gm)
 
         info = TransformInfo(
             skipped=(cnt == 0),

@@ -587,12 +587,72 @@ def _torch_fake_quant_finegrained_fp8_linear_fake(
     return torch.empty((*input.shape[:-1], out_features), dtype=input.dtype, device=input.device)
 
 
+@torch.library.custom_op("auto_deploy::trtllm_fp8_deepgemm", mutates_args=())
+def trtllm_fp8_deepgemm(
+    input: torch.Tensor,  # [..., K] bfloat16
+    weight: torch.Tensor,  # [N, K] float8_e4m3fn
+    bias: Optional[torch.Tensor],  # [N] or None
+    weight_scale: torch.Tensor,  # UE8M0 packed int, TMA-aligned col-major
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
+) -> torch.Tensor:
+    """Blackwell (SM100f) FineGrainedFP8 linear via DeepGEMM fp8_swap_ab_gemm.
+
+    Dedicated compile-time-selected path for the UE8M0 fast path. The caller
+    (fuse_finegrained_fp8_linear transform) is responsible for routing to this
+    op only when:
+      * Running on SM100f, and
+      * `weight_scale` has been converted to UE8M0 packed int (torch.int) layout
+        by FineGrainedFP8LinearQuantization.post_load_hook.
+
+    Keeping this as its own op avoids per-call `is_sm_100f()` / dtype branching
+    inside `trtllm_finegrained_fp8_linear` and makes the graph shape explicit.
+    """
+    if input.dtype == torch.float8_e4m3fn:
+        raise ValueError("trtllm_fp8_deepgemm expects bfloat16 input, not FP8")
+
+    input_shape = input.shape
+    N = weight.shape[0]
+    input_2d = input.reshape(-1, input_shape[-1])
+    output = torch.ops.trtllm.fp8_swap_ab_gemm(
+        input_2d,
+        weight,
+        weight_scale,
+        output_dtype=input.dtype,
+        # Both activation scales (from _fp8_quantize_1x128_ue8m0 inside
+        # fp8_swap_ab_gemm) and weight scales (from post_load_hook) are
+        # already UE8M0. Skip DeepGEMM's internal conversion.
+        disable_ue8m0_cast=True,
+    )
+    if bias is not None:
+        output = output + bias
+    return output.reshape(*input_shape[:-1], N)
+
+
+@trtllm_fp8_deepgemm.register_fake
+def _trtllm_fp8_deepgemm_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    weight_scale: torch.Tensor,
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
+) -> torch.Tensor:
+    """Fake implementation for torch.export tracing."""
+    out_features = weight.shape[0]
+    return torch.empty((*input.shape[:-1], out_features), dtype=input.dtype, device=input.device)
+
+
 @torch.library.custom_op("auto_deploy::trtllm_finegrained_fp8_linear", mutates_args=())
 def trtllm_finegrained_fp8_linear(
     input: torch.Tensor,  # [..., K] bfloat16
     weight: torch.Tensor,  # [N, K] float8_e4m3fn
     bias: Optional[torch.Tensor],  # [N] or None
-    weight_scale: torch.Tensor,  # [N/128, K/128] per-block weight scale
+    weight_scale: torch.Tensor,  # [N/128, K/128] per-block weight scale (FP32)
     tp_mode: str = "none",
     output_sizes: Optional[List[int]] = None,
     tp_min_local_shape: int = 1,
@@ -600,42 +660,24 @@ def trtllm_finegrained_fp8_linear(
 ) -> torch.Tensor:
     """TRT-LLM optimized FineGrainedFP8 linear operation.
 
-    Uses TRT-LLM's optimized fp8_block_scaling_gemm kernel instead of HF's triton kernel.
-    On Blackwell (SM100f), when weight scales have been converted to UE8M0 format
-    (torch.int dtype) by post_load_hook, dispatches to fp8_swap_ab_gemm (DeepGEMM).
-    - weight_scale: per-block weight scale with shape [ceil(N/128), ceil(K/128)]
-      or UE8M0 packed int format after post_load_hook conversion
-    - Input is dynamically quantized using fp8_quantize_1x128
-    - Assumes 128x128 block size (standard for DeepSeek/MiniMax style FP8)
-    """
-    from tensorrt_llm._utils import get_sm_version, is_sm_100f
+    Uses TRT-LLM's fp8_block_scaling_gemm kernel with FP32 per-block weight
+    scales. The SM100f + UE8M0 fast path is handled by a separate op
+    (`trtllm_fp8_deepgemm`) that the `fuse_finegrained_fp8_linear` transform
+    dispatches to at compile time.
 
-    # Ensure input is bfloat16 for the optimized kernel
+    - weight_scale: per-block weight scale with shape [ceil(N/128), ceil(K/128)]
+      in FP32. UE8M0 packed int scales are NOT handled here.
+    - Input is dynamically quantized using fp8_quantize_1x128.
+    - For exact 128x128 blocks, uses the TRT-LLM fast path; otherwise falls
+      back to BF16 dequant + cuBLAS to avoid underutilizing the FP8 kernel.
+    """
+    from tensorrt_llm._utils import get_sm_version
+
     if input.dtype == torch.float8_e4m3fn:
         raise ValueError("trtllm_finegrained_fp8_linear expects bfloat16 input, not FP8")
 
     input_shape = input.shape
     N, K = weight.shape
-
-    # On Blackwell (SM100f): weight scales have been pre-converted to UE8M0 +
-    # TMA-aligned layout (torch.int) by FineGrainedFP8LinearQuantization's
-    # post_load_hook. Detect this and route directly to fp8_swap_ab_gemm,
-    # bypassing the block-size derivation (which assumes raw FP32 scales).
-    if is_sm_100f() and weight_scale.dtype == torch.int:
-        input_2d = input.reshape(-1, input_shape[-1])
-        output = torch.ops.trtllm.fp8_swap_ab_gemm(
-            input_2d,
-            weight,
-            weight_scale,
-            output_dtype=input.dtype,
-            # Both activation scales (from _fp8_quantize_1x128_ue8m0 inside
-            # fp8_swap_ab_gemm) and weight scales (from post_load_hook) are
-            # already UE8M0. Skip DeepGEMM's internal conversion.
-            disable_ue8m0_cast=True,
-        )
-        if bias is not None:
-            output = output + bias
-        return output.reshape(*input_shape[:-1], N)
 
     # TRT-LLM fp8_block_scaling_gemm requires float32 scales; HF checkpoints may
     # store weight_scale_inv in bfloat16 to save space, so cast here.

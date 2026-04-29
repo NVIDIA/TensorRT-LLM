@@ -308,6 +308,7 @@ class LinearShardableNode(ShardableNode):
 @ShardableNode.register(
     torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear,
     torch.ops.auto_deploy.trtllm_finegrained_fp8_linear,
+    torch.ops.auto_deploy.trtllm_fp8_deepgemm,
 )
 class FineGrainedFP8LinearShardableNode(LinearShardableNode):
     """FineGrained FP8 linear: shards per-block ``weight_scale_inv`` buffers."""
