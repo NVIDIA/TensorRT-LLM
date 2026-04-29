@@ -253,38 +253,8 @@ UniqPageLock::~UniqPageLock()
     {
         assert(p.cacheLevel == kGpuLevel && !p.scheduledForEviction());
     }
-    // Merge finish events and set on the page.
-    // Mirrors Python's merge_events(): 0 → NULL, 1 → use it,
-    // multiple → create a TemporaryCudaStream that waits for all, yielding one event.
-    {
-        std::vector<CachedCudaEvent*> live;
-        for (auto& ev : finishEvents)
-        {
-            if (!ev.isClosed())
-                live.push_back(&ev);
-        }
-        if (live.empty())
-        {
-            p.readyEvent = CachedCudaEvent::makeNull();
-        }
-        else if (live.size() == 1)
-        {
-            p.readyEvent = std::move(*live[0]);
-        }
-        else
-        {
-            // Multiple events: merge via TemporaryCudaStream.
-            std::vector<CachedCudaEvent const*> priors;
-            priors.reserve(live.size());
-            for (auto* ev : live)
-                priors.push_back(ev);
-            TemporaryCudaStream tempStream(priors);
-            {
-                auto scope = tempStream.enter();
-            }
-            p.readyEvent = tempStream.takeFinishEvent();
-        }
-    }
+    // Merge finish events and set on the page (mirrors Python's merge_events()).
+    p.readyEvent = mergeEvents(finishEvents);
 
     // Clear the holder's lock reference.
     assert(holder);
@@ -312,34 +282,7 @@ void UniqPageLock::notifyFinish(CachedCudaEvent event)
     // Avoid unbounded growth for system prompt pages shared by all requests.
     if (finishEvents.size() > 32)
     {
-        // Merge all events into one (same pattern as destructor).
-        std::vector<CachedCudaEvent*> live;
-        for (auto& ev : finishEvents)
-        {
-            if (!ev.isClosed())
-                live.push_back(&ev);
-        }
-        CachedCudaEvent merged = CachedCudaEvent::makeNull();
-        if (live.empty())
-        {
-            // already null
-        }
-        else if (live.size() == 1)
-        {
-            merged = std::move(*live[0]);
-        }
-        else
-        {
-            std::vector<CachedCudaEvent const*> priors;
-            priors.reserve(live.size());
-            for (auto* ev : live)
-                priors.push_back(ev);
-            TemporaryCudaStream tempStream(priors);
-            {
-                auto scope = tempStream.enter();
-            }
-            merged = tempStream.takeFinishEvent();
-        }
+        CachedCudaEvent merged = mergeEvents(finishEvents);
         finishEvents.clear();
         finishEvents.push_back(std::move(merged));
     }

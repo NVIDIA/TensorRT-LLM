@@ -156,4 +156,34 @@ TemporaryCudaStream::TemporaryCudaStream(std::vector<CachedCudaEvent const*> con
             ev->waitInStream(cs);
 }
 
+// ---------------------------------------------------------------------------
+// mergeEvents — merge multiple CUDA events into one.
+// Mirrors Python's merge_events() in _utils.py.
+// ---------------------------------------------------------------------------
+
+CachedCudaEvent mergeEvents(std::vector<CachedCudaEvent>& events)
+{
+    // Filter out closed events (optimization: skip cuStreamWaitEvent calls).
+    std::vector<CachedCudaEvent*> live;
+    for (auto& ev : events)
+    {
+        if (!ev.isClosed())
+            live.push_back(&ev);
+    }
+    if (live.empty())
+        return CachedCudaEvent::makeNull();
+    if (live.size() == 1)
+        return std::move(*live[0]);
+    // Multiple live events: merge via TemporaryCudaStream.
+    std::vector<CachedCudaEvent const*> priors;
+    priors.reserve(live.size());
+    for (auto* ev : live)
+        priors.push_back(ev);
+    TemporaryCudaStream tempStream(priors);
+    {
+        auto scope = tempStream.enter();
+    }
+    return tempStream.takeFinishEvent();
+}
+
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

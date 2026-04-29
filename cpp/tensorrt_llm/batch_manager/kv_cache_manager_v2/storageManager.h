@@ -242,6 +242,16 @@ private:
     // slot-to-page-index scale factors: [lcId][poolIdx]
     std::vector<std::vector<int>> mSlotToPageIndices;
 
+    // Get buffer attributes for a (LayerId, DataRole) pair. Throws std::out_of_range if not found.
+    // Mirrors Python's get_buffer_attr().
+    BufferAttr const& getBufferAttr(LayerId layerId, DataRole role) const
+    {
+        auto it = mBufferAttr.find(BufferId{layerId, role});
+        if (it == mBufferAttr.end())
+            throw std::out_of_range("Unknown buffer id");
+        return it->second;
+    }
+
     // Buffer attributes keyed by BufferId.
     std::map<BufferId, BufferAttr> mBufferAttr;
 

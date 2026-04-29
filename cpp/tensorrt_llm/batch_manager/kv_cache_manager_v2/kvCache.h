@@ -376,6 +376,13 @@ private:
     // Mirrors Python's _on_stop_committing().
     void _onStopCommitting();
 
+    // Commit a single block at ordinal `ord`.
+    // `isLast` mirrors Python's is_last parameter: when True (or on VIRTUAL_STOP),
+    // transitions to USER_STOP and calls _onStopCommitting() internally.
+    // Caller must have recordEventScope() open so finishEvent() works.
+    // Mirrors Python's _commit_block(ordinal, is_last).
+    void _commitBlock(int ord, bool isLast);
+
     std::shared_ptr<CommittedPage> _takeUncommittedPage(SeqBlock& sb, LifeCycleId lc);
 
     // Page index table management.

@@ -134,19 +134,13 @@ MemAddress KvCacheManager::getMemPoolBaseAddress(LayerId layerId, DataRole role)
 
 int KvCacheManager::getPageStride(LayerId layerId, DataRole role) const
 {
-    auto it = mStorage->mBufferAttr.find(BufferId{layerId, role});
-    if (it == mStorage->mBufferAttr.end())
-        throw std::out_of_range("Unknown buffer id");
-    auto const& attr = it->second;
+    auto const& attr = mStorage->getBufferAttr(layerId, role);
     return exactDiv(static_cast<int>(attr.size), attr.expansion);
 }
 
 int KvCacheManager::getPageIndexUpperBound(LayerId layerId, DataRole role) const
 {
-    auto it = mStorage->mBufferAttr.find(BufferId{layerId, role});
-    if (it == mStorage->mBufferAttr.end())
-        throw std::out_of_range("Unknown buffer id");
-    auto const& attr = it->second;
+    auto const& attr = mStorage->getBufferAttr(layerId, role);
     LifeCycleId lc = attr.lifeCycleId;
     PoolGroupIndex pg = static_cast<PoolGroupIndex>(mStorage->getPoolGroupIndex(lc));
     int numSlots = mStorage->numSlots(pg, kGpuLevel);
@@ -159,20 +153,17 @@ int KvCacheManager::getPageIndexUpperBound(LayerId layerId, DataRole role) const
 
 int KvCacheManager::getPageIndexScale(LayerId layerId, DataRole role) const
 {
-    auto it = mStorage->mBufferAttr.find(BufferId{layerId, role});
-    if (it == mStorage->mBufferAttr.end())
-        throw std::out_of_range("Unknown buffer id");
-    auto const& attr = it->second;
+    auto const& attr = mStorage->getBufferAttr(layerId, role);
     return mStorage->mSlotToPageIndices.at(static_cast<size_t>(attr.lifeCycleId))
         .at(static_cast<size_t>(attr.poolIndex));
 }
 
 PageIndexConverter KvCacheManager::getPageIndexConverter(LayerId layerId, DataRole role) const
 {
-    int scale = getPageIndexScale(layerId, role);
-    auto it = mStorage->mBufferAttr.find(BufferId{layerId, role});
-    int exp = it != mStorage->mBufferAttr.end() ? it->second.expansion : 1;
-    return PageIndexConverter{scale, exp};
+    auto const& attr = mStorage->getBufferAttr(layerId, role);
+    int scale = mStorage->mSlotToPageIndices.at(static_cast<size_t>(attr.lifeCycleId))
+                    .at(static_cast<size_t>(attr.poolIndex));
+    return PageIndexConverter{scale, attr.expansion};
 }
 
 // ---- getAggregatedPages ---------------------------------------------------
