@@ -146,6 +146,14 @@ class DynamicTreeOpsConverter:
         # Non-packed path ignores this (bool [bs,N,N] still has a last dim).
         num_int32_per_row = tree_mask.shape[-1]
 
+        # The CUDA builder writes only active tree links/bits. Clear the reused
+        # work buffers first so stale slot/tree state cannot leak into this tree.
+        tree_mask[:bs].zero_()
+        positions[:bs].zero_()
+        retrieve_index[:bs].zero_()
+        retrieve_next_token[:bs].fill_(-1)
+        retrieve_next_sibling[:bs].fill_(-1)
+
         # Call CUDA kernel in-place
         try:
             torch.ops.trtllm.build_dynamic_tree_op(
