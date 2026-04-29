@@ -68,6 +68,13 @@ public:
     // Dropping the returned PhysMemHandle returns it to the pool.
     [[nodiscard]] PooledPhysMem acquire();
 
+    // Release all cached (unused) physical memory back to the driver.
+    // Mirrors Python PooledPhysMemAllocator.clear().
+    void clear()
+    {
+        mPool.clear();
+    }
+
     [[nodiscard]] size_t physMemSize() const noexcept
     {
         return mPhysMemSize;

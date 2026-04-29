@@ -211,6 +211,52 @@ void SlotAllocator::synchronize()
     }
 }
 
+bool SlotAllocator::check() const noexcept
+{
+    // Mirrors Python SlotAllocator._check().
+    if (mNumActiveSlots > mCapacity)
+        return false;
+    if (mTargetCapacity > mCapacity)
+        return false;
+    if (!shrinkInProgress() && !mOverflowSlots.empty())
+        return false;
+    for (auto const& slot : mOverflowSlots)
+    {
+        if (!slot.hasValidSlot())
+            return false;
+        SlotId id = slot.slotId();
+        if (id < mTargetCapacity || id >= mCapacity)
+            return false;
+    }
+    if (static_cast<int>(mRecycledSlots.size()) + static_cast<int>(mOverflowSlots.size()) + numOccupiedSlots()
+        != mNumActiveSlots)
+        return false;
+    return true;
+}
+
+void SlotAllocator::forceFinishShrink() noexcept
+{
+    // Force-complete a pending shrink without throwing.
+    // Used in destroy() paths where we cannot propagate exceptions.
+    if (!shrinkInProgress())
+        return;
+    // Synchronize and discard all overflow slots.
+    for (auto& s : mOverflowSlots)
+    {
+        try
+        {
+            s.readyEvent.synchronize();
+        }
+        catch (...)
+        {
+        }
+        s.resetSlot();
+    }
+    mOverflowSlots.clear();
+    mCapacity = mTargetCapacity;
+    mNumActiveSlots = std::min(mNumActiveSlots, mCapacity);
+}
+
 void SlotAllocator::scrubEvents()
 {
     int num = mNumReadyRecycledSlots;

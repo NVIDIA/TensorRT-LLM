@@ -288,6 +288,16 @@ public:
         return total;
     }
 
+    // Total bytes across all pools, rounding each pool's bytes up to granularity.
+    // Mirrors Python total_quota: sum(round_up(p.num_bytes, granularity) for p in pg._pools).
+    size_t roundedNumBytes(int granularity) const noexcept
+    {
+        size_t total = 0;
+        for (auto const& pool : mPools)
+            total += roundUp(pool->numBytes(), static_cast<size_t>(granularity));
+        return total;
+    }
+
 protected:
     SlotAllocator mSlotAllocator;
     std::vector<std::unique_ptr<SlotPoolBase>> mPools;
@@ -337,7 +347,7 @@ public:
     std::vector<Address> slotAddress(PoolGroupIndex pgIdx, SlotId slotId) const;
 
     // Additional accessors used by StorageManager and KvCacheManager.
-    void destroy()
+    virtual void destroy()
     {
         for (auto& pg : mPoolGroups)
             pg->destroy();
@@ -372,9 +382,10 @@ public:
 
     size_t totalQuota() const noexcept
     {
+        int granularity = poolSizeGranularity();
         size_t total = 0;
         for (auto const& pg : mPoolGroups)
-            total += pg->numBytes();
+            total += pg->roundedNumBytes(granularity);
         return total;
     }
 
@@ -459,6 +470,23 @@ public:
         return CacheTier::GPU_MEM;
     }
 
+    int poolSizeGranularity() const noexcept override
+    {
+        return static_cast<int>(mPhysMemAllocator->physMemSize());
+    }
+
+    void postResize() override
+    {
+        CacheLevelStorage::postResize();
+        mPhysMemAllocator->clear();
+    }
+
+    void destroy() override
+    {
+        CacheLevelStorage::destroy();
+        mPhysMemAllocator->clear();
+    }
+
 private:
     std::unique_ptr<PooledPhysMemAllocator> mPhysMemAllocator;
 };
@@ -471,6 +499,11 @@ public:
     CacheTier cacheTier() const noexcept override
     {
         return CacheTier::HOST_MEM;
+    }
+
+    int poolSizeGranularity() const noexcept override
+    {
+        return static_cast<int>(HostMem::kAlignment);
     }
 };
 
