@@ -979,8 +979,15 @@ class DeepseekV4Indexer(Indexer):
         return q
 
     def _update_k_cache(self, k_fp8, k_scale, metadata):
-        """Overwrite the fused compressor's FP8 cache with reference-style FP4-QAT values."""
-        super()._update_k_cache(k_fp8, k_scale, metadata)
+        """No-op: the DeepSeek-V4 compressor already scatters indexer K cache.
+
+        The base DSA indexer expects pre-indexer projection to return K values
+        that still need to be appended to the indexer cache.  DeepSeek-V4 uses
+        Compressor.forward() instead, and its fused postprocess/scatter kernel
+        writes the same INDEXER_COMPRESS cache before sparse_attn_indexer() runs.
+        Re-scattering here duplicates cache writes and adds an extra kernel.
+        """
+        return
 
     def forward(
         self,

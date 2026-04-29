@@ -25,7 +25,9 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor import 
 )
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
     DeepseekV4AttentionType,
+    DeepseekV4Indexer,
 )
+from tensorrt_llm._torch.attention_backend.sparse.dsa import Indexer
 from tensorrt_llm._torch.modules.rotary_embedding import RopeParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -1661,6 +1663,12 @@ def _create_minimal_metadata(compressor: Compressor, total_compressed_tokens: in
     return metadata
 
 
+def test_compressor_wkv_gate_uses_checkpoint_dtype():
+    compressor = _create_small_compressor(kv_cache_dtype="default", is_indexer=False)
+
+    assert compressor.wkv_gate.weight.dtype == DTYPE
+
+
 def _run_compressor_with_fake_postprocess(monkeypatch, kv_cache_dtype: str, is_indexer: bool):
     compressor = _create_small_compressor(kv_cache_dtype, is_indexer)
     metadata = _create_minimal_metadata(compressor)
@@ -1792,6 +1800,16 @@ def test_indexer_returns_fused_quant_outputs(
         assert torch.equal(scale_output, torch.full_like(scale_output, 2.0))
     else:
         assert torch.equal(scale_output, torch.full_like(scale_output, 0x7F))
+
+
+def test_deepseek_v4_indexer_skips_duplicate_cache_scatter(monkeypatch):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("base DSA cache scatter should not run for DeepSeek-V4 indexer")
+
+    monkeypatch.setattr(Indexer, "_update_k_cache", fail_if_called)
+    indexer = DeepseekV4Indexer.__new__(DeepseekV4Indexer)
+
+    assert indexer._update_k_cache(object(), object(), object()) is None
 
 
 # ============================================================================
