@@ -20,7 +20,7 @@ from __future__ import annotations
 import heapq
 from abc import ABC, abstractmethod
 from collections import namedtuple
-from dataclasses import MISSING, astuple, dataclass, fields
+from dataclasses import MISSING, astuple, dataclass, field, fields
 from typing import TYPE_CHECKING, Dict, List, Tuple
 
 if TYPE_CHECKING:
@@ -31,17 +31,46 @@ if TYPE_CHECKING:
 
 HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
 
-_ITER_STATS_RANK_STATE_FIELDS = (
-    "has_iter_stats",
-    "iter_stats_iter",
-    "num_context_requests",
-    "num_ctx_tokens",
-    "num_ctx_kv_tokens",
-    "num_gen_requests",
-    "num_gen_kv_tokens",
-    "num_paused_requests",
-    "num_paused_kv_tokens",
-)
+
+@dataclass
+class RankIterStatsPayload:
+    """Per-rank IterationStats payload piggybacked on the ADP allgather."""
+
+    has_iter_stats: int = 0
+    iter_stats_iter: int = -1
+    num_context_requests: int = 0
+    num_ctx_tokens: int = 0
+    num_ctx_kv_tokens: int = 0
+    num_gen_requests: int = 0
+    num_gen_kv_tokens: int = 0
+    num_paused_requests: int = 0
+    num_paused_kv_tokens: int = 0
+
+    def serialize(self) -> list[int]:
+        """Serialize to a flat list for allgather transport."""
+        return list(astuple(self))
+
+    @classmethod
+    def deserialize(cls, data: list[int]) -> RankIterStatsPayload:
+        """Deserialize a flat payload, filling omitted trailing defaults."""
+        values = list(data)
+        payload_fields = fields(cls)
+        if len(values) > len(payload_fields):
+            raise ValueError(
+                f"RankIterStatsPayload has {len(values)} fields, expected at most "
+                f"{len(payload_fields)}"
+            )
+        for field_info in payload_fields[len(values) :]:
+            if field_info.default is not MISSING:
+                values.append(field_info.default)
+            elif field_info.default_factory is not MISSING:
+                values.append(field_info.default_factory())
+            else:
+                raise ValueError(
+                    "RankIterStatsPayload is missing required field "
+                    f"{field_info.name}"
+                )
+        return cls(*values)
 
 
 @dataclass
@@ -56,46 +85,54 @@ class RankState:
     rank: int
     num_active_requests: int = 0
     num_active_tokens: int = 0
-    has_iter_stats: int = 0
-    iter_stats_iter: int = -1
-    num_context_requests: int = 0
-    num_ctx_tokens: int = 0
-    num_ctx_kv_tokens: int = 0
-    num_gen_requests: int = 0
-    num_gen_kv_tokens: int = 0
-    num_paused_requests: int = 0
-    num_paused_kv_tokens: int = 0
+    iter_stats: RankIterStatsPayload = field(default_factory=RankIterStatsPayload)
 
-    def copy_iter_stats_from(self, iter_stats_state: RankState | None) -> None:
-        if iter_stats_state is None:
+    def copy_iter_stats_from(
+        self, iter_stats_payload: RankIterStatsPayload | None
+    ) -> None:
+        if iter_stats_payload is None:
             return
-        for field_name in _ITER_STATS_RANK_STATE_FIELDS:
-            setattr(self, field_name, getattr(iter_stats_state, field_name))
+        self.iter_stats = RankIterStatsPayload.deserialize(
+            iter_stats_payload.serialize()
+        )
 
     def serialize(self) -> list[int]:
         """Serialize to a flat list for allgather transport."""
-        return list(astuple(self))
+        return [
+            self.rank,
+            self.num_active_requests,
+            self.num_active_tokens,
+            *self.iter_stats.serialize(),
+        ]
 
     @classmethod
     def deserialize(cls, data: list[int]) -> RankState:
         """Deserialize from a flat list received via allgather."""
         values = list(data)
-        rank_state_fields = fields(cls)
-        if len(values) > len(rank_state_fields):
+        rank_state_fields = fields(cls)[:3]
+        if len(values) < 1:
+            raise ValueError("RankState payload is missing required field rank")
+        if len(values) > 3 + len(fields(RankIterStatsPayload)):
             raise ValueError(
                 f"RankState payload has {len(values)} fields, expected at most "
-                f"{len(rank_state_fields)}"
+                f"{3 + len(fields(RankIterStatsPayload))}"
             )
-        for field_info in rank_state_fields[len(values) :]:
+        rank_values = values[:3]
+        for field_info in rank_state_fields[len(rank_values) :]:
             if field_info.default is not MISSING:
-                values.append(field_info.default)
+                rank_values.append(field_info.default)
             elif field_info.default_factory is not MISSING:
-                values.append(field_info.default_factory())
+                rank_values.append(field_info.default_factory())
             else:
                 raise ValueError(
                     f"RankState payload is missing required field {field_info.name}"
                 )
-        return cls(*values)
+        return cls(
+            rank=rank_values[0],
+            num_active_requests=rank_values[1],
+            num_active_tokens=rank_values[2],
+            iter_stats=RankIterStatsPayload.deserialize(values[3:]),
+        )
 
 
 class ADPRouter(ABC):
@@ -171,7 +208,7 @@ class ADPRouter(ABC):
         self,
         active_requests: list[LlmRequest],
         new_requests: list[RequestQueueItem] | None = None,
-        iter_stats_state: RankState | None = None,
+        iter_stats_payload: RankIterStatsPayload | None = None,
     ) -> list[RankState]:
         """Build local RankState, allgather across DP ranks, return all states.
 
@@ -180,11 +217,11 @@ class ADPRouter(ABC):
             new_requests: New requests popped from the waiting queue.
                 Currently unused; reserved for future routers that need
                 new-request info (e.g. KV-cache-aware routing).
-            iter_stats_state: Completed previous-iteration stats payload to
+            iter_stats_payload: Completed previous-iteration stats payload to
                 piggyback on this allgather, if one is pending.
         """
         local_state = self.create_rank_state(active_requests, new_requests or [])
-        local_state.copy_iter_stats_from(iter_stats_state)
+        local_state.copy_iter_stats_from(iter_stats_payload)
         responses = self.dist.tp_allgather(local_state.serialize())
         return [RankState.deserialize(data=resp) for resp in responses]
 

@@ -70,7 +70,7 @@ from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
-from .scheduler.adp_router import ADPRouter, RankState
+from .scheduler.adp_router import ADPRouter, RankIterStatsPayload, RankState
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -541,7 +541,8 @@ class PyExecutor:
         self._kv_iter_stats_interval = getattr(
             getattr(self.llm_args, 'kv_cache_config', None),
             'iteration_stats_interval', 1)
-        self._pending_adp_iter_stats_state: Optional[RankState] = None
+        self._pending_adp_iter_stats_payload: Optional[
+            RankIterStatsPayload] = None
         self._pending_adp_iter_stats: Optional[IterationStats] = None
         self._pending_adp_req_stats: Optional[List[RequestStats]] = None
         self._pending_adp_kv_iter_stats = None
@@ -1327,11 +1328,10 @@ class PyExecutor:
 
         return stats
 
-    def _make_adp_iter_stats_rank_state(self,
-                                        stats: IterationStats) -> RankState:
+    def _make_adp_iter_stats_payload(
+            self, stats: IterationStats) -> RankIterStatsPayload:
         ifb = stats.inflight_batching_stats
-        return RankState(
-            rank=self.dist.tp_rank,
+        return RankIterStatsPayload(
             has_iter_stats=1,
             iter_stats_iter=stats.iter,
             num_context_requests=ifb.num_context_requests,
@@ -1348,15 +1348,15 @@ class PyExecutor:
         stats: IterationStats,
         req_stats: Optional[List[RequestStats]] = None,
     ) -> None:
-        if self._pending_adp_iter_stats_state is not None:
+        if self._pending_adp_iter_stats_payload is not None:
             logger.warning(
                 "Replacing an ungathered attention-DP IterationStats payload "
-                f"for iter {self._pending_adp_iter_stats_state.iter_stats_iter} "
+                f"for iter {self._pending_adp_iter_stats_payload.iter_stats_iter} "
                 f"with iter {stats.iter}"
             )
 
-        self._pending_adp_iter_stats_state = (
-            self._make_adp_iter_stats_rank_state(stats))
+        self._pending_adp_iter_stats_payload = (
+            self._make_adp_iter_stats_payload(stats))
 
         if self.dist.rank == 0:
             self._pending_adp_iter_stats = stats
@@ -1364,7 +1364,7 @@ class PyExecutor:
             self._pending_adp_kv_iter_stats = self._latest_kv_iter_stats
 
     def _clear_pending_adp_iter_stats(self) -> None:
-        self._pending_adp_iter_stats_state = None
+        self._pending_adp_iter_stats_payload = None
         self._pending_adp_iter_stats = None
         self._pending_adp_req_stats = None
         self._pending_adp_kv_iter_stats = None
@@ -1372,24 +1372,28 @@ class PyExecutor:
     def _aggregate_adp_iter_stats(self, stats: IterationStats,
                                   all_rank_states: List[RankState]) -> None:
         ifb = stats.inflight_batching_stats
-        ifb.num_context_requests = sum(s.num_context_requests
+        ifb.num_context_requests = sum(s.iter_stats.num_context_requests
                                        for s in all_rank_states)
-        ifb.num_ctx_tokens = sum(s.num_ctx_tokens for s in all_rank_states)
-        ifb.num_ctx_kv_tokens = sum(s.num_ctx_kv_tokens
+        ifb.num_ctx_tokens = sum(s.iter_stats.num_ctx_tokens
+                                 for s in all_rank_states)
+        ifb.num_ctx_kv_tokens = sum(s.iter_stats.num_ctx_kv_tokens
                                     for s in all_rank_states)
-        ifb.num_gen_requests = sum(s.num_gen_requests for s in all_rank_states)
-        ifb.num_gen_kv_tokens = sum(s.num_gen_kv_tokens
+        ifb.num_gen_requests = sum(s.iter_stats.num_gen_requests
+                                   for s in all_rank_states)
+        ifb.num_gen_kv_tokens = sum(s.iter_stats.num_gen_kv_tokens
                                     for s in all_rank_states)
-        ifb.num_paused_requests = sum(s.num_paused_requests
+        ifb.num_paused_requests = sum(s.iter_stats.num_paused_requests
                                       for s in all_rank_states)
-        ifb.num_paused_kv_tokens = sum(s.num_paused_kv_tokens
+        ifb.num_paused_kv_tokens = sum(s.iter_stats.num_paused_kv_tokens
                                        for s in all_rank_states)
         ifb.num_scheduled_requests = (
             ifb.num_context_requests + ifb.num_gen_requests)
 
     def _finalize_pending_adp_iter_stats(
             self, all_rank_states: List[RankState]) -> None:
-        pending_states = [s for s in all_rank_states if s.has_iter_stats]
+        pending_states = [
+            s for s in all_rank_states if s.iter_stats.has_iter_stats
+        ]
         if not pending_states:
             return
         if len(pending_states) != len(all_rank_states):
@@ -1398,7 +1402,7 @@ class PyExecutor:
                 f"{len(pending_states)}/{len(all_rank_states)} rank payloads")
             return
 
-        pending_iters = {s.iter_stats_iter for s in pending_states}
+        pending_iters = {s.iter_stats.iter_stats_iter for s in pending_states}
         if len(pending_iters) != 1:
             logger.warning(
                 "Skipping attention-DP IterationStats aggregation: mixed "
@@ -1406,7 +1410,7 @@ class PyExecutor:
             return
 
         iter_stats_iter = next(iter(pending_iters))
-        local_pending = self._pending_adp_iter_stats_state
+        local_pending = self._pending_adp_iter_stats_payload
         if (local_pending is None
                 or local_pending.iter_stats_iter != iter_stats_iter):
             logger.warning(
@@ -2967,7 +2971,7 @@ class PyExecutor:
             # info, the allgather position may need to be revisited.
             all_rank_states = self.adp_router.gather_all_rank_states(
                 active_requests,
-                iter_stats_state=self._pending_adp_iter_stats_state)
+                iter_stats_payload=self._pending_adp_iter_stats_payload)
             self._finalize_pending_adp_iter_stats(all_rank_states)
             all_ranks_num_active_requests = [
                 s.num_active_requests for s in all_rank_states

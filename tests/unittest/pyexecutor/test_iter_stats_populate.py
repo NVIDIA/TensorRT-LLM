@@ -38,7 +38,10 @@ import threading
 import types
 from unittest.mock import MagicMock, patch
 
-from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankState
+from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
+    RankIterStatsPayload,
+    RankState,
+)
 from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats
 
 
@@ -557,7 +560,7 @@ def _build_adp_stats_harness(pending_stats, *, rank=0, tp_rank=0):
     harness._pending_adp_iter_stats = pending_stats if rank == 0 else None
     harness._pending_adp_req_stats = ["req-stats"] if rank == 0 else None
     harness._pending_adp_kv_iter_stats = "pending-kv" if rank == 0 else None
-    harness._pending_adp_iter_stats_state = PyExecutor._make_adp_iter_stats_rank_state(
+    harness._pending_adp_iter_stats_payload = PyExecutor._make_adp_iter_stats_payload(
         harness, pending_stats
     )
 
@@ -592,18 +595,21 @@ def test_attention_dp_aggregation_sums_rank_local_fields_only():
         num_queued_gen_kv_tokens=800,
     )
     harness = _build_adp_stats_harness(rank0_stats)
-    rank0_state = harness._pending_adp_iter_stats_state
+    rank0_state = RankState(
+        rank=0, iter_stats=harness._pending_adp_iter_stats_payload)
     rank1_state = RankState(
         rank=1,
-        has_iter_stats=1,
-        iter_stats_iter=9,
-        num_context_requests=3,
-        num_ctx_tokens=300,
-        num_ctx_kv_tokens=30,
-        num_gen_requests=4,
-        num_gen_kv_tokens=40,
-        num_paused_requests=2,
-        num_paused_kv_tokens=25,
+        iter_stats=RankIterStatsPayload(
+            has_iter_stats=1,
+            iter_stats_iter=9,
+            num_context_requests=3,
+            num_ctx_tokens=300,
+            num_ctx_kv_tokens=30,
+            num_gen_requests=4,
+            num_gen_kv_tokens=40,
+            num_paused_requests=2,
+            num_paused_kv_tokens=25,
+        ),
     )
 
     harness._finalize_pending_adp_iter_stats([rank0_state, rank1_state])
@@ -627,31 +633,34 @@ def test_attention_dp_aggregation_sums_rank_local_fields_only():
     assert ifb.num_queued_gen_kv_tokens == 800
     assert req_stats == ["req-stats"]
     assert kv_iter_stats == "pending-kv"
-    assert harness._pending_adp_iter_stats_state is None
+    assert harness._pending_adp_iter_stats_payload is None
 
 
 def test_attention_dp_aggregation_waits_for_complete_matching_payloads():
     rank0_stats = _make_adp_iteration_stats(iter_id=9, num_context_requests=1)
     harness = _build_adp_stats_harness(rank0_stats)
-    rank0_state = harness._pending_adp_iter_stats_state
+    rank0_state = RankState(
+        rank=0, iter_stats=harness._pending_adp_iter_stats_payload)
     missing_rank1_state = RankState(rank=1)
 
     harness._finalize_pending_adp_iter_stats([rank0_state, missing_rank1_state])
 
     assert harness.stats == []
-    assert harness._pending_adp_iter_stats_state is rank0_state
+    assert harness._pending_adp_iter_stats_payload is rank0_state.iter_stats
 
     mismatched_rank1_state = RankState(
         rank=1,
-        has_iter_stats=1,
-        iter_stats_iter=8,
-        num_context_requests=2,
+        iter_stats=RankIterStatsPayload(
+            has_iter_stats=1,
+            iter_stats_iter=8,
+            num_context_requests=2,
+        ),
     )
 
     harness._finalize_pending_adp_iter_stats([rank0_state, mismatched_rank1_state])
 
     assert harness.stats == []
-    assert harness._pending_adp_iter_stats_state is rank0_state
+    assert harness._pending_adp_iter_stats_payload is rank0_state.iter_stats
 
 
 # ---------------------------------------------------------------------------
