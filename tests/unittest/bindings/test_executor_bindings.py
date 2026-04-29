@@ -1016,6 +1016,7 @@ def test_multimodal_input():
     assert config.multimodal_lengths == multimodal_lengths
     # Default value for multimodal_uuids should be None
     assert config.multimodal_uuids is None
+    assert config.multimodal_hash_positions is None
 
 
 @pytest.mark.parametrize(
@@ -1072,6 +1073,24 @@ def test_multimodal_input_pickle_with_uuids():
     pickled_no_uuids = pickle.dumps(config_no_uuids)
     restored_no_uuids = pickle.loads(pickled_no_uuids)
     assert restored_no_uuids.multimodal_uuids is None
+
+
+def test_multimodal_input_with_hash_positions():
+    """Test MultimodalInput with exact multimodal hash token positions."""
+    multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8]]
+    multimodal_positions = [1]
+    multimodal_lengths = [2]
+    multimodal_uuids = ["test-uuid-1"]
+    multimodal_hash_positions = [[1, 3]]
+
+    config = trtllm.MultimodalInput(multimodal_hashes, multimodal_positions,
+                                    multimodal_lengths, multimodal_uuids,
+                                    multimodal_hash_positions)
+
+    assert config.multimodal_hash_positions == multimodal_hash_positions
+
+    restored = pickle.loads(pickle.dumps(config))
+    assert restored.multimodal_hash_positions == multimodal_hash_positions
 
 
 def test_mrope_config():

@@ -34,9 +34,11 @@ using MmKey = tensorrt_llm::executor::MmKey;
 
 //! \brief Generate the multimodal extra keys for a single KV cache block.
 //! \param llmRequest The request with multimodal data.
-//! \param startTokenIdx First multimodal token index in the cache block respectively to the start of the multimodal
-//! data array. \param endTokenIdx Last multimodal token index in the cache block respectively to the end of the
-//! multimodal data array. \return Vector of MmKey entries for multimodal items overlapping the block.
+//! \param startTokenIdx First token index in the cache block relative to the prompt.
+//! \param endTokenIdx One-past-last token index in the cache block relative to the prompt.
+//! \return Vector of MmKey entries for multimodal items overlapping the block.
+//! \details When exact multimodal hash positions are present, each hash applies only to those sparse prompt positions.
+//! Otherwise this falls back to the legacy contiguous [position, position + length) span.
 std::vector<MmKey> generateBlockHashExtraKeys(
     tensorrt_llm::batch_manager::LlmRequest const& llmRequest, SizeType32 startTokenIdx, SizeType32 endTokenIdx);
 
@@ -46,8 +48,8 @@ struct BlockKey
     std::optional<LoraTaskIdType> loraTaskId = std::nullopt;
     VecUniqueTokens uniqueTokens;
 
-    // Extra keys for multimodal data (similar to VLLM's approach)
-    // Each extra key is a pair of (mm_hash, start_offset_in_block)
+    // Extra keys for multimodal data (similar to VLLM's approach).
+    // Each extra key is a pair of (mm_hash, token_offset_within_multimodal_item).
     std::vector<MmKey> extraKeys;
     std::optional<CacheSaltIDType> cacheSaltID = std::nullopt;
 

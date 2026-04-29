@@ -2474,11 +2474,37 @@ class KVCacheManagerV2(BaseResourceManager):
             end = len(tokens)
         is_sliced = start != 0 or end != len(tokens)
 
-        if (req.multimodal_hashes is None or req.multimodal_positions is None
-                or req.multimodal_lengths is None):
+        if req.multimodal_hashes is None:
             return tokens[start:end] if is_sliced else tokens
 
         result: list[TokenIdExt] = list(tokens[start:end])
+
+        def _hash_ints_to_digest(hash_ints: Sequence[int]) -> bytes:
+            # Convert 8 x int32 hash to 32-byte digest (big-endian,
+            # matching v1 C++ getNthByte which extracts MSB first).
+            assert len(
+                hash_ints
+            ) == 8, f"Expected 8 int32 hash values, got {len(hash_ints)}"
+            return b''.join(
+                v.to_bytes(4, 'big', signed=True) for v in hash_ints)
+
+        multimodal_hash_positions = getattr(req, "multimodal_hash_positions",
+                                            None)
+        if multimodal_hash_positions is not None:
+            for hash_ints, positions in zip(req.multimodal_hashes,
+                                            multimodal_hash_positions,
+                                            strict=True):
+                digest = _hash_ints_to_digest(hash_ints)
+                mm_tokens = gen_multi_modal_tokens(self.vocab_size, digest,
+                                                   len(positions))
+                for hash_offset, prompt_position in enumerate(positions):
+                    if start <= prompt_position < end:
+                        result[prompt_position - start] = mm_tokens[hash_offset]
+            return result
+
+        if req.multimodal_positions is None or req.multimodal_lengths is None:
+            return tokens[start:end] if is_sliced else tokens
+
         for hash_ints, pos, length in zip(req.multimodal_hashes,
                                           req.multimodal_positions,
                                           req.multimodal_lengths,
@@ -2487,13 +2513,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # Skip multimodal items outside [start, end).
             if mm_end <= start or pos >= end:
                 continue
-            # Convert 8 x int32 hash to 32-byte digest (big-endian,
-            # matching v1 C++ getNthByte which extracts MSB first).
-            assert len(
-                hash_ints
-            ) == 8, f"Expected 8 int32 hash values, got {len(hash_ints)}"
-            digest = b''.join(
-                v.to_bytes(4, 'big', signed=True) for v in hash_ints)
+            digest = _hash_ints_to_digest(hash_ints)
             mm_tokens = gen_multi_modal_tokens(self.vocab_size, digest, length)
             # Overlap between [pos, mm_end) and [start, end).
             overlap_start = max(pos, start)

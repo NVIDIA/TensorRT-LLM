@@ -1203,6 +1203,14 @@ TEST(SerializeUtilsTest, MultimodalInputWithUuids)
                 EXPECT_EQ((*origUuids)[i], (*deserUuids)[i]);
             }
         }
+
+        auto origHashPositions = original.getMultimodalHashPositions();
+        auto deserHashPositions = deserialized.getMultimodalHashPositions();
+        EXPECT_EQ(origHashPositions.has_value(), deserHashPositions.has_value());
+        if (origHashPositions.has_value() && deserHashPositions.has_value())
+        {
+            EXPECT_EQ(*origHashPositions, *deserHashPositions);
+        }
     };
 
     // Test MultimodalInput with UUIDs
@@ -1211,12 +1219,17 @@ TEST(SerializeUtilsTest, MultimodalInputWithUuids)
         {10, 20, 30, 40, 50, 60, 70, 80} // Second image hash
     };
     std::vector<SizeType32> positions = {0, 100};
-    std::vector<SizeType32> lengths = {50, 75};
+    std::vector<SizeType32> lengths = {3, 2};
+    std::vector<std::vector<SizeType32>> hashPositions = {{0, 2, 4}, {100, 103}};
 
     // Test with full UUIDs
     std::vector<std::optional<std::string>> uuids = {std::string("image-uuid-001"), std::string("image-uuid-002")};
     MultimodalInput inputWithUuids(hashes, positions, lengths, uuids);
     verifyMultimodalInput(inputWithUuids);
+
+    // Test with exact sparse hash positions
+    MultimodalInput inputWithHashPositions(hashes, positions, lengths, uuids, hashPositions);
+    verifyMultimodalInput(inputWithHashPositions);
 
     // Test with partial UUIDs (mixed Some and None)
     std::vector<std::optional<std::string>> partialUuids = {std::string("uuid-a"), std::nullopt};

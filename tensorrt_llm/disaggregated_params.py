@@ -36,6 +36,7 @@ class DisaggregatedParams:
 
         multimodal_embedding_handles (List[Dict[str, Any]]): The resulting multimodal embedding handles from ViT.
         multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.
+        multimodal_hash_positions (List[List[int]]): Exact prompt token positions covered by each multimodal hash.
     """
 
     request_type: Optional[str] = None
@@ -59,6 +60,7 @@ class DisaggregatedParams:
     multimodal_hashes: Optional[List[List[int]]] = (
         None  # user provided mm hashes should be a list of 8 integers
     )
+    multimodal_hash_positions: Optional[List[List[int]]] = None
     mrope_position_ids_handle: Optional[Dict[str, Any]] = None
     mrope_position_deltas_handle: Optional[Dict[str, Any]] = None
 
@@ -104,17 +106,8 @@ class DisaggregatedParams:
                     "context_and_generation"
                 )
         if self.multimodal_embedding_handles is not None:
-            if self.multimodal_hashes is not None:
-                # if mm hashes are provided, kvcache reuse can be enabled
-                assert len(self.multimodal_embedding_handles) == len(self.multimodal_hashes), (
-                    "multimodal_embedding_handles and multimodal_hashes must have the same length"
-                )
-                for mm_hash in self.multimodal_hashes:
-                    assert isinstance(mm_hash, list), "mm_hash must be a list"
-                    assert len(mm_hash) == 8, "mm_hash must be a list of 8 integers"
-                    assert all(isinstance(x, int) for x in mm_hash), "mm_hash must contain integers"
-            else:
-                # if user did not provide mm embedding handles, kvcache reuse will be disabled
+            if self.multimodal_hashes is None:
+                # if user did not provide mm hashes, kvcache reuse will be disabled
                 assert len(self.multimodal_embedding_handles) > 0, (
                     "multimodal_embedding_handles must be provided"
                 )
@@ -122,3 +115,31 @@ class DisaggregatedParams:
                     np.iinfo(np.int32).min, np.iinfo(np.int32).max, size=8, dtype=np.int32
                 ).tolist()
                 self.multimodal_hashes = [vals] * len(self.multimodal_embedding_handles)
+            assert len(self.multimodal_embedding_handles) == len(self.multimodal_hashes), (
+                "multimodal_embedding_handles and multimodal_hashes must have the same length"
+            )
+
+        if self.multimodal_hashes is not None:
+            for mm_hash in self.multimodal_hashes:
+                assert isinstance(mm_hash, list), "mm_hash must be a list"
+                assert len(mm_hash) == 8, "mm_hash must be a list of 8 integers"
+                assert all(isinstance(x, int) for x in mm_hash), "mm_hash must contain integers"
+
+        if self.multimodal_hash_positions is not None:
+            assert self.multimodal_hashes is not None, (
+                "multimodal_hash_positions requires multimodal_hashes"
+            )
+            assert len(self.multimodal_hash_positions) == len(self.multimodal_hashes), (
+                "multimodal_hash_positions and multimodal_hashes must have the same length"
+            )
+            for positions in self.multimodal_hash_positions:
+                assert isinstance(positions, list), "multimodal_hash_positions item must be a list"
+                assert all(isinstance(x, int) for x in positions), (
+                    "multimodal_hash_positions must contain integers"
+                )
+                assert all(x >= 0 for x in positions), (
+                    "multimodal_hash_positions must contain non-negative positions"
+                )
+                assert all(positions[i] < positions[i + 1] for i in range(len(positions) - 1)), (
+                    "multimodal_hash_positions must be strictly increasing"
+                )

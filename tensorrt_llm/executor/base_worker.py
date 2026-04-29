@@ -432,7 +432,9 @@ class BaseWorker(GenerationExecutor):
                     multimodal_lengths=request.multimodal_params.
                     multimodal_input.multimodal_lengths,
                     multimodal_uuids=request.multimodal_params.multimodal_input.
-                    multimodal_uuids)
+                    multimodal_uuids,
+                    multimodal_hash_positions=request.multimodal_params.
+                    multimodal_input.multimodal_hash_positions)
             # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
             request.multimodal_params.multimodal_input = None
 

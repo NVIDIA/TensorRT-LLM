@@ -86,6 +86,15 @@ class MultimodalInput:
     returned in KV cache events.
     """
 
+    multimodal_hash_positions: Optional[List[List[int]]] = None
+    """Exact prompt token positions covered by each multimodal item hash.
+
+    When provided, the outer list must match ``multimodal_hashes``. Each inner
+    list contains the prompt positions for that multimodal item's hash token
+    sequence, in order. Legacy callers may leave this unset, in which case
+    consumers fall back to ``multimodal_positions`` plus ``multimodal_lengths``.
+    """
+
     def __post_init__(self):
         """Validate input data structure and consistency."""
         # Validate multimodal_hashes
@@ -131,6 +140,45 @@ class MultimodalInput:
                         f"multimodal_uuids[{i}] must be a string or None, got {type(uuid)}"
                     )
 
+        # Validate multimodal_hash_positions if provided
+        if self.multimodal_hash_positions is not None:
+            if not isinstance(self.multimodal_hash_positions, list):
+                raise TypeError("multimodal_hash_positions must be a list")
+            if len(self.multimodal_hash_positions) != len(
+                    self.multimodal_hashes):
+                raise ValueError(
+                    f"multimodal_hash_positions length ({len(self.multimodal_hash_positions)}) must match "
+                    f"multimodal_hashes length ({len(self.multimodal_hashes)})")
+            for i, (hash_positions, start_position, length) in enumerate(
+                    zip(self.multimodal_hash_positions,
+                        self.multimodal_positions,
+                        self.multimodal_lengths,
+                        strict=True)):
+                if not isinstance(hash_positions, list):
+                    raise TypeError(
+                        f"multimodal_hash_positions[{i}] must be a list")
+                if len(hash_positions) != length:
+                    raise ValueError(
+                        f"multimodal_hash_positions[{i}] length ({len(hash_positions)}) must match "
+                        f"multimodal_lengths[{i}] ({length})")
+                if not all(isinstance(pos, int) for pos in hash_positions):
+                    raise TypeError(
+                        f"multimodal_hash_positions[{i}] must contain only integers"
+                    )
+                if any(pos < 0 for pos in hash_positions):
+                    raise ValueError(
+                        f"multimodal_hash_positions[{i}] must not contain negative positions"
+                    )
+                if any(hash_positions[j] >= hash_positions[j + 1]
+                       for j in range(len(hash_positions) - 1)):
+                    raise ValueError(
+                        f"multimodal_hash_positions[{i}] must be strictly increasing"
+                    )
+                if hash_positions and hash_positions[0] != start_position:
+                    raise ValueError(
+                        f"multimodal_hash_positions[{i}] must start at multimodal_positions[{i}] "
+                        f"({start_position})")
+
     @classmethod
     def from_components(
         cls,
@@ -138,11 +186,13 @@ class MultimodalInput:
         mm_positions: List[int],
         mm_lengths: List[int],
         mm_uuids: Optional[List[Optional[str]]] = None,
+        mm_hash_positions: Optional[List[List[int]]] = None,
     ) -> 'MultimodalInput':
         return cls(multimodal_hashes=mm_hashes,
                    multimodal_positions=mm_positions,
                    multimodal_lengths=mm_lengths,
-                   multimodal_uuids=mm_uuids)
+                   multimodal_uuids=mm_uuids,
+                   multimodal_hash_positions=mm_hash_positions)
 
     def to_tensor(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Convert data to tensors"""
@@ -809,7 +859,6 @@ def find_mm_token_lengths(
 
     return num_mm_tokens  # flatten all mm instances to a single list
 
-
 # Keys in py_multimodal_data that carry metadata (not vision/audio content).
 # If py_multimodal_data has ONLY these keys, the request has no real MM
 # payload (e.g. mrope-only warmup on an mrope-enabled model) and the
@@ -957,6 +1006,36 @@ def _compute_mm_masks(
 
     mm_mask = embed_mask if special_mask is None else embed_mask | special_mask
     return mm_mask, embed_mask, special_mask
+
+
+def find_mm_hash_token_positions(
+        input_ids: Union[torch.Tensor, List[int], np.ndarray],
+        num_mm_tokens: List[int],
+        vocab_size: Optional[int] = None,
+        mm_token_ids: Optional[torch.Tensor] = None,
+        mm_special_token_ids: Optional[torch.Tensor] = None) -> List[List[int]]:
+    """Get exact prompt token positions for each multimodal item's hash tokens."""
+    input_ids_tensor = _as_cpu_tensor(input_ids)
+    mm_mask, _, _ = _compute_mm_masks(input_ids_tensor, vocab_size,
+                                      mm_token_ids, mm_special_token_ids)
+    if not torch.any(mm_mask):
+        return []
+
+    mm_positions = torch.where(mm_mask)[0]
+    lengths_t = torch.tensor(num_mm_tokens)
+    assert mm_positions.numel() == lengths_t.sum().item(), (
+        f"Number of multimodal tokens ({mm_positions.numel()}) does not match "
+        f"sum of per-unit lengths ({lengths_t.sum().item()}): "
+        f"num_mm_tokens={num_mm_tokens}")
+
+    hash_positions = []
+    current_position = 0
+    for length in num_mm_tokens:
+        hash_positions.append(mm_positions[current_position:current_position +
+                                           length].tolist())
+        current_position += length
+
+    return hash_positions
 
 
 def _find_mm_token_start_pos_from_masks(

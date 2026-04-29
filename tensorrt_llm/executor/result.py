@@ -174,6 +174,8 @@ class GenerationResultBase:
         self.postproc_params = postproc_params
         self._error_msg: Optional[str] = None
         self._disaggregated_params = None
+        self._multimodal_hashes = None
+        self._multimodal_hash_positions = None
         self.decoding_iter = 0
         self.cached_tokens = 0
         # Average decoded tokens per runtime iteration; set when the first LLM response arrives.
@@ -528,12 +530,18 @@ class GenerationResultBase:
                 # mm_embedding_handles is a list of handles (one per multimodal item).
                 mm_embedding_handles = response_result.mm_embedding_handles
                 if self._disaggregated_params is not None:
-                    self._disaggregated_params.multimodal_embedding_handles = mm_embedding_handles
-                    self._disaggregated_params.multimodal_hashes = self._multimodal_hashes
+                    self._disaggregated_params = dataclasses.replace(
+                        self._disaggregated_params,
+                        multimodal_embedding_handles=mm_embedding_handles,
+                        multimodal_hashes=self._multimodal_hashes,
+                        multimodal_hash_positions=(
+                            self._multimodal_hash_positions))
                 else:
                     self._disaggregated_params = DisaggregatedParams(
                         multimodal_embedding_handles=mm_embedding_handles,
-                        multimodal_hashes=self._multimodal_hashes)
+                        multimodal_hashes=self._multimodal_hashes,
+                        multimodal_hash_positions=(
+                            self._multimodal_hash_positions))
 
             # Handle mrope handles for both:
             # 1. Regular mm_embedding case (disaggregated_params was just created/updated above)
@@ -815,10 +823,14 @@ class GenerationResult(GenerationResultBase):
             "GenerationExecutor"]] = weakref.ref(executor) if executor else None
 
         # Pipelined multimodal hashes from request to result
-        mm_hashes = getattr(
-            getattr(getattr(generation_request, "multimodal_params", None),
-                    "multimodal_input", None), "multimodal_hashes", None)
-        self._multimodal_hashes = mm_hashes
+        multimodal_input = getattr(
+            getattr(generation_request, "multimodal_params", None),
+            "multimodal_input", None)
+        self._multimodal_hashes = getattr(multimodal_input, "multimodal_hashes",
+                                          None)
+        self._multimodal_hash_positions = getattr(multimodal_input,
+                                                  "multimodal_hash_positions",
+                                                  None)
 
     @property
     def request_id(self) -> int:

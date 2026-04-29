@@ -120,6 +120,7 @@ public:
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalPositions = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalLengths = std::nullopt,
         std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>> multimodalUuids = std::nullopt,
+        std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>> multimodalHashPositions = std::nullopt,
         std::optional<TensorPtr> multimodalEmbedding = std::nullopt,
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
@@ -170,6 +171,7 @@ public:
         , mMultimodalPositions(std::move(multimodalPositions))
         , mMultimodalLengths(std::move(multimodalLengths))
         , mMultimodalUuids(std::move(multimodalUuids))
+        , mMultimodalHashPositions(std::move(multimodalHashPositions))
         , mMultimodalEmbedding(std::move(multimodalEmbedding))
         , mMropeRotaryCosSin(std::move(mropeRotaryCosSin))
         , mMropePositionDeltas(mropePositionDeltas)
@@ -387,6 +389,26 @@ public:
             {
                 mInputTokenExtraIds
                     = std::make_shared<VecTokenExtraIds>(pTuningConfig->getInputTokenExtraIds().value());
+            }
+        }
+        auto multimodalInput = req.getMultimodalInput();
+        if (multimodalInput)
+        {
+            mMultimodalHashes
+                = std::make_shared<std::vector<std::vector<SizeType32>>>(multimodalInput.value().getMultimodalHashes());
+            mMultimodalPositions
+                = std::make_shared<std::vector<SizeType32>>(multimodalInput.value().getMultimodalPositions());
+            mMultimodalLengths
+                = std::make_shared<std::vector<SizeType32>>(multimodalInput.value().getMultimodalLengths());
+            if (multimodalInput.value().getMultimodalUuids())
+            {
+                mMultimodalUuids = std::make_shared<std::vector<std::optional<std::string>>>(
+                    multimodalInput.value().getMultimodalUuids().value());
+            }
+            if (multimodalInput.value().getMultimodalHashPositions())
+            {
+                mMultimodalHashPositions = std::make_shared<std::vector<std::vector<SizeType32>>>(
+                    multimodalInput.value().getMultimodalHashPositions().value());
             }
         }
         auto mRopeConfig = req.getMropeConfig();
@@ -923,6 +945,12 @@ public:
     [[nodiscard]] std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>> getMultimodalUuids() const
     {
         return mMultimodalUuids;
+    }
+
+    [[nodiscard]] std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>>
+    getMultimodalHashPositions() const
+    {
+        return mMultimodalHashPositions;
     }
 
     [[nodiscard]] std::optional<TensorPtr> getMultimodalEmbedding() const
@@ -2020,6 +2048,7 @@ protected:
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalPositions{std::nullopt};
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalLengths{std::nullopt};
     std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>> mMultimodalUuids{std::nullopt};
+    std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>> mMultimodalHashPositions{std::nullopt};
     std::optional<TensorPtr> mMultimodalEmbedding{std::nullopt};
     std::optional<TensorPtr> mMropeRotaryCosSin{std::nullopt};
     std::optional<SizeType32> mMropePositionDeltas{std::nullopt};
@@ -2310,6 +2339,7 @@ public:
         std::optional<std::vector<SizeType32>> multimodalPositions = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalLengths = std::nullopt,
         std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt,
+        std::optional<std::vector<std::vector<SizeType32>>> multimodalHashPositions = std::nullopt,
         std::optional<TensorPtr> multimodalEmbedding = std::nullopt,
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
@@ -2353,6 +2383,9 @@ public:
             multimodalUuids.has_value()
                 ? std::make_shared<std::vector<std::optional<std::string>>>(std::move(multimodalUuids.value()))
                 : std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>>(std::nullopt),
+            multimodalHashPositions.has_value()
+                ? std::make_shared<std::vector<std::vector<SizeType32>>>(std::move(multimodalHashPositions.value()))
+                : std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>>(std::nullopt),
             std::move(multimodalEmbedding), std::move(mropeRotaryCosSin), mropePositionDeltas, loraTaskId,
             std::move(loraWeights), std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig),
             returnLogProbs, returnContextLogits, returnGenerationLogits,

@@ -17,11 +17,30 @@
 
 #include "tensorrt_llm/batch_manager/blockKey.h"
 
+#include <algorithm>
+
 namespace
 {
 inline uint8_t getNthByte(tensorrt_llm::runtime::SizeType32 hashPart, uint8_t byteIdx) noexcept
 {
     return static_cast<uint8_t>((hashPart >> (24 - byteIdx * 8)) & 0xFF);
+}
+
+std::array<uint8_t, 32> makeHashArray(std::vector<tensorrt_llm::runtime::SizeType32> const& mmHashVector)
+{
+    TLLM_CHECK_WITH_INFO(
+        mmHashVector.size() == 8, "Multimodal hash vector has unexpected size: %zu (expected 8)", mmHashVector.size());
+
+    std::array<uint8_t, 32> mmHashArray;
+    for (size_t j = 0; j < 8; ++j)
+    {
+        auto const& hashPart = mmHashVector[j];
+        for (uint8_t byteIdx = 0; byteIdx < 4; ++byteIdx)
+        {
+            mmHashArray[j * 4 + byteIdx] = getNthByte(hashPart, byteIdx);
+        }
+    }
+    return mmHashArray;
 }
 } // namespace
 
@@ -34,9 +53,91 @@ std::vector<MmKey> generateBlockHashExtraKeys(
     auto const multimodalPositions = llmRequest.getMultimodalPositions();
     auto const multimodalLengths = llmRequest.getMultimodalLengths();
     auto const multimodalUuids = llmRequest.getMultimodalUuids();
+    auto const multimodalHashPositions = llmRequest.getMultimodalHashPositions();
 
-    if (!multimodalHashes || !multimodalPositions || !multimodalLengths || !(*multimodalHashes)
-        || (*multimodalHashes)->empty() || !(*multimodalPositions) || (*multimodalPositions)->empty()
+    if (!multimodalHashes || !(*multimodalHashes) || (*multimodalHashes)->empty())
+    {
+        return {};
+    }
+
+    auto const hasExactHashPositions = multimodalHashPositions && *multimodalHashPositions;
+    if (hasExactHashPositions)
+    {
+        TLLM_CHECK_WITH_INFO((*multimodalHashes)->size() == (*multimodalHashPositions)->size(),
+            "Multimodal hash arrays and hash-position arrays have mismatched sizes");
+        TLLM_CHECK_WITH_INFO(multimodalLengths && *multimodalLengths,
+            "Multimodal hash positions require multimodal lengths for validation");
+        TLLM_CHECK_WITH_INFO((*multimodalHashes)->size() == (*multimodalLengths)->size(),
+            "Multimodal hash arrays and length arrays have mismatched sizes");
+
+        std::vector<MmKey> extraKeys;
+        extraKeys.reserve((*multimodalHashes)->size());
+
+        for (size_t i = 0; i < (*multimodalHashes)->size(); ++i)
+        {
+            auto const mmHashArray = makeHashArray((*(*multimodalHashes))[i]);
+            auto const& promptPositions = (*(*multimodalHashPositions))[i];
+            auto const expectedLength = (*(*multimodalLengths))[i];
+            TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(promptPositions.size()) == expectedLength,
+                "Multimodal hash positions and lengths have mismatched sizes");
+
+            std::optional<std::string> uuid = std::nullopt;
+            if (multimodalUuids && *multimodalUuids && i < (*multimodalUuids)->size())
+            {
+                uuid = (*(*multimodalUuids))[i];
+            }
+
+            auto emitRegion = [&](SizeType32 regionStart, SizeType32 regionLength, SizeType32 hashStartOffset)
+            {
+                auto const regionEnd = regionStart + regionLength;
+                if (endTokenIdx > regionStart && startTokenIdx < regionEnd)
+                {
+                    auto const overlapStart = std::max(startTokenIdx, regionStart);
+                    auto const startOffset = hashStartOffset + overlapStart - regionStart;
+                    extraKeys.emplace_back(mmHashArray, startOffset, uuid);
+                }
+            };
+
+            bool hasRegion = false;
+            SizeType32 regionStart = 0;
+            SizeType32 regionEnd = 0;
+            SizeType32 regionHashStartOffset = 0;
+            for (SizeType32 hashOffset = 0; hashOffset < static_cast<SizeType32>(promptPositions.size()); ++hashOffset)
+            {
+                auto const position = promptPositions[hashOffset];
+                if (!hasRegion)
+                {
+                    regionStart = position;
+                    regionEnd = position + 1;
+                    regionHashStartOffset = hashOffset;
+                    hasRegion = true;
+                    continue;
+                }
+                if (position < regionEnd)
+                {
+                    TLLM_CHECK_WITH_INFO(false, "Multimodal hash positions must be strictly increasing");
+                }
+                if (position == regionEnd)
+                {
+                    ++regionEnd;
+                    continue;
+                }
+
+                emitRegion(regionStart, regionEnd - regionStart, regionHashStartOffset);
+                regionStart = position;
+                regionEnd = position + 1;
+                regionHashStartOffset = hashOffset;
+            }
+            if (hasRegion)
+            {
+                emitRegion(regionStart, regionEnd - regionStart, regionHashStartOffset);
+            }
+        }
+
+        return extraKeys;
+    }
+
+    if (!multimodalPositions || !multimodalLengths || !(*multimodalPositions) || (*multimodalPositions)->empty()
         || !(*multimodalLengths) || (*multimodalLengths)->empty())
     {
         return {};
@@ -51,29 +152,13 @@ std::vector<MmKey> generateBlockHashExtraKeys(
 
     std::vector<MmKey> extraKeys;
     extraKeys.reserve((*multimodalPositions)->size());
-    std::array<uint8_t, 32> mmHashArray;
 
     for (size_t i = 0; i < (*multimodalPositions)->size(); ++i)
     {
         auto const& startPos = (*(*multimodalPositions))[i];
         auto const& length = (*(*multimodalLengths))[i];
         auto const& mmHashVector = (*(*multimodalHashes))[i];
-
-        TLLM_CHECK_WITH_INFO(mmHashVector.size() == 8, "Multimodal hash vector has unexpected size: %zu (expected 8)",
-            mmHashVector.size());
-
-        // mmHashVector[j] comes from Python's int(hex_chunk, 16)
-        // where hex_chunk like "00010203" means 0x00 is MSB and 0x03 is LSB (big endian)
-        // Convert 8x 32-bit integers into a 32-byte array preserving Blake3 hash byte order
-        // Example: hashPart = 0x00010203 → mmHashArray[0:3] = [0x00, 0x01, 0x02, 0x03]
-        for (size_t j = 0; j < 8; ++j)
-        {
-            auto const& hashPart = mmHashVector[j];
-            for (uint8_t byteIdx = 0; byteIdx < 4; ++byteIdx)
-            {
-                mmHashArray[j * 4 + byteIdx] = getNthByte(hashPart, byteIdx);
-            }
-        }
+        auto const mmHashArray = makeHashArray(mmHashVector);
 
         // Check if this multimodal content overlaps with the current block
         if (endTokenIdx > startPos && startTokenIdx < startPos + length)

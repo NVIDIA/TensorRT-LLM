@@ -72,7 +72,7 @@ using PriorityType = float;
 using BufferView = std::basic_string_view<uint8_t>;
 
 //! MmKey is used in KVCacheBlock when multimodal data presents in a block.
-//! Hash is a 32-byte array; startOffset is the per-block token offset; uuid is optional.
+//! Hash is a 32-byte array; startOffset is the token offset within that multimodal item; uuid is optional.
 struct MmKey
 {
     std::array<uint8_t, 32> hash;

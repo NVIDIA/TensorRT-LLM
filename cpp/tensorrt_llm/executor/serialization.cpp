@@ -340,8 +340,9 @@ MultimodalInput Serialization::deserializeMultimodalInput(std::istream& is)
     auto multimodalPositions = su::deserialize<std::vector<SizeType32>>(is);
     auto multimodalLengths = su::deserialize<std::vector<SizeType32>>(is);
     auto multimodalUuids = su::deserialize<std::optional<std::vector<std::optional<std::string>>>>(is);
+    auto multimodalHashPositions = su::deserialize<std::optional<std::vector<std::vector<SizeType32>>>>(is);
     return MultimodalInput{std::move(multimodalHashes), std::move(multimodalPositions), std::move(multimodalLengths),
-        std::move(multimodalUuids)};
+        std::move(multimodalUuids), std::move(multimodalHashPositions)};
 }
 
 void Serialization::serialize(MultimodalInput const& multimodalInput, std::ostream& os)
@@ -350,6 +351,7 @@ void Serialization::serialize(MultimodalInput const& multimodalInput, std::ostre
     su::serialize(multimodalInput.mMultimodalPositions, os);
     su::serialize(multimodalInput.mMultimodalLengths, os);
     su::serialize(multimodalInput.mMultimodalUuids, os);
+    su::serialize(multimodalInput.mMultimodalHashPositions, os);
 }
 
 size_t Serialization::serializedSize(MultimodalInput const& multimodalInput)
@@ -359,6 +361,7 @@ size_t Serialization::serializedSize(MultimodalInput const& multimodalInput)
     totalSize += su::serializedSize(multimodalInput.mMultimodalPositions);
     totalSize += su::serializedSize(multimodalInput.mMultimodalLengths);
     totalSize += su::serializedSize(multimodalInput.mMultimodalUuids);
+    totalSize += su::serializedSize(multimodalInput.mMultimodalHashPositions);
     return totalSize;
 }
 

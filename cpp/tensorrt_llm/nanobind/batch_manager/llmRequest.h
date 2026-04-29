@@ -62,6 +62,7 @@ public:
         std::optional<std::vector<SizeType32>> multimodalPositions = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalLengths = std::nullopt,
         std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt,
+        std::optional<std::vector<std::vector<SizeType32>>> multimodalHashPositions = std::nullopt,
         std::optional<TensorPtr> multimodalEmbedding = std::nullopt,
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
@@ -115,6 +116,9 @@ public:
             multimodalUuids.has_value()
                 ? std::make_shared<std::vector<std::optional<std::string>>>(std::move(multimodalUuids.value()))  //
                 : std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>>(std::nullopt),         //
+            multimodalHashPositions.has_value()
+                ? std::make_shared<std::vector<std::vector<SizeType32>>>(std::move(multimodalHashPositions.value()))
+                : std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>>(std::nullopt),            //
             multimodalEmbedding,                                                                                 //
             mropeRotaryCosSin,                                                                                   //
             mropePositionDeltas,                                                                                 //

@@ -298,12 +298,14 @@ class MultimodalInput
 public:
     explicit MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
         std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths,
-        std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt);
+        std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt,
+        std::optional<std::vector<std::vector<SizeType32>>> multimodalHashPositions = std::nullopt);
 
     [[nodiscard]] std::vector<std::vector<SizeType32>> getMultimodalHashes() const;
     [[nodiscard]] std::vector<SizeType32> getMultimodalPositions() const;
     [[nodiscard]] std::vector<SizeType32> getMultimodalLengths() const;
     [[nodiscard]] std::optional<std::vector<std::optional<std::string>>> const& getMultimodalUuids() const;
+    [[nodiscard]] std::optional<std::vector<std::vector<SizeType32>>> const& getMultimodalHashPositions() const;
 
 private:
     friend class Serialization;
@@ -316,6 +318,8 @@ private:
     /// @brief Optional user-provided UUIDs for multimodal items.
     /// When provided, these are returned in KV cache events instead of content hashes.
     std::optional<std::vector<std::optional<std::string>>> mMultimodalUuids;
+    /// @brief Optional exact prompt token positions for each multimodal hash.
+    std::optional<std::vector<std::vector<SizeType32>>> mMultimodalHashPositions;
 };
 
 /// @brief Configuration for mrope
