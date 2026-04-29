@@ -14,6 +14,7 @@ from utils.cpp_paths import llm_root  # noqa: F401
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
+    AllGatherStrategy,
     ShardingTransformConfig,
     ShardingTransformContainer,
     SplitDimension,
@@ -402,3 +403,108 @@ def test_allreduce_strategy_propagation(strategy):
     )
 
     print(f"✓ Test passed: allreduce_strategy '{strategy}' correctly propagated to graph node")
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        "AUTO",
+        "SYMM_MEM",
+    ],
+)
+def test_allgather_strategy_propagation(strategy):
+    """Test that allgather_strategy is correctly propagated to graph nodes.
+
+    Mirrors test_allreduce_strategy_propagation: when we set an
+    allgather_strategy on the ShardingConfig, it must reach the
+    torch_dist_all_gather (or trtllm_dist_all_gather) node's args at
+    the position the dist op expects (4th positional, just before the
+    default workspace_id).
+    """
+
+    # Same SimpleMLP as the allreduce variant — keeps the two tests symmetric.
+    class SimpleMLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear1 = nn.Linear(128, 256, bias=False)
+            self.linear2 = nn.Linear(256, 128, bias=False)
+
+        def forward(self, x):
+            return self.linear2(torch.relu(self.linear1(x)))
+
+    model = SimpleMLP()
+    dummy_input = torch.randn(2, 128)
+
+    gm = torch_export_to_gm(model, (dummy_input,))
+
+    from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op
+
+    linear_nodes = [node for node in gm.graph.nodes if is_linear_op(node)]
+    assert len(linear_nodes) == 2, f"Expected 2 linear nodes, found {len(linear_nodes)}"
+    linear1_node, _ = linear_nodes[0], linear_nodes[1]
+
+    rank, world_size = 0, 4
+    config = ShardingTransformConfig(
+        rank=rank,
+        world_size=world_size,
+        stage="sharding",
+        allgather_strategy=AllGatherStrategy[strategy],
+    )
+    sharding_container = ShardingTransformContainer(config=config)
+
+    # Column shard with all_gather is the only valid emission path for
+    # an allgather node (validate() rejects column+all_reduce and
+    # row+all_gather).
+    sharding_container.add(
+        WeightShardingInfo(
+            target_node=linear1_node.name,
+            config=config,
+            split_dim=SplitDimension.COLUMN,
+            dist_op="all_gather",
+        )
+    )
+
+    # Strategy must be visible on the transform itself before it lands in
+    # the graph, otherwise propagation can't possibly work below.
+    assert len(sharding_container.weight_sharding_transforms) == 1
+    for transform in sharding_container.weight_sharding_transforms:
+        assert transform.config.allgather_strategy == AllGatherStrategy[strategy], (
+            f"Transform {transform.target_node} should have strategy {strategy}, "
+            f"got {transform.config.allgather_strategy}"
+        )
+
+    for transform in sharding_container.weight_sharding_transforms:
+        node = next((n for n in gm.graph.nodes if n.name == transform.target_node), None)
+        if node:
+            transform.check_and_apply(gm, node)
+
+    recompile(gm)
+
+    # _get_dist_ops uses TRT-LLM ops only when running under MPI
+    # (is_ompi()); single-process pytest falls back to torch_dist_*.
+    # Accept either op so the test stays correct in both runners.
+    allgather_nodes = [
+        node
+        for node in gm.graph.nodes
+        if is_op(node, torch.ops.auto_deploy.torch_dist_all_gather)
+        or is_op(node, torch.ops.auto_deploy.trtllm_dist_all_gather)
+    ]
+    assert len(allgather_nodes) == 1, f"Expected 1 allgather node, found {len(allgather_nodes)}"
+    allgather_node = allgather_nodes[0]
+
+    # Op signature: (tensor, dim, sizes, strategy, workspace_id=0).
+    # The column+all_gather emit path passes (input, -1, None,
+    # strategy_name); workspace_id may or may not be explicit, so accept
+    # either 4 or 5 positional args.
+    assert 4 <= len(allgather_node.args) <= 5, (
+        f"Expected 4 or 5 args for allgather node, got {len(allgather_node.args)}"
+    )
+    assert allgather_node.args[1] == -1, f"Expected gather dim=-1, got {allgather_node.args[1]}"
+    assert allgather_node.args[2] is None, f"Expected sizes=None, got {allgather_node.args[2]}"
+
+    strategy_arg = allgather_node.args[3]
+    assert strategy_arg == strategy, (
+        f"Expected allgather strategy '{strategy}', got '{strategy_arg}'"
+    )
+
+    print(f"✓ Test passed: allgather_strategy '{strategy}' correctly propagated to graph node")
