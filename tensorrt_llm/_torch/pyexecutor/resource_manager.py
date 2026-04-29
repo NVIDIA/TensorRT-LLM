@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import copy
 import enum
 import math
@@ -39,6 +53,9 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, TokenIdExt,
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import (BAD_PAGE_INDEX,
                                                               GPU_LEVEL)
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
+from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import CuError
+from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import \
+    OutOfMemoryError as KVCacheOutOfMemoryError
 from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (exact_div,
                                                              typed_range)
 from tensorrt_llm.sampling_params import SamplingParams
@@ -1747,11 +1764,42 @@ class KVCacheManagerV2(BaseResourceManager):
             f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
         cache_tiers: List[CacheTierConfig] = [GpuCacheTierConfig(quota=quota)]
-        if kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size > 0:
-            cache_tiers.append(
-                HostCacheTierConfig(quota=kv_cache_config.host_cache_size))
+        if kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size >= 0:
+            host_quota = kv_cache_config.host_cache_size
+        else:
+            # The V2 MAX_UTILIZATION scheduler relies on suspend/resume to
+            # evict and later restore KV cache pages.  Without a host tier,
+            # suspended pages have nowhere to be offloaded and resume()
+            # always fails, causing a scheduling deadlock where no
+            # generation request can ever make progress.
+            #
+            # Automatically provision a host tier matching the GPU quota so
+            # suspend/resume works out of the box.  Cap at available host
+            # memory and pinnable memory limit to avoid allocation failures.
+            import resource
+            try:
+                mem_available = os.sysconf('SC_PAGE_SIZE') * os.sysconf(
+                    'SC_AVPHYS_PAGES')
+            except (ValueError, OSError):
+                mem_available = float('inf')
+            try:
+                _soft, _hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+                memlock_limit = _soft if _soft != resource.RLIM_INFINITY else float(
+                    'inf')
+            except (ValueError, OSError):
+                memlock_limit = float('inf')
+            candidates = [quota]
+            if mem_available != float('inf'):
+                candidates.append(int(mem_available * 0.5))
+            if memlock_limit != float('inf'):
+                candidates.append(int(memlock_limit * 0.8))
+            host_quota = min(candidates)
+            if host_quota <= 0:
+                host_quota = quota
+        if host_quota > 0:
+            cache_tiers.append(HostCacheTierConfig(quota=host_quota))
             logger.info(
-                f"KV cache manager v2 host cache quota set to {kv_cache_config.host_cache_size / (1 << 30)}GiB"
+                f"KV cache manager v2 host cache quota set to {host_quota / (1 << 30):.2f}GiB"
             )
 
         config = self._build_cache_config(
@@ -1763,8 +1811,27 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_manager_py_config = config
 
-        self.impl = KVCacheManagerPy(config)
-
+        try:
+            self.impl = KVCacheManagerPy(config)
+        except (CuError, KVCacheOutOfMemoryError):
+            if len(cache_tiers) > 1:
+                logger.warning(
+                    "Failed to initialize KV cache manager with host cache "
+                    "tier (cuMemHostRegister may have failed). "
+                    "Retrying without host cache tier.")
+                cache_tiers_gpu_only = [
+                    t for t in cache_tiers if isinstance(t, GpuCacheTierConfig)
+                ]
+                config = self._build_cache_config(
+                    kv_cache_config,
+                    tokens_per_block=tokens_per_block,
+                    vocab_size=vocab_size,
+                    cache_tiers=cache_tiers_gpu_only,
+                )
+                self.kv_cache_manager_py_config = config
+                self.impl = KVCacheManagerPy(config)
+            else:
+                raise
         self.num_pools = len(self.impl.layer_grouping)
 
         num_layers = len(config.layers)
