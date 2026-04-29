@@ -61,7 +61,7 @@ from .hang_detector import HangDetector
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, get_draft_token_length)
-from .mamba_cache_manager import MambaHybridCacheManager
+from .mamba_cache_manager import BaseMambaCacheManager, MambaHybridCacheManager
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
@@ -642,10 +642,27 @@ class PyExecutor:
                     "Both KV Cache Connector and KV Cache Transceiver are enabled. Are you sure you want to do this?"
                 )
 
-            if self.dist.pp_size > 1:
+            if self.dist.pp_size > 1 or self.dist.cp_size > 1:
                 raise NotImplementedError(
-                    "KV Cache Connector is not supported with pipeline parallelism."
-                )
+                    "KV Cache Connector is not supported with pipeline or "
+                    "context parallelism: the connector worker is registered "
+                    "with the local rank's primary pool only, with no "
+                    "coordination across ranks.")
+
+            if self.max_beam_width > 1:
+                raise NotImplementedError(
+                    "KV Cache Connector is not supported with beam search "
+                    "(max_beam_width > 1). The connector's per-request block "
+                    "list has no notion of beams, so non-leading beams would "
+                    "save and restore the wrong KV state.")
+
+            if self.enable_attention_dp:
+                raise NotImplementedError(
+                    "KV Cache Connector is not supported with attention data "
+                    "parallelism (enable_attention_dp). Dummy requests "
+                    "inserted for cross-DP balancing flow through the "
+                    "connector scheduler / worker hooks and are not "
+                    "distinguished from real requests.")
 
             kv_cache_config = getattr(self.llm_args, 'kv_cache_config', None)
             if kv_cache_config is not None and kv_cache_config.host_cache_size:
@@ -661,6 +678,22 @@ class PyExecutor:
             if self.kv_cache_manager is None:
                 raise ValueError(
                     "KV Cache Connector requires a KV Cache Manager.")
+
+            if getattr(self.kv_cache_manager, 'is_vswa', False):
+                raise NotImplementedError(
+                    "KV Cache Connector is not supported with variable "
+                    "sliding-window attention (per-layer max_attention_window "
+                    "with more than one distinct window size). The connector "
+                    "is registered with a single primary pool, but VSWA "
+                    "models allocate one pool per window size.")
+
+            if isinstance(self.kv_cache_manager, BaseMambaCacheManager):
+                raise NotImplementedError(
+                    "KV Cache Connector is not supported with Mamba / hybrid "
+                    "linear-attention models. Mamba layers carry SSM state "
+                    "rather than per-token KV blocks, so the connector's "
+                    "per-layer load/save hooks have nothing meaningful to "
+                    "transfer for those layers.")
 
             kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
             self.kv_connector_manager.worker.register_kv_caches(kv_tensor)

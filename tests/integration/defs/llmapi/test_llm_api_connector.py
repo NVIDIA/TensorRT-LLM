@@ -543,17 +543,37 @@ def test_connector_priorities_default(enforce_single_worker,
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_connector_rejects_host_offloading(enforce_single_worker,
-                                           model_with_connector):
-    # The connector worker is only registered with the primary (GPU) pool, so
-    # combining it with host offloading would silently mishandle blocks that
-    # have been evicted to the secondary pool. Until that's wired up, the
-    # combination must fail loudly at construction time.
+@pytest.mark.parametrize(
+    "llm_kwargs,match",
+    [
+        pytest.param(
+            dict(kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1,
+                                               host_cache_size=1024**3)),
+            "host",
+            id="host_offloading",
+        ),
+        pytest.param(
+            dict(max_beam_width=2),
+            "beam",
+            id="beam_search",
+        ),
+        pytest.param(
+            dict(enable_attention_dp=True),
+            "attention data parallelism",
+            id="attention_dp",
+        ),
+    ],
+)
+def test_connector_rejects_unsupported_config(enforce_single_worker,
+                                              model_with_connector, llm_kwargs,
+                                              match):
+    # Configurations the connector cannot handle today must fail loudly at
+    # construction time rather than silently miscompute. This pins the set of
+    # constructor-time exclusions in `_maybe_init_kv_connector_manager`.
     model_fn, _, _ = model_with_connector
 
-    with pytest.raises(NotImplementedError, match="host"):
-        model_fn(kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1,
-                                               host_cache_size=1024**3))
+    with pytest.raises(NotImplementedError, match=match):
+        model_fn(**llm_kwargs)
 
 
 @pytest.mark.threadleak(enabled=False)
