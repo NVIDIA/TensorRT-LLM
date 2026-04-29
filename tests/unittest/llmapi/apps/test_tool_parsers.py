@@ -24,9 +24,9 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionToolsParam,
 from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
 from tensorrt_llm.serve.tool_parser.core_types import StructureInfo
 from tensorrt_llm.serve.tool_parser.deepseekv3_parser import DeepSeekV3Parser
+from tensorrt_llm.serve.tool_parser.deepseekv4_parser import DeepSeekV4Parser
 from tensorrt_llm.serve.tool_parser.deepseekv31_parser import DeepSeekV31Parser
 from tensorrt_llm.serve.tool_parser.deepseekv32_parser import DeepSeekV32Parser
-from tensorrt_llm.serve.tool_parser.deepseekv4_parser import DeepSeekV4Parser
 from tensorrt_llm.serve.tool_parser.glm4_parser import Glm4ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
 from tensorrt_llm.serve.tool_parser.minimax_m2_parser import MiniMaxM2ToolParser
@@ -1507,17 +1507,14 @@ class TestDeepSeekV4Parser(BaseToolParserTestClass):
 
     def make_tool_parser_test_cases(self):
         return ToolParserTestCases(
-            has_tool_call_true=(
-                'Some text <｜DSML｜tool_calls> <｜DSML｜invoke name="get_weather"> '
-                '<｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> '
-                "</｜DSML｜invoke> </｜DSML｜tool_calls>"
-            ),
+            has_tool_call_true=
+            ('Some text <｜DSML｜tool_calls> <｜DSML｜invoke name="get_weather"> '
+             '<｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> '
+             "</｜DSML｜invoke> </｜DSML｜tool_calls>"),
             detect_and_parse_single_tool=(
-                (
-                    'Normal text<｜DSML｜tool_calls> <｜DSML｜invoke name="get_weather"> '
-                    '<｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> '
-                    "</｜DSML｜invoke> </｜DSML｜tool_calls>"
-                ),
+                ('Normal text<｜DSML｜tool_calls> <｜DSML｜invoke name="get_weather"> '
+                 '<｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> '
+                 "</｜DSML｜invoke> </｜DSML｜tool_calls>"),
                 "Normal text",
                 "get_weather",
                 {
@@ -1525,36 +1522,31 @@ class TestDeepSeekV4Parser(BaseToolParserTestClass):
                 },
             ),
             detect_and_parse_multiple_tools=(
-                (
-                    '<｜DSML｜tool_calls> <｜DSML｜invoke name="get_weather"> '
-                    '<｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> '
-                    '</｜DSML｜invoke> <｜DSML｜invoke name="search_web"> '
-                    '{ "query": "AI" } </｜DSML｜invoke> </｜DSML｜tool_calls>'
-                ),
+                ('<｜DSML｜tool_calls> <｜DSML｜invoke name="get_weather"> '
+                 '<｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> '
+                 '</｜DSML｜invoke> <｜DSML｜invoke name="search_web"> '
+                 '{ "query": "AI" } </｜DSML｜invoke> </｜DSML｜tool_calls>'),
                 ("get_weather", "search_web"),
             ),
-            detect_and_parse_malformed_tool=(
-                '<|DSML|tool_calls> <|DSML|invoke name="get_weather"> '
-                '<|DSML|parameter name="location" string="true">NYC</|DSML|parameter> '
-                "</|DSML|invoke> </|DSML|tool_calls>"
-            ),
+            detect_and_parse_malformed_tool=
+            ('<|DSML|tool_calls> <|DSML|invoke name="get_weather"> '
+             '<|DSML|parameter name="location" string="true">NYC</|DSML|parameter> '
+             "</|DSML|invoke> </|DSML|tool_calls>"),
             detect_and_parse_with_parameters_key=(
-                (
-                    '<｜DSML｜tool_calls> <｜DSML｜invoke name="search_web"> '
-                    '{ "query": "test" } </｜DSML｜invoke> </｜DSML｜tool_calls>'
-                ),
+                ('<｜DSML｜tool_calls> <｜DSML｜invoke name="search_web"> '
+                 '{ "query": "test" } </｜DSML｜invoke> </｜DSML｜tool_calls>'),
                 "search_web",
                 {
                     "query": "test"
                 },
             ),
             parse_streaming_increment_partial_bot_token="<｜DSML｜tool",
-            undefined_tool=(
-                '<｜DSML｜tool_calls> <｜DSML｜invoke name="undefined_func"> '
-                '<｜DSML｜parameter name="arg" string="true">value</｜DSML｜parameter> '
-                "</｜DSML｜invoke> </｜DSML｜tool_calls>"
-            ),
+            undefined_tool=
+            ('<｜DSML｜tool_calls> <｜DSML｜invoke name="undefined_func"> '
+             '<｜DSML｜parameter name="arg" string="true">value</｜DSML｜parameter> '
+             "</｜DSML｜invoke> </｜DSML｜tool_calls>"),
         )
+
 
 # ============================================================================
 # Glm4ToolParser Tests
@@ -2161,6 +2153,7 @@ class TestToolParserFactory:
             ToolParserFactory
         parser = ToolParserFactory.create_tool_parser("minimax_m2")
         assert isinstance(parser, MiniMaxM2ToolParser)
+
 
 # ============================================================================
 # FunctionDefinition strict field and ChatCompletionRequest store field Tests

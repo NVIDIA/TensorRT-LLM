@@ -62,17 +62,14 @@ def test_deepseek_v4_reasoning_parser_extracts_when_thinking(
 
 def test_deepseek_v4_reasoning_parser_streams_when_thinking():
     reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
-        "deepseek_v4", {
-            "enable_thinking": True
-        })
+        "deepseek_v4", {"enable_thinking": True})
 
     deltas = ["hid", f"den{R1_END}visible", " tail"]
     results = [reasoning_parser.parse_delta(delta) for delta in deltas]
 
     assert [result.content for result in results] == ["", "visible", " tail"]
-    assert [result.reasoning_content for result in results] == [
-        "hid", "den", ""
-    ]
+    assert [result.reasoning_content
+            for result in results] == ["hid", "den", ""]
 
 
 TOOL_START = "<|tool_calls_section_begin|>"

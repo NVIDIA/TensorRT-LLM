@@ -202,8 +202,7 @@ class DeepSeekV4ReasoningParser(BaseReasoningParser):
         chat_template_kwargs = chat_template_kwargs or {}
         thinking = bool(
             chat_template_kwargs.get("thinking", False)
-            or chat_template_kwargs.get("enable_thinking", False)
-        )
+            or chat_template_kwargs.get("enable_thinking", False))
         if thinking:
             self._parser = DeepSeekR1Parser(
                 reasoning_at_start=True,
