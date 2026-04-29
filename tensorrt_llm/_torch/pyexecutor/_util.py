@@ -109,8 +109,6 @@ class KvCacheCreator:
         self._max_beam_width = max_beam_width
         self._kv_connector_manager = kv_connector_manager
         self._llm_args = llm_args
-        # For V2 fallback use only, will be removed after V2 is stable
-        self._cache_transceiver_config = llm_args.cache_transceiver_config
         self._speculative_config = speculative_config
         self._sparse_attention_config = sparse_attention_config
         self._tokens_per_block = tokens_per_block
@@ -129,18 +127,18 @@ class KvCacheCreator:
     def _get_model_kv_cache_manager_cls(self, model_engine: PyTorchModelEngine):
         cls = get_kv_cache_manager_cls(model_engine.model.model_config,
                                        self._kv_cache_config)
-        if cls == KVCacheManagerV2:
+        self._warn_if_unsupported_kv_cache_manager_v2(cls)
+        return cls
+
+    def _warn_if_unsupported_kv_cache_manager_v2(self,
+                                                kv_cache_manager_cls):
+        if kv_cache_manager_cls == KVCacheManagerV2:
             if self._kv_connector_manager is not None or (
                     self._max_beam_width is not None and self._max_beam_width
-                    > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
-                        self._cache_transceiver_config is not None
-                        and self._cache_transceiver_config.backend is not None):
+                    > 1) or self._kv_cache_config.event_buffer_max_size > 0:
                 logger.warning(
                     "KVCacheManagerV2 is not supported with kv_connector_manager, beam width > 1, "
-                    "event buffer max size > 0, or cache transceiver. Falling back to KVCacheManager."
-                )
-                cls = KVCacheManager
-        return cls
+                    "or event buffer max size > 0.")
 
     def _get_kv_size_per_token(self):
         model_config = self._model_engine.model.model_config
@@ -684,18 +682,8 @@ class KvCacheCreator:
         # Get the appropriate KV cache manager class for the draft model
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
             effective_draft_config, self._kv_cache_config)
-
-        # Use V2 if enabled and the base class is KVCacheManager
-        if draft_kv_cache_manager_cls == KVCacheManagerV2:
-            if self._kv_connector_manager is not None or (
-                    self._max_beam_width is not None and self._max_beam_width
-                    > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
-                        self._cache_transceiver_config is not None
-                        and self._cache_transceiver_config.backend is not None):
-                logger.warning(
-                    "KVCacheManagerV2 is not supported with disaggregated serving or beam width > 1 or event buffer max size > 0 or disagg config. "
-                    "Falling back to KVCacheManager for draft model.")
-                draft_kv_cache_manager_cls = KVCacheManager
+        self._warn_if_unsupported_kv_cache_manager_v2(
+            draft_kv_cache_manager_cls)
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         # For MTP with models using sparse attention (e.g., DeepSeek V3 with DSA),
