@@ -2567,7 +2567,15 @@ def renderTestDB(testContext, llmSrc, stageName, preDefinedMakoOpts=null) {
     }
 
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
+    // CBTS Layer 3: when CBTS provided a tmp test-db dir (each affected
+    // block's tests narrowed to entries in the per-block filter prefix
+    // subtree), point trt-test-db at it. Otherwise use the source test-db.
+    def cbts = testFilter[(CBTS_RESULT)]
     def testDBPath = "${llmSrc}/tests/integration/test_lists/test-db"
+    if (cbts != null && cbts.test_db_dir_override) {
+        testDBPath = "${llmSrc}/${cbts.test_db_dir_override}"
+        echo "CBTS [${cbts.scope}]: rendering test list from filtered test-db at ${testDBPath}"
+    }
     def testList = "${llmSrc}/${testContext}.txt"
     def testDBQueryCmd = [
         "trt-test-db",

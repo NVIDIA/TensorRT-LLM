@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from blocks import Stage, YAMLIndex, block_matches_stage, normalize_test_id
+from blocks import Block, Stage, YAMLIndex, block_matches_stage, normalize_test_id
 
 from .base import PRInputs, Rule, RuleResult
 
@@ -88,14 +88,38 @@ class WaivesRule(Rule):
                 reason="waives.txt: no actionable test ids in diff",
             )
 
+        # For each waive, walk the parent chain looking for the first level
+        # where a YAML entry actually applies (-k keyword check included).
+        # Any unmatchable waive triggers full fallback — better safe than to
+        # silently drop CI for a typo'd or out-of-tree waive id.
+        block_filters: dict[tuple[str, int], set[str]] = {}
+        affected_blocks: list[Block] = []
         seen_block_keys: set[tuple[str, int]] = set()
-        affected_blocks = []
+        misses: list[str] = []
+
         for tid in changed_test_ids:
-            for block in self.yaml_index.blocks_containing_test(tid):
+            match = self.yaml_index.find_match_for_waive(tid)
+            if match is None:
+                misses.append(tid)
+                continue
+            level, blocks = match
+            for block in blocks:
                 key = (block.yaml_stem, block.block_index)
+                block_filters.setdefault(key, set()).add(level)
                 if key not in seen_block_keys:
                     seen_block_keys.add(key)
                     affected_blocks.append(block)
+
+        if misses:
+            preview = ", ".join(sorted(misses)[:3])
+            more = f" (+{len(misses) - 3} more)" if len(misses) > 3 else ""
+            return RuleResult(
+                handled_files={WAIVES_FILE},
+                tests=changed_test_ids,
+                affected_stages=set(),
+                scope=None,  # Selector treats this as "no decision" → fallback
+                reason=f"waives.txt: {len(misses)} unmatchable waive(s): {preview}{more}",
+            )
 
         affected_stage_names: set[str] = set()
         for block in affected_blocks:
@@ -108,6 +132,7 @@ class WaivesRule(Rule):
             tests=changed_test_ids,
             affected_stages=affected_stage_names,
             scope="waiveonly",
+            block_filters=block_filters,
             reason=(
                 f"waives.txt: +{len(added)} / -{len(removed)} → "
                 f"{len(affected_blocks)} blocks, {len(affected_stage_names)} stages"

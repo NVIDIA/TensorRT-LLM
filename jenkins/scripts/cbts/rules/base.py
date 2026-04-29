@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -30,13 +30,22 @@ class PRInputs:
 
 @dataclass
 class RuleResult:
-    """What a single rule contributes when it applies to a PR."""
+    """What a single rule contributes when it applies to a PR.
+
+    `block_filters` (CBTS Layer 3): per-block set of filter prefixes. Each
+    affected block (keyed by `(yaml_stem, block_index)`) maps to the filter
+    levels at which its waive(s) hit. The Selector aggregates this across
+    rules and uses it to write a tmp test-db with each affected block's
+    `tests:` array narrowed to entries in any filter prefix's subtree.
+    Empty when the rule doesn't produce Layer 3 narrowing.
+    """
 
     handled_files: set[str]
     tests: set[str]
     affected_stages: set[str]
-    scope: str
+    scope: Optional[str]
     reason: str
+    block_filters: dict[tuple[str, int], set[str]] = field(default_factory=dict)
 
 
 class Rule(ABC):

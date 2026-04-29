@@ -99,8 +99,8 @@ def _iter_parent_ids(test_id: str):
         `dir/x.py`                    (strip `::TestC`)
         `dir`                         (strip `/x.py`)
 
-    Lets `blocks_containing_test` match coarser YAML entries (file, class,
-    directory) when the waive id is finer-grained.
+    Lets the lookup match coarser YAML entries (file, class, directory) when
+    the waive id is finer-grained.
     """
     s = test_id
     if "[" in s:
@@ -115,6 +115,78 @@ def _iter_parent_ids(test_id: str):
         s = s.rsplit("/", 1)[0]
         if s:
             yield s
+
+
+# pytest's `-k` keyword expressions can be a single word like `"deepseek"` or
+# a boolean expression like `"a and not b"`. We tokenize on identifier chars
+# and strip the boolean operators, then check substring against the waive id.
+# Over-includes for complex expressions; never under-includes.
+_K_VALUE_RE = re.compile(r'\s+-k\s+"([^"]*)"')
+_M_FLAG_RE = re.compile(r"\s+-m\b")
+_K_RESERVED_WORDS = {"and", "or", "not"}
+
+
+def _extract_k_keyword(entry: str) -> Optional[str]:
+    """Return the raw `-k "<value>"` keyword text, or None."""
+    m = _K_VALUE_RE.search(entry)
+    return m.group(1) if m else None
+
+
+def _entry_applies_to_waive(entry: str, waive_id: str) -> bool:
+    """Best-effort check: would this entry's pytest options run the waived test.
+
+    Skips ancestor-level entries whose `-k` filter excludes the waive (e.g.
+    `file.py -k "weights"` shouldn't match a `test_biases[a]` waive).
+
+    `-k "<expr>"`: extract identifier tokens, drop boolean operators, accept
+                   if any remaining token appears in waive id.
+    `-m "<mark>"`: always accept (markers are runtime metadata, can't verify
+                   from the test id string alone).
+    No options:    always accept.
+    """
+    kw = _extract_k_keyword(entry)
+    if kw is None:
+        return True  # no -k → unconstrained
+    tokens = re.findall(r"[A-Za-z_]\w*", kw)
+    real = [t for t in tokens if t.lower() not in _K_RESERVED_WORDS]
+    if not real:
+        return True  # all-reserved expression → can't decide; over-include
+    return any(t in waive_id for t in real)
+
+
+def _strip_params(s: str) -> str:
+    """Strip `[params]` suffix if present.
+
+    `file.py::test_x[a]`  → `file.py::test_x`
+    `file.py::test_x`     → `file.py::test_x`
+    """
+    return s.rsplit("[", 1)[0] if "[" in s else s
+
+
+def _entry_target(entry: str) -> str:
+    """Canonical "target" key for indexing/lookup.
+
+    Strips SKIP/TIMEOUT/full:gpu, pytest options (-k/-m), and `[params]` suffix.
+
+    `file.py::TestC::test_m[a-b] TIMEOUT (90)` → `file.py::TestC::test_m`
+    `file.py -k "kw"`                          → `file.py`
+    """
+    return _strip_params(_strip_pytest_options(normalize_test_id(entry)))
+
+
+def _target_in_filter_subtree(target: str, filter_prefix: str) -> bool:
+    """True iff `target` is in `filter_prefix`'s subtree.
+
+    `target` matches when it is `filter_prefix` itself or a descendant of it
+    (params / method / file / dir component below) in the pytest tree.
+    """
+    if target == filter_prefix:
+        return True
+    return (
+        target.startswith(filter_prefix + "[")
+        or target.startswith(filter_prefix + "::")
+        or target.startswith(filter_prefix + "/")
+    )
 
 
 class YAMLIndex:
@@ -146,37 +218,77 @@ class YAMLIndex:
                 tests=list(tests),
             )
             self.blocks.append(block)
-            # Index each test under up to three keys so a waive id can match
+            # Index each test under up to four keys so a waive id can match
             # YAML entries written at any granularity:
-            #   1. raw YAML string    (with TIMEOUT/markers as written)
-            #   2. normalized form    (SKIP/TIMEOUT/full:gpu prefix stripped)
-            #   3. target-only form   (pytest options like `-k "..."` stripped)
-            # Waive-side lookup walks the pytest node-id parent chain, so a
-            # coarse YAML entry (file / dir / `dir/x.py -k "kw"`) matches a
-            # fine-grained waive (`dir/x.py::TestC::test_m[params]`).
+            #   1. raw YAML string     (with TIMEOUT/markers as written)
+            #   2. normalized form     (SKIP/TIMEOUT/full:gpu prefix stripped)
+            #   3. target-w/-options   (pytest options `-k "..."` stripped)
+            #   4. canonical target    (also `[params]` stripped — the level
+            #                           the lookup walks against)
+            # Waive-side lookup walks the pytest node-id parent chain. A
+            # coarse YAML entry (file / dir / `dir/x.py -k "kw"`) and a fine
+            # waive (`dir/x.py::TestC::test_m[params]`) meet in the middle
+            # via key #4.
             for test in tests:
                 seen: set[str] = set()
+                norm = normalize_test_id(test)
                 for key in (
                     test,
-                    normalize_test_id(test),
-                    _strip_pytest_options(normalize_test_id(test)),
+                    norm,
+                    _strip_pytest_options(norm),
+                    _strip_params(_strip_pytest_options(norm)),
                 ):
                     if key and key not in seen:
                         seen.add(key)
                         self._test_to_blocks.setdefault(key, []).append(block)
 
-    def blocks_containing_test(self, test_id: str) -> list[Block]:
-        # Exact match first, then walk the pytest node-id parent chain to
-        # also catch coarser YAML entries (file / class / directory).
-        blocks = list(self._test_to_blocks.get(test_id, []))
-        seen_block_keys = {(b.yaml_stem, b.block_index) for b in blocks}
-        for parent in _iter_parent_ids(test_id):
-            for b in self._test_to_blocks.get(parent, []):
-                key = (b.yaml_stem, b.block_index)
-                if key not in seen_block_keys:
-                    seen_block_keys.add(key)
-                    blocks.append(b)
-        return blocks
+    def find_match_for_waive(self, waive_id: str) -> Optional[tuple[str, list[Block]]]:
+        """Walk up the pytest parent chain; first level with a match wins.
+
+        Returns (level, blocks) for the first level whose YAML index has at
+        least one matching entry, or None when even the root level misses.
+
+        Detail:
+            (level, blocks): `level` is the YAML target string where the match
+                            was found; `blocks` are the affected blocks at
+                            that level.
+            None:            no level matched all the way to the root —
+                            caller should treat as fallback (CBTS exits,
+                            baseline runs).
+
+        An entry "matches" at a level when its target (after stripping pytest
+        options) equals the level AND its `-k` filter (if any) actually applies
+        to the waive id.
+        """
+        # Step 1+2: normalize the waive id, strip [params] to get the start.
+        #   `file.py::TestC::test_m[a-b]` → `file.py::TestC::test_m`
+        #   `file.py::TestC::test_m`      → unchanged (already at function level)
+        #   `file.py::TestC`              → unchanged (class)
+        #   `file.py`                     → unchanged (file)
+        target = _strip_pytest_options(normalize_test_id(waive_id))
+        if "[" in target:
+            target = target.rsplit("[", 1)[0]
+
+        # Step 3: walk up until something matches.
+        for level in [target, *_iter_parent_ids(target)]:
+            candidates = self._test_to_blocks.get(level, [])
+            matched: list[Block] = []
+            seen_keys: set[tuple[str, int]] = set()
+            for block in candidates:
+                key = (block.yaml_stem, block.block_index)
+                if key in seen_keys:
+                    continue
+                # Verify at least one entry in this block has canonical
+                # target == level AND its -k constraint (if any) applies to
+                # the waive. Canonical = strip pytest options and [params].
+                for raw in block.tests:
+                    if _entry_target(raw) == level and _entry_applies_to_waive(raw, waive_id):
+                        matched.append(block)
+                        seen_keys.add(key)
+                        break
+            if matched:
+                return level, matched
+        return None
 
     def all_test_ids(self) -> Iterable[str]:
         return self._test_to_blocks.keys()
@@ -390,3 +502,70 @@ def block_matches_stage(block: Block, stage: Stage) -> bool:
             return False
 
     return True
+
+
+# ---------------------------------------------------------------------------
+# CBTS Layer 3: filtered test-db YAML generation
+# ---------------------------------------------------------------------------
+
+
+def write_filtered_test_db(
+    src_dir: Path,
+    output_dir: Path,
+    block_filters: dict[tuple[str, int], set[str]],
+) -> None:
+    """Generate a tmp test-db dir narrowed by CBTS Layer 3.
+
+    Contains only the YAMLs whose blocks were affected, with each affected
+    block's `tests:` array filtered to entries in the per-block filter prefix
+    subtree.
+
+    Layer 3 narrowing: trt-test-db invoked with `-d <output_dir>` will produce
+    a smaller testDBList for each affected stage, since the YAML it reads has
+    fewer tests in the matched block.
+
+    `block_filters` keys: (yaml_stem, block_index) of affected blocks.
+    Values: set of filter prefix strings that should keep tests in their
+    subtree.
+
+    Unaffected blocks (not in `block_filters`) are written through unchanged.
+    Unaffected YAML files are NOT written — only stages whose YAML appears in
+    `block_filters` will be running anyway (Layer 2 already filtered).
+
+    Safety: if filtering would empty a block's tests, the original tests are
+    kept (prevents silent skip when a YAML/waive granularity mismatch slips
+    through).
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    affected_stems = {stem for stem, _ in block_filters}
+    for stem in sorted(affected_stems):
+        src = src_dir / f"{stem}.yml"
+        if not src.exists():
+            continue
+        data = yaml.safe_load(src.read_text()) or {}
+
+        for ctx_blocks in data.values():
+            if not isinstance(ctx_blocks, list):
+                continue
+            for i, block_data in enumerate(ctx_blocks):
+                if not isinstance(block_data, dict):
+                    continue
+                key = (stem, i)
+                if key not in block_filters:
+                    continue
+                original = block_data.get("tests") or []
+                filters = block_filters[key]
+                kept = [
+                    t
+                    for t in original
+                    if any(_target_in_filter_subtree(_entry_target(t), f) for f in filters)
+                ]
+                # Safety: empty filter result → fallback to original (prevents
+                # silent skip from typo'd waive ids or granularity mismatch).
+                if kept:
+                    block_data["tests"] = kept
+
+        (output_dir / src.name).write_text(
+            yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
+        )

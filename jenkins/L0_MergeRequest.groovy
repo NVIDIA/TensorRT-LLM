@@ -851,6 +851,7 @@ def _cbtsParseSelectionResult(String text)
         affected_stages: data.affected_stages ?: [],
         affected_tests: data.tests ?: [],
         reasons: data.reasons ?: [],
+        test_db_dir_override: data.test_db_dir_override,  // Layer 3: tmp test-db path
     ]
 }
 

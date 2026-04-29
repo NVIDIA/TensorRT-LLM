@@ -47,7 +47,7 @@ from typing import Optional
 # Make sibling modules importable when invoked as `python3 <path>/main.py ...`.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from blocks import Stage, YAMLIndex, parse_stages_from_groovy  # noqa: E402
+from blocks import Stage, YAMLIndex, parse_stages_from_groovy, write_filtered_test_db  # noqa: E402
 from rules.base import PRInputs, Rule, RuleResult  # noqa: E402
 from rules.waives_rule import WaivesRule  # noqa: E402
 
@@ -66,13 +66,22 @@ def build_rules(yaml_index: YAMLIndex, stages: dict[str, Stage]) -> list[Rule]:
 
 @dataclass
 class SelectionResult:
-    """Final aggregated decision."""
+    """Final aggregated decision.
+
+    `block_filters` and `test_db_dir_override` drive CBTS Layer 3 (within-stage
+    test filtering). After the Selector aggregates per-rule `block_filters`,
+    `main.py` writes a tmp test-db dir with each affected block's `tests:`
+    array narrowed to entries in the per-block filter prefix subtree, then
+    sets `test_db_dir_override` so Groovy points trt-test-db at it.
+    """
 
     scope: Optional[str]
     affected_stages: set[str] = field(default_factory=set)
     affected_cpu_arch: set[str] = field(default_factory=set)
     tests: set[str] = field(default_factory=set)
     reasons: list[str] = field(default_factory=list)
+    block_filters: dict[tuple[str, int], set[str]] = field(default_factory=dict)
+    test_db_dir_override: Optional[str] = None
 
     def to_json(self) -> str:
         data = {
@@ -81,6 +90,7 @@ class SelectionResult:
             "affected_stages": sorted(self.affected_stages),
             "tests": sorted(self.tests),
             "reasons": list(self.reasons),
+            "test_db_dir_override": self.test_db_dir_override,
         }
         return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
@@ -152,12 +162,20 @@ class Selector:
             self.stages[name].cpu_arch for name in affected_stages if name in self.stages
         }
 
+        # Aggregate per-block filter prefix sets across rules. Same block keyed
+        # by multiple rules: union the filter prefixes.
+        block_filters: dict[tuple[str, int], set[str]] = {}
+        for _, r in pairs:
+            for key, filters in r.block_filters.items():
+                block_filters.setdefault(key, set()).update(filters)
+
         return SelectionResult(
             scope=scope,
             affected_stages=affected_stages,
             affected_cpu_arch=affected_cpu_arch,
             tests=tests,
             reasons=reasons,
+            block_filters=block_filters,
         )
 
 
@@ -251,6 +269,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     pr = _load_pr_inputs(input_path)
     rules = build_rules(yaml_index, stages)
     result = Selector(stages).run(pr, rules)
+
+    # Layer 3: if any block has filter prefixes, write a tmp test-db so
+    # trt-test-db downstream renders a narrower testDBList for the affected
+    # stages. The path is relative to repo_root so Groovy can resolve it as
+    # `${LLM_ROOT}/cbts_test_db`.
+    if result.scope is not None and result.block_filters:
+        out_dir_name = "cbts_test_db"
+        write_filtered_test_db(
+            src_dir=test_db_dir,
+            output_dir=repo_root / out_dir_name,
+            block_filters=result.block_filters,
+        )
+        result.test_db_dir_override = out_dir_name
+
     sys.stdout.write(result.to_json())
     return 0
 
