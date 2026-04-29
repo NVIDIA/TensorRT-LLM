@@ -3039,6 +3039,7 @@ class KVCacheManagerV2(BaseResourceManager):
         This method shrinks capacity back to undo that spurious growth
         so it does not accumulate across iterations and overflow the
         host page-index buffer.
+
         Mirror the effective draft length used in _required_gen_capacity
         so disagg-gen-trans-complete revert stays symmetric.
         """
