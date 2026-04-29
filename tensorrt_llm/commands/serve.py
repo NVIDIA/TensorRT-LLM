@@ -821,7 +821,7 @@ def serve(
                 f"Cannot auto-detect tool parser for model '{model}'. "
                 f"Supported model types for auto-detection: qwen2, qwen3, "
                 f"qwen3_moe, qwen3_5, qwen3_5_moe, qwen3_next, deepseek_v3, "
-                f"deepseek_v32, kimi_k2, kimi_k25, glm4. "
+                f"deepseek_v32, deepseek_v4, kimi_k2, kimi_k25, glm4. "
                 f"Please specify a parser explicitly: "
                 f"{list(ToolParserFactory.parsers.keys())}",
                 param_hint="--tool_parser")

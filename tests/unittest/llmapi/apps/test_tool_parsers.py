@@ -26,6 +26,7 @@ from tensorrt_llm.serve.tool_parser.core_types import StructureInfo
 from tensorrt_llm.serve.tool_parser.deepseekv3_parser import DeepSeekV3Parser
 from tensorrt_llm.serve.tool_parser.deepseekv31_parser import DeepSeekV31Parser
 from tensorrt_llm.serve.tool_parser.deepseekv32_parser import DeepSeekV32Parser
+from tensorrt_llm.serve.tool_parser.deepseekv4_parser import DeepSeekV4Parser
 from tensorrt_llm.serve.tool_parser.glm4_parser import Glm4ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
 from tensorrt_llm.serve.tool_parser.minimax_m2_parser import MiniMaxM2ToolParser
@@ -1494,6 +1495,87 @@ class TestDeepSeekV32Parser(BaseToolParserTestClass):
 
 
 # ============================================================================
+# DeepSeekV4Parser Tests
+# ============================================================================
+
+
+class TestDeepSeekV4Parser(BaseToolParserTestClass):
+    """Test suite for DeepSeekV4Parser class."""
+
+    def make_parser(self):
+        return DeepSeekV4Parser()
+
+    def make_tool_parser_test_cases(self):
+        return ToolParserTestCases(
+            has_tool_call_true=(
+                'Some text <｜DSML｜tool_calls> <｜DSML｜invoke name="get_weather"> '
+                '<｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> '
+                "</｜DSML｜invoke> </｜DSML｜tool_calls>"
+            ),
+            detect_and_parse_single_tool=(
+                (
+                    'Normal text<｜DSML｜tool_calls> <｜DSML｜invoke name="get_weather"> '
+                    '<｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> '
+                    "</｜DSML｜invoke> </｜DSML｜tool_calls>"
+                ),
+                "Normal text",
+                "get_weather",
+                {
+                    "location": "NYC"
+                },
+            ),
+            detect_and_parse_multiple_tools=(
+                (
+                    '<｜DSML｜tool_calls> <｜DSML｜invoke name="get_weather"> '
+                    '<｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> '
+                    '</｜DSML｜invoke> <｜DSML｜invoke name="search_web"> '
+                    '{ "query": "AI" } </｜DSML｜invoke> </｜DSML｜tool_calls>'
+                ),
+                ("get_weather", "search_web"),
+            ),
+            detect_and_parse_malformed_tool=(
+                '<|DSML|tool_calls> <|DSML|invoke name="get_weather"> '
+                '<|DSML|parameter name="location" string="true">NYC</|DSML|parameter> '
+                "</|DSML|invoke> </|DSML|tool_calls>"
+            ),
+            detect_and_parse_with_parameters_key=(
+                (
+                    '<｜DSML｜tool_calls> <｜DSML｜invoke name="search_web"> '
+                    '{ "query": "test" } </｜DSML｜invoke> </｜DSML｜tool_calls>'
+                ),
+                "search_web",
+                {
+                    "query": "test"
+                },
+            ),
+            parse_streaming_increment_partial_bot_token="<｜DSML｜tool",
+            undefined_tool=(
+                '<｜DSML｜tool_calls> <｜DSML｜invoke name="undefined_func"> '
+                '<｜DSML｜parameter name="arg" string="true">value</｜DSML｜parameter> '
+                "</｜DSML｜invoke> </｜DSML｜tool_calls>"
+            ),
+        )
+
+    def test_initialization(self, parser):
+        """Test that DeepSeekV4Parser initializes correctly."""
+        assert parser.bot_token == "<｜DSML｜tool_calls>"
+        assert parser.eot_token == "</｜DSML｜tool_calls>"
+        assert parser.invoke_end_token == "</｜DSML｜invoke>"
+
+    def test_deepseek_v4_does_not_accept_v32_function_calls(self, sample_tools,
+                                                            parser):
+        text = (
+            '<｜DSML｜function_calls> <｜DSML｜invoke name="get_weather"> '
+            '<｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> '
+            "</｜DSML｜invoke> </｜DSML｜function_calls>"
+        )
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 0
+
+
+# ============================================================================
 # Glm4ToolParser Tests
 # ============================================================================
 
@@ -2098,6 +2180,19 @@ class TestToolParserFactory:
             ToolParserFactory
         parser = ToolParserFactory.create_tool_parser("minimax_m2")
         assert isinstance(parser, MiniMaxM2ToolParser)
+
+    def test_deepseek_v4_registered(self):
+        """Test that deepseek_v4 parser is registered in factory."""
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+        assert "deepseek_v4" in ToolParserFactory.parsers
+
+    def test_create_deepseek_v4_parser(self):
+        """Test creating deepseek_v4 parser via factory."""
+        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
+            ToolParserFactory
+        parser = ToolParserFactory.create_tool_parser("deepseek_v4")
+        assert isinstance(parser, DeepSeekV4Parser)
 
 
 # ============================================================================
