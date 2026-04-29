@@ -221,6 +221,15 @@ def parse_args():
             "transformer for stage 2 and un-merged afterwards."
         ),
     )
+    parser.add_argument(
+        "--one_stage_pipeline",
+        action="store_true",
+        help=(
+            "Force the LTX2 one-stage pipeline. This disables automatic "
+            "two-stage auxiliary checkpoint discovery and prevents promotion "
+            "to LTX2TwoStagesPipeline."
+        ),
+    )
 
     # Parallelism
     parser.add_argument(
@@ -362,6 +371,7 @@ def _build_diffusion_args(args) -> VisualGenArgs:
         pipeline={
             "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
         },
+        one_stage_pipeline=args.one_stage_pipeline,
     )
     if args.spatial_upsampler_path:
         kwargs["spatial_upsampler_path"] = args.spatial_upsampler_path

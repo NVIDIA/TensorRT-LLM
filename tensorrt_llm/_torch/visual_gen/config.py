@@ -423,6 +423,17 @@ class VisualGenArgs(StrictBaseModel):
         ),
     )
 
+    # LTX-2 specific option: force base one-stage pipeline even when two-stage
+    # auxiliary checkpoints are passed explicitly or discoverable next to the model.
+    one_stage_pipeline: bool = PydanticField(
+        False,
+        description=(
+            "Force the LTX-2 one-stage pipeline. When enabled, TensorRT-LLM "
+            "does not discover or use spatial_upsampler_path/distilled_lora_path "
+            "for two-stage pipeline promotion."
+        ),
+    )
+
     # HuggingFace Hub options
     revision: Optional[str] = PydanticField(
         None,
@@ -914,34 +925,49 @@ class DiffusionModelConfig(BaseModel):
         # Resolve LTX2 two-stage auxiliary paths before pipeline variant selection.
         explicit_spatial_upsampler_path = args.spatial_upsampler_path if args else ""
         explicit_distilled_lora_path = args.distilled_lora_path if args else ""
-        spatial_upsampler_path, distilled_lora_path = discover_ltx2_two_stage_paths(
-            checkpoint_path,
-            explicit_spatial_upsampler_path,
-            explicit_distilled_lora_path,
-        )
-        if bool(spatial_upsampler_path) != bool(distilled_lora_path):
-            if explicit_spatial_upsampler_path or explicit_distilled_lora_path:
-                missing = (
-                    "distilled_lora_path" if spatial_upsampler_path else "spatial_upsampler_path"
-                )
-                raise ValueError(
-                    "LTX2 two-stage pipeline requires both spatial_upsampler_path "
-                    f"and distilled_lora_path, but {missing} was not provided or discovered."
-                )
-            logger.warning(
-                "Found only one LTX2 two-stage auxiliary checkpoint in "
-                f"{checkpoint_path}; falling back to the one-stage pipeline. "
-                "Pass both paths explicitly to enable two-stage inference."
+        one_stage_pipeline = bool(getattr(args, "one_stage_pipeline", False))
+        if one_stage_pipeline:
+            extra_attrs["one_stage_pipeline"] = True
+            logger.info(
+                "LTX2 one_stage_pipeline is enabled; skipping two-stage auxiliary "
+                "checkpoint discovery and promotion."
             )
-            spatial_upsampler_path = ""
-            distilled_lora_path = ""
-        if spatial_upsampler_path and distilled_lora_path:
-            extra_attrs["spatial_upsampler_path"] = spatial_upsampler_path
-            extra_attrs["distilled_lora_path"] = distilled_lora_path
-            if not explicit_spatial_upsampler_path:
-                logger.info(f"Discovered LTX2 spatial upsampler: {spatial_upsampler_path}")
-            if not explicit_distilled_lora_path:
-                logger.info(f"Discovered LTX2 distilled LoRA: {distilled_lora_path}")
+            if explicit_spatial_upsampler_path or explicit_distilled_lora_path:
+                logger.info(
+                    "Ignoring spatial_upsampler_path/distilled_lora_path because "
+                    "one_stage_pipeline is enabled."
+                )
+        else:
+            spatial_upsampler_path, distilled_lora_path = discover_ltx2_two_stage_paths(
+                checkpoint_path,
+                explicit_spatial_upsampler_path,
+                explicit_distilled_lora_path,
+            )
+            if bool(spatial_upsampler_path) != bool(distilled_lora_path):
+                if explicit_spatial_upsampler_path or explicit_distilled_lora_path:
+                    missing = (
+                        "distilled_lora_path"
+                        if spatial_upsampler_path
+                        else "spatial_upsampler_path"
+                    )
+                    raise ValueError(
+                        "LTX2 two-stage pipeline requires both spatial_upsampler_path "
+                        f"and distilled_lora_path, but {missing} was not provided or discovered."
+                    )
+                logger.warning(
+                    "Found only one LTX2 two-stage auxiliary checkpoint in "
+                    f"{checkpoint_path}; falling back to the one-stage pipeline. "
+                    "Pass both paths explicitly to enable two-stage inference."
+                )
+                spatial_upsampler_path = ""
+                distilled_lora_path = ""
+            if spatial_upsampler_path and distilled_lora_path:
+                extra_attrs["spatial_upsampler_path"] = spatial_upsampler_path
+                extra_attrs["distilled_lora_path"] = distilled_lora_path
+                if not explicit_spatial_upsampler_path:
+                    logger.info(f"Discovered LTX2 spatial upsampler: {spatial_upsampler_path}")
+                if not explicit_distilled_lora_path:
+                    logger.info(f"Discovered LTX2 distilled LoRA: {distilled_lora_path}")
 
         # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)
