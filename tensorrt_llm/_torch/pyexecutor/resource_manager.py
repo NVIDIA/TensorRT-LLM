@@ -2160,6 +2160,45 @@ class KVCacheManagerV2(BaseResourceManager):
         return kv_cache.resize(
             self._required_gen_capacity(req, kv_cache.capacity))
 
+    def trim_to_history(self, req: LlmRequest, history_length: int) -> bool:
+        """Mark *history_length* tokens of this request's KV as historic.
+
+        For sliding-window-style life cycles (AttnLifeCycle with non-None
+        window_size), this triggers ``_unlock_stale_blocks`` inside V2's
+        ``resize()`` so blocks before ``(history_length + 1 - window) //
+        tokens_per_block`` get released back to their pool group.  For
+        full-context life cycles (``window_size=None``) and SSM cycles, it
+        is a no-op — the stale range stays empty.
+
+        Used by the disagg-gen transceiver right after KV transfer
+        completes: at that moment the cache has the entire prompt KV
+        written, so ``history_length=prompt_len`` correctly classifies
+        every prompt token as historic.  Without this call, ``history_length``
+        stays 0 until ``update_resources`` runs after the first forward
+        pass — and in benchmark fill-phase the first forward never fires
+        until every disagg-gen request is ready, so SWA / sparse-attn
+        pool groups would otherwise stay 100% occupied with pre-window
+        prompt blocks and the V2 scheduler would deadlock on the next
+        ``resize(+1)``.
+
+        Returns True on success (or no-op), False if the underlying
+        ``kv_cache.resize`` rejected the call.
+        """
+        kv_cache = self.kv_cache_map.get(req.py_request_id)
+        if kv_cache is None or not kv_cache.is_active:
+            return True
+        if history_length <= kv_cache.history_length:
+            return True
+        # resize() requires capacity >= history_length; clamp for safety.
+        target_capacity = max(kv_cache.capacity, history_length)
+        try:
+            return kv_cache.resize(target_capacity, history_length=history_length)
+        except Exception as e:
+            logger.warning(
+                f"trim_to_history failed for req {req.py_request_id} "
+                f"(capacity={kv_cache.capacity}, target_history={history_length}): {e}")
+            return False
+
     def revert_allocate_generation(self, req: LlmRequest) -> None:
         """Undo the capacity growth from try_allocate_generation.
 
