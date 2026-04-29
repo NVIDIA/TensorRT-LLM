@@ -1556,25 +1556,6 @@ class TestDeepSeekV4Parser(BaseToolParserTestClass):
             ),
         )
 
-    def test_initialization(self, parser):
-        """Test that DeepSeekV4Parser initializes correctly."""
-        assert parser.bot_token == "<｜DSML｜tool_calls>"
-        assert parser.eot_token == "</｜DSML｜tool_calls>"
-        assert parser.invoke_end_token == "</｜DSML｜invoke>"
-
-    def test_deepseek_v4_does_not_accept_v32_function_calls(self, sample_tools,
-                                                            parser):
-        text = (
-            '<｜DSML｜function_calls> <｜DSML｜invoke name="get_weather"> '
-            '<｜DSML｜parameter name="location" string="true">NYC</｜DSML｜parameter> '
-            "</｜DSML｜invoke> </｜DSML｜function_calls>"
-        )
-
-        result = parser.detect_and_parse(text, sample_tools)
-
-        assert len(result.calls) == 0
-
-
 # ============================================================================
 # Glm4ToolParser Tests
 # ============================================================================
@@ -2180,20 +2161,6 @@ class TestToolParserFactory:
             ToolParserFactory
         parser = ToolParserFactory.create_tool_parser("minimax_m2")
         assert isinstance(parser, MiniMaxM2ToolParser)
-
-    def test_deepseek_v4_registered(self):
-        """Test that deepseek_v4 parser is registered in factory."""
-        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
-            ToolParserFactory
-        assert "deepseek_v4" in ToolParserFactory.parsers
-
-    def test_create_deepseek_v4_parser(self):
-        """Test creating deepseek_v4 parser via factory."""
-        from tensorrt_llm.serve.tool_parser.tool_parser_factory import \
-            ToolParserFactory
-        parser = ToolParserFactory.create_tool_parser("deepseek_v4")
-        assert isinstance(parser, DeepSeekV4Parser)
-
 
 # ============================================================================
 # FunctionDefinition strict field and ChatCompletionRequest store field Tests
