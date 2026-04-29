@@ -209,6 +209,33 @@ int RootBlock::tokensPerBlock() const
 // Block
 // ---------------------------------------------------------------------------
 
+namespace
+{
+
+static void tryExcludeFromEviction(std::weak_ptr<CommittedPage> const& weakPage)
+{
+    auto page = weakPage.lock();
+    if (page && page->status() == PageStatus::DROPPABLE && page->nodeRef.has_value())
+    {
+        if (auto mgr = page->manager.lock())
+            mgr->excludeFromEviction(*page);
+    }
+}
+
+static bool isPrefix(std::vector<TokenIdExt> const& prefix, std::vector<TokenIdExt> const& full)
+{
+    if (prefix.size() > full.size())
+        return false;
+    for (size_t i = 0; i < prefix.size(); ++i)
+    {
+        if (prefix[i] != full[i])
+            return false;
+    }
+    return true;
+}
+
+} // anonymous namespace
+
 BlockKey Block::makeKey(BlockKey const& prevKey, TokenIdExt const* tokens, size_t count)
 {
     Hasher h;
@@ -223,12 +250,7 @@ Block::~Block()
     // This mirrors Python Block.__del__.
     for (auto const& weakPage : storage)
     {
-        auto page = weakPage.lock();
-        if (page && page->status() == PageStatus::DROPPABLE && page->nodeRef.has_value())
-        {
-            if (auto mgr = page->manager.lock())
-                mgr->excludeFromEviction(*page);
-        }
+        tryExcludeFromEviction(weakPage);
     }
     // If we're the last child of a root block, remove the root block from the tree.
     if (parentRoot && parentRoot->next.empty())
@@ -301,31 +323,19 @@ void Block::unsetPage(LifeCycleId lcIdx, LifeCycle const& lc)
     if (auto const* alc = std::get_if<AttnLifeCycle>(&lc))
     {
         // If this is a non-sink block with no window (or sink block): evict descendants.
+        // Delegate to removeSubtree() for each child, matching Python's unset_page().
         if (!alc->windowSize.has_value() || ordinal < alc->numSinkBlocks)
         {
-            // Collect and exclude all descendant pages from eviction.
-            std::vector<std::weak_ptr<Block>> stack;
-            for (auto& [k, child] : next)
-                stack.push_back(child);
+            std::vector<BlockKey> childKeys;
+            childKeys.reserve(next.size());
+            for (auto const& [k, child] : next)
+                childKeys.push_back(k);
 
-            while (!stack.empty())
+            for (auto const& k : childKeys)
             {
-                auto weakChild = stack.back();
-                stack.pop_back();
-                auto child = weakChild.lock();
-                if (!child)
-                    continue;
-                for (auto& weakPage : child->storage)
-                {
-                    auto page = weakPage.lock();
-                    if (page && page->status() == PageStatus::DROPPABLE && page->nodeRef.has_value())
-                    {
-                        if (auto mgr = page->manager.lock())
-                            mgr->excludeFromEviction(*page);
-                    }
-                }
-                for (auto& [k2, grandchild] : child->next)
-                    stack.push_back(grandchild);
+                auto pages = removeSubtree(next, k);
+                for (auto const& weakPage : pages)
+                    tryExcludeFromEviction(weakPage);
             }
         }
     }
@@ -365,20 +375,8 @@ std::shared_ptr<Block> addOrGetExistingBlock(std::unordered_map<BlockKey, std::s
     {
         for (auto const& [k, sibling] : parentNext)
         {
-            if (sibling->tokens.size() >= tokens.size())
-            {
-                bool prefixMatch = true;
-                for (size_t i = 0; i < tokens.size(); ++i)
-                {
-                    if (sibling->tokens[i] != tokens[i])
-                    {
-                        prefixMatch = false;
-                        break;
-                    }
-                }
-                if (prefixMatch)
-                    return nullptr; // useless
-            }
+            if (sibling->tokens.size() >= tokens.size() && isPrefix(tokens, sibling->tokens))
+                return nullptr; // useless
         }
     }
 
@@ -386,20 +384,8 @@ std::shared_ptr<Block> addOrGetExistingBlock(std::unordered_map<BlockKey, std::s
     std::vector<BlockKey> toRemove;
     for (auto const& [k, sibling] : parentNext)
     {
-        if (sibling->tokens.size() < tokens.size() && sibling->next.empty())
-        {
-            bool prefixMatch = true;
-            for (size_t i = 0; i < sibling->tokens.size(); ++i)
-            {
-                if (tokens[i] != sibling->tokens[i])
-                {
-                    prefixMatch = false;
-                    break;
-                }
-            }
-            if (prefixMatch)
-                toRemove.push_back(k);
-        }
+        if (sibling->tokens.size() < tokens.size() && sibling->next.empty() && isPrefix(sibling->tokens, tokens))
+            toRemove.push_back(k);
     }
     for (auto const& k : toRemove)
         parentNext.erase(k);
@@ -558,23 +544,17 @@ std::vector<std::weak_ptr<CommittedPage>> BlockRadixTree::clear()
 
     for (auto& [rootKey, root] : mRoots)
     {
-        // Iterate and clear all blocks under this root.
-        std::vector<std::shared_ptr<Block>> stack;
-        for (auto& [k, child] : root.next)
-            stack.push_back(child);
-        root.next.clear();
+        // Collect child keys, then delegate to removeSubtree() for each — mirrors Python's clear().
+        std::vector<BlockKey> childKeys;
+        childKeys.reserve(root.next.size());
+        for (auto const& [k, child] : root.next)
+            childKeys.push_back(k);
 
-        while (!stack.empty())
+        for (auto const& k : childKeys)
         {
-            auto block = stack.back();
-            stack.pop_back();
-            for (auto const& weakPage : block->storage)
-                if (!weakPage.expired())
-                    ret.push_back(weakPage);
-            block->storage.assign(block->storage.size(), {});
-            for (auto& [k, child] : block->next)
-                stack.push_back(child);
-            block->next.clear();
+            auto pages = removeSubtree(root.next, k);
+            for (auto const& weakPage : pages)
+                ret.push_back(weakPage);
         }
     }
     mRoots.clear();

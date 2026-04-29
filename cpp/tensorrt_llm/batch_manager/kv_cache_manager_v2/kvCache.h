@@ -383,7 +383,16 @@ private:
     // Mirrors Python's _commit_block(ordinal, is_last).
     void _commitBlock(int ord, bool isLast);
 
-    std::shared_ptr<CommittedPage> _takeUncommittedPage(SeqBlock& sb, LifeCycleId lc);
+    struct TakenPage
+    {
+        std::shared_ptr<UncommittedPage> page;
+        bool locked;
+    };
+
+    // Extract uncommitted pages from a SeqBlock, resetting block page entries.
+    // Returns one TakenPage per lifecycle. Mirrors Python's _take_uncommitted_page().
+    std::vector<TakenPage> _takeUncommittedPage(
+        SeqBlock& sb, BeamIndex beamIdx, std::optional<LifeCycleId> skipLc = std::nullopt);
 
     // Page index table management.
     // _basePageIndices[beamIdx][lcId][blockOrdinal] = slotId or BAD

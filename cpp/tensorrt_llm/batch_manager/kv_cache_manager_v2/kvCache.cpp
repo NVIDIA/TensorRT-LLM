@@ -31,6 +31,28 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
+namespace
+{
+
+// Copy one slot's data across all pools in a pool group.
+// Used by resume() (GPU→GPU partial block copy) and _snapshotSsmToTreeBlock().
+void copySlotData(StorageManager& storageMgr, CacheLevel dstLevel, CacheLevel srcLevel, PoolGroupIndex pgIdx,
+    SlotId dstSlotId, SlotId srcSlotId, CUstream stream)
+{
+    auto slotSizes = storageMgr.slotSize(pgIdx);
+    CacheTier dstTier = storageMgr.cacheTier(dstLevel);
+    CacheTier srcTier = storageMgr.cacheTier(srcLevel);
+    int nPools = static_cast<int>(slotSizes.size());
+    for (int poolIdx = 0; poolIdx < nPools; ++poolIdx)
+    {
+        Address dst = storageMgr.slotAddress(dstLevel, pgIdx, dstSlotId, poolIdx);
+        Address src = storageMgr.slotAddress(srcLevel, pgIdx, srcSlotId, poolIdx);
+        batchedCopy(dstTier, srcTier, static_cast<size_t>(slotSizes[poolIdx]), {{dst, src}}, stream);
+    }
+}
+
+} // anonymous namespace
+
 // ---------------------------------------------------------------------------
 // KvCache constructor
 // ---------------------------------------------------------------------------
@@ -280,7 +302,6 @@ bool KvCache::resume(std::optional<CUstream> stream)
     {
         BeamIndex beamIdx = 0;
         int lastOrdinal = mBlocks.empty() ? 0 : (numCommittedTokens() - 1) / mTokensPerBlock;
-        CacheTier gpuTier = storageMgr.cacheTier(kGpuLevel);
         CUstream cudaStr = cudaStream();
 
         // Wait for all new slots to be ready.
@@ -314,14 +335,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
 
             PoolGroupIndex pgIdx
                 = static_cast<PoolGroupIndex>(storageMgr.getPoolGroupIndex(static_cast<LifeCycleId>(lcIdx)));
-            auto slotSizes = storageMgr.slotSize(pgIdx);
-            int nPools = storageMgr.numPools(pgIdx);
-            for (int poolIdx = 0; poolIdx < nPools; ++poolIdx)
-            {
-                Address dst = storageMgr.slotAddress(kGpuLevel, pgIdx, newSlot.slotId(), poolIdx);
-                Address src = storageMgr.slotAddress(kGpuLevel, pgIdx, lock->page()->slotId(), poolIdx);
-                batchedCopy(gpuTier, gpuTier, static_cast<size_t>(slotSizes[poolIdx]), {{dst, src}}, cudaStr);
-            }
+            copySlotData(storageMgr, kGpuLevel, kGpuLevel, pgIdx, newSlot.slotId(), lock->page()->slotId(), cudaStr);
         }
 
         // Unlock source pages — recordEventScope captures all prior CUDA work
@@ -479,17 +493,7 @@ void KvCache::_snapshotSsmToTreeBlock(std::shared_ptr<Block> const& treeBlock, L
 
         CUstream stream = cudaStream();
         newSlot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(stream));
-        auto slotSizes = storageMgr.slotSize(pgIdx);
-        CacheTier dstTier = storageMgr.cacheTier(lvl);
-        CacheTier srcTier = storageMgr.cacheTier(srcPage->cacheLevel);
-        int nPools = storageMgr.numPools(pgIdx);
-
-        for (int poolIdx = 0; poolIdx < nPools; ++poolIdx)
-        {
-            Address dst = storageMgr.slotAddress(lvl, pgIdx, newSlot.slotId(), poolIdx);
-            Address src = storageMgr.slotAddress(srcPage->cacheLevel, pgIdx, srcPage->slotId(), poolIdx);
-            batchedCopy(dstTier, srcTier, static_cast<size_t>(slotSizes[poolIdx]), {{dst, src}}, stream);
-        }
+        copySlotData(storageMgr, lvl, srcPage->cacheLevel, pgIdx, newSlot.slotId(), srcPage->slotId(), stream);
 
         CachedCudaEvent readyEv(reinterpret_cast<CudaStream>(stream));
         assert(mTokensPerBlock * (treeBlock->ordinal + 1) == static_cast<int>(mCommittedTokens.size()));
@@ -749,6 +753,41 @@ void KvCache::_lockHeldBlocks(std::vector<StaleBackup> const& backup)
 }
 
 // ---------------------------------------------------------------------------
+// _takeUncommittedPage — extract uncommitted pages from a SeqBlock.
+// Mirrors Python's _take_uncommitted_page().
+// ---------------------------------------------------------------------------
+
+std::vector<KvCache::TakenPage> KvCache::_takeUncommittedPage(
+    SeqBlock& sb, BeamIndex beamIdx, std::optional<LifeCycleId> skipLc)
+{
+    int numLc = mManager->storage().numLifeCycles();
+    std::vector<TakenPage> result(static_cast<size_t>(numLc), {nullptr, false});
+    for (int lc = 0; lc < numLc; ++lc)
+    {
+        if (skipLc.has_value() && lc == *skipLc)
+            continue;
+        auto& bp = sb.pages[beamIdx][lc];
+        if (auto* lock = std::get_if<SharedPageLock>(&bp))
+        {
+            auto up = std::dynamic_pointer_cast<UncommittedPage>(lock->page());
+            if (up)
+                result[lc] = {up, true};
+        }
+        else if (auto* holder = std::get_if<std::shared_ptr<PageHolder>>(&bp))
+        {
+            if (*holder)
+            {
+                auto up = std::dynamic_pointer_cast<UncommittedPage>((*holder)->page);
+                if (up)
+                    result[lc] = {up, false};
+            }
+        }
+        bp = std::monostate{};
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // _commitBlock — shared logic for committing a single block.
 // Mirrors Python's _commit_block(ordinal, is_last).
 // Caller must have recordEventScope() open so finishEvent() works.
@@ -811,35 +850,7 @@ void KvCache::_commitBlock(int ord, bool isLast)
     {
         // New block: take uncommitted pages, convert to committed.
         // Mirrors Python's _take_uncommitted_page + convert path.
-        struct TakenPage
-        {
-            std::shared_ptr<UncommittedPage> page;
-            bool locked;
-        };
-
-        std::vector<TakenPage> taken(static_cast<size_t>(numLc), {nullptr, false});
-        for (int lc = 0; lc < numLc; ++lc)
-        {
-            if (ssmLcId.has_value() && lc == *ssmLcId)
-                continue;
-            auto& bp = sb.pages[0][lc];
-            if (auto* lock = std::get_if<SharedPageLock>(&bp))
-            {
-                auto up = std::dynamic_pointer_cast<UncommittedPage>(lock->page());
-                if (up)
-                    taken[lc] = {up, true};
-            }
-            else if (auto* holder = std::get_if<std::shared_ptr<PageHolder>>(&bp))
-            {
-                if (*holder)
-                {
-                    auto up = std::dynamic_pointer_cast<UncommittedPage>((*holder)->page);
-                    if (up)
-                        taken[lc] = {up, false};
-                }
-            }
-            bp = std::monostate{};
-        }
+        auto taken = _takeUncommittedPage(sb, 0, ssmLcId);
         sb.treeBlock = newBlock;
         for (int lc = 0; lc < numLc; ++lc)
         {
