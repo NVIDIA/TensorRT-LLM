@@ -4,8 +4,8 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-from ...modules.linear import Linear, WeightMode, WeightsLoadingConfig
-from ...modules.rms_norm import RMSNorm
+from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
+from ..modules.rms_norm import RMSNorm
 from ..attention_backend.interface import AttentionTensorLayout
 from ..attention_backend.utils import create_attention
 from ..config import DiffusionModelConfig
@@ -58,6 +58,9 @@ class Attention(nn.Module):
         self.skip_create_weights_in_init = config.skip_create_weights_in_init
         self.force_dynamic_quantization = config.force_dynamic_quantization
         self.mapping = getattr(config, "mapping", None)
+        self.allreduce_strategy = config.allreduce_strategy
+
+        tp_size = self.mapping.tp_size if self.mapping else 1
 
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
@@ -98,13 +101,17 @@ class Attention(nn.Module):
         if self.qk_norm:
             # "full": norm over all heads combined (e.g. WAN, dim=q_dim)
             # "per_head": norm over each head independently (e.g. FLUX, dim=head_dim)
+
             q_norm_dim = self.head_dim if qk_norm_mode == "per_head" else self.q_dim
             k_norm_dim = self.head_dim if qk_norm_mode == "per_head" else self.kv_dim
+            reduce_variance = (tp_size > 1) and qk_norm_mode == "full"
             self.norm_q = RMSNorm(
-                hidden_size=q_norm_dim, eps=self.eps, dtype=self.dtype, has_weights=True
+                hidden_size=q_norm_dim, eps=self.eps, dtype=self.dtype, has_weights=True,
+                allreduce_variance=reduce_variance, mapping=self.mapping,
             )
             self.norm_k = RMSNorm(
-                hidden_size=k_norm_dim, eps=self.eps, dtype=self.dtype, has_weights=True
+                hidden_size=k_norm_dim, eps=self.eps, dtype=self.dtype, has_weights=True,
+                allreduce_variance=reduce_variance, mapping=self.mapping,
             )
 
         # TODO: Use weight mapper to create just a Linear module
@@ -119,8 +126,9 @@ class Attention(nn.Module):
                     quant_config=self.quant_config,
                     skip_create_weights_in_init=self.skip_create_weights_in_init,
                     force_dynamic_quantization=self.force_dynamic_quantization,
-                    # TODO: TP attn
-                    reduce_output=False,
+                    tensor_parallel_mode=TensorParallelMode.ROW if tp_size > 1 else None,
+                    reduce_output=(tp_size > 1),
+                    allreduce_strategy=self.allreduce_strategy,
                 )
             ]
         )
@@ -140,6 +148,16 @@ class Attention(nn.Module):
         else:
             backend_num_heads = self.num_attention_heads
             backend_num_kv_heads = self.num_key_value_heads
+
+        if tp_size > 1:
+            assert backend_num_heads % tp_size == 0
+            backend_num_heads = backend_num_heads // tp_size
+
+            assert backend_num_kv_heads % tp_size == 0
+            backend_num_kv_heads = backend_num_kv_heads // tp_size
+
+            self.num_attention_heads //= tp_size
+            self.num_key_value_heads //= tp_size
 
         # Create compute backend
         self.attn = create_attention(
@@ -172,7 +190,10 @@ class Attention(nn.Module):
             )
 
     def _init_qkv_proj(self) -> None:
+        tp_mode = TensorParallelMode.COLUMN if self.mapping.tp_size > 1 else None
+
         if self.qkv_mode == QKVMode.FUSE_QKV:
+            assert tp_mode is None, 'fused QKV TP is not supported yet'
             qkv_out_dim = self.q_dim + 2 * self.kv_dim
             self.qkv_proj = Linear(
                 self.hidden_size,
@@ -191,7 +212,7 @@ class Attention(nn.Module):
                     "k": (self.q_dim, self.kv_dim),
                     "v": (self.q_dim + self.kv_dim, self.kv_dim),
                 },
-                # TODO: TP attn
+                # TODO: Fused QKV TP support
                 reduce_output=False,
             )
         else:
@@ -204,8 +225,9 @@ class Attention(nn.Module):
                 quant_config=self.quant_config,
                 skip_create_weights_in_init=self.skip_create_weights_in_init,
                 force_dynamic_quantization=self.force_dynamic_quantization,
-                # TODO: TP attn
+                tensor_parallel_mode=tp_mode,
                 reduce_output=False,
+                allreduce_strategy=self.allreduce_strategy,
             )
             self.to_k = Linear(
                 self.hidden_size,
@@ -216,8 +238,9 @@ class Attention(nn.Module):
                 quant_config=self.quant_config,
                 skip_create_weights_in_init=self.skip_create_weights_in_init,
                 force_dynamic_quantization=self.force_dynamic_quantization,
-                # TODO: TP attn
+                tensor_parallel_mode=tp_mode,
                 reduce_output=False,
+                allreduce_strategy=self.allreduce_strategy,
             )
             self.to_v = Linear(
                 self.hidden_size,
@@ -228,8 +251,9 @@ class Attention(nn.Module):
                 quant_config=self.quant_config,
                 skip_create_weights_in_init=self.skip_create_weights_in_init,
                 force_dynamic_quantization=self.force_dynamic_quantization,
-                # TODO: TP attn
+                tensor_parallel_mode=tp_mode,
                 reduce_output=False,
+                allreduce_strategy=self.allreduce_strategy,
             )
 
     def get_qkv(

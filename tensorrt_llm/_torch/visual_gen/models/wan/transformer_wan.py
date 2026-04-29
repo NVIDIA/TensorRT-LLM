@@ -290,7 +290,7 @@ class WanBlock(nn.Module):
             hidden_size=hidden_size,
             num_attention_heads=num_heads,
             head_dim=head_dim,
-            qkv_mode=QKVMode.FUSE_QKV,
+            qkv_mode=QKVMode.SEPARATE_QKV,
             qk_norm=True,
             eps=eps,
             fuse_qk_norm_rope=True,
