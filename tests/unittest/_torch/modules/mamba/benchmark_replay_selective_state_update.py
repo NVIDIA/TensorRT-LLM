@@ -205,6 +205,27 @@ def _flush_l2() -> None:
     torch.cuda.synchronize()
 
 
+def _resolve_prev_ks(args, mtp_len: int) -> list[int]:
+    """Resolve prev_k values for one mtp_len cell.
+
+    Two input modes (mutually exclusive in spirit; absolute wins if both given):
+      --prev-tokens-int "0,10,11,16"  → use literal integers, clamped to
+        [0, max_window] (where max_window is the cache T-axis capacity).
+      --prev-tokens-fracs "0,0.5,1.0" → fractions of mtp_len, clamped to
+        [0, mtp_len] (current behavior).
+
+    For replay-style checkpointing the cache holds up to max_window old
+    tokens, so absolute integers are the right knob.  Fractions are kept
+    for back-compat with prior placeholder runs.
+    """
+    upper = getattr(args, "max_window", 0) or mtp_len
+    if getattr(args, "prev_tokens_int", None):
+        return sorted(set(max(0, min(upper, int(v))) for v in args.prev_tokens_int))
+    return sorted(
+        set(min(mtp_len, max(0, round(f * mtp_len))) for f in args.prev_tokens_fracs)
+    )
+
+
 # Tensor construction helpers
 
 
@@ -217,6 +238,7 @@ def _build_tensors(
     head_dim: int,
     d_state: int,
     ngroups: int,
+    max_window: int | None = None,
 ):
     """
     Build all tensors for one benchmark configuration.
@@ -250,14 +272,18 @@ def _build_tensors(
     state0 = torch.randn(batch, nheads, head_dim, d_state, device=device, dtype=state_dtype)
 
     # --- Cache tensors for replay kernel ---
-    # old_x: single-buffered (cache, T, nheads, dim)
-    old_x = torch.randn(batch, mtp_len, nheads, head_dim, device=device, dtype=act_dtype)
-    # old_B: double-buffered (cache, 2, T, ngroups, dstate)
-    old_B = torch.randn(batch, 2, mtp_len, ngroups, d_state, device=device, dtype=act_dtype)
-    # old_dt: double-buffered (cache, 2, nheads, T) fp32 — T contiguous
-    old_dt = torch.randn(batch, 2, nheads, mtp_len, device=device, dtype=torch.float32)
-    # old_dA_cumsum: double-buffered (cache, 2, nheads, T) fp32 — T contiguous
-    old_dA_cumsum = torch.randn(batch, 2, nheads, mtp_len, device=device, dtype=torch.float32)
+    # max_window is the cache T-axis capacity; defaults to mtp_len (the
+    # placeholder/degenerate case where every step is a checkpoint step).
+    # For real replay-style checkpointing, max_window > mtp_len.
+    cache_T = max_window if max_window is not None else mtp_len
+    # old_x: single-buffered (cache, max_window, nheads, dim)
+    old_x = torch.randn(batch, cache_T, nheads, head_dim, device=device, dtype=act_dtype)
+    # old_B: double-buffered (cache, 2, max_window, ngroups, dstate)
+    old_B = torch.randn(batch, 2, cache_T, ngroups, d_state, device=device, dtype=act_dtype)
+    # old_dt: double-buffered (cache, 2, nheads, max_window) fp32 — T contiguous
+    old_dt = torch.randn(batch, 2, nheads, cache_T, device=device, dtype=torch.float32)
+    # old_dA_cumsum: double-buffered (cache, 2, nheads, max_window) fp32 — T contiguous
+    old_dA_cumsum = torch.randn(batch, 2, nheads, cache_T, device=device, dtype=torch.float32)
     # cache_buf_idx: which buffer to read (0 or 1)
     cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
 
@@ -438,8 +464,8 @@ def _time_kernel(args, run_fn, reset_fn, tag: str) -> tuple[float, float, float]
 # Per-config benchmark (consolidated baseline + replay)
 
 
-def _parallel_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtypes,
-                           baseline_fn, max_workers: int) -> None:
+def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtypes,
+                          baseline_fn, max_workers: int) -> None:
     """Run each config once in parallel to compile + cache Triton kernels.
 
     Triton's ``compile()`` releases the GIL, so a ThreadPoolExecutor
@@ -456,14 +482,12 @@ def _parallel_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dty
     configs = []
     for batch in batch_sizes:
         for mtp_len in mtp_lengths:
-            prev_ks = sorted(
-                set(min(mtp_len, max(0, round(f * mtp_len))) for f in args.prev_tokens_fracs)
-            )
+            prev_ks = _resolve_prev_ks(args, mtp_len)
             for state_dtype in state_dtypes:
                 for act_dtype in act_dtypes:
                     configs.append((batch, mtp_len, prev_ks, state_dtype, act_dtype))
 
-    print(f"[parallel-warmup] {len(configs)} configs across {max_workers} threads")
+    print(f"[compile-warmup] {len(configs)} configs across {max_workers} threads")
     t0 = time.perf_counter()
 
     def _warm(cfg):
@@ -484,11 +508,11 @@ def _parallel_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dty
 
     if errors:
         for cfg, e in errors:
-            print(f"[parallel-warmup] FAILED config {cfg}: {type(e).__name__}: {e}",
+            print(f"[compile-warmup] FAILED config {cfg}: {type(e).__name__}: {e}",
                   file=sys.stderr)
         raise errors[0][1]
 
-    print(f"[parallel-warmup] done in {time.perf_counter() - t0:.1f}s")
+    print(f"[compile-warmup] done in {time.perf_counter() - t0:.1f}s")
 
 
 def _bench_config(
@@ -549,6 +573,7 @@ def _bench_config(
         args.head_dim,
         args.d_state,
         args.tp_ngroups,
+        max_window=getattr(args, "max_window", None) or None,
     )
 
     nheads = args.tp_nheads
@@ -754,6 +779,10 @@ def _bench_config(
                 else:
                     x_call, B_call, C_call = x, B, C
                     extra_kwargs = {}
+                # write_checkpoint is only meaningful for the checkpointing
+                # variant; replay variant ignores the kwarg.
+                if args.variant == "checkpointing":
+                    extra_kwargs["write_checkpoint"] = args.write_checkpoint
                 variant_fn(
                     state_work,
                     old_x_work,
@@ -880,10 +909,10 @@ def _run_benchmark(args) -> None:
     elif args.l2_flush:
         _init_l2_flush()
 
-    if args.parallel_warmup > 0:
-        _parallel_warmup_phase(
+    if args.compile_threads > 0:
+        _compile_warmup_phase(
             args, batch_sizes, mtp_lengths, state_dtypes, act_dtypes,
-            baseline_fn, max_workers=args.parallel_warmup,
+            baseline_fn, max_workers=args.compile_threads,
         )
 
     if args.profile:
@@ -913,9 +942,7 @@ def _run_benchmark(args) -> None:
     for batch in batch_sizes:
         for mtp_len in mtp_lengths:
             # Resolve prev_k fractions → clamped integers in [0, mtp_len]
-            prev_ks = sorted(
-                set(min(mtp_len, max(0, round(f * mtp_len))) for f in args.prev_tokens_fracs)
-            )
+            prev_ks = _resolve_prev_ks(args, mtp_len)
             for state_dtype in state_dtypes:
                 for act_dtype in act_dtypes:
                     _bench_config(
@@ -977,14 +1004,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=20, help="Number of warmup iterations")
     parser.add_argument("--iters", type=int, default=100, help="Number of timed iterations")
     parser.add_argument(
-        "--parallel-warmup",
+        "--compile-threads",
         type=int,
-        default=0,
-        help="Run a parallel-warmup phase that calls each (batch, mtp_len, "
-        "prev_k, dtype, sweep) config once across N threads before the "
-        "sequential timed phase.  Triton compile releases the GIL so threads "
-        "compile in parallel, populating the persistent cache for free hits "
-        "during measurement.  0 disables the phase.  Try 8 on a multi-core box.",
+        default=64,
+        help="Number of THREADS used in the compile-warmup phase (one call "
+        "per (batch, mtp_len, prev_k, dtype, sweep) cell, parallelized over "
+        "N threads).  Triton compile releases the GIL, so threads compile "
+        "in parallel and populate the persistent cache for free hits during "
+        "the sequential timed phase.  0 disables the phase.  Default 64.",
     )
     parser.add_argument(
         "--profile",
@@ -1065,6 +1092,32 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Override num_stages for precompute kernel (comma-separated sweep).",
+    )
+    parser.add_argument(
+        "--max-window",
+        type=int,
+        default=0,
+        help="Cache T-axis capacity (max replay buffer length).  0 (default) "
+        "= use mtp_len, the placeholder/degenerate every-step-checkpoint "
+        "case.  Set to e.g. 16 for real replay-style checkpointing on "
+        "Nemotron-3-Super-120B.",
+    )
+    parser.add_argument(
+        "--prev-tokens-int",
+        type=lambda s: [int(x) for x in s.split(",")] if s else None,
+        default=None,
+        help="Absolute prev_num_accepted_tokens values to test, comma-separated "
+        "(e.g. '0,10,11,16').  Clamped to [0, max_window].  When set, "
+        "overrides --prev-tokens-fracs.",
+    )
+    parser.add_argument(
+        "--write-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether the checkpointing kernel should write the post-replay "
+        "state to HBM.  True = checkpoint step (default).  False = "
+        "non-checkpoint step (skip state HBM write + Philox).  No effect on "
+        "the replay variant.",
     )
     parser.add_argument(
         "--with-conv1d",
