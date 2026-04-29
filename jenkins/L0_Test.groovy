@@ -1873,12 +1873,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     kubernetes.io/os: linux
                     nvidia.com/gpu.machine: NVIDIA_DGX_Spark
                     nvidia.com/tenant: blossom_trt"""
-            } else if (type.contains("dgx-h100")) {
-                selectors = """
-                    kubernetes.io/arch: ${arch}
-                    kubernetes.io/os: linux
-                    kubernetes.io/hostname: viking-prod-208.ipp2u1.colossus
-                    nvidia.com/gpu_type: ${gpuType}"""
             } else {
                 selectors = """
                     kubernetes.io/arch: ${arch}
@@ -1984,6 +1978,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                         requiredDuringSchedulingIgnoredDuringExecution:
                             nodeSelectorTerms:
                             - matchExpressions:
+                              - key: "tensorrt/taints"
+                                operator: DoesNotExist
                               - key: "tensorrt/affinity"
                                 operator: NotIn
                                 values:
