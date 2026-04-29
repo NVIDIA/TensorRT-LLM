@@ -340,7 +340,7 @@ def main():
             extra_params["boundary_ratio"] = args.boundary_ratio
 
         output = visual_gen.generate(
-            inputs={"prompt": args.prompt},
+            inputs=args.prompt,
             params=VisualGenParams(
                 height=args.height,
                 width=args.width,

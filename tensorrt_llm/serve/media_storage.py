@@ -604,6 +604,7 @@ class MediaStorage:
         output: Any,  # Can be path string or BytesIO
         format: str,
         quality: int,
+        png_compress_level: int = 1,
     ):
         """Save PIL Image to file or buffer.
 
@@ -612,6 +613,8 @@ class MediaStorage:
             output: Output path (str) or BytesIO buffer
             format: Image format (PNG, JPEG, WEBP)
             quality: Quality for lossy formats (1-100)
+            png_compress_level: PNG compression level (0-9, lower is faster).
+                Default 1 for fast encoding; PNG is lossless at all levels.
         """
         format_upper = format.upper()
 
@@ -629,7 +632,7 @@ class MediaStorage:
         elif format_upper == "WEBP":
             pil_image.save(output, format="WEBP", quality=quality)
         else:  # PNG or default
-            pil_image.save(output, format="PNG", optimize=True)
+            pil_image.save(output, format="PNG", compress_level=png_compress_level)
 
     @staticmethod
     def save_video(
