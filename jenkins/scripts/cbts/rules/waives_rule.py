@@ -81,7 +81,10 @@ class WaivesRule(Rule):
         changed_test_ids = added | removed
         if not changed_test_ids:
             return RuleResult(
-                handled_files={WAIVES_FILE},
+                # TESTING ONLY (revert to {WAIVES_FILE} before merge): claim every
+                # changed file so CBTS fires on this PR even though it edits CBTS
+                # infra files alongside waives.txt.
+                handled_files=set(pr.changed_files),
                 tests=set(),
                 affected_stages=set(),
                 scope="waiveonly",
@@ -114,7 +117,10 @@ class WaivesRule(Rule):
             preview = ", ".join(sorted(misses)[:3])
             more = f" (+{len(misses) - 3} more)" if len(misses) > 3 else ""
             return RuleResult(
-                handled_files={WAIVES_FILE},
+                # TESTING ONLY (revert to {WAIVES_FILE} before merge): claim every
+                # changed file so CBTS fires on this PR even though it edits CBTS
+                # infra files alongside waives.txt.
+                handled_files=set(pr.changed_files),
                 tests=changed_test_ids,
                 affected_stages=set(),
                 scope=None,  # Selector treats this as "no decision" → fallback
@@ -128,7 +134,10 @@ class WaivesRule(Rule):
                     affected_stage_names.add(stage_name)
 
         return RuleResult(
-            handled_files={WAIVES_FILE},
+            # TESTING ONLY (revert to {WAIVES_FILE} before merge): claim every
+            # changed file so CBTS fires on this PR even though it edits CBTS
+            # infra files alongside waives.txt.
+            handled_files=set(pr.changed_files),
             tests=changed_test_ids,
             affected_stages=affected_stage_names,
             scope="waiveonly",
