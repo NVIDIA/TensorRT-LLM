@@ -114,11 +114,13 @@ def _import_mamba_kernels_fast():
     _load("softplus", "softplus.py")
     # 3. The actual kernels
     replay_mod = _load("replay_selective_state_update", "replay_selective_state_update.py")
+    checkpoint_mod = _load("checkpointing_state_update", "checkpointing_state_update.py")
     base_mod = _load("selective_state_update", "selective_state_update.py")
     conv1d_mod = _load("causal_conv1d_triton", "causal_conv1d_triton.py")
 
     return (
         replay_mod.replay_selective_state_update,
+        checkpoint_mod.checkpointing_state_update,
         base_mod.selective_state_update,
         conv1d_mod.causal_conv1d_update,
     )
@@ -127,25 +129,39 @@ def _import_mamba_kernels_fast():
 def _import_mamba_kernels_full():
     """Import via the standard tensorrt_llm package (slow but safe)."""
     from tensorrt_llm._torch.modules.mamba.causal_conv1d_triton import causal_conv1d_update
+    from tensorrt_llm._torch.modules.mamba.checkpointing_state_update import (
+        checkpointing_state_update,
+    )
     from tensorrt_llm._torch.modules.mamba.replay_selective_state_update import (
         replay_selective_state_update,
     )
     from tensorrt_llm._torch.modules.mamba.selective_state_update import selective_state_update
 
-    return replay_selective_state_update, selective_state_update, causal_conv1d_update
+    return (
+        replay_selective_state_update,
+        checkpointing_state_update,
+        selective_state_update,
+        causal_conv1d_update,
+    )
 
 
 # Use fast import by default; --full-import parsed later but we need the
 # functions at module level.  Check sys.argv early.
 if "--full-import" in sys.argv:
-    replay_selective_state_update, selective_state_update, causal_conv1d_update = (
-        _import_mamba_kernels_full()
-    )
+    (
+        replay_selective_state_update,
+        checkpointing_state_update,
+        selective_state_update,
+        causal_conv1d_update,
+    ) = _import_mamba_kernels_full()
 else:
     try:
-        replay_selective_state_update, selective_state_update, causal_conv1d_update = (
-            _import_mamba_kernels_fast()
-        )
+        (
+            replay_selective_state_update,
+            checkpointing_state_update,
+            selective_state_update,
+            causal_conv1d_update,
+        ) = _import_mamba_kernels_fast()
     except Exception as e:  # noqa: BLE001 - exit loudly; don't hide a fast-import regression
         print(
             f"ERROR: fast import failed ({type(e).__name__}: {e})\n"
@@ -154,6 +170,12 @@ else:
             file=sys.stderr,
         )
         sys.exit(1)
+
+
+_VARIANT_FNS = {
+    "replay": lambda: replay_selective_state_update,
+    "checkpointing": lambda: checkpointing_state_update,
+}
 
 # Model config defaults (Nemotron-3-Super-120B full model).
 # --tp-size divides nheads and ngroups to get the per-GPU slice.
@@ -535,6 +557,7 @@ def _bench_config(
     d_state = args.d_state
     with_conv1d = getattr(args, "with_conv1d", False)
     use_philox = getattr(args, "philox_rounding", False)
+    variant_fn = _VARIANT_FNS[args.variant]()
 
     # Philox rounding: allocate rand_seed tensor
     rand_seed = None
@@ -731,7 +754,7 @@ def _bench_config(
                 else:
                     x_call, B_call, C_call = x, B, C
                     extra_kwargs = {}
-                replay_selective_state_update(
+                variant_fn(
                     state_work,
                     old_x_work,
                     old_B_work,
@@ -786,7 +809,7 @@ def _bench_config(
 
                 _print_row(
                     show_kernel_col,
-                    "replay",
+                    args.variant,
                     batch,
                     mtp_len,
                     prev_k,
@@ -1068,6 +1091,14 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable Philox stochastic rounding for fp16 state "
         "(rand_seed generated per iteration, philox_rounds=10).",
+    )
+    parser.add_argument(
+        "--variant",
+        choices=["replay", "checkpointing"],
+        default="replay",
+        help="Which kernel to time as the 'replay' row.  'replay' = today's "
+        "kernel (selective_state_update.py:replay).  'checkpointing' = "
+        "checkpointing_state_update.py.  Both share the same wrapper signature.",
     )
     parser.add_argument(
         "--full-import",
