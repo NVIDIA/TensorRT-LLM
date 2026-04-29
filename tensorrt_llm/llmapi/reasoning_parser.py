@@ -95,6 +95,19 @@ class BaseReasoningParser(ABC):
         return ReasoningParserResult()
 
 
+class IdentityReasoningParser(BaseReasoningParser):
+    """Reasoning parser that treats all model output as visible content."""
+
+    reasoning_start = "<think>"
+    reasoning_end = "</think>"
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        return ReasoningParserResult(content=text)
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        return ReasoningParserResult(content=delta_text)
+
+
 @register_reasoning_parser("deepseek-r1", reasoning_at_start=True)
 @register_reasoning_parser("laguna")
 @register_reasoning_parser("qwen3")
@@ -198,6 +211,42 @@ class DeepSeekR1Parser(BaseReasoningParser):
             "Unreachable code reached in `DeepSeekR1Parser.parse_delta`")
 
 
+@register_reasoning_parser("deepseek_v4")
+class DeepSeekV4ReasoningParser(BaseReasoningParser):
+    """DeepSeek-V4 parser selected by thinking-mode chat template kwargs."""
+
+    reasoning_start = "<think>"
+    reasoning_end = "</think>"
+
+    def __init__(
+        self,
+        *,
+        chat_template_kwargs: Optional[dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(chat_template_kwargs=chat_template_kwargs)
+        chat_template_kwargs = chat_template_kwargs or {}
+        thinking = bool(
+            chat_template_kwargs.get("thinking", False)
+            or chat_template_kwargs.get("enable_thinking", False))
+        if thinking:
+            self._parser = DeepSeekR1Parser(
+                reasoning_at_start=True,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+        else:
+            self._parser = IdentityReasoningParser(
+                chat_template_kwargs=chat_template_kwargs)
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        return self._parser.parse(text)
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        return self._parser.parse_delta(delta_text)
+
+    def finish(self) -> ReasoningParserResult:
+        return self._parser.finish()
+
+
 MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "qwen3": "qwen3",
     "qwen3_moe": "qwen3",
@@ -206,6 +255,7 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "qwen3_next": "qwen3",
     "deepseek_v3": "deepseek-r1",
     "deepseek_v32": "deepseek-r1",
+    "deepseek_v4": "deepseek_v4",
     "laguna": "laguna",
     "nemotron_h": "nemotron-v3",
     "nemotron_h_puzzle": "nemotron-v3",

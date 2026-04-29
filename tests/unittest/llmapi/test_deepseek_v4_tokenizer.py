@@ -69,6 +69,326 @@ def test_deepseek_v4_chat_template_tokenize_uses_rendered_prompt():
     )
 
 
+def test_deepseek_v4_chat_template_supports_thinking_mode():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": "hello",
+            }
+        ],
+        tokenize=False,
+        enable_thinking=True,
+    )
+
+    assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>hello<｜Assistant｜><think>")
+
+
+def test_deepseek_v4_chat_template_supports_thinking_alias():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": "hello",
+            }
+        ],
+        tokenize=False,
+        thinking=True,
+    )
+
+    assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>hello<｜Assistant｜><think>")
+
+
+def test_deepseek_v4_chat_template_matches_vllm_add_generation_prompt_behavior():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": "hello",
+            }
+        ],
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+
+    assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>hello<｜Assistant｜></think>")
+
+
+def test_deepseek_v4_chat_template_accepts_openai_reasoning_effort_values():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+
+    for reasoning_effort in ("none", "low", "medium", "high"):
+        prompt = tokenizer.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": "hello",
+                }
+            ],
+            tokenize=False,
+            enable_thinking=True,
+            reasoning_effort=reasoning_effort,
+        )
+
+        assert prompt.endswith("<｜Assistant｜><think>")
+        assert "Reasoning Effort: Absolute maximum" not in prompt
+
+
+def test_deepseek_v4_chat_template_preserves_reference_max_reasoning_effort():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": "hello",
+            }
+        ],
+        tokenize=False,
+        enable_thinking=True,
+        reasoning_effort="max",
+    )
+
+    assert prompt.startswith("<｜begin▁of▁sentence｜>Reasoning Effort: Absolute maximum")
+    assert prompt.endswith("<｜User｜>hello<｜Assistant｜><think>")
+
+
+def test_deepseek_v4_chat_template_drops_historical_thinking_without_tools():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": "first",
+            },
+            {
+                "role": "assistant",
+                "reasoning": "hidden chain",
+                "content": "answer",
+            },
+            {
+                "role": "user",
+                "content": "second",
+            },
+        ],
+        tokenize=False,
+        enable_thinking=True,
+    )
+
+    assert "hidden chain" not in prompt
+    assert "answer<｜end▁of▁sentence｜>" in prompt
+    assert prompt.endswith("<｜User｜>second<｜Assistant｜><think>")
+
+
+def test_deepseek_v4_chat_template_keeps_historical_thinking_with_tools():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+
+    prompt = tokenizer.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": "first",
+            },
+            {
+                "role": "assistant",
+                "reasoning": "kept chain",
+                "content": "answer",
+            },
+            {
+                "role": "user",
+                "content": "second",
+            },
+        ],
+        tools=tools,
+        tokenize=False,
+        enable_thinking=True,
+    )
+
+    assert "kept chain</think>answer<｜end▁of▁sentence｜>" in prompt
+    assert prompt.endswith("<｜User｜>second<｜Assistant｜><think>")
+
+
+def test_deepseek_v4_chat_template_renders_developer_tools_and_latest_reminder():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+    messages = [
+        {
+            "role": "system",
+            "content": "sys",
+        },
+        {
+            "role": "latest_reminder",
+            "content": "today",
+        },
+        {
+            "role": "developer",
+            "content": "dev",
+            "tools": tools,
+        },
+        {
+            "role": "assistant",
+            "reasoning": "need search",
+            "content": "",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search",
+                        "arguments": '{"query": "x"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": "[0]",
+        },
+    ]
+
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        enable_thinking=True,
+    )
+
+    assert prompt.startswith("<｜begin▁of▁sentence｜>sys<｜latest_reminder｜>today<｜User｜>dev")
+    assert "## Tools" in prompt
+    assert '<｜DSML｜invoke name="search">' in prompt
+    assert "need search</think>" in prompt
+    assert "<｜User｜><tool_result>[0]</tool_result><｜Assistant｜><think>" in prompt
+
+
+def test_deepseek_v4_chat_template_renders_action_task_token():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [
+            {
+                "role": "system",
+                "content": "sys",
+            },
+            {
+                "role": "latest_reminder",
+                "content": "today",
+            },
+            {
+                "role": "user",
+                "content": "search this",
+                "task": "action",
+            },
+            {
+                "role": "assistant",
+                "content": "Search",
+            },
+        ],
+        tokenize=False,
+    )
+
+    assert prompt == (
+        "<｜begin▁of▁sentence｜>sys<｜latest_reminder｜>today"
+        "<｜User｜>search this<｜Assistant｜></think><｜action｜>"
+        "Search<｜end▁of▁sentence｜>"
+    )
+
+
+def test_deepseek_v4_chat_template_uses_v4_tool_prompt_from_request_tools():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather for a city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
+
+    prompt = tokenizer.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": "Weather?",
+            }
+        ],
+        tools=tools,
+        tokenize=False,
+    )
+
+    assert "## Tools" in prompt
+    assert "<｜DSML｜tool_calls>" in prompt
+    assert "</｜DSML｜tool_calls>" in prompt
+    assert "function_calls" not in prompt
+    assert '"name": "get_weather"' in prompt
+    assert prompt.endswith("<｜User｜>Weather?<｜Assistant｜></think>")
+
+
+def test_deepseek_v4_chat_template_renders_tool_call_history():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+    messages = [
+        {
+            "role": "user",
+            "content": "List the repo",
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "str_replace_editor",
+                        "arguments": '{"command": "view", "path": "/testbed"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "file list",
+        },
+    ]
+
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False)
+
+    assert '<｜DSML｜invoke name="str_replace_editor">' in prompt
+    assert '<｜DSML｜parameter name="command" string="true">view' in prompt
+    assert '<｜DSML｜parameter name="path" string="true">/testbed' in prompt
+    assert "<｜User｜><tool_result>file list</tool_result><｜Assistant｜></think>" in prompt
+    assert 'parameter name="arguments"' not in prompt
+
+
 def test_deepseek_v4_custom_tokenizer_reuses_loaded_wrapper():
     tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
 
@@ -95,3 +415,35 @@ def test_deepseek_v4_server_chat_template_path_uses_custom_tokenizer():
     )
 
     assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>hello<｜Assistant｜></think>")
+
+
+def test_deepseek_v4_server_chat_template_path_forwards_tools():
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+
+    prompt = apply_chat_template(
+        model_type="deepseek_v4",
+        tokenizer=tokenizer,
+        processor=None,
+        conversation=[
+            {
+                "role": "user",
+                "content": "hello",
+            }
+        ],
+        add_generation_prompt=True,
+        mm_placeholder_counts=[{}],
+        tools=tools,
+    )
+
+    assert "<｜DSML｜tool_calls>" in prompt
+    assert '"name": "search"' in prompt
