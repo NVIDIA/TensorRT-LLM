@@ -129,6 +129,11 @@ public:
     int tokensPerBlock() const noexcept;
     bool enablePartialMatch() const noexcept;
 
+    int ssmReuseInterval() const noexcept
+    {
+        return mConfig.ssmReuseInterval;
+    }
+
     bool allowSeqRebasing() const noexcept
     {
         return true;

@@ -297,34 +297,36 @@ void Block::unsetPage(LifeCycleId lcIdx, LifeCycle const& lc)
     storage[static_cast<size_t>(lcIdx)].reset();
 
     // Reuse cleanup only applies to attention lifecycles.
-    assert(std::holds_alternative<AttnLifeCycle>(lc) && "Reuse for SSM layers is not supported yet");
-    auto const& alc = std::get<AttnLifeCycle>(lc);
-    // If this is a non-sink block with no window (or sink block): evict descendants.
-    if (!alc.windowSize.has_value() || ordinal < alc.numSinkBlocks)
+    // SSM lifecycles are allowed in the tree but don't trigger subtree eviction.
+    if (auto const* alc = std::get_if<AttnLifeCycle>(&lc))
     {
-        // Collect and exclude all descendant pages from eviction.
-        std::vector<std::weak_ptr<Block>> stack;
-        for (auto& [k, child] : next)
-            stack.push_back(child);
-
-        while (!stack.empty())
+        // If this is a non-sink block with no window (or sink block): evict descendants.
+        if (!alc->windowSize.has_value() || ordinal < alc->numSinkBlocks)
         {
-            auto weakChild = stack.back();
-            stack.pop_back();
-            auto child = weakChild.lock();
-            if (!child)
-                continue;
-            for (auto& weakPage : child->storage)
+            // Collect and exclude all descendant pages from eviction.
+            std::vector<std::weak_ptr<Block>> stack;
+            for (auto& [k, child] : next)
+                stack.push_back(child);
+
+            while (!stack.empty())
             {
-                auto page = weakPage.lock();
-                if (page && page->status() == PageStatus::DROPPABLE && page->nodeRef.has_value())
+                auto weakChild = stack.back();
+                stack.pop_back();
+                auto child = weakChild.lock();
+                if (!child)
+                    continue;
+                for (auto& weakPage : child->storage)
                 {
-                    if (auto mgr = page->manager.lock())
-                        mgr->excludeFromEviction(*page);
+                    auto page = weakPage.lock();
+                    if (page && page->status() == PageStatus::DROPPABLE && page->nodeRef.has_value())
+                    {
+                        if (auto mgr = page->manager.lock())
+                            mgr->excludeFromEviction(*page);
+                    }
                 }
+                for (auto& [k2, grandchild] : child->next)
+                    stack.push_back(grandchild);
             }
-            for (auto& [k2, grandchild] : child->next)
-                stack.push_back(grandchild);
         }
     }
 

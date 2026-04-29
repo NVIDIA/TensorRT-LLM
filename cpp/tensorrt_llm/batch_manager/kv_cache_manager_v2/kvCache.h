@@ -324,6 +324,8 @@ private:
     // Internal helpers.
     void _setupForReuse(std::vector<TokenIdExt> const& inputTokens);
     void _clearBlocks();
+    // Snapshot live SSM state to a new page and attach to radix tree block.
+    void _snapshotSsmToTreeBlock(std::shared_ptr<Block> const& treeBlock, LifeCycleId ssmLcId, BeamIndex beamIdx);
     // Returns [stale_begin, stale_end) block ordinal range for a SWA lifecycle.
     HalfOpenRange _getStaleRange(int historyLength, LifeCycle const& lc) const;
 
@@ -398,9 +400,9 @@ private:
     Average mAvgHistoryLength;
     Average mAvgCapacity;
 
-    // SSM pages: [beamIdx][lcId] — one slot per beam, not per block ordinal.
-    // Allocated once on first _increaseCapacity, cleared on close().
-    std::optional<std::vector<std::vector<BlockPage>>> mSsmBlocks;
+    // SSM pages: [beamIdx][lcId] — always initialized (empty entries = monostate).
+    std::vector<std::vector<BlockPage>> mSsmBlocks;
+    bool mNeverResumed = true;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

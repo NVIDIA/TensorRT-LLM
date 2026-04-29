@@ -140,7 +140,7 @@ UncommittedPage::~UncommittedPage()
     // Delegate to Page::~Page().
 }
 
-std::shared_ptr<CommittedPage> UncommittedPage::convertToCommitted(std::shared_ptr<Block> blk)
+std::shared_ptr<CommittedPage> UncommittedPage::convertToCommitted(std::shared_ptr<Block> blk, CachedCudaEvent readyEv)
 {
     assert(!scheduledForEviction());
     assert(blk->storage.at(static_cast<size_t>(lifeCycle)).expired()
@@ -150,12 +150,17 @@ std::shared_ptr<CommittedPage> UncommittedPage::convertToCommitted(std::shared_p
     auto mgr = manager.lock();
     assert(mgr);
 
+    // Set the ready event before transfer (matches Python: self.ready_event = ready_event).
+    this->readyEvent = std::move(readyEv);
+
     auto committed = std::make_shared<CommittedPage>(mgr, blk, lifeCycle, cacheLevel, priority);
     // Move slot id to the committed page; invalidate our slot.
     committed->setSlotId(slotId()); // asserts valid
     committed->readyEvent = std::move(readyEvent);
     resetSlot();
     readyEvent = CachedCudaEvent::makeNull();
+
+    assert(!hasValidSlot() && readyEvent.isNull());
 
     // Register in block storage.
     blk->storage.at(static_cast<size_t>(lifeCycle)) = committed;
@@ -301,6 +306,45 @@ UniqPageLock::~UniqPageLock()
     }
 }
 
+void UniqPageLock::notifyFinish(CachedCudaEvent event)
+{
+    finishEvents.push_back(std::move(event));
+    // Avoid unbounded growth for system prompt pages shared by all requests.
+    if (finishEvents.size() > 32)
+    {
+        // Merge all events into one (same pattern as destructor).
+        std::vector<CachedCudaEvent*> live;
+        for (auto& ev : finishEvents)
+        {
+            if (!ev.isClosed())
+                live.push_back(&ev);
+        }
+        CachedCudaEvent merged = CachedCudaEvent::makeNull();
+        if (live.empty())
+        {
+            // already null
+        }
+        else if (live.size() == 1)
+        {
+            merged = std::move(*live[0]);
+        }
+        else
+        {
+            std::vector<CachedCudaEvent const*> priors;
+            priors.reserve(live.size());
+            for (auto* ev : live)
+                priors.push_back(ev);
+            TemporaryCudaStream tempStream(priors);
+            {
+                auto scope = tempStream.enter();
+            }
+            merged = tempStream.takeFinishEvent();
+        }
+        finishEvents.clear();
+        finishEvents.push_back(std::move(merged));
+    }
+}
+
 std::shared_ptr<Page> const& UniqPageLock::page() const
 {
     assert(holder && holder->page);
@@ -364,7 +408,7 @@ std::shared_ptr<Page> SharedPageLock::unlock()
 
     // Record finish event from the KvCache stream.
     if (auto kvc = mUser.kvCache.lock())
-        mUniqLock->finishEvents.push_back(kvc->finishEvent());
+        mUniqLock->notifyFinish(kvc->finishEvent());
 
     releasePageIndex();
     auto p = page(); // copy shared_ptr before reset

@@ -152,6 +152,18 @@ public:
         return mSsmLifeCycleId.has_value();
     }
 
+    // Return (id, AttnLifeCycle*) pairs for attention lifecycles only. Used by _setupForReuse.
+    std::vector<std::pair<LifeCycleId, AttnLifeCycle const*>> attentionLifeCycles() const
+    {
+        std::vector<std::pair<LifeCycleId, AttnLifeCycle const*>> result;
+        for (size_t i = 0; i < mLifeCycleList.size(); ++i)
+        {
+            if (auto const* attn = std::get_if<AttnLifeCycle>(&mLifeCycleList[i]))
+                result.emplace_back(static_cast<LifeCycleId>(i), attn);
+        }
+        return result;
+    }
+
     // Iterate: (id, lifecycle) pairs — all entries.
     struct Item
     {

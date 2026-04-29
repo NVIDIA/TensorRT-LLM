@@ -1656,11 +1656,13 @@ class TestSSMSupport(unittest.TestCase):
     def test_ssm_reuse_config_validation(self) -> None:
         """Invalid ssm_reuse_interval raises assertion."""
         # Not divisible by tokens_per_block
-        with self.assertRaises(AssertionError):
-            self._make_ssm_config(tokens_per_block=32, ssm_reuse_interval=50)
+        with self.assertRaises((AssertionError, ValueError)):
+            cfg = self._make_ssm_config(tokens_per_block=32, ssm_reuse_interval=50)
+            KVCacheManager(cfg)
         # Zero interval
-        with self.assertRaises(AssertionError):
-            self._make_ssm_config(tokens_per_block=32, ssm_reuse_interval=0)
+        with self.assertRaises((AssertionError, ValueError)):
+            cfg = self._make_ssm_config(tokens_per_block=32, ssm_reuse_interval=0)
+            KVCacheManager(cfg)
 
 
 class TestInitRatioConfig(unittest.TestCase):

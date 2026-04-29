@@ -247,8 +247,12 @@ struct KVCacheManagerConfig
     bool enablePartialReuse = true;
 
     // Constraint-based memory partitioning.
-    std::vector<BatchDesc> constraints;     // batches that must always be supportable
-    std::optional<BatchDesc> typicalStep;   // typical step for initial ratio computation
+    std::vector<BatchDesc> constraints;   // batches that must always be supportable
+    std::optional<BatchDesc> typicalStep; // typical step for initial ratio computation
+
+    // Interval (in tokens) at which SSM state is snapshotted for prefix reuse.
+    // Must be a positive multiple of tokensPerBlock. Only takes effect when SSM layers are present.
+    int ssmReuseInterval = 512;
 
     std::optional<HelixConfig> helixConfig; // unsupported yet
 

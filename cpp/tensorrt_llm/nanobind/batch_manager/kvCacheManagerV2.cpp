@@ -182,7 +182,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::KVCacheManagerConfig* cfg, int tokensPerBlock, int vocabSize,
                 std::vector<kv::CacheTierConfig> cacheTiers, nb::list layers, float maxUtilForResume,
                 bool enablePartialReuse, std::optional<kv::BatchDesc> typicalStep,
-                std::vector<kv::BatchDesc> constraints)
+                std::vector<kv::BatchDesc> constraints, int ssmReuseInterval)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -200,10 +200,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->enablePartialReuse = enablePartialReuse;
                 cfg->typicalStep = std::move(typicalStep);
                 cfg->constraints = std::move(constraints);
+                cfg->ssmReuseInterval = ssmReuseInterval;
             },
             nb::arg("tokens_per_block"), nb::arg("vocab_size"), nb::arg("cache_tiers"), nb::arg("layers"),
             nb::arg("max_util_for_resume") = 0.97f, nb::arg("enable_partial_reuse") = true,
-            nb::arg("typical_step") = std::nullopt, nb::arg("constraints") = std::vector<kv::BatchDesc>{})
+            nb::arg("typical_step") = std::nullopt, nb::arg("constraints") = std::vector<kv::BatchDesc>{},
+            nb::arg("ssm_reuse_interval") = 512)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("vocab_size", &kv::KVCacheManagerConfig::vocabSize)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
@@ -212,6 +214,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("enable_partial_reuse", &kv::KVCacheManagerConfig::enablePartialReuse)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
+        .def_rw("ssm_reuse_interval", &kv::KVCacheManagerConfig::ssmReuseInterval)
         .def("validate", &kv::KVCacheManagerConfig::validate) DEF_COPY(kv::KVCacheManagerConfig);
 
 #undef DEF_COPY
@@ -407,6 +410,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("get_quota", &kv::KvCacheManager::getQuota, nb::arg("cache_level"))
         .def_prop_ro("tokens_per_block", &kv::KvCacheManager::tokensPerBlock)
         .def_prop_ro("enable_partial_match", &kv::KvCacheManager::enablePartialMatch)
+        .def_prop_ro("ssm_reuse_interval", &kv::KvCacheManager::ssmReuseInterval)
         .def_prop_ro("num_layers", &kv::KvCacheManager::numLayers)
         .def_prop_ro("layer_ids", &kv::KvCacheManager::layerIds)
         .def_prop_ro("layer_grouping", &kv::KvCacheManager::layerGrouping)
