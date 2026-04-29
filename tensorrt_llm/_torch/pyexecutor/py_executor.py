@@ -1871,25 +1871,30 @@ class PyExecutor:
             # release their KV cache.
             if (self.benchmark_req_queues_size > 0 and not self.is_warmup
                     and not fitting_disagg_gen_init_requests):
-                stuck_init_requests = [
-                    req for req in self.active_requests
-                    if req.is_disagg_generation_init_state
-                ]
-                # Only fail once all benchmark requests have been fetched
-                # so that _handle_errors covers every request and every
-                # client receives an error response.
-                if (stuck_init_requests and self.num_fetch_requests
-                        >= self.benchmark_req_queues_size):
+                local_ready_gen = sum(
+                    1 for req in self.active_requests if req.state in (
+                        LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
+                        LlmRequestState.GENERATION_IN_PROGRESS,
+                    ))
+                now = time.time()
+                last_count = getattr(self, "_bench_disagg_last_gen_count", None)
+                last_change_time = getattr(self,
+                                           "_bench_disagg_last_gen_count_time",
+                                           None)
+                if last_count != local_ready_gen or last_change_time is None:
+                    self._bench_disagg_last_gen_count = local_ready_gen
+                    self._bench_disagg_last_gen_count_time = now
+                elif now - last_change_time > 60.0:
                     error_msg = (
-                        f"Insufficient KV cache for gen-only benchmark mode: "
-                        f"{len(stuck_init_requests)} request(s) are waiting for "
-                        f"KV cache allocation but the scheduler could not fit "
-                        f"any of them. Increase free_gpu_memory_fraction or "
-                        f"reduce TLLM_BENCHMARK_REQ_QUEUES_SIZE (currently "
-                        f"{self.benchmark_req_queues_size}).")
+                        f"Benchmark gen request count stalled at "
+                        f"{local_ready_gen} "
+                        f"for {now - last_change_time:.0f}s "
+                        f"(target {self.benchmark_req_queues_size}, "
+                        f"fetched={self.num_fetch_requests}). "
+                        f"Likely causes: KV transfer stuck, KV cache pool "
+                        f"too small, or transceiver deadlock. Aborting all "
+                        f"active requests.")
                     logger.error(error_msg)
-                    # Fail all active and waiting requests so every
-                    # client receives an error instead of hanging.
                     self._handle_errors(error_msg,
                                         requests=self.active_requests)
                     return None, None
@@ -2014,6 +2019,10 @@ class PyExecutor:
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
                     scheduled_batch, can_forward)
                 if should_retry:
+                    if self._scheduler_manages_kv_suspend:
+                        for req in scheduled_batch.generation_requests:
+                            self.kv_cache_manager.revert_allocate_generation(
+                                req)
                     continue
 
                 if not self._scheduler_manages_kv_suspend:
@@ -2265,6 +2274,10 @@ class PyExecutor:
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
                     scheduled_batch, can_forward)
                 if should_retry:
+                    if self._scheduler_manages_kv_suspend:
+                        for req in scheduled_batch.generation_requests:
+                            self.kv_cache_manager.revert_allocate_generation(
+                                req)
                     continue
 
                 if not self._scheduler_manages_kv_suspend:
