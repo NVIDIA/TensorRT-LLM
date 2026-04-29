@@ -31,84 +31,38 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
 // ---------------------------------------------------------------------------
-// Helpers: convert Address variant to typed pointers for copy functions.
+// dispatchCopy<DstTier, SrcTier> — template that maps CacheTier pair to
+// address types and the underlying copy function via if-constexpr.
+// Replaces 7 near-identical static dispatcher functions.
 // ---------------------------------------------------------------------------
 
-static MemAddress asMemAddress(Address const& a)
-{
-    return std::get<MemAddress>(a);
-}
+template <CacheTier Tier>
+using TierAddr = std::conditional_t<Tier == CacheTier::DISK, DiskAddress, MemAddress>;
 
-static DiskAddress asDiskAddress(Address const& a)
+template <CacheTier DstTier, CacheTier SrcTier>
+void dispatchCopy(std::vector<CopyTask> const& tasks, size_t numBytes, CUstream stream)
 {
-    return std::get<DiskAddress>(a);
-}
+    using DstAddr = TierAddr<DstTier>;
+    using SrcAddr = TierAddr<SrcTier>;
 
-// ---------------------------------------------------------------------------
-// Single-hop copy dispatchers — map to existing copy functions.
-// ---------------------------------------------------------------------------
-
-static void copyGpuToGpu(std::vector<CopyTask> const& tasks, size_t numBytes, CUstream stream)
-{
-    std::vector<Task<MemAddress, MemAddress>> t;
+    std::vector<Task<DstAddr, SrcAddr>> t;
     t.reserve(tasks.size());
     for (auto const& task : tasks)
-        t.push_back({asMemAddress(task.dst), asMemAddress(task.src)});
-    cuCheck(copyDeviceToDevice(t, static_cast<ssize_t>(numBytes), stream));
-}
+        t.push_back({std::get<DstAddr>(task.dst), std::get<SrcAddr>(task.src)});
 
-static void copyHostToHost(std::vector<CopyTask> const& tasks, size_t numBytes, CUstream stream)
-{
-    std::vector<Task<MemAddress, MemAddress>> t;
-    t.reserve(tasks.size());
-    for (auto const& task : tasks)
-        t.push_back({asMemAddress(task.dst), asMemAddress(task.src)});
-    cuCheck(copyHostToHost(t, static_cast<ssize_t>(numBytes), stream));
-}
+    constexpr auto G = CacheTier::GPU_MEM;
+    constexpr auto H = CacheTier::HOST_MEM;
+    constexpr auto D = CacheTier::DISK;
 
-static void copyDiskToDisk(std::vector<CopyTask> const& tasks, size_t numBytes, CUstream stream)
-{
-    std::vector<Task<DiskAddress, DiskAddress>> t;
-    t.reserve(tasks.size());
-    for (auto const& task : tasks)
-        t.push_back({asDiskAddress(task.dst), asDiskAddress(task.src)});
-    cuCheck(copyDiskToDisk(t, static_cast<ssize_t>(numBytes), stream));
-}
-
-static void copyGpuToHost(std::vector<CopyTask> const& tasks, size_t numBytes, CUstream stream)
-{
-    std::vector<Task<MemAddress, MemAddress>> t;
-    t.reserve(tasks.size());
-    for (auto const& task : tasks)
-        t.push_back({asMemAddress(task.dst), asMemAddress(task.src)});
-    cuCheck(copyDeviceToHost(t, static_cast<ssize_t>(numBytes), stream));
-}
-
-static void copyHostToGpu(std::vector<CopyTask> const& tasks, size_t numBytes, CUstream stream)
-{
-    std::vector<Task<MemAddress, MemAddress>> t;
-    t.reserve(tasks.size());
-    for (auto const& task : tasks)
-        t.push_back({asMemAddress(task.dst), asMemAddress(task.src)});
-    cuCheck(copyHostToDevice(t, static_cast<ssize_t>(numBytes), stream));
-}
-
-static void copyDiskToHost(std::vector<CopyTask> const& tasks, size_t numBytes, CUstream stream)
-{
-    std::vector<Task<MemAddress, DiskAddress>> t;
-    t.reserve(tasks.size());
-    for (auto const& task : tasks)
-        t.push_back({asMemAddress(task.dst), asDiskAddress(task.src)});
-    cuCheck(copyDiskToHost(t, static_cast<ssize_t>(numBytes), stream));
-}
-
-static void copyHostToDisk(std::vector<CopyTask> const& tasks, size_t numBytes, CUstream stream)
-{
-    std::vector<Task<DiskAddress, MemAddress>> t;
-    t.reserve(tasks.size());
-    for (auto const& task : tasks)
-        t.push_back({asDiskAddress(task.dst), asMemAddress(task.src)});
-    cuCheck(copyHostToDisk(t, static_cast<ssize_t>(numBytes), stream));
+    // clang-format off
+    if constexpr      (DstTier == G && SrcTier == G) cuCheck(copyDeviceToDevice(std::move(t), static_cast<ssize_t>(numBytes), stream));
+    else if constexpr (DstTier == G && SrcTier == H) cuCheck(copyHostToDevice(std::move(t), static_cast<ssize_t>(numBytes), stream));
+    else if constexpr (DstTier == H && SrcTier == G) cuCheck(copyDeviceToHost(std::move(t), static_cast<ssize_t>(numBytes), stream));
+    else if constexpr (DstTier == H && SrcTier == H) cuCheck(copyHostToHost(std::move(t), static_cast<ssize_t>(numBytes), stream));
+    else if constexpr (DstTier == D && SrcTier == D) cuCheck(copyDiskToDisk(std::move(t), static_cast<ssize_t>(numBytes), stream));
+    else if constexpr (DstTier == H && SrcTier == D) cuCheck(copyDiskToHost(std::move(t), static_cast<ssize_t>(numBytes), stream));
+    else if constexpr (DstTier == D && SrcTier == H) cuCheck(copyHostToDisk(std::move(t), static_cast<ssize_t>(numBytes), stream));
+    // clang-format on
 }
 
 // ---------------------------------------------------------------------------
@@ -192,12 +146,10 @@ StagingBufferManager& CopyEngine::getStagingManager()
 }
 
 // Two-hop transfer via host staging buffer (e.g., GPU→Disk or Disk→GPU).
-// firstHop:  copies src → staging
-// secondHop: copies staging → dst
-using SingleHopFn = void (*)(std::vector<CopyTask> const&, size_t, CUstream);
-
-static void twoHopTransfer(StagingBufferManager& manager, SingleHopFn firstHop, SingleHopFn secondHop, size_t numBytes,
-    std::vector<CopyTask> const& tasks, CUstream stream)
+// SrcTier → MidTier (staging) → DstTier.  MidTier is the staging tier (HOST_MEM).
+template <CacheTier DstTier, CacheTier MidTier, CacheTier SrcTier>
+static void twoHopTransfer(
+    StagingBufferManager& manager, size_t numBytes, std::vector<CopyTask> const& tasks, CUstream stream)
 {
     size_t remaining = tasks.size();
     size_t offset = 0;
@@ -215,7 +167,7 @@ static void twoHopTransfer(StagingBufferManager& manager, SingleHopFn firstHop, 
             hop1.reserve(n);
             for (size_t i = 0; i < n; ++i)
                 hop1.push_back({Address{addr + numBytes * i}, tasks[offset + i].src});
-            firstHop(hop1, numBytes, buf.stream());
+            dispatchCopy<MidTier, SrcTier>(hop1, numBytes, buf.stream());
         }
 
         // Second hop: staging → dst
@@ -224,7 +176,7 @@ static void twoHopTransfer(StagingBufferManager& manager, SingleHopFn firstHop, 
             hop2.reserve(n);
             for (size_t i = 0; i < n; ++i)
                 hop2.push_back({tasks[offset + i].dst, Address{addr + numBytes * i}});
-            secondHop(hop2, numBytes, buf.stream());
+            dispatchCopy<DstTier, MidTier>(hop2, numBytes, buf.stream());
         }
 
         offset += n;
@@ -235,60 +187,30 @@ static void twoHopTransfer(StagingBufferManager& manager, SingleHopFn firstHop, 
 void CopyEngine::transfer(
     CacheTier dstTier, CacheTier srcTier, size_t numBytes, std::vector<CopyTask> tasks, CUstream stream)
 {
-    // Dispatch table: [dstTier][srcTier]
-    // CacheTier values: GPU_MEM=0, HOST_MEM=1, DISK=2
-    enum
-    {
-        GPU = 0,
-        HOST = 1,
-        DISK = 2
-    };
+    constexpr auto G = CacheTier::GPU_MEM;
+    constexpr auto H = CacheTier::HOST_MEM;
+    constexpr auto D = CacheTier::DISK;
 
-    int dst = static_cast<int>(dstTier);
-    int src = static_cast<int>(srcTier);
-
-    if (dst == GPU && src == GPU)
-    {
-        copyGpuToGpu(tasks, numBytes, stream);
-    }
-    else if (dst == GPU && src == HOST)
-    {
-        copyHostToGpu(tasks, numBytes, stream);
-    }
-    else if (dst == GPU && src == DISK)
-    {
-        // Two-hop: Disk→Host→GPU
-        twoHopTransfer(getStagingManager(), copyDiskToHost, copyHostToGpu, numBytes, tasks, stream);
-    }
-    else if (dst == HOST && src == GPU)
-    {
-        copyGpuToHost(tasks, numBytes, stream);
-    }
-    else if (dst == HOST && src == HOST)
-    {
-        copyHostToHost(tasks, numBytes, stream);
-    }
-    else if (dst == HOST && src == DISK)
-    {
-        copyDiskToHost(tasks, numBytes, stream);
-    }
-    else if (dst == DISK && src == GPU)
-    {
-        // Two-hop: GPU→Host→Disk
-        twoHopTransfer(getStagingManager(), copyGpuToHost, copyHostToDisk, numBytes, tasks, stream);
-    }
-    else if (dst == DISK && src == HOST)
-    {
-        copyHostToDisk(tasks, numBytes, stream);
-    }
-    else if (dst == DISK && src == DISK)
-    {
-        copyDiskToDisk(tasks, numBytes, stream);
-    }
+    if (dstTier == G && srcTier == G)
+        dispatchCopy<G, G>(tasks, numBytes, stream);
+    else if (dstTier == G && srcTier == H)
+        dispatchCopy<G, H>(tasks, numBytes, stream);
+    else if (dstTier == G && srcTier == D)
+        twoHopTransfer<G, H, D>(getStagingManager(), numBytes, tasks, stream);
+    else if (dstTier == H && srcTier == G)
+        dispatchCopy<H, G>(tasks, numBytes, stream);
+    else if (dstTier == H && srcTier == H)
+        dispatchCopy<H, H>(tasks, numBytes, stream);
+    else if (dstTier == H && srcTier == D)
+        dispatchCopy<H, D>(tasks, numBytes, stream);
+    else if (dstTier == D && srcTier == G)
+        twoHopTransfer<D, H, G>(getStagingManager(), numBytes, tasks, stream);
+    else if (dstTier == D && srcTier == H)
+        dispatchCopy<D, H>(tasks, numBytes, stream);
+    else if (dstTier == D && srcTier == D)
+        dispatchCopy<D, D>(tasks, numBytes, stream);
     else
-    {
         throw std::invalid_argument("CopyEngine::transfer: unsupported tier combination");
-    }
 }
 
 // ---------------------------------------------------------------------------
