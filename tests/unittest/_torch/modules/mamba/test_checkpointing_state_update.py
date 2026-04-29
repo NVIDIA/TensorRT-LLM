@@ -215,16 +215,42 @@ def test_checkpointing_state_update(
         # T<=16, ~2.0 at T=32-55; mean ~0.014; <0.02% of elements exceed 0.5.
         # State dtype (fp16/bf16/fp32) doesn't shift the error — bf16 dot
         # inputs dominate, not state storage.
-        torch.testing.assert_close(
-            test_out, ref_out, rtol=2e-2, atol=1.0, msg=f"Output mismatch at k={k}"
-        )
+        out_diff = (test_out.float() - ref_out.float()).abs()
+        out_max = out_diff.max().item()
+        out_mean = out_diff.mean().item()
+        try:
+            torch.testing.assert_close(
+                test_out, ref_out, rtol=2e-2, atol=1.0, msg=f"Output mismatch at k={k}"
+            )
+        except AssertionError:
+            print(
+                f"k={k}  out:  max={out_max:.4f}  mean={out_mean:.4f}  "
+                f"nan={torch.isnan(test_out).any().item()}  "
+                f"inf={torch.isinf(test_out).any().item()}"
+            )
+            raise
 
         expected_state = (
             state0[slots] if k == 0 else states_buffer_f32[slots, k - 1].to(state_dtype)
         )
-        torch.testing.assert_close(
-            test_state[slots], expected_state, rtol=2e-2, atol=1.0, msg=f"State mismatch at k={k}"
-        )
+        state_diff = (test_state[slots].float() - expected_state.float()).abs()
+        state_max = state_diff.max().item()
+        state_mean = state_diff.mean().item()
+        try:
+            torch.testing.assert_close(
+                test_state[slots],
+                expected_state,
+                rtol=2e-2,
+                atol=1.0,
+                msg=f"State mismatch at k={k}",
+            )
+        except AssertionError:
+            print(
+                f"k={k}  state: max={state_max:.4f}  mean={state_mean:.4f}  "
+                f"nan={torch.isnan(test_state).any().item()}  "
+                f"inf={torch.isinf(test_state).any().item()}"
+            )
+            raise
 
 
 @_skip_pre_sm100
