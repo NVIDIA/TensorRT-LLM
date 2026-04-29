@@ -2,20 +2,20 @@
 
 set -ex
 
-TRT_VER="10.16.0.72"
+TRT_VER="10.16.1.11"
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-03.html#rel-26-03
-CUDA_VER="13.2" # 13.2.0
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-04.html#rel-26-04
+CUDA_VER="13.2" # 13.2.1
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
-CUDNN_VER="9.20.0.48-1"
+CUDNN_VER="9.21.0.82-1"
 NCCL_VER="2.29.7-1+cuda13.2"
-CUBLAS_VER="13.3.0.5-1"
+CUBLAS_VER="13.4.0.1-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
-NVRTC_VER="13.2.51-1"
-CUDA_RUNTIME="13.2.51-1"
-CUDA_DRIVER_VERSION="595.45.04-1.el8"
+NVRTC_VER="13.2.78-1"
+CUDA_RUNTIME="13.2.75-1"
+CUDA_DRIVER_VERSION="595.58.03-1.el8"
 
 for i in "$@"; do
     case $i in

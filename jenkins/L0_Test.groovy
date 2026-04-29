@@ -40,7 +40,7 @@ LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
 
 // DLFW torch image
-DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.03-py3"
+DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.04-py3"
 
 //Ubuntu base image
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
@@ -2112,7 +2112,7 @@ def launchTestListCheck(pipeline)
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def llmSrc = "${llmPath}/TensorRT-LLM/src"
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${llmSrc}/requirements-dev.txt")
-            sh "NVIDIA_TRITON_SERVER_VERSION=26.03 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
+            sh "NVIDIA_TRITON_SERVER_VERSION=26.04 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -3726,7 +3726,7 @@ def launchTestJobs(pipeline, testFilter)
     // Python version and OS for sanity check
     x86SanityCheckConfigs = [
         "PY312-DLFW": [
-            LLM_DOCKER_IMAGE,  // Workaround ABI incompatibilities between PyTorch 2.11.0 and 2.11.0a0
+            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
             "B200_PCIe",
             X86_64_TRIPLE,
             false,
@@ -3741,7 +3741,7 @@ def launchTestJobs(pipeline, testFilter)
             true,
             "",
             UBUNTU_22_04_IMAGE,
-            true, // Extra install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
+            true, // Extra install PyTorch CUDA 13.x package to align with the CUDA version used for building TensorRT LLM wheels.
         ],
         "PY312-UB2404": [
             LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
@@ -3750,7 +3750,7 @@ def launchTestJobs(pipeline, testFilter)
             true,
             "",
             UBUNTU_24_04_IMAGE,
-            true, // Extra PyTorch CUDA 13.0 install
+            true, // Extra PyTorch CUDA 13.x install
         ],
     ]
 
@@ -3764,8 +3764,8 @@ def launchTestJobs(pipeline, testFilter)
             AARCH64_TRIPLE,
             false,
             "",
-            DLFW_IMAGE,
-            false, // Extra PyTorch CUDA 13.0 install
+            UBUNTU_24_04_IMAGE,
+            true, // Extra PyTorch CUDA 13.x install
         ],
         "PY312-DLFW": [
             LLM_DOCKER_IMAGE,
