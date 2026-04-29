@@ -2045,14 +2045,35 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache = self.kv_cache_map.get(request_id)
         return kv_cache is not None and kv_cache.is_active
 
+    def _effective_draft_len(self, req: LlmRequest) -> int:
+        """Draft token length to use for next-step KV capacity calculation.
+
+        For a disagg gen request whose KV transmission just completed
+        (state == DISAGG_GENERATION_TRANS_COMPLETE), py_draft_tokens is
+        still [] when the scheduler asks for capacity, because it gets
+        mirrored from context_phase_params.draft_tokens later in
+        _prepare_disagg_gen_transmission_complete (which runs AFTER the
+        scheduler in the executor loop). Without compensating here, the
+        first gen forward writes 1 + len(ctx_draft_tokens) tokens into
+        KV cache but only +1 was reserved, OOB-ing the KV block table at
+        the next tokens_per_block-aligned boundary.
+        """
+        draft_len = get_draft_token_length(req)
+        if (draft_len == 0
+                and req.is_disagg_generation_transmission_complete
+                and req.context_phase_params is not None):
+            ctx_draft_tokens = req.context_phase_params.draft_tokens
+            if ctx_draft_tokens is not None:
+                draft_len = len(ctx_draft_tokens)
+        return draft_len
+
     def _required_gen_capacity(self, req: LlmRequest,
                                current_capacity: int) -> int:
         """Compute generation KV cache capacity for a request.
 
         Grows *current_capacity* by 1 + draft tokens.
         """
-        draft_len = get_draft_token_length(req)
-        return current_capacity + 1 + draft_len
+        return current_capacity + 1 + self._effective_draft_len(req)
 
     def try_allocate_generation(self, req: LlmRequest) -> bool:
         """Try to allocate one additional KV cache slot for a generation request.
@@ -2081,11 +2102,14 @@ class KVCacheManagerV2(BaseResourceManager):
         This method shrinks capacity back to undo that spurious growth
         so it does not accumulate across iterations and overflow the
         host page-index buffer.
+
+        Mirror the effective draft length used in _required_gen_capacity
+        so disagg-gen-trans-complete revert stays symmetric.
         """
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None or not kv_cache.is_active:
             return
-        draft_len = get_draft_token_length(req)
+        draft_len = self._effective_draft_len(req)
         reverted_cap = kv_cache.capacity - 1 - draft_len
         if reverted_cap < 0:
             return
