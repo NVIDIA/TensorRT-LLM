@@ -1004,7 +1004,7 @@ def _capture_trtllm_logs(caplog):
     import logging
     trtllm_logger = logging.getLogger("TRT-LLM")
     trtllm_logger.addHandler(caplog.handler)
-    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="TRT-LLM")
     yield
     trtllm_logger.removeHandler(caplog.handler)
 
