@@ -846,8 +846,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             restored = snapshot_restored + dense_restored
             if restored != n:
                 raise RuntimeError(
-                    f"Restored {restored} LoRA-touched weights after stage 2, "
-                    f"but {n} were applied."
+                    f"Restored {restored} LoRA-touched weights after stage 2, but {n} were applied."
                 )
             logger.info("Un-merged distilled LoRA after stage 2")
 

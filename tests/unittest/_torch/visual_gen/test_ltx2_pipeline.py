@@ -523,9 +523,7 @@ class TestTwoStageLoRAHelpers:
         delta = torch.randn(64, 64, device=device) * 0.01
         deltas = {"weight": delta}
 
-        applied, saved_state, snapshot_required = _apply_lora_deltas(
-            linear, deltas, sign=1.0
-        )
+        applied, saved_state, snapshot_required = _apply_lora_deltas(linear, deltas, sign=1.0)
         assert applied == 1, "Expected one parameter to be modified"
         assert saved_state == {}, "Dense BF16 weights should not be snapshotted"
         assert snapshot_required == 0
@@ -569,9 +567,7 @@ class TestTwoStageLoRAHelpers:
         deltas = {"weight": torch.randn(64, 64, device=device) * 0.01}
         rounds = 10
         for _ in range(rounds):
-            _, saved_state, snapshot_required = _apply_lora_deltas(
-                model, deltas, sign=1.0
-            )
+            _, saved_state, snapshot_required = _apply_lora_deltas(model, deltas, sign=1.0)
             assert saved_state == {}, "Dense BF16 weights should not be snapshotted"
             assert snapshot_required == 0
             _subtract_dense_lora_deltas(model, deltas, saved_state)
@@ -592,9 +588,7 @@ class TestTwoStageLoRAHelpers:
         original_weight = linear.weight.data.clone()
 
         deltas = {"weight": torch.randn(32, 32, device=device) * 0.1}
-        _, saved_state, snapshot_required = _apply_lora_deltas(
-            linear, deltas, sign=1.0
-        )
+        _, saved_state, snapshot_required = _apply_lora_deltas(linear, deltas, sign=1.0)
 
         assert saved_state == {}, "Dense FP32 weights should not be snapshotted"
         assert snapshot_required == 0
