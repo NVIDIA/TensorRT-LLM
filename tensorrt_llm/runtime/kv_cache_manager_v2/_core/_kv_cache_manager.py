@@ -19,7 +19,7 @@ from collections import defaultdict
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Iterable, Iterator, cast
+from typing import TYPE_CHECKING, Iterable, Iterator, cast
 
 from .. import rawref
 from .._block_radix_tree import BlockRadixTree
@@ -56,6 +56,9 @@ from .._utils import (
 )
 from ._kv_cache import _KVCache
 from ._moving_average import MovingAverage
+
+if TYPE_CHECKING:
+    from .._event_manager import KVCacheEventManager
 
 
 @dataclass(slots=True, frozen=True)
@@ -134,6 +137,7 @@ class KVCacheManager:
         "_num_closed_kv_caches",
         "_last_adjustment_time",
         "_last_update_num_closed_requests",
+        "_event_manager",
     )
     _init_config: KVCacheManagerConfig
     _life_cycles: LifeCycleRegistry
@@ -156,13 +160,18 @@ class KVCacheManager:
     _num_closed_kv_caches: int
     _last_adjustment_time: float
     _last_update_num_closed_requests: int
+    _event_manager: "KVCacheEventManager | None"
 
-    def __init__(self, config: KVCacheManagerConfig) -> None:
+    def __init__(
+        self,
+        config: KVCacheManagerConfig,
+        event_manager: "KVCacheEventManager | None" = None,
+    ) -> None:
         init_cuda_once()
         config = deepcopy(config)
         self._init_config = config
         self._life_cycles = LifeCycleRegistry(config)
-        self._radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block)
+        self._radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block, event_manager)
         storage_config = create_storage_config(config)
         self._storage = StorageManager(
             self._life_cycles,
@@ -170,6 +179,7 @@ class KVCacheManager:
             config.tokens_per_block,
             typical_batch=config.typical_step,
             constraints=config.constraints,
+            event_manager=event_manager,
         )
         self._living_kv_caches = set[rawref.ref[_KVCache]]()
         decay = 0.9999
@@ -182,6 +192,7 @@ class KVCacheManager:
         self._num_closed_kv_caches = 0
         self._last_adjustment_time = time.monotonic()
         self._last_update_num_closed_requests = 0
+        self._event_manager = event_manager
 
     def __del__(self) -> None:
         self.shutdown()
@@ -308,6 +319,10 @@ class KVCacheManager:
     @property
     def tokens_per_block(self) -> int:
         return self._radix_tree.tokens_per_block
+
+    @property
+    def event_manager(self) -> "KVCacheEventManager | None":
+        return self._event_manager
 
     @property
     def allow_seq_rebasing(self) -> bool:
@@ -552,7 +567,8 @@ class KVCacheManager:
 
         for pg in typed_range(num_pool_groups):
             remaining_slots[pg] -= get_num_slots(1)[pg] * (batch_size - 1)
-            assert remaining_slots[pg] >= 0
+            if remaining_slots[pg] < 0:
+                return 0
 
         def is_enough(num_blocks: int) -> bool:
             return all(
@@ -560,7 +576,8 @@ class KVCacheManager:
                 for cnt, rem in zip(get_num_slots(num_blocks * tokens_per_block), remaining_slots)
             )
 
-        assert is_enough(1)
+        if not is_enough(1):
+            return 0
         lb = 1
         ub = div_up(token_num_upper_bound, tokens_per_block)
         if is_enough(ub):

@@ -141,7 +141,7 @@ class TestOpenAIHttpClient:
         assert isinstance(response, CompletionResponse)
         assert response.model == "test-model"
         mock_session.post.assert_called_once()
-        mock_router.finish_request.assert_called_once_with(completion_request)
+        mock_router.finish_request.assert_called_once_with(completion_request, mock_session)
 
     @pytest.mark.asyncio
     async def test_streaming_completion_request(
@@ -183,7 +183,9 @@ class TestOpenAIHttpClient:
         for i, chunk in enumerate(chunks):
             assert chunk == dummy_data[i]
         mock_session.post.assert_called_once()
-        mock_router.finish_request.assert_called_once_with(streaming_completion_request)
+        mock_router.finish_request.assert_called_once_with(
+            streaming_completion_request, mock_session
+        )
 
     @pytest.mark.asyncio
     async def test_request_with_custom_server(
@@ -221,7 +223,7 @@ class TestOpenAIHttpClient:
             await openai_client.send_request(completion_request)
 
         # Should finish request on error
-        mock_router.finish_request.assert_called_once_with(completion_request)
+        mock_router.finish_request.assert_called_once_with(completion_request, mock_session)
 
     @pytest.mark.asyncio
     async def test_request_with_retry(

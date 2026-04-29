@@ -43,6 +43,8 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.runtime.kv_cache_hash import \
+    get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
@@ -1632,10 +1634,15 @@ class OpenAIServer:
         return JSONResponse(content={"status": "success"})
 
     async def get_server_info(self) -> JSONResponse:
-        return JSONResponse(
-            content={
-                "disaggregated_params": self.generator.disaggregated_params
-            })
+        content = {"disaggregated_params": self.generator.disaggregated_params}
+        args = getattr(self.generator, "args", None)
+        kv_cache_config = getattr(args, "kv_cache_config", None)
+        if kv_cache_config is not None:
+            content[
+                "kv_cache_hash_algo"] = get_effective_kv_cache_event_hash_algo(
+                    kv_cache_config.kv_cache_event_hash_algo,
+                    kv_cache_config.use_kv_cache_manager_v2)
+        return JSONResponse(content=content)
 
     async def openai_image_generation(self, request: ImageGenerationRequest,
                                       raw_request: Request) -> Response:
