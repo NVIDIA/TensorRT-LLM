@@ -30,7 +30,8 @@ static bool isPropSupported(CUmemAllocationProp const& prop)
 {
     CUmemGenericAllocationHandle handle;
     CUresult err = cuMemCreate(&handle, 2ULL << 20, &prop, 0);
-    if (err == CUDA_ERROR_NOT_PERMITTED || err == CUDA_ERROR_NOT_SUPPORTED || err == CUDA_ERROR_INVALID_DEVICE)
+    if (err == CUDA_ERROR_NOT_PERMITTED || err == CUDA_ERROR_NOT_SUPPORTED || err == CUDA_ERROR_INVALID_DEVICE
+        || err == CUDA_ERROR_INVALID_VALUE)
     {
         return false;
     }
