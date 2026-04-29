@@ -7,8 +7,10 @@ from .modeling_cohere2 import Cohere2ForCausalLM
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
 from .modeling_exaone4 import Exaone4ForCausalLM
 from .modeling_exaone_moe import ExaoneMoeForCausalLM
+from .modeling_gemma2 import Gemma2ForCausalLM
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_gemma3vl import Gemma3VLM
+from .modeling_paligemma import PaliGemmaForConditionalGeneration
 from .modeling_glm import Glm4MoeForCausalLM
 from .modeling_gpt_oss import GptOssForCausalLM
 from .modeling_hunyuan_dense import HunYuanDenseV1ForCausalLM
@@ -49,8 +51,10 @@ __all__ = [
     "DeepseekV3ForCausalLM",
     "Exaone4ForCausalLM",
     "ExaoneMoeForCausalLM",
+    "Gemma2ForCausalLM",
     "Gemma3ForCausalLM",
     "Gemma3VLM",
+    "PaliGemmaForConditionalGeneration",
     "HCXVisionForCausalLM",
     "HunYuanDenseV1ForCausalLM",
     "HunYuanMoEV1ForCausalLM",

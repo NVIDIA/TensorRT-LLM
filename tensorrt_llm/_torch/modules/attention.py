@@ -345,6 +345,7 @@ class Attention(nn.Module):
         reduce_output: bool = True,
         mapping_with_cp: Optional[Mapping] = None,
         head_dim: Optional[int] = None,
+        logits_soft_cap: Optional[float] = None,
     ):
         """
         Initialize the Attention module.
@@ -404,6 +405,7 @@ class Attention(nn.Module):
         self.pos_embd_params = pos_embd_params
         self.dense_bias = dense_bias
         self.q_scaling = q_scaling
+        self.logits_soft_cap = logits_soft_cap
         self.attn_output_gate = attn_output_gate
 
         if self.attn_output_gate:
@@ -752,6 +754,7 @@ class Attention(nn.Module):
                     attention_mask_data=attention_mask_data,
                     softmax_stats_tensor=softmax_stats,
                     attention_sinks=attention_sinks,
+                    logits_soft_cap=self.logits_soft_cap,
                 ))
             if isinstance(attn_output, tuple):
                 attn_output = attn_output[0]
@@ -791,6 +794,7 @@ class Attention(nn.Module):
                 output=output[:num_tokens, :] if output is not None else None,
                 output_sf=output_sf,
                 attention_sinks=attention_sinks,
+                logits_soft_cap=self.logits_soft_cap,
             ))
         if isinstance(attn_output, tuple):
             assert len(
