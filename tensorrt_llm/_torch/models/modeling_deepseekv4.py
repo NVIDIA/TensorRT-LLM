@@ -63,7 +63,16 @@ from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.engram import Engram, EngramConfig, EngramHashProvider
-from ..modules.fused_moe import DeepSeekV4MoeRoutingMethod, MoE, MoEWeightLoadingMode, create_moe
+from ..modules.fused_moe import (
+    CutlassFusedMoE,
+    DeepSeekV4MoeRoutingMethod,
+    MoE,
+    MoEWeightLoadingMode,
+    TritonFusedMoE,
+    TRTLLMGenFusedMoE,
+    create_moe,
+    get_moe_cls,
+)
 from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from ..modules.linear import Linear
 from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
@@ -204,6 +213,14 @@ _SHARED_EXPERT_RENAME = {
     "w3": "up_proj",
     "w2": "down_proj",
 }
+
+
+def _resolve_enable_fused_hc(config: PretrainedConfig) -> bool:
+    """Resolve the DeepSeek-V4 fused HC boundary-fusion knob."""
+    env = os.environ.get("TRTLLM_MHC_ENABLE_FUSED_HC")
+    if env is not None:
+        return env not in ("0", "false", "False")
+    return bool(getattr(config, "enable_fused_hc", True))
 
 
 def _remap_deepseek_v4_checkpoint_keys(
@@ -1378,17 +1395,16 @@ class DeepseekV4MoE(nn.Module):
         swiglu_limit = getattr(config, "swiglu_limit", None)
         moe_swiglu_limit = None
         if swiglu_limit is not None:
-            supports_swiglu_limit = True
-            if (model_config.moe_backend or "").upper() == "TRTLLM":
-                supports_swiglu_limit = False
-                if experts_quant_config is not None:
-                    mode = experts_quant_config.layer_quant_mode
-                    supports_swiglu_limit = (
-                        mode.has_nvfp4()
-                        or mode.has_w4a16_mxfp4()
-                        or mode.has_w4a8_mxfp4_fp8()
-                        or mode.has_w4a8_mxfp4_mxfp8()
-                    )
+            # `create_moe` only accepts swiglu_limit for these MoE classes;
+            # resolve via get_moe_cls so backend-string fallbacks (e.g.
+            # TRTLLM/CUTEDSL/DENSEGEMM dropping back to CutlassFusedMoE on
+            # unsupported quant) are handled correctly.
+            moe_cls = get_moe_cls(model_config, override_quant_config=experts_quant_config)
+            supports_swiglu_limit = moe_cls in (
+                CutlassFusedMoE,
+                TritonFusedMoE,
+                TRTLLMGenFusedMoE,
+            )
             if supports_swiglu_limit:
                 moe_load_balancer_config = getattr(model_config, "moe_load_balancer", None)
                 num_slots = (
@@ -1757,14 +1773,8 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         # the MHC boundary fusion (`mHC.fused_hc`) is used. When False, fall back
         # to the unfused `post_mapping → pre_mapping` chain (same path engram
         # layers already take). Env var TRTLLM_MHC_ENABLE_FUSED_HC overrides the
-        # config attr (set to "1" to force-enable while validating fused_hc).
-        # Default is disabled because fused_hc must be bit-equivalent to the
-        # explicit post_mapping -> pre_mapping chain before it can safely replace it.
-        _env = os.environ.get("TRTLLM_MHC_ENABLE_FUSED_HC")
-        if _env is not None:
-            self.enable_fused_hc = _env not in ("0", "false", "False")
-        else:
-            self.enable_fused_hc = bool(getattr(config, "enable_fused_hc", False))
+        # config attr (set to "0" to force-disable for validation/rollback).
+        self.enable_fused_hc = _resolve_enable_fused_hc(config)
         self.next_layer_layernorm: RMSNorm = None
         # Finalized in DeepseekV4ForCausalLM.post_load_weights once the full layer
         # list is visible: a layer may defer its hc_ffn.post_mapping only if

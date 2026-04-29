@@ -720,6 +720,17 @@ class TestEviction:
         sched.schedule_request(reqs, set())
         mgr.suspend_request.assert_called_once_with(victim)
 
+    def test_eviction_clears_request_runtime_state(self):
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=lambda req: False,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        req = make_gen_request(0)
+        req.py_batch_idx = 7
+        out = sched.schedule_request([req], set())
+        assert ids(out.paused_requests) == [0]
+        assert req.py_batch_idx is None
+
     def test_unknown_state_not_evictable(self):
         """UNKNOWN state at tail is not evictable; gen0 self-evicts."""
         mgr = make_kv_cache_manager(

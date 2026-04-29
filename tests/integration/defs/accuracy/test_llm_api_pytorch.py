@@ -3470,6 +3470,112 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 task.evaluate(llm)
 
 
+def _make_deepseekv4_eplb_config(model_path, layer_updates_per_iter, ep_size=8):
+    """Build a MoeLoadBalancerConfig for DeepSeek V4 from the HF config.
+
+    All V4 layers run MoE (no first_k_dense_replace prefix), so static
+    assignments cover every layer in 0..num_hidden_layers-1. Extra slots
+    per rank match the TestNemotronV3Super pattern (16 redundant per rank).
+    """
+    with open(f"{model_path}/config.json") as f:
+        cfg = json.load(f)
+    num_experts = cfg["n_routed_experts"]
+    num_slots = num_experts + 16 * ep_size
+    if layer_updates_per_iter > 0:
+        return MoeLoadBalancerConfig(
+            num_slots=num_slots, layer_updates_per_iter=layer_updates_per_iter)
+    num_hidden_layers = cfg["num_hidden_layers"]
+    initial_global_assignments = {
+        i: [(i + j) % num_experts for j in range(num_slots)]
+        for i in range(num_hidden_layers)
+    }
+    return MoeLoadBalancerConfig(
+        num_slots=num_slots,
+        initial_global_assignments=initial_global_assignments,
+        layer_updates_per_iter=0)
+
+
+def _run_deepseekv4_eplb(model_name,
+                         model_path,
+                         moe_backend,
+                         eplb_config,
+                         mtp_nextn=0):
+    # V4 (~284B) plus EPLB redundant slots leaves little headroom; keep the
+    # KV-cache fraction conservative and clamp max_seq_len so the default
+    # 1M context doesn't pre-allocate KV blocks beyond what 180GB B200s have.
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+    pytorch_config = dict(cuda_graph_config=CudaGraphConfig(),
+                          moe_config=MoeConfig(backend=moe_backend,
+                                               load_balancer=eplb_config))
+    mtp_config = (MTPDecodingConfig(
+        num_nextn_predict_layers=mtp_nextn) if mtp_nextn > 0 else None)
+    with LLM(model_path,
+             tensor_parallel_size=8,
+             moe_expert_parallel_size=8,
+             kv_cache_config=kv_cache_config,
+             enable_attention_dp=True,
+             max_seq_len=4096,
+             **pytorch_config,
+             speculative_config=mtp_config) as llm:
+        task = GSM8K(model_name)
+        task.evaluate(llm)
+
+
+@pytest.mark.timeout(14400)
+@pytest.mark.skip_less_device_memory(140000)
+@skip_pre_blackwell
+class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Flash"
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @parametrize_with_ids("moe_backend", ["WIDEEP", "TRTLLM"])
+    def test_nvfp4_8gpus_static_eplb(self, moe_backend):
+        eplb_config = _make_deepseekv4_eplb_config(self.MODEL_PATH,
+                                                   layer_updates_per_iter=0)
+        _run_deepseekv4_eplb(self.MODEL_NAME, self.MODEL_PATH, moe_backend,
+                             eplb_config)
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @parametrize_with_ids("moe_backend", ["WIDEEP", "TRTLLM"])
+    @parametrize_with_ids("mtp_nextn", [0, 1])
+    def test_nvfp4_8gpus_online_eplb(self, moe_backend, mtp_nextn):
+        eplb_config = _make_deepseekv4_eplb_config(self.MODEL_PATH,
+                                                   layer_updates_per_iter=2)
+        _run_deepseekv4_eplb(self.MODEL_NAME,
+                             self.MODEL_PATH,
+                             moe_backend,
+                             eplb_config,
+                             mtp_nextn=mtp_nextn)
+
+
+@pytest.mark.timeout(14400)
+@pytest.mark.skip_less_device_memory(140000)
+@skip_pre_blackwell
+class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash-Base"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Flash-Base"
+
+    # CUTLASS is omitted: V4 Flash-Base FP8 block-scale weights take a
+    # Hopper-only kernel path (CutlassFp8BlockScaleGemmRunner::moeGemm) that
+    # fails on Blackwell. WIDEEP avoids that path and works on B200.
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @parametrize_with_ids("moe_backend", ["WIDEEP"])
+    def test_fp8_8gpus_static_eplb(self, moe_backend):
+        eplb_config = _make_deepseekv4_eplb_config(self.MODEL_PATH,
+                                                   layer_updates_per_iter=0)
+        _run_deepseekv4_eplb(self.MODEL_NAME, self.MODEL_PATH, moe_backend,
+                             eplb_config)
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @parametrize_with_ids("moe_backend", ["WIDEEP"])
+    def test_fp8_8gpus_online_eplb(self, moe_backend):
+        eplb_config = _make_deepseekv4_eplb_config(self.MODEL_PATH,
+                                                   layer_updates_per_iter=2)
+        _run_deepseekv4_eplb(self.MODEL_NAME, self.MODEL_PATH, moe_backend,
+                             eplb_config)
+
+
 @skip_pre_blackwell
 class TestGLM4_6(LlmapiAccuracyTestHarness):
     MODEL_NAME = "zai-org/GLM-4.6"

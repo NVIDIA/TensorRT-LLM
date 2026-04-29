@@ -31,6 +31,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     DeepseekV4MTP,
     _deepseek_v4_pos_embd_params,
     _remap_deepseek_v4_checkpoint_keys,
+    _resolve_enable_fused_hc,
 )
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
@@ -114,6 +115,22 @@ def test_deepseek_v4_config_aliases():
     assert config.v_head_dim == 128
     assert config.scoring_func == "sigmoid"
     assert config.swiglu_limit == 9.0
+
+
+def test_deepseek_v4_fused_hc_default_enabled(monkeypatch):
+    monkeypatch.delenv("TRTLLM_MHC_ENABLE_FUSED_HC", raising=False)
+    config = PretrainedConfig()
+
+    assert _resolve_enable_fused_hc(config) is True
+
+    config.enable_fused_hc = False
+    assert _resolve_enable_fused_hc(config) is False
+
+    monkeypatch.setenv("TRTLLM_MHC_ENABLE_FUSED_HC", "1")
+    assert _resolve_enable_fused_hc(config) is True
+
+    monkeypatch.setenv("TRTLLM_MHC_ENABLE_FUSED_HC", "0")
+    assert _resolve_enable_fused_hc(config) is False
 
 
 def test_deepseek_v4_model_defaults_keep_tokens_per_block():

@@ -2878,9 +2878,8 @@ class PyTorchModelEngine(ModelEngine):
                     )
                 if segment.shape[0] != 3 and segment.shape[-1] == 3:
                     logger.warning(
-                        "Transposing unexpected mrope_position_ids shape from %s",
-                        tuple(segment.shape),
-                    )
+                        "Transposing unexpected mrope_position_ids shape from "
+                        f"{tuple(segment.shape)}")
                     segment = segment.transpose(0, 2).contiguous()
                 if segment.shape[:2] != (3, 1):
                     raise RuntimeError(
