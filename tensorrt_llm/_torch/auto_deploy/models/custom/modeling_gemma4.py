@@ -37,7 +37,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import numpy as np
 import torch
@@ -1451,6 +1451,9 @@ class Gemma4TextModel(Gemma4TextPreTrainedModel):
             return None
 
         if input_ids is None:
+            # Compatibility path for direct-embedding callers. AutoDeploy serving uses
+            # input_ids, or explicit per_layer_inputs, so this reverse lookup is not
+            # part of CUDA graph replay.
             with torch.no_grad():
                 input_ids = (
                     (
@@ -1466,6 +1469,8 @@ class Gemma4TextModel(Gemma4TextPreTrainedModel):
                 )
                 input_ids = input_ids.view(inputs_embeds.shape[:2])
 
+        # The text serving path reaches this point with input_ids, so the token
+        # remapping stays in fixed-shape device tensor ops with no CPU sync.
         per_layer_inputs_mask = torch.logical_and(
             input_ids >= 0,
             input_ids < self.vocab_size_per_layer_input,
@@ -1524,9 +1529,12 @@ class Gemma4TextModel(Gemma4TextPreTrainedModel):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
         if input_ids is not None:
+            # Text-only prompts enter through input_ids; materialize embeddings once
+            # so the rest of the model follows a single tensor path.
             inputs_embeds = self.embed_tokens(input_ids)
+        else:
+            inputs_embeds = cast(torch.Tensor, inputs_embeds)
 
-        assert inputs_embeds is not None
         if per_layer_inputs is None:
             per_layer_inputs = self.get_per_layer_inputs(input_ids, inputs_embeds)
         per_layer_inputs = self.project_per_layer_inputs(inputs_embeds, per_layer_inputs)

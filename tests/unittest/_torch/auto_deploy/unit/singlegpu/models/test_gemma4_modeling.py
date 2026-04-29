@@ -1932,6 +1932,39 @@ def test_e2b_like_explicit_per_layer_inputs_match_implicit_path():
     torch.testing.assert_close(explicit_logits, implicit_logits, rtol=1e-4, atol=1e-4)
 
 
+@torch.no_grad()
+def test_e2b_like_input_ids_per_layer_path_is_cuda_graph_capturable():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for CUDA graph capture coverage")
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    config = _small_e2b_text_config()
+    model = Gemma4ForCausalLM(config).to(device=device, dtype=dtype).eval()
+
+    input_ids = torch.randint(0, config.vocab_size, (1, 4), device=device)
+    position_ids = _position_ids(1, 4, device)
+
+    eager_logits = model(input_ids=input_ids, position_ids=position_ids).logits.clone()
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            model(input_ids=input_ids, position_ids=position_ids)
+    warmup_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_logits = model(input_ids=input_ids, position_ids=position_ids).logits
+
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(graph_logits).all()
+    torch.testing.assert_close(graph_logits, eager_logits, rtol=1e-4, atol=1e-4)
+
+
 def test_e2b_like_conditional_wrapper_forwards_explicit_per_layer_inputs():
     device, dtype = _device_and_dtype()
     config = Gemma4Config(
