@@ -5,12 +5,16 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
 from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import is_dynamic_cached_op
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention.flashinfer_attention import (
     FlashInferAttention,
 )
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention.torch_backend_attention import (
     TorchBackendAttention,
+)
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
+    TritonPagedAttention,
 )
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
@@ -266,6 +270,28 @@ def test_torch_backend_attention_metadata_for_shared_kv_node():
     assert TorchBackendAttention.get_shared_kv_source_layer_idx(shared) == 0
 
 
+def test_torch_backend_attention_cache_init_falls_back_when_v_meta_val_missing():
+    module = _TinySharedKVModule().eval()
+    gm = torch_export_to_gm(module, (torch.randn(1, 4, 8),))
+    source_nodes = [
+        node
+        for node in gm.graph.nodes
+        if node.op == "call_function"
+        and node.target == torch.ops.auto_deploy.torch_attention.default
+    ]
+    regular = next(node for node in source_nodes if TorchBackendAttention.get_layer_idx(node) == 0)
+
+    regular.args[2].meta.pop("val", None)
+    cache_initializers = TorchBackendAttention.get_cache_initializers(
+        regular, KvCacheConfig(dtype="bfloat16")
+    )
+
+    assert cache_initializers["k_cache"].token_shape == (2, 4)
+    assert cache_initializers["v_cache"].token_shape == (2, 4)
+    assert cache_initializers["k_cache"].dtype == torch.bfloat16
+    assert cache_initializers["v_cache"].dtype == torch.bfloat16
+
+
 def test_flashinfer_backend_attention_metadata_for_shared_kv_node():
     module = _TinySharedKVModule().eval()
     gm = torch_export_to_gm(module, (torch.randn(1, 4, 8),))
@@ -347,6 +373,167 @@ def test_flashinfer_cached_attention_is_dynamic_for_piecewise():
     assert is_dynamic_cached_op(
         _FakeNode(torch.ops.auto_deploy.flashinfer_attention_mha_with_cache.default)
     )
+
+
+def test_triton_paged_backend_attention_metadata_for_shared_kv_node():
+    module = _TinySharedKVModule().eval()
+    gm = torch_export_to_gm(module, (torch.randn(1, 4, 8),))
+    source_nodes = [
+        node
+        for node in gm.graph.nodes
+        if node.op == "call_function"
+        and node.target == torch.ops.auto_deploy.torch_attention.default
+    ]
+    regular = next(
+        node
+        for node in source_nodes
+        if node.target == torch.ops.auto_deploy.torch_attention.default
+    )
+    shared = next(node for node in source_nodes if TritonPagedAttention.get_layer_idx(node) == 1)
+
+    assert TritonPagedAttention.get_layer_idx(regular) == 0
+    assert TritonPagedAttention.get_layer_idx(shared) == 1
+    assert TritonPagedAttention.get_shared_kv_source_layer_idx(regular) is None
+    assert TritonPagedAttention.get_shared_kv_source_layer_idx(shared) == 0
+    assert TritonPagedAttention.get_cached_attention_op() == (
+        torch.ops.auto_deploy.triton_paged_mha_with_cache.default
+    )
+
+
+def test_shared_kv_transform_aliases_source_cache_placeholders_for_triton_paged():
+    module = _TinySharedKVModule().eval()
+    gm = torch_export_to_gm(module, (torch.randn(1, 4, 8),))
+
+    cm = CachedSequenceInterface(
+        max_seq_len=16,
+        max_batch_size=2,
+        max_num_tokens=16,
+        device="cpu",
+    )
+    transform = _InsertCachedOperator(
+        InsertCachedAttentionConfig(stage=Stages.CACHE_INIT, backend="triton_paged")
+    )
+    gm, info = transform._apply(gm, cm, factory=None, shared_config=SharedConfig())
+
+    assert info.num_matches == 2
+
+    placeholder_names = [node.target for node in gm.graph.nodes if node.op == "placeholder"]
+    assert placeholder_names.count("r0_kv_cache") == 1
+    assert "r1_kv_cache" not in placeholder_names
+    assert set(cm._resource_lookup).issubset(set(placeholder_names))
+
+    cached_nodes = [node for node in gm.graph.nodes if node.op == "call_function"]
+    regular_node = next(
+        node
+        for node in cached_nodes
+        if node.target == torch.ops.auto_deploy.triton_paged_mha_with_cache.default
+        and node.args[-1] is False
+    )
+    shared_node = next(
+        node
+        for node in cached_nodes
+        if node.target == torch.ops.auto_deploy.triton_paged_mha_with_cache.default
+        and node.args[-1] is True
+    )
+
+    assert regular_node.args[13] is shared_node.args[13]
+    assert regular_node.target == torch.ops.auto_deploy.triton_paged_mha_with_cache.default
+    assert shared_node.target == torch.ops.auto_deploy.triton_paged_mha_with_cache.default
+    assert regular_node.args[-1] is False
+    assert shared_node.args[-1] is True
+
+
+@torch.no_grad()
+def test_triton_paged_shared_kv_cached_attention_reads_aliased_cache_without_writing():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for triton_paged shared-KV runtime coverage")
+
+    device = torch.device("cuda")
+    head_dim = 16
+
+    q = torch.tensor([[[[1.0] * head_dim]]], dtype=torch.float16, device=device)
+    dummy_k = torch.full((1, 1, 1, head_dim), 7.0, dtype=torch.float16, device=device)
+    dummy_v = torch.full((1, 1, 1, head_dim), -3.0, dtype=torch.float16, device=device)
+
+    owner_k = torch.tensor(
+        [[[[1.0] * head_dim], [[0.0] * head_dim], [[0.5] * head_dim]]],
+        dtype=torch.float16,
+        device=device,
+    )
+    owner_v = torch.tensor(
+        [[[[10.0] * head_dim], [[20.0] * head_dim], [[30.0] * head_dim]]],
+        dtype=torch.float16,
+        device=device,
+    )
+
+    kv_cache = torch.zeros((1, 2, 1, 32, head_dim), dtype=torch.float16, device=device)
+    kv_cache[0, 0, 0, :3, :] = owner_k[0, :, 0, :]
+    kv_cache[0, 1, 0, :3, :] = owner_v[0, :, 0, :]
+    kv_cache_before = kv_cache.clone()
+    owner_write_cache = torch.zeros_like(kv_cache)
+    owner_write_cache[0, 0, 0, :2, :] = owner_k[0, :2, 0, :]
+    owner_write_cache[0, 1, 0, :2, :] = owner_v[0, :2, 0, :]
+
+    batch_info_host = BatchInfo()
+    batch_info_host.update([0, 0, 0, 0, 1, 1])
+    cu_seqlen_host = torch.tensor([0, 1], dtype=torch.int32)
+    cu_num_pages = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    cu_num_pages_host = torch.tensor([0, 1], dtype=torch.int32)
+    cache_loc = torch.tensor([0], dtype=torch.int32, device=device)
+    last_page_len = torch.tensor([3], dtype=torch.int32, device=device)
+    last_page_len_host = torch.tensor([3], dtype=torch.int32)
+    seq_len_with_cache_host = torch.tensor([3], dtype=torch.int32)
+    position_ids = torch.tensor([[0]], dtype=torch.int32, device=device)
+
+    triton_batch_indices, triton_positions = torch.ops.auto_deploy.triton_paged_prepare_metadata(
+        position_ids,
+        batch_info_host.serialize(),
+        cu_seqlen_host.to(device),
+        seq_len_with_cache_host.to(device),
+    )
+
+    output = torch.ops.auto_deploy.triton_paged_mha_with_cache(
+        q,
+        dummy_k,
+        dummy_v,
+        batch_info_host.serialize(),
+        cu_seqlen_host,
+        cu_num_pages,
+        cu_num_pages_host,
+        cache_loc,
+        last_page_len,
+        last_page_len_host,
+        seq_len_with_cache_host,
+        triton_batch_indices,
+        triton_positions,
+        kv_cache,
+        1.0 / (head_dim**0.5),
+        None,
+        True,
+    )
+    expected = torch.ops.auto_deploy.triton_paged_mha_with_cache(
+        q,
+        owner_k[:, 2:3],
+        owner_v[:, 2:3],
+        batch_info_host.serialize(),
+        cu_seqlen_host,
+        cu_num_pages,
+        cu_num_pages_host,
+        cache_loc,
+        last_page_len,
+        last_page_len_host,
+        seq_len_with_cache_host,
+        triton_batch_indices,
+        triton_positions,
+        owner_write_cache,
+        1.0 / (head_dim**0.5),
+        None,
+        False,
+    )
+
+    torch.testing.assert_close(kv_cache, kv_cache_before, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(owner_write_cache, kv_cache_before, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(output, expected, rtol=0.0, atol=0.0)
 
 
 @torch.no_grad()
