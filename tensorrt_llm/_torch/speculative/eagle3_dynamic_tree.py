@@ -375,10 +375,14 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             "update_kv_cache_draft_token_location_2d requires uniform num_kv_heads across all layers, "
             f"but got {cache_mgr.num_kv_heads_per_layer}"
         )
-        torch.ops.tensorrt_llm.update_kv_cache_draft_token_location_2d(
+        max_kv_cache_len = cache_mgr.max_attention_window_vec[0]
+        if max_kv_cache_len is None:
+            max_kv_cache_len = cache_mgr.max_seq_len
+        past_key_value_lengths = attn_metadata.kv_lens_cuda[:batch_size]
+        update_args = (
             self._accepted_draft_indices_tensor[:batch_size],
             self._num_accepted_tokens_buf[:batch_size],
-            attn_metadata.kv_lens_cuda[:batch_size],
+            past_key_value_lengths,
             True,
             cache_mgr.num_layers,
             # Use TP-sharded num_kv_heads (per-rank) instead of the unsharded
@@ -386,13 +390,24 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
             cache_mgr.num_kv_heads_per_layer[0],
             self._kv_head_dim_bytes,
             cache_mgr.max_total_draft_tokens,
-            cache_mgr.max_attention_window_vec[0],
+            max_kv_cache_len,
             cache_mgr.kv_cache_pool_pointers,
             attn_metadata.kv_cache_block_offsets,
             cache_mgr.max_blocks_per_seq,
             cache_mgr.tokens_per_block,
-            None,
         )
+        pool_mapping = getattr(cache_mgr, "kv_cache_pool_mapping", None)
+        if pool_mapping is None:
+            torch.ops.tensorrt_llm.update_kv_cache_draft_token_location_2d(
+                *update_args,
+                None,
+            )
+        else:
+            torch.ops.tensorrt_llm.update_kv_cache_draft_token_location_2d_with_pool_mapping(
+                *update_args,
+                pool_mapping,
+                None,
+            )
 
     @nvtx_range("eagle3_dyn.sample_and_accept_draft_tokens")
     def sample_and_accept_draft_tokens(self, logits, attn_metadata, spec_metadata):

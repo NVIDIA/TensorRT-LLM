@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -113,12 +113,13 @@ void updateKVCacheDraftTokenLocation(torch::Tensor seqAcceptedDraftTokenOffsetsT
     }
 }
 
-void updateKVCacheDraftTokenLocation2D(torch::Tensor acceptedDraftTokensIndices2DTensor,
+void updateKVCacheDraftTokenLocation2DImpl(torch::Tensor acceptedDraftTokensIndices2DTensor,
     torch::Tensor numAcceptedTokensTensor, torch::Tensor pastKeyValueLengthsTensor, bool usePagedKVCache,
     int64_t layerCount, int64_t numKVHeads, int64_t headSizeInBytes, int64_t rewindDraftTokenCount,
     int64_t maxKVCacheLen, th::optional<torch::Tensor> pointerArrayOpt = th::nullopt,
     th::optional<torch::Tensor> offsetArrayOpt = th::nullopt, th::optional<int64_t> maxBlocksPerSeqOpt = th::nullopt,
-    th::optional<int64_t> tokensPerBlockOpt = th::nullopt, th::optional<int64_t> stream_ptr = th::nullopt)
+    th::optional<int64_t> tokensPerBlockOpt = th::nullopt, th::optional<torch::Tensor> poolMappingOpt = th::nullopt,
+    th::optional<int64_t> stream_ptr = th::nullopt)
 {
     TLLM_CHECK_WITH_INFO(
         at::cuda::is_available(), "update_kv_cache_draft_token_location_2d should be called with cuda enabled.");
@@ -157,6 +158,15 @@ void updateKVCacheDraftTokenLocation2D(torch::Tensor acceptedDraftTokensIndices2
 
         auto const& pointerArray = pointerArrayOpt.value();
         auto const& offsetArray = offsetArrayOpt.value();
+        runtime::SizeType32 const* poolMappingPtr = nullptr;
+        if (poolMappingOpt.has_value())
+        {
+            auto const& poolMapping = poolMappingOpt.value();
+            TLLM_CHECK_WITH_INFO(poolMapping.dim() == 2 && poolMapping.size(0) == layerCount && poolMapping.size(1) == 2
+                    && poolMapping.scalar_type() == torch::kInt,
+                "pool_mapping tensor should be 2D int tensor with shape [layerCount, 2].");
+            poolMappingPtr = poolMapping.data_ptr<int>();
+        }
         bool constexpr canUseOneMoreBlock{true};
 
         tksd::updateKVBlockArrayDraftTokenLocation2D(acceptedDraftTokensIndices2DTensor.data_ptr<int>(),
@@ -165,12 +175,38 @@ void updateKVCacheDraftTokenLocation2D(torch::Tensor acceptedDraftTokensIndices2
             reinterpret_cast<tensorrt_llm::kernels::KVCacheIndex*>(
                 offsetArray.data_ptr<tensorrt_llm::kernels::KVCacheIndex::UnderlyingType>()),
             layerCount, seqCount, numKVHeads, headSizeInBytes, rewindDraftTokenCount, nullptr, nullptr, nullptr,
-            maxKVCacheLen, maxBlocksPerSeqOpt.value(), tokensPerBlockOpt.value(), canUseOneMoreBlock, stream);
+            maxKVCacheLen, maxBlocksPerSeqOpt.value(), tokensPerBlockOpt.value(), canUseOneMoreBlock, poolMappingPtr,
+            stream);
     }
     else
     {
         TLLM_CHECK_WITH_INFO(false, "update_kv_cache_draft_token_location_2d only supports paged KV cache.");
     }
+}
+
+void updateKVCacheDraftTokenLocation2D(torch::Tensor acceptedDraftTokensIndices2DTensor,
+    torch::Tensor numAcceptedTokensTensor, torch::Tensor pastKeyValueLengthsTensor, bool usePagedKVCache,
+    int64_t layerCount, int64_t numKVHeads, int64_t headSizeInBytes, int64_t rewindDraftTokenCount,
+    int64_t maxKVCacheLen, th::optional<torch::Tensor> pointerArrayOpt = th::nullopt,
+    th::optional<torch::Tensor> offsetArrayOpt = th::nullopt, th::optional<int64_t> maxBlocksPerSeqOpt = th::nullopt,
+    th::optional<int64_t> tokensPerBlockOpt = th::nullopt, th::optional<int64_t> stream_ptr = th::nullopt)
+{
+    updateKVCacheDraftTokenLocation2DImpl(acceptedDraftTokensIndices2DTensor, numAcceptedTokensTensor,
+        pastKeyValueLengthsTensor, usePagedKVCache, layerCount, numKVHeads, headSizeInBytes, rewindDraftTokenCount,
+        maxKVCacheLen, pointerArrayOpt, offsetArrayOpt, maxBlocksPerSeqOpt, tokensPerBlockOpt, th::nullopt, stream_ptr);
+}
+
+void updateKVCacheDraftTokenLocation2DWithPoolMapping(torch::Tensor acceptedDraftTokensIndices2DTensor,
+    torch::Tensor numAcceptedTokensTensor, torch::Tensor pastKeyValueLengthsTensor, bool usePagedKVCache,
+    int64_t layerCount, int64_t numKVHeads, int64_t headSizeInBytes, int64_t rewindDraftTokenCount,
+    int64_t maxKVCacheLen, th::optional<torch::Tensor> pointerArrayOpt, th::optional<torch::Tensor> offsetArrayOpt,
+    th::optional<int64_t> maxBlocksPerSeqOpt, th::optional<int64_t> tokensPerBlockOpt, torch::Tensor poolMapping,
+    th::optional<int64_t> stream_ptr)
+{
+    updateKVCacheDraftTokenLocation2DImpl(acceptedDraftTokensIndices2DTensor, numAcceptedTokensTensor,
+        pastKeyValueLengthsTensor, usePagedKVCache, layerCount, numKVHeads, headSizeInBytes, rewindDraftTokenCount,
+        maxKVCacheLen, pointerArrayOpt, offsetArrayOpt, maxBlocksPerSeqOpt, tokensPerBlockOpt,
+        th::optional<torch::Tensor>(poolMapping), stream_ptr);
 }
 
 } // namespace torch_ext
@@ -183,3 +219,7 @@ static auto update_kv_cache_draft_token_location = torch::RegisterOperators(
 static auto update_kv_cache_draft_token_location_2d
     = torch::RegisterOperators("tensorrt_llm::update_kv_cache_draft_token_location_2d",
         &tensorrt_llm::torch_ext::updateKVCacheDraftTokenLocation2D);
+
+static auto update_kv_cache_draft_token_location_2d_with_pool_mapping
+    = torch::RegisterOperators("tensorrt_llm::update_kv_cache_draft_token_location_2d_with_pool_mapping",
+        &tensorrt_llm::torch_ext::updateKVCacheDraftTokenLocation2DWithPoolMapping);

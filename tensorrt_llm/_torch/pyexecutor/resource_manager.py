@@ -275,6 +275,9 @@ def _update_kv_cache_draft_token_location(cache_manager,
     assert len(
         cache_manager.max_attention_window_vec
     ) == 1, "Currently, only one max attention window size is supported."
+    max_kv_cache_len = cache_manager.max_attention_window_vec[0]
+    if max_kv_cache_len is None:
+        max_kv_cache_len = cache_manager.max_seq_len
 
     if use_paged_kv_cache:
         assert len(set(cache_manager.num_kv_heads_per_layer)) == 1, \
@@ -291,7 +294,7 @@ def _update_kv_cache_draft_token_location(cache_manager,
             cache_manager.num_kv_heads_per_layer[0],
             int(cache_manager.head_dim * kv_cache_dtype_byte_size),
             cache_manager.max_total_draft_tokens,
-            cache_manager.max_attention_window_vec[0],
+            max_kv_cache_len,
             rewind_draft_token_separate_adjustments,
             None,
             cache_manager.kv_cache_pool_pointers,
@@ -1793,7 +1796,10 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
         from ..speculative import get_num_extra_kv_tokens
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
-        self.max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
+        self.max_total_draft_tokens = (spec_config.max_total_draft_tokens
+                                       if spec_config is not None else 0)
+        self.use_dynamic_tree = bool(
+            getattr(spec_config, "use_dynamic_tree", False))
 
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
 
@@ -2395,6 +2401,17 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return True
 
+    def get_context_draft_token_capacity(self, req: LlmRequest) -> int:
+        """Return draft KV capacity needed while processing a context request."""
+        draft_len = get_draft_token_length(req)
+        # Dynamic tree materializes up to max_total_draft_tokens tree nodes
+        # before py_draft_tokens reflects them on the request. Linear/MTP paths
+        # should keep using the request-visible draft length so their rewind
+        # accounting stays paired with the allocated draft slots.
+        if self.use_dynamic_tree and self.max_total_draft_tokens > 0:
+            draft_len = max(draft_len, self.max_total_draft_tokens)
+        return draft_len
+
     def extend_capacity_for_tokens(self, request: LlmRequest) -> None:
         """Extend KV cache capacity for the CUDA-graph padding delta.
 
@@ -2458,7 +2475,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     raise RuntimeError(
                         f"Failed to resume draft KV cache for request {req.py_request_id}"
                     )
-                draft_len = get_draft_token_length(req)
+                draft_len = self.get_context_draft_token_capacity(req)
                 capacity = (req.context_current_position +
                             req.context_chunk_size + draft_len +
                             self.num_extra_kv_tokens)
@@ -2915,7 +2932,9 @@ class KVCacheManagerV2(BaseResourceManager):
                          scheduled_batch: ScheduledRequests,
                          attn_metadata: "AttentionMetadata" = None,
                          kv_cache_dtype_byte_size: float = None):
-        if not self.is_draft:
+        # Dynamic tree relocates accepted draft KV eagerly while
+        # sample_and_accept_draft_tokens still owns its 2D accepted-index tensor.
+        if not self.is_draft and not self.use_dynamic_tree:
             _update_kv_cache_draft_token_location(self, scheduled_batch,
                                                   attn_metadata,
                                                   kv_cache_dtype_byte_size)

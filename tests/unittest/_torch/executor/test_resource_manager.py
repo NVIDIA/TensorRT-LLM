@@ -3,6 +3,7 @@ import pathlib
 import subprocess
 import sys
 import unittest
+from types import SimpleNamespace
 from typing import NamedTuple, Tuple
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
+                                                             KVCacheManagerV2,
                                                              PeftCacheManager)
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
@@ -33,6 +35,29 @@ current_dir = pathlib.Path(__file__).parent.resolve()
 root_dir = current_dir.parent.parent.parent.parent
 
 sys.path.append(str(root_dir / "tests" / "integration"))
+
+
+def test_kv_cache_manager_v2_context_draft_capacity():
+    request = SimpleNamespace(py_draft_tokens=[])
+
+    dynamic_tree_manager = SimpleNamespace(use_dynamic_tree=True,
+                                           max_total_draft_tokens=60)
+    assert KVCacheManagerV2.get_context_draft_token_capacity(
+        dynamic_tree_manager, request) == 60
+
+    request.py_draft_tokens = list(range(70))
+    assert KVCacheManagerV2.get_context_draft_token_capacity(
+        dynamic_tree_manager, request) == 70
+
+    linear_spec_manager = SimpleNamespace(use_dynamic_tree=False,
+                                          max_total_draft_tokens=60)
+    request.py_draft_tokens = []
+    assert KVCacheManagerV2.get_context_draft_token_capacity(
+        linear_spec_manager, request) == 0
+
+    request.py_draft_tokens = [1, 2, 3]
+    assert KVCacheManagerV2.get_context_draft_token_capacity(
+        linear_spec_manager, request) == 3
 
 
 class TestResourceManager(unittest.TestCase):
