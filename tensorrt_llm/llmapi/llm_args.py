@@ -574,9 +574,7 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
 
 
 class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
-    """
-    Configuration for DeepSeek-V4 Sparse Attention.
-    """
+    """Configuration for DeepSeek-V4 Sparse Attention."""
     algorithm: Literal["deepseek_v4"] = "deepseek_v4"
     skip_indexer_for_short_seqs: bool = Field(
         default=False,
@@ -822,6 +820,7 @@ Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core']
 # Maps alias → full import path (module.ClassName).
 TOKENIZER_ALIASES = {
     'deepseek_v32': 'tensorrt_llm.tokenizer.deepseek_v32.DeepseekV32Tokenizer',
+    'deepseek_v4': 'tensorrt_llm.tokenizer.deepseek_v4.DeepseekV4Tokenizer',
 }
 
 
@@ -3510,15 +3509,27 @@ class BaseLlmArgs(StrictBaseModel):
                     "Please specify a tokenizer path or leave it as None to load from model path."
                 )
 
-            from tensorrt_llm.tokenizer import load_custom_tokenizer
+            # Resolve short aliases via the module-level TOKENIZER_ALIASES.
+            tokenizer_path = TOKENIZER_ALIASES.get(self.custom_tokenizer,
+                                                   self.custom_tokenizer)
 
-            # Use tokenizer path if specified, otherwise use model path
-            load_path = self.tokenizer if self.tokenizer else self.model
-            self.tokenizer = load_custom_tokenizer(
-                self.custom_tokenizer,
-                load_path,
-                trust_remote_code=self.trust_remote_code,
-                use_fast=self.tokenizer_mode != 'slow')
+            # Dynamically import and use custom tokenizer
+            from importlib import import_module
+            try:
+                module_path, class_name = tokenizer_path.rsplit('.', 1)
+                module = import_module(module_path)
+                tokenizer_class = getattr(module, class_name)
+                # Use tokenizer path if specified, otherwise use model path
+                load_path = self.tokenizer if self.tokenizer else self.model
+                self.tokenizer = tokenizer_class.from_pretrained(
+                    load_path,
+                    trust_remote_code=self.trust_remote_code,
+                    use_fast=self.tokenizer_mode != 'slow')
+            except (ValueError, ImportError, AttributeError) as e:
+                raise ValueError(
+                    f"Failed to load custom tokenizer '{self.custom_tokenizer}': {e}. "
+                    "Expected format: 'module.path.ClassName' or a recognized alias."
+                ) from e
         else:
             self.tokenizer = tokenizer_factory(
                 self.tokenizer,
