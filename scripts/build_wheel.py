@@ -565,11 +565,11 @@ def main(*,
     if build_type == "Debug":
         print(
             "-- Debug build: only --generate-line-info is enabled by default. "
-            "Full device debug info (-G) is NOT enabled because ptxas runs "
-            "out of memory on heavy cutlass GEMM kernels and gets OOM-killed. "
+            "Full device debug info (-G) is NOT enabled because it makes "
+            "ptxas memory usage explode and get OOM-killed on some kernels. "
             "If you need cuda-gdb stepping inside kernels, opt in with "
             "`--extra-cmake-vars CMAKE_CUDA_FLAGS_DEBUG=-G`, ideally combined "
-            "with `--fast_build` to skip the heaviest instantiations.")
+            "with `--fast_build` to skip the heaviest kernels.")
 
     cuda_architectures = cuda_architectures or 'all'
     cmake_cuda_architectures = f'"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}"'

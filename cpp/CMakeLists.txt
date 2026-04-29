@@ -328,10 +328,10 @@ endif()
 # configurations for all CUDA architectures at once will fail to link --
 # build_wheel.py enforces that a specific --cuda_architectures must be passed in
 # that case. Note: full device debug info (-G) is intentionally NOT enabled by
-# default for Debug -- it makes ptxas memory usage explode on cutlass GEMM
-# kernels and gets OOM-killed in CI. Developers who need cuda-gdb stepping can
-# opt in via `build_wheel.py --extra-cmake-vars CMAKE_CUDA_FLAGS_DEBUG=-G`,
-# ideally combined with --fast_build to skip the heavy cutlass instantiations.
+# default for Debug -- it makes ptxas memory usage explode on some kernels and
+# get OOM-killed in CI. Developers who need cuda-gdb stepping can opt in via
+# `build_wheel.py --extra-cmake-vars CMAKE_CUDA_FLAGS_DEBUG=-G`, ideally
+# combined with --fast_build to skip the heaviest kernels.
 # cmake-format: off
 set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} --generate-line-info")
 set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} --generate-line-info")
