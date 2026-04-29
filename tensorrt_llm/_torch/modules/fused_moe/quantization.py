@@ -501,8 +501,8 @@ class FusedMoEMethodBase(ABC):
             # Finalize shared weights eagerly so each layer's CPU tensors are freed
             # before the next layer is loaded. This prevents accumulation of all
             # layers' shared weight tensors in host memory simultaneously.
-            # For partial loading (e.g. RLHF), finalization is deferred to the
-            # caller's explicit finalization phase (see rlhf_utils.py).
+            # Partial-loading callers (e.g. RLHF reload) instead rely on
+            # ``post_load_weights`` to finalize once the loading sequence ends.
             self._finalize_shared_weights(module)
 
     def _prepare_shared_weights_for_finalization(self, module: torch.nn.Module):
@@ -525,8 +525,16 @@ class FusedMoEMethodBase(ABC):
         from accumulating in host memory simultaneously.  With fewer GPUs per
         node each rank is responsible for more experts, so the accumulated
         private tensors can easily exceed available host memory.
+
+        This method is idempotent: if the per-layer ``local_shared_*`` tensors
+        have already been finalized (and deleted), it is a no-op.  This lets
+        ``post_load_weights`` invoke it as a safety net for callers that pass
+        ``allow_partial_loading=True`` (e.g. the RLHF reload path), without
+        double-finalizing in the eager path.
         """
         if not self.need_load_shared_weights(module):
+            return
+        if not hasattr(module, 'local_shared_w3_w1_tensors'):
             return
         self._prepare_shared_weights_for_finalization(module)
         weight_fns = {
@@ -548,6 +556,11 @@ class FusedMoEMethodBase(ABC):
         module.layer_load_balancer.host_tensor_sharer.finalize_layer_weights()
 
     def post_load_weights(self, module: torch.nn.Module):
+        # Safety net for deferred-finalization callers (e.g. RLHF reload, which
+        # passes allow_partial_loading=True and so skips the eager per-layer
+        # finalization in load_weights).  Idempotent when finalization already
+        # ran eagerly.
+        self._finalize_shared_weights(module)
         if hasattr(module,
                    "layer_load_balancer") and module.layer_load_balancer:
             module.layer_load_balancer.set_initial_weight_assignments(
