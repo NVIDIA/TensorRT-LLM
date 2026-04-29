@@ -3209,7 +3209,16 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 }
 
                 if (noRegularTests && noIsolateTests) {
-                    error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
+                    // CBTS Layer 3 may narrow a block's tests below the stage's
+                    // split count, leaving some shards with 0 tests. That's
+                    // expected — other shards run the affected tests. Only
+                    // raise the sanity-check error when CBTS isn't active.
+                    def cbtsActive = testFilter[(CBTS_RESULT)]?.test_db_dir_override
+                    if (cbtsActive) {
+                        echo "CBTS Layer 3: shard ${splitId}/${splits} got 0 tests after narrowing — other shards run the affected tests. Marking as success."
+                    } else {
+                        error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
+                    }
                 }
             }
         }
