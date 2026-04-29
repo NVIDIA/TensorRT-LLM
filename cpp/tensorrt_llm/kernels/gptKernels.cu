@@ -195,7 +195,8 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
     int batchIdx = blockIdx.x;
 
     // Compute the padding offsets.
-    auto compute_padding_offset = [&](int* smem_offset, int maxSeqLength, int* paddingOffsets, int paddingOffsetsCapacity)
+    auto compute_padding_offset
+        = [&](int* smem_offset, int maxSeqLength, int* paddingOffsets, int paddingOffsetsCapacity, char const* bufName)
     {
         // Block x dimension is the batch dimension, while threads iterate all tokens in the sequence.
         int seqBegin = smem_offset[batchIdx];
@@ -206,27 +207,37 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         // The number of padded tokens in the previous sequences.
         int paddingOffset = batchIdx * maxSeqLength - seqBegin;
 
-        // Iterate over the tokens. Bound the write to the buffer's allocated capacity so a
-        // mismatched seqQLengths sum cannot scribble past the [numTokens]-sized allocation.
+        // Each write must lie within the buffer allocation (sized to numTokens on the caller side).
+        // If the caller's seqQLengths sum exceeds numTokens we surface the violation loudly so the
+        // upstream metadata bug is investigable rather than producing silent garbage offsets.
         for (int tokenIdx = threadIdx.x; tokenIdx < seqLength; tokenIdx += blockDim.x)
         {
             int const idx = seqBegin + tokenIdx;
-            if (idx < paddingOffsetsCapacity)
+            if (idx >= paddingOffsetsCapacity)
             {
-                paddingOffsets[idx] = paddingOffset;
+                if (threadIdx.x == 0)
+                {
+                    printf(
+                        "[computeSeqAndPaddingOffsets] %s OOB: blockIdx=%d batchSize=%d capacity=%d seqBegin=%d "
+                        "seqEnd=%d -- sum(seqQLengths) exceeds buffer capacity\n",
+                        bufName, blockIdx.x, params.batchSize, paddingOffsetsCapacity, seqBegin, seqEnd);
+                }
+                __trap();
             }
+            paddingOffsets[idx] = paddingOffset;
         }
     };
 
     if (params.paddingOffsets != nullptr)
     {
-        compute_padding_offset(smemSeqQOffsets, params.maxQSeqLength, params.paddingOffsets, params.numTokens);
+        compute_padding_offset(
+            smemSeqQOffsets, params.maxQSeqLength, params.paddingOffsets, params.numTokens, "paddingOffsets");
     }
 
     if (need_encoder_padding_offsets)
     {
-        compute_padding_offset(
-            smemEncoderSeqQOffsets, params.maxEncoderQSeqLength, params.encoderPaddingOffsets, params.numTokens);
+        compute_padding_offset(smemEncoderSeqQOffsets, params.maxEncoderQSeqLength, params.encoderPaddingOffsets,
+            params.numTokens, "encoderPaddingOffsets");
     }
 
     // Compute tokens Info (batchIdx, tokenIdxInSeq).
@@ -245,16 +256,24 @@ __global__ __launch_bounds__(THREADS_PER_BLOCK) void computeSeqAndPaddingOffsets
         // The length of the sequence.
         int seqLength = seqEnd - seqBegin;
 
-        // Iterate over the tokens. Each write is bounded by the tokensInfo allocation
-        // (sized to numTokens on the caller side); the bound keeps the kernel safe even if
-        // the caller's seqQLengths sum exceeds numTokens under multi-token generation paths.
+        // Each write must lie within the tokensInfo allocation (sized to numTokens on the caller
+        // side). If the caller's seqQLengths sum exceeds numTokens, surface the violation loudly so
+        // the upstream metadata bug is investigable rather than producing silent garbage entries.
         for (int tokenIdx = threadIdx.x; tokenIdx < seqLength; tokenIdx += blockDim.x)
         {
             int const idx = seqBegin + tokenIdx;
-            if (idx < params.numTokens)
+            if (idx >= params.numTokens)
             {
-                params.tokensInfo[idx] = make_int2(batchIdx, tokenIdx);
+                if (threadIdx.x == 0)
+                {
+                    printf(
+                        "[computeSeqAndPaddingOffsets] tokensInfo OOB: blockIdx=%d batchSize=%d numTokens=%d "
+                        "seqBegin=%d seqEnd=%d -- sum(seqQLengths) exceeds numTokens\n",
+                        blockIdx.x, params.batchSize, params.numTokens, seqBegin, seqEnd);
+                }
+                __trap();
             }
+            params.tokensInfo[idx] = make_int2(batchIdx, tokenIdx);
         }
     };
 
