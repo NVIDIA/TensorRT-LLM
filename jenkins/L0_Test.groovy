@@ -2567,12 +2567,11 @@ def renderTestDB(testContext, llmSrc, stageName, preDefinedMakoOpts=null) {
     }
 
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
-    // CBTS Layer 3: when CBTS provided a tmp test-db dir (each affected
-    // block's tests narrowed to entries in the per-block filter prefix
-    // subtree), point trt-test-db at it. Otherwise use the source test-db.
+    // CBTS Layer 3: use the narrowed test-db when CBTS provides one;
+    // perf stages keep the source test-db for stable baselines.
     def cbts = testFilter[(CBTS_RESULT)]
     def testDBPath = "${llmSrc}/tests/integration/test_lists/test-db"
-    if (cbts != null && cbts.test_db_dir_override) {
+    if (cbts != null && cbts.test_db_dir_override && !perfMode) {
         testDBPath = "${llmSrc}/${cbts.test_db_dir_override}"
         echo "CBTS [${cbts.scope}]: rendering test list from filtered test-db at ${testDBPath}"
     }
@@ -4423,17 +4422,17 @@ def launchTestJobs(pipeline, testFilter)
     }
 
     // CBTS Layer 2: stage-level short-circuit override. Runs AFTER all
-    // existing filter rules so that unknown / no-decision paths fall through
-    // naturally. Scope-agnostic: any non-null cbts result with affected_stages
-    // is treated as actionable. See jenkins/scripts/cbts/README.md.
+    // existing filter rules so unknown / no-decision paths fall through
+    // naturally. Perf stages are excluded — they have their own trigger
+    // model and need full test lists. See jenkins/scripts/cbts/README.md.
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts != null && cbts.affected_stages) {
         def affectedSet = cbts.affected_stages as Set
-        parallelJobsFiltered = parallelJobs.findAll { key, _ -> affectedSet.contains(key) }
+        parallelJobsFiltered = parallelJobs.findAll { key, _ ->
+            affectedSet.contains(key) && !(key =~ /Perf/)
+        }
         // Under `/bot run --post-merge`, keep only post-merge hits; if none,
-        // no-op (no fallback to full post-merge). IS_POST_MERGE is also true
-        // for the official PostMerge pipeline, but getCbtsResult() defers
-        // there, so reading it here is equivalent to "user passed --post-merge".
+        // no-op (no fallback to full post-merge).
         if (testFilter[(IS_POST_MERGE)]) {
             parallelJobsFiltered = parallelJobsFiltered.findAll { it.key.contains("Post-Merge") }
             echo "CBTS [${cbts.scope}] (--post-merge): keeping ${parallelJobsFiltered.size()} affected post-merge stages"
