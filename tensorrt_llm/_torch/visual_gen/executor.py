@@ -16,6 +16,7 @@ import zmq
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.executor.ipc import ZeroMqQueue
+from tensorrt_llm.llmapi.utils import configure_cpu_affinity
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import VisualGenArgs
 
@@ -353,6 +354,14 @@ def run_diffusion_worker(
         device_id = _local_rank % torch.cuda.device_count() if torch.cuda.is_available() else 0
         if torch.cuda.is_available():
             torch.cuda.set_device(device_id)
+            try:
+                configure_cpu_affinity(device_id)
+            except Exception as e:
+                logger.warning(
+                    f"[rank {rank}] NUMA-aware CPU affinity setup failed: {e}. "
+                    f"The worker will run without NUMA pinning, which may impact "
+                    f"performance."
+                )
 
         dist.init_process_group(
             backend="cuda:nccl,cpu:gloo" if torch.cuda.is_available() else "gloo",
