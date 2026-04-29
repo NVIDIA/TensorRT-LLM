@@ -1412,7 +1412,13 @@ def _(
 
 class FinegrainedMixedDtypeGemm(TunableRunner):
     _runner_dict = dict()
+    # Max SM for W4A8 (FP8 activation). The Sm80 fallback used on SM120/121
+    # has no FP8 mma, so W4A8 remains capped here.
     MAX_SUPPORTED_SM_VERSION = 103
+    # Max SM for W4A16 (FP16/BF16 activation). SM120/121 dispatch through
+    # cutlass::arch::Sm80 MMA kernels which are MMA-compatible with Blackwell
+    # consumer GPUs (RTX 5090/5080).
+    MAX_SUPPORTED_SM_VERSION_W4A16 = 121
 
     def __init__(self, activation_dtype: torch.dtype, output_dtype: torch.dtype,
                  quant_mode: int):
@@ -1445,7 +1451,10 @@ class FinegrainedMixedDtypeGemm(TunableRunner):
                 do_preparation: bool = False,
                 **kwargs) -> torch.Tensor:
 
-        if get_sm_version() > self.MAX_SUPPORTED_SM_VERSION:
+        max_sm = (self.MAX_SUPPORTED_SM_VERSION
+                  if self.activation_dtype == torch.float8_e4m3fn else
+                  self.MAX_SUPPORTED_SM_VERSION_W4A16)
+        if get_sm_version() > max_sm:
             raise ValueError(
                 f"SM version {get_sm_version()} is not supported for W4A16/W4A8 finegrained mixed dtype GEMM"
             )

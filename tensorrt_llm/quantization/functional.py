@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -959,7 +959,13 @@ def preprocess_weights_for_mixed_gemm(
     sm_ = sm_ if sm_ > 0 else get_sm_version()
     if len(tensor.shape) == 2:
         tensor = tensor.unsqueeze(0)
-    elif sm_ >= 90:
+    # Hopper / Blackwell weight-only paths reuse the SM80 layout (TMA-WS or
+    # SM80-fallback kernels read the same interleaved/row-permuted format).
+    # This adjustment must apply for both 2-D and 3-D inputs; previously it
+    # was guarded by an elif tied to the 2-D shape check, which silently
+    # skipped row permutation + column interleave for vanilla 2-D linears on
+    # SM>=90 and produced wrong-layout weights on SM120/121.
+    if sm_ >= 90:
         sm_ = 80
     if sm_ == 100 or sm_ == 103:
         do_weight_interleave = False
