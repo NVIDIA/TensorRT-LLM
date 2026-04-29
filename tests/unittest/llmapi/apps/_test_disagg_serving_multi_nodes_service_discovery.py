@@ -1,8 +1,10 @@
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
 import uuid
+from contextlib import ExitStack
 
 import openai
 import pytest
@@ -20,19 +22,24 @@ NODE_RANK = int(os.environ.get("SLURM_NODEID", 0))
 NODE_LIST = expand_slurm_nodelist(os.environ.get("SLURM_NODELIST", ""))
 SLURM_NTASKS_PER_NODE = int(os.environ.get("SLURM_NTASKS_PER_NODE", 1))
 
+# When SLURM is not available, fall back to single-node mode using localhost
+if not NODE_LIST:
+    NODE_LIST = [socket.gethostname()]
+
 # This a multi-node QA test, use a fixed port instead of finding a free port
 # so that all nodes can have the same disagg server config
 DISAGG_SERVER_PORT = 8000
 
 
-# This test is supposed to run with 2 nodes or more
 def is_ctx_node():
-    assert len(NODE_LIST) == 2
+    if len(NODE_LIST) < 2:
+        return True
     return NODE_RANK == 0
 
 
 def is_gen_node():
-    assert len(NODE_LIST) == 2
+    if len(NODE_LIST) < 2:
+        return True
     return NODE_RANK == 1
 
 
@@ -105,45 +112,40 @@ def worker(model_name: str, disagg_cluster_config: dict):
         "return_perf_metrics": True,
         "perf_metrics_max_requests": 1000,
     }
+    model_path = get_model_path(model_name)
+    tp_size, pp_size = 1, 1
+    args = ["--tp_size", str(tp_size), "--pp_size", str(pp_size)]
+
+    roles = []
+    if is_ctx_node():
+        roles.append(ServerRole.CONTEXT)
+    if is_gen_node():
+        roles.append(ServerRole.GENERATION)
+
+    if not roles:
+        yield None
+        return
+
     # start workers on 0.0.0.0:<free_port>, then the workers should be able to
     # report their correct hostname:port to the disagg server
-    port = get_free_port()
-    if is_ctx_node():
-        print(f"starting ctx_server for rank {RANK} node rank {NODE_RANK}")
-        model_path = get_model_path(model_name)
-        tp_size, pp_size = 1, 1
-        args = ["--tp_size", str(tp_size), "--pp_size", str(pp_size)]
-        with RemoteOpenAIServer(
-            model_path,
-            port=port,
-            cli_args=args,
-            host="0.0.0.0",
-            env=env(),
-            llmapi_launch=False,
-            rank=RANK % SLURM_NTASKS_PER_NODE,
-            extra_config=extra_config,
-            role=ServerRole.CONTEXT,
-        ) as server:
-            yield server
-    elif is_gen_node():
-        print(f"starting gen_server for rank {RANK} node rank {NODE_RANK}")
-        model_path = get_model_path(model_name)
-        tp_size, pp_size = 1, 1
-        args = ["--tp_size", str(tp_size), "--pp_size", str(pp_size)]
-        with RemoteOpenAIServer(
-            model_path,
-            port=port,
-            cli_args=args,
-            host="0.0.0.0",
-            env=env(),
-            llmapi_launch=False,
-            rank=RANK % SLURM_NTASKS_PER_NODE,
-            extra_config=extra_config,
-            role=ServerRole.GENERATION,
-        ) as server:
-            yield server
-    else:
-        yield None
+    with ExitStack() as stack:
+        servers = [
+            stack.enter_context(
+                RemoteOpenAIServer(
+                    model_path,
+                    port=get_free_port(),
+                    cli_args=args,
+                    host="0.0.0.0",
+                    env=env(),
+                    llmapi_launch=False,
+                    rank=RANK % SLURM_NTASKS_PER_NODE,
+                    extra_config=extra_config,
+                    role=role,
+                )
+            )
+            for role in roles
+        ]
+        yield servers[0] if len(roles) == 1 else None
 
 
 # different from non-service-discovery version, disagg server doesn't have to
