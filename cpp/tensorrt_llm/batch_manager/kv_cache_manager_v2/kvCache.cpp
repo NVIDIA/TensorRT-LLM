@@ -541,7 +541,10 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
     int newNumBlocks = divUp(newCap, mTokensPerBlock);
 
     if (newNumBlocks < oldNumBlocks)
+    {
+        auto scope = recordEventScope();
         _decreaseCapacity(newNumBlocks);
+    }
     else if (newNumBlocks > oldNumBlocks)
         _increaseCapacity(newNumBlocks, newHist);
 
@@ -692,6 +695,7 @@ std::vector<KvCache::StaleBackup> KvCache::_unlockStaleBlocks(int newHistoryLeng
     if (newHistoryLength == mHistoryLength)
         return ret;
 
+    auto scope = recordEventScope();
     auto const& lcs = mManager->lifeCycles();
     int numLc = mManager->storage().numLifeCycles();
 
