@@ -457,12 +457,24 @@ def generate_kernel_from_subgraph(subgraph) -> Callable:
             safe_name = out_name
             cast = ""
         elif out_dt in ("tl.bfloat16", "tl.float16"):
-            # NaN/inf sanitization before bf16/f16 downcast (IEEE 754: x != x is true only for NaN)
+            # NaN/inf sanitization before bf16/f16 downcast (IEEE 754: x != x is true only for NaN).
+            # Clamp bound must match the output dtype's max-finite value — using fp16's 65504
+            # for a bf16 store would silently truncate legitimate values in [65504, 3.39e38]
+            # that bf16 can represent. This only masks the overflow symptom; the NaN root cause
+            # (e.g. rsqrt of a near-zero value) should be fixed upstream when possible.
+            if out_dt == "tl.float16":
+                # fp16 max-finite: (1 + 1023/1024) * 2^15 = 65504
+                clamp_bound = 65504.0
+            else:
+                # bf16 max-finite: (1 + 127/128) * 2^127 ≈ 3.389531389251535e+38
+                clamp_bound = 3.3895313892515355e38
             safe_name = f"_safe{i}"
             body_lines.append(
                 f"    {safe_name} = tl.where({out_name} != {out_name}, 0.0, {out_name})"
             )
-            body_lines.append(f"    {safe_name} = tl.clamp({safe_name}, -65504.0, 65504.0)")
+            body_lines.append(
+                f"    {safe_name} = tl.clamp({safe_name}, {-clamp_bound}, {clamp_bound})"
+            )
             cast = f".to({out_dt})"
         else:
             safe_name = out_name
