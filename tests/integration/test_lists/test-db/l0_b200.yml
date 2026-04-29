@@ -320,9 +320,9 @@ l0_b200:
   - unittest/auto_deploy/singlegpu/custom_ops/moe/test_ad_moe_op.py
   - unittest/auto_deploy/singlegpu/custom_ops/moe/test_trtllm_moe.py
   - unittest/auto_deploy/singlegpu/custom_ops/quantization/test_quant.py
-  # singlegpu/models tests are HF-modeling-layer correctness checks (no SM-specific paths,
-  # no quant references); covered on Hopper (l0_h100.yml).
-  - unittest/auto_deploy/singlegpu/shim
+  # singlegpu/models and singlegpu/shim are AutoDeploy Python/glue-layer correctness
+  # tests (HF modeling parity, LlmArgs validation, executor/engine wiring) with no
+  # SM-specific paths and no quant references; covered on Hopper (l0_h100.yml).
   # B-tier only runs the FP8 build smoke (FP8 block-scaling GEMM is SM-specific).
   # All other singlegpu/smoke variants are bf16/HW-agnostic and covered on Hopper (l0_h100.yml).
   - unittest/auto_deploy/singlegpu/smoke/test_ad_build_small_single.py -k "Nemotron-3-Nano-30B-A3B-FP8"
