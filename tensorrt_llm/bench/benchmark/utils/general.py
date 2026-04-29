@@ -87,12 +87,16 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     if extra_llm_api_options:
         with open(extra_llm_api_options, 'r') as f:
             llm_args_dict = yaml.safe_load(f)
-            kv_cache_config = llm_args_dict.get("kv_cache_config", {
-                "dtype": "auto",
-            })
-            kv_cache_dtype = kv_cache_config.get("dtype", "auto")
-            mamba_ssm_cache_dtype = kv_cache_config.get("mamba_ssm_cache_dtype",
-                                                        mamba_ssm_cache_dtype)
+        if not isinstance(llm_args_dict, dict):
+            raise TypeError(
+                f"extra_llm_api_options must contain a YAML mapping, "
+                f"got {type(llm_args_dict)}")
+        kv_cache_config = llm_args_dict.get("kv_cache_config", {
+            "dtype": "auto",
+        })
+        kv_cache_dtype = kv_cache_config.get("dtype", "auto")
+        mamba_ssm_cache_dtype = kv_cache_config.get("mamba_ssm_cache_dtype",
+                                                    mamba_ssm_cache_dtype)
 
         enable_chunked_prefill = llm_args_dict.get("enable_chunked_prefill",
                                                    enable_chunked_prefill)

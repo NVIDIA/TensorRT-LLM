@@ -79,9 +79,11 @@ def calc_engine_setting(
     else:
         # Fallback to param_count-based estimation for backward compatibility.
         engine_size = model_config.param_count * byte_per_elem / (1024**3)
-    # With attention DP, each TP rank independently manages its own KV cache
-    # and holds a TP shard of the model weights. Compute per-rank available
-    # memory: single GPU memory minus per-rank engine size.
+    # With attention DP, each TP rank independently manages its own KV cache.
+    # Attention weights are replicated across TP ranks, while MoE/MLP weights
+    # are distributed via expert parallelism (EP). We approximate per-rank
+    # engine size as total / tp_size, which slightly underestimates because
+    # replicated attention weights are small relative to distributed MoE weights.
     if enable_attention_dp:
         total_gpu_memory = get_device_memory() * pp_size
         engine_size = engine_size / tp_size
@@ -153,7 +155,8 @@ def calc_engine_setting(
     if kv_cache_max_requests < 1:
         raise RuntimeError("The amount of KV cache memory is insufficient to "
                            "run this model. Please try with more GPUs.")
-    if cache_memory / n_gpus < 10.0:
+    warning_gpu_count = pp_size if enable_attention_dp else n_gpus
+    if cache_memory / warning_gpu_count < 10.0:
         logger.warning(
             f"The KV cache memory per GPU is less than 10 GB. "
             "Performance may be undesirable. Please consider using a different "

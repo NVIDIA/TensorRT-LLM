@@ -219,7 +219,8 @@ class ModelConfig(BaseModel):
                 count * SAFETENSORS_DTYPE_BYTES.get(dtype, 1)
                 for dtype, count in metadata.parameter_count.items())
             checkpoint_size_in_gb = checkpoint_size_in_bytes / (1024**3)
-        assert param_count, (f"Can't get valid parameter count for model: "
+        if not param_count:
+            raise ValueError(f"Can't get valid parameter count for model: "
                              f"{hf_model_path or model_hf_name}.")
 
         return param_count, checkpoint_size_in_gb
