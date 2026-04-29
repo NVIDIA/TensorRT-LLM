@@ -289,7 +289,14 @@ public:
     [[nodiscard]] auto recordEventScope()
     {
         assert(!mFinishEvent.has_value());
-        mFinishEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(*mCudaStream));
+        // When mCudaStream is nullopt the cache was never resumed — no GPU work
+        // was performed, so no CUDA event synchronization is needed.  Blocks only
+        // contain PageHolders (not SharedPageLocks) whose destructors do not read
+        // finishEvent.  Mirrors Python's _record_event() early-return path.
+        if (mCudaStream.has_value())
+        {
+            mFinishEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(*mCudaStream));
+        }
         return FuncGuard([this]() { mFinishEvent.reset(); });
     }
 

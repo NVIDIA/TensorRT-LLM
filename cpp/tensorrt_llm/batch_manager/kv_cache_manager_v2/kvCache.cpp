@@ -1078,7 +1078,7 @@ void KvCache::stopCommitting()
                 sb.treeBlock = newBlock;
                 ++mNumCommittedBlocks;
             }
-            else if (newBlock && newBlock->isFull() && mManager->allowSeqRebasing())
+            else if (newBlock && newBlock->isFull() && mManager->allowSeqRebasing() && tokensLeft >= mTokensPerBlock)
             {
                 // Existing block, rebase — mirrors Python's _commit_block rebase path.
                 std::vector<BatchedLockTarget> reuseTasks;
