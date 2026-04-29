@@ -921,7 +921,16 @@ def test_fp8_k_cache_roundtrip():
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
 @pytest.mark.parametrize("batch_size,next_n", [(4, 1), (2, 2), (4, 3), (4, 4)])
-@pytest.mark.parametrize("backend", ["deepgemm", "dsl"])
+@pytest.mark.parametrize("backend", [
+    "deepgemm",
+    pytest.param(
+        "dsl",
+        marks=pytest.mark.skipif(
+            get_sm_version() not in (100, 103),
+            reason=
+            f"CuTe DSL FP8 Paged MQA Logits only supports SM 100/103, got SM {get_sm_version()}",
+        )),
+])
 def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend):
     """
     Test FP8 paged KV cache with two-phase workflow and variable context lengths.
