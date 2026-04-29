@@ -207,8 +207,6 @@ void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual
     if (M <= 0)
         return;
 
-    TLLM_CHECK_WITH_INFO(hidden_size == static_cast<int>(FHC_HIDDEN),
-        "mhcFusedHcLaunch: hidden_size=%d not supported (only %u)", hidden_size, FHC_HIDDEN);
     TLLM_CHECK_WITH_INFO(hc_mult == static_cast<int>(FHC_HC_MULT),
         "mhcFusedHcLaunch: hc_mult=%d not supported (only %u)", hc_mult, FHC_HC_MULT);
 
@@ -391,8 +389,6 @@ void mhcFusedHcAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* 
     if (M <= 0)
         return;
 
-    TLLM_CHECK_WITH_INFO(hidden_size == static_cast<int>(FHC_HIDDEN),
-        "mhcFusedHcAllInOneLaunch: hidden_size=%d not supported (only %u)", hidden_size, FHC_HIDDEN);
     TLLM_CHECK_WITH_INFO(hc_mult == static_cast<int>(FHC_HC_MULT),
         "mhcFusedHcAllInOneLaunch: hc_mult=%d not supported (only %u)", hc_mult, FHC_HC_MULT);
 
