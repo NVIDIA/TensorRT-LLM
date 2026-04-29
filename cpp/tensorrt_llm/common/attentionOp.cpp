@@ -723,7 +723,7 @@ int AttentionOp::getHeadSize(bool checkInit) const
 }
 
 size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t max_num_seq, int32_t input_seq_length,
-    int32_t cross_kv_length, int32_t max_num_tokens) const noexcept
+    int32_t cross_kv_length, int32_t max_num_tokens, int32_t total_kv_len) const noexcept
 {
     if (max_num_tokens == 0)
     {
@@ -800,8 +800,12 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
         }
         else
         {
-            fp8_k_buf_size = mChunkPrefillBufferBatchSize * max_num_tokens * static_cast<size_t>(total_k_dim_all_heads);
-            fp8_v_buf_size = mChunkPrefillBufferBatchSize * max_num_tokens * static_cast<size_t>(total_v_dim_all_heads);
+            // Use total_kv_len when available (KV cache reuse causes total_kv_len >> max_num_tokens).
+            // enqueueContext sizes these buffers by total_kv_len, so workspace must match.
+            size_t const kv_buf_tokens = std::max(
+                static_cast<size_t>(total_kv_len), static_cast<size_t>(mChunkPrefillBufferBatchSize) * max_num_tokens);
+            fp8_k_buf_size = kv_buf_tokens * static_cast<size_t>(total_k_dim_all_heads);
+            fp8_v_buf_size = kv_buf_tokens * static_cast<size_t>(total_v_dim_all_heads);
         }
     }
 
