@@ -16,6 +16,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
+import triton
 from einops import repeat
 
 from tensorrt_llm._torch.modules.mamba.checkpointing_state_update import (
@@ -46,8 +47,11 @@ _CONFIGS = [
 @pytest.mark.parametrize(
     "T", [6, 10, 16, 27, 32, 55], ids=["T6", "T10", "T16", "T27", "T32", "T55"]
 )
+@pytest.mark.parametrize(
+    "write_checkpoint", [True, False], ids=["write", "no_write"]
+)
 def test_checkpointing_state_update(
-    nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, T
+    nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, T, write_checkpoint
 ):
     """
     Verify that:
@@ -60,6 +64,12 @@ def test_checkpointing_state_update(
     device = "cuda"
     dtype = torch.bfloat16  # input activations are bf16
     assert nheads % ngroups == 0
+
+    # Cache T-axis size (max_window).  Use the kernel's BLOCK_SIZE_T as the
+    # ceiling — this is what the wrapper allows and enables PNAT-aware writes
+    # at [PNAT, PNAT+T) for no-checkpoint mode.  For T=6 that's 16 (production
+    # max_window); for larger T it scales with np2(T).
+    max_window = max(triton.next_power_of_2(T), 16)
 
     if paged_cache:
         cache_size = 4
@@ -120,37 +130,43 @@ def test_checkpointing_state_update(
     )
 
     # Build cache tensors for the replay kernel.
-    # old_x: (cache, T, nheads, dim) bf16 — single-buffered
-    # old_B: (cache, 2, T, ngroups, dstate) bf16 — double-buffered
-    # old_dt: (cache, 2, nheads, T) fp32 — double-buffered, T contiguous
-    # old_dA_cumsum: (cache, 2, nheads, T) fp32 — double-buffered, T contiguous
+    # old_x: (cache, max_window, nheads, dim) bf16 — single-buffered
+    # old_B: (cache, 2, max_window, ngroups, dstate) bf16 — double-buffered
+    # old_dt: (cache, 2, nheads, max_window) fp32 — double-buffered, T contiguous
+    # old_dA_cumsum: (cache, 2, nheads, max_window) fp32 — double-buffered, T contiguous
     # cache_buf_idx: random 0s and 1s to verify indexing correctness
-    old_x = torch.zeros(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
-    old_B = torch.randn(cache_size, 2, T, ngroups, d_state, device=device, dtype=dtype)
-    old_dt = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
-    old_dA_cumsum = torch.randn(cache_size, 2, nheads, T, device=device, dtype=torch.float32)
+    old_x = torch.zeros(cache_size, max_window, nheads, head_dim, device=device, dtype=dtype)
+    old_B = torch.randn(cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype)
+    old_dt = torch.randn(cache_size, 2, nheads, max_window, device=device, dtype=torch.float32)
+    old_dA_cumsum = torch.randn(cache_size, 2, nheads, max_window, device=device, dtype=torch.float32)
     cache_buf_idx = torch.randint(0, 2, (cache_size,), device=device, dtype=torch.int32)
 
-    # Fill each slot's READ buffer (indexed by cache_buf_idx) with step 1's data.
-    # The OTHER buffer has random garbage to catch indexing bugs.
+    # Fill each slot's active buffer (= cache_buf_idx) with step 1's data at
+    # positions [0:T).  Positions [T:max_window) stay as torch.randn garbage —
+    # they're outside the test's PNAT range, kernel doesn't read them.
+    # The OTHER (inactive) buffer has random garbage to catch indexing bugs.
     slots = state_batch_indices if paged_cache else slice(None)
-    old_x[slots] = x1
+    old_x[slots, :T] = x1
 
     # Compute processed dt and dA_cumsum for step 1
     dt1 = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
     dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1, dim=1)
 
-    # Write to each slot's read buffer based on its cache_buf_idx
+    # Write to each slot's active buffer based on its cache_buf_idx
     slot_indices = state_batch_indices.tolist() if paged_cache else list(range(cache_size))
     for i, slot in enumerate(slot_indices):
         buf = cache_buf_idx[slot].item()
         batch_idx = i  # maps slot back to the batch index
-        old_B[slot, buf] = B1[batch_idx]
-        old_dt[slot, buf] = dt1[batch_idx].T  # (T, nheads) → (nheads, T)
-        old_dA_cumsum[slot, buf] = dA_cumsum1[batch_idx].T  # (T, nheads) → (nheads, T)
+        old_B[slot, buf, :T] = B1[batch_idx]
+        old_dt[slot, buf, :, :T] = dt1[batch_idx].T  # (T, nheads) → (nheads, T)
+        old_dA_cumsum[slot, buf, :, :T] = dA_cumsum1[batch_idx].T  # (T, nheads) → (nheads, T)
 
-    # Main loop: test each k (number of old tokens replayed)
+    # Main loop: test each k (number of old tokens replayed).  For
+    # write_checkpoint=False, the kernel writes new tokens at [k:k+T) of the
+    # active buffer — skip k where this would exceed max_window.
     for k in range(T + 1):
+        if not write_checkpoint and k + T > max_window:
+            continue
         torch.manual_seed(k + 100)
 
         x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
@@ -179,18 +195,23 @@ def test_checkpointing_state_update(
             out=ref_out,
         )
 
-        # Replay kernel
+        # Replay kernel — clone caches into mutable working copies that we
+        # can inspect AFTER the call to verify cache postconditions.
         test_state = state0.clone()
         prev_tokens = torch.full((cache_size,), k, device=device, dtype=torch.int32)
         test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+        old_x_w = old_x.clone()
+        old_B_w = old_B.clone()
+        old_dt_w = old_dt.clone()
+        old_dA_cumsum_w = old_dA_cumsum.clone()
         # cache_buf_idx stays at its random values — each slot reads from its own buffer
 
         checkpointing_state_update(
             test_state,
-            old_x.clone(),
-            old_B.clone(),
-            old_dt.clone(),
-            old_dA_cumsum.clone(),
+            old_x_w,
+            old_B_w,
+            old_dt_w,
+            old_dA_cumsum_w,
             cache_buf_idx.clone(),
             prev_tokens,
             x=x2,
@@ -203,6 +224,7 @@ def test_checkpointing_state_update(
             dt_bias=dt_bias,
             dt_softplus=True,
             state_batch_indices=state_batch_indices,
+            write_checkpoint=write_checkpoint,
         )
 
         # Tolerance rationale: the replay kernel uses bf16 tl.dot for four
@@ -230,9 +252,17 @@ def test_checkpointing_state_update(
             )
             raise
 
-        expected_state = (
-            state0[slots] if k == 0 else states_buffer_f32[slots, k - 1].to(state_dtype)
-        )
+        # State expectation depends on write_checkpoint:
+        #   True  → kernel writes the post-replay state; expect the
+        #           selective_state_update reference's state at step k-1.
+        #   False → kernel skips the HBM store; state must be UNCHANGED
+        #           from the input (state0).
+        if write_checkpoint:
+            expected_state = (
+                state0[slots] if k == 0 else states_buffer_f32[slots, k - 1].to(state_dtype)
+            )
+        else:
+            expected_state = state0[slots]
         state_diff = (test_state[slots].float() - expected_state.float()).abs()
         state_max = state_diff.max().item()
         state_mean = state_diff.mean().item()
@@ -241,8 +271,8 @@ def test_checkpointing_state_update(
                 test_state[slots],
                 expected_state,
                 rtol=2e-2,
-                atol=1.0,
-                msg=f"State mismatch at k={k}",
+                atol=1.0 if write_checkpoint else 0.0,
+                msg=f"State mismatch at k={k} (write_checkpoint={write_checkpoint})",
             )
         except AssertionError:
             print(
@@ -251,6 +281,80 @@ def test_checkpointing_state_update(
                 f"inf={torch.isinf(test_state).any().item()}"
             )
             raise
+
+        # --- Cache postconditions ---
+        # Compute step 2's processed values (what the kernel should have
+        # stored at [write_offset : write_offset+T) of write_buf):
+        #   write_buf    = (1 - active_buf) if write_checkpoint else active_buf
+        #   write_offset = 0                if write_checkpoint else k
+        # Untouched cache regions must equal their pre-call snapshots
+        # (old_x / old_B / old_dt / old_dA_cumsum captured before the call).
+        dt2_proc = F.softplus(dt2_base.float() + dt_bias_base.float()[None, None, :])  # (B,T,H)
+        dA_cumsum2 = torch.cumsum(A_base.float()[None, None, :] * dt2_proc, dim=1)
+        write_offset = 0 if write_checkpoint else k
+
+        for batch_idx, slot in enumerate(slot_indices):
+            active = cache_buf_idx[slot].item()
+            wb = (1 - active) if write_checkpoint else active
+
+            # --- old_x (single-buffered): write at [write_offset : +T) of slot ---
+            written_x = old_x_w[slot, write_offset : write_offset + T]
+            torch.testing.assert_close(
+                written_x, x2[batch_idx], rtol=0, atol=0,
+                msg=f"old_x written region wrong at k={k} write={write_checkpoint}",
+            )
+            # Untouched ranges of old_x[slot]
+            if write_offset > 0:
+                torch.testing.assert_close(
+                    old_x_w[slot, :write_offset], old_x[slot, :write_offset],
+                    rtol=0, atol=0,
+                    msg=f"old_x [0:{write_offset}) modified at k={k} write={write_checkpoint}",
+                )
+            if write_offset + T < max_window:
+                torch.testing.assert_close(
+                    old_x_w[slot, write_offset + T:], old_x[slot, write_offset + T:],
+                    rtol=0, atol=0,
+                    msg=f"old_x [{write_offset+T}:) modified at k={k} write={write_checkpoint}",
+                )
+
+            # --- old_B (double-buffered): write at write_buf, [write_offset:+T) ---
+            torch.testing.assert_close(
+                old_B_w[slot, wb, write_offset : write_offset + T],
+                B2[batch_idx], rtol=0, atol=0,
+                msg=f"old_B written region wrong at k={k} write={write_checkpoint}",
+            )
+            # Other-buffer (= 1-wb) untouched
+            torch.testing.assert_close(
+                old_B_w[slot, 1 - wb], old_B[slot, 1 - wb],
+                rtol=0, atol=0,
+                msg=f"old_B inactive buffer modified at k={k} write={write_checkpoint}",
+            )
+
+            # --- old_dt (double-buffered, fp32, layout (heads, T)): ---
+            torch.testing.assert_close(
+                old_dt_w[slot, wb, :, write_offset : write_offset + T],
+                dt2_proc[batch_idx].T,
+                rtol=1e-4, atol=1e-4,
+                msg=f"old_dt written region wrong at k={k} write={write_checkpoint}",
+            )
+            torch.testing.assert_close(
+                old_dt_w[slot, 1 - wb], old_dt[slot, 1 - wb],
+                rtol=0, atol=0,
+                msg=f"old_dt inactive buffer modified at k={k} write={write_checkpoint}",
+            )
+
+            # --- old_dA_cumsum (double-buffered, fp32, layout (heads, T)): ---
+            torch.testing.assert_close(
+                old_dA_cumsum_w[slot, wb, :, write_offset : write_offset + T],
+                dA_cumsum2[batch_idx].T,
+                rtol=1e-4, atol=1e-4,
+                msg=f"old_dA_cumsum written region wrong at k={k} write={write_checkpoint}",
+            )
+            torch.testing.assert_close(
+                old_dA_cumsum_w[slot, 1 - wb], old_dA_cumsum[slot, 1 - wb],
+                rtol=0, atol=0,
+                msg=f"old_dA_cumsum inactive buf modified at k={k} write={write_checkpoint}",
+            )
 
 
 @_skip_pre_sm100
