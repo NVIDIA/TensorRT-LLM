@@ -405,7 +405,20 @@ class _SharedPageLock:
 
     def __del__(self) -> None:
         if self._uniq_lock is not None:
-            self.unlock()
+            try:
+                self.unlock()
+            except ValueError:
+                # Interpreter shutdown can release the C++ KV cache before
+                # its outstanding _SharedPageLocks finalize, leaving
+                # self._user.kv_cache as a dangling rawref. Registering a
+                # finish_event on a freed cache is meaningless (no consumer
+                # remains), so drop the lock state quietly. Without this
+                # guard the ValueError raised from unwrap_rawref propagates
+                # out of __del__ and Python prints it but the surrounding
+                # destructor chain stalls — visible as srun timing out
+                # waiting for the worker rank to exit even though all
+                # bench iters and report_json writes have completed.
+                self._uniq_lock = None
 
     def unlock(self) -> Page:
         assert self._uniq_lock is not None
