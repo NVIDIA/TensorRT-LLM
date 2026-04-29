@@ -25,9 +25,12 @@ from typing import Any, Callable
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.kv_cache_hash import (
     KV_CACHE_HASH_ALGO_AUTO,
+    KV_CACHE_HASH_ALGO_DEFAULT,
     KV_CACHE_HASH_ALGO_V1,
     KV_CACHE_HASH_ALGO_V2,
     KV_CACHE_HASH_ALGO_V2_SHA256_64,
+    NonTextTokenHashError,
+    hash_v1_block_key,
     truncate_sha256_hash_to_int64,
 )
 
@@ -116,15 +119,12 @@ class KVCacheEventManager:
         window_size_by_layer_group: dict[int, int] | None = None,
     ) -> None:
         if hash_algo == KV_CACHE_HASH_ALGO_AUTO:
-            hash_algo = KV_CACHE_HASH_ALGO_V2
-        elif hash_algo == KV_CACHE_HASH_ALGO_V1:
-            logger.warning(
-                "V1 KV cache event hash algorithm is not supported by V2 "
-                "KV cache manager events: "
-                f"{hash_algo}. Falling back to {KV_CACHE_HASH_ALGO_V2_SHA256_64}."
-            )
-            hash_algo = KV_CACHE_HASH_ALGO_V2_SHA256_64
-        elif hash_algo not in (KV_CACHE_HASH_ALGO_V2, KV_CACHE_HASH_ALGO_V2_SHA256_64):
+            hash_algo = KV_CACHE_HASH_ALGO_DEFAULT
+        elif hash_algo not in (
+            KV_CACHE_HASH_ALGO_V1,
+            KV_CACHE_HASH_ALGO_V2,
+            KV_CACHE_HASH_ALGO_V2_SHA256_64,
+        ):
             raise ValueError(f"Unsupported V2 KV cache event hash algorithm: {hash_algo}")
         self._max_kv_event_entries = max_kv_event_entries
         self._window_size = window_size
@@ -139,6 +139,10 @@ class KVCacheEventManager:
         self._pending_events: list[KVCacheEvent] = []
         self._events: deque[KVCacheEvent] = deque()
         self._condition = Condition()
+        self._v1_hash_by_block_key: dict[bytes, int] = {}
+        self._v1_hash_compatible_keys: set[bytes] = set()
+        self._v1_root_attrs_by_block_key: dict[bytes, tuple[int | None, int | None]] = {}
+        self._warned_v1_hash_fallback = False
 
     def add_created_event(
         self,
@@ -176,7 +180,7 @@ class KVCacheEventManager:
             return
         parent_hash = self._parent_hash_from_radix_block(block)
         self._stored_blocks[block.key] = _StoredBlockState(
-            block_hash=self._normalize_block_hash(block.key),
+            block_hash=self._hash_from_radix_block(block),
             life_cycle_ids=set(life_cycle_ids),
         )
         for life_cycle_id in sorted(life_cycle_ids):
@@ -465,6 +469,7 @@ class KVCacheEventManager:
             state = self._stored_blocks.pop(block_hash, None)
             if state is None:
                 return None
+            self._drop_hash_cache(block_hash)
             return state.block_hash, set(state.life_cycle_ids)
         return block_hash, set()
 
@@ -483,7 +488,13 @@ class KVCacheEventManager:
         is_last_life_cycle = not state.life_cycle_ids
         if is_last_life_cycle:
             self._stored_blocks.pop(block_hash, None)
+            self._drop_hash_cache(block_hash)
         return state.block_hash, life_cycle_id, is_last_life_cycle
+
+    def _drop_hash_cache(self, block_hash: bytes) -> None:
+        self._v1_hash_by_block_key.pop(block_hash, None)
+        self._v1_hash_compatible_keys.discard(block_hash)
+        self._v1_root_attrs_by_block_key.pop(block_hash, None)
 
     @staticmethod
     def _normalize_token(token: TokenIdExt) -> UniqueToken:
@@ -514,7 +525,7 @@ class KVCacheEventManager:
             return None
 
         return KVCacheStoredBlockData(
-            block_hash=self._normalize_block_hash(block.key),
+            block_hash=self._hash_from_radix_block(block),
             tokens=[self._normalize_token(token) for token in block.tokens],
             cache_level=int(cache_level),
             priority=int(priority),
@@ -533,4 +544,88 @@ class KVCacheEventManager:
         parent = block.prev
         if getattr(parent, "ordinal", -1) == -1:
             return None
-        return self._normalize_block_hash(parent.key)
+        return self._hash_from_radix_block(parent)
+
+    def _hash_from_radix_block(self, block: Any) -> EventBlockHash:
+        if self._hash_algo == KV_CACHE_HASH_ALGO_V1:
+            return self._v1_hash_from_radix_block(block)
+        return self._normalize_block_hash(block.key)
+
+    def _v1_hash_from_radix_block(self, block: Any) -> int:
+        key = bytes(block.key)
+        cached = self._v1_hash_by_block_key.get(key)
+        if cached is not None:
+            return cached
+
+        chain: list[Any] = []
+        current = block
+        while self._is_radix_block(current):
+            current_key = bytes(current.key)
+            cached = self._v1_hash_by_block_key.get(current_key)
+            if cached is not None:
+                parent_hash = cached
+                parent_is_v1_compatible = current_key in self._v1_hash_compatible_keys
+                root_attrs = self._v1_root_attrs_by_block_key[current_key]
+                break
+            chain.append(current)
+            current = current.prev
+
+        if not self._is_radix_block(current):
+            parent_hash = 0
+            parent_is_v1_compatible = True
+            root_attrs = self._root_attrs_from_root_block(current)
+
+        lora_task_id, cache_salt_id = root_attrs
+        for current in reversed(chain):
+            current_key = bytes(current.key)
+            if parent_is_v1_compatible:
+                try:
+                    parent_hash = self._hash_block_key(
+                        current.tokens,
+                        parent_hash,
+                        lora_task_id,
+                        cache_salt_id,
+                    )
+                    self._v1_hash_compatible_keys.add(current_key)
+                except NonTextTokenHashError:
+                    parent_hash = self._fallback_v1_hash(current_key)
+                    parent_is_v1_compatible = False
+            else:
+                parent_hash = self._fallback_v1_hash(current_key)
+            self._v1_hash_by_block_key[current_key] = parent_hash
+            self._v1_root_attrs_by_block_key[current_key] = root_attrs
+
+        return parent_hash
+
+    def _fallback_v1_hash(self, block_key: bytes) -> int:
+        if not self._warned_v1_hash_fallback:
+            logger.warning(
+                "V2 KV cache event hash algorithm %s only matches v1 for "
+                "text-token radix blocks. Falling back to truncated V2 block "
+                "hash for unsupported blocks.",
+                KV_CACHE_HASH_ALGO_V1,
+            )
+            self._warned_v1_hash_fallback = True
+        return truncate_sha256_hash_to_int64(block_key)
+
+    @staticmethod
+    def _is_radix_block(value: Any) -> bool:
+        return hasattr(value, "tokens") and hasattr(value, "key")
+
+    @staticmethod
+    def _root_attrs_from_root_block(root: Any) -> tuple[int | None, int | None]:
+        return getattr(root, "lora_task_id", None), getattr(root, "cache_salt_id", None)
+
+    @staticmethod
+    def _hash_block_key(
+        tokens: Sequence[TokenIdExt],
+        parent_hash: int,
+        lora_task_id: int | None,
+        cache_salt_id: int | None,
+    ) -> int:
+        return hash_v1_block_key(
+            tokens,
+            parent_hash=parent_hash,
+            lora_task_id=lora_task_id,
+            cache_salt_id=cache_salt_id,
+        )

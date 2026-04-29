@@ -11,7 +11,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import KVCacheEventSerializer
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_hash import KV_CACHE_HASH_ALGO_V2
+from tensorrt_llm.runtime.kv_cache_hash import KV_CACHE_HASH_ALGO_V1
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.scheduling_params import SchedulingParams
 
@@ -85,39 +85,43 @@ def flush_events(kv_cache_manager):
 
 def test_kv_cache_event_data_serialization():
     kv_cache_manager = create_kv_cache_manager()
-    flush_events(kv_cache_manager)
-    events = kv_cache_manager.get_latest_events(10)
-    serialized_event = KVCacheEventSerializer.serialize(events)
-    assert len(serialized_event) == 1 and serialized_event[0][
-        "event_id"] == 0 and serialized_event[0]["window_size"] == 256
-    assert serialized_event[0]["data"]["type"] == "created"
-    assert len(serialized_event[0]["data"]["num_blocks_per_cache_level"]) == 2
+    try:
+        flush_events(kv_cache_manager)
+        events = kv_cache_manager.get_latest_events(10)
+        serialized_event = KVCacheEventSerializer.serialize(events)
+        assert len(serialized_event) == 1 and serialized_event[0][
+            "event_id"] == 0 and serialized_event[0]["window_size"] == 256
+        assert serialized_event[0]["data"]["type"] == "created"
+        assert len(
+            serialized_event[0]["data"]["num_blocks_per_cache_level"]) == 2
 
-    req = create_llm_request(0, [1, 2, 3, 4, 5])
-    kv_cache_manager.impl.add_sequence(req.py_request_id, req.prompt_len, 1,
-                                       req)
-    kv_cache_manager.free_resources(req)
+        req = create_llm_request(0, [1, 2, 3, 4, 5])
+        kv_cache_manager.impl.add_sequence(req.py_request_id, req.prompt_len, 1,
+                                           req)
+        kv_cache_manager.free_resources(req)
 
-    flush_events(kv_cache_manager)
-    events = kv_cache_manager.get_latest_events(10)
-    serialized_event = KVCacheEventSerializer.serialize(events)
+        flush_events(kv_cache_manager)
+        events = kv_cache_manager.get_latest_events(10)
+        serialized_event = KVCacheEventSerializer.serialize(events)
 
-    assert serialized_event[0]["data"]["type"] == "stored"
-    assert serialized_event[0]["data"]["parent_hash"] is None
-    assert len(serialized_event[0]["data"]["blocks"]) == 1
-    assert len(serialized_event[0]["data"]["blocks"][0]["tokens"]) == 4
-    # Verify mm_keys field exists (empty for text-only requests)
-    assert "mm_keys" in serialized_event[0]["data"]["blocks"][0]
-    assert serialized_event[0]["data"]["blocks"][0]["mm_keys"] == []
+        assert serialized_event[0]["data"]["type"] == "stored"
+        assert serialized_event[0]["data"]["parent_hash"] is None
+        assert len(serialized_event[0]["data"]["blocks"]) == 1
+        assert len(serialized_event[0]["data"]["blocks"][0]["tokens"]) == 4
+        # Verify mm_keys field exists (empty for text-only requests)
+        assert "mm_keys" in serialized_event[0]["data"]["blocks"][0]
+        assert serialized_event[0]["data"]["blocks"][0]["mm_keys"] == []
 
-    req2 = create_llm_request(1, [1, 2, 3, 4, 5])
-    kv_cache_manager.impl.add_sequence(req2.py_request_id, req2.prompt_len, 1,
-                                       req2)
-    kv_cache_manager.free_resources(req2)
+        req2 = create_llm_request(1, [1, 2, 3, 4, 5])
+        kv_cache_manager.impl.add_sequence(req2.py_request_id, req2.prompt_len,
+                                           1, req2)
+        kv_cache_manager.free_resources(req2)
 
-    flush_events(kv_cache_manager)
-    events = kv_cache_manager.get_latest_events(10)
-    serialized_event = KVCacheEventSerializer.serialize(events)
+        flush_events(kv_cache_manager)
+        events = kv_cache_manager.get_latest_events(10)
+        serialized_event = KVCacheEventSerializer.serialize(events)
+    finally:
+        kv_cache_manager.shutdown()
 
 
 def test_mm_keys_serialization():
@@ -472,101 +476,98 @@ def test_apply_mm_hashes_multiple_modalities():
 
 def test_mm_keys_in_stored_events():
     """Test that mm_keys field is present in stored block events."""
-    llm = create_llm()
-    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
-    prompt = "Hello, my name is"
+    with create_llm() as llm:
+        sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+        prompt = "Hello, my name is"
 
-    _ = llm.generate(prompt, sampling_params=sampling_params)
+        _ = llm.generate(prompt, sampling_params=sampling_params)
 
-    events = llm.get_kv_cache_events(5)
+        events = llm.get_kv_cache_events(5)
 
-    # Find stored events and verify mm_keys field
-    for event in events:
-        if event and event["data"]["type"] == "stored":
-            blocks = event["data"]["blocks"]
-            for block in blocks:
-                # mm_keys should always be present (empty list for text-only)
-                assert "mm_keys" in block
-                assert isinstance(block["mm_keys"], list)
-                # For text-only requests, mm_keys should be empty
-                assert block["mm_keys"] == []
+        # Find stored events and verify mm_keys field
+        for event in events:
+            if event and event["data"]["type"] == "stored":
+                blocks = event["data"]["blocks"]
+                for block in blocks:
+                    # mm_keys should always be present (empty list for text-only)
+                    assert "mm_keys" in block
+                    assert isinstance(block["mm_keys"], list)
+                    # For text-only requests, mm_keys should be empty
+                    assert block["mm_keys"] == []
 
 
 def test_expected_kv_cache_events():
-    llm = create_llm()
-    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
-    prompt = "Hello, my name is"
+    with create_llm() as llm:
+        sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+        prompt = "Hello, my name is"
 
-    _ = llm.generate(prompt, sampling_params=sampling_params)
+        _ = llm.generate(prompt, sampling_params=sampling_params)
 
-    events = llm.get_kv_cache_events(5)
-    # created + stored events
-    assert events and len(events) >= 2
-    for event in events:
-        if event:
-            if event["event_id"] == 0:
-                assert event["data"]["type"] == "created"
-            elif event["event_id"] == 1:
-                assert event["data"]["type"] == "stored"
+        events = llm.get_kv_cache_events(5)
+        # created + stored events
+        assert events and len(events) >= 2
+        for event in events:
+            if event:
+                if event["event_id"] == 0:
+                    assert event["data"]["type"] == "created"
+                elif event["event_id"] == 1:
+                    assert event["data"]["type"] == "stored"
 
 
 def test_expected_v2_kv_cache_events():
-    llm = create_v2_llm()
-    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
-    prompt = list(range(127))
+    with create_v2_llm() as llm:
+        sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+        prompt = list(range(127))
 
-    _ = llm.generate(prompt, sampling_params=sampling_params)
+        _ = llm.generate(prompt, sampling_params=sampling_params)
 
-    events = llm.get_kv_cache_events(5)
-    assert events and len(events) >= 2
-    assert all(event["hash_algo"] == KV_CACHE_HASH_ALGO_V2 for event in events
-               if event)
+        events = llm.get_kv_cache_events(5)
+        assert events and len(events) >= 2
+        assert all(event["hash_algo"] == KV_CACHE_HASH_ALGO_V1
+                   for event in events if event)
 
-    created_events = [
-        event for event in events if event["data"]["type"] == "created"
-    ]
-    stored_events = [
-        event for event in events if event["data"]["type"] == "stored"
-    ]
-    assert created_events
-    assert stored_events
-    assert created_events[0]["event_id"] == 0
+        created_events = [
+            event for event in events if event["data"]["type"] == "created"
+        ]
+        stored_events = [
+            event for event in events if event["data"]["type"] == "stored"
+        ]
+        assert created_events
+        assert stored_events
+        assert created_events[0]["event_id"] == 0
 
-    block_hashes = [
-        block["block_hash"] for event in stored_events
-        for block in event["data"]["blocks"]
-    ]
-    assert block_hashes
-    assert all(
-        isinstance(block_hash, str) and len(block_hash) == 64
-        for block_hash in block_hashes)
+        block_hashes = [
+            block["block_hash"] for event in stored_events
+            for block in event["data"]["blocks"]
+        ]
+        assert block_hashes
+        assert all(isinstance(block_hash, int) for block_hash in block_hashes)
 
 
 def test_kv_cache_event_async_api():
-    llm = create_llm()
-    sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
-    prompt = "Hello, my name is"
+    with create_llm() as llm:
+        sampling_params = SamplingParams(max_tokens=6, temperature=0.01)
+        prompt = "Hello, my name is"
 
-    async def generate():
-        async for output in llm.generate_async(prompt,
-                                               streaming=True,
-                                               sampling_params=sampling_params):
-            pass
+        async def generate():
+            async for output in llm.generate_async(
+                    prompt, streaming=True, sampling_params=sampling_params):
+                pass
 
-    events = []
+        events = []
 
-    async def get_events():
-        async for event in llm.get_kv_cache_events_async():
-            events.append(event)
+        async def get_events():
+            async for event in llm.get_kv_cache_events_async():
+                events.append(event)
 
-        assert events
+            assert events
 
-    async def main():
-        await generate()
-        await asyncio.gather(generate(), get_events())
-        await asyncio.gather(generate(), get_events())
+        async def main():
+            await generate()
+            await asyncio.gather(generate(), get_events())
+            await asyncio.gather(generate(), get_events())
 
-    asyncio.run(main())
+        asyncio.run(main())
 
 
 def check_events(llm,
@@ -657,41 +658,41 @@ def check_events(llm,
 
 
 def test_llm_kv_events_api():
-    llm = create_llm()
-    sampling_params = SamplingParams(max_tokens=6,
-                                     temperature=0.01,
-                                     ignore_eos=True)
+    with create_llm() as llm:
+        sampling_params = SamplingParams(max_tokens=6,
+                                         temperature=0.01,
+                                         ignore_eos=True)
 
-    requests = []
-    for i in range(3):
-        input_tokens = list(range(127 + i))[i:]
-        requests.append(input_tokens)
+        requests = []
+        for i in range(3):
+            input_tokens = list(range(127 + i))[i:]
+            requests.append(input_tokens)
 
-    check_events(llm, requests, sampling_params)
+        check_events(llm, requests, sampling_params)
 
 
 @skip_single_gpu
 @pytest.mark.threadleak(enabled=False)
 def test_llm_api_attention_dp_kv_events():
 
-    llm = LLM(model=llama_model_path,
-              tensor_parallel_size=2,
-              enable_attention_dp=True,
-              kv_cache_config=global_kvcache_config,
-              enable_autotuner=False)
+    with LLM(model=llama_model_path,
+             tensor_parallel_size=2,
+             enable_attention_dp=True,
+             kv_cache_config=global_kvcache_config,
+             enable_autotuner=False) as llm:
 
-    sampling_params = SamplingParams(max_tokens=6,
-                                     temperature=0.01,
-                                     ignore_eos=True)
+        sampling_params = SamplingParams(max_tokens=6,
+                                         temperature=0.01,
+                                         ignore_eos=True)
 
-    for attention_dp_rank in range(2):
-        requests = []
-        for i in range(3):
-            input_tokens = list(range(127 + i))[i:]
-            requests.append(input_tokens)
+        for attention_dp_rank in range(2):
+            requests = []
+            for i in range(3):
+                input_tokens = list(range(127 + i))[i:]
+                requests.append(input_tokens)
 
-        scheduling_params = SchedulingParams(
-            attention_dp_rank=attention_dp_rank, attention_dp_relax=False)
+            scheduling_params = SchedulingParams(
+                attention_dp_rank=attention_dp_rank, attention_dp_relax=False)
 
-        check_events(llm, requests, sampling_params, scheduling_params,
-                     attention_dp_rank)
+            check_events(llm, requests, sampling_params, scheduling_params,
+                         attention_dp_rank)

@@ -2349,9 +2349,11 @@ class KVCacheManagerV2(BaseResourceManager):
                 # Last token cannot be recovered, so we don't include it in
                 # the input tokens to look up for the block that can be reused.
                 kv_cache = self._create_kv_cache(
-                    req.py_request_id, req.lora_task_id,
+                    req.py_request_id,
+                    req.lora_task_id,
                     req.get_tokens(DEFAULT_BEAM_INDEX)[:-1]
-                    if self.enable_block_reuse else None)
+                    if self.enable_block_reuse else None,
+                    cache_salt_id=req.cache_salt_id)
                 if kv_cache is None:
                     return False
                 kv_cache.cuda_stream = self._stream.cuda_stream
@@ -2427,8 +2429,11 @@ class KVCacheManagerV2(BaseResourceManager):
             for req in scheduled_batch.context_requests:
                 kv_cache = self.kv_cache_map.get(req.py_request_id)
                 if kv_cache is None:
-                    kv_cache = self._create_kv_cache(req.py_request_id,
-                                                     req.lora_task_id, None)
+                    kv_cache = self._create_kv_cache(
+                        req.py_request_id,
+                        req.lora_task_id,
+                        None,
+                        cache_salt_id=req.cache_salt_id)
                     kv_cache.stop_committing()
                 if not self._resume_and_restore(req.py_request_id, kv_cache):
                     raise RuntimeError(
@@ -2551,8 +2556,11 @@ class KVCacheManagerV2(BaseResourceManager):
             req.is_dummy_request = True
             req.paged_kv_block_ids = []
             if prepare_resource:
-                kv_cache = self._create_kv_cache(req.py_request_id,
-                                                 req.lora_task_id, input_tokens)
+                kv_cache = self._create_kv_cache(
+                    req.py_request_id,
+                    req.lora_task_id,
+                    input_tokens,
+                    cache_salt_id=req.cache_salt_id)
                 assert kv_cache.num_committed_tokens == 0
                 success = kv_cache.resume(self._stream.cuda_stream)
                 if not success:
@@ -2570,7 +2578,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 draft_kv_cache = None
                 if draft_kv_cache_manager is not None:
                     draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
-                        req.py_request_id, req.lora_task_id, input_tokens)
+                        req.py_request_id,
+                        req.lora_task_id,
+                        input_tokens,
+                        cache_salt_id=req.cache_salt_id)
                     success = draft_kv_cache.resume(
                         torch.cuda.current_stream().cuda_stream)
                     if not success:
@@ -2937,8 +2948,12 @@ class KVCacheManagerV2(BaseResourceManager):
                                            self.index_scales, self.kv_offset,
                                            self._stream.cuda_stream)
 
-    def _create_kv_cache(self, request_id: int, lora_task_id: int | None,
-                         input_tokens: Sequence[TokenIdExt] | None):
+    def _create_kv_cache(self,
+                         request_id: int,
+                         lora_task_id: int | None,
+                         input_tokens: Sequence[TokenIdExt] | None,
+                         *,
+                         cache_salt_id: int | None = None):
         assert request_id not in self.kv_cache_map, f"KV cache for request {request_id} already exists"
         if self.index_mapper.num_free_slots() == 0:
             logger.warning(
@@ -2947,7 +2962,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 "Skipping KV cache creation; request will retry next iteration.",
                 request_id, self.index_mapper.size(), self.index_mapper.size())
             return None
-        kv_cache = self.impl.create_kv_cache(lora_task_id, input_tokens)
+        kv_cache = self.impl.create_kv_cache(lora_task_id,
+                                             input_tokens,
+                                             cache_salt_id=cache_salt_id)
         self.kv_cache_map[request_id] = kv_cache
         index = self.index_mapper.add_new_sequence(request_id)
         for i in range(self.max_beam_width):
