@@ -388,4 +388,10 @@ private:
     CachedCudaEvent mFinishEvent = CachedCudaEvent::makeNull();
 };
 
+// Merge multiple CUDA events into one.
+// Returns makeNull() for 0 live events, the single live event for 1,
+// or a TemporaryCudaStream-merged event for many.
+// Mirrors Python's merge_events() utility.
+CachedCudaEvent mergeEvents(std::vector<CachedCudaEvent>& events);
+
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

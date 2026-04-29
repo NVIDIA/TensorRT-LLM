@@ -749,6 +749,212 @@ void KvCache::_lockHeldBlocks(std::vector<StaleBackup> const& backup)
 }
 
 // ---------------------------------------------------------------------------
+// _commitBlock — shared logic for committing a single block.
+// Mirrors Python's _commit_block(ordinal, is_last).
+// Caller must have recordEventScope() open so finishEvent() works.
+// On VIRTUAL_STOP or when isLast is true, transitions to USER_STOP and
+// calls _onStopCommitting() — callers do not need post-call cleanup.
+// ---------------------------------------------------------------------------
+
+void KvCache::_commitBlock(int ord, bool isLast)
+{
+    assert(mCommitState == CommitState::ALLOWED);
+
+    auto& sb = mBlocks.at(static_cast<size_t>(ord));
+
+    if (sb.isCommitted())
+    {
+        ++mNumCommittedBlocks;
+        if (isLast)
+        {
+            mCommitState = CommitState::USER_STOP;
+            _onStopCommitting();
+        }
+        return;
+    }
+
+    // Build token block — always slice up to tokens_per_block; is_full tells us
+    // whether we got a full block's worth.  Mirrors Python's:
+    //   tokens = self._committed_tokens[start : start + tokens_per_block]
+    //   is_full = len(tokens) == tokens_per_block
+    int start = ord * mTokensPerBlock;
+    int end = std::min(start + mTokensPerBlock, static_cast<int>(mCommittedTokens.size()));
+    std::vector<TokenIdExt> tokenBlock(mCommittedTokens.begin() + start, mCommittedTokens.begin() + end);
+    bool isFull = static_cast<int>(tokenBlock.size()) == mTokensPerBlock;
+
+    if (!isLast && !isFull)
+        throw LogicError("Cannot commit block that is not full except last block");
+
+    // Parent block lookup (root or previous committed block).
+    RootBlock& root = mManager->radixTree().addOrGetExisting(mLoraTaskId);
+    int numLc = mManager->storage().numLifeCycles();
+
+    std::shared_ptr<Block> parentBlock;
+    std::unordered_map<BlockKey, std::shared_ptr<Block>>* parentNext = &root.next;
+    BlockKey const* parentKey = &root.key;
+    if (ord > 0)
+    {
+        assert(mBlocks[ord - 1].treeBlock && "prev block must be committed");
+        parentBlock = mBlocks[ord - 1].treeBlock;
+        parentNext = &parentBlock->next;
+        parentKey = &parentBlock->key;
+    }
+
+    // Try to find or create a block in the radix tree.
+    bool blockIsNew = false;
+    auto newBlock = addOrGetExistingBlock(*parentNext, *parentKey, numLc, mTokensPerBlock, tokenBlock,
+        ord == 0 ? &root : nullptr, parentBlock.get(), &blockIsNew);
+
+    auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
+
+    if (newBlock && blockIsNew)
+    {
+        // New block: take uncommitted pages, convert to committed.
+        // Mirrors Python's _take_uncommitted_page + convert path.
+        struct TakenPage
+        {
+            std::shared_ptr<UncommittedPage> page;
+            bool locked;
+        };
+
+        std::vector<TakenPage> taken(static_cast<size_t>(numLc), {nullptr, false});
+        for (int lc = 0; lc < numLc; ++lc)
+        {
+            if (ssmLcId.has_value() && lc == *ssmLcId)
+                continue;
+            auto& bp = sb.pages[0][lc];
+            if (auto* lock = std::get_if<SharedPageLock>(&bp))
+            {
+                auto up = std::dynamic_pointer_cast<UncommittedPage>(lock->page());
+                if (up)
+                    taken[lc] = {up, true};
+            }
+            else if (auto* holder = std::get_if<std::shared_ptr<PageHolder>>(&bp))
+            {
+                if (*holder)
+                {
+                    auto up = std::dynamic_pointer_cast<UncommittedPage>((*holder)->page);
+                    if (up)
+                        taken[lc] = {up, false};
+                }
+            }
+            bp = std::monostate{};
+        }
+        sb.treeBlock = newBlock;
+        for (int lc = 0; lc < numLc; ++lc)
+        {
+            auto& [up, locked] = taken[lc];
+            if (!up)
+                continue;
+            auto committed = up->convertToCommitted(newBlock, finishEvent());
+            if (locked)
+                sb.pages[0][lc]
+                    = committed->lock(*this, 0, static_cast<BlockOrdinal>(ord), static_cast<LifeCycleId>(lc));
+            else
+                sb.pages[0][lc] = committed->hold();
+        }
+        // SSM snapshot: copy live SSM state at interval boundaries.
+        if (ssmLcId.has_value())
+        {
+            int numCommitted = static_cast<int>(mCommittedTokens.size());
+            int blockEnd = (ord + 1) * mTokensPerBlock;
+            if (blockEnd == numCommitted && numCommitted > 0 && numCommitted % mManager->ssmReuseInterval() == 0)
+            {
+                _snapshotSsmToTreeBlock(newBlock, *ssmLcId, 0);
+            }
+            else
+            {
+                newBlock->storage[static_cast<size_t>(*ssmLcId)].reset();
+            }
+        }
+        ++mNumCommittedBlocks;
+    }
+    else if (newBlock && newBlock->isFull() && mManager->allowSeqRebasing() && isFull)
+    {
+        // Existing block: rebase — reuse existing block's committed pages.
+        // Mirrors Python's `elif tree_block.is_full and allow_seq_rebasing and is_full` path.
+        std::vector<BatchedLockTarget> reuseTasks;
+        for (int lc = 0; lc < numLc; ++lc)
+        {
+            if (ssmLcId.has_value() && lc == *ssmLcId)
+                continue;
+            auto& bp = sb.pages[0][lc];
+            if (blockPageIsNull(bp))
+                continue;
+            auto existingPage = newBlock->storage.at(static_cast<size_t>(lc)).lock();
+            bool isLocked = std::holds_alternative<SharedPageLock>(bp);
+            if (!existingPage)
+            {
+                // Existing page gone — put our uncommitted page into the tree block.
+                if (auto* lock = std::get_if<SharedPageLock>(&bp))
+                {
+                    auto up = std::dynamic_pointer_cast<UncommittedPage>(lock->page());
+                    if (up)
+                    {
+                        bp = std::monostate{};
+                        auto committed = up->convertToCommitted(newBlock, finishEvent());
+                        bp = isLocked ? BlockPage{committed->lock(
+                                 *this, 0, static_cast<BlockOrdinal>(ord), static_cast<LifeCycleId>(lc))}
+                                      : BlockPage{committed->hold()};
+                    }
+                }
+                else if (auto* holder = std::get_if<std::shared_ptr<PageHolder>>(&bp))
+                {
+                    if (*holder)
+                    {
+                        auto up = std::dynamic_pointer_cast<UncommittedPage>((*holder)->page);
+                        if (up)
+                        {
+                            bp = std::monostate{};
+                            auto committed = up->convertToCommitted(newBlock, finishEvent());
+                            bp = committed->hold();
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // Downgrade lock to holder for our page; reuse the existing page.
+                if (isLocked)
+                {
+                    auto holder = blockPageGetPage(bp)->hold();
+                    bp = std::move(holder);
+                }
+                reuseTasks.push_back({existingPage, static_cast<BeamIndex>(0), static_cast<BlockOrdinal>(ord),
+                    static_cast<LifeCycleId>(lc)});
+            }
+        }
+        if (!reuseTasks.empty())
+        {
+            auto locks = batchedLockToGpu(*this, reuseTasks);
+            for (size_t ri = 0; ri < reuseTasks.size(); ++ri)
+            {
+                int lc = static_cast<int>(reuseTasks[ri].lifeCycle);
+                sb.pages[0][lc] = std::move(locks[ri]);
+            }
+        }
+        // Don't clear SSM storage on rebase — the existing block may have a valid snapshot.
+        sb.treeBlock = newBlock;
+        ++mNumCommittedBlocks;
+    }
+    else
+    {
+        // Can't commit and can't reuse existing block. Just stop committing.
+        mCommitState = CommitState::VIRTUAL_STOP;
+    }
+
+    // Mirrors Python's tail of _commit_block:
+    //   if is_last or self._commit_state == self.CommitState.VIRTUAL_STOP:
+    //       self._commit_state = self.CommitState.USER_STOP
+    //       self._on_stop_committing()
+    if (isLast || mCommitState == CommitState::VIRTUAL_STOP)
+    {
+        mCommitState = CommitState::USER_STOP;
+        _onStopCommitting();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // commit
 // ---------------------------------------------------------------------------
 
@@ -780,184 +986,12 @@ void KvCache::commit(std::vector<TokenIdExt> const& tokens)
             auto scope = recordEventScope();
             while (static_cast<int>(mCommittedTokens.size()) >= mTokensPerBlock * (mNumCommittedBlocks + 1))
             {
-                int ord = mNumCommittedBlocks;
-                if (ord >= static_cast<int>(mBlocks.size()))
+                _commitBlock(mNumCommittedBlocks, /*isLast=*/false);
+                // _commitBlock transitions to USER_STOP on VIRTUAL_STOP internally.
+                if (mCommitState != CommitState::ALLOWED)
                     break;
-
-                auto& sb = mBlocks.at(static_cast<size_t>(ord));
-                if (sb.isCommitted())
-                {
-                    ++mNumCommittedBlocks;
-                    continue;
-                }
-
-                // Build token block for this ordinal.
-                std::vector<TokenIdExt> tokenBlock(mCommittedTokens.begin() + ord * mTokensPerBlock,
-                    mCommittedTokens.begin() + (ord + 1) * mTokensPerBlock);
-
-                // Get the parent block key (or root block key).
-                RootBlock& root = mManager->radixTree().addOrGetExisting(mLoraTaskId);
-                int numLc = mManager->storage().numLifeCycles();
-
-                // Try to find or create block.
-                // Python: prev = self._get_tree_block(ordinal - 1) — asserts tree_block is not None.
-                std::shared_ptr<Block> parentBlock;
-                std::unordered_map<BlockKey, std::shared_ptr<Block>>* parentNext = &root.next;
-                BlockKey const* parentKey = &root.key;
-                if (ord > 0)
-                {
-                    assert(mBlocks[ord - 1].treeBlock && "prev block must be committed before committing next");
-                    parentBlock = mBlocks[ord - 1].treeBlock;
-                    parentNext = &parentBlock->next;
-                    parentKey = &parentBlock->key;
-                }
-
-                bool blockIsNew = false;
-                auto newBlock = addOrGetExistingBlock(*parentNext, *parentKey, numLc, mTokensPerBlock, tokenBlock,
-                    ord == 0 ? &root : nullptr, parentBlock.get(), &blockIsNew);
-
-                if (!newBlock)
-                {
-                    // Useless block; virtual stop committing.
-                    mCommitState = CommitState::VIRTUAL_STOP;
-                    break;
-                }
-
-                auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
-
-                if (blockIsNew)
-                {
-                    // New block: mirror Python _take_uncommitted_page + convert.
-                    // Clear slots first, then set treeBlock, then convert.
-                    struct TakenPage
-                    {
-                        std::shared_ptr<UncommittedPage> page;
-                        bool locked;
-                    };
-
-                    std::vector<TakenPage> taken(static_cast<size_t>(numLc), {nullptr, false});
-                    for (int lc = 0; lc < numLc; ++lc)
-                    {
-                        if (ssmLcId.has_value() && lc == *ssmLcId)
-                            continue;
-                        auto& bp = sb.pages[0][lc];
-                        if (auto* lock = std::get_if<SharedPageLock>(&bp))
-                        {
-                            auto up = std::dynamic_pointer_cast<UncommittedPage>(lock->page());
-                            if (up)
-                                taken[lc] = {up, true};
-                        }
-                        else if (auto* holder = std::get_if<std::shared_ptr<PageHolder>>(&bp))
-                        {
-                            if (*holder)
-                            {
-                                auto up = std::dynamic_pointer_cast<UncommittedPage>((*holder)->page);
-                                if (up)
-                                    taken[lc] = {up, false};
-                            }
-                        }
-                        bp = std::monostate{};
-                    }
-                    sb.treeBlock = newBlock;
-                    for (int lc = 0; lc < numLc; ++lc)
-                    {
-                        auto& [up, locked] = taken[lc];
-                        if (!up)
-                            continue;
-                        auto committed = up->convertToCommitted(newBlock, finishEvent());
-                        if (locked)
-                            sb.pages[0][lc] = committed->lock(
-                                *this, 0, static_cast<BlockOrdinal>(ord), static_cast<LifeCycleId>(lc));
-                        else
-                            sb.pages[0][lc] = committed->hold();
-                    }
-                    // SSM snapshot: copy live SSM state at interval boundaries.
-                    if (ssmLcId.has_value())
-                    {
-                        int numCommitted = static_cast<int>(mCommittedTokens.size());
-                        int blockEnd = (ord + 1) * mTokensPerBlock;
-                        if (blockEnd == numCommitted && numCommitted > 0
-                            && numCommitted % mManager->ssmReuseInterval() == 0)
-                        {
-                            _snapshotSsmToTreeBlock(newBlock, *ssmLcId, 0);
-                        }
-                        else
-                        {
-                            newBlock->storage[static_cast<size_t>(*ssmLcId)].reset();
-                        }
-                    }
-                    ++mNumCommittedBlocks;
-                }
-                else if (newBlock->isFull() && mManager->allowSeqRebasing())
-                {
-                    // Existing block: rebase — reuse existing block's committed pages.
-                    // Mirrors Python's `elif tree_block.is_full and allow_seq_rebasing` path.
-                    std::vector<BatchedLockTarget> reuseTasks;
-                    for (int lc = 0; lc < numLc; ++lc)
-                    {
-                        if (ssmLcId.has_value() && lc == *ssmLcId)
-                            continue;
-                        auto* bp = &sb.pages[0][lc];
-                        if (blockPageIsNull(*bp))
-                            continue;
-                        auto existingPage = newBlock->storage.at(static_cast<size_t>(lc)).lock();
-                        bool isLocked = std::holds_alternative<SharedPageLock>(*bp);
-                        if (!existingPage)
-                        {
-                            // Existing page is gone — put our uncommitted page into the tree block.
-                            if (auto* lock = std::get_if<SharedPageLock>(bp))
-                            {
-                                auto up = std::dynamic_pointer_cast<UncommittedPage>(lock->page());
-                                if (up)
-                                {
-                                    lock->unlock();
-                                    auto committed = up->convertToCommitted(newBlock, finishEvent());
-                                    *bp = committed->lock(
-                                        *this, 0, static_cast<BlockOrdinal>(ord), static_cast<LifeCycleId>(lc));
-                                }
-                            }
-                        }
-                        else
-                        {
-                            // Downgrade lock to holder for our page, we'll reuse the existing page.
-                            if (isLocked)
-                            {
-                                auto holder = blockPageGetPage(*bp)->hold();
-                                *bp = std::move(holder);
-                            }
-                            reuseTasks.push_back({existingPage, static_cast<BeamIndex>(0),
-                                static_cast<BlockOrdinal>(ord), static_cast<LifeCycleId>(lc)});
-                        }
-                    }
-                    if (!reuseTasks.empty())
-                    {
-                        auto locks = batchedLockToGpu(*this, reuseTasks);
-                        for (size_t ri = 0; ri < reuseTasks.size(); ++ri)
-                        {
-                            int lc = static_cast<int>(reuseTasks[ri].lifeCycle);
-                            sb.pages[0][lc] = std::move(locks[ri]);
-                        }
-                    }
-                    // Don't clear SSM storage on rebase — the existing block may have a valid snapshot.
-                    sb.treeBlock = newBlock;
-                    ++mNumCommittedBlocks;
-                }
-                else
-                {
-                    // Can't commit and can't reuse. Stop committing.
-                    mCommitState = CommitState::VIRTUAL_STOP;
-                    break;
-                }
             }
         }
-    }
-
-    // Mirrors Python: if VIRTUAL_STOP was set during the loop, transition to USER_STOP
-    // and release stale SWA pages.
-    if (mCommitState == CommitState::VIRTUAL_STOP)
-    {
-        mCommitState = CommitState::USER_STOP;
-        _onStopCommitting();
     }
 
     // Bump history_length to cover newly committed tokens (mirrors Python's behavior).
@@ -983,173 +1017,18 @@ void KvCache::stopCommitting()
     int tokensLeft = static_cast<int>(mCommittedTokens.size()) - mNumCommittedBlocks * mTokensPerBlock;
     if (tokensLeft > 0 && mNumCommittedBlocks < static_cast<int>(mBlocks.size()))
     {
-        int ord = mNumCommittedBlocks;
-        auto& sb = mBlocks.at(static_cast<size_t>(ord));
-
+        auto& sb = mBlocks.at(static_cast<size_t>(mNumCommittedBlocks));
         if (!sb.isCommitted())
         {
-            // Wrap in recordEventScope() — mirrors Python's `with self._record_event()`.
             auto scope = recordEventScope();
-
-            // Build token block from the already-recorded committed tokens.
-            std::vector<TokenIdExt> tokenBlock(
-                mCommittedTokens.begin() + ord * mTokensPerBlock, mCommittedTokens.end());
-
-            RootBlock& root = mManager->radixTree().addOrGetExisting(mLoraTaskId);
-            int numLc = mManager->storage().numLifeCycles();
-
-            std::shared_ptr<Block> parentBlock;
-            std::unordered_map<BlockKey, std::shared_ptr<Block>>* parentNext = &root.next;
-            BlockKey const* parentKey = &root.key;
-            if (ord > 0)
-            {
-                assert(mBlocks[ord - 1].treeBlock && "prev block must be committed");
-                parentBlock = mBlocks[ord - 1].treeBlock;
-                parentNext = &parentBlock->next;
-                parentKey = &parentBlock->key;
-            }
-
-            bool blockIsNew = false;
-            auto newBlock = addOrGetExistingBlock(*parentNext, *parentKey, numLc, mTokensPerBlock, tokenBlock,
-                ord == 0 ? &root : nullptr, parentBlock.get(), &blockIsNew);
-
-            auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
-
-            if (newBlock && blockIsNew)
-            {
-                // New block: _take_uncommitted_page + convert.
-                struct TakenPage
-                {
-                    std::shared_ptr<UncommittedPage> page;
-                    bool locked;
-                };
-
-                std::vector<TakenPage> taken(static_cast<size_t>(numLc), {nullptr, false});
-                for (int lc = 0; lc < numLc; ++lc)
-                {
-                    if (ssmLcId.has_value() && lc == *ssmLcId)
-                        continue;
-                    auto& bp = sb.pages[0][lc];
-                    if (auto* lock = std::get_if<SharedPageLock>(&bp))
-                    {
-                        auto up = std::dynamic_pointer_cast<UncommittedPage>(lock->page());
-                        if (up)
-                            taken[lc] = {up, true};
-                    }
-                    else if (auto* holder = std::get_if<std::shared_ptr<PageHolder>>(&bp))
-                    {
-                        if (*holder)
-                        {
-                            auto up = std::dynamic_pointer_cast<UncommittedPage>((*holder)->page);
-                            if (up)
-                                taken[lc] = {up, false};
-                        }
-                    }
-                    bp = std::monostate{};
-                }
-                sb.treeBlock = newBlock;
-                for (int lc = 0; lc < numLc; ++lc)
-                {
-                    auto& [up, locked] = taken[lc];
-                    if (!up)
-                        continue;
-                    auto committed = up->convertToCommitted(newBlock, finishEvent());
-                    if (locked)
-                        sb.pages[0][lc]
-                            = committed->lock(*this, 0, static_cast<BlockOrdinal>(ord), static_cast<LifeCycleId>(lc));
-                    else
-                        sb.pages[0][lc] = committed->hold();
-                }
-                // SSM snapshot: copy live SSM state at interval boundaries.
-                if (ssmLcId.has_value())
-                {
-                    int numCommitted = static_cast<int>(mCommittedTokens.size());
-                    int blockEnd = (ord + 1) * mTokensPerBlock;
-                    if (blockEnd == numCommitted && numCommitted > 0
-                        && numCommitted % mManager->ssmReuseInterval() == 0)
-                    {
-                        _snapshotSsmToTreeBlock(newBlock, *ssmLcId, 0);
-                    }
-                    else
-                    {
-                        newBlock->storage[static_cast<size_t>(*ssmLcId)].reset();
-                    }
-                }
-                sb.treeBlock = newBlock;
-                ++mNumCommittedBlocks;
-            }
-            else if (newBlock && newBlock->isFull() && mManager->allowSeqRebasing() && tokensLeft >= mTokensPerBlock)
-            {
-                // Existing block, rebase — mirrors Python's _commit_block rebase path.
-                std::vector<BatchedLockTarget> reuseTasks;
-                for (int lc = 0; lc < numLc; ++lc)
-                {
-                    if (ssmLcId.has_value() && lc == *ssmLcId)
-                        continue;
-                    auto& bp = sb.pages[0][lc];
-                    if (blockPageIsNull(bp))
-                        continue;
-                    auto existingPage = newBlock->storage.at(static_cast<size_t>(lc)).lock();
-                    bool isLocked = std::holds_alternative<SharedPageLock>(bp);
-                    if (!existingPage)
-                    {
-                        // Existing page gone — put our uncommitted page into tree block.
-                        if (auto* lock = std::get_if<SharedPageLock>(&bp))
-                        {
-                            auto up = std::dynamic_pointer_cast<UncommittedPage>(lock->page());
-                            if (up)
-                            {
-                                bp = std::monostate{};
-                                auto committed = up->convertToCommitted(newBlock, finishEvent());
-                                bp = isLocked ? BlockPage{committed->lock(
-                                         *this, 0, static_cast<BlockOrdinal>(ord), static_cast<LifeCycleId>(lc))}
-                                              : BlockPage{committed->hold()};
-                            }
-                        }
-                        else if (auto* holder = std::get_if<std::shared_ptr<PageHolder>>(&bp))
-                        {
-                            if (*holder)
-                            {
-                                auto up = std::dynamic_pointer_cast<UncommittedPage>((*holder)->page);
-                                if (up)
-                                {
-                                    bp = std::monostate{};
-                                    auto committed = up->convertToCommitted(newBlock, finishEvent());
-                                    bp = committed->hold();
-                                }
-                            }
-                        }
-                    }
-                    else
-                    {
-                        // Downgrade lock to holder; reuse existing page.
-                        if (isLocked)
-                        {
-                            auto holder = blockPageGetPage(bp)->hold();
-                            bp = std::move(holder);
-                        }
-                        reuseTasks.push_back({existingPage, static_cast<BeamIndex>(0), static_cast<BlockOrdinal>(ord),
-                            static_cast<LifeCycleId>(lc)});
-                    }
-                }
-                if (!reuseTasks.empty())
-                {
-                    auto locks = batchedLockToGpu(*this, reuseTasks);
-                    for (size_t ri = 0; ri < reuseTasks.size(); ++ri)
-                    {
-                        int lc = static_cast<int>(reuseTasks[ri].lifeCycle);
-                        sb.pages[0][lc] = std::move(locks[ri]);
-                    }
-                }
-                // Don't clear SSM storage on rebase — the existing block may have a valid snapshot.
-                sb.treeBlock = newBlock;
-                ++mNumCommittedBlocks;
-            }
-            // else: can't commit and can't rebase — just stop committing.
-            // Mirrors Python's else → VIRTUAL_STOP → USER_STOP path in _commit_block.
+            // isLast=true: _commitBlock handles USER_STOP + _onStopCommitting() internally.
+            _commitBlock(mNumCommittedBlocks, /*isLast=*/true);
+            return;
         }
     }
 
+    // No partial block to commit (or block was already committed).
+    // Mirrors Python's else branch in stop_committing().
     mCommitState = CommitState::USER_STOP;
     _onStopCommitting();
 }
