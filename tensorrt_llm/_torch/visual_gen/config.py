@@ -925,13 +925,21 @@ class DiffusionModelConfig(BaseModel):
         # Resolve LTX2 two-stage auxiliary paths before pipeline variant selection.
         explicit_spatial_upsampler_path = args.spatial_upsampler_path if args else ""
         explicit_distilled_lora_path = args.distilled_lora_path if args else ""
-        one_stage_pipeline = bool(getattr(args, "one_stage_pipeline", False))
+        explicit_one_stage_pipeline = bool(getattr(args, "one_stage_pipeline", False))
+        cache_dit_forces_one_stage = isinstance(cache_cfg, CacheDiTConfig)
+        one_stage_pipeline = explicit_one_stage_pipeline or cache_dit_forces_one_stage
         if one_stage_pipeline:
             extra_attrs["one_stage_pipeline"] = True
-            logger.info(
-                "LTX2 one_stage_pipeline is enabled; skipping two-stage auxiliary "
-                "checkpoint discovery and promotion."
-            )
+            if cache_dit_forces_one_stage and not explicit_one_stage_pipeline:
+                logger.info(
+                    "LTX2 Cache-DiT is only supported with the one-stage pipeline; "
+                    "skipping two-stage auxiliary checkpoint discovery and promotion."
+                )
+            else:
+                logger.info(
+                    "LTX2 one_stage_pipeline is enabled; skipping two-stage auxiliary "
+                    "checkpoint discovery and promotion."
+                )
             if explicit_spatial_upsampler_path or explicit_distilled_lora_path:
                 logger.info(
                     "Ignoring spatial_upsampler_path/distilled_lora_path because "
