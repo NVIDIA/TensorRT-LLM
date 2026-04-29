@@ -155,6 +155,36 @@ class SymmetricMemoryAllGather(nn.Module):
             )
             return
 
+        # Cross-node rendezvous probe.
+        #
+        # `get_symm_mem_workspace` below returns a pooled workspace handle
+        # whose `multicast_ptr` can read as non-zero locally even when the
+        # group spans multiple NVSwitch domains (cross-node TP). The first
+        # `multimem_all_gather_out` would then hang on the implicit
+        # rendezvous instead of letting the caller fall back to NCCL.
+        #
+        # Mirror SymmetricMemoryAllReduce: allocate a small symm_mem buffer
+        # and call `torch_symm_mem.rendezvous`, which is a blocking
+        # cross-rank handshake. If MULTIMEM isn't actually usable the
+        # handle's `multicast_ptr` comes back as 0 and we disable here
+        # rather than at runtime.
+        try:
+            probe = torch_symm_mem.empty(
+                1,
+                device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+                dtype=torch.uint8,
+            )
+            rendezvous_handle = torch_symm_mem.rendezvous(probe, self.group_name_str)
+            if rendezvous_handle.multicast_ptr == 0:
+                logger.warning(
+                    "SymmetricMemoryAllGather: MULTIMEM not available after "
+                    "rendezvous (multicast_ptr is 0) — disabling"
+                )
+                return
+        except Exception as e:
+            logger.warning(f"SymmetricMemoryAllGather: rendezvous probe failed: {e}")
+            return
+
         # Acquire the workspace once and verify MULTIMEM is actually
         # available. Holding the handle as a member guarantees forward()
         # never re-enters get_symm_mem_workspace(), so there is no chance
