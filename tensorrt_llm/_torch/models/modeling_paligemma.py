@@ -195,9 +195,11 @@ class PaliGemmaForConditionalGeneration(PreTrainedModel):
         self._device = "cuda"
         self.model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
 
-        self.image_token_ids = torch.tensor([config.image_token_index],
-                                            dtype=torch.int32,
-                                            device=self._device)
+        self.register_buffer(
+            "image_token_ids",
+            torch.tensor([config.image_token_index], dtype=torch.int32),
+            persistent=False,
+        )
 
         model_config_cp = copy.deepcopy(model_config)
         self.model_config = model_config_cp
@@ -297,13 +299,14 @@ class PaliGemmaForConditionalGeneration(PreTrainedModel):
             mm_token_ids=self.image_token_ids,
             **kwargs,
         )
+        llm_kwargs = {k: v for k, v in kwargs.items() if k != "multimodal_params"}
         logits = self.llm.forward(
             attn_metadata=attn_metadata,
             input_ids=input_ids,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
             return_context_logits=return_context_logits,
-            lora_params=kwargs.get("lora_params", None),
+            **llm_kwargs,
         )
         return logits
 

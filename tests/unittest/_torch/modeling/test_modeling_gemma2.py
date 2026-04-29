@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import unittest
-from copy import deepcopy
 
 import torch
 from transformers import Gemma2Config
@@ -150,6 +149,62 @@ class TestGemma2AttentionSliding(unittest.TestCase):
         self.assertEqual(attn_sliding.attention_window_size,
                          config.sliding_window)
         self.assertIsNone(attn_full.attention_window_size)
+
+
+class TestPaliGemmaSmoke(unittest.TestCase):
+    """Narrow smoke tests for PaliGemmaForConditionalGeneration."""
+
+    def _build_paligemma_model(self):
+        from transformers import PaliGemmaConfig, SiglipVisionConfig
+        from tensorrt_llm._torch.models.modeling_paligemma import \
+            PaliGemmaForConditionalGeneration
+
+        vision_config = SiglipVisionConfig(
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            image_size=56,
+            patch_size=14,
+            vision_use_head=False,
+        )
+        text_config = _build_hf_config(GEMMA2_SMALL_CONFIG)
+        text_config.model_type = "gemma2"
+
+        config = PaliGemmaConfig(
+            vision_config=vision_config,
+            text_config=text_config,
+            projection_dim=text_config.hidden_size,
+        )
+        config.torch_dtype = torch.bfloat16
+
+        mapping = Mapping(world_size=1, tp_size=1)
+        model_config = ModelConfig(pretrained_config=config, mapping=mapping)
+        return PaliGemmaForConditionalGeneration(model_config)
+
+    def test_paligemma_instantiation(self):
+        """Model creates with expected sub-components."""
+        model = self._build_paligemma_model()
+        self.assertTrue(hasattr(model, "llm"))
+        self.assertTrue(hasattr(model, "siglip_tower"))
+        self.assertTrue(hasattr(model, "mm_projector"))
+
+    def test_image_token_ids_is_buffer(self):
+        """image_token_ids must be a registered buffer, not a plain tensor."""
+        from tensorrt_llm._torch.models.modeling_paligemma import \
+            PaliGemmaForConditionalGeneration
+        model = self._build_paligemma_model()
+        buffer_names = [name for name, _ in model.named_buffers()]
+        self.assertIn("image_token_ids", buffer_names,
+                      "image_token_ids must be a registered buffer")
+
+    def test_mm_projector_shape(self):
+        """Projector linear weight has expected shape."""
+        model = self._build_paligemma_model()
+        w = model.mm_projector.linear.weight
+        vision_hidden = model.siglip_tower.config.hidden_size
+        text_hidden = model.llm.config.hidden_size
+        self.assertEqual(w.shape, (text_hidden, vision_hidden))
 
 
 if __name__ == "__main__":

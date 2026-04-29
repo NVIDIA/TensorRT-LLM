@@ -52,10 +52,13 @@ class Gemma2HfWeightMapper(HfWeightMapper):
                            p: nn.Parameter,
                            allow_partial_loading: bool = False) -> None:
         if "norm" in module_name:
-            if not allow_partial_loading:
-                assert n in module_weights
-            if n in module_weights:
-                p.data.copy_(module_weights[n][:] + 1)
+            if n not in module_weights:
+                if allow_partial_loading:
+                    return
+                raise KeyError(
+                    f"Missing weight '{n}' while loading module '{module_name}'."
+                )
+            p.data.copy_(module_weights[n][:] + 1)
         else:
             super().handle_manual_copy(
                 module_name,
