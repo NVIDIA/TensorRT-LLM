@@ -1146,10 +1146,10 @@ int AttentionOp::mlaGeneration(
         if (useSparseMLA())
         {
             tllmRunnerParams.mSparseAttention = SparseType::StaticTokenSparse;
-            tllmRunnerParams.mSparseTopK = mRuntimeSparseAttentionParams.sparse_topk;
+            tllmRunnerParams.mSparseTopK = mRuntimeSparseAttentionParams.sparse_mla_topk;
             tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<KVCacheIndex::UnderlyingType const*>(
                 mRuntimeSparseAttentionParams.sparse_attn_indices);
-            tllmRunnerParams.kvPtr = mRuntimeSparseAttentionParams.sparse_kv_cache_pool;
+            tllmRunnerParams.kvPtr = mRuntimeSparseAttentionParams.sparse_mla_kv_cache_pool;
         }
 
         mTllmGenFMHARunner->run(tllmRunnerParams);

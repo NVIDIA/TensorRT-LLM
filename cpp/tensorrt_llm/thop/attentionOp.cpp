@@ -379,10 +379,10 @@ public:
         op.mRuntimeSparseAttentionParams.sparse_attn_indices_block_size = sparse_attn_indices_block_size;
         op.mRuntimeSparseAttentionParams.sparse_attn_indices_stride
             = sparse_attn_indices.has_value() ? sparse_attn_indices.value().size(-1) : 0;
-        op.mRuntimeSparseAttentionParams.sparse_topk = num_sparse_topk;
+        op.mRuntimeSparseAttentionParams.sparse_mla_topk = num_sparse_topk;
         if (op.mUseSparseAttention && use_kv_cache)
         {
-            op.mRuntimeSparseAttentionParams.sparse_kv_cache_pool
+            op.mRuntimeSparseAttentionParams.sparse_mla_kv_cache_pool
                 = reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>());
         }
 
@@ -770,14 +770,20 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mUseSpecDecoding = spec_decoding_bool_params[1];       // use_spec_decoding
     op->mIsSpecDecTree = spec_decoding_bool_params[2];         // is_spec_dec_tree
 
+    // Sparse attention flags:
+    // - mUseSparseAttention: set when any sparse indices are provided (context or generation phase).
+    //   Also covers sparse MLA because sparse_attn_indices are always provided in that case.
+    // - mUseTllmGenSparseAttention: set when sparse_attn_indices are provided, indicating
+    //   trtllm-gen generation-phase sparse attention is in use.
     op->mUseSparseAttention = false;
     op->mUseTllmGenSparseAttentionPaged = false;
     op->mUseTllmGenSparseAttention = false;
-    if ((sparse_kv_indices.has_value() && sparse_kv_indices.value().numel() > 0)
-        || (sparse_attn_indices.has_value() && sparse_attn_indices.value().numel() > 0))
+    bool const hasSparseKvIndices = sparse_kv_indices.has_value() && sparse_kv_indices.value().numel() > 0;
+    bool const hasSparseAttnIndices = sparse_attn_indices.has_value() && sparse_attn_indices.value().numel() > 0;
+    if (hasSparseKvIndices || hasSparseAttnIndices)
     {
         op->mUseSparseAttention = true;
-        if (sparse_attn_indices.has_value() && sparse_attn_indices.value().numel() > 0)
+        if (hasSparseAttnIndices)
         {
             // Dispatch based on sparse_attn_offsets presence:
             // - sparse_attn_offsets provided → generation paged sparse attention
@@ -793,6 +799,11 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         }
     }
     int32_t const num_sparse_topk_value = num_sparse_topk.has_value() ? num_sparse_topk.value() : 0;
+    TLLM_CHECK_WITH_INFO(
+        num_sparse_topk_value >= 0, "sparse_mla_topk must be non-negative, got %d", num_sparse_topk_value);
+
+    // Note: mUseSparseAttention is already set by the block above when hasSparseAttnIndices is true,
+    // which covers the sparse MLA case since sparse_attn_indices are always provided for sparse MLA.
 
     if (is_mla_enable)
     {
@@ -801,11 +812,6 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
 
         TLLM_CHECK(host_kv_cache_pool_mapping.has_value());
         int32_t const layer_num = host_kv_cache_pool_mapping.value().size(0);
-
-        if (num_sparse_topk_value > 0 && sparse_attn_indices.has_value() && sparse_attn_indices.value().numel() > 0)
-        {
-            op->mUseSparseAttention = true;
-        }
 
         op->mIsMLAEnabled = true;
         op->mMLAParams = {static_cast<int>(q_lora_rank.value()), static_cast<int>(kv_lora_rank.value()),

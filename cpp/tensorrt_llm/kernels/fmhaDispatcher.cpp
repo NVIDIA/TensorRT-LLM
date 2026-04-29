@@ -257,12 +257,12 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         if (mFixedParams.useTllmGenSparseAttention)
         {
             tllmRunnerParams.mSparseAttention = SparseType::StaticTokenSparse;
-            tllmRunnerParams.mSparseTopK = runnerParams.sparse_params.sparse_topk;
+            tllmRunnerParams.mSparseTopK = runnerParams.sparse_params.sparse_mla_topk;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
             tllmRunnerParams.kvPageIdxPtr
                 = reinterpret_cast<int const*>(runnerParams.sparse_params.sparse_attn_indices);
-            tllmRunnerParams.kvPtr = runnerParams.sparse_params.sparse_kv_cache_pool;
+            tllmRunnerParams.kvPtr = runnerParams.sparse_params.sparse_mla_kv_cache_pool;
         }
 
         mTllmGenFMHARunner->run(tllmRunnerParams);

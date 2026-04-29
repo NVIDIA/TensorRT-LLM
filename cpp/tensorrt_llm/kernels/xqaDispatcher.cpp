@@ -452,10 +452,10 @@ void XqaDispatcher::runImpl(
             else if (mFixedParams.useTllmGenSparseAttention)
             {
                 tllmRunnerParams.mSparseAttention = SparseType::StaticTokenSparse;
-                tllmRunnerParams.mSparseTopK = params.sparse_params.sparse_topk;
+                tllmRunnerParams.mSparseTopK = params.sparse_params.sparse_mla_topk;
                 tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
                 tllmRunnerParams.kvPageIdxPtr = reinterpret_cast<int const*>(params.sparse_params.sparse_attn_indices);
-                tllmRunnerParams.kvPtr = params.sparse_params.sparse_kv_cache_pool;
+                tllmRunnerParams.kvPtr = params.sparse_params.sparse_mla_kv_cache_pool;
             }
         }
         else

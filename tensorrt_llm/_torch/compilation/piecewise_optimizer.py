@@ -256,24 +256,27 @@ def piecewise_optimizer(
     idx = 0
     exclude_modules_id = []
 
+    # DSA custom op is only registered when the DSA backend is loaded.
+    _attn_inplace_ops = [
+        torch.ops.trtllm.attn_custom_op_inplace.default,
+        torch.ops.trtllm.mla_custom_op_inplace.default,
+    ]
+    if hasattr(torch.ops.trtllm, "mla_dsa_attn_inplace"):
+        _attn_inplace_ops.append(torch.ops.trtllm.mla_dsa_attn_inplace.default)
+
+    _split_targets = _attn_inplace_ops + [
+        torch.ops.aten.index.Tensor,
+        torch.ops.aten.cumsum.default,
+    ]
+
     for node in graph.nodes:
         if node.op in ("output", "placeholder"):
             continue
-        if (not stop_partition and is_call_function(node, [
-                torch.ops.trtllm.attn_custom_op_inplace.default,
-                torch.ops.trtllm.mla_custom_op_inplace.default,
-                torch.ops.trtllm.mla_dsa_attn_inplace.default,
-                torch.ops.aten.index.Tensor,
-                torch.ops.aten.cumsum.default,
-        ])):
+        if (not stop_partition and is_call_function(node, _split_targets)):
             idx += 1
             node_to_graph_id[node] = idx
             exclude_modules_id.append(idx)
-            if (node.target != torch.ops.trtllm.attn_custom_op_inplace.default
-                    and node.target
-                    != torch.ops.trtllm.mla_custom_op_inplace.default
-                    and node.target
-                    != torch.ops.trtllm.mla_dsa_attn_inplace.default):
+            if node.target not in _attn_inplace_ops:
                 # We only know it is safe to continue splitting after attention
                 stop_partition = True
             else:

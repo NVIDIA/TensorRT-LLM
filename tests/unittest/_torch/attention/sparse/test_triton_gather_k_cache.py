@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.attention_backend.sparse.kernel import triton_gather_k_cache
+from tensorrt_llm._torch.attention_backend.sparse.dsa.kernels import triton_gather_k_cache
 
 
 def reference_gather_k_cache(

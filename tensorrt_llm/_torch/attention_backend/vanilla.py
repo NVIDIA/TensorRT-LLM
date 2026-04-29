@@ -13,7 +13,7 @@ except ImportError:
 
 from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
                         PredefinedAttentionMask)
-from .sparse.kernel import triton_index_gather
+from .sparse.kernels.common import triton_index_gather
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:

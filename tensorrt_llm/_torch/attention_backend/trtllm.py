@@ -10,13 +10,13 @@ import torch
 if TYPE_CHECKING:
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
+    from .sparse.params import SparseParams
 
 from tensorrt_llm._torch.attention_backend import trtllm_gen
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
-from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -1814,6 +1814,82 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         else:
             return metadata.kv_cache_manager.layer_offsets[self.layer_idx]
 
+    def sparse_params(
+        self,
+        metadata: TrtllmAttentionMetadata,
+    ) -> "SparseParams":
+        """Return non-index sparse parameters for this backend.
+
+        Subclasses override to populate backend-specific fields such as
+        block_size, mla_topk, skip_softmax thresholds, etc.
+        The base implementation returns default (empty) params.
+        """
+        from .sparse.params import SparseParams
+        return SparseParams()
+
+    def sparse_kv_predict(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        **kwargs,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Predict which KV cache blocks each token should attend to.
+
+        Subclasses override for their specific sparse algorithm.
+        Base implementation returns (None, None).
+        """
+        return None, None
+
+    def sparse_attn_predict(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        **kwargs,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Predict which attention blocks each token should attend to.
+
+        Subclasses override for their specific sparse algorithm.
+        Base implementation returns (None, None).
+        """
+        return None, None
+
+    def _prepare_sparse_params(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        **kwargs,
+    ) -> "SparseParams":
+        """Orchestrate sparse parameter preparation for wrapper.plan().
+
+        Calls three standard interfaces in order:
+        1. sparse_params() — non-index parameters (block_size, topk, thresholds)
+        2. sparse_kv_predict() — KV block indices/offsets
+        3. sparse_attn_predict() — attention block indices/offsets
+
+        Each sparse backend overrides the interfaces it needs.
+        This method itself should NOT be overridden.
+        """
+        params = self.sparse_params(metadata)
+
+        kv_indices, kv_offsets = self.sparse_kv_predict(q, k, metadata,
+                                                        **kwargs)
+        params.sparse_kv_indices = kv_indices
+        params.sparse_kv_offsets = kv_offsets
+
+        attn_indices, attn_offsets = self.sparse_attn_predict(
+            q, k, metadata, **kwargs)
+        params.sparse_attn_indices = attn_indices
+        params.sparse_attn_offsets = attn_offsets
+
+        # Consistency check: if topk is set but indexing failed, disable sparse.
+        if params.num_sparse_topk > 0 and params.sparse_attn_indices is None:
+            params.num_sparse_topk = 0
+
+        return params
+
     def use_nvfp4_output(
         self,
         metadata: TrtllmAttentionMetadata,
@@ -2002,24 +2078,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             output = outputs[0]
             output_sf = outputs[1] if len(outputs) == 2 else None
 
-        sparse_kv_indices, sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets = None, None, None, None
-        sparse_attn_indices_block_size = 1
-        skip_softmax_threshold_scale_factor_prefill = None
-        skip_softmax_threshold_scale_factor_decode = None
-        if self.sparse_attention_config is not None:
-            if isinstance(self.sparse_attention_config,
-                          SkipSoftmaxAttentionConfig):
-                skip_softmax_threshold_scale_factor_prefill = self.sparse_attention_config.threshold_scale_factor_prefill
-                skip_softmax_threshold_scale_factor_decode = self.sparse_attention_config.threshold_scale_factor_decode
-
-            else:
-                sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
-                    q, k, metadata, **kwargs)
-                sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
-                    q, k, metadata, **kwargs)
-                sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
-                )
-        num_sparse_topk = getattr(metadata, 'num_sparse_topk', 0)
+        sparse_params = self._prepare_sparse_params(q, k, metadata,
+                                                    **kwargs).as_dict()
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is reset in prepare_flash_mla() and update_for_spec_dec() to trigger
@@ -2096,17 +2156,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             spec_bl_tree_first_sparse_mask_offset_kv,
             attention_sinks=attention_sinks,
             chunked_prefill_buffer_batch_size=chunked_prefill_buffer_batch_size,
-            sparse_kv_indices=sparse_kv_indices,
-            sparse_kv_offsets=sparse_kv_offsets,
-            sparse_attn_indices=sparse_attn_indices,
-            sparse_attn_offsets=sparse_attn_offsets,
-            sparse_attn_indices_block_size=sparse_attn_indices_block_size,
-            num_sparse_topk=num_sparse_topk,
-            sparse_attention_config=self.sparse_attention_config,
-            skip_softmax_threshold_scale_factor_prefill=
-            skip_softmax_threshold_scale_factor_prefill,
-            skip_softmax_threshold_scale_factor_decode=
-            skip_softmax_threshold_scale_factor_decode,
+            **sparse_params,
             helix_position_offsets=metadata.helix_position_offsets,
             helix_is_inactive_rank=metadata.helix_is_inactive_rank,
             sage_attn_num_elts_per_blk_q=sage_attn_num_elts_per_blk_q,
@@ -2333,30 +2383,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.num_heads,
             self.mla_params.v_head_dim,
         )
-
-    def sparse_kv_predict(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        metadata: TrtllmAttentionMetadata,
-        **kwargs,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-            Predict sparse kv indices. It's implemented in the derived class.
-        """
-        raise NotImplementedError
-
-    def sparse_attn_predict(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        metadata: TrtllmAttentionMetadata,
-        **kwargs,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """
-            Predict sparse attn indices. It's implemented in the derived class.
-        """
-        raise NotImplementedError
 
     def mla_rope_generation(
         self,
