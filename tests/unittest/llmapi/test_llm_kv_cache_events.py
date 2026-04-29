@@ -310,6 +310,52 @@ def test_apply_mm_hashes_uuid_content_combined():
         "Different UUID + same content should produce different hashes"
 
 
+def test_apply_mm_hashes_video_audio_metadata_affects_hash():
+    """VideoData hashes include extracted audio when it affects model inputs."""
+    import numpy as np
+    from PIL import Image
+
+    from tensorrt_llm.inputs.multimodal import apply_mm_hashes
+    from tensorrt_llm.inputs.utils import VideoData
+
+    frames = [
+        Image.new("RGB", (2, 2), (10, 20, 30)),
+        Image.new("RGB", (2, 2), (40, 50, 60)),
+    ]
+    audio_a = np.array([0.0, 0.25, -0.5, 1.0], dtype=np.float32)
+    audio_a_copy = audio_a.copy()
+    audio_b = np.array([0.0, 0.25, -0.5, -1.0], dtype=np.float32)
+
+    def make_video(audio_samples=None, sample_rate=16000):
+        metadata = {}
+        if audio_samples is not None:
+            metadata = {
+                "audio_samples": audio_samples,
+                "audio_sample_rate": sample_rate,
+            }
+        return VideoData(frames=frames, metadata=metadata)
+
+    hashes_a, _ = apply_mm_hashes({"video": [make_video(audio_a)]})
+    hashes_a_copy, _ = apply_mm_hashes({"video": [make_video(audio_a_copy)]})
+    hashes_b, _ = apply_mm_hashes({"video": [make_video(audio_b)]})
+    hashes_a_different_rate, _ = apply_mm_hashes(
+        {"video": [make_video(audio_a, sample_rate=8000)]})
+    hashes_no_audio, _ = apply_mm_hashes({"video": [make_video()]})
+    hashes_frame_list, _ = apply_mm_hashes({"video": [frames]})
+
+    assert hashes_a["video"][0] == hashes_a_copy["video"][0]
+    assert hashes_a["video"][0] != hashes_b["video"][0]
+    assert hashes_a["video"][0] != hashes_a_different_rate["video"][0]
+    assert hashes_no_audio["video"][0] == hashes_frame_list["video"][0]
+
+    mm_uuids = {"video": ["shared-video-id"]}
+    hashes_uuid_a, _ = apply_mm_hashes({"video": [make_video(audio_a)]},
+                                       mm_uuids)
+    hashes_uuid_b, _ = apply_mm_hashes({"video": [make_video(audio_b)]},
+                                       mm_uuids)
+    assert hashes_uuid_a["video"][0] != hashes_uuid_b["video"][0]
+
+
 def test_int32_hexdigest_roundtrip():
     """Test that hexdigest_to_int32 and int32_to_hexdigest are inverses."""
     from tensorrt_llm.inputs.multimodal import (hexdigest_to_int32,
