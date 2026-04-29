@@ -562,6 +562,15 @@ def main(*,
             "limits. Pass a narrow arch list matching the GPU you intend to "
             "debug/profile.")
 
+    if build_type == "Debug":
+        print(
+            "-- Debug build: only --generate-line-info is enabled by default. "
+            "Full device debug info (-G) is NOT enabled because ptxas runs "
+            "out of memory on heavy cutlass GEMM kernels and gets OOM-killed. "
+            "If you need cuda-gdb stepping inside kernels, opt in with "
+            "`--extra-cmake-vars CMAKE_CUDA_FLAGS_DEBUG=-G`, ideally combined "
+            "with `--fast_build` to skip the heaviest instantiations.")
+
     cuda_architectures = cuda_architectures or 'all'
     cmake_cuda_architectures = f'"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}"'
 
