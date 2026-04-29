@@ -206,6 +206,14 @@ _SHARED_EXPERT_RENAME = {
 }
 
 
+def _resolve_enable_fused_hc(config: PretrainedConfig) -> bool:
+    """Resolve the DeepSeek-V4 fused HC boundary-fusion knob."""
+    env = os.environ.get("TRTLLM_MHC_ENABLE_FUSED_HC")
+    if env is not None:
+        return env not in ("0", "false", "False")
+    return bool(getattr(config, "enable_fused_hc", True))
+
+
 def _remap_deepseek_v4_checkpoint_keys(
     weights: Dict, num_hidden_layers: int, kv_lora_rank: int = 448
 ) -> Dict:
@@ -1757,14 +1765,8 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         # the MHC boundary fusion (`mHC.fused_hc`) is used. When False, fall back
         # to the unfused `post_mapping → pre_mapping` chain (same path engram
         # layers already take). Env var TRTLLM_MHC_ENABLE_FUSED_HC overrides the
-        # config attr (set to "1" to force-enable while validating fused_hc).
-        # Default is disabled because fused_hc must be bit-equivalent to the
-        # explicit post_mapping -> pre_mapping chain before it can safely replace it.
-        _env = os.environ.get("TRTLLM_MHC_ENABLE_FUSED_HC")
-        if _env is not None:
-            self.enable_fused_hc = _env not in ("0", "false", "False")
-        else:
-            self.enable_fused_hc = bool(getattr(config, "enable_fused_hc", False))
+        # config attr (set to "0" to force-disable for validation/rollback).
+        self.enable_fused_hc = _resolve_enable_fused_hc(config)
         self.next_layer_layernorm: RMSNorm = None
         # Finalized in DeepseekV4ForCausalLM.post_load_weights once the full layer
         # list is visible: a layer may defer its hc_ffn.post_mapping only if

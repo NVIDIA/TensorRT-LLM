@@ -257,8 +257,8 @@ void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual
     // Delegate to mhcBigFuseLaunch (defined in mhcKernels.cu) to avoid
     // instantiating the mhcBigFuseKernel template in this TU.
     mhcBigFuseLaunch(y_acc_workspace, r_acc_workspace, residual_cur, hc_scale, hc_base, post_mix_cur, comb_mix_cur,
-        layer_input_cur, M, /*K=*/hidden_size, hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
-        sinkhorn_repeat, /*num_splits=*/1, /*block_size=*/bs, stream);
+        layer_input_cur, M, /*K=*/static_cast<int>(SHAPE_K), hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
+        hc_post_mult_value, sinkhorn_repeat, /*num_splits=*/1, /*block_size=*/bs, stream);
 }
 
 // ===================================================================
@@ -336,7 +336,7 @@ void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* resid
 
     // ---- Step 2: big-fuse postlogue (reduces ks splits internally) ----
     mhcBigFuseLaunch(y_acc_workspace, r_acc_workspace, residual_cur, hc_scale, hc_base, post_mix_cur, comb_mix_cur,
-        layer_input_cur, M, /*K=*/hidden_size, hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
+        layer_input_cur, M, /*K=*/K, hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
         sinkhorn_repeat, /*num_splits=*/num_k_splits, bigfuse_block_size, stream);
 }
 
