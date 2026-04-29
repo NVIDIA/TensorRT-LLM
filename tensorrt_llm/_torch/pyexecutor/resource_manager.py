@@ -2000,11 +2000,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 mem_available = os.sysconf('SC_PAGE_SIZE') * os.sysconf(
                     'SC_AVPHYS_PAGES')
             except (ValueError, OSError):
+                mem_available = float('inf')
+            host_quota = min(quota, int(mem_available * 0.5))
+            if host_quota <= 0:
                 host_quota = quota
-            else:
-                host_quota = min(quota, int(mem_available * 0.5))
-                if host_quota <= 0:
-                    host_quota = quota
         if host_quota > 0:
             cache_tiers.append(HostCacheTierConfig(quota=host_quota))
             logger.info(
