@@ -49,6 +49,9 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     bash /opt/docker/common/install.sh --base --cmake --ccache --cuda_toolkit \
          --tensorrt --polygraphy --mpi4py --pytorch --opencv
 
+# Copy the CMake fetched dependencies' source link files
+COPY third-party-sources.json third-party-sources.json
+
 # Install constraints after install.sh so cleanup() doesn't delete the file mid-RUN
 COPY constraints.txt /tmp/constraints.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
