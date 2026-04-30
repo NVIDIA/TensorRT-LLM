@@ -919,8 +919,8 @@ class DecodingBaseConfig(StrictBaseModel):
         status="prototype",
         description=
         "If true, enables rejection sampling for one-model speculative decoding paths. "
-        "This is intended for non-greedy sampling configurations on the PyTorch backend."
-    )
+        "This is intended for non-greedy sampling configurations on the PyTorch backend. "
+        "The non-dynamic-tree one-model path requires FlashInfer.")
 
     # If set, drafting is allowed to use chain drafter.
     _allow_chain_drafter: bool = PrivateAttr(True)

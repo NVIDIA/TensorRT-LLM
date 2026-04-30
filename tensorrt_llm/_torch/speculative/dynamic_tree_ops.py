@@ -98,11 +98,11 @@ class DynamicTreeOpsConverter:
             raise TypeError(f"{name} must be an int or torch.Tensor, got {type(value)!r}")
         if value.dtype != torch.int64:
             raise TypeError(f"{name} must be int64 tensor, got {value.dtype}")
-        if value.numel() < 1:
-            raise ValueError(f"{name} tensor must have at least one element")
+        if value.numel() != 1:
+            raise ValueError(f"{name} tensor must have exactly one element, got {value.numel()}")
         if value.device != buffer.device:
             raise ValueError(f"{name} tensor must be on device {buffer.device}, got {value.device}")
-        return value.reshape(-1)[:1]
+        return value.reshape(-1)
 
     def build_dynamic_tree(
         self,
@@ -272,6 +272,13 @@ class DynamicTreeOpsConverter:
         seed_tensor = self._get_rejection_rng_tensor(seed, self._rej_seed_buf, "seed")
         offset_tensor = self._get_rejection_rng_tensor(offset, self._rej_offset_buf, "offset")
         num_draft_tokens = candidates.shape[1]
+        if num_gens <= 0:
+            raise ValueError(f"num_gens must be positive, got {num_gens}")
+        if draft_logits_tree.shape[0] % num_gens != 0:
+            raise ValueError(
+                f"draft_logits_tree rows ({draft_logits_tree.shape[0]}) must be divisible by "
+                f"num_gens ({num_gens})"
+            )
         num_draft_prob_rows = draft_logits_tree.shape[0] // num_gens
         target_vocab_size = target_logits_tree.shape[-1]
 
