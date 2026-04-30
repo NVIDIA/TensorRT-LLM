@@ -261,10 +261,10 @@ ELEM_TOL = {
     "epi_dtype, output_dtype",
     [
         # (torch.float32, torch.float32),  # Stage 0
-        # (torch.bfloat16, torch.bfloat16),     # Stage 1: packed FMA bf16 path
-        # (torch.float16, torch.float16),       # Stage 1: packed FMA fp16 path
         (torch.float32, torch.bfloat16),  # Stage 2: cast path
         # (torch.float32, torch.float16),       # Stage 2: cast path
+        # (torch.bfloat16, torch.bfloat16),     # Stage 1: packed FMA bf16 path
+        # (torch.float16, torch.float16),       # Stage 1: packed FMA fp16 path
     ],
 )
 @pytest.mark.parametrize(

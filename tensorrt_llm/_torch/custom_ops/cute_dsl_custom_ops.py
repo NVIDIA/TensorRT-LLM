@@ -6821,10 +6821,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cutlass.Uint8, (N, half_head_dim, sym_B),
                 stride_order=(1, 0, 2))
 
-            # sf_q is padded to N_padded by the host wrapper.
-            N_padded_compile = ((N + 127) // 128) * 128
-            sf_q_fake = cute.runtime.make_fake_compact_tensor(
-                cutlass.Int32, (N_padded_compile, sym_B), stride_order=(0, 1))
+            # sf_q has shape (N, B); kernel TMA descriptor tile = real N
+            # (no GMEM pad). SMEM/UTCCP padding to N_padded is handled inside
+            # the kernel.
+            sf_q_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32,
+                                                              (N, sym_B),
+                                                              stride_order=(0,
+                                                                            1))
 
             if epi_dtype == torch.float16:
                 w_dtype = cutlass.Float16
@@ -6932,20 +6935,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             q_3d = q.reshape(B, N, half_D).permute(1, 2, 0)
 
             # Reshape sf_q: [B, next_n, H] -> [B, N] -> [N, B]
-            # Pad along N to N_padded BEFORE the transpose, so the final view
-            # `(N_padded, B)` has strides (1, N_padded) matching the fake's
-            # stride_order=(0, 1). Padding the (N, B) shape directly with
-            # torch.zeros and then assigning produces (B, 1) strides, which
-            # mismatches the fake — keep the pad in (B, N) layout instead.
-            N_padded = ((N + 127) // 128) * 128
-            sf_q_2d_pre = sf_q.reshape(B, N)  # (B, N) contiguous
-            if N_padded != N:
-                sf_q_padded = torch.zeros((B, N_padded),
-                                          device=sf_q.device,
-                                          dtype=torch.int32)
-                sf_q_padded[:, :N] = sf_q_2d_pre
-                sf_q_2d_pre = sf_q_padded
-            sf_q_2d = sf_q_2d_pre.t()  # (N_padded, B), strides (1, N_padded)
+            # No GMEM pad — kernel TMA descriptor uses tile=N (real), so TMA
+            # only fetches N int32 from GMEM. SMEM is still N_padded for UTCCP
+            # alignment; the SMEM tail (N..N_padded) is left as garbage and
+            # never read by MMA (UMMA_N=N) or epilogue (acc cols [0,N) only).
+            # Mirrors DeepGEMM's pattern (kRealNumSFQAtom=N, kNumSFQAtom=N_pad).
+            sf_q_2d = sf_q.reshape(B, N).t()  # (N, B), strides (1, N)
 
             # Reshape weights: [B*next_n, H] -> [B, N] -> [N, B] (cast to epi_dtype)
             # NOTE: no .contiguous() — same reason as q_3d above.
