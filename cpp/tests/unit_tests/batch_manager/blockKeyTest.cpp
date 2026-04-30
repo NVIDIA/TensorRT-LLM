@@ -24,12 +24,25 @@ using namespace tensorrt_llm::batch_manager::kv_cache_manager;
 class BlockKeyTest : public ::testing::Test
 {
 protected:
+    using LlmRequest = tensorrt_llm::batch_manager::LlmRequest;
+
     // Convenience: build an MmKey with a recognisable hash byte pattern.
     static MmKey makeMmKey(uint8_t fill, SizeType32 startOffset)
     {
         std::array<uint8_t, 32> hashBytes{};
         hashBytes.fill(fill);
         return MmKey{hashBytes, startOffset};
+    }
+
+    static std::vector<SizeType32> makeHashParts(SizeType32 base)
+    {
+        std::vector<SizeType32> hashParts;
+        hashParts.reserve(8);
+        for (SizeType32 partIdx = 0; partIdx < 8; ++partIdx)
+        {
+            hashParts.push_back(base + partIdx);
+        }
+        return hashParts;
     }
 
     static std::array<uint8_t, 32> makeHashBytes(std::vector<SizeType32> const& hashParts)
@@ -44,6 +57,47 @@ protected:
             }
         }
         return hashBytes;
+    }
+
+    static LlmRequest makeMultimodalRequest(std::vector<TokenIdType> inputTokens,
+        std::vector<std::vector<SizeType32>> multimodalHashes,
+        std::optional<std::vector<SizeType32>> multimodalPositions,
+        std::optional<std::vector<SizeType32>> multimodalLengths,
+        std::optional<std::vector<std::vector<SizeType32>>> multimodalHashPositions = std::nullopt)
+    {
+        return LlmRequest(0, 1, inputTokens, tensorrt_llm::runtime::SamplingConfig{1}, false, std::nullopt,
+            std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+            std::move(multimodalHashes), std::move(multimodalPositions), std::move(multimodalLengths), std::nullopt,
+            std::move(multimodalHashPositions));
+    }
+
+    static std::list<VecUniqueTokens> makeBlockedUniqueTokens(std::vector<VecTokens> const& tokenBlocks)
+    {
+        std::list<VecUniqueTokens> blockedUniqueTokens;
+        for (auto const& tokenBlock : tokenBlocks)
+        {
+            VecUniqueTokens uniqueTokens;
+            uniqueTokens.reserve(tokenBlock.size());
+            for (auto const& token : tokenBlock)
+            {
+                uniqueTokens.push_back(UniqueToken{token, 0});
+            }
+            blockedUniqueTokens.push_back(std::move(uniqueTokens));
+        }
+        return blockedUniqueTokens;
+    }
+
+    static std::vector<size_t> hashBlockKeySequence(std::vector<BlockKey> const& blockKeys)
+    {
+        std::vector<size_t> hashes;
+        hashes.reserve(blockKeys.size());
+        size_t parentHash = 0;
+        for (auto const& blockKey : blockKeys)
+        {
+            parentHash = BlockKeyHasher::hash(blockKey, parentHash);
+            hashes.push_back(parentHash);
+        }
+        return hashes;
     }
 };
 
@@ -185,8 +239,6 @@ TEST_F(BlockKeyTest, HashWithExtraKeys)
 
 TEST_F(BlockKeyTest, MultimodalExtraKeysRespectSparsePromptPositions)
 {
-    using LlmRequest = tensorrt_llm::batch_manager::LlmRequest;
-
     auto const hashParts = std::vector<SizeType32>{
         0x01020304, 0x05060708, 0x11121314, 0x15161718, 0x21222324, 0x25262728, 0x31323334, 0x35363738};
 
@@ -211,8 +263,6 @@ TEST_F(BlockKeyTest, MultimodalExtraKeysRespectSparsePromptPositions)
 
 TEST_F(BlockKeyTest, MultimodalExtraKeysFallbackToContiguousSpan)
 {
-    using LlmRequest = tensorrt_llm::batch_manager::LlmRequest;
-
     auto const hashParts = std::vector<SizeType32>{
         0x01020304, 0x05060708, 0x11121314, 0x15161718, 0x21222324, 0x25262728, 0x31323334, 0x35363738};
     auto const request = LlmRequest(0, 1, std::vector<TokenIdType>{11, 999, 77, 999, 12},
@@ -230,10 +280,83 @@ TEST_F(BlockKeyTest, MultimodalExtraKeysFallbackToContiguousSpan)
     EXPECT_TRUE(secondSparseMmTokenKeys.empty());
 }
 
+TEST_F(BlockKeyTest, MultimodalExtraKeysStressMultipleSparseItemsAcrossBlockBoundaries)
+{
+    auto const firstHashParts = makeHashParts(0x01020300);
+    auto const secondHashParts = makeHashParts(0x11121300);
+    auto const request = makeMultimodalRequest(std::vector<TokenIdType>{10, 999, 20, 998, 999, 999, 30, 31, 998, 40},
+        std::vector<std::vector<SizeType32>>{firstHashParts, secondHashParts}, std::vector<SizeType32>{1, 3},
+        std::vector<SizeType32>{3, 2}, std::vector<std::vector<SizeType32>>{{1, 4, 5}, {3, 8}});
+    auto const firstHash = makeHashBytes(firstHashParts);
+    auto const secondHash = makeHashBytes(secondHashParts);
+
+    auto const firstBlockKeys = generateBlockHashExtraKeys(request, 0, 4);
+    ASSERT_EQ(firstBlockKeys.size(), 2);
+    EXPECT_EQ(firstBlockKeys[0].hash, firstHash);
+    EXPECT_EQ(firstBlockKeys[0].startOffset, 0);
+    EXPECT_EQ(firstBlockKeys[1].hash, secondHash);
+    EXPECT_EQ(firstBlockKeys[1].startOffset, 0);
+
+    auto const secondBlockKeys = generateBlockHashExtraKeys(request, 4, 8);
+    ASSERT_EQ(secondBlockKeys.size(), 1);
+    EXPECT_EQ(secondBlockKeys.front().hash, firstHash);
+    EXPECT_EQ(secondBlockKeys.front().startOffset, 1);
+
+    auto const blockGapKeys = generateBlockHashExtraKeys(request, 6, 8);
+    EXPECT_TRUE(blockGapKeys.empty());
+
+    auto const thirdBlockKeys = generateBlockHashExtraKeys(request, 8, 12);
+    ASSERT_EQ(thirdBlockKeys.size(), 1);
+    EXPECT_EQ(thirdBlockKeys.front().hash, secondHash);
+    EXPECT_EQ(thirdBlockKeys.front().startOffset, 1);
+}
+
+TEST_F(BlockKeyTest, BuildBlockKeysStressRepeatedHashesAndSparsePositionIdentity)
+{
+    auto const repeatedHashParts = makeHashParts(0x01010100);
+    auto const differentHashParts = makeHashParts(0x02020200);
+
+    auto makeKeys = [&](std::vector<std::vector<SizeType32>> hashes, std::vector<SizeType32> positions,
+                        std::vector<std::vector<SizeType32>> exactPositions)
+    {
+        auto const request
+            = makeMultimodalRequest(std::vector<TokenIdType>{10, 999, 20, 21, 999, 22, 23, 24, 999, 25, 26, 27},
+                std::move(hashes), std::move(positions), std::vector<SizeType32>{1, 1}, std::move(exactPositions));
+        auto blockedUniqueTokens
+            = makeBlockedUniqueTokens(std::vector<VecTokens>{{10, 999, 20, 21}, {999, 22, 23, 24}, {999, 25, 26, 27}});
+        return buildBlockKeys(blockedUniqueTokens, request);
+    };
+
+    auto const keysWithRepeatedHash
+        = makeKeys({repeatedHashParts, repeatedHashParts}, std::vector<SizeType32>{1, 4}, {{1}, {4}});
+    auto const identicalKeys
+        = makeKeys({repeatedHashParts, repeatedHashParts}, std::vector<SizeType32>{1, 4}, {{1}, {4}});
+    auto const differentPositionKeys
+        = makeKeys({repeatedHashParts, repeatedHashParts}, std::vector<SizeType32>{1, 8}, {{1}, {8}});
+    auto const differentHashKeys
+        = makeKeys({repeatedHashParts, differentHashParts}, std::vector<SizeType32>{1, 4}, {{1}, {4}});
+    auto const repeatedHash = makeHashBytes(repeatedHashParts);
+
+    ASSERT_EQ(keysWithRepeatedHash.size(), 3);
+    ASSERT_EQ(keysWithRepeatedHash[0].extraKeys.size(), 1);
+    ASSERT_EQ(keysWithRepeatedHash[1].extraKeys.size(), 1);
+    EXPECT_EQ(keysWithRepeatedHash[0].extraKeys.front().hash, repeatedHash);
+    EXPECT_EQ(keysWithRepeatedHash[0].extraKeys.front().startOffset, 0);
+    EXPECT_EQ(keysWithRepeatedHash[1].extraKeys.front().hash, repeatedHash);
+    EXPECT_EQ(keysWithRepeatedHash[1].extraKeys.front().startOffset, 0);
+
+    EXPECT_EQ(keysWithRepeatedHash, identicalKeys);
+    EXPECT_EQ(hashBlockKeySequence(keysWithRepeatedHash), hashBlockKeySequence(identicalKeys));
+
+    EXPECT_NE(keysWithRepeatedHash, differentPositionKeys);
+    EXPECT_NE(hashBlockKeySequence(keysWithRepeatedHash), hashBlockKeySequence(differentPositionKeys));
+
+    EXPECT_NE(keysWithRepeatedHash, differentHashKeys);
+    EXPECT_NE(hashBlockKeySequence(keysWithRepeatedHash), hashBlockKeySequence(differentHashKeys));
+}
+
 TEST_F(BlockKeyTest, MultimodalExtraKeysRejectInvalidExactHashPositions)
 {
-    using LlmRequest = tensorrt_llm::batch_manager::LlmRequest;
-
     auto const hashParts = std::vector<SizeType32>{
         0x01020304, 0x05060708, 0x11121314, 0x15161718, 0x21222324, 0x25262728, 0x31323334, 0x35363738};
 
@@ -256,6 +379,26 @@ TEST_F(BlockKeyTest, MultimodalExtraKeysRejectInvalidExactHashPositions)
             std::nullopt, std::vector<std::vector<SizeType32>>{hashParts}, std::vector<SizeType32>{1},
             std::vector<SizeType32>{2}, std::nullopt, std::vector<std::vector<SizeType32>>{{3, 1}});
     EXPECT_THROW((void) generateBlockHashExtraKeys(unsortedHashPositions, 1, 2), std::exception);
+
+    auto const duplicateHashPositions
+        = LlmRequest(0, 1, std::vector<TokenIdType>{11, 999, 77, 999, 12}, tensorrt_llm::runtime::SamplingConfig{1},
+            false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+            std::nullopt, std::vector<std::vector<SizeType32>>{hashParts}, std::vector<SizeType32>{1},
+            std::vector<SizeType32>{2}, std::nullopt, std::vector<std::vector<SizeType32>>{{1, 1}});
+    EXPECT_THROW((void) generateBlockHashExtraKeys(duplicateHashPositions, 1, 2), std::exception);
+
+    auto const missingLengths = LlmRequest(0, 1, std::vector<TokenIdType>{11, 999, 77, 999, 12},
+        tensorrt_llm::runtime::SamplingConfig{1}, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::vector<std::vector<SizeType32>>{hashParts},
+        std::vector<SizeType32>{1}, std::nullopt, std::nullopt, std::vector<std::vector<SizeType32>>{{1}});
+    EXPECT_THROW((void) generateBlockHashExtraKeys(missingLengths, 1, 2), std::exception);
+
+    auto const outerMismatch = LlmRequest(0, 1, std::vector<TokenIdType>{11, 999, 77, 999, 12},
+        tensorrt_llm::runtime::SamplingConfig{1}, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::vector<std::vector<SizeType32>>{hashParts, makeHashParts(0x11121300)}, std::vector<SizeType32>{1, 3},
+        std::vector<SizeType32>{1, 1}, std::nullopt, std::vector<std::vector<SizeType32>>{{1}});
+    EXPECT_THROW((void) generateBlockHashExtraKeys(outerMismatch, 1, 2), std::exception);
 }
 
 // ---------------------------------------------------------------------------

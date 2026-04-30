@@ -258,7 +258,6 @@ class MultimodalRuntimeData:
                                        if self.chunk_end_pos > 0 else 0)
         self.total_embeds_in_request = int(cs[-1])
 
-
 # Keys under `MultimodalParams.multimodal_data` that are CPU-resident metadata
 # and must never be moved to GPU by `MultimodalParams.to_device`.
 # Extend only after auditing each key's consumers.

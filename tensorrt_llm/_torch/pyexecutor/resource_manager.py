@@ -2491,9 +2491,38 @@ class KVCacheManagerV2(BaseResourceManager):
         multimodal_hash_positions = getattr(req, "multimodal_hash_positions",
                                             None)
         if multimodal_hash_positions is not None:
-            for hash_ints, positions in zip(req.multimodal_hashes,
-                                            multimodal_hash_positions,
-                                            strict=True):
+            for item_idx, (hash_ints, positions) in enumerate(
+                    zip(req.multimodal_hashes,
+                        multimodal_hash_positions,
+                        strict=True)):
+                if len(positions) == 0:
+                    raise ValueError(
+                        f"multimodal_hash_positions[{item_idx}] must not be empty"
+                    )
+                if req.multimodal_lengths is not None:
+                    expected_length = req.multimodal_lengths[item_idx]
+                    if len(positions) != expected_length:
+                        raise ValueError(
+                            f"multimodal_hash_positions[{item_idx}] length ({len(positions)}) must match "
+                            f"multimodal_lengths[{item_idx}] ({expected_length})"
+                        )
+                for offset, prompt_position in enumerate(positions):
+                    if prompt_position < 0 or prompt_position >= len(tokens):
+                        raise ValueError(
+                            f"multimodal_hash_positions[{item_idx}] contains position "
+                            f"{prompt_position} outside prompt token range [0, {len(tokens)})"
+                        )
+                    if offset > 0 and positions[offset - 1] >= prompt_position:
+                        raise ValueError(
+                            f"multimodal_hash_positions[{item_idx}] must be strictly increasing"
+                        )
+                if req.multimodal_positions is not None:
+                    expected_start = req.multimodal_positions[item_idx]
+                    if positions[0] != expected_start:
+                        raise ValueError(
+                            f"multimodal_hash_positions[{item_idx}] must start at "
+                            f"multimodal_positions[{item_idx}] ({expected_start})"
+                        )
                 digest = _hash_ints_to_digest(hash_ints)
                 mm_tokens = gen_multi_modal_tokens(self.vocab_size, digest,
                                                    len(positions))

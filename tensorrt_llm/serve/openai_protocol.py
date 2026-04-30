@@ -135,6 +135,11 @@ class DisaggregatedParams(OpenAIBaseModel):
     ctx_info_endpoint: Optional[str] = None
     schedule_style: Optional[DisaggScheduleStyle] = None
     conversation_id: Optional[str] = None
+    multimodal_embedding_handles: Optional[List[Dict[str, Any]]] = None
+    multimodal_hashes: Optional[List[List[int]]] = None
+    multimodal_hash_positions: Optional[List[List[int]]] = None
+    mrope_position_ids_handle: Optional[Dict[str, Any]] = None
+    mrope_position_deltas_handle: Optional[Dict[str, Any]] = None
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -577,7 +582,8 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     stop_reason: Optional[Union[int, str]] = None
     # TODO: progressivly add more info like input_ids, specific_token_ids, mrope, mm_hashes, etc
     # TODO: and use a JSON-safe handle to refer to the server-side output
-    mm_embedding_handle: Optional[Dict[str, Any]] = None
+    mm_embedding_handle: Optional[Union[Dict[str, Any], List[Dict[str,
+                                                                  Any]]]] = None
 
     disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
     avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
@@ -1211,6 +1217,15 @@ def to_disaggregated_params(
         ctx_dp_rank=tllm_disagg_params.ctx_dp_rank,
         ctx_info_endpoint=tllm_disagg_params.ctx_info_endpoint,
         schedule_style=tllm_disagg_params.schedule_style,
+        multimodal_embedding_handles=(
+            tllm_disagg_params.multimodal_embedding_handles),
+        multimodal_hashes=tllm_disagg_params.multimodal_hashes,
+        multimodal_hash_positions=(
+            tllm_disagg_params.multimodal_hash_positions),
+        mrope_position_ids_handle=(
+            tllm_disagg_params.mrope_position_ids_handle),
+        mrope_position_deltas_handle=(
+            tllm_disagg_params.mrope_position_deltas_handle),
     )
 
 
@@ -1233,6 +1248,15 @@ def to_llm_disaggregated_params(
         ctx_dp_rank=disaggregated_params.ctx_dp_rank,
         ctx_info_endpoint=disaggregated_params.ctx_info_endpoint,
         schedule_style=disaggregated_params.schedule_style,
+        multimodal_embedding_handles=(
+            disaggregated_params.multimodal_embedding_handles),
+        multimodal_hashes=disaggregated_params.multimodal_hashes,
+        multimodal_hash_positions=(
+            disaggregated_params.multimodal_hash_positions),
+        mrope_position_ids_handle=(
+            disaggregated_params.mrope_position_ids_handle),
+        mrope_position_deltas_handle=(
+            disaggregated_params.mrope_position_deltas_handle),
     )
 
 

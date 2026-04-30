@@ -6,6 +6,7 @@ import torch
 
 from tensorrt_llm.inputs.multimodal import (
     MultimodalInput,
+    MultimodalRuntimeData,
     find_mm_hash_token_positions,
     find_mm_token_positions,
 )
@@ -58,3 +59,36 @@ def test_multimodal_input_rejects_unordered_hash_positions():
         MultimodalInput.from_components(
             [[1, 2, 3, 4, 5, 6, 7, 8]], [1], [2], mm_hash_positions=[[3, 1]]
         )
+
+
+def test_multimodal_runtime_uses_sparse_hash_positions_for_chunk_bounds():
+    run_length = 254
+    run_starts = [37, 319, 601, 883, 1165]
+    hash_positions = [
+        pos for run_start in run_starts for pos in range(run_start, run_start + run_length)
+    ]
+    special_token_offsets = [0, 253, 254, 507, 508, 761, 762, 1015, 1016, 1269]
+
+    legacy_runtime = MultimodalRuntimeData(
+        past_seen_token_num=256,
+        mm_token_positions=[37],
+        mm_token_lengths=[1270],
+        chunk_end_pos=512,
+        special_token_offsets=special_token_offsets,
+    )
+
+    sparse_runtime = MultimodalRuntimeData(
+        past_seen_token_num=256,
+        mm_token_positions=[37],
+        mm_token_lengths=[1270],
+        chunk_end_pos=512,
+        special_token_offsets=special_token_offsets,
+        mm_token_hash_positions=[hash_positions],
+    )
+
+    assert legacy_runtime.num_mm_tokens_in_chunk - legacy_runtime.num_special_tokens_in_chunk == 254
+    assert sparse_runtime.num_unseen_mm_tokens == 219
+    assert sparse_runtime.num_mm_tokens_in_chunk == 228
+    assert sparse_runtime.num_unseen_special_tokens == 1
+    assert sparse_runtime.num_special_tokens_in_chunk == 2
+    assert sparse_runtime.num_mm_tokens_in_chunk - sparse_runtime.num_special_tokens_in_chunk == 226
