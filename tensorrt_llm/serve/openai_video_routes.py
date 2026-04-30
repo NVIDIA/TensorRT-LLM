@@ -100,7 +100,11 @@ class _VideoRoutesMixin:
             return self.create_error_response(str(e))
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_error_response(
+                str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     async def _parse_video_generation_request(
         self,
@@ -192,16 +196,8 @@ class _VideoRoutesMixin:
                 f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}"
             )
 
-            # Start background generation task
-            self.video_gen_tasks[video_id] = asyncio.create_task(
-                self._generate_video_background(
-                    video_id=video_id,
-                    request=request,
-                    params=params,
-                )
-            )
-
-            # Return job metadata immediately
+            # Persist the queued job before scheduling the background task so
+            # that a fast-completing task can always look it up in VIDEO_STORE.
             video_job = VideoJob(
                 created_at=int(time.time()),
                 id=video_id,
@@ -214,6 +210,17 @@ class _VideoRoutesMixin:
             )
             await VIDEO_STORE.upsert(video_id, video_job)
 
+            # Start background generation task
+            task = asyncio.create_task(
+                self._generate_video_background(
+                    video_id=video_id,
+                    request=request,
+                    params=params,
+                )
+            )
+            self.video_gen_tasks[video_id] = task
+            task.add_done_callback(lambda t, vid=video_id: self._on_video_task_done(vid, t))
+
             return JSONResponse(content=video_job.model_dump(), status_code=202)
 
         except ValueError as e:
@@ -221,7 +228,11 @@ class _VideoRoutesMixin:
             return self.create_error_response(str(e))
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_error_response(
+                str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     async def _generate_video_background(
         self,
@@ -297,7 +308,11 @@ class _VideoRoutesMixin:
 
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_error_response(
+                str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     async def get_video_metadata(self, video_id: str, raw_request: Request) -> Response:
         """Get video metadata by ID.
@@ -328,7 +343,11 @@ class _VideoRoutesMixin:
 
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_error_response(
+                str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     async def get_video_content(self, video_id: str, raw_request: Request) -> Response:
         """Download video file by ID.
@@ -389,7 +408,11 @@ class _VideoRoutesMixin:
 
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_error_response(
+                str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     async def delete_video(self, video_id: str, raw_request: Request) -> Response:
         """Delete a video by ID.
@@ -415,6 +438,16 @@ class _VideoRoutesMixin:
                     status_code=HTTPStatus.BAD_REQUEST,
                 )
 
+            # Cancel any in-flight generation task so it cannot recreate the
+            # output file or pin memory after the delete returns.
+            task = self.video_gen_tasks.pop(video_id, None)
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
             # Delete the video file(s) - check for both .mp4 and .avi
             video_path = None
             if job.output_path and os.path.exists(job.output_path):
@@ -437,4 +470,24 @@ class _VideoRoutesMixin:
 
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            return self.create_error_response(
+                str(e),
+                err_type="InternalServerError",
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+
+    def _on_video_task_done(self, video_id: str, task: "asyncio.Task") -> None:
+        """Drop a finished background task and surface its outcome.
+
+        Pops ``video_id`` from ``video_gen_tasks`` to bound memory growth
+        and logs any unexpected exception the task raised.
+        """
+        # Pop only if the slot still points at this task — delete_video may
+        # have replaced or removed it already.
+        if self.video_gen_tasks.get(video_id) is task:
+            self.video_gen_tasks.pop(video_id, None)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error(f"Background video generation task for {video_id} failed: {exc!r}")

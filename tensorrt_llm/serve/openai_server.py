@@ -1894,7 +1894,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
             e2e_ms = (time.perf_counter() - image_edit_start) * 1000.0
             logger.info(
-                f"Image {image_id} edited and encoded: "
+                f"Image {image_id} encoded: "
                 f"e2e_ms={e2e_ms:.1f} pipeline_ms={getattr(output.metrics, 'pipeline_ms', 0.0):.1f} "
                 f"denoise_ms={getattr(output.metrics, 'denoise_ms', 0.0):.1f}")
 

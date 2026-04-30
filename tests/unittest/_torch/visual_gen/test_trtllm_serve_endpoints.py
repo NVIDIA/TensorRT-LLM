@@ -763,7 +763,7 @@ class TestVideoGenerationSync:
             },
             headers={"content-type": "application/json"},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 500
 
     def test_sync_video_null_output(self, tmp_path):
         """Generator returns VisualGenOutput with video=None."""

@@ -597,16 +597,20 @@ class VisualGenResult:
         response = await asyncio.wrap_future(future)
 
         if response is None:
-            # Timeout before any response. Single-prompt: raise. Batch: synthesize.
+            # Timeout before any response. Persist as resolved error state so
+            # that subsequent aresult()/result() calls replay the same outcome
+            # via the ``self._finished`` fast path instead of returning None.
             if self._batch_size is None:
-                self._finished = True
-                raise VisualGenError("Generation timed out")
-            self._resolved = [
-                VisualGenOutput(request_id=self.request_id, error="Generation timed out")
-                for _ in range(self._batch_size)
-            ]
+                self._resolved = VisualGenOutput(
+                    request_id=self.request_id, error="Generation timed out"
+                )
+            else:
+                self._resolved = [
+                    VisualGenOutput(request_id=self.request_id, error="Generation timed out")
+                    for _ in range(self._batch_size)
+                ]
             self._finished = True
-            return self._resolved
+            return self._resolved_value()
 
         self._resolved = self._build_resolved(response)
         self._finished = True
