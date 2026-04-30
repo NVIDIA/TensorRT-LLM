@@ -2571,10 +2571,31 @@ def renderTestDB(testContext, llmSrc, stageName, preDefinedMakoOpts=null) {
     // Perf stages are excluded at Layer 2 (launchTestJobs) and never
     // reach this path with cbts != null, so no perfMode guard is needed here.
     def cbts = testFilter[(CBTS_RESULT)]
+    // Regenerate cbts_test_db/ on this stage's agent. L0_MergeRequest's
+    // getCbtsResult ran main.py on its own pod and produced the dir there,
+    // but L0_Test stages run in separate Kubernetes pods that never receive
+    // that dir. Re-running main.py here with the piggybacked input JSON is
+    // deterministic — output matches what L0_MergeRequest produced.
+    // Idempotent: only runs when cbts_test_db/ doesn't already exist.
+    if (cbts != null && cbts.test_db_dir_override && cbts.cbts_input_json) {
+        def overrideDir = "${llmSrc}/${cbts.test_db_dir_override}"
+        def dirExists = sh(returnStdout: true, script: "test -d ${overrideDir} && echo yes || echo no").trim()
+        if (dirExists != "yes") {
+            sh "apt-get update -qq && apt-get install -y -qq python3-yaml || true"
+            writeFile file: "${llmSrc}/cbts_input.json", text: cbts.cbts_input_json
+            sh "cd ${llmSrc} && python3 jenkins/scripts/cbts/main.py cbts_input.json > /dev/null 2>&1 || true"
+        }
+    }
     def testDBPath = "${llmSrc}/tests/integration/test_lists/test-db"
     if (cbts != null && cbts.test_db_dir_override) {
-        testDBPath = "${llmSrc}/${cbts.test_db_dir_override}"
-        echo "CBTS [${cbts.scope}]: rendering test list from filtered test-db at ${testDBPath}"
+        def overrideYaml = "${llmSrc}/${cbts.test_db_dir_override}/${testContext}.yml"
+        def overrideOk = sh(returnStdout: true, script: "test -s ${overrideYaml} && echo yes || echo no").trim()
+        if (overrideOk == "yes") {
+            testDBPath = "${llmSrc}/${cbts.test_db_dir_override}"
+            echo "CBTS [${cbts.scope}]: rendering test list from filtered test-db at ${testDBPath}"
+        } else {
+            echo "CBTS [${cbts.scope}]: ${overrideYaml} missing/empty -- falling back to source test-db"
+        }
     }
     def testList = "${llmSrc}/${testContext}.txt"
     def testDBQueryCmd = [

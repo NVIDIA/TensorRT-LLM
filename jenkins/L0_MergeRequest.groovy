@@ -776,6 +776,11 @@ def getCbtsResult(pipeline, testFilter, globalVars)
                           "Reasons: ${result.reasons.join('; ')}")
             return null
         }
+        // Layer 3 cross-job seed: piggyback the input JSON on testFilter so
+        // each L0_Test stage agent can re-run main.py locally and regenerate
+        // its own copy of cbts_test_db/. The directory written here lives on
+        // the L0_MergeRequest agent and never reaches downstream pods.
+        result.cbts_input_json = inputJson
         pipeline.echo("CBTS: scope=${result.scope}, " +
                       "archs=${result.affected_cpu_arch}, " +
                       "stages=${result.affected_stages.size()}, " +
