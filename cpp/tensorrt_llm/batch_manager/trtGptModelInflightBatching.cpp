@@ -2137,6 +2137,8 @@ void TrtGptModelInflightBatching::buildGatheredBeamTokensForCallback(DecoderInpu
     NVTX3_SCOPED_RANGE(buildGatheredBeamTokensForCallback);
 
     auto const numReqs = inputBuffers.decoderRequests.size();
+    // TODO(kyumin): remove. Diagnostic to confirm the patch is loaded by the runtime.
+    TLLM_LOG_INFO("buildGatheredBeamTokensForCallback called with %zu requests", numReqs);
     inputBuffers.gatheredBeamTokensForCallback.assign(numReqs, std::nullopt);
 
     for (size_t i = 0; i < numReqs; ++i)
@@ -2246,6 +2248,9 @@ void TrtGptModelInflightBatching::buildGatheredBeamTokensForCallback(DecoderInpu
 
         if (anyReorderNeeded)
         {
+            // TODO(kyumin): remove. Diagnostic to confirm the gathered path fires.
+            TLLM_LOG_INFO("buildGatheredBeamTokensForCallback: reorder detected for req %lu (slot %d, beamWidth %d)",
+                static_cast<unsigned long>(llmReq->mRequestId), seqSlot, beamWidth);
             inputBuffers.gatheredBeamTokensForCallback[i] = std::move(gathered);
         }
     }
