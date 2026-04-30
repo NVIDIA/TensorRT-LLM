@@ -1009,12 +1009,44 @@ def serve(
 
     def _serve_llm():
         nonlocal server_role
+
+        # Auto-detect models that only support the AutoDeploy backend.
+        # Maps model_type to required AD defaults (mirrors configs in
+        # examples/auto_deploy/model_registry/configs/).
+        _AUTODEPLOY_ONLY_DEFAULTS = {
+            "gemma4": {
+                "model_factory": "Gemma4ForConditionalGeneration",
+                "attn_backend": "triton_paged",
+                "max_seq_len": 8192,
+                "max_batch_size": 512,
+                "max_num_tokens": 8192,
+            },
+        }
+
+        effective_backend = backend
+        autodeploy_extra = {}
+        if backend == "pytorch":
+            import transformers
+            try:
+                config_dict, _ = transformers.PretrainedConfig.get_config_dict(
+                    model)
+                model_type = config_dict.get("model_type")
+                if model_type in _AUTODEPLOY_ONLY_DEFAULTS:
+                    logger.info(
+                        f"Model type '{model_type}' requires the AutoDeploy "
+                        f"backend. Switching from 'pytorch' to '_autodeploy'.")
+                    effective_backend = "_autodeploy"
+                    autodeploy_extra = _AUTODEPLOY_ONLY_DEFAULTS[model_type]
+            except (OSError, ValueError) as e:
+                logger.debug(f"Could not read model config for backend "
+                             f"auto-detection: {e}")
+
         llm_args, _ = get_llm_args(
             model=model,
             tokenizer=tokenizer,
             custom_tokenizer=custom_tokenizer,
             post_processor_hook=post_processor_hook,
-            backend=backend,
+            backend=effective_backend,
             max_beam_width=max_beam_width,
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -1046,6 +1078,9 @@ def serve(
         if extra_llm_api_options is not None:
             with open(extra_llm_api_options, 'r') as f:
                 llm_args_extra_dict = yaml.safe_load(f)
+        # Inject auto-detected AD defaults; user-provided options take priority
+        if autodeploy_extra:
+            llm_args_extra_dict = {**autodeploy_extra, **llm_args_extra_dict}
         llm_args = update_llm_args_with_extra_dict(
             llm_args, llm_args_extra_dict, explicit_cli_keys=explicit_cli_keys)
 
