@@ -237,17 +237,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "resize",
             [](kv::KvCache& self, std::optional<int> capacity, std::optional<int> historyLength) -> bool
-            {
-                try
-                {
-                    self.resize(capacity, historyLength);
-                    return true;
-                }
-                catch (kv::OutOfPagesError const&)
-                {
-                    return false;
-                }
-            },
+            { return self.resize(capacity, historyLength); },
             nb::arg("capacity"), nb::arg("history_length") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "commit",
