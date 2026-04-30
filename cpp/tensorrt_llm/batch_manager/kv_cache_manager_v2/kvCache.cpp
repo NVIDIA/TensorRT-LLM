@@ -198,12 +198,11 @@ void KvCache::activate()
         {
             bp = &mBlocks[static_cast<size_t>(ap.ordinal)].pages[ap.beamIdx][static_cast<size_t>(ap.lcId)];
         }
-        auto* holder = std::get_if<std::shared_ptr<PageHolder>>(bp);
-        if (holder && *holder)
-            targets.push_back({(*holder)->page, ap.beamIdx, ap.ordinal, ap.lcId});
+        auto& holder = std::get<std::shared_ptr<PageHolder>>(*bp);
+        assert(holder);
+        targets.push_back({holder->page, ap.beamIdx, ap.ordinal, ap.lcId});
     }
 
-    if (!targets.empty())
     {
         auto locks = batchedLockToGpu(*this, targets);
         size_t idx = 0;
@@ -535,7 +534,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
     if (_shortcutSetCapacity(newCap) && _shortcutSetHistoryLength(newHist))
         return true;
 
-    _unlockStaleBlocks(newHist);
+    auto backupHolders = _unlockStaleBlocks(newHist);
 
     int oldNumBlocks = divUp(mCapacity, mTokensPerBlock);
     int newNumBlocks = divUp(newCap, mTokensPerBlock);
@@ -546,7 +545,17 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
         _decreaseCapacity(newNumBlocks);
     }
     else if (newNumBlocks > oldNumBlocks)
-        _increaseCapacity(newNumBlocks, newHist);
+    {
+        try
+        {
+            _increaseCapacity(newNumBlocks, newHist);
+        }
+        catch (OutOfPagesError const&)
+        {
+            _lockHeldBlocks(backupHolders);
+            return false;
+        }
+    }
 
     mCapacity = newCap;
     mHistoryLength = newHist;
@@ -557,7 +566,8 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
 
 void KvCache::setCapacity(int cap)
 {
-    resize(cap, std::nullopt);
+    if (!resize(cap, std::nullopt))
+        throw OutOfPagesError("Not enough pages in GPU memory");
 }
 
 void KvCache::setHistoryLength(int hist)
@@ -844,13 +854,25 @@ void KvCache::_commitBlock(int ord, bool isLast)
     }
 
     // Try to find or create a block in the radix tree.
+    // Mirrors Python's try/except UselessBlockError pattern.
+    // TODO: Replace with if-condition once Python is removed and C++ is the primary codebase.
     bool blockIsNew = false;
-    auto newBlock = addOrGetExistingBlock(*parentNext, *parentKey, numLc, mTokensPerBlock, tokenBlock,
-        ord == 0 ? &root : nullptr, parentBlock.get(), &blockIsNew);
+    std::shared_ptr<Block> newBlock;
+    try
+    {
+        newBlock = addOrGetExistingBlock(*parentNext, *parentKey, numLc, mTokensPerBlock, tokenBlock,
+            ord == 0 ? &root : nullptr, parentBlock.get(), &blockIsNew);
+    }
+    catch (UselessBlockError const& e)
+    {
+        newBlock = e.block;
+        blockIsNew = false;
+    }
+    assert(newBlock);
 
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
 
-    if (newBlock && blockIsNew)
+    if (blockIsNew)
     {
         // New block: take uncommitted pages, convert to committed.
         // Mirrors Python's _take_uncommitted_page + convert path.
@@ -884,7 +906,7 @@ void KvCache::_commitBlock(int ord, bool isLast)
         }
         ++mNumCommittedBlocks;
     }
-    else if (newBlock && newBlock->isFull() && mManager->allowSeqRebasing() && isFull)
+    else if (newBlock->isFull() && mManager->allowSeqRebasing() && isFull)
     {
         // Existing block: rebase — reuse existing block's committed pages.
         // Mirrors Python's `elif tree_block.is_full and allow_seq_rebasing and is_full` path.

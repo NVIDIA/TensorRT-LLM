@@ -147,6 +147,16 @@ public:
     // Layer grouping: layers with the same lifecycle share pool allocation.
     std::vector<std::vector<LayerId>> layerGrouping() const;
 
+    // Sorted by CacheLevel from warm to cold. Mirrors Python's cache_tier_list property.
+    std::vector<CacheTier> cacheTierList() const;
+
+    // Iterator over all buffer identifiers. Mirrors Python's all_buffer_ids property.
+    std::vector<BufferId> allBufferIds() const;
+
+    // Get the max possible sequence length limited by GPU memory pools.
+    // Mirrors Python's clamp_max_seq_len_for_mem().
+    int clampMaxSeqLenForMem(int batchSize, int tokenNumUpperBound) const;
+
     // ---- Resize -----------------------------------------------------------
 
     bool resize(CacheLevel level, size_t quota, bool bestEfforts = false);

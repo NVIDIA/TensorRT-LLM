@@ -270,14 +270,21 @@ public:
 
     CUstream cudaStream() const;
 
-    // Mirrors Python's cuda_stream setter: if already on a stream, make the
-    // new stream wait for the old one before switching (cross-stream sync).
+    // Mirrors Python's cuda_stream setter: if already on a stream AND active,
+    // make the new stream wait for the old one before switching (cross-stream sync).
     void setCudaStream(CUstream stream)
     {
         if (mCudaStream.has_value())
         {
-            CachedCudaEvent ev(reinterpret_cast<CudaStream>(*mCudaStream));
-            ev.waitInStream(reinterpret_cast<CudaStream>(stream));
+            if (mStatus == Status::ACTIVE)
+            {
+                CachedCudaEvent ev(reinterpret_cast<CudaStream>(*mCudaStream));
+                ev.waitInStream(reinterpret_cast<CudaStream>(stream));
+            }
+        }
+        else
+        {
+            assert(mStatus == Status::SUSPENDED && !mFinishEvent.has_value());
         }
         mCudaStream = stream;
     }

@@ -109,15 +109,22 @@ void KvCacheManager::shutdown()
 
 void KvCacheManager::clearReusableBlocks()
 {
-    if (!mRadixTree)
-        return;
+    assert(mRadixTree);
 
     auto refs = mRadixTree->clear();
     for (auto& weakPage : refs)
     {
         auto page = weakPage.lock();
-        if (page && page->scheduledForEviction())
-            mStorage->excludeFromEviction(*page);
+        assert(page);
+        assert(page->status() == PageStatus::DROPPABLE);
+        mStorage->excludeFromEviction(*page);
+    }
+
+    // Post-condition: no evictable pages remain in any level.
+    for (auto const& lvl : mStorage->mLevels)
+    {
+        for (int pg = 0; pg < static_cast<int>(lvl.numPoolGroups()); ++pg)
+            assert(lvl.controller.numEvictablePages(static_cast<PoolGroupIndex>(pg)) == 0);
     }
 }
 
@@ -305,9 +312,90 @@ size_t KvCacheManager::getQuota(CacheLevel level) const
     return mStorage->mLevels.at(static_cast<size_t>(level)).storage->totalQuota();
 }
 
+std::vector<CacheTier> KvCacheManager::cacheTierList() const
+{
+    std::vector<CacheTier> result;
+    result.reserve(static_cast<size_t>(mStorage->numCacheLevels()));
+    for (auto const& lvl : mStorage->mLevels)
+        result.push_back(lvl.cacheTier);
+    return result;
+}
+
+std::vector<BufferId> KvCacheManager::allBufferIds() const
+{
+    std::vector<BufferId> result;
+    result.reserve(mStorage->mBufferAttr.size());
+    for (auto const& [id, attr] : mStorage->mBufferAttr)
+        result.push_back(id);
+    return result;
+}
+
+int KvCacheManager::clampMaxSeqLenForMem(int batchSize, int tokenNumUpperBound) const
+{
+    assert(batchSize > 0);
+    int tokPerBlock = tokensPerBlock();
+    int numPg = mStorage->numPoolGroups();
+    auto const& lcs = mLifeCycles;
+    auto const& lcGrouping = mStorage->mLifeCycleGrouping;
+
+    // Remaining slots per pool group.
+    std::vector<int> remainingSlots(static_cast<size_t>(numPg));
+    for (int pg = 0; pg < numPg; ++pg)
+        remainingSlots[static_cast<size_t>(pg)] = mStorage->numSlots(static_cast<PoolGroupIndex>(pg));
+
+    // Compute required slots per pool group for a given seq_len.
+    auto getNumSlots = [&](int seqLen) -> std::vector<int>
+    {
+        std::vector<int> ret(static_cast<size_t>(numPg), 0);
+        for (int lcId = 0; lcId < lcs.size(); ++lcId)
+        {
+            auto staleRange = getStaleRange(lcs[lcId], seqLen, tokPerBlock);
+            int numStaleBlocks = staleRange.end - staleRange.beg;
+            int numSlots = divUp(seqLen, tokPerBlock) - numStaleBlocks;
+            auto pgIdx = lcGrouping[static_cast<size_t>(lcId)];
+            ret[static_cast<size_t>(pgIdx)] += numSlots;
+        }
+        return ret;
+    };
+
+    // Reserve slots for (batch_size - 1) minimal sequences.
+    auto minSlots = getNumSlots(1);
+    for (int pg = 0; pg < numPg; ++pg)
+    {
+        remainingSlots[static_cast<size_t>(pg)] -= minSlots[static_cast<size_t>(pg)] * (batchSize - 1);
+        assert(remainingSlots[static_cast<size_t>(pg)] >= 0);
+    }
+
+    auto isEnough = [&](int numBlocks) -> bool
+    {
+        auto needed = getNumSlots(numBlocks * tokPerBlock);
+        for (int pg = 0; pg < numPg; ++pg)
+        {
+            if (needed[static_cast<size_t>(pg)] > remainingSlots[static_cast<size_t>(pg)])
+                return false;
+        }
+        return true;
+    };
+
+    assert(isEnough(1));
+    int lb = 1;
+    int ub = divUp(tokenNumUpperBound, tokPerBlock);
+    if (isEnough(ub))
+        return tokenNumUpperBound;
+    while (lb < ub - 1)
+    {
+        int mid = (lb + ub) / 2;
+        if (isEnough(mid))
+            lb = mid;
+        else
+            ub = mid;
+    }
+    return std::min(lb * tokPerBlock, tokenNumUpperBound);
+}
+
 void KvCacheManager::_adjustLevel(CacheLevel level, size_t quota)
 {
-    auto ratioList = (level == kGpuLevel) ? _currentGpuRatio() : _currentOtherRatios();
+    auto const& ratioList = _getTargetRatioList(level);
     std::vector<std::vector<std::shared_ptr<Page>>> const* persistent = nullptr;
     std::vector<std::vector<std::shared_ptr<Page>>> persistentPages;
     if (mStorage->isLastLevel(level))
