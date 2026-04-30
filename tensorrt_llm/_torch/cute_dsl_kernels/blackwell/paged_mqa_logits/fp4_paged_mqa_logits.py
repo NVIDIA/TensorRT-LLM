@@ -495,7 +495,7 @@ class FP4MQALogitsKernel:
         # acc TMEM (per math WG, per UMMA stage)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
-        self.num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake)
+        self.num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake, rounding=False)
 
         # TMEM SF layouts (single region, NOT staged — see plan U1).
         # Build a virtual 1-stage chunk SMEM layout to feed the TMEM helpers
@@ -541,6 +541,7 @@ class FP4MQALogitsKernel:
         )
         # TMEM allocator requires num_columns to be a power of two AND a
         # multiple of 32, between 32 and 512. Round up to next valid value.
+        # TODO: learn how utils.get_num_tmem_alloc_cols rounds up to the next valid value
         valid_tmem_cols = (32, 64, 128, 256, 512)
         rounded = next((v for v in valid_tmem_cols if v >= raw_total), None)
         assert rounded is not None, (
@@ -734,10 +735,14 @@ class FP4MQALogitsKernel:
         self.num_kv_sf_tma_bytes = self.num_blocks_per_mma * (
             kv_tma_bytes_per_subblock + sf_kv_tma_bytes_per_subblock
         )
-        # Q + SF_Q + Weights share barrier (Q-pipe). SF Q transaction is the
-        # *real* (= self.N) byte count, not N_padded — pad bytes aren't fetched.
-        sf_q_real_tma_bytes = self.N * 4
-        self.num_q_tma_bytes = b_copy_size * atom_thr_size + sf_q_real_tma_bytes + w_copy_size
+        # Q + SF_Q + Weights share barrier (Q-pipe). SF Q TMA descriptor tile
+        # is N_padded (built from sf_q_smem_layout_staged); host wrapper pads
+        # GMEM to N_padded with zeros (cute_dsl_custom_ops.py:5584-5590). So
+        # TMA actually fetches N_padded * 4 bytes, NOT N * 4. Barrier tx_count
+        # must match actual fetch — undersizing it caused the in-flight pad
+        # bytes to race with consumer (UMMA warp) reads of SMEM via UTCCP.
+        sf_q_tma_bytes = self.N_padded * 4
+        self.num_q_tma_bytes = b_copy_size * atom_thr_size + sf_q_tma_bytes + w_copy_size
 
         num_ctas = self.num_sms
 

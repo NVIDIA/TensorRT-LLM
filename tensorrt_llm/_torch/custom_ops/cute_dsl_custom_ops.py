@@ -5573,29 +5573,37 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_sms = _get_num_sms()
 
             # Reshape Q: [B, next_n, H, D/2] -> [B, N, D/2] -> [N, D/2, B]
-            q_3d = q.reshape(B, N, half_D).permute(1, 2, 0).contiguous()
+            # NOTE: do NOT call .contiguous() — that would repack memory and
+            # produce strides depending on B, breaking the fake tensor compile
+            # cache (which assumes stride_order with half_D innermost).
+            # The permute view alone gives strides (half_D, 1, N*half_D) which
+            # are B-independent and match the compile-time fake stride.
+            q_3d = q.reshape(B, N, half_D).permute(1, 2, 0)
 
             # Reshape sf_q: [B, next_n, H] -> [B, N] -> [N, B]
-            # Pad along N to N_padded (multiple of 128, the UTCCP atom).
-            # The kernel TMA loads N_padded rows; pad rows hold 0 so the
-            # corresponding (dummy) SF doesn't perturb acc — the schedule
-            # only references real-token positions.
-            sf_q_2d = sf_q.reshape(B, N).t().contiguous()
+            # Pad along N to N_padded BEFORE the transpose, so the final view
+            # `(N_padded, B)` has strides (1, N_padded) matching the fake's
+            # stride_order=(0, 1). Padding the (N, B) shape directly with
+            # torch.zeros and then assigning produces (B, 1) strides, which
+            # mismatches the fake — keep the pad in (B, N) layout instead.
             N_padded = ((N + 127) // 128) * 128
+            sf_q_2d_pre = sf_q.reshape(B, N)  # (B, N) contiguous
             if N_padded != N:
-                sf_q_padded = torch.zeros((N_padded, B),
+                sf_q_padded = torch.zeros((B, N_padded),
                                           device=sf_q.device,
                                           dtype=torch.int32)
-                sf_q_padded[:N] = sf_q_2d
-                sf_q_2d = sf_q_padded
+                sf_q_padded[:, :N] = sf_q_2d_pre
+                sf_q_2d_pre = sf_q_padded
+            sf_q_2d = sf_q_2d_pre.t()  # (N_padded, B), strides (1, N_padded)
 
             # Reshape weights: [B*next_n, H] -> [B, N] -> [N, B] (cast to epi_dtype)
+            # NOTE: no .contiguous() — same reason as q_3d above.
             if epi_dtype == torch.float16:
-                w_2d = weights.reshape(B, N).half().t().contiguous()
+                w_2d = weights.reshape(B, N).half().t()
             elif epi_dtype == torch.bfloat16:
-                w_2d = weights.reshape(B, N).bfloat16().t().contiguous()
+                w_2d = weights.reshape(B, N).bfloat16().t()
             else:
-                w_2d = weights.reshape(B, N).t().contiguous()
+                w_2d = weights.reshape(B, N).t()
 
             # Flatten fused KV to [num_phys_blocks, block_bytes]
             kv_flat = kv_fused.reshape(num_phys_blocks, -1)
