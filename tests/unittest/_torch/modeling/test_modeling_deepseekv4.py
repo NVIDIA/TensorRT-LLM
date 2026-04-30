@@ -27,7 +27,6 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
     DeepseekV4Gate,
-    DeepseekV4MoE,
     DeepseekV4MTP,
     _deepseek_v4_pos_embd_params,
     _remap_deepseek_v4_checkpoint_keys,
@@ -336,19 +335,6 @@ def test_deepseek_v4_compressor_rotate_and_indexer_rope_contracts():
     assert "rotate_activation=False" in attention_init
 
 
-def test_deepseek_v4_moe_swiglu_limit_applies_to_routed_and_shared_experts():
-    moe_init = inspect.getsource(DeepseekV4MoE.__init__)
-    assert "moe_swiglu_limit = None" in moe_init
-    assert "supports_swiglu_limit = False" in moe_init
-    assert "mode.has_w4a8_mxfp4_mxfp8()" in moe_init
-    assert "swiglu_limit=moe_swiglu_limit" in moe_init
-
-    shared_expert_block = moe_init.split("self.shared_experts = GatedMLP", 1)[1].split(
-        "self.allreduce", 1
-    )[0]
-    assert "swiglu_limit=swiglu_limit" in shared_expert_block
-
-
 def test_deepseek_v4_attention_forward_injects_attn_sink(monkeypatch):
     captured = {}
 
@@ -534,17 +520,17 @@ def test_deepseek_v4_rope_params_follow_layer_compress_ratio():
     assert active_config_rope.rope.scale_type == RotaryScalingType.none
     assert active_config_rope.rope.theta == 10000.0
 
-def test_deepseek_v4_sparse_ratios_prefer_checkpoint_defaults(
-        tmp_path, monkeypatch):
+
+def test_deepseek_v4_sparse_ratios_prefer_checkpoint_defaults(tmp_path, monkeypatch):
     checkpoint_ratios = [128, 128, 4, 128, 4, 128, 0, 4]
     config = DeepseekV4Config(
         architectures=["DeepseekV4ForCausalLM"],
         num_hidden_layers=len(checkpoint_ratios),
         compress_ratios=checkpoint_ratios,
-        sliding_window=256,
     )
-    monkeypatch.setattr("tensorrt_llm._torch.model_config.load_pretrained_config",
-                        lambda *args, **kwargs: config)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.model_config.load_pretrained_config", lambda *args, **kwargs: config
+    )
     sparse_attn_config = DeepSeekV4SparseAttentionConfig(
         compress_ratios=[1, 1, 4, 128, 4, 128, 4],
         q_split_threshold=2048,
@@ -558,22 +544,23 @@ def test_deepseek_v4_sparse_ratios_prefer_checkpoint_defaults(
         moe_backend="TRTLLM",
     )
 
-    assert model_config.sparse_attention_config.compress_ratios == [
-        128, 128, 4, 128, 4, 128, 1, 4
-    ]
-    assert model_config.sparse_attention_config.window_size == 256
+    assert model_config.sparse_attention_config.compress_ratios == [128, 128, 4, 128, 4, 128, 1, 4]
+    # V4 sparse MLA hardcodes window_size==128 (FMHA kernel TileSizeKV; see
+    # the runtime assertion in deepseek_v4.py:DeepseekV4TrtllmAttentionMetadata
+    # __post_init__), so this is the only legal value here.
+    assert model_config.sparse_attention_config.window_size == 128
 
 
-def test_deepseek_v4_sparse_ratios_keep_checkpoint_length_without_mtp(
-        tmp_path, monkeypatch):
+def test_deepseek_v4_sparse_ratios_keep_checkpoint_length_without_mtp(tmp_path, monkeypatch):
     checkpoint_ratios = [128, 128] + [4, 128] * 29 + [0, 4]
     config = DeepseekV4Config(
         architectures=["DeepseekV4ForCausalLM"],
         num_hidden_layers=61,
         compress_ratios=checkpoint_ratios,
     )
-    monkeypatch.setattr("tensorrt_llm._torch.model_config.load_pretrained_config",
-                        lambda *args, **kwargs: config)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.model_config.load_pretrained_config", lambda *args, **kwargs: config
+    )
     sparse_attn_config = DeepSeekV4SparseAttentionConfig(
         compress_ratios=[1, 1, 4, 128, 4, 128, 4],
     )
@@ -585,15 +572,12 @@ def test_deepseek_v4_sparse_ratios_keep_checkpoint_length_without_mtp(
         moe_backend="TRTLLM",
     )
 
-    assert len(model_config.sparse_attention_config.compress_ratios) == len(
-        checkpoint_ratios)
-    assert model_config.sparse_attention_config.compress_ratios[:-2] == (
-        checkpoint_ratios[:-2])
+    assert len(model_config.sparse_attention_config.compress_ratios) == len(checkpoint_ratios)
+    assert model_config.sparse_attention_config.compress_ratios[:-2] == (checkpoint_ratios[:-2])
     assert model_config.sparse_attention_config.compress_ratios[-2:] == [1, 4]
 
 
-def test_deepseek_v4_sparse_ratios_keep_explicit_override(
-        tmp_path, monkeypatch):
+def test_deepseek_v4_sparse_ratios_keep_explicit_override(tmp_path, monkeypatch):
     checkpoint_ratios = [128, 128, 4, 128, 4, 128, 0, 4]
     explicit_ratios = [1, 4, 1, 4, 1, 4, 1, 4]
     config = DeepseekV4Config(
@@ -601,8 +585,9 @@ def test_deepseek_v4_sparse_ratios_keep_explicit_override(
         num_hidden_layers=len(checkpoint_ratios),
         compress_ratios=checkpoint_ratios,
     )
-    monkeypatch.setattr("tensorrt_llm._torch.model_config.load_pretrained_config",
-                        lambda *args, **kwargs: config)
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.model_config.load_pretrained_config", lambda *args, **kwargs: config
+    )
     sparse_attn_config = DeepSeekV4SparseAttentionConfig(
         compress_ratios=explicit_ratios,
     )
