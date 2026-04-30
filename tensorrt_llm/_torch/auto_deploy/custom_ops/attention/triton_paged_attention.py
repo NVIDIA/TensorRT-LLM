@@ -1093,7 +1093,8 @@ def triton_paged_context(
     # Normalize sliding_window for kernel constexpr: None/non-positive → 0
     sw = sliding_window if isinstance(sliding_window, int) and sliding_window > 0 else 0
 
-    # Use SDPA for large head dims to avoid paged-kernel tl.dot restrictions.
+    # Force SDPA for large head_dim: the Triton paged kernel's tl.dot produces
+    # misaligned shared memory accesses on Blackwell when HEAD_DIM > 256.
     large_head_dim = head_dim > 256
     # SDPA reshape requires all sequences to have the same q_len (since q is
     # packed as [total_tokens, ...] and we reshape to [num_seq, max_q_len, ...]).
