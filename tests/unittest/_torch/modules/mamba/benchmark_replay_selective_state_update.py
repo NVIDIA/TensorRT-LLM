@@ -511,22 +511,26 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
     """
     from concurrent.futures import ThreadPoolExecutor
 
+    sr_modes_list = getattr(args, "sr_modes_list", ["RN"])
+
     configs = []
     for batch in batch_sizes:
         for mtp_len in mtp_lengths:
             prev_ks = _resolve_prev_ks(args, mtp_len)
             for state_dtype in state_dtypes:
                 for act_dtype in act_dtypes:
-                    configs.append((batch, mtp_len, prev_ks, state_dtype, act_dtype))
+                    for sr_mode in sr_modes_list:
+                        configs.append(
+                            (batch, mtp_len, prev_ks, state_dtype, act_dtype, sr_mode))
 
     print(f"[compile-warmup] {len(configs)} configs across {max_workers} threads")
     t0 = time.perf_counter()
 
     def _warm(cfg):
-        batch, mtp_len, prev_ks, state_dtype, act_dtype = cfg
+        batch, mtp_len, prev_ks, state_dtype, act_dtype, sr_mode = cfg
         _bench_config(
             args, batch, mtp_len, prev_ks, state_dtype, act_dtype, baseline_fn,
-            warmup_only=True,
+            sr_mode=sr_mode, warmup_only=True,
         )
 
     errors = []
@@ -555,6 +559,7 @@ def _bench_config(
     state_dtype: torch.dtype,
     act_dtype: torch.dtype,
     baseline_fn,
+    sr_mode: str = "RN",
     warmup_only: bool = False,
 ) -> None:
     """
@@ -614,23 +619,21 @@ def _bench_config(
     head_dim = args.head_dim
     d_state = args.d_state
     with_conv1d = getattr(args, "with_conv1d", False)
-    use_philox = getattr(args, "philox_rounding", False)
+    use_philox = (sr_mode == "SR")
     variant_fn = _VARIANT_FNS[args.variant]()
 
-    # Philox rounding: allow fp16 and the quantized dtypes (int8/int16/fp8).
+    # SR rounding: allow fp16 and the quantized dtypes (int8/int16/fp8).
     # bf16/fp32 SR is not supported (no PTX path for bf16; fp32 doesn't need
-    # rounding).  This validates the user's input — it doesn't apply to the
-    # baseline (incompatible baselines are silently skipped below).
+    # rounding).  When sweeping --sr-modes RN,SR over a mixed dtype set,
+    # silently skip the SR cell for unsupported dtypes — the RN cell still
+    # prints, and other dtypes still get their SR row.
     rand_seed = None
     _SR_SUPPORTED = (
         torch.float16, torch.int8, torch.int16, torch.float8_e4m3fn,
     )
     if use_philox:
         if state_dtype not in _SR_SUPPORTED:
-            raise ValueError(
-                f"--philox-rounding requires state dtype in {{fp16, int8, int16, fp8}}, "
-                f"got {state_dtype}"
-            )
+            return
         rand_seed = torch.randint(0, 2**62, (1,), device="cuda", dtype=torch.int64)
 
     is_quantized = state_dtype in (torch.int8, torch.int16, torch.float8_e4m3fn)
@@ -914,6 +917,7 @@ def _bench_config(
                 parts.append(f"R={maxnreg}")
             if num_ctas is not None:
                 parts.append(f"CT={num_ctas}")
+            parts.append(f"SR={1 if use_philox else 0}")
             sweep_suffix = (" " + ",".join(parts)) if parts else ""
             sweep_tag = tag + sweep_suffix.replace(" ", "_").replace(",", "_")
 
@@ -1035,15 +1039,19 @@ def _run_benchmark(args) -> None:
             f"|{'-' * 7}|{'-' * 9}|{'-' * 8}|{'-' * 13}|{'-' * 11}|{'-' * 11}|{'-' * 9}|{'-' * 9}|"
         )
 
+    sr_modes_list = getattr(args, "sr_modes_list", ["RN"])
+
     for batch in batch_sizes:
         for mtp_len in mtp_lengths:
             # Resolve prev_k fractions → clamped integers in [0, mtp_len]
             prev_ks = _resolve_prev_ks(args, mtp_len)
             for state_dtype in state_dtypes:
                 for act_dtype in act_dtypes:
-                    _bench_config(
-                        args, batch, mtp_len, prev_ks, state_dtype, act_dtype, baseline_fn
-                    )
+                    for sr_mode in sr_modes_list:
+                        _bench_config(
+                            args, batch, mtp_len, prev_ks, state_dtype, act_dtype,
+                            baseline_fn, sr_mode=sr_mode,
+                        )
 
     if args.profile:
         torch.cuda.cudart().cudaProfilerStop()
@@ -1252,11 +1260,20 @@ def _parse_args() -> argparse.Namespace:
         help="Override num_ctas for the main kernel (comma-separated sweep).",
     )
     parser.add_argument(
+        "--sr-modes",
+        type=str,
+        default="RN",
+        help="Comma-separated rounding modes to sweep: any combination of "
+        "{RN, SR}.  SR (stochastic rounding) is silently skipped for state "
+        "dtypes that don't support it (bf16, fp32).  Default 'RN' matches "
+        "legacy --philox-rounding=False behavior.",
+    )
+    parser.add_argument(
         "--philox-rounding",
         action="store_true",
-        help="Enable Philox stochastic rounding (rand_seed generated per "
-        "iteration).  Supported state dtypes: fp16, int8, int16, fp8.  "
-        "fp16 SR and fp8 SR require sm_100a (Blackwell B200+).",
+        help="DEPRECATED — equivalent to --sr-modes SR.  Retained for "
+        "backward compatibility; use --sr-modes for new scripts.  fp16 SR "
+        "and fp8 SR require sm_100a (Blackwell B200+).",
     )
     parser.add_argument(
         "--philox-rounds",
@@ -1283,7 +1300,26 @@ def _parse_args() -> argparse.Namespace:
         "module loading. Slower (~40s startup) but guaranteed correct "
         "if the fast path breaks due to package changes.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Backward-compat: --philox-rounding implies --sr-modes SR if --sr-modes
+    # was left at the default.  If both are set explicitly, error.
+    sr_modes_default = (args.sr_modes == "RN")
+    if args.philox_rounding:
+        if not sr_modes_default and args.sr_modes != "SR":
+            parser.error(
+                "--philox-rounding (deprecated) is incompatible with explicit "
+                f"--sr-modes={args.sr_modes!r}.  Use --sr-modes SR (or "
+                "RN,SR) instead and drop --philox-rounding."
+            )
+        args.sr_modes = "SR"
+
+    sr_modes = [m.strip() for m in args.sr_modes.split(",") if m.strip()]
+    for m in sr_modes:
+        if m not in ("RN", "SR"):
+            parser.error(f"--sr-modes value must be RN or SR, got {m!r}")
+    args.sr_modes_list = sr_modes
+    return args
 
 
 class _Tee:
