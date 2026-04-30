@@ -1,3 +1,4 @@
+import threading
 import time
 import uuid
 
@@ -310,6 +311,181 @@ def test_cancel_request_in_transmission_does_not_break_sender_future(
     captured = capfd.readouterr()
     merged = captured.out + captured.err
     assert "Broken promise" not in merged
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("attention_type",
+                         [AttentionTypeCpp.DEFAULT, AttentionTypeCpp.MLA],
+                         ids=["mha", "mla"])
+def test_cancelled_after_ready_does_not_leak_recv_buffer_index(attention_type):
+    """Reproduce the recv-buffer leak via the !isReady early return.
+
+    Signature #6 of NVBug 6104831. The signature #1 fix on the sender
+    side correctly sends ``is_ready=false`` for cancelled-after-ready
+    requests; on the receiver side that becomes
+    ``bool isReady = false`` from ``receiveReadySignal()`` in
+    ``CacheReceiver::Impl::requestSync()``. The pre-fix early return
+    sets ``kDISAGG_TRANS_ERROR`` and returns *without* calling
+    ``receiveSync()``, so ``unformat()`` never runs and the recv buffer
+    index reserved at the top of ``sendRequestInfo()`` is leaked.
+    Because ``mRecvBufferCount`` defaults to ``1`` for the NIXL agent
+    backend, a single leaked recv buffer index is enough to wedge every
+    subsequent ``assignBufferIndexForRecv()`` call forever inside the
+    unbounded ``cv.wait`` in ``BaseTransBufferManager::assignBufferIndex``.
+
+    The test drives one full ctx/gen handshake to completion to capture
+    a real opaque comm/cache state, then exercises the
+    cancelled-after-ready path once (sender ``respond_and_send_async``
+    + ``cancel_request`` + receiver ``request_and_receive_async``) so
+    the receiver side hits the ``!isReady`` early return. It then
+    issues a follow-up generation request whose context counterpart is
+    a fresh, healthy ``respond_and_send_async`` and asserts the
+    follow-up request completes within a reasonable timeout. Pre-fix
+    the follow-up request hangs in
+    ``assignBufferIndexForRecv()``; post-fix it completes promptly
+    because the recv buffer index has been freed by the new explicit
+    free in the ``!isReady`` early return path.
+    """
+    tensorrt_llm.logger.set_level("info")
+    mapping = Mapping(world_size=1, rank=0)
+    dist = Distributed.get(mapping)
+    kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF)
+    kv_cache_manager_gen = create_kv_cache_manager(mapping, DataType.HALF)
+
+    # The bug only manifests with the NIXL agent backend, which is the only
+    # backend that goes through assignBufferIndexForRecv() /
+    # AgentConnection::sendRequestAndBufferInfo(). The DEFAULT-resolves-to-UCX
+    # path uses connection->send() directly and does not reserve recv buffer
+    # slots, so it cannot exercise this leak.
+    cache_transceiver_config = CacheTransceiverConfig(backend="NIXL",
+                                                      max_tokens_in_buffer=512)
+
+    kv_cache_transceiver_ctx = create_kv_cache_transceiver(
+        mapping, dist, kv_cache_manager_ctx, attention_type,
+        cache_transceiver_config)
+    kv_cache_transceiver_gen = create_kv_cache_transceiver(
+        mapping, dist, kv_cache_manager_gen, attention_type,
+        cache_transceiver_config)
+
+    fill_kv_cache_buffer(kv_cache_manager_ctx)
+    sampling_params = SamplingParams()
+
+    def make_request(request_id, llm_request_type, context_phase_params=None):
+        kwargs = dict(
+            request_id=request_id,
+            max_new_tokens=1,
+            input_tokens=list(range(256)),
+            sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                sampling_params._get_sampling_config()),
+            is_streaming=False,
+            llm_request_type=llm_request_type,
+        )
+        if context_phase_params is not None:
+            kwargs["context_phase_params"] = context_phase_params
+        return LlmRequest(**kwargs)
+
+    def add_sequence(kv_cache_manager, request):
+        kv_cache_manager.impl.add_sequence(request.py_request_id,
+                                           request.prompt_len, 1, request)
+
+    template_ctx_request = make_request(
+        200, LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+    add_sequence(kv_cache_manager_ctx, template_ctx_request)
+    kv_cache_transceiver_ctx.respond_and_send_async(template_ctx_request)
+
+    template_gen_request = make_request(
+        200, LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+        template_ctx_request.context_phase_params)
+    add_sequence(kv_cache_manager_gen, template_gen_request)
+    kv_cache_transceiver_gen.request_and_receive_async(template_gen_request)
+    kv_cache_transceiver_ctx.check_context_transfer_status(1)
+    kv_cache_transceiver_gen.check_gen_transfer_status(1)
+
+    opaque_state = template_ctx_request.context_phase_params.opaque_state
+    assert opaque_state is not None
+    kv_cache_manager_ctx.free_resources(template_ctx_request)
+    kv_cache_manager_gen.free_resources(template_gen_request)
+
+    # Trigger a cancelled-after-ready transfer. The signature #1 fix is a
+    # prerequisite (it is the code path that sends is_ready=false); this PR
+    # is chained on top of #13640 to ensure that fix is present.
+    cancel_ctx_request = make_request(
+        201, LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+    add_sequence(kv_cache_manager_ctx, cancel_ctx_request)
+    kv_cache_transceiver_ctx.respond_and_send_async(cancel_ctx_request)
+    time.sleep(2)
+    is_cancelled = kv_cache_transceiver_ctx.cancel_request(cancel_ctx_request)
+    assert is_cancelled
+
+    cancel_gen_request = make_request(
+        201, LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+        cancel_ctx_request.context_phase_params)
+    add_sequence(kv_cache_manager_gen, cancel_gen_request)
+    kv_cache_transceiver_gen.request_and_receive_async(cancel_gen_request)
+
+    deadline = time.time() + 10
+    while time.time() < deadline and (cancel_gen_request.state
+                                      != LlmRequestState.DISAGG_TRANS_ERROR):
+        kv_cache_transceiver_gen.check_gen_transfer_status(1)
+        time.sleep(0.1)
+    assert cancel_gen_request.state == LlmRequestState.DISAGG_TRANS_ERROR
+    deadline = time.time() + 10
+    completed_ids, _ = [], []
+    while time.time(
+    ) < deadline and cancel_ctx_request.py_request_id not in completed_ids:
+        completed_ids, _ = kv_cache_transceiver_ctx.check_context_transfer_status(
+            1)
+        time.sleep(0.1)
+    kv_cache_manager_ctx.free_resources(cancel_ctx_request)
+    kv_cache_manager_gen.free_resources(cancel_gen_request)
+
+    # Issue a follow-up generation request with a real, healthy context
+    # counterpart and assert it completes within a reasonable timeout.
+    # Pre-fix the receiver worker thread blocks forever inside
+    # assignBufferIndexForRecv() because the only recv buffer slot was leaked
+    # by the previous !isReady early return. Post-fix the slot is freed and
+    # the follow-up completes normally.
+    followup_ctx_request = make_request(
+        202, LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+    add_sequence(kv_cache_manager_ctx, followup_ctx_request)
+    kv_cache_transceiver_ctx.respond_and_send_async(followup_ctx_request)
+
+    followup_gen_request = make_request(
+        202, LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+        followup_ctx_request.context_phase_params)
+    add_sequence(kv_cache_manager_gen, followup_gen_request)
+
+    # Run request_and_receive_async on a worker thread so a pre-fix wedge
+    # surfaces as the worker thread staying alive past the probe timeout
+    # rather than as the test process itself hanging.
+    request_done = threading.Event()
+
+    def issue_followup():
+        try:
+            kv_cache_transceiver_gen.request_and_receive_async(
+                followup_gen_request)
+        finally:
+            request_done.set()
+
+    issuer = threading.Thread(target=issue_followup, daemon=True)
+    issuer.start()
+    issuer.join(timeout=10)
+    wedged_in_assign_buffer = issuer.is_alive()
+
+    deadline = time.time() + 30
+    while time.time() < deadline and (
+            followup_gen_request.state
+            != LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE):
+        kv_cache_transceiver_ctx.check_context_transfer_status(1)
+        kv_cache_transceiver_gen.check_gen_transfer_status(1)
+        time.sleep(0.1)
+
+    assert not wedged_in_assign_buffer, (
+        "signature #6 reproduced: assignBufferIndexForRecv() blocked the "
+        "follow-up generation request because the previous "
+        "cancelled-after-ready transfer leaked its recv buffer slot")
+    assert (followup_gen_request.state ==
+            LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE)
 
 
 def create_hybrid_cache_manager(mapping,
