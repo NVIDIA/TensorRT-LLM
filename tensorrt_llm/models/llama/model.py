@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -409,8 +409,12 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
         vocab_size_padded = pad_vocab_size(config.vocab_size,
                                            config.mapping.tp_size)
         if config.mapping.is_last_pp_rank():
+            if config.architecture == "LlamaForSequenceClassification":
+                lm_head_output_size = config.num_labels
+            else:
+                lm_head_output_size = vocab_size_padded
             lm_head = ColumnLinear(config.hidden_size,
-                                   vocab_size_padded,
+                                   lm_head_output_size,
                                    bias=False,
                                    dtype=config.dtype,
                                    tp_group=config.mapping.tp_group,
@@ -495,6 +499,8 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
                 }
             elif config.tie_word_embeddings:
                 custom_dict = {"lm_head": "model.embed_tokens"}
+            elif config.architecture == "LlamaForSequenceClassification":
+                custom_dict = {"lm_head": "score"}
 
             if quant_ckpt_path is not None:
                 hf_model_dir = quant_ckpt_path

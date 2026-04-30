@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import copy
 import os
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -707,7 +721,9 @@ class LlamaDecoderLayer(DecoderLayer):
 
         self.attention_mask = PredefinedAttentionMask.CAUSAL
         # If the model is being used as an encoder model (prefill only) we use a full attention mask
-        if not model_config.is_generation:
+        architectures = getattr(config, "architectures", [])
+        if (not model_config.is_generation
+                and architectures != ["LlamaForSequenceClassification"]):
             self.attention_mask = PredefinedAttentionMask.FULL
 
         self.enable_fusion = os.environ.get(
@@ -1130,6 +1146,72 @@ class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
                     idx + 1].input_layernorm
                 self.model.layers[idx + 1].skip_input_layernorm = True
                 layer.next_attn = self.model.layers[idx + 1].self_attn
+
+
+@register_auto_model("LlamaForSequenceClassification")
+class LlamaForSequenceClassification(DecoderModelForCausalLM[LlamaModel,
+                                                             LlamaConfig]):
+    """
+    Llama backbone with a sequence-classification / reward head on top.
+
+    Used for Llama-based reward or classifier models such as
+    ``Skywork/Skywork-Reward-Llama-3.1-8B-v0.2``. The ``score`` linear layer
+    replaces the usual ``lm_head``; the forward pass returns the per-request
+    score read from the last non-padding token of each sequence.
+    """
+
+    def __init__(self, model_config: ModelConfig[LlamaConfig]):
+        # Bypass ``DecoderModelForCausalLM.__init__`` which would build a full
+        # vocab-sized ``lm_head``; we only need the backbone plus a small
+        # ``score`` head of size ``num_labels``. The ``PostInitCaller``
+        # metaclass on the parent class still runs ``__post_init__`` after
+        # this, which walks submodules and calls ``create_weights()`` on any
+        # module that defines it (e.g. Linear).
+        nn.Module.__init__(self)
+        self.model_config = model_config
+        self.model = LlamaModel(model_config)
+
+        config = model_config.pretrained_config
+        self.score = Linear(
+            config.hidden_size,
+            config.num_labels,
+            bias=False,
+            dtype=config.torch_dtype,
+        )
+
+    def post_load_weights(self):
+        # Same layernorm / attention fusion optimisation as LlamaForCausalLM.
+        for idx, layer in enumerate(
+                self.model.layers[:self.config.num_hidden_layers]):
+            if idx == self.config.num_hidden_layers - 1:
+                layer.next_layer_layernorm = self.model.norm
+                self.model.skip_norm = True
+            else:
+                layer.next_layer_layernorm = self.model.layers[
+                    idx + 1].input_layernorm
+                self.model.layers[idx + 1].skip_input_layernorm = True
+                layer.next_attn = self.model.layers[idx + 1].self_attn
+
+    @torch.inference_mode()
+    def forward(self,
+                attn_metadata: AttentionMetadata,
+                input_ids: torch.IntTensor,
+                position_ids: Optional[torch.IntTensor] = None,
+                inputs_embeds: Optional[torch.FloatTensor] = None,
+                **kwargs) -> torch.Tensor:
+        assert attn_metadata.seq_lens is not None
+
+        hidden_states = self.model(attn_metadata,
+                                   input_ids=input_ids,
+                                   position_ids=position_ids,
+                                   inputs_embeds=inputs_embeds)
+        logits = self.score(hidden_states)
+
+        # Return the score at the last token of each request
+        # (flat [total_tokens, num_labels] -> [batch, num_labels]).
+        seq_lens = attn_metadata.seq_lens.to(logits.device)
+        end_indices = torch.cumsum(seq_lens, dim=0) - 1
+        return logits[end_indices]
 
 
 class Llama4VisionEncoder(nn.Module):

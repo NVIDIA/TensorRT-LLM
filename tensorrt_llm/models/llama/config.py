@@ -40,6 +40,7 @@ class LLaMAConfig(PretrainedConfig):
                  attention_multiplier: float = 1.0,
                  residual_multiplier: float = 1.0,
                  output_multiplier_scale: float = 1.0,
+                 num_labels: int = 1,
                  **kwargs):
         self.mlp_bias = mlp_bias
         self.attn_bias = attn_bias
@@ -68,6 +69,7 @@ class LLaMAConfig(PretrainedConfig):
         self.attention_multiplier = attention_multiplier
         self.residual_multiplier = residual_multiplier
         self.output_multiplier_scale = output_multiplier_scale
+        self.num_labels = num_labels
         self.has_partial_lora_mask = False
 
         super().__init__(**kwargs)
@@ -87,6 +89,7 @@ class LLaMAConfig(PretrainedConfig):
             'use_input_layernorm_in_first_layer'] = self.use_input_layernorm_in_first_layer
         output['use_last_layernorm'] = self.use_last_layernorm
         output['layer_idx_offset'] = self.layer_idx_offset
+        output['num_labels'] = self.num_labels
         output['moe'] = self.moe.to_dict()
         return output
 
@@ -189,6 +192,9 @@ class LLaMAConfig(PretrainedConfig):
 
         dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
         tie_word_embeddings = getattr(hf_config, 'tie_word_embeddings', False)
+        num_labels = 1
+        if hf_config.architectures[0] == "LlamaForSequenceClassification":
+            num_labels = hf_config.num_labels
 
         return cls(
             architecture=hf_config.architectures[0],
@@ -219,6 +225,7 @@ class LLaMAConfig(PretrainedConfig):
             attention_multiplier=attention_multiplier,
             residual_multiplier=residual_multiplier,
             output_multiplier_scale=output_multiplier_scale,
+            num_labels=num_labels,
             **kwargs)
 
     @classmethod

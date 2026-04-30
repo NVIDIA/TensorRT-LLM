@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -471,6 +471,9 @@ def load_hf_llama(model_dir: str, load_model_on_cpu: bool = False):
 
     hf_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
     model_cls = AutoModelForCausalLM
+    if "LlamaForSequenceClassification" in (hf_config.architectures or []):
+        from transformers import AutoModelForSequenceClassification
+        model_cls = AutoModelForSequenceClassification
     if hf_config.model_type == "llava":
         from transformers import LlavaForConditionalGeneration
         model_cls = LlavaForConditionalGeneration
@@ -1068,14 +1071,17 @@ def load_weights_from_hf_model(hf_model,
             weights['transformer.vocab_embedding.weight'] = vocab_embedding
 
     if mapping.is_last_pp_rank():
-        if hf_model.config.tie_word_embeddings:
+        if config.architecture == "LlamaForSequenceClassification":
+            lm_head_weights = get_weight(model_params, "score", dtype)
+        elif hf_model.config.tie_word_embeddings:
             # lm_head.weight has the same weights as embedding
             lm_head_weights = vocab_embedding.clone()
         else:
             lm_head_weights = get_weight(model_params,
                                          param_name_map["lm_head"], dtype)
 
-        if config.vocab_size % mapping.tp_size != 0:
+        if (config.architecture != "LlamaForSequenceClassification"
+                and config.vocab_size % mapping.tp_size != 0):
             # padding
             vocab_size_padded = pad_vocab_size(config.vocab_size,
                                                mapping.tp_size)
