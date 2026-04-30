@@ -131,11 +131,20 @@ Child = TypeVar("Child", bound="Block | RootBlock")
 Children = dict[BlockKey, Child]
 
 
-def get_tree(block: "RootBlock | Block") -> "BlockRadixTree":
+def try_get_tree(block: "RootBlock | Block") -> "BlockRadixTree | None":
     node = block
     while not isinstance(node, BlockRadixTree):
-        node = node.prev
+        node = node._prev()
+        if node is None:
+            return None
     return node
+
+
+def get_tree(block: "RootBlock | Block") -> "BlockRadixTree":
+    tree = try_get_tree(block)
+    if tree is None:
+        raise ValueError("Dereferencing a dangling rawref")
+    return tree
 
 
 def remove_subtree(root: "RootBlock | Block") -> list[rawref.ref["CommittedPage"]]:
@@ -143,7 +152,8 @@ def remove_subtree(root: "RootBlock | Block") -> list[rawref.ref["CommittedPage"
     # remove leaf blocks one by one, in post-order
     ret: list[rawref.ref["CommittedPage"]] = []
     removed_block_hashes: list[BlockKey] = []
-    event_manager = get_tree(root).event_manager
+    tree = try_get_tree(root)
+    event_manager = tree.event_manager if tree is not None else None
     block: "RootBlock | Block" = root
     while True:
         if block.next:
@@ -372,7 +382,8 @@ class Block:
             return
         ordinal = self.ordinal
         self.storage[lc_idx] = None
-        event_manager = get_tree(self).event_manager
+        tree = try_get_tree(self)
+        event_manager = tree.event_manager if tree is not None else None
         if type(lc) is AttnLifeCycle and (lc.window_size is None or ordinal < lc.num_sink_blocks):
             pages = remove_subtree(self)
             for r in pages:

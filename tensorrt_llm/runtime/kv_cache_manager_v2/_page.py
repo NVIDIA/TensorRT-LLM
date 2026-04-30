@@ -239,14 +239,10 @@ class CommittedPage(Page):
             # block may be None when rebase happens, i.e. another block with the same key is committed,
             # replacing it, but the page is still used by a _KVCache.
             if block is not None:
-                try:
-                    block.unset_page(
-                        self.life_cycle,
-                        self.manager._life_cycles.get_life_cycle(self.life_cycle),
-                    )
-                except ValueError as exc:
-                    if str(exc) != "Dereferencing a dangling rawref":
-                        raise
+                block.unset_page(
+                    self.life_cycle,
+                    self.manager._life_cycles.get_life_cycle(self.life_cycle),
+                )
         finally:
             try:
                 Page.__del__(self)
