@@ -113,7 +113,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
     float* __restrict__ D, // [M, SHAPE_N]  (caller memsets to 0)
     float const* __restrict__ post_mix, float const* __restrict__ comb_mix, float* __restrict__ sqr_sum)
 {                          // [M]            (caller memsets to 0)
-#if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
+#if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000) and (__CUDA_ARCH__ < 1100)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
     constexpr uint32_t SHAPE_K = HC_MULT * HIDDEN;
@@ -637,7 +637,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         float* __restrict__ comb_mix_out,        // [M, HC_MULT, HC_MULT]
         float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value, uint32_t sinkhorn_repeat)
 {
-#if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
+#if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000) and (__CUDA_ARCH__ < 1100)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
     constexpr uint32_t HC_MULT2 = HC_MULT * HC_MULT;
