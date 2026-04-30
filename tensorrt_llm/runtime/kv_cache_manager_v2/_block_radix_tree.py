@@ -370,9 +370,9 @@ class Block:
     def unset_page(self, lc_idx: LifeCycleId, lc: LifeCycle) -> None:
         if self.storage[lc_idx] is None:
             return
-        event_manager = get_tree(self).event_manager
         ordinal = self.ordinal
         self.storage[lc_idx] = None
+        event_manager = get_tree(self).event_manager
         if type(lc) is AttnLifeCycle and (lc.window_size is None or ordinal < lc.num_sink_blocks):
             pages = remove_subtree(self)
             for r in pages:

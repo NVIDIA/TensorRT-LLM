@@ -234,16 +234,24 @@ class CommittedPage(Page):
         self.set_slot(slot)
 
     def __del__(self) -> None:
-        block = self.block()
-        # block may be None when rebase happens, i.e. another block with the same key is committed,
-        # replacing it, but the page is still used by a _KVCache.
-        if block is not None:
-            block.unset_page(
-                self.life_cycle,
-                self.manager._life_cycles.get_life_cycle(self.life_cycle),
-            )
-        Page.__del__(self)
-        self.__rawref__.invalidate()
+        try:
+            block = self.block()
+            # block may be None when rebase happens, i.e. another block with the same key is committed,
+            # replacing it, but the page is still used by a _KVCache.
+            if block is not None:
+                try:
+                    block.unset_page(
+                        self.life_cycle,
+                        self.manager._life_cycles.get_life_cycle(self.life_cycle),
+                    )
+                except ValueError as exc:
+                    if str(exc) != "Dereferencing a dangling rawref":
+                        raise
+        finally:
+            try:
+                Page.__del__(self)
+            finally:
+                self.__rawref__.invalidate()
 
 
 @dataclass(slots=True)

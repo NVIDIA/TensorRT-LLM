@@ -270,8 +270,7 @@ class KvCacheCreator:
         if kv_cache_manager_cls == KVCacheManagerV2:
             if self._kv_connector_manager is not None or (
                     self._max_beam_width is not None
-                    and self._max_beam_width > 1
-            ) or self._kv_cache_config.event_buffer_max_size > 0 or self._is_disagg:
+                    and self._max_beam_width > 1) or self._is_disagg:
                 # Per-layer head_dim models (e.g., Gemma4 hybrid) require V2's
                 # split-pool layout. KVCacheManager (V1) coerces head_dim list
                 # to max(head_dim), changing per-layer KV byte sizes — which
@@ -282,13 +281,12 @@ class KvCacheCreator:
                     raise NotImplementedError(
                         "Gemma4 hybrid attention requires KVCacheManagerV2, "
                         "which is not yet supported with kv_connector_manager, "
-                        "beam_width > 1, event_buffer_max_size > 0, or "
+                        "beam_width > 1, or "
                         "disaggregated serving. Disable these features to run "
                         "Gemma4 hybrid models.")
                 logger.warning(
                     "KVCacheManagerV2 is not supported with kv_connector_manager, beam width > 1, "
-                    "event buffer max size > 0, or disaggregated serving. Falling back to KVCacheManager."
-                )
+                    "or disaggregated serving. Falling back to KVCacheManager.")
                 return KVCacheManager
         return kv_cache_manager_cls
 
