@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Tests comparing Compressor with RefCompressor."""
 
@@ -19,10 +19,15 @@ from tensorrt_llm._torch.attention_backend.interface import (
     RotaryScalingType,
 )
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import DeepseekV4CacheManager
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor import Compressor
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor import (
+    Compressor,
+    KVCacheDtype,
+)
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
     DeepseekV4AttentionType,
+    DeepseekV4Indexer,
 )
+from tensorrt_llm._torch.attention_backend.sparse.dsa import Indexer
 from tensorrt_llm._torch.modules.rotary_embedding import RopeParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -1575,6 +1580,231 @@ def test_mixed_batch():
         assert out_comp is None, "Mixed batch: expected no compression output"
     else:
         assert_similar(out_ref, out_comp, "Mixed batch context+generation single forward")
+
+
+class _FakeCompressorCacheManager:
+    def __init__(self, head_dim: int, tokens_per_block: int = 4):
+        self.tokens_per_block = tokens_per_block
+        self.compressed_block_sizes = {0: tokens_per_block}
+        self._buffer = torch.empty(1, tokens_per_block * head_dim, device=DEVICE, dtype=DTYPE)
+
+    def get_buffers(self, layer_idx, attn_type):
+        return self._buffer
+
+
+def _create_small_compressor(kv_cache_dtype: str, is_indexer: bool) -> Compressor:
+    head_dim = 128
+    rope_dim = 64
+    mla_params = MLAParams(
+        hidden_size=16,
+        qk_rope_head_dim=rope_dim,
+        qk_nope_head_dim=head_dim - rope_dim,
+    )
+    rope_params = RopeParams(
+        dim=rope_dim,
+        theta=ROPE_THETA,
+        max_positions=16,
+        original_max_positions=16,
+        scale_type=RotaryScalingType.none,
+    )
+    pos_embd_params = PositionalEmbeddingParams(
+        type=PositionEmbeddingType.rope_gpt_neox,
+        rope=rope_params,
+        is_neox=False,
+    )
+    return Compressor(
+        mla_params=mla_params,
+        layer_idx=0,
+        compress_ratio=4,
+        norm_eps=1e-6,
+        skip_create_weights_in_init=False,
+        pos_embd_params=pos_embd_params,
+        dtype=DTYPE,
+        kv_cache_dtype=kv_cache_dtype,
+        is_indexer=is_indexer,
+        rotate_activation=True,
+    ).to(DEVICE)
+
+
+def _create_minimal_metadata(compressor: Compressor, total_compressed_tokens: int = 1):
+    ratio = compressor.compress_ratio
+    bsz = 1
+    block_table = torch.zeros(bsz, 1, device=DEVICE, dtype=torch.int32)
+    block_tables = {(ratio, attn_type): block_table for attn_type in DeepseekV4AttentionType}
+    metadata = DummyAttentionMetadata(
+        num_contexts=1,
+        num_generations=0,
+        num_ctx_tokens=ratio,
+        num_tokens=ratio,
+        kv_cache_manager=_FakeCompressorCacheManager(compressor.head_dim),
+        block_tables=block_tables,
+        cu_seq_lens=torch.tensor([0, ratio], device=DEVICE, dtype=torch.int32),
+        cu_new_comp_kv={
+            ratio: torch.tensor([0, total_compressed_tokens], device=DEVICE, dtype=torch.int32)
+        },
+        compressed_position_ids={
+            ratio: torch.zeros(total_compressed_tokens, device=DEVICE, dtype=torch.int32)
+        },
+        compressed_kv_lens={
+            ratio: torch.tensor([total_compressed_tokens], device=DEVICE, dtype=torch.int32)
+        },
+        past_kv_lens={ratio: torch.zeros(bsz, device=DEVICE, dtype=torch.int32)},
+        new_comp_kv_lens_cuda={
+            ratio: torch.tensor([total_compressed_tokens], device=DEVICE, dtype=torch.int32)
+        },
+        num_total_compressed_tokens={ratio: total_compressed_tokens},
+        max_ctx_compressed_tokens={ratio: total_compressed_tokens},
+        compressed_mask_cuda={
+            ratio: torch.ones(total_compressed_tokens, device=DEVICE, dtype=torch.bool)
+        },
+    )
+    metadata.kv_lens_cuda_runtime = torch.tensor([ratio], device=DEVICE, dtype=torch.int32)
+    metadata.cached_token_lens_cuda = torch.zeros(bsz, device=DEVICE, dtype=torch.int32)
+    return metadata
+
+
+def test_compressor_wkv_gate_uses_checkpoint_dtype():
+    compressor = _create_small_compressor(kv_cache_dtype="default", is_indexer=False)
+
+    assert compressor.wkv_gate.weight.dtype == DTYPE
+
+
+def _run_compressor_with_fake_postprocess(monkeypatch, kv_cache_dtype: str, is_indexer: bool):
+    compressor = _create_small_compressor(kv_cache_dtype, is_indexer)
+    metadata = _create_minimal_metadata(compressor)
+    seen = {}
+
+    def fake_prefill_reduction(*args):
+        kv_comp = args[6]
+        kv_comp.fill_(0.25)
+
+    def fake_paged_kv_compress(*args):
+        raise AssertionError("generation compression path should not run")
+
+    def fake_postprocess_scatter(
+        kv_comp,
+        kv_out,
+        rms_weight,
+        rms_eps,
+        rotary_cos_sin,
+        position_ids,
+        nope_head_dim,
+        rope_head_dim,
+        kv_cache,
+        num_comp_tokens,
+        cu_new_comp_kv,
+        start_pos,
+        block_table,
+        compressed_mask,
+        tokens_per_block,
+        cache_dtype,
+        rotate_activation,
+        quant_output,
+        scale_output,
+    ):
+        seen["kv_out"] = kv_out
+        seen["quant_output"] = quant_output
+        seen["scale_output"] = scale_output
+        seen["cache_dtype"] = cache_dtype
+        if kv_out is not None:
+            kv_out.fill_(0.5)
+        if quant_output is not None:
+            quant_output.fill_(0x38)
+            if scale_output.dtype.is_floating_point:
+                scale_output.fill_(2.0)
+            else:
+                scale_output.fill_(0x7F)
+
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "compressor_prefill_reduction",
+        fake_prefill_reduction,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "compressor_paged_kv_compress",
+        fake_paged_kv_compress,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "compressor_postprocess_scatter",
+        fake_postprocess_scatter,
+        raising=False,
+    )
+
+    x = torch.randn(compressor.compress_ratio, 16, device=DEVICE, dtype=DTYPE)
+    with torch.no_grad():
+        output = compressor(x, metadata)
+    return output, seen
+
+
+def test_main_compressor_does_not_materialize_postprocess_output(monkeypatch):
+    """The fused kernel writes main compressor output directly to paged cache.
+
+    Re-materializing kv_out here and doing a Python scatter afterwards defeats
+    the fused postprocess/scatter kernel and regresses end-to-end performance.
+    """
+    output, seen = _run_compressor_with_fake_postprocess(
+        monkeypatch, kv_cache_dtype="default", is_indexer=False
+    )
+
+    assert seen["cache_dtype"] == int(KVCacheDtype.NONE)
+    assert seen["kv_out"] is None
+    assert seen["quant_output"] is None
+    assert seen["scale_output"] is None
+    assert output[0].shape == (1, 128)
+    assert output[1] is None
+
+
+@pytest.mark.parametrize(
+    "kv_cache_dtype,cache_dtype,expected_dtype,expected_quant_shape,expected_scale_shape",
+    [
+        (
+            "fp8_blockwise",
+            KVCacheDtype.FP8_BLOCKWISE,
+            torch.float8_e4m3fn,
+            (1, 128),
+            (1, 1),
+        ),
+        (
+            "mxfp4",
+            KVCacheDtype.MXFP4_BLOCKWISE,
+            torch.float4_e2m1fn_x2,
+            (1, 64),
+            (1, 4),
+        ),
+    ],
+)
+def test_indexer_returns_fused_quant_outputs(
+    monkeypatch,
+    kv_cache_dtype,
+    cache_dtype,
+    expected_dtype,
+    expected_quant_shape,
+    expected_scale_shape,
+):
+    output, seen = _run_compressor_with_fake_postprocess(
+        monkeypatch, kv_cache_dtype=kv_cache_dtype, is_indexer=True
+    )
+
+    quant_output, scale_output = output
+    assert seen["cache_dtype"] == int(cache_dtype)
+    assert seen["kv_out"] is None
+    assert quant_output.dtype == expected_dtype
+    assert quant_output.shape == expected_quant_shape
+    assert scale_output.shape == expected_scale_shape
+    assert torch.equal(quant_output.view(torch.uint8), torch.full_like(seen["quant_output"], 0x38))
+    if scale_output.dtype.is_floating_point:
+        assert torch.equal(scale_output, torch.full_like(scale_output, 2.0))
+    else:
+        assert torch.equal(scale_output, torch.full_like(scale_output, 0x7F))
+
+
+def test_deepseek_v4_indexer_uses_base_cache_scatter():
+    assert "_update_k_cache" not in DeepseekV4Indexer.__dict__
+    assert DeepseekV4Indexer._update_k_cache is Indexer._update_k_cache
 
 
 # ============================================================================

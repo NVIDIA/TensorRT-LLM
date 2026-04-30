@@ -984,10 +984,6 @@ class DeepseekV4Indexer(Indexer):
         )
         return q
 
-    def _update_k_cache(self, k_fp8, k_scale, metadata):
-        """Overwrite the fused compressor's FP8 cache with reference-style FP4-QAT values."""
-        super()._update_k_cache(k_fp8, k_scale, metadata)
-
     def forward(
         self,
         qr: torch.Tensor,
@@ -995,15 +991,12 @@ class DeepseekV4Indexer(Indexer):
         metadata: DeepseekV4TrtllmAttentionMetadata,
         position_ids: torch.Tensor,
     ):
-        if self.indexer_cache_dtype not in (
-            KVCacheDtype.FP8_PERTENSOR,
-            KVCacheDtype.FP8_BLOCKWISE,
-        ):
+        if self.indexer_cache_dtype != KVCacheDtype.FP8_BLOCKWISE:
             raise NotImplementedError(
-                "DeepSeek-V4 indexer BMM currently consumes FP8 K. "
-                f"Indexer cache preset {self.indexer_k_cache_dtype!r} is supported by "
-                "the compressor/cache scatter path, but needs the matching BF16/FP4 "
-                "indexer BMM path before end-to-end indexer execution can use it."
+                "DeepSeek-V4 indexer currently consumes FP8 blockwise K. "
+                f"Indexer cache preset {self.indexer_k_cache_dtype!r} needs matching "
+                "cache layout, cache update, and BMM paths before end-to-end indexer "
+                "execution can use it."
             )
         # compress k
         k_fp8, k_scale = self.compressor(hidden_states, metadata)
