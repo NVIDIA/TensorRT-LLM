@@ -26,6 +26,8 @@ if TYPE_CHECKING:
     from ._page import CommittedPage
 
 BlockKey = bytes
+_ROOT_KEY_LORA_TASK_ID_TAG = b"trtllm_kv_cache_v2_root_lora_task_id"
+_ROOT_KEY_CACHE_SALT_ID_TAG = b"trtllm_kv_cache_v2_root_cache_salt_id"
 
 
 # id_offset is usually vocab_size
@@ -75,10 +77,22 @@ class Hasher:
 TokenBlock = list[TokenIdExt]
 
 
+def _make_root_key(lora_task_id: int | None, cache_salt_id: int | None = None) -> BlockKey:
+    hasher = Hasher()
+    if lora_task_id is not None:
+        hasher.update(_ROOT_KEY_LORA_TASK_ID_TAG).update(lora_task_id)
+    if cache_salt_id is not None:
+        hasher.update(_ROOT_KEY_CACHE_SALT_ID_TAG).update(cache_salt_id)
+    return hasher.digest
+
+
 def sequence_to_blockchain_keys(
-    tokens_per_block: int, lora_task_id: int | None, tokens: Sequence[TokenIdExt]
+    tokens_per_block: int,
+    lora_task_id: int | None,
+    tokens: Sequence[TokenIdExt],
+    cache_salt_id: int | None = None,
 ) -> Iterator[tuple[TokenBlock, BlockKey]]:
-    digest = Hasher(lora_task_id).digest
+    digest = _make_root_key(lora_task_id, cache_salt_id)
     yield [], digest
     for token_block in chunked(tokens, tokens_per_block):
         digest = Hasher(digest).update(token_block).digest
@@ -204,17 +218,24 @@ def _add_or_get_existing(
 
 
 class RootBlock:
-    __slots__ = ("_prev", "key", "next", "lora_task_id", "__rawref__")
+    __slots__ = ("_prev", "key", "next", "lora_task_id", "cache_salt_id", "__rawref__")
     key: BlockKey
     lora_task_id: int | None
+    cache_salt_id: int | None
     _prev: rawref.ref["BlockRadixTree"]
     next: Children["Block"]
     __rawref__: rawref.ref["RootBlock"]
 
-    def __init__(self, lora_task_id: int | None, prev: "BlockRadixTree") -> None:
-        self.key = self.make_key(lora_task_id)
+    def __init__(
+        self,
+        lora_task_id: int | None,
+        prev: "BlockRadixTree",
+        cache_salt_id: int | None = None,
+    ) -> None:
+        self.key = self.make_key(lora_task_id, cache_salt_id)
         assert self.key not in prev.next, "Root block already exists"
         self.lora_task_id = lora_task_id
+        self.cache_salt_id = cache_salt_id
         self._prev = rawref.ref(prev)
         self.next = {}
         self.__rawref__ = rawref.NULL
@@ -240,8 +261,8 @@ class RootBlock:
         return self.prev.tokens_per_block
 
     @staticmethod
-    def make_key(lora_task_id: int | None) -> BlockKey:
-        return Hasher(lora_task_id).digest
+    def make_key(lora_task_id: int | None, cache_salt_id: int | None = None) -> BlockKey:
+        return _make_root_key(lora_task_id, cache_salt_id)
 
 
 class Block:
@@ -401,11 +422,13 @@ class BlockRadixTree:
     def __del__(self) -> None:
         self.__rawref__.invalidate()
 
-    def add_or_get_existing(self, lora_task_id: int | None) -> RootBlock:
-        key = RootBlock.make_key(lora_task_id)
+    def add_or_get_existing(
+        self, lora_task_id: int | None, cache_salt_id: int | None = None
+    ) -> RootBlock:
+        key = RootBlock.make_key(lora_task_id, cache_salt_id)
         if key in self.next:
             return self.next[key]
-        return RootBlock(lora_task_id, self)
+        return RootBlock(lora_task_id, self, cache_salt_id)
 
     @property
     def tokens_per_block(self) -> int:
@@ -440,11 +463,12 @@ class BlockRadixTree:
         lora_task_id: int | None,
         tokens: Sequence[TokenIdExt],
         enable_partial_match: bool = False,
+        cache_salt_id: int | None = None,
     ) -> Iterator[tuple[Block, int]]:
         block: Block | RootBlock | BlockRadixTree = self
         mismatched_token_block: TokenBlock = []
         for token_block, key in sequence_to_blockchain_keys(
-            self._tokens_per_block, lora_task_id, tokens
+            self._tokens_per_block, lora_task_id, tokens, cache_salt_id
         ):
             if key in block.next:
                 block = block.next[key]

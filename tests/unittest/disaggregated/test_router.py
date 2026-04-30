@@ -5,7 +5,9 @@ from unittest import mock
 import pytest
 
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
-from tensorrt_llm.runtime.kv_cache_hash import truncate_sha256_hash_to_int64
+from tensorrt_llm.runtime.kv_cache_hash import (get_cache_salt_id,
+                                                hash_v1_block_key,
+                                                truncate_sha256_hash_to_int64)
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
     sequence_to_blockchain_keys
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
@@ -296,6 +298,71 @@ def test_v2_sha256_64_block_hashes_match_truncated_kv_cache_manager_v2(servers):
     assert all(isinstance(block_hash, int) for block_hash in block_hashes[0])
 
 
+def test_cache_aware_router_block_hashes_include_cache_salt_id(servers):
+    tokens_per_block = 4
+    cache_salt_id = 123
+    token_lists = [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]]
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=tokens_per_block)
+
+    salted_v1_block_hashes = router._compute_block_hashes(
+        token_lists,
+        hash_algo=KV_CACHE_HASH_ALGO_V1,
+        cache_salt_id=cache_salt_id)
+    expected_v1_block_hashes = []
+    parent_hash = None
+    for t in range(0, len(token_lists[0]) - 1, tokens_per_block):
+        t_end = min(t + tokens_per_block, len(token_lists[0]) - 1)
+        parent_hash = hash_v1_block_key(
+            token_lists[0][t:t_end],
+            parent_hash=0 if parent_hash is None else parent_hash,
+            cache_salt_id=cache_salt_id)
+        expected_v1_block_hashes.append(parent_hash)
+
+    salted_v2_block_hashes = router._compute_block_hashes(
+        token_lists,
+        hash_algo=KV_CACHE_HASH_ALGO_V2,
+        cache_salt_id=cache_salt_id)
+    expected_v2_block_hashes = [
+        block_key.hex()
+        for token_block, block_key in sequence_to_blockchain_keys(
+            tokens_per_block, None, token_lists[0][:-1], cache_salt_id)
+        if token_block
+    ]
+
+    salted_v2_64_block_hashes = router._compute_block_hashes(
+        token_lists,
+        hash_algo=KV_CACHE_HASH_ALGO_V2_SHA256_64,
+        cache_salt_id=cache_salt_id)
+    expected_v2_64_block_hashes = [
+        truncate_sha256_hash_to_int64(block_key)
+        for token_block, block_key in sequence_to_blockchain_keys(
+            tokens_per_block, None, token_lists[0][:-1], cache_salt_id)
+        if token_block
+    ]
+
+    assert salted_v1_block_hashes == [expected_v1_block_hashes]
+    assert salted_v2_block_hashes == [expected_v2_block_hashes]
+    assert salted_v2_64_block_hashes == [expected_v2_64_block_hashes]
+    assert salted_v1_block_hashes != router._compute_block_hashes(
+        token_lists, hash_algo=KV_CACHE_HASH_ALGO_V1)
+    assert salted_v2_block_hashes != router._compute_block_hashes(
+        token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2)
+    assert salted_v2_64_block_hashes != router._compute_block_hashes(
+        token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2_SHA256_64)
+
+
+def test_cache_salt_id_derivation_matches_worker_path():
+    from tensorrt_llm.inputs.utils import \
+        get_cache_salt_id as worker_get_cache_salt_id
+
+    assert get_cache_salt_id("abc") == 3697813978277427044
+    assert get_cache_salt_id("tenant-a") == get_cache_salt_id("tenant-a")
+    assert get_cache_salt_id("tenant-a") != get_cache_salt_id("tenant-b")
+    assert get_cache_salt_id("tenant-a") == worker_get_cache_salt_id("tenant-a")
+
+
 @pytest.mark.asyncio
 async def test_kv_cache_aware_server_state_uses_hash_algo():
     tokens_per_block = 4
@@ -394,6 +461,64 @@ async def test_kv_cache_aware_router_routes_to_v2_server(servers):
     assert server == v2_server
     assert info["hash_algo"] == KV_CACHE_HASH_ALGO_V2
     assert info["block_hashes"] == v2_block_hashes
+    assert info["matches"] == [0, 8, 0]
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_routes_with_cache_salt(
+        servers, monkeypatch):
+
+    class SaltedRequest:
+        model = "TinyLlama"
+        cache_salt = "tenant-a"
+
+        def __init__(self, prompt):
+            self.prompt = prompt
+
+    tokens_per_block = 4
+    cache_salt_id = 123
+    token_lists = [[1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]]
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=tokens_per_block)
+    monkeypatch.setattr("tensorrt_llm.serve.router.get_cache_salt_id",
+                        lambda cache_salt: cache_salt_id)
+    for server in servers:
+        router._server_info[server] = {
+            "kv_cache_hash_algo": KV_CACHE_HASH_ALGO_V2
+        }
+
+    salted_block_hashes = router._compute_block_hashes(
+        token_lists,
+        hash_algo=KV_CACHE_HASH_ALGO_V2,
+        cache_salt_id=cache_salt_id)
+    unsalted_block_hashes = router._compute_block_hashes(
+        token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2)
+    salted_server = servers[1]
+    router._server_state[salted_server].update_with_events([{
+        "event_id": 0,
+        "hash_algo": KV_CACHE_HASH_ALGO_V2,
+        "data": {
+            "type":
+            "stored",
+            "parent_hash":
+            None,
+            "blocks": [{
+                "block_hash": block_hash
+            } for block_hash in salted_block_hashes[0]],
+        },
+    }])
+
+    request = SaltedRequest(prompt=copy.deepcopy(token_lists))
+    server, info = await router.get_next_server(request)
+    await router.finish_request(request)
+
+    assert salted_block_hashes != unsalted_block_hashes
+    assert server == salted_server
+    assert info["hash_algo"] == KV_CACHE_HASH_ALGO_V2
+    assert info["block_hashes"] == salted_block_hashes
     assert info["matches"] == [0, 8, 0]
 
 
