@@ -44,13 +44,17 @@ TOT_RESEARCH_TOOLS = [
         name="python_interpreter",
         description=(
             "Run Python in the configured sandbox for calculations, parsing, "
-            "or consistency checks. Use print() for required output."
+            "or consistency checks. Use print() for required output. The Python "
+            "environment only has basic packages by default; if extra packages "
+            "are needed before import, first call python_interpreter with code "
+            "such as: import subprocess, sys; subprocess.check_call([sys.executable, "
+            "'-m', 'pip', 'install', '<package>'])."
         ),
         parameters={
             "code": {
                 "type": "string",
                 "description": "Python source code to execute.",
-            }
+            },
         },
     ),
     OpenAIToolDescription(

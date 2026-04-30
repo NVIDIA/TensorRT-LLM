@@ -1,23 +1,9 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 r"""Run one Tree-of-Thought research prompt.
 
 Start the MCP servers and an OpenAI-compatible TensorRT-LLM endpoint, then run::
 
     python examples/scaffolding/contrib/tree_of_thought_research/run_tot_research.py \
-        --config examples/scaffolding/contrib/iter_research/config.yaml --enable_tracing
+        --config examples/scaffolding/contrib/tree_of_thought_research/config.yaml --enable_tracing
 """
 
 from __future__ import annotations

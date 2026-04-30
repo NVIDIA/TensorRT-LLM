@@ -23,7 +23,7 @@ GitHub pull-request / issue within a pre-configured ``/testbed`` sandbox.
 
 import json
 import re
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from tensorrt_llm.scaffolding.controller import (
     ChatWithMCPController,
@@ -50,6 +50,7 @@ from tensorrt_llm.scaffolding.task_collection import (
 )
 from tensorrt_llm.scaffolding.worker import Worker
 
+from .prompts import SWEBENCH_SYSTEM_PROMPT
 from .tools import ALL_CODER_TOOLS
 
 # ---------------------------------------------------------------------------
@@ -192,9 +193,22 @@ def normalize_swebench_pred_patch(patch: str) -> str:
     return result
 
 
-def _last_complete_task_tool_call_id(chat_task: ChatTask) -> Optional[str]:
-    """Return the ``tool_call_id`` for the last ``complete_task`` in chat order."""
+def _parse_tool_arguments(arguments: Any) -> dict[str, Any]:
+    if isinstance(arguments, dict):
+        return arguments
+    if not isinstance(arguments, str) or not arguments.strip():
+        return {}
+    try:
+        payload = json.loads(arguments)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _last_complete_task_tool_call(chat_task: ChatTask) -> tuple[Optional[str], dict[str, Any]]:
+    """Return the id and arguments for the last ``complete_task`` in chat order."""
     last_id: Optional[str] = None
+    last_arguments: dict[str, Any] = {}
     for message in chat_task.messages:
         if not isinstance(message, AssistantMessage):
             continue
@@ -203,20 +217,41 @@ def _last_complete_task_tool_call_id(chat_task: ChatTask) -> Optional[str]:
                 name = tc.function.name
                 if isinstance(name, str) and name.strip() == "complete_task":
                     last_id = tc.id
-    return last_id
+                    last_arguments = _parse_tool_arguments(tc.function.arguments)
+    return last_id, last_arguments
+
+
+def extract_swebench_complete_task_for_preds(chat_task: ChatTask) -> dict[str, str]:
+    """Return ``complete_task`` summary and normalized patch for ``preds.json``."""
+    tcid, arguments = _last_complete_task_tool_call(chat_task)
+    summary = arguments.get("summary")
+    patch = arguments.get("answer_patch")
+    if tcid and isinstance(patch, str) and patch.strip():
+        return {
+            "summary": summary if isinstance(summary, str) else "",
+            "model_patch": normalize_swebench_pred_patch(patch),
+        }
+
+    return {
+        "summary": summary if isinstance(summary, str) else "",
+        "model_patch": _SWEBENCH_PREDS_UNFINISHED,
+    }
 
 
 def extract_swebench_model_patch_for_preds(chat_task: ChatTask) -> str:
     """Patch string for SWE-bench ``preds.json`` when the run finished correctly.
 
-    Reads the JSON tool result from the last ``complete_task`` MCP call and returns
-    the ``answer_patch`` field (raw diff only). If there is no such call, no
-    matching tool message, or ``answer_patch`` is missing or empty, returns
+    Reads the last ``complete_task`` arguments and returns the ``answer_patch``
+    field (raw diff only). If there is no such call, no matching tool message,
+    or ``answer_patch`` is missing or empty, returns
     :data:`_SWEBENCH_PREDS_UNFINISHED`.
     """
-    tcid = _last_complete_task_tool_call_id(chat_task)
+    tcid, arguments = _last_complete_task_tool_call(chat_task)
     if not tcid:
         return _SWEBENCH_PREDS_UNFINISHED
+    patch = arguments.get("answer_patch")
+    if isinstance(patch, str) and patch.strip():
+        return normalize_swebench_pred_patch(patch)
     for message in chat_task.messages:
         if not isinstance(message, ToolMessage):
             continue
@@ -236,93 +271,6 @@ def extract_swebench_model_patch_for_preds(chat_task: ChatTask) -> str:
             return _SWEBENCH_PREDS_UNFINISHED
         return normalize_swebench_pred_patch(patch)
     return _SWEBENCH_PREDS_UNFINISHED
-
-
-# ---------------------------------------------------------------------------
-# SWE-bench system prompt
-# ---------------------------------------------------------------------------
-
-SWEBENCH_SYSTEM_PROMPT = """\
-You are an expert software engineer interacting with a computer shell to solve programming tasks.
-
-You have access to the following tools:
-- **read_file**: Read a file with 1-indexed line numbers.
-- **list_dir**: List directory contents with type labels.
-- **grep_files**: Search files by regex pattern using ripgrep.
-- **shell**: Run shell commands (pipes, redirects, etc.). Use this for file edits via ``sed``, ``tee``, heredocs (``cat <<'EOF' > file``), ``awk``, etc.
-- **exec**: Execute a command array directly via execvp.
-- **update_plan**: Track multi-step plans with status.
-- **think**: Record internal reasoning (no side effects).
-- **complete_task**: Finish the task with a short ``summary`` and the final patch in ``answer_patch`` (patch text only).
-
-# Task
-
-You will receive a PR description (bug report / feature request).  Your job is to modify **non-test source files** in ``/testbed`` to fix the described issue in a way that is correct and consistent with the codebase.
-
-# Workflow
-
-1. **Analyze**: Read the PR description carefully.  Identify the relevant module, class, or function.
-2. **Explore**: Use ``list_dir``, ``read_file``, ``grep_files`` to understand the codebase structure and find the relevant code in ``/testbed``.
-3. **Reproduce**: Write a small script and run it with ``shell`` to confirm the bug exists.
-4. **Fix**: Edit source files via ``shell`` (e.g. ``sed -i``, heredoc-redirected ``cat``, or ``tee``).  Re-read the file with ``read_file`` after each edit to confirm the change applied as intended.  Only modify files that are necessary to fix the issue.
-5. **Verify**: Re-run your reproduction script and any relevant existing tests to confirm the fix works.
-6. **Edge cases**: Consider and test edge cases to make sure the fix is robust.
-
-# Important Boundaries
-
-- **MODIFY**: Regular source code files in ``/testbed``.
-- **DO NOT MODIFY**: Tests, configuration files (pyproject.toml, setup.cfg, etc.), or any test fixtures.
-
-# Environment Details
-
-- Your sandbox **working directory (cwd) is ``/testbed``** — the checkout root. Always use ``/testbed`` as the working directory.
-- ``read_file``, ``list_dir``, ``grep_files``, and ``apply_patch`` all operate under ``/testbed`` (e.g. paths like ``/testbed/src/foo.py`` or repo-relative segments in diffs as below).
-- You have a full Linux shell; use non-interactive flags (``-y``, ``-f``).
-- Avoid interactive tools like ``vi``, ``nano``, or anything requiring user input.
-- Directory or environment variable changes are not persistent across separate ``shell`` calls.  Prefix commands with ``cd /testbed && ...`` when needed.
-
-# apply_patch rules (required — same as standard Coder / MCP smoke tests)
-
-- Use a **minimal unified diff** that GNU ``patch`` accepts: ``--- a/<path>``, ``+++ b/<path>``, ``@@`` hunks, then context lines (leading space), removals (``-``), additions (``+``). You do **not** need a ``diff --git`` line for ``apply_patch`` — that is **only** for the final submission below.
-- Paths after ``a/`` and ``b/`` are **relative to ``/testbed``** (the repo root). **Wrong:** ``--- a/testbed/src/foo.py``. **Right:** ``--- a/src/foo.py``.
-- Do **not** wrap the patch in markdown fences or prose.
-
-# Submission (``complete_task`` / SWE-bench ``preds.json`` only)
-
-When you have completed your work, you MUST submit your changes as a git patch.
-Follow these steps IN ORDER, with SEPARATE tool calls:
-
-Step 1: Create the patch file
-Call ``shell`` with ``git diff -- path/to/file1.py path/to/file2.py > /tmp/patch.txt``, listing only the source files you modified.  Do NOT commit your changes.
-
-<IMPORTANT>
-The patch must only contain changes to the specific source files you modified to fix the issue.
-Do not submit file creations or changes to any of the following files:
-
-- test and reproduction files
-- helper scripts, tests, or tools that you created
-- installation, build, packaging, configuration, or setup scripts unless they are directly part of the issue you were fixing (you can assume that the environment is already set up for your client)
-- binary or compiled files
-</IMPORTANT>
-
-Step 2: Verify your patch
-Call ``read_file`` on ``/tmp/patch.txt`` to confirm it only contains your intended changes and headers show ``--- a/`` and ``+++ b/`` paths.
-
-Step 3: Submit
-Call ``complete_task`` with the **exact, verbatim contents of /tmp/patch.txt** as the ``summary`` argument.  Do NOT write a natural-language description; paste the raw patch bytes you just saw in ``read_file``.
-
-<CRITICAL>
-- Creating/viewing the patch and submitting it MUST be separate tool calls.
-- If you modify /tmp/patch.txt after verifying, you MUST re-verify with ``read_file`` before submitting.
-- You CANNOT continue working (reading, editing, testing) on this task after calling ``complete_task``.
-</CRITICAL>
-
-# Critical Rules
-
-- THINK before each action.  Use ``think`` to reason about your approach.
-- Use ``update_plan`` to track your progress through the workflow.
-- Each response MUST include at least one tool call.
-"""
 
 
 # ---------------------------------------------------------------------------
@@ -361,9 +309,9 @@ class SWEBenchCoder(Controller):
         yield from self.chat_with_tools_controller.process([chat_task])
 
         task.output_str = chat_task.last_assistant_content()
-        task.customized_result_fields["swebench_model_patch"] = (
-            extract_swebench_model_patch_for_preds(chat_task)
-        )
+        complete_task_result = extract_swebench_complete_task_for_preds(chat_task)
+        task.customized_result_fields["swebench_model_patch"] = complete_task_result["model_patch"]
+        task.customized_result_fields["swebench_summary"] = complete_task_result["summary"]
         return
 
 

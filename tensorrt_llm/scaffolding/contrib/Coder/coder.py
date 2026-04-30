@@ -17,8 +17,10 @@ from tensorrt_llm.scaffolding.task import ChatTask, MCPCallTask, SystemMessage, 
 from tensorrt_llm.scaffolding.task_collection import (
     DropKVCacheWorkerTag,
     TaskMetricsCollector,
+    TokenizeWorkerTag,
     drop_kv_cache_scope,
     sub_request_node,
+    tokenize_trace_scope,
     with_execution_tracing,
     with_task_collection,
 )
@@ -200,6 +202,7 @@ def create_coder_scaffolding_llm(
 
     if enable_tracing:
         coder_type = with_execution_tracing("Coder")(coder_type)
+        coder_type = tokenize_trace_scope()(coder_type)
 
     # Create the ChatWithMCPController
     chat_with_tools_controller = chat_with_mcp_controller_type(
@@ -212,13 +215,17 @@ def create_coder_scaffolding_llm(
     )
 
     # Create and return the ScaffoldingLlm
+    workers = {
+        NativeGenerationController.WorkerTag.GENERATION: generation_worker,
+        ChatWithMCPController.WorkerTag.TOOLCALL: mcp_worker,
+        DropKVCacheWorkerTag.DROP_KV_CACHE: generation_worker,
+    }
+    if enable_tracing:
+        workers[TokenizeWorkerTag.TOKENIZE] = generation_worker
+
     scaffolding_llm = ScaffoldingLlm(
         coder_controller,
-        {
-            NativeGenerationController.WorkerTag.GENERATION: generation_worker,
-            ChatWithMCPController.WorkerTag.TOOLCALL: mcp_worker,
-            DropKVCacheWorkerTag.DROP_KV_CACHE: generation_worker,
-        },
+        workers,
         max_parallel_requests=max_parallel_requests,
     )
 

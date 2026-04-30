@@ -362,7 +362,11 @@ Depth: {depth + 1} of {self.max_depth}
 Create one distinct next branch. Choose exactly one available native tool:
 - tavily_search for web search.
 - fetch_webpage for reading known URLs.
-- python_interpreter for computation or parsing.
+- python_interpreter for computation or parsing. It has only a basic Python
+  environment by default; before importing a non-basic package, first call
+  python_interpreter with code like:
+  import subprocess, sys; subprocess.check_call([sys.executable, "-m", "pip",
+  "install", "<package>"])
 - reflection for planning when no external action is needed.
 - complete_task only when this trajectory is ready to provide the final answer.
 
@@ -469,8 +473,8 @@ def create_tot_research_controller(
     enable_tracing: bool = False,
 ) -> Controller:
     sampling_params = {
-        "temperature": 0.7,
-        "top_p": 0.95,
+        # "temperature": 0.7,
+        # "top_p": 0.95,
         "max_tokens": max_tokens,
     }
     generation_controller = NativeGenerationController(sampling_params=sampling_params)

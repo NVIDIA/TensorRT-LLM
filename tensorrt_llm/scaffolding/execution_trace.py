@@ -8,7 +8,9 @@ from typing import Any, Dict, List, Optional
 _FULL_TRACE_ONLY_KEYS = frozenset(
     {
         "llm_duration_ms",
+        "llm_request_params",
         "llm_request_messages",
+        "llm_request_tools",
         "tool_calls_detail",
         "reasoning",
         "reasoning_content",
@@ -49,9 +51,7 @@ class TraceEvent:
         Assistant messages carry generation metadata (token counts,
         tool_calls, finish_reason).  For ``event_type == "message"`` with
         ``role == "assistant"``, ``finish_reason`` is the completion
-        finish reason for that turn when known.  In full traces,
-        ``llm_request_messages`` entries for prior assistant turns also
-        include ``finish_reason`` when stored on ``AssistantMessage``.
+        finish reason for that turn when known.
         Non-assistant messages are informational context recorded between yields.
       - "tool_call": a single MCP tool invocation (MCPCallTask).
       - "parallel_start": a parallel branching point.  Child events are
@@ -63,8 +63,12 @@ class TraceEvent:
     Full-trace-only fields (see ``ExecutionTrace.save(..., full=True)``):
       - ``llm_duration_ms``: wall time for the ChatTask / GenerationTask yield
         (LLM round-trip) in milliseconds.
+      - ``llm_request_params``: non-message/tool request parameters sent to
+        the model API, such as model, sampling params, stop, and extra_body.
       - ``llm_request_messages``: messages sent to the model for that
         completion (chat), or a minimal request description.
+      - ``llm_request_tools``: native tool schemas sent with chat requests,
+        stored once on the conversation's system message.
       - ``tool_calls_detail``: structured native tool_calls on assistant turns.
       - ``reasoning`` / ``reasoning_content``: assistant reasoning payloads.
       - ``tool_arguments`` / ``tool_result``: MCP call input and raw result.
@@ -89,7 +93,9 @@ class TraceEvent:
 
     # -- full trace: LLM turn (event_type == "message", assistant) --
     llm_duration_ms: Optional[float] = None
+    llm_request_params: Optional[Dict[str, Any]] = None
     llm_request_messages: Optional[List[Dict[str, Any]]] = None
+    llm_request_tools: Optional[List[Dict[str, Any]]] = None
     tool_calls_detail: Optional[List[Dict[str, Any]]] = None
     reasoning: Optional[str] = None
     reasoning_content: Optional[str] = None
@@ -110,7 +116,9 @@ class TraceEvent:
     content: Optional[str] = None
 
     # -- tokenization annotation (filled by tokenize_trace_scope) --
+    # tokens_source is "tokenize_endpoint" for direct counts.
     tokens: Optional[int] = None
+    tokens_source: Optional[str] = None
     tokenize_error: Optional[str] = None
 
 

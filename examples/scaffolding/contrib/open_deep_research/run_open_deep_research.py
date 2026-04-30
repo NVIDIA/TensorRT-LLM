@@ -1,9 +1,8 @@
 r"""Open Deep Research runner (TensorRT-LLM scaffolding).
 
-Start Apiary (if using python_interpreter), then ``apiary_python_gateway.py``, then MCP
-servers and LLM, then::
+Start Apiary (if using python_interpreter), then MCP servers and LLM, then::
 
-    python examples/scaffolding/contrib/open_deep_research/run_deep_research.py \\
+    python examples/scaffolding/contrib/open_deep_research/run_open_deep_research.py \\
         --config examples/scaffolding/contrib/open_deep_research/config.yaml --enable_tracing
 """
 

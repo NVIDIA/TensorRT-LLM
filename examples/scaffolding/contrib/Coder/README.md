@@ -159,7 +159,6 @@ python examples/scaffolding/contrib/Coder/run_swebench.py \
     --base_url http://localhost:8000/v1 \
     --model Qwen3/Qwen3-30B-A3B \
     --mcp_url http://0.0.0.0:8083/sse \
-    --output_dir ./swebench_output \
     --max_parallel_requests 16
 ```
 
@@ -180,9 +179,11 @@ The runner is idempotent: already-loaded images are reported as `alreadypresent`
 
 Outputs:
 
-- `swebench_output/preds.json`: Predictions for SWE-bench evaluation
-- `swebench_output/<instance_id>/<instance_id>.traj.json`: Per-instancetrajectory
-- `swebench_output/<instance_id>/<instance_id>.trace.json`: Optional execution trace when `--enable_tracing` is enabled
+- `swebench_output/<dataset>-<split>-<model>-<time>/preds.json`: Predictions for SWE-bench evaluation
+- `swebench_output/<dataset>-<split>-<model>-<time>/<instance_id>/<instance_id>.traj.json`: Per-instance trajectory
+- `swebench_output/<dataset>-<split>-<model>-<time>/<instance_id>/<instance_id>.trace.json`: Optional execution trace when `--enable_tracing` is enabled
+
+Pass `--output_dir` to override the default run directory.
 
 ## Run the Coder Benchmark
 

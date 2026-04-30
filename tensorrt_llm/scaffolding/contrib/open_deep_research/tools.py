@@ -83,7 +83,11 @@ python_interpreter_tool = OpenAIToolDescription(
     name="python_interpreter",
     description=(
         "Execute Python in the configured sandbox. Use print() for output you need "
-        "to see. For calculations, data checks, or parsing scraped text."
+        "to see. For calculations, data checks, or parsing scraped text. The "
+        "environment only has basic packages by default; before importing a "
+        "non-basic package, you may first call this tool to install it, for "
+        "example: import subprocess, sys; subprocess.check_call([sys.executable, "
+        "'-m', 'pip', 'install', '<package>'])."
     ),
     parameters={
         "code": {

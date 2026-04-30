@@ -118,7 +118,7 @@ You have access to four tools (three information-gathering tools plus reflection
 
 1. **tavily_search**: General web search via Tavily. Pass `query` as a list of one or more strings.
 2. **fetch_webpage**: Fetch page or PDF text from specific URLs. Pass `url` as a list of strings; set `parse_type` to `"html"` or `"pdf"` as appropriate.
-3. **python_interpreter**: Run Python in the sandbox for computation, parsing, or verification. Pass `code` as a string; use `print()` for visible output.
+3. **python_interpreter**: Run Python in the sandbox for computation, parsing, or verification. Pass `code` as a string; use `print()` for visible output. The environment only has basic packages by default. If you need a non-basic package, call python_interpreter before importing it with code like `import subprocess, sys; subprocess.check_call([sys.executable, "-m", "pip", "install", "<package>"])`, then import the package in a later python_interpreter call.
 4. **reflection**: Strategic reflection and planning (no external calls).
 
 **CRITICAL: Call reflection only by itself** (not in parallel with tavily_search, fetch_webpage, or python_interpreter). After you finish a batch of information-gathering tool calls, use reflection to decide what to do next.

@@ -49,7 +49,10 @@ TOOLS = [
             "Executes arbitrary Python code in a secure, sandboxed environment. This "
             "tool is designed for performing complex calculations, data manipulations, "
             "string processing, logical operations, and general programming tasks. Use "
-            "print() for any output you want to see."
+            "print() for any output you want to see. The environment only has basic "
+            "packages by default; before importing a non-basic package, you may first "
+            "call this tool to install it, for example: import subprocess, sys; "
+            "subprocess.check_call([sys.executable, '-m', 'pip', 'install', '<package>'])."
         ),
         parameters={
             "code": {

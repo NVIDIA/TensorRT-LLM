@@ -605,8 +605,9 @@ class ExecutionTracer(TaskCollection):
     tool results, per-turn LLM latency, request message snapshots, and
     assistant message bodies.  Each ``message`` event with role ``tool``
     repeats ``tool_name`` and ``tool_arguments`` from the matching
-    ``tool_call``; the same fields are added to ``role`` ``tool`` entries
-    inside ``llm_request_messages``.
+    ``tool_call``.  ``llm_request_messages`` preserves the messages sent to
+    the chat completion API; request tool schemas are stored once on the
+    conversation's system message in ``llm_request_tools``.
 
     Multi-task yields and ParallelProcess forks both produce a
     ``parallel_start`` / ``parallel_end`` pair with child events recorded
@@ -659,6 +660,9 @@ class ExecutionTracer(TaskCollection):
                 conv_id = self._get_conversation_id(task_id)
                 last_recorded = self._last_recorded_counts.get(task_id, 0)
                 branch_path = self._get_branch_path()
+                llm_request_tools = None
+                if task.tools is not None:
+                    llm_request_tools = [tool.to_dict() for tool in task.tools]
                 for i, msg in enumerate(task.messages[last_recorded:pre_count]):
                     message_index = last_recorded + i
                     self.events.append(
@@ -666,6 +670,7 @@ class ExecutionTracer(TaskCollection):
                             msg,
                             conv_id,
                             branch_path,
+                            llm_request_tools=llm_request_tools,
                             message_index=message_index))
                 self._last_recorded_counts[task_id] = pre_count
 
@@ -831,13 +836,10 @@ class ExecutionTracer(TaskCollection):
             new_messages = task.messages[pre_count:]
             self._last_recorded_counts[task_id] = len(task.messages)
 
-            tool_meta = self._tool_call_meta_by_id_from_messages(
-                task.messages[:pre_count])
             llm_request_messages = [
-                self._serialize_role_message_for_trace(m, tool_meta)
-                for m in task.messages[:pre_count]
+                message.to_dict() for message in task.messages[:pre_count]
+                if getattr(message, "content", None) is not None
             ]
-
             first_assistant = None
             for msg in new_messages:
                 if getattr(msg, "role", None) == "assistant":
@@ -877,6 +879,7 @@ class ExecutionTracer(TaskCollection):
                 finish_reason=finish_reason_val,
                 content=content_val,
                 llm_duration_ms=duration_ms,
+                llm_request_params=getattr(task, "llm_request_params", None),
                 llm_request_messages=llm_request_messages,
                 tool_calls_detail=tool_calls_detail,
                 reasoning=reasoning_val,
@@ -926,6 +929,7 @@ class ExecutionTracer(TaskCollection):
                 reasoning_tokens=getattr(task, 'reasoning_tokens_num', 0),
                 finish_reason=getattr(task, 'finish_reason', None),
                 llm_duration_ms=duration_ms,
+                llm_request_params=getattr(task, "llm_request_params", None),
                 llm_request_messages=llm_req,
             )
         elif isinstance(task, DropKVCacheTask):
@@ -961,6 +965,7 @@ class ExecutionTracer(TaskCollection):
             message,
             conversation_id: int,
             branch_path: List[int],
+            llm_request_tools: Optional[List[Dict[str, Any]]] = None,
             message_index: Optional[int] = None) -> TraceEvent:
         """Convert a RoleMessage into a non-assistant message event."""
         role = getattr(message, "role", None)
@@ -977,6 +982,8 @@ class ExecutionTracer(TaskCollection):
             fr = getattr(message, "finish_reason", None)
             if fr is not None:
                 ev.finish_reason = fr
+        if role == "system" and message_index == 0 and llm_request_tools:
+            ev.llm_request_tools = llm_request_tools
         if role == "tool":
             ts = getattr(message, "trace_stdout", None)
             te = getattr(message, "trace_stderr", None)
@@ -1165,55 +1172,41 @@ def _collect_tokenizable_events(events: List[TraceEvent]) -> List[TraceEvent]:
     ]
 
 
-def _collect_all_message_events(events: List[TraceEvent]) -> List[TraceEvent]:
-    """Collect all message events (any role)."""
-    return [ev for ev in events if ev.event_type == "message"]
-
-
-def _correct_system_tokenss(events: List[TraceEvent]) -> None:
-    """Correct the tokens of system messages using assistant prompt_tokens.
-
-    For each conversation_id, if the first message is a system message,
-    find the first assistant message with prompt_tokens, then subtract
-    the tokens of every message in between.  The remainder is assigned
-    to the system message, capturing hidden tokens (e.g. tool definitions)
-    that the naive per-content tokenization misses.
-    """
-    all_msgs = _collect_all_message_events(events)
-
-    # Group by conversation_id (skip events without one)
-    convs: Dict[int, List[TraceEvent]] = {}
-    for msg in all_msgs:
-        cid = msg.conversation_id
-        if cid is None:
+def _balance_system_tokens(events: List[TraceEvent]) -> None:
+    """Force each conversation's system tokens to match the first assistant prompt."""
+    conversations: Dict[int, List[TraceEvent]] = {}
+    for event in events:
+        if event.event_type != "message" or event.conversation_id is None:
             continue
-        convs.setdefault(cid, []).append(msg)
+        conversations.setdefault(event.conversation_id, []).append(event)
 
-    for cid, msgs in convs.items():
-        # Only correct when the first message is a system message.
-        if not msgs or msgs[0].role != "system":
-            continue
-        first_system = msgs[0]
-
-        # Find the first assistant message that has prompt_tokens
-        first_assistant = None
-        assistant_idx = -1
-        for idx, m in enumerate(msgs):
-            if m.role == "assistant" and m.prompt_tokens is not None:
-                first_assistant = m
-                assistant_idx = idx
+    for messages in conversations.values():
+        system_message = None
+        first_assistant_index = None
+        first_assistant_prompt_tokens = None
+        for index, message in enumerate(messages):
+            if message.role == "system" and system_message is None:
+                system_message = message
+                continue
+            if message.role == "assistant" and message.prompt_tokens is not None:
+                first_assistant_index = index
+                first_assistant_prompt_tokens = message.prompt_tokens
                 break
-        if first_assistant is None:
+
+        if system_message is None or first_assistant_index is None or first_assistant_prompt_tokens is None:
             continue
 
-        # Subtract all preceding tokens between the system and the assistant.
-        remaining = first_assistant.prompt_tokens
-        for m in msgs[1:assistant_idx]:
-            if m.tokens is not None:
-                remaining -= m.tokens
-
-        if remaining >= 0:
-            first_system.tokens = remaining
+        prompt_user_tokens = 0
+        can_balance = True
+        for message in messages[:first_assistant_index]:
+            if message.role != "user":
+                continue
+            if message.tokens is None:
+                can_balance = False
+                break
+            prompt_user_tokens += message.tokens
+        if can_balance:
+            system_message.tokens = first_assistant_prompt_tokens - prompt_user_tokens
 
 
 def tokenize_trace_scope():
@@ -1247,13 +1240,12 @@ def tokenize_trace_scope():
                 for task in tokenize_tasks:
                     if task.token_count is not None and task.event is not None:
                         task.event.tokens = task.token_count
+                        task.event.tokens_source = "tokenize_endpoint"
                         task.event.tokenize_error = None
                     elif task.event is not None and task.tokenize_error:
                         task.event.tokenize_error = task.tokenize_error
 
-                # Correct system message token counts using assistant
-                # prompt_tokens to account for tool definitions, etc.
-                _correct_system_tokenss(tracer.events)
+                _balance_system_tokens(tracer.events)
 
             return wrapper()
 

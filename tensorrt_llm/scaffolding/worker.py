@@ -196,6 +196,14 @@ class OpenaiWorker(Worker):
 
         return params
 
+    @staticmethod
+    def _request_params_for_trace(params: dict) -> dict:
+        return {
+            key: copy.deepcopy(value)
+            for key, value in params.items()
+            if key not in ("messages", "tools", "prompt")
+        }
+
     def fill_generation_task_with_response(self, task: GenerationTask,
                                            response: openai.Completion):
         task.output_str = response.choices[0].text
@@ -205,6 +213,7 @@ class OpenaiWorker(Worker):
 
     async def generation_handler(self, task: GenerationTask) -> TaskStatus:
         params = self.convert_task_params(task)
+        task.llm_request_params = self._request_params_for_trace(params)
 
         # Make the API call
         try:
@@ -224,6 +233,7 @@ class OpenaiWorker(Worker):
         params["model"] = self.model
         if task.tools is not None:
             params["tools"] = [tool.to_dict() for tool in task.tools]
+        task.llm_request_params = self._request_params_for_trace(params)
 
         try:
             response = await self.async_client.chat.completions.create(**params)

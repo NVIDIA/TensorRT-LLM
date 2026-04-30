@@ -70,5 +70,4 @@ python examples/scaffolding/contrib/open_deep_research/run_open_deep_research.py
 
 ## Trace replay
 
-For replaying recorded traces, see `run_deep_research_replay.py` in this directory,
-or use the general scripts under `examples/scaffolding/trace_replay`.
+For replaying recorded traces, use the general scripts under `examples/scaffolding/trace_replay`.

@@ -169,8 +169,7 @@ complete_task_tool = OpenAIToolDescription(
         "Call when finished and ready to return the final response. "
         "Use ``summary`` for a short human-readable recap. "
         "Use ``answer_patch`` for any final patch text the task requires (format depends on the "
-        "system prompt — SWE-bench runs require full ``git diff`` output, which differs from the "
-        "minimal ``---``/``+++`` form used by ``apply_patch``). "
+        "system prompt - SWE-bench runs require full ``git diff`` output). "
         "Do not wrap ``answer_patch`` in markdown fences or commentary."
     ),
     parameters={
@@ -195,6 +194,7 @@ ALL_CODER_TOOLS = [
     read_file_tool,
     list_dir_tool,
     grep_files_tool,
+    # apply_patch_tool,
     update_plan_tool,
     exec_tool,
     shell_tool,
@@ -203,6 +203,6 @@ ALL_CODER_TOOLS = [
 ]
 
 # Commonly used tool subsets
-FILE_TOOLS = [read_file_tool, list_dir_tool, grep_files_tool]
+FILE_TOOLS = [read_file_tool, list_dir_tool, grep_files_tool]  # apply_patch_tool
 SHELL_TOOLS = [exec_tool, shell_tool]
 PLANNING_TOOLS = [update_plan_tool, think_tool, complete_task_tool]

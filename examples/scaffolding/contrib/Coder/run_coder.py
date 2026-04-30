@@ -31,7 +31,7 @@ def parse_arguments():
     parser.add_argument(
         "--mcp_url",
         type=str,
-        default="http://0.0.0.0:8083/sse",
+        default="http://0.0.0.0:8086/sse",
         help="URL for the Coder Apiary MCP server (coder_mcp.py)",
     )
     parser.add_argument(
@@ -49,7 +49,7 @@ def parse_arguments():
     parser.add_argument(
         "--apiary_url",
         type=str,
-        default=os.getenv("APIARY_URL", "http://127.0.0.1:8080"),
+        default=os.getenv("APIARY_URL", "http://172.17.0.1:8080"),
         help="Apiary daemon URL used to register the sandbox image",
     )
     parser.add_argument(

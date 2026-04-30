@@ -90,6 +90,7 @@ class GenerationTask(Task):
     output_str: Optional[str] = None
     output_tokens: Optional[List[int]] = None
     finish_reason: Optional[str] = None
+    llm_request_params: Optional[Dict[str, Any]] = None
     # TODO: support openai API format context logits
     context_logits: Optional[torch.Tensor] = None
     # TODO: don't not use TokenLogprobs for general support
@@ -106,11 +107,13 @@ class GenerationTask(Task):
 
     def create_scaffolding_output(self) -> ScaffoldingOutput:
         meta = None
-        if self.customized_result_fields and "swebench_model_patch" in self.customized_result_fields:
+        # customized for running swebench
+        if self.customized_result_fields:
             meta = {
-                "swebench_model_patch":
-                self.customized_result_fields["swebench_model_patch"],
-            }
+                key: self.customized_result_fields[key]
+                for key in ("swebench_model_patch", "swebench_summary")
+                if key in self.customized_result_fields
+            } or None
         return ScaffoldingOutput(self.output_str, self.output_tokens, meta)
 
 
