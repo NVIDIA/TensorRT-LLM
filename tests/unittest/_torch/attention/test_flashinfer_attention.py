@@ -280,10 +280,12 @@ class TestFlashInferAttention(unittest.TestCase):
         for plan_params in attn_metadata._plan_params_to_wrappers.keys():
             self.assertEqual(attn_metadata.get_num_plans(plan_params), 1)
 
-        # Make sure prepare() re-planned all params.
+        # prepare() now defers re-planning to forward_impl (lazy re-plan) to
+        # avoid workspace corruption when multiple wrappers share the same
+        # workspace_buffer; assert the wrappers were marked not-planned.
         attn_metadata.prepare()
-        for plan_params in attn_metadata._plan_params_to_wrappers.keys():
-            self.assertEqual(attn_metadata.get_num_plans(plan_params), 2)
+        for wrappers in attn_metadata._plan_params_to_wrappers.values():
+            self.assertFalse(wrappers.is_planned)
 
         # [context_1, gen_1]
         results_2 = []
@@ -326,10 +328,12 @@ class TestFlashInferAttention(unittest.TestCase):
         for plan_params in attn_metadata._plan_params_to_wrappers.keys():
             self.assertEqual(attn_metadata.get_num_plans(plan_params), 1)
 
-        # Make sure prepare() re-planned all params.
+        # prepare() now defers re-planning to forward_impl (lazy re-plan) to
+        # avoid workspace corruption when multiple wrappers share the same
+        # workspace_buffer; assert the wrappers were marked not-planned.
         attn_metadata.prepare()
-        for plan_params in attn_metadata._plan_params_to_wrappers.keys():
-            self.assertEqual(attn_metadata.get_num_plans(plan_params), 2)
+        for wrappers in attn_metadata._plan_params_to_wrappers.values():
+            self.assertFalse(wrappers.is_planned)
 
         # [context_2, gen_2]
         results_3 = []
@@ -371,10 +375,12 @@ class TestFlashInferAttention(unittest.TestCase):
         for plan_params in attn_metadata._plan_params_to_wrappers.keys():
             self.assertEqual(attn_metadata.get_num_plans(plan_params), 1)
 
-        # Make sure prepare() re-planned all params.
+        # prepare() now defers re-planning to forward_impl (lazy re-plan) to
+        # avoid workspace corruption when multiple wrappers share the same
+        # workspace_buffer; assert the wrappers were marked not-planned.
         attn_metadata.prepare()
-        for plan_params in attn_metadata._plan_params_to_wrappers.keys():
-            self.assertEqual(attn_metadata.get_num_plans(plan_params), 2)
+        for wrappers in attn_metadata._plan_params_to_wrappers.values():
+            self.assertFalse(wrappers.is_planned)
 
         # assert value
 
