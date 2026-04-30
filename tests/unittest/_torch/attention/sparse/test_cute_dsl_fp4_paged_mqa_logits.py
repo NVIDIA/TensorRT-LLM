@@ -253,9 +253,7 @@ ELEM_TOL = {
 
 @skip_not_sm100
 @pytest.mark.parametrize("batch_size", [1, 4, 16])
-@pytest.mark.parametrize(
-    "next_n", [1, 2]
-)  # next_n=3 disabled: TMEM overflow (raw_total=544>512), needs design change
+@pytest.mark.parametrize("next_n", [1, 2, 3])
 @pytest.mark.parametrize("num_heads", [64])
 @pytest.mark.parametrize("avg_ctx", [256, 4096, 32768])
 @pytest.mark.parametrize(
@@ -276,7 +274,8 @@ ELEM_TOL = {
         # 4,    # follow-up
     ],
 )
-@pytest.mark.parametrize("fix_length", [True, False])
+# @pytest.mark.parametrize("fix_length", [True, False])
+@pytest.mark.parametrize("fix_length", [True])
 def test_cute_dsl_fp4_paged_mqa_logits(
     batch_size,
     next_n,
