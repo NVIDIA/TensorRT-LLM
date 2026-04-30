@@ -797,6 +797,12 @@ def find_mm_token_lengths(
                     item = item.frames
                 assert isinstance(item, list), "Video must be a list of frames"
                 call_kwargs = {"video": item}
+                if video_metadata is not None:
+                    # Used by per-model overrides that need to account for
+                    # video-derived auxiliary modalities (e.g. Nemotron Nano
+                    # adds <so_*> token slots when metadata carries
+                    # `audio_samples` from extract_audio=true).
+                    call_kwargs["video_metadata"] = video_metadata
                 if video_grid_thw_for_items is not None:
                     # TODO(TRTLLM-11951): Replace this Qwen-VL-specific
                     # metadata wiring with a generic per-item processed
@@ -806,13 +812,7 @@ def find_mm_token_lengths(
                     call_kwargs["video_grid_thw"] = video_grid_thw_for_items[
                         idx]
                 num_tokens = input_processor.get_num_tokens_per_video(
-<<<<<<< HEAD
                     **call_kwargs)
-=======
-                    video=item,
-                    video_metadata=video_metadata,
-                )
->>>>>>> cfc5f09533 (Support extracting audio from video)
                 modality_token_lengths.append(num_tokens)
             elif modality == "audio":
                 num_tokens = input_processor.get_num_tokens_per_audio(
