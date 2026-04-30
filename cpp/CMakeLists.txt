@@ -84,7 +84,10 @@ option(USING_OSS_CUTLASS_MOE_GEMM "Using open sourced Cutlass moe gemm kernel"
        ON)
 option(USING_OSS_CUTLASS_ALLREDUCE_GEMM
        "Using open sourced Cutlass AR gemm kernel" ON)
-option(SKIP_SOFTMAX_STAT "Enable Statistics of Skip-Softmax" OFF)
+# Opt-in macro that activates the legacy XQA-decoder skip-softmax stat path
+# (#ifdef SKIP_SOFTMAX_STAT in cpp/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/).
+# The FMHA prefill path no longer depends on this — it has runtime variants.
+option(SKIP_SOFTMAX_STAT "Enable legacy XQA-decoder Skip-Softmax stat path" OFF)
 
 message(STATUS "ENABLE_NVSHMEM is ${ENABLE_NVSHMEM}")
 
@@ -384,7 +387,7 @@ endif()
 
 if(SKIP_SOFTMAX_STAT)
   add_compile_definitions("SKIP_SOFTMAX_STAT")
-  message(STATUS "SKIP_SOFTMAX_STAT is enabled")
+  message(STATUS "SKIP_SOFTMAX_STAT is enabled (legacy XQA-decoder path)")
 endif()
 
 # Fix linking issue with TRT 10, the detailed description about `--mcmodel` can

@@ -128,10 +128,8 @@ struct Softmax_base
         , log2_chunked_attention_size_(params.log2_chunked_attention_size)
         , packed_mask_ptr_{reinterpret_cast<uint32_t*>(params.packed_mask_ptr)}
         , params_packed_mask_stride_in_bytes_{params.packed_mask_stride_in_bytes}
-#ifdef SKIP_SOFTMAX_STAT
         , total_blocks(0)
         , skipped_blocks(0)
-#endif
         , skip_softmax_threshold(0)
     {
 
@@ -413,9 +411,10 @@ struct Softmax_base
 
         if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX)
         {
-#ifdef SKIP_SOFTMAX_STAT
-            total_blocks++;
-#endif
+            if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX_STAT)
+            {
+                total_blocks++;
+            }
             if constexpr (may_skip)
             {
 
@@ -434,9 +433,10 @@ struct Softmax_base
                 skip = *((uint32_t volatile*) skip_softmax_vote);
                 if (skip)
                 {
-#ifdef SKIP_SOFTMAX_STAT
-                    skipped_blocks++;
-#endif
+                    if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX_STAT)
+                    {
+                        skipped_blocks++;
+                    }
                     return false;
                 }
             }
@@ -601,11 +601,11 @@ struct Softmax_base
     uint4 packed_mask_;
     // Skip softmax when exp(local_max - global_max) < skip_softmax_threshold.
     float skip_softmax_threshold;
-#ifdef SKIP_SOFTMAX_STAT
-    // Statistics of skip-softmax
+    // Per-thread accumulators for skip-softmax block statistics.
+    // Always declared so the struct layout is independent of compile flags;
+    // only written when Kernel_traits::ENABLE_SKIP_SOFTMAX_STAT is true.
     uint32_t total_blocks;
     uint32_t skipped_blocks;
-#endif
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1011,9 +1011,10 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
 
         if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX)
         {
-#ifdef SKIP_SOFTMAX_STAT
-            this->total_blocks++;
-#endif
+            if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX_STAT)
+            {
+                this->total_blocks++;
+            }
 
             if constexpr (may_skip)
             {
@@ -1032,9 +1033,10 @@ struct Softmax<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
                 skip = *((uint32_t volatile*) skip_softmax_vote);
                 if (skip)
                 {
-#ifdef SKIP_SOFTMAX_STAT
-                    this->skipped_blocks++;
-#endif
+                    if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX_STAT)
+                    {
+                        this->skipped_blocks++;
+                    }
                     return false;
                 }
             }

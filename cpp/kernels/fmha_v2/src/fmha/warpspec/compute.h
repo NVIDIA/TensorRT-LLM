@@ -539,13 +539,15 @@ struct Compute
                 }
             }
         }
-#ifdef SKIP_SOFTMAX_STAT
-        if (tidx == 0)
+        if constexpr (Kernel_traits::ENABLE_SKIP_SOFTMAX_STAT)
         {
-            atomicAdd(params.skip_softmax_total_blocks, softmax.total_blocks);
-            atomicAdd(params.skip_softmax_skipped_blocks, softmax.skipped_blocks);
+            if (tidx == 0 && params.skip_softmax_total_blocks != nullptr
+                && params.skip_softmax_skipped_blocks != nullptr)
+            {
+                atomicAdd(params.skip_softmax_total_blocks, softmax.total_blocks);
+                atomicAdd(params.skip_softmax_skipped_blocks, softmax.skipped_blocks);
+            }
         }
-#endif
     }
 
     ////////////////////////////////////////////////////////////////////////////////////////////////

@@ -74,6 +74,10 @@ template <
     bool RETURN_SOFTMAX_STATS_ = false,
     // Enable skip softmax attention feature
     bool ENABLE_SKIP_SOFTMAX_ = false,
+    // Collect skip-softmax block statistics (atomic counters in global memory).
+    // Only meaningful with ENABLE_SKIP_SOFTMAX_ = true. Adds per-block atomic adds;
+    // intended only for the _skipSoftmaxStat cubin variants used by debug builds.
+    bool ENABLE_SKIP_SOFTMAX_STAT_ = false,
     // The output type (only used by fp8 kernels).
     typename OutputType = typename Instruction_traits<STEP_Q_, STEP_KV_, 0, false, false>::A_type,
     // The sage attention block size for Q, K and V
@@ -303,6 +307,12 @@ struct Kernel_traits
     enum
     {
         ENABLE_SKIP_SOFTMAX = ENABLE_SKIP_SOFTMAX_
+    };
+
+    // Are we collecting per-block skip-softmax statistics?
+    enum
+    {
+        ENABLE_SKIP_SOFTMAX_STAT = ENABLE_SKIP_SOFTMAX_STAT_
     };
 
     static_assert(!USE_CUSTOM_MASK || STEP_KV == 64 || STEP_KV == 128 || STEP_KV == 256, "Not implemented!");
@@ -603,6 +613,8 @@ template < // The step size in query sequence dimension (M of BMM1 and BMM2).
     bool RETURN_SOFTMAX_STATS_ = false,
     // Enable skip softmax attention feature
     bool ENABLE_SKIP_SOFTMAX_ = false,
+    // Collect skip-softmax block statistics (atomic counters in global memory).
+    bool ENABLE_SKIP_SOFTMAX_STAT_ = false,
     // The output type (only used by fp8 kernels).
     typename OutputType = e4m3_t,
     // The sage attention block size for Q, K and V
@@ -611,15 +623,16 @@ struct Kernel_traits_Hopper_qgmma_e4m3_fp32
     : public Kernel_traits<Hopper_qgmma_e4m3_fp32_traits, STEP_Q_, STEP_KV_, D_, DV_, Q_BUFFERS_, KV_BUFFERS_,
           NUM_COMPUTE_GROUPS_, DMA2COMPUTE_DEPTH_, ATTENTION_MASK_TYPE_, HEADS_INTERLEAVED_, APPLY_ALIBI_,
           ENABLE_MUTEX_, SCHEDULING_MODE_, INPUT_LAYOUT_, USE_TMA_STORE_, ENABLE_BMM1_SOFTCAPPING_SCALE_,
-          RETURN_SOFTMAX_STATS_, ENABLE_SKIP_SOFTMAX_, OutputType, SAGE_BLOCK_SIZE_Q_, SAGE_BLOCK_SIZE_K_,
-          SAGE_BLOCK_SIZE_V_>
+          RETURN_SOFTMAX_STATS_, ENABLE_SKIP_SOFTMAX_, ENABLE_SKIP_SOFTMAX_STAT_, OutputType, SAGE_BLOCK_SIZE_Q_,
+          SAGE_BLOCK_SIZE_K_, SAGE_BLOCK_SIZE_V_>
 {
 
     // Base class.
     using Base = Kernel_traits<Hopper_qgmma_e4m3_fp32_traits, STEP_Q_, STEP_KV_, D_, DV_, Q_BUFFERS_, KV_BUFFERS_,
         NUM_COMPUTE_GROUPS_, DMA2COMPUTE_DEPTH_, ATTENTION_MASK_TYPE_, HEADS_INTERLEAVED_, APPLY_ALIBI_, ENABLE_MUTEX_,
         SCHEDULING_MODE_, INPUT_LAYOUT_, USE_TMA_STORE_, ENABLE_BMM1_SOFTCAPPING_SCALE_, RETURN_SOFTMAX_STATS_,
-        ENABLE_SKIP_SOFTMAX_, OutputType, SAGE_BLOCK_SIZE_Q_, SAGE_BLOCK_SIZE_K_, SAGE_BLOCK_SIZE_V_>;
+        ENABLE_SKIP_SOFTMAX_, ENABLE_SKIP_SOFTMAX_STAT_, OutputType, SAGE_BLOCK_SIZE_Q_, SAGE_BLOCK_SIZE_K_,
+        SAGE_BLOCK_SIZE_V_>;
 
     enum
     {
