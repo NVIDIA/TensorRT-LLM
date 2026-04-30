@@ -632,27 +632,13 @@ class PyExecutor:
 
             self.kv_connector_manager.wait_for_initialization()
 
-    def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
-        if self.kv_cache_transceiver and request in self.active_requests:
-            # Fast-transfer: KV transfer completed in the same iteration
-            # before _handle_responses could run. Create the response now
-            # while state is still TRANS_IN_PROGRESS (required by C++
-            # createResult). Then proceed with end_transfer + termination.
-            response = request.create_response(False, self.dist.rank)
-            if response:
-                response.result.cached_tokens = request.cached_tokens
-                self._enqueue_responses([(request.py_request_id, response)])
-            if self.async_transfer_manager.end_transfer(request):
-                self.active_requests.remove(request)
-                self._terminate_request(request)
-            return
-        if self.async_transfer_manager.end_transfer(request):
-            # When should_store_blocks is True, _handle_responses already
-            # terminated this request via the early-termination path
-            # (enable_partial_reuse_for_disagg branch). Skip the redundant
-            # termination to avoid double free_resources calls.
-            if not self.async_transfer_manager.should_store_blocks:
-                self._terminate_request(request)
+    def _update_resources(self, scheduled_requests) -> None:
+        attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
+        kv_cache_dtype_byte_size = getattr(self.model_engine,
+                                           'kv_cache_dtype_byte_size', None)
+        self.resource_manager.update_resources(scheduled_requests,
+                                               attn_metadata,
+                                               kv_cache_dtype_byte_size)
 
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
@@ -1799,6 +1785,7 @@ class PyExecutor:
                 self._update_requests(executed_batch.sample_state)
 
                 scheduled_requests = executed_batch.scheduled_requests
+                self._update_resources(executed_batch.scheduled_requests)
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
@@ -1809,15 +1796,6 @@ class PyExecutor:
                 # _handle_responses sees the request before it is terminated.
                 if self.kv_cache_transceiver:
                     self._check_disagg_ctx_cache_transfer_status(0)
-                sample_state_scheduled_requests = executed_batch.scheduled_requests
-                attn_metadata = getattr(self.model_engine, 'attn_metadata',
-                                        None)
-                kv_cache_dtype_byte_size = getattr(self.model_engine,
-                                                   'kv_cache_dtype_byte_size',
-                                                   None)
-                self.resource_manager.update_resources(
-                    sample_state_scheduled_requests, attn_metadata,
-                    kv_cache_dtype_byte_size)
 
                 self._remove_inflight_ids(scheduled_requests)
 
@@ -2061,7 +2039,7 @@ class PyExecutor:
         if self.kv_connector_manager:
             reqs_to_terminate = self.kv_connector_manager.get_finished()
             for req in reqs_to_terminate:
-                self._end_transfer_and_maybe_terminate(req)
+                self.async_transfer_manager.end_transfer(req)
 
     def _kv_connector_wait_for_save(self):
         if self.kv_connector_manager is not None:
@@ -2275,6 +2253,8 @@ class PyExecutor:
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state, self.resource_manager)
 
+                    self._update_resources(scheduled_batch)
+
                     self._send_kv_async(scheduled_batch.all_requests())
 
                     self._handle_canceled_requests()
@@ -2287,13 +2267,6 @@ class PyExecutor:
                     # (safe in non-overlap mode: no next iteration to overwrite events)
                     self.perf_manager.compute_batch_gpu_times(
                         scheduled_batch.all_requests())
-                    attn_metadata = getattr(self.model_engine, 'attn_metadata',
-                                            None)
-                    kv_cache_dtype_byte_size = getattr(
-                        self.model_engine, 'kv_cache_dtype_byte_size', None)
-                    self.resource_manager.update_resources(
-                        scheduled_batch, attn_metadata,
-                        kv_cache_dtype_byte_size)
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
 
@@ -2683,15 +2656,9 @@ class PyExecutor:
         return result_tensors, num_accepted_tokens
 
     def _process_previous_batch(self):
+        self._update_resources(self.previous_batch.scheduled_requests)
         self._handle_canceled_requests()
         finished_requests = self._handle_responses()
-        scheduled_requests = self.previous_batch.scheduled_requests
-        attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
-        kv_cache_dtype_byte_size = getattr(self.model_engine,
-                                           'kv_cache_dtype_byte_size', None)
-        self.resource_manager.update_resources(scheduled_requests,
-                                               attn_metadata,
-                                               kv_cache_dtype_byte_size)
         if self.enable_kv_cache_events:
             self._add_kv_cache_events()
 
@@ -3446,7 +3413,7 @@ class PyExecutor:
 
             request = requests_in_transfer[request_id]
 
-            self._end_transfer_and_maybe_terminate(request)
+            self.async_transfer_manager.end_transfer(request)
 
         # The set of requests in transfer may have changed since we terminated some requests.
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
@@ -3462,7 +3429,7 @@ class PyExecutor:
                     request.py_kv_transfer_start_time = None
                     request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
 
-                    self._end_transfer_and_maybe_terminate(request)
+                    self.async_transfer_manager.end_transfer(request)
 
         self._check_cache_transfer_errors("context requests")
 
