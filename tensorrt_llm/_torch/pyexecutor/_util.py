@@ -8,7 +8,7 @@ import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import \
     MODEL_CLASS_VISION_ENCODER_MAPPING
-from tensorrt_llm._utils import (confidential_compute_enabled,
+from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
 
@@ -729,16 +729,15 @@ class KvCacheCreator:
         )
 
     def _split_kv_cache_budget_for_draft(self) -> Optional[KvCacheConfig]:
-        """Split max_gpu_total_bytes between target and draft KV caches.
+        """Split KV cache budgets between target and draft KV caches.
 
         When using KVCacheManagerV2 with a separate draft KV cache,
-        max_gpu_total_bytes represents the total budget for both target and
-        draft combined.  This method splits the budget proportionally based
-        on their per-token KV cache sizes.
+        max_gpu_total_bytes and host_cache_size each represent the total
+        budget for both target and draft combined.  This method splits both
+        budgets proportionally based on their per-token KV cache sizes.
 
         Returns a cloned KvCacheConfig for the draft, or None if no split is
-        needed.  Also modifies self._kv_cache_config.max_gpu_total_bytes
-        in-place for the target.
+        needed.  Also modifies self._kv_cache_config in-place for the target.
         """
         total_budget = self._kv_cache_config.max_gpu_total_bytes
         if total_budget is None or total_budget <= 0:
@@ -753,7 +752,9 @@ class KvCacheCreator:
         if total_kv <= 0 or draft_kv <= 0:
             return None
 
-        draft_budget = int(total_budget * draft_kv / total_kv)
+        draft_ratio = draft_kv / total_kv
+
+        draft_budget = int(total_budget * draft_ratio)
         target_budget = total_budget - draft_budget
 
         logger.info(
@@ -765,6 +766,18 @@ class KvCacheCreator:
 
         draft_kv_cache_config = self._kv_cache_config.model_copy()
         draft_kv_cache_config.max_gpu_total_bytes = draft_budget
+
+        host_budget = self._kv_cache_config.host_cache_size
+        if host_budget is not None and host_budget > 0:
+            draft_host_budget = int(host_budget * draft_ratio)
+            target_host_budget = host_budget - draft_host_budget
+            self._kv_cache_config.host_cache_size = target_host_budget
+            draft_kv_cache_config.host_cache_size = draft_host_budget
+            logger.info(
+                f"Splitting KV cache host budget: total={host_budget / GB:.2f} GiB, "
+                f"target={target_host_budget / GB:.2f} GiB, "
+                f"draft={draft_host_budget / GB:.2f} GiB")
+
         return draft_kv_cache_config
 
     def build_managers(self,
@@ -1030,6 +1043,44 @@ def _create_kv_cache_manager(
                     full_attention_layer_mask.extend([True] * num_spec_layers)
                     mamba_layer_mask.extend([False] * num_spec_layers)
                     num_full_attention_layers += num_spec_layers
+        # Replay state update kernel for MTP: default on for sm >= 80; gates
+        # below disable it for incompatible feature combinations.  Cpp cache
+        # manager doesn't expose use_replay_state_update, so the wrapper
+        # property's getattr default keeps replay off there automatically.
+        sm = get_sm_version()
+        ssm_cache_dtype = (quant_config.mamba_ssm_cache_dtype
+                           if quant_config is not None else None)
+        stochastic_rounding = getattr(
+            quant_config, 'mamba_ssm_stochastic_rounding',
+            False) if quant_config is not None else False
+
+        use_replay = sm >= 80
+
+        # Block reuse (prefix caching): replay leaves SSM state at a
+        # checkpoint after speculation. The next decode step replays forward
+        # to correct it. If block reuse feeds that stale state into a new
+        # prefill, the correction never happens.
+        if kv_cache_config.enable_block_reuse:
+            logger.info("Replay kernel incompatible with block reuse "
+                        "(stale SSM state); using legacy MTP path")
+            use_replay = False
+
+        # Tree attention: replay assumes linear token sequence.
+        if (spec_config is not None
+                and (getattr(spec_config, 'eagle_choices', None) is not None
+                     or getattr(spec_config, 'use_dynamic_tree', False))):
+            logger.info("Replay kernel incompatible with tree attention; "
+                        "using legacy MTP path")
+            use_replay = False
+
+        # Replay Philox uses PTX cvt.rs.f16x2.f32 which needs sm >= 100.
+        # Flashinfer has a SW fallback at any SM.
+        if (stochastic_rounding and ssm_cache_dtype == torch.float16
+                and sm < 100):
+            logger.info("Replay kernel Philox requires sm >= 100; "
+                        "using legacy MTP path for stochastic rounding support")
+            use_replay = False
+
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             config.ssm_state_size,
@@ -1059,6 +1110,7 @@ def _create_kv_cache_manager(
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             model_type="nemotron_hybrid",
+            use_replay_state_update=use_replay,
         )
     elif is_qwen3_hybrid(config):
         if max_beam_width > 1:

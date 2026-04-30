@@ -118,12 +118,10 @@ l0_b200:
   # ------------- MoE: FlashInfer & TRTLLM symbol collision tests ---------------
   - unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py
   # --- MoE end
-  - unittest/_torch/multimodal/test_mm_encoder_standalone.py
-  - unittest/_torch/multimodal/test_multimodal_runtime.py
-  - unittest/_torch/multimodal/test_find_num_image_tokens.py
-  - unittest/_torch/multimodal/test_fuse_input_embeds.py
-  - unittest/_torch/multimodal/test_external_embedding.py
-  - unittest/_torch/multimodal/test_share_multiparams.py
+  # B-tier only runs the FP8 MoE parametrize (DEEPGEMM path is SM100-only via
+  # _get_moe_config_for_blackwell); dense bf16 variants are covered on Hopper.
+  # The other 5 multimodal files are HW-agnostic Python plumbing and run on Hopper only.
+  - unittest/_torch/multimodal/test_mm_encoder_standalone.py -k "qwen3_30b_a3b_fp8"
   - unittest/_torch/sampler
   - unittest/_torch/speculative
   - unittest/_torch/thop/parallel TIMEOUT (90)
@@ -279,11 +277,12 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=2-fp8kv=False-attention_dp=False-cuda_graph=True-overlap_scheduler=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=TRTLLM-mtp_nextn=2-fp8kv=False-attention_dp=False-cuda_graph=True-overlap_scheduler=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTEDSL-mtp_nextn=0-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp1-CUTLASS]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp1-TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestSeedOss_36B::test_auto_dtype
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B_Instruct_RocketKV::test_auto_dtype
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-trtllm-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-True-True-trtllm-auto]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16
 # ------------- AutoDeploy Backend Stages ---------------
 - condition:
     ranges:

@@ -267,6 +267,14 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      use_cute_dsl_bf16_bmm:
+        annotation: bool
+        default: False
+        status: prototype
+      use_cute_dsl_bf16_gemm:
+        annotation: bool
+        default: False
+        status: prototype
     return_annotation: None
   generate:
     parameters:

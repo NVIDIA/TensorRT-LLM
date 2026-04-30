@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Multimodal utilities for handling images and other media types in TensorRT-LLM."""
 
 from dataclasses import dataclass, field
@@ -37,25 +39,36 @@ def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
 
 @dataclass
 class MultimodalInput:
-    multimodal_hashes: List[List[int]]
-    """Hash values for multimodal data items (e.g., images).
+    """Per-logical-unit multimodal metadata for KV-cache hashing (C++ layer).
 
-    Each element is a list of 8 integers representing the hash digest of a multimodal item.
+    Indexed per logical unit (one image, video, or audio clip).
     """
+
+    multimodal_hashes: List[List[int]]
+    """Hash digest per logical unit (list of 8 int32 each)."""
 
     multimodal_positions: List[int]
-    """Starting positions of each contiguous multimodal token chunk in the token sequence.
-
-    Contains only the start position of each chunk, not all positions of multimodal tokens.
-    This is different from mm_positions elsewhere which contains all positions.
-    """
+    """Prompt position of each logical unit's first MM token."""
 
     multimodal_lengths: List[int]
-    """Length of each contiguous multimodal token chunk, including any special tokens.
+    """Per logical unit count of prompt-side MM tokens.
 
-    Each span is unique to its multimodal item and may include special tokens for some models,
-    (e.g., image_end_token, image_break_token for mistral3) mixed with the actual multimodal tokens.
+    Counts every prompt position belonging to this MM unit — both the
+    encoder-bound placeholder slots and any model-specific framing tokens
+    (e.g. Mistral's image_break/image_end inside an image). Ordinary
+    interleaved text is excluded, so the value is not a bounding-box span
+    for sparse layouts and is not always the number of encoder-output
+    embedding vectors produced for this item.
+
+    Current consumers overload this value: encoder-only split paths use it
+    as an encoder-output embedding count, the C++ KV hasher treats
+    `start + length` as a contiguous prompt span, and AutoDeploy forwards
+    it as VLM layout metadata.
     """
+    # TODO(TRTLLM-12175): split this into explicit layout fields — per-item
+    # MM-token offsets/lengths, per-item encoder-output embedding counts, and
+    # prompt-position segments or masks for sparse layouts — then retire the
+    # ambiguous `multimodal_lengths` contract.
 
     multimodal_uuids: Optional[List[Optional[str]]] = None
     """Optional user-provided UUIDs for multimodal data items.
@@ -120,11 +133,11 @@ class MultimodalInput:
 
     @classmethod
     def from_components(
-            cls,
-            mm_hashes: List[List[int]],
-            mm_positions: List[int],
-            mm_lengths: List[int],
-            mm_uuids: Optional[List[Optional[str]]] = None
+        cls,
+        mm_hashes: List[List[int]],
+        mm_positions: List[int],
+        mm_lengths: List[int],
+        mm_uuids: Optional[List[Optional[str]]] = None,
     ) -> 'MultimodalInput':
         return cls(multimodal_hashes=mm_hashes,
                    multimodal_positions=mm_positions,
@@ -142,109 +155,66 @@ class MultimodalInput:
 
 @dataclass
 class MultimodalRuntimeData:
-    """Runtime data for tracking multimodal token caching and reuse per request sequence.
+    """Runtime data for tracking multimodal embedding caching and reuse per request sequence.
 
-    This class tracks which multimodal tokens are cached vs. need to be processed
-    for each request sequence during both KV cache reuse and chunked prefill scenarios.
+    Constructed from `py_multimodal_data["multimodal_embed_mask_cumsum"]`
+    (int64 CPU cumsum populated by the producer); counts are derived via
+    three O(1) cumsum lookups. Handles non-contiguous embedding positions
+    (inline specials, interleaved text) natively.
 
     Attributes:
-        past_seen_token_num: Total number of tokens seen in previous iterations (cached)
-        mm_token_lengths: Length of each multimodal token chunk
-        mm_token_positions: Starting positions of each multimodal token chunk
+        past_seen_token_num: Total tokens already processed in previous iterations (cached)
         chunk_end_pos: End position of the current chunk for chunked prefill
-        special_token_offsets: Starting positions of special tokens in the union of all multimodal token chunks (optional, depending on the model)
+        embed_mask_cumsum: int64 prefix sum of the flat embedding-slot mask
 
-        num_unseen_mm_tokens: Number of multimodal tokens that are cached (computed)
-        num_mm_tokens_in_chunk: Number of multimodal tokens in the current chunk (computed)
-        total_mm_tokens_in_request: Total number of multimodal tokens in the request sequence (computed)
-
-        num_unseen_special_tokens: Number of special tokens that are cached (computed)
-        num_special_tokens_in_chunk: Number of special tokens in the current chunk (computed)
-        total_special_tokens_in_request: Total number of special tokens in the request sequence (computed)
+        num_cached_mm_tokens: Number of embeddings already cached (computed)
+        num_mm_tokens_in_chunk: Number of embeddings in the current chunk (computed)
+        total_embeds_in_request: Total embeddings in the request (computed)
     """
     past_seen_token_num: int
-    mm_token_lengths: List[int]
-    mm_token_positions: List[int]
     chunk_end_pos: int
-    special_token_offsets: List[int]
+    embed_mask_cumsum: torch.Tensor
 
-    num_unseen_mm_tokens: Optional[int] = None
+    num_cached_mm_tokens: Optional[int] = None
     num_mm_tokens_in_chunk: Optional[int] = None
-    total_mm_tokens_in_request: Optional[int] = None
-
-    num_unseen_special_tokens: Optional[int] = 0
-    num_special_tokens_in_chunk: Optional[int] = 0
-    total_special_tokens_in_request: Optional[int] = 0
-
-    # TODO: fine-grained control of encoder runner/cache to each mm_item
+    total_embeds_in_request: Optional[int] = None
 
     def __post_init__(self):
-        # Validate input data
-        if self.total_mm_tokens_in_request is None:
-            self.total_mm_tokens_in_request = sum(self.mm_token_lengths)
-        if len(self.mm_token_positions) != len(self.mm_token_lengths):
-            raise ValueError(
-                f"mm_token_positions ({len(self.mm_token_positions)}) and mm_token_lengths ({len(self.mm_token_lengths)}) must have the same length"
-            )
-
         if self.past_seen_token_num < 0:
             raise ValueError(
                 f"past_seen_token_num must be non-negative, got {self.past_seen_token_num}"
             )
-
-        if any(length <= 0 for length in self.mm_token_lengths):
+        if self.embed_mask_cumsum is None:
             raise ValueError(
-                f"All mm_token_lengths must be positive, got {self.mm_token_lengths}"
-            )
+                "MultimodalRuntimeData requires embed_mask_cumsum.")
 
-        if any(pos < 0 for pos in self.mm_token_positions):
-            raise ValueError(
-                f"All mm_token_positions must be non-negative, got {self.mm_token_positions}"
-            )
+        cs = self.embed_mask_cumsum
+        # int(cs[idx]) below would D2H-sync if cs lived on CUDA.
+        assert cs.device.type == "cpu", f"embed_mask_cumsum must be CPU, got {cs.device}"
+        assert cs.numel() > 0, "embed_mask_cumsum must be non-empty"
+        assert self.chunk_end_pos >= self.past_seen_token_num, (
+            f"chunk_end_pos ({self.chunk_end_pos}) < past_seen_token_num "
+            f"({self.past_seen_token_num})")
+        assert 0 <= self.past_seen_token_num <= cs.numel(), (
+            f"past_seen_token_num {self.past_seen_token_num} out of range "
+            f"[0, {cs.numel()}]")
+        assert self.chunk_end_pos <= cs.numel(), (
+            f"chunk_end_pos {self.chunk_end_pos} > cumsum length {cs.numel()}")
 
-        if self.num_unseen_mm_tokens is None or self.num_mm_tokens_in_chunk is None:
-            # Compute cached multimodal tokens based on positions and cached tokens
-            self.num_unseen_mm_tokens = 0
-            self.num_mm_tokens_in_chunk = 0
-            remainder = 0
-            for pos, length in zip(self.mm_token_positions,
-                                   self.mm_token_lengths):
-                if pos + length <= self.past_seen_token_num:
-                    self.num_unseen_mm_tokens += length
-                elif pos < self.past_seen_token_num:
-                    # Partial overlap - only count the cached portion
-                    self.num_unseen_mm_tokens += self.past_seen_token_num - pos
-                    self.num_mm_tokens_in_chunk += min(
-                        self.chunk_end_pos,
-                        pos + length) - self.past_seen_token_num
-                else:
-                    if pos + length > self.chunk_end_pos:
-                        # Partial overlap - only count the cached portion
-                        if pos < self.chunk_end_pos:
-                            self.num_mm_tokens_in_chunk += self.chunk_end_pos - pos
-                        else:
-                            remainder += length
-                    else:
-                        # Full overlap - count the entire mm item chunk
-                        self.num_mm_tokens_in_chunk += length
+        self.num_cached_mm_tokens = (int(cs[self.past_seen_token_num - 1])
+                                     if self.past_seen_token_num > 0 else 0)
+        self.num_mm_tokens_in_chunk = (int(cs[self.chunk_end_pos - 1]) -
+                                       self.num_cached_mm_tokens
+                                       if self.chunk_end_pos > 0 else 0)
+        self.total_embeds_in_request = int(cs[-1])
 
-        if len(self.special_token_offsets) > 0:
-            self.num_unseen_special_tokens = sum(
-                1 for offset in self.special_token_offsets
-                if offset < self.num_unseen_mm_tokens)
-            mm_tokens_end_pos = self.num_unseen_mm_tokens + self.num_mm_tokens_in_chunk
-            self.num_special_tokens_in_chunk = sum(
-                1 for offset in self.special_token_offsets
-                if self.num_unseen_mm_tokens <= offset < mm_tokens_end_pos)
 
-            self.total_special_tokens_in_request = len(
-                self.special_token_offsets)
-
-        if self.num_unseen_mm_tokens + self.num_mm_tokens_in_chunk + remainder > sum(
-                self.mm_token_lengths):
-            raise ValueError(
-                f"num_unseen_mm_tokens ({self.num_unseen_mm_tokens}) + num_mm_tokens_in_chunk ({self.num_mm_tokens_in_chunk}) + remainder ({remainder}) must be less than or equal to sum of mm_token_lengths ({sum(self.mm_token_lengths)})"
-            )
+# Keys under `MultimodalParams.multimodal_data` that are CPU-resident metadata
+# and must never be moved to GPU by `MultimodalParams.to_device`.
+# Extend only after auditing each key's consumers.
+_CPU_ONLY_MULTIMODAL_DATA_KEYS = frozenset({
+    "multimodal_embed_mask_cumsum",
+})
 
 
 @dataclass
@@ -373,7 +343,14 @@ class MultimodalParams:
                         f"Failed to restore tensor from shared tensor dict: {e}"
                     )
             else:
-                # Regular dictionary - recursively process values
+                # Regular dictionary - recursively process values.
+                if operation == "to_device":
+                    return {
+                        key: (value if key in _CPU_ONLY_MULTIMODAL_DATA_KEYS
+                              else self._apply_tensor_operation(
+                                  value, operation, **kwargs))
+                        for key, value in input_data.items()
+                    }
                 return {
                     key: self._apply_tensor_operation(value, operation,
                                                       **kwargs)
@@ -538,6 +515,14 @@ class MultimodalParams:
             else:
                 # Check if the target key exists and move it to device
                 if isinstance(current, dict) and target_key in current:
+                    if target_key in _CPU_ONLY_MULTIMODAL_DATA_KEYS:
+                        logger.warning_once(
+                            "to_device('%s') skipped: key is CPU-only "
+                            "multimodal metadata.",
+                            keyword_path,
+                            key="mm_cpu_only_skip",
+                        )
+                        continue
                     current[target_key] = self._apply_tensor_operation(
                         current[target_key],
                         "to_device",
@@ -604,7 +589,7 @@ def apply_mm_hashes(
     mm_uuids: Optional[Dict[str, List[Optional[str]]]] = None,
     hash_lib=default_hasher
 ) -> Tuple[Dict[str, List[str]], Optional[List[Optional[str]]]]:
-    """Apply hashing to multimodal data items, combining UUID with content when provided.
+    """Apply hashing to multimodal data, one hash per multimodal item.
 
     When a UUID is provided for an item, the hash is computed from both the UUID
     and the content together: BLAKE3(UUID || Content). This ensures:
@@ -751,21 +736,28 @@ def int32_to_hexdigest(int32_values: List[int]) -> str:
     return ''.join(result)
 
 
-def find_mm_token_lengths(mm_data: Dict[str, Any],
-                          input_processor: Any) -> List[int]:
-    """Get the maximum contiguous multimodal token lengths from multimodal data items.
+def find_mm_token_lengths(
+    mm_data: Dict[str, Any],
+    input_processor: Any,
+    *,
+    multimodal_data: Optional[Dict[str, Any]] = None,
+) -> Dict[str, List[int]]:
+    """Get the token lengths of each multimodal item.
 
     Returns the total token count for each multimodal item, including any special tokens
     (e.g., image_begin, image_end, image_break) that may be mixed with the actual
-    multimodal content tokens. This mm_token_lengths represents the full contiguous chunk from beginning
+    multimodal content tokens. This mm_token_lengths represents the full chunk from beginning
     to end, not just pure image/video/audio tokens.
-    """
 
+    """
     mm_items = {
         modality: items if isinstance(items, list) else [items]
         for modality, items in mm_data.items()
     }
     num_mm_tokens = {}
+
+    mm_video_dict = (multimodal_data or {}).get("video") or {}
+    video_grid_thw = mm_video_dict.get("video_grid_thw")
 
     for modality, items in mm_items.items():
         if not hasattr(input_processor, f"get_num_tokens_per_{modality}"):
@@ -773,8 +765,19 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
                 f"Input processor {type(input_processor).__name__} does not have 'get_num_tokens_per_{modality}' method required for multimodal hashing."
             )
 
+        video_grid_thw_for_items = None
+        if modality == "video" and video_grid_thw is not None:
+            if len(video_grid_thw) == len(items):
+                video_grid_thw_for_items = video_grid_thw
+            else:
+                logger.warning(
+                    "find_mm_token_lengths: video_grid_thw row count "
+                    f"({len(video_grid_thw)}) does not match number of "
+                    f"videos in mm_data ({len(items)}); falling back to "
+                    "per-item recompute without video_grid_thw.")
+
         modality_token_lengths = []
-        for item in items:
+        for idx, item in enumerate(items):
             if modality == "image":
                 num_tokens = input_processor.get_num_tokens_per_image(
                     image=item, )
@@ -783,8 +786,17 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
                 if isinstance(item, tensorrt_llm.inputs.utils.VideoData):
                     item = item.frames
                 assert isinstance(item, list), "Video must be a list of frames"
+                call_kwargs = {"video": item}
+                if video_grid_thw_for_items is not None:
+                    # TODO(TRTLLM-11951): Replace this Qwen-VL-specific
+                    # metadata wiring with a generic per-item processed
+                    # metadata route. Keep this for now: Qwen3-VL needs the
+                    # processor-produced video_grid_thw for correct video token
+                    # counts.
+                    call_kwargs["video_grid_thw"] = video_grid_thw_for_items[
+                        idx]
                 num_tokens = input_processor.get_num_tokens_per_video(
-                    video=item, )
+                    **call_kwargs)
                 modality_token_lengths.append(num_tokens)
             elif modality == "audio":
                 num_tokens = input_processor.get_num_tokens_per_audio(
@@ -798,99 +810,196 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
     return num_mm_tokens  # flatten all mm instances to a single list
 
 
-def find_mm_token_positions(
-    input_ids: Union[torch.Tensor, List[int], np.ndarray],
-    num_mm_tokens: List[int],
-    vocab_size: Optional[int] = None,
-    mm_token_ids: Optional[torch.Tensor] = None,
-    mm_special_token_ids: Optional[torch.Tensor] = None
-) -> Tuple[List[int], List[int]]:
-    """Get starting positions of contiguous multimodal token chunks using known lengths.
+# Keys in py_multimodal_data that carry metadata (not vision/audio content).
+# If py_multimodal_data has ONLY these keys, the request has no real MM
+# payload (e.g. mrope-only warmup on an mrope-enabled model) and the
+# check_mm_embed_cumsum_if_needed gate short-circuits.
+_MM_METADATA_ONLY_KEYS = frozenset({
+    "mrope_config",
+    "multimodal_embed_mask_cumsum",
+    "special_token_offsets",
+    "layout_metadata",
+})
 
-    This function finds multimodal tokens (with IDs > vocab_size or matching mm_token_ids)
-    and uses the provided lengths in num_mm_tokens to identify where each contiguous chunk starts.
-    Each chunk in num_mm_tokens is assumed to be a contiguous block of multimodal tokens for each multimodal item, and may include special tokens (e.g., image_begin, image_end, image_break) within the chunk.
 
-    Note: at least one of vocab_size or mm_token_ids must be provided. If mm_token_ids
-    is provided, vocab_size is ignored.
+def _has_mm_payload_keys(py_multimodal_data: Optional[dict]) -> bool:
+    """True iff py_multimodal_data contains vision/video/audio content keys.
 
-    Args:
-        input_ids: Token sequence (tensor, list, or numpy array)
-        num_mm_tokens: List of contiguous chunk lengths for each multimodal item
-        vocab_size: Size of the model's vocabulary (used to identify tokens > vocab_size)
-        mm_token_ids: Specific token IDs that represent multimodal tokens
-        mm_special_token_ids: Specific token IDs that represent special multimodal tokens
+    Metadata-only payloads (`mrope_config` on mrope warmup,
+    `multimodal_embed_mask_cumsum` alone, `special_token_offsets` alone,
+    `layout_metadata`) return False — those don't carry real MM content
+    that the model needs to fuse embeddings for.
+    """
+    if not py_multimodal_data:
+        return False
+    return bool(set(py_multimodal_data.keys()) - _MM_METADATA_ONLY_KEYS)
 
-    Returns:
-        List of starting positions for each contiguous multimodal token
-        (Optional) List of starting positions of special tokens in the union of all multimodal token chunks
+
+# TODO(TRTLLM-11951): fold this gate into MultimodalRuntimeData.__post_init__
+# so new call sites cannot forget to invoke it.
+def check_mm_embed_cumsum_if_needed(
+    py_multimodal_data: Optional[dict],
+    *,
+    begin_compute: int,
+    end_compute: int,
+    prompt_len: int,
+) -> None:
+    """Raise iff chunked prefill or KV-cache reuse is in effect AND MM data is present without embed cumsum.
+
+    Triggers on the two cases where the scheduler advances less than the
+    whole prompt in one step:
+      * `begin_compute > 0` — KV-cache reuse: a prefix was served from cache, OR
+      * `end_compute < prompt_len` — chunked prefill: the scheduler split the
+        remaining tokens across iterations.
+
+    Both cases require `multimodal_embed_mask_cumsum` to derive per-chunk
+    embedding counts in `MultimodalRuntimeData`. Full-prefill, no-reuse
+    iterations don't: `MultimodalRuntimeData` stays `None` and
+    `find_input_mm_embeds` handles the full payload.
+
+    When the cumsum is missing outside the chunked-prefill / KV-reuse cases,
+    log a one-shot warning via `logger.warning_once` and proceed.
+    """
+    assert 0 <= begin_compute <= end_compute <= prompt_len, (
+        f"invalid window: {begin_compute}..{end_compute}/{prompt_len}")
+    if not _has_mm_payload_keys(py_multimodal_data):
+        return
+    if py_multimodal_data.get("multimodal_embed_mask_cumsum") is not None:
+        return
+
+    is_chunked_or_reused = (begin_compute > 0) or (end_compute < prompt_len)
+    mm_keys = set(py_multimodal_data.keys()) - _MM_METADATA_ONLY_KEYS
+
+    if is_chunked_or_reused:
+        raise ValueError(
+            f"Request requires multimodal_embed_mask_cumsum for chunked prefill "
+            f"or KV-cache reuse (begin_compute={begin_compute}, "
+            f"end_compute={end_compute}, prompt_len={prompt_len}) but "
+            f"py_multimodal_data has keys {mm_keys} with no cumsum. The input "
+            f"processor may be missing a discriminator (override "
+            f"get_mm_token_ids or ensure get_vocab_size "
+            f"resolves).")
+
+    logger.warning_once(
+        "multimodal_embed_mask_cumsum missing on multimodal request (keys=%s); "
+        "running without mask-aware accounting. This is fine for full-prefill "
+        "iterations but will fail if this request is later chunked or reuses "
+        "KV cache.",
+        mm_keys,
+        key="mm_embed_cumsum_missing_non_partial",
+    )
+
+
+def _as_cpu_tensor(
+        input_ids: Union[torch.Tensor, List[int], np.ndarray]) -> torch.Tensor:
+    """Coerce input_ids to a CPU torch.Tensor without copying when possible."""
+    input_ids_tensor = torch.as_tensor(input_ids)
+    if input_ids_tensor.device.type != "cpu":
+        raise ValueError("prompt_token_ids must be CPU-resident when computing "
+                         f"multimodal metadata, got {input_ids_tensor.device}.")
+    return input_ids_tensor
+
+
+def _compute_mm_masks(
+    input_ids: torch.Tensor,
+    vocab_size: Optional[int],
+    mm_token_ids: Optional[torch.Tensor],
+    mm_special_token_ids: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Compute MM masks in a single pass.
+
+    Returns `(mm_mask, embed_mask, special_mask)` where:
+      - `mm_mask[i]` is True iff position i is any MM token (embed slot OR special)
+      - `embed_mask[i]` is True iff position i is an embed slot (specials excluded)
+      - `special_mask[i]` is True iff position i is a special (None when
+        `mm_special_token_ids` is not provided)
+
+    At least one of `vocab_size` or `mm_token_ids` must be provided; if
+    both, `mm_token_ids` takes precedence (matching legacy behavior).
+
+    Example: `input_ids=[1, 5, 5, 6, 5, 7, 2]`,
+    `mm_token_ids=[5]`, `mm_special_token_ids=[6, 7]` gives
+    `embed_mask=[F, T, T, F, T, F, F]` and
+    `mm_mask=[F, T, T, T, T, T, F]`.
+
+    Each call performs at most two full-sequence `isin` scans — one for
+    regular MM tokens and one for specials — and reuses them to derive all
+    three masks. Callers that need multiple masks should share one invocation
+    rather than recomputing predicates.
     """
     if mm_token_ids is None and vocab_size is None:
         raise ValueError(
-            "Provide either mm_token_ids or vocab_size to find multimodal token positions"
+            "Provide either mm_token_ids or vocab_size to compute multimodal masks"
         )
     if mm_token_ids is not None and vocab_size is not None:
         logger.debug(
             "Both mm_token_ids and vocab_size are provided, using mm_token_ids and ignoring vocab_size"
         )
 
-    # Convert input_ids to tensor if needed
-    if not isinstance(input_ids, torch.Tensor):
-        if isinstance(input_ids, list):
-            input_ids = torch.tensor(input_ids)
-        elif isinstance(input_ids, np.ndarray):
-            input_ids = torch.from_numpy(input_ids)
-
-    # Create mask for multimodal tokens including special tokens if provided
-    if mm_token_ids is None:
-        mm_mask = input_ids >= vocab_size
-        if mm_special_token_ids is not None:
-            mm_special_token_ids = mm_special_token_ids.to(
-                device=input_ids.device, dtype=input_ids.dtype)
-            mm_mask = mm_mask | torch.isin(input_ids, mm_special_token_ids)
+    if mm_special_token_ids is not None:
+        mm_special_token_ids = mm_special_token_ids.to(device=input_ids.device,
+                                                       dtype=input_ids.dtype)
+        special_mask = torch.isin(input_ids, mm_special_token_ids)
     else:
+        special_mask = None
+
+    if mm_token_ids is not None:
         mm_token_ids = mm_token_ids.to(device=input_ids.device,
                                        dtype=input_ids.dtype)
         if mm_token_ids.ndim != 1:
             raise ValueError("mm_token_ids must be a 1D tensor")
-        if mm_special_token_ids is not None:
-            mm_special_token_ids = mm_special_token_ids.to(
-                device=input_ids.device, dtype=input_ids.dtype)
-            mm_token_ids = torch.unique(
-                torch.cat([mm_token_ids, mm_special_token_ids]))
-        else:
-            mm_token_ids = torch.unique(mm_token_ids)
-        mm_mask = torch.isin(input_ids, mm_token_ids)
+        embed_mask = torch.isin(input_ids, mm_token_ids)
+    else:
+        embed_mask = input_ids >= vocab_size
 
-    # If no multimodal tokens found, return empty list
+    if special_mask is not None:
+        embed_mask &= ~special_mask
+
+    mm_mask = embed_mask if special_mask is None else embed_mask | special_mask
+    return mm_mask, embed_mask, special_mask
+
+
+def _find_mm_token_start_pos_from_masks(
+    mm_mask: torch.Tensor,
+    special_mask: Optional[torch.Tensor],
+    num_mm_tokens: List[int],
+) -> Tuple[List[int], List[int]]:
+    """Compute indices where each logical multimodal unit starts from precomputed masks.
+
+    Args:
+        mm_mask: Boolean tensor; True for multimodal tokens.
+        special_mask: Optional boolean tensor for special MM tokens.
+        num_mm_tokens: List of multimodal tokens per logical unit.
+
+    Returns:
+        start_positions: Indices where each logical MM unit starts.
+        start_special_token_positions: Indices (within MM tokens) of special tokens.
+
+    Example: if MM prompt positions are `[1, 2, 3, 4, 5]` and prompt
+    positions `[3, 5]` are special, returns `start_positions=[1]` and
+    `start_special_token_positions=[2, 4]`.
+    """
     if not torch.any(mm_mask):
-        return []
+        return [], []
 
-    # Get positions of all multimodal tokens
-    mm_positions = torch.where(mm_mask)[0].tolist()
-    assert len(mm_positions) == sum(
-        num_mm_tokens
-    ), f"Number of multimodal tokens does not match sum of all lengths"
+    mm_positions = torch.where(mm_mask)[0]
 
-    # Use num_mm_tokens to find the starting position of each chunk
-    start_positions = []
-    current_position = 0
-
-    # Process each expected length
-    for length in num_mm_tokens:
-        if current_position < len(mm_positions):
-            # Add the starting position of this chunk
-            start_positions.append(mm_positions[current_position])
-            # Move to the next chunk
-            current_position += length
-
-    start_special_token_positions = []
-    if mm_special_token_ids is not None:
-        mm_token_ids = input_ids[mm_positions]
-        special_token_mask_in_mm = torch.isin(mm_token_ids,
-                                              mm_special_token_ids)
+    if special_mask is not None:
         start_special_token_positions = torch.where(
-            special_token_mask_in_mm)[0].tolist()
+            special_mask[mm_positions])[0].tolist()
+    else:
+        start_special_token_positions = []
+
+    lengths_t = torch.tensor(num_mm_tokens)
+    assert mm_positions.numel() == lengths_t.sum().item(), (
+        f"Number of multimodal tokens ({mm_positions.numel()}) does not match "
+        f"sum of per-unit lengths ({lengths_t.sum().item()}): "
+        f"num_mm_tokens={num_mm_tokens}")
+
+    offsets = torch.zeros(len(num_mm_tokens), dtype=torch.long)
+    if len(num_mm_tokens) > 1:
+        torch.cumsum(lengths_t[:-1], dim=0, out=offsets[1:])
+    start_positions = mm_positions[offsets].tolist()
 
     return start_positions, start_special_token_positions
 

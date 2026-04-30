@@ -803,14 +803,14 @@ files = [
 
 [[package]]
 name = "fsspec"
-version = "2026.3.0"
+version = "2026.4.0"
 description = "File-system specification"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "fsspec-2026.3.0-py3-none-any.whl", hash = "sha256:d2ceafaad1b3457968ed14efa28798162f1638dbb5d2a6868a2db002a5ee39a4"},
-    {file = "fsspec-2026.3.0.tar.gz", hash = "sha256:1ee6a0e28677557f8c2f994e3eea77db6392b4de9cd1f5d7a9e87a0ae9d01b41"},
+    {file = "fsspec-2026.4.0-py3-none-any.whl", hash = "sha256:11ef7bb35dab8a394fde6e608221d5cf3e8499401c249bebaeaad760a1a8dec2"},
+    {file = "fsspec-2026.4.0.tar.gz", hash = "sha256:301d8ac70ae90ef3ad05dcf94d6c3754a097f9b5fe4667d2787aa359ec7df7e4"},
 ]
 
 [package.extras]
@@ -1464,14 +1464,14 @@ files = [
 
 [[package]]
 name = "perf-analyzer"
-version = "2.59.1"
+version = "2.60.0"
 description = "Triton Performance Analyzer"
 optional = false
 python-versions = "*"
 groups = ["main"]
 files = [
-    {file = "perf_analyzer-2.59.1-py3-none-manylinux_2_38_aarch64.whl", hash = "sha256:493ac232e55fa4467aeb007aafe48e0ace67198b5012d4a43489c5d5d543fed4"},
-    {file = "perf_analyzer-2.59.1-py3-none-manylinux_2_38_x86_64.whl", hash = "sha256:1719ad97306f442eed16a8abe7930ab81cd84c61658b8bbe864bee6520c7a656"},
+    {file = "perf_analyzer-2.60.0-py3-none-manylinux_2_38_aarch64.whl", hash = "sha256:c2ece0adb7760ea1abc258222d80bf8e367fa9639401406b96da2c9b55131d29"},
+    {file = "perf_analyzer-2.60.0-py3-none-manylinux_2_38_x86_64.whl", hash = "sha256:23ef56b107ae9233e5cf09fbdf508dd9b936a52f1bae2f63f53c8117087b3f25"},
 ]
 
 [[package]]
@@ -2388,14 +2388,14 @@ propcache = ">=0.2.1"
 
 [[package]]
 name = "zope-event"
-version = "6.1"
+version = "6.2"
 description = "Very basic event publishing system"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "zope_event-6.1-py3-none-any.whl", hash = "sha256:0ca78b6391b694272b23ec1335c0294cc471065ed10f7f606858fc54566c25a0"},
-    {file = "zope_event-6.1.tar.gz", hash = "sha256:6052a3e0cb8565d3d4ef1a3a7809336ac519bc4fe38398cb8d466db09adef4f0"},
+    {file = "zope_event-6.2-py3-none-any.whl", hash = "sha256:5e755153ac4faf64c10a4b6dd3307680166a3edf65b38df22df592610f8fa874"},
+    {file = "zope_event-6.2.tar.gz", hash = "sha256:b97d5d6327067ee6b9dfcbdf606ade9ade70991e19c162e808ea39e5fcf0f8d3"},
 ]
 
 [package.extras]
