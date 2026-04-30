@@ -256,13 +256,14 @@ ELEM_TOL = {
 @pytest.mark.parametrize("next_n", [1, 2, 3])
 @pytest.mark.parametrize("num_heads", [64])
 @pytest.mark.parametrize("avg_ctx", [256, 4096, 8192, 16384, 32768])
+@pytest.mark.parametrize("phys_block_kv", [32, 64, 128])
 @pytest.mark.parametrize(
     "epi_dtype, output_dtype",
     [
-        (torch.float32, torch.float32),  # Stage 0
+        # (torch.float32, torch.float32),  # Stage 0
         # (torch.bfloat16, torch.bfloat16),     # Stage 1: packed FMA bf16 path
         # (torch.float16, torch.float16),       # Stage 1: packed FMA fp16 path
-        # (torch.float32, torch.bfloat16),      # Stage 2: cast path
+        (torch.float32, torch.bfloat16),  # Stage 2: cast path
         # (torch.float32, torch.float16),       # Stage 2: cast path
     ],
 )
@@ -281,17 +282,22 @@ def test_cute_dsl_fp4_paged_mqa_logits(
     next_n,
     num_heads,
     avg_ctx,
+    phys_block_kv,
     epi_dtype,
     output_dtype,
     num_epi_subtiles,
     fix_length,
 ):
-    """Compare CuTe DSL FP4 kernel output against a pure PyTorch reference."""
+    """Compare CuTe DSL FP4 kernel output against a pure PyTorch reference.
+
+    Sweeps phys_block_kv ∈ {32, 64, 128} so the paged multi-block TMA path
+    (phys_block_kv < compute tile = 128, NUM_BLOCKS_PER_MMA > 1) is covered
+    in the same test as the single-block path.
+    """
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
 
     head_dim = 128
-    phys_block_kv = 128
     max_model_len = max(avg_ctx * 2, 2048)
     device = "cuda"
 
@@ -482,166 +488,4 @@ def test_cute_dsl_fp4_paged_mqa_logits(
     diff = calc_diff(logits_clean, ref_clean)
     assert diff < 0.02, (
         f"cosine diff {diff} > 0.02 (B={batch_size}, next_n={next_n}, avg_ctx={avg_ctx})"
-    )
-
-
-@skip_not_sm100
-@pytest.mark.parametrize("batch_size", [1, 4, 32])
-@pytest.mark.parametrize("next_n", [1, 2, 3])
-@pytest.mark.parametrize("avg_ctx", [256, 4096, 8192, 16384, 32768])
-@pytest.mark.parametrize("phys_block_kv", [32, 64])
-def test_cute_dsl_fp4_paged_mqa_logits_multi_block(
-    batch_size,
-    next_n,
-    avg_ctx,
-    phys_block_kv,
-):
-    """Validate paged multi-block TMA path: phys_block_kv < compute tile (128).
-
-    Stage 0: fp32/fp32, num_epi_subtiles=1 only.
-    """
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-
-    num_heads = 64
-    head_dim = 128
-    compute_block_kv = 128
-    max_model_len = max(avg_ctx * 2, 2048)
-    epi_dtype = torch.float32
-    output_dtype = torch.float32
-    num_epi_subtiles = 1
-    device = "cuda"
-
-    context_lens = torch.full(
-        (batch_size,),
-        avg_ctx,
-        dtype=torch.int32,
-        device=device,
-    )
-
-    num_blocks_per_seq = ceil_div_tensor(context_lens, phys_block_kv)
-    total_blocks = num_blocks_per_seq.sum().item()
-    num_total_blocks = total_blocks + batch_size * 2
-    max_blocks_per_seq = num_blocks_per_seq.max().item()
-
-    block_table = torch.zeros(
-        (batch_size, max_blocks_per_seq),
-        dtype=torch.int32,
-        device=device,
-    )
-    block_idx_pool = torch.randperm(num_total_blocks, device=device, dtype=torch.int32)
-    offset = 0
-    for i, n_blks in enumerate(num_blocks_per_seq.tolist()):
-        block_table[i, :n_blks] = block_idx_pool[offset : offset + n_blks]
-        offset += n_blks
-
-    q = torch.randn(
-        (batch_size, next_n, num_heads, head_dim),
-        device=device,
-        dtype=torch.bfloat16,
-    )
-    kv_cache = torch.randn(
-        (num_total_blocks, phys_block_kv, 1, head_dim),
-        device=device,
-        dtype=torch.bfloat16,
-    )
-    weights = torch.randn(
-        (batch_size * next_n, num_heads),
-        device=device,
-        dtype=torch.float32,
-    )
-
-    q_packed, sf_q_packed = per_token_cast_to_fp4(
-        q.view(-1, head_dim),
-        use_ue8m0=True,
-        gran_k=32,
-        use_packed_ue8m0=True,
-    )
-    q_fp4 = q_packed.view(torch.uint8).view(batch_size, next_n, num_heads, head_dim // 2)
-    sf_q = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
-    q_simulated = (
-        cast_back_from_fp4(
-            q_packed,
-            sf_q_packed,
-            gran_k=32,
-            use_packed_ue8m0=True,
-        )
-        .view(batch_size, next_n, num_heads, head_dim)
-        .to(torch.bfloat16)
-    )
-
-    kv_fused, kv_simulated = kv_cache_cast_to_fp4(kv_cache)
-
-    # DSL scheduler counts compute tiles (always 128), not pages.
-    num_sms = deep_gemm.get_num_sms()
-    schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(context_lens, compute_block_kv, num_sms)
-
-    # Use fp32 inputs to ref so its matmul is fp32; bf16 matmul masks the
-    # kernel's true precision (see Stage 0 test for explanation).
-    ref = _ref_paged_mqa_logits(
-        q_simulated.float(),
-        kv_simulated.float(),
-        weights,
-        context_lens,
-        block_table,
-        max_model_len=max_model_len,
-    )
-
-    logits = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
-        q_fp4,
-        sf_q,
-        kv_fused,
-        weights,
-        context_lens,
-        block_table,
-        schedule_meta,
-        max_model_len,
-        num_epi_subtiles=num_epi_subtiles,
-        epi_dtype=epi_dtype,
-        output_dtype=output_dtype,
-    )
-
-    assert logits.dtype == output_dtype
-
-    positions = (
-        torch.arange(max_model_len, device=device).unsqueeze(0).expand(batch_size * next_n, -1)
-    )
-    offsets = torch.arange(batch_size * next_n, device=device)
-    limits = (context_lens[offsets // next_n] - next_n + offsets % next_n).unsqueeze(1)
-    neginf_mask = ~(positions <= limits)
-
-    logits_masked = logits.float().masked_fill(neginf_mask, 0)
-    ref_masked = ref.float().masked_fill(neginf_mask, 0)
-    finite = torch.isfinite(logits_masked) & torch.isfinite(ref_masked)
-    logits_clean = logits_masked.masked_fill(~finite, 0)
-    ref_clean = ref_masked.masked_fill(~finite, 0)
-
-    atol, rtol = ELEM_TOL[(epi_dtype, output_dtype)]
-
-    valid = (~neginf_mask) & finite
-    elem_abs = (logits_clean - ref_clean).abs()[valid]
-    if elem_abs.numel() > 0:
-        print(
-            f"[fp4-multi-block] B={batch_size} next_n={next_n} "
-            f"avg_ctx={avg_ctx} phys_block_kv={phys_block_kv} -> "
-            f"max_abs={elem_abs.max().item():.3e} "
-            f"mean_abs={elem_abs.mean().item():.3e}"
-        )
-
-    torch.testing.assert_close(
-        logits_clean,
-        ref_clean,
-        atol=atol,
-        rtol=rtol,
-        msg=lambda m: (
-            f"{m}\nB={batch_size}, next_n={next_n}, avg_ctx={avg_ctx}, "
-            f"phys_block_kv={phys_block_kv}"
-        ),
-    )
-
-    diff = calc_diff(logits_clean, ref_clean)
-    assert diff < 0.02, (
-        f"cosine diff {diff} > 0.02 "
-        f"(B={batch_size}, next_n={next_n}, "
-        f"avg_ctx={avg_ctx}, phys_block_kv={phys_block_kv})"
     )
