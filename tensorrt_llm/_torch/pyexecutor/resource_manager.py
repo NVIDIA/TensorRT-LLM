@@ -8,7 +8,11 @@ from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
                     Set, Tuple, Union)
 
 import torch
-from mpi4py import MPI
+
+try:
+    from mpi4py import MPI
+except ImportError:
+    MPI = None  # callers gate on ENABLE_MULTI_DEVICE / mpi_disabled()
 
 import tensorrt_llm
 import tensorrt_llm.bindings

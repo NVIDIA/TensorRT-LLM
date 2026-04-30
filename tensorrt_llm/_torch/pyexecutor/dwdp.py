@@ -4,7 +4,11 @@ import torch
 import torch.nn as nn
 from cuda.bindings import driver as cuda_driver
 from cuda.bindings import runtime as cudart
-from mpi4py.MPI import COMM_WORLD
+
+try:
+    from mpi4py.MPI import COMM_WORLD
+except ImportError:
+    COMM_WORLD = None  # only used when ENABLE_MULTI_DEVICE / DwDP is active
 
 from tensorrt_llm._torch.distributed import MPIDist
 from tensorrt_llm._utils import global_mpi_rank, nvtx_range
