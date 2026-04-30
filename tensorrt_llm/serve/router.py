@@ -21,23 +21,25 @@ from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Union
 
 import aiohttp
 
-from tensorrt_llm.bindings.internal.batch_manager import (BlockKey,
-                                                          BlockKeyHasher)
 from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig,
                                               RouterConfig, ServerRole)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.runtime.kv_cache_hash import (KV_CACHE_HASH_ALGO_DEFAULT,
-                                                KV_CACHE_HASH_ALGO_V1,
-                                                KV_CACHE_HASH_ALGO_V2,
-                                                KV_CACHE_HASH_ALGO_V2_SHA256_64,
-                                                truncate_sha256_hash_to_int64)
+from tensorrt_llm.runtime import kv_cache_hash
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
     Block as V2Block
-from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
-    RootBlock as V2RootBlock
+from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
+    ReuseScope, RootBlock as V2RootBlock)
 from tensorrt_llm.serve.metadata_server import JsonDictionary
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest)
+
+KV_CACHE_HASH_ALGO_DEFAULT = kv_cache_hash.KV_CACHE_HASH_ALGO_DEFAULT
+KV_CACHE_HASH_ALGO_V1 = kv_cache_hash.KV_CACHE_HASH_ALGO_V1
+KV_CACHE_HASH_ALGO_V2 = kv_cache_hash.KV_CACHE_HASH_ALGO_V2
+KV_CACHE_HASH_ALGO_V2_SHA256_64 = kv_cache_hash.KV_CACHE_HASH_ALGO_V2_SHA256_64
+get_cache_salt_id = kv_cache_hash.get_cache_salt_id
+hash_v1_block_key = kv_cache_hash.hash_v1_block_key
+truncate_sha256_hash_to_int64 = kv_cache_hash.truncate_sha256_hash_to_int64
 
 OpenAIRequest = Union[CompletionRequest, ChatCompletionRequest]
 BlockHash = Union[int, str]
@@ -724,15 +726,18 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
 
 
 def block_key_hasher(token_ids: list[int],
-                     parent_hash: Optional[int] = None) -> int:
-    block_key = BlockKey(token_ids)
-    return BlockKeyHasher.hash(block_key,
-                               0 if parent_hash is None else parent_hash)
+                     parent_hash: Optional[int] = None,
+                     cache_salt_id: Optional[int] = None) -> int:
+    return hash_v1_block_key(
+        token_ids,
+        parent_hash=0 if parent_hash is None else parent_hash,
+        cache_salt_id=cache_salt_id)
 
 
 def v2_sha256_block_hasher(token_ids: list[int],
-                           parent_hash: Optional[str] = None) -> str:
-    parent_key = (V2RootBlock.make_key(None)
+                           parent_hash: Optional[str] = None,
+                           cache_salt_id: Optional[int] = None) -> str:
+    parent_key = (V2RootBlock.make_key(ReuseScope(salt=cache_salt_id))
                   if parent_hash is None else bytes.fromhex(parent_hash))
     return V2Block.make_key(parent_key, token_ids).hex()
 
@@ -818,9 +823,10 @@ class BlockHashMixin:
         return token_lists
 
     def _compute_block_hashes(
-            self,
-            token_lists: list[list[int]],
-            hash_algo: str = KV_CACHE_HASH_ALGO_DEFAULT
+        self,
+        token_lists: list[list[int]],
+        hash_algo: str = KV_CACHE_HASH_ALGO_DEFAULT,
+        cache_salt_id: Optional[int] = None,
     ) -> list[list[BlockHash]]:
         if hash_algo == KV_CACHE_HASH_ALGO_V1:
             block_hasher = block_key_hasher
@@ -830,7 +836,8 @@ class BlockHashMixin:
             block_hashes: list[list[BlockHash]] = []
             for token_list in token_lists:
                 hash_list = []
-                parent_key = V2RootBlock.make_key(None)
+                parent_key = V2RootBlock.make_key(
+                    ReuseScope(salt=cache_salt_id))
                 for t in range(0, len(token_list) - 1, self._tokens_per_block):
                     t_end = min(t + self._tokens_per_block, len(token_list) - 1)
                     parent_key = V2Block.make_key(parent_key,
@@ -850,7 +857,8 @@ class BlockHashMixin:
                 t_end = min(t + self._tokens_per_block, len(token_list) - 1)
                 hash_list.append(
                     block_hasher(token_list[t:t_end],
-                                 None if t == 0 else hash_list[-1]))
+                                 None if t == 0 else hash_list[-1],
+                                 cache_salt_id))
             block_hashes.append(hash_list)
         return block_hashes
 
@@ -870,12 +878,14 @@ class BlockHashMixin:
 
     def _tokenize_and_compute_block_hashes_by_algo(
             self, request: OpenAIRequest,
-            hash_algos: Iterable[str]
+            hash_algos: Iterable[str],
+            cache_salt_id: Optional[int] = None,
     ) -> tuple[list[list[int]], dict[str, list[list[BlockHash]]]]:
         """Synchronous tokenize + per-algorithm block hashes for thread offload."""
         token_lists = self._tokenize(request)
         return token_lists, {
-            hash_algo: self._compute_block_hashes(token_lists, hash_algo)
+            hash_algo: self._compute_block_hashes(
+                token_lists, hash_algo, cache_salt_id=cache_salt_id)
             for hash_algo in set(hash_algos)
         }
 
@@ -886,6 +896,11 @@ class BlockHashMixin:
         Usable as input to ``_compute_block_hashes``.
         """
         return [[ord(c) for c in text] for text in texts]
+
+    @staticmethod
+    def _get_request_cache_salt_id(request: OpenAIRequest) -> Optional[int]:
+        cache_salt = getattr(request, "cache_salt", None)
+        return None if cache_salt is None else get_cache_salt_id(cache_salt)
 
 
 class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
@@ -931,6 +946,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             if not servers:
                 raise ValueError(
                     f"No available servers after excluding {exclude_server}")
+        cache_salt_id = self._get_request_cache_salt_id(request)
         hash_algo_by_server = {
             server: await self._get_server_hash_algo(server)
             for server in servers
@@ -944,7 +960,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         # dispatch HTTP traffic to the CTX/GEN workers meanwhile.
         token_lists, block_hashes_by_algo = await asyncio.to_thread(
             self._tokenize_and_compute_block_hashes_by_algo, request,
-            hash_algo_by_server.values())
+            hash_algo_by_server.values(), cache_salt_id)
         padded_tokens_by_algo = {
             hash_algo:
             max(

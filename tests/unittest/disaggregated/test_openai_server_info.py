@@ -37,4 +37,11 @@ async def test_server_info_includes_effective_kv_cache_hash_algo():
     server.generator.args.kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=True)
     response = await server.get_server_info()
     content = json.loads(response.body)
+    assert content["kv_cache_hash_algo"] == KV_CACHE_HASH_ALGO_V1
+
+    server.generator.args.kv_cache_config = KvCacheConfig(
+        use_kv_cache_manager_v2=True, kv_cache_event_hash_algo=KV_CACHE_HASH_ALGO_V2
+    )
+    response = await server.get_server_info()
+    content = json.loads(response.body)
     assert content["kv_cache_hash_algo"] == KV_CACHE_HASH_ALGO_V2

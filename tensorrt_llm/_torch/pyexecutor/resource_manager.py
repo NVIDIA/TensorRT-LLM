@@ -3062,11 +3062,13 @@ class KVCacheManagerV2(BaseResourceManager):
         # resize() requires capacity >= history_length; clamp for safety.
         target_capacity = max(kv_cache.capacity, history_length)
         try:
-            return kv_cache.resize(target_capacity, history_length=history_length)
+            return kv_cache.resize(target_capacity,
+                                   history_length=history_length)
         except Exception as e:
             logger.warning(
                 f"trim_to_history failed for req {req.py_request_id} "
-                f"(capacity={kv_cache.capacity}, target_history={history_length}): {e}")
+                f"(capacity={kv_cache.capacity}, target_history={history_length}): {e}"
+            )
             return False
 
     def revert_allocate_generation(self, req: LlmRequest) -> None:
@@ -3883,6 +3885,7 @@ class KVCacheManagerV2(BaseResourceManager):
                          request_id: int,
                          lora_task_id: int | None,
                          input_tokens: Sequence[TokenIdExt] | None,
+                         *,
                          cache_salt_id: int | None = None):
         assert request_id not in self.kv_cache_map, f"KV cache for request {request_id} already exists"
         if self.index_mapper.num_free_slots() == 0:

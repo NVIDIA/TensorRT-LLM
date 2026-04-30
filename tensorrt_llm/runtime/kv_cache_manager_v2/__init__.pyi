@@ -271,6 +271,7 @@ class _KVCache:
         reuse_match: Any | None,
         id: Any,
         custom_priority_callback: Callable[[int, Any], Priority],
+        cache_salt_id: int | None,
     ) -> None: ...
     def set_base_page_index_buf(
         self, beam_idx: BeamIndex, layer_group_id: LayerGroupId, buf: memoryview | None
@@ -410,6 +411,7 @@ class KVCacheManager:
         input_tokens: Sequence[TokenIdExt] | None = None,
         id: Any = None,
         custom_priority_callback: Callable[[int, Any], Priority] = ...,
+        cache_salt_id: int | None = None,
     ) -> _KVCache: ...
     def probe_reuse(
         self,

@@ -27,6 +27,8 @@ if TYPE_CHECKING:
     from ._page import CommittedPage
 
 BlockKey = bytes
+_ROOT_KEY_LORA_TASK_ID_TAG = b"trtllm_kv_cache_v2_root_lora_task_id"
+_ROOT_KEY_CACHE_SALT_ID_TAG = b"trtllm_kv_cache_v2_root_cache_salt_id"
 
 
 class ReuseScope(NamedTuple):
@@ -115,6 +117,15 @@ class Hasher:
 
 
 TokenBlock = list[TokenIdExt]
+
+
+def _make_root_key(lora_task_id: int | None, cache_salt_id: int | None = None) -> BlockKey:
+    hasher = Hasher()
+    if lora_task_id is not None:
+        hasher.update(_ROOT_KEY_LORA_TASK_ID_TAG).update(lora_task_id)
+    if cache_salt_id is not None:
+        hasher.update(_ROOT_KEY_CACHE_SALT_ID_TAG).update(cache_salt_id)
+    return hasher.digest
 
 
 def sequence_to_blockchain_keys(
