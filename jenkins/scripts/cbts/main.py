@@ -283,8 +283,41 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         result.test_db_dir_override = out_dir_name
 
+    _log_decision_to_stderr(stages, result)
     sys.stdout.write(result.to_json())
     return 0
+
+
+def _log_decision_to_stderr(stages: dict[str, Stage], result: SelectionResult) -> None:
+    """Dump the full CBTS decision to stderr for Jenkins console diagnostics.
+
+    stdout carries the JSON consumed by Groovy `getCbtsResult`, so all
+    human-readable detail goes to stderr to avoid corrupting that contract.
+    Each affected stage is annotated with its yaml_stem so blocks-vs-stages
+    mismatches (e.g. a stage matched by an unexpected YAML) are obvious.
+    """
+    out = sys.stderr
+    print("=" * 64, file=out)
+    print("CBTS decision (diagnostic; stderr only):", file=out)
+    print(f"  scope: {result.scope}", file=out)
+    print(f"  test_db_dir_override: {result.test_db_dir_override}", file=out)
+    print(f"  affected_cpu_arch: {sorted(result.affected_cpu_arch)}", file=out)
+    if result.reasons:
+        print("  reasons:", file=out)
+        for r in result.reasons:
+            print(f"    - {r}", file=out)
+    print(f"  affected_tests ({len(result.tests)}):", file=out)
+    for t in sorted(result.tests):
+        print(f"    - {t}", file=out)
+    print(f"  block_filters ({len(result.block_filters)} blocks):", file=out)
+    for (yaml_stem, idx), prefixes in sorted(result.block_filters.items()):
+        print(f"    - {yaml_stem}#{idx}: {sorted(prefixes)}", file=out)
+    print(f"  affected_stages ({len(result.affected_stages)}):", file=out)
+    for name in sorted(result.affected_stages):
+        stage = stages.get(name)
+        annotation = f" [yaml_stem={stage.yaml_stem}]" if stage else ""
+        print(f"    - {name}{annotation}", file=out)
+    print("=" * 64, file=out)
 
 
 if __name__ == "__main__":
