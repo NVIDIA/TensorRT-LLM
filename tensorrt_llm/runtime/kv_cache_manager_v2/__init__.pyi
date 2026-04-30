@@ -410,6 +410,7 @@ class KVCacheManager:
         input_tokens: Sequence[TokenIdExt] | None = None,
         id: Any = None,
         custom_priority_callback: Callable[[int, Any], Priority] = ...,
+        cache_salt_id: int | None = None,
     ) -> _KVCache: ...
     def probe_reuse(
         self,

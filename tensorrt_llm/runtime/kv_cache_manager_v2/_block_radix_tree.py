@@ -27,6 +27,8 @@ if TYPE_CHECKING:
     from ._page import CommittedPage
 
 BlockKey = bytes
+_ROOT_KEY_LORA_TASK_ID_TAG = b"trtllm_kv_cache_v2_root_lora_task_id"
+_ROOT_KEY_CACHE_SALT_ID_TAG = b"trtllm_kv_cache_v2_root_cache_salt_id"
 
 
 class ReuseScope(NamedTuple):
@@ -117,10 +119,37 @@ class Hasher:
 TokenBlock = list[TokenIdExt]
 
 
+def _coerce_reuse_scope(
+    reuse_scope_or_lora_id: ReuseScope | int | None,
+    cache_salt_id: int | None = None,
+) -> ReuseScope:
+    if type(reuse_scope_or_lora_id) is ReuseScope:
+        assert reuse_scope_or_lora_id.salt in (None, cache_salt_id), (
+            "cache_salt_id conflicts with ReuseScope.salt"
+        )
+        if cache_salt_id is None:
+            return reuse_scope_or_lora_id
+        return reuse_scope_or_lora_id._replace(salt=cache_salt_id)
+    return ReuseScope(lora_id=reuse_scope_or_lora_id, salt=cache_salt_id)
+
+
+def _make_root_key(reuse_scope: ReuseScope) -> BlockKey:
+    hasher = Hasher()
+    if reuse_scope.lora_id is not None:
+        hasher.update(_ROOT_KEY_LORA_TASK_ID_TAG).update(reuse_scope.lora_id)
+    if reuse_scope.salt is not None:
+        hasher.update(_ROOT_KEY_CACHE_SALT_ID_TAG).update(reuse_scope.salt)
+    return hasher.digest
+
+
 def sequence_to_blockchain_keys(
-    tokens_per_block: int, reuse_scope: ReuseScope, tokens: Sequence[TokenIdExt]
+    tokens_per_block: int,
+    reuse_scope_or_lora_id: ReuseScope | int | None,
+    tokens: Sequence[TokenIdExt],
+    cache_salt_id: int | None = None,
 ) -> Iterator[tuple[TokenBlock, BlockKey]]:
-    digest = Hasher(reuse_scope.to_bytes()).digest
+    reuse_scope = _coerce_reuse_scope(reuse_scope_or_lora_id, cache_salt_id)
+    digest = _make_root_key(reuse_scope)
     yield [], digest
     for token_block in chunked(tokens, tokens_per_block):
         digest = Hasher(digest).update(token_block).digest
@@ -291,9 +320,20 @@ class RootBlock:
     def tokens_per_block(self) -> int:
         return self.prev.tokens_per_block
 
+    @property
+    def lora_task_id(self) -> int | None:
+        return self.reuse_scope.lora_id
+
+    @property
+    def cache_salt_id(self) -> int | None:
+        return self.reuse_scope.salt
+
     @staticmethod
-    def make_key(reuse_scope: ReuseScope) -> BlockKey:
-        return Hasher(reuse_scope.to_bytes()).digest
+    def make_key(
+        reuse_scope_or_lora_id: ReuseScope | int | None = None,
+        cache_salt_id: int | None = None,
+    ) -> BlockKey:
+        return _make_root_key(_coerce_reuse_scope(reuse_scope_or_lora_id, cache_salt_id))
 
 
 class Block:
@@ -505,6 +545,7 @@ class BlockRadixTree:
         reuse_scope: ReuseScope,
         tokens: Sequence[TokenIdExt],
         enable_partial_match: bool = False,
+        cache_salt_id: int | None = None,
     ) -> Iterator[tuple[Block, int]]:
         block: Block | RootBlock | BlockRadixTree = self
         mismatched_token_block: TokenBlock = []

@@ -3834,6 +3834,7 @@ class KVCacheManagerV2(BaseResourceManager):
                          request_id: int,
                          lora_task_id: int | None,
                          input_tokens: Sequence[TokenIdExt] | None,
+                         *,
                          cache_salt_id: int | None = None):
         assert request_id not in self.kv_cache_map, f"KV cache for request {request_id} already exists"
         if self.index_mapper.num_free_slots() == 0:
