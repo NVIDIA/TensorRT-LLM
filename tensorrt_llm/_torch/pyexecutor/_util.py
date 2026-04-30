@@ -1251,6 +1251,7 @@ def _create_kv_cache_manager(
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             layer_mask=layer_mask,
+            max_num_tokens=max_num_tokens,
             is_disagg=is_disagg,
         )
     elif is_nemotron_hybrid(config):
