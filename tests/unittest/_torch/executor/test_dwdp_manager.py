@@ -237,6 +237,9 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
         self.assertEqual(kwargs["device_id"], 0)
         self.assertIs(kwargs["comm"], sub_comm)
         self.assertEqual(kwargs["layer_indices"], [3, 5, 7])  # sorted SSOT
+        # Config-driven expert range fields are forwarded from DwdpConfig.
+        self.assertEqual(kwargs["num_experts_per_worker"], 4)
+        self.assertEqual(kwargs["num_prefetch_experts"], 4)
         self.assertIs(result, fake_weight_manager)
         self.assertIs(mgr._weight_manager, fake_weight_manager)
 

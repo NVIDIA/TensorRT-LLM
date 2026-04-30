@@ -172,6 +172,8 @@ class DwdpManager:
             device_id=device_id,
             comm=self.dwdp_group,
             layer_indices=layer_indices,
+            num_experts_per_worker=self.num_experts_per_worker,
+            num_prefetch_experts=self.num_prefetch_experts,
         )
         return self._weight_manager
 

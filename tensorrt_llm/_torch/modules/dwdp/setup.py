@@ -74,6 +74,8 @@ def setup_dwdp(
     device_id: int,
     comm,
     layer_indices: List[int],
+    num_experts_per_worker: int,
+    num_prefetch_experts: int,
 ) -> Optional[DWDPWeightManager]:
     """Set up DWDP for a model after weight loading.
 
@@ -89,6 +91,16 @@ def setup_dwdp(
         layer_indices: MoE layer indices collected by
             ``DwdpManager._registered_layers`` (SSOT).  Each index must
             correspond to an MoE layer in the model.
+        num_experts_per_worker: Range size — number of experts each rank
+            owns (``DwdpConfig.num_experts_per_worker``).  Used as the local
+            expert range length: ``[start, start + num_experts_per_worker)``.
+        num_prefetch_experts: Stride between consecutive ranks
+            (``DwdpConfig.num_prefetch_experts``).  Used as the rank-to-rank
+            offset: rank ``r`` owns ``[r * num_prefetch_experts, ...)``.
+            For uniform integer-division partitioning these two values are
+            equal (e.g. dwdp=4: 64/64, dwdp=8: 32/32).  Differing values
+            allow overlapping ranges but require fused-MoE-side support
+            that is not yet implemented.
 
     Returns:
         A ready-to-use DWDPWeightManager if DWDP is enabled, ``None`` otherwise.
@@ -139,15 +151,27 @@ def setup_dwdp(
         f"[DWDP Setup] Built weight specs for {len(layer_weight_specs)} layers"
     )
 
-    # 3. Compute local expert range
+    # 3. Compute local expert range from DwdpConfig fields (SSOT).
+    # Range size = num_experts_per_worker, stride = num_prefetch_experts.
+    # When the two are equal (uniform integer-division partitioning, the
+    # only currently supported mode) this matches num_experts // dwdp_size
+    # and is consistent with the chunk shape produced by the fused MoE
+    # backend during weight loading.
     first_spec = _get_first_spec(layer_weight_specs)
     num_experts_total = first_spec.num_experts
-    experts_per_rank = num_experts_total // mapping.dwdp_size
-    local_start = mapping.dwdp_rank * experts_per_rank
-    local_end = local_start + experts_per_rank
+    _validate_partition_config(
+        num_experts_per_worker=num_experts_per_worker,
+        num_prefetch_experts=num_prefetch_experts,
+        num_experts_total=num_experts_total,
+        dwdp_size=mapping.dwdp_size,
+        loaded_local_experts=first_spec.local_experts,
+    )
+    local_start = mapping.dwdp_rank * num_prefetch_experts
+    local_end = local_start + num_experts_per_worker
     logger.info(
         f"[DWDP Setup] Expert range: local=[{local_start}, {local_end}), "
-        f"total={num_experts_total}, per_rank={experts_per_rank}"
+        f"total={num_experts_total}, "
+        f"size={num_experts_per_worker}, stride={num_prefetch_experts}"
     )
 
     # 4. Transport: MNNVL alloc -> copy -> free originals -> exchange handles
@@ -161,6 +185,8 @@ def setup_dwdp(
         device_id=device_id,
         local_start=local_start,
         local_end=local_end,
+        num_experts_per_worker=num_experts_per_worker,
+        num_prefetch_experts=num_prefetch_experts,
     )
     logger.info("[DWDP Setup] Transport created successfully.")
     free_mem, total_mem = torch.cuda.mem_get_info(device_id)
@@ -875,3 +901,73 @@ def _get_first_spec(layer_weight_specs: LayerWeightSpecs) -> WeightSpec:
         for name, spec in weight_specs.items():
             return spec
     raise ValueError("layer_weight_specs is empty")
+
+
+def _validate_partition_config(
+    *,
+    num_experts_per_worker: int,
+    num_prefetch_experts: int,
+    num_experts_total: int,
+    dwdp_size: int,
+    loaded_local_experts: int,
+) -> None:
+    """Validate that the DwdpConfig partition is internally consistent.
+
+    Checks (in order, each independent):
+
+    1. Both ``num_experts_per_worker`` and ``num_prefetch_experts`` are
+       positive integers.
+    2. ``num_prefetch_experts <= num_experts_per_worker`` — stride must
+       not exceed range size, otherwise consecutive ranks leave a gap
+       (some experts owned by no one).
+    3. Total coverage ``(dwdp_size - 1) * stride + size >= num_experts``
+       — last rank's range must reach the final expert.
+    4. ``loaded_local_experts == num_experts_per_worker`` — the chunk
+       shape produced by the fused MoE weight loader (currently
+       ``num_experts // ep_size``) must match what DwdpConfig declares,
+       so DWDP does not redirect prefetch to a tensor of the wrong size.
+       This is what blocks "redundant" partitioning today: supporting
+       redundancy requires the loader to produce larger-than-uniform
+       chunks, which is a separate change in the fused MoE backend.
+
+    Together these guarantee that every expert in
+    ``[0, num_experts_total)`` is owned by at least one rank, that the
+    runtime range computation matches the stored weights, and that no
+    rank's range silently runs off the end of the global expert table.
+    """
+    if num_experts_per_worker <= 0:
+        raise ValueError(
+            f"[DWDP Setup] num_experts_per_worker must be positive, "
+            f"got {num_experts_per_worker}"
+        )
+    if num_prefetch_experts <= 0:
+        raise ValueError(
+            f"[DWDP Setup] num_prefetch_experts must be positive, "
+            f"got {num_prefetch_experts}"
+        )
+    if num_prefetch_experts > num_experts_per_worker:
+        raise ValueError(
+            f"[DWDP Setup] num_prefetch_experts ({num_prefetch_experts}) "
+            f"must be <= num_experts_per_worker ({num_experts_per_worker}); "
+            f"a stride larger than the range size leaves expert gaps "
+            f"between consecutive ranks."
+        )
+    coverage = (dwdp_size - 1) * num_prefetch_experts + num_experts_per_worker
+    if coverage < num_experts_total:
+        raise ValueError(
+            f"[DWDP Setup] DWDP partition does not cover all experts: "
+            f"(dwdp_size - 1) * num_prefetch_experts + num_experts_per_worker "
+            f"= ({dwdp_size} - 1) * {num_prefetch_experts} + "
+            f"{num_experts_per_worker} = {coverage} < num_experts_total "
+            f"= {num_experts_total}. Increase num_prefetch_experts or "
+            f"num_experts_per_worker so coverage >= num_experts."
+        )
+    if loaded_local_experts != num_experts_per_worker:
+        raise ValueError(
+            f"[DWDP Setup] DwdpConfig.num_experts_per_worker="
+            f"{num_experts_per_worker} does not match the fused MoE chunk "
+            f"shape ({loaded_local_experts}). Non-uniform partitioning is "
+            f"not yet supported; expected num_experts_per_worker == "
+            f"num_experts_total ({num_experts_total}) // dwdp_size "
+            f"({dwdp_size}) = {num_experts_total // dwdp_size}."
+        )

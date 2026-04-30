@@ -203,6 +203,8 @@ class DWDPTransport:
         device_id: int,
         local_start: int,
         local_end: int,
+        num_experts_per_worker: int,
+        num_prefetch_experts: int,
     ) -> DWDPTransport:
         """Allocate MNNVL handles, populate them, and exchange with all peers.
 
@@ -381,19 +383,17 @@ class DWDPTransport:
                 if peer_rank == dwdp_rank:
                     continue
 
-                # Compute peer's expert range
-                # (same formula the caller used for this rank)
+                # Compute peer's expert range using the same config-driven
+                # formula every rank uses for itself (size = num_experts_per_worker,
+                # stride = num_prefetch_experts).  All ranks share the same
+                # DwdpConfig, so peer ranges are deterministic — no allgather needed.
                 for layer_idx in sorted(layer_weight_specs.keys()):
                     weight_specs = layer_weight_specs[layer_idx]
                     for name in sorted(weight_specs.keys()):
                         spec = weight_specs[name]
 
-                        # Compute peer's expert range and handle size
-                        # using the same formula as PageAlignedLayout.
-                        num_experts = spec.num_experts
-                        experts_per_rank = num_experts // dwdp_size
-                        peer_local_start = peer_rank * experts_per_rank
-                        peer_local_end = peer_local_start + experts_per_rank
+                        peer_local_start = peer_rank * num_prefetch_experts
+                        peer_local_end = peer_local_start + num_experts_per_worker
 
                         peer_start_bytes = peer_local_start * spec.expert_bytes
                         peer_end_bytes = peer_local_end * spec.expert_bytes
