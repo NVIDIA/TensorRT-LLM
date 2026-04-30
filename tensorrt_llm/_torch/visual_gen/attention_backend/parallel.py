@@ -179,15 +179,84 @@ class UlyssesAttention(AttentionBackend):
 
 class Attention2DAttention(AttentionBackend):
     """
-    Attention2D Context Parallelism wrapper.
+    Attention2D Context Parallelism wrapper for video-generation inference.
 
-    Based on the Attention2D parallelism scheme from:
+    Based on:
         "Attention2D: Communication Efficient Distributed Self-Attention Mechanism"
         https://arxiv.org/pdf/2503.15758
 
-    The original paper targets LLM training with causal attention. This is a
+    The original paper targets LLM training with causal attention.  This is a
     simplified adaptation for video generation inference with full (non-causal)
     attention.
+
+    Motivation vs. Ulysses and Ring attention
+    -----------------------------------------
+    *vs. Ulysses*: Ulysses (head-sharding) requires the parallelism degree to divide
+    the model's head count (e.g. for WAN: degree ≤ 12 and must divide 12).
+    Attention2D removes this constraint entirely — any ``row_size × col_size`` mesh
+    is valid regardless of head count.  Attention2D can also be composed with Ulysses
+    (head-sharding across a separate process group) to combine both parallelism axes.
+
+    *vs. Ring attention*: Ring attention is the closest algorithmic alternative — both
+    distribute sequence across GPUs without a head-count constraint.  Attention2D
+    scales better: for a symmetric mesh (``row_size ≈ col_size ≈ √P``), communication
+    volume scales as ``O(N / √P)`` where ``N`` is the sequence length and ``P`` is the
+    total number of GPUs, compared to ``O(N)`` for ring attention.
+
+    Mesh layout
+    -----------
+    Ranks are arranged in a 2-D logical mesh of shape ``[row_size, col_size]``
+    (total parallelism degree = ``P = row_size * col_size``).  Each rank holds a
+    ``[B, S/P, H, D]`` shard of Q, K, and V.
+
+    Example for ``row_size=2, col_size=3`` (6 ranks total)::
+
+                   col group (K/V all-gather)
+                     ↓        ↓        ↓
+                   col 0    col 1    col 2
+        row 0  [  rank 0 | rank 1 | rank 2  ]  ← row group (Q all-gather)
+        row 1  [  rank 3 | rank 4 | rank 5  ]  ← row group (Q all-gather)
+
+    Ranks in the same **row** share a ``row_process_group`` and all-gather Q.
+    Ranks in the same **column** share a ``col_process_group`` and all-gather K/V.
+
+    Architecture:
+        Input:   [B, S/P, H, D]  (sequence sharded across P = row_size × col_size ranks)
+        Step 1:  Q all-gather within row group:        [B, S/P, H, D] → [B, S/col_size, H, D]
+        Step 2:  K/V fused all-gather within col group [B, S/P, H, D] → [B, S/row_size, H, D]
+                   (K and V packed into [2, B, S/P, H, D] before the gather,
+                    halving NCCL launch overhead vs. two separate collectives)
+        Step 3:  Local attention with inner backend:
+                   Q [B, S/col_size, H, D] × K,V [B, S/row_size, H, D]
+                   → output [B, S/col_size, H, D] + LSE [B, H, S/col_size]
+        Step 4:  Reduce-scatter output within row group, split into:
+                   all_to_all_single to exchange partial outputs and LSEs, then
+                   LSE-weighted combine via flash_attn_combine
+                   → [B, S/P, H, D]  (fully reduced, matching input layout)
+        Output:  [B, S/P, H, D]
+
+    Supported inner backends
+    ------------------------
+    The inner backend must support LSE output (``support_lse() -> True``) — required
+    for the reduce-scatter combine step.  Currently only the FA4 backend
+    (``FlashAttn4Attention``) meets this requirement.
+
+    Note: ``AttentionTensorLayout.NHD`` and ``AttentionTensorLayout.HND`` are both
+    handled transparently; transposition is applied before the inner forward and
+    reversed afterward.
+
+    Note: ``support_fused_qkv()`` is *not* required — fused QKV would not reduce
+    communication costs because Q and K/V are gathered over different process
+    groups and cannot be merged into a single collective.
+
+    Constraints
+    -----------
+    * Only ``PredefinedAttentionMask.FULL`` (or ``None``) is supported.
+    * ``flash_attn_combine`` (JIT CUDA kernel) must be importable at
+      construction time; the constructor raises ``ImportError`` otherwise.
+    * The ``_combine`` step is wrapped in ``@torch.compiler.disable`` because
+      the JIT kernel accesses raw data pointers that are incompatible with
+      ``FakeTensor`` tracing during ``torch.compile``.
     """
 
     def __init__(
