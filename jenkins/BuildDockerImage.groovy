@@ -236,7 +236,7 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
 
     def wheelScript = 'scripts/get_wheel_from_package.py'
     def wheelArgs = "--arch ${arch} --timeout ${WAIT_TIME_FOR_BUILD_STAGE} --artifact_path " + env.uploadPath
-    return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}' PREPARE_WHEEL_FROM_BUILD_STAGE=true"
+    return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}' PREPARE_WHEEL_FROM_BUILD_STAGE='true'"
 }
 
 def buildImage(config, imageKeyToTag)

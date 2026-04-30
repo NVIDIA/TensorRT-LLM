@@ -1,10 +1,11 @@
-"""Generate json with repo urls for third-party sources used in the cmake build.
+"""Generate a JSON manifest of third-party source URLs used in the CMake build.
 
-The purpose of this script is to simplify the process of producing third party
-sources "as used" in the build. We package up all of the sources we use and
-stash them in a location in the container so that they are automatically
-distributed alongside the build artifacts ensuring that we comply with the
-license requirements in an obvious and transparent manner.
+This script produces a record of third-party dependencies exactly as consumed
+during the build. Each dependency is mirrored to the GitLab OSS components group
+(https://gitlab.com/nvidia/tensorrt-llm/oss-components), and the resulting
+third-party-sources.json is copied into the container image so that source
+references are distributed alongside build artifacts, satisfying open-source
+license obligations in a traceable and auditable way.
 """
 
 import argparse
@@ -90,7 +91,6 @@ def create_oss_component(
     package_name: str, namespace_id: int, upstream_url: str
 ) -> tuple[str, int]:
     """Create a new project under oss-components with a pull mirror and return (web_url, project_id)."""
-    print(upstream_url)
     payload = json.dumps(
         {
             "name": package_name,
@@ -191,6 +191,9 @@ def main():
         tag = source_info["tag"]
         if tag and commit_exists_in_project(project_id, tag):
             logger.info("%s -> ref %r confirmed in oss-components, updating url", package_name, tag)
+            if package_name not in dep_source_index:
+                logger.warning("%s -> not found in fetch_content.json, skipping", package_name)
+                continue
             third_party_source_list.append(
                 {**dep_source_index[package_name], "git_repository": oss_url}
             )
