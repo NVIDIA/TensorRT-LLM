@@ -780,7 +780,24 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         // each L0_Test stage agent can re-run main.py locally and regenerate
         // its own copy of cbts_test_db/. The directory written here lives on
         // the L0_MergeRequest agent and never reaches downstream pods.
-        result.cbts_input_json = inputJson
+        //
+        // Hard cap to keep us well below ARG_MAX (~2 MB on most kernels) and
+        // Jenkins's per-parameter handling. CACHED_CHANGED_FILE_LIST already
+        // hits "Argument list too long" at smaller sizes (see comment on
+        // launchJob), so 256 KB is conservative. If we exceed it, drop the
+        // piggyback — Layer 2 stage filtering still applies, and renderTestDB
+        // falls back to the source test-db automatically.
+        final int CBTS_INPUT_PIGGYBACK_MAX_BYTES = 256000
+        def inputJsonSize = inputJson.length()
+        if (inputJsonSize <= CBTS_INPUT_PIGGYBACK_MAX_BYTES) {
+            result.cbts_input_json = inputJson
+            pipeline.echo("CBTS Layer 3: cbts_input_json piggyback enabled (${inputJsonSize} bytes)")
+        } else {
+            pipeline.echo("CBTS Layer 3: cbts_input_json is ${inputJsonSize} bytes, " +
+                          "exceeds ${CBTS_INPUT_PIGGYBACK_MAX_BYTES}-byte piggyback limit; " +
+                          "downstream stages will fall back to source test-db " +
+                          "(Layer 2 stage filtering still applies)")
+        }
         pipeline.echo("CBTS: scope=${result.scope}, " +
                       "archs=${result.affected_cpu_arch}, " +
                       "stages=${result.affected_stages.size()}, " +
