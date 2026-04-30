@@ -269,7 +269,34 @@ def _build_tensors(
     D = repeat(D_base, "h -> h p", p=head_dim)
 
     # --- SSM state ---
-    state0 = torch.randn(batch, nheads, head_dim, d_state, device=device, dtype=state_dtype)
+    # Quantized dtypes need their own initializer (torch.randn doesn't accept
+    # int) and a parallel fp32 scales tensor (per-(head, dim) channel decode
+    # scale, broadcast over dstate).  Quant state is filled with realistic-
+    # range values via fp32 → quant; scales are derived consistently so the
+    # initial state isn't garbage on dequant.
+    _QUANT_BENCH = {
+        torch.int8: 127.0,
+        torch.int16: 32767.0,
+        torch.float8_e4m3fn: 448.0,
+    }
+    if state_dtype in _QUANT_BENCH:
+        quant_max = _QUANT_BENCH[state_dtype]
+        state_fp32 = torch.randn(
+            batch, nheads, head_dim, d_state, device=device, dtype=torch.float32
+        )
+        amax = state_fp32.abs().amax(dim=-1)  # (batch, nheads, head_dim)
+        encode_scale = quant_max / amax.clamp(min=1e-30)
+        state_scales0 = (1.0 / encode_scale).to(torch.float32)  # decode scale
+        scaled = state_fp32 * encode_scale.unsqueeze(-1)
+        if state_dtype == torch.float8_e4m3fn:
+            state0 = scaled.clamp(-quant_max, quant_max).to(state_dtype)
+        else:
+            state0 = scaled.round().clamp(-quant_max, quant_max).to(state_dtype)
+    else:
+        state0 = torch.randn(
+            batch, nheads, head_dim, d_state, device=device, dtype=state_dtype
+        )
+        state_scales0 = None
 
     # --- Cache tensors for replay kernel ---
     # max_window is the cache T-axis capacity; defaults to mtp_len (the
@@ -301,8 +328,12 @@ def _build_tensors(
     out_incr = torch.zeros(batch, mtp_len, nheads, head_dim, device=device, dtype=act_dtype)
     out_base = torch.zeros(batch, mtp_len, nheads, head_dim, device=device, dtype=act_dtype)
 
+    # intermediate_states_buffer is only consumed by the fp/baseline path;
+    # for quantized state dtypes we'll skip baselines entirely, so the buffer
+    # dtype falls back to fp32 to keep selective_state_update happy.
+    int_buffer_dtype = state_dtype if state_dtype not in _QUANT_BENCH else torch.float32
     intermediate_states_buffer = torch.zeros(
-        batch, mtp_len, nheads, head_dim, d_state, device=device, dtype=state_dtype
+        batch, mtp_len, nheads, head_dim, d_state, device=device, dtype=int_buffer_dtype
     )
 
     # --- Conv1d tensors (for --with-conv1d mode) ---
@@ -328,6 +359,7 @@ def _build_tensors(
 
     return (
         state0,
+        state_scales0,
         old_x,
         old_B,
         old_dt,
@@ -542,6 +574,7 @@ def _bench_config(
 
     (
         state0,
+        state_scales0,
         old_x0,
         old_B0,
         old_dt0,
@@ -584,19 +617,26 @@ def _bench_config(
     use_philox = getattr(args, "philox_rounding", False)
     variant_fn = _VARIANT_FNS[args.variant]()
 
-    # Philox rounding: allocate rand_seed tensor
+    # Philox rounding: allow fp16 and the quantized dtypes (int8/int16/fp8).
+    # bf16/fp32 SR is not supported (no PTX path for bf16; fp32 doesn't need
+    # rounding).  This validates the user's input — it doesn't apply to the
+    # baseline (incompatible baselines are silently skipped below).
     rand_seed = None
+    _SR_SUPPORTED = (
+        torch.float16, torch.int8, torch.int16, torch.float8_e4m3fn,
+    )
     if use_philox:
-        if state_dtype != torch.float16:
-            raise ValueError(f"--philox-rounding requires --state-dtypes fp16, got {state_dtype}")
-        if args.baseline == "triton":
+        if state_dtype not in _SR_SUPPORTED:
             raise ValueError(
-                "--philox-rounding not supported with --baseline triton "
-                "(only flashinfer and replay support it)"
+                f"--philox-rounding requires state dtype in {{fp16, int8, int16, fp8}}, "
+                f"got {state_dtype}"
             )
         rand_seed = torch.randint(0, 2**62, (1,), device="cuda", dtype=torch.int64)
 
+    is_quantized = state_dtype in (torch.int8, torch.int16, torch.float8_e4m3fn)
+
     state_work = state0.clone()
+    state_scales_work = state_scales0.clone() if state_scales0 is not None else None
     old_x_work = old_x0.clone()
     old_B_work = old_B0.clone()
     old_dt_work = old_dt0.clone()
@@ -607,6 +647,8 @@ def _bench_config(
 
     def _reset():
         state_work.copy_(state0)
+        if state_scales_work is not None:
+            state_scales_work.copy_(state_scales0)
         old_x_work.copy_(old_x0)
         old_B_work.copy_(old_B0)
         old_dt_work.copy_(old_dt0)
@@ -619,6 +661,8 @@ def _bench_config(
         """Realistic reset: cold cache, L2 flush, then hot in_proj output."""
         # 1. Reset cold state (cache tensors, SSM state)
         state_work.copy_(state0)
+        if state_scales_work is not None:
+            state_scales_work.copy_(state_scales0)
         old_x_work.copy_(old_x0)
         old_B_work.copy_(old_B0)
         old_dt_work.copy_(old_dt0)
@@ -630,6 +674,33 @@ def _bench_config(
             _l2_flush.fill_(0.0)
         # 3. Write hot tensors (simulates in_proj output landing in L2)
         xbc_input_work.copy_(xbc_input0)
+
+    # Silently skip the baseline row for any (baseline, state_dtype, SR)
+    # combo it can't run.  Better than erroring on a partial sweep — our
+    # kernel rows still print.  Compatibility:
+    #   * Quantized states (int8 / int16 / fp8): no baseline supports them.
+    #   * Triton baseline (selective_state_update): no rand_seed kwarg.
+    #   * flashinfer baseline: rand_seed only on fp16 state.
+    def _baseline_supports() -> bool:
+        if baseline_fn is None:
+            return False
+        if is_quantized:
+            return False
+        if use_philox:
+            if args.baseline == "triton":
+                return False
+            if args.baseline == "flashinfer" and state_dtype != torch.float16:
+                return False
+        return True
+
+    if baseline_fn is not None and not _baseline_supports():
+        if not warmup_only:
+            sr_tag = " + SR" if use_philox else ""
+            print(
+                f"# Skipping {args.baseline} baseline for "
+                f"state_dtype={state_dtype_name}{sr_tag} (unsupported)."
+            )
+        baseline_fn = None
 
     show_kernel_col = baseline_fn is not None
 
@@ -665,7 +736,7 @@ def _bench_config(
 
         philox_kwargs = {}
         if rand_seed is not None and args.baseline == "flashinfer":
-            philox_kwargs = {"rand_seed": rand_seed, "philox_rounds": 10}
+            philox_kwargs = {"rand_seed": rand_seed, "philox_rounds": args.philox_rounds}
 
         if with_conv1d:
 
@@ -740,6 +811,8 @@ def _bench_config(
     precompute_num_warps_values = _parse_sweep(args.precompute_num_warps)
     precompute_num_stages_values = _parse_sweep(args.precompute_num_stages)
     heads_per_block_values = _parse_sweep(args.heads_per_block)
+    maxnreg_values = _parse_sweep(args.maxnreg)
+    num_ctas_values = _parse_sweep(args.num_ctas)
 
     # --- Replay kernel, one row per prev_k ---
     for prev_k in prev_ks:
@@ -753,6 +826,8 @@ def _bench_config(
             precompute_num_warps,
             precompute_num_stages,
             heads_per_block,
+            maxnreg,
+            num_ctas,
         ) in itertools.product(
             block_size_m_values,
             num_warps_values,
@@ -760,6 +835,8 @@ def _bench_config(
             precompute_num_warps_values,
             precompute_num_stages_values,
             heads_per_block_values,
+            maxnreg_values,
+            num_ctas_values,
         ):
 
             def _run_incr(
@@ -770,6 +847,8 @@ def _bench_config(
                 precompute_num_warps=precompute_num_warps,
                 precompute_num_stages=precompute_num_stages,
                 heads_per_block=heads_per_block,
+                maxnreg=maxnreg,
+                num_ctas=num_ctas,
             ):
                 if with_conv1d:
                     x_call, B_call, C_call = _conv1d_split(
@@ -780,9 +859,12 @@ def _bench_config(
                     x_call, B_call, C_call = x, B, C
                     extra_kwargs = {}
                 # write_checkpoint is only meaningful for the checkpointing
-                # variant; replay variant ignores the kwarg.
+                # variant; replay variant ignores the kwarg.  state_scales
+                # is also checkpointing-only (replay kernel doesn't quantize).
                 if args.variant == "checkpointing":
                     extra_kwargs["write_checkpoint"] = args.write_checkpoint
+                    if state_scales_work is not None:
+                        extra_kwargs["state_scales"] = state_scales_work
                 variant_fn(
                     state_work,
                     old_x_work,
@@ -802,6 +884,7 @@ def _bench_config(
                     dt_softplus=True,
                     state_batch_indices=None,
                     rand_seed=rand_seed,
+                    philox_rounds=args.philox_rounds,
                     use_internal_pdl=args.internal_pdl,
                     _block_size_m=block_size_m,
                     _num_warps=num_warps,
@@ -809,6 +892,8 @@ def _bench_config(
                     _precompute_num_warps=precompute_num_warps,
                     _precompute_num_stages=precompute_num_stages,
                     _heads_per_block=heads_per_block,
+                    _maxnreg=maxnreg,
+                    _num_ctas=num_ctas,
                     **extra_kwargs,
                 )
 
@@ -825,6 +910,10 @@ def _bench_config(
                 parts.append(f"pS={precompute_num_stages}")
             if heads_per_block is not None:
                 parts.append(f"H={heads_per_block}")
+            if maxnreg is not None:
+                parts.append(f"R={maxnreg}")
+            if num_ctas is not None:
+                parts.append(f"CT={num_ctas}")
             sweep_suffix = (" " + ",".join(parts)) if parts else ""
             sweep_tag = tag + sweep_suffix.replace(" ", "_").replace(",", "_")
 
@@ -889,7 +978,14 @@ def _run_benchmark(args) -> None:
     batch_sizes = [int(x) for x in args.batch_sizes.split(",")]
     mtp_lengths = [int(x) for x in args.mtp_lengths.split(",")]
 
-    dtype_map = {"bf16": torch.bfloat16, "fp32": torch.float32, "fp16": torch.float16}
+    dtype_map = {
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+        "fp16": torch.float16,
+        "int8": torch.int8,
+        "int16": torch.int16,
+        "fp8": torch.float8_e4m3fn,
+    }
     state_dtypes = [dtype_map[s] for s in args.state_dtypes.split(",")]
     act_dtypes = [dtype_map[s] for s in args.act_dtypes.split(",")]
 
@@ -994,7 +1090,11 @@ def _parse_args() -> argparse.Namespace:
         help="Comma-separated per-request sequence lengths (num_draft_tokens + 1 target)",
     )
     parser.add_argument(
-        "--state-dtypes", default="fp32", help="Comma-separated state dtypes: fp16,bf16,fp32"
+        "--state-dtypes",
+        default="fp32",
+        help="Comma-separated state dtypes: fp16,bf16,fp32,int8,int16,fp8.  "
+        "Quantized dtypes (int8/int16/fp8) require the checkpointing variant "
+        "and skip baselines (selective_state_update doesn't accept them).",
     )
     parser.add_argument(
         "--act-dtypes",
@@ -1140,10 +1240,33 @@ def _parse_args() -> argparse.Namespace:
         help="Override HEADS_PER_BLOCK for precompute kernel (comma-separated sweep).",
     )
     parser.add_argument(
+        "--maxnreg",
+        type=str,
+        default=None,
+        help="Override maxnreg for the main kernel (comma-separated sweep).",
+    )
+    parser.add_argument(
+        "--num-ctas",
+        type=str,
+        default=None,
+        help="Override num_ctas for the main kernel (comma-separated sweep).",
+    )
+    parser.add_argument(
         "--philox-rounding",
         action="store_true",
-        help="Enable Philox stochastic rounding for fp16 state "
-        "(rand_seed generated per iteration, philox_rounds=10).",
+        help="Enable Philox stochastic rounding (rand_seed generated per "
+        "iteration).  Supported state dtypes: fp16, int8, int16, fp8.  "
+        "fp16 SR and fp8 SR require sm_100a (Blackwell B200+).",
+    )
+    parser.add_argument(
+        "--philox-rounds",
+        type=int,
+        default=5,
+        help="Number of Philox PRNG rounds.  Default 5 matches the "
+        "Nemotron-3-Super-120B production config (mamba_ssm_philox_rounds=5 "
+        "in examples/configs and tests/integration/perf configs).  The "
+        "wrapper's generic fallback default is 10; callers without explicit "
+        "config see 10.  Only consulted when --philox-rounding is enabled.",
     )
     parser.add_argument(
         "--variant",

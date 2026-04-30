@@ -17,6 +17,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 import triton
+import triton.language as tl
 from einops import repeat
 
 from tensorrt_llm._torch.modules.mamba.checkpointing_state_update import (
@@ -40,9 +41,60 @@ _CONFIGS = [
     (32, 64, 128, 2),  # TP=4, ngroups>1 (more heads than B/C groups)
 ]
 
+# Quantized state dtypes and their representable-magnitude limits (== QUANT_MAX
+# in the kernel).  fp8_e4m3fn cells require SM 89+ for the fp32↔fp8 cvt PTX
+# instructions; SR variants of fp16/fp8 additionally need SM 100+.
+_QUANT_MAX_BY_DTYPE = {
+    torch.int8: 127.0,
+    torch.int16: 32767.0,
+    torch.float8_e4m3fn: 448.0,
+}
+
+
+def _quantize_state(state_fp32: torch.Tensor, state_dtype: torch.dtype, quant_max: float):
+    """Quantize fp32 state to (state_quant, decode_scale) using the same
+    per-(head, dim) channel scheme the kernel does on store.  decode_scale =
+    max_abs_per_channel / quant_max (= 1/encode_scale).
+    """
+    amax = state_fp32.abs().amax(dim=-1)  # (cache, nheads, head_dim)
+    encode_scale = quant_max / amax.clamp(min=1e-30)
+    decode_scale = 1.0 / encode_scale
+    scaled = state_fp32 * encode_scale.unsqueeze(-1)
+    if state_dtype == torch.float8_e4m3fn:
+        # Native cast does RN at the fp8 grid; explicit round() would destroy
+        # sub-integer precision (matches the kernel's fp8 RN path).
+        state_quant = scaled.clamp(-quant_max, quant_max).to(state_dtype)
+    else:
+        state_quant = scaled.round().clamp(-quant_max, quant_max).to(state_dtype)
+    return state_quant, decode_scale
+
+
+def _dequantize_state(state_quant: torch.Tensor, decode_scale: torch.Tensor):
+    return state_quant.to(torch.float32) * decode_scale.unsqueeze(-1)
+
+
+def _maybe_skip_dtype(state_dtype, use_sr):
+    """Skip on insufficient SM.  fp8 e4m3fn (any) needs SM 89+; fp16/fp8 SR
+    needs SM 100+; int8/int16 (RN or SR) runs anywhere."""
+    if state_dtype == torch.float8_e4m3fn and get_sm_version() < 89:
+        pytest.skip("fp8_e4m3fn requires SM 89+ (Ada Lovelace / Hopper / Blackwell)")
+    if use_sr and state_dtype in (torch.float16, torch.float8_e4m3fn) and get_sm_version() < 100:
+        pytest.skip(f"{state_dtype} stochastic rounding requires SM 100+ (Blackwell B200+)")
+
 
 @pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
-@pytest.mark.parametrize("state_dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "state_dtype",
+    [
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int8,
+        torch.int16,
+        torch.float8_e4m3fn,
+    ],
+    ids=["fp16", "bf16", "fp32", "int8", "int16", "fp8"],
+)
 @pytest.mark.parametrize("paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"])
 @pytest.mark.parametrize(
     "T", [6, 10, 16, 27, 32, 55], ids=["T6", "T10", "T16", "T27", "T32", "T55"]
@@ -59,7 +111,16 @@ def test_checkpointing_state_update(
     produces the same output as:
       selective_state_update(state_after_k_old_tokens, new_x, ...)
     and writes state_after_k_old_tokens back to the state tensor.
+
+    Quantized state dtypes (int8/int16/fp8) follow the same flow with
+    a per-(head, dim) channel decode-scale tensor; comparison is done
+    via dequant(state, scales) against the fp32 reference.
     """
+    _maybe_skip_dtype(state_dtype, use_sr=False)
+
+    quant_max = _QUANT_MAX_BY_DTYPE.get(state_dtype, 0.0)
+    is_quantized = quant_max > 0.0
+
     batch = 2
     device = "cuda"
     dtype = torch.bfloat16  # input activations are bf16
@@ -92,8 +153,24 @@ def test_checkpointing_state_update(
     D_base = torch.randn(nheads, device=device, dtype=dtype)
     D = repeat(D_base, "h -> h p", p=head_dim)
 
-    # Initial SSM state (cache_size slots)
-    state0 = torch.randn(cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype)
+    # Initial SSM state (cache_size slots).  Quantized dtypes need a separate
+    # init: derive scales from a fp32 source so the quantized state isn't
+    # garbage on dequant.  ref_input_state is what the fp32 reference run
+    # sees — for non-quant it's state0 (cast to fp32 inside reference); for
+    # quant it's the lossy dequant of state0 (matches what the kernel sees
+    # internally on load).
+    if is_quantized:
+        state0_fp32 = torch.randn(
+            cache_size, nheads, head_dim, d_state, device=device, dtype=torch.float32
+        )
+        state0, state0_scales = _quantize_state(state0_fp32, state_dtype, quant_max)
+        ref_input_state = _dequantize_state(state0, state0_scales)
+    else:
+        state0 = torch.randn(
+            cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype
+        )
+        state0_scales = None
+        ref_input_state = state0.float()
 
     # Old inputs: T tokens per batch request
     x1 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
@@ -113,7 +190,7 @@ def test_checkpointing_state_update(
     )
     out1 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     selective_state_update(
-        state0.clone(),
+        ref_input_state.clone(),
         x1,
         dt1,
         A,
@@ -175,8 +252,9 @@ def test_checkpointing_state_update(
         B2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
         C2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
 
-        # Reference
-        ref_state_f32 = state0.float().clone()
+        # Reference (fp32, starting from the same lossy-or-not state the
+        # kernel sees).
+        ref_state_f32 = ref_input_state.clone()
         if k > 0:
             ref_state_f32[slots] = states_buffer_f32[slots, k - 1]
 
@@ -198,6 +276,7 @@ def test_checkpointing_state_update(
         # Replay kernel — clone caches into mutable working copies that we
         # can inspect AFTER the call to verify cache postconditions.
         test_state = state0.clone()
+        test_scales = state0_scales.clone() if is_quantized else None
         prev_tokens = torch.full((cache_size,), k, device=device, dtype=torch.int32)
         test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
         old_x_w = old_x.clone()
@@ -224,6 +303,7 @@ def test_checkpointing_state_update(
             dt_bias=dt_bias,
             dt_softplus=True,
             state_batch_indices=state_batch_indices,
+            state_scales=test_scales,
             write_checkpoint=write_checkpoint,
         )
 
@@ -237,12 +317,36 @@ def test_checkpointing_state_update(
         # T<=16, ~2.0 at T=32-55; mean ~0.014; <0.02% of elements exceed 0.5.
         # State dtype (fp16/bf16/fp32) doesn't shift the error — bf16 dot
         # inputs dominate, not state storage.
+        #
+        # Quantized states add a per-element state quant error eps that
+        # propagates through C @ state in the output dot.  With dstate=128
+        # and C ~ N(0,1), the output channel std from this noise is roughly
+        # eps * sqrt(128/3) ≈ 6.5 * eps.  Stack with the bf16 baseline:
+        #   out_atol = bf16_atol + 6.5 * eps_max
+        # where eps_max is the worst-case per-element error at the
+        # post-replay state magnitude (T=55 → amax ≈ 23).
+        #
+        # Per-element error (eps_max for T=55):
+        #   int8     (uniform grid):  amax/(2*127)        ≈ 0.091
+        #   int16    (uniform grid):  amax/(2*32767)      ≈ 3.5e-4
+        #   fp8_e4m3 (variable grid): amax/16             ≈ 1.44 (worst-case
+        #                             cell at top of channel; smaller for
+        #                             smaller-magnitude elements)
+        out_atol = (
+            {torch.int8: 1.6, torch.int16: 1.05, torch.float8_e4m3fn: 4.0}[state_dtype]
+            if is_quantized else 1.0
+        )
+        out_rtol = (
+            {torch.int8: 2e-2, torch.int16: 2e-2, torch.float8_e4m3fn: 5e-2}[state_dtype]
+            if is_quantized else 2e-2
+        )
         out_diff = (test_out.float() - ref_out.float()).abs()
         out_max = out_diff.max().item()
         out_mean = out_diff.mean().item()
         try:
             torch.testing.assert_close(
-                test_out, ref_out, rtol=2e-2, atol=1.0, msg=f"Output mismatch at k={k}"
+                test_out, ref_out, rtol=out_rtol, atol=out_atol,
+                msg=f"Output mismatch at k={k}",
             )
         except AssertionError:
             print(
@@ -256,31 +360,85 @@ def test_checkpointing_state_update(
         #   True  → kernel writes the post-replay state; expect the
         #           selective_state_update reference's state at step k-1.
         #   False → kernel skips the HBM store; state must be UNCHANGED
-        #           from the input (state0).
-        if write_checkpoint:
-            expected_state = (
-                state0[slots] if k == 0 else states_buffer_f32[slots, k - 1].to(state_dtype)
-            )
+        #           from the input (state0; for quant, scales also unchanged).
+        if is_quantized:
+            if write_checkpoint:
+                # Compare via dequant against the fp32 reference state.
+                expected_fp32 = (
+                    ref_input_state[slots] if k == 0 else states_buffer_f32[slots, k - 1]
+                )
+                actual_fp32 = _dequantize_state(test_state[slots], test_scales[slots])
+                # State diff = bf16_replay_error + quant_error (per element).
+                # The bf16 component is the SAME error source the non-quant
+                # test absorbs in its atol=1.0 baseline (replay's tl.dot is
+                # bf16-input fp32-accum; per-element error ~ 2^-7 * amax,
+                # empirically ≤ ~0.2 at T=55 amax≈23).  Quant adds:
+                #   int8: amax/(2*127) ≈ 0.091 worst-case
+                #   int16: amax/(2*32767) ≈ 3.5e-4 (negligible vs bf16)
+                #   fp8_e4m3 (variable grid): amax/16 ≈ 1.44 worst-case
+                # Atol = bf16_baseline (1.0) + quant_eps_max.
+                state_atol = {
+                    torch.int8: 1.1, torch.int16: 1.0, torch.float8_e4m3fn: 2.5,
+                }[state_dtype]
+                state_rtol = {
+                    torch.int8: 5e-2, torch.int16: 2e-2, torch.float8_e4m3fn: 1e-1,
+                }[state_dtype]
+                try:
+                    torch.testing.assert_close(
+                        actual_fp32, expected_fp32,
+                        rtol=state_rtol, atol=state_atol,
+                        msg=f"State mismatch at k={k} dtype={state_dtype}",
+                    )
+                except AssertionError:
+                    diff = (actual_fp32 - expected_fp32).abs()
+                    print(
+                        f"k={k}  state(dequant): max={diff.max().item():.4f}  "
+                        f"mean={diff.mean().item():.4f}"
+                    )
+                    raise
+                # Scales sanity (fp32, finite, positive).
+                assert test_scales.dtype == torch.float32
+                assert torch.isfinite(test_scales[slots]).all(), (
+                    f"state_scales has non-finite values at k={k}"
+                )
+                assert (test_scales[slots] > 0).all(), (
+                    f"state_scales has non-positive values at k={k}"
+                )
+            else:
+                # No write: raw quant state and scales unchanged.  Use
+                # torch.equal for byte-level equality (dtype-agnostic; works
+                # for int8 / int16 / fp8 alike).
+                assert torch.equal(test_state[slots], state0[slots]), (
+                    f"Quant state changed at k={k} write_checkpoint=False"
+                )
+                assert torch.equal(test_scales[slots], state0_scales[slots]), (
+                    f"State scales changed at k={k} write_checkpoint=False"
+                )
         else:
-            expected_state = state0[slots]
-        state_diff = (test_state[slots].float() - expected_state.float()).abs()
-        state_max = state_diff.max().item()
-        state_mean = state_diff.mean().item()
-        try:
-            torch.testing.assert_close(
-                test_state[slots],
-                expected_state,
-                rtol=2e-2,
-                atol=1.0 if write_checkpoint else 0.0,
-                msg=f"State mismatch at k={k} (write_checkpoint={write_checkpoint})",
-            )
-        except AssertionError:
-            print(
-                f"k={k}  state: max={state_max:.4f}  mean={state_mean:.4f}  "
-                f"nan={torch.isnan(test_state).any().item()}  "
-                f"inf={torch.isinf(test_state).any().item()}"
-            )
-            raise
+            if write_checkpoint:
+                expected_state = (
+                    state0[slots] if k == 0 else states_buffer_f32[slots, k - 1].to(state_dtype)
+                )
+            else:
+                expected_state = state0[slots]
+            state_diff = (test_state[slots].float() - expected_state.float()).abs()
+            state_max = state_diff.max().item()
+            state_mean = state_diff.mean().item()
+            try:
+                torch.testing.assert_close(
+                    test_state[slots],
+                    expected_state,
+                    rtol=2e-2,
+                    atol=1.0 if write_checkpoint else 0.0,
+                    msg=f"State mismatch at k={k} (write_checkpoint={write_checkpoint})",
+                )
+            except AssertionError:
+                print(
+                    f"k={k}  state: max={state_max:.4f}  mean={state_mean:.4f}  "
+                    f"nan={torch.isnan(test_state).any().item()}  "
+                    f"inf={torch.isinf(test_state).any().item()}"
+                )
+                raise
 
         # --- Cache postconditions ---
         # Compute step 2's processed values (what the kernel should have
@@ -357,24 +515,33 @@ def test_checkpointing_state_update(
             )
 
 
-@_skip_pre_sm100
 @pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
+@pytest.mark.parametrize(
+    "state_dtype",
+    [torch.float16, torch.int8, torch.int16, torch.float8_e4m3fn],
+    ids=["fp16", "int8", "int16", "fp8"],
+)
 @pytest.mark.parametrize("paged_cache", [False, True], ids=["no_cache_indices", "paged_cache"])
 @pytest.mark.parametrize("T", [6, 16, 32], ids=["T6", "T16", "T32"])
-def test_checkpointing_state_update_philox(nheads, head_dim, d_state, ngroups, paged_cache, T):
+def test_checkpointing_state_update_philox(state_dtype, nheads, head_dim, d_state, ngroups, paged_cache, T):
     """
-    Verify that Philox stochastic rounding produces correct results.
+    Verify that Philox stochastic rounding produces correct results across
+    all SR-supported state dtypes (fp16, int8, int16, fp8_e4m3fn).
 
-    Runs our kernel twice with identical inputs: once without rounding
-    (fp16 state, deterministic), once with rounding (fp16 state, Philox).
-    The outputs should be nearly identical — stochastic rounding only
-    perturbs the state by ±1 fp16 ULP, which barely affects output.
-    Also verifies the state dtype remains fp16.
+    Runs our kernel twice with identical inputs — once without rand_seed
+    (deterministic RN), once with rand_seed (Philox SR) — and confirms:
+      - Outputs are within bf16-dot tolerance (state perturbation ≤ 1 ULP).
+      - State dtype is preserved.
+      - State difference is bounded by ~1 ULP of the chosen grid.
     """
+    _maybe_skip_dtype(state_dtype, use_sr=True)
+
+    quant_max = _QUANT_MAX_BY_DTYPE.get(state_dtype, 0.0)
+    is_quantized = quant_max > 0.0
+
     batch = 2
     device = "cuda"
     dtype = torch.bfloat16
-    state_dtype = torch.float16
     assert nheads % ngroups == 0
 
     if paged_cache:
@@ -393,7 +560,16 @@ def test_checkpointing_state_update_philox(nheads, head_dim, d_state, ngroups, p
     D_base = torch.randn(nheads, device=device, dtype=dtype)
     D = repeat(D_base, "h -> h p", p=head_dim)
 
-    state0 = torch.randn(cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype)
+    if is_quantized:
+        state0_fp32 = torch.randn(
+            cache_size, nheads, head_dim, d_state, device=device, dtype=torch.float32
+        )
+        state0, state0_scales = _quantize_state(state0_fp32, state_dtype, quant_max)
+    else:
+        state0 = torch.randn(
+            cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype
+        )
+        state0_scales = None
 
     # Cache tensors
     old_x = torch.randn(cache_size, T, nheads, head_dim, device=device, dtype=dtype)
@@ -423,8 +599,9 @@ def test_checkpointing_state_update_philox(nheads, head_dim, d_state, ngroups, p
         state_batch_indices=state_batch_indices,
     )
 
-    # --- Run without rounding (deterministic fp16 state store) ---
+    # --- Run without rounding (deterministic RN store) ---
     state_no_round = state0.clone()
+    scales_no_round = state0_scales.clone() if is_quantized else None
     out_no_round = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_state_update(
         state_no_round,
@@ -435,12 +612,14 @@ def test_checkpointing_state_update_philox(nheads, head_dim, d_state, ngroups, p
         cache_buf_idx.clone(),
         prev_tokens,
         out=out_no_round,
+        state_scales=scales_no_round,
         **common_kwargs,
     )
 
     # --- Run with Philox rounding ---
     rand_seed = torch.tensor([12345], device=device, dtype=torch.int64)
     state_rounded = state0.clone()
+    scales_rounded = state0_scales.clone() if is_quantized else None
     out_rounded = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_state_update(
         state_rounded,
@@ -453,47 +632,100 @@ def test_checkpointing_state_update_philox(nheads, head_dim, d_state, ngroups, p
         out=out_rounded,
         rand_seed=rand_seed,
         philox_rounds=10,
+        state_scales=scales_rounded,
         **common_kwargs,
     )
 
     # Outputs should be nearly identical — rounding only perturbs the
     # post-replay state by ±1 ULP before the output phase reads it.
+    # Out_atol = bf16_baseline + 6.5 * per_elem_ULP_after_dequant:
+    #   non-quant fp16: fp16 ULP at typical magnitude is tiny → 1.0
+    #   int8:  amax/127 ≈ 23/127 → 6.5*0.18 ≈ 1.2 + bf16_baseline
+    #   int16: amax/32767 ≈ 7e-4 → ~bf16_baseline only
+    #   fp8:   amax/14 ≈ 23/14 → 6.5*1.6 ≈ 10.7 + bf16_baseline
+    out_atol = (
+        {torch.int8: 1.5, torch.int16: 1.0, torch.float8_e4m3fn: 6.0}[state_dtype]
+        if is_quantized else 1.0
+    )
+    out_rtol = (
+        {torch.int8: 2e-2, torch.int16: 2e-2, torch.float8_e4m3fn: 5e-2}[state_dtype]
+        if is_quantized else 2e-2
+    )
     torch.testing.assert_close(
-        out_rounded, out_no_round, rtol=2e-2, atol=1.0, msg="Output diverged with Philox rounding"
+        out_rounded, out_no_round, rtol=out_rtol, atol=out_atol,
+        msg=f"Output diverged with Philox rounding ({state_dtype})",
     )
 
-    # State should remain fp16
-    assert state_rounded.dtype == torch.float16
+    # State dtype preserved.
+    assert state_rounded.dtype == state_dtype
 
-    # States should differ by at most 1 fp16 ULP per element.
-    # fp16 ULP depends on magnitude: up to 0.5 for values near 512.
-    # Use rtol to account for magnitude-dependent ULP.
+    # State diff between RN and SR is bounded by 1 quant cell per element.
+    # Per-channel decode_scale varies by 10x+ across channels (amax depends
+    # on randn extremes), so a single flat atol can't bound it accurately —
+    # use per-channel ULP-aware comparison.
     slots = state_batch_indices if paged_cache else slice(None)
-    torch.testing.assert_close(
-        state_rounded[slots],
-        state_no_round[slots],
-        rtol=2e-3,
-        atol=0.2,
-        msg="State diverged with Philox rounding",
-    )
+    if is_quantized:
+        rounded_fp32 = _dequantize_state(state_rounded[slots], scales_rounded[slots])
+        no_round_fp32 = _dequantize_state(state_no_round[slots], scales_no_round[slots])
+        diff = (rounded_fp32 - no_round_fp32).abs()
+        # Per-element bound = max(decode_scale_no_round, decode_scale_rounded).
+        # decode_scale is shape (cache, nheads, dim); broadcast over dstate.
+        scale_bound = torch.maximum(
+            scales_no_round[slots], scales_rounded[slots]
+        ).unsqueeze(-1)
+        # int8 / int16: 1 cell after dequant = decode_scale exactly.
+        # fp8_e4m3: variable grid; the largest cell within a channel scaled
+        # to fit ±448 is at the channel's max-magnitude element, where the
+        # cell is ~32x larger than the average.  Bound = decode_scale * 32.
+        # Apply a 1.5x slack pad for floating-point compare quirks at the
+        # exact-cell boundary.
+        cell_pad = (
+            32.0 if state_dtype == torch.float8_e4m3fn else 1.0
+        )
+        bound = scale_bound * (cell_pad * 1.5)
+        if not (diff <= bound).all():
+            offenders = (diff > bound).sum().item()
+            n_total = diff.numel()
+            pytest.fail(
+                f"State RN-SR diff exceeds 1 cell per element for "
+                f"{offenders}/{n_total} elements ({state_dtype}).  "
+                f"max_diff={diff.max().item():.4g}, "
+                f"max_bound={bound.max().item():.4g}."
+            )
+    else:
+        # fp16 ULP depends on magnitude — rtol absorbs that.
+        torch.testing.assert_close(
+            state_rounded[slots],
+            state_no_round[slots],
+            rtol=2e-3,
+            atol=0.2,
+            msg=f"State diverged with Philox rounding ({state_dtype})",
+        )
 
 
-@_skip_pre_sm100
-def test_philox_rounding_unbiased():
+@pytest.mark.parametrize(
+    "state_dtype",
+    [torch.float16, torch.int8, torch.int16, torch.float8_e4m3fn],
+    ids=["fp16", "int8", "int16", "fp8"],
+)
+def test_philox_rounding_unbiased(state_dtype):
     """
-    Verify that Philox stochastic rounding is unbiased.
+    Verify that Philox stochastic rounding is unbiased across all
+    SR-supported state dtypes (fp16, int8, int16, fp8_e4m3fn).
 
-    Runs the replay kernel with fp32 state (capturing the true fp32
-    post-replay state) and with fp16 state + Philox rounding.  Compares the
-    rounding residual (fp16_state.float() - fp32_state) against deterministic
-    rounding (fp32_state.to(fp16).float() - fp32_state).
-
-    Deterministic round-to-nearest-even has a systematic positive bias on
-    the residual.  Philox stochastic rounding should be unbiased: the mean
-    residual should be near zero.
+    Captures the true fp32 post-replay state by running with fp32 storage,
+    then runs the kernel with the target dtype + Philox SR.  Compares the
+    SR rounding residual against the deterministic-RN residual: SR should
+    have mean residual closer to zero than RN, since RN has a systematic
+    round-to-nearest-even bias and SR is unbiased by construction.
 
     Uses a large batch (16) for ~2M state elements — plenty of statistics.
     """
+    _maybe_skip_dtype(state_dtype, use_sr=True)
+
+    quant_max = _QUANT_MAX_BY_DTYPE.get(state_dtype, 0.0)
+    is_quantized = quant_max > 0.0
+
     nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
     batch, T = 16, 6
     device = "cuda"
@@ -507,8 +739,11 @@ def test_philox_rounding_unbiased():
     D_base = torch.randn(nheads, device=device, dtype=dtype)
     D = repeat(D_base, "h -> h p", p=head_dim)
 
-    # Use fp32 initial state so replay produces non-fp16-representable values
-    state0 = torch.randn(batch, nheads, head_dim, d_state, device=device, dtype=torch.float32)
+    # fp32 reference state — replay produces values that don't fit cleanly
+    # in the target dtype's grid, exposing the rounding bias.
+    state0_fp32 = torch.randn(
+        batch, nheads, head_dim, d_state, device=device, dtype=torch.float32
+    )
 
     old_x = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
     old_B = torch.randn(batch, 2, T, ngroups, d_state, device=device, dtype=dtype)
@@ -525,68 +760,83 @@ def test_philox_rounding_unbiased():
     prev_tokens = torch.full((batch,), T, device=device, dtype=torch.int32)
 
     common_kwargs = dict(
-        x=x,
-        dt=dt_val,
-        A=A,
-        B=B,
-        C=C,
-        D=D,
-        dt_bias=dt_bias,
-        dt_softplus=True,
+        x=x, dt=dt_val, A=A, B=B, C=C, D=D, dt_bias=dt_bias, dt_softplus=True,
     )
 
-    # 1. fp32 state — captures true post-replay state
-    state_fp32 = state0.clone()
+    # 1. fp32 state — captures true post-replay fp32 state.
+    state_fp32 = state0_fp32.clone()
     out_fp32 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_state_update(
         state_fp32,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_dA_cumsum.clone(),
-        cache_buf_idx.clone(),
-        prev_tokens,
-        out=out_fp32,
-        **common_kwargs,
+        old_x.clone(), old_B.clone(), old_dt.clone(), old_dA_cumsum.clone(),
+        cache_buf_idx.clone(), prev_tokens, out=out_fp32, **common_kwargs,
     )
 
-    # 2. fp16 state with Philox rounding
+    # 2. Target dtype + Philox SR.  For quant we also need scales (derived
+    # from the same per-channel amax used by the kernel on store).
     rand_seed = torch.tensor([99999], device=device, dtype=torch.int64)
-    state_rounded = state0.to(torch.float16).clone()
+    if is_quantized:
+        state_rounded, scales_rounded = _quantize_state(state0_fp32, state_dtype, quant_max)
+    else:
+        state_rounded = state0_fp32.to(state_dtype)
+        scales_rounded = None
     out_rounded = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
     checkpointing_state_update(
         state_rounded,
-        old_x.clone(),
-        old_B.clone(),
-        old_dt.clone(),
-        old_dA_cumsum.clone(),
-        cache_buf_idx.clone(),
-        prev_tokens,
-        out=out_rounded,
-        rand_seed=rand_seed,
-        philox_rounds=10,
+        old_x.clone(), old_B.clone(), old_dt.clone(), old_dA_cumsum.clone(),
+        cache_buf_idx.clone(), prev_tokens, out=out_rounded,
+        rand_seed=rand_seed, philox_rounds=10,
+        state_scales=scales_rounded,
         **common_kwargs,
     )
 
-    # Compute rounding residuals where fp32 state has non-zero values
-    fp32_vals = state_fp32.flatten()
-    stochastic_residual = state_rounded.float().flatten() - fp32_vals
-    deterministic_residual = fp32_vals.to(torch.float16).float() - fp32_vals
+    # Compute residuals.  For non-quant: stochastic_residual = SR(fp32) -
+    # fp32, deterministic_residual = RN(fp32) - fp32.  For quant: dequant
+    # both, comparing in fp32.
+    if is_quantized:
+        fp32_vals = state_fp32.flatten()
+        stochastic_residual = (
+            _dequantize_state(state_rounded, scales_rounded).flatten() - fp32_vals
+        )
+        # Deterministic reference: do the same per-channel quant on the
+        # captured fp32 state, then dequant.  This is what the kernel would
+        # have produced with rand_seed=None.
+        det_quant, det_scales = _quantize_state(state_fp32, state_dtype, quant_max)
+        deterministic_residual = (
+            _dequantize_state(det_quant, det_scales).flatten() - fp32_vals
+        )
+    else:
+        fp32_vals = state_fp32.flatten()
+        stochastic_residual = state_rounded.float().flatten() - fp32_vals
+        deterministic_residual = fp32_vals.to(state_dtype).float() - fp32_vals
 
-    # Only consider elements where rounding matters (non-zero residual possible)
+    # Only consider elements where rounding matters (non-zero residual possible).
     nonzero_mask = deterministic_residual.abs() > 0
     num_nonzero = nonzero_mask.sum().item()
     assert num_nonzero > 1000, f"Too few roundable elements: {num_nonzero}"
 
     stochastic_mean = stochastic_residual[nonzero_mask].mean().item()
+    stochastic_std = stochastic_residual[nonzero_mask].std().item()
     deterministic_mean = deterministic_residual[nonzero_mask].mean().item()
 
-    # Stochastic rounding should be less biased than deterministic.
-    # With ~millions of elements, the stochastic mean should be very close to 0.
-    # Deterministic round-to-nearest-even has a small but systematic bias.
-    assert abs(stochastic_mean) < abs(deterministic_mean) or abs(stochastic_mean) < 1e-5, (
-        f"Stochastic rounding appears biased: stochastic_mean={stochastic_mean:.6f}, "
-        f"deterministic_mean={deterministic_mean:.6f}, n_elements={num_nonzero}"
+    # SE-based bias check.  An unbiased estimator's sample mean has standard
+    # error SE = std / sqrt(n).  We require |sr_mean| < K*SE (K=4 ≈ ~3.2e-5
+    # one-sided false-positive rate).  This auto-calibrates per dtype:
+    #   * int16: residual std ~1e-4 → SE ~9e-8 (very tight bound)
+    #   * int8:  residual std ~3e-2 → SE ~2e-5
+    #   * fp8:   residual std ~1e-1 → SE ~9e-5 (loosest, magnitude-driven)
+    # The previous fixed-1e-5 threshold was below SE for int8/fp8 and would
+    # always fail by chance.  Note the |sr|<|det| fallback was also dropped:
+    # on Gaussian (symmetric) inputs RN's bias is ~0 by symmetry, so SR vs RN
+    # is just two unbiased estimators racing — unreliable as a unbias test.
+    se_sr = stochastic_std / (num_nonzero ** 0.5)
+    K = 4
+    assert abs(stochastic_mean) < K * se_sr, (
+        f"SR mean exceeds {K}*SE (likely biased) ({state_dtype}): "
+        f"stochastic_mean={stochastic_mean:.3e}, "
+        f"SE={se_sr:.3e} (K*SE={K * se_sr:.3e}), "
+        f"deterministic_mean={deterministic_mean:.3e} (for reference), "
+        f"n_elements={num_nonzero}"
     )
 
 
@@ -888,3 +1138,156 @@ def test_checkpointing_heads_per_block_multistep(
             f"T={T}, nheads={nheads}, ngroups={ngroups}, "
             f"state_dtype={state_dtype}, paged_cache={paged_cache}",
         )
+
+
+# ----- SR grid-bracket tests (fp8 and fp16) -----
+#
+# Verify that each PTX SR output lands on the destination dtype's grid as
+# a bracket neighbour of the fp32 input.  Catches byte-order traps in the
+# inline-asm source-register specifier:
+#   * fp8: cvt.rs.satfinite.e4m3x4.f32 with pack=4, asm "{$4,$3,$2,$1}"
+#   * fp16: cvt.rs.f16x2.f32 with pack=2, asm "$0, $2, $1, $3"
+# The unbiased test (test_philox_rounding_unbiased) wouldn't catch a
+# shuffle: outputs that are still on-grid but swapped within a pack still
+# average correctly.  Only the per-element bracket check exposes it.
+#
+# Both kernels are inline copies of the production helpers — kept here so
+# the test exercises the exact PTX form independent of wrapper changes.
+
+
+@triton.jit
+def _bracket_kernel_fp8(x_ptr, rand_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    rand = tl.load(rand_ptr + offs)
+    y = tl.inline_asm_elementwise(
+        asm="cvt.rs.satfinite.e4m3x4.f32 $0, {$4, $3, $2, $1}, $5;",
+        constraints="=r,r,r,r,r,r,r,r,r",
+        args=(x, rand),
+        dtype=tl.float8e4nv,
+        is_pure=True,
+        pack=4,
+    )
+    tl.store(out_ptr + offs, y)
+
+
+@triton.jit
+def _bracket_kernel_fp16(x_ptr, rand_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    rand = tl.load(rand_ptr + offs)
+    y = tl.inline_asm_elementwise(
+        asm="""{
+        cvt.rs.f16x2.f32 $0, $2, $1, $3;
+        }""",
+        constraints=("=r,r,r,r,r"),
+        args=(x, rand),
+        dtype=tl.float16,
+        is_pure=True,
+        pack=2,
+    )
+    tl.store(out_ptr + offs, y)
+
+
+_BRACKET_KERNEL = {
+    torch.float8_e4m3fn: _bracket_kernel_fp8,
+    torch.float16: _bracket_kernel_fp16,
+}
+
+
+def _build_finite_grid(dtype: torch.dtype, device: str) -> torch.Tensor:
+    """Reinterpret all bit patterns of ``dtype`` as floats; return sorted
+    unique finite values (drops ±inf, NaNs)."""
+    if dtype == torch.float8_e4m3fn:
+        ints = torch.arange(256, dtype=torch.uint8, device=device)
+        full = ints.view(torch.float8_e4m3fn).to(torch.float32)
+    elif dtype == torch.float16:
+        # int16 view of all 65536 patterns (covers fp16 normals + subnormals
+        # + ±inf + NaN; we filter to finite below).
+        ints = torch.arange(65536, dtype=torch.int32, device=device).to(torch.int16)
+        full = ints.view(torch.float16).to(torch.float32)
+    else:
+        raise ValueError(f"Unsupported bracket-test dtype: {dtype}")
+    return full[torch.isfinite(full)].sort()[0].unique()
+
+
+def _build_bracket_inputs(dtype: torch.dtype, n: int, device: str) -> torch.Tensor:
+    """Test inputs spanning the dtype's grid range.  Includes on-grid points
+    so we exercise the no-rounding case; for fp8 also includes overflow to
+    test saturation (PTX `cvt.rs.satfinite.e4m3x4.f32` clamps in-op).
+
+    fp16 inputs are kept inside the finite range — `cvt.rs.f16x2.f32` does
+    NOT have a `satfinite` modifier and produces ±inf for OOR inputs (not
+    a saturate-to-±max).  The kernel only ever sees in-range fp32 state in
+    practice (state_amax is always ≪ fp16_max), so the test mirrors that.
+    """
+    grid = _build_finite_grid(dtype, device)
+    g_min, g_max = grid[0].item(), grid[-1].item()
+    x = torch.empty(n, device=device, dtype=torch.float32)
+    if dtype == torch.float8_e4m3fn:
+        # 1.5x range exercises saturation; satfinite handles it in-op.
+        x.uniform_(g_min * 1.5, g_max * 1.5)
+    else:  # fp16: four magnitude bands, all within finite range.
+        x[: n // 4].uniform_(-1.0, 1.0)
+        x[n // 4 : n // 2].uniform_(-100, 100)
+        x[n // 2 : 3 * n // 4].uniform_(-1000, 1000)
+        x[3 * n // 4 :].uniform_(g_min * 0.99, g_max * 0.99)
+    return x, grid
+
+
+@_skip_pre_sm100
+@pytest.mark.parametrize(
+    "state_dtype",
+    [torch.float8_e4m3fn, torch.float16],
+    ids=["fp8", "fp16"],
+)
+def test_sr_grid_bracket(state_dtype):
+    """Verify SR PTX outputs each lie on the destination grid as a bracket
+    neighbour of the fp32 input."""
+    device = "cuda"
+    n = 1024  # multiple of both pack=4 (fp8) and pack=2 (fp16)
+
+    torch.manual_seed(42)
+    x, grid_finite = _build_bracket_inputs(state_dtype, n, device)
+    g_min, g_max = grid_finite[0].item(), grid_finite[-1].item()
+
+    # Bracket [lo, hi] in the destination grid for each input.  For
+    # out-of-range inputs the bracket is the saturating endpoint pair.
+    x_clamped = x.clamp(g_min, g_max)
+    idx = torch.searchsorted(grid_finite, x_clamped, right=False).clamp(
+        min=1, max=len(grid_finite) - 1
+    )
+    lo = grid_finite[idx - 1]
+    hi = grid_finite[idx]
+    # For x exactly on grid, idx points at it; lo = grid[i-1], hi = x — the
+    # bracket allows out==hi (=x) which is what RN-on-grid produces.
+
+    kernel = _BRACKET_KERNEL[state_dtype]
+
+    for seed in range(4):
+        torch.manual_seed(seed)
+        # int32 for raw random bits — PTX takes the bit pattern, sign
+        # interpretation doesn't matter.
+        rand = torch.randint(-(2**31), 2**31, (n,), device=device, dtype=torch.int32)
+        out = torch.empty(n, device=device, dtype=state_dtype)
+        kernel[(1,)](x, rand, out, BLOCK=n)
+        out_fp32 = out.to(torch.float32)
+
+        on_grid = (out_fp32 == lo) | (out_fp32 == hi)
+        if not on_grid.all():
+            offenders = ~on_grid
+            n_off = offenders.sum().item()
+            sample = (
+                x[offenders][:5].tolist(),
+                lo[offenders][:5].tolist(),
+                hi[offenders][:5].tolist(),
+                out_fp32[offenders][:5].tolist(),
+            )
+            pytest.fail(
+                f"{state_dtype} SR output not on grid bracket for {n_off}/{n} "
+                f"elements (seed={seed}).  x={sample[0]} lo={sample[1]} "
+                f"hi={sample[2]} out={sample[3]}.  Likely the PTX byte-order "
+                "bug (cvt.rs source-register order)."
+            )
+
+
