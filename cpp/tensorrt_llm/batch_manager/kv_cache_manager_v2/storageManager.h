@@ -198,6 +198,9 @@ public:
     // Cache tier for a given level.
     CacheTier cacheTier(CacheLevel level) const;
 
+    // NOTE: Python's get_statistics(level) returns a list over all pool groups.
+    // C++ takes a single pgIdx for flexibility; the nanobind wrapper loops over
+    // all pool groups to match Python's signature.
     StorageStatistics getStatistics(CacheLevel level = kGpuLevel, PoolGroupIndex pgIdx = 0) const;
     float getOverallUtilization(CacheLevel level = kGpuLevel) const;
 

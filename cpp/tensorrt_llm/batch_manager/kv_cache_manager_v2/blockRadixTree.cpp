@@ -253,12 +253,13 @@ Block::~Block()
         tryExcludeFromEviction(weakPage);
     }
     // If we're the last child of a root block, remove the root block from the tree.
+    // Mirrors Python: `self.prev.prev.next.pop(self.prev.key)`
     if (parentRoot && parentRoot->next.empty())
     {
         if (auto t = parentRoot->tree.lock())
         {
-            // Remove the root block from the tree's mRoots map.
-            // (BlockRadixTree will call this; the root is already empty.)
+            auto rootKey = parentRoot->key;
+            t->eraseRoot(rootKey);
         }
     }
 }
@@ -323,7 +324,7 @@ void Block::unsetPage(LifeCycleId lcIdx, LifeCycle const& lc)
     if (auto const* alc = std::get_if<AttnLifeCycle>(&lc))
     {
         // If this is a non-sink block with no window (or sink block): evict descendants.
-        // Delegate to removeSubtree() for each child, matching Python's unset_page().
+        // Mirrors Python's remove_subtree(self), which clears ALL storage on self and descendants.
         if (!alc->windowSize.has_value() || ordinal < alc->numSinkBlocks)
         {
             std::vector<BlockKey> childKeys;
@@ -336,6 +337,17 @@ void Block::unsetPage(LifeCycleId lcIdx, LifeCycle const& lc)
                 auto pages = removeSubtree(next, k);
                 for (auto const& weakPage : pages)
                     tryExcludeFromEviction(weakPage);
+            }
+
+            // Also clear self's storage for OTHER lifecycles (Python's remove_subtree(self)
+            // clears all entries in self.storage, not just lcIdx).
+            for (size_t i = 0; i < storage.size(); ++i)
+            {
+                if (i != static_cast<size_t>(lcIdx))
+                {
+                    tryExcludeFromEviction(storage[i]);
+                    storage[i].reset();
+                }
             }
         }
     }
@@ -371,12 +383,13 @@ std::shared_ptr<Block> addOrGetExistingBlock(std::unordered_map<BlockKey, std::s
     }
 
     // Useless check: is this block's token prefix covered by a sibling?
+    // Mirrors Python's UselessBlockError — throw with the sibling block.
     if (static_cast<int>(tokens.size()) < tokensPerBlock)
     {
         for (auto const& [k, sibling] : parentNext)
         {
             if (sibling->tokens.size() >= tokens.size() && isPrefix(tokens, sibling->tokens))
-                return nullptr; // useless
+                throw UselessBlockError(sibling);
         }
     }
 
@@ -384,8 +397,11 @@ std::shared_ptr<Block> addOrGetExistingBlock(std::unordered_map<BlockKey, std::s
     std::vector<BlockKey> toRemove;
     for (auto const& [k, sibling] : parentNext)
     {
-        if (sibling->tokens.size() < tokens.size() && sibling->next.empty() && isPrefix(sibling->tokens, tokens))
+        if (sibling->tokens.size() < tokens.size() && isPrefix(sibling->tokens, tokens))
+        {
+            assert(!sibling->isFull() && sibling->key == k && sibling->next.empty());
             toRemove.push_back(k);
+        }
     }
     for (auto const& k : toRemove)
         parentNext.erase(k);
@@ -478,8 +494,6 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::match(
     std::optional<int64_t> loraTaskId, std::vector<TokenIdExt> const& tokens, bool enablePartialMatch) const
 {
     std::vector<MatchResult> results;
-    if (tokens.empty())
-        return results;
 
     // Lazily compute one key per iteration — no wasted hashing on early miss.
     auto gen = makeBlockchainKeyGenerator(mTokensPerBlock, loraTaskId, tokens.data(), tokens.size());
@@ -542,7 +556,12 @@ std::vector<std::weak_ptr<CommittedPage>> BlockRadixTree::clear()
 {
     std::vector<std::weak_ptr<CommittedPage>> ret;
 
-    for (auto& [rootKey, root] : mRoots)
+    // Swap mRoots into a local so that if ~Block() calls eraseRoot() during
+    // removeSubtree() destruction, it operates on the (now-empty) mRoots — safe no-op.
+    std::unordered_map<BlockKey, RootBlock> roots;
+    roots.swap(mRoots);
+
+    for (auto& [rootKey, root] : roots)
     {
         // Collect child keys, then delegate to removeSubtree() for each — mirrors Python's clear().
         std::vector<BlockKey> childKeys;
@@ -557,7 +576,6 @@ std::vector<std::weak_ptr<CommittedPage>> BlockRadixTree::clear()
                 ret.push_back(weakPage);
         }
     }
-    mRoots.clear();
 
     return ret;
 }

@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cuda.h>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -113,6 +114,27 @@ class OutOfPagesError : public std::runtime_error
 public:
     explicit OutOfPagesError(std::string const& msg = "Out of pages")
         : std::runtime_error(msg)
+    {
+    }
+};
+
+// Block creation rejected because its tokens are fully covered by an existing sibling.
+// Mirrors Python's UselessBlockError — carries the sibling block.
+// TODO: Once Python is removed and C++ becomes the primary development target,
+// replace this exception-based flow with a simple if-condition return in
+// addOrGetExistingBlock (returning the sibling block directly instead of throwing).
+// The exception pattern exists only to maintain parity with the Python code path.
+// Forward-declared; Block definition is in blockRadixTree.h.
+struct Block;
+
+class UselessBlockError : public std::runtime_error
+{
+public:
+    std::shared_ptr<Block> block;
+
+    explicit UselessBlockError(std::shared_ptr<Block> blk)
+        : std::runtime_error("Block is useless — covered by existing sibling")
+        , block(std::move(blk))
     {
     }
 };

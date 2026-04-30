@@ -204,6 +204,12 @@ public:
         return mRoots;
     }
 
+    // Remove a childless root block from the tree (mirrors Python Block.__del__ cleanup).
+    void eraseRoot(BlockKey const& key)
+    {
+        mRoots.erase(key);
+    }
+
 private:
     LifeCycleRegistry const& mLifeCycles;
     int mTokensPerBlock;
@@ -216,10 +222,10 @@ private:
 // ---------------------------------------------------------------------------
 
 // Add a block to a parent's `next` map, or return the existing one on collision.
-// Returns nullptr if the block would be "useless" (its tokens are a prefix of an
-// existing sibling).
+// Throws UselessBlockError (with the sibling block) if the block's tokens are a
+// prefix of an existing sibling — mirrors Python's UselessBlockError.
 // If isNew is non-null, *isNew is set to true if a new block was created, false
-// if an existing block was returned (matches Python's UselessBlockError path).
+// if an existing block was returned.
 std::shared_ptr<Block> addOrGetExistingBlock(std::unordered_map<BlockKey, std::shared_ptr<Block>>& parentNext,
     BlockKey const& parentKey, int numLifeCycles, int tokensPerBlock, std::vector<TokenIdExt> tokens,
     RootBlock* parentRoot, Block* parentBlock, bool* isNew = nullptr);

@@ -20,6 +20,7 @@
 #include "kv_cache_manager_v2/copyEngine.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/page.h"
+#include "kv_cache_manager_v2/utils/hostMem.h"
 #include "kv_cache_manager_v2/utils/math.h"
 
 #include <algorithm>
@@ -54,8 +55,8 @@ int CacheLevelManager::cacheTierGranularity(CacheTier tier, size_t quota)
         return static_cast<int>(
             kPageSize << std::min(4, std::max(0, static_cast<int>(std::log2(quota / (kPageSize * 512))))));
     }
-    case CacheTier::HOST_MEM: return 2 << 20; // HostCacheLevelStorage::POOL_SIZE_GRANULARITY
-    case CacheTier::DISK: return 2 << 20;     // DiskCacheLevelStorage::POOL_SIZE_GRANULARITY
+    case CacheTier::HOST_MEM: return static_cast<int>(HostMem::kAlignment); // 4 KiB
+    case CacheTier::DISK: return 2 << 20; // DiskCacheLevelStorage::POOL_SIZE_GRANULARITY
     default: throw std::invalid_argument("Invalid cache tier");
     }
 }
@@ -439,8 +440,8 @@ void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, Cac
             int oldFree = storage.numFreeSlots(static_cast<PoolGroupIndex>(pg));
             int numEvicted = static_cast<int>(ev.size());
             auto& fp = fallenPages.at(static_cast<size_t>(pg));
-            for (auto& sp : ev)
-                fp.insert(fp.begin(), sp); // prepend evicted to fallen (shared_ptr copy)
+            fp.insert(fp.begin(), ev.begin(), ev.end()); // prepend evicted to fallen (preserving order)
+            ev.clear();
 
             int goal = goals.at(static_cast<size_t>(lvlId)).at(static_cast<size_t>(pg));
             int numAccepted = std::min(oldFree + numEvicted - goal, static_cast<int>(fp.size()));
