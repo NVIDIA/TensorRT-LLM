@@ -1,5 +1,3 @@
-import os
-from contextlib import contextmanager
 from enum import IntEnum
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
@@ -11,37 +9,9 @@ from tensorrt_llm._torch.attention_backend.interface import MLAParams, Positiona
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
-from tensorrt_llm._torch.utils import maybe_compile
 
 if TYPE_CHECKING:
     from .deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
-
-# When set to "1", forces wkv_gate to use full FP32 computation (via nn.Linear)
-# instead of the default TF32 path (via F.linear + allow_tf32).
-_USE_FP32_COMPRESSOR = os.environ.get("DEEPSEEK_V4_COMPRESSOR_FP32", "0") == "1"
-
-
-@maybe_compile(dynamic=True)
-def _to_float(x: torch.Tensor) -> torch.Tensor:
-    """Cast to float32 for TF32 GEMM (following DSA pattern)."""
-    return x.float()
-
-
-@contextmanager
-def _tf32_matmul_enabled():
-    """Temporarily enable TF32 for FP32 matmul in this scope.
-
-    Forces PyTorch/cuBLASLt to use CUBLAS_COMPUTE_32F_FAST_TF32 which
-    guarantees TF32 tensor cores. Plain CUBLAS_COMPUTE_32F (used by
-    torch.ops.trtllm.cublas_mm) falls back to SIMT SGEMM based on
-    cuBLASLt heuristics for small M.
-    """
-    prev = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = True
-    try:
-        yield
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = prev
 
 
 class KVCacheDtype(IntEnum):
@@ -137,7 +107,7 @@ class Compressor(nn.Module):
             self.dim,
             self.state_dim * 2,
             bias=False,
-            dtype=torch.float32,
+            dtype=dtype,
             quant_config=None,
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True,
@@ -213,15 +183,9 @@ class Compressor(nn.Module):
         num_comp_tokens = metadata.new_comp_kv_lens_cuda[self.compress_ratio][:bsz]
         max_ctx_comp_kv_lens = metadata.max_ctx_compressed_tokens[self.compress_ratio]
 
-        # Project input to KV and score.
-        # Default: TF32 via F.linear under allow_tf32 context (explicit
-        #   CUBLAS_COMPUTE_32F_FAST_TF32 -> TF32 tensor cores on Ampere+).
-        # Fallback: strict FP32 via nn.Linear when DEEPSEEK_V4_COMPRESSOR_FP32=1.
-        if _USE_FP32_COMPRESSOR:
-            kv_score = self.wkv_gate(_to_float(x))
-        else:
-            with _tf32_matmul_enabled():
-                kv_score = F.linear(_to_float(x), self.wkv_gate.weight)
+        # Project input to KV and score in the checkpoint dtype, then store the
+        # result in fp32 for the compressor kernels.
+        kv_score = F.linear(x.to(self.wkv_gate.weight.dtype), self.wkv_gate.weight).float()
 
         # Allocate output buffer
         kv_comp = torch.empty(total_num_comp_tokens, self.head_dim, device=x.device, dtype=x.dtype)

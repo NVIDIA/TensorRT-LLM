@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the BF16 GEMM and FP32 escape-hatch paths in the DeepSeek-V4
-Compressor wkv_gate.
+"""Tests for the BF16 GEMM path in the DeepSeek-V4 Compressor wkv_gate.
 
 The wkv_gate weight now matches the upstream V4 checkpoint dtype (bf16). The
-DEEPSEEK_V4_COMPRESSOR_FP32=1 escape hatch keeps the GEMM in fp32 for
-accuracy debugging. These tests cover both paths against an fp32 reference.
+GEMM runs in that dtype, then stores the result in fp32 for compressor kernels.
 """
-
-import os
-from unittest import mock
 
 import pytest
 import torch
@@ -47,8 +42,8 @@ def _bf16_path(x: torch.Tensor, wkv_gate: Linear) -> torch.Tensor:
     return F.linear(x.to(wkv_gate.weight.dtype), wkv_gate.weight).float()
 
 
-def _fp32_path(x: torch.Tensor, wkv_gate: Linear) -> torch.Tensor:
-    """FP32 escape hatch: upcast both inputs to fp32 (DEEPSEEK_V4_COMPRESSOR_FP32=1)."""
+def _fp32_reference(x: torch.Tensor, wkv_gate: Linear) -> torch.Tensor:
+    """FP32 reference path."""
     return F.linear(x.float(), wkv_gate.weight.float())
 
 
@@ -77,9 +72,10 @@ def test_bf16_path_close_to_fp32_reference(num_tokens):
 
     with torch.no_grad():
         out_bf16 = _bf16_path(x, bf16_gate)
-        out_fp32 = _fp32_path(x, fp32_gate)
+        out_fp32 = _fp32_reference(x, fp32_gate)
 
     assert out_bf16.shape == out_fp32.shape
+    assert out_bf16.dtype == torch.float32
 
     a, b = out_bf16.flatten(), out_fp32.flatten()
     cos_sim = F.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
@@ -89,20 +85,3 @@ def test_bf16_path_close_to_fp32_reference(num_tokens):
     scale = max(a.abs().max().item(), b.abs().max().item(), 1e-3)
     rel_err = max_diff / scale
     assert rel_err <= 0.1, f"rel_err={rel_err:.6f}, max_diff={max_diff:.6f}"
-
-
-def test_env_var_selects_fp32_path():
-    """DEEPSEEK_V4_COMPRESSOR_FP32=1 env var causes module-level flag to be True."""
-    import importlib
-
-    import tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor as mod
-
-    with mock.patch.dict(os.environ, {"DEEPSEEK_V4_COMPRESSOR_FP32": "1"}):
-        importlib.reload(mod)
-        assert mod._USE_FP32_COMPRESSOR is True
-
-    # Restore default
-    with mock.patch.dict(os.environ, {}, clear=False):
-        os.environ.pop("DEEPSEEK_V4_COMPRESSOR_FP32", None)
-        importlib.reload(mod)
-        assert mod._USE_FP32_COMPRESSOR is False
