@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,9 +35,18 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-static constexpr int BLOCK_SIZE = 1024;
 static constexpr int WARP_SIZE = 32;
-static constexpr int WARPS_PER_BLOCK = BLOCK_SIZE / WARP_SIZE;
+// Default block size for kernels with small MaxNumExperts (<=128).
+// Large-expert variants (256/384/512) use a smaller block (see pickBlockSize)
+// to reduce register-file pressure and permit higher SM occupancy.
+static constexpr int DEFAULT_BLOCK_SIZE = 1024;
+static constexpr int LARGE_BLOCK_SIZE = 256;
+
+template <int MaxNumExperts>
+constexpr int pickBlockSize()
+{
+    return MaxNumExperts > 128 ? LARGE_BLOCK_SIZE : DEFAULT_BLOCK_SIZE;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -110,15 +119,17 @@ __device__ void calcSoftmax(cg::thread_block_tile<WARP_SIZE> const& warp, DataTy
 
 template <typename InputT, typename OutputT, typename IdxT, int MaxNumExperts, int MaxNumTopExperts,
     bool DoSoftmaxBeforeTopK>
-__global__ void customMoeRoutingKernel(InputT* routerLogits, OutputT* topkValues, IdxT* topkIndices,
-    int32_t const numTokens, int32_t const numExperts, int32_t const topK)
+__global__ void __launch_bounds__(pickBlockSize<MaxNumExperts>(), 1) customMoeRoutingKernel(InputT* routerLogits,
+    OutputT* topkValues, IdxT* topkIndices, int32_t const numTokens, int32_t const numExperts, int32_t const topK)
 {
     using BaseType = std::conditional_t<DoSoftmaxBeforeTopK, float, InputT>;
+    constexpr int kBlockSize = pickBlockSize<MaxNumExperts>();
+    constexpr int kWarpsPerBlock = kBlockSize / WARP_SIZE;
     uint32_t const blockRank = blockIdx.x;
-    uint32_t const tIdx = BLOCK_SIZE * blockRank + threadIdx.x;
+    uint32_t const tIdx = kBlockSize * blockRank + threadIdx.x;
     uint32_t const warpIdx = tIdx / WARP_SIZE;
     uint32_t const laneIdx = tIdx % WARP_SIZE;
-    uint32_t const warpNum = gridDim.x * WARPS_PER_BLOCK;
+    uint32_t const warpNum = gridDim.x * kWarpsPerBlock;
     auto block = cg::this_thread_block();
     auto warp = cg::tiled_partition<WARP_SIZE>(block);
 
@@ -217,6 +228,9 @@ int nextPowerOfTwo(int num)
         case 8:                                                                                                        \
             kernelInstance = &customMoeRoutingKernel<InputT, OutputT, IdxT, MAX_NUM_EXPERTS, 8, DoSoftmaxBeforeTopK>;  \
             break;                                                                                                     \
+        case 16:                                                                                                       \
+            kernelInstance = &customMoeRoutingKernel<InputT, OutputT, IdxT, MAX_NUM_EXPERTS, 16, DoSoftmaxBeforeTopK>; \
+            break;                                                                                                     \
         default: kernelInstance = nullptr; break;                                                                      \
         }                                                                                                              \
         break;
@@ -227,10 +241,15 @@ void invokeCustomMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* top
 {
 
     const uint32_t maxNumBlocks = 1024;
-    const uint32_t numBlocks = std::min(static_cast<uint32_t>((numTokens - 1) / WARPS_PER_BLOCK + 1), maxNumBlocks);
 
     uint32_t maxNumExperts = nextPowerOfTwo(numExperts) < 32 ? 32 : nextPowerOfTwo(numExperts);
     uint32_t maxNumTopExperts = nextPowerOfTwo(topK);
+
+    // Pick block size matching what pickBlockSize<> selects for this MaxNumExperts.
+    // Large-expert variants use LARGE_BLOCK_SIZE to reduce register pressure.
+    uint32_t blockSize = maxNumExperts > 128 ? LARGE_BLOCK_SIZE : DEFAULT_BLOCK_SIZE;
+    uint32_t warpsPerBlock = blockSize / WARP_SIZE;
+    const uint32_t numBlocks = std::min(static_cast<uint32_t>((numTokens - 1) / warpsPerBlock + 1), maxNumBlocks);
 
     auto* kernelInstance = &customMoeRoutingKernel<InputT, OutputT, IdxT, 128, 8, DoSoftmaxBeforeTopK>;
 
@@ -240,6 +259,9 @@ void invokeCustomMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* top
         CASE(64)
         CASE(96)
         CASE(128)
+        CASE(256)
+        CASE(384)
+        CASE(512)
     default: kernelInstance = nullptr; break;
     }
 
@@ -249,7 +271,7 @@ void invokeCustomMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* top
     }
 
     dim3 renormMoeRoutingGridDim(numBlocks);
-    dim3 renormMoeRoutingBlockDim(BLOCK_SIZE);
+    dim3 renormMoeRoutingBlockDim(blockSize);
     cudaLaunchConfig_t config;
     config.gridDim = renormMoeRoutingGridDim;
     config.blockDim = renormMoeRoutingBlockDim;
