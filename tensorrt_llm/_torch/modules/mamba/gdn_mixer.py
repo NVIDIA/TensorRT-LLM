@@ -3,6 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from typing import Optional
 
 import torch
@@ -11,7 +12,12 @@ import triton.language as tl
 from torch import nn
 from transformers import Qwen3NextConfig
 
-from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
+# Default: FlashInfer GDN prefill ON. Set TLLM_USE_FLASHINFER_GDN_PREFILL=0 to
+# fall back to the vendored Triton chunk_gated_delta_rule.
+if os.getenv("TLLM_USE_FLASHINFER_GDN_PREFILL", "1") == "1":
+    from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule
+else:
+    from tensorrt_llm._torch.modules.fla.chunk import chunk_gated_delta_rule
 from tensorrt_llm._torch.modules.fla.fused_recurrent import fused_recurrent_gated_delta_rule_update
 from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
@@ -743,7 +749,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 beta_p = b_p.sigmoid().unsqueeze(0)
                 g_p = fused_gdn_gating(self.A_log, a_p, self.dt_bias).unsqueeze(0)
                 recurrent_state_p = ssm_states[state_indices_p]
-
                 attn_out_prefill, last_recurrent_state = chunk_gated_delta_rule(
                     q=query_p,
                     k=key_p,
