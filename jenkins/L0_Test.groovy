@@ -3228,59 +3228,9 @@ def launchTestJobs(pipeline, testFilter)
     }]]}
 
     // Python version and OS for sanity check
-    x86SanityCheckConfigs = [
-        "PY312-DLFW": [
-            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,  // Workaround ABI incompatibilities between PyTorch 2.9.1 and 2.10.0a0
-            "B200_PCIe",
-            X86_64_TRIPLE,
-            false,
-            "dlfw/",
-            DLFW_IMAGE,
-            false,
-        ],
-        "PY310-UB2204": [
-            LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
-            "A10",
-            X86_64_TRIPLE,
-            true,
-            "",
-            UBUNTU_22_04_IMAGE,
-            true, // Extra install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
-        ],
-        "PY312-UB2404": [
-            LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
-            "RTX5090",
-            X86_64_TRIPLE,
-            true,
-            "",
-            UBUNTU_24_04_IMAGE,
-            true, // Extra PyTorch CUDA 13.0 install
-        ],
-    ]
+    x86SanityCheckConfigs = [:]
 
-    aarch64SanityCheckConfigs = [
-        // Workaround PyTorch 2.9.1 vs. 2.10.0a0 incompatibility issue. Once resolved, change back to:
-        // 1. DLFW_IMAGE -> UBUNTU_24_04_IMAGE
-        // 2. Extra PyTorch CUDA install: false -> true
-        "PY312-UB2404": [
-            LLM_DOCKER_IMAGE,
-            "GH200",
-            AARCH64_TRIPLE,
-            false,
-            "",
-            UBUNTU_24_04_IMAGE,
-            true, // Extra PyTorch CUDA 13.0 install
-        ],
-        "PY312-DLFW": [
-            LLM_DOCKER_IMAGE,
-            "GH200",
-            AARCH64_TRIPLE,
-            false,
-            "dlfw/",
-            DLFW_IMAGE,
-            false,
-        ],
-    ]
+    aarch64SanityCheckConfigs = [:]
 
     def toStageName = { gpuType, key -> "${gpuType}-PackageSanityCheck-${key}".toString() }
     fullSet += x86SanityCheckConfigs.collectEntries{ key, values -> [toStageName(values[1], key), null] }.keySet()

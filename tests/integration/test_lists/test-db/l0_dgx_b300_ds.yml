@@ -12,7 +12,7 @@ l0_dgx_b300_ds:
       linux_distribution_name: ubuntu*
       cpu: x86_64
     terms:
-      stage: post_merge
+      stage: pre_merge
       backend: pytorch
   tests:
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_kv_cache_v2_nixl_python
