@@ -77,26 +77,33 @@ th::Tensor dsv3_router_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b,
     auto const out_dtype_ = out_dtype.value_or(mat_a.scalar_type());
     auto const data_type = mat_a.scalar_type();
     constexpr int kNumExperts = 256;
-    constexpr int kHiddenDim = 7168;
     std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[1]};
     th::Tensor out = th::empty(output_size, mat_a.options().dtype(out_dtype_));
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
     TORCH_CHECK(mat_a.strides()[1] == 1 && out.strides()[1] == 1); // Row-major
     TORCH_CHECK(mat_b.strides()[0] == 1);                          // Column-major
-    TORCH_CHECK(!bias.has_value(), "bias is not support yet");
-    auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
-    bool use_custom_kernel = false;
-    if (num_tokens >= 1 && num_tokens <= 16 && num_experts == kNumExperts && hidden_dim == kHiddenDim
-        && data_type == torch::kBFloat16 && out_dtype_ == torch::kFloat32)
-    {
-        use_custom_kernel = true;
-    }
+
+    // For batch <= 16 with bf16 input, fp32 output, and 256 experts, use the fast
+    // template-unrolled kernel. Supports hidden_dim 7168 (V3) and 4096 (V4).
+    // For larger batches or other configs, fall back to cuBLAS.
+    bool const use_custom_kernel = num_tokens >= 1 && num_tokens <= 16 && num_experts == kNumExperts
+        && (hidden_dim == 7168 || hidden_dim == 4096) && data_type == torch::kBFloat16 && out_dtype_ == torch::kFloat32
+        && !bias.has_value();
 
     if (use_custom_kernel)
     {
-        LoopUnroller<1, 16, kNumExperts, kHiddenDim>::unroll(num_tokens,
-            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
+        auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
+        auto* out_ptr = reinterpret_cast<float*>(out.mutable_data_ptr());
+        auto const* a_ptr = reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr());
+        auto const* b_ptr = reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr());
+        if (hidden_dim == 7168)
+        {
+            LoopUnroller<1, 16, kNumExperts, 7168>::unroll(num_tokens, out_ptr, a_ptr, b_ptr, stream);
+        }
+        else
+        {
+            LoopUnroller<1, 16, kNumExperts, 4096>::unroll(num_tokens, out_ptr, a_ptr, b_ptr, stream);
+        }
     }
     else
     {
