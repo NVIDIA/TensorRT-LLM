@@ -68,7 +68,6 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 UpdateWeightsRequest, UsageInfo,
                                                 VideoGenerationRequest,
                                                 VideoJob, VideoJobList,
-                                                to_disaggregated_params,
                                                 to_llm_disaggregated_params)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
@@ -1216,8 +1215,6 @@ class OpenAIServer:
                         index=0,
                         message=ChatMessage(role="assistant", content="dummy"),
                         mm_embedding_handle=mm_embedding_handle,
-                        disaggregated_params=to_disaggregated_params(
-                            promise.disaggregated_params),
                         finish_reason="length",
                     )
                 ],

@@ -4,15 +4,6 @@ import pytest
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
-MM_HANDLES = [
-    {"tensor_size": [2, 4], "method_key": "cuda:0"},
-    {"tensor_size": [3, 4], "method_key": "cuda:1"},
-]
-MM_HASHES = [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]]
-MM_HASH_POSITIONS = [[1, 3], [6, 8, 10]]
-MROPE_POSITION_IDS_HANDLE = {"tensor_size": [1, 2]}
-MROPE_POSITION_DELTAS_HANDLE = {"tensor_size": [1]}
-
 
 def test_disaggregated_params_ctx_dp_rank():
     params = DisaggregatedParams()
@@ -65,11 +56,6 @@ def test_to_disaggregated_params():
         first_gen_tokens=[1, 2],
         ctx_dp_rank=5,
         ctx_info_endpoint="tcp://10.0.0.1:5000",
-        multimodal_embedding_handles=MM_HANDLES,
-        multimodal_hashes=MM_HASHES,
-        multimodal_hash_positions=MM_HASH_POSITIONS,
-        mrope_position_ids_handle=MROPE_POSITION_IDS_HANDLE,
-        mrope_position_deltas_handle=MROPE_POSITION_DELTAS_HANDLE,
     )
     openai_params = to_disaggregated_params(llm_params)
 
@@ -77,11 +63,6 @@ def test_to_disaggregated_params():
     assert openai_params.first_gen_tokens == [1, 2]
     assert openai_params.ctx_dp_rank == 5
     assert openai_params.ctx_info_endpoint == "tcp://10.0.0.1:5000"
-    assert openai_params.multimodal_embedding_handles == MM_HANDLES
-    assert openai_params.multimodal_hashes == MM_HASHES
-    assert openai_params.multimodal_hash_positions == MM_HASH_POSITIONS
-    assert openai_params.mrope_position_ids_handle == MROPE_POSITION_IDS_HANDLE
-    assert openai_params.mrope_position_deltas_handle == MROPE_POSITION_DELTAS_HANDLE
 
 
 def test_to_llm_disaggregated_params():
@@ -92,111 +73,12 @@ def test_to_llm_disaggregated_params():
         request_type="generation_only",
         ctx_dp_rank=2,
         ctx_info_endpoint="tcp://10.0.0.1:5000",
-        multimodal_embedding_handles=MM_HANDLES,
-        multimodal_hashes=MM_HASHES,
-        multimodal_hash_positions=MM_HASH_POSITIONS,
-        mrope_position_ids_handle=MROPE_POSITION_IDS_HANDLE,
-        mrope_position_deltas_handle=MROPE_POSITION_DELTAS_HANDLE,
     )
     llm_params = to_llm_disaggregated_params(openai_params)
 
     assert llm_params.request_type == "generation_only"
     assert llm_params.ctx_dp_rank == 2
     assert llm_params.ctx_info_endpoint == "tcp://10.0.0.1:5000"
-    assert llm_params.multimodal_embedding_handles == MM_HANDLES
-    assert llm_params.multimodal_hashes == MM_HASHES
-    assert llm_params.multimodal_hash_positions == MM_HASH_POSITIONS
-    assert llm_params.mrope_position_ids_handle == MROPE_POSITION_IDS_HANDLE
-    assert llm_params.mrope_position_deltas_handle == MROPE_POSITION_DELTAS_HANDLE
-
-
-def test_disaggregated_params_conversion_roundtrip_preserves_exact_positions():
-    from tensorrt_llm.serve.openai_protocol import (
-        to_disaggregated_params,
-        to_llm_disaggregated_params,
-    )
-
-    llm_params = DisaggregatedParams(
-        request_type="context_only",
-        first_gen_tokens=[1, 2],
-        ctx_request_id=17,
-        multimodal_embedding_handles=MM_HANDLES,
-        multimodal_hashes=MM_HASHES,
-        multimodal_hash_positions=MM_HASH_POSITIONS,
-        mrope_position_ids_handle=MROPE_POSITION_IDS_HANDLE,
-        mrope_position_deltas_handle=MROPE_POSITION_DELTAS_HANDLE,
-    )
-
-    roundtripped = to_llm_disaggregated_params(to_disaggregated_params(llm_params))
-
-    assert roundtripped.multimodal_embedding_handles == MM_HANDLES
-    assert roundtripped.multimodal_hashes == MM_HASHES
-    assert roundtripped.multimodal_hash_positions == MM_HASH_POSITIONS
-    assert roundtripped.mrope_position_ids_handle == MROPE_POSITION_IDS_HANDLE
-    assert roundtripped.mrope_position_deltas_handle == MROPE_POSITION_DELTAS_HANDLE
-
-
-def test_conversion_roundtrip_keeps_absent_positions_none():
-    from tensorrt_llm.serve.openai_protocol import (
-        to_disaggregated_params,
-        to_llm_disaggregated_params,
-    )
-
-    llm_params = DisaggregatedParams(
-        request_type="context_only",
-        multimodal_embedding_handles=MM_HANDLES,
-        multimodal_hashes=MM_HASHES,
-    )
-
-    roundtripped = to_llm_disaggregated_params(to_disaggregated_params(llm_params))
-
-    assert roundtripped.multimodal_embedding_handles == MM_HANDLES
-    assert roundtripped.multimodal_hashes == MM_HASHES
-    assert roundtripped.multimodal_hash_positions is None
-
-
-def test_mm_encoder_response_json_roundtrip_preserves_multimodal_disagg_fields():
-    from tensorrt_llm.serve.openai_protocol import (
-        ChatCompletionResponse,
-        ChatCompletionResponseChoice,
-        ChatMessage,
-        UsageInfo,
-        to_llm_disaggregated_params,
-    )
-    from tensorrt_llm.serve.openai_protocol import DisaggregatedParams as OpenAIDisaggregatedParams
-
-    response = ChatCompletionResponse(
-        id="mm-encoder-response",
-        model="test-model",
-        choices=[
-            ChatCompletionResponseChoice(
-                index=0,
-                message=ChatMessage(role="assistant", content="dummy"),
-                finish_reason="length",
-                mm_embedding_handle=MM_HANDLES,
-                disaggregated_params=OpenAIDisaggregatedParams(
-                    request_type="context_only",
-                    multimodal_embedding_handles=MM_HANDLES,
-                    multimodal_hashes=MM_HASHES,
-                    multimodal_hash_positions=MM_HASH_POSITIONS,
-                    mrope_position_ids_handle=MROPE_POSITION_IDS_HANDLE,
-                    mrope_position_deltas_handle=MROPE_POSITION_DELTAS_HANDLE,
-                ),
-            )
-        ],
-        usage=UsageInfo(prompt_tokens=5, completion_tokens=0, total_tokens=5),
-    )
-
-    roundtripped = ChatCompletionResponse(**response.model_dump(mode="json"))
-    choice = roundtripped.choices[0]
-    llm_params = to_llm_disaggregated_params(choice.disaggregated_params)
-
-    assert choice.mm_embedding_handle == MM_HANDLES
-    assert llm_params.multimodal_embedding_handles == MM_HANDLES
-    assert llm_params.multimodal_hashes == MM_HASHES
-    assert llm_params.multimodal_hash_positions == MM_HASH_POSITIONS
-    assert llm_params.mrope_position_ids_handle == MROPE_POSITION_IDS_HANDLE
-    assert llm_params.mrope_position_deltas_handle == MROPE_POSITION_DELTAS_HANDLE
 
 
 @patch("tensorrt_llm.disaggregated_params.tllme")
