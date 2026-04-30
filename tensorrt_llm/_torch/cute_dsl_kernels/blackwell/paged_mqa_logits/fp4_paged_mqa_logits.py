@@ -43,6 +43,7 @@ Epilogue dtype flows:
   before passing to the kernel, so the tma_atom_w dtype matches `self.epi_bytes`.
 """
 
+import math
 from typing import Tuple
 
 import cuda.bindings.driver as cuda
@@ -541,20 +542,11 @@ class FP4MQALogitsKernel:
         )
         # TMEM allocator requires num_columns to be a power of two AND a
         # multiple of 32, between 32 and 512. Round up to next valid value.
-        # TODO: learn how utils.get_num_tmem_alloc_cols rounds up to the next valid value
-        valid_tmem_cols = (32, 64, 128, 256, 512)
-        rounded = next((v for v in valid_tmem_cols if v >= raw_total), None)
-        assert rounded is not None, (
-            f"FP4 raw TMEM cols {raw_total} exceeds 512 (max). "
-            f"acc={self.num_tmem_alloc_cols * self.num_groups * self.num_umma_stages}, "
-            f"sfa_per_wg={self.num_sfa_tmem_cols} x{self.num_groups}, "
-            f"sfb={self.num_sfb_tmem_cols}. "
-            f"next_n={self.next_n} — see plan TMEM table."
-        )
-        self.num_tmem_alloc_cols_total = rounded
-        # Sanity: we should always pass since raw_total <= 512 holds for next_n ≤ 3.
+        # Equivalent to utils.get_num_tmem_alloc_cols(..., rounding=True) but
+        # without needing a tmem tensor handle (we already have raw_total).
+        self.num_tmem_alloc_cols_total = max(1 << math.ceil(math.log2(raw_total)), 32)
         assert self.num_tmem_alloc_cols_total <= 512, (
-            f"FP4 TMEM exceeds 512 cols: "
+            f"FP4 TMEM exceeds 512 cols: raw={raw_total}, "
             f"acc={self.num_tmem_alloc_cols * self.num_groups * self.num_umma_stages}, "
             f"sfa_per_wg={self.num_sfa_tmem_cols} x{self.num_groups}, "
             f"sfb={self.num_sfb_tmem_cols}, "
@@ -705,14 +697,15 @@ class FP4MQALogitsKernel:
         )
 
         # TMA for SF Q — [N, batch_size] int32, tile [N] (1D, like weights).
-        # SMEM single stage size = N_padded int32 (pad to UTCCP atom = 128 token).
-        # TMA descriptor tile = real N (NOT N_padded): TMA fetches only the
-        # valid SF Q region from GMEM. Remaining N_padded-N SMEM positions
-        # stay whatever was there (zero from host pad while host pad still
-        # exists; once host pad is removed this becomes garbage). UMMA_N=N
-        # ensures MMA never reads SFB cols ≥ N, and the math epilogue only
-        # writes acc cols [0, N), so the SMEM/TMEM tail is harmless.
-        # Mirrors DeepGEMM's TMA box = kRealNumSFQAtom (= next_n*num_heads).
+        # SMEM single stage size = N_padded int32 (UTCCP atom is 128-token
+        # aligned, so SMEM allocation must round up; UTCCP reads the full
+        # N_padded region). TMA descriptor tile = real N: TMA fetches only
+        # the valid GMEM region; SMEM positions [N, N_padded) are left as
+        # garbage. The garbage propagates through UTCCP into TMEM SFB cols
+        # ≥ N, but MMA reads only SFB cols [0, N) since UMMA_N = N, and
+        # the epilogue writes acc cols [0, N) — so the tail never affects
+        # output. Mirrors DeepGEMM's tma::copy<kRealNumSFQAtom, ...> with
+        # kNumSFQAtom-sized SMEM (sm100_fp4_paged_mqa_logits.cuh:202).
         N_padded = ((self.N + 127) // 128) * 128
         self.N_padded = N_padded
         # sf_q stage stride in int32 elem (= 4 bytes/elem). Pad to 128B (= 32 int32).
