@@ -14,7 +14,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 FunctionDefinition)
 from tensorrt_llm.serve.router import (ConversationRouter, KvCacheAwareRouter,
                                        LoadBalancingRouter, RoundRobinRouter,
-                                       create_router)
+                                       block_key_hasher, create_router)
 
 
 def _make_mock_aiohttp_session(return_value=None):
@@ -301,20 +301,22 @@ async def test_kv_cache_aware_router(servers, mock_aiohttp_session):
     hit_servers, hit_infos = zip(*results)
     assert hit_servers == (server_of[2], server_of[1], server_of[0])
 
-    # matched partial block will be counted as a whole block
-    # req2 ([1002]*300): only matches server_of[2] → 320 tokens
+    # matched partial blocks are counted by their actual token lengths
+    # req2 ([1002]*300): only matches server_of[2] -> 299 hashable tokens
     m0 = matches_by_server(hit_infos[0])
-    assert m0[server_of[2]] == 320
+    assert m0[server_of[2]] == 299
     assert m0[server_of[0]] == 0
     assert m0[server_of[1]] == 0
-    # req1 ([1000]*50+[1001]*150): full match server_of[1] → 224, partial server_of[0] → 32
+    # req1 ([1000]*50+[1001]*150): full match server_of[1] -> 199,
+    # partial server_of[0] -> 32
     m1 = matches_by_server(hit_infos[1])
-    assert m1[server_of[1]] == 224
+    assert m1[server_of[1]] == 199
     assert m1[server_of[0]] == 32
     assert m1[server_of[2]] == 0
-    # req0 ([1000]*100): full match server_of[0] → 128, partial server_of[1] → 32
+    # req0 ([1000]*100): full match server_of[0] -> 99,
+    # partial server_of[1] -> 32
     m2 = matches_by_server(hit_infos[2])
-    assert m2[server_of[0]] == 128
+    assert m2[server_of[0]] == 99
     assert m2[server_of[1]] == 32
     assert m2[server_of[2]] == 0
     for request in requests:
@@ -355,6 +357,129 @@ async def test_kv_cache_aware_router(servers, mock_aiohttp_session):
     # req2 routes to server_of[2] (full cache hit); others spread elsewhere
     assert final_servers[0] == server_of[2]
     assert len(set(final_servers)) == 3
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_exclude_server_uses_candidate_workloads(
+        servers: list[str]) -> None:
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                use_tokens=False,
+                                max_batch_size=10,
+                                tokens_per_block=32)
+
+    router._server_state["server1"]._num_active_requests = 100
+    router._server_state["server2"]._num_active_requests = 0
+    router._server_state["server3"]._num_active_requests = 1
+
+    request = CompletionRequest(model="TinyLlama", prompt=[[1234] * 65])
+    server, info = await router.get_next_server(request,
+                                                exclude_server="server1")
+    try:
+        assert server == "server2"
+        assert info["candidate_servers"] == ["server2", "server3"]
+        assert info["workloads"] == [0, 1]
+    finally:
+        await router.finish_request(request)
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_short_prompt_without_blocks_uses_load(
+        servers: list[str]) -> None:
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                use_tokens=False,
+                                max_batch_size=10,
+                                tokens_per_block=32)
+
+    router._server_state["server1"]._num_active_requests = 9
+    router._server_state["server2"]._num_active_requests = 0
+    router._server_state["server3"]._num_active_requests = 1
+
+    request = CompletionRequest(model="TinyLlama", prompt=[[1234]])
+    server, info = await router.get_next_server(request)
+    try:
+        assert server == "server2"
+        assert info["block_hashes"] == [[]]
+        assert info["block_lengths"] == [[]]
+        assert info["hashable_tokens"] == 0
+        assert info["workloads"] == [9, 0, 1]
+        assert info["scores"] == [-0.9, 0.0, -0.1]
+    finally:
+        await router.finish_request(request)
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_counts_partial_block_tokens() -> None:
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=10,
+                                tokens_per_block=32)
+    token_ids = list(range(50))
+    block_hashes = router._compute_block_hashes([token_ids])
+    block_lengths = router._compute_block_lengths([token_ids])
+
+    assert block_lengths == [[32, 17]]
+    router._server_state["server1"].add_blocks(block_hashes[0])
+    assert await router._server_state["server1"].matched_tokens(
+        block_hashes, block_lengths) == 49
+
+    request = CompletionRequest(model="TinyLlama", prompt=[token_ids])
+    server, info = await router.get_next_server(request)
+    try:
+        assert server == "server1"
+        assert info["matches"] == [49]
+        assert info["hashable_tokens"] == 49
+        assert info["scores"] == [1.0]
+    finally:
+        await router.finish_request(request)
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_cache_salt_partitions_hashes() -> None:
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1", "server2"],
+                                use_tokens=False,
+                                max_batch_size=10,
+                                tokens_per_block=32)
+    token_ids = list(range(65))
+    tenant_a = ChatCompletionRequest(model="TinyLlama",
+                                     messages=[{
+                                         "role": "user",
+                                         "content": "unused"
+                                     }],
+                                     prompt_token_ids=token_ids,
+                                     cache_salt="tenant-a")
+    token_lists, tenant_a_hashes, block_lengths = (
+        router._tokenize_and_compute_block_hashes(tenant_a))
+    salt_id = router._request_cache_salt_id(tenant_a)
+
+    assert token_lists == [token_ids]
+    assert block_lengths == [[32, 32]]
+    assert salt_id is not None
+    assert tenant_a_hashes != router._compute_block_hashes([token_ids])
+    assert tenant_a_hashes[0][0] != block_key_hasher(token_ids[:32])
+    assert block_key_hasher(token_ids[32:64], tenant_a_hashes[0][0],
+                            salt_id) == block_key_hasher(
+                                token_ids[32:64], tenant_a_hashes[0][0])
+
+    router._server_state["server1"].add_blocks(tenant_a_hashes[0])
+    tenant_b = ChatCompletionRequest(model="TinyLlama",
+                                     messages=[{
+                                         "role": "user",
+                                         "content": "unused"
+                                     }],
+                                     prompt_token_ids=token_ids,
+                                     cache_salt="tenant-b")
+    server, info = await router.get_next_server(tenant_b)
+    try:
+        server1_index = info["candidate_servers"].index("server1")
+        assert info["block_hashes"][0] != tenant_a_hashes[0]
+        assert info["matches"][server1_index] == 0
+        assert server == "server1"
+    finally:
+        await router.finish_request(tenant_b)
 
 
 @pytest.mark.asyncio
@@ -1000,6 +1125,59 @@ def test_tokenize_preserves_empty_tools_list():
     assert kwargs["tools"] == []
 
 
+def test_gpt_oss_tokenize_uses_harmony_tokens_for_router_hashes() -> None:
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32)
+
+    tokenizer = _mock_tokenizer(token_ids=[900, 901, 902, 903])
+    harmony_tokens = [100, 101, 102, 103, 104]
+    harmony = mock.MagicMock()
+    harmony.openai_to_harmony_tokens.return_value = harmony_tokens
+
+    with mock.patch("tensorrt_llm.serve.harmony_adapter.get_harmony_adapter",
+                    return_value=harmony), mock.patch(
+                        "tensorrt_llm.serve.harmony_adapter."
+                        "maybe_transform_reasoning_effort",
+                        return_value="medium"), mock.patch.object(
+                            router, "_get_tokenizer", return_value=tokenizer):
+        req = ChatCompletionRequest(
+            model="openai/gpt-oss-20b",
+            messages=[{
+                "role": "developer",
+                "content": "Use tools when useful."
+            }, {
+                "role": "user",
+                "content": "what's the weather in Paris?"
+            }],
+            tools=[_get_weather_tool()],
+            tool_choice="none",
+            reasoning_effort="medium",
+        )
+        token_lists, block_hashes, block_lengths = (
+            router._tokenize_and_compute_block_hashes(req))
+
+    tokenizer.apply_chat_template.assert_not_called()
+    harmony.openai_to_harmony_tokens.assert_called_once()
+    assert token_lists == [harmony_tokens]
+    assert block_lengths == router._compute_block_lengths([harmony_tokens])
+    assert router._request_cache_salt_id(req) is None
+    assert req.prompt_token_ids == harmony_tokens
+
+    call_args = harmony.openai_to_harmony_tokens.call_args
+    assert call_args.args[0] == req.messages
+    tool_dicts = call_args.args[1]
+    assert isinstance(tool_dicts, list)
+    assert tool_dicts[0]["function"]["name"] == "get_current_weather"
+    assert call_args.kwargs["reasoning_effort"] == "medium"
+    assert call_args.kwargs["tool_choice"] == "none"
+
+    expected_hashes = router._compute_block_hashes([harmony_tokens])
+    assert block_hashes == expected_hashes
+
+
 def test_tokenize_skipped_when_prompt_token_ids_already_set():
     """Skip tokenization when ``prompt_token_ids`` is already populated.
 
@@ -1031,3 +1209,43 @@ def test_tokenize_skipped_when_prompt_token_ids_already_set():
     assert out == [[10, 20, 30]]
     get_tok.assert_not_called()
     tok.apply_chat_template.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_chat_harmony_uses_prompt_token_ids_and_cache_salt() -> None:
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    server = OpenAIServer.__new__(OpenAIServer)
+    server.harmony_adapter = mock.MagicMock()
+    server.harmony_adapter.openai_to_harmony_tokens.return_value = [900, 901]
+    server.harmony_adapter.get_stop_tokens.return_value = [42]
+    server.tokenizer = mock.MagicMock()
+    server.tokenizer.tokenizer.vocab_size = 1000
+    server.await_disconnected = mock.AsyncMock()
+
+    promise = mock.MagicMock()
+    promise.prompt_token_ids = [10, 11, 12, 13]
+    server.generator = mock.MagicMock()
+    server.generator.args.num_postprocess_workers = 1
+    server.generator.generate_async.return_value = promise
+
+    req = ChatCompletionRequest(
+        model="openai/gpt-oss-20b",
+        messages=[{
+            "role": "user",
+            "content": "hello"
+        }],
+        prompt_token_ids=[10, 11, 12, 13],
+        stream=True,
+        max_completion_tokens=1,
+        cache_salt="tenant-a",
+    )
+
+    await server.chat_harmony(req, raw_request=None)
+    await asyncio.sleep(0)
+
+    server.harmony_adapter.openai_to_harmony_tokens.assert_not_called()
+    server.generator.generate_async.assert_called_once()
+    generate_kwargs = server.generator.generate_async.call_args.kwargs
+    assert generate_kwargs["inputs"] == [10, 11, 12, 13]
+    assert generate_kwargs["cache_salt"] == "tenant-a"

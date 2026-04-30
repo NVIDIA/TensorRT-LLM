@@ -1490,17 +1490,20 @@ class OpenAIServer:
             # Get tool_choice from request
             tool_choice = getattr(request, 'tool_choice', None)
 
-            try:
-                harmony_tokens = self.harmony_adapter.openai_to_harmony_tokens(
-                    request.messages,
-                    tools_dict,
-                    reasoning_effort=reasoning_effort,
-                    tool_choice=tool_choice)
-            except Exception as e:
-                logger.error(f"messages_dict: {request.messages}")
-                logger.error(f"tools_dict: {tools_dict}")
-                logger.error(f"request: {request}")
-                raise e
+            if request.prompt_token_ids is not None:
+                harmony_tokens = request.prompt_token_ids
+            else:
+                try:
+                    harmony_tokens = self.harmony_adapter.openai_to_harmony_tokens(
+                        request.messages,
+                        tools_dict,
+                        reasoning_effort=reasoning_effort,
+                        tool_choice=tool_choice)
+                except Exception as e:
+                    logger.error(f"messages_dict: {request.messages}")
+                    logger.error(f"tools_dict: {tools_dict}")
+                    logger.error(f"request: {request}")
+                    raise e
 
             # Get harmony stop tokens
             harmony_stop_tokens = self.harmony_adapter.get_stop_tokens()
@@ -1534,6 +1537,7 @@ class OpenAIServer:
                 streaming=bool(request.stream),
                 lora_request=request.lora_request,
                 disaggregated_params=disaggregated_params,
+                cache_salt=request.cache_salt,
                 trace_headers=trace_headers,
             )
             if not self.postproc_worker_enabled:

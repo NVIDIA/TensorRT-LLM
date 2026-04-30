@@ -1,12 +1,14 @@
 import asyncio
+import json
 import os
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Union
+from typing import (Awaitable, Callable, Dict, Iterable, List, Mapping,
+                    Optional, TypeAlias, Union)
 
 import aiohttp
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 from tensorrt_llm.bindings.internal.batch_manager import (BlockKey,
                                                           BlockKeyHasher)
@@ -18,6 +20,80 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest)
 
 OpenAIRequest = Union[CompletionRequest, ChatCompletionRequest]
+KvCacheEventRecord: TypeAlias = Mapping[str, object]
+UINT32_MASK = (1 << 32) - 1
+UINT64_MASK = (1 << 64) - 1
+
+
+def _hash32_mix(value: int, seed: int) -> int:
+    value &= UINT32_MASK
+    value = (((value >> 16) ^ value) * 0x45d9f3b) & UINT32_MASK
+    value = (((value >> 16) ^ value) * 0x45d9f3b) & UINT32_MASK
+    value = ((value >> 16) ^ value) & UINT32_MASK
+    value = (value + 0x9e3779b9) & UINT32_MASK
+    return (seed ^ (value + ((seed << 6) & UINT64_MASK) +
+                    (seed >> 2))) & UINT64_MASK
+
+
+def _hash64_mix(value: int, seed: int) -> int:
+    value &= UINT64_MASK
+    value = ((value ^ (value >> 30)) * 0xbf58476d1ce4e5b9) & UINT64_MASK
+    value = ((value ^ (value >> 27)) * 0x94d049bb133111eb) & UINT64_MASK
+    value = (value ^ (value >> 31)) & UINT64_MASK
+    return (seed ^ (value + 0x9e3779b9 + ((seed << 6) & UINT64_MASK) +
+                    (seed >> 2))) & UINT64_MASK
+
+
+def _get_cache_salt_id(cache_salt: str) -> int:
+    from blake3 import blake3
+
+    cache_salt_id = int.from_bytes(blake3(
+        cache_salt.encode("utf-8")).digest(length=8),
+                                   "little",
+                                   signed=False)
+    if cache_salt_id < 0 or cache_salt_id >= (1 << 64):
+        raise ValueError(
+            f"cache_salt_id must be in [0, 2**64 - 1], got {cache_salt_id}.")
+    return cache_salt_id
+
+
+def _as_event_records(event_raw: object) -> list[KvCacheEventRecord]:
+    if isinstance(event_raw, str):
+        try:
+            decoded = json.loads(event_raw)
+        except json.JSONDecodeError:
+            return []
+        return _as_event_records(decoded)
+    if isinstance(event_raw, Mapping):
+        return [event_raw]
+    if isinstance(event_raw, list):
+        records: list[KvCacheEventRecord] = []
+        for item in event_raw:
+            records.extend(_as_event_records(item))
+        return records
+    return []
+
+
+def _extract_block_hashes_from_blocks(blocks: object) -> list[int]:
+    if not isinstance(blocks, list):
+        return []
+    block_hashes: list[int] = []
+    for block in blocks:
+        if not isinstance(block, Mapping):
+            continue
+        block_hash = block.get("block_hash")
+        if isinstance(block_hash, int):
+            block_hashes.append(block_hash)
+    return block_hashes
+
+
+def _extract_block_hashes(block_hashes_raw: object) -> list[int]:
+    if not isinstance(block_hashes_raw, list):
+        return []
+    return [
+        block_hash for block_hash in block_hashes_raw
+        if isinstance(block_hash, int)
+    ]
 
 
 def get_request_num_tokens(request: OpenAIRequest) -> int:
@@ -101,53 +177,71 @@ class KvCacheAwareServerState(ServerState):
         self._kv_cache_block_table: set[int] = set()
         self._tokens_per_block = tokens_per_block
 
-    def add_blocks(self, block_hashes: Iterable[int]):
-        for hash in block_hashes:
-            self._kv_cache_block_table.add(hash)
+    def add_blocks(self, block_hashes: Iterable[int]) -> None:
+        for block_hash in block_hashes:
+            self._kv_cache_block_table.add(block_hash)
 
-    def remove_blocks(self, block_hashes: Iterable[int]):
-        for hash in block_hashes:
-            self._kv_cache_block_table.discard(hash)
+    def remove_blocks(self, block_hashes: Iterable[int]) -> None:
+        for block_hash in block_hashes:
+            self._kv_cache_block_table.discard(block_hash)
 
-    def update_with_events(self, events: Iterable[dict]):
-        # event_raw: {"id": <id>, "data": <event body>}
+    def update_with_events(self, events: Iterable[object]) -> None:
         for event_raw in events:
-            if "data" in event_raw:
-                event = event_raw["data"]
-            else:
-                event = event_raw
+            event_records = _as_event_records(event_raw)
 
-            if event["type"] == "stored":
-                self.add_blocks(block["block_hash"]
-                                for block in event["blocks"])
-            elif event["type"] == "removed":
-                self.remove_blocks(event["block_hashes"])
+            for event_record in event_records:
+                event = event_record.get("data", event_record)
+                if not isinstance(event, Mapping):
+                    continue
 
-    async def poll_events(self, session: aiohttp.ClientSession):
+                event_type = event.get("type")
+                if event_type == "stored":
+                    block_hashes = _extract_block_hashes_from_blocks(
+                        event.get("blocks"))
+                    self.add_blocks(block_hashes)
+                elif event_type == "removed":
+                    block_hashes = _extract_block_hashes(
+                        event.get("block_hashes"))
+                    self.remove_blocks(block_hashes)
+
+    async def poll_events(
+            self, session: aiohttp.ClientSession) -> list[object] | None:
         async with session.post(
                 f"{self._base_url}/kv_cache_events") as response:
             events_raw = await response.json()
-        return events_raw
+        if events_raw is None:
+            return None
+        if isinstance(events_raw, list):
+            return events_raw
+        return [events_raw]
 
-    async def matched_tokens(self, block_hashes: list[list[int]]) -> int:
+    async def matched_tokens(
+            self,
+            block_hashes: list[list[int]],
+            block_lengths: Optional[list[list[int]]] = None) -> int:
         match_count = 0
         async with self._lock:
-            for hash_list in block_hashes:
-                for hash in hash_list:
-                    # TODO: 1) parent hash verification, 2) partial matching
-                    if hash in self._kv_cache_block_table:
-                        match_count += self._tokens_per_block
+            for prompt_index, hash_list in enumerate(block_hashes):
+                lengths = None if block_lengths is None else block_lengths[
+                    prompt_index]
+                for block_index, block_hash in enumerate(hash_list):
+                    # TODO: parent hash verification
+                    if block_hash in self._kv_cache_block_table:
+                        if lengths is None:
+                            match_count += self._tokens_per_block
+                        else:
+                            match_count += lengths[block_index]
                     else:
                         break
         return match_count
 
-    async def decrement_load(self, request: OpenAIRequest):
+    async def decrement_load(self, request: OpenAIRequest) -> None:
         num_tokens = get_request_num_tokens(request) if self._use_tokens else 0
         async with self._lock:
             self._num_active_requests -= 1
             self._num_active_tokens -= num_tokens
 
-    async def poll_and_update(self):
+    async def poll_and_update(self) -> None:
         """Poll KV cache events and update block table. Called outside the critical path."""
         try:
             assert self._session is not None, "session must be set on KvCacheAwareServerState"
@@ -159,10 +253,10 @@ class KvCacheAwareServerState(ServerState):
             logger.warning(
                 f"Failed to poll KV cache events from {self._server}: {e}")
 
-    def num_active_tokens(self):
+    def num_active_tokens(self) -> int:
         return self._num_active_tokens
 
-    def num_active_requests(self):
+    def num_active_requests(self) -> int:
         return self._num_active_requests
 
 
@@ -644,11 +738,27 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
             await self._unregister_request(request)
 
 
+def _python_block_key_hash(token_ids: list[int], parent_hash: int,
+                           cache_salt_id: Optional[int]) -> int:
+    seed = (len(token_ids) ^ ((parent_hash * 0xbf58476d1ce4e5b9) & UINT64_MASK))
+    seed &= UINT64_MASK
+    if parent_hash == 0 and cache_salt_id is not None:
+        seed = _hash64_mix(cache_salt_id, seed)
+    for token_id in token_ids:
+        seed = _hash32_mix(token_id, seed)
+    return seed
+
+
 def block_key_hasher(token_ids: list[int],
-                     parent_hash: Optional[int] = None) -> int:
+                     parent_hash: Optional[int] = None,
+                     cache_salt_id: Optional[int] = None) -> int:
+    normalized_parent_hash = 0 if parent_hash is None else parent_hash
+    if cache_salt_id is not None:
+        return _python_block_key_hash(token_ids, normalized_parent_hash,
+                                      cache_salt_id)
+
     block_key = BlockKey(token_ids)
-    return BlockKeyHasher.hash(block_key,
-                               0 if parent_hash is None else parent_hash)
+    return BlockKeyHasher.hash(block_key, normalized_parent_hash)
 
 
 class BlockHashMixin:
@@ -659,13 +769,14 @@ class BlockHashMixin:
 
     def _init_block_hashing(self,
                             tokens_per_block: int = 32,
-                            custom_tokenizer: Optional[str] = None):
+                            custom_tokenizer: Optional[str] = None) -> None:
         env_tokens_per_block = os.environ.get(
             "TRTLLM_KVCACHE_AWARE_ROUTER_HASH_TOKENS_PER_BLOCK")
         if env_tokens_per_block is not None:
             tokens_per_block = int(env_tokens_per_block)
         self._tokens_per_block = tokens_per_block
         self._tokenizers: dict = {}
+        self._model_types: dict[str, Optional[str]] = {}
         self._custom_tokenizer = custom_tokenizer
         logger.info(f"BlockHashMixin: tokens_per_block={self._tokens_per_block}"
                     f", custom_tokenizer={self._custom_tokenizer}")
@@ -681,21 +792,62 @@ class BlockHashMixin:
                     model, trust_remote_code=True)
         return self._tokenizers[model]
 
+    def _get_model_type(self, model: str) -> Optional[str]:
+        if model not in self._model_types:
+            model_type = None
+            normalized_model = model.lower().replace("_", "-")
+            if "gpt-oss" in normalized_model or "gptoss" in normalized_model:
+                model_type = "gpt_oss"
+            elif os.path.exists(model):
+                try:
+                    model_config = AutoConfig.from_pretrained(
+                        model, trust_remote_code=True, local_files_only=True)
+                    model_type = getattr(model_config, "model_type", None)
+                except Exception as e:
+                    logger.debug(
+                        "BlockHashMixin: failed to read model config for "
+                        f"{model}: {e}")
+            self._model_types[model] = model_type
+        return self._model_types[model]
+
+    def _uses_harmony_tokenization(self,
+                                   request: ChatCompletionRequest) -> bool:
+        return self._get_model_type(request.model) == "gpt_oss"
+
+    @staticmethod
+    def _tool_dicts(request: ChatCompletionRequest) -> Optional[list[dict]]:
+        return (None if getattr(request, "tools", None) is None else [
+            tool.model_dump() if hasattr(tool, "model_dump") else tool
+            for tool in request.tools
+        ])
+
+    def _tokenize_harmony_chat(
+            self, request: ChatCompletionRequest) -> list[list[int]]:
+        from tensorrt_llm.serve import harmony_adapter
+
+        result = harmony_adapter.get_harmony_adapter().openai_to_harmony_tokens(
+            request.messages,
+            self._tool_dicts(request),
+            reasoning_effort=harmony_adapter.maybe_transform_reasoning_effort(
+                request.reasoning_effort),
+            tool_choice=getattr(request, "tool_choice", None),
+        )
+        request.prompt_token_ids = result
+        return [result]
+
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
         # Handle ChatCompletionRequest (has messages, not prompt)
         if isinstance(request, ChatCompletionRequest):
             if request.prompt_token_ids is not None:
                 return [request.prompt_token_ids]
+            if self._uses_harmony_tokenization(request):
+                return self._tokenize_harmony_chat(request)
             tokenizer = self._get_tokenizer(request.model)
             # Forward tools and chat_template_kwargs so custom tokenizers
             # (e.g. DeepseekV32Tokenizer) render tool schemas and respect
             # template flags like `thinking=true` when computing the prompt
             # token ids used for cache-aware routing AND passed downstream
             # (prompt_token_ids makes the worker skip re-tokenization).
-            tool_dicts = (None if getattr(request, "tools", None) is None else [
-                tool.model_dump() if hasattr(tool, "model_dump") else tool
-                for tool in request.tools
-            ])
             chat_template_kwargs = (request.chat_template_kwargs if getattr(
                 request, "chat_template_kwargs", None) else {})
             result = tokenizer.apply_chat_template(
@@ -705,7 +857,7 @@ class BlockHashMixin:
                 ],
                 add_generation_prompt=request.add_generation_prompt,
                 tokenize=True,
-                tools=tool_dicts,
+                tools=self._tool_dicts(request),
                 **chat_template_kwargs,
             )
             # Some custom tokenizers (e.g. DeepseekV32Tokenizer) return a
@@ -736,8 +888,29 @@ class BlockHashMixin:
                           if len(token_lists) > 1 else token_lists[0])
         return token_lists
 
-    def _compute_block_hashes(self,
-                              token_lists: list[list[int]]) -> list[list[int]]:
+    @staticmethod
+    def _request_cache_salt_id(request: OpenAIRequest) -> Optional[int]:
+        cache_salt = getattr(request, "cache_salt", None)
+        if cache_salt is None:
+            return None
+
+        return _get_cache_salt_id(cache_salt)
+
+    def _compute_block_lengths(self,
+                               token_lists: list[list[int]]) -> list[list[int]]:
+        block_lengths: list[list[int]] = []
+        for token_list in token_lists:
+            lengths = []
+            for t in range(0, len(token_list) - 1, self._tokens_per_block):
+                t_end = min(t + self._tokens_per_block, len(token_list) - 1)
+                lengths.append(t_end - t)
+            block_lengths.append(lengths)
+        return block_lengths
+
+    def _compute_block_hashes(
+            self,
+            token_lists: list[list[int]],
+            cache_salt_id: Optional[int] = None) -> list[list[int]]:
         block_hashes: list[list[int]] = []
         for token_list in token_lists:
             hash_list = []
@@ -747,13 +920,14 @@ class BlockHashMixin:
                 t_end = min(t + self._tokens_per_block, len(token_list) - 1)
                 hash_list.append(
                     block_key_hasher(token_list[t:t_end],
-                                     None if t == 0 else hash_list[-1]))
+                                     None if t == 0 else hash_list[-1],
+                                     cache_salt_id))
             block_hashes.append(hash_list)
         return block_hashes
 
     def _tokenize_and_compute_block_hashes(
-            self,
-            request: OpenAIRequest) -> tuple[list[list[int]], list[list[int]]]:
+        self, request: OpenAIRequest
+    ) -> tuple[list[list[int]], list[list[int]], list[list[int]]]:
         """Synchronous tokenize + block-hash, combined for thread offload.
 
         Factored into one method so ``get_next_server`` can offload the whole
@@ -762,8 +936,10 @@ class BlockHashMixin:
         requests in parallel.
         """
         token_lists = self._tokenize(request)
-        block_hashes = self._compute_block_hashes(token_lists)
-        return token_lists, block_hashes
+        block_lengths = self._compute_block_lengths(token_lists)
+        block_hashes = self._compute_block_hashes(
+            token_lists, self._request_cache_salt_id(request))
+        return token_lists, block_hashes, block_lengths
 
     @staticmethod
     def _text_to_int_sequences(texts: list[str]) -> list[list[int]]:
@@ -809,6 +985,10 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 server for server in self._server_state.keys()
                 if server != exclude_server
             ]
+        if not servers:
+            raise ValueError(
+                f"No available servers after excluding {exclude_server}")
+
         # Tokenize + block-hash is CPU-bound (~50 ms p50 for a 40 k-token
         # chat request with a Rust-backed tokenizer). Running it directly
         # inside the async handler blocks the orchestrator's event loop and
@@ -816,26 +996,32 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         # tokenizers releasing the GIL, offloading to a thread lets multiple
         # tokenize calls run in parallel and frees the event loop to
         # dispatch HTTP traffic to the CTX/GEN workers meanwhile.
-        token_lists, block_hashes = await asyncio.to_thread(
+        token_lists, block_hashes, block_lengths = await asyncio.to_thread(
             self._tokenize_and_compute_block_hashes, request)
-        padded_tokens = sum(
-            len(hash_list)
-            for hash_list in block_hashes) * self._tokens_per_block
+        hashable_tokens = sum(
+            sum(prompt_block_lengths) for prompt_block_lengths in block_lengths)
         # select the server by (KV match - load)
         # TODO: more options
-        workloads = [
-            state.num_active_requests()
-            for state in self._server_state.values()
-        ]
+        workloads_by_server = {
+            server: self._server_state[server].num_active_requests()
+            for server in servers
+        }
+        active_tokens_by_server = {
+            server: self._server_state[server].num_active_tokens()
+            for server in servers
+        }
+        workloads = [workloads_by_server[server] for server in servers]
+        active_tokens = [active_tokens_by_server[server] for server in servers]
         scores = []
         matches = []
-        for i in range(len(servers)):
-            server = servers[i]
+        for server in servers:
             # https://github.com/ai-dynamo/dynamo/blob/main/docs/kv_cache_routing.md#kv-cache-routing-and-load-balancing
-            matches.append(
-                await self._server_state[server].matched_tokens(block_hashes))
-            score = matches[-1] / padded_tokens - workloads[
-                i] / self._max_batch_size
+            matched_tokens = await self._server_state[server].matched_tokens(
+                block_hashes, block_lengths)
+            matches.append(matched_tokens)
+            match_ratio = matched_tokens / hashable_tokens if hashable_tokens else 0.0
+            score = (match_ratio -
+                     workloads_by_server[server] / self._max_batch_size)
             scores.append(score)
         max_score = max(scores)
         tied = [i for i, s in enumerate(scores) if s == max_score]
@@ -846,8 +1032,14 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             await self._register_request(server, request)
         return server, {
             "block_hashes": block_hashes,  # list[list[int]]
+            "block_lengths": block_lengths,  # list[list[int]]
             "token_lists": token_lists,  # list[list[int]]
+            "hashable_tokens": hashable_tokens,  # int
             "matches": matches,  # list[int]
+            "scores": scores,  # list[float]
+            "workloads": workloads,  # list[int]
+            "active_tokens": active_tokens,  # list[int]
+            "candidate_servers": servers,  # list[str]
             "server_info": self._server_info.get(server, {}),
         }
 
