@@ -27,6 +27,7 @@ from .modeling_kimi_k25 import KimiK25ForConditionalGeneration
 from .modeling_laguna import LagunaForCausalLM
 from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
+from .modeling_deepseekv4 import DeepseekV4ForCausalLM
 from .modeling_minimaxm2 import MiniMaxM2ForCausalLM
 from .modeling_mistral import Mistral3VLM, MistralForCausalLM
 from .modeling_mixtral import MixtralForCausalLM
@@ -78,6 +79,7 @@ __all__ = [
     "Mistral3VLM",
     "MistralForCausalLM",
     "MixtralForCausalLM",
+    "DeepseekV4ForCausalLM",
     "NemotronH_Nano_VL_V2",
     "NemotronForCausalLM",
     "NemotronHForCausalLM",

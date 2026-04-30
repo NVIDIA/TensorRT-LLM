@@ -15,7 +15,7 @@ from tensorrt_llm._torch.attention_backend import trtllm_gen
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
-from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
+from tensorrt_llm.llmapi import DeepSeekV4SparseAttentionConfig, SkipSoftmaxAttentionConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
@@ -1814,6 +1814,32 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_args.sparse_attn_offsets = at_off
             sparse_args.sparse_attn_indices_block_size = (
                 self.sparse_attention_config.get_indices_block_size())
+            if isinstance(self.sparse_attention_config,
+                          DeepSeekV4SparseAttentionConfig):
+                # TODO: refactor this part of code.
+                ratio = self.compress_ratio
+                if hasattr(metadata, 'sparse_mla_topk_lens'):
+                    num_ctx_tokens = metadata.num_ctx_tokens
+                    num_tokens = metadata.num_tokens
+                    topk_lens = metadata.sparse_mla_topk_lens[ratio]
+                    attention_input_type = forward_args.attention_input_type
+                    if attention_input_type == AttentionInputType.context_only:
+                        sparse_args.sparse_mla_topk_lens = topk_lens[:
+                                                                      num_ctx_tokens]
+                    elif attention_input_type == AttentionInputType.generation_only:
+                        sparse_args.sparse_mla_topk_lens = topk_lens[
+                            num_ctx_tokens:num_tokens]
+                    else:
+                        sparse_args.sparse_mla_topk_lens = topk_lens[:
+                                                                      num_tokens]
+                window_size = self.sparse_attention_config.window_size
+                compressed_len = metadata.max_compressed_indices[ratio]
+                metadata.num_sparse_topk = compressed_len + window_size
+                if ratio > 1:
+                    # host_kv_cache_pool_pointers carries the SWA pool. The optional extra
+                    # pointer is the compressed pool used for non-SWA sparse MLA tokens.
+                    sparse_args.compressed_kv_cache_pool_ptr = (
+                        metadata.sparse_mla_base_ptrs[ratio])
 
         # Compute FlashMLA tile-scheduler metadata once per forward pass.
         # The flag is reset in prepare_flash_mla() and update_for_spec_dec() to trigger

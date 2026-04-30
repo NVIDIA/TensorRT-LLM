@@ -28,8 +28,7 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
-from ...custom_ops.trtllm_gen_custom_ops import \
-    fp4_block_scale_fake_output_without_finalize
+from ...custom_ops.trtllm_gen_custom_ops import fp4_block_scale_fake_output_without_finalize
 from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
@@ -44,8 +43,13 @@ from .quantization import (
     W4A8MXFP4FP8TRTLLMGenFusedMoEMethod, W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod,
     W4A8NVFP4FP8TRTLLMGenFusedMoEMethod, W4A16MXFP4TRTLLMGenFusedMoEMethod)
 # isort: on
-from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
-                      DefaultMoeRoutingMethod, MiniMaxM2MoeRoutingMethod)
+from .routing import (
+    BaseMoeRoutingMethod,
+    DeepSeekV3MoeRoutingMethod,
+    DeepSeekV4MoeRoutingMethod,
+    DefaultMoeRoutingMethod,
+    MiniMaxM2MoeRoutingMethod,
+)
 
 
 @dataclass
@@ -580,7 +584,7 @@ class TRTLLMGenFusedMoE(MoE):
         elif self.has_w4a8_mxfp4_mxfp8:
             x, x_sf = self.op_backend.mxfp8_quantize(
                 x, False, alignment=self.quant_method.input_hidden_alignment)
-            x_row, x_col = x.shape[0], x.shape[1]
+            x_row = x.shape[0]
         elif self.has_deepseek_fp8_block_scales:
             # For SM100+, fp8_quantize_1x128 returns x_sf with shape (blocked_n, num_tokens),
             # but moe_a2a_dispatch requires all payloads to have first dim = num_tokens.
@@ -624,6 +628,14 @@ class TRTLLMGenFusedMoE(MoE):
                 n_group=None,
                 topk_group=None,
                 routed_scaling_factor=None,
+            )
+        elif isinstance(self.routing_method, DeepSeekV4MoeRoutingMethod):
+            return RoutingParams(
+                top_k=self.routing_method.top_k,
+                routing_bias=self.routing_method.e_score_correction_bias,
+                n_group=self.routing_method.n_group,
+                topk_group=self.routing_method.topk_group,
+                routed_scaling_factor=self.routing_method.routed_scaling_factor,
             )
         else:
             return RoutingParams(
@@ -909,6 +921,7 @@ class TRTLLMGenFusedMoE(MoE):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
         *,
+        input_ids: Optional[torch.IntTensor] = None,
         do_finalize: bool = True,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
@@ -921,6 +934,7 @@ class TRTLLMGenFusedMoE(MoE):
         run_post_quant_allgather = (self.use_dp and self.parallel_size > 1
                                     and not self.enable_alltoall)
         post_quant_comm = run_post_quant_allgather or self.enable_alltoall
+        requires_separated_routing = self.routing_method.requires_separated_routing
 
         x_sf = None
         token_selected_experts = None
@@ -931,11 +945,11 @@ class TRTLLMGenFusedMoE(MoE):
         is_first_call = self.repeat_idx == 0
         is_last_call = self.repeat_idx == self.repeat_count - 1
 
-        if post_quant_comm:
+        if post_quant_comm or requires_separated_routing:
             self._load_balancer_start_wait_gpu_stage(is_first_call)
 
             token_selected_experts, token_final_scales = self.routing_method.apply(
-                router_logits)
+                router_logits, input_ids)
             token_selected_experts = token_selected_experts.to(torch.int32)
             if token_final_scales is not None:
                 token_final_scales = token_final_scales.to(torch.bfloat16)
@@ -963,6 +977,7 @@ class TRTLLMGenFusedMoE(MoE):
             # Use routed slots for subsequent processing
             token_selected_experts = token_selected_slots
 
+        if post_quant_comm:
             x, x_sf = self.quantize_input(x)
 
         if self.enable_alltoall:
@@ -1103,7 +1118,8 @@ class TRTLLMGenFusedMoE(MoE):
 
         # Call the extracted run_moe interface
         # Determine router_logits based on post_quant_comm
-        router_logits_arg = None if post_quant_comm else router_logits
+        router_logits_arg = None if (
+            post_quant_comm or requires_separated_routing) else router_logits
 
         final_hidden_states = self.run_moe(
             x=x,

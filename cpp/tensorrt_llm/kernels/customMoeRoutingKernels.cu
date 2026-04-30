@@ -15,6 +15,7 @@
  */
 
 #include "moeTopKFuncs.cuh"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/envUtils.h"
@@ -308,6 +309,177 @@ INSTANTIATE_RENORM_MOE_ROUTING(float, __nv_bfloat16, int32_t, true);
 INSTANTIATE_RENORM_MOE_ROUTING(half, __nv_bfloat16, int32_t, true);
 INSTANTIATE_RENORM_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, int32_t, true);
 #endif
+
+static constexpr int kTOPK = 6;
+
+// CUDA kernel for gate forward
+// Input: pre-computed scores from linear(x, weight) done outside kernel
+// Template parameters:
+//   nExperts: number of experts
+//   topK: number of top experts to select
+//   hash: true for hash mode, false for topk mode
+// One warp per row (batch element)
+template <int nExperts, int topK, bool hash>
+__global__ void gate_forward_kernel(
+    float const* __restrict__ scores_in, // [batch_size, nExperts] - pre-computed from linear(x, weight)
+    float const* __restrict__ bias,      // [nExperts] (only used when hash=false)
+    int const* __restrict__ input_ids,   // [batch_size] (only used when hash=true)
+    int const* __restrict__ tid2eid,     // [vocab_size, topK] (only used when hash=true)
+    float* __restrict__ out_weights,     // [batch_size, topK]
+    int* __restrict__ out_indices,       // [batch_size, topK]
+    int batch_size, float route_scale)
+{
+    // Compile-time constants
+    constexpr int kExpertsPerThread = nExperts / WARP_SIZE;
+    constexpr int kWarpsPerBlock = 4; // Adjust based on occupancy needs
+
+    // Shared memory for original scores (one array per warp in the block)
+    __shared__ float smem_scores[kWarpsPerBlock][nExperts];
+
+    // One warp per batch element
+    int const global_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / WARP_SIZE;
+    int const local_warp_id = (threadIdx.x / WARP_SIZE) % kWarpsPerBlock;
+    int const lane_id = threadIdx.x % WARP_SIZE;
+
+    if (global_warp_id >= batch_size)
+        return;
+
+    auto warp = cg::tiled_partition<WARP_SIZE>(cg::this_thread_block());
+
+    // Pointer to this warp's shared memory and input scores
+    float* my_smem = smem_scores[local_warp_id];
+    float const* scores_row = scores_in + global_warp_id * nExperts;
+
+// Load scores, apply score function (softplus + sqrt), and store to shared memory
+#pragma unroll
+    for (int e = 0; e < kExpertsPerThread; ++e)
+    {
+        int expert_id = lane_id + e * WARP_SIZE;
+        float s = scores_row[expert_id];
+        float sp = log1pf(expf(s));
+        float score = sqrtf(sp);
+        my_smem[expert_id] = score; // Store original score to shared memory
+    }
+    __syncwarp();                   // Ensure all scores are written before reading
+
+    // Output: each of first K lanes holds one value
+    float my_topk_value = 0.0f;
+    int my_topk_index = 0;
+
+    if constexpr (hash)
+    {
+        // Hash mode: directly read from shared memory
+        int token_id = input_ids[global_warp_id];
+        int const* expert_ids = tid2eid + token_id * topK;
+
+        if (lane_id < topK)
+        {
+            int expert_id = expert_ids[lane_id];
+            my_topk_index = expert_id;
+            my_topk_value = my_smem[expert_id]; // Direct lookup from shared memory
+        }
+    }
+    else
+    {
+        // Topk mode: load from shared memory, add bias to registers for topk
+        float scores[kExpertsPerThread];
+        int indices[kExpertsPerThread];
+
+#pragma unroll
+        for (int e = 0; e < kExpertsPerThread; ++e)
+        {
+            int expert_id = lane_id + e * WARP_SIZE;
+            indices[e] = expert_id;
+            scores[e] = my_smem[expert_id] + bias[expert_id]; // Add bias for topk selection
+        }
+
+        // Use reduceTopK to find top-k experts
+        float topk_values[topK];
+        int32_t topk_indices[topK];
+        constexpr float minValue = -1e30f;
+        reduce_topk::reduceTopK<topK, float, kExpertsPerThread>(
+            warp, topk_values, topk_indices, scores, indices, minValue, topK);
+
+        // Gather original weights (without bias) from shared memory
+        if (lane_id < topK)
+        {
+            int expert_id = topk_indices[lane_id];
+            my_topk_index = expert_id;
+            my_topk_value = my_smem[expert_id]; // Read original score (no bias)
+        }
+    }
+
+    // Reduce to get sum (first K lanes have values, others have 0)
+    float weight_sum = cg::reduce(warp, my_topk_value, cg::plus<float>{});
+
+    // Normalize weights and write output (first K lanes)
+    if (lane_id < topK)
+    {
+        out_weights[global_warp_id * topK + lane_id] = (my_topk_value / weight_sum) * route_scale;
+        out_indices[global_warp_id * topK + lane_id] = my_topk_index;
+    }
+}
+
+// C++ wrapper function (output tensors passed as parameters)
+// All tensors are float32
+template <int nExperts, bool hash>
+void launch_gate_forward_kernel(float* scores_in, float* bias, int* input_ids, int* tid2eid, float* out_weights,
+    int* out_indices, int batch_size, float route_scale, cudaStream_t stream)
+{
+    constexpr int warps_per_block = 4;
+    constexpr int threads_per_block = warps_per_block * WARP_SIZE;
+    int const blocks = (batch_size + warps_per_block - 1) / warps_per_block;
+
+    gate_forward_kernel<nExperts, kTOPK, hash><<<blocks, threads_per_block, 0, stream>>>(
+        scores_in, bias, input_ids, tid2eid, out_weights, out_indices, batch_size, route_scale);
+}
+
+void gate_forward(void* scores_in, // [batch_size, nExperts] - pre-computed from linear(x, weight)
+    void* bias,                    // nullptr if hash mode
+    void* input_ids,               // nullptr if non-hash mode
+    void* tid2eid,                 // nullptr if non-hash mode
+    void* out_weights,             // [batch_size, topK] - pre-allocated
+    void* out_indices,             // [batch_size, topK] - pre-allocated
+    int batch_size, int n_experts, float route_scale, bool is_hash, cudaStream_t stream)
+{
+    auto* scores = static_cast<float*>(scores_in);
+    auto* bias_ptr = static_cast<float*>(bias);
+    auto* input_ids_ptr = static_cast<int*>(input_ids);
+    auto* tid2eid_ptr = static_cast<int*>(tid2eid);
+    auto* weights = static_cast<float*>(out_weights);
+    auto* indices = static_cast<int*>(out_indices);
+
+    switch (n_experts)
+    {
+    case 256:
+        if (is_hash)
+        {
+            launch_gate_forward_kernel<256, true>(
+                scores, nullptr, input_ids_ptr, tid2eid_ptr, weights, indices, batch_size, route_scale, stream);
+        }
+        else
+        {
+            launch_gate_forward_kernel<256, false>(
+                scores, bias_ptr, nullptr, nullptr, weights, indices, batch_size, route_scale, stream);
+        }
+        break;
+    case 384:
+        if (is_hash)
+        {
+            launch_gate_forward_kernel<384, true>(
+                scores, nullptr, input_ids_ptr, tid2eid_ptr, weights, indices, batch_size, route_scale, stream);
+        }
+        else
+        {
+            launch_gate_forward_kernel<384, false>(
+                scores, bias_ptr, nullptr, nullptr, weights, indices, batch_size, route_scale, stream);
+        }
+        break;
+    default:
+        TLLM_CHECK_WITH_INFO(false, "gate_forward only supports n_experts 256 or 384");
+    }
+    sync_check_cuda_error(stream);
+}
 
 } // namespace kernels
 

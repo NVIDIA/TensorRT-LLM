@@ -1,6 +1,7 @@
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
+from .deepseek_v4 import DeepseekV4CacheManager, DeepseekV4TrtllmAttention
 from .dsa import DSACacheManager, DSATrtllmAttention
 from .rocket import (RocketKVCacheManager, RocketTrtllmAttention,
                      RocketVanillaAttention)
@@ -12,6 +13,8 @@ def get_sparse_attn_kv_cache_manager(
         return RocketKVCacheManager
     elif sparse_attn_config.algorithm == "dsa":
         return DSACacheManager
+    elif sparse_attn_config.algorithm == "deepseek_v4":
+        return DeepseekV4CacheManager
     elif sparse_attn_config.algorithm == "skip_softmax":
         return KVCacheManager
     else:
@@ -36,6 +39,8 @@ def get_trtllm_sparse_attn_attention_backend(
         return RocketTrtllmAttention
     elif sparse_attn_config.algorithm == "dsa":
         return DSATrtllmAttention
+    elif sparse_attn_config.algorithm == "deepseek_v4":
+        return DeepseekV4TrtllmAttention
     elif sparse_attn_config.algorithm == "skip_softmax":
         return TrtllmAttention
     else:

@@ -381,7 +381,7 @@ def _run_forward(
 ):
     """Run forward_context_dsa on cloned inputs and return the output tensor."""
     output = torch.empty(q.shape[0], NUM_HEADS * V_HEAD_DIM, dtype=q.dtype, device=q.device)
-    mla.forward_context_dsa(
+    mla.forward_context_sparse_mla(
         q=q.clone(),
         compressed_kv=compressed_kv.clone(),
         k_pe=k_pe.clone(),

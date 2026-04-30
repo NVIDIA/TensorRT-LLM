@@ -15,11 +15,13 @@ class RotaryEmbedding(nn.Module):
         *,
         head_dim: int,
         is_neox: bool = True,
+        inverse: bool = False,
     ):
         super().__init__()
         self.rope_params = rope_params
         self.head_dim = head_dim
         self.is_neox = is_neox
+        self.inverse = inverse
         self.max_positions = rope_params.max_positions
         self.rotary_cos_sin = rope_params.create_rope_const_params(
             interleave=False)[1].reshape(rope_params.max_positions, 2, -1)
@@ -70,7 +72,8 @@ class RotaryEmbedding(nn.Module):
             target = RotaryEmbedding.apply_rotary_pos_emb(target,
                                                           cos,
                                                           sin,
-                                                          is_neox=self.is_neox)
+                                                          is_neox=self.is_neox,
+                                                          inverse=self.inverse)
             target = target.transpose(1, 2).contiguous()
             if remove_input_padding:
                 target = target.view(seq_len, -1)
@@ -85,7 +88,8 @@ class RotaryEmbedding(nn.Module):
                              cos: torch.Tensor,
                              sin: torch.Tensor,
                              unsqueeze_dim: int = 1,
-                             is_neox: bool = True) -> torch.Tensor:
+                             is_neox: bool = True,
+                             inverse: bool = False) -> torch.Tensor:
         """Applies Rotary Position Embedding to the query and key tensors.
 
         Args:
@@ -100,6 +104,7 @@ class RotaryEmbedding(nn.Module):
                 cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
                 the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
             is_neox (bool): Whether to use Neox style RoPE, True by default.
+            inverse (bool): Whether to apply inverse RoPE (for de-rotating), False by default.
         Returns:
             `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
         """
@@ -117,8 +122,12 @@ class RotaryEmbedding(nn.Module):
             x1 = q_or_k[..., ::2]
             x2 = q_or_k[..., 1::2]
 
-        o1 = x1 * cos - x2 * sin
-        o2 = x2 * cos + x1 * sin
+        if inverse:
+            o1 = x1 * cos + x2 * sin
+            o2 = x2 * cos - x1 * sin
+        else:
+            o1 = x1 * cos - x2 * sin
+            o2 = x2 * cos + x1 * sin
 
         if is_neox:
             return torch.cat((o1, o2, q_or_k_pass), dim=-1)

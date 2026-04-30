@@ -25,6 +25,7 @@ aux_stream_name_list = [
     'MoeBalancer',
     'MoeOutputMemset',
     'MoeFc2Alpha',
+    'EngramPrecompute',
 ]
 AuxStreamType = Enum(
     'AuxStreamType',

@@ -227,9 +227,10 @@ def generate_seq_lens(batch_size, min_long_seq, num_tokens):
 
 @pytest.mark.parametrize("batch_size", [1, 64, 512, 2048])
 @pytest.mark.parametrize("next_n", [1, 2])
-@pytest.mark.parametrize("index_topk", [2048, 128])
+@pytest.mark.parametrize("index_topk", [2048, 512, 128])
 @pytest.mark.parametrize("num_tokens", [4096, 8192])
-def test_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+def test_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens, compress_ratio):
     """Verify indexer_topk_decode output matches torch.topk for random logits."""
     torch.manual_seed(24)
     torch.cuda.manual_seed(24)
@@ -239,16 +240,30 @@ def test_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
     next_n_offset = torch.arange(num_gen_tokens, device="cuda") % next_n
 
     seq_lens = generate_seq_lens(batch_size, index_topk, num_tokens)
-    row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
 
+    # Calculate actual KV lengths
+    actual_kv_lens = seq_lens[row_indices] - next_n + next_n_offset + 1
+
+    # Apply compression with floor division
+    row_ends = actual_kv_lens // compress_ratio
+
+    # Generate logits with the compressed size
     logits = create_random_logits(row_starts, row_ends, torch.float32, 42)
 
     indices = torch.empty((num_gen_tokens, index_topk), dtype=torch.int32, device="cuda")
 
-    torch.ops.trtllm.indexer_topk_decode(logits, seq_lens, indices, next_n, index_topk)
+    # Run CUDA implementation with compress_ratio
+    torch.ops.trtllm.indexer_topk_decode(
+        logits, seq_lens, indices, next_n, index_topk, compress_ratio=compress_ratio
+    )
+
     torch.cuda.synchronize()
 
+    # Run reference implementation on compressed row_ends
     max_row_len = row_ends.max().item()
+    if max_row_len == 0:
+        # All rows are empty after compression, skip comparison
+        return
     torch_indices = logits.topk(min(index_topk, max_row_len), dim=-1)[1]
     mask_lo = torch_indices >= 0
     mask_hi = (torch_indices - (row_ends - row_starts)[:, None]) < 0

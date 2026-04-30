@@ -200,6 +200,8 @@ set(TRTLLM_LINK_LIBS
     layers_src
     runtime_src
     testing_src
+    mhcKernels_src
+    compressorKernels_src
     userbuffers_src
     ${DECODER_SHARED_TARGET_0}
     ${DECODER_SHARED_TARGET_1})

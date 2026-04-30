@@ -798,6 +798,7 @@ class KvCacheCreator:
             sparse_attn_config=self._sparse_attention_config,
             max_num_tokens=self._max_num_tokens,
             max_beam_width=self._max_beam_width,
+            max_input_len=self._llm_args.max_input_len,
             kv_connector_manager=self._kv_connector_manager,
             estimating_kv_cache=estimating_kv_cache,
             execution_stream=self._execution_stream,
@@ -842,6 +843,11 @@ class KvCacheCreator:
         if self._mapping.enable_attention_dp:
             logger.info(
                 "Attention DP is enabled, separate draft KV cache is not supported."
+            )
+            return False
+        if self._sparse_attention_config is not None:
+            logger.info(
+                "Sparse attention is enabled, separate draft KV cache is not supported."
             )
             return False
         return should_use_separate_draft_kv_cache(self._speculative_config)
@@ -1476,6 +1482,8 @@ def _create_kv_cache_manager(
         max_num_tokens: int,
         max_beam_width: int,
         kv_connector_manager: Optional[KvCacheConnectorManager],
+        is_disagg: bool = False,
+        max_input_len: Optional[int] = None,
         estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
         # Optional overrides for one-model draft case (when model_engine is None)
@@ -1486,8 +1494,7 @@ def _create_kv_cache_manager(
         num_layers: Optional[int] = None,
         num_kv_heads: Optional[Union[int, List[int]]] = None,
         head_dim: Optional[int] = None,
-        kv_cache_type=None,
-        is_disagg: bool = False) -> KVCacheManager:
+        kv_cache_type=None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -1619,6 +1626,7 @@ def _create_kv_cache_manager(
             vocab_size=config.vocab_size,
             max_beam_width=max_beam_width,
             is_draft=is_draft,
+            max_input_len=max_input_len,
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
             sparse_attn_config=sparse_attn_config,
@@ -1626,6 +1634,7 @@ def _create_kv_cache_manager(
             execution_stream=execution_stream,
             layer_mask=layer_mask,
             is_disagg=is_disagg,
+            max_num_tokens=max_num_tokens,
         )
     elif is_nemotron_hybrid(config):
         if max_beam_width > 1:
@@ -1804,6 +1813,7 @@ def _create_kv_cache_manager(
             max_num_tokens=max_num_tokens,
             model_config=binding_model_config,
             max_beam_width=max_beam_width,
+            max_input_len=max_input_len,
             is_draft=is_draft,
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
