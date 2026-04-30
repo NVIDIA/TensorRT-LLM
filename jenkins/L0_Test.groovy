@@ -1267,7 +1267,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     """
                 } else {
                     if(nodeCount > 1) {
-                        srunArgs.add("--mpi=pmi2")
+                        srunArgs.add("--mpi=pmix")
                     }
 
                     def scriptContent = """
