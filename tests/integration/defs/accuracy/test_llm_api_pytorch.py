@@ -4608,6 +4608,26 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_hopper
+    def test_fp8_block_scales_early_first_token_emission(self):
+        """Accuracy with overlap scheduler + early first-token emission."""
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            enable_early_first_token_emission=True,
+            cuda_graph_config=CudaGraphConfig(),
+        )
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+
+        with LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8",
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 enable_chunked_prefill=False,
+                 max_batch_size=64) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
     def test_dummy_load_format(self):
         llm = LLM(
             f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8",

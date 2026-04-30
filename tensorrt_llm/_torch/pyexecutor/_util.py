@@ -1672,6 +1672,8 @@ def create_py_executor_instance(
         dist=dist,
         max_num_sequences=max_num_sequences,
         disable_overlap_scheduler=llm_args.disable_overlap_scheduler,
+        enable_early_first_token_emission=llm_args.
+        enable_early_first_token_emission,
         max_batch_size=max_batch_size,
         max_beam_width=max_beam_width,
         max_draft_len=spec_config.max_draft_len

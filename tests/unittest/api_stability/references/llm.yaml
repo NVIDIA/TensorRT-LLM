@@ -143,6 +143,10 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      enable_early_first_token_emission:
+        annotation: bool
+        default: False
+        status: prototype
       enable_iter_perf_stats:
         annotation: bool
         default: False
