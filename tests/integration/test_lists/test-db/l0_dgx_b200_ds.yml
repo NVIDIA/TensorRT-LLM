@@ -1,0 +1,18 @@
+version: 0.0.1
+l0_dgx_b200_ds:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*b200*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: pre_merge
+      backend: pytorch
+      orchestrator: mpi
+  tests:
+  - unittest/_torch/modeling/test_modeling_deepseekv4.py

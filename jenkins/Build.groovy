@@ -57,28 +57,28 @@ def BUILD_CONFIGS = [
   (CONFIG_LINUX_X86_64_VANILLA) : [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --extra-cmake-vars MOONCAKE_ROOT=/usr/local/Mooncake --micro_benchmarks",
     (TARNAME) : "TensorRT-LLM.tar.gz",
-    (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real;120-real",
+    (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real",
   ],
   (CONFIG_LINUX_X86_64_SINGLE_DEVICE) : [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=0 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars ENABLE_UCX=0 --micro_benchmarks",
     (TARNAME) : "single-device-TensorRT-LLM.tar.gz",
-    (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real;120-real",
+    (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real",
   ],
   (CONFIG_LINUX_X86_64_LLVM) : [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --micro_benchmarks -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CUDA_HOST_COMPILER=clang -DCMAKE_LINKER_TYPE=LLD",
     (TARNAME) : "llvm-TensorRT-LLM.tar.gz",
-    (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real;120-real",
+    (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real",
   ],
   (CONFIG_LINUX_AARCH64): [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --extra-cmake-vars MOONCAKE_ROOT=/usr/local/Mooncake",
     (TARNAME) : "TensorRT-LLM-GH200.tar.gz",
-    (WHEEL_ARCHS): "90-real;100-real;103-real;120-real",
+    (WHEEL_ARCHS): "90-real;100-real;103-real",
     (BUILD_JOBS_FOR_CONFIG): "8", // TODO: Remove after fix the build OOM issue on SBSA
   ],
   (CONFIG_LINUX_AARCH64_LLVM) : [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CUDA_HOST_COMPILER=clang -DCMAKE_LINKER_TYPE=LLD",
     (TARNAME) : "llvm-TensorRT-LLM-GH200.tar.gz",
-    (WHEEL_ARCHS): "90-real;100-real;103-real;120-real",
+    (WHEEL_ARCHS): "90-real;100-real;103-real",
     (BUILD_JOBS_FOR_CONFIG): "8", // TODO: Remove after fix the build OOM issue on SBSA
   ],
 ]
@@ -470,9 +470,9 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
 
     if (extra_args == "") {
         if (triple == AARCH64_TRIPLE) {
-            extra_args = "-a '90-real;100-real;103-real;120-real'"
+            extra_args = "-a '90-real;100-real;103-real'"
         } else {
-            extra_args = "-a '80-real;86-real;89-real;90-real;100-real;103-real;120-real'"
+            extra_args = "-a '80-real;86-real;89-real;90-real;100-real;103-real'"
         }
     }
     if (pre_cxx11abi) {
