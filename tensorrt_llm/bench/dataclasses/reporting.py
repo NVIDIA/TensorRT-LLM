@@ -99,46 +99,41 @@ class StatsKeeper:
         if batch_size <= 0:
             return None
 
-        events: Dict[int, int] = {}
-        request_spans = []
+        events: Dict[int, tuple[int, float]] = {}
         for request in requests:
             start = request.start_timestamp
             end = request.end_timestamp
             if end <= start:
                 continue
-            request_spans.append((start, end, request.num_total_output_tokens))
-            events[start] = events.get(start, 0) + 1
-            events[end] = events.get(end, 0) - 1
+            token_rate = request.num_total_output_tokens / (end - start)
+            start_request_delta, start_rate_delta = events.get(start, (0, 0.0))
+            events[start] = (start_request_delta + 1,
+                             start_rate_delta + token_rate)
+            end_request_delta, end_rate_delta = events.get(end, (0, 0.0))
+            events[end] = (end_request_delta - 1, end_rate_delta - token_rate)
 
-        if not request_spans:
+        if not events:
             return None
 
         active_requests = 0
+        active_token_rate = 0.0
+        batch_full_duration_ns = 0
+        batch_full_output_tokens = 0.0
         last_timestamp = None
-        batch_full_intervals = []
         for timestamp in sorted(events):
             if (last_timestamp is not None and timestamp > last_timestamp
                     and active_requests >= batch_size):
-                batch_full_intervals.append((last_timestamp, timestamp))
-            active_requests += events[timestamp]
+                duration_ns = timestamp - last_timestamp
+                batch_full_duration_ns += duration_ns
+                batch_full_output_tokens += active_token_rate * duration_ns
+
+            request_delta, rate_delta = events[timestamp]
+            active_requests += request_delta
+            active_token_rate += rate_delta
             last_timestamp = timestamp
 
-        batch_full_duration_ns = sum(end - start
-                                     for start, end in batch_full_intervals)
         if batch_full_duration_ns <= 0:
             return None
-
-        batch_full_output_tokens = 0.0
-        for request_start, request_end, output_tokens in request_spans:
-            request_duration_ns = request_end - request_start
-            for interval_start, interval_end in batch_full_intervals:
-                overlap_ns = max(
-                    0,
-                    min(request_end, interval_end) -
-                    max(request_start, interval_start))
-                if overlap_ns:
-                    batch_full_output_tokens += (output_tokens * overlap_ns /
-                                                 request_duration_ns)
 
         return batch_full_output_tokens / batch_full_duration_ns
 
