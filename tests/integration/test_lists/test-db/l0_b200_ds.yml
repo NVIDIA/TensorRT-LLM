@@ -14,3 +14,15 @@ l0_b200_ds:
       backend: pytorch
   tests:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_2_model_mtp
+  # ------------- DeepSeek-V4 unit tests (single B200) ---------------
+  # Sparse-attention kernels + cache manager + compressor + indices_transform
+  # + o_proj. Only path to V4 sparse-attention kernel coverage in CI.
+  - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_sparse_mla.py TIMEOUT (60)
+  - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_cache_manager.py TIMEOUT (60)
+  - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_indices_transform.py TIMEOUT (60)
+  - unittest/_torch/attention/sparse/deepseek_v4/test_deepseek_v4_o_proj.py TIMEOUT (30)
+  - unittest/_torch/attention/sparse/deepseek_v4/test_compressor_kernel.py TIMEOUT (90)
+  - unittest/_torch/attention/sparse/deepseek_v4/test_compressor_module.py TIMEOUT (90)
+  - unittest/_torch/attention/sparse/deepseek_v4/test_compressor_tf32.py TIMEOUT (15)
+  # Tokenizer chat-template tests.
+  - unittest/llmapi/test_deepseek_v4_tokenizer.py
