@@ -226,6 +226,8 @@ class KvCacheCreator:
         self._max_beam_width = max_beam_width
         self._kv_connector_manager = kv_connector_manager
         self._llm_args = llm_args
+        # For V2 fallback use only, will be removed after V2 is stable
+        self._cache_transceiver_config = llm_args.cache_transceiver_config
         self._speculative_config = speculative_config
         self._sparse_attention_config = sparse_attention_config
         self._tokens_per_block = tokens_per_block
@@ -274,7 +276,7 @@ class KvCacheCreator:
             if self._kv_connector_manager is not None or (
                     self._max_beam_width is not None
                     and self._max_beam_width > 1
-            ) or self._kv_cache_config.event_buffer_max_size > 0 or (
+            ) or (
                     self._cache_transceiver_config is not None
                     and self._cache_transceiver_config.backend is not None):
                 # Per-layer head_dim models (e.g., Gemma4 hybrid) require V2's
@@ -287,12 +289,12 @@ class KvCacheCreator:
                     raise NotImplementedError(
                         "Gemma4 hybrid attention requires KVCacheManagerV2, "
                         "which is not yet supported with kv_connector_manager, "
-                        "beam_width > 1, event_buffer_max_size > 0, or "
+                        "beam_width > 1, or "
                         "cache_transceiver. Disable these features to run "
                         "Gemma4 hybrid models.")
                 logger.warning(
                     "KVCacheManagerV2 is not supported with kv_connector_manager, beam width > 1, "
-                    "event buffer max size > 0, or cache transceiver. Falling back to KVCacheManager."
+                    "or cache transceiver. Falling back to KVCacheManager."
                 )
                 return KVCacheManager
         return kv_cache_manager_cls

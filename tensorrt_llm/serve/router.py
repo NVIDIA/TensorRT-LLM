@@ -846,12 +846,17 @@ class BlockHashMixin:
         block_hashes: list[list[BlockHash]] = []
         for token_list in token_lists:
             hash_list = []
-            # in KvCacheManager, the last token is not included in the block key
+            parent_hash = None
+            # In KV cache managers, the last token is not included in the block key.
             for t in range(0, len(token_list) - 1, self._tokens_per_block):
                 t_end = min(t + self._tokens_per_block, len(token_list) - 1)
-                hash_list.append(
-                    block_key_hasher(token_list[t:t_end],
-                                     None if t == 0 else hash_list[-1]))
+                if hash_algo == KV_CACHE_HASH_ALGO_V2:
+                    parent_hash = v2_sha256_block_hasher(
+                        token_list[t:t_end], parent_hash)
+                else:
+                    parent_hash = block_key_hasher(token_list[t:t_end],
+                                                   parent_hash)
+                hash_list.append(parent_hash)
             block_hashes.append(hash_list)
         return block_hashes
 
