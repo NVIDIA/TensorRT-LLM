@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Tests comparing Compressor with RefCompressor."""
 
@@ -1802,14 +1802,9 @@ def test_indexer_returns_fused_quant_outputs(
         assert torch.equal(scale_output, torch.full_like(scale_output, 0x7F))
 
 
-def test_deepseek_v4_indexer_skips_duplicate_cache_scatter(monkeypatch):
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("base DSA cache scatter should not run for DeepSeek-V4 indexer")
-
-    monkeypatch.setattr(Indexer, "_update_k_cache", fail_if_called)
-    indexer = DeepseekV4Indexer.__new__(DeepseekV4Indexer)
-
-    assert indexer._update_k_cache(object(), object(), object()) is None
+def test_deepseek_v4_indexer_uses_base_cache_scatter():
+    assert "_update_k_cache" not in DeepseekV4Indexer.__dict__
+    assert DeepseekV4Indexer._update_k_cache is Indexer._update_k_cache
 
 
 # ============================================================================

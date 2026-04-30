@@ -1,4 +1,3 @@
-import os
 from enum import IntEnum
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
@@ -13,10 +12,6 @@ from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 
 if TYPE_CHECKING:
     from .deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
-
-# When set to "1", run wkv_gate in fp32 for accuracy debugging.
-# The default path follows the checkpoint dtype (bf16).
-_USE_FP32_COMPRESSOR = os.environ.get("DEEPSEEK_V4_COMPRESSOR_FP32", "0") == "1"
 
 
 class KVCacheDtype(IntEnum):
@@ -188,13 +183,9 @@ class Compressor(nn.Module):
         num_comp_tokens = metadata.new_comp_kv_lens_cuda[self.compress_ratio][:bsz]
         max_ctx_comp_kv_lens = metadata.max_ctx_compressed_tokens[self.compress_ratio]
 
-        # Project input to KV and score. Default uses checkpoint dtype (bf16)
-        # for the GEMM, then upcasts to fp32 for the compressor kernels.
-        # DEEPSEEK_V4_COMPRESSOR_FP32=1 keeps an fp32 debugging path.
-        if _USE_FP32_COMPRESSOR:
-            kv_score = F.linear(x.float(), self.wkv_gate.weight.float())
-        else:
-            kv_score = F.linear(x.to(self.wkv_gate.weight.dtype), self.wkv_gate.weight).float()
+        # Project input to KV and score in the checkpoint dtype, then store the
+        # result in fp32 for the compressor kernels.
+        kv_score = F.linear(x.to(self.wkv_gate.weight.dtype), self.wkv_gate.weight).float()
 
         # Allocate output buffer
         kv_comp = torch.empty(total_num_comp_tokens, self.head_dim, device=x.device, dtype=x.dtype)
