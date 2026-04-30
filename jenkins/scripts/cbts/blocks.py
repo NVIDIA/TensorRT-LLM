@@ -519,25 +519,25 @@ def write_filtered_test_db(
 ) -> None:
     """Generate a tmp test-db dir narrowed by CBTS Layer 3.
 
-    Contains only the YAMLs whose blocks were affected, with each affected
-    block's `tests:` array filtered to entries in the per-block filter prefix
-    subtree.
+    Each output YAML contains ONLY the blocks listed in `block_filters` for
+    that stem, with each affected block's `tests:` array filtered to entries
+    in the per-block filter prefix subtree. Unaffected blocks and unaffected
+    YAML files are dropped entirely.
 
-    Layer 3 narrowing: trt-test-db invoked with `-d <output_dir>` will produce
-    a smaller testDBList for each affected stage, since the YAML it reads has
-    fewer tests in the matched block.
+    Why drop unaffected blocks rather than write them through unchanged:
+    Layer 3's contract is "only run tests touched by the affected blocks". If
+    we kept post_merge / other-backend blocks that this PR never touched, a
+    `/bot run --post-merge` could activate them on stages whose mako happens
+    to match — running tests CBTS never selected. Dropping them keeps Layer
+    3's narrowing semantically tight.
 
     `block_filters` keys: (yaml_stem, block_index) of affected blocks.
     Values: set of filter prefix strings that should keep tests in their
     subtree.
 
-    Unaffected blocks (not in `block_filters`) are written through unchanged.
-    Unaffected YAML files are NOT written — only stages whose YAML appears in
-    `block_filters` will be running anyway (Layer 2 already filtered).
-
-    Safety: if filtering would empty a block's tests, the original tests are
-    kept (prevents silent skip when a YAML/waive granularity mismatch slips
-    through).
+    Safety: if filtering would empty an affected block's tests, the original
+    tests are kept (prevents silent skip from typo'd waive ids or granularity
+    mismatch). The block itself is still kept either way.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -548,14 +548,16 @@ def write_filtered_test_db(
             continue
         data = yaml.safe_load(src.read_text()) or {}
 
-        for ctx_blocks in data.values():
+        for ctx_key, ctx_blocks in list(data.items()):
             if not isinstance(ctx_blocks, list):
                 continue
+            new_blocks = []
             for i, block_data in enumerate(ctx_blocks):
                 if not isinstance(block_data, dict):
                     continue
                 key = (stem, i)
                 if key not in block_filters:
+                    # Drop unaffected blocks (see docstring rationale).
                     continue
                 original = block_data.get("tests") or []
                 filters = block_filters[key]
@@ -568,6 +570,8 @@ def write_filtered_test_db(
                 # silent skip from typo'd waive ids or granularity mismatch).
                 if kept:
                     block_data["tests"] = kept
+                new_blocks.append(block_data)
+            data[ctx_key] = new_blocks
 
         (output_dir / src.name).write_text(
             yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
