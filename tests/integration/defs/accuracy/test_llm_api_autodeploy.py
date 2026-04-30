@@ -684,6 +684,7 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             assert len(outputs) == 1
 
     @skip_pre_hopper
+    @pytest.mark.parametrize("model_id", ["bf16", "fp8", "nvfp4"])
     @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
     @pytest.mark.parametrize(
         "world_size",
@@ -700,17 +701,22 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             ),
         ],
     )
-    def test_mtp(self, world_size, attn_backend):
+    def test_mtp(self, world_size, attn_backend, model_id):
         if get_device_count() < world_size:
             pytest.skip(f"Not enough devices for world_size={world_size}")
+        # bf16 120B model requires at least 4 GPUs
+        if model_id == "bf16" and world_size < 4:
+            pytest.skip("bf16 Super V3 requires at least 4 GPUs")
 
-        model_path = self.MODEL_PATHS["bf16"]
+        model_path = self.MODEL_PATHS[model_id]
         kwargs = {}
-        low_memory_overrides(
-            kwargs,
-            max_batch_size=8,
-            cuda_graph_batch_sizes=[1, 2, 4, 8],
-        )
+        # bf16 needs memory overrides to fit; fp8/nvfp4 are compact enough without
+        if model_id == "bf16":
+            low_memory_overrides(
+                kwargs,
+                max_batch_size=8,
+                cuda_graph_batch_sizes=[1, 2, 4, 8],
+            )
         kwargs["attn_backend"] = attn_backend
 
         # Note: Torch-cudagraph is only enabled for TRTLLM Attention backend.
@@ -720,8 +726,8 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             kwargs["compile_backend"] = "torch-simple"
 
         print(
-            f"SuperV3 MTP params: world_size={world_size}, model_path={model_path}"
-        )
+            f"SuperV3 MTP params: model_id={model_id}, world_size={world_size}, "
+            f"model_path={model_path}")
         print(f"kwargs: {kwargs}")
 
         mtp_yaml = str(
@@ -739,9 +745,17 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                 enable_iter_perf_stats=True,
                 **kwargs,
         ) as llm:
+            _set_quant_config(llm, model_id)
+            if model_id == "nvfp4":
+                llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
+            print_memory_usage("after engine build")
+
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            self.check_acceptance_rate(llm, min_acceptance_rate=0.45)
+            # bf16 acceptance is stable; fp8/nvfp4 have higher variance due to
+            # arithmetic rounding, so use a lower threshold for quantized models.
+            min_rate = 0.50 if model_id == "bf16" else 0.40
+            self.check_acceptance_rate(llm, min_acceptance_rate=min_rate)
 
         print_memory_usage("after evaluation")
 
