@@ -206,6 +206,13 @@ input [
     optional: true
   },
   {
+    name: "prompt_ignore_length"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+    reshape: { shape: [ ] }
+    optional: true
+  },
+  {
     name: "early_stopping"
     data_type: TYPE_BOOL
     dims: [ 1 ]

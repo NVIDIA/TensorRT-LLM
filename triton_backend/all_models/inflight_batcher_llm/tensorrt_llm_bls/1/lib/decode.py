@@ -76,6 +76,7 @@ class Request:
     top_p: Optional[np.ndarray] = None
     temperature: Optional[np.ndarray] = None
     length_penalty: Optional[np.ndarray] = None
+    prompt_ignore_length: Optional[np.ndarray] = None
     repetition_penalty: Optional[np.ndarray] = None
     min_tokens: Optional[np.ndarray] = None
     return_log_probs: Optional[np.ndarray] = None

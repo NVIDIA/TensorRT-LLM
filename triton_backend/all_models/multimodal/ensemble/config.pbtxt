@@ -124,6 +124,12 @@ input [
     optional: true
   },
   {
+    name: "prompt_ignore_length"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
     name: "repetition_penalty"
     data_type: TYPE_FP32
     dims: [ 1 ]
@@ -511,6 +517,10 @@ ensemble_scheduling {
       input_map {
           key: "len_penalty"
           value: "length_penalty"
+      }
+      input_map {
+          key: "prompt_ignore_length"
+          value: "prompt_ignore_length"
       }
       input_map {
           key: "repetition_penalty"

@@ -388,6 +388,7 @@ std::optional<tensorrt_llm::executor::Request> getRequest(
     pushTensor<float>(inputsTensors, InputFieldsNames::beamSearchDiversityRate, nvinfer1::DataType::kFLOAT, {1}, {0.1});
     pushTensor<float>(inputsTensors, InputFieldsNames::presencePenalty, nvinfer1::DataType::kFLOAT, {1}, {0.2});
     pushTensor<float>(inputsTensors, InputFieldsNames::frequencyPenalty, nvinfer1::DataType::kFLOAT, {1}, {0.3});
+    pushTensor<int32_t>(inputsTensors, InputFieldsNames::promptIgnoreLength, nvinfer1::DataType::kINT32, {1}, {7});
     pushTensor<uint64_t>(inputsTensors, InputFieldsNames::seed, nvinfer1::DataType::kINT64, {1}, {3456});
 
     // PromptTuningConfig
@@ -585,6 +586,7 @@ void checkRequest(tensorrt_llm::executor::Request const& request,
     EXPECT_EQ(samplingConfig.getBeamSearchDiversityRate().value(), 0.1f);
     EXPECT_EQ(samplingConfig.getPresencePenalty().value(), 0.2f);
     EXPECT_EQ(samplingConfig.getFrequencyPenalty().value(), 0.3f);
+    EXPECT_EQ(samplingConfig.getPromptIgnoreLength().value(), 7);
     EXPECT_EQ(samplingConfig.getSeed().value(), 3456);
     EXPECT_EQ(samplingConfig.getNumReturnSequences().value(), 29);
 
