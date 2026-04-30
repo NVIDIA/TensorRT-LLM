@@ -30,7 +30,7 @@ from .trtllm_gen import trtllm_gen_attention
 
 # Enable TRTLLM-Gen attention backend via environment variable (default: off).
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
-    "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1")
+    "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "1") == "1")
 
 
 @dataclass(kw_only=True, init=False)
@@ -580,6 +580,7 @@ class TrtllmAttentionWrapper:
                 has_cross_kv=False,
                 quant_config=self.quant_config,
                 kv_cache_manager=self.kv_cache_manager,
+                attention_input_type=self.attention_input_type,
                 skip_softmax_threshold_scale_factor_prefill=self.
                 skip_softmax_threshold_scale_factor_prefill,
                 skip_softmax_threshold_scale_factor_decode=self.
