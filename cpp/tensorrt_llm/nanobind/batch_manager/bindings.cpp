@@ -277,7 +277,24 @@ void initBindings(nb::module_& m)
                     return std::optional<GenLlmReq::VecUniqueTokens>(*encoderUniqueTokens.value());
                 }
                 return std::optional<GenLlmReq::VecUniqueTokens>(std::nullopt);
-            });
+            })
+        // Encoder-decoder accessors (Step 9: encoder iteration in PyExecutor).
+        // ``encoder_tokens`` returns the source-side tokens used to drive the
+        // encoder forward.  ``encoder_output_len`` is the cross-KV capacity
+        // for the request (number of encoder hidden states the decoder
+        // cross-attention will read), which mirrors the C++
+        // ``getEncoderOutputLen`` contract.
+        .def_prop_ro("encoder_tokens",
+            [](GenLlmReq& self) -> std::optional<GenLlmReq::VecTokens>
+            {
+                auto const& encoderTokens = self.getEncoderTokens();
+                if (encoderTokens.has_value() && encoderTokens.value())
+                {
+                    return std::optional<GenLlmReq::VecTokens>(*encoderTokens.value());
+                }
+                return std::nullopt;
+            })
+        .def_prop_ro("encoder_output_len", &GenLlmReq::getEncoderOutputLen);
 
     nb::class_<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", nb::dynamic_attr())
         .def(

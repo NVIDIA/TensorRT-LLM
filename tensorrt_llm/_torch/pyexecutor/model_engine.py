@@ -1806,6 +1806,89 @@ class PyTorchModelEngine(ModelEngine):
             input_ids, vocab_size=vocab_size, mm_token_ids=mm_token_ids)
         return text_token_indices, mm_token_indices
 
+    def _is_encoder_decoder_model(self) -> bool:
+        return bool(
+            getattr(getattr(self.model, "model_config", None),
+                    "is_encoder_decoder", False))
+
+    def _get_top_level_model(self) -> Any:
+        model = getattr(self.model, "_orig_mod", self.model)
+        top_level_model = getattr(model, "model", model)
+        return getattr(top_level_model, "_orig_mod", top_level_model)
+
+    def _get_position_id_offset(self) -> int:
+        offset = getattr(self._get_top_level_model(), "position_id_offset", 0)
+        return 0 if offset is None else int(offset)
+
+    def _apply_position_id_offset(self, position_ids: List[int]) -> List[int]:
+        offset = self._get_position_id_offset()
+        if offset == 0:
+            return position_ids
+        return [position_id + offset for position_id in position_ids]
+
+    def _prepare_encoder_decoder_cross_attention_inputs(
+        self,
+        encoder_hidden_states: List[torch.Tensor],
+        encoder_seq_lens: List[int],
+        encoder_num_cached_tokens_per_seq: List[int],
+        attn_metadata: AttentionMetadata,
+        resource_manager: Optional[ResourceManager],
+    ) -> Dict[str, Any]:
+        if not encoder_seq_lens:
+            return {}
+
+        if len(encoder_seq_lens) != attn_metadata.num_seqs:
+            raise RuntimeError(
+                "Cross-attention encoder lengths must align with decoder "
+                f"sequences: got {len(encoder_seq_lens)} encoder lengths for "
+                f"{attn_metadata.num_seqs} decoder sequences.")
+
+        if resource_manager is None:
+            raise RuntimeError(
+                "Encoder-decoder decoder forward requires a resource manager "
+                "with a cross-KV cache manager.")
+        enc_dec_kv_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.ENC_DEC_KV_CACHE_MANAGER)
+        if enc_dec_kv_cache_manager is None:
+            raise RuntimeError("Encoder-decoder decoder forward requires "
+                               "ResourceManagerType.ENC_DEC_KV_CACHE_MANAGER.")
+
+        new_encoder_tokens = sum(encoder_seq_lens)
+        if encoder_hidden_states:
+            packed_encoder_hidden_states = (
+                encoder_hidden_states[0] if len(encoder_hidden_states) == 1 else
+                torch.cat(encoder_hidden_states, dim=0))
+            if packed_encoder_hidden_states.shape[0] != new_encoder_tokens:
+                raise RuntimeError(
+                    "Packed encoder hidden states do not match cross-attention "
+                    "metadata: got "
+                    f"{packed_encoder_hidden_states.shape[0]} rows for "
+                    f"{new_encoder_tokens} new encoder KV tokens.")
+            skip_cross_kv_projection = False
+        else:
+            if new_encoder_tokens != 0:
+                raise RuntimeError(
+                    "Cross-attention metadata asks to project encoder K/V, "
+                    "but no encoder hidden states were supplied.")
+            packed_encoder_hidden_states = None
+            skip_cross_kv_projection = True
+
+        encoder_seq_lens_tensor = torch.tensor(encoder_seq_lens,
+                                               dtype=torch.int,
+                                               pin_memory=prefer_pinned())
+        cross_attn_metadata = attn_metadata.create_cross_metadata(
+            encoder_seq_lens=encoder_seq_lens_tensor,
+            enc_dec_kv_cache_manager=enc_dec_kv_cache_manager,
+            encoder_num_cached_tokens_per_seq=encoder_num_cached_tokens_per_seq,
+        )
+        cross_attn_metadata.prepare()
+
+        return {
+            "encoder_hidden_states": packed_encoder_hidden_states,
+            "cross_attn_metadata": cross_attn_metadata,
+            "skip_cross_kv_projection": skip_cross_kv_projection,
+        }
+
     def _can_use_incremental_update(
             self, scheduled_requests: ScheduledRequests,
             new_tokens_device: Optional[torch.Tensor],
@@ -2341,6 +2424,11 @@ class PyTorchModelEngine(ModelEngine):
         mrope_position_ids = [
         ]  # (start_idx, end_idx, (3,1,L) mrope_pos_ids) per multimodal request
         num_accepted_draft_tokens = []  # per request
+        is_encoder_decoder = self._is_encoder_decoder_model()
+        cross_encoder_hidden_states: List[torch.Tensor] = []
+        cross_encoder_seq_lens: List[int] = [
+        ]  # new encoder K/V tokens per decoder sequence
+        cross_encoder_cached_tokens_per_seq: List[int] = []
         # if using tree decoding, we need to store the request type and accepted path for each request,
         # which will be used to update the hidden_states_read_indices.
         request_accepted_path = {}  # per request
@@ -2357,6 +2445,37 @@ class PyTorchModelEngine(ModelEngine):
         context_input_ids_positions = []
         # (start_idx, end_idx, seq_slot) for first_draft requests
         first_draft_input_ids_positions = []
+
+        def append_cross_attention_state(request: LlmRequest,
+                                         project_encoder_output: bool,
+                                         repeat: int = 1) -> None:
+            if not is_encoder_decoder:
+                return
+
+            encoder_output_len = int(request.encoder_output_len)
+            if project_encoder_output:
+                encoder_output = getattr(request, "py_encoder_output", None)
+                if encoder_output is None:
+                    raise RuntimeError(
+                        "Decoder context request "
+                        f"{request.py_request_id} has no encoder output. "
+                        "The encoder iteration must populate "
+                        "req.py_encoder_output before the first decoder "
+                        "context step.")
+                if encoder_output.shape[0] != encoder_output_len:
+                    raise RuntimeError(
+                        "Decoder context request "
+                        f"{request.py_request_id} encoder output length "
+                        f"({encoder_output.shape[0]}) does not match "
+                        f"encoder_output_len ({encoder_output_len}).")
+                cross_encoder_hidden_states.append(encoder_output)
+                cross_encoder_seq_lens.append(encoder_output_len)
+                cross_encoder_cached_tokens_per_seq.append(0)
+                return
+
+            for _ in range(repeat):
+                cross_encoder_seq_lens.append(0)
+                cross_encoder_cached_tokens_per_seq.append(encoder_output_len)
 
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
@@ -2391,6 +2510,10 @@ class PyTorchModelEngine(ModelEngine):
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num)
             request.cached_tokens = num_cached_tokens_per_seq[-1]
+            append_cross_attention_state(
+                request,
+                project_encoder_output=not request.py_skip_cross_kv_projection
+                and not getattr(request, "is_dummy", False))
 
             # Embed mask is required only for partial iterations (chunked
             # prefill or KV-cache reuse); full-prefill degrades gracefully.
@@ -2577,6 +2700,8 @@ class PyTorchModelEngine(ModelEngine):
                 else:
                     prompt_lengths.append(request.py_prompt_len)
 
+            append_cross_attention_state(request, project_encoder_output=False)
+
         for request in first_draft_requests:
             request_ids.append(request.py_request_id)
             all_prompt_tokens = request.get_tokens(0)
@@ -2626,6 +2751,7 @@ class PyTorchModelEngine(ModelEngine):
             prompt_lengths.append(request.py_prompt_len)
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num)
+            append_cross_attention_state(request, project_encoder_output=False)
 
             # update batch index
             request.py_batch_idx = request.py_seq_slot
@@ -2729,6 +2855,9 @@ class PyTorchModelEngine(ModelEngine):
                                 multimodal_params_list.append(multimodal_params)
 
                 request.py_batch_idx = request.py_seq_slot
+                append_cross_attention_state(request,
+                                             project_encoder_output=False,
+                                             repeat=beam_width)
                 # Do not add a gen_request_seq_slot for CUDA graph dummy requests
                 # to prevent access errors due to None values
                 if not request.is_cuda_graph_dummy:
@@ -2959,6 +3088,7 @@ class PyTorchModelEngine(ModelEngine):
             self.previous_pos_id_offsets_cuda *= 0
             self.previous_kv_lens_offsets_cuda *= 0
 
+        position_ids = self._apply_position_id_offset(position_ids)
         if self.use_mrope and mrope_position_ids:
             # Mixed batches may have only some requests with multimodal MRoPE
             # data. Seed the full (3,1,N) buffer from scalar position_ids
@@ -3096,6 +3226,14 @@ class PyTorchModelEngine(ModelEngine):
         if hasattr(self.model.model_config.pretrained_config, 'chunk_size'):
             attn_metadata.mamba_chunk_size = self.model.model_config.pretrained_config.chunk_size
         attn_metadata.prepare()
+        cross_attention_inputs = (
+            self._prepare_encoder_decoder_cross_attention_inputs(
+                cross_encoder_hidden_states,
+                cross_encoder_seq_lens,
+                cross_encoder_cached_tokens_per_seq,
+                attn_metadata,
+                resource_manager,
+            ) if is_encoder_decoder else {})
 
         peft_cache_manager = resource_manager and resource_manager.get_resource_manager(
             ResourceManagerType.PEFT_CACHE_MANAGER)
@@ -3137,6 +3275,7 @@ class PyTorchModelEngine(ModelEngine):
             "multimodal_params": multimodal_params_list,
             'resource_manager': resource_manager,
         }
+        inputs.update(cross_attention_inputs)
 
         if bool(lora_params):
             inputs['lora_params'] = lora_params
@@ -3247,6 +3386,7 @@ class PyTorchModelEngine(ModelEngine):
                                  pin_memory=prefer_pinned())
         self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
 
+        position_ids = self._apply_position_id_offset(position_ids)
         position_ids = torch.tensor(position_ids,
                                     dtype=torch.int,
                                     pin_memory=prefer_pinned())
@@ -4178,6 +4318,193 @@ class PyTorchModelEngine(ModelEngine):
             result['mrope_position_deltas'] = mrope_position_deltas_list
 
         return result
+
+    @nvtx_range("_prepare_tp_inputs_encoder")
+    def _prepare_tp_inputs_encoder(
+        self,
+        encoder_requests: List[LlmRequest],
+        resource_manager: Optional[ResourceManager] = None,
+    ):
+        """Pack encoder-side inputs for an encoder-decoder forward pass.
+
+        Mirrors the no-cache path used by ``mm_encoder_only`` and the
+        legacy ``EncoderBuffers`` shape contract: ``encoder_input_ids``
+        and ``encoder_position_ids`` are concatenated across requests
+        into a single ``[sum(encoder_output_len)]`` tensor, with one
+        non-causal :class:`AttentionMetadata` describing the packed
+        encoder batch.
+
+        The encoder pass does not touch any KV-cache pool — the cross
+        pool is only written by the *decoder*'s cross-attention on the
+        first context step (Step 6 / decoder cross-attn integration).
+        Self-pool blocks for the decoder are reserved on the next
+        scheduler iteration when the request transitions to
+        ``CONTEXT_INIT`` (Stage-1 next-iteration dispatch, see G1 in
+        the porting guide).
+        """
+        if not encoder_requests:
+            raise ValueError(
+                "_prepare_tp_inputs_encoder called with no encoder requests")
+
+        encoder_input_ids: List[int] = []
+        encoder_position_ids: List[int] = []
+        sequence_lengths: List[int] = []
+        request_ids: List[int] = []
+
+        for request in encoder_requests:
+            tokens = request.encoder_tokens
+            if tokens is None:
+                raise ValueError(
+                    f"Encoder request {request.py_request_id} has no "
+                    "encoder_tokens; encoder_input_token_ids must be wired "
+                    "through executor_request_to_llm_request "
+                    "(see Step 10 in the encoder-decoder porting guide).")
+            seq_len = len(tokens)
+            encoder_input_ids.extend(tokens)
+            encoder_position_ids.extend(
+                self._apply_position_id_offset(list(range(seq_len))))
+            sequence_lengths.append(seq_len)
+            request_ids.append(request.py_request_id)
+
+        num_tokens = len(encoder_input_ids)
+        assert num_tokens <= self.max_num_tokens, (
+            f"encoder packed length ({num_tokens}) exceeds max_num_tokens "
+            f"({self.max_num_tokens})")
+
+        # Build a fresh, no-cache attention metadata for the encoder
+        # pass.  We do not reuse ``self.attn_metadata`` because that
+        # object is bound to the decoder's KV-cache manager.
+        encoder_attn_metadata = self.attn_backend.Metadata(
+            max_num_requests=self.batch_size,
+            max_num_tokens=self.max_num_tokens,
+            max_num_sequences=self.batch_size * self.max_beam_width,
+            kv_cache_manager=None,
+            mapping=self.mapping,
+            runtime_features=self.attn_runtime_features,
+            enable_flash_mla=self.model.model_config.enable_flash_mla,
+            enable_context_mla_with_cached_kv=False,
+            cache_indirection=None,
+            sparse_attention_config=self.sparse_attention_config,
+            num_heads_per_kv=1,
+        )
+        assert isinstance(
+            encoder_attn_metadata,
+            (VanillaAttentionMetadata, TrtllmAttentionMetadata)
+        ), "Only vanilla and trtllm attention metadata are supported for the encoder pass"
+
+        encoder_attn_metadata.seq_lens = torch.tensor(
+            sequence_lengths,
+            dtype=torch.int,
+            pin_memory=prefer_pinned(),
+        )
+        encoder_attn_metadata.num_contexts = len(encoder_requests)
+        encoder_attn_metadata.max_seq_len = self.max_seq_len
+        encoder_attn_metadata.request_ids = request_ids
+        encoder_attn_metadata.prepare()
+
+        encoder_input_ids_t = torch.tensor(encoder_input_ids,
+                                           dtype=torch.int,
+                                           pin_memory=prefer_pinned())
+        encoder_position_ids_t = torch.tensor(encoder_position_ids,
+                                              dtype=torch.int,
+                                              pin_memory=prefer_pinned())
+
+        inputs = {
+            'encoder_input_ids':
+            encoder_input_ids_t.to('cuda', non_blocking=True),
+            'encoder_position_ids':
+            encoder_position_ids_t.to('cuda', non_blocking=True).unsqueeze(0),
+            'encoder_attn_metadata':
+            encoder_attn_metadata,
+            'encoder_seq_lens':
+            sequence_lengths,
+            'resource_manager':
+            resource_manager,
+        }
+        return inputs
+
+    @nvtx_range("_forward_step_encoder")
+    def _forward_step_encoder(
+        self,
+        inputs: Dict[str, Any],
+    ) -> torch.Tensor:
+        """Run the encoder stack and return packed encoder hidden states.
+
+        Returns ``[sum(encoder_output_len), hidden_size]`` (matches the
+        ``EncoderBuffers`` shape contract from the legacy TRT path).
+        Slicing back into per-request hidden states is the executor's
+        responsibility — see :meth:`PyExecutor._scatter_encoder_output`.
+        """
+        encoder = getattr(self.model, "encoder", None)
+        if encoder is None:
+            inner = getattr(self.model, "model", None)
+            encoder = getattr(inner, "encoder",
+                              None) if inner is not None else None
+        if encoder is None:
+            raise AttributeError(
+                "Model does not expose an `encoder` submodule; encoder-decoder "
+                "models must define a top-level `encoder` (or `model.encoder`) "
+                "stack to participate in the encoder iteration.")
+
+        # Encoder operates on packed token IDs.  Models like T5 own the
+        # shared embedding on ``self.model`` rather than inside the
+        # encoder stack, so we go through the top-level model when
+        # available so the embedding is applied consistently with the
+        # decoder pass.
+        top_level_model = self._get_top_level_model()
+        embed = getattr(top_level_model, "shared_embedding", None) or getattr(
+            top_level_model, "embed_tokens", None)
+        encoder_input_ids = inputs['encoder_input_ids']
+        if embed is not None:
+            hidden_states = embed(encoder_input_ids)
+            embed_scale = getattr(top_level_model, "embed_scale", None)
+            if embed_scale is not None:
+                hidden_states = hidden_states * embed_scale
+        else:
+            # Fall back to letting the encoder accept token ids directly.
+            hidden_states = encoder_input_ids
+
+        encoder_attn_metadata = inputs['encoder_attn_metadata']
+        position_ids = inputs.get('encoder_position_ids')
+        if position_ids is not None and position_ids.dim() == 2:
+            position_ids = position_ids.squeeze(0)
+
+        encoder_hidden_states = encoder(
+            hidden_states=hidden_states,
+            attn_metadata=encoder_attn_metadata,
+            position_ids=position_ids,
+        )
+        return encoder_hidden_states
+
+    @nvtx_range("forward_encoder")
+    def forward_encoder(
+        self,
+        encoder_requests: List[LlmRequest],
+        resource_manager: Optional[ResourceManager] = None,
+    ) -> Tuple[torch.Tensor, List[int]]:
+        """Run the encoder stack for ``encoder_requests``.
+
+        Returns a tuple ``(encoder_hidden_states, encoder_seq_lens)``
+        where the hidden states tensor is shaped
+        ``[sum(encoder_seq_lens), hidden_size]`` (one packed batch).
+        The accompanying ``encoder_seq_lens`` list is in the same
+        ordering as ``encoder_requests``, so callers can split the
+        packed output 1:1.
+
+        This entry point is the encoder-step analog of the legacy
+        ``TrtEncoderModel::forwardAsync`` (see §2.6/§2.7).  The decoder
+        IFB step is unchanged and continues to flow through
+        :meth:`forward`.
+        """
+        if not encoder_requests:
+            raise ValueError("forward_encoder called with no encoder requests")
+
+        with torch.inference_mode():
+            inputs = self._prepare_tp_inputs_encoder(
+                encoder_requests, resource_manager=resource_manager)
+            encoder_hidden_states = self._forward_step_encoder(inputs)
+
+        return encoder_hidden_states, inputs['encoder_seq_lens']
 
     def _init_userbuffers(self, hidden_size):
         if self.mapping.tp_size <= 1 or self.mapping.pp_size > 1:

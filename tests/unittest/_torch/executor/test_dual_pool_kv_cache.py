@@ -20,12 +20,13 @@ registration, and the cross pool wiring for both the V1 ``KVCacheManager``
 (additive secondary path) scheduler integrations.
 """
 
-import pytest  # noqa: I001
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+import pytest
 
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -33,14 +34,19 @@ from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
 
 def _make_mock_kv_cache_config(
-    cross_kv_cache_fraction=None, max_gpu_total_bytes=None, use_kv_cache_manager_v2=True
+    cross_kv_cache_fraction=None,
+    max_gpu_total_bytes=None,
+    use_kv_cache_manager_v2=True,
+    max_tokens=None,
+    free_gpu_memory_fraction=0.9,
 ):
     """Create a mock KvCacheConfig with the fields KvCacheCreator needs."""
     config = Mock()
     config.cross_kv_cache_fraction = cross_kv_cache_fraction
     config.max_gpu_total_bytes = max_gpu_total_bytes
     config.use_kv_cache_manager_v2 = use_kv_cache_manager_v2
-    config.max_tokens = None
+    config.max_tokens = max_tokens
+    config.free_gpu_memory_fraction = free_gpu_memory_fraction
     config.max_attention_window = None
     config.event_buffer_max_size = 0
 
@@ -50,6 +56,7 @@ def _make_mock_kv_cache_config(
         c.max_gpu_total_bytes = config.max_gpu_total_bytes
         c.use_kv_cache_manager_v2 = config.use_kv_cache_manager_v2
         c.max_tokens = config.max_tokens
+        c.free_gpu_memory_fraction = config.free_gpu_memory_fraction
         c.max_attention_window = config.max_attention_window
         c.event_buffer_max_size = config.event_buffer_max_size
         return c
@@ -176,52 +183,97 @@ class TestSplitKvCacheBudgetForCross:
 
     def test_split_50_50(self):
         total = 10 * (1 << 30)  # 10 GiB
-        config = _make_mock_kv_cache_config(cross_kv_cache_fraction=0.5, max_gpu_total_bytes=total)
+        config = _make_mock_kv_cache_config(
+            cross_kv_cache_fraction=0.5,
+            max_gpu_total_bytes=total,
+            free_gpu_memory_fraction=0.8,
+        )
 
         creator = _make_creator(config, is_enc_dec=True)
-        cross_config = creator._split_kv_cache_budget_for_cross()
+        self_config, cross_config = creator._split_kv_cache_budget_for_cross()
 
         assert cross_config is not None
+        assert self_config is not config
         assert cross_config.max_gpu_total_bytes == total // 2
-        assert config.max_gpu_total_bytes == total - total // 2
+        assert self_config.max_gpu_total_bytes == total - total // 2
+        assert cross_config.free_gpu_memory_fraction == pytest.approx(0.4)
+        assert self_config.free_gpu_memory_fraction == pytest.approx(0.4)
+        assert config.max_gpu_total_bytes == total
+        assert config.free_gpu_memory_fraction == pytest.approx(0.8)
 
     def test_split_30_70(self):
         total = 10 * (1 << 30)
-        config = _make_mock_kv_cache_config(cross_kv_cache_fraction=0.3, max_gpu_total_bytes=total)
+        config = _make_mock_kv_cache_config(
+            cross_kv_cache_fraction=0.3,
+            max_gpu_total_bytes=total,
+            free_gpu_memory_fraction=0.8,
+        )
 
         creator = _make_creator(config, is_enc_dec=True)
-        cross_config = creator._split_kv_cache_budget_for_cross()
+        self_config, cross_config = creator._split_kv_cache_budget_for_cross()
 
         expected_cross = int(total * 0.3)
         expected_self = total - expected_cross
         assert cross_config.max_gpu_total_bytes == expected_cross
-        assert config.max_gpu_total_bytes == expected_self
+        assert self_config.max_gpu_total_bytes == expected_self
+        assert cross_config.free_gpu_memory_fraction == pytest.approx(0.24)
+        assert self_config.free_gpu_memory_fraction == pytest.approx(0.56)
+        assert config.max_gpu_total_bytes == total
+        assert config.free_gpu_memory_fraction == pytest.approx(0.8)
 
     def test_no_split_when_fraction_is_none(self):
         total = 10 * (1 << 30)
         config = _make_mock_kv_cache_config(cross_kv_cache_fraction=None, max_gpu_total_bytes=total)
 
-        creator = _make_creator(config)
-        cross_config = creator._split_kv_cache_budget_for_cross()
+        creator = _make_creator(config, is_enc_dec=True)
+        with pytest.raises(ValueError, match="cross_kv_cache_fraction"):
+            creator._split_kv_cache_budget_for_cross()
 
-        assert cross_config is None
-        assert config.max_gpu_total_bytes == total
-
-    def test_no_split_when_budget_is_none(self):
-        config = _make_mock_kv_cache_config(cross_kv_cache_fraction=0.5, max_gpu_total_bytes=None)
+    def test_split_free_fraction_when_budget_is_none(self):
+        config = _make_mock_kv_cache_config(
+            cross_kv_cache_fraction=0.5,
+            max_gpu_total_bytes=None,
+            max_tokens=1000,
+            free_gpu_memory_fraction=0.8,
+        )
 
         creator = _make_creator(config, is_enc_dec=True)
-        cross_config = creator._split_kv_cache_budget_for_cross()
+        self_config, cross_config = creator._split_kv_cache_budget_for_cross()
 
-        assert cross_config is None
+        assert cross_config.max_tokens == 1000
+        assert self_config.max_tokens == 1000
+        assert cross_config.free_gpu_memory_fraction == pytest.approx(0.4)
+        assert self_config.free_gpu_memory_fraction == pytest.approx(0.4)
+        assert config.free_gpu_memory_fraction == pytest.approx(0.8)
 
-    def test_no_split_when_budget_is_zero(self):
-        config = _make_mock_kv_cache_config(cross_kv_cache_fraction=0.5, max_gpu_total_bytes=0)
+    def test_split_free_fraction_when_budget_is_zero(self):
+        config = _make_mock_kv_cache_config(
+            cross_kv_cache_fraction=0.5,
+            max_gpu_total_bytes=0,
+            max_tokens=1000,
+            free_gpu_memory_fraction=0.8,
+        )
 
         creator = _make_creator(config, is_enc_dec=True)
-        cross_config = creator._split_kv_cache_budget_for_cross()
+        self_config, cross_config = creator._split_kv_cache_budget_for_cross()
 
-        assert cross_config is None
+        assert cross_config.max_tokens == 1000
+        assert self_config.max_tokens == 1000
+        assert cross_config.free_gpu_memory_fraction == pytest.approx(0.4)
+        assert self_config.free_gpu_memory_fraction == pytest.approx(0.4)
+        assert config.free_gpu_memory_fraction == pytest.approx(0.8)
+
+    def test_raises_when_no_budget_source_exists(self):
+        config = _make_mock_kv_cache_config(
+            cross_kv_cache_fraction=0.5,
+            max_gpu_total_bytes=0,
+            max_tokens=None,
+            free_gpu_memory_fraction=None,
+        )
+
+        creator = _make_creator(config, is_enc_dec=True)
+        with pytest.raises(ValueError, match="Unable to size"):
+            creator._split_kv_cache_budget_for_cross()
 
     def test_is_encoder_decoder_helper(self):
         dec_config = _make_mock_model_config(is_encoder_decoder=False)
@@ -238,9 +290,10 @@ class TestSplitKvCacheBudgetForCross:
         config = _make_mock_kv_cache_config(cross_kv_cache_fraction=0.4, max_gpu_total_bytes=total)
 
         creator = _make_creator(config, is_enc_dec=True)
-        cross_config = creator._split_kv_cache_budget_for_cross()
+        self_config, cross_config = creator._split_kv_cache_budget_for_cross()
 
-        assert (config.max_gpu_total_bytes + cross_config.max_gpu_total_bytes) == total
+        assert (self_config.max_gpu_total_bytes + cross_config.max_gpu_total_bytes) == total
+        assert config.max_gpu_total_bytes == total
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +412,7 @@ class TestCrossKvCacheConstruction:
         )
         creator.configure_kv_cache_capacity = Mock()
         creator._should_create_separate_draft_kv_cache = Mock(return_value=False)
-        creator._split_kv_cache_budget_for_cross = Mock(return_value=Mock())
+        creator._split_kv_cache_budget_for_cross = Mock(return_value=(Mock(), Mock()))
         creator._create_kv_cache_manager = Mock(return_value=Mock())
         creator._create_enc_dec_kv_cache_manager = Mock(return_value=Mock())
 
@@ -369,6 +422,93 @@ class TestCrossKvCacheConstruction:
         assert resources[ResourceManagerType.KV_CACHE_MANAGER] is not None
         assert resources[ResourceManagerType.ENC_DEC_KV_CACHE_MANAGER] is not None
         creator._create_enc_dec_kv_cache_manager.assert_called_once()
+
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+    def test_build_managers_registers_cross_pool_for_enc_dec_estimation(
+        self, use_kv_cache_manager_v2
+    ):
+        creator = _make_creator(
+            _make_mock_kv_cache_config(
+                cross_kv_cache_fraction=0.5,
+                max_gpu_total_bytes=0,
+                max_tokens=1024,
+                free_gpu_memory_fraction=0.8,
+                use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+            ),
+            is_enc_dec=True,
+        )
+        creator.configure_kv_cache_capacity = Mock()
+        creator._should_create_separate_draft_kv_cache = Mock(return_value=False)
+        creator._split_kv_cache_budget_for_cross = Mock(return_value=(Mock(), Mock()))
+        creator._create_kv_cache_manager = Mock(return_value=Mock())
+        creator._create_enc_dec_kv_cache_manager = Mock(return_value=Mock())
+
+        resources = {}
+        creator.build_managers(resources, estimating_kv_cache=True)
+
+        assert resources[ResourceManagerType.KV_CACHE_MANAGER] is not None
+        assert resources[ResourceManagerType.ENC_DEC_KV_CACHE_MANAGER] is not None
+        creator._create_enc_dec_kv_cache_manager.assert_called_once()
+
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True])
+    def test_build_managers_uses_split_cross_budget_without_mutating_base_config(
+        self, use_kv_cache_manager_v2
+    ):
+        total_budget = 10 * (1 << 30)
+        creator = _make_creator(
+            _make_mock_kv_cache_config(
+                cross_kv_cache_fraction=0.5,
+                max_gpu_total_bytes=total_budget,
+                free_gpu_memory_fraction=0.9,
+                use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+            ),
+            is_enc_dec=True,
+        )
+        creator.configure_kv_cache_capacity = Mock()
+        creator._should_create_separate_draft_kv_cache = Mock(return_value=False)
+
+        self_budgets = []
+        cross_budgets = []
+
+        def create_self_manager(*_args, **kwargs):
+            self_cfg = kwargs["kv_cache_config_override"]
+            self_budgets.append(
+                (
+                    self_cfg.free_gpu_memory_fraction,
+                    self_cfg.max_gpu_total_bytes,
+                )
+            )
+            return Mock()
+
+        def create_cross_manager(cross_cfg, *_args, **_kwargs):
+            cross_budgets.append(
+                (
+                    cross_cfg.free_gpu_memory_fraction,
+                    cross_cfg.max_gpu_total_bytes,
+                )
+            )
+            return Mock()
+
+        creator._create_kv_cache_manager = Mock(side_effect=create_self_manager)
+        creator._create_enc_dec_kv_cache_manager = Mock(side_effect=create_cross_manager)
+
+        resources = {}
+        creator.build_managers(resources, estimating_kv_cache=True)
+
+        assert creator._kv_cache_config.free_gpu_memory_fraction == pytest.approx(0.9)
+        assert creator._kv_cache_config.max_gpu_total_bytes == total_budget
+
+        creator.build_managers(resources, estimating_kv_cache=False)
+
+        expected_split = total_budget // 2
+        assert self_budgets == [
+            (pytest.approx(0.45), expected_split),
+            (pytest.approx(0.45), expected_split),
+        ]
+        assert cross_budgets == [
+            (pytest.approx(0.45), expected_split),
+            (pytest.approx(0.45), expected_split),
+        ]
 
     def test_build_managers_skips_cross_pool_for_decoder_only(self):
         creator = _make_creator(
@@ -432,6 +572,81 @@ class TestKVCacheV2SchedulerCrossParam:
             enc_dec_kv_cache_manager=enc_dec_mgr,
         )
         assert scheduler.enc_dec_kv_cache_manager is enc_dec_mgr
+
+    def test_factory_forwards_encoder_init_until_state_for_cross_pool(self):
+        """The executor factory must widen V2 scheduling to ENCODER_INIT.
+
+        Without this, V2 enc-dec requests are filtered by the default
+        CONTEXT_INIT state gate before the encoder loop can see them.
+        """
+        from tensorrt_llm._torch.pyexecutor._util import create_py_executor_instance
+        from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+
+        kv_mgr = Mock()
+        kv_mgr.tokens_per_block = 64
+        enc_dec_mgr = Mock()
+        resources = {
+            ResourceManagerType.KV_CACHE_MANAGER: kv_mgr,
+            ResourceManagerType.ENC_DEC_KV_CACHE_MANAGER: enc_dec_mgr,
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER: None,
+        }
+        mapping = SimpleNamespace(
+            pp_size=1,
+            enable_attention_dp=False,
+            has_pp=lambda: False,
+        )
+        model_engine = SimpleNamespace(
+            spec_config=None,
+            model=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    pretrained_config=SimpleNamespace(
+                        kv_lora_rank=None,
+                        qk_rope_head_dim=None,
+                    ),
+                ),
+            ),
+        )
+        llm_args = SimpleNamespace(
+            extra_resource_managers={},
+            disable_overlap_scheduler=True,
+        )
+
+        with (
+            patch(
+                "tensorrt_llm._torch.pyexecutor._util.KVCacheManagerV2",
+                new=Mock,
+            ),
+            patch(
+                "tensorrt_llm._torch.pyexecutor._util.KVCacheV2Scheduler",
+            ) as scheduler_cls,
+            patch(
+                "tensorrt_llm._torch.pyexecutor._util.create_kv_cache_transceiver",
+                return_value=None,
+            ),
+            patch(
+                "tensorrt_llm._torch.pyexecutor._util.PyExecutor",
+            ),
+        ):
+            scheduler_cls.return_value = Mock()
+            create_py_executor_instance(
+                dist=Mock(),
+                resources=resources,
+                mapping=mapping,
+                llm_args=llm_args,
+                ctx_chunk_config=None,
+                model_engine=model_engine,
+                start_worker=False,
+                sampler=Mock(),
+                drafter=None,
+                max_seq_len=128,
+                max_batch_size=8,
+                max_beam_width=1,
+                max_num_tokens=4096,
+            )
+
+        kwargs = scheduler_cls.call_args.kwargs
+        assert kwargs["enc_dec_kv_cache_manager"] is enc_dec_mgr
+        assert kwargs["no_schedule_until_state"] == LlmRequestState.ENCODER_INIT
 
 
 # ---------------------------------------------------------------------------
@@ -561,7 +776,7 @@ class TestV1DualPoolSmoke:
         creator = _make_creator(kv_cache_config, is_enc_dec=True, manager_cls=KVCacheManager)
         creator.configure_kv_cache_capacity = Mock()
         creator._should_create_separate_draft_kv_cache = Mock(return_value=False)
-        creator._split_kv_cache_budget_for_cross = Mock(return_value=Mock())
+        creator._split_kv_cache_budget_for_cross = Mock(return_value=(Mock(), Mock()))
 
         # Both _create_kv_cache_manager (self pool) and
         # _create_enc_dec_kv_cache_manager are exercised through the
