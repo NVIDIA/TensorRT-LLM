@@ -41,6 +41,7 @@ from .fuse_elementwise_ops import (extract_transpose_xbc_prefill,
                                    fused_split_rearrange_after_conv1d)
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .layernorm_gated import fused_gated_rmsnorm_quant_shape_ok
+from .replay_selective_state_update import replay_selective_state_update
 from .selective_state_update import \
     selective_state_update as selective_state_update_native
 from .selective_state_update import selective_state_update_mtp_ssm_cache_trtllm
@@ -160,12 +161,16 @@ class Mamba2Mixer(nn.Module):
                             self.tp_ngroups if self.tp_ngroups > 0 else 0)
         self._use_flashinfer = (head_dim in supported_head_dims and
                                 head_group_ratio in supported_head_group_ratios)
-        # Stochastic rounding requires FlashInfer and fp16 cache
-        self._use_stochastic_rounding = (
-            config.quant_config.mamba_ssm_stochastic_rounding
-            and self._use_flashinfer
-            and self._mamba_ssm_cache_dtype == torch.float16)
+        self._stochastic_rounding_requested = (
+            config.quant_config.mamba_ssm_stochastic_rounding)
         self._philox_rounds = config.quant_config.mamba_ssm_philox_rounds
+        # SR needs fp16 cache.  Replay and flashinfer each supply a Philox impl;
+        # custom_op does not.  Only use_replay is resolved per-forward (from the
+        # cache manager), so precompute both gate values here.
+        sr_base = (self._stochastic_rounding_requested
+                   and self._mamba_ssm_cache_dtype == torch.float16)
+        self._stochastic_rounding_for_replay = sr_base
+        self._stochastic_rounding_for_flashinfer = sr_base and self._use_flashinfer
 
         self._use_mtp_custom_op = os.environ.get(
             "TRTLLM_MAMBA2_MTP_USE_CUSTOM_OP", "0") == "1"
@@ -179,12 +184,18 @@ class Mamba2Mixer(nn.Module):
                              key="selective_state_update")
             self.selective_state_update_func = selective_state_update_native
 
-        # Warn if stochastic rounding was requested but couldn't be enabled
-        if config.quant_config.mamba_ssm_stochastic_rounding and not self._use_stochastic_rounding:
-            logger.warning_once(
-                f"Stochastic rounding requires FlashInfer and float16 SSM cache, "
-                f"but got head_dim={head_dim}, dtype={self._mamba_ssm_cache_dtype}. Disabled.",
-                key="stochastic_rounding_disabled")
+        # Warn if stochastic rounding was requested but no path can supply it.
+        if self._stochastic_rounding_requested:
+            if self._mamba_ssm_cache_dtype != torch.float16:
+                logger.warning_once(
+                    f"Stochastic rounding needs fp16 SSM cache, "
+                    f"have {self._mamba_ssm_cache_dtype}. Disabled.",
+                    key="stochastic_rounding_disabled")
+            elif not self._use_flashinfer:
+                logger.warning_once(
+                    "Stochastic rounding needs flashinfer or replay; "
+                    "neither available with current configuration.",
+                    key="stochastic_rounding_disabled")
 
         # D
         self.D = nn.Parameter(
@@ -307,7 +318,6 @@ class Mamba2Mixer(nn.Module):
         # Split z and dt with views.
         z = zxbcdt[:, :self.tp_d_inner]
         dt = zxbcdt[:, self.tp_d_inner + self.tp_conv_dim:]
-        z_p, z_d = torch.split(z, seqlen_split_size, dim=0)
         dt_p, dt_d = torch.split(dt, seqlen_split_size, dim=0)
 
         # Decode path uses regular view since no transpose is needed.
@@ -317,10 +327,7 @@ class Mamba2Mixer(nn.Module):
         # Preallocate output tensor to avoid memcpy cost for merging prefill
         # and decode outputs
         preallocated_ssm_out = torch.empty(
-            [
-                zxbcdt.shape[0],
-                (self.num_heads * self.head_dim) // self.tp_size,
-            ],
+            [zxbcdt.shape[0], (self.tp_nheads * self.head_dim)],
             dtype=zxbcdt.dtype,
             device=zxbcdt.device,
         )
@@ -360,9 +367,6 @@ class Mamba2Mixer(nn.Module):
                 self.head_dim,
             )
             dt_p = dt_p.unsqueeze(0)
-            z_p = rearrange(z_p.unsqueeze(0),
-                            "b l (h p) -> b l h p",
-                            h=self.tp_nheads)
 
             initial_states = None
             if mamba_metadata.use_initial_states:
@@ -407,6 +411,8 @@ class Mamba2Mixer(nn.Module):
                 # TODO: support dynamic speculation, will add current_draft_len later [TRTLLM-10319]
                 draft_token_num = spec_metadata.max_draft_len + 1
                 intermediate_conv_states = layer_cache.intermediate_conv_window
+                use_replay = getattr(attn_metadata.kv_cache_manager,
+                                     'use_replay_state_update', False)
 
                 intermediate_state_indices = _cached_arange(
                     attn_metadata.kv_cache_manager.get_max_resource_count(),
@@ -427,6 +433,8 @@ class Mamba2Mixer(nn.Module):
                         conv_state_indices=state_indices_d[:num_decodes],
                         intermediate_conv_window=intermediate_conv_states,
                         intermediate_state_indices=intermediate_state_indices,
+                        # PDL chain: conv1d → precompute → main (replay only)
+                        launch_dependent_kernels=use_replay,
                     )
 
                     return xbc_d_processed.transpose(1, 2).view(
@@ -443,22 +451,21 @@ class Mamba2Mixer(nn.Module):
                         activation="silu",
                         conv_state_indices=state_indices_d)
 
-            # For flashinfer state update, dt dtype has to match dt_bias and D.
-            def convert_dt():
-                return dt_d.to(dtype=torch.float32)
+            if is_target_verify and use_replay:
+                # Replay path: kernel handles bf16 dt natively (applies bias +
+                # softplus internally).  No dt conversion needed.
+                xbc_d = conv1d()
+            else:
+                # Non-replay paths: flashinfer/native needs fp32 dt.
+                def convert_dt():
+                    return dt_d.to(dtype=torch.float32)
 
-            # If we're in a cuda graph and using PDL on conv1d, the next kernel
-            # if PDL'd will launch when convert_dt is done and conv1d triggers
-            # dependent kernels.  If these don't happen in parallel, then
-            # convert will go second and we lose PDL, but we're using cuda
-            # graphs for low latency so that seems ok.
-            # If any of the contiguous calls below actually fire, that also breaks PDL.
-            xbc_d, dt_d = maybe_execute_in_parallel(conv1d,
-                                                    convert_dt,
-                                                    self.events[0],
-                                                    self.events[1],
-                                                    self.aux_steram,
-                                                    disable_on_compile=True)
+                xbc_d, dt_d = maybe_execute_in_parallel(conv1d,
+                                                        convert_dt,
+                                                        self.events[0],
+                                                        self.events[1],
+                                                        self.aux_steram,
+                                                        disable_on_compile=True)
 
             x_d, B_d, C_d = torch.split(
                 xbc_d,
@@ -469,101 +476,114 @@ class Mamba2Mixer(nn.Module):
                 ],
                 dim=-1,
             )
-            # Use .contiguous() to ensure proper 128-byte alignment required by
-            # flashinfer's selective_state_update kernel. x_d, B_d, C_d are views
-            # into sliced tensors which may not be 128-byte aligned.
-            x_d = rearrange(x_d, "b (h p) -> b h p",
-                            p=self.head_dim).contiguous()
+            x_d = rearrange(x_d, "b (h p) -> b h p", p=self.head_dim)
             dt_d = repeat(dt_d, "b h -> b h p", p=self.head_dim)
-            B_d = rearrange(B_d, "b (g n) -> b g n",
-                            g=self.tp_ngroups).contiguous()
-            C_d = rearrange(C_d, "b (g n) -> b g n",
-                            g=self.tp_ngroups).contiguous()
-            z_d = rearrange(z_d, "b (h p) -> b h p", p=self.head_dim)
+            B_d = rearrange(B_d, "b (g n) -> b g n", g=self.tp_ngroups)
+            C_d = rearrange(C_d, "b (g n) -> b g n", g=self.tp_ngroups)
 
             A = self._A_expanded
             dt_bias = self._dt_bias_expanded
             D = self._D_expanded
             if is_target_verify:
+                # 4D views for multi-token processing (shared by all paths).
                 intermediate_ssm_states = layer_cache.intermediate_ssm
-                x_d_mtp = x_d.view(
-                    num_decodes,
-                    draft_token_num,
-                    self.num_heads // self.tp_size,
-                    self.head_dim,
-                )
-                dt_d_mtp = dt_d.view(
-                    num_decodes,
-                    draft_token_num,
-                    self.num_heads // self.tp_size,
-                    self.head_dim,
-                )
-                B_d_mtp = B_d.view(num_decodes, draft_token_num,
-                                   self.tp_ngroups, -1)
-                C_d_mtp = C_d.view(num_decodes, draft_token_num,
-                                   self.tp_ngroups, -1)
-                out_mtp = preallocated_ssm_out_d.view(
-                    num_decodes,
-                    draft_token_num,
-                    self.num_heads // self.tp_size,
-                    self.head_dim,
-                )
+                x_d_4d = x_d.view(num_decodes, draft_token_num, self.tp_nheads,
+                                  self.head_dim)
+                dt_d_4d = dt_d.view(num_decodes, draft_token_num,
+                                    self.tp_nheads, self.head_dim)
+                B_d_4d = B_d.view(num_decodes, draft_token_num, self.tp_ngroups,
+                                  -1)
+                C_d_4d = C_d.view(num_decodes, draft_token_num, self.tp_ngroups,
+                                  -1)
+                out_4d = preallocated_ssm_out_d.view(num_decodes,
+                                                     draft_token_num,
+                                                     self.tp_nheads,
+                                                     self.head_dim)
+                state_batch_indices = state_indices_d[:num_decodes]
 
-                if self._use_mtp_custom_op and not self._use_stochastic_rounding:
-                    # Use the TRT-LLM CUDA custom op for MTP SSM cache
-                    # update. This path does not support stochastic
-                    # rounding (rand_seed / philox_rounds).
+                use_stochastic_rounding = (
+                    self._stochastic_rounding_for_replay
+                    if use_replay else self._stochastic_rounding_for_flashinfer)
+
+                philox_kwargs = {}
+                if use_stochastic_rounding:
+                    philox_kwargs['rand_seed'] = torch.randint(
+                        0, 2**62, (1, ), device=x_d.device, dtype=torch.int64)
+                    philox_kwargs['philox_rounds'] = self._philox_rounds
+
+                if use_replay:
+                    replay_selective_state_update(
+                        ssm_states,
+                        layer_cache.old_x,
+                        layer_cache.old_B,
+                        layer_cache.old_dt,
+                        layer_cache.old_dA_cumsum,
+                        layer_cache.cache_buf_idx,
+                        layer_cache.prev_num_accepted_tokens,
+                        x_d_4d,
+                        dt_d_4d,
+                        A,
+                        B_d_4d,
+                        C_d_4d,
+                        D=D,
+                        dt_bias=dt_bias,
+                        dt_softplus=self.delta_softplus,
+                        state_batch_indices=state_batch_indices,
+                        out=out_4d,
+                        launch_with_pdl=True,
+                        **philox_kwargs,
+                    )
+                elif self._use_mtp_custom_op and not use_stochastic_rounding:
+                    # Upstream TRT-LLM CUDA custom op for MTP SSM cache update.
+                    # Does not support stochastic rounding.
                     selective_state_update_mtp_ssm_cache_trtllm(
                         ssm_states,
-                        x_d_mtp,
-                        dt_d_mtp,
+                        x_d_4d,
+                        dt_d_4d,
                         A,
-                        B_d_mtp,
-                        C_d_mtp,
-                        out_mtp,
+                        B_d_4d,
+                        C_d_4d,
+                        out_4d,
                         intermediate_ssm_states,
                         draft_token_num,
                         D=D,
                         z=None,
                         dt_bias=dt_bias,
                         dt_softplus=True,
-                        state_batch_indices=state_indices_d[:num_decodes],
+                        state_batch_indices=state_batch_indices,
                         disable_state_update=True,
                         intermediate_state_indices=intermediate_state_indices,
                     )
                 else:
-                    # Build kwargs for MTP selective_state_update
-                    mtp_kwargs = dict(
+                    # Legacy flashinfer path: contiguous copies for alignment.
+                    x_d_4d = x_d_4d.contiguous()
+                    B_d_4d = B_d_4d.contiguous()
+                    C_d_4d = C_d_4d.contiguous()
+                    self.selective_state_update_func(
+                        ssm_states,
+                        x_d_4d,
+                        dt_d_4d,
+                        A,
+                        B_d_4d,
+                        C_d_4d,
+                        D,
                         z=None,
                         dt_bias=dt_bias,
                         dt_softplus=True,
-                        state_batch_indices=state_indices_d[:num_decodes],
-                        out=out_mtp,
+                        state_batch_indices=state_batch_indices,
+                        out=out_4d,
                         disable_state_update=True,
                         intermediate_states_buffer=intermediate_ssm_states,
                         cache_steps=draft_token_num,
                         intermediate_state_indices=intermediate_state_indices,
-                    )
-                    if self._use_stochastic_rounding:
-                        mtp_kwargs['rand_seed'] = torch.randint(
-                            0,
-                            2**62, (1, ),
-                            device=x_d.device,
-                            dtype=torch.int64)
-                        mtp_kwargs['philox_rounds'] = self._philox_rounds
-
-                    self.selective_state_update_func(
-                        ssm_states,
-                        x_d_mtp,
-                        dt_d_mtp,
-                        A,
-                        B_d_mtp,
-                        C_d_mtp,
-                        D,
-                        **mtp_kwargs,
+                        **philox_kwargs,
                     )
             else:
-                # Build kwargs for selective_state_update
+                # Non-MTP single-token decode
+                # flashinfer needs contiguous x/B/C with 128-byte alignment.
+                x_d = x_d.contiguous()
+                B_d = B_d.contiguous()
+                C_d = C_d.contiguous()
                 ssu_kwargs = dict(
                     z=None,
                     dt_bias=dt_bias,
@@ -573,7 +593,9 @@ class Mamba2Mixer(nn.Module):
                                                     self.head_dim),
                 )
 
-                if self._use_stochastic_rounding:
+                # Non-MTP decode only runs through flashinfer, no replay path.
+                use_stochastic_rounding = self._stochastic_rounding_for_flashinfer
+                if use_stochastic_rounding:
                     ssu_kwargs['rand_seed'] = torch.randint(0,
                                                             2**62, (1, ),
                                                             device=x_d.device,

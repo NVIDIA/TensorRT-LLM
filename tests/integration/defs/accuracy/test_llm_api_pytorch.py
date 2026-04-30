@@ -4768,7 +4768,8 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-30B-A3B-Instruct-2507"
     MODEL_PATH = f"{llm_models_root()}/{MODEL_NAME}"
 
-    @skip_pre_hopper
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(140000)
     @parametrize_with_ids("fp8kv", [False, True])
     @pytest.mark.parametrize(
         "target_sparsity,thr_prefill,thr_decode",
@@ -5865,6 +5866,41 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
             accept_rate = num_accepted / num_drafted
             assert accept_rate > 0.2, \
                 f"Acceptance rate too low for prompt {i}: {accept_rate:.2f}"
+
+
+class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen3.5-4B"
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        chat_template_kwargs=dict(enable_thinking=False),
+    )
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                    enable_block_reuse=False)
+    cuda_graph_config = CudaGraphConfig(enable_padding=True)
+
+    def test_bf16(self):
+        model_path = f"{llm_models_root()}/Qwen3.5-4B"
+        with LLM(model_path,
+                 max_seq_len=4096,
+                 max_batch_size=128,
+                 kv_cache_config=self.kv_cache_config,
+                 cuda_graph_config=self.cuda_graph_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_hopper
+    def test_fp8(self):
+        model_path = f"{llm_models_root()}/Qwen3.5-4B-FP8"
+        with LLM(model_path,
+                 max_seq_len=4096,
+                 max_batch_size=128,
+                 kv_cache_config=self.kv_cache_config,
+                 cuda_graph_config=self.cuda_graph_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
 @pytest.mark.skip_less_device_memory(80000)
