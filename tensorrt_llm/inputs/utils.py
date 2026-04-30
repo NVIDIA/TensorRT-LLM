@@ -1,14 +1,16 @@
 import asyncio
 import base64
+import ipaddress
 import math
 import os
+import socket
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Optional, Tuple, TypedDict, Union
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import aiohttp
 import numpy as np
@@ -111,6 +113,56 @@ def convert_image_mode(image: Image.Image, to_mode: str) -> Image.Image:
         return image.convert(to_mode)
 
 
+# SSRF/DoS protections for user-supplied URLs in multimodal inputs (see NVBugs 5911304).
+_MAX_RESPONSE_BYTES = 200 * 1024 * 1024
+_MAX_REDIRECTS = 5
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+
+
+def _validate_public_url(url: str) -> None:
+    """Reject non-http(s) schemes and URLs resolving to non-public addresses."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise RuntimeError(
+            f"Only http/https URLs are allowed, got {parsed.scheme!r}")
+    if not parsed.hostname:
+        raise RuntimeError("URL has no hostname")
+    try:
+        infos = socket.getaddrinfo(parsed.hostname,
+                                   None,
+                                   proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise RuntimeError(
+            f"Could not resolve hostname {parsed.hostname!r}") from exc
+    for *_, sockaddr in infos:
+        ip = ipaddress.ip_address(sockaddr[0])
+        if not ip.is_global or ip.is_multicast:
+            raise RuntimeError(f"URL resolves to a non-public address ({ip})")
+
+
+async def _safe_aiohttp_get(url: str,
+                            session: aiohttp.ClientSession) -> bytes:
+    """Fetch *url*, validating each redirect hop and capping response size."""
+    current = url
+    for _ in range(_MAX_REDIRECTS + 1):
+        await asyncio.to_thread(_validate_public_url, current)
+        async with session.get(current, allow_redirects=False) as response:
+            if response.status in _REDIRECT_STATUSES:
+                current = urljoin(current, response.headers.get("Location", ""))
+                continue
+            response.raise_for_status()
+            buf = BytesIO()
+            total = 0
+            async for chunk in response.content.iter_chunked(1 << 20):
+                total += len(chunk)
+                if total > _MAX_RESPONSE_BYTES:
+                    raise RuntimeError(
+                        "Response exceeds maximum allowed size")
+                buf.write(chunk)
+            return buf.getvalue()
+    raise RuntimeError("Too many redirects")
+
+
 def _load_and_convert_image(image):
     image = Image.open(image)
     image.load()
@@ -176,8 +228,7 @@ async def async_load_image(
 
     if parsed_url.scheme in ["http", "https"]:
         session = await _get_aiohttp_session()
-        async with session.get(image) as response:
-            content = await response.read()
+        content = await _safe_aiohttp_get(image, session)
         image = await asyncio.to_thread(_load_and_convert_image,
                                         BytesIO(content))
     elif parsed_url.scheme == "data":
@@ -440,8 +491,7 @@ async def async_load_video(video: str,
 
     if parsed_url.scheme in ["http", "https"]:
         session = await _get_aiohttp_session()
-        async with session.get(video) as response:
-            content = await response.content.read()
+        content = await _safe_aiohttp_get(video, session)
         return await asyncio.to_thread(_load_from_bytes, content)
     elif parsed_url.scheme == "data":
         decoded_video = load_base64_video(video)
@@ -489,8 +539,7 @@ async def async_load_audio(
 
     if parsed_url.scheme in ["http", "https"]:
         session = await _get_aiohttp_session()
-        async with session.get(audio) as response:
-            content = await response.content.read()
+        content = await _safe_aiohttp_get(audio, session)
         # Offload CPU-bound soundfile decoding to thread pool
         return await asyncio.to_thread(soundfile.read, BytesIO(content))
     elif parsed_url.scheme == "file":
