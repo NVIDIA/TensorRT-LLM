@@ -116,21 +116,26 @@ def convert_image_mode(image: Image.Image, to_mode: str) -> Image.Image:
 # Maximum allowed response size for remote fetches (200 MB).
 _MAX_RESPONSE_BYTES = 200 * 1024 * 1024
 
+# Chunk size used while enforcing the response size cap.
+_RESPONSE_CHUNK_BYTES = 1024 * 1024
+
 # Maximum number of redirects allowed for remote fetches.
 _MAX_REDIRECTS = 5
+
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 
 
 def _validate_url(url: str) -> None:
     """Validate that *url* points to a public, non-internal HTTP(S) resource.
 
-    Raises ``RuntimeError`` for URLs that target private, loopback, or
-    link-local addresses, or that use a scheme other than http / https.
+    Raises ``RuntimeError`` for URLs that target non-global addresses or that
+    use a scheme other than http / https.
 
     Note: validation is performed at DNS-resolution time. A DNS-rebinding
     attack (TTL=0, resolves to a public IP during validation then a private IP
     during the actual TCP connect) could bypass this check. For strict
     isolation, supplement with network-level egress filtering that blocks
-    RFC-1918 and APIPA ranges at the host firewall.
+    non-global address ranges at the host firewall.
     """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
@@ -149,40 +154,82 @@ def _validate_url(url: str) -> None:
 
     for _family, _type, _proto, _canon, sockaddr in infos:
         ip = ipaddress.ip_address(sockaddr[0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+        if not ip.is_global or ip.is_multicast:
             raise RuntimeError(f"URL resolves to a non-public address ({ip})")
+
+
+def _buffer_requests_response(resp: "requests.Response") -> "requests.Response":
+    """Read a requests response with a hard size limit."""
+    content = BytesIO()
+    total = 0
+    try:
+        for chunk in resp.iter_content(chunk_size=_RESPONSE_CHUNK_BYTES):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > _MAX_RESPONSE_BYTES:
+                raise RuntimeError("Response exceeds maximum allowed size")
+            content.write(chunk)
+    except Exception:
+        resp.close()
+        raise
+
+    data = content.getvalue()
+    resp._content = data
+    resp.raw = BytesIO(data)
+    return resp
 
 
 def _safe_request_get(url: str,
                       *,
                       stream: bool = False,
                       timeout: int = 30) -> "requests.Response":
-    """``requests.get`` wrapper that validates the URL first."""
-    _validate_url(url)
-    resp = requests.get(
-        url,
-        stream=stream,
-        timeout=timeout,
-        allow_redirects=False,
-    )
-    for _ in range(_MAX_REDIRECTS):
-        if resp.status_code not in (301, 302, 303, 307, 308):
-            break
-        redirect_url = resp.headers.get("Location", "")
-        _validate_url(redirect_url)
-        resp.close()
+    """``requests.get`` wrapper that validates URLs and bounds response size."""
+    del stream  # Kept for API compatibility; responses are always bounded.
+
+    current_url = url
+    _validate_url(current_url)
+
+    for redirect_count in range(_MAX_REDIRECTS + 1):
         resp = requests.get(
-            redirect_url,
-            stream=stream,
+            current_url,
+            stream=True,
             timeout=timeout,
             allow_redirects=False,
         )
-    else:
-        raise RuntimeError("Too many redirects")
-    resp.raise_for_status()
-    if not stream and len(resp.content) > _MAX_RESPONSE_BYTES:
-        raise RuntimeError("Response exceeds maximum allowed size")
-    return resp
+        if resp.status_code not in _REDIRECT_STATUSES:
+            try:
+                resp.raise_for_status()
+            except Exception:
+                resp.close()
+                raise
+            return _buffer_requests_response(resp)
+
+        if redirect_count == _MAX_REDIRECTS:
+            resp.close()
+            raise RuntimeError("Too many redirects")
+
+        redirect_url = resp.headers.get("Location", "")
+        next_url = urljoin(current_url, redirect_url)
+        resp.close()
+        _validate_url(next_url)
+        current_url = next_url
+
+    raise RuntimeError("Too many redirects")
+
+
+async def _read_aiohttp_content(response: aiohttp.ClientResponse) -> bytes:
+    """Read an aiohttp response to EOF with a hard size limit."""
+    content = BytesIO()
+    total = 0
+    while True:
+        chunk = await response.content.read(_RESPONSE_CHUNK_BYTES)
+        if not chunk:
+            return content.getvalue()
+        total += len(chunk)
+        if total > _MAX_RESPONSE_BYTES:
+            raise RuntimeError("Response exceeds maximum allowed size")
+        content.write(chunk)
 
 
 async def _safe_aiohttp_get(
@@ -199,7 +246,7 @@ async def _safe_aiohttp_get(
             async with fetch_session.get(current_url,
                                          timeout=timeout,
                                          allow_redirects=False) as response:
-                if response.status in (301, 302, 303, 307, 308):
+                if response.status in _REDIRECT_STATUSES:
                     redirect_url = response.headers.get("Location", "")
                     current_url = urljoin(current_url, redirect_url)
                     await asyncio.to_thread(_validate_url, current_url)
@@ -207,10 +254,7 @@ async def _safe_aiohttp_get(
                 maybe_coro = response.raise_for_status()
                 if asyncio.iscoroutine(maybe_coro):
                     await maybe_coro
-                data = await response.content.read(_MAX_RESPONSE_BYTES + 1)
-                if len(data) > _MAX_RESPONSE_BYTES:
-                    raise RuntimeError("Response exceeds maximum allowed size")
-                return data
+                return await _read_aiohttp_content(response)
         raise RuntimeError("Too many redirects")
 
     if session is not None:
