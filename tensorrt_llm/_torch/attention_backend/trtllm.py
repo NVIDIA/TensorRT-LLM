@@ -1,9 +1,13 @@
+import atexit
 import functools
+import json
 import math
 import os
+import threading
 import weakref
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from pathlib import Path
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
@@ -16,6 +20,7 @@ from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
@@ -29,6 +34,89 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
 # Enable TRTLLM-Gen attention backend via environment variable (default: on).
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1")
+
+
+class SkipSoftmaxStatLogger:
+    """Per-process accumulator for skip-softmax block statistics.
+
+    The class is debug-only: every record reads two uint32 values back from
+    device memory, which serializes the GPU stream.
+    """
+
+    def __init__(self, stat_log_path: str):
+        self._lock = threading.Lock()
+        self._path = Path(stat_log_path)
+        self._steps: Dict[int, Dict[str, object]] = {}
+        self._cur_step = -1
+        self._last_layer_idx = -1
+        self._dumped = False
+        atexit.register(self._atexit_dump)
+
+    def _maybe_advance_step(self, layer_idx: int) -> int:
+        if layer_idx <= self._last_layer_idx:
+            self._cur_step += 1
+        if self._cur_step < 0:
+            self._cur_step = 0
+        self._last_layer_idx = layer_idx
+        return self._cur_step
+
+    def record_step_meta(self, layer_idx: int, num_contexts: int,
+                         num_ctx_tokens: int, num_gen_tokens: int) -> None:
+        with self._lock:
+            if layer_idx <= self._last_layer_idx:
+                self._cur_step += 1
+                self._last_layer_idx = -1
+            if self._cur_step < 0:
+                self._cur_step = 0
+            entry = self._steps.setdefault(self._cur_step, {"layers": {}})
+            entry["num_contexts"] = int(num_contexts)
+            entry["num_ctx_tokens"] = int(num_ctx_tokens)
+            entry["num_gen_tokens"] = int(num_gen_tokens)
+
+    def record(self, layer_idx: int, total: int, skipped: int) -> None:
+        with self._lock:
+            step = self._maybe_advance_step(layer_idx)
+            entry = self._steps.setdefault(step, {"layers": {}})
+            entry["layers"][str(layer_idx)] = {
+                "total": int(total),
+                "skipped": int(skipped),
+            }
+
+    def dump(self) -> None:
+        with self._lock:
+            if self._dumped:
+                return
+            payload = {"steps": {str(k): v for k, v in self._steps.items()}}
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(json.dumps(payload, indent=2))
+            self._dumped = True
+            logger.info(
+                f"SkipSoftmaxStatLogger: wrote {len(self._steps)} steps to "
+                f"{self._path}")
+
+    def _atexit_dump(self) -> None:
+        try:
+            self.dump()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"SkipSoftmaxStatLogger: atexit dump failed: {exc!r}")
+
+
+_skip_softmax_stat_logger: Optional[SkipSoftmaxStatLogger] = None
+_skip_softmax_stat_logger_lock = threading.Lock()
+
+
+def _get_or_create_skip_softmax_stat_logger(
+        stat_log_path: str) -> SkipSoftmaxStatLogger:
+    global _skip_softmax_stat_logger
+    with _skip_softmax_stat_logger_lock:
+        if _skip_softmax_stat_logger is None:
+            _skip_softmax_stat_logger = SkipSoftmaxStatLogger(stat_log_path)
+        return _skip_softmax_stat_logger
+
+
+def _peek_skip_softmax_stat_logger() -> Optional[SkipSoftmaxStatLogger]:
+    return _skip_softmax_stat_logger
 
 
 @functools.cache
@@ -1061,6 +1149,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                              device='cuda')
         self.print_skip_softmax_stat = os.environ.get(
             "TRTLLM_PRINT_SKIP_SOFTMAX_STAT", "0") == "1"
+        stat_log_path = None
+        if isinstance(self.sparse_attention_config,
+                      SkipSoftmaxAttentionConfig):
+            stat_log_path = self.sparse_attention_config.stat_log_path
+        self.skip_softmax_stat_enabled = stat_log_path is not None
+        if self.skip_softmax_stat_enabled:
+            _get_or_create_skip_softmax_stat_logger(stat_log_path)
 
         self.kv_cache_scaling_factor = torch.ones(1,
                                                   dtype=torch.float32,
@@ -1362,7 +1457,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if metadata.spec_decoding_bl_tree_mask is not None and layer_idx == 0:
             metadata.spec_decoding_bl_tree_mask.zero_()
 
-        if self.print_skip_softmax_stat:
+        if self.print_skip_softmax_stat or self.skip_softmax_stat_enabled:
             self.skip_softmax_stat.zero_()
 
         use_nvfp4_output = output_sf is not None
@@ -1506,12 +1601,19 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 compressed_kv_cache_pool_ptr=compressed_kv_cache_pool_ptr,
             )
 
-        if self.print_skip_softmax_stat:
-            total_blocks, skipped_blocks = self.skip_softmax_stat
-            if total_blocks != 0:
+        if self.print_skip_softmax_stat or self.skip_softmax_stat_enabled:
+            total_blocks, skipped_blocks = (
+                int(v) for v in self.skip_softmax_stat.tolist())
+            if self.skip_softmax_stat_enabled:
+                stat_logger = _peek_skip_softmax_stat_logger()
+                if stat_logger is not None:
+                    stat_logger.record(self.layer_idx, total_blocks,
+                                       skipped_blocks)
+            if self.print_skip_softmax_stat and total_blocks != 0:
+                skipped_percent = skipped_blocks / total_blocks * 100
                 print(
                     f"SKIP_SOFTMAX_STAT: layer{self.layer_idx}: {skipped_blocks} / {total_blocks}"
-                    f" = {skipped_blocks / total_blocks * 100: .2f}%")
+                    f" = {skipped_percent: .2f}%")
 
     def forward(
         self,
@@ -1608,6 +1710,19 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                is not None
                                and metadata._seq_lens_cuda is not None):
             metadata.update_blackwell_first_sparse_mask_offset()
+
+        if self.skip_softmax_stat_enabled:
+            stat_logger = _peek_skip_softmax_stat_logger()
+            if stat_logger is not None:
+                num_total_tokens = (metadata.num_ctx_tokens
+                                    + metadata.num_generations)
+                num_gen_tokens = max(0,
+                                     num_total_tokens - metadata.num_ctx_tokens)
+                stat_logger.record_step_meta(
+                    layer_idx=self.layer_idx,
+                    num_contexts=int(metadata.num_contexts),
+                    num_ctx_tokens=int(metadata.num_ctx_tokens),
+                    num_gen_tokens=int(num_gen_tokens))
 
         self._run(q, k, v, output, output_sf, metadata, forward_args,
                   use_paged_context_fmha, sparse_kv_indices, sparse_kv_offsets,

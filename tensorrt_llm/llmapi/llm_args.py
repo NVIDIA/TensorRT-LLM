@@ -407,6 +407,13 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
         description="Target sparsity for prefill and/or decode phases. "
         "Requires formula coefficients in the model's config.json. "
         "Ignored if threshold_scale_factor is also set.")
+    stat_log_path: Optional[str] = Field(
+        default=None,
+        description=
+        "If set, dump per-step / per-layer skip-softmax block statistics as "
+        "JSON to this path on executor shutdown. Forces the _skipSoftmaxStat "
+        "kernel variants and is incompatible with CUDA graphs. Debug only — "
+        "expect measurable attention-kernel slowdown.")
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -4126,6 +4133,29 @@ class TorchLlmArgs(BaseLlmArgs):
     @model_validator(mode="after")
     def set_model_format(self):
         self._model_format = _ModelFormatKind.HF
+        return self
+
+    @model_validator(mode="after")
+    def validate_skip_softmax_stat_log_path(self):
+        cfg = self.sparse_attention_config
+        if not isinstance(cfg, SkipSoftmaxAttentionConfig):
+            return self
+        if cfg.stat_log_path is None:
+            return self
+        # Stat collection performs per-layer .zero_() and host-side readback of
+        # (total, skipped) every step — both incompatible with CUDA graph capture.
+        graph_cfg = self.cuda_graph_config
+        if graph_cfg is not None and graph_cfg.batch_sizes:
+            raise ValueError(
+                "SkipSoftmaxAttentionConfig.stat_log_path is incompatible with "
+                "CUDA graphs (per-layer .zero_() and host-side stat readback "
+                "break graph capture). Disable cuda_graph_config to collect "
+                "stats.")
+        logger.warning(
+            "SkipSoftmaxAttentionConfig.stat_log_path is set: stat-collecting "
+            "FMHA kernel variants (_skipSoftmaxStat) will be selected at "
+            "runtime. Expect a measurable attention-kernel slowdown; debug "
+            "use only.")
         return self
 
     @model_validator(mode="after")
