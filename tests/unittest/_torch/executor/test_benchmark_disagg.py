@@ -230,7 +230,7 @@ class TestFillCompleteADPRouterImbalance:
     """Regression test for nvbug 6071070.
 
     The old count-based predicate hung when ADP router produced ±1 skew
-    (e.g. 31×256 + 1×255 = 8191 < 8192). The new state-based predicate
+    (e.g. 31x256 + 1x255 = 8191 < 8192). The new state-based predicate
     must open when all requests are past transfer, regardless of per-rank
     distribution.
     """
@@ -720,7 +720,14 @@ class TestADPRouterPerRankCap:
 
     @pytest.mark.parametrize("router_cls_path", _ROUTER_CLS_PATHS)
     def test_cap_not_applied_when_below_max(self, router_cls_path):
-        """When the natural expected is within max, cap has no effect."""
+        """When the natural expected is within max, cap has no effect.
+
+        The natural value differs per router class: DefaultADPRouter computes
+        ceil(total/tp_size) directly, whereas KVCacheAwareADPRouter wraps it
+        with fair_share_multiplier (default 2.0) to allow more concentration
+        for cache affinity.  Both must land below max_num_active_requests so
+        that the hard cap is a no-op.
+        """
         from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankState
 
         router, cls_name, _ = _make_router(router_cls_path)
@@ -734,7 +741,18 @@ class TestADPRouterPerRankCap:
 
         result, expected = router.route_requests(all_rank_states, requests, max_num_active)
 
-        assert expected == 2
+        if cls_name == "KVCacheAwareADPRouter":
+            # fair_share_multiplier defaults to 2.0, so natural value is
+            # ceil(2.0 * ceil(8/4)) = ceil(2.0 * 2) = 4.
+            expected_natural = 4
+        else:
+            # DefaultADPRouter natural value is ceil(8/4) = 2.
+            expected_natural = 2
+        assert expected == expected_natural, (
+            f"{cls_name}: natural expected was {expected_natural}, got {expected}"
+        )
+        # Hard cap must be a no-op here since natural value << max.
+        assert expected < max_num_active
         total_assigned = sum(len(v) for v in result.values())
         assert total_assigned == 8
 

@@ -2355,8 +2355,7 @@ class PyExecutor:
                 f"Benchmark disagg fill: blocked on ranks {blocked_ranks} "
                 f"(rank {self.dist.rank} local: {num_init} INIT, "
                 f"{num_in_progress} in-progress, "
-                f"inflight={not local_no_inflight})"
-            )
+                f"inflight={not local_no_inflight})")
         if global_ok and self.dist.rank == 0:
             logger.info(f"Benchmark disagg fill complete: "
                         f"{len(self.active_requests)} active requests ready, "
