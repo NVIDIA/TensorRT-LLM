@@ -30,6 +30,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from ..utils._graph import canonicalize_graph, lift_to_meta, load_buffers_and_params, tree_to
 from ..utils.logger import ad_logger
 from ..utils.node_utils import get_op_schema, is_op
+from ..utils.pipeline_cache_hooks import mark_pipeline_cache_hook
 from .interface import apply_export_patches
 
 if TYPE_CHECKING:
@@ -415,11 +416,21 @@ def _deduplicate_params_and_buffers(gm: fx.GraphModule) -> None:
             delattr(gm.get_submodule(submod), name)
 
             # add load hooks to also load the weights correctly
+            param_key_remaining = str(node_kept.target)
+            param_key_removed = str(n.target)
+            hook = partial(
+                _load_hook_for_deduplication,
+                param_key_remaining=param_key_remaining,
+                param_key_removed=param_key_removed,
+            )
             gm._register_load_state_dict_pre_hook(
-                partial(
-                    _load_hook_for_deduplication,
-                    param_key_remaining=str(node_kept.target),
-                    param_key_removed=str(n.target),
+                mark_pipeline_cache_hook(
+                    hook,
+                    {
+                        "type": "dedup",
+                        "param_key_remaining": param_key_remaining,
+                        "param_key_removed": param_key_removed,
+                    },
                 )
             )
 
@@ -453,7 +464,13 @@ def _build_aliasing_load_pre_hook(aliased_groups: List[List[str]]) -> Callable:
                 state_dict[name] = value
             ad_logger.debug(f"Applied value from {group[0]} to aliased parameters: {group}")
 
-    return aliasing_load_pre_hook
+    return mark_pipeline_cache_hook(
+        aliasing_load_pre_hook,
+        {
+            "type": "alias",
+            "aliased_groups": aliased_groups,
+        },
+    )
 
 
 def _add_missing_load_hooks(gm: fx.GraphModule, model: nn.Module) -> None:
@@ -599,24 +616,49 @@ def _is_export_input_constraint_hook(hook: Any) -> bool:
     )
 
 
-def _clean_up_export_input_constraint_hooks(gm: fx.GraphModule):
-    """Remove torch.export input guards that remain as module forward pre-hooks."""
+def _is_export_stateful_graph_module_hook(hook: Any) -> bool:
+    hook_fn = hook.hook if hasattr(hook, "hook") else hook
+    return (
+        getattr(hook_fn, "__module__", None) == "torch.export._unlift"
+        and getattr(hook_fn, "__qualname__", None)
+        == "_create_stateful_graph_module.<locals>.<lambda>"
+    )
+
+
+def _clean_up_export_forward_hooks(gm: fx.GraphModule):
+    """Remove torch.export forward hooks that are not part of the AD graph."""
     removed = 0
     for mod in gm.modules():
         forward_pre_hooks = getattr(mod, "_forward_pre_hooks", None)
-        if not forward_pre_hooks:
-            continue
-        for hook_id, hook in list(forward_pre_hooks.items()):
-            if not _is_export_input_constraint_hook(hook):
-                continue
-            del forward_pre_hooks[hook_id]
-            with_kwargs = getattr(mod, "_forward_pre_hooks_with_kwargs", None)
-            if with_kwargs is not None:
-                with_kwargs.pop(hook_id, None)
-            removed += 1
+        if forward_pre_hooks:
+            for hook_id, hook in list(forward_pre_hooks.items()):
+                if not (
+                    _is_export_input_constraint_hook(hook)
+                    or _is_export_stateful_graph_module_hook(hook)
+                ):
+                    continue
+                del forward_pre_hooks[hook_id]
+                with_kwargs = getattr(mod, "_forward_pre_hooks_with_kwargs", None)
+                if with_kwargs is not None:
+                    with_kwargs.pop(hook_id, None)
+                removed += 1
+
+        forward_hooks = getattr(mod, "_forward_hooks", None)
+        if forward_hooks:
+            for hook_id, hook in list(forward_hooks.items()):
+                if not _is_export_stateful_graph_module_hook(hook):
+                    continue
+                del forward_hooks[hook_id]
+                with_kwargs = getattr(mod, "_forward_hooks_with_kwargs", None)
+                if with_kwargs is not None:
+                    with_kwargs.pop(hook_id, None)
+                always_called = getattr(mod, "_forward_hooks_always_called", None)
+                if always_called is not None:
+                    always_called.pop(hook_id, None)
+                removed += 1
 
     if removed:
-        ad_logger.debug(f"Removed {removed} torch.export input constraint forward pre-hook(s)")
+        ad_logger.debug(f"Removed {removed} torch.export forward hook(s)")
 
 
 def run_forward_for_capture(
@@ -758,7 +800,7 @@ def torch_export_to_gm(
 
     # clean up checks --> generally the sanity checks are overly conservative and we can remove them
     _clean_up_assertions_and_guards(egm)
-    _clean_up_export_input_constraint_hooks(egm)
+    _clean_up_export_forward_hooks(egm)
 
     # Rename nodes to reflect module hierarchy for better debuggability
     _rename_nodes_with_module_hierarchy(egm)

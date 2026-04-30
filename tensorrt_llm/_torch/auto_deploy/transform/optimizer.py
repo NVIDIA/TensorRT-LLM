@@ -13,6 +13,7 @@ from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
 from ..utils.logger import ad_logger
 from .interface import (
+    BaseTransform,
     DistConfig,
     InferenceOptimizerConfig,
     SharedConfig,
@@ -42,7 +43,6 @@ class InferenceOptimizer:
             local_rank=local_rank,
             world_size=world_size,
             dist_config=dist_config,
-            transform_config=self._cache_key_config,
         )
 
     def _clean_config(self, config: InferenceOptimizerConfig) -> StrictInferenceOptimizerConfig:
@@ -96,7 +96,7 @@ class InferenceOptimizer:
         # iterate over all transforms sorted by stage in the config
         for idx, (t_name, t_config) in enumerate(list(self.config.items())[start_idx:], start_idx):
             # instantiate transform
-            transform = TransformRegistry.get(t_name)(t_config)
+            transform = self._create_transform(t_name, t_config)
             # run transform
             mod = transform(mod, cm, self.factory, self.shared_config, idx)
         total_time = time.time() - start_time
@@ -117,13 +117,14 @@ class InferenceOptimizer:
             transform_cls = TransformRegistry.get(t_name)
             if not callable(getattr(transform_cls, "maybe_restore", None)):
                 continue
-            transform = transform_cls(t_config)
-            maybe_restore = getattr(transform, "maybe_restore", None)
-            if not callable(maybe_restore):
-                continue
-            restored_mod = maybe_restore(
-                cm, self.factory, self.shared_config, idx, self._cache_key_config
-            )
+            transform = self._create_transform(t_name, t_config)
+            restored_mod = transform.maybe_restore(cm, self.factory, self.shared_config, idx)
             if restored_mod is not None:
                 return restored_mod, idx + 1
         return None, 0
+
+    def _create_transform(self, t_name: str, t_config: TransformConfig) -> BaseTransform:
+        transform = TransformRegistry.get(t_name)(t_config)
+        if t_name == "pipeline_cache":
+            transform.set_cache_key_config(self._cache_key_config)
+        return transform

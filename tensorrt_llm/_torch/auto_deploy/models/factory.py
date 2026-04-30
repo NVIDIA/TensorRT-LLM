@@ -20,7 +20,6 @@ import copy
 import hashlib
 import os
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Mapping
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Type, final
@@ -148,48 +147,18 @@ class ModelFactory(ABC):
         """The tokenizer path."""
         return self._prefetched_tokenizer_path or self._tokenizer or self.model
 
-    def get_pipeline_cache_model_identifier(
-        self,
-        non_prefix_transform_names: Optional[Iterable[str]] = None,
-    ) -> Dict[str, Any]:
+    def get_pipeline_cache_model_identifier(self) -> Dict[str, Any]:
         """Return graph-producing model identity fields for the pipeline cache key.
 
-        The pipeline cache snapshots the pre-weight graph at the configured
-        boundary. Transform configs at or after the cache boundary may be
-        carried through generic factory kwargs in some flows, but they must not
-        invalidate this cache because they run after restore.
+        The pipeline cache snapshots the pre-weight graph at the configured boundary.
         """
         return {
             "factory_type": f"{type(self).__module__}.{type(self).__qualname__}",
             "model": self._model,
-            "model_kwargs": self._pipeline_cache_structural_model_kwargs(
-                non_prefix_transform_names
-            ),
+            "model_kwargs": copy.deepcopy(self.model_kwargs),
             "tokenizer": self._tokenizer or self._model,
             "tokenizer_kwargs": copy.deepcopy(self.tokenizer_kwargs),
         }
-
-    def _pipeline_cache_structural_model_kwargs(
-        self,
-        non_prefix_transform_names: Optional[Iterable[str]] = None,
-    ) -> Dict[str, Any]:
-        """Return only model kwargs that can affect factory-built graph structure."""
-        ignored_transform_names = set(non_prefix_transform_names or ())
-        structural_kwargs = {}
-        for key, value in self.model_kwargs.items():
-            if key in ignored_transform_names:
-                continue
-            if key == "transforms" and isinstance(value, Mapping):
-                filtered_transforms = {
-                    transform_name: copy.deepcopy(transform_config)
-                    for transform_name, transform_config in value.items()
-                    if transform_name not in ignored_transform_names
-                }
-                if filtered_transforms:
-                    structural_kwargs[key] = filtered_transforms
-                continue
-            structural_kwargs[key] = copy.deepcopy(value)
-        return structural_kwargs
 
     def get_pipeline_cache_checkpoint_fingerprint(self) -> Dict[str, Any]:
         """Return a checkpoint fingerprint used by the AutoDeploy pipeline cache key."""

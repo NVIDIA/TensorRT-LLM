@@ -96,9 +96,13 @@ def _shard_scale_and_hook(
     """Register a sharded scale buffer and its corresponding load hook."""
     buf_name = sn.node_key.rsplit(".", 1)[-1]
     sn.submod.register_buffer(buf_name, sharded_scale)
-    gm._register_load_state_dict_pre_hook(
-        partial(_load_hook, f_split=f_split, param_key=sn.node_key, param_shape=sharded_scale.shape)
+    hook = partial(
+        _load_hook,
+        f_split=f_split,
+        param_key=sn.node_key,
+        param_shape=sharded_scale.shape,
     )
+    gm._register_load_state_dict_pre_hook(hook)
 
 
 _SHARDING_HINT_NAMES = frozenset(

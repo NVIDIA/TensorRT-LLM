@@ -15,6 +15,7 @@
 
 import io
 import json
+import pickle
 import types
 from functools import partial
 from pathlib import Path
@@ -26,12 +27,15 @@ from torch.fx import symbolic_trace
 
 from tensorrt_llm._torch.auto_deploy.export.export import (
     _build_aliasing_load_pre_hook,
+    _clean_up_assertions_and_guards,
+    _clean_up_export_forward_hooks,
     _load_hook_for_deduplication,
 )
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactory
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.interface import (
     BaseTransform,
+    DistConfig,
     MemStats,
     SharedConfig,
     Stages,
@@ -45,17 +49,21 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     ShardingTransformContainer,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.transform.pipeline_cache import (
-    HOOKS_FILE_NAME,
-    MODULE_FILE_NAME,
-    PipelineCacheConfig,
-    _load_graphmodule_structural,
-    _save_graphmodule_structural,
-    _use_cached_graphmodule_code_for_pickling,
+from tensorrt_llm._torch.auto_deploy.transform.pipeline_cache.hooks import (
     collect_hook_specs,
     reattach_hooks,
 )
+from tensorrt_llm._torch.auto_deploy.transform.pipeline_cache.pipeline_cache import (
+    HOOKS_FILE_NAME,
+    MODULE_FILE_NAME,
+    PipelineCacheConfig,
+)
+from tensorrt_llm._torch.auto_deploy.transform.pipeline_cache.structural import (
+    load_module_structural,
+    save_module_structural,
+)
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_weight_name, is_linear_op
+from tensorrt_llm._torch.auto_deploy.utils.pipeline_cache_hooks import mark_pipeline_cache_hook
 
 _COUNTERS = {
     "build": 0,
@@ -65,6 +73,18 @@ _COUNTERS = {
 _MUTATING_CONFIG_RUNS = 0
 
 
+def _unit_test_forward_pre_hook(*args, **kwargs):
+    del args, kwargs
+
+
+def _unit_test_load_state_dict_post_hook(*args, **kwargs):
+    del args, kwargs
+
+
+def _unit_test_load_state_dict_pre_hook(*args, **kwargs):
+    del args, kwargs
+
+
 class _ToyModule(nn.Module):
     def __init__(self):
         super().__init__()
@@ -72,6 +92,33 @@ class _ToyModule(nn.Module):
 
     def forward(self, x):
         return x + self.weight
+
+
+class _PartialBoundHookOwner:
+    def __init__(self, payload_value):
+        self.payload_value = payload_value
+
+    def load_hook(self, state_dict, prefix, *args, weight_name):
+        del args
+        state_dict[prefix + weight_name] = self._payload_value()
+
+    def _payload_value(self):
+        return self.payload_value
+
+
+class _ReadOnlyPropertyHookModule(nn.Module):
+    def __init__(self, payload_value):
+        super().__init__()
+        self.payload_value = payload_value
+        self._register_load_state_dict_pre_hook(self.load_hook)
+
+    @property
+    def can_record_outputs(self):
+        return {}
+
+    def load_hook(self, state_dict, prefix, *args):
+        del args
+        state_dict[prefix + "weight"] = self.payload_value
 
 
 class _RequiresArgTracer(torch.fx.Tracer):
@@ -125,58 +172,6 @@ class _DummyFactory(ModelFactory):
 
     def get_export_infos(self, model: nn.Module):
         return []
-
-
-class _SourceHookBackbone(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.embeddings = nn.Embedding(2, 3)
-        self._register_load_state_dict_pre_hook(_fake_embedding_rename_hook)
-
-
-class _SourceHookModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(1))
-        self.backbone = _SourceHookBackbone()
-
-    def forward(self, x):
-        return x + self.weight
-
-
-class _SourceHookGraphModule(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(1, device="meta"))
-        self.backbone = nn.Module()
-        self.backbone.add_module("embeddings", nn.Embedding(2, 3, device="meta"))
-        self.backbone._register_load_state_dict_pre_hook(_fake_embedding_rename_hook)
-
-    def forward(self, x):
-        token_ids = torch.tensor([0], dtype=torch.long)
-        return x + self.weight + self.backbone.embeddings(token_ids).sum()
-
-
-class _SourceHookFactory(ModelFactory):
-    @property
-    def max_seq_len(self) -> int:
-        return 8
-
-    def _build_model(self, device: str) -> nn.Module:
-        return _SourceHookModel().to(device)
-
-    def _load_checkpoint(self, model: nn.Module, device, disable_preload: bool = False):
-        return None
-
-    def get_export_infos(self, model: nn.Module):
-        return []
-
-
-def _fake_embedding_rename_hook(state_dict, prefix, *args, **kwargs):
-    del args, kwargs
-    for key in list(state_dict.keys()):
-        if key == f"{prefix}embedding.weight":
-            state_dict[f"{prefix}embeddings.weight"] = state_dict.pop(key)
 
 
 @TransformRegistry.register("_unit_test_build_graph_for_pipeline_cache")
@@ -238,11 +233,7 @@ class _BuildForwardHookGraphForPipelineCache(BaseTransform):
     def _apply_to_full_model(self, model, cm, factory, shared_config: SharedConfig):
         _COUNTERS["build"] += 1
         gm = symbolic_trace(_ToyModule().to("meta"))
-
-        def local_forward_pre_hook(*args, **kwargs):
-            del args, kwargs
-
-        gm.register_forward_pre_hook(local_forward_pre_hook)
+        gm.register_forward_pre_hook(_unit_test_forward_pre_hook)
         return gm, TransformInfo(
             skipped=False,
             num_matches=1,
@@ -251,22 +242,8 @@ class _BuildForwardHookGraphForPipelineCache(BaseTransform):
         )
 
 
-@TransformRegistry.register("_unit_test_build_source_hook_graph_for_pipeline_cache")
-class _BuildSourceHookGraphForPipelineCache(BaseTransform):
-    def _apply_to_full_model(self, model, cm, factory, shared_config: SharedConfig):
-        _COUNTERS["build"] += 1
-        gm = symbolic_trace(_SourceHookGraphModule())
-        gm.backbone._register_load_state_dict_pre_hook(_fake_embedding_rename_hook)
-        return gm, TransformInfo(
-            skipped=False,
-            num_matches=1,
-            is_clean=True,
-            has_valid_shapes=True,
-        )
-
-
-@TransformRegistry.register("_unit_test_build_unknown_ad_hook_graph_for_pipeline_cache")
-class _BuildUnknownADHookGraphForPipelineCache(BaseTransform):
+@TransformRegistry.register("_unit_test_build_unknown_ad_pipeline_hook_graph_for_pipeline_cache")
+class _BuildUnknownADPipelineHookGraphForPipelineCache(BaseTransform):
     def _apply_to_full_model(self, model, cm, factory, shared_config: SharedConfig):
         _COUNTERS["build"] += 1
         gm = symbolic_trace(_ToyModule().to("meta"))
@@ -284,11 +261,39 @@ class _BuildUnknownADHookGraphForPipelineCache(BaseTransform):
         )
 
 
+@TransformRegistry.register("_unit_test_build_materialized_buffer_graph_for_pipeline_cache")
+class _BuildMaterializedBufferGraphForPipelineCache(BaseTransform):
+    def _apply_to_full_model(self, model, cm, factory, shared_config: SharedConfig):
+        _COUNTERS["build"] += 1
+        gm = symbolic_trace(_ToyModule().to("meta"))
+        gm.register_buffer("materialized_buffer", torch.ones(1))
+        return gm, TransformInfo(
+            skipped=False,
+            num_matches=1,
+            is_clean=True,
+            has_valid_shapes=True,
+        )
+
+
+@TransformRegistry.register("_unit_test_build_materialized_parameter_graph_for_pipeline_cache")
+class _BuildMaterializedParameterGraphForPipelineCache(BaseTransform):
+    def _apply_to_full_model(self, model, cm, factory, shared_config: SharedConfig):
+        _COUNTERS["build"] += 1
+        gm = symbolic_trace(_ToyModule().to("meta"))
+        gm.weight = nn.Parameter(torch.ones(1))
+        return gm, TransformInfo(
+            skipped=False,
+            num_matches=1,
+            is_clean=True,
+            has_valid_shapes=True,
+        )
+
+
 @TransformRegistry.register("_unit_test_boundary_for_pipeline_cache")
 class _BoundaryForPipelineCache(BaseTransform):
     def _apply(self, gm, cm, factory, shared_config: SharedConfig):
         _COUNTERS["boundary"] += 1
-        gm.register_buffer("boundary_marker", torch.tensor([_COUNTERS["boundary"]]))
+        gm.register_buffer("boundary_marker", torch.empty(1, device="meta"))
         return gm, TransformInfo(
             skipped=False,
             num_matches=1,
@@ -348,7 +353,28 @@ def _optimizer_config(tmp_path, build_transform="_unit_test_build_graph_for_pipe
             "stage": "sharding",
             "enabled": True,
             "root": str(tmp_path),
-            "trust_cache_root": True,
+        },
+        "_unit_test_after_boundary_for_pipeline_cache": {
+            "stage": "weight_load",
+        },
+    }
+
+
+def _pre_sharding_optimizer_config(
+    tmp_path, build_transform="_unit_test_build_graph_for_pipeline_cache"
+):
+    return {
+        build_transform: {
+            "stage": "export",
+            "run_per_gm": False,
+        },
+        "pipeline_cache": {
+            "stage": "pattern_matcher",
+            "enabled": True,
+            "root": str(tmp_path),
+        },
+        "_unit_test_boundary_for_pipeline_cache": {
+            "stage": "sharding",
         },
         "_unit_test_after_boundary_for_pipeline_cache": {
             "stage": "weight_load",
@@ -359,6 +385,7 @@ def _optimizer_config(tmp_path, build_transform="_unit_test_build_graph_for_pipe
 def test_pipeline_cache_config_defaults_root_for_enabled_cache():
     config = PipelineCacheConfig(stage=Stages.SHARDING, enabled=True)
     unsupported_transform_options = {
+        "cache_key_extra",
         "debug_visualize_dir",
         "expect_mem_change",
         "requires_clean_graph",
@@ -367,6 +394,8 @@ def test_pipeline_cache_config_defaults_root_for_enabled_cache():
         "run_per_gm",
         "run_shape_prop",
         "skip_on_error",
+        "strict_root_permissions",
+        "trust_cache_root",
     }
 
     assert unsupported_transform_options.isdisjoint(PipelineCacheConfig.model_fields)
@@ -375,10 +404,10 @@ def test_pipeline_cache_config_defaults_root_for_enabled_cache():
     assert config.requires_shape_prop is False
     assert config.run_graph_cleanup is False
     assert config.run_shape_prop is False
+    assert config.skip_on_error is True
     assert config.root == str(
         Path.home() / ".cache" / "tensorrt_llm" / "auto_deploy" / "pipeline_cache"
     )
-    assert config.trust_cache_root
 
 
 def test_pipeline_cache_config_accepts_user_root_by_default(tmp_path):
@@ -389,23 +418,13 @@ def test_pipeline_cache_config_accepts_user_root_by_default(tmp_path):
     )
 
     assert config.root == str(tmp_path)
-    assert config.trust_cache_root
-
-
-def test_pipeline_cache_config_rejects_explicit_untrusted_root(tmp_path):
-    with pytest.raises(ValueError, match="trust_cache_root=true"):
-        PipelineCacheConfig(
-            stage=Stages.SHARDING,
-            enabled=True,
-            root=str(tmp_path),
-            trust_cache_root=False,
-        )
 
 
 @pytest.mark.parametrize(
     ("field_name", "field_value"),
     [
         ("debug_visualize_dir", "/tmp/debug"),
+        ("cache_key_extra", {"manual": "token"}),
         ("expect_mem_change", True),
         ("requires_clean_graph", True),
         ("requires_shape_prop", True),
@@ -414,6 +433,8 @@ def test_pipeline_cache_config_rejects_explicit_untrusted_root(tmp_path):
         ("run_per_gm", True),
         ("run_shape_prop", True),
         ("skip_on_error", True),
+        ("strict_root_permissions", True),
+        ("trust_cache_root", True),
     ],
 )
 def test_pipeline_cache_config_rejects_unsupported_transform_options(
@@ -449,6 +470,8 @@ def test_pipeline_cache_transform_restores_and_skips_prefix(monkeypatch, tmp_pat
     assert hasattr(model_second, "after_marker")
     assert list(tmp_path.rglob(MODULE_FILE_NAME))
     assert list(tmp_path.rglob(HOOKS_FILE_NAME))
+    assert list(tmp_path.glob("*/rank_0"))
+    assert not list(tmp_path.glob("*/pipeline_cache/rank_0"))
 
 
 def test_pipeline_cache_ignores_post_boundary_runtime_transform_config(monkeypatch, tmp_path):
@@ -479,45 +502,46 @@ def test_pipeline_cache_ignores_post_boundary_runtime_transform_config(monkeypat
     assert _COUNTERS == {"build": 1, "boundary": 1, "after": 2}
 
 
-def test_pipeline_cache_ignores_non_prefix_transform_factory_model_kwargs(monkeypatch, tmp_path):
+def test_pipeline_cache_ignores_dist_config_before_sharding_boundary(monkeypatch, tmp_path):
     _reset_counters()
     _patch_mem_stats(monkeypatch)
+    factory = _DummyFactory(model="dummy-model")
     cm = _cache_seq_interface()
-    model_kwargs_first = {
-        "pipeline_cache": {"root": str(tmp_path / "cache_a")},
-        "_unit_test_after_boundary_for_pipeline_cache": {
-            "fused_moe": {"enabled": True},
-        },
-        "transforms": {
-            "pipeline_cache": {"root": str(tmp_path / "cache_a")},
-            "_unit_test_after_boundary_for_pipeline_cache": {
-                "fused_moe": {"enabled": True},
-            },
-        },
-    }
-    model_kwargs_second = {
-        "pipeline_cache": {"root": str(tmp_path / "cache_b")},
-        "_unit_test_after_boundary_for_pipeline_cache": {
-            "fused_moe": {"enabled": False},
-        },
-        "transforms": {
-            "pipeline_cache": {"root": str(tmp_path / "cache_b")},
-            "_unit_test_after_boundary_for_pipeline_cache": {
-                "fused_moe": {"enabled": False},
-            },
-        },
-    }
+    config = _pre_sharding_optimizer_config(tmp_path)
 
     InferenceOptimizer(
-        factory=_DummyFactory(model="dummy-model", model_kwargs=model_kwargs_first),
-        config=_optimizer_config(tmp_path),
+        factory=factory,
+        config=config,
+        dist_config=DistConfig(world_size=2, tp_size=1),
     )(cm)
     InferenceOptimizer(
-        factory=_DummyFactory(model="dummy-model", model_kwargs=model_kwargs_second),
-        config=_optimizer_config(tmp_path),
+        factory=factory,
+        config=config,
+        dist_config=DistConfig(world_size=2, tp_size=2, moe_tp_size=2),
     )(cm)
 
-    assert _COUNTERS == {"build": 1, "boundary": 1, "after": 2}
+    assert _COUNTERS == {"build": 1, "boundary": 2, "after": 2}
+
+
+def test_pipeline_cache_keeps_dist_config_after_sharding_boundary(monkeypatch, tmp_path):
+    _reset_counters()
+    _patch_mem_stats(monkeypatch)
+    factory = _DummyFactory(model="dummy-model")
+    cm = _cache_seq_interface()
+    config = _optimizer_config(tmp_path)
+
+    InferenceOptimizer(
+        factory=factory,
+        config=config,
+        dist_config=DistConfig(world_size=2, tp_size=1),
+    )(cm)
+    InferenceOptimizer(
+        factory=factory,
+        config=config,
+        dist_config=DistConfig(world_size=2, tp_size=2, moe_tp_size=2),
+    )(cm)
+
+    assert _COUNTERS == {"build": 2, "boundary": 2, "after": 2}
 
 
 def test_pipeline_cache_keeps_world_size_factory_model_kwarg_in_key(monkeypatch, tmp_path):
@@ -604,64 +628,83 @@ def test_pipeline_cache_transform_restores_wrapper_with_graphmodule(monkeypatch,
     assert hasattr(restored.language_model.model, "after_marker")
 
 
-def test_pipeline_cache_strips_unpickleable_forward_hooks(monkeypatch, tmp_path):
+def test_pipeline_cache_rejects_forward_hooks(monkeypatch, tmp_path):
     _reset_counters()
     _patch_mem_stats(monkeypatch)
+    warnings = []
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.auto_deploy.transform.pipeline_cache.pipeline_cache.ad_logger.warning",
+        warnings.append,
+    )
     factory = _DummyFactory(model="dummy-model")
     cm = _cache_seq_interface()
     config = _optimizer_config(tmp_path, "_unit_test_build_forward_hook_graph_for_pipeline_cache")
 
-    first = InferenceOptimizer(factory=factory, config=config)(cm)
-    restored = InferenceOptimizer(factory=factory, config=config)(cm)
+    model = InferenceOptimizer(factory=factory, config=config)(cm)
 
-    assert _COUNTERS == {"build": 1, "boundary": 1, "after": 2}
-    assert first._forward_pre_hooks
-    assert not restored._forward_pre_hooks
-
-
-def test_pipeline_cache_pickles_existing_graphmodule_code(monkeypatch):
-    gm = symbolic_trace(_ToyModule())
-    assert hasattr(gm, "_code")
-    gm._tracer_cls = _RequiresArgTracer
-
-    def fail_recompile(self):
-        raise AssertionError("pipeline cache save should not regenerate FX code")
-
-    monkeypatch.setattr(torch.fx.GraphModule, "recompile", fail_recompile)
-    buffer = io.BytesIO()
-    with _use_cached_graphmodule_code_for_pickling():
-        torch.save(gm, buffer)
-
-    buffer.seek(0)
-    monkeypatch.undo()
-    restored = torch.load(buffer, map_location="cpu", weights_only=False)
-
-    assert isinstance(restored, torch.fx.GraphModule)
-    assert torch.equal(restored(torch.ones(1)), torch.tensor([2.0]))
+    assert _COUNTERS == {"build": 1, "boundary": 1, "after": 1}
+    assert model._forward_pre_hooks
+    assert list(tmp_path.rglob("manifest.json")) == []
+    assert any("forward hooks" in msg for msg in warnings)
 
 
-def test_pipeline_cache_saves_structural_graphmodule_without_graphmodule_reduce(monkeypatch):
+def test_pipeline_cache_cleans_tmp_dir_when_publish_fails(monkeypatch, tmp_path):
+    _reset_counters()
+    _patch_mem_stats(monkeypatch)
+
+    def fail_publish(tmp_rank_dir, rank_dir):
+        del rank_dir
+        assert tmp_rank_dir.exists()
+        raise OSError("publish failed")
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.auto_deploy.transform.pipeline_cache.pipeline_cache."
+        "atomic_publish_rank_dir",
+        fail_publish,
+    )
+    factory = _DummyFactory(model="dummy-model")
+    cm = _cache_seq_interface()
+
+    model = InferenceOptimizer(factory=factory, config=_optimizer_config(tmp_path))(cm)
+
+    assert _COUNTERS == {"build": 1, "boundary": 1, "after": 1}
+    assert hasattr(model, "after_marker")
+    assert list(tmp_path.rglob("manifest.json")) == []
+    assert list(tmp_path.glob(".*.tmp.*")) == []
+
+
+def test_pipeline_cache_saves_graphmodule_snapshot_without_graphmodule_reduce(monkeypatch):
     gm = symbolic_trace(_ToyModule())
     gm._tracer_cls = _RequiresArgTracer
     gm.graph._tracer_cls = _RequiresArgTracer
     gm.meta["preserved"] = True
 
     def fail_reduce(self):
-        raise AssertionError("pipeline cache structural save must not pickle GraphModule itself")
+        raise AssertionError("pipeline cache snapshot must not pickle GraphModule itself")
 
     monkeypatch.setattr(torch.fx.GraphModule, "__reduce__", fail_reduce)
     buffer = io.BytesIO()
-    _save_graphmodule_structural(gm, buffer)
+    save_module_structural(gm, buffer)
 
     assert gm.graph.owning_module is gm
 
     buffer.seek(0)
-    restored = _load_graphmodule_structural(buffer)
+    restored = load_module_structural(buffer)
 
     assert isinstance(restored, torch.fx.GraphModule)
     assert restored.graph.owning_module is restored
     assert restored.meta["preserved"]
     assert torch.equal(restored(torch.ones(1)), torch.tensor([2.0]))
+
+
+def test_pipeline_cache_rejects_native_graphmodule_pickle():
+    gm = symbolic_trace(_ToyModule())
+    buffer = io.BytesIO()
+    torch.save(gm, buffer)
+    buffer.seek(0)
+
+    with pytest.raises(ValueError, match="unsupported payload shape"):
+        load_module_structural(buffer)
 
 
 def test_pipeline_cache_restored_graphmodule_rebuilds_weight_node_mapping():
@@ -684,10 +727,10 @@ def test_pipeline_cache_restored_graphmodule_rebuilds_weight_node_mapping():
     assert gm.meta["_weight_mapping_computed"]
 
     buffer = io.BytesIO()
-    _save_graphmodule_structural(gm, buffer)
+    save_module_structural(gm, buffer)
 
     buffer.seek(0)
-    restored = _load_graphmodule_structural(buffer)
+    restored = load_module_structural(buffer)
     restored_input = next(node for node in restored.graph.nodes if node.op == "placeholder")
     restored_linears = [node for node in restored.graph.nodes if is_linear_op(node)]
 
@@ -710,10 +753,10 @@ def test_pipeline_cache_drops_consumed_sharding_transforms_from_graphmodule_body
     gm._sharding_transform_container = container
 
     buffer = io.BytesIO()
-    _save_graphmodule_structural(gm, buffer)
+    save_module_structural(gm, buffer)
 
     buffer.seek(0)
-    restored = _load_graphmodule_structural(buffer)
+    restored = load_module_structural(buffer)
     restored_container = restored._sharding_transform_container
 
     assert restored_container.config.allreduce_strategy.name == "NCCL"
@@ -726,15 +769,38 @@ def test_pipeline_cache_restores_graphmodule_bound_methods():
     gm.get_input_embeddings = types.MethodType(_EmbeddingToyModule.get_input_embeddings, gm)
 
     buffer = io.BytesIO()
-    _save_graphmodule_structural(gm, buffer)
+    save_module_structural(gm, buffer)
 
     buffer.seek(0)
-    restored = _load_graphmodule_structural(buffer)
+    restored = load_module_structural(buffer)
 
     assert restored.get_input_embeddings() is restored.embed_tokens
 
 
-def test_pipeline_cache_saves_structural_graphmodule_with_op_overload_target():
+def test_pipeline_cache_saves_exported_program_module_train_eval_methods():
+    ep = torch.export.export(_ToyModule(), (torch.ones(1),))
+    gm = ep.module()
+
+    assert "ExportedProgram.module.<locals>._train" in gm.train.__func__.__qualname__
+    assert "ExportedProgram.module.<locals>._eval" in gm.eval.__func__.__qualname__
+
+    _clean_up_assertions_and_guards(gm)
+    _clean_up_export_forward_hooks(gm)
+
+    buffer = io.BytesIO()
+    save_module_structural(gm, buffer)
+
+    buffer.seek(0)
+    restored = load_module_structural(buffer)
+
+    assert torch.equal(restored(torch.ones(1)), torch.tensor([2.0]))
+    restored.eval()
+    assert not restored.training
+    assert restored.train(True) is restored
+    assert restored.training
+
+
+def test_pipeline_cache_saves_graphmodule_snapshot_with_op_overload_target():
     graph = torch.fx.Graph()
     x = graph.placeholder("x")
     size = graph.call_function(torch.ops.aten.sym_size.int, args=(x, 0))
@@ -742,42 +808,26 @@ def test_pipeline_cache_saves_structural_graphmodule_with_op_overload_target():
     gm = torch.fx.GraphModule({}, graph)
 
     buffer = io.BytesIO()
-    _save_graphmodule_structural(gm, buffer)
+    save_module_structural(gm, buffer)
 
     buffer.seek(0)
-    restored = _load_graphmodule_structural(buffer)
+    restored = load_module_structural(buffer)
 
     assert restored(torch.ones(3, 2)) == 3
 
 
-def test_pipeline_cache_replays_source_model_hooks(monkeypatch, tmp_path):
+def test_pipeline_cache_rejects_unknown_ad_pipeline_hook(monkeypatch, tmp_path):
     _reset_counters()
     _patch_mem_stats(monkeypatch)
-    factory = _SourceHookFactory(model="dummy-model")
-    cm = _cache_seq_interface()
-    config = _optimizer_config(tmp_path, "_unit_test_build_source_hook_graph_for_pipeline_cache")
-
-    InferenceOptimizer(factory=factory, config=config)(cm)
-    restored = InferenceOptimizer(factory=factory, config=config)(cm)
-
-    expected_weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
-    restored.load_state_dict(
-        {"backbone.embedding.weight": expected_weight},
-        strict=False,
-        assign=True,
+    warnings = []
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.auto_deploy.transform.pipeline_cache.hooks.ad_logger.warning",
+        warnings.append,
     )
-
-    assert _COUNTERS == {"build": 1, "boundary": 1, "after": 2}
-    assert torch.equal(restored.backbone.embeddings.weight, expected_weight)
-
-
-def test_pipeline_cache_rejects_unknown_ad_managed_hook(monkeypatch, tmp_path):
-    _reset_counters()
-    _patch_mem_stats(monkeypatch)
     factory = _DummyFactory(model="dummy-model")
     cm = _cache_seq_interface()
     config = _optimizer_config(
-        tmp_path, "_unit_test_build_unknown_ad_hook_graph_for_pipeline_cache"
+        tmp_path, "_unit_test_build_unknown_ad_pipeline_hook_graph_for_pipeline_cache"
     )
 
     model = InferenceOptimizer(factory=factory, config=config)(cm)
@@ -785,15 +835,64 @@ def test_pipeline_cache_rejects_unknown_ad_managed_hook(monkeypatch, tmp_path):
     assert _COUNTERS == {"build": 1, "boundary": 1, "after": 1}
     assert hasattr(model, "after_marker")
     assert list(tmp_path.rglob("manifest.json")) == []
+    assert any("unrecognized hook" in msg for msg in warnings)
+
+
+def test_pipeline_cache_allows_materialized_buffers(monkeypatch, tmp_path):
+    _reset_counters()
+    _patch_mem_stats(monkeypatch)
+    factory = _DummyFactory(model="dummy-model")
+    cm = _cache_seq_interface()
+    config = _optimizer_config(
+        tmp_path, "_unit_test_build_materialized_buffer_graph_for_pipeline_cache"
+    )
+
+    model = InferenceOptimizer(factory=factory, config=config)(cm)
+    restored = InferenceOptimizer(factory=factory, config=config)(cm)
+
+    assert _COUNTERS == {"build": 1, "boundary": 1, "after": 2}
+    assert torch.equal(model.materialized_buffer, torch.ones(1))
+    assert torch.equal(restored.materialized_buffer, torch.ones(1))
+    assert list(tmp_path.rglob("manifest.json"))
+
+
+def test_pipeline_cache_rejects_materialized_parameters(monkeypatch, tmp_path):
+    _reset_counters()
+    _patch_mem_stats(monkeypatch)
+    warnings = []
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.auto_deploy.transform.pipeline_cache.pipeline_cache.ad_logger.warning",
+        warnings.append,
+    )
+    factory = _DummyFactory(model="dummy-model")
+    cm = _cache_seq_interface()
+    config = _optimizer_config(
+        tmp_path, "_unit_test_build_materialized_parameter_graph_for_pipeline_cache"
+    )
+
+    model = InferenceOptimizer(factory=factory, config=config)(cm)
+
+    assert _COUNTERS == {"build": 1, "boundary": 1, "after": 1}
+    assert hasattr(model, "after_marker")
+    assert list(tmp_path.rglob("manifest.json")) == []
+    assert any("parameters found: ['weight']" in msg for msg in warnings)
 
 
 def _make_gm_with_hooks():
     gm = symbolic_trace(_ToyModule())
+    hook = partial(
+        _load_hook_for_deduplication,
+        param_key_remaining="weight",
+        param_key_removed="weight_alias",
+    )
     gm._register_load_state_dict_pre_hook(
-        partial(
-            _load_hook_for_deduplication,
-            param_key_remaining="weight",
-            param_key_removed="weight_alias",
+        mark_pipeline_cache_hook(
+            hook,
+            {
+                "type": "dedup",
+                "param_key_remaining": "weight",
+                "param_key_removed": "weight_alias",
+            },
         )
     )
     gm._register_load_state_dict_pre_hook(
@@ -824,8 +923,21 @@ def test_hook_spec_round_trip_shard_tp():
 
     gm = symbolic_trace(_ToyModule())
     f_split = partial(_split_tensor_for_tp, dim=0, rank=0, world_size=2, min_local_shape=1)
+    hook = partial(_load_hook, f_split=f_split, param_key="weight", param_shape=torch.Size([1]))
     gm._register_load_state_dict_pre_hook(
-        partial(_load_hook, f_split=f_split, param_key="weight", param_shape=torch.Size([1]))
+        mark_pipeline_cache_hook(
+            hook,
+            {
+                "type": "shard_tp",
+                "param_key": "weight",
+                "param_shape": [1],
+                "dim": 0,
+                "rank": 0,
+                "world_size": 2,
+                "min_local_shape": 1,
+                "fused_weight_dims": None,
+            },
+        )
     )
 
     specs, has_unknown = collect_hook_specs(gm)
@@ -837,3 +949,345 @@ def test_hook_spec_round_trip_shard_tp():
     fresh = symbolic_trace(_ToyModule())
     reattach_hooks(fresh, specs)
     assert len(fresh._load_state_dict_pre_hooks) == 1
+
+
+def test_hook_specs_reject_post_load_hooks():
+    gm = symbolic_trace(_ToyModule())
+    gm.register_load_state_dict_post_hook(_unit_test_load_state_dict_post_hook)
+
+    specs, has_unknown = collect_hook_specs(gm)
+
+    assert specs == []
+    assert has_unknown
+
+
+def test_hook_specs_reject_with_module_load_hooks():
+    gm = symbolic_trace(_ToyModule())
+    gm.register_load_state_dict_pre_hook(_unit_test_load_state_dict_pre_hook)
+
+    specs, has_unknown = collect_hook_specs(gm)
+
+    assert specs == []
+    assert has_unknown
+
+
+def test_hook_specs_reject_unsupported_marked_sharding_closures():
+    from tensorrt_llm._torch.auto_deploy.transform.library.sharding import _load_hook
+
+    gm = symbolic_trace(_ToyModule())
+    start_idx = 0
+    end_idx = 1
+
+    def slice_tensor(t: torch.Tensor) -> torch.Tensor:
+        return t[start_idx:end_idx]
+
+    shard_slice_hook = partial(
+        _load_hook,
+        f_split=slice_tensor,
+        param_key="weight",
+        param_shape=torch.Size([1]),
+    )
+    with pytest.raises((AttributeError, pickle.PicklingError), match="local object"):
+        pickle.dumps(shard_slice_hook)
+
+    gm._register_load_state_dict_pre_hook(
+        mark_pipeline_cache_hook(
+            shard_slice_hook,
+            {
+                "type": "shard_slice",
+                "param_key": "weight",
+                "param_shape": [1],
+                "start_idx": start_idx,
+                "end_idx": end_idx,
+            },
+        )
+    )
+    specs, has_unknown = collect_hook_specs(gm)
+
+    assert specs == []
+    assert has_unknown
+
+
+def test_hook_specs_cover_unpickleable_fused_tp_closures():
+    from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
+        _load_hook,
+        _split_tensor_for_tp,
+    )
+
+    fused_gm = symbolic_trace(_ToyModule())
+    rank = 0
+    world_size = 2
+    min_local_shape = 1
+    fused_weight_dims = [1]
+    dim = 0
+
+    def f_split(
+        t: torch.Tensor,
+        fused_dims: list[int] = fused_weight_dims,
+        d: int = dim,
+    ) -> torch.Tensor:
+        return torch.cat(
+            [
+                _split_tensor_for_tp(w, d, rank, world_size, min_local_shape)
+                for w in torch.split(t, fused_dims, dim=d)
+            ],
+            dim=d,
+        )
+
+    fused_tp_hook = partial(
+        _load_hook,
+        f_split=f_split,
+        param_key="weight",
+        param_shape=torch.Size([1]),
+    )
+    with pytest.raises((AttributeError, pickle.PicklingError), match="local object"):
+        pickle.dumps(fused_tp_hook)
+
+    fused_gm._register_load_state_dict_pre_hook(
+        mark_pipeline_cache_hook(
+            fused_tp_hook,
+            {
+                "type": "shard_tp",
+                "param_key": "weight",
+                "param_shape": [1],
+                "dim": dim,
+                "rank": rank,
+                "world_size": world_size,
+                "min_local_shape": min_local_shape,
+                "fused_weight_dims": fused_weight_dims,
+            },
+        )
+    )
+    specs, has_unknown = collect_hook_specs(fused_gm)
+
+    assert not has_unknown
+    assert specs[0]["type"] == "shard_tp"
+    assert specs[0]["fused_weight_dims"] == fused_weight_dims
+    assert specs[0]["rank"] == rank
+    assert specs[0]["world_size"] == world_size
+    assert specs[0]["min_local_shape"] == min_local_shape
+    assert json.loads(json.dumps(specs)) == specs
+
+
+def test_hook_spec_round_trip_mla_rope_utils():
+    from tensorrt_llm._torch.auto_deploy.models.custom.mla_rope_utils import (
+        _kv_b_proj_dequant_load_hook,
+        _rope_deinterleave_load_hook,
+    )
+
+    gm = symbolic_trace(_ToyModule())
+    gm._register_load_state_dict_pre_hook(
+        partial(
+            _rope_deinterleave_load_hook,
+            qk_rope_head_dim=4,
+            qk_nope_head_dim=6,
+            num_heads=2,
+            kv_lora_rank=3,
+            num_layers=1,
+        )
+    )
+    gm._register_load_state_dict_pre_hook(partial(_kv_b_proj_dequant_load_hook, num_layers=1))
+
+    specs, has_unknown = collect_hook_specs(gm)
+    assert not has_unknown
+    assert {spec["type"] for spec in specs} == {"importable_load_hook"}
+    assert {spec["callable"]["qualname"] for spec in specs} == {
+        "_rope_deinterleave_load_hook",
+        "_kv_b_proj_dequant_load_hook",
+    }
+    assert (
+        next(
+            spec for spec in specs if spec["callable"]["qualname"] == "_rope_deinterleave_load_hook"
+        )["keywords"]["qk_rope_head_dim"]
+        == 4
+    )
+    assert json.loads(json.dumps(specs)) == specs
+
+    fresh = symbolic_trace(_ToyModule())
+    reattach_hooks(fresh, specs)
+    assert len(fresh._load_state_dict_pre_hooks) == 2
+
+
+def test_hook_spec_round_trip_partial_bound_method():
+    gm = symbolic_trace(_ToyModule())
+    owner = _PartialBoundHookOwner(payload_value=7)
+    gm._register_load_state_dict_pre_hook(partial(owner.load_hook, weight_name="weight"))
+
+    specs, has_unknown = collect_hook_specs(gm)
+    assert not has_unknown
+    assert len(specs) == 1
+    assert specs[0]["type"] == "importable_load_hook"
+    assert specs[0]["callable"]["qualname"] == "_PartialBoundHookOwner.load_hook"
+    assert specs[0]["owner_class"]["qualname"] == "_PartialBoundHookOwner"
+    assert specs[0]["owner_payload"]["payload_value"] == 7
+    assert specs[0]["keywords"]["weight_name"] == "weight"
+    assert json.loads(json.dumps(specs)) == specs
+
+    fresh = symbolic_trace(_ToyModule())
+    reattach_hooks(fresh, specs)
+    assert len(fresh._load_state_dict_pre_hooks) == 1
+
+    hook = next(iter(fresh._load_state_dict_pre_hooks.values()))
+    hook_fn = hook.hook if hasattr(hook, "hook") else hook
+    state_dict = {}
+    hook_fn(state_dict, "prefix.", {}, True, [], [], [])
+    assert state_dict["prefix.weight"] == 7
+
+
+def test_hook_spec_round_trip_module_bound_method_with_read_only_property():
+    module = _ReadOnlyPropertyHookModule(payload_value=7)
+
+    specs, has_unknown = collect_hook_specs(module)
+    assert not has_unknown
+    assert len(specs) == 1
+    assert specs[0]["type"] == "importable_load_hook"
+    assert specs[0]["callable"]["qualname"] == "_ReadOnlyPropertyHookModule.load_hook"
+    assert specs[0]["bind_to_module"]
+    assert "can_record_outputs" not in specs[0]
+    assert "owner_payload" not in specs[0]
+    assert json.loads(json.dumps(specs)) == specs
+
+    fresh = _ReadOnlyPropertyHookModule(payload_value=11)
+    fresh._load_state_dict_pre_hooks.clear()
+    reattach_hooks(fresh, specs)
+    assert len(fresh._load_state_dict_pre_hooks) == 1
+
+    hook = next(iter(fresh._load_state_dict_pre_hooks.values()))
+    hook_fn = hook.hook if hasattr(hook, "hook") else hook
+    state_dict = {}
+    hook_fn(state_dict, "prefix.", {}, True, [], [], [])
+    assert state_dict["prefix.weight"] == 11
+
+    legacy_spec = {
+        "type": "importable_load_hook",
+        "scope": "root",
+        "callable": {
+            "module": _ReadOnlyPropertyHookModule.load_hook.__module__,
+            "qualname": _ReadOnlyPropertyHookModule.load_hook.__qualname__,
+        },
+        "owner_class": {
+            "module": _ReadOnlyPropertyHookModule.__module__,
+            "qualname": _ReadOnlyPropertyHookModule.__qualname__,
+        },
+        "owner_payload": {
+            "payload_value": 7,
+            "can_record_outputs": {},
+        },
+    }
+    fresh._load_state_dict_pre_hooks.clear()
+    reattach_hooks(fresh, [legacy_spec])
+    hook = next(iter(fresh._load_state_dict_pre_hooks.values()))
+    hook_fn = hook.hook if hasattr(hook, "hook") else hook
+    state_dict = {}
+    hook_fn(state_dict, "prefix.", {}, True, [], [], [])
+    assert state_dict["prefix.weight"] == 11
+
+
+def test_hook_spec_round_trip_custom_model_checkpoint_hooks():
+    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_gemma4 import (
+        Gemma4Model,
+        Gemma4TextDecoderLayer,
+    )
+    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_h import NemotronHModel
+    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_qwen3_5_moe import (
+        Qwen3_5MoeRMSNorm,
+        Qwen3_5MoeSparseMoeBlock,
+    )
+
+    gm = symbolic_trace(_ToyModule())
+    qwen_norm = nn.Module()
+    qwen_norm._register_load_state_dict_pre_hook(Qwen3_5MoeRMSNorm._offset_weight)
+    gm.add_module("qwen_norm", qwen_norm)
+
+    qwen_moe = nn.Module()
+    qwen_moe._register_load_state_dict_pre_hook(
+        Qwen3_5MoeSparseMoeBlock._load_experts_from_fused_checkpoint
+    )
+    gm.add_module("qwen_moe", qwen_moe)
+
+    gemma4_model = nn.Module()
+    gemma4_model._register_load_state_dict_pre_hook(Gemma4Model._drop_unsupported_weights)
+    gm.add_module("gemma4_model", gemma4_model)
+
+    gemma4_layer = nn.Module()
+    gemma4_layer_owner = types.SimpleNamespace(num_experts=2, expert_intermediate_size=3)
+    gemma4_layer._register_load_state_dict_pre_hook(
+        types.MethodType(Gemma4TextDecoderLayer._unfuse_moe_weights, gemma4_layer_owner)
+    )
+    gm.add_module("gemma4_layer", gemma4_layer)
+
+    nemotron_h = nn.Module()
+    nemotron_h._register_load_state_dict_pre_hook(
+        types.MethodType(NemotronHModel.load_hook, types.SimpleNamespace())
+    )
+    gm.add_module("nemotron_h", nemotron_h)
+
+    specs, has_unknown = collect_hook_specs(gm)
+    assert not has_unknown
+    assert {spec["type"] for spec in specs} == {"importable_load_hook"}
+    assert {spec["callable"]["qualname"] for spec in specs} == {
+        "Qwen3_5MoeRMSNorm._offset_weight",
+        "Qwen3_5MoeSparseMoeBlock._load_experts_from_fused_checkpoint",
+        "Gemma4Model._drop_unsupported_weights",
+        "Gemma4TextDecoderLayer._unfuse_moe_weights",
+        "NemotronHModel.load_hook",
+    }
+    assert json.loads(json.dumps(specs)) == specs
+    assert (
+        next(
+            spec
+            for spec in specs
+            if spec["callable"]["qualname"] == "Gemma4TextDecoderLayer._unfuse_moe_weights"
+        )["owner_payload"]["expert_intermediate_size"]
+        == 3
+    )
+    fresh = symbolic_trace(_ToyModule())
+    fresh.add_module("qwen_norm", nn.Module())
+    fresh.add_module("qwen_moe", nn.Module())
+    fresh.add_module("gemma4_model", nn.Module())
+    fresh.add_module("gemma4_layer", nn.Module())
+    fresh.add_module("nemotron_h", nn.Module())
+
+    reattach_hooks(fresh, specs)
+
+    def run_first_pre_hook(module, state_dict):
+        hook = next(iter(module._load_state_dict_pre_hooks.values()))
+        hook_fn = hook.hook if hasattr(hook, "hook") else hook
+        hook_fn(state_dict, "", {}, True, [], [], [])
+
+    qwen_norm_state = {"weight": torch.zeros(1)}
+    run_first_pre_hook(fresh.qwen_norm, qwen_norm_state)
+    assert torch.equal(qwen_norm_state["weight"], torch.ones(1))
+
+    qwen_moe_state = {
+        "experts.gate_up_proj": torch.arange(12, dtype=torch.float32).reshape(2, 6, 1),
+        "experts.down_proj": torch.arange(6, dtype=torch.float32).reshape(2, 1, 3),
+    }
+    run_first_pre_hook(fresh.qwen_moe, qwen_moe_state)
+    assert "experts.1.up_proj.weight" in qwen_moe_state
+    assert "experts.down_proj" not in qwen_moe_state
+
+    gemma4_model_state = {"vision_tower.weight": torch.ones(1)}
+    run_first_pre_hook(fresh.gemma4_model, gemma4_model_state)
+    assert gemma4_model_state == {}
+
+    gemma4_layer_state = {
+        "moe.gate_up_proj": torch.arange(12, dtype=torch.float32).reshape(2, 6, 1),
+        "moe.down_proj": torch.ones(2, 1, 3),
+        "moe.per_expert_scale": torch.tensor([2.0, 3.0]),
+    }
+    run_first_pre_hook(fresh.gemma4_layer, gemma4_layer_state)
+    assert "moe.experts.1.up_proj.weight" in gemma4_layer_state
+    assert torch.equal(
+        gemma4_layer_state["moe.experts.1.down_proj.weight"], torch.full((1, 3), 3.0)
+    )
+
+    nemotron_h_state = {"embedding.weight": torch.ones(1)}
+    run_first_pre_hook(fresh.nemotron_h, nemotron_h_state)
+    assert "embeddings.weight" in nemotron_h_state
+
+    assert len(fresh.qwen_norm._load_state_dict_pre_hooks) == 1
+    assert len(fresh.qwen_moe._load_state_dict_pre_hooks) == 1
+    assert len(fresh.gemma4_model._load_state_dict_pre_hooks) == 1
+    assert len(fresh.gemma4_layer._load_state_dict_pre_hooks) == 1
+    assert len(fresh.nemotron_h._load_state_dict_pre_hooks) == 1
