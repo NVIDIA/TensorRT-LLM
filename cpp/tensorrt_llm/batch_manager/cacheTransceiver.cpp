@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -715,6 +715,22 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         {
             try
             {
+                // When the caller only asked for ``atLeastRequestNum`` completed
+                // transfers (``!blockAll``), do a non-blocking probe before
+                // calling ``future.get()``. The selection logic above can pick
+                // a request whose receiver-side future is not yet ready (the
+                // ready-frequency vector and the insertion-order fallback both
+                // ignore future status), and an unconditional ``get()`` on
+                // such a future blocks the entire PyExecutor disagg event
+                // loop on a single in-flight generation request whose
+                // context counterpart has not yet sent its ready signal.
+                // Skip unready entries instead so the loop can make progress
+                // on whichever futures are actually ready right now.
+                if (!blockAll && it->second.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+                {
+                    ++it;
+                    continue;
+                }
                 it->second.get();
                 it->first->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
 
