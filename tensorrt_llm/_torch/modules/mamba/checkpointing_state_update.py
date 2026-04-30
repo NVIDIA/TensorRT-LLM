@@ -51,6 +51,32 @@ def _stochastic_round_fp16x2(x: tl.tensor, rand: tl.tensor) -> tl.tensor:
     )
 
 
+@triton.jit
+def _stochastic_round_fp8x4_e4m3(x: tl.tensor, rand: tl.tensor) -> tl.tensor:
+    """Stochastic rounding: fp32 quad → fp8 e4m3 using Philox random bits.
+
+    Uses PTX cvt.rs.satfinite.e4m3x4.f32 which combines stochastic rounding
+    and saturating cast in a single op (output is final fp8, no separate
+    clamp needed).  The reversed source-register order {$4,$3,$2,$1} is
+    load-bearing — PTX packs leftmost source into the high byte but Triton's
+    pack=4 is little-endian, so the natural {$1,$2,$3,$4} order would
+    silently shuffle every group of 4 contiguous outputs.
+
+    Requires SM_100a+ (Blackwell B200).  Caller must gate at the wrapper
+    level — this kernel does not check.
+
+    Adapted from vLLM PR #40012 (Apache-2.0).
+    """
+    return tl.inline_asm_elementwise(
+        asm="cvt.rs.satfinite.e4m3x4.f32 $0, {$4, $3, $2, $1}, $5;",
+        constraints="=r,r,r,r,r,r,r,r,r",
+        args=(x, rand),
+        dtype=tl.float8e4nv,
+        is_pure=True,
+        pack=4,
+    )
+
+
 # Precompute kernel: CB_scaled, decay_vec.  Writes new cache (old_B,
 # old_dt, old_dA_cumsum) to the WRITE buffer slot for next step's replay.
 # Grid: (batch, nheads // HEADS_PER_BLOCK).
@@ -342,6 +368,9 @@ def _checkpointing_precompute_kernel(
 def _checkpointing_main_kernel(
     # Pointers
     state_ptr,
+    # Per-(cache, head, dim) decode scale, fp32, only consulted when QUANT_MAX>0.
+    # Layout (cache, nheads, dim) — broadcast over dstate at load/store.
+    state_scales_ptr,
     # Cache READ pointers (read-buffer from previous step)
     old_x_ptr,
     old_B_ptr,
@@ -373,6 +402,10 @@ def _checkpointing_main_kernel(
     stride_state_head,
     stride_state_dim,
     stride_state_dstate,
+    # state_scales strides: (cache, nheads, dim) — only used when QUANT_MAX>0
+    stride_state_scales_cache,
+    stride_state_scales_head,
+    stride_state_scales_dim,
     # old_x strides: (cache, T, nheads, dim) — single-buffered
     stride_old_x_cache,
     stride_old_x_T,
@@ -436,6 +469,12 @@ def _checkpointing_main_kernel(
     LAUNCH_WITH_PDL: tl.constexpr,
     USE_RS_ROUNDING: tl.constexpr,
     PHILOX_ROUNDS: tl.constexpr,
+    # State quantization: 0.0 means non-quantized (fp16/bf16/fp32); >0 means
+    # quantized (int8=127, int16=32767, fp8_e4m3fn=448).  Single in-kernel
+    # switch for the dequant-on-load and encode-on-store paths.  Wrapper sets
+    # this from state.dtype; kernel-entry static_assert below pins the
+    # invariant that it must coincide with int8/int16/float8e4nv state dtype.
+    QUANT_MAX: tl.constexpr,
     # Checkpointing flags
     WRITE_CHECKPOINT: tl.constexpr,  # When True: quantize+write post-replay state to HBM (checkpoint step).
                                       # When False: skip state write entirely (non-checkpoint step).
@@ -443,6 +482,19 @@ def _checkpointing_main_kernel(
                                       # Currently asserted False at the wrapper; kernel takes the
                                       # replay-style code path unconditionally.
 ):
+    # Compile-time invariant: QUANT_MAX > 0 must coincide with a quantized
+    # state dtype (int8 / int16 / float8e4nv) and only those.  Cheap
+    # insurance against a wrapper bug that desynchronizes the two.
+    tl.static_assert(
+        (QUANT_MAX > 0.0)
+        == (
+            (state_ptr.dtype.element_ty == tl.int8)
+            or (state_ptr.dtype.element_ty == tl.int16)
+            or (state_ptr.dtype.element_ty == tl.float8e4nv)
+        ),
+        "QUANT_MAX > 0.0 must coincide with int8 / int16 / float8e4nv state dtype.",
+    )
+
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)
@@ -481,6 +533,20 @@ def _checkpointing_main_kernel(
     )
     state_mask = m_mask[:, None] & n_mask[None, :]
     state = tl.load(state_ptrs, mask=state_mask, other=0.0).to(tl.float32)
+    # Dequantize on load (per-(head, dim) decode scale, broadcast over dstate).
+    # Only consulted when QUANT_MAX>0 — non-quantized paths skip entirely.
+    if QUANT_MAX > 0.0:
+        state_scales_base = (
+            state_scales_ptr
+            + cache_batch_idx * stride_state_scales_cache
+            + pid_h * stride_state_scales_head
+        )
+        decode_scale = tl.load(
+            state_scales_base + offs_m * stride_state_scales_dim,
+            mask=m_mask,
+            other=1.0,
+        ).to(tl.float32)
+        state = state * decode_scale[:, None]
 
     # Phase 1: Replay via tl.dot fast-forward (reads from active_buf)
     group_idx = pid_h // nheads_ngroups_ratio
@@ -556,10 +622,10 @@ def _checkpointing_main_kernel(
     # win of replay-style checkpointing on the common (non-checkpoint) step.
     if WRITE_CHECKPOINT:
         if USE_RS_ROUNDING:
-            # Stochastic rounding for fp16 state using Philox-4x32 PRNG.
-            # Each Philox call produces 4 random ints.  We call randint4x on
-            # quarter-sized dstate offsets and join+reshape to get the full
-            # (M, dstate) random tensor — 4x fewer PRNG rounds.
+            # Generate (M, dstate) random tensor for stochastic rounding.
+            # Used by fp16 / int8 / int16 / fp8 SR paths below.  Quarter-sized
+            # randint4x calls produce 4 u32s each; we interleave them into the
+            # full (M, dstate) tensor — 4x fewer PRNG rounds vs per-element.
             rand_seed = tl.load(rand_seed_ptr)
             base_rand = cache_batch_idx * stride_state_batch + pid_h * stride_state_head
             offs_n_q = tl.arange(0, BLOCK_SIZE_DSTATE // 4)
@@ -577,8 +643,78 @@ def _checkpointing_main_kernel(
             r23 = tl.join(r2, r3)  # (M, dstate//4, 2)
             r0123 = tl.join(r01, r23)  # (M, dstate//4, 2, 2)
             rand = tl.reshape(r0123, (BLOCK_SIZE_M, BLOCK_SIZE_DSTATE))
+
+        if QUANT_MAX > 0.0:
+            # Quantized state path: int8 / int16 / fp8_e4m3fn (RN or SR).
+            # 1) Per-(head, dim) channel scale via amax over dstate.
+            amax = tl.max(tl.abs(state), axis=1)  # (M,)
+            encode_scale = tl.where(amax == 0.0, 1.0, QUANT_MAX / amax)  # (M,)
+            decode_scale = 1.0 / encode_scale  # (M,)
+            # 2) Store decode_scale (1/encode) so reads do a single multiply.
+            state_scales_ptrs = (
+                state_scales_ptr
+                + cache_batch_idx * stride_state_scales_cache
+                + pid_h * stride_state_scales_head
+                + offs_m * stride_state_scales_dim
+            )
+            tl.store(state_scales_ptrs, decode_scale, mask=m_mask)
+            # 3) Scale state into quant range — into a NEW variable so the
+            # downstream output phase still sees the dequantized fp32 state.
+            state_q = state * encode_scale[:, None]
+            # 4) Round per dtype.  Order matters: handle fp8 SR first (PTX
+            # combines round + saturating cast in one op, output is final fp8
+            # so we store and finish on that branch).  Other branches share
+            # the clamp + cast tail below.
+            if USE_RS_ROUNDING and (state_ptrs.dtype.element_ty == tl.float8e4nv):
+                # fp8_e4m3fn + SR — PTX cvt.rs.satfinite.e4m3x4.f32.  Output
+                # is final fp8 (saturate included); store directly.
+                tl.store(
+                    state_ptrs,
+                    _stochastic_round_fp8x4_e4m3(state_q, rand),
+                    mask=state_mask,
+                )
+            else:
+                if USE_RS_ROUNDING:
+                    # int8 / int16 + SR — uniform-noise + floor.
+                    # (fp8 SR was handled by the early branch above.)
+                    tl.static_assert(
+                        (state_ptrs.dtype.element_ty == tl.int8)
+                        or (state_ptrs.dtype.element_ty == tl.int16),
+                        "Quantized SR fall-through expects int8 or int16; "
+                        "fp8 SR is handled by the prior branch.",
+                    )
+                    rand01 = (rand & 0x00FFFFFF).to(tl.float32) * (1.0 / float(1 << 24))
+                    state_q = tl.extra.cuda.libdevice.floor(state_q + rand01)
+                elif state_ptrs.dtype.element_ty != tl.float8e4nv:
+                    # int8 / int16 + RN — explicit round before clamp.
+                    # fp8 + RN deliberately skips this — explicit round() would
+                    # destroy fp8 sub-integer precision; native cast at store
+                    # does RN at the fp8 grid resolution.
+                    tl.static_assert(
+                        (state_ptrs.dtype.element_ty == tl.int8)
+                        or (state_ptrs.dtype.element_ty == tl.int16),
+                        "Quantized RN with explicit round() expects int8 or int16.",
+                    )
+                    state_q = tl.extra.cuda.libdevice.round(state_q)
+                # Clamp + cast tail: int8/int16 (RN+SR) and fp8 RN.
+                # fp8 RN reaches here without prior round() — .to(float8e4nv)
+                # does native RN at the fp8 grid.
+                state_q = tl.minimum(tl.maximum(state_q, -QUANT_MAX), QUANT_MAX)
+                tl.store(
+                    state_ptrs,
+                    state_q.to(state_ptrs.dtype.element_ty),
+                    mask=state_mask,
+                )
+        elif USE_RS_ROUNDING:
+            # Non-quantized + SR: only fp16 (bf16 has no PTX SR cast; fp32
+            # doesn't need rounding).
+            tl.static_assert(
+                state_ptrs.dtype.element_ty == tl.float16,
+                "Non-quantized SR only supports fp16 state.",
+            )
             tl.store(state_ptrs, _stochastic_round_fp16x2(state, rand), mask=state_mask)
         else:
+            # Non-quantized + RN: fp16 / bf16 / fp32 native cast.
             tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=state_mask)
 
     # Phase 2: Output using precomputed CB_scaled and decay_vec
@@ -668,6 +804,13 @@ def _checkpointing_main_kernel(
 # Python wrapper
 
 
+_QUANT_MAX_BY_DTYPE = {
+    torch.int8: 127.0,
+    torch.int16: 32767.0,
+    torch.float8_e4m3fn: 448.0,
+}
+
+
 def checkpointing_state_update(
     state: torch.Tensor,
     old_x: torch.Tensor,
@@ -690,6 +833,7 @@ def checkpointing_state_update(
     pad_slot_id: int = PAD_SLOT_ID,
     rand_seed: torch.Tensor | None = None,
     philox_rounds: int = 10,
+    state_scales: torch.Tensor | None = None,
     launch_with_pdl=False,
     use_internal_pdl=True,
     write_checkpoint: bool = True,
@@ -700,6 +844,8 @@ def checkpointing_state_update(
     _precompute_num_warps: int | None = None,
     _precompute_num_stages: int | None = None,
     _heads_per_block: int | None = None,
+    _maxnreg: int | None = None,
+    _num_ctas: int | None = None,
 ):
     """
     Replay SSM state update with precomputed CB and tl.dot fast-forward.
@@ -743,9 +889,16 @@ def checkpointing_state_update(
         dt_bias: (nheads, dim) optional, with stride(-1)==0 (tie_hdim).
         state_batch_indices: (batch,) optional cache slot mapping.
         rand_seed: optional single-element int64 CUDA tensor for Philox PRNG seed.
-            When provided, state is stochastically rounded to fp16 on store.
-            When None, standard deterministic rounding is used.
+            When provided, state is stochastically rounded on store.  Supported
+            for state.dtype in (fp16, int8, int16, fp8_e4m3fn); other dtypes
+            silently use deterministic rounding.  fp16+SR and fp8+SR both
+            require sm_100a (Blackwell B200+) — wrapper asserts this loudly.
         philox_rounds: number of Philox PRNG rounds (default 10).
+        state_scales: required when state.dtype in (int8, int16, fp8_e4m3fn).
+            Shape (cache_size, nheads, dim), fp32.  Per-(head, dim) channel
+            decode scale (= 1 / encode_scale).  The kernel writes scales on
+            checkpoint steps and reads them on load (broadcast over dstate).
+            Ignored for non-quantized state dtypes.
         launch_with_pdl: enable external PDL (conv1d → precompute chain).
             Defaults False; caller opts in when the upstream chain is PDL-safe.
             Ignored on hardware that doesn't support PDL (sm < 90).
@@ -754,9 +907,9 @@ def checkpointing_state_update(
             Ignored on hardware that doesn't support PDL (sm < 90).
 
         _-prefixed kwargs (_block_size_m, _num_warps, _num_stages,
-        _precompute_num_warps, _precompute_num_stages, _heads_per_block) are
-        benchmark-only overrides; production callers should leave them None
-        to use the heuristic-tuned defaults.
+        _precompute_num_warps, _precompute_num_stages, _heads_per_block,
+        _maxnreg, _num_ctas) are benchmark-only overrides; production callers
+        should leave them None to use the heuristic-tuned defaults.
     """
     # PDL needs sm >= 90.
     if get_sm_version() < 90:
@@ -776,6 +929,31 @@ def checkpointing_state_update(
     assert not (write_checkpoint and rectangle), (
         "WRITE_CHECKPOINT and RECTANGLE are mutually exclusive."
     )
+
+    # --- Hardware support gates ---
+    # fp8 e4m3fn (any rounding mode) needs SM 89+ for the fp32↔e4m3 cvt PTX
+    # instructions (Ada Lovelace introduced them; Hopper/Blackwell carry them).
+    if state.dtype == torch.float8_e4m3fn:
+        assert get_sm_version() >= 89, (
+            "fp8_e4m3fn state requires SM 89+ (Ada Lovelace / Hopper / Blackwell) "
+            f"for fp32↔fp8 cvt PTX instructions; current SM is {get_sm_version()}."
+        )
+
+    # PTX cvt.rs.* (stochastic rounding) family lands on Blackwell only.
+    # Wrapper fails loud; framework decides fall-back (e.g. drop SR, use RN).
+    # int8 / int16 SR uses pure-Triton libdevice.floor + uniform noise — no
+    # PTX SR instruction needed, runs anywhere.
+    if rand_seed is not None:
+        if state.dtype == torch.float16:
+            assert get_sm_version() >= 100, (
+                "fp16 stochastic rounding (PTX cvt.rs.f16x2.f32) requires "
+                f"sm_100a (Blackwell B200+); current SM is {get_sm_version()}."
+            )
+        elif state.dtype == torch.float8_e4m3fn:
+            assert get_sm_version() >= 100, (
+                "fp8 stochastic rounding (PTX cvt.rs.satfinite.e4m3x4.f32) "
+                f"requires sm_100a (Blackwell B200+); current SM is {get_sm_version()}."
+            )
 
     # --- Unsqueeze inputs to canonical shapes ---
     if state.dim() == 3:
@@ -816,6 +994,25 @@ def checkpointing_state_update(
     batch, T, _, _ = x.shape
     ngroups = B.shape[2]
     assert nheads % ngroups == 0
+
+    # --- Quantization plumbing ---
+    # QUANT_MAX > 0 ⇔ state is int8 / int16 / fp8_e4m3fn.  Kernel-entry
+    # static_assert on the Triton side mirrors this invariant.
+    quant_max = _QUANT_MAX_BY_DTYPE.get(state.dtype, 0.0)
+    is_quantized = quant_max > 0.0
+    if is_quantized:
+        assert state_scales is not None, (
+            f"state.dtype={state.dtype} requires state_scales tensor "
+            "(shape (cache_size, nheads, dim), fp32)."
+        )
+        assert state_scales.shape == (cache_size, nheads, dim), (
+            f"state_scales shape mismatch: expected {(cache_size, nheads, dim)}, "
+            f"got {state_scales.shape}."
+        )
+        assert state_scales.dtype == torch.float32, (
+            f"state_scales must be fp32, got {state_scales.dtype}."
+        )
+        assert state_scales.device == state.device
 
     # Cache T-axis = MAX_WINDOW (the replay buffer capacity).  For the
     # placeholder degenerate case max_window = T (every step is a checkpoint
@@ -1062,8 +1259,22 @@ def checkpointing_state_update(
         def grid(META):
             return (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
 
+        # state_scales pointer + strides: real tensor when quantized, otherwise
+        # zero-strided dummy (kernel never reads it because QUANT_MAX==0.0).
+        if is_quantized:
+            state_scales_arg = state_scales
+            state_scales_strides = (
+                state_scales.stride(0),
+                state_scales.stride(1),
+                state_scales.stride(2),
+            )
+        else:
+            state_scales_arg = state  # any valid ptr — gated by QUANT_MAX==0
+            state_scales_strides = (0, 0, 0)
+
         _checkpointing_main_kernel[grid](
             state,
+            state_scales_arg,
             old_x,
             old_B,
             old_dt,
@@ -1089,6 +1300,10 @@ def checkpointing_state_update(
             state.stride(1),
             state.stride(2),
             state.stride(3),
+            # state_scales strides (cache, head, dim)
+            state_scales_strides[0],
+            state_scales_strides[1],
+            state_scales_strides[2],
             # old_x strides (single-buffered: cache, T, nheads, dim)
             old_x.stride(0),
             old_x.stride(1),
@@ -1144,9 +1359,12 @@ def checkpointing_state_update(
             BLOCK_SIZE_M,
             LAUNCH_WITH_PDL=use_internal_pdl,
             PHILOX_ROUNDS=philox_rounds if rand_seed is not None else 0,
+            QUANT_MAX=quant_max,
             WRITE_CHECKPOINT=write_checkpoint,
             RECTANGLE=rectangle,
             num_warps=num_warps,
             **({"num_stages": _num_stages} if _num_stages else {}),
+            **({"num_ctas": _num_ctas} if _num_ctas else {}),
+            **({"maxnreg": _maxnreg} if _maxnreg else {}),
             launch_pdl=use_internal_pdl,
         )
