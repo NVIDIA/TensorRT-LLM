@@ -11,8 +11,10 @@ try:
 except ImportError:
     AttentionMaskConverter = None
 
-from .interface import (AttentionBackend, AttentionMask, AttentionMetadata,
-                        PredefinedAttentionMask)
+from .interface import (AttentionBackend, AttentionForwardContext,
+                        AttentionMask, AttentionMetadata,
+                        PredefinedAttentionMask,
+                        merge_attention_forward_context)
 from .sparse.kernel import triton_index_gather
 
 
@@ -268,8 +270,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                                 cache_idx,
                                 sample_idx,
                                 metadata: AttentionMetadata,
-                                attention_window_size: Optional[int] = None,
-                                **kwargs):
+                                attention_window_size: Optional[int] = None):
         # preprocess inputs
         q, k, v, kv_len = self._single_request_preprocess_inputs(
             q, k, v, kv_cache_tensor.dtype)
@@ -314,8 +315,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             metadata: AttentionMetadata,
             *,
             attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
-            position_ids: Optional[torch.Tensor] = None,
-            **kwargs) -> torch.Tensor:
+            position_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         This function is used to perform attention without kv cache.
         Args:
@@ -380,10 +380,9 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 k: Optional[torch.Tensor],
                 v: Optional[torch.Tensor],
                 metadata: VanillaAttentionMetadata,
-                *,
-                attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
-                attention_window_size: Optional[int] = None,
+                ctx: Optional[AttentionForwardContext] = None,
                 **kwargs) -> torch.Tensor:
+        ctx = merge_attention_forward_context(ctx, kwargs)
         if metadata.kv_cache_manager is None:
             # NOTE: WAR for no kv cache attn e.g. BERT,
             # try to separate the kv cache estimation path from no kv cache attn.
@@ -395,8 +394,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                                             num_heads=num_heads,
                                             num_kv_heads=num_kv_heads,
                                             metadata=metadata,
-                                            attention_mask=attention_mask,
-                                            **kwargs)
+                                            attention_mask=ctx.attention_mask)
 
         past_seen_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
         cache_indices = [
@@ -426,9 +424,9 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             cache_idx = cache_indices[sample_idx]
 
             attn_output = self._single_request_forward(
-                single_q, single_k, single_v, attention_mask, kv_cache_tensor,
-                past_seen_token, cache_idx, sample_idx, metadata,
-                attention_window_size, **kwargs)
+                single_q, single_k, single_v, ctx.attention_mask,
+                kv_cache_tensor, past_seen_token, cache_idx, sample_idx,
+                metadata, ctx.attention_window_size)
 
             attn_outputs.append(attn_output)
 

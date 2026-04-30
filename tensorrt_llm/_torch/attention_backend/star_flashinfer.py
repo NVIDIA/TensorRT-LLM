@@ -10,7 +10,9 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..distributed import allgather
 from .flashinfer import FlashInferAttentionMetadata, PlanParams
-from .interface import AttentionBackend, AttentionMask, PredefinedAttentionMask
+from .interface import (AttentionBackend, AttentionForwardContext,
+                        PredefinedAttentionMask,
+                        merge_attention_forward_context)
 
 
 # Please sync with flashinfer's DISPATCH_GQA_GROUP_SIZE in include/flashinfer/utils.cuh
@@ -312,9 +314,9 @@ class StarAttention(AttentionBackend[StarAttentionMetadata]):
                 k: Optional[torch.Tensor],
                 v: Optional[torch.Tensor],
                 metadata: StarAttentionMetadata,
-                *,
-                attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+                ctx: Optional[AttentionForwardContext] = None,
                 **kwargs) -> torch.Tensor:
+        ctx = merge_attention_forward_context(ctx, kwargs)
         assert isinstance(
             metadata,
             StarAttentionMetadata,
@@ -412,10 +414,10 @@ class StarAttention(AttentionBackend[StarAttentionMetadata]):
                                       return_lse=True)
             return output, lse
 
-        if attention_mask == PredefinedAttentionMask.CAUSAL:
+        if ctx.attention_mask == PredefinedAttentionMask.CAUSAL:
             attention_mask_type = int(AttentionMaskType.causal)
             attention_mask_data = None
-        elif attention_mask == PredefinedAttentionMask.FULL:
+        elif ctx.attention_mask == PredefinedAttentionMask.FULL:
             attention_mask_type = int(AttentionMaskType.padding)
             attention_mask_data = None
         else:
