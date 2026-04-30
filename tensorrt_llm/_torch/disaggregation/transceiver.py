@@ -330,6 +330,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if result == WaitResult.COMPLETED:
                 if self._need_aux_transfer(req):
                     self._apply_aux(session, req)
+                self._trim_kv_to_prompt_history(req)
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             else:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
@@ -421,6 +422,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req = self._recv_reqs[rid]
             if self._need_aux_transfer(req):
                 self._apply_aux(session, req)
+            self._trim_kv_to_prompt_history(req)
             req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             session.close()
             del self._recv_reqs[rid]
@@ -431,6 +433,38 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     def check_gen_transfer_complete(self):
         return len(self._recv_sessions) == 0
+
+    def _trim_kv_to_prompt_history(self, req: LlmRequest) -> None:
+        """Mark received KV as historic so SWA pools release pre-window blocks.
+
+        Call right before the TRANS_COMPLETE state transition.  The cache
+        was sized to hold the full prompt by ``resize_context`` and just
+        got fully populated by the transfer; setting ``history_length`` to
+        the prompt length triggers ``_unlock_stale_blocks`` inside V2's
+        ``resize()`` for any sliding-window life cycle, releasing blocks
+        before the window back to their pool group.
+
+        This closes the gap between transfer completion and
+        ``update_resources`` (which only runs after the *first* forward
+        pass and would otherwise be the first thing to update
+        ``history_length``).  In benchmark fill-phase the first forward
+        is gated until every disagg-gen request is ready, so without
+        this trim the SWA / sparse-attn pool groups stay 100% occupied
+        with pre-window prompt blocks and the V2 scheduler deadlocks
+        on the next ``resize(+1)``.
+
+        No-op for V1 managers and for V2 caches with only full-context
+        life cycles.
+        """
+        if not self._is_v2_manager:
+            return
+        trim = getattr(self._kv_cache_manager, "trim_to_history", None)
+        if trim is None:
+            return
+        prompt_len = getattr(req, "prompt_len", None)
+        if not prompt_len or prompt_len <= 0:
+            return
+        trim(req, prompt_len)
 
     def cancel_request(self, req: LlmRequest):
         raise NotImplementedError("cancel_request is not implemented")
