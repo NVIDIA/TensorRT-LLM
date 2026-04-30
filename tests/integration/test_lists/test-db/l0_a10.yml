@@ -29,12 +29,14 @@ l0_a10:
   - unittest/_torch/executor/test_async_transfer_manager.py
   - unittest/_torch/executor/test_scheduler_serializable_output.py
   - unittest/_torch/executor/test_kv_cache_estimation.py
+  - unittest/_torch/executor/test_kv_cache_budget_split.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
   - unittest/_torch/models/checkpoints/hf/test_weight_loader.py
   - unittest/_torch/models/checkpoints/hf/test_checkpoint_loader.py
   - unittest/inputs/test_chat_template_dispatch.py
   - unittest/inputs/test_content_format.py
+  - unittest/inputs/test_multimodal.py
   - unittest/others/test_convert_utils.py
   - unittest/others/test_lora_manager.py
   - unittest/others/test_lora_module_count.py

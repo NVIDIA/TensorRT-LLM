@@ -970,8 +970,28 @@ def get_all_layer_subgraphs(
             if shape is not None:
                 lin_node.meta["lin_node_shape"] = shape
 
-    # Find the embedding size from the first linear node
-    embd = get_weight_shape(linear_nodes[0], dim=-1)
+    embd = None
+
+    # Draft drafters take tokens and hidden states as inputs, so the first linear
+    # may consume a wider fused representation (for example 2h in Eagle / MTP).
+    # Infer the model width from the final projection back to hidden size instead.
+    in_eagle_drafter = False
+    if getattr(gm, "is_draft", False):
+        draft_match = infer_draft_embedding_size(gm, linear_nodes)
+        if draft_match is not None:
+            embd, in_eagle_drafter = draft_match
+            ad_logger.debug(
+                f"Draft embd inference matched; embd={embd}, is_eagle={in_eagle_drafter}"
+            )
+        else:
+            ad_logger.debug(
+                "Draft embd inference could not infer the final hidden width; "
+                "falling back to first-linear heuristic"
+            )
+
+    # Find the embedding size from the first linear node.
+    if embd is None:
+        embd = get_weight_shape(linear_nodes[0], dim=-1)
     if embd is None:
         raise ValueError("Failed to extract embedding size from first linear node")
 
@@ -984,7 +1004,11 @@ def get_all_layer_subgraphs(
     # For each linear node, find its layer subgraph defined as regions between consecutive linear nodes.
     while last_lin_index < len(linear_nodes):
         layer_subgraph = get_layer_after_linear_node(
-            linear_nodes, terminating_indices, embd=embd, residuals=residuals
+            linear_nodes,
+            terminating_indices,
+            embd=embd,
+            residuals=residuals,
+            in_eagle_drafter=in_eagle_drafter,
         )
 
         if layer_subgraph.opening_nodes is not None and len(layer_subgraph.opening_nodes) > 0:
@@ -998,6 +1022,88 @@ def get_all_layer_subgraphs(
 
     # Unprocessed linear nodes can be "simple sharded".
     return layer_subgraphs, unprocessed_linear_nodes
+
+
+def infer_draft_embedding_size(
+    gm: GraphModule, linear_nodes: List[Node]
+) -> Optional[Tuple[int, bool]]:
+    """Infer the hidden width for exported draft graphs.
+
+    Exported draft graphs are expected to represent the inner draft body, not an
+    lm_head. In both Eagle and Nemotron MTP drafters, the final executed linear
+    projects back to the model hidden size, so we use that output width as the
+    draft embedding size.
+
+    Eagle still needs special handling during layer-boundary detection because
+    its q/k/v projections open on a 2h-wide fused input. We infer that topology
+    separately and return it as the second tuple element.
+    """
+
+    assert getattr(gm, "is_draft", False), "Draft embedding inference should only run on drafts"
+
+    if len(linear_nodes) == 0:
+        return None
+
+    shape = linear_nodes[-1].meta.get("lin_node_shape")
+    if shape is None:
+        shape = get_weight_shape(linear_nodes[-1])
+    if shape is None or len(shape) < 2:
+        return None
+
+    embd = shape[0]
+    if embd is None:
+        return None
+
+    return embd, _is_eagle_draft_topology(linear_nodes, embd)
+
+
+def _get_linear_input_node(node: Node) -> Optional[Node]:
+    if not is_any_lin_op(node) or len(node.all_input_nodes) == 0:
+        return None
+    return node.all_input_nodes[0]
+
+
+# Note: The following logic is very brittle and will need to be updated if the Eagle draft topology changes.
+# The purpose of it is to enable the changes made for detecting the input width of Eagle draft attention layers,
+# which is 2 * embd for eagle layers. It is purposely made to be restrictive - when this is True, we detect
+# input widths as 2 * embd instead of embd, which is different than the usual input width detection logic.
+# TODO: Deprecate this as part of the AD sharding infrastructure transition.
+# See https://github.com/NVIDIA/TensorRT-LLM/issues/13174
+def _is_eagle_draft_topology(linear_nodes: List[Node], embd: int) -> bool:
+    """Match Eagle-style q/k/v/o topology on top of a known hidden width."""
+
+    if len(linear_nodes) < 4:
+        return False
+
+    q_node, k_node, v_node, o_node = linear_nodes[:4]
+    q_shape = get_weight_shape(q_node)
+    k_shape = get_weight_shape(k_node)
+    v_shape = get_weight_shape(v_node)
+    o_shape = get_weight_shape(o_node)
+    if any(shape is None or len(shape) < 2 for shape in (q_shape, k_shape, v_shape, o_shape)):
+        return False
+
+    q_in_dim, q_out_dim = q_shape[-1], q_shape[0]
+    k_in_dim, k_out_dim = k_shape[-1], k_shape[0]
+    v_in_dim, v_out_dim = v_shape[-1], v_shape[0]
+    o_in_dim, o_out_dim = o_shape[-1], o_shape[0]
+
+    if not (q_in_dim == k_in_dim == v_in_dim == 2 * embd):
+        return False
+    if o_out_dim != embd:
+        return False
+    if o_in_dim != q_out_dim:
+        return False
+    if k_out_dim != v_out_dim:
+        return False
+
+    shared_source = _get_linear_input_node(q_node)
+    if shared_source is None:
+        return False
+    if any(_get_linear_input_node(node) is not shared_source for node in (k_node, v_node)):
+        return False
+
+    return True
 
 
 def bfs(
@@ -1313,6 +1419,7 @@ def get_layer_after_linear_node(
     residuals: List[Node],
     match_on_shapes: bool = True,
     enforce_strict_linear_history: bool = True,
+    in_eagle_drafter: bool = False,
 ) -> LayerSubgraph:
     """
     Get the next model layer.
@@ -1381,6 +1488,14 @@ def get_layer_after_linear_node(
     def filter_condition(node: Node, dim: int) -> bool:
         if match_on_shapes:
             if is_any_lin_op(node):
+                if dim == -1:
+                    in_dim = node.meta["lin_node_shape"][dim]
+                    if in_dim == embd:
+                        return True
+                    if in_eagle_drafter and in_dim == 2 * embd:
+                        # Eagle drafts feed attention with 2h-wide q/k/v inputs.
+                        return any(is_any_attention_op(u) for u in node.users)
+                    return False
                 return node.meta["lin_node_shape"][dim] == embd
             return False
         else:
@@ -1438,9 +1553,10 @@ def get_layer_after_linear_node(
     start_lin_index -= 1
     terminating_linear_node = lin_nodes_in_subgraph[0]
 
-    # For backward pass, match embedding on dim=-1
+    # Backward pass to find the opening op
     backward_subgraph = subgraph(
-        sinks=[terminating_linear_node], boundary_condition=lambda n: boundary_condition(n, dim=-1)
+        sinks=[terminating_linear_node],
+        boundary_condition=lambda n: boundary_condition(n, dim=-1),
     )
 
     # Get all opening linear nodes

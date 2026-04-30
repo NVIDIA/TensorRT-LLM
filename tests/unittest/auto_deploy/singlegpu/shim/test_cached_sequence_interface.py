@@ -244,6 +244,52 @@ def test_initialize_resources_paged_only_creates_kv_cache_manager(paged_kv_cache
     assert not isinstance(interface.kv_cache_manager, MambaHybridCacheManager)
 
 
+def test_initialize_resources_incompatible_kv_layers_can_be_unmanaged(paged_kv_cache_config):
+    """Compatible layers are managed; incompatible ones may fall back to unmanaged buffers."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=paged_kv_cache_config,
+        requires_uniform_kv_caches=False,
+    )
+
+    managed_name = interface.add_resource(
+        "kv_cache_0",
+        KVPagedResourceHandler(8, 64, dtype=torch.float16, kv_layout="HND"),
+    )
+    unmanaged_name = interface.add_resource(
+        "kv_cache_1",
+        KVPagedResourceHandler(8, 80, dtype=torch.float16, kv_layout="HND"),
+    )
+
+    interface.initialize_resources()
+
+    assert managed_name not in interface._unmanaged_resources
+    assert unmanaged_name in interface._unmanaged_resources
+
+
+def test_initialize_resources_incompatible_kv_layers_raise_when_uniform_managed_caches_required(
+    paged_kv_cache_config,
+):
+    """Strict interface configurations reject mixed managed and unmanaged KV layouts."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=paged_kv_cache_config,
+        requires_uniform_kv_caches=True,
+    )
+
+    interface.add_resource("kv_cache_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_cache_1", KVPagedResourceHandler(8, 80, dtype=torch.float16))
+
+    with pytest.raises(RuntimeError):
+        interface.initialize_resources()
+
+
 def test_initialize_resources_mixed_creates_mamba_hybrid_cache_manager(paged_kv_cache_config):
     """Test mixed paged + state resources create MambaHybridCacheManager."""
     interface = CachedSequenceInterface(
@@ -785,6 +831,26 @@ def test_sequence_info_page_assignments():
         cache_loc[cu_num_pages[i] : cu_num_pages[i + 1]] for i in range(len(cu_num_pages) - 1)
     ]
     assert page_assignments == [[0], [1, 2]]
+
+
+def test_sequence_info_set_capture_batch_max_draft_len_gt_0_builds_extend_only_batch():
+    """max_draft_len > 0 should build the synthetic extend-only batch used by Eagle capture."""
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        tokens_per_block=32,
+    )
+
+    seq_info.set_capture_batch(batch_size=2, max_draft_len=3)
+
+    assert not seq_info.is_generate_only
+    assert seq_info.is_extend_only
+    assert seq_info.batch_info.get_num_sequences() == (0, 2, 0)
+    assert seq_info.batch_info.get_num_tokens() == (0, 8, 0)
+
+    input_ids = seq_info.get_arg("input_ids", truncate=True, unflatten=True)
+    assert tuple(input_ids.shape) == (2, 4)
 
 
 # =============================================================================
