@@ -16,10 +16,11 @@
 """Torch backend attention using pure PyTorch reference implementations."""
 
 import math
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 from torch._ops import OpOverloadPacket
+from torch._subclasses import FakeTensor
 from torch.fx import Node
 
 from ..._compat import KvCacheConfig
@@ -36,19 +37,6 @@ from ..attention_interface import (
     UnpagedResourceHandler,
 )
 from .torch_attention import repeat_kv
-
-
-def _get_node_shape_dtype(node: Node) -> Optional[Tuple[torch.Size, torch.dtype]]:
-    """Extract shape and dtype metadata from an FX node when available."""
-    val = node.meta.get("val")
-    if val is not None and hasattr(val, "shape") and hasattr(val, "dtype"):
-        return val.shape, val.dtype
-
-    tensor_meta = node.meta.get("tensor_meta")
-    if tensor_meta is not None and hasattr(tensor_meta, "shape") and hasattr(tensor_meta, "dtype"):
-        return tensor_meta.shape, tensor_meta.dtype
-
-    return None
 
 
 def _update_kv_cache(
@@ -652,46 +640,23 @@ class TorchBackendAttention(AttentionDescriptor):
     def get_cache_initializers(
         cls, source_attn_node: Node, cache_config: KvCacheConfig
     ) -> ResourceHandlerDict:
-        # Source op is [bsnd] layout already. Some graphs lose meta["val"] on V after
-        # post-load fusions, so fall back to other preserved metadata before failing.
-        k_meta = _get_node_shape_dtype(source_attn_node.args[1])
-        if k_meta is None:
-            raise RuntimeError(
-                "Missing shape metadata for K input when initializing torch backend KV cache: "
-                f"{source_attn_node.format_node()}"
-            )
-
-        v_meta = _get_node_shape_dtype(source_attn_node.args[2])
-        if v_meta is None:
-            source_meta = _get_node_shape_dtype(source_attn_node)
-            if source_meta is None:
-                raise RuntimeError(
-                    "Missing shape metadata for V input and attention output when initializing "
-                    f"torch backend KV cache: {source_attn_node.format_node()}"
-                )
-
-            ad_logger.warning(
-                "Falling back to attention output metadata for torch KV cache initialization "
-                "because the V input lost meta['val']."
-            )
-            v_meta = (torch.Size((*k_meta[0][:3], source_meta[0][-1])), source_meta[1])
-
-        k_shape, k_dtype = k_meta
-        v_shape, v_dtype = v_meta
-        num_kv_heads = k_shape[2]
-        k_head_dim = k_shape[3]
-        v_head_dim = v_shape[3]
+        # source op is [bsnd] layout already
+        k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
+        v_fake: FakeTensor = source_attn_node.args[2].meta["val"]
+        num_kv_heads = k_fake.shape[2]
+        k_head_dim = k_fake.shape[3]
+        v_head_dim = v_fake.shape[3]
 
         return {
             "k_cache": UnpagedResourceHandler(
                 num_kv_heads,
                 k_head_dim,
-                dtype=cls.resolve_cache_dtype(cache_config.dtype, k_dtype),
+                dtype=cls.resolve_cache_dtype(cache_config.dtype, k_fake.dtype),
             ),
             "v_cache": UnpagedResourceHandler(
                 num_kv_heads,
                 v_head_dim,
-                dtype=cls.resolve_cache_dtype(cache_config.dtype, v_dtype),
+                dtype=cls.resolve_cache_dtype(cache_config.dtype, v_fake.dtype),
             ),
         }
 

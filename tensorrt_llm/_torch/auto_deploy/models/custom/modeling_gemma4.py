@@ -1444,30 +1444,10 @@ class Gemma4TextModel(Gemma4TextPreTrainedModel):
 
     def get_per_layer_inputs(
         self,
-        input_ids: Optional[torch.LongTensor],
-        inputs_embeds: torch.Tensor,
+        input_ids: torch.LongTensor,
     ) -> Optional[torch.Tensor]:
         if self.embed_tokens_per_layer is None:
             return None
-
-        if input_ids is None:
-            # Compatibility path for direct-embedding callers. AutoDeploy serving uses
-            # input_ids, or explicit per_layer_inputs, so this reverse lookup is not
-            # part of CUDA graph replay.
-            with torch.no_grad():
-                input_ids = (
-                    (
-                        inputs_embeds[:, :, None, :]
-                        == self.embed_tokens.weight[None, None, :, :]
-                        * self.embed_tokens.embed_scale.to(
-                            device=inputs_embeds.device,
-                            dtype=inputs_embeds.dtype,
-                        )
-                    )
-                    .all(dim=3)
-                    .nonzero()[:, 2]
-                )
-                input_ids = input_ids.view(inputs_embeds.shape[:2])
 
         # The text serving path reaches this point with input_ids, so the token
         # remapping stays in fixed-shape device tensor ops with no CPU sync.
@@ -1536,7 +1516,14 @@ class Gemma4TextModel(Gemma4TextPreTrainedModel):
             inputs_embeds = cast(torch.Tensor, inputs_embeds)
 
         if per_layer_inputs is None:
-            per_layer_inputs = self.get_per_layer_inputs(input_ids, inputs_embeds)
+            if input_ids is None:
+                if self.embed_tokens_per_layer is not None:
+                    raise ValueError(
+                        "per_layer_inputs must be provided when using inputs_embeds with Gemma4 "
+                        "per-layer inputs"
+                    )
+            else:
+                per_layer_inputs = self.get_per_layer_inputs(input_ids)
         per_layer_inputs = self.project_per_layer_inputs(inputs_embeds, per_layer_inputs)
         pos_emb_global = self.rotary_emb_global(inputs_embeds, position_ids)
         pos_emb_local = self.rotary_emb_local(inputs_embeds, position_ids)

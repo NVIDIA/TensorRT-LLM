@@ -1877,7 +1877,7 @@ def test_e2b_like_double_wide_mlp_applies_to_shared_kv_tail():
     assert doubled_mlp.down_proj.weight.shape == (config.hidden_size, config.intermediate_size * 2)
 
 
-def test_e2b_like_inputs_embeds_preserve_per_layer_token_identity():
+def test_e2b_like_inputs_embeds_require_explicit_per_layer_inputs():
     device, dtype = _device_and_dtype()
     config = _small_e2b_text_config()
     model = Gemma4ForCausalLM(config).to(device=device, dtype=dtype).eval()
@@ -1886,15 +1886,8 @@ def test_e2b_like_inputs_embeds_preserve_per_layer_token_identity():
     position_ids = _position_ids(2, 6, device)
     inputs_embeds = model.model.embed_tokens(input_ids)
 
-    derived_per_layer_inputs = model.model.get_per_layer_inputs(None, inputs_embeds)
-    expected_per_layer_inputs = model.model.get_per_layer_inputs(input_ids, inputs_embeds)
-    torch.testing.assert_close(derived_per_layer_inputs, expected_per_layer_inputs)
-
-    with torch.no_grad():
-        logits_from_ids = model(input_ids=input_ids, position_ids=position_ids).logits
-        logits_from_embeds = model(inputs_embeds=inputs_embeds, position_ids=position_ids).logits
-
-    torch.testing.assert_close(logits_from_embeds, logits_from_ids, rtol=1e-4, atol=1e-4)
+    with pytest.raises(ValueError, match="per_layer_inputs must be provided"):
+        model(inputs_embeds=inputs_embeds, position_ids=position_ids)
 
 
 def test_e2b_like_explicit_per_layer_inputs_match_implicit_path():
@@ -1905,7 +1898,7 @@ def test_e2b_like_explicit_per_layer_inputs_match_implicit_path():
     input_ids = torch.randint(0, config.vocab_size, (2, 6), device=device)
     position_ids = _position_ids(2, 6, device)
     inputs_embeds = model.model.embed_tokens(input_ids)
-    per_layer_inputs = model.model.get_per_layer_inputs(input_ids, inputs_embeds)
+    per_layer_inputs = model.model.get_per_layer_inputs(input_ids)
 
     assert per_layer_inputs is not None
 
@@ -1976,7 +1969,7 @@ def test_e2b_like_conditional_wrapper_forwards_explicit_per_layer_inputs():
     input_ids = torch.randint(0, config.text_config.vocab_size, (2, 6), device=device)
     position_ids = _position_ids(2, 6, device)
     inputs_embeds = model.model.language_model.embed_tokens(input_ids)
-    per_layer_inputs = model.model.language_model.get_per_layer_inputs(input_ids, inputs_embeds)
+    per_layer_inputs = model.model.language_model.get_per_layer_inputs(input_ids)
 
     assert per_layer_inputs is not None
 

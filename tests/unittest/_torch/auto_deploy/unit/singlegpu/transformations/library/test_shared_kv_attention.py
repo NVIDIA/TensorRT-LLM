@@ -5,7 +5,6 @@ import pytest
 import torch
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
-from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
 from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import is_dynamic_cached_op
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention.flashinfer_attention import (
     FlashInferAttention,
@@ -268,28 +267,6 @@ def test_torch_backend_attention_metadata_for_shared_kv_node():
     assert TorchBackendAttention.get_layer_idx(shared) == 1
     assert TorchBackendAttention.get_shared_kv_source_layer_idx(regular) is None
     assert TorchBackendAttention.get_shared_kv_source_layer_idx(shared) == 0
-
-
-def test_torch_backend_attention_cache_init_falls_back_when_v_meta_val_missing():
-    module = _TinySharedKVModule().eval()
-    gm = torch_export_to_gm(module, (torch.randn(1, 4, 8),))
-    source_nodes = [
-        node
-        for node in gm.graph.nodes
-        if node.op == "call_function"
-        and node.target == torch.ops.auto_deploy.torch_attention.default
-    ]
-    regular = next(node for node in source_nodes if TorchBackendAttention.get_layer_idx(node) == 0)
-
-    regular.args[2].meta.pop("val", None)
-    cache_initializers = TorchBackendAttention.get_cache_initializers(
-        regular, KvCacheConfig(dtype="bfloat16")
-    )
-
-    assert cache_initializers["k_cache"].token_shape == (2, 4)
-    assert cache_initializers["v_cache"].token_shape == (2, 4)
-    assert cache_initializers["k_cache"].dtype == torch.bfloat16
-    assert cache_initializers["v_cache"].dtype == torch.bfloat16
 
 
 def test_flashinfer_backend_attention_metadata_for_shared_kv_node():

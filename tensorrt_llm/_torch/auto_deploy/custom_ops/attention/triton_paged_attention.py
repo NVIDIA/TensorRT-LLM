@@ -1289,43 +1289,6 @@ def triton_paged_context_with_custom_mask(
     return output
 
 
-def _torch_manual_context_no_cache_prefix(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    sm_scale: float,
-    sliding_window: Optional[int],
-    out: torch.Tensor,
-) -> None:
-    """Manual BF16-compatible context path for single-sequence no-prefix prefill."""
-    q_len, n_heads, head_dim = q.shape
-    n_kv_heads = k.shape[1]
-
-    q_ref = q.view(1, q_len, n_heads, head_dim).transpose(1, 2)
-    k_ref = k.view(1, q_len, n_kv_heads, head_dim).transpose(1, 2)
-    v_ref = v.view(1, q_len, n_kv_heads, head_dim).transpose(1, 2)
-
-    if n_heads != n_kv_heads:
-        repeat = n_heads // n_kv_heads
-        k_ref = k_ref.repeat_interleave(repeat, dim=1)
-        v_ref = v_ref.repeat_interleave(repeat, dim=1)
-
-    attn_scores = torch.matmul(q_ref, k_ref.transpose(-2, -1)) * sm_scale
-    mask = torch.triu(
-        torch.ones(q_len, q_len, device=q.device, dtype=torch.bool),
-        diagonal=1,
-    )
-
-    if sliding_window is not None and sliding_window > 0:
-        positions = torch.arange(q_len, device=q.device)
-        pos_diff = positions.unsqueeze(1) - positions.unsqueeze(0)
-        mask = mask | (pos_diff >= sliding_window)
-
-    attn_scores.masked_fill_(mask.view(1, 1, q_len, q_len), float("-inf"))
-    attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
-    attn_out = torch.matmul(attn_weights, v_ref).transpose(1, 2).reshape(q_len, n_heads, head_dim)
-    out.copy_(attn_out)
-
 
 @torch.library.custom_op("auto_deploy::triton_paged_prepare_metadata", mutates_args=())
 def prepare_triton_paged_metadata(
@@ -1433,24 +1396,7 @@ def triton_paged_mha_with_cache(
         cu_seqlen = cu_seqlen_host[: num_prefill + 1].to(q.device, non_blocking=True)
         seq_len_with_cache = seq_len_with_cache_host[:num_prefill].to(q.device, non_blocking=True)
         has_custom_attn_mask = custom_attn_mask is not None and custom_attn_mask.numel() > 0
-        use_manual_context = (
-            not read_cache_only
-            and not has_custom_attn_mask
-            and num_prefill == 1
-            and int(seq_len_with_cache_host[0]) == num_prefill_tokens
-            and int(cu_seqlen_host[0]) == 0
-            and int(cu_seqlen_host[1]) == num_prefill_tokens
-        )
-        if use_manual_context:
-            _torch_manual_context_no_cache_prefix(
-                q[:num_prefill_tokens],
-                k[:num_prefill_tokens],
-                v[:num_prefill_tokens],
-                sm_scale,
-                sliding_window,
-                y[:num_prefill_tokens],
-            )
-        elif has_custom_attn_mask:
+        if has_custom_attn_mask:
             triton_paged_context_with_custom_mask(
                 q[:num_prefill_tokens],
                 kv_cache,

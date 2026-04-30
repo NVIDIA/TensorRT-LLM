@@ -753,8 +753,8 @@ class TestTritonPagedMHAIntegration:
         assert not torch.isnan(output).any(), "Output contains NaN"
         assert not torch.isinf(output).any(), "Output contains Inf"
 
-    def test_manual_context_fallback_honors_out_buffer(self):
-        """The single-sequence context fallback must write through out= exactly."""
+    def test_context_prefill_honors_out_buffer(self):
+        """The generic context prefill path must write through out= exactly."""
         from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
             triton_paged_mha_with_cache,
         )
@@ -845,7 +845,7 @@ class TestTritonPagedMHAIntegration:
 
         assert returned.numel() == 0
         torch.testing.assert_close(out[:, :seq_len], expected_from_op[:, :seq_len])
-        torch.testing.assert_close(out[:, :seq_len], expected)
+        torch.testing.assert_close(out[:, :seq_len].float(), expected.float(), rtol=1e-2, atol=1e-2)
         torch.testing.assert_close(out[:, seq_len:], torch.zeros_like(out[:, seq_len:]))
 
     def test_batch_info_with_extend_requests(self):
