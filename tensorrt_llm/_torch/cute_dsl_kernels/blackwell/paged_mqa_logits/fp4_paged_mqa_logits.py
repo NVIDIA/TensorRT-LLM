@@ -995,6 +995,16 @@ class FP4MQALogitsKernel:
         # because math warps are the last TMEM consumers (epilogue reads).
         tmem_alloc_num_threads = 320  # 10 warps: warp 0-7 (math) + warp 10-11 (umma)
         tmem_alloc_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=tmem_alloc_num_threads)
+        # SFB (Q SF) cross-warp TMEM-write visibility:
+        # umma_warp_0 owns the SMEM transpose + s2t copy of SF Q into TMEM SFB
+        # on every q_idx transition; umma_warp_1's MMA reads the same SFB TMEM
+        # region. consumer_wait on the Q pipeline only orders TMA→SMEM, not the
+        # cross-warp TMEM write. Without this barrier, umma_warp_1 can fire its
+        # MMA before umma_warp_0's s2t lands, reading stale SFB from the prior
+        # batch — the source of B>1 numerical mismatches at large ctx + next_n.
+        # 64 threads = 32 (umma_warp_0) + 32 (umma_warp_1). DeepGEMM avoids this
+        # entirely by issuing both groups' UMMAs from a single UMMA warp.
+        sfb_sync_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=64)
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf,
             barrier_for_retrieve=tmem_alloc_barrier,
@@ -1494,6 +1504,11 @@ class FP4MQALogitsKernel:
                         )
                         tCtSFB_s2t = thr_copy_s2t_sfb.partition_D(tCtSFB_compact)
                         cute.copy(tiled_copy_s2t_sfb, tCsSFB_s2t, tCtSFB_s2t)
+                        # Make SFB TMEM write visible to umma_warp_1 before its
+                        # MMA reads the same SFB region. fence orders the async
+                        # s2t; barrier crosses the warp boundary.
+                        cute.arch.fence_view_async_tmem_store()
+                        sfb_sync_barrier.arrive_and_wait()
 
                     # Process KV block for group 0 (kv_idx + 0)
                     # Unconditional UMMA (like DeepGEMM): OOB iterations
@@ -1558,6 +1573,16 @@ class FP4MQALogitsKernel:
                     umma_pipeline_0.producer_commit(umma_prod_state_0)
                     umma_prod_state_0.advance()
 
+                    # Per-iter sync with umma_warp_1: SFB TMEM is a single
+                    # region (no staging). Without this, warp 0 can race
+                    # ahead and overwrite SFB at the next q transition while
+                    # warp 1's previous-batch MMA is still reading the old
+                    # SFB. DeepGEMM avoids this implicitly via single-warp
+                    # ordering. arrive_and_wait here lock-steps the two UMMA
+                    # warps every tile so the next transition's s2t cannot
+                    # land before warp 1's previous MMA has committed.
+                    sfb_sync_barrier.arrive_and_wait()
+
                     # Advance: inline fetch_next_task
                     next_kv_idx = kv_idx + NUM_MATH_WG
                     if next_kv_idx >= num_kv:
@@ -1617,8 +1642,12 @@ class FP4MQALogitsKernel:
                         q_pipeline.consumer_wait(q_cons_state_umma_1)
                         q_stage_1 = q_cons_state_umma_1.index
                         # Step 5.6: UMMA warp 1 does NOT re-issue UTCCP_SF_Q —
-                        # warp 0 owns it (same Q, same SFB TMEM region). The
-                        # consumer_wait already enforces visibility ordering.
+                        # warp 0 owns it (same Q, same SFB TMEM region). But
+                        # consumer_wait only orders TMA→SMEM Q; warp 0's s2t to
+                        # TMEM SFB is a separate cross-warp dependency. Sync
+                        # with warp 0 so its SFB write is visible before our
+                        # MMA reads it.
+                        sfb_sync_barrier.arrive_and_wait()
 
                     # Process KV block for group 1 (kv_idx + 1)
                     # Unconditional UMMA (like DeepGEMM)
@@ -1675,6 +1704,12 @@ class FP4MQALogitsKernel:
 
                     umma_pipeline_1.producer_commit(umma_prod_state_1)
                     umma_prod_state_1.advance()
+
+                    # Per-iter sync with umma_warp_0 — see umma_warp_0 for
+                    # rationale. Lock-steps the two UMMA warps every tile so
+                    # warp 0 cannot overwrite SFB while warp 1's MMA is still
+                    # reading it.
+                    sfb_sync_barrier.arrive_and_wait()
 
                     # Advance: inline fetch_next_task
                     next_kv_idx = kv_idx + NUM_MATH_WG
