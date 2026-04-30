@@ -448,7 +448,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # Build constraints and typical_step for better pool ratio.
         max_batch_size = self.max_batch_size
         max_seq_len = self.max_seq_len
-        max_input_len = self._max_input_len
         max_num_tokens = self._max_num_tokens
         max_draft_len = self._max_draft_len
 
@@ -457,32 +456,29 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # the typical step. An all-generation typical_step over-provisions the
         # compressed-cache pool at the expense of the SWA pool, starving the
         # SWA pool and artificially capping the achievable batch size.
+        ctx_capacity = max_num_tokens if max_num_tokens is not None else max_seq_len
         typical_step = BatchDesc(
             kv_caches=[
-                KVCacheDesc(capacity=max_seq_len, history_length=0),
+                KVCacheDesc(capacity=ctx_capacity, history_length=0),
             ]
             + [KVCacheDesc(capacity=max_seq_len, history_length=max_seq_len - max_draft_len - 1)]
             * (max_batch_size - 1),
         )
 
         constraints = []
-        # Constraint 1: one context request at max_seq_len, this case is used in warmup stage.
-        # max_draft_len is already included in max_seq_len, so no need to add it again.
-        constraints.append(BatchDesc([KVCacheDesc(capacity=max_seq_len, history_length=0)]))
+        # Constraint 1: cuda graph generation warmup — one decode request that has
+        # accumulated to the tail of max_seq_len. Using history_length=max_seq_len-1
+        # (instead of 0) lets SWA / SSM pools collapse to their windowed working set,
+        # while full-cache pools still need max_seq_len/tokens_per_block blocks
+        # because they don't age.
+        constraints.append(
+            BatchDesc([KVCacheDesc(capacity=max_seq_len, history_length=max_seq_len - 1)])
+        )
 
-        # Constraint 2: when user given max_input_len and max_num_tokens, we can build constraints for context requests.
-        if max_input_len is not None and max_num_tokens is not None:
-            # There are at most max_batch_size generation requests, and each generation request consumes
-            # (max_draft_len + 1) tokens, so the remaining tokens are for context requests.
-            max_context_tokens = max_num_tokens - max_batch_size * (max_draft_len + 1)
-            if max_context_tokens > 0:
-                max_num_context = min(max_context_tokens // max_input_len, max_batch_size)
-                constraints.append(
-                    BatchDesc(
-                        [KVCacheDesc(capacity=max_input_len + max_draft_len + 1, history_length=0)]
-                        * max_num_context
-                    )
-                )
+        # Constraint 2: general / chunked-prefill warmup — one fresh context request
+        # at max_num_tokens (the per-iteration token budget).
+        if max_num_tokens is not None:
+            constraints.append(BatchDesc([KVCacheDesc(capacity=max_num_tokens, history_length=0)]))
 
         return KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,
