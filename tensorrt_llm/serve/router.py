@@ -427,7 +427,9 @@ class Router(ABC):
         '''Select server by request and return some intermediate information, exclude_server is a server to exclude from the selection'''
 
     @abstractmethod
-    async def finish_request(self, request: OpenAIRequest):
+    async def finish_request(self,
+                             request: OpenAIRequest,
+                             session: Optional[aiohttp.ClientSession] = None):
         pass
 
     @property
@@ -672,8 +674,10 @@ class RoundRobinRouter(Router):
                     )
         return server, {"server_info": self._server_info.get(server, {})}
 
-    async def finish_request(self, request: OpenAIRequest):
-        pass
+    async def finish_request(self,
+                             request: OpenAIRequest,
+                             session: Optional[aiohttp.ClientSession] = None):
+        del request, session
 
 
 class LoadBalancingRouter(LoadBalancingMixin, Router):
@@ -813,20 +817,15 @@ class BlockHashMixin:
                           if len(token_lists) > 1 else token_lists[0])
         return token_lists
 
-    async def _get_server_hash_algo(self, server: str) -> str:
-        server_info = self._server_info.get(server, {})
-        hash_algo = server_info.get("kv_cache_hash_algo")
-        return await self._server_state[server].get_hash_algo(hash_algo)
-
     def _compute_block_hashes(
             self,
             token_lists: list[list[int]],
             hash_algo: str = KV_CACHE_HASH_ALGO_DEFAULT
     ) -> list[list[BlockHash]]:
         if hash_algo == KV_CACHE_HASH_ALGO_V1:
-            pass
+            block_hasher = block_key_hasher
         elif hash_algo == KV_CACHE_HASH_ALGO_V2:
-            pass
+            block_hasher = v2_sha256_block_hasher
         elif hash_algo == KV_CACHE_HASH_ALGO_V2_SHA256_64:
             block_hashes: list[list[BlockHash]] = []
             for token_list in token_lists:
@@ -846,17 +845,12 @@ class BlockHashMixin:
         block_hashes: list[list[BlockHash]] = []
         for token_list in token_lists:
             hash_list = []
-            parent_hash = None
-            # In KV cache managers, the last token is not included in the block key.
+            # in KvCacheManager, the last token is not included in the block key
             for t in range(0, len(token_list) - 1, self._tokens_per_block):
                 t_end = min(t + self._tokens_per_block, len(token_list) - 1)
-                if hash_algo == KV_CACHE_HASH_ALGO_V2:
-                    parent_hash = v2_sha256_block_hasher(
-                        token_list[t:t_end], parent_hash)
-                else:
-                    parent_hash = block_key_hasher(token_list[t:t_end],
-                                                   parent_hash)
-                hash_list.append(parent_hash)
+                hash_list.append(
+                    block_hasher(token_list[t:t_end],
+                                 None if t == 0 else hash_list[-1]))
             block_hashes.append(hash_list)
         return block_hashes
 
@@ -920,17 +914,20 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                                        self._tokens_per_block,
                                        lambda: self.session)
 
+    async def _get_server_hash_algo(self, server: str) -> str:
+        server_info = self._server_info.get(server, {})
+        hash_algo = server_info.get("kv_cache_hash_algo")
+        return await self._server_state[server].get_hash_algo(hash_algo)
+
     async def get_next_server(
             self,
             request: OpenAIRequest,
             exclude_server: Optional[str] = None) -> tuple[str, dict]:
-        self._validate_servers_available()
-
         async with self._lock:
-            servers = [
+            servers = list([
                 server for server in self._server_state.keys()
                 if server != exclude_server
-            ]
+            ])
             if not servers:
                 raise ValueError(
                     f"No available servers after excluding {exclude_server}")
@@ -1453,7 +1450,10 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
 
         return server, {"server_info": self._server_info.get(server, {})}
 
-    async def finish_request(self, request: OpenAIRequest):
+    async def finish_request(self,
+                             request: OpenAIRequest,
+                             session: Optional[aiohttp.ClientSession] = None):
+        del session
         async with self._lock:
             server = await self._unregister_request(request)
             self._remove_content_load(server, request)

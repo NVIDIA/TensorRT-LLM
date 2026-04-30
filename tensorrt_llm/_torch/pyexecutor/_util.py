@@ -249,8 +249,7 @@ class KvCacheCreator:
             self._kv_cache_config,
             is_disagg=self._is_disagg,
             cache_transceiver_config=self._cache_transceiver_config)
-        cls = self._fallback_if_unsupported_kv_cache_manager_v2(
-            cls, model_engine.model.model_config)
+        self._warn_if_unsupported_kv_cache_manager_v2(cls)
         # The V1-route hybrid mamba managers (disagg, TRTLLM_USE_CPP_MAMBA,
         # TRTLLM_USE_PY_MAMBA, or one-model speculative decoding) keep mamba
         # state in a separate cache that doesn't honor block reuse. Warn at
@@ -268,36 +267,14 @@ class KvCacheCreator:
                 )
         return cls
 
-    def _fallback_if_unsupported_kv_cache_manager_v2(
-            self,
-            kv_cache_manager_cls,
-            model_config: Optional[ModelConfig] = None):
+    def _warn_if_unsupported_kv_cache_manager_v2(self, kv_cache_manager_cls):
         if kv_cache_manager_cls == KVCacheManagerV2:
             if self._kv_connector_manager is not None or (
                     self._max_beam_width is not None
-                    and self._max_beam_width > 1
-            ) or (
-                    self._cache_transceiver_config is not None
-                    and self._cache_transceiver_config.backend is not None):
-                # Per-layer head_dim models (e.g., Gemma4 hybrid) require V2's
-                # split-pool layout. KVCacheManager (V1) coerces head_dim list
-                # to max(head_dim), changing per-layer KV byte sizes — which
-                # breaks correctness, not just efficiency. Fail fast here
-                # rather than silently producing wrong outputs.
-                if (model_config is not None
-                        and is_gemma4_hybrid(model_config.pretrained_config)):
-                    raise NotImplementedError(
-                        "Gemma4 hybrid attention requires KVCacheManagerV2, "
-                        "which is not yet supported with kv_connector_manager, "
-                        "beam_width > 1, or "
-                        "cache_transceiver. Disable these features to run "
-                        "Gemma4 hybrid models.")
+                    and self._max_beam_width > 1):
                 logger.warning(
-                    "KVCacheManagerV2 is not supported with kv_connector_manager, beam width > 1, "
-                    "or cache transceiver. Falling back to KVCacheManager."
+                    "KVCacheManagerV2 is not supported with kv_connector_manager or beam width > 1."
                 )
-                return KVCacheManager
-        return kv_cache_manager_cls
 
     def _per_manager_cache_cost(self, manager_cls, model_config,
                                 **extra_kwargs) -> CacheCost:
@@ -896,8 +873,8 @@ class KvCacheCreator:
             effective_draft_config,
             self._kv_cache_config,
             is_disagg=self._is_disagg)
-        draft_kv_cache_manager_cls = self._fallback_if_unsupported_kv_cache_manager_v2(
-            draft_kv_cache_manager_cls, effective_draft_config)
+        self._warn_if_unsupported_kv_cache_manager_v2(
+            draft_kv_cache_manager_cls)
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         # For MTP with models using sparse attention (e.g., DeepSeek V3 with DSA),
