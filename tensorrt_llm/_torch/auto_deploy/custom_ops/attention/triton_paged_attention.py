@@ -1093,10 +1093,8 @@ def triton_paged_context(
     # Normalize sliding_window for kernel constexpr: None/non-positive → 0
     sw = sliding_window if isinstance(sliding_window, int) and sliding_window > 0 else 0
 
-    # Keep the large-head-dim SDPA workaround only on Blackwell. Hopper's native
-    # paged context path supports HEAD_DIM=512 and avoids the gather fallback for
-    # short prefill chunks.
-    large_head_dim = head_dim > 256 and torch.cuda.get_device_capability(q.device) >= (10, 0)
+    # Use SDPA for large head dims to avoid paged-kernel tl.dot restrictions.
+    large_head_dim = head_dim > 256
     # SDPA reshape requires all sequences to have the same q_len (since q is
     # packed as [total_tokens, ...] and we reshape to [num_seq, max_q_len, ...]).
     # Check without GPU sync: sum(q_len_i) == num_seq * max_q_len iff all equal.

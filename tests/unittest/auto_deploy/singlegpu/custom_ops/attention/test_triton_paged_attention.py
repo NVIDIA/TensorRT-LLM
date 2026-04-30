@@ -1601,10 +1601,10 @@ class TestSDPADispatch:
     @pytest.mark.parametrize("batch_size", [1, 2])
     @pytest.mark.parametrize("n_heads,n_kv_heads", [(4, 4), (8, 2)])
     @pytest.mark.parametrize("seq_len", [64, 512])
-    def test_large_head_dim_context_matches_reference(
+    def test_large_head_dim_forces_sdpa(
         self, batch_size: int, n_heads: int, n_kv_heads: int, seq_len: int
     ):
-        """head_dim > 256 should match reference regardless of dispatch path."""
+        """head_dim > 256 should force the SDPA path and match reference."""
         head_dim = 512
         seq_lens = [seq_len] * batch_size
 
@@ -1679,8 +1679,7 @@ class TestSDPADispatch:
     def test_large_head_dim_context_respects_cache_prefix_and_page_tail(self):
         """Large-head-dim context must honor true KV length and cache prefix.
 
-        On Hopper this exercises the native paged kernel. On Blackwell it also
-        protects the large-head-dim SDPA workaround path.
+        This protects the large-head-dim SDPA path for a cache-prefix context.
         """
         from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
             triton_paged_context,

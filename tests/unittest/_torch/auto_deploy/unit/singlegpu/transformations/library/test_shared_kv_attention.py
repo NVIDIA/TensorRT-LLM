@@ -514,6 +514,105 @@ def test_triton_paged_shared_kv_cached_attention_reads_aliased_cache_without_wri
 
 
 @torch.no_grad()
+def test_triton_paged_shared_kv_prefill_sdpa_reads_aliased_cache_without_writing():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for triton_paged shared-KV SDPA runtime coverage")
+
+    from unittest.mock import patch
+
+    device = torch.device("cuda")
+    dtype = torch.float16
+    seq_len = 512
+    page_size = 32
+    num_pages = seq_len // page_size
+    n_heads = 4
+    n_kv_heads = 2
+    head_dim = 64
+
+    torch.manual_seed(0)
+    q = torch.randn(1, seq_len, n_heads, head_dim, dtype=dtype, device=device)
+    dummy_k = torch.full((1, seq_len, n_kv_heads, head_dim), 7.0, dtype=dtype, device=device)
+    dummy_v = torch.full((1, seq_len, n_kv_heads, head_dim), -3.0, dtype=dtype, device=device)
+    owner_k = torch.randn(1, seq_len, n_kv_heads, head_dim, dtype=dtype, device=device)
+    owner_v = torch.randn(1, seq_len, n_kv_heads, head_dim, dtype=dtype, device=device)
+
+    kv_cache = torch.zeros(
+        (num_pages, 2, n_kv_heads, page_size, head_dim), dtype=dtype, device=device
+    )
+    owner_k_pages = owner_k[0].view(num_pages, page_size, n_kv_heads, head_dim)
+    owner_v_pages = owner_v[0].view(num_pages, page_size, n_kv_heads, head_dim)
+    kv_cache[:, 0] = owner_k_pages.permute(0, 2, 1, 3)
+    kv_cache[:, 1] = owner_v_pages.permute(0, 2, 1, 3)
+    kv_cache_before = kv_cache.clone()
+    owner_write_cache = torch.zeros_like(kv_cache)
+
+    batch_info_host = BatchInfo()
+    batch_info_host.update([1, seq_len, 0, 0, 0, 0])
+    cu_seqlen_host = torch.tensor([0, seq_len], dtype=torch.int32)
+    cu_num_pages = torch.tensor([0, num_pages], dtype=torch.int32, device=device)
+    cu_num_pages_host = torch.tensor([0, num_pages], dtype=torch.int32)
+    cache_loc = torch.arange(num_pages, dtype=torch.int32, device=device)
+    last_page_len = torch.tensor([page_size], dtype=torch.int32, device=device)
+    last_page_len_host = torch.tensor([page_size], dtype=torch.int32)
+    seq_len_with_cache_host = torch.tensor([seq_len], dtype=torch.int32)
+    batch_indices = torch.zeros(seq_len, dtype=torch.int32, device=device)
+    positions = torch.arange(seq_len, dtype=torch.int32, device=device)
+
+    sdpa_calls = 0
+    original_sdpa = torch.nn.functional.scaled_dot_product_attention
+
+    def tracking_sdpa(*args, **kwargs):
+        nonlocal sdpa_calls
+        sdpa_calls += 1
+        return original_sdpa(*args, **kwargs)
+
+    with patch.object(torch.nn.functional, "scaled_dot_product_attention", tracking_sdpa):
+        output = torch.ops.auto_deploy.triton_paged_mha_with_cache(
+            q,
+            dummy_k,
+            dummy_v,
+            batch_info_host.serialize(),
+            cu_seqlen_host,
+            cu_num_pages,
+            cu_num_pages_host,
+            cache_loc,
+            last_page_len,
+            last_page_len_host,
+            seq_len_with_cache_host,
+            batch_indices,
+            positions,
+            kv_cache,
+            None,
+            None,
+            True,
+        )
+        expected = torch.ops.auto_deploy.triton_paged_mha_with_cache(
+            q,
+            owner_k,
+            owner_v,
+            batch_info_host.serialize(),
+            cu_seqlen_host,
+            cu_num_pages,
+            cu_num_pages_host,
+            cache_loc,
+            last_page_len,
+            last_page_len_host,
+            seq_len_with_cache_host,
+            batch_indices,
+            positions,
+            owner_write_cache,
+            None,
+            None,
+            False,
+        )
+
+    assert sdpa_calls == 2
+    torch.testing.assert_close(kv_cache, kv_cache_before, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(owner_write_cache, kv_cache_before, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(output.float(), expected.float(), rtol=1e-2, atol=1e-2)
+
+
+@torch.no_grad()
 def test_torch_shared_kv_cached_attention_supports_out_buffer():
     q = torch.randn(1, 3, 2, 4)
     k = torch.randn(1, 3, 1, 4)
