@@ -1229,6 +1229,12 @@ class PyTorchModelEngine(ModelEngine):
         if requests is None:
             return None
 
+        def free_warmup_requests() -> None:
+            for r in requests:
+                kv_cache_manager.free_resources(r)
+                if draft_kv_cache_manager is not None:
+                    draft_kv_cache_manager.free_resources(r)
+
         # Add one dummy request with the maximum possible sequence length.
         max_seq_len = min(
             self.max_seq_len if max_seq_len is None else max_seq_len,
@@ -1247,11 +1253,13 @@ class PyTorchModelEngine(ModelEngine):
                 max_num_draft_tokens=draft_len)
             available_tokens = min(available_tokens, draft_available_tokens)
 
-        token_num = max(
-            1,
-            min(
-                available_tokens, max_seq_len - 1 -
-                get_num_extra_kv_tokens(self.spec_config) - draft_len))
+        token_num = min(
+            available_tokens, max_seq_len - 1 -
+            get_num_extra_kv_tokens(self.spec_config) - draft_len)
+        if token_num <= 0:
+            free_warmup_requests()
+            return None
+        token_num = max(1, token_num)
         model_config = self.model.model_config.pretrained_config
         max_position_embeddings = getattr(model_config,
                                           'max_position_embeddings', None)
@@ -1274,8 +1282,7 @@ class PyTorchModelEngine(ModelEngine):
             draft_kv_cache_manager=draft_kv_cache_manager)
 
         if max_seq_len_request is None:
-            for r in requests:
-                kv_cache_manager.free_resources(r)
+            free_warmup_requests()
             return None
         else:
             max_seq_len_request = max_seq_len_request[0]

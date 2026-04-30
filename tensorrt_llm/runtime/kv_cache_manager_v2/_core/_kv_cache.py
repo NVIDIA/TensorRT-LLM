@@ -757,8 +757,12 @@ class _KVCache:
             seq_block.tree_block = tree_block
             assert self._get_tree_block(ordinal) is tree_block
             self._num_committed_blocks = BlockOrdinal(ordinal + 1)
+            event_manager = self.manager.event_manager
+            if event_manager is not None:
+                event_manager.add_stored_block_event_from_block(tree_block)
         elif tree_block.is_full and self.manager.allow_seq_rebasing:
-            # try to replace our pages with pages from the existing block.
+            # Happens when a concurrent request committed the same tokens before us.
+            # Try to replace our pages with pages from the existing block to save memory.
             reuse_list = list[tuple[LifeCycleId, CommittedPage]]()
             for lc in typed_range(typed_len(beam_block)):
                 if lc == ssm_lc_id:
@@ -772,6 +776,9 @@ class _KVCache:
                     page = cast(UncommittedPage, cast(_SharedPageLock, beam_block[lc]).page)
                     beam_block[lc] = None
                     p = page.convert_to_committed(tree_block)
+                    event_manager = self.manager.event_manager
+                    if event_manager is not None:
+                        event_manager.add_stored_life_cycle_event_from_block(tree_block, int(lc))
                     # The page comes from uncommitted page of self, so safe to skip wait.
                     beam_block[lc] = (
                         p.lock(self, beam_idx, ordinal, lc, skip_wait=True) if locked else p.hold()
