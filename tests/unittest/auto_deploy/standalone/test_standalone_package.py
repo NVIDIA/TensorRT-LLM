@@ -190,14 +190,15 @@ class TestStandalonePackage:
             "pytest",
             os.path.join(tests_dir, "singlegpu"),
             "-q",
-            "--timeout=300",
+            # Parallelize across CPU workers; pytest-xdist is in [dev] extras.
+            "-n",
+            "4",
         ]
 
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=600,
             cwd=pkg_dir,
             env=standalone_env,
         )

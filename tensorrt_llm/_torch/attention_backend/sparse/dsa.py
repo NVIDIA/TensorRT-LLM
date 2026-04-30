@@ -1123,6 +1123,13 @@ class Indexer(nn.Module):
             cute_dsl_custom_ops.warmup_cute_dsl_indexer_topk(
                 dtype=torch.float32, top_k=self.index_topk)
 
+        if self._enable_heuristic_topk and layer_idx == 0:
+            # Populate static caches (sm_count, L2 cache size) inside the C++
+            # Scheme X dispatcher before any CUDA Graph capture so the host
+            # attribute queries do not end up frozen into a captured graph.
+            from tensorrt_llm._torch.custom_ops import cpp_custom_ops
+            cpp_custom_ops.warmup_heuristic_topk_decode(top_k=self.index_topk)
+
     def post_load_weights(self):
         """Fuse wk + weights_proj into single FP32 weight for cuBLAS GEMM (TF32 on Ampere+)."""
         # wk: [head_dim, hidden_size] + weights_proj: [n_heads, hidden_size]

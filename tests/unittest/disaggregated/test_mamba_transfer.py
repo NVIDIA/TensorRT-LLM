@@ -38,7 +38,7 @@ NUM_MAMBA_LAYERS = 4
 MAMBA_D_STATE = 16
 MAMBA_D_CONV = 4
 MAMBA_NUM_HEADS = 4
-MAMBA_N_GROUPS = 1
+MAMBA_N_GROUPS = 4  # divisible by all tested TP sizes; satisfies nheads % ngroups == 0
 MAMBA_HEAD_DIM = 64
 MAX_BATCH_SIZE = 4
 REQUEST_LENGTHS = [16, 32]

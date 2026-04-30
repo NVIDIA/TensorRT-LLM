@@ -404,12 +404,6 @@ class PyExecutor:
             self.enable_kv_cache_reuse
             and self.kv_cache_manager.enable_partial_reuse)
 
-        self.adp_router: ADPRouter = ADPRouter.create(
-            dist=self.dist,
-            kv_cache_manager=self.kv_cache_manager,
-            attention_dp_config=self.llm_args.attention_dp_config,
-        )
-
         self.max_input_len = max_input_len
         # _executor_loop private data
         self.max_num_active_requests = model_engine.get_max_num_sequences()
@@ -417,10 +411,28 @@ class PyExecutor:
         self.expected_num_active_requests = 0
         # TODO: Remove the condition on the PP size once disagg support from KVCache reuse
         # path is fixed.
+        # Buffer for responses generated inside _end_transfer_and_maybe_terminate.
+        # With ADP, _enqueue_responses does a tp_gather collective.  When called
+        # from _send_kv_async the owning DP rank has a response but the other
+        # rank does not, causing a collective mismatch deadlock.  Buffering the
+        # responses and flushing them at a synchronised point in the executor
+        # loop avoids the mismatch.
+        self._pending_transfer_responses: List[Tuple[int, LlmResponse]] = []
+
         self.async_transfer_manager = AsyncTransferManager(
             self.resource_manager,
             should_store_blocks=self.enable_partial_reuse_for_disagg
             and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1)
+
+        # Router is built after async_transfer_manager so KVCacheAwareADPRouter
+        # can receive the transfer-manager reference at construction time.
+        self.adp_router: ADPRouter = ADPRouter.create(
+            dist=self.dist,
+            kv_cache_manager=self.kv_cache_manager,
+            attention_dp_config=self.llm_args.attention_dp_config,
+            async_transfer_manager=self.async_transfer_manager,
+        )
+
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
@@ -637,7 +649,15 @@ class PyExecutor:
             response = request.create_response(False, self.dist.rank)
             if response:
                 response.result.cached_tokens = request.cached_tokens
-                self._enqueue_responses([(request.py_request_id, response)])
+                # Buffer the response instead of enqueueing immediately.
+                # With ADP, _enqueue_responses does a tp_gather collective.
+                # Calling it here would deadlock because only the owning DP
+                # rank reaches this point; the other DP rank never enters
+                # the matching collective.  The buffer is flushed later at
+                # _flush_pending_transfer_responses where all ranks
+                # participate.
+                self._pending_transfer_responses.append(
+                    (request.py_request_id, response))
             if self.async_transfer_manager.end_transfer(request):
                 self.active_requests.remove(request)
                 self._terminate_request(request)
@@ -649,6 +669,20 @@ class PyExecutor:
             # termination to avoid double free_resources calls.
             if not self.async_transfer_manager.should_store_blocks:
                 self._terminate_request(request)
+
+    def _flush_pending_transfer_responses(self):
+        """Enqueue buffered transfer-completion responses.
+
+        Must be called at a point where ALL DP ranks execute in lockstep so
+        that the tp_gather inside _enqueue_responses does not deadlock.
+        """
+        responses = self._pending_transfer_responses
+        self._pending_transfer_responses = []
+        if responses or self.enable_attention_dp:
+            # Even when this rank has no responses we must participate in the
+            # collective when ADP is enabled so that the other rank's gather
+            # can complete.
+            self._enqueue_responses(responses)
 
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
@@ -1798,6 +1832,7 @@ class PyExecutor:
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
+                self._flush_pending_transfer_responses()
                 self._handle_canceled_requests()
 
                 finished_requests = self._handle_responses()
@@ -2272,6 +2307,7 @@ class PyExecutor:
                     self._update_requests(sample_state, self.resource_manager)
 
                     self._send_kv_async(scheduled_batch.all_requests())
+                    self._flush_pending_transfer_responses()
 
                     self._handle_canceled_requests()
                     finished_requests = self._handle_responses()
@@ -2518,6 +2554,11 @@ class PyExecutor:
 
                     self._send_kv_async(
                         self.previous_batch.scheduled_requests.all_requests())
+
+                # Flush outside the conditional so that all DP ranks
+                # participate in the tp_gather collective even when
+                # should_process_previous_batch differs between ranks.
+                self._flush_pending_transfer_responses()
 
                 if self.drafter is not None and self.use_spec_decode and should_process_previous_batch:
                     # Cleanup previous draft resources used in the draft model
@@ -2825,6 +2866,7 @@ class PyExecutor:
             # extra allgather. When introducing new router implementations
             # (e.g. KV-cache-aware) that need new_requests to gather additional
             # info, the allgather position may need to be revisited.
+
             all_rank_states = self.adp_router.gather_all_rank_states(
                 active_requests)
             all_ranks_num_active_requests = [

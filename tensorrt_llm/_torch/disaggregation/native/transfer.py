@@ -193,6 +193,12 @@ class KVSendTask(SendTaskBase):
 
 
 class Sender(SenderBase):
+    # Time-to-live for orphaned RecvReqInfo entries (seconds).
+    # In gen-first ADP broadcast, non-assigned DP ranks accumulate
+    # RecvReqInfo that never gets consumed.  Entries older than this
+    # are evicted during periodic sweeps.
+    _STALE_REQ_INFO_TTL_S = 120.0
+
     def __init__(
         self,
         peer_registrar: PeerRegistrar,
@@ -202,6 +208,7 @@ class Sender(SenderBase):
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
         self._peer_requests: dict = {}
+        self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
         self._messenger = ZMQMessenger(mode="ROUTER")
         self._dealers = {}
@@ -235,6 +242,7 @@ class Sender(SenderBase):
         with self._peer_requests_lock:
             if unique_rid not in self._peer_requests:
                 self._peer_requests[unique_rid] = {}
+                self._peer_requests_timestamps[unique_rid] = time.monotonic()
             self._peer_requests[unique_rid][instance_rank] = req_info
 
     def _is_req_ready(self, unique_rid: int, expected_count: int) -> bool:
@@ -258,6 +266,30 @@ class Sender(SenderBase):
     def _remove_req_info(self, unique_rid: int):
         with self._peer_requests_lock:
             self._peer_requests.pop(unique_rid, None)
+            self._peer_requests_timestamps.pop(unique_rid, None)
+
+    def sweep_stale_req_infos(self):
+        """Evict RecvReqInfo entries that have no matching TxSession and exceed the TTL.
+
+        Called opportunistically from the listener thread when a new REQUEST_DATA
+        arrives. With gen-first ADP broadcast, non-assigned DP ranks accumulate
+        entries that are never consumed; this sweep prevents unbounded growth.
+        """
+        now = time.monotonic()
+        with self._peer_requests_lock:
+            stale_rids = [
+                rid
+                for rid, ts in self._peer_requests_timestamps.items()
+                if now - ts > self._STALE_REQ_INFO_TTL_S
+            ]
+        if not stale_rids:
+            return
+        for rid in stale_rids:
+            with self._sessions_lock, self._peer_requests_lock:
+                if rid not in self._sessions and rid in self._peer_requests:
+                    self._peer_requests.pop(rid, None)
+                    self._peer_requests_timestamps.pop(rid, None)
+                    logger.debug(f"Swept stale RecvReqInfo for rid={rid}")
 
     def setup_session(self, tx_session: "TxSession"):
         unique_rid = tx_session.disagg_request_id
@@ -1040,17 +1072,41 @@ class Receiver(ReceiverBase):
 
     def dispatch_task(self, task: KVRecvTask):
         params = task._params
-        logger.debug(f"Preparing async data transfer request for disagg_params={params}")
+        logger.debug(
+            f"Receiver.dispatch_task: unique_rid={task._unique_rid}, ctx_dp_rank={params.ctx_dp_rank}"
+        )
         receiver_req = self._build_recv_req_info(task)
         sender_dp_rank = params.ctx_dp_rank
-        if sender_dp_rank is None:
-            raise ValueError(
-                f"ctx_dp_rank is None for request {task._unique_rid}; "
-                "disaggregated params may be missing context rank info"
-            )
         peer_infos: RankInfo = self._get_sender_info(params)
-        peer_overlap = self._registrar.get_peer_overlap(peer_infos, sender_dp_rank)
-        task.expected_transfers = len(peer_overlap.ranks)
+
+        if sender_dp_rank is not None:
+            # Normal path: ctx_dp_rank is known, send to overlapping ranks.
+            peer_overlap = self._registrar.get_peer_overlap(peer_infos, sender_dp_rank)
+        else:
+            # Gen-first with ADP: ctx_dp_rank unknown — broadcast REQUEST_DATA
+            # to ALL ctx sender ranks so every DP group receives it.
+            # get_peer_overlap returns ranks for one DP group (topology is
+            # symmetric), so use dp_rank=0 as representative.
+            dp_size = peer_infos.dp_size
+            dp0_overlap = self._registrar.get_peer_overlap(peer_infos, 0)
+            # Union of overlapping ranks across all DP groups for broadcast (deduplicated)
+            all_ranks_set: set[int] = set(dp0_overlap.ranks)
+            for dp in range(1, dp_size):
+                all_ranks_set.update(self._registrar.get_peer_overlap(peer_infos, dp).ranks)
+            all_ranks = list(all_ranks_set)
+            logger.debug(
+                f"Receiver.dispatch_task: ADP broadcast path, dp_size={dp_size}, "
+                f"all_ranks={all_ranks}"
+            )
+            peer_overlap = type(dp0_overlap)(ranks=all_ranks)
+
+        # In gen-first ADP broadcast, peer_overlap contains the union of all DP
+        # groups, but expected_transfers should reflect per-DP-group count since
+        # only one DP group will actually process the context request.
+        if sender_dp_rank is not None:
+            task.expected_transfers = len(peer_overlap.ranks)
+        else:
+            task.expected_transfers = len(dp0_overlap.ranks)
         session = self._get_session(task._unique_rid)
         if session is None:
             raise RuntimeError(
@@ -1519,6 +1575,10 @@ class TransferWorker:
 
     def has_all_peer_req_infos_for_send(self, unique_rid: int) -> bool:
         return self._sender.has_all_peer_req_infos(unique_rid)
+
+    def sweep_stale_req_infos(self):
+        """Forward to Sender to evict orphaned RecvReqInfo from ADP broadcast."""
+        self._sender.sweep_stale_req_infos()
 
     def _setup_peer_infrastructure(self, kvm: KVCacheManager):
         self._rank_info_server = RankInfoServer(self._rank_info) if kvm.mapping.rank == 0 else None
