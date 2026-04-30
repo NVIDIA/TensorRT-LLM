@@ -1771,11 +1771,17 @@ class FP4MQALogitsKernel:
                 # weights (pack 2 per 32-bit reg) — same budget. Only fp32
                 # differs. (`!= Float32` because const_expr `in tuple` behavior
                 # is unverified across DSL versions.)
+                # fp32 values determined empirically by SASS spill check
+                # (cuobjdump --dump-sass | grep LDL/STL) with 240-reg math
+                # warpgroup: next_n=1,2 fit 64 weights/slot with 0 spill;
+                # next_n=3 spills at 60/64, max safe is 56. Must be a
+                # multiple of 4 to match the packed-FMA (h_g, h_g+1, h_g+2,
+                # h_g+3) layout below.
                 if cutlass.const_expr(self.epi_dtype != cutlass.Float32):
                     # 2-byte weights (fp16 or bf16): next_n in {1,2,3} all fit
                     MAX_NUM_W_IN_REG = 64
                 else:  # fp32, 4-byte weights
-                    MAX_NUM_W_IN_REG = 64 if next_n == 1 else 52  # next_n=2,3
+                    MAX_NUM_W_IN_REG = 56 if next_n == 3 else 64
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
                 w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
                 q_stage_local = cutlass.Int32(0)
@@ -2022,7 +2028,7 @@ class FP4MQALogitsKernel:
                 if cutlass.const_expr(self.epi_dtype != cutlass.Float32):
                     MAX_NUM_W_IN_REG = 64
                 else:
-                    MAX_NUM_W_IN_REG = 64 if next_n == 1 else 52
+                    MAX_NUM_W_IN_REG = 56 if next_n == 3 else 64
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
                 w_cache = cute.make_fragment(NUM_W_IN_REG * next_n, self.epi_dtype)
                 q_stage_local = cutlass.Int32(0)
