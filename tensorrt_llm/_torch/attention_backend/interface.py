@@ -721,6 +721,8 @@ class AttentionSparseArgs:
     sparse_attn_indices: Optional[torch.Tensor] = None
     sparse_attn_offsets: Optional[torch.Tensor] = None
     sparse_attn_indices_block_size: int = 0
+    sparse_mla_topk_lens: Optional[torch.Tensor] = None
+    compressed_kv_cache_pool_ptr: Optional[int] = None
 
 
 @dataclass(kw_only=True, slots=True)

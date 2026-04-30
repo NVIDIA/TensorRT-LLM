@@ -1834,7 +1834,8 @@ def _(a, b, a_scale, b_scale, tune_max_num_tokens=4096):
 @torch.library.custom_op("trtllm::silu_and_mul", mutates_args=())
 def silu_and_mul(x: torch.Tensor,
                  scale: Optional[torch.Tensor] = None,
-                 dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+                 dtype: Optional[torch.dtype] = None,
+                 swiglu_limit: Optional[float] = None) -> torch.Tensor:
     b, n = x.shape
 
     assert n % 2 == 0
@@ -1853,8 +1854,10 @@ def silu_and_mul(x: torch.Tensor,
         x_ptr=x,
         x_stride=x.stride(0),
         d=d,
+        swiglu_limit=swiglu_limit or 0.0,
         BLOCK_SIZE=1024,
         HAS_O_SCALE=scale is not None,
+        HAS_SWIGLU_LIMIT=swiglu_limit is not None and swiglu_limit > 0.0,
     )
 
     return o
@@ -1865,6 +1868,7 @@ def _(
     x: torch.Tensor,
     scale: Optional[torch.Tensor] = None,
     dtype: Optional[torch.dtype] = None,
+    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     b, n = x.shape
 

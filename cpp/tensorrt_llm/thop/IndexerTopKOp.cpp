@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -38,9 +38,10 @@ namespace torch_ext
 
 void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, th::Tensor const& indices,
     int64_t next_n, int64_t index_topk, std::optional<th::Tensor> const& pre_idx,
-    std::optional<th::Tensor> const& heuristic_scratch, std::optional<th::Tensor> const& done_counter_scratch,
-    std::optional<th::Tensor> const& scratch, bool is_prefill)
+    std::optional<th::Tensor> const& heuristic_scratch, int64_t compress_ratio,
+    std::optional<th::Tensor> const& radix_aux_indices, std::optional<th::Tensor> const& radix_aux_logits)
 {
+    TORCH_CHECK(compress_ratio > 0, "compress_ratio must be greater than 0");
 
     TORCH_CHECK(logits.is_cuda() && seq_lens.is_cuda() && indices.is_cuda(),
         "logits, seq_lens, and indices must be CUDA tensors");
@@ -110,70 +111,74 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
         heuristicScratchPtr = scratchTensor.data_ptr();
     }
 
-    // Multi-pass radix scratch. Pre-allocate it for CUDA-graph stable
-    // addresses, or let the wrapper allocate internally below.
-    void* multiPassScratchPtr = nullptr;
-    size_t multiPassScratchBytes = 0;
-    if (scratch.has_value())
-    {
-        auto const& t = scratch.value();
-        TORCH_CHECK(t.is_cuda(), "scratch must be a CUDA tensor");
-        TORCH_CHECK(t.device() == logits.device(), "scratch must be on the same device as logits");
-        TORCH_CHECK(t.is_contiguous(), "scratch must be contiguous");
-        TORCH_CHECK(t.scalar_type() == at::ScalarType::Byte, "scratch must be uint8");
-        multiPassScratchPtr = t.data_ptr();
-        multiPassScratchBytes = static_cast<size_t>(t.numel());
-    }
-
-    // 0 lets invokeIndexerTopKDecode pick its numRows-aware threshold.
-    int32_t const splitWorkThreshold = 0;
+    int32_t splitWorkThreshold = 200 * 1000;
     auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
-
-    // Mirror the kernel's threshold so we only allocate when split-work fires.
-    int32_t const adaptiveSplitWorkThreshold = 200 * 1000;
-    th::Tensor scratch_internal;
-    if (num_columns >= adaptiveSplitWorkThreshold && multiPassScratchPtr == nullptr)
-    {
-        size_t const bytes = tk::indexerTopKDecodeScratchBytes(num_rows, num_columns, static_cast<int32_t>(index_topk));
-        // Zero-init: the radix kernel reads the per-row state on first call.
-        scratch_internal
-            = th::zeros({static_cast<int64_t>(bytes)}, th::TensorOptions().dtype(th::kByte).device(logits.device()));
-        multiPassScratchPtr = scratch_internal.data_ptr();
-        multiPassScratchBytes = bytes;
-    }
-
-    // `done_counter_scratch` is kept on the op signature for source compat
-    // but unused since the fused split-work tier was removed. Warn once so
-    // callers still passing it know to drop the argument.
-    if (done_counter_scratch.has_value())
-    {
-        TORCH_WARN_ONCE(
-            "indexer_topk_decode: `done_counter_scratch` is deprecated and ignored since the fused split-work tier "
-            "was removed; drop this argument. The multi-pass radix path allocates its scratch internally, or you may "
-            "pass a pre-allocated buffer via `scratch` for CUDA-graph capture.");
-    }
 
     if (logits_dtype == at::ScalarType::Float)
     {
+        // fp32 path — full Scheme X v1.2 dispatcher (GVR / Insertion / Radix /
+        // Radix-split-work). Caller-owned radix_aux_{indices,logits} are the
+        // split-work scratch buffers and are dereferenced only when
+        // blocksPerRow > 1; for blocksPerRow == 1 the dispatcher passes
+        // nullptr through to the kernel and never touches them (see
+        // indexerTopK.cu's invokeIndexerTopKDecode bp==1 branch).
+        int const blocks_per_row = tk::computeIndexerTopKDecodeBlocksPerRow(num_rows, num_columns, splitWorkThreshold);
+        int32_t* aux_indices_ptr = nullptr;
+        float* aux_logits_ptr = nullptr;
+        if (radix_aux_indices.has_value() && radix_aux_logits.has_value())
+        {
+            // Caller-owned scratch with stable address (CUDA Graph safe;
+            // matches the heuristic_scratch convention noted above). All
+            // in-tree callers under CUDA Graph capture go through dsa.py's
+            // DSAtrtllmAttentionMetadata which always pre-allocates these.
+            auto const& ai = radix_aux_indices.value();
+            auto const& al = radix_aux_logits.value();
+            TORCH_CHECK(ai.is_cuda() && al.is_cuda(), "radix_aux_{indices,logits} must be CUDA tensors");
+            TORCH_CHECK(ai.device() == logits.device() && al.device() == logits.device(),
+                "radix_aux_{indices,logits} must be on the same device as logits");
+            TORCH_CHECK(ai.is_contiguous() && al.is_contiguous(), "radix_aux_{indices,logits} must be contiguous");
+            TORCH_CHECK(ai.scalar_type() == th::kInt32, "radix_aux_indices must be int32");
+            TORCH_CHECK(al.scalar_type() == th::kFloat32, "radix_aux_logits must be float32");
+            if (blocks_per_row > 1)
+            {
+                int64_t const needed_elts = static_cast<int64_t>(num_rows) * blocks_per_row * index_topk;
+                TORCH_CHECK(ai.numel() >= needed_elts && al.numel() >= needed_elts,
+                    "radix_aux_{indices,logits} must hold at least num_rows*blocks_per_row*index_topk elements (got ",
+                    ai.numel(), " / ", al.numel(), ", need ", needed_elts, ")");
+            }
+            aux_indices_ptr = ai.data_ptr<int32_t>();
+            aux_logits_ptr = al.data_ptr<float>();
+        }
+        else
+        {
+            // No caller-supplied scratch. Allowed only when blocksPerRow == 1
+            // (kernel never dereferences nullptr aux pointers in that case).
+            // blocksPerRow > 1 without caller-owned scratch is the original
+            // G4 CUDA-Graph stale-pointer hazard — reject early.
+            TORCH_CHECK(blocks_per_row == 1,
+                "radix_aux_{indices,logits} must be pre-allocated by the caller when blocks_per_row > 1 "
+                "(got blocks_per_row=",
+                blocks_per_row, "). Required for CUDA Graph safety.");
+        }
         tk::invokeIndexerTopKDecode(logits.data_ptr<float>(), seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(),
-            splitWorkThreshold, num_rows, num_columns, logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n),
-            static_cast<int32_t>(index_topk), preIdxPtr, preIdxStride, preIdxCount,
-            static_cast<float*>(heuristicScratchPtr), stream, multiPassScratchPtr, multiPassScratchBytes, is_prefill);
+            aux_logits_ptr, aux_indices_ptr, splitWorkThreshold, num_rows, num_columns, logits_stride_0,
+            logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr, preIdxStride,
+            preIdxCount, static_cast<float*>(heuristicScratchPtr), static_cast<int32_t>(compress_ratio), stream);
     }
     else if (logits_dtype == at::ScalarType::BFloat16)
     {
         tk::invokeIndexerTopKDecode(reinterpret_cast<__nv_bfloat16 const*>(logits.data_ptr()),
             seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns,
             logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr,
-            preIdxStride, preIdxCount, static_cast<__nv_bfloat16*>(heuristicScratchPtr), stream, multiPassScratchPtr,
-            multiPassScratchBytes, is_prefill);
+            preIdxStride, preIdxCount, static_cast<__nv_bfloat16*>(heuristicScratchPtr),
+            static_cast<int32_t>(compress_ratio), stream);
     }
     else // Half
     {
         tk::invokeIndexerTopKDecode(reinterpret_cast<__half const*>(logits.data_ptr()), seq_lens.data_ptr<int32_t>(),
             indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns, logits_stride_0, logits_stride_1,
             static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr, preIdxStride, preIdxCount,
-            static_cast<__half*>(heuristicScratchPtr), stream, multiPassScratchPtr, multiPassScratchBytes, is_prefill);
+            static_cast<__half*>(heuristicScratchPtr), static_cast<int32_t>(compress_ratio), stream);
     }
 }
 
@@ -188,6 +193,8 @@ void indexer_topk_prefill(th::Tensor const& logits, th::Tensor const& row_starts
 
     TORCH_CHECK(indices.dim() == 2, "indices must be a 2D Tensor");
     TORCH_CHECK(logits.dim() == 2, "logits must be a 2D Tensor");
+    TORCH_CHECK(indices.size(1) >= index_topk, "indices.size(1) must be >= index_topk, got ", indices.size(1), " < ",
+        index_topk);
 
     auto const inputSize = logits.sizes();
     auto const numRows64 = inputSize[0];
@@ -213,16 +220,6 @@ void indexer_topk_prefill(th::Tensor const& logits, th::Tensor const& row_starts
         static_cast<int32_t>(logits_stride_1), static_cast<int32_t>(index_topk), stream);
 }
 
-// Returns the size in bytes of the `scratch` buffer required by
-// indexer_topk_decode's multi-pass radix path for the given shape. Callers
-// can allocate `torch.empty(size, dtype=torch.uint8, device='cuda')` and
-// pass the result as the `scratch` argument.
-int64_t indexer_topk_decode_scratch_bytes(int64_t num_rows, int64_t num_columns, int64_t index_topk)
-{
-    return static_cast<int64_t>(tk::indexerTopKDecodeScratchBytes(
-        static_cast<int>(num_rows), static_cast<int>(num_columns), static_cast<int>(index_topk)));
-}
-
 } // end namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -231,19 +228,13 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "indexer_topk_decode(Tensor logits, Tensor seq_lens, Tensor indices, int next_n, int index_topk=2048, "
-        "Tensor? pre_idx=None, Tensor? heuristic_scratch=None, Tensor? done_counter_scratch=None, "
-        "Tensor? scratch=None, bool is_prefill=False) -> ()");
-    m.def("indexer_topk_decode_scratch_bytes(int num_rows, int num_columns, int index_topk) -> int");
+        "Tensor? pre_idx=None, Tensor? heuristic_scratch=None, int compress_ratio=1, "
+        "Tensor? radix_aux_indices=None, Tensor? radix_aux_logits=None) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("indexer_topk_decode", &tensorrt_llm::torch_ext::indexer_topk_decode);
-}
-
-TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
-{
-    m.impl("indexer_topk_decode_scratch_bytes", &tensorrt_llm::torch_ext::indexer_topk_decode_scratch_bytes);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

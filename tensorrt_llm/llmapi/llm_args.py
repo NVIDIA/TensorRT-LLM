@@ -573,6 +573,37 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         return self.skip_indexer_for_short_seqs
 
 
+class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
+    """
+    Configuration for DeepSeek-V4 Sparse Attention.
+    """
+    algorithm: Literal["deepseek_v4"] = "deepseek_v4"
+    skip_indexer_for_short_seqs: bool = Field(
+        default=False,
+        description=
+        "Whether to skip the MQA and Top-K in the indexer for short sequences.")
+
+    compress_ratios: List[int] = Field(
+        default_factory=lambda: [1, 1, 4, 128, 4, 128, 4],
+        description="The compress ratios of each layer. DeepSeek-V4 uses 0 "
+        "for uncompressed/SWA-only layers; internal allocation code normalizes "
+        "0 to 1, while checkpoint-facing semantics remain unchanged.")
+
+    window_size: int = Field(
+        default=128,
+        description="The window size for slicing window attention part.")
+
+    index_topk: Optional[int] = Field(default=512,
+                                      description="The topk for the indexer.")
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    def needs_separate_short_long_cuda_graphs(self) -> bool:
+        # DeepSeek-V4 does not support short/long CUDA graph separation.
+        return False
+
+
 class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
     """Configuration for skip softmax attention."""
     algorithm: Literal["skip_softmax"] = "skip_softmax"
@@ -2652,6 +2683,7 @@ SparseAttentionConfig: TypeAlias = Annotated[
     Union[
         RocketSparseAttentionConfig,
         DeepSeekSparseAttentionConfig,
+        DeepSeekV4SparseAttentionConfig,
         SkipSoftmaxAttentionConfig,
     ],
     Field(discriminator="algorithm"),
@@ -3466,9 +3498,13 @@ class BaseLlmArgs(StrictBaseModel):
         if self.skip_tokenizer_init:
             self.tokenizer = None
         elif self.custom_tokenizer:
-            # If tokenizer is already a tokenizer object, custom_tokenizer is not compatible
-            if isinstance(self.tokenizer,
-                          (TokenizerBase, PreTrainedTokenizerBase)):
+            # IPC workers receive the tokenizer object that was already loaded
+            # in the parent LLM process. Reuse TRT-LLM tokenizer wrappers as-is.
+            if isinstance(self.tokenizer, TokenizerBase):
+                return self
+            # A raw HF tokenizer object would bypass the requested custom
+            # wrapper, so keep rejecting that combination.
+            if isinstance(self.tokenizer, PreTrainedTokenizerBase):
                 raise ValueError(
                     "Cannot use custom_tokenizer when tokenizer is already a tokenizer object. "
                     "Please specify a tokenizer path or leave it as None to load from model path."

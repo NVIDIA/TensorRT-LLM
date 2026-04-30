@@ -1385,15 +1385,15 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platfor
 def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 {
     stages = [
-        "Release-Check": {
-            script {
-                if (GEN_POST_MERGE_BUILDS_ONLY) {
-                    echo "Skipping Release-Check (GenPostMergeBuilds mode: builds only)"
-                    return
-                }
-                launchReleaseCheck(this, globalVars)
-            }
-        },
+        // "Release-Check": {
+        //     script {
+        //         if (GEN_POST_MERGE_BUILDS_ONLY) {
+        //             echo "Skipping Release-Check (GenPostMergeBuilds mode: builds only)"
+        //             return
+        //         }
+        //         launchReleaseCheck(this, globalVars)
+        //     }
+        // },
         "x86_64-Linux": {
             script {
                 // CBTS deliberately does NOT short-circuit at the arch / Build

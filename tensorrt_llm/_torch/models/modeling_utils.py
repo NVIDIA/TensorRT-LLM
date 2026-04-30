@@ -300,11 +300,25 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
                 skip_forward(module)
 
         num_hidden_layers = self.model_config.pretrained_config.num_hidden_layers
-        assert num_hidden_layers >= mapping.pp_size, f"{num_hidden_layers} layers are not enough for PP{mapping.pp_size}"
+        assert num_hidden_layers >= mapping.pp_size, (
+            f"{num_hidden_layers} layers are not enough for PP{mapping.pp_size}"
+        )
+
         pp_layer_list = mapping.pp_layers(num_hidden_layers)
+        total_num_layers = num_hidden_layers
+        spec_config = getattr(self.model_config, "spec_config", None)
+        if spec_config is not None:
+            from ..speculative.utils import get_num_spec_layers
+
+            num_spec_layers = get_num_spec_layers(spec_config)
+            total_num_layers += num_spec_layers
+            if num_spec_layers > 0 and mapping.is_last_pp_rank():
+                pp_layer_list.extend(
+                    range(total_num_layers - num_spec_layers, total_num_layers))
+        if len(pp_layer_list) == 0:
+            pp_layer_list.append(0)
         has_pp_layer = len(pp_layer_list) > 0
-        for layer_idx in range(num_hidden_layers):
-            layer = self.layers[layer_idx]
+        for layer_idx, layer in enumerate(self.layers[:num_hidden_layers]):
             is_last_layer = (layer_idx == num_hidden_layers - 1)
             if layer_idx not in pp_layer_list:
                 # keep next layer's input_layernorm's weights for fusion

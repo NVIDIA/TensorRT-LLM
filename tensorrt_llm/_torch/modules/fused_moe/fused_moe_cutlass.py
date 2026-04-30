@@ -945,6 +945,7 @@ class CutlassFusedMoE(MoE):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
+        input_ids: Optional[torch.IntTensor],
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
@@ -962,7 +963,7 @@ class CutlassFusedMoE(MoE):
 
         # apply routing
         token_selected_experts, token_final_scales = self.routing_method.apply(
-            router_logits)
+            router_logits, input_ids)
         assert token_selected_experts.shape[
             1] == self.routing_method.experts_per_token
         assert token_selected_experts.shape == token_final_scales.shape
@@ -1200,6 +1201,7 @@ class CutlassFusedMoE(MoE):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
         *,
+        input_ids: Optional[torch.IntTensor] = None,
         do_finalize: bool = True,  # used by other MoE backends
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
@@ -1251,7 +1253,8 @@ class CutlassFusedMoE(MoE):
             outputs = self.forward_chunk(
                 x,
                 router_logits,
-                output_dtype,
+                input_ids=input_ids,
+                output_dtype=output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
                 use_dp_padding=use_dp_padding,
                 repeating_info=(is_first_call, is_last_call),
@@ -1276,17 +1279,21 @@ class CutlassFusedMoE(MoE):
 
             x_list = x.split(chunk_size_list)
             router_logits_list = router_logits.split(chunk_size_list)
+            input_ids_list = input_ids.split(
+                chunk_size_list) if input_ids is not None else [None
+                                                                ] * num_chunks
 
             self.event_dict[EventType.Main].record()
             with torch.cuda.stream(self.aux_stream):
                 self.event_dict[EventType.Main].wait()
 
-            def _forward_chunk(x_, router_logits_, idx):
+            def _forward_chunk(x_, router_logits_, input_ids_, idx):
                 is_first_call = idx == 0 and self.repeat_idx == 0
                 is_last_call = idx == num_chunks - 1 and self.repeat_idx == self.repeat_count - 1
                 return self.forward_chunk(
                     x_,
                     router_logits_,
+                    input_ids=input_ids_,
                     all_rank_num_tokens=all_rank_num_tokens_list[idx]
                     if self.use_dp else None,
                     use_dp_padding=use_dp_padding,
@@ -1301,8 +1308,8 @@ class CutlassFusedMoE(MoE):
 
             outputs_list = []
             # Postpone reduce-scatter/all-reduce to the next iteration to achieve better overlap
-            for idx_chunk, (x, router_logits) in enumerate(
-                    zip(x_list, router_logits_list)):
+            for idx_chunk, (x, router_logits, input_ids) in enumerate(
+                    zip(x_list, router_logits_list, input_ids_list)):
                 if not (self.alltoall_method_type
                         == AlltoallMethodType.NVLinkOneSided
                         or self.alltoall_method_type
@@ -1310,17 +1317,19 @@ class CutlassFusedMoE(MoE):
                     if idx_chunk % 2 == 0:
                         with torch.cuda.stream(self.aux_stream):
                             outputs = _forward_chunk(x, router_logits,
-                                                     idx_chunk)
+                                                     input_ids, idx_chunk)
                         if idx_chunk > 0:
                             outputs_list[-1] = _reducescatter_or_allreduce(
                                 outputs_list[-1], idx_chunk - 1)
                     else:
-                        outputs = _forward_chunk(x, router_logits, idx_chunk)
+                        outputs = _forward_chunk(x, router_logits, input_ids,
+                                                 idx_chunk)
                         with torch.cuda.stream(self.aux_stream):
                             outputs_list[-1] = _reducescatter_or_allreduce(
                                 outputs_list[-1], idx_chunk - 1)
                 else:
-                    outputs = _forward_chunk(x, router_logits, idx_chunk)
+                    outputs = _forward_chunk(x, router_logits, input_ids,
+                                             idx_chunk)
 
                 outputs_list.append(outputs)
 

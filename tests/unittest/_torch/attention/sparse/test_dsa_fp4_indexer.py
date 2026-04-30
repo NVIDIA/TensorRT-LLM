@@ -41,7 +41,7 @@ else:
         "check that the correct DeepGEMM version is installed"
     )
 
-from test_dsa_indexer import _create_mock_metadata, create_dsa_cache_manager
+from .dsa.test_dsa_indexer import _create_mock_metadata, create_dsa_cache_manager
 from utils.util import skip_pre_blackwell
 
 

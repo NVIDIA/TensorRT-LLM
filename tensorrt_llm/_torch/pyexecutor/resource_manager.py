@@ -3599,23 +3599,22 @@ class KVCacheManagerV2(BaseResourceManager):
         mem_per_token *= kv_factor
         return mem_per_token
 
-    def update_resources(self,
-                         scheduled_batch: ScheduledRequests,
-                         attn_metadata: "AttentionMetadata" = None,
-                         kv_cache_dtype_byte_size: float = None):
-        if not self.is_draft:
-            _update_kv_cache_draft_token_location(self, scheduled_batch,
-                                                  attn_metadata,
-                                                  kv_cache_dtype_byte_size)
+    def update_context_resources(self, scheduled_batch: ScheduledRequests):
+        """Update KV cache for context requests in the current batch.
+
+        This is separated from update_resources (which handles generation
+        requests only) because the overlap executor needs context KV cache
+        updates to happen before next batch scheduling. Otherwise, the scheduler would under-estimate available KV cache for sliding-window attention layer. In non-overlap scheduler, you should call it together with update_resources().
+        """
         for req in scheduled_batch.context_requests:
             if req.py_request_id not in self.kv_cache_map:
                 continue
             kv_cache = self.kv_cache_map[req.py_request_id]
             # In the overlap scheduler, iteration N+1's eviction may
             # suspend a ctx request's KV cache while iteration N's
-            # update_resources still needs to process it.  Skip the
-            # resize — the request will be resumed by the scheduler
-            # on the next iteration.
+            # update still needs to process it.  Skip the resize — the
+            # request will be resumed by the scheduler on the next
+            # iteration.
             if not kv_cache.is_active:
                 continue
             if self.enable_block_reuse and not self.is_draft and not req.is_dummy_request:
@@ -3635,6 +3634,16 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"Failed to resize history length of KV cache for request {req.py_request_id} to {req.context_current_position} tokens at context update"
                     )
 
+    def update_resources(self,
+                         scheduled_batch: ScheduledRequests,
+                         attn_metadata: "AttentionMetadata" = None,
+                         kv_cache_dtype_byte_size: float = None):
+        if not self.is_draft:
+            _update_kv_cache_draft_token_location(self, scheduled_batch,
+                                                  attn_metadata,
+                                                  kv_cache_dtype_byte_size)
+        # Context request KV cache updates are handled by
+        # update_context_resources, called separately from the executor loop.
         for req in scheduled_batch.generation_requests:
             if req.py_request_id not in self.kv_cache_map:
                 continue

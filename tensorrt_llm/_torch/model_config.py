@@ -2,6 +2,7 @@ import contextlib
 import errno
 import json
 import os
+import struct
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,13 +15,17 @@ from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_qwen3_hybrid_num_attention_layers, is_nemotron_hybrid, is_qwen3_hybrid,
-    load_pretrained_config)
+    is_hybrid_linear, load_pretrained_config)
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
-from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
-                                          KvCacheConfig, MoeLoadBalancerConfig)
+from tensorrt_llm.llmapi.llm_args import (
+    DeepSeekSparseAttentionConfig,
+    DeepSeekV4SparseAttentionConfig,
+    KvCacheConfig,
+    MoeLoadBalancerConfig,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -33,11 +38,17 @@ from tensorrt_llm.quantization.modelopt_config import (
 
 if TYPE_CHECKING:
     from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
-    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig, LoraConfig,
-                                              SparseAttentionConfig,
-                                              SpeculativeConfig)
+    from tensorrt_llm.llmapi.llm_args import (
+        DecodingBaseConfig,
+        LoraConfig,
+        SparseAttentionConfig,
+        SpeculativeConfig,
+    )
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
+
+_DEEPSEEK_V4_ARCHITECTURES = {"DeepseekV4ForCausalLM"}
+_DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT = "layers.0.ffn.experts.0.w1.weight"
 
 
 def _unified_kv_pool_includes_mamba(
@@ -305,6 +316,11 @@ class ModelConfig(Generic[TConfig]):
         if moe_backend.upper() != "AUTO":
             return moe_backend
 
+        if architecture in _DEEPSEEK_V4_ARCHITECTURES:
+            sm_version = get_sm_version()
+            if 100 <= sm_version < 120:
+                return "TRTLLM"
+
         if architecture == "GptOssForCausalLM":
             sm_version = get_sm_version()
             # Select the best performing backend based on SM version
@@ -508,6 +524,91 @@ class ModelConfig(Generic[TConfig]):
         return quant_config, layer_quant_config
 
     @staticmethod
+    def _read_safetensors_header(path: Path) -> Dict[str, Any]:
+        with open(path, "rb") as f:
+            header_size = struct.unpack("<Q", f.read(8))[0]
+            return json.loads(f.read(header_size))
+
+    @staticmethod
+    def _get_safetensors_header_for_tensor(checkpoint_dir: str,
+                                           tensor_name: str) -> Optional[Dict]:
+        checkpoint_path = Path(checkpoint_dir)
+        candidates = []
+        index_path = checkpoint_path / "model.safetensors.index.json"
+        if index_path.exists():
+            with open(index_path) as f:
+                index = json.load(f)
+            shard_name = index.get("weight_map", {}).get(tensor_name)
+            if shard_name is not None:
+                candidates.append(checkpoint_path / shard_name)
+
+        candidates.extend(sorted(checkpoint_path.glob("*.safetensors")))
+        seen = set()
+        for candidate in candidates:
+            if candidate in seen or not candidate.exists():
+                continue
+            seen.add(candidate)
+            header = ModelConfig._read_safetensors_header(candidate)
+            if tensor_name in header:
+                return header[tensor_name]
+        return None
+
+    @staticmethod
+    def _detect_deepseek_v4_routed_moe_layout(
+            checkpoint_dir: str) -> Optional[str]:
+        tensor_info = ModelConfig._get_safetensors_header_for_tensor(
+            checkpoint_dir, _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT)
+        if tensor_info is None:
+            return None
+
+        dtype = tensor_info.get("dtype")
+        shape = tensor_info.get("shape", [])
+        if dtype == "I8" and len(shape) == 2:
+            return "mxfp4"
+        if dtype is not None and dtype.startswith("F8_"):
+            return "fp8_block_scales"
+        return None
+
+    @staticmethod
+    def _set_deepseek_v4_routed_moe_quant_config(pretrained_config,
+                                                 checkpoint_dir: str,
+                                                 moe_backend: str,
+                                                 layer_quant_config,
+                                                 spec_config=None):
+        layout = ModelConfig._detect_deepseek_v4_routed_moe_layout(
+            checkpoint_dir)
+        if layout != "mxfp4":
+            return layer_quant_config
+
+        experts_quant_config = QuantConfig()
+        experts_quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
+            moe_backend)
+        experts_quant_config.group_size = 32
+        experts_quant_config.exclude_modules = [
+            'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
+            'embedding', 'unembedding'
+        ]
+
+        if layer_quant_config is None:
+            layer_quant_config = {}
+        else:
+            layer_quant_config = dict(layer_quant_config)
+
+        num_moe_layers = pretrained_config.num_hidden_layers
+        if (spec_config is not None
+                and spec_config.spec_dec_mode.is_mtp_one_model()):
+            num_moe_layers += spec_config.num_nextn_predict_layers
+
+        for layer_idx in range(num_moe_layers):
+            layer_quant_config[
+                f"model.layers.{layer_idx}.mlp.experts"] = experts_quant_config
+
+        logger.info(
+            "Detected DeepSeek-V4 routed MoE MXFP4 checkpoint layout; using "
+            "%s for routed experts.", experts_quant_config.quant_algo)
+        return layer_quant_config
+
+    @staticmethod
     def load_quant_config_from_dtypes_json(dtypes_json_file, moe_backend: str):
         quant_config = QuantConfig()
         layer_quant_config = None
@@ -564,6 +665,30 @@ class ModelConfig(Generic[TConfig]):
                         checkpoint_dir: str,
                         trust_remote_code=False,
                         **kwargs):
+
+        def update_sparse_attention_indexer_config(pretrained_config, kwargs):
+            sparse_attention_config = kwargs.get('sparse_attention_config')
+            if sparse_attention_config:
+                index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
+                index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
+                index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
+                indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
+                skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
+            else:
+                index_n_heads = pretrained_config.index_n_heads
+                index_head_dim = pretrained_config.index_head_dim
+                index_topk = pretrained_config.index_topk
+                indexer_max_chunk_size = None
+                skip_indexer_for_short_seqs = True
+            indexer_config = {}
+            indexer_config['index_n_heads'] = index_n_heads
+            indexer_config['index_head_dim'] = index_head_dim
+            indexer_config['index_topk'] = index_topk
+            indexer_config['indexer_max_chunk_size'] = indexer_max_chunk_size
+            indexer_config[
+                'skip_indexer_for_short_seqs'] = skip_indexer_for_short_seqs
+            return indexer_config
+
         # Use file lock to prevent race conditions when multiple processes
         # try to import/cache the same remote model config file
         with config_file_lock():
@@ -619,6 +744,65 @@ class ModelConfig(Generic[TConfig]):
                             indexer_rope_interleave=indexer_rope_interleave,
                             enable_heuristic_topk=enable_heuristic_topk,
                             indexer_k_dtype=indexer_k_dtype)
+                elif pretrained_config.architectures[
+                        0] == "DeepseekV4ForCausalLM":
+                    indexer_config = update_sparse_attention_indexer_config(
+                        pretrained_config, kwargs)
+                    checkpoint_compress_ratios = getattr(
+                        pretrained_config, 'compress_ratios', None)
+                    num_base_layers = pretrained_config.num_hidden_layers
+                    spec_config = kwargs.get('spec_config', None)
+                    mtp_enabled = (
+                        spec_config is not None
+                        and spec_config.spec_dec_mode.is_mtp_one_model())
+                    sparse_attention_config = kwargs.get(
+                        'sparse_attention_config')
+                    checkpoint_window_size = getattr(
+                        pretrained_config, 'window_size', None)
+                    if checkpoint_window_size is None:
+                        checkpoint_window_size = getattr(
+                            pretrained_config, 'sliding_window', None)
+                    if sparse_attention_config:
+                        compress_ratios = sparse_attention_config.compress_ratios
+                        window_size = sparse_attention_config.window_size
+                        if 'window_size' not in sparse_attention_config.model_fields_set:
+                            window_size = checkpoint_window_size
+                    else:
+                        compress_ratios = checkpoint_compress_ratios
+                        window_size = checkpoint_window_size
+
+                    if (checkpoint_compress_ratios is not None
+                            and (compress_ratios is None
+                                 or len(checkpoint_compress_ratios) >
+                                 len(compress_ratios))):
+                        compress_ratios = checkpoint_compress_ratios
+
+                    if window_size is None:
+                        window_size = checkpoint_window_size
+
+                    # Normalize checkpoint-facing ratio 0 (SWA-only/uncompressed)
+                    # to 1 internally so cache allocation math works. The
+                    # external config keeps the original semantics.
+                    compress_ratios = [
+                        ratio if ratio > 0 else 1 for ratio in compress_ratios
+                    ]
+
+                    # Only synthesize ratios for extra MTP layers. The base
+                    # model ratios must come from the checkpoint or an
+                    # explicit user override; padding a short default list for
+                    # non-MTP changes sparse attention semantics.
+                    if mtp_enabled:
+                        mtp_num_layers = spec_config.num_nextn_predict_layers
+                        total_layers = num_base_layers + mtp_num_layers
+                        if len(compress_ratios) < total_layers:
+                            compress_ratios = list(compress_ratios) + [1] * (
+                                total_layers - len(compress_ratios))
+
+                    kwargs[
+                        'sparse_attention_config'] = DeepSeekV4SparseAttentionConfig(
+                            compress_ratios=compress_ratios,
+                            window_size=window_size,
+                            **indexer_config)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."
@@ -735,6 +919,11 @@ class ModelConfig(Generic[TConfig]):
             architecture,
             quant_config=quant_config,
         )
+
+        if architecture in _DEEPSEEK_V4_ARCHITECTURES:
+            layer_quant_config = cls._set_deepseek_v4_routed_moe_quant_config(
+                pretrained_config, checkpoint_dir, moe_backend,
+                layer_quant_config, kwargs.get('spec_config', None))
 
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,
@@ -890,8 +1079,7 @@ class ModelConfig(Generic[TConfig]):
             for x in self.pretrained_config.block_configs
         ])
 
-        from tensorrt_llm._torch.models.modeling_nemotron_nas import \
-            _ffn_mult_to_intermediate_size
+        from tensorrt_llm._torch.models.modeling_nemotron_nas import _ffn_mult_to_intermediate_size
         mlp_hidden_size = _ffn_mult_to_intermediate_size(
             biggest_ffn_mult, self.pretrained_config.hidden_size)
 

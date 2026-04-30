@@ -85,8 +85,10 @@ enum class RoutingMethodType : int64_t
     MiniMax2 = 5,
     // SigmoidRenorm: Sigmoid -> TopK -> Renormalize
     SigmoidRenorm = 6,
+    // DeepSeek-V4
+    DeepSeekV4 = 7,
     // Unspecified
-    Unspecified = 7,
+    Unspecified = 8,
 };
 
 inline int32_t maybeGetMinTokenCount(int32_t numPaddedTokens, int32_t hiddenSize, int32_t dtypeSizeBits)
@@ -107,6 +109,7 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
     case RoutingMethodType::RenormalizeNaive: return "RenormalizeNaive";
     case RoutingMethodType::MiniMax2: return "MiniMax2";
     case RoutingMethodType::SigmoidRenorm: return "SigmoidRenorm";
+    case RoutingMethodType::DeepSeekV4: return "DeepSeekV4";
     default: TLLM_CHECK_WITH_INFO(false, "Invalid routing method"); return "";
     };
 }
