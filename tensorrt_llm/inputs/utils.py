@@ -190,7 +190,7 @@ async def _safe_aiohttp_get(
         timeout_sec: int = 30,
         session: Optional[aiohttp.ClientSession] = None) -> bytes:
     """Aiohttp GET wrapper that validates every redirect hop before following."""
-    _validate_url(url)
+    await asyncio.to_thread(_validate_url, url)
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
 
     async def _fetch(fetch_session: aiohttp.ClientSession) -> bytes:
@@ -202,7 +202,7 @@ async def _safe_aiohttp_get(
                 if response.status in (301, 302, 303, 307, 308):
                     redirect_url = response.headers.get("Location", "")
                     current_url = urljoin(current_url, redirect_url)
-                    _validate_url(current_url)
+                    await asyncio.to_thread(_validate_url, current_url)
                     continue
                 maybe_coro = response.raise_for_status()
                 if asyncio.iscoroutine(maybe_coro):
