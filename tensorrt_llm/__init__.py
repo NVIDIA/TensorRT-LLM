@@ -133,8 +133,8 @@ from .python_plugin import PluginBase
 from .sampling_params import SamplingParams
 from .version import __version__
 from .visual_gen import (ExtraParamSchema, VisualGen, VisualGenArgs,
-                         VisualGenError, VisualGenParams, VisualGenParamsError,
-                         VisualGenResult)
+                         VisualGenError, VisualGenMetrics, VisualGenOutput,
+                         VisualGenParams, VisualGenParamsError, VisualGenResult)
 
 __all__ = [
     'AutoConfig',
@@ -185,6 +185,8 @@ __all__ = [
     'VisualGenArgs',
     'ExtraParamSchema',
     'VisualGenError',
+    'VisualGenMetrics',
+    'VisualGenOutput',
     'VisualGenParamsError',
     'VisualGenResult',
     'DisaggregatedParams',

@@ -33,10 +33,18 @@ class VisualGenSampleRequest:
 
 @dataclass
 class VisualGenRequestOutput:
-    """Timing and status result for a single visual generation request."""
+    """Timing and status result for a single visual generation request.
+
+    ``e2e_latency`` is wall-clock time around the generate (and save, if
+    measured by the caller). ``pipeline_ms`` and ``denoise_ms`` come from
+    the engine-side ``VisualGenOutput.metrics`` and are populated when the
+    request succeeds.
+    """
 
     success: bool = False
     e2e_latency: float = 0.0
+    pipeline_ms: float = 0.0
+    denoise_ms: float = 0.0
     ttff: float = -1.0
     gen_fps: float = -1.0
     error: str = ""

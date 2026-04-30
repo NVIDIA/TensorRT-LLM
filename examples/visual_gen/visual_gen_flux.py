@@ -40,7 +40,6 @@ import time
 
 from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams, logger
 from tensorrt_llm._torch.visual_gen.config import CacheDiTConfig, TeaCacheConfig
-from tensorrt_llm.serve.media_storage import MediaStorage
 
 logger.set_level("info")
 
@@ -414,7 +413,7 @@ def main():
 
                 elapsed = time.time() - start_time
                 output_path = os.path.join(args.output_dir, f"{i:02d}.png")
-                MediaStorage.save_image(output.image, output_path)
+                output.save(output_path)
                 logger.info(f"  Saved {output_path} ({elapsed:.1f}s)")
 
                 timing_records.append(
@@ -472,7 +471,7 @@ def main():
 
             logger.info(f"Generation completed in {time.time() - start_time:.2f}s")
 
-            MediaStorage.save_image(output.image, args.output_path)
+            output.save(args.output_path)
 
     finally:
         visual_gen.shutdown()

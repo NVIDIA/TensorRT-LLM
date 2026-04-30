@@ -352,6 +352,33 @@ def _run_benchmark(
     return outputs
 
 
+def _save_to_tempfile(result) -> None:
+    """Persist ``result`` to a throwaway tempfile so e2e timing covers encoding.
+
+    Picks a suffix that matches the produced modality so
+    :meth:`VisualGenOutput.save` infers the format from the path. The
+    artifact is removed after writing; the call exists purely to include
+    encoding latency in the externally-measured ``e2e_ms``.
+    """
+    import os
+    import tempfile
+
+    if result.image is not None:
+        suffix = ".png"
+    elif result.video is not None:
+        suffix = ".mp4"
+    else:
+        return
+
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    try:
+        result.save(tmp_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
 def _run_sequential(visual_gen, input_requests, gen_params) -> list[VisualGenRequestOutput]:
     """Run requests one at a time, measuring per-request latency."""
     outputs = []
@@ -360,9 +387,13 @@ def _run_sequential(visual_gen, input_requests, gen_params) -> list[VisualGenReq
         output = VisualGenRequestOutput()
         st = time.perf_counter()
         try:
-            visual_gen.generate(inputs=req.prompt, params=gen_params)
+            result = visual_gen.generate(inputs=req.prompt, params=gen_params)
+            _save_to_tempfile(result)
             output.e2e_latency = time.perf_counter() - st
             output.success = True
+            if result.metrics is not None:
+                output.pipeline_ms = result.metrics.pipeline_ms
+                output.denoise_ms = result.metrics.denoise_ms
         except Exception as e:
             output.e2e_latency = time.perf_counter() - st
             output.success = False
@@ -390,9 +421,13 @@ async def _run_concurrent(
             st = time.perf_counter()
             try:
                 future = visual_gen.generate_async(inputs=req.prompt, params=gen_params)
-                await future.result()
+                result = await future
+                _save_to_tempfile(result)
                 output.e2e_latency = time.perf_counter() - st
                 output.success = True
+                if result.metrics is not None:
+                    output.pipeline_ms = result.metrics.pipeline_ms
+                    output.denoise_ms = result.metrics.denoise_ms
             except Exception as e:
                 output.e2e_latency = time.perf_counter() - st
                 output.success = False
