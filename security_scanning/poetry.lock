@@ -1459,14 +1459,14 @@ files = [
 
 [[package]]
 name = "flashinfer-python"
-version = "0.6.8"
+version = "0.6.9"
 description = "FlashInfer: Kernel Library for LLM Serving"
 optional = false
 python-versions = "<4.0,>=3.10"
 groups = ["main"]
 files = [
-    {file = "flashinfer_python-0.6.8-py3-none-any.whl", hash = "sha256:e96d09b810cedd5f26a6764fface84b0d39dc60cbcc6167dc61bde3e949b3ed0"},
-    {file = "flashinfer_python-0.6.8.tar.gz", hash = "sha256:37b320efa00d8bf14a13f3a3bbc529faad171c47daa18bf381c892bee306d974"},
+    {file = "flashinfer_python-0.6.9-py3-none-any.whl", hash = "sha256:46d013119ecd039a5844c4847325b3571f99cdd8fd9e00839bf008c67b15811a"},
+    {file = "flashinfer_python-0.6.9.tar.gz", hash = "sha256:044ed74698b5f6c1e719b32cf95189609166740076c11287e81a38450953de50"},
 ]
 
 [package.dependencies]
@@ -7073,4 +7073,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "bc51ce9668bdec3f5da0e4cb418a64655dc64fa9fd606611e90bc04145ba1483"
+content-hash = "ce88f145d60fa44ae65820ed536c8554ada070a18411efd6c052322fc19f191f"

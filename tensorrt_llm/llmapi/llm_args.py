@@ -3844,6 +3844,19 @@ class TorchLlmArgs(BaseLlmArgs):
         description="If true, use CuTe DSL fp8 blockscaling bmm implementation.",
         status="prototype",
     )
+    # bf16 cute dsl configs
+    use_cute_dsl_bf16_bmm: bool = Field(
+        default=False,
+        description=
+        "If true, use CuTe DSL bf16 persistent GEMM for BMM on Blackwell.",
+        status="prototype",
+    )
+    use_cute_dsl_bf16_gemm: bool = Field(
+        default=False,
+        description=
+        "If true, use CuTe DSL bf16 persistent GEMM for Linear layers on Blackwell.",
+        status="prototype",
+    )
 
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
@@ -4126,6 +4139,18 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError(
                 "ray_placement_config is only supported with orchestrator_type='ray'"
             )
+        return self
+
+    @model_validator(mode='after')
+    def validate_cute_dsl_bf16(self) -> 'TorchLlmArgs':
+        if self.use_cute_dsl_bf16_bmm or self.use_cute_dsl_bf16_gemm:
+            major, minor = torch.cuda.get_device_capability()
+            sm = major * 10 + minor
+            if sm < 100:
+                raise ValueError(
+                    f"use_cute_dsl_bf16_bmm and use_cute_dsl_bf16_gemm are only "
+                    f"supported on Blackwell (sm >= 100), but current device has "
+                    f"sm {sm}.")
         return self
 
     def get_executor_config(

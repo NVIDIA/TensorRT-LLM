@@ -904,6 +904,7 @@ def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
                            cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
 @pytest.mark.parametrize("ctx_pp", [1, 4], ids=["ctx_pp1", "ctx_pp4"])

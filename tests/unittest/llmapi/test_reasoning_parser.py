@@ -479,3 +479,110 @@ def test_auto_detect_no_config(tmp_path):
 
     result = resolve_auto_reasoning_parser(model_dir)
     assert result is None
+
+
+def test_auto_detect_gemma4(tmp_path):
+    """Gemma 4 model → 'gemma4' parser."""
+    model_dir = str(tmp_path / "gemma-4-26B-A4B-it")
+    os.makedirs(model_dir)
+    _write_config(model_dir, "gemma4")
+
+    result = resolve_auto_reasoning_parser(model_dir)
+    assert result == "gemma4"
+
+
+# ---------------------------------------------------------------------------
+# Gemma 4 reasoning parser tests
+# ---------------------------------------------------------------------------
+
+G4_OPEN, G4_CLOSE = "<|channel>", "<channel|>"
+
+
+@pytest.mark.parametrize(
+    ("text", "content", "reasoning_content"),
+    [
+        # No reasoning block: everything is content.
+        ("hello world", "hello world", ""),
+        # Channel block wrapping reasoning, followed by content.
+        (f"{G4_OPEN}thought\nreasoning{G4_CLOSE}answer", "answer",
+         "thought\nreasoning"),
+        # Content before and after the reasoning block.
+        (f"pre{G4_OPEN}r{G4_CLOSE}post", "prepost", "r"),
+        # Unterminated channel: remainder treated as reasoning.
+        (f"{G4_OPEN}abc", "", "abc"),
+        # Multiple interleaved channel blocks.
+        (f"a{G4_OPEN}r1{G4_CLOSE}b{G4_OPEN}r2{G4_CLOSE}c", "abc", "r1r2"),
+        # Empty reasoning block (e.g. prefilled when enable_thinking=False).
+        (f"{G4_OPEN}thought\n{G4_CLOSE}answer", "answer", "thought\n"),
+    ],
+)
+def test_gemma4_reasoning_parser(text: str, content: str,
+                                 reasoning_content: str):
+    parser = ReasoningParserFactory.create_reasoning_parser("gemma4")
+    result = parser.parse(text)
+    assert result.content == content
+    assert result.reasoning_content == reasoning_content
+
+
+@pytest.mark.parametrize(
+    ("delta_texts", "content", "reasoning_content"),
+    [
+        # No reasoning: plain content streams through.
+        (["a", "b"], ["a", "b"], ["", ""]),
+        # Open and close in a single delta.
+        ([f"{G4_OPEN}r{G4_CLOSE}c"], ["c"], ["r"]),
+        # Delimiters split across deltas.
+        ([G4_OPEN, "r", G4_CLOSE, "c"], ["", "", "", "c"], ["", "r", "", ""]),
+        # Partial open tag held back until complete.
+        (["pre<|cha", "nnel>r<chan", "nel|>post"], ["pre", "", "post"
+                                                    ], ["", "r", ""]),
+        # Two reasoning blocks interleaved with content.
+        (
+            [f"{G4_OPEN}r1{G4_CLOSE}c1", f"{G4_OPEN}r2{G4_CLOSE}c2"],
+            ["c1", "c2"],
+            ["r1", "r2"],
+        ),
+        # Partial close tag at end of delta buffered.
+        ([f"{G4_OPEN}reason<chan", "nel|>tail"], ["", "tail"], ["reason", ""]),
+    ],
+)
+def test_gemma4_reasoning_parser_stream(delta_texts: list, content: list,
+                                        reasoning_content: list):
+    parser = ReasoningParserFactory.create_reasoning_parser("gemma4")
+    for i, delta in enumerate(delta_texts):
+        result = parser.parse_delta(delta)
+        assert result.content == content[i], (
+            f"Step {i}: delta={delta!r} expected content={content[i]!r} "
+            f"got {result.content!r}")
+        assert result.reasoning_content == reasoning_content[i], (
+            f"Step {i}: delta={delta!r} expected reasoning="
+            f"{reasoning_content[i]!r} got {result.reasoning_content!r}")
+
+
+def test_gemma4_reasoning_parser_finish_flushes_buffer():
+    """finish() should flush any buffered trailing text."""
+    parser = ReasoningParserFactory.create_reasoning_parser("gemma4")
+    # Send a partial open tag; parser holds it back.
+    parser.parse_delta("some text<|cha")
+    # Stream ended mid-tag: the held-back suffix flushes as content.
+    result = parser.finish()
+    assert result.content == "<|cha"
+    assert result.reasoning_content == ""
+
+
+def test_gemma4_reasoning_parser_finish_unterminated_reasoning():
+    """Verify finish() flushes a held-back partial close tag as reasoning.
+
+    When the stream ends mid-channel with a buffered partial close tag, the
+    remainder should surface as reasoning content.
+    """
+    parser = ReasoningParserFactory.create_reasoning_parser("gemma4")
+    # Enter reasoning; stream ends with a partial close tag (held back).
+    stream = parser.parse_delta(f"{G4_OPEN}reasoning_start<chan")
+    assert stream.reasoning_content == "reasoning_start"
+    assert stream.content == ""
+    # finish() should release the buffered "<chan" as reasoning since we are
+    # still inside the channel block.
+    result = parser.finish()
+    assert result.content == ""
+    assert result.reasoning_content == "<chan"

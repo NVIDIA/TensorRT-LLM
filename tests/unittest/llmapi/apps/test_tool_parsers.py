@@ -27,6 +27,7 @@ from tensorrt_llm.serve.tool_parser.core_types import (StreamingParseResult,
 from tensorrt_llm.serve.tool_parser.deepseekv3_parser import DeepSeekV3Parser
 from tensorrt_llm.serve.tool_parser.deepseekv31_parser import DeepSeekV31Parser
 from tensorrt_llm.serve.tool_parser.deepseekv32_parser import DeepSeekV32Parser
+from tensorrt_llm.serve.tool_parser.gemma4_parser import Gemma4ToolParser
 from tensorrt_llm.serve.tool_parser.glm4_parser import Glm4ToolParser
 from tensorrt_llm.serve.tool_parser.glm47_parser import Glm47ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
@@ -37,9 +38,9 @@ from tensorrt_llm.serve.tool_parser.qwen3_tool_parser import Qwen3ToolParser
 from tensorrt_llm.tokenizer.deepseek_v32.encoding import encode_messages
 
 from tensorrt_llm.serve.tool_parser.gemma4_parser import (  # isort: skip
-    BOT_TOKEN, CALL_PREFIX, EOT_TOKEN, STRING_DELIM, Gemma4ToolParser,
-    _extract_tool_calls, _find_matching_brace, _parse_gemma4_args,
-    _parse_gemma4_array, _parse_gemma4_value,
+    BOT_TOKEN, CALL_PREFIX, EOT_TOKEN, STRING_DELIM, _extract_tool_calls,
+    _find_matching_brace, _parse_gemma4_args, _parse_gemma4_array,
+    _parse_gemma4_value,
 )
 
 

@@ -18,8 +18,8 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
-from defs.conftest import (get_llm_root, get_sm_version, skip_pre_blackwell,
-                           skip_pre_hopper)
+from defs.conftest import (get_llm_root, get_sm_version, skip_pre_ada,
+                           skip_pre_blackwell, skip_pre_hopper)
 from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
@@ -494,6 +494,7 @@ class TestNemotronV2(LlmapiAccuracyTestHarness):
                            **kwargs) as llm:
             self.evaluate_tasks(llm, sampling_params)
 
+    @skip_pre_ada
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("enable_chunked_prefill", [True])
     def test_fp8(self, enable_chunked_prefill):
@@ -553,6 +554,8 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
     def test_accuracy(self, model_id, world_size, attn_backend):
         if model_id == "nvfp4" and get_sm_version() < 100:
             pytest.skip("NVFP4 requires Blackwell or later")
+        if model_id == "fp8" and get_sm_version() < 90:
+            pytest.skip("FP8 requires Hopper or later")
         if world_size > get_device_count():
             pytest.skip(f"Not enough devices for world_size={world_size}")
         model_path = self.MODEL_PATHS[model_id]
@@ -1111,8 +1114,10 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
         pytest.param("meta-llama/Llama-3.1-8B-Instruct", {}, [MMLU, GSM8K],
                      id="meta-llama_Llama-3.1-8B-Instruct"),
         pytest.param("nvidia/Llama-3.1-8B-Instruct-FP8", {}, [MMLU, GSM8K],
+                     marks=skip_pre_ada,
                      id="nvidia_Llama-3.1-8B-Instruct-FP8"),
         pytest.param("nvidia/Llama-3.1-8B-Instruct-NVFP4", {}, [MMLU, GSM8K],
+                     marks=skip_pre_blackwell,
                      id="nvidia_Llama-3.1-8B-Instruct-NVFP4"),
         pytest.param("google/gemma-3-1b-it", {}, [MMLU, GSM8K],
                      id="google_gemma-3-1b-it"),

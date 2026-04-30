@@ -25,6 +25,7 @@ from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
 from ..._compat import KvCacheConfig
+from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -562,7 +563,6 @@ class TorchBackendMLAAttention(AttentionDescriptor):
         compressed_kv_fake = source_attn_node.args[2].meta["val"]
         kv_lora_rank = compressed_kv_fake.shape[-1]
 
-        # Get scale from kwargs
-        scale = source_attn_node.kwargs.get("scale", None)
+        (scale,) = extract_op_args(source_attn_node, "scale")
 
         return [scale, kv_lora_rank]
