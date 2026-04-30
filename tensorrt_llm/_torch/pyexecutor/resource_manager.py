@@ -29,6 +29,9 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
+from tensorrt_llm.runtime.kv_cache_hash import (
+    KV_CACHE_HASH_ALGO_AUTO, KV_CACHE_HASH_ALGO_V1,
+    get_effective_kv_cache_event_hash_algo)
 
 # isort: off
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -46,6 +49,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import (BAD_PAGE_INDEX,
                                                               GPU_LEVEL)
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
+from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import \
+    KVCacheEventManager
 from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import CuError
 from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import \
     OutOfMemoryError as KVCacheOutOfMemoryError
@@ -95,6 +100,16 @@ class PoolConfiguration:
     window_size: int
     head_dim: int
     dtype: "DataType"
+
+
+def _warn_if_unsupported_v1_kv_cache_event_hash_algo(hash_algo: str) -> None:
+    if hash_algo in (KV_CACHE_HASH_ALGO_AUTO, KV_CACHE_HASH_ALGO_V1):
+        return
+
+    logger.warning(
+        "KV cache manager v1 only supports KV cache event hash algorithm "
+        f"{KV_CACHE_HASH_ALGO_V1}. Ignoring configured hash algorithm "
+        f"{hash_algo}; v1 events will continue to use {KV_CACHE_HASH_ALGO_V1}.")
 
 
 class ResourceManagerType(enum.Enum):
@@ -891,6 +906,8 @@ class KVCacheManager(BaseResourceManager):
         }
 
         if self.event_buffer_max_size > 0:
+            _warn_if_unsupported_v1_kv_cache_event_hash_algo(
+                kv_cache_config.kv_cache_event_hash_algo)
             if mapping.enable_attention_dp:
                 kwargs['event_manager'] = KVCacheEventManagerCpp(
                     max_kv_event_entries=self.event_buffer_max_size,
@@ -1713,7 +1730,7 @@ class KVCacheManager(BaseResourceManager):
     def flush_iteration_events(self):
         self.impl.flush_iteration_events()
 
-    def get_latest_events(self, timeout_ms: Optional[float] = 0):
+    def get_latest_events(self, timeout_ms: Optional[float] = None):
         return self.impl.get_latest_events(timeout_ms)
 
     def get_kv_cache_stats(self):
@@ -2408,8 +2425,10 @@ class KVCacheManagerV2(BaseResourceManager):
                                                 draft_loop_tokens)
 
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
-
-        assert self.event_buffer_max_size == 0, "event_buffer_max_size must be 0"
+        kv_cache_event_hash_algo = get_effective_kv_cache_event_hash_algo(
+            kv_cache_config.kv_cache_event_hash_algo,
+            use_kv_cache_manager_v2=True,
+        )
 
         self._stream = execution_stream if execution_stream is not None else torch.cuda.current_stream(
         )
@@ -2434,6 +2453,26 @@ class KVCacheManagerV2(BaseResourceManager):
 
         else:
             self.max_attention_window_vec = [None]
+
+        event_window_size = max(
+            self.max_seq_len if window_size is None else int(window_size)
+            for window_size in self.max_attention_window_vec)
+        self.event_manager: Optional[KVCacheEventManager] = None
+        if self.event_buffer_max_size > 0:
+            if mapping.enable_attention_dp:
+                self.event_manager = KVCacheEventManager(
+                    self.event_buffer_max_size,
+                    window_size=event_window_size,
+                    attention_dp_rank=mapping.rank,
+                    attention_dp_gather=Distributed.get(mapping).allgather,
+                    hash_algo=kv_cache_event_hash_algo,
+                )
+            elif mpi_rank() == 0:
+                self.event_manager = KVCacheEventManager(
+                    self.event_buffer_max_size,
+                    window_size=event_window_size,
+                    hash_algo=kv_cache_event_hash_algo,
+                )
 
         if isinstance(num_kv_heads, int):
             self.num_kv_heads_per_layer = [
@@ -2582,7 +2621,8 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_cache_manager_py_config = config
 
         try:
-            self.impl = KVCacheManagerPy(config)
+            self.impl = KVCacheManagerPy(config,
+                                         event_manager=self.event_manager)
         except (CuError, KVCacheOutOfMemoryError):
             if len(cache_tiers) > 1:
                 logger.warning(
@@ -2598,10 +2638,21 @@ class KVCacheManagerV2(BaseResourceManager):
                     vocab_size=vocab_size,
                     cache_tiers=cache_tiers_gpu_only,
                 )
+                cache_tiers = cache_tiers_gpu_only
                 self.kv_cache_manager_py_config = config
-                self.impl = KVCacheManagerPy(config)
+                self.impl = KVCacheManagerPy(config,
+                                             event_manager=self.event_manager)
             else:
                 raise
+
+        if self.event_manager is not None:
+            self.event_manager.set_layer_group_window_sizes(
+                self._get_event_window_sizes_by_layer_group())
+            self.event_manager.add_created_event(
+                self._get_event_num_blocks_per_cache_level(
+                    cache_tiers, tokens_per_block),
+                self._get_event_layer_group_ids())
+
         self.num_pools = len(self.impl.layer_grouping)
 
         num_layers = len(config.layers)
@@ -2704,6 +2755,38 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
         return int(max_tokens * self.get_cache_bytes_per_token())
+
+    def _get_event_num_blocks_per_cache_level(
+        self,
+        cache_tiers: List[CacheTierConfig],
+        tokens_per_block: int,
+    ) -> List[int]:
+        bytes_per_block = self.get_cache_bytes_per_token() * tokens_per_block
+        if bytes_per_block <= 0:
+            return []
+        return [int(tier.quota // bytes_per_block) for tier in cache_tiers]
+
+    def _get_event_layer_group_ids(self) -> List[int]:
+        return [
+            int(layer_group_id)
+            for layer_group_id in range(len(self.impl.layer_grouping))
+        ]
+
+    def _get_event_window_sizes_by_layer_group(self) -> Dict[int, int]:
+        # Assumes every layer in a group shares the same sliding_window_size,
+        # which is how `impl.layer_grouping` partitions layers today. Only the
+        # first layer's window is read; if the grouping policy ever permits
+        # mixed windows in one group, this needs to fan out per-layer.
+
+        def get_event_window_size(layer_id: int) -> int:
+            window_size = self.kv_cache_manager_py_config.layers[
+                layer_id].sliding_window_size
+            return self.max_seq_len if window_size is None else int(window_size)
+
+        return {
+            int(layer_group_id): get_event_window_size(int(layer_ids[0]))
+            for layer_group_id, layer_ids in enumerate(self.impl.layer_grouping)
+        }
 
     def _build_pool_mapping_tensors(self) -> Tuple[torch.Tensor, torch.Tensor]:
         kv_cache_pool_pointers = torch.tensor([[
@@ -2898,14 +2981,34 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache = self.kv_cache_map.get(request_id)
         return kv_cache is not None and kv_cache.is_active
 
+    def _effective_draft_len(self, req: LlmRequest) -> int:
+        """Draft token length to use for next-step KV capacity calculation.
+
+        For a disagg gen request whose KV transmission just completed
+        (state == DISAGG_GENERATION_TRANS_COMPLETE), py_draft_tokens is
+        still [] when the scheduler asks for capacity, because it gets
+        mirrored from context_phase_params.draft_tokens later in
+        _prepare_disagg_gen_transmission_complete (which runs AFTER the
+        scheduler in the executor loop). Without compensating here, the
+        first gen forward writes 1 + len(ctx_draft_tokens) tokens into
+        KV cache but only +1 was reserved, OOB-ing the KV block table at
+        the next tokens_per_block-aligned boundary.
+        """
+        draft_len = get_draft_token_length(req)
+        if (draft_len == 0 and req.is_disagg_generation_transmission_complete
+                and req.context_phase_params is not None):
+            ctx_draft_tokens = req.context_phase_params.draft_tokens
+            if ctx_draft_tokens is not None:
+                draft_len = len(ctx_draft_tokens)
+        return draft_len
+
     def _required_gen_capacity(self, req: LlmRequest,
                                current_capacity: int) -> int:
         """Compute generation KV cache capacity for a request.
 
         Grows *current_capacity* by 1 + draft tokens.
         """
-        draft_len = get_draft_token_length(req)
-        return current_capacity + 1 + draft_len
+        return current_capacity + 1 + self._effective_draft_len(req)
 
     def try_allocate_generation(self, req: LlmRequest) -> bool:
         """Try to allocate one additional KV cache slot for a generation request.
@@ -2922,7 +3025,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 return False
             self._restore_page_index_bufs(req.py_request_id, kv_cache)
 
-        draft_len = get_draft_token_length(req)
+        draft_len = self._effective_draft_len(req)
         self._allocated_draft_lens[req.py_request_id] = draft_len
         return kv_cache.resize(
             self._required_gen_capacity(req, kv_cache.capacity))
@@ -2940,7 +3043,7 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None or not kv_cache.is_active:
             return
-        draft_len = get_draft_token_length(req)
+        draft_len = self._effective_draft_len(req)
         reverted_cap = kv_cache.capacity - 1 - draft_len
         if reverted_cap < 0:
             return
@@ -3249,6 +3352,15 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache_stats.allocated_bytes = self.impl.get_quota(GPU_LEVEL)
 
         return kv_cache_stats
+
+    def flush_iteration_events(self):
+        if self.event_manager is not None:
+            self.event_manager.flush_iteration_events()
+
+    def get_latest_events(self, timeout_ms: Optional[float] = None):
+        if self.event_manager is None:
+            return []
+        return self.event_manager.get_latest_events(timeout_ms)
 
     def get_iteration_stats(self):
         """V2 does not support per-iteration stats yet."""
