@@ -18,9 +18,10 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/envUtils.h"
 
-// Import heuristicTopKJob (__device__ __noinline__) and all helpers.
-// heuristicTopKJob is independently optimized by ptxas, matching standalone
+// Import gvrTopKJob (__device__ __noinline__, the GVR micro-kernel) and
+// all helpers. gvrTopKJob is independently optimized by ptxas, matching standalone
 // SASS quality regardless of the caller's prologue code.
 #include "tensorrt_llm/kernels/heuristic_topk.cuh"
 
@@ -34,12 +35,13 @@ namespace
 {
 
 using heuristic_topk::BLOCK_SIZE;
-using heuristic_topk::heuristicTopKJob;
+using heuristic_topk::gvrTopKJob;
 using heuristic_topk::KernelSmem;
 using heuristic_topk::TOP_K;
 
-// Multi-row kernel: thin wrapper that computes per-row parameters,
-// then calls heuristicTopKJob (independently optimized device function).
+// heuristicTopKMultiRowKernel — outer multi-row launch wrapper (1 CTA per row).
+// Computes per-row parameters, then dispatches to the GVR micro-kernel
+// (gvrTopKJob, single-CTA single-row, independently optimized device function).
 __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernel(float const* __restrict__ logits,
     int const* __restrict__ seqLens, int const* __restrict__ preIdx, float* __restrict__ scratchValues,
     int* __restrict__ outIndices, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount)
@@ -69,13 +71,19 @@ __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernel(float 
             outputValues[i] = -FLT_MAX;
             outputIndices[i] = -1;
         }
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        cudaTriggerProgrammaticLaunchCompletion();
+#endif
         return;
     }
 
     // +1 accounts for the temporal shift: prev_topk indices were computed at
     // seq_len-1, but the current step has one additional KV token appended.
     int const preIdxOffset = (rowIdx % next_n) + 1;
-    heuristicTopKJob(input, N, rowPreIdx, preIdxCount, topK, outputValues, outputIndices, smem, preIdxOffset);
+    gvrTopKJob(input, N, rowPreIdx, preIdxCount, topK, outputValues, outputIndices, smem, preIdxOffset);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
 }
 
 } // anonymous namespace
@@ -102,8 +110,19 @@ void launchHeuristicTopKDecode(float const* logits, int const* seqLens, int cons
     TLLM_CHECK_WITH_INFO(stride0 % 4 == 0 || numRows <= 1,
         "heuristicTopKDecode requires logits stride0 divisible by 4 for multi-row launch");
 
-    heuristicTopKMultiRowKernel<<<numRows, BLOCK_SIZE, smemSize, stream>>>(
-        logits, seqLens, preIdx, scratchValues, outIndices, stride0, next_n, topK, preIdxStride, preIdxCount);
+    cudaLaunchConfig_t config;
+    config.gridDim = numRows;
+    config.blockDim = BLOCK_SIZE;
+    config.dynamicSmemBytes = smemSize;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+
+    cudaLaunchKernelEx(&config, heuristicTopKMultiRowKernel, logits, seqLens, preIdx, scratchValues, outIndices,
+        stride0, next_n, topK, preIdxStride, preIdxCount);
 }
 
 } // namespace kernels

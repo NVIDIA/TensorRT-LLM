@@ -132,6 +132,8 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=False-enable_max_concurrency=True-enable_draft_len_schedule=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_dflash
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dflash
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_bf16
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_fp8
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_cuda_graph_padding[mtp_nextn=0]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_cuda_graph_padding[mtp_nextn=2]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano::test_fp8
@@ -348,6 +350,9 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[llguidance-eagle3_one_model=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_ngram[xgrammar]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_ngram[llguidance]
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestMistralSmall24B::test_auto_dtype[forced_chunked_prefill]
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3VL::test_auto_dtype[forced_chunked_prefill]
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestNemotron_Nano_12B_V2_VL::test_auto_dtype[forced_chunked_prefill]
   - examples/test_phi.py::test_phi_4_mini_instruct_with_bf16_lora_torch[Phi-4-mini-instruct]
   - test_e2e.py::test_draft_token_tree_quickstart_advanced_eagle3[Llama-3.1-8b-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct-EAGLE3-LLaMA3.1-Instruct-8B]
   - test_e2e.py::test_draft_token_tree_quickstart_advanced_eagle3_depth_1_tree[Llama-3.1-8b-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct-EAGLE3-LLaMA3.1-Instruct-8B]
@@ -488,7 +493,8 @@ l0_h100:
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-False-1]
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-True-1]
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[triton_paged-False-1]
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle3_one_model
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle3_one_model[flashinfer]
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B_Instruct_Eagle3::test_eagle3_one_model[trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[trtllm-triton_ssm-False]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[trtllm-flashinfer_ssm-False]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronH::test_auto_dtype[trtllm-triton_ssm-True]
@@ -499,9 +505,8 @@ l0_h100:
   - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_fp8[True]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[bf16-1-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-trtllm]
-  - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[draft_target]
-  - examples/test_ad_speculative_decoding.py::test_autodeploy_spec_dec_output[eagle3]
-  - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_acceptance_rate
+  - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_one_model_acceptance_rate[trtllm-torch-cudagraph]
+  - examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_one_model_acceptance_rate[flashinfer-torch-simple]
   - examples/test_ad_speculative_decoding.py::test_eagle_model_with_weights
   - examples/test_ad_speculative_decoding.py::test_eagle_wrapper_forward[1]
   - examples/test_ad_speculative_decoding.py::test_eagle_wrapper_forward[2]

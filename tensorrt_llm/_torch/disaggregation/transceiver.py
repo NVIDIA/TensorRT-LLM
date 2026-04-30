@@ -393,6 +393,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             del self._send_sessions[rid]
         self._close_failed_sessions(self._send_sessions, self._send_reqs, failed)
 
+        # Sweep orphaned RecvReqInfo entries from ADP broadcast on non-assigned
+        # DP ranks (entries that will never have a TxSession created for them).
+        self._transfer_worker.sweep_stale_req_infos()
+
         return completed, failed
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]):
@@ -439,8 +443,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # Keep this aligned with fields populated in respond_and_send_async().
         # These values are server-level metadata used to seed generation-first
         # requests before context-phase response data arrives.
+        #
+        # With ADP (enable_attention_dp), ctx_dp_rank is not known at
+        # registration time because the context scheduler has not yet assigned
+        # the request to a DP rank.  Return None so that the gen-side Receiver
+        # broadcasts REQUEST_DATA to all ctx DP ranks.  The actual ctx_dp_rank
+        # is stamped into ContextPhaseParams by respond_and_send_async() after
+        # the prefill is scheduled.
+        ctx_dp_rank = None if self._mapping.enable_attention_dp else self._dp_rank
         return {
-            "ctx_dp_rank": self._dp_rank,
+            "ctx_dp_rank": ctx_dp_rank,
             "ctx_info_endpoint": [self._context_info_endpoint]
             if self._context_info_endpoint
             else None,

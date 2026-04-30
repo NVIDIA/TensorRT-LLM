@@ -59,10 +59,9 @@ class ADLogger(metaclass=Singleton):
 
     def log(self, severity, *msg):
         level = self._SEVERITY_TO_LEVEL.get(severity, logging.INFO)
-        parts = [f"[{self.PREFIX}]"]
+        parts = []
         if self.rank is not None:
             parts.append(f"[RANK {self.rank}]")
-        parts.append(severity)
         parts.extend(map(str, msg))
         self._logger.log(level, " ".join(parts))
 
@@ -71,17 +70,17 @@ class ADLogger(metaclass=Singleton):
             self._appeared_keys.add(key)
             self.log(severity, *msg)
 
-    def info(self, msg, *args, **kwargs):
-        self._logger.info(msg, *args, **kwargs)
+    def info(self, *msg):
+        self.log(self.INFO, *msg)
 
-    def warning(self, msg, *args, **kwargs):
-        self._logger.warning(msg, *args, **kwargs)
+    def warning(self, *msg):
+        self.log(self.WARNING, *msg)
 
-    def error(self, msg, *args, **kwargs):
-        self._logger.error(msg, *args, **kwargs)
+    def error(self, *msg):
+        self.log(self.ERROR, *msg)
 
-    def debug(self, msg, *args, **kwargs):
-        self._logger.debug(msg, *args, **kwargs)
+    def debug(self, *msg):
+        self.log(self.DEBUG, *msg)
 
     def warning_once(self, *msg, key):
         self.log_once(self.WARNING, *msg, key=key)

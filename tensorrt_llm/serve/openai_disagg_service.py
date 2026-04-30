@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import asyncio
+import json
 import os
+from collections.abc import AsyncIterator
 from typing import Any, Callable, Dict, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import (
@@ -34,6 +36,7 @@ from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
     DisaggregatedParams,
     DisaggScheduleStyle,
+    PromptTokensDetails,
     UCompletionRequest,
     UCompletionResponse,
 )
@@ -162,13 +165,138 @@ class OpenAIDisaggregatedService(OpenAIService):
                 gen_server, _ = await self._gen_router.get_next_server(
                     gen_req, exclude_server=ctx_server
                 )
-            return await self._gen_client.send_request(gen_req, server=gen_server, hooks=hooks)
+            gen_response = await self._gen_client.send_request(
+                gen_req, server=gen_server, hooks=hooks
+            )
+            return self._rewrite_disagg_usage(gen_response, ctx_response)
         else:
             if request.stream:
                 # ctx client will never return a generator when streaming is requested
                 # make up for this by returning a done generator
                 return done_generator()
             return ctx_response
+
+    def _ctx_usage_for_client(
+        self, ctx_response: Optional[UCompletionResponse]
+    ) -> tuple[Optional[int], int]:
+        if ctx_response is None or ctx_response.usage is None:
+            return None, 0
+
+        prompt_tokens = ctx_response.usage.prompt_tokens
+        cached_tokens = 0
+        prompt_tokens_details = ctx_response.usage.prompt_tokens_details
+        if prompt_tokens_details is not None:
+            cached_tokens = prompt_tokens_details.cached_tokens
+        return prompt_tokens, cached_tokens
+
+    def _rewrite_usage_payload_from_ctx(
+        self,
+        usage: dict[str, Any],
+        ctx_response: Optional[UCompletionResponse],
+    ) -> None:
+        prompt_tokens, cached_tokens = self._ctx_usage_for_client(ctx_response)
+        if prompt_tokens is None:
+            return
+
+        usage["prompt_tokens"] = prompt_tokens
+        usage["total_tokens"] = prompt_tokens + (usage.get("completion_tokens") or 0)
+        prompt_tokens_details = usage.get("prompt_tokens_details")
+        if not isinstance(prompt_tokens_details, dict):
+            prompt_tokens_details = {}
+            usage["prompt_tokens_details"] = prompt_tokens_details
+        prompt_tokens_details["cached_tokens"] = cached_tokens
+
+    def _rewrite_usage_response_from_ctx(
+        self,
+        response: UCompletionResponse,
+        ctx_response: Optional[UCompletionResponse],
+    ) -> UCompletionResponse:
+        prompt_tokens, cached_tokens = self._ctx_usage_for_client(ctx_response)
+        if prompt_tokens is None or response.usage is None:
+            return response
+
+        response.usage.prompt_tokens = prompt_tokens
+        response.usage.total_tokens = prompt_tokens + (response.usage.completion_tokens or 0)
+        response.usage.prompt_tokens_details = PromptTokensDetails(cached_tokens=cached_tokens)
+        return response
+
+    @staticmethod
+    def _sse_separator_index(data: bytes) -> tuple[int, bytes] | None:
+        indexes = [(data.find(sep), sep) for sep in (b"\n\n", b"\r\n\r\n")]
+        indexes = [(idx, sep) for idx, sep in indexes if idx >= 0]
+        if not indexes:
+            return None
+        return min(indexes, key=lambda item: item[0])
+
+    def _rewrite_usage_sse_event_from_ctx(
+        self,
+        event: bytes,
+        ctx_response: Optional[UCompletionResponse],
+    ) -> bytes:
+        separator_match = self._sse_separator_index(event)
+        separator = separator_match[1] if separator_match else b""
+        event_body = event[: -len(separator)] if separator else event
+        data_lines = [
+            line.removeprefix(b"data:").strip()
+            for line in event_body.splitlines()
+            if line.startswith(b"data:")
+        ]
+        if len(data_lines) != 1 or data_lines[0] == b"[DONE]":
+            return event
+
+        try:
+            payload = json.loads(data_lines[0])
+        except json.JSONDecodeError:
+            return event
+
+        usage = payload.get("usage") if isinstance(payload, dict) else None
+        if not isinstance(usage, dict):
+            return event
+
+        self._rewrite_usage_payload_from_ctx(usage, ctx_response)
+        return b"data: " + json.dumps(payload, separators=(",", ":")).encode("utf-8") + separator
+
+    async def _rewrite_streaming_usage_from_ctx(
+        self,
+        response: AsyncIterator[Any],
+        ctx_response: Optional[UCompletionResponse],
+    ) -> AsyncIterator[Any]:
+        pending = b""
+        pending_is_str = False
+        async for chunk in response:
+            is_str = isinstance(chunk, str)
+            chunk_bytes = chunk.encode("utf-8") if is_str else chunk
+            if not isinstance(chunk_bytes, bytes):
+                yield chunk
+                continue
+
+            if not pending:
+                pending_is_str = is_str
+            pending += chunk_bytes
+            while separator_match := self._sse_separator_index(pending):
+                separator_index, separator = separator_match
+                event_end = separator_index + len(separator)
+                event = pending[:event_end]
+                pending = pending[event_end:]
+                event = self._rewrite_usage_sse_event_from_ctx(event, ctx_response)
+                yield event.decode("utf-8") if pending_is_str else event
+                if not pending:
+                    pending_is_str = False
+
+        if pending:
+            event = self._rewrite_usage_sse_event_from_ctx(pending, ctx_response)
+            yield event.decode("utf-8") if pending_is_str else event
+
+    def _rewrite_disagg_usage(
+        self,
+        response: UCompletionResponseOrGenerator,
+        ctx_response: Optional[UCompletionResponse],
+    ) -> UCompletionResponseOrGenerator:
+        if ctx_response is None:
+            return response
+        if hasattr(response, "__aiter__"):
+            return self._rewrite_streaming_usage_from_ctx(response, ctx_response)
+        return self._rewrite_usage_response_from_ctx(response, ctx_response)
 
     def _need_gen(self, response: UCompletionResponse) -> bool:
         if response and response.choices[0].finish_reason not in ["length", "not_finished"]:
@@ -449,7 +577,9 @@ class OpenAIDisaggregatedService(OpenAIService):
 
             # Now send ctx request — gen server has received its request
             try:
-                await self._ctx_client.send_request(ctx_req, server=ctx_server, hooks=hooks)
+                ctx_response = await self._ctx_client.send_request(
+                    ctx_req, server=ctx_server, hooks=hooks
+                )
             except Exception:
                 consume_task.cancel()
                 try:
@@ -475,7 +605,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                     except asyncio.CancelledError:
                         pass
 
-            return _yield_from_queue()
+            return self._rewrite_disagg_usage(_yield_from_queue(), ctx_response)
         else:
             # Non-streaming or no ctx needed: both HTTP POSTs fire eagerly
             # through generator consumption, so asyncio.gather works fine.
@@ -492,4 +622,5 @@ class OpenAIDisaggregatedService(OpenAIService):
                 )
             )
             responses = await asyncio.gather(*tasks)
-            return responses[-1]
+            ctx_response = responses[0] if need_ctx else None
+            return self._rewrite_disagg_usage(responses[-1], ctx_response)

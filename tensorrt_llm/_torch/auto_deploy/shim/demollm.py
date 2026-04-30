@@ -202,6 +202,7 @@ class DemoEngine(ADEngine):
                 cache_loc=cache_loc,
                 cu_num_pages=cu_num_pages,
                 slot_idx=list(range(batch_size)),
+                prompt_lens=total_lens,
             )
 
             # nest new tokens and run stop check

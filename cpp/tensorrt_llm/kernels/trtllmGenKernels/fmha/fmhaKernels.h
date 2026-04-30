@@ -246,7 +246,8 @@ public:
         // HOTFIX: FmhaDispatcher path may leave multiCtasKvCounter/Scratch null when use GmemReduction. Force Disabled
         // here so as to avoid crashing.
         // TODO: add scratch allocation and re-enable GmemReduction.
-        if (options.mMultiCtasKvMode == tensorrt_llm::kernels::MultiCtasKvMode::GmemReduction)
+        if (options.mMultiCtasKvMode == tensorrt_llm::kernels::MultiCtasKvMode::GmemReduction
+            || options.mMultiCtasKvMode == tensorrt_llm::kernels::MultiCtasKvMode::GmemReductionWithSeparateKernel)
         {
             if (params.multiCtasKvScratchPtr == nullptr || params.multiCtasKvCounterPtr == nullptr)
             {
@@ -308,7 +309,8 @@ public:
         // HOTFIX: FmhaDispatcher path may leave multiCtasKvCounter/Scratch null when use GmemReduction. Force Disabled
         // here so as to avoid crashing.
         // TODO: add scratch allocation and re-enable GmemReduction.
-        if (options.mMultiCtasKvMode == tensorrt_llm::kernels::MultiCtasKvMode::GmemReduction)
+        if (options.mMultiCtasKvMode == tensorrt_llm::kernels::MultiCtasKvMode::GmemReduction
+            || options.mMultiCtasKvMode == tensorrt_llm::kernels::MultiCtasKvMode::GmemReductionWithSeparateKernel)
         {
             if (params.multiCtasKvScratchPtr == nullptr || params.multiCtasKvCounterPtr == nullptr)
             {

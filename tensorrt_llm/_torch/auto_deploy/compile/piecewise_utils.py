@@ -34,6 +34,7 @@ _CACHED_ATTENTION_OPS = [
     "auto_deploy::flashinfer_mla_with_cache",
     "auto_deploy::flashinfer_trtllm_mla_with_cache",
     "auto_deploy::torch_cached_mla_with_cache",
+    "auto_deploy::trtllm_mla_with_cache",
 ]
 
 # Cached SSM ops (Python-level branching on batch_info_host)
@@ -60,6 +61,7 @@ _METADATA_PREP_OPS = [
     "auto_deploy::flashinfer_attention_prepare_metadata",
     "auto_deploy::flashinfer_mla_prepare_metadata",
     "auto_deploy::triton_paged_prepare_metadata",
+    "auto_deploy::trtllm_mla_prepare_metadata",
     "auto_deploy::mamba_ssm_prepare_metadata",
 ]
 

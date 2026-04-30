@@ -235,12 +235,13 @@ def should_skip_trtllm(
         QuantAlgo.W4A16_MXFP4,
         QuantAlgo.W4A8_MXFP4_MXFP8,
     }
-
-    if quant_algo not in trtllm_gen_quant_algos:
+    # Quant_algo==None (BF16 path) also falls through and must meet the should_skip_trtllm criteria
+    if quant_algo is not None and quant_algo not in trtllm_gen_quant_algos:
         return None
 
     num_experts = model_config.num_experts
     top_k = model_config.top_k
+    hidden_size = model_config.hidden_size
     intermediate_size = model_config.intermediate_size
 
     # Check: num_experts must be divisible by 4
@@ -258,11 +259,22 @@ def should_skip_trtllm(
             f"TRTLLMGenFusedMoE requires num_experts > top_k "
             f"(got num_experts={num_experts}, top_k={top_k})"
         )
+
+    if quant_algo is None:
+        if swiglu_gptoss_style:
+            return "TRTLLMGenFusedMoE BF16 path does not support bias/swiglu custom parameters."
+
+        if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
+            return (
+                "TRTLLMGenFusedMoE BF16 path requires hidden_size and intermediate_size "
+                f"to be multiples of 128 (got h={hidden_size}, i={intermediate_size})."
+            )
+        return None
+
     # W4A8_MXFP4_MXFP8 with non-128-aligned hidden_size or intermediate_size
     # causes block_scale_interleave_reverse to fail with
     # "rows of Interleaved block scales should be multiple of 128".
     if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
-        hidden_size = model_config.hidden_size
         if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
             return (
                 f"TRTLLMGenFusedMoE W4A8_MXFP4_MXFP8 with non-128-aligned "
@@ -959,7 +971,8 @@ def should_skip_to_accelerate_ci(
     all combinations run (local exhaustive testing).
 
     Rules applied (in order):
-    0. Skip unquantized (quant=None) — quantized paths are the focus of CI
+    0. Skip unquantized (quant=None) for most paths, but keep TRTLLM BF16
+       unquantized coverage enabled.
     1. e256 model: only DeepSeekV3 routing, bfloat16, seq=1, non-gptoss
     2. Multi-GPU: only DEP and TTP parallel modes
     3. Routing: full 6 routing methods only on (CUTLASS or TRTLLM) with NVFP4;
@@ -985,8 +998,13 @@ def should_skip_to_accelerate_ci(
     if model_config is None:
         return None
 
-    # --- Rule 0: Skip gated and unquantized (quant=None) ---
-    if quant_algo is None and is_gated_activation(activation_type):
+    # --- Rule 0: Skip gated and unquantized (quant=None) for most backends ---
+    # Keep TRTLLM BF16 unquantized enabled to cover FlashInfer BF16 TRTLLM MoE.
+    if (
+        quant_algo is None
+        and is_gated_activation(activation_type)
+        and not (backend_type == MoeBackendType.TRTLLM and dtype == torch.bfloat16)
+    ):
         return "[CI accel] Skip unquantized (quant=None) in CI"
 
     is_large_model = model_config.num_experts >= 256 and model_config.hidden_size >= 7168
