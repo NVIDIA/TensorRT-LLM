@@ -404,6 +404,15 @@ class _SharedPageLock:
         assert old_base_index == BAD_PAGE_INDEX
 
     def __del__(self) -> None:
+        """Release the underlying unique lock on garbage collection.
+
+        Calls ``self.unlock()`` if a lock is still held. Swallows the
+        ``ValueError`` raised by ``unwrap_rawref`` when the C++ KV cache
+        has already been freed during interpreter shutdown — at that
+        point the page lock has nothing left to release, so quietly
+        dropping the wrapper state is the correct behaviour and lets
+        the surrounding destructor chain return cleanly.
+        """
         if self._uniq_lock is not None:
             try:
                 self.unlock()
