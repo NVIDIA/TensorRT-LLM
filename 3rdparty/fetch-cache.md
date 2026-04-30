@@ -20,9 +20,11 @@ system git, and the build path is byte-for-byte identical to before.
 For read-only shared caches — the typical setup for the autonomous-agent
 builds discussed in the [threat model](#why-this-exists) — pass
 `-DTRTLLM_FETCHCONTENT_UPDATE_CMD=<script>`. The write-back step then
-runs `<script> <src_dir>` in place of `fetch_cache.py`, so the
-orchestrator that owns the real cache can mount it read-only into the
-build container.
+invokes
+`<script> --log-prefix <prefix> update --cache-dir <dir> --src <src_dir>`
+in place of `fetch_cache.py` — same argv, so any script that mimics
+`fetch_cache.py`'s CLI is a drop-in. The orchestrator that owns the
+real cache can mount it read-only into the build container.
 
 ## Flow
 
@@ -455,12 +457,16 @@ git -C $TRTLLM_FETCHCONTENT_CACHE/<subdir>/<name>.git pack-refs --all
 (`packed-refs.lock` + delete-if-matches), so it does not need to
 coordinate with builds.
 
-**Cmake internals published as `CACHE INTERNAL`.** `_FC_CACHE_DIR`,
-`_FC_UPDATE_CMD`, `_FC_CACHE_PY`, `_FC_PYTHON` are stored as
-`CACHE INTERNAL` in `3rdparty/CMakeLists.txt`. Sibling subdirectories
-(`cpp/tests`, `cpp/kernels/xqa`, `cpp/tensorrt_llm/deep_ep`, ...) call
+**Cmake internals published as `CACHE INTERNAL`.** `_FC_CACHE_DIR` and
+`_FC_WRITER_CMD` are stored as `CACHE INTERNAL` in
+`3rdparty/CMakeLists.txt`. Sibling subdirectories (`cpp/tests`,
+`cpp/kernels/xqa`, `cpp/tensorrt_llm/deep_ep`, ...) call
 `FetchContent_MakeAvailable` from their own scopes; directory-scoped
-variables would be invisible to them.
+variables would be invisible to them. `_FC_WRITER_CMD` resolves at
+configure time to `TRTLLM_FETCHCONTENT_UPDATE_CMD` (caller-supplied) or
+the python interpreter + `fetch_cache.py` (default); the
+`FetchContent_MakeAvailable` override invokes it verbatim per dep with
+`--log-prefix <prefix> update --cache-dir <dir> --src <src_dir>`.
 
 **Fail-closed strict argparse in the wrapper.**
 `fetch_cache_wrapper.py` only accepts the argument set cmake actually

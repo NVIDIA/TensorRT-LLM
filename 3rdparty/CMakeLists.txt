@@ -32,15 +32,19 @@ if(NOT WIN32 AND NOT "${TRTLLM_FETCHCONTENT_CACHE}" STREQUAL "")
   set(_FC_CACHE_DIR
       "${TRTLLM_FETCHCONTENT_CACHE}"
       CACHE INTERNAL "")
-  set(_FC_UPDATE_CMD
-      "${TRTLLM_FETCHCONTENT_UPDATE_CMD}"
-      CACHE INTERNAL "")
-  set(_FC_CACHE_PY
-      "${CMAKE_CURRENT_SOURCE_DIR}/fetch_cache.py"
-      CACHE INTERNAL "")
-  set(_FC_PYTHON
-      "${_FC_PYTHON}"
-      CACHE INTERNAL "")
+  # Stored as a cmake list so `${_FC_WRITER_CMD}` expands into separate argv
+  # entries when used unquoted in execute_process below.  See fetch-cache.md
+  # "Cmake internals published as CACHE INTERNAL" for the writer resolution and
+  # drop-in calling convention.
+  if(NOT "${TRTLLM_FETCHCONTENT_UPDATE_CMD}" STREQUAL "")
+    set(_FC_WRITER_CMD
+        "${TRTLLM_FETCHCONTENT_UPDATE_CMD}"
+        CACHE INTERNAL "")
+  else()
+    set(_FC_WRITER_CMD
+        "${_FC_PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/fetch_cache.py"
+        CACHE INTERNAL "")
+  endif()
   message(STATUS "FetchContent cache: enabled (${_FC_CACHE_DIR})")
 endif()
 
@@ -65,18 +69,11 @@ function(_trtllm_fc_update_one name)
   if(NOT DEFINED ${_lc}_SOURCE_DIR)
     return()
   endif()
-  # --log-prefix so fetch_cache.py's output lines up with the continuation
-  # column of the surrounding cmake log.  External update commands are opaque —
-  # their output streams through unprefixed.
-  if(NOT "${_FC_UPDATE_CMD}" STREQUAL "")
-    execute_process(COMMAND "${_FC_UPDATE_CMD}" "${${_lc}_SOURCE_DIR}")
-  else()
-    execute_process(
-      COMMAND
-        "${_FC_PYTHON}" "${_FC_CACHE_PY}" --log-prefix
-        "--             [${name}]: " update --cache-dir "${_FC_CACHE_DIR}"
-        --src "${${_lc}_SOURCE_DIR}")
-  endif()
+  # --log-prefix aligns the writer's output with the continuation column of the
+  # surrounding cmake log.
+  execute_process(
+    COMMAND ${_FC_WRITER_CMD} --log-prefix "--             [${name}]: " update
+            --cache-dir "${_FC_CACHE_DIR}" --src "${${_lc}_SOURCE_DIR}")
 endfunction()
 # ── End FetchContent cache ───────────────────────────────────────────────
 
