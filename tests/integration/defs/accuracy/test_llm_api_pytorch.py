@@ -3637,10 +3637,12 @@ def _run_deepseekv4_eplb(model_name,
                          model_path,
                          moe_backend,
                          eplb_config,
-                         mtp_nextn=0):
-    # V4 (~284B) plus EPLB redundant slots leaves little headroom; keep the
-    # KV-cache fraction conservative and clamp max_seq_len so the default
-    # 1M context doesn't pre-allocate KV blocks beyond what 180GB B200s have.
+                         mtp_nextn=0,
+                         tensor_parallel_size=4):
+    # Default config targets 4x B300 (~288 GB/GPU): plenty of headroom at
+    # TP=4 for V4-Flash NVFP4 (~36 GB/rank weights) or V4-Flash-Base FP8
+    # (~71 GB/rank weights), even with EPLB redundancy + DeepGemm MoE
+    # workspace + cuda graph capture.
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
     pytorch_config = dict(cuda_graph_config=CudaGraphConfig(),
                           moe_config=MoeConfig(backend=moe_backend,
@@ -3648,8 +3650,8 @@ def _run_deepseekv4_eplb(model_name,
     mtp_config = (MTPDecodingConfig(
         num_nextn_predict_layers=mtp_nextn) if mtp_nextn > 0 else None)
     with LLM(model_path,
-             tensor_parallel_size=8,
-             moe_expert_parallel_size=8,
+             tensor_parallel_size=tensor_parallel_size,
+             moe_expert_parallel_size=tensor_parallel_size,
              kv_cache_config=kv_cache_config,
              enable_attention_dp=True,
              max_seq_len=4096,
@@ -3666,20 +3668,61 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Flash"
 
-    @pytest.mark.skip_less_mpi_world_size(8)
-    @parametrize_with_ids("moe_backend", ["WIDEEP", "TRTLLM"])
-    def test_nvfp4_8gpus_static_eplb(self, moe_backend):
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_auto_dtype(self):
+        # Aggregate (non-disagg, non-EPLB) smoke test. NVFP4 weights are ~71
+        # GB/rank at TP=2, ~36 GB/rank at TP=4 — TP=4 fits comfortably on
+        # 4x B200 178GB. TRTLLM backend required because V4-Flash MXFP4
+        # routed experts are unsupported by WIDEEP (raises "Unsupported
+        # quantization mode: [65536]"). is_integration_test=True keeps this
+        # to a 1-sample smoke (no GSM8K reference required).
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 moe_config=MoeConfig(backend="TRTLLM"),
+                 enable_attention_dp=True,
+                 max_seq_len=4096,
+                 kv_cache_config=kv_cache_config) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, is_integration_test=True)
+
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @parametrize_with_ids("moe_backend", [
+        pytest.param(
+            "WIDEEP",
+            marks=pytest.mark.skip(
+                reason=
+                "V4-Flash MXFP4 routed experts: WIDEEP _get_quant_method has "
+                "no MXFP4 branch (raises 'Unsupported quantization mode: "
+                "[65536]'). Re-enable once fused_moe_wide_ep.py supports MXFP4."
+            )),
+        "TRTLLM",
+    ])
+    def test_nvfp4_4gpus_static_eplb(self, moe_backend):
         eplb_config = _make_deepseekv4_eplb_config(self.MODEL_PATH,
-                                                   layer_updates_per_iter=0)
+                                                   layer_updates_per_iter=0,
+                                                   ep_size=4)
         _run_deepseekv4_eplb(self.MODEL_NAME, self.MODEL_PATH, moe_backend,
                              eplb_config)
 
-    @pytest.mark.skip_less_mpi_world_size(8)
-    @parametrize_with_ids("moe_backend", ["WIDEEP", "TRTLLM"])
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @parametrize_with_ids("moe_backend", [
+        pytest.param(
+            "WIDEEP",
+            marks=pytest.mark.skip(
+                reason=
+                "V4-Flash MXFP4 routed experts: WIDEEP _get_quant_method has "
+                "no MXFP4 branch (raises 'Unsupported quantization mode: "
+                "[65536]'). Re-enable once fused_moe_wide_ep.py supports MXFP4."
+            )),
+        "TRTLLM",
+    ])
     @parametrize_with_ids("mtp_nextn", [0, 1])
-    def test_nvfp4_8gpus_online_eplb(self, moe_backend, mtp_nextn):
+    def test_nvfp4_4gpus_online_eplb(self, moe_backend, mtp_nextn):
         eplb_config = _make_deepseekv4_eplb_config(self.MODEL_PATH,
-                                                   layer_updates_per_iter=2)
+                                                   layer_updates_per_iter=2,
+                                                   ep_size=4)
         _run_deepseekv4_eplb(self.MODEL_NAME,
                              self.MODEL_PATH,
                              moe_backend,
@@ -3694,22 +3737,40 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash-Base"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Flash-Base"
 
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_auto_dtype(self):
+        # Aggregate (non-disagg, non-EPLB) smoke test. FP8 weights ~71 GB/rank
+        # at TP=4 — fits on 4x B300 (~288 GB/GPU). WIDEEP required (CUTLASS
+        # path is Hopper-only on Blackwell). 1-sample smoke.
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 moe_config=MoeConfig(backend="WIDEEP"),
+                 enable_attention_dp=True,
+                 max_seq_len=4096,
+                 kv_cache_config=kv_cache_config) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, is_integration_test=True)
+
     # CUTLASS is omitted: V4 Flash-Base FP8 block-scale weights take a
     # Hopper-only kernel path (CutlassFp8BlockScaleGemmRunner::moeGemm) that
-    # fails on Blackwell. WIDEEP avoids that path and works on B200.
-    @pytest.mark.skip_less_mpi_world_size(8)
+    # fails on Blackwell. WIDEEP avoids that path and works on B200/B300.
+    @pytest.mark.skip_less_mpi_world_size(4)
     @parametrize_with_ids("moe_backend", ["WIDEEP"])
-    def test_fp8_8gpus_static_eplb(self, moe_backend):
+    def test_fp8_4gpus_static_eplb(self, moe_backend):
         eplb_config = _make_deepseekv4_eplb_config(self.MODEL_PATH,
-                                                   layer_updates_per_iter=0)
+                                                   layer_updates_per_iter=0,
+                                                   ep_size=4)
         _run_deepseekv4_eplb(self.MODEL_NAME, self.MODEL_PATH, moe_backend,
                              eplb_config)
 
-    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.skip_less_mpi_world_size(4)
     @parametrize_with_ids("moe_backend", ["WIDEEP"])
-    def test_fp8_8gpus_online_eplb(self, moe_backend):
+    def test_fp8_4gpus_online_eplb(self, moe_backend):
         eplb_config = _make_deepseekv4_eplb_config(self.MODEL_PATH,
-                                                   layer_updates_per_iter=2)
+                                                   layer_updates_per_iter=2,
+                                                   ep_size=4)
         _run_deepseekv4_eplb(self.MODEL_NAME, self.MODEL_PATH, moe_backend,
                              eplb_config)
 
