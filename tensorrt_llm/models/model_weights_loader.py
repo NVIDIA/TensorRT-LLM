@@ -335,7 +335,8 @@ class ModelWeightsLoader:
             if self.tllm_to_externel_key_dict['layers'] != 'layers':
                 del self.tllm_to_externel_key_dict['layers']
 
-        # Share embedding; only applies to standard structure with lm_head and transformer.vocab_embedding
+        # Share embedding when config.tie_word_embeddings is set; only applies
+        # to the standard lm_head + transformer.vocab_embedding structure.
         if hasattr(self.model, 'lm_head') and hasattr(
                 self.model, 'transformer') and hasattr(self.model.transformer,
                                                        'vocab_embedding'):
@@ -344,12 +345,16 @@ class ModelWeightsLoader:
             vocab_embed_weights = self.load_tensor(
                 self.translate_to_external_key(
                     'transformer.vocab_embedding.weight'))
-            if lm_head_weights is None and vocab_embed_weights is not None:
+            tie_word_embeddings = getattr(model.config, 'tie_word_embeddings',
+                                          False)
+            if (tie_word_embeddings and lm_head_weights is None
+                    and vocab_embed_weights is not None):
                 self.tllm_to_externel_key_dict[
                     'lm_head'] = self.tllm_to_externel_key_dict[
                         'transformer'] + '.' + self.tllm_to_externel_key_dict[
                             'vocab_embedding']
-            elif lm_head_weights is not None and vocab_embed_weights is None:
+            elif (tie_word_embeddings and lm_head_weights is not None
+                  and vocab_embed_weights is None):
                 self.tllm_to_externel_key_dict[
                     'vocab_embedding'] = self.tllm_to_externel_key_dict[
                         'lm_head']

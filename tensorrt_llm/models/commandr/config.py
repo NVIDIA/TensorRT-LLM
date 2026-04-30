@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -60,7 +60,8 @@ class CohereConfig(PretrainedConfig):
 
         dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
-        if hf_config.tie_word_embeddings:
+        tie_word_embeddings = getattr(hf_config, 'tie_word_embeddings', False)
+        if tie_word_embeddings:
             kwargs['use_parallel_embedding'] = True
             kwargs['embedding_sharding_dim'] = 0
 
@@ -82,6 +83,7 @@ class CohereConfig(PretrainedConfig):
             rotary_base=hf_config.rope_theta,
             attn_bias=hf_config.attention_bias,
             qk_layernorm=hf_config.use_qk_norm,
+            tie_word_embeddings=tie_word_embeddings,
             mapping=mapping,
             quantization=quant_config,
             **kwargs)
