@@ -255,7 +255,7 @@ ELEM_TOL = {
 @pytest.mark.parametrize("batch_size", [1, 4, 16])
 @pytest.mark.parametrize("next_n", [1, 2, 3])
 @pytest.mark.parametrize("num_heads", [64])
-@pytest.mark.parametrize("avg_ctx", [256, 4096, 32768])
+@pytest.mark.parametrize("avg_ctx", [256, 4096, 8192, 16384, 32768])
 @pytest.mark.parametrize(
     "epi_dtype, output_dtype",
     [
@@ -270,12 +270,12 @@ ELEM_TOL = {
     "num_epi_subtiles",
     [
         1,
-        # 2,    # follow-up: subtile loop
-        # 4,    # follow-up
+        2,  # follow-up: subtile loop
+        4,  # follow-up
     ],
 )
-# @pytest.mark.parametrize("fix_length", [True, False])
-@pytest.mark.parametrize("fix_length", [True])
+@pytest.mark.parametrize("fix_length", [True, False])
+# @pytest.mark.parametrize("fix_length", [True])
 def test_cute_dsl_fp4_paged_mqa_logits(
     batch_size,
     next_n,
@@ -486,9 +486,9 @@ def test_cute_dsl_fp4_paged_mqa_logits(
 
 
 @skip_not_sm100
-@pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("next_n", [1, 2])  # next_n=3 disabled: TMEM overflow
-@pytest.mark.parametrize("avg_ctx", [256, 4096])
+@pytest.mark.parametrize("batch_size", [1, 4, 32])
+@pytest.mark.parametrize("next_n", [1, 2, 3])
+@pytest.mark.parametrize("avg_ctx", [256, 4096, 8192, 16384, 32768])
 @pytest.mark.parametrize("phys_block_kv", [32, 64])
 def test_cute_dsl_fp4_paged_mqa_logits_multi_block(
     batch_size,
