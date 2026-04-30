@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_quant_packed.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/EmptyTensor.h>
@@ -141,6 +142,73 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_quantize_1x128_permute102(at::Ten
 
     return {valueE4M3.slice(0, 0, b * m * n).view({b, m, n}), scaleFP8SF};
 }
+
+// Fused 1x128 FP8 quantize + UE8M0 packing (SM100 only).
+//
+// Drop-in replacement for the (fp8_quantize_1x128 → get_mn_major_tma_aligned_packed_ue8m0_tensor)
+// two-kernel sequence used by deep_gemm fp8 block-scale GEMMs.  Returns the
+// packed UE8M0 scale tensor (int32, MN-major, TMA-aligned) directly so
+// deep_gemm's transform_sf_into_required_layout falls through the
+// `(INT, 1, gran_k)` branch and skips its own pack call.
+std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0(at::Tensor const& self)
+{
+    CHECK_TH_CUDA(self);
+    CHECK_CONTIGUOUS(self);
+
+    TORCH_CHECK(self.scalar_type() == at::ScalarType::BFloat16, "Input matrix dtype must be BF16.");
+    TORCH_CHECK(self.dim() == 2, "input must be a matrix");
+    TORCH_CHECK(tensorrt_llm::common::isSM100Family(),
+        "fp8_quantize_1x128_packed_ue8m0 currently only supports SM100 (Blackwell).");
+
+    auto const m = self.sizes()[0];
+    auto const n = self.sizes()[1];
+
+    TORCH_CHECK(m <= std::numeric_limits<int32_t>::max(), "M must be within int32");
+    TORCH_CHECK(n <= std::numeric_limits<int32_t>::max(), "N must be within int32");
+    TORCH_CHECK(n % 16 == 0, "self.sizes()[1] must be a multiple of 16, but got ", n);
+
+    // FP8 output is row-major [m, n] with the same alignment used by the legacy path.
+    // The legacy path pads M to a multiple of 4; replicate that to avoid layout surprises.
+    auto const m_padded = (m + 4 - 1) / 4 * 4;
+
+    at::Tensor valueE4M3 = at::detail::empty_cuda(
+        {m_padded, n}, at::ScalarType::Float8_e4m3fn, self.device(), /* stride */ std::nullopt);
+
+    // Packed scale physical layout: [num_packed_sf_k, m_aligned] uint32, MN-contiguous in memory.
+    // deep_gemm's get_mn_major_tma_aligned_packed_ue8m0_tensor returns a strided VIEW with
+    // PyTorch shape `[mn, packed_sf_k]` and strides `(1, tma_aligned_mn)`. We build the same
+    // strided view so deep_gemm's transform_sf_into_required_layout falls into the
+    // `(INT, 1, gran_k)` branch and skips its own pack call.
+    auto const num_n_blocks = (n + 127) / 128;
+    auto const num_packed_sf_k = (num_n_blocks + 3) / 4;
+    constexpr int kTmaAlignedUint32Elems = 4; // 16 bytes / sizeof(uint32_t)
+    auto const m_aligned = (m_padded + kTmaAlignedUint32Elems - 1) / kTmaAlignedUint32Elems * kTmaAlignedUint32Elems;
+
+    // Allocate physical buffer [num_packed_sf_k, m_aligned] (K-major in memory).
+    at::Tensor packedBuf = at::detail::empty_cuda(
+        {num_packed_sf_k, m_aligned}, at::ScalarType::Int, self.device(), /* stride */ std::nullopt);
+    // Zero-fill so the [m, m_aligned) tail and out-of-range scale slots are deterministic.
+    packedBuf.zero_();
+
+    auto stream = at::cuda::getCurrentCUDAStream(self.get_device());
+
+    tensorrt_llm::kernels::fp8_blockscale_gemm::launch_fp8_quantize_1x128_packed_bf16_e4m3(
+        reinterpret_cast<__nv_fp8_e4m3*>(valueE4M3.data_ptr()), reinterpret_cast<int32_t*>(packedBuf.data_ptr()),
+        reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()), static_cast<int>(m), static_cast<int>(n),
+        static_cast<int>(m_aligned), stream);
+
+    // Wrap the [num_packed_sf_k, m_aligned] memory as a [m, num_packed_sf_k] strided tensor
+    // matching deep_gemm's get_mn_major_tma_aligned_packed_ue8m0_tensor return contract:
+    //   shape  = (m, num_packed_sf_k)
+    //   stride = (1, m_aligned)
+    at::Tensor packedScale = at::from_blob(
+        packedBuf.data_ptr(),
+        /* sizes   */ {m, num_packed_sf_k},
+        /* strides */ {1, m_aligned},
+        /* deleter */ [keep = packedBuf](void*) mutable {}, packedBuf.options());
+
+    return {valueE4M3.slice(0, 0, m), packedScale};
+}
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -149,10 +217,12 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("fp8_quantize_1x128(Tensor input, bool use_ue8m0=False) -> (Tensor, Tensor)");
     m.def("fp8_batched_quantize_1x128_permute102(Tensor input) -> (Tensor, Tensor)");
+    m.def("fp8_quantize_1x128_packed_ue8m0(Tensor input) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("fp8_quantize_1x128", &tensorrt_llm::torch_ext::fp8_quantize_1x128);
     m.impl("fp8_batched_quantize_1x128_permute102", &tensorrt_llm::torch_ext::fp8_batched_quantize_1x128_permute102);
+    m.impl("fp8_quantize_1x128_packed_ue8m0", &tensorrt_llm::torch_ext::fp8_quantize_1x128_packed_ue8m0);
 }
