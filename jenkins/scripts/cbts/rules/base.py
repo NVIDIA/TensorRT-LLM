@@ -32,11 +32,12 @@ class PRInputs:
 class RuleResult:
     """What a single rule contributes when it applies to a PR.
 
-    `block_filters` (CBTS Layer 3): per-block set of filter prefixes. Each
-    affected block (keyed by `(yaml_stem, block_index)`) maps to the filter
-    levels at which its waive(s) hit. The Selector aggregates this across
-    rules and uses it to write a tmp test-db with each affected block's
-    `tests:` array narrowed to entries in any filter prefix's subtree.
+    `block_filters` (CBTS Layer 3): per-block map of filter prefix -> set of
+    waive ids that resolved to that prefix. Each affected block (keyed by
+    `(yaml_stem, block_index)`) maps to {prefix: {waive_id, ...}}. The
+    Selector aggregates this across rules and `write_filtered_test_db`
+    uses both the prefix (subtree match) AND the waive ids (to skip YAML
+    entries whose `-k "<keyword>"` filter doesn't match the waived test).
     Empty when the rule doesn't produce Layer 3 narrowing.
     """
 
@@ -45,7 +46,7 @@ class RuleResult:
     affected_stages: set[str]
     scope: Optional[str]
     reason: str
-    block_filters: dict[tuple[str, int], set[str]] = field(default_factory=dict)
+    block_filters: dict[tuple[str, int], dict[str, set[str]]] = field(default_factory=dict)
 
 
 class Rule(ABC):

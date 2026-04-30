@@ -515,7 +515,7 @@ def block_matches_stage(block: Block, stage: Stage) -> bool:
 def write_filtered_test_db(
     src_dir: Path,
     output_dir: Path,
-    block_filters: dict[tuple[str, int], set[str]],
+    block_filters: dict[tuple[str, int], dict[str, set[str]]],
 ) -> None:
     """Generate a tmp test-db dir narrowed by CBTS Layer 3.
 
@@ -523,6 +523,15 @@ def write_filtered_test_db(
     that stem, with each affected block's `tests:` array filtered to entries
     in the per-block filter prefix subtree. Unaffected blocks and unaffected
     YAML files are dropped entirely.
+
+    Two narrowing checks per entry:
+      1. Subtree match — entry's target lives under at least one filter prefix
+      2. -k keyword guard — if the entry uses `func -k "K"`, drop it unless
+         `K` would actually run at least one of the waives that resolved to
+         the matching prefix(es). Without this guard, a parent-chain fallback
+         (e.g. waive `func[CUTLASS-fp8-tp4]` -> prefix `func`) over-includes
+         every `-k` variant of `func` even though only `-k "CUTLASS"` would
+         pick up the waived test at runtime.
 
     Why drop unaffected blocks rather than write them through unchanged:
     Layer 3's contract is "only run tests touched by the affected blocks". If
@@ -532,8 +541,8 @@ def write_filtered_test_db(
     3's narrowing semantically tight.
 
     `block_filters` keys: (yaml_stem, block_index) of affected blocks.
-    Values: set of filter prefix strings that should keep tests in their
-    subtree.
+    Values: {filter_prefix: {waive_id, ...}} — prefix governs subtree match;
+    waive ids are consulted by the -k keyword guard above.
 
     Safety: if filtering would empty an affected block's tests, the original
     tests are kept (prevents silent skip from typo'd waive ids or granularity
@@ -560,12 +569,22 @@ def write_filtered_test_db(
                     # Drop unaffected blocks (see docstring rationale).
                     continue
                 original = block_data.get("tests") or []
-                filters = block_filters[key]
-                kept = [
-                    t
-                    for t in original
-                    if any(_target_in_filter_subtree(_entry_target(t), f) for f in filters)
-                ]
+                prefix_to_waives = block_filters[key]
+                kept = []
+                for t in original:
+                    target = _entry_target(t)
+                    matched_waives: set[str] = set()
+                    for prefix, waives in prefix_to_waives.items():
+                        if _target_in_filter_subtree(target, prefix):
+                            matched_waives |= waives
+                    if not matched_waives:
+                        continue
+                    # -k keyword guard: drop entries whose `-k` filter
+                    # excludes every matching waive. Entries without `-k`
+                    # are always kept (`_entry_applies_to_waive` returns
+                    # True when no keyword is present).
+                    if any(_entry_applies_to_waive(t, w) for w in matched_waives):
+                        kept.append(t)
                 # Safety: empty filter result → fallback to original (prevents
                 # silent skip from typo'd waive ids or granularity mismatch).
                 if kept:

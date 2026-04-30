@@ -95,7 +95,10 @@ class WaivesRule(Rule):
         # where a YAML entry actually applies (-k keyword check included).
         # Any unmatchable waive triggers full fallback — better safe than to
         # silently drop CI for a typo'd or out-of-tree waive id.
-        block_filters: dict[tuple[str, int], set[str]] = {}
+        # Record (prefix -> {waive_ids that resolved to it}) per block so
+        # write_filtered_test_db can re-check `-k` keywords against the
+        # original waive ids when narrowing entries.
+        block_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
         affected_blocks: list[Block] = []
         seen_block_keys: set[tuple[str, int]] = set()
         misses: list[str] = []
@@ -108,7 +111,7 @@ class WaivesRule(Rule):
             level, blocks = match
             for block in blocks:
                 key = (block.yaml_stem, block.block_index)
-                block_filters.setdefault(key, set()).add(level)
+                block_filters.setdefault(key, {}).setdefault(level, set()).add(tid)
                 if key not in seen_block_keys:
                     seen_block_keys.add(key)
                     affected_blocks.append(block)

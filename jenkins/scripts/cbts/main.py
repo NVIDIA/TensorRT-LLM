@@ -80,7 +80,7 @@ class SelectionResult:
     affected_cpu_arch: set[str] = field(default_factory=set)
     tests: set[str] = field(default_factory=set)
     reasons: list[str] = field(default_factory=list)
-    block_filters: dict[tuple[str, int], set[str]] = field(default_factory=dict)
+    block_filters: dict[tuple[str, int], dict[str, set[str]]] = field(default_factory=dict)
     test_db_dir_override: Optional[str] = None
 
     def to_json(self) -> str:
@@ -162,12 +162,14 @@ class Selector:
             self.stages[name].cpu_arch for name in affected_stages if name in self.stages
         }
 
-        # Aggregate per-block filter prefix sets across rules. Same block keyed
-        # by multiple rules: union the filter prefixes.
-        block_filters: dict[tuple[str, int], set[str]] = {}
+        # Aggregate per-block prefix->{waive_ids} maps across rules. Same
+        # block keyed by multiple rules: union the waive_ids per prefix.
+        block_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
         for _, r in pairs:
-            for key, filters in r.block_filters.items():
-                block_filters.setdefault(key, set()).update(filters)
+            for key, prefix_to_waives in r.block_filters.items():
+                dst = block_filters.setdefault(key, {})
+                for prefix, waives in prefix_to_waives.items():
+                    dst.setdefault(prefix, set()).update(waives)
 
         return SelectionResult(
             scope=scope,
@@ -310,8 +312,10 @@ def _log_decision_to_stderr(stages: dict[str, Stage], result: SelectionResult) -
     for t in sorted(result.tests):
         print(f"    - {t}", file=out)
     print(f"  block_filters ({len(result.block_filters)} blocks):", file=out)
-    for (yaml_stem, idx), prefixes in sorted(result.block_filters.items()):
-        print(f"    - {yaml_stem}#{idx}: {sorted(prefixes)}", file=out)
+    for (yaml_stem, idx), prefix_to_waives in sorted(result.block_filters.items()):
+        print(f"    - {yaml_stem}#{idx}:", file=out)
+        for prefix, waives in sorted(prefix_to_waives.items()):
+            print(f"        {prefix} <- {sorted(waives)}", file=out)
     print(f"  affected_stages ({len(result.affected_stages)}):", file=out)
     for name in sorted(result.affected_stages):
         stage = stages.get(name)
