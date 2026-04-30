@@ -1,4 +1,5 @@
 import dataclasses
+import inspect
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from dataclasses import dataclass
@@ -30,15 +31,22 @@ def _call_with_optional_summary(
     The nanobind binding for ``get_remaining_blocks_to_completion`` and
     ``get_needed_blocks_one_step`` accepts ``cached_summary: PrefixReuseSummary | None = None``
     so the C++ side can skip a redundant radix-tree walk. Test mocks may not
-    accept this kwarg yet; fall back to the positional form on TypeError to
-    keep the path working for both.
+    accept this kwarg yet; inspect the callable before passing it so real
+    ``TypeError`` exceptions from inside ``fn`` are not hidden.
     """
     if cached_summary is None:
         return fn(*args)
+
     try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
         return fn(*args, cached_summary=cached_summary)
-    except TypeError:
+    if not any(
+        param.name == "cached_summary" or param.kind == inspect.Parameter.VAR_KEYWORD
+        for param in signature.parameters.values()
+    ):
         return fn(*args)
+    return fn(*args, cached_summary=cached_summary)
 
 
 SchedulerOutput = namedtuple(
@@ -821,15 +829,18 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                     remaining_context_len = self.max_context_length - req.context_chunk_size
                     remaining_space = min(remaining_space, remaining_context_len)
 
+                remaining_space = max(0, remaining_space)
+                kept_drafts = min(req.num_draft_tokens, remaining_space)
+
                 if capacity is not None:
                     # capacity - num_ctx_tokens can go negative if the request
-                    # batch has already overshot the compute budget, which would
-                    # wrap draft_discard into an invalid large positive value
-                    # below. Clamp at 0.
-                    remaining_space = max(0, min(remaining_space, capacity - num_ctx_tokens))
-                    num_ctx_tokens += remaining_space
+                    # batch has already overshot the compute budget. Clamp at 0
+                    # and only charge the draft tokens that actually remain
+                    # attached to this request.
+                    kept_drafts = max(0, min(kept_drafts, capacity - num_ctx_tokens))
+                    num_ctx_tokens += kept_drafts
 
-                draft_discard = req.num_draft_tokens - remaining_space
+                draft_discard = req.num_draft_tokens - kept_drafts
                 if draft_discard > 0:
                     logger.debug(f"Discarding {draft_discard} draft tokens")
                     req.discard_draft_tokens(draft_discard)
@@ -1426,21 +1437,7 @@ class PyCapacityScheduler:
         return newly_contributed_context_blocks, newly_contributed_cross_context_blocks
 
     def _make_prefix_summary_caches(self) -> tuple[PrefixSummaryCache, PrefixSummaryCache]:
-        """Build empty caches for `PrefixReuseSummary` keyed by `py_request_id`.
-
-        The caches are populated **lazily** by `_beneficial_to_skip` when it
-        walks the radix tree for a pending request. Downstream consumers
-        (`enough_available_blocks`, `decrement_reserved_blocks`) reuse the
-        cached summary to avoid re-walking.
-
-        Precomputing for every active request is avoided on purpose: the
-        ``req.get_unique_tokens(0)`` marshalling copies a potentially very
-        large token vector across the Python/C++ boundary and, at high
-        concurrency, dominated scheduler CPU time (verified via py-spy:
-        >80% of `_schedule`). Lazy population matches the C++ pattern in
-        ``capacityScheduler.cpp`` which only walks for pending-loop
-        candidates.
-        """
+        """Build empty caches for `PrefixReuseSummary` keyed by `py_request_id`."""
         return {}, {}
 
     def _beneficial_to_skip(

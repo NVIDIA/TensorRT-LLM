@@ -24,16 +24,17 @@ estimation logic under realistic serving conditions.
 """
 
 import csv
-import importlib.metadata
 import json
 import math
 import os
 import queue
 import re
 import subprocess
-import sys
 import threading
 import time
+from collections.abc import Mapping
+from pathlib import Path
+from typing import TypeAlias
 
 import pytest
 import requests as req_lib
@@ -57,6 +58,7 @@ _LMBENCHMARK_SCRIPT_IN_PACKAGE = "synthetic-multi-round-qa/multi-round-qa.py"
 _LMBENCHMARK_INSTALL_SPEC = (
     f"{_LMBENCHMARK_PACKAGE} @ git+https://github.com/LMCache/LMBenchmark.git@{LMBENCHMARK_SHA}"
 )
+CsvMetrics: TypeAlias = dict[str, int | float]
 
 # ---------------------------------------------------------------------------
 # Scheduler / KV-cache config combinations
@@ -227,7 +229,13 @@ def _assert_no_server_errors(server_log: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _wait_for_server_ready(proc, port, timeout=300, interval=2, server_log=None):
+def _wait_for_server_ready(
+    proc: subprocess.Popen,
+    port: int,
+    timeout: int = 300,
+    interval: int = 2,
+    server_log: str | None = None,
+) -> None:
     """Wait for trtllm-serve /health to return 200.
 
     If *server_log* is provided, the log is scanned for error patterns on each
@@ -271,7 +279,7 @@ def _make_server_cmd(port: int, config_path: str) -> list[str]:
     ]
 
 
-def _write_config(tmp_path, cfg: dict, name: str = "config.yml") -> str:
+def _write_config(tmp_path: Path, cfg: dict[str, object], name: str = "config.yml") -> str:
     """Serialise *cfg* to YAML in *tmp_path* and return the file path."""
     path = str(tmp_path / name)
     with open(path, "w") as f:
@@ -285,17 +293,18 @@ def _write_config(tmp_path, cfg: dict, name: str = "config.yml") -> str:
 
 
 def _run_lmbenchmark(
-    port,
-    output_csv,
-    qps=0.5,
-    num_users=4,
-    num_rounds=3,
-    system_prompt=500,
-    chat_history=2000,
-    answer_len=20,
-    duration=30,
-    server_log=None,
-):
+    llm_venv: PythonVenvRunnerImpl,
+    port: int,
+    output_csv: str,
+    qps: float = 0.5,
+    num_users: int = 4,
+    num_rounds: int = 3,
+    system_prompt: int = 500,
+    chat_history: int = 2000,
+    answer_len: int = 20,
+    duration: int = 30,
+    server_log: str | None = None,
+) -> int:
     """Run the LMBenchmark multi-round-qa script and return the exit code.
 
     stdout and stderr are drained in background threads so that the main
@@ -305,9 +314,9 @@ def _run_lmbenchmark(
     goes quiet (which is exactly what happens when the server stalls),
     defeating the point of the watchdog.
     """
+    assert LMBENCHMARK_SCRIPT, "ensure_lmbenchmark fixture must resolve LMBenchmark first"
     script_dir = os.path.dirname(LMBENCHMARK_SCRIPT)
     cmd = [
-        sys.executable,
         LMBENCHMARK_SCRIPT,
         "--num-users",
         str(num_users),
@@ -337,21 +346,30 @@ def _run_lmbenchmark(
     print_info(f"Running LMBenchmark: {' '.join(cmd)}")
 
     t_start = time.time()
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=script_dir
-    )
 
-    stdout_q: queue.Queue = queue.Queue()
+    def _popen_lmbenchmark(call_args: list[str], env: Mapping[str, str]) -> subprocess.Popen:
+        return subprocess.Popen(
+            call_args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=script_dir,
+            env=env,
+        )
+
+    proc = llm_venv.run_cmd(cmd, caller=_popen_lmbenchmark)
+
+    stdout_q: queue.Queue[str | None] = queue.Queue()
     stderr_lines: list[str] = []
 
-    def _drain_stdout():
+    def _drain_stdout() -> None:
         try:
             for line in iter(proc.stdout.readline, ""):
                 stdout_q.put(line)
         finally:
             stdout_q.put(None)  # EOF sentinel
 
-    def _drain_stderr():
+    def _drain_stderr() -> None:
         for line in iter(proc.stderr.readline, ""):
             stderr_lines.append(line)
 
@@ -385,6 +403,13 @@ def _run_lmbenchmark(
         stderr_thread.join(timeout=5)
         return -1
 
+    def _cleanup_if_running() -> None:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        stdout_thread.join(timeout=5)
+        stderr_thread.join(timeout=5)
+
     def _drain_queued_stdout() -> int | None:
         """Pop all queued stdout lines; return -1 if NaN seen, else None."""
         while True:
@@ -398,6 +423,7 @@ def _run_lmbenchmark(
             if line and _NAN_RE.search(line):
                 return _kill(f"NaN detected in benchmark output: {line!r}")
 
+    completed = False
     try:
         while proc.poll() is None:
             rc = _drain_queued_stdout()
@@ -427,7 +453,7 @@ def _run_lmbenchmark(
                     resp = req_lib.get(f"http://localhost:{port}/health", timeout=5)
                     if resp.status_code == 200:
                         last_health_ok = now
-                except Exception:
+                except RequestException:
                     pass
                 # 60s (was 30s) — extreme QPS stages need more slack before
                 # declaring the server stalled; genuine hangs still get caught.
@@ -435,13 +461,10 @@ def _run_lmbenchmark(
                     return _kill("Server stopped responding to /health (stalled)")
 
             time.sleep(0.2)
-
-    except Exception:
-        proc.kill()
-        proc.wait()
-        stdout_thread.join(timeout=5)
-        stderr_thread.join(timeout=5)
-        raise
+        completed = True
+    finally:
+        if not completed:
+            _cleanup_if_running()
 
     # Benchmark has exited.  Wait for drain threads to finish so we see
     # every remaining line, then surface any leftover output.
@@ -479,7 +502,7 @@ def _run_lmbenchmark(
     return proc.returncode
 
 
-def _parse_csv_metrics(csv_path):
+def _parse_csv_metrics(csv_path: str) -> CsvMetrics | None:
     """Parse LMBenchmark output CSV and return TTFT metrics.
 
     Returns a dict with keys:
@@ -496,7 +519,7 @@ def _parse_csv_metrics(csv_path):
         return None
 
     nan_count = 0
-    ttfts = []
+    ttfts: list[float] = []
     for r in rows:
         raw = r.get("ttft")
         if not raw:
@@ -511,22 +534,28 @@ def _parse_csv_metrics(csv_path):
         else:
             ttfts.append(v)
 
-    if not ttfts:
-        return None
-
-    ttfts.sort()
-    return {
+    metrics: CsvMetrics = {
         "num_requests": len(rows),
         "nan_count": nan_count,
         "ttft_count": len(ttfts),
-        "ttft_avg": sum(ttfts) / len(ttfts),
-        "ttft_p50": ttfts[len(ttfts) // 2],
-        "ttft_p99": ttfts[int(len(ttfts) * 0.99)],
     }
+    if not ttfts:
+        return metrics
+
+    ttfts.sort()
+    metrics.update(
+        {
+            "ttft_avg": sum(ttfts) / len(ttfts),
+            "ttft_p50": ttfts[len(ttfts) // 2],
+            "ttft_p99": ttfts[int(len(ttfts) * 0.99)],
+        }
+    )
+    return metrics
 
 
 def _run_and_assert_stage(
     label: str,
+    llm_venv: PythonVenvRunnerImpl,
     port: int,
     output_csv: str,
     server_log: str,
@@ -538,9 +567,10 @@ def _run_and_assert_stage(
     chat_history: int,
     answer_len: int,
     duration: int,
-) -> dict:
+) -> CsvMetrics:
     """Run one LMBenchmark stage, assert success, and return the metrics dict."""
     rc = _run_lmbenchmark(
+        llm_venv=llm_venv,
         port=port,
         output_csv=output_csv,
         qps=qps,
@@ -570,20 +600,10 @@ def _run_and_assert_stage(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_lmbenchmark_script() -> str:
-    """Return the benchmark script from the pinned installed LMBenchmark package."""
-    try:
-        dist = importlib.metadata.distribution(_LMBENCHMARK_PACKAGE)
-    except importlib.metadata.PackageNotFoundError:
-        pytest.fail(
-            "LMBenchmark package is not installed after fixture setup. "
-            f"Expected {_LMBENCHMARK_SCRIPT_IN_PACKAGE} at commit {LMBENCHMARK_SHA}."
-        )
-
-    direct_url = dist.read_text("direct_url.json")
+def _validate_lmbenchmark_direct_url(direct_url: str | None) -> None:
+    """Verify the installed LMBenchmark package records the pinned Git revision."""
     if direct_url is None:
         pytest.fail("LMBenchmark package is missing direct_url.json provenance.")
-
     try:
         direct_url_data = json.loads(direct_url)
     except json.JSONDecodeError as exc:
@@ -597,7 +617,41 @@ def _resolve_lmbenchmark_script() -> str:
             f"expected {LMBENCHMARK_SHA}."
         )
 
-    script = os.fspath(dist.locate_file(_LMBENCHMARK_SCRIPT_IN_PACKAGE))
+
+def _resolve_lmbenchmark_install(llm_venv: PythonVenvRunnerImpl) -> str:
+    """Return the benchmark script from the fixture Python environment."""
+    query = f"""
+import importlib.metadata
+import json
+import os
+
+package = {_LMBENCHMARK_PACKAGE!r}
+script_in_package = {_LMBENCHMARK_SCRIPT_IN_PACKAGE!r}
+
+try:
+    dist = importlib.metadata.distribution(package)
+except importlib.metadata.PackageNotFoundError:
+    raise SystemExit(
+        "LMBenchmark package is not installed after fixture setup. "
+        f"Expected {{script_in_package}}."
+    )
+
+print(
+    json.dumps(
+        {{
+            "direct_url": dist.read_text("direct_url.json"),
+            "script": os.fspath(dist.locate_file(script_in_package)),
+        }}
+    )
+)
+"""
+    try:
+        payload = json.loads(llm_venv.run_output(query))
+    except (RuntimeError, json.JSONDecodeError) as exc:
+        pytest.fail(f"Failed to resolve installed LMBenchmark package: {exc}")
+
+    _validate_lmbenchmark_direct_url(payload.get("direct_url"))
+    script = payload["script"]
     if not os.path.exists(script):
         pytest.fail(
             f"LMBenchmark package installed, but {_LMBENCHMARK_SCRIPT_IN_PACKAGE} was not found."
@@ -606,12 +660,13 @@ def _resolve_lmbenchmark_script() -> str:
 
 
 @pytest.fixture(scope="module")
-def ensure_lmbenchmark(llm_venv: PythonVenvRunnerImpl) -> None:
+def ensure_lmbenchmark(llm_venv: PythonVenvRunnerImpl) -> PythonVenvRunnerImpl:
     """Install and resolve the pinned LMBenchmark script used by this module."""
     global LMBENCHMARK_SCRIPT
 
     llm_venv.run_cmd(["-m", "pip", "install", _LMBENCHMARK_INSTALL_SPEC], timeout=600)
-    LMBENCHMARK_SCRIPT = _resolve_lmbenchmark_script()
+    LMBENCHMARK_SCRIPT = _resolve_lmbenchmark_install(llm_venv)
+    return llm_venv
 
 
 # ---------------------------------------------------------------------------
@@ -635,7 +690,9 @@ class TestServePrefixAwareScheduling:
       * disable_overlap_scheduler: false / true
     """
 
-    def test_multi_round_qa_shared_prefix_smoke(self, tmp_path, ensure_lmbenchmark):
+    def test_multi_round_qa_shared_prefix_smoke(
+        self, tmp_path: Path, ensure_lmbenchmark: PythonVenvRunnerImpl
+    ) -> None:
         """Pre-merge smoke: two-stage LMBenchmark run to catch the original bug.
 
         Uses the baseline scheduler config (GUARANTEED_NO_EVICT + chunked
@@ -667,6 +724,7 @@ class TestServePrefixAwareScheduling:
                 print_info("Smoke stage 1: seeding radix tree...")
                 _run_and_assert_stage(
                     "Smoke warmup",
+                    ensure_lmbenchmark,
                     port,
                     str(tmp_path / "smoke_warmup.csv"),
                     server_log,
@@ -683,6 +741,7 @@ class TestServePrefixAwareScheduling:
                 print_info("Smoke stage 2: main load at QPS=32...")
                 _run_and_assert_stage(
                     "Smoke main stage",
+                    ensure_lmbenchmark,
                     port,
                     str(tmp_path / "smoke_main.csv"),
                     server_log,
@@ -719,7 +778,12 @@ class TestServePrefixAwareScheduling:
             )
         ],
     )
-    def test_multi_round_qa_shared_prefix(self, tmp_path, sched_cfg, ensure_lmbenchmark):
+    def test_multi_round_qa_shared_prefix(
+        self,
+        tmp_path: Path,
+        sched_cfg: dict[str, object],
+        ensure_lmbenchmark: PythonVenvRunnerImpl,
+    ) -> None:
         """Full QPS-sweep regression: shared prefix at escalating load.
 
         Launches trtllm-serve with block reuse enabled, then runs the full
@@ -756,6 +820,7 @@ class TestServePrefixAwareScheduling:
                 print_info("Warmup to seed the radix tree with the shared system prompt.")
                 _run_and_assert_stage(
                     "Warmup to seed the radix tree with the shared system prompt.",
+                    ensure_lmbenchmark,
                     port,
                     str(tmp_path / "warmup_1u_qps2.csv"),
                     server_log,
@@ -772,6 +837,7 @@ class TestServePrefixAwareScheduling:
                     print_info(f"Benchmark: 15 users, QPS={qps}...")
                     metrics = _run_and_assert_stage(
                         f"Benchmark at QPS={qps}",
+                        ensure_lmbenchmark,
                         port,
                         str(tmp_path / f"benchmark_15u_qps{qps}.csv"),
                         server_log,

@@ -1758,6 +1758,34 @@ class TestDraftTokensGreaterThanChunkSize:
             f"got num_draft_tokens={r2.num_draft_tokens}, expected 9"
         )
 
+    def test_short_draft_request_charges_only_kept_drafts(self) -> None:
+        """Regression: a request with fewer drafts than chunk remainder should
+        not charge the whole remainder against the shared compute budget.
+        """
+        config = ContextChunkingConfig(ChunkingPolicy.FIRST_COME_FIRST_SERVED, chunk_unit_size=16)
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=64,
+            max_num_tokens=30,
+            ctx_chunk_config=config,
+        )
+        scheduler.max_context_length = 64
+
+        requests = [
+            make_context_request(0, prompt_len=3, draft_tokens_len=1),
+            make_context_request(1, prompt_len=3, draft_tokens_len=13),
+            make_context_request(2, prompt_len=3, draft_tokens_len=13),
+        ]
+        ctx, _ = scheduler.schedule(requests, set())
+        assert len(ctx) == 3
+
+        r0 = next(r for r in ctx if r.request_id == 0)
+        r1 = next(r for r in ctx if r.request_id == 1)
+        r2 = next(r for r in ctx if r.request_id == 2)
+
+        assert r0.num_draft_tokens == 1
+        assert r1.num_draft_tokens == 13
+        assert r2.num_draft_tokens == 7
+
     def test_no_draft_tokens_bypasses_fit_draft(self):
         """Regression: _fit_draft_tokens must not discard when no drafts exist.
 
