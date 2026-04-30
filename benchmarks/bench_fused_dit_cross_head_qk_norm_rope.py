@@ -11,7 +11,7 @@ Three baselines are compared:
                 + RoPE in a single pass.
 
 Usage:
-    python bench_fused_dit_cross_head_qk_norm_rope.py
+    python benchmarks/bench_fused_dit_cross_head_qk_norm_rope.py
 """
 
 import torch

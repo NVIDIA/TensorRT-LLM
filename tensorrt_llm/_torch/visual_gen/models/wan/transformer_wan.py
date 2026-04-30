@@ -261,7 +261,7 @@ class WanBlock(nn.Module):
             hidden_size=hidden_size, eps=eps, dtype=torch.float32, has_weights=False, has_bias=False
         )
 
-        # Self-attention with fused QKV
+        # Self-attention with fused QKV.
         # fuse_qk_norm_rope=True: use fused cross-head QK Norm + RoPE CUDA kernel
         # to eliminate extra global memory round-trip between separate norm and RoPE.
         self.attn1 = Attention(
@@ -271,6 +271,7 @@ class WanBlock(nn.Module):
             qkv_mode=QKVMode.FUSE_QKV,
             qk_norm=True,
             eps=eps,
+            fuse_qk_norm_rope=True,
             config=model_config,
             layer_idx=_layer_idx,
         )

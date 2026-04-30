@@ -68,10 +68,8 @@ class Attention(nn.Module):
 
         # Fused QK Norm + RoPE: each model class opts in via fuse_qk_norm_rope.
         # Supported for both per_head (FLUX) and full/cross-head (WAN) norm modes.
-        if fuse_qk_norm_rope is not None:
-            self.fuse_qk_norm_rope = fuse_qk_norm_rope
-        else:
-            self.fuse_qk_norm_rope = True
+        # Defaults to False; models that want the fused kernel must pass True explicitly.
+        self.fuse_qk_norm_rope = fuse_qk_norm_rope if fuse_qk_norm_rope is not None else False
         self.interleave = interleave
 
         # Select compute backend (orthogonal to parallelism)
