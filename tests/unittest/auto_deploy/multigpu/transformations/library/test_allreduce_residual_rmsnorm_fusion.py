@@ -151,11 +151,14 @@ def _test_allreduce_fusion(port: int, ModuleCls, strategy: str):
     ids=["strategy_auto", "strategy_nccl", "strategy_oneshot"],
 )
 def test_allreduce_fusion(device_count, ModuleCls, strategy):
+    # Test the allreduce, residual, and rmsnorm fusion.
+    # MpiPoolSession is required because the test exercises trtllm's MPI-mode allreduce ops,
+    # which only activate when is_ompi() is true.
     if device_count <= 1:
         pytest.skip("Require multi GPUs to run test_allreduce_fusion.")
 
     n_workers = device_count
-    # Retry on EADDRINUSE: there is a TOCTOU race between get_free_port() in
+    # Retry on EADDRINUSE: there is a Time-of-check-to-time-of-use (TOCTOU) race between get_free_port() in
     # the parent and dist.init_process_group("nccl") in the workers. The
     # spawn_multiprocess_job path handles this internally; the MpiPoolSession
     # path used here does not, so retry with a fresh port and pool.
