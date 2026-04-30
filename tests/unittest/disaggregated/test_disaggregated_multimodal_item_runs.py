@@ -14,25 +14,25 @@ from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.sampling_params import SamplingParams
 
 MM_HASHES = [[1, 2, 3, 4, 5, 6, 7, 8]]
-MM_HASH_POSITIONS = [[1, 3]]
+MM_ITEM_RUNS = [[(1, 1), (3, 1)]]
 MM_HANDLES = [{"tensor_size": [2, 8], "ipc_handle": "handle"}]
 
 
-def test_disaggregated_params_accepts_multimodal_hash_positions():
+def test_disaggregated_params_accepts_multimodal_item_runs():
     params = DisaggregatedParams(
         multimodal_embedding_handles=MM_HANDLES,
         multimodal_hashes=MM_HASHES,
-        multimodal_hash_positions=MM_HASH_POSITIONS,
+        multimodal_item_runs=MM_ITEM_RUNS,
     )
 
-    assert params.multimodal_hash_positions == MM_HASH_POSITIONS
+    assert params.multimodal_item_runs == MM_ITEM_RUNS
 
 
-def test_disaggregated_params_rejects_hash_position_count_mismatch():
-    with pytest.raises(AssertionError, match="multimodal_hash_positions and multimodal_hashes"):
+def test_disaggregated_params_rejects_item_run_count_mismatch():
+    with pytest.raises(AssertionError, match="multimodal_item_runs and multimodal_hashes"):
         DisaggregatedParams(
             multimodal_hashes=MM_HASHES,
-            multimodal_hash_positions=[MM_HASH_POSITIONS[0], [5]],
+            multimodal_item_runs=[MM_ITEM_RUNS[0], [(5, 1)]],
         )
 
 
@@ -66,9 +66,9 @@ def _response(
     return SimpleNamespace(has_error=lambda: False, result=response_result)
 
 
-def test_generation_result_preserves_hash_positions_through_epd_handoff():
+def test_generation_result_preserves_item_runs_through_epd_handoff():
     multimodal_input = MultimodalInput.from_components(
-        MM_HASHES, [1], [2], mm_hash_positions=MM_HASH_POSITIONS
+        MM_HASHES, [1], [2], mm_item_runs=MM_ITEM_RUNS
     )
     request = GenerationRequest(
         prompt_token_ids=[11, 999, 77, 999, 12],
@@ -79,7 +79,7 @@ def test_generation_result_preserves_hash_positions_through_epd_handoff():
 
     result._handle_response(_response(10, finished=False, mm_embedding_handles=MM_HANDLES))
     assert result.disaggregated_params.multimodal_hashes == MM_HASHES
-    assert result.disaggregated_params.multimodal_hash_positions == MM_HASH_POSITIONS
+    assert result.disaggregated_params.multimodal_item_runs == MM_ITEM_RUNS
 
     context_phase_params = SimpleNamespace(
         first_gen_tokens=[10],
@@ -93,10 +93,10 @@ def test_generation_result_preserves_hash_positions_through_epd_handoff():
 
     assert result.disaggregated_params.multimodal_embedding_handles is None
     assert result.disaggregated_params.multimodal_hashes == MM_HASHES
-    assert result.disaggregated_params.multimodal_hash_positions == MM_HASH_POSITIONS
+    assert result.disaggregated_params.multimodal_item_runs == MM_ITEM_RUNS
 
 
-def test_llm_preprocess_reconstructs_multimodal_input_with_hash_positions():
+def test_llm_preprocess_reconstructs_multimodal_input_with_item_runs():
     class FakeInputProcessor:
         support_mm_disagg = True
 
@@ -109,7 +109,7 @@ def test_llm_preprocess_reconstructs_multimodal_input_with_hash_positions():
     disaggregated_params = DisaggregatedParams(
         multimodal_embedding_handles=MM_HANDLES,
         multimodal_hashes=MM_HASHES,
-        multimodal_hash_positions=MM_HASH_POSITIONS,
+        multimodal_item_runs=MM_ITEM_RUNS,
     )
 
     prompt_token_ids, prompt, query_token_ids, multimodal_params = BaseLLM._preprocess(
@@ -121,4 +121,4 @@ def test_llm_preprocess_reconstructs_multimodal_input_with_hash_positions():
     assert query_token_ids is None
     assert multimodal_params.multimodal_data["multimodal_embedding"] == MM_HANDLES
     assert multimodal_params.multimodal_input.multimodal_hashes == MM_HASHES
-    assert multimodal_params.multimodal_input.multimodal_hash_positions == MM_HASH_POSITIONS
+    assert multimodal_params.multimodal_input.multimodal_item_runs == MM_ITEM_RUNS

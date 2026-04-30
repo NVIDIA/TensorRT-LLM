@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,6 +34,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/chrono.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unique_ptr.h>
@@ -233,15 +234,15 @@ void initBindings(nb::module_& m)
                 }
                 return lengths;
             })
-        .def_prop_ro("multimodal_hash_positions",
+        .def_prop_ro("multimodal_item_runs",
             [](GenLlmReq& self)
             {
-                std::optional<std::vector<std::vector<GenLlmReq::SizeType32>>> positions = std::nullopt;
-                if (self.getMultimodalHashPositions())
+                std::optional<GenLlmReq::MultimodalItemRuns> runs = std::nullopt;
+                if (self.getMultimodalItemRuns())
                 {
-                    positions = *self.getMultimodalHashPositions().value();
+                    runs = *self.getMultimodalItemRuns().value();
                 }
-                return positions;
+                return runs;
             })
         .def_prop_ro("position_ids",
             [](GenLlmReq& self)
@@ -304,8 +305,9 @@ void initBindings(nb::module_& m)
                 std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_positions,
                 std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_lengths,
                 std::optional<std::vector<std::optional<std::string>>> multimodal_uuids,
-                std::optional<std::vector<std::vector<tb::LlmRequest::SizeType32>>> multimodal_hash_positions,
-                std::optional<at::Tensor> multimodal_embedding, std::optional<at::Tensor> mrope_rotary_cos_sin,
+                std::optional<at::Tensor> multimodal_embedding,
+                std::optional<tb::LlmRequest::MultimodalItemRuns> multimodal_item_runs,
+                std::optional<at::Tensor> mrope_rotary_cos_sin,
                 std::optional<tb::LlmRequest::SizeType32> mrope_position_deltas,
                 std::optional<LoraTaskIdType> lora_task_id, std::optional<at::Tensor> lora_weights,
                 std::optional<at::Tensor> lora_config,
@@ -360,11 +362,11 @@ void initBindings(nb::module_& m)
                 new (self) tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
                     end_id, pad_id, embedding_bias_tensor_ptr, bad_words_list_tensor_ptr, stop_words_list_tensor_ptr,
                     position_ids, prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes,
-                    multimodal_positions, multimodal_lengths, multimodal_uuids, multimodal_hash_positions,
-                    multimodal_embedding_tensor_ptr, mrope_rotary_cos_sin_tensor_ptr, mrope_position_deltas,
-                    lora_task_id, lora_weights_tensor_ptr, lora_config_tensor_ptr, lookahead_config,
-                    kv_cache_retention_config, return_log_probs, return_context_logits, return_generation_logits,
-                    draft_tokens, draft_logits_tensor_ptr, exclude_input_from_output, logits_post_processor,
+                    multimodal_positions, multimodal_lengths, multimodal_uuids, multimodal_embedding_tensor_ptr,
+                    multimodal_item_runs, mrope_rotary_cos_sin_tensor_ptr, mrope_position_deltas, lora_task_id,
+                    lora_weights_tensor_ptr, lora_config_tensor_ptr, lookahead_config, kv_cache_retention_config,
+                    return_log_probs, return_context_logits, return_generation_logits, draft_tokens,
+                    draft_logits_tensor_ptr, exclude_input_from_output, logits_post_processor,
                     apply_logits_post_processor_batched, encoder_input_tokens, return_encoder_output, client_id,
                     priority, encoder_input_features_tensor_ptr, encoder_output_length, cross_attention_mask_tensor_ptr,
                     llm_request_type, input_token_extra_ids, num_return_sequences, eagle_config,
@@ -378,7 +380,7 @@ void initBindings(nb::module_& m)
             nb::arg("prompt_embedding_table") = std::nullopt, nb::arg("prompt_vocab_size") = std::nullopt,
             nb::arg("multimodal_hashes") = std::nullopt, nb::arg("multimodal_positions") = std::nullopt,
             nb::arg("multimodal_lengths") = std::nullopt, nb::arg("multimodal_uuids") = std::nullopt,
-            nb::arg("multimodal_hash_positions") = std::nullopt, nb::arg("multimodal_embedding") = std::nullopt,
+            nb::arg("multimodal_embedding") = std::nullopt, nb::arg("multimodal_item_runs") = std::nullopt,
             nb::arg("mrope_rotary_cos_sin") = std::nullopt, nb::arg("mrope_position_deltas") = std::nullopt,
             nb::arg("lora_task_id") = std::nullopt, nb::arg("lora_weights") = std::nullopt,
             nb::arg("lora_config") = std::nullopt, nb::arg("lookahead_config") = std::nullopt,

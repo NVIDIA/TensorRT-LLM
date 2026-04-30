@@ -64,7 +64,7 @@ def _make_request(
     multimodal_hashes=None,
     multimodal_positions=None,
     multimodal_lengths=None,
-    multimodal_hash_positions=None,
+    multimodal_item_runs=None,
 ):
     return LlmRequest(
         request_id=0,
@@ -77,7 +77,7 @@ def _make_request(
         multimodal_hashes=multimodal_hashes,
         multimodal_positions=multimodal_positions,
         multimodal_lengths=multimodal_lengths,
-        multimodal_hash_positions=multimodal_hash_positions,
+        multimodal_item_runs=multimodal_item_runs,
     )
 
 
@@ -88,12 +88,12 @@ def _augment(req, start: int = 0, end: int | None = None):
     )
 
 
-def test_hash_positions_replace_only_exact_sparse_prompt_positions():
+def test_item_runs_replace_only_exact_sparse_prompt_coverage():
     req = _make_request(
         multimodal_hashes=[HASH_INTS],
         multimodal_positions=[1],
         multimodal_lengths=[2],
-        multimodal_hash_positions=[[1, 3]],
+        multimodal_item_runs=[[(1, 1), (3, 1)]],
     )
 
     assert _augment(req) == [
@@ -107,7 +107,7 @@ def test_hash_positions_replace_only_exact_sparse_prompt_positions():
     assert _augment(req, start=3, end=4) == [DIGEST_TOKENS[1]]
 
 
-def test_missing_hash_positions_keeps_legacy_contiguous_projection():
+def test_missing_item_runs_keeps_legacy_contiguous_projection():
     req = _make_request(
         multimodal_hashes=[HASH_INTS], multimodal_positions=[1], multimodal_lengths=[2]
     )
@@ -121,14 +121,14 @@ def test_missing_hash_positions_keeps_legacy_contiguous_projection():
     ]
 
 
-def test_multiple_items_replace_sparse_positions_across_slices():
+def test_multiple_items_replace_sparse_runs_across_slices():
     prompt_tokens = [101, 999, 201, 999, 301, 998, 401, 998, 402, 998, 501]
     req = _make_request(
         prompt_tokens,
         multimodal_hashes=[HASH_INTS, OTHER_HASH_INTS],
         multimodal_positions=[1, 5],
         multimodal_lengths=[2, 3],
-        multimodal_hash_positions=[[1, 3], [5, 7, 9]],
+        multimodal_item_runs=[[(1, 1), (3, 1)], [(5, 1), (7, 1), (9, 1)]],
     )
 
     assert _augment(req) == [
@@ -160,39 +160,40 @@ def test_multiple_items_replace_sparse_positions_across_slices():
 
 
 @pytest.mark.parametrize(
-    "multimodal_hash_positions, match",
+    "multimodal_item_runs, match",
     [
-        ([[1, 99]], "outside prompt"),
-        ([[-1, 3]], "outside prompt"),
-        ([[1, 1]], "strictly increasing"),
-        ([[1]], "length"),
-        ([[2, 3]], "start"),
+        ([[(1, 1), (99, 1)]], "outside prompt"),
+        ([[(-1, 1), (3, 1)]], "outside prompt"),
+        ([[(1, 2), (2, 1)]], "ordered and non-overlapping"),
+        ([[(1, 0), (3, 1)]], "positive length"),
+        ([[(1, 1)]], "length"),
+        ([[(2, 2)]], "start"),
     ],
 )
-def test_invalid_exact_hash_positions_are_rejected(multimodal_hash_positions, match):
+def test_invalid_exact_item_runs_are_rejected(multimodal_item_runs, match):
     req = _make_request(
         multimodal_hashes=[HASH_INTS],
         multimodal_positions=[1],
         multimodal_lengths=[2],
-        multimodal_hash_positions=multimodal_hash_positions,
+        multimodal_item_runs=multimodal_item_runs,
     )
 
     with pytest.raises(ValueError, match=match):
         _augment(req)
 
 
-def test_same_approximate_span_with_different_exact_positions_has_distinct_cache_keys():
+def test_same_contiguous_fallback_span_with_different_exact_runs_has_distinct_cache_keys():
     sparse_req = _make_request(
         multimodal_hashes=[HASH_INTS],
         multimodal_positions=[1],
         multimodal_lengths=[2],
-        multimodal_hash_positions=[[1, 3]],
+        multimodal_item_runs=[[(1, 1), (3, 1)]],
     )
     contiguous_req = _make_request(
         multimodal_hashes=[HASH_INTS],
         multimodal_positions=[1],
         multimodal_lengths=[2],
-        multimodal_hash_positions=[[1, 2]],
+        multimodal_item_runs=[[(1, 2)]],
     )
 
     sparse_tokens = _augment(sparse_req)

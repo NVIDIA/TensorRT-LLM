@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -340,9 +340,9 @@ MultimodalInput Serialization::deserializeMultimodalInput(std::istream& is)
     auto multimodalPositions = su::deserialize<std::vector<SizeType32>>(is);
     auto multimodalLengths = su::deserialize<std::vector<SizeType32>>(is);
     auto multimodalUuids = su::deserialize<std::optional<std::vector<std::optional<std::string>>>>(is);
-    auto multimodalHashPositions = su::deserialize<std::optional<std::vector<std::vector<SizeType32>>>>(is);
+    auto multimodalItemRuns = su::deserialize<std::optional<MultimodalItemRuns>>(is);
     return MultimodalInput{std::move(multimodalHashes), std::move(multimodalPositions), std::move(multimodalLengths),
-        std::move(multimodalUuids), std::move(multimodalHashPositions)};
+        std::move(multimodalUuids), std::move(multimodalItemRuns)};
 }
 
 void Serialization::serialize(MultimodalInput const& multimodalInput, std::ostream& os)
@@ -351,7 +351,7 @@ void Serialization::serialize(MultimodalInput const& multimodalInput, std::ostre
     su::serialize(multimodalInput.mMultimodalPositions, os);
     su::serialize(multimodalInput.mMultimodalLengths, os);
     su::serialize(multimodalInput.mMultimodalUuids, os);
-    su::serialize(multimodalInput.mMultimodalHashPositions, os);
+    su::serialize(multimodalInput.mMultimodalItemRuns, os);
 }
 
 size_t Serialization::serializedSize(MultimodalInput const& multimodalInput)
@@ -361,7 +361,7 @@ size_t Serialization::serializedSize(MultimodalInput const& multimodalInput)
     totalSize += su::serializedSize(multimodalInput.mMultimodalPositions);
     totalSize += su::serializedSize(multimodalInput.mMultimodalLengths);
     totalSize += su::serializedSize(multimodalInput.mMultimodalUuids);
-    totalSize += su::serializedSize(multimodalInput.mMultimodalHashPositions);
+    totalSize += su::serializedSize(multimodalInput.mMultimodalItemRuns);
     return totalSize;
 }
 

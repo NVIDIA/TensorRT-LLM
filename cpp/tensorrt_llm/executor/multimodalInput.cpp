@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,12 +23,12 @@ namespace tensorrt_llm::executor
 MultimodalInput::MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
     std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths,
     std::optional<std::vector<std::optional<std::string>>> multimodalUuids,
-    std::optional<std::vector<std::vector<SizeType32>>> multimodalHashPositions)
+    std::optional<MultimodalItemRuns> multimodalItemRuns)
     : mMultimodalHashes(std::move(multimodalHashes))
     , mMultimodalPositions(std::move(multimodalPositions))
     , mMultimodalLengths(std::move(multimodalLengths))
     , mMultimodalUuids(std::move(multimodalUuids))
-    , mMultimodalHashPositions(std::move(multimodalHashPositions))
+    , mMultimodalItemRuns(std::move(multimodalItemRuns))
 {
 }
 
@@ -52,9 +52,9 @@ std::optional<std::vector<std::optional<std::string>>> const& MultimodalInput::g
     return mMultimodalUuids;
 }
 
-std::optional<std::vector<std::vector<SizeType32>>> const& MultimodalInput::getMultimodalHashPositions() const
+std::optional<MultimodalItemRuns> const& MultimodalInput::getMultimodalItemRuns() const
 {
-    return mMultimodalHashPositions;
+    return mMultimodalItemRuns;
 }
 
 } // namespace tensorrt_llm::executor

@@ -53,22 +53,28 @@ std::vector<MmKey> generateBlockHashExtraKeys(
     auto const multimodalPositions = llmRequest.getMultimodalPositions();
     auto const multimodalLengths = llmRequest.getMultimodalLengths();
     auto const multimodalUuids = llmRequest.getMultimodalUuids();
-    auto const multimodalHashPositions = llmRequest.getMultimodalHashPositions();
+    auto const multimodalItemRuns = llmRequest.getMultimodalItemRuns();
 
     if (!multimodalHashes || !(*multimodalHashes) || (*multimodalHashes)->empty())
     {
         return {};
     }
 
-    auto const hasExactHashPositions = multimodalHashPositions && *multimodalHashPositions;
-    if (hasExactHashPositions)
+    auto const hasItemRuns = multimodalItemRuns && *multimodalItemRuns;
+    if (hasItemRuns)
     {
-        TLLM_CHECK_WITH_INFO((*multimodalHashes)->size() == (*multimodalHashPositions)->size(),
-            "Multimodal hash arrays and hash-position arrays have mismatched sizes");
-        TLLM_CHECK_WITH_INFO(multimodalLengths && *multimodalLengths,
-            "Multimodal hash positions require multimodal lengths for validation");
+        auto const promptLen = llmRequest.getPromptLen();
+        TLLM_CHECK_WITH_INFO((*multimodalHashes)->size() == (*multimodalItemRuns)->size(),
+            "Multimodal hash arrays and item-run arrays have mismatched sizes");
+        TLLM_CHECK_WITH_INFO(
+            multimodalLengths && *multimodalLengths, "Multimodal item runs require multimodal lengths for validation");
         TLLM_CHECK_WITH_INFO((*multimodalHashes)->size() == (*multimodalLengths)->size(),
             "Multimodal hash arrays and length arrays have mismatched sizes");
+        if (multimodalPositions && *multimodalPositions)
+        {
+            TLLM_CHECK_WITH_INFO((*multimodalHashes)->size() == (*multimodalPositions)->size(),
+                "Multimodal hash arrays and position arrays have mismatched sizes");
+        }
 
         std::vector<MmKey> extraKeys;
         extraKeys.reserve((*multimodalHashes)->size());
@@ -76,10 +82,9 @@ std::vector<MmKey> generateBlockHashExtraKeys(
         for (size_t i = 0; i < (*multimodalHashes)->size(); ++i)
         {
             auto const mmHashArray = makeHashArray((*(*multimodalHashes))[i]);
-            auto const& promptPositions = (*(*multimodalHashPositions))[i];
+            auto const& positionRuns = (*(*multimodalItemRuns))[i];
             auto const expectedLength = (*(*multimodalLengths))[i];
-            TLLM_CHECK_WITH_INFO(static_cast<SizeType32>(promptPositions.size()) == expectedLength,
-                "Multimodal hash positions and lengths have mismatched sizes");
+            TLLM_CHECK_WITH_INFO(!positionRuns.empty(), "Multimodal item runs must not be empty");
 
             std::optional<std::string> uuid = std::nullopt;
             if (multimodalUuids && *multimodalUuids && i < (*multimodalUuids)->size())
@@ -98,40 +103,31 @@ std::vector<MmKey> generateBlockHashExtraKeys(
                 }
             };
 
-            bool hasRegion = false;
-            SizeType32 regionStart = 0;
-            SizeType32 regionEnd = 0;
-            SizeType32 regionHashStartOffset = 0;
-            for (SizeType32 hashOffset = 0; hashOffset < static_cast<SizeType32>(promptPositions.size()); ++hashOffset)
+            SizeType32 consumedLength = 0;
+            std::optional<SizeType32> previousRunEnd = std::nullopt;
+            for (size_t runIdx = 0; runIdx < positionRuns.size(); ++runIdx)
             {
-                auto const position = promptPositions[hashOffset];
-                if (!hasRegion)
+                auto const [runStart, runLength] = positionRuns[runIdx];
+                TLLM_CHECK_WITH_INFO(runLength > 0, "Multimodal item run length must be positive, got %d", runLength);
+                TLLM_CHECK_WITH_INFO(runStart >= 0 && runLength <= promptLen && runStart <= promptLen - runLength,
+                    "Multimodal item run [%d, %d) is outside prompt token range [0, %d)", runStart,
+                    runStart + runLength, promptLen);
+                if (runIdx == 0 && multimodalPositions && *multimodalPositions)
                 {
-                    regionStart = position;
-                    regionEnd = position + 1;
-                    regionHashStartOffset = hashOffset;
-                    hasRegion = true;
-                    continue;
+                    TLLM_CHECK_WITH_INFO(runStart == (*(*multimodalPositions))[i],
+                        "First multimodal item run must start at multimodal_positions[%zu]", i);
                 }
-                if (position < regionEnd)
+                if (previousRunEnd)
                 {
-                    TLLM_CHECK_WITH_INFO(false, "Multimodal hash positions must be strictly increasing");
+                    TLLM_CHECK_WITH_INFO(
+                        runStart >= *previousRunEnd, "Multimodal item runs must be ordered and non-overlapping");
                 }
-                if (position == regionEnd)
-                {
-                    ++regionEnd;
-                    continue;
-                }
-
-                emitRegion(regionStart, regionEnd - regionStart, regionHashStartOffset);
-                regionStart = position;
-                regionEnd = position + 1;
-                regionHashStartOffset = hashOffset;
+                emitRegion(runStart, runLength, consumedLength);
+                consumedLength += runLength;
+                previousRunEnd = runStart + runLength;
             }
-            if (hasRegion)
-            {
-                emitRegion(regionStart, regionEnd - regionStart, regionHashStartOffset);
-            }
+            TLLM_CHECK_WITH_INFO(
+                consumedLength == expectedLength, "Multimodal item run lengths must sum to multimodal_lengths[%zu]", i);
         }
 
         return extraKeys;

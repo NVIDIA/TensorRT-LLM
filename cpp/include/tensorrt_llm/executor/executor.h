@@ -48,6 +48,8 @@ namespace tensorrt_llm::executor
 {
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
+using ContiguousRun = std::pair<SizeType32, SizeType32>;
+using MultimodalItemRuns = std::vector<std::vector<ContiguousRun>>;
 
 /// @brief Version of TRT-LLM
 char const* version() noexcept;
@@ -299,13 +301,13 @@ public:
     explicit MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
         std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths,
         std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt,
-        std::optional<std::vector<std::vector<SizeType32>>> multimodalHashPositions = std::nullopt);
+        std::optional<MultimodalItemRuns> multimodalItemRuns = std::nullopt);
 
     [[nodiscard]] std::vector<std::vector<SizeType32>> getMultimodalHashes() const;
     [[nodiscard]] std::vector<SizeType32> getMultimodalPositions() const;
     [[nodiscard]] std::vector<SizeType32> getMultimodalLengths() const;
     [[nodiscard]] std::optional<std::vector<std::optional<std::string>>> const& getMultimodalUuids() const;
-    [[nodiscard]] std::optional<std::vector<std::vector<SizeType32>>> const& getMultimodalHashPositions() const;
+    [[nodiscard]] std::optional<MultimodalItemRuns> const& getMultimodalItemRuns() const;
 
 private:
     friend class Serialization;
@@ -318,8 +320,8 @@ private:
     /// @brief Optional user-provided UUIDs for multimodal items.
     /// When provided, these are returned in KV cache events instead of content hashes.
     std::optional<std::vector<std::optional<std::string>>> mMultimodalUuids;
-    /// @brief Optional exact prompt token positions for each multimodal hash.
-    std::optional<std::vector<std::vector<SizeType32>>> mMultimodalHashPositions;
+    /// @brief Optional compact prompt token runs for each multimodal item.
+    std::optional<MultimodalItemRuns> mMultimodalItemRuns;
 };
 
 /// @brief Configuration for mrope

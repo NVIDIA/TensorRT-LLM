@@ -421,20 +421,19 @@ class BaseWorker(GenerationExecutor):
         # NOTE: Since, we only support PyTorch backend for multimodal, we will send multimodal_data through the 'py_multimodal_data' field
         # except `multimodal_input` as it needs to go through the C++ runtime.
         multimodal_input = None
+        multimodal_item_runs = None
         if request.multimodal_params is not None and request.multimodal_params.has_content(
         ):
             if request.multimodal_params.multimodal_input is not None:
+                py_multimodal_input = request.multimodal_params.multimodal_input
+                multimodal_item_runs = (
+                    py_multimodal_input.multimodal_item_runs)
                 multimodal_input = tllm.MultimodalInput(
-                    multimodal_hashes=request.multimodal_params.
-                    multimodal_input.multimodal_hashes,
-                    multimodal_positions=request.multimodal_params.
-                    multimodal_input.multimodal_positions,
-                    multimodal_lengths=request.multimodal_params.
-                    multimodal_input.multimodal_lengths,
-                    multimodal_uuids=request.multimodal_params.multimodal_input.
-                    multimodal_uuids,
-                    multimodal_hash_positions=request.multimodal_params.
-                    multimodal_input.multimodal_hash_positions)
+                    multimodal_hashes=py_multimodal_input.multimodal_hashes,
+                    multimodal_positions=py_multimodal_input.
+                    multimodal_positions,
+                    multimodal_lengths=py_multimodal_input.multimodal_lengths,
+                    multimodal_uuids=py_multimodal_input.multimodal_uuids)
             # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
             request.multimodal_params.multimodal_input = None
 
@@ -566,6 +565,7 @@ class BaseWorker(GenerationExecutor):
             executor_request.py_num_logprobs = request.sampling_params.logprobs
             executor_request.py_lora_path = py_lora_path
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
+            executor_request.py_multimodal_item_runs = (multimodal_item_runs)
 
             # here we add executor_request.py_disaggregated_params= request.disaggregated_params for python cache transceiver
             if self._is_pytorch_backend and request.disaggregated_params is not None:

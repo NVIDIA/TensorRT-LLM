@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -50,6 +50,7 @@ public:
     using VecTokens = Base::VecTokens;
     using VecTokenExtraIds = Base::VecTokenExtraIds;
     using LogitsPostProcessor = Base::LogitsPostProcessor;
+    using MultimodalItemRuns = Base::MultimodalItemRuns;
 
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
         runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
@@ -62,8 +63,8 @@ public:
         std::optional<std::vector<SizeType32>> multimodalPositions = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalLengths = std::nullopt,
         std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt,
-        std::optional<std::vector<std::vector<SizeType32>>> multimodalHashPositions = std::nullopt,
         std::optional<TensorPtr> multimodalEmbedding = std::nullopt,
+        std::optional<MultimodalItemRuns> multimodalItemRuns = std::nullopt,
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
@@ -116,10 +117,10 @@ public:
             multimodalUuids.has_value()
                 ? std::make_shared<std::vector<std::optional<std::string>>>(std::move(multimodalUuids.value()))  //
                 : std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>>(std::nullopt),         //
-            multimodalHashPositions.has_value()
-                ? std::make_shared<std::vector<std::vector<SizeType32>>>(std::move(multimodalHashPositions.value()))
-                : std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>>(std::nullopt),            //
             multimodalEmbedding,                                                                                 //
+            multimodalItemRuns.has_value()
+                ? std::make_shared<MultimodalItemRuns>(std::move(multimodalItemRuns.value()))                    //
+                : std::optional<std::shared_ptr<MultimodalItemRuns>>(std::nullopt),                              //
             mropeRotaryCosSin,                                                                                   //
             mropePositionDeltas,                                                                                 //
             loraTaskId,                                                                                          //

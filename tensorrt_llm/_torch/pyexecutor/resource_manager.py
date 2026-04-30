@@ -2488,47 +2488,79 @@ class KVCacheManagerV2(BaseResourceManager):
             return b''.join(
                 v.to_bytes(4, 'big', signed=True) for v in hash_ints)
 
-        multimodal_hash_positions = getattr(req, "multimodal_hash_positions",
-                                            None)
-        if multimodal_hash_positions is not None:
-            for item_idx, (hash_ints, positions) in enumerate(
+        multimodal_item_runs = getattr(req, "multimodal_item_runs", None)
+        if multimodal_item_runs is not None:
+            if len(multimodal_item_runs) != len(req.multimodal_hashes):
+                raise ValueError(
+                    "multimodal_item_runs and multimodal_hashes must have the same length"
+                )
+
+            for item_idx, (hash_ints, item_runs) in enumerate(
                     zip(req.multimodal_hashes,
-                        multimodal_hash_positions,
+                        multimodal_item_runs,
                         strict=True)):
-                if len(positions) == 0:
+                if len(item_runs) == 0:
                     raise ValueError(
-                        f"multimodal_hash_positions[{item_idx}] must not be empty"
-                    )
+                        f"multimodal_item_runs[{item_idx}] must not be empty")
+                item_length = 0
+                previous_end = None
+                for run_idx, run in enumerate(item_runs):
+                    if not isinstance(run, (list, tuple)) or len(run) != 2:
+                        raise TypeError(
+                            f"multimodal_item_runs[{item_idx}][{run_idx}] must be a "
+                            "(prompt_start, run_length) pair")
+                    run_start, run_length = run
+                    if not isinstance(run_start, int) or not isinstance(
+                            run_length, int):
+                        raise TypeError(
+                            f"multimodal_item_runs[{item_idx}][{run_idx}] must contain only integers"
+                        )
+                    if run_start < 0 or run_start + run_length > len(tokens):
+                        raise ValueError(
+                            f"multimodal_item_runs[{item_idx}] contains run "
+                            f"({run_start}, {run_length}) outside prompt token range [0, {len(tokens)})"
+                        )
+                    if run_length <= 0:
+                        raise ValueError(
+                            f"multimodal_item_runs[{item_idx}][{run_idx}] must have positive length"
+                        )
+                    if previous_end is not None and run_start < previous_end:
+                        raise ValueError(
+                            f"multimodal_item_runs[{item_idx}] must be ordered and non-overlapping"
+                        )
+                    item_length += run_length
+                    previous_end = run_start + run_length
                 if req.multimodal_lengths is not None:
                     expected_length = req.multimodal_lengths[item_idx]
-                    if len(positions) != expected_length:
+                    if item_length != expected_length:
                         raise ValueError(
-                            f"multimodal_hash_positions[{item_idx}] length ({len(positions)}) must match "
+                            f"multimodal_item_runs[{item_idx}] total length ({item_length}) must match "
                             f"multimodal_lengths[{item_idx}] ({expected_length})"
-                        )
-                for offset, prompt_position in enumerate(positions):
-                    if prompt_position < 0 or prompt_position >= len(tokens):
-                        raise ValueError(
-                            f"multimodal_hash_positions[{item_idx}] contains position "
-                            f"{prompt_position} outside prompt token range [0, {len(tokens)})"
-                        )
-                    if offset > 0 and positions[offset - 1] >= prompt_position:
-                        raise ValueError(
-                            f"multimodal_hash_positions[{item_idx}] must be strictly increasing"
                         )
                 if req.multimodal_positions is not None:
                     expected_start = req.multimodal_positions[item_idx]
-                    if positions[0] != expected_start:
+                    if item_runs[0][0] != expected_start:
                         raise ValueError(
-                            f"multimodal_hash_positions[{item_idx}] must start at "
+                            f"multimodal_item_runs[{item_idx}] must start at "
                             f"multimodal_positions[{item_idx}] ({expected_start})"
                         )
                 digest = _hash_ints_to_digest(hash_ints)
                 mm_tokens = gen_multi_modal_tokens(self.vocab_size, digest,
-                                                   len(positions))
-                for hash_offset, prompt_position in enumerate(positions):
-                    if start <= prompt_position < end:
-                        result[prompt_position - start] = mm_tokens[hash_offset]
+                                                   item_length)
+                hash_offset = 0
+                for run_start, run_length in item_runs:
+                    run_end = run_start + run_length
+                    if run_end <= start or run_start >= end:
+                        hash_offset += run_length
+                        continue
+                    overlap_start = max(run_start, start)
+                    overlap_end = min(run_end, end)
+                    result_offset = overlap_start - start
+                    mm_offset = hash_offset + overlap_start - run_start
+                    n = overlap_end - overlap_start
+                    result[result_offset:result_offset +
+                           n] = mm_tokens[mm_offset:mm_offset + n]
+                    hash_offset += run_length
             return result
 
         if req.multimodal_positions is None or req.multimodal_lengths is None:

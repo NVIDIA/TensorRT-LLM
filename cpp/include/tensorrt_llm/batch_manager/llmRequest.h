@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -108,6 +108,8 @@ public:
     using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
     using Duration = std::chrono::time_point<std::chrono::steady_clock>::duration;
     using CacheSaltIDType = runtime::CacheSaltIDType;
+    using ContiguousRun = std::pair<SizeType32, SizeType32>;
+    using MultimodalItemRuns = std::vector<std::vector<ContiguousRun>>;
 
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> const& inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
@@ -120,8 +122,8 @@ public:
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalPositions = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalLengths = std::nullopt,
         std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>> multimodalUuids = std::nullopt,
-        std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>> multimodalHashPositions = std::nullopt,
         std::optional<TensorPtr> multimodalEmbedding = std::nullopt,
+        std::optional<std::shared_ptr<MultimodalItemRuns>> multimodalItemRuns = std::nullopt,
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
@@ -171,8 +173,8 @@ public:
         , mMultimodalPositions(std::move(multimodalPositions))
         , mMultimodalLengths(std::move(multimodalLengths))
         , mMultimodalUuids(std::move(multimodalUuids))
-        , mMultimodalHashPositions(std::move(multimodalHashPositions))
         , mMultimodalEmbedding(std::move(multimodalEmbedding))
+        , mMultimodalItemRuns(std::move(multimodalItemRuns))
         , mMropeRotaryCosSin(std::move(mropeRotaryCosSin))
         , mMropePositionDeltas(mropePositionDeltas)
         , mLoraTaskId(loraTaskId)
@@ -404,11 +406,6 @@ public:
             {
                 mMultimodalUuids = std::make_shared<std::vector<std::optional<std::string>>>(
                     multimodalInput.value().getMultimodalUuids().value());
-            }
-            if (multimodalInput.value().getMultimodalHashPositions())
-            {
-                mMultimodalHashPositions = std::make_shared<std::vector<std::vector<SizeType32>>>(
-                    multimodalInput.value().getMultimodalHashPositions().value());
             }
         }
         auto mRopeConfig = req.getMropeConfig();
@@ -947,10 +944,9 @@ public:
         return mMultimodalUuids;
     }
 
-    [[nodiscard]] std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>>
-    getMultimodalHashPositions() const
+    [[nodiscard]] std::optional<std::shared_ptr<MultimodalItemRuns>> getMultimodalItemRuns() const
     {
-        return mMultimodalHashPositions;
+        return mMultimodalItemRuns;
     }
 
     [[nodiscard]] std::optional<TensorPtr> getMultimodalEmbedding() const
@@ -2048,8 +2044,8 @@ protected:
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalPositions{std::nullopt};
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalLengths{std::nullopt};
     std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>> mMultimodalUuids{std::nullopt};
-    std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>> mMultimodalHashPositions{std::nullopt};
     std::optional<TensorPtr> mMultimodalEmbedding{std::nullopt};
+    std::optional<std::shared_ptr<MultimodalItemRuns>> mMultimodalItemRuns{std::nullopt};
     std::optional<TensorPtr> mMropeRotaryCosSin{std::nullopt};
     std::optional<SizeType32> mMropePositionDeltas{std::nullopt};
 
@@ -2339,8 +2335,8 @@ public:
         std::optional<std::vector<SizeType32>> multimodalPositions = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalLengths = std::nullopt,
         std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt,
-        std::optional<std::vector<std::vector<SizeType32>>> multimodalHashPositions = std::nullopt,
         std::optional<TensorPtr> multimodalEmbedding = std::nullopt,
+        std::optional<MultimodalItemRuns> multimodalItemRuns = std::nullopt,
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
@@ -2383,12 +2379,12 @@ public:
             multimodalUuids.has_value()
                 ? std::make_shared<std::vector<std::optional<std::string>>>(std::move(multimodalUuids.value()))
                 : std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>>(std::nullopt),
-            multimodalHashPositions.has_value()
-                ? std::make_shared<std::vector<std::vector<SizeType32>>>(std::move(multimodalHashPositions.value()))
-                : std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>>(std::nullopt),
-            std::move(multimodalEmbedding), std::move(mropeRotaryCosSin), mropePositionDeltas, loraTaskId,
-            std::move(loraWeights), std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig),
-            returnLogProbs, returnContextLogits, returnGenerationLogits,
+            std::move(multimodalEmbedding),
+            multimodalItemRuns.has_value() ? std::make_shared<MultimodalItemRuns>(std::move(multimodalItemRuns.value()))
+                                           : std::optional<std::shared_ptr<MultimodalItemRuns>>(std::nullopt),
+            std::move(mropeRotaryCosSin), mropePositionDeltas, loraTaskId, std::move(loraWeights),
+            std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig), returnLogProbs,
+            returnContextLogits, returnGenerationLogits,
             draftTokens.has_value() ? std::make_shared<VecTokens>(std::move(draftTokens.value()))
                                     : std::make_shared<VecTokens>(),
             std::move(draftLogits), excludeInputFromOutput, std::move(logitsPostProcessor),

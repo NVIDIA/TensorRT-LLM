@@ -175,7 +175,7 @@ class GenerationResultBase:
         self._error_msg: Optional[str] = None
         self._disaggregated_params = None
         self._multimodal_hashes = None
-        self._multimodal_hash_positions = None
+        self._multimodal_item_runs = None
         self.decoding_iter = 0
         self.cached_tokens = 0
         # Average decoded tokens per runtime iteration; set when the first LLM response arrives.
@@ -534,14 +534,12 @@ class GenerationResultBase:
                         self._disaggregated_params,
                         multimodal_embedding_handles=mm_embedding_handles,
                         multimodal_hashes=self._multimodal_hashes,
-                        multimodal_hash_positions=(
-                            self._multimodal_hash_positions))
+                        multimodal_item_runs=(self._multimodal_item_runs))
                 else:
                     self._disaggregated_params = DisaggregatedParams(
                         multimodal_embedding_handles=mm_embedding_handles,
                         multimodal_hashes=self._multimodal_hashes,
-                        multimodal_hash_positions=(
-                            self._multimodal_hash_positions))
+                        multimodal_item_runs=(self._multimodal_item_runs))
 
             # Handle mrope handles for both:
             # 1. Regular mm_embedding case (disaggregated_params was just created/updated above)
@@ -828,9 +826,8 @@ class GenerationResult(GenerationResultBase):
             "multimodal_input", None)
         self._multimodal_hashes = getattr(multimodal_input, "multimodal_hashes",
                                           None)
-        self._multimodal_hash_positions = getattr(multimodal_input,
-                                                  "multimodal_hash_positions",
-                                                  None)
+        self._multimodal_item_runs = getattr(multimodal_input,
+                                             "multimodal_item_runs", None)
 
     @property
     def request_id(self) -> int:

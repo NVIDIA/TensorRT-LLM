@@ -606,13 +606,12 @@ class BaseLLM:
                 )
             else:
                 mm_hashes = disaggregated_params.multimodal_hashes
-                mm_hash_positions = (
-                    disaggregated_params.multimodal_hash_positions)
+                mm_item_runs = (disaggregated_params.multimodal_item_runs)
                 multimodal_input = MultimodalInput.from_components(
                     mm_hashes,
                     mm_token_positions,
                     mm_token_length,
-                    mm_hash_positions=mm_hash_positions)
+                    mm_item_runs=mm_item_runs)
                 multimodal_data = {"multimodal_embedding": mm_handles}
                 if disaggregated_params.mrope_position_ids_handle is not None:
                     # NOTE: `PyTorchModelEngine` assumes both are present when using mrope.

@@ -17,6 +17,94 @@ from tensorrt_llm.logger import logger
 # Default hasher
 default_hasher = blake3
 
+ContiguousRun = Tuple[int, int]
+MultimodalItemRuns = List[List[ContiguousRun]]
+
+
+def _normalize_item_runs(
+        runs_by_item: MultimodalItemRuns,
+        field_name: str,
+        expected_items: Optional[int] = None) -> MultimodalItemRuns:
+    if not isinstance(runs_by_item, list):
+        raise TypeError(f"{field_name} must be a list")
+    if expected_items is not None and len(runs_by_item) != expected_items:
+        raise ValueError(
+            f"{field_name} length ({len(runs_by_item)}) must match "
+            f"multimodal_hashes length ({expected_items})")
+
+    normalized_runs: MultimodalItemRuns = []
+    for item_idx, item_runs in enumerate(runs_by_item):
+        if not isinstance(item_runs, list):
+            raise TypeError(f"{field_name}[{item_idx}] must be a list")
+        if len(item_runs) == 0:
+            raise ValueError(f"{field_name}[{item_idx}] must not be empty")
+
+        normalized_item_runs: List[ContiguousRun] = []
+        previous_end: Optional[int] = None
+        for run_idx, run in enumerate(item_runs):
+            if not isinstance(run, (list, tuple)) or len(run) != 2:
+                raise TypeError(
+                    f"{field_name}[{item_idx}][{run_idx}] must be a "
+                    "(prompt_start, run_length) pair")
+            prompt_start, run_length = run
+            if not isinstance(prompt_start, int) or not isinstance(
+                    run_length, int):
+                raise TypeError(
+                    f"{field_name}[{item_idx}][{run_idx}] must contain only integers"
+                )
+            if prompt_start < 0:
+                raise ValueError(
+                    f"{field_name}[{item_idx}][{run_idx}] must not contain negative positions"
+                )
+            if run_length <= 0:
+                raise ValueError(
+                    f"{field_name}[{item_idx}][{run_idx}] must have positive length"
+                )
+            if previous_end is not None and prompt_start < previous_end:
+                raise ValueError(
+                    f"{field_name}[{item_idx}] must be ordered and non-overlapping"
+                )
+            normalized_item_runs.append((prompt_start, run_length))
+            previous_end = prompt_start + run_length
+        normalized_runs.append(normalized_item_runs)
+
+    return normalized_runs
+
+
+def _item_run_total_length(item_runs: List[ContiguousRun]) -> int:
+    return sum(run_length for _, run_length in item_runs)
+
+
+def _positions_to_item_runs(
+        item_positions: List[List[int]]) -> MultimodalItemRuns:
+    runs_by_item: MultimodalItemRuns = []
+    for positions in item_positions:
+        if not positions:
+            runs_by_item.append([])
+            continue
+        item_runs: List[ContiguousRun] = []
+        run_start = positions[0]
+        previous_position = positions[0]
+        run_length = 1
+        for position in positions[1:]:
+            if position == previous_position + 1:
+                run_length += 1
+            else:
+                item_runs.append((run_start, run_length))
+                run_start = position
+                run_length = 1
+            previous_position = position
+        item_runs.append((run_start, run_length))
+        runs_by_item.append(item_runs)
+    return runs_by_item
+
+
+def _item_runs_to_positions(item_runs: List[ContiguousRun]) -> List[int]:
+    return [
+        position for run_start, run_length in item_runs
+        for position in range(run_start, run_start + run_length)
+    ]
+
 
 def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
     """Clear `mm_data` in place, retaining only `mrope_config.mrope_position_deltas`.
@@ -47,10 +135,10 @@ class MultimodalInput:
     multimodal_hashes: List[List[int]]
     """Hash digest per logical unit (list of 8 int32 each)."""
 
-    multimodal_positions: List[int]
+    multimodal_positions: Optional[List[int]] = None
     """Prompt position of each logical unit's first MM token."""
 
-    multimodal_lengths: List[int]
+    multimodal_lengths: Optional[List[int]] = None
     """Per logical unit count of prompt-side MM tokens.
 
     Counts every prompt position belonging to this MM unit — both the
@@ -86,13 +174,13 @@ class MultimodalInput:
     returned in KV cache events.
     """
 
-    multimodal_hash_positions: Optional[List[List[int]]] = None
-    """Exact prompt token positions covered by each multimodal item hash.
+    multimodal_item_runs: Optional[MultimodalItemRuns] = None
+    """Exact prompt token runs covered by each multimodal item.
 
     When provided, the outer list must match ``multimodal_hashes``. Each inner
-    list contains the prompt positions for that multimodal item's hash token
-    sequence, in order. Legacy callers may leave this unset, in which case
-    consumers fall back to ``multimodal_positions`` plus ``multimodal_lengths``.
+    list contains compact ``(prompt_start, run_length)`` runs for that
+    multimodal item. ``multimodal_positions`` and ``multimodal_lengths`` are
+    derived from these runs when not supplied.
     """
 
     def __post_init__(self):
@@ -112,6 +200,32 @@ class MultimodalInput:
                 f"All hash arrays must have the same length, got lengths: {hash_lengths}"
             )
 
+        if self.multimodal_item_runs is not None:
+            self.multimodal_item_runs = _normalize_item_runs(
+                self.multimodal_item_runs,
+                "multimodal_item_runs",
+                expected_items=len(self.multimodal_hashes))
+            derived_positions = [
+                item_runs[0][0] for item_runs in self.multimodal_item_runs
+            ]
+            derived_lengths = [
+                _item_run_total_length(item_runs)
+                for item_runs in self.multimodal_item_runs
+            ]
+            if self.multimodal_positions is None:
+                self.multimodal_positions = derived_positions
+            if self.multimodal_lengths is None:
+                self.multimodal_lengths = derived_lengths
+
+        if self.multimodal_positions is None:
+            raise ValueError(
+                "multimodal_positions must be provided when multimodal_item_runs is not provided"
+            )
+        if self.multimodal_lengths is None:
+            raise ValueError(
+                "multimodal_lengths must be provided when multimodal_item_runs is not provided"
+            )
+
         # Check that positions and lengths are valid
         if not all(isinstance(x, int) for x in self.multimodal_positions):
             raise TypeError("multimodal_positions must contain only integers")
@@ -125,6 +239,27 @@ class MultimodalInput:
                 f"Position and length arrays must match in size: "
                 f"positions={len(self.multimodal_positions)}, lengths={len(self.multimodal_lengths)}"
             )
+
+        if len(self.multimodal_positions) != len(self.multimodal_hashes):
+            raise ValueError(
+                f"multimodal_positions length ({len(self.multimodal_positions)}) must match "
+                f"multimodal_hashes length ({len(self.multimodal_hashes)})")
+
+        if self.multimodal_item_runs is not None:
+            for i, (item_runs, start_position, length) in enumerate(
+                    zip(self.multimodal_item_runs,
+                        self.multimodal_positions,
+                        self.multimodal_lengths,
+                        strict=True)):
+                if item_runs[0][0] != start_position:
+                    raise ValueError(
+                        f"multimodal_item_runs[{i}] must start at multimodal_positions[{i}] "
+                        f"({start_position})")
+                run_length = _item_run_total_length(item_runs)
+                if run_length != length:
+                    raise ValueError(
+                        f"multimodal_item_runs[{i}] total length ({run_length}) must match "
+                        f"multimodal_lengths[{i}] ({length})")
 
         # Validate multimodal_uuids if provided
         if self.multimodal_uuids is not None:
@@ -140,59 +275,22 @@ class MultimodalInput:
                         f"multimodal_uuids[{i}] must be a string or None, got {type(uuid)}"
                     )
 
-        # Validate multimodal_hash_positions if provided
-        if self.multimodal_hash_positions is not None:
-            if not isinstance(self.multimodal_hash_positions, list):
-                raise TypeError("multimodal_hash_positions must be a list")
-            if len(self.multimodal_hash_positions) != len(
-                    self.multimodal_hashes):
-                raise ValueError(
-                    f"multimodal_hash_positions length ({len(self.multimodal_hash_positions)}) must match "
-                    f"multimodal_hashes length ({len(self.multimodal_hashes)})")
-            for i, (hash_positions, start_position, length) in enumerate(
-                    zip(self.multimodal_hash_positions,
-                        self.multimodal_positions,
-                        self.multimodal_lengths,
-                        strict=True)):
-                if not isinstance(hash_positions, list):
-                    raise TypeError(
-                        f"multimodal_hash_positions[{i}] must be a list")
-                if len(hash_positions) != length:
-                    raise ValueError(
-                        f"multimodal_hash_positions[{i}] length ({len(hash_positions)}) must match "
-                        f"multimodal_lengths[{i}] ({length})")
-                if not all(isinstance(pos, int) for pos in hash_positions):
-                    raise TypeError(
-                        f"multimodal_hash_positions[{i}] must contain only integers"
-                    )
-                if any(pos < 0 for pos in hash_positions):
-                    raise ValueError(
-                        f"multimodal_hash_positions[{i}] must not contain negative positions"
-                    )
-                if any(hash_positions[j] >= hash_positions[j + 1]
-                       for j in range(len(hash_positions) - 1)):
-                    raise ValueError(
-                        f"multimodal_hash_positions[{i}] must be strictly increasing"
-                    )
-                if hash_positions and hash_positions[0] != start_position:
-                    raise ValueError(
-                        f"multimodal_hash_positions[{i}] must start at multimodal_positions[{i}] "
-                        f"({start_position})")
-
     @classmethod
     def from_components(
         cls,
         mm_hashes: List[List[int]],
-        mm_positions: List[int],
-        mm_lengths: List[int],
+        mm_positions: Optional[List[int]] = None,
+        mm_lengths: Optional[List[int]] = None,
         mm_uuids: Optional[List[Optional[str]]] = None,
-        mm_hash_positions: Optional[List[List[int]]] = None,
+        mm_item_runs: Optional[MultimodalItemRuns] = None,
     ) -> 'MultimodalInput':
-        return cls(multimodal_hashes=mm_hashes,
-                   multimodal_positions=mm_positions,
-                   multimodal_lengths=mm_lengths,
-                   multimodal_uuids=mm_uuids,
-                   multimodal_hash_positions=mm_hash_positions)
+        return cls(
+            multimodal_hashes=mm_hashes,
+            multimodal_positions=mm_positions,
+            multimodal_lengths=mm_lengths,
+            multimodal_item_runs=mm_item_runs,
+            multimodal_uuids=mm_uuids,
+        )
 
     def to_tensor(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Convert data to tensors"""
@@ -1007,34 +1105,33 @@ def _compute_mm_masks(
     return mm_mask, embed_mask, special_mask
 
 
-def find_mm_hash_token_positions(
+def find_mm_token_item_runs(
         input_ids: Union[torch.Tensor, List[int], np.ndarray],
         num_mm_tokens: List[int],
         vocab_size: Optional[int] = None,
         mm_token_ids: Optional[torch.Tensor] = None,
-        mm_special_token_ids: Optional[torch.Tensor] = None) -> List[List[int]]:
-    """Get exact prompt token positions for each multimodal item's hash tokens."""
+        mm_special_token_ids: Optional[torch.Tensor] = None
+) -> MultimodalItemRuns:
+    """Get exact prompt token runs for each multimodal item."""
     input_ids_tensor = _as_cpu_tensor(input_ids)
     mm_mask, _, _ = _compute_mm_masks(input_ids_tensor, vocab_size,
                                       mm_token_ids, mm_special_token_ids)
     if not torch.any(mm_mask):
         return []
 
-    mm_positions = torch.where(mm_mask)[0]
-    lengths_t = torch.tensor(num_mm_tokens)
-    assert mm_positions.numel() == lengths_t.sum().item(), (
-        f"Number of multimodal tokens ({mm_positions.numel()}) does not match "
-        f"sum of per-unit lengths ({lengths_t.sum().item()}): "
-        f"num_mm_tokens={num_mm_tokens}")
+    mm_positions = torch.where(mm_mask)[0].tolist()
+    assert len(mm_positions) == sum(
+        num_mm_tokens
+    ), f"Number of multimodal tokens does not match sum of all lengths"
 
-    hash_positions = []
+    item_positions = []
     current_position = 0
     for length in num_mm_tokens:
-        hash_positions.append(mm_positions[current_position:current_position +
-                                           length].tolist())
+        item_positions.append(mm_positions[current_position:current_position +
+                                           length])
         current_position += length
 
-    return hash_positions
+    return _positions_to_item_runs(item_positions)
 
 
 def _find_mm_token_start_pos_from_masks(

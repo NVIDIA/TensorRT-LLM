@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -1160,6 +1160,7 @@ TEST(SerializeUtilsTest, BlockKeyWithExtrasAndUuids)
 TEST(SerializeUtilsTest, MultimodalInputWithUuids)
 {
     using tensorrt_llm::executor::MultimodalInput;
+    using tensorrt_llm::executor::MultimodalItemRuns;
 
     // Helper to verify MultimodalInput serialization round-trip
     auto verifyMultimodalInput = [](MultimodalInput const& original)
@@ -1204,12 +1205,12 @@ TEST(SerializeUtilsTest, MultimodalInputWithUuids)
             }
         }
 
-        auto origHashPositions = original.getMultimodalHashPositions();
-        auto deserHashPositions = deserialized.getMultimodalHashPositions();
-        EXPECT_EQ(origHashPositions.has_value(), deserHashPositions.has_value());
-        if (origHashPositions.has_value() && deserHashPositions.has_value())
+        auto origItemRuns = original.getMultimodalItemRuns();
+        auto deserItemRuns = deserialized.getMultimodalItemRuns();
+        EXPECT_EQ(origItemRuns.has_value(), deserItemRuns.has_value());
+        if (origItemRuns.has_value() && deserItemRuns.has_value())
         {
-            EXPECT_EQ(*origHashPositions, *deserHashPositions);
+            EXPECT_EQ(*origItemRuns, *deserItemRuns);
         }
     };
 
@@ -1220,16 +1221,16 @@ TEST(SerializeUtilsTest, MultimodalInputWithUuids)
     };
     std::vector<SizeType32> positions = {0, 100};
     std::vector<SizeType32> lengths = {3, 2};
-    std::vector<std::vector<SizeType32>> hashPositions = {{0, 2, 4}, {100, 103}};
+    MultimodalItemRuns hashPositionRuns = {{{0, 1}, {2, 1}, {4, 1}}, {{100, 1}, {103, 1}}};
 
     // Test with full UUIDs
     std::vector<std::optional<std::string>> uuids = {std::string("image-uuid-001"), std::string("image-uuid-002")};
     MultimodalInput inputWithUuids(hashes, positions, lengths, uuids);
     verifyMultimodalInput(inputWithUuids);
 
-    // Test with exact sparse hash positions
-    MultimodalInput inputWithHashPositions(hashes, positions, lengths, uuids, hashPositions);
-    verifyMultimodalInput(inputWithHashPositions);
+    // Test with compact sparse item runs
+    MultimodalInput inputWithItemRuns(hashes, positions, lengths, uuids, hashPositionRuns);
+    verifyMultimodalInput(inputWithItemRuns);
 
     // Test with partial UUIDs (mixed Some and None)
     std::vector<std::optional<std::string>> partialUuids = {std::string("uuid-a"), std::nullopt};

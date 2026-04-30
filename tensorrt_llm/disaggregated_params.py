@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -36,7 +36,7 @@ class DisaggregatedParams:
 
         multimodal_embedding_handles (List[Dict[str, Any]]): The resulting multimodal embedding handles from ViT.
         multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.
-        multimodal_hash_positions (List[List[int]]): Exact prompt token positions covered by each multimodal hash.
+        multimodal_item_runs (List[List[Tuple[int, int]]]): Exact prompt token runs covered by each multimodal item.
     """
 
     request_type: Optional[str] = None
@@ -60,7 +60,7 @@ class DisaggregatedParams:
     multimodal_hashes: Optional[List[List[int]]] = (
         None  # user provided mm hashes should be a list of 8 integers
     )
-    multimodal_hash_positions: Optional[List[List[int]]] = None
+    multimodal_item_runs: Optional[List[List[Tuple[int, int]]]] = None
     mrope_position_ids_handle: Optional[Dict[str, Any]] = None
     mrope_position_deltas_handle: Optional[Dict[str, Any]] = None
 
@@ -125,21 +125,28 @@ class DisaggregatedParams:
                 assert len(mm_hash) == 8, "mm_hash must be a list of 8 integers"
                 assert all(isinstance(x, int) for x in mm_hash), "mm_hash must contain integers"
 
-        if self.multimodal_hash_positions is not None:
+        if self.multimodal_item_runs is not None:
             assert self.multimodal_hashes is not None, (
-                "multimodal_hash_positions requires multimodal_hashes"
+                "multimodal_item_runs requires multimodal_hashes"
             )
-            assert len(self.multimodal_hash_positions) == len(self.multimodal_hashes), (
-                "multimodal_hash_positions and multimodal_hashes must have the same length"
+            assert len(self.multimodal_item_runs) == len(self.multimodal_hashes), (
+                "multimodal_item_runs and multimodal_hashes must have the same length"
             )
-            for positions in self.multimodal_hash_positions:
-                assert isinstance(positions, list), "multimodal_hash_positions item must be a list"
-                assert all(isinstance(x, int) for x in positions), (
-                    "multimodal_hash_positions must contain integers"
-                )
-                assert all(x >= 0 for x in positions), (
-                    "multimodal_hash_positions must contain non-negative positions"
-                )
-                assert all(positions[i] < positions[i + 1] for i in range(len(positions) - 1)), (
-                    "multimodal_hash_positions must be strictly increasing"
-                )
+            for item_runs in self.multimodal_item_runs:
+                assert isinstance(item_runs, list), "multimodal_item_runs item must be a list"
+                assert len(item_runs) > 0, "multimodal_item_runs item must not be empty"
+                previous_end = None
+                for run in item_runs:
+                    assert isinstance(run, (list, tuple)) and len(run) == 2, (
+                        "multimodal_item_runs entries must be (prompt_start, run_length) pairs"
+                    )
+                    start, length = run
+                    assert isinstance(start, int) and isinstance(length, int), (
+                        "multimodal_item_runs must contain integers"
+                    )
+                    assert start >= 0, "multimodal_item_runs must contain non-negative positions"
+                    assert length > 0, "multimodal_item_runs must contain positive lengths"
+                    assert previous_end is None or start >= previous_end, (
+                        "multimodal_item_runs must be ordered and non-overlapping"
+                    )
+                    previous_end = start + length

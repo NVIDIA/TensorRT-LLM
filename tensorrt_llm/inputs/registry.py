@@ -21,8 +21,9 @@ from .content_format import ContentFormat
 from .data import TextPrompt
 from .multimodal import (MultimodalInput, _as_cpu_tensor, _compute_mm_masks,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
-                         find_mm_hash_token_positions, find_mm_token_lengths,
-                         hexdigest_to_int32, validate_mm_inputs)
+                         find_mm_token_item_runs, find_mm_token_lengths,
+                         default_hasher, hexdigest_to_int32,
+                         validate_mm_inputs)
 
 N = TypeVar("N", bound=Type[nn.Module])
 
@@ -967,7 +968,7 @@ def create_input_processor_with_hash(
                            num_mm_tokens)
         mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes_flat
                            ]  # nested list w/ multiple int32 per hash
-        mm_hash_positions = find_mm_hash_token_positions(
+        mm_item_runs = find_mm_token_item_runs(
             input_ids=prompt_token_ids,
             num_mm_tokens=num_mm_tokens,
             vocab_size=vocab_size,
@@ -980,7 +981,7 @@ def create_input_processor_with_hash(
                 start_positions,
                 num_mm_tokens,
                 mm_uuid_list,
-                mm_hash_positions=mm_hash_positions)
+                mm_item_runs=mm_item_runs)
         return prompt_token_ids, extra_processed_inputs
 
     def process_tokenized_prompt_maybe_hash(
