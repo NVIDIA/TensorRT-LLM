@@ -11,13 +11,11 @@ integration.
 from .pipeline_qwen_image import QwenImagePipeline
 from .transformer_qwen_image import (
     AdaLayerNormContinuous,
-    FeedForward,
     QwenEmbedRope,
     QwenImageTransformer2DModel,
     QwenImageTransformerBlock,
     QwenJointAttention,
     QwenTimestepProjEmbeddings,
-    RMSNorm,
     Timesteps,
     TimestepEmbedding,
     apply_rotary_emb_qwen,
@@ -26,14 +24,12 @@ from .transformer_qwen_image import (
 
 __all__ = [
     "AdaLayerNormContinuous",
-    "FeedForward",
     "QwenEmbedRope",
     "QwenImagePipeline",
     "QwenImageTransformer2DModel",
     "QwenImageTransformerBlock",
     "QwenJointAttention",
     "QwenTimestepProjEmbeddings",
-    "RMSNorm",
     "Timesteps",
     "TimestepEmbedding",
     "apply_rotary_emb_qwen",

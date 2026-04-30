@@ -11,11 +11,13 @@ registry detection.
 import json
 
 import pytest
+import torch
 
 # Importing the models package side-effects the ``@register_pipeline``
 # decorator on ``QwenImagePipeline`` being applied, which is what we are
 # testing here.
 from tensorrt_llm._torch.visual_gen import models  # noqa: F401
+from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.qwen_image import (
     QwenImagePipeline,
     QwenImageTransformer2DModel,
@@ -92,3 +94,47 @@ def test_transformer_load_weights_detects_mismatch():
     model = QwenImageTransformer2DModel(model_config=None, num_layers=2)
     with pytest.raises(RuntimeError, match=r"Missing keys|Unexpected keys"):
         model.load_weights({})
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("with_text_mask", [False, True])
+def test_transformer_forward_sanity(with_text_mask):
+    """A tiny Qwen-Image transformer runs both unmasked and text-masked paths."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    model_config = DiffusionModelConfig(
+        attention=AttentionConfig(backend="VANILLA"),
+        skip_create_weights_in_init=False,
+    )
+    model = QwenImageTransformer2DModel(
+        model_config=model_config,
+        patch_size=1,
+        in_channels=4,
+        out_channels=4,
+        num_layers=1,
+        attention_head_dim=8,
+        num_attention_heads=2,
+        joint_attention_dim=12,
+        axes_dims_rope=(2, 2, 4),
+    ).to(device, dtype=dtype).eval()
+
+    hidden_states = torch.randn(1, 4, 4, device=device, dtype=dtype)
+    encoder_hidden_states = torch.randn(1, 5, 12, device=device, dtype=dtype)
+    encoder_hidden_states_mask = None
+    if with_text_mask:
+        encoder_hidden_states_mask = torch.tensor(
+            [[True, True, True, False, False]], device=device
+        )
+
+    with torch.inference_mode():
+        output = model(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
+            timestep=torch.tensor([0.5], device=device, dtype=dtype),
+            img_shapes=[[[1, 2, 2]]],
+        )
+
+    assert isinstance(output, tuple)
+    assert output[0].shape == (1, 4, 4)

@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import functools
 import math
-import numbers
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -28,6 +27,7 @@ from torch import nn
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mlp import MLP
+from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import \
@@ -172,58 +172,6 @@ class QwenTimestepProjEmbeddings(nn.Module):
         return conditioning
 
 
-# ===========================================================================
-# Norm primitives.
-# ===========================================================================
-
-
-class RMSNorm(nn.Module):
-    """Root Mean Square LayerNorm.
-
-    Matches ``diffusers.models.normalization.RMSNorm`` for the
-    configuration used by Qwen-Image (``elementwise_affine=True``,
-    ``bias=False``). Computes the variance in fp32 like diffusers does.
-    """
-
-    def __init__(
-        self,
-        dim,
-        eps: float,
-        elementwise_affine: bool = True,
-        bias: bool = False,
-    ):
-        super().__init__()
-        self.eps = eps
-        self.elementwise_affine = elementwise_affine
-
-        if isinstance(dim, numbers.Integral):
-            dim = (dim,)
-        self.dim = torch.Size(dim)
-
-        self.weight = None
-        self.bias = None
-        if elementwise_affine:
-            self.weight = nn.Parameter(torch.ones(dim))
-            if bias:
-                self.bias = nn.Parameter(torch.zeros(dim))
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        variance = hidden_states.to(torch.float32).pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
-
-        if self.weight is not None:
-            if self.weight.dtype in (torch.float16, torch.bfloat16):
-                hidden_states = hidden_states.to(self.weight.dtype)
-            hidden_states = hidden_states * self.weight
-            if self.bias is not None:
-                hidden_states = hidden_states + self.bias
-        else:
-            hidden_states = hidden_states.to(input_dtype)
-
-        return hidden_states
-
-
 class AdaLayerNormContinuous(nn.Module):
     """AdaLN continuous: SiLU -> Linear(cond, 2*dim) -> LayerNorm(x)*scale+shift.
 
@@ -253,7 +201,9 @@ class AdaLayerNormContinuous(nn.Module):
                 embedding_dim, eps=eps, elementwise_affine=elementwise_affine
             )
         elif norm_type == "rms_norm":
-            self.norm = RMSNorm(embedding_dim, eps, elementwise_affine)
+            self.norm = RMSNorm(
+                hidden_size=embedding_dim, eps=eps, has_weights=elementwise_affine
+            )
         else:
             raise ValueError(f"unknown norm_type {norm_type}")
 
@@ -333,6 +283,10 @@ def apply_rotary_emb_qwen(
             "Qwen-Image uses complex-valued freqs (use_real=False); "
             "the real-valued path is unused."
         )
+    # The shared VisualGen apply_rotary_emb helper takes real-valued
+    # cos/sin tensors. Qwen-Image stores RoPE as complex frequencies to
+    # match diffusers, so keep this adapter until we add a shared complex
+    # RoPE helper or normalize Qwen's cache format.
     x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
     freqs_cis = freqs_cis.unsqueeze(1)
     x_out = torch.view_as_real(x_rotated * freqs_cis).flatten(3)
@@ -509,6 +463,8 @@ class QwenJointAttention(Attention):
             qk_norm_mode="per_head",
             eps=eps,
             bias=True,
+            # TODO: enable fused qk-norm+RoPE after adapting Qwen's
+            # complex frequency cache to the shared real cos/sin format.
             fuse_qk_norm_rope=False,
             config=config,
             layer_idx=layer_idx,
@@ -549,10 +505,12 @@ class QwenJointAttention(Attention):
         )
 
         # QK-norms, applied per-head on the head_dim.
-        self.norm_q = RMSNorm(attention_head_dim, eps=eps)
-        self.norm_k = RMSNorm(attention_head_dim, eps=eps)
-        self.norm_added_q = RMSNorm(attention_head_dim, eps=eps)
-        self.norm_added_k = RMSNorm(attention_head_dim, eps=eps)
+        self.norm_added_q = RMSNorm(
+            hidden_size=attention_head_dim, eps=eps, dtype=dtype, has_weights=True
+        )
+        self.norm_added_k = RMSNorm(
+            hidden_size=attention_head_dim, eps=eps, dtype=dtype, has_weights=True
+        )
         # Text output projection.
         self.to_add_out = Linear(
             dim,
@@ -564,6 +522,10 @@ class QwenJointAttention(Attention):
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
         )
+
+    @staticmethod
+    def _apply_rms_norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
+        return F.rms_norm(x, (x.shape[-1],), norm.weight, norm.variance_epsilon)
 
     def forward(
         self,
@@ -590,10 +552,10 @@ class QwenJointAttention(Attention):
         txt_v = txt_v.unflatten(-1, (self.heads, -1))
 
         # Per-stream QK-norm on head dim.
-        img_q = self.norm_q(img_q)
-        img_k = self.norm_k(img_k)
-        txt_q = self.norm_added_q(txt_q)
-        txt_k = self.norm_added_k(txt_k)
+        img_q = self._apply_rms_norm(img_q, self.norm_q)
+        img_k = self._apply_rms_norm(img_k, self.norm_k)
+        txt_q = self._apply_rms_norm(txt_q, self.norm_added_q)
+        txt_k = self._apply_rms_norm(txt_k, self.norm_added_k)
 
         # Rotary on both streams.
         if image_rotary_emb is not None:
@@ -618,6 +580,8 @@ class QwenJointAttention(Attention):
         if attention_mask is not None:
             # attention_mask is (B, Sjoint) bool or float. Expand to
             # (B, 1, 1, Sjoint) so SDPA broadcasts over (H, Sq).
+            # Qwen pads text embeddings before concatenating [text | image],
+            # so masked SDPA is required to ignore padded text tokens.
             attn_mask = attention_mask[:, None, None, :]
 
         if attn_mask is None:
@@ -817,7 +781,12 @@ class QwenImageTransformer2DModel(nn.Module):
             theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True
         )
         self.time_text_embed = QwenTimestepProjEmbeddings(embedding_dim=self.inner_dim)
-        self.txt_norm = RMSNorm(joint_attention_dim, eps=1e-6)
+        self.txt_norm = RMSNorm(
+            hidden_size=joint_attention_dim,
+            eps=1e-6,
+            dtype=self.model_config.torch_dtype,
+            has_weights=True,
+        )
         linear_kwargs = {
             "dtype": self.model_config.torch_dtype,
             "quant_config": self.model_config.get_quant_config(),

@@ -218,9 +218,9 @@ def test_pre_post_block_modules_parity(transformer_state_dict, transformer_confi
     We construct one of each on both sides, load the relevant state_dict
     slice, and compare output on fixed random inputs.
     """
+    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
     from tensorrt_llm._torch.visual_gen.models.qwen_image import (
         AdaLayerNormContinuous,
-        RMSNorm,
     )
 
     device = torch.device("cuda")
@@ -262,7 +262,9 @@ def test_pre_post_block_modules_parity(transformer_state_dict, transformer_confi
     # Our ports.
     our_img_in = torch.nn.Linear(cfg["in_channels"], inner_dim).to(dtype).to(device)
     our_txt_in = torch.nn.Linear(joint_attn_dim, inner_dim).to(dtype).to(device)
-    our_txt_norm = RMSNorm(joint_attn_dim, eps=1e-6).to(dtype).to(device)
+    our_txt_norm = RMSNorm(
+        hidden_size=joint_attn_dim, eps=1e-6, dtype=dtype, has_weights=True
+    ).to(device)
     our_norm_out = AdaLayerNormContinuous(inner_dim, inner_dim, elementwise_affine=False, eps=1e-6).to(dtype).to(device)
     our_proj_out = torch.nn.Linear(
         inner_dim, patch_size * patch_size * out_channels, bias=True
