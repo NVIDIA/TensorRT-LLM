@@ -2875,8 +2875,7 @@ class PyExecutor:
                 gpu_forward_end = None
                 gpu_forward_events_from_perf_pool = False
 
-                can_queue, can_queue_this_rank = self._can_queue(
-                    scheduled_batch)
+                can_queue, _ = self._can_queue(scheduled_batch)
 
                 if can_queue:
                     if self.kv_cache_transceiver:
@@ -2899,15 +2898,7 @@ class PyExecutor:
 
                 # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
                 if self.kv_connector_manager:
-                    can_queue, can_queue_this_rank = self._can_queue(
-                        scheduled_batch)
-
-                # Revert spurious KV cache capacity growth (see overlap
-                # loop for the full comment).
-                if not can_queue and can_queue_this_rank \
-                        and self._scheduler_manages_kv_suspend:
-                    for req in scheduled_batch.generation_requests:
-                        self.kv_cache_manager.revert_allocate_generation(req)
+                    can_queue, _ = self._can_queue(scheduled_batch)
 
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
@@ -3312,18 +3303,6 @@ class PyExecutor:
                 # we need to delay the update of the previous batch's sample state,
                 # and let the later iteration to update it.
                 should_process_previous_batch = can_queue or not can_queue_this_rank
-
-                # With attention DP, can_queue=False means another rank has
-                # an empty batch so no forward pass will run.  The V2
-                # scheduler already grew each generation request's KV cache
-                # capacity during scheduling; revert that growth so it does
-                # not accumulate across skipped iterations and overflow the
-                # host page-index buffer.
-                if not can_queue and can_queue_this_rank \
-                        and self._scheduler_manages_kv_suspend:
-                    for req in scheduled_batch.generation_requests:
-                        self.kv_cache_manager.revert_allocate_generation(req)
-
                 if can_queue:
 
                     # The generation requests that do not have batch_idx
