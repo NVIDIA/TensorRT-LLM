@@ -272,6 +272,24 @@ class Qwen3HybridConfig(ModelConfig):
     num_linear_attention_layers: Optional[int] = Field(default=None)
     mamba_ssm_cache_dtype: Optional[str] = Field(default="auto")
 
+    @classmethod
+    def from_hf(cls, model_hf_name, hf_model_path):
+        pretrained_config = load_pretrained_config(hf_model_path
+                                                   or model_hf_name,
+                                                   trust_remote_code=True)
+        hf_config = pretrained_config.to_dict()
+        param_count = cls.get_param_count(model_hf_name, hf_model_path)
+
+        layer_types = get_qwen3_hybrid_layer_types(pretrained_config)
+        num_attention_layers = layer_types.count("full_attention")
+        num_linear_attention_layers = layer_types.count("linear_attention")
+
+        return cls(name=model_hf_name,
+                   param_count=param_count,
+                   num_attention_layers=num_attention_layers,
+                   num_linear_attention_layers=num_linear_attention_layers,
+                   **hf_config)
+
     @model_validator(mode="after")
     def set_values_if_none(self):
         """Derive num_attention_layers and num_linear_attention_layers.
@@ -283,11 +301,10 @@ class Qwen3HybridConfig(ModelConfig):
                                                        trust_remote_code=True)
             layer_types = get_qwen3_hybrid_layer_types(pretrained_config)
             if self.num_attention_layers is None:
-                self.num_attention_layers = sum(1 for lt in layer_types
-                                                if lt == "full_attention")
+                self.num_attention_layers = layer_types.count("full_attention")
             if self.num_linear_attention_layers is None:
-                self.num_linear_attention_layers = sum(
-                    1 for lt in layer_types if lt == "linear_attention")
+                self.num_linear_attention_layers = layer_types.count(
+                    "linear_attention")
 
         super().set_values_if_none()
         return self
