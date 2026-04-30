@@ -4434,15 +4434,9 @@ def launchTestJobs(pipeline, testFilter)
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts != null && cbts.affected_stages) {
         def affectedSet = cbts.affected_stages as Set
-        // CBTS diagnostics: show what CBTS actually decided BEFORE the
-        // /Perf/ exclusion and post-merge narrowing, so empty / over-eager
-        // affected_stages are visible at a glance.
-        echo "CBTS [${cbts.scope}]: affected_stages (${affectedSet.size()}):\n  ${affectedSet.sort().join('\n  ')}"
         parallelJobsFiltered = parallelJobs.findAll { key, _ ->
             affectedSet.contains(key) && !(key =~ /Perf/)
         }
-        def droppedStages = (parallelJobs.keySet() - parallelJobsFiltered.keySet()).sort()
-        echo "CBTS [${cbts.scope}]: dropped ${droppedStages.size()} stages from parallelJobs (not in affected_stages or matched /Perf/)"
         // Under `/bot run --post-merge`, keep only post-merge hits; if none,
         // no-op (no fallback to full post-merge).
         if (testFilter[(IS_POST_MERGE)]) {
