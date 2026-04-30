@@ -140,8 +140,7 @@ def _validate_public_url(url: str) -> None:
             raise RuntimeError(f"URL resolves to a non-public address ({ip})")
 
 
-async def _safe_aiohttp_get(url: str,
-                            session: aiohttp.ClientSession) -> bytes:
+async def _safe_aiohttp_get(url: str, session: aiohttp.ClientSession) -> bytes:
     """Fetch *url*, validating each redirect hop and capping response size."""
     current = url
     for _ in range(_MAX_REDIRECTS + 1):
@@ -156,8 +155,7 @@ async def _safe_aiohttp_get(url: str,
             async for chunk in response.content.iter_chunked(1 << 20):
                 total += len(chunk)
                 if total > _MAX_RESPONSE_BYTES:
-                    raise RuntimeError(
-                        "Response exceeds maximum allowed size")
+                    raise RuntimeError("Response exceeds maximum allowed size")
                 buf.write(chunk)
             return buf.getvalue()
     raise RuntimeError("Too many redirects")
