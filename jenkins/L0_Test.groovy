@@ -2581,20 +2581,14 @@ def renderTestDB(testContext, llmSrc, stageName, preDefinedMakoOpts=null) {
         def overrideDir = "${llmSrc}/${cbts.test_db_dir_override}"
         def dirExists = sh(returnStdout: true, script: "test -d ${overrideDir} && echo yes || echo no").trim()
         if (dirExists != "yes") {
-            // writeFile() goes through Jenkins's sandbox file IO and was
-            // hitting AccessDeniedException on absolute workspace paths.
-            // Encode the JSON as base64 in Groovy and decode in-shell so
-            // the file is written by the container user, bypassing the
-            // sandbox entirely. base64 only contains [A-Za-z0-9+/=] so
-            // the heredoc body has no shell-meta hazards.
-            def encodedInput = cbts.cbts_input_json.bytes.encodeBase64().toString()
+            // Write input JSON to a JNLP-writable temp location instead of
+            // ${llmSrc}/, which the build container created as root and
+            // would reject writeFile() with AccessDeniedException. Matches
+            // the scriptLaunch*PathLocal pattern used in the SLURM path.
+            def cbtsInputLocal = Utils.createTempLocation(pipeline, "./cbts_input.json")
+            pipeline.writeFile(file: cbtsInputLocal, text: cbts.cbts_input_json)
             sh "apt-get update -qq && apt-get install -y -qq python3-yaml || true"
-            sh """\
-base64 -d > ${llmSrc}/cbts_input.json << 'CBTS_INPUT_B64_EOF'
-${encodedInput}
-CBTS_INPUT_B64_EOF
-"""
-            sh "cd ${llmSrc} && python3 jenkins/scripts/cbts/main.py cbts_input.json > /dev/null 2>&1 || true"
+            sh "cd ${llmSrc} && python3 jenkins/scripts/cbts/main.py ${cbtsInputLocal} > /dev/null 2>&1 || true"
         }
     }
     def testDBPath = "${llmSrc}/tests/integration/test_lists/test-db"
