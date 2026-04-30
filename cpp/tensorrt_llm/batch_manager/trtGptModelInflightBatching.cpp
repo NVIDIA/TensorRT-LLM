@@ -68,11 +68,13 @@
 #include "tensorrt_llm/runtime/utils/runtimeUtils.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -2137,8 +2139,6 @@ void TrtGptModelInflightBatching::buildGatheredBeamTokensForCallback(DecoderInpu
     NVTX3_SCOPED_RANGE(buildGatheredBeamTokensForCallback);
 
     auto const numReqs = inputBuffers.decoderRequests.size();
-    // TODO(kyumin): remove. Diagnostic to confirm the patch is loaded by the runtime.
-    TLLM_LOG_INFO("buildGatheredBeamTokensForCallback called with %zu requests", numReqs);
     inputBuffers.gatheredBeamTokensForCallback.assign(numReqs, std::nullopt);
 
     for (size_t i = 0; i < numReqs; ++i)
@@ -2246,11 +2246,58 @@ void TrtGptModelInflightBatching::buildGatheredBeamTokensForCallback(DecoderInpu
             }
         }
 
+        // TODO(kyumin): TEMP DIAG — dump actual parentIds and gathered tokens for the
+        // first time we see a reorder for req 1 (one-shot to avoid log flooding).
+        // Helps differentiate "gather logic correct, data wrong" from "gather logic wrong".
+        if (anyReorderNeeded && llmReq->mRequestId == 1)
+        {
+            static std::atomic<bool> alreadyLogged{false};
+            bool expected = false;
+            if (alreadyLogged.compare_exchange_strong(expected, true))
+            {
+                std::ostringstream pSS;
+                std::ostringstream gSS;
+                pSS << "req=1 parentIds[beam][promptLen+g] for g=1.." << (maxGenerated - 1) << ": ";
+                for (SizeType32 b = 0; b < beamWidth; ++b)
+                {
+                    pSS << "b" << b << "=[";
+                    for (SizeType32 g = 1; g < numGeneratedPerBeam[b]; ++g)
+                    {
+                        pSS << parentIdsData[b * maxSeqLength + (promptLen + g)] << (g + 1 == numGeneratedPerBeam[b] ? "" : ",");
+                    }
+                    pSS << "] ";
+                }
+                gSS << "req=1 gathered (last " << maxGenerated << " tokens of each beam): ";
+                for (SizeType32 b = 0; b < beamWidth; ++b)
+                {
+                    gSS << "b" << b << "=[";
+                    auto const start = static_cast<SizeType32>(gathered[b].size()) - numGeneratedPerBeam[b];
+                    for (SizeType32 g = 0; g < numGeneratedPerBeam[b]; ++g)
+                    {
+                        gSS << gathered[b][start + g] << (g + 1 == numGeneratedPerBeam[b] ? "" : ",");
+                    }
+                    gSS << "] ";
+                }
+                std::ostringstream mSS;
+                mSS << "req=1 mTokens slot view (last " << maxGenerated << " tokens of each slot): ";
+                for (SizeType32 b = 0; b < beamWidth; ++b)
+                {
+                    mSS << "s" << b << "=[";
+                    auto const start = static_cast<SizeType32>(mTokens[b].size()) - numGeneratedPerBeam[b];
+                    for (SizeType32 g = 0; g < numGeneratedPerBeam[b]; ++g)
+                    {
+                        mSS << mTokens[b][start + g] << (g + 1 == numGeneratedPerBeam[b] ? "" : ",");
+                    }
+                    mSS << "] ";
+                }
+                TLLM_LOG_INFO("[GATHER-DUMP] %s", pSS.str().c_str());
+                TLLM_LOG_INFO("[GATHER-DUMP] %s", mSS.str().c_str());
+                TLLM_LOG_INFO("[GATHER-DUMP] %s", gSS.str().c_str());
+            }
+        }
+
         if (anyReorderNeeded)
         {
-            // TODO(kyumin): remove. Diagnostic to confirm the gathered path fires.
-            TLLM_LOG_INFO("buildGatheredBeamTokensForCallback: reorder detected for req %lu (slot %d, beamWidth %d)",
-                static_cast<unsigned long>(llmReq->mRequestId), seqSlot, beamWidth);
             inputBuffers.gatheredBeamTokensForCallback[i] = std::move(gathered);
         }
     }
