@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -84,6 +84,7 @@ class LlmRequest;
 class RuntimeBuffers;
 class BasePeftCacheManager;
 class GuidedDecoder;
+class TrtGptModelTest;
 
 // Algorithms
 class CapacityScheduler;
@@ -235,7 +236,11 @@ public:
         return mModelConfig.getSpeculativeDecodingMode();
     }
 
+    [[nodiscard]] SizeType32 numCachedCudaGraphs() const;
+
 private:
+    friend class TrtGptModelTest;
+
     [[nodiscard]] SizeType32 getContextBufferId() const
     {
         return mMicroBatchId;

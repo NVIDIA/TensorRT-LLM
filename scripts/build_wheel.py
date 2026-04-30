@@ -550,6 +550,27 @@ def main(*,
         if "70-real" in cuda_architectures:
             raise RuntimeError("Volta architecture is deprecated support.")
 
+    # Debug and RelWithDebInfo enable CUDA `--generate-line-info`, which
+    # inflates .text so much that linking against every supported arch
+    # overflows section limits. Require an explicit arch list so the build
+    # won't silently fail deep into compilation.
+    if build_type in ("Debug", "RelWithDebInfo") and not cuda_architectures:
+        raise RuntimeError(
+            f"Building {build_type} requires --cuda_architectures to be set "
+            "explicitly (e.g. --cuda_architectures=90-real). Building for all "
+            "architectures with line info enabled exceeds linker section "
+            "limits. Pass a narrow arch list matching the GPU you intend to "
+            "debug/profile.")
+
+    if build_type == "Debug":
+        print(
+            "-- Debug build: only --generate-line-info is enabled by default. "
+            "Full device debug info (-G) is NOT enabled because it can make "
+            "ptxas memory usage explode and get OOM-killed on some kernels. "
+            "If you need cuda-gdb stepping inside kernels, opt in with "
+            "`--extra-cmake-vars CMAKE_CUDA_FLAGS_DEBUG=-G` and make sure "
+            "the build host has enough memory for ptxas.")
+
     cuda_architectures = cuda_architectures or 'all'
     cmake_cuda_architectures = f'"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}"'
 

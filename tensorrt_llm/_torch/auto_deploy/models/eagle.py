@@ -283,6 +283,9 @@ class EagleOneModelFactory(ModelFactory):
             raise ValueError("speculative_config is required for EagleOneModelFactory.")
 
         self.speculative_config = speculative_config
+        self.sync_before_hidden_state_capture = kwargs.get(
+            "sync_before_hidden_state_capture", False
+        )
         # For MTP, derive Eagle-pipeline fields from MTP-specific fields.
         if isinstance(speculative_config, MTPDecodingConfig):
             draft_model_path = speculative_config.speculative_model or model
@@ -301,7 +304,7 @@ class EagleOneModelFactory(ModelFactory):
             max_seq_len=max_seq_len,
         )
 
-        # Create draft factory (EagleDrafter)
+        # Create draft factory (EagleDrafter).
         self.draft_factory = EagleDrafterFactory(
             model=str(draft_model_path),
             model_kwargs=speculative_model_kwargs,
@@ -330,6 +333,7 @@ class EagleOneModelFactory(ModelFactory):
             normalize_target_hidden_state=getattr(
                 draft_config, "normalize_target_hidden_state", False
             ),
+            sync_before_hidden_state_capture=self.sync_before_hidden_state_capture,
         )
 
         return EagleWrapper(

@@ -43,11 +43,18 @@ from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 
 
-def _logit_bias_to_embedding_bias(logit_bias: Optional[Dict[str, float]],
-                                  vocab_size: int) -> Optional[torch.Tensor]:
+def _logit_bias_to_embedding_bias(
+        logit_bias: Optional[Dict[str, float]],
+        vocab_size: Optional[int]) -> Optional[torch.Tensor]:
     """Convert OpenAI logit_bias dict to embedding_bias tensor for sampling."""
     if logit_bias is None:
         return None
+    if vocab_size is None:
+        raise ValueError(
+            "logit_bias requires a tokenizer, but the server was started "
+            "without one (e.g. num_postprocess_workers > 0). "
+            "Remove logit_bias from your request or set num_postprocess_workers=0."
+        )
 
     # Create 1D zeros tensor as expected by executor API (will be unsqueezed to [1, vocab_size] internally)
     embedding_bias = torch.zeros(vocab_size, dtype=torch.float32)
@@ -390,7 +397,7 @@ class CompletionRequest(OpenAIBaseModel):
     # doc: end-completion-extra-params
 
     def to_sampling_params(self,
-                           vocab_size: int = 32000,
+                           vocab_size: Optional[int] = None,
                            gather_generation_logits: bool = False,
                            backend: Optional[str] = None) -> SamplingParams:
         sampling_params = SamplingParams(
@@ -752,7 +759,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # doc: end-chat-completion-extra-params
 
     def to_sampling_params(self,
-                           vocab_size: int = 32000,
+                           vocab_size: Optional[int] = None,
                            gather_generation_logits: bool = False,
                            reasoning_parser: Optional[str] = None,
                            backend: Optional[str] = None) -> SamplingParams:

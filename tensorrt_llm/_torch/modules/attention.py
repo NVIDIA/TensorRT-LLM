@@ -174,12 +174,14 @@ def _helix_post_process(
         fifo_version = mapping.cp_config.get("fifo_version", 2)
 
         if fifo_version == 1:
-            reshape_o = lambda: partial_o.view(
-                num_tokens, cp_size, num_heads_tp_cp, value_dim).transpose(
-                    1, 2).contiguous()
-            reshape_s = lambda: softmax_stats.view(
-                num_tokens, cp_size, num_heads_tp_cp, 2).transpose(
-                    1, 2).contiguous()
+
+            def reshape_o():
+                return partial_o.view(num_tokens, cp_size, num_heads_tp_cp,
+                                      value_dim).transpose(1, 2).contiguous()
+
+            def reshape_s():
+                return softmax_stats.view(num_tokens, cp_size, num_heads_tp_cp,
+                                          2).transpose(1, 2).contiguous()
 
             if aux_stream is not None and ln_events is not None:
                 partial_o, softmax_stats = maybe_execute_in_parallel(
@@ -462,6 +464,8 @@ class Attention(nn.Module):
 
         self.use_cute_dsl_blockscaling_mm = config.use_cute_dsl_blockscaling_mm
         self.use_cute_dsl_blockscaling_bmm = config.use_cute_dsl_blockscaling_bmm
+        self.use_cute_dsl_bf16_bmm = config.use_cute_dsl_bf16_bmm
+        self.use_cute_dsl_bf16_gemm = config.use_cute_dsl_bf16_gemm
 
         qkv_shard_indices_mapping = {
             "q": (0, self.q_size * (2 if self.attn_output_gate else 1)),
@@ -899,6 +903,19 @@ class Attention(nn.Module):
         else:
             q, k, v = qkv, None, None
 
+        # For dynamic tree spec decoding with Python RoPE, adjust position_ids
+        # to use tree offsets (same as C++ kernel: past_seq_len + offset).
+        if (not self.rope_fusion
+                and getattr(attn_metadata, 'is_spec_dec_dynamic_tree', False)
+                and getattr(attn_metadata, 'use_spec_decoding', False)
+                and getattr(attn_metadata, 'spec_decoding_position_offsets',
+                            None) is not None
+                and attn_metadata.spec_decoding_position_offsets.dim() ==
+                1  # 1D layout ⇒ dynamic tree
+                and position_ids is not None):
+            position_ids = self._adjust_position_ids_for_spec_dec(
+                position_ids, attn_metadata)
+
         q, k, v = self.apply_rope(q, k, v, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
 
@@ -947,6 +964,25 @@ class Attention(nn.Module):
             q, k, v = self.split_qkv(q, k, v)
             q, k = self.rotary_emb(position_ids, [q, k])
         return q, k, v
+
+    def _adjust_position_ids_for_spec_dec(self, position_ids, attn_metadata):
+        """Replicate C++ kernel's rotary_pos = past_seq_len + offset."""
+        num_contexts = attn_metadata.num_contexts
+        num_gens = attn_metadata.num_seqs - num_contexts
+        if num_gens <= 0:
+            return position_ids
+        gen_len = int(attn_metadata.seq_lens[num_contexts])
+        base_pos = attn_metadata.kv_lens_cuda[num_contexts:num_contexts +
+                                              num_gens] - gen_len
+        offsets = attn_metadata.spec_decoding_position_offsets[:num_gens *
+                                                               gen_len].view(
+                                                                   num_gens,
+                                                                   gen_len)
+        adjusted = (base_pos.unsqueeze(1) + offsets).reshape(-1)
+        start = attn_metadata.num_ctx_tokens
+        end = start + num_gens * gen_len
+        position_ids[0, start:end] = adjusted
+        return position_ids
 
     def apply_qk_norm(self, q, k):
         raise NotImplementedError(
@@ -1228,6 +1264,8 @@ class MLA(nn.Module):
 
         self.use_cute_dsl_blockscaling_mm = config.use_cute_dsl_blockscaling_mm
         self.use_cute_dsl_blockscaling_bmm = config.use_cute_dsl_blockscaling_bmm
+        self.use_cute_dsl_bf16_bmm = config.use_cute_dsl_bf16_bmm
+        self.use_cute_dsl_bf16_gemm = config.use_cute_dsl_bf16_gemm
 
         if not self.is_lite:
             self.kv_a_proj_with_mqa = Linear(
@@ -1239,7 +1277,8 @@ class MLA(nn.Module):
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 use_custom_cublas_mm=True,
                 force_dynamic_quantization=config.force_dynamic_quantization,
-                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
 
             self.q_a_layernorm = RMSNorm(hidden_size=self.q_lora_rank,
                                          eps=rms_norm_eps,
@@ -1256,7 +1295,8 @@ class MLA(nn.Module):
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 allreduce_strategy=config.allreduce_strategy,
                 force_dynamic_quantization=config.force_dynamic_quantization,
-                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
         else:
             self.kv_a_proj_with_mqa = Linear(
                 hidden_size,
@@ -1267,7 +1307,8 @@ class MLA(nn.Module):
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 use_custom_cublas_mm=True,
                 force_dynamic_quantization=config.force_dynamic_quantization,
-                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
 
             self.q_proj = Linear(
                 self.q_lora_rank,
@@ -1280,7 +1321,8 @@ class MLA(nn.Module):
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
                 allreduce_strategy=config.allreduce_strategy,
                 force_dynamic_quantization=config.force_dynamic_quantization,
-                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+                use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
             self.q_b_proj = self.q_proj
 
         self.kv_a_layernorm = RMSNorm(hidden_size=kv_lora_rank,
@@ -1298,7 +1340,8 @@ class MLA(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
-            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+            use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm)
         # This parameter will view into self.kv_b_proj.weight after loading weights.
         # For dummy weight initialization, this parameter is initialized with empty tensor.
         # Used in forward_absorption only
@@ -2324,6 +2367,14 @@ class MLA(nn.Module):
                                             position_ids, attn_metadata, output,
                                             latent_cache)
 
+    def _bmm_bf16_out(self, a, b_no_transpose, b_transposed, output):
+        """BMM with optional CuTe DSL bf16 acceleration on Blackwell."""
+        if self.use_cute_dsl_bf16_bmm and is_sm_100f():
+            torch.ops.trtllm.cute_dsl_bf16_bmm_blackwell(
+                a, b_no_transpose, output)
+        else:
+            torch.ops.trtllm.bmm_out(a, b_transposed, output)
+
     def forward_absorption_generation(
         self,
         q: torch.Tensor,
@@ -2391,8 +2442,9 @@ class MLA(nn.Module):
             # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
             # The output of bmm is written directly into fused_q
             maybe_execute_in_parallel(
-                lambda: torch.ops.trtllm.bmm_out(
-                    q_nope_t, self.k_b_proj_trans.transpose(1, 2), q_nope_out),
+                lambda: self._bmm_bf16_out(q_nope_t, self.k_b_proj_trans,
+                                           self.k_b_proj_trans.transpose(1, 2),
+                                           q_nope_out),
                 lambda: self.mqa.mla_rope_generation(
                     fused_q,
                     q_pe,
@@ -2489,9 +2541,9 @@ class MLA(nn.Module):
         if self.v_b_proj.dtype == torch.bfloat16:
             # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
             # -> [num_heads, seq, v_head_dim]
-            torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
-                                     self.v_b_proj.transpose(1, 2),
-                                     attn_output.transpose(0, 1))
+            self._bmm_bf16_out(attn_out_latent.transpose(0, 1), self.v_b_proj,
+                               self.v_b_proj.transpose(1, 2),
+                               attn_output.transpose(0, 1))
         elif self.v_b_proj.dtype == torch.float8_e4m3fn:
             fp8_block_scaling_bmm_out(
                 attn_out_latent,
@@ -2542,9 +2594,8 @@ class MLA(nn.Module):
             # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
             # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
             # The output of bmm is written directly into fused_q
-            torch.ops.trtllm.bmm_out(q_nope_t,
-                                     self.k_b_proj_trans.transpose(1, 2),
-                                     q_nope_out)
+            self._bmm_bf16_out(q_nope_t, self.k_b_proj_trans,
+                               self.k_b_proj_trans.transpose(1, 2), q_nope_out)
         elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
@@ -2601,9 +2652,9 @@ class MLA(nn.Module):
         if self.v_b_proj.dtype == torch.bfloat16:
             # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
             # -> [num_heads, seq, v_head_dim]
-            torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
-                                     self.v_b_proj.transpose(1, 2),
-                                     attn_output.transpose(0, 1))
+            self._bmm_bf16_out(attn_out_latent.transpose(0, 1), self.v_b_proj,
+                               self.v_b_proj.transpose(1, 2),
+                               attn_output.transpose(0, 1))
         elif self.v_b_proj.dtype == torch.float8_e4m3fn:
             fp8_block_scaling_bmm_out(
                 attn_out_latent,
@@ -2666,9 +2717,8 @@ class MLA(nn.Module):
             # [num_heads, num_tokens, self.qk_nope_head_dim] x [num_heads, kv_lora_rank, qk_nope_head_dim]
             # -> [num_heads, num_tokens, kv_lora_rank] -> [num_tokens, num_heads, kv_lora_rank]
             # The output of bmm is written directly into fused_q
-            torch.ops.trtllm.bmm_out(q_nope_t,
-                                     self.k_b_proj_trans.transpose(1, 2),
-                                     q_nope_out)
+            self._bmm_bf16_out(q_nope_t, self.k_b_proj_trans,
+                               self.k_b_proj_trans.transpose(1, 2), q_nope_out)
         elif self.k_b_proj_trans.dtype == torch.float8_e4m3fn:
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = q_nope_out.transpose(0, 1)
@@ -2746,9 +2796,9 @@ class MLA(nn.Module):
         if self.v_b_proj.dtype == torch.bfloat16:
             # [num_heads, seq, kv_lora_rank] x [num_heads, kv_lora_rank, v_head_dim]
             # -> [num_heads, seq, v_head_dim]
-            torch.ops.trtllm.bmm_out(attn_out_latent.transpose(0, 1),
-                                     self.v_b_proj.transpose(1, 2),
-                                     attn_output.transpose(0, 1))
+            self._bmm_bf16_out(attn_out_latent.transpose(0, 1), self.v_b_proj,
+                               self.v_b_proj.transpose(1, 2),
+                               attn_output.transpose(0, 1))
         elif self.v_b_proj.dtype == torch.float8_e4m3fn:
             fp8_block_scaling_bmm_out(
                 attn_out_latent,

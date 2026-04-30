@@ -998,8 +998,11 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         image: Union[Image.Image, torch.Tensor],
         **kwargs,
     ):
-        # Dynamic resolution path.
-        if self.dynamic_tiler is not None:
+        # Dynamic resolution path — only when max_num_tiles is not
+        # explicitly overridden (e.g. for video frames which use
+        # VIDEO_MAX_NUM_TILES and rely on the InternVL tiling logic
+        # in the HF processor, not the dynamic tiler).
+        if self.dynamic_tiler is not None and "max_num_tiles" not in kwargs:
             budget = self.dynamic_tiler._max_num_patches
             params, _ = self.dynamic_tiler.process_media(image, budget)
             num_image_tokens = params.num_embeddings

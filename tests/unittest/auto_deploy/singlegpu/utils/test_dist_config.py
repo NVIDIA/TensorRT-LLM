@@ -15,8 +15,17 @@
 
 """Unit tests for ``DistConfig`` (CPU-only)."""
 
+import pytest
+
 from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
-from tensorrt_llm.mapping import Mapping
+
+try:
+    from tensorrt_llm.mapping import Mapping
+
+    _HAS_MAPPING = True
+except ImportError:
+    Mapping = None  # type: ignore[assignment]
+    _HAS_MAPPING = False
 
 
 def test_defaults():
@@ -62,6 +71,7 @@ def test_from_dict_ignores_unknown_keys():
     assert cfg.rank == 0
 
 
+@pytest.mark.skipif(not _HAS_MAPPING, reason="Requires tensorrt_llm.mapping (not in standalone)")
 def test_from_mapping_to_mapping_roundtrip():
     m = Mapping(
         world_size=8,

@@ -398,10 +398,7 @@ public:
     static BlockPtr createPlaceholder(IdType blockId, SizeType32 windowSize);
 
     void detachDescendantsFromLookupTree();
-    //! \brief Detach all placeholder blocks in the previous-block chain from the lookup tree.
-    //! \details Walks upward via getPrevBlock() and calls detachFromLookupNode() on each
-    //! block that is a placeholder. Stops at the root (kCachedBlocksRootId).
-    void detachPreviousPlaceholdersFromLookupTree() const;
+
     void freeBlockAndAllDescendants();
 
     //! \brief Find block matching blockKey. If allowPartial is true, the returned block may match only a prefix of
@@ -635,7 +632,7 @@ public:
         TLLM_CHECK_WITH_INFO(currentPrepopulatedPromptLen <= mCurrentPrepopulatedPromptLen,
             "currentPrepopulatedPromptLen must be updated non-increasingly due to the "
             "assumption that smaller window sizes have shorter or equal"
-            "currentPrepopulatedPromptLen in WindowSizeManager::loadOrAllocateBlocks.");
+            " currentPrepopulatedPromptLen during multi-window batch allocation.");
         mCurrentPrepopulatedPromptLen = currentPrepopulatedPromptLen;
     }
 
@@ -789,11 +786,6 @@ public:
     void createIndexerKCachePools();
 
     void startScheduling();
-
-    //! \brief Assign blocks for new sequence
-    //! \return The number of tokens that were matched/prepopulated from cache (prepopulatedPromptLen)
-    [[nodiscard]] SizeType32 addSequence(GenerationRequest& sequence, SizeType32 inputLength,
-        SizeType32 numContextBlocks, LlmRequest& llmRequest, bool isEnableBlockReuse);
 
     //! \brief Per-request block allocation statistics from batch addSequence.
     struct BatchSeqStats
@@ -1116,6 +1108,9 @@ public:
 
     [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey);
 
+    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(
+        std::vector<BlockKey> const& blockKeys);
+
     //! \brief Unpin blocks by block ids directly
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
@@ -1149,6 +1144,9 @@ public:
     }
 
 private:
+    //! \brief Walk the reuse tree with precomputed per-block keys (no lock; callers must hold mCachedBlocksRootMutex).
+    [[nodiscard]] std::shared_ptr<KVCacheBlock> searchReuseTree(std::vector<BlockKey> const& blockKeys);
+
     bool tryAllocatePlaceholderForLinearAttention(GenerationRequest& sequence, bool shareAmongBeams);
 
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
@@ -1156,16 +1154,6 @@ private:
 
     //! \brief Add single block to all beams of sequence.
     void addBlockToAllBeams(BlockPtr const& block, GenerationRequest& sequence);
-
-    //! \brief Try to load blocks from cache. Allocate new blocks if necessary.
-    //! \param blockKeys Key of each block.
-    //! \param sequence Sequence to which blocks are assigned.
-    //! \return Number of matched tokens from loaded blocks.
-    SizeType32 loadOrAllocateBlocks(std::vector<BlockKey> const& blockKeys, SizeType32 inputLength,
-        SizeType32 numContextBlocks, GenerationRequest& sequence,
-        std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions,
-        executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "",
-        bool isEnableBlockReuse = false);
 
     //! \brief Phase 1: Walk radix tree and claim matching blocks.
     //! \details Caller must hold mCachedBlocksRootMutex.
@@ -1382,10 +1370,6 @@ public:
         std::map<SizeType32, SizeType32> const& cacheSizePerTokenPerWindowSize);
 
     void allocatePools(bool useUvm);
-
-    //! \return The number of tokens that were matched/prepopulated from cache (prepopulatedPromptLen)
-    [[nodiscard]] SizeType32 addSequence(GenerationRequest& sequence, SizeType32 inputLength,
-        SizeType32 numContextBlocks, LlmRequest& llmRequest, SizeType32 windowSize, bool isEnableBlockReuse);
 
     //! \brief Batch add sequences forwarding to WindowBlockManager::addSequenceBatch.
     [[nodiscard]] std::vector<WindowBlockManager::BatchSeqStats> addSequenceBatch(
@@ -1654,6 +1638,12 @@ public:
         return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKey(blockKey);
     }
 
+    [[nodiscard]] std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(
+        std::vector<BlockKey> const& blockKeys, SizeType32 windowSize)
+    {
+        return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKeys(blockKeys);
+    }
+
     [[nodiscard]] SizeType32 getNumPrimaryBlocks() const
     {
         return sumWindows([](auto const& manager) { return manager.getNumPrimaryBlocks(); });
@@ -1890,16 +1880,6 @@ public:
     /// LlmRequest::getNumTokens.
     [[nodiscard]] virtual SizeType32 getTokenCount(LlmRequest::RequestIdType requestId) const = 0;
 
-    /// @brief Add new request to the KV cache manager.
-    /// @param inputLength Input length for which KV cache need to be allocated.
-    /// @param beamWidth Beam width for which KV cache need to be allocated.
-    /// @param llmRequest Optional request to use for KV cache lookup.
-    /// @details If llmRequest is supplied and KV cache reuse is enabled, try to recover KV cache blocks for
-    /// inputLength - 1 tokens and populate prepopulatedPromptLen.
-    virtual void addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
-        OptionalRef<LlmRequest> llmRequest = std::nullopt)
-        = 0;
-
     //! \brief Batch add sequences with two-phase claim-then-onboard strategy.
     //! \details For each attention window, when block reuse is enabled, Phase 1 claims all matching
     //!          blocks across all requests (protecting them from eviction via PartialClaimTracker),
@@ -2064,6 +2044,10 @@ public:
 
     [[nodiscard]] virtual std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKey(
         BlockKey const& blockKey, SizeType32 windowSize)
+        = 0;
+
+    [[nodiscard]] virtual std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(
+        std::vector<BlockKey> const& blockKeys, SizeType32 windowSize)
         = 0;
 
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
@@ -2267,15 +2251,6 @@ public:
     //! the placeholder block). It should be called before every forward step, after adding new tokens.
     void copyLinearAttentionBlock(LlmRequest const& llmRequest);
 
-    /// @brief Add new request to the KV cache manager.
-    /// @param inputLength Input length for which KV cache need to be allocated.
-    /// @param beamWidth Beam width for which KV cache need to be allocated.
-    /// @param llmRequest Optional request to use for KV cache lookup.
-    /// @details If llmRequest is supplied and KV cache reuse is enabled, try to recover KV cache blocks for
-    /// inputLength - 1 tokens and populate prepopulatedPromptLen.
-    void addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
-        OptionalRef<LlmRequest> llmRequest = std::nullopt) override;
-
     void addSequenceBatch(
         std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const& requestInfos,
         std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests) override;
@@ -2438,6 +2413,12 @@ public:
         BlockKey const& blockKey, SizeType32 windowSize) override
     {
         return mBlockManager.findBlocksInReuseTreeByBlockKey(blockKey, windowSize);
+    }
+
+    std::shared_ptr<KVCacheBlock> findBlocksInReuseTreeByBlockKeys(
+        std::vector<BlockKey> const& blockKeys, SizeType32 windowSize) override
+    {
+        return mBlockManager.findBlocksInReuseTreeByBlockKeys(blockKeys, windowSize);
     }
 
     void resetReuseState() override

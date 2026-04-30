@@ -597,15 +597,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         model_is_wrapped: bool = False,
         spec_metadata: Optional['SpecMetadata'] = None,
         spec_tree_manager: Optional['SpecTreeManager'] = None,
-        spec_decoding_tensor: Optional['SpecDecodingTensor'] = None,
     ):
         """Update speculative decoding parameters and create expanded buffers."""
         super().update_spec_dec_param(batch_size, is_spec_decoding_enabled,
                                       is_spec_dec_tree,
                                       is_spec_dec_dynamic_tree, max_draft_len,
                                       max_total_draft_tokens, model_is_wrapped,
-                                      spec_metadata, spec_tree_manager,
-                                      spec_decoding_tensor)
+                                      spec_metadata, spec_tree_manager)
         self.max_draft_tokens = max_draft_len
         init_shape = self.kv_lens_expanded_host.shape[0]
         if self.max_num_sequences * (1 + self.max_draft_tokens) != init_shape:
@@ -1124,6 +1122,13 @@ class Indexer(nn.Module):
             # Note, need to update it if the dtype of topk input tensor is changed.
             cute_dsl_custom_ops.warmup_cute_dsl_indexer_topk(
                 dtype=torch.float32, top_k=self.index_topk)
+
+        if self._enable_heuristic_topk and layer_idx == 0:
+            # Populate static caches (sm_count, L2 cache size) inside the C++
+            # Scheme X dispatcher before any CUDA Graph capture so the host
+            # attribute queries do not end up frozen into a captured graph.
+            from tensorrt_llm._torch.custom_ops import cpp_custom_ops
+            cpp_custom_ops.warmup_heuristic_topk_decode(top_k=self.index_topk)
 
     def post_load_weights(self):
         """Fuse wk + weights_proj into single FP32 weight for cuBLAS GEMM (TF32 on Ampere+)."""

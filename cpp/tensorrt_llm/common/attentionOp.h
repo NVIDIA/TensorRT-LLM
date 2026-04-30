@@ -119,6 +119,10 @@ public:
         // this is a buffer of size [num_tokens, num_heads_q] with each element
         // representing the max and LSE/denominator of the softmax values
         float2* softmax_stats = nullptr;
+        // Optional SageAttention scaling factors.
+        float const* sage_attn_sfs_q = nullptr;
+        float const* sage_attn_sfs_k = nullptr;
+        float const* sage_attn_sfs_v = nullptr;
     };
 
     template <typename T>
@@ -139,6 +143,8 @@ public:
         // optional for separate QKV input, currently only used for context MLA
         T const* k_ptr = nullptr;
         T const* v_ptr = nullptr;
+        // V tensor token stride in bytes (0 = use default computed from head dims).
+        int64_t v_stride_in_bytes = 0;
 
         // Helix parallelism params.
         int32_t const* helix_position_offsets = nullptr;
@@ -525,6 +531,12 @@ public:
     // Skip softmax threshold scale factor.
     float mSkipSoftmaxThresholdScaleFactorPrefill = 0;
     float mSkipSoftmaxThresholdScaleFactorDecode = 0;
+    // Optional SageAttention block sizes.
+    // Currently, these are only consumed by the TllmGen backend path.
+    int mSageAttnNumEltsPerBlkQ = 0;
+    int mSageAttnNumEltsPerBlkK = 0;
+    int mSageAttnNumEltsPerBlkV = 0;
+    bool mSageAttnQkInt8 = false;
 #ifdef SKIP_SOFTMAX_STAT
     uint32_t* mSkipSoftmaxTotalBlocks;
     uint32_t* mSkipSoftmaxSkippedBlocks;
@@ -547,7 +559,8 @@ public:
             mNumKVHeadsOrigin, mAttnTpSize, mAttnTpRank, mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast,
             mEnableContextFMHA, mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant,
             mNbMultiBlockSemaphores, mAttentionChunkSize.value_or(-1), mSkipSoftmaxThresholdScaleFactorPrefill,
-            mSkipSoftmaxThresholdScaleFactorDecode);
+            mSkipSoftmaxThresholdScaleFactorDecode, mSageAttnNumEltsPerBlkQ, mSageAttnNumEltsPerBlkK,
+            mSageAttnNumEltsPerBlkV, mSageAttnQkInt8);
     };
 
 private:
