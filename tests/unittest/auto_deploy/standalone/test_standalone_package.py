@@ -182,6 +182,9 @@ class TestStandalonePackage:
             "PATH": os.path.join(standalone_package["venv_dir"], "bin")
             + os.pathsep
             + os.environ.get("PATH", ""),
+            # Use a fresh flashinfer JIT cache per run to avoid stale ninja build
+            # files that reference source paths from previous (now deleted) venvs.
+            "FLASHINFER_WORKSPACE_BASE": standalone_package["venv_dir"],
         }
 
         cmd = [
