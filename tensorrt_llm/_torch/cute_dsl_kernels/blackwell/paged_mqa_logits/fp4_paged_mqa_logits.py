@@ -706,8 +706,13 @@ class FP4MQALogitsKernel:
 
         # TMA for SF Q — [N, batch_size] int32, tile [N] (1D, like weights).
         # SMEM single stage size = N_padded int32 (pad to UTCCP atom = 128 token).
-        # SMEM stage stride padded similarly (TMA bulk-copy SMEM dest must be
-        # 128-byte aligned, M1 reminder).
+        # TMA descriptor tile = real N (NOT N_padded): TMA fetches only the
+        # valid SF Q region from GMEM. Remaining N_padded-N SMEM positions
+        # stay whatever was there (zero from host pad while host pad still
+        # exists; once host pad is removed this becomes garbage). UMMA_N=N
+        # ensures MMA never reads SFB cols ≥ N, and the math epilogue only
+        # writes acc cols [0, N), so the SMEM/TMEM tail is harmless.
+        # Mirrors DeepGEMM's TMA box = kRealNumSFQAtom (= next_n*num_heads).
         N_padded = ((self.N + 127) // 128) * 128
         self.N_padded = N_padded
         # sf_q stage stride in int32 elem (= 4 bytes/elem). Pad to 128B (= 32 int32).
@@ -717,12 +722,22 @@ class FP4MQALogitsKernel:
             (N_padded, self.num_q_stages),
             stride=(1, sf_q_stage_stride_int32),
         )
-        sf_q_smem_per_stage = cute.select(self.sf_q_smem_layout_staged, mode=[0])
+        # TMA atom uses a smaller per-stage layout matching real N (not N_padded)
+        # so the DSL helper's symmetry check passes (it requires
+        # cosize(smem_layout) == cosize(cta_v_map)). The actual SMEM allocation
+        # still uses sf_q_smem_layout_staged with N_padded for UTCCP alignment;
+        # only TMA atom construction + tma_partition use this smaller view.
+        # Stride matches the staged layout so per-stage offsets are consistent.
+        self.sf_q_tma_smem_layout_staged = cute.make_layout(
+            (self.N, self.num_q_stages),
+            stride=(1, sf_q_stage_stride_int32),
+        )
+        sf_q_tma_smem_per_stage = cute.select(self.sf_q_tma_smem_layout_staged, mode=[0])
         tma_atom_sf_q, tma_tensor_sf_q = cpasync.make_tiled_tma_atom(
             tma_load_op,
             sf_q,
-            sf_q_smem_per_stage,
-            self.sf_q_smem_layout_staged.shape[:1],
+            sf_q_tma_smem_per_stage,
+            (self.N,),
         )
 
         b_copy_size = cute.size_in_bytes(b_dtype, b_smem_layout)
@@ -736,12 +751,10 @@ class FP4MQALogitsKernel:
             kv_tma_bytes_per_subblock + sf_kv_tma_bytes_per_subblock
         )
         # Q + SF_Q + Weights share barrier (Q-pipe). SF Q TMA descriptor tile
-        # is N_padded (built from sf_q_smem_layout_staged); host wrapper pads
-        # GMEM to N_padded with zeros (cute_dsl_custom_ops.py:5584-5590). So
-        # TMA actually fetches N_padded * 4 bytes, NOT N * 4. Barrier tx_count
-        # must match actual fetch — undersizing it caused the in-flight pad
-        # bytes to race with consumer (UMMA warp) reads of SMEM via UTCCP.
-        sf_q_tma_bytes = self.N_padded * 4
+        # is now real N (see TMA atom construction above), so the actual
+        # GMEM→SMEM transfer is N int32 = self.N * 4 bytes. Barrier tx_count
+        # must match the real fetch.
+        sf_q_tma_bytes = self.N * 4
         self.num_q_tma_bytes = b_copy_size * atom_thr_size + sf_q_tma_bytes + w_copy_size
 
         num_ctas = self.num_sms
@@ -778,6 +791,7 @@ class FP4MQALogitsKernel:
             self.w_smem_layout_staged,
             self.sf_kv_smem_layout_staged,
             self.sf_q_smem_layout_staged,
+            self.sf_q_tma_smem_layout_staged,
             self.tmem_sfa_layout,
             self.tmem_sfb_layout,
             self.sfa_chunk_smem_layout,
@@ -818,6 +832,7 @@ class FP4MQALogitsKernel:
         w_smem_layout_staged: cute.Layout,
         sf_kv_smem_layout_staged: cute.Layout,
         sf_q_smem_layout_staged: cute.Layout,
+        sf_q_tma_smem_layout_staged: cute.Layout,
         tmem_sfa_layout: cute.Layout,
         tmem_sfb_layout: cute.Layout,
         sfa_chunk_smem_layout: cute.Layout,
@@ -1151,12 +1166,20 @@ class FP4MQALogitsKernel:
         # Step 5.3: Partition SF Q: standalone TMA, [N, batch_size] → [N] per
         # stage (parallel to weights). Single SMEM ring buffer (sSF_Q has
         # num_q_stages stages).
+        # The TMA atom was built with a smaller (N, num_q_stages) layout to
+        # satisfy the DSL helper's symmetry check; here we make a matching
+        # logical view of sSF_Q (sharing the same SMEM iterator) so
+        # tma_partition produces N-element tiles. The physical SMEM is still
+        # sf_q_smem_layout_staged-shaped (N_padded per stage); positions
+        # ≥ self.N in each stage are untouched by TMA but still readable by
+        # UTCCP via the original sSF_Q.
+        sSF_Q_for_tma = cute.make_tensor(sSF_Q.iterator, sf_q_tma_smem_layout_staged)
         sf_q_cta_layout = cute.make_layout((1,))
         tSF_Q_sSF_Q, tSF_Q_gSF_Q = cpasync.tma_partition(
             tma_atom_sf_q,
             0,
             sf_q_cta_layout,
-            cute.group_modes(sSF_Q, 0, 1),
+            cute.group_modes(sSF_Q_for_tma, 0, 1),
             cute.group_modes(mSF_Q_tma, 0, 1),
         )
 
