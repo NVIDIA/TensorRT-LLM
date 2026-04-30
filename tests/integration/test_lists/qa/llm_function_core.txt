@@ -492,6 +492,7 @@ accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-True-True-cutlass-auto]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-True-True-trtllm-auto]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-True-True-trtllm-fp8]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu_piecewise_cuda_graph
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_2gpus[dp2-cutlass-auto]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_2gpus[dp2-triton-auto]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_2gpus[dp2-trtllm-auto]

@@ -5031,6 +5031,39 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
+    @skip_no_hopper
+    def test_w4_1gpu_piecewise_cuda_graph(self, mocker):
+        # Regression test for https://nvbugs/5880745. GPT-OSS with TRITON MoE
+        # backend + fullgraph torch.compile + piecewise CUDA graph requires
+        # layer_idx to propagate into MoE so MoE.forward dispatches through
+        # the torch.library.custom_op path instead of tracing the Triton
+        # kernel call (which Dynamo cannot lift).
+        if is_h20_gpu():
+            pytest.skip("nvbugs/5446119")
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
+                                        enable_block_reuse=False)
+
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=8,
+                  pipeline_parallel_size=1,
+                  moe_expert_parallel_size=8,
+                  kv_cache_config=kv_cache_config,
+                  max_batch_size=128,
+                  disable_overlap_scheduler=True,
+                  cuda_graph_config=CudaGraphConfig(enable_padding=False,
+                                                    max_batch_size=128),
+                  torch_compile_config=_get_default_torch_compile_config(True),
+                  moe_config=MoeConfig(backend="TRITON"))
+
+        with llm:
+            task = GSM8K("GPT-OSS/20B-MXFP4")
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
     def test_dummy_load_format(self):
         llm = LLM(
             self.MODEL_PATH,
