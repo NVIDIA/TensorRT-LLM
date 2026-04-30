@@ -1,1 +1,4 @@
-# Pin the dependencies version due to Vulnerabilities here as WAR
+# These vulnerabilities were inherited from the base image (pytorch:25.12-py3) and should be removed when the base image
+# is updated.
+# Upgrade base image nvidia-cutlass-dsl 4.3.5 to 4.4.2
+nvidia-cutlass-dsl>=4.4.2
