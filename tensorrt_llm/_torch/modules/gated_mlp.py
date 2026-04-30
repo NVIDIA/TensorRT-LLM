@@ -34,6 +34,7 @@ class GatedMLP(nn.Module):
         disable_deep_gemm: bool = False,
         use_custom_cublas_mm: bool = False,
         is_shared_expert: bool = False,
+        swiglu_limit: Optional[float] = None,
     ):
 
         super().__init__()
@@ -42,6 +43,7 @@ class GatedMLP(nn.Module):
         self.intermediate_size = intermediate_size
         self.activation = activation
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
+        self.swiglu_limit = float(swiglu_limit) if swiglu_limit is not None else None
 
         config = config or ModelConfig()
         self.mapping = config.mapping
@@ -139,13 +141,14 @@ class GatedMLP(nn.Module):
                     logger.warning(
                         f"GatedMLP._apply_activation: LoRA path active; forcing non-FP8 activation dtype bf16/fp16, layer_idx={self.layer_idx}"
                     )
-                    return swiglu(x)
+                    return swiglu(x, swiglu_limit=self.swiglu_limit)
                 else:
                     return swiglu(x,
                                   quant_scale=self.down_proj.input_scale,
-                                  quant_type=torch.float8_e4m3fn)
+                                  quant_type=torch.float8_e4m3fn,
+                                  swiglu_limit=self.swiglu_limit)
             else:
-                return swiglu(x)
+                return swiglu(x, swiglu_limit=self.swiglu_limit)
         elif callable(self.activation):
             return self.activation(x)
         elif self.activation is None:

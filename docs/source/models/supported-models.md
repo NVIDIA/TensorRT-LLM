@@ -12,6 +12,7 @@ The following is a table of supported models for the PyTorch backend:
 | `DeepSeekV2ForCausalLM` [^5]         | DeepSeek V2                        | `deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct` |
 | `DeepseekV3ForCausalLM`              | DeepSeek-V3, Kimi-K2               | `deepseek-ai/DeepSeek-V3`                    |
 | `DeepseekV32ForCausalLM`             | DeepSeek-V3.2                      | `deepseek-ai/DeepSeek-V3.2`                  |
+| `DeepseekV4ForCausalLM` [^11]        | DeepSeek-V4                        | `deepseek-ai/DeepSeek-V4-Pro`                |
 | `ExaoneForCausalLM` [^5]             | EXAONE 3.5                         | `LGAI-EXAONE/EXAONE-3.5-32B-Instruct`        |
 | `Exaone4ForCausalLM`                 | EXAONE 4.0                         | `LGAI-EXAONE/EXAONE-4.0-32B`                 |
 | `ExaoneMoEForCausalLM`               | K-EXAONE                           | `LGAI-EXAONE/K-EXAONE-236B-A23B`             |
@@ -62,6 +63,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | -------------------------------- | ----------------- | ---------- | -------------------------- | --------------------- | --------------- | --- | ---------------- | ----------------- | ------ | ------------- | ---------------- | -------------- | ------------------------ | --------------------- | --------------- |
 | `DeepseekV3ForCausalLM`          | Yes               | Yes        | Yes                        | Yes                   | Yes [^1]        | Yes | No               | No                | No     | Yes           | Yes              | Yes [^2]       | N/A                      | Yes                   | Yes             |
 | `DeepseekV32ForCausalLM`         | Yes               | Yes        | Yes                        | Yes                   | Yes             | Yes | No               | No                | No     | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
+| `DeepseekV4ForCausalLM` [^11]    | Yes               | Yes        | Yes                        | Untested              | Yes             | Yes | No               | No                | No     | Yes           | Yes              | Untested       | Yes                      | Untested              | Untested        |
 | `Glm4MoeForCausalLM`             | Yes               | Yes        | Yes                        | Untested              | Yes             | Yes | No               | No                | No     | Yes           | Yes              | Untested       | N/A                      | Yes                   | Yes             |
 | `Qwen3MoeForCausalLM`            | Yes               | Yes        | Yes                        | Yes                   | Yes             | No  | Yes              | Yes               | No     | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
 | `Qwen3NextForCausalLM` [^3]      | Yes               | Yes        | Yes                        | Untested              | Yes             | No  | No               | No                | No     | Yes           | Yes              | No             | No                       | Untested              | Untested        |
@@ -82,6 +84,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 [^8]: Supports text and image inputs. The vision tower runs in BF16 even when the text decoder is quantized (FP8 block-scale or NVFP4). The text decoder is also usable standalone (text-only) via the `Step3p5ForCausalLM` architecture.
 [^9]: Audio modality only supported on E2B/E4B variants.
 [^10]: Audio requires a checkpoint with a `sound_config` and is supported only on the full (non-disaggregated) model path, not the EPD disaggregated path.
+[^11]: DeepSeek-V4 is only supported on Blackwell GPUs (`SM100+`). See the [DeepSeek-V4 example README](../../../examples/models/core/deepseek_v4/README.md) for setup and parallelism.
 
 # Multimodal Feature Support Matrix (PyTorch Backend)
 

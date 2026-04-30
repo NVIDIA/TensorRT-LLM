@@ -5,12 +5,14 @@ from ..sampling_params import GuidedDecodingParams, SamplingParams
 from ..scheduling_params import SchedulingParams
 from .build_cache import BuildCacheConfig
 from .llm import LLM, RequestOutput
+
 # yapf: disable
 from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy, ContextChunkingPolicy,
                        CudaGraphConfig, DecodeCudaGraphConfig,
-                       DeepSeekSparseAttentionConfig, DFlashDecodingConfig,
+                       DeepSeekSparseAttentionConfig,
+                       DeepSeekV4SparseAttentionConfig, DFlashDecodingConfig,
                        DraftTargetDecodingConfig, DynamicBatchConfig,
                        Eagle3DecodingConfig, EagleDecodingConfig,
                        EncodeCudaGraphConfig, ExtendedRuntimePerfKnobConfig,
@@ -88,4 +90,5 @@ __all__ = [
     'PrometheusMetricsConfig',
     'ThinkingBudgetLogitsProcessor',
     'add_thinking_budget_logits_processor',
+    'DeepSeekV4SparseAttentionConfig',
 ]

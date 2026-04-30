@@ -7,6 +7,7 @@ from tensorrt_llm.tokenizer import (TLLM_INCREMENTAL_DETOKENIZATION_BACKEND,
                                     _xgrammar_tokenizer_info, load_hf_tokenizer,
                                     tokenizer_factory)
 from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
+from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
 
 __all__ = [
     "TLLM_INCREMENTAL_DETOKENIZATION_BACKEND",
@@ -14,6 +15,7 @@ __all__ = [
     "TokenizerBase",
     "TransformersTokenizer",
     "DeepseekV32Tokenizer",
+    "DeepseekV4Tokenizer",
     "tokenizer_factory",
     "_xgrammar_tokenizer_info",
     "_llguidance_tokenizer_info",

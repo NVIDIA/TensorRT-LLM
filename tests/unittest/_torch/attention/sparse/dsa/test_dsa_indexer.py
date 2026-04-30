@@ -17,19 +17,22 @@ import torch
 from utils.util import check_accuracy, skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm import deep_gemm
-from tensorrt_llm._torch.attention_backend.interface import (
-    PositionalEmbeddingParams, RopeParams)
+from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (
-    DSACacheManager, DSAtrtllmAttentionMetadata, Indexer,
-    compute_cu_seqlen_kv_bounds_with_cache, split_prefill_chunks)
+    DSACacheManager,
+    DSAtrtllmAttentionMetadata,
+    Indexer,
+    compute_cu_seqlen_kv_bounds_with_cache,
+    split_prefill_chunks,
+)
 from tensorrt_llm._torch.speculative.interface import (
     prepare_attn_metadata_for_draft_replay,
-    restore_attn_metadata_after_draft_replay)
+    restore_attn_metadata_after_draft_replay,
+)
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.bindings.internal.batch_manager import \
-    CacheType as CacheTypeCpp
+from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.deep_gemm import fp8_paged_mqa_logits
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
@@ -195,9 +198,11 @@ def _ref_fp8_paged_mqa_logits(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
     weights: torch.Tensor,
-    context_lens: torch.Tensor,
+    num_tokens: torch.Tensor,
+    num_kv_tokens: torch.Tensor,
     block_tables: torch.Tensor,
     max_model_len: int,
+    compress_ratio: int = 1,
 ):
     """
     Reference implementation of fp8_paged_mqa_logits (optimized version).
@@ -206,9 +211,11 @@ def _ref_fp8_paged_mqa_logits(
         q: [batch_size, next_n, num_heads, head_dim]
         kv_cache: [num_blocks, block_size, 1, head_dim]
         weights: [batch_size * next_n, num_heads]
-        context_lens: [batch_size]
+        num_tokens: [batch_size]
+        num_kv_tokens: [batch_size]
         block_tables: [batch_size, max_num_blocks]
         max_model_len: Maximum sequence length
+        compress_ratio: Compression ratio for the KV cache
 
     Returns:
         logits: [batch_size * next_n, max_model_len]
@@ -223,22 +230,22 @@ def _ref_fp8_paged_mqa_logits(
         dtype=torch.float32,
     )
 
-    context_lens_list = context_lens.tolist()
+    num_tokens_list = num_tokens.tolist()
+    num_kv_tokens_list = num_kv_tokens.tolist()
 
     for i in range(batch_size):
-        context_len = context_lens_list[i]
+        num_token = num_tokens_list[i]
+        num_kv_token = num_kv_tokens_list[i]
 
-        # Query positions: [context_len - next_n, ..., context_len - 1]
-        q_offsets = torch.arange(context_len - next_n,
-                                 context_len,
-                                 device="cuda")
+        # Query positions: [num_token - next_n, ..., num_token - 1]
+        q_offsets = torch.arange(num_token - next_n, num_token, device="cuda")
 
         # Transpose weights for this sequence: [num_heads, next_n]
         weight_slice = (weights[i * next_n:(i + 1) * next_n, :].transpose(
             0, 1).contiguous())
 
         # Process each block in the sequence
-        for block_rk in range(cdiv(context_len, block_size)):
+        for block_rk in range(cdiv(num_kv_token, block_size)):
             block_idx = block_tables[i][block_rk]
             qx, kx = q[i], kv_cache[block_idx]
 
@@ -249,9 +256,11 @@ def _ref_fp8_paged_mqa_logits(
                 device="cuda",
             )
 
-            # Causal mask: k_pos < context_len AND k_pos <= q_pos
-            mask = (k_offsets[None, :] < context_len) & (k_offsets[None, :]
-                                                         <= q_offsets[:, None])
+            # Causal mask: k_pos < num_token AND k_pos < (q_pos + 1) // compress_ratio
+            k_mask = k_offsets[None, :] < num_kv_token
+            causal_mask = k_offsets[None, :] < (q_offsets[:, None] +
+                                                1) // compress_ratio
+            mask = k_mask & causal_mask
 
             # Compute attention scores: [num_heads, next_n, block_size]
             s = torch.where(
@@ -269,8 +278,7 @@ def _ref_fp8_paged_mqa_logits(
             logits[
                 i * next_n:(i + 1) * next_n,
                 block_rk * block_size:(block_rk + 1) * block_size,
-            ] = torch.where(k_offsets[None, :] <= q_offsets[:, None], s,
-                            float("-inf"))
+            ] = torch.where(causal_mask, s, float("-inf"))
 
     return logits
 
@@ -320,7 +328,8 @@ def _ref_fp8_mqa_logits(
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
-def test_deepgemm_fp8_mqa_logits_basic():
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+def test_deepgemm_fp8_mqa_logits_basic(compress_ratio):
     """
     Basic test for deepgemm.fp8_mqa_logits kernel.
     Tests the disable_cp path with simple validation.
@@ -330,6 +339,7 @@ def test_deepgemm_fp8_mqa_logits_basic():
     num_heads, head_dim = 64, 128
     seq_len = 2048
     seq_len_kv = 4096
+    seq_len_kv_compressed = seq_len_kv // compress_ratio
     #[seq_len, num_heads, head_dim]
     q = torch.randn(
         seq_len,
@@ -340,7 +350,7 @@ def test_deepgemm_fp8_mqa_logits_basic():
     )
     #[seq_len_kv, head_dim] -> num_head = 1
     kv = torch.randn(
-        seq_len_kv,
+        seq_len_kv_compressed,
         head_dim,
         device="cuda",
         dtype=torch.bfloat16,
@@ -353,9 +363,15 @@ def test_deepgemm_fp8_mqa_logits_basic():
         dtype=torch.float32,
     )
     # ks[i] -> ke[i] for each q[i]
-    ks = torch.zeros(seq_len, dtype=torch.int, device="cuda")
-    ke = torch.arange(seq_len, dtype=torch.int,
-                      device="cuda") + (seq_len_kv - seq_len)
+    ks, ke = compute_cu_seqlen_kv_bounds_with_cache(
+        seq_lens=torch.tensor([seq_len], dtype=torch.int, device="cuda"),
+        num_contexts=1,
+        num_ctx_tokens=seq_len,
+        cached_token_lens=torch.tensor([512], dtype=torch.int, device="cuda"),
+        kv_lens=torch.tensor([seq_len_kv_compressed],
+                             dtype=torch.int,
+                             device="cuda"),
+        compress_ratio=compress_ratio)
 
     # Convert to FP8
     q_fp8 = q.to(torch.float8_e4m3fn)
@@ -364,8 +380,8 @@ def test_deepgemm_fp8_mqa_logits_basic():
                                       ke)  # -> [seq_len, seq_len_kv]
 
     # Basic sanity checks
-    assert logits.shape == (seq_len, seq_len_kv), \
-        f"Expected shape ({seq_len}, {seq_len_kv}), got {logits.shape}"
+    assert logits.shape == (seq_len, seq_len_kv_compressed), \
+        f"Expected shape ({seq_len}, {seq_len_kv_compressed}), got {logits.shape}"
     assert logits.dtype == torch.float32, \
         f"Expected dtype torch.float32, got {logits.dtype}"
 
@@ -405,7 +421,9 @@ def _create_mock_metadata(request_ids,
                           enable_context_mla_with_cached_kv=False,
                           index_topk=2048,
                           enable_indexer_skip=False,
-                          use_cute_dsl_paged_mqa_logits=False):
+                          use_cute_dsl_paged_mqa_logits=False,
+                          compress_ratio=1,
+                          indexer_head_dim=128):
     """Helper to create mock metadata for testing."""
 
     class MockKVCacheParams:
@@ -428,12 +446,22 @@ def _create_mock_metadata(request_ids,
             self.max_draft_tokens = max_draft_tokens
             self.num_sparse_topk = index_topk
             self.enable_indexer_skip = enable_indexer_skip
+            self.indexer_head_dim = indexer_head_dim
+            self.indexer_quant_block_size = 128
+            self.compress_ratios = [compress_ratio]
             # Keep seq_lens on CPU for split_prefill_chunks and other CPU operations
             # CUDA kernels will convert to CUDA as needed
             self.seq_lens = seq_lens.cpu() if seq_lens.is_cuda else seq_lens
             self.kv_lens = kv_lens
             self.kv_cache_params = MockKVCacheParams()
             self.kv_cache_manager = cache_manager
+            # Effective tokens-per-block for the indexer k-cache slot mapping,
+            # mirroring DSAtrtllmAttentionMetadata.__post_init__ (dsa.py).
+            tpb = self.kv_cache_manager.tokens_per_block
+            if hasattr(self.kv_cache_manager, 'compressed_block_sizes'):
+                _cr = 4 if 4 in self.compress_ratios else 1
+                tpb = tpb // _cr
+            self._tokens_per_block = tpb
             self.kv_lens_cuda_runtime = kv_lens.cuda()
             self.indexer_k_cache_block_offsets = torch.zeros(
                 [batch_size, cache_manager.max_blocks_per_seq],
@@ -729,6 +757,7 @@ def test_indexer_k_cache_scatter_custom_op():
         cache_manager=cache_manager,
         num_ctx_tokens=num_tokens,
         num_tokens=num_tokens,
+        indexer_head_dim=head_dim,
     )
 
     from tensorrt_llm._torch.attention_backend.sparse.dsa import Indexer
@@ -893,6 +922,7 @@ def test_fp8_k_cache_roundtrip():
         cache_manager=cache_manager,
         num_ctx_tokens=total_tokens,
         num_tokens=total_tokens,
+        indexer_head_dim=head_dim,
     )
     Indexer.prepare(metadata)
 
@@ -951,7 +981,9 @@ def test_fp8_k_cache_roundtrip():
             f"CuTe DSL FP8 Paged MQA Logits only supports SM 100/103, got SM {get_sm_version()}",
         )),
 ])
-def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend):
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend,
+                                            compress_ratio):
     """
     Test FP8 paged KV cache with two-phase workflow and variable context lengths.
 
@@ -983,7 +1015,14 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend):
 
     # Final lengths after generation phase
     final_lens = context_lens_context + num_gen_tokens
+    final_kv_lens = final_lens // compress_ratio
+    num_ctx_kv_tokens = context_lens_context // compress_ratio
+    num_gen_kv_tokens = final_kv_lens - num_ctx_kv_tokens
     max_seq_len = final_lens.max().item()
+    max_kv_len = final_kv_lens.max().item()
+    total_context_tokens = context_lens_context.sum().item()
+    total_context_kv_tokens = num_ctx_kv_tokens.sum().item()
+    total_gen_kv_tokens = num_gen_kv_tokens.sum().item()
 
     print("\n=== Test Config ===")
     print(
@@ -991,36 +1030,38 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend):
     )
     print(f"  Context lengths: {context_lens_context.tolist()}")
     print(f"  Final lengths: {final_lens.tolist()}")
+    print(f"  Final kv lengths: {final_kv_lens.tolist()}")
     print(f"  Max sequence length: {max_seq_len}")
+    if compress_ratio != 1:
+        print(f"  Compress ratio: {compress_ratio}")
 
     # Setup: Create cache manager and indexer
     cache_manager, sparse_attn_config = create_dsa_cache_manager(
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
-        max_seq_len=max_model_len,
+        max_seq_len=max_kv_len,
         num_layers=1)
     indexer = create_indexer(sparse_attn_config, layer_idx=layer_idx)
 
     # Allocate blocks for all sequences (max final length)
     request_ids = list(range(batch_size))
     cache_manager.add_dummy_requests(request_ids=request_ids,
-                                     token_nums=final_lens.tolist(),
+                                     token_nums=final_kv_lens.tolist(),
                                      is_gen=False,
                                      prepare_resource=True)
 
     # Generate test data with variable lengths
-    total_context_tokens = context_lens_context.sum().item()
     q = torch.randn((batch_size, next_n, heads, head_dim),
                     device="cuda",
                     dtype=torch.bfloat16)
     weights = torch.randn((batch_size * next_n, heads),
                           device="cuda",
                           dtype=torch.float32)
-    k_context_bf16 = torch.randn((total_context_tokens, head_dim),
+    k_context_bf16 = torch.randn((total_context_kv_tokens, head_dim),
                                  device="cuda",
                                  dtype=torch.bfloat16)
-    k_gen_bf16 = torch.randn((batch_size * num_gen_tokens, head_dim),
+    k_gen_bf16 = torch.randn((total_gen_kv_tokens, head_dim),
                              device="cuda",
                              dtype=torch.bfloat16)
 
@@ -1032,13 +1073,15 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend):
         num_contexts=batch_size,
         num_generations=0,
         seq_lens=context_lens_context.clone(),
-        kv_lens=context_lens_context.clone(),
+        kv_lens=num_ctx_kv_tokens.clone(),
         num_cached_tokens=[0] * batch_size,
         cache_manager=cache_manager,
         num_ctx_tokens=total_context_tokens,
         num_tokens=total_context_tokens,
         max_draft_tokens=next_n - 1,
         use_cute_dsl_paged_mqa_logits=use_dsl,
+        compress_ratio=compress_ratio,
+        indexer_head_dim=head_dim,
     )
     Indexer.prepare(metadata_context)
 
@@ -1046,7 +1089,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend):
         k_context_bf16)
 
     indexer._update_k_cache(k_context_fp8, k_context_scale, metadata_context)
-    print(f"✓ Wrote {total_context_tokens} FP8 context tokens to cache")
+    print(f"✓ Wrote {total_context_kv_tokens} FP8 context tokens to cache")
 
     # Phase 2: Write generation tokens (next_n per sequence) as FP8
     # Similar to prepare_resources: add_token() for each new token
@@ -1059,21 +1102,22 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend):
         seq_lens=torch.tensor([num_gen_tokens] * batch_size,
                               dtype=torch.int32,
                               device='cpu'),
-        kv_lens=final_lens.clone(),
+        kv_lens=final_kv_lens.clone(),
         num_cached_tokens=context_lens_context.tolist(),
         cache_manager=cache_manager,
         num_ctx_tokens=0,
         num_tokens=batch_size * num_gen_tokens,
         max_draft_tokens=next_n - 1,
         use_cute_dsl_paged_mqa_logits=use_dsl,
+        compress_ratio=compress_ratio,
+        indexer_head_dim=head_dim,
     )
     Indexer.prepare(metadata_gen)
 
     k_gen_fp8, k_gen_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(
         k_gen_bf16)
     indexer._update_k_cache(k_gen_fp8, k_gen_scale, metadata_gen)
-    print(
-        f"✓ Wrote {batch_size * num_gen_tokens} FP8 generation tokens to cache")
+    print(f"✓ Wrote {total_gen_kv_tokens} FP8 generation tokens to cache")
 
     # Run kernel: FP8 paged MQA with actual cache
     print("\n=== Kernel Execution ===")
@@ -1129,7 +1173,8 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend):
     context_offset = 0
     gen_offset = 0
     for seq_idx in range(batch_size):
-        seq_context_len = context_lens_context[seq_idx].item()
+        seq_context_len = num_ctx_kv_tokens[seq_idx].item()
+        seq_gen_len = num_gen_kv_tokens[seq_idx].item()
 
         # Write context tokens
         for token_pos in range(seq_context_len):
@@ -1142,7 +1187,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend):
                     k_context_bf16[context_offset + token_pos]
 
         # Write generation tokens
-        for gen_token_idx in range(num_gen_tokens):
+        for gen_token_idx in range(seq_gen_len):
             token_pos = seq_context_len + gen_token_idx
             block_idx = token_pos // block_size
             pos_in_block = token_pos % block_size
@@ -1153,17 +1198,19 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend):
                     k_gen_bf16[gen_offset + gen_token_idx]
 
         context_offset += seq_context_len
-        gen_offset += num_gen_tokens
+        gen_offset += seq_gen_len
 
+    num_tokens_cuda = final_lens.cuda()
+    num_kv_tokens_cuda = metadata_gen.kv_lens_cuda_runtime
     ref_logits = _ref_fp8_paged_mqa_logits(
-        q, kv_cache_bf16, weights,
-        metadata_gen.kv_lens_cuda_runtime[0:batch_size],
-        metadata_gen.indexer_k_cache_block_offsets, max_model_len)
+        q, kv_cache_bf16, weights, num_tokens_cuda[0:batch_size],
+        num_kv_tokens_cuda[0:batch_size],
+        metadata_gen.indexer_k_cache_block_offsets, max_model_len,
+        compress_ratio)
     print(f"✓ Reference output shape: {ref_logits.shape}")
 
     # Validate: Compare masked outputs (handle variable lengths and next_n)
     print("\n=== Validation ===")
-    context_lens_cuda = metadata_gen.kv_lens_cuda_runtime  # [batch_size]
 
     # Expand context lens for each query: each sequence has next_n queries
     # Query at position i (where i = 0..next_n-1) attends to tokens up to (context_len - next_n + i)
@@ -1177,12 +1224,12 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend):
     next_n_offset = torch.arange(
         batch_size * next_n,
         device="cuda") % next_n  # Query offset within sequence
-    query_end_positions = context_lens_cuda[
+    query_end_positions = num_tokens_cuda[
         row_indices] - next_n + next_n_offset  # [batch_size * next_n]
 
     # Create mask: positions <= query_end_position
     # Shape: [batch_size * next_n, max_model_len]
-    mask = positions <= query_end_positions.unsqueeze(1)
+    mask = positions < (query_end_positions.unsqueeze(1) + 1) // compress_ratio
 
     diff = _calc_diff(logits.masked_fill(~mask, 0),
                       ref_logits.masked_fill(~mask, 0))
@@ -1841,6 +1888,90 @@ def test_compute_cu_seqlen_bounds_with_cache_properties():
             f"Trial {trial}: Last ke should equal total KV count: {cu_seqlen_ke[-1].item()} != {expected_total_kv}"
 
 
+def test_compute_cu_seqlen_bounds_nocache_compressed_kv():
+    """Simple test case with 2 sequences and compressed KV."""
+    seq_lens = torch.tensor([3, 4], dtype=torch.int32, device="cuda")
+    num_contexts = 2
+    num_ctx_tokens = 7
+    compress_ratio = 2
+
+    kv_lens = seq_lens // compress_ratio
+
+    cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
+        seq_lens, num_contexts, num_ctx_tokens, None, kv_lens, compress_ratio)
+
+    # Expected results:
+    # Seq 0: tokens [0,1,2], KV [0]
+    #   Token 0: [0, 0)
+    #   Token 1: [0, 1)
+    #   Token 2: [0, 1)
+    # Seq 1: tokens [3,4,5,6], KV [1,2]
+    #   Token 3: [1, 1)
+    #   Token 4: [1, 2)
+    #   Token 5: [1, 2)
+    #   Token 6: [1, 3)
+
+    expected_ks = torch.tensor([0, 0, 0, 1, 1, 1, 1],
+                               dtype=torch.int32,
+                               device="cuda")
+    expected_ke = torch.tensor([0, 1, 1, 1, 2, 2, 3],
+                               dtype=torch.int32,
+                               device="cuda")
+
+    assert torch.equal(cu_seqlen_ks, expected_ks), \
+        f"cu_seqlen_ks mismatch:\nGot:      {cu_seqlen_ks.tolist()}\nExpected: {expected_ks.tolist()}"
+    assert torch.equal(cu_seqlen_ke, expected_ke), \
+        f"cu_seqlen_ke mismatch:\nGot:      {cu_seqlen_ke.tolist()}\nExpected: {expected_ke.tolist()}"
+
+
+def test_compute_cu_seqlen_bounds_with_cache_compressed_kv():
+    """
+    Test case with 2 sequences using chunked prefill (with cached tokens) and compressed KV.
+
+    Scenario:
+    - Seq 0: 2 cached tokens, 3 new tokens being added
+    - Seq 1: 1 cached token, 4 new tokens being added
+    """
+    compress_ratio = 2
+    # New tokens being added in this chunk
+    seq_lens = torch.tensor([3, 4], dtype=torch.int32, device="cuda")
+    # Previously cached tokens
+    num_past_tokens = torch.tensor([2, 1], dtype=torch.int32, device="cuda")
+    kv_lens = (num_past_tokens + seq_lens) // compress_ratio
+
+    num_contexts = 2
+    num_ctx_tokens = 7  # 3 + 4 new tokens total
+
+    cu_seqlen_ks, cu_seqlen_ke = compute_cu_seqlen_kv_bounds_with_cache(
+        seq_lens, num_contexts, num_ctx_tokens, num_past_tokens, kv_lens,
+        compress_ratio)
+
+    # Expected results:
+    #
+    # Seq 0: req has [past: 0,1] + [new: 2,3,4] = total 5 tokens, compressed to 2 KV tokens, global range [0:2]
+    #   New Q token 0: [0, 1)
+    #   New Q token 1: [0, 2)
+    #   New Q token 2: [0, 2]
+    #
+    # Seq 1: req has [past: 0] + [new: 1,2,3,4] = total 5 tokens, compressed to 2 KV tokens, global range [2:4]
+    #   New Q token 0: [2, 3)
+    #   New Q token 1: [2, 3)
+    #   New Q token 2: [2, 4)
+    #   New Q token 3: [2, 4)
+
+    expected_ks = torch.tensor([0, 0, 0, 2, 2, 2, 2],
+                               dtype=torch.int32,
+                               device="cuda")
+    expected_ke = torch.tensor([1, 2, 2, 3, 3, 4, 4],
+                               dtype=torch.int32,
+                               device="cuda")
+
+    assert torch.equal(cu_seqlen_ks, expected_ks), \
+        f"cu_seqlen_ks mismatch:\nGot:      {cu_seqlen_ks.tolist()}\nExpected: {expected_ks.tolist()}"
+    assert torch.equal(cu_seqlen_ke, expected_ke), \
+        f"cu_seqlen_ke mismatch:\nGot:      {cu_seqlen_ke.tolist()}\nExpected: {expected_ke.tolist()}"
+
+
 @pytest.mark.parametrize(
     "max_chunk_size,seq_lens,start_idx,expected_specs",
     [
@@ -1894,6 +2025,7 @@ def test_split_prefill_chunks(max_chunk_size, seq_lens, start_idx,
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
+@pytest.mark.parametrize("compress_ratio", [1, 4])
 @pytest.mark.parametrize(
     "chunk_size,seq_lens_list,chunking_type",
     [
@@ -1909,7 +2041,8 @@ def test_split_prefill_chunks(max_chunk_size, seq_lens, start_idx,
                 ], "two_level"),  # Mixed: request 2 needs Q-blocks
     ],
 )
-def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
+def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type,
+                                 compress_ratio):
     """
     Tests for indexer chunked prefill:
     1. Request-level chunking: Multiple small requests packed together
@@ -1951,10 +2084,18 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
     total_tokens = seq_lens.sum().item()
     max_seq_len = seq_lens.max().item()
 
-    print(f"\n=== Test Config: {chunking_type} ===")
+    # Compute compressed KV token counts
+    kv_lens_compressed = seq_lens // compress_ratio
+    total_kv_tokens = kv_lens_compressed.sum().item()
+
+    print(
+        f"\n=== Test Config: {chunking_type}, compress_ratio={compress_ratio} ==="
+    )
     print(f"  Batch: {batch_size}, Chunk size: {chunk_size}")
     print(f"  Sequence lengths: {seq_lens_list}")
-    print(f"  Total tokens: {total_tokens}, Max seq len: {max_seq_len}")
+    print(
+        f"  Total tokens: {total_tokens}, Total KV tokens: {total_kv_tokens}, Max seq len: {max_seq_len}"
+    )
 
     # Identify large requests for two-level chunking
     if chunking_type == "two_level":
@@ -1990,7 +2131,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
     q = torch.randn((total_tokens, heads, head_dim),
                     device="cuda",
                     dtype=torch.bfloat16)
-    k = torch.randn((total_tokens, head_dim),
+    k = torch.randn((total_kv_tokens, head_dim),
                     device="cuda",
                     dtype=torch.bfloat16)
     weights = torch.randn((total_tokens, heads),
@@ -2019,6 +2160,8 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
         num_ctx_tokens=total_tokens,
         num_tokens=total_tokens,
         indexer_max_chunk_size=chunk_size,
+        indexer_head_dim=head_dim,
+        compress_ratio=compress_ratio,
     )
 
     Indexer.prepare(metadata_chunked)
@@ -2057,6 +2200,8 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type):
         num_ctx_tokens=total_tokens,
         num_tokens=total_tokens,
         indexer_max_chunk_size=max_model_len,
+        indexer_head_dim=head_dim,
+        compress_ratio=compress_ratio,
     )
 
     Indexer.prepare(metadata_baseline)
@@ -2287,6 +2432,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
         num_ctx_tokens=total_context_tokens,
         num_tokens=total_context_tokens,
         max_draft_tokens=next_n - 1,
+        indexer_head_dim=head_dim,
     )
     Indexer.prepare(metadata_context)
     indexer._update_k_cache(k_context_fp8, k_context_scale, metadata_context)
@@ -2320,6 +2466,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
         num_ctx_tokens=0,
         num_tokens=num_gen_tokens,
         max_draft_tokens=next_n - 1,
+        indexer_head_dim=head_dim,
     )
     Indexer.prepare(metadata_gen_write)
     indexer._update_k_cache(k_fp8, k_scale, metadata_gen_write)
@@ -2336,7 +2483,8 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
                                             0,
                                             num_gen_tokens,
                                             max_model_len,
-                                            max_draft_tokens=next_n - 1)
+                                            max_draft_tokens=next_n - 1,
+                                            indexer_head_dim=head_dim)
 
     Indexer.prepare(metadata_custom)
     indexer._update_k_cache(k_fp8, k_scale, metadata_custom)
@@ -2364,7 +2512,8 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
                                               0,
                                               num_gen_tokens,
                                               max_model_len,
-                                              max_draft_tokens=next_n - 1)
+                                              max_draft_tokens=next_n - 1,
+                                              indexer_head_dim=head_dim)
 
     Indexer.prepare(metadata_fallback)
     indexer._update_k_cache(k_fp8, k_scale, metadata_fallback)
@@ -2390,7 +2539,8 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk,
                                               num_gen_tokens,
                                               max_model_len,
                                               max_draft_tokens=next_n - 1,
-                                              enable_indexer_skip=True)
+                                              enable_indexer_skip=True,
+                                              indexer_head_dim=head_dim)
 
         Indexer.prepare(metadata_skip)
         indexer._update_k_cache(k_fp8, k_scale, metadata_skip)
@@ -2499,11 +2649,17 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk,
     k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k)
 
     # Test with custom CUDA kernel
-    metadata_custom = _create_mock_metadata(request_ids, batch_size,
-                                            batch_size, 0, seq_lens.clone(),
+    metadata_custom = _create_mock_metadata(request_ids,
+                                            batch_size,
+                                            batch_size,
+                                            0,
+                                            seq_lens.clone(),
                                             seq_lens.clone(), [0] * batch_size,
-                                            cache_manager, total_tokens,
-                                            total_tokens, chunk_size)
+                                            cache_manager,
+                                            total_tokens,
+                                            total_tokens,
+                                            chunk_size,
+                                            indexer_head_dim=head_dim)
 
     Indexer.prepare(metadata_custom)
     indexer._update_k_cache(k_fp8, k_scale, metadata_custom)
@@ -2522,12 +2678,18 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk,
         pytest.skip(f"Custom topk not available: {e}")
 
     # Test with PyTorch fallback
-    metadata_fallback = _create_mock_metadata(request_ids, batch_size,
-                                              batch_size, 0, seq_lens.clone(),
+    metadata_fallback = _create_mock_metadata(request_ids,
+                                              batch_size,
+                                              batch_size,
+                                              0,
                                               seq_lens.clone(),
-                                              [0] * batch_size, cache_manager,
-                                              total_tokens, total_tokens,
-                                              chunk_size)
+                                              seq_lens.clone(),
+                                              [0] * batch_size,
+                                              cache_manager,
+                                              total_tokens,
+                                              total_tokens,
+                                              chunk_size,
+                                              indexer_head_dim=head_dim)
 
     Indexer.prepare(metadata_fallback)
     indexer._update_k_cache(k_fp8, k_scale, metadata_fallback)
@@ -2607,11 +2769,17 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk,
     k_fp8, k_scale = fp8_utils.fp8_quantize_1x128_sf_transpose(k)
 
     # Test with custom CUDA kernel
-    metadata_custom = _create_mock_metadata(request_ids, batch_size,
-                                            batch_size, 0, seq_lens.clone(),
+    metadata_custom = _create_mock_metadata(request_ids,
+                                            batch_size,
+                                            batch_size,
+                                            0,
+                                            seq_lens.clone(),
                                             seq_lens.clone(), [0] * batch_size,
-                                            cache_manager, total_tokens,
-                                            total_tokens, max_model_len)
+                                            cache_manager,
+                                            total_tokens,
+                                            total_tokens,
+                                            max_model_len,
+                                            indexer_head_dim=head_dim)
 
     Indexer.prepare(metadata_custom)
     indexer._update_k_cache(k_fp8, k_scale, metadata_custom)
@@ -2630,12 +2798,18 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk,
         pytest.skip(f"Custom topk not available: {e}")
 
     # Test with PyTorch fallback
-    metadata_fallback = _create_mock_metadata(request_ids, batch_size,
-                                              batch_size, 0, seq_lens.clone(),
+    metadata_fallback = _create_mock_metadata(request_ids,
+                                              batch_size,
+                                              batch_size,
+                                              0,
                                               seq_lens.clone(),
-                                              [0] * batch_size, cache_manager,
-                                              total_tokens, total_tokens,
-                                              max_model_len)
+                                              seq_lens.clone(),
+                                              [0] * batch_size,
+                                              cache_manager,
+                                              total_tokens,
+                                              total_tokens,
+                                              max_model_len,
+                                              indexer_head_dim=head_dim)
 
     Indexer.prepare(metadata_fallback)
     indexer._update_k_cache(k_fp8, k_scale, metadata_fallback)
@@ -2661,7 +2835,8 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk,
                                           total_tokens,
                                           total_tokens,
                                           max_model_len,
-                                          enable_indexer_skip=True)
+                                          enable_indexer_skip=True,
+                                          indexer_head_dim=head_dim)
     Indexer.prepare(metadata_skip)
     indexer._update_k_cache(k_fp8, k_scale, metadata_skip)
     metadata_skip.indexer_prefill_chunks = None
@@ -2772,7 +2947,8 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
                                      total_tokens,
                                      total_tokens,
                                      indexer_max_chunk_size=32768,
-                                     enable_context_mla_with_cached_kv=True)
+                                     enable_context_mla_with_cached_kv=True,
+                                     indexer_head_dim=head_dim)
 
     Indexer.prepare(metadata)
     indexer._update_k_cache(k_fp8, k_scale, metadata)
@@ -2810,7 +2986,8 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
             total_tokens,
             indexer_max_chunk_size=32768,
             enable_context_mla_with_cached_kv=True,
-            enable_indexer_skip=True)
+            enable_indexer_skip=True,
+            indexer_head_dim=head_dim)
         Indexer.prepare(metadata_skip)
         indexer._update_k_cache(k_fp8, k_scale, metadata_skip)
         topk_indices_skip = indexer.sparse_attn_indexer(metadata_skip,
@@ -2846,8 +3023,9 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
 
     # Check tokens with large windows (>= 2048) should have exactly 2048 valid indices
     print("\n=== Check: Large windows must have 2048 valid ===")
-    from tensorrt_llm._torch.attention_backend.sparse.dsa import \
-        compute_cu_seqlen_kv_bounds_with_cache
+    from tensorrt_llm._torch.attention_backend.sparse.dsa import (
+        compute_cu_seqlen_kv_bounds_with_cache,
+    )
     host_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device='cpu')
     host_cached = torch.tensor(cached_tokens, dtype=torch.int32, device='cpu')
     cu_ks, cu_ke = compute_cu_seqlen_kv_bounds_with_cache(
@@ -2911,8 +3089,7 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
 
     def test_prepare_swaps_and_restore_recovers(self):
         """Test that prepare swaps KV manager and restore recovers original state."""
-        from tensorrt_llm._torch.attention_backend.trtllm import \
-            TrtllmAttentionMetadata
+        from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 
         meta = self._make_mock_metadata()
         mgr = self._make_mock_draft_manager()
