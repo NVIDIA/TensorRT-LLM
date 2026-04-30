@@ -2834,6 +2834,16 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         status="prototype",
         description="Whether to use the KV cache manager v2 (experimental).")
 
+    kv_cache_event_hash_algo: Literal[
+        "auto", "v1_block_key", "v2_sha256", "v2_sha256_64"] = Field(
+            default="auto",
+            status="prototype",
+            description=
+            "The block hash algorithm used by KV cache manager events. "
+            "'auto' uses the native hash for each KV cache manager. "
+            "Explicit V2 hash choices are ignored with a warning by the V1 "
+            "KV cache manager.")
+
     max_util_for_resume: float = Field(
         default=0.95,
         ge=0,

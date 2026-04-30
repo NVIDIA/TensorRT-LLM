@@ -286,7 +286,7 @@ class OpenAIHttpClient(OpenAIClient):
 
     async def _finish_request(self, request: UCompletionRequest) -> None:
         self._metrics_collector.completed_requests.inc()
-        await self._router.finish_request(request)
+        await self._router.finish_request(request, self._session)
 
     async def collect_metrics(self) -> Dict[str, Any]:
         metrics = {}
