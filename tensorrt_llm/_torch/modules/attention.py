@@ -2055,37 +2055,26 @@ class MLA(nn.Module):
                 self.ln_events[1],
                 self.aux_stream,
             )
-
-            # Indexer (depends on qr / hidden_states only).  Kept serial
-            # because it internally reuses self.aux_stream for its own
-            # multi-stream q-proj || weights-proj split; running it
-            # concurrently with q_b_proj would create a stream-aliasing
-            # hazard.
-            topk_indices = None
-            if self.indexer is not None:
-                topk_indices = self.indexer(
-                    qr,
-                    hidden_states,
-                    attn_metadata,
-                    position_ids,
-                )
         else:
             q = self.q_b_proj(q)
             # Per-head RMS: view as [N*n_heads, head_dim] so RMSNorm reduces per-head.
             q = self.q_b_layernorm(q.view(-1, self.qk_head_dim)).view_as(q)
-            # Indexer
-            topk_indices = None
-            if self.indexer is not None:
-                topk_indices = self.indexer(
-                    qr,
-                    hidden_states,
-                    attn_metadata,
-                    position_ids,
-                )
-
-            # Compressor
             if self.compressor is not None:
                 self.compressor(hidden_states, attn_metadata)
+
+        # Indexer is independent of both q_b_proj and the compressor's KV-cache
+        # write, so it runs after either schedule.  Kept serial because it
+        # internally reuses self.aux_stream for its own multi-stream q-proj ||
+        # weights-proj split; running it concurrently with q_b_proj would
+        # create a stream-aliasing hazard.
+        topk_indices = None
+        if self.indexer is not None:
+            topk_indices = self.indexer(
+                qr,
+                hidden_states,
+                attn_metadata,
+                position_ids,
+            )
 
         assert q.shape[
             0] == num_tokens, f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"
