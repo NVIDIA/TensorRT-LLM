@@ -2023,10 +2023,50 @@ class MLA(nn.Module):
         qr = q
         latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
 
-        q = self.q_b_proj(q)
-        # Per-head RMS: view as [N*n_heads, head_dim] so RMSNorm reduces per-head.
-        q = self.q_b_layernorm(q.view(-1, self.qk_head_dim)).view_as(q)
-        # Indexer
+        # TRTLLM_MLA_EXTRA_OVERLAP=1 reorders the V4 attention prologue so the
+        # outer compressor (writes its own KV-cache slot, only reads
+        # hidden_states) executes on the auxiliary CUDA stream concurrently
+        # with q_b_proj + q_b_layernorm on the default stream.  Both branches
+        # are entirely independent (no shared inputs and disjoint writes),
+        # so this is a pure dependency-aware reorder.  Falls back to the
+        # serial schedule when the env-var is unset, when the aux stream is
+        # unavailable, or when multi-stream mode is off.
+        _v4_extra_overlap = (os.environ.get("TRTLLM_MLA_EXTRA_OVERLAP", "0")
+                             == "1" and self.compressor is not None
+                             and self.aux_stream is not None)
+
+        if _v4_extra_overlap:
+
+            def _q_branch():
+                q_proj = self.q_b_proj(q)
+                # Per-head RMS: view as [N*n_heads, head_dim] so RMSNorm
+                # reduces per-head.
+                return self.q_b_layernorm(q_proj.view(
+                    -1, self.qk_head_dim)).view_as(q_proj)
+
+            def _compressor_branch():
+                self.compressor(hidden_states, attn_metadata)
+                return None
+
+            q, _ = maybe_execute_in_parallel(
+                _q_branch,
+                _compressor_branch,
+                self.ln_events[0],
+                self.ln_events[1],
+                self.aux_stream,
+            )
+        else:
+            q = self.q_b_proj(q)
+            # Per-head RMS: view as [N*n_heads, head_dim] so RMSNorm reduces per-head.
+            q = self.q_b_layernorm(q.view(-1, self.qk_head_dim)).view_as(q)
+            if self.compressor is not None:
+                self.compressor(hidden_states, attn_metadata)
+
+        # Indexer is independent of both q_b_proj and the compressor's KV-cache
+        # write, so it runs after either schedule.  Kept serial because it
+        # internally reuses self.aux_stream for its own multi-stream q-proj ||
+        # weights-proj split; running it concurrently with q_b_proj would
+        # create a stream-aliasing hazard.
         topk_indices = None
         if self.indexer is not None:
             topk_indices = self.indexer(
@@ -2035,10 +2075,6 @@ class MLA(nn.Module):
                 attn_metadata,
                 position_ids,
             )
-
-        # Compressor
-        if self.compressor is not None:
-            self.compressor(hidden_states, attn_metadata)
 
         assert q.shape[
             0] == num_tokens, f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"
