@@ -437,3 +437,4 @@ unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1] SKIP
 full:H100_PCIe/unittest/auto_deploy/standalone SKIP (https://nvbugs/6129630)
 full:RTX_6000D/accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-cutlass-two_model-no_overlap_scheduler] SKIP (https://nvbugs/6128420)
 full:RTX_6000D/accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4[latency_moe_cutlass] SKIP (https://nvbugs/6128419)
+unittest/_torch/ray_orchestrator/multi_gpu/test_ops.py::test_cp_tp_broadcast_object[tp_cp_broadcast-list] SKIP (https://nvbugs/6132301)
