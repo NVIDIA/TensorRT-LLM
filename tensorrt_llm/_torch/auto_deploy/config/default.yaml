@@ -106,6 +106,15 @@ transforms:
   detect_hidden_states_for_capture:
     stage: pattern_matcher
     enabled: false
+  # LoRA injection: inserts lora_delta + add nodes after target linears.
+  # Disabled by default; enabled by ad_executor when lora_config is set.
+  inject_lora:
+    stage: pattern_matcher
+    enabled: false
+    run_graph_cleanup: false
+    run_shape_prop: false
+    lora_targets: []
+    max_lora_rank: 8
   detect_sharding:
     stage: sharding
     simple_shard_only: false

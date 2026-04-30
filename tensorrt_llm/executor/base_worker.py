@@ -285,7 +285,8 @@ class BaseWorker(GenerationExecutor):
             if engine_config.build_config.max_prompt_embedding_table_size > 0:
                 self._prompt_adapter_manager = PromptAdapterManager()
 
-        if self._backend == "pytorch" and self._lora_config is not None:
+        if self._backend in ("pytorch",
+                             "_autodeploy") and self._lora_config is not None:
             from tensorrt_llm._torch.pyexecutor.resource_manager import \
                 ResourceManagerType
             peft_cache_manager = self.engine.resource_manager.resource_managers.get(

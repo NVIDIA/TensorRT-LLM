@@ -25,6 +25,7 @@ from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeat
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.models.modeling_speculative import Eagle3ForCausalLM
 from tensorrt_llm._torch.pyexecutor._util import (
+    _compute_num_lora_modules,
     _create_kv_cache_manager,
     get_decoding_mode,
     get_kv_cache_manager_cls,
@@ -36,17 +37,20 @@ from tensorrt_llm._torch.pyexecutor.py_executor_creator import get_guided_decodi
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._torch.speculative import get_spec_drafter
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSampler, Eagle3ResourceManager
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import nvtx_range, str_dtype_to_binding, torch_dtype_to_binding
 from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData
 from tensorrt_llm.llmapi.llm_args import (
     ContextChunkingPolicy,
     EagleDecodingConfig,
     KvCacheConfig,
     LoadFormat,
+    PeftCacheConfig,
     SamplerType,
     TorchLlmArgs,
 )
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
+from tensorrt_llm.lora_helper import LoraConfig, get_default_trtllm_modules_to_hf_modules
+from tensorrt_llm.lora_manager import LoraManager, load_torch_lora
 
 from ...._utils import get_free_port, mpi_rank, mpi_world_size
 from ....mapping import Mapping
@@ -57,6 +61,7 @@ from ...pyexecutor.py_executor import PyExecutor
 from ...pyexecutor.resource_manager import (
     BaseResourceManager,
     KVCacheManager,
+    PeftCacheManager,
     ResourceManager,
     ResourceManagerType,
 )
@@ -844,6 +849,23 @@ class ADEngine(ModelEngine):
             extra_args=extra_args,
         )
 
+        # Populate LoRA planner with per-batch adapter state from PeftCacheManager
+        peft_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.PEFT_CACHE_MANAGER
+        )
+        if peft_cache_manager is not None:
+            from ..custom_ops.lora.lora_delta import _GlobalLoraPlanner
+
+            peft_table = peft_cache_manager.get_and_reset_batch_peft_table()
+            num_seqs = len(ordered_requests)
+            _GlobalLoraPlanner.get().populate(
+                peft_table=peft_table,
+                ordered_requests=ordered_requests,
+                num_seqs=num_seqs,
+                num_context_requests=num_prefill,
+                max_rank=peft_cache_manager._lora_config.max_lora_rank,
+            )
+
         # update the sequence info object now (also triggers rescatter + host_prepare internally)
         self.cache_seq_interface.info.nest_sequences(
             input_ids,
@@ -1066,6 +1088,104 @@ class TRTLLMSamplerModelConfig:
         self.config.num_attention_heads = 42
 
 
+def _create_peft_cache_manager(
+    ad_config: LlmArgs, dist_mapping: Mapping, dist: Distributed
+) -> Optional[PeftCacheManager]:
+    lora_config: Optional[LoraConfig] = ad_config.lora_config
+    if lora_config is None:
+        return None
+
+    if dist_mapping.tp_size != 1:
+        raise NotImplementedError("AutoDeploy LoRA Phase 0 only supports tensor_parallel_size=1")
+
+    # load_torch_lora and target module resolution already done in create_autodeploy_executor
+    assert len(lora_config.lora_target_modules) >= 1, "Expecting at least one lora target module"
+
+    ad_logger.info(f"Creating PeftCacheManager for AutoDeploy model={ad_config.model}")
+
+    # Reuse the factory's config resolution (applies model_kwargs, handles custom models).
+    # This is lightweight — no weight loading, just JSON config parsing.
+    factory = ad_config.create_factory()
+    hf_config, _ = factory._get_model_config()
+
+    hidden_size = hf_config.hidden_size
+    num_attention_heads = hf_config.num_attention_heads
+    mlp_hidden_size = getattr(hf_config, "intermediate_size", hidden_size * 4)
+    num_kv_heads = getattr(hf_config, "num_key_value_heads", num_attention_heads)
+    head_size = getattr(hf_config, "head_dim", None) or (hidden_size // num_attention_heads)
+
+    # Resolve dtype for the C++ ModelConfig binding.
+    # HF configs may have torch_dtype="auto" or an actual torch.dtype.
+    dtype = getattr(ad_config, "dtype", None)
+    if dtype is None or dtype == "auto":
+        dtype = getattr(hf_config, "torch_dtype", None)
+    if dtype is None or dtype == "auto" or not isinstance(dtype, (str, torch.dtype)):
+        dtype = torch.bfloat16
+    binding_dtype = (
+        str_dtype_to_binding(dtype) if isinstance(dtype, str) else torch_dtype_to_binding(dtype)
+    )
+
+    from tensorrt_llm.bindings import LoraModule, WorldConfig
+    from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
+
+    model_binding_config = ModelConfigCpp(
+        vocab_size=hf_config.vocab_size,
+        num_layers=hf_config.num_hidden_layers,
+        num_attention_layers=hf_config.num_hidden_layers,
+        num_rnn_layers=0,
+        num_heads=num_attention_heads,
+        hidden_size=hidden_size,
+        data_type=binding_dtype,
+    )
+    model_binding_config.set_num_kv_heads(num_kv_heads)
+    model_binding_config.mlp_hidden_size = mlp_hidden_size
+    model_binding_config.size_per_head = head_size
+
+    target_modules = list(lora_config.lora_target_modules)
+    lora_modules = LoraModule.create_lora_modules(
+        lora_module_names=target_modules,
+        hidden_size=hidden_size,
+        mlp_hidden_size=mlp_hidden_size,
+        num_attention_heads=num_attention_heads,
+        num_kv_attention_heads=num_kv_heads,
+        attention_head_size=head_size,
+        tp_size=dist_mapping.tp_size,
+        num_experts=0,
+    )
+
+    model_binding_config.use_lora_plugin = True
+    model_binding_config.lora_modules = lora_modules
+    model_binding_config.max_lora_rank = lora_config.max_lora_rank
+
+    # Size the PEFT cache
+    peft_cache_config_model = ad_config.peft_cache_config or PeftCacheConfig()
+    num_lora_modules = _compute_num_lora_modules(
+        hf_config, target_modules + lora_config.missing_qkv_modules
+    )
+    if lora_config.max_loras is not None:
+        peft_cache_config_model.num_device_module_layer = (
+            lora_config.max_lora_rank * num_lora_modules * lora_config.max_loras
+        )
+    if lora_config.max_cpu_loras is not None:
+        peft_cache_config_model.num_host_module_layer = (
+            lora_config.max_lora_rank * num_lora_modules * lora_config.max_cpu_loras
+        )
+
+    world_config = WorldConfig(
+        tensor_parallelism=dist_mapping.tp_size,
+        pipeline_parallelism=dist_mapping.pp_size,
+        context_parallelism=dist_mapping.cp_size,
+        rank=dist_mapping.rank,
+        gpus_per_node=dist_mapping.gpus_per_node,
+    )
+    return PeftCacheManager(
+        peft_cache_config=peft_cache_config_model,
+        lora_config=lora_config,
+        model_config=model_binding_config,
+        world_config=world_config,
+    )
+
+
 def instantiate_sampler(
     ad_config: LlmArgs,
     max_num_sequences: int,
@@ -1169,6 +1289,44 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
         else ad_config.speculative_config.tokens_per_gen_step - 1
     )
 
+    # Enable inject_lora transform when lora_config is set.
+    # Must run before engine build so the transform sees the config.
+    # load_torch_lora populates lora_target_modules from the adapter file.
+    if ad_config.lora_config is not None:
+        lora_config = ad_config.lora_config
+        if len(lora_config.lora_dir) == 1:
+            load_torch_lora(lora_config)
+        else:
+            if not lora_config.lora_target_modules:
+                raise ValueError("lora_target_modules must be set when multiple lora_dirs are used")
+            if not lora_config.trtllm_modules_to_hf_modules:
+                lora_config.trtllm_modules_to_hf_modules = (
+                    get_default_trtllm_modules_to_hf_modules()
+                )
+
+        trtllm_to_hf = lora_config.trtllm_modules_to_hf_modules
+        if not trtllm_to_hf:
+            trtllm_to_hf = get_default_trtllm_modules_to_hf_modules()
+        lora_targets = []
+        for trtllm_name in lora_config.lora_target_modules:
+            hf_name = trtllm_to_hf.get(trtllm_name)
+            if hf_name is None:
+                raise ValueError(
+                    f"No HF module mapping found for LoRA target module {trtllm_name!r}"
+                )
+            if not isinstance(hf_name, str):
+                raise ValueError(
+                    "AutoDeploy LoRA requires each target module to resolve to one HF module "
+                    f"name, but {trtllm_name!r} resolved to {hf_name!r}."
+                )
+            module_id = LoraManager.LORA_MODULE_IDS.get(trtllm_name)
+            if module_id is None:
+                raise ValueError(f"Unsupported TRT-LLM LoRA target module: {trtllm_name!r}")
+            lora_targets.append({"hf_module_name": hf_name, "module_id": module_id})
+
+        ad_config.transforms["inject_lora"]["enabled"] = True
+        ad_config.transforms["inject_lora"]["lora_targets"] = lora_targets
+
     # initialize model engine
     engine = ADEngine.build_from_config(
         ad_config=ad_config, dist_config=dc, mapping=dist_mapping, dist=dist
@@ -1228,15 +1386,20 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     draft_kv_cache_manager = create_draft_kv_cache_manager_maybe(
         draft_model_engine, ad_config, kv_cache_config_tuned, dist_mapping
     )
+    peft_cache_manager = _create_peft_cache_manager(ad_config, dist_mapping, dist)
+    if peft_cache_manager is not None:
+        engine.lora_model_config = peft_cache_manager._lora_model_config
 
-    resource_manager = ResourceManager(
-        {
-            ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager,
-            ResourceManagerType.DRAFT_KV_CACHE_MANAGER: draft_kv_cache_manager,
-            ResourceManagerType.SEQ_SLOT_MANAGER: seq_slot_manager,
-            ResourceManagerType.SPEC_RESOURCE_MANAGER: spec_resource_manager,
-        }
-    )
+    resource_managers = {
+        ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager,
+        ResourceManagerType.DRAFT_KV_CACHE_MANAGER: draft_kv_cache_manager,
+        ResourceManagerType.SEQ_SLOT_MANAGER: seq_slot_manager,
+        ResourceManagerType.SPEC_RESOURCE_MANAGER: spec_resource_manager,
+    }
+    if peft_cache_manager is not None:
+        resource_managers[ResourceManagerType.PEFT_CACHE_MANAGER] = peft_cache_manager
+
+    resource_manager = ResourceManager(resource_managers)
     resource_manager.resource_managers.move_to_end(ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
     # TODO: consider passing through scheduler_config arguments here. Not doing this for now since
@@ -1255,7 +1418,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     capacitor_scheduler = BindCapacityScheduler(
         max_num_requests=ad_config.max_batch_size,
         kv_cache_manager=kv_cache_manager.impl,
-        peft_cache_manager=None,
+        peft_cache_manager=peft_cache_manager.impl if peft_cache_manager is not None else None,
     )
     mb_scheduler = BindMicroBatchScheduler(
         max_batch_size=ad_config.max_batch_size,

@@ -152,3 +152,150 @@ def test_create_autodeploy_executor_with_guided_decoding(
         assert guided_decoder.guided_decoding_config == mock_guided_decoding_config
         assert guided_decoder.max_num_sequences == ad_config.max_batch_size
         assert guided_decoder.vocab_size_padded == vocab_size_padded
+
+
+"""Unit tests for LoRA PeftCacheManager wiring in create_autodeploy_executor."""
+
+
+def _make_mock_engine(max_batch_size=2, vocab_size_padded=128):
+    """Create a mock ADEngine with the attributes create_autodeploy_executor reads."""
+    engine = Mock()
+    engine.cache_seq_interface.info.num_pages = 100
+    engine.cache_seq_interface.info.max_num_tokens = 512
+    engine.cache_seq_interface.info.vocab_size_padded = vocab_size_padded
+    engine.cache_seq_interface.max_num_state_slots = max_batch_size
+    return engine
+
+
+def test_create_autodeploy_executor_with_lora_creates_peft_cache_manager():
+    """Verify PeftCacheManager is wired into ResourceManager when lora_config is set."""
+    mock_peft_cache_manager = Mock()
+    mock_peft_cache_manager.impl = Mock()  # C++ handle for scheduler
+
+    ad_config = LlmArgs(
+        model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+        max_batch_size=2,
+        max_seq_len=32,
+        backend="_autodeploy",
+        cuda_graph_config={"max_batch_size": 2},
+        lora_config={
+            "lora_target_modules": ["attn_q", "attn_k", "attn_v"],
+            "max_lora_rank": 8,
+            "max_loras": 2,
+            "max_cpu_loras": 2,
+        },
+    )
+
+    with (
+        patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.ADEngine.build_from_config"
+        ) as mock_ad_engine,
+        patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.PyExecutor") as py_executor_cls,
+        patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor._create_peft_cache_manager",
+            return_value=mock_peft_cache_manager,
+        ),
+        patch(
+            "tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs.create_factory",
+            return_value=MockFactory(vocab_size_padded=128),
+        ),
+    ):
+        mock_ad_engine.return_value = _make_mock_engine()
+        py_executor_cls.side_effect = MockPyExecutor
+
+        result = create_autodeploy_executor(ad_config)
+
+    assert isinstance(result, MockPyExecutor)
+
+    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+
+    rm = result.resource_manager
+    peft_mgr = rm.get_resource_manager(ResourceManagerType.PEFT_CACHE_MANAGER)
+    assert peft_mgr is mock_peft_cache_manager, (
+        "PeftCacheManager should be in ResourceManager when lora_config is set"
+    )
+
+
+def test_create_autodeploy_executor_without_lora_no_peft_cache_manager():
+    """Verify no PeftCacheManager when lora_config is not set."""
+    ad_config = LlmArgs(
+        model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+        max_batch_size=2,
+        max_seq_len=32,
+        backend="_autodeploy",
+        cuda_graph_config={"max_batch_size": 2},
+    )
+
+    with (
+        patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.ADEngine.build_from_config"
+        ) as mock_ad_engine,
+        patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.PyExecutor") as py_executor_cls,
+        patch(
+            "tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs.create_factory",
+            return_value=MockFactory(vocab_size_padded=128),
+        ),
+    ):
+        mock_ad_engine.return_value = _make_mock_engine()
+        py_executor_cls.side_effect = MockPyExecutor
+
+        result = create_autodeploy_executor(ad_config)
+
+    assert isinstance(result, MockPyExecutor)
+
+    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+
+    rm = result.resource_manager
+    peft_mgr = rm.get_resource_manager(ResourceManagerType.PEFT_CACHE_MANAGER)
+    assert peft_mgr is None, "PeftCacheManager should NOT be present without lora_config"
+
+
+def test_create_autodeploy_executor_with_lora_sets_lora_model_config():
+    """Verify lora_model_config is set on ADEngine when lora_config is present.
+
+    This is required for BaseWorker to wire _lora_manager, which enables
+    LoRARequest → lora_task_id flow on incoming requests.
+    """
+    mock_peft_cache_manager = Mock()
+    mock_peft_cache_manager.impl = Mock()
+    mock_peft_cache_manager._lora_model_config = Mock()
+
+    ad_config = LlmArgs(
+        model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+        max_batch_size=2,
+        max_seq_len=32,
+        backend="_autodeploy",
+        cuda_graph_config={"max_batch_size": 2},
+        lora_config={
+            "lora_target_modules": ["attn_q", "attn_k", "attn_v"],
+            "max_lora_rank": 8,
+            "max_loras": 2,
+            "max_cpu_loras": 2,
+        },
+    )
+
+    mock_engine = _make_mock_engine()
+
+    with (
+        patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor.ADEngine.build_from_config"
+        ) as mock_ad_engine,
+        patch("tensorrt_llm._torch.auto_deploy.shim.ad_executor.PyExecutor") as py_executor_cls,
+        patch(
+            "tensorrt_llm._torch.auto_deploy.shim.ad_executor._create_peft_cache_manager",
+            return_value=mock_peft_cache_manager,
+        ),
+        patch(
+            "tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs.create_factory",
+            return_value=MockFactory(vocab_size_padded=128),
+        ),
+    ):
+        mock_ad_engine.return_value = mock_engine
+        py_executor_cls.side_effect = MockPyExecutor
+
+        result = create_autodeploy_executor(ad_config)
+
+    assert isinstance(result, MockPyExecutor)
+    assert mock_engine.lora_model_config is mock_peft_cache_manager._lora_model_config, (
+        "lora_model_config should be set on ADEngine from PeftCacheManager"
+    )
