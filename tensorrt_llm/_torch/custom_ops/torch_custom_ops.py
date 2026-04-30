@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import enum
+import os
 import threading
 from dataclasses import replace
 from functools import lru_cache
@@ -1607,14 +1608,30 @@ def _(
 
 # deep_gemm_gen_tuning_buckets is imported from ..utils
 
+_USE_FUSED_FP8_QUANT_PACK = os.environ.get("TRTLLM_FUSED_FP8_QUANT_PACK",
+                                           "0") == "1"
+
 
 def _fp8_quantize_1x128_ue8m0(input: torch.Tensor, tactic: int):
-    """Dispatch FP8 1x128 quantization to CUDA or Triton kernel."""
+    """Dispatch FP8 1x128 quantization to CUDA or Triton kernel.
+
+    When the CUDA path is selected on SM100 and ``TRTLLM_FUSED_FP8_QUANT_PACK=1``
+    is set, the fused ``fp8_quantize_1x128_packed_ue8m0`` op is used and the
+    follow-on ``get_mn_major_tma_aligned_packed_ue8m0_tensor`` call is skipped:
+    the new op writes packed-UE8M0 (int32) scales directly in the layout
+    deep_gemm expects, so deep_gemm's internal layout transform falls into the
+    pre-packed branch and skips its own pack kernel as well.
+    """
     TACTIC_TRITON = 1
     if tactic == TACTIC_TRITON:
         a, a_sf = fp8_quantize.triton_fp8_quantize_1x128(input, use_ue8m0=True)
-    else:
-        a, a_sf = torch.ops.trtllm.fp8_quantize_1x128(input, use_ue8m0=True)
+        a_sf = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+            a_sf.transpose(0, 1))
+        return a, a_sf
+    if _USE_FUSED_FP8_QUANT_PACK and get_sm_version() >= 100:
+        a, a_sf = torch.ops.trtllm.fp8_quantize_1x128_packed_ue8m0(input)
+        return a, a_sf
+    a, a_sf = torch.ops.trtllm.fp8_quantize_1x128(input, use_ue8m0=True)
     a_sf = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(
         a_sf.transpose(0, 1))
     return a, a_sf
