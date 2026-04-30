@@ -143,6 +143,16 @@ deepseek-ai/DeepSeek-V3.2-Exp:
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP
     accuracy: 95.6
+deepseek-ai/DeepSeek-V4-Flash:
+  # GSM8K measurements:
+  # * 95.11 on 8x B200 178GB at TP=8 with tightened config (fraction=0.15,
+  #   cuda_graph=None, max_num_tokens=2048) — original measurement.
+  # * 95.38 on 4x B300 275GB at TP=4 with default config (fraction=0.5,
+  #   CudaGraphConfig()) — current CI path (test_nvfp4_4gpus_static_eplb
+  #   in l0_dgx_b300_ds.yml). Drift +0.27 from 95.11 is within sigma; the
+  #   95.11 reference still holds for the hypothesis test.
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 95.11
 Qwen3/Qwen3-4B:
   - spec_dec_algo: Eagle
     accuracy: 85.823
