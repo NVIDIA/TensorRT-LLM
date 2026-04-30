@@ -672,6 +672,22 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
 
+        # Encoder-decoder runtime state. ``py_encoder_output`` holds the
+        # packed encoder hidden states produced by the encoder iteration as
+        # a temporary GPU buffer between encoder forward and the first
+        # decoder context step. ``py_encoder_output_ready_event`` is
+        # recorded on the encoder stream when those hidden states become
+        # available; the scheduler queries it before admitting the request
+        # to a decoder context step. ``py_skip_cross_kv_projection`` controls
+        # whether the decoder's cross-attention projects K/V from
+        # ``encoder_output`` (False on the first context step, the only step
+        # that writes the cross pool) or reads cross-KV without projection
+        # (True on later decoder steps and chunks). All three are unused for
+        # decoder-only models.
+        self.py_encoder_output: Optional[torch.Tensor] = None
+        self.py_encoder_output_ready_event: Optional[torch.cuda.Event] = None
+        self.py_skip_cross_kv_projection: bool = False
+
         # Performance timing info (step metrics, GPU events, context GPU timing)
         # Lazily created only when return_perf_metrics is enabled to avoid
         # overhead for every request.

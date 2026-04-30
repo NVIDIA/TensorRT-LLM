@@ -431,6 +431,8 @@ class BartModel(nn.Module):
             gather_output=True,
         )
         self.embed_scale = math.sqrt(config.d_model)
+        # HF BART learned position embeddings reserve indices 0 and 1.
+        self.position_id_offset = 2
 
         self.encoder = BartEncoder(model_config)
         self.decoder = BartDecoder(model_config)

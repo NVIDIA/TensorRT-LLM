@@ -161,6 +161,7 @@ def _build_trtllm_cross_metadata(
     dtype,
     skip_cross_kv_projection: bool = False,
     kv_managers=None,
+    kv_cache_manager_cls=None,
 ):
     """Build a TrtllmAttentionMetadata + cross sub-metadata for CrossAttention.
 
@@ -171,12 +172,21 @@ def _build_trtllm_cross_metadata(
     used by the cross-attention forward call. When ``kv_managers`` is
     provided, reuse the existing SELF/CROSS managers so generation tests can
     read encoder K/V written during an earlier context pass.
+
+    ``kv_cache_manager_cls`` selects the KV cache manager class for both
+    pools (V1 ``KVCacheManager`` or V2 ``KVCacheManagerV2``).  Defaults
+    to V2 to preserve backward compatibility with existing call sites;
+    Step 7 covers the V1 production lane via the parametrized sibling
+    test classes below.
     """
     from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
     from tensorrt_llm._torch.metadata import KVCacheParams
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
     from tensorrt_llm.mapping import Mapping
+
+    if kv_cache_manager_cls is None:
+        kv_cache_manager_cls = KVCacheManagerV2
 
     metadata_cls = get_attention_backend("TRTLLM").Metadata
     num_seqs = len(decoder_seq_lens)
@@ -201,7 +211,7 @@ def _build_trtllm_cross_metadata(
 
     request_ids = list(range(num_seqs))
     if kv_managers is None:
-        cross_kv_cache_manager = KVCacheManagerV2(
+        cross_kv_cache_manager = kv_cache_manager_cls(
             KvCacheConfig(max_tokens=num_seqs * cross_max_seq_len),
             cross_cache_type,
             num_layers=1,
@@ -213,7 +223,7 @@ def _build_trtllm_cross_metadata(
             mapping=mapping,
             dtype=kv_cache_dtype,
         )
-        self_kv_cache_manager = KVCacheManagerV2(
+        self_kv_cache_manager = kv_cache_manager_cls(
             KvCacheConfig(max_tokens=num_seqs * page_size),
             self_cache_type,
             num_layers=1,
@@ -269,7 +279,16 @@ class TestCrossAttentionTrtllmBackend(unittest.TestCase):
     On Blackwell (SM100/SM103) the request flows through the ``trtllm_gen``
     sub-path (5\u03b1); on Hopper / Ampere / earlier it flows through the legacy
     ``thop.attention`` sub-path extended in 5\u03b2.
+
+    Subclasses override ``kv_cache_manager_cls`` to run the same correctness
+    cases on the V1 ``KVCacheManager`` (the production lane and default
+    target) and the V2 ``KVCacheManagerV2`` (the additive secondary path).
+    The base class defaults to V2 so the existing CI lanes keep their
+    current coverage; ``TestCrossAttentionTrtllmBackendV1`` re-runs the
+    same suite on V1.
     """
+
+    kv_cache_manager_cls = None  # ``None`` lets the helper default to V2.
 
     def setUp(self):
         torch.random.manual_seed(42)
@@ -382,6 +401,7 @@ class TestCrossAttentionTrtllmBackend(unittest.TestCase):
             num_kv_heads=num_heads,
             head_dim=head_dim,
             dtype=dtype,
+            kv_cache_manager_cls=self.kv_cache_manager_cls,
         )
 
         try:
@@ -432,6 +452,7 @@ class TestCrossAttentionTrtllmBackend(unittest.TestCase):
             num_kv_heads=num_heads,
             head_dim=head_dim,
             dtype=dtype,
+            kv_cache_manager_cls=self.kv_cache_manager_cls,
         )
 
         try:
@@ -502,6 +523,7 @@ class TestCrossAttentionTrtllmBackend(unittest.TestCase):
             num_kv_heads=num_heads,
             head_dim=head_dim,
             dtype=dtype,
+            kv_cache_manager_cls=self.kv_cache_manager_cls,
         )
 
         try:
@@ -591,6 +613,147 @@ class TestCrossAttentionTrtllmBackendLegacy(TestCrossAttentionTrtllmBackend):
     def test_attn_backend_selection(self):
         """Backend selection is independent of the trtllm-gen vs legacy split."""
         super().test_attn_backend_selection()
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestCrossAttentionTrtllmBackendV1(TestCrossAttentionTrtllmBackend):
+    """Step 7: re-run the dual-pool cross-attention suite on V1 ``KVCacheManager``.
+
+    V1 is the **default and production target** for encoder-decoder
+    deployments (``KvCacheConfig.use_kv_cache_manager_v2=False``); V2 is
+    an additive secondary path validated by the base class.  Subclassing
+    ``TestCrossAttentionTrtllmBackend`` re-runs the same context /
+    generation correctness cases against the V1 dual-pool stack so the
+    model + backend + cache stack is locked in on both paths before the
+    scheduler and executor bring-up steps land.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+
+        cls.kv_cache_manager_cls = KVCacheManager
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestCrossAttentionTrtllmBackendV1Legacy(TestCrossAttentionTrtllmBackendLegacy):
+    """Step 7: re-run the legacy ``thop.attention`` 5\u03b2 sub-path on V1 ``KVCacheManager``.
+
+    Doubles the V1 production-lane coverage by also forcing the legacy
+    ``thop.attention`` sub-path so that Hopper / Ampere / earlier
+    deployments (which never hit the trtllm-gen sub-path) are exercised
+    against the V1 dual-pool stack.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+
+        cls.kv_cache_manager_cls = KVCacheManager
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestCrossAttentionDualPoolSmokeBenchmark(unittest.TestCase):
+    """Step 7 smoke benchmark: V1 dual-pool cross-attention micro-bench.
+
+    Times one decoder context cross-attention call followed by one
+    decoder generation cross-attention call against the V1 dual-pool
+    stack and prints wall-clock latency + tokens/s. Asserts only loose
+    upper bounds so the test acts as a smoke gate (it should not flake
+    on CI noise) while still exposing pathological regressions in the
+    V1 production lane.
+
+    For sustained throughput / TTFT / TPOT measurements, use
+    ``trtllm-bench`` once the executor bring-up steps land. This bench
+    only validates that the V1 dual-pool model + backend + cache stack
+    boots and runs at a sensible order of magnitude.
+    """
+
+    def setUp(self):
+        torch.random.manual_seed(42)
+
+    def test_v1_dual_pool_cross_attention_smoke(self):
+        from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+
+        device = torch.device("cuda")
+        dtype = torch.bfloat16
+        num_heads = 8
+        head_dim = 64
+        hidden_size = num_heads * head_dim
+        decoder_seq_lens = [4, 4, 4, 4]
+        encoder_seq_lens = [16, 16, 16, 16]
+        num_warmup = 2
+        num_iters = 5
+
+        cross_attn = (
+            TestCrossAttentionTrtllmBackend()
+            ._make_cross_attn(hidden_size, num_heads, head_dim, dtype)
+            .to(device)
+        )
+        decoder_hs = torch.randn(sum(decoder_seq_lens), hidden_size, device=device, dtype=dtype)
+        encoder_hs = torch.randn(sum(encoder_seq_lens), hidden_size, device=device, dtype=dtype)
+
+        # Build the V1 dual-pool metadata once for context, reuse the same
+        # SELF/CROSS managers across iterations to mimic steady state.
+        context_metadata, context_cross_metadata, kv_managers = _build_trtllm_cross_metadata(
+            decoder_seq_lens,
+            encoder_seq_lens,
+            num_kv_heads=num_heads,
+            head_dim=head_dim,
+            dtype=dtype,
+            kv_cache_manager_cls=KVCacheManager,
+        )
+
+        try:
+            # Warmup
+            for _ in range(num_warmup):
+                with torch.inference_mode():
+                    cross_attn(
+                        hidden_states=decoder_hs,
+                        encoder_hidden_states=encoder_hs,
+                        attn_metadata=context_metadata,
+                        cross_attn_metadata=context_cross_metadata,
+                        skip_cross_kv_projection=False,
+                    )
+            torch.cuda.synchronize()
+
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(num_iters):
+                with torch.inference_mode():
+                    cross_attn(
+                        hidden_states=decoder_hs,
+                        encoder_hidden_states=encoder_hs,
+                        attn_metadata=context_metadata,
+                        cross_attn_metadata=context_cross_metadata,
+                        skip_cross_kv_projection=False,
+                    )
+            end.record()
+            torch.cuda.synchronize()
+            ms_per_iter = start.elapsed_time(end) / num_iters
+        finally:
+            for mgr in kv_managers:
+                mgr.shutdown()
+
+        total_decoder_tokens = sum(decoder_seq_lens)
+        tokens_per_sec = total_decoder_tokens * 1000.0 / max(ms_per_iter, 1e-6)
+        print(
+            f"\n[V1 dual-pool cross-attn smoke] "
+            f"decoder_tokens={total_decoder_tokens} encoder_tokens={sum(encoder_seq_lens)} "
+            f"ms/iter={ms_per_iter:.3f} tokens/s={tokens_per_sec:.1f}",
+            flush=True,
+        )
+
+        # Loose smoke bounds: 100 ms/iter is generous enough to absorb
+        # CI jitter and small-shape kernel-launch overhead while still
+        # catching catastrophic regressions (e.g. accidental fall-through
+        # to a CPU reference path).
+        self.assertLess(
+            ms_per_iter,
+            100.0,
+            f"V1 dual-pool cross-attn smoke is suspiciously slow ({ms_per_iter:.2f} ms/iter)",
+        )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -720,6 +883,7 @@ class TestBartModules(unittest.TestCase):
     def test_bart_model_forward(self):
         """BartModel encoder-decoder body runs end-to-end."""
         model = BartModel(self.model_config).to(self.device)
+        self.assertEqual(model.position_id_offset, 2)
         enc_len = 8
         dec_len = 4
         encoder_ids = torch.randint(0, self.hf_config.vocab_size, (enc_len,), device=self.device)

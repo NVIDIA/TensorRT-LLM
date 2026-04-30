@@ -131,9 +131,15 @@ class KvCacheCreator:
         self._draft_config = draft_config
         self._skip_est = skip_est
 
-    def _get_model_kv_cache_manager_cls(self, model_engine: PyTorchModelEngine):
+    def _get_model_kv_cache_manager_cls(
+        self,
+        model_engine: PyTorchModelEngine,
+        kv_cache_config_override: Optional[KvCacheConfig] = None,
+    ):
+        kv_cache_config = (kv_cache_config_override if kv_cache_config_override
+                           is not None else self._kv_cache_config)
         return get_kv_cache_manager_cls(model_engine.model.model_config,
-                                        self._kv_cache_config)
+                                        kv_cache_config)
 
     def _get_kv_size_per_token(self):
         model_config = self._model_engine.model.model_config
@@ -542,13 +548,17 @@ class KvCacheCreator:
         # ---------------------------handle max_gpu_total_bytes---------------------------------
 
     def _create_kv_cache_manager(
-            self,
-            model_engine: PyTorchModelEngine,
-            estimating_kv_cache: bool = False) -> KVCacheManager:
+        self,
+        model_engine: PyTorchModelEngine,
+        estimating_kv_cache: bool = False,
+        kv_cache_config_override: Optional[KvCacheConfig] = None
+    ) -> KVCacheManager:
         mapping = self._mapping
         assert model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
+        kv_cache_config = (kv_cache_config_override if kv_cache_config_override
+                           is not None else self._kv_cache_config)
         kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
-            model_engine)
+            model_engine, kv_cache_config)
 
         # When using separate draft KV cache in one-model speculative decoding,
         # use layer_mask to include only target layers. The draft layers should
@@ -564,7 +574,7 @@ class KvCacheCreator:
             model_engine=model_engine,
             kv_cache_manager_cls=kv_cache_manager_cls,
             mapping=mapping,
-            kv_cache_config=self._kv_cache_config,
+            kv_cache_config=kv_cache_config,
             tokens_per_block=self._tokens_per_block,
             max_seq_len=self._max_seq_len,
             max_batch_size=self._max_batch_size,
@@ -674,15 +684,17 @@ class KvCacheCreator:
         # otherwise fall back to target model config for MTP).
         effective_draft_config = self._get_effective_draft_config()
 
+        draft_kv_config = (kv_cache_config_override if kv_cache_config_override
+                           is not None else self._kv_cache_config)
         # Get the appropriate KV cache manager class for the draft model
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-            effective_draft_config, self._kv_cache_config)
+            effective_draft_config, draft_kv_config)
 
         # Use V2 if enabled and the base class is KVCacheManager
         if draft_kv_cache_manager_cls == KVCacheManagerV2:
             if self._kv_connector_manager is not None or (
                     self._max_beam_width is not None and self._max_beam_width
-                    > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
+                    > 1) or draft_kv_config.event_buffer_max_size > 0 or (
                         self._cache_transceiver_config is not None
                         and self._cache_transceiver_config.backend is not None):
                 logger.warning(
@@ -696,7 +708,6 @@ class KvCacheCreator:
         # the sparse_attention_config. Get it from effective_draft_config which
         # falls back to the target model's config for MTP mode.
         sparse_attn_config = effective_draft_config.sparse_attention_config
-        draft_kv_config = kv_cache_config_override if kv_cache_config_override is not None else self._kv_cache_config
         return _create_kv_cache_manager(
             model_engine=None,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
@@ -720,7 +731,10 @@ class KvCacheCreator:
             num_layers=num_draft_layers,
         )
 
-    def _split_kv_cache_budget_for_draft(self) -> Optional[KvCacheConfig]:
+    def _split_kv_cache_budget_for_draft(
+        self,
+        kv_cache_config: Optional[KvCacheConfig] = None,
+    ) -> tuple[KvCacheConfig, Optional[KvCacheConfig]]:
         """Split max_gpu_total_bytes between target and draft KV caches.
 
         When using KVCacheManagerV2 with a separate draft KV cache,
@@ -728,13 +742,15 @@ class KvCacheCreator:
         draft combined.  This method splits the budget proportionally based
         on their per-token KV cache sizes.
 
-        Returns a cloned KvCacheConfig for the draft, or None if no split is
-        needed.  Also modifies self._kv_cache_config.max_gpu_total_bytes
-        in-place for the target.
+        Returns cloned target/draft configs for the current build.  When no
+        split is needed, the input config is returned as the target and the
+        draft config is None. The creator's base config is not mutated.
         """
-        total_budget = self._kv_cache_config.max_gpu_total_bytes
+        target_kv_cache_config = (kv_cache_config if kv_cache_config is not None
+                                  else self._kv_cache_config)
+        total_budget = target_kv_cache_config.max_gpu_total_bytes
         if total_budget is None or total_budget <= 0:
-            return None
+            return target_kv_cache_config, None
 
         total_kv = self._get_kv_size_per_token()
         target_kv = self._kv_cache_manager_cls.get_cache_size_per_token(
@@ -743,7 +759,7 @@ class KvCacheCreator:
             tokens_per_block=self._tokens_per_block)
         draft_kv = total_kv - target_kv
         if total_kv <= 0 or draft_kv <= 0:
-            return None
+            return target_kv_cache_config, None
 
         draft_budget = int(total_budget * draft_kv / total_kv)
         target_budget = total_budget - draft_budget
@@ -753,11 +769,11 @@ class KvCacheCreator:
             f"target={target_budget / GB:.2f} GiB ({target_kv}B/tok), "
             f"draft={draft_budget / GB:.2f} GiB ({draft_kv}B/tok)")
 
-        self._kv_cache_config.max_gpu_total_bytes = target_budget
-
-        draft_kv_cache_config = self._kv_cache_config.model_copy()
+        split_target_kv_cache_config = target_kv_cache_config.model_copy()
+        split_target_kv_cache_config.max_gpu_total_bytes = target_budget
+        draft_kv_cache_config = target_kv_cache_config.model_copy()
         draft_kv_cache_config.max_gpu_total_bytes = draft_budget
-        return draft_kv_cache_config
+        return split_target_kv_cache_config, draft_kv_cache_config
 
     def _is_encoder_decoder(self) -> bool:
         return self._model_engine.model.model_config.is_encoder_decoder
@@ -859,38 +875,62 @@ class KvCacheCreator:
             num_layers=num_layers,
         )
 
-    def _split_kv_cache_budget_for_cross(self) -> Optional[KvCacheConfig]:
-        """Split max_gpu_total_bytes between self and cross KV caches.
+    def _split_kv_cache_budget_for_cross(
+        self,
+        kv_cache_config: Optional[KvCacheConfig] = None,
+    ) -> tuple[KvCacheConfig, KvCacheConfig]:
+        """Split enc-dec KV cache budgets between self and cross pools.
 
-        For encoder-decoder models, the total KV cache budget is split using
-        ``cross_kv_cache_fraction``: the cross pool gets
-        ``fraction * total_budget`` and the self pool gets the remainder.
-
-        Returns a cloned KvCacheConfig for the cross pool, or None if no split
-        is needed.  Also modifies self._kv_cache_config.max_gpu_total_bytes
-        in-place for the self pool.
+        The cross manager must exist for every encoder-decoder runtime. During
+        both estimation and final construction, split the same memory-derived
+        budget sources used by the legacy TRT path: the free-memory fraction,
+        and any explicit ``max_gpu_total_bytes`` override. ``max_tokens`` is a
+        logical cap, not a memory split knob, so it is intentionally left
+        unchanged. The creator's base config is not mutated.
         """
-        fraction = self._kv_cache_config.cross_kv_cache_fraction
+        base_kv_cache_config = (kv_cache_config if kv_cache_config is not None
+                                else self._kv_cache_config)
+        fraction = base_kv_cache_config.cross_kv_cache_fraction
         if fraction is None:
-            return None
+            raise ValueError("Encoder-decoder models require "
+                             "cross_kv_cache_fraction to size the cross "
+                             "KV cache pool.")
 
-        total_budget = self._kv_cache_config.max_gpu_total_bytes
-        if total_budget is None or total_budget <= 0:
-            return None
+        self_kv_cache_config = base_kv_cache_config.model_copy()
+        cross_kv_cache_config = base_kv_cache_config.model_copy()
+        split_any_budget = False
 
-        cross_budget = int(total_budget * fraction)
-        self_budget = total_budget - cross_budget
+        free_fraction = base_kv_cache_config.free_gpu_memory_fraction
+        if free_fraction is not None:
+            cross_fraction = free_fraction * fraction
+            self_fraction = free_fraction - cross_fraction
+            logger.info(
+                "Splitting encoder-decoder free GPU memory fraction: "
+                f"total={free_fraction:.3f}, self={self_fraction:.3f}, cross={cross_fraction:.3f}"
+            )
+            self_kv_cache_config.free_gpu_memory_fraction = self_fraction
+            cross_kv_cache_config.free_gpu_memory_fraction = cross_fraction
+            split_any_budget = True
 
-        logger.info(f"Splitting KV cache budget for encoder-decoder: "
-                    f"total={total_budget / GB:.2f} GiB, "
-                    f"self={self_budget / GB:.2f} GiB ({1 - fraction:.0%}), "
-                    f"cross={cross_budget / GB:.2f} GiB ({fraction:.0%})")
+        total_budget = base_kv_cache_config.max_gpu_total_bytes
+        if total_budget is not None and total_budget > 0:
+            cross_budget = int(total_budget * fraction)
+            self_budget = total_budget - cross_budget
+            logger.info(
+                f"Splitting KV cache budget for encoder-decoder: "
+                f"total={total_budget / GB:.2f} GiB, "
+                f"self={self_budget / GB:.2f} GiB ({1 - fraction:.0%}), "
+                f"cross={cross_budget / GB:.2f} GiB ({fraction:.0%})")
+            self_kv_cache_config.max_gpu_total_bytes = self_budget
+            cross_kv_cache_config.max_gpu_total_bytes = cross_budget
+            split_any_budget = True
 
-        self._kv_cache_config.max_gpu_total_bytes = self_budget
+        if not split_any_budget:
+            raise ValueError("Unable to size the encoder-decoder cross KV "
+                             "cache pool: neither free_gpu_memory_fraction nor "
+                             "max_gpu_total_bytes is available.")
 
-        cross_kv_cache_config = self._kv_cache_config.model_copy()
-        cross_kv_cache_config.max_gpu_total_bytes = cross_budget
-        return cross_kv_cache_config
+        return self_kv_cache_config, cross_kv_cache_config
 
     def _create_cross_kv_cache_manager(
         self,
@@ -941,13 +981,15 @@ class KvCacheCreator:
         if self._skip_est:
             self.configure_kv_cache_capacity()
 
-        # For encoder-decoder models, split the total budget between self and
-        # cross pools first (using cross_kv_cache_fraction).  This must happen
+        # For encoder-decoder models, split the self/cross budgets first so
+        # every enc-dec build creates a real cross pool.  This must happen
         # before any draft split so that the draft split operates on the
         # already-reduced self-pool budget.
+        self_kv_cache_config = self._kv_cache_config
         cross_kv_cache_config = None
-        if not estimating_kv_cache and self._is_encoder_decoder():
-            cross_kv_cache_config = self._split_kv_cache_budget_for_cross()
+        if self._is_encoder_decoder():
+            self_kv_cache_config, cross_kv_cache_config = self._split_kv_cache_budget_for_cross(
+            )
 
         # For V2 with separate one-model draft KV cache, split the total budget
         # between target and draft before creating either manager.
@@ -958,7 +1000,8 @@ class KvCacheCreator:
         if (not estimating_kv_cache
                 and self._should_create_separate_draft_kv_cache()
                 and issubclass(self._kv_cache_manager_cls, KVCacheManagerV2)):
-            draft_kv_cache_config = self._split_kv_cache_budget_for_draft()
+            self_kv_cache_config, draft_kv_cache_config = (
+                self._split_kv_cache_budget_for_draft(self_kv_cache_config))
 
         # Also split for V1 VSWA. The VSWA pool is sized directly from
         # max_gpu_total_bytes and ignores max_tokens, so without splitting
@@ -971,17 +1014,24 @@ class KvCacheCreator:
         if (not estimating_kv_cache and has_draft
                 and draft_kv_cache_config is None
                 and not issubclass(self._kv_cache_manager_cls, KVCacheManagerV2)
-                and is_vswa_enabled(self._kv_cache_config)):
-            draft_kv_cache_config = self._split_kv_cache_budget_for_draft()
+                and is_vswa_enabled(self_kv_cache_config)):
+            self_kv_cache_config, draft_kv_cache_config = (
+                self._split_kv_cache_budget_for_draft(self_kv_cache_config))
 
         kv_cache_manager = self._create_kv_cache_manager(
-            self._model_engine, estimating_kv_cache)
+            self._model_engine,
+            estimating_kv_cache,
+            kv_cache_config_override=self_kv_cache_config)
 
-        if not estimating_kv_cache and self._kv_connector_manager is not None and self._draft_model_engine is not None:
+        if (not estimating_kv_cache and self._kv_connector_manager is not None
+                and self._draft_model_engine is not None):
             raise NotImplementedError(
                 "Connector manager is not supported for draft model.")
 
         draft_kv_cache_manager = None
+        draft_build_kv_cache_config = (draft_kv_cache_config
+                                       if draft_kv_cache_config is not None else
+                                       self_kv_cache_config)
 
         # Two-model speculative decoding: draft model has separate engine
         if self._draft_model_engine is not None:
@@ -989,19 +1039,15 @@ class KvCacheCreator:
                 assert draft_kv_cache_config is None, (
                     "KVCacheManagerV2 does not support two-model speculative "
                     "decoding with separate draft KV cache budget splitting.")
-            # For V1 VSWA, apply the draft's split budget temporarily
-            if draft_kv_cache_config is not None:
-                saved_budget = self._kv_cache_config.max_gpu_total_bytes
-                self._kv_cache_config.max_gpu_total_bytes = draft_kv_cache_config.max_gpu_total_bytes
             draft_kv_cache_manager = self._create_kv_cache_manager(
-                self._draft_model_engine, estimating_kv_cache)
-            if draft_kv_cache_config is not None:
-                self._kv_cache_config.max_gpu_total_bytes = saved_budget
+                self._draft_model_engine,
+                estimating_kv_cache,
+                kv_cache_config_override=draft_build_kv_cache_config)
         # One-model speculative decoding with different KV layouts
         elif self._should_create_separate_draft_kv_cache():
             draft_kv_cache_manager = self._create_one_model_draft_kv_cache_manager(
                 estimating_kv_cache,
-                kv_cache_config_override=draft_kv_cache_config)
+                kv_cache_config_override=draft_build_kv_cache_config)
 
         # Encoder-decoder cross-attention pool
         cross_kv_cache_manager = None
@@ -1577,6 +1623,7 @@ def create_py_executor_instance(
             scheduler_capacity=scheduler_capacity,
             draft_kv_cache_manager=draft_kv_cache_manager,
             cross_kv_cache_manager=cross_kv_cache_manager,
+            no_schedule_until_state=no_schedule_until_state,
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):
