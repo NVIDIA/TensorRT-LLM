@@ -14,8 +14,6 @@ cuda_graph_config:
   max_batch_size: 256
   batch_sizes: [1, 2, 4, 8, 16, 32, 64, 80, 96, 112, 128, 192, 208, 224, 240, 256]
 transforms:
-  optimize_rope:
-    stage: pattern_matcher
   fuse_gemms_mixed_children:
     enabled: false
   mlir_elementwise_fusion:
