@@ -9,7 +9,7 @@ license = "Apache-2.0"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "accelerate (>=1.7.0)",
-    "build (>=1.4.4,<2.0.0)",
+    "build (>=1.5.0,<2.0.0)",
     "colored (>=2.3.2,<3.0.0)",
     "cuda-python (>=13)",
     "diffusers (>=0.27.0)",
