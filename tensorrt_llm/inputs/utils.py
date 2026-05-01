@@ -14,7 +14,6 @@ import numpy as np
 import soundfile
 import torch
 from PIL import Image
-from torchvision.transforms import ToTensor
 from transformers import AutoProcessor, ProcessorMixin
 from transformers.utils import logging
 
@@ -83,6 +82,7 @@ def load_image(image: Union[str, Image.Image],
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
+    from torchvision.transforms import ToTensor
     if format == "pt":
         return ToTensor()(image).to(device=device)
     else:
@@ -113,6 +113,7 @@ async def async_load_image(
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
+    from torchvision.transforms import ToTensor
     if format == "pt":
         return await asyncio.to_thread(lambda: ToTensor()
                                        (image).to(device=device))

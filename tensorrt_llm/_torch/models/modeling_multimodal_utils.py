@@ -25,7 +25,6 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from PIL import Image
-from torchvision.transforms import Normalize, Resize, ToTensor
 
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm.inputs.multimodal import MultimodalParams
@@ -466,6 +465,7 @@ def preprocess_dispatch(image,
                         use_fast: bool = True):
 
     if use_fast:
+        from torchvision.transforms import Normalize, Resize, ToTensor
         image = ToTensor()(image) if isinstance(image, Image.Image) else image
         if device is not None or dtype is not None:
             image = image.to(device=device, dtype=dtype)
@@ -609,6 +609,7 @@ def dynamic_preprocess_torch(image,
         processed_images.append(thumbnail_img)
 
     images = torch.cat(processed_images, dim=0)
+    from torchvision.transforms import Normalize
     images = Normalize(image_processor.image_mean,
                        image_processor.image_std,
                        inplace=True)(images)
@@ -628,6 +629,7 @@ def dynamic_preprocess_dispatch(image,
                                 use_fast: bool = True):
 
     if use_fast:
+        from torchvision.transforms import ToTensor
         return dynamic_preprocess_torch(
             ToTensor()(image) if isinstance(image, Image.Image) else image,
             image_processor,
@@ -799,6 +801,7 @@ def dynamic_s2_preprocess_torch(image,
         processed_images.append(split_img)
 
     images = torch.cat(processed_images, dim=0)
+    from torchvision.transforms import Normalize
     images = Normalize(image_processor.image_mean,
                        image_processor.image_std,
                        inplace=True)(images)
@@ -817,6 +820,7 @@ def dynamic_s2_preprocess_dispatch(image,
                                    use_fast: bool = True):
 
     if use_fast:
+        from torchvision.transforms import ToTensor
         return dynamic_s2_preprocess_torch(
             ToTensor()(image) if isinstance(image, Image.Image) else image,
             image_processor,

@@ -18,10 +18,8 @@ from types import MethodType
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-import torchvision
 import transformers
 from einops import rearrange
-from torchvision.transforms.functional import get_image_size, pad, resize
 from transformers.image_processing_utils import BatchFeature
 from transformers.image_utils import (ImageInput, is_pil_image,
                                       make_list_of_images, valid_images)
@@ -337,6 +335,8 @@ def dynamic_preprocess(
 
     Ref code: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/processing_phi4mm.py#L201
     """
+    from torchvision.transforms.functional import get_image_size, pad, resize
+
     # Get target_width, target_height and target_aspect_ratio.
     orig_width, orig_height = get_image_size(image)
     w_crop_num = math.ceil(orig_width / float(image_size))
@@ -441,6 +441,7 @@ def image_preprocess(
 
     Ref code: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/processing_phi4mm.py#L161
     """
+    import torchvision
     images = make_list_of_images(images)
     if not valid_images(images):
         raise TypeError(

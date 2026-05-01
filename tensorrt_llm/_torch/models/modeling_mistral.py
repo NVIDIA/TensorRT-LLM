@@ -3,7 +3,6 @@ import dataclasses
 from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
-import torchvision
 from mistral_common.tokens.tokenizers.multimodal import ImageEncoder
 from PIL import Image
 from torch import nn
@@ -901,6 +900,7 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         # computed above. Note that as far as this function is concerned, the original sizes for
         # batching purposes can be deduced from looking at the tensors in `pixel_values`, NOT in
         # `image_sizes`.
+        import torchvision
         pixel_values = [
             torchvision.transforms.v2.functional.pad(
                 image,
