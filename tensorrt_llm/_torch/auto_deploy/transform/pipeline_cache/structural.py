@@ -200,19 +200,21 @@ def _meta_value_from_spec(spec: Mapping[str, Any], fake_mode: FakeTensorMode) ->
     raise ValueError(f"Pipeline cache: unknown placeholder meta value spec {spec!r}.")
 
 
-def _concrete_shape_dim(dim: Any) -> int:
-    try:
-        return int(dim)
-    except (TypeError, ValueError):
-        node = getattr(dim, "node", None)
-        hint = getattr(node, "hint", None)
-        if hint is not None:
-            return int(hint)
-    raise ValueError(f"Pipeline cache: cannot serialize symbolic shape dimension {dim!r}.")
-
-
 def _concrete_shape(shape: Any) -> tuple[int, ...]:
-    return tuple(_concrete_shape_dim(dim) for dim in shape)
+    def concrete_dim(dim: Any) -> int:
+        try:
+            return int(dim)
+        except (TypeError, ValueError):
+            node = getattr(dim, "node", None)
+            hint = getattr(node, "hint", None)
+            if hint is not None:
+                return int(hint)
+        raise ValueError(f"Pipeline cache: cannot serialize symbolic shape dimension {dim!r}.")
+
+    concrete_dims: list[int] = []
+    for dim in shape:
+        concrete_dims.append(concrete_dim(dim))
+    return tuple(concrete_dims)
 
 
 def _contains_non_durable_meta_ref(value: Any) -> bool:
