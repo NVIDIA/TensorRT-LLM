@@ -555,16 +555,18 @@ class PyExecutor:
         # mutate them from background request/stat threads without locking.
         # All ranks: local per-iteration payloads waiting to piggyback on the
         # next ADP rank-state allgather.
-        self._pending_adp_iter_stats_payloads: Dict[
-            int, RankIterStatsPayload] = {}
+        self._pending_adp_iter_stats_payloads: Dict[int,
+                                                    RankIterStatsPayload] = {}
         # Iteration IDs whose pending payload is an explicit zero placeholder,
         # not real measured local stats.
         self._synthetic_adp_iter_stats_iters: Set[int] = set()
         # Rank 0 only: full IterationStats objects waiting for ADP aggregation.
         self._pending_adp_iter_stats: Dict[int, IterationStats] = {}
-        # Rank 0 only: matching per-request stats for pending IterationStats.
-        self._pending_adp_req_stats: Dict[int, Optional[List[
-            RequestStats]]] = {}
+        # Rank 0 only: per-request stats preserved for compatibility. TODO:
+        # aggregate RequestStats across ADP ranks before treating them as
+        # engine-wide request details.
+        self._pending_adp_req_stats: Dict[int,
+                                          Optional[List[RequestStats]]] = {}
         # Rank 0 only: KV iteration stats captured with pending IterationStats.
         self._pending_adp_kv_iter_stats: Dict[int, object] = {}
         self.gather_all_responses = False
@@ -1527,9 +1529,13 @@ class PyExecutor:
                 return
 
             self._aggregate_adp_iter_stats(stats, all_rank_states)
+            # TODO: RequestStats are still rank-0-only under Attention-DP.
+            # Preserve the existing get_stats() shape for compatibility, but
+            # do not treat these request details as engine-wide.
+            req_stats = self._pending_adp_req_stats.get(iter_stats_iter)
             self._append_iter_stats(
                 stats,
-                self._pending_adp_req_stats.get(iter_stats_iter),
+                req_stats,
                 kv_iter_stats=self._pending_adp_kv_iter_stats.get(
                     iter_stats_iter),
             )
