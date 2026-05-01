@@ -214,7 +214,7 @@ input [
   },
   {
     name: "early_stopping"
-    data_type: TYPE_BOOL
+    data_type: TYPE_INT32
     dims: [ 1 ]
     reshape: { shape: [ ] }
     optional: true

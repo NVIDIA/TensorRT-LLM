@@ -382,7 +382,11 @@ std::optional<tensorrt_llm::executor::Request> getRequest(
     pushTensor<int32_t>(inputsTensors, InputFieldsNames::topPResetIds, nvinfer1::DataType::kINT32, {1}, {25});
     pushTensor<float>(inputsTensors, InputFieldsNames::temperature, nvinfer1::DataType::kFLOAT, {1}, {0.3});
     pushTensor<float>(inputsTensors, InputFieldsNames::lengthPenalty, nvinfer1::DataType::kFLOAT, {1}, {0.4});
-    pushTensor<int32_t>(inputsTensors, InputFieldsNames::earlyStopping, nvinfer1::DataType::kINT32, {1}, {4});
+    // early_stopping is a HuggingFace-style tri-state: 0=heuristic, 1=fast,
+    // 2=stop only when all beams emit <eos>. Push 2 to lock in INT32 wire-format
+    // for the canonical-beam-search mode (was silently truncated under the old
+    // TYPE_BOOL config declaration; cf. PR fixing the wire-protocol type).
+    pushTensor<int32_t>(inputsTensors, InputFieldsNames::earlyStopping, nvinfer1::DataType::kINT32, {1}, {2});
     pushTensor<float>(inputsTensors, InputFieldsNames::repetitionPenalty, nvinfer1::DataType::kFLOAT, {1}, {0.8});
     pushTensor<int32_t>(inputsTensors, InputFieldsNames::minTokens, nvinfer1::DataType::kINT32, {1}, {45});
     pushTensor<float>(inputsTensors, InputFieldsNames::beamSearchDiversityRate, nvinfer1::DataType::kFLOAT, {1}, {0.1});
@@ -580,7 +584,7 @@ void checkRequest(tensorrt_llm::executor::Request const& request,
     EXPECT_EQ(samplingConfig.getTopPResetIds().value(), 25);
     EXPECT_EQ(samplingConfig.getTemperature().value(), 0.3f);
     EXPECT_EQ(samplingConfig.getLengthPenalty().value(), 0.4f);
-    EXPECT_EQ(samplingConfig.getEarlyStopping().value(), 4);
+    EXPECT_EQ(samplingConfig.getEarlyStopping().value(), 2);
     EXPECT_EQ(samplingConfig.getRepetitionPenalty().value(), 0.8f);
     EXPECT_EQ(samplingConfig.getMinTokens().value(), 45);
     EXPECT_EQ(samplingConfig.getBeamSearchDiversityRate().value(), 0.1f);
