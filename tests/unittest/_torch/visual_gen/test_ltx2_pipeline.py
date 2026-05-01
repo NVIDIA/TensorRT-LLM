@@ -513,6 +513,7 @@ class TestTwoStageLoRAHelpers:
         """Merge then unmerge in BF16 should leave weights approximately unchanged."""
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
             _apply_lora_deltas,
+            _subtract_dense_lora_deltas,
         )
 
         device = "cuda"
@@ -522,13 +523,16 @@ class TestTwoStageLoRAHelpers:
         delta = torch.randn(64, 64, device=device) * 0.01
         deltas = {"weight": delta}
 
-        applied, _ = _apply_lora_deltas(linear, deltas, sign=1.0)
+        applied, saved_state, snapshot_required = _apply_lora_deltas(linear, deltas, sign=1.0)
         assert applied == 1, "Expected one parameter to be modified"
+        assert saved_state == {}, "Dense BF16 weights should not be snapshotted"
+        assert snapshot_required == 0
         assert not torch.allclose(linear.weight.data, original_weight), (
             "Weights should have changed after applying delta"
         )
 
-        _apply_lora_deltas(linear, deltas, sign=-1.0)
+        removed = _subtract_dense_lora_deltas(linear, deltas, saved_state)
+        assert removed == 1, "Expected one dense parameter to be unmerged"
         drift = (linear.weight.data.float() - original_weight.float()).abs().max().item()
         assert drift < 0.05, f"bf16 merge/unmerge drift too large: {drift:.2e}"
 
@@ -543,8 +547,9 @@ class TestTwoStageLoRAHelpers:
         original_weight = linear.weight.data.clone()
 
         deltas = {"nonexistent_param.weight": torch.randn(8, 8, device=device)}
-        applied, _ = _apply_lora_deltas(linear, deltas, sign=1.0)
+        applied, _, snapshot_required = _apply_lora_deltas(linear, deltas, sign=1.0)
         assert applied == 0
+        assert snapshot_required == 0
         assert torch.allclose(linear.weight.data, original_weight)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -552,6 +557,7 @@ class TestTwoStageLoRAHelpers:
         """After N merge+unmerge rounds the drift stays bounded."""
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
             _apply_lora_deltas,
+            _subtract_dense_lora_deltas,
         )
 
         device = "cuda"
@@ -561,18 +567,20 @@ class TestTwoStageLoRAHelpers:
         deltas = {"weight": torch.randn(64, 64, device=device) * 0.01}
         rounds = 10
         for _ in range(rounds):
-            _apply_lora_deltas(model, deltas, sign=1.0)
-            _apply_lora_deltas(model, deltas, sign=-1.0)
+            _, saved_state, snapshot_required = _apply_lora_deltas(model, deltas, sign=1.0)
+            assert saved_state == {}, "Dense BF16 weights should not be snapshotted"
+            assert snapshot_required == 0
+            _subtract_dense_lora_deltas(model, deltas, saved_state)
 
         drift = (model.weight.data.float() - original.float()).abs().max().item()
         assert drift < 0.1, f"bf16 drift after {rounds} rounds too large: {drift:.2e}"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_restore_lora_state_exact(self):
-        """_restore_lora_state restores original quantized tensors exactly."""
+    def test_dense_lora_state_not_saved_and_subtract_restores(self):
+        """Dense weights are restored by subtraction without snapshot storage."""
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
             _apply_lora_deltas,
-            _restore_lora_state,
+            _subtract_dense_lora_deltas,
         )
 
         device = "cuda"
@@ -580,13 +588,16 @@ class TestTwoStageLoRAHelpers:
         original_weight = linear.weight.data.clone()
 
         deltas = {"weight": torch.randn(32, 32, device=device) * 0.1}
-        _, saved_state = _apply_lora_deltas(linear, deltas, sign=1.0)
+        _, saved_state, snapshot_required = _apply_lora_deltas(linear, deltas, sign=1.0)
 
+        assert saved_state == {}, "Dense FP32 weights should not be snapshotted"
+        assert snapshot_required == 0
         assert not torch.allclose(linear.weight.data, original_weight)
 
-        _restore_lora_state(linear, saved_state)
+        removed = _subtract_dense_lora_deltas(linear, deltas, saved_state)
+        assert removed == 1
         assert torch.allclose(linear.weight.data, original_weight), (
-            "_restore_lora_state should restore weights exactly"
+            "Dense LoRA subtraction should restore weights"
         )
 
 
@@ -942,6 +953,7 @@ class TestLTX2TwoStagePipelineLoading:
         """Loaded LoRA deltas should match transformer parameter names."""
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
             _apply_lora_deltas,
+            _subtract_dense_lora_deltas,
         )
 
         args = VisualGenArgs(
@@ -955,7 +967,7 @@ class TestLTX2TwoStagePipelineLoading:
 
         pipeline = PipelineLoader(args).load(skip_warmup=True)
         try:
-            applied, saved_state = _apply_lora_deltas(
+            applied, saved_state, snapshot_required = _apply_lora_deltas(
                 pipeline.transformer,
                 pipeline._distilled_lora_deltas,
                 sign=1.0,
@@ -966,11 +978,14 @@ class TestLTX2TwoStagePipelineLoading:
             print(f"\n[Two-Stage] LoRA apply rate: {match_rate:.1f}% ({applied}/{total})")
             assert match_rate > 99.0, f"Expected >99% LoRA match rate, got {match_rate:.1f}%"
 
-            # Verify unmerge
-            removed, _ = _apply_lora_deltas(
+            assert saved_state == {}, "BF16 checkpoint should not snapshot dense weights"
+            assert snapshot_required == 0
+
+            # Verify dense unmerge by subtraction
+            removed = _subtract_dense_lora_deltas(
                 pipeline.transformer,
                 pipeline._distilled_lora_deltas,
-                sign=-1.0,
+                saved_state,
             )
             assert removed == applied, (
                 f"Unmerge applied {removed} deltas, but merge applied {applied}"

@@ -104,6 +104,11 @@ class UlyssesAttention(AttentionBackend):
 
         B, seq_len, _, Hp, D = qkv.shape
 
+        # Caller passed pre-A2A (sharded) seq_len; the inner backend
+        # reshapes by it, so hand it the post-A2A length instead.
+        kwargs["seq_len"] = seq_len
+        kwargs["seq_len_kv"] = seq_len
+
         output = self.inner_backend.forward(q=qkv, k=None, v=None, **kwargs)
 
         return self._output_a2a(output, batch_size, seq_len)
@@ -122,11 +127,17 @@ class UlyssesAttention(AttentionBackend):
             v = all_to_all_4d(v, scatter_dim=2, gather_dim=1, process_group=self.process_group)
 
         seq_len_full = q.shape[1]
+        kv_seq_len_full = k.shape[1]
 
         if self.inner_backend.preferred_layout == AttentionTensorLayout.HND:
             q = q.transpose(1, 2)
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
+
+        # Caller passed pre-A2A (sharded) seq_lens; hand the inner
+        # backend the post-A2A lengths instead.
+        kwargs["seq_len"] = seq_len_full
+        kwargs["seq_len_kv"] = kv_seq_len_full
 
         output = self.inner_backend.forward(q=q, k=k, v=v, **kwargs)
 
