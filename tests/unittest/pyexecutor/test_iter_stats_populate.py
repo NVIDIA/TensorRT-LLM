@@ -557,18 +557,32 @@ def _build_adp_stats_harness(pending_stats, *, rank=0, tp_rank=0):
     harness.stats = []
     harness.max_stats_len = 64
     harness._latest_kv_iter_stats = "current-kv"
-    harness._pending_adp_iter_stats = pending_stats if rank == 0 else None
-    harness._pending_adp_req_stats = ["req-stats"] if rank == 0 else None
-    harness._pending_adp_kv_iter_stats = "pending-kv" if rank == 0 else None
-    harness._pending_adp_iter_stats_payload = PyExecutor._make_adp_iter_stats_payload(
-        harness, pending_stats
+    pending_payload = PyExecutor._make_adp_iter_stats_payload(
+        harness, pending_stats)
+    harness._pending_adp_iter_stats_payloads = {
+        pending_payload.iter_stats_iter: pending_payload
+    }
+    harness._synthetic_adp_iter_stats_iters = set()
+    harness._pending_adp_iter_stats = (
+        {pending_payload.iter_stats_iter: pending_stats} if rank == 0 else {}
+    )
+    harness._pending_adp_req_stats = (
+        {pending_payload.iter_stats_iter: ["req-stats"]} if rank == 0 else {}
+    )
+    harness._pending_adp_kv_iter_stats = (
+        {pending_payload.iter_stats_iter: "pending-kv"} if rank == 0 else {}
     )
 
     for method_name in (
         "_aggregate_adp_iter_stats",
         "_append_iter_stats",
-        "_clear_pending_adp_iter_stats",
+        "_clear_pending_adp_iter_stats_through",
+        "_drop_pending_adp_iter_stats_before",
+        "_ensure_adp_zero_iter_stats_payload",
         "_finalize_pending_adp_iter_stats",
+        "_make_adp_iter_stats_payload",
+        "_next_adp_iter_stats_payload",
+        "_queue_adp_iter_stats",
     ):
         setattr(
             harness,
@@ -596,7 +610,7 @@ def test_attention_dp_aggregation_sums_rank_local_fields_only():
     )
     harness = _build_adp_stats_harness(rank0_stats)
     rank0_state = RankState(
-        rank=0, iter_stats=harness._pending_adp_iter_stats_payload)
+        rank=0, iter_stats=harness._next_adp_iter_stats_payload())
     rank1_state = RankState(
         rank=1,
         iter_stats=RankIterStatsPayload(
@@ -633,20 +647,20 @@ def test_attention_dp_aggregation_sums_rank_local_fields_only():
     assert ifb.num_queued_gen_kv_tokens == 800
     assert req_stats == ["req-stats"]
     assert kv_iter_stats == "pending-kv"
-    assert harness._pending_adp_iter_stats_payload is None
+    assert harness._pending_adp_iter_stats_payloads == {}
 
 
 def test_attention_dp_aggregation_waits_for_complete_matching_payloads():
     rank0_stats = _make_adp_iteration_stats(iter_id=9, num_context_requests=1)
     harness = _build_adp_stats_harness(rank0_stats)
     rank0_state = RankState(
-        rank=0, iter_stats=harness._pending_adp_iter_stats_payload)
+        rank=0, iter_stats=harness._next_adp_iter_stats_payload())
     missing_rank1_state = RankState(rank=1)
 
     harness._finalize_pending_adp_iter_stats([rank0_state, missing_rank1_state])
 
     assert harness.stats == []
-    assert harness._pending_adp_iter_stats_payload is rank0_state.iter_stats
+    assert harness._next_adp_iter_stats_payload() is rank0_state.iter_stats
 
     mismatched_rank1_state = RankState(
         rank=1,
@@ -660,7 +674,41 @@ def test_attention_dp_aggregation_waits_for_complete_matching_payloads():
     harness._finalize_pending_adp_iter_stats([rank0_state, mismatched_rank1_state])
 
     assert harness.stats == []
-    assert harness._pending_adp_iter_stats_payload is rank0_state.iter_stats
+    assert harness._next_adp_iter_stats_payload() is rank0_state.iter_stats
+
+
+def test_attention_dp_aggregation_buffers_multiple_pending_payloads():
+    rank0_stats_9 = _make_adp_iteration_stats(iter_id=9, num_context_requests=1)
+    rank0_stats_10 = _make_adp_iteration_stats(iter_id=10, num_context_requests=2)
+    harness = _build_adp_stats_harness(rank0_stats_9)
+
+    harness._queue_adp_iter_stats(rank0_stats_10, ["req-stats-10"])
+
+    assert sorted(harness._pending_adp_iter_stats_payloads) == [9, 10]
+    assert harness._next_adp_iter_stats_payload().iter_stats_iter == 9
+
+
+def test_attention_dp_aggregation_aligns_non_rank0_to_rank0_iter():
+    rank1_stats = _make_adp_iteration_stats(iter_id=10, num_context_requests=3)
+    harness = _build_adp_stats_harness(rank1_stats, rank=1, tp_rank=1)
+    rank0_state = RankState(
+        rank=0,
+        iter_stats=RankIterStatsPayload(
+            has_iter_stats=1,
+            iter_stats_iter=9,
+            num_context_requests=1,
+        ),
+    )
+    rank1_state = RankState(
+        rank=1, iter_stats=harness._next_adp_iter_stats_payload())
+
+    harness._finalize_pending_adp_iter_stats([rank0_state, rank1_state])
+
+    next_payload = harness._next_adp_iter_stats_payload()
+    assert next_payload.iter_stats_iter == 9
+    assert next_payload.num_context_requests == 0
+    assert 9 in harness._synthetic_adp_iter_stats_iters
+    assert 10 in harness._pending_adp_iter_stats_payloads
 
 
 # ---------------------------------------------------------------------------

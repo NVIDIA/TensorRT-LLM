@@ -8,7 +8,7 @@ import traceback
 from contextlib import contextmanager
 from enum import IntEnum
 from queue import Queue
-from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -541,11 +541,13 @@ class PyExecutor:
         self._kv_iter_stats_interval = getattr(
             getattr(self.llm_args, 'kv_cache_config', None),
             'iteration_stats_interval', 1)
-        self._pending_adp_iter_stats_payload: Optional[
-            RankIterStatsPayload] = None
-        self._pending_adp_iter_stats: Optional[IterationStats] = None
-        self._pending_adp_req_stats: Optional[List[RequestStats]] = None
-        self._pending_adp_kv_iter_stats = None
+        self._pending_adp_iter_stats_payloads: Dict[
+            int, RankIterStatsPayload] = {}
+        self._synthetic_adp_iter_stats_iters: Set[int] = set()
+        self._pending_adp_iter_stats: Dict[int, IterationStats] = {}
+        self._pending_adp_req_stats: Dict[int, Optional[List[
+            RequestStats]]] = {}
+        self._pending_adp_kv_iter_stats: Dict[int, object] = {}
         self.gather_all_responses = False
 
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -1348,26 +1350,58 @@ class PyExecutor:
         stats: IterationStats,
         req_stats: Optional[List[RequestStats]] = None,
     ) -> None:
-        if self._pending_adp_iter_stats_payload is not None:
+        payload = self._make_adp_iter_stats_payload(stats)
+        iter_id = payload.iter_stats_iter
+
+        if (iter_id in self._pending_adp_iter_stats_payloads
+                and iter_id not in self._synthetic_adp_iter_stats_iters):
             logger.warning(
-                "Replacing an ungathered attention-DP IterationStats payload "
-                f"for iter {self._pending_adp_iter_stats_payload.iter_stats_iter} "
-                f"with iter {stats.iter}"
+                "Replacing duplicate attention-DP IterationStats payload "
+                f"for iter {iter_id}"
             )
 
-        self._pending_adp_iter_stats_payload = (
-            self._make_adp_iter_stats_payload(stats))
+        self._pending_adp_iter_stats_payloads[iter_id] = payload
+        self._synthetic_adp_iter_stats_iters.discard(iter_id)
 
         if self.dist.rank == 0:
-            self._pending_adp_iter_stats = stats
-            self._pending_adp_req_stats = req_stats
-            self._pending_adp_kv_iter_stats = self._latest_kv_iter_stats
+            self._pending_adp_iter_stats[iter_id] = stats
+            self._pending_adp_req_stats[iter_id] = req_stats
+            self._pending_adp_kv_iter_stats[iter_id] = self._latest_kv_iter_stats
 
-    def _clear_pending_adp_iter_stats(self) -> None:
-        self._pending_adp_iter_stats_payload = None
-        self._pending_adp_iter_stats = None
-        self._pending_adp_req_stats = None
-        self._pending_adp_kv_iter_stats = None
+    def _next_adp_iter_stats_payload(self) -> Optional[RankIterStatsPayload]:
+        if not self._pending_adp_iter_stats_payloads:
+            return None
+        iter_id = min(self._pending_adp_iter_stats_payloads)
+        return self._pending_adp_iter_stats_payloads[iter_id]
+
+    def _ensure_adp_zero_iter_stats_payload(self, iter_id: int) -> None:
+        if iter_id in self._pending_adp_iter_stats_payloads:
+            return
+        self._pending_adp_iter_stats_payloads[iter_id] = RankIterStatsPayload(
+            has_iter_stats=1,
+            iter_stats_iter=iter_id,
+        )
+        self._synthetic_adp_iter_stats_iters.add(iter_id)
+
+    def _drop_pending_adp_iter_stats_before(self, iter_id: int) -> None:
+        for pending_iter in list(self._pending_adp_iter_stats_payloads):
+            if pending_iter >= iter_id:
+                continue
+            self._pending_adp_iter_stats_payloads.pop(pending_iter, None)
+            self._synthetic_adp_iter_stats_iters.discard(pending_iter)
+            self._pending_adp_iter_stats.pop(pending_iter, None)
+            self._pending_adp_req_stats.pop(pending_iter, None)
+            self._pending_adp_kv_iter_stats.pop(pending_iter, None)
+
+    def _clear_pending_adp_iter_stats_through(self, iter_id: int) -> None:
+        for pending_iter in list(self._pending_adp_iter_stats_payloads):
+            if pending_iter > iter_id:
+                continue
+            self._pending_adp_iter_stats_payloads.pop(pending_iter, None)
+            self._synthetic_adp_iter_stats_iters.discard(pending_iter)
+            self._pending_adp_iter_stats.pop(pending_iter, None)
+            self._pending_adp_req_stats.pop(pending_iter, None)
+            self._pending_adp_kv_iter_stats.pop(pending_iter, None)
 
     def _aggregate_adp_iter_stats(self, stats: IterationStats,
                                   all_rank_states: List[RankState]) -> None:
@@ -1396,45 +1430,53 @@ class PyExecutor:
         ]
         if not pending_states:
             return
-        if len(pending_states) != len(all_rank_states):
-            logger.warning(
-                "Skipping attention-DP IterationStats aggregation: received "
-                f"{len(pending_states)}/{len(all_rank_states)} rank payloads")
+
+        rank0_state = next((s for s in all_rank_states if s.rank == 0), None)
+        if rank0_state is None or not rank0_state.iter_stats.has_iter_stats:
+            logger.debug(
+                "Waiting for rank 0 attention-DP IterationStats payload before "
+                "aggregation")
             return
 
-        pending_iters = {s.iter_stats.iter_stats_iter for s in pending_states}
-        if len(pending_iters) != 1:
-            logger.warning(
-                "Skipping attention-DP IterationStats aggregation: mixed "
-                f"iteration payloads {sorted(pending_iters)}")
-            return
+        # Rank 0 owns the stats queue consumed by get_stats(), so converge all
+        # ranks to rank 0's pending iteration. Ranks without local work for
+        # that iteration contribute an explicit zero payload on the next
+        # piggyback allgather instead of forcing a mixed-iteration skip.
+        iter_stats_iter = rank0_state.iter_stats.iter_stats_iter
+        self._drop_pending_adp_iter_stats_before(iter_stats_iter)
+        self._ensure_adp_zero_iter_stats_payload(iter_stats_iter)
 
-        iter_stats_iter = next(iter(pending_iters))
-        local_pending = self._pending_adp_iter_stats_payload
-        if (local_pending is None
-                or local_pending.iter_stats_iter != iter_stats_iter):
-            logger.warning(
-                "Skipping attention-DP IterationStats aggregation: local "
-                f"pending payload does not match gathered iter {iter_stats_iter}"
-            )
+        matching_states = [
+            s for s in all_rank_states
+            if (s.iter_stats.has_iter_stats
+                and s.iter_stats.iter_stats_iter == iter_stats_iter)
+        ]
+        if len(matching_states) != len(all_rank_states):
+            logger.debug(
+                "Waiting for attention-DP IterationStats payloads for rank 0 "
+                f"iter {iter_stats_iter}: received "
+                f"{len(matching_states)}/{len(all_rank_states)} matching "
+                "rank payloads")
             return
 
         if self.dist.rank == 0:
-            if self._pending_adp_iter_stats is None:
+            stats = self._pending_adp_iter_stats.get(iter_stats_iter)
+            if stats is None:
                 logger.warning(
                     "Skipping attention-DP IterationStats aggregation on "
-                    "rank 0: pending IterationStats object is missing")
+                    f"rank 0: pending IterationStats object is missing for "
+                    f"iter {iter_stats_iter}")
                 return
 
-            self._aggregate_adp_iter_stats(self._pending_adp_iter_stats,
-                                           all_rank_states)
+            self._aggregate_adp_iter_stats(stats, all_rank_states)
             self._append_iter_stats(
-                self._pending_adp_iter_stats,
-                self._pending_adp_req_stats,
-                kv_iter_stats=self._pending_adp_kv_iter_stats,
+                stats,
+                self._pending_adp_req_stats.get(iter_stats_iter),
+                kv_iter_stats=self._pending_adp_kv_iter_stats.get(
+                    iter_stats_iter),
             )
 
-        self._clear_pending_adp_iter_stats()
+        self._clear_pending_adp_iter_stats_through(iter_stats_iter)
 
     def _append_iter_stats(self,
                            stats: IterationStats,
@@ -2971,7 +3013,7 @@ class PyExecutor:
             # info, the allgather position may need to be revisited.
             all_rank_states = self.adp_router.gather_all_rank_states(
                 active_requests,
-                iter_stats_payload=self._pending_adp_iter_stats_payload)
+                iter_stats_payload=self._next_adp_iter_stats_payload())
             self._finalize_pending_adp_iter_stats(all_rank_states)
             all_ranks_num_active_requests = [
                 s.num_active_requests for s in all_rank_states
