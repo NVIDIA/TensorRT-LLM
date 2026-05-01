@@ -508,6 +508,57 @@ def block_matches_stage(block: Block, stage: Stage) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# CBTS Layer 3 split-count heuristic: per-stage narrowed test count
+# ---------------------------------------------------------------------------
+
+
+def compute_stage_test_counts(
+    yaml_index: "YAMLIndex",
+    stages: dict[str, "Stage"],
+    affected_stages: set[str],
+    block_filters: dict[tuple[str, int], dict[str, set[str]]],
+) -> dict[str, int]:
+    """Sum the kept-test count per affected stage across matching blocks.
+
+    Used by Groovy launchTestJobs to decide whether to collapse the stage's
+    pytest-split splits to 1 (when narrowed_count < 20). The keep filter
+    here mirrors the one in `write_filtered_test_db` exactly so the count
+    matches what trt-test-db will eventually render.
+    """
+    block_by_key: dict[tuple[str, int], Block] = {
+        (b.yaml_stem, b.block_index): b for b in yaml_index.blocks
+    }
+    counts: dict[str, int] = {}
+    for stage_name in affected_stages:
+        stage = stages.get(stage_name)
+        if stage is None:
+            continue
+        total = 0
+        for (yaml_stem, idx), prefix_to_waives in block_filters.items():
+            if yaml_stem != stage.yaml_stem:
+                continue
+            block = block_by_key.get((yaml_stem, idx))
+            if block is None or not block_matches_stage(block, stage):
+                continue
+            kept: list[str] = []
+            for t in block.tests:
+                target = _entry_target(t)
+                matched_waives: set[str] = set()
+                for prefix, waives in prefix_to_waives.items():
+                    if _target_in_filter_subtree(target, prefix):
+                        matched_waives |= waives
+                if not matched_waives:
+                    continue
+                if any(_entry_applies_to_waive(t, w) for w in matched_waives):
+                    kept.append(t)
+            # Safety fallback mirrors write_filtered_test_db: when the
+            # narrowing would empty the block, the original tests stay.
+            total += len(kept) if kept else len(block.tests)
+        counts[stage_name] = total
+    return counts
+
+
+# ---------------------------------------------------------------------------
 # CBTS Layer 3: filtered test-db YAML generation
 # ---------------------------------------------------------------------------
 

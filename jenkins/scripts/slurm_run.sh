@@ -102,8 +102,13 @@ if [ "${SLURM_JOB_NUM_NODES:-1}" -eq 1 ] || \
     done
 fi
 
-# Turn off "exit on error" so the following lines always run
+# Turn off "exit on error" so the following lines always run.
+# `set -E` (errtrace, set on line 4) makes the ERR trap fire even after
+# `set +e`, so without removing the trap a non-zero pytest exit would
+# trigger the trap's `exit $rc` and skip the rest of this script
+# (including the CBTS exit-5 tolerance below).
 set +e
+trap - ERR
 
 pytest_exit_code=0
 perf_check_exit_code=0

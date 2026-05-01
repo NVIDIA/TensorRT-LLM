@@ -47,7 +47,13 @@ from typing import Optional
 # Make sibling modules importable when invoked as `python3 <path>/main.py ...`.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from blocks import Stage, YAMLIndex, parse_stages_from_groovy, write_filtered_test_db  # noqa: E402
+from blocks import (  # noqa: E402
+    Stage,
+    YAMLIndex,
+    compute_stage_test_counts,
+    parse_stages_from_groovy,
+    write_filtered_test_db,
+)
 from rules.base import PRInputs, Rule, RuleResult  # noqa: E402
 from rules.waives_rule import WaivesRule  # noqa: E402
 
@@ -82,6 +88,10 @@ class SelectionResult:
     reasons: list[str] = field(default_factory=list)
     block_filters: dict[tuple[str, int], dict[str, set[str]]] = field(default_factory=dict)
     test_db_dir_override: Optional[str] = None
+    # Per-stage narrowed test count (sum across blocks the stage's mako
+    # matches, post-keep-filter). Groovy launchTestJobs uses this to
+    # collapse splits to 1 when the count is below the 20-test threshold.
+    affected_stage_test_counts: dict[str, int] = field(default_factory=dict)
 
     def to_json(self) -> str:
         data = {
@@ -91,6 +101,7 @@ class SelectionResult:
             "tests": sorted(self.tests),
             "reasons": list(self.reasons),
             "test_db_dir_override": self.test_db_dir_override,
+            "affected_stage_test_counts": dict(self.affected_stage_test_counts),
         }
         return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
@@ -284,6 +295,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             block_filters=result.block_filters,
         )
         result.test_db_dir_override = out_dir_name
+        # Per-stage narrowed test count for the launchTestJobs split-collapse
+        # heuristic (collapse pytest-split to splits=1 when count < 20).
+        result.affected_stage_test_counts = compute_stage_test_counts(
+            yaml_index=yaml_index,
+            stages=stages,
+            affected_stages=set(result.affected_stages),
+            block_filters=result.block_filters,
+        )
 
     _log_decision_to_stderr(stages, result)
     sys.stdout.write(result.to_json())
@@ -316,6 +335,13 @@ def _log_decision_to_stderr(stages: dict[str, Stage], result: SelectionResult) -
         print(f"    - {yaml_stem}#{idx}:", file=out)
         for prefix, waives in sorted(prefix_to_waives.items()):
             print(f"        {prefix} <- {sorted(waives)}", file=out)
+    if result.affected_stage_test_counts:
+        print(
+            f"  affected_stage_test_counts ({len(result.affected_stage_test_counts)}):",
+            file=out,
+        )
+        for name, count in sorted(result.affected_stage_test_counts.items()):
+            print(f"    - {name}: {count}", file=out)
     print(f"  affected_stages ({len(result.affected_stages)}):", file=out)
     for name in sorted(result.affected_stages):
         stage = stages.get(name)

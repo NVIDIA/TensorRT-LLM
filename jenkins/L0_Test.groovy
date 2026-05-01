@@ -1698,8 +1698,47 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     }
 }
 
+// CBTS Layer 3 split-collapse heuristic: when the affected stage's
+// narrowed test count (computed by main.py compute_stage_test_counts)
+// is below this threshold, collapse pytest-split's splits to 1 — only
+// group 1 runs everything; groups 2..N skip and don't even allocate a
+// machine. Above the threshold, splits stay at the stage's default and
+// pytest-split parallelizes normally.
+def _CBTS_SPLIT_COLLAPSE_THRESHOLD = 20
+
+// Decide whether to collapse this stage's splits or skip the group entirely.
+// Returns a map [skip: bool, splits: int, splitId: int]. Callers should
+// `return` early when skip == true and otherwise overwrite splits/splitId
+// with the returned values before continuing their existing dispatch logic.
+def _cbtsMaybeCollapseSplits(stageName, splitId, splits) {
+    def cbts = testFilter[(CBTS_RESULT)]
+    def counts = cbts?.affected_stage_test_counts
+    if (!counts) {
+        return [skip: false, splits: splits, splitId: splitId]
+    }
+    def count = counts[stageName]
+    if (count == null || count >= _CBTS_SPLIT_COLLAPSE_THRESHOLD) {
+        return [skip: false, splits: splits, splitId: splitId]
+    }
+    if (splitId > 1) {
+        echo "CBTS [${cbts.scope}]: ${stageName} narrowed to ${count} (< ${_CBTS_SPLIT_COLLAPSE_THRESHOLD}), skipping group ${splitId}/${splits}"
+        return [skip: true, splits: splits, splitId: splitId]
+    }
+    if (splits > 1) {
+        echo "CBTS [${cbts.scope}]: ${stageName} narrowed to ${count} (< ${_CBTS_SPLIT_COLLAPSE_THRESHOLD}), collapsing splits=${splits} → 1"
+    }
+    return [skip: false, splits: 1, splitId: 1]
+}
+
 def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312")
 {
+  def collapse = _cbtsMaybeCollapseSplits(stageName, splitId, splits)
+  if (collapse.skip) {
+    return
+  }
+  splits = collapse.splits
+  splitId = collapse.splitId
+
   echo "Run Slurm job with native sbatch: $runWithSbatch"
 
   def attempt = 0
@@ -3338,6 +3377,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 // and junit() for intermediate retryable failures).
 def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", typeCheck=false, boolean isFinalAttempt=true)
 {
+    def collapse = _cbtsMaybeCollapseSplits(stageName, splitId, splits)
+    if (collapse.skip) {
+        return
+    }
+    splits = collapse.splits
+    splitId = collapse.splitId
+
     cacheErrorAndUploadResult(stageName, {
         runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, typeCheck)
     }, {

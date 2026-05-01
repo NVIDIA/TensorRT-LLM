@@ -874,6 +874,10 @@ def _cbtsParseSelectionResult(String text)
         affected_tests: data.tests ?: [],
         reasons: data.reasons ?: [],
         test_db_dir_override: data.test_db_dir_override,  // Layer 3: tmp test-db path
+        // Layer 3 split-collapse heuristic: per-stage narrowed test count.
+        // launchTestJobs reads this to drop excess pytest-split groups when
+        // the affected stage's narrowed count falls below the 20-test threshold.
+        affected_stage_test_counts: data.affected_stage_test_counts ?: [:],
     ]
 }
 
