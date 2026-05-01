@@ -1,4 +1,5 @@
 import json
+import time
 
 import requests
 
@@ -13,15 +14,17 @@ def is_permissive(licenses, license_check_token):
         "Authorization": f"Bearer {license_check_token}",
         "Content-Type": "application/json",
     }
-    response = requests.post(
-        "https://nspect.nvidia.com/pm/api/v1.0/public/osrb/license/status",
-        headers=headers,
-        data=json.dumps({"licenses": licenses}),
-    )
-    has_non_permissive_license = False
-    print(response)
-    for check_result in response:
-        if not check_result["isPermissive"]:
-            has_non_permissive_license = True
-            break
-    return has_non_permissive_license
+    for attempt in range(5):
+        response = requests.post(
+            "https://nspect.nvidia.com/pm/api/v1.0/public/osrb/license/status",
+            headers=headers,
+            data=json.dumps({"licenses": licenses}),
+        )
+        resp = response.json()
+        print(resp)
+        if resp["success"]:
+            return all(result["isPermissive"] for result in resp["data"])
+        else:
+            print(f"Check License attempt {attempt + 1} failed")
+            time.sleep(2**attempt)
+    return False

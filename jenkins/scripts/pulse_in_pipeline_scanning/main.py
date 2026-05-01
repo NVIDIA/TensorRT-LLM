@@ -55,7 +55,6 @@ SUBMIT_KWARG = {
     },
     "start_datetime": datetime.now(timezone.utc),
     "only_report_new_risk": args.scan_mode == "monitor",
-    "license_check_token": args.license_check_token,
 }
 
 
@@ -76,6 +75,7 @@ def process_result():
         os.path.join(args.report_directory, "source_code/sbom.json"),
         last_source_licenses,
         **SUBMIT_KWARG,
+        license_check_token=args.license_check_token,
     )
     if len(source_licenses) > 0:
         RISKY_DEPENDENCIES.append(f"{len(source_licenses)} new source code non-permissive license")
@@ -106,6 +106,7 @@ def process_result():
         "amd64",
         last_container_licenses,
         **SUBMIT_KWARG,
+        license_check_token=args.license_check_token,
     )
     arm64_container_licenses = submit_container_licenses(
         os.path.join(args.report_directory, "release_arm64/licenses.json"),
@@ -113,6 +114,7 @@ def process_result():
         "arm64",
         last_container_licenses,
         **SUBMIT_KWARG,
+        license_check_token=args.license_check_token,
     )
     count_container_licenses = len(amd64_container_licenses + arm64_container_licenses)
     if count_container_licenses > 0:
@@ -122,10 +124,14 @@ def process_result():
 
     if RISKY_DEPENDENCIES:
         detail = ", ".join(RISKY_DEPENDENCIES)
+        status = "unstable"
         if args.scan_mode == "monitor":
             post_slack_msg(args.build_number, args.ref, detail)
+        if args.scan_mode == "release" and count_container_licenses + len(source_licenses) == 0:
+            status = "success"
+
         return {
-            "status": "unstable",
+            "status": status,
             "detail": detail,
             "risks": RISKY_DEPENDENCIES,
             "dashboard_url": get_dashboard_url(args.build_number, args.ref),

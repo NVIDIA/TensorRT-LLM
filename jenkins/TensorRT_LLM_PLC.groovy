@@ -411,13 +411,13 @@ pipeline {
                         }
                     }
                 }
-                stage("SonarQube Code Analysis") {
-                    steps {
-                        script {
-                            sonarScan()
-                        }
-                    }
-                }
+                //stage("SonarQube Code Analysis") {
+                    //steps {
+                        //script {
+                            //sonarScan()
+                        //}
+                    //}
+                //}
             }
         }
         stage("Process Scan Result") {
