@@ -67,6 +67,7 @@ add_library(
   dsv3FusedAGemmOp.cpp
   fusedQKNormRopeOp.cpp
   fusedDiTQKNormRopeOp.cpp
+  fusedDiTSplitQKNormRopeOp.cpp
   fusedAddRMSNormQuant.cpp
   fusedActivationQuant.cpp
   fusedGatedRMSNormQuant.cpp

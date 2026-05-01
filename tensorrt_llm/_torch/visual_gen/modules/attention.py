@@ -261,58 +261,66 @@ class Attention(nn.Module):
     ) -> None:
         """Apply fused QK Norm + RoPE in-place on packed QKV tensor.
 
-        Dispatches to per-head kernel (FLUX) or cross-head kernel (WAN)
-        based on qk_norm_mode.
+        cos/sin can be either shape (per-token total elements):
+          - [..., head_dim]            : shared across heads (FLUX/Cosmos style)
+          - [..., num_heads*head_dim]  : per-head freqs (LTX-2 3D RoPE style)
+        Op auto-detects via cos_emb.size(1) and dispatches the kernel template.
         """
-        cos_2d = freqs_cos.reshape(-1, self.head_dim).float().contiguous()
-        sin_2d = freqs_sin.reshape(-1, self.head_dim).float().contiguous()
-
         B, S, D = qkv.shape
-        assert cos_2d.shape == (S, self.head_dim), (
-            f"cos_emb shape mismatch: expected [{S}, {self.head_dim}], got {list(cos_2d.shape)}"
-        )
-        qkv_2d = qkv.view(B * S, D)
-        cos_tiled = cos_2d.repeat(B, 1) if B > 1 else cos_2d
-        sin_tiled = sin_2d.repeat(B, 1) if B > 1 else sin_2d
-
-        if self.qk_norm_mode == "full":
-            torch.ops.trtllm.fused_dit_cross_head_qk_norm_rope(
-                qkv_2d,
-                self.num_attention_heads,
-                self.num_key_value_heads,
-                self.num_key_value_heads,
-                self.head_dim,
-                self.eps,
-                self.norm_q.weight,
-                self.norm_k.weight,
-                cos_tiled,
-                sin_tiled,
-                self.interleave,
-            )
+        total_tokens = B * S
+        # Determine cos last-dim by looking at total numel and which divisor fits.
+        cos_total = freqs_cos.numel()
+        if cos_total == total_tokens * self.head_dim:
+            cos_last = self.head_dim
+        elif cos_total == total_tokens * self.num_attention_heads * self.head_dim:
+            cos_last = self.num_attention_heads * self.head_dim
+        elif cos_total == S * self.head_dim:
+            cos_last = self.head_dim
+        elif cos_total == S * self.num_attention_heads * self.head_dim:
+            cos_last = self.num_attention_heads * self.head_dim
         else:
-            # Dual-stream batch correction: when B>1 and dual-stream is active,
-            # the kernel uses modulo (tokenIdx % tokens_per_batch) to find the
-            # local position within each batch element for the text/image boundary.
-            # 0 = no dual-stream (single-stream or batch=1).
-            tokens_per_batch = S if num_txt_tokens > 0 else 0
-
-            torch.ops.trtllm.fused_dit_qk_norm_rope(
-                qkv_2d,
-                self.num_attention_heads,
-                self.num_key_value_heads,
-                self.num_key_value_heads,
-                self.head_dim,
-                self.eps,
-                self.norm_q.weight,
-                self.norm_k.weight,
-                q_add_weight,
-                k_add_weight,
-                cos_tiled,
-                sin_tiled,
-                num_txt_tokens,
-                self.interleave,
-                tokens_per_batch,
+            raise AssertionError(
+                f"cos_emb numel ({cos_total}) doesn't match S={S} or B*S={total_tokens} "
+                f"× (head_dim={self.head_dim} or num_heads*head_dim={self.num_attention_heads * self.head_dim})"
             )
+        # SPLIT-rope cos is stored per-head as (B, H, T, D); permute to (B, T, H, D)
+        # so reshape(-1, H*D) gives the token-major layout the kernel expects.
+        if freqs_cos.ndim == 4 and freqs_cos.shape[1] == self.num_attention_heads:
+            freqs_cos = freqs_cos.permute(0, 2, 1, 3).contiguous()
+            freqs_sin = freqs_sin.permute(0, 2, 1, 3).contiguous()
+        cos_2d = freqs_cos.reshape(-1, cos_last).float().contiguous()
+        sin_2d = freqs_sin.reshape(-1, cos_last).float().contiguous()
+        if cos_2d.shape[0] == S and B > 1:
+            cos_tiled = cos_2d.repeat(B, 1)
+            sin_tiled = sin_2d.repeat(B, 1)
+        else:
+            cos_tiled = cos_2d
+            sin_tiled = sin_2d
+        qkv_2d = qkv.view(B * S, D)
+
+        # Dual-stream batch correction: when B>1 and dual-stream is active,
+        # the kernel uses modulo (tokenIdx % tokens_per_batch) to find the
+        # local position within each batch element for the text/image boundary.
+        # 0 = no dual-stream (single-stream or batch=1).
+        tokens_per_batch = S if num_txt_tokens > 0 else 0
+
+        torch.ops.trtllm.fused_dit_qk_norm_rope(
+            qkv_2d,
+            self.num_attention_heads,
+            self.num_key_value_heads,
+            self.num_key_value_heads,
+            self.head_dim,
+            self.eps,
+            self.norm_q.weight,
+            self.norm_k.weight,
+            q_add_weight,
+            k_add_weight,
+            cos_tiled,
+            sin_tiled,
+            num_txt_tokens,
+            self.interleave,
+            tokens_per_batch,
+        )
 
     def _attn_impl(
         self,

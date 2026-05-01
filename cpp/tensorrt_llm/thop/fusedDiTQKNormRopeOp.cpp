@@ -46,8 +46,8 @@ void fused_dit_qk_norm_rope(torch::Tensor& qkv, // [num_tokens, (Hq+Hk+Hv)*head_
     TORCH_CHECK(qkv.dim() == 2, "QKV tensor must be 2D: [num_tokens, total_heads*head_dim]");
     TORCH_CHECK(q_weight.dim() == 1, "q_weight must be 1D");
     TORCH_CHECK(k_weight.dim() == 1, "k_weight must be 1D");
-    TORCH_CHECK(cos_emb.dim() == 2, "cos_emb must be 2D: [num_tokens, head_dim]");
-    TORCH_CHECK(sin_emb.dim() == 2, "sin_emb must be 2D: [num_tokens, head_dim]");
+    TORCH_CHECK(cos_emb.dim() == 2, "cos_emb must be 2D: [num_tokens, head_dim] or [num_tokens, num_heads*head_dim]");
+    TORCH_CHECK(sin_emb.dim() == 2, "sin_emb must be 2D: [num_tokens, head_dim] or [num_tokens, num_heads*head_dim]");
 
     CHECK_INPUT(qkv, torch::kBFloat16);
     CHECK_INPUT(q_weight, torch::kBFloat16);
@@ -58,19 +58,42 @@ void fused_dit_qk_norm_rope(torch::Tensor& qkv, // [num_tokens, (Hq+Hk+Hv)*head_
     int64_t num_tokens = qkv.size(0);
     int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
     TORCH_CHECK(qkv.size(1) == total_heads * head_dim, "QKV tensor size must match total_heads * head_dim");
-    TORCH_CHECK(cos_emb.size(0) == num_tokens && cos_emb.size(1) == head_dim, "cos_emb must be [num_tokens, head_dim]");
-    TORCH_CHECK(sin_emb.size(0) == num_tokens && sin_emb.size(1) == head_dim, "sin_emb must be [num_tokens, head_dim]");
+    TORCH_CHECK(cos_emb.size(0) == num_tokens, "cos_emb token count must match qkv (got ", cos_emb.size(0), " vs ",
+        num_tokens, ")");
+    bool const per_head_cos = (cos_emb.size(1) == num_heads_q * head_dim);
+    TORCH_CHECK(per_head_cos || cos_emb.size(1) == head_dim, "cos_emb last dim must be head_dim (", head_dim,
+        ") or num_heads_q*head_dim (", num_heads_q * head_dim, "); got ", cos_emb.size(1));
+    TORCH_CHECK(
+        sin_emb.size(0) == num_tokens && sin_emb.size(1) == cos_emb.size(1), "sin_emb shape must match cos_emb");
 
-    // Only per-head norm supported
-    TORCH_CHECK(q_weight.size(0) == head_dim,
-        "fused_dit_qk_norm_rope only supports per-head norm (q_weight must be [head_dim]). "
-        "Full-dim norm (q_weight [num_heads * head_dim]) is not yet supported. Got q_weight size: ",
-        q_weight.size(0), ", head_dim: ", head_dim);
-    TORCH_CHECK(k_weight.size(0) == head_dim,
-        "fused_dit_qk_norm_rope only supports per-head norm (k_weight must be [head_dim]). Got k_weight size: ",
-        k_weight.size(0));
+    // Auto-dispatch by weight shape:
+    //   weight.size(0) == head_dim                   → per-head norm (FLUX/Cosmos3, original kernel)
+    //   weight.size(0) == num_heads_per_side*head_dim → full-dim norm (LTX-2)
+    bool const is_full_dim_q = (q_weight.size(0) == num_heads_q * head_dim);
+    bool const is_full_dim_k = (k_weight.size(0) == num_heads_k * head_dim);
+    bool const is_per_head_q = (q_weight.size(0) == head_dim);
+    bool const is_per_head_k = (k_weight.size(0) == head_dim);
+    TORCH_CHECK(is_full_dim_q == is_full_dim_k && is_per_head_q == is_per_head_k,
+        "q_weight and k_weight must use the same norm mode (both per-head or both full-dim).");
+    TORCH_CHECK(is_per_head_q || is_full_dim_q,
+        "q_weight size must be [head_dim] (per-head) or [num_heads*head_dim] (full-dim); got ", q_weight.size(0),
+        " head_dim=", head_dim, " num_heads_q=", num_heads_q);
 
-    // Validate optional add_weights (dual-stream)
+    if (is_full_dim_q)
+    {
+        TORCH_CHECK(!q_add_weight.has_value() && !k_add_weight.has_value(),
+            "Full-dim norm does not support dual-stream add_weights");
+        TORCH_CHECK(num_txt_tokens <= 0, "Full-dim norm does not support dual-stream (num_txt_tokens must be -1)");
+        auto stream = at::cuda::getCurrentCUDAStream(qkv.get_device());
+        tensorrt_llm::kernels::launchFusedDiTQKNormRopeFullDim(qkv.data_ptr(), static_cast<int>(num_tokens),
+            static_cast<int>(num_heads_q), static_cast<int>(num_heads_k), static_cast<int>(num_heads_v),
+            static_cast<int>(head_dim), static_cast<float>(eps), q_weight.data_ptr(), k_weight.data_ptr(),
+            reinterpret_cast<float const*>(cos_emb.data_ptr()), reinterpret_cast<float const*>(sin_emb.data_ptr()),
+            interleave, per_head_cos, stream);
+        return;
+    }
+
+    // Per-head path (original FLUX/Cosmos3 kernel)
     void const* q_add_ptr = nullptr;
     void const* k_add_ptr = nullptr;
     if (q_add_weight.has_value())

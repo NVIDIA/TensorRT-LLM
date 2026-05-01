@@ -103,6 +103,10 @@ class LTX2Attention(Attention):
         # Cross-attention: SEPARATE_QKV since K/V come from a different source.
         qkv_mode = QKVMode.SEPARATE_QKV if self._is_cross_attn else QKVMode.FUSE_QKV
 
+        # Map LTX RoPE type to the fused-kernel INTERLEAVE template parameter:
+        #   INTERLEAVED → pair (2i, 2i+1) pattern   → kernel INTERLEAVE=true
+        #   SPLIT       → rotate-half pattern        → kernel INTERLEAVE=false
+        # (cos/sin are stored block-duplicated for SPLIT; see _split_freqs_cis.)
         super().__init__(
             hidden_size=query_dim,
             num_attention_heads=heads,
@@ -112,6 +116,7 @@ class LTX2Attention(Attention):
             qk_norm_mode="full",
             eps=norm_eps,
             bias=True,
+            interleave=(rope_type == LTXRopeType.INTERLEAVED),
             config=config,
             layer_idx=layer_idx,
         )
@@ -201,20 +206,92 @@ class LTX2Attention(Attention):
             force_dynamic_quantization=self.force_dynamic_quantization,
         )
 
+    def _apply_split_norm_rope(
+        self,
+        tensor: torch.Tensor,
+        weight: torch.Tensor,
+        num_heads: int,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> None:
+        """In-place fused RMSNorm + RoPE on a single Q or K tensor [B, T, H*D].
+
+        Calls trtllm.fused_dit_split_norm_rope. Used by the cross-attn fast path.
+        """
+        # Auto-detect cos last-dim: head_dim (shared) or num_heads*head_dim (per-head).
+        B, T, _ = tensor.shape
+        total_tokens = B * T
+        cos_total = cos.numel()
+        full_inner = num_heads * self.head_dim
+        if cos_total in (T * self.head_dim, total_tokens * self.head_dim):
+            cos_last = self.head_dim
+        elif cos_total in (T * full_inner, total_tokens * full_inner):
+            cos_last = full_inner
+        else:
+            raise AssertionError(
+                f"cos numel ({cos_total}) doesn't match expected for T={T}, B*T={total_tokens}, "
+                f"head_dim={self.head_dim} or num_heads*head_dim={full_inner}"
+            )
+        # SPLIT-rope cos is stored per-head as (B, H, T, D); permute to (B, T, H, D)
+        # so the subsequent reshape(-1, H*D) gives the token-major layout the kernel
+        # expects (each row = one token's flat (h*D+d) values).
+        if cos.ndim == 4 and cos.shape[1] == num_heads:
+            cos = cos.permute(0, 2, 1, 3).contiguous()
+            sin = sin.permute(0, 2, 1, 3).contiguous()
+        cos_2d = cos.reshape(-1, cos_last).float().contiguous()
+        sin_2d = sin.reshape(-1, cos_last).float().contiguous()
+        if cos_2d.shape[0] == T and B > 1:
+            cos_tiled = cos_2d.repeat(B, 1)
+            sin_tiled = sin_2d.repeat(B, 1)
+        else:
+            cos_tiled = cos_2d
+            sin_tiled = sin_2d
+        tensor_2d = tensor.view(B * T, -1)
+        torch.ops.trtllm.fused_dit_split_norm_rope(
+            tensor_2d,
+            num_heads,
+            self.head_dim,
+            self.eps,
+            weight,
+            cos_tiled,
+            sin_tiled,
+            self.qk_norm_mode == "full",
+            True,  # do_norm
+            self.interleave,
+        )
+
     def project_kv(
         self,
         context: torch.Tensor,
+        pe: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Project and normalize K/V from context.
+        """Project K/V from context, optionally apply RMSNorm + RoPE on K.
 
-        Used by the project-before-gather pattern in AV cross-attention:
-        project K/V on sharded data, then all-gather the smaller projected
-        tensors instead of all-gathering the full context first.
+        Used by the project-before-gather pattern in AV cross-attention.
+        When *pe* is given, RoPE is applied on the LOCAL K shard (Ulysses)
+        before all-gather. RoPE is per-token element-wise so it commutes with
+        seq-dim concat — bit-identical to the post-gather rope while saving
+        the cos/sin all-gather collective and reducing K-rope compute by U×.
+        The forward() consumer should pass ``k_pe=None`` to signal that K is
+        already rotated.
         """
         k = self.to_k(context)
         v = self.to_v(context)
-        if self.qk_norm:
-            k = self.norm_k(k)
+
+        head_dim_supported = self.head_dim in (64, 128)
+        rope_supported = self.rope_type in (LTXRopeType.INTERLEAVED, LTXRopeType.SPLIT)
+        pe_compatible = pe is not None and pe[0].shape[-1] in (
+            self.head_dim,
+            self.num_key_value_heads * self.head_dim,
+        )
+        if pe_compatible and self.qk_norm and head_dim_supported and rope_supported:
+            cos, sin = pe
+            self._apply_split_norm_rope(k, self.norm_k.weight, self.num_key_value_heads, cos, sin)
+        else:
+            if self.qk_norm:
+                k = self.norm_k(k)
+            if pe is not None:
+                k = apply_rotary_emb(k, pe, self.rope_type)
         return k, v
 
     def forward(
@@ -235,18 +312,91 @@ class LTX2Attention(Attention):
             pre_projected_kv: Pre-projected (k, v) tuple from project_kv().
                 When provided, skips K/V projection and K-norm (already done).
         """
-        if pre_projected_kv is not None:
+        # Our fused op accepts cos/sin in two layouts (auto-detected by op):
+        #   [num_tokens, head_dim]            — shared across heads (FLUX-style)
+        #   [num_tokens, num_heads*head_dim]  — per-head (LTX-2 3D RoPE)
+        # Kernel supports head_dim in {64, 128} only.
+        head_dim_supported = self.head_dim in (64, 128)
+        rope_supported = self.rope_type in (LTXRopeType.INTERLEAVED, LTXRopeType.SPLIT)
+
+        def _pe_compatible(p):
+            if p is None:
+                return False
+            last = p[0].shape[-1]
+            return last == self.head_dim or last == self.num_attention_heads * self.head_dim
+
+        # Fast path: FUSE_QKV self-attn → packed kernel for full QKV.
+        can_fuse_packed = (
+            not self._is_cross_attn
+            and self.qk_norm
+            and head_dim_supported
+            and rope_supported
+            and _pe_compatible(pe)
+            and (k_pe is None or k_pe is pe)
+            and pre_projected_kv is None
+        )
+        # Fast path: SEPARATE_QKV cross-attn (text cross-attn) → split kernel for Q + K.
+        can_fuse_split = (
+            self._is_cross_attn
+            and self.qk_norm
+            and head_dim_supported
+            and rope_supported
+            and _pe_compatible(pe)
+            and (k_pe is None or k_pe is pe or _pe_compatible(k_pe))
+            and pre_projected_kv is None
+        )
+        # Fast path: AV cross-attn with pre-projected KV (K already norm+rotated by
+        # project_kv). Q-only fused split kernel; K rope is skipped here.
+        can_fuse_split_q_only = (
+            self._is_cross_attn
+            and self.qk_norm
+            and head_dim_supported
+            and rope_supported
+            and _pe_compatible(pe)
+            and pre_projected_kv is not None
+            and k_pe is None  # signals K already rotated
+        )
+        if can_fuse_packed:
+            qkv = self.qkv_proj(x)
+            cos, sin = pe
+            self.apply_qk_norm_rope(qkv, cos, sin)
+            q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
+        elif can_fuse_split:
+            q = self.to_q(x)
+            k = self.to_k(context)
+            v = self.to_v(context)
+            cos_q, sin_q = pe
+            cos_k, sin_k = k_pe if k_pe is not None else pe
+            self._apply_split_norm_rope(
+                q, self.norm_q.weight, self.num_attention_heads, cos_q, sin_q
+            )
+            self._apply_split_norm_rope(
+                k, self.norm_k.weight, self.num_key_value_heads, cos_k, sin_k
+            )
+        elif can_fuse_split_q_only:
             k, v = pre_projected_kv
             q = self.to_q(x)
-            if self.qk_norm:
-                q = self.norm_q(q)
+            cos_q, sin_q = pe
+            self._apply_split_norm_rope(
+                q, self.norm_q.weight, self.num_attention_heads, cos_q, sin_q
+            )
         else:
-            q, k, v = self.get_qkv(x, context)
-            q, k = self.apply_qk_norm(q, k)
+            if pre_projected_kv is not None:
+                k, v = pre_projected_kv
+                q = self.to_q(x)
+                if self.qk_norm:
+                    q = self.norm_q(q)
+            else:
+                q, k, v = self.get_qkv(x, context)
+                q, k = self.apply_qk_norm(q, k)
 
-        if pe is not None:
-            q = apply_rotary_emb(q, pe, self.rope_type)
-            k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
+            if pe is not None:
+                q = apply_rotary_emb(q, pe, self.rope_type)
+                # k_pe=None with pre_projected_kv signals K already rotated.
+                if k_pe is not None:
+                    k = apply_rotary_emb(k, k_pe, self.rope_type)
+                elif pre_projected_kv is None:
+                    k = apply_rotary_emb(k, pe, self.rope_type)
 
         out = self._attn_impl(q, k, v)
 
@@ -463,18 +613,6 @@ class BasicAVTransformerBlock(nn.Module):
         """All-gather *x* along *dim* across sequence-parallel ranks."""
         return self._sharder.gather(x, dim=dim)
 
-    def _sp_gather_pe(self, pe):
-        """All-gather RoPE (cos, sin) tuple along its sequence dim.
-
-        Split RoPE is ``[B, H, S, D]`` (dim 2); interleaved RoPE is
-        ``[B, S, D]`` (dim 1).  Inferred from ``cos.ndim``.
-        """
-        if pe is None:
-            return None
-        cos, sin = pe
-        seq_dim = 2 if cos.ndim == 4 else 1
-        return (self._sharder.gather(cos, dim=seq_dim), self._sharder.gather(sin, dim=seq_dim))
-
     # -- Forward -------------------------------------------------------------
 
     def forward(
@@ -603,22 +741,23 @@ class BasicAVTransformerBlock(nn.Module):
                 ax_scaled = ax_norm3 * (1 + scale_ca_audio_a2v) + shift_ca_audio_a2v
 
                 # Project-before-gather: K/V projections run on sharded data
-                # so they benefit from Ulysses scaling.  Only the smaller
-                # projected tensors are all-gathered.
-                k_a2v, v_a2v = self.audio_to_video_attn.project_kv(ax_scaled)
+                # so they benefit from Ulysses scaling.  RoPE is applied to K
+                # inside project_kv on the sharded shard (RoPE commutes with
+                # seq-dim concat), so the cos/sin all-gather is unneeded and K
+                # rope work is U× cheaper.
+                k_a2v, v_a2v = self.audio_to_video_attn.project_kv(
+                    ax_scaled, pe=audio.cross_positional_embeddings
+                )
                 if self._audio_is_sharded:
                     k_a2v = self._sp_all_gather(k_a2v)
                     v_a2v = self._sp_all_gather(v_a2v)
-                    k_pe_a2v = self._sp_gather_pe(audio.cross_positional_embeddings)
-                else:
-                    k_pe_a2v = audio.cross_positional_embeddings
 
                 a2v_out = (
                     self.audio_to_video_attn(
                         vx_scaled,
                         pre_projected_kv=(k_a2v, v_a2v),
                         pe=video.cross_positional_embeddings,
-                        k_pe=k_pe_a2v,
+                        k_pe=None,  # K already rotated in project_kv
                     )
                     * gate_out_a2v
                 )
@@ -634,21 +773,21 @@ class BasicAVTransformerBlock(nn.Module):
                 ax_scaled = ax_norm3 * (1 + scale_ca_audio_v2a) + shift_ca_audio_v2a
                 vx_scaled = vx_norm3 * (1 + scale_ca_video_v2a) + shift_ca_video_v2a
 
-                # Project-before-gather (video → audio direction).
-                k_v2a, v_v2a = self.video_to_audio_attn.project_kv(vx_scaled)
+                # Project-before-gather (video → audio direction).  RoPE applied
+                # to K in project_kv on local shard; see audio→video branch above.
+                k_v2a, v_v2a = self.video_to_audio_attn.project_kv(
+                    vx_scaled, pe=video.cross_positional_embeddings
+                )
                 if self._sharder.is_active:
                     k_v2a = self._sp_all_gather(k_v2a)
                     v_v2a = self._sp_all_gather(v_v2a)
-                    k_pe_v2a = self._sp_gather_pe(video.cross_positional_embeddings)
-                else:
-                    k_pe_v2a = video.cross_positional_embeddings
 
                 v2a_out = (
                     self.video_to_audio_attn(
                         ax_scaled,
                         pre_projected_kv=(k_v2a, v_v2a),
                         pe=audio.cross_positional_embeddings,
-                        k_pe=k_pe_v2a,
+                        k_pe=None,  # K already rotated in project_kv
                     )
                     * gate_out_v2a
                 )
