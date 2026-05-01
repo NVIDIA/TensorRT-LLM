@@ -79,7 +79,7 @@ def getLLMRepo () {
 def installTools() {
     container("cpu") {
         sh "apt update"
-        sh "apt install -y git git-lfs openjdk-17-jdk python3-dev python3-venv curl zip unzip wget"
+        sh "apt install -y git git-lfs openjdk-17-jdk python3-dev python3-venv curl zip unzip wget jq"
     }
 }
 
