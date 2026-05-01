@@ -1168,6 +1168,7 @@ class PerfSanityTestConfig:
     def __init__(self, test_case_name: str, output_dir: str):
         self._output_dir = output_dir
         self._perf_results: Dict[int, List[Dict[str, float]]] = {}
+        self._timeout = DEFAULT_TIMEOUT
 
         # Initialize server configs
         self.server_configs: List = []
@@ -1194,7 +1195,8 @@ class PerfSanityTestConfig:
                 raise RuntimeError("Failed to get GPU type")
 
         self.upload_to_db = "upload" in test_case_name.split("-")[0] and bool(
-            os.environ.get("OPEN_SEARCH_DB_BASE_URL", "")
+            os.environ.get("OPEN_SEARCH_DB_BASE_URL")
+            and os.environ.get("OPEN_SEARCH_DB_CREDENTIALS_USR")
         )
         self.gpu_type = get_gpu_type()
 
@@ -1312,7 +1314,15 @@ class PerfSanityTestConfig:
         slurm_config = config.get("slurm", {})
         worker_config = config.get("worker_config", {})
 
-        timeout = slurm_config.get("timeout", DEFAULT_TIMEOUT)
+        timeout = slurm_config.get("timeout", None)
+        if timeout is None:
+            job_time = slurm_config.get("job_time", "")
+            if job_time:
+                parts = job_time.split(":")
+                timeout = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+            else:
+                timeout = DEFAULT_TIMEOUT
+        self._timeout = timeout
         numa_bind = slurm_config.get("numa_bind", False)
         gpus_per_node = hardware.get("gpus_per_node", 0)
         model_name = metadata.get("model_name", "")
@@ -1420,7 +1430,7 @@ class PerfSanityTestConfig:
             client_config_data = {
                 "concurrency": concurrency,
                 "iterations": 1
-                if benchmark_mode == "gen_only"
+                if benchmark_mode in ("gen_only", "ctx_only")
                 else benchmark.get("multi_round", 1),
                 "isl": benchmark.get("input_length", 1024),
                 "osl": osl,
@@ -1478,7 +1488,7 @@ class PerfSanityTestConfig:
         return AggrTestCmds(
             server_cmds=server_cmds,
             client_cmds=client_cmds,
-            timeout=DEFAULT_TIMEOUT,
+            timeout=self._timeout,
             output_dir=output_dir,
             test_output_dir=test_output_dir,
         )
