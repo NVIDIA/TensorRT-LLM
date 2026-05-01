@@ -23,11 +23,12 @@ namespace tensorrt_llm::executor
 
 CacheTransceiverConfig::CacheTransceiverConfig(std::optional<BackendType> backendType,
     std::optional<size_t> maxNumTokens, std::optional<int> kvTransferTimeoutMs,
-    std::optional<int> kvTransferSenderFutureTimeoutMs)
+    std::optional<int> kvTransferSenderFutureTimeoutMs, std::optional<SizeType32> chunkSizeBlocks)
     : mBackendType(backendType)
     , mMaxTokensInBuffer(maxNumTokens)
     , mKvTransferTimeoutMs(kvTransferTimeoutMs)
     , mKvTransferSenderFutureTimeoutMs(kvTransferSenderFutureTimeoutMs)
+    , mChunkSizeBlocks(chunkSizeBlocks)
 {
 }
 
@@ -83,5 +84,19 @@ std::optional<int> CacheTransceiverConfig::getKvTransferTimeoutMs() const
 std::optional<int> CacheTransceiverConfig::getKvTransferSenderFutureTimeoutMs() const
 {
     return mKvTransferSenderFutureTimeoutMs;
+}
+
+void CacheTransceiverConfig::setChunkSizeBlocks(std::optional<SizeType32> chunkSizeBlocks)
+{
+    if (chunkSizeBlocks.has_value() && chunkSizeBlocks.value() <= 0)
+    {
+        TLLM_THROW("chunkSizeBlocks must be positive");
+    }
+    mChunkSizeBlocks = chunkSizeBlocks;
+}
+
+std::optional<SizeType32> CacheTransceiverConfig::getChunkSizeBlocks() const
+{
+    return mChunkSizeBlocks;
 }
 } // namespace tensorrt_llm::executor

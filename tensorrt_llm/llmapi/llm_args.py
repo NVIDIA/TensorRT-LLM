@@ -2681,13 +2681,32 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         "Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms"
     )
 
+    chunk_size_blocks: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "Maximum number of KV cache blocks per layer group per chunk for "
+        "chunked KV cache transfer. When set, each layer group's block list "
+        "is partitioned into slices of at most this many blocks, and each "
+        "slice is transferred independently. The total data per chunk is "
+        "approximately chunk_size_blocks * num_layer_groups * slot_bytes. "
+        "This reduces per-transfer descriptor pressure for long "
+        "sequences and enables early block release to free GPU memory "
+        "incrementally during transfer. When None (default), the entire "
+        "KV cache is transferred in a single slice. Supported by both "
+        "C++ and Python transceivers. With NIXL backend, the Python "
+        "transceiver is auto-selected for zero-copy GPUDirect RDMA.")
+
     def _to_pybind(self):
+        # Phase 1b adds C++ transceiver support for chunking, so the field is
+        # forwarded to pybind.  In Phase 1a it was Python-transceiver-only and
+        # intentionally stripped before constructing the C++ config.
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
             max_tokens_in_buffer=self.max_tokens_in_buffer,
             kv_transfer_timeout_ms=self.kv_transfer_timeout_ms,
             kv_transfer_sender_future_timeout_ms=self.
-            kv_transfer_sender_future_timeout_ms)
+            kv_transfer_sender_future_timeout_ms,
+            chunk_size_blocks=self.chunk_size_blocks)
 
 
 @dataclass

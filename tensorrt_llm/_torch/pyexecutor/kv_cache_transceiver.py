@@ -69,12 +69,45 @@ def create_kv_cache_transceiver(
             f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
             f"hangs or lower-than-expected performance.")
 
+    # Both C++ and Python transceivers support chunked transfer.
+    # For NIXL/DEFAULT, the Python transceiver is preferred when
+    # chunk_size_blocks is set because it avoids the staging buffer.
+    # For other backends, the C++ transceiver handles chunking natively.
+    use_python = cache_transceiver_config.transceiver_runtime == "PYTHON"
+    if (cache_transceiver_config.transceiver_runtime is None
+            and cache_transceiver_config.chunk_size_blocks is not None
+            and cache_transceiver_config.backend in (None, "DEFAULT", "NIXL")):
+        # Use warning (not info) so users notice the implementation swap and
+        # the implied perf / staging-buffer characteristics change.  Explicit
+        # transceiver_runtime='CPP' is honored now that the C++ transceiver
+        # supports chunked transfer.
+        logger.warning(
+            "chunk_size_blocks is set with NIXL/DEFAULT backend and "
+            "transceiver_runtime is unset; auto-selecting the Python "
+            "transceiver (no staging buffer, GPUDirect RDMA). Set "
+            "transceiver_runtime='CPP' to use the C++ chunked transceiver.")
+        use_python = True
+
+    # Warn when chunk_size_blocks is below the recommended floor.  The Pydantic
+    # field is PositiveInt (>=1), but values below ~16 push the per-chunk RDMA
+    # overhead into the regime where it dominates transfer throughput.
+    _MIN_RECOMMENDED_CHUNK_SIZE_BLOCKS = 16
+    if (cache_transceiver_config.chunk_size_blocks is not None
+            and cache_transceiver_config.chunk_size_blocks
+            < _MIN_RECOMMENDED_CHUNK_SIZE_BLOCKS):
+        logger.warning(
+            f"chunk_size_blocks={cache_transceiver_config.chunk_size_blocks} "
+            f"is below the recommended floor of "
+            f"{_MIN_RECOMMENDED_CHUNK_SIZE_BLOCKS}; per-chunk RDMA overhead "
+            f"may dominate transfer throughput. Consider 64-128 for "
+            f"long-context workloads (ISL >= 32K).")
+
     # Select transceiver implementation based on transceiver_runtime
     # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
     # transceiver_runtime == "PYTHON" -> use Python transceiver
-    if cache_transceiver_config.transceiver_runtime == "PYTHON":
+    if use_python:
         # Python transceiver currently only supports NIXL and DEFAULT backend
-        if cache_transceiver_config.backend not in ("DEFAULT", "NIXL"):
+        if cache_transceiver_config.backend not in (None, "DEFAULT", "NIXL"):
             raise ValueError(
                 f"Python transceiver currently only supports NIXL or DEFAULT backend, "
                 f"got {cache_transceiver_config.backend}. "

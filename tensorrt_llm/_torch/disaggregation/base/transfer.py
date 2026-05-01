@@ -53,6 +53,7 @@ class KVSlice:
     )  # Physical block IDs per layer group, each np.ndarray(dtype=np.int64)
     is_last_slice: bool = False
     mamba_state_index: Optional[int] = None
+    chunk_block_offset: int = 0
 
 
 class SessionStatus(Enum):
@@ -141,7 +142,19 @@ class TxSessionBase(_SessionBase):
         self._sender = sender
 
     @abstractmethod
-    def send(self, slice: KVSlice) -> concurrent.futures.Future: ...
+    def send(self, slice: KVSlice) -> concurrent.futures.Future:
+        """Send a KV slice and return a Future for the transfer.
+
+        Args:
+            slice: The KV slice describing which source blocks to send.
+                The slice's ``chunk_block_offset`` field indicates the
+                offset into the receiver's destination block list for
+                sender-side chunking.
+
+        Returns:
+            A ``Future`` that resolves when the transfer completes.
+        """
+        ...
 
 
 class RxSessionBase(_SessionBase):

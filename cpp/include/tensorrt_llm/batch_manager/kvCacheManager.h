@@ -589,6 +589,17 @@ public:
         ++mNumFrontBlocksRemoved;
     }
 
+    //! \brief Advance ``mNumFrontBlocksRemoved`` without touching cache blocks.
+    //! \details Used by ``BlockManager::releasePrefixBlocks`` to advance the
+    //! shared front-block counter once after every ``WindowBlockManager`` has
+    //! processed the same prefix range.  Has clearer intent than calling
+    //! ``removeFrontBlock`` with a sentinel ``windowSize`` value, and is robust
+    //! to future changes that consume the ``windowSize`` argument.
+    void incrementNumFrontBlocksRemoved()
+    {
+        ++mNumFrontBlocksRemoved;
+    }
+
     void removeLastBlock(SizeType32 windowSize)
     {
         for (auto& beamBlockIds : mCacheBlockIds.at(windowSize))
@@ -870,6 +881,14 @@ public:
     //! \details When llmRequest is provided and reuse is enabled, blocks will be stored.
     std::optional<KVCacheBlock::IdType> releaseBlocks(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
+
+    //! \brief Release prefix blocks in range [startIdx, numBlocks) for a sequence.
+    //! \details Used by disaggregated serving to free sender-side KV memory
+    //! for blocks whose data has already been transferred.  Reuses the
+    //! detachFrontBlock mechanism (decRefCount + eviction policy release).
+    //! Called by BlockManager::releasePrefixBlocks which coordinates the
+    //! shared mNumFrontBlocksRemoved counter across all window managers.
+    void releasePrefixBlocks(GenerationRequest& sequence, SizeType32 startIdx, SizeType32 numBlocks);
 
     //! \brief Simulate freeing all blocks for that sequence to check impact on number of free blocks
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
@@ -1382,6 +1401,13 @@ public:
     std::optional<KVCacheBlock::IdType> releaseBlocks(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);
 
+    //! \brief Release the first numBlocks prefix blocks of a sequence.
+    //! \details Mirrors detachFrontBlock logic: decRefCount + eviction policy
+    //! release for each prefix block.  The mNumFrontBlocksRemoved counter on
+    //! GenerationRequest ensures releaseBlocks (called during removeSequence)
+    //! skips already-freed prefix blocks.
+    void releasePrefixBlocks(GenerationRequest& sequence, SizeType32 numBlocks);
+
     [[nodiscard]] std::vector<KVCacheBlock::IdType> storeBlocksForReuse(
         GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinBlocks = false);
 
@@ -1891,6 +1917,17 @@ public:
 
     virtual void schedulingRemoveSequence(LlmRequest::RequestIdType requestId) = 0;
 
+    //! \brief Whether releasePrefixBlocks performs early block release.
+    [[nodiscard]] virtual bool supportsPrefixRelease() const noexcept
+    {
+        return false;
+    }
+
+    //! \brief Release prefix blocks for a sequence (no-op by default).
+    //! \details Concrete implementations (e.g. KVCacheManager) override this
+    //! to support early block release during chunked KV cache transfer.
+    virtual void releasePrefixBlocks(LlmRequest::RequestIdType /*requestId*/, SizeType32 /*numBlocks*/) {}
+
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getBlockPoolPointers() const = 0;
 
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getBlockScalePoolPointers() const = 0;
@@ -2250,6 +2287,16 @@ public:
 
     [[nodiscard]] std::optional<KVCacheBlock::IdType> removeSequence(LlmRequest::RequestIdType requestId,
         OptionalRef<LlmRequest const> llmRequest = std::nullopt, bool pinOnRelease = false) override;
+
+    //! \brief Release prefix blocks for a sequence without removing it.
+    //! \details Used by disaggregated serving for early block release during
+    //! chunked KV cache transfer.  No-op if the sequence does not exist.
+    [[nodiscard]] bool supportsPrefixRelease() const noexcept override
+    {
+        return true;
+    }
+
+    void releasePrefixBlocks(LlmRequest::RequestIdType requestId, SizeType32 numBlocks) override;
 
     void schedulingRemoveSequence(LlmRequest::RequestIdType requestId) override;
 

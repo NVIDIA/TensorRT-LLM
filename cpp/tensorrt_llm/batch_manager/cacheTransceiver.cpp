@@ -177,13 +177,14 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         " CacheTransceiverConfig::BackendType is not set.");
 
     std::optional<size_t> maxNumTokens = mCacheTransceiverConfig.value().getMaxTokensInBuffer();
+    auto chunkSizeBlocks = mCacheTransceiverConfig.value().getChunkSizeBlocks();
 
-    mCacheTransBufferManagers.push_back(
-        std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens));
+    mCacheTransBufferManagers.push_back(std::make_unique<kv_cache_manager::CacheTransBufferManager>(
+        cacheManager, maxNumTokens, /*transferIndexerKCache=*/false, chunkSizeBlocks));
     if (isMLA && cacheManager->isEnableIndexerKCache())
     {
-        mCacheTransBufferManagers.push_back(
-            std::make_unique<kv_cache_manager::CacheTransBufferManager>(cacheManager, maxNumTokens, true));
+        mCacheTransBufferManagers.push_back(std::make_unique<kv_cache_manager::CacheTransBufferManager>(
+            cacheManager, maxNumTokens, /*transferIndexerKCache=*/true, chunkSizeBlocks));
     }
 
     // RNN specific setup
@@ -262,7 +263,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         TLLM_THROW("Unsupported cache transceiver backend type ");
     }
 
-    auto makeFormatter = [cacheManager, isMLA, this]()
+    auto makeFormatter = [cacheManager, isMLA, chunkSizeBlocks, this]()
     {
         std::vector<kv_cache_manager::CacheTransBufferManager*> kvBufferPtrs;
         kvBufferPtrs.reserve(mCacheTransBufferManagers.size());
@@ -270,7 +271,7 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         {
             kvBufferPtrs.push_back(mgr.get());
         }
-        return createCacheFormatter(cacheManager, kvBufferPtrs, isMLA);
+        return createCacheFormatter(cacheManager, kvBufferPtrs, isMLA, chunkSizeBlocks);
     };
 
     auto makeRnnFormatter = [this]() -> std::unique_ptr<RnnCacheFormatter>

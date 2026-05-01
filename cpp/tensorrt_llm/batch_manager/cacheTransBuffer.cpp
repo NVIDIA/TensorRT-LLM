@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,10 +22,28 @@
 #include "tensorrt_llm/executor/executor.h"
 
 #include <NvInferRuntimeBase.h>
+#include <algorithm>
 #include <mutex>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
+namespace
+{
+std::optional<size_t> getEffectiveMaxNumTokens(
+    std::optional<size_t> maxNumTokens, std::optional<SizeType32> chunkSizeBlocks, SizeType32 tokensPerBlock)
+{
+    if (!chunkSizeBlocks.has_value())
+    {
+        return maxNumTokens;
+    }
+    auto const chunkNumTokens = static_cast<size_t>(chunkSizeBlocks.value()) * static_cast<size_t>(tokensPerBlock);
+    if (maxNumTokens.has_value())
+    {
+        return std::min(maxNumTokens.value(), chunkNumTokens);
+    }
+    return chunkNumTokens;
+}
+} // namespace
 
 // ============================================================================
 // FabricMemory Implementation
@@ -191,8 +209,8 @@ bool FabricMemory::supportFbaricMemory()
 // CacheTransBufferManager Implementation
 // ============================================================================
 
-size_t CacheTransBufferManager::computeTransferBufferSize(
-    KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens, bool transferIndexerKCache)
+size_t CacheTransBufferManager::computeTransferBufferSize(KVCacheManager::BaseKVCacheManager* cacheManager,
+    std::optional<size_t> maxNumTokens, bool transferIndexerKCache, std::optional<SizeType32> chunkSizeBlocks)
 {
     nvinfer1::DataType dataType;
     if (transferIndexerKCache)
@@ -205,6 +223,7 @@ size_t CacheTransBufferManager::computeTransferBufferSize(
     }
 
     auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
+    maxNumTokens = getEffectiveMaxNumTokens(maxNumTokens, chunkSizeBlocks, tokensPerBlock);
     size_t bufferSizeFromMaxNumToken = 0;
 
     if (maxNumTokens.has_value())
@@ -242,12 +261,13 @@ size_t CacheTransBufferManager::computeTransferBufferSize(
     return maxNumTokens.has_value() ? bufferSizeFromMaxNumToken : common::getEnvMemSizeForKVCacheTransferBuffer();
 }
 
-CacheTransBufferManager::CacheTransBufferManager(
-    KVCacheManager::BaseKVCacheManager* cacheManager, std::optional<size_t> maxNumTokens, bool transferIndexerKCache)
-    : BaseTransBufferManager(computeTransferBufferSize(cacheManager, maxNumTokens, transferIndexerKCache),
+CacheTransBufferManager::CacheTransBufferManager(KVCacheManager::BaseKVCacheManager* cacheManager,
+    std::optional<size_t> maxNumTokens, bool transferIndexerKCache, std::optional<SizeType32> chunkSizeBlocks)
+    : BaseTransBufferManager(
+        computeTransferBufferSize(cacheManager, maxNumTokens, transferIndexerKCache, chunkSizeBlocks),
         transferIndexerKCache ? cacheManager->getIndexerKCachePool()->getDataType()
                               : cacheManager->getPrimaryPool(0)->getDataType(),
-        maxNumTokens)
+        getEffectiveMaxNumTokens(maxNumTokens, chunkSizeBlocks, cacheManager->getBlockManager().getTokensPerBlock()))
     , mCacheManager{cacheManager}
     , mTransferIndexerKCache{transferIndexerKCache}
 {
@@ -268,7 +288,8 @@ size_t CacheTransBufferManager::preAllocBufferSize(
     {
         return 0;
     }
-    auto maxNumTokens = cacheTransceiverConfig->getMaxTokensInBuffer();
+    auto maxNumTokens = getEffectiveMaxNumTokens(
+        cacheTransceiverConfig->getMaxTokensInBuffer(), cacheTransceiverConfig->getChunkSizeBlocks(), tokensPerBlock);
     size_t transferBufferSize = common::getEnvMemSizeForKVCacheTransferBuffer();
     if (maxNumTokens.has_value())
     {
