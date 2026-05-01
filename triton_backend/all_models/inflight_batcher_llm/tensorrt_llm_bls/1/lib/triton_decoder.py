@@ -90,8 +90,8 @@ class TritonDecoder(Decoder):
             "image_bytes_input", "image_url_input", "video_bytes_input",
             "max_tokens", "bad_words", "stop_words", "end_id", "pad_id",
             "top_k", "top_p", "temperature", "length_penalty",
-            "repetition_penalty", "min_tokens", "presence_penalty",
-            "frequency_penalty", "seed", "return_log_probs",
+            "prompt_ignore_length", "repetition_penalty", "min_tokens",
+            "presence_penalty", "frequency_penalty", "seed", "return_log_probs",
             "return_context_logits", "return_generation_logits", "beam_width",
             "stream", "prompt_embedding_table", "prompt_vocab_size",
             "prompt_table_extra_id", "embedding_bias_words",
@@ -104,13 +104,13 @@ class TritonDecoder(Decoder):
 
         self.__undo_reshape_whitelist = {
             "max_tokens", "end_id", "pad_id", "top_k", "top_p", "temperature",
-            "length_penalty", "repetition_penalty", "min_tokens",
-            "presence_penalty", "frequency_penalty", "seed", "return_log_probs",
-            "return_context_logits", "return_generation_logits", "beam_width",
-            "stream", "prompt_vocab_size", "num_draft_tokens",
-            "use_draft_logits", "exclude_input_in_output",
-            "return_perf_metrics", "lora_weights", "lora_config",
-            "lora_task_id", "return_num_input_tokens",
+            "length_penalty", "prompt_ignore_length", "repetition_penalty",
+            "min_tokens", "presence_penalty", "frequency_penalty", "seed",
+            "return_log_probs", "return_context_logits",
+            "return_generation_logits", "beam_width", "stream",
+            "prompt_vocab_size", "num_draft_tokens", "use_draft_logits",
+            "exclude_input_in_output", "return_perf_metrics", "lora_weights",
+            "lora_config", "lora_task_id", "return_num_input_tokens",
             "return_num_output_tokens"
         }
 
@@ -455,6 +455,7 @@ class TritonDecoder(Decoder):
             "top_p": "runtime_top_p",
             "temperature": "temperature",
             "length_penalty": "len_penalty",
+            "prompt_ignore_length": "prompt_ignore_length",
             "repetition_penalty": "repetition_penalty",
             "min_tokens": "min_tokens",
             "presence_penalty": "presence_penalty",

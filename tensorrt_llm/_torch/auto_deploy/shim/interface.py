@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 import functools
 from typing import Callable, Dict, List, Optional, Tuple, Union, final
@@ -10,14 +25,13 @@ from .._compat import TRTLLM_AVAILABLE, KvCacheConfig
 
 if TRTLLM_AVAILABLE:
     import tensorrt_llm.bindings
-    from tensorrt_llm.mapping import Mapping
-
-    from ...._utils import torch_dtype_to_binding
-    from ...pyexecutor.mamba_cache_manager import (
+    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
         MambaHybridCacheManager,
         MixedMambaHybridCacheManager,
     )
-    from ...pyexecutor.resource_manager import KVCacheManager
+    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+    from tensorrt_llm._utils import torch_dtype_to_binding
+    from tensorrt_llm.mapping import Mapping
 
     CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
     DataType = tensorrt_llm.bindings.DataType
@@ -27,6 +41,7 @@ else:
     # but initialize_resources() and other cache-manager methods will raise.
     KVCacheManager = None
     MambaHybridCacheManager = None
+    MixedMambaHybridCacheManager = None
     CacheTypeCpp = None
     DataType = None
     Mapping = None

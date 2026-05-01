@@ -1,16 +1,14 @@
-# 🔥🚀⚡ AutoDeploy
+# 🔥🚀⚡ AutoDeploy Examples
 
-**AutoDeploy** automatically optimizes and deploys HuggingFace LLM checkpoints for high-performance inference on NVIDIA GPUs. It works as part of [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) or as a **standalone** lightweight package (`llm-compiler`).
+This folder contains runnable examples for **AutoDeploy** as it ships inside [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM). For general AutoDeploy documentation, motivation, support matrix, and feature overview, please see the [official docs](https://nvidia.github.io/TensorRT-LLM/features/auto_deploy/auto-deploy.html).
 
-For general AutoDeploy documentation, motivation, support matrix, and feature overview, please see the [official docs](https://nvidia.github.io/TensorRT-LLM/features/auto_deploy/auto-deploy.html).
+> Looking for the lightweight standalone package (no TRT-LLM required)? See **LLM Compiler** at [github.com/NVIDIA/llm-compiler](https://github.com/NVIDIA/llm-compiler). That repo is generated from this source tree by [`llmc/create_standalone_package.py`](./llmc/create_standalone_package.py).
 
 ______________________________________________________________________
 
 ## Quick Start
 
-### Option A: As part of TensorRT-LLM (full features)
-
-AutoDeploy is included with the TRT-LLM installation:
+AutoDeploy is included with the TRT-LLM installation.
 
 ```bash
 sudo apt-get -y install libopenmpi-dev && pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm
@@ -18,46 +16,7 @@ sudo apt-get -y install libopenmpi-dev && pip3 install --upgrade pip setuptools 
 
 You can refer to the [TRT-LLM installation guide](../../docs/source/installation/installation-guide.md) for more information.
 
-### Option B: Standalone package (lightweight, no TRT-LLM required)
-
-```bash
-pip install llm-compiler
-```
-
-Or install from source with [uv](https://docs.astral.sh/uv/) (recommended):
-
-```bash
-uv venv .venv --python 3.12
-source .venv/bin/activate
-uv pip install -e '.[dev]'
-```
-
-Or with pip:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -e '.[dev]'
-```
-
-In standalone mode, AutoDeploy uses PyTorch, Triton, and FlashInfer backends. TRT-LLM-specific optimizations (custom CUDA kernels, optimized all-reduce, etc.) are available only when using TRT-LLM.
-
-```python
-# Standalone usage
-from auto_deploy._compat import TRTLLM_AVAILABLE
-print(f"TRT-LLM available: {TRTLLM_AVAILABLE}")
-
-# When using TRT-LLM, the import path is:
-# from tensorrt_llm._torch.auto_deploy import LLM, LlmArgs
-```
-
-#### Running tests (standalone)
-
-```bash
-pytest tests/
-```
-
-### Run an example
+Run a simple example with a Hugging Face model:
 
 ```bash
 cd examples/auto_deploy
@@ -182,15 +141,6 @@ llm = LLM(
     max_seq_len=<MAX_SEQ_LEN>,
     max_batch_size=<MAX_BATCH_SIZE>,
 )
-```
-
-In standalone mode, you can directly use the graph transformation and compilation pipeline:
-
-```python
-# Standalone
-from auto_deploy.export import torch_export_to_gm
-from auto_deploy.transform.interface import TransformRegistry
-from auto_deploy.models.factory import ModelFactoryRegistry
 ```
 
 ### Expert Configuration of LLM API

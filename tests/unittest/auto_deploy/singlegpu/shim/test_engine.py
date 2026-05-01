@@ -6,11 +6,11 @@ import torch.nn as nn
 from _model_test_utils import default_max_num_tokens
 
 from tensorrt_llm import SamplingParams
+from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import ADEngine
 from tensorrt_llm._torch.auto_deploy.shim.demollm import DemoEngine
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 
 class TransformerLikeModelwithFakeCachePool(nn.Module):
