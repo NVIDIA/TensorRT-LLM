@@ -28,7 +28,12 @@ class TransformerArgs:
     timesteps: torch.Tensor
     embedded_timestep: torch.Tensor
     positional_embeddings: tuple[torch.Tensor, torch.Tensor]
-    cross_positional_embeddings: tuple[torch.Tensor, torch.Tensor] | None
+    # Cross-modal (AV) RoPE pe carried in two layouts:
+    #   *_local : sharded along seq (matches sharded Q for Q-side rope)
+    #   *_full  : un-sharded (matches all-gathered K for K-side rope)
+    # Equal at construction time; *_local is sliced inside _shard_transformer_args.
+    cross_positional_embeddings_local: tuple[torch.Tensor, torch.Tensor] | None
+    cross_positional_embeddings_full: tuple[torch.Tensor, torch.Tensor] | None
     cross_scale_shift_timestep: torch.Tensor | None
     cross_gate_timestep: torch.Tensor | None
     enabled: bool
@@ -172,7 +177,8 @@ class TransformerArgsPreprocessor:
             timesteps=timestep,
             embedded_timestep=embedded_timestep,
             positional_embeddings=static_pe,
-            cross_positional_embeddings=None,
+            cross_positional_embeddings_local=None,
+            cross_positional_embeddings_full=None,
             cross_scale_shift_timestep=None,
             cross_gate_timestep=None,
             enabled=modality.enabled,
@@ -271,7 +277,8 @@ class MultiModalTransformerArgsPreprocessor:
         )
         return replace(
             transformer_args,
-            cross_positional_embeddings=static_cross_pe,
+            cross_positional_embeddings_local=static_cross_pe,
+            cross_positional_embeddings_full=static_cross_pe,
             cross_scale_shift_timestep=cross_scale_shift_timestep,
             cross_gate_timestep=cross_gate_timestep,
         )

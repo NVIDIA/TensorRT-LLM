@@ -473,16 +473,6 @@ class BasicAVTransformerBlock(nn.Module):
         dist.all_gather(gathered, x, group=self._seq_parallel_pg)
         return torch.cat(gathered, dim=dim)
 
-    def _sp_gather_pe(self, pe):
-        """All-gather RoPE (cos, sin) tuple along the sequence dim."""
-        if pe is None:
-            return None
-        cos, sin = pe
-        # Split RoPE: [B, H, S, D] — sequence at dim 2
-        # Interleaved RoPE: [B, S, D] — sequence at dim 1
-        seq_dim = 2 if cos.ndim == 4 else 1
-        return (self._sp_all_gather(cos, dim=seq_dim), self._sp_all_gather(sin, dim=seq_dim))
-
     # -- Forward -------------------------------------------------------------
 
     def forward(
@@ -617,16 +607,13 @@ class BasicAVTransformerBlock(nn.Module):
                 if self._audio_is_sharded:
                     k_a2v = self._sp_all_gather(k_a2v)
                     v_a2v = self._sp_all_gather(v_a2v)
-                    k_pe_a2v = self._sp_gather_pe(audio.cross_positional_embeddings)
-                else:
-                    k_pe_a2v = audio.cross_positional_embeddings
 
                 a2v_out = (
                     self.audio_to_video_attn(
                         vx_scaled,
                         pre_projected_kv=(k_a2v, v_a2v),
-                        pe=video.cross_positional_embeddings,
-                        k_pe=k_pe_a2v,
+                        pe=video.cross_positional_embeddings_local,
+                        k_pe=audio.cross_positional_embeddings_full,
                     )
                     * gate_out_a2v
                 )
@@ -647,16 +634,13 @@ class BasicAVTransformerBlock(nn.Module):
                 if self._use_seq_parallel:
                     k_v2a = self._sp_all_gather(k_v2a)
                     v_v2a = self._sp_all_gather(v_v2a)
-                    k_pe_v2a = self._sp_gather_pe(video.cross_positional_embeddings)
-                else:
-                    k_pe_v2a = video.cross_positional_embeddings
 
                 v2a_out = (
                     self.video_to_audio_attn(
                         ax_scaled,
                         pre_projected_kv=(k_v2a, v_v2a),
-                        pe=audio.cross_positional_embeddings,
-                        k_pe=k_pe_v2a,
+                        pe=audio.cross_positional_embeddings_local,
+                        k_pe=video.cross_positional_embeddings_full,
                     )
                     * gate_out_v2a
                 )
@@ -1192,7 +1176,7 @@ class LTXModel(nn.Module):
             timesteps=_shard(args.timesteps),
             embedded_timestep=_shard(args.embedded_timestep),
             positional_embeddings=_shard_pe(args.positional_embeddings),
-            cross_positional_embeddings=_shard_pe(args.cross_positional_embeddings),
+            cross_positional_embeddings_local=_shard_pe(args.cross_positional_embeddings_full),
             cross_scale_shift_timestep=_shard(args.cross_scale_shift_timestep),
             cross_gate_timestep=_shard(args.cross_gate_timestep),
         )
