@@ -1803,7 +1803,21 @@ class KVCacheManagerV2(BaseResourceManager):
             f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
         cache_tiers: List[CacheTierConfig] = [GpuCacheTierConfig(quota=quota)]
-        if kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size >= 0:
+        _host_override = os.environ.get("TRTLLM_KVCACHE_HOST_SIZE_OVERRIDE")
+        if _host_override is not None:
+            try:
+                host_quota = max(0, int(_host_override))
+            except ValueError:
+                logger.warning(
+                    f"TRTLLM_KVCACHE_HOST_SIZE_OVERRIDE={_host_override!r} is not "
+                    f"a valid integer; ignoring override.")
+                _host_override = None
+        if _host_override is not None:
+            logger.info(
+                f"TRTLLM_KVCACHE_HOST_SIZE_OVERRIDE is set; "
+                f"V2 host cache quota forced to {host_quota / (1 << 30):.2f}GiB"
+            )
+        elif kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size >= 0:
             host_quota = kv_cache_config.host_cache_size
         else:
             # The V2 MAX_UTILIZATION scheduler relies on suspend/resume to
