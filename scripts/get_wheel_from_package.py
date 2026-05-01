@@ -101,8 +101,7 @@ def get_wheel_from_package(arch, artifact_path, timeout):
 
     third_party_sources = tmp_dir / "third-party-sources.json"
     if third_party_sources.exists():
-        shutil.copy2(third_party_sources,
-                     build_dir / "third-party-sources.json")
+        shutil.copy2(third_party_sources, llm_root / "third-party-sources.json")
         print(f"Copied third-party-sources.json -> {build_dir}")
 
     shutil.rmtree(tmp_dir)

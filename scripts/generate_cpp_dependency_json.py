@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 GITLAB_OSS_GROUP = "nvidia/tensorrt-llm/oss-components"
 GITLAB_API_BASE = "https://gitlab.com/api/v4"
 
+REPO_URL_OVERWRITE = {"deep_ep_download": "https://github.com/deepseek-ai/DeepEP"}
+
 _FETCH_CONTENT_JSON = pathlib.Path(__file__).parent.parent / "3rdparty" / "fetch_content.json"
 
 
@@ -169,6 +171,8 @@ def main():
     for src_dir in src_dirs:
         package_name = src_dir.name.removesuffix("-src")
         source_info = get_source_info(args.deps_dir, package_name)
+        if package_name in REPO_URL_OVERWRITE:
+            source_info["url"] = REPO_URL_OVERWRITE[package_name]
         logger.info(
             "%s -> upstream url=%s tag=%s", package_name, source_info["url"], source_info["tag"]
         )
