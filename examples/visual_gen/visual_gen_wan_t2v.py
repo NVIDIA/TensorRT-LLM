@@ -60,12 +60,6 @@ def parse_args():
         help="Number of frames to generate (default: auto-detect)",
     )
     parser.add_argument(
-        "--frame_rate",
-        type=float,
-        default=None,
-        help="Output video frame rate (default: auto-detect)",
-    )
-    parser.add_argument(
         "--steps",
         type=int,
         default=None,
@@ -375,13 +369,11 @@ def main():
         width = args.width if args.width is not None else defaults.width
         num_frames = args.num_frames if args.num_frames is not None else defaults.num_frames
         steps = args.steps if args.steps is not None else defaults.num_inference_steps
-        frame_rate = args.frame_rate if args.frame_rate is not None else defaults.frame_rate
+        frame_rate = defaults.frame_rate
 
         logger.info(f"Generating video for prompt: '{args.prompt}'")
         logger.info(f"Negative prompt: '{negative_prompt_log}'")
-        logger.info(
-            f"Resolution: {height}x{width}, Frames: {num_frames}, Steps: {steps}, FPS: {frame_rate}"
-        )
+        logger.info(f"Resolution: {height}x{width}, Frames: {num_frames}, Steps: {steps}")
 
         start_time = time.time()
 
@@ -400,7 +392,7 @@ def main():
                 guidance_scale=args.guidance_scale,
                 seed=args.seed,
                 num_frames=args.num_frames,
-                frame_rate=args.frame_rate,
+                frame_rate=frame_rate,
                 negative_prompt=args.negative_prompt,
                 extra_params=extra_params if extra_params else None,
             ),
