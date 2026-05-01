@@ -3,6 +3,8 @@
 Tests for:
 - RankState serialization/deserialization
 - ADPRouter interface and DefaultADPRouter
+- Piggybacking per-rank iter-stats payloads on the existing ADP allgather
+- Strict/relaxed attention-DP request routing while respecting rank capacity
 """
 
 from unittest.mock import MagicMock, Mock
@@ -109,6 +111,8 @@ def all_ranks_num_active_tokens():
 
 
 class TestRankState:
+    # RankState is the wire payload shared across attention-DP ranks. Keep its
+    # serialization stable because iter-stats now ride on the same allgather.
     def test_creation(self):
         state = RankState(rank=0, num_active_requests=5, num_active_tokens=100)
         assert state.rank == 0
@@ -139,6 +143,8 @@ class TestRankState:
 
 
 class TestDefaultADPRouter:
+    # Router tests model strict placement, relaxed placement, and capacity
+    # handling so ADP ranks report consistent load and iter-stats state.
     def test_interface_compliance(self):
         router = DefaultADPRouter(dist=_mock_dist())
         assert isinstance(router, ADPRouter)

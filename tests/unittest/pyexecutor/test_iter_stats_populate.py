@@ -30,6 +30,10 @@ unbound call against a minimal fake ``self``. Exercising the production
 function directly (rather than a duplicated shim) catches drift from
 refactors, renamed attributes, or silent unit changes in the populate
 block.
+
+Attention-DP-specific cases verify that dummy padding is excluded from
+planner/FPM metrics and that rank-local iter-stats payloads are aggregated
+only when all ranks line up on the same iteration.
 """
 
 from __future__ import annotations
@@ -215,6 +219,7 @@ def _invoke_update_iter_stats(
 # ---------------------------------------------------------------------------
 # Populate tests: call the real ``_update_iter_stats`` and assert on the
 # inflight_batching_stats request-aggregate fields it populates.
+# These are the fields Dynamo publishes as forward-pass metrics.
 # ---------------------------------------------------------------------------
 
 
@@ -594,6 +599,8 @@ def _build_adp_stats_harness(pending_stats, *, rank=0, tp_rank=0):
 
 
 def test_attention_dp_aggregation_sums_rank_local_fields_only():
+    # Rank 0 emits the planner-visible aggregate; each ADP rank contributes
+    # only rank-local scheduled work, while queued fields remain rank-0-owned.
     rank0_stats = _make_adp_iteration_stats(
         iter_id=9,
         num_context_requests=1,
