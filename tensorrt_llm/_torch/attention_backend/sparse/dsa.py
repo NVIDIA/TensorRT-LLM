@@ -1974,7 +1974,7 @@ class DSATrtllmAttention(TrtllmAttention):
             cached_token_indptr,
             kv_indptr,
             max_seq_len,
-            self.wrapper.rotary_cos_sin,
+            self.rotary_cos_sin,
             self.num_heads,
             self.mla_params.qk_nope_head_dim,
             self.mla_params.qk_rope_head_dim,
@@ -1989,7 +1989,7 @@ class DSATrtllmAttention(TrtllmAttention):
             metadata.kv_cache_manager.max_seq_len,
             sink_token_length,
             beam_width,
-            self.wrapper.quant_mode,
+            self.quant_mode,
         )
 
 
