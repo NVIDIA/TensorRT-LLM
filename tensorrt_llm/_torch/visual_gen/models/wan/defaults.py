@@ -59,11 +59,11 @@ _WAN22_14B_PARAMS = {
 _WAN22_5B_PARAMS = {
     "height": 704,
     "width": 1280,
-    "num_inference_steps": 40,
+    "num_inference_steps": 50,
     "guidance_scale": 5.0,
     "max_sequence_length": 512,
-    "num_frames": 81,
-    "frame_rate": 16.0,
+    "num_frames": 121,
+    "frame_rate": 24.0,
 }
 
 _WAN22_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {

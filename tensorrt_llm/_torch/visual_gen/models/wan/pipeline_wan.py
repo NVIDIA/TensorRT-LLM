@@ -32,7 +32,7 @@ from .transformer_wan import WanTransformer3DModel
 # - Wan2.1-T2V-14B: Single-stage text-to-video (14B parameters)
 # - Wan2.1-T2V-1.3B: Single-stage text-to-video (1.3B parameters)
 # - Wan2.2-T2V-A14B: Two-stage text-to-video (14B, boundary_ratio for high/low-noise stages; supports 480P & 720P)
-# - Wan2.2-TI2V-5B: Single-stage, text-to-video and image-to-video (5B; supports 480P & 720P)
+# - Wan2.2-TI2V-5B: Single-stage, text-to-video and image-to-video (5B; supports 720P)
 
 WAN_TEACACHE_COEFFICIENTS = {
     "1.3B": {
@@ -91,9 +91,9 @@ class WanPipeline(BasePipeline):
         self.is_wan22_5b = self.expand_timesteps
 
         # Validate TeaCache compatibility before allocating GPU memory
-        if self.is_wan22_14b and model_config.cache_backend == "teacache":
+        if (self.is_wan22_14b or self.is_wan22_5b) and model_config.cache_backend == "teacache":
             raise ValueError(
-                "TeaCache is not supported for Wan 2.2 T2V models. "
+                "TeaCache is not supported for Wan 2.2 models. "
                 "Use cache_backend='none' or 'cache_dit' (not 'teacache')."
             )
 
@@ -141,11 +141,13 @@ class WanPipeline(BasePipeline):
     def default_warmup_resolutions(self):
         if self.is_wan22_5b:
             # The 720p resolution of Wan2.2 TI2V 5B model is 704x1280
-            return [(480, 832), (704, 1280)]
+            return [(704, 1280)]
         return [(480, 832), (720, 1280)]
 
     @property
     def default_warmup_num_frames(self):
+        if self.is_wan22_5b:
+            return [33, 121]
         return [33, 81]
 
     @property
@@ -197,8 +199,9 @@ class WanPipeline(BasePipeline):
             logger.info("Detected Wan 2.1 T2V (single-stage denoising)")
 
         # Set default VAE scale factors (will be overridden if VAE is loaded)
+        default_vae_scale_factor_spatial = 16 if self.is_wan22_5b else 8
         self.vae_scale_factor_temporal = 4
-        self.vae_scale_factor_spatial = 8
+        self.vae_scale_factor_spatial = default_vae_scale_factor_spatial
 
         if PipelineComponent.TOKENIZER not in skip_components:
             logger.info("Loading tokenizer...")
@@ -224,7 +227,11 @@ class WanPipeline(BasePipeline):
             ).to(device)
 
             self.vae_scale_factor_temporal = getattr(self.vae.config, "scale_factor_temporal", 4)
-            self.vae_scale_factor_spatial = getattr(self.vae.config, "scale_factor_spatial", 8)
+            self.vae_scale_factor_spatial = getattr(
+                self.vae.config,
+                "scale_factor_spatial",
+                default_vae_scale_factor_spatial,
+            )
 
         if PipelineComponent.SCHEDULER not in skip_components:
             logger.info("Loading scheduler...")
@@ -341,7 +348,11 @@ class WanPipeline(BasePipeline):
         # Wan 2.2 TI2V-5B takes one conditioning image if provided
         image = req.params.image
         if isinstance(image, list):
-            raise ValueError(f"WanPipeline I2V expects a single image, got list of {len(image)}.")
+            if len(image) != 1:
+                raise ValueError(
+                    f"WanPipeline I2V expects a single image, got list of {len(image)}."
+                )
+            image = image[0]
 
         return self.forward(
             prompt=req.prompt,
@@ -377,7 +388,7 @@ class WanPipeline(BasePipeline):
     ):
         pipeline_start = time.time()
 
-        # I2V is only supported on Wan 2.2 TI2V-5B here. Wan 2.1 I2V and Wan 2.2 A14B I2V use WanImageToVideoPipeline
+        # WanPipeline supports I2V for Wan 2.2 TI2V-5B. Use WanImageToVideoPipeline for Wan 2.1 I2V and Wan 2.2 A14B I2V
         is_i2v = image is not None
         if is_i2v and not self.is_wan22_5b:
             raise ValueError(
@@ -421,6 +432,13 @@ class WanPipeline(BasePipeline):
             f"Running {mode_str} inference "
             f"(boundary_ratio={boundary_ratio}, has_transformer_2={self.transformer_2 is not None})"
         )
+
+        # Set model-specific defaults if not provided
+        defaults = self.default_generation_params
+        if num_inference_steps is None:
+            num_inference_steps = defaults["num_inference_steps"]
+        if guidance_scale is None:
+            guidance_scale = defaults["guidance_scale"]
 
         if self.is_wan22_14b and guidance_scale_2 is None:
             guidance_scale_2 = guidance_scale  # Match HF: default to guidance_scale when unset
@@ -622,6 +640,8 @@ class WanPipeline(BasePipeline):
 
         return randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
 
+    # Adapted from diffusers.pipelines.wan.pipeline_wan_i2v
+    # https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/wan/pipeline_wan_i2v.py
     @nvtx_range("_prepare_latents_wan22_5B_i2v", color="blue")
     def _prepare_latents_wan22_5B_i2v(
         self,
@@ -642,7 +662,7 @@ class WanPipeline(BasePipeline):
         latent_height = height // self.vae_scale_factor_spatial
         latent_width = width // self.vae_scale_factor_spatial
 
-        num_channels_latents = getattr(self.transformer.config, "in_channels", 16)
+        num_channels_latents = getattr(self.transformer.config, "in_channels", 48)
         shape = (batch_size, num_channels_latents, num_latent_frames, latent_height, latent_width)
         latents = randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
 
@@ -659,6 +679,8 @@ class WanPipeline(BasePipeline):
         latent_condition = retrieve_latents(self.vae.encode(image), sample_mode="argmax").to(
             self.dtype
         )
+        if batch_size > 1:
+            latent_condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
 
         # Normalize latents to match diffusion model's latent space
         latents_mean = (

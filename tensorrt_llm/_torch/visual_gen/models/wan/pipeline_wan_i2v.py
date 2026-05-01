@@ -454,6 +454,13 @@ class WanImageToVideoPipeline(BasePipeline):
         if negative_prompt is None:
             negative_prompt = WAN_DEFAULT_NEGATIVE_PROMPT
 
+        # Set model-specific defaults if not provided
+        defaults = self.default_generation_params
+        if num_inference_steps is None:
+            num_inference_steps = defaults["num_inference_steps"]
+        if guidance_scale is None:
+            guidance_scale = defaults["guidance_scale"]
+
         if self.is_wan22_14b and guidance_scale_2 is None:
             guidance_scale_2 = guidance_scale  # Match HF: default to guidance_scale when unset
 
