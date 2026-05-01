@@ -113,6 +113,16 @@ eval $pytestCommand
 pytest_exit_code=$?
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
 
+# CBTS Layer 3 may narrow this shard's test list below pytest-split's
+# --splits count, leaving some groups with 0 tests. pytest then exits 5
+# (no tests collected). Treat exit 5 as success when CBTS is active —
+# other shards run the actual affected tests. This mirrors the K8s-path
+# tolerance in runLLMTestlistOnPlatformImpl (noRegularTests && noIsolateTests).
+if [ "$pytest_exit_code" -eq 5 ] && [ "${cbtsActive:-false}" = "true" ]; then
+    echo "Rank${SLURM_PROCID} CBTS Layer 3: 0 tests in this shard after narrowing — marking as success"
+    pytest_exit_code=0
+fi
+
 # DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
 # Remove this after the issue is resolved
 if [ $pytest_exit_code -eq 4 ]; then
