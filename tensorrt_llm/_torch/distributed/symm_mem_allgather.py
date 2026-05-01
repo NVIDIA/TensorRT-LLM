@@ -46,9 +46,10 @@ class SymmetricMemoryAllGather(nn.Module):
     - SM 9.0: 4, 6, 8 GPUs
     - SM 10.0: 6, 8 GPUs
 
-    Only dim-0 gather is served; other dims return ``None`` so the caller
-    falls back to NCCL (the transpose+contiguous copies that a generic-dim
-    path would need erode the MULTIMEM latency advantage).
+    Any gather dim is supported via transpose-to-dim-0 in :py:meth:`forward`.
+    Large outputs on the dim != 0 path fall back to NCCL via
+    ``_SYMM_MEM_THRESHOLD`` because the transpose+contiguous copies
+    erode the MULTIMEM latency advantage on prefill-sized tensors.
     """
 
     MiB = 1024 * 1024
@@ -75,6 +76,21 @@ class SymmetricMemoryAllGather(nn.Module):
             8: 128 * MiB,
         },
     }
+
+    # Output-bytes threshold above which the dim != 0 (transpose) path falls
+    # back to NCCL. The transpose+contiguous copies plus the multimem
+    # all-at-once latency stop beating NCCL ring-LL's pipelined bandwidth —
+    # and on paths where multi-stream overlap is disabled (e.g. piecewise
+    # CG under disable_multi_stream), the multimem call ends up fully
+    # exposed on the critical path. Falling back to NCCL in that regime
+    # trades ~µs of latency for several ms of saved transpose + better
+    # pipelining on prefill-sized tensors.
+    # Measured on B200/H100 ws=8 piecewise CG with multi_stream disabled
+    # (#13321). Cross-over is weakly ws-dependent (~17% via the (ws-1)/ws
+    # factor), so a single scalar covers all measured (cap, ws) configs.
+    # The dim == 0 path is unaffected (no transpose), and is gated only
+    # by the workspace overflow check (_MAX_SIZES).
+    _SYMM_MEM_THRESHOLD = 1 * MiB
 
     def __init__(
         self,
@@ -212,20 +228,28 @@ class SymmetricMemoryAllGather(nn.Module):
         except Exception as e:
             logger.warning(f"SymmetricMemoryAllGather: workspace pre-allocation failed: {e}")
 
+    @staticmethod
+    def _normalize_dim(dim: int, ndim: int) -> Optional[int]:
+        """Normalize a possibly-negative dim. Returns ``None`` if out of range."""
+        if dim < 0:
+            dim = ndim + dim
+        if dim < 0 or dim >= ndim:
+            return None
+        return dim
+
     def can_use_symm_mem(self, inp: torch.Tensor, dim: int = 0) -> bool:
-        """Check whether this tensor can be gathered with symm_mem."""
+        """Check whether this tensor can be gathered with symm_mem.
+
+        Non-zero gather dims are supported by transposing the gather dim to
+        position 0 in :py:meth:`forward`, performing the dim-0 multimem
+        allgather, and transposing back.
+        """
         if self.disabled:
             return False
         if inp.dtype != self.dtype:
             return False
-        # Normalize negative dim.
-        ndim = inp.ndim
-        if dim < 0:
-            dim = ndim + dim
-        if dim < 0 or dim >= ndim:
-            return False
-        # Only dim-0 is served; other dims fall back to NCCL.
-        if dim != 0:
+        dim = self._normalize_dim(dim, inp.ndim)
+        if dim is None:
             return False
         # multimem_all_gather_out requires 4B-aligned input.
         inp_bytes = inp.numel() * inp.element_size()
@@ -235,6 +259,12 @@ class SymmetricMemoryAllGather(nn.Module):
         # Use >= to match SymmetricMemoryAllReduce's bound.
         out_bytes = inp_bytes * self.world_size
         if out_bytes >= self.max_size:
+            return False
+        # On the dim != 0 (transpose) path, gate by the perf threshold so
+        # that large tensors (typical of prefill) fall back to NCCL where
+        # ring-LL pipelining beats multimem-with-transpose. dim == 0 is
+        # unaffected.
+        if dim != 0 and out_bytes >= self._SYMM_MEM_THRESHOLD:
             return False
         return True
 
@@ -259,13 +289,24 @@ class SymmetricMemoryAllGather(nn.Module):
         dim: int = 0,
     ) -> Optional[torch.Tensor]:
         """
-        Perform allgather using multimem_all_gather_out along dim 0.
+        Perform allgather using multimem_all_gather_out.
 
-        Returns the gathered tensor, or ``None`` if this call cannot be
-        served by symm_mem (caller should fall back to NCCL). Non-zero
-        gather dims are deliberately rejected — see class docstring.
+        Supports any gather dimension by transposing the gather dim to
+        position 0, running the dim-0 multimem allgather, and transposing
+        back. Returns the gathered tensor, or ``None`` if this call cannot
+        be served by symm_mem (caller should fall back to NCCL).
         """
         if not self.can_use_symm_mem(inp, dim):
             return None
 
-        return self._allgather_dim0(inp)
+        dim = self._normalize_dim(dim, inp.ndim)
+        assert dim is not None, "dim already validated by can_use_symm_mem"
+
+        if dim == 0:
+            return self._allgather_dim0(inp)
+
+        # For dim != 0: move the gather dim to position 0,
+        # allgather along dim-0, then move it back.
+        inp_t = inp.transpose(0, dim).contiguous()
+        gathered = self._allgather_dim0(inp_t)
+        return gathered.transpose(0, dim).contiguous()
