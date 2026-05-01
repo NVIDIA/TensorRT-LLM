@@ -241,9 +241,7 @@ class TestPipelineExtraParamSpecs:
         """Wan 2.2 A14B exposes guidance_scale_2 and boundary_ratio."""
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
 
-        specs = WanPipeline.extra_param_specs.fget(
-            _wan_mock(is_wan22_14b=True, is_wan22_5b=False)
-        )
+        specs = WanPipeline.extra_param_specs.fget(_wan_mock(is_wan22_14b=True, is_wan22_5b=False))
         assert "guidance_scale_2" in specs
         assert "boundary_ratio" in specs
         assert specs["guidance_scale_2"].type == "float"
@@ -260,9 +258,7 @@ class TestPipelineExtraParamSpecs:
         """Wan 2.2 TI2V-5B has no model-specific extra params."""
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
 
-        specs = WanPipeline.extra_param_specs.fget(
-            _wan_mock(is_wan22_14b=False, is_wan22_5b=True)
-        )
+        specs = WanPipeline.extra_param_specs.fget(_wan_mock(is_wan22_14b=False, is_wan22_5b=True))
         assert specs == {}
 
     def test_wan_i2v_extra_specs(self):
@@ -479,9 +475,7 @@ class TestVisualGenDefaultParams:
         """Wan 2.2 A14B returns 720p defaults with guidance_scale_2/boundary_ratio."""
         from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
 
-        vg = self._make_visual_gen(
-            WanPipeline, _wan_mock(is_wan22_14b=True, is_wan22_5b=False)
-        )
+        vg = self._make_visual_gen(WanPipeline, _wan_mock(is_wan22_14b=True, is_wan22_5b=False))
         params = vg.default_params
         assert params.height == 720
         assert params.width == 1280
@@ -816,9 +810,7 @@ class TestRequestValidation:
             WanImageToVideoPipeline,
         )
 
-        executor = self._make_mock_executor(
-            WanImageToVideoPipeline, _wan_mock(num_heads=12)
-        )
+        executor = self._make_mock_executor(WanImageToVideoPipeline, _wan_mock(num_heads=12))
         req = self._make_request(image="/path/to/img.png")
         self._merge_and_validate(executor, req)
 
@@ -882,9 +874,7 @@ class TestRequestValidation:
         )
         from tensorrt_llm.visual_gen import VisualGenParamsError
 
-        executor = self._make_mock_executor(
-            WanImageToVideoPipeline, _wan_mock(num_heads=12)
-        )
+        executor = self._make_mock_executor(WanImageToVideoPipeline, _wan_mock(num_heads=12))
         req = self._make_request(
             image="/img.png",
             extra_params={"last_image": 123},

@@ -47,15 +47,24 @@ def parse_args():
     )
 
     # Generation Params
-    parser.add_argument("--height", type=int, default=None, help="Video height (default: auto-detect)")
-    parser.add_argument("--width", type=int, default=None, help="Video width (default: auto-detect)")
+    parser.add_argument(
+        "--height", type=int, default=None, help="Video height (default: auto-detect)"
+    )
+    parser.add_argument(
+        "--width", type=int, default=None, help="Video width (default: auto-detect)"
+    )
     parser.add_argument(
         "--num_frames",
         type=int,
         default=None,
         help="Number of frames to generate (default: auto-detect)",
     )
-    parser.add_argument("--frame_rate", type=float, default=None, help="Output video frame rate (default: auto-detect)")
+    parser.add_argument(
+        "--frame_rate",
+        type=float,
+        default=None,
+        help="Output video frame rate (default: auto-detect)",
+    )
     parser.add_argument(
         "--steps",
         type=int,
@@ -359,7 +368,9 @@ def main():
 
     try:
         defaults = visual_gen.default_params
-        negative_prompt_log = args.negative_prompt if args.negative_prompt is not None else "[model default]"
+        negative_prompt_log = (
+            args.negative_prompt if args.negative_prompt is not None else "[model default]"
+        )
         height = args.height if args.height is not None else defaults.height
         width = args.width if args.width is not None else defaults.width
         num_frames = args.num_frames if args.num_frames is not None else defaults.num_frames
@@ -368,7 +379,9 @@ def main():
 
         logger.info(f"Generating video for prompt: '{args.prompt}'")
         logger.info(f"Negative prompt: '{negative_prompt_log}'")
-        logger.info(f"Resolution: {height}x{width}, Frames: {num_frames}, Steps: {steps}, FPS: {frame_rate}")
+        logger.info(
+            f"Resolution: {height}x{width}, Frames: {num_frames}, Steps: {steps}, FPS: {frame_rate}"
+        )
 
         start_time = time.time()
 
@@ -395,7 +408,9 @@ def main():
 
         logger.info(f"Generation completed in {time.time() - start_time:.2f}s")
 
-        MediaStorage.save_video(output.video, args.output_path, audio=output.audio, frame_rate=frame_rate)
+        MediaStorage.save_video(
+            output.video, args.output_path, audio=output.audio, frame_rate=frame_rate
+        )
 
     finally:
         visual_gen.shutdown()

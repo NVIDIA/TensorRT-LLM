@@ -4,9 +4,10 @@
 """Correctness tests for Wan 2.2 TI2V-5B pipeline against HuggingFace reference.
 
 Tests verify that the TRTLLM WanPipeline produces decoded video with high cosine
-similarity to the HuggingFace diffusers baseline for both T2V and I2V. The threshold is 0.99 for T2V test and 0.98 (not 0.99) for I2V test because
-I2V image conditioning (VAE-encoded image + mask concatenated to the latent)
-accumulates additional bfloat16 error compared to T2V.
+similarity to the HuggingFace diffusers baseline for both T2V and I2V.
+The threshold is 0.99 for T2V and 0.98 (not 0.99) for I2V because I2V image
+conditioning (VAE-encoded image + mask concatenated to the latent) accumulates
+additional bfloat16 error compared to T2V.
 
 Model tested:
   - Wan2.2-TI2V-5B-Diffusers   (704x1280, 9 frames)
