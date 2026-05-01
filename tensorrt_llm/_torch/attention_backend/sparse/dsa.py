@@ -1,10 +1,12 @@
 """Dense Sparse Attention (DSA) backend for TRT-LLM with indexer-based TopK selection."""
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import tensorrt_llm
 import tensorrt_llm.bindings
@@ -1042,6 +1044,23 @@ def _to_float(hidden_states: torch.Tensor) -> torch.Tensor:
     return hidden_states.float()
 
 
+@contextmanager
+def _tf32_matmul_enabled():
+    """Temporarily enable TF32 tensor cores for FP32 matmul in this scope.
+
+    Forces PyTorch/cuBLASLt to use CUBLAS_COMPUTE_32F_FAST_TF32, which
+    guarantees TF32 tensor cores. Plain CUBLAS_COMPUTE_32F (used by
+    torch.ops.trtllm.cublas_mm) falls back to SIMT SGEMM on CUDA cores
+    based on cuBLASLt heuristics for small M.
+    """
+    prev = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev
+
+
 class Indexer(nn.Module):
     """DSA sparse attention indexer that selects top-K KV cache entries per token."""
 
@@ -1090,8 +1109,8 @@ class Indexer(nn.Module):
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True)
 
-        # Fused wk + weights_proj weight for single FP32 cuBLAS GEMM
-        # (populated in post_load_weights; maps to TF32 tensor cores on Ampere+)
+        # Fused wk + weights_proj weight for single F.linear FP32 GEMM under allow_tf32.
+        # Maps to TF32 tensor cores on Ampere+.
         self._fused_wk_wp_weight: Optional[torch.Tensor] = None
 
         indexer_rope_interleave = getattr(sparse_attention_config,
@@ -1131,7 +1150,7 @@ class Indexer(nn.Module):
             cpp_custom_ops.warmup_heuristic_topk_decode(top_k=self.index_topk)
 
     def post_load_weights(self):
-        """Fuse wk + weights_proj into single FP32 weight for cuBLAS GEMM (TF32 on Ampere+)."""
+        """Fuse wk + weights_proj into single FP32 weight for F.linear GEMM under allow_tf32 (TF32 tensor cores on Ampere+)."""
         # wk: [head_dim, hidden_size] + weights_proj: [n_heads, hidden_size]
         # → fused: [head_dim + n_heads, hidden_size]
         self._fused_wk_wp_weight = torch.cat(
@@ -1805,10 +1824,13 @@ class Indexer(nn.Module):
         assert self._fused_wk_wp_weight is not None, \
             "post_load_weights() must be called before forward()"
         hidden_float = _to_float(hidden_states)
-        fused_out = torch.ops.trtllm.cublas_mm(hidden_float,
-                                               self._fused_wk_wp_weight.t(),
-                                               None,
-                                               out_dtype=None)
+        with _tf32_matmul_enabled():
+            # F.linear computes input @ weight.T internally; no explicit .t() needed.
+            # _fused_wk_wp_weight is [head_dim + n_heads, hidden_size] (nn.Linear convention).
+            # Goes through PyTorch's cuBLAS handle which respects allow_tf32 and
+            # dispatches CUBLAS_COMPUTE_32F_FAST_TF32, unlike torch.ops.trtllm.cublas_mm
+            # which uses its own handle and always falls back to CUDA-core SGEMM.
+            fused_out = F.linear(hidden_float, self._fused_wk_wp_weight)
         indexer_k, weights = fused_out.split([self.head_dim, self.n_heads],
                                              dim=-1)
         # Cast indexer_k back to model dtype for downstream ops (k_norm, RoPE, FP8 quantize)

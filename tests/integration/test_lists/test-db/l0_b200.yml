@@ -312,13 +312,23 @@ l0_b200:
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[nvfp4-1-attn_dp_off-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_functional_small[bf16]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_functional_small[fp8]
-  - unittest/auto_deploy/singlegpu/compile
-  - unittest/auto_deploy/singlegpu/custom_ops
-  - unittest/auto_deploy/singlegpu/models
-  - unittest/auto_deploy/singlegpu/shim
-  - unittest/auto_deploy/singlegpu/smoke
-  - unittest/auto_deploy/singlegpu/transformations
-  - unittest/auto_deploy/singlegpu/utils
+  # ------------- AutoDeploy unit tests ---------------
+  # B-tier keeps only Blackwell-meaningful tests (NVFP4 / FP4 / TRTLLM-Gen /
+  # SM100+-gated). HW-agnostic tests (compile, models, shim, utils, plus most
+  # custom_ops, smoke, transformations files) and pure-FP8 tests are covered
+  # on Hopper (l0_h100.yml) and not duplicated here.
+  - unittest/auto_deploy/singlegpu/custom_ops/attention/test_triton_paged_attention.py::TestSDPADispatch
+  - unittest/auto_deploy/singlegpu/custom_ops/moe/test_ad_moe_op.py
+  - unittest/auto_deploy/singlegpu/custom_ops/moe/test_trtllm_moe.py
+  - unittest/auto_deploy/singlegpu/custom_ops/quantization/test_quant.py
+  - unittest/auto_deploy/singlegpu/smoke/test_ad_build_small_single.py -k "Nemotron-3-Nano-30B-A3B-FP8 or Nemotron-Nano-3-30B-A3.5B-dev or Llama-4-Scout"
+  - unittest/auto_deploy/singlegpu/transformations/library/test_fuse_relu2_quant_nvfp4.py
+  - unittest/auto_deploy/singlegpu/transformations/library/test_moe_fusion.py
+  - unittest/auto_deploy/singlegpu/transformations/library/test_nvfp4_swiglu.py
+  - unittest/auto_deploy/singlegpu/transformations/library/test_quant_fusion.py
+  - unittest/auto_deploy/singlegpu/transformations/library/test_quant_moe.py
+  - unittest/auto_deploy/singlegpu/transformations/library/test_quantization.py
+  - unittest/auto_deploy/singlegpu/transformations/library/test_trtllm_gen_diag.py
   # ------------- AutoDeploy Perf Sanity ---------------
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-super_ad_blackwell-super_ad_ws1_1k1k] TIMEOUT (120)
 

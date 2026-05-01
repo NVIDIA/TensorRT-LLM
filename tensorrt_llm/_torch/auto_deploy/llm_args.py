@@ -6,15 +6,16 @@ import torch
 from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from tensorrt_llm.mapping import Mapping
-
-from ...llmapi.llm_args import (
+from tensorrt_llm.llmapi.llm_args import (
     BuildConfig,
     EagleDecodingConfig,
     MTPDecodingConfig,
     TorchLlmArgs,
     _ParallelConfig,
 )
+from tensorrt_llm.mapping import Mapping
+
+from . import config as _ad_config_pkg
 from .models import ModelFactory, ModelFactoryRegistry
 from .utils._config import DynamicYamlMixInForSettings
 from .utils.dist_config import DistConfig
@@ -459,7 +460,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     ### PRIVATE METHODS ############################################################################
     @classmethod
     def _get_yaml_default_from_mode(cls, mode: Optional[str]) -> Optional[str]:
-        config_path = files("tensorrt_llm._torch.auto_deploy.config")
+        config_path = files(_ad_config_pkg)
         mapping = {
             "graph": str(config_path / "default.yaml"),
             "transformers": str(config_path / "transformers.yaml"),
