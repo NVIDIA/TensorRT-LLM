@@ -533,8 +533,7 @@ class HarmonyAdapter:
         # Remove Harmony header-only lines while preserving real content lines.
         cleaned = re.sub(
             r"(?m)^\s*(assistant|analysis|commentary|final|system|developer|user)(?:\s+to=[^\n]*)?\s*$\n?",
-            "",
-            cleaned)
+            "", cleaned)
         cleaned = re.sub(r"(?m)^\s*(json|code)\s*$\n?", "", cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
         cleaned = cleaned.strip("\n")
@@ -577,12 +576,9 @@ class HarmonyAdapter:
         }
 
     def _handle_streaming_parse_error(
-            self,
-            request_id: str,
-            tokens: list[int],
+            self, request_id: str, tokens: list[int],
             available_tools: list[dict[str, Any]] | None,
-            tool_choice: str | None,
-            parse_error: Exception,
+            tool_choice: str | None, parse_error: Exception,
             stream_state: HarmonyStreamState | None) -> str:
         """Log, decode, and reset parser state after a streaming Harmony parse error."""
         token_sample = {
@@ -597,7 +593,8 @@ class HarmonyAdapter:
             f"fallback_chars={len(fallback_text)}; "
             f"token_sample={token_sample}; "
             f"state={self._streaming_error_state_summary(stream_state)}")
-        logger.debug(f"Problematic streaming tokens for request {request_id}: {tokens}")
+        logger.debug(
+            f"Problematic streaming tokens for request {request_id}: {tokens}")
 
         # A StreamableParser can remain poisoned after a parse exception. Reset it so
         # later batches still have a chance to parse normally.

@@ -3414,8 +3414,8 @@ TEST_F(KVCacheManagerTest, SchedulingRemoveSequenceIgnoresAlreadyRemovedSequence
         inputTokens->push_back(token);
     }
 
-    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow,
-        maxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt,
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt,
         nvinfer1::DataType::kHALF, sinkTokenLength, stream, maxSequenceLength, false);
     kvCacheManager.allocatePools(false);
 

@@ -414,13 +414,12 @@ async def test_kv_cache_aware_router_short_prompt_without_blocks_uses_load(
 @pytest.mark.asyncio
 async def test_kv_cache_aware_router_tie_breaks_changing_candidate_sets(
 ) -> None:
-    router = KvCacheAwareRouter(server_role=None,
-                                servers=[
-                                    "server1", "server2", "server3", "server4"
-                                ],
-                                use_tokens=False,
-                                max_batch_size=10,
-                                tokens_per_block=32)
+    router = KvCacheAwareRouter(
+        server_role=None,
+        servers=["server1", "server2", "server3", "server4"],
+        use_tokens=False,
+        max_batch_size=10,
+        tokens_per_block=32)
 
     requests = [
         CompletionRequest(model="TinyLlama", prompt=[[index] * 65])
@@ -549,8 +548,9 @@ def test_block_key_hasher_matches_bound_cpp_hasher_with_cache_salt() -> None:
     assert block_key_hasher(first_block,
                             cache_salt_id=salt_id) == salted_first_hash
 
-    salted_second_hash = BlockKeyHasher.hash_token_ids(
-        second_block, salted_first_hash, salt_id)
+    salted_second_hash = BlockKeyHasher.hash_token_ids(second_block,
+                                                       salted_first_hash,
+                                                       salt_id)
     assert block_key_hasher(second_block, salted_first_hash,
                             salt_id) == salted_second_hash
     assert salted_second_hash == BlockKeyHasher.hash_token_ids(
@@ -1100,8 +1100,7 @@ def _mock_tokenizer(token_ids=None):
 
 @pytest.mark.parametrize("router_class",
                          [KvCacheAwareRouter, ConversationRouter])
-def test_tokenize_forwards_tools_and_chat_template_kwargs(
-        router_class) -> None:
+def test_tokenize_forwards_tools_and_chat_template_kwargs(router_class) -> None:
     """Regression test for PR #13232.
 
     ``BlockHashMixin._tokenize`` must forward the request's ``tools`` (as a
@@ -1255,6 +1254,44 @@ def test_gpt_oss_tokenize_uses_harmony_tokens_for_router_hashes() -> None:
 
     expected_hashes = router._compute_block_hashes([harmony_tokens])
     assert block_hashes == expected_hashes
+
+
+def test_gpt_oss_harmony_empty_tools_matches_chat_harmony_path() -> None:
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1"],
+                                use_tokens=False,
+                                max_batch_size=32,
+                                tokens_per_block=32)
+
+    harmony_tokens = [100, 101, 102, 103, 104]
+    harmony = mock.MagicMock()
+    harmony.openai_to_harmony_tokens.return_value = harmony_tokens
+
+    with mock.patch("tensorrt_llm.serve.harmony_adapter.get_harmony_adapter",
+                    return_value=harmony), mock.patch(
+                        "tensorrt_llm.serve.harmony_adapter."
+                        "maybe_transform_reasoning_effort",
+                        return_value="medium"):
+        req = ChatCompletionRequest(
+            model="openai/gpt-oss-20b",
+            messages=[{
+                "role": "user",
+                "content": "what's the weather in Paris?"
+            }],
+            tools=[],
+            tool_choice="auto",
+            reasoning_effort="medium",
+        )
+        token_lists = router._tokenize(req)
+
+    harmony.openai_to_harmony_tokens.assert_called_once()
+    assert token_lists == [harmony_tokens]
+
+    call_args = harmony.openai_to_harmony_tokens.call_args
+    assert call_args.args[0] == req.messages
+    assert call_args.args[1] is None
+    assert call_args.kwargs["reasoning_effort"] == "medium"
+    assert call_args.kwargs["tool_choice"] == "auto"
 
 
 def test_use_harmony_flag_for_alias_model() -> None:

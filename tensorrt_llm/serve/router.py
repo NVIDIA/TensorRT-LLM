@@ -810,9 +810,10 @@ class BlockHashMixin:
             self, request: ChatCompletionRequest) -> list[list[int]]:
         from tensorrt_llm.serve import harmony_adapter
 
+        tools = None if not request.tools else self._tool_dicts(request)
         result = harmony_adapter.get_harmony_adapter().openai_to_harmony_tokens(
             request.messages,
-            self._tool_dicts(request),
+            tools,
             reasoning_effort=harmony_adapter.maybe_transform_reasoning_effort(
                 request.reasoning_effort),
             tool_choice=getattr(request, "tool_choice", None),

@@ -625,20 +625,18 @@ class TestStreamingParseFallback:
 
         assert adapter._strip_harmony_stream_control_text(" next token") == " next token"
 
-    def test_parse_failure_falls_back_to_decoded_content_and_resets_state(
-            self) -> None:
+    def test_parse_failure_falls_back_to_decoded_content_and_resets_state(self) -> None:
         adapter = HarmonyAdapter(harmony_input=False, harmony_output=False)
         request_id = "test-streaming-parse-fallback"
         stream_state = adapter.create_stream_state(
-            request_id=request_id, available_tools=None, tool_choice=None)
-        stream_state.process_token_batch = Mock(
-            side_effect=ValueError("bad harmony state"))
+            request_id=request_id, available_tools=None, tool_choice=None
+        )
+        stream_state.process_token_batch = Mock(side_effect=ValueError("bad harmony state"))
 
         with patch.object(
-                adapter,
-                "_safe_decode_utf8",
-                return_value=
-                "<|start|>assistant<|channel|>final<|message|>Hello<|return|>"
+            adapter,
+            "_safe_decode_utf8",
+            return_value="<|start|>assistant<|channel|>final<|message|>Hello<|return|>",
         ):
             deltas = adapter.stateful_stream_harmony_tokens_to_openai_deltas(
                 request_id=request_id,
@@ -650,20 +648,18 @@ class TestStreamingParseFallback:
         assert deltas == [{"content": "Hello"}]
         assert adapter.get_stream_state(request_id) is not stream_state
 
-    def test_parse_failure_drops_control_only_fallback_and_resets_state(
-            self) -> None:
+    def test_parse_failure_drops_control_only_fallback_and_resets_state(self) -> None:
         adapter = HarmonyAdapter(harmony_input=False, harmony_output=False)
         request_id = "test-streaming-control-only-fallback"
         stream_state = adapter.create_stream_state(
-            request_id=request_id, available_tools=None, tool_choice=None)
-        stream_state.process_token_batch = Mock(
-            side_effect=ValueError("bad harmony state"))
+            request_id=request_id, available_tools=None, tool_choice=None
+        )
+        stream_state.process_token_batch = Mock(side_effect=ValueError("bad harmony state"))
 
         with patch.object(
-                adapter,
-                "_safe_decode_utf8",
-                return_value=
-                "<|start|>assistant<|channel|>final<|message|><|return|>"
+            adapter,
+            "_safe_decode_utf8",
+            return_value="<|start|>assistant<|channel|>final<|message|><|return|>",
         ):
             deltas = adapter.stateful_stream_harmony_tokens_to_openai_deltas(
                 request_id=request_id,
@@ -679,15 +675,14 @@ class TestStreamingParseFallback:
         adapter = HarmonyAdapter(harmony_input=False, harmony_output=False)
         request_id = "test-streaming-response-fallback"
         stream_state = adapter.create_stream_state(
-            request_id=request_id, available_tools=None, tool_choice=None)
-        stream_state.process_token_batch = Mock(
-            side_effect=ValueError("bad harmony state"))
+            request_id=request_id, available_tools=None, tool_choice=None
+        )
+        stream_state.process_token_batch = Mock(side_effect=ValueError("bad harmony state"))
 
         with patch.object(
-                adapter,
-                "_safe_decode_utf8",
-                return_value=
-                "<|start|>assistant<|channel|>final<|message|>Hello<|return|>"
+            adapter,
+            "_safe_decode_utf8",
+            return_value="<|start|>assistant<|channel|>final<|message|>Hello<|return|>",
         ):
             responses, should_stop = adapter.create_openai_streaming_response(
                 request_id=request_id,
