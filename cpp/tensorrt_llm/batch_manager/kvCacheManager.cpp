@@ -3043,7 +3043,17 @@ void BlockManager::schedulingReleaseBlocks(RequestIdType requestId)
 
 void WindowBlockManager::schedulingReleaseBlocks(RequestIdType requestId)
 {
-    for (auto& block : mAllocatedBlocksPerSeq.at(requestId))
+    auto const seqIt = mAllocatedBlocksPerSeq.find(requestId);
+    if (seqIt == mAllocatedBlocksPerSeq.end())
+    {
+        TLLM_LOG_WARNING(
+            "%s::schedulingReleaseBlocks skipped request %lu because no allocated blocks are tracked. "
+            "The request was likely already removed before the max-utilization scheduler simulated a pause.",
+            mLogPrefix.c_str(), requestId);
+        return;
+    }
+
+    for (auto& block : seqIt->second)
     {
         // Decrease ref count
         block->decSchedulingRefCount();
@@ -3288,7 +3298,27 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
             return 0;
         }
 
-        auto const numCurrTokens = getSequence(req.mRequestId).getNumTokens();
+        auto const maybeNumCurrTokens = [this, requestId = req.mRequestId]() -> std::optional<SizeType32>
+        {
+            auto lck = std::scoped_lock(mSequencesMtx);
+            auto const seqIt = mSequences.find(requestId);
+            if (seqIt == mSequences.end())
+            {
+                return std::nullopt;
+            }
+            return seqIt->second.getNumTokens();
+        }();
+        if (!maybeNumCurrTokens.has_value())
+        {
+            auto const unuschedulableBlocks = mBlockManager.getWindowSizeMetadata(windowSize).maxNumBlocks + 1;
+            TLLM_LOG_WARNING(
+                "[kv cache manager] getNeededBlocksOneStep: request %lu is generation-in-progress but no KV "
+                "sequence exists. Returning %d required blocks so the scheduler pauses or drops the stale request.",
+                req.mRequestId, unuschedulableBlocks);
+            return unuschedulableBlocks;
+        }
+
+        auto const numCurrTokens = maybeNumCurrTokens.value();
         auto const generatedTokens = numCurrTokens - req.getPromptLen();
         auto const maxTokensToAddToKVCache = req.mMaxNewTokens - generatedTokens;
         auto const tokensPerStep = req.getNumDraftTokens() + 1;

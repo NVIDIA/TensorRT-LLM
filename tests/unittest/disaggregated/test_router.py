@@ -412,6 +412,58 @@ async def test_kv_cache_aware_router_short_prompt_without_blocks_uses_load(
 
 
 @pytest.mark.asyncio
+async def test_kv_cache_aware_router_tie_breaks_changing_candidate_sets(
+) -> None:
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=[
+                                    "server1", "server2", "server3", "server4"
+                                ],
+                                use_tokens=False,
+                                max_batch_size=10,
+                                tokens_per_block=32)
+
+    requests = [
+        CompletionRequest(model="TinyLlama", prompt=[[index] * 65])
+        for index in range(2)
+    ]
+
+    server0, _ = await router.get_next_server(requests[0])
+    server1, _ = await router.get_next_server(requests[1])
+    try:
+        assert server0 == "server1"
+        assert server1 == "server2"
+    finally:
+        for request in requests:
+            await router.finish_request(request)
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_gates_low_match_rate_to_load_balance(
+) -> None:
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=["server1", "server2"],
+                                use_tokens=False,
+                                max_batch_size=10,
+                                tokens_per_block=32,
+                                match_rate_threshold=0.5)
+    token_ids = list(range(101))
+    block_hashes = router._compute_block_hashes([token_ids])
+    router._server_state["server1"].add_blocks(block_hashes[0][:1])
+    router._server_state["server1"]._num_active_requests = 1
+
+    request = CompletionRequest(model="TinyLlama", prompt=[token_ids])
+    server, info = await router.get_next_server(request)
+    try:
+        assert info["matches"] == [32, 0]
+        assert info["max_match_rate"] == pytest.approx(0.32)
+        assert info["cache_affinity_active"] is False
+        assert info["scores"] == pytest.approx([-0.1, 0.0])
+        assert server == "server2"
+    finally:
+        await router.finish_request(request)
+
+
+@pytest.mark.asyncio
 async def test_kv_cache_aware_router_counts_partial_block_tokens() -> None:
     router = KvCacheAwareRouter(server_role=None,
                                 servers=["server1"],

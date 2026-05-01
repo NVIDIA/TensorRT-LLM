@@ -267,6 +267,23 @@ class LoadBalancingMixin:
         return state._num_active_tokens if self._use_tokens \
             else state._num_active_requests
 
+    def _select_round_robin_tied(self, candidates: list[str]) -> str:
+        """Select the next candidate using a stable server-ring pointer."""
+        if not candidates:
+            raise ValueError("No tied candidates available")
+
+        ordered_servers = list(self._server_state)
+        candidate_set = set(candidates)
+        start = self._rr_counter % len(ordered_servers)
+        for offset in range(len(ordered_servers)):
+            index = (start + offset) % len(ordered_servers)
+            server = ordered_servers[index]
+            if server in candidate_set:
+                self._rr_counter = index + 1
+                return server
+
+        raise ValueError("No tied candidate is present in server state")
+
     def _validate_servers_available(self):
         if not self._servers:
             if self._metadata_server:
@@ -298,10 +315,9 @@ class LoadBalancingMixin:
         loads = {s: self._get_server_load(s) for s in candidates}
         min_load = min(loads.values())
         tied = [s for s in candidates if loads[s] == min_load]
-        server = tied[self._rr_counter % len(tied)]
-        self._rr_counter += 1
+        server = self._select_round_robin_tied(tied)
         logger.debug(f"LoadBalancingMixin: selected={server}, "
-                     f"loads={loads}, tied={tied}, rr={self._rr_counter - 1}")
+                     f"loads={loads}, tied={tied}, rr={self._rr_counter}")
         return server
 
 
@@ -923,6 +939,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  use_tokens: bool = False,
                  max_batch_size: int = 64,
                  tokens_per_block: int = 32,
+                 match_rate_threshold: float = 0.1,
                  custom_tokenizer: Optional[str] = None,
                  use_harmony: Optional[bool] = None,
                  **kwargs) -> None:
@@ -933,6 +950,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         self._init_load_balancing(servers, use_tokens)
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size
+        self._match_rate_threshold = match_rate_threshold
 
     def _create_server_state(self, server: str) -> KvCacheAwareServerState:
         return KvCacheAwareServerState(server, self._use_tokens,
@@ -982,16 +1000,20 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             matched_tokens = await self._server_state[server].matched_tokens(
                 block_hashes, block_lengths)
             matches.append(matched_tokens)
-            match_ratio = matched_tokens / hashable_tokens if hashable_tokens else 0.0
+        max_match_rate = (max(matches) /
+                          hashable_tokens) if hashable_tokens else 0.0
+        cache_affinity_active = max_match_rate > self._match_rate_threshold
+        for matched_tokens, server in zip(matches, servers):
+            effective_match_tokens = matched_tokens if cache_affinity_active else 0
+            match_ratio = effective_match_tokens / hashable_tokens if hashable_tokens else 0.0
             score = (match_ratio -
                      workloads_by_server[server] / self._max_batch_size)
             scores.append(score)
         max_score = max(scores)
         tied = [i for i, s in enumerate(scores) if s == max_score]
-        winner = tied[self._rr_counter % len(tied)]
-        self._rr_counter += 1
-        server = servers[winner]
         async with self._lock:
+            tied_servers = [servers[i] for i in tied]
+            server = self._select_round_robin_tied(tied_servers)
             await self._register_request(server, request)
         return server, {
             "block_hashes": block_hashes,  # list[list[int]]
@@ -1003,6 +1025,9 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             "workloads": workloads,  # list[int]
             "active_tokens": active_tokens,  # list[int]
             "candidate_servers": servers,  # list[str]
+            "match_rate_threshold": self._match_rate_threshold,
+            "cache_affinity_active": cache_affinity_active,
+            "max_match_rate": max_match_rate,
             "server_info": self._server_info.get(server, {}),
         }
 
