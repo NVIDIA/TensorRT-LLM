@@ -85,8 +85,6 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 
-_KV_ITER_STATS_SENTINEL = object()
-
 
 class PPCommTag(IntEnum):
     """
@@ -553,12 +551,21 @@ class PyExecutor:
         self._kv_iter_stats_interval = getattr(
             getattr(self.llm_args, 'kv_cache_config', None),
             'iteration_stats_interval', 1)
+        # ADP pending stats are owned by the executor loop thread; do not
+        # mutate them from background request/stat threads without locking.
+        # All ranks: local per-iteration payloads waiting to piggyback on the
+        # next ADP rank-state allgather.
         self._pending_adp_iter_stats_payloads: Dict[
             int, RankIterStatsPayload] = {}
+        # Iteration IDs whose pending payload is an explicit zero placeholder,
+        # not real measured local stats.
         self._synthetic_adp_iter_stats_iters: Set[int] = set()
+        # Rank 0 only: full IterationStats objects waiting for ADP aggregation.
         self._pending_adp_iter_stats: Dict[int, IterationStats] = {}
+        # Rank 0 only: matching per-request stats for pending IterationStats.
         self._pending_adp_req_stats: Dict[int, Optional[List[
             RequestStats]]] = {}
+        # Rank 0 only: KV iteration stats captured with pending IterationStats.
         self._pending_adp_kv_iter_stats: Dict[int, object] = {}
         self.gather_all_responses = False
 
@@ -1186,7 +1193,13 @@ class PyExecutor:
             else:
                 self._latest_kv_iter_stats = None
 
+        # Attention-DP may add dummy requests to keep ranks aligned during
+        # distributed scheduling. Those placeholders are not user work, so
+        # count the request lists with a filter instead of using the cached
+        # batch counters, which include every scheduled item.
         if getattr(self, "enable_attention_dp", False):
+            # The sum(...) scans are small and keep planner-facing metrics
+            # from treating Attention-DP dummy requests as real load.
             num_context_requests = sum(
                 1 for req in scheduled_batch.context_requests
                 if not getattr(req, "is_attention_dp_dummy", False))
@@ -1366,6 +1379,7 @@ class PyExecutor:
 
     def _make_adp_iter_stats_payload(
             self, stats: IterationStats) -> RankIterStatsPayload:
+        """All ranks: pack local IterationStats fields for ADP allgather."""
         ifb = stats.inflight_batching_stats
         return RankIterStatsPayload(
             has_iter_stats=1,
@@ -1384,6 +1398,7 @@ class PyExecutor:
         stats: IterationStats,
         req_stats: Optional[List[RequestStats]] = None,
     ) -> None:
+        """All ranks: queue local stats; rank 0 also keeps objects to append."""
         payload = self._make_adp_iter_stats_payload(stats)
         iter_id = payload.iter_stats_iter
 
@@ -1400,15 +1415,20 @@ class PyExecutor:
         if self.dist.rank == 0:
             self._pending_adp_iter_stats[iter_id] = stats
             self._pending_adp_req_stats[iter_id] = req_stats
+            # Capture KV iteration stats with this IterationStats object.
+            # ADP aggregation happens on a later allgather, when
+            # _latest_kv_iter_stats may already refer to a newer iteration.
             self._pending_adp_kv_iter_stats[iter_id] = self._latest_kv_iter_stats
 
     def _next_adp_iter_stats_payload(self) -> Optional[RankIterStatsPayload]:
+        """All ranks: return the oldest pending stats payload to piggyback."""
         if not self._pending_adp_iter_stats_payloads:
             return None
         iter_id = min(self._pending_adp_iter_stats_payloads)
         return self._pending_adp_iter_stats_payloads[iter_id]
 
     def _ensure_adp_zero_iter_stats_payload(self, iter_id: int) -> None:
+        """All ranks: add a zero payload when this rank had no work for iter."""
         if iter_id in self._pending_adp_iter_stats_payloads:
             return
         self._pending_adp_iter_stats_payloads[iter_id] = RankIterStatsPayload(
@@ -1418,6 +1438,7 @@ class PyExecutor:
         self._synthetic_adp_iter_stats_iters.add(iter_id)
 
     def _drop_pending_adp_iter_stats_before(self, iter_id: int) -> None:
+        """All ranks: discard local pending stats older than rank 0's target."""
         for pending_iter in list(self._pending_adp_iter_stats_payloads):
             if pending_iter >= iter_id:
                 continue
@@ -1428,6 +1449,7 @@ class PyExecutor:
             self._pending_adp_kv_iter_stats.pop(pending_iter, None)
 
     def _clear_pending_adp_iter_stats_through(self, iter_id: int) -> None:
+        """All ranks: clear local ADP stats once aggregation has caught up."""
         for pending_iter in list(self._pending_adp_iter_stats_payloads):
             if pending_iter > iter_id:
                 continue
@@ -1439,6 +1461,7 @@ class PyExecutor:
 
     def _aggregate_adp_iter_stats(self, stats: IterationStats,
                                   all_rank_states: List[RankState]) -> None:
+        """Rank 0 only: sum per-rank payloads into one engine-wide stat."""
         ifb = stats.inflight_batching_stats
         ifb.num_context_requests = sum(s.iter_stats.num_context_requests
                                        for s in all_rank_states)
@@ -1459,6 +1482,7 @@ class PyExecutor:
 
     def _finalize_pending_adp_iter_stats(
             self, all_rank_states: List[RankState]) -> None:
+        """All ranks: align payloads; rank 0 appends aggregate when ready."""
         pending_states = [
             s for s in all_rank_states if s.iter_stats.has_iter_stats
         ]
@@ -1515,8 +1539,12 @@ class PyExecutor:
     def _append_iter_stats(self,
                            stats: IterationStats,
                            req_stats: Optional[List[RequestStats]] = None,
-                           kv_iter_stats=_KV_ITER_STATS_SENTINEL):
-        if kv_iter_stats is _KV_ITER_STATS_SENTINEL:
+                           kv_iter_stats=None):
+        """ADP rank 0 or non-ADP path: append finalized stats for get_stats()."""
+        # Non-ADP appends immediately, so the latest KV stats belong to this
+        # IterationStats. ADP appends later and passes the saved iter-matched
+        # KV stats explicitly.
+        if not self.enable_attention_dp:
             kv_iter_stats = self._latest_kv_iter_stats
 
         with self.stats_lock:
@@ -1531,6 +1559,7 @@ class PyExecutor:
         batch_state: BatchState,
         micro_batch_id: int = 0,
     ):
+        """All ranks: build local stats; ADP queues them for later aggregation."""
         iter_end_time = time.time()
         iter_latency_ms = (iter_end_time - batch_state.iter_start_time) * 1e3
         if batch_state.iter_stats is None:
@@ -3046,6 +3075,9 @@ class PyExecutor:
             # (e.g. KV-cache-aware) that need new_requests to gather additional
             # info, the allgather position may need to be revisited.
 
+            # Piggyback this rank's oldest pending IterationStats payload on
+            # the ADP rank-state allgather, then use the gathered states below
+            # to aggregate/clear stats once every rank is aligned.
             all_rank_states = self.adp_router.gather_all_rank_states(
                 active_requests,
                 iter_stats_payload=self._next_adp_iter_stats_payload())
