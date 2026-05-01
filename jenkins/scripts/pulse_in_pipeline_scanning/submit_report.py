@@ -94,6 +94,7 @@ def submit_source_code_licenses(
     build_metadata: BuildMetadata,
     start_datetime: datetime,
     only_report_new_risk: bool,
+    license_check_token: str,
 ):
     map_preapproved = get_preapproved_deps_map("source_code_license")
     sbom_documents = []
@@ -108,7 +109,7 @@ def submit_source_code_licenses(
             for lic_entry in component.get("licenses", []):
                 lic = lic_entry.get("license", {})
                 license_ids.append(lic.get("id") or lic.get("name") or "")
-            if is_permissive(license_ids):
+            if is_permissive(license_ids, license_check_token):
                 continue
             result_key = (package_name, package_version)
             is_new = result_key not in last_scan_result
@@ -209,6 +210,7 @@ def submit_container_licenses(
     build_metadata: BuildMetadata,
     start_datetime: datetime,
     only_report_new_risk: bool,
+    license_check_token: str,
 ):
     release_data = load_json(input_file)
     base_data = load_json(base_input_file)
@@ -221,8 +223,11 @@ def submit_container_licenses(
     release_image = release_data.get("image_tag", "")
     base_image = base_data.get("image_tag", "")
     for v in trtllm_deps:
+        license_ids = v.get("licenses", [])
         package_name = v.get("package")
         package_version = v.get("version")
+        if is_permissive(license_ids, license_check_token):
+            continue
         result_key = (package_name, package_version)
         is_new = result_key not in last_scan_result
         doc = {
@@ -238,7 +243,7 @@ def submit_container_licenses(
             "s_package_name": package_name,
             "s_package_version": package_version,
             "s_package_type": v.get("type"),
-            "s_license_ids": ",".join(v.get("licenses", [])),
+            "s_license_ids": ",".join(license_ids),
             "b_is_new": is_new,
         }
         if (is_new or not only_report_new_risk) and (package_name not in map_preapproved):

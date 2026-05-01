@@ -1,20 +1,6 @@
 import json
 
-PERMISSIVE_LICENSES = {
-    "mit",
-    "bsd-2-clause",
-    "bsd-3-clause",
-    "apache-2.0",
-    "isc",
-    "0bsd",
-    "zlib",
-    "unlicense",
-    "python-2.0",
-    "postgresql",
-    "nvidia license",
-    "python-license-2.0",
-    "public domain",
-}
+import requests
 
 
 def load_json(path):
@@ -22,8 +8,20 @@ def load_json(path):
         return json.load(f)
 
 
-def is_permissive(licenses):
-    return all(
-        license_name.strip().casefold().replace(" ", "-") in PERMISSIVE_LICENSES
-        for license_name in licenses
+def is_permissive(licenses, license_check_token):
+    headers = {
+        "Authorization": f"Bearer {license_check_token}",
+        "Content-Type": "application/json",
+    }
+    response = requests.post(
+        "https://nspect.nvidia.com/pm/api/v1.0/public/osrb/license/status",
+        headers=headers,
+        data=json.dumps({"licenses": licenses}),
     )
+    has_non_permissive_license = False
+    print(response)
+    for check_result in response:
+        if not check_result["isPermissive"]:
+            has_non_permissive_license = True
+            break
+    return has_non_permissive_license

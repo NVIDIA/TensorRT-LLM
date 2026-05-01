@@ -329,13 +329,15 @@ def processScanResults(ref) {
                     python3 -m venv venv
                     venv/bin/pip install requests elasticsearch==7.13.4
                 """
+                def token = getPulseToken("4ubglassowmtsi7ogqwarmut7msn1q5ynts62fwnr1i", "public.api:read")
                 def output = sh(script: """
                     venv/bin/python ./jenkins/scripts/pulse_in_pipeline_scanning/main.py \
                         --build-url ${pipelineUrl} \
                         --build-number ${env.BUILD_NUMBER} \
                         --ref ${ref} \
                         --report-directory ${pwd()}/scan_report \
-                        --scan-mode ${params.scanMode}
+                        --scan-mode ${params.scanMode} \
+                        --license-check-token ${token}
                 """, returnStdout: true).trim()
                 echo "Scan result: ${output}"
                 def result = new JsonSlurper().parseText(output)

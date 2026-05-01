@@ -1,6 +1,6 @@
 from utils.es import get_latest_license_preapproved_container_deps
 
-from .common import is_permissive, load_json
+from .common import load_json
 
 HIGH_SEVERITY = frozenset({"Critical", "High"})
 
@@ -64,11 +64,7 @@ def diff_licenses(scan_type, release_path, base_path=None):
     introduced_licenses = [
         v
         for k, v in release_pkgs.items()
-        if (
-            (k not in base_pkgs)
-            and (k not in map_preapproved_deps)
-            and not is_permissive(v["licenses"])
-        )
+        if ((k not in base_pkgs) and (k not in map_preapproved_deps))
     ]
 
     introduced_licenses.sort(key=lambda e: (e["package"], e["version"]))

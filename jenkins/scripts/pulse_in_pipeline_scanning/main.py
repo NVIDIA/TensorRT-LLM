@@ -36,6 +36,11 @@ parser.add_argument(
         "if set to release, all risks will be reported"
     ),
 )
+parser.add_argument(
+    "--license-check-token",
+    required=True,
+    help=("Access token for license check API"),
+)
 args = parser.parse_args()
 
 SEVERITY_RANK = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
@@ -50,6 +55,7 @@ SUBMIT_KWARG = {
     },
     "start_datetime": datetime.now(timezone.utc),
     "only_report_new_risk": args.scan_mode == "monitor",
+    "license_check_token": args.license_check_token,
 }
 
 
