@@ -177,7 +177,7 @@ for NUM_GPU in "${NUM_GPUS_TO_TEST[@]}"; do
         break
     fi
 
-    SERVER_ARGS="--world_size=${NUM_GPU} --model_repo=${MODEL_DIR}"
+    SERVER_ARGS="--world_size=${NUM_GPU} --model_repo=${MODEL_DIR} --oversubscribe"
 
     reset_model_repo
 
@@ -252,7 +252,6 @@ for NUM_GPU in "${NUM_GPUS_TO_TEST[@]}"; do
         exit 1
     fi
 
-    set -e
     python3 ${TOOLS_DIR}/inflight_batcher_llm/benchmark_core_model.py \
         --max-input-len=500 \
         --protocol grpc \
@@ -266,9 +265,7 @@ for NUM_GPU in "${NUM_GPUS_TO_TEST[@]}"; do
         wait_for_server_terminated ${SERVER_TIMEOUT} ${SERVER_PID[@]}
         RET=1
     fi
-    set +e
 
-    set -e
     python3 ${TOOLS_DIR}/inflight_batcher_llm/end_to_end_test.py \
         --max-input-len=500 \
         --dataset=${DATASET}
@@ -280,7 +277,6 @@ for NUM_GPU in "${NUM_GPUS_TO_TEST[@]}"; do
         wait_for_server_terminated ${SERVER_TIMEOUT} ${SERVER_PID[@]}
         RET=1
     fi
-    set +e
 
     # Make sure the metrics is retrieved after the server has updated the metrics internally
     sleep ${SLEEP_DURATION}

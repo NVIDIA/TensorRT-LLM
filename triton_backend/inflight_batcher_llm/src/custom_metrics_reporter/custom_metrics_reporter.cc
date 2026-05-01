@@ -72,10 +72,12 @@ const std::vector<std::string> CustomMetricsReporter::input_metric_type_labels_{
 
 uint64_t convertTimestampToMicroseconds(std::string const& ts)
 {
+    // -1 tells mktime to determine DST automatically, matching localtime() used in getCurrentTimestamp
+    int const kMktimeDetermineDst = -1;
     std::tm tm = {};
     std::stringstream ss(ts);
     ss >> std::get_time(&tm, "%m-%d-%Y %H:%M:%S");
-    tm.tm_isdst = -1; // Let mktime determine DST to match localtime() used in getCurrentTimestamp
+    tm.tm_isdst = kMktimeDetermineDst;
     auto timestamp = std::chrono::system_clock::from_time_t(std::mktime(&tm));
     auto epoch = std::chrono::time_point_cast<std::chrono::microseconds>(timestamp).time_since_epoch();
     uint64_t seconds_to_microseconds = std::chrono::duration_cast<std::chrono::microseconds>(epoch).count();
