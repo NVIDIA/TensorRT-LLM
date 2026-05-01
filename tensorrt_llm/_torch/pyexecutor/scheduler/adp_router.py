@@ -71,8 +71,7 @@ class RankIterStatsPayload:
                 values.append(field_info.default_factory())
             else:
                 raise ValueError(
-                    "RankIterStatsPayload is missing required field "
-                    f"{field_info.name}"
+                    f"RankIterStatsPayload is missing required field {field_info.name}"
                 )
         return cls(*values)
 
@@ -91,14 +90,10 @@ class RankState:
     num_active_tokens: int = 0
     iter_stats: RankIterStatsPayload = field(default_factory=RankIterStatsPayload)
 
-    def copy_iter_stats_from(
-        self, iter_stats_payload: RankIterStatsPayload | None
-    ) -> None:
+    def copy_iter_stats_from(self, iter_stats_payload: RankIterStatsPayload | None) -> None:
         if iter_stats_payload is None:
             return
-        self.iter_stats = RankIterStatsPayload.deserialize(
-            iter_stats_payload.serialize()
-        )
+        self.iter_stats = RankIterStatsPayload.deserialize(iter_stats_payload.serialize())
 
     def serialize(self) -> list[int]:
         """Serialize to a flat list for allgather transport."""
@@ -128,9 +123,7 @@ class RankState:
             elif field_info.default_factory is not MISSING:
                 rank_values.append(field_info.default_factory())
             else:
-                raise ValueError(
-                    f"RankState payload is missing required field {field_info.name}"
-                )
+                raise ValueError(f"RankState payload is missing required field {field_info.name}")
         return cls(
             rank=rank_values[0],
             num_active_requests=rank_values[1],

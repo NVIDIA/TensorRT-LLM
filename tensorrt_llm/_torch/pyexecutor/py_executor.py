@@ -1406,8 +1406,7 @@ class PyExecutor:
                 and iter_id not in self._synthetic_adp_iter_stats_iters):
             logger.warning(
                 "Replacing duplicate attention-DP IterationStats payload "
-                f"for iter {iter_id}"
-            )
+                f"for iter {iter_id}")
 
         self._pending_adp_iter_stats_payloads[iter_id] = payload
         self._synthetic_adp_iter_stats_iters.discard(iter_id)
@@ -1418,7 +1417,8 @@ class PyExecutor:
             # Capture KV iteration stats with this IterationStats object.
             # ADP aggregation happens on a later allgather, when
             # _latest_kv_iter_stats may already refer to a newer iteration.
-            self._pending_adp_kv_iter_stats[iter_id] = self._latest_kv_iter_stats
+            self._pending_adp_kv_iter_stats[
+                iter_id] = self._latest_kv_iter_stats
 
     def _next_adp_iter_stats_payload(self) -> Optional[RankIterStatsPayload]:
         """All ranks: return the oldest pending stats payload to piggyback."""
@@ -1477,8 +1477,8 @@ class PyExecutor:
                                       for s in all_rank_states)
         ifb.num_paused_kv_tokens = sum(s.iter_stats.num_paused_kv_tokens
                                        for s in all_rank_states)
-        ifb.num_scheduled_requests = (
-            ifb.num_context_requests + ifb.num_gen_requests)
+        ifb.num_scheduled_requests = (ifb.num_context_requests +
+                                      ifb.num_gen_requests)
 
     def _finalize_pending_adp_iter_stats(
             self, all_rank_states: List[RankState]) -> None:
