@@ -42,10 +42,7 @@ import threading
 import types
 from unittest.mock import MagicMock, patch
 
-from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
-    RankIterStatsPayload,
-    RankState,
-)
+from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankIterStatsPayload, RankState
 from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats
 
 
@@ -192,9 +189,7 @@ def _invoke_update_iter_stats(
 
     iter_states = None if num_ctx_tokens is None else {"num_ctx_tokens": num_ctx_tokens}
 
-    fake_self = _build_fake_self(
-        queued_items, iter_states, enable_attention_dp=enable_attention_dp
-    )
+    fake_self = _build_fake_self(queued_items, iter_states, enable_attention_dp=enable_attention_dp)
 
     stats = IterationStats()
     # The method reads ``stats.inflight_batching_stats.*`` unconditionally;
@@ -562,11 +557,8 @@ def _build_adp_stats_harness(pending_stats, *, rank=0, tp_rank=0):
     harness.stats = []
     harness.max_stats_len = 64
     harness._latest_kv_iter_stats = "current-kv"
-    pending_payload = PyExecutor._make_adp_iter_stats_payload(
-        harness, pending_stats)
-    harness._pending_adp_iter_stats_payloads = {
-        pending_payload.iter_stats_iter: pending_payload
-    }
+    pending_payload = PyExecutor._make_adp_iter_stats_payload(harness, pending_stats)
+    harness._pending_adp_iter_stats_payloads = {pending_payload.iter_stats_iter: pending_payload}
     harness._synthetic_adp_iter_stats_iters = set()
     harness._pending_adp_iter_stats = (
         {pending_payload.iter_stats_iter: pending_stats} if rank == 0 else {}
@@ -616,8 +608,7 @@ def test_attention_dp_aggregation_sums_rank_local_fields_only():
         num_queued_gen_kv_tokens=800,
     )
     harness = _build_adp_stats_harness(rank0_stats)
-    rank0_state = RankState(
-        rank=0, iter_stats=harness._next_adp_iter_stats_payload())
+    rank0_state = RankState(rank=0, iter_stats=harness._next_adp_iter_stats_payload())
     rank1_state = RankState(
         rank=1,
         iter_stats=RankIterStatsPayload(
@@ -660,8 +651,7 @@ def test_attention_dp_aggregation_sums_rank_local_fields_only():
 def test_attention_dp_aggregation_waits_for_complete_matching_payloads():
     rank0_stats = _make_adp_iteration_stats(iter_id=9, num_context_requests=1)
     harness = _build_adp_stats_harness(rank0_stats)
-    rank0_state = RankState(
-        rank=0, iter_stats=harness._next_adp_iter_stats_payload())
+    rank0_state = RankState(rank=0, iter_stats=harness._next_adp_iter_stats_payload())
     missing_rank1_state = RankState(rank=1)
 
     harness._finalize_pending_adp_iter_stats([rank0_state, missing_rank1_state])
@@ -706,8 +696,7 @@ def test_attention_dp_aggregation_aligns_non_rank0_to_rank0_iter():
             num_context_requests=1,
         ),
     )
-    rank1_state = RankState(
-        rank=1, iter_stats=harness._next_adp_iter_stats_payload())
+    rank1_state = RankState(rank=1, iter_stats=harness._next_adp_iter_stats_payload())
 
     harness._finalize_pending_adp_iter_stats([rank0_state, rank1_state])
 
