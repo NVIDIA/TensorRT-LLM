@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Qwen-Image text-to-image generation example using TensorRT-LLM VisualGen.
+r"""Qwen-Image text-to-image generation example using TensorRT-LLM VisualGen.
 
 This example supports the native BF16 reference path. FP8 / NVFP4 / CUDA
 graph / CFG+Ulysses / TeaCache are scheduled for follow-up PRs (see the
@@ -47,7 +47,10 @@ def parse_args():
         help="HuggingFace Hub revision (branch, tag, or commit SHA)",
     )
     parser.add_argument(
-        "--prompt", type=str, default=None, help="Single prompt (mutually exclusive with --prompts_file)"
+        "--prompt",
+        type=str,
+        default=None,
+        help="Single prompt (mutually exclusive with --prompts_file)",
     )
     parser.add_argument(
         "--negative_prompt",

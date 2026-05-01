@@ -22,10 +22,7 @@ from tensorrt_llm._torch.visual_gen.models.qwen_image import (
     QwenImagePipeline,
     QwenImageTransformer2DModel,
 )
-from tensorrt_llm._torch.visual_gen.pipeline_registry import (
-    PIPELINE_REGISTRY,
-    AutoPipeline,
-)
+from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, AutoPipeline
 
 
 def test_qwen_image_pipeline_is_registered():
@@ -36,13 +33,8 @@ def test_qwen_image_pipeline_is_registered():
 
 def test_auto_pipeline_detects_qwen_image_class_name(tmp_path):
     """model_index.json with _class_name=QwenImagePipeline resolves."""
-    (tmp_path / "model_index.json").write_text(
-        json.dumps({"_class_name": "QwenImagePipeline"})
-    )
-    assert (
-        AutoPipeline._detect_from_checkpoint(str(tmp_path))
-        == "QwenImagePipeline"
-    )
+    (tmp_path / "model_index.json").write_text(json.dumps({"_class_name": "QwenImagePipeline"}))
+    assert AutoPipeline._detect_from_checkpoint(str(tmp_path)) == "QwenImagePipeline"
 
 
 @pytest.mark.parametrize(
@@ -60,13 +52,8 @@ def test_auto_pipeline_routes_qwen_image_variants(tmp_path, variant_class_name):
     ``pipeline_registry.py``: anything containing ``Qwen`` + ``Image`` in
     its class name falls through to the base pipeline.
     """
-    (tmp_path / "model_index.json").write_text(
-        json.dumps({"_class_name": variant_class_name})
-    )
-    assert (
-        AutoPipeline._detect_from_checkpoint(str(tmp_path))
-        == "QwenImagePipeline"
-    )
+    (tmp_path / "model_index.json").write_text(json.dumps({"_class_name": variant_class_name}))
+    assert AutoPipeline._detect_from_checkpoint(str(tmp_path)) == "QwenImagePipeline"
 
 
 def test_transformer_constructs_with_defaults():
@@ -107,25 +94,27 @@ def test_transformer_forward_sanity(with_text_mask):
         attention=AttentionConfig(backend="VANILLA"),
         skip_create_weights_in_init=False,
     )
-    model = QwenImageTransformer2DModel(
-        model_config=model_config,
-        patch_size=1,
-        in_channels=4,
-        out_channels=4,
-        num_layers=1,
-        attention_head_dim=8,
-        num_attention_heads=2,
-        joint_attention_dim=12,
-        axes_dims_rope=(2, 2, 4),
-    ).to(device, dtype=dtype).eval()
+    model = (
+        QwenImageTransformer2DModel(
+            model_config=model_config,
+            patch_size=1,
+            in_channels=4,
+            out_channels=4,
+            num_layers=1,
+            attention_head_dim=8,
+            num_attention_heads=2,
+            joint_attention_dim=12,
+            axes_dims_rope=(2, 2, 4),
+        )
+        .to(device, dtype=dtype)
+        .eval()
+    )
 
     hidden_states = torch.randn(1, 4, 4, device=device, dtype=dtype)
     encoder_hidden_states = torch.randn(1, 5, 12, device=device, dtype=dtype)
     encoder_hidden_states_mask = None
     if with_text_mask:
-        encoder_hidden_states_mask = torch.tensor(
-            [[True, True, True, False, False]], device=device
-        )
+        encoder_hidden_states_mask = torch.tensor([[True, True, True, False, False]], device=device)
 
     with torch.inference_mode():
         output = model(

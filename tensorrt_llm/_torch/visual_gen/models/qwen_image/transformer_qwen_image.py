@@ -30,8 +30,7 @@ from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
-from tensorrt_llm._torch.visual_gen.quantization.loader import \
-    DynamicLinearWeightLoader
+from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 
 _WEIGHT_KEY_REMAPS = [
     (".net.0.proj.", ".up_proj."),
@@ -156,15 +155,12 @@ class QwenTimestepProjEmbeddings(nn.Module):
         addition_t_cond: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         timesteps_proj = self.time_proj(timestep)
-        timesteps_emb = self.timestep_embedder(
-            timesteps_proj.to(dtype=hidden_states.dtype)
-        )
+        timesteps_emb = self.timestep_embedder(timesteps_proj.to(dtype=hidden_states.dtype))
         conditioning = timesteps_emb
         if self.use_additional_t_cond:
             if addition_t_cond is None:
                 raise ValueError(
-                    "When use_additional_t_cond=True, addition_t_cond "
-                    "must be provided."
+                    "When use_additional_t_cond=True, addition_t_cond must be provided."
                 )
             addition_t_emb = self.addition_t_embedding(addition_t_cond)
             addition_t_emb = addition_t_emb.to(dtype=hidden_states.dtype)
@@ -197,19 +193,13 @@ class AdaLayerNormContinuous(nn.Module):
             bias=bias,
         )
         if norm_type == "layer_norm":
-            self.norm = nn.LayerNorm(
-                embedding_dim, eps=eps, elementwise_affine=elementwise_affine
-            )
+            self.norm = nn.LayerNorm(embedding_dim, eps=eps, elementwise_affine=elementwise_affine)
         elif norm_type == "rms_norm":
-            self.norm = RMSNorm(
-                hidden_size=embedding_dim, eps=eps, has_weights=elementwise_affine
-            )
+            self.norm = RMSNorm(hidden_size=embedding_dim, eps=eps, has_weights=elementwise_affine)
         else:
             raise ValueError(f"unknown norm_type {norm_type}")
 
-    def forward(
-        self, x: torch.Tensor, conditioning_embedding: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, conditioning_embedding: torch.Tensor) -> torch.Tensor:
         emb = self.linear(self.silu(conditioning_embedding).to(x.dtype))
         scale, shift = torch.chunk(emb, 2, dim=1)
         x = self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
@@ -253,14 +243,16 @@ class FeedForward(MLP):
             )
         if dim_out != dim:
             raise ValueError("TRT-LLM MLP FeedForward requires dim_out == dim")
-        super().__init__(hidden_size=dim,
-                         intermediate_size=inner_dim,
-                         bias=bias,
-                         activation=activation,
-                         dtype=dtype,
-                         config=config,
-                         layer_idx=layer_idx,
-                         reduce_output=False)
+        super().__init__(
+            hidden_size=dim,
+            intermediate_size=inner_dim,
+            bias=bias,
+            activation=activation,
+            dtype=dtype,
+            config=config,
+            layer_idx=layer_idx,
+            reduce_output=False,
+        )
 
 
 # ===========================================================================
@@ -280,8 +272,7 @@ def apply_rotary_emb_qwen(
     """
     if use_real:
         raise NotImplementedError(
-            "Qwen-Image uses complex-valued freqs (use_real=False); "
-            "the real-valued path is unused."
+            "Qwen-Image uses complex-valued freqs (use_real=False); the real-valued path is unused."
         )
     # The shared VisualGen apply_rotary_emb helper takes real-valued
     # cos/sin tensors. Qwen-Image stores RoPE as complex frequencies to
@@ -389,40 +380,28 @@ class QwenEmbedRope(nn.Module):
         freqs_neg = neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
 
         freqs_frame = (
-            freqs_pos[0][idx : idx + frame]
-            .view(frame, 1, 1, -1)
-            .expand(frame, height, width, -1)
+            freqs_pos[0][idx : idx + frame].view(frame, 1, 1, -1).expand(frame, height, width, -1)
         )
         if self.scale_rope:
             freqs_height = torch.cat(
                 [freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]],
                 dim=0,
             )
-            freqs_height = freqs_height.view(1, height, 1, -1).expand(
-                frame, height, width, -1
-            )
+            freqs_height = freqs_height.view(1, height, 1, -1).expand(frame, height, width, -1)
             freqs_width = torch.cat(
                 [freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]],
                 dim=0,
             )
-            freqs_width = freqs_width.view(1, 1, width, -1).expand(
-                frame, height, width, -1
-            )
+            freqs_width = freqs_width.view(1, 1, width, -1).expand(frame, height, width, -1)
         else:
             freqs_height = (
-                freqs_pos[1][:height]
-                .view(1, height, 1, -1)
-                .expand(frame, height, width, -1)
+                freqs_pos[1][:height].view(1, height, 1, -1).expand(frame, height, width, -1)
             )
             freqs_width = (
-                freqs_pos[2][:width]
-                .view(1, 1, width, -1)
-                .expand(frame, height, width, -1)
+                freqs_pos[2][:width].view(1, 1, width, -1).expand(frame, height, width, -1)
             )
 
-        freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(
-            seq_lens, -1
-        )
+        freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(seq_lens, -1)
         return freqs.clone().contiguous()
 
 
@@ -585,16 +564,15 @@ class QwenJointAttention(Attention):
             attn_mask = attention_mask[:, None, None, :]
 
         if attn_mask is None:
-            out = self._attn_impl(joint_q.transpose(1, 2).flatten(2),
-                                  joint_k.transpose(1, 2).flatten(2),
-                                  joint_v.transpose(1, 2).flatten(2))
+            out = self._attn_impl(
+                joint_q.transpose(1, 2).flatten(2),
+                joint_k.transpose(1, 2).flatten(2),
+                joint_v.transpose(1, 2).flatten(2),
+            )
         else:
-            out = F.scaled_dot_product_attention(joint_q,
-                                                 joint_k,
-                                                 joint_v,
-                                                 attn_mask=attn_mask,
-                                                 dropout_p=0.0,
-                                                 is_causal=False)
+            out = F.scaled_dot_product_attention(
+                joint_q, joint_k, joint_v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
+            )
             out = out.transpose(1, 2).flatten(2, 3).to(joint_q.dtype)
 
         txt_attn_output = out[:, :seq_txt, :]
@@ -630,13 +608,15 @@ class QwenImageTransformerBlock(nn.Module):
         # Image stream.
         self.img_mod = nn.Sequential(
             nn.SiLU(),
-            Linear(dim,
-                   6 * dim,
-                   bias=True,
-                   dtype=dtype,
-                   quant_config=config.get_quant_config(),
-                   skip_create_weights_in_init=config.skip_create_weights_in_init,
-                   force_dynamic_quantization=config.force_dynamic_quantization),
+            Linear(
+                dim,
+                6 * dim,
+                bias=True,
+                dtype=dtype,
+                quant_config=config.get_quant_config(),
+                skip_create_weights_in_init=config.skip_create_weights_in_init,
+                force_dynamic_quantization=config.force_dynamic_quantization,
+            ),
         )
         self.img_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.attn = QwenJointAttention(
@@ -649,37 +629,41 @@ class QwenImageTransformerBlock(nn.Module):
             layer_idx=layer_idx,
         )
         self.img_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.img_mlp = FeedForward(dim=dim,
-                                   dim_out=dim,
-                                   activation_fn="gelu-approximate",
-                                   dtype=dtype,
-                                   config=config,
-                                   layer_idx=layer_idx)
+        self.img_mlp = FeedForward(
+            dim=dim,
+            dim_out=dim,
+            activation_fn="gelu-approximate",
+            dtype=dtype,
+            config=config,
+            layer_idx=layer_idx,
+        )
 
         # Text stream (shares attention with image stream).
         self.txt_mod = nn.Sequential(
             nn.SiLU(),
-            Linear(dim,
-                   6 * dim,
-                   bias=True,
-                   dtype=dtype,
-                   quant_config=config.get_quant_config(),
-                   skip_create_weights_in_init=config.skip_create_weights_in_init,
-                   force_dynamic_quantization=config.force_dynamic_quantization),
+            Linear(
+                dim,
+                6 * dim,
+                bias=True,
+                dtype=dtype,
+                quant_config=config.get_quant_config(),
+                skip_create_weights_in_init=config.skip_create_weights_in_init,
+                force_dynamic_quantization=config.force_dynamic_quantization,
+            ),
         )
         self.txt_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.txt_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.txt_mlp = FeedForward(dim=dim,
-                                   dim_out=dim,
-                                   activation_fn="gelu-approximate",
-                                   dtype=dtype,
-                                   config=config,
-                                   layer_idx=layer_idx)
+        self.txt_mlp = FeedForward(
+            dim=dim,
+            dim_out=dim,
+            activation_fn="gelu-approximate",
+            dtype=dtype,
+            config=config,
+            layer_idx=layer_idx,
+        )
 
     @staticmethod
-    def _modulate(
-        x: torch.Tensor, mod_params: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _modulate(x: torch.Tensor, mod_params: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         shift, scale, gate = mod_params.chunk(3, dim=-1)
         shift = shift.unsqueeze(1)
         scale = scale.unsqueeze(1)
@@ -702,9 +686,7 @@ class QwenImageTransformerBlock(nn.Module):
 
         # Norm1 + modulation.
         img_modulated, img_gate1 = self._modulate(self.img_norm1(hidden_states), img_mod1)
-        txt_modulated, txt_gate1 = self._modulate(
-            self.txt_norm1(encoder_hidden_states), txt_mod1
-        )
+        txt_modulated, txt_gate1 = self._modulate(self.txt_norm1(encoder_hidden_states), txt_mod1)
 
         # Joint attention.
         img_attn_output, txt_attn_output = self.attn(
@@ -722,12 +704,8 @@ class QwenImageTransformerBlock(nn.Module):
         img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), img_mod2)
         hidden_states = hidden_states + img_gate2 * self.img_mlp(img_modulated2)
 
-        txt_modulated2, txt_gate2 = self._modulate(
-            self.txt_norm2(encoder_hidden_states), txt_mod2
-        )
-        encoder_hidden_states = encoder_hidden_states + txt_gate2 * self.txt_mlp(
-            txt_modulated2
-        )
+        txt_modulated2, txt_gate2 = self._modulate(self.txt_norm2(encoder_hidden_states), txt_mod2)
+        encoder_hidden_states = encoder_hidden_states + txt_gate2 * self.txt_mlp(txt_modulated2)
 
         if encoder_hidden_states.dtype == torch.float16:
             encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
@@ -777,9 +755,7 @@ class QwenImageTransformer2DModel(nn.Module):
         self.joint_attention_dim = joint_attention_dim
         self.inner_dim = num_attention_heads * attention_head_dim
 
-        self.pos_embed = QwenEmbedRope(
-            theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True
-        )
+        self.pos_embed = QwenEmbedRope(theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True)
         self.time_text_embed = QwenTimestepProjEmbeddings(embedding_dim=self.inner_dim)
         self.txt_norm = RMSNorm(
             hidden_size=joint_attention_dim,
@@ -793,14 +769,8 @@ class QwenImageTransformer2DModel(nn.Module):
             "skip_create_weights_in_init": self.model_config.skip_create_weights_in_init,
             "force_dynamic_quantization": self.model_config.force_dynamic_quantization,
         }
-        self.img_in = Linear(in_channels,
-                             self.inner_dim,
-                             bias=True,
-                             **linear_kwargs)
-        self.txt_in = Linear(joint_attention_dim,
-                             self.inner_dim,
-                             bias=True,
-                             **linear_kwargs)
+        self.img_in = Linear(in_channels, self.inner_dim, bias=True, **linear_kwargs)
+        self.txt_in = Linear(joint_attention_dim, self.inner_dim, bias=True, **linear_kwargs)
 
         self.transformer_blocks = nn.ModuleList(
             [
@@ -864,9 +834,7 @@ class QwenImageTransformer2DModel(nn.Module):
         if missing:
             raise RuntimeError(f"Missing keys when loading transformer: {missing[:5]}...")
         if unexpected:
-            raise RuntimeError(
-                f"Unexpected keys when loading transformer: {unexpected[:5]}..."
-            )
+            raise RuntimeError(f"Unexpected keys when loading transformer: {unexpected[:5]}...")
 
         loader = DynamicLinearWeightLoader(self.model_config)
         for name, module in self.named_modules():
@@ -933,9 +901,7 @@ class QwenImageTransformer2DModel(nn.Module):
                 dtype=torch.bool,
                 device=hidden_states.device,
             )
-            block_attention_mask = torch.cat(
-                [encoder_hidden_states_mask, image_mask], dim=1
-            )
+            block_attention_mask = torch.cat([encoder_hidden_states_mask, image_mask], dim=1)
 
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(

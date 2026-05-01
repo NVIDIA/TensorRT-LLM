@@ -16,8 +16,8 @@ from .transformer_qwen_image import (
     QwenImageTransformerBlock,
     QwenJointAttention,
     QwenTimestepProjEmbeddings,
-    Timesteps,
     TimestepEmbedding,
+    Timesteps,
     apply_rotary_emb_qwen,
     get_timestep_embedding,
 )

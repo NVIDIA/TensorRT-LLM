@@ -13,7 +13,7 @@ are loaded directly from the HF checkpoint using diffusers/transformers.
 """
 
 import time
-from typing import Any, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -25,7 +25,6 @@ from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm.logger import logger
 
 from .transformer_qwen_image import QwenImageTransformer2DModel
-
 
 # ``self.prompt_template_encode`` from diffusers.QwenImagePipeline.
 _PROMPT_TEMPLATE = (
@@ -177,10 +176,7 @@ class QwenImagePipeline(BasePipeline):
         skip_components = skip_components or []
 
         try:
-            from diffusers import (
-                AutoencoderKLQwenImage,
-                FlowMatchEulerDiscreteScheduler,
-            )
+            from diffusers import AutoencoderKLQwenImage, FlowMatchEulerDiscreteScheduler
         except ImportError as e:  # pragma: no cover
             raise ImportError(
                 "Qwen-Image requires diffusers with AutoencoderKLQwenImage "
@@ -188,14 +184,10 @@ class QwenImagePipeline(BasePipeline):
             ) from e
 
         try:
-            from transformers import (
-                Qwen2_5_VLForConditionalGeneration,
-                Qwen2Tokenizer,
-            )
+            from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
         except ImportError as e:  # pragma: no cover
             raise ImportError(
-                "Qwen-Image requires transformers with Qwen2_5_VL* "
-                "(`pip install -U transformers`)."
+                "Qwen-Image requires transformers with Qwen2_5_VL* (`pip install -U transformers`)."
             ) from e
 
         if PipelineComponent.TOKENIZER not in skip_components:
@@ -221,9 +213,7 @@ class QwenImagePipeline(BasePipeline):
             ).to(device)
             # Qwen-Image VAE has a ``temperal_downsample`` list (sic --
             # typo in diffusers source); vae_scale_factor = 2**len(it).
-            temperal_downsample = getattr(
-                self.vae, "temperal_downsample", [1, 1, 1]
-            )
+            temperal_downsample = getattr(self.vae, "temperal_downsample", [1, 1, 1])
             self.vae_scale_factor = 2 ** len(temperal_downsample)
 
         if PipelineComponent.SCHEDULER not in skip_components:
@@ -290,7 +280,9 @@ class QwenImagePipeline(BasePipeline):
 
         split_hidden = self._extract_masked_hidden(hidden_states, tok.attention_mask)
         split_hidden = [h[drop_idx:] for h in split_hidden]
-        attn_masks = [torch.ones(h.size(0), dtype=torch.long, device=h.device) for h in split_hidden]
+        attn_masks = [
+            torch.ones(h.size(0), dtype=torch.long, device=h.device) for h in split_hidden
+        ]
         max_len = max(h.size(0) for h in split_hidden)
         prompt_embeds = torch.stack(
             [torch.cat([h, h.new_zeros(max_len - h.size(0), h.size(1))]) for h in split_hidden]
@@ -316,13 +308,9 @@ class QwenImagePipeline(BasePipeline):
         height: int,
         width: int,
     ) -> torch.Tensor:
-        latents = latents.view(
-            batch_size, num_channels_latents, height // 2, 2, width // 2, 2
-        )
+        latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
         latents = latents.permute(0, 2, 4, 1, 3, 5)
-        return latents.reshape(
-            batch_size, (height // 2) * (width // 2), num_channels_latents * 4
-        )
+        return latents.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
 
     @staticmethod
     def _unpack_latents(
@@ -356,9 +344,7 @@ class QwenImagePipeline(BasePipeline):
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
         return self._pack_latents(latents, batch_size, num_channels_latents, h, w)
 
-    def _decode_latents(
-        self, latents: torch.Tensor, height: int, width: int
-    ) -> torch.Tensor:
+    def _decode_latents(self, latents: torch.Tensor, height: int, width: int) -> torch.Tensor:
         latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
         latents = latents.to(self.vae.dtype)
 
@@ -368,11 +354,8 @@ class QwenImagePipeline(BasePipeline):
             .view(1, z_dim, 1, 1, 1)
             .to(latents.device, latents.dtype)
         )
-        latents_std = (
-            1.0
-            / torch.tensor(self.vae.config.latents_std)
-            .view(1, z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, z_dim, 1, 1, 1).to(
+            latents.device, latents.dtype
         )
         latents = latents / latents_std + latents_mean
         image = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
@@ -451,9 +434,7 @@ class QwenImagePipeline(BasePipeline):
 
         # Text encoding.
         logger.info("Encoding prompt...")
-        prompt_embeds, prompt_embeds_mask = self._encode_prompt(
-            prompt, device, max_sequence_length
-        )
+        prompt_embeds, prompt_embeds_mask = self._encode_prompt(prompt, device, max_sequence_length)
         neg_prompt_embeds = neg_prompt_embeds_mask = None
         if do_true_cfg:
             if isinstance(negative_prompt, str):
@@ -498,9 +479,7 @@ class QwenImagePipeline(BasePipeline):
             self.scheduler.config.get("base_shift", 0.5),
             self.scheduler.config.get("max_shift", 1.15),
         )
-        self.scheduler.set_timesteps(
-            sigmas=sigmas_np, device=device, mu=mu
-        )
+        self.scheduler.set_timesteps(sigmas=sigmas_np, device=device, mu=mu)
         timesteps = self.scheduler.timesteps
         self.scheduler.set_begin_index(0)
 

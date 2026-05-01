@@ -85,9 +85,7 @@ def transformer_config() -> dict:
 @requires_ckpt
 @requires_cuda
 @pytest.mark.parametrize("timestep_value", [0.001, 0.25, 0.5, 0.99])
-def test_qwen_timestep_proj_embedding_parity(
-    transformer_state_dict, timestep_value
-):
+def test_qwen_timestep_proj_embedding_parity(transformer_state_dict, timestep_value):
     from diffusers.models.transformers.transformer_qwenimage import (
         QwenTimestepProjEmbeddings as RefTimestep,
     )
@@ -102,9 +100,7 @@ def test_qwen_timestep_proj_embedding_parity(
 
     prefix = "time_text_embed."
     time_text_sd = {
-        k.removeprefix(prefix): v
-        for k, v in transformer_state_dict.items()
-        if k.startswith(prefix)
+        k.removeprefix(prefix): v for k, v in transformer_state_dict.items() if k.startswith(prefix)
     }
 
     ref = RefTimestep(embedding_dim=embedding_dim).to(dtype).to(device).eval()
@@ -125,13 +121,9 @@ def test_qwen_timestep_proj_embedding_parity(
 
 @requires_cuda
 def test_get_timestep_embedding_matches_diffusers():
-    from diffusers.models.embeddings import (
-        get_timestep_embedding as ref_fn,
-    )
+    from diffusers.models.embeddings import get_timestep_embedding as ref_fn
 
-    from tensorrt_llm._torch.visual_gen.models.qwen_image import (
-        get_timestep_embedding as our_fn,
-    )
+    from tensorrt_llm._torch.visual_gen.models.qwen_image import get_timestep_embedding as our_fn
 
     device = torch.device("cuda")
     t = torch.tensor([0.001, 0.25, 0.5, 0.99], dtype=torch.float32, device=device)
@@ -157,9 +149,7 @@ def test_get_timestep_embedding_matches_diffusers():
 @pytest.mark.parametrize("max_txt_seq_len", [16, 512])
 def test_qwen_embed_rope_parity(video_fhw, max_txt_seq_len):
     """Our ``QwenEmbedRope`` must produce bit-exact complex freqs."""
-    from diffusers.models.transformers.transformer_qwenimage import (
-        QwenEmbedRope as RefRope,
-    )
+    from diffusers.models.transformers.transformer_qwenimage import QwenEmbedRope as RefRope
 
     from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenEmbedRope
 
@@ -177,15 +167,11 @@ def test_qwen_embed_rope_parity(video_fhw, max_txt_seq_len):
 
 @requires_cuda
 def test_apply_rotary_emb_qwen_parity():
-    from diffusers.models.transformers.transformer_qwenimage import (
-        apply_rotary_emb_qwen as ref_fn,
-        QwenEmbedRope as RefRope,
-    )
+    from diffusers.models.transformers.transformer_qwenimage import QwenEmbedRope as RefRope
+    from diffusers.models.transformers.transformer_qwenimage import apply_rotary_emb_qwen as ref_fn
 
-    from tensorrt_llm._torch.visual_gen.models.qwen_image import (
-        apply_rotary_emb_qwen as our_fn,
-        QwenEmbedRope,
-    )
+    from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenEmbedRope
+    from tensorrt_llm._torch.visual_gen.models.qwen_image import apply_rotary_emb_qwen as our_fn
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -219,9 +205,7 @@ def test_pre_post_block_modules_parity(transformer_state_dict, transformer_confi
     slice, and compare output on fixed random inputs.
     """
     from tensorrt_llm._torch.modules.rms_norm import RMSNorm
-    from tensorrt_llm._torch.visual_gen.models.qwen_image import (
-        AdaLayerNormContinuous,
-    )
+    from tensorrt_llm._torch.visual_gen.models.qwen_image import AdaLayerNormContinuous
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -232,18 +216,20 @@ def test_pre_post_block_modules_parity(transformer_state_dict, transformer_confi
     patch_size = cfg["patch_size"]
 
     # Diffusers refs.
-    from diffusers.models.normalization import (
-        AdaLayerNormContinuous as RefAdaLN,
-        RMSNorm as RefRMS,
-    )
+    from diffusers.models.normalization import AdaLayerNormContinuous as RefAdaLN
+    from diffusers.models.normalization import RMSNorm as RefRMS
 
     ref_img_in = torch.nn.Linear(cfg["in_channels"], inner_dim).to(dtype).to(device)
     ref_txt_in = torch.nn.Linear(joint_attn_dim, inner_dim).to(dtype).to(device)
     ref_txt_norm = RefRMS(joint_attn_dim, eps=1e-6).to(dtype).to(device)
-    ref_norm_out = RefAdaLN(inner_dim, inner_dim, elementwise_affine=False, eps=1e-6).to(dtype).to(device)
-    ref_proj_out = torch.nn.Linear(
-        inner_dim, patch_size * patch_size * out_channels, bias=True
-    ).to(dtype).to(device)
+    ref_norm_out = (
+        RefAdaLN(inner_dim, inner_dim, elementwise_affine=False, eps=1e-6).to(dtype).to(device)
+    )
+    ref_proj_out = (
+        torch.nn.Linear(inner_dim, patch_size * patch_size * out_channels, bias=True)
+        .to(dtype)
+        .to(device)
+    )
 
     # Load weights from the HF checkpoint.
     def sd(prefix):
@@ -262,13 +248,19 @@ def test_pre_post_block_modules_parity(transformer_state_dict, transformer_confi
     # Our ports.
     our_img_in = torch.nn.Linear(cfg["in_channels"], inner_dim).to(dtype).to(device)
     our_txt_in = torch.nn.Linear(joint_attn_dim, inner_dim).to(dtype).to(device)
-    our_txt_norm = RMSNorm(
-        hidden_size=joint_attn_dim, eps=1e-6, dtype=dtype, has_weights=True
-    ).to(device)
-    our_norm_out = AdaLayerNormContinuous(inner_dim, inner_dim, elementwise_affine=False, eps=1e-6).to(dtype).to(device)
-    our_proj_out = torch.nn.Linear(
-        inner_dim, patch_size * patch_size * out_channels, bias=True
-    ).to(dtype).to(device)
+    our_txt_norm = RMSNorm(hidden_size=joint_attn_dim, eps=1e-6, dtype=dtype, has_weights=True).to(
+        device
+    )
+    our_norm_out = (
+        AdaLayerNormContinuous(inner_dim, inner_dim, elementwise_affine=False, eps=1e-6)
+        .to(dtype)
+        .to(device)
+    )
+    our_proj_out = (
+        torch.nn.Linear(inner_dim, patch_size * patch_size * out_channels, bias=True)
+        .to(dtype)
+        .to(device)
+    )
 
     our_img_in.load_state_dict(sd("img_in"), strict=True)
     our_txt_in.load_state_dict(sd("txt_in"), strict=True)
@@ -319,9 +311,9 @@ def test_qwen_image_transformer_block_parity(transformer_state_dict, transformer
     and temb are constructed consistently; text-stream RMSNorm and
     img_in / txt_in are applied to produce the block input.
     """
+    from diffusers.models.transformers.transformer_qwenimage import QwenEmbedRope as RefRope
     from diffusers.models.transformers.transformer_qwenimage import (
         QwenImageTransformerBlock as RefBlock,
-        QwenEmbedRope as RefRope,
     )
 
     from tensorrt_llm._torch.visual_gen.models.qwen_image import (
@@ -337,16 +329,26 @@ def test_qwen_image_transformer_block_parity(transformer_state_dict, transformer
     cfg = transformer_config
     inner_dim = cfg["num_attention_heads"] * cfg["attention_head_dim"]
 
-    ref_block = RefBlock(
-        dim=inner_dim,
-        num_attention_heads=cfg["num_attention_heads"],
-        attention_head_dim=cfg["attention_head_dim"],
-    ).to(dtype).to(device).eval()
-    our_block = QwenImageTransformerBlock(
-        dim=inner_dim,
-        num_attention_heads=cfg["num_attention_heads"],
-        attention_head_dim=cfg["attention_head_dim"],
-    ).to(dtype).to(device).eval()
+    ref_block = (
+        RefBlock(
+            dim=inner_dim,
+            num_attention_heads=cfg["num_attention_heads"],
+            attention_head_dim=cfg["attention_head_dim"],
+        )
+        .to(dtype)
+        .to(device)
+        .eval()
+    )
+    our_block = (
+        QwenImageTransformerBlock(
+            dim=inner_dim,
+            num_attention_heads=cfg["num_attention_heads"],
+            attention_head_dim=cfg["attention_head_dim"],
+        )
+        .to(dtype)
+        .to(device)
+        .eval()
+    )
 
     block0_prefix = "transformer_blocks.0."
     block0_sd = {
@@ -361,9 +363,7 @@ def test_qwen_image_transformer_block_parity(transformer_state_dict, transformer
     _m_ref, _u_ref = ref_block.load_state_dict(block0_sd, strict=False)
     # Silently ignore missing keys on diffusers side: its Attention has
     # some optional norm/head_dim params we don't need to set.
-    _m_our, _u_our = our_block.load_state_dict(
-        _remap_checkpoint_keys(block0_sd), strict=False
-    )
+    _m_our, _u_our = our_block.load_state_dict(_remap_checkpoint_keys(block0_sd), strict=False)
     assert not _u_our, f"unexpected keys in our block: {_u_our[:3]}"
     # Diffusers' extra (ignored) keys are OK; missing on our side must
     # be 0 because we mirror the state_dict structure.
@@ -430,9 +430,7 @@ def test_qwen_image_transformer_full_parity(transformer_state_dict, transformer_
     """
     from diffusers import QwenImageTransformer2DModel as RefT
 
-    from tensorrt_llm._torch.visual_gen.models.qwen_image import (
-        QwenImageTransformer2DModel,
-    )
+    from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenImageTransformer2DModel
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
