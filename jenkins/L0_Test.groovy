@@ -1436,11 +1436,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "export ${varName}=\"${escapedValue}\""
                 }.join('\n')
 
-                // CBTS Layer 3 may narrow this stage's shard list below pytest-split's
-                // --splits count, leaving some shards with 0 tests → pytest exits 5.
-                // slurm_run.sh tolerates exit 5 only when this env var is "true".
-                def cbtsActive = testFilter[(CBTS_RESULT)]?.test_db_dir_override ? "true" : "false"
-
                 def scriptLaunchPrefix = """#!/bin/bash
                     #SBATCH ${exemptionComment}
                     #SBATCH --output=${slurmJobLogPath}
@@ -1463,7 +1458,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
-                    export cbtsActive=$cbtsActive
                     export HF_TOKEN=$HF_TOKEN
                     export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
                     export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=csv,noheader)-1)))}
@@ -3286,16 +3280,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 }
 
                 if (noRegularTests && noIsolateTests) {
-                    // CBTS Layer 3 may narrow a block's tests below the stage's
-                    // split count, leaving some shards with 0 tests. That's
-                    // expected — other shards run the affected tests. Only
-                    // raise the sanity-check error when CBTS isn't active.
-                    def cbtsActive = testFilter[(CBTS_RESULT)]?.test_db_dir_override
-                    if (cbtsActive) {
-                        echo "CBTS Layer 3: shard ${splitId}/${splits} got 0 tests after narrowing — other shards run the affected tests. Marking as success."
-                    } else {
-                        error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
-                    }
+                    error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
                 }
             }
         }

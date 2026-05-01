@@ -102,13 +102,8 @@ if [ "${SLURM_JOB_NUM_NODES:-1}" -eq 1 ] || \
     done
 fi
 
-# Turn off "exit on error" so the following lines always run.
-# `set -E` (errtrace, set on line 4) makes the ERR trap fire even after
-# `set +e`, so without removing the trap a non-zero pytest exit would
-# trigger the trap's `exit $rc` and skip the rest of this script
-# (including the CBTS exit-5 tolerance below).
+# Turn off "exit on error" so the following lines always run
 set +e
-trap - ERR
 
 pytest_exit_code=0
 perf_check_exit_code=0
@@ -117,16 +112,6 @@ perf_report_exit_code=0
 eval $pytestCommand
 pytest_exit_code=$?
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
-
-# CBTS Layer 3 may narrow this shard's test list below pytest-split's
-# --splits count, leaving some groups with 0 tests. pytest then exits 5
-# (no tests collected). Treat exit 5 as success when CBTS is active —
-# other shards run the actual affected tests. This mirrors the K8s-path
-# tolerance in runLLMTestlistOnPlatformImpl (noRegularTests && noIsolateTests).
-if [ "$pytest_exit_code" -eq 5 ] && [ "${cbtsActive:-false}" = "true" ]; then
-    echo "Rank${SLURM_PROCID} CBTS Layer 3: 0 tests in this shard after narrowing — marking as success"
-    pytest_exit_code=0
-fi
 
 # DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
 # Remove this after the issue is resolved
