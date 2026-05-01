@@ -192,8 +192,25 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
         = at::detail::empty_cuda({args.num_tokens * args.top_k}, at::ScalarType::Int, routing_device, std::nullopt);
     at::Tensor permuted_idx_to_token_idx
         = at::detail::empty_cuda({max_num_padded_tokens}, at::ScalarType::Int, routing_device, std::nullopt);
-    at::Tensor expert_weights
-        = at::detail::empty_cuda({args.num_tokens, args.top_k}, routing_bias_dtype, routing_device, std::nullopt);
+    // expert_weights is the routing kernel's topk-weights output and is consumed by moe_finalize,
+    // which requires `dtype == scale_dtype` against gemm2_output. Track args.mDtypeOut so the two
+    // buffers stay in lock-step automatically; do NOT tie this to the bias dtype, which is allowed
+    // to differ.
+    auto const expert_weights_scalar_type = [&]()
+    {
+        switch (args.mDtypeOut)
+        {
+        case btg::Dtype::Bfloat16: return at::ScalarType::BFloat16;
+        case btg::Dtype::Fp16: return at::ScalarType::Half;
+        case btg::Dtype::Fp32: return at::ScalarType::Float;
+        default:
+            TORCH_CHECK(false,
+                "Unsupported MoE output dtype for expert_weights allocation: ", btg::dtypeToString(args.mDtypeOut),
+                ". Expected Bfloat16/Fp16/Fp32.");
+        }
+    }();
+    at::Tensor expert_weights = at::detail::empty_cuda(
+        {args.num_tokens, args.top_k}, expert_weights_scalar_type, routing_device, std::nullopt);
     at::Tensor expert_indexes
         = at::detail::empty_cuda({args.num_tokens, args.top_k}, at::ScalarType::Int, routing_device, std::nullopt);
     int64_t const size_of_expert_count_histogram = std::max(num_experts * 2, int64_t(256 * 2));

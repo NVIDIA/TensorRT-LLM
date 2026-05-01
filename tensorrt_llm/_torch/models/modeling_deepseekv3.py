@@ -829,8 +829,12 @@ class DeepseekV3Gate(nn.Module):
                                                dtype=dtype),
                                    requires_grad=False)
         self.moe_backend = moe_backend
+        if moe_backend == 'TRTLLM':
+            bias_dtype = torch.bfloat16
+        else:
+            bias_dtype = torch.float32
         self.e_score_correction_bias = nn.Parameter(torch.empty(
-            (num_experts), dtype=torch.float32),
+            (num_experts), dtype=bias_dtype),
                                                     requires_grad=False)
 
         assert not apply_routing, "DeepseekV3Gate routing is called inside MoE"
