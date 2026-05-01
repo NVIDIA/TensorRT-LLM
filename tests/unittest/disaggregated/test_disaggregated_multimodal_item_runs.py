@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
@@ -103,6 +104,15 @@ def test_llm_preprocess_reconstructs_multimodal_input_with_item_runs():
         def get_prompt_token_ids(self, inputs, mm_handles):
             assert mm_handles == MM_HANDLES
             return [11, 999, 77, 999, 12], [2], [1]
+
+        def get_vocab_size(self):
+            return None
+
+        def get_mm_token_ids(self):
+            return torch.tensor([999])
+
+        def get_mm_special_token_ids(self):
+            return None
 
     llm = BaseLLM.__new__(BaseLLM)
     llm.input_processor = FakeInputProcessor()
