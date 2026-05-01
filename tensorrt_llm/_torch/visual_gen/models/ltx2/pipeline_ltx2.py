@@ -487,7 +487,7 @@ class LTX2Pipeline(BasePipeline):
 
     @classmethod
     def resolve_variant(cls, config):
-        if config.extra_attrs.get("one_stage_pipeline"):
+        if config.extra_attrs.get("force_one_stage_pipeline"):
             return cls
         if config.extra_attrs.get("spatial_upsampler_path") and config.extra_attrs.get(
             "distilled_lora_path"

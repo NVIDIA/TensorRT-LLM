@@ -1,4 +1,5 @@
 import json
+import os
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,9 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 # =============================================================================
 
 CacheBackendName = Literal["teacache", "cache_dit"]
+
+LTX2_FORCE_ONE_STAGE_ENV = "TLLM_LTX2_FORCE_ONE_STAGE_PIPELINE"
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 
 # =============================================================================
 # Pipeline component identifiers
@@ -420,17 +424,6 @@ class VisualGenArgs(StrictBaseModel):
         ),
     )
 
-    # LTX-2 specific option: force base one-stage pipeline even when two-stage
-    # auxiliary checkpoints are passed explicitly or discoverable next to the model.
-    one_stage_pipeline: bool = PydanticField(
-        False,
-        description=(
-            "Force the LTX-2 one-stage pipeline. When enabled, TensorRT-LLM "
-            "does not discover or use spatial_upsampler_path/distilled_lora_path "
-            "for two-stage pipeline promotion."
-        ),
-    )
-
     # HuggingFace Hub options
     revision: Optional[str] = PydanticField(
         None,
@@ -595,6 +588,10 @@ def _pick_unique_file(search_dir: Path, pattern: str) -> str:
     return ""
 
 
+def _env_flag_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in _TRUE_ENV_VALUES
+
+
 def discover_ltx2_two_stage_paths(
     checkpoint_path: Path,
     spatial_upsampler_path: str = "",
@@ -625,20 +622,19 @@ def resolve_ltx2_pipeline_extra_attrs(
     checkpoint_path: Path,
     spatial_upsampler_path: str = "",
     distilled_lora_path: str = "",
-    one_stage_pipeline: bool = False,
 ) -> Dict[str, Any]:
     """Resolve LTX2 pipeline-selection attributes before variant selection."""
-    if one_stage_pipeline:
+    if _env_flag_enabled(LTX2_FORCE_ONE_STAGE_ENV):
         logger.info(
-            "LTX2 one_stage_pipeline is enabled; skipping two-stage auxiliary "
+            f"{LTX2_FORCE_ONE_STAGE_ENV} is enabled; skipping two-stage auxiliary "
             "checkpoint discovery and promotion."
         )
         if spatial_upsampler_path or distilled_lora_path:
             logger.info(
                 "Ignoring spatial_upsampler_path/distilled_lora_path because "
-                "one_stage_pipeline is enabled."
+                f"{LTX2_FORCE_ONE_STAGE_ENV} is enabled."
             )
-        return {"one_stage_pipeline": True}
+        return {"force_one_stage_pipeline": True}
 
     resolved_upsampler_path, resolved_lora_path = discover_ltx2_two_stage_paths(
         checkpoint_path,
@@ -975,7 +971,6 @@ class DiffusionModelConfig(BaseModel):
                 checkpoint_path,
                 args.spatial_upsampler_path if args else "",
                 args.distilled_lora_path if args else "",
-                args.one_stage_pipeline if args else False,
             )
         )
 

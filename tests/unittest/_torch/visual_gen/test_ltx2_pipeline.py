@@ -21,6 +21,7 @@ from test_common.llm_data import llm_models_root
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import (
+    LTX2_FORCE_ONE_STAGE_ENV,
     AttentionConfig,
     DiffusionModelConfig,
     PipelineComponent,
@@ -749,15 +750,15 @@ class TestTwoStagePipelineVariantResolution:
         result = LTX2Pipeline.resolve_variant(config)
         assert result is LTX2TwoStagesPipeline
 
-    def test_resolve_variant_honors_one_stage_pipeline(self):
-        """one_stage_pipeline should prevent promotion even when two-stage paths exist."""
+    def test_resolve_variant_honors_force_one_stage_pipeline(self):
+        """force_one_stage_pipeline should prevent promotion even when two-stage paths exist."""
         from unittest.mock import MagicMock
 
         from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
 
         config = MagicMock()
         config.extra_attrs = {
-            "one_stage_pipeline": True,
+            "force_one_stage_pipeline": True,
             "spatial_upsampler_path": "/fake/upsampler.safetensors",
             "distilled_lora_path": "/fake/lora.safetensors",
         }
@@ -790,10 +791,11 @@ class TestTwoStagePipelineVariantResolution:
         assert result is LTX2Pipeline
 
 
-class TestLTX2OneStagePipelineConfig:
-    """Test one_stage_pipeline config behavior before pipeline construction."""
+class TestLTX2ForceOneStageEnv:
+    """Test force-one-stage env-var behavior before pipeline construction."""
 
-    def test_two_stage_auxiliary_paths_are_discovered_by_default(self, tmp_path):
+    def test_two_stage_auxiliary_paths_are_discovered_by_default(self, tmp_path, monkeypatch):
+        monkeypatch.delenv(LTX2_FORCE_ONE_STAGE_ENV, raising=False)
         checkpoint_path = _write_minimal_ltx2_diffusers_checkpoint(tmp_path)
         upsampler_path = checkpoint_path / "ltx-2-spatial-upscaler-x2-1.0.safetensors"
         lora_path = checkpoint_path / "ltx-2-19b-distilled-lora-384.safetensors"
@@ -806,30 +808,31 @@ class TestLTX2OneStagePipelineConfig:
         assert config.extra_attrs["spatial_upsampler_path"] == str(upsampler_path)
         assert config.extra_attrs["distilled_lora_path"] == str(lora_path)
 
-    def test_one_stage_pipeline_disables_auxiliary_discovery(self, tmp_path):
+    def test_force_one_stage_env_disables_auxiliary_discovery(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(LTX2_FORCE_ONE_STAGE_ENV, "1")
         checkpoint_path = _write_minimal_ltx2_diffusers_checkpoint(tmp_path)
         (checkpoint_path / "ltx-2-spatial-upscaler-x2-1.0.safetensors").touch()
         (checkpoint_path / "ltx-2-19b-distilled-lora-384.safetensors").touch()
 
-        args = VisualGenArgs(checkpoint_path=str(checkpoint_path), one_stage_pipeline=True)
+        args = VisualGenArgs(checkpoint_path=str(checkpoint_path))
         config = DiffusionModelConfig.from_pretrained(str(checkpoint_path), args=args)
 
-        assert config.extra_attrs["one_stage_pipeline"] is True
+        assert config.extra_attrs["force_one_stage_pipeline"] is True
         assert "spatial_upsampler_path" not in config.extra_attrs
         assert "distilled_lora_path" not in config.extra_attrs
 
-    def test_one_stage_pipeline_ignores_explicit_auxiliary_paths(self, tmp_path):
+    def test_force_one_stage_env_ignores_explicit_auxiliary_paths(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(LTX2_FORCE_ONE_STAGE_ENV, "1")
         checkpoint_path = _write_minimal_ltx2_diffusers_checkpoint(tmp_path)
 
         args = VisualGenArgs(
             checkpoint_path=str(checkpoint_path),
             spatial_upsampler_path="/fake/upsampler.safetensors",
             distilled_lora_path="/fake/lora.safetensors",
-            one_stage_pipeline=True,
         )
         config = DiffusionModelConfig.from_pretrained(str(checkpoint_path), args=args)
 
-        assert config.extra_attrs["one_stage_pipeline"] is True
+        assert config.extra_attrs["force_one_stage_pipeline"] is True
         assert "spatial_upsampler_path" not in config.extra_attrs
         assert "distilled_lora_path" not in config.extra_attrs
 
