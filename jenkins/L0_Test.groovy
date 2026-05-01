@@ -1728,31 +1728,24 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       // User abort / pipeline timeout -- never retry
       throw e
     } catch (Exception e) {
-      // FlowInterruptedException may not extend InterruptedException in all Jenkins versions
-      if (e.toString().contains("FlowInterruptedException") ||
-          e.toString().contains("AbortException: script returned exit code 143")) {
-        throw e
-      }
+      // classify() handles FlowInterruptedException + exit-code-143 +
+      // typed throws + cause-chain pattern matching, returning one of
+      // PipelineInterruption / InfraFailure / UserFailure. Scope=SLURM
+      // ensures we only match catalog rows tagged SLURM or BOTH.
+      def c = classify(e, InfraFailure.SLURM)
+      if (c instanceof PipelineInterruption) throw e
+      if (!(c instanceof InfraFailure))      throw e   // UserFailure -> don't retry
 
-      // Check if this is a retryable infrastructure failure
-      def classification = classifyInfraFailure(e)
-
-      if (!classification.isInfraFailure) {
-        // Not an infrastructure failure (test failure, compilation error, etc.)
-        throw e
-      }
-
-      // Determine effective max retries for this pattern
-      def effectiveMax = classification.isSingleRetryOnly ? 1 : SLURM_INFRA_RETRY_MAX
+      def effectiveMax = (c.severity == InfraFailure.PERSISTENT) ? 1 : SLURM_INFRA_RETRY_MAX
 
       if (attempt > effectiveMax) {
-        echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${classification.matchedPattern}) " +
+        echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) " +
              "but max retries (${effectiveMax}) exhausted after ${attempt} attempts. Failing."
         throw e
       }
 
       echo "[INFRA-RETRY] ${stageName}: Infrastructure failure detected on attempt ${attempt}: " +
-           "${classification.matchedPattern}"
+           "${c.detectedPattern}"
       echo "[INFRA-RETRY] ${stageName}: Exception: ${e.toString()}"
       echo "[INFRA-RETRY] ${stageName}: Will retry (attempt ${attempt + 1} of ${effectiveMax + 1}) after 60s cooldown."
 
@@ -1959,10 +1952,10 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             // for forensics; only the in-build test reporting is gated.
             boolean suppressTestReporting = false
             if (!isFinalAttempt && stageIsFailed && caughtError != null) {
-                def cls = classifyInfraFailure(caughtError, K8S_INFRA_FAILURE_PATTERNS, K8S_INFRA_SINGLE_RETRY_PATTERNS)
-                suppressTestReporting = cls.isInfraFailure
-                if (suppressTestReporting) {
-                    echo "[INFRA-RETRY] ${stageName}${postTag}: suppressing synthetic stage-fail XML and junit() on intermediate retryable infra failure (${cls.matchedPattern})"
+                def c = classify(caughtError, InfraFailure.K8S)
+                if (c instanceof InfraFailure) {
+                    suppressTestReporting = true
+                    echo "[INFRA-RETRY] ${stageName}${postTag}: suppressing synthetic stage-fail XML and junit() on intermediate retryable infra failure (${c.detectedPattern})"
                 }
             }
 
@@ -3576,6 +3569,11 @@ def runKubernetesPodWithInfraRetry(pipeline, podSpec, containerName, String stag
     }
 
     def attempt = 0
+    // Severity of the previous attempt's classification, or null on first attempt.
+    // Used to compute isFinalAttempt for the next attempt: a PERSISTENT prior
+    // failure caps the budget at 1 retry (attempt 2 is final), so the next
+    // attempt must not suppress synthetic stage-fail XML / junit().
+    def lastSeverity = null
     while (true) {
         attempt++
         try {
@@ -3587,13 +3585,16 @@ def runKubernetesPodWithInfraRetry(pipeline, podSpec, containerName, String stag
             // Retries append "-attempt-N" to dodge the upload-once guard and
             // preserve every attempt's tarball in Artifactory.
             def attemptTag = (attempt == 1) ? "" : "-attempt-${attempt}"
-            // isFinalAttempt uses the worst-case retry budget. Single-retry-only
-            // patterns terminate early at attempt 2, in which case the synthetic
-            // stage-fail XML is suppressed even though the attempt is effectively
-            // final. The tar still uploads to Artifactory for forensics and the
-            // Jenkins build itself surfaces as failed; this is an acceptable
-            // edge case to keep the helper's pre-call decision simple.
-            boolean isFinalAttempt = (attempt > K8S_INFRA_RETRY_MAX)
+            // For attempt 1 we don't yet know whether the failure (if any) will
+            // be PERSISTENT, so use the worst-case multi-retry budget. From
+            // attempt 2 onward we know the prior classification — if it was
+            // PERSISTENT, effectiveMax for THIS attempt is 1, meaning attempt
+            // 2 IS the final attempt; pass isFinalAttempt=true so the inner
+            // cacheErrorAndUploadResult does not suppress synthetic stage-fail
+            // XML / junit() on what would otherwise look (to it) like just
+            // another intermediate attempt.
+            def effectiveMaxThisAttempt = (lastSeverity == InfraFailure.PERSISTENT) ? 1 : K8S_INFRA_RETRY_MAX
+            boolean isFinalAttempt = (attempt > effectiveMaxThisAttempt)
             trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner(attemptTag, isFinalAttempt) })
             if (attempt > 1) {
                 echo "[INFRA-RETRY] ${stageName}: Succeeded on attempt ${attempt}"
@@ -3603,32 +3604,32 @@ def runKubernetesPodWithInfraRetry(pipeline, podSpec, containerName, String stag
             // User abort / pipeline timeout -- never retry
             throw e
         } catch (Exception e) {
-            // FlowInterruptedException may not extend InterruptedException in all Jenkins versions
-            if (e.toString().contains("FlowInterruptedException") ||
-                e.toString().contains("AbortException: script returned exit code 143")) {
-                throw e
-            }
+            // classify() handles FlowInterruptedException + exit-code-143 +
+            // typed throws + cause-chain pattern matching, returning one of
+            // PipelineInterruption / InfraFailure / UserFailure. Scope=K8S
+            // ensures we only match catalog rows tagged K8S or BOTH; the new
+            // scope-isolation guard inside classify() also prevents a typed
+            // SLURM-scoped InfraFailure (e.g. from an inner SLURM retry that
+            // exhausted its own budget) from being treated as K8s infra here.
+            def c = classify(e, InfraFailure.K8S)
+            if (c instanceof PipelineInterruption) throw e
+            if (!(c instanceof InfraFailure))      throw e   // UserFailure -> don't retry
 
-            def classification = classifyInfraFailure(e, K8S_INFRA_FAILURE_PATTERNS, K8S_INFRA_SINGLE_RETRY_PATTERNS)
-
-            if (!classification.isInfraFailure) {
-                // Not an infrastructure failure (test failure, compilation error, etc.)
-                throw e
-            }
-
-            def effectiveMax = classification.isSingleRetryOnly ? 1 : K8S_INFRA_RETRY_MAX
+            def effectiveMax = (c.severity == InfraFailure.PERSISTENT) ? 1 : K8S_INFRA_RETRY_MAX
 
             if (attempt > effectiveMax) {
-                echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${classification.matchedPattern}) " +
+                echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) " +
                      "but max retries (${effectiveMax}) exhausted after ${attempt} attempts. Failing."
                 throw e
             }
 
             echo "[INFRA-RETRY] ${stageName}: Infrastructure failure detected on attempt ${attempt}: " +
-                 "${classification.matchedPattern}"
+                 "${c.detectedPattern}"
             echo "[INFRA-RETRY] ${stageName}: Exception: ${e.toString()}"
             echo "[INFRA-RETRY] ${stageName}: Will retry (attempt ${attempt + 1} of ${effectiveMax + 1}) after 60s cooldown."
 
+            // Remember severity so the next attempt's isFinalAttempt is correct.
+            lastSeverity = c.severity
             sleep(60)
         }
     }
