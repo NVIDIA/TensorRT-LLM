@@ -2554,6 +2554,34 @@ std::optional<KVCacheBlock::IdType> BlockManager::releaseBlocks(
     return lastStoredId;
 }
 
+void BlockManager::releasePrefixBlocks(GenerationRequest& sequence, SizeType32 numBlocks)
+{
+    // NOTE: This assumes a single window size (no VSWA).  With different window
+    // sizes, each WindowBlockManager may have a different number of allocated
+    // blocks, so releasing the same numBlocks from all managers would need
+    // per-window-size handling.  Disaggregated serving does not support VSWA
+    // today (gated by should_store_blocks: not is_vswa in the executor and
+    // beamWidth == 1 assertion in WindowBlockManager::releasePrefixBlocks).
+    //
+    // Snapshot the counter before iterating so that every WindowBlockManager
+    // releases the same range.  Without this, the first manager would advance
+    // the shared mNumFrontBlocksRemoved counter and subsequent managers would
+    // see the counter already at the target, skipping their own blocks.
+    SizeType32 const startIdx = sequence.getNumFrontBlocksRemoved();
+    for (auto& [_, manager] : mWindowBlockManagers)
+    {
+        manager.releasePrefixBlocks(sequence, startIdx, numBlocks);
+    }
+    // Advance the shared counter once, after all managers have released.
+    // Uses incrementNumFrontBlocksRemoved (counter-only) instead of
+    // removeFrontBlock so the intent is explicit and we do not depend on
+    // removeFrontBlock ignoring its windowSize argument.
+    while (sequence.getNumFrontBlocksRemoved() < numBlocks)
+    {
+        sequence.incrementNumFrontBlocksRemoved();
+    }
+}
+
 void BlockManager::pinBlocks(GenerationRequest& sequence)
 {
     for (auto& [_, manager] : mWindowBlockManagers)
@@ -3253,6 +3281,36 @@ void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)
     sequence.removeFrontBlock(mWindowSize);
 }
 
+void WindowBlockManager::releasePrefixBlocks(GenerationRequest& sequence, SizeType32 startIdx, SizeType32 numBlocks)
+{
+    TLLM_CHECK_WITH_INFO(
+        sequence.getBeamWidth() == 1, "[kv cache manager] releasePrefixBlocks does not support beamWidth > 1");
+
+    auto const requestId = sequence.getRequestId();
+    auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
+    SizeType32 const target = std::min(numBlocks, static_cast<SizeType32>(allocatedBlocks.size()));
+
+    // Release blocks in range [startIdx, target).  The shared
+    // mNumFrontBlocksRemoved counter is advanced by BlockManager after
+    // all WindowBlockManagers have processed the same range.
+    for (SizeType32 blockIdx = startIdx; blockIdx < target; ++blockIdx)
+    {
+        auto& block = allocatedBlocks.at(blockIdx);
+
+        TLLM_LOG_DEBUG("%s::releasePrefixBlocks - Releasing block %d from sequence %lu", mLogPrefix.c_str(),
+            block->getBlockId(), requestId);
+
+        if (block->hasRefs())
+        {
+            block->decRefCount();
+        }
+        if (!block->hasRefs())
+        {
+            mEvictionPolicy->releaseBlock(block);
+        }
+    }
+}
+
 PrefixReuseSummary KVCacheManager::analyzePrefixReuse(
     VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
 {
@@ -3431,6 +3489,31 @@ std::optional<KVCacheBlock::IdType> KVCacheManager::removeSequence(
     TLLM_CHECK(!mBlockManager.isSequenceHeld(requestId));
     TLLM_LOG_TRACE("[%s]::%s stop", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
     return lastStoredId;
+}
+
+void KVCacheManager::releasePrefixBlocks(RequestIdType requestId, SizeType32 numBlocks)
+{
+    // Hard precondition: BlockManager::releasePrefixBlocks advances the shared
+    // mNumFrontBlocksRemoved counter to numBlocks for every WindowBlockManager,
+    // even when a window has fewer than numBlocks allocated.  Under variable
+    // sliding window attention (VSWA), that would cause WindowBlockManager::
+    // releaseBlocks (called during removeSequence) to underrun rbegin() and
+    // skip tail blocks for the smaller window.  Disagg serving already gates
+    // VSWA out, but we enforce the assumption here so the C++ API contract is
+    // self-defending instead of relying on caller discipline.
+    TLLM_CHECK_WITH_INFO(
+        !mBlockManager.isVariableWindow(), "releasePrefixBlocks does not support variable sliding window attention");
+    if (numBlocks <= 0)
+    {
+        return;
+    }
+    std::scoped_lock lock(mSequencesMtx);
+    auto it = mSequences.find(requestId);
+    if (it == mSequences.end())
+    {
+        return;
+    }
+    mBlockManager.releasePrefixBlocks(it->second, numBlocks);
 }
 
 std::vector<KVCacheBlock::IdType> KVCacheManager::storeBlocksForReuse(
