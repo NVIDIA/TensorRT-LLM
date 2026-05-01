@@ -141,12 +141,23 @@ class CapturedGraph(nn.Module):
     def _get_hash(self, flat_args: List[Any]) -> Tuple[int, ...]:
         return tuple(hash(a) for a in flat_args)
 
-    def _capture_one_graph(self, *args, **kwargs) -> torch.cuda.CUDAGraph:
+    def _capture_one_graph(
+        self,
+        args: Tuple,
+        kwargs: Dict,
+        refresh_args_static: Optional[Callable] = None,
+    ) -> torch.cuda.CUDAGraph:
         """Capture and return one cuda graph."""
         # warm-up and invoke autotuner
-        with CudaGraphWarmUpPhase(), autotune():
+        with autotune():
             for _ in range(3):
-                self.model(*args, **kwargs)
+                with CudaGraphWarmUpPhase():
+                    self.model(*args, **kwargs)
+                if refresh_args_static is not None:
+                    # model.forward() sometimes modifies the cache_seq_interface directly
+                    # Example: Eagle switches the batch from extend-only to generate-only mode during the
+                    # draft loop. We want to restore the args to satisfy invariants needed by model.forward()
+                    refresh_args_static()
 
         # capture graph now
         torch.cuda.synchronize()
@@ -257,9 +268,20 @@ class CapturedGraph(nn.Module):
             ]
             args, kwargs = self._in_spec.unflatten(inputs_truncated + args_static)
 
+            # model.forward() sometimes modifies the cache_seq_interface directly (e.g. Eagle
+            # switches the batch from extend-only to generate-only mode during the draft loop).
+            # Always refresh the static input buffers before graph capture so the next warmup
+            # iteration sees the original layout.
+            def refresh_args_static(_bs: int = bs) -> None:
+                get_args_kwargs(_bs)
+
             # capture graph for truncated inputs
             combined_shape = sum((tuple(input.shape) for input in inputs_truncated), start=())
-            self.cudagraphs[combined_shape] = self._capture_one_graph(*args, **kwargs)
+            self.cudagraphs[combined_shape] = self._capture_one_graph(
+                args=args,
+                kwargs=kwargs,
+                refresh_args_static=refresh_args_static,
+            )
 
     def forward(self, *args, **kwargs) -> Any:
         """Run the compiled graph."""

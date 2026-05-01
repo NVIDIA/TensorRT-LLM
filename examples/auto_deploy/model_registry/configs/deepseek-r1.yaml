@@ -3,7 +3,12 @@ compile_backend: torch-cudagraph
 max_batch_size: 64
 max_seq_len: 8192
 enable_chunked_prefill: true
+# Opt into FP8 KV cache for ~2x capacity; default ("auto") keeps bf16.
+kv_cache_config:
+  dtype: fp8
 cuda_graph_config:
+  # Override dashboard_default.yaml's max_batch_size=8 so batch_sizes up to 64 are captured.
+  max_batch_size: 64
   batch_sizes: [1, 2, 4, 8, 16, 32, 64]
 transforms:
   fuse_nvfp4_moe:
@@ -13,6 +18,10 @@ transforms:
   multi_stream_moe:
     # causes crash during inference, fix as part of #12593
     enabled: false
+  insert_cached_mla_attention:
+    backend: trtllm_mla
+  fuse_rope_into_trtllm_mla:
+    enabled: true
   multi_stream_mla_attn:
     stage: compile
     enabled: true

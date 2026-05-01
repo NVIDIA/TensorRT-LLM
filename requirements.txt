@@ -11,7 +11,6 @@ mpi4py
 numpy>=2.0.0,<2.4 # numba 0.63.1 requires numpy<2.4
 onnx>=1.18.0,<1.20.0
 onnx_graphsurgeon>=0.5.2
-onnxscript==0.5.4
 graphviz
 openai
 polygraphy
@@ -55,7 +54,7 @@ ordered-set
 peft>=0.18.1,<0.19.0
 patchelf
 einops
-flashinfer-python==0.6.6
+flashinfer-python==0.6.9
 opencv-python-headless
 xgrammar==0.1.32
 llguidance==0.7.29
@@ -72,7 +71,7 @@ xdsl>=0.59.0 # Optional: required for MLIR-based elementwise fusion in AutoDeplo
 tiktoken
 blobfile
 openai-harmony==0.0.4
-nvidia-cutlass-dsl==4.3.4; python_version >= "3.10"
+nvidia-cutlass-dsl==4.4.2; python_version >= "3.10"
 plotly
 numexpr
 partial_json_parser

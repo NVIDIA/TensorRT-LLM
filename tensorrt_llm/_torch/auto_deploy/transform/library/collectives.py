@@ -106,13 +106,6 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        # Collectives fusion depends on sharding (reads _sharding_transform_container).
-        # Draft models are not sharded, so skip them.
-        if getattr(gm, "is_draft", False):
-            return gm, TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
-
         patterns = ADPatternMatcherPass()
 
         # Dummy shapes for tracing
