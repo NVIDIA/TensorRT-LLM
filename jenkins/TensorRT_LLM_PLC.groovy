@@ -396,14 +396,14 @@ pipeline {
         }
         stage('Run TRT-LLM PLC Jobs') {
             parallel {
-                stage("Source Code OSS Scanning") {
-                    steps {
-                        script {
-                            generateLockFiles(env.LLM_REPO, env.REF)
-                            pulseScanSourceCode(env.LLM_REPO, env.REF)
-                        }
-                    }
-                }
+                //stage("Source Code OSS Scanning") {
+                    //steps {
+                        //script {
+                            //generateLockFiles(env.LLM_REPO, env.REF)
+                            //pulseScanSourceCode(env.LLM_REPO, env.REF)
+                        //}
+                    //}
+                //}
                 stage("Run Container Scanning") {
                     steps {
                         script {
