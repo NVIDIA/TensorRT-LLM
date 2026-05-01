@@ -476,7 +476,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                     continue
                 rep_layer = self._vswa_pool_to_rep_layer[pool_id]
                 pool_block_ids = self.kv_cache_manager.get_batch_cache_indices(
-                    self.request_ids, layer_id=rep_layer)
+                    self.request_ids, layer_idx=rep_layer)
                 pool_idx_list = []
                 for i, blk_ids in enumerate(pool_block_ids):
                     pool_idx_list.extend(blk_ids[:self.num_blocks[i]])
