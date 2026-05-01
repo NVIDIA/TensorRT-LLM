@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -2033,6 +2033,48 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteManyExperts)
     this->mIsLongTest = true;
     /* This test is very slow. Only do one k value */
     this->BasicPermuteTest(2, this->mDeviceMinimumAlignment, 512);
+}
+
+// Decode-like profile: num_experts (128) >> k * num_tokens (24), so most experts have no assigned tokens. This
+// exercises the gemm_m == 0 early-exit path in computeStridesTmaWarpSpecializedKernel and, for the NVFP4 / MXFP8xMXFP4
+// block-scaled paths, confirms that not writing zeros to the N-dim SF padding region in expandInputRowsKernel /
+// doActivationKernel is safe. BasicPermuteTest memsets workspace buffers to mMemsetValue, re-runs with ~mMemsetValue,
+// and asserts bit-exact output equality, so any CUTLASS read of uninitialised SF padding would surface as
+// non-determinism here.
+TYPED_TEST(MixtureOfExpertsTest, PermuteManyInactiveExperts)
+{
+    this->BasicPermuteTest(8, this->mDeviceMinimumAlignment, 128);
+}
+
+// Single-token decode: every active expert receives exactly gemm_m == 1, the tightest valid case. Combined with
+// num_experts (128) >> k (8), this also covers the inactive-expert early-exit for ~120 experts.
+TYPED_TEST(MixtureOfExpertsTest, PermuteSingleTokenDecode)
+{
+    this->BasicPermuteTest(8, this->mDeviceMinimumAlignment, 128, 1);
+}
+
+// Gated-activation variant of PermuteManyInactiveExperts. For MXFP8xMXFP4 this exercises the block-scaled GLU path in
+// doActivationKernel with many inactive experts; for non-block-scaled dtypes it adds Swiglu coverage for the decode
+// profile. NVFP4 is skipped inside BasicPermuteTest (Relu-only). Half output is skipped here because FP16's narrow
+// dynamic range can't hold the top_k=8 Swiglu accumulation at hidden=mDeviceMinimumAlignment within compareFinal's
+// tolerance.
+TYPED_TEST(MixtureOfExpertsTest, PermuteSwigluManyInactiveExperts)
+{
+    if (std::is_same_v<typename TypeParam::OutputType, half>)
+    {
+        GTEST_SKIP() << "FP16 output too imprecise for 128-expert top_k=8 Swiglu at minimum alignment";
+        return;
+    }
+    this->mActType = ActivationType::Swiglu;
+    this->BasicPermuteTest(8, this->mDeviceMinimumAlignment, 128);
+}
+
+// Expert-parallel variant: sharding 128 experts across ep_size ranks (64 or 128) with k=8 and 3 tokens leaves many
+// ranks with zero active tokens, so their per-rank CUTLASS grouped GEMM sees every expert at gemm_m == 0. Validates
+// the early-exit path end-to-end with the alltoall-adjacent flow.
+TYPED_TEST(MixtureOfExpertsTest, ExpertParallelManyInactiveExperts)
+{
+    this->ExpertParallelTest(8, this->mDeviceMinimumAlignment, 128);
 }
 
 TYPED_TEST(MixtureOfExpertsTest, PermuteSwigluVerySmall)
