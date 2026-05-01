@@ -1,4 +1,5 @@
 import json
+import sys
 import time
 
 import requests
@@ -24,7 +25,7 @@ def is_permissive(licenses, license_check_token):
         if resp["success"]:
             return all(result["isPermissive"] for result in resp["data"])
         else:
-            print(resp)
-            print(f"Check License attempt {attempt + 1} failed")
+            print(json.dumps(resp), file=sys.stderr)
+            print(f"Check License attempt {attempt + 1} failed", file=sys.stderr)
             time.sleep(2**attempt)
     return False

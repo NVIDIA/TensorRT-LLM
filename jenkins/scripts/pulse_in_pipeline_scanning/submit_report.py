@@ -83,7 +83,10 @@ def submit_source_code_vulns(
                     "Elasticsearch bulk indexing reported errors for vulnerability report."
                 )
     else:
-        print(f"Vulnerability result json not found, vulnerability reporting: {input_file}")
+        print(
+            f"Vulnerability result json not found, vulnerability reporting: {input_file}",
+            file=sys.stderr,
+        )
 
     return risks_to_report
 
@@ -141,7 +144,10 @@ def submit_source_code_licenses(
                     "Elasticsearch bulk indexing reported errors for SBOM license report."
                 )
     else:
-        print(f"SBOM file not found, skipping GPL/LGPL license reporting: {input_file}")
+        print(
+            f"SBOM file not found, skipping GPL/LGPL license reporting: {input_file}",
+            file=sys.stderr,
+        )
 
     return risks_to_report
 
@@ -197,7 +203,7 @@ def submit_container_vulns(
                 f"Elasticsearch indexing errors for container vulnerability ({release_image})."
             )
     else:
-        print(f"No High/Critical container vulnerabilities in {release_image}.")
+        print(f"No High/Critical container vulnerabilities in {release_image}.", file=sys.stderr)
 
     return risks_to_report
 
@@ -256,6 +262,6 @@ def submit_container_licenses(
                 f"Elasticsearch indexing errors for container licenses ({release_image})."
             )
     else:
-        print(f"No non-permissive licenses in {release_image}.")
+        print(f"No non-permissive licenses in {release_image}.", file=sys.stderr)
 
     return risks_to_report

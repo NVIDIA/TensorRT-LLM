@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -47,9 +48,9 @@ def es_post(url, documents):
         failed = [
             item["index"] for item in result.get("items", []) if item.get("index", {}).get("error")
         ]
-        print(f"Indexing errors ({len(failed)}):")
+        print(f"Indexing errors ({len(failed)}):", file=sys.stderr)
         for f in failed:
-            print(f"  {f.get('_id')}: {f.get('error', {}).get('reason')}")
+            print(f"  {f.get('_id')}: {f.get('error', {}).get('reason')}", file=sys.stderr)
     return indexed, errors
 
 
