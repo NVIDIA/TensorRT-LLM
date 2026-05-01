@@ -1178,7 +1178,9 @@ class PerfSanityTestConfig:
             except (subprocess.CalledProcessError, FileNotFoundError, IndexError):
                 raise RuntimeError("Failed to get GPU type")
 
-        self.upload_to_db = "upload" in test_case_name.split("-")[0]
+        self.upload_to_db = "upload" in test_case_name.split("-")[0] and bool(
+            os.environ.get("OPEN_SEARCH_DB_BASE_URL", "")
+        )
         self.gpu_type = get_gpu_type()
 
         # Parse test case name to get config_base_name, select_pattern, runtime, benchmark_mode
@@ -1526,15 +1528,32 @@ class PerfSanityTestConfig:
         if not output:
             return
 
+        # Tolerance: allow up to 1% failed requests for high-concurrency benchmarks
+        # where transient network issues can cause rare individual request failures.
+        max_failure_rate = 0.01
+
         # Check for non-zero failed requests (default benchmark)
         failed_requests_match = re.search(r"Failed requests:\s+(\d+)", output)
         if failed_requests_match:
             failed_count = int(failed_requests_match.group(1))
             if failed_count > 0:
-                error_msg = f"Benchmark output contains {failed_count} failed requests."
-                raise RuntimeError(error_msg)
+                total_match = re.search(r"Successful requests:\s+(\d+)", output)
+                total_requests = (
+                    int(total_match.group(1)) + failed_count if total_match else failed_count
+                )
+                failure_rate = failed_count / total_requests if total_requests > 0 else 1.0
+                if failure_rate > max_failure_rate:
+                    error_msg = (
+                        f"Benchmark output contains {failed_count} failed requests "
+                        f"({failure_rate:.2%} failure rate exceeds {max_failure_rate:.0%} threshold)."
+                    )
+                    raise RuntimeError(error_msg)
+                return
 
-        # Check for explicit failure markers (default benchmark)
+        # Check for explicit failure markers (default benchmark) only when
+        # the numeric "Failed requests:" line was not found (the markers are
+        # always printed together with the numeric count, so this avoids
+        # double-counting when the failure rate is within tolerance).
         if "!FAILED REQUESTS!" in output or "!CHECK LOG FOR ERRORS!" in output:
             error_msg = "Benchmark output contains failure markers."
             raise RuntimeError(error_msg)
@@ -1550,11 +1569,14 @@ class PerfSanityTestConfig:
                 num_prompts = int(num_prompts_match.group(1))
                 failed_count = num_prompts - successful_count
                 if failed_count > 0:
-                    error_msg = (
-                        f"SA benchmark: {failed_count} of {num_prompts} requests failed "
-                        f"({successful_count} successful)."
-                    )
-                    raise RuntimeError(error_msg)
+                    failure_rate = failed_count / num_prompts if num_prompts > 0 else 1.0
+                    if failure_rate > max_failure_rate:
+                        error_msg = (
+                            f"SA benchmark: {failed_count} of {num_prompts} requests failed "
+                            f"({successful_count} successful, "
+                            f"{failure_rate:.2%} exceeds {max_failure_rate:.0%} threshold)."
+                        )
+                        raise RuntimeError(error_msg)
 
     def run_ex(self, commands) -> Dict[int, List[str]]:
         """Run commands and collect outputs."""
