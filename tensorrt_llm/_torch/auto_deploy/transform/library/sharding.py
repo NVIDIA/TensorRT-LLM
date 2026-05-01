@@ -603,7 +603,9 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
         return ["weight_scale_inv"]
 
     @staticmethod
-    def _compute_shard_bounds(weight_original_n: int, rank: int, world_size: int):
+    def _compute_shard_bounds(
+        weight_original_n: int, rank: int, world_size: int
+    ) -> tuple[int, int]:
         """Compute (row_start, n_shard) matching torch.tensor_split semantics."""
         n_big = weight_original_n % world_size
         size_big = weight_original_n // world_size + 1
@@ -653,6 +655,19 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
         else:
             return scale[:, scale_indices]
 
+    @classmethod
+    def _get_sharded_scale(
+        cls,
+        scale: torch.Tensor,
+        weight_original_n: int,
+        dim: int,
+        rank: int,
+        world_size: int,
+    ) -> torch.Tensor:
+        """Shard a blocked FineGrained FP8 scale tensor for the local TP rank."""
+        row_start, n_shard = cls._compute_shard_bounds(weight_original_n, rank, world_size)
+        return cls._expand_scale_per_row(scale, dim, row_start, n_shard)
+
     def shard_scales(
         self,
         dim: int,
@@ -665,8 +680,13 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
         weight_scale_inv: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         weight_original_n = weight_original_shape[dim]
-        row_start, n_shard = self._compute_shard_bounds(weight_original_n, rank, world_size)
-        sharded_scale = self._expand_scale_per_row(weight_scale_inv, dim, row_start, n_shard)
+        sharded_scale = self._get_sharded_scale(
+            weight_scale_inv,
+            weight_original_n,
+            dim,
+            rank,
+            world_size,
+        )
         return {"weight_scale_inv": sharded_scale}
 
     def shard_load_hook(
@@ -686,8 +706,13 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
         if scale_key in state_dict:
             scale = state_dict[scale_key]
             weight_original_n = weight_original_shape[dim]
-            row_start, n_shard = self._compute_shard_bounds(weight_original_n, rank, world_size)
-            state_dict[scale_key] = self._expand_scale_per_row(scale, dim, row_start, n_shard)
+            state_dict[scale_key] = self._get_sharded_scale(
+                scale,
+                weight_original_n,
+                dim,
+                rank,
+                world_size,
+            )
 
 
 def _shard_fp4_weight_scale(
@@ -1110,14 +1135,9 @@ class Sharding(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        # Draft models are not sharded — they run unsharded inside EagleWrapper.
-        if getattr(gm, "is_draft", False):
-            return gm, TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
-
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
         assert isinstance(gm, GraphModule), "Expecting GraphModule"
+        _is_draft = getattr(gm, "is_draft", False)
         config = self.config
         config.factory_config = factory.get_sharding_config() if factory else {}
         config.rank = local_rank
@@ -1186,6 +1206,12 @@ class Sharding(BaseTransform):
             # they can only apply to yet-unsharded nodes.
             for source in config.sharding_source:
                 if source == ShardingSource.FACTORY:
+                    if _is_draft:
+                        # Factory config contains the *target* model's HF base_tp_plan,
+                        # whose weight name patterns (e.g. "self_attn.q_proj") don't match
+                        # draft model node names. Skip factory for drafters and let
+                        # heuristic-based sharding handle them instead.
+                        continue
                     if len(config.factory_config) == 0:
                         ad_logger.debug(
                             "No factory config found. Skipping sharding from factory config"
@@ -1232,12 +1258,6 @@ class ShardingTransformExecutor(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        # Draft models are not sharded — they run unsharded inside EagleWrapper.
-        if getattr(gm, "is_draft", False):
-            return gm, TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
-
         # create a node dict for faster lookup
         node_dict = {n.name: n for n in gm.graph.nodes}
 
@@ -1875,7 +1895,8 @@ def _tp_shard_moe_scale(
         )
     elif scale_name == "weight_scale_inv":
         f_split = partial(
-            FineGrainedFP8WeightShardingInfo._split_scale,
+            FineGrainedFP8WeightShardingInfo._get_sharded_scale,
+            weight_original_n=orig_weight_shape[dim],
             dim=dim,
             rank=rank,
             world_size=world_size,

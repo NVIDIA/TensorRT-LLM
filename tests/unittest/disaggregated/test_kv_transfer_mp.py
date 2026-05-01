@@ -319,8 +319,8 @@ def worker_fn(
             ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
 
             # Add sequence to KVCacheManager
-            kv_cache_manager.impl.add_sequence(
-                ctx_request.py_request_id, ctx_request.prompt_len, 1, ctx_request
+            kv_cache_manager.impl.add_sequence_batch(
+                [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request]
             )
 
             # Create sender session
@@ -361,8 +361,8 @@ def worker_fn(
             )
 
             # Add sequence to KVCacheManager
-            kv_cache_manager.impl.add_sequence(
-                gen_request.py_request_id, gen_request.prompt_len, 1, gen_request
+            kv_cache_manager.impl.add_sequence_batch(
+                [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request]
             )
 
             # Create receiver session

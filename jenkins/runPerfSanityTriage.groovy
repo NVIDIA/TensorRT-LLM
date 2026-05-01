@@ -1,6 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
-
-import java.lang.InterruptedException
+@Library(['trtllm-jenkins-shared-lib@main']) _
 
 DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.10-py3-x86_64-ubuntu24.04-trt10.13.3.9-skip-tritondevel-202510291120-8621"
 
@@ -79,33 +77,28 @@ pipeline {
         OPEN_SEARCH_DB_CREDENTIALS=credentials("open_search_db_credentials")
     }
     parameters {
+        choice(name: "OPERATION", choices: ["Update Perf Data"], description: "Operation to perform.")
         string(name: "BRANCH", defaultValue: "main", description: "Branch to checkout.")
-        string(name: "OPEN_SEARCH_PROJECT_NAME", defaultValue: "swdl-trtllm-infra-ci-prod-perf_sanity_info", description: "OpenSearch project name.")
-        string(name: "OPERATION", defaultValue: "SLACK BOT SENDS MESSAGE", description: "Operation to perform.")
-        string(name: "QUERY_JOB_NUMBER", defaultValue: "1", description: "Number of latest jobs to query. (Only used when OPERATION is SLACK BOT SENDS MESSAGE)")
-        string(name: "SLACK_CHANNEL_ID", defaultValue: "C0A7D0LCA1F", description: "Slack channel IDs to send messages to. (Only used when OPERATION is SLACK BOT SENDS MESSAGE)")
-        string(name: "SLACK_BOT_TOKEN", defaultValue: "", description: "Slack bot token for authentication. (Only used when OPERATION is SLACK BOT SENDS MESSAGE)")
+        choice(name: "OPEN_SEARCH_PROJECT_NAME", choices: ["swdl-trtllm-infra-ci-prod-perf_sanity_info"], description: "OpenSearch project name.")
+        text(name: "COMMANDS", defaultValue: "", description: "UPDATE commands, one per line. Example: UPDATE SET field=value WHERE condition=value.")
     }
     stages {
-        stage("Run Perf Sanity Script") {
+        stage("Update Perf Data") {
+            when { expression { params.OPERATION == "Update Perf Data" } }
             steps {
                 container("trt-llm") {
                     script {
                         sh "pwd && ls -alh"
-                        sh "env | sort"
                         trtllm_utils.checkoutSource(LLM_REPO, params.BRANCH, LLM_ROOT, false, false)
-                        sh "pip install slack_sdk"
+                        def commandsBase64 = params.COMMANDS.bytes.encodeBase64().toString()
                         sh """
-                            cd ${LLM_ROOT}/jenkins/scripts/perf && ls -alh && python3 perf_sanity_triage.py \
+                            cd ${LLM_ROOT}/jenkins/scripts/perf && python3 perf_sanity_triage.py \
                             --project_name "${params.OPEN_SEARCH_PROJECT_NAME}" \
-                            --operation "${params.OPERATION}" \
-                            --channel_id "${params.SLACK_CHANNEL_ID}" \
-                            --bot_token "${params.SLACK_BOT_TOKEN}" \
-                            --query_job_number "${params.QUERY_JOB_NUMBER}"
+                            --commands "\$(echo '${commandsBase64}' | base64 -d)"
                         """
                     }
                 }
             }
-        } // stage Run Perf Sanity Script
+        } // stage Update Perf Data
     } // stages
 } // pipeline

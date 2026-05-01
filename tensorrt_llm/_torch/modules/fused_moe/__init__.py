@@ -16,11 +16,11 @@ from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
                       RenormalizeMoeRoutingMethod,
                       RenormalizeNaiveMoeRoutingMethod, RoutingMethodType,
                       SparseMixerMoeRoutingMethod, StaticMoeRoutingMethod,
-                      create_renormalize_expert_load_balanced_logits)
+                      create_load_balanced_logits)
 
 __all__ = [
     "BaseMoeRoutingMethod",
-    "create_renormalize_expert_load_balanced_logits",
+    "create_load_balanced_logits",
     "create_moe",
     "CuteDslFusedMoE",
     "CutlassFusedMoE",

@@ -1897,8 +1897,16 @@ InflightBatchingStats Serialization::deserializeInflightBatchingStats(std::istre
     auto numCtxTokens = su::deserialize<SizeType32>(is);
     auto microBatchId = su::deserialize<SizeType32>(is);
     auto avgNumDecodedTokensPerIter = su::deserialize<float>(is);
+    auto numCtxKvTokens = su::deserialize<SizeType32>(is);
+    auto numGenKvTokens = su::deserialize<SizeType32>(is);
+    auto numQueuedContextRequests = su::deserialize<SizeType32>(is);
+    auto numQueuedCtxTokens = su::deserialize<SizeType32>(is);
+    auto numQueuedGenRequests = su::deserialize<SizeType32>(is);
+    auto numQueuedGenKvTokens = su::deserialize<SizeType32>(is);
+    auto numPausedKvTokens = su::deserialize<SizeType32>(is);
     return InflightBatchingStats{numScheduledRequests, numContextRequests, numGenRequests, numPausedRequests,
-        numCtxTokens, microBatchId, avgNumDecodedTokensPerIter};
+        numCtxTokens, microBatchId, avgNumDecodedTokensPerIter, numCtxKvTokens, numGenKvTokens,
+        numQueuedContextRequests, numQueuedCtxTokens, numQueuedGenRequests, numQueuedGenKvTokens, numPausedKvTokens};
 }
 
 void Serialization::serialize(InflightBatchingStats const& inflightBatchingStats, std::ostream& os)
@@ -1910,6 +1918,13 @@ void Serialization::serialize(InflightBatchingStats const& inflightBatchingStats
     su::serialize(inflightBatchingStats.numCtxTokens, os);
     su::serialize(inflightBatchingStats.microBatchId, os);
     su::serialize(inflightBatchingStats.avgNumDecodedTokensPerIter, os);
+    su::serialize(inflightBatchingStats.numCtxKvTokens, os);
+    su::serialize(inflightBatchingStats.numGenKvTokens, os);
+    su::serialize(inflightBatchingStats.numQueuedContextRequests, os);
+    su::serialize(inflightBatchingStats.numQueuedCtxTokens, os);
+    su::serialize(inflightBatchingStats.numQueuedGenRequests, os);
+    su::serialize(inflightBatchingStats.numQueuedGenKvTokens, os);
+    su::serialize(inflightBatchingStats.numPausedKvTokens, os);
 }
 
 size_t Serialization::serializedSize(InflightBatchingStats const& inflightBatchingStats)
@@ -1922,6 +1937,13 @@ size_t Serialization::serializedSize(InflightBatchingStats const& inflightBatchi
     totalSize += su::serializedSize(inflightBatchingStats.numCtxTokens);
     totalSize += su::serializedSize(inflightBatchingStats.microBatchId);
     totalSize += su::serializedSize(inflightBatchingStats.avgNumDecodedTokensPerIter);
+    totalSize += su::serializedSize(inflightBatchingStats.numCtxKvTokens);
+    totalSize += su::serializedSize(inflightBatchingStats.numGenKvTokens);
+    totalSize += su::serializedSize(inflightBatchingStats.numQueuedContextRequests);
+    totalSize += su::serializedSize(inflightBatchingStats.numQueuedCtxTokens);
+    totalSize += su::serializedSize(inflightBatchingStats.numQueuedGenRequests);
+    totalSize += su::serializedSize(inflightBatchingStats.numQueuedGenKvTokens);
+    totalSize += su::serializedSize(inflightBatchingStats.numPausedKvTokens);
     return totalSize;
 }
 

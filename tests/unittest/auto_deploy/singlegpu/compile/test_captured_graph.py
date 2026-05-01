@@ -176,6 +176,36 @@ def test_cudagraph_capture_replay(
         )
 
 
+def test_cudagraph_replays_with_rectangular_seq_len_input():
+    """CapturedGraph can capture and replay inputs where seq_len > 1 (e.g. extend-only batches)."""
+
+    class SimpleModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.forward_calls = 0
+
+        def forward(self, input_ids):
+            self.forward_calls += 1
+            return input_ids + 1
+
+    model = SimpleModel().eval().to("cuda")
+    compiled_model = CapturedGraph(model, num_batched_inputs=1)
+    bs = 4
+    seq_len = 5
+    input_ids = torch.randn(bs, seq_len, device="cuda")
+
+    def get_args_kwargs(batch_size):
+        return (input_ids[:batch_size],), {}
+
+    with torch.inference_mode():
+        compiled_model.capture_graph(get_args_kwargs, [bs])
+
+        calls_after_capture = model.forward_calls
+        compiled_model(input_ids)
+        # No eager fallback — graph was replayed.
+        assert model.forward_calls == calls_after_capture
+
+
 # ============================================================================
 # Tests for CapturedGraph capture-time truncation
 # ============================================================================
@@ -195,7 +225,7 @@ class TestCapturedGraphCapture:
         )
         captured_shapes = []
 
-        def fake_capture_one_graph(self, *args, **kwargs):
+        def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
             captured_shapes.append(tuple(arg.shape for arg in args))
             return object()
 

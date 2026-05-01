@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +15,7 @@
 import logging
 import os
 import sys
-from typing import Optional
+from typing import Dict, Optional
 
 import tensorrt as trt
 
@@ -23,6 +23,134 @@ try:
     from polygraphy.logger import G_LOGGER
 except ImportError:
     G_LOGGER = None
+
+# Numeric ordering for severity comparison.  Lower value = more verbose.
+_SEVERITY_NUMERIC = {
+    "trace": 0,
+    "debug": 10,
+    "verbose": 10,
+    "info": 20,
+    "warning": 30,
+    "error": 40,
+    "internal_error": 50,
+}
+
+# Map severity tag constants (e.g. "[I]") to level names used in _SEVERITY_NUMERIC.
+_TAG_TO_LEVEL_NAME = {
+    "[F]": "internal_error",
+    "[E]": "error",
+    "[W]": "warning",
+    "[I]": "info",
+    "[V]": "verbose",
+    "[D]": "debug",
+}
+
+
+def _extract_module(qualname: str) -> str:
+    """Extract the first sub-package after ``tensorrt_llm`` from a dotted module name.
+
+    Examples:
+        ``tensorrt_llm.runtime.generation``    -> ``runtime``
+        ``tensorrt_llm._torch.pyexecutor.foo`` -> ``_torch``
+        ``tensorrt_llm.logger``                -> ``logger``
+        ``__main__``                           -> ``""``
+    """
+    parts = qualname.split(".")
+    # Find the last occurrence of "tensorrt_llm" (mirrors the C++ rfind approach).
+    idx = -1
+    for i, p in enumerate(parts):
+        if p == "tensorrt_llm":
+            idx = i
+    if idx >= 0 and idx + 1 < len(parts):
+        return parts[idx + 1]
+    return ""
+
+
+_MODULE_WIDTH = 8
+
+# Abbreviation table for module names exceeding _MODULE_WIDTH characters.
+_MODULE_ABBREVIATIONS = {
+    "auto_parallel": "autoprll",
+    "deep_gemm": "deepgemm",
+    "flash_mla": "flashmla",
+    "quantization": "quantize",
+    "scaffolding": "scaffold",
+    "_tensorrt_engine": "trt_engn",
+    "visual_gen": "vis_gen",
+    "__pycache__": "pycache",
+    "tokenizer": "tokenizr",
+}
+
+
+def _format_module(name: str) -> str:
+    """Return a fixed-width display string for *name* (``_MODULE_WIDTH`` chars).
+
+    Long names are abbreviated via ``_MODULE_ABBREVIATIONS``;
+    short names are right-padded with spaces.
+    """
+    display = _MODULE_ABBREVIATIONS.get(name, name)
+    return display[:_MODULE_WIDTH].ljust(_MODULE_WIDTH)
+
+
+# Cache: filename -> module name (avoids repeated frame inspection).
+_filename_to_module: Dict[str, str] = {}
+
+
+def _get_caller_module() -> str:
+    """Walk the call stack to find the first frame outside logger.py and return its module."""
+    frame = sys._getframe(1)
+    logger_file = __file__
+    while frame is not None:
+        if frame.f_code.co_filename != logger_file:
+            break
+        frame = frame.f_back
+    if frame is None:
+        return ""
+    filename = frame.f_code.co_filename
+    # Only cache real file paths (not <string>, <stdin>, etc.)
+    if not filename.startswith("<"):
+        cached = _filename_to_module.get(filename)
+        if cached is not None:
+            return cached
+    module = _extract_module(frame.f_globals.get("__name__", ""))
+    if not filename.startswith("<"):
+        _filename_to_module[filename] = module
+    return module
+
+
+def _parse_module_levels(env_value: str) -> Dict[str, int]:
+    """Parse ``TLLM_LOG_LEVEL_BY_MODULE`` env-var value.
+
+    Format: ``"level:mod1,mod2;level:mod3,mod4"``
+    Example: ``"debug:runtime,_torch;info:serve;warning:executor"``
+
+    Returns a dict mapping module name -> numeric severity threshold.
+    """
+    result: Dict[str, int] = {}
+    for group in env_value.split(";"):
+        group = group.strip()
+        if not group:
+            continue
+        if ":" not in group:
+            print(
+                f'[TRT-LLM][WARNING] TLLM_LOG_LEVEL_BY_MODULE: skipping malformed group "{group}"',
+                file=sys.stderr,
+            )
+            continue
+        level_str, _, module_list = group.partition(":")
+        level_str = level_str.strip().lower()
+        numeric = _SEVERITY_NUMERIC.get(level_str)
+        if numeric is None:
+            print(
+                f'[TRT-LLM][WARNING] TLLM_LOG_LEVEL_BY_MODULE: unknown level "{level_str}"',
+                file=sys.stderr,
+            )
+            continue
+        for mod in module_list.split(","):
+            mod = mod.strip()
+            if mod:
+                result[mod] = numeric
+    return result
 
 
 class Singleton(type):
@@ -66,7 +194,34 @@ class Logger(metaclass=Singleton):
             logging.Formatter(fmt="[%(asctime)s] %(message)s", datefmt="%m/%d/%Y-%H:%M:%S")
         )
         self._logger.addHandler(handler)
-        self._logger.setLevel(severity_map[min_severity][1])
+
+        # Parse per-module log level overrides.
+        self._module_levels: Dict[str, int] = {}
+        module_env = os.environ.get("TLLM_LOG_LEVEL_BY_MODULE")
+        if module_env:
+            self._module_levels = _parse_module_levels(module_env)
+
+        # Set the underlying Python logger to the minimum of all configured
+        # levels so that per-module overrides more verbose than the global
+        # level are not silently dropped by Python's logging framework.
+        global_py_level = severity_map[min_severity][1]
+        if self._module_levels:
+            # Map our numeric levels to Python logging levels.
+            _numeric_to_py = {
+                0: logging.DEBUG,
+                10: logging.DEBUG,
+                20: logging.INFO,
+                30: logging.WARNING,
+                40: logging.ERROR,
+                50: logging.CRITICAL,
+            }
+            min_module_py = min(
+                _numeric_to_py.get(v, logging.DEBUG) for v in self._module_levels.values()
+            )
+            self._logger.setLevel(min(global_py_level, min_module_py))
+        else:
+            self._logger.setLevel(global_py_level)
+
         self._polygraphy_logger = G_LOGGER
         if self._polygraphy_logger is not None:
             self._polygraphy_logger.module_severity = severity_map[min_severity][2]
@@ -78,6 +233,23 @@ class Logger(metaclass=Singleton):
             self.warning(
                 f"Requested log level {environ_severity} is invalid. Using '{self.DEFAULT_LEVEL}' instead"
             )
+
+    @property
+    def _global_numeric_level(self) -> int:
+        return _SEVERITY_NUMERIC.get(self._min_severity, 0)
+
+    def is_severity_enabled(self, severity_tag: str, module: str = "") -> bool:
+        """Check whether a message with *severity_tag* should be emitted.
+
+        If *module* is non-empty and has a per-module override, that takes
+        precedence over the global level.
+        """
+        msg_level = _SEVERITY_NUMERIC.get(_TAG_TO_LEVEL_NAME.get(severity_tag, ""), 0)
+        if module and self._module_levels:
+            mod_threshold = self._module_levels.get(module)
+            if mod_threshold is not None:
+                return msg_level >= mod_threshold
+        return msg_level >= self._global_numeric_level
 
     def set_rank(self, rank: int):
         self.rank = rank
@@ -101,10 +273,15 @@ class Logger(metaclass=Singleton):
         return self._trt_logger
 
     def log(self, severity, *msg):
+        module = _get_caller_module()
+        if not self.is_severity_enabled(severity, module):
+            return
         parts = [f"[{self.PREFIX}]"]
+        parts.append(severity)
+        if module:
+            parts.append(f"[{_format_module(module)}]")
         if self.rank is not None:
             parts.append(f"[RANK {self.rank}]")
-        parts.append(severity)
         parts.extend(map(str, msg))
         self._func_wrapper(severity)(" ".join(parts))
 

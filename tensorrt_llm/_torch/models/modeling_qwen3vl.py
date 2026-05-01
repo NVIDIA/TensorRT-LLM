@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN as HF_ACT2FN
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
@@ -255,6 +256,39 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
                 )
 
             return position_ids, mrope_position_deltas
+
+    def get_num_tokens_per_video(
+        self,
+        *,
+        video: List[Image.Image],
+        video_grid_thw: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> int:
+        merge = self.config.vision_config.spatial_merge_size
+        if video_grid_thw is not None:
+            t, h, w = (int(x) for x in video_grid_thw)
+            return t * (h // merge) * (w // merge)
+
+        # Must run the full processor: HF's Qwen3VLProcessor._get_num_multimodal_tokens
+        # (what the base class default delegates to) raises on video-only calls
+        # and returns a wrong-formula fallback that would break chunked prefill.
+        do_rescale = not (video and isinstance(video[0], torch.Tensor))
+        processed = self._processor(
+            text=["<|vision_start|><|video_pad|><|vision_end|>"],
+            videos=[video],
+            padding=True,
+            do_rescale=do_rescale,
+            return_tensors="pt",
+            **kwargs,
+        )
+        vgt = processed.get("video_grid_thw")
+        if vgt is None or len(vgt) == 0:
+            raise RuntimeError(
+                "get_num_tokens_per_video: HF processor returned no "
+                "video_grid_thw for the provided video."
+            )
+        t, h, w = (int(x) for x in vgt[0].tolist())
+        return t * (h // merge) * (w // merge)
 
     def _preprocess(
         self, text: Dict[str, Any], mm_data: Dict[str, Any], mm_processor_kwargs: Dict[str, Any]
