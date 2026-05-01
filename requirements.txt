@@ -54,8 +54,8 @@ ordered-set
 peft>=0.18.1,<0.19.0
 patchelf
 einops
-git+https://github.com/flashinfer-ai/flashinfer.git@9f7adfb8461d68ef5e18479f61cc6919b7f80c3d#egg=flashinfer-python
-git+https://github.com/flashinfer-ai/flashinfer.git@9f7adfb8461d68ef5e18479f61cc6919b7f80c3d#subdirectory=flashinfer-cubin&egg=flashinfer-cubin
+git+https://github.com/flashinfer-ai/flashinfer.git@12b59ae463a1bb40f67fc35270ee62e0989491d4#egg=flashinfer-python
+git+https://github.com/flashinfer-ai/flashinfer.git@12b59ae463a1bb40f67fc35270ee62e0989491d4#subdirectory=flashinfer-cubin&egg=flashinfer-cubin
 opencv-python-headless
 xgrammar==0.1.32
 llguidance==0.7.29
