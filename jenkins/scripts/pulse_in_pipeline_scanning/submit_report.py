@@ -148,6 +148,7 @@ def submit_source_code_licenses(
             f"SBOM file not found, skipping GPL/LGPL license reporting: {input_file}",
             file=sys.stderr,
         )
+        return None
 
     return risks_to_report
 

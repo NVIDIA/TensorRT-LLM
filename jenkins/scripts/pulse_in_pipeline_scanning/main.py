@@ -77,8 +77,15 @@ def process_result():
         **SUBMIT_KWARG,
         license_check_token=args.license_check_token,
     )
-    if len(source_licenses) > 0:
-        RISKY_DEPENDENCIES.append(f"{len(source_licenses)} new source code non-permissive license")
+    if source_licenses is None:
+        RISKY_DEPENDENCIES.append("source code SBOM not found")
+        sbom_missing = True
+    else:
+        sbom_missing = False
+        if len(source_licenses) > 0:
+            RISKY_DEPENDENCIES.append(
+                f"{len(source_licenses)} new source code non-permissive license"
+            )
 
     last_container_vulns = get_last_scan_results("container_vulnerability", args.ref)
     amd64_container_vulns = submit_container_vulns(
@@ -127,7 +134,11 @@ def process_result():
         status = "unstable"
         if args.scan_mode == "monitor":
             post_slack_msg(args.build_number, args.ref, detail)
-        if args.scan_mode == "release" and count_container_licenses + len(source_licenses) == 0:
+        if (
+            args.scan_mode == "release"
+            and not sbom_missing
+            and count_container_licenses + len(source_licenses) == 0
+        ):
             status = "success"
 
         return {
