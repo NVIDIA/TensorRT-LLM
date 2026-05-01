@@ -940,9 +940,33 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        // If the exception is about job being inactive, enrich it with log path
-                        if (e.message.contains("is no longer active")) {
-                            throw new Exception("${e.message}. Check SLURM logs at /home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out on ${cluster.host}")
+                        // If the exception is about job being inactive, throw a typed
+                        // InfraFailure(SLURM) so downstream consumers route via instanceof
+                        // rather than substring matching the catalog. The "<typed:..."
+                        // marker keeps the [INFRA-RETRY] log line distinguishable from
+                        // catalog-matched fallbacks.
+                        //
+                        // Critical for nested-retry correctness: the SLURM-scoped typed
+                        // throw is rejected by classify() at the OUTER K8s pod-launch
+                        // retry's scope guard (see classify() scope-mismatch branch).
+                        // That prevents the K8s outer from re-running a budget that the
+                        // inner SLURM retry already exhausted. End-to-end trace:
+                        //   1. SLURM job goes inactive while running.
+                        //   2. SlurmConfig.checkJobStatus() throws plain Exception with
+                        //      message "...is no longer active...".
+                        //   3. This catch wraps it as InfraFailure(TRANSIENT, SLURM).
+                        //   4. Inner runLLMTestlistOnSlurm retry catches, classifies via
+                        //      classify(scope=SLURM): instanceof InfraFailure with scope=SLURM
+                        //      passes through; consumer retries up to SLURM_INFRA_RETRY_MAX.
+                        //   5. If exhausted, the typed InfraFailure(SLURM) bubbles out of
+                        //      the inner SLURM retry into the outer K8s pod-launch retry.
+                        //   6. Outer classify(scope=K8S) sees typed InfraFailure with
+                        //      scope=SLURM != K8S, wraps as UserFailure -> outer rethrows
+                        //      without retry. No double-budget consumption.
+                        if (e.message?.contains("is no longer active")) {
+                            throw new InfraFailure(
+                                "${e.message}. Check SLURM logs at /home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out on ${cluster.host}",
+                                e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-inactive>")
                         }
                         // Otherwise, log the error but continue (SSH might be temporarily unavailable)
                         pipeline.echo("Warning: Could not check SLURM job status: ${e.message}")
