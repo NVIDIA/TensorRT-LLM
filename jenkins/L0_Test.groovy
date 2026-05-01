@@ -1698,16 +1698,17 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     }
 }
 
-// CBTS Layer 3 split-collapse heuristic: when the affected stage's
-// narrowed test count (computed by main.py compute_stage_test_counts)
-// is below this threshold, collapse pytest-split's splits to 1 — only
-// group 1 runs everything; groups 2..N skip and don't even allocate a
-// machine. Above the threshold, splits stay at the stage's default and
-// pytest-split parallelizes normally.
-def _CBTS_SPLIT_COLLAPSE_THRESHOLD = 20
-
-// Decide whether to collapse this stage's splits or skip the group entirely.
-// Returns a map [skip: bool, splits: int, splitId: int]. Callers should
+// CBTS Layer 3 split-collapse heuristic: when the affected stage's narrowed
+// test count (from main.py compute_stage_test_counts) is below 20, collapse
+// pytest-split's splits to 1 — only group 1 runs everything; groups 2..N
+// skip and don't allocate a machine. At/above 20, splits stay at the
+// stage's default and pytest-split parallelizes normally.
+//
+// The 20 below is hard-coded inline rather than a top-level constant
+// because Groovy script-level `def` is not visible from method bodies
+// without `@Field`, and we don't otherwise need this value elsewhere.
+//
+// Returns [skip: bool, splits: int, splitId: int]. Callers should
 // `return` early when skip == true and otherwise overwrite splits/splitId
 // with the returned values before continuing their existing dispatch logic.
 def _cbtsMaybeCollapseSplits(stageName, splitId, splits) {
@@ -1717,15 +1718,15 @@ def _cbtsMaybeCollapseSplits(stageName, splitId, splits) {
         return [skip: false, splits: splits, splitId: splitId]
     }
     def count = counts[stageName]
-    if (count == null || count >= _CBTS_SPLIT_COLLAPSE_THRESHOLD) {
+    if (count == null || count >= 20) {
         return [skip: false, splits: splits, splitId: splitId]
     }
     if (splitId > 1) {
-        echo "CBTS [${cbts.scope}]: ${stageName} narrowed to ${count} (< ${_CBTS_SPLIT_COLLAPSE_THRESHOLD}), skipping group ${splitId}/${splits}"
+        echo "CBTS [${cbts.scope}]: ${stageName} narrowed to ${count} (< 20), skipping group ${splitId}/${splits}"
         return [skip: true, splits: splits, splitId: splitId]
     }
     if (splits > 1) {
-        echo "CBTS [${cbts.scope}]: ${stageName} narrowed to ${count} (< ${_CBTS_SPLIT_COLLAPSE_THRESHOLD}), collapsing splits=${splits} → 1"
+        echo "CBTS [${cbts.scope}]: ${stageName} narrowed to ${count} (< 20), collapsing splits=${splits} → 1"
     }
     return [skip: false, splits: 1, splitId: 1]
 }
