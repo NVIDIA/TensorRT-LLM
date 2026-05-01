@@ -23,7 +23,11 @@ from tensorrt_llm._torch.models.modeling_nemotron_nano import (
     get_video_target_size_and_feature_size,
     video_to_pixel_values,
 )
-from tensorrt_llm.inputs.multimodal import MultimodalParams, find_mm_token_positions
+from tensorrt_llm.inputs.multimodal import (
+    MultimodalParams,
+    _compute_mm_masks,
+    _find_mm_token_start_pos_from_masks,
+)
 
 
 def make_tiler(**overrides):
@@ -1542,7 +1546,7 @@ class TestGetNumTokensPerVideoInvariants:
     `get_num_tokens_per_video` fix: `find_mm_token_lengths` (via
     `get_num_tokens_per_video`) and `_compute_token_numbers_per_video` must
     report counts that agree on per-video totals, because
-    `find_mm_token_positions` later asserts
+    `_find_mm_token_start_pos_from_masks` later asserts
     `len(mm_positions) == sum(num_mm_tokens)`, where `len(mm_positions)` is
     driven by the expansion (built from `_compute_token_numbers_per_video`)
     and `sum(num_mm_tokens)` comes from `find_mm_token_lengths` /
@@ -1552,7 +1556,7 @@ class TestGetNumTokensPerVideoInvariants:
     frame through `get_num_tokens_per_image`'s dynamic-tiler logic, which
     returned a multi-block count that the vision encoder never actually
     produces — so `find_mm_token_lengths` over-reported the total and the
-    fast path's `find_mm_token_positions` assertion failed.
+    fast path's `_find_mm_token_start_pos_from_masks` assertion failed.
 
     This test parametrizes over the knobs that gate branching in both
     functions (`video_target_num_patches`, `video_maintain_aspect_ratio`)
@@ -1608,7 +1612,7 @@ class TestMultiTokenWrappersConsistency:
 
     `get_num_tokens_per_image` adds `len(_img_start_token_ids) +
     len(_img_end_token_ids)` so multi-token BPE wrappers are correctly counted.
-    For that count to line up at the assertion in `find_mm_token_positions`
+    For that count to line up at the assertion in `_find_mm_token_start_pos_from_masks`
     (`len(mm_positions) == sum(num_mm_tokens)`), `get_mm_special_token_ids`
     must include **every** ID in those wrapper lists — not just the [0]
     aliases. Otherwise trailing wrapper tokens are seen as plain text and the
@@ -1648,10 +1652,10 @@ class TestMultiTokenWrappersConsistency:
         assert proc.image_start_token_id in special_ids
         assert proc.image_end_token_id in special_ids
 
-    def test_find_mm_token_positions_matches_get_num_tokens_per_image(self):
+    def test_mm_token_start_pos_matches_get_num_tokens_per_image(self):
         """End-to-end invariant: with multi-token wrappers, the count
         reported by get_num_tokens_per_image must equal the number of mm
-        positions find_mm_token_positions extracts from the expanded prompt.
+        positions _find_mm_token_start_pos_from_masks extracts from the expanded prompt.
         Before the get_mm_special_token_ids fix, only the first BPE token of
         each wrapper was masked as special and this assertion was off by
         `(len(start) - 1) + (len(end) - 1)` per image."""
@@ -1665,16 +1669,27 @@ class TestMultiTokenWrappersConsistency:
         num_per_image = proc.get_num_tokens_per_image(image=Image.new("RGB", (320, 320)))
         expanded = proc._expand_image_placeholders_in_token_ids(prompt, [num_per_image])
 
-        # Mirror the fast path's call to find_mm_token_positions.
-        start_positions, _ = find_mm_token_positions(
-            input_ids=expanded,
-            num_mm_tokens=[num_per_image],
+        # Mirror the fast path's mask + start-position computation. The
+        # legacy public `find_mm_token_positions` was split into private
+        # helpers `_compute_mm_masks` + `_find_mm_token_start_pos_from_masks`;
+        # the latter still owns the `mm_positions.numel() == sum(num_mm_tokens)`
+        # assertion that triggers when wrappers BPE-split and only the [0]
+        # alias is in `mm_special_token_ids`.
+        input_ids_tensor = torch.tensor(expanded)
+        mm_mask, _embed_mask, special_mask = _compute_mm_masks(
+            input_ids=input_ids_tensor,
+            vocab_size=None,
             mm_token_ids=proc.get_mm_token_ids(),
             mm_special_token_ids=proc.get_mm_special_token_ids(),
         )
+        start_positions, _ = _find_mm_token_start_pos_from_masks(
+            mm_mask=mm_mask,
+            special_mask=special_mask,
+            num_mm_tokens=[num_per_image],
+        )
 
-        # find_mm_token_positions internally asserts
-        #   len(mm_positions) == sum(num_mm_tokens)
+        # _find_mm_token_start_pos_from_masks internally asserts
+        #   mm_positions.numel() == sum(num_mm_tokens)
         # so reaching here without an exception is the regression check. Also
         # sanity-check the start position lands at the expected offset.
         assert len(start_positions) == 1
@@ -1699,7 +1714,7 @@ class TestFastPathVideoWithExtractedAudio:
     audio embeddings produced by `_interleave_video_audio_embeddings` at forward
     time. `get_num_tokens_per_video` must include those tokens in its count so
     `find_mm_token_lengths` reports a total that matches the actual mm-token
-    count in the tokenized prompt (otherwise `find_mm_token_positions` asserts
+    count in the tokenized prompt (otherwise `_find_mm_token_start_pos_from_masks` asserts
     `sum(num_mm_tokens) == len(mm_positions)` and the request fails).
     """
 
@@ -1832,7 +1847,7 @@ class TestFastPathVideoWithExtractedAudio:
         """`get_num_tokens_per_video` must add `M + 2` to its return value when
         the video metadata carries extracted audio. Without this,
         `find_mm_token_lengths` under-reports total mm-tokens and the fast path's
-        `find_mm_token_positions` assertion fires."""
+        `_find_mm_token_start_pos_from_masks` assertion fires."""
         proc = self._make_video_audio_processor()
         num_frames = 2
         frames = [Image.new("RGB", (512, 512)) for _ in range(num_frames)]
@@ -1856,7 +1871,7 @@ class TestFastPathVideoWithExtractedAudio:
         """End-to-end invariant: the number of mm-tokens the fast-path expansion
         emits for a single video must equal what `get_num_tokens_per_video` /
         `find_mm_token_lengths` reports for that video — both with and without
-        extracted audio. If these drift, `find_mm_token_positions`'s
+        extracted audio. If these drift, `_find_mm_token_start_pos_from_masks`'s
         `sum(num_mm_tokens) == len(mm_positions)` assertion fails."""
         proc = self._make_video_audio_processor()
         vid_ctx = proc.video_context_token_id
@@ -1870,7 +1885,7 @@ class TestFastPathVideoWithExtractedAudio:
         expanded, _ = proc._expand_video_placeholders_in_token_ids(prompt, [declared], mm_data)
 
         # Count mm-token IDs present in the expansion (mirrors
-        # find_mm_token_positions's mask, which catches both context tokens and
+        # _find_mm_token_start_pos_from_masks's mask, which catches both context tokens and
         # special wrappers via mm_token_ids / mm_special_token_ids).
         mm_token_ids = {
             proc.img_context_token_id,
