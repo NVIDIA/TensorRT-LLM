@@ -32,31 +32,26 @@ class FmhaConfig:
 # (Qwen3-30B columns), which were calibrated to span 0% → 90% target sparsity
 # on real workloads. Random data does not produce the same achieved sparsity,
 # but the magnitude span is informative for kernel-level characterisation.
+# Clean log-spaced integer thresholds — chosen for good achieved-sparsity
+# coverage on random data (the kernel skip predicate hits its transition
+# regime between ~10^4 and ~10^6 at head_dim=128 bf16).
 PREFILL_THRESHOLDS = [
     0.0,
-    18.76,
-    44.37,
-    104.97,
-    248.40,
-    587.18,
-    1390.63,
-    3293.04,
-    7799.91,
-    18471.56,
+    1.0,
+    10.0,
+    100.0,
+    1_000.0,
+    3_000.0,
+    10_000.0,
+    30_000.0,
+    100_000.0,
+    300_000.0,
+    1_000_000.0,
+    10_000_000.0,
+    100_000_000.0,
 ]
 
-DECODE_THRESHOLDS = [
-    0.0,
-    0.32,
-    0.86,
-    2.30,
-    6.17,
-    16.52,
-    44.26,
-    118.62,
-    317.99,
-    852.20,
-]
+DECODE_THRESHOLDS = list(PREFILL_THRESHOLDS)
 
 
 def llm_configs() -> List[FmhaConfig]:
@@ -77,14 +72,16 @@ def llm_configs() -> List[FmhaConfig]:
                     mask="causal",
                     threshold_sweep=list(PREFILL_THRESHOLDS),
                 ))
-    # Decode: bs=64, q=1, kv∈{16k,64k}, dtype∈{bf16,fp8}, causal mask, GQA(64/4)
+    # Decode: bs=8 (lower than blog 16's 64 — fmha.exe test-bench scratch
+    # allocates O(B*S*S) and OOMs on H200 at higher batches), q=1,
+    # kv∈{16k,64k}, dtype∈{bf16,fp8}, causal mask, GQA(64/4)
     for kv_len in (16384, 65536):
         for dtype in ("bf16", "e4m3"):
             cfgs.append(
                 FmhaConfig(
                     name=f"llm_decode_{dtype}_kv{kv_len}",
                     dtype=dtype,
-                    batch=64,
+                    batch=8,
                     num_heads_q=64,
                     num_heads_kv=4,
                     head_size=128,
