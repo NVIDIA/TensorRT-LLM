@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/common/attentionOp.h"
+#include "tensorrt_llm/common/attentionWorkspace.h"
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
@@ -35,8 +36,226 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 using tensorrt_llm::common::op::AttentionOp;
+using tensorrt_llm::common::op::AttentionWorkspaceManager;
 using tensorrt_llm::common::op::hash;
 using tensorrt_llm::runtime::RequestType;
+
+namespace
+{
+
+int64_t exportOffset(tensorrt_llm::common::op::WorkspaceSlice const& slice)
+{
+    if (slice.size == 0)
+    {
+        return -1;
+    }
+    return static_cast<int64_t>(slice.offset);
+}
+
+} // namespace
+
+std::optional<at::Tensor> TrtllmAttentionWorkspaceManager::makeWorkspaceView(
+    at::Tensor const& workspace, int64_t const offset, int64_t const sizeBytes, at::ScalarType const scalarType)
+{
+    if (sizeBytes == 0)
+    {
+        return std::nullopt;
+    }
+
+    auto const* workspaceBase = static_cast<uint8_t const*>(workspace.data_ptr());
+    auto const workspaceSizeBytes = static_cast<int64_t>(workspace.nbytes());
+    TORCH_CHECK(offset >= 0, "Negative workspace offset is invalid.");
+    TORCH_CHECK(offset + sizeBytes <= workspaceSizeBytes, "Workspace view exceeds workspace bounds.");
+
+    auto const itemSize = static_cast<int64_t>(c10::elementSize(scalarType));
+    TORCH_CHECK(sizeBytes % itemSize == 0, "Workspace slice is not aligned to dtype size.");
+
+    auto options = at::TensorOptions().dtype(scalarType).device(workspace.device());
+    return torch::from_blob(const_cast<uint8_t*>(workspaceBase) + offset, {sizeBytes / itemSize}, options);
+}
+
+TrtllmGenContextWorkspaceLayout TrtllmAttentionWorkspaceManager::buildContextLayout(at::ScalarType const qDtype,
+    int64_t const batchSize, int64_t const numTokens, int64_t const numHeads, int64_t const headSize,
+    int64_t const rotaryEmbeddingDim, bool const separateQKvInput, bool const fp8ContextFmha)
+{
+    auto const dtypeSize = static_cast<int64_t>(c10::elementSize(qDtype));
+    auto const localHiddenUnitsQo = numHeads * headSize;
+    auto const cuSeqlensSize = static_cast<int64_t>(sizeof(int32_t)) * (batchSize + 1);
+    auto const rotaryInvFreqSize
+        = rotaryEmbeddingDim > 0 ? static_cast<int64_t>(sizeof(float)) * batchSize * rotaryEmbeddingDim / 2 : 0;
+    auto const qBufSize = separateQKvInput ? (fp8ContextFmha ? 1 : dtypeSize) * numTokens * localHiddenUnitsQo : 0;
+    auto const tokensInfoSize = static_cast<int64_t>(sizeof(int32_t) * 2) * numTokens;
+    auto const fmhaTileCounterSize = static_cast<int64_t>(sizeof(uint32_t));
+    auto const fmhaBmm1ScaleSize = fp8ContextFmha ? static_cast<int64_t>(sizeof(float) * 2) : 0;
+    auto const fmhaBmm2ScaleSize = fp8ContextFmha ? static_cast<int64_t>(sizeof(float)) : 0;
+
+    tensorrt_llm::common::op::AttentionContextWorkspaceSizes workspaceSizes{};
+    workspaceSizes.cuQSeqlens = cuSeqlensSize;
+    workspaceSizes.cuKvSeqlens = cuSeqlensSize;
+    workspaceSizes.cuMaskRows = cuSeqlensSize;
+    workspaceSizes.rotaryInvFreq = rotaryInvFreqSize;
+    workspaceSizes.qBuf = qBufSize;
+    workspaceSizes.tokensInfo = tokensInfoSize;
+    workspaceSizes.fmhaTileCounter = fmhaTileCounterSize;
+    workspaceSizes.fmhaBmm1Scale = fmhaBmm1ScaleSize;
+    workspaceSizes.fmhaBmm2Scale = fmhaBmm2ScaleSize;
+    auto const layout = AttentionWorkspaceManager::buildContextLayout(workspaceSizes, kWorkspaceAlignment);
+
+    return TrtllmGenContextWorkspaceLayout{
+        .trtllmGenWorkspaceOffset = exportOffset(layout.cublasWorkspace),
+        .cuQSeqlensOffset = exportOffset(layout.cuQSeqlens),
+        .cuKvSeqlensOffset = exportOffset(layout.cuKvSeqlens),
+        .cuMaskRowsOffset = exportOffset(layout.cuMaskRows),
+        .rotaryInvFreqOffset = exportOffset(layout.rotaryInvFreq),
+        .qBufOffset = exportOffset(layout.qBuf),
+        .tokensInfoOffset = exportOffset(layout.tokensInfo),
+        .fmhaTileCounterOffset = exportOffset(layout.fmhaTileCounter),
+        .fmhaBmm1ScaleOffset = exportOffset(layout.fmhaBmm1Scale),
+        .fmhaBmm2ScaleOffset = exportOffset(layout.fmhaBmm2Scale),
+        .trtllmGenWorkspaceSize = kTrtllmGenWorkspaceSize,
+        .cuSeqlensSize = cuSeqlensSize,
+        .rotaryInvFreqSize = rotaryInvFreqSize,
+        .qBufSize = qBufSize,
+        .tokensInfoSize = tokensInfoSize,
+        .fmhaTileCounterSize = fmhaTileCounterSize,
+        .fmhaBmm1ScaleSize = fmhaBmm1ScaleSize,
+        .fmhaBmm2ScaleSize = fmhaBmm2ScaleSize,
+        .totalSize = static_cast<int64_t>(layout.totalSize),
+        .qBufScalarType = fp8ContextFmha ? at::kByte : qDtype,
+    };
+}
+
+TrtllmGenGenerationWorkspaceLayout TrtllmAttentionWorkspaceManager::buildGenerationLayout(at::ScalarType const qDtype,
+    int64_t const batchBeam, int64_t const numTokens, int64_t const numHeads, int64_t const headSize,
+    int64_t const rotaryEmbeddingDim, int64_t const numKvHeads, int64_t const maxBlocksPerSequence,
+    bool const useSparseAttention)
+{
+    auto const dtypeSize = static_cast<int64_t>(c10::elementSize(qDtype));
+    auto const cuSeqlensSize = static_cast<int64_t>(sizeof(int32_t)) * (batchBeam + 1);
+    auto const cuKvSeqlensSize = static_cast<int64_t>(sizeof(int32_t)) * (batchBeam + 1);
+    auto const rotaryInvFreqSize
+        = rotaryEmbeddingDim > 0 ? static_cast<int64_t>(sizeof(float)) * batchBeam * rotaryEmbeddingDim / 2 : 0;
+    auto const tokensInfoSize = static_cast<int64_t>(sizeof(int32_t) * 2) * numTokens;
+    auto const qBufSize = dtypeSize * numTokens * numHeads * headSize;
+    auto const bmm1ScaleSize = static_cast<int64_t>(sizeof(float) * 2);
+    auto const bmm2ScaleSize = static_cast<int64_t>(sizeof(float));
+    auto const sparseAttnCacheSize = useSparseAttention
+        ? static_cast<int64_t>(sizeof(int32_t)) * (batchBeam + batchBeam * 2 * maxBlocksPerSequence) * numKvHeads
+        : 0;
+
+    tensorrt_llm::common::op::AttentionXqaWorkspaceSizes workspaceSizes{};
+    workspaceSizes.cuSeqlens = cuSeqlensSize;
+    workspaceSizes.cuKvSeqlens = cuKvSeqlensSize;
+    workspaceSizes.rotaryInvFreq = rotaryInvFreqSize;
+    workspaceSizes.tokensInfo = tokensInfoSize;
+    workspaceSizes.bmm1Scale = bmm1ScaleSize;
+    workspaceSizes.bmm2Scale = bmm2ScaleSize;
+    workspaceSizes.sparseAttnCache = sparseAttnCacheSize;
+    workspaceSizes.kernelWorkspace = qBufSize;
+    auto const xqaLayout = AttentionWorkspaceManager::buildXqaLayout(workspaceSizes, kWorkspaceAlignment);
+    auto const trtllmGenWorkspaceOffset = static_cast<int64_t>(xqaLayout.totalSize);
+    auto const totalSize = xqaLayout.totalSize
+        + tensorrt_llm::common::alignSize(static_cast<size_t>(kTrtllmGenWorkspaceSize), kWorkspaceAlignment);
+
+    return TrtllmGenGenerationWorkspaceLayout{
+        .trtllmGenWorkspaceOffset = trtllmGenWorkspaceOffset,
+        .cuSeqlensOffset = exportOffset(xqaLayout.cuSeqlens),
+        .cuKvSeqlensOffset = exportOffset(xqaLayout.cuKvSeqlens),
+        .rotaryInvFreqOffset = exportOffset(xqaLayout.rotaryInvFreq),
+        .tokensInfoOffset = exportOffset(xqaLayout.tokensInfo),
+        .qBufOffset = exportOffset(xqaLayout.kernelWorkspace),
+        .bmm1ScaleOffset = exportOffset(xqaLayout.bmm1Scale),
+        .bmm2ScaleOffset = exportOffset(xqaLayout.bmm2Scale),
+        .sparseAttnCacheOffset = exportOffset(xqaLayout.sparseAttnCache),
+        .trtllmGenWorkspaceSize = kTrtllmGenWorkspaceSize,
+        .cuSeqlensSize = cuSeqlensSize,
+        .cuKvSeqlensSize = cuKvSeqlensSize,
+        .rotaryInvFreqSize = rotaryInvFreqSize,
+        .tokensInfoSize = tokensInfoSize,
+        .qBufSize = qBufSize,
+        .bmm1ScaleSize = bmm1ScaleSize,
+        .bmm2ScaleSize = bmm2ScaleSize,
+        .sparseAttnCacheSize = sparseAttnCacheSize,
+        .totalSize = static_cast<int64_t>(totalSize),
+        .qBufScalarType = qDtype,
+    };
+}
+
+int64_t TrtllmAttentionWorkspaceManager::getContextWorkspaceSize(at::ScalarType const qDtype, int64_t const batchSize,
+    int64_t const numTokens, int64_t const numHeads, int64_t const headSize, int64_t const rotaryEmbeddingDim,
+    bool const separateQKvInput, bool const fp8ContextFmha)
+{
+    return buildContextLayout(
+        qDtype, batchSize, numTokens, numHeads, headSize, rotaryEmbeddingDim, separateQKvInput, fp8ContextFmha)
+        .totalSize;
+}
+
+int64_t TrtllmAttentionWorkspaceManager::getGenerationWorkspaceSize(at::ScalarType const qDtype,
+    int64_t const batchBeam, int64_t const numTokens, int64_t const numHeads, int64_t const headSize,
+    int64_t const rotaryEmbeddingDim, int64_t const numKvHeads, int64_t const maxBlocksPerSequence,
+    bool const useSparseAttention)
+{
+    return buildGenerationLayout(qDtype, batchBeam, numTokens, numHeads, headSize, rotaryEmbeddingDim, numKvHeads,
+        maxBlocksPerSequence, useSparseAttention)
+        .totalSize;
+}
+
+TrtllmGenContextWorkspaceViews TrtllmAttentionWorkspaceManager::materializeContextWorkspace(
+    at::Tensor const& workspace, TrtllmGenContextWorkspaceLayout const& layout)
+{
+    return TrtllmGenContextWorkspaceViews{
+        .trtllmGenWorkspace
+        = *makeWorkspaceView(workspace, layout.trtllmGenWorkspaceOffset, layout.trtllmGenWorkspaceSize, at::kByte),
+        .cuQSeqlens = *makeWorkspaceView(workspace, layout.cuQSeqlensOffset, layout.cuSeqlensSize, at::kInt),
+        .cuKvSeqlens = *makeWorkspaceView(workspace, layout.cuKvSeqlensOffset, layout.cuSeqlensSize, at::kInt),
+        .cuMaskRows = *makeWorkspaceView(workspace, layout.cuMaskRowsOffset, layout.cuSeqlensSize, at::kInt),
+        .rotaryInvFreqBuf
+        = makeWorkspaceView(workspace, layout.rotaryInvFreqOffset, layout.rotaryInvFreqSize, at::kFloat),
+        .qBuf = makeWorkspaceView(workspace, layout.qBufOffset, layout.qBufSize, layout.qBufScalarType),
+        .tokensInfo = *makeWorkspaceView(workspace, layout.tokensInfoOffset, layout.tokensInfoSize, at::kInt),
+        .fmhaTileCounter
+        = *makeWorkspaceView(workspace, layout.fmhaTileCounterOffset, layout.fmhaTileCounterSize, at::kUInt32),
+        .fmhaBmm1Scale = makeWorkspaceView(workspace, layout.fmhaBmm1ScaleOffset, layout.fmhaBmm1ScaleSize, at::kFloat),
+        .fmhaBmm2Scale = makeWorkspaceView(workspace, layout.fmhaBmm2ScaleOffset, layout.fmhaBmm2ScaleSize, at::kFloat),
+    };
+}
+
+TrtllmGenContextWorkspaceViews TrtllmAttentionWorkspaceManager::materializeContextWorkspace(at::Tensor const& workspace,
+    at::ScalarType const qDtype, int64_t const batchSize, int64_t const numTokens, int64_t const numHeads,
+    int64_t const headSize, int64_t const rotaryEmbeddingDim, bool const fp8ContextFmha)
+{
+    auto const layout = buildContextLayout(
+        qDtype, batchSize, numTokens, numHeads, headSize, rotaryEmbeddingDim, true, fp8ContextFmha);
+    return materializeContextWorkspace(workspace, layout);
+}
+
+TrtllmGenGenerationWorkspaceViews TrtllmAttentionWorkspaceManager::materializeGenerationWorkspace(
+    at::Tensor const& workspace, TrtllmGenGenerationWorkspaceLayout const& layout)
+{
+    return TrtllmGenGenerationWorkspaceViews{
+        .trtllmGenWorkspace
+        = *makeWorkspaceView(workspace, layout.trtllmGenWorkspaceOffset, layout.trtllmGenWorkspaceSize, at::kByte),
+        .cuSeqlens = *makeWorkspaceView(workspace, layout.cuSeqlensOffset, layout.cuSeqlensSize, at::kInt),
+        .cuKvSeqlens = *makeWorkspaceView(workspace, layout.cuKvSeqlensOffset, layout.cuKvSeqlensSize, at::kInt),
+        .rotaryInvFreqBuf
+        = makeWorkspaceView(workspace, layout.rotaryInvFreqOffset, layout.rotaryInvFreqSize, at::kFloat),
+        .tokensInfo = *makeWorkspaceView(workspace, layout.tokensInfoOffset, layout.tokensInfoSize, at::kInt),
+        .qBuf = *makeWorkspaceView(workspace, layout.qBufOffset, layout.qBufSize, layout.qBufScalarType),
+        .bmm1Scale = *makeWorkspaceView(workspace, layout.bmm1ScaleOffset, layout.bmm1ScaleSize, at::kFloat),
+        .bmm2Scale = *makeWorkspaceView(workspace, layout.bmm2ScaleOffset, layout.bmm2ScaleSize, at::kFloat),
+        .sparseAttnCache
+        = makeWorkspaceView(workspace, layout.sparseAttnCacheOffset, layout.sparseAttnCacheSize, at::kInt),
+    };
+}
+
+TrtllmGenGenerationWorkspaceViews TrtllmAttentionWorkspaceManager::materializeGenerationWorkspace(
+    at::Tensor const& workspace, at::ScalarType const qDtype, int64_t const batchBeam, int64_t const numTokens,
+    int64_t const numHeads, int64_t const headSize, int64_t const rotaryEmbeddingDim, int64_t const numKvHeads)
+{
+    auto const layout = buildGenerationLayout(
+        qDtype, batchBeam, numTokens, numHeads, headSize, rotaryEmbeddingDim, numKvHeads, 0, false);
+    return materializeGenerationWorkspace(workspace, layout);
+}
 
 namespace trtllm::attention
 {
@@ -1108,10 +1327,9 @@ common::op::KvCacheBuffers<kernels::KVBlockArray> buildPagedKvCacheBuffers(
         blockOffsets, quantMode.hasFp4KvCache());
 }
 
-std::tuple<at::Tensor, std::optional<at::Tensor>> buildFlashinferTrtllmGenPagedKvCacheBuffers(
-    at::Tensor host_kv_cache_pool_pointers, at::Tensor host_kv_cache_pool_mapping, int64_t layer_idx,
-    int64_t num_kv_heads, int64_t tokens_per_block, int64_t head_dim, int64_t kv_factor, int64_t total_num_blocks,
-    int64_t kv_cache_quant_mode, at::ScalarType dtype)
+at::Tensor buildFlashinferTrtllmGenPagedKvCacheBuffers(at::Tensor host_kv_cache_pool_pointers,
+    at::Tensor host_kv_cache_pool_mapping, int64_t layer_idx, int64_t num_kv_heads, int64_t tokens_per_block,
+    int64_t head_dim, int64_t kv_factor, int64_t total_num_blocks, int64_t kv_cache_quant_mode, at::ScalarType dtype)
 {
     int32_t const poolIndex = host_kv_cache_pool_mapping.index({static_cast<int64_t>(layer_idx), 0}).item<int32_t>();
     int32_t const layerIdxInCachePool
@@ -1129,6 +1347,7 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> buildFlashinferTrtllmGenPagedK
 
     auto poolPointers = buildKvCachePoolPointers(host_kv_cache_pool_pointers, poolIndex, intraPoolOffset, blockSize,
         layerIdxInCachePool, static_cast<int32_t>(kv_factor), isFp4);
+    TORCH_CHECK(poolPointers.primaryPoolPtr != nullptr, "Primary KV cache pool pointer is null.");
 
     at::ScalarType storageDtype = dtype;
     if (quantMode.hasFp8KvCache())
@@ -1141,20 +1360,13 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> buildFlashinferTrtllmGenPagedK
     int64_t containerDim = isFp4 ? head_dim / 2 : head_dim;
 
     // Flat-block KV cache: [total_blocks, num_kv_heads, tokens_per_block, containerDim]
-    auto options = at::TensorOptions().dtype(storageDtype).device(at::kCUDA);
+    auto options = at::TensorOptions()
+                       .dtype(storageDtype)
+                       .device(c10::Device(at::kCUDA, static_cast<c10::DeviceIndex>(at::cuda::current_device())));
     auto kv_pool = torch::from_blob(
         poolPointers.primaryPoolPtr, {total_num_blocks, num_kv_heads, tokens_per_block, containerDim}, options);
 
-    // FP4 block scale pool (same flat-block layout, E4M3 dtype, vector_size=16)
-    std::optional<at::Tensor> kv_scale_pool = std::nullopt;
-    if (quantMode.hasFp4KvCache() && poolPointers.primaryBlockScalePoolPtr != nullptr)
-    {
-        auto sf_options = at::TensorOptions().dtype(at::kFloat8_e4m3fn).device(at::kCUDA);
-        kv_scale_pool = torch::from_blob(poolPointers.primaryBlockScalePoolPtr,
-            {total_num_blocks, num_kv_heads, tokens_per_block, head_dim / 16}, sf_options);
-    }
-
-    return {kv_pool, kv_scale_pool};
+    return kv_pool;
 }
 
 } // namespace torch_ext
