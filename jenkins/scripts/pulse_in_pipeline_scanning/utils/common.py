@@ -21,11 +21,13 @@ def is_permissive(licenses, license_check_token):
             headers=headers,
             data=json.dumps({"licenses": licenses}),
         )
-        resp = response.json()
-        if resp["success"]:
-            return all(result["isPermissive"] for result in resp["data"])
-        else:
+        if response:
+            resp = response.json()
+            if resp["success"]:
+                return all(result["isPermissive"] for result in resp["data"])
             print(json.dumps(resp), file=sys.stderr)
-            print(f"Check License attempt {attempt + 1} failed", file=sys.stderr)
-            time.sleep(2**attempt)
+        else:
+            print(f"HTTP {response.status_code}", file=sys.stderr)
+        print(f"Check License attempt {attempt + 1} failed", file=sys.stderr)
+        time.sleep(2**attempt)
     return False
