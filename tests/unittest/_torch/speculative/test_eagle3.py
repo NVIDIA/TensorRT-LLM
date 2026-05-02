@@ -244,12 +244,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
             num_tokens = len(new_tokens)
 
         accept_rate = num_accepted / num_drafted
-        # FLASHINFER backend draft logits diverge slightly from TRTLLM after the
-        # flashinfer 9f7adfb8 nightly bump, dropping observed acceptance to ~0.06.
-        # Output equality (`text_spec == text_ref`) still holds, so spec dec
-        # remains correct — only the acceptance ceiling is lower.
-        accept_rate_floor = 0.05 if attn_backend == "FLASHINFER" else 0.10
-        assert accept_rate > accept_rate_floor
+        assert accept_rate > 0.1
 
     # Output tests
     sampling_params = SamplingParams(max_tokens=10, temperature=0)

@@ -547,14 +547,21 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # Generally, plan_params with non-trivial attention_mask_data are relevant only the
         # corresponding forward pass. So, flush them out here as they won't be relevant for
         # subsequent forward calls.
+        # Multi-wrapper case (Gemma4 hybrid: different head_dim per layer)
+        # shares one workspace_buffer; eager plan() would overwrite earlier
+        # wrappers' workspace, so defer plan() to forward_impl. Single-wrapper
+        # case (e.g., Llama, Gemma3 uniform head_dim) needs eager plan() here
+        # because forward_impl cannot plan() during cuda-graph stream capture.
+        active_wrappers = [
+            pp for pp in self._plan_params_to_wrappers
+            if pp.attention_mask_data is None
+        ]
+        defer_plan = len(active_wrappers) > 1
         for plan_params in list(self._plan_params_to_wrappers.keys()):
             if plan_params.attention_mask_data is None:
-                # Mark as not-planned so forward_impl will re-plan just before
-                # use.  We intentionally do NOT re-plan here because multiple
-                # wrappers (e.g., different head_dim for hybrid attention) share
-                # the same workspace_buffer, and sequential re-planning would
-                # overwrite the first wrapper's workspace with the second's.
                 self._plan_params_to_wrappers[plan_params].is_planned = False
+                if not defer_plan:
+                    self._plan_with_params(plan_params)
             else:
                 del self._plan_params_to_wrappers[plan_params]
 
