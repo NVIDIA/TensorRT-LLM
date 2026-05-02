@@ -152,9 +152,10 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
         if (transferState == TransferState::kIN_PROGRESS && ctx.getTransferTerminate().load(std::memory_order_relaxed))
         {
             bool const released = status->release();
-            TLLM_LOG_WARNING(
+            TLLM_LOG_ERROR(
                 "AgentConnection::send cancelled while transfer was in progress (ctx tag=%d, remote=%s, "
-                "releaseAccepted=%d)",
+                "releaseAccepted=%d). Release is not a memory quiescence proof; callers must poison the affected "
+                "transfer buffer and restart before reuse.",
                 ctx.getTag(), mRemoteAgentName.c_str(), released);
             TLLM_CHECK_WITH_INFO(
                 released, "AgentConnection::send cancel could not release the backend transfer handle");

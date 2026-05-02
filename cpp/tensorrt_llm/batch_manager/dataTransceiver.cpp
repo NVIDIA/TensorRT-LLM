@@ -1120,17 +1120,29 @@ private:
         llmRequest.setKvCacheTransferStart(std::chrono::steady_clock::now());
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
         auto session = sendRequestInfo(llmRequest);
-        session.setTime(TransferSession::kTimeRequestInfo);
-        bool isReady = receiveReadySignal(session);
-        if (!isReady)
+        try
         {
-            // Reuse the error state for the cancelled request.
-            llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+            session.setTime(TransferSession::kTimeRequestInfo);
+            bool isReady = receiveReadySignal(session);
+            if (!isReady)
+            {
+                if (mTerminate.load(std::memory_order_relaxed))
+                {
+                    session.poisonBufferIndexHolders();
+                }
+                // Reuse the error state for the cancelled request.
+                llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
+                return;
+            }
+            receiveSync(session);
             llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
-            return;
         }
-        receiveSync(session);
-        llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
+        catch (...)
+        {
+            session.poisonBufferIndexHolders();
+            throw;
+        }
 
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "End calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
