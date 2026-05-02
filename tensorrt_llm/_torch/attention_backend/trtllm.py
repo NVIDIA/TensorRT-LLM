@@ -13,7 +13,8 @@ if TYPE_CHECKING:
 
 from tensorrt_llm._torch.attention_backend import trtllm_gen
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
+from tensorrt_llm._utils import (get_sm_version, is_sm_100f, maybe_pin_memory,
+                                 prefer_pinned)
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
@@ -557,34 +558,36 @@ class TrtllmAttentionWrapper:
         out_scale = self.out_scale_sf if self.use_nvfp4_output else self.out_scale
 
         helix_active = self.helix_position_offsets is not None
-        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not helix_active and trtllm_gen.is_supported(
-                q=q,
-                num_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                head_size=self.head_size,
-                out_dtype=output.dtype,
-                mask_type=int(mask_type),
-                has_alibi=(self.position_embedding_type == 4
-                           or self.position_embedding_type == 5),
-                is_padded=False,
-                use_paged_kv_cache=(self.kv_cache_block_offsets is not None),
-                tokens_per_block=self.tokens_per_block,
-                beam_width=self.beam_width,
-                position_shift_enabled=False,
-                sink_token_length=self.sink_token_length,
-                cross_attention=False,
-                is_spec_decoding=self.is_spec_decoding_enabled,
-                is_mla_enable=self.is_mla_enable,
-                is_fused_qkv=is_fused_qkv,
-                update_kv_cache=update_kv_cache,
-                has_cross_kv=False,
-                quant_config=self.quant_config,
-                kv_cache_manager=self.kv_cache_manager,
-                skip_softmax_threshold_scale_factor_prefill=self.
-                skip_softmax_threshold_scale_factor_prefill,
-                skip_softmax_threshold_scale_factor_decode=self.
-                skip_softmax_threshold_scale_factor_decode,
-        )[0]:
+        if (_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION or
+                is_sm_100f()) and not helix_active and trtllm_gen.is_supported(
+                    q=q,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_size,
+                    out_dtype=output.dtype,
+                    mask_type=int(mask_type),
+                    has_alibi=(self.position_embedding_type == 4
+                               or self.position_embedding_type == 5),
+                    is_padded=False,
+                    use_paged_kv_cache=(self.kv_cache_block_offsets
+                                        is not None),
+                    tokens_per_block=self.tokens_per_block,
+                    beam_width=self.beam_width,
+                    position_shift_enabled=False,
+                    sink_token_length=self.sink_token_length,
+                    cross_attention=False,
+                    is_spec_decoding=self.is_spec_decoding_enabled,
+                    is_mla_enable=self.is_mla_enable,
+                    is_fused_qkv=is_fused_qkv,
+                    update_kv_cache=update_kv_cache,
+                    has_cross_kv=False,
+                    quant_config=self.quant_config,
+                    kv_cache_manager=self.kv_cache_manager,
+                    skip_softmax_threshold_scale_factor_prefill=self.
+                    skip_softmax_threshold_scale_factor_prefill,
+                    skip_softmax_threshold_scale_factor_decode=self.
+                    skip_softmax_threshold_scale_factor_decode,
+                )[0]:
             trtllm_gen_attention(
                 q,
                 k,

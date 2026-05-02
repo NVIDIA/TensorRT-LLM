@@ -14,7 +14,8 @@ from transformers.utils import HF_MODULES_CACHE
 from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_qwen3_hybrid_num_attention_layers, is_hybrid_linear, is_nemotron_hybrid,
     is_qwen3_hybrid, load_pretrained_config)
-from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
+from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
+                                 torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
@@ -258,8 +259,9 @@ class ModelConfig(Generic[TConfig]):
         if moe_backend.upper() != "AUTO":
             return moe_backend
 
+        sm_version = get_sm_version()
+
         if architecture == "GptOssForCausalLM":
-            sm_version = get_sm_version()
             # Select the best performing backend based on SM version
             if 100 <= sm_version < 120:  # Blackwell
                 return "TRTLLM"
@@ -267,6 +269,12 @@ class ModelConfig(Generic[TConfig]):
                 return "TRITON"
             else:
                 return "CUTLASS"  # Fallback to CUTLASS for other SM versions (e.g., SM120)
+
+        # CUTLASS FP8_BLOCK_SCALES path uses DeepGEMM JIT which only supports
+        # Hopper (SM90). On Blackwell (SM100/103), use DEEPGEMM backend which
+        # natively supports these architectures.
+        if is_sm_100f(sm_version):
+            return "DEEPGEMM"
 
         return "CUTLASS"
 
