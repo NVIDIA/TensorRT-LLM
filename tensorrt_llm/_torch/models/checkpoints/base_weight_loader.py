@@ -102,8 +102,7 @@ class BaseWeightLoader(ABC):
         Args:
             checkpoint_dir: A path to the checkpoint directory.
             mapping: A mapping object containing the distributed configuration.
-            **kwargs: Optional format-specific loader arguments. Generic HF
-                loaders ignore these; MX uses ``model`` for direct P2P writes.
+            **kwargs: Optional format-specific loader arguments.
 
         Returns:
             A dictionary (or ConsumableWeightsDict) where keys are tensor names

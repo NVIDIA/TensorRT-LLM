@@ -33,7 +33,9 @@ import threading
 import traceback
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Type, Union
+
+import grpc
 
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader
@@ -234,9 +236,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
 
         if fallback_weights:
             fallback_bytes = sum(
-                tensor.numel() * tensor.element_size()
-                for tensor in fallback_weights.values()
-                if hasattr(tensor, "numel") and hasattr(tensor, "element_size")
+                tensor.numel() * tensor.element_size() for tensor in fallback_weights.values()
             )
             # Mixed-success case: MX delivered matched tensors into model
             # params via P2P and returned only size-mismatched tensors for
@@ -262,7 +262,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
         return {}
 
     def _resolve_query_timeout_override(
-        self, checkpoint_dir: str, MxClient, build_identity
+        self, checkpoint_dir: str, MxClient: Type[Any], build_identity: Callable[..., Any]
     ) -> Optional[str]:
         """Return temporary ``MX_SOURCE_QUERY_TIMEOUT`` override, if any."""
         if self._query_timeout_s is not None:
@@ -282,7 +282,9 @@ class MXCheckpointLoader(HfCheckpointLoader):
         )
         return _MX_SOURCE_QUERY_TIMEOUT_DEFAULT_S
 
-    def _has_any_source_instance(self, checkpoint_dir: str, MxClient, build_identity) -> bool:
+    def _has_any_source_instance(
+        self, checkpoint_dir: str, MxClient: Type[Any], build_identity: Callable[..., Any]
+    ) -> bool:
         """Best-effort fast probe for registered MX source instances."""
         client = None
         try:
@@ -290,7 +292,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
             client = MxClient(server_url=self._mx_server_url)
             list_resp = client.list_sources(identity=identity)
             return bool(getattr(list_resp, "instances", []))
-        except Exception:
+        except (AttributeError, RuntimeError, TimeoutError, grpc.RpcError):
             # If the probe cannot complete, prefer fast fallback over the
             # upstream 1-hour default. The actual MxLiveWeightLoader call below
             # remains the source of truth and may still succeed.
@@ -310,13 +312,9 @@ class MXCheckpointLoader(HfCheckpointLoader):
     ) -> dict[str, Any]:
         """Standard HF disk loading fallback."""
         if reason is not None:
-            logger.info(
-                "MX P2P unavailable (%s); loading from disk: %s",
-                reason,
-                checkpoint_dir,
-            )
+            logger.info(f"MX P2P unavailable ({reason}); loading from disk: {checkpoint_dir}")
         else:
-            logger.info("MX P2P unavailable; loading from disk: %s", checkpoint_dir)
+            logger.info(f"MX P2P unavailable; loading from disk: {checkpoint_dir}")
         return super().load_weights(checkpoint_dir, mapping=mapping, **kwargs)
 
     def publish_as_source(
