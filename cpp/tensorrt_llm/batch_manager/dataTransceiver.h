@@ -163,6 +163,14 @@ public:
         mBufferIndexHolders.emplace_back(std::move(holder));
     }
 
+    void poisonBufferIndexHolders() noexcept
+    {
+        for (auto& holder : mBufferIndexHolders)
+        {
+            holder.poison();
+        }
+    }
+
 private:
     std::vector<Connection const*> mConnections;
     std::vector<SizeType32> mCounterPartRanks;        // Ranks corresponding to mConnections indices

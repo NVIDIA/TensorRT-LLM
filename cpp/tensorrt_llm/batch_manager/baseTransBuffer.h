@@ -80,6 +80,7 @@ public:
     }
 
     void reset() noexcept;
+    void poison() noexcept;
 
 private:
     BaseTransBufferManager* mManager{nullptr};
@@ -106,6 +107,9 @@ public:
     /// @param bufferId The buffer index to free.
     void freeBufferIndexForSend(std::optional<int> bufferId);
 
+    /// @brief Quarantine a send buffer index whose transfer may still be in flight.
+    void poisonBufferIndexForSend(std::optional<int> bufferId) noexcept;
+
     /// @brief Assign a buffer index for receiving.
     /// @return Assigned buffer index, or nullopt if using dynamic buffers.
     std::optional<int> assignBufferIndexForRecv();
@@ -113,6 +117,9 @@ public:
     /// @brief Free a buffer index used for receiving.
     /// @param bufferId The buffer index to free.
     void freeBufferIndexForRecv(std::optional<int> bufferId);
+
+    /// @brief Quarantine a receive buffer index whose transfer may still be in flight.
+    void poisonBufferIndexForRecv(std::optional<int> bufferId) noexcept;
 
     /// @brief Get or allocate send buffers for cache transfer.
     /// @param bufferId The assigned buffer ID.
@@ -167,6 +174,7 @@ protected:
         std::mutex mBuffersMutex;
         std::condition_variable mBuffersCV;
         std::atomic<int> mConcurrence{0};
+        std::atomic<bool> mPoisoned{false};
     };
 
     std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateBuffers(std::optional<int> bufferId,
@@ -177,6 +185,8 @@ protected:
     std::optional<int> assignBufferIndex(ConcurrenceResource& resource, size_t bufferCount, bool onlyUseDynamicBuffer);
     void freeBufferIndex(
         ConcurrenceResource& resource, std::optional<int> bufferId, size_t bufferCount, bool onlyUseDynamicBuffer);
+    void poisonBufferIndex(ConcurrenceResource& resource, std::optional<int> bufferId, size_t bufferCount,
+        bool onlyUseDynamicBuffer, char const* direction) noexcept;
 
     size_t mPreAllocBufferSize;
     size_t mRecvBufferCount;

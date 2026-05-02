@@ -574,8 +574,19 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                 == inputKvCacheBlocksPerWindow.begin()->second.front()->getDataType());
         }
 
-        sendAllBuffers(session, deviceId, outputSplitCaches, bufferCoverTargetNum, preAllocSendBuffer, bufferManager,
-            targetInfo, pickUpConnections);
+        try
+        {
+            sendAllBuffers(session, deviceId, outputSplitCaches, bufferCoverTargetNum, preAllocSendBuffer,
+                bufferManager, targetInfo, pickUpConnections);
+        }
+        catch (...)
+        {
+            if (agentConnection != nullptr)
+            {
+                cacheBufferHolder.poison();
+            }
+            throw;
+        }
 
         session.setTime(TransferSession::kTimeTransmissions);
 
