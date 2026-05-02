@@ -2189,6 +2189,8 @@ class PerfSanityTestConfig:
             if has_spec_decoding:
                 regression_metrics.append("d_al")
 
+        upload_enabled = self.upload_to_db and bool(os.environ.get("OPEN_SEARCH_DB_BASE_URL"))
+
         process_and_upload_test_results(
             new_data_dict=new_data_dict,
             match_keys=match_keys,
@@ -2196,7 +2198,7 @@ class PerfSanityTestConfig:
             minimize_metrics=MINIMIZE_METRICS,
             regression_metrics=regression_metrics,
             extra_fields=extra_fields,
-            upload_to_db=self.upload_to_db,
+            upload_to_db=upload_enabled,
         )
 
 
