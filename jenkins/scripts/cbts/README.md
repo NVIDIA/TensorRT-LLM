@@ -77,12 +77,16 @@ The `-k` keyword guard is applied **twice** by design:
 
 ## When CBTS activates
 
-CBTS narrows test selection in **two usages only**:
+CBTS is **on by default** and narrows test selection in **two usages only**:
 
 - `/bot run` — full pre-merge with CBTS narrowing.
 - `/bot run --post-merge` — post-merge with CBTS narrowing. Layer 2 keeps
   only post-merge hits; no post-merge hit → no-op (no fallback to full
   post-merge baseline).
+
+Pass `/bot run --disable-cbts` (or combine with `--post-merge`) to opt out
+and run the full baseline filter chain — useful when you suspect CBTS
+mis-selection or want a sanity full run.
 
 Any other **stage-selection** flag makes `getCbtsResult` return `null` and
 the existing filter chain takes over: `--stage-list`, `--extra-stage`,

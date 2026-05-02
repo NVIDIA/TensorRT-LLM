@@ -122,6 +122,8 @@ def DEBUG_MODE = "debug"
 def DETAILED_LOG = "detailed_log"
 @Field
 def CBTS_RESULT = "cbts_result"
+@Field
+def DISABLE_CBTS = "disable_cbts"   // /bot run --disable-cbts → skip CBTS entirely; default off (CBTS on).
 
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
@@ -141,6 +143,7 @@ def testFilter = [
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): gitlabParamsFromBot.get(DETAILED_LOG, false),
     (CBTS_RESULT): null,
+    (DISABLE_CBTS): gitlabParamsFromBot.get((DISABLE_CBTS), false),
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -714,6 +717,11 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
 
 def getCbtsResult(pipeline, testFilter, globalVars)
 {
+    if (testFilter[(DISABLE_CBTS)]) {
+        pipeline.echo("CBTS: deferring — user passed --disable-cbts")
+        return null
+    }
+
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
     if (env.alternativeTRT || isOfficialPostMergeJob) {
         pipeline.echo("CBTS: deferring — post-merge job or alternativeTRT set")
