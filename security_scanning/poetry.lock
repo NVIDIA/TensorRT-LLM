@@ -504,14 +504,14 @@ urllib3 = ">=2"
 
 [[package]]
 name = "build"
-version = "1.4.4"
+version = "1.5.0"
 description = "A simple, correct Python build frontend"
 optional = false
-python-versions = ">=3.9"
+python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "build-1.4.4-py3-none-any.whl", hash = "sha256:8c3f48a6090b39edec1a273d2d57949aaf13723b01e02f9d518396887519f64d"},
-    {file = "build-1.4.4.tar.gz", hash = "sha256:f832ae053061f3fb524af812dc94b8b84bac6880cd587630e3b5d91a6a9c1703"},
+    {file = "build-1.5.0-py3-none-any.whl", hash = "sha256:13f3eecb844759ab66efec90ca17639bbf14dc06cb2fdf37a9010322d9c50a6f"},
+    {file = "build-1.5.0.tar.gz", hash = "sha256:302c22c3ba2a0fd5f3911918651341ebb3896176cbdec15bd421f80b1afc7647"},
 ]
 
 [package.dependencies]
@@ -524,7 +524,7 @@ tomli = {version = ">=1.1.0", markers = "python_version < \"3.11\""}
 [package.extras]
 keyring = ["keyring"]
 uv = ["uv (>=0.1.18)"]
-virtualenv = ["virtualenv (>=20.11) ; python_version < \"3.10\"", "virtualenv (>=20.17) ; python_version >= \"3.10\" and python_version < \"3.14\"", "virtualenv (>=20.31) ; python_version >= \"3.14\""]
+virtualenv = ["virtualenv (>=20.17) ; python_version >= \"3.10\" and python_version < \"3.14\"", "virtualenv (>=20.31) ; python_version >= \"3.14\""]
 
 [[package]]
 name = "cache-dit"
@@ -1459,14 +1459,14 @@ files = [
 
 [[package]]
 name = "flashinfer-python"
-version = "0.6.8"
+version = "0.6.9"
 description = "FlashInfer: Kernel Library for LLM Serving"
 optional = false
 python-versions = "<4.0,>=3.10"
 groups = ["main"]
 files = [
-    {file = "flashinfer_python-0.6.8-py3-none-any.whl", hash = "sha256:e96d09b810cedd5f26a6764fface84b0d39dc60cbcc6167dc61bde3e949b3ed0"},
-    {file = "flashinfer_python-0.6.8.tar.gz", hash = "sha256:37b320efa00d8bf14a13f3a3bbc529faad171c47daa18bf381c892bee306d974"},
+    {file = "flashinfer_python-0.6.9-py3-none-any.whl", hash = "sha256:46d013119ecd039a5844c4847325b3571f99cdd8fd9e00839bf008c67b15811a"},
+    {file = "flashinfer_python-0.6.9.tar.gz", hash = "sha256:044ed74698b5f6c1e719b32cf95189609166740076c11287e81a38450953de50"},
 ]
 
 [package.dependencies]
@@ -7073,4 +7073,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "bc51ce9668bdec3f5da0e4cb418a64655dc64fa9fd606611e90bc04145ba1483"
+content-hash = "c94a9698b7762aee19190022b01d2841cd7f2b4ceec96fcc961c0f5f91a43987"

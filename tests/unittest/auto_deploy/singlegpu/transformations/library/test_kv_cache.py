@@ -8,6 +8,8 @@ import torch.nn as nn
 from _model_test_utils import GQA, default_max_num_tokens
 from _torch_test_utils import all_close
 
+from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
+
 # Initialize resources first (KVPagedResourceHandler is used within tests below)
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import KVPagedResourceHandler
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
@@ -24,7 +26,6 @@ from tensorrt_llm._torch.auto_deploy.transform.library.kvcache import (
     ResizeKVCache,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 
 class DummyFactory(ModelFactory):

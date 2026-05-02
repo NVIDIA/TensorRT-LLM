@@ -399,10 +399,13 @@ class BatchInfo:
     - [10] num_tokens_to_gather: number of tokens to gather before LM head
     - [11] gather_required: whether gathering is required (0 or 1)
 
+    Slot 12 (spec-decoding info, set once at runtime init):
+    - [12] max_draft_len: maximum draft length per request (0 when not spec dec)
+
     All fields can be accessed and updated with the convenience functions below.
     """
 
-    _NUM_ELEMENTS = 12
+    _NUM_ELEMENTS = 13
 
     def __init__(self, batch_info_host: Optional[torch.Tensor] = None):
         if batch_info_host is None:
@@ -422,6 +425,11 @@ class BatchInfo:
 
     def is_generate_only(self) -> bool:
         return self._batch_info[:4].sum().item() == 0
+
+    def is_extend_only(self) -> bool:
+        """True when batch contains only extend requests (no prefill, no decode)."""
+        num_prefill, num_extend, num_decode = self.get_num_sequences()
+        return num_prefill == 0 and num_extend > 0 and num_decode == 0
 
     def get_total_num_sequences(self) -> int:
         return sum(self.get_num_sequences())
@@ -499,6 +507,16 @@ class BatchInfo:
 
     def is_gather_required(self) -> bool:
         return bool(self._batch_info[11])
+
+    # --- spec-decoding info (slot 12) writer ---
+
+    def update_max_draft_len(self, max_draft_len: int) -> None:
+        self._batch_info[12] = max_draft_len
+
+    # --- spec-decoding info (slot 12) readers ---
+
+    def get_max_draft_len(self) -> int:
+        return int(self._batch_info[12])
 
 
 class SequenceInfo:
@@ -661,6 +679,7 @@ class SequenceInfo:
             ### ADDITIONAL ARGUMENTS AVAILABLE THAT ARE DERIVED FROM THE BASIC ARGUMENTS ###########
             ("seq_len", self.max_batch_size, torch.int),
             ("seq_len_with_cache", self.max_batch_size, torch.int),
+            ("prompt_lens", self.max_batch_size, torch.int),
             ("use_initial_states", self.max_batch_size, torch.bool),
             ### OTHER ARGUMENTS USED BY THE RUNTIME ################################################
             ("extra_page_per_seq", self.max_batch_size, torch.int),
@@ -722,8 +741,9 @@ class SequenceInfo:
         # check if we are still running uncached attention in which case we are also still
         # operate on unflattened tensors with explicit [batch_size, seq_len, ...] shape
         # generate-only batches are also formatted like this (i.e. [b, 1])
+        # Extend-only batches are also rectangular by construction.
         total_num_tokens = self.total_num_tokens
-        if not self._use_flattened_layout or self.is_generate_only:
+        if not self._use_flattened_layout or self.is_generate_only or self.is_extend_only:
             bs = self.num_sequences
             sl = total_num_tokens // bs
         # use [1,total_len] shape to indicate non-generate-only batch for cached attention
@@ -814,6 +834,10 @@ class SequenceInfo:
     @property
     def is_generate_only(self) -> bool:
         return self.batch_info.is_generate_only()
+
+    @property
+    def is_extend_only(self) -> bool:
+        return self.batch_info.is_extend_only()
 
     @property
     def num_blocks(self) -> int:
@@ -933,10 +957,25 @@ class SequenceInfo:
         input_ids = torch.ones(self.max_batch_size, seq_len, dtype=torch.int)
         self.set_example_sequence(input_ids)
 
-    def set_generate_only_batch(self, batch_size: Optional[int] = None) -> None:
-        """Set an example sequence for generate-only batch."""
+    def set_capture_batch(self, max_draft_len: int = 0, batch_size: Optional[int] = None) -> None:
+        """Set a synthetic cached-attention batch for cudagraph capture.
+
+        ``max_draft_len == 0`` produces the usual generate-only layout. ``max_draft_len > 0``
+        produces a synthetic extend-only batch with ``1 + max_draft_len`` tokens per sequence.
+        """
         batch_size = batch_size or self.max_batch_size
-        self.set_example_sequence(torch.ones(batch_size, 1, dtype=torch.int))
+        seq_len = 1 + max_draft_len
+
+        if seq_len > 1:
+            # extend-only request
+            batch_info = [0, 0, batch_size, batch_size * seq_len, 0, 0]
+        else:
+            # decode-only request
+            batch_info = [0, 0, 0, 0, batch_size, batch_size]
+
+        self.set_example_sequence(
+            input_ids=torch.ones(batch_size, seq_len, dtype=torch.int), batch_info=batch_info
+        )
 
     def reset(self) -> None:
         """Reset the sequence information.
@@ -944,7 +983,7 @@ class SequenceInfo:
         After reset the sequence information should correspond to a "generate-only" batch of
         sequences (b, s==1) without cache history.
         """
-        self.set_generate_only_batch()
+        self.set_capture_batch()
 
     @staticmethod
     def _flatten(nested_seqs: Sequence[Sequence[int]]) -> List[int]:
@@ -1047,6 +1086,7 @@ class SequenceInfo:
         cu_num_pages: Union[Sequence[int], torch.Tensor, None] = None,
         extra_page_per_seq: Optional[Sequence[int]] = None,
         slot_idx: Union[Sequence[int], torch.Tensor, None] = None,
+        prompt_lens: Union[Sequence[int], torch.Tensor, None] = None,
         ### RUNTIME ARGUMENTS ######################################################################
         gather_context_logits: bool = False,
         _gather_idx: Union[Sequence[int], torch.Tensor, None] = None,
@@ -1169,6 +1209,15 @@ class SequenceInfo:
         # update sequence length with cache
         seq_len_with_cache = ip_host + sl_host
         self._stage_arg("seq_len_with_cache", seq_len_with_cache)
+
+        # prompt_lens: original context length per sequence, constant across iterations.
+        # Defaults to seq_len when not provided (correct for prefill).
+        if prompt_lens is not None:
+            if isinstance(prompt_lens, (list, tuple)):
+                prompt_lens = torch.tensor(prompt_lens, dtype=torch.int)
+        else:
+            prompt_lens = sl_host
+        self._stage_arg("prompt_lens", prompt_lens)
 
         # check for updated use_initial_states
         use_initial_states = ip_host > 0
@@ -1353,9 +1402,17 @@ class SequenceInfo:
         # position_ids is per-token while offset is per-sequence; expand if needed
         if self.is_generate_only:
             offset_for_pos_ids = offset
+        elif self.is_extend_only:
+            _, num_extend, _ = self.batch_info.get_num_sequences()
+            _, num_extend_tokens, _ = self.batch_info.get_num_tokens()
+            tokens_per_seq = num_extend_tokens // num_extend
+            offset_for_pos_ids = offset[:num_extend].repeat_interleave(tokens_per_seq)
         else:
+            # mixed prefill + (extend/decode). Need to use seq_len in the generic case. Causes host sync.
+            # TODO: Can special case for cases where we know offset of prefill sequences to avoid host sync.
             seq_len = self.get_arg("seq_len", truncate=True)
             offset_for_pos_ids = torch.repeat_interleave(offset, seq_len.to(torch.int64))
+
         position_ids += offset_for_pos_ids
 
         # --- seq_len_with_cache (device) ---
@@ -1383,7 +1440,14 @@ class SequenceInfo:
         increment = torch.zeros(self.num_sequences, dtype=torch.int32, device=self.device)
         num_prefill = self.batch_info.get_num_sequences()[0]
         gather_slot_idx = self.get_arg("_gather_slot_idx", truncate=True)
-        increment[num_prefill:] = new_lens_ungathered[gather_slot_idx] - 1
+        num_overlap = gather_slot_idx.numel()
+        # AD overlap mode packs real overlap-carried non-prefill sequences first. CUDA-graph dummy
+        # requests are appended later and therefore remain in the trailing zero-increment region.
+        # We deliberately only write gather_slot_idx entries for non-dummy requests, so that we
+        # can apply them to the prefix of "increment" here.
+        increment[num_prefill : num_prefill + num_overlap] = (
+            new_lens_ungathered[gather_slot_idx] - 1
+        )
         self.offset_pos_and_cache_(increment)
 
     @nvtx_range("ad_switch_to_generate_")

@@ -2861,6 +2861,11 @@ repos:
         entry: ./scripts/check_pinned_memory_usage.py
         language: script
         files: ^(tensorrt_llm|triton_backend)/.*\.py$
+    -   id: auto-deploy-import-discipline
+        name: Enforce relative imports inside auto_deploy
+        entry: python scripts/check_auto_deploy_imports.py
+        language: python
+        files: ^tensorrt_llm/_torch/auto_deploy/.*\.py$
     -   id:  type-check
         name: Run static analysis of type correctness using mypy
         entry: scripts/run_mypy.sh
