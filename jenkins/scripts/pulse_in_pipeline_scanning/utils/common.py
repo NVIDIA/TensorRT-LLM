@@ -10,7 +10,14 @@ def load_json(path):
         return json.load(f)
 
 
-def is_permissive(licenses, license_check_token):
+def is_permissive(licenses: list, license_check_token: str) -> dict:
+    """Checks permissiveness for a list of license IDs in a single API call.
+
+    Returns a dict mapping each license ID to its permissiveness.
+    On API failure, all licenses default to False (non-permissive).
+    """
+    if not licenses:
+        return {}
     headers = {
         "Authorization": f"Bearer {license_check_token}",
         "Content-Type": "application/json",
@@ -24,10 +31,10 @@ def is_permissive(licenses, license_check_token):
         if response:
             resp = response.json()
             if resp["success"]:
-                return all(result["isPermissive"] for result in resp["data"])
+                return {lic: result["isPermissive"] for lic, result in zip(licenses, resp["data"])}
             print(json.dumps(resp), file=sys.stderr)
         else:
             print(f"HTTP {response.status_code}", file=sys.stderr)
         print(f"Check License attempt {attempt + 1} failed", file=sys.stderr)
         time.sleep(2**attempt)
-    return False
+    return {lic: False for lic in licenses}

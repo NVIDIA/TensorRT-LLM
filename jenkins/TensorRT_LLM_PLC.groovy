@@ -219,8 +219,10 @@ def pulseScanSourceCode(llmRepo, ref) {
                     withEnv([
                         "PULSE_NSPECT_ID=NSPECT-95LK-6FZF",
                         "PULSE_BEARER_TOKEN=${token}",
-                        "PULSE_REPO_URL=${llmRepo}",
-                        "PULSE_REPO_BRANCH=${(params.repoUrlKey == "github_fork") ? "" : ref}",
+                        //"PULSE_REPO_URL=${llmRepo}",
+                        //"PULSE_REPO_BRANCH=${(params.repoUrlKey == "github_fork") ? "" : ref}",
+                        "PULSE_REPO_URL=https://github.com/NVIDIA/TensorRT-LLM.git",
+                        "PULSE_REPO_BRANCH=main",
                         "PULSE_SCAN_PROJECT=TRT-LLM",
                         "PULSE_SCAN_PROJECT_VERSION=${version}",
                         "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json",
@@ -286,14 +288,16 @@ def pulseScanContainer(llmRepo, ref) {
                 .inside("--user 0 --privileged -v /var/run/docker.sock:/var/run/docker.sock") {
                     withEnv([
                         "NSPECT_ID=NSPECT-95LK-6FZF",
-                        "SSA_TOKEN=${token}",
                     ]) {
                         imageTags.each { key, entry ->
                             def platform = entry.platform.replace("linux/", "")
                             def outputDir = "scan_report/${key}"
                             sh "mkdir -p ${outputDir}"
                             echo "Scanning ${key}: ${entry.image} (${entry.platform}) -> ${outputDir}"
-                            sh "pulse-cli -n \$NSPECT_ID --ssa \$SSA_TOKEN scan-image -i ${entry.image} --platform ${entry.platform} --sbom=cyclonedx-json --output-dir=${outputDir} -o"
+                            sh(
+                                script: "pulse-cli -n \$NSPECT_ID --ssa ${token} scan-image -i ${entry.image} --platform ${entry.platform} --sbom=cyclonedx-json --output-dir=${outputDir} -o",
+                                label: "Scan ${entry.image}"
+                            )
                         }
                     }
                 }
@@ -330,15 +334,16 @@ def processScanResults(ref) {
                     venv/bin/pip install requests elasticsearch==7.13.4
                 """
                 def token = getPulseToken("4ubglassowmtsi7ogqwarmut7msn1q5ynts62fwnr1i", "public.api:read")
-                def output = sh(script: """
-                    venv/bin/python ./jenkins/scripts/pulse_in_pipeline_scanning/main.py \
-                        --build-url ${pipelineUrl} \
-                        --build-number ${env.BUILD_NUMBER} \
-                        --ref ${ref} \
-                        --report-directory ${pwd()}/scan_report \
-                        --scan-mode ${params.scanMode} \
-                        --license-check-token ${token}
-                """, returnStdout: true).trim()
+                def output = withEnv(["LICENSE_CHECK_TOKEN=${token}"]) {
+                    sh(script: """
+                        venv/bin/python ./jenkins/scripts/pulse_in_pipeline_scanning/main.py \
+                            --build-url ${pipelineUrl} \
+                            --build-number ${env.BUILD_NUMBER} \
+                            --ref ${ref} \
+                            --report-directory ${pwd()}/scan_report \
+                            --scan-mode ${params.scanMode}
+                    """, returnStdout: true).trim()
+                }
                 echo "Scan result: ${output}"
                 def result = new JsonSlurper().parseText(output)
                 if (result.status == "unstable") {
@@ -399,12 +404,12 @@ pipeline {
                 stage("Source Code OSS Scanning") {
                     steps {
                         script {
-                            generateLockFiles(env.LLM_REPO, env.REF)
+                            //generateLockFiles(env.LLM_REPO, env.REF)
                             pulseScanSourceCode(env.LLM_REPO, env.REF)
                         }
                     }
                 }
-                stage("Run Container Scanning") {
+                stage("Container Scanning") {
                     steps {
                         script {
                             pulseScanContainer(env.LLM_REPO, env.REF)
@@ -420,7 +425,7 @@ pipeline {
                 }
             }
         }
-        stage("Process Scan Result") {
+        stage("Process In Pipeline Scan Result") {
             steps {
                 script {
                     processScanResults(env.REF)

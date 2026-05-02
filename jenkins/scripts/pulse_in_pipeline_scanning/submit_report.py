@@ -105,15 +105,37 @@ def submit_source_code_licenses(
     sbom_path = Path(input_file)
     if sbom_path.exists():
         sbom_data = json.loads(sbom_path.read_text())
-        for component in sbom_data.get("components", []):
-            license_ids = []
-            package_name = component.get("name")
-            package_version = component.get("version")
+        components = sbom_data.get("components", [])
+
+        # Build {license_id: [components]} and call the API once for all licenses
+        license_to_components = {}
+        for component in components:
             for lic_entry in component.get("licenses", []):
                 lic = lic_entry.get("license", {})
-                license_ids.append(lic.get("id") or lic.get("name") or "")
-            if is_permissive(license_ids, license_check_token):
+                lid = lic.get("id") or lic.get("name") or ""
+                license_to_components.setdefault(lid, []).append(component)
+
+        permissiveness = is_permissive(list(license_to_components.keys()), license_check_token)
+
+        non_permissive_pkgs = {
+            c.get("name")
+            for lid, perm in permissiveness.items()
+            if not perm
+            for c in license_to_components[lid]
+        }
+
+        for component in components:
+            package_name = component.get("name")
+            package_version = component.get("version")
+            component_licenses = component.get("licenses", [])
+            if component_licenses and package_name not in non_permissive_pkgs:
                 continue
+            license_ids = [
+                lic_entry.get("license", {}).get("id")
+                or lic_entry.get("license", {}).get("name")
+                or ""
+                for lic_entry in component_licenses
+            ]
             result_key = (package_name, package_version)
             is_new = result_key not in last_scan_result
             purl = component.get("purl", "")
@@ -136,7 +158,7 @@ def submit_source_code_licenses(
             }
             if (is_new or not only_report_new_risk) and (package_name not in map_preapproved):
                 risks_to_report.append(doc)
-            sbom_documents.append(doc)
+                sbom_documents.append(doc)
         if sbom_documents:
             _, sbom_errors = es_post(ES_POST_URL, sbom_documents)
             if sbom_errors:
@@ -229,11 +251,26 @@ def submit_container_licenses(
     risks_to_report = []
     release_image = release_data.get("image_tag", "")
     base_image = base_data.get("image_tag", "")
+    # Build {license_id: [deps]} and call the API once for all detected licenses
+    license_to_deps = {}
     for v in trtllm_deps:
-        license_ids = v.get("licenses", [])
+        for lid in v.get("licenses", []):
+            license_to_deps.setdefault(lid, []).append(v)
+
+    permissiveness = is_permissive(list(license_to_deps.keys()), license_check_token)
+
+    non_permissive_pkgs = {
+        dep.get("package")
+        for lid, perm in permissiveness.items()
+        if not perm
+        for dep in license_to_deps[lid]
+    }
+
+    for v in trtllm_deps:
         package_name = v.get("package")
         package_version = v.get("version")
-        if is_permissive(license_ids, license_check_token):
+        license_ids = v.get("licenses", [])
+        if license_ids and package_name not in non_permissive_pkgs:
             continue
         result_key = (package_name, package_version)
         is_new = result_key not in last_scan_result
@@ -255,7 +292,7 @@ def submit_container_licenses(
         }
         if (is_new or not only_report_new_risk) and (package_name not in map_preapproved):
             risks_to_report.append(doc)
-        docs.append(doc)
+            docs.append(doc)
     if docs:
         _, errors = es_post(ES_POST_URL, docs)
         if errors:

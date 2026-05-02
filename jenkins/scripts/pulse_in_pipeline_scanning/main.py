@@ -36,12 +36,11 @@ parser.add_argument(
         "if set to release, all risks will be reported"
     ),
 )
-parser.add_argument(
-    "--license-check-token",
-    required=True,
-    help=("Access token for license check API"),
-)
 args = parser.parse_args()
+
+LICENSE_CHECK_TOKEN = os.environ.get("LICENSE_CHECK_TOKEN")
+if not LICENSE_CHECK_TOKEN:
+    raise EnvironmentError("Error: Environment variable 'LICENSE_CHECK_TOKEN' is not set!")
 
 SEVERITY_RANK = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
 ES_HEADERS = {"Content-Type": "application/json"}
@@ -75,7 +74,7 @@ def process_result():
         os.path.join(args.report_directory, "source_code/sbom.json"),
         last_source_licenses,
         **SUBMIT_KWARG,
-        license_check_token=args.license_check_token,
+        license_check_token=LICENSE_CHECK_TOKEN,
     )
     if source_licenses is None:
         RISKY_DEPENDENCIES.append("source code SBOM not found")
@@ -113,7 +112,7 @@ def process_result():
         "amd64",
         last_container_licenses,
         **SUBMIT_KWARG,
-        license_check_token=args.license_check_token,
+        license_check_token=LICENSE_CHECK_TOKEN,
     )
     arm64_container_licenses = submit_container_licenses(
         os.path.join(args.report_directory, "release_arm64/licenses.json"),
@@ -121,7 +120,7 @@ def process_result():
         "arm64",
         last_container_licenses,
         **SUBMIT_KWARG,
-        license_check_token=args.license_check_token,
+        license_check_token=LICENSE_CHECK_TOKEN,
     )
     count_container_licenses = len(amd64_container_licenses + arm64_container_licenses)
     if count_container_licenses > 0:
