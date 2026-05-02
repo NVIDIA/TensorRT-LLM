@@ -866,14 +866,21 @@ class TestKimiK25E2ESmoke(unittest.TestCase):
                     "multi_modal_data": {"video": [video_tmp]},
                 }
             )
-            # The framework's multimodal hashing (find_mm_token_lengths)
-            # doesn't support video file paths — it asserts video items
-            # are list[PIL.Image]. If prior image tests already set
-            # multimodal_hashing_supported=True, the hashing path runs
-            # without fallback and fails. Reset to None so the framework
-            # retries hashing, fails on the file path, and falls back to
-            # the basic input processor which handles file paths via
-            # _decode_video_to_chunks.
+            # This test passes a video file path (str) rather than pre-decoded
+            # PIL frames, on purpose: it exercises the same code path used by
+            # trtllm-serve when a client uploads a raw video to the OpenAI API
+            # (KimiK25InputProcessor._decode_video_to_chunks handles file paths
+            # / bytes natively).
+            #
+            # The framework's multimodal hashing path
+            # (tensorrt_llm/inputs/multimodal.py:785, find_mm_token_lengths)
+            # supports VideoData and List[PIL.Image] but not file paths — it
+            # asserts the video item is a list. Once an earlier image test in
+            # this shared-LLM class sets multimodal_hashing_supported to True,
+            # the framework would skip the first-try fallback and raise on
+            # this assert. Resetting to None puts the framework back in the
+            # first-try state, so it falls back (registry.py:929) to calling
+            # KimiK25InputProcessor directly, which handles the file path.
             saved = self.llm.input_processor.multimodal_hashing_supported
             self.llm.input_processor.multimodal_hashing_supported = None
             try:
