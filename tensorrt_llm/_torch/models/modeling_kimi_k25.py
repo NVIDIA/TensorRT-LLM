@@ -398,7 +398,7 @@ def _tpool_patch_merger(
     return outputs
 
 
-class _Learnable2DPosEmb(nn.Module):
+class Learnable2DPosEmb(nn.Module):
     """Learnable 2D position embedding with bicubic interpolation + temporal sincos."""
 
     def __init__(self, height: int, width: int, num_frames: int, dim: int) -> None:
@@ -430,7 +430,7 @@ class _Learnable2DPosEmb(nn.Module):
         return x + torch.cat(pos_embs)
 
 
-class _PatchEmbed3d(nn.Module):
+class PatchEmbed3d(nn.Module):
     """Conv2d patch embedding + learnable 2D position embedding."""
 
     def __init__(
@@ -443,14 +443,14 @@ class _PatchEmbed3d(nn.Module):
     ) -> None:
         super().__init__()
         self.proj = nn.Conv2d(3, hidden_dim, kernel_size=patch_size, stride=patch_size)
-        self.pos_emb = _Learnable2DPosEmb(pos_emb_height, pos_emb_width, pos_emb_time, hidden_dim)
+        self.pos_emb = Learnable2DPosEmb(pos_emb_height, pos_emb_width, pos_emb_time, hidden_dim)
 
     def forward(self, x: torch.Tensor, grid_thws: torch.Tensor) -> torch.Tensor:
         x = self.proj(x).view(x.size(0), -1)
         return self.pos_emb(x, grid_thws)
 
 
-class _Rope2D(nn.Module):
+class Rope2D(nn.Module):
     """2D rotary position embedding with height/width interleaved frequencies."""
 
     def __init__(
@@ -487,7 +487,7 @@ class _Rope2D(nn.Module):
         )
 
 
-class _VisionMLP(MLP):
+class VisionMLP(MLP):
     """TRT-LLM MLP wrapper for each MoonViT3d encoder layer."""
 
     def __init__(
@@ -505,7 +505,7 @@ class _VisionMLP(MLP):
         )
 
 
-class _KimiK25VisionAttention(Attention):
+class KimiK25VisionAttention(Attention):
     """TRT-LLM attention wrapper that applies Kimi K2.5's 2D RoPE."""
 
     def __init__(
@@ -563,7 +563,7 @@ class _KimiK25VisionAttention(Attention):
         return self.o_proj(output, layer_idx=self.layer_idx)
 
 
-class _EncoderLayer(nn.Module):
+class EncoderLayer(nn.Module):
     """Single MoonViT3d encoder layer: LayerNorm + QKV attention + 2D RoPE + MLP."""
 
     def __init__(
@@ -587,14 +587,14 @@ class _EncoderLayer(nn.Module):
             eps=ln_eps,
             dtype=model_config.torch_dtype,
         )
-        self.attn = _KimiK25VisionAttention(
+        self.attn = KimiK25VisionAttention(
             model_config,
             hidden_dim=hidden_dim,
             num_heads=num_heads,
             layer_idx=layer_idx,
             attn_bias=attn_bias,
         )
-        self.mlp = _VisionMLP(model_config, layer_idx, hidden_dim, mlp_dim)
+        self.mlp = VisionMLP(model_config, layer_idx, hidden_dim, mlp_dim)
 
     def forward(
         self,
@@ -614,7 +614,7 @@ class _EncoderLayer(nn.Module):
         return x
 
 
-class _MoonViT3dEncoder(nn.Module):
+class MoonViT3dEncoder(nn.Module):
     """Stack of MoonViT3d encoder layers + 2D RoPE + final LayerNorm."""
 
     def __init__(
@@ -628,10 +628,10 @@ class _MoonViT3dEncoder(nn.Module):
         ln_eps: float = 1e-5,
     ) -> None:
         super().__init__()
-        self.rope_2d = _Rope2D(hidden_dim // num_heads)
+        self.rope_2d = Rope2D(hidden_dim // num_heads)
         self.blocks = nn.ModuleList(
             [
-                _EncoderLayer(
+                EncoderLayer(
                     model_config,
                     layer_idx=layer_idx,
                     num_heads=num_heads,
@@ -680,7 +680,7 @@ class _MoonViT3dEncoder(nn.Module):
         return self.final_layernorm(x)
 
 
-class _PatchMergerMLP(nn.Module):
+class PatchMergerMLP(nn.Module):
     """PatchMergerMLP projector: LayerNorm + spatial-merge reshape + MLP.
 
     Architecture:
@@ -832,8 +832,8 @@ class KimiK25VisionModel(nn.Module):
         )
 
         # --- Native sub-modules ---
-        self.patch_embed = _PatchEmbed3d(hidden_dim, patch_size, pos_h, pos_w, pos_t)
-        self.encoder = _MoonViT3dEncoder(
+        self.patch_embed = PatchEmbed3d(hidden_dim, patch_size, pos_h, pos_w, pos_t)
+        self.encoder = MoonViT3dEncoder(
             self.model_config,
             hidden_dim,
             num_layers,
@@ -841,7 +841,7 @@ class KimiK25VisionModel(nn.Module):
             mlp_dim,
             ln_eps=layer_norm_eps,
         )
-        self.mm_projector = _PatchMergerMLP(
+        self.mm_projector = PatchMergerMLP(
             self.model_config,
             mm_hidden_size,
             self.text_hidden_size,
