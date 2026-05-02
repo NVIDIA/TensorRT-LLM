@@ -66,10 +66,11 @@ std::vector<MmKey> generateBlockHashExtraKeys(
         auto const promptLen = llmRequest.getPromptLen();
         TLLM_CHECK_WITH_INFO((*multimodalHashes)->size() == (*multimodalItemRuns)->size(),
             "Multimodal hash arrays and item-run arrays have mismatched sizes");
-        TLLM_CHECK_WITH_INFO(
-            multimodalLengths && *multimodalLengths, "Multimodal item runs require multimodal lengths for validation");
-        TLLM_CHECK_WITH_INFO((*multimodalHashes)->size() == (*multimodalLengths)->size(),
-            "Multimodal hash arrays and length arrays have mismatched sizes");
+        if (multimodalLengths && *multimodalLengths)
+        {
+            TLLM_CHECK_WITH_INFO((*multimodalHashes)->size() == (*multimodalLengths)->size(),
+                "Multimodal hash arrays and length arrays have mismatched sizes");
+        }
         if (multimodalPositions && *multimodalPositions)
         {
             TLLM_CHECK_WITH_INFO((*multimodalHashes)->size() == (*multimodalPositions)->size(),
@@ -83,7 +84,6 @@ std::vector<MmKey> generateBlockHashExtraKeys(
         {
             auto const mmHashArray = makeHashArray((*(*multimodalHashes))[i]);
             auto const& positionRuns = (*(*multimodalItemRuns))[i];
-            auto const expectedLength = (*(*multimodalLengths))[i];
             TLLM_CHECK_WITH_INFO(!positionRuns.empty(), "Multimodal item runs must not be empty");
 
             std::optional<std::string> uuid = std::nullopt;
@@ -107,11 +107,22 @@ std::vector<MmKey> generateBlockHashExtraKeys(
             std::optional<SizeType32> previousRunEnd = std::nullopt;
             for (size_t runIdx = 0; runIdx < positionRuns.size(); ++runIdx)
             {
-                auto const [runStart, runLength] = positionRuns[runIdx];
+                auto const& [runStart, runLength, nonEmbedOffsets] = positionRuns[runIdx];
                 TLLM_CHECK_WITH_INFO(runLength > 0, "Multimodal item run length must be positive, got %d", runLength);
                 TLLM_CHECK_WITH_INFO(runStart >= 0 && runLength <= promptLen && runStart <= promptLen - runLength,
                     "Multimodal item run [%d, %d) is outside prompt token range [0, %d)", runStart,
                     runStart + runLength, promptLen);
+                std::optional<SizeType32> previousOffset = std::nullopt;
+                for (auto const offset : nonEmbedOffsets)
+                {
+                    // Non-embed offsets are metadata for downstream consumers. Cache hashing still covers the
+                    // entire prompt-owned run, so these offsets are validated but not filtered out here.
+                    TLLM_CHECK_WITH_INFO(offset >= 0 && offset < runLength,
+                        "Multimodal item run non-embed offset %d is outside run length %d", offset, runLength);
+                    TLLM_CHECK_WITH_INFO(!previousOffset || offset > *previousOffset,
+                        "Multimodal item run non-embed offsets must be ordered and unique");
+                    previousOffset = offset;
+                }
                 if (runIdx == 0 && multimodalPositions && *multimodalPositions)
                 {
                     TLLM_CHECK_WITH_INFO(runStart == (*(*multimodalPositions))[i],
@@ -126,8 +137,12 @@ std::vector<MmKey> generateBlockHashExtraKeys(
                 consumedLength += runLength;
                 previousRunEnd = runStart + runLength;
             }
-            TLLM_CHECK_WITH_INFO(
-                consumedLength == expectedLength, "Multimodal item run lengths must sum to multimodal_lengths[%zu]", i);
+            if (multimodalLengths && *multimodalLengths)
+            {
+                auto const expectedLength = (*(*multimodalLengths))[i];
+                TLLM_CHECK_WITH_INFO(consumedLength == expectedLength,
+                    "Multimodal item run lengths must sum to multimodal_lengths[%zu]", i);
+            }
         }
 
         return extraKeys;

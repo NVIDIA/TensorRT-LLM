@@ -27,6 +27,7 @@
 #include <list>
 #include <optional>
 #include <ostream>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -113,6 +114,20 @@ struct is_std_pair<std::pair<A, B>> : std::true_type
 
 template <typename T>
 constexpr bool is_std_pair_v = is_std_pair<T>::value;
+
+// Detect std::tuple
+template <typename T>
+struct is_std_tuple : std::false_type
+{
+};
+
+template <typename... Args>
+struct is_std_tuple<std::tuple<Args...>> : std::true_type
+{
+};
+
+template <typename T>
+constexpr bool is_std_tuple_v = is_std_tuple<T>::value;
 
 // SerializedSize
 template <typename T>
@@ -216,6 +231,11 @@ size_t serializedSize(T const& data)
     else if constexpr (is_std_pair_v<T>)
     {
         return serializedSize(data.first) + serializedSize(data.second);
+    }
+    // std::tuple
+    else if constexpr (is_std_tuple_v<T>)
+    {
+        return std::apply([](auto const&... elements) { return (serializedSize(elements) + ... + 0); }, data);
     }
     // Optional
     else if constexpr (std::is_same_v<T, std::optional<typename ValueType<T>::type>>)
@@ -337,6 +357,11 @@ void serialize(T const& data, std::ostream& os)
         serialize(data.first, os);
         serialize(data.second, os);
     }
+    // std::tuple
+    else if constexpr (is_std_tuple_v<T>)
+    {
+        std::apply([&os](auto const&... elements) { (serialize(elements, os), ...); }, data);
+    }
     // Optional
     else if constexpr (std::is_same_v<T, std::optional<typename ValueType<T>::type>>)
     {
@@ -380,6 +405,12 @@ struct get_variant_alternative_type
 
 template <typename T>
 T deserialize(std::istream& is);
+
+template <typename T, std::size_t... Is>
+T deserializeTuple(std::istream& is, std::index_sequence<Is...> /*indices*/)
+{
+    return T{deserialize<std::tuple_element_t<Is, T>>(is)...};
+}
 
 // Helper function to deserialize variant by index using template recursion
 template <typename T, std::size_t... Is>
@@ -699,6 +730,11 @@ T deserialize(std::istream& is)
         auto first = deserialize<typename is_std_pair<T>::first_type>(is);
         auto second = deserialize<typename is_std_pair<T>::second_type>(is);
         return T{std::move(first), std::move(second)};
+    }
+    // std::tuple
+    else if constexpr (is_std_tuple_v<T>)
+    {
+        return deserializeTuple<T>(is, std::make_index_sequence<std::tuple_size_v<T>>{});
     }
     // std::variant
     else if constexpr (is_variant_v<T>)

@@ -451,7 +451,7 @@ def test_llm_request_multimodal_positional_abi():
     assert torch.equal(llm_request.multimodal_embedding, multimodal_embedding)
     assert llm_request.multimodal_item_runs is None
 
-    multimodal_item_runs = [[(1, 2)]]
+    multimodal_item_runs = [[(1, 2, [])]]
     llm_request_with_item_runs = _tb.internal.batch_manager.LlmRequest(
         request_id=2,
         max_new_tokens=2,

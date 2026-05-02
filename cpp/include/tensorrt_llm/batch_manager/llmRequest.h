@@ -33,6 +33,7 @@
 #include <list>
 #include <memory>
 #include <optional>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -108,8 +109,9 @@ public:
     using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
     using Duration = std::chrono::time_point<std::chrono::steady_clock>::duration;
     using CacheSaltIDType = runtime::CacheSaltIDType;
-    using ContiguousRun = std::pair<SizeType32, SizeType32>;
-    using MultimodalItemRuns = std::vector<std::vector<ContiguousRun>>;
+    /// @brief Prompt span plus local offsets that do not consume encoder-output rows.
+    using MultimodalItemRun = std::tuple<SizeType32, SizeType32, std::vector<SizeType32>>;
+    using MultimodalItemRuns = std::vector<std::vector<MultimodalItemRun>>;
 
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> const& inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
@@ -406,6 +408,11 @@ public:
             {
                 mMultimodalUuids = std::make_shared<std::vector<std::optional<std::string>>>(
                     multimodalInput.value().getMultimodalUuids().value());
+            }
+            if (multimodalInput.value().getMultimodalItemRuns())
+            {
+                mMultimodalItemRuns
+                    = std::make_shared<MultimodalItemRuns>(multimodalInput.value().getMultimodalItemRuns().value());
             }
         }
         auto mRopeConfig = req.getMropeConfig();

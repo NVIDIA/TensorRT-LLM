@@ -36,7 +36,8 @@ class DisaggregatedParams:
 
         multimodal_embedding_handles (List[Dict[str, Any]]): The resulting multimodal embedding handles from ViT.
         multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.
-        multimodal_item_runs (List[List[Tuple[int, int]]]): Exact prompt token runs covered by each multimodal item.
+        multimodal_item_runs (List[List[Tuple[int, int, List[int]]]]): Exact prompt token runs covered by each
+         multimodal item. The third tuple element lists local non-embed offsets for that run.
     """
 
     request_type: Optional[str] = None
@@ -60,7 +61,7 @@ class DisaggregatedParams:
     multimodal_hashes: Optional[List[List[int]]] = (
         None  # user provided mm hashes should be a list of 8 integers
     )
-    multimodal_item_runs: Optional[List[List[Tuple[int, int]]]] = None
+    multimodal_item_runs: Optional[List[List[Tuple[int, int, List[int]]]]] = None
     mrope_position_ids_handle: Optional[Dict[str, Any]] = None
     mrope_position_deltas_handle: Optional[Dict[str, Any]] = None
 
@@ -137,15 +138,28 @@ class DisaggregatedParams:
                 assert len(item_runs) > 0, "multimodal_item_runs item must not be empty"
                 previous_end = None
                 for run in item_runs:
-                    assert isinstance(run, (list, tuple)) and len(run) == 2, (
-                        "multimodal_item_runs entries must be (prompt_start, run_length) pairs"
+                    assert isinstance(run, (list, tuple)) and len(run) == 3, (
+                        "multimodal_item_runs entries must be "
+                        "(prompt_start, run_length, non_embed_offsets) tuples"
                     )
-                    start, length = run
+                    start, length, non_embed_offsets = run
                     assert isinstance(start, int) and isinstance(length, int), (
                         "multimodal_item_runs must contain integers"
                     )
                     assert start >= 0, "multimodal_item_runs must contain non-negative positions"
                     assert length > 0, "multimodal_item_runs must contain positive lengths"
+                    assert isinstance(non_embed_offsets, list), (
+                        "multimodal_item_runs non-embed offsets must be a list"
+                    )
+                    assert all(isinstance(offset, int) for offset in non_embed_offsets), (
+                        "multimodal_item_runs non-embed offsets must contain integers"
+                    )
+                    assert non_embed_offsets == sorted(set(non_embed_offsets)), (
+                        "multimodal_item_runs non-embed offsets must be ordered and unique"
+                    )
+                    assert all(0 <= offset < length for offset in non_embed_offsets), (
+                        "multimodal_item_runs non-embed offsets must be within the run"
+                    )
                     assert previous_end is None or start >= previous_end, (
                         "multimodal_item_runs must be ordered and non-overlapping"
                     )

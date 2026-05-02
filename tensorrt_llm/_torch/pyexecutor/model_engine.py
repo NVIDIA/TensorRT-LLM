@@ -64,7 +64,8 @@ from .config_utils import is_mla
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from .guided_decoder import CapturableGuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
-from .llm_request import LlmRequest, get_draft_token_length
+from .llm_request import (LlmRequest, get_draft_token_length,
+                          get_request_multimodal_embedding_lengths)
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .resource_manager import (BaseResourceManager, KVCacheManager,
@@ -4057,19 +4058,12 @@ class PyTorchModelEngine(ModelEngine):
         if not multimodal_params or len(multimodal_params) == 0:
             # Return empty embeddings if no multimodal data
             return {'mm_embeddings': []}
-        # TODO(TRTLLM-12175): split encoder outputs by explicit per-request
-        # encoder-output embedding lengths. multimodal_lengths is a
-        # prompt-side MM-token count and may include non-embedding
-        # special/framing tokens.
-        if getattr(scheduled_requests.context_requests[0], 'multimodal_lengths',
-                   None) is None:
-            multimodal_chunks = None
-        else:
-            multimodal_chunks = [
-                sum(request.multimodal_lengths)
-                for request in scheduled_requests.context_requests
-                if request.multimodal_lengths is not None
-            ]
+        multimodal_chunks = []
+        for request in scheduled_requests.context_requests:
+            multimodal_embedding_lengths = (
+                get_request_multimodal_embedding_lengths(request))
+            if multimodal_embedding_lengths is not None:
+                multimodal_chunks.append(sum(multimodal_embedding_lengths))
         # For mm_encoder_only mode, we only run the vision encoder part
         # The model should be a vision encoder (e.g., Qwen2VisionModelBase)
         mm_embeddings = self.model.forward(multimodal_params)
@@ -4077,15 +4071,16 @@ class PyTorchModelEngine(ModelEngine):
             mm_embeddings
         ) == 1, "mm_embeddings should be a 1-element list, mix modality (video+image) is not supported"
 
-        if multimodal_chunks is None or len(multimodal_chunks) != len(
-                multimodal_params):
-            mm_embeddings = list(
-                torch.chunk(mm_embeddings[0],
-                            scheduled_requests.num_context_requests,
-                            dim=0))
-        else:
+        if multimodal_chunks:
+            if len(multimodal_chunks) != len(multimodal_params):
+                raise ValueError("multimodal embedding split count mismatch: "
+                                 f"{len(multimodal_chunks)} request chunks for "
+                                 f"{len(multimodal_params)} multimodal params")
             mm_embeddings = list(
                 torch.split(mm_embeddings[0], multimodal_chunks, dim=0))
+        else:
+            mm_embeddings = list(
+                torch.chunk(mm_embeddings[0], len(multimodal_params), dim=0))
 
         # Extract mrope position data from multimodal_params if available
         mrope_position_ids_list = []

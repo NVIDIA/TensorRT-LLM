@@ -1081,7 +1081,7 @@ def test_multimodal_input_with_item_runs():
     multimodal_positions = [1]
     multimodal_lengths = [2]
     multimodal_uuids = ["test-uuid-1"]
-    multimodal_item_runs = [[(1, 1), (3, 1)]]
+    multimodal_item_runs = [[(1, 1, []), (3, 1, [])]]
 
     config = trtllm.MultimodalInput(multimodal_hashes, multimodal_positions,
                                     multimodal_lengths, multimodal_uuids,

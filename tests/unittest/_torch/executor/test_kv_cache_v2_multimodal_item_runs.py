@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import pytest
 
 import tensorrt_llm
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
     gen_multi_modal_tokens,
@@ -54,6 +53,7 @@ def _digest(hash_ints):
 
 DIGEST = _digest(HASH_INTS)
 DIGEST_TOKENS = gen_multi_modal_tokens(VOCAB_SIZE, DIGEST, 2)
+DIGEST_TOKENS_WITH_SPECIAL = gen_multi_modal_tokens(VOCAB_SIZE, DIGEST, 3)
 OTHER_DIGEST = _digest(OTHER_HASH_INTS)
 OTHER_DIGEST_TOKENS = gen_multi_modal_tokens(VOCAB_SIZE, OTHER_DIGEST, 3)
 
@@ -66,18 +66,14 @@ def _make_request(
     multimodal_lengths=None,
     multimodal_item_runs=None,
 ):
-    return LlmRequest(
-        request_id=0,
-        max_new_tokens=1,
-        input_tokens=prompt_tokens or PROMPT_TOKENS,
-        sampling_config=tensorrt_llm.bindings.SamplingConfig(
-            SamplingParams()._get_sampling_config()
-        ),
-        is_streaming=False,
+    sampling_config = tensorrt_llm.bindings.SamplingConfig(SamplingParams()._get_sampling_config())
+    return _RequestLike(
+        prompt_tokens or PROMPT_TOKENS,
         multimodal_hashes=multimodal_hashes,
         multimodal_positions=multimodal_positions,
         multimodal_lengths=multimodal_lengths,
         multimodal_item_runs=multimodal_item_runs,
+        sampling_config=sampling_config,
     )
 
 
@@ -88,12 +84,34 @@ def _augment(req, start: int = 0, end: int | None = None):
     )
 
 
+class _RequestLike:
+    def __init__(
+        self,
+        prompt_tokens,
+        *,
+        multimodal_hashes=None,
+        multimodal_positions=None,
+        multimodal_lengths=None,
+        multimodal_item_runs=None,
+        sampling_config=None,
+    ):
+        self._prompt_tokens = prompt_tokens
+        self.multimodal_hashes = multimodal_hashes
+        self.multimodal_positions = multimodal_positions
+        self.multimodal_lengths = multimodal_lengths
+        self.multimodal_item_runs = multimodal_item_runs
+        self.sampling_config = sampling_config
+
+    def get_tokens(self, beam_idx):
+        return self._prompt_tokens
+
+
 def test_item_runs_replace_only_exact_sparse_prompt_coverage():
     req = _make_request(
         multimodal_hashes=[HASH_INTS],
         multimodal_positions=[1],
         multimodal_lengths=[2],
-        multimodal_item_runs=[[(1, 1), (3, 1)]],
+        multimodal_item_runs=[[(1, 1, []), (3, 1, [])]],
     )
 
     assert _augment(req) == [
@@ -105,6 +123,25 @@ def test_item_runs_replace_only_exact_sparse_prompt_coverage():
     ]
     assert _augment(req, start=2, end=3) == [TEXT_GAP]
     assert _augment(req, start=3, end=4) == [DIGEST_TOKENS[1]]
+
+
+def test_non_embed_offsets_do_not_reduce_cache_hash_prompt_coverage():
+    prompt_tokens = [TEXT_BEFORE, MM_PLACEHOLDER, 777, MM_PLACEHOLDER, TEXT_AFTER]
+    req = _RequestLike(
+        prompt_tokens,
+        multimodal_hashes=[HASH_INTS],
+        multimodal_positions=[1],
+        multimodal_lengths=[3],
+        multimodal_item_runs=[[(1, 3, [1])]],
+    )
+
+    assert _augment(req) == [
+        TEXT_BEFORE,
+        DIGEST_TOKENS_WITH_SPECIAL[0],
+        DIGEST_TOKENS_WITH_SPECIAL[1],
+        DIGEST_TOKENS_WITH_SPECIAL[2],
+        TEXT_AFTER,
+    ]
 
 
 def test_missing_item_runs_keeps_legacy_contiguous_projection():
@@ -128,7 +165,10 @@ def test_multiple_items_replace_sparse_runs_across_slices():
         multimodal_hashes=[HASH_INTS, OTHER_HASH_INTS],
         multimodal_positions=[1, 5],
         multimodal_lengths=[2, 3],
-        multimodal_item_runs=[[(1, 1), (3, 1)], [(5, 1), (7, 1), (9, 1)]],
+        multimodal_item_runs=[
+            [(1, 1, []), (3, 1, [])],
+            [(5, 1, []), (7, 1, []), (9, 1, [])],
+        ],
     )
 
     assert _augment(req) == [
@@ -162,12 +202,14 @@ def test_multiple_items_replace_sparse_runs_across_slices():
 @pytest.mark.parametrize(
     "multimodal_item_runs, match",
     [
-        ([[(1, 1), (99, 1)]], "outside prompt"),
-        ([[(-1, 1), (3, 1)]], "outside prompt"),
-        ([[(1, 2), (2, 1)]], "ordered and non-overlapping"),
-        ([[(1, 0), (3, 1)]], "positive length"),
-        ([[(1, 1)]], "length"),
-        ([[(2, 2)]], "start"),
+        ([[(1, 1), (3, 1)]], "prompt_start, run_length, non_embed_offsets"),
+        ([[((1, 1), []), ((3, 1), [])]], "prompt_start, run_length, non_embed_offsets"),
+        ([[(1, 1, []), (99, 1, [])]], "outside prompt"),
+        ([[(-1, 1, []), (3, 1, [])]], "outside prompt"),
+        ([[(1, 2, []), (2, 1, [])]], "ordered and non-overlapping"),
+        ([[(1, 0, []), (3, 1, [])]], "positive length"),
+        ([[(1, 1, [])]], "length"),
+        ([[(2, 2, [])]], "start"),
     ],
 )
 def test_invalid_exact_item_runs_are_rejected(multimodal_item_runs, match):
@@ -178,7 +220,7 @@ def test_invalid_exact_item_runs_are_rejected(multimodal_item_runs, match):
         multimodal_item_runs=multimodal_item_runs,
     )
 
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises((TypeError, ValueError), match=match):
         _augment(req)
 
 
@@ -187,13 +229,13 @@ def test_same_contiguous_fallback_span_with_different_exact_runs_has_distinct_ca
         multimodal_hashes=[HASH_INTS],
         multimodal_positions=[1],
         multimodal_lengths=[2],
-        multimodal_item_runs=[[(1, 1), (3, 1)]],
+        multimodal_item_runs=[[(1, 1, []), (3, 1, [])]],
     )
     contiguous_req = _make_request(
         multimodal_hashes=[HASH_INTS],
         multimodal_positions=[1],
         multimodal_lengths=[2],
-        multimodal_item_runs=[[(1, 2)]],
+        multimodal_item_runs=[[(1, 2, [])]],
     )
 
     sparse_tokens = _augment(sparse_req)

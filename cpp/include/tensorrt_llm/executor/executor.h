@@ -30,6 +30,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -48,8 +49,9 @@ namespace tensorrt_llm::executor
 {
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
-using ContiguousRun = std::pair<SizeType32, SizeType32>;
-using MultimodalItemRuns = std::vector<std::vector<ContiguousRun>>;
+/// @brief Prompt span plus local offsets that do not consume encoder-output rows.
+using MultimodalItemRun = std::tuple<SizeType32, SizeType32, std::vector<SizeType32>>;
+using MultimodalItemRuns = std::vector<std::vector<MultimodalItemRun>>;
 
 /// @brief Version of TRT-LLM
 char const* version() noexcept;
@@ -321,6 +323,7 @@ private:
     /// When provided, these are returned in KV cache events instead of content hashes.
     std::optional<std::vector<std::optional<std::string>>> mMultimodalUuids;
     /// @brief Optional compact prompt token runs for each multimodal item.
+    /// Each run also carries local offsets that are multimodal-owned but do not consume encoder-output rows.
     std::optional<MultimodalItemRuns> mMultimodalItemRuns;
 };
 
@@ -677,7 +680,7 @@ public:
     /// @param embeddingBias The embedding bias tensor. Expected shape is [vocab_size]
     /// @param externalDraftTokensConfig The speculative decoding with external draft tokens configuration
     /// @param pTuningConfig The prompt tuning configuration
-    /// @param multimodalInput The multimodal input {multimodalHashes, multimodalPositions, multimodalLengths}
+    /// @param multimodalInput The multimodal input. Item runs are the preferred prompt-layout contract when present.
     /// @param multimodalEmbedding The multimodal embedding tensor. Expected shape is [num_multimodal_tokens,
     /// hidden_dim]
     /// @param mRopeConfig The mrope configuration

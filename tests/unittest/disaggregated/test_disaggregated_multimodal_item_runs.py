@@ -15,7 +15,7 @@ from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.sampling_params import SamplingParams
 
 MM_HASHES = [[1, 2, 3, 4, 5, 6, 7, 8]]
-MM_ITEM_RUNS = [[(1, 1), (3, 1)]]
+MM_ITEM_RUNS = [[(1, 1, []), (3, 1, [])]]
 MM_HANDLES = [{"tensor_size": [2, 8], "ipc_handle": "handle"}]
 
 
@@ -33,7 +33,22 @@ def test_disaggregated_params_rejects_item_run_count_mismatch():
     with pytest.raises(AssertionError, match="multimodal_item_runs and multimodal_hashes"):
         DisaggregatedParams(
             multimodal_hashes=MM_HASHES,
-            multimodal_item_runs=[MM_ITEM_RUNS[0], [(5, 1)]],
+            multimodal_item_runs=[MM_ITEM_RUNS[0], [(5, 1, [])]],
+        )
+
+
+@pytest.mark.parametrize(
+    "item_runs",
+    [
+        [[(1, 1), (3, 1)]],
+        [[((1, 1), []), ((3, 1), [])]],
+    ],
+)
+def test_disaggregated_params_rejects_non_canonical_item_run_shapes(item_runs):
+    with pytest.raises(AssertionError, match="prompt_start, run_length, non_embed_offsets"):
+        DisaggregatedParams(
+            multimodal_hashes=MM_HASHES,
+            multimodal_item_runs=item_runs,
         )
 
 

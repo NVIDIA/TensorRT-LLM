@@ -2495,6 +2495,50 @@ class KVCacheManagerV2(BaseResourceManager):
                     "multimodal_item_runs and multimodal_hashes must have the same length"
                 )
 
+            def _validate_item_run(item_idx: int, run_idx: int,
+                                   run: Sequence) -> tuple[int, int]:
+                if not isinstance(run, (list, tuple)) or len(run) != 3:
+                    raise TypeError(
+                        f"multimodal_item_runs[{item_idx}][{run_idx}] must be a "
+                        "(prompt_start, run_length, non_embed_offsets) tuple")
+                run_start, run_length, non_embed_offsets = run
+
+                if not isinstance(run_start, int) or not isinstance(
+                        run_length, int):
+                    raise TypeError(
+                        f"multimodal_item_runs[{item_idx}][{run_idx}] must contain integer start/length"
+                    )
+                if run_length <= 0:
+                    raise ValueError(
+                        f"multimodal_item_runs[{item_idx}][{run_idx}] must have positive length"
+                    )
+                if run_start < 0 or run_start + run_length > len(tokens):
+                    raise ValueError(
+                        f"multimodal_item_runs[{item_idx}] contains run "
+                        f"({run_start}, {run_length}) outside prompt token range [0, {len(tokens)})"
+                    )
+
+                if not isinstance(non_embed_offsets, list):
+                    raise TypeError(
+                        f"multimodal_item_runs[{item_idx}][{run_idx}] non-embed offsets must be a list"
+                    )
+                if not all(
+                        isinstance(offset, int)
+                        for offset in non_embed_offsets):
+                    raise TypeError(
+                        f"multimodal_item_runs[{item_idx}][{run_idx}] non-embed offsets must contain only integers"
+                    )
+                if any(offset < 0 or offset >= run_length
+                       for offset in non_embed_offsets):
+                    raise ValueError(
+                        f"multimodal_item_runs[{item_idx}][{run_idx}] non-embed offsets must be within the run"
+                    )
+                if non_embed_offsets != sorted(set(non_embed_offsets)):
+                    raise ValueError(
+                        f"multimodal_item_runs[{item_idx}][{run_idx}] non-embed offsets must be ordered and unique"
+                    )
+                return run_start, run_length
+
             for item_idx, (hash_ints, item_runs) in enumerate(
                     zip(req.multimodal_hashes,
                         multimodal_item_runs,
@@ -2504,32 +2548,17 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"multimodal_item_runs[{item_idx}] must not be empty")
                 item_length = 0
                 previous_end = None
+                validated_item_runs = []
                 for run_idx, run in enumerate(item_runs):
-                    if not isinstance(run, (list, tuple)) or len(run) != 2:
-                        raise TypeError(
-                            f"multimodal_item_runs[{item_idx}][{run_idx}] must be a "
-                            "(prompt_start, run_length) pair")
-                    run_start, run_length = run
-                    if not isinstance(run_start, int) or not isinstance(
-                            run_length, int):
-                        raise TypeError(
-                            f"multimodal_item_runs[{item_idx}][{run_idx}] must contain only integers"
-                        )
-                    if run_start < 0 or run_start + run_length > len(tokens):
-                        raise ValueError(
-                            f"multimodal_item_runs[{item_idx}] contains run "
-                            f"({run_start}, {run_length}) outside prompt token range [0, {len(tokens)})"
-                        )
-                    if run_length <= 0:
-                        raise ValueError(
-                            f"multimodal_item_runs[{item_idx}][{run_idx}] must have positive length"
-                        )
+                    run_start, run_length = _validate_item_run(
+                        item_idx, run_idx, run)
                     if previous_end is not None and run_start < previous_end:
                         raise ValueError(
                             f"multimodal_item_runs[{item_idx}] must be ordered and non-overlapping"
                         )
                     item_length += run_length
                     previous_end = run_start + run_length
+                    validated_item_runs.append((run_start, run_length))
                 if req.multimodal_lengths is not None:
                     expected_length = req.multimodal_lengths[item_idx]
                     if item_length != expected_length:
@@ -2539,7 +2568,7 @@ class KVCacheManagerV2(BaseResourceManager):
                         )
                 if req.multimodal_positions is not None:
                     expected_start = req.multimodal_positions[item_idx]
-                    if item_runs[0][0] != expected_start:
+                    if validated_item_runs[0][0] != expected_start:
                         raise ValueError(
                             f"multimodal_item_runs[{item_idx}] must start at "
                             f"multimodal_positions[{item_idx}] ({expected_start})"
@@ -2548,7 +2577,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 mm_tokens = gen_multi_modal_tokens(self.vocab_size, digest,
                                                    item_length)
                 hash_offset = 0
-                for run_start, run_length in item_runs:
+                for run_start, run_length in validated_item_runs:
                     run_end = run_start + run_length
                     if run_end <= start or run_start >= end:
                         hash_offset += run_length

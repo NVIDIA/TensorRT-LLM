@@ -1160,6 +1160,7 @@ TEST(SerializeUtilsTest, BlockKeyWithExtrasAndUuids)
 TEST(SerializeUtilsTest, MultimodalInputWithUuids)
 {
     using tensorrt_llm::executor::MultimodalInput;
+    using tensorrt_llm::executor::MultimodalItemRun;
     using tensorrt_llm::executor::MultimodalItemRuns;
 
     // Helper to verify MultimodalInput serialization round-trip
@@ -1221,7 +1222,9 @@ TEST(SerializeUtilsTest, MultimodalInputWithUuids)
     };
     std::vector<SizeType32> positions = {0, 100};
     std::vector<SizeType32> lengths = {3, 2};
-    MultimodalItemRuns hashPositionRuns = {{{0, 1}, {2, 1}, {4, 1}}, {{100, 1}, {103, 1}}};
+    MultimodalItemRuns hashPositionRuns
+        = {{MultimodalItemRun{0, 1, {}}, MultimodalItemRun{2, 1, {0}}, MultimodalItemRun{4, 1, {}}},
+            {MultimodalItemRun{100, 1, {}}, MultimodalItemRun{103, 1, {}}}};
 
     // Test with full UUIDs
     std::vector<std::optional<std::string>> uuids = {std::string("image-uuid-001"), std::string("image-uuid-002")};

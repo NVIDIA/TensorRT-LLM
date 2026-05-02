@@ -9,6 +9,7 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
+from tensorrt_llm.inputs.multimodal import get_multimodal_embedding_lengths
 from tensorrt_llm.sampling_params import LogprobMode
 
 SamplingConfig = tensorrt_llm.bindings.SamplingConfig
@@ -42,6 +43,24 @@ REQUEST_TYPE_MAPPING = {
 
 if TYPE_CHECKING:
     from .sampling_utils import Strategy
+
+
+def get_request_multimodal_embedding_lengths(
+        request: Any) -> Optional[List[int]]:
+    """Return per-item encoder-output row counts for a request.
+
+    Canonical item runs are the source of truth when present. The legacy
+    `multimodal_lengths` fallback is retained only for requests that predate
+    item-run metadata.
+    """
+    multimodal_item_runs = getattr(request, "multimodal_item_runs", None)
+    if multimodal_item_runs is not None:
+        return get_multimodal_embedding_lengths(multimodal_item_runs)
+
+    multimodal_lengths = getattr(request, "multimodal_lengths", None)
+    if multimodal_lengths is None:
+        return None
+    return list(multimodal_lengths)
 
 
 @dataclass(slots=True)
@@ -383,19 +402,17 @@ class PyResult:
             self._log_probs.append(log_probs, cum_log_probs)
 
     def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
-                             multimodal_lengths: List[int]):
+                             multimodal_embedding_lengths: List[int]):
         """Split concatenated embeddings by per-item lengths and create handles.
 
         Args:
             mm_embeddings: Concatenated multimodal embeddings tensor of shape
                 [total_tokens, hidden_dim].
-            multimodal_lengths: Current per-item split lengths.
+            multimodal_embedding_lengths: Per-item encoder-output row counts.
         """
-        # TODO(TRTLLM-12175): callers currently pass request.multimodal_lengths,
-        # a prompt-side MM-token count that may include non-embedding
-        # special/framing tokens. This split needs per-item encoder-output
-        # embedding lengths instead.
-        split_embeddings = torch.split(mm_embeddings, multimodal_lengths, dim=0)
+        split_embeddings = torch.split(mm_embeddings,
+                                       multimodal_embedding_lengths,
+                                       dim=0)
 
         # Create a SharedTensorContainer handle for each split
         self._mm_embeddings = [
@@ -952,8 +969,8 @@ def executor_request_to_llm_request(
         multimodal_positions = executor_request.multimodal_input.multimodal_positions
         multimodal_lengths = executor_request.multimodal_input.multimodal_lengths
         multimodal_uuids = executor_request.multimodal_input.multimodal_uuids
-        multimodal_item_runs = getattr(executor_request,
-                                       "py_multimodal_item_runs", None)
+        multimodal_item_runs = (
+            executor_request.multimodal_input.multimodal_item_runs)
 
     # Extract mrope fields
     mrope_rotary_cos_sin = None
