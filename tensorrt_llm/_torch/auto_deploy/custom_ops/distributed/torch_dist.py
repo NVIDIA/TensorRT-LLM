@@ -23,7 +23,8 @@ from typing import List, Optional
 
 import torch
 
-from ....distributed.symm_mem_allgather import SymmetricMemoryAllGather
+from tensorrt_llm._torch.distributed.symm_mem_allgather import SymmetricMemoryAllGather
+
 from ...distributed import common as dist
 
 # SymmetricMemoryAllGather instances keyed on (rank, world_size, workspace_id).
@@ -46,7 +47,7 @@ def _get_symm_mem_allgather_torch(workspace_id: int):
     """Get or create a cached SymmetricMemoryAllGather instance for *workspace_id*."""
     import torch.distributed as torch_dist
 
-    from .....mapping import Mapping
+    from tensorrt_llm.mapping import Mapping
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()

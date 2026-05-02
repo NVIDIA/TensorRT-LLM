@@ -47,9 +47,9 @@ class SymmetricMemoryAllGather(nn.Module):
     - SM 10.0: 6, 8 GPUs
 
     Any gather dim is supported via transpose-to-dim-0 in :py:meth:`forward`.
-    Large outputs on the dim != 0 path fall back to NCCL via
-    ``_SYMM_MEM_THRESHOLD`` because the transpose+contiguous copies
-    erode the MULTIMEM latency advantage on prefill-sized tensors.
+    Large outputs on the dim != 0 path fall back to NCCL because the
+    transpose+contiguous copies erode the MULTIMEM latency advantage on
+    prefill-sized tensors. See :py:meth:`can_use_symm_mem` for the threshold.
     """
 
     MiB = 1024 * 1024
@@ -77,21 +77,6 @@ class SymmetricMemoryAllGather(nn.Module):
         },
     }
 
-    # Output-bytes threshold above which the dim != 0 (transpose) path falls
-    # back to NCCL. The transpose+contiguous copies plus the multimem
-    # all-at-once latency stop beating NCCL ring-LL's pipelined bandwidth —
-    # and on paths where multi-stream overlap is disabled (e.g. piecewise
-    # CG under disable_multi_stream), the multimem call ends up fully
-    # exposed on the critical path. Falling back to NCCL in that regime
-    # trades ~µs of latency for several ms of saved transpose + better
-    # pipelining on prefill-sized tensors.
-    # Measured on B200/H100 ws=8 piecewise CG with multi_stream disabled
-    # (#13321). Cross-over is weakly ws-dependent (~17% via the (ws-1)/ws
-    # factor), so a single scalar covers all measured (cap, ws) configs.
-    # The dim == 0 path is unaffected (no transpose), and is gated only
-    # by the workspace overflow check (_MAX_SIZES).
-    _SYMM_MEM_THRESHOLD = 1 * MiB
-
     def __init__(
         self,
         mapping: Mapping,
@@ -115,10 +100,28 @@ class SymmetricMemoryAllGather(nn.Module):
             logger.warning("SymmetricMemoryAllGather: CUDA not available")
             return
 
-        # The executor has already pinned this process to the right GPU
-        # via torch.cuda.set_device(); use that rather than re-deriving an
-        # ordinal from the TP/local rank (which breaks on multi-node).
-        capability = torch.cuda.get_device_capability(torch.cuda.current_device())
+        # GPU pinning sanity check.
+        #
+        # The caller is expected to have run torch.cuda.set_device(local_rank)
+        # before constructing this module so that subsequent symm_mem
+        # allocations land on the rank-local GPU. A common multi-node bug is
+        # forgetting set_device() — every rank ends up on cuda:0, the symm_mem
+        # buffers go to the wrong GPU vs. the model weights, and runtime
+        # either crashes or produces garbage. Detect that mismatch up front
+        # and disable the fast path rather than silently mis-pinning memory.
+        current_device = torch.cuda.current_device()
+        expected_local_rank = mapping.local_rank
+        if current_device != expected_local_rank:
+            logger.warning(
+                f"SymmetricMemoryAllGather: torch.cuda.current_device()={current_device} "
+                f"does not match mapping.local_rank={expected_local_rank}. "
+                f"Caller likely forgot torch.cuda.set_device(local_rank); "
+                f"disabling fast path to avoid GPU mismatch."
+            )
+            return
+
+        # current_device is now verified to match local_rank.
+        capability = torch.cuda.get_device_capability(current_device)
         self.device_capability = f"{capability[0]}.{capability[1]}"
 
         if self.device_capability not in self._MAX_SIZES:
@@ -144,10 +147,11 @@ class SymmetricMemoryAllGather(nn.Module):
 
         self.max_size = self._MAX_SIZES[self.device_capability][self.world_size]
 
-        # Process group. NOTE: a group created here is left alive for the
-        # module's lifetime — torch does not provide a cheap, safe way to
-        # tear it down on partial init failure, and the cache in
-        # auto_deploy/.../trtllm_dist.py keeps this module long-lived.
+        # Process group. A group created here lives for the module's
+        # lifetime: torch does not expose a cheap, safe teardown for
+        # partial-init failures, and callers are expected to keep the
+        # module long-lived (e.g. cache it across forwards) so the cost
+        # is paid once.
         self.group = group
         if self.group is None:
             if not dist.is_initialized():
@@ -260,11 +264,13 @@ class SymmetricMemoryAllGather(nn.Module):
         out_bytes = inp_bytes * self.world_size
         if out_bytes >= self.max_size:
             return False
-        # On the dim != 0 (transpose) path, gate by the perf threshold so
-        # that large tensors (typical of prefill) fall back to NCCL where
-        # ring-LL pipelining beats multimem-with-transpose. dim == 0 is
+        # Gate the dim != 0 path on output size: gather along a non-leading
+        # dim requires a transpose+contiguous copy before the symm_mem
+        # allgather, and for large tensors that combined cost loses to NCCL
+        # ring-LL pipelining. The dim == 0 path skips the transpose and is
         # unaffected.
-        if dim != 0 and out_bytes >= self._SYMM_MEM_THRESHOLD:
+        transpose_threshold = 1 * self.MiB
+        if dim != 0 and out_bytes >= transpose_threshold:
             return False
         return True
 
