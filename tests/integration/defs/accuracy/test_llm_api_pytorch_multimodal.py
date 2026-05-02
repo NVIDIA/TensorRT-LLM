@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import pytest
 
 from tensorrt_llm import LLM
@@ -5,7 +19,7 @@ from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig, Sampl
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import llm_models_root, skip_pre_blackwell, skip_pre_hopper
-from .accuracy_core import MMMU, LlmapiAccuracyTestHarness
+from .accuracy_core import MMMU, LlmapiAccuracyTestHarness, VoxPopuli
 
 
 class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
@@ -487,10 +501,32 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
         temperature=0.0,
         top_k=1,
     )
+    MMMU_TASK_SPEC = (MMMU, sampling_params, EXTRA_EVALUATOR_KWARGS)
+
+    voxpopuli_sampling_params = SamplingParams(
+        max_tokens=512,
+        truncate_prompt_tokens=VoxPopuli.MAX_INPUT_LEN,
+        temperature=0.0,
+        top_k=1,
+    )
+    voxpopuli_extra_evaluator_kwargs = {
+        # We explicitly disable thinking, because otherwise the thinking traces could
+        # be absurdly long (20k+ tokens), which is not helpful for test-runtime, nor
+        # for reproducibility (the more tokens there are, the higher likelihood of the
+        # end output not being the same).
+        # In addition, if reasoning is cut off, then the WER goes through the roof,
+        # since each word in the output is treated as an error.
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    VOXPOPULI_TASK_SPEC = (
+        VoxPopuli,
+        voxpopuli_sampling_params,
+        voxpopuli_extra_evaluator_kwargs,
+    )
 
     @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.parametrize(
-        "model_name,model_path,kv_cache_config,max_batch_size,expected_quant_algo",
+        "model_name,model_path,kv_cache_config,max_batch_size,expected_quant_algo,task_specs",
         [
             pytest.param(
                 "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16",
@@ -502,6 +538,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 ),
                 32,
                 None,
+                (MMMU_TASK_SPEC,),
                 id="bf16",
             ),
             pytest.param(
@@ -515,6 +552,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 ),
                 64,
                 QuantAlgo.FP8,
+                (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC),
                 marks=skip_pre_hopper,
                 id="fp8",
             ),
@@ -529,6 +567,7 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
                 ),
                 128,
                 QuantAlgo.MIXED_PRECISION,
+                (MMMU_TASK_SPEC, VOXPOPULI_TASK_SPEC),
                 marks=skip_pre_blackwell,
                 id="nvfp4",
             ),
@@ -541,15 +580,17 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
         kv_cache_config: KvCacheConfig,
         max_batch_size: int,
         expected_quant_algo: QuantAlgo | None,
+        task_specs: tuple[
+            tuple[type[MMMU] | type[VoxPopuli], SamplingParams, dict[str, object]],
+            ...,
+        ],
     ) -> None:
-        task = MMMU(model_name)
-
         with LLM(
             model_path,
             kv_cache_config=kv_cache_config,
             enable_chunked_prefill=True,
-            # Keep the integration test fast; full benchmark-style runs may use
-            # a larger generation budget.
+            # Use a low-ish value for the below to force chunking for requests (helping to surface
+            # runtime errors if introduced by a change).
             max_num_tokens=512,
             # The amount of memory pre-allocated for mamba SSM states is proportional to the below,
             # so lower it from its default of 2048.
@@ -558,8 +599,10 @@ class TestNanoV3Omni(LlmapiAccuracyTestHarness):
         ) as llm:
             if expected_quant_algo is not None:
                 assert llm.args.quant_config.quant_algo == expected_quant_algo
-            task.evaluate(
-                llm,
-                sampling_params=self.sampling_params,
-                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
-            )
+            for task_cls, sampling_params, extra_evaluator_kwargs in task_specs:
+                task = task_cls(model_name)
+                task.evaluate(
+                    llm,
+                    sampling_params=sampling_params,
+                    extra_evaluator_kwargs=extra_evaluator_kwargs,
+                )

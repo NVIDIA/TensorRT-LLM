@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .audio_asr import AudioASREvaluator
 from .cnn_dailymail import CnnDailymail
 from .json_mode_eval import JsonModeEval
 from .lm_eval import (GSM8K, MMMU, GPQADiamond, GPQAExtended, GPQAMain,
@@ -21,6 +22,15 @@ from .longbench_v2 import LongBenchV2
 from .mmlu import MMLU
 
 __all__ = [
-    "CnnDailymail", "MMLU", "GSM8K", "GPQADiamond", "GPQAMain", "GPQAExtended",
-    "JsonModeEval", "MMMU", "LongBenchV1", "LongBenchV2"
+    "CnnDailymail",
+    "MMLU",
+    "GSM8K",
+    "GPQADiamond",
+    "GPQAMain",
+    "GPQAExtended",
+    "JsonModeEval",
+    "MMMU",
+    "LongBenchV1",
+    "LongBenchV2",
+    "AudioASREvaluator",
 ]
