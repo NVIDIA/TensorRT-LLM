@@ -30,6 +30,7 @@
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <future>
@@ -253,7 +254,17 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             return bufferSizeForTarget;
         };
         auto bufferEleSizes = getBufferSizeForTarget();
-        auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend();
+        // RAII wrapper mirrors the receiver-side pattern. Happy-path calls
+        // sendHolder.release(); other exits auto-release via
+        // ~BufferIndexHolder. Send-pool CV wait observes the per-request
+        // cancel flag via the session's DataContext and throws on cancel
+        // (parity with recv side).
+        auto const sendReqIdForLog = std::make_optional(static_cast<uint64_t>(llmRequest.mRequestId));
+        auto const* sendCancelFlag = &session.getDataContext().getTransferTerminate();
+        auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend(
+            sendCancelFlag, kBufferAcquireSliceMs, sendReqIdForLog);
+        BufferIndexHolder sendHolder(
+            *mCacheTransBufferManagers[transferIndexerKCache], cacheBufferId, /*isRecv=*/false, sendReqIdForLog);
         auto result = mCacheTransBufferManagers[transferIndexerKCache]->getOrAllocateSendBuffers(
             cacheBufferId, static_cast<int>(pPDomainSize * cPDomainSize), bufferEleSizes, bufferManager);
         auto& outputSplitCaches = std::get<0>(result);
@@ -380,7 +391,8 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         {
             sendBufferFun(deviceId, pickUpConnections[0]);
         }
-        mCacheTransBufferManagers[transferIndexerKCache]->freeBufferIndexForSend(cacheBufferId);
+        // Atomic happy-path release — silent free + disarm in one noexcept call.
+        sendHolder.release();
     }
     session.setTime(TransferSession::kTimeTransmissions);
     session.setTime(TransferSession::kTimePostprocess);
