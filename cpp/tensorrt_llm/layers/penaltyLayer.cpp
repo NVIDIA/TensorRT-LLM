@@ -26,6 +26,7 @@
 #include "tensorrt_llm/runtime/common.h"
 
 #include <algorithm>
+#include <atomic>
 
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels;
@@ -195,6 +196,19 @@ void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorCo
     // the diagnostic in setup will catch that).
     mLogitsPostProcessorReturnsLogProbs
         |= penaltyParams->logitsPostProcessorReturnsLogProbs.value_or(false);
+    {
+        static std::atomic<bool> diagLogged{false};
+        bool expected = false;
+        if (diagLogged.compare_exchange_strong(expected, true))
+        {
+            TLLM_LOG_INFO(
+                "[LPP-DIAG] PenaltyLayer::setup: penaltyParams->logitsPostProcessorReturnsLogProbs=%d "
+                "(has_value=%d), member after sticky-OR=%d",
+                (int) penaltyParams->logitsPostProcessorReturnsLogProbs.value_or(false),
+                (int) penaltyParams->logitsPostProcessorReturnsLogProbs.has_value(),
+                (int) mLogitsPostProcessorReturnsLogProbs);
+        }
+    }
 
     if (mUseTemperature)
     {
@@ -379,6 +393,19 @@ void PenaltyLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& b
         biasSoftmaxParams.skipSoftMax = mLogitsPostProcessorReturnsLogProbs;
         biasSoftmaxParams.batchSlotsLogits = penaltyParams.batchSlots != nullptr;
         biasSoftmaxParams.checkParams();
+        {
+            static std::atomic<bool> diagLogged{false};
+            bool expected = false;
+            if (diagLogged.compare_exchange_strong(expected, true))
+            {
+                TLLM_LOG_INFO(
+                    "[LPP-DIAG] PenaltyLayer::forwardAsync (beam search): "
+                    "mLogitsPostProcessorReturnsLogProbs=%d, biasSoftmaxParams.skipSoftMax=%d, "
+                    "beamWidth=%d",
+                    (int) mLogitsPostProcessorReturnsLogProbs, (int) biasSoftmaxParams.skipSoftMax,
+                    (int) penaltyParams.beamWidth);
+            }
+        }
         invokeAddBiasSoftMax(biasSoftmaxParams, penaltyParams.stream);
     }
 

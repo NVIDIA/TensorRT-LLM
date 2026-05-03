@@ -68,6 +68,7 @@
 #include "tensorrt_llm/runtime/utils/runtimeUtils.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <memory>
@@ -497,6 +498,9 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     bool const logitsPostProcessorReturnsLogProbs
         = executorConfig.getLogitsPostProcessorConfig().has_value()
         && executorConfig.getLogitsPostProcessorConfig()->getReturnsLogProbs();
+    TLLM_LOG_INFO("[LPP-DIAG] TrtGptModelInflightBatching ctor: lppConfig.has_value=%d, returnsLogProbs=%d",
+        (int) executorConfig.getLogitsPostProcessorConfig().has_value(),
+        (int) logitsPostProcessorReturnsLogProbs);
     mCreateNewDecoderRequests = std::make_unique<CreateNewDecoderRequests>(
         mSpeculativeDecodingFastLogits, mIsLeaderInOrchMode, isNormalizeLogProbs(),
         logitsPostProcessorReturnsLogProbs);
@@ -1885,6 +1889,21 @@ void TrtGptModelInflightBatching::setupDecoderStep(
         if (localBatchSize > 0)
         {
             auto samplingConfig = SamplingConfig(samplingConfigs);
+            {
+                static std::atomic<bool> diagLogged{false};
+                bool expected = false;
+                if (diagLogged.compare_exchange_strong(expected, true))
+                {
+                    int firstReqHasFlag = samplingConfigs.empty()
+                        ? -1
+                        : (int) samplingConfigs.front().logitsPostProcessorReturnsLogProbs.value_or(false);
+                    TLLM_LOG_INFO(
+                        "[LPP-DIAG] setupDecoderStep: localBatchSize=%d, configs.front().logitsPostProcessor"
+                        "ReturnsLogProbs=%d, fused.logitsPostProcessorReturnsLogProbs=%d",
+                        (int) localBatchSize, firstReqHasFlag,
+                        (int) samplingConfig.logitsPostProcessorReturnsLogProbs.value_or(false));
+                }
+            }
             mDecoder->getUnderlyingDecoder().setup(samplingConfig, localBatchSize, batchSlots,
                 {mDecoderState->getJointDecodingOutput()}, mModelConfig.getDataType(), lookaheadPrompt,
                 lookaheadAlgoConfigs);

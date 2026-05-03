@@ -16,6 +16,8 @@
  */
 
 #include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
+
+#include <atomic>
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/medusaBuffers.h"
@@ -665,6 +667,18 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
         if (mLogitsPostProcessorReturnsLogProbs)
         {
             llmReq->mSamplingConfig.logitsPostProcessorReturnsLogProbs = true;
+        }
+        {
+            static std::atomic<bool> diagLogged{false};
+            bool expected = false;
+            if (diagLogged.compare_exchange_strong(expected, true))
+            {
+                TLLM_LOG_INFO(
+                    "[LPP-DIAG] CreateNewDecoderRequests: mLogitsPostProcessorReturnsLogProbs=%d, "
+                    "req=%lu → mSamplingConfig.logitsPostProcessorReturnsLogProbs=%d",
+                    (int) mLogitsPostProcessorReturnsLogProbs, (unsigned long) llmReq->mRequestId,
+                    (int) llmReq->mSamplingConfig.logitsPostProcessorReturnsLogProbs.value_or(false));
+            }
         }
 
         TLLM_CHECK(llmReq->mSeqSlot.has_value());
