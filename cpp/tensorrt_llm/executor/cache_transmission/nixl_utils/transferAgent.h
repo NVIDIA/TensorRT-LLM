@@ -63,10 +63,13 @@ class NixlTransferStatus final : public TransferStatus
 {
 public:
     NixlTransferStatus(nixlAgent* agent, nixlXferReqH* handle);
+    ~NixlTransferStatus() override;
 
     [[nodiscard]] bool isCompleted() const override;
 
     [[nodiscard]] TransferState wait(int64_t timeout_ms = -1) const override;
+
+    [[nodiscard]] bool release() override;
 
 private:
     nixlAgent* mRawAgent{};
