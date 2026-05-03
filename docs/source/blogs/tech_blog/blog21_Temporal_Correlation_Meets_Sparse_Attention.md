@@ -273,6 +273,8 @@ llm = LLM(
 
 The current GVR implementation supports `index_topk=2048`. Support for `index_topk=512` and `index_topk=1024` is planned but not enabled yet, so those configurations continue to use the production insertion/radix Top-K path.
 
+Looking ahead, DeepSeek V4-style DSA workloads are expected to make this extension more important: the indexer Top-K can move to smaller `index_topk` settings such as 512 or 1024 while still operating over long decode-time sequences. GVR Top-K is being extended to cover those configurations so the same temporal-correlation idea can accelerate both today's `2048`-wide selector and upcoming smaller-K long-context selectors.
+
 Pass that config with the usual DSA deployment flow, for example:
 
 ```bash
@@ -501,4 +503,4 @@ In DeepSeek Sparse Attention decode, the previous step's Top-K is exactly such a
 - lowers synchronization overhead in candidate collection,
 - and still preserves exact Top-K outputs.
 
-That combination is what makes GVR interesting: it is not an approximate pruning trick and it is not just a micro-optimization of radix select. It is a workload-aware exact algorithm that fits naturally into TensorRT-LLM's DSA path and converts temporal stability into real operator-level and end-to-end gains.
+That combination is what makes GVR interesting: it is not an approximate pruning trick and it is not just a micro-optimization of radix select. It is a workload-aware exact algorithm that fits naturally into TensorRT-LLM's DSA path and converts temporal stability into real operator-level and end-to-end gains. As DSA-style models evolve toward long-sequence `index_topk=512/1024` use cases, the same GVR Top-K direction is expected to remain useful beyond the current `index_topk=2048` deployment.
