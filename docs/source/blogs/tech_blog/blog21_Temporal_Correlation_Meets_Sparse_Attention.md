@@ -481,7 +481,7 @@ trtllm-bench -m deepseek-ai/DeepSeek-V3.2-Exp \
     --concurrency 1 \
     --warmup 2 \
     --streaming \
-    --extra_llm_api_options <config.yml> \
+    --config <config.yml> \
     --num_requests 5
 ```
 
