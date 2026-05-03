@@ -26,6 +26,36 @@
 namespace tensorrt_llm::batch_manager
 {
 
+void BufferIndexHolder::release() noexcept
+{
+    // Happy-path release: frees the slot and disarms the holder in one
+    // noexcept call. Used in place of an older detach() + explicit
+    // freeBufferIndex*() sequence so a throw between the two calls cannot
+    // leave the holder in a partially-released state.
+    if (!mHeld || mMgr == nullptr)
+    {
+        return;
+    }
+    try
+    {
+        if (mIsRecv)
+        {
+            mMgr->freeBufferIndexForRecv(mIndex);
+        }
+        else
+        {
+            mMgr->freeBufferIndexForSend(mIndex);
+        }
+    }
+    catch (...)
+    {
+        // Swallow; the destructor must be noexcept and any exit path that
+        // failed to release explicitly relies on this fallback to free the
+        // slot.
+    }
+    mHeld = false;
+}
+
 BaseTransBufferManager::BaseTransBufferManager(
     size_t transferBufferSize, nvinfer1::DataType dataType, std::optional<size_t> maxNumTokens)
     : mDataType{dataType}
@@ -54,9 +84,11 @@ BaseTransBufferManager::BaseTransBufferManager(
     allocateBuffer();
 }
 
-std::optional<int> BaseTransBufferManager::assignBufferIndexForSend()
+std::optional<int> BaseTransBufferManager::assignBufferIndexForSend(
+    std::atomic<bool> const* perRequestCancel, int64_t waitSliceMs, std::optional<uint64_t> requestIdForLog)
 {
-    return assignBufferIndex(mConcurrenceSendResource, mSendBufferCount, mOnlyUseDynamicBuffer);
+    return assignBufferIndex(mConcurrenceSendResource, mSendBufferCount, mOnlyUseDynamicBuffer, perRequestCancel,
+        waitSliceMs, requestIdForLog);
 }
 
 void BaseTransBufferManager::freeBufferIndexForSend(std::optional<int> bufferId)
@@ -64,9 +96,11 @@ void BaseTransBufferManager::freeBufferIndexForSend(std::optional<int> bufferId)
     freeBufferIndex(mConcurrenceSendResource, bufferId, mSendBufferCount, mOnlyUseDynamicBuffer);
 }
 
-std::optional<int> BaseTransBufferManager::assignBufferIndexForRecv()
+std::optional<int> BaseTransBufferManager::assignBufferIndexForRecv(
+    std::atomic<bool> const* perRequestCancel, int64_t waitSliceMs, std::optional<uint64_t> requestIdForLog)
 {
-    return assignBufferIndex(mConcurrenceRecvResource, mRecvBufferCount, mOnlyUseDynamicBuffer);
+    return assignBufferIndex(mConcurrenceRecvResource, mRecvBufferCount, mOnlyUseDynamicBuffer, perRequestCancel,
+        waitSliceMs, requestIdForLog);
 }
 
 void BaseTransBufferManager::freeBufferIndexForRecv(std::optional<int> bufferId)
@@ -225,16 +259,35 @@ void BaseTransBufferManager::allocateBuffer()
     }
 }
 
-std::optional<int> BaseTransBufferManager::assignBufferIndex(
-    ConcurrenceResource& resource, size_t bufferCount, bool onlyUseDynamicBuffer)
+std::optional<int> BaseTransBufferManager::assignBufferIndex(ConcurrenceResource& resource, size_t bufferCount,
+    bool onlyUseDynamicBuffer, std::atomic<bool> const* perRequestCancel, int64_t waitSliceMs,
+    std::optional<uint64_t> requestIdForLog)
 {
     if (onlyUseDynamicBuffer)
     {
         return std::nullopt;
     }
+    // Bounded wait_for loop so a cancel fired on this request while parked
+    // here can interrupt the wait via the per-request cancel atomic, and so
+    // mTerminate (flipped between slices) keeps the drain worker responsive
+    // to shutdown.
     std::unique_lock lk(resource.mBuffersMutex);
-    resource.mBuffersCV.wait(
-        lk, [&resource, bufferCount]() { return static_cast<size_t>(resource.mConcurrence) < bufferCount; });
+    auto const predicate
+        = [&resource, bufferCount]() { return static_cast<size_t>(resource.mConcurrence) < bufferCount; };
+    if (!predicate())
+    {
+        auto const slice = std::chrono::milliseconds{waitSliceMs};
+        while (!predicate())
+        {
+            resource.mBuffersCV.wait_for(lk, slice);
+            if (perRequestCancel != nullptr && perRequestCancel->load(std::memory_order_relaxed))
+            {
+                auto const reqIdStr
+                    = requestIdForLog.has_value() ? std::to_string(requestIdForLog.value()) : std::string{"?"};
+                TLLM_THROW("assignBufferIndex cancelled via perRequestCancel (reqId=%s)", reqIdStr.c_str());
+            }
+        }
+    }
     int bufferId = -1;
     for (size_t i = 0; i < bufferCount; i++)
     {
