@@ -175,7 +175,8 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
     // subclass type is not directly registered (e.g., agents created via factory).
     nb::class_<kvc::TransferStatus>(m, "TransferStatus")
         .def("is_completed", &kvc::TransferStatus::isCompleted, nb::call_guard<nb::gil_scoped_release>())
-        .def("wait", &kvc::TransferStatus::wait, nb::arg("timeout_ms") = -1, nb::call_guard<nb::gil_scoped_release>());
+        .def("wait", &kvc::TransferStatus::wait, nb::arg("timeout_ms") = -1, nb::call_guard<nb::gil_scoped_release>())
+        .def("release", &kvc::TransferStatus::release, nb::call_guard<nb::gil_scoped_release>());
 
     // BaseAgentConfig struct
     nb::class_<kvc::BaseAgentConfig>(m, "BaseAgentConfig")
@@ -228,7 +229,8 @@ NB_MODULE(tensorrt_llm_transfer_agent_binding, m)
     nb::class_<kvc::NixlTransferStatus, kvc::TransferStatus>(m, "NixlTransferStatus")
         .def("is_completed", &kvc::NixlTransferStatus::isCompleted, nb::call_guard<nb::gil_scoped_release>())
         .def("wait", &kvc::NixlTransferStatus::wait, nb::arg("timeout_ms") = -1,
-            nb::call_guard<nb::gil_scoped_release>());
+            nb::call_guard<nb::gil_scoped_release>())
+        .def("release", &kvc::NixlTransferStatus::release, nb::call_guard<nb::gil_scoped_release>());
 
     // NixlTransferAgent class
     nb::class_<kvc::NixlTransferAgent, kvc::BaseTransferAgent>(m, "NixlTransferAgent")
