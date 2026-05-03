@@ -26,6 +26,14 @@ class NixlTransferStatus(TransferStatus):
         status = TransferState(self.agent.check_xfer_state(self.handle))
         return status == TransferState.DONE
 
+    def release(self):
+        try:
+            self.handle.release()
+            return True
+        except Exception:
+            logger.exception("Failed to release NIXL transfer handle (agent=%s).", self.agent.name)
+            return False
+
     def wait(self, timeout_ms=None):
         start_time = time.time()
         status = TransferState.PENDING

@@ -34,6 +34,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <future>
@@ -63,7 +64,6 @@ void sendBuffer(TransferSession& session, int deviceId, size_t localIdx,
     executor::kv_cache::TargetRanksInfo const& targetInfo, std::vector<size_t> const& pickUpConnections)
 {
     size_t connIdx = pickUpConnections[localIdx];
-    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " send localIdx: %ld connIdx: %ld", localIdx, connIdx);
     NVTX3_SCOPED_RANGE(sendBuffer);
     TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
     TLLM_CHECK(session.getConnections().size() > (connIdx / targetInfo.mPeerDupHeadFactor));
@@ -76,11 +76,7 @@ void sendBuffer(TransferSession& session, int deviceId, size_t localIdx,
 
     if (bufferIdx < bufferCoverTargetNum)
     {
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " send connIdx: %ld bufferIdx: %ld size:%ld", connIdx,
-            bufferIdx, outputBuffers[bufferIdx]->getSizeInBytes());
         session.send(connIdx, outputBuffers[bufferIdx]->data(), outputBuffers[bufferIdx]->getSizeInBytes());
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " end send connIdx: %ld bufferIdx: %ld size:%ld", connIdx,
-            bufferIdx, outputBuffers[bufferIdx]->getSizeInBytes());
     }
     else
     {
@@ -494,7 +490,17 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         // cache blocks to the corresponding buffer.
         // 5. send the buffer to the corresponding target. Ideally, we send only once (one buffer) for each target.
 
-        auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
+        // RAII wrapper mirrors the receiver-side pattern. Happy-path calls
+        // sendHolder.release() after sendAllBuffers returns; any other exit
+        // between acquire and release auto-releases via ~BufferIndexHolder.
+        // The send-pool CV wait inside assignBufferIndexForSend observes the
+        // session's per-request cancel flag and throws on cancel (parity
+        // with the recv side).
+        auto const sendReqIdForLog = std::make_optional(static_cast<uint64_t>(llmRequest.mRequestId));
+        auto const* sendCancelFlag = &session.getDataContext().getTransferTerminate();
+        auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend(
+            sendCancelFlag, kBufferAcquireSliceMs, sendReqIdForLog);
+        BufferIndexHolder sendHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/false, sendReqIdForLog);
         int peerDuplicateHeadFactor = targetInfo.mPeerDupHeadFactor;
         auto bufferTargetNum = targetNum / peerDuplicateHeadFactor;
         auto ppRank = selfIdx
@@ -576,9 +582,12 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         sendAllBuffers(session, deviceId, outputSplitCaches, bufferCoverTargetNum, preAllocSendBuffer, bufferManager,
             targetInfo, pickUpConnections);
 
+        // Happy-path release — frees the slot and disarms the holder in
+        // one noexcept call. Placed immediately after sendAllBuffers so any
+        // subsequent throw (e.g. from setTime) does not turn a non-leak into
+        // a destructor-driven release.
+        sendHolder.release();
         session.setTime(TransferSession::kTimeTransmissions);
-
-        mCacheTransBufferManager->freeBufferIndexForSend(cacheBufferId);
         session.setTime(TransferSession::kTimePostprocess);
     }
     TLLM_LOG_DEBUG(
