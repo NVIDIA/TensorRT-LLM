@@ -1,4 +1,5 @@
 import operator
+from contextlib import contextmanager
 from unittest.mock import MagicMock
 
 import pytest
@@ -12,13 +13,14 @@ from _model_test_utils import (
 from pydantic import ValidationError
 from torch.fx import Graph, GraphModule
 
+from tensorrt_llm._torch.auto_deploy.compile import piecewise_runner as piecewise_runner_mod
 from tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph import (
     CapturedGraph,
     DualModeCapturedGraph,
     PiecewiseCapturedGraph,
     _args_kwargs_flatten_spec,
 )
-from tensorrt_llm._torch.auto_deploy.compile.piecewise_runner import ADPiecewiseRunner
+from tensorrt_llm._torch.auto_deploy.compile.piecewise_runner import ADPiecewiseRunner, OutputInfo
 from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import submod_has_cuda_ops
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
@@ -609,6 +611,61 @@ class TestPiecewiseCapturedGraphStaticInputBuffers:
         assert copied.data_ptr() == static_buffer.data_ptr()
         assert copied is static_buffer
         assert torch.equal(copied, src)
+
+
+# ============================================================================
+# Tests for ADPiecewiseRunner capture-time output liveness
+# ============================================================================
+
+
+class TestADPiecewiseRunnerCapture:
+    """Tests for dynamic output buffers allocated during runner capture."""
+
+    def test_dynamic_out_buf_stays_strong_until_capture_finalized(self, monkeypatch):
+        @contextmanager
+        def fake_cuda_graph(*args, **kwargs):
+            yield
+
+        class FakeCudaGraph:
+            def pool(self):
+                return ("fake-pool",)
+
+        def fake_make_weak_ref(value):
+            if isinstance(value, torch.Tensor):
+                return ("weak", value.data_ptr())
+            return value
+
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+        monkeypatch.setattr(torch.cuda, "CUDAGraph", FakeCudaGraph)
+        monkeypatch.setattr(torch.cuda, "graph", fake_cuda_graph)
+        monkeypatch.setattr(piecewise_runner_mod, "make_weak_ref", fake_make_weak_ref)
+
+        runner = ADPiecewiseRunner(nn.Identity())
+        runner.set_dynamic_out_info(
+            7,
+            OutputInfo(
+                shape=torch.Size([8, 4]),
+                dtype=torch.float32,
+                device=torch.device("cpu"),
+            ),
+        )
+
+        ADPiecewiseRunner.set_current_phase("capture")
+        ADPiecewiseRunner.set_current_num_tokens(8)
+        try:
+            runner(torch.zeros(8, 4))
+        finally:
+            ADPiecewiseRunner.set_current_phase("replay")
+            ADPiecewiseRunner.set_current_num_tokens(None)
+
+        entry = runner.entries[8]
+        out_buf = entry.dynamic_out_bufs[7]
+        assert isinstance(out_buf, torch.Tensor)
+
+        ptr = out_buf.data_ptr()
+        runner.finalize_capture(8)
+
+        assert entry.dynamic_out_bufs[7] == ("weak", ptr)
 
 
 # ============================================================================
