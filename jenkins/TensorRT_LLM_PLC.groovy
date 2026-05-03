@@ -219,10 +219,8 @@ def pulseScanSourceCode(llmRepo, ref) {
                     withEnv([
                         "PULSE_NSPECT_ID=NSPECT-95LK-6FZF",
                         "PULSE_BEARER_TOKEN=${token}",
-                        //"PULSE_REPO_URL=${llmRepo}",
-                        //"PULSE_REPO_BRANCH=${(params.repoUrlKey == "github_fork") ? "" : ref}",
-                        "PULSE_REPO_URL=https://github.com/NVIDIA/TensorRT-LLM.git",
-                        "PULSE_REPO_BRANCH=main",
+                        "PULSE_REPO_URL=${llmRepo}",
+                        "PULSE_REPO_BRANCH=${(params.repoUrlKey == "github_fork") ? "" : ref}",
                         "PULSE_SCAN_PROJECT=TRT-LLM",
                         "PULSE_SCAN_PROJECT_VERSION=${version}",
                         "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json",
@@ -404,7 +402,7 @@ pipeline {
                 stage("Source Code OSS Scanning") {
                     steps {
                         script {
-                            //generateLockFiles(env.LLM_REPO, env.REF)
+                            generateLockFiles(env.LLM_REPO, env.REF)
                             pulseScanSourceCode(env.LLM_REPO, env.REF)
                         }
                     }

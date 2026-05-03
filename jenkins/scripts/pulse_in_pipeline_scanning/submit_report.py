@@ -122,7 +122,7 @@ def submit_source_code_licenses(
             for lid, perm in permissiveness.items()
             if not perm
             for c in license_to_components[lid]
-        }
+        } | {c.get("name") for c in license_to_components.get("", [])}
 
         for component in components:
             package_name = component.get("name")
