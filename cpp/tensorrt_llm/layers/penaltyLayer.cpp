@@ -185,6 +185,17 @@ void PenaltyLayer<T>::setup(SizeType32 batchSize, SizeType32 beamWidth, TensorCo
     mUseMinLength |= useMinLength;
     mUsePromptIgnoreLength |= usePromptIgnoreLength;
 
+    // Sticky OR: once any setup pass requests log-prob mode for the
+    // LogitsPostProcessor, keep it on. The flag controls a per-batch kernel
+    // gate (skipSoftMax in addBiasSoftMax) so it is safe to leave enabled
+    // even for setup batches whose own requests don't carry the flag — the
+    // skipped softmax is exactly what users with the flag set want, and
+    // batches without the flag have already applied log_softmax themselves
+    // inside their post-processor (otherwise validity would be broken, and
+    // the diagnostic in setup will catch that).
+    mLogitsPostProcessorReturnsLogProbs
+        |= penaltyParams->logitsPostProcessorReturnsLogProbs.value_or(false);
+
     if (mUseTemperature)
     {
         fillBuffers(penaltyParams->temperature, DefaultDecodingParams::getTemperature(), mTemperature,
@@ -344,6 +355,17 @@ void PenaltyLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& b
     if (penaltyParams.beamWidth > 1)
     {
         // Convert logits into logProbs before penalties, only necessary in Beam-Search.
+        //
+        // Gating: when the user's LogitsPostProcessor has already produced
+        // full-vocab log-probs (mLogitsPostProcessorReturnsLogProbs == true,
+        // signalled via ExecutorConfig::LogitsPostProcessorConfig::returnsLogProbs),
+        // we MUST NOT apply log_softmax again. The kernel is shift-invariant in
+        // the values it sees within the support of finite entries: another
+        // log_softmax over {log P_full(t), -inf} would renormalize back to
+        // log P_constrained(t) and we'd be back to the constrained-scoring bug
+        // this flag exists to fix. We still invoke addBiasSoftMax so the bias /
+        // temperature / finished-beam / padded-vocab handling runs uniformly;
+        // skipSoftMax just gates the softmax block at the tail of the kernel.
         BiasSoftmaxParams<T> biasSoftmaxParams;
         biasSoftmaxParams.logitsPtrs = const_cast<T**>(penaltyParams.inputLogits);
         biasSoftmaxParams.bias = penaltyParams.biases;
@@ -354,7 +376,7 @@ void PenaltyLayer<T>::forwardAsync(std::shared_ptr<BaseDecodingOutputs> const& b
         biasSoftmaxParams.maxBeamWidth = penaltyParams.beamWidth;
         biasSoftmaxParams.vocabSize = penaltyParams.vocabSize;
         biasSoftmaxParams.vocabSizePadded = penaltyParams.vocabSizePadded;
-        biasSoftmaxParams.skipSoftMax = false;
+        biasSoftmaxParams.skipSoftMax = mLogitsPostProcessorReturnsLogProbs;
         biasSoftmaxParams.batchSlotsLogits = penaltyParams.batchSlots != nullptr;
         biasSoftmaxParams.checkParams();
         invokeAddBiasSoftMax(biasSoftmaxParams, penaltyParams.stream);

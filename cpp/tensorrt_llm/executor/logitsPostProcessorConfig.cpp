@@ -21,10 +21,11 @@ namespace tensorrt_llm::executor
 {
 
 LogitsPostProcessorConfig::LogitsPostProcessorConfig(std::optional<LogitsPostProcessorMap> processorMap,
-    std::optional<LogitsPostProcessorBatched> processorBatched, bool replicate)
+    std::optional<LogitsPostProcessorBatched> processorBatched, bool replicate, bool returnsLogProbs)
     : mProcessorMap(std::move(processorMap))
     , mProcessorBatched(std::move(processorBatched))
     , mReplicate(replicate)
+    , mReturnsLogProbs(returnsLogProbs)
 {
 }
 
@@ -43,6 +44,11 @@ bool LogitsPostProcessorConfig::getReplicate() const
     return mReplicate;
 }
 
+bool LogitsPostProcessorConfig::getReturnsLogProbs() const
+{
+    return mReturnsLogProbs;
+}
+
 void LogitsPostProcessorConfig::setProcessorMap(LogitsPostProcessorMap const& processorMap)
 {
     mProcessorMap = processorMap;
@@ -56,6 +62,11 @@ void LogitsPostProcessorConfig::setProcessorBatched(LogitsPostProcessorBatched c
 void LogitsPostProcessorConfig::setReplicate(bool replicate)
 {
     mReplicate = replicate;
+}
+
+void LogitsPostProcessorConfig::setReturnsLogProbs(bool returnsLogProbs)
+{
+    mReturnsLogProbs = returnsLogProbs;
 }
 
 } // namespace tensorrt_llm::executor

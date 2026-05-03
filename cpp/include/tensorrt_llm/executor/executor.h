@@ -1458,15 +1458,18 @@ class LogitsPostProcessorConfig
 {
 public:
     explicit LogitsPostProcessorConfig(std::optional<LogitsPostProcessorMap> processorMap = std::nullopt,
-        std::optional<LogitsPostProcessorBatched> processorBatched = std::nullopt, bool replicate = true);
+        std::optional<LogitsPostProcessorBatched> processorBatched = std::nullopt, bool replicate = true,
+        bool returnsLogProbs = false);
 
     [[nodiscard]] std::optional<LogitsPostProcessorMap> getProcessorMap() const;
     [[nodiscard]] std::optional<LogitsPostProcessorBatched> getProcessorBatched() const;
     [[nodiscard]] bool getReplicate() const;
+    [[nodiscard]] bool getReturnsLogProbs() const;
 
     void setProcessorMap(LogitsPostProcessorMap const& processorMap);
     void setProcessorBatched(LogitsPostProcessorBatched const& processorBatched);
     void setReplicate(bool replicate);
+    void setReturnsLogProbs(bool returnsLogProbs);
 
 private:
     /// @brief mapping from post processor names to non-batched post processors
@@ -1475,6 +1478,16 @@ private:
     std::optional<LogitsPostProcessorBatched> mProcessorBatched;
     /// @brief If set to true, logits post processor will run on all TP ranks in last PP rank
     bool mReplicate;
+    /// @brief If true, the user-supplied LogitsPostProcessor returns full-vocab
+    /// log-probabilities (with -inf for masked-out positions) rather than raw
+    /// logits. In beam search mode, the runtime then skips the in-place
+    /// log_softmax that ``PenaltyLayer`` would otherwise apply to the
+    /// processor's output, so the values flow into ``BeamSearchLayer``
+    /// unchanged. This makes cumulative beam scores accumulate full-vocab
+    /// log-probs (matching HuggingFace ``model.generate()`` with a
+    /// ``LogitsProcessor``) instead of constrained log-probs renormalized
+    /// over the allowed set. Default false (current TRT-LLM behavior).
+    bool mReturnsLogProbs;
 };
 
 class CacheTransceiverConfig
