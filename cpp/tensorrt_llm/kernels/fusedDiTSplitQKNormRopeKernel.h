@@ -25,31 +25,31 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-// Fused RMSNorm + RoPE for a SINGLE Q or K tensor (DiT models, e.g. LTX-2).
+// Fused full-dim RMSNorm + RoPE for a SINGLE Q or K tensor (DiT models, e.g. LTX-2).
 //
 // Designed for SEPARATE_QKV layout: input is a contiguous 2D tensor
 // [num_tokens, num_heads * head_dim] (e.g. output of self.to_q / self.to_k).
-// One block per token, one warp per head (block_size = num_heads * 32, max 1024).
+// Block=256 with chunked reduce; cross-warp shared-memory sum² reduction over
+// the full inner dim (num_heads * head_dim).
 //
-// For FUSE_QKV layout (packed QKV buffer), use fusedDiTQKNormRopeKernel
-// (per-head or full-dim variant) instead — it processes Q+K in one launch.
+// For FUSE_QKV layout (packed QKV buffer), use fusedDiTQKNormFullDimRopeKernel
+// (full-dim variant in fusedDiTQKNormRopeKernel.h) -- it processes Q+K together
+// in one launch.
 //
-// Constraints (Phase 1):
-//   - full_dim_norm = true (LTX-2 only mode)
-//   - do_norm = true (norm + RoPE; do_norm=false will be added in Phase 2 for K-skip-norm)
-//   - num_heads ≤ 32 (so block_size ≤ 1024)
+// Constraints:
+//   - num_heads ≤ 32
 //   - head_dim ∈ {64, 128}
+//   - num_heads * head_dim ≤ 4096 (chunk count cap)
 
-void launchFusedDiTSplitNormRope(void* tensor, // [num_tokens, num_heads * head_dim], bf16, contiguous, in-place
+void launchFusedDiTSplitNormFullDimRope(void* tensor, // [num_tokens, num_heads * head_dim], bf16, contiguous, in-place
     int num_tokens, int num_heads,
-    int head_dim,                              // Must be 64 or 128
+    int head_dim,                                     // 64 or 128
     float eps,
-    void const* weight,                        // bf16, [num_heads * head_dim] when full_dim_norm=true
-    float const* cos_emb,                      // float32
-    float const* sin_emb,                      // float32
-    bool full_dim_norm, bool do_norm,
-    bool interleave,                           // true = pair (2i, 2i+1); false = rotate_half
-    bool per_head_cos,                         // false: cos shape [N, head_dim]; true: [N, num_heads*head_dim]
+    void const* weight,                               // bf16, [num_heads * head_dim] (full-dim norm weight)
+    float const* cos_emb,                             // float32
+    float const* sin_emb,                             // float32
+    bool interleave,                                  // true = pair (2i, 2i+1); false = rotate_half
+    bool per_head_cos,                                // false: cos shape [N, head_dim]; true: [N, num_heads*head_dim]
     cudaStream_t stream);
 
 } // namespace kernels

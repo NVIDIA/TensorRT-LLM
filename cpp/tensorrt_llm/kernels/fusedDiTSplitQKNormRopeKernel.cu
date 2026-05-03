@@ -29,178 +29,17 @@ namespace kernels
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
-// Split single-tensor RMSNorm + RoPE for DiT (LTX-2).
+// Fused full-dim RMSNorm + RoPE on a SINGLE Q or K tensor (DiT, e.g. LTX-2 cross-attn).
+// Layout: block=256 (8 warps), grid=(num_tokens,). Chunked reduce loop holds
+// only one chunk's data in registers at a time → ~32 regs/thread, 8 blocks/SM,
+// ~94% warps_active. Mirror of fusedDiTQKNormFullDimRopeKernel but for one tensor.
 //
-// Layout: 1 block = 1 (token), block_size = num_heads * 32, 1 warp = 1 head.
-// Each warp does its own warp-level reduce. For full_dim_norm, partial sums
-// are written to shared memory and a single warp does inter-warp reduce +
-// broadcasts the rms_rcp back via shared memory.
-//
-template <int HEAD_DIM, bool INTERLEAVE, bool FULL_DIM_NORM, bool DO_NORM>
-__global__ void fusedDiTSplitNormRopeKernel(__nv_bfloat16* tensor, int const num_tokens, int const num_heads,
-    float const eps, __nv_bfloat16 const* weight, float const* cos_emb, float const* sin_emb)
-{
-    int const tokenIdx = blockIdx.x;
-    int const warpId = threadIdx.x >> 5;
-    int const laneId = threadIdx.x & 31;
-
-    if (tokenIdx >= num_tokens)
-    {
-        return;
-    }
-
-    int const headIdx = warpId; // 1 warp == 1 head
-
-    static_assert(HEAD_DIM % (32 * 2) == 0, "head_dim must be divisible by 64");
-    constexpr int numElemsPerThread = HEAD_DIM / 32;
-    float elements[numElemsPerThread];
-    constexpr int elemSizeBytes = numElemsPerThread * sizeof(__nv_bfloat16);
-    static_assert(elemSizeBytes % 4 == 0, "elemSizeBytes must be a multiple of 4");
-    constexpr int vecSize = elemSizeBytes / 4;
-    using vec_T = typename tensorrt_llm::common::packed_as<uint, vecSize>::type;
-
-    // Contiguous SEPARATE_QKV input: row_stride = num_heads * head_dim.
-    int64_t const offsetWarp = static_cast<int64_t>(tokenIdx) * num_heads * HEAD_DIM + headIdx * HEAD_DIM;
-    int64_t const offsetThread = offsetWarp + laneId * numElemsPerThread;
-
-    // ---- Step 1: Load + sum_of_squares ----
-    float sumOfSquares = 0.0f;
-    {
-        vec_T vec = *reinterpret_cast<vec_T const*>(&tensor[offsetThread]);
-        for (int i = 0; i < vecSize; i++)
-        {
-            float2 vals = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<uint*>(&vec) + i));
-            sumOfSquares += vals.x * vals.x;
-            sumOfSquares += vals.y * vals.y;
-            elements[2 * i] = vals.x;
-            elements[2 * i + 1] = vals.y;
-        }
-    }
-
-    // ---- Step 2: RMS normalization ----
-    // Shared memory used by the full-dim path; declared at function scope so
-    // its lifetime is unambiguous regardless of constexpr branching.
-    __shared__ float warp_sums[32];
-    __shared__ float shared_rms_rcp;
-
-    if constexpr (DO_NORM)
-    {
-        float rms_rcp;
-
-        if constexpr (FULL_DIM_NORM)
-        {
-            // 1) Warp-level reduce (per head)
-            sumOfSquares = tensorrt_llm::common::warpReduceSum(sumOfSquares);
-            // 2) Cross-warp reduce via shared memory
-            if (laneId == 0)
-            {
-                warp_sums[warpId] = sumOfSquares;
-            }
-            __syncthreads();
-            if (warpId == 0)
-            {
-                float v = (laneId < num_heads) ? warp_sums[laneId] : 0.f;
-                v = tensorrt_llm::common::warpReduceSum(v);
-                if (laneId == 0)
-                {
-                    float const norm_dim = static_cast<float>(num_heads) * static_cast<float>(HEAD_DIM);
-                    shared_rms_rcp = rsqrtf(v / norm_dim + eps);
-                }
-            }
-            __syncthreads();
-            rms_rcp = shared_rms_rcp;
-        }
-        else
-        {
-            // Per-head: just warp reduce
-            sumOfSquares = tensorrt_llm::common::warpReduceSum(sumOfSquares);
-            rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(HEAD_DIM) + eps);
-        }
-
-        // Apply weight + scale
-        for (int i = 0; i < numElemsPerThread; i++)
-        {
-            int const dim = laneId * numElemsPerThread + i;
-            int const weight_offset = FULL_DIM_NORM ? (headIdx * HEAD_DIM + dim) : dim;
-            float const w = __bfloat162float(weight[weight_offset]);
-            elements[i] *= rms_rcp * w;
-        }
-    }
-
-    // ---- Step 3: Apply RoPE ----
-    int64_t const embOffset = static_cast<int64_t>(tokenIdx) * HEAD_DIM;
-
-    if constexpr (INTERLEAVE)
-    {
-        // Pair (2i, 2i+1) — neighbor pairing (LTX-2 INTERLEAVED mode)
-        for (int i = 0; i < numElemsPerThread; i += 2)
-        {
-            int const dim = laneId * numElemsPerThread + i;
-            float const cos0 = cos_emb[embOffset + dim];
-            float const sin0 = sin_emb[embOffset + dim];
-            float const cos1 = cos_emb[embOffset + dim + 1];
-            float const sin1 = sin_emb[embOffset + dim + 1];
-
-            float const x = elements[i];
-            float const y = elements[i + 1];
-
-            elements[i] = x * cos0 + (-y) * sin0;
-            elements[i + 1] = y * cos1 + x * sin1;
-        }
-    }
-    else
-    {
-        // rotate_half via __shfl_xor_sync(pairOffset=16): each lane's partner
-        // element at offset HEAD_DIM/2 lives in (HEAD_DIM/2)/numElemsPerThread = 16 lanes away.
-        __syncwarp();
-        constexpr int pairOffset = 16;
-
-        float partner[numElemsPerThread];
-        for (int i = 0; i < numElemsPerThread; i++)
-        {
-            partner[i] = __shfl_xor_sync(0xffffffff, elements[i], pairOffset);
-            if (laneId < pairOffset)
-            {
-                partner[i] = -partner[i];
-            }
-        }
-        __syncwarp();
-
-        for (int i = 0; i < numElemsPerThread; i++)
-        {
-            int const dim = laneId * numElemsPerThread + i;
-            float const cos_val = cos_emb[embOffset + dim];
-            float const sin_val = sin_emb[embOffset + dim];
-            elements[i] = elements[i] * cos_val + partner[i] * sin_val;
-        }
-    }
-
-    // ---- Step 4: Store ----
-    {
-        vec_T vec;
-        for (int i = 0; i < vecSize; i++)
-        {
-            __nv_bfloat162 vals = __float22bfloat162_rn(make_float2(elements[2 * i], elements[2 * i + 1]));
-            reinterpret_cast<__nv_bfloat162&>(*(reinterpret_cast<uint*>(&vec) + i)) = vals;
-        }
-        vec_T* outputPtr = reinterpret_cast<vec_T*>(&tensor[offsetThread]);
-        *outputPtr = vec;
-    }
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-//
-// Inductor-style full-dim split kernel (LTX-2 INTERLEAVE only):
-// block=256 (8 warps), grid=(num_tokens,). One block per token.
-// Chunked reduce loop holds only one chunk's data in registers at a time
-// → ~32 regs/thread, 8 blocks/SM, ~94% warps_active.
-// Mirror of fusedDiTQKNormRopeFullDimKernelInductorLike but for one tensor (Q xor K).
-
 // PER_HEAD_COS=false: cos/sin shape [num_tokens, HEAD_DIM] (FLUX-style, head broadcast).
 // PER_HEAD_COS=true:  cos/sin shape [num_tokens, num_heads * HEAD_DIM] (LTX-2 3D RoPE).
 template <int HEAD_DIM, bool INTERLEAVE, bool PER_HEAD_COS>
-__global__ void fusedDiTSplitNormRopeKernelInductorLike(__nv_bfloat16* tensor, int const num_tokens,
-    int const num_heads, float const eps, __nv_bfloat16 const* weight, float const* cos_emb, float const* sin_emb)
+__global__ void fusedDiTSplitNormFullDimRopeKernel(__nv_bfloat16* __restrict__ tensor, int const num_tokens,
+    int const num_heads, float const eps, __nv_bfloat16 const* __restrict__ weight, float const* __restrict__ cos_emb,
+    float const* __restrict__ sin_emb)
 {
     constexpr int BLOCK_SIZE = 256;
     constexpr int N_WARPS = BLOCK_SIZE / 32;                    // 8
@@ -271,11 +110,30 @@ __global__ void fusedDiTSplitNormRopeKernelInductorLike(__nv_bfloat16* tensor, i
         for (int i = 0; i < CHUNK_ELEMS; i++)
             w_vals[i] = __bfloat162float(weight[headIdx * HEAD_DIM + baseDim + i]);
         int const cosHeadOff = PER_HEAD_COS ? headIdx * HEAD_DIM : 0;
-#pragma unroll
-        for (int i = 0; i < CHUNK_ELEMS; i++)
+        // Force 128-bit vectorized loads — 8 scalar loads → 2 LDG.128 per array,
+        // halves L1 transactions for cos/sin (major bottleneck with chunked layout).
+        static_assert(CHUNK_ELEMS == 8, "CHUNK_ELEMS=8 required for float4×2 vectorization");
         {
-            cos_vals[i] = cos_emb[embBase + cosHeadOff + baseDim + i];
-            sin_vals[i] = sin_emb[embBase + cosHeadOff + baseDim + i];
+            float4 const* cos_v = reinterpret_cast<float4 const*>(&cos_emb[embBase + cosHeadOff + baseDim]);
+            float4 const* sin_v = reinterpret_cast<float4 const*>(&sin_emb[embBase + cosHeadOff + baseDim]);
+            float4 c0 = cos_v[0], c1 = cos_v[1];
+            float4 s0 = sin_v[0], s1 = sin_v[1];
+            cos_vals[0] = c0.x;
+            cos_vals[1] = c0.y;
+            cos_vals[2] = c0.z;
+            cos_vals[3] = c0.w;
+            cos_vals[4] = c1.x;
+            cos_vals[5] = c1.y;
+            cos_vals[6] = c1.z;
+            cos_vals[7] = c1.w;
+            sin_vals[0] = s0.x;
+            sin_vals[1] = s0.y;
+            sin_vals[2] = s0.z;
+            sin_vals[3] = s0.w;
+            sin_vals[4] = s1.x;
+            sin_vals[5] = s1.y;
+            sin_vals[6] = s1.z;
+            sin_vals[7] = s1.w;
         }
 
         float elements[CHUNK_ELEMS];
@@ -302,6 +160,23 @@ __global__ void fusedDiTSplitNormRopeKernelInductorLike(__nv_bfloat16* tensor, i
                 elements[i + 1] = y * cos_vals[i + 1] + x * sin_vals[i + 1];
             }
         }
+        else
+        {
+            // rotate-half: partner element at +HEAD_DIM/2 within the same head.
+            // Inline partner exchange (single reg `p` per iter, no array).
+            constexpr int xor_mask = HEAD_DIM / 16;
+            bool const negate = ((laneId & xor_mask) == 0);
+#pragma unroll
+            for (int i = 0; i < CHUNK_ELEMS; i++)
+            {
+                float p = __shfl_xor_sync(0xffffffff, elements[i], xor_mask);
+                if (negate)
+                {
+                    p = -p;
+                }
+                elements[i] = elements[i] * cos_vals[i] + p * sin_vals[i];
+            }
+        }
 
         uint4 out_vec;
         uint* o_uints = reinterpret_cast<uint*>(&out_vec);
@@ -321,98 +196,56 @@ __global__ void fusedDiTSplitNormRopeKernelInductorLike(__nv_bfloat16* tensor, i
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void launchFusedDiTSplitNormRope(void* tensor, int num_tokens, int num_heads, int head_dim, float eps,
-    void const* weight, float const* cos_emb, float const* sin_emb, bool full_dim_norm, bool do_norm, bool interleave,
-    bool per_head_cos, cudaStream_t stream)
+void launchFusedDiTSplitNormFullDimRope(void* tensor, int num_tokens, int num_heads, int head_dim, float eps,
+    void const* weight, float const* cos_emb, float const* sin_emb, bool interleave, bool per_head_cos,
+    cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(num_heads <= 32,
-        "fusedDiTSplitNormRope: num_heads (%d) must be <= 32 (block_size = num_heads*32 <= 1024)", num_heads);
-    TLLM_CHECK_WITH_INFO(num_heads >= 1, "fusedDiTSplitNormRope: num_heads must be >= 1, got %d", num_heads);
+        "fusedDiTSplitNormFullDimRope: num_heads (%d) must be <= 32 (block_size = num_heads*32 <= 1024)", num_heads);
+    TLLM_CHECK_WITH_INFO(num_heads >= 1, "fusedDiTSplitNormFullDimRope: num_heads must be >= 1, got %d", num_heads);
 
-    // do_norm=false (K-skip-norm for AV cross-attn) is Phase 2 work.
-    TLLM_CHECK_WITH_INFO(do_norm, "fusedDiTSplitNormRope: do_norm=false not yet supported");
-
-    // Dispatch:
-    //   full_dim_norm + interleave  → InductorLike (block=256, chunked, Q-or-K)
-    //                                  templated on per_head_cos.
-    //   full_dim_norm + rotate_half → 32-warp template (cross-warp shfl partner)
-    //   per_head     (any RoPE)     → 32-warp template, warp-only reduce.
-    if (full_dim_norm && interleave)
-    {
-        dim3 const gridDim(num_tokens);
-        dim3 const blockDim(256);
-        cudaLaunchConfig_t cfg = {};
-        cfg.gridDim = gridDim;
-        cfg.blockDim = blockDim;
-        cfg.dynamicSmemBytes = 0;
-        cfg.stream = stream;
-        cudaLaunchAttribute attrs[1] = {};
-        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = 1;
-        cfg.attrs = attrs;
-        cfg.numAttrs = 1;
-#define LAUNCH_INDUCTOR_LIKE(HEAD_DIM, PER_HEAD)                                                                       \
-    cudaLaunchKernelEx(&cfg, fusedDiTSplitNormRopeKernelInductorLike<HEAD_DIM, true, PER_HEAD>,                        \
+    dim3 const gridDim(num_tokens);
+    dim3 const blockDim(256);
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = gridDim;
+    cfg.blockDim = blockDim;
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = stream;
+    cudaLaunchAttribute attrs[1] = {};
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attrs;
+    cfg.numAttrs = 1;
+#define LAUNCH(HEAD_DIM, INTERLEAVE, PER_HEAD)                                                                         \
+    cudaLaunchKernelEx(&cfg, fusedDiTSplitNormFullDimRopeKernel<HEAD_DIM, INTERLEAVE, PER_HEAD>,                       \
         reinterpret_cast<__nv_bfloat16*>(tensor), num_tokens, num_heads, eps,                                          \
         reinterpret_cast<__nv_bfloat16 const*>(weight), cos_emb, sin_emb)
+#define DISPATCH(INTERLEAVE, PER_HEAD)                                                                                 \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        switch (head_dim)                                                                                              \
+        {                                                                                                              \
+        case 64: LAUNCH(64, INTERLEAVE, PER_HEAD); break;                                                              \
+        case 128: LAUNCH(128, INTERLEAVE, PER_HEAD); break;                                                            \
+        default: TLLM_THROW("Unsupported head_dim for fusedDiTSplitNormFullDimRope: %d (only 64, 128)", head_dim);     \
+        }                                                                                                              \
+    } while (0)
+    if (interleave)
+    {
         if (per_head_cos)
-        {
-            switch (head_dim)
-            {
-            case 64: LAUNCH_INDUCTOR_LIKE(64, true); break;
-            case 128: LAUNCH_INDUCTOR_LIKE(128, true); break;
-            default: TLLM_THROW("Unsupported head_dim for fusedDiTSplitNormRope: %d (only 64, 128)", head_dim);
-            }
-        }
+            DISPATCH(true, true);
         else
-        {
-            switch (head_dim)
-            {
-            case 64: LAUNCH_INDUCTOR_LIKE(64, false); break;
-            case 128: LAUNCH_INDUCTOR_LIKE(128, false); break;
-            default: TLLM_THROW("Unsupported head_dim for fusedDiTSplitNormRope: %d (only 64, 128)", head_dim);
-            }
-        }
-#undef LAUNCH_INDUCTOR_LIKE
+            DISPATCH(true, false);
     }
     else
     {
-        int const blockSize = num_heads * 32;
-        dim3 const gridDim(num_tokens);
-        dim3 const blockDim(blockSize);
-#define LAUNCH_GENERIC(HEAD_DIM, INTERLEAVE, FULL_DIM)                                                                 \
-    fusedDiTSplitNormRopeKernel<HEAD_DIM, INTERLEAVE, FULL_DIM, true>                                                  \
-        <<<gridDim, blockDim, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(tensor), num_tokens, num_heads, eps,       \
-            reinterpret_cast<__nv_bfloat16 const*>(weight), cos_emb, sin_emb)
-        if (interleave && !full_dim_norm)
-        {
-            switch (head_dim)
-            {
-            case 64: LAUNCH_GENERIC(64, true, false); break;
-            case 128: LAUNCH_GENERIC(128, true, false); break;
-            default: TLLM_THROW("Unsupported head_dim for fusedDiTSplitNormRope: %d (only 64, 128)", head_dim);
-            }
-        }
-        else if (!interleave && full_dim_norm)
-        {
-            switch (head_dim)
-            {
-            case 64: LAUNCH_GENERIC(64, false, true); break;
-            case 128: LAUNCH_GENERIC(128, false, true); break;
-            default: TLLM_THROW("Unsupported head_dim for fusedDiTSplitNormRope: %d (only 64, 128)", head_dim);
-            }
-        }
-        else // !interleave && !full_dim_norm
-        {
-            switch (head_dim)
-            {
-            case 64: LAUNCH_GENERIC(64, false, false); break;
-            case 128: LAUNCH_GENERIC(128, false, false); break;
-            default: TLLM_THROW("Unsupported head_dim for fusedDiTSplitNormRope: %d (only 64, 128)", head_dim);
-            }
-        }
-#undef LAUNCH_GENERIC
+        if (per_head_cos)
+            DISPATCH(false, true);
+        else
+            DISPATCH(false, false);
     }
+#undef DISPATCH
+#undef LAUNCH
 }
 
 } // namespace kernels
