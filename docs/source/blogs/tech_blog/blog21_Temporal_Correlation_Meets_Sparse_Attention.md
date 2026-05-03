@@ -31,15 +31,15 @@ By NVIDIA TensorRT LLM team
 
 ## Introduction
 
-Long-context and code-centric LLM workloads routinely push decode-time context lengths into the 100K+ regime. Sparse attention removes the quadratic attention bottleneck, but it does **not** remove the need to rank a long vector of indexer scores at every decode step. In practical sparse-attention deployments such as DeepSeek DSA, exact **Top-K selection** remains on the critical path, and its cost still grows with sequence length.
+Long-context and code-centric LLM workloads routinely push decode-time context lengths into the 100K+ regime. Sparse attention reduces the quadratic attention bottleneck, but it does **not** remove the need to rank a long vector of indexer scores at every decode step. In practical sparse-attention deployments such as DeepSeek DSA, exact **Top-K selection** remains on the critical path, and its cost still grows with sequence length.
 
 TensorRT-LLM already ships a highly tuned production radix-select Top-K kernel for DeepSeek Sparse Attention (DSA), as described in [Tech Blog 15](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md). This blog introduces the next step: **Guess-Verify-Refine (GVR)**, a data-aware **exact** Top-K algorithm that uses the previous decode step's Top-K result as a prediction signal.
 
-The key idea is simple:
+The core observation is simple:
 
 - consecutive decode steps tend to query highly similar KV neighborhoods,
 - so the previous step's Top-K is a strong warm-start for the current step,
-- which makes it possible to reduce full-row passes from 3-4 to 1-2 in the common case,
+- which lets GVR reduce full-row passes from 3-4 to 1-2 in the common case,
 - while still preserving exact Top-K outputs.
 
 On real DeepSeek-V3.2 decoding workloads running on NVIDIA Blackwell GPUs, GVR delivers:
@@ -48,7 +48,7 @@ On real DeepSeek-V3.2 decoding workloads running on NVIDIA Blackwell GPUs, GVR d
 - up to **2.42x** per layer per decode step,
 - and end-to-end TPOT reduction of up to **7.52%** in fixed-OSL TEP8 min-latency deployment.
 
-This blog focuses on the technical-blog view of the work: the background, the motivation, the main ideas, how GVR is integrated into TensorRT-LLM, how to enable it, and what the operator-level and end-to-end gains look like. For the full derivations, exact correctness argument, detailed iteration statistics, and supplementary methodology, see Cheng, Long, et al. ["Guess-Verify-Refine: Data-Aware Top-K for Sparse-Attention Decoding on Blackwell via Temporal Correlation"](https://doi.org/10.48550/arXiv.2604.22312), arXiv:2604.22312 (2026).
+This blog explains the motivation, algorithm, TensorRT-LLM integration, enablement path, and measured operator-level and end-to-end gains. For full derivations, correctness arguments, iteration statistics, and supplementary methodology, see Cheng, Long, et al. ["Guess-Verify-Refine: Data-Aware Top-K for Sparse-Attention Decoding on Blackwell via Temporal Correlation"](https://doi.org/10.48550/arXiv.2604.22312), arXiv:2604.22312 (2026).
 
 ## Why Decode-Time Top-K Matters in DSA
 
@@ -104,12 +104,12 @@ We measured this on real DeepSeek-V3.2 decode-stage indexer logits using a long-
 </div>
 <p align="center"><sub><em>Figure 2. Raw Top-K overlap between consecutive decode steps across layers. Layers 20-60 show 35-50% average raw overlap, while Layers 0 and 1 are much lower.</em></sub></p>
 
-Two details matter here:
+Two details help interpret the figure:
 
 1. **Figure 2 reports raw overlap**, i.e. exact set intersection between consecutive steps.
 2. A related but different view is **shifted overlap**, where the previous-step indices are shifted by `+1` before comparison. Shifted overlap is useful for intuition, but Figure 2 itself uses the stricter raw metric.
 
-The practical takeaway is straightforward: for most layers, the previous step's Top-K already provides a meaningful prediction set for the next step.
+The practical takeaway is straightforward: for most layers, the previous step's Top-K is already a useful prediction set for the next step.
 
 ### Why RoPE and YaRN Make This Predictable
 
@@ -217,7 +217,7 @@ GVR is not an approximate pruning method. The heuristic is used only to get a go
 
 In practice:
 
-- the kernel remains **bit-exact** with respect to `torch.topk` on tested sequence lengths,
+- the output Top-K set matches `torch.topk` on tested sequence lengths,
 - ties remain non-deterministic in the same way as the production kernel,
 - and end-to-end model behavior remains unchanged within observed variance.
 
@@ -231,7 +231,7 @@ GVR is integrated into the existing TensorRT-LLM DSA decode path rather than as 
 
 1. Python-level DSA code decides whether a small-batch CuTE DSL path is appropriate,
 2. otherwise the request falls through to the C++ `indexer_topk_decode` operator, carrying the previous-step Top-K indices and a graph-safe scratch buffer when GVR is enabled,
-3. inside that operator, the Scheme X dispatcher selects GVR only when the heuristic prerequisites and hardware-aware `(batch size, sequence length)` thresholds are met,
+3. inside that operator, the GVR Top-K dispatcher selects the fast path only when the heuristic prerequisites and hardware-aware `(batch size, sequence length)` thresholds are met,
 4. otherwise the original insertion/radix-select fallback chain is used.
 
 <div align="center">
@@ -239,7 +239,7 @@ GVR is integrated into the existing TensorRT-LLM DSA decode path rather than as 
   <img src="../media/tech_blog21_dispatch_logic.png" alt="Dispatch Logic" width="800" height="auto">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 7. Full decode-stage Top-K dispatch in TensorRT-LLM. GVR takes priority only when `preIdx`, scratch buffers, and Scheme X thresholds are satisfied; otherwise dispatch falls back to the original insertion/radix-select pipeline.</em></sub></p>
+<p align="center"><sub><em>Figure 7. Full decode-stage Top-K dispatch in TensorRT-LLM. GVR takes priority only when `preIdx`, scratch buffers, and hardware-aware thresholds are satisfied; otherwise dispatch falls back to the original insertion/radix-select pipeline.</em></sub></p>
 
 From a system point of view, this fits naturally into the broader TensorRT-LLM sparse attention stack described in [Tech Blog 17](blog17_Sparse_Attention_in_TensorRT-LLM.md), while specifically accelerating the DSA Top-K selector discussed in [Tech Blog 15](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md).
 
@@ -254,6 +254,21 @@ sparse_attention_config:
   algorithm: dsa
   index_topk: 2048
   enable_heuristic_topk: true
+```
+
+The same option is also available through the Python LLM API:
+
+```python
+from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import DeepSeekSparseAttentionConfig
+
+llm = LLM(
+    model="<model>",
+    sparse_attention_config=DeepSeekSparseAttentionConfig(
+        index_topk=2048,
+        enable_heuristic_topk=True,
+    ),
+)
 ```
 
 The current GVR implementation supports `index_topk=2048`. Support for `index_topk=512` and `index_topk=1024` is planned but not enabled yet, so those configurations continue to use the production insertion/radix Top-K path.
@@ -284,12 +299,12 @@ torch.ops.trtllm.indexer_topk_decode(
 )
 ```
 
-PR #13477 did not add a new user-facing API. The public option remains `enable_heuristic_topk`, and the public launcher/operator names keep the existing `heuristic_*` spelling for compatibility. Internally, the single-CTA micro-kernel is named after the algorithm (`gvrTopKJob` / `gvrTopKKernel`).
+GVR Top-K does not add another user-facing API beyond this configuration flag. The public option remains `enable_heuristic_topk`, and the public launcher/operator names keep the existing `heuristic_*` spelling for compatibility. Internally, the single-CTA micro-kernel is named after the algorithm (`gvrTopKJob` / `gvrTopKKernel`).
 
 Two environment variables are useful for benchmarking and debugging:
 
-- `TRTLLM_HEURISTIC_NMIN=<int>` overrides the Scheme X small-sequence lower bound (`12288` by default, valid range `[1024, 200000]`).
-- `TRTLLM_SCHEMEX_DEBUG=1` prints the per-launch Scheme X routing decision, including the SM/L2-derived batch threshold and the small-N route marker.
+- `TRTLLM_HEURISTIC_NMIN=<int>` overrides the small-sequence lower bound (`12288` by default, valid range `[1024, 200000]`).
+- `TRTLLM_SCHEMEX_DEBUG=1` prints the per-launch GVR dispatcher decision, including the SM/L2-derived batch threshold and the small-N route marker.
 
 ### When It Falls Back to Radix Select
 
@@ -298,8 +313,8 @@ The GVR fast path is only taken when the required conditions are satisfied. Nota
 - **prefill** (no previous-step Top-K yet),
 - missing or invalid `preIdx` / scratch feedback buffers,
 - non-contiguous logits layout, `index_topk` values other than the currently supported `2048`, or unsupported hint size,
-- **short rows** below Scheme X's `kSeqSmall` threshold,
-- **large batches** above the SM/L2-derived `kBsLarge` threshold,
+- **short rows** below the small-sequence threshold,
+- **large batches** above the SM/L2-derived batch threshold,
 - **very long rows** where the implementation still prefers the existing split-work radix path,
 - unsupported architectures.
 
@@ -311,14 +326,14 @@ Today, the heuristic path is targeted at **Blackwell (sm_100+)**. On older archi
 
 ### Single-Operator Performance
 
-On synthetic data, GVR shows the expected scaling behavior: there is fixed overhead at short sequence length, but the reduced pass count wins as $N$ grows. Production dispatch is controlled by Scheme X rather than a single hard crossover: the default small-sequence lower bound is `12288`, while a hardware-aware batch threshold routes large-batch or L2-pressure cases back to radix.
+On synthetic data, GVR shows the expected scaling behavior: there is fixed overhead at short sequence length, but the reduced pass count wins as $N$ grows. Production dispatch uses a hardware-aware GVR gate rather than a single hard crossover: the default small-sequence lower bound is `12288`, while a hardware-aware batch threshold routes large-batch or L2-pressure cases back to radix.
 
 <div align="center">
 <figure>
   <img src="../media/tech_blog21_synthetic_scaling.png" alt="Synthetic Data Scaling" width="750" height="auto">
 </figure>
 </div>
-<p align="center"><sub><em>Figure 8. On random synthetic data, standalone GVR reaches parity around 16K sequence length and then increasingly outperforms the production radix-select kernel as context grows. In production, Scheme X starts from the validated 12,288-token lower bound and falls back when the `(batch size, sequence length)` cell is better served by radix.</em></sub></p>
+<p align="center"><sub><em>Figure 8. On random synthetic data, standalone GVR reaches parity around 16K sequence length and then increasingly outperforms the production radix-select kernel as context grows. In production, the GVR dispatcher starts from the validated 12,288-token lower bound and falls back when the `(batch size, sequence length)` cell is better served by radix.</em></sub></p>
 
 The more important result is real decode data.
 
@@ -403,19 +418,9 @@ For each configuration we use 5 requests and repeat the A/B pair 3 times. The fi
 | **64K** | **5.47%** | **4.36%** | **2.40%** |
 | **100K** | **7.52%** | **6.30%** | **3.45%** |
 
-Three trends stand out:
+The fixed-OSL=1K slice shows the two expected trends. First, GVR becomes more valuable as context grows: at MTP=0, TPOT reduction rises from 5.47% at 64K to 7.52% at 100K. Second, speculative decoding dilutes the per-step saving, but does not remove it: at 100K, the gain remains positive from MTP=0 through MTP=3.
 
-1. **Longer context helps more.** GVR becomes more valuable as the decode-time Top-K problem gets larger.
-2. **MTP reduces the apparent gain.** This is expected from Amdahl's law: speculative decoding amortizes fixed per-step savings across multiple accepted tokens.
-3. **The context-length trend is stable.** Even when MTP reduces the magnitude of the benefit, the direction remains the same.
-
-The broader E2E sweep used during analysis also showed the same trend outside the fixed-OSL=1K slice:
-
-- with **MTP=0**, speedup grows from **1.85% / 4.07% / 5.47% / 7.52%** at 16K / 32K / 64K / 128K for the OSL=1K setting,
-- with **MTP=1**, the same setting gives **0.98% / 2.77% / 4.36% / 6.30%**,
-- and with **MTP=3**, gains are smaller but still positive at larger ISL: **1.53%** at 32K, **2.40%** at 64K, and **3.45%** at 128K.
-
-This is consistent with the single-operator story: the longer the context, the larger the decode-stage Top-K burden, and the more valuable the heuristic warm-start becomes.
+The broader 16K-128K sweep shows the same pattern: gains increase with context length, and MTP reduces the magnitude through Amdahl's law while preserving the direction. This is consistent with the single-operator story: the longer the context, the larger the decode-stage Top-K burden, and the more valuable the heuristic warm-start becomes.
 
 ## Further Reading and Reproduction
 
@@ -434,7 +439,7 @@ Those cover:
 - the broader sparse attention framework in TensorRT-LLM,
 - and the system context in which GVR is integrated.
 
-For end-to-end benchmarking, the paper experiments use `trtllm-bench` with the standard DSA config path and only toggle `enable_heuristic_topk` between the A/B runs. A representative setup looks like this:
+For end-to-end benchmarking, use `trtllm-bench` with the standard DSA config path and only toggle `enable_heuristic_topk` between the A/B runs. A representative setup looks like this:
 
 ```yaml
 cuda_graph_config:
@@ -483,7 +488,7 @@ In the benchmark script, the only A/B difference between the two runs is:
 - `enable_heuristic_topk: false` for the production radix-select path,
 - `enable_heuristic_topk: true` for the GVR path.
 
-The benchmark configuration above is the self-contained TensorRT-LLM setup used for the technical-blog reproduction path; additional methodology details are available in the [GVR Top-K arXiv paper](https://doi.org/10.48550/arXiv.2604.22312).
+The benchmark configuration above is the self-contained TensorRT-LLM setup for the technical-blog reproduction path; additional methodology details are available in the [GVR Top-K arXiv paper](https://doi.org/10.48550/arXiv.2604.22312).
 
 ## Conclusion
 
