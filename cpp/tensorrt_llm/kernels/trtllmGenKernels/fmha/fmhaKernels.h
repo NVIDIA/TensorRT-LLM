@@ -263,6 +263,7 @@ public:
 
         // Check if a precompiled cubin exists for this configuration (same lookup as run()).
         // If not, return (false, info) so the dispatcher can fall back to unfused MHA like on main.
+        algoFilterForCubinPath(options);
         auto [hashId, info] = hashFromFmhaOptions(options);
 
         if (mFunctions.find(hashId) == mFunctions.end())
@@ -273,6 +274,15 @@ public:
         TLLM_LOG_DEBUG("TRTLLM-Gen kernel traits: %s", info.c_str());
 
         return std::make_pair(true, info);
+    }
+
+    void algoFilterForCubinPath(FmhaOptions& options) const
+    {
+        if (!isContextKernel(options.mFmhaKernelType) && options.mMaskType == TrtllmGenAttentionMaskType::Dense
+            && !options.mIsMlaGen && !isTokenSparse(options.mSparseType))
+        {
+            options.mMaskType = TrtllmGenAttentionMaskType::Causal;
+        }
     }
 
     void run(RunnerParams const& params)
@@ -344,6 +354,7 @@ public:
         }
         else
         {
+            algoFilterForCubinPath(options);
             auto [hashId, info] = hashFromFmhaOptions(options);
 
             // load from cubin
