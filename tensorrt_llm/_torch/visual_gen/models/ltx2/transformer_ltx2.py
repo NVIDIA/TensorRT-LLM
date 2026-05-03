@@ -255,10 +255,48 @@ class LTX2Attention(Attention):
             weight,
             cos_tiled,
             sin_tiled,
-            self.qk_norm_mode == "full",
-            True,  # do_norm
             self.interleave,
         )
+
+    def _apply_split_norm(
+        self,
+        tensor: torch.Tensor,
+        weight: torch.Tensor,
+        num_heads: int,
+    ) -> None:
+        """In-place fused full-dim RMSNorm only (no RoPE) on a single Q or K tensor [B, T, H*D].
+
+        Calls trtllm.fused_dit_split_norm. Used by paths that need norm but
+        no RoPE -- LTX-2 text cross-attn (Q-norm with pe=None) and the K-norm
+        side of prepare_text_cache project_kv when pe is unavailable.
+        """
+        B, T, _ = tensor.shape
+        tensor_2d = tensor.view(B * T, -1)
+        torch.ops.trtllm.fused_dit_split_norm(
+            tensor_2d,
+            num_heads,
+            self.head_dim,
+            self.eps,
+            weight,
+        )
+
+    def _apply_split_norm_or_norm_rope(
+        self,
+        tensor: torch.Tensor,
+        weight: torch.Tensor,
+        num_heads: int,
+        pe: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> None:
+        """Dispatcher: in-place norm-only when pe is None, else norm + RoPE.
+
+        Used to dispatch all SEPARATE_QKV cross-attn norm paths through the
+        split-fuse kernels regardless of whether the path needs RoPE.
+        """
+        if pe is None:
+            self._apply_split_norm(tensor, weight, num_heads)
+        else:
+            cos, sin = pe
+            self._apply_split_norm_rope(tensor, weight, num_heads, cos, sin)
 
     def project_kv(
         self,
@@ -278,15 +316,10 @@ class LTX2Attention(Attention):
         k = self.to_k(context)
         v = self.to_v(context)
 
-        head_dim_supported = self.head_dim in (64, 128)
-        rope_supported = self.rope_type in (LTXRopeType.INTERLEAVED, LTXRopeType.SPLIT)
-        pe_compatible = pe is not None and pe[0].shape[-1] in (
-            self.head_dim,
-            self.num_key_value_heads * self.head_dim,
-        )
-        if pe_compatible and self.qk_norm and head_dim_supported and rope_supported:
-            cos, sin = pe
-            self._apply_split_norm_rope(k, self.norm_k.weight, self.num_key_value_heads, cos, sin)
+        # All cross-attn K-norm paths (with or without RoPE) go through the
+        # split-fuse kernels.  fallback only kicks in for unsupported head_dim.
+        if self.qk_norm and self.head_dim in (64, 128):
+            self._apply_split_norm_or_norm_rope(k, self.norm_k.weight, self.num_key_value_heads, pe)
         else:
             if self.qk_norm:
                 k = self.norm_k(k)
@@ -304,99 +337,94 @@ class LTX2Attention(Attention):
     ) -> torch.Tensor:
         """Forward pass.
 
-        Args:
-            x: Query input [B, T, D].
-            context: Key/value input [B, S, C]. None → self-attention.
-            pe: (cos, sin) RoPE embeddings for Q (and K when k_pe is None).
-            k_pe: Separate (cos, sin) RoPE embeddings for K (for AV cross-attn).
-            pre_projected_kv: Pre-projected (k, v) tuple from project_kv().
-                When provided, skips K/V projection and K-norm (already done).
+        Caller contract:
+          - FUSE_QKV (self-attn): pe must be set; k_pe and pre_projected_kv unused.
+          - SEPARATE_QKV (cross-attn): cached path requires pre_projected_kv;
+            uncached path requires `context`. pe optional (None = norm-only).
+            k_pe overrides pe for K (e.g. AV cross-attn) when provided.
         """
-        # Our fused op accepts cos/sin in two layouts (auto-detected by op):
-        #   [num_tokens, head_dim]            — shared across heads (FLUX-style)
-        #   [num_tokens, num_heads*head_dim]  — per-head (LTX-2 3D RoPE)
-        # Kernel supports head_dim in {64, 128} only.
-        head_dim_supported = self.head_dim in (64, 128)
-        rope_supported = self.rope_type in (LTXRopeType.INTERLEAVED, LTXRopeType.SPLIT)
+        # Hard kernel limit: head_dim must be in {64, 128}. LTX-2 always
+        # satisfies this; the fallback below only ever runs for non-LTX-2 use.
+        if self.head_dim not in (64, 128):
+            return self._forward_unfused(x, context, pe, k_pe, pre_projected_kv)
 
-        def _pe_compatible(p):
-            if p is None:
-                return False
-            last = p[0].shape[-1]
-            return last == self.head_dim or last == self.num_attention_heads * self.head_dim
-
-        # Fast path: FUSE_QKV self-attn → packed kernel for full QKV.
-        can_fuse_packed = (
-            not self._is_cross_attn
-            and self.qk_norm
-            and head_dim_supported
-            and rope_supported
-            and _pe_compatible(pe)
-            and (k_pe is None or k_pe is pe)
-            and pre_projected_kv is None
-        )
-        # Fast path: SEPARATE_QKV cross-attn (text cross-attn) → split kernel for Q + K.
-        can_fuse_split = (
-            self._is_cross_attn
-            and self.qk_norm
-            and head_dim_supported
-            and rope_supported
-            and _pe_compatible(pe)
-            and (k_pe is None or k_pe is pe or _pe_compatible(k_pe))
-            and pre_projected_kv is None
-        )
-        # Fast path: AV cross-attn with pre-projected KV (K already norm+rotated by
-        # project_kv). Q-only fused split kernel; K rope is skipped here.
-        can_fuse_split_q_only = (
-            self._is_cross_attn
-            and self.qk_norm
-            and head_dim_supported
-            and rope_supported
-            and _pe_compatible(pe)
-            and pre_projected_kv is not None
-            and k_pe is None  # signals K already rotated
-        )
-        if can_fuse_packed:
+        if self.qkv_mode == QKVMode.FUSE_QKV:
+            # ─── self-attn → packed kernel (norm + rope on QKV in-place) ───
             qkv = self.qkv_proj(x)
             cos, sin = pe
             self.apply_qk_norm_rope(qkv, cos, sin)
             q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
-        elif can_fuse_split:
-            q = self.to_q(x)
-            k = self.to_k(context)
-            v = self.to_v(context)
-            cos_q, sin_q = pe
-            cos_k, sin_k = k_pe if k_pe is not None else pe
-            self._apply_split_norm_rope(
-                q, self.norm_q.weight, self.num_attention_heads, cos_q, sin_q
-            )
-            self._apply_split_norm_rope(
-                k, self.norm_k.weight, self.num_key_value_heads, cos_k, sin_k
-            )
-        elif can_fuse_split_q_only:
-            k, v = pre_projected_kv
-            q = self.to_q(x)
-            cos_q, sin_q = pe
-            self._apply_split_norm_rope(
-                q, self.norm_q.weight, self.num_attention_heads, cos_q, sin_q
-            )
-        else:
+
+        elif self.qkv_mode == QKVMode.SEPARATE_QKV:
+            # ─── cross-attn → split kernel (norm or norm+rope based on pe) ───
             if pre_projected_kv is not None:
+                # K/V cached by caller (text cross-attn + AV cross-attn).
+                # The caller is responsible for any K-norm + K-rope on the
+                # cached tensor; we only fuse Q here.
                 k, v = pre_projected_kv
                 q = self.to_q(x)
-                if self.qk_norm:
-                    q = self.norm_q(q)
+                self._apply_split_norm_or_norm_rope(
+                    q, self.norm_q.weight, self.num_attention_heads, pe
+                )
             else:
-                q, k, v = self.get_qkv(x, context)
-                q, k = self.apply_qk_norm(q, k)
+                # Uncached cross-attn (LTX-2 实际不进；保留 fuse 一致性).
+                q = self.to_q(x)
+                k = self.to_k(context)
+                v = self.to_v(context)
+                self._apply_split_norm_or_norm_rope(
+                    q, self.norm_q.weight, self.num_attention_heads, pe
+                )
+                self._apply_split_norm_or_norm_rope(
+                    k,
+                    self.norm_k.weight,
+                    self.num_key_value_heads,
+                    k_pe if k_pe is not None else pe,
+                )
+        else:
+            # Defensive: unknown QKVMode (LTX-2 always FUSE_QKV or SEPARATE_QKV).
+            return self._forward_unfused(x, context, pe, k_pe, pre_projected_kv)
 
-            if pe is not None:
-                q = apply_rotary_emb(q, pe, self.rope_type)
-                # k_pe=None with pre_projected_kv signals K already rotated.
-                if k_pe is not None:
-                    k = apply_rotary_emb(k, k_pe, self.rope_type)
-                elif pre_projected_kv is None:
-                    k = apply_rotary_emb(k, pe, self.rope_type)
+        out = self._attn_impl(q, k, v)
+
+        if self.to_gate_logits is not None:
+            gate_logits = self.to_gate_logits(x)
+            b, t, _ = out.shape
+            out = out.view(b, t, self.num_attention_heads, self.head_dim)
+            gates = 2.0 * torch.sigmoid(gate_logits)
+            out = out * gates.unsqueeze(-1)
+            out = out.view(b, t, self.num_attention_heads * self.head_dim)
+
+        return self.to_out[0](out)
+
+    def _forward_unfused(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor | None,
+        pe: tuple[torch.Tensor, torch.Tensor] | None,
+        k_pe: tuple[torch.Tensor, torch.Tensor] | None,
+        pre_projected_kv: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> torch.Tensor:
+        """Fallback path for unsupported configs (e.g. head_dim ∉ {64, 128}).
+
+        LTX-2 head_dim is always 64 or 128, so in practice this is never
+        entered. Kept for safety in case the class is reused for other models.
+        """
+        if pre_projected_kv is not None:
+            k, v = pre_projected_kv
+            q = self.to_q(x)
+            if self.qk_norm:
+                q = self.norm_q(q)
+        else:
+            q, k, v = self.get_qkv(x, context)
+            q, k = self.apply_qk_norm(q, k)
+
+        if pe is not None:
+            q = apply_rotary_emb(q, pe, self.rope_type)
+            # k_pe=None with pre_projected_kv signals K already rotated.
+            if k_pe is not None:
+                k = apply_rotary_emb(k, k_pe, self.rope_type)
+            elif pre_projected_kv is None:
+                k = apply_rotary_emb(k, pe, self.rope_type)
 
         out = self._attn_impl(q, k, v)
 
