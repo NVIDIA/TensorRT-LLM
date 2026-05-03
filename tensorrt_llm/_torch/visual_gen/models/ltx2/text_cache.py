@@ -28,7 +28,12 @@ class TextCache:
         audio_mask: Attention mask for audio text cross-attention.
         audio_pe: RoPE (cos, sin) for audio.
         video_cross_pe: Cross-modal RoPE for video (audio-video model only).
-        audio_cross_pe: Cross-modal RoPE for audio (audio-video model only).
+            Full (un-sharded) layout, used for K-rope after all-gather.
+        video_cross_pe_local: Sharded contiguous Cross-modal RoPE for video.
+            Pre-sharded once here so the per-step ``_shard_pe`` slice + downstream
+            non-contiguous reshape copy in the fuse-op prologue both go away.
+        audio_cross_pe: Cross-modal RoPE for audio.  Full layout (see above).
+        audio_cross_pe_local: Sharded contiguous Cross-modal RoPE for audio.
         video_kv: Per-layer pre-projected text K/V for video cross-attention.
         audio_kv: Per-layer pre-projected text K/V for audio cross-attention.
     """
@@ -37,9 +42,11 @@ class TextCache:
     video_mask: Optional[torch.Tensor] = None
     video_pe: Optional[tuple[torch.Tensor, torch.Tensor]] = None
     video_cross_pe: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+    video_cross_pe_local: Optional[tuple[torch.Tensor, torch.Tensor]] = None
     video_kv: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None
     audio_context: Optional[torch.Tensor] = None
     audio_mask: Optional[torch.Tensor] = None
     audio_pe: Optional[tuple[torch.Tensor, torch.Tensor]] = None
     audio_cross_pe: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+    audio_cross_pe_local: Optional[tuple[torch.Tensor, torch.Tensor]] = None
     audio_kv: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None

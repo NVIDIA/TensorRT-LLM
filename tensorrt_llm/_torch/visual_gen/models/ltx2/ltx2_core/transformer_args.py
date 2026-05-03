@@ -261,8 +261,17 @@ class MultiModalTransformerArgsPreprocessor:
         static_mask: torch.Tensor | None,
         static_pe: tuple[torch.Tensor, torch.Tensor],
         static_cross_pe: tuple[torch.Tensor, torch.Tensor],
+        static_cross_pe_local: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> TransformerArgs:
-        """Build TransformerArgs for one denoise step with pre-computed static outputs."""
+        """Build TransformerArgs for one denoise step with pre-computed static outputs.
+
+        ``static_cross_pe_local`` is the sharded-contiguous variant of
+        ``static_cross_pe`` (matches the local Q shard for Q-side rope).  When
+        ``None`` (single-rank or caller didn't pre-shard) we fall back to
+        ``static_cross_pe`` so behavior is unchanged.  Pre-sharding it once in
+        ``prepare_text_cache`` instead of every step's ``_shard_transformer_args``
+        avoids the per-step slice + downstream non-contiguous reshape copy.
+        """
         transformer_args = self.simple_preprocessor.prepare(
             modality,
             static_context=static_context,
@@ -275,9 +284,11 @@ class MultiModalTransformerArgsPreprocessor:
             batch_size=transformer_args.x.shape[0],
             hidden_dtype=modality.latent.dtype,
         )
+        if static_cross_pe_local is None:
+            static_cross_pe_local = static_cross_pe
         return replace(
             transformer_args,
-            cross_positional_embeddings_local=static_cross_pe,
+            cross_positional_embeddings_local=static_cross_pe_local,
             cross_positional_embeddings_full=static_cross_pe,
             cross_scale_shift_timestep=cross_scale_shift_timestep,
             cross_gate_timestep=cross_gate_timestep,

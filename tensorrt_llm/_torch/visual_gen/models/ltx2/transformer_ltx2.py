@@ -1176,7 +1176,11 @@ class LTXModel(nn.Module):
             timesteps=_shard(args.timesteps),
             embedded_timestep=_shard(args.embedded_timestep),
             positional_embeddings=_shard_pe(args.positional_embeddings),
-            cross_positional_embeddings_local=_shard_pe(args.cross_positional_embeddings_full),
+            # cross_positional_embeddings_local is pre-sharded + contiguous in
+            # prepare_text_cache (see _make_cross_pe_local) and threaded through
+            # preprocessor.prepare(static_cross_pe_local=...), so we leave it
+            # unchanged here — re-slicing every step would re-introduce the
+            # non-contiguous reshape copy this caching is meant to eliminate.
             cross_scale_shift_timestep=_shard(args.cross_scale_shift_timestep),
             cross_gate_timestep=_shard(args.cross_gate_timestep),
         )
@@ -1269,18 +1273,22 @@ class LTXModel(nn.Module):
         is passed to ``forward()`` on every step.  Does not require latent
         data — only text context, positions, and dtype are needed.
         """
-        v_ctx = v_mask = v_pe = v_cross_pe = v_kv = None
-        a_ctx = a_mask = a_pe = a_cross_pe = a_kv = None
+        v_ctx = v_mask = v_pe = v_cross_pe = v_cross_pe_local = v_kv = None
+        a_ctx = a_mask = a_pe = a_cross_pe = a_cross_pe_local = a_kv = None
 
         if video_context is not None:
             v_ctx, v_mask, v_pe, v_cross_pe = self.video_args_preprocessor.prepare_text_cache(
                 video_context, video_context_mask, video_positions, dtype
             )
+            v_cross_pe_local = self._make_cross_pe_local(v_cross_pe, is_sharded=self.use_ulysses)
             v_kv = [block.attn2.project_kv(v_ctx) for block in self.transformer_blocks]
 
         if audio_context is not None:
             a_ctx, a_mask, a_pe, a_cross_pe = self.audio_args_preprocessor.prepare_text_cache(
                 audio_context, audio_context_mask, audio_positions, dtype
+            )
+            a_cross_pe_local = self._make_cross_pe_local(
+                a_cross_pe, is_sharded=self._audio_is_sharded
             )
             a_kv = [block.audio_attn2.project_kv(a_ctx) for block in self.transformer_blocks]
 
@@ -1289,13 +1297,47 @@ class LTXModel(nn.Module):
             video_mask=v_mask,
             video_pe=v_pe,
             video_cross_pe=v_cross_pe,
+            video_cross_pe_local=v_cross_pe_local,
             video_kv=v_kv,
             audio_context=a_ctx,
             audio_mask=a_mask,
             audio_pe=a_pe,
             audio_cross_pe=a_cross_pe,
+            audio_cross_pe_local=a_cross_pe_local,
             audio_kv=a_kv,
         )
+
+    def _make_cross_pe_local(
+        self,
+        cross_pe: tuple[torch.Tensor, torch.Tensor] | None,
+        is_sharded: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Pre-shard + contiguous-ify cross_pe for the local Ulysses rank.
+
+        Computed once in ``prepare_text_cache``; stored on ``TextCache`` and
+        consumed each step via ``preprocessor.prepare(..., static_cross_pe_local=...)``.
+        Eliminates the per-step ``_shard_pe`` slice + downstream reshape copy
+        on a non-contiguous slice that would otherwise show up as a triton
+        prologue kernel before the fused norm+rope op.
+        """
+        if cross_pe is None:
+            return None
+        if not is_sharded:
+            return cross_pe
+        cos, sin = cross_pe
+        if cos.ndim == 4:
+            seq_len = cos.shape[2]
+            chunk = seq_len // self.ulysses_size
+            s = self.ulysses_rank * chunk
+            e = s + chunk
+            return (cos[:, :, s:e].contiguous(), sin[:, :, s:e].contiguous())
+        elif cos.ndim == 3:
+            seq_len = cos.shape[1]
+            chunk = seq_len // self.ulysses_size
+            s = self.ulysses_rank * chunk
+            e = s + chunk
+            return (cos[:, s:e].contiguous(), sin[:, s:e].contiguous())
+        return cross_pe
 
     def forward(
         self,
@@ -1329,6 +1371,7 @@ class LTXModel(nn.Module):
                 text_cache.video_mask,
                 text_cache.video_pe,
                 text_cache.video_cross_pe,
+                static_cross_pe_local=text_cache.video_cross_pe_local,
             )
             if video is not None
             else None
@@ -1340,6 +1383,7 @@ class LTXModel(nn.Module):
                 text_cache.audio_mask,
                 text_cache.audio_pe,
                 text_cache.audio_cross_pe,
+                static_cross_pe_local=text_cache.audio_cross_pe_local,
             )
             if audio is not None
             else None
