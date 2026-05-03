@@ -289,12 +289,14 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
                 video_context=v.video_context.clone() if v.video_context is not None else None,
                 video_mask=v.video_mask.clone() if v.video_mask is not None else None,
                 video_pe=clone_pair(v.video_pe),
+                video_pe_local=clone_pair(v.video_pe_local),
                 video_cross_pe=clone_pair(v.video_cross_pe),
                 video_cross_pe_local=clone_pair(v.video_cross_pe_local),
                 video_kv=[clone_pair(kv) for kv in v.video_kv] if v.video_kv is not None else None,
                 audio_context=v.audio_context.clone() if v.audio_context is not None else None,
                 audio_mask=v.audio_mask.clone() if v.audio_mask is not None else None,
                 audio_pe=clone_pair(v.audio_pe),
+                audio_pe_local=clone_pair(v.audio_pe_local),
                 audio_cross_pe=clone_pair(v.audio_cross_pe),
                 audio_cross_pe_local=clone_pair(v.audio_cross_pe_local),
                 audio_kv=[clone_pair(kv) for kv in v.audio_kv] if v.audio_kv is not None else None,
@@ -325,6 +327,7 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
             if dst.video_mask is not None and src.video_mask is not None:
                 dst.video_mask.copy_(src.video_mask)
             copy_pair(dst.video_pe, src.video_pe)
+            copy_pair(dst.video_pe_local, src.video_pe_local)
             copy_pair(dst.video_cross_pe, src.video_cross_pe)
             copy_pair(dst.video_cross_pe_local, src.video_cross_pe_local)
             if dst.video_kv is not None and src.video_kv is not None:
@@ -335,6 +338,7 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
             if dst.audio_mask is not None and src.audio_mask is not None:
                 dst.audio_mask.copy_(src.audio_mask)
             copy_pair(dst.audio_pe, src.audio_pe)
+            copy_pair(dst.audio_pe_local, src.audio_pe_local)
             copy_pair(dst.audio_cross_pe, src.audio_cross_pe)
             copy_pair(dst.audio_cross_pe_local, src.audio_cross_pe_local)
             if dst.audio_kv is not None and src.audio_kv is not None:

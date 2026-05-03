@@ -1158,29 +1158,17 @@ class LTXModel(nn.Module):
                 return t
             return t[:, s:e]
 
-        def _shard_pe(pe):
-            if pe is None:
-                return None
-            cos, sin = pe
-            if cos.ndim == 4 and cos.shape[2] == seq_len:
-                # Split RoPE: [B, H, S, D] — sequence dim at index 2
-                return (cos[:, :, s:e], sin[:, :, s:e])
-            elif cos.ndim == 3 and cos.shape[1] == seq_len:
-                # Interleaved RoPE: [B, S, D] — sequence dim at index 1
-                return (cos[:, s:e], sin[:, s:e])
-            return pe
-
+        # All step-invariant pe fields (positional_embeddings,
+        # cross_positional_embeddings_local) are pre-sharded + contiguous in
+        # prepare_text_cache via LTXModel._shard_pe and threaded through
+        # preprocessor.prepare(static_pe_local=..., static_cross_pe_local=...).
+        # Re-slicing here every step would re-introduce the non-contiguous
+        # reshape copy that the caching is meant to eliminate.
         return replace(
             args,
             x=args.x[:, s:e],
             timesteps=_shard(args.timesteps),
             embedded_timestep=_shard(args.embedded_timestep),
-            positional_embeddings=_shard_pe(args.positional_embeddings),
-            # cross_positional_embeddings_local is pre-sharded + contiguous in
-            # prepare_text_cache (see _make_cross_pe_local) and threaded through
-            # preprocessor.prepare(static_cross_pe_local=...), so we leave it
-            # unchanged here — re-slicing every step would re-introduce the
-            # non-contiguous reshape copy this caching is meant to eliminate.
             cross_scale_shift_timestep=_shard(args.cross_scale_shift_timestep),
             cross_gate_timestep=_shard(args.cross_gate_timestep),
         )
@@ -1273,71 +1261,72 @@ class LTXModel(nn.Module):
         is passed to ``forward()`` on every step.  Does not require latent
         data — only text context, positions, and dtype are needed.
         """
-        v_ctx = v_mask = v_pe = v_cross_pe = v_cross_pe_local = v_kv = None
-        a_ctx = a_mask = a_pe = a_cross_pe = a_cross_pe_local = a_kv = None
+        v_ctx = v_mask = v_pe = v_pe_local = v_cross_pe = v_cross_pe_local = v_kv = None
+        a_ctx = a_mask = a_pe = a_pe_local = a_cross_pe = a_cross_pe_local = a_kv = None
 
         if video_context is not None:
             v_ctx, v_mask, v_pe, v_cross_pe = self.video_args_preprocessor.prepare_text_cache(
                 video_context, video_context_mask, video_positions, dtype
             )
-            v_cross_pe_local = self._make_cross_pe_local(v_cross_pe, is_sharded=self.use_ulysses)
+            v_pe_local = self._shard_pe(v_pe, is_sharded=self.use_ulysses)
+            v_cross_pe_local = self._shard_pe(v_cross_pe, is_sharded=self.use_ulysses)
             v_kv = [block.attn2.project_kv(v_ctx) for block in self.transformer_blocks]
 
         if audio_context is not None:
             a_ctx, a_mask, a_pe, a_cross_pe = self.audio_args_preprocessor.prepare_text_cache(
                 audio_context, audio_context_mask, audio_positions, dtype
             )
-            a_cross_pe_local = self._make_cross_pe_local(
-                a_cross_pe, is_sharded=self._audio_is_sharded
-            )
+            a_pe_local = self._shard_pe(a_pe, is_sharded=self._audio_is_sharded)
+            a_cross_pe_local = self._shard_pe(a_cross_pe, is_sharded=self._audio_is_sharded)
             a_kv = [block.audio_attn2.project_kv(a_ctx) for block in self.transformer_blocks]
 
         return TextCache(
             video_context=v_ctx,
             video_mask=v_mask,
             video_pe=v_pe,
+            video_pe_local=v_pe_local,
             video_cross_pe=v_cross_pe,
             video_cross_pe_local=v_cross_pe_local,
             video_kv=v_kv,
             audio_context=a_ctx,
             audio_mask=a_mask,
             audio_pe=a_pe,
+            audio_pe_local=a_pe_local,
             audio_cross_pe=a_cross_pe,
             audio_cross_pe_local=a_cross_pe_local,
             audio_kv=a_kv,
         )
 
-    def _make_cross_pe_local(
+    def _shard_pe(
         self,
-        cross_pe: tuple[torch.Tensor, torch.Tensor] | None,
+        pe: tuple[torch.Tensor, torch.Tensor] | None,
         is_sharded: bool,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Pre-shard + contiguous-ify cross_pe for the local Ulysses rank.
+        """Pre-shard + contiguous-ify a (cos, sin) tuple for the local Ulysses rank.
 
-        Computed once in ``prepare_text_cache``; stored on ``TextCache`` and
-        consumed each step via ``preprocessor.prepare(..., static_cross_pe_local=...)``.
-        Eliminates the per-step ``_shard_pe`` slice + downstream reshape copy
-        on a non-contiguous slice that would otherwise show up as a triton
-        prologue kernel before the fused norm+rope op.
+        Computed once in ``prepare_text_cache`` for self-attn pe and AV
+        cross-attn pe; stored on ``TextCache`` and threaded through
+        ``preprocessor.prepare(static_pe_local=..., static_cross_pe_local=...)``.
+        Eliminates the per-step slice + downstream non-contiguous reshape copy
+        in the fused norm+rope op prologue. Returns input unchanged when not
+        sharded. Auto-handles 4D ``[B, H, T, D]`` (split rope) and 3D
+        ``[B, T, D]`` (interleaved rope) layouts.
         """
-        if cross_pe is None:
-            return None
-        if not is_sharded:
-            return cross_pe
-        cos, sin = cross_pe
+        if pe is None or not is_sharded or self.ulysses_size <= 1:
+            return pe
+        cos, sin = pe
         if cos.ndim == 4:
             seq_len = cos.shape[2]
-            chunk = seq_len // self.ulysses_size
-            s = self.ulysses_rank * chunk
-            e = s + chunk
-            return (cos[:, :, s:e].contiguous(), sin[:, :, s:e].contiguous())
         elif cos.ndim == 3:
             seq_len = cos.shape[1]
-            chunk = seq_len // self.ulysses_size
-            s = self.ulysses_rank * chunk
-            e = s + chunk
-            return (cos[:, s:e].contiguous(), sin[:, s:e].contiguous())
-        return cross_pe
+        else:
+            return pe
+        chunk = seq_len // self.ulysses_size
+        s = self.ulysses_rank * chunk
+        e = s + chunk
+        if cos.ndim == 4:
+            return (cos[:, :, s:e].contiguous(), sin[:, :, s:e].contiguous())
+        return (cos[:, s:e].contiguous(), sin[:, s:e].contiguous())
 
     def forward(
         self,
@@ -1372,6 +1361,7 @@ class LTXModel(nn.Module):
                 text_cache.video_pe,
                 text_cache.video_cross_pe,
                 static_cross_pe_local=text_cache.video_cross_pe_local,
+                static_pe_local=text_cache.video_pe_local,
             )
             if video is not None
             else None
@@ -1384,6 +1374,7 @@ class LTXModel(nn.Module):
                 text_cache.audio_pe,
                 text_cache.audio_cross_pe,
                 static_cross_pe_local=text_cache.audio_cross_pe_local,
+                static_pe_local=text_cache.audio_pe_local,
             )
             if audio is not None
             else None

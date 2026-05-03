@@ -160,23 +160,32 @@ class TransformerArgsPreprocessor:
         static_mask: torch.Tensor | None,
         static_pe: tuple[torch.Tensor, torch.Tensor],
         static_cross_pe: tuple[torch.Tensor, torch.Tensor] | None = None,
+        static_pe_local: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> TransformerArgs:
         """Build TransformerArgs for one denoise step.
 
         Step-invariant static args are always required.  *static_cross_pe*
         is only used by the MultiModal subclass; ignored here.
+        ``static_pe_local`` is the sharded-contiguous variant of
+        ``static_pe``; when ``None`` (single-rank) we fall back to
+        ``static_pe`` so behavior is unchanged.  Pre-sharding it once in
+        ``prepare_text_cache`` instead of every step in
+        ``_shard_transformer_args`` avoids the per-step slice + downstream
+        non-contiguous reshape copy.
         """
         x = self.patchify_proj(modality.latent.contiguous())
         timestep, embedded_timestep = self._prepare_timestep(
             modality.timesteps, x.shape[0], modality.latent.dtype
         )
+        if static_pe_local is None:
+            static_pe_local = static_pe
         return TransformerArgs(
             x=x,
             context=static_context,
             context_mask=static_mask,
             timesteps=timestep,
             embedded_timestep=embedded_timestep,
-            positional_embeddings=static_pe,
+            positional_embeddings=static_pe_local,
             cross_positional_embeddings_local=None,
             cross_positional_embeddings_full=None,
             cross_scale_shift_timestep=None,
@@ -262,21 +271,24 @@ class MultiModalTransformerArgsPreprocessor:
         static_pe: tuple[torch.Tensor, torch.Tensor],
         static_cross_pe: tuple[torch.Tensor, torch.Tensor],
         static_cross_pe_local: tuple[torch.Tensor, torch.Tensor] | None = None,
+        static_pe_local: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> TransformerArgs:
         """Build TransformerArgs for one denoise step with pre-computed static outputs.
 
-        ``static_cross_pe_local`` is the sharded-contiguous variant of
-        ``static_cross_pe`` (matches the local Q shard for Q-side rope).  When
-        ``None`` (single-rank or caller didn't pre-shard) we fall back to
-        ``static_cross_pe`` so behavior is unchanged.  Pre-sharding it once in
-        ``prepare_text_cache`` instead of every step's ``_shard_transformer_args``
-        avoids the per-step slice + downstream non-contiguous reshape copy.
+        ``static_cross_pe_local`` / ``static_pe_local`` are the sharded-contiguous
+        variants of ``static_cross_pe`` / ``static_pe`` (match the local Q shard
+        for Q-side rope).  When ``None`` (single-rank or caller didn't pre-shard)
+        we fall back to the un-sharded version so behavior is unchanged.
+        Pre-sharding once in ``prepare_text_cache`` instead of every step's
+        ``_shard_transformer_args`` avoids the per-step slice + downstream
+        non-contiguous reshape copy.
         """
         transformer_args = self.simple_preprocessor.prepare(
             modality,
             static_context=static_context,
             static_mask=static_mask,
             static_pe=static_pe,
+            static_pe_local=static_pe_local,
         )
         cross_scale_shift_timestep, cross_gate_timestep = self._prepare_cross_attention_timestep(
             timestep=modality.timesteps,
