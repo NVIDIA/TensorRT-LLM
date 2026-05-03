@@ -143,8 +143,50 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
     NotificationInfo notificationInfo{syncInfo};
     std::stringstream ss;
     NotificationInfo::serialize(notificationInfo, ss);
-    TransferState transferState = status->wait();
+    // Poll in bounded chunks so we can observe ctx.getTransferTerminate()
+    // (which may be a per-request cancel flag plumbed in from the drain
+    // worker's requestSync) between polls. Without this, a stuck peer
+    // blocks submitTransferRequests's completion indefinitely — the
+    // post-saturation no-recovery signature diagnosed in
+    // docs/pr-13056-option-c.md and verified via v11b [reqSync]
+    // instrumentation, where pre-sendRequestInfo had no matching
+    // post-sendRequestInfo for 60 s+.
+    static constexpr int64_t kCancelPollTimeoutMs = 100;
+    TransferState transferState = TransferState::kIN_PROGRESS;
+    while (transferState == TransferState::kIN_PROGRESS)
+    {
+        transferState = status->wait(kCancelPollTimeoutMs);
+        if (transferState == TransferState::kIN_PROGRESS && ctx.getTransferTerminate().load(std::memory_order_relaxed))
+        {
+            // Cancel observed mid-send. Release the underlying backend
+            // transfer handle before unwinding so NIXL does not retain
+            // stale in-flight state below TRT-LLM's request cleanup.
+            bool const released = status->release();
+            TLLM_LOG_WARNING(
+                "AgentConnection::send cancelled while transfer was in progress (ctx tag=%d, remote=%s, "
+                "releaseAccepted=%d)",
+                ctx.getTag(), mRemoteAgentName.c_str(), released);
+            TLLM_CHECK_WITH_INFO(
+                released, "AgentConnection::send cancel could not release the backend transfer handle");
+            TLLM_THROW("AgentConnection::send cancelled mid-transfer");
+        }
+    }
     TLLM_CHECK_WITH_INFO(transferState == TransferState::kSUCCESS, "AgentConnection::send failed");
+    // One more cancel check between the successful wait and the (potentially
+    // blocking) notifySyncMessage. notifySyncMessage goes through the NIXL
+    // backend and is not interruptible from this layer; if cancel fires in
+    // the gap between wait() returning and notify starting, bail out now.
+    if (ctx.getTransferTerminate().load(std::memory_order_relaxed))
+    {
+        bool const released = status->release();
+        TLLM_LOG_WARNING(
+            "AgentConnection::send cancelled after transfer completed but before notify (ctx tag=%d, remote=%s, "
+            "releaseAccepted=%d)",
+            ctx.getTag(), mRemoteAgentName.c_str(), released);
+        TLLM_CHECK_WITH_INFO(
+            released, "AgentConnection::send pre-notify cancel could not release the backend transfer handle");
+        TLLM_THROW("AgentConnection::send cancelled pre-notify");
+    }
     // TODO: there is a bug in request_with_notify https://github.com/ai-dynamo/nixl/pull/252
     mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
 }
@@ -153,11 +195,16 @@ void AgentConnection::recv(DataContext const& ctx, void* data, size_t size) cons
 {
 
     NotificationSyncInfo syncInfo{mAgentName, ctx};
-    mAgentConnectionManager->waitForSyncInfo(mRemoteAgentName, syncInfo, ctx.getTransferTerminate());
+    bool const received
+        = mAgentConnectionManager->waitForSyncInfo(mRemoteAgentName, syncInfo, ctx.getTransferTerminate());
+    TLLM_CHECK_WITH_INFO(received,
+        "AgentConnection::recv ended before receiving sync notification (ctx tag=%d, remote=%s)", ctx.getTag(),
+        mRemoteAgentName.c_str());
 }
 
 void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& requestInfo,
-    std::vector<std::optional<size_t>> const& cacheBufferIds, int connectionIdx)
+    std::vector<std::optional<size_t>> const& cacheBufferIds, int connectionIdx,
+    std::atomic<bool> const* perRequestCancel)
 {
     TLLM_CHECK(!common::getEnvTryZCopyForKVCacheTransfer());
 
@@ -209,6 +256,18 @@ void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& reque
     std::stringstream ss;
     NotificationInfo notificationInfo{requestAndBufferInfo};
     NotificationInfo::serialize(notificationInfo, ss);
+    // Pre-notify cancel check: notifySyncMessage enters the NIXL backend and
+    // is not interruptible from this layer. The caller's for-loop in
+    // CacheReceiver::Impl::sendRequestInfo also checks perRequestCancel
+    // between iterations; this check narrows the window where a cancel
+    // fired right before this peer's notify is suppressed.
+    if (perRequestCancel != nullptr && perRequestCancel->load(std::memory_order_relaxed))
+    {
+        TLLM_LOG_WARNING(
+            "AgentConnection::sendRequestAndBufferInfo cancelled via perRequestCancel before notify (remote=%s)",
+            mRemoteAgentName.c_str());
+        TLLM_THROW("sendRequestAndBufferInfo cancelled pre-notify");
+    }
     mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
 }
 
@@ -247,7 +306,10 @@ void AgentConnection::sendReadySignal(DataContext const& ctx, bool isReady) cons
 bool AgentConnection::recvReadySignal(DataContext const& ctx) const
 {
     ReadySignalInfo readySignalInfo{mAgentName, ctx, false};
-    mAgentConnectionManager->waitForReadySignal(mRemoteAgentName, readySignalInfo, ctx.getTransferTerminate());
+    if (!mAgentConnectionManager->waitForReadySignal(mRemoteAgentName, readySignalInfo, ctx.getTransferTerminate()))
+    {
+        return false;
+    }
     return readySignalInfo.mIsReady;
 }
 
@@ -582,7 +644,7 @@ int AgentConnectionManager::getDeviceId() const
 }
 
 template <typename NotificationType>
-void AgentConnectionManager::waitForNotification(
+bool AgentConnectionManager::waitForNotification(
     std::string const& remoteAgentName, NotificationType& expectedInfo, std::atomic<bool> const& terminateFlag)
 {
     while (!terminateFlag.load())
@@ -590,7 +652,7 @@ void AgentConnectionManager::waitForNotification(
 
         if (!mIsRunning)
         {
-            return;
+            return false;
         }
         updateUnhandledNotifications();
         std::scoped_lock lock(mNotificationMutex);
@@ -623,7 +685,7 @@ void AgentConnectionManager::waitForNotification(
                             {
                                 it = mUnhandledNotifications.erase(it);
                             }
-                            return;
+                            return true;
                         }
                     }
                 }
@@ -643,7 +705,7 @@ void AgentConnectionManager::waitForNotification(
                             {
                                 it = mUnhandledNotifications.erase(it);
                             }
-                            return;
+                            return true;
                         }
                     }
                 }
@@ -663,24 +725,25 @@ void AgentConnectionManager::waitForNotification(
             }
         }
     }
+    return false;
 }
 
 // Explicit template instantiations
-template void AgentConnectionManager::waitForNotification<NotificationSyncInfo>(
+template bool AgentConnectionManager::waitForNotification<NotificationSyncInfo>(
     std::string const& remoteAgentName, NotificationSyncInfo& expectedInfo, std::atomic<bool> const& terminateFlag);
-template void AgentConnectionManager::waitForNotification<ReadySignalInfo>(
+template bool AgentConnectionManager::waitForNotification<ReadySignalInfo>(
     std::string const& remoteAgentName, ReadySignalInfo& expectedInfo, std::atomic<bool> const& terminateFlag);
 
-void AgentConnectionManager::waitForSyncInfo(
+bool AgentConnectionManager::waitForSyncInfo(
     std::string const& remoteAgentName, NotificationSyncInfo& syncInfo, std::atomic<bool> const& terminateFlag)
 {
-    waitForNotification(remoteAgentName, syncInfo, terminateFlag);
+    return waitForNotification(remoteAgentName, syncInfo, terminateFlag);
 }
 
-void AgentConnectionManager::waitForReadySignal(
+bool AgentConnectionManager::waitForReadySignal(
     std::string const& remoteAgentName, ReadySignalInfo& readySignalInfo, std::atomic<bool> const& terminateFlag)
 {
-    waitForNotification(remoteAgentName, readySignalInfo, terminateFlag);
+    return waitForNotification(remoteAgentName, readySignalInfo, terminateFlag);
 }
 
 std::string const& AgentConnectionManager::getAgentName() const

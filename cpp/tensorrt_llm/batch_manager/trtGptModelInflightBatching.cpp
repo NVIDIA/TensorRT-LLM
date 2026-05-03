@@ -921,7 +921,7 @@ void TrtGptModelInflightBatching::forwardSync()
                     TLLM_CHECK_WITH_INFO(mCacheTransceiver,
                         "Disaggregated serving is not enabled, please check the configuration of "
                         "cacheTransceiverConfig.");
-                    mCacheTransceiver->respondAndSendAsync(llmReq.get());
+                    mCacheTransceiver->respondAndSendAsync(llmReq);
                 }
                 mSeqSlotManager->freeSequenceSlot(llmReq->mRequestId);
             }
@@ -1602,11 +1602,11 @@ void TrtGptModelInflightBatching::prepareDisaggGenInitRequests(
             mCacheTransceiver, "Disaggregated serving is not enabled, please check the configuration.");
         if (common::getEnvDisableKVCacheTransferOverlap())
         {
-            mCacheTransceiver->requestAndReceiveSync(newGenReq.get());
+            mCacheTransceiver->requestAndReceiveSync(newGenReq);
         }
         else
         {
-            mCacheTransceiver->requestAndReceiveAsync(newGenReq.get());
+            mCacheTransceiver->requestAndReceiveAsync(newGenReq);
         }
     }
     if (!common::getEnvDisableKVCacheTransferOverlap())

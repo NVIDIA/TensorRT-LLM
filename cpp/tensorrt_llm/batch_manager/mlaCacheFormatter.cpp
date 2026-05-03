@@ -30,6 +30,7 @@
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <future>
@@ -253,7 +254,18 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             return bufferSizeForTarget;
         };
         auto bufferEleSizes = getBufferSizeForTarget();
-        auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend();
+        // RAII wrapper mirrors the receiver-side pattern. Happy-path calls
+        // sendHolder.release(); other exits auto-release via
+        // ~BufferIndexHolder. Send-pool CV wait observes the per-request
+        // cancel flag via the session's DataContext and throws on cancel
+        // (parity with recv side).
+        auto const sendReqIdForLog = std::make_optional(static_cast<uint64_t>(llmRequest.mRequestId));
+        auto const* sendCancelFlag = &session.getDataContext().getTransferTerminate();
+        auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend(
+            sendCancelFlag, /*waitSliceMs=*/100, sendReqIdForLog);
+        BufferIndexHolder sendHolder(
+            *mCacheTransBufferManagers[transferIndexerKCache], cacheBufferId, /*isRecv=*/false, sendReqIdForLog);
+        TLLM_LOG_DEBUG("[buf] SEND_ACQUIRED reqId=%zu index=%d", llmRequest.mRequestId, cacheBufferId.value_or(-1));
         auto result = mCacheTransBufferManagers[transferIndexerKCache]->getOrAllocateSendBuffers(
             cacheBufferId, static_cast<int>(pPDomainSize * cPDomainSize), bufferEleSizes, bufferManager);
         auto& outputSplitCaches = std::get<0>(result);
@@ -295,6 +307,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             NVTX3_SCOPED_RANGE(sendBufferFun);
 
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
+            auto const sendReqId = static_cast<uint64_t>(llmRequest.mRequestId);
             auto startTime = LlmRequest::getSteadyClockNow();
             // Compute cacheIdx based on CP-major connection ordering:
             // - cpDomainIdx = which CP domain this connection belongs to.
@@ -305,7 +318,11 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             if (cacheIdx < bufferCoverTargetNum)
             {
                 size_t size = outputSplitCaches.at(cacheIdx)->getSizeInBytes();
+                TLLM_LOG_DEBUG(
+                    "[send] PRE reqId=%zu connIdx=%zu cacheIdx=%zu size=%zu", sendReqId, processIdx, cacheIdx, size);
                 session.send(processIdx, outputSplitCaches.at(cacheIdx)->data(), size);
+                TLLM_LOG_DEBUG(
+                    "[send] DONE reqId=%zu connIdx=%zu cacheIdx=%zu size=%zu", sendReqId, processIdx, cacheIdx, size);
             }
             else
             {
@@ -380,7 +397,9 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         {
             sendBufferFun(deviceId, pickUpConnections[0]);
         }
-        mCacheTransBufferManagers[transferIndexerKCache]->freeBufferIndexForSend(cacheBufferId);
+        // Atomic happy-path release — silent free + disarm in one noexcept call.
+        sendHolder.release();
+        TLLM_LOG_DEBUG("[buf] SEND_RELEASE reqId=%zu index=%d", llmRequest.mRequestId, cacheBufferId.value_or(-1));
     }
     session.setTime(TransferSession::kTimeTransmissions);
     session.setTime(TransferSession::kTimePostprocess);

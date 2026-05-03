@@ -351,6 +351,13 @@ class PyExecutor:
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
+        self._disagg_gen_init_prepared_ids: Dict[
+            ResourceManagerType, set[int]] = {
+                ResourceManagerType.KV_CACHE_MANAGER: set(),
+                ResourceManagerType.SPEC_RESOURCE_MANAGER: set(),
+                ResourceManagerType.DRAFT_KV_CACHE_MANAGER: set(),
+            }
+        self._disagg_gen_kv_recv_started_ids: set[int] = set()
 
         # Rolling acceptance tracking for spec decode (disable speculation if rolling acceptance is below threshold)
         spec_config = getattr(self.model_engine, 'spec_config', None)
@@ -2973,9 +2980,6 @@ class PyExecutor:
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
         if fitting_disagg_gen_init_requests:
-            disagg_gen_init_to_prepare = ScheduledRequests()
-            disagg_gen_init_to_prepare.context_requests_last_chunk = fitting_disagg_gen_init_requests
-
             for resource_mgr_type in (
                     ResourceManagerType.KV_CACHE_MANAGER,
                     ResourceManagerType.SPEC_RESOURCE_MANAGER,
@@ -2983,9 +2987,22 @@ class PyExecutor:
                 if (resource_mgr_type in self.resource_manager.resource_managers
                         and self.resource_manager.
                         resource_managers[resource_mgr_type] is not None):
+                    prepared_ids = self._disagg_gen_init_prepared_ids[
+                        resource_mgr_type]
+                    resources_to_prepare = [
+                        req for req in fitting_disagg_gen_init_requests
+                        if req.py_request_id not in prepared_ids
+                    ]
+                    if not resources_to_prepare:
+                        continue
+
+                    disagg_gen_init_to_prepare = ScheduledRequests()
+                    disagg_gen_init_to_prepare.context_requests_last_chunk = resources_to_prepare
                     self.resource_manager.resource_managers[
                         resource_mgr_type].prepare_resources(
                             disagg_gen_init_to_prepare)
+                    for req in resources_to_prepare:
+                        prepared_ids.add(req.py_request_id)
 
             # Trigger KV cache exchange for new disagg_gen_init_requests
             self._recv_disagg_gen_cache(fitting_disagg_gen_init_requests)
@@ -3068,15 +3085,36 @@ class PyExecutor:
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             return
 
+        recv_reqs = []
+        for req in new_gen_reqs:
+            if req.py_request_id in self._disagg_gen_kv_recv_started_ids:
+                continue
+            recv_reqs.append(req)
+
+        if not recv_reqs:
+            return
+
         if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
-            for req in new_gen_reqs:
-                self.kv_cache_transceiver.request_and_receive_sync(req)
+            for req in recv_reqs:
+                self._disagg_gen_kv_recv_started_ids.add(req.py_request_id)
+                try:
+                    self.kv_cache_transceiver.request_and_receive_sync(req)
+                except Exception:
+                    self._disagg_gen_kv_recv_started_ids.discard(
+                        req.py_request_id)
+                    raise
         else:
-            for req in new_gen_reqs:
-                self.kv_cache_transceiver.request_and_receive_async(req)
+            for req in recv_reqs:
+                self._disagg_gen_kv_recv_started_ids.add(req.py_request_id)
+                try:
+                    self.kv_cache_transceiver.request_and_receive_async(req)
+                except Exception:
+                    self._disagg_gen_kv_recv_started_ids.discard(
+                        req.py_request_id)
+                    raise
 
         if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
-            for req in new_gen_reqs:
+            for req in recv_reqs:
                 if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
                     req.py_kv_transfer_start_time = time.time()
 
@@ -3175,6 +3213,16 @@ class PyExecutor:
         for request_id in list(requests_in_transfer.keys()):
             request = requests_in_transfer[request_id]
             if request.py_kv_transfer_timed_out and request_id not in completed_req_ids:
+                # The Path B guard previously deferred cleanup while state was
+                # DISAGG_CONTEXT_TRANS_IN_PROGRESS to avoid a UAF on
+                # CacheTransceiver::mSenderFutures's raw LlmRequest* (confirmed
+                # via MALLOC_PERTURB_=85 producing mRequestId=0x5555555555555555).
+                # mSenderFutures now holds std::shared_ptr<LlmRequest>, so the
+                # LlmRequest outlives every C++ access regardless of when
+                # Python drops its pybind reference — the UAF class is gone
+                # and the guard is no longer needed. Running cancel_request +
+                # end_transfer here recovers the KV blocks promptly even when
+                # the C++ deadline check can't reach the entry (orphan class).
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
                 # If cancel is successful, mark as complete so it can be cleaned up
                 # Otherwise, try at next iteration
@@ -3544,7 +3592,17 @@ class PyExecutor:
                 requests_to_terminate.append(request)
                 continue
 
-            # Check if generation request needs cleanup due to KV cache transfer timeout
+            # Check if generation request needs cleanup due to KV cache transfer timeout.
+            #
+            # The C++ transceiver's async workers and mSenderFutures /
+            # mRequesterFutures now hold std::shared_ptr<LlmRequest> (not raw
+            # pointers), so Python-side _terminate_request can safely run
+            # regardless of C++ state — the LlmRequest stays alive until all
+            # strong references (Python active_requests, C++ futures map,
+            # async workers) drop. The previous Path A guard existed to defer
+            # cleanup until C++ evicted first; that guard was what turned
+            # C++ tracker orphans into permanent KV-block leaks because the
+            # C++ deadline check couldn't reach orphaned entries.
             if request.py_kv_transfer_timed_out:
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
                 if is_cancelled:
@@ -3618,11 +3676,25 @@ class PyExecutor:
                 # If partial reuse is enabled, and the KV cache manager is not VSWA, and the PP size is 1,
                 # then we need to terminate the request. TODO: Remove this once disagg support from KVCache reuse
                 # path is fixed.
-                if self.enable_partial_reuse_for_disagg and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1:
+                if request.is_disagg_context_complete_state:
+                    # Already terminated (or attempted) by
+                    # _check_disagg_ctx_cache_transfer_status; re-terminating
+                    # here would cause a double free in resource_manager
+                    # (nvbug/5961736).
+                    pass
+                elif request.is_disagg_context_transmission_state:
+                    # Request is still transferring KV cache to the decode worker.
+                    # Do NOT terminate — the C++ CacheTransceiver still holds a raw
+                    # pointer to this request in mSenderFutures. Terminating now
+                    # would free the LlmRequest and create a dangling pointer,
+                    # causing use-after-free (request ID reads as 0, transfer start
+                    # reads as epoch). Let the transfer complete or time out via
+                    # kv_transfer_timeout_ms in checkContextTransferStatus.
+                    pass
+                elif self.enable_partial_reuse_for_disagg and not self.kv_cache_manager.is_vswa and self.dist.pp_size == 1:
                     requests_to_terminate.append(request)
                 else:
-                    if not request.is_disagg_context_transmission_state:
-                        requests_to_terminate.append(request)
+                    requests_to_terminate.append(request)
             else:
                 new_active_requests.append(request)
 

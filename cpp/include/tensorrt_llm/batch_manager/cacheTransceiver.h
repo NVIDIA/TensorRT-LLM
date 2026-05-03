@@ -204,13 +204,22 @@ class BaseCacheTransceiver
 {
 public:
     virtual ~BaseCacheTransceiver() = default;
-    virtual void respondAndSendAsync(LlmRequest* llmRequest) = 0;
+    // These methods take std::shared_ptr<LlmRequest> (not a raw pointer) so the
+    // transceiver and its async workers can hold a strong reference for the
+    // duration of the transfer. Previously they took LlmRequest*, which left
+    // the worker (via RequestAndPromise::mRequest) dereferencing a pybind
+    // shared_ptr that Python could drop via _terminate_request — a
+    // forensically-confirmed UAF pattern (mRequestId read as
+    // 0x5555555555555555 under MALLOC_PERTURB_). Passing the shared_ptr through
+    // keeps the LlmRequest alive until every holder (Python active_requests,
+    // C++ futures map, async worker) has released its reference.
+    virtual void respondAndSendAsync(std::shared_ptr<LlmRequest> llmRequest) = 0;
     virtual void respondAndSendLayerWise(
         RequestVector const& requests, std::shared_ptr<ContextProgress> const& progress)
         = 0;
 
-    virtual void requestAndReceiveSync(LlmRequest* llmRequest) = 0;
-    virtual void requestAndReceiveAsync(LlmRequest* llmRequest) = 0;
+    virtual void requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest) = 0;
+    virtual void requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmRequest) = 0;
 
     /// Check all requests transferring context, and return the requests that have completed or encountered an error.
     virtual RequestStatuses checkContextTransferStatus(
@@ -221,7 +230,7 @@ public:
 
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
 
-    virtual bool cancelRequest(LlmRequest* llmRequest) = 0;
+    virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) = 0;
 };
 
 class CacheTransceiver : public BaseCacheTransceiver
@@ -252,13 +261,13 @@ public:
 
     virtual ~CacheTransceiver();
 
-    void respondAndSendAsync(LlmRequest* llmRequest) override;
+    void respondAndSendAsync(std::shared_ptr<LlmRequest> llmRequest) override;
 
     void respondAndSendLayerWise(
         RequestVector const& requests, std::shared_ptr<ContextProgress> const& progress) override;
 
-    void requestAndReceiveSync(LlmRequest* llmRequest) override;
-    void requestAndReceiveAsync(LlmRequest* llmRequest) override;
+    void requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest) override;
+    void requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmRequest) override;
 
     RequestStatuses checkContextTransferStatus(
         std::optional<int> const& atLeastRequestNum = std::nullopt, bool markComplete = false) override;
@@ -267,7 +276,7 @@ public:
 
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
-    virtual bool cancelRequest(LlmRequest* llmRequest) override;
+    virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) override;
 
 private:
     void initializeCommState();
@@ -276,8 +285,17 @@ private:
 
     std::unique_ptr<CacheSender> mCacheSender;
     std::unique_ptr<CacheReceiver> mCacheReceiver;
-    std::vector<std::pair<LlmRequest*, std::future<void>>> mSenderFutures;
-    std::vector<std::pair<LlmRequest*, std::future<void>>> mRequesterFutures;
+    // Store shared_ptr rather than raw LlmRequest* so the futures map holds a
+    // strong reference for the duration of the transfer. Otherwise Python's
+    // _terminate_request can drop its pybind shared_ptr while the C++ side's
+    // raw pointer is still dereferenced by checkGenTransferStatus /
+    // checkContextTransferStatus (the UAF forensically confirmed via
+    // MALLOC_PERTURB_=85 producing mRequestId=0x5555555555555555). Entries are
+    // erased only in the normal eviction paths (completion, deadline,
+    // exception), ensuring the request outlives every C++ access but doesn't
+    // leak past the transfer lifecycle.
+    std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mSenderFutures;
+    std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mRequesterFutures;
     mpi::MpiComm const* mMpiWorldComm{nullptr};
 
     std::shared_ptr<CacheTransceiverComm> mGroupComm;
