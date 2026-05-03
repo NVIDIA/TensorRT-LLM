@@ -648,8 +648,22 @@ class Sender(SenderBase):
                         f"{dst_block_ids.size} (expected diff <= 1)"
                     )
                 tpb = extractor.page_table.tokens_per_block
-                src_start = task._slice.token_range.start if task._slice.token_range else 0
-                dst_start = req_info.start_token_idx or 0
+                token_range = task._slice.token_range
+                lg_info = extractor.page_table.layer_groups[self_lg]
+                window_size = getattr(lg_info, "sliding_window_size", None)
+                if window_size is not None and token_range is not None:
+                    # For sliding-window layers the window-trimmed block list
+                    # starts at stale_end*tpb, not 0.  Compute correct per-group
+                    # src_start and dst_start so _align_kv_blocks can pair blocks
+                    # by their actual token coverage rather than the global offset.
+                    prompt_len = token_range.end
+                    stale_end = max(0, (prompt_len + 1 - window_size) // tpb)
+                    cached_tokens = token_range.start
+                    src_start = max(stale_end * tpb, cached_tokens)
+                    dst_start = max(stale_end * tpb, req_info.start_token_idx or 0)
+                else:
+                    src_start = token_range.start if token_range else 0
+                    dst_start = req_info.start_token_idx or 0
                 src_block_ids, dst_block_ids = Sender._align_kv_blocks(
                     src_block_ids,
                     dst_block_ids,
@@ -1535,6 +1549,8 @@ class RxSession(RxSessionBase):
     def status(self) -> SessionStatus:
         if self._terminal_status is not None:
             return self._terminal_status
+        if self._exception is not None or any(t.status == TaskStatus.ERROR for t in self._kv_tasks):
+            return SessionStatus.ERROR
         if self._kv_tasks:
             kv_all_transferred = all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks)
             if kv_all_transferred and self._aux_status == TaskStatus.TRANSFERRED:
