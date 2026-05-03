@@ -48,7 +48,7 @@ On real DeepSeek-V3.2 decoding workloads running on NVIDIA Blackwell GPUs, GVR d
 - up to **2.42x** per layer per decode step,
 - and end-to-end TPOT reduction of up to **7.52%** in fixed-OSL TEP8 min-latency deployment.
 
-This blog focuses on the technical-blog view of the work: the background, the motivation, the main ideas, how GVR is integrated into TensorRT-LLM, how to enable it, and what the operator-level and end-to-end gains look like. For the full derivations, exact correctness argument, detailed iteration statistics, and supplementary methodology, see the current [arXiv manuscript draft](https://services.arxiv.org/html/submission/7430996/view) and the detailed [performance-model / pseudocode notes](https://github.com/longcheng-nv/TensorRT-LLM/tree/tmp/heuristic_topK_pseudocode_perfmodel/GVR_TopK_Perf_Model).
+This blog focuses on the technical-blog view of the work: the background, the motivation, the main ideas, how GVR is integrated into TensorRT-LLM, how to enable it, and what the operator-level and end-to-end gains look like. For the full derivations, exact correctness argument, detailed iteration statistics, and supplementary methodology, see Cheng, Long, et al. ["Guess-Verify-Refine: Data-Aware Top-K for Sparse-Attention Decoding on Blackwell via Temporal Correlation"](https://doi.org/10.48550/arXiv.2604.22312), arXiv:2604.22312 (2026).
 
 ## Why Decode-Time Top-K Matters in DSA
 
@@ -130,7 +130,7 @@ At a high level:
 
 YaRN matters here too: by preserving meaningful long-range peaks, it makes the Top-K set span both nearby and more distant positions, which strengthens the prediction signal available from the previous step.
 
-For the full theoretical derivation and the formal connection between RoPE/YaRN structure and temporal Top-K stability, see the [arXiv manuscript draft](https://services.arxiv.org/html/submission/7430996/view).
+For the full theoretical derivation and the formal connection between RoPE/YaRN structure and temporal Top-K stability, see the [GVR Top-K arXiv paper](https://doi.org/10.48550/arXiv.2604.22312).
 
 ## How GVR Works
 
@@ -221,7 +221,7 @@ In practice:
 - ties remain non-deterministic in the same way as the production kernel,
 - and end-to-end model behavior remains unchanged within observed variance.
 
-For the full correctness argument, the exact candidate-set condition, detailed pseudocode, and the GPU performance model, see the [arXiv manuscript draft](https://services.arxiv.org/html/submission/7430996/view) and the detailed [performance-model / pseudocode notes](https://github.com/longcheng-nv/TensorRT-LLM/tree/tmp/heuristic_topK_pseudocode_perfmodel/GVR_TopK_Perf_Model).
+For the full correctness argument, the exact candidate-set condition, detailed pseudocode, and the GPU performance model, see the [GVR Top-K arXiv paper](https://doi.org/10.48550/arXiv.2604.22312).
 
 ## TensorRT-LLM Integration
 
@@ -341,7 +341,7 @@ These real-data gains line up with the main design intuition:
 - bounded distributions (for example beta-like layers) give cleaner thresholds,
 - but even the harder layers still remain meaningfully faster than the baseline.
 
-For the full tables, per-layer breakdowns, and replay statistics of Phase 2 / Phase 4 iteration counts, see the [arXiv manuscript draft](https://services.arxiv.org/html/submission/7430996/view) and the [performance-model / pseudocode notes](https://github.com/longcheng-nv/TensorRT-LLM/tree/tmp/heuristic_topK_pseudocode_perfmodel/GVR_TopK_Perf_Model).
+For the full tables, per-layer breakdowns, and replay statistics of Phase 2 / Phase 4 iteration counts, see the [GVR Top-K arXiv paper](https://doi.org/10.48550/arXiv.2604.22312).
 
 ### Ablation: Architecture vs Prediction Quality
 
@@ -373,7 +373,7 @@ We validated that enabling GVR does not introduce measurable end-to-end quality 
 
 The high-level conclusion is the important one for this blog: GVR accelerates the decode-stage Top-K path without introducing measurable end-to-end accuracy regression.
 
-For the detailed benchmark table and discussion of why long-context evaluation is the most representative stress test for this path, see the [arXiv manuscript draft](https://services.arxiv.org/html/submission/7430996/view).
+For the detailed benchmark table and discussion of why long-context evaluation is the most representative stress test for this path, see the [GVR Top-K arXiv paper](https://doi.org/10.48550/arXiv.2604.22312).
 
 ### End-to-End TPOT Reduction
 
@@ -419,9 +419,9 @@ This is consistent with the single-operator story: the longer the context, the l
 
 ## Further Reading and Reproduction
 
-If you want the paper-level version of this work, start with the current [arXiv manuscript draft](https://services.arxiv.org/html/submission/7430996/view).
+If you want the paper-level version of this work, start with Cheng, Long, et al. ["Guess-Verify-Refine: Data-Aware Top-K for Sparse-Attention Decoding on Blackwell via Temporal Correlation"](https://doi.org/10.48550/arXiv.2604.22312), arXiv:2604.22312 (2026).
 
-If you want the low-level algorithm, pseudocode, replay statistics, and GPU performance model, see the detailed [performance-model / pseudocode notes](https://github.com/longcheng-nv/TensorRT-LLM/tree/tmp/heuristic_topK_pseudocode_perfmodel/GVR_TopK_Perf_Model).
+The arXiv paper contains the low-level algorithm, pseudocode, replay statistics, and GPU performance model behind the implementation summarized here.
 
 For surrounding TensorRT-LLM context, the most relevant companion reads are:
 
@@ -483,7 +483,7 @@ In the benchmark script, the only A/B difference between the two runs is:
 - `enable_heuristic_topk: false` for the production radix-select path,
 - `enable_heuristic_topk: true` for the GVR path.
 
-The complete TEP8 benchmark driver, dataset preparation logic, and report-generation utilities are included in the supplementary materials linked from the [arXiv manuscript draft](https://services.arxiv.org/html/submission/7430996/view).
+The benchmark configuration above is the self-contained TensorRT-LLM setup used for the technical-blog reproduction path; additional methodology details are available in the [GVR Top-K arXiv paper](https://doi.org/10.48550/arXiv.2604.22312).
 
 ## Conclusion
 
