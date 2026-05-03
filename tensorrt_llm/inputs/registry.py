@@ -19,8 +19,9 @@ from ..logger import logger
 from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
 from .data import TextPrompt
-from .multimodal import (MultimodalInput, apply_mm_hashes, default_hasher,
-                         find_mm_token_lengths, find_mm_token_positions,
+from .multimodal import (MultimodalInput, _as_cpu_tensor, _compute_mm_masks,
+                         _find_mm_token_start_pos_from_masks, apply_mm_hashes,
+                         default_hasher, find_mm_token_lengths,
                          hexdigest_to_int32, validate_mm_inputs)
 
 N = TypeVar("N", bound=Type[nn.Module])
@@ -237,11 +238,15 @@ class BaseMultimodalInputProcessor(ABC):
         return None
 
     def get_mm_token_ids(self) -> Optional[Tensor]:
-        """Return multimodal token IDs if available; otherwise None.
+        """Token IDs for a logical multimodal unit; include framing tokens for one contiguous span per unit.
 
-        The token IDs filtered by this method should be contiguous for each multimodal item, i.e. special tokens if any should be included.
+        Framing tokens must also be in `get_mm_special_token_ids`. Example (Mistral):
+        `[IMG][IMG][IMG_BREAK][IMG][IMG][IMG_END]` → `{IMG, IMG_BREAK, IMG_END}`
+        = 1 span; `{IMG}` alone fragments into 3.
+        Return value is a 1-D tensor of token IDs; these are token values, not
+        prompt positions or per-image counts.
         """
-        if hasattr(self.processor, 'mm_token_ids'):
+        if hasattr(self.processor, "mm_token_ids"):
             return self.processor.mm_token_ids
 
         logger.debug(
@@ -251,13 +256,13 @@ class BaseMultimodalInputProcessor(ABC):
         return None
 
     def get_mm_special_token_ids(self) -> Optional[Tensor]:
-        """
-        Return multimodal special token IDs if available; otherwise None.
+        """IDs for in-prompt framing tokens inside a multimodal unit that carry no vision embedding.
 
-        Special tokens refer to multimodal-related tokens (e.g. <image_end>, <image_break>) that are not part
-        of the ViT output but come from text embeddings. Some VLMs
-        (e.g., Mistral3, LLaMA4) mix special tokens with multimodal tokens,
-        so they need to be returned separately.
+        Found in e.g. Mistral3/LLaMA4 (`image_break`, `image_end`). Example: for
+        `[IMG][IMG][IMG_BREAK][IMG][IMG][IMG_END]` return `{IMG_BREAK, IMG_END}`
+        — subtracted from the embed mask so embed-slot count stays accurate.
+        Return value is a 1-D tensor of token IDs; these tokens are excluded
+        from the embedding-row mask.
         """
         return getattr(self.processor, "mm_special_token_ids", None)
 
@@ -284,9 +289,13 @@ class BaseMultimodalInputProcessor(ABC):
         Calculate the number of tokens generated for an image.
 
         This (default) method delegates to the Hugging Face processor's '_get_num_multimodal_tokens' method.
-        Accepts either a PIL Image or a CHW ``torch.Tensor`` — the hashing path
-        in ``find_mm_token_lengths`` feeds tensors directly to avoid a costly
+        Accepts either a PIL Image or a CHW `torch.Tensor` — the hashing path
+        in `find_mm_token_lengths` feeds tensors directly to avoid a costly
         ToPIL round-trip, while existing direct callers may still pass PIL.
+
+        Returns the token count for the given image.
+        Example: for Mistral, this count includes IMG placeholders plus row
+        break/end framing tokens, matching the prompt-side logical MM unit.
 
         Subclasses can override this method to provide custom logic to calculate the number of tokens.
         """
@@ -307,7 +316,11 @@ class BaseMultimodalInputProcessor(ABC):
         Calculate the number of tokens generated for a video.
 
         This (default) method delegates to the Hugging Face processor's '_get_num_multimodal_tokens' method.
-        Accepts a list of PIL Images or CHW ``torch.Tensor`` frames.
+        Accepts a list of PIL Images or CHW `torch.Tensor` frames.
+
+        Returns the token count for the given video.
+        Example: for a video item, return the prompt-side token count for that
+        one video unit, not the number of video frames.
 
         Subclasses can override this method to provide custom logic to calculate the number of tokens.
         """
@@ -729,18 +742,67 @@ def _process_multimodal_with_dummy_placeholders(
 def _get_single_mm_token_lengths(
     mm_data: Dict[str, Any],
     input_processor: BaseMultimodalInputProcessor,
+    *,
+    multimodal_data: Optional[Dict[str, Any]] = None,
 ) -> Optional[List[int]]:
     """Get the single set of MM token lengths (first value from find_mm_token_lengths). Returns None if empty."""
-    num_mm_tokens_by_key = find_mm_token_lengths(mm_data, input_processor)
+    num_mm_tokens_by_key = find_mm_token_lengths(
+        mm_data, input_processor, multimodal_data=multimodal_data)
     if not num_mm_tokens_by_key:
         return None
     # find_mm_token_lengths returns Dict[modality, List[int]], e.g. {"image": [2928, 2928]}.
-    # We need the list of per-item lengths (for find_mm_token_positions), We take the first modality's
-    # list; multi-modality is not yet supported (see TODO in multimodal_hashing_process).
+    # We need the list of per-item lengths (for _find_mm_token_start_pos_from_masks). We take
+    # the first modality's list; multi-modality is not yet supported
+    # (see TODO in multimodal_hashing_process).
     num_mm_tokens = next(iter(num_mm_tokens_by_key.values()))
     if len(num_mm_tokens) <= 0:
         return None
     return num_mm_tokens
+
+
+def maybe_compute_mm_embed_cumsum(
+    prompt_token_ids: List[int],
+    extra_processed_inputs: Optional[ExtraProcessedInputs],
+    input_processor: BaseMultimodalInputProcessor,
+) -> None:
+    """Ensure `multimodal_embed_mask_cumsum` is present in `extra_processed_inputs`.
+
+    Silently skipped if the processor provides neither `vocab_size` nor
+    `mm_token_ids`.
+
+    Idempotent: no-op when the cumsum is already populated. Otherwise
+    classifies every prompt position via the processor's `mm_token_ids` /
+    `vocab_size` predicate (with specials subtracted), takes the int64
+    prefix sum, and stores the flat `int64[prompt_len]` tensor at
+    `extra_processed_inputs["multimodal_data"]["multimodal_embed_mask_cumsum"]`.
+
+    """
+    if extra_processed_inputs is None:
+        return
+    mm_data = extra_processed_inputs.get("multimodal_data")
+    if mm_data is None:
+        return
+    if "multimodal_embed_mask_cumsum" in mm_data:
+        return
+
+    vocab_size = input_processor.get_vocab_size()
+    mm_token_ids = input_processor.get_mm_token_ids()
+    if vocab_size is None and mm_token_ids is None:
+        logger.debug(
+            "maybe_compute_mm_embed_cumsum: processor provides neither "
+            "vocab_size nor mm_token_ids — skipping cumsum computation.")
+        return
+
+    input_ids = _as_cpu_tensor(prompt_token_ids)
+    _, embed_mask, _ = _compute_mm_masks(
+        input_ids,
+        vocab_size=vocab_size,
+        mm_token_ids=mm_token_ids,
+        mm_special_token_ids=input_processor.get_mm_special_token_ids(),
+    )
+    # Cache the int64 cumsum; request-invariant, read once per chunk.
+    mm_data["multimodal_embed_mask_cumsum"] = embed_mask.cumsum(
+        0, dtype=torch.int64)
 
 
 def create_input_processor_with_hash(
@@ -786,7 +848,12 @@ def create_input_processor_with_hash(
             inputs.get("mm_processor_kwargs"),
             sampling_params,
         )
-        num_mm_tokens = _get_single_mm_token_lengths(mm_data, input_processor)
+        num_mm_tokens = _get_single_mm_token_lengths(
+            mm_data,
+            input_processor,
+            multimodal_data=(extra_processed_inputs
+                             or {}).get("multimodal_data"),
+        )
         if num_mm_tokens is None:
             raise ValueError(
                 "tokenized_multimodal_process: find_mm_token_lengths returned "
@@ -801,6 +868,7 @@ def create_input_processor_with_hash(
             sampling_params,
             precomputed_token_ids=expanded_ids,
             precomputed_extra=extra_processed_inputs,
+            precomputed_num_mm_tokens=num_mm_tokens,
         )
 
     def multimodal_hashing_process(
@@ -809,6 +877,7 @@ def create_input_processor_with_hash(
         *,
         precomputed_token_ids: Optional[List[int]] = None,
         precomputed_extra: Optional[ExtraProcessedInputs] = None,
+        precomputed_num_mm_tokens: Optional[List[int]] = None,
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         """
         Process multimodal hashing for media tokens if possible.
@@ -816,6 +885,10 @@ def create_input_processor_with_hash(
         precomputed_token_ids and precomputed_extra must be provided together or
         both be None. When both are provided (tokenized+MM path), skips the
         input_processor call and uses them; when both are None, calls input_processor.
+
+        precomputed_num_mm_tokens is optional and independent: if provided, skips
+        the otherwise-duplicate find_mm_token_lengths call (the tokenized+MM path
+        already computes it upstream to expand the prompt).
 
         Supports optional user-provided UUIDs via 'multi_modal_uuids' in inputs.
         When a UUID is provided for a multimodal item, it will be used as the
@@ -840,9 +913,19 @@ def create_input_processor_with_hash(
                 "precomputed_token_ids and precomputed_extra must be provided "
                 "together or both be None; got one without the other.")
 
-        num_mm_tokens = find_mm_token_lengths(mm_data, input_processor)
-        # TODO: here we assume there is only one modality for now
-        num_mm_tokens = next(iter(num_mm_tokens.values()))
+        if precomputed_num_mm_tokens is not None:
+            num_mm_tokens = precomputed_num_mm_tokens
+        else:
+            # TODO: here we assume there is only one modality for now
+            num_mm_tokens_by_key = find_mm_token_lengths(
+                mm_data,
+                input_processor,
+                multimodal_data=(extra_processed_inputs
+                                 or {}).get("multimodal_data"),
+            )
+            if not num_mm_tokens_by_key:
+                return [], None
+            num_mm_tokens = next(iter(num_mm_tokens_by_key.values()))
         if len(num_mm_tokens) <= 0:
             return [], None
 
@@ -853,14 +936,26 @@ def create_input_processor_with_hash(
             raise ValueError(
                 "Cannot locate vocab_size or mm_token_ids for multimodal token preprocessing"
             )
-        start_positions, start_special_token_positions = find_mm_token_positions(
-            input_ids=prompt_token_ids,  # token sequence
-            num_mm_tokens=
-            num_mm_tokens,  # list of lengths of each chunk of visual tokens
-            vocab_size=vocab_size,
-            mm_token_ids=mm_ids,
-            mm_special_token_ids=mm_special_token_ids,
-        )
+        # Compute all three masks once here and reuse downstream. The embed
+        # cumsum is stashed into extra_processed_inputs so the wrapper's
+        # subsequent maybe_compute_mm_embed_cumsum call short-circuits via
+        # its idempotency guard, avoiding a second full-sequence isin pass.
+        input_ids_tensor = _as_cpu_tensor(prompt_token_ids)
+        if input_ids_tensor.numel() == 0:
+            start_positions, start_special_token_positions = [], []
+        else:
+            mm_mask, embed_mask, special_mask = _compute_mm_masks(
+                input_ids_tensor,
+                vocab_size=vocab_size,
+                mm_token_ids=mm_ids,
+                mm_special_token_ids=mm_special_token_ids,
+            )
+            extra_processed_inputs["multimodal_data"].setdefault(
+                "multimodal_embed_mask_cumsum",
+                embed_mask.cumsum(0, dtype=torch.int64))
+            start_positions, start_special_token_positions = (
+                _find_mm_token_start_pos_from_masks(mm_mask, special_mask,
+                                                    num_mm_tokens))
         # Store special token offsets if available
         if len(start_special_token_positions
                ) > 0 and mm_special_token_ids is not None:
@@ -878,22 +973,18 @@ def create_input_processor_with_hash(
                 mm_hashes_int32, start_positions, num_mm_tokens, mm_uuid_list)
         return prompt_token_ids, extra_processed_inputs
 
-    def input_processor_wrapper(
+    def process_tokenized_prompt_maybe_hash(
         inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        # Tokenized prompt + multi_modal_data
-        if (inputs.get("prompt_token_ids") is not None
-                and inputs.get("multi_modal_data") is not None
-                and inputs.get("prompt") is None):
-            if hasattr(input_processor,
-                       "get_text_with_mm_placeholders") and hasattr(
-                           input_processor, "expand_prompt_token_ids_for_mm"):
-                try:
-                    return tokenized_multimodal_process(inputs, sampling_params)
-                except Exception as e:
-                    logger.warning(f"Tokenized+MM path failed: {e}")
-                    raise
+        try:
+            return tokenized_multimodal_process(inputs, sampling_params)
+        except Exception as e:
+            logger.warning(f"Tokenized+MM path failed: {e}")
+            raise
 
+    def process_prompt_maybe_hash(
+        inputs: TextPrompt, sampling_params: SamplingParams
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         try_multimodal_hashing = False  # only used for first time
         use_multimodal_hashing = False  # used for subsequent calls
         modalities = list(set(inputs['multi_modal_data'].keys())
@@ -917,7 +1008,6 @@ def create_input_processor_with_hash(
                 if try_multimodal_hashing:
                     # if trying for first time, set the flag to True
                     input_processor.multimodal_hashing_supported = True
-                return prompt_token_ids, extra_processed_inputs
             except Exception as e:
                 logger.warning(f"Multimodal hashing failed: {e}.")
                 if try_multimodal_hashing:
@@ -926,7 +1016,8 @@ def create_input_processor_with_hash(
                     input_processor.multimodal_hashing_supported = False
                     logger.warning("Falling back to basic input processor.")
                     try:
-                        return input_processor(inputs, sampling_params)
+                        prompt_token_ids, extra_processed_inputs = input_processor(
+                            inputs, sampling_params)
                     except Exception as e2:
                         logger.warning(f"Basic input processor failed: {e}.")
                         logger.debug(traceback.format_exc())
@@ -935,10 +1026,36 @@ def create_input_processor_with_hash(
                     raise e
         else:
             try:
-                return input_processor(inputs, sampling_params)
+                prompt_token_ids, extra_processed_inputs = input_processor(
+                    inputs, sampling_params)
             except Exception as e:
                 logger.warning(f"Basic input processor failed: {e}.")
                 logger.debug(traceback.format_exc())
                 raise e
+
+        return prompt_token_ids, extra_processed_inputs
+
+    def input_processor_wrapper(
+        inputs: TextPrompt, sampling_params: SamplingParams
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        # Tokenized prompt + multi_modal_data path: requires the optional hooks.
+        # If the processor lacks them, fall through to the regular prompt path.
+        has_tokenized_multimodal_prompt = (
+            inputs.get("prompt_token_ids") is not None
+            and inputs.get("multi_modal_data") is not None
+            and inputs.get("prompt") is None
+            and hasattr(input_processor, "get_text_with_mm_placeholders")
+            and hasattr(input_processor, "expand_prompt_token_ids_for_mm"))
+
+        if has_tokenized_multimodal_prompt:
+            prompt_token_ids, extra_processed_inputs = (
+                process_tokenized_prompt_maybe_hash(inputs, sampling_params))
+        else:
+            prompt_token_ids, extra_processed_inputs = (
+                process_prompt_maybe_hash(inputs, sampling_params))
+
+        maybe_compute_mm_embed_cumsum(prompt_token_ids, extra_processed_inputs,
+                                      input_processor)
+        return prompt_token_ids, extra_processed_inputs
 
     return input_processor_wrapper

@@ -350,6 +350,10 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
             assert request.multimodal_lengths is not None
+            # TODO(TRTLLM-12175): request.multimodal_lengths is a
+            # prompt-side MM-token count and may include non-embedding
+            # special/framing tokens. This validation needs per-item
+            # encoder-output embedding lengths instead.
             if len(mm_embedding) != sum(request.multimodal_lengths):
                 raise ValueError(
                     f"mm_embedding shape mismatch: {len(mm_embedding)} != {sum(request.multimodal_lengths)}"
@@ -4129,17 +4133,24 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             "batch_logits_for_logprobs_cuda must be a Tensor for _process_logprobs"
         )
 
-        all_req_indices = batched_sampling_result.batch_req_indices.tolist()
-        # The request indices in the shuffled batch after grouping (NB: Beam search request are handled separately)
-        local_group_req_indices = torch.tensor(
-            [
-                req_id
-                for req_id, req_gid in enumerate(all_req_indices)
-                if requests[req_gid].py_num_logprobs is not None
-                and requests[req_gid].sampling_config.beam_width == 1
-            ],
-            dtype=torch.int32,
-        )
+        all_req_indices: list[int] = batched_sampling_result.batch_req_indices.tolist()
+
+        local_group_req_indices_list: list[int] = []
+        max_num_logprobs_no_beam_search = 0
+
+        local_group_req_indices_with_beam_search_list: list[int] = []
+
+        for req_id, req_gid in enumerate(all_req_indices):
+            req = requests[req_gid]
+            num_logprobs = req.py_num_logprobs
+            if num_logprobs is None:
+                continue
+            if req.sampling_config.beam_width == 1:
+                local_group_req_indices_list.append(req_id)
+                max_num_logprobs_no_beam_search = max(max_num_logprobs_no_beam_search, num_logprobs)
+            else:
+                local_group_req_indices_with_beam_search_list.append(req_id)
+
         # Index the positions of each token in the padded 2d tensors
         # NB: Using all_req_indices to allow reuse for beam search requests
         padded_indexer = _PackedStepIndexer(
@@ -4155,12 +4166,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             max_steps=cast(int, req_num_steps.max().item()),
         )
 
-        any_request_without_beam_search = local_group_req_indices.shape[0] > 0
-
         log_probs_store = self.store.log_probs_store
         sampled_log_prob_indices = log_probs_store.sampled_log_prob_indices
         sampled_log_prob_ranks = log_probs_store.sampled_log_prob_ranks
-        if any_request_without_beam_search:
+
+        if local_group_req_indices_list:
+            # The request indices in the shuffled batch after grouping (NB: Beam search request are handled separately)
+            local_group_req_indices = torch.tensor(local_group_req_indices_list, dtype=torch.int32)
             sampled_log_probs = log_probs_store.sampled_log_probs
             # NB: Already begin copy here, to overlap with the remaining host code
             padded_indices_cuda = padded_indexer[local_group_req_indices].to(
@@ -4181,13 +4193,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # Process the topk logprobs
             if self.batch_max_topk_logprobs > 0:
                 # Get the topk logprobs
-                # The request indices in the batch before grouping
-                group_req_indices = batched_sampling_result.batch_req_indices[
-                    local_group_req_indices
-                ]
                 topk_vals_cuda, topk_indices_cuda = torch.topk(
                     group_logprobs_cuda,
-                    k=max(requests[req_id].py_num_logprobs for req_id in group_req_indices),
+                    k=max_num_logprobs_no_beam_search,
                     dim=-1,
                 )
                 expanded_indices_cuda = padded_indices_cuda.view(-1, 1).expand(
@@ -4234,40 +4242,30 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 self.max_num_sequences * self.max_tokens * self.max_beam_width
             ).scatter_(dim=0, index=padded_indices_cuda, src=sampled_rank_cuda)
 
-        if self._use_beam_search:
+        if local_group_req_indices_with_beam_search_list:
             local_group_req_indices_with_beam_search = torch.tensor(
-                [
-                    req_id
-                    for req_id, req_gid in enumerate(all_req_indices)
-                    if requests[req_gid].py_num_logprobs is not None
-                    and requests[req_gid].sampling_config.beam_width > 1
-                ],
-                dtype=torch.int32,
+                local_group_req_indices_with_beam_search_list, dtype=torch.int32
             )
-            any_request_has_beam_search = local_group_req_indices_with_beam_search.shape[0] > 0
-            if any_request_has_beam_search:
-                group_logits_indices_with_beam_search = logits_cuda_indexer[
-                    local_group_req_indices_with_beam_search
-                ]
-                group_logits_indices_with_beam_search_cuda = (
-                    group_logits_indices_with_beam_search.to(
-                        device=batched_sampling_result.batch_next_tokens_cuda_int.device,
-                        non_blocking=True,
-                    )
-                )
-                group_next_tokens_with_beam_search_cuda = (
-                    batched_sampling_result.batch_next_tokens_cuda_int[
-                        group_logits_indices_with_beam_search_cuda
-                    ].view(-1)
-                )
-                padded_indices_with_beam_search_cuda = padded_indexer[
-                    local_group_req_indices_with_beam_search
-                ].to(device=sampled_log_prob_indices.device, non_blocking=True)
-                sampled_log_prob_indices.view(-1).scatter_(
-                    dim=0,
-                    index=padded_indices_with_beam_search_cuda,
-                    src=group_next_tokens_with_beam_search_cuda,
-                )
+            group_logits_indices_with_beam_search = logits_cuda_indexer[
+                local_group_req_indices_with_beam_search
+            ]
+            group_logits_indices_with_beam_search_cuda = group_logits_indices_with_beam_search.to(
+                device=batched_sampling_result.batch_next_tokens_cuda_int.device,
+                non_blocking=True,
+            )
+            group_next_tokens_with_beam_search_cuda = (
+                batched_sampling_result.batch_next_tokens_cuda_int[
+                    group_logits_indices_with_beam_search_cuda
+                ].view(-1)
+            )
+            padded_indices_with_beam_search_cuda = padded_indexer[
+                local_group_req_indices_with_beam_search
+            ].to(device=sampled_log_prob_indices.device, non_blocking=True)
+            sampled_log_prob_indices.view(-1).scatter_(
+                dim=0,
+                index=padded_indices_with_beam_search_cuda,
+                src=group_next_tokens_with_beam_search_cuda,
+            )
 
     @nvtx_range("_process_requests")
     def _process_requests(

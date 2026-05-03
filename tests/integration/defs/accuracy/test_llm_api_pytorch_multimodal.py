@@ -182,11 +182,20 @@ class TestNemotron_Nano_12B_V2_VL(LlmapiAccuracyTestHarness):
 
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8, enable_block_reuse=False)
 
-    def test_auto_dtype(self):
+    @pytest.mark.parametrize(
+        "enable_chunked_prefill,max_num_tokens",
+        [
+            (False, MAX_NUM_TOKENS),
+            (True, 1024),
+        ],
+        ids=["full_budget", "forced_chunked_prefill"],
+    )
+    def test_auto_dtype(self, enable_chunked_prefill, max_num_tokens):
         with LLM(
             self.MODEL_PATH,
             max_batch_size=128,
-            max_num_tokens=self.MAX_NUM_TOKENS,
+            enable_chunked_prefill=enable_chunked_prefill,
+            max_num_tokens=max_num_tokens,
             kv_cache_config=self.kv_cache_config,
         ) as llm:
             task = MMMU(self.MODEL_NAME)
@@ -406,10 +415,19 @@ class TestQwen3VL(LlmapiAccuracyTestHarness):
         max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<|endoftext|>"
     )
 
-    def test_auto_dtype(self):
+    @pytest.mark.parametrize(
+        "enable_chunked_prefill,max_num_tokens",
+        [
+            (False, MAX_NUM_TOKENS),
+            (True, 1024),
+        ],
+        ids=["full_budget", "forced_chunked_prefill"],
+    )
+    def test_auto_dtype(self, enable_chunked_prefill, max_num_tokens):
         with LLM(
             self.MODEL_PATH,
-            max_num_tokens=self.MAX_NUM_TOKENS,
+            enable_chunked_prefill=enable_chunked_prefill,
+            max_num_tokens=max_num_tokens,
         ) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
@@ -428,13 +446,21 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
     )
 
     @pytest.mark.skip_less_device_memory(80000)
-    def test_auto_dtype(self):
+    @pytest.mark.parametrize(
+        "max_num_tokens",
+        [
+            MAX_NUM_TOKENS,
+            1024,
+        ],
+        ids=["full_budget", "forced_chunked_prefill"],
+    )
+    def test_auto_dtype(self, max_num_tokens):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         with LLM(
             self.MODEL_PATH,
             kv_cache_config=kv_cache_config,
             enable_chunked_prefill=True,
-            max_num_tokens=self.MAX_NUM_TOKENS,
+            max_num_tokens=max_num_tokens,
         ) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)

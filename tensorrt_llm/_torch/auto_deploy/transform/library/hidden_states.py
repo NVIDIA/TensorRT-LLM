@@ -156,6 +156,7 @@ class DetectHiddenStatesForCapture(BaseTransform):
             The transformed graph module and transform info.
         """
         if getattr(gm, "is_draft", False):
+            # Draft models do not capture hidden states through this mechanism.
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )

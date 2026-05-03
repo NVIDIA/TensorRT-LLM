@@ -32,6 +32,7 @@ from tensorrt_llm._torch.visual_gen.config import (
     VisualGenArgs,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+from tensorrt_llm._utils import get_free_port
 
 
 def _llm_models_root() -> str:
@@ -899,11 +900,11 @@ class TestFluxBatchGeneration:
 # =============================================================================
 
 
-def _setup_distributed(rank, world_size, backend="nccl"):
+def _setup_distributed(rank, world_size, master_port, backend="nccl"):
     """Initialize distributed process group for multi-GPU tests."""
     os.environ["TLLM_DISABLE_MPI"] = "1"
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "12355"
+    os.environ["MASTER_PORT"] = str(master_port)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
 
@@ -917,13 +918,13 @@ def _cleanup_distributed():
         dist.destroy_process_group()
 
 
-def _run_ulysses_worker(rank, world_size, checkpoint_path, inputs_cpu, return_dict):
+def _run_ulysses_worker(rank, world_size, master_port, checkpoint_path, inputs_cpu, return_dict):
     """Worker function for Ulysses multi-GPU test.
 
     Must be module-level for multiprocessing.spawn() pickling.
     """
     try:
-        _setup_distributed(rank, world_size)
+        _setup_distributed(rank, world_size, master_port)
 
         from tensorrt_llm._torch.visual_gen.config import ParallelConfig, VisualGenArgs
         from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
@@ -1024,9 +1025,10 @@ class TestFluxParallelism:
         manager = mp.Manager()
         return_dict = manager.dict()
 
+        master_port = get_free_port()
         mp.spawn(
             _run_ulysses_worker,
-            args=(2, FLUX1_CHECKPOINT_PATH, inputs_cpu, return_dict),
+            args=(2, master_port, FLUX1_CHECKPOINT_PATH, inputs_cpu, return_dict),
             nprocs=2,
             join=True,
         )
@@ -1061,13 +1063,15 @@ class TestFluxParallelism:
         torch.cuda.empty_cache()
 
 
-def _run_all_optimizations_worker(rank, world_size, checkpoint_path, inputs_cpu, return_dict):
+def _run_all_optimizations_worker(
+    rank, world_size, master_port, checkpoint_path, inputs_cpu, return_dict
+):
     """Worker for combined optimizations test (FP8 + TeaCache + TRTLLM + Ulysses).
 
     Must be module-level for multiprocessing.spawn() pickling.
     """
     try:
-        _setup_distributed(rank, world_size)
+        _setup_distributed(rank, world_size, master_port)
 
         from tensorrt_llm._torch.visual_gen.config import (
             AttentionConfig,
@@ -1205,9 +1209,10 @@ class TestFluxCombinedOptimizations:
         manager = mp.Manager()
         return_dict = manager.dict()
 
+        master_port = get_free_port()
         mp.spawn(
             _run_all_optimizations_worker,
-            args=(2, FLUX1_CHECKPOINT_PATH, inputs_cpu, return_dict),
+            args=(2, master_port, FLUX1_CHECKPOINT_PATH, inputs_cpu, return_dict),
             nprocs=2,
             join=True,
         )
