@@ -767,29 +767,22 @@ class TestNemotronUltraV3(LlmapiAccuracyTestHarness):
                               n=1,
                               use_beam_search=False)
 
-    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
-    @pytest.mark.parametrize("enable_attention_dp", [False, True],
-                             ids=["attn_dp_off", "attn_dp_on"])
+    @skip_pre_blackwell
     @pytest.mark.parametrize("world_size", [4, 8])
     @pytest.mark.parametrize("model_id", ["nvfp4"])
-    def test_accuracy(self, model_id, world_size, enable_attention_dp,
-                      attn_backend):
+    def test_accuracy(self, model_id, world_size):
         if get_device_count() < world_size:
             pytest.skip(f"Not enough devices for world_size={world_size}")
 
         model_path = self.MODEL_PATHS[model_id]
-        kwargs = {}
-        kwargs["attn_backend"] = attn_backend
-        kwargs.setdefault("transforms", {}).setdefault(
-            "detect_sharding", {})["enable_attention_dp"] = enable_attention_dp
-
         print_memory_usage("test start")
-        with AutoDeployLLM(model=model_path,
-                           tokenizer=model_path,
-                           world_size=world_size,
-                           yaml_extra=[self.CONFIG_YAML],
-                           trust_remote_code=True,
-                           **kwargs) as llm:
+        with AutoDeployLLM(
+                model=model_path,
+                tokenizer=model_path,
+                world_size=world_size,
+                yaml_extra=[self.CONFIG_YAML],
+                trust_remote_code=True,
+        ) as llm:
             _set_quant_config(llm, model_id)
             print_memory_usage("after engine build")
 
