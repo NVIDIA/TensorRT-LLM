@@ -1,4 +1,4 @@
-# Guess-Verify-Refine: Data-Aware Top-K for Sparse-Attention Decoding on Blackwell via Temporal Correlation
+# Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell
 
 By NVIDIA TensorRT LLM team
 
