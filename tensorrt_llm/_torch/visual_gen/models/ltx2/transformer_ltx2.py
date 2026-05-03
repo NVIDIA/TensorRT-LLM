@@ -232,12 +232,8 @@ class LTX2Attention(Attention):
                 f"cos numel ({cos_total}) doesn't match expected for T={T}, B*T={total_tokens}, "
                 f"head_dim={self.head_dim} or num_heads*head_dim={full_inner}"
             )
-        # SPLIT-rope cos is stored per-head as (B, H, T, D); permute to (B, T, H, D)
-        # so the subsequent reshape(-1, H*D) gives the token-major layout the kernel
-        # expects (each row = one token's flat (h*D+d) values).
-        if cos.ndim == 4 and cos.shape[1] == num_heads:
-            cos = cos.permute(0, 2, 1, 3).contiguous()
-            sin = sin.permute(0, 2, 1, 3).contiguous()
+        # cos/sin are token-major [B, T, H, D] (or [B, T, D] for shared per-token);
+        # reshape(-1, cos_last) yields the [B*T, cos_last] layout the kernel reads.
         cos_2d = cos.reshape(-1, cos_last).float().contiguous()
         sin_2d = sin.reshape(-1, cos_last).float().contiguous()
         if cos_2d.shape[0] == T and B > 1:
@@ -1316,17 +1312,11 @@ class LTXModel(nn.Module):
         """
         seq_len = args.x.shape[1]
         sh = self._sharder
-        pe_seq_dim = (
-            2
-            if args.positional_embeddings is not None and args.positional_embeddings[0].ndim == 4
-            else 1
-        )
-        cross_pe_seq_dim = (
-            2
-            if args.cross_positional_embeddings is not None
-            and args.cross_positional_embeddings[0].ndim == 4
-            else 1
-        )
+        # 538f624ec1: SPLIT cos/sin produced token-major [B, S, H, D] (ndim==4)
+        # and INTERLEAVED cos/sin are [B, S, D] (ndim==3). Both have seq at
+        # index 1, so pe/cross_pe both shard on dim 1 regardless of ndim.
+        pe_seq_dim = 1
+        cross_pe_seq_dim = 1
         return replace(
             args,
             x=sh.shard(args.x, dim=1),

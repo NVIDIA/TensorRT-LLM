@@ -283,11 +283,8 @@ class Attention(nn.Module):
                 f"cos_emb numel ({cos_total}) doesn't match S={S} or B*S={total_tokens} "
                 f"× (head_dim={self.head_dim} or num_heads*head_dim={self.num_attention_heads * self.head_dim})"
             )
-        # SPLIT-rope cos is stored per-head as (B, H, T, D); permute to (B, T, H, D)
-        # so reshape(-1, H*D) gives the token-major layout the kernel expects.
-        if freqs_cos.ndim == 4 and freqs_cos.shape[1] == self.num_attention_heads:
-            freqs_cos = freqs_cos.permute(0, 2, 1, 3).contiguous()
-            freqs_sin = freqs_sin.permute(0, 2, 1, 3).contiguous()
+        # cos/sin are token-major [B, T, H, D] (or shared per-token [B, T, D]);
+        # reshape(-1, cos_last) yields the [B*T, cos_last] layout the kernel reads.
         cos_2d = freqs_cos.reshape(-1, cos_last).float().contiguous()
         sin_2d = freqs_sin.reshape(-1, cos_last).float().contiguous()
         if cos_2d.shape[0] == S and B > 1:
