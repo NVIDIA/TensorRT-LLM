@@ -82,7 +82,7 @@ public:
 
     ~BufferIndexHolder()
     {
-        release();
+        releaseWithLog();
     }
 
     BufferIndexHolder(BufferIndexHolder const&) = delete;
@@ -133,18 +133,23 @@ public:
     }
 
     /// @brief Happy-path release. Frees the slot immediately and disarms the
-    ///        destructor. Use this on any path where the caller has confirmed
-    ///        the slot is no longer needed and the release is the expected
-    ///        outcome (e.g. the sender formatter after sendAllBuffers
-    ///        returns). After this call, the holder owns nothing; subsequent
-    ///        destructor or move-assignment is a no-op.
+    ///        destructor so AUTO_RELEASE is NOT logged. Use this on any path
+    ///        where the caller has confirmed the slot is no longer needed and
+    ///        the release is the expected outcome (e.g. the sender formatter
+    ///        after sendAllBuffers returns). After this call, the holder owns
+    ///        nothing; subsequent destructor or move-assignment is a no-op.
     ///
-    ///        If the holder goes out of scope with mHeld still true (exception
-    ///        or early return that forgot to call release/detach), the
-    ///        destructor calls release() to free the slot.
+    ///        Contrast with the destructor's fallback path: if the holder goes
+    ///        out of scope with mHeld still true (exception, early return that
+    ///        forgot to call release/detach), the destructor logs AUTO_RELEASE
+    ///        so the non-happy exit is visible in [buf] diagnostics.
     void release() noexcept;
 
 private:
+    /// @brief Destructor-fallback path. Emits AUTO_RELEASE log (tagged with
+    ///        reqId if known) and then performs the same work as release().
+    void releaseWithLog() noexcept;
+
     BaseTransBufferManager* mMgr{nullptr};
     std::optional<int> mIndex{};
     bool mHeld{false};
@@ -171,9 +176,9 @@ public:
     ///        assignBufferIndexForRecv.
     /// @param waitSliceMs Per-iteration timeout for the internal condition
     ///        variable wait (ms). Defaults to 100 ms.
-    /// @param requestIdForLog Optional request id used to tag any
-    ///        diagnostic log lines so a pool-exhausted wedge on the send
-    ///        side can be attributed to a specific reqId.
+    /// @param requestIdForLog Optional request id used to tag [buf] log lines
+    ///        so a pool-exhausted wedge on the send side can be attributed
+    ///        to a specific reqId.
     /// @return Assigned buffer index, or nullopt if using dynamic buffers.
     std::optional<int> assignBufferIndexForSend(std::atomic<bool> const* perRequestCancel = nullptr,
         int64_t waitSliceMs = 100, std::optional<uint64_t> requestIdForLog = std::nullopt);
@@ -191,9 +196,9 @@ public:
     ///        for recovery even without an explicit cancel.
     /// @param waitSliceMs Per-iteration timeout for the internal condition
     ///        variable wait (ms). Defaults to 100 ms.
-    /// @param requestIdForLog Optional request id used to tag any
-    ///        diagnostic log lines so a pool-exhausted wedge can be
-    ///        attributed to a specific reqId.
+    /// @param requestIdForLog Optional request id used to tag [buf] log lines
+    ///        so a pool-exhausted wedge can be attributed to a specific reqId
+    ///        when cross-referenced with the drain-worker's [reqSync] trail.
     /// @return Assigned buffer index, or nullopt if using dynamic buffers.
     std::optional<int> assignBufferIndexForRecv(std::atomic<bool> const* perRequestCancel = nullptr,
         int64_t waitSliceMs = 100, std::optional<uint64_t> requestIdForLog = std::nullopt);

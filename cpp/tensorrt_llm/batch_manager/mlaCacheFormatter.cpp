@@ -254,11 +254,11 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             return bufferSizeForTarget;
         };
         auto bufferEleSizes = getBufferSizeForTarget();
-        // RAII wrapper mirrors the receiver-side pattern. Happy-path calls
-        // sendHolder.release(); other exits auto-release via
-        // ~BufferIndexHolder. Send-pool CV wait observes the per-request
-        // cancel flag via the session's DataContext and throws on cancel
-        // (parity with recv side).
+        // RAII wrapper mirrors the receiver-side pattern. Happy-path uses
+        // sendHolder.release() (silent atomic free+disarm); other exits auto-
+        // release via ~BufferIndexHolder with an AUTO_RELEASE log. Send-pool CV
+        // wait observes the per-request cancel flag via the session's
+        // DataContext and throws on cancel (parity with recv side).
         auto const sendReqIdForLog = std::make_optional(static_cast<uint64_t>(llmRequest.mRequestId));
         auto const* sendCancelFlag = &session.getDataContext().getTransferTerminate();
         auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend(
@@ -372,6 +372,8 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
 
                 auto remainSendNum = pickUpConnections.size();
 
+                auto const sendReqId = static_cast<uint64_t>(llmRequest.mRequestId);
+                size_t batchIdx = 0;
                 while (remainSendNum > 0)
                 {
                     auto sendConcurrencyNum = std::min(remainSendNum, concurrencyNum);
@@ -385,11 +387,20 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
                         TLLM_CHECK(connIdx < session.getConnections().size());
                         futures.push_back(std::async(std::launch::async, sendBufferFun, deviceId, connIdx));
                     }
+                    TLLM_LOG_WARNING("[send] FUTURE_WAIT reqId=%zu batch=%zu concurrency=%zu remain=%zu", sendReqId,
+                        batchIdx, sendConcurrencyNum, remainSendNum);
+                    auto const waitStart = std::chrono::steady_clock::now();
                     for (auto& future : futures)
                     {
                         future.get();
                     }
+                    auto const elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - waitStart)
+                                               .count();
+                    TLLM_LOG_WARNING("[send] FUTURE_JOIN reqId=%zu batch=%zu elapsedMs=%lld", sendReqId, batchIdx,
+                        static_cast<long long>(elapsedMs));
                     remainSendNum -= sendConcurrencyNum;
+                    ++batchIdx;
                 }
             }
         }

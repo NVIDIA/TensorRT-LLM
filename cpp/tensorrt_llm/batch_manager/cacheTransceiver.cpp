@@ -401,6 +401,7 @@ void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmReq
         static_cast<long>(llmRequest->getKvCacheTransferStart().time_since_epoch().count()),
         mRequesterFutures.size() + 1);
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    TLLM_LOG_WARNING("[reqFut] INSERT reqId=%zu size_after=%zu", llmRequest->mRequestId, mRequesterFutures.size() + 1);
     mRequesterFutures.emplace_back(std::move(llmRequest), std::move(future));
 }
 

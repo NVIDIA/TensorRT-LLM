@@ -1093,9 +1093,10 @@ public:
             // the drain worker's cancelRequest has fired (e.g. the gen-side
             // kv_transfer_timeout_ms hit), bail out of this loop instead of
             // continuing to notify peers that have already abandoned their
-            // side of the transfer. Without this check the for-body can
-            // block on notifySyncMessage to a stuck peer without any
-            // opportunity to observe the cancel flag.
+            // side of the transfer. v11b instrumentation localized the
+            // post-saturation wedge to this function; without this check the
+            // for-body can block on notifySyncMessage to a stuck peer without
+            // any opportunity to observe the cancel flag.
             if (perRequestCancel.load(std::memory_order_relaxed))
             {
                 TLLM_THROW("sendRequestInfo cancelled via perRequestCancel for request %zu", llmRequest.mRequestId);
@@ -1265,6 +1266,7 @@ public:
             // rather than continuing to wait on subsequent peers.
             if (perRequestCancel.load(std::memory_order_relaxed))
             {
+                TLLM_LOG_WARNING("[reqSync] receiveReadySignal cancelled via perRequestCancel mid-loop");
                 return false;
             }
             auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
@@ -1345,18 +1347,21 @@ private:
         // sendRequestInfo. This is the core of the RAII fix: the formatter
         // inside receiveSync releases the indices on the happy path (hence
         // the `detach()` after a successful receiveSync below), but every
-        // OTHER exit path from requestSync used to leak one index per exit
-        // (e.g. an early return on `(not-ready or cancel after ready)` would
-        // permanently wedge the size-1 pool). With the holder, any return or
-        // throw between acquisition and the final detach releases the index
-        // via the holder's destructor, closing the class of bug rather than
-        // any specific branch.
+        // OTHER exit path from requestSync used to leak one index per exit.
+        // v12 evidence: one `(not-ready or cancel after ready)` early return
+        // permanently wedged the size-1 pool after prefill's ctx-timeout
+        // flipped isReady=0. With the holder, any return or throw between
+        // acquisition and the final detach releases the index via the
+        // holder's destructor, closing the class of bug rather than the
+        // specific branch observed.
         std::vector<BufferIndexHolder> recvHolders;
         std::vector<std::optional<size_t>> cacheBufferIds;
         auto* agentConnectionManagerForAcq = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
         if (agentConnectionManagerForAcq)
         {
             auto const reqIdForLog = std::make_optional(static_cast<uint64_t>(llmRequest.mRequestId));
+            TLLM_LOG_WARNING("[reqSync] pre-assignBufferIndexForRecv reqId=%zu managerCount=%zu", llmRequest.mRequestId,
+                agentConnectionManagerForAcq->getCacheTransBufferManagers().size());
             auto const& managers = agentConnectionManagerForAcq->getCacheTransBufferManagers();
             recvHolders.reserve(managers.size());
             cacheBufferIds.reserve(managers.size());
@@ -1374,8 +1379,14 @@ private:
                     cacheBufferIds.push_back(std::nullopt);
                 }
             }
+            TLLM_LOG_WARNING("[reqSync] post-assignBufferIndexForRecv reqId=%zu assigned=%zu", llmRequest.mRequestId,
+                cacheBufferIds.size());
         }
 
+        // [reqSync] pre-sendRequestInfo — if the next line prints but
+        // post-sendRequestInfo never does, sendRequestInfo wedges (NIXL agent
+        // state corruption is the leading hypothesis).
+        TLLM_LOG_WARNING("[reqSync] pre-sendRequestInfo reqId=%zu", llmRequest.mRequestId);
         auto session = sendRequestInfo(llmRequest, perRequestCancel, std::move(cacheBufferIds));
         session.setTime(TransferSession::kTimeRequestInfo);
         // receiveReadySignal blocks inside AgentConnectionManager::waitForNotification's
@@ -1474,6 +1485,12 @@ private:
         tensorrt_llm::common::setThreadName("dataTransRequest");
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
 
+        // Entry-point marker. If this never prints, the std::async launch in
+        // requestAndReceiveAsyncMultiThreads never actually ran — suspect a
+        // mInstanceToAsyncResource.emplace race or missing thread creation.
+        TLLM_LOG_WARNING("[drain] ENTER tid=%ld resource=%p", static_cast<long>(syscall(SYS_gettid)),
+            static_cast<void const*>(&resource));
+
         while (!resource.mTerminate)
         {
             RequestAndPromise requestAndPromise;
@@ -1503,7 +1520,15 @@ private:
                     TLLM_CHECK_WITH_INFO(requestAndPromise.mRequest != nullptr, "requestAndPromise.mRequest is null");
                     TLLM_CHECK_WITH_INFO(
                         requestAndPromise.mCancelFlag != nullptr, "requestAndPromise.mCancelFlag is null");
+                    // Log before the blocking call so we can pair pre/post on the
+                    // same reqId; an unmatched pre-requestSync beyond kv_transfer_timeout_ms
+                    // without a corresponding post-requestSync indicates the worker is
+                    // alive but parked inside requestSync (likely NIXL/UCX progress
+                    // loop or a lock) rather than having exited.
+                    TLLM_LOG_WARNING(
+                        "[drain] pre-requestSync reqId=%zu queueRemaining=%zu", reqId, resource.mRequestsQueue.size());
                     requestSync(*requestAndPromise.mRequest, *requestAndPromise.mCancelFlag);
+                    TLLM_LOG_WARNING("[drain] post-requestSync reqId=%zu", reqId);
                     requestAndPromise.mPromise->set_value();
                 }
                 catch (tensorrt_llm::common::RequestSpecificException const& err)
@@ -1538,8 +1563,7 @@ private:
                     // Swallow and continue so the drain loop remains alive;
                     // set the promise so the caller's future resolves with an
                     // error rather than hanging.
-                    TLLM_LOG_ERROR(
-                        "Non-std::exception escape in CacheReceiver request() loop for reqId=%zu; continuing.", reqId);
+                    TLLM_LOG_WARNING("[drain] UNKNOWN (non-std::exception) escape reqId=%zu — continuing loop", reqId);
                     if (requestAndPromise.mPromise)
                     {
                         try
@@ -1563,6 +1587,12 @@ private:
                 }
             }
         }
+
+        // Exit marker. If mTerminate is 0 here, something bypassed the
+        // catch-all above (shouldn't happen) — the queueSize snapshot at exit
+        // tells us how many requests the worker abandoned when it died.
+        TLLM_LOG_WARNING("[drain] EXIT tid=%ld mTerminate=%d queueSize=%zu", static_cast<long>(syscall(SYS_gettid)),
+            static_cast<int>(resource.mTerminate.load()), resource.mRequestsQueue.size());
     }
 
     int mDeviceId{-1};

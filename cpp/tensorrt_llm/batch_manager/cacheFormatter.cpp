@@ -125,6 +125,11 @@ void sendAllBuffers(TransferSession& session, int deviceId,
     executor::kv_cache::TargetRanksInfo const& targetInfo, std::vector<size_t> const& pickUpConnections)
 {
     size_t targetNum = pickUpConnections.size();
+    // Diagnostic markers around future.get() waits — if the send-side wedges
+    // inside the transport layer rather than at the formatter-level short
+    // circuit, the FUTURE_WAIT / FUTURE_JOIN trail pins the stuck batch to a
+    // specific (reqId, connIdx-range, elapsedMs) for post-mortem.
+    auto const sendReqId = static_cast<uint64_t>(session.getLlmRequest().mRequestId);
 
     if (targetNum > 1)
     {
@@ -143,6 +148,7 @@ void sendAllBuffers(TransferSession& session, int deviceId,
             auto concurrencyNum = std::min(std::max(static_cast<size_t>(1), bufferCoverTargetNum), targetNum);
 
             auto remainSendNum = targetNum;
+            size_t batchIdx = 0;
             while (remainSendNum > 0)
             {
                 auto sendConcurrencyNum = std::min(remainSendNum, concurrencyNum);
@@ -160,11 +166,20 @@ void sendAllBuffers(TransferSession& session, int deviceId,
                                 bufferManager, targetInfo, pickUpConnections);
                         }));
                 }
+                TLLM_LOG_WARNING("[send] FUTURE_WAIT reqId=%zu batch=%zu concurrency=%zu remain=%zu", sendReqId,
+                    batchIdx, sendConcurrencyNum, remainSendNum);
+                auto const waitStart = std::chrono::steady_clock::now();
                 for (auto& future : futures)
                 {
                     future.get();
                 }
+                auto const elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - waitStart)
+                                           .count();
+                TLLM_LOG_WARNING("[send] FUTURE_JOIN reqId=%zu batch=%zu elapsedMs=%lld", sendReqId, batchIdx,
+                    static_cast<long long>(elapsedMs));
                 remainSendNum -= sendConcurrencyNum;
+                ++batchIdx;
             }
         }
     }
@@ -484,12 +499,12 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         // cache blocks to the corresponding buffer.
         // 5. send the buffer to the corresponding target. Ideally, we send only once (one buffer) for each target.
 
-        // RAII wrapper mirrors the receiver-side pattern. Happy-path calls
-        // sendHolder.release() after sendAllBuffers returns; any other exit
-        // between acquire and release auto-releases via ~BufferIndexHolder.
-        // The send-pool CV wait inside assignBufferIndexForSend observes the
-        // session's per-request cancel flag and throws on cancel (parity
-        // with the recv side).
+        // RAII wrapper mirrors the receiver-side pattern. Happy-path uses
+        // sendHolder.release() (silent atomic free+disarm) after sendAllBuffers
+        // returns; any other exit between acquire and release auto-releases via
+        // ~BufferIndexHolder with a diagnostic AUTO_RELEASE log. The send-pool
+        // CV wait inside assignBufferIndexForSend observes the session's
+        // per-request cancel flag and throws on cancel (parity with recv side).
         auto const sendReqIdForLog = std::make_optional(static_cast<uint64_t>(llmRequest.mRequestId));
         auto const* sendCancelFlag = &session.getDataContext().getTransferTerminate();
         auto cacheBufferId
@@ -577,10 +592,10 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         sendAllBuffers(session, deviceId, outputSplitCaches, bufferCoverTargetNum, preAllocSendBuffer, bufferManager,
             targetInfo, pickUpConnections);
 
-        // Happy-path release — frees the slot and disarms the holder in
+        // Atomic happy-path release — frees the slot and disarms the holder in
         // one noexcept call. Placed immediately after sendAllBuffers so any
-        // subsequent throw (e.g. from setTime) does not turn a non-leak into
-        // a destructor-driven release.
+        // subsequent throw (e.g. from setTime) cannot trip the destructor
+        // fallback and emit a misleading AUTO_RELEASE for a non-leak.
         sendHolder.release();
         TLLM_LOG_DEBUG("[buf] SEND_RELEASE reqId=%zu index=%d", llmRequest.mRequestId, cacheBufferId.value_or(-1));
         session.setTime(TransferSession::kTimeTransmissions);
