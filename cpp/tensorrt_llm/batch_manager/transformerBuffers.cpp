@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -344,8 +344,6 @@ void TransformerBuffers::copyKvBlockOffsets(RequestVector const& contextRequests
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(copyKvBlockOffsets);
 
-    auto const& cudaStream = manager.getStream();
-
     SizeType32 constexpr contextBeamWidth{1};
     SizeType32 numSequences{0};
     SizeType32 maxBlockCount{0};
@@ -370,21 +368,18 @@ void TransformerBuffers::copyKvBlockOffsets(RequestVector const& contextRequests
         }
     }
 
-    // requests' block offsets collected as [totalNumSequences, 2, maxBlocksPerSeq], copy to device
-    auto copyOffsetsToDevice = [&cudaStream](TensorPtr& offsetsHost, TensorPtr& offsetsDevice, SizeType32 maxBlockCount)
+    // requests' block offsets collected as [numPools, totalNumSequences, 2, maxBlocksPerSeq], copy to device
+    auto copyOffsetsToDevice = [&manager](TensorPtr& offsetsHost, TensorPtr& offsetsDevice, SizeType32 maxBlockCount)
     {
-        // shape should be [totalNumSequences, 2, maxBlocksPerSeq]
         auto const& offsetsShape = offsetsHost->getShape();
+        TLLM_CHECK_WITH_INFO(
+            offsetsShape.nbDims == 4, "Expected 4D block offsets tensor, got %d dims", offsetsShape.nbDims);
         auto const maxBlocksPerSeq = offsetsShape.d[3];
-        auto const offsetsTypeSize = tensorrt_llm::common::getDTypeSize(offsetsHost->getDataType());
-        auto const copyPitch = maxBlocksPerSeq * offsetsTypeSize;
-        auto const copyHeight = offsetsShape.d[0] * offsetsShape.d[1] * offsetsShape.d[2];
-        auto const copyWidth = maxBlockCount * offsetsTypeSize;
-        auto* srcPtr = bufferCast<tk::KVCacheIndex>(*offsetsHost);
-        auto* dstPtr = bufferCast<tk::KVCacheIndex>(*offsetsDevice);
-
-        TLLM_CUDA_CHECK(cudaMemcpy2DAsync(
-            dstPtr, copyPitch, srcPtr, copyPitch, copyWidth, copyHeight, cudaMemcpyHostToDevice, cudaStream.get()));
+        TLLM_CHECK_WITH_INFO(maxBlockCount <= maxBlocksPerSeq,
+            "Block count (%d) exceeds max blocks per sequence (%ld). "
+            "This indicates a block accounting inconsistency in the KV cache.",
+            maxBlockCount, maxBlocksPerSeq);
+        manager.copy(*offsetsHost, *offsetsDevice);
     };
 
     copyOffsetsToDevice(kvCacheBlockOffsetsHost, kvCacheBlockOffsetsDevice, maxBlockCount);
