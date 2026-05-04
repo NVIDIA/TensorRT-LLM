@@ -85,6 +85,8 @@ public:
         // Cyclic kv cache capacity (used to get the cyclic kv cache position for new tokens)
         int32_t cyclic_attention_window_size = 0;
         int32_t max_cyclic_attention_window_size = 0;
+        // Optional physical cyclic span for context KV writes. This can be larger than the semantic sliding window.
+        int32_t context_kv_cache_window_size = 0;
         bool can_use_one_more_block = false;
         int32_t sink_token_length = 0;
         float const* kv_scale_orig_quant = nullptr;
@@ -161,6 +163,7 @@ public:
             ss << "max_attention_window_size: " << this->max_attention_window_size << std::endl;
             ss << "cyclic_attention_window_size: " << this->cyclic_attention_window_size << std::endl;
             ss << "max_cyclic_attention_window_size: " << this->max_cyclic_attention_window_size << std::endl;
+            ss << "context_kv_cache_window_size: " << this->context_kv_cache_window_size << std::endl;
             ss << "can_use_one_more_block: " << (this->can_use_one_more_block ? "true" : "false") << std::endl;
             ss << "sink_token_length: " << this->sink_token_length << std::endl;
             if (this->context_lengths && batch_size > 0)

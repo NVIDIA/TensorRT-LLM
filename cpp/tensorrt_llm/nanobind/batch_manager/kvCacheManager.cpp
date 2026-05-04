@@ -112,9 +112,9 @@ public:
         NB_OVERRIDE_PURE(getIterationStats);
     }
 
-    void addToken(tb::LlmRequest::RequestIdType requestId) override
+    void addToken(tb::LlmRequest::RequestIdType requestId, bool detachSwaFrontBlocks = true) override
     {
-        NB_OVERRIDE_PURE(addToken, requestId);
+        NB_OVERRIDE_PURE(addToken, requestId, detachSwaFrontBlocks);
     }
 
     SizeType32 getTokenCount(tb::LlmRequest::RequestIdType requestId) const override
@@ -169,9 +169,10 @@ public:
     }
 
     SizeType32 copyBlockOffsets(tensorrt_llm::runtime::ITensor& output, SizeType32 outputSlotOffset,
-        tb::LlmRequest::RequestIdType requestId) const override
+        tb::LlmRequest::RequestIdType requestId, bool useSwaCyclicSlots = true,
+        bool useSwaContextSlots = false) const override
     {
-        NB_OVERRIDE_PURE(copyBlockOffsets, output, outputSlotOffset, requestId);
+        NB_OVERRIDE_PURE(copyBlockOffsets, output, outputSlotOffset, requestId, useSwaCyclicSlots, useSwaContextSlots);
     }
 
     bool isEnableBlockReuse() const override
@@ -417,8 +418,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("dtype"), nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"), nb::arg("tokens_per_block"),
             nb::arg("world_config"), nb::arg("window_size_to_layers"), nb::arg("allotted_primary_mem_bytes"),
             nb::arg("allotted_secondary_mem_bytes"), nb::arg("extra_cost_memory"), nb::arg("kv_factor"),
-            nb::arg("max_batch_size"), nb::arg("linear_attention_metadata") = std::nullopt,
-            nb::call_guard<nb::gil_scoped_release>())
+            nb::arg("max_batch_size"), nb::arg("temp_attention_window_inputs") = std::nullopt,
+            nb::arg("linear_attention_metadata") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def("allocate_pools", &BaseKVCacheManager::allocatePools, nb::call_guard<nb::gil_scoped_release>())
         .def("release_pools", &BaseKVCacheManager::releasePools, nb::call_guard<nb::gil_scoped_release>())
         .def("start_scheduling", &BaseKVCacheManager::startScheduling, nb::call_guard<nb::gil_scoped_release>())
@@ -437,7 +438,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def("get_remaining_blocks_to_completion", &BaseKVCacheManager::getRemainingBlocksToCompletion, nb::arg("req"),
             nb::arg("window_size"), nb::arg("cached_summary") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
-        .def("add_token", &BaseKVCacheManager::addToken, nb::call_guard<nb::gil_scoped_release>())
+        .def("add_token", &BaseKVCacheManager::addToken, nb::arg("request_id"),
+            nb::arg("detach_swa_front_blocks") = true, nb::call_guard<nb::gil_scoped_release>())
         .def("get_token_count", &BaseKVCacheManager::getTokenCount, nb::arg("request_id"))
         .def(
             "add_sequence_batch",
@@ -557,27 +559,33 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def(
             "copy_block_offsets",
             [](tbk::BaseKVCacheManager& self, at::Tensor output, SizeType32 outputSlotOffset,
-                tb::LlmRequest::RequestIdType requestId)
+                tb::LlmRequest::RequestIdType requestId, bool useSwaCyclicSlots = true, bool useSwaContextSlots = false)
             {
                 auto _output = from_torch(output);
                 TLLM_CHECK_WITH_INFO(_output.has_value(), "Invalid output tensor.");
-                auto maxBlockCount = self.copyBlockOffsets(*(_output.value()), outputSlotOffset, requestId);
+                auto maxBlockCount = self.copyBlockOffsets(
+                    *(_output.value()), outputSlotOffset, requestId, useSwaCyclicSlots, useSwaContextSlots);
                 return maxBlockCount;
             },
+            nb::arg("output"), nb::arg("output_slot_offset"), nb::arg("request_id"),
+            nb::arg("use_swa_cyclic_slots") = true, nb::arg("use_swa_context_slots") = false,
             nb::call_guard<nb::gil_scoped_release>())
         .def(
             "copy_batch_block_offsets",
             [](tbk::BaseKVCacheManager& self, at::Tensor output,
                 std::vector<tb::LlmRequest::RequestIdType> const& requestIds, SizeType32 const beamWidth,
-                SizeType32 const offset)
+                SizeType32 const offset, bool useSwaCyclicSlots = true, bool useSwaContextSlots = false)
             {
                 auto _output = from_torch(output);
                 TLLM_CHECK_WITH_INFO(_output.has_value(), "Invalid output tensor.");
                 for (size_t i = 0; i < requestIds.size(); ++i)
                 {
-                    self.copyBlockOffsets(*(_output.value()), i * beamWidth + offset, requestIds[i]);
+                    self.copyBlockOffsets(*(_output.value()), i * beamWidth + offset, requestIds[i], useSwaCyclicSlots,
+                        useSwaContextSlots);
                 }
             },
+            nb::arg("output"), nb::arg("request_ids"), nb::arg("beam_width"), nb::arg("offset"),
+            nb::arg("use_swa_cyclic_slots") = true, nb::arg("use_swa_context_slots") = false,
             nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_latest_events",

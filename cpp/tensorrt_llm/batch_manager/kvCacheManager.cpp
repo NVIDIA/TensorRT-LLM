@@ -35,6 +35,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <map>
 #include <optional>
@@ -112,6 +113,46 @@ SizeType32 getUsableUniqueTokenCountForReuse(
 {
     auto const materializedUniqueTokenCount = getMaterializedUniqueTokenCountForReuse(uniqueTokens, llmRequest);
     return materializedUniqueTokenCount > 0 ? materializedUniqueTokenCount - 1 : 0;
+}
+
+std::vector<SizeType32> getReuseSafeWindowOrder(std::map<SizeType32, WindowSizeMetadata> const& metadataByWindow)
+{
+    // Mixed full+SWA models keep a single request-level cached-prefix scalar.
+    // Process full-attention windows first so the short SWA tail cannot cap
+    // the prefix that full-attention layers can safely reuse.
+    std::vector<SizeType32> orderedWindowSizes;
+    orderedWindowSizes.reserve(metadataByWindow.size());
+
+    for (bool const wantSwa : {false, true})
+    {
+        for (auto const& [windowSize, metadata] : metadataByWindow)
+        {
+            if (metadata.isSWA == wantSwa)
+            {
+                orderedWindowSizes.push_back(windowSize);
+            }
+        }
+    }
+    return orderedWindowSizes;
+}
+
+SizeType32 getFirstRealBlockIdxForWindow(
+    WindowSizeMetadata const& metadata, SizeType32 inputLength, SizeType32 tokensPerBlock)
+{
+    // SWA context only needs a bounded physical tail, but the request still
+    // has a full logical block table. Blocks before firstRealBlockIdx remain
+    // placeholders and are aliased when context block offsets are copied.
+    auto const logicalInputLength = std::min(inputLength, metadata.maxTokenNum + metadata.temporaryAttentionWindow);
+    auto const logicalBlocks = tc::ceilDiv(logicalInputLength, tokensPerBlock);
+    if (!metadata.isSWA || metadata.temporaryAttentionWindow <= 0)
+    {
+        return 0;
+    }
+
+    auto const physicalInputLength
+        = std::min(inputLength, metadata.windowSize + metadata.temporaryAttentionWindow + tokensPerBlock);
+    auto const physicalBlocks = tc::ceilDiv(physicalInputLength, tokensPerBlock);
+    return logicalBlocks > physicalBlocks ? logicalBlocks - physicalBlocks : 0;
 }
 
 } // namespace
@@ -560,41 +601,48 @@ bool KVCacheBlock::isLeaf() const
 // achieve identical performance as assuming all layers as full attention.
 std::map<SizeType32, float> BlockManager::calculateWindowSizeToShare(
     std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers,
-    std::map<SizeType32, SizeType32> const& windowSizeToCacheSizePerToken)
+    std::map<SizeType32, SizeType32> const& windowSizeToCacheSizePerToken,
+    std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs)
 {
     if (windowSizeToLayers.size() == 1)
     {
         return {{windowSizeToLayers.begin()->first, 1.0f}};
     }
 
-    std::map<SizeType32, float> windowSizeToContribution;
-
-    SizeType32 cacheSizePerTokenTotal
-        = std::accumulate(windowSizeToCacheSizePerToken.begin(), windowSizeToCacheSizePerToken.end(), SizeType32{0},
-            [](auto sum, auto const& windowSize) { return sum + windowSize.second; });
-    for (auto const& [windowSize, cacheSizePerToken] : windowSizeToCacheSizePerToken)
-    {
-        auto const cacheSizeWeight = static_cast<float>(cacheSizePerToken) / cacheSizePerTokenTotal;
-        windowSizeToContribution[windowSize] = cacheSizeWeight;
-    }
-
+    std::map<SizeType32, double> windowSizeToContribution;
     for (auto const& [windowSize, _] : windowSizeToLayers)
     {
-        windowSizeToContribution.at(windowSize) *= windowSize;
+        TLLM_CHECK_WITH_INFO(windowSizeToCacheSizePerToken.count(windowSize) > 0,
+            "Missing cache size per token for window size %d", windowSize);
+        auto const cacheSizePerToken = windowSizeToCacheSizePerToken.at(windowSize);
+        TLLM_CHECK_WITH_INFO(cacheSizePerToken > 0, "Cache size per token for window size %d must be positive, got %d",
+            windowSize, cacheSizePerToken);
+        SizeType32 temporaryAttentionWindow = 0;
+        if (tempAttentionWindowInputs && tempAttentionWindowInputs->pagedContextFMHA
+            && tempAttentionWindowInputs->maxInputLen > windowSize)
+        {
+            temporaryAttentionWindow = std::min(
+                tempAttentionWindowInputs->maxNumTokens, tempAttentionWindowInputs->maxInputLen - windowSize);
+            temporaryAttentionWindow = std::max(temporaryAttentionWindow, SizeType32{0});
+        }
+        auto const effectiveWindowSize = windowSize + temporaryAttentionWindow;
+        windowSizeToContribution[windowSize]
+            = static_cast<double>(effectiveWindowSize) * static_cast<double>(cacheSizePerToken);
     }
     auto const windowSizesTotalSum = std::accumulate(windowSizeToContribution.begin(), windowSizeToContribution.end(),
         0.0, [](auto sum, auto const& windowSize) { return sum + windowSize.second; });
+    TLLM_CHECK_WITH_INFO(windowSizesTotalSum > 0.0, "Window size contribution sum must be positive.");
 
     std::map<SizeType32, float> windowSizeToShare;
     for (auto const& [windowSize, windowSizeSum] : windowSizeToContribution)
     {
-        float const fraction = windowSizeSum / windowSizesTotalSum;
+        float const fraction = static_cast<float>(windowSizeSum / windowSizesTotalSum);
         TLLM_CHECK(0.0f < fraction && fraction <= 1.0f);
         windowSizeToShare[windowSize] = fraction;
     }
     auto total = std::accumulate(windowSizeToShare.begin(), windowSizeToShare.end(), 0.0f,
         [](auto sum, auto const& windowSize) { return sum + windowSize.second; });
-    TLLM_CHECK(total == 1.0f);
+    TLLM_CHECK_WITH_INFO(std::abs(total - 1.0f) < 1.0e-5f, "Window size shares must sum to 1.0, got %f", total);
     return windowSizeToShare;
 }
 
@@ -978,8 +1026,7 @@ void WindowBlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequ
     // invoke storeContextBlocks immediately after addSequenceBatch (before
     // simulatePrefillCompletion is used in tests, or before the first generation step in
     // production) and rely on the full context being stored.
-    int constexpr beamIdx = 0; // no need to consider more than one beam for input tokens
-    auto cacheBlockIds = sequence.getCacheBlockIds(mWindowSize);
+    auto constexpr beamIdx = 0; // no need to consider more than one beam for input tokens
     auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
     TLLM_LOG_DEBUG("storeContextBlocks for request %lu on window %d with %zu unique tokens", llmRequest.mRequestId,
         mWindowSize, uniqueTokens.size());
@@ -1011,19 +1058,17 @@ void WindowBlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequ
     }
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
 
-    // Convert beam-0 cache block IDs to BlockPtrs. Placeholder slots are represented
-    // by blocks whose isPlaceholder() is true; storeBlocks handles those specially.
-    auto const& beamBlockIds = cacheBlockIds[beamIdx];
+    // Build beam-0 block pointers from the allocated-block list rather than
+    // resolving IDs. SWA context may use transient placeholder sentinels that
+    // are intentionally not present in mAllBlocksById.
+    auto const& allocatedBlocks = mAllocatedBlocksPerSeq.at(sequence.getRequestId());
+    auto const beamWidth = sequence.getBeamWidth();
     std::vector<BlockPtr> beam0Blocks;
-    beam0Blocks.reserve(std::min<std::size_t>(beamBlockIds.size(), blockKeys.size()));
-    for (std::size_t i = 0; i < beamBlockIds.size() && i < blockKeys.size(); ++i)
+    beam0Blocks.reserve(std::min<std::size_t>(allocatedBlocks.size() / std::max(beamWidth, 1), blockKeys.size()));
+    for (SizeType32 bi = 0;
+         bi < static_cast<SizeType32>(allocatedBlocks.size()) && beam0Blocks.size() < blockKeys.size(); bi += beamWidth)
     {
-        auto block = getBlockById(beamBlockIds[i]);
-        if (!block)
-        {
-            break;
-        }
-        beam0Blocks.push_back(std::move(block));
+        beam0Blocks.push_back(allocatedBlocks[bi]);
     }
     blockKeys.resize(beam0Blocks.size());
     (void) storeBlocks(std::move(blockKeys), beam0Blocks);
@@ -1363,6 +1408,12 @@ PrefixReuseSummary BlockManager::analyzePrefixReuse(
     return onlyManager.analyzePrefixReuse(uniqueTokens, llmRequest);
 }
 
+PrefixReuseSummary BlockManager::analyzePrefixReuse(
+    VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, SizeType32 windowSize) const
+{
+    return mWindowBlockManagers.at(windowSize).analyzePrefixReuse(uniqueTokens, llmRequest);
+}
+
 PrefixReuseSummary WindowBlockManager::analyzePrefixReuse(
     VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
 {
@@ -1493,8 +1544,8 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
 }
 
 WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(GenerationRequest& sequence,
-    SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest, size_t requestIdx,
-    PartialClaimTracker& tracker, std::vector<ClaimResult>& claimResults)
+    SizeType32 inputLength, SizeType32 numContextBlocks, SizeType32 firstRealBlockIdx, LlmRequest& llmRequest,
+    size_t requestIdx, PartialClaimTracker& tracker, std::vector<ClaimResult>& claimResults)
 {
     // NOTE: Caller must hold mLookupTree->getMutex().
     TLLM_CHECK_WITH_INFO(!(isRecurrentState()) || inputLength == llmRequest.getPromptLen(),
@@ -1502,6 +1553,7 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
 
     ClaimResult result;
     result.numContextBlocks = numContextBlocks;
+    result.firstRealBlockIdx = firstRealBlockIdx;
 
     auto const requestId = sequence.getRequestId();
     auto const [seqIt, emplaceDone] = mAllocatedBlocksPerSeq.emplace(requestId, std::vector<BlockPtr>{});
@@ -1569,10 +1621,14 @@ WindowBlockManager::ClaimResult WindowBlockManager::claimMatchingBlocks(Generati
         claimed.isPartialMatch = match.isPartialMatch;
         claimed.needsCopy = false;
         claimed.isTraversalOnly = match.isTraversalOnly;
-        if (match.isTraversalOnly)
+        if (match.isTraversalOnly || (mIsSWA && bi < result.firstRealBlockIdx))
         {
+            // The prefix is reusable for traversal, but this SWA block is outside
+            // the active attention window for this sequence. Keep a logical slot
+            // in the sequence without claiming or allocating physical KV memory.
             claimed.block = KVCacheBlock::createPlaceholder();
             claimed.isPlaceholder = true;
+            claimed.isTraversalOnly = true;
             result.claimedBlocks.push_back(std::move(claimed));
             continue;
         }
@@ -1797,6 +1853,10 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
     for (; bi < claimResult.numSharedContextBlocks; ++bi)
     {
         bool shouldAllocate = true;
+        if (mIsSWA && bi < claimResult.firstRealBlockIdx)
+        {
+            shouldAllocate = false;
+        }
         if (isRecurrentState())
         {
             if (isEnableBlockReuse)
@@ -1813,6 +1873,16 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
             TLLM_LOG_DEBUG(
                 "%s::onboardAndAllocateBlocks - Recurrent state block %d. shouldAllocate=%d for sequence %lu",
                 mLogPrefix.c_str(), bi, shouldAllocate, sequence.getRequestId());
+        }
+
+        if (mIsSWA && !shouldAllocate)
+        {
+            addSwaPlaceholderToAllBeams(sequence);
+            if (blockItr != claimResult.blockKeys.end())
+            {
+                ++blockItr;
+            }
+            continue;
         }
 
         auto freeBlock = getFreeBlock(sequence,
@@ -1836,6 +1906,15 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
     auto const beamWidth = sequence.getBeamWidth();
     for (int nbi = claimResult.numSharedContextBlocks; nbi < claimResult.numContextBlocks; ++nbi)
     {
+        if (mIsSWA && nbi < claimResult.firstRealBlockIdx)
+        {
+            addSwaPlaceholderToAllBeams(sequence);
+            if (blockItr != claimResult.blockKeys.end())
+            {
+                ++blockItr;
+            }
+            continue;
+        }
         for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
         {
             auto freeBlock = getFreeBlock(sequence,
@@ -1899,13 +1978,14 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
     return totalPrepopulatedLen;
 }
 
-WindowBlockManager::ClaimResult WindowBlockManager::buildClaimResultMetadata(
-    GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest)
+WindowBlockManager::ClaimResult WindowBlockManager::buildClaimResultMetadata(GenerationRequest& sequence,
+    SizeType32 inputLength, SizeType32 numContextBlocks, SizeType32 firstRealBlockIdx, LlmRequest& llmRequest)
 {
     // Build ClaimResult metadata without walking the radix tree.
     // Used for non-reuse path where all blocks are freshly allocated.
     ClaimResult result;
     result.numContextBlocks = numContextBlocks;
+    result.firstRealBlockIdx = firstRealBlockIdx;
 
     auto const requestId = sequence.getRequestId();
     auto const [seqIt, emplaceDone] = mAllocatedBlocksPerSeq.emplace(requestId, std::vector<BlockPtr>{});
@@ -1958,7 +2038,7 @@ WindowBlockManager::ClaimResult WindowBlockManager::buildClaimResultMetadata(
 
 std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBatch(
     std::vector<GenerationRequest*> const& sequences, std::vector<SizeType32> const& inputLengths,
-    std::vector<SizeType32> const& numContextBlocksVec,
+    std::vector<SizeType32> const& numContextBlocksVec, std::vector<SizeType32> const& firstRealBlockIdxVec,
     std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, bool isEnableBlockReuse)
 {
     auto const n = sequences.size();
@@ -1976,8 +2056,8 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
         PartialClaimTracker tracker;
         for (size_t i = 0; i < n; ++i)
         {
-            claimResults[i] = claimMatchingBlocks(
-                *sequences[i], inputLengths[i], numContextBlocksVec[i], llmRequests[i].get(), i, tracker, claimResults);
+            claimResults[i] = claimMatchingBlocks(*sequences[i], inputLengths[i], numContextBlocksVec[i],
+                firstRealBlockIdxVec[i], llmRequests[i].get(), i, tracker, claimResults);
         }
     }
     else
@@ -1987,7 +2067,7 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
         for (size_t i = 0; i < n; ++i)
         {
             claimResults[i] = buildClaimResultMetadata(
-                *sequences[i], inputLengths[i], numContextBlocksVec[i], llmRequests[i].get());
+                *sequences[i], inputLengths[i], numContextBlocksVec[i], firstRealBlockIdxVec[i], llmRequests[i].get());
         }
     }
 
@@ -2087,26 +2167,27 @@ void WindowBlockManager::refreshBlocks()
 
 std::vector<WindowBlockManager::BatchSeqStats> BlockManager::addSequenceBatch(
     std::vector<GenerationRequest*> const& sequences, std::vector<SizeType32> const& inputLengths,
-    std::vector<SizeType32> const& numContextBlocksVec,
+    std::vector<SizeType32> const& numContextBlocksVec, std::vector<SizeType32> const& firstRealBlockIdxVec,
     std::vector<std::reference_wrapper<LlmRequest>> const& llmRequests, SizeType32 windowSize, bool isEnableBlockReuse)
 {
     return mWindowBlockManagers.at(windowSize)
-        .addSequenceBatch(sequences, inputLengths, numContextBlocksVec, llmRequests, isEnableBlockReuse);
+        .addSequenceBatch(
+            sequences, inputLengths, numContextBlocksVec, firstRealBlockIdxVec, llmRequests, isEnableBlockReuse);
 }
 
-void BlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence)
+void BlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence, bool detachSwaFrontBlocks)
 {
-    for (auto& [windowSize, manager] : mWindowBlockManagers)
+    for (auto& [_, manager] : mWindowBlockManagers)
     {
-        mWindowBlockManagers.at(windowSize).adjustBlocksIfNeeded(sequence);
+        manager.adjustBlocksIfNeeded(sequence, detachSwaFrontBlocks);
     }
 }
 
-void WindowBlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence)
+void WindowBlockManager::adjustBlocksIfNeeded(GenerationRequest& sequence, bool detachSwaFrontBlocks)
 {
     auto const minTokensForBlockDetach = mWindowSize + mTokensPerBlock;
-    while (mIsSWA && // A block only go out-of-window in SWA
-        (sequence.getNumTokens() - sequence.getNumFrontBlocksRemoved() * getTokensPerBlock()
+    while (detachSwaFrontBlocks && mIsSWA && // A block only go out-of-window in SWA
+        (sequence.getNumTokens() - sequence.getNumFrontBlocksRemoved(mWindowSize) * getTokensPerBlock()
             >= minTokensForBlockDetach))
     {
         // Detaching block for SWA is non-trivial due to the radix tree structure.
@@ -2148,6 +2229,12 @@ void WindowBlockManager::addBlockToAllBeams(BlockPtr const& block, GenerationReq
     {
         addBlockToBeam(block, sequence, beamIdx);
     }
+}
+
+void WindowBlockManager::addSwaPlaceholderToAllBeams(GenerationRequest& sequence)
+{
+    auto placeholder = KVCacheBlock::createPlaceholder();
+    addBlockToAllBeams(placeholder, sequence);
 }
 
 void BlockManager::allocateBlock(GenerationRequest& sequence, SizeType32 windowSize)
@@ -2825,7 +2912,6 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
 {
     auto constexpr beamIdx = 0;
     auto const& uniqueTokens = llmRequest->getUniqueTokens(beamIdx);
-
     if (uniqueTokens.size() == 0)
     {
         return;
@@ -2842,8 +2928,9 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
     auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock, true);
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
 
-    // Build beam-0 block pointer vector from mAllocatedBlocksPerSeq.  OOW positions
-    // contain placeholders (isPlaceholder()==true); storeBlocks handles them.
+    // Build beam-0 block pointers from the allocated sequence blocks. SWA
+    // out-of-window positions are placeholders with sentinel ids, so storing
+    // by BlockPtr is the only representation that preserves the trie path.
     auto const requestId = sequence.getRequestId();
     auto& seqBlocks = mAllocatedBlocksPerSeq.at(requestId);
     auto const beamWidth = sequence.getBeamWidth();
@@ -2865,7 +2952,8 @@ void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<
     auto const& lastBlock = beam0Blocks.at(blockKeys.size() - 1);
     auto const& prevBlock = beam0Blocks.at(blockKeys.size() - 2);
 
-    // If the previous block is a placeholder or not in the radix tree, store all blocks.
+    // If the previous block is a placeholder or not in the radix tree, store
+    // all blocks so storeBlocks can advance through the placeholder path.
     if (prevBlock->isPlaceholder() || prevBlock->getPrevBlock() == nullptr)
     {
         TLLM_LOG_DEBUG("%s::storeNewBlock - store all blocks", mLogPrefix.c_str());
@@ -2938,17 +3026,17 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
     auto& allocatedBlocks = node.mapped();
     if (llmRequest.has_value() && !isRecurrentState()) // only store context blocks for recurrent states
     {
-        // If llmRequest is provided, block store for reuse is enabled. OOW positions in
-        // allocatedBlocks are placeholders; storeBlocks handles them (advances past
-        // placeholders in the trie rather than re-inserting).
+        // If llmRequest is provided, block store for reuse is enabled. OOW
+        // positions in allocatedBlocks are placeholders; storeBlocks handles
+        // them by advancing the trie path instead of inserting a real block.
         if (mIsSWA)
         {
             TLLM_LOG_DEBUG("%s::releaseBlocks - SWA sequence %lu, storing blocks for reuse", mLogPrefix.c_str(),
                 sequence.getRequestId());
         }
         auto const& uniqueTokens = llmRequest->getUniqueTokens(/*beamIdx=*/0);
-        // Respect chunked prefill (see storeContextBlocks for detail + legacy-test fallback).
-        SizeType32 usableUniqueTokenCount = getUsableUniqueTokenCountForReuse(uniqueTokens, *llmRequest);
+        // Respect chunked prefill; store only blocks whose KV state has been computed.
+        auto usableUniqueTokenCount = getUsableUniqueTokenCountForReuse(uniqueTokens, *llmRequest);
         if (usableUniqueTokenCount == 0 && llmRequest->getContextCurrentPosition() == 0 && !uniqueTokens.empty())
         {
             usableUniqueTokenCount = static_cast<SizeType32>(uniqueTokens.size()) - 1;
@@ -2957,7 +3045,6 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
             uniqueTokens, usableUniqueTokenCount, mTokensPerBlock, /*allowPartial=*/true);
         auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
 
-        // Build beam-0 block pointer vector directly from allocatedBlocks.
         auto const beamWidth = sequence.getBeamWidth();
         std::vector<BlockPtr> beam0Blocks;
         beam0Blocks.reserve(allocatedBlocks.size() / std::max(beamWidth, 1));
@@ -2976,6 +3063,17 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
     for (auto it = allocatedBlocks.rbegin(); it != allocatedBlocks.rend(); ++it)
     {
         auto& block = *it;
+        if (block->isPlaceholder())
+        {
+            // SWA placeholder blocks model out-of-window logical slots. They
+            // have no backing pool entry, so they must not enter the real LRU
+            // eviction queues during sequence release.
+            if (block->hasRefs())
+            {
+                block->decRefCount();
+            }
+            continue;
+        }
         // Decrease ref count
         if (block->hasRefs())
         {
@@ -3234,13 +3332,17 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(LlmRequest const& req, bool tw
             = tc::ceilDiv(numUnSharedTokens, getTokensPerBlock()) * req.mSamplingConfig.beamWidth;
         auto numRequiredBlocks = numSharedBlocks + numUnSharedBlocks;
 
-        // Subtract reusable blocks if block reuse is enabled and we're not using variable window attention
-        if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && !isCrossKv()
-            && !req.isDisaggGenerationInitState())
+        // Subtract reusable blocks if block reuse is enabled. For variable-window
+        // attention, reuse must be analyzed per window because each window owns a
+        // distinct block pool and can have a different reusable prefix.
+        if (mEnableBlockReuse && !isCrossKv() && !req.isDisaggGenerationInitState())
         {
             // Use the cached summary if provided; otherwise perform a fresh tree walk.
-            auto const summary
-                = cachedSummary.has_value() ? cachedSummary.value() : analyzePrefixReuse(req.getUniqueTokens(0), req);
+            auto const summary = cachedSummary.has_value()
+                ? cachedSummary.value()
+                : (mBlockManager.isVariableWindow()
+                        ? mBlockManager.analyzePrefixReuse(req.getUniqueTokens(0), req, windowSize)
+                        : analyzePrefixReuse(req.getUniqueTokens(0), req));
             auto const numReusableBlocks = summary.reusableBlocksAllocated;
             auto const promptInputLen = std::min(req.mPromptLen, windowSize + chunkSize);
             // Sequence insertion ignores the last prompt token because its KV cannot be recovered.
@@ -3345,7 +3447,8 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
         }
     }
 
-    auto const temporaryAttentionWindow = mBlockManager.getWindowSizeMetadata(windowSize).temporaryAttentionWindow;
+    auto const metadata = mBlockManager.getWindowSizeMetadata(windowSize);
+    auto const temporaryAttentionWindow = metadata.temporaryAttentionWindow;
 
     SizeType32 const numContextBlocks
         = (std::min(req.mPromptLen, windowSize + temporaryAttentionWindow) + mSinkBubbleLength) / getTokensPerBlock();
@@ -3363,7 +3466,16 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
         if (seqIt != mSequences.end())
         {
             auto const& seq = seqIt->second;
-            numAllocBlocksPerBeam = seq.getCacheBlockIds(windowSize).at(0).size();
+            auto const& blockIds = seq.getCacheBlockIds(windowSize).at(0);
+            if (metadata.isSWA)
+            {
+                numAllocBlocksPerBeam = static_cast<SizeType32>(std::count_if(blockIds.begin(), blockIds.end(),
+                    [](auto const blockId) { return blockId != KVCacheBlock::kPlaceholderBlockId; }));
+            }
+            else
+            {
+                numAllocBlocksPerBeam = static_cast<SizeType32>(blockIds.size());
+            }
         }
     }
 
@@ -3371,28 +3483,34 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
     // comment in getNeededBlocksOneStep for the full rationale — free reusable blocks must
     // not be subtracted because they are already counted in the eviction policy's free count.
     SizeType32 numReusableContextBlocks = 0;
-    if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && req.isContextInitState() && req.isFirstContextChunk()
-        && numAllocBlocksPerBeam == 0)
+    SizeType32 numReusableBlocksAllocated = 0;
+    SizeType32 numReusableBlocksAll = 0;
+    if (mEnableBlockReuse && req.isContextInitState() && req.isFirstContextChunk() && numAllocBlocksPerBeam == 0)
     {
         // Use the cached summary if provided; otherwise perform a fresh tree walk.
-        auto const summary
-            = cachedSummary.has_value() ? cachedSummary.value() : analyzePrefixReuse(req.getUniqueTokens(0), req);
+        auto const summary = cachedSummary.has_value()
+            ? cachedSummary.value()
+            : (mBlockManager.isVariableWindow()
+                    ? mBlockManager.analyzePrefixReuse(req.getUniqueTokens(0), req, windowSize)
+                    : analyzePrefixReuse(req.getUniqueTokens(0), req));
         // Block budget: only subtract blocks that are already allocated (have active refs).
         // Free cached blocks are already counted in the eviction policy's free pool and
         // must not be double-counted against the capacity estimate.
         // Cap at (promptLen-1)/tpb to avoid over-counting when the prompt is exactly
         // block-aligned (last full block has not been committed to the tree yet).
         SizeType32 const maxRecoverableBlocks = (req.mPromptLen - 1) / getTokensPerBlock();
-        numReusableContextBlocks = std::min({summary.reusableBlocksAllocated, numContextBlocks, maxRecoverableBlocks});
+        numReusableBlocksAllocated = summary.reusableBlocksAllocated;
+        numReusableBlocksAll = summary.reusableBlocksAll;
+        numReusableContextBlocks = std::min({numReusableBlocksAllocated, numContextBlocks, maxRecoverableBlocks});
         // Token budget: count all reusable blocks (free or allocated). Cached tokens need
         // not be recomputed regardless of whether their blocks currently have active refs.
         req.setEstimatedReusableTokens(
-            std::min({summary.reusableBlocksAll, numContextBlocks, maxRecoverableBlocks}) * getTokensPerBlock());
+            std::min({numReusableBlocksAll, numContextBlocks, maxRecoverableBlocks}) * getTokensPerBlock());
         TLLM_LOG_DEBUG(
             "getRemainingBlocksToCompletion: request ID %lu, numContextBlocks=%d, "
             "numReusableBlocksAllocated=%d, numReusableBlocksAll=%d, "
             "numReusableContextBlocks=%d, numGenBlocksPerBeam=%d",
-            req.mRequestId, numContextBlocks, summary.reusableBlocksAllocated, summary.reusableBlocksAll,
+            req.mRequestId, numContextBlocks, numReusableBlocksAllocated, numReusableBlocksAll,
             numReusableContextBlocks, numGenBlocksPerBeam);
     }
 
@@ -3411,15 +3529,21 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(
 
     // Adjust for reusable context blocks (only allocated ones)
     SizeType32 const effectiveContextBlocks = numContextBlocks - numReusableContextBlocks;
+    SizeType32 remainingBlocks{0};
 
     if (numAllocBlocksPerBeam < effectiveContextBlocks) // Still haven't allocated all context blocks
     {
-        return effectiveContextBlocks - numAllocBlocksPerBeam
+        remainingBlocks = effectiveContextBlocks - numAllocBlocksPerBeam
             + (numGenBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
     }
+    else
+    {
+        SizeType32 const effectiveTotalBlocks = numTotalBlocksPerBeam - numReusableContextBlocks;
+        remainingBlocks
+            = (effectiveTotalBlocks - numAllocBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
+    }
 
-    SizeType32 const effectiveTotalBlocks = numTotalBlocksPerBeam - numReusableContextBlocks;
-    return (effectiveTotalBlocks - numAllocBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
+    return remainingBlocks;
 }
 
 void BlockManager::updateSequenceCacheBlockOffsets(GenerationRequest& sequence, SizeType32 windowSize)
@@ -3477,12 +3601,12 @@ void BlockManager::updateCacheBlockOffsetsAtIdx(GenerationRequest& sequence, Siz
     }
 }
 
-void KVCacheManager::addToken(RequestIdType requestId)
+void KVCacheManager::addToken(RequestIdType requestId, bool detachSwaFrontBlocks)
 {
     // TODO: add streamLLM support
     auto& sequence = getSequence(requestId);
     sequence.addNewTokens(1);
-    mBlockManager.adjustBlocksIfNeeded(sequence);
+    mBlockManager.adjustBlocksIfNeeded(sequence, detachSwaFrontBlocks);
 }
 
 void KVCacheManager::copyLinearAttentionBlock(LlmRequest const& llmRequest)
@@ -3501,7 +3625,10 @@ void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)
     auto const requestId = sequence.getRequestId();
     auto const beamWidth = sequence.getBeamWidth();
     auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
-    SizeType32 outOfWindowBlockIdx = sequence.getNumFrontBlocksRemoved();
+    SizeType32 outOfWindowBlockIdx = sequence.getNumFrontBlocksRemoved(mWindowSize);
+    auto& cacheBlocksTensor = sequence.getCacheBlockIndices(mWindowSize);
+    auto* offsetsPtr = bufferCast<tk::KVCacheIndex>(cacheBlocksTensor);
+    auto const& offsetsShape = cacheBlocksTensor.getShape();
 
     for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
     {
@@ -3516,15 +3643,25 @@ void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)
         // trying to re-insert the real block. Use the
         // kPlaceholderBlockId sentinel (not the real block's ID) to avoid
         // mAllBlocksById aliasing.
-        blockSlot = KVCacheBlock::createPlaceholder();
+        if (outOfWindowBlock->isPlaceholder())
+        {
+            if (outOfWindowBlock->hasRefs())
+            {
+                outOfWindowBlock->decRefCount();
+            }
+            blockSlot = KVCacheBlock::createPlaceholder();
+            sequence.changeCacheBlock(mWindowSize, beamIdx, outOfWindowBlockIdx, KVCacheBlock::kPlaceholderBlockId);
+            setOffsets(offsetsPtr, offsetsShape, beamIdx, outOfWindowBlockIdx, KVCacheBlock::kPlaceholderBlockId);
+            continue;
+        }
 
-        // Clear retention duration and expiration so the block is treated as a plain
-        // cache block at its user-assigned priority, not one with an expiry that
-        // originated from its prior in-window state (coderabbitai review #2902723423).
-        // We intentionally DO NOT override setPriority here: the block's priority is
-        // preserved so that subsequent getFreeBlock / eviction decisions honor the
-        // priority level the user originally requested for the block (thorjohnsen
-        // review #2902723423).
+        blockSlot = KVCacheBlock::createPlaceholder();
+        sequence.changeCacheBlock(mWindowSize, beamIdx, outOfWindowBlockIdx, KVCacheBlock::kPlaceholderBlockId);
+        setOffsets(offsetsPtr, offsetsShape, beamIdx, outOfWindowBlockIdx, KVCacheBlock::kPlaceholderBlockId);
+
+        // Clear transient retention duration/expiration inherited from the
+        // in-window sequence state. Keep the user priority intact so later
+        // eviction decisions still honor the requested priority level.
         outOfWindowBlock->setDurationMs(std::nullopt);
         outOfWindowBlock->setExpirationTime(std::nullopt);
 
@@ -3587,9 +3724,12 @@ void KVCacheManager::addSequenceBatch(
         sequences[i] = &seqIt->second;
     }
 
-    // Track the minimum prepopulated length across all windows per sequence
-    // (for VSWA with mixed isSWA flags).
+    // Track reusable prefix by window family per sequence. SWA windows only
+    // require a bounded active tail, so mixed VSWA uses the non-SWA minimum for
+    // the request-level cached-prefix scalar.
     std::vector<SizeType32> minPrepopulatedLen(n, std::numeric_limits<SizeType32>::max());
+    std::vector<SizeType32> minNonSwaPrepopulatedLen(n, std::numeric_limits<SizeType32>::max());
+    std::vector<bool> hasNonSwaWindow(n, false);
     // Accumulate block allocation stats across all windows per sequence
     std::vector<SizeType32> totalAllocTotalDelta(n, 0);
     std::vector<SizeType32> totalAllocNewDelta(n, 0);
@@ -3597,24 +3737,29 @@ void KVCacheManager::addSequenceBatch(
     std::vector<SizeType32> totalMissedDelta(n, 0);
 
     // --- Iterate over all window sizes (single iteration for non-VSWA) ---
-    for (auto const& [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
+    auto const orderedWindowSizes = getReuseSafeWindowOrder(mBlockManager.getWindowSizesMetadata());
+    for (auto const windowSize : orderedWindowSizes)
     {
+        auto const metadata = mBlockManager.getWindowSizeMetadata(windowSize);
         auto const maxTokenNum = metadata.maxTokenNum;
         auto const temporaryAttentionWindow = metadata.temporaryAttentionWindow;
 
         // Compute per-sequence effective input length for this window
         std::vector<SizeType32> inputLengths(n);
         std::vector<SizeType32> numContextBlocksVec(n);
+        std::vector<SizeType32> firstRealBlockIdxVec(n);
         for (size_t i = 0; i < n; ++i)
         {
             auto const inputLength = std::get<1>(requestInfos[i]);
             inputLengths[i] = std::min(inputLength, maxTokenNum + temporaryAttentionWindow);
             numContextBlocksVec[i] = tc::ceilDiv(inputLengths[i], getTokensPerBlock());
+            firstRealBlockIdxVec[i] = getFirstRealBlockIdxForWindow(metadata, inputLength, getTokensPerBlock());
+            sequences[i]->setNumFrontBlocksRemoved(windowSize, firstRealBlockIdxVec[i]);
         }
 
         // Two-phase claim-then-onboard for this window
-        auto const windowResults = mBlockManager.addSequenceBatch(
-            sequences, inputLengths, numContextBlocksVec, llmRequests, windowSize, mEnableBlockReuse);
+        auto const windowResults = mBlockManager.addSequenceBatch(sequences, inputLengths, numContextBlocksVec,
+            firstRealBlockIdxVec, llmRequests, windowSize, mEnableBlockReuse);
 
         // Update offsets and accumulate stats
         for (size_t i = 0; i < n; ++i)
@@ -3623,6 +3768,11 @@ void KVCacheManager::addSequenceBatch(
 
             auto const& stats = windowResults[i];
             minPrepopulatedLen[i] = std::min(minPrepopulatedLen[i], stats.prepopulatedLen);
+            if (!metadata.isSWA)
+            {
+                hasNonSwaWindow[i] = true;
+                minNonSwaPrepopulatedLen[i] = std::min(minNonSwaPrepopulatedLen[i], stats.prepopulatedLen);
+            }
             totalAllocTotalDelta[i] += stats.allocTotalDelta;
             totalAllocNewDelta[i] += stats.allocNewDelta;
             totalReusedDelta[i] += stats.reusedDelta;
@@ -3637,9 +3787,11 @@ void KVCacheManager::addSequenceBatch(
 
         if (mEnableBlockReuse)
         {
+            auto const selectedPrepopulatedLen
+                = hasNonSwaWindow[i] ? minNonSwaPrepopulatedLen[i] : minPrepopulatedLen[i];
             TLLM_LOG_DEBUG("KVCacheManager::addSequenceBatch: Setting prepopulatedPromptLen to %d for request %lu",
-                minPrepopulatedLen[i], llmRequest.mRequestId);
-            llmRequest.setPrepopulatedPromptLen(minPrepopulatedLen[i], getTokensPerBlock());
+                selectedPrepopulatedLen, llmRequest.mRequestId);
+            llmRequest.setPrepopulatedPromptLen(selectedPrepopulatedLen, getTokensPerBlock());
             // Clear the scheduling estimate now that the authoritative value is set.
             // This prevents subsequent chunks from double-counting reusable tokens.
             llmRequest.setEstimatedReusableTokens(0);
@@ -3762,7 +3914,8 @@ tle::RetentionPriority KVCacheManager::getPriorityByBlockId(KVCacheBlock::IdType
     }
 }
 
-SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSlotOffset, RequestIdType requestId) const
+SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSlotOffset, RequestIdType requestId,
+    bool useSwaCyclicSlots, bool useSwaContextSlots) const
 {
     auto const& sequence = getSequence(requestId);
     auto const beamWidth = sequence.getBeamWidth();
@@ -3795,6 +3948,45 @@ SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSl
                     auto const dstIndex
                         = tc::flat_index(dstShape.d, absolutePoolIdx, outputSlotOffset + beamIdx, xIdx, 0);
                     std::memcpy(dstPtr + dstIndex, srcPtr + srcIndex, copyChunkSize);
+                    if (metadata.isSWA && useSwaCyclicSlots)
+                    {
+                        // SWA stores only a bounded physical tail. For context
+                        // FMHA, fill every logical page-table slot by aliasing
+                        // it back into that valid cyclic tail; generation keeps
+                        // the compact cyclic view.
+                        auto const firstActiveBlockIdx = sequence.getNumFrontBlocksRemoved(ws);
+                        auto const maxBlocksPerSeq = static_cast<SizeType32>(srcShape.d[3]);
+                        auto const contextCyclicBlockCount
+                            = tc::ceilDiv(ws + metadata.temporaryAttentionWindow, getTokensPerBlock()) + kSWAExtraBlock;
+                        auto const generationCyclicBlockCount = tc::ceilDiv(ws, getTokensPerBlock()) + kSWAExtraBlock;
+                        auto const cyclicBlockCount = std::min(
+                            useSwaContextSlots ? contextCyclicBlockCount : generationCyclicBlockCount, maxBlocksPerSeq);
+                        TLLM_CHECK_WITH_INFO(cyclicBlockCount > 0,
+                            "SWA cyclic block count must be positive for window size %d and tokens per block %d", ws,
+                            getTokensPerBlock());
+                        for (SizeType32 blockIdx = firstActiveBlockIdx;
+                             blockIdx < static_cast<SizeType32>(beamBlockCount); ++blockIdx)
+                        {
+                            auto const cyclicBlockIdx = blockIdx % cyclicBlockCount;
+                            auto const srcBlockIndex = tc::flat_index(srcShape.d, poolIdx, beamIdx, xIdx, blockIdx);
+                            auto const dstBlockIndex = tc::flat_index(
+                                dstShape.d, absolutePoolIdx, outputSlotOffset + beamIdx, xIdx, cyclicBlockIdx);
+                            dstPtr[dstBlockIndex] = srcPtr[srcBlockIndex];
+                        }
+                        if (useSwaContextSlots)
+                        {
+                            for (SizeType32 blockIdx = 0; blockIdx < static_cast<SizeType32>(beamBlockCount);
+                                 ++blockIdx)
+                            {
+                                auto const cyclicBlockIdx = blockIdx % cyclicBlockCount;
+                                auto const srcBlockIndex = tc::flat_index(
+                                    dstShape.d, absolutePoolIdx, outputSlotOffset + beamIdx, xIdx, cyclicBlockIdx);
+                                auto const dstBlockIndex = tc::flat_index(
+                                    dstShape.d, absolutePoolIdx, outputSlotOffset + beamIdx, xIdx, blockIdx);
+                                dstPtr[dstBlockIndex] = dstPtr[srcBlockIndex];
+                            }
+                        }
+                    }
                 }
                 maxBlockCount = std::max<SizeType32>(maxBlockCount, static_cast<SizeType32>(beamBlockCount));
             }
@@ -3900,6 +4092,7 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
     SizeType32 tokensPerBlock, WorldConfig const& worldConfig,
     std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers, uint64_t allottedPrimaryMemBytes,
     uint64_t allottedSecondaryMemBytes, size_t extraCostMemory, SizeType32 kvFactor, SizeType32 maxBatchSize,
+    std::optional<TempAttentionWindowInputs> const& tempAttentionWindowInputs,
     std::optional<LinearAttentionMetadata> const& linearAttentionMetadata)
 {
     TLLM_LOG_DEBUG("Calculating max num blocks: {.allottedPrimaryMemBytes=%" PRIu64
@@ -3976,13 +4169,9 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
     };
 
     std::map<SizeType32, float> windowSizeToShare;
-    // By default, we allocate equal proportion shares of memory for all
-    // window sizes (see the else case). With TRTLLM_WINDOW_SIZE_SHARES,
-    // we can override this behavior to adjust the memory share of each
-    // window size. For example, if we have window size of [512, 32768],
-    // then setting TRTLLM_WINDOW_SIZE_SHARES=0.4,0.6 will be allocating
-    // 40% of the memory to window size 512 and 60% of the memory to window
-    // size 32768.
+    // By default, allocate memory proportional to each window's effective KV
+    // footprint. TRTLLM_WINDOW_SIZE_SHARES can override that distribution; for
+    // example, "0.4,0.6" assigns 40% and 60% to the sorted window sizes.
     if (auto envStr = std::getenv("TRTLLM_WINDOW_SIZE_SHARES"))
     {
         std::stringstream ss(envStr);
@@ -4018,13 +4207,9 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
     }
     else
     {
-        // NOTE: Righteously, blocks allocated should be proportional with
-        // regard to window size. Currently, we are first allocating identical
-        // number of blocks for all layers to achieve identical performance.
-        for (auto const& [windowSize, _] : windowSizeToLayers)
-        {
-            windowSizeToShare[windowSize] = 1.0f / windowSizeToLayers.size();
-        }
+        windowSizeToShare = BlockManager::calculateWindowSizeToShare(
+            windowSizeToLayers, cacheSizeBytesPerTokenPerWindow, tempAttentionWindowInputs);
+        TLLM_LOG_DEBUG("Using derived proportional allocation of memory to each effective window size.");
     }
 
     std::vector<SizeType32> blocksPrimary;

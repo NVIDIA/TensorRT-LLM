@@ -55,7 +55,7 @@ void tensorrt_llm::batch_manager::AllocateKvCache::operator()(BaseKVCacheManager
             {
                 for (SizeType32 di = 0; di < draftLength; ++di)
                 {
-                    kvCacheManager.addToken(requestId);
+                    kvCacheManager.addToken(requestId, /*detachSwaFrontBlocks=*/false);
                 }
             }
 

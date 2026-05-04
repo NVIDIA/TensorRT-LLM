@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -14,12 +15,97 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.pyexecutor._util import \
+    _derive_draft_max_attention_window
+from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
+    _extend_full_attention_windows_for_spec_decode
+from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSpecMetadata
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig)
 from tensorrt_llm.lora_helper import LoraConfig
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+
+def test_eagle3_draft_kv_cache_uses_full_window_when_draft_has_no_swa() -> None:
+    kv_cache_config = KvCacheConfig(max_attention_window=[128, 131072])
+    draft_pretrained_config = SimpleNamespace(num_hidden_layers=3)
+
+    max_attention_window = _derive_draft_max_attention_window(
+        kv_cache_config=kv_cache_config,
+        draft_pretrained_config=draft_pretrained_config,
+        max_seq_len=131072,
+        num_draft_layers=3,
+    )
+
+    assert max_attention_window is None
+
+
+def test_eagle3_draft_kv_cache_uses_draft_layer_types_for_swa() -> None:
+    kv_cache_config = KvCacheConfig(max_attention_window=[128, 131072])
+    draft_pretrained_config = SimpleNamespace(
+        sliding_window=512,
+        layer_types=["sliding_attention", "full_attention"],
+    )
+
+    max_attention_window = _derive_draft_max_attention_window(
+        kv_cache_config=kv_cache_config,
+        draft_pretrained_config=draft_pretrained_config,
+        max_seq_len=4096,
+        num_draft_layers=3,
+    )
+
+    assert max_attention_window == [512, 4096, 512]
+
+
+def test_eagle3_target_kv_cache_extends_full_window_for_spec_decode() -> None:
+    kv_cache_config = KvCacheConfig(max_attention_window=[128, 131072])
+    spec_config = Eagle3DecodingConfig(max_draft_len=3,
+                                       speculative_model="draft")
+
+    _extend_full_attention_windows_for_spec_decode(
+        kv_cache_config=kv_cache_config,
+        spec_config=spec_config,
+        net_max_seq_len=131072,
+        model_engine_max_seq_len=131080,
+    )
+
+    assert kv_cache_config.max_attention_window == [128, 131080]
+
+
+def test_eagle3_one_model_capture_uses_real_token_count(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    real_empty = torch.empty
+
+    def empty_on_cpu(*args: object, **kwargs: object) -> torch.Tensor:
+        if kwargs.get("device") == "cuda":
+            kwargs = {**kwargs, "device": "cpu"}
+        return real_empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", empty_on_cpu)
+
+    spec_metadata = Eagle3OneModelSpecMetadata(
+        max_num_requests=1,
+        max_draft_len=3,
+        max_total_draft_tokens=3,
+        num_layers=36,
+        hidden_size=2,
+        max_num_tokens=4,
+        dtype=torch.float32,
+        layers_to_capture={23},
+    )
+    assert spec_metadata.hidden_states is not None
+    spec_metadata.hidden_states.fill_(-1)
+    spec_metadata.num_tokens = 4
+
+    hidden_states = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    residual = torch.ones_like(hidden_states)
+    spec_metadata.maybe_capture_hidden_states(23, hidden_states, residual)
+
+    assert torch.equal(spec_metadata.hidden_states[:4, :2],
+                       hidden_states[:4] + residual[:4])
+    assert spec_metadata.hidden_states.shape == (4, 2)
 
 
 @pytest.fixture(scope="function")

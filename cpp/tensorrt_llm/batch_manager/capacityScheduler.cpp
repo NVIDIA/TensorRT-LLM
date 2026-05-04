@@ -44,7 +44,7 @@ prefillWithChunkedContextsAlreadyExecuting(RequestList const& activeRequests,
         {
             // Chunked context request already executing, but haven't completed all chunks yet.
             // Skipping is not an option, register it's contributed blocks
-            if (kvCacheManager.isEnableBlockReuse())
+            if (kvCacheManager.isEnableBlockReuse() && !kvCacheManager.getBlockManager().isVariableWindow())
             {
                 auto uniqueTokens = req->getUniqueTokens(0);
                 auto summary = kvCacheManager.analyzePrefixReuse(uniqueTokens, *req);
@@ -53,7 +53,8 @@ prefillWithChunkedContextsAlreadyExecuting(RequestList const& activeRequests,
                     newlyContributedContextBlocks.insert(summary.firstNewBlock.value());
                 }
             }
-            if (crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse())
+            if (crossKvCacheManager && crossKvCacheManager->isEnableBlockReuse()
+                && !crossKvCacheManager->getBlockManager().isVariableWindow())
             {
                 auto uniqueTokens = *(req->getEncoderUniqueTokens().value());
                 auto summary = crossKvCacheManager->analyzePrefixReuse(uniqueTokens, *req);

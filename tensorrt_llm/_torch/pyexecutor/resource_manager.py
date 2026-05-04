@@ -71,6 +71,45 @@ BlocksPerWindow = Dict[int, Tuple[
     int]]  # window_size -> (blocks_in_primary_pool, blocks_in_secondary_pool)
 
 
+def _derive_window_size_shares(
+    window_size_to_layers: Dict[int, List[int]],
+    cache_size_bytes_per_token_per_window: Dict[int, int],
+    max_input_len: Optional[int] = None,
+    max_num_tokens: Optional[int] = None,
+) -> Dict[int, float]:
+    """Allocate VSWA memory in proportion to each window's effective KV footprint."""
+    if len(window_size_to_layers) == 1:
+        window_size = next(iter(window_size_to_layers))
+        return {window_size: 1.0}
+
+    window_size_to_contribution: Dict[int, float] = {}
+    for window_size in window_size_to_layers:
+        cache_size_bytes_per_token = cache_size_bytes_per_token_per_window[
+            window_size]
+        if cache_size_bytes_per_token <= 0:
+            raise ValueError(
+                f"cache_size_bytes_per_token for window size {window_size} "
+                f"must be positive, got {cache_size_bytes_per_token}")
+        temporary_attention_window = 0
+        if max_input_len is not None and max_num_tokens is not None and max_input_len > window_size:
+            temporary_attention_window = max(
+                0, min(max_num_tokens, max_input_len - window_size))
+        effective_window_size = window_size + temporary_attention_window
+        window_size_to_contribution[window_size] = float(
+            effective_window_size) * cache_size_bytes_per_token
+
+    total_contribution = sum(window_size_to_contribution.values())
+    if total_contribution <= 0:
+        raise ValueError(
+            f"Window-size contributions must be positive, got {window_size_to_contribution}"
+        )
+
+    return {
+        window_size: contribution / total_contribution
+        for window_size, contribution in window_size_to_contribution.items()
+    }
+
+
 class ResourceManagerType(enum.Enum):
     KV_CACHE_MANAGER = "KV_CACHE_MANAGER"
     DRAFT_KV_CACHE_MANAGER = "DRAFT_KV_CACHE_MANAGER"
@@ -104,7 +143,7 @@ class BaseResourceManager(ABC):
     def add_dummy_requests(self, request_ids: List[int]):
         pass
 
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
         pass
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
@@ -598,6 +637,12 @@ class KVCacheManager(BaseResourceManager):
         return self.impl.max_num_blocks
 
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
+        if self.is_vswa:
+            return max(
+                self.impl.get_remaining_blocks_to_completion(
+                    request, window_size)
+                for window_size in set(self.max_attention_window_vec))
+
         # TODO: the C++ implementation of this method can be used, but the
         # Python and C++ schedulers currently do not agree on what "needed
         # resource to completion" means. The C++ one excludes already allocated
@@ -612,7 +657,7 @@ class KVCacheManager(BaseResourceManager):
             remaining_tokens / self.tokens_per_block)
         return need_blocks
 
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
         with request_context(self.is_draft, scheduled_batch):
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
@@ -655,10 +700,13 @@ class KVCacheManager(BaseResourceManager):
                 self.impl.add_sequence_batch(batch_request_infos,
                                              batch_llm_requests)
                 for req in batch_ctx_requests:
+                    # These speculative reservations are still part of context
+                    # attention. Keep SWA front blocks attached until the
+                    # context kernel has consumed the temporary page-table span.
                     for _ in range(self.num_extra_kv_tokens):
-                        self.impl.add_token(req.py_request_id)
+                        self.impl.add_token(req.py_request_id, False)
                     for _ in range(get_draft_token_length(req)):
-                        self.impl.add_token(req.py_request_id)
+                        self.impl.add_token(req.py_request_id, False)
 
                     if self.kv_connector_manager is not None:
                         block_ids = self.get_cache_indices(req)
@@ -717,7 +765,7 @@ class KVCacheManager(BaseResourceManager):
         # occur.
         num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional[BaseResourceManager] = None,
-    ):
+    ) -> Optional[List[LlmRequest]]:
         available_blocks = self.get_num_free_blocks()
         # No padding if not enough KV cache space
         if available_blocks < 1:
@@ -786,11 +834,15 @@ class KVCacheManager(BaseResourceManager):
         if batch_request_infos:
             self.impl.add_sequence_batch(batch_request_infos,
                                          batch_llm_requests)
+            # Context warmup/reservation must preserve SWA front blocks until
+            # context attention has consumed them. Generation warmup can use
+            # the normal cyclic detach behavior.
+            detach_swa_front_blocks = is_gen
             for req_id, token_num, _ in batch_request_infos:
                 for _ in range(self.num_extra_kv_tokens):
-                    self.impl.add_token(req_id)
+                    self.impl.add_token(req_id, detach_swa_front_blocks)
                 for _ in range(num_extra_decoding_steps):
-                    self.impl.add_token(req_id)
+                    self.impl.add_token(req_id, detach_swa_front_blocks)
 
         if draft_batch_request_infos and draft_kv_cache_manager is not None:
             draft_kv_cache_manager.impl.add_sequence_batch(
@@ -1412,9 +1464,9 @@ class KVCacheManager(BaseResourceManager):
             A dict of (max_attention_window, (blocks_in_primary_pool, blocks_in_secondary_pool)).
 
         Environment variable TRTLLM_WINDOW_SIZE_SHARES is used to adjust the memory
-        share of each window size. By default, we allocate equal proportion shares of
-        memory for all window sizes (see the else case). With TRTLLM_WINDOW_SIZE_SHARES,
-        we can override this behavior to adjust the memory share of each window size.
+        share of each window size. By default, shares are derived from the effective
+        KV footprint of each window. With TRTLLM_WINDOW_SIZE_SHARES, we can override
+        this behavior to adjust the memory share of each window size.
 
         For example, if we have window size of [512, 32768], then setting
         TRTLLM_WINDOW_SIZE_SHARES=0.4,0.6 will be allocating 40% of the memory to
@@ -1467,10 +1519,19 @@ class KVCacheManager(BaseResourceManager):
             total_kv_heads = sum(self.num_kv_heads_per_layer[i] for i in layers)
             return total_kv_heads * self.kv_factor * model_config.head_size
 
+        def calculate_cache_size_bytes_per_token(layers: Set[int]) -> int:
+            cache_size_per_token = calculate_cache_size_per_token(layers)
+            return get_size_in_bytes(cache_size_per_token, self.dtype)
+
         logger.info(
             f"Primary pool memory bytes: {self._primary_pool_memory_bytes}")
         logger.info(
             f"Secondary pool memory bytes: {self._secondary_pool_memory_bytes}")
+
+        cache_size_bytes_per_token_per_window = {
+            window_size: calculate_cache_size_bytes_per_token(set(layers))
+            for window_size, layers in window_size_to_layers.items()
+        }
 
         if os.getenv("TRTLLM_WINDOW_SIZE_SHARES") is not None:
             logger.info("Environment variable TRTLLM_WINDOW_SIZE_SHARES is set")
@@ -1480,15 +1541,26 @@ class KVCacheManager(BaseResourceManager):
             assert len(window_size_shares) == len(
                 window_size_to_layers
             ), "Number of shares in TRTLLM_WINDOW_SIZE_SHARES must match number of window sizes"
-            assert sum(
-                window_size_shares
-            ) == 1.0, "Sum of shares in TRTLLM_WINDOW_SIZE_SHARES must be 1.0"
+            assert all(0.0 <= share <= 1.0 for share in window_size_shares
+                       ), "TRTLLM_WINDOW_SIZE_SHARES values must be in [0, 1]"
+            sum_shares = sum(window_size_shares)
+            assert sum_shares > 0.0, "Sum of TRTLLM_WINDOW_SIZE_SHARES must be > 0"
+            window_size_shares = [
+                share / sum_shares for share in window_size_shares
+            ]
         else:
             logger.info(
-                "Using default allocation of equal proportion of memory to each window size"
+                "Using derived proportional allocation of memory to each window size"
+            )
+            window_size_to_share = _derive_window_size_shares(
+                window_size_to_layers,
+                cache_size_bytes_per_token_per_window,
+                max_input_len=self.max_seq_len - 1,
+                max_num_tokens=self.max_num_tokens,
             )
             window_size_shares = [
-                1.0 / len(window_size_to_layers) for _ in window_size_to_layers
+                window_size_to_share[window_size]
+                for window_size in sorted(window_size_to_layers)
             ]
 
         logger.info(f"Derived window_size_shares: {window_size_shares}")
@@ -1496,9 +1568,8 @@ class KVCacheManager(BaseResourceManager):
         blocks_per_window = {}
         for window_idx, (window_size, layers) in enumerate(
                 sorted(window_size_to_layers.items())):
-            cache_size_per_token = calculate_cache_size_per_token(layers)
-            cache_size_bytes_per_token = get_size_in_bytes(
-                cache_size_per_token, self.dtype)
+            cache_size_bytes_per_token = cache_size_bytes_per_token_per_window[
+                window_size]
 
             primary_tokens = self._primary_pool_memory_bytes * window_size_shares[
                 window_idx] / cache_size_bytes_per_token
@@ -1615,12 +1686,16 @@ class KVCacheManager(BaseResourceManager):
 
     def copy_batch_block_offsets(self, dst_tensor: torch.Tensor,
                                  request_ids: List[int], beam_width: int,
-                                 num_context: int, num_seqs: int):
+                                 num_context: int, num_seqs: int) -> None:
+        # Context SWA uses a wider temporary cyclic span and aliases logical
+        # page-table slots to valid cyclic slots. Generation only needs the
+        # smaller sliding-window cyclic view.
         self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
-                                           request_ids[:num_context], 1, 0)
+                                           request_ids[:num_context], 1, 0,
+                                           True, True)
         self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
                                            request_ids[num_context:],
-                                           beam_width, num_context)
+                                           beam_width, num_context, True)
 
         for pool_idx in range(self.host_kv_cache_block_offsets.shape[0]):
             dst_tensor[pool_idx, :num_seqs].copy_(
