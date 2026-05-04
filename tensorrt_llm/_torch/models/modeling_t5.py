@@ -74,6 +74,12 @@ def _t5_head_dim(config: T5Config) -> int:
     return config.d_kv
 
 
+def _t5_q_scaling(config: T5Config) -> float:
+    # TRT-LLM attention backends use 1 / (sqrt(head_dim) * q_scaling).
+    # T5 matches Hugging Face by leaving QK scores unscaled.
+    return 1.0 / math.sqrt(_t5_head_dim(config))
+
+
 def _t5_dense_act_fn(config: T5Config):
     """Resolve the T5 MLP activation function from the HF config.
 
@@ -83,7 +89,7 @@ def _t5_dense_act_fn(config: T5Config):
     _ACT_FN_MAP = {
         "relu": F.relu,
         "gelu": F.gelu,
-        "gelu_new": F.gelu,
+        "gelu_new": lambda x: F.gelu(x, approximate="tanh"),
         "silu": F.silu,
         "swish": F.silu,
     }
@@ -92,6 +98,16 @@ def _t5_dense_act_fn(config: T5Config):
             f"Unsupported T5 dense_act_fn '{act_name}'. Supported: {list(_ACT_FN_MAP.keys())}"
         )
     return _ACT_FN_MAP[act_name]
+
+
+def _t5_gated_act_fn(config: T5Config):
+    act_fn = _t5_dense_act_fn(config)
+
+    def gated_act_fn(hidden_states: torch.Tensor) -> torch.Tensor:
+        gate, up = hidden_states.chunk(2, dim=-1)
+        return act_fn(gate) * up
+
+    return gated_act_fn
 
 
 def _t5_encoder_num_layers(config: T5Config) -> int:
@@ -213,7 +229,7 @@ class T5Attention(Attention):
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
-            q_scaling=1.0,
+            q_scaling=_t5_q_scaling(config),
         )
         self._is_decoder = is_decoder
         self._head_dim = _t5_head_dim(config)
@@ -306,7 +322,7 @@ class T5CrossAttention(CrossAttention):
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
-            q_scaling=1.0,
+            q_scaling=_t5_q_scaling(config),
         )
 
 
@@ -329,7 +345,7 @@ class T5EncoderLayer(EncoderLayer):
         intermediate_size = _t5_intermediate_size(config)
         is_gated = _t5_is_gated_act(config)
 
-        act_fn = _t5_dense_act_fn(config)
+        act_fn = _t5_gated_act_fn(config) if is_gated else _t5_dense_act_fn(config)
 
         self.self_attn = T5Attention(model_config, layer_idx=layer_idx, is_decoder=False)
 
@@ -413,7 +429,7 @@ class T5DecoderLayer(EncoderDecoderLayer):
         intermediate_size = _t5_intermediate_size(config)
         is_gated = _t5_is_gated_act(config)
 
-        act_fn = _t5_dense_act_fn(config)
+        act_fn = _t5_gated_act_fn(config) if is_gated else _t5_dense_act_fn(config)
 
         self.self_attn = T5Attention(model_config, layer_idx=layer_idx, is_decoder=True)
 

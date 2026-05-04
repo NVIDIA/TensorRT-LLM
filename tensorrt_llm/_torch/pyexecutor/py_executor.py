@@ -3554,6 +3554,10 @@ class PyExecutor:
         for req in encoder_requests:
             req.py_encoder_output_ready_event = torch.cuda.Event()
             req.py_encoder_output_ready_event.record(self.encoder_stream)
+            if req.py_return_encoder_output:
+                with torch.cuda.stream(self.encoder_stream):
+                    req.py_result.set_encoder_output(
+                        req.py_encoder_output.detach().cpu())
 
     @nvtx_range("_scatter_encoder_output")
     def _scatter_encoder_output(

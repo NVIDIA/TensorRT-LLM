@@ -748,8 +748,16 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _sort_requests(self, context_requests, generation_requests, has_chunks):
         """Sort by LoRA task ID. Non-last chunks before last chunks."""
         if has_chunks:
-            not_last = [r for r in context_requests if not r.is_last_context_chunk]
-            last = [r for r in context_requests if r.is_last_context_chunk]
+            not_last = [
+                r
+                for r in context_requests
+                if r.is_encoder_init_state or not r.is_last_context_chunk
+            ]
+            last = [
+                r
+                for r in context_requests
+                if not r.is_encoder_init_state and r.is_last_context_chunk
+            ]
             not_last.sort(key=self._lora_key)
             last.sort(key=self._lora_key)
             context_requests.clear()

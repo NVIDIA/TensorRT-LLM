@@ -33,6 +33,10 @@ methods:
         default: None
     return_annotation: None
 properties:
+  encoder_output:
+    annotation: Optional[torch.Tensor]
+    default: inspect._empty
+    status: prototype
   error:
     annotation: Optional[str]
     default: inspect._empty

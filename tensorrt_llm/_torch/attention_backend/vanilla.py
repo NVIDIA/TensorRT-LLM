@@ -394,6 +394,10 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
 
         from flash_attn.flash_attn_interface import flash_attn_varlen_func
 
+        softmax_scale = None
+        if self.q_scaling is not None:
+            softmax_scale = 1 / (math.sqrt(head_dim) * self.q_scaling)
+
         attn_output_unpad = flash_attn_varlen_func(
             q,
             k,
@@ -403,7 +407,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             max_seqlen_q,
             max_seqlen_k,
             dropout_p=0.0,
-            softmax_scale=None,
+            softmax_scale=softmax_scale,
             causal=attention_mask == PredefinedAttentionMask.CAUSAL,
             alibi_slopes=None,
             deterministic=False,
