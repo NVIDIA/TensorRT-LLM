@@ -69,6 +69,7 @@ def _get_symm_mem_allgather(workspace_id: int):
 
 def trtllm_symm_mem_allgather_impl(tensor, dim, sizes, workspace_id):
     """Symm-mem allgather with TRT-LLM NCCL fallback."""
+    # Uneven per-rank sizes (allgatherv) aren't supported by multimem_all_gather_out; fall back to NCCL.
     if sizes is not None:
         return trtllm_allgather(tensor, dim=dim, sizes=sizes)
 
@@ -119,6 +120,7 @@ def trtllm_dist_all_gather(
     dim: int = 0,
     sizes: Optional[List[int]] = None,
     strategy: str = "AUTO",
+    # Picks the symm_mem workspace; use distinct ids for concurrent multi-stream allgathers to avoid buffer races.
     workspace_id: int = 0,
 ) -> torch.Tensor:
     """AllGather via TRT-LLM optimized backend.
