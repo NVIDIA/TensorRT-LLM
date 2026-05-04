@@ -100,10 +100,17 @@ def _maybe_skip_dtype(state_dtype, use_sr):
     "T", [6, 10, 16, 27, 32, 55], ids=["T6", "T10", "T16", "T27", "T32", "T55"]
 )
 @pytest.mark.parametrize(
-    "write_checkpoint", [True, False], ids=["write", "no_write"]
+    "write_checkpoint,rectangle_for_nowrite",
+    [
+        (True, False),    # write path (rectangle_for_nowrite is ignored)
+        (False, False),   # nowrite path via replay-style kernels
+        (False, True),    # nowrite path via dedicated rectangle kernels
+    ],
+    ids=["write", "no_write_replay", "no_write_rectangle"],
 )
 def test_checkpointing_state_update(
-    nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, T, write_checkpoint
+    nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, T,
+    write_checkpoint, rectangle_for_nowrite,
 ):
     """
     Verify that:
@@ -318,6 +325,7 @@ def test_checkpointing_state_update(
             state_batch_indices=state_batch_indices,
             state_scales=test_scales,
             write_checkpoint=write_checkpoint,
+            rectangle_for_nowrite=rectangle_for_nowrite,
         )
 
         # Tolerance rationale: the replay kernel uses bf16 tl.dot for four
