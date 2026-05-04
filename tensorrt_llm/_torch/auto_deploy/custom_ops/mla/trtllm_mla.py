@@ -93,11 +93,20 @@ from ..attention_interface import (
 # rope info on torch_mla nodes, consumed by prepare_node_for_cache_insertion
 # (at cache_init) to materialize the rotary_cos_sin buffer as a graph node.
 _TRTLLM_MLA_ROPE_INFO_KEY = "_trtllm_mla_rope_info"
-# The cache-reused prefill path (``_handle_prefill_thop_cached_kv``) loads the
-# full ``[past + new]`` context from the paged KV cache; ``thop.attention``'s
-# context FMHA scratch grows with that total.  256 MiB suffices for fresh
-# prefill but is undersized once host_past_kv_lengths is non-zero.
-_TRTLLM_MLA_WORKSPACE_BYTES = 512 * 1024 * 1024
+# ``thop.attention``'s C++ side (``cpp/tensorrt_llm/thop/attentionOp.cpp``)
+# auto-resizes the workspace tensor when its sizing formula exceeds the
+# tensor's capacity.  ``resize_()`` reallocates storage and rebinds the
+# ``data_ptr_`` — which **invalidates any captured CUDA graph that
+# recorded the old address**.  Mirroring the standard trtllm_attention
+# backend, we keep two workspaces and route per call:
+#
+# * ``workspace`` — used by eager paths (prefill).  Free to grow on demand
+#   via ``resize_()``; no captured graph references it.
+# * ``cuda_graph_workspace`` — used during CUDA-graph warmup and capture.
+#   Grows lazily during warmup so the captured graph records the final
+#   pointer; afterwards no resize fires for the captured workload.
+#
+# Both start size-0 and grow on first use.
 
 
 def get_trtllm_mla_rope_info(attn_node: Node) -> Optional[dict]:
@@ -126,7 +135,9 @@ class _TrtllmMLAPlanner:
     Mirrors ``_TrtllmPlanner`` from the standard trtllm backend.  Only stores data
     that cannot be derived from ``SequenceInfo`` or tensor shapes:
 
-    - ``workspace``: scratch for thop.attention
+    - ``workspace`` / ``cuda_graph_workspace``: scratch for thop.attention,
+      split between eager (prefill) and captured (decode) paths so the
+      C++ side's ``resize_()`` cannot invalidate captured graphs
     - Host metadata not in SequenceInfo: ``host_request_types``, ``host_total_kv_lens``,
       ``host_past_kv_lengths``, ``host_context_lengths``
     - ``block_offsets`` / ``block_ids_per_seq``: filled by the device-side
@@ -143,6 +154,7 @@ class _TrtllmMLAPlanner:
 
     def __init__(self):
         self.workspace: Optional[torch.Tensor] = None
+        self.cuda_graph_workspace: Optional[torch.Tensor] = None
         # Per-layer caches, keyed by the relevant tensor's data_ptr().
         self._pool_ptr_cache: dict = {}
         self._kv_b_proj_bmm_cache: dict = {}
@@ -205,10 +217,12 @@ class _TrtllmMLAPlanner:
         if self.workspace is not None:
             return
 
-        # Pre-allocate workspace large enough to avoid cudaMalloc during
-        # CUDA graph capture (matching the standard trtllm_attention backend).
-        # See ``_TRTLLM_MLA_WORKSPACE_BYTES`` for sizing rationale.
-        self.workspace = torch.empty(_TRTLLM_MLA_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+        # Two size-0 workspaces; ``thop.attention``'s C++ side resizes on
+        # first use.  Splitting eager (prefill) from captured (decode)
+        # callers prevents a prefill-driven ``resize_()`` from invalidating
+        # captured-graph kernel pointers (see ``_select_workspace``).
+        self.workspace = torch.empty(0, dtype=torch.uint8, device=device)
+        self.cuda_graph_workspace = torch.empty(0, dtype=torch.uint8, device=device)
         # Shape: [_CONTEXT_LAYER_OFFSET + 1, 2] — one row per distinct mLayerIdx
         # we actually pass to thop.attention (decode=0, prefill=_CONTEXT_LAYER_OFFSET).
         # All zeros: each layer's pool pointer already points to that layer's
@@ -277,6 +291,18 @@ class _TrtllmMLAPlanner:
                 sm_count * 8, dtype=torch.int32, device=device
             )
             self.flash_mla_num_splits = torch.zeros(max_batch + 1, dtype=torch.int32, device=device)
+
+    def _select_workspace(self) -> torch.Tensor:
+        """Return the right workspace for the current execution context.
+
+        During CUDA-graph warmup or live capture, return ``cuda_graph_workspace``
+        so any C++-side ``resize_()`` happens before the graph records the
+        kernel's pointer.  Otherwise return ``workspace`` — captured graphs
+        do not reference it, so it is free to grow on demand.
+        """
+        if torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up():
+            return self.cuda_graph_workspace
+        return self.workspace
 
     def ensure_decode_buffers(
         self,
@@ -754,7 +780,7 @@ def _handle_prefill_thop(
         v,  # v
         output,  # output
         None,  # output_sf
-        planner.workspace,  # workspace
+        planner._select_workspace(),  # workspace
         context_lengths[:pf],  # sequence_length (new tokens only)
         host_past_kv_lengths[:pf],  # host_past_key_value_lengths (all zero here)
         planner.ctx_total_kv_lens_host,  # host_total_kv_lens
@@ -1020,7 +1046,7 @@ def _handle_prefill_thop_cached_kv(
         full_v,  # v
         output,  # output
         None,  # output_sf
-        planner.workspace,  # workspace
+        planner._select_workspace(),  # workspace
         sequence_length[:pf],  # sequence_length (past + new tokens)
         host_past_kv_lengths[:pf],  # host_past_key_value_lengths (real)
         planner.ctx_total_kv_lens_host,  # host_total_kv_lens
@@ -1067,7 +1093,17 @@ def _handle_prefill_thop_cached_kv(
         True,  # use_paged_context_fmha
         int(AttentionInputType.context_only),  # attention_input_type
         True,  # is_mla_enable
-        1,  # chunked_prefill_buffer_batch_size
+        # FP8 context-MLA workspace (``fp8_k_buf`` / ``fp8_v_buf``) is sized
+        # to ``chunked_prefill_buffer_batch_size * max_num_tokens`` tokens.
+        # The cache-reused-prefill path passes the FULL ``[past + new]`` K/V
+        # in one call; ``num_full_tokens`` can exceed ``max_num_tokens`` at
+        # high prefill concurrency (e.g. 84 prefill seqs × 1003 tokens =
+        # 84252 vs ``max_num_tokens=15360`` at bs=256, isl=1000).  Hard-
+        # coding ``1`` caused IMA inside ``AttentionOp::enqueueContext``.
+        # Use ``16`` — covers up to ``16 * max_num_tokens`` tokens of FP8
+        # K/V scratch, ~1 GiB extra workspace at our config, while leaving
+        # KV-cache budget intact.
+        16,  # chunked_prefill_buffer_batch_size
         0,  # q_lora_rank
         kv_lora_rank,
         qk_nope_head_dim,
@@ -1264,7 +1300,7 @@ def _handle_decode_impl(
         None,  # v
         output_latent,  # output
         None,  # output_sf
-        planner.workspace,  # workspace
+        planner._select_workspace(),  # workspace
         sequence_length,  # sequence_length
         host_past_kv_lengths,  # host_past_key_value_lengths
         host_total_kv_lens,  # host_total_kv_lens
@@ -1367,6 +1403,7 @@ def _mla_with_cache_impl(
     scale: Optional[float],
     kv_lora_rank: int,
     rotary_cos_sin: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Shared implementation for both MLA attention ops (with and without fused RoPE).
 
@@ -1489,9 +1526,25 @@ def _mla_with_cache_impl(
     # otherwise identity table so the kernel's RoPE is a no-op.
     decode_rotary_cos_sin = rotary_cos_sin if fused_rope else planner.identity_cos_sin
 
-    # Allocate output with bs rows (may include CG padding); only real-token
-    # positions are filled — padding stays zero, matching the FI MLA pattern.
-    y = torch.zeros(bs, num_heads * v_head_dim, dtype=q_nope_flat.dtype, device=q_nope_flat.device)
+    # Allocate output with padding capacity.  Piecewise CUDA graph replay may
+    # pass real-token-shaped inputs while the stable ``out`` buffer is sized to
+    # the bucket captured for the following static segment.
+    if out is not None:
+        y = out.view(-1, num_heads * v_head_dim)
+        output_tokens = y.shape[0]
+        if output_tokens < num_tokens:
+            raise RuntimeError(
+                "trtllm_mla_with_cache out buffer is too small: "
+                f"capacity={output_tokens}, required={num_tokens}"
+            )
+    else:
+        output_tokens = bs
+        y = torch.zeros(
+            output_tokens,
+            num_heads * v_head_dim,
+            dtype=q_nope_flat.dtype,
+            device=q_nope_flat.device,
+        )
 
     if num_prefill > 0:
         y[:num_prefill_tokens] = _handle_prefill_thop(
@@ -1562,6 +1615,11 @@ def _mla_with_cache_impl(
             decode_rotary_cos_sin,
         )
 
+    if out is not None:
+        if num_tokens < output_tokens:
+            y[num_tokens:].zero_()
+        return out.new_empty(0)
+
     return y.view(b, s, num_heads, v_head_dim)
 
 
@@ -1607,6 +1665,7 @@ def trtllm_mla_with_cache(
     scale: Optional[float],
     kv_lora_rank: int,
     rotary_cos_sin: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """TRT-LLM MLA attention with paged latent cache.
 
@@ -1627,6 +1686,7 @@ def trtllm_mla_with_cache(
         scale,
         kv_lora_rank,
         rotary_cos_sin=rotary_cos_sin,
+        out=out,
     )
 
 
@@ -1645,8 +1705,11 @@ def trtllm_mla_with_cache_fake(
     scale: Optional[float],
     kv_lora_rank: int,
     rotary_cos_sin: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile tracing."""
+    if out is not None:
+        return out.new_empty(0)
     return _mla_with_cache_fake_impl(q_nope, kv_b_proj_weight)
 
 

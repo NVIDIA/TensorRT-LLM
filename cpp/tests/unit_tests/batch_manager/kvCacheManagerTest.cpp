@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheTransferManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
@@ -9471,4 +9472,250 @@ TEST_F(KVCacheManagerTest, VSWAEvictedPlaceholderAnchorAllowsTrailingReuse)
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest2);
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(2, llmRequest2)));
     ASSERT_NE(kvCacheManager.findBlocksInReuseTreeByBlockKeys(b6PartialKeys, window), nullptr);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// KvCacheConnector decode-time block allocation tests
+//
+// Repro and coverage for https://github.com/NVIDIA/TensorRT-LLM/issues/13320:
+// when a kv_connector::KvCacheConnectorManager is attached, decode-time
+// addToken() must still grow GenerationRequest::mCacheBlockIds at every
+// tokens_per_block boundary. Failing to do so causes decode KV writes to
+// overwrite the prefill block, silently corrupting attention outputs.
+//
+// The C++ source (KVCacheManager::addToken -> BlockManager::adjustBlocksIfNeeded
+// -> WindowBlockManager::allocateBlock) does not branch on
+// mKvCacheConnectorManager on the decode path, so on paper these tests should
+// pass with a connector attached. They are intentionally written to exercise
+// both the "attached but reports zero matches" path and the "attached and
+// reports >0 matches" path so a regression in either direction surfaces.
+///////////////////////////////////////////////////////////////////////////////
+
+namespace
+{
+// Minimal mock matching the KvCacheConnectorManager interface declared in
+// cpp/include/tensorrt_llm/batch_manager/kvCacheConnector.h. Returns a
+// configurable number of "externally matched" tokens, the same hook the
+// real Dynamo / KVBM connector uses.
+class MockKvCacheConnectorManager : public kv_connector::KvCacheConnectorManager
+{
+public:
+    explicit MockKvCacheConnectorManager(SizeType32 numNewMatchedTokens)
+        : mNumNewMatchedTokens(numNewMatchedTokens)
+    {
+    }
+
+    SizeType32 getNumNewMatchedTokens(LlmRequest const& /*request*/, SizeType32 /*numComputedTokens*/) override
+    {
+        ++mCallCount;
+        return mNumNewMatchedTokens;
+    }
+
+    SizeType32 getCallCount() const
+    {
+        return mCallCount;
+    }
+
+private:
+    SizeType32 mNumNewMatchedTokens{0};
+    SizeType32 mCallCount{0};
+};
+
+// Build a small KVCacheManager wired to the supplied connector. tokensPerBlock=4
+// keeps the boundary math obvious; 16 primary blocks is plenty for the
+// scenarios below.
+std::unique_ptr<KVCacheManager> makeConnectorTestKVCacheManager(
+    std::shared_ptr<tensorrt_llm::runtime::CudaStream> const& stream,
+    std::shared_ptr<kv_connector::KvCacheConnectorManager> connector)
+{
+    auto constexpr numLayers = 1;
+    auto constexpr numKvHeads = 1;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimaryPool = 16;
+    auto constexpr blocksInSecondaryPool = 0;
+    auto constexpr maxNumSequences = 4;
+    auto constexpr beamWidth = 1;
+    auto constexpr maxAttentionWindow = tokensPerBlock * 8;
+
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+
+    auto mgr
+        = std::make_unique<KVCacheManager>(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock,
+            blocksPerWindow, maxNumSequences, beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow},
+            /*tempAttentionWindowInputs*/ std::nullopt,
+            /*dtype*/ nvinfer1::DataType::kHALF,
+            /*sinkTokenLength*/ 0, stream,
+            /*maxSequenceLength*/ maxAttentionWindow,
+            /*enableBlockReuse*/ true,
+            /*cacheType*/ CacheType::kSELF,
+            /*secondaryOffloadMinPriority*/ std::nullopt,
+            /*eventManager*/ nullptr,
+            /*enablePartialReuse*/ true,
+            /*copyOnPartialReuse*/ true,
+            /*kvCacheConnectorManager*/ std::move(connector));
+    mgr->allocatePools(false);
+    return mgr;
+}
+
+// Drive a single-request decode loop until mNumTokens reaches `targetNumTokens`,
+// returning the cache block ids observed at every step. The first entry in the
+// returned vector corresponds to the post-prefill state; each subsequent entry
+// is the state after one addToken call.
+std::vector<std::vector<SizeType32>> driveDecode(
+    KVCacheManager& mgr, LlmRequest::RequestIdType reqId, SizeType32 targetNumTokens)
+{
+    auto const windowSize = theOnlyWindowSize(mgr);
+    std::vector<std::vector<SizeType32>> trace;
+    trace.push_back(mgr.getCacheBlockIds(reqId, windowSize).at(0));
+
+    while (mgr.getSequence(reqId).getNumTokens() < targetNumTokens)
+    {
+        mgr.addToken(reqId);
+        trace.push_back(mgr.getCacheBlockIds(reqId, windowSize).at(0));
+    }
+    return trace;
+}
+} // namespace
+
+// Test 1: connector attached but reports zero external matches. Decode-time
+// boundary allocation must still fire; this is the simplest possible
+// invariant a KvCacheConnector must not break.
+TEST_F(KVCacheManagerTest, KvCacheConnector_DecodeBlockBoundary_NoExternalMatches)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto connector = std::make_shared<MockKvCacheConnectorManager>(/*numNewMatchedTokens=*/0);
+    auto mgr = makeConnectorTestKVCacheManager(stream, connector);
+
+    auto constexpr beamWidth = 1;
+    auto constexpr tokensPerBlock = 4;
+
+    // Prompt with 2 tokens -> exactly one block at prefill.
+    auto tokens = std::make_shared<VecTokens>(VecTokens{0, 1});
+    auto const promptLen = static_cast<SizeType32>(tokens->size());
+    SizeType32 constexpr maxNewTokens{0};
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    auto req = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{0}, maxNewTokens, tokens, samplingConfig, /*isStreaming=*/false);
+
+    mgr->addSequenceBatch({{{req->mRequestId, promptLen, beamWidth}}}, {std::ref(*req)});
+
+    auto const windowSize = theOnlyWindowSize(*mgr);
+    EXPECT_EQ(mgr->getSequence(req->mRequestId).getNumTokens(), promptLen);
+    ASSERT_EQ(mgr->getCacheBlockIds(req->mRequestId, windowSize).at(0).size(), 1U);
+
+    // Drive decode past the first block boundary. Boundary fires when
+    // (mNumTokens - 1) % tokensPerBlock == 0, i.e. at mNumTokens == 5 with
+    // tokensPerBlock == 4. Stop at 7 so we are firmly past the boundary.
+    auto const targetNumTokens = static_cast<SizeType32>(2 * tokensPerBlock - 1); // 7
+    auto trace = driveDecode(*mgr, req->mRequestId, targetNumTokens);
+
+    EXPECT_EQ(mgr->getSequence(req->mRequestId).getNumTokens(), targetNumTokens);
+
+    auto const finalIds = mgr->getCacheBlockIds(req->mRequestId, windowSize).at(0);
+    EXPECT_GT(finalIds.size(), 1U) << "Decode never allocated a second block despite crossing tokensPerBlock boundary; "
+                                      "trace size="
+                                   << trace.size() << ", final block count=" << finalIds.size();
+    EXPECT_EQ(finalIds.size(), 2U);
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req);
+    (void) mgr->removeSequence(req->mRequestId, req);
+}
+
+// Test 2: connector attached AND reports a non-zero external match count
+// during prefill (the production path used by the Dynamo / KVBM connector).
+// Decode-time boundary allocation must still fire correctly.
+TEST_F(KVCacheManagerTest, KvCacheConnector_DecodeBlockBoundary_WithExternalMatches)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    // Report 4 matched tokens (exactly one block). The connector contract is
+    // that the worker has already loaded these into the allocated block.
+    auto constexpr numConnectorMatched = 4;
+    auto connector = std::make_shared<MockKvCacheConnectorManager>(numConnectorMatched);
+    auto mgr = makeConnectorTestKVCacheManager(stream, connector);
+
+    auto constexpr beamWidth = 1;
+    auto constexpr tokensPerBlock = 4;
+
+    // Prompt with 6 tokens -> two blocks at prefill (block0 full, block1 with 2 tokens).
+    auto tokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5});
+    auto const promptLen = static_cast<SizeType32>(tokens->size());
+    SizeType32 constexpr maxNewTokens{0};
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    auto req = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{1}, maxNewTokens, tokens, samplingConfig, /*isStreaming=*/false);
+
+    mgr->addSequenceBatch({{{req->mRequestId, promptLen, beamWidth}}}, {std::ref(*req)});
+
+    auto const windowSize = theOnlyWindowSize(*mgr);
+    EXPECT_EQ(mgr->getSequence(req->mRequestId).getNumTokens(), promptLen);
+    ASSERT_EQ(mgr->getCacheBlockIds(req->mRequestId, windowSize).at(0).size(), 2U)
+        << "Prefill must allocate ceil(promptLen / tokensPerBlock) blocks regardless of connector matches";
+
+    EXPECT_GT(connector->getCallCount(), 0);
+    EXPECT_EQ(req->getPrepopulatedPromptLen(), numConnectorMatched);
+
+    // Drive decode well past two more block boundaries (mNumTokens == 9 and 13).
+    auto const targetNumTokens = static_cast<SizeType32>(promptLen + 2 * tokensPerBlock + 1); // 15
+    auto trace = driveDecode(*mgr, req->mRequestId, targetNumTokens);
+
+    EXPECT_EQ(mgr->getSequence(req->mRequestId).getNumTokens(), targetNumTokens);
+
+    auto const finalIds = mgr->getCacheBlockIds(req->mRequestId, windowSize).at(0);
+    auto const expectedNumBlocks = tc::ceilDiv(targetNumTokens, tokensPerBlock);
+    EXPECT_EQ(finalIds.size(), static_cast<size_t>(expectedNumBlocks))
+        << "With connector reporting " << numConnectorMatched << " matched tokens, expected " << expectedNumBlocks
+        << " blocks after " << targetNumTokens << " total tokens, got " << finalIds.size() << " (issue #13320)";
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req);
+    (void) mgr->removeSequence(req->mRequestId, req);
+}
+
+// Test 3: parity check. Run the same decode workload with and without a
+// connector attached and assert mCacheBlockIds growth is identical. Any
+// future regression that gates allocateBlock on mKvCacheConnectorManager
+// will diverge the two traces.
+TEST_F(KVCacheManagerTest, KvCacheConnector_DecodeBlockBoundary_ParityWithBaseline)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+
+    auto constexpr beamWidth = 1;
+    auto constexpr tokensPerBlock = 4;
+
+    auto runScenario = [&](std::shared_ptr<kv_connector::KvCacheConnectorManager> connector)
+    {
+        auto mgr = makeConnectorTestKVCacheManager(stream, std::move(connector));
+        auto tokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4});
+        auto const promptLen = static_cast<SizeType32>(tokens->size());
+        SizeType32 constexpr maxNewTokens{0};
+        tr::SamplingConfig const samplingConfig{beamWidth};
+        auto req = std::make_shared<LlmRequest>(
+            LlmRequest::RequestIdType{0}, maxNewTokens, tokens, samplingConfig, /*isStreaming=*/false);
+        mgr->addSequenceBatch({{{req->mRequestId, promptLen, beamWidth}}}, {std::ref(*req)});
+
+        auto const targetNumTokens = static_cast<SizeType32>(3 * tokensPerBlock + 2); // 14
+        auto trace = driveDecode(*mgr, req->mRequestId, targetNumTokens);
+
+        std::vector<size_t> sizes;
+        sizes.reserve(trace.size());
+        for (auto const& step : trace)
+        {
+            sizes.push_back(step.size());
+        }
+
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req);
+        (void) mgr->removeSequence(req->mRequestId, req);
+        return sizes;
+    };
+
+    auto baseline = runScenario(/*connector=*/nullptr);
+    auto withConnector = runScenario(std::make_shared<MockKvCacheConnectorManager>(/*numNewMatchedTokens=*/0));
+
+    ASSERT_EQ(baseline.size(), withConnector.size());
+    for (size_t i = 0; i < baseline.size(); ++i)
+    {
+        EXPECT_EQ(baseline[i], withConnector[i])
+            << "Block count diverged at decode step " << i << " (baseline=" << baseline[i]
+            << ", withConnector=" << withConnector[i] << "); see issue #13320";
+    }
 }

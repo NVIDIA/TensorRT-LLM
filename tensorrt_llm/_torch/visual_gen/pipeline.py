@@ -598,6 +598,10 @@ class BasePipeline(nn.Module):
         vgm = self.model_config.visual_gen_mapping
         cfg_size = vgm.cfg_size if vgm else 1
         ulysses_size = vgm.ulysses_size if vgm else 1
+        attn2d_row_size = vgm.attn2d_row_size if vgm else 1
+        attn2d_col_size = vgm.attn2d_col_size if vgm else 1
+        attn2d_size = attn2d_row_size * attn2d_col_size
+        seq_parallel_size = attn2d_size if attn2d_size > 1 else ulysses_size
 
         is_conditional = vgm.is_cfg_conditional if vgm else True
         is_split_embeds = neg_prompt_embeds is not None
@@ -607,7 +611,13 @@ class BasePipeline(nn.Module):
 
         if do_cfg_parallel:
             if self.rank == 0:
-                logger.info(f"CFG Parallel: cfg_size={cfg_size}, ulysses_size={ulysses_size}")
+                if attn2d_row_size * attn2d_col_size > 1:
+                    logger.info(
+                        f"CFG Parallel: cfg_size={cfg_size}, "
+                        f"attn2d_row_size={attn2d_row_size}, attn2d_col_size={attn2d_col_size}"
+                    )
+                else:
+                    logger.info(f"CFG Parallel: cfg_size={cfg_size}, ulysses_size={ulysses_size}")
 
             # Split main embeddings
             if is_split_embeds:
@@ -639,9 +649,7 @@ class BasePipeline(nn.Module):
 
         return {
             "enabled": do_cfg_parallel,
-            "cfg_size": cfg_size,
-            "ulysses_size": ulysses_size,
-            "cfg_rank": vgm.cfg_rank if vgm else 0,
+            "seq_parallel_size": seq_parallel_size,
             "local_embeds": local_embeds,
             "prompt_embeds": prompt_embeds,
             "local_extras": local_extras,
@@ -656,7 +664,7 @@ class BasePipeline(nn.Module):
         forward_fn,
         guidance_scale,
         guidance_rescale,
-        ulysses_size,
+        seq_parallel_size,
         local_extras,
     ):
         """Execute single denoising step with CFG parallel."""
@@ -905,7 +913,7 @@ class BasePipeline(nn.Module):
                         forward_fn,
                         current_guidance_scale,
                         guidance_rescale,
-                        cfg_config["ulysses_size"],
+                        cfg_config["seq_parallel_size"],
                         local_extras,
                     )
                 else:
