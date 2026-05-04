@@ -20,6 +20,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     LayerRange,
     SessionStatus,
     TokenRange,
+    WaitResult,
 )
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
@@ -1132,8 +1133,12 @@ def test_transfer_with_gen_prefix_offset(use_v2):
         kv.resize(request_len)
         gen_kv_caches.append(kv)
     else:
-        ctx_mgr.impl.add_sequence(0, request_len, 1, ctx_request)
-        gen_mgr.impl.add_sequence(1, request_len, 1, gen_request)
+        ctx_mgr.impl.add_sequence_batch(
+            [(ctx_request.py_request_id, request_len, 1)], [ctx_request]
+        )
+        gen_mgr.impl.add_sequence_batch(
+            [(gen_request.py_request_id, request_len, 1)], [gen_request]
+        )
 
     # Get block IDs
     ctx_block_ids = get_block_ids_per_layer_groups(ctx_mgr, ctx_tw, 0, use_v2, tokens_per_block)
@@ -1152,7 +1157,6 @@ def test_transfer_with_gen_prefix_offset(use_v2):
             block_ids_per_layer_groups=ctx_block_ids,
             token_range=TokenRange(start=0, end=request_len),
         )
-        send_future = tx.send(send_slice)
 
         # Gen receives only suffix blocks with start_token_idx offset
         rx = gen_tw.create_rx_session(gen_request)
@@ -1161,10 +1165,13 @@ def test_transfer_with_gen_prefix_offset(use_v2):
             block_ids_per_layer_groups=gen_suffix_block_ids,
             token_range=TokenRange(start=prefix_tokens, end=request_len),
         )
-        recv_future = rx.receive(recv_slice)
+        rx.receive(recv_slice)
+        tx.send(send_slice)
 
-        send_future.result()
-        recv_future.result()
+        result = tx.wait_complete()
+        assert result == WaitResult.COMPLETED, f"tx wait_complete returned {result}"
+        result = rx.wait_complete(blocking=True)
+        assert result == WaitResult.COMPLETED, f"rx wait_complete returned {result}"
 
         # Verify: suffix blocks on gen should match corresponding ctx blocks
         num_layer_groups = len(ctx_block_ids)
