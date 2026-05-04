@@ -566,7 +566,10 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
             pytest.skip(f"Not enough devices for world_size={world_size}")
         model_path = self.MODEL_PATHS[model_id]
         kwargs = {}
-        if model_id == "bf16":
+        # bf16 always needs low-memory overrides; on Ada (sm_89, e.g. L40S
+        # ~44 GB) the quantized variants do too, since the 30B FP8 / NVFP4
+        # weights leave too little headroom for the nano_v3.yaml defaults.
+        if model_id == "bf16" or get_sm_version() < 90:
             low_memory_overrides(kwargs)
         kwargs["attn_backend"] = attn_backend
 
