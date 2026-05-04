@@ -432,7 +432,8 @@ async def async_benchmark(
                 except asyncio.TimeoutError:
                     logger.debug("No items in queue. Continuing.")
 
-            assert finished_requests == len(requests), "Benchmark failed"
+            if duration is None:
+                assert finished_requests == len(requests), "Benchmark failed"
 
         statistics.set_energy(monitor.total_energy)
         logger.info("Benchmark complete.")
