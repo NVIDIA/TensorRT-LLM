@@ -513,6 +513,9 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
 
     sr_modes_list = getattr(args, "sr_modes_list", ["RN"])
 
+    rect_list = getattr(args, "rectangle_for_nowrite_list", [False])
+    write_modes_list = getattr(args, "write_modes_list", [args.write_checkpoint])
+
     configs = []
     for batch in batch_sizes:
         for mtp_len in mtp_lengths:
@@ -520,17 +523,26 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
             for state_dtype in state_dtypes:
                 for act_dtype in act_dtypes:
                     for sr_mode in sr_modes_list:
-                        configs.append(
-                            (batch, mtp_len, prev_ks, state_dtype, act_dtype, sr_mode))
+                        for write_ckpt in write_modes_list:
+                            # Rectangle is only meaningful for nowrite cells.
+                            effective_rect_list = (
+                                [False] if write_ckpt else rect_list
+                            )
+                            for rect in effective_rect_list:
+                                configs.append((
+                                    batch, mtp_len, prev_ks, state_dtype, act_dtype,
+                                    sr_mode, rect, write_ckpt,
+                                ))
 
     print(f"[compile-warmup] {len(configs)} configs across {max_workers} threads")
     t0 = time.perf_counter()
 
     def _warm(cfg):
-        batch, mtp_len, prev_ks, state_dtype, act_dtype, sr_mode = cfg
+        batch, mtp_len, prev_ks, state_dtype, act_dtype, sr_mode, rect, write_ckpt = cfg
         _bench_config(
             args, batch, mtp_len, prev_ks, state_dtype, act_dtype, baseline_fn,
-            sr_mode=sr_mode, warmup_only=True,
+            sr_mode=sr_mode, rectangle_for_nowrite=rect,
+            write_checkpoint=write_ckpt, warmup_only=True,
         )
 
     errors = []
@@ -560,6 +572,8 @@ def _bench_config(
     act_dtype: torch.dtype,
     baseline_fn,
     sr_mode: str = "RN",
+    rectangle_for_nowrite: bool = False,
+    write_checkpoint: bool = True,
     warmup_only: bool = False,
 ) -> None:
     """
@@ -818,7 +832,15 @@ def _bench_config(
     num_ctas_values = _parse_sweep(args.num_ctas)
 
     # --- Replay kernel, one row per prev_k ---
+    # Cache T-axis capacity (for prev_k validity check on the nowrite path).
+    max_window = getattr(args, "max_window", 0) or mtp_len
     for prev_k in prev_ks:
+        # On the nowrite path, new tokens append at [prev_k, prev_k+T) of the
+        # active buffer, so prev_k+T must fit within max_window.  Skip
+        # silently for combinations that don't satisfy this — lets a single
+        # nsys run sweep both write modes against a shared prev_k list.
+        if not write_checkpoint and prev_k + mtp_len > max_window:
+            continue
         prev_tokens.fill_(prev_k)
         tag = f"incr_b{batch}_mtp{mtp_len}_k{prev_k}_s{state_dtype_name}_a{act_dtype_name}"
 
@@ -865,7 +887,8 @@ def _bench_config(
                 # variant; replay variant ignores the kwarg.  state_scales
                 # is also checkpointing-only (replay kernel doesn't quantize).
                 if args.variant == "checkpointing":
-                    extra_kwargs["write_checkpoint"] = args.write_checkpoint
+                    extra_kwargs["write_checkpoint"] = write_checkpoint
+                    extra_kwargs["rectangle_for_nowrite"] = rectangle_for_nowrite
                     if state_scales_work is not None:
                         extra_kwargs["state_scales"] = state_scales_work
                 variant_fn(
@@ -918,6 +941,8 @@ def _bench_config(
             if num_ctas is not None:
                 parts.append(f"CT={num_ctas}")
             parts.append(f"SR={1 if use_philox else 0}")
+            parts.append(f"RECT={1 if rectangle_for_nowrite else 0}")
+            parts.append(f"WC={1 if write_checkpoint else 0}")
             sweep_suffix = (" " + ",".join(parts)) if parts else ""
             sweep_tag = tag + sweep_suffix.replace(" ", "_").replace(",", "_")
 
@@ -1040,6 +1065,8 @@ def _run_benchmark(args) -> None:
         )
 
     sr_modes_list = getattr(args, "sr_modes_list", ["RN"])
+    rect_list = getattr(args, "rectangle_for_nowrite_list", [False])
+    write_modes_list = getattr(args, "write_modes_list", [args.write_checkpoint])
 
     for batch in batch_sizes:
         for mtp_len in mtp_lengths:
@@ -1048,10 +1075,18 @@ def _run_benchmark(args) -> None:
             for state_dtype in state_dtypes:
                 for act_dtype in act_dtypes:
                     for sr_mode in sr_modes_list:
-                        _bench_config(
-                            args, batch, mtp_len, prev_ks, state_dtype, act_dtype,
-                            baseline_fn, sr_mode=sr_mode,
-                        )
+                        for write_ckpt in write_modes_list:
+                            # Rectangle only meaningful for nowrite cells.
+                            effective_rect_list = (
+                                [False] if write_ckpt else rect_list
+                            )
+                            for rect in effective_rect_list:
+                                _bench_config(
+                                    args, batch, mtp_len, prev_ks, state_dtype, act_dtype,
+                                    baseline_fn, sr_mode=sr_mode,
+                                    rectangle_for_nowrite=rect,
+                                    write_checkpoint=write_ckpt,
+                                )
 
     if args.profile:
         torch.cuda.cudart().cudaProfilerStop()
@@ -1225,7 +1260,17 @@ def _parse_args() -> argparse.Namespace:
         help="Whether the checkpointing kernel should write the post-replay "
         "state to HBM.  True = checkpoint step (default).  False = "
         "non-checkpoint step (skip state HBM write + Philox).  No effect on "
-        "the replay variant.",
+        "the replay variant.  Ignored if --write-modes is set.",
+    )
+    parser.add_argument(
+        "--write-modes",
+        type=str,
+        default=None,
+        help="Comma-separated 0/1 values to sweep both write modes in a "
+        "single nsys process — for apples-to-apples comparison of write "
+        "vs nowrite (replay) vs nowrite (rectangle) within one timeline. "
+        "Skips silently for (write=False, prev_k+T>max_window) combos. "
+        "When set, overrides --write-checkpoint.",
     )
     parser.add_argument(
         "--with-conv1d",
@@ -1267,6 +1312,16 @@ def _parse_args() -> argparse.Namespace:
         "{RN, SR}.  SR (stochastic rounding) is silently skipped for state "
         "dtypes that don't support it (bf16, fp32).  Default 'RN' matches "
         "legacy --philox-rounding=False behavior.",
+    )
+    parser.add_argument(
+        "--rectangle-for-nowrite",
+        type=str,
+        default="0",
+        help="Comma-separated 0/1 values: 0 = replay-style nowrite kernel, "
+        "1 = dedicated rectangle nowrite kernel.  Sweep both with '0,1' to "
+        "compare in one invocation.  Silently no-op for write cells (the "
+        "write path always uses replay-style).  Only applies to the "
+        "checkpointing variant.",
     )
     parser.add_argument(
         "--philox-rounding",
@@ -1319,6 +1374,25 @@ def _parse_args() -> argparse.Namespace:
         if m not in ("RN", "SR"):
             parser.error(f"--sr-modes value must be RN or SR, got {m!r}")
     args.sr_modes_list = sr_modes
+
+    rect_modes = [v.strip() for v in args.rectangle_for_nowrite.split(",") if v.strip()]
+    rect_list = []
+    for v in rect_modes:
+        if v not in ("0", "1"):
+            parser.error(f"--rectangle-for-nowrite value must be 0 or 1, got {v!r}")
+        rect_list.append(v == "1")
+    args.rectangle_for_nowrite_list = rect_list
+
+    if args.write_modes is not None:
+        wm = [v.strip() for v in args.write_modes.split(",") if v.strip()]
+        write_list = []
+        for v in wm:
+            if v not in ("0", "1"):
+                parser.error(f"--write-modes value must be 0 or 1, got {v!r}")
+            write_list.append(v == "1")
+        args.write_modes_list = write_list
+    else:
+        args.write_modes_list = [args.write_checkpoint]
     return args
 
 
