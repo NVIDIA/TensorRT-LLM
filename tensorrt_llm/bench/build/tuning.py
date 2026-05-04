@@ -6,7 +6,7 @@ from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.bench.build.dataclasses import ModelConfig, NemotronHybridConfig
+from tensorrt_llm.bench.build.dataclasses import ModelConfig, NemotronHybridConfig, Qwen3HybridConfig
 from .utils import get_device_memory
 import math
 
@@ -82,7 +82,7 @@ def calc_engine_setting(
         kv_cache_gpu_mem_fraction)
 
     bytes_per_elem = BYTES_PER_ELEM.get(QuantAlgo.NO_QUANT)
-    if isinstance(model_config, NemotronHybridConfig):
+    if isinstance(model_config, (NemotronHybridConfig, Qwen3HybridConfig)):
         mamba_ssm_cache_dtype = model_config.mamba_ssm_cache_dtype
         if mamba_ssm_cache_dtype != "auto":
             if str_dtype_to_torch(mamba_ssm_cache_dtype) == torch.float32:
@@ -110,8 +110,8 @@ def calc_engine_setting(
         target_input_len,
         target_output_len,
         pp_size,
-        disable_optimistic_tuning=isinstance(model_config,
-                                             NemotronHybridConfig))
+        disable_optimistic_tuning=isinstance(
+            model_config, (NemotronHybridConfig, Qwen3HybridConfig)))
 
     # Functional and performance
     if total_gpu_memory < engine_size:

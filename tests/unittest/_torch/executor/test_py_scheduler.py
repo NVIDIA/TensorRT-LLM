@@ -37,6 +37,15 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
 
+@dataclass
+class MockPrefixReuseSummary:
+    """Mock for C++ PrefixReuseSummary returned by analyze_prefix_reuse."""
+
+    reusable_blocks_allocated: int = 0
+    reusable_blocks_all: int = 0
+    first_new_block: Optional[object] = None
+
+
 def _make_request(
     request_id: int,
     prompt_len: int = 10,
@@ -165,8 +174,17 @@ class MockKVCacheManager:
     def scheduling_remove_sequence(self, req_id: int):
         pass
 
-    def find_new_context_block(self, unique_tokens, req):
-        return None
+    def analyze_prefix_reuse(self, unique_tokens, req):
+        if self.enable_block_reuse and unique_tokens:
+            # Derive a deterministic, hashable block key from the tokens so that
+            # duplicate requests produce equal first_new_block values and trigger
+            # the beneficial-to-skip logic.  UniqueToken objects (nanobind-wrapped
+            # C++ structs) have no __hash__/__eq__, so extract the primitive fields.
+            block_key = tuple(
+                t if isinstance(t, int) else (t.token_id, t.token_extra_id) for t in unique_tokens
+            )
+            return MockPrefixReuseSummary(first_new_block=block_key)
+        return MockPrefixReuseSummary()
 
     def get_max_resource_count(self) -> int:
         return self._num_free_blocks
@@ -1690,6 +1708,110 @@ class TestDraftTokensGreaterThanChunkSize:
         assert req1.num_draft_tokens == 13
         assert req2.num_draft_tokens == 5
 
+    def test_mixed_batch_zero_draft_does_not_consume_speculative_budget(self):
+        """Regression: in a mixed batch, zero-draft requests must not burn the
+        ``remaining_space`` compute budget that a later draft-bearing request
+        needs.
+
+        ``req.has_draft_tokens`` is a nanobind-bound method in
+        ``cpp/tensorrt_llm/nanobind/batch_manager/bindings.cpp``, so
+        reading it without ``()`` returned a truthy bound-method object. That
+        made every last-context-chunk request enter ``_fit_draft_tokens``'s
+        draft branch, including zero-draft ones, which then accumulated
+        ``remaining_space`` into ``num_ctx_tokens`` and left less room for
+        later speculative requests to keep their drafts.
+
+        Setup (chunk_unit_size=16, max_num_tokens=28, three last-chunk reqs):
+          - req0 prompt=8  draft=0   → rs=8 on buggy path
+          - req1 prompt=8  draft=0   → rs=8 on buggy path
+          - req2 prompt=3  draft=13  → rs=13, needs budget
+
+        Initial num_ctx_tokens sum = 8 + 8 + 3 = 19.
+        Fixed: req0/req1 skip draft branch; req2 keeps
+        min(13, 16-3=13, 28-19=9) = 9 drafts.
+        Buggy: req0 burns 8 (→27), req1 burns 1 (→28), req2 gets 0 drafts.
+        """
+        config = ContextChunkingConfig(ChunkingPolicy.FIRST_COME_FIRST_SERVED, chunk_unit_size=16)
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=64,
+            max_num_tokens=28,
+            ctx_chunk_config=config,
+        )
+        scheduler.max_context_length = 64
+
+        requests = [
+            make_context_request(0, prompt_len=8, draft_tokens_len=0),
+            make_context_request(1, prompt_len=8, draft_tokens_len=0),
+            make_context_request(2, prompt_len=3, draft_tokens_len=13),
+        ]
+        ctx, _ = scheduler.schedule(requests, set())
+        assert len(ctx) == 3
+        r0 = next(r for r in ctx if r.request_id == 0)
+        r1 = next(r for r in ctx if r.request_id == 1)
+        r2 = next(r for r in ctx if r.request_id == 2)
+        assert r0.num_draft_tokens == 0
+        assert r1.num_draft_tokens == 0
+        # Before fix this would be 0 (all drafts discarded because the earlier
+        # zero-draft siblings had already burned the compute budget).
+        assert r2.num_draft_tokens == 9, (
+            f"zero-draft siblings burned speculative budget: "
+            f"got num_draft_tokens={r2.num_draft_tokens}, expected 9"
+        )
+
+    def test_short_draft_request_charges_only_kept_drafts(self) -> None:
+        """Regression: a request with fewer drafts than chunk remainder should
+        not charge the whole remainder against the shared compute budget.
+        """
+        config = ContextChunkingConfig(ChunkingPolicy.FIRST_COME_FIRST_SERVED, chunk_unit_size=16)
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=64,
+            max_num_tokens=30,
+            ctx_chunk_config=config,
+        )
+        scheduler.max_context_length = 64
+
+        requests = [
+            make_context_request(0, prompt_len=3, draft_tokens_len=1),
+            make_context_request(1, prompt_len=3, draft_tokens_len=13),
+            make_context_request(2, prompt_len=3, draft_tokens_len=13),
+        ]
+        ctx, _ = scheduler.schedule(requests, set())
+        assert len(ctx) == 3
+
+        r0 = next(r for r in ctx if r.request_id == 0)
+        r1 = next(r for r in ctx if r.request_id == 1)
+        r2 = next(r for r in ctx if r.request_id == 2)
+
+        assert r0.num_draft_tokens == 1
+        assert r1.num_draft_tokens == 13
+        assert r2.num_draft_tokens == 7
+
+    def test_no_draft_tokens_bypasses_fit_draft(self):
+        """Regression: _fit_draft_tokens must not discard when no drafts exist.
+
+        Previously, ``req.has_draft_tokens`` (bound method, always truthy)
+        was accidentally evaluated without ``()``, so draft-discarding ran
+        for requests with zero drafts. When the capacity budget was
+        exhausted, ``capacity - num_ctx_tokens`` went negative and
+        ``draft_discard`` wrapped into a large positive value, triggering
+        the C++ assertion "Can't discard more draft tokens (N) than exists
+        (0)" in ``llmRequest.h``. Guard against that by ensuring
+        scheduling a batch of large no-draft requests does not raise.
+        """
+        config = ContextChunkingConfig(ChunkingPolicy.FIRST_COME_FIRST_SERVED, chunk_unit_size=16)
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=64,
+            max_num_tokens=32,
+            ctx_chunk_config=config,
+        )
+        # Requests with zero draft tokens, large enough to exhaust budget.
+        requests = [make_context_request(i, prompt_len=24, draft_tokens_len=0) for i in range(4)]
+        ctx, _ = scheduler.schedule(requests, set())
+        assert ctx, "expected at least one context request to be scheduled"
+        # All scheduled requests must still report 0 draft tokens — no discard happened.
+        for r in ctx:
+            assert r.num_draft_tokens == 0
+
 
 # ############################################################################
 #
@@ -2446,8 +2568,11 @@ class TestPyCapacitySchedulerKVCacheReuse:
         r1 = _make_request(1, prompt_len=21, input_tokens=tokens)
         r2 = _make_request(2, prompt_len=21, input_tokens=tokens)
         fitting, disagg, paused = scheduler.schedule_request([r0, r1, r2])
-        # With reuse enabled, beneficial_to_skip may delay r1 and r2
-        assert len(fitting) >= 1
+        # With reuse enabled, r1 and r2 share the same prefix as r0 and are delayed.
+        # GUARANTEED_NO_EVICT skips them via continue — they are not in paused.
+        assert len(fitting) == 1
+        assert fitting[0].request_id == 0
+        assert len(paused) == 0
 
     def test_delay_duplicate_request_chunked(self):
         """C++ ref: DelayDuplicateRequestChunked"""
@@ -2463,7 +2588,11 @@ class TestPyCapacitySchedulerKVCacheReuse:
         r1 = _make_request(1, prompt_len=50, input_tokens=tokens)
         r1.context_chunk_size = 20
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
-        assert len(fitting) >= 1
+        # r1 shares the same prefix as r0 and is delayed.
+        # GUARANTEED_NO_EVICT skips it via continue — it is not in paused.
+        assert len(fitting) == 1
+        assert fitting[0].request_id == 0
+        assert len(paused) == 0
 
     def test_delay_five_requests_complicated(self):
         """C++ ref: DelayFiveRequestsComplicated"""
@@ -2493,7 +2622,11 @@ class TestPyCapacitySchedulerKVCacheReuse:
         r0 = _make_request(0, prompt_len=20, input_tokens=tokens)
         r1 = _make_request(1, prompt_len=20, input_tokens=tokens)
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
-        assert len(fitting) >= 1
+        # r1 shares the same prefix as r0 and is delayed.
+        # GUARANTEED_NO_EVICT skips it via continue — it is not in paused.
+        assert len(fitting) == 1
+        assert fitting[0].request_id == 0
+        assert len(paused) == 0
 
     def test_reuse_aware_partial_prefix_match(self):
         """C++ ref: ReuseAwareSchedulingWithPartialPrefixMatch"""
@@ -2508,7 +2641,8 @@ class TestPyCapacitySchedulerKVCacheReuse:
         r0 = _make_request(0, prompt_len=30, input_tokens=tokens0)
         r1 = _make_request(1, prompt_len=30, input_tokens=tokens1)
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
-        assert len(fitting) >= 1
+        # Different token sequences produce different block keys — no skipping
+        assert len(fitting) == 2
 
     def test_no_reuse_with_different_prompts(self):
         """C++ ref: NoReuseWithDifferentPrompts"""

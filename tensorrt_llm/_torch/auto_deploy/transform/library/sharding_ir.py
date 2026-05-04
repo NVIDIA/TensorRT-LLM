@@ -34,12 +34,11 @@ from pydantic import Field, field_validator
 from torch._ops import OpOverload, OpOverloadPacket
 from torch.fx import GraphModule, Node
 
-from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
-
-from .....functional import AllReduceStrategy
+from ..._compat import AllReduceStrategy
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import del_attr_by_name, eliminate_dead_code
+from ...utils.dist_config import DistConfig
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     WeightBiasInfoCache,
@@ -786,7 +785,6 @@ class MoEShardableNode(ShardableNode):
         )
 
 
-@ShardableNode.register(torch.ops.auto_deploy.triton_mxfp4_moe)
 class StackedMoEShardableNode(ShardableNode):
     """Stacked-tensor MoE EP sharding: slice along the expert dimension and rewrite.
 
@@ -856,6 +854,15 @@ class StackedMoEShardableNode(ShardableNode):
             f"  sharded MXFP4 MoE: {num_experts} experts, ep={ep_size}, rank slice [{lo}:{hi}]"
         )
         return 1
+
+
+# MXFP4 MoE ops depend on triton_kernels + TRT-LLM internals that aren't in the
+# standalone package, so the op may not be registered at import time. Register
+# only when the op is actually available.
+try:
+    ShardableNode.register(torch.ops.auto_deploy.triton_mxfp4_moe)(StackedMoEShardableNode)
+except AttributeError:
+    pass
 
 
 # =============================================================================

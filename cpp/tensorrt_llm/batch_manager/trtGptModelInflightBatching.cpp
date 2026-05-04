@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -485,9 +485,9 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
         = executorConfig.getSpecDecConfig().has_value() && executorConfig.getSpecDecConfig()->fastLogits;
     if (mSpeculativeDecodingFastLogits && modelConfig.getSpeculativeDecodingMode().isNone() && mIsLeaderInOrchMode)
     {
-        mDraftModelSendLogitsThread = std::make_unique<std::thread>(&utils::draftModelSendLogitsThread, mDevice,
-            &mDraftModelThreadShouldExit, &mDraftRequestsWaitingToSendLogits, mSeqSlotManager, getMaxInputLen(),
-            mKvCacheManager, mCrossKvCacheManager, mPeftCacheManager);
+        mDraftModelSendLogitsThread
+            = std::make_unique<std::thread>(&utils::draftModelSendLogitsThread, mDevice, &mDraftModelThreadShouldExit,
+                &mDraftRequestsWaitingToSendLogits, &mDraftRequestsDoneSendingLogits, &mDraftRequestsMtx);
     }
 
     mCreateNewDecoderRequests = std::make_unique<CreateNewDecoderRequests>(
@@ -901,6 +901,19 @@ void TrtGptModelInflightBatching::forwardSync()
                         mReqIdsToTerminate.erase(llmReq->mRequestId);
                     }
                 }
+            }
+        }
+
+        // Terminate draft requests whose logits have been sent by the background thread.
+        {
+            RequestVector doneSending;
+            {
+                std::lock_guard<std::mutex> lk(mDraftRequestsMtx);
+                doneSending.swap(mDraftRequestsDoneSendingLogits);
+            }
+            for (auto const& llmReq : doneSending)
+            {
+                terminateRequest(llmReq);
             }
         }
 
@@ -2524,6 +2537,7 @@ void TrtGptModelInflightBatching::updateRequests(ScheduledRequests const& schedu
             {
                 if (llmReq->getReturnGenerationLogits() && mSpeculativeDecodingFastLogits && mIsLeaderInOrchMode)
                 {
+                    std::lock_guard<std::mutex> lk(mDraftRequestsMtx);
                     mDraftRequestsWaitingToSendLogits.push_back(llmReq);
                 }
                 else
@@ -2663,6 +2677,12 @@ nvinfer1::DataType TrtGptModelInflightBatching::getLogitDataType() const
     return mModelConfig.getLogitsDtype();
 }
 
+TrtGptModelInflightBatching::SizeType32 TrtGptModelInflightBatching::numCachedCudaGraphs() const
+{
+    return std::accumulate(mCudaGraphExecutorCaches.begin(), mCudaGraphExecutorCaches.end(), SizeType32{0},
+        [](SizeType32 sum, auto const& cache) { return sum + cache.size(); });
+}
+
 void TrtGptModelInflightBatching::changeBeamWidth(SizeType32 beamWidth)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -2674,6 +2694,13 @@ void TrtGptModelInflightBatching::changeBeamWidth(SizeType32 beamWidth)
     TLLM_LOG_DEBUG("Changing operating beam width from %d to %d", mOperatingBeamWidth, beamWidth);
     mOperatingBeamWidth = beamWidth;
 
+    if (isCudaGraphMode())
+    {
+        for (auto& cache : mCudaGraphExecutorCaches)
+        {
+            cache.clear();
+        }
+    }
     createBuffers(mDecodingConfig, mAdditionalModelOutputs);
     createDecoder(mDecodingConfig.getDecodingMode());
 

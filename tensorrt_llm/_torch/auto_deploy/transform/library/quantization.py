@@ -40,7 +40,7 @@ from ...utils.quantization_utils import (
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 try:
-    from .....quantization.utils.fp4_utils import float4_sf_dtype
+    from tensorrt_llm.quantization.utils.fp4_utils import float4_sf_dtype
 except ImportError:
     float4_sf_dtype = None
 

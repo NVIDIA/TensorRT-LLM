@@ -9,47 +9,52 @@ from tensorrt_llm.serve.openai_protocol import (
     ImageGenerationRequest,
     VideoGenerationRequest,
 )
-from tensorrt_llm.visual_gen import VisualGenParams
+from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
 
 
 def parse_visual_gen_params(
     request: ImageGenerationRequest | VideoGenerationRequest | ImageEditRequest,
     id: str,
+    generator: VisualGen,
     media_storage_path: Optional[str] = None,
 ) -> VisualGenParams:
-    kwargs: Dict[str, Any] = {}
-    extra: Dict[str, Any] = {}
+    # Start from the pipeline's resolved defaults so unspecified request
+    # fields keep the model's defaults instead of being overwritten with None.
+    params = generator.default_params
+    if params.extra_params is None:
+        params.extra_params = {}
 
-    kwargs["negative_prompt"] = request.negative_prompt
+    if request.negative_prompt is not None:
+        params.negative_prompt = request.negative_prompt
     if request.size is not None and request.size != "auto":
-        kwargs["width"], kwargs["height"] = map(int, request.size.split("x"))
+        params.width, params.height = map(int, request.size.split("x"))
     if request.guidance_scale is not None:
-        kwargs["guidance_scale"] = request.guidance_scale
+        params.guidance_scale = request.guidance_scale
     if request.guidance_rescale is not None:
-        extra["guidance_rescale"] = request.guidance_rescale
+        params.extra_params["guidance_rescale"] = request.guidance_rescale
 
     if isinstance(request, (ImageGenerationRequest, ImageEditRequest)):
         if request.num_inference_steps is not None:
-            kwargs["num_inference_steps"] = request.num_inference_steps
+            params.num_inference_steps = request.num_inference_steps
         elif isinstance(request, ImageGenerationRequest) and request.quality == "hd":
-            kwargs["num_inference_steps"] = 30
+            params.num_inference_steps = 30
         if request.n is not None:
-            kwargs["num_images_per_prompt"] = request.n
+            params.num_images_per_prompt = request.n
         if isinstance(request, ImageEditRequest):
             if request.image is not None:
                 if isinstance(request.image, list):
-                    kwargs["image"] = [base64.b64decode(image) for image in request.image]
+                    params.image = [base64.b64decode(image) for image in request.image]
                 else:
-                    kwargs["image"] = [base64.b64decode(request.image)]
+                    params.image = [base64.b64decode(request.image)]
             if request.mask is not None:
                 if isinstance(request.mask, list):
-                    kwargs["mask"] = [base64.b64decode(mask) for mask in request.mask]
+                    params.mask = [base64.b64decode(mask) for mask in request.mask]
                 else:
-                    kwargs["mask"] = base64.b64decode(request.mask)
+                    params.mask = base64.b64decode(request.mask)
 
     elif isinstance(request, VideoGenerationRequest):
         if request.num_inference_steps is not None:
-            kwargs["num_inference_steps"] = request.num_inference_steps
+            params.num_inference_steps = request.num_inference_steps
         if request.input_reference is not None:
             if media_storage_path is None:
                 raise ValueError("media_storage_path is required when input_reference is provided")
@@ -60,18 +65,20 @@ def parse_visual_gen_params(
             else:
                 with open(ref_path, "wb") as f:
                     shutil.copyfileobj(request.input_reference.file, f)
-            kwargs["image"] = ref_path
+            params.image = ref_path
 
-        kwargs["frame_rate"] = request.fps
-        kwargs["num_frames"] = int(request.seconds * request.fps)
+        params.frame_rate = request.fps
+        params.num_frames = int(request.seconds * request.fps)
 
         if request.seed is not None:
-            kwargs["seed"] = int(request.seed)
+            params.seed = int(request.seed)
 
-    if extra:
-        kwargs["extra_params"] = extra
+    # Drop extra_params if we didn't end up with any — matches VisualGenParams
+    # convention where None means "no extras" for pipelines that declare none.
+    if not params.extra_params:
+        params.extra_params = None
 
-    return VisualGenParams(**kwargs)
+    return params
 
 
 class AsyncDictStore:

@@ -33,7 +33,8 @@ from tensorrt_llm.executor import (GenerationExecutorWorker, GenerationRequest,
                                    GenerationResult, LoRARequest,
                                    PromptAdapterRequest, RequestError)
 from tensorrt_llm.llmapi import (BuildCacheConfig, EagleDecodingConfig,
-                                 KvCacheConfig, KvCacheRetentionConfig,
+                                 ExtendedRuntimePerfKnobConfig, KvCacheConfig,
+                                 KvCacheRetentionConfig,
                                  LookaheadDecodingConfig, MedusaDecodingConfig,
                                  RequestOutput)
 from tensorrt_llm.llmapi import TrtLlmArgs as LlmArgs
@@ -701,6 +702,56 @@ def test_generate_with_beam_search(llm_for_sampling_params: LLM):
     outputs = [output.result() for output in outputs]
     print(outputs)
     check_output(outputs, references)
+
+
+@force_ampere
+@pytest.mark.part0
+def test_generate_with_cuda_graph_dynamic_beam_width():
+    build_config = BuildConfig(max_beam_width=3)
+    extended_runtime_perf_knob_config = ExtendedRuntimePerfKnobConfig(
+        cuda_graph_mode=True, cuda_graph_cache_size=64)
+
+    llm = LLM(
+        model=llama_model_path,
+        build_config=build_config,
+        kv_cache_config=global_kvcache_config,
+        extended_runtime_perf_knob_config=extended_runtime_perf_knob_config,
+        fast_build=True,
+    )
+
+    def _generate(beam_width):
+        sampling_params = SamplingParams(
+            max_tokens=8,
+            n=beam_width,
+            use_beam_search=(beam_width > 1),
+        )
+        outputs = llm.generate(prompts, sampling_params=sampling_params)
+        # Snapshot per-prompt, per-beam token IDs as a hashable structure
+        # so we can compare bit-for-bit across runs.
+        return [
+            tuple(tuple(o.token_ids) for o in out.outputs) for out in outputs
+        ]
+
+    try:
+        # Capture clean references. The first time each beam width is
+        # used, a fresh graph is captured against the *current* buffers,
+        # so these outputs are correct regardless of the bug.
+        ref = {1: _generate(1), 2: _generate(2), 3: _generate(3)}
+
+        # Now cycle through the beam widths again. Each transition fires
+        # changeBeamWidth(), reallocating decoder state.
+        revisit_sequence = [1, 2, 3, 1, 3, 2, 1]
+        for beam_width in revisit_sequence:
+            got = _generate(beam_width)
+            assert got == ref[beam_width], (
+                f"beam_width={beam_width}: token IDs diverged from the "
+                f"reference run after intervening beam-width changes. "
+                f"This indicates that a stale cudaGraphExec_t was "
+                f"replayed against reallocated decoder state.\n"
+                f"reference: {ref[beam_width]}\n"
+                f"got:       {got}")
+    finally:
+        llm.shutdown()
 
 
 @pytest.mark.skip(reason="https://nvbugs/5435714")
@@ -2126,6 +2177,45 @@ def validate_stats(
         #TODO: For some reason, with stats_async and TRT backend, numCompleted is 0 at first iteration
         if pytorch_backend:
             assert result["numCompletedRequests"] == expected_num_completed
+
+            # Per-iteration request-aggregate fields populated by
+            # PyExecutor._update_iter_stats inside inflightBatchingStats.
+            # Assert presence (a missing key indicates a serializer or
+            # RPC-path regression) and sane per-iteration values (a
+            # zero-under-load value indicates a mis-wired populate block).
+            new_aggregate_keys = (
+                "numCtxKvTokens",
+                "numGenKvTokens",
+                "numQueuedContextRequests",
+                "numQueuedCtxTokens",
+                "numQueuedGenRequests",
+                "numQueuedGenKvTokens",
+                "numPausedKvTokens",
+            )
+            for k in new_aggregate_keys:
+                assert k in ifbStats, f"iter {iter}: missing ifbStats key {k}"
+                assert isinstance(
+                    ifbStats[k],
+                    int), (f"iter {iter}: ifbStats key {k} not int "
+                           f"(got {type(ifbStats[k])})")
+                assert ifbStats[
+                    k] >= 0, f"iter {iter}: ifbStats key {k} negative"
+
+            if iter < context_iterations:
+                # Prefill iteration: at least one scheduled context request
+                # and nonzero numCtxTokens. numCtxTokens is sourced from
+                # model_engine.iter_states after _forward_step for this
+                # batch, so it is overlap-safe under every scheduler
+                # configuration.
+                assert ifbStats["numContextRequests"] >= 1, f"iter: {iter}"
+                assert ifbStats["numGenRequests"] == 0, f"iter: {iter}"
+                assert ifbStats["numCtxTokens"] > 0, f"iter: {iter}"
+            else:
+                # Generation iteration: at least one decode request with
+                # nonzero total KV context length.
+                assert ifbStats["numGenRequests"] >= 1, f"iter: {iter}"
+                assert ifbStats["numGenKvTokens"] > 0, f"iter: {iter}"
+                assert ifbStats["numContextRequests"] == 0, f"iter: {iter}"
 
 
 def llm_get_stats_test_harness(tp_size: int = 1,
