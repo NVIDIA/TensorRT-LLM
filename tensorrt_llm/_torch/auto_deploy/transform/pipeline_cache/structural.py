@@ -17,7 +17,9 @@
 
 import importlib
 import inspect
-import pickle
+
+# Used only to probe torch.save-compatible cache payloads.
+import pickle  # nosec B403
 import types
 from collections.abc import Mapping, Sequence
 from typing import Any
