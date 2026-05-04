@@ -41,7 +41,8 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     ConsumableWeightsDict
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -134,10 +135,13 @@ def weight_dequant(x: torch.Tensor,
 
 
 @torch.compile(dynamic=True)
-def moe_reduce_add_shared_output(routed_output, shared_output):
-    routed_output = torch.sum(routed_output, dim=1, keepdim=False)
+def moe_reduce_add_shared_output(routed_output, shared_output, out=None):
+    routed_reduced = torch.sum(routed_output, dim=1, keepdim=False)
+    if out is not None:
+        torch.add(shared_output, routed_reduced, out=out)
+        return out
     # In-place add to avoid allocating a temporary tensor, reducing peak memory
-    return shared_output.add_(routed_output)
+    return shared_output.add_(routed_reduced)
 
 
 class DeepseekV3WeightLoader:
@@ -817,8 +821,10 @@ class DeepseekV3Gate(nn.Module):
         fuse_routing_kernel: bool = True,
         apply_routing: bool = False,
         moe_backend: str = 'CUTLASS',
+        use_cute_dsl_bf16_gemm: bool = False,
     ):
         super().__init__()
+        self.use_cute_dsl_bf16_gemm = use_cute_dsl_bf16_gemm
         self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
                                                dtype=dtype),
                                    requires_grad=False)
@@ -843,10 +849,24 @@ class DeepseekV3Gate(nn.Module):
             is_fused=fuse_routing_kernel)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        logits = torch.ops.trtllm.dsv3_router_gemm_op(hidden_states,
-                                                      self.weight.t(),
-                                                      bias=None,
-                                                      out_dtype=torch.float32)
+        if (self.use_cute_dsl_bf16_gemm and is_sm_100f()
+                and self.weight.dtype == torch.bfloat16):
+            input_2d = hidden_states.view(-1, hidden_states.shape[-1])
+            m, k = input_2d.shape
+            n = self.weight.shape[0]
+            output = torch.empty(m,
+                                 n,
+                                 dtype=torch.float32,
+                                 device=hidden_states.device)
+            torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell(
+                input_2d.contiguous(), self.weight, output)
+            logits = output.view(*hidden_states.shape[:-1], n)
+        else:
+            logits = torch.ops.trtllm.dsv3_router_gemm_op(
+                hidden_states,
+                self.weight.t(),
+                bias=None,
+                out_dtype=torch.float32)
         return logits
 
     def load_weights(self, weights: List[Dict]):
@@ -903,16 +923,18 @@ class Deepseekv3MoE(nn.Module):
         gate_cls = DeepseekV3Gate
         if hasattr(model_config.pretrained_config, "gate_cls"):
             gate_cls = model_config.pretrained_config.gate_cls
-        self.gate = gate_cls(hidden_size,
-                             num_experts,
-                             top_k=top_k,
-                             n_group=config.n_group,
-                             topk_group=config.topk_group,
-                             routed_scaling_factor=config.routed_scaling_factor,
-                             dtype=dtype,
-                             fuse_routing_kernel=True,
-                             apply_routing=False,
-                             moe_backend=model_config.moe_backend)
+        self.gate = gate_cls(
+            hidden_size,
+            num_experts,
+            top_k=top_k,
+            n_group=config.n_group,
+            topk_group=config.topk_group,
+            routed_scaling_factor=config.routed_scaling_factor,
+            dtype=dtype,
+            fuse_routing_kernel=True,
+            apply_routing=False,
+            moe_backend=model_config.moe_backend,
+            use_cute_dsl_bf16_gemm=model_config.use_cute_dsl_bf16_gemm)
         self.experts = create_moe(
             num_experts=num_experts,
             routing_method=self.gate.routing_method,
@@ -1127,17 +1149,36 @@ class Deepseekv3MoE(nn.Module):
         if not do_finalize:
             return [shared_output, *routed_output]
         else:
+            if not isinstance(shared_output, torch.Tensor):
+                final_hidden_states = shared_output + routed_output
+                if not self.use_dp and self.mapping.tp_size > 1:
+                    final_hidden_states = self.allreduce(
+                        final_hidden_states,
+                        all_reduce_params=final_all_reduce_params)
+                return final_hidden_states
+            output_tensor = None
+            if not self.use_dp and self.mapping.tp_size > 1:
+                w, actual_kind = torch.ops.trtllm.allocate_output(
+                    shared_output, self.allreduce.output_buffer_kind,
+                    self.mapping.tp_group)
+                if actual_kind == int(BufferKind.NCCL_WINDOW):
+                    output_tensor = w
             if routed_output.dim() == 3:
                 assert shared_output.numel(
                 ) * self.top_k == routed_output.numel(
                 ), 'unmatched tensor shape'
                 final_hidden_states = moe_reduce_add_shared_output(
-                    routed_output, shared_output)
+                    routed_output, shared_output, out=output_tensor)
             else:
                 assert shared_output.size() == routed_output.size(
                 ), 'unmatched tensor shape'
-                # In-place add to avoid allocating a temporary tensor, reducing peak memory
-                final_hidden_states = shared_output.add_(routed_output)
+                if output_tensor is not None:
+                    final_hidden_states = torch.add(shared_output,
+                                                    routed_output,
+                                                    out=output_tensor)
+                else:
+                    # In-place add to avoid allocating a temporary tensor, reducing peak memory
+                    final_hidden_states = shared_output.add_(routed_output)
 
             if not self.use_dp and self.mapping.tp_size > 1:
                 final_hidden_states = self.allreduce(

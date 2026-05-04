@@ -384,13 +384,17 @@ class PyResult:
 
     def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
                              multimodal_lengths: List[int]):
-        """Split concatenated embeddings by multimodal_lengths and create handles for each.
+        """Split concatenated embeddings by per-item lengths and create handles.
 
         Args:
-            mm_embeddings: Concatenated multimodal embeddings tensor of shape [total_tokens, hidden_dim]
-            multimodal_lengths: List of token lengths for each multimodal item
+            mm_embeddings: Concatenated multimodal embeddings tensor of shape
+                [total_tokens, hidden_dim].
+            multimodal_lengths: Current per-item split lengths.
         """
-        # Split the concatenated tensor by lengths to get per-item embeddings
+        # TODO(TRTLLM-12175): callers currently pass request.multimodal_lengths,
+        # a prompt-side MM-token count that may include non-embedding
+        # special/framing tokens. This split needs per-item encoder-output
+        # embedding lengths instead.
         split_embeddings = torch.split(mm_embeddings, multimodal_lengths, dim=0)
 
         # Create a SharedTensorContainer handle for each split

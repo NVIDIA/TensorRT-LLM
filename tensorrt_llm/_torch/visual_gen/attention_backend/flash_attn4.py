@@ -24,7 +24,7 @@ at commit ea8f73506369d7cdd498396474107a978858138c)
 """
 
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -77,9 +77,9 @@ class FlashAttn4Attention(AttentionBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         causal: bool,
-    ) -> torch.Tensor:
-        """Calls _flash_attn_fwd with torch.compile disabled."""
-        output, _lse = _flash_attn_fwd(
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Calls _flash_attn_fwd with torch.compile disabled. Returns (output, lse)."""
+        output, lse = _flash_attn_fwd(
             q,
             k,
             v,
@@ -94,7 +94,30 @@ class FlashAttn4Attention(AttentionBackend):
             block_sparse_tensors=None,
             return_lse=True,
         )
-        return output
+        return output, lse
+
+    def _prepare_inputs(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attention_mask: PredefinedAttentionMask,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool, torch.dtype]:
+        """Cast inputs to FA4-compatible dtype and resolve causal flag."""
+        if _flash_attn_fwd is None:
+            raise ImportError(
+                f"FlashAttention 4 is not available. Import error: {_flash_attn_fwd_import_error}"
+            ) from _flash_attn_fwd_import_error
+
+        is_causal = attention_mask == PredefinedAttentionMask.CAUSAL
+
+        # FA4 only supports float16 and bfloat16
+        origin_dtype = q.dtype
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            q = q.to(torch.bfloat16)
+            k = k.to(torch.bfloat16)
+            v = v.to(torch.bfloat16)
+        return q, k, v, is_causal, origin_dtype
 
     def forward(
         self,
@@ -119,26 +142,35 @@ class FlashAttn4Attention(AttentionBackend):
         Returns:
             Output tensor [batch_size, seq_len, num_heads, head_dim]
         """
-        if _flash_attn_fwd is None:
-            raise ImportError(
-                f"FlashAttention 4 is not available. Import error: {_flash_attn_fwd_import_error}"
-            ) from _flash_attn_fwd_import_error
+        output, _ = self.forward_with_lse(q, k, v, attention_mask=attention_mask, **kwargs)
+        return output
 
-        is_causal = attention_mask == PredefinedAttentionMask.CAUSAL
+    def forward_with_lse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass returning both output and log-sum-exp (LSE).
 
-        # FA4 only supports float16 and bfloat16
-        origin_dtype = q.dtype
-        if q.dtype not in (torch.float16, torch.bfloat16):
-            q = q.to(torch.bfloat16)
-            k = k.to(torch.bfloat16)
-            v = v.to(torch.bfloat16)
-
-        output = self._fwd(q, k, v, is_causal)
-
+        Returns:
+            output: [batch_size, seq_len, num_heads, head_dim]
+            lse:    [batch_size, num_heads, seq_len] — log-sum-exp per query position,
+                    always in float32. Used for numerically stable combination of
+                    partial attention results in Attention2D parallelism.
+        """
+        q, k, v, is_causal, origin_dtype = self._prepare_inputs(q, k, v, attention_mask)
+        output, lse = self._fwd(q, k, v, is_causal)
         if output.dtype != origin_dtype:
             output = output.to(origin_dtype)
+        return output, lse
 
-        return output
+    @classmethod
+    def support_lse(cls) -> bool:
+        return True
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:
