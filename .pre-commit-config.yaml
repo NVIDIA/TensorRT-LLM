@@ -2771,6 +2771,8 @@ repos:
             .*\.vscode/.*\.json | # vscode files can take comments
             .*\.devcontainer/.*\.json # devcontainer json files can take comments
           )$
+    -   id: file-contents-sorter
+        files: ^tests/integration/test_lists/waives\.txt$
 -   repo: https://github.com/PyCQA/autoflake
     rev: v2.3.1
     hooks:
