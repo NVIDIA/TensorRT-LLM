@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,13 +22,14 @@ simplified metadata that doesn't require KV caching.
 
 from .flash_attn4 import FlashAttn4Attention
 from .interface import AttentionBackend, AttentionTensorLayout
-from .parallel import UlyssesAttention
+from .parallel import Attention2DAttention, UlyssesAttention
 from .trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from .utils import create_attention, get_visual_gen_attention_backend
 from .vanilla import VanillaAttention
 
 __all__ = [
     "AttentionBackend",
+    "Attention2DAttention",
     "AttentionTensorLayout",
     "get_visual_gen_attention_backend",
     "create_attention",

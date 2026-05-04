@@ -19,6 +19,8 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
+
 using namespace tensorrt_llm::batch_manager::kv_cache_manager;
 using namespace tensorrt_llm::batch_manager::radix_block_tree;
 using namespace tensorrt_llm::kernels;
@@ -538,6 +540,16 @@ TEST(MambaTest, CreatePlaceholderIsPlaceholder)
     ASSERT_NE(ph, nullptr);
     EXPECT_TRUE(ph->isPlaceholder());
     EXPECT_EQ(ph->getBlockId(), 42);
+}
+
+TEST(MambaTest, CreatePlaceholderNoArgUsesSentinelId)
+{
+    auto ph = KVCacheBlock::createPlaceholder();
+    ASSERT_NE(ph, nullptr);
+    EXPECT_TRUE(ph->isPlaceholder());
+    EXPECT_EQ(ph->getBlockId(), KVCacheBlock::kPlaceholderBlockId);
+    EXPECT_NE(ph->getBlockId(), std::numeric_limits<KVCacheBlock::IdType>::min());
+    EXPECT_GT(-ph->getBlockId(), 0);
 }
 
 TEST(MambaTest, RegularBlockIsNotPlaceholder)
