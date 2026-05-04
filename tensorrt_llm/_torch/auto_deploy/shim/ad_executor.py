@@ -794,6 +794,19 @@ class ADEngine(ModelEngine):
         )
         self.iter_counter += 1
 
+        # Compute DP-aware max(total_num_tokens) and write to BatchInfo slot 13.
+        # Mirrors base TRT-LLM's pattern in `model_engine._get_all_rank_num_tokens`:
+        # MoE all-to-all needs the cross-rank max to size dispatch padding without
+        # over-padding to the static config max_num_tokens. nest_sequences already
+        # initialized slot 13 to the local total_num_tokens; this overrides with
+        # the cross-rank max only when attention-DP requires it.
+        if self.enable_attention_dp and self.dist_config.tp_size > 1:
+            assert self.dist is not None, "Distributed object is required for attention DP mode"
+            info = self.cache_seq_interface.info
+            local_total_num_tokens = info.batch_info.get_total_num_tokens()
+            all_rank_num_tokens = list(self.dist.tp_allgather(local_total_num_tokens))
+            info.batch_info.update_max_dp_num_tokens(max(all_rank_num_tokens))
+
         # compute outputs
         outputs = self._run_forward()
 
