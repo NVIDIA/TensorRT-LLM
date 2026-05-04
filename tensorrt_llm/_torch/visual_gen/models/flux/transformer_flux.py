@@ -17,7 +17,7 @@ Forward Pass Flow:
 5. norm_out + proj_out -> noise prediction
 """
 
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -30,13 +30,11 @@ from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import maybe_compile
+from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
 from tensorrt_llm._torch.visual_gen.models.flux.pos_embed_flux import FluxPosEmbed
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.models.modeling_utils import QuantConfig
-
-if TYPE_CHECKING:
-    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 
 # HF checkpoint key → our module attribute name
 _WEIGHT_KEY_REMAPS = [
@@ -268,7 +266,7 @@ class FluxTransformerBlock(nn.Module):
         quant_config=None,
         skip_create_weights: bool = False,
         force_dynamic_quant: bool = False,
-        config: Optional["DiffusionModelConfig"] = None,
+        config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
     ):
         super().__init__()
@@ -430,7 +428,7 @@ class FluxSingleTransformerBlock(nn.Module):
         quant_config=None,
         skip_create_weights: bool = False,
         force_dynamic_quant: bool = False,
-        config: Optional["DiffusionModelConfig"] = None,
+        config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
     ):
         super().__init__()
@@ -561,22 +559,40 @@ class FluxTransformer2DModel(nn.Module):
     - proj_out: Linear projection to output
     """
 
-    def __init__(self, model_config: "DiffusionModelConfig"):
+    def __init__(self, model_config: DiffusionModelConfig):
         super().__init__()
         self.model_config = model_config
 
         vgm = model_config.visual_gen_mapping
         num_heads = getattr(model_config.pretrained_config, "num_attention_heads", 24)
+        attn2d_row_size = vgm.attn2d_row_size if vgm else 1
+        attn2d_col_size = vgm.attn2d_col_size if vgm else 1
+        attn2d_mesh_size = attn2d_row_size * attn2d_col_size
         ulysses_size = vgm.ulysses_size if vgm else 1
-        if ulysses_size > 1 and num_heads % ulysses_size != 0:
+        use_attn2d = attn2d_mesh_size > 1
+        use_ulysses = ulysses_size > 1
+
+        if use_ulysses and num_heads % ulysses_size != 0:
             raise ValueError(
                 f"num_attention_heads ({num_heads}) must be divisible by "
                 f"ulysses_size ({ulysses_size})"
             )
-        self.use_ulysses = ulysses_size > 1
-        self.ulysses_size = ulysses_size
-        self.ulysses_pg = vgm.ulysses_group if vgm else None
-        self.ulysses_rank = vgm.ulysses_rank if vgm else 0
+
+        if use_attn2d:
+            self.use_seq_parallel = True
+            self.seq_parallel_size = attn2d_mesh_size
+            self.seq_parallel_pg = vgm.attn2d_mesh_group
+            self.seq_parallel_rank = vgm.attn2d_mesh_rank
+        elif use_ulysses:
+            self.use_seq_parallel = True
+            self.seq_parallel_size = ulysses_size
+            self.seq_parallel_pg = vgm.ulysses_group
+            self.seq_parallel_rank = vgm.ulysses_rank
+        else:
+            self.use_seq_parallel = False
+            self.seq_parallel_size = 1
+            self.seq_parallel_pg = None
+            self.seq_parallel_rank = 0
 
         # Extract pretrained config from model_config
         pretrained_config = model_config.pretrained_config
@@ -812,25 +828,25 @@ class FluxTransformer2DModel(nn.Module):
         if img_ids.ndim == 3:
             img_ids = img_ids[0]
 
-        # Ulysses: shard sequences and position IDs before RoPE
-        if self.use_ulysses:
+        # Shard sequences and position IDs before RoPE
+        if self.use_seq_parallel:
             img_seq_len = img_ids.shape[0]
             txt_seq_len = txt_ids.shape[0]
 
-            if img_seq_len % self.ulysses_size != 0:
+            if img_seq_len % self.seq_parallel_size != 0:
                 raise ValueError(
                     f"Image seq len ({img_seq_len}) not divisible by "
-                    f"ulysses_size ({self.ulysses_size})"
+                    f"seq_parallel_size ({self.seq_parallel_size})"
                 )
-            if txt_seq_len % self.ulysses_size != 0:
+            if txt_seq_len % self.seq_parallel_size != 0:
                 raise ValueError(
                     f"Text seq len ({txt_seq_len}) not divisible by "
-                    f"ulysses_size ({self.ulysses_size})"
+                    f"seq_parallel_size ({self.seq_parallel_size})"
                 )
 
-            img_chunk = img_seq_len // self.ulysses_size
-            txt_chunk = txt_seq_len // self.ulysses_size
-            r = self.ulysses_rank
+            img_chunk = img_seq_len // self.seq_parallel_size
+            txt_chunk = txt_seq_len // self.seq_parallel_size
+            r = self.seq_parallel_rank
 
             # Shard position IDs (before RoPE computation)
             img_ids = img_ids[r * img_chunk : (r + 1) * img_chunk]
@@ -864,11 +880,11 @@ class FluxTransformer2DModel(nn.Module):
                 joint_attention_kwargs=joint_attention_kwargs,
             )
 
-        # Ulysses: gather output sequence from all ranks
-        if self.use_ulysses:
+        # Gather output sequence from all ranks
+        if self.use_seq_parallel:
             hidden_states = hidden_states.contiguous()
-            gathered = [torch.zeros_like(hidden_states) for _ in range(self.ulysses_size)]
-            torch.distributed.all_gather(gathered, hidden_states, group=self.ulysses_pg)
+            gathered = [torch.zeros_like(hidden_states) for _ in range(self.seq_parallel_size)]
+            torch.distributed.all_gather(gathered, hidden_states, group=self.seq_parallel_pg)
             hidden_states = torch.cat(gathered, dim=1)
 
         # Output projection

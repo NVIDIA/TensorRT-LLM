@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -953,21 +953,24 @@ TEST_F(MicroBatchSchedulerTest, ReusableTokensWithChunkedContextEqualProgress)
 {
     // Test compute-aware budget tracking in EQUAL_PROGRESS with reusable tokens.
     //
-    // Setup: 2 requests, promptLen=15, reusable=10, compute budget=3, chunkUnit=1.
+    // Setup: 2 requests, promptLen=15, reusable=10, compute budget=12, chunkUnit=1.
     //
-    // In EQUAL_PROGRESS, chunks grow by 1 per request per iteration. Reusable tokens
-    // do not consume forward-pass capacity, so the budget is only charged for tokens
-    // beyond the reusable prefix.
+    // setPrepopulatedPromptLen shifts the chunk window right by the reused amount.
+    // For non-last chunks (reusable + chunkSize < contextRemaining), cost = chunkSize.
+    // For last chunks (reusable + chunkSize >= contextRemaining), cost = contextRemaining - reusable.
     //
-    // Expected (compute-aware EQUAL_PROGRESS):
-    //   Tokens 0-10 are "free" (all cached). Budget is only consumed for tokens > 10.
-    //   req0: chunk=12 (model cost = 12-10 = 2)
-    //   req1: chunk=11 (model cost = 11-10 = 1)
-    //   total compute = 3 = budget (fully utilised).
+    // With reusable=10, contextRemaining=15:
+    //   chunkSize 1-4: non-last (10+4=14 < 15), cost = chunkSize.
+    //   chunkSize >= 5: last (10+5=15 >= 15), cost = max(0, 15-10) = 5.
     //
-    // Bug (raw-token EQUAL_PROGRESS): chunks capped at 2 and 1 (budget fully consumed
-    //   after the very first two tokens, ignoring reusable credits).
-    constexpr SizeType32 maxNumTokens = 3;
+    // EQUAL_PROGRESS grows chunks in lock-step:
+    //   Iters 1-4: both grow to chunk=4, total compute = 2*4 = 8.
+    //   Iter 5: both reach chunk=5 (last-chunk threshold), cost=5, increment=1 each. total=10.
+    //   Iters 6+: cost stays 5, compute increment=0 — chunks grow for free to full context.
+    //   Result: both complete full context (chunk=15), total compute = 10 < 12.
+    //
+    // Without reusable tokens, budget=12 would only allow both to reach chunk=6 (total=12).
+    constexpr SizeType32 maxNumTokens = 12;
     constexpr SizeType32 maxBatchSize = 4;
     constexpr SizeType32 chunkUnitSize = 1;
     constexpr SizeType32 reusableTokens = 10;
@@ -993,9 +996,62 @@ TEST_F(MicroBatchSchedulerTest, ReusableTokensWithChunkedContextEqualProgress)
 
     EXPECT_EQ(ctx.size(), 2u) << "Both requests should be scheduled";
 
-    // req0 gets one extra unit over req1 due to equal-progress ordering.
-    EXPECT_EQ(req0->getContextChunkSize(), 12) << "req0: reusable(10) + 2 compute tokens = chunk 12";
-    EXPECT_EQ(req1->getContextChunkSize(), 11) << "req1: reusable(10) + 1 compute token = chunk 11";
+    // Both complete full context: once past the last-chunk threshold (chunkSize=5),
+    // additional tokens cost 0 compute, so chunks grow to full promptLen.
+    EXPECT_EQ(req0->getContextChunkSize(), 15) << "req0: full context (last-chunk cost capped at 5)";
+    EXPECT_EQ(req1->getContextChunkSize(), 15) << "req1: full context (last-chunk cost capped at 5)";
+}
+
+TEST_F(MicroBatchSchedulerTest, ReusableTokensChunkShiftNonLastChunk)
+{
+    // Test that reuse_adjusted_compute returns chunkSize (not chunkSize - reusable)
+    // for non-last chunks where reusable + chunkSize < contextRemaining.
+    //
+    // setPrepopulatedPromptLen shifts the chunk window right by the reused amount
+    // rather than shrinking it, so non-last chunks still process ~chunkSize tokens.
+    //
+    // Setup: 1 request, promptLen=100, reusable=30, FCFS, chunkUnit=1.
+    //   Budget = 25 (maxNumTokens).
+    //
+    // Old (wrong) formula: compute = max(0, chunkSize - reusable)
+    //   → chunk=100, compute = max(0, 100-30) = 70 > 25 → chunked to 25,
+    //     compute = max(0, 25-30) = 0 → budget barely touched.
+    //
+    // New (correct) formula: reuse_adjusted_compute(chunkSize=25, reusable=30, remaining=100)
+    //   → reusable(30) + chunkSize(25) = 55 < remaining(100) → non-last chunk
+    //   → compute = chunkSize = 25 = budget → correct accounting.
+    //
+    // With 2 requests: budget=25 should only fit one non-last chunk of 25 tokens,
+    // not two (which the old formula would allow by underestimating compute to 0).
+    constexpr SizeType32 maxNumTokens = 25;
+    constexpr SizeType32 maxBatchSize = 4;
+    constexpr SizeType32 chunkUnitSize = 1;
+    constexpr SizeType32 reusableTokens = 30;
+    constexpr SizeType32 promptLen = 100;
+    constexpr SizeType32 maxNewTokens = 5;
+    constexpr ContextChunkingPolicy ctxChunkPolicy{ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED};
+
+    mNumContexts = 2;
+    mContextRequests.resize(mNumContexts);
+    mMicroBatchScheduler
+        = std::make_shared<MicroBatchScheduler>(ContextChunkingConfig{ctxChunkPolicy, chunkUnitSize}, std::nullopt);
+
+    RequestVector activeRequests;
+    auto req0 = createRequest(promptLen, maxNewTokens, 0);
+    auto req1 = createRequest(promptLen, maxNewTokens, 1);
+    req0->setEstimatedReusableTokens(reusableTokens);
+    req1->setEstimatedReusableTokens(reusableTokens);
+    activeRequests.push_back(req0);
+    activeRequests.push_back(req1);
+
+    ReqIdsSet inflightReqIds;
+    auto const [ctx, gen] = (*mMicroBatchScheduler)(activeRequests, inflightReqIds, maxBatchSize, maxNumTokens);
+
+    // req0: chunk=25, reuse_adjusted_compute(25, 30, 100) = 25 (non-last: 30+25<100)
+    // Budget fully consumed → req1 gets chunk=0.
+    EXPECT_EQ(ctx.size(), 1u) << "Only req0 fits; non-last chunk costs full chunkSize";
+    EXPECT_EQ(req0->getContextChunkSize(), 25) << "req0: chunk=25 (budget fully consumed by non-last chunk compute)";
+    EXPECT_EQ(req1->getContextChunkSize(), 0) << "req1: no budget remaining";
 }
 
 TEST_F(MicroBatchSchedulerTest, ReusableTokensZeroHasNoEffect)
@@ -1245,8 +1301,8 @@ TEST_F(CombinedSchedulerTest, CapacitySchedulerSetsReusableTokensForMicroBatch)
     // Request 0 should be scheduled
     ASSERT_GE(scheduled0.size(), 1u);
 
-    // Process request 0: addSequence → complete context → store blocks
-    kvCacheManager->addSequence(req0->mRequestId, promptLen, /*beamWidth=*/1, req0);
+    // Process request 0: addSequenceBatch → complete context → store blocks
+    kvCacheManager->addSequenceBatch({{{req0->mRequestId, promptLen, /*beamWidth=*/1}}}, {std::ref(*req0)});
     req0->moveToNextContextChunk();
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req0);
     kvCacheManager->storeContextBlocks(*req0);
@@ -1347,7 +1403,7 @@ TEST_F(CombinedSchedulerTest, CapacitySchedulerReusableTokensWithChunkedMicroBat
     auto [scheduled0, disaggInit0, paused0]
         = capacityScheduler(activeList, *kvCacheManager, /*peftCacheManager=*/std::nullopt);
 
-    kvCacheManager->addSequence(req0->mRequestId, promptLen, /*beamWidth=*/1, req0);
+    kvCacheManager->addSequenceBatch({{{req0->mRequestId, promptLen, /*beamWidth=*/1}}}, {std::ref(*req0)});
     req0->moveToNextContextChunk();
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req0);
     kvCacheManager->storeContextBlocks(*req0);

@@ -1,8 +1,9 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 # Note: The code is to extract image embedding from RADIO model, to support Nano v2 VLM.
 # TODO: Check and add more compatible logic for the full-series RADIO model.
 
 import copy
+import dataclasses
 import math
 from collections import namedtuple
 from typing import (Dict, Iterable, List, Literal, NamedTuple, Optional, Tuple,
@@ -744,11 +745,19 @@ class VisionTransformer(nn.Module):
 
         self.metadata_cls = attention_utils.get_attention_backend(
             model_config.attn_backend).Metadata
-        self.attn_metadata = self.metadata_cls(
+        metadata_kwargs = dict(
             max_num_requests=8192,  # TODO: Make this dynamic
             max_num_tokens=model_config.max_num_tokens,
             kv_cache_manager=None,
         )
+        if model_config.attn_backend == "FLASHINFER":
+            # FlashInfer's original default kv_layout is "NHD". TRT-LLM changed
+            # the default to "HND" for paged KV cache paths (see PR #6917).
+            # For ModelingRadio ragged prefill (kv_cache_manager=None), we
+            # explicitly use "NHD" because ragged k/v tensors computed directly
+            # from input are always in NHD format ([tokens, heads, dim]).
+            metadata_kwargs["kv_layout"] = "NHD"
+        self.attn_metadata = self.metadata_cls(**metadata_kwargs)
 
     def prepare_attn_metadata(self, batch_size: int, seq_lengths: List[int],
                               attn_metadata: AttentionMetadata):
@@ -758,7 +767,7 @@ class VisionTransformer(nn.Module):
         """
         prompt_lens = seq_lengths
         seq_lens = torch.tensor(seq_lengths,
-                                dtype=torch.int,
+                                dtype=torch.int32,
                                 pin_memory=prefer_pinned())
         request_ids = list(range(1, batch_size + 1))
 
@@ -1008,12 +1017,14 @@ class RADIOVisionModel(PreTrainedModel):
 
     def __init__(self,
                  model_config: model_config_lib.ModelConfig,
-                 disable_quantization: bool = True):
+                 disable_quantization: bool = True,
+                 vision_attn_backend: Optional[str] = "FLASHINFER"):
         """
         Args:
             model_config: Model configuration.
             disable_quantization: Disable quantization for RADIO model.
                 Since the radio model is for vision only, we can disable quantization for it by default.
+            vision_attn_backend: Attention backend to use for the vision tower. Defaults to "FLASHINFER".
         """
         config = model_config.pretrained_config
         super().__init__(config)
@@ -1021,10 +1032,14 @@ class RADIOVisionModel(PreTrainedModel):
         self.model_config = copy.deepcopy(model_config)
         if self.model_config.quant_config is not None:
             if disable_quantization:
-                # The basic method `apply_quant_config_exclude_modules` in DecoderModelForCausalLM keeps the kv_cache_quant_algo so we also keep it here.
-                self.model_config.quant_config = QuantConfig(
-                    kv_cache_quant_algo=self.model_config.quant_config.
-                    kv_cache_quant_algo)
+                # Vision encoder runs with kv_cache_manager=None, so there is no KV cache to
+                # quantize. Keeping kv_cache_quant_algo would make FlashInfer raise:
+                # "FP8 KV cache is not supported without a KV cache manager" for FP8 LLM checkpoints
+                # that specify FP8 KV Cache.
+                self.model_config.quant_config = QuantConfig()
+
+        self.model_config = dataclasses.replace(
+            self.model_config, attn_backend=vision_attn_backend)
 
         self.config = config
 
@@ -1122,8 +1137,10 @@ class RADIOVisionModel(PreTrainedModel):
             # _load_weights_impl (to handle qkv splitting).
             # video_embedder is only unexpected when temporal_patch_size==1
             # (model doesn't have the submodule).
-            if not u.startswith(
-                ('model.blocks.', 'model.patch_generator.video_embedder')):
+            if not u.startswith((
+                    'model.blocks.',
+                    'model.patch_generator.video_embedder',
+            )):
                 raise ValueError(f"Unexpected key: {u}")
 
         # Mark video_embedder as loaded only when the submodule exists and its weights were actually

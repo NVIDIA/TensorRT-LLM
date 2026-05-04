@@ -10,10 +10,12 @@ from typing import Any, Dict, List, Optional, Union
 import safetensors.torch
 import torch
 
+from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm._torch.visual_gen.quantization.ops import quantize_fp8_blockwise, quantize_nvfp4
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.utils.fp8_utils import (
     align,
@@ -36,6 +38,7 @@ from .ltx2_core.video_vae import TilingConfig
 from .pipeline_ltx2 import LTX2Pipeline, _assert_resolution, _find_safetensors_files
 
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 
 
 # ---------------------------------------------------------------------------
@@ -338,18 +341,31 @@ def _apply_lora_deltas(
 ) -> tuple:
     """Add (sign=+1) or remove (sign=-1) pre-computed LoRA deltas.
 
-    For standard (BF16/FP16) weights the delta is added directly.
-    For FP8-quantized weights (same shape, float8 dtype) and
-    NVFP4-quantized weights (packed, half the last dim) we
-    dequantize → apply → requantize.
+    For standard (BF16/FP16) weights the delta is added directly and
+    later removed by subtracting the same delta.
+    For FP8-quantized weights (same shape, float8 dtype), we
+    dequantize → apply → requantize.  FP4 weights are handled through
+    the packed-FP4 branch because the current static and dynamic NVFP4
+    load paths both store packed FP4 weights by the time LoRA deltas are
+    applied.  For packed FP4, merged weights are kept in BF16 for stage 2
+    inference.  The parent ``Linear`` module's ``quant_method`` is swapped
+    to ``UnquantizedLinearMethod`` so inference runs with plain
+    ``F.linear``.  The quantized original tensors and ``quant_method`` are
+    saved so that ``_restore_lora_state`` can fully restore the original
+    state afterwards.
 
-    Returns ``(applied_count, saved_quant_state)`` where
-    *saved_quant_state* maps parameter names to their original
-    quantized tensors so that un-merging can restore them exactly
-    (avoiding double round-trip loss).
+    Returns ``(applied_count, saved_lora_state, snapshot_required_count)`` where
+    *saved_lora_state* maps each touched quantized parameter name to its
+    original tensor.  For packed FP4 it also stores the parent
+    ``quant_method`` so that stage 2 can run with BF16 weights and then
+    restore the exact original FP4 state without another quantization round
+    trip.  Dense BF16/FP16/FP32 weights are not stored in
+    *saved_lora_state*.  *snapshot_required_count* is the number of
+    quantized weights that must be restored from saved snapshots.
     """
     applied = 0
-    saved_state: Dict[str, torch.Tensor] = {}
+    snapshot_required = 0
+    saved_state: Dict[str, Any] = {}
     # Build a lookup that maps *clean* parameter names to the actual
     # Parameter objects.  torch.compile wraps each block in an
     # OptimizedModule, inserting ``._orig_mod.`` into the parameter
@@ -360,7 +376,12 @@ def _apply_lora_deltas(
     for raw_name, param in module.named_parameters():
         clean = raw_name.replace("._orig_mod.", ".")
         state[clean] = param
-    _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+    # Always build module path → module mapping for quant_method swapping.
+    module_dict: Dict[str, torch.nn.Module] = {}
+    for raw_name, mod in module.named_modules():
+        clean = raw_name.replace("._orig_mod.", ".")
+        module_dict[clean] = mod
 
     for name, delta in deltas.items():
         param_name = name if name in state else f"{name}.weight"
@@ -401,16 +422,17 @@ def _apply_lora_deltas(
                 )
                 param.data.copy_(qw)
                 ws_param.data.copy_(new_scale)
+                snapshot_required += 1
             else:
-                # BF16/FP16/FP32 — direct in-place addition
-                saved_state[param_name] = param.data.clone()
+                # BF16/FP16/FP32: direct in-place addition. These are
+                # restored by subtracting the same delta after stage 2.
                 param.data.add_(
                     delta.to(param.device, param.dtype),
                     alpha=sign,
                 )
             applied += 1
 
-        # --- FP4 packed (half last dim) -----------------------------------
+        # --- packed FP4 (half last dim) -----------------------------------
         elif (
             param.ndim == 2
             and delta.ndim == 2
@@ -442,10 +464,19 @@ def _apply_lora_deltas(
             )
             bf16.add_(delta.to(bf16.device, bf16.dtype), alpha=sign)
 
-            qw, new_scale, new_s2 = _requantize_fp4_weight(bf16)
-            param.data.copy_(qw)
-            ws_param.data.copy_(new_scale)
-            ws2_param.data.fill_(new_s2.item())
+            linear_mod = module_dict.get(base)
+            if linear_mod is None or not isinstance(linear_mod, Linear):
+                raise RuntimeError(
+                    f"Packed FP4 LoRA merge: could not find Linear module at '{base}'."
+                )
+
+            # Packed FP4: keep the LoRA-merged weight in BF16 for stage 2.
+            # This replaces packed FP4 storage (out, in//2) with BF16 storage
+            # (out, in) and swaps the parent Linear to plain F.linear.
+            param.data = bf16
+            saved_state[f"__quant_method__{base}"] = linear_mod.quant_method
+            linear_mod.quant_method = UnquantizedLinearMethod()
+            snapshot_required += 1
             applied += 1
         else:
             logger.warning(
@@ -453,21 +484,95 @@ def _apply_lora_deltas(
                 f"param={list(param.shape)}, delta={list(delta.shape)}. "
                 f"Skipping."
             )
-    return applied, saved_state
+    return applied, saved_state, snapshot_required
 
 
-def _restore_lora_state(
+def _subtract_dense_lora_deltas(
     module: torch.nn.Module,
-    saved_state: Dict[str, torch.Tensor],
-) -> None:
-    """Restore quantized parameters saved by ``_apply_lora_deltas``."""
+    deltas: Dict[str, torch.Tensor],
+    saved_state: Dict[str, Any],
+) -> int:
+    """Remove LoRA deltas from dense floating-point weights.
+
+    Quantized weights are skipped here because FP8 and FP4 are restored from
+    exact snapshots in ``saved_state``.
+    """
+    restored = 0
     state: Dict[str, torch.nn.Parameter] = {}
     for raw_name, param in module.named_parameters():
         clean = raw_name.replace("._orig_mod.", ".")
         state[clean] = param
+
+    for name, delta in deltas.items():
+        param_name = name if name in state else f"{name}.weight"
+        if param_name not in state or param_name in saved_state:
+            continue
+
+        param = state[param_name]
+        if param.shape != delta.shape or param.dtype in _FP8_DTYPES:
+            continue
+
+        if not param.data.is_floating_point():
+            continue
+
+        param.data.add_(
+            delta.to(param.device, param.dtype),
+            alpha=-1.0,
+        )
+        restored += 1
+
+    return restored
+
+
+def _count_saved_lora_weight_tensors(saved_state: Dict[str, Any]) -> int:
+    """Count LoRA-touched base weights restored from snapshots."""
+    return sum(
+        1
+        for name in saved_state
+        if not name.startswith("__quant_method__")
+        and (name == "weight" or name.endswith(".weight"))
+    )
+
+
+def _restore_lora_state(
+    module: torch.nn.Module,
+    saved_state: Dict[str, Any],
+) -> None:
+    """Restore parameters and quantization state saved by ``_apply_lora_deltas``.
+
+    Handles three cases:
+    - Regular tensors (same shape/dtype): restored via ``.data.copy_()``.
+    - BF16-swapped FP4 weights (shape/dtype changed for stage 2):
+      restored via ``.data =`` assignment to replace the storage.
+    - Saved ``quant_method`` objects (keys starting with
+      ``__quant_method__``): re-assigned to the corresponding Linear module.
+    """
+    state: Dict[str, torch.nn.Parameter] = {}
+    for raw_name, param in module.named_parameters():
+        clean = raw_name.replace("._orig_mod.", ".")
+        state[clean] = param
+
+    module_dict: Dict[str, torch.nn.Module] = {}
+    for raw_name, mod in module.named_modules():
+        clean = raw_name.replace("._orig_mod.", ".")
+        module_dict[clean] = mod
+
     for name, data in saved_state.items():
-        if name in state:
-            state[name].data.copy_(data)
+        if name.startswith("__quant_method__"):
+            mod_path = name[len("__quant_method__") :]
+            mod = module_dict.get(mod_path)
+            if mod is None or not isinstance(mod, Linear):
+                raise RuntimeError(
+                    f"Could not restore quant_method for Linear module '{mod_path}'."
+                )
+            mod.quant_method = data
+        elif name in state:
+            param = state[name]
+            if param.data.shape == data.shape and param.data.dtype == data.dtype:
+                param.data.copy_(data)
+            else:
+                # Shape or dtype changed (e.g. BF16 swap): replace storage.
+                param.data = data
 
 
 # ---------------------------------------------------------------------------
@@ -564,22 +669,22 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
     # ------------------------------------------------------------------
 
     def infer(self, req):
-        extra = req.extra_params or {}
+        extra = req.params.extra_params or {}
         return self.forward(
             prompt=req.prompt,
-            negative_prompt=req.negative_prompt,
-            height=req.height,
-            width=req.width,
-            num_frames=req.num_frames,
-            frame_rate=req.frame_rate,
-            num_inference_steps=req.num_inference_steps,
-            guidance_scale=req.guidance_scale,
-            seed=req.seed,
+            negative_prompt=req.params.negative_prompt,
+            height=req.params.height,
+            width=req.params.width,
+            num_frames=req.params.num_frames,
+            frame_rate=req.params.frame_rate,
+            num_inference_steps=req.params.num_inference_steps,
+            guidance_scale=req.params.guidance_scale,
+            seed=req.params.seed,
             output_type=extra["output_type"],
             guidance_rescale=extra["guidance_rescale"],
-            max_sequence_length=req.max_sequence_length,
-            image=req.image,
-            image_cond_strength=req.image_cond_strength,
+            max_sequence_length=req.params.max_sequence_length,
+            image=req.params.image,
+            image_cond_strength=req.params.image_cond_strength,
             stg_scale=extra["stg_scale"],
             stg_blocks=extra["stg_blocks"],
             modality_scale=extra["modality_scale"],
@@ -686,16 +791,20 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # ================================================================
         # Stage 2: refinement denoising with distilled LoRA
         # ================================================================
-        n, saved_quant_state = _apply_lora_deltas(
+        # For FP4 models (static-packed or dynamic), stage 2 always runs in
+        # BF16: the quant_method is swapped to UnquantizedLinearMethod inside
+        # _apply_lora_deltas and restored afterwards.  BF16 models are unaffected.
+        n, saved_lora_state, snapshot_required = _apply_lora_deltas(
             self.transformer,
             self._distilled_lora_deltas,
             sign=1.0,
         )
-        logger.info(f"Merged distilled LoRA ({n} params) for stage 2")
+        logger.info(f"Merged distilled LoRA ({n} params) for stage 2 (BF16 weights)")
 
         # Disable Ulysses for Stage 2: only rank 0 is active, so
         # cross-rank collectives in the attention backend would hang.
         self.transformer.set_ulysses_enabled(False)
+        stage2_start = time.time()
         try:
             video_latents, audio_latents = self._refinement_denoise(
                 video_latents=video_latents,
@@ -711,16 +820,33 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 image_cond_strength=image_cond_strength,
             )
         finally:
+            stage2_denoise_time = time.time() - stage2_start
+            logger.info(f"Stage 2 denoising time: {stage2_denoise_time:.2f}s (BF16 weights)")
             self.transformer.set_ulysses_enabled(True)
-            if saved_quant_state:
-                # for FP8 / FP4 stage 2, we restore the original quantized weights by copying them back
-                _restore_lora_state(self.transformer, saved_quant_state)
-            else:
-                # for BF16 stage 2, we restore the original weights by subtracting LoRA deltas
-                _apply_lora_deltas(
-                    self.transformer,
-                    self._distilled_lora_deltas,
-                    sign=-1.0,
+            if snapshot_required and not saved_lora_state:
+                raise RuntimeError(
+                    "Quantized LoRA state was not saved; cannot safely restore "
+                    "FP8/FP4 stage 2 weights."
+                )
+
+            snapshot_restored = 0
+            if snapshot_required:
+                # Restore every LoRA-touched parameter from its snapshot. Packed
+                # FP4 also restores the original quant_method.
+                _restore_lora_state(self.transformer, saved_lora_state)
+                snapshot_restored = _count_saved_lora_weight_tensors(saved_lora_state)
+
+            # Dense BF16/FP16/FP32 weights are not snapshotted; restore them by
+            # subtracting the LoRA deltas directly.
+            dense_restored = _subtract_dense_lora_deltas(
+                self.transformer,
+                self._distilled_lora_deltas,
+                saved_lora_state,
+            )
+            restored = snapshot_restored + dense_restored
+            if restored != n:
+                raise RuntimeError(
+                    f"Restored {restored} LoRA-touched weights after stage 2, but {n} were applied."
                 )
             logger.info("Un-merged distilled LoRA after stage 2")
 
@@ -797,16 +923,10 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         logger.info("Stage 2: refinement denoising...")
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
-        # --- Text conditioning (positive only, no CFG) ---
-        prompt_embeds, prompt_attention_mask = self._encode_prompt(
-            prompt,
-            num_videos_per_prompt=1,
-            max_sequence_length=max_sequence_length,
-        )
-        video_embeds, audio_embeds, connector_mask = self._process_connectors(
-            prompt_embeds,
-            prompt_attention_mask,
-        )
+        # --- Text conditioning: reuse Stage 1 encoder output ---
+        # Gemma3 + Connector outputs depend only on prompt text, not on
+        # resolution or LoRA weights.
+        video_embeds, audio_embeds, connector_mask = self._cached_encoder_output
 
         # --- Shapes at full resolution ---
         pixel_shape = VideoPixelShape(
@@ -908,63 +1028,76 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             a_noise = torch.randn_like(a_working, generator=generator)
             a_working = a_noise * sigma_0 + a_working * (1.0 - sigma_0)
 
+        # --- Pre-compute static preproc (context, PE, KV) for Stage 2 ---
+        _s2_static = self.transformer.prepare_text_cache(
+            video_context=video_embeds,
+            video_context_mask=connector_mask,
+            video_positions=video_positions,
+            audio_context=audio_embeds if a_working is not None else None,
+            audio_context_mask=connector_mask if a_working is not None else None,
+            audio_positions=audio_positions if a_working is not None else None,
+            dtype=self.dtype,
+        )
+
         # --- Euler denoising loop (no guidance) ---
         for i in range(len(sigmas) - 1):
-            sigma = sigmas[i]
-            sigma_next = sigmas[i + 1]
-            dt = sigma_next - sigma
-            timestep = sigma.unsqueeze(0).expand(v_working.shape[0])
+            with nvtx_range(f"refinement_step {i}"):
+                sigma = sigmas[i]
+                sigma_next = sigmas[i + 1]
+                dt = sigma_next - sigma
+                timestep = sigma.unsqueeze(0).expand(v_working.shape[0])
 
-            if denoise_mask is not None:
-                v_timestep = denoise_mask * sigma
-            else:
-                v_timestep = timestep
+                if denoise_mask is not None:
+                    v_timestep = denoise_mask * sigma
+                else:
+                    v_timestep = timestep
 
-            video_mod = Modality(
-                latent=v_working.to(self.dtype),
-                timesteps=v_timestep,
-                positions=video_positions,
-                context=video_embeds,
-                context_mask=connector_mask,
-            )
-
-            audio_mod = None
-            if a_working is not None:
-                audio_mod = Modality(
-                    latent=a_working.to(self.dtype),
-                    timesteps=timestep,
-                    positions=audio_positions,
-                    context=audio_embeds,
+                video_mod = Modality(
+                    latent=v_working.to(self.dtype),
+                    timesteps=v_timestep,
+                    positions=video_positions,
+                    context=video_embeds,
                     context_mask=connector_mask,
                 )
 
-            vel_v, vel_a = self.transformer(
-                video=video_mod,
-                audio=audio_mod,
-            )
+                audio_mod = None
+                if a_working is not None:
+                    audio_mod = Modality(
+                        latent=a_working.to(self.dtype),
+                        timesteps=timestep,
+                        positions=audio_positions,
+                        context=audio_embeds,
+                        context_mask=connector_mask,
+                    )
 
-            # Video: velocity → x0 → post-process → Euler step
-            sigma_v = sigma.float()
-            while sigma_v.dim() < vel_v.dim():
-                sigma_v = sigma_v.unsqueeze(-1)
+                vel_v, vel_a = self.transformer(
+                    video=video_mod,
+                    audio=audio_mod,
+                    text_cache=_s2_static,
+                )
 
-            denoised_v = v_working.float() - vel_v.float() * sigma_v
+                # Video: velocity → x0 → post-process → Euler step
+                sigma_v = sigma.float()
+                while sigma_v.dim() < vel_v.dim():
+                    sigma_v = sigma_v.unsqueeze(-1)
 
-            if denoise_mask is not None and clean_latent is not None:
-                dm = denoise_mask.unsqueeze(-1)
-                denoised_v = denoised_v * dm + clean_latent.float() * (1.0 - dm)
+                denoised_v = v_working.float() - vel_v.float() * sigma_v
 
-            velocity_v = (v_working.float() - denoised_v) / sigma_v
-            v_working = (v_working.float() + velocity_v * dt).to(v_working.dtype)
+                if denoise_mask is not None and clean_latent is not None:
+                    dm = denoise_mask.unsqueeze(-1)
+                    denoised_v = denoised_v * dm + clean_latent.float() * (1.0 - dm)
 
-            # Audio: velocity → x0 → Euler step
-            if vel_a is not None and a_working is not None:
-                sigma_a = sigma.float()
-                while sigma_a.dim() < vel_a.dim():
-                    sigma_a = sigma_a.unsqueeze(-1)
-                denoised_a = a_working.float() - vel_a.float() * sigma_a
-                velocity_a = (a_working.float() - denoised_a) / sigma_a
-                a_working = (a_working.float() + velocity_a * dt).to(a_working.dtype)
+                velocity_v = (v_working.float() - denoised_v) / sigma_v
+                v_working = (v_working.float() + velocity_v * dt).to(v_working.dtype)
+
+                # Audio: velocity → x0 → Euler step
+                if vel_a is not None and a_working is not None:
+                    sigma_a = sigma.float()
+                    while sigma_a.dim() < vel_a.dim():
+                        sigma_a = sigma_a.unsqueeze(-1)
+                    denoised_a = a_working.float() - vel_a.float() * sigma_a
+                    velocity_a = (a_working.float() - denoised_a) / sigma_a
+                    a_working = (a_working.float() + velocity_a * dt).to(a_working.dtype)
 
         # --- Unpatchify ---
         video_out = self.video_patchifier.unpatchify(v_working, video_shape)

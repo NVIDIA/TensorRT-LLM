@@ -32,7 +32,7 @@ AutoDeploy is included with the TRT-LLM installation.
 sudo apt-get -y install libopenmpi-dev && pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm
 ```
 
-You can refer to [TRT-LLM installation guide](../../installation/linux.md) for more information.
+You can refer to the [TRT-LLM installation guide](../../installation/installation-guide.md) for more information.
 
 2. **Run Llama Example:**
 
@@ -61,7 +61,6 @@ The exported graph then undergoes a series of automated transformations, includi
 - [Expert Configurations](./advanced/expert_configurations.md)
 - [Performance Benchmarking](./advanced/benchmarking_with_trtllm_bench.md)
 - [KV Cache Architecture](./advanced/kv_cache_architecture.md)
-- [Export ONNX for EdgeLLM](./advanced/export_onnx.md)
 - [Testing Strategy](./advanced/testing_strategy.md)
 
 ## Roadmap

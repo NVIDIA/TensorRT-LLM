@@ -220,6 +220,9 @@ deepseek-ai/DeepSeek-R1:
 deepseek-ai/DeepSeek-R1-0528:
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 84.722
+  - quant_algo: FP8_BLOCK_SCALES
+    kv_cache_quant_algo: FP8
+    accuracy: 84.722
 deepseek-ai/DeepSeek-R1-Distill-Llama-70B:
   - accuracy: 78.19
 deepseek-ai/DeepSeek-V3.2-Exp:

@@ -31,8 +31,7 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import Node
 
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-
+from ..._compat import KvCacheConfig
 from ...utils.logger import ad_logger
 from ...utils.node_utils import extract_op_args
 from ..attention_interface import (
@@ -1044,7 +1043,7 @@ def prepare_triton_paged_metadata(
     seq_len_with_cache: torch.Tensor,
 ) -> List[torch.Tensor]:
     """Prepare metadata for Triton paged attention."""
-    from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
+    from ..attention_interface import BatchInfo
 
     batch_info = BatchInfo(batch_info_host)
     num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
@@ -1109,7 +1108,7 @@ def triton_paged_mha_with_cache(
     k = k.reshape(b * s, -1, head_dim).contiguous()
     v = v.reshape(b * s, -1, head_dim).contiguous()
 
-    from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
+    from ..attention_interface import BatchInfo
 
     batch_info = BatchInfo(batch_info_host)
     num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()

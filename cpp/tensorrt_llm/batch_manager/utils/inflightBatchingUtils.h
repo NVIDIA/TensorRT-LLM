@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -100,7 +100,7 @@ private:
     bool update(cudaGraph_t const& graph);
     void uploadToStream(runtime::CudaStream const& stream);
 
-    cudaGraphExec_t mInstance;
+    cudaGraphExec_t mInstance = nullptr;
 };
 
 class CudaGraphExecutorCache
@@ -115,6 +115,13 @@ public:
     std::optional<std::shared_ptr<CudaGraphExecutor>> get(BatchState const& state);
 
     void put(BatchState const& state, std::shared_ptr<CudaGraphExecutor> const& value);
+
+    void clear();
+
+    [[nodiscard]] runtime::SizeType32 size() const noexcept
+    {
+        return static_cast<runtime::SizeType32>(mCache.size());
+    }
 
 private:
     using BatchStateGraphExecutorPair = std::pair<BatchState, std::shared_ptr<CudaGraphExecutor>>;

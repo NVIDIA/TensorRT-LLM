@@ -19,12 +19,10 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
+from ...utils.fp8_dequant import dequant_fp8_weight_two_dim_block_grid
+from ...utils.quantization_utils import (
     cutlass_fp4_scale_to_modelopt_fp4_scale,
     unpack_uint8_to_int4_weight_2d,
-)
-from tensorrt_llm.quantization.utils.fp8_matrix_weight_dequant import (
-    dequant_fp8_weight_two_dim_block_grid,
 )
 
 # FP4 tables (E2M1)
@@ -184,6 +182,10 @@ def torch_fake_quant_fp8_linear(
     weight_scale: List[torch.Tensor],
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """
     Reference (eager) implementation for multiple quant formats via `format_type`.
@@ -219,6 +221,10 @@ def torch_fake_quant_fp8_linear(
     weight_scale: List[torch.Tensor],
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     w = weight_quantized.to(input.dtype)
     return torch.ops.aten.linear(input, w, bias)
@@ -233,6 +239,10 @@ def torch_fake_quant_nvfp4_linear(
     weight_scale: List[torch.Tensor],
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """
     Reference (eager) implementation for multiple quant formats via `format_type`.
@@ -295,6 +305,10 @@ def torch_fake_quant_nvfp4_linear(
     weight_scale: List[torch.Tensor],
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     return torch.ops.aten.linear(input, weight_quantized.repeat(1, 2).to(input.dtype), bias)
 
@@ -308,6 +322,10 @@ def torch_fake_quant_int4_linear(
     weight_scale: List[torch.Tensor],  # [ weight_scale ]
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     BLOCK_SIZE = 128
     # activation pre-scale
@@ -323,7 +341,15 @@ def torch_fake_quant_int4_linear(
     # Dequantize
     w_deq = (q_int4.to(torch.float32) / scale_full).to(input.dtype)
 
-    return torch.ops.auto_deploy.torch_linear_simple.default(x_scaled, w_deq, bias)
+    return torch.ops.auto_deploy.torch_linear_simple.default(
+        x_scaled,
+        w_deq,
+        bias,
+        tp_mode=tp_mode,
+        output_sizes=output_sizes,
+        tp_min_local_shape=tp_min_local_shape,
+        layer_type=layer_type,
+    )
 
 
 @torch_fake_quant_int4_linear.register_fake
@@ -335,6 +361,10 @@ def _fake(
     weight_scale: List[torch.Tensor],
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     N_half = weight_quantized.shape[-2]
     N = N_half * 2
@@ -350,6 +380,10 @@ def torch_fake_quant_int4_gptq_linear(
     weight_scale: List[torch.Tensor],  # GPTQ scales [G, N]
     input_zp: List[torch.Tensor],  # unused for GPTQ
     weight_zp: List[torch.Tensor],  # GPTQ qzeros [G, N/8] int32
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """
     GPTQ INT4 linear with compatible signature to other quant ops.
@@ -431,6 +465,10 @@ def torch_fake_quant_int4_gptq_linear_fake(
     weight_scale: List[torch.Tensor],
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     N = weight_quantized.size(1)
     return torch.empty((*input.shape[:-1], N), dtype=input.dtype, device=input.device)
@@ -492,6 +530,10 @@ def torch_fake_quant_finegrained_fp8_linear(
     weight_scale: List[torch.Tensor],  # [weight_scale_inv]
     input_zp: List[torch.Tensor],  # unused
     weight_zp: List[torch.Tensor],  # unused
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """FineGrainedFP8 linear operation.
     - weight_scale[0] = weight_scale_inv (per-block weight scale)
@@ -503,11 +545,11 @@ def torch_fake_quant_finegrained_fp8_linear(
     weight_scale_inv = weight_scale[0]
 
     # Infer block_size from weight and weight_scale_inv shapes
-    # weight shape: [N, K], weight_scale_inv shape: [N/block_n, K/block_k]
+    # weight shape: [N, K], weight_scale_inv shape: [ceil(N/block_n), ceil(K/block_k)]
     N, K = weight_quantized.shape
     scale_n, scale_k = weight_scale_inv.shape
-    block_n = N // scale_n
-    block_k = K // scale_k
+    block_n = triton.cdiv(N, scale_n)
+    block_k = triton.cdiv(K, scale_k)
     block_size = [block_n, block_k]
 
     qinput, scale = _safe_act_quant(input, block_size[1])
@@ -535,6 +577,10 @@ def _torch_fake_quant_finegrained_fp8_linear_fake(
     weight_scale: List[torch.Tensor],
     input_zp: List[torch.Tensor],
     weight_zp: List[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Fake implementation for torch.export tracing."""
     out_features = weight_quantized.shape[0]
@@ -547,6 +593,10 @@ def trtllm_finegrained_fp8_linear(
     weight: torch.Tensor,  # [N, K] float8_e4m3fn
     bias: Optional[torch.Tensor],  # [N] or None
     weight_scale: torch.Tensor,  # [N/128, K/128] per-block weight scale
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """TRT-LLM optimized FineGrainedFP8 linear operation.
 
@@ -555,7 +605,7 @@ def trtllm_finegrained_fp8_linear(
     - Input is dynamically quantized using fp8_quantize_1x128
     - Assumes 128x128 block size (standard for DeepSeek/MiniMax style FP8)
     """
-    from tensorrt_llm._utils import get_sm_version
+    from ..._compat import get_sm_version
 
     # Ensure input is bfloat16 for the optimized kernel
     if input.dtype == torch.float8_e4m3fn:
@@ -576,8 +626,10 @@ def trtllm_finegrained_fp8_linear(
             f"(shape={weight_scale.shape}), weight shape={weight.shape}. "
             f"This usually means scale tensor sharding produced an empty tensor."
         )
-    block_n = N // scale_n
-    block_k = K // scale_k
+    # Ceiling division is required because the weight dimension may not be
+    # evenly divisible by the number of scale blocks (e.g. after TP sharding).
+    block_n = triton.cdiv(N, scale_n)
+    block_k = triton.cdiv(K, scale_k)
 
     # TRT-LLM fp8_block_scaling_gemm requires exact 128x128 blocks.
     # For small layers where a dimension < 128 (e.g. N=64), the derived block
@@ -617,6 +669,10 @@ def _trtllm_finegrained_fp8_linear_fake(
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
     weight_scale: torch.Tensor,
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
 ) -> torch.Tensor:
     """Fake implementation for torch.export tracing."""
     out_features = weight.shape[0]

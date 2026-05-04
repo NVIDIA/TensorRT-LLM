@@ -154,6 +154,38 @@ def test_fuse_input_embeds_success_oov_path(device):
 
 @pytest.mark.parametrize("device", ["cpu"] +
                          (["cuda"] if torch.cuda.is_available() else []))
+def test_fuse_input_embeds_empty_multimodal_params_falls_through(device):
+    """
+    An empty multimodal_params list (non-None but len 0) passed through kwargs
+    is accepted and ignored; fuse_input_embeds returns a correctly shaped
+    fused tensor.
+    """
+    hidden = 8
+    vocab_size = 40
+    emb = make_embedding(num_embeddings=vocab_size,
+                         hidden_size=hidden,
+                         device=device)
+
+    input_ids = torch.tensor([0, 1, 41, 2, 42, 3, 43, 4],
+                             dtype=torch.long,
+                             device=device)
+    text_idx, mm_idx = filter_mm_token_from_input_ids(input_ids,
+                                                      vocab_size=vocab_size)
+    mm_emb = torch.randn(mm_idx.shape[0], hidden, device=device)
+
+    out_ids, out_embeds = fuse_input_embeds(emb,
+                                            input_ids,
+                                            mm_embeds=[mm_emb],
+                                            mm_token_ids=None,
+                                            multimodal_params=[])
+
+    assert out_ids is None
+    assert out_embeds is not None
+    assert out_embeds.shape == (input_ids.numel(), hidden)
+
+
+@pytest.mark.parametrize("device", ["cpu"] +
+                         (["cuda"] if torch.cuda.is_available() else []))
 def test_fuse_input_embeds_kwargs_precedence_over_sentinel_and_ids(device):
     """
     Ensure that when kwargs provide precomputed indices, they take precedence

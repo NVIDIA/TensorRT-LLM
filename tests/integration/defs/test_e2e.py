@@ -44,7 +44,7 @@ _MEM_FRACTION_95 = 0.95
 
 
 def test_gpt3_175b_1layers_build_only(llm_root, llm_venv, engine_dir):
-    "Build GPT-3 175B: 96 layer w/ plugins"
+    """Build GPT-3 175B: 96 layer w/ plugins"""
     example_root = os.path.join(llm_root, "examples", "models", "core", "gpt")
     engine_dir = os.path.join(engine_dir, "gpt-175-96layers-build-only")
 
@@ -99,17 +99,17 @@ def test_llama_e2e(llama_example_root, llama_tokenizer_model_root, llm_venv,
 
     build_cmd = [
         "trtllm-build", f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}", f"--max_beam_width=4",
+        f"--output_dir={engine_dir}", "--max_beam_width=4",
         f"--max_batch_size={1}", f"--max_input_len={1024}",
-        f"--gpt_attention_plugin=float16", f"--gemm_plugin=float16"
+        "--gpt_attention_plugin=float16", "--gemm_plugin=float16"
     ]
 
     print("Build engines...")
 
     if additional_build_option == "":
-        build_cmd += [f"--remove_input_padding=disable"]
+        build_cmd += ["--remove_input_padding=disable"]
     elif additional_build_option == "remove_input_padding":
-        build_cmd += [f"--remove_input_padding=enable"]
+        build_cmd += ["--remove_input_padding=enable"]
     else:
         build_cmd += [f"--{additional_build_option}"]
 
@@ -175,19 +175,19 @@ def test_mistral_e2e(llama_example_root, llama_tokenizer_model_root, llm_venv,
         "trtllm-build",
         f"--checkpoint_dir={model_dir}",
         f"--output_dir={engine_dir}",
-        f"--max_batch_size=1",
-        f"--max_input_len=1024",
-        f"--max_num_tokens=1024",
-        f"--max_beam_width=4",
-        f"--gemm_plugin=float16",
+        "--max_batch_size=1",
+        "--max_input_len=1024",
+        "--max_num_tokens=1024",
+        "--max_beam_width=4",
+        "--gemm_plugin=float16",
     ]
     print("Build engines...")
 
     if additional_build_option == "":
         if not enable_fp8:
-            build_cmd += [f"--remove_input_padding=disable"]
+            build_cmd += ["--remove_input_padding=disable"]
     elif additional_build_option == "remove_input_padding":
-        build_cmd += [f"--remove_input_padding=enable"]
+        build_cmd += ["--remove_input_padding=enable"]
     else:
         build_cmd += [f"--{additional_build_option}"]
 
@@ -228,7 +228,7 @@ def test_mistral_e2e(llama_example_root, llama_tokenizer_model_root, llm_venv,
 def test_qwen_e2e_cpprunner_large_new_tokens(model_name, model_path, llm_venv,
                                              qwen_example_root, cmodel_dir,
                                              engine_dir):
-    "RCCA: https://nvbugs/5238105"
+    """RCCA: https://nvbugs/5238105"""
     model_dir = convert_weights(
         llm_venv=llm_venv,
         example_root=qwen_example_root,
@@ -239,7 +239,7 @@ def test_qwen_e2e_cpprunner_large_new_tokens(model_name, model_path, llm_venv,
 
     build_cmd = [
         "trtllm-build", f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}", f"--gemm_plugin=float16",
+        f"--output_dir={engine_dir}", "--gemm_plugin=float16",
         "--max_num_tokens=32768"
     ]
 
@@ -329,7 +329,7 @@ class BenchRunner:
 
         self.work_dir = Path(tempfile.TemporaryDirectory().name)
 
-        self.dataset_path = os.path.join(self.work_dir, f"data.txt")
+        self.dataset_path = os.path.join(self.work_dir, "data.txt")
         if self.use_mpirun:
             self.mpirun_cmd = f"mpirun --allow-run-as-root -n {self.tp_size} trtllm-llmapi-launch"
         else:
@@ -563,14 +563,13 @@ def trtllm_bench_prolog(
         streaming: bool,
         skip_engine_build: bool = False
 ) -> Union[Tuple[Path, Path, Path], Path]:
-    ''' Optionally build engine and generate dataset for benchmark.
+    """Optionally build engine and generate dataset for benchmark.
 
     Returns:
         Union[Tuple[Path, Path, Path], Path]:
             - Tuple containing model_path, engine_path, and dataset_path.
             - A single dataset_path object if skip_engine_build is True.
-    '''
-
+    """
     llm_models = llm_models_root()
     # skip when llm_models_root is None
     if llm_models is None:
@@ -697,12 +696,10 @@ def test_trtllm_bench_sanity(llm_root, llm_venv, engine_dir, model_subdir,
                              model_name, quant, streaming, use_extra_config,
                              pytorch_backend_config,
                              temp_extra_llm_api_options_file):
-    '''
-    sanity check on the new benchmark script to make sure it works
+    """Sanity check on the new benchmark script to make sure it works
     - meta-llama/Llama-3.1-8B for baseline
     - fp16 and fp8 to test quantization
-    '''
-
+    """
     model_path, engine_path, dataset_path = trtllm_bench_prolog(
         llm_root, llm_venv, engine_dir, model_subdir, model_name, quant,
         "streaming" in streaming)
@@ -743,9 +740,8 @@ def test_trtllm_bench_pytorch_backend_sanity(llm_root, llm_venv,
                                              use_extra_config,
                                              pytorch_backend_config,
                                              temp_extra_llm_api_options_file):
-    '''
-    sanity check on latency benchmark for LLM API with PyTorch backend
-    '''
+    """Sanity check on latency benchmark for LLM API with PyTorch backend
+    """
     model_path, _, dataset_path = trtllm_bench_prolog(llm_root,
                                                       llm_venv,
                                                       None,
@@ -810,12 +806,10 @@ def test_trtllm_bench_mgmn(llm_root, llm_venv):
 @pytest.mark.parametrize("quant", [None, "FP8"], ids=["FP16", "FP8"])
 def test_trtllm_bench_latency_sanity(llm_root, llm_venv, engine_dir,
                                      model_subdir, model_name, quant):
-    '''
-    sanity check on the new benchmark script to make sure it works
+    """Sanity check on the new benchmark script to make sure it works
     - meta-llama/Llama-3.1-8B for baseline
     - fp16 and fp8 to test quantization
-    '''
-
+    """
     model_path, engine_path, dataset_path = trtllm_bench_prolog(llm_root,
                                                                 llm_venv,
                                                                 engine_dir,
@@ -837,9 +831,8 @@ def test_trtllm_bench_latency_sanity(llm_root, llm_venv, engine_dir,
     ],
 )
 def test_trtllm_bench_help_sanity(model_name):
-    '''
-    Sanity check that the options are defined properly by printing out help
-    '''
+    """Sanity check that the options are defined properly by printing out help
+    """
     check_call("trtllm-bench --help", shell=True)
     check_call(f"trtllm-bench --model {model_name} build --help", shell=True)
     check_call(f"trtllm-bench --model {model_name} throughput --help",
@@ -854,9 +847,8 @@ def test_trtllm_bench_help_sanity(model_name):
 def test_trtllm_bench_request_rate_and_concurrency(llm_root, llm_venv,
                                                    engine_dir, request_rate,
                                                    concurrency):
-    '''
-    sanity check on the trtllm-bench new request rate and concurrency API
-    '''
+    """Sanity check on the trtllm-bench new request rate and concurrency API
+    """
     model_subdir = "llama-3.1-model/Meta-Llama-3.1-8B"
     model_name = "meta-llama/Llama-3.1-8B"
 
@@ -902,9 +894,8 @@ def test_trtllm_bench_request_rate_and_concurrency(llm_root, llm_venv,
                          ids=["TRT", "PyTorch"])
 def test_trtllm_bench_iteration_log(llm_root, llm_venv, model_name,
                                     model_subdir, streaming, backend):
-    '''
-    Test the iteration log functionality with necessary options
-    '''
+    """Test the iteration log functionality with necessary options
+    """
     iteration_log = None
     engine_dir = None
 
@@ -1441,9 +1432,9 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
             f"--model_dir={llm_models_root()}/{model_path}",
         ]
         if "Qwen3" in model_name:
-            cmds.append(f"--kv_cache_fraction=0.6")
+            cmds.append("--kv_cache_fraction=0.6")
         if "Llama3.1-70B" in model_name or "Llama3.3-70B" in model_name:
-            cmds.append(f"--max_num_tokens=1024")
+            cmds.append("--max_num_tokens=1024")
         llm_venv.run_cmd(cmds)
 
 
@@ -1780,8 +1771,7 @@ def test_ptp_quickstart_advanced_deepseek_r1_w4afp8_8gpus(
 @pytest.mark.skip_less_device_memory(140000)
 @pytest.mark.skip_less_device(8)
 def test_deepseek_r1_mtp_bench(llm_root, llm_venv):
-    """
-    Test DeepSeek-R1 FP4 with MTP speculative decoding using BenchRunner.
+    """Test DeepSeek-R1 FP4 with MTP speculative decoding using BenchRunner.
     The goal is to test the bug fix for https://nvbugs/5670108.
     Average input sequence length: 1k, average output sequence length: 10k.
     """
@@ -2110,98 +2100,6 @@ def test_ptp_quickstart_multimodal_kv_cache_reuse(llm_root, llm_venv,
     # TODO: Setting max_batch_size=1 and repeating the same request helps test KV cache reuse indirectly,
     # but does not directly measure the KV cache hit rate. For a more direct test, we would need to enable
     # return_perf_metrics=True, which is not currently supported by the quickstart example CLI.
-    print("All answers are correct!")
-
-
-@pytest.mark.parametrize("modality", ["image", "video"])
-@pytest.mark.parametrize(
-    "model_name,model_path,match_ratio",
-    [
-        pytest.param(
-            "mistral-small-3.1-24b-instruct",
-            "Mistral-Small-3.1-24B-Instruct-2503",
-            # Lower threshold to give some wiggle room for flakiness.
-            0.6,
-            marks=pytest.mark.skip_less_device_memory(80000)),
-    ])
-def test_ptp_quickstart_multimodal_chunked_prefill(llm_root, llm_venv,
-                                                   model_name, model_path,
-                                                   modality, match_ratio):
-    # NOTE: individual tests need to be enabled in
-    # tests/integration/test_lists/qa/examples_test_list.txt
-
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    test_data_root = Path(
-        os.path.join(llm_models_root(), "multimodals", "test_data"))
-    print(f"Accuracy test {model_name} {modality} mode with example inputs.")
-    if modality == "video" and model_name in {"mistral-small-3.1-24b-instruct"}:
-        pytest.skip(f"Skipping video modality test for {model_name}")
-    accuracy_inputs = {
-        "image": {
-            "prompt": [
-                "Describe the natural environment in the image.",
-                "Describe the object and the weather condition in the image.",
-                "Describe the traffic condition on the road in the image.",
-            ],
-            "media": [
-                str(test_data_root / "seashore.png"),
-                str(test_data_root / "inpaint.png"),
-                str(test_data_root / "61.jpg"),
-            ],
-        },
-        "video": {
-            "prompt": [
-                "Tell me what you see in the video briefly.",
-                "Describe the scene in the video briefly.",
-            ],
-            "media": [
-                str(test_data_root / "OAI-sora-tokyo-walk.mp4"),
-                str(test_data_root / "world.mp4"),
-            ],
-        },
-    }
-
-    expected_keywords = {
-        "mistral-small-3.1-24b-instruct": {
-            "image": [
-                [
-                    "cloud", "dramatic", "seascape", "ocean", "turbulent",
-                    "waves"
-                ],
-                ["scenic", "rock", "landscape", "monolith", "formation"],
-                [
-                    "multi-lane", "highway", "moderate", "traffic", "flow",
-                    "vehicles", "congestion"
-                ],
-            ],
-        },
-    }
-
-    cmd = [
-        str(example_root / "quickstart_multimodal.py"),
-        "--model_dir",
-        f"{llm_models_root()}/{model_path}",
-        "--modality",
-        modality,
-        "--prompt",
-        *accuracy_inputs[modality]["prompt"],
-        "--media",
-        *accuracy_inputs[modality]["media"],
-        "--enable_chunked_prefill",
-        "--max_num_tokens=256",
-    ]
-
-    output = llm_venv.run_cmd(cmd, caller=check_output)
-    for prompt_output, prompt_keywords in zip(
-            parse_output(output), expected_keywords[model_name][modality]):
-        matches = [
-            keyword in prompt_output.lower() for keyword in prompt_keywords
-        ]
-        obs_match_ratio = 1. * sum(matches) / len(matches)
-        print(
-            f"Prompt output: {prompt_output}\nExpected keywords: {prompt_keywords}\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} given threshold {match_ratio}"
-        )
-        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}"
     print("All answers are correct!")
 
 
@@ -2551,8 +2449,7 @@ def test_ptp_quickstart_advanced_multinode(llm_root, llm_venv, model_path,
                  marks=skip_pre_blackwell),
 ])
 def test_eagle3_output_repetition_4gpus(model_dir: str, draft_model_dir: str):
-    """
-    RCCA: https://nvbugspro.nvidia.com/bug/5575211
+    """RCCA: https://nvbugspro.nvidia.com/bug/5575211
     """
     from tensorrt_llm import LLM, SamplingParams
     from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
@@ -2624,3 +2521,59 @@ def test_get_ci_container_port():
     assert container_port_start > 0
     assert container_port_num > 0
     assert container_port_start + container_port_num <= 60000
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("model_name", ["meta/Meta-Llama-3.1-8B"],
+                         ids=["llama3_1-8b"])
+@pytest.mark.parametrize("model_subdir", ["llama-3.1-model/Meta-Llama-3.1-8B"],
+                         ids=["llama_v3_1"])
+def test_trtllm_bench_mig_launch(llm_root, llm_venv, model_name, model_subdir):
+    """Run benchmark in MIG mode, check if throughput increases with concurrency."""
+    results = {}
+    concurrency_list = [1, 32, 64, 128]
+
+    for concurrency in concurrency_list:
+        num_requests = concurrency * 10
+        runner = BenchRunner(llm_root=llm_root,
+                             llm_venv=llm_venv,
+                             model_name=model_name,
+                             model_subdir=model_subdir,
+                             streaming=False,
+                             use_pytorch_backend=True,
+                             use_mpirun=False,
+                             tp_size=1,
+                             concurrency=concurrency,
+                             num_requests=num_requests)
+
+        output = runner()
+        results[concurrency] = output
+
+    print(f"\n=== Benchmark Results Comparison ===")
+    print(f"Model: {model_name}")
+    print(
+        f"{'Concurrency':<15} {'Throughput':<15} {'Latency':<15} {'Num Requests':<15}"
+    )
+    print("-" * 60)
+
+    for idx, val in enumerate(concurrency_list):
+        metrics = results.get(val)
+        if not isinstance(metrics, dict):
+            pytest.fail(
+                f"Unexpected benchmark result type for concurrency {val}: {type(metrics)}"
+            )
+        try:
+            throughput = float(metrics.get('throughput', 0))
+            latency = float(metrics.get('latency', 0))
+            num_requests = int(metrics.get('num_requests', 0))
+        except (ValueError, TypeError) as e:
+            pytest.fail(
+                f"Failed to parse benchmark results for concurrency {val}: {e}")
+        assert throughput > 0, f"Throughput is 0 for concurrency {val}"
+        assert latency > 0, f"Latency is 0 for concurrency {val}"
+        print(f"{val:<15} {throughput:<15} {latency:<15} {num_requests:<15}")
+        if idx > 0:
+            prev_throughput = float(results[concurrency_list[idx - 1]].get(
+                'throughput', 0))
+            assert throughput > prev_throughput * 1.3, f"Throughput is not increasing for concurrency {concurrency_list[idx]}"

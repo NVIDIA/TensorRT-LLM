@@ -3,7 +3,7 @@ import queue
 import threading
 import traceback
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -15,42 +15,24 @@ from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.logger import logger
 
+if TYPE_CHECKING:
+    from tensorrt_llm.visual_gen.params import VisualGenParams
+
 
 @dataclass
 class DiffusionRequest:
     """Request for diffusion inference.
 
-    Universal parameters are top-level fields with ``None`` meaning
-    "use model default" (resolved by the executor before calling
-    ``pipeline.infer()``).  Model-specific parameters live in
-    ``extra_params`` and are passed through to the pipeline.
+    Generation parameters live in the optional ``params`` object
+    (a :class:`~tensorrt_llm.visual_gen.params.VisualGenParams` instance).
+    When ``params`` is ``None`` (the default), the executor creates a
+    ``VisualGenParams()`` and fills it with pipeline-specific defaults
+    before calling ``pipeline.infer()``.
     """
 
     request_id: int
     prompt: List[str]
-    negative_prompt: Optional[str] = None
-
-    # Core — None means "use model default" (resolved by executor)
-    height: Optional[int] = None
-    width: Optional[int] = None
-    num_inference_steps: Optional[int] = None
-    guidance_scale: Optional[float] = None
-    max_sequence_length: Optional[int] = None
-    seed: int = 42
-
-    # Video
-    num_frames: Optional[int] = None
-    frame_rate: Optional[float] = None
-
-    # Image
-    num_images_per_prompt: int = 1
-
-    # Conditioning inputs
-    image: Optional[Union[str, bytes, List[Union[str, bytes]]]] = None
-    image_cond_strength: Optional[float] = None
-
-    # Model-specific overflow (from VisualGenParams.extra_params)
-    extra_params: Optional[dict] = None
+    params: Optional["VisualGenParams"] = None
 
 
 @dataclass
@@ -79,7 +61,7 @@ _TYPE_MAP = {
 
 # Generation config fields that pipelines declare defaults for.
 # If a user sets one of these but the pipeline doesn't declare it in
-# DEFAULT_GENERATION_PARAMS, the value will be silently ignored.
+# default_generation_params, the value will be silently ignored.
 # Conditioning inputs (image, negative_prompt, mask, image_cond_strength)
 # are excluded — they are validated at runtime by the pipeline's infer().
 _GENERATION_CONFIG_FIELDS = frozenset(
@@ -186,8 +168,8 @@ class DiffusionExecutor:
                     request_id=-1,
                     output={
                         "status": "READY",
-                        "default_generation_params": self.pipeline.DEFAULT_GENERATION_PARAMS,
-                        "extra_param_specs": self.pipeline.EXTRA_PARAM_SPECS,
+                        "default_generation_params": self.pipeline.default_generation_params,
+                        "extra_param_specs": self.pipeline.extra_param_specs,
                     },
                 )
             )
@@ -216,34 +198,45 @@ class DiffusionExecutor:
             self.process_request(req)
 
     def _merge_defaults(self, req: DiffusionRequest):
-        """Fill ``None`` fields in *req* with pipeline-specific defaults.
+        """Fill ``None`` fields in *req.params* with pipeline-specific defaults.
 
         Merges both universal defaults (from ``default_generation_params``)
         and extra_param defaults (from ``extra_param_specs``).
         """
+        if req.params is None:
+            from tensorrt_llm.visual_gen.params import VisualGenParams
+
+            kwargs = dict(self.pipeline.default_generation_params)
+            specs = self.pipeline.extra_param_specs
+            if specs:
+                kwargs["extra_params"] = {key: spec.default for key, spec in specs.items()}
+            req.params = VisualGenParams(**kwargs)
+            return
+
+        params = req.params
         # Universal field defaults
-        for field_name, default_value in self.pipeline.DEFAULT_GENERATION_PARAMS.items():
-            if hasattr(req, field_name) and getattr(req, field_name) is None:
-                setattr(req, field_name, default_value)
+        for field_name, default_value in self.pipeline.default_generation_params.items():
+            if hasattr(params, field_name) and getattr(params, field_name) is None:
+                setattr(params, field_name, default_value)
 
         # Extra param defaults — fill all declared keys so infer() can use direct access
-        specs = self.pipeline.EXTRA_PARAM_SPECS
+        specs = self.pipeline.extra_param_specs
         if specs:
-            if req.extra_params is None:
-                req.extra_params = {}
+            if params.extra_params is None:
+                params.extra_params = {}
             for key, spec in specs.items():
-                if key not in req.extra_params:
-                    req.extra_params[key] = spec.default
+                if key not in params.extra_params:
+                    params.extra_params[key] = spec.default
 
         self._validate_request(req)
 
     def _validate_request(self, req: DiffusionRequest):
-        """Validate *req* against the loaded pipeline's declared parameters.
+        """Validate *req.params* against the loaded pipeline's declared parameters.
 
         Raises ``VisualGenParamsError`` on:
         - Unknown ``extra_params`` keys
         - Universal fields (e.g. ``num_frames``) set by the user but not
-          declared in the pipeline's ``DEFAULT_GENERATION_PARAMS``
+          declared in the pipeline's ``default_generation_params``
         - Type mismatches for ``extra_params`` values
         - Out-of-range ``extra_params`` values
         """
@@ -251,14 +244,15 @@ class DiffusionExecutor:
         # (executor → visual_gen.visual_gen → _torch.visual_gen → executor)
         from tensorrt_llm.visual_gen.visual_gen import VisualGenParamsError
 
+        params = req.params
         errors: list[str] = []
         pipeline_name = self.pipeline.__class__.__name__
-        declared_defaults = self.pipeline.DEFAULT_GENERATION_PARAMS
-        specs = self.pipeline.EXTRA_PARAM_SPECS
+        declared_defaults = self.pipeline.default_generation_params
+        specs = self.pipeline.extra_param_specs
 
         # --- unknown extra_params keys ---
-        if req.extra_params:
-            unknown = set(req.extra_params.keys()) - set(specs.keys())
+        if params.extra_params:
+            unknown = set(params.extra_params.keys()) - set(specs.keys())
             if unknown:
                 errors.append(
                     f"Unknown extra_params {sorted(unknown)} for {pipeline_name}. "
@@ -267,21 +261,21 @@ class DiffusionExecutor:
 
         # --- unsupported universal fields ---
         # Check generation config fields the user explicitly set (not None)
-        # that the pipeline never declared in DEFAULT_GENERATION_PARAMS.
+        # that the pipeline never declared in default_generation_params.
         # Conditioning inputs (image, negative_prompt, mask) are excluded —
         # they are validated at runtime by the pipeline's infer().
         for field_name in _GENERATION_CONFIG_FIELDS:
-            value = getattr(req, field_name, None)
+            value = getattr(params, field_name, None)
             if value is not None and field_name not in declared_defaults:
                 errors.append(
                     f"Parameter '{field_name}' is set but {pipeline_name} does "
-                    f"not use it (not in DEFAULT_GENERATION_PARAMS). "
+                    f"not use it (not in default_generation_params). "
                     f"It will be silently ignored."
                 )
 
         # --- extra_params type and range checks ---
-        if req.extra_params:
-            for key, value in req.extra_params.items():
+        if params.extra_params:
+            for key, value in params.extra_params.items():
                 if key not in specs:
                     continue  # already reported as unknown above
                 spec = specs[key]
@@ -315,7 +309,7 @@ class DiffusionExecutor:
         try:
             self._merge_defaults(req)
             cache_key = self.pipeline.warmup_cache_key(
-                req.height, req.width, num_frames=req.num_frames
+                req.params.height, req.params.width, num_frames=req.params.num_frames
             )
             if self.pipeline._warmed_up_shapes and cache_key not in self.pipeline._warmed_up_shapes:
                 logger.warning(
@@ -341,12 +335,13 @@ def run_diffusion_worker(
     world_size: int,
     master_addr: str,
     master_port: int,
-    request_queue_addr: str,
-    response_queue_addr: str,
+    request_queue_addr: Optional[str],
+    response_queue_addr: Optional[str],
     diffusion_args: "VisualGenArgs",
     log_level: str = "info",
     req_hmac_key: Optional[bytes] = None,
     resp_hmac_key: Optional[bytes] = None,
+    local_rank: Optional[int] = None,
 ):
     """Entry point for worker process."""
     try:
@@ -360,8 +355,17 @@ def run_diffusion_worker(
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
 
-        # Calculate device_id before init_process_group
-        device_id = rank % torch.cuda.device_count() if torch.cuda.is_available() else 0
+        # Determine local_rank: explicit arg > LOCAL_RANK env > global rank.
+        # In multi-node runs (torchrun / srun --ntasks-per-node) SLURM/torchelastic
+        # sets LOCAL_RANK; in single-node mp.Process mode it equals the global rank.
+        _local_rank = (
+            local_rank if local_rank is not None else int(os.environ.get("LOCAL_RANK", rank))
+        )
+        os.environ["LOCAL_RANK"] = str(_local_rank)
+
+        # Use local_rank for device assignment so that each node's ranks map to
+        # GPUs 0..gpus_per_node-1 rather than wrapping the global rank.
+        device_id = _local_rank % torch.cuda.device_count() if torch.cuda.is_available() else 0
         if torch.cuda.is_available():
             torch.cuda.set_device(device_id)
 

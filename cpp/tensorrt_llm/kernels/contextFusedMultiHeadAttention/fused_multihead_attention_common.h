@@ -145,6 +145,8 @@ struct MHARunnerFixedParams
     int sageBlockSizeV = 0;
     // Use sparse MLA ?
     bool useSparseMLA = false;
+    // Use sparse attention in trtllm-gen ?
+    bool useTllmGenSparseAttention = false;
 
     // Convert to string for debug.
     std::string convertToStrOutput()
@@ -195,6 +197,8 @@ struct MHARunnerFixedParams
         output += ", sageBlockSizeQ = " + std::to_string(sageBlockSizeQ);
         output += ", sageBlockSizeK = " + std::to_string(sageBlockSizeK);
         output += ", sageBlockSizeV = " + std::to_string(sageBlockSizeV);
+        output += ", useSparseMLA = " + std::string(useSparseMLA ? "true" : "false");
+        output += ", useTllmGenSparseAttention = " + std::string(useTllmGenSparseAttention ? "true" : "false");
 
         return output;
     }
@@ -270,6 +274,10 @@ struct MHARunnerParams
     void const* kPtr;
     // The V buffer ptr (for separate V input).
     void const* vPtr;
+    // The V tensor token stride in bytes (0 = compute from head dimensions).
+    // Set this when V's actual stride differs from the default (e.g. contiguous V in AutoDeploy
+    // vs non-contiguous V from kv.split() in PyTorch backend).
+    int64_t vStrideInBytes = 0;
     // The paged kv cache array.
     KVBlockArray pagedKvCache;
     // The paged kv cache array for scaling factor.
