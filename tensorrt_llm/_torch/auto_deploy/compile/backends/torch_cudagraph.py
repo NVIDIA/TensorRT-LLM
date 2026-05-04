@@ -64,24 +64,6 @@ def _coalesce_output(
     return out if out is not None else op_result
 
 
-def _find_positional_out_arg(target_node: torch.fx.Node) -> Optional[int]:
-    """Return the positional-arg index of ``out`` in *target_node*, or ``None``.
-
-    When the op schema includes an ``out`` parameter and the graph already passes
-    it as a positional argument (because ``get_constants`` returned later args
-    that pushed ``out`` into the positional slot), we must replace it in-place
-    rather than adding a duplicate kwarg — passing both would exceed the op's
-    declared argument count.
-    """
-    if not hasattr(target_node.target, "_schema"):
-        return None
-    schema = target_node.target._schema
-    for schema_idx, arg in enumerate(schema.arguments):
-        if arg.name == "out" and schema_idx < len(target_node.args):
-            return schema_idx
-    return None
-
-
 def _inject_out_param(submod: GraphModule) -> None:
     """Rewrite a dynamic submodule's FX graph to accept and forward an ``out`` kwarg.
 
@@ -117,18 +99,7 @@ def _inject_out_param(submod: GraphModule) -> None:
     with graph.inserting_after(last_placeholder):
         out_placeholder = graph.placeholder("out", default_value=None)
 
-    # When the cached op's positional args already include ``out=None`` (because
-    # ``get_constants`` returns args that follow the schema's ``out`` slot), we
-    # must replace the positional slot in place; adding a kwarg too would
-    # over-supply the argument list.  This path fires under the piecewise CUDA
-    # graph (PWCG) backend which exercises the dynamic-submodule split.
-    out_arg_idx = _find_positional_out_arg(target_node)
-    if out_arg_idx is not None:
-        args_list = list(target_node.args)
-        args_list[out_arg_idx] = out_placeholder
-        target_node.args = tuple(args_list)
-    else:
-        target_node.kwargs = {**dict(target_node.kwargs), "out": out_placeholder}
+    target_node.kwargs = {**dict(target_node.kwargs), "out": out_placeholder}
 
     with graph.inserting_after(target_node):
         coalesce_node = graph.call_function(_coalesce_output, args=(target_node, out_placeholder))

@@ -556,13 +556,16 @@ def trtllm_mha_with_cache(
     kv_scale_orig_quant: float = 1.0,
     kv_scale_quant_orig: float = 1.0,
     out_scale: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
     rotary_cos_sin: Optional[torch.Tensor] = None,
     position_embedding_type: int = 0,
     rotary_embedding_dim: int = 0,
     num_heads_hint: int = 0,
     num_kv_heads_hint: int = 0,
     head_dim_hint: int = 0,
+    # OPTIONAL PRE-ALLOCATED OUTPUT — kept last so it stays unfilled in
+    # ``get_constants`` and ``_inject_out_param`` can wire it as a kwarg
+    # (mirrors FlashInfer's signature layout).
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """TRT-LLM attention with paged KV cache for Auto-Deploy.
 
@@ -776,13 +779,13 @@ def trtllm_mha_with_cache_fake(
     kv_scale_orig_quant: float = 1.0,
     kv_scale_quant_orig: float = 1.0,
     out_scale: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
     rotary_cos_sin: Optional[torch.Tensor] = None,
     position_embedding_type: int = 0,
     rotary_embedding_dim: int = 0,
     num_heads_hint: int = 0,
     num_kv_heads_hint: int = 0,
     head_dim_hint: int = 0,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile tracing."""
     if out is not None:
@@ -979,11 +982,12 @@ class TrtllmAttention(AttentionDescriptor):
             1.0,  # kv_scale_orig_quant (hard-coded, same as FlashInfer)
             1.0,  # kv_scale_quant_orig (hard-coded, same as FlashInfer)
             out_scale,
-            None,  # out (pre-allocated output buffer, not used here)
             rope_cos_sin,
             pos_emb_type,
             rot_emb_dim,
             num_heads_hint,
             num_kv_heads_hint,
             head_dim_hint,
+            # ``out`` is intentionally omitted — it stays unfilled positionally so
+            # ``_inject_out_param`` can wire a pre-allocated buffer as a kwarg.
         ]
