@@ -619,7 +619,8 @@ async def async_load_video(video: str,
                                        num_frames,
                                        fps,
                                        format,
-                                       device, extract_audio=extract_audio)
+                                       device,
+                                       extract_audio=extract_audio)
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 

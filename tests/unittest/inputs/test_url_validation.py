@@ -39,7 +39,6 @@ def _requests_response(status_code=200, headers=None, chunks=(b"body",)):
 
 
 class _AsyncContent:
-
     def __init__(self, chunks):
         self._chunks = list(chunks)
 
