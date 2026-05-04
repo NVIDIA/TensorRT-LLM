@@ -23,7 +23,6 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -33,6 +32,7 @@ from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -295,19 +295,12 @@ class BasicAVTransformerBlock(nn.Module):
         self.idx = idx
         self.norm_eps = norm_eps
 
-        self._use_seq_parallel = False
-        self._seq_parallel_size = 1
-        self._seq_parallel_pg = None
-        self._audio_is_sharded = False
+        # Per-block sharder: mirrors the root sharder's topology so the block
+        # can run cross-attention all-gathers independently.  Head-divisibility
+        # is checked once at the root model — skip num_heads here.
         vgm = config.visual_gen_mapping if config is not None else None
-        if vgm is not None and vgm.ulysses_size > 1:
-            self._use_seq_parallel = True
-            self._seq_parallel_size = vgm.ulysses_size
-            self._seq_parallel_pg = vgm.ulysses_group
-        elif vgm is not None and vgm.attn2d_row_size * vgm.attn2d_col_size > 1:
-            self._use_seq_parallel = True
-            self._seq_parallel_size = vgm.attn2d_row_size * vgm.attn2d_col_size
-            self._seq_parallel_pg = vgm.attn2d_mesh_group
+        self._sharder = SequenceSharder.from_vgm(vgm)
+        self._audio_is_sharded = False
 
         if video is not None:
             self._init_video_modules(video, rope_type, norm_eps, config, idx)
@@ -468,20 +461,19 @@ class BasicAVTransformerBlock(nn.Module):
 
     def _sp_all_gather(self, x: torch.Tensor, dim: int = 1) -> torch.Tensor:
         """All-gather *x* along *dim* across sequence-parallel ranks."""
-        x = x.contiguous()
-        gathered = [torch.empty_like(x) for _ in range(self._seq_parallel_size)]
-        dist.all_gather(gathered, x, group=self._seq_parallel_pg)
-        return torch.cat(gathered, dim=dim)
+        return self._sharder.gather(x, dim=dim)
 
     def _sp_gather_pe(self, pe):
-        """All-gather RoPE (cos, sin) tuple along the sequence dim."""
+        """All-gather RoPE (cos, sin) tuple along its sequence dim.
+
+        Split RoPE is ``[B, H, S, D]`` (dim 2); interleaved RoPE is
+        ``[B, S, D]`` (dim 1).  Inferred from ``cos.ndim``.
+        """
         if pe is None:
             return None
         cos, sin = pe
-        # Split RoPE: [B, H, S, D] — sequence at dim 2
-        # Interleaved RoPE: [B, S, D] — sequence at dim 1
         seq_dim = 2 if cos.ndim == 4 else 1
-        return (self._sp_all_gather(cos, dim=seq_dim), self._sp_all_gather(sin, dim=seq_dim))
+        return (self._sharder.gather(cos, dim=seq_dim), self._sharder.gather(sin, dim=seq_dim))
 
     # -- Forward -------------------------------------------------------------
 
@@ -644,7 +636,7 @@ class BasicAVTransformerBlock(nn.Module):
 
                 # Project-before-gather (video → audio direction).
                 k_v2a, v_v2a = self.video_to_audio_attn.project_kv(vx_scaled)
-                if self._use_seq_parallel:
+                if self._sharder.is_active:
                     k_v2a = self._sp_all_gather(k_v2a)
                     v_v2a = self._sp_all_gather(v_v2a)
                     k_pe_v2a = self._sp_gather_pe(video.cross_positional_embeddings)
@@ -835,38 +827,23 @@ class LTXModel(nn.Module):
         self._init_preprocessors(cross_pe_max_pos)
 
         vgm = model_config.visual_gen_mapping
-        attn2d_row_size = vgm.attn2d_row_size if vgm else 1
-        attn2d_col_size = vgm.attn2d_col_size if vgm else 1
-        attn2d_size = attn2d_row_size * attn2d_col_size
-        ulysses_size = vgm.ulysses_size if vgm else 1
-
-        use_attn2d = attn2d_size > 1
-        use_ulysses = ulysses_size > 1
-        self.use_seq_parallel = use_attn2d or use_ulysses
-        self.seq_parallel_size = attn2d_size if use_attn2d else ulysses_size
-        if use_attn2d:
-            self.seq_parallel_pg = vgm.attn2d_mesh_group
-            self.seq_parallel_rank = vgm.attn2d_mesh_rank
-        elif use_ulysses:
-            self.seq_parallel_pg = vgm.ulysses_group if vgm else None
-            self.seq_parallel_rank = vgm.ulysses_rank if vgm else 0
-        else:
-            self.seq_parallel_pg = None
-            self.seq_parallel_rank = 0
-
-        # Ulysses shards heads; Attention2D shards sequence — no head-count constraint for the latter.
-        if use_ulysses and model_type.is_video_enabled():
-            if num_attention_heads % ulysses_size != 0:
-                raise ValueError(
-                    f"num_attention_heads ({num_attention_heads}) "
-                    f"must be divisible by dit_ulysses_size ({ulysses_size})"
-                )
-        if use_ulysses and model_type.is_audio_enabled():
-            if audio_num_attention_heads % ulysses_size != 0:
-                raise ValueError(
-                    f"audio_num_attention_heads ({audio_num_attention_heads}) "
-                    f"must be divisible by dit_ulysses_size ({ulysses_size})"
-                )
+        # Validate video-head divisibility through the factory; audio heads
+        # are checked separately because the factory only accepts one count.
+        self._sharder = SequenceSharder.from_vgm(
+            vgm,
+            num_attention_heads=num_attention_heads if model_type.is_video_enabled() else None,
+        )
+        if (
+            self._sharder.is_active
+            and vgm is not None
+            and vgm.ulysses_size > 1
+            and model_type.is_audio_enabled()
+            and audio_num_attention_heads % vgm.ulysses_size != 0
+        ):
+            raise ValueError(
+                f"audio_num_attention_heads ({audio_num_attention_heads}) "
+                f"must be divisible by dit_ulysses_size ({vgm.ulysses_size})"
+            )
 
         self._audio_is_sharded = False
         self._cache_dit_video_args: Optional[TransformerArgs] = None
@@ -1163,46 +1140,31 @@ class LTXModel(nn.Module):
     # -- Sequence sharding / gathering ----------------------------------------
 
     def _shard_transformer_args(self, args: TransformerArgs) -> TransformerArgs:
-        """Shard sequence-dependent fields of *args* across sequence-parallel ranks."""
+        """Shard sequence-dependent fields of *args* across sequence-parallel ranks.
+
+        Fields whose dim-1 doesn't match ``args.x``'s sequence length are passed
+        through unchanged (broadcast-compatible scalars, etc.).
+        """
         seq_len = args.x.shape[1]
-        chunk = seq_len // self.seq_parallel_size
-        s = self.seq_parallel_rank * chunk
-        e = s + chunk
-
-        def _shard(t):
-            if t is None or t.ndim < 2 or t.shape[1] != seq_len:
-                return t
-            return t[:, s:e]
-
-        def _shard_pe(pe):
-            if pe is None:
-                return None
-            cos, sin = pe
-            if cos.ndim == 4 and cos.shape[2] == seq_len:
-                # Split RoPE: [B, H, S, D] — sequence dim at index 2
-                return (cos[:, :, s:e], sin[:, :, s:e])
-            elif cos.ndim == 3 and cos.shape[1] == seq_len:
-                # Interleaved RoPE: [B, S, D] — sequence dim at index 1
-                return (cos[:, s:e], sin[:, s:e])
-            return pe
-
+        sh = self._sharder
         return replace(
             args,
-            x=args.x[:, s:e],
-            timesteps=_shard(args.timesteps),
-            embedded_timestep=_shard(args.embedded_timestep),
-            positional_embeddings=_shard_pe(args.positional_embeddings),
-            cross_positional_embeddings=_shard_pe(args.cross_positional_embeddings),
-            cross_scale_shift_timestep=_shard(args.cross_scale_shift_timestep),
-            cross_gate_timestep=_shard(args.cross_gate_timestep),
+            x=sh.shard(args.x, dim=1),
+            timesteps=sh.shard(args.timesteps, dim=1, expected_seq_len=seq_len),
+            embedded_timestep=sh.shard(args.embedded_timestep, dim=1, expected_seq_len=seq_len),
+            positional_embeddings=sh.shard_rope(args.positional_embeddings, seq_len=seq_len),
+            cross_positional_embeddings=sh.shard_rope(
+                args.cross_positional_embeddings, seq_len=seq_len
+            ),
+            cross_scale_shift_timestep=sh.shard(
+                args.cross_scale_shift_timestep, dim=1, expected_seq_len=seq_len
+            ),
+            cross_gate_timestep=sh.shard(args.cross_gate_timestep, dim=1, expected_seq_len=seq_len),
         )
 
     def _gather_sequence(self, x: torch.Tensor) -> torch.Tensor:
         """All-gather hidden states along the sequence dim."""
-        x = x.contiguous()
-        gathered = [torch.empty_like(x) for _ in range(self.seq_parallel_size)]
-        dist.all_gather(gathered, x, group=self.seq_parallel_pg)
-        return torch.cat(gathered, dim=1)
+        return self._sharder.gather(x, dim=1)
 
     def configure_audio_ulysses(self, audio_seq_len: int) -> None:
         """Configure whether audio uses Ulysses based on sequence length.
@@ -1211,11 +1173,11 @@ class LTXModel(nn.Module):
         known.  The decision is cached — ``forward()`` uses it without
         re-checking.
         """
-        if not self.use_seq_parallel:
+        if not self._sharder.is_active:
             self._audio_is_sharded = False
             return
 
-        self._audio_is_sharded = audio_seq_len % self.seq_parallel_size == 0
+        self._audio_is_sharded = audio_seq_len % self._sharder.size == 0
         for block in self.transformer_blocks:
             target = block.inner if isinstance(block, LTX2CacheDiTPattern0BlockWrapper) else block
             target._audio_is_sharded = self._audio_is_sharded
@@ -1231,21 +1193,26 @@ class LTXModel(nn.Module):
         multi-rank operation; audio sharding will be reconfigured by
         the next :meth:`configure_audio_ulysses` call.
         """
-        if self.seq_parallel_size <= 1:
+        if self._sharder.size <= 1:
             return
 
-        self.use_seq_parallel = enabled
-        if not enabled:
+        if enabled:
+            self._sharder.enable()
+        else:
+            self._sharder.disable()
             self._audio_is_sharded = False
 
         for block in self.transformer_blocks:
-            block._use_seq_parallel = enabled
-            if not enabled:
-                block._audio_is_sharded = False
-            if hasattr(block, "attn1"):
-                block.attn1.set_ulysses_active(enabled)
-            if hasattr(block, "audio_attn1") and not enabled:
-                block.audio_attn1.set_ulysses_active(False)
+            target = block.inner if isinstance(block, LTX2CacheDiTPattern0BlockWrapper) else block
+            if enabled:
+                target._sharder.enable()
+            else:
+                target._sharder.disable()
+                target._audio_is_sharded = False
+            if hasattr(target, "attn1"):
+                target.attn1.set_ulysses_active(enabled)
+            if hasattr(target, "audio_attn1") and not enabled:
+                target.audio_attn1.set_ulysses_active(False)
 
     # -- Output processing ---------------------------------------------------
 
@@ -1361,10 +1328,10 @@ class LTXModel(nn.Module):
             else None
         )
 
-        # Shard sequences for parallelism (Ulysses head-sharding or Attention2D context parallelism).
+        # Shard sequences for parallelism (Ulysses head-sharding, ring CP, or Attention2D).
         # Video is always sharded.  Audio sharding is decided once by
         # configure_audio_ulysses() and cached in self._audio_is_sharded.
-        if self.use_seq_parallel:
+        if self._sharder.is_active:
             if video_args is not None:
                 video_args = self._shard_transformer_args(video_args)
             if self._audio_is_sharded and audio_args is not None:
@@ -1406,7 +1373,7 @@ class LTXModel(nn.Module):
         # Only gather embedded_timestep if it was actually sharded (dim-1
         # matches x); scalar timestep embeddings [B, 1, D] are
         # broadcast-compatible and must not be gathered.
-        if self.use_seq_parallel:
+        if self._sharder.is_active:
             if video_args is not None:
                 gathered_vx = self._gather_sequence(video_args.x)
                 v_et = video_args.embedded_timestep

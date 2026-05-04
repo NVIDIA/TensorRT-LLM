@@ -34,9 +34,10 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
 
     Parallelism Hierarchy:
         total_workers = cfg × sp
-        sp (sequence parallelism) = cp × ulysses  [mutually exclusive today; TODO to combine]
+        sp (sequence parallelism) = cp × ulysses
         cp (context parallelism)  = ring           [ring attention, 1D cp group]
-                                  | attn2d         [Attention2D 2D mesh, row_size × col_size]
+                                  | attn2d         [Attention2D 2D mesh, row_size × col_size.
+                                                    Cannot be combined with Ulysses right now.]
 
         cfg:     Splits positive/negative CFG prompts across GPUs (independent streams).
         tp:      Tensor parallelism all-reduce within tp groups.
@@ -82,19 +83,23 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
                 "Ring and Attention2D are mutually exclusive: both shard the sequence "
                 f"dimension. Got ring_size={ring_size}, attn2d={attn2d_row_size}x{attn2d_col_size}."
             )
-        cp_size = attn2d_size if attn2d_size > 1 else ring_size
-        if cp_size > 1 and ulysses_size > 1:
-            raise NotImplementedError(
-                "Combining CP and Ulysses is not yet supported. "
-                "They are orthogonal (CP shards sequence; Ulysses shards heads) "
-                "but the combined wrapper is not implemented."
-            )
-        if attn2d_size > 1 and tp_size > 1:
-            raise NotImplementedError(
-                "Combining Attention2D and TP is not yet supported. "
-                "The row/col group construction in _build_attn2d_groups does not account "
-                "for TP ranks."
-            )
+        if attn2d_size > 1:
+            cp_size = attn2d_size
+            if ulysses_size > 1:
+                raise NotImplementedError(
+                    "Combining Attention2D and Ulysses is not yet supported. "
+                    "They are orthogonal (Attention2D shards sequence; Ulysses shards heads) "
+                    "but the combined wrapper is not implemented."
+                )
+            if tp_size > 1:
+                raise NotImplementedError(
+                    "Combining Attention2D and TP is not yet supported. "
+                    "The row/col group construction in _build_attn2d_groups does not account "
+                    "for TP ranks."
+                )
+        else:
+            cp_size = ring_size
+
         product = cfg_size * tp_size * cp_size * ulysses_size
         if product != world_size:
             raise ValueError(
@@ -168,7 +173,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         # Combined sequence-parallel mesh (cp × ulysses) for token sharding (e.g. WAN).
         # ``_flatten`` is collective; every rank must call with the same dim names/order.
         # Requires ``cp`` and ``ulysses`` adjacent (default ``cfg-tp-cp-ulysses``).
-        if self.ring_size * self.ulysses_size > 1:
+        if self.cp_size * self.ulysses_size > 1:
             cp_idx = self._dim_names.index("cp")
             uly_idx = self._dim_names.index("ulysses")
             if abs(cp_idx - uly_idx) != 1:
@@ -312,26 +317,25 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
     # Attention2D is off).  This is the dimension along which the *input token
     # sequence* is sharded.  Ring and Ulysses then re-shard internally, but from
     # the transformer's point of view there is one group of size
-    # ``ring_size * ulysses_size``.
+    # ``cp_size * ulysses_size``.
     @property
     def seq_size(self) -> int:
-        return self.ring_size * self.ulysses_size
-
-    @property
-    def ring_rank(self) -> int:
-        """Rank along the CP (ring) mesh axis; ``cp_rank`` when ring uses the ``cp`` dim."""
-        return self.cp_rank
+        return self.cp_size * self.ulysses_size
 
     @property
     def seq_rank(self) -> int:
         # Must match the linearisation used by ``_flatten("cp", "ulysses")``:
         # cp is outer (slower-varying), ulysses is inner (faster-varying).
-        return self.ring_rank * self.ulysses_size + self.ulysses_rank
+        return self.cp_rank * self.ulysses_size + self.ulysses_rank
+
+    @property
+    def ring_rank(self) -> int:
+        return self.cp_rank
 
     @property
     def attn2d_mesh_rank(self) -> int:
         """Rank within the Attention2D CP group (same as cp_rank)."""
-        return self._local_rank("cp")
+        return self.cp_rank
 
     @property
     def is_cfg_conditional(self) -> bool:
@@ -367,8 +371,6 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
     @property
     def ring_group(self) -> Optional[ProcessGroup]:
         """Process group for RingAttention (1D ``cp`` mesh when ``ring_size > 1``)."""
-        if self.ring_size <= 1:
-            return None
         return self.cp_group
 
     @property
@@ -382,7 +384,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
     @property
     def attn2d_mesh_group(self) -> Optional[ProcessGroup]:
         """Full CP group for Attention2D (same as cp_group)."""
-        return self._group("cp")
+        return self.cp_group
 
     @property
     def vae_ranks(self) -> list[int]:
@@ -403,7 +405,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
             if self.world_size == 1:
                 return SingleProcessGroup.get_group()
             return None
-        if self.ring_size * self.ulysses_size == 1:
+        if self.cp_size * self.ulysses_size == 1:
             # Degenerate: single rank along both dims.  Fall back to the
             # ulysses group (equivalent at size-1) to keep call sites simple.
             return self._group("ulysses")
