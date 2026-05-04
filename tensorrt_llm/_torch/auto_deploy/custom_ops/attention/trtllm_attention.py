@@ -848,9 +848,20 @@ class TrtllmAttention(AttentionDescriptor):
         if source_attn_node.meta.get("_trtllm_fused_qkv"):
             num_kv_heads = source_attn_node.meta["_trtllm_num_kv_heads"]
             head_dim = source_attn_node.meta["_trtllm_head_dim"]
-            # Infer KV dtype from Q (fused QKV) tensor's meta, or default to bfloat16
-            q_meta = source_attn_node.args[0].meta.get("val")
-            kv_dtype = q_meta.dtype if q_meta is not None else torch.bfloat16
+            # KV dtype is captured by ``fuse_rope_into_trtllm_attention`` at
+            # fusion time (when V's meta is still trustworthy).  Fall back to
+            # reading the fused-QKV node's ``meta['val']`` only if it survived
+            # later transforms; otherwise fail loudly so the bug is visible.
+            kv_dtype = source_attn_node.meta.get("_trtllm_kv_dtype")
+            if kv_dtype is None:
+                q_node = source_attn_node.args[0]
+                q_meta = q_node.meta.get("val")
+                assert q_meta is not None, (
+                    f"fused-QKV attention node is missing both _trtllm_kv_dtype "
+                    f"and meta['val'] on its first input "
+                    f"({q_node.op}:{q_node.target}); cannot infer KV cache dtype"
+                )
+                kv_dtype = q_meta.dtype
         else:
             k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
             num_kv_heads = k_fake.shape[2]

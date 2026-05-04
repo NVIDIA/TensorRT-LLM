@@ -171,6 +171,12 @@ class FuseRopeIntoTrtllmAttention(BaseTransform):
         fused_qkv = _try_trace_to_fused_qkv(pre_rope_q, pre_rope_k, bind_v)
         if fused_qkv is not None:
             fused_qkv_node, num_heads, num_kv_heads, head_dim = fused_qkv
+            # Capture the KV dtype now, before V is overwritten and while shape
+            # propagation on these nodes is still trustworthy.  Subsequent
+            # transforms (e.g. fp8 GEMM rewrites) can drop ``meta['val']`` on
+            # the fused-QKV node, so we cannot rely on reading it back later.
+            kv_dtype_node = bind_v if bind_v.meta.get("val") is not None else pre_rope_k
+            kv_val = kv_dtype_node.meta.get("val")
             args_list = list(attn_node.args)
             args_list[0] = fused_qkv_node
             args_list[1] = fused_qkv_node
@@ -180,6 +186,8 @@ class FuseRopeIntoTrtllmAttention(BaseTransform):
             attn_node.meta["_trtllm_num_heads"] = num_heads
             attn_node.meta["_trtllm_num_kv_heads"] = num_kv_heads
             attn_node.meta["_trtllm_head_dim"] = head_dim
+            if kv_val is not None:
+                attn_node.meta["_trtllm_kv_dtype"] = kv_val.dtype
         return True
 
 
