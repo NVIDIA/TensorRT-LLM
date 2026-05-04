@@ -6,7 +6,7 @@ from unittest import mock
 import aiohttp
 import pytest
 
-from tensorrt_llm.llmapi.disagg_utils import RouterConfig
+from tensorrt_llm.llmapi.disagg_utils import RouterConfig, ServerRole
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionToolsParam,
                                                 CompletionRequest,
@@ -355,6 +355,78 @@ async def test_kv_cache_aware_router(servers, mock_aiohttp_session):
     # req2 routes to server_of[2] (full cache hit); others spread elsewhere
     assert final_servers[0] == server_of[2]
     assert len(set(final_servers)) == 3
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_context_uses_unused_servers_first(
+) -> None:
+    router = KvCacheAwareRouter(server_role=ServerRole.CONTEXT,
+                                servers=["server1", "server2", "server3"],
+                                use_tokens=False,
+                                max_batch_size=10,
+                                tokens_per_block=32)
+    token_ids = list(range(65))
+
+    first_request = CompletionRequest(model="TinyLlama", prompt=[token_ids])
+    first_server, first_info = await router.get_next_server(first_request)
+    await router.finish_request(first_request)
+    router._server_state[first_server].add_blocks(first_info["block_hashes"][0])
+
+    second_request = CompletionRequest(model="TinyLlama", prompt=[token_ids])
+    second_server, second_info = await router.get_next_server(second_request)
+    await router.finish_request(second_request)
+
+    third_request = CompletionRequest(model="TinyLlama", prompt=[token_ids])
+    third_server, third_info = await router.get_next_server(third_request)
+    await router.finish_request(third_request)
+
+    fourth_request = CompletionRequest(model="TinyLlama", prompt=[token_ids])
+    fourth_server, fourth_info = await router.get_next_server(fourth_request)
+    try:
+        assert first_server == "server1"
+        assert second_server == "server2"
+        assert third_server == "server3"
+        assert fourth_server == "server1"
+
+        assert second_info["matches"] == [64, 0, 0]
+        assert second_info["assignment_counts"] == [1, 0, 0]
+        assert second_info["unused_context_servers"] == ["server2", "server3"]
+        assert second_info["selection_reason"] == "unused_context_server"
+
+        assert third_info["unused_context_servers"] == ["server3"]
+        assert third_info["selection_reason"] == "unused_context_server"
+        assert fourth_info["unused_context_servers"] == []
+        assert fourth_info["selection_reason"] == "score"
+    finally:
+        await router.finish_request(fourth_request)
+
+
+@pytest.mark.asyncio
+async def test_kv_cache_aware_router_generation_keeps_score_priority() -> None:
+    router = KvCacheAwareRouter(server_role=ServerRole.GENERATION,
+                                servers=["server1", "server2", "server3"],
+                                use_tokens=False,
+                                max_batch_size=10,
+                                tokens_per_block=32)
+    token_ids = list(range(65))
+
+    warmup_request = CompletionRequest(model="TinyLlama", prompt=[[9999] * 65])
+    warmup_server, _ = await router.get_next_server(warmup_request)
+    await router.finish_request(warmup_request)
+
+    block_hashes = router._compute_block_hashes([token_ids])
+    router._server_state[warmup_server].add_blocks(block_hashes[0])
+
+    request = CompletionRequest(model="TinyLlama", prompt=[token_ids])
+    server, info = await router.get_next_server(request)
+    try:
+        assert warmup_server == "server1"
+        assert server == "server1"
+        assert info["matches"] == [64, 0, 0]
+        assert info["unused_context_servers"] == []
+        assert info["selection_reason"] == "score"
+    finally:
+        await router.finish_request(request)
 
 
 @pytest.mark.asyncio

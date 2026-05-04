@@ -195,6 +195,23 @@ class LoadBalancingMixin:
         return state._num_active_tokens if self._use_tokens \
             else state._num_active_requests
 
+    def _select_round_robin_tied(self, candidates: list[str]) -> str:
+        """Select the next candidate using a stable server-ring pointer."""
+        if not candidates:
+            raise ValueError("No tied candidates available")
+
+        ordered_servers = list(self._server_state)
+        candidate_set = set(candidates)
+        start = self._rr_counter % len(ordered_servers)
+        for offset in range(len(ordered_servers)):
+            index = (start + offset) % len(ordered_servers)
+            server = ordered_servers[index]
+            if server in candidate_set:
+                self._rr_counter = index + 1
+                return server
+
+        raise ValueError("No tied candidate is present in server state")
+
     def _validate_servers_available(self):
         if not self._servers:
             if self._metadata_server:
@@ -842,11 +859,23 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         self._init_load_balancing(servers, use_tokens)
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size
+        self._num_assigned_requests_by_server: dict[str, int] = {
+            server: 0
+            for server in servers or []
+        }
 
     def _create_server_state(self, server: str) -> KvCacheAwareServerState:
         return KvCacheAwareServerState(server, self._use_tokens,
                                        self._tokens_per_block,
                                        lambda: self.session)
+
+    def _get_unused_context_servers(self, servers: list[str]) -> list[str]:
+        if self._server_role != ServerRole.CONTEXT:
+            return []
+        return [
+            server for server in servers
+            if self._num_assigned_requests_by_server.get(server, 0) == 0
+        ]
 
     async def get_next_server(
             self,
@@ -875,6 +904,10 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             state.num_active_requests()
             for state in self._server_state.values()
         ]
+        assignment_counts = [
+            self._num_assigned_requests_by_server.get(server, 0)
+            for server in servers
+        ]
         scores = []
         matches = []
         for i in range(len(servers)):
@@ -887,15 +920,25 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             scores.append(score)
         max_score = max(scores)
         tied = [i for i, s in enumerate(scores) if s == max_score]
-        winner = tied[self._rr_counter % len(tied)]
-        self._rr_counter += 1
-        server = servers[winner]
         async with self._lock:
+            unused_context_servers = self._get_unused_context_servers(servers)
+            if unused_context_servers:
+                server = self._select_round_robin_tied(unused_context_servers)
+                selection_reason = "unused_context_server"
+            else:
+                tied_servers = [servers[i] for i in tied]
+                server = self._select_round_robin_tied(tied_servers)
+                selection_reason = "score"
             await self._register_request(server, request)
+            self._num_assigned_requests_by_server[server] = (
+                self._num_assigned_requests_by_server.get(server, 0) + 1)
         return server, {
             "block_hashes": block_hashes,  # list[list[int]]
             "token_lists": token_lists,  # list[list[int]]
             "matches": matches,  # list[int]
+            "assignment_counts": assignment_counts,  # list[int]
+            "unused_context_servers": unused_context_servers,  # list[str]
+            "selection_reason": selection_reason,
             "server_info": self._server_info.get(server, {}),
         }
 
@@ -913,6 +956,10 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             new_state[server] = (self._server_state.get(server)
                                  or self._create_server_state(server))
         self._server_state = new_state
+        self._num_assigned_requests_by_server = {
+            server: self._num_assigned_requests_by_server.get(server, 0)
+            for server in new_servers
+        }
 
 
 class _BlockHashTrie:
