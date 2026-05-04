@@ -332,6 +332,11 @@ class PyExecutor:
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
         self.sampler = sampler
+        # When using TRTLLMSampler, beam search logits processing is handled
+        # by the sampler with coherent per-beam token histories from parentIds
+        # tracing. Tell model_engine to skip its own beam search logits processing.
+        if isinstance(sampler, TRTLLMSampler):
+            model_engine.skip_beam_search_logits_processing = True
         self.drafter = drafter
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
                                           None)

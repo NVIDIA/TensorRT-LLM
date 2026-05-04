@@ -153,6 +153,9 @@ class PyTorchModelEngine(ModelEngine):
     ):
         self.forward_pass_callable = None
         self.ub_buffers = None
+        # Set to True by PyExecutor when TRTLLMSampler handles beam search
+        # logits processing with coherent per-beam token histories.
+        self.skip_beam_search_logits_processing = False
         (
             max_beam_width,
             max_num_tokens,
@@ -3983,7 +3986,9 @@ class PyTorchModelEngine(ModelEngine):
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
 
-            self._execute_logit_post_processors(scheduled_requests, outputs)
+            self._execute_logit_post_processors(
+                scheduled_requests, outputs,
+                skip_beam_search=self.skip_beam_search_logits_processing)
 
             return outputs
 
@@ -4142,8 +4147,15 @@ class PyTorchModelEngine(ModelEngine):
 
     def _execute_logit_post_processors(self,
                                        scheduled_requests: ScheduledRequests,
-                                       outputs: dict):
-        """Apply logit post processors (in-place modify outputs Tensors) if any."""
+                                       outputs: dict,
+                                       skip_beam_search: bool = False):
+        """Apply logit post processors (in-place modify outputs Tensors) if any.
+
+        Args:
+            skip_beam_search: When True, skip requests with beam_width > 1.
+                These will be handled by TRTLLMSampler._apply_logits_post_processors_for_beams
+                which has access to coherent per-beam token histories via parentIds tracing.
+        """
 
         if not (self.mapping.is_last_pp_rank()):
             return
@@ -4159,6 +4171,12 @@ class PyTorchModelEngine(ModelEngine):
             logits_processors = getattr(request, "py_logits_post_processors",
                                         None)
             if not logits_processors:
+                continue
+
+            # When using TRTLLMSampler with beam search, skip beam search
+            # requests here — they are handled by the sampler with coherent
+            # per-beam token histories from parentIds tracing.
+            if skip_beam_search and request.sampling_config.beam_width > 1:
                 continue
 
             token_ids = request.get_tokens(0)
