@@ -3387,6 +3387,50 @@ TEST_P(KVCacheManagerTest, KVCacheManagerTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), 0);
 }
 
+TEST_F(KVCacheManagerTest, SchedulingRemoveSequenceIgnoresAlreadyRemovedSequence)
+{
+    auto constexpr numLayers = 1;
+    auto constexpr numKvHeads = 1;
+    auto constexpr sizePerHead = 8;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr totalNumBlocks = 16;
+    auto constexpr blocksInSecondaryPool = 0;
+    auto constexpr maxNumSequences = 2;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr sinkTokenLength = 0;
+    auto constexpr maxSequenceLength = 16;
+    auto constexpr maxAttentionWindow = maxSequenceLength;
+    auto constexpr requestId = 17;
+    auto constexpr inputLength = 8;
+    auto constexpr maxNewTokens = 0;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {totalNumBlocks, blocksInSecondaryPool}}};
+    tr::SamplingConfig const samplingConfig{maxBeamWidth};
+    bool constexpr isStreaming{false};
+
+    auto inputTokens = std::make_shared<VecTokens>();
+    for (SizeType32 token = 0; token < inputLength; ++token)
+    {
+        inputTokens->push_back(token);
+    }
+
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt,
+        nvinfer1::DataType::kHALF, sinkTokenLength, stream, maxSequenceLength, false);
+    kvCacheManager.allocatePools(false);
+
+    auto llmRequest = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{requestId}, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    EXPECT_NO_THROW(
+        kvCacheManager.addSequenceBatch({{{requestId, inputLength, maxBeamWidth}}}, {std::ref(*llmRequest)}));
+
+    kvCacheManager.startScheduling();
+    EXPECT_NO_THROW(kvCacheManager.schedulingRemoveSequence(requestId));
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId)));
+    EXPECT_NO_THROW(kvCacheManager.schedulingRemoveSequence(requestId));
+    EXPECT_NO_THROW(kvCacheManager.schedulingRemoveSequence(requestId + 1));
+}
+
 TEST_P(KVCacheManagerTest, KVCacheManagerRewindTokensTest)
 {
     using DType = half;
