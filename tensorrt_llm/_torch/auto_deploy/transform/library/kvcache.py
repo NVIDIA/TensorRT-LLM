@@ -18,7 +18,7 @@
 
 import inspect
 import operator
-from typing import List, Optional, Tuple, Type
+from typing import Dict, List, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
@@ -144,6 +144,7 @@ class _InsertCachedOperator(BaseTransform):
         meta_nodes_extra: List[Node],
         cache_nodes: List[Node],
         constants: List[Constant],
+        cache_kwarg_nodes: Optional[Dict[str, Node]] = None,
     ):
         """Insert a cached attention node into the graph."""
         with gm.graph.inserting_before(attn_node):
@@ -156,6 +157,7 @@ class _InsertCachedOperator(BaseTransform):
                     *cache_nodes,
                     *constants,
                 ),
+                kwargs=cache_kwarg_nodes or {},
             )
         attn_node.replace_all_uses_with(cached_attn_node)
         gm.graph.erase_node(attn_node)
@@ -224,11 +226,18 @@ class _InsertCachedOperator(BaseTransform):
                         "Each non-shared attention layer must own exactly one cache."
                     )
                 cache_in_nodes = []
+                cache_kwarg_nodes = {}
+                kwarg_keys = attn_descriptor.get_kwarg_cache_keys()
                 for k, resource_handler in attn_descriptor.get_cache_initializers(
                     attn_node, cm.kv_cache_config
                 ).items():
                     resource_name = cm.add_resource(k, resource_handler)
-                    cache_in_nodes.append(self._process_cache_node(gm, resource_name))
+                    node = self._process_cache_node(gm, resource_name)
+                    if k in kwarg_keys:
+                        # Pass as named kwarg to call_function (e.g. replay args after constants)
+                        cache_kwarg_nodes[k] = node
+                    else:
+                        cache_in_nodes.append(node)
                 if layer_idx is not None:
                     cache_nodes_by_layer_idx[layer_idx] = cache_in_nodes
 
@@ -248,6 +257,7 @@ class _InsertCachedOperator(BaseTransform):
                 meta_nodes_extra,
                 cache_in_nodes,
                 constants,
+                cache_kwarg_nodes,
             )
 
             num_cached_attn_replacements += 1

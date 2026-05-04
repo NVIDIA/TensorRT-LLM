@@ -50,10 +50,9 @@ transforms:
   fuse_mamba_a_log:
     stage: post_load_fusion
     enabled: true
-  # Triton SSM + causal conv are required for MTP as currently they are the only backends
-  # that support speculative mamba state caching.
   insert_cached_ssm_attention:
     backend: flashinfer_ssm
+    ssm_replay: true
   insert_cached_causal_conv:
     backend: triton_causal_conv
   fuse_nvfp4_moe:
