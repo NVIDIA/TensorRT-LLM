@@ -15,7 +15,7 @@ from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import (Annotated, Any, AsyncGenerator, AsyncIterator, List,
-                    Optional, Union)
+                    Optional, Sequence, Union)
 
 import uvicorn
 from fastapi import Body, FastAPI, Request
@@ -187,7 +187,7 @@ class OpenAIServer:
     def __init__(
             self,
             generator: Union[LLM, MultimodalEncoder, VisualGen],
-            model: str,
+            model: Union[str, Sequence[str]],
             tool_parser: Optional[str],
             server_role: Optional[ServerRole],
             metadata_server_cfg: MetadataServerConfig,
@@ -206,11 +206,7 @@ class OpenAIServer:
         self.host = None
         self.port = None
 
-        model_dir = Path(model)
-        if model_dir.exists() and model_dir.is_dir():
-            self.model = model_dir.name
-        else:
-            self.model = model
+        self.model, self.served_model_names = self._normalize_model_names(model)
         self.metrics_collector = None
         self.perf_metrics = None
         self.perf_metrics_lock = None
@@ -748,7 +744,7 @@ class OpenAIServer:
                     "role": "user",
                     "content": "hi"
                 }],  # Minimal prompt (often > 1 token after tokenization)
-                model=self.model,
+                model=self.model,  # Use primary model name for health checks
                 max_completion_tokens=1,  # Request only 1 token out
                 stream=False,
                 temperature=0.0,  # Deterministic output
@@ -785,8 +781,63 @@ class OpenAIServer:
         ver = {"version": VERSION}
         return JSONResponse(content=ver)
 
+    @staticmethod
+    def _normalize_model_names(
+            names: Union[str, Sequence[str]]) -> tuple[str, list[str]]:
+        """Return (primary, aliases) from a sequence of names.
+
+        If the first name points to an existing directory, its basename
+        becomes the primary and the original path is kept as an alias so
+        clients that launched the server by path can still address it.
+        Duplicates are removed while preserving order.
+
+        A bare ``str`` is accepted as a convenience for callers that still
+        pass a single name; it is treated as ``[name]``.
+        """
+        if isinstance(names, str):
+            names = [names]
+        first = names[0] if names else ""
+        model_dir = Path(first) if first else None
+        if model_dir is not None and model_dir.exists() and model_dir.is_dir():
+            candidates = [model_dir.name, first, *names[1:]]
+        else:
+            candidates = list(names)
+        seen: set[str] = set()
+        aliases: list[str] = []
+        for n in candidates:
+            if n and n not in seen:
+                seen.add(n)
+                aliases.append(n)
+        if not aliases:
+            raise ValueError(
+                "served model names must contain at least one non-empty name")
+        return aliases[0], aliases
+
+    def _is_model_supported(self, model_name: Optional[str]) -> bool:
+        """Return True if ``model_name`` is unset or matches a registered name.
+
+        Falsy values (``None`` and ``""``) are treated as "unspecified" and
+        accepted — clients that omit the field still get a response. Only
+        explicit unknown names are rejected by :meth:`_check_model`.
+        """
+        if not model_name:
+            return True
+        return model_name in self.served_model_names
+
+    def _check_model(self, request: Any) -> Optional[Response]:
+        """Return a 404 Response if ``request.model`` is not a registered name, else None."""
+        model_name = getattr(request, "model", None)
+        if self._is_model_supported(model_name):
+            return None
+        return self.create_error_response(
+            message=f"The model `{model_name}` does not exist.",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
+
     async def get_model(self) -> JSONResponse:
-        model_list = ModelList(data=[ModelCard(id=self.model)])
+        model_list = ModelList(
+            data=[ModelCard(id=name) for name in self.served_model_names])
         return JSONResponse(content=model_list.model_dump())
 
     async def get_iteration_stats(self) -> JSONResponse:
@@ -1021,6 +1072,9 @@ class OpenAIServer:
 
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
+        error_check_ret = self._check_model(request)
+        if error_check_ret is not None:
+            return error_check_ret
 
         def get_role() -> str:
             if request.add_generation_prompt:
@@ -1086,6 +1140,9 @@ class OpenAIServer:
                     if strict_guided is not None:
                         sampling_params.guided_decoding = strict_guided
             postproc_args = ChatPostprocArgs.from_request(request)
+            # Always report the primary name in responses; streaming inherits
+            # this via postproc_args.
+            postproc_args.model = self.model
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
 
@@ -1185,6 +1242,9 @@ class OpenAIServer:
 
     async def openai_mm_encoder(self, request: ChatCompletionRequest,
                                 raw_request: Request) -> Response:
+        error_check_ret = self._check_model(request)
+        if error_check_ret is not None:
+            return error_check_ret
 
         async def create_mm_embedding_response(promise: RequestOutput):
             await promise.aresult()
@@ -1282,6 +1342,9 @@ class OpenAIServer:
 
     async def openai_completion(self, request: CompletionRequest,
                                 raw_request: Request) -> Response:
+        error_check_ret = self._check_model(request)
+        if error_check_ret is not None:
+            return error_check_ret
 
         async def completion_response(
                 promise: RequestOutput,
@@ -1411,6 +1474,7 @@ class OpenAIServer:
                 request.disaggregated_params)
             for idx, prompt in enumerate(prompts):
                 postproc_args = CompletionPostprocArgs.from_request(request)
+                postproc_args.model = self.model
                 postproc_args.prompt_idx = idx
                 if request.echo:
                     postproc_args.prompt = prompt
@@ -1485,6 +1549,9 @@ class OpenAIServer:
         Chat Completion API with harmony format support.
         Supports both streaming and non-streaming modes.
         """
+        error_check_ret = self._check_model(request)
+        if error_check_ret is not None:
+            return error_check_ret
 
         async def create_streaming_generator(promise: RequestOutput,
                                              postproc_params: PostprocParams):
@@ -1543,6 +1610,7 @@ class OpenAIServer:
                              tracing.extract_trace_headers(raw_request.headers))
 
             postproc_args = ChatCompletionPostprocArgs.from_request(request)
+            postproc_args.model = self.model
             postproc_params = PostprocParams(
                 post_processor=chat_harmony_streaming_post_processor
                 if request.stream else chat_harmony_post_processor,
@@ -1584,6 +1652,9 @@ class OpenAIServer:
 
     async def openai_responses(self, request: ResponsesRequest,
                                raw_request: Request) -> Response:
+        error_check_ret = self._check_model(request)
+        if error_check_ret is not None:
+            return error_check_ret
 
         async def create_response(
                 promise: RequestOutput,
@@ -1793,6 +1864,9 @@ class OpenAIServer:
 
         Follows the OpenAI Images API specification for image generation.
         """
+        error_check_ret = self._check_model(request)
+        if error_check_ret is not None:
+            return error_check_ret
         try:
             image_id = f"image_{uuid.uuid4().hex}"
             params = parse_visual_gen_params(request, image_id, self.generator)
@@ -1850,6 +1924,9 @@ class OpenAIServer:
         Follows the OpenAI Images API specification for image editing.
         Creates an edited or extended image given an original image and a prompt.
         """
+        error_check_ret = self._check_model(request)
+        if error_check_ret is not None:
+            return error_check_ret
         try:
             image_id = f"image_{uuid.uuid4().hex}"
             params = parse_visual_gen_params(request, image_id, self.generator)
@@ -1905,6 +1982,9 @@ class OpenAIServer:
         try:
             # Parse request based on content-type
             request = await self._parse_video_generation_request(raw_request)
+            error_check_ret = self._check_model(request)
+            if error_check_ret is not None:
+                return error_check_ret
 
             # Resolve the video encode format (mp4/avi/auto)
             resolved_fmt, resolved_ext = resolve_video_format(
@@ -2036,6 +2116,9 @@ class OpenAIServer:
         try:
             # Parse request based on content-type
             request = await self._parse_video_generation_request(raw_request)
+            error_check_ret = self._check_model(request)
+            if error_check_ret is not None:
+                return error_check_ret
 
             video_id = f"video_{uuid.uuid4().hex}"
             params = parse_visual_gen_params(request,
@@ -2059,7 +2142,7 @@ class OpenAIServer:
             video_job = VideoJob(
                 created_at=int(time.time()),
                 id=video_id,
-                model=request.model or self.model,
+                model=self.model,
                 prompt=request.prompt,
                 status="queued",
                 duration=request.seconds,

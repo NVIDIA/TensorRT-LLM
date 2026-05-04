@@ -178,7 +178,7 @@ def _create_server(generator: MockVisualGen, model_name: str = "test-model") -> 
     with patch("tensorrt_llm.serve.openai_server.VisualGen", MockVisualGen):
         server = OpenAIServer(
             generator=generator,
-            model=model_name,
+            model=[model_name],
             tool_parser=None,
             server_role=ServerRole.VISUAL_GEN,
             metadata_server_cfg=None,

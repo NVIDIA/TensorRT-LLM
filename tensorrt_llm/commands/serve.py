@@ -267,6 +267,42 @@ def get_llm_args(
     return llm_args, llm_args_extra_dict
 
 
+def _split_served_model_names(ctx, param, value):
+    """Flatten comma-separated --served_model_name values.
+
+    Click options can't use argparse-style ``nargs="+"``, so this callback
+    lets users pass comma-separated names in a single flag or repeat the flag.
+    All of these produce the same tuple ("a", "b", "c"):
+
+      --served_model_name a --served_model_name b --served_model_name c
+      --served_model_name a,b,c
+      --served_model_name a,b --served_model_name c
+    """
+    if not value:
+        return value
+    out: list[str] = []
+    for v in value:
+        out.extend(p.strip() for p in v.split(",") if p.strip())
+    return tuple(out)
+
+
+def _resolve_served_model_names(served_model_name: Optional[Sequence[str]],
+                                llm_args: dict) -> list[str]:
+    """Normalize click's ``--served_model_name`` into a non-empty list.
+
+    Drops empty strings (click passes ``""`` through for unset flags),
+    deduplicates while preserving order, and falls back to
+    ``llm_args["model"]`` when no explicit name is provided.
+    """
+    seen: set[str] = set()
+    names: list[str] = []
+    for n in (served_model_name or []):
+        if n and n not in seen:
+            seen.add(n)
+            names.append(n)
+    return names or [llm_args["model"]]
+
+
 def launch_server(
         host: str,
         port: int,
@@ -277,10 +313,11 @@ def launch_server(
         server_role: Optional[ServerRole] = None,
         disagg_cluster_config: Optional[DisaggClusterConfig] = None,
         multimodal_server_config: Optional[MultimodalServerConfig] = None,
-        served_model_name: Optional[str] = None):
+        served_model_name: Optional[Sequence[str]] = None):
 
     backend = llm_args["backend"]
-    model = served_model_name or llm_args["model"]
+    served_model_names = _resolve_served_model_names(served_model_name,
+                                                     llm_args)
     addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
                                    socket.SOCK_STREAM)
     address_family = socket.AF_INET6 if all(
@@ -313,7 +350,7 @@ def launch_server(
                 param_hint="backend")
 
         server = OpenAIServer(generator=llm,
-                              model=model,
+                              model=served_model_names,
                               tool_parser=tool_parser,
                               server_role=server_role,
                               metadata_server_cfg=metadata_server_cfg,
@@ -331,7 +368,7 @@ def launch_server(
 def launch_grpc_server(host: str,
                        port: int,
                        llm_args: dict,
-                       served_model_name: Optional[str] = None):
+                       served_model_name: Optional[Sequence[str]] = None):
     """
     Launch a gRPC server for TensorRT-LLM.
 
@@ -342,7 +379,9 @@ def launch_grpc_server(host: str,
         host: Host to bind to
         port: Port to bind to
         llm_args: Arguments for LLM initialization (from get_llm_args)
-        served_model_name: Custom model name for API responses (defaults to model path)
+        served_model_name: Model name(s) for API responses (defaults to model path).
+            Note: the gRPC server only uses the first (primary) name. Multiple
+            aliases are supported by the HTTP/OpenAI server only.
     """
     import grpc
 
@@ -360,7 +399,8 @@ def launch_grpc_server(host: str,
         logger.info("Initializing TensorRT-LLM gRPC server...")
 
         backend = llm_args.get("backend")
-        model_path = served_model_name or llm_args.get("model", "")
+        names = [n for n in (served_model_name or []) if n]
+        model_path = names[0] if names else llm_args.get("model", "")
 
         if backend == "pytorch":
             llm_args.pop("build_config", None)
@@ -463,7 +503,7 @@ def launch_mm_encoder_server(
     mm_encoder = MultimodalEncoder(**encoder_args)
 
     server = OpenAIServer(generator=mm_encoder,
-                          model=model,
+                          model=[model],
                           server_role=ServerRole.MM_ENCODER,
                           metadata_server_cfg=metadata_server_cfg,
                           tool_parser=None)
@@ -497,7 +537,7 @@ def launch_visual_gen_server(
         f"Ulysses size: {visual_gen_model.args.parallel.dit_ulysses_size}")
 
     server = OpenAIServer(generator=visual_gen_model,
-                          model=model,
+                          model=[model],
                           server_role=ServerRole.VISUAL_GEN,
                           metadata_server_cfg=metadata_server_cfg,
                           tool_parser=None)
@@ -782,11 +822,16 @@ class ChoiceWithAlias(click.Choice):
 @click.option(
     "--served_model_name",
     type=str,
+    multiple=True,
+    callback=_split_served_model_names,
     default=None,
     help=help_info_with_stability_tag(
-        "The model name used in the API. If not specified, the model path is "
-        "used as the model name. This is useful when the model path is long or "
-        "when you want to expose a custom name to clients.", "prototype"))
+        "The model name(s) used in the API. Accepts repeated flags "
+        "(`--served_model_name a --served_model_name b`) or comma-separated "
+        "values (`--served_model_name a,b,c`); the server accepts requests "
+        "addressed to any of them. The first name is primary and is returned "
+        "in the `model` field of responses. If not specified, the model path "
+        "is used.", "prototype"))
 @click.option("--extra_visual_gen_options",
               type=str,
               default=None,
@@ -810,8 +855,8 @@ def serve(
         enable_attention_dp: bool, disagg_cluster_uri: Optional[str],
         media_io_kwargs: Optional[str], video_pruning_rate: Optional[float],
         telemetry: bool, custom_module_dirs: list[Path],
-        chat_template: Optional[str], grpc: bool,
-        served_model_name: Optional[str],
+        chat_template: Optional[str], grpc: bool, served_model_name: tuple[str,
+                                                                           ...],
         extra_visual_gen_options: Optional[str]):
     """Running an OpenAI API compatible server
 

@@ -26,7 +26,7 @@ def llm():
 @pytest.fixture(scope="module")
 def client(llm):
     app_instance = OpenAIServer(llm,
-                                model=llama_model_path,
+                                model=[llama_model_path],
                                 tool_parser=None,
                                 server_role=None,
                                 metadata_server_cfg=None)
