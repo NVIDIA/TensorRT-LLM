@@ -273,6 +273,7 @@ public:
     [[nodiscard]] bool hasLoadRemoteAgent() const;
     void sendReadySignal(DataContext const& ctx, bool isReady) const;
     bool recvReadySignal(DataContext const& ctx) const;
+    std::optional<bool> recvReadySignalWithStatus(DataContext const& ctx) const;
 
     void activateBuffer(uint8_t kind) const override;
     [[nodiscard]] std::optional<size_t> getPreAssignedBufferId(uint8_t kind) const override;

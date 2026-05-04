@@ -863,28 +863,45 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             auto elapsedMs = static_cast<long>(elapsed.count());
             if (elapsedMs > kvTransferTimeoutMs.value())
             {
-                TLLM_LOG_WARNING(
-                    "Generation KV cache transfer for request %ld exceeded total timeout: "
-                    "elapsed %ld ms > limit %d ms. Marking as error.",
-                    request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
-                // Erasing the std::future<void> from mRequesterFutures only
-                // destroys the Python-facing handle; the std::async task
-                // spawned by CacheReceiver::receiveAsync is still running,
-                // blocked inside recvReadySignal waiting on a peer signal
-                // that will never arrive. Over a saturation window these
-                // zombies accumulate and pin NIXL/UCX per-request state, so
-                // subsequent receives queue behind a frozen pool and every
-                // new transfer deterministically waits kv_transfer_timeout_ms
-                // even after load stops (the "no-recovery" bug). Call
-                // cancelRequest to flip the per-request cancel flag in
-                // CacheReceiver::Impl, which the notification polling loop
-                // observes via the DataContext and returns early with
-                // isReady=false. requestSync then takes the
-                // kDISAGG_TRANS_ERROR branch and the task exits cleanly.
-                mCacheReceiver->cancelRequest(*request);
-                request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
-                it = mRequesterFutures.erase(it);
-                ++numErrored;
+                bool const firstTimeout = mTimedOutRequesterIds.insert(request->mRequestId).second;
+                if (firstTimeout)
+                {
+                    TLLM_LOG_WARNING(
+                        "Generation KV cache transfer for request %ld exceeded total timeout: "
+                        "elapsed %ld ms > limit %d ms. Requesting cancellation.",
+                        request->mRequestId, elapsedMs, kvTransferTimeoutMs.value());
+                    // cancelRequest requests worker unwind, but it is not a
+                    // quiescence proof. Keep the future tracked until the
+                    // worker future becomes ready, otherwise Python could
+                    // free KV resources while the worker/transport may still
+                    // reference the advertised buffers.
+                    mCacheReceiver->cancelRequest(*request);
+                }
+                if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+                {
+                    try
+                    {
+                        future.get();
+                    }
+                    catch (std::exception const& e)
+                    {
+                        TLLM_LOG_WARNING(
+                            "Generation KV cache transfer for timed-out request %ld finished with error: %s",
+                            request->mRequestId, e.what());
+                    }
+                    request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                    mTimedOutRequesterIds.erase(request->mRequestId);
+                    it = mRequesterFutures.erase(it);
+                    ++numErrored;
+                }
+                else
+                {
+                    if (firstTimeout)
+                    {
+                        ++numErrored;
+                    }
+                    ++it;
+                }
                 continue;
             }
         }
@@ -898,9 +915,20 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                 if (status == std::future_status::ready)
                 {
                     future.get();
-                    completeEntry(request);
+                    if (request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR)
+                    {
+                        TLLM_LOG_WARNING(
+                            "Generation KV cache transfer for request %ld finished after an error state was set.",
+                            request->mRequestId);
+                        ++numErrored;
+                    }
+                    else
+                    {
+                        completeEntry(request);
+                        ++numCompleted;
+                    }
+                    mTimedOutRequesterIds.erase(request->mRequestId);
                     it = mRequesterFutures.erase(it);
-                    ++numCompleted;
                 }
                 else if (status == std::future_status::timeout)
                 {
@@ -924,9 +952,20 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                         // so the per-iteration poll timeout can drive the deadline
                         // check each tick.
                         future.get();
-                        completeEntry(request);
+                        if (request->getState() == LlmRequestState::kDISAGG_TRANS_ERROR)
+                        {
+                            TLLM_LOG_WARNING(
+                                "Generation KV cache transfer for request %ld finished after an error state was set.",
+                                request->mRequestId);
+                            ++numErrored;
+                        }
+                        else
+                        {
+                            completeEntry(request);
+                            ++numCompleted;
+                        }
+                        mTimedOutRequesterIds.erase(request->mRequestId);
                         it = mRequesterFutures.erase(it);
-                        ++numCompleted;
                     }
                 }
                 else
@@ -934,6 +973,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                     TLLM_LOG_ERROR("Future returned unexpected status for generation request %ld. Marking as error.",
                         request->mRequestId);
                     request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                    mTimedOutRequesterIds.erase(request->mRequestId);
                     it = mRequesterFutures.erase(it);
                     ++numErrored;
                 }
@@ -948,6 +988,7 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
                 TLLM_LOG_WARNING("Error during generation transfer for request %ld: %s. Marking as error.",
                     request->mRequestId, e.what());
                 request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                mTimedOutRequesterIds.erase(request->mRequestId);
                 it = mRequesterFutures.erase(it);
                 ++numErrored;
             }

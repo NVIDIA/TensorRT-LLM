@@ -21,10 +21,27 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/opUtils.h"
 
+#include <exception>
 #include <mutex>
 
 namespace tensorrt_llm::batch_manager
 {
+
+namespace
+{
+
+char const* bufferKindName(BufferKind kind)
+{
+    switch (kind)
+    {
+    case BufferKind::kKV: return "kv";
+    case BufferKind::kKV_INDEXER: return "kv_indexer";
+    case BufferKind::kRNN: return "rnn";
+    }
+    return "unknown";
+}
+
+} // namespace
 
 void BufferIndexHolder::release() noexcept
 {
@@ -52,6 +69,31 @@ void BufferIndexHolder::release() noexcept
         // Swallow; the destructor must be noexcept and any exit path that
         // failed to release explicitly relies on this fallback to free the
         // slot.
+    }
+    mHeld = false;
+}
+
+void BufferIndexHolder::poison() noexcept
+{
+    if (!mHeld || mMgr == nullptr)
+    {
+        return;
+    }
+    try
+    {
+        if (mIsRecv)
+        {
+            mMgr->poisonBufferIndexForRecv(mIndex);
+        }
+        else
+        {
+            mMgr->poisonBufferIndexForSend(mIndex);
+        }
+    }
+    catch (...)
+    {
+        // poisonBufferIndex is noexcept; keep this as belt-and-suspenders so
+        // fail-closed cleanup cannot throw from an exception path.
     }
     mHeld = false;
 }
@@ -96,6 +138,11 @@ void BaseTransBufferManager::freeBufferIndexForSend(std::optional<int> bufferId)
     freeBufferIndex(mConcurrenceSendResource, bufferId, mSendBufferCount, mOnlyUseDynamicBuffer);
 }
 
+void BaseTransBufferManager::poisonBufferIndexForSend(std::optional<int> bufferId) noexcept
+{
+    poisonBufferIndex(mConcurrenceSendResource, bufferId, mSendBufferCount, mOnlyUseDynamicBuffer, "send");
+}
+
 std::optional<int> BaseTransBufferManager::assignBufferIndexForRecv(
     std::atomic<bool> const* perRequestCancel, int64_t waitSliceMs, std::optional<uint64_t> requestIdForLog)
 {
@@ -106,6 +153,11 @@ std::optional<int> BaseTransBufferManager::assignBufferIndexForRecv(
 void BaseTransBufferManager::freeBufferIndexForRecv(std::optional<int> bufferId)
 {
     freeBufferIndex(mConcurrenceRecvResource, bufferId, mRecvBufferCount, mOnlyUseDynamicBuffer);
+}
+
+void BaseTransBufferManager::poisonBufferIndexForRecv(std::optional<int> bufferId) noexcept
+{
+    poisonBufferIndex(mConcurrenceRecvResource, bufferId, mRecvBufferCount, mOnlyUseDynamicBuffer, "recv");
 }
 
 std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> BaseTransBufferManager::getOrAllocateSendBuffers(
@@ -265,6 +317,10 @@ std::optional<int> BaseTransBufferManager::assignBufferIndex(ConcurrenceResource
 {
     if (onlyUseDynamicBuffer)
     {
+        TLLM_CHECK_WITH_INFO(!resource.mPoisoned.load(std::memory_order_relaxed),
+            "Cannot assign dynamic cache transfer buffer kind=%s because a previous transfer left dynamic transfer "
+            "memory poisoned. The process must restart before these memory ranges can be safely reused.",
+            bufferKindName(getBufferKind()));
         return std::nullopt;
     }
     // Bounded wait_for loop so a cancel fired on this request while parked
@@ -272,8 +328,11 @@ std::optional<int> BaseTransBufferManager::assignBufferIndex(ConcurrenceResource
     // mTerminate (flipped between slices) keeps the drain worker responsive
     // to shutdown.
     std::unique_lock lk(resource.mBuffersMutex);
-    auto const predicate
-        = [&resource, bufferCount]() { return static_cast<size_t>(resource.mConcurrence) < bufferCount; };
+    auto const predicate = [&resource, bufferCount]()
+    {
+        return resource.mPoisoned.load(std::memory_order_relaxed)
+            || static_cast<size_t>(resource.mConcurrence) < bufferCount;
+    };
     if (!predicate())
     {
         auto const slice = std::chrono::milliseconds{waitSliceMs};
@@ -288,6 +347,10 @@ std::optional<int> BaseTransBufferManager::assignBufferIndex(ConcurrenceResource
             }
         }
     }
+    TLLM_CHECK_WITH_INFO(!resource.mPoisoned.load(std::memory_order_relaxed),
+        "Cannot assign cache transfer buffer kind=%s because a previous transfer left the buffer pool poisoned. "
+        "The process must restart before these memory ranges can be safely reused.",
+        bufferKindName(getBufferKind()));
     int bufferId = -1;
     for (size_t i = 0; i < bufferCount; i++)
     {
@@ -317,11 +380,68 @@ void BaseTransBufferManager::freeBufferIndex(
         TLLM_CHECK(static_cast<size_t>(bufferId.value()) < bufferCount);
         {
             std::scoped_lock lk(resource.mBuffersMutex);
+            if (resource.mBufferIndexFlag[bufferId.value()] == 2)
+            {
+                TLLM_LOG_ERROR("Refusing to free poisoned cache transfer buffer kind=%s index=%d",
+                    bufferKindName(getBufferKind()), bufferId.value());
+                return;
+            }
             resource.mBufferIndexFlag[bufferId.value()] = 0;
         }
         resource.mConcurrence--;
         resource.mBuffersCV.notify_one();
     }
+}
+
+void BaseTransBufferManager::poisonBufferIndex(ConcurrenceResource& resource, std::optional<int> bufferId,
+    size_t bufferCount, bool onlyUseDynamicBuffer, char const* direction) noexcept
+{
+    resource.mPoisoned.store(true, std::memory_order_relaxed);
+
+    if (onlyUseDynamicBuffer)
+    {
+        TLLM_LOG_ERROR(
+            "Poisoned dynamic %s cache transfer buffer kind=%s. Dynamic transfer memory cannot be safely reused; "
+            "the process must restart.",
+            direction, bufferKindName(getBufferKind()));
+        resource.mBuffersCV.notify_all();
+        return;
+    }
+
+    if (!bufferId.has_value())
+    {
+        TLLM_LOG_ERROR("Poisoned unknown %s cache transfer buffer kind=%s. The process must restart.", direction,
+            bufferKindName(getBufferKind()));
+        resource.mBuffersCV.notify_all();
+        return;
+    }
+
+    try
+    {
+        TLLM_CHECK(static_cast<size_t>(bufferId.value()) < bufferCount);
+        {
+            std::scoped_lock lk(resource.mBuffersMutex);
+            if (resource.mBufferIndexFlag[bufferId.value()] == 1)
+            {
+                resource.mBufferIndexFlag[bufferId.value()] = 2;
+            }
+        }
+        TLLM_LOG_ERROR(
+            "Poisoned %s cache transfer buffer kind=%s index=%d. The slot will not be returned to the pool because "
+            "transport quiescence is unknown; restart the process before serving more KV transfers.",
+            direction, bufferKindName(getBufferKind()), bufferId.value());
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_ERROR("Exception while poisoning %s cache transfer buffer kind=%s index=%d: %s", direction,
+            bufferKindName(getBufferKind()), bufferId.value_or(-1), e.what());
+    }
+    catch (...)
+    {
+        TLLM_LOG_ERROR("Unknown exception while poisoning %s cache transfer buffer kind=%s index=%d", direction,
+            bufferKindName(getBufferKind()), bufferId.value_or(-1));
+    }
+    resource.mBuffersCV.notify_all();
 }
 
 size_t BaseTransBufferManager::getRecvBufferCount()
