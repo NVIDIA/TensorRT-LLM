@@ -344,9 +344,11 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
     enable_heuristic_topk: bool = Field(
         default=False,
         description=
-        "Whether to reuse previous step's TopK indices as heuristic hints "
-        "for the decode indexer TopK kernel, reducing threshold search iterations."
-    )
+        "Whether to enable Guess-Verify-Refine (GVR) Top-K for the DSA decode "
+        "indexer. GVR reuses previous-step Top-K indices as hints to reduce "
+        "threshold search iterations. Currently supported for index_topk=2048 "
+        "on Blackwell (SM100+) and falls back to the production insertion/radix "
+        "Top-K path when prerequisites are not met.")
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
