@@ -335,28 +335,31 @@ def test_multimodal_input_dataclass_with_uuids():
 
     # Test with all UUIDs
     mm_input = MultimodalInput(multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
-                               multimodal_positions=[10],
-                               multimodal_lengths=[50],
+                               multimodal_item_runs=[[(10, 50, [0, 49])]],
                                multimodal_uuids=["test-uuid-123"])
 
     assert mm_input.multimodal_uuids == ["test-uuid-123"]
+    assert mm_input.multimodal_embedding_lengths == [48]
+    assert mm_input.multimodal_prompt_lengths == [50]
 
     # Test with partial UUIDs (some None)
     mm_input_partial = MultimodalInput(
         multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]],
-        multimodal_positions=[10, 100],
-        multimodal_lengths=[50, 60],
+        multimodal_item_runs=[[(10, 50, [])], [(100, 60, [10])]],
         multimodal_uuids=["sku-001", None])
 
     assert mm_input_partial.multimodal_uuids == ["sku-001", None]
+    assert mm_input_partial.multimodal_embedding_lengths == [50, 59]
+    assert mm_input_partial.multimodal_prompt_lengths == [50, 60]
 
     # Test with None UUIDs (default)
     mm_input_no_uuids = MultimodalInput(
         multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
-        multimodal_positions=[10],
-        multimodal_lengths=[50])
+        multimodal_item_runs=[[(10, 50, [])]])
 
     assert mm_input_no_uuids.multimodal_uuids is None
+    assert mm_input_no_uuids.multimodal_embedding_lengths == [50]
+    assert mm_input_no_uuids.multimodal_prompt_lengths == [50]
 
 
 def test_multimodal_input_dataclass_uuid_validation():
@@ -367,22 +370,19 @@ def test_multimodal_input_dataclass_uuid_validation():
     with pytest.raises(ValueError, match="multimodal_uuids length"):
         MultimodalInput(multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8],
                                            [8, 7, 6, 5, 4, 3, 2, 1]],
-                        multimodal_positions=[10, 100],
-                        multimodal_lengths=[50, 60],
+                        multimodal_item_runs=[[(10, 50, [])], [(100, 60, [])]],
                         multimodal_uuids=["only-one-uuid"])
 
     # Test invalid UUID type
     with pytest.raises(TypeError, match="must be a string or None"):
         MultimodalInput(multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
-                        multimodal_positions=[10],
-                        multimodal_lengths=[50],
+                        multimodal_item_runs=[[(10, 50, [])]],
                         multimodal_uuids=[123])  # Integer instead of string
 
     # Test invalid multimodal_uuids type (not a list)
     with pytest.raises(TypeError, match="multimodal_uuids must be a list"):
         MultimodalInput(multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
-                        multimodal_positions=[10],
-                        multimodal_lengths=[50],
+                        multimodal_item_runs=[[(10, 50, [])]],
                         multimodal_uuids="not-a-list")
 
 
@@ -391,22 +391,23 @@ def test_multimodal_input_from_components_with_uuids():
     from tensorrt_llm.inputs.multimodal import MultimodalInput
 
     mm_hashes = [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]]
-    mm_positions = [10, 100]
-    mm_lengths = [50, 60]
+    mm_item_runs = [[(10, 50, [0])], [(100, 60, [5, 10])]]
     mm_uuids = ["uuid-a", "uuid-b"]
 
-    mm_input = MultimodalInput.from_components(mm_hashes, mm_positions,
-                                               mm_lengths, mm_uuids)
+    mm_input = MultimodalInput.from_components(mm_hashes, mm_item_runs,
+                                               mm_uuids)
 
     assert mm_input.multimodal_hashes == mm_hashes
-    assert mm_input.multimodal_positions == mm_positions
-    assert mm_input.multimodal_lengths == mm_lengths
+    assert mm_input.multimodal_item_runs == mm_item_runs
+    assert mm_input.multimodal_embedding_lengths == [49, 58]
+    assert mm_input.multimodal_prompt_lengths == [50, 60]
     assert mm_input.multimodal_uuids == mm_uuids
 
     # Test without UUIDs
-    mm_input_no_uuids = MultimodalInput.from_components(mm_hashes, mm_positions,
-                                                        mm_lengths)
+    mm_input_no_uuids = MultimodalInput.from_components(mm_hashes, mm_item_runs)
     assert mm_input_no_uuids.multimodal_uuids is None
+    assert mm_input_no_uuids.multimodal_embedding_lengths == [49, 58]
+    assert mm_input_no_uuids.multimodal_prompt_lengths == [50, 60]
 
 
 def test_apply_mm_hashes_uuid_length_mismatch():

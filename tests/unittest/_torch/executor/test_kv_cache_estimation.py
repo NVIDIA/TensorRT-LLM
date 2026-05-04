@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+from tensorrt_llm._torch.pyexecutor._util import MODEL_CLASS_VISION_ENCODER_MAPPING, KvCacheCreator
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -55,6 +55,30 @@ def _make_creator(
     )
 
     c._kv_cache_config = Mock(free_gpu_memory_fraction=0.9)
+
+    return c
+
+
+def _make_dummy_request_creator(*, is_disagg):
+    """Build a minimal KvCacheCreator for dummy request construction."""
+    c = object.__new__(KvCacheCreator)
+
+    c._max_num_tokens = 4
+    c._max_beam_width = 1
+    c._profiling_stage_data = {"enable_mm_reqs": True}
+    c._is_disagg = is_disagg
+    c._mapping = Mock(enable_attention_dp=False)
+    c._model_engine = Mock()
+    c._model_engine.use_mrope = True
+    c._model_engine.model.original_arch = "FakeVLForConditionalGeneration"
+    c._model_engine.model.model_config.pretrained_config.vocab_size = 128
+    c._model_engine.input_processor.get_dummy_prompt.return_value = {
+        "prompt": "<image>",
+        "multi_modal_data": {"image": "dummy"},
+    }
+    c._model_engine.input_processor_with_hash.side_effect = AssertionError(
+        "disaggregated dummy request construction must not require raw MM data"
+    )
 
     return c
 
@@ -145,3 +169,19 @@ def test_regression_without_fix_would_overcount():
     wrong = tp * 3 * tpb  # 768  (all duplicates summed)
     assert result == correct
     assert result != wrong
+
+
+def test_disagg_vlm_dummy_requests_skip_raw_multimodal_profile():
+    """Disagg context/gen workers cannot synthesize encoder-side MM handoff."""
+    creator = _make_dummy_request_creator(is_disagg=True)
+
+    with patch.dict(
+        MODEL_CLASS_VISION_ENCODER_MAPPING, {"FakeVLForConditionalGeneration": (object, object)}
+    ):
+        requests = creator._create_dummy_context_requests(input_seq_len=3)
+
+    creator._model_engine.input_processor_with_hash.assert_not_called()
+    assert requests
+    for request in requests:
+        assert request.py_multimodal_data is not None
+        assert set(request.py_multimodal_data) == {"mrope_config"}

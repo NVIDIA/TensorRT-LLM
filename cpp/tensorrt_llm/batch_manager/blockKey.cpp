@@ -18,6 +18,7 @@
 #include "tensorrt_llm/batch_manager/blockKey.h"
 
 #include <algorithm>
+#include <utility>
 
 namespace
 {
@@ -50,8 +51,6 @@ std::vector<MmKey> generateBlockHashExtraKeys(
     tensorrt_llm::batch_manager::LlmRequest const& llmRequest, SizeType32 startTokenIdx, SizeType32 endTokenIdx)
 {
     auto const multimodalHashes = llmRequest.getMultimodalHashes();
-    auto const multimodalPositions = llmRequest.getMultimodalPositions();
-    auto const multimodalLengths = llmRequest.getMultimodalLengths();
     auto const multimodalUuids = llmRequest.getMultimodalUuids();
     auto const multimodalItemRuns = llmRequest.getMultimodalItemRuns();
 
@@ -61,129 +60,77 @@ std::vector<MmKey> generateBlockHashExtraKeys(
     }
 
     auto const hasItemRuns = multimodalItemRuns && *multimodalItemRuns;
-    if (hasItemRuns)
+    if (!hasItemRuns)
     {
-        auto const promptLen = llmRequest.getPromptLen();
-        TLLM_CHECK_WITH_INFO((*multimodalHashes)->size() == (*multimodalItemRuns)->size(),
-            "Multimodal hash arrays and item-run arrays have mismatched sizes");
-        if (multimodalLengths && *multimodalLengths)
-        {
-            TLLM_CHECK_WITH_INFO((*multimodalHashes)->size() == (*multimodalLengths)->size(),
-                "Multimodal hash arrays and length arrays have mismatched sizes");
-        }
-        if (multimodalPositions && *multimodalPositions)
-        {
-            TLLM_CHECK_WITH_INFO((*multimodalHashes)->size() == (*multimodalPositions)->size(),
-                "Multimodal hash arrays and position arrays have mismatched sizes");
-        }
-
-        std::vector<MmKey> extraKeys;
-        extraKeys.reserve((*multimodalHashes)->size());
-
-        for (size_t i = 0; i < (*multimodalHashes)->size(); ++i)
-        {
-            auto const mmHashArray = makeHashArray((*(*multimodalHashes))[i]);
-            auto const& positionRuns = (*(*multimodalItemRuns))[i];
-            TLLM_CHECK_WITH_INFO(!positionRuns.empty(), "Multimodal item runs must not be empty");
-
-            std::optional<std::string> uuid = std::nullopt;
-            if (multimodalUuids && *multimodalUuids && i < (*multimodalUuids)->size())
-            {
-                uuid = (*(*multimodalUuids))[i];
-            }
-
-            auto emitRegion = [&](SizeType32 regionStart, SizeType32 regionLength, SizeType32 hashStartOffset)
-            {
-                auto const regionEnd = regionStart + regionLength;
-                if (endTokenIdx > regionStart && startTokenIdx < regionEnd)
-                {
-                    auto const overlapStart = std::max(startTokenIdx, regionStart);
-                    auto const startOffset = hashStartOffset + overlapStart - regionStart;
-                    extraKeys.emplace_back(mmHashArray, startOffset, uuid);
-                }
-            };
-
-            SizeType32 consumedLength = 0;
-            std::optional<SizeType32> previousRunEnd = std::nullopt;
-            for (size_t runIdx = 0; runIdx < positionRuns.size(); ++runIdx)
-            {
-                auto const& [runStart, runLength, nonEmbedOffsets] = positionRuns[runIdx];
-                TLLM_CHECK_WITH_INFO(runLength > 0, "Multimodal item run length must be positive, got %d", runLength);
-                TLLM_CHECK_WITH_INFO(runStart >= 0 && runLength <= promptLen && runStart <= promptLen - runLength,
-                    "Multimodal item run [%d, %d) is outside prompt token range [0, %d)", runStart,
-                    runStart + runLength, promptLen);
-                std::optional<SizeType32> previousOffset = std::nullopt;
-                for (auto const offset : nonEmbedOffsets)
-                {
-                    // Non-embed offsets are metadata for downstream consumers. Cache hashing still covers the
-                    // entire prompt-owned run, so these offsets are validated but not filtered out here.
-                    TLLM_CHECK_WITH_INFO(offset >= 0 && offset < runLength,
-                        "Multimodal item run non-embed offset %d is outside run length %d", offset, runLength);
-                    TLLM_CHECK_WITH_INFO(!previousOffset || offset > *previousOffset,
-                        "Multimodal item run non-embed offsets must be ordered and unique");
-                    previousOffset = offset;
-                }
-                if (runIdx == 0 && multimodalPositions && *multimodalPositions)
-                {
-                    TLLM_CHECK_WITH_INFO(runStart == (*(*multimodalPositions))[i],
-                        "First multimodal item run must start at multimodal_positions[%zu]", i);
-                }
-                if (previousRunEnd)
-                {
-                    TLLM_CHECK_WITH_INFO(
-                        runStart >= *previousRunEnd, "Multimodal item runs must be ordered and non-overlapping");
-                }
-                emitRegion(runStart, runLength, consumedLength);
-                consumedLength += runLength;
-                previousRunEnd = runStart + runLength;
-            }
-            if (multimodalLengths && *multimodalLengths)
-            {
-                auto const expectedLength = (*(*multimodalLengths))[i];
-                TLLM_CHECK_WITH_INFO(consumedLength == expectedLength,
-                    "Multimodal item run lengths must sum to multimodal_lengths[%zu]", i);
-            }
-        }
-
-        return extraKeys;
+        TLLM_CHECK_WITH_INFO(false, "Multimodal hashes require multimodal item runs");
     }
 
-    if (!multimodalPositions || !multimodalLengths || !(*multimodalPositions) || (*multimodalPositions)->empty()
-        || !(*multimodalLengths) || (*multimodalLengths)->empty())
-    {
-        return {};
-    }
-
-    if ((*multimodalHashes)->size() != (*multimodalPositions)->size()
-        || (*multimodalPositions)->size() != (*multimodalLengths)->size())
-    {
-        TLLM_LOG_WARNING("Multimodal data arrays have mismatched sizes");
-        return {};
-    }
+    auto const promptLen = llmRequest.getPromptLen();
+    TLLM_CHECK_WITH_INFO((*multimodalHashes)->size() == (*multimodalItemRuns)->size(),
+        "Multimodal hash arrays and item-run arrays have mismatched sizes");
 
     std::vector<MmKey> extraKeys;
-    extraKeys.reserve((*multimodalPositions)->size());
+    extraKeys.reserve((*multimodalHashes)->size());
+    std::vector<std::pair<SizeType32, SizeType32>> occupiedRuns;
 
-    for (size_t i = 0; i < (*multimodalPositions)->size(); ++i)
+    for (size_t i = 0; i < (*multimodalHashes)->size(); ++i)
     {
-        auto const& startPos = (*(*multimodalPositions))[i];
-        auto const& length = (*(*multimodalLengths))[i];
-        auto const& mmHashVector = (*(*multimodalHashes))[i];
-        auto const mmHashArray = makeHashArray(mmHashVector);
+        auto const mmHashArray = makeHashArray((*(*multimodalHashes))[i]);
+        auto const& positionRuns = (*(*multimodalItemRuns))[i];
+        TLLM_CHECK_WITH_INFO(!positionRuns.empty(), "Multimodal item runs must not be empty");
 
-        // Check if this multimodal content overlaps with the current block
-        if (endTokenIdx > startPos && startTokenIdx < startPos + length)
+        std::optional<std::string> uuid = std::nullopt;
+        if (multimodalUuids && *multimodalUuids && i < (*multimodalUuids)->size())
         {
-            uint64_t mmStartInBlock = (startPos >= startTokenIdx) ? 0 : static_cast<uint64_t>(startTokenIdx - startPos);
+            uuid = (*(*multimodalUuids))[i];
+        }
 
-            // Get UUID if available
-            std::optional<std::string> uuid = std::nullopt;
-            if (multimodalUuids && *multimodalUuids && i < (*multimodalUuids)->size())
+        auto emitRegion = [&](SizeType32 regionStart, SizeType32 regionLength, SizeType32 hashStartOffset)
+        {
+            auto const regionEnd = regionStart + regionLength;
+            if (endTokenIdx > regionStart && startTokenIdx < regionEnd)
             {
-                uuid = (*(*multimodalUuids))[i];
+                auto const overlapStart = std::max(startTokenIdx, regionStart);
+                auto const startOffset = hashStartOffset + overlapStart - regionStart;
+                extraKeys.emplace_back(mmHashArray, startOffset, uuid);
             }
+        };
 
-            extraKeys.emplace_back(mmHashArray, mmStartInBlock, std::move(uuid));
+        SizeType32 consumedLength = 0;
+        std::optional<SizeType32> previousRunEnd = std::nullopt;
+        for (size_t runIdx = 0; runIdx < positionRuns.size(); ++runIdx)
+        {
+            auto const& [runStart, runLength, nonEmbedOffsets] = positionRuns[runIdx];
+            TLLM_CHECK_WITH_INFO(runLength > 0, "Multimodal item run length must be positive, got %d", runLength);
+            TLLM_CHECK_WITH_INFO(runStart >= 0 && runLength <= promptLen && runStart <= promptLen - runLength,
+                "Multimodal item run [%d, %d) is outside prompt token range [0, %d)", runStart, runStart + runLength,
+                promptLen);
+            std::optional<SizeType32> previousOffset = std::nullopt;
+            for (auto const offset : nonEmbedOffsets)
+            {
+                // Non-embed offsets are metadata for downstream consumers. Cache hashing still covers the
+                // entire prompt-owned run, so these offsets are validated but not filtered out here.
+                TLLM_CHECK_WITH_INFO(offset >= 0 && offset < runLength,
+                    "Multimodal item run non-embed offset %d is outside run length %d", offset, runLength);
+                TLLM_CHECK_WITH_INFO(!previousOffset || offset > *previousOffset,
+                    "Multimodal item run non-embed offsets must be ordered and unique");
+                previousOffset = offset;
+            }
+            if (previousRunEnd)
+            {
+                TLLM_CHECK_WITH_INFO(
+                    runStart >= *previousRunEnd, "Multimodal item runs must be ordered and non-overlapping");
+            }
+            auto const runEnd = runStart + runLength;
+            for (auto const& [occupiedStart, occupiedEnd] : occupiedRuns)
+            {
+                TLLM_CHECK_WITH_INFO(runStart >= occupiedEnd || occupiedStart >= runEnd,
+                    "Multimodal item runs must be globally non-overlapping");
+            }
+            emitRegion(runStart, runLength, consumedLength);
+            consumedLength += runLength;
+            previousRunEnd = runEnd;
+            occupiedRuns.emplace_back(runStart, runEnd);
         }
     }
 

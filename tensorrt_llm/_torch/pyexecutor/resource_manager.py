@@ -2488,131 +2488,35 @@ class KVCacheManagerV2(BaseResourceManager):
             return b''.join(
                 v.to_bytes(4, 'big', signed=True) for v in hash_ints)
 
-        multimodal_item_runs = getattr(req, "multimodal_item_runs", None)
-        if multimodal_item_runs is not None:
-            if len(multimodal_item_runs) != len(req.multimodal_hashes):
-                raise ValueError(
-                    "multimodal_item_runs and multimodal_hashes must have the same length"
-                )
+        multimodal_prompt_lengths = getattr(req, "multimodal_prompt_lengths",
+                                            None)
+        item_run_spans = getattr(req, "py_multimodal_item_run_spans", None)
+        if multimodal_prompt_lengths is None or item_run_spans is None:
+            raise ValueError(
+                "multimodal item-run span metadata must be prevalidated on LlmRequest before block reuse"
+            )
 
-            def _validate_item_run(item_idx: int, run_idx: int,
-                                   run: Sequence) -> tuple[int, int]:
-                if not isinstance(run, (list, tuple)) or len(run) != 3:
-                    raise TypeError(
-                        f"multimodal_item_runs[{item_idx}][{run_idx}] must be a "
-                        "(prompt_start, run_length, non_embed_offsets) tuple")
-                run_start, run_length, non_embed_offsets = run
-
-                if not isinstance(run_start, int) or not isinstance(
-                        run_length, int):
-                    raise TypeError(
-                        f"multimodal_item_runs[{item_idx}][{run_idx}] must contain integer start/length"
-                    )
-                if run_length <= 0:
-                    raise ValueError(
-                        f"multimodal_item_runs[{item_idx}][{run_idx}] must have positive length"
-                    )
-                if run_start < 0 or run_start + run_length > len(tokens):
-                    raise ValueError(
-                        f"multimodal_item_runs[{item_idx}] contains run "
-                        f"({run_start}, {run_length}) outside prompt token range [0, {len(tokens)})"
-                    )
-
-                if not isinstance(non_embed_offsets, list):
-                    raise TypeError(
-                        f"multimodal_item_runs[{item_idx}][{run_idx}] non-embed offsets must be a list"
-                    )
-                if not all(
-                        isinstance(offset, int)
-                        for offset in non_embed_offsets):
-                    raise TypeError(
-                        f"multimodal_item_runs[{item_idx}][{run_idx}] non-embed offsets must contain only integers"
-                    )
-                if any(offset < 0 or offset >= run_length
-                       for offset in non_embed_offsets):
-                    raise ValueError(
-                        f"multimodal_item_runs[{item_idx}][{run_idx}] non-embed offsets must be within the run"
-                    )
-                if non_embed_offsets != sorted(set(non_embed_offsets)):
-                    raise ValueError(
-                        f"multimodal_item_runs[{item_idx}][{run_idx}] non-embed offsets must be ordered and unique"
-                    )
-                return run_start, run_length
-
-            for item_idx, (hash_ints, item_runs) in enumerate(
-                    zip(req.multimodal_hashes,
-                        multimodal_item_runs,
-                        strict=True)):
-                if len(item_runs) == 0:
-                    raise ValueError(
-                        f"multimodal_item_runs[{item_idx}] must not be empty")
-                item_length = 0
-                previous_end = None
-                validated_item_runs = []
-                for run_idx, run in enumerate(item_runs):
-                    run_start, run_length = _validate_item_run(
-                        item_idx, run_idx, run)
-                    if previous_end is not None and run_start < previous_end:
-                        raise ValueError(
-                            f"multimodal_item_runs[{item_idx}] must be ordered and non-overlapping"
-                        )
-                    item_length += run_length
-                    previous_end = run_start + run_length
-                    validated_item_runs.append((run_start, run_length))
-                if req.multimodal_lengths is not None:
-                    expected_length = req.multimodal_lengths[item_idx]
-                    if item_length != expected_length:
-                        raise ValueError(
-                            f"multimodal_item_runs[{item_idx}] total length ({item_length}) must match "
-                            f"multimodal_lengths[{item_idx}] ({expected_length})"
-                        )
-                if req.multimodal_positions is not None:
-                    expected_start = req.multimodal_positions[item_idx]
-                    if validated_item_runs[0][0] != expected_start:
-                        raise ValueError(
-                            f"multimodal_item_runs[{item_idx}] must start at "
-                            f"multimodal_positions[{item_idx}] ({expected_start})"
-                        )
-                digest = _hash_ints_to_digest(hash_ints)
-                mm_tokens = gen_multi_modal_tokens(self.vocab_size, digest,
-                                                   item_length)
-                hash_offset = 0
-                for run_start, run_length in validated_item_runs:
-                    run_end = run_start + run_length
-                    if run_end <= start or run_start >= end:
-                        hash_offset += run_length
-                        continue
-                    overlap_start = max(run_start, start)
-                    overlap_end = min(run_end, end)
-                    result_offset = overlap_start - start
-                    mm_offset = hash_offset + overlap_start - run_start
-                    n = overlap_end - overlap_start
-                    result[result_offset:result_offset +
-                           n] = mm_tokens[mm_offset:mm_offset + n]
-                    hash_offset += run_length
-            return result
-
-        if req.multimodal_positions is None or req.multimodal_lengths is None:
-            return tokens[start:end] if is_sliced else tokens
-
-        for hash_ints, pos, length in zip(req.multimodal_hashes,
-                                          req.multimodal_positions,
-                                          req.multimodal_lengths,
-                                          strict=True):
-            mm_end = pos + length
-            # Skip multimodal items outside [start, end).
-            if mm_end <= start or pos >= end:
-                continue
+        for hash_ints, item_length, run_spans in zip(req.multimodal_hashes,
+                                                     multimodal_prompt_lengths,
+                                                     item_run_spans,
+                                                     strict=True):
             digest = _hash_ints_to_digest(hash_ints)
-            mm_tokens = gen_multi_modal_tokens(self.vocab_size, digest, length)
-            # Overlap between [pos, mm_end) and [start, end).
-            overlap_start = max(pos, start)
-            overlap_end = min(mm_end, end)
-            mm_offset = overlap_start - pos
-            result_offset = overlap_start - start
-            n = overlap_end - overlap_start
-            result[result_offset:result_offset +
-                   n] = mm_tokens[mm_offset:mm_offset + n]
+            mm_tokens = gen_multi_modal_tokens(self.vocab_size, digest,
+                                               item_length)
+            hash_offset = 0
+            for run_start, run_length in run_spans:
+                run_end = run_start + run_length
+                if run_end <= start or run_start >= end:
+                    hash_offset += run_length
+                    continue
+                overlap_start = max(run_start, start)
+                overlap_end = min(run_end, end)
+                result_offset = overlap_start - start
+                mm_offset = hash_offset + overlap_start - run_start
+                n = overlap_end - overlap_start
+                result[result_offset:result_offset +
+                       n] = mm_tokens[mm_offset:mm_offset + n]
+                hash_offset += run_length
         return result
 
     def get_kv_cache_stats(self):
