@@ -25,6 +25,8 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <cstring>
 #include <optional>
 #include <type_traits>
 #include <variant>
@@ -1183,16 +1185,6 @@ TEST(SerializeUtilsTest, MultimodalInputWithUuids)
             EXPECT_EQ(origHashes[i], deserHashes[i]);
         }
 
-        // Verify positions
-        auto origPositions = original.getMultimodalPositions();
-        auto deserPositions = deserialized.getMultimodalPositions();
-        EXPECT_EQ(origPositions, deserPositions);
-
-        // Verify lengths
-        auto origLengths = original.getMultimodalLengths();
-        auto deserLengths = deserialized.getMultimodalLengths();
-        EXPECT_EQ(origLengths, deserLengths);
-
         // Verify UUIDs
         auto origUuids = original.getMultimodalUuids();
         auto deserUuids = deserialized.getMultimodalUuids();
@@ -1206,13 +1198,7 @@ TEST(SerializeUtilsTest, MultimodalInputWithUuids)
             }
         }
 
-        auto origItemRuns = original.getMultimodalItemRuns();
-        auto deserItemRuns = deserialized.getMultimodalItemRuns();
-        EXPECT_EQ(origItemRuns.has_value(), deserItemRuns.has_value());
-        if (origItemRuns.has_value() && deserItemRuns.has_value())
-        {
-            EXPECT_EQ(*origItemRuns, *deserItemRuns);
-        }
+        EXPECT_EQ(original.getMultimodalItemRuns(), deserialized.getMultimodalItemRuns());
     };
 
     // Test MultimodalInput with UUIDs
@@ -1220,41 +1206,82 @@ TEST(SerializeUtilsTest, MultimodalInputWithUuids)
         {1, 2, 3, 4, 5, 6, 7, 8},        // First image hash
         {10, 20, 30, 40, 50, 60, 70, 80} // Second image hash
     };
-    std::vector<SizeType32> positions = {0, 100};
-    std::vector<SizeType32> lengths = {3, 2};
     MultimodalItemRuns hashPositionRuns
         = {{MultimodalItemRun{0, 1, {}}, MultimodalItemRun{2, 1, {0}}, MultimodalItemRun{4, 1, {}}},
             {MultimodalItemRun{100, 1, {}}, MultimodalItemRun{103, 1, {}}}};
 
     // Test with full UUIDs
     std::vector<std::optional<std::string>> uuids = {std::string("image-uuid-001"), std::string("image-uuid-002")};
-    MultimodalInput inputWithUuids(hashes, positions, lengths, uuids);
+    MultimodalInput inputWithUuids(hashes, hashPositionRuns, uuids);
     verifyMultimodalInput(inputWithUuids);
 
     // Test with compact sparse item runs
-    MultimodalInput inputWithItemRuns(hashes, positions, lengths, uuids, hashPositionRuns);
+    MultimodalInput inputWithItemRuns(hashes, hashPositionRuns, uuids);
     verifyMultimodalInput(inputWithItemRuns);
 
     // Test with partial UUIDs (mixed Some and None)
     std::vector<std::optional<std::string>> partialUuids = {std::string("uuid-a"), std::nullopt};
-    MultimodalInput inputPartialUuids(hashes, positions, lengths, partialUuids);
+    MultimodalInput inputPartialUuids(hashes, hashPositionRuns, partialUuids);
     verifyMultimodalInput(inputPartialUuids);
 
     // Test without UUIDs (nullopt)
-    MultimodalInput inputNoUuids(hashes, positions, lengths, std::nullopt);
+    MultimodalInput inputNoUuids(hashes, hashPositionRuns, std::nullopt);
     verifyMultimodalInput(inputNoUuids);
 
     // Test with empty string UUID
     std::vector<std::optional<std::string>> emptyUuids = {std::string(""), std::string("valid-uuid")};
-    MultimodalInput inputEmptyUuid(hashes, positions, lengths, emptyUuids);
+    MultimodalInput inputEmptyUuid(hashes, hashPositionRuns, emptyUuids);
     verifyMultimodalInput(inputEmptyUuid);
 
     // Test with long UUIDs (> 32 bytes)
     std::vector<std::optional<std::string>> longUuids
         = {std::string("this-is-a-very-long-uuid-string-that-exceeds-the-32-byte-limit-for-testing-purposes"),
             std::string("short")};
-    MultimodalInput inputLongUuids(hashes, positions, lengths, longUuids);
+    MultimodalInput inputLongUuids(hashes, hashPositionRuns, longUuids);
     verifyMultimodalInput(inputLongUuids);
+}
+
+TEST(SerializeUtilsTest, MultimodalInputRejectsUnversionedPayload)
+{
+    using tensorrt_llm::executor::MultimodalItemRun;
+    using tensorrt_llm::executor::MultimodalItemRuns;
+
+    std::vector<std::vector<SizeType32>> hashes = {{1, 2, 3, 4, 5, 6, 7, 8}};
+    std::optional<std::vector<std::optional<std::string>>> uuids
+        = std::vector<std::optional<std::string>>{std::string("image-uuid-001")};
+    MultimodalItemRuns itemRuns = {{MultimodalItemRun{0, 1, {}}}};
+
+    std::ostringstream legacyPayload;
+    su::serialize(hashes, legacyPayload);
+    su::serialize(uuids, legacyPayload);
+    su::serialize(itemRuns, legacyPayload);
+
+    std::istringstream input(legacyPayload.str());
+    EXPECT_THROW((void) tensorrt_llm::executor::Serialization::deserializeMultimodalInput(input), std::exception);
+}
+
+TEST(SerializeUtilsTest, MultimodalInputRejectsUnsupportedVersion)
+{
+    using tensorrt_llm::executor::MultimodalInput;
+    using tensorrt_llm::executor::MultimodalItemRun;
+    using tensorrt_llm::executor::MultimodalItemRuns;
+
+    std::vector<std::vector<SizeType32>> hashes = {{1, 2, 3, 4, 5, 6, 7, 8}};
+    MultimodalItemRuns itemRuns = {{MultimodalItemRun{0, 1, {}}}};
+    MultimodalInput input(hashes, itemRuns, std::nullopt);
+
+    std::ostringstream oss;
+    tensorrt_llm::executor::Serialization::serialize(input, oss);
+    auto buffer = oss.str();
+
+    auto constexpr versionOffset = sizeof(std::uint32_t);
+    ASSERT_GE(buffer.size(), versionOffset + sizeof(std::uint32_t));
+    auto constexpr unsupportedVersion = std::uint32_t{999U};
+    std::memcpy(buffer.data() + versionOffset, &unsupportedVersion, sizeof(unsupportedVersion));
+
+    std::istringstream serializedInput(buffer);
+    EXPECT_THROW(
+        (void) tensorrt_llm::executor::Serialization::deserializeMultimodalInput(serializedInput), std::exception);
 }
 
 // Connection notification tests

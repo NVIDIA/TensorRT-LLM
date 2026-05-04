@@ -25,6 +25,7 @@
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 #include <cstddef>
+#include <cstdint>
 #include <iostream>
 #include <memory>
 #include <type_traits>
@@ -33,6 +34,11 @@ namespace su = tensorrt_llm::executor::serialize_utils;
 
 namespace tensorrt_llm::executor
 {
+namespace
+{
+std::uint32_t constexpr kMultimodalInputSerializationMagic = 0x4D4D4932U; // "MMI2"
+std::uint32_t constexpr kMultimodalInputSerializationVersion = 1U;
+} // namespace
 
 // TimePoint
 RequestPerfMetrics::TimePoint Serialization::deserializeTimePoint(std::istream& is)
@@ -336,20 +342,29 @@ size_t Serialization::serializedSize(PromptTuningConfig const& config)
 // MultimodalInput
 MultimodalInput Serialization::deserializeMultimodalInput(std::istream& is)
 {
+    auto magic = su::deserialize<std::uint32_t>(is);
+    if (magic != kMultimodalInputSerializationMagic)
+    {
+        TLLM_THROW("Unsupported MultimodalInput serialization magic: %u", magic);
+    }
+
+    auto version = su::deserialize<std::uint32_t>(is);
+    if (version != kMultimodalInputSerializationVersion)
+    {
+        TLLM_THROW("Unsupported MultimodalInput serialization version: %u", version);
+    }
+
     auto multimodalHashes = su::deserialize<std::vector<std::vector<SizeType32>>>(is);
-    auto multimodalPositions = su::deserialize<std::vector<SizeType32>>(is);
-    auto multimodalLengths = su::deserialize<std::vector<SizeType32>>(is);
     auto multimodalUuids = su::deserialize<std::optional<std::vector<std::optional<std::string>>>>(is);
-    auto multimodalItemRuns = su::deserialize<std::optional<MultimodalItemRuns>>(is);
-    return MultimodalInput{std::move(multimodalHashes), std::move(multimodalPositions), std::move(multimodalLengths),
-        std::move(multimodalUuids), std::move(multimodalItemRuns)};
+    auto multimodalItemRuns = su::deserialize<MultimodalItemRuns>(is);
+    return MultimodalInput{std::move(multimodalHashes), std::move(multimodalItemRuns), std::move(multimodalUuids)};
 }
 
 void Serialization::serialize(MultimodalInput const& multimodalInput, std::ostream& os)
 {
+    su::serialize(kMultimodalInputSerializationMagic, os);
+    su::serialize(kMultimodalInputSerializationVersion, os);
     su::serialize(multimodalInput.mMultimodalHashes, os);
-    su::serialize(multimodalInput.mMultimodalPositions, os);
-    su::serialize(multimodalInput.mMultimodalLengths, os);
     su::serialize(multimodalInput.mMultimodalUuids, os);
     su::serialize(multimodalInput.mMultimodalItemRuns, os);
 }
@@ -357,9 +372,9 @@ void Serialization::serialize(MultimodalInput const& multimodalInput, std::ostre
 size_t Serialization::serializedSize(MultimodalInput const& multimodalInput)
 {
     size_t totalSize = 0;
+    totalSize += su::serializedSize(kMultimodalInputSerializationMagic);
+    totalSize += su::serializedSize(kMultimodalInputSerializationVersion);
     totalSize += su::serializedSize(multimodalInput.mMultimodalHashes);
-    totalSize += su::serializedSize(multimodalInput.mMultimodalPositions);
-    totalSize += su::serializedSize(multimodalInput.mMultimodalLengths);
     totalSize += su::serializedSize(multimodalInput.mMultimodalUuids);
     totalSize += su::serializedSize(multimodalInput.mMultimodalItemRuns);
     return totalSize;
