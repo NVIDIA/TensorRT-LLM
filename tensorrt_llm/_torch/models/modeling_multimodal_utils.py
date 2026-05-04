@@ -191,6 +191,31 @@ def get_multimodal_embeddings(
     return [all_embeddings]
 
 
+def _get_cached_input_mm_embeds(
+        multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+    cached_mm_embeds = []
+    for param in multimodal_params:
+        if param.multimodal_runtime is None:
+            continue
+        mm_embed = param.multimodal_data.get("multimodal_embedding")
+        if mm_embed is None:
+            return []
+        if isinstance(mm_embed, list):
+            if len(mm_embed) == 0:
+                return []
+            mm_embed = torch.cat(mm_embed, dim=0)
+            param.multimodal_data["multimodal_embedding"] = mm_embed
+        if not isinstance(mm_embed, torch.Tensor):
+            return []
+        cached_mm_embeds.append(mm_embed)
+
+    if not cached_mm_embeds:
+        return []
+    if len(cached_mm_embeds) == 1:
+        return cached_mm_embeds
+    return [torch.cat(cached_mm_embeds, dim=0)]
+
+
 def find_input_mm_embeds(
         mm_embeds: List[torch.Tensor],
         multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
@@ -237,6 +262,13 @@ def find_input_mm_embeds(
             "All multimodal tokens are cached or beyond current chunk, skipping vision encoder forward"
         )
         return []
+
+    if len(mm_embeds) == 0:
+        mm_embeds = _get_cached_input_mm_embeds(multimodal_params)
+        if len(mm_embeds) == 0:
+            raise ValueError(
+                "No multimodal embeddings were provided for active multimodal params. "
+                "The encoder handoff may be missing or malformed.")
 
     if total_mm_tokens == sum(mm_embed.shape[0] for mm_embed in mm_embeds):
         return mm_embeds

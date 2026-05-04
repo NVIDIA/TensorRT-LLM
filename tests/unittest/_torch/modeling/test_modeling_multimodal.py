@@ -383,12 +383,15 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
                     else num_cached_tokens_per_seq[0] + input_ids.size(-1)
                 )
                 full_mask = torch.zeros(prompt_len, dtype=torch.bool)
-                for unit_idx in range(len(mi.multimodal_positions)):
-                    pos = mi.multimodal_positions[unit_idx]
-                    length = mi.multimodal_lengths[unit_idx]
-                    # Default all positions inside the outer box to embed=True
-                    # (tests here don't model inline specials).
-                    full_mask[pos : pos + length] = True
+                covered_prompt_len = 0
+                for item_runs in mi.multimodal_item_runs:
+                    for pos, length, non_embed_offsets in item_runs:
+                        covered_prompt_len += length
+                        full_mask[pos : pos + length] = True
+                        for offset in non_embed_offsets:
+                            full_mask[pos + offset] = False
+                self.assertEqual(covered_prompt_len, sum(mi.multimodal_prompt_lengths))
+                self.assertEqual(full_mask.sum().item(), sum(mi.multimodal_embedding_lengths))
                 multimodal_runtime = MultimodalRuntimeData(
                     embed_mask_cumsum=full_mask.cumsum(0, dtype=torch.int64),
                     past_seen_token_num=num_cached_tokens_per_seq[0],

@@ -21,9 +21,9 @@ from .content_format import ContentFormat
 from .data import TextPrompt
 from .multimodal import (MultimodalInput, _as_cpu_tensor, _compute_mm_masks,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
-                         find_mm_token_item_runs, find_mm_token_lengths,
-                         default_hasher, hexdigest_to_int32,
-                         validate_mm_inputs)
+                         default_hasher, find_mm_token_item_runs,
+                         find_mm_token_lengths, hexdigest_to_int32,
+                         validate_mm_item_runs)
 
 N = TypeVar("N", bound=Type[nn.Module])
 
@@ -943,7 +943,7 @@ def create_input_processor_with_hash(
         # its idempotency guard, avoiding a second full-sequence isin pass.
         input_ids_tensor = _as_cpu_tensor(prompt_token_ids)
         if input_ids_tensor.numel() == 0:
-            start_positions, start_special_token_positions = [], []
+            start_special_token_positions = []
         else:
             mm_mask, embed_mask, special_mask = _compute_mm_masks(
                 input_ids_tensor,
@@ -954,7 +954,7 @@ def create_input_processor_with_hash(
             extra_processed_inputs["multimodal_data"].setdefault(
                 "multimodal_embed_mask_cumsum",
                 embed_mask.cumsum(0, dtype=torch.int64))
-            start_positions, start_special_token_positions = (
+            _, start_special_token_positions = (
                 _find_mm_token_start_pos_from_masks(mm_mask, special_mask,
                                                     num_mm_tokens))
         # Store special token offsets if available
@@ -964,8 +964,6 @@ def create_input_processor_with_hash(
                 "special_token_offsets"] = start_special_token_positions
         # flatten the hashes from dict to a single list
         mm_hashes_flat = [h for hashes in mm_hashes.values() for h in hashes]
-        validate_mm_inputs(prompt_token_ids, mm_hashes_flat, start_positions,
-                           num_mm_tokens)
         mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes_flat
                            ]  # nested list w/ multiple int32 per hash
         mm_item_runs = find_mm_token_item_runs(
@@ -974,14 +972,11 @@ def create_input_processor_with_hash(
             vocab_size=vocab_size,
             mm_token_ids=mm_ids,
             mm_special_token_ids=mm_special_token_ids)
+        validate_mm_item_runs(prompt_token_ids, mm_hashes_flat, mm_item_runs)
 
         extra_processed_inputs[
             "multimodal_input"] = MultimodalInput.from_components(
-                mm_hashes_int32,
-                start_positions,
-                num_mm_tokens,
-                mm_uuid_list,
-                mm_item_runs=mm_item_runs)
+                mm_hashes_int32, mm_item_runs, mm_uuid_list)
         return prompt_token_ids, extra_processed_inputs
 
     def process_tokenized_prompt_maybe_hash(

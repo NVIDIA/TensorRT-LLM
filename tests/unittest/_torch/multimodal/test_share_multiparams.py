@@ -44,8 +44,9 @@ class TestMultimodalParamsHandleConversion(unittest.TestCase):
         params = MultimodalParams()
         multimodal_input = MultimodalInput(
             multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]] * 2,
-            multimodal_positions=[0, 10],
-            multimodal_lengths=[2, 2])
+            multimodal_item_runs=[[(0, 2, [])], [(10, 3, [1])]])
+        self.assertEqual(multimodal_input.multimodal_embedding_lengths, [2, 2])
+        self.assertEqual(multimodal_input.multimodal_prompt_lengths, [2, 3])
         params.multimodal_input = multimodal_input
 
         with self.assertRaises(ValueError) as context:

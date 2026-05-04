@@ -4,13 +4,38 @@
 import pytest
 import torch
 
+import tensorrt_llm.inputs.multimodal as multimodal_module
 from tensorrt_llm.inputs.multimodal import (
     MultimodalInput,
     MultimodalRuntimeData,
     _find_mm_token_start_pos_from_masks,
     find_mm_token_item_runs,
     get_multimodal_embedding_lengths,
+    validate_mm_item_runs,
 )
+from tensorrt_llm.inputs.registry import create_input_processor_with_hash
+
+
+class _HashingTestInputProcessor:
+    def __init__(self):
+        self.multimodal_hashing_supported = None
+        self.call_count = 0
+
+    def __call__(self, inputs, sampling_params):
+        self.call_count += 1
+        return [11, 999, 999, 12], {"multimodal_data": {}}
+
+    def get_num_tokens_per_image(self, *, image):
+        return 2
+
+    def get_vocab_size(self):
+        return None
+
+    def get_mm_token_ids(self):
+        return torch.tensor([999])
+
+    def get_mm_special_token_ids(self):
+        return None
 
 
 def test_find_mm_token_start_pos_from_masks_returns_two_lists_for_all_text():
@@ -53,39 +78,114 @@ def test_find_mm_token_item_runs_preserves_non_embed_offsets():
     assert get_multimodal_embedding_lengths(item_runs) == [3]
 
 
-def test_multimodal_input_from_components_preserves_legacy_uuid_position():
+def test_validate_mm_item_runs_rejects_prompt_overflow():
+    with pytest.raises(AssertionError, match="exceeding input sequence length"):
+        validate_mm_item_runs(
+            prompt_token_ids=[11, 999],
+            mm_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+            mm_item_runs=[[(1, 2, [])]],
+        )
+
+
+def test_validate_mm_item_runs_rejects_global_overlap():
+    with pytest.raises(AssertionError, match="globally non-overlapping"):
+        validate_mm_item_runs(
+            prompt_token_ids=[999, 999, 999],
+            mm_hashes=[
+                [1, 2, 3, 4, 5, 6, 7, 8],
+                [8, 7, 6, 5, 4, 3, 2, 1],
+            ],
+            mm_item_runs=[[(1, 2, [])], [(2, 1, [])]],
+        )
+
+
+def test_validate_mm_item_runs_allows_interleaved_non_overlapping_items():
+    validate_mm_item_runs(
+        prompt_token_ids=[999, 999, 999, 999, 999],
+        mm_hashes=[
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            [8, 7, 6, 5, 4, 3, 2, 1],
+        ],
+        mm_item_runs=[[(1, 1, []), (4, 1, [])], [(3, 1, [])]],
+    )
+
+
+def test_multimodal_input_from_components_preserves_uuid():
     mm_hashes = [[1, 2, 3, 4, 5, 6, 7, 8]]
-    mm_positions = [1]
-    mm_lengths = [2]
+    mm_item_runs = [[(1, 2, [])]]
     mm_uuids = ["uuid-a"]
 
-    mm_input = MultimodalInput.from_components(mm_hashes, mm_positions, mm_lengths, mm_uuids)
+    mm_input = MultimodalInput.from_components(mm_hashes, mm_item_runs, mm_uuids)
 
     assert mm_input.multimodal_uuids == mm_uuids
-    assert mm_input.multimodal_item_runs == [[(1, 2, [])]]
+    assert mm_input.multimodal_item_runs == mm_item_runs
+    assert mm_input.multimodal_embedding_lengths == [2]
+    assert mm_input.multimodal_prompt_lengths == [2]
 
 
 def test_multimodal_input_accepts_item_runs():
     mm_input = MultimodalInput.from_components(
         [[1, 2, 3, 4, 5, 6, 7, 8]],
-        [1],
-        [2],
+        [[(1, 1, []), (3, 1, [])]],
         mm_uuids=["uuid-a"],
-        mm_item_runs=[[(1, 1, []), (3, 1, [])]],
     )
 
     assert mm_input.multimodal_item_runs == [[(1, 1, []), (3, 1, [])]]
+    assert mm_input.multimodal_embedding_lengths == [2]
+    assert mm_input.multimodal_prompt_lengths == [2]
 
 
-def test_multimodal_input_derives_position_and_length_from_item_runs():
+def test_create_input_processor_with_hash_preserves_item_runs_and_support():
+    input_processor = _HashingTestInputProcessor()
+    wrapped_processor = create_input_processor_with_hash(input_processor)
+
+    prompt_token_ids, extra_processed_inputs = wrapped_processor(
+        {
+            "prompt": "text <image> text",
+            "multi_modal_data": {"image": torch.tensor([1, 2, 3])},
+        },
+        sampling_params=object(),
+    )
+
+    multimodal_input = extra_processed_inputs["multimodal_input"]
+    assert prompt_token_ids == [11, 999, 999, 12]
+    assert input_processor.call_count == 1
+    assert input_processor.multimodal_hashing_supported is True
+    assert isinstance(multimodal_input, MultimodalInput)
+    assert multimodal_input.multimodal_item_runs == [[(1, 2, [])]]
+    assert multimodal_input.multimodal_embedding_lengths == [2]
+    assert multimodal_input.multimodal_prompt_lengths == [2]
+    assert len(multimodal_input.multimodal_hashes) == 1
+    assert len(multimodal_input.multimodal_hashes[0]) == 8
+
+
+def test_multimodal_input_rejects_legacy_layout_fields():
+    with pytest.raises(TypeError, match="multimodal_positions"):
+        MultimodalInput(
+            multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+            multimodal_positions=[1],
+            multimodal_lengths=[2],
+        )
+
+
+def test_multimodal_input_requires_item_runs():
+    with pytest.raises(TypeError, match="multimodal_item_runs"):
+        MultimodalInput(multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]])
+
+
+def test_multimodal_input_stores_lengths_from_item_runs_once(monkeypatch):
     mm_input = MultimodalInput(
         multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
         multimodal_item_runs=[[(1, 1, []), (3, 1, [])]],
     )
 
-    assert mm_input.multimodal_positions == [1]
-    assert mm_input.multimodal_lengths == [2]
+    def fail_on_recompute(item_runs):
+        raise AssertionError("multimodal lengths should be cached")
+
+    monkeypatch.setattr(multimodal_module, "get_multimodal_embedding_lengths", fail_on_recompute)
+
     assert mm_input.multimodal_embedding_lengths == [2]
+    assert mm_input.multimodal_prompt_lengths == [2]
 
 
 def test_multimodal_input_derives_embedding_lengths_from_non_embed_offsets():
@@ -94,16 +194,16 @@ def test_multimodal_input_derives_embedding_lengths_from_non_embed_offsets():
         multimodal_item_runs=[[(1, 5, [2, 4])]],
     )
 
-    assert mm_input.multimodal_positions == [1]
-    assert mm_input.multimodal_lengths == [5]
     assert mm_input.multimodal_embedding_lengths == [3]
+    assert mm_input.multimodal_prompt_lengths == [5]
     assert mm_input.multimodal_item_runs == [[(1, 5, [2, 4])]]
 
 
 def test_multimodal_input_rejects_item_run_length_mismatch():
-    with pytest.raises(ValueError, match="multimodal_item_runs\\[0\\] total length"):
+    with pytest.raises(ValueError, match="multimodal_item_runs length"):
         MultimodalInput.from_components(
-            [[1, 2, 3, 4, 5, 6, 7, 8]], [1], [2], mm_item_runs=[[(1, 1, [])]]
+            [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]],
+            [[(1, 1, [])]],
         )
 
 
@@ -111,9 +211,7 @@ def test_multimodal_input_rejects_overlapping_item_runs():
     with pytest.raises(ValueError, match="ordered and non-overlapping"):
         MultimodalInput.from_components(
             [[1, 2, 3, 4, 5, 6, 7, 8]],
-            [1],
-            [2],
-            mm_item_runs=[[(1, 2, []), (2, 1, [])]],
+            [[(1, 2, []), (2, 1, [])]],
         )
 
 
@@ -126,9 +224,7 @@ def test_multimodal_input_rejects_overlapping_item_runs():
 )
 def test_multimodal_input_rejects_non_canonical_item_run_shapes(item_runs):
     with pytest.raises(TypeError, match="prompt_start, run_length, non_embed_offsets"):
-        MultimodalInput.from_components(
-            [[1, 2, 3, 4, 5, 6, 7, 8]], [1], [2], mm_item_runs=item_runs
-        )
+        MultimodalInput.from_components([[1, 2, 3, 4, 5, 6, 7, 8]], item_runs)
 
 
 def _embed_cumsum_from_runs(item_runs, prompt_len):
