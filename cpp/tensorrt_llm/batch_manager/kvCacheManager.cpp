@@ -583,7 +583,8 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
     std::optional<BaseAgentConfig> agentConfig, bool enableIndexerKCache, SizeType32 indexerKCacheQuantBlockSize,
-    SizeType32 indexerKCacheIndexHeadDim, std::optional<LinearAttentionMetadata> linearAttentionMetadata)
+    SizeType32 indexerKCacheIndexHeadDim, std::optional<LinearAttentionMetadata> linearAttentionMetadata,
+    std::unordered_map<SizeType32, nvinfer1::DataType> perLayerDtype)
     : mNumLayers{static_cast<SizeType32>(numKvHeadsPerLayer.size())}
     , mTokensPerBlock{tokensPerBlock}
     , mEventManager{std::move(eventManager)}
@@ -665,7 +666,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
             enablePartialReuse, copyOnPartialReuse, kvCacheConnectorManager, mLookupTree, mLoopbackAgent,
             enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim,
             LinearAttentionMetadata::hasLinearCache(windowSize) ? linearAttentionMetadata : std::nullopt,
-            numPlaceholderBlocks);
+            numPlaceholderBlocks, perLayerDtype);
     }
 
     auto const numAllPools = getNumPools();
@@ -724,8 +725,10 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
     radix_block_tree::UnifiedBlockTree& lookupTree, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent,
     bool enableIndexerKCache, SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
-    std::optional<LinearAttentionMetadata> linearAttentionMetadata, SizeType32 numPlaceholderBlocks)
+    std::optional<LinearAttentionMetadata> linearAttentionMetadata, SizeType32 numPlaceholderBlocks,
+    std::unordered_map<SizeType32, nvinfer1::DataType> perLayerDtype)
     : mDataType{dtype}
+    , mPerLayerDtype{std::move(perLayerDtype)}
     , mWindowSize{windowSize}
     , mNumPrimaryBlocks{blocksInPrimaryPool}
     , mNumSecondaryBlocks{blocksInSecondaryPool}
@@ -766,28 +769,48 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mLinearAttentionMetadata{std::move(linearAttentionMetadata)}
 {
     TLLM_LOG_DEBUG("Creating WindowBlockManager for windowSize=%d", windowSize);
-    std::map<SizeType32, SizeType32> numLayersPerPool;
+
+    // Helper: resolve the dtype for a given layer (falls back to the global mDataType).
+    auto poolDtypeOf = [&](SizeType32 layerIdx) -> nvinfer1::DataType
+    {
+        auto it = mPerLayerDtype.find(layerIdx);
+        return it != mPerLayerDtype.end() ? it->second : mDataType;
+    };
+
+    // Group layers by (numKvHeads, dtype) so that layers with the same head count but different
+    // precisions are allocated to separate memory pools.
+    using PoolKey = std::pair<SizeType32, nvinfer1::DataType>;
+    std::map<PoolKey, SizeType32> numLayersPerPool;
 
     for (auto const layerIdx : managedLayers)
     {
-        auto const& layerIndexWithinPool = numLayersPerPool[numKvHeadsPerLayer.at(layerIdx)]++;
+        PoolKey const key{numKvHeadsPerLayer.at(layerIdx), poolDtypeOf(layerIdx)};
+        auto const layerIndexWithinPool = numLayersPerPool[key]++;
         mLayerToIndexWithinPool[layerIdx] = layerIndexWithinPool;
     }
 
-    auto numEltsPerContainer = getNumEltsPerContainer();
 #ifdef ENABLE_FP4
-    if (numEltsPerContainer == 2)
+    constexpr SizeType32 kQuantBlockSizeNVFP4 = 16;
+    for (auto const& [key, numLayers] : numLayersPerPool)
     {
-        TLLM_CHECK_WITH_INFO(sizePerHead % 2 == 0, "sizePerHead must be divisible by 2 for 4-bit KV cache.");
+        if (key.second == nvinfer1::DataType::kFP4)
+        {
+            TLLM_CHECK_WITH_INFO(sizePerHead % 2 == 0, "sizePerHead must be divisible by 2 for 4-bit KV cache.");
+            break;
+        }
     }
 #endif
 
     size_t poolIndex = 0;
-    for (auto const [numKvHeads, numLayers] : numLayersPerPool)
+    for (auto const& [poolKey, numLayers] : numLayersPerPool)
     {
+        auto const [numKvHeads, poolDtype] = poolKey;
+        // FP4 packs 2 values per byte; all other dtypes are 1 element per container.
+        SizeType32 const numEltsForThisPool = (poolDtype == nvinfer1::DataType::kFP4) ? 2 : 1;
+
         for (auto const layerIdx : managedLayers)
         {
-            if (numKvHeadsPerLayer.at(layerIdx) == numKvHeads)
+            if (numKvHeadsPerLayer.at(layerIdx) == numKvHeads && poolDtypeOf(layerIdx) == poolDtype)
             {
                 mLayerToPoolIndex[layerIdx] = poolIndex;
             }
@@ -795,25 +818,36 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
         if (isRecurrentState())
         {
             TLLM_CHECK(numLayersPerPool.size() == 1);
-            auto bytesPerElement = common::getDTypeSize(mDataType);
+            auto bytesPerElement = common::getDTypeSize(poolDtype);
             KVCacheBlockPool pool(numLayers, /*kvFactor=*/1, /*numKvHeads=*/-1,
                 /*sizePerHead=*/-1, tokensPerBlock);
             pool.blockSize = mLinearAttentionMetadata->allRecurrentStatesBytes / bytesPerElement;
+            pool.dataType = poolDtype;
             mPools.push_back(std::move(pool));
         }
         else
         {
-            mPools.emplace_back(numLayers, mKVFactor, numKvHeads, sizePerHead / numEltsPerContainer, tokensPerBlock);
+            auto& newPool = mPools.emplace_back(
+                numLayers, mKVFactor, numKvHeads, sizePerHead / numEltsForThisPool, tokensPerBlock);
+            newPool.dataType = poolDtype;
         }
         ++poolIndex;
     }
 
 #ifdef ENABLE_FP4
-    // TODO(miovine): make the block size configurable. Should we have an additional argument
-    // to specify FP4 related parameters (scale dtypes, etc)? This can also be passed
-    // in the constructor.
-    constexpr SizeType32 kQuantBlockSizeNVFP4 = 16;
-    if (dtype == nvinfer1::DataType::kFP4)
+    // Create block-scale pools for any FP4 data pools. Non-FP4 pools are skipped inside
+    // createBlockScalePools via the pool.dataType check.
+    bool hasAnyFP4Pool = false;
+    for (auto const& pool : mPools)
+    {
+        if (!pool.containsBlockScales && !pool.containsIndexerKCache
+            && pool.dataType == nvinfer1::DataType::kFP4)
+        {
+            hasAnyFP4Pool = true;
+            break;
+        }
+    }
+    if (hasAnyFP4Pool)
     {
         createBlockScalePools(kQuantBlockSizeNVFP4);
     }
@@ -1006,7 +1040,9 @@ void WindowBlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequ
 
 void WindowBlockManager::createBlockScalePools(SizeType32 quantBlockSize)
 {
-    SizeType32 const numEltsPerContainer = getNumEltsPerContainer();
+    // FP4 packs 2 values per byte.
+    constexpr SizeType32 kFP4EltsPerContainer = 2;
+
     SizeType32 numPools = mPools.size();
     for (SizeType32 i = 0; i < numPools; ++i)
     {
@@ -1015,9 +1051,14 @@ void WindowBlockManager::createBlockScalePools(SizeType32 quantBlockSize)
         {
             continue;
         }
-        TLLM_CHECK_WITH_INFO((kvPool.sizePerHead * numEltsPerContainer) % quantBlockSize == 0,
+        // Only create scale pools for FP4 data pools.
+        if (kvPool.dataType != nvinfer1::DataType::kFP4)
+        {
+            continue;
+        }
+        TLLM_CHECK_WITH_INFO((kvPool.sizePerHead * kFP4EltsPerContainer) % quantBlockSize == 0,
             "Cannot use FP4 quantization since kvPool.sizePerHead is not divisible by FP4 quantBlockSize.");
-        auto blockScaleSizePerHead = kvPool.sizePerHead * numEltsPerContainer / quantBlockSize;
+        auto blockScaleSizePerHead = kvPool.sizePerHead * kFP4EltsPerContainer / quantBlockSize;
         mPools.emplace_back(kvPool.numLayers, kvPool.kvFactor, kvPool.numKvHeads, blockScaleSizePerHead,
             kvPool.tokensPerBlock,
             /*primaryPool=*/nullptr,
@@ -1039,12 +1080,15 @@ void WindowBlockManager::createIndexerKCachePools()
         }
         SizeType32 scaleSize = mIndexerKCacheIndexHeadDim / mIndexerKCacheQuantBlockSize * 4;
 
-        mPools.emplace_back(kvPool.numLayers, kvPool.kvFactor, 1, scaleSize + mIndexerKCacheIndexHeadDim,
-            kvPool.tokensPerBlock,
+        auto& newPool = mPools.emplace_back(kvPool.numLayers, kvPool.kvFactor, 1,
+            scaleSize + mIndexerKCacheIndexHeadDim, kvPool.tokensPerBlock,
             /*primaryPool=*/nullptr,
             /*secondaryPool=*/nullptr,
             /*containsBlockScales=*/false,
             /*containsIndexerKCache=*/true);
+        // Indexer-K cache buffers are always allocated as kUINT8; record that so the
+        // byte-accounting in KVCacheManager::allocatePools() uses the correct element size.
+        newPool.dataType = nvinfer1::DataType::kUINT8;
     }
 }
 
@@ -1060,12 +1104,13 @@ void WindowBlockManager::allocatePools(bool useUvm)
 {
     constexpr nvinfer1::DataType kScaleDtypeNVFP4 = nvinfer1::DataType::kFP8;
 
-    // Allocate a memory pool backing the blocks for each numKvHeads
+    // Allocate a memory pool backing the blocks for each (numKvHeads, dtype) group.
     // TODO(oargov): allocate pools in a single buffer and split it, to avoid fragmentation
     for (auto& pool : mPools)
     {
         auto blockSize = pool.blockSize;
-        auto poolDtype = pool.containsBlockScales ? kScaleDtypeNVFP4 : mDataType;
+        // Scale pools are always FP8; data pools use their own per-pool dtype.
+        auto poolDtype = pool.containsBlockScales ? kScaleDtypeNVFP4 : pool.dataType;
 #ifdef ENABLE_FP4
         auto const poolIsFP4 = poolDtype == nvinfer1::DataType::kFP4;
 #else
@@ -3033,13 +3078,14 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool enableIndexerKCache,
     SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
-    std::optional<LinearAttentionMetadata> linearAttentionMetadata)
+    std::optional<LinearAttentionMetadata> linearAttentionMetadata,
+    std::unordered_map<SizeType32, nvinfer1::DataType> perLayerDtype)
     : KVCacheManager(numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences, maxBeamWidth,
         maxAttentionWindowVec, tempAttentionWindowInputs, dtype, sinkTokenLength,
         std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength,
         enableBlockReuse, cacheType, secondaryOffloadMinPriority, eventManager, enablePartialReuse, copyOnPartialReuse,
         kvCacheConnectorManager, enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim,
-        linearAttentionMetadata)
+        linearAttentionMetadata, std::move(perLayerDtype))
 {
 }
 
@@ -3052,7 +3098,8 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool enableIndexerKCache,
     SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
-    std::optional<LinearAttentionMetadata> linearAttentionMetadata)
+    std::optional<LinearAttentionMetadata> linearAttentionMetadata,
+    std::unordered_map<SizeType32, nvinfer1::DataType> perLayerDtype)
     : mMaxBeamWidth(maxBeamWidth)
     , mDataType(dtype)
     , mMaxAttentionWindow(*std::max_element(maxAttentionWindowVec.begin(), maxAttentionWindowVec.end()))
@@ -3063,7 +3110,8 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
           std::move(stream), maxSequenceLength, maxBeamWidth, maxAttentionWindowVec, tempAttentionWindowInputs, dtype,
           mSinkBubbleLength, cacheType, secondaryOffloadMinPriority, std::move(eventManager), enablePartialReuse,
           copyOnPartialReuse, std::move(kvCacheConnectorManager), std::nullopt, enableIndexerKCache,
-          indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, linearAttentionMetadata)
+          indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, linearAttentionMetadata,
+          std::move(perLayerDtype))
     // disable block reuse for sink bubble since chopVectorIntoBlocks does not match KV cache blocks in this case
     , mEnableBlockReuse{mSinkBubbleLength > 0 ? false : enableBlockReuse}
 {
@@ -3106,66 +3154,137 @@ void KVCacheManager::allocatePools(bool useUvm)
     mBlockManager.allocatePools(useUvm);
     auto const numPools = mBlockManager.getNumPools();
 
+    // Compute the total bytes occupied by all primary KV-cache pools.
+    //
+    // There are two categories of pools for NVFP4 KV cache:
+    //   1. KV element pools  — store the actual K/V data, packed as INT8
+    //                          (2 FP4 values per byte).
+    //   2. Block scale pools — store per-block FP8 quantization scales
+    //                          (1 scale per 16 FP4 elements).
+    //
+    // BUG FIX 1 (scale pool dtype):
+    //   The original code applied the FP4 byte formula `(volume * 4) / 8` to
+    //   every pool when mDataType == kFP4, including block scale pools whose
+    //   elements are FP8 (1 byte each).  This caused a 2× undercount of the
+    //   scale pool size.  Fix: detect containsBlockScales and use the FP8
+    //   element size unconditionally for those pools.
+    //
+    // BUG FIX 2 (FP4 element pool double-halving):
+    //   When a FP4 element pool is constructed, sizePerHead is already divided
+    //   by numEltsPerContainer=2 so that each "element" in the pool tensor
+    //   represents one packed INT8 byte (holding 2 FP4 values).  The original
+    //   formula `(cacheVolume * 4) / 8` = cacheVolume * 0.5 halved the volume
+    //   a second time, reporting half the actual GPU allocation.  Fix: treat
+    //   each element as 1 byte (kINT8), matching how allocatePools() allocates
+    //   the buffer (see WindowBlockManager::allocatePools where poolDtype is
+    //   set to kINT8 for FP4 pools before calling gpuSync).
     uint64_t cacheSizeBytes = 0;
+    uint64_t elemPoolBytes = 0;
+    uint64_t scalePoolBytes = 0;
     for (SizeType32 poolIdx = 0; poolIdx < numPools; poolIdx++)
     {
+        auto const& pool = mBlockManager.getPool(poolIdx);
         auto const cacheShape = mBlockManager.getPrimaryPool(poolIdx)->getShape();
         auto const cacheVolume = ITensor::volume(cacheShape);
-#ifdef ENABLE_FP4
-        auto const isFp4 = mDataType == nvinfer1::DataType::kFP4;
-#else
-        auto const isFp4 = false;
-#endif
-        if (!isFp4)
+        uint64_t poolBytes = 0;
+        if (pool.containsBlockScales)
         {
-            cacheSizeBytes += cacheVolume * BufferDataType(mDataType).getSize();
+            // BUG FIX 1: scale pools are FP8 regardless of mDataType.
+            poolBytes = cacheVolume * BufferDataType(nvinfer1::DataType::kFP8).getSize();
+            scalePoolBytes += poolBytes;
         }
         else
         {
-            cacheSizeBytes += (cacheVolume * 4) / 8;
+#ifdef ENABLE_FP4
+            // Use each pool's own dtype (not the global mDataType) to handle mixed-precision.
+            auto const isFp4 = pool.dataType == nvinfer1::DataType::kFP4;
+#else
+            auto const isFp4 = false;
+#endif
+            if (isFp4)
+            {
+                // BUG FIX 2: sizePerHead was already halved at pool construction
+                // (sizePerHead / numEltsPerContainer), so cacheVolume is already
+                // in bytes (INT8 elements).  Use size 1, not 0.5.
+                poolBytes = cacheVolume * BufferDataType(nvinfer1::DataType::kINT8).getSize();
+            }
+            else
+            {
+                poolBytes = cacheVolume * BufferDataType(pool.dataType).getSize();
+            }
+            elemPoolBytes += poolBytes;
         }
+        cacheSizeBytes += poolBytes;
     }
     // Save the total number of bytes allocated for the KV-cache for KvCacheStats
     mAllocatedBytes = cacheSizeBytes;
     if (tc::Logger::getLogger()->getLevel() <= tc::Logger::INFO)
     {
-
         TLLM_LOG_INFO("Number of tokens per block: %d.", mBlockManager.getTokensPerBlock());
         auto const maxNumTokens = mBlockManager.getNumPrimaryBlocks() * mBlockManager.getTokensPerBlock();
         TLLM_LOG_INFO("[MemUsageChange] Allocated %0.2f GiB for max tokens in paged KV cache (%d).",
+            cacheSizeBytes / static_cast<double>(1 << 30), maxNumTokens);
+        TLLM_LOG_DEBUG(
+            "KV cache pool breakdown: element pool=%.2f GiB, scale pool=%.2f GiB, total=%.2f GiB"
+            " [max tokens=%d]",
+            elemPoolBytes / static_cast<double>(1 << 30), scalePoolBytes / static_cast<double>(1 << 30),
             cacheSizeBytes / static_cast<double>(1 << 30), maxNumTokens);
     }
 
     auto const numKVPools
         = mBlockManager.getNumPools(/*include_block_scalar_pools=*/false, /*include_indexer_k_cache_pools=*/false);
-    auto const numBlockScalePools
-        = mBlockManager.getNumPools(/*includeBlockScalePools=*/true, /*includeIndexerKCachePools=*/false) - numKVPools;
 
-    // Code in the attention kernels is cleaner if we can access the KV values and block scales separately.
+    // Data pool pointers: shape (numKVPools, 2) — [primary_ptr, secondary_ptr].
     mBlockPoolPointers = BufferManager::cpu(ITensor::makeShape({numKVPools, 2}), TRTDataType<void*>::value);
-    mBlockScalePoolPointers
-        = BufferManager::cpu(ITensor::makeShape({numBlockScalePools, 2}), TRTDataType<void*>::value);
+
+    // Scale pool pointers: shape (numKVPools, 2) — aligned 1:1 with data pools.
+    // Non-FP4 data pools have zero (null) scale pointer entries. This uniform shape
+    // lets Python always stack (data, scale) into a (numKVPools, 2, 2) tensor for
+    // mixed-precision KV cache without special-casing.
+    mBlockScalePoolPointers = BufferManager::cpu(ITensor::makeShape({numKVPools, 2}), TRTDataType<void*>::value);
 
     auto poolPtrsRange = BufferRange<void*>(*mBlockPoolPointers);
     auto blockScalePtrsRange = BufferRange<void*>(*mBlockScalePoolPointers);
-    SizeType32 kvPoolIdx = 0;
-    SizeType32 blockScalePoolIdx = 0;
+    // Zero-initialise scale pointers; non-FP4 data pool entries remain null.
+    std::fill(blockScalePtrsRange.begin(), blockScalePtrsRange.end(), nullptr);
 
+    // First pass: fill data pool pointers and record, in order, which KV pool slots belong
+    // to FP4 data pools (they will be matched to scale pools below).
+    std::vector<SizeType32> fp4DataPoolSlots;
+    SizeType32 kvPoolIdx = 0;
     for (SizeType32 poolIdx = 0; poolIdx < numPools; poolIdx++)
     {
         auto const& pool = mBlockManager.getPool(poolIdx);
-        auto& outIdx = pool.containsBlockScales ? blockScalePoolIdx : kvPoolIdx;
-        auto& outRange = pool.containsBlockScales ? blockScalePtrsRange : poolPtrsRange;
         if (pool.containsIndexerKCache)
         {
             mIndexerKCachePoolPointers = pool.primaryPtr;
         }
-        else
+        else if (!pool.containsBlockScales)
         {
-            outRange[outIdx * 2] = pool.primaryPtr->data();
-            outRange[outIdx * 2 + 1] = pool.secondaryPtr ? pool.secondaryPtr->data() : nullptr;
-            outIdx++;
+            poolPtrsRange[kvPoolIdx * 2] = pool.primaryPtr->data();
+            poolPtrsRange[kvPoolIdx * 2 + 1] = pool.secondaryPtr ? pool.secondaryPtr->data() : nullptr;
+            if (pool.dataType == nvinfer1::DataType::kFP4)
+            {
+                fp4DataPoolSlots.push_back(kvPoolIdx);
+            }
+            kvPoolIdx++;
         }
+    }
+    // Second pass: match scale pools to their FP4 data pools in creation order.
+    // createBlockScalePools() creates one scale pool per FP4 data pool in the same order.
+    SizeType32 scaleIdx = 0;
+    for (SizeType32 poolIdx = 0; poolIdx < numPools && scaleIdx < static_cast<SizeType32>(fp4DataPoolSlots.size());
+         poolIdx++)
+    {
+        auto const& pool = mBlockManager.getPool(poolIdx);
+        if (!pool.containsBlockScales || pool.containsIndexerKCache)
+        {
+            continue;
+        }
+        SizeType32 const kvSlot = fp4DataPoolSlots[scaleIdx];
+        blockScalePtrsRange[kvSlot * 2] = pool.primaryPtr->data();
+        blockScalePtrsRange[kvSlot * 2 + 1] = pool.secondaryPtr ? pool.secondaryPtr->data() : nullptr;
+        scaleIdx++;
     }
 
     auto const numLayers = mBlockManager.getNumLayers();

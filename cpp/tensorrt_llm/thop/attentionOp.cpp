@@ -1020,11 +1020,28 @@ KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPo
     }
     else
     {
-        TORCH_CHECK(hostKvCachePoolPointers.dim() == 2);
-        pointers.primaryPoolPtr = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 0}).item<int64_t>()) + intraPoolOffset);
-        pointers.secondaryPoolPtr = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 1}).item<int64_t>()) + intraPoolOffset);
+        TORCH_CHECK(hostKvCachePoolPointers.dim() == 2 || hostKvCachePoolPointers.dim() == 3);
+        // In mixed-precision KV cache (e.g. fp8 + nvfp4), the tensor is built as 3D to
+        // accommodate FP4 scale pool pointers. For non-FP4 pools the data pointers sit at
+        // index [..., 0] of the last dimension; secondary scale entries are unused zeros.
+        if (hostKvCachePoolPointers.dim() == 3)
+        {
+            pointers.primaryPoolPtr = reinterpret_cast<void*>(
+                reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 0, 0}).item<int64_t>())
+                + intraPoolOffset);
+            pointers.secondaryPoolPtr = reinterpret_cast<void*>(
+                reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 1, 0}).item<int64_t>())
+                + intraPoolOffset);
+        }
+        else
+        {
+            pointers.primaryPoolPtr = reinterpret_cast<void*>(
+                reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 0}).item<int64_t>())
+                + intraPoolOffset);
+            pointers.secondaryPoolPtr = reinterpret_cast<void*>(
+                reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 1}).item<int64_t>())
+                + intraPoolOffset);
+        }
     }
     return pointers;
 }

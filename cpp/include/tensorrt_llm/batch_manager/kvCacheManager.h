@@ -695,6 +695,10 @@ public:
     // Used for recurrent state (linear attention) pools.
     bool layerFirstLayout;
 
+    // The dtype of the data stored in this pool. May differ from the KVCacheManager's global
+    // mDataType when mixed-precision KV cache is enabled (e.g. some layers use FP8, others NVFP4).
+    nvinfer1::DataType dataType{nvinfer1::DataType::kFLOAT};
+
     KVCacheBlockPool(SizeType32 numLayers, SizeType32 kvFactor, SizeType32 numKvHeads, SizeType32 sizePerHead,
         SizeType32 tokensPerBlock, runtime::ITensor::SharedPtr primaryPtr = nullptr,
         runtime::ITensor::SharedPtr secondaryPtr = nullptr, bool containsBlockScales = false,
@@ -774,7 +778,8 @@ public:
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0,
         std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
-        SizeType32 numPlaceholderBlocks = 0);
+        SizeType32 numPlaceholderBlocks = 0,
+        std::unordered_map<SizeType32, nvinfer1::DataType> perLayerDtype = {});
 
     ~WindowBlockManager();
 
@@ -1226,6 +1231,10 @@ private:
     nvinfer1::DataType mDataType;
     SizeType32 mWindowSize;
 
+    // Per-layer dtype overrides. Layers absent from this map use mDataType.
+    // Enables mixed-precision KV cache (e.g., layers 0-3: FP8, layers 4-35: NVFP4).
+    std::unordered_map<SizeType32, nvinfer1::DataType> mPerLayerDtype;
+
     // Number of blocks in pools
     SizeType32 mNumPrimaryBlocks;
     SizeType32 mNumSecondaryBlocks;
@@ -1233,7 +1242,7 @@ private:
     // List of allocated blocks for each sequences
     std::unordered_map<LlmRequest::RequestIdType, std::vector<BlockPtr>> mAllocatedBlocksPerSeq;
 
-    // Pool per unique numKvHeads in the model
+    // Pool per unique (numKvHeads, dtype) pair in the model
     std::vector<KVCacheBlockPool> mPools;
 
     // Matching layers to their respective pools: {<layer #0>: <pool idx 2>, }, etc.
@@ -1345,7 +1354,8 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         std::optional<kvc::BaseAgentConfig> agentConfig = std::nullopt, bool enableIndexerKCache = false,
         SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0,
-        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
+        std::unordered_map<SizeType32, nvinfer1::DataType> perLayerDtype = {});
 
     [[nodiscard]] bool isEnableIndexerKCache() const
     {
@@ -2047,7 +2057,8 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0,
-        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
+        std::unordered_map<SizeType32, nvinfer1::DataType> perLayerDtype = {});
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -2061,7 +2072,8 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0,
-        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
+        std::unordered_map<SizeType32, nvinfer1::DataType> perLayerDtype = {});
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,

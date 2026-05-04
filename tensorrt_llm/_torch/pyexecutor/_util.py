@@ -17,7 +17,7 @@ from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
     KvCacheConfig, MTPDecodingConfig, PeftCacheConfig, SamplerType,
     SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs,
-    WaitingQueuePolicy)
+    WaitingQueuePolicy, parse_kv_cache_dtype_spec)
 # isort: on
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
@@ -889,6 +889,152 @@ def _build_per_layer_num_kv_heads(
                                                         ] * num_spec_layers
 
 
+def _dtype_str_to_binding(dtype_str: str,
+                          fallback_dtype: "tensorrt_llm.bindings.DataType",
+                          quant_config) -> "tensorrt_llm.bindings.DataType":
+    """Map a per-layer KV cache dtype string to a binding DataType."""
+    s = dtype_str.lower()
+    if s == "auto":
+        return fallback_dtype
+    if s in ("fp8", "float8"):
+        return tensorrt_llm.bindings.DataType.FP8
+    if s in ("nvfp4", "fp4"):
+        return tensorrt_llm.bindings.DataType.NVFP4
+    if s in ("fp16", "float16"):
+        return tensorrt_llm.bindings.DataType.HALF
+    if s in ("bf16", "bfloat16"):
+        return tensorrt_llm.bindings.DataType.BF16
+    raise ValueError(f"Unsupported per-layer KV cache dtype: '{dtype_str}'")
+
+
+def _resolve_per_layer_dtype(
+    dtype_spec: Union[str, Dict[int, str]],
+    num_layers: int,
+    quant_config,
+    fallback_dtype: "tensorrt_llm.bindings.DataType",
+) -> Dict[int, "tensorrt_llm.bindings.DataType"]:
+    """Resolve KvCacheConfig.dtype into a full per-layer DataType mapping."""
+    raw_map = parse_kv_cache_dtype_spec(dtype_spec, num_layers)
+    return {
+        i: _dtype_str_to_binding(s, fallback_dtype, quant_config)
+        for i, s in raw_map.items()
+    }
+
+
+def _apply_per_layer_kv_quant_config(model, per_layer_dtype_map: Dict,
+                                     base_quant_config):
+    """Call update_quant_config on each attention layer with the right KV dtype.
+
+    Handles two cases:
+      1. The module found by _get_attention_module has ``update_quant_config``
+         directly (e.g. TrtllmAttention when it is the leaf attention).
+      2. The module is an ``Attention`` wrapper (e.g. Qwen3Attention) whose
+         inner ``TrtllmAttention`` is stored in ``.attn``.  In this case we
+         update ``wrapper.quant_config`` so that ``attention.py`` picks up the
+         new KV dtype when building ``kv_scales_sf``, and then call
+         ``wrapper.attn.update_quant_config`` so the C++ wrapper's quant_mode
+         is also updated.
+
+    For NVFP4 KV cache used with BF16 model weights the ``qkv_proj`` may not
+    have ``kv_scales`` / ``inv_kv_scales`` attributes because those are only
+    created when the module is instantiated with an FP4 quant config.  We add
+    identity-scale tensors (value 1.0) so the forward pass can pass them to
+    the kernel without raising AttributeError.
+    """
+    import copy
+    from torch.nn import Parameter
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization import QuantMode
+
+    # Pre-compute the base mode (weight quant bits only, no KV cache bits).
+    base_mode = (base_quant_config.layer_quant_mode
+                 if base_quant_config is not None else QuantMode(0))
+    base_mode_no_kv = (base_mode & ~QuantMode.FP8_KV_CACHE
+                       & ~QuantMode.NVFP4_KV_CACHE & ~QuantMode.INT8_KV_CACHE)
+
+    for layer_idx, dtype in per_layer_dtype_map.items():
+        attn = _get_attention_module(model, layer_idx)
+        if attn is None:
+            continue
+        qcfg = copy.deepcopy(base_quant_config) if base_quant_config else None
+        if qcfg is None:
+            qcfg = QuantConfig()
+        # Compute the desired per-layer KV cache quant mode.
+        mode = base_mode_no_kv
+        if dtype == tensorrt_llm.bindings.DataType.FP8:
+            mode = mode.set_fp8_kv_cache()
+        elif dtype == tensorrt_llm.bindings.DataType.NVFP4:
+            mode = mode.set_fp4_kv_cache()
+        # layer_quant_mode is a @cached_property; inject the pre-computed value
+        # directly into the instance cache so update_quant_config sees it correctly.
+        qcfg.__dict__['layer_quant_mode'] = mode
+
+        if hasattr(attn, 'update_quant_config'):
+            # Case 1: leaf TrtllmAttention (or any module with the method).
+            attn.update_quant_config(qcfg)
+        else:
+            # Case 2: Attention wrapper (e.g. QKNormRoPEAttention / Qwen3Attention).
+            # Update the wrapper's quant_config so attention.py reads kv_scales_sf.
+            attn.quant_config = qcfg
+            # Update the inner TrtllmAttention so the C++ wrapper uses the right
+            # quantMode when computing intraPoolOffset / cacheElemBits.
+            inner = getattr(attn, 'attn', None)
+            if inner is not None and hasattr(inner, 'update_quant_config'):
+                inner.update_quant_config(qcfg)
+
+        # For NVFP4 KV cache with BF16 model weights: qkv_proj may lack
+        # kv_scales / inv_kv_scales because they are only added at Linear
+        # creation time when the quant config already has fp4_kv_cache set.
+        # Inject identity-scale tensors so the attention forward succeeds.
+        if mode.has_fp4_kv_cache():
+            qkv_proj = getattr(attn, 'qkv_proj', None)
+            if qkv_proj is not None and not hasattr(qkv_proj, 'kv_scales'):
+                # Determine device from an existing model parameter.
+                try:
+                    dev = next(attn.parameters()).device
+                except StopIteration:
+                    dev = torch.device('cuda')
+                qkv_proj.kv_scales = Parameter(
+                    torch.ones(3, dtype=torch.float32, device=dev),
+                    requires_grad=False)
+                qkv_proj.inv_kv_scales = Parameter(
+                    torch.ones(3, dtype=torch.float32, device=dev),
+                    requires_grad=False)
+
+
+def _get_attention_module(model, layer_idx: int):
+    """Walk model.layers[layer_idx] to find the self-attention module.
+
+    Handles flat models (model.layers), single-wrapped models
+    (model.{model,llm}.layers), and double-wrapped VL models
+    (model.llm.model.layers, e.g. Qwen3VLForConditionalGeneration wrapping
+    Qwen3ForCausalLM wrapping Qwen3Model).
+    """
+    layers = getattr(model, 'layers', None)
+    if layers is None:
+        for first_attr in ('model', 'llm'):
+            inner = getattr(model, first_attr, None)
+            if inner is None:
+                continue
+            layers = getattr(inner, 'layers', None)
+            if layers is not None:
+                break
+            # Two levels: VL wrapper -> ForCausalLM -> inner Model
+            inner2 = getattr(inner, 'model', None)
+            if inner2 is not None:
+                layers = getattr(inner2, 'layers', None)
+                if layers is not None:
+                    break
+    if layers is None or layer_idx >= len(layers):
+        return None
+    layer = layers[layer_idx]
+    for attr in ('self_attn', 'self_attention', 'attention', 'attn'):
+        attn = getattr(layer, attr, None)
+        if attn is not None:
+            return attn
+    return None
+
+
 def _create_kv_cache_manager(
         model_engine: Optional[PyTorchModelEngine],
         kv_cache_manager_cls,
@@ -949,6 +1095,26 @@ def _create_kv_cache_manager(
 
     # Use provided num_layers if available, otherwise use config
     num_hidden_layers = num_layers if num_layers is not None else config.num_hidden_layers
+
+    # --- Mixed-precision per-layer KV cache ---
+    # If the dtype spec is a per-layer mapping (dict or range syntax like
+    # "0-3:fp8,4-35:nvfp4"), resolve it now and pass as per_layer_dtype to
+    # the standard KVCacheManager constructor.  The single manager handles all
+    # layer groups; no wrapper is needed.
+    per_layer_dtype_map: dict[int, "tensorrt_llm.bindings.DataType"] | None = None
+    if not is_mla(config):
+        raw_dtype_spec = kv_cache_config.dtype
+        if isinstance(raw_dtype_spec, (dict, str)) and (
+                isinstance(raw_dtype_spec, dict)
+                or ":" in str(raw_dtype_spec)):
+            per_layer_dtype_map = _resolve_per_layer_dtype(
+                raw_dtype_spec, num_hidden_layers, quant_config, kv_cache_dtype)
+            unique_dtypes = set(per_layer_dtype_map.values())
+            if len(unique_dtypes) == 1:
+                # Uniform — collapse to global dtype; no per-layer map needed.
+                (kv_cache_dtype, ) = unique_dtypes
+                per_layer_dtype_map = None
+
     # Only include draft KV heads in the per-layer list when draft layers
     # are NOT handled by a separate draft KV cache manager.  When layer_mask
     # is provided from the caller, it means the main KV cache covers only
@@ -1197,7 +1363,13 @@ def _create_kv_cache_manager(
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             layer_mask=layer_mask,
+            per_layer_dtype=per_layer_dtype_map,
         )
+
+    if per_layer_dtype_map and model_engine is not None:
+        _apply_per_layer_kv_quant_config(model_engine.model, per_layer_dtype_map,
+                                         quant_config)
+
     return kv_cache_manager
 
 

@@ -76,6 +76,16 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
             "checkpoint KV quantization.")
         return
 
+    # Per-layer mixed-precision spec (e.g. "0-1:fp8,2-35:nvfp4" or a dict).
+    # Per-layer quant config is applied later by _apply_per_layer_kv_quant_config;
+    # skip global override here.
+    if isinstance(pyt_kv_cache_dtype, dict) or (
+            isinstance(pyt_kv_cache_dtype, str) and ":" in pyt_kv_cache_dtype):
+        logger.info(
+            f'Per-layer mixed KV cache dtype spec "{pyt_kv_cache_dtype}" detected; '
+            "skipping global quant override.")
+        return
+
     # If we have an invalid quantization, simply raise an exception.
     if not valid_pyt_quant:
         raise ValueError(

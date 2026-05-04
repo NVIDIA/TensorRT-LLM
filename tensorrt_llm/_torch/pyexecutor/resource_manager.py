@@ -332,10 +332,12 @@ class KVCacheManager(BaseResourceManager):
         is_estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
         linear_attention_metadata: Optional[LinearAttentionMetadata] = None,
+        per_layer_dtype: dict[int, DataType] | None = None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
+        self.per_layer_dtype = per_layer_dtype
         self.kv_cache_type = kv_cache_type
         self.pp_layers, self.num_layers = get_pp_layers(
             num_layers,
@@ -599,6 +601,8 @@ class KVCacheManager(BaseResourceManager):
             'indexer_k_cache_index_head_dim': indexer_k_cache_index_head_dim,
             'linear_attention_metadata': linear_attention_metadata
         }
+        if per_layer_dtype:
+            kwargs['per_layer_dtype'] = per_layer_dtype
 
         if self.event_buffer_max_size > 0:
             if mapping.enable_attention_dp:
@@ -633,6 +637,21 @@ class KVCacheManager(BaseResourceManager):
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
+
+        pool_bytes = (self.blocks_in_primary_pool * self.tokens_per_block *
+                      self.get_cache_bytes_per_token())
+        layer_list = self.pp_layers
+        if layer_list:
+            layer_str = (f"{layer_list[0]}-{layer_list[-1]}"
+                         if len(layer_list) > 1 else str(layer_list[0]))
+        else:
+            layer_str = "(none)"
+        logger.info(
+            f"KV cache pool: dtype={self.dtype}, layers=[{layer_str}], "
+            f"num_layers={len(layer_list)}, "
+            f"pool_size={pool_bytes / (1 << 30):.2f} GiB "
+            f"({self.blocks_in_primary_pool} blocks × {self.tokens_per_block} tokens/block)")
+
         self.host_kv_cache_block_offsets = torch.empty(
             self.num_pools,
             max_batch_size * max_beam_width,
@@ -1031,11 +1050,32 @@ class KVCacheManager(BaseResourceManager):
         return mem_per_token
 
     def get_cache_bytes_per_token(self):
+        supported_dtypes = (DataType.FP8, DataType.HALF, DataType.BF16,
+                            DataType.FLOAT, DataType.NVFP4)
+
+        if self.per_layer_dtype:
+            total_bytes = 0
+            for local_idx, global_idx in enumerate(self.pp_layers):
+                layer_dtype = self.per_layer_dtype.get(global_idx, self.dtype)
+                if layer_dtype not in supported_dtypes:
+                    raise ValueError(
+                        f'Cannot support {layer_dtype} KV cache on layer {global_idx}.'
+                    )
+                layer_kv_heads = self.num_kv_heads_per_layer[local_idx]
+                cache_size = self.kv_factor * layer_kv_heads * self.head_dim
+                layer_bytes = get_size_in_bytes(cache_size, layer_dtype)
+                if layer_dtype == DataType.NVFP4:
+                    layer_bytes += self.calculate_scaling_factor_size_bytes(
+                        cache_size,
+                        quant_vector_size=16,
+                        scaling_factor_dtype=DataType.FP8)
+                total_bytes += layer_bytes
+            return total_bytes
+
         cache_size_per_token = self.kv_factor * sum(
             self.num_kv_heads_per_layer) * self.head_dim
 
-        if self.dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
-                              DataType.FLOAT, DataType.NVFP4):
+        if self.dtype not in supported_dtypes:
             raise ValueError(f'Cannot support {self.dtype} KV cache.')
 
         cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token,

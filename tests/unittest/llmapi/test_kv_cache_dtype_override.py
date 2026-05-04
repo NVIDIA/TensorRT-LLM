@@ -65,3 +65,14 @@ def test_update_from_hf_quant_config_explicit_dtype_overrides(tmp_path):
 
     assert model_loader._update_from_hf_quant_config() is True
     assert llm_args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+
+
+def test_kv_cache_config_range_dtype_passes_validation():
+    cfg = KvCacheConfig(dtype="0-3:fp8,4-35:nvfp4")
+    assert cfg.dtype == "0-3:fp8,4-35:nvfp4"
+
+
+def test_kv_cache_config_descending_range_raises():
+    with pytest.raises(ValueError, match="start.*must not exceed end"):
+        from tensorrt_llm.llmapi.llm_args import parse_kv_cache_dtype_spec
+        parse_kv_cache_dtype_spec("5-2:fp8", num_layers=36)
