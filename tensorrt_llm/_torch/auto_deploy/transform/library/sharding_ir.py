@@ -983,10 +983,13 @@ def _apply_simple_shard(gm: GraphModule, dc: DistConfig) -> int:
             enable_sharding._shard_scales(
                 gm, dc, weight_nodes, dim=SplitDimension.COLUMN, min_shape=1, fused=None
             )
+        # Op signature is (tensor, strategy, dim=0, ...). strategy is required;
+        # this code path is not backend-aware (always torch_dist) and has no
+        # AD-config knob for allgather strategy, so we pass "AUTO" explicitly.
         with gm.graph.inserting_after(node):
             gather_node = gm.graph.call_function(
                 torch.ops.auto_deploy.torch_dist_all_gather.default,
-                args=(node, -1),
+                args=(node, "AUTO", -1),
             )
             node.replace_all_uses_with(gather_node)
             gather_node.replace_input_with(gather_node, node)

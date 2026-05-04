@@ -16,8 +16,9 @@ def _run_all_reduce_test(rank, world_size):
 
 def _run_all_gather_test(rank, world_size):
     x = torch.ones(10, 10).to("cuda")
-    # Test torch backend (demollm mode with Python multiprocessing)
-    y = torch.ops.auto_deploy.torch_dist_all_gather(x)
+    # Test torch backend (demollm mode with Python multiprocessing).
+    # strategy is required; pick "AUTO" (plain torch.distributed.all_gather).
+    y = torch.ops.auto_deploy.torch_dist_all_gather(x, "AUTO")
 
     assert torch.sum(y) == world_size * torch.sum(x)
     assert y.shape == (world_size * x.shape[0], *x.shape[1:])

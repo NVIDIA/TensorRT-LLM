@@ -117,15 +117,17 @@ def trtllm_allreduce(tensor, op, strategy: str, all_reduce_params=None):
 )
 def trtllm_dist_all_gather(
     tensor: torch.Tensor,
+    strategy: str,
     dim: int = 0,
     sizes: Optional[List[int]] = None,
-    strategy: str = "AUTO",
     # Picks the symm_mem workspace; use distinct ids for concurrent multi-stream allgathers to avoid buffer races.
     workspace_id: int = 0,
 ) -> torch.Tensor:
     """AllGather via TRT-LLM optimized backend.
 
-    Strategy:
+    Strategy (required, no default — callers must pick the strategy explicitly
+    from the AD config to avoid silently using a default when emitting this
+    op into the graph):
         AUTO     — TRT-LLM NCCL allgather.
         SYMM_MEM — symmetric memory (multimem_all_gather_out) with NCCL fallback.
 
@@ -140,7 +142,7 @@ def trtllm_dist_all_gather(
 
 
 @trtllm_dist_all_gather.register_fake
-def trtllm_dist_all_gather_fake(tensor, dim=0, sizes=None, strategy="AUTO", workspace_id=0):
+def trtllm_dist_all_gather_fake(tensor, strategy, dim=0, sizes=None, workspace_id=0):
     return torch.cat([torch.empty_like(tensor) for _ in range(get_world_size())], dim=dim)
 
 

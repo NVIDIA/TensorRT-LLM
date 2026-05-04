@@ -929,11 +929,16 @@ class BMMShardingInfo(ShardingTransformInfo):
         handle_tensor(node, lhs_tensor, 0, self.start_idx, self.end_idx)
         handle_tensor(node, rhs_tensor, 1, self.start_idx, self.end_idx)
 
-        # Add all_gather node after BMM to collect results
+        # Add all_gather node after BMM to collect results.
+        # NOTE: BMM sharding is not backend-aware (always torch_dist_all_gather),
+        # but we still honor the user-configured allgather_strategy from the
+        # ShardingTransformConfig. The op signature is
+        # (tensor, strategy, dim=0, ...); strategy is required.
+        allgather_strategy = self.config.allgather_strategy.name
         with gm.graph.inserting_after(node):
             gather_node = gm.graph.call_function(
                 torch.ops.auto_deploy.torch_dist_all_gather.default,
-                args=(node, 0),  # Gather along batch dimension (0)
+                args=(node, allgather_strategy, 0),  # Gather along batch dim (0)
             )
             node.replace_all_uses_with(gather_node)
             gather_node.replace_input_with(gather_node, node)
@@ -1819,8 +1824,11 @@ def _shard_parameter_node(
     # figure out the right dist op (backend-aware) — strategies flow as op args
     all_gather_op, all_reduce_op = _get_dist_ops(config.dist_backend)
     allgather_strategy = config.allgather_strategy.name
+    # all_gather op signature: (tensor, strategy, dim=0, sizes=None, workspace_id=0).
+    # strategy is required (no default) so the caller cannot accidentally drop
+    # the AD-config-selected strategy when emitting the op into the graph.
     dist_lookup = {
-        0: (all_gather_op, -1, None, allgather_strategy),
+        0: (all_gather_op, allgather_strategy, -1, None),
         1: (all_reduce_op, allreduce_strategy),
     }
     fn_dist, *dist_args = dist_lookup[dim]

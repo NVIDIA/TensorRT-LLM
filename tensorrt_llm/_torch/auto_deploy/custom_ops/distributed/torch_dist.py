@@ -77,14 +77,14 @@ def _torch_symm_mem_allgather_impl(tensor, dim, sizes, workspace_id):
 @torch.library.custom_op("auto_deploy::torch_dist_all_gather", mutates_args=(), device_types="cuda")
 def torch_dist_all_gather(
     tensor: torch.Tensor,
+    strategy: str,
     dim: int = 0,
     sizes: Optional[List[int]] = None,
-    strategy: str = "AUTO",
     workspace_id: int = 0,
 ) -> torch.Tensor:
     """AllGather via torch.distributed backend (demollm mode).
 
-    Strategy:
+    Strategy (required, no default — see trtllm_dist_all_gather for rationale):
         AUTO     — torch.distributed.all_gather.
         SYMM_MEM — symmetric memory (multimem_all_gather_out) with
                    torch.distributed fallback.
@@ -97,7 +97,7 @@ def torch_dist_all_gather(
 
 
 @torch_dist_all_gather.register_fake
-def torch_dist_all_gather_fake(tensor, dim=0, sizes=None, strategy="AUTO", workspace_id=0):
+def torch_dist_all_gather_fake(tensor, strategy, dim=0, sizes=None, workspace_id=0):
     return torch.cat([torch.empty_like(tensor) for _ in range(dist.get_world_size())], dim=dim)
 
 

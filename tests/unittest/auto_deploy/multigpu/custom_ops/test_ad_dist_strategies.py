@@ -418,8 +418,9 @@ def test_allgather_strategy_propagation(strategy):
     Mirrors test_allreduce_strategy_propagation: when we set an
     allgather_strategy on the ShardingConfig, it must reach the
     torch_dist_all_gather (or trtllm_dist_all_gather) node's args at
-    the position the dist op expects (4th positional, just before the
-    default workspace_id).
+    the position the dist op expects (2nd positional, immediately after
+    the input tensor — strategy is required and intentionally placed
+    early so callers can't drop it by accident).
     """
 
     # Same SimpleMLP as the allreduce variant — keeps the two tests symmetric.
@@ -492,19 +493,18 @@ def test_allgather_strategy_propagation(strategy):
     assert len(allgather_nodes) == 1, f"Expected 1 allgather node, found {len(allgather_nodes)}"
     allgather_node = allgather_nodes[0]
 
-    # Op signature: (tensor, dim, sizes, strategy, workspace_id=0).
-    # The column+all_gather emit path passes (input, -1, None,
-    # strategy_name); workspace_id may or may not be explicit, so accept
-    # either 4 or 5 positional args.
+    # Op signature: (tensor, strategy, dim=0, sizes=None, workspace_id=0).
+    # The column+all_gather emit path passes (input, strategy_name, -1,
+    # None); workspace_id may or may not be explicit, so accept either 4
+    # or 5 positional args.
     assert 4 <= len(allgather_node.args) <= 5, (
         f"Expected 4 or 5 args for allgather node, got {len(allgather_node.args)}"
     )
-    assert allgather_node.args[1] == -1, f"Expected gather dim=-1, got {allgather_node.args[1]}"
-    assert allgather_node.args[2] is None, f"Expected sizes=None, got {allgather_node.args[2]}"
-
-    strategy_arg = allgather_node.args[3]
+    strategy_arg = allgather_node.args[1]
     assert strategy_arg == strategy, (
         f"Expected allgather strategy '{strategy}', got '{strategy_arg}'"
     )
+    assert allgather_node.args[2] == -1, f"Expected gather dim=-1, got {allgather_node.args[2]}"
+    assert allgather_node.args[3] is None, f"Expected sizes=None, got {allgather_node.args[3]}"
 
     print(f"✓ Test passed: allgather_strategy '{strategy}' correctly propagated to graph node")
