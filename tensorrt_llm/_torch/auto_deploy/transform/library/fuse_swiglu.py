@@ -28,6 +28,15 @@ import torch
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
+try:
+    from .....quantization.utils.fp8_utils import (
+        resmooth_to_fp8_e8m0,
+        transform_sf_into_required_layout,
+    )
+except ImportError:
+    resmooth_to_fp8_e8m0 = None
+    transform_sf_into_required_layout = None
+
 # Import the custom ops to ensure they are registered and for use in replacements
 from ...custom_ops.linear.swiglu import torch_swiglu_mlp
 from ...models.factory import ModelFactory
@@ -80,6 +89,71 @@ def _ensure_tma_col_major(t: torch.Tensor) -> torch.Tensor:
     result = col_major[:, :mn, :]
 
     return result.squeeze(0) if remove_dim else result
+
+
+def _maybe_to_deepgemm_layout(
+    weight: torch.Tensor, scale: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """If running on SM100f and the weight is 128x128 block-aligned, convert
+    (weight, raw FP32 per-block scale) to (weight, UE8M0 packed-int col-major
+    scale) — the layout `trtllm_fp8_deepgemm` / `fused_finegrained_fp8_deepgemm_swiglu_mlp`
+    require. Otherwise return inputs unchanged.
+
+    Mirrors the conversion previously done by FineGrainedFP8LinearQuantization's
+    post_load_hook, applied here so the fuse_finegrained_fp8_swiglu transform
+    can keep selecting the deepgemm fast path now that the hook has been
+    removed in favor of dispatch-time atomic conversion.
+    """
+    from tensorrt_llm._utils import is_sm_100f
+
+    if not is_sm_100f():
+        return weight, scale
+    if resmooth_to_fp8_e8m0 is None or transform_sf_into_required_layout is None:
+        return weight, scale
+    if weight.dtype != torch.float8_e4m3fn:
+        return weight, scale
+    N, K = weight.shape[-2], weight.shape[-1]
+    if N % 128 != 0 or K % 128 != 0:
+        return weight, scale
+    if scale.dtype == torch.int:
+        return weight, scale  # Already converted
+
+    with torch.no_grad():
+        weight_new, scale_new = resmooth_to_fp8_e8m0(weight, scale.float())
+        N_new, K_new = weight_new.shape[-2], weight_new.shape[-1]
+        scale_new = transform_sf_into_required_layout(
+            scale_new, mn=N_new, k=K_new, recipe=(1, 128, 128), is_sfa=False
+        )
+    return weight_new, scale_new
+
+
+def _replace_buffer_in_place(gm: GraphModule, attr_node: Node, new_tensor: torch.Tensor) -> bool:
+    """Replace the live tensor backing a get_attr node, preserving its
+    storage class. Returns True on success."""
+    target = getattr(attr_node, "target", None)
+    if not isinstance(target, str):
+        return False
+    *path, attr_name = target.split(".")
+    obj = gm
+    for p in path:
+        obj = getattr(obj, p, None)
+        if obj is None:
+            return False
+
+    was_parameter = hasattr(obj, "_parameters") and attr_name in obj._parameters
+    was_buffer = hasattr(obj, "_buffers") and attr_name in obj._buffers
+    if was_parameter:
+        del obj._parameters[attr_name]
+    if was_buffer:
+        del obj._buffers[attr_name]
+    if attr_name in obj.__dict__:
+        del obj.__dict__[attr_name]
+
+    if was_parameter and not was_buffer:
+        setattr(obj, attr_name, torch.nn.Parameter(new_tensor.detach(), requires_grad=False))
+    else:
+        obj.register_buffer(attr_name, new_tensor.detach())
+    return True
 
 
 def _try_free_attr_node(gm: GraphModule, graph, attr_node: Node) -> None:
@@ -872,14 +946,41 @@ class FuseFineGrainedFP8SwiGLU(BaseTransform):
             gate_weight_scale = get_attr_by_name(gm, gate_weight_scale_node.target)
             up_weight_scale = get_attr_by_name(gm, up_weight_scale_node.target)
             gate_up_weight_scale = torch.cat([gate_weight_scale, up_weight_scale], dim=0)
-            # torch.cat creates contiguous (row-major) output.
-            # Re-apply column-major layout for DeepGEMM.
+
+            # On Blackwell + 128x128-aligned, atomically resmooth weight + scale
+            # to UE8M0 packed-int col-major for the DeepGEMM fast path. This used
+            # to be done up-front by FineGrainedFP8LinearQuantization.post_load_hook;
+            # since that hook was removed, the conversion is now performed locally
+            # at fuse-time so the dispatch below can still pick the deepgemm op.
+            gate_up_weight, gate_up_weight_scale = _maybe_to_deepgemm_layout(
+                gate_up_weight, gate_up_weight_scale
+            )
+
+            # If we did NOT convert (raw FP32 path), torch.cat still produced a
+            # row-major result, so re-apply col-major for the trtllm
+            # fp8_block_scaling kernel. _ensure_tma_col_major is a no-op when
+            # the scale is already col-major (the deepgemm conversion above
+            # produces col-major already).
             gate_up_weight_scale = _ensure_tma_col_major(gate_up_weight_scale)
 
             # Register fused buffers
             prefix = f"fused_finegrained_fp8_swiglu_{fused_weight_idx}"
             gm.register_buffer(f"{prefix}_gate_up_weight", gate_up_weight)
             gm.register_buffer(f"{prefix}_gate_up_weight_scale", gate_up_weight_scale)
+
+            # Down weight is reused in place (not concatenated). Convert its
+            # weight + scale to the same UE8M0 layout when applicable, so the
+            # deepgemm op sees a consistent (UE8M0, UE8M0) pair.
+            down_weight_tensor = get_attr_by_name(gm, down_weight_node.target)
+            down_weight_scale_tensor = get_attr_by_name(gm, down_weight_scale_node.target)
+            if down_weight_tensor is not None and down_weight_scale_tensor is not None:
+                down_weight_new, down_weight_scale_new = _maybe_to_deepgemm_layout(
+                    down_weight_tensor, down_weight_scale_tensor
+                )
+                if down_weight_new is not down_weight_tensor:
+                    _replace_buffer_in_place(gm, down_weight_node, down_weight_new)
+                if down_weight_scale_new is not down_weight_scale_tensor:
+                    _replace_buffer_in_place(gm, down_weight_scale_node, down_weight_scale_new)
 
             # Create get_attr nodes for fused weights/scales
             with graph.inserting_before(node):

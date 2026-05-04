@@ -205,6 +205,21 @@ def _has_no_fake_quant_finegrained_fp8(gm):
     return _count_ops(gm, torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear) == 0
 
 
+def _count_fused_swiglu_ops(gm):
+    """Count fused FineGrainedFP8 SwiGLU MLP ops across both fused targets.
+
+    Accepts either the generic (FP32 per-block scale) or the Blackwell DeepGEMM
+    (UE8M0 packed-int) variant. On SM100f the fuse_finegrained_fp8_swiglu
+    transform converts weights/scales to UE8M0 in-place and dispatches to the
+    deepgemm op.
+    """
+    n = _count_ops(gm, torch.ops.auto_deploy.fused_finegrained_fp8_swiglu_mlp.default)
+    deepgemm_op = getattr(torch.ops.auto_deploy, "fused_finegrained_fp8_deepgemm_swiglu_mlp", None)
+    if deepgemm_op is not None:
+        n += _count_ops(gm, deepgemm_op.default)
+    return n
+
+
 # -- Tests ---------------------------------------------------------------------
 
 
@@ -276,11 +291,9 @@ def test_finegrained_fp8_swiglu_full_fusion():
 
     gm_fused = gm_fused.to("cuda")
 
-    # Check the fused op is present
-    fused_count = _count_ops(
-        gm_fused, torch.ops.auto_deploy.fused_finegrained_fp8_swiglu_mlp.default
-    )
-    assert fused_count == 1, f"Expected 1 fused_finegrained_fp8_swiglu_mlp op, got {fused_count}"
+    # Check the fused op is present (either generic or deepgemm variant).
+    fused_count = _count_fused_swiglu_ops(gm_fused)
+    assert fused_count == 1, f"Expected 1 fused swiglu mlp op, got {fused_count}"
 
     # No intermediate or unfused ops should remain
     assert (
@@ -327,12 +340,10 @@ def test_finegrained_fp8_swiglu_fusion_multiple_layers(num_layers):
 
     gm_fused = gm_fused.to("cuda")
 
-    # Check that all layers are fused
-    fused_count = _count_ops(
-        gm_fused, torch.ops.auto_deploy.fused_finegrained_fp8_swiglu_mlp.default
-    )
+    # Check that all layers are fused (either generic or deepgemm variant).
+    fused_count = _count_fused_swiglu_ops(gm_fused)
     assert fused_count == num_layers, (
-        f"Expected {num_layers} fused_finegrained_fp8_swiglu_mlp ops, got {fused_count}"
+        f"Expected {num_layers} fused swiglu mlp ops, got {fused_count}"
     )
 
     # Verify numerical correctness
@@ -458,11 +469,9 @@ def test_finegrained_fp8_swiglu_deepgemm_scale_layout():
 
     gm_fused = gm_fused.to("cuda")
 
-    # Verify fused op is present
-    fused_count = _count_ops(
-        gm_fused, torch.ops.auto_deploy.fused_finegrained_fp8_swiglu_mlp.default
-    )
-    assert fused_count == 1, f"Expected 1 fused_finegrained_fp8_swiglu_mlp op, got {fused_count}"
+    # Verify fused op is present (deepgemm variant expected on Blackwell).
+    fused_count = _count_fused_swiglu_ops(gm_fused)
+    assert fused_count == 1, f"Expected 1 fused swiglu mlp op, got {fused_count}"
 
     # Verify fused gate+up scale has correct layout for DeepGEMM
     for name, buf in gm_fused.named_buffers():
