@@ -3102,7 +3102,12 @@ class PyExecutor:
         wait_threshold: float,
         should_waiting: bool,
     ) -> None:
-        """Diagnostics for batch_wait: set TLLM_LOG_BATCH_WAIT=1 (rank 0 only)."""
+        """Emit per-iteration batch-wait diagnostics on rank 0.
+
+        Logs the scheduling-formula token count next to the actual chunk-token
+        sum so that mismatches (e.g., from KV cache reuse estimation drift) are
+        visible in the rank-0 stream. Other ranks early-return.
+        """
         if self.dist.rank != 0:
             return
 

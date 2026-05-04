@@ -6,24 +6,20 @@
 # You may obtain a copy of the License at
 #
 # http://www.apache.org/licenses/LICENSE-2.0
-"""Unit tests for KVCacheManager._estimate_post_reuse_compute() — DYN-2868.
+"""Unit tests for ``KVCacheManager._estimate_post_reuse_compute``.
 
 The helper is effectively pure: it depends only on the arguments and
-``self.tokens_per_block``. Tests construct a stub holding tokens_per_block
-and bind the unbound method, avoiding any real KVCacheManager initialization.
-
-Tier 1A: branch coverage of the helper.
-Tier 1B: divergence vs ``_prepare_tp_inputs`` actual position-id count.
-Tier 1C: precise property tests — undercharges in the reuse branch
-         (0 < P < prompt_len), short-circuits to chunk_size outside it.
+``self.tokens_per_block``. Tests construct a stub holding ``tokens_per_block``
+and bind the unbound method, avoiding any real ``KVCacheManager`` initialization.
 """
+
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
 
 class _Stub:
-    """Minimal stand-in for KVCacheManager exposing only tokens_per_block."""
+    """Minimal stand-in for KVCacheManager exposing only ``tokens_per_block``."""
 
     def __init__(self, tokens_per_block):
         self.tokens_per_block = tokens_per_block
@@ -32,12 +28,12 @@ class _Stub:
 
 
 def _model_engine_forward_count(begin_compute, chunk_size, prompt_len):
-    """Mirror model_engine.py:2293-2297 — len(prompt_tokens) per ctx req."""
+    """Mirror ``_prepare_tp_inputs`` slicing: ``len(prompt_tokens[begin:end])``."""
     return max(0, min(chunk_size, prompt_len - begin_compute))
 
 
 # ---------------------------------------------------------------------------
-# Tier 1A: branch coverage
+# Branch coverage of the helper
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "P, chunk, prompt_len, block, expected, branch",
@@ -68,34 +64,34 @@ def test_branch_coverage(P, chunk, prompt_len, block, expected, branch):
 
 
 # ---------------------------------------------------------------------------
-# Tier 1B: helper vs model_engine — production-relevant divergence
+# Helper vs model engine — production-relevant divergence
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "P, chunk_size, prompt_len, tokens_per_block, expect_undercharge",
     [
-        # Block-aligned chunk + block-aligned reuse: helper == model_engine
+        # Block-aligned chunk + block-aligned reuse: helper == model engine count
         (64, 128, 1024, 64, False),
         (0, 256, 1024, 64, False),
         (128, 256, 200, 64, False),  # last chunk, exact match (helper=72, actual=72)
         (192, 64, 1024, 64, False),
-        # Block-aligned reuse + UNALIGNED chunk: helper undercharges. This
-        # case is legal in production per
-        # tests/unittest/_torch/executor/test_kv_cache_v2_scheduler.py:243-247
-        # (chunk_unit_size=100 with tokens_per_block=64).
-        (64, 100, 1000, 64, True),   # aligned_end=128, helper=64,  actual=100
-        (128, 50, 1024, 64, True),   # aligned_end=128, helper=1,   actual=50
+        # Block-aligned reuse + UNALIGNED chunk: helper undercharges. Unaligned
+        # chunk_unit_size is legal — V2 scheduler tests use chunk_unit_size=100
+        # with tokens_per_block=64.
+        (64, 100, 1000, 64, True),  # aligned_end=128, helper=64,  actual=100
+        (128, 50, 1024, 64, True),  # aligned_end=128, helper=1,   actual=50
         # Block-unaligned reuse: also undercharges
-        (70, 130, 1024, 64, True),   # aligned_end=192, helper=122, actual=130
+        (70, 130, 1024, 64, True),  # aligned_end=192, helper=122, actual=130
     ],
 )
-def test_helper_vs_model_engine_per_case(P, chunk_size, prompt_len,
-                                         tokens_per_block,
-                                         expect_undercharge):
-    """Document where the helper diverges from _prepare_tp_inputs token
-    counting. The aligned cases agree; the unaligned cases undercharge —
-    which means the budget guard is conservative-enough to catch run-14's
-    +2 overshoot but not a strict ≤ max guarantee under all legal scheduler
-    outputs. Surfaced as a caveat in the PR description."""
+def test_helper_vs_model_engine_per_case(
+    P, chunk_size, prompt_len, tokens_per_block, expect_undercharge
+):
+    """The helper short-circuits to ``chunk_size`` outside the reuse range and
+    rounds the chunk window down to a block boundary inside it. The aligned
+    cases agree with the actual ``_prepare_tp_inputs`` token count; the unaligned
+    cases undercharge — the budget guard is therefore a conservative-enough
+    backstop for small overshoots, not a strict ``≤ max_num_tokens`` guarantee
+    under all scheduler outputs."""
     stub = _Stub(tokens_per_block)
     helper = stub._estimate_post_reuse_compute(P, chunk_size, prompt_len)
     actual = _model_engine_forward_count(P, chunk_size, prompt_len)
@@ -103,8 +99,8 @@ def test_helper_vs_model_engine_per_case(P, chunk_size, prompt_len,
         assert helper < actual, (
             f"Expected undercharge for unaligned (P={P}, chunk={chunk_size}, "
             f"block={tokens_per_block}): helper={helper}, actual={actual}. "
-            f"If this fails, the helper has been tightened — update this "
-            f"test and review whether Tier 3 needs new scenarios."
+            f"If this fails, the helper has been tightened — review whether "
+            f"the regression scenarios still trigger the bug condition."
         )
     else:
         assert helper == actual, (
@@ -116,13 +112,13 @@ def test_helper_vs_model_engine_per_case(P, chunk_size, prompt_len,
 
 
 # ---------------------------------------------------------------------------
-# Tier 1C: precise property tests
+# Property tests
 # ---------------------------------------------------------------------------
 def test_helper_undercharges_in_reuse_branch():
-    """When 0 < P < prompt_len, helper <= actual model_engine forward count.
-    This is the invariant the budget guard relies on for the run-14
-    scenario (block-aligned reuse + block-aligned chunk_size). Counts as
-    the load-bearing property — a regression that breaks this is a real bug."""
+    """When ``0 < P < prompt_len``, helper ≤ actual model-engine forward count.
+    This is the load-bearing invariant the budget guard relies on for
+    block-aligned reuse + block-aligned chunk_size — a regression that breaks
+    it can re-introduce overshoot."""
     counterexamples = []
     for P in [1, 32, 63, 64, 65, 70, 128, 199]:
         for chunk in [1, 50, 64, 100, 128, 256]:
@@ -134,18 +130,14 @@ def test_helper_undercharges_in_reuse_branch():
                     h = stub._estimate_post_reuse_compute(P, chunk, prompt_len)
                     a = _model_engine_forward_count(P, chunk, prompt_len)
                     if h > a:
-                        counterexamples.append(
-                            (P, chunk, prompt_len, block, h, a))
-    assert not counterexamples, (
-        f"helper > actual in reuse branch (first 5): {counterexamples[:5]}"
-    )
+                        counterexamples.append((P, chunk, prompt_len, block, h, a))
+    assert not counterexamples, f"helper > actual in reuse branch (first 5): {counterexamples[:5]}"
 
 
 def test_helper_short_circuits_outside_reuse_range():
-    """When P <= 0 or P >= prompt_len, helper returns chunk_size verbatim
-    regardless of prompt_len — so the helper may OVERCHARGE actual forward
-    tokens here. This is intentional: outside the reuse branch the guard
-    falls back to the no-credit path, mirroring the pre-fix behavior."""
+    """When ``P <= 0`` or ``P >= prompt_len``, helper returns ``chunk_size``
+    verbatim regardless of ``prompt_len``. The helper may overcharge actual
+    forward tokens here, mirroring the no-reuse-credit fallback."""
     stub = _Stub(tokens_per_block=64)
     # P=0: no reuse credit → return chunk_size even when chunk > prompt_len
     assert stub._estimate_post_reuse_compute(0, 256, 128) == 256

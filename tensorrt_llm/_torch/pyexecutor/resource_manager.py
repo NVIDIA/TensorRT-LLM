@@ -757,8 +757,13 @@ class KVCacheManager(BaseResourceManager):
                             req):
                         if remaining_budget is not None:
                             unique_tokens = req.get_unique_tokens(0)
-                            reusable_blocks = self.impl.count_reusable_blocks(
-                                unique_tokens, req, False)
+                            # reusable_blocks_all counts every block that
+                            # matches the prefix, including blocks not yet
+                            # allocated to a request — the right basis for
+                            # the budget re-probe since any of them could be
+                            # claimed before add_sequence_batch runs.
+                            reusable_blocks = self.impl.analyze_prefix_reuse(
+                                unique_tokens, req).reusable_blocks_all
                             actual_reuse = (reusable_blocks *
                                             self.tokens_per_block)
                             req_compute = self._estimate_post_reuse_compute(
@@ -831,11 +836,14 @@ class KVCacheManager(BaseResourceManager):
 
     def _estimate_post_reuse_compute(self, reuse_tokens: int, chunk_size: int,
                                      prompt_len: int) -> int:
-        """Estimate forward compute tokens after setPrepopulatedPromptLen.
+        """Estimate forward compute tokens for a context chunk given how many
+        prefix tokens will be served from KV cache reuse.
 
-        For non-last chunks the chunk window shifts right by the reused
-        amount and the forward cost is approximately chunk_size.  For
-        last chunks the cost is prompt_len - reuse (original formula).
+        For non-last chunks the chunk window shifts right by the reused amount
+        and the forward cost is approximately ``chunk_size`` (rounded down to
+        a ``tokens_per_block`` boundary).  For last chunks the cost is
+        ``prompt_len - reuse``.  Returns ``chunk_size`` verbatim when reuse is
+        out of range (``reuse <= 0`` or ``reuse >= prompt_len``).
         """
         P = reuse_tokens
         if P > 0 and P < prompt_len:
