@@ -39,8 +39,23 @@ void fused_dit_split_norm_rope(torch::Tensor& tensor, int64_t num_heads, int64_t
 
     CHECK_INPUT(tensor, torch::kBFloat16);
     CHECK_INPUT(weight, torch::kBFloat16);
-    CHECK_INPUT(cos_emb, torch::kFloat32);
-    CHECK_INPUT(sin_emb, torch::kFloat32);
+    // Cos/sin may be fp32 (legacy) or bf16 (B-2: kernel upcasts in registers).
+    auto const cos_dtype = cos_emb.scalar_type();
+    TORCH_CHECK(cos_dtype == torch::kFloat32 || cos_dtype == torch::kBFloat16,
+        "cos_emb dtype must be float32 or bfloat16, got ", cos_dtype);
+    TORCH_CHECK(sin_emb.scalar_type() == cos_dtype, "sin_emb dtype must match cos_emb (", sin_emb.scalar_type(), " vs ",
+        cos_dtype, ")");
+    bool const cos_is_bf16 = (cos_dtype == torch::kBFloat16);
+    if (cos_is_bf16)
+    {
+        CHECK_INPUT(cos_emb, torch::kBFloat16);
+        CHECK_INPUT(sin_emb, torch::kBFloat16);
+    }
+    else
+    {
+        CHECK_INPUT(cos_emb, torch::kFloat32);
+        CHECK_INPUT(sin_emb, torch::kFloat32);
+    }
 
     int64_t const num_tokens = tensor.size(0);
     TORCH_CHECK(
@@ -59,8 +74,7 @@ void fused_dit_split_norm_rope(torch::Tensor& tensor, int64_t num_heads, int64_t
 
     tensorrt_llm::kernels::launchFusedDiTSplitNormFullDimRope(tensor.data_ptr(), static_cast<int>(num_tokens),
         static_cast<int>(num_heads), static_cast<int>(head_dim), static_cast<float>(eps), weight.data_ptr(),
-        reinterpret_cast<float const*>(cos_emb.data_ptr()), reinterpret_cast<float const*>(sin_emb.data_ptr()),
-        interleave, per_head_cos, stream);
+        cos_emb.data_ptr(), sin_emb.data_ptr(), interleave, per_head_cos, cos_is_bf16, stream);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

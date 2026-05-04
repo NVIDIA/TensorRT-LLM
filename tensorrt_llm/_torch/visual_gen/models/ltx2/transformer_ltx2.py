@@ -234,8 +234,9 @@ class LTX2Attention(Attention):
             )
         # cos/sin are token-major [B, T, H, D] (or [B, T, D] for shared per-token);
         # reshape(-1, cos_last) yields the [B*T, cos_last] layout the kernel reads.
-        cos_2d = cos.reshape(-1, cos_last).float().contiguous()
-        sin_2d = sin.reshape(-1, cos_last).float().contiguous()
+        # B-2: kernel accepts bf16 cos (upcasts in registers); skip the .float() cast.
+        cos_2d = cos.reshape(-1, cos_last).contiguous()
+        sin_2d = sin.reshape(-1, cos_last).contiguous()
         if cos_2d.shape[0] == T and B > 1:
             cos_tiled = cos_2d.repeat(B, 1)
             sin_tiled = sin_2d.repeat(B, 1)

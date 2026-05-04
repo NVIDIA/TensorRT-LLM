@@ -46,10 +46,11 @@ void launchFusedDiTSplitNormFullDimRope(void* tensor, // [num_tokens, num_heads 
     int head_dim,                                     // 64 or 128
     float eps,
     void const* weight,                               // bf16, [num_heads * head_dim] (full-dim norm weight)
-    float const* cos_emb,                             // float32
-    float const* sin_emb,                             // float32
+    void const* cos_emb,                              // float32 or bfloat16 (selected by cos_is_bf16)
+    void const* sin_emb,                              // same dtype as cos_emb
     bool interleave,                                  // true = pair (2i, 2i+1); false = rotate_half
     bool per_head_cos,                                // false: cos shape [N, head_dim]; true: [N, num_heads*head_dim]
+    bool cos_is_bf16,                                 // true → cos/sin are bf16 (no fp32 cast needed upstream)
     cudaStream_t stream);
 
 } // namespace kernels

@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <type_traits>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -36,10 +37,11 @@ namespace kernels
 //
 // PER_HEAD_COS=false: cos/sin shape [num_tokens, HEAD_DIM] (FLUX-style, head broadcast).
 // PER_HEAD_COS=true:  cos/sin shape [num_tokens, num_heads * HEAD_DIM] (LTX-2 3D RoPE).
-template <int HEAD_DIM, bool INTERLEAVE, bool PER_HEAD_COS>
+// CosT: float (fp32 cos) or __nv_bfloat16 (B-2: kernel upcasts in registers).
+template <int HEAD_DIM, bool INTERLEAVE, bool PER_HEAD_COS, typename CosT>
 __global__ void fusedDiTSplitNormFullDimRopeKernel(__nv_bfloat16* __restrict__ tensor, int const num_tokens,
-    int const num_heads, float const eps, __nv_bfloat16 const* __restrict__ weight, float const* __restrict__ cos_emb,
-    float const* __restrict__ sin_emb)
+    int const num_heads, float const eps, __nv_bfloat16 const* __restrict__ weight, CosT const* __restrict__ cos_emb,
+    CosT const* __restrict__ sin_emb)
 {
     constexpr int BLOCK_SIZE = 256;
     constexpr int N_WARPS = BLOCK_SIZE / 32;                    // 8
@@ -110,10 +112,10 @@ __global__ void fusedDiTSplitNormFullDimRopeKernel(__nv_bfloat16* __restrict__ t
         for (int i = 0; i < CHUNK_ELEMS; i++)
             w_vals[i] = __bfloat162float(weight[headIdx * HEAD_DIM + baseDim + i]);
         int const cosHeadOff = PER_HEAD_COS ? headIdx * HEAD_DIM : 0;
-        // Force 128-bit vectorized loads — 8 scalar loads → 2 LDG.128 per array,
-        // halves L1 transactions for cos/sin (major bottleneck with chunked layout).
-        static_assert(CHUNK_ELEMS == 8, "CHUNK_ELEMS=8 required for float4×2 vectorization");
+        static_assert(CHUNK_ELEMS == 8, "CHUNK_ELEMS=8 required for vectorized cos/sin load");
+        if constexpr (std::is_same_v<CosT, float>)
         {
+            // fp32 cos: 8 scalar loads → 2 LDG.128 per array (float4 × 2).
             float4 const* cos_v = reinterpret_cast<float4 const*>(&cos_emb[embBase + cosHeadOff + baseDim]);
             float4 const* sin_v = reinterpret_cast<float4 const*>(&sin_emb[embBase + cosHeadOff + baseDim]);
             float4 c0 = cos_v[0], c1 = cos_v[1];
@@ -134,6 +136,25 @@ __global__ void fusedDiTSplitNormFullDimRopeKernel(__nv_bfloat16* __restrict__ t
             sin_vals[5] = s1.y;
             sin_vals[6] = s1.z;
             sin_vals[7] = s1.w;
+        }
+        else
+        {
+            // bf16 cos: 8 bf16 = 16 bytes → 1 LDG.128 (uint4) per array (halves cos/sin
+            // memory traffic vs fp32). Upcast in registers via __bfloat1622float2.
+            uint4 const cos_packed = *reinterpret_cast<uint4 const*>(&cos_emb[embBase + cosHeadOff + baseDim]);
+            uint4 const sin_packed = *reinterpret_cast<uint4 const*>(&sin_emb[embBase + cosHeadOff + baseDim]);
+            uint const* cos_uints = reinterpret_cast<uint const*>(&cos_packed);
+            uint const* sin_uints = reinterpret_cast<uint const*>(&sin_packed);
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+            {
+                float2 cv = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&cos_uints[i]));
+                float2 sv = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162 const*>(&sin_uints[i]));
+                cos_vals[2 * i] = cv.x;
+                cos_vals[2 * i + 1] = cv.y;
+                sin_vals[2 * i] = sv.x;
+                sin_vals[2 * i + 1] = sv.y;
+            }
         }
 
         float elements[CHUNK_ELEMS];
@@ -197,7 +218,7 @@ __global__ void fusedDiTSplitNormFullDimRopeKernel(__nv_bfloat16* __restrict__ t
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 void launchFusedDiTSplitNormFullDimRope(void* tensor, int num_tokens, int num_heads, int head_dim, float eps,
-    void const* weight, float const* cos_emb, float const* sin_emb, bool interleave, bool per_head_cos,
+    void const* weight, void const* cos_emb, void const* sin_emb, bool interleave, bool per_head_cos, bool cos_is_bf16,
     cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(num_heads <= 32,
@@ -216,34 +237,44 @@ void launchFusedDiTSplitNormFullDimRope(void* tensor, int num_tokens, int num_he
     attrs[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attrs;
     cfg.numAttrs = 1;
-#define LAUNCH(HEAD_DIM, INTERLEAVE, PER_HEAD)                                                                         \
-    cudaLaunchKernelEx(&cfg, fusedDiTSplitNormFullDimRopeKernel<HEAD_DIM, INTERLEAVE, PER_HEAD>,                       \
+#define LAUNCH(HEAD_DIM, INTERLEAVE, PER_HEAD, COS_T)                                                                  \
+    cudaLaunchKernelEx(&cfg, fusedDiTSplitNormFullDimRopeKernel<HEAD_DIM, INTERLEAVE, PER_HEAD, COS_T>,                \
         reinterpret_cast<__nv_bfloat16*>(tensor), num_tokens, num_heads, eps,                                          \
-        reinterpret_cast<__nv_bfloat16 const*>(weight), cos_emb, sin_emb)
-#define DISPATCH(INTERLEAVE, PER_HEAD)                                                                                 \
+        reinterpret_cast<__nv_bfloat16 const*>(weight), reinterpret_cast<COS_T const*>(cos_emb),                       \
+        reinterpret_cast<COS_T const*>(sin_emb))
+#define DISPATCH(INTERLEAVE, PER_HEAD, COS_T)                                                                          \
     do                                                                                                                 \
     {                                                                                                                  \
         switch (head_dim)                                                                                              \
         {                                                                                                              \
-        case 64: LAUNCH(64, INTERLEAVE, PER_HEAD); break;                                                              \
-        case 128: LAUNCH(128, INTERLEAVE, PER_HEAD); break;                                                            \
+        case 64: LAUNCH(64, INTERLEAVE, PER_HEAD, COS_T); break;                                                       \
+        case 128: LAUNCH(128, INTERLEAVE, PER_HEAD, COS_T); break;                                                     \
         default: TLLM_THROW("Unsupported head_dim for fusedDiTSplitNormFullDimRope: %d (only 64, 128)", head_dim);     \
         }                                                                                                              \
+    } while (0)
+#define DISPATCH_DTYPE(INTERLEAVE, PER_HEAD)                                                                           \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (cos_is_bf16)                                                                                               \
+            DISPATCH(INTERLEAVE, PER_HEAD, __nv_bfloat16);                                                             \
+        else                                                                                                           \
+            DISPATCH(INTERLEAVE, PER_HEAD, float);                                                                     \
     } while (0)
     if (interleave)
     {
         if (per_head_cos)
-            DISPATCH(true, true);
+            DISPATCH_DTYPE(true, true);
         else
-            DISPATCH(true, false);
+            DISPATCH_DTYPE(true, false);
     }
     else
     {
         if (per_head_cos)
-            DISPATCH(false, true);
+            DISPATCH_DTYPE(false, true);
         else
-            DISPATCH(false, false);
+            DISPATCH_DTYPE(false, false);
     }
+#undef DISPATCH_DTYPE
 #undef DISPATCH
 #undef LAUNCH
 }

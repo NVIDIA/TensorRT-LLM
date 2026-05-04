@@ -285,8 +285,10 @@ class Attention(nn.Module):
             )
         # cos/sin are token-major [B, T, H, D] (or shared per-token [B, T, D]);
         # reshape(-1, cos_last) yields the [B*T, cos_last] layout the kernel reads.
-        cos_2d = freqs_cos.reshape(-1, cos_last).float().contiguous()
-        sin_2d = freqs_sin.reshape(-1, cos_last).float().contiguous()
+        # B-2: full-dim LTX-2 path accepts bf16 cos directly (kernel upcasts in registers).
+        # FLUX per-head path requires fp32; cos is already fp32 upstream there, so this is a no-op.
+        cos_2d = freqs_cos.reshape(-1, cos_last).contiguous()
+        sin_2d = freqs_sin.reshape(-1, cos_last).contiguous()
         if cos_2d.shape[0] == S and B > 1:
             cos_tiled = cos_2d.repeat(B, 1)
             sin_tiled = sin_2d.repeat(B, 1)

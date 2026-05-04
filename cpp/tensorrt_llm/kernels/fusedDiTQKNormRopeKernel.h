@@ -85,9 +85,11 @@ void launchFusedDiTQKNormRopeFullDim(void* qkv, // [num_tokens, (Hq+Hk+Hv)*head_
     float eps,
     void const* q_weight,                       // [num_heads_q * head_dim]
     void const* k_weight,                       // [num_heads_k * head_dim]
-    float const* cos_emb,                       // float32
-    float const* sin_emb,                       // float32
-    bool interleave, bool per_head_cos, cudaStream_t stream);
+    void const* cos_emb,                        // float32 or bfloat16 (selected by cos_is_bf16)
+    void const* sin_emb,                        // same dtype as cos_emb
+    bool interleave, bool per_head_cos,
+    bool cos_is_bf16,                           // true → cos/sin are bf16
+    cudaStream_t stream);
 
 } // namespace kernels
 

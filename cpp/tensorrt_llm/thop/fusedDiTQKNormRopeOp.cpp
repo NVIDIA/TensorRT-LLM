@@ -52,8 +52,23 @@ void fused_dit_qk_norm_rope(torch::Tensor& qkv, // [num_tokens, (Hq+Hk+Hv)*head_
     CHECK_INPUT(qkv, torch::kBFloat16);
     CHECK_INPUT(q_weight, torch::kBFloat16);
     CHECK_INPUT(k_weight, torch::kBFloat16);
-    CHECK_INPUT(cos_emb, torch::kFloat32);
-    CHECK_INPUT(sin_emb, torch::kFloat32);
+    // Cos/sin may be fp32 (per-head FLUX path) or bf16 (B-2 full-dim LTX-2 path).
+    // Per-head path requires fp32 (kernel has no bf16 branch); enforced below.
+    auto const cos_dtype = cos_emb.scalar_type();
+    TORCH_CHECK(cos_dtype == torch::kFloat32 || cos_dtype == torch::kBFloat16,
+        "cos_emb dtype must be float32 or bfloat16, got ", cos_dtype);
+    TORCH_CHECK(sin_emb.scalar_type() == cos_dtype, "sin_emb dtype must match cos_emb");
+    bool const cos_is_bf16 = (cos_dtype == torch::kBFloat16);
+    if (cos_is_bf16)
+    {
+        CHECK_INPUT(cos_emb, torch::kBFloat16);
+        CHECK_INPUT(sin_emb, torch::kBFloat16);
+    }
+    else
+    {
+        CHECK_INPUT(cos_emb, torch::kFloat32);
+        CHECK_INPUT(sin_emb, torch::kFloat32);
+    }
 
     int64_t num_tokens = qkv.size(0);
     int64_t total_heads = num_heads_q + num_heads_k + num_heads_v;
@@ -88,12 +103,14 @@ void fused_dit_qk_norm_rope(torch::Tensor& qkv, // [num_tokens, (Hq+Hk+Hv)*head_
         tensorrt_llm::kernels::launchFusedDiTQKNormRopeFullDim(qkv.data_ptr(), static_cast<int>(num_tokens),
             static_cast<int>(num_heads_q), static_cast<int>(num_heads_k), static_cast<int>(num_heads_v),
             static_cast<int>(head_dim), static_cast<float>(eps), q_weight.data_ptr(), k_weight.data_ptr(),
-            reinterpret_cast<float const*>(cos_emb.data_ptr()), reinterpret_cast<float const*>(sin_emb.data_ptr()),
-            interleave, per_head_cos, stream);
+            cos_emb.data_ptr(), sin_emb.data_ptr(), interleave, per_head_cos, cos_is_bf16, stream);
         return;
     }
 
-    // Per-head path (original FLUX/Cosmos3 kernel)
+    // Per-head path (original FLUX/Cosmos3 kernel) — only fp32 cos supported here.
+    TORCH_CHECK(!cos_is_bf16,
+        "Per-head fused_dit_qk_norm_rope (FLUX/Cosmos) requires fp32 cos/sin; bf16 cos is only supported "
+        "by the full-dim path (LTX-2)");
     void const* q_add_ptr = nullptr;
     void const* k_add_ptr = nullptr;
     if (q_add_weight.has_value())
