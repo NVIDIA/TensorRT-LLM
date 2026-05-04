@@ -44,15 +44,6 @@ try:
 except ImportError:
     float4_sf_dtype = None
 
-try:
-    from tensorrt_llm.quantization.utils.fp8_utils import (
-        resmooth_to_fp8_e8m0,
-        transform_sf_into_required_layout,
-    )
-except ImportError:
-    resmooth_to_fp8_e8m0 = None
-    transform_sf_into_required_layout = None
-
 
 class Quantization(BaseTransform):
     """Abstract base for config-driven quantization of a single algorithm/op-kind.
@@ -896,77 +887,14 @@ class FineGrainedFP8LinearQuantization(Quantization):
                 mod_prefix = weight_name.rsplit(".", 1)[0]
                 state_dict[mod_prefix + ".weight_scale_inv"] = state_dict[scale_inv_name]
 
-    def post_load_hook(self, module, incompatible_keys, weight_name):
-        """Convert FP8 weight scales to UE8M0 format for DeepGEMM on Blackwell."""
-        from tensorrt_llm._utils import is_sm_100f
-
-        if not is_sm_100f():
-            return
-
-        # Navigate to the weight parameter
-        *path, attr_name = weight_name.split(".")
-        target_module = module
-        for p in path:
-            target_module = getattr(target_module, p)
-
-        weight_param = getattr(target_module, attr_name, None)
-        if weight_param is None or weight_param.dtype != torch.float8_e4m3fn:
-            return
-
-        # Find the corresponding scale parameter.
-        # Linear path registers buffer as "weight_scale_inv" directly.
-        # BMM path registers as "{attr_name}_weight_scale_inv" (e.g. "weight_weight_scale_inv").
-        scale_attr = "weight_scale_inv"
-        scale_param = getattr(target_module, scale_attr, None)
-        if scale_param is None:
-            scale_attr = attr_name + "_weight_scale_inv"
-            scale_param = getattr(target_module, scale_attr, None)
-        if scale_param is None:
-            return
-
-        N, K = weight_param.shape[-2], weight_param.shape[-1]
-        scale_n, scale_k = scale_param.shape[-2], scale_param.shape[-1]
-        if scale_n == 0 or scale_k == 0:
-            return
-
-        # Skip DeepGEMM for TP-misaligned projections (N not a multiple of 128).
-        # Misalignment would require re-quantizing the weight to 128x128 UE8M0
-        # blocks, which introduces precision loss from power-of-2 scale
-        # rounding.  Empirically observed on DeepSeek-R1 (q_a N=192, kv_a N=72
-        # at TP=8): MMLU 82.31 → 84.16 when these fall back to cuBLAS with
-        # float32 scales.  Aligned projections (q_b N=3072, kv_b N=1024, MoE
-        # etc.) keep DeepGEMM — no re-quant, no precision loss.
-        if K % 128 != 0 or N % 128 != 0:
-            return
-
-        if resmooth_to_fp8_e8m0 is None or transform_sf_into_required_layout is None:
-            raise ImportError(
-                "FineGrained FP8 DeepGEMM on SM100f requires "
-                "'tensorrt_llm.quantization.utils.fp8_utils' which could not be imported. "
-                "Please install tensorrt_llm with quantization support."
-            )
-
-        with torch.no_grad():
-            weight_new, scale_new = resmooth_to_fp8_e8m0(
-                weight_param.data, scale_param.data.float()
-            )
-
-            N, K = weight_new.shape[-2], weight_new.shape[-1]
-            transformed_scale = transform_sf_into_required_layout(
-                scale_new,
-                mn=N,
-                k=K,
-                recipe=(1, 128, 128),
-                is_sfa=False,
-            )
-
-            # Replace parameters in-place
-            setattr(
-                target_module,
-                attr_name,
-                nn.Parameter(weight_new, requires_grad=False),
-            )
-            target_module.register_buffer(scale_attr, transformed_scale.detach())
+    # NOTE: post_load_hook intentionally inherited as None from the base
+    # `Quantization`. UE8M0 conversion + TMA col-major layout for DeepGEMM is
+    # done atomically inside `_dispatch_trtllm_finegrained_fp8_to_deepgemm`
+    # (transform/library/fuse_quant.py) for every node we actually swap to
+    # `trtllm_fp8_deepgemm`. Doing it there guarantees the graph never carries
+    # a UE8M0 scale paired with a raw-FP32-scale op, which previously caused
+    # NaN whenever dispatch failed to swap (deepgemm op missing in build,
+    # fuse_finegrained_fp8_linear disabled, partial pipeline, etc.).
 
     def _apply(
         self,
