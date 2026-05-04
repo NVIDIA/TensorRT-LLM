@@ -434,6 +434,8 @@ async def async_benchmark(
 
             if duration is None:
                 assert finished_requests == len(requests), "Benchmark failed"
+            elif finished_requests < len(requests):
+                logger.info(f"Duration limit reached. Processed {finished_requests}/{len(requests)} requests.")
 
         statistics.set_energy(monitor.total_energy)
         logger.info("Benchmark complete.")
