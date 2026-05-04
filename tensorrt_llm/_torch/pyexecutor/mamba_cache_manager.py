@@ -609,6 +609,41 @@ class PythonMambaCacheManager(BaseResourceManager):
         return self.mamba_cache.at_layer_idx(
             layer_offset).intermediate_conv_window
 
+    def get_replay_old_x(self, layer_idx: int) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        layer_offset = self.mamba_layer_offsets[layer_idx]
+        return self.mamba_cache.old_x[layer_offset]
+
+    def get_replay_old_B(self, layer_idx: int) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        layer_offset = self.mamba_layer_offsets[layer_idx]
+        return self.mamba_cache.old_B[layer_offset]
+
+    def get_replay_old_dt(self, layer_idx: int) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        layer_offset = self.mamba_layer_offsets[layer_idx]
+        return self.mamba_cache.old_dt[layer_offset]
+
+    def get_replay_old_dA_cumsum(self,
+                                 layer_idx: int) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        layer_offset = self.mamba_layer_offsets[layer_idx]
+        return self.mamba_cache.old_dA_cumsum[layer_offset]
+
+    def get_replay_cache_buf_idx(self) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        return self.mamba_cache.cache_buf_idx
+
+    def get_replay_prev_num_accepted_tokens(self) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        return self.mamba_cache.prev_num_accepted_tokens
+
     def is_speculative(self) -> bool:
         return isinstance(self.mamba_cache, self.SpeculativeState)
 
@@ -812,6 +847,31 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
                                      layer_idx: int) -> Optional[torch.Tensor]:
         assert not self._use_cpp, "get_intermediate_conv_states is not supported in CppMambaCacheManager"
         return self._impl.get_intermediate_conv_states(layer_idx)
+
+    def get_replay_old_x(self, layer_idx: int) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_old_x is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_old_x(layer_idx)
+
+    def get_replay_old_B(self, layer_idx: int) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_old_B is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_old_B(layer_idx)
+
+    def get_replay_old_dt(self, layer_idx: int) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_old_dt is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_old_dt(layer_idx)
+
+    def get_replay_old_dA_cumsum(self,
+                                 layer_idx: int) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_old_dA_cumsum is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_old_dA_cumsum(layer_idx)
+
+    def get_replay_cache_buf_idx(self) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_cache_buf_idx is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_cache_buf_idx()
+
+    def get_replay_prev_num_accepted_tokens(self) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_prev_num_accepted_tokens is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_prev_num_accepted_tokens()
 
     def is_speculative(self) -> bool:
         return self._impl.is_speculative()

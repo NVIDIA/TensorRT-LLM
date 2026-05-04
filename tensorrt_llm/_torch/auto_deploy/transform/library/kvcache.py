@@ -211,6 +211,7 @@ class _InsertCachedOperator(BaseTransform):
         cache_nodes: List[Node],
         constants: List[Constant],
         prepared_attn_mask: Optional[Node] = None,
+        cache_kwarg_nodes: Optional[Dict[str, Node]] = None,
     ):
         """Insert a cached attention node into the graph."""
         with gm.graph.inserting_before(attn_node):
@@ -225,7 +226,14 @@ class _InsertCachedOperator(BaseTransform):
                 all_args = (*all_args, prepared_attn_mask)
             cached_attn_node = gm.graph.call_function(
                 cached_attn_op,
-                args=all_args,
+                args=(
+                    *qkv_nodes,
+                    *meta_nodes_std,
+                    *meta_nodes_extra,
+                    *cache_nodes,
+                    *constants,
+                ),
+                kwargs=cache_kwarg_nodes or {},
             )
         attn_node.replace_all_uses_with(cached_attn_node)
         gm.graph.erase_node(attn_node)
@@ -295,11 +303,18 @@ class _InsertCachedOperator(BaseTransform):
                         "Each non-shared attention layer must own exactly one cache."
                     )
                 cache_in_nodes = []
+                cache_kwarg_nodes = {}
+                kwarg_keys = attn_descriptor.get_kwarg_cache_keys()
                 for k, resource_handler in attn_descriptor.get_cache_initializers(
                     attn_node, cm.kv_cache_config
                 ).items():
                     resource_name = cm.add_resource(k, resource_handler)
-                    cache_in_nodes.append(self._process_cache_node(gm, resource_name))
+                    node = self._process_cache_node(gm, resource_name)
+                    if k in kwarg_keys:
+                        # Pass as named kwarg to call_function (e.g. replay args after constants)
+                        cache_kwarg_nodes[k] = node
+                    else:
+                        cache_in_nodes.append(node)
                 if layer_idx is not None:
                     cache_nodes_by_layer_idx[layer_idx] = cache_in_nodes
 
@@ -327,6 +342,7 @@ class _InsertCachedOperator(BaseTransform):
                 cache_in_nodes,
                 constants,
                 prepared_mask,
+                cache_kwarg_nodes,
             )
 
             num_cached_attn_replacements += 1

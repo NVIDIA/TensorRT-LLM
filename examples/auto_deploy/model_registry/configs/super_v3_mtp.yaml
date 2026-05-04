@@ -3,13 +3,14 @@
 runtime: trtllm
 compile_backend: torch-cudagraph
 max_batch_size: 128
-max_seq_len: 65536 # tunable
+max_seq_len: 16384
+max_num_tokens: 8192
 enable_chunked_prefill: false # TODO: Support chunked prefill w/ spec dec
 attn_backend: trtllm
 model_factory: AutoModelForCausalLM
 skip_loading_weights: false
 cuda_graph_config:
-  batch_sizes: [1, 2, 4, 8, 16, 24, 32, 64, 128]
+  max_batch_size: 64
 kv_cache_config:
   # tunable mamba cache dtype
   # --> use float32 for accuracy and default (auto) for speed
@@ -54,6 +55,7 @@ transforms:
   # for speculative Mamba state caching in this configuration.
   insert_cached_ssm_attention:
     backend: flashinfer_ssm
+    ssm_replay: true
   insert_cached_causal_conv:
     backend: triton_causal_conv
   fuse_nvfp4_moe:
