@@ -21,6 +21,7 @@ server_configs:
     cuda_graph_config:
       enable_padding: true
       max_batch_size: 640
+      batch_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 256, 512, 640]
     kv_cache_config:
       dtype: 'fp8'
       enable_block_reuse: false
