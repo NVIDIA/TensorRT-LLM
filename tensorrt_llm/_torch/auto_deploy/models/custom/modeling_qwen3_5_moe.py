@@ -1829,6 +1829,78 @@ class Qwen3_5MoeModel(nn.Module):
         )
         return special_image_mask, special_video_mask
 
+    @staticmethod
+    def _build_request_item_runs(
+        req_mm_positions: Sequence[int],
+        req_mm_lengths: Sequence[int],
+        req_mm_item_run_cu_seqlen: Optional[Sequence[int]] = None,
+        req_mm_run_positions: Optional[Sequence[int]] = None,
+        req_mm_run_lengths: Optional[Sequence[int]] = None,
+    ) -> List[List[Tuple[int, int, int]]]:
+        if (
+            req_mm_item_run_cu_seqlen is None
+            and req_mm_run_positions is None
+            and req_mm_run_lengths is None
+        ):
+            return [
+                [(int(mm_start), int(mm_len), 0)]
+                for mm_start, mm_len in zip(req_mm_positions, req_mm_lengths)
+            ]
+        if (
+            req_mm_item_run_cu_seqlen is None
+            or req_mm_run_positions is None
+            or req_mm_run_lengths is None
+        ):
+            raise ValueError("Incomplete multimodal item-run metadata for Qwen3.5 chunk")
+        if len(req_mm_item_run_cu_seqlen) != len(req_mm_positions) + 1:
+            raise ValueError(
+                "mm_item_run_cu_seqlen must have one more entry than request items: "
+                f"cu={len(req_mm_item_run_cu_seqlen)}, items={len(req_mm_positions)}"
+            )
+        if len(req_mm_run_positions) != len(req_mm_run_lengths):
+            raise ValueError(
+                "Mismatch between mm_run_token_positions and mm_run_token_lengths: "
+                f"positions={len(req_mm_run_positions)}, lengths={len(req_mm_run_lengths)}"
+            )
+        if int(req_mm_item_run_cu_seqlen[-1]) != len(req_mm_run_positions):
+            raise ValueError(
+                "mm_item_run_cu_seqlen final value must match number of run entries: "
+                f"final={int(req_mm_item_run_cu_seqlen[-1])}, runs={len(req_mm_run_positions)}"
+            )
+
+        item_runs: List[List[Tuple[int, int, int]]] = []
+        for item_idx, mm_len in enumerate(req_mm_lengths):
+            run_start_idx = int(req_mm_item_run_cu_seqlen[item_idx])
+            run_end_idx = int(req_mm_item_run_cu_seqlen[item_idx + 1])
+            if run_start_idx == run_end_idx:
+                raise ValueError(f"Qwen3.5 multimodal item {item_idx} has no run entries")
+            item_length = 0
+            previous_run_end: Optional[int] = None
+            runs: List[Tuple[int, int, int]] = []
+            for run_idx in range(run_start_idx, run_end_idx):
+                run_start = int(req_mm_run_positions[run_idx])
+                run_length = int(req_mm_run_lengths[run_idx])
+                if run_length <= 0:
+                    raise ValueError(
+                        f"Qwen3.5 multimodal item {item_idx} run {run_idx} "
+                        "must have positive length"
+                    )
+                if previous_run_end is not None and run_start < previous_run_end:
+                    raise ValueError(
+                        f"Qwen3.5 multimodal item {item_idx} run {run_idx} overlaps "
+                        "or is not sorted after the previous run"
+                    )
+                runs.append((run_start, run_length, item_length))
+                item_length += run_length
+                previous_run_end = run_start + run_length
+            if item_length != int(mm_len):
+                raise ValueError(
+                    "Qwen3.5 multimodal item run lengths do not match item length: "
+                    f"item={item_idx}, runs={item_length}, item_length={int(mm_len)}"
+                )
+            item_runs.append(runs)
+        return item_runs
+
     def _select_request_chunk_multimodal_embeds(
         self,
         req_input_pos: int,
@@ -1839,6 +1911,9 @@ class Qwen3_5MoeModel(nn.Module):
         req_special_offsets: Sequence[int],
         image_embeds_list: Optional[Sequence[torch.Tensor]],
         video_embeds_list: Optional[Sequence[torch.Tensor]],
+        req_mm_item_run_cu_seqlen: Optional[Sequence[int]] = None,
+        req_mm_run_positions: Optional[Sequence[int]] = None,
+        req_mm_run_lengths: Optional[Sequence[int]] = None,
     ) -> torch.Tensor:
         chunk_end = req_input_pos + req_seq_len
         mm_cumulative_offset = 0
@@ -1847,14 +1922,18 @@ class Qwen3_5MoeModel(nn.Module):
         chunks: list[torch.Tensor] = []
         hidden_size = self.config.text_config.hidden_size
         special_offsets_set = set(int(x) for x in req_special_offsets)
+        item_runs_by_item = self._build_request_item_runs(
+            req_mm_positions,
+            req_mm_lengths,
+            req_mm_item_run_cu_seqlen,
+            req_mm_run_positions,
+            req_mm_run_lengths,
+        )
 
-        for item_type, mm_start, mm_len in zip(req_mm_item_types, req_mm_positions, req_mm_lengths):
+        for item_idx, (item_type, mm_len) in enumerate(zip(req_mm_item_types, req_mm_lengths)):
             item_mm_offset = mm_cumulative_offset
             item_mm_len = int(mm_len)
-            item_abs_start = int(mm_start)
-            item_abs_end = item_abs_start + item_mm_len
-            overlap_start = max(req_input_pos, item_abs_start)
-            overlap_end = min(chunk_end, item_abs_end)
+            item_runs = item_runs_by_item[item_idx]
 
             if item_type == 0:
                 if image_embeds_list is None:
@@ -1882,18 +1961,26 @@ class Qwen3_5MoeModel(nn.Module):
                 raise ValueError(
                     "Multimodal embedding length mismatch for Qwen3.5 item: "
                     f"type={item_type}, expected={feature_idx}, actual={item_embeds.shape[0]}, "
-                    f"mm_len={item_mm_len}, item_start={item_abs_start}, "
+                    f"mm_len={item_mm_len}, item_runs={item_runs}, "
                     f"special_offsets={sorted(special_offsets_set)}"
                 )
 
-            if overlap_start < overlap_end:
-                selected_indices = [
-                    local_to_feature_idx[rel]
-                    for rel in range(overlap_start - item_abs_start, overlap_end - item_abs_start)
-                    if local_to_feature_idx[rel] is not None
-                ]
-                if selected_indices:
-                    chunks.append(item_embeds[selected_indices])
+            selected_indices: list[int] = []
+            for run_start, run_length, item_local_start in item_runs:
+                overlap_start = max(req_input_pos, run_start)
+                overlap_end = min(chunk_end, run_start + run_length)
+                if overlap_start >= overlap_end:
+                    continue
+                selected_indices.extend(
+                    feature_idx
+                    for feature_idx in (
+                        local_to_feature_idx[item_local_start + rel]
+                        for rel in range(overlap_start - run_start, overlap_end - run_start)
+                    )
+                    if feature_idx is not None
+                )
+            if selected_indices:
+                chunks.append(item_embeds[selected_indices])
 
             mm_cumulative_offset += item_mm_len
 
@@ -1949,8 +2036,11 @@ class Qwen3_5MoeModel(nn.Module):
         mm_item_types: torch.Tensor,
         mm_token_positions: torch.Tensor,
         mm_token_lengths: torch.Tensor,
-        mm_special_offsets_cu_seqlen: Optional[torch.Tensor],
-        mm_special_offsets: Optional[torch.Tensor],
+        mm_item_run_cu_seqlen: Optional[torch.Tensor] = None,
+        mm_run_token_positions: Optional[torch.Tensor] = None,
+        mm_run_token_lengths: Optional[torch.Tensor] = None,
+        mm_special_offsets_cu_seqlen: Optional[torch.Tensor] = None,
+        mm_special_offsets: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         num_prefill_seqs = int(batch_info[0].item())
         img_idx = 0
@@ -1963,6 +2053,22 @@ class Qwen3_5MoeModel(nn.Module):
             req_mm_item_types = mm_item_types[item_start:item_end].tolist()
             req_mm_positions = mm_token_positions[item_start:item_end].tolist()
             req_mm_lengths = mm_token_lengths[item_start:item_end].tolist()
+
+            req_item_run_cu_seqlen = None
+            req_run_positions = None
+            req_run_lengths = None
+            if (
+                mm_item_run_cu_seqlen is not None
+                and mm_run_token_positions is not None
+                and mm_run_token_lengths is not None
+            ):
+                run_start = int(mm_item_run_cu_seqlen[item_start].item())
+                run_end = int(mm_item_run_cu_seqlen[item_end].item())
+                req_item_run_cu_seqlen = (
+                    mm_item_run_cu_seqlen[item_start : item_end + 1] - run_start
+                ).tolist()
+                req_run_positions = mm_run_token_positions[run_start:run_end].tolist()
+                req_run_lengths = mm_run_token_lengths[run_start:run_end].tolist()
 
             req_special_offsets: list[int] = []
             if mm_special_offsets_cu_seqlen is not None and mm_special_offsets is not None:
@@ -1994,6 +2100,9 @@ class Qwen3_5MoeModel(nn.Module):
                 req_special_offsets=req_special_offsets,
                 image_embeds_list=req_image_embeds,
                 video_embeds_list=req_video_embeds,
+                req_mm_item_run_cu_seqlen=req_item_run_cu_seqlen,
+                req_mm_run_positions=req_run_positions,
+                req_mm_run_lengths=req_run_lengths,
             )
             chunks.append(req_chunk_embeds)
 
@@ -2079,6 +2188,9 @@ class Qwen3_5MoeModel(nn.Module):
         mm_token_positions = kwargs.get("mm_token_positions")
         mm_token_lengths = kwargs.get("mm_token_lengths")
         mm_item_types = kwargs.get("mm_item_types")
+        mm_item_run_cu_seqlen = kwargs.get("mm_item_run_cu_seqlen")
+        mm_run_token_positions = kwargs.get("mm_run_token_positions")
+        mm_run_token_lengths = kwargs.get("mm_run_token_lengths")
         mm_special_offsets_cu_seqlen = kwargs.get("mm_special_offsets_cu_seqlen")
         mm_special_offsets = kwargs.get("mm_special_offsets")
         slot_idx = kwargs.get("slot_idx")
@@ -2135,6 +2247,9 @@ class Qwen3_5MoeModel(nn.Module):
                     mm_item_types=mm_item_types,
                     mm_token_positions=mm_token_positions,
                     mm_token_lengths=mm_token_lengths,
+                    mm_item_run_cu_seqlen=mm_item_run_cu_seqlen,
+                    mm_run_token_positions=mm_run_token_positions,
+                    mm_run_token_lengths=mm_run_token_lengths,
                     mm_special_offsets_cu_seqlen=mm_special_offsets_cu_seqlen,
                     mm_special_offsets=mm_special_offsets,
                 )
@@ -2205,6 +2320,9 @@ class Qwen3_5MoeModel(nn.Module):
                 mm_item_types,
                 mm_token_positions,
                 mm_token_lengths,
+                mm_item_run_cu_seqlen,
+                mm_run_token_positions,
+                mm_run_token_lengths,
                 mm_special_offsets_cu_seqlen,
                 mm_special_offsets,
             )
@@ -2260,6 +2378,9 @@ class Qwen3_5MoeModel(nn.Module):
             "mm_item_types",
             "mm_token_positions",
             "mm_token_lengths",
+            "mm_item_run_cu_seqlen",
+            "mm_run_token_positions",
+            "mm_run_token_lengths",
             "mm_special_offsets_cu_seqlen",
             "mm_special_offsets",
             "mrope_delta_cache",
@@ -2290,8 +2411,11 @@ class Qwen3_5MoeModel(nn.Module):
         mm_item_types: torch.Tensor,
         mm_token_positions: torch.Tensor,
         mm_token_lengths: torch.Tensor,
-        mm_special_offsets_cu_seqlen: Optional[torch.Tensor],
-        mm_special_offsets: Optional[torch.Tensor],
+        mm_item_run_cu_seqlen: Optional[torch.Tensor] = None,
+        mm_run_token_positions: Optional[torch.Tensor] = None,
+        mm_run_token_lengths: Optional[torch.Tensor] = None,
+        mm_special_offsets_cu_seqlen: Optional[torch.Tensor] = None,
+        mm_special_offsets: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Build 3D positions using chunk runtime metadata from the executor.
 
@@ -2321,6 +2445,22 @@ class Qwen3_5MoeModel(nn.Module):
             req_mm_item_types = mm_item_types[item_start:item_end].tolist()
             req_mm_positions = mm_token_positions[item_start:item_end].tolist()
             req_mm_lengths = mm_token_lengths[item_start:item_end].tolist()
+
+            req_item_run_cu_seqlen = None
+            req_run_positions = None
+            req_run_lengths = None
+            if (
+                mm_item_run_cu_seqlen is not None
+                and mm_run_token_positions is not None
+                and mm_run_token_lengths is not None
+            ):
+                run_start = int(mm_item_run_cu_seqlen[item_start].item())
+                run_end = int(mm_item_run_cu_seqlen[item_end].item())
+                req_item_run_cu_seqlen = (
+                    mm_item_run_cu_seqlen[item_start : item_end + 1] - run_start
+                ).tolist()
+                req_run_positions = mm_run_token_positions[run_start:run_end].tolist()
+                req_run_lengths = mm_run_token_lengths[run_start:run_end].tolist()
 
             req_special_offsets: list[int] = []
             if mm_special_offsets_cu_seqlen is not None and mm_special_offsets is not None:
@@ -2352,6 +2492,9 @@ class Qwen3_5MoeModel(nn.Module):
                     req_mm_positions=req_mm_positions,
                     req_mm_lengths=req_mm_lengths,
                     req_special_offsets=req_special_offsets,
+                    req_mm_item_run_cu_seqlen=req_item_run_cu_seqlen,
+                    req_mm_run_positions=req_run_positions,
+                    req_mm_run_lengths=req_run_lengths,
                     image_grid_thw=req_img_grid,
                     video_grid_thw=req_vid_grid,
                     dtype=input_ids.dtype,
@@ -2394,6 +2537,9 @@ class Qwen3_5MoeModel(nn.Module):
         req_mm_positions: Sequence[int],
         req_mm_lengths: Sequence[int],
         req_special_offsets: Sequence[int],
+        req_mm_item_run_cu_seqlen: Optional[Sequence[int]],
+        req_mm_run_positions: Optional[Sequence[int]],
+        req_mm_run_lengths: Optional[Sequence[int]],
         image_grid_thw: Optional[torch.Tensor],
         video_grid_thw: Optional[torch.Tensor],
         dtype: torch.dtype,
@@ -2408,6 +2554,13 @@ class Qwen3_5MoeModel(nn.Module):
         comp_cursor = 0
         img_idx = 0
         vid_idx = 0
+        item_runs_by_item = self._build_request_item_runs(
+            req_mm_positions,
+            req_mm_lengths,
+            req_mm_item_run_cu_seqlen,
+            req_mm_run_positions,
+            req_mm_run_lengths,
+        )
 
         def fill_text(abs_start: int, abs_end: int, comp_start: int) -> None:
             ov_start = max(req_input_pos, abs_start)
@@ -2422,52 +2575,54 @@ class Qwen3_5MoeModel(nn.Module):
                 0
             ).expand(3, -1)
 
-        def fill_vision(abs_start: int, grid: torch.Tensor, comp_start: int) -> Tuple[int, int]:
+        def build_vision_positions(grid: torch.Tensor, comp_start: int) -> Tuple[torch.Tensor, int]:
             t, h, w = [int(v) for v in grid.tolist()]
             llm_grid_t = int(t)
             llm_grid_h = int(h) // self.config.vision_config.spatial_merge_size
             llm_grid_w = int(w) // self.config.vision_config.spatial_merge_size
-            vision_len = llm_grid_t * llm_grid_h * llm_grid_w
 
-            ov_start = max(req_input_pos, abs_start)
-            ov_end = min(chunk_end, abs_start + vision_len)
-            if ov_start < ov_end:
-                t_index = (
-                    torch.arange(llm_grid_t, device=device, dtype=dtype)
-                    .view(-1, 1)
-                    .expand(-1, llm_grid_h * llm_grid_w)
-                    .flatten()
-                )
-                h_index = (
-                    torch.arange(llm_grid_h, device=device, dtype=dtype)
-                    .view(1, -1, 1)
-                    .expand(llm_grid_t, -1, llm_grid_w)
-                    .flatten()
-                )
-                w_index = (
-                    torch.arange(llm_grid_w, device=device, dtype=dtype)
-                    .view(1, 1, -1)
-                    .expand(llm_grid_t, llm_grid_h, -1)
-                    .flatten()
-                )
-                positions = torch.stack([t_index, h_index, w_index]) + comp_start
-                local_start = ov_start - abs_start
-                local_end = ov_end - abs_start
-                out[:, 0, ov_start - req_input_pos : ov_end - req_input_pos] = positions[
-                    :, local_start:local_end
-                ]
+            t_index = (
+                torch.arange(llm_grid_t, device=device, dtype=dtype)
+                .view(-1, 1)
+                .expand(-1, llm_grid_h * llm_grid_w)
+                .flatten()
+            )
+            h_index = (
+                torch.arange(llm_grid_h, device=device, dtype=dtype)
+                .view(1, -1, 1)
+                .expand(llm_grid_t, -1, llm_grid_w)
+                .flatten()
+            )
+            w_index = (
+                torch.arange(llm_grid_w, device=device, dtype=dtype)
+                .view(1, 1, -1)
+                .expand(llm_grid_t, llm_grid_h, -1)
+                .flatten()
+            )
+            positions = torch.stack([t_index, h_index, w_index]) + comp_start
+            return positions, comp_start + max(llm_grid_t, llm_grid_h, llm_grid_w)
 
-            return vision_len, comp_start + max(llm_grid_t, llm_grid_h, llm_grid_w)
-
-        for item_type, mm_start, mm_len in zip(req_mm_item_types, req_mm_positions, req_mm_lengths):
+        for item_idx, (item_type, mm_len) in enumerate(zip(req_mm_item_types, req_mm_lengths)):
             item_mm_offset = mm_cumulative_offset
-            leading_specials = 0
-            while item_mm_offset + leading_specials in special_offsets_set:
-                leading_specials += 1
+            item_runs = item_runs_by_item[item_idx]
+            vision_abs_positions: list[int] = []
+            for run_start, run_length, item_local_start in item_runs:
+                for rel in range(run_length):
+                    item_local_offset = item_local_start + rel
+                    if item_mm_offset + item_local_offset not in special_offsets_set:
+                        vision_abs_positions.append(run_start + rel)
 
-            vision_abs_start = int(mm_start) + leading_specials
-            fill_text(abs_cursor, vision_abs_start, comp_cursor)
-            comp_cursor += vision_abs_start - abs_cursor
+            if not vision_abs_positions:
+                item_abs_end = max(run_start + run_length for run_start, run_length, _ in item_runs)
+                fill_text(abs_cursor, item_abs_end, comp_cursor)
+                comp_cursor += item_abs_end - abs_cursor
+                abs_cursor = item_abs_end
+                mm_cumulative_offset += int(mm_len)
+                continue
+
+            first_vision_abs_start = vision_abs_positions[0]
+            fill_text(abs_cursor, first_vision_abs_start, comp_cursor)
+            comp_cursor += first_vision_abs_start - abs_cursor
 
             if item_type == 0:
                 if image_grid_thw is None:
@@ -2482,9 +2637,26 @@ class Qwen3_5MoeModel(nn.Module):
             else:
                 raise ValueError(f"Unsupported multimodal item type: {item_type}")
 
-            _, next_comp_cursor = fill_vision(vision_abs_start, grid, comp_cursor)
-            comp_cursor = next_comp_cursor
-            abs_cursor = int(mm_start) + int(mm_len)
+            vision_positions, next_comp_cursor = build_vision_positions(grid, comp_cursor)
+            if vision_positions.shape[1] != len(vision_abs_positions):
+                raise ValueError(
+                    "Qwen3.5 vision grid length does not match exact item runs: "
+                    f"grid_tokens={vision_positions.shape[1]}, run_tokens={len(vision_abs_positions)}"
+                )
+
+            text_cursor = first_vision_abs_start
+            text_comp_cursor = next_comp_cursor
+            for vision_idx, vision_abs_pos in enumerate(vision_abs_positions):
+                fill_text(text_cursor, vision_abs_pos, text_comp_cursor)
+                text_comp_cursor += vision_abs_pos - text_cursor
+                if req_input_pos <= vision_abs_pos < chunk_end:
+                    out[:, 0, vision_abs_pos - req_input_pos] = vision_positions[:, vision_idx]
+                text_cursor = vision_abs_pos + 1
+
+            item_abs_end = max(run_start + run_length for run_start, run_length, _ in item_runs)
+            fill_text(text_cursor, item_abs_end, text_comp_cursor)
+            comp_cursor = text_comp_cursor + item_abs_end - text_cursor
+            abs_cursor = item_abs_end
             mm_cumulative_offset += int(mm_len)
 
         fill_text(abs_cursor, chunk_end, comp_cursor)
@@ -2750,8 +2922,7 @@ class Qwen3_5MoeADInputProcessor:
         vision_start_token_id = int(self.processor.vision_start_token_id)
         ids = token_ids
 
-        starts: List[int] = []
-        lengths: List[int] = []
+        item_runs_by_item: List[List[Tuple[int, int, List[int]]]] = []
         special_offsets: List[int] = []
         item_types: List[int] = []
         mm_union_offset = 0
@@ -2782,11 +2953,11 @@ class Qwen3_5MoeADInputProcessor:
                 i += 1
                 continue
 
-            starts.append(i)
-            lengths.append(j - i)
+            span_length = j - i
+            item_runs_by_item.append([(i, span_length, [0])])
             special_offsets.append(mm_union_offset)
             item_types.append(item_type)
-            mm_union_offset += j - i
+            mm_union_offset += span_length
             i = j
 
         image_items = _normalize_qwen_image_items(mm_data.get("image"))
@@ -2800,10 +2971,11 @@ class Qwen3_5MoeADInputProcessor:
                 f"spans={num_video_spans}, expected_from_videos={sum(video_span_counts)}"
             )
 
-        if len(starts) != len(image_items) + num_video_spans:
+        if len(item_runs_by_item) != len(image_items) + num_video_spans:
             raise ValueError(
                 "Mismatch between multimodal prompt spans and multimodal items: "
-                f"spans={len(starts)}, images={len(image_items)}, video_spans={num_video_spans}"
+                f"spans={len(item_runs_by_item)}, images={len(image_items)}, "
+                f"video_spans={num_video_spans}"
             )
 
         mm_uuids = inputs.get("multi_modal_uuids", None)
@@ -2842,9 +3014,8 @@ class Qwen3_5MoeADInputProcessor:
         return (
             MultimodalInput.from_components(
                 mm_hashes_flat,
-                starts,
-                lengths,
-                mm_uuid_list if mm_uuids is not None else None,
+                mm_uuids=mm_uuid_list if mm_uuids is not None else None,
+                mm_item_runs=item_runs_by_item,
             ),
             special_offsets,
             item_types,

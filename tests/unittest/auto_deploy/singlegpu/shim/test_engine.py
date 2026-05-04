@@ -184,8 +184,7 @@ class _DummyRequest:
         self.py_seq_slot = seq_slot
         self.py_batch_idx = None
         self.py_multimodal_data = None
-        self.multimodal_positions = None
-        self.multimodal_lengths = None
+        self.multimodal_item_runs = None
 
     def get_tokens(self, _beam: int) -> List[int]:
         return self._tokens
@@ -275,10 +274,12 @@ def test_ad_engine_chunked_prefill_stages_multimodal_runtime_metadata():
 
     tokens = [1, 2, 99, 99, 99, 99, 3, 4]
     req = _DummyRequest(tokens=tokens, begin=4, size=4, seq_slot=0)
-    req.multimodal_positions = [2]
-    req.multimodal_lengths = [4]
+    req.multimodal_item_runs = [[(2, 4, [])]]
     # Flat prompt-length mask: text at [0,1,6,7], embeds at [2..5].
     req.py_multimodal_data = {
+        "layout_metadata": {
+            "item_types": torch.tensor([0], dtype=torch.int32),
+        },
         "multimodal_embed_mask_cumsum": torch.tensor(
             [False, False, True, True, True, True, False, False]
         )
@@ -381,10 +382,12 @@ def test_ad_engine_stages_mm_chunk_bounds_for_multimodal_block_reuse():
 
     tokens = [1, 2, 99, 99, 99, 99, 3, 4]
     req = _DummyRequest(tokens=tokens, begin=4, size=4, seq_slot=0)
-    req.multimodal_positions = [2]
-    req.multimodal_lengths = [4]
+    req.multimodal_item_runs = [[(2, 4, [])]]
     # 4-slot unit at positions 2..5, no inline specials.
     req.py_multimodal_data = {
+        "layout_metadata": {
+            "item_types": torch.tensor([0], dtype=torch.int32),
+        },
         "multimodal_embed_mask_cumsum": torch.tensor(
             [False, False, True, True, True, True, False, False]
         )
@@ -410,13 +413,8 @@ def test_ad_engine_stages_mm_chunk_bounds_for_multimodal_block_reuse():
     cache_seq_interface.shutdown()
 
 
-def test_ad_engine_mm_special_offsets_for_non_contiguous_unit():
-    """Non-contiguous unit: use pre-computed mm_special_offsets.
-
-    Must be the pre-computed indices into the MM-token list, not derived from
-    flat_mask[pos:pos+len] (which would be wrong because multimodal_lengths is
-    an MM-token count, not an outer-box span).
-    """
+def test_ad_engine_derives_mm_special_offsets_from_item_runs():
+    """Non-embed offsets in item runs become dense MM-token-list offsets."""
     device = torch.device("cuda")
     max_seq_len = 64
     max_batch_size = 8
@@ -436,23 +434,21 @@ def test_ad_engine_mm_special_offsets_for_non_contiguous_unit():
     kv_manager = _DummyKVCacheManager(tokens_per_block=8)
     resource_manager = _DummyResourceManager(kv_manager)
 
-    # Prompt layout (12 tokens): [t, t, E, E, t, t, S, E, E, t, t, t]
-    # One logical unit with MM tokens at positions 2,3,6,7,8 (5 MM tokens,
-    # gap at 4-5 is interleaved text). Token at pos 6 is a special.
-    # multimodal_positions=[2], multimodal_lengths=[5] (MM-token count, not
-    # outer-box span of 7). special_token_offsets=[2] — index 2 in the flat
-    # mm-token list.
-    tokens = [1, 2, 90, 91, 3, 4, 95, 92, 93, 5, 6, 7]
-    req = _DummyRequest(tokens=tokens, begin=0, size=12, seq_slot=0)
-    req.multimodal_positions = [2]
-    req.multimodal_lengths = [5]
+    # Prompt layout (8 tokens): [t, t, S, E, E, E, E, t].
+    # The logical unit starts at position 2 and owns 5 prompt tokens; the
+    # leading special token is local non-embed offset 0.
+    tokens = [1, 2, 95, 90, 91, 92, 93, 5]
+    req = _DummyRequest(tokens=tokens, begin=0, size=8, seq_slot=0)
+    req.multimodal_item_runs = [[(2, 5, [0])]]
     req.py_multimodal_data = {
+        "layout_metadata": {
+            "item_types": torch.tensor([0], dtype=torch.int32),
+        },
         "multimodal_embed_mask_cumsum": torch.tensor(
-            [False, False, True, True, False, False, False, True, True, False, False, False]
+            [False, False, False, True, True, True, True, False]
         )
         .to(torch.int64)
         .cumsum(0),
-        "special_token_offsets": [2],
     }
 
     scheduled_requests = ScheduledRequests()
@@ -462,11 +458,75 @@ def test_ad_engine_mm_special_offsets_for_non_contiguous_unit():
     named_args = cache_seq_interface.named_args
     torch.testing.assert_close(
         named_args["mm_special_offsets"].cpu(),
-        torch.tensor([2], dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int32),
     )
     torch.testing.assert_close(
         named_args["mm_special_offsets_cu_seqlen"].cpu(),
         torch.tensor([0, 1], dtype=torch.int32),
+    )
+    cache_seq_interface.shutdown()
+
+
+def test_ad_engine_stages_sparse_same_item_runs():
+    """Executor metadata should preserve exact sparse runs for one logical item."""
+    device = torch.device("cuda")
+    max_seq_len = 64
+    max_batch_size = 8
+
+    kv_cache_config = KvCacheConfig(tokens_per_block=8)
+    cache_seq_interface = CachedSequenceInterface(
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        max_num_tokens=default_max_num_tokens(max_seq_len, max_batch_size),
+        device=device,
+        kv_cache_config=kv_cache_config,
+    )
+    cache_seq_interface.to(device)
+
+    engine = ADEngine(get_inference_model, cache_seq_interface)
+    engine._enable_chunked_prefill = True
+    kv_manager = _DummyKVCacheManager(tokens_per_block=8)
+    resource_manager = _DummyResourceManager(kv_manager)
+
+    # Prompt layout: [text, image-row0, text-gap, image-row1].
+    tokens = [10, 100, 11, 100]
+    req = _DummyRequest(tokens=tokens, begin=2, size=1, seq_slot=0)
+    req.multimodal_item_runs = [[(1, 1, []), (3, 1, [])]]
+    req.py_multimodal_data = {
+        "layout_metadata": {
+            "item_types": torch.tensor([0], dtype=torch.int32),
+        },
+        "multimodal_embed_mask_cumsum": torch.tensor([0, 1, 1, 2], dtype=torch.int64),
+    }
+
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.context_requests_last_chunk.append(req)
+    engine._prepare_inputs(scheduled_requests, resource_manager, new_tokens=None)
+
+    named_args = cache_seq_interface.named_args
+    torch.testing.assert_close(
+        named_args["mm_item_cu_seqlen"].cpu(), torch.tensor([0, 1], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        named_args["mm_token_positions"].cpu(), torch.tensor([1], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        named_args["mm_token_lengths"].cpu(), torch.tensor([2], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        named_args["mm_item_run_cu_seqlen"].cpu(), torch.tensor([0, 2], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        named_args["mm_run_token_positions"].cpu(), torch.tensor([1, 3], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        named_args["mm_run_token_lengths"].cpu(), torch.tensor([1, 1], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        named_args["mm_chunk_flat_start"].cpu(), torch.tensor([1], dtype=torch.int64)
+    )
+    torch.testing.assert_close(
+        named_args["mm_chunk_count"].cpu(), torch.tensor([0], dtype=torch.int64)
     )
     cache_seq_interface.shutdown()
 
@@ -495,12 +555,10 @@ def test_ad_engine_rejects_mismatched_multimodal_layout_arrays():
 
     tokens = [1, 2, 99, 99, 99, 99, 3, 4]
     req = _DummyRequest(tokens=tokens, begin=4, size=4, seq_slot=0)
-    req.multimodal_positions = [2]
-    req.multimodal_lengths = [4]
+    req.multimodal_item_runs = [[(2, 4, [])]]
     req.py_multimodal_data = {
         "layout_metadata": {
             "item_types": torch.tensor([0, 1], dtype=torch.int32),
-            "special_token_offsets": torch.tensor([], dtype=torch.int32),
         }
     }
 
@@ -510,8 +568,8 @@ def test_ad_engine_rejects_mismatched_multimodal_layout_arrays():
     with pytest.raises(
         ValueError,
         match=(
-            "Mismatch between multimodal item_types and multimodal span arrays in request 0: "
-            "item_types=2, positions=1, lengths=1"
+            "Mismatch between multimodal item_types and multimodal_item_runs in request 0: "
+            "item_types=2, items=1"
         ),
     ):
         engine._prepare_inputs(scheduled_requests, resource_manager, new_tokens=None)

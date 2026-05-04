@@ -584,8 +584,8 @@ class ADEngine(ModelEngine):
 
         This tensorization happens in the executor because it still has the scheduled request
         list, per-request chunk boundaries, input_pos, cu_seqlen, and access to the raw
-        request-side multimodal fields (multimodal_positions, multimodal_lengths, and
-        py_multimodal_data["layout_metadata"]). By the time control reaches the exported
+        request-side multimodal item runs and py_multimodal_data["layout_metadata"].
+        By the time control reaches the exported
         wrapper/modeling path, Python request objects are gone and the model call can only
         consume concrete tensor kwargs.
         """
@@ -593,63 +593,144 @@ class ADEngine(ModelEngine):
             return
 
         prefill_requests = ordered_requests[:num_prefill_seqs]
-        if not any(getattr(req, "multimodal_positions", None) for req in prefill_requests):
+        if not any(getattr(req, "multimodal_item_runs", None) for req in prefill_requests):
             return
 
         mm_item_cu_seqlen: List[int] = [0]
         mm_item_types_flat: List[int] = []
         mm_token_positions_flat: List[int] = []
         mm_token_lengths_flat: List[int] = []
+        mm_item_run_cu_seqlen: List[int] = [0]
+        mm_run_token_positions_flat: List[int] = []
+        mm_run_token_lengths_flat: List[int] = []
         mm_special_offsets_cu_seqlen: List[int] = [0]
         mm_special_offsets_flat: List[int] = []
         flat_start_list: List[int] = []
         count_list: List[int] = []
         cumsum_total_mm = 0
 
+        def as_int_list(values) -> List[int]:
+            if values is None:
+                return []
+            if isinstance(values, torch.Tensor):
+                return [int(value) for value in values.reshape(-1).tolist()]
+            return [int(value) for value in values]
+
+        def flatten_item_runs(
+            item_runs_by_item,
+        ) -> Tuple[List[int], List[int], List[int], List[int], List[int], List[int]]:
+            token_positions: List[int] = []
+            token_lengths: List[int] = []
+            run_counts: List[int] = []
+            run_token_positions: List[int] = []
+            run_token_lengths: List[int] = []
+            non_embed_offsets_flat: List[int] = []
+            item_mm_offset = 0
+
+            for item_idx, item_runs in enumerate(item_runs_by_item):
+                if not item_runs:
+                    raise ValueError(f"multimodal_item_runs[{item_idx}] must not be empty")
+
+                item_start: Optional[int] = None
+                item_length = 0
+                expected_run_start: Optional[int] = None
+                for run_idx, run in enumerate(item_runs):
+                    if not isinstance(run, (list, tuple)) or len(run) != 3:
+                        raise TypeError(
+                            f"multimodal_item_runs[{item_idx}][{run_idx}] must be a "
+                            "(prompt_start, run_length, non_embed_offsets) tuple"
+                        )
+                    run_start, run_length, non_embed_offsets = run
+                    run_start = int(run_start)
+                    run_length = int(run_length)
+                    if run_length <= 0:
+                        raise ValueError(
+                            f"multimodal_item_runs[{item_idx}][{run_idx}] must have positive length"
+                        )
+                    if item_start is None:
+                        item_start = run_start
+                    if expected_run_start is not None and run_start < expected_run_start:
+                        raise ValueError(
+                            f"multimodal_item_runs[{item_idx}][{run_idx}] overlaps or "
+                            "is not sorted after the previous run"
+                        )
+
+                    local_non_embed_offsets = as_int_list(non_embed_offsets)
+                    for local_offset in local_non_embed_offsets:
+                        if local_offset < 0 or local_offset >= run_length:
+                            raise ValueError(
+                                f"multimodal_item_runs[{item_idx}][{run_idx}] non-embed "
+                                "offsets must be within the run"
+                            )
+                        non_embed_offsets_flat.append(item_mm_offset + item_length + local_offset)
+
+                    item_length += run_length
+                    run_token_positions.append(run_start)
+                    run_token_lengths.append(run_length)
+                    expected_run_start = run_start + run_length
+
+                token_positions.append(int(item_start))
+                token_lengths.append(item_length)
+                run_counts.append(len(item_runs))
+                item_mm_offset += item_length
+
+            return (
+                token_positions,
+                token_lengths,
+                run_counts,
+                run_token_positions,
+                run_token_lengths,
+                non_embed_offsets_flat,
+            )
+
         for i, req in enumerate(prefill_requests):
             begin_compute = input_pos[i]
             end_compute = begin_compute + (cu_seqlen[i + 1] - cu_seqlen[i])
-            mm_pos = getattr(req, "multimodal_positions", None)
-            mm_len = getattr(req, "multimodal_lengths", None)
+            mm_item_runs = getattr(req, "multimodal_item_runs", None)
+
             layout_metadata = {}
             if req.py_multimodal_data:
                 layout_metadata = req.py_multimodal_data.get(
                     "layout_metadata", req.py_multimodal_data
                 )
             mm_item_types = layout_metadata.get("item_types", []) if layout_metadata else []
-            mm_pos_list = list(mm_pos) if mm_pos is not None else []
-            mm_len_list = list(mm_len) if mm_len is not None else []
-            mm_item_types_list = list(mm_item_types)
-            if len(mm_pos_list) != len(mm_len_list):
+            mm_item_runs_list = list(mm_item_runs) if mm_item_runs is not None else []
+            mm_item_types_list = as_int_list(mm_item_types)
+            (
+                mm_pos_list,
+                mm_len_list,
+                mm_run_counts,
+                mm_run_pos_list,
+                mm_run_len_list,
+                mm_special_offsets_list,
+            ) = (
+                flatten_item_runs(mm_item_runs_list)
+                if mm_item_runs_list
+                else ([], [], [], [], [], [])
+            )
+            if len(mm_item_types_list) != len(mm_pos_list):
                 raise ValueError(
-                    "Mismatch between multimodal_positions and multimodal_lengths in "
-                    f"request {i}: positions={len(mm_pos_list)}, lengths={len(mm_len_list)}"
-                )
-            if mm_item_types_list and len(mm_item_types_list) != len(mm_pos_list):
-                raise ValueError(
-                    "Mismatch between multimodal item_types and multimodal span arrays in "
+                    "Mismatch between multimodal item_types and multimodal_item_runs in "
                     f"request {i}: item_types={len(mm_item_types_list)}, "
-                    f"positions={len(mm_pos_list)}, lengths={len(mm_len_list)}"
+                    f"items={len(mm_pos_list)}"
                 )
             mm_item_cu_seqlen.append(mm_item_cu_seqlen[-1] + len(mm_pos_list))
             mm_item_types_flat.extend(mm_item_types_list)
             mm_token_positions_flat.extend(mm_pos_list)
             mm_token_lengths_flat.extend(mm_len_list)
+            for run_count in mm_run_counts:
+                mm_item_run_cu_seqlen.append(mm_item_run_cu_seqlen[-1] + run_count)
+            mm_run_token_positions_flat.extend(mm_run_pos_list)
+            mm_run_token_lengths_flat.extend(mm_run_len_list)
 
             mm_data = req.py_multimodal_data or {}
             flat_cumsum = mm_data.get("multimodal_embed_mask_cumsum")
-            # special_token_offsets indices into the dense MM-token-list (which includes both embeds and specials).
-            # It does not index into the prompt-position-indexed cumsum.
-            special_offsets = list(
-                mm_data.get("special_token_offsets")
-                or (layout_metadata or {}).get("special_token_offsets", [])
-            )
             mm_special_offsets_cu_seqlen.append(
-                mm_special_offsets_cu_seqlen[-1] + len(special_offsets)
+                mm_special_offsets_cu_seqlen[-1] + len(mm_special_offsets_list)
             )
-            mm_special_offsets_flat.extend(special_offsets)
+            mm_special_offsets_flat.extend(mm_special_offsets_list)
 
-            if not mm_pos or not mm_len:
+            if not mm_item_runs_list:
                 flat_start_list.append(0)
                 count_list.append(0)
                 continue
@@ -692,6 +773,15 @@ class ADEngine(ModelEngine):
         extra_args["mm_token_lengths"] = [
             torch.tensor(mm_token_lengths_flat, dtype=torch.int32, device="cpu")
         ]
+        extra_args["mm_item_run_cu_seqlen"] = [
+            torch.tensor(mm_item_run_cu_seqlen, dtype=torch.int32, device="cpu")
+        ]
+        extra_args["mm_run_token_positions"] = [
+            torch.tensor(mm_run_token_positions_flat, dtype=torch.int32, device="cpu")
+        ]
+        extra_args["mm_run_token_lengths"] = [
+            torch.tensor(mm_run_token_lengths_flat, dtype=torch.int32, device="cpu")
+        ]
         extra_args["mm_special_offsets_cu_seqlen"] = [
             torch.tensor(mm_special_offsets_cu_seqlen, dtype=torch.int32, device="cpu")
         ]
@@ -703,7 +793,7 @@ class ADEngine(ModelEngine):
         # chunked prefill, but also for KV-cache reuse where begin_compute > 0 even when
         # chunked prefill is disabled in the config.
         needs_mm_chunk_bounds = self._enable_chunked_prefill or any(
-            int(input_pos[i]) > 0 and getattr(req, "multimodal_positions", None)
+            int(input_pos[i]) > 0 and getattr(req, "multimodal_item_runs", None)
             for i, req in enumerate(prefill_requests)
         )
         if needs_mm_chunk_bounds:

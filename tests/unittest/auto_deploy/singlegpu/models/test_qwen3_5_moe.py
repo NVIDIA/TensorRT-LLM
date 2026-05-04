@@ -1684,11 +1684,16 @@ def test_qwen_ad_input_processor_duplicates_video_hashes_per_frame_span():
         Image.new("RGB", (4, 4), color="blue"),
     ]
 
-    multimodal_input, _, item_types = processor._build_multimodal_input(
+    multimodal_input, special_offsets, item_types = processor._build_multimodal_input(
         token_ids, {"multi_modal_data": {"video": frames}}
     )
 
-    assert multimodal_input.multimodal_positions == [1, 1 + (1 + frame_tokens) + 1]
+    assert multimodal_input.multimodal_item_runs == [
+        [(1, 1 + frame_tokens, [0])],
+        [(1 + (1 + frame_tokens) + 1, 1 + frame_tokens, [0])],
+    ]
+    assert multimodal_input.multimodal_embedding_lengths == [frame_tokens, frame_tokens]
+    assert special_offsets == [0, 1 + frame_tokens]
     assert item_types == [1, 1]
     assert len(multimodal_input.multimodal_hashes) == 2
     assert multimodal_input.multimodal_hashes[0] == multimodal_input.multimodal_hashes[1]
@@ -1719,15 +1724,17 @@ def test_qwen_ad_input_processor_preserves_video_item_order_across_frame_spans()
         [Image.new("RGB", (4, 4), color="blue")],
     ]
 
-    multimodal_input, _, item_types = processor._build_multimodal_input(
+    multimodal_input, special_offsets, item_types = processor._build_multimodal_input(
         token_ids, {"multi_modal_data": {"video": videos}}
     )
 
-    assert multimodal_input.multimodal_positions == [
-        1,
-        1 + (1 + frame_tokens) + 1,
-        1 + ((1 + frame_tokens) + 1) * 2,
+    assert multimodal_input.multimodal_item_runs == [
+        [(1, 1 + frame_tokens, [0])],
+        [(1 + (1 + frame_tokens) + 1, 1 + frame_tokens, [0])],
+        [(1 + ((1 + frame_tokens) + 1) * 2, 1 + frame_tokens, [0])],
     ]
+    assert multimodal_input.multimodal_embedding_lengths == [frame_tokens] * 3
+    assert special_offsets == [0, 1 + frame_tokens, (1 + frame_tokens) * 2]
     assert item_types == [1, 1, 1]
     assert len(multimodal_input.multimodal_hashes) == 3
     assert multimodal_input.multimodal_hashes[0] == multimodal_input.multimodal_hashes[1]
@@ -2383,6 +2390,55 @@ def test_vlm_wrapper_chunked_prefill_inside_video_span():
         rtol=1e-5,
         atol=1e-5,
         msg="Chunked video prefill should match the full-request video mRoPE slice",
+    )
+
+
+@torch.no_grad()
+def test_vlm_wrapper_selects_sparse_same_item_run_embeds():
+    """Sparse runs for one logical item should not be collapsed into a contiguous span."""
+    config = _make_small_composite_config()
+    model = Qwen3_5MoeForConditionalGeneration(config)
+    model.eval()
+
+    hidden_size = config.text_config.hidden_size
+    image_embeds = torch.stack(
+        [
+            torch.full((hidden_size,), 101.0, dtype=torch.float32),
+            torch.full((hidden_size,), 202.0, dtype=torch.float32),
+        ]
+    )
+
+    gap_chunk = model.model._select_request_chunk_multimodal_embeds(
+        req_input_pos=2,
+        req_seq_len=1,
+        req_mm_item_types=[0],
+        req_mm_positions=[1],
+        req_mm_lengths=[2],
+        req_special_offsets=[],
+        image_embeds_list=[image_embeds],
+        video_embeds_list=None,
+        req_mm_item_run_cu_seqlen=[0, 2],
+        req_mm_run_positions=[1, 3],
+        req_mm_run_lengths=[1, 1],
+    )
+    later_chunk = model.model._select_request_chunk_multimodal_embeds(
+        req_input_pos=3,
+        req_seq_len=1,
+        req_mm_item_types=[0],
+        req_mm_positions=[1],
+        req_mm_lengths=[2],
+        req_special_offsets=[],
+        image_embeds_list=[image_embeds],
+        video_embeds_list=None,
+        req_mm_item_run_cu_seqlen=[0, 2],
+        req_mm_run_positions=[1, 3],
+        req_mm_run_lengths=[1, 1],
+    )
+
+    assert gap_chunk.shape == (0, hidden_size)
+    torch.testing.assert_close(
+        later_chunk[:, 0],
+        torch.tensor([202.0], dtype=torch.float32),
     )
 
 
