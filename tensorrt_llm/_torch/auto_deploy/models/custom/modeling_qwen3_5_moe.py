@@ -45,8 +45,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
-import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 -- register all ops
-
+from ... import custom_ops  # noqa: F401 -- register all ops
 from ...custom_ops.attention_interface import BatchInfo
 from ..factory import ModelFactoryRegistry
 from ..hf import (
