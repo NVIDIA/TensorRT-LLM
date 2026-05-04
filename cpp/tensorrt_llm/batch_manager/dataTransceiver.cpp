@@ -1277,7 +1277,14 @@ public:
         return isCancelled;
     }
 
-    bool receiveReadySignal(TransferSession& session, std::atomic<bool> const& perRequestCancel)
+    enum class ReadySignalResult
+    {
+        kReady,
+        kNotReady,
+        kCancelled,
+    };
+
+    ReadySignalResult receiveReadySignalDetailed(TransferSession& session, std::atomic<bool> const& perRequestCancel)
     {
         bool isReadyFinal = true;
         bool isReady = false;
@@ -1290,7 +1297,7 @@ public:
             // rather than continuing to wait on subsequent peers.
             if (perRequestCancel.load(std::memory_order_relaxed))
             {
-                return false;
+                return ReadySignalResult::kCancelled;
             }
             auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
             if (agentConnectionManager)
@@ -1303,18 +1310,32 @@ public:
                 // atomic and returns early when it flips — either on
                 // process shutdown (all per-request flags flipped in
                 // ~Impl()) or on per-request cancelRequest().
-                isReady = agentConnection->recvReadySignal(
+                auto readyResult = agentConnection->recvReadySignalWithStatus(
                     executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG, perRequestCancel});
+                if (!readyResult.has_value())
+                {
+                    return ReadySignalResult::kCancelled;
+                }
+                isReady = readyResult.value();
             }
             else
             {
                 connections.at(i)->recv(
                     executor::kv_cache::DataContext{TransceiverTag::kREADY_SIGNAL_TAG}, &isReady, sizeof(isReady));
+                if (perRequestCancel.load(std::memory_order_relaxed))
+                {
+                    return ReadySignalResult::kCancelled;
+                }
             }
             isReadyFinal &= isReady;
         }
 
-        return isReadyFinal;
+        return isReadyFinal ? ReadySignalResult::kReady : ReadySignalResult::kNotReady;
+    }
+
+    bool receiveReadySignal(TransferSession& session, std::atomic<bool> const& perRequestCancel)
+    {
+        return receiveReadySignalDetailed(session, perRequestCancel) == ReadySignalResult::kReady;
     }
 
     // Overload preserved for the (currently unused) std::async-based receiveAsync
@@ -1401,37 +1422,61 @@ private:
             }
         }
 
-        auto session = sendRequestInfo(llmRequest, perRequestCancel, std::move(cacheBufferIds));
-        session.setTime(TransferSession::kTimeRequestInfo);
-        // receiveReadySignal blocks inside AgentConnectionManager::waitForNotification's
-        // polling loop until the peer sends the ready notification OR the
-        // perRequestCancel flag flips. That's the one path that can actually
-        // release a zombie receive when a timeout-eviction fires on the C++
-        // side; without it the std::async/worker task would stay blocked
-        // indefinitely and hold NIXL/UCX per-request state.
-        bool isReady = receiveReadySignal(session, perRequestCancel);
-        if (!isReady || perRequestCancel.load())
+        auto poisonRecvHolders = [&recvHolders]()
         {
-            // Either the peer never sent the ready signal (timeout / cancel
-            // fired) or the cancel was observed after ready. Either way,
-            // reuse the error state — AsyncTransferManager cleanup will run.
+            for (auto& h : recvHolders)
+            {
+                h.poison();
+            }
+        };
+
+        try
+        {
+            auto session = sendRequestInfo(llmRequest, perRequestCancel, std::move(cacheBufferIds));
+            session.setTime(TransferSession::kTimeRequestInfo);
+            // receiveReadySignal blocks inside AgentConnectionManager::waitForNotification's
+            // polling loop until the peer sends the ready notification OR the
+            // perRequestCancel flag flips. The result is intentionally
+            // tri-state: explicit peer not-ready means no data phase will
+            // write into the advertised receive buffers, while local cancel /
+            // no-notification means TRT-LLM cannot prove the peer is not still
+            // writing and must poison the advertised slots.
+            auto readyResult = receiveReadySignalDetailed(session, perRequestCancel);
+            if (readyResult == ReadySignalResult::kCancelled)
+            {
+                poisonRecvHolders();
+                llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
+                return;
+            }
+            if (readyResult == ReadySignalResult::kNotReady)
+            {
+                llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
+                return;
+            }
+
+            receiveSync(session);
+            llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
+
+            // Happy path only: the formatter invoked inside receiveSync already
+            // released each buffer index via freeBufferIndexForRecv. Detach the
+            // holders so they don't double-release when this stack frame
+            // unwinds.
+            for (auto& h : recvHolders)
+            {
+                (void) h.detach();
+            }
+        }
+        catch (...)
+        {
+            if (agentConnectionManagerForAcq)
+            {
+                poisonRecvHolders();
+            }
             llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
             llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
-            return;
-        }
-        receiveSync(session);
-        llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
-
-        // Happy path only: the formatter invoked inside receiveSync already
-        // released each buffer index via freeBufferIndexForRecv. Detach the
-        // holders so they don't double-release when this stack frame
-        // unwinds. If control is about to leave requestSync via any OTHER
-        // path below (none today, but safe against future edits), the
-        // holders would still release automatically — detaching is strictly
-        // a correctness requirement for the just-completed receiveSync path.
-        for (auto& h : recvHolders)
-        {
-            (void) h.detach();
+            throw;
         }
 
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
