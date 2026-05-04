@@ -61,7 +61,6 @@ TRTLLM_SECURITY = os.path.join(REPO_ROOT, "SECURITY.md")
 TRTLLM_ATTRIBUTIONS_PYTHON = os.path.join(REPO_ROOT, "ATTRIBUTIONS-Python.md")
 LLMC_README = os.path.join(SCRIPT_DIR, "README.md")
 LLMC_CONTRIBUTING = os.path.join(SCRIPT_DIR, "CONTRIBUTING.md")
-LLMC_GITHUB_DIR = os.path.join(SCRIPT_DIR, ".github_for_llmc")
 
 # Test source directories
 AD_TESTS_DIR = os.path.join(REPO_ROOT, "tests", "unittest", "auto_deploy")
@@ -535,12 +534,6 @@ def create_standalone_package(output_dir: str) -> None:
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(output_dir, name))
             print(f"  Copied {name}")
-
-    # 11. Copy .github/ tree (issue/PR templates) from .github_for_llmc/
-    if os.path.isdir(LLMC_GITHUB_DIR):
-        github_dst = os.path.join(output_dir, ".github")
-        github_count = _copy_tree(LLMC_GITHUB_DIR, github_dst)
-        print(f"  Copied {github_count} .github/ files")
 
     print(f"\nStandalone package created at: {output_dir}")
     print("\nTo install:")
