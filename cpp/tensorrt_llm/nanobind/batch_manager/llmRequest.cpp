@@ -91,8 +91,6 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
         from_torch(mPromptEmbeddingTable),                         //
         mPromptVocabSize,                                          //
         mMultimodalHashes,                                         //
-        mMultimodalPositions,                                      //
-        mMultimodalLengths,                                        //
         mMultimodalUuids,                                          //
         from_torch(mMultimodalEmbedding),                          //
         mMultimodalItemRuns,                                       //

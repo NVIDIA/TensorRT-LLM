@@ -21,12 +21,8 @@
 namespace tensorrt_llm::executor
 {
 MultimodalInput::MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
-    std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths,
-    std::optional<std::vector<std::optional<std::string>>> multimodalUuids,
-    std::optional<MultimodalItemRuns> multimodalItemRuns)
+    MultimodalItemRuns multimodalItemRuns, std::optional<std::vector<std::optional<std::string>>> multimodalUuids)
     : mMultimodalHashes(std::move(multimodalHashes))
-    , mMultimodalPositions(std::move(multimodalPositions))
-    , mMultimodalLengths(std::move(multimodalLengths))
     , mMultimodalUuids(std::move(multimodalUuids))
     , mMultimodalItemRuns(std::move(multimodalItemRuns))
 {
@@ -37,22 +33,12 @@ std::vector<std::vector<SizeType32>> MultimodalInput::getMultimodalHashes() cons
     return mMultimodalHashes;
 }
 
-std::vector<SizeType32> MultimodalInput::getMultimodalPositions() const
-{
-    return mMultimodalPositions;
-}
-
-std::vector<SizeType32> MultimodalInput::getMultimodalLengths() const
-{
-    return mMultimodalLengths;
-}
-
 std::optional<std::vector<std::optional<std::string>>> const& MultimodalInput::getMultimodalUuids() const
 {
     return mMultimodalUuids;
 }
 
-std::optional<MultimodalItemRuns> const& MultimodalInput::getMultimodalItemRuns() const
+MultimodalItemRuns const& MultimodalInput::getMultimodalItemRuns() const
 {
     return mMultimodalItemRuns;
 }

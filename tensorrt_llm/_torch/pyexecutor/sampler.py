@@ -77,12 +77,7 @@ from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..speculative.interface import get_force_num_accepted_tokens
 from ..speculative.spec_tree_manager import SpecTreeManager
 from .finish_reason import FinishedState
-from .llm_request import (
-    LlmRequest,
-    LlmRequestState,
-    get_draft_token_length,
-    get_request_multimodal_embedding_lengths,
-)
+from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from .resource_manager import ResourceManager, ResourceManagerType
 from .sampling_utils import (
     BEAM_SEARCH_PAD_TOKEN,
@@ -358,7 +353,7 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
-            multimodal_embedding_lengths = get_request_multimodal_embedding_lengths(request)
+            multimodal_embedding_lengths = request.multimodal_embedding_lengths
             if multimodal_embedding_lengths is None:
                 raise ValueError(
                     f"request {request.py_request_id} has no multimodal embedding lengths"

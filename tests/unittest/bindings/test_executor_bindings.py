@@ -1007,16 +1007,12 @@ def test_multimodal_embedding():
 
 def test_multimodal_input():
     multimodal_hashes = [[1, 2, 3], [4, 5, 6]]
-    multimodal_positions = [1, 2, 3]
-    multimodal_lengths = [4, 5, 6]
-    config = trtllm.MultimodalInput(multimodal_hashes, multimodal_positions,
-                                    multimodal_lengths)
+    multimodal_item_runs = [[(1, 2, [])], [(4, 5, [])]]
+    config = trtllm.MultimodalInput(multimodal_hashes, multimodal_item_runs)
     assert config.multimodal_hashes == multimodal_hashes
-    assert config.multimodal_positions == multimodal_positions
-    assert config.multimodal_lengths == multimodal_lengths
     # Default value for multimodal_uuids should be None
     assert config.multimodal_uuids is None
-    assert config.multimodal_item_runs is None
+    assert config.multimodal_item_runs == multimodal_item_runs
 
 
 @pytest.mark.parametrize(
@@ -1036,40 +1032,35 @@ def test_multimodal_input():
 def test_multimodal_input_with_uuids(multimodal_uuids, expected_uuids):
     """Test MultimodalInput with user-provided UUIDs."""
     multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]]
-    multimodal_positions = [10, 100]
-    multimodal_lengths = [50, 60]
+    multimodal_item_runs = [[(10, 50, [])], [(100, 60, [])]]
 
-    config = trtllm.MultimodalInput(multimodal_hashes, multimodal_positions,
-                                    multimodal_lengths, multimodal_uuids)
+    config = trtllm.MultimodalInput(multimodal_hashes, multimodal_item_runs,
+                                    multimodal_uuids)
     assert config.multimodal_hashes == multimodal_hashes
-    assert config.multimodal_positions == multimodal_positions
-    assert config.multimodal_lengths == multimodal_lengths
+    assert config.multimodal_item_runs == multimodal_item_runs
     assert config.multimodal_uuids == expected_uuids
 
 
 def test_multimodal_input_pickle_with_uuids():
     """Test pickling and unpickling of MultimodalInput with UUIDs."""
     multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]]
-    multimodal_positions = [10, 100]
-    multimodal_lengths = [50, 60]
+    multimodal_item_runs = [[(10, 50, [])], [(100, 60, [])]]
     multimodal_uuids = ["test-uuid-1", None]
 
-    config = trtllm.MultimodalInput(multimodal_hashes, multimodal_positions,
-                                    multimodal_lengths, multimodal_uuids)
+    config = trtllm.MultimodalInput(multimodal_hashes, multimodal_item_runs,
+                                    multimodal_uuids)
 
     # Pickle and unpickle
     pickled = pickle.dumps(config)
     restored = pickle.loads(pickled)
 
     assert restored.multimodal_hashes == multimodal_hashes
-    assert restored.multimodal_positions == multimodal_positions
-    assert restored.multimodal_lengths == multimodal_lengths
+    assert restored.multimodal_item_runs == multimodal_item_runs
     assert restored.multimodal_uuids == multimodal_uuids
 
     # Test with None UUIDs
     config_no_uuids = trtllm.MultimodalInput(multimodal_hashes,
-                                             multimodal_positions,
-                                             multimodal_lengths)
+                                             multimodal_item_runs)
     pickled_no_uuids = pickle.dumps(config_no_uuids)
     restored_no_uuids = pickle.loads(pickled_no_uuids)
     assert restored_no_uuids.multimodal_uuids is None
@@ -1078,14 +1069,11 @@ def test_multimodal_input_pickle_with_uuids():
 def test_multimodal_input_with_item_runs():
     """Test MultimodalInput with compact multimodal hash token-position runs."""
     multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8]]
-    multimodal_positions = [1]
-    multimodal_lengths = [2]
     multimodal_uuids = ["test-uuid-1"]
     multimodal_item_runs = [[(1, 1, []), (3, 1, [])]]
 
-    config = trtllm.MultimodalInput(multimodal_hashes, multimodal_positions,
-                                    multimodal_lengths, multimodal_uuids,
-                                    multimodal_item_runs)
+    config = trtllm.MultimodalInput(multimodal_hashes, multimodal_item_runs,
+                                    multimodal_uuids)
 
     assert config.multimodal_item_runs == multimodal_item_runs
 

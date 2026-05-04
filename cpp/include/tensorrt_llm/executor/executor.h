@@ -301,30 +301,23 @@ class MultimodalInput
 {
 public:
     explicit MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
-        std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths,
-        std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt,
-        std::optional<MultimodalItemRuns> multimodalItemRuns = std::nullopt);
+        MultimodalItemRuns multimodalItemRuns,
+        std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt);
 
     [[nodiscard]] std::vector<std::vector<SizeType32>> getMultimodalHashes() const;
-    [[nodiscard]] std::vector<SizeType32> getMultimodalPositions() const;
-    [[nodiscard]] std::vector<SizeType32> getMultimodalLengths() const;
     [[nodiscard]] std::optional<std::vector<std::optional<std::string>>> const& getMultimodalUuids() const;
-    [[nodiscard]] std::optional<MultimodalItemRuns> const& getMultimodalItemRuns() const;
+    [[nodiscard]] MultimodalItemRuns const& getMultimodalItemRuns() const;
 
 private:
     friend class Serialization;
     /// @brief The multimodal hashes
     std::vector<std::vector<SizeType32>> mMultimodalHashes;
-    /// @brief The multimodal positions
-    std::vector<SizeType32> mMultimodalPositions;
-    /// @brief The multimodal lengths
-    std::vector<SizeType32> mMultimodalLengths;
     /// @brief Optional user-provided UUIDs for multimodal items.
     /// When provided, these are returned in KV cache events instead of content hashes.
     std::optional<std::vector<std::optional<std::string>>> mMultimodalUuids;
-    /// @brief Optional compact prompt token runs for each multimodal item.
+    /// @brief Compact prompt token runs for each multimodal item.
     /// Each run also carries local offsets that are multimodal-owned but do not consume encoder-output rows.
-    std::optional<MultimodalItemRuns> mMultimodalItemRuns;
+    MultimodalItemRuns mMultimodalItemRuns;
 };
 
 /// @brief Configuration for mrope

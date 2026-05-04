@@ -214,26 +214,6 @@ void initBindings(nb::module_& m)
                 }
                 return hashes;
             })
-        .def_prop_ro("multimodal_positions",
-            [](GenLlmReq& self)
-            {
-                std::optional<std::vector<GenLlmReq::SizeType32>> positions = std::nullopt;
-                if (self.getMultimodalPositions())
-                {
-                    positions = *self.getMultimodalPositions().value();
-                }
-                return positions;
-            })
-        .def_prop_ro("multimodal_lengths",
-            [](GenLlmReq& self)
-            {
-                std::optional<std::vector<GenLlmReq::SizeType32>> lengths = std::nullopt;
-                if (self.getMultimodalLengths())
-                {
-                    lengths = *self.getMultimodalLengths().value();
-                }
-                return lengths;
-            })
         .def_prop_ro("multimodal_item_runs",
             [](GenLlmReq& self)
             {
@@ -359,19 +339,22 @@ void initBindings(nb::module_& m)
                 auto cross_attention_mask_tensor_ptr = makeOptionalTensor(cross_attention_mask);
                 auto skip_cross_attn_blocks_tensor_ptr = makeOptionalTensor(skip_cross_attn_blocks);
 
+                TLLM_CHECK_WITH_INFO(!multimodal_positions && !multimodal_lengths,
+                    "multimodal_positions and multimodal_lengths are no longer accepted; pass multimodal_item_runs");
+
                 new (self) tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
                     end_id, pad_id, embedding_bias_tensor_ptr, bad_words_list_tensor_ptr, stop_words_list_tensor_ptr,
                     position_ids, prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes,
-                    multimodal_positions, multimodal_lengths, multimodal_uuids, multimodal_embedding_tensor_ptr,
-                    multimodal_item_runs, mrope_rotary_cos_sin_tensor_ptr, mrope_position_deltas, lora_task_id,
-                    lora_weights_tensor_ptr, lora_config_tensor_ptr, lookahead_config, kv_cache_retention_config,
-                    return_log_probs, return_context_logits, return_generation_logits, draft_tokens,
-                    draft_logits_tensor_ptr, exclude_input_from_output, logits_post_processor,
-                    apply_logits_post_processor_batched, encoder_input_tokens, return_encoder_output, client_id,
-                    priority, encoder_input_features_tensor_ptr, encoder_output_length, cross_attention_mask_tensor_ptr,
-                    llm_request_type, input_token_extra_ids, num_return_sequences, eagle_config,
-                    skip_cross_attn_blocks_tensor_ptr, return_perf_metrics, guided_decoding_params,
-                    language_adapter_uid, allotted_time_ms, context_phase_params, cache_salt_id, arrival_time};
+                    multimodal_uuids, multimodal_embedding_tensor_ptr, multimodal_item_runs,
+                    mrope_rotary_cos_sin_tensor_ptr, mrope_position_deltas, lora_task_id, lora_weights_tensor_ptr,
+                    lora_config_tensor_ptr, lookahead_config, kv_cache_retention_config, return_log_probs,
+                    return_context_logits, return_generation_logits, draft_tokens, draft_logits_tensor_ptr,
+                    exclude_input_from_output, logits_post_processor, apply_logits_post_processor_batched,
+                    encoder_input_tokens, return_encoder_output, client_id, priority, encoder_input_features_tensor_ptr,
+                    encoder_output_length, cross_attention_mask_tensor_ptr, llm_request_type, input_token_extra_ids,
+                    num_return_sequences, eagle_config, skip_cross_attn_blocks_tensor_ptr, return_perf_metrics,
+                    guided_decoding_params, language_adapter_uid, allotted_time_ms, context_phase_params, cache_salt_id,
+                    arrival_time};
             },
             nb::arg("request_id"), nb::arg("max_new_tokens"), nb::arg("input_tokens"), nb::arg("sampling_config"),
             nb::arg("is_streaming"), nb::arg("end_id") = std::nullopt, nb::arg("pad_id") = std::nullopt,

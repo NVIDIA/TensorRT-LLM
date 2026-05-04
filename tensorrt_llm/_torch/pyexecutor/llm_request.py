@@ -1,6 +1,6 @@
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
 
 import torch
 
@@ -9,7 +9,6 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
-from tensorrt_llm.inputs.multimodal import get_multimodal_embedding_lengths
 from tensorrt_llm.sampling_params import LogprobMode
 
 SamplingConfig = tensorrt_llm.bindings.SamplingConfig
@@ -47,20 +46,146 @@ if TYPE_CHECKING:
 
 def get_request_multimodal_embedding_lengths(
         request: Any) -> Optional[List[int]]:
-    """Return per-item encoder-output row counts for a request.
+    """Return cached per-item encoder-output row counts for a request."""
+    multimodal_embedding_lengths = getattr(request,
+                                           "multimodal_embedding_lengths", None)
+    if multimodal_embedding_lengths is not None:
+        return list(multimodal_embedding_lengths)
+    return None
 
-    Canonical item runs are the source of truth when present. The legacy
-    `multimodal_lengths` fallback is retained only for requests that predate
-    item-run metadata.
-    """
-    multimodal_item_runs = getattr(request, "multimodal_item_runs", None)
-    if multimodal_item_runs is not None:
-        return get_multimodal_embedding_lengths(multimodal_item_runs)
 
-    multimodal_lengths = getattr(request, "multimodal_lengths", None)
-    if multimodal_lengths is None:
+def _copy_optional_int_list(
+        values: Optional[Sequence[int]]) -> Optional[List[int]]:
+    if values is None:
         return None
-    return list(multimodal_lengths)
+    return list(values)
+
+
+def _resolve_cached_mm_length_field(name: str,
+                                    cached_lengths: Optional[Sequence[int]],
+                                    derived_lengths: List[int]) -> List[int]:
+    if cached_lengths is None:
+        return derived_lengths
+
+    cached_lengths = list(cached_lengths)
+    if len(cached_lengths) != len(derived_lengths):
+        raise ValueError(
+            f"{name} length ({len(cached_lengths)}) must match "
+            f"multimodal_item_runs length ({len(derived_lengths)})")
+    for item_idx, (cached_length, derived_length) in enumerate(
+            zip(cached_lengths, derived_lengths, strict=True)):
+        if cached_length != derived_length:
+            raise ValueError(
+                f"{name}[{item_idx}] ({cached_length}) must match "
+                f"multimodal_item_runs-derived length ({derived_length})")
+    return cached_lengths
+
+
+def _prepare_multimodal_runtime_fields(
+    multimodal_item_runs: Optional[Sequence[Sequence[Sequence[Any]]]],
+    prompt_len: int,
+    *,
+    multimodal_embedding_lengths: Optional[Sequence[int]],
+    multimodal_prompt_lengths: Optional[Sequence[int]],
+    multimodal_hashes: Optional[Sequence[Sequence[int]]],
+) -> tuple[Optional[List[int]], Optional[List[int]], Optional[List[List[tuple[
+        int, int]]]]]:
+    if multimodal_item_runs is None:
+        return (
+            _copy_optional_int_list(multimodal_embedding_lengths),
+            _copy_optional_int_list(multimodal_prompt_lengths),
+            None,
+        )
+
+    if multimodal_hashes is not None and len(multimodal_item_runs) != len(
+            multimodal_hashes):
+        raise ValueError(
+            "multimodal_item_runs and multimodal_hashes must have the same length"
+        )
+
+    derived_embedding_lengths = []
+    derived_prompt_lengths = []
+    item_run_spans = []
+    occupied_runs: List[tuple[int, int, int, int]] = []
+    for item_idx, item_runs in enumerate(multimodal_item_runs):
+        if len(item_runs) == 0:
+            raise ValueError(
+                f"multimodal_item_runs[{item_idx}] must not be empty")
+
+        item_embedding_length = 0
+        item_prompt_length = 0
+        item_spans = []
+        previous_end = None
+        for run_idx, run in enumerate(item_runs):
+            if not isinstance(run, (list, tuple)) or len(run) != 3:
+                raise TypeError(
+                    f"multimodal_item_runs[{item_idx}][{run_idx}] must be a "
+                    "(prompt_start, run_length, non_embed_offsets) tuple")
+            run_start, run_length, non_embed_offsets = run
+
+            if not isinstance(run_start, int) or not isinstance(
+                    run_length, int):
+                raise TypeError(
+                    f"multimodal_item_runs[{item_idx}][{run_idx}] must contain integer start/length"
+                )
+            if run_length <= 0:
+                raise ValueError(
+                    f"multimodal_item_runs[{item_idx}][{run_idx}] must have positive length"
+                )
+            if run_start < 0 or run_start + run_length > prompt_len:
+                raise ValueError(
+                    f"multimodal_item_runs[{item_idx}] contains run "
+                    f"({run_start}, {run_length}) outside prompt token range [0, {prompt_len})"
+                )
+
+            if not isinstance(non_embed_offsets, list):
+                raise TypeError(
+                    f"multimodal_item_runs[{item_idx}][{run_idx}] non-embed offsets must be a list"
+                )
+            if not all(isinstance(offset, int) for offset in non_embed_offsets):
+                raise TypeError(
+                    f"multimodal_item_runs[{item_idx}][{run_idx}] non-embed offsets must contain only integers"
+                )
+            if any(offset < 0 or offset >= run_length
+                   for offset in non_embed_offsets):
+                raise ValueError(
+                    f"multimodal_item_runs[{item_idx}][{run_idx}] non-embed offsets must be within the run"
+                )
+            if non_embed_offsets != sorted(set(non_embed_offsets)):
+                raise ValueError(
+                    f"multimodal_item_runs[{item_idx}][{run_idx}] non-embed offsets must be ordered and unique"
+                )
+            if previous_end is not None and run_start < previous_end:
+                raise ValueError(
+                    f"multimodal_item_runs[{item_idx}] must be ordered and non-overlapping"
+                )
+            run_end = run_start + run_length
+            for prev_item_idx, prev_run_idx, prev_start, prev_end in occupied_runs:
+                if run_start < prev_end and prev_start < run_end:
+                    raise ValueError(
+                        "multimodal_item_runs must be globally non-overlapping "
+                        f"but [{item_idx}][{run_idx}] overlaps "
+                        f"[{prev_item_idx}][{prev_run_idx}]")
+
+            item_prompt_length += run_length
+            item_embedding_length += run_length - len(non_embed_offsets)
+            previous_end = run_end
+            item_spans.append((run_start, run_length))
+            occupied_runs.append((item_idx, run_idx, run_start, run_end))
+
+        derived_embedding_lengths.append(item_embedding_length)
+        derived_prompt_lengths.append(item_prompt_length)
+        item_run_spans.append(item_spans)
+
+    return (
+        _resolve_cached_mm_length_field("multimodal_embedding_lengths",
+                                        multimodal_embedding_lengths,
+                                        derived_embedding_lengths),
+        _resolve_cached_mm_length_field("multimodal_prompt_lengths",
+                                        multimodal_prompt_lengths,
+                                        derived_prompt_lengths),
+        item_run_spans,
+    )
 
 
 @dataclass(slots=True)
@@ -649,6 +774,24 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
+        multimodal_embedding_lengths = kwargs.pop(
+            "multimodal_embedding_lengths", None)
+        multimodal_prompt_lengths = kwargs.pop("multimodal_prompt_lengths",
+                                               None)
+        multimodal_runtime_fields = None
+        if llm_request is None and kwargs.get(
+                "multimodal_item_runs") is not None:
+            input_tokens = kwargs.get("input_tokens")
+            if input_tokens is None and len(args) >= 3:
+                input_tokens = args[2]
+            if input_tokens is not None:
+                multimodal_runtime_fields = _prepare_multimodal_runtime_fields(
+                    kwargs.get("multimodal_item_runs"),
+                    len(input_tokens),
+                    multimodal_embedding_lengths=multimodal_embedding_lengths,
+                    multimodal_prompt_lengths=multimodal_prompt_lengths,
+                    multimodal_hashes=kwargs.get("multimodal_hashes"),
+                )
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
         if llm_request is not None:
@@ -670,6 +813,16 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_end_id = self.end_id
         self.py_prompt_len = self.prompt_len
         self.py_orig_prompt_len = self.orig_prompt_len
+        if multimodal_runtime_fields is None:
+            multimodal_runtime_fields = _prepare_multimodal_runtime_fields(
+                getattr(self, "multimodal_item_runs", None),
+                self.py_prompt_len,
+                multimodal_embedding_lengths=multimodal_embedding_lengths,
+                multimodal_prompt_lengths=multimodal_prompt_lengths,
+                multimodal_hashes=getattr(self, "multimodal_hashes", None),
+            )
+        (self.multimodal_embedding_lengths, self.multimodal_prompt_lengths,
+         self.py_multimodal_item_run_spans) = multimodal_runtime_fields
         self.py_max_new_tokens = self.max_new_tokens
         self.py_min_length = self.sampling_config.min_length
         # `seqlen_this_rank_cp`, `total_input_len_cp`, and `py_helix_is_inactive_rank` are relevant to helix parallelism.
@@ -887,7 +1040,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             if attr_name.startswith('py_'):
                 attr_value = getattr(self, attr_name)
                 setattr(py_request, attr_name, deepcopy(attr_value))
-            elif attr_name in ['is_attention_dp_dummy', 'is_cuda_graph_dummy']:
+            elif attr_name in [
+                    'is_attention_dp_dummy', 'is_cuda_graph_dummy',
+                    'multimodal_embedding_lengths', 'multimodal_prompt_lengths'
+            ]:
                 setattr(py_request, attr_name, attr_value)
 
         # Rewrite specific attributes that should use child_request values.
@@ -960,17 +1116,20 @@ def executor_request_to_llm_request(
 
     # Extract multimodal fields from executor request
     multimodal_hashes = None
-    multimodal_positions = None
-    multimodal_lengths = None
     multimodal_uuids = None
     multimodal_item_runs = None
+    multimodal_embedding_lengths = None
+    multimodal_prompt_lengths = None
     if executor_request.multimodal_input is not None:
-        multimodal_hashes = executor_request.multimodal_input.multimodal_hashes
-        multimodal_positions = executor_request.multimodal_input.multimodal_positions
-        multimodal_lengths = executor_request.multimodal_input.multimodal_lengths
-        multimodal_uuids = executor_request.multimodal_input.multimodal_uuids
-        multimodal_item_runs = (
-            executor_request.multimodal_input.multimodal_item_runs)
+        multimodal_input = executor_request.multimodal_input
+        multimodal_hashes = multimodal_input.multimodal_hashes
+        multimodal_uuids = multimodal_input.multimodal_uuids
+        multimodal_item_runs = multimodal_input.multimodal_item_runs
+        multimodal_embedding_lengths = getattr(multimodal_input,
+                                               "multimodal_embedding_lengths",
+                                               None)
+        multimodal_prompt_lengths = getattr(multimodal_input,
+                                            "multimodal_prompt_lengths", None)
 
     # Extract mrope fields
     mrope_rotary_cos_sin = None
@@ -998,10 +1157,10 @@ def executor_request_to_llm_request(
         prompt_vocab_size=None if executor_request.prompt_tuning_config is None
         else executor_request.prompt_tuning_config.embedding_table.shape[0],
         multimodal_hashes=multimodal_hashes,
-        multimodal_positions=multimodal_positions,
-        multimodal_lengths=multimodal_lengths,
         multimodal_uuids=multimodal_uuids,
         multimodal_item_runs=multimodal_item_runs,
+        multimodal_embedding_lengths=multimodal_embedding_lengths,
+        multimodal_prompt_lengths=multimodal_prompt_lengths,
         multimodal_embedding=executor_request.multimodal_embedding,
         lora_task_id=executor_request.lora_config.task_id
         if executor_request.lora_config is not None else None,

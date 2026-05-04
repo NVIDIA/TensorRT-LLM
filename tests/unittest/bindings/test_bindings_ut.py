@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 from utils.runtime_defaults import assert_runtime_defaults_are_parsed_correctly
 
@@ -419,12 +420,11 @@ def test_llm_request():
     assert torch.equal(llm_request.draft_logits, logits)
 
 
-def test_llm_request_multimodal_positional_abi():
+def test_llm_request_multimodal_item_runs_abi():
     sampling_config = _tb.SamplingConfig()
     multimodal_embedding = torch.arange(4, dtype=torch.float32).reshape(2, 2)
     multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8]]
-    multimodal_positions = [1]
-    multimodal_lengths = [2]
+    multimodal_item_runs = [[(1, 2, [])]]
     multimodal_uuids = ["image-0"]
 
     llm_request = _tb.internal.batch_manager.LlmRequest(
@@ -442,34 +442,55 @@ def test_llm_request_multimodal_positional_abi():
         None,
         None,
         multimodal_hashes,
-        multimodal_positions,
-        multimodal_lengths,
+        None,
+        None,
         multimodal_uuids,
         multimodal_embedding,
+        multimodal_item_runs,
     )
 
     assert torch.equal(llm_request.multimodal_embedding, multimodal_embedding)
-    assert llm_request.multimodal_item_runs is None
+    assert llm_request.multimodal_item_runs == multimodal_item_runs
 
-    multimodal_item_runs = [[(1, 2, [])]]
-    llm_request_with_item_runs = _tb.internal.batch_manager.LlmRequest(
+    llm_request_keyword = _tb.internal.batch_manager.LlmRequest(
         request_id=2,
         max_new_tokens=2,
         input_tokens=[0, 1, 2],
         sampling_config=sampling_config,
         is_streaming=False,
         multimodal_hashes=multimodal_hashes,
-        multimodal_positions=multimodal_positions,
-        multimodal_lengths=multimodal_lengths,
         multimodal_uuids=multimodal_uuids,
         multimodal_embedding=multimodal_embedding,
         multimodal_item_runs=multimodal_item_runs,
     )
 
-    assert torch.equal(llm_request_with_item_runs.multimodal_embedding,
+    assert torch.equal(llm_request_keyword.multimodal_embedding,
                        multimodal_embedding)
-    assert llm_request_with_item_runs.multimodal_item_runs == (
-        multimodal_item_runs)
+    assert llm_request_keyword.multimodal_item_runs == multimodal_item_runs
+
+    with pytest.raises(RuntimeError,
+                       match="multimodal_positions and multimodal_lengths"):
+        _tb.internal.batch_manager.LlmRequest(
+            3,
+            2,
+            [0, 1, 2],
+            sampling_config,
+            False,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            multimodal_hashes,
+            [1],
+            [2],
+            multimodal_uuids,
+            multimodal_embedding,
+            multimodal_item_runs,
+        )
 
 
 def test_Mpicomm():

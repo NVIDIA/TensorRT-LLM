@@ -151,6 +151,28 @@ class TestFindInputMmEmbed:
         assert len(result) == 1
         torch.testing.assert_close(result[0], mm_embeds[0])
 
+    def test_uses_cached_multimodal_embeddings_for_disagg_handoff(self):
+        """E/P/D handoff can arrive as cached embeddings on MultimodalParams."""
+        cached = torch.randn(10, _EMBED_DIM)
+        param = _make_multimodal_params(2, 6, [10])
+        param.multimodal_data["multimodal_embedding"] = cached
+
+        result = find_input_mm_embeds([], [param])
+
+        assert len(result) == 1
+        torch.testing.assert_close(result[0], cached[2:8])
+
+    def test_missing_disagg_handoff_raises_value_error(self):
+        """Missing E/P/D embeddings should not surface as list indexing."""
+        param = _make_multimodal_params(2, 6, [10])
+
+        with pytest.raises(
+                ValueError,
+                match=
+                "No multimodal embeddings were provided for active multimodal params"
+        ):
+            find_input_mm_embeds([], [param])
+
     def test_chunked_prefill_scenario(self):
         """Mix of cached and in-chunk across three batched requests."""
         mm_embeds = [torch.randn(25, _EMBED_DIM)

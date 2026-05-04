@@ -231,8 +231,6 @@ class KvCacheCreator:
                 multimodal_data = extra_processed_inputs.get('multimodal_data')
                 req_mm_input = trtllm.MultimodalInput(
                     multimodal_hashes=multimodal_input.multimodal_hashes,
-                    multimodal_positions=multimodal_input.multimodal_positions,
-                    multimodal_lengths=multimodal_input.multimodal_lengths,
                     multimodal_uuids=multimodal_input.multimodal_uuids,
                     multimodal_item_runs=multimodal_input.multimodal_item_runs,
                 ) if multimodal_input else None
@@ -277,9 +275,10 @@ class KvCacheCreator:
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
         requests = []
-        if hasattr(self._model_engine.model,
-                   "original_arch") and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
-                       self._model_engine.model.original_arch, None):
+        if (not self._is_disagg
+                and hasattr(self._model_engine.model, "original_arch")
+                and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
+                    self._model_engine.model.original_arch, None)):
             requests = self._create_dummy_mm_context_request(input_seq_len)
         # if succeed profiling with multimodal requests then return, otherwise profile
         # with default case

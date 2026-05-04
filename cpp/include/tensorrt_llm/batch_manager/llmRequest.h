@@ -121,8 +121,6 @@ public:
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
         std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>> multimodalHashes = std::nullopt,
-        std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalPositions = std::nullopt,
-        std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalLengths = std::nullopt,
         std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>> multimodalUuids = std::nullopt,
         std::optional<TensorPtr> multimodalEmbedding = std::nullopt,
         std::optional<std::shared_ptr<MultimodalItemRuns>> multimodalItemRuns = std::nullopt,
@@ -172,8 +170,6 @@ public:
         , mPromptEmbeddingTable(std::move(promptEmbeddingTable))
         , mPromptVocabSize(promptVocabSize)
         , mMultimodalHashes(std::move(multimodalHashes))
-        , mMultimodalPositions(std::move(multimodalPositions))
-        , mMultimodalLengths(std::move(multimodalLengths))
         , mMultimodalUuids(std::move(multimodalUuids))
         , mMultimodalEmbedding(std::move(multimodalEmbedding))
         , mMultimodalItemRuns(std::move(multimodalItemRuns))
@@ -400,20 +396,12 @@ public:
         {
             mMultimodalHashes
                 = std::make_shared<std::vector<std::vector<SizeType32>>>(multimodalInput.value().getMultimodalHashes());
-            mMultimodalPositions
-                = std::make_shared<std::vector<SizeType32>>(multimodalInput.value().getMultimodalPositions());
-            mMultimodalLengths
-                = std::make_shared<std::vector<SizeType32>>(multimodalInput.value().getMultimodalLengths());
             if (multimodalInput.value().getMultimodalUuids())
             {
                 mMultimodalUuids = std::make_shared<std::vector<std::optional<std::string>>>(
                     multimodalInput.value().getMultimodalUuids().value());
             }
-            if (multimodalInput.value().getMultimodalItemRuns())
-            {
-                mMultimodalItemRuns
-                    = std::make_shared<MultimodalItemRuns>(multimodalInput.value().getMultimodalItemRuns().value());
-            }
+            mMultimodalItemRuns = std::make_shared<MultimodalItemRuns>(multimodalInput.value().getMultimodalItemRuns());
         }
         auto mRopeConfig = req.getMropeConfig();
         if (mRopeConfig)
@@ -934,16 +922,6 @@ public:
     [[nodiscard]] std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>> getMultimodalHashes() const
     {
         return mMultimodalHashes;
-    }
-
-    [[nodiscard]] std::optional<std::shared_ptr<std::vector<SizeType32>>> getMultimodalPositions() const
-    {
-        return mMultimodalPositions;
-    }
-
-    [[nodiscard]] std::optional<std::shared_ptr<std::vector<SizeType32>>> getMultimodalLengths() const
-    {
-        return mMultimodalLengths;
     }
 
     [[nodiscard]] std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>> getMultimodalUuids() const
@@ -2048,8 +2026,6 @@ protected:
     std::optional<TensorPtr> mPromptEmbeddingTable{std::nullopt};
     std::optional<SizeType32> mPromptVocabSize{std::nullopt};
     std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>> mMultimodalHashes{std::nullopt};
-    std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalPositions{std::nullopt};
-    std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalLengths{std::nullopt};
     std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>> mMultimodalUuids{std::nullopt};
     std::optional<TensorPtr> mMultimodalEmbedding{std::nullopt};
     std::optional<std::shared_ptr<MultimodalItemRuns>> mMultimodalItemRuns{std::nullopt};
@@ -2339,8 +2315,6 @@ public:
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
         std::optional<std::vector<std::vector<SizeType32>>> multimodalHashes = std::nullopt,
-        std::optional<std::vector<SizeType32>> multimodalPositions = std::nullopt,
-        std::optional<std::vector<SizeType32>> multimodalLengths = std::nullopt,
         std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt,
         std::optional<TensorPtr> multimodalEmbedding = std::nullopt,
         std::optional<MultimodalItemRuns> multimodalItemRuns = std::nullopt,
@@ -2377,12 +2351,6 @@ public:
             multimodalHashes.has_value()
                 ? std::make_shared<std::vector<std::vector<SizeType32>>>(std::move(multimodalHashes.value()))
                 : std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>>(std::nullopt),
-            multimodalPositions.has_value()
-                ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalPositions.value()))
-                : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
-            multimodalLengths.has_value()
-                ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalLengths.value()))
-                : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
             multimodalUuids.has_value()
                 ? std::make_shared<std::vector<std::optional<std::string>>>(std::move(multimodalUuids.value()))
                 : std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>>(std::nullopt),

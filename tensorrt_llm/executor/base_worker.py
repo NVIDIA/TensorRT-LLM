@@ -427,9 +427,6 @@ class BaseWorker(GenerationExecutor):
                 py_multimodal_input = request.multimodal_params.multimodal_input
                 multimodal_input = tllm.MultimodalInput(
                     multimodal_hashes=py_multimodal_input.multimodal_hashes,
-                    multimodal_positions=py_multimodal_input.
-                    multimodal_positions,
-                    multimodal_lengths=py_multimodal_input.multimodal_lengths,
                     multimodal_uuids=py_multimodal_input.multimodal_uuids,
                     multimodal_item_runs=py_multimodal_input.
                     multimodal_item_runs)

@@ -64,8 +64,7 @@ from .config_utils import is_mla
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from .guided_decoder import CapturableGuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
-from .llm_request import (LlmRequest, get_draft_token_length,
-                          get_request_multimodal_embedding_lengths)
+from .llm_request import LlmRequest, get_draft_token_length
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .resource_manager import (BaseResourceManager, KVCacheManager,
@@ -4060,8 +4059,7 @@ class PyTorchModelEngine(ModelEngine):
             return {'mm_embeddings': []}
         multimodal_chunks = []
         for request in scheduled_requests.context_requests:
-            multimodal_embedding_lengths = (
-                get_request_multimodal_embedding_lengths(request))
+            multimodal_embedding_lengths = request.multimodal_embedding_lengths
             if multimodal_embedding_lengths is not None:
                 multimodal_chunks.append(sum(multimodal_embedding_lengths))
         # For mm_encoder_only mode, we only run the vision encoder part

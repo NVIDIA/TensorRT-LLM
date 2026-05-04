@@ -306,33 +306,22 @@ void initRequestBindings(nb::module_& m)
         .def("__setstate__", loraConfigSetstate);
 
     auto multimodalInputGetstate = [](tle::MultimodalInput const& self)
-    {
-        return nb::make_tuple(self.getMultimodalHashes(), self.getMultimodalPositions(), self.getMultimodalLengths(),
-            self.getMultimodalUuids(), self.getMultimodalItemRuns());
-    };
+    { return nb::make_tuple(self.getMultimodalHashes(), self.getMultimodalItemRuns(), self.getMultimodalUuids()); };
     auto multimodalInputSetstate = [](tle::MultimodalInput& multimodalInput, nb::tuple const& state)
     {
-        if (state.size() != 4 && state.size() != 5)
+        if (state.size() != 3)
         {
             throw std::runtime_error("Invalid MultimodalInput state!");
         }
-        std::optional<tle::MultimodalItemRuns> multimodalItemRuns = std::nullopt;
-        if (state.size() == 5)
-        {
-            multimodalItemRuns = nb::cast<std::optional<tle::MultimodalItemRuns>>(state[4]);
-        }
         new (&multimodalInput) tle::MultimodalInput(nb::cast<std::vector<std::vector<SizeType32>>>(state[0]),
-            nb::cast<std::vector<SizeType32>>(state[1]), nb::cast<std::vector<SizeType32>>(state[2]),
-            nb::cast<std::optional<std::vector<std::optional<std::string>>>>(state[3]), std::move(multimodalItemRuns));
+            nb::cast<tle::MultimodalItemRuns>(state[1]),
+            nb::cast<std::optional<std::vector<std::optional<std::string>>>>(state[2]));
     };
     nb::class_<tle::MultimodalInput>(m, "MultimodalInput")
-        .def(nb::init<std::vector<std::vector<SizeType32>>, std::vector<SizeType32>, std::vector<SizeType32>,
-                 std::optional<std::vector<std::optional<std::string>>>, std::optional<tle::MultimodalItemRuns>>(),
-            nb::arg("multimodal_hashes"), nb::arg("multimodal_positions"), nb::arg("multimodal_lengths"),
-            nb::arg("multimodal_uuids") = nb::none(), nb::arg("multimodal_item_runs") = nb::none())
+        .def(nb::init<std::vector<std::vector<SizeType32>>, tle::MultimodalItemRuns,
+                 std::optional<std::vector<std::optional<std::string>>>>(),
+            nb::arg("multimodal_hashes"), nb::arg("multimodal_item_runs"), nb::arg("multimodal_uuids") = nb::none())
         .def_prop_ro("multimodal_hashes", &tle::MultimodalInput::getMultimodalHashes)
-        .def_prop_ro("multimodal_positions", &tle::MultimodalInput::getMultimodalPositions)
-        .def_prop_ro("multimodal_lengths", &tle::MultimodalInput::getMultimodalLengths)
         .def_prop_ro("multimodal_uuids", &tle::MultimodalInput::getMultimodalUuids)
         .def_prop_ro("multimodal_item_runs", &tle::MultimodalInput::getMultimodalItemRuns)
         .def("__getstate__", multimodalInputGetstate)
