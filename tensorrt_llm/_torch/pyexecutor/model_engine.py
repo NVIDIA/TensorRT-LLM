@@ -4231,7 +4231,13 @@ class PyTorchModelEngine(ModelEngine):
                 all_beam_token_ids = [
                     request.get_tokens(beam) for beam in range(beam_width)
                 ]
+                # Pass predecessor beam indices (set by PyExecutor._update_requests
+                # after the previous sampling step) so the logits processor can
+                # correctly remap per-beam state after beam reassignment.
+                predecessor_beams = getattr(request, 'py_predecessor_beams', None)
                 for lp in logits_processors:
+                    if predecessor_beams is not None and hasattr(lp, 'set_predecessor_beams'):
+                        lp.set_predecessor_beams(predecessor_beams)
                     lp_params = inspect.signature(lp).parameters
                     assert 4 <= len(lp_params) <= 5, (
                         "Logit post processor signature must match the `LogitsProcessor` interface "

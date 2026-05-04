@@ -3706,6 +3706,21 @@ class PyExecutor:
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
+            return
+
+        # Propagate per-beam predecessor indices from the sampler's
+        # BeamSearchStore onto each request so that logits processors
+        # can correctly remap per-beam trie state after beam reassignment.
+        # predecessor_beams[slot, beam] = which beam at step N became beam
+        # at step N+1.  This is a tiny CPU copy (max_num_sequences × beam_width int32).
+        sampler_store = getattr(self.sampler, 'store', None)
+        beam_search_store = getattr(sampler_store, 'beam_search_store', None) if sampler_store else None
+        if beam_search_store is not None:
+            pred_host = beam_search_store.predecessor_beams.cpu()
+            for req in (sample_state.requests or []):
+                bw = req.sampling_config.beam_width
+                if bw > 1 and req.py_seq_slot is not None:
+                    req.py_predecessor_beams = pred_host[req.py_seq_slot, :bw].tolist()
 
     def _handle_errors(self,
                        error_msg: Optional[str] = None,
