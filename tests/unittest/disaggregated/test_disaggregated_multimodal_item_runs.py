@@ -29,11 +29,55 @@ def test_disaggregated_params_accepts_multimodal_item_runs():
     assert params.multimodal_item_runs == MM_ITEM_RUNS
 
 
+def test_disaggregated_params_accepts_hashes_and_item_runs_without_embedding_handles():
+    params = DisaggregatedParams(
+        multimodal_hashes=MM_HASHES,
+        multimodal_item_runs=MM_ITEM_RUNS,
+    )
+
+    assert params.multimodal_hashes == MM_HASHES
+    assert params.multimodal_item_runs == MM_ITEM_RUNS
+
+
+def test_disaggregated_params_accepts_embedding_handles_without_hashes():
+    params = DisaggregatedParams(multimodal_embedding_handles=MM_HANDLES)
+
+    assert params.multimodal_embedding_handles == MM_HANDLES
+    assert params.multimodal_hashes is None
+    assert params.multimodal_item_runs is None
+
+
+def test_disaggregated_params_rejects_hashes_without_item_runs():
+    with pytest.raises(AssertionError, match="multimodal_hashes requires multimodal_item_runs"):
+        DisaggregatedParams(multimodal_hashes=MM_HASHES)
+
+
+def test_disaggregated_params_rejects_handles_and_hashes_without_item_runs():
+    with pytest.raises(AssertionError, match="multimodal_hashes requires multimodal_item_runs"):
+        DisaggregatedParams(
+            multimodal_embedding_handles=MM_HANDLES,
+            multimodal_hashes=MM_HASHES,
+        )
+
+
+def test_disaggregated_params_rejects_item_runs_without_hashes():
+    with pytest.raises(AssertionError, match="multimodal_item_runs requires multimodal_hashes"):
+        DisaggregatedParams(multimodal_item_runs=MM_ITEM_RUNS)
+
+
 def test_disaggregated_params_rejects_item_run_count_mismatch():
     with pytest.raises(AssertionError, match="multimodal_item_runs and multimodal_hashes"):
         DisaggregatedParams(
             multimodal_hashes=MM_HASHES,
             multimodal_item_runs=[MM_ITEM_RUNS[0], [(5, 1, [])]],
+        )
+
+
+def test_disaggregated_params_rejects_globally_overlapping_item_runs():
+    with pytest.raises(AssertionError, match="globally non-overlapping"):
+        DisaggregatedParams(
+            multimodal_hashes=MM_HASHES + [[8, 7, 6, 5, 4, 3, 2, 1]],
+            multimodal_item_runs=[[(1, 2, [])], [(2, 1, [])]],
         )
 
 
@@ -83,9 +127,7 @@ def _response(
 
 
 def test_generation_result_preserves_item_runs_through_epd_handoff():
-    multimodal_input = MultimodalInput.from_components(
-        MM_HASHES, [1], [2], mm_item_runs=MM_ITEM_RUNS
-    )
+    multimodal_input = MultimodalInput.from_components(MM_HASHES, MM_ITEM_RUNS)
     request = GenerationRequest(
         prompt_token_ids=[11, 999, 77, 999, 12],
         sampling_params=SamplingParams(max_tokens=4),
@@ -110,6 +152,20 @@ def test_generation_result_preserves_item_runs_through_epd_handoff():
     assert result.disaggregated_params.multimodal_embedding_handles is None
     assert result.disaggregated_params.multimodal_hashes == MM_HASHES
     assert result.disaggregated_params.multimodal_item_runs == MM_ITEM_RUNS
+
+
+def test_generation_result_accepts_embedding_handles_without_hashes():
+    request = GenerationRequest(
+        prompt_token_ids=[11],
+        sampling_params=SamplingParams(max_tokens=4),
+    )
+    result = GenerationResult(request)
+
+    result._handle_response(_response(10, finished=False, mm_embedding_handles=MM_HANDLES))
+
+    assert result.disaggregated_params.multimodal_embedding_handles == MM_HANDLES
+    assert result.disaggregated_params.multimodal_hashes is None
+    assert result.disaggregated_params.multimodal_item_runs is None
 
 
 def test_llm_preprocess_reconstructs_multimodal_input_with_item_runs():
@@ -147,3 +203,68 @@ def test_llm_preprocess_reconstructs_multimodal_input_with_item_runs():
     assert multimodal_params.multimodal_data["multimodal_embedding"] == MM_HANDLES
     assert multimodal_params.multimodal_input.multimodal_hashes == MM_HASHES
     assert multimodal_params.multimodal_input.multimodal_item_runs == MM_ITEM_RUNS
+
+
+def test_llm_preprocess_rejects_out_of_prompt_disaggregated_item_runs():
+    class FakeInputProcessor:
+        support_mm_disagg = True
+
+        def get_prompt_token_ids(self, inputs, mm_handles):
+            assert mm_handles == MM_HANDLES
+            return [11, 999, 77, 999, 12], [2], [1]
+
+        def get_vocab_size(self):
+            return None
+
+        def get_mm_token_ids(self):
+            return torch.tensor([999])
+
+        def get_mm_special_token_ids(self):
+            return None
+
+    llm = BaseLLM.__new__(BaseLLM)
+    llm.input_processor = FakeInputProcessor()
+    disaggregated_params = DisaggregatedParams(
+        multimodal_embedding_handles=MM_HANDLES,
+        multimodal_hashes=MM_HASHES,
+        multimodal_item_runs=[[(99, 1, [])]],
+    )
+
+    with pytest.raises(AssertionError, match="exceeding input sequence length"):
+        BaseLLM._preprocess(
+            llm, {"prompt": "describe image"}, SamplingParams(max_tokens=1), disaggregated_params
+        )
+
+
+def test_llm_preprocess_accepts_embedding_handles_without_hashes():
+    class FakeInputProcessor:
+        support_mm_disagg = True
+
+        def get_prompt_token_ids(self, inputs, mm_handles):
+            assert mm_handles == MM_HANDLES
+            return [11, 999, 12], [1], [1]
+
+        def get_vocab_size(self):
+            return None
+
+        def get_mm_token_ids(self):
+            return torch.tensor([999])
+
+        def get_mm_special_token_ids(self):
+            return None
+
+    llm = BaseLLM.__new__(BaseLLM)
+    llm.input_processor = FakeInputProcessor()
+    disaggregated_params = DisaggregatedParams(
+        multimodal_embedding_handles=MM_HANDLES,
+    )
+
+    prompt_token_ids, prompt, query_token_ids, multimodal_params = BaseLLM._preprocess(
+        llm, {"prompt": "describe image"}, SamplingParams(max_tokens=1), disaggregated_params
+    )
+
+    assert prompt_token_ids == [11, 999, 12]
+    assert prompt == "describe image"
+    assert query_token_ids is None
+    assert multimodal_params.multimodal_data["multimodal_embedding"] == MM_HANDLES
+    assert multimodal_params.multimodal_input is None

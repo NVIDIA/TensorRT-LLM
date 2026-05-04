@@ -18,7 +18,8 @@ from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.inputs.data import TextPrompt
-from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
+from tensorrt_llm.inputs.multimodal import (MultimodalInput, MultimodalParams,
+                                            validate_mm_item_runs)
 from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
                                           DefaultInputProcessor)
 from tensorrt_llm.llmapi import tracing
@@ -596,7 +597,7 @@ class BaseLLM:
                     "Multimodal disaggregated inference is not supported for this model"
                 )
             mm_handles = disaggregated_params.multimodal_embedding_handles
-            prompt_token_ids, mm_token_length, mm_token_positions = self.input_processor.get_prompt_token_ids(
+            prompt_token_ids, _, _ = self.input_processor.get_prompt_token_ids(
                 inputs, mm_handles)
             prompt = inputs.get("prompt", None)
             query_token_ids = inputs.get("query_token_ids", None)
@@ -606,12 +607,17 @@ class BaseLLM:
                 )
             else:
                 mm_hashes = disaggregated_params.multimodal_hashes
-                mm_item_runs = (disaggregated_params.multimodal_item_runs)
-                multimodal_input = MultimodalInput.from_components(
-                    mm_hashes,
-                    mm_token_positions,
-                    mm_token_length,
-                    mm_item_runs=mm_item_runs)
+                mm_item_runs = disaggregated_params.multimodal_item_runs
+                multimodal_input = None
+                if mm_hashes is not None:
+                    if mm_item_runs is None:
+                        raise ValueError(
+                            "multimodal_item_runs must be provided with multimodal hashes"
+                        )
+                    validate_mm_item_runs(prompt_token_ids, mm_hashes,
+                                          mm_item_runs)
+                    multimodal_input = MultimodalInput.from_components(
+                        mm_hashes, mm_item_runs)
                 multimodal_data = {"multimodal_embedding": mm_handles}
                 if disaggregated_params.mrope_position_ids_handle is not None:
                     # NOTE: `PyTorchModelEngine` assumes both are present when using mrope.
@@ -662,7 +668,7 @@ class BaseLLM:
                                       or "multi_modal_embeddings" in inputs))):
             if 'multi_modal_data' in inputs:
                 # TODO: The current design uses a wrapper for existing input processor (input_processor_with_hash)
-                # to handle/add multimodal hashes, positions, and lengths. Now we only support image modality.
+                # to handle/add multimodal hashes and item runs. Now we only support image modality.
                 # In the future, we should refactor this to:
                 # 1. Extend support for more modalities and models
                 # 2. Decouple input processor into distinct phases (preprocessor (all preprocessing logics), vision model (fuse in model fwd), etc.

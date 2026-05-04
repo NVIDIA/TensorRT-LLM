@@ -56,6 +56,8 @@ def test_to_disaggregated_params():
         first_gen_tokens=[1, 2],
         ctx_dp_rank=5,
         ctx_info_endpoint="tcp://10.0.0.1:5000",
+        mrope_position_ids_handle={"tensor_size": [3, 1, 4]},
+        mrope_position_deltas_handle={"tensor_size": [1, 1]},
     )
     openai_params = to_disaggregated_params(llm_params)
 
@@ -63,6 +65,8 @@ def test_to_disaggregated_params():
     assert openai_params.first_gen_tokens == [1, 2]
     assert openai_params.ctx_dp_rank == 5
     assert openai_params.ctx_info_endpoint == "tcp://10.0.0.1:5000"
+    assert openai_params.mrope_position_ids_handle == {"tensor_size": [3, 1, 4]}
+    assert openai_params.mrope_position_deltas_handle == {"tensor_size": [1, 1]}
 
 
 def test_to_llm_disaggregated_params():
@@ -73,12 +77,16 @@ def test_to_llm_disaggregated_params():
         request_type="generation_only",
         ctx_dp_rank=2,
         ctx_info_endpoint="tcp://10.0.0.1:5000",
+        mrope_position_ids_handle={"tensor_size": [3, 1, 4]},
+        mrope_position_deltas_handle={"tensor_size": [1, 1]},
     )
     llm_params = to_llm_disaggregated_params(openai_params)
 
     assert llm_params.request_type == "generation_only"
     assert llm_params.ctx_dp_rank == 2
     assert llm_params.ctx_info_endpoint == "tcp://10.0.0.1:5000"
+    assert llm_params.mrope_position_ids_handle == {"tensor_size": [3, 1, 4]}
+    assert llm_params.mrope_position_deltas_handle == {"tensor_size": [1, 1]}
 
 
 @patch("tensorrt_llm.disaggregated_params.tllme")

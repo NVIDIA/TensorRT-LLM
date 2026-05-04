@@ -1,8 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Dict, List, Optional, Tuple
-
-import numpy as np
 
 # isort: off
 # needed before trying to import bindings to load tensorrt_libs
@@ -36,6 +37,7 @@ class DisaggregatedParams:
 
         multimodal_embedding_handles (List[Dict[str, Any]]): The resulting multimodal embedding handles from ViT.
         multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.
+         Requires multimodal_item_runs so cache keys know the exact prompt coverage.
         multimodal_item_runs (List[List[Tuple[int, int, List[int]]]]): Exact prompt token runs covered by each
          multimodal item. The third tuple element lists local non-embed offsets for that run.
     """
@@ -107,24 +109,19 @@ class DisaggregatedParams:
                     "context_and_generation"
                 )
         if self.multimodal_embedding_handles is not None:
-            if self.multimodal_hashes is None:
-                # if user did not provide mm hashes, kvcache reuse will be disabled
-                assert len(self.multimodal_embedding_handles) > 0, (
-                    "multimodal_embedding_handles must be provided"
+            if self.multimodal_hashes is not None:
+                assert len(self.multimodal_embedding_handles) == len(self.multimodal_hashes), (
+                    "multimodal_embedding_handles and multimodal_hashes must have the same length"
                 )
-                vals = np.random.randint(
-                    np.iinfo(np.int32).min, np.iinfo(np.int32).max, size=8, dtype=np.int32
-                ).tolist()
-                self.multimodal_hashes = [vals] * len(self.multimodal_embedding_handles)
-            assert len(self.multimodal_embedding_handles) == len(self.multimodal_hashes), (
-                "multimodal_embedding_handles and multimodal_hashes must have the same length"
-            )
 
         if self.multimodal_hashes is not None:
             for mm_hash in self.multimodal_hashes:
                 assert isinstance(mm_hash, list), "mm_hash must be a list"
                 assert len(mm_hash) == 8, "mm_hash must be a list of 8 integers"
                 assert all(isinstance(x, int) for x in mm_hash), "mm_hash must contain integers"
+            assert self.multimodal_item_runs is not None, (
+                "multimodal_hashes requires multimodal_item_runs"
+            )
 
         if self.multimodal_item_runs is not None:
             assert self.multimodal_hashes is not None, (
@@ -133,11 +130,12 @@ class DisaggregatedParams:
             assert len(self.multimodal_item_runs) == len(self.multimodal_hashes), (
                 "multimodal_item_runs and multimodal_hashes must have the same length"
             )
-            for item_runs in self.multimodal_item_runs:
+            occupied_runs: List[Tuple[int, int, int, int]] = []
+            for item_idx, item_runs in enumerate(self.multimodal_item_runs):
                 assert isinstance(item_runs, list), "multimodal_item_runs item must be a list"
                 assert len(item_runs) > 0, "multimodal_item_runs item must not be empty"
                 previous_end = None
-                for run in item_runs:
+                for run_idx, run in enumerate(item_runs):
                     assert isinstance(run, (list, tuple)) and len(run) == 3, (
                         "multimodal_item_runs entries must be "
                         "(prompt_start, run_length, non_embed_offsets) tuples"
@@ -163,4 +161,12 @@ class DisaggregatedParams:
                     assert previous_end is None or start >= previous_end, (
                         "multimodal_item_runs must be ordered and non-overlapping"
                     )
+                    end = start + length
+                    for prev_item_idx, prev_run_idx, prev_start, prev_end in occupied_runs:
+                        assert start >= prev_end or prev_start >= end, (
+                            "multimodal_item_runs must be globally non-overlapping "
+                            f"but [{item_idx}][{run_idx}] overlaps "
+                            f"[{prev_item_idx}][{prev_run_idx}]"
+                        )
                     previous_end = start + length
+                    occupied_runs.append((item_idx, run_idx, start, end))

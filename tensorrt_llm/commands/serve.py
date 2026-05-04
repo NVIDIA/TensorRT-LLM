@@ -458,8 +458,10 @@ def launch_mm_encoder_server(
     encoder_args: dict,
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
 ):
+    encoder_args = encoder_args.copy()
     model = encoder_args["model"]
     encoder_args.pop("build_config", None)
+    encoder_args.pop("free_gpu_memory_fraction", None)
     mm_encoder = MultimodalEncoder(**encoder_args)
 
     server = OpenAIServer(generator=mm_encoder,
