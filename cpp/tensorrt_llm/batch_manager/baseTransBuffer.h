@@ -75,7 +75,7 @@ public:
         std::optional<uint64_t> requestIdForLog = std::nullopt) noexcept
         : mMgr(&mgr)
         , mIndex(index)
-        , mHeld(index.has_value())
+        , mHeld(true)
         , mIsRecv(isRecv)
         , mRequestIdForLog(requestIdForLog)
     {
@@ -149,6 +149,12 @@ public:
     ///        destructor calls release() to free the slot.
     void release() noexcept;
 
+    /// @brief Fail-closed release for paths where transport quiescence is not
+    ///        known. The buffer slot is marked poisoned, is not returned to
+    ///        the pool, and later assignments fail so the process must restart
+    ///        before serving more transfer traffic.
+    void poison() noexcept;
+
 private:
     BaseTransBufferManager* mMgr{nullptr};
     std::optional<int> mIndex{};
@@ -192,6 +198,9 @@ public:
     /// @param bufferId The buffer index to free.
     void freeBufferIndexForSend(std::optional<int> bufferId);
 
+    /// @brief Poison a send buffer index after an unquiesced transfer exit.
+    void poisonBufferIndexForSend(std::optional<int> bufferId) noexcept;
+
     /// @brief Assign a buffer index for receiving.
     /// @param perRequestCancel Optional per-request cancel flag. When non-null
     ///        and flipped true while this call is parked on the pool-exhausted
@@ -211,6 +220,9 @@ public:
     /// @brief Free a buffer index used for receiving.
     /// @param bufferId The buffer index to free.
     void freeBufferIndexForRecv(std::optional<int> bufferId);
+
+    /// @brief Poison a receive buffer index after an unquiesced transfer exit.
+    void poisonBufferIndexForRecv(std::optional<int> bufferId) noexcept;
 
     /// @brief Get or allocate send buffers for cache transfer.
     /// @param bufferId The assigned buffer ID.
@@ -265,6 +277,7 @@ protected:
         std::mutex mBuffersMutex;
         std::condition_variable mBuffersCV;
         std::atomic<int> mConcurrence{0};
+        std::atomic<bool> mPoisoned{false};
     };
 
     std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> getOrAllocateBuffers(std::optional<int> bufferId,
@@ -277,6 +290,8 @@ protected:
         std::optional<uint64_t> requestIdForLog = std::nullopt);
     void freeBufferIndex(
         ConcurrenceResource& resource, std::optional<int> bufferId, size_t bufferCount, bool onlyUseDynamicBuffer);
+    void poisonBufferIndex(ConcurrenceResource& resource, std::optional<int> bufferId, size_t bufferCount,
+        bool onlyUseDynamicBuffer, char const* direction) noexcept;
 
     size_t mPreAllocBufferSize;
     size_t mRecvBufferCount;
