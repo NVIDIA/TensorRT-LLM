@@ -201,7 +201,25 @@ def parse_args():
         "--ulysses_size",
         type=int,
         default=1,
-        help="Ulysses (sequence) parallel size within each CFG group.",
+        help="Ulysses (head-sharding) parallel size within each CFG group. "
+        "Cannot be combined with --attn2d_row_size / --attn2d_col_size (not yet implemented).",
+    )
+    parser.add_argument(
+        "--attn2d_row_size",
+        type=int,
+        default=1,
+        help="Attention2D row mesh size (Q all-gather dimension). "
+        "Can be set independently of --attn2d_col_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
+        "Total context parallelism degree = attn2d_row_size * attn2d_col_size. "
+        "Cannot be combined with --ulysses_size (not yet implemented).",
+    )
+    parser.add_argument(
+        "--attn2d_col_size",
+        type=int,
+        default=1,
+        help="Attention2D column mesh size (K/V all-gather dimension). "
+        "Can be set independently of --attn2d_row_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
+        "Cannot be combined with --ulysses_size (not yet implemented).",
     )
     parser.add_argument("--disable_parallel_vae", action="store_true", help="Disable parallel VAE")
 
@@ -283,12 +301,30 @@ def main():
     else:
         cache_kwargs = {}
 
+    attn2d_size = args.attn2d_row_size * args.attn2d_col_size
+    if attn2d_size > 1 and args.ulysses_size > 1:
+        raise ValueError(
+            "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
+        )
+
+    if args.ulysses_size > 1:
+        parallel_str = f"Ulysses(size={args.ulysses_size})"
+    elif attn2d_size > 1:
+        parallel_str = (
+            f"Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}, "
+            f"total={attn2d_size})"
+        )
+    else:
+        parallel_str = "None"
+
     kwargs = dict(
         attention={"backend": args.attention_backend},
         **cache_kwargs,
         parallel={
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
+            "dit_attn2d_row_size": args.attn2d_row_size,
+            "dit_attn2d_col_size": args.attn2d_col_size,
             "enable_parallel_vae": not args.disable_parallel_vae,
         },
         torch_compile={
@@ -308,7 +344,7 @@ def main():
     logger.info(
         f"Initializing VisualGen: "
         f"cfg_size={diffusion_args.parallel.dit_cfg_size}, "
-        f"ulysses_size={diffusion_args.parallel.dit_ulysses_size}"
+        f"parallelism={parallel_str}"
     )
     visual_gen = VisualGen(
         model=args.model_path,

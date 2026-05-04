@@ -1,13 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import types
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from ...executor.result import CompletionOutput
-from ...inputs.registry import DefaultInputProcessor, ExtraProcessedInputs
-from ...llmapi.llm import RequestOutput, _TorchLLM
-from ...llmapi.tokenizer import TokenizerBase, TransformersTokenizer, tokenizer_factory
-from ...sampling_params import SamplingParams
+from tensorrt_llm.executor.result import CompletionOutput
+from tensorrt_llm.inputs.registry import DefaultInputProcessor, ExtraProcessedInputs
+from tensorrt_llm.llmapi.llm import RequestOutput, _TorchLLM
+from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer, tokenizer_factory
+from tensorrt_llm.sampling_params import SamplingParams
+
 from .distributed import common as dist_ad
 from .llm_args import LlmArgs
 from .models.factory import ModelFactory

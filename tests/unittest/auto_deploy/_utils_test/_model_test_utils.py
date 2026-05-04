@@ -563,16 +563,16 @@ _SMALL_MODEL_CONFIGS = {
     },
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16": {
         "model_kwargs": {
-            "num_hidden_layers": 1,
-            "layers_block_type": ["mamba"],
+            "num_hidden_layers": 3,
+            "layers_block_type": ["mamba", "attention", "moe"],
             "hidden_size": 32,
             "intermediate_size": 64,
             "mamba_num_heads": 4,
-            "mamba_head_dim": 40,
+            "mamba_head_dim": 8,
             "n_groups": 2,
-            "ssm_state_size": 32,
+            "ssm_state_size": 8,
             "conv_kernel": 4,
-            # MoE dimensions (used by the MTP/Eagle drafter's "E" layer)
+            # Attention/MoE dimensions for the reduced target.
             "n_routed_experts": 4,
             "n_shared_experts": 1,
             "num_experts_per_tok": 2,

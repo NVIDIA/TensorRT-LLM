@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -388,9 +388,8 @@ class ResizeKVCache(BaseTransform):
         # Run a forward pass to get the extra memory usage
         cm.info.set_max_num_tokens_sample()
         try:
-            # TODO (lucaslie): revisit this logic as part of spec dec cudagraph support...
-            if getattr(mod, "_requires_csi", False):
-                mod(cache_seq_interface=cm)
+            if cm._spec_config is not None:
+                mod(**cm.named_args, cache_seq_interface=cm)
             else:
                 mod(**cm.named_args)
         except torch.OutOfMemoryError as e:

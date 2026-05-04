@@ -455,6 +455,13 @@ public:
             enqueue_params.batch_size = num_seqs;
             enqueue_params.k_ptr = k_ptr;
             enqueue_params.v_ptr = v_ptr;
+            // Pass V's actual token stride so the FMHA runner handles both
+            // contiguous V (AutoDeploy) and non-contiguous V (PyTorch backend
+            // kv.split() view) correctly.
+            if (v_ptr != nullptr && v.has_value())
+            {
+                enqueue_params.v_stride_in_bytes = v->strides()[0] * v->element_size();
+            }
 
             if (op.isMLAEnabled())
             {

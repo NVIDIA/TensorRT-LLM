@@ -102,7 +102,10 @@ python visual_gen_wan_t2v.py \
 
 WAN supports two parallelism modes that can be combined:
 - **CFG Parallelism**: Split positive/negative prompts across GPUs
-- **Ulysses Parallelism**: Split sequence across GPUs for longer sequences
+- **Sequence Parallelism**:
+  - *Ulysses*: Split sequence along head dimension across GPUs; requires `ulysses_size` to divide the model's head count
+  - *Attention2D*: 2D mesh sequence parallelism; no head-count constraint; requires `--attention_backend FA4`
+  - Combining Ulysses and Attention2D is not yet supported
 
 
 **Ulysses Only (2 GPUs):**
@@ -129,6 +132,19 @@ python visual_gen_wan_t2v.py \
 ```
 GPU Layout: GPU 0 (positive) | GPU 1 (negative)
 
+**Attention2D Only (4 GPUs):**
+```bash
+python visual_gen_wan_t2v.py \
+    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+    --prompt "A cute cat playing piano" \
+    --height 480 --width 832 --num_frames 33 \
+    --attention_backend FA4 \
+    --cfg_size 1 \
+    --attn2d_row_size 2 --attn2d_col_size 2 \
+    --output_path output.mp4
+```
+GPU Layout: Sequence equally split among GPU 0-3
+
 **CFG + Ulysses (4 GPUs):**
 ```bash
 python visual_gen_wan_t2v.py \
@@ -141,16 +157,31 @@ python visual_gen_wan_t2v.py \
 ```
 GPU Layout: GPU 0-1 (positive, Ulysses) | GPU 2-3 (negative, Ulysses)
 
-**Large-Scale (8 GPUs):**
+**CFG + Attention2D (8 GPUs):**
 ```bash
 python visual_gen_wan_t2v.py \
     --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --prompt "A cute cat playing piano" \
     --height 480 --width 832 --num_frames 33 \
-    --attention_backend TRTLLM \
-    --cfg_size 2 --ulysses_size 4 \
+    --attention_backend FA4 \
+    --cfg_size 2 \
+    --attn2d_row_size 2 --attn2d_col_size 2 \
     --output_path output.mp4
 ```
+GPU Layout: GPU 0-3 (positive, Attention2D) | GPU 4-7 (negative, Attention2D)
+
+**Large-Scale (64 GPUs):**
+```bash
+python visual_gen_wan_t2v.py \
+    --model_path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+    --prompt "A cute cat playing piano" \
+    --height 720 --width 1280 --num_frames 81 \
+    --attention_backend FA4 \
+    --attn2d_row_size 8 --attn2d_col_size 4 \
+    --cfg_size 2 \
+    --output_path output.mp4
+```
+GPU Layout: GPU 0-31 (positive, Attention2D 8×4) | GPU 32-63 (negative, Attention2D 8×4)
 
 
 ## WAN (Image-to-Video)
@@ -245,7 +276,9 @@ python visual_gen_ltx2.py \
 | `--teacache_thresh` | ✓ | ✓ | — | 0.2 | TeaCache similarity threshold |
 | `--attention_backend` | ✓ | ✓ | — | VANILLA | `VANILLA`, `TRTLLM`, or `FA4` |
 | `--cfg_size` | — | ✓ | — | 1 | CFG parallelism |
-| `--ulysses_size` | ✓ | ✓ | — | 1 | Sequence parallelism |
+| `--ulysses_size` | ✓ | ✓ | — | 1 | Ulysses parallelism |
+| `--attn2d_row_size` | ✓ | ✓ | ✓ | 1 | Attention2D mesh row size |
+| `--attn2d_col_size` | ✓ | ✓ | ✓ | 1 | Attention2D mesh column size |
 | `--linear_type` | ✓ | ✓ | — | default | Quantization type |
 | `--enhance_prompt` | — | ✓ | False | Gemma3 prompt enhancement |
 | `--stg_scale` | — | ✓ | 0.0 | Spatiotemporal guidance scale |
@@ -270,9 +303,17 @@ python visual_gen_ltx2.py \
 - Install necessary dependencies, e.g., `pip install -r requirements-dev.txt`
 
 **Ulysses Errors:**
-- `ulysses_size` must divide the model's head count (12 for WAN)
+- `ulysses_size` must divide the model's head count (12 for WAN); if your GPU
+  count does not divide the head count, use Attention2D instead
+  (`--attention_backend FA4 --attn2d_row_size <row> --attn2d_col_size <col>`)
 - Total GPUs = `cfg_size × ulysses_size`
 - Sequence length must be divisible by `ulysses_size`
+
+**Attention2D Errors:**
+- Requires `--attention_backend FA4`
+- Combining with `--ulysses_size` is not yet supported
+- Total GPUs = `cfg_size × attn2d_row_size × attn2d_col_size`
+- Sequence length must be divisible by `attn2d_row_size × attn2d_col_size`
 
 ## Output Formats
 

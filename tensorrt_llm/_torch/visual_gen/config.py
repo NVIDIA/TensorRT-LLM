@@ -64,18 +64,20 @@ class ParallelConfig(StrictBaseModel):
 
     Currently Supported:
         - dit_cfg_size: CFG (Classifier-Free Guidance) parallelism
-        - dit_ulysses_size: Ulysses sequence parallelism
+        - dit_ulysses_size: Ulysses head-sharding parallelism
+        - dit_attn2d_row_size, dit_attn2d_col_size: Attention2D context parallelism
 
     Not Yet Supported:
         - dit_tp_size: Tensor parallelism (not implemented)
-        - dit_ring_size: Ring attention (not implemented)
-        - dit_cp_size, dit_dp_size, dit_fsdp_size: Other parallelism types
+        - dit_ring_size: Ring attention context parallelism (not implemented)
+        - dit_dp_size, dit_fsdp_size: Other parallelism types
+        - Combining Ulysses and Attention2D (orthogonal in principle, not yet implemented)
 
     See mapping.py for more details.
 
     Example Configurations:
         1. cfg_size=1, ulysses_size=2 -> 2 GPUs (Ulysses only)
-           GPU 0-1: Single prompt, sequence parallelism across 2 GPUs
+           GPU 0-1: Single prompt, heads sharded across 2 GPUs
 
         2. cfg_size=2, ulysses_size=1 -> 2 GPUs (CFG only)
            GPU 0: Positive prompt
@@ -88,6 +90,9 @@ class ParallelConfig(StrictBaseModel):
         4. cfg_size=2, ulysses_size=4 -> 8 GPUs (CFG + Ulysses)
            GPU 0-3: CFG group 0 (positive), Ulysses parallel
            GPU 4-7: CFG group 1 (negative), Ulysses parallel
+
+        5. cfg_size=1, attn2d_row_size=2, attn2d_col_size=2 -> 4 GPUs (Attention2D only)
+           2x2 mesh: Q gathered across row group, K/V gathered across col group
     """
 
     enable_parallel_vae: bool = True
@@ -98,7 +103,8 @@ class ParallelConfig(StrictBaseModel):
     dit_tp_size: int = PydanticField(1, ge=1)  # Not yet supported
     dit_ulysses_size: int = PydanticField(1, ge=1)  # Supported
     dit_ring_size: int = PydanticField(1, ge=1)  # Not yet supported
-    dit_cp_size: int = PydanticField(1, ge=1)
+    dit_attn2d_row_size: int = PydanticField(1, ge=1)  # Supported
+    dit_attn2d_col_size: int = PydanticField(1, ge=1)  # Supported
     dit_cfg_size: int = PydanticField(1, ge=1)  # Supported
     dit_fsdp_size: int = PydanticField(1, ge=1)
     dit_dim_order: str = PydanticField(
@@ -121,12 +127,27 @@ class ParallelConfig(StrictBaseModel):
     t5_fsdp_size: int = 1
 
     @property
+    def seq_parallel_size(self) -> int:
+        """Parallelism degree over the sequence/context axis.
+
+        Returns the active parallel degree: Attention2D total mesh size if enabled,
+        ring size if ring CP is enabled, otherwise Ulysses size (head-sharding).
+        Exactly one of these is active at a time; combining them is not yet implemented.
+        """
+        attn2d_size = self.dit_attn2d_row_size * self.dit_attn2d_col_size
+        if attn2d_size > 1:
+            return attn2d_size
+        if self.dit_ring_size > 1:
+            return self.dit_ring_size
+        return self.dit_ulysses_size
+
+    @property
     def n_workers(self) -> int:
-        return self.dit_cfg_size * self.dit_ulysses_size
+        return self.dit_cfg_size * self.seq_parallel_size
 
     @property
     def total_parallel_size(self) -> int:
-        return self.dit_cfg_size * self.dit_tp_size * self.dit_ring_size * self.dit_ulysses_size
+        return self.dit_cfg_size * self.dit_tp_size * self.seq_parallel_size
 
     def validate_world_size(self, world_size: int) -> None:
         if self.total_parallel_size > world_size:
