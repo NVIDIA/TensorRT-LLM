@@ -107,7 +107,6 @@ class GenerationRequest:
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
-        cache_salt_id: Optional[int] = None,
         cache_salt: Optional[str] = None,
         arrival_time: Optional[float] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
@@ -137,7 +136,6 @@ class GenerationRequest:
         self.disaggregated_params = disaggregated_params
         self.trace_headers = trace_headers
         self.scheduling_params = scheduling_params
-        self.cache_salt_id = cache_salt_id
         if cache_salt is not None:
             if not isinstance(cache_salt, str):
                 raise TypeError(

@@ -29,7 +29,6 @@ using VecTokens = std::vector<TokenIdType>;
 using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 using VecUniqueTokens = tensorrt_llm::runtime::VecUniqueTokens;
 using LoraTaskIdType = tensorrt_llm::runtime::LoraTaskIdType;
-using CacheSaltIDType = tensorrt_llm::runtime::CacheSaltIDType;
 using MmKey = tensorrt_llm::executor::MmKey;
 
 //! \brief Generate the multimodal extra keys for a single KV cache block.
@@ -49,8 +48,7 @@ struct BlockKey
     // Extra keys for multimodal data (similar to VLLM's approach)
     // Each extra key is a pair of (mm_hash, start_offset_in_block)
     std::vector<MmKey> extraKeys;
-    std::optional<CacheSaltIDType> cacheSaltID = std::nullopt;
-    // Original cache salt string, carried for event reporting only (not used in hashing or matching).
+    // Cache salt string. Used as part of the block key so blocks from different salts do not match.
     std::optional<std::string> cacheSalt = std::nullopt;
 
     BlockKey() = default;
@@ -66,13 +64,11 @@ struct BlockKey
     }
 
     explicit BlockKey(bool usesExtraIds, std::optional<LoraTaskIdType> loraTaskId, VecUniqueTokens uniqueTokens,
-        std::vector<MmKey> extraKeys = {}, std::optional<CacheSaltIDType> cacheSaltID = std::nullopt,
-        std::optional<std::string> cacheSalt = std::nullopt)
+        std::vector<MmKey> extraKeys = {}, std::optional<std::string> cacheSalt = std::nullopt)
         : usesExtraIds{usesExtraIds}
         , loraTaskId{loraTaskId}
         , uniqueTokens{std::move(uniqueTokens)}
         , extraKeys{std::move(extraKeys)}
-        , cacheSaltID{cacheSaltID}
         , cacheSalt{std::move(cacheSalt)}
     {
     }
@@ -90,7 +86,7 @@ struct BlockKey
     }
 
     //! \brief Count the number of leading tokens that match between this key and \p other.
-    //! \details Returns 0 immediately when loraTaskId, extraKeys, or cacheSaltID differ, because those fields must
+    //! \details Returns 0 immediately when loraTaskId, extraKeys, or cacheSalt differ, because those fields must
     //! match exactly before token content is considered.
     //! \param other The key to compare against.
     //! \return Number of leading uniqueTokens that are identical in both keys.
@@ -98,7 +94,7 @@ struct BlockKey
     {
         SizeType32 numMatched{0};
         if (usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId && extraKeys == other.extraKeys
-            && cacheSaltID == other.cacheSaltID)
+            && cacheSalt == other.cacheSalt)
         {
             auto [matchEnd, otherMatchEnd] = std::mismatch(
                 uniqueTokens.begin(), uniqueTokens.end(), other.uniqueTokens.begin(), other.uniqueTokens.end());

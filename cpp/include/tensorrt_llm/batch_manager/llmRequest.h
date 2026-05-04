@@ -108,7 +108,6 @@ public:
     using MillisecondsType = std::chrono::milliseconds;
     using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
     using Duration = std::chrono::time_point<std::chrono::steady_clock>::duration;
-    using CacheSaltIDType = runtime::CacheSaltIDType;
 
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> const& inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
@@ -147,7 +146,7 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt,
+        std::optional<TimePoint> arrivalTime = std::nullopt,
         std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalItemRunCuOffsets = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalRunPositions = std::nullopt,
@@ -214,7 +213,6 @@ public:
         , mGuidedDecodingParams(std::move(guidedDecodingParams))
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
-        , mCacheSaltID(cacheSaltID)
         , mAgentHierarchy(std::move(agent_hierarchy))
         , mCacheSalt(std::move(cacheSalt))
     {
@@ -244,7 +242,7 @@ public:
         executor::PriorityType priority = executor::Request::kDefaultPriority, SizeType32 numReturnSequences = 1,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<std::string> cacheSalt = std::nullopt)
+        std::optional<std::string> cacheSalt = std::nullopt)
         : mRequestId(requestId)
         , mPromptLen(inputTokens.size())
         , mMaxNewTokens(maxNewTokens)
@@ -285,7 +283,6 @@ public:
         , mContextPhaseParams(contextPhaseParams)
         , mNumReturnSequences(numReturnSequences)
         , mLanguageAdapterUid(languageAdapterUid)
-        , mCacheSaltID(cacheSaltID)
         , mCacheSalt(std::move(cacheSalt))
     {
         if (mEncoderTokens.has_value())
@@ -326,7 +323,6 @@ public:
         , mGuidedDecodingParams(req.getGuidedDecodingParams())
         , mLanguageAdapterUid(req.getLanguageAdapterUid())
         , mAllottedTimeMs(req.getAllottedTimeMs())
-        , mCacheSaltID(req.getCacheSaltID())
         , mCacheSalt(req.getCacheSalt())
     {
         if (req.getRequestType() == executor::RequestType::REQUEST_TYPE_GENERATION_ONLY)
@@ -1901,11 +1897,6 @@ public:
         return mLanguageAdapterUid;
     }
 
-    [[nodiscard]] std::optional<CacheSaltIDType> getCacheSaltID() const
-    {
-        return mCacheSaltID;
-    }
-
     [[nodiscard]] std::optional<std::string> getCacheSalt() const
     {
         return mCacheSalt;
@@ -2205,9 +2196,7 @@ protected:
 
     bool mUseDraftModel{false};
 
-    // Cache salt id for each request.
-    std::optional<CacheSaltIDType> mCacheSaltID{std::nullopt};
-    // Original cache salt string for event reporting.
+    // Cache salt string. Used in BlockKey hashing/matching and surfaced in KV cache events.
     std::optional<std::string> mCacheSalt{std::nullopt};
 
     std::optional<std::vector<std::tuple<std::string, int>>> mAgentHierarchy{std::nullopt};
@@ -2405,7 +2394,7 @@ public:
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt,
+        std::optional<TimePoint> arrivalTime = std::nullopt,
         std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalItemRunCuOffsets = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalRunPositions = std::nullopt,
@@ -2443,8 +2432,8 @@ public:
             inputTokenExtraIds ? std::make_optional(std::make_shared<VecTokenExtraIds>(std::move(*inputTokenExtraIds)))
                                : std::optional<std::shared_ptr<VecTokenExtraIds>>(std::nullopt),
             numReturnSequences, std::move(eagleConfig), skipCrossAttnBlocks, returnPerfMetrics,
-            std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams, cacheSaltID,
-            arrivalTime, std::move(agent_hierarchy),
+            std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams, arrivalTime,
+            std::move(agent_hierarchy),
             multimodalItemRunCuOffsets.has_value()
                 ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalItemRunCuOffsets.value()))
                 : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),

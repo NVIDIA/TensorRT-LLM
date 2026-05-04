@@ -134,7 +134,6 @@ class GenerationExecutor(ABC):
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
-        cache_salt_id: Optional[int] = None,
         cache_salt: Optional[str] = None,
         arrival_time: Optional[float] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
@@ -163,7 +162,6 @@ class GenerationExecutor(ABC):
             trace_headers=trace_headers,
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
-            cache_salt_id=cache_salt_id,
             cache_salt=cache_salt,
             arrival_time=arrival_time,
             priority=priority)
@@ -182,7 +180,6 @@ class GenerationExecutor(ABC):
         prompt_adapter_request: Optional[Union[
             PromptAdapterRequest, List[PromptAdapterRequest]]] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
-        cache_salt_id: Optional[Union[int, List[Optional[int]]]] = None,
         cache_salt: Optional[Union[str, List[Optional[str]]]] = None,
     ) -> Union[GenerationResult, List[GenerationResult]]:
         """Generate output for the given prompt token ids in the synchronous mode.
@@ -209,8 +206,6 @@ class GenerationExecutor(ABC):
                 pa_req = prompt_adapter_request[i]
             else:
                 pa_req = prompt_adapter_request
-            cs_id = cache_salt_id[i] if isinstance(cache_salt_id,
-                                                   list) else cache_salt_id
             cs = cache_salt[i] if isinstance(cache_salt, list) else cache_salt
             future = self.generate_async(
                 p,
@@ -220,7 +215,6 @@ class GenerationExecutor(ABC):
                 prompt_adapter_request=pa_req,
                 streaming=False,
                 disaggregated_params=disaggregated_params,
-                cache_salt_id=cs_id,
                 cache_salt=cs)
             futures.append(future)
 

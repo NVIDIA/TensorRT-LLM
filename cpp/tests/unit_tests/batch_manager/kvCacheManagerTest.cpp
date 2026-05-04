@@ -2094,12 +2094,11 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 }
 
-TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
+TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
 {
-    // Test that cache_salt_id prevents KV cache reuse between requests with same tokens
-    // but different cache_salt_id values.
+    // Test that cache_salt prevents KV cache reuse between requests with same tokens
+    // but different cache_salt values.
     using VecTokenExtraIds = LlmRequest::VecTokenExtraIds;
-    using CacheSaltIDType = LlmRequest::CacheSaltIDType;
 
     auto constexpr numLayers = 12;
     auto constexpr numKvHeads = 6;
@@ -2135,7 +2134,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     auto const inputLength = static_cast<SizeType32>(inputTokens->size());
 
     ///////////////////////////////////////////////////////////////////////////
-    // Test Case 1: Request without cache_salt_id
+    // Test Case 1: Request without cache_salt
     LlmRequest::RequestIdType requestId{0};
     auto llmRequest0 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
@@ -2143,8 +2142,8 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false,
         std::nullopt, false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt,
-        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt); // No cache_salt_id
+        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt); // No cache_salt
 
     GenerationRequest seq0{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
 
@@ -2177,21 +2176,21 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
     ///////////////////////////////////////////////////////////////////////////
-    // Test Case 2: Request with same tokens but with cache_salt_id = 12345
+    // Test Case 2: Request with same tokens but with cache_salt = "tenant-A"
     requestId = 1;
-    CacheSaltIDType cacheSaltId1{12345};
+    std::string const cacheSalt1{"tenant-A"};
     auto llmRequest1 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false,
         std::nullopt, false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt,
-        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        cacheSaltId1); // With cache_salt_id = 12345
+        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        cacheSalt1); // With cache_salt = "tenant-A"
 
     GenerationRequest seq1{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
 
-    // Should NOT reuse blocks despite same tokens, because cache_salt_id is different
+    // Should NOT reuse blocks despite same tokens, because cache_salt is different
     auto promptLen1 = llmRequest1->getNumTokens(beamIdx);
     auto numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
     auto prepopulatedPromptLen1 = blockManager
@@ -2215,7 +2214,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
     ///////////////////////////////////////////////////////////////////////////
-    // Test Case 3: Request with same tokens and same cache_salt_id = 12345
+    // Test Case 3: Request with same tokens and same cache_salt = "tenant-A"
     requestId = 2;
     auto llmRequest2 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
@@ -2223,12 +2222,12 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false,
         std::nullopt, false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt,
-        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        cacheSaltId1); // Same cache_salt_id = 12345
+        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        cacheSalt1); // Same cache_salt = "tenant-A"
 
     GenerationRequest seq2{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
 
-    // SHOULD reuse blocks because both tokens and cache_salt_id match
+    // SHOULD reuse blocks because both tokens and cache_salt match
     auto promptLen2 = llmRequest2->getNumTokens(beamIdx);
     auto numContextBlocks2 = tc::ceilDiv(promptLen2, blockManager.getTokensPerBlock());
     auto prepopulatedPromptLen2 = blockManager
@@ -2252,21 +2251,21 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
     ///////////////////////////////////////////////////////////////////////////
-    // Test Case 4: Request with same tokens but different cache_salt_id = 67890
+    // Test Case 4: Request with same tokens but different cache_salt = "tenant-B"
     requestId = 3;
-    CacheSaltIDType cacheSaltId2{67890};
+    std::string const cacheSalt2{"tenant-B"};
     auto llmRequest3 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false,
         std::nullopt, false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt,
-        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        cacheSaltId2); // Different cache_salt_id = 67890
+        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        cacheSalt2); // Different cache_salt = "tenant-B"
 
     GenerationRequest seq3{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
 
-    // Should NOT reuse blocks from any previous request because cache_salt_id is different
+    // Should NOT reuse blocks from any previous request because cache_salt is different
     auto promptLen3 = llmRequest3->getNumTokens(beamIdx);
     auto numContextBlocks3 = tc::ceilDiv(promptLen3, blockManager.getTokensPerBlock());
     auto prepopulatedPromptLen3 = blockManager
@@ -2284,7 +2283,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     ///////////////////////////////////////////////////////////////////////////
-    // Test Case 5: Request without cache_salt_id again
+    // Test Case 5: Request without cache_salt again
     requestId = 4;
     auto llmRequest4 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
@@ -2292,12 +2291,12 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false,
         std::nullopt, false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt,
-        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt); // No cache_salt_id
+        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt); // No cache_salt
 
     GenerationRequest seq4{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
 
-    // Should reuse blocks from request0 (blocks 0,1) because both have no cache_salt_id
+    // Should reuse blocks from request0 (blocks 0,1) because both have no cache_salt
     auto promptLen4 = llmRequest4->getNumTokens(beamIdx);
     auto numContextBlocks4 = tc::ceilDiv(promptLen4, blockManager.getTokensPerBlock());
     auto prepopulatedPromptLen4 = blockManager

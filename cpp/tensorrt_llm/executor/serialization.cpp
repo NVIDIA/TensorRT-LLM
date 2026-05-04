@@ -885,7 +885,6 @@ Request Serialization::deserializeRequest(std::istream& is)
     auto allottedTimeMs = allottedTimeInt
         ? std::optional<std::chrono::milliseconds>(std::chrono::milliseconds(*allottedTimeInt))
         : std::nullopt;
-    auto cacheSaltID = su::deserialize<std::optional<CacheSaltIDType>>(is);
     auto disaggRequestId = su::deserialize<std::optional<IdType>>(is);
     auto cacheSalt = su::deserialize<std::optional<std::string>>(is);
 
@@ -897,8 +896,7 @@ Request Serialization::deserializeRequest(std::istream& is)
         std::move(encoderInputTokenIds), clientId, returnAllGeneratedTokens, priority, requestType,
         std::move(contextPhaseParams), std::move(encoderInputFeatures), encoderOutputLength,
         std::move(crossAttentionMask), numReturnSequences, std::move(eagleConfig), std::move(skipCrossAttnBlocks),
-        std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, cacheSaltID, disaggRequestId,
-        std::move(cacheSalt));
+        std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, disaggRequestId, std::move(cacheSalt));
 }
 
 void Serialization::serialize(Request const& request, std::ostream& os)
@@ -2691,7 +2689,6 @@ size_t Serialization::serializedSize(tensorrt_llm::batch_manager::kv_cache_manag
     totalSize += su::serializedSize(key.uniqueTokens);
     // std::vector<MmKey> where MmKey is pair<std::array<uint8_t,32>, SizeType32>
     totalSize += su::serializedSize(key.extraKeys);
-    totalSize += su::serializedSize(key.cacheSaltID);
     totalSize += su::serializedSize(key.cacheSalt);
     return totalSize;
 }
@@ -2702,7 +2699,6 @@ void Serialization::serialize(tensorrt_llm::batch_manager::kv_cache_manager::Blo
     su::serialize(key.loraTaskId, os);
     su::serialize(key.uniqueTokens, os);
     su::serialize(key.extraKeys, os);
-    su::serialize(key.cacheSaltID, os);
     su::serialize(key.cacheSalt, os);
 }
 
@@ -2712,14 +2708,12 @@ tensorrt_llm::batch_manager::kv_cache_manager::BlockKey Serialization::deseriali
     auto loraTaskId = su::deserialize<std::optional<tensorrt_llm::batch_manager::kv_cache_manager::LoraTaskIdType>>(is);
     auto uniqueTokens = su::deserialize<std::vector<tensorrt_llm::runtime::UniqueToken>>(is);
     auto extraKeys = su::deserialize<std::vector<tensorrt_llm::batch_manager::kv_cache_manager::MmKey>>(is);
-    auto cacheSaltID = su::deserialize<std::optional<CacheSaltIDType>>(is);
     auto cacheSalt = su::deserialize<std::optional<std::string>>(is);
     tensorrt_llm::batch_manager::kv_cache_manager::BlockKey key;
     key.usesExtraIds = usesExtraIds;
     key.loraTaskId = std::move(loraTaskId);
     key.uniqueTokens = std::move(uniqueTokens);
     key.extraKeys = std::move(extraKeys);
-    key.cacheSaltID = std::move(cacheSaltID);
     key.cacheSalt = std::move(cacheSalt);
     return key;
 }
