@@ -738,6 +738,12 @@ class PyTorchModelEngine(ModelEngine):
         # Reset the global cuda graph dummy requests in warmup.
         self.cuda_graph_runner.padding_dummy_requests = {}
 
+        if self._is_encoder_decoder_model():
+            logger.info(
+                "Skipping warmup for encoder-decoder models; warmup dummy "
+                "requests do not carry encoder output state.")
+            return
+
         if self.mapping.cp_size > 1:
             cp_type = self.mapping.cp_config.get("cp_type", None)
             if cp_type != CpType.HELIX:

@@ -282,6 +282,18 @@ methods:
         annotation: Union[float, List[float]]
         default: 0.5
         status: prototype
+      encoder_inputs:
+        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt, Sequence[Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt]], NoneType]
+        default: null
+        status: prototype
+      encoder_input_token_ids:
+        annotation: Union[List[int], Sequence[List[int]], NoneType]
+        default: null
+        status: prototype
+      decoder_input_token_ids:
+        annotation: Union[List[int], Sequence[List[int]], NoneType]
+        default: null
+        status: prototype
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:
     parameters:
@@ -306,6 +318,18 @@ methods:
         annotation: float
         default: 0.5
         status: prototype
+      encoder_inputs:
+        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt, NoneType]
+        default: null
+        status: prototype
+      encoder_input_token_ids:
+        annotation: Optional[List[int]]
+        default: null
+        status: prototype
+      decoder_input_token_ids:
+        annotation: Optional[List[int]]
+        default: null
+        status: prototype
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
   preprocess:
     parameters:
@@ -318,6 +342,18 @@ methods:
       disaggregated_params:
         annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
         default: null
+      encoder_inputs:
+        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt, NoneType]
+        default: null
+        status: prototype
+      encoder_input_token_ids:
+        annotation: Optional[List[int]]
+        default: null
+        status: prototype
+      decoder_input_token_ids:
+        annotation: Optional[List[int]]
+        default: null
+        status: prototype
     return_annotation: tensorrt_llm.llmapi.llm.PreprocessedInputs
     status: prototype
   get_kv_cache_events:

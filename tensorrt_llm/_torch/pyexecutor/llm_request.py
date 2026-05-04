@@ -278,6 +278,7 @@ class PyResult:
         additional_generation_outputs_list: list[tuple[str,
                                                        torch.Tensor]] = field(
                                                            default_factory=list)
+        encoder_output: torch.Tensor | None = None
 
     def __init__(self,
                  *,
@@ -324,6 +325,7 @@ class PyResult:
             name: []
             for name in additional_outputs
         } if additional_outputs else None
+        self._encoder_output: Optional[torch.Tensor] = None
         self.diff = PyResult.Diff()
 
     def reset_diff(self):
@@ -352,6 +354,8 @@ class PyResult:
         if diff.mrope_position_ids is not None:
             self._mrope_position_ids = diff.mrope_position_ids
             self._mrope_position_deltas = diff.mrope_position_deltas
+        if diff.encoder_output is not None:
+            self._encoder_output = diff.encoder_output
         if len(diff.additional_context_outputs_list) > 0:
             for name, additional_context_outputs in diff.additional_context_outputs_list:
                 self._additional_context_outputs[name].append(
@@ -411,6 +415,10 @@ class PyResult:
             mrope_position_deltas).dump_to_dict())
         self.diff.mrope_position_ids = self._mrope_position_ids
         self.diff.mrope_position_deltas = self._mrope_position_deltas
+
+    def set_encoder_output(self, encoder_output: torch.Tensor):
+        self._encoder_output = encoder_output
+        self.diff.encoder_output = encoder_output
 
     def transfer_remaining_device_logits(self):
         """Finalize any remaining generation logits transfers (for chunked mode)"""
@@ -532,14 +540,18 @@ class PyResult:
                 output_list, dim=0) if len(output_list) > 1 else output_list[0]
         return outputs
 
+    @property
+    def encoder_output(self) -> torch.Tensor | None:
+        return self._encoder_output
+
 
 class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
         ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
          'mm_embedding_handles', 'additional_context_outputs',
-         'additional_generation_outputs', 'mrope_position_ids_handle',
-         'mrope_position_deltas_handle'))
+         'additional_generation_outputs', 'encoder_output',
+         'mrope_position_ids_handle', 'mrope_position_deltas_handle'))
 
     def __init__(self,
                  result: Union[bytes, tensorrt_llm.bindings.executor.Result],
@@ -630,6 +642,15 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
+        encoder_input_tokens = kwargs.get("encoder_input_tokens")
+        encoder_output_len = kwargs.get("encoder_output_len")
+        return_encoder_output = bool(kwargs.get("return_encoder_output", False))
+        if return_encoder_output:
+            kwargs["return_encoder_output"] = False
+        if (llm_request is None and encoder_input_tokens is not None
+                and encoder_output_len is None):
+            encoder_output_len = len(encoder_input_tokens)
+            kwargs["encoder_output_len"] = encoder_output_len
         if llm_request is not None:
             super().__init__(llm_request)
         else:
@@ -643,6 +664,15 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 stop_words_list=torch.tensor(stop_words_list, dtype=torch.int32)
                 if stop_words_list else None,
                 **kwargs)
+        if encoder_output_len is not None and not hasattr(
+                self, "encoder_output_len"):
+            self.encoder_output_len = int(encoder_output_len)
+        if encoder_input_tokens is not None and not hasattr(
+                self, "encoder_tokens"):
+            encoder_tokens = (encoder_input_tokens.tolist() if hasattr(
+                encoder_input_tokens, "tolist") else list(encoder_input_tokens))
+            self.encoder_tokens = encoder_tokens
+        self.py_return_encoder_output = return_encoder_output
         self.py_client_id = client_id
         self.py_request_id = self.request_id
         self.py_llm_request_type = self.llm_request_type
@@ -674,8 +704,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         # Encoder-decoder runtime state. ``py_encoder_output`` holds the
         # packed encoder hidden states produced by the encoder iteration as
-        # a temporary GPU buffer between encoder forward and the first
-        # decoder context step. ``py_encoder_output_ready_event`` is
+        # a GPU buffer for cross-attention projection and fallback paths.
+        # ``py_encoder_output_ready_event`` is
         # recorded on the encoder stream when those hidden states become
         # available; the scheduler queries it before admitting the request
         # to a decoder context step. ``py_skip_cross_kv_projection`` controls
@@ -882,7 +912,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             if attr_name.startswith('py_'):
                 attr_value = getattr(self, attr_name)
                 setattr(py_request, attr_name, deepcopy(attr_value))
-            elif attr_name in ['is_attention_dp_dummy', 'is_cuda_graph_dummy']:
+            elif attr_name in [
+                    'is_attention_dp_dummy', 'is_cuda_graph_dummy',
+                    'encoder_tokens', 'encoder_output_len'
+            ]:
                 setattr(py_request, attr_name, attr_value)
 
         # Rewrite specific attributes that should use child_request values.
@@ -1026,8 +1059,9 @@ def executor_request_to_llm_request(
         guided_decoding_params=executor_request.guided_decoding_params,
         py_logits_post_processors=getattr(executor_request,
                                           "py_logits_post_processors", None),
-        encoder_input_tokens=None,
-        return_encoder_output=False,
+        encoder_input_tokens=executor_request.encoder_input_token_ids,
+        return_encoder_output=executor_request.output_config.
+        return_encoder_output,
         client_id=executor_request.client_id
         if executor_request.client_id is not None else req_id,
         priority=executor_request.priority,

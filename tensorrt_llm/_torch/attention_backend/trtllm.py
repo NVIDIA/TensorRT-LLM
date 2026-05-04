@@ -689,6 +689,13 @@ class TrtllmAttentionWrapper:
             # the C++ side via the new ``cross_attention`` flag.
             k_arg = None if is_cross else k
             v_arg = None if is_cross else v
+            legacy_attention_kwargs = {}
+            if is_cross:
+                legacy_attention_kwargs = {
+                    "cross_attention": True,
+                    "cross_kv": cross_kv_input,
+                    "encoder_input_lengths": encoder_seq_lens,
+                }
             thop.attention(
                 q,
                 k_arg,
@@ -772,9 +779,7 @@ class TrtllmAttentionWrapper:
                 self.flash_mla_num_splits,
                 num_contexts=num_contexts,
                 num_ctx_tokens=num_ctx_tokens,
-                cross_attention=is_cross,
-                cross_kv=cross_kv_input,
-                encoder_input_lengths=encoder_seq_lens,
+                **legacy_attention_kwargs,
             )
 
         if self.print_skip_softmax_stat:

@@ -32,4 +32,8 @@ methods:
         annotation: Optional[dict[str, float]]
         default: None
     return_annotation: None
-properties: {}
+properties:
+  encoder_output:
+    annotation: Optional[torch.Tensor]
+    default: inspect._empty
+    status: prototype

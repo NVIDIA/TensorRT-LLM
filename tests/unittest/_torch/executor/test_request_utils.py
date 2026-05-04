@@ -11,13 +11,17 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
+from tensorrt_llm._torch.pyexecutor.llm_request import (
+    LlmRequestState,
+    executor_request_to_llm_request,
+)
 from tensorrt_llm._torch.pyexecutor.request_utils import (
     can_process_attention_dp_request,
     get_from_waiting_queue,
     merge_helix_requests,
     merge_requests,
 )
-from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
+from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue, ScheduledRequests
 from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.mapping import CpType
 
@@ -55,6 +59,53 @@ def create_mock_request_with_py_schedule_params(attention_dp_rank=None, attentio
     mock_request.input_token_ids = [1, 2, 3]
 
     return mock_request
+
+
+def test_executor_request_to_llm_request_preserves_encoder_tokens():
+    """Encoder-decoder requests should enter the encoder phase after conversion."""
+
+    encoder_input_token_ids = [11, 12, 13, 14]
+    executor_request = trtllm.Request(
+        input_token_ids=[0],
+        max_tokens=5,
+        streaming=False,
+        sampling_config=trtllm.SamplingConfig(),
+        output_config=trtllm.OutputConfig(return_encoder_output=True),
+        encoder_input_token_ids=encoder_input_token_ids,
+    )
+
+    llm_request = executor_request_to_llm_request(
+        req_id=7,
+        executor_request=executor_request,
+        child_req_ids=[],
+        exclude_last_generation_logits=False,
+    )
+
+    encoder_unique_tokens = llm_request.get_encoder_unique_tokens()
+    assert [token.token_id for token in encoder_unique_tokens] == encoder_input_token_ids
+    assert llm_request.encoder_tokens == encoder_input_token_ids
+    assert llm_request.encoder_output_len == len(encoder_input_token_ids)
+    assert llm_request.py_return_encoder_output
+    assert not llm_request.get_return_encoder_output()
+    assert llm_request.state == LlmRequestState.ENCODER_INIT
+    assert llm_request.is_encoder_init_state
+
+
+def test_scheduled_requests_does_not_query_encoder_context_chunk_state():
+    class EncoderInitRequest:
+        is_encoder_init_state = True
+
+        @property
+        def is_last_context_chunk(self):
+            raise AssertionError("encoder-init requests do not have context chunks")
+
+    request = EncoderInitRequest()
+    scheduled_requests = ScheduledRequests()
+
+    scheduled_requests.append_context_request(request)
+
+    assert scheduled_requests.context_requests_chunking == [request]
+    assert scheduled_requests.context_requests_last_chunk == []
 
 
 def test_merge_helix_requests_with_padding():

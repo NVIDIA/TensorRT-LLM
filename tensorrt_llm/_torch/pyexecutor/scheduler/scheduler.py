@@ -109,6 +109,9 @@ class ScheduledRequests:
         return self.context_requests + self.generation_requests
 
     def append_context_request(self, request: LlmRequest) -> None:
+        if request.is_encoder_init_state:
+            self.context_requests_chunking.append(request)
+            return
         if request.is_last_context_chunk:
             self.context_requests_last_chunk.append(request)
         else:
@@ -641,8 +644,16 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
 
         if chunks_present:
             # Partition: non-last-chunk first, last-chunk at end
-            not_last_chunk = [r for r in context_requests if not r.is_last_context_chunk]
-            last_chunk = [r for r in context_requests if r.is_last_context_chunk]
+            not_last_chunk = [
+                r
+                for r in context_requests
+                if r.is_encoder_init_state or not r.is_last_context_chunk
+            ]
+            last_chunk = [
+                r
+                for r in context_requests
+                if not r.is_encoder_init_state and r.is_last_context_chunk
+            ]
             # Sort each group by lora_task_id
             not_last_chunk.sort(key=get_lora_task_id)
             last_chunk.sort(key=get_lora_task_id)

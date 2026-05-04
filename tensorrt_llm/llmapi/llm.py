@@ -62,6 +62,7 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
         prompt_token_ids (List[int]): The token ids of the prompt.
         outputs (List[CompletionOutput]): The output sequences of the request.
         context_logits (torch.Tensor, optional): The logits on the prompt token ids.
+        encoder_output (torch.Tensor, optional): The encoder output hidden states when requested.
         disaggregated_params (DisaggregatedParams, optional): Parameters for disaggregated serving, including multimodal embedding handles.
         finished (bool): Whether the whole request is finished.
     """
@@ -128,6 +129,7 @@ class PreprocessedInputs:
     prompt_token_ids: List[int]
     query_token_ids: Optional[List[int]] = None
     multimodal_params: Optional[MultimodalParams] = None
+    encoder_input_token_ids: Optional[List[int]] = None
 
 
 class BaseLLM:
@@ -306,6 +308,77 @@ class BaseLLM:
             ) if self._executor else {}
         return self._disaggregated_params
 
+    @staticmethod
+    def _is_token_id_list(value: Any) -> bool:
+        return isinstance(value, list) and all(
+            isinstance(token, int) for token in value)
+
+    @classmethod
+    def _is_unbatched_inputs(cls, inputs: Any) -> bool:
+        if inputs is None:
+            return False
+        if isinstance(inputs, str) or isinstance(inputs, dict):
+            return True
+        if cls._is_token_id_list(inputs):
+            return True
+        return False
+
+    @classmethod
+    def _is_unbatched_optional_inputs(cls, *values: Any) -> bool:
+        for value in values:
+            if value is None:
+                continue
+            return cls._is_unbatched_inputs(value)
+        return True
+
+    @classmethod
+    def _item_at(cls,
+                 maybe_batched: Any,
+                 pos: int,
+                 *,
+                 token_ids_are_scalar: bool = False) -> Any:
+        if maybe_batched is None:
+            return None
+        if token_ids_are_scalar and cls._is_token_id_list(maybe_batched):
+            return maybe_batched
+        if isinstance(maybe_batched, list):
+            return maybe_batched[pos]
+        return maybe_batched
+
+    @staticmethod
+    def _copy_prompt_inputs(inputs: PromptInputs) -> PromptInputs:
+        if isinstance(inputs, dict):
+            return dict(inputs)
+        return inputs
+
+    def _get_decoder_start_token_id(self) -> int:
+        configs = [
+            self._generation_config,
+            self._hf_model_config,
+            getattr(self._hf_model_config, "text_config", None),
+        ]
+        for config in configs:
+            if config is None:
+                continue
+            decoder_start_token_id = getattr(config, "decoder_start_token_id",
+                                             None)
+            if decoder_start_token_id is not None:
+                return int(decoder_start_token_id)
+
+        raise ValueError(
+            "decoder_input_token_ids must be provided for encoder-decoder "
+            "requests when the model config has no decoder_start_token_id.")
+
+    @classmethod
+    def _normalize_token_ids(cls, token_ids: Any, name: str) -> List[int]:
+        if cls._is_token_id_list(token_ids):
+            return list(token_ids)
+        if hasattr(token_ids, "tolist"):
+            normalized = token_ids.tolist()
+            if cls._is_token_id_list(normalized):
+                return normalized
+        raise TypeError(f"{name} must be a list of token ids.")
+
     def generate(
         self,
         inputs: Union[PromptInputs, Sequence[PromptInputs]],
@@ -324,6 +397,12 @@ class BaseLLM:
                                           List[SchedulingParams]]] = None,
         cache_salt: Optional[Union[str, Sequence[str]]] = None,
         priority: Union[float, List[float]] = DEFAULT_REQUEST_PRIORITY,
+        encoder_inputs: Optional[Union[PromptInputs,
+                                       Sequence[PromptInputs]]] = None,
+        encoder_input_token_ids: Optional[Union[List[int],
+                                                Sequence[List[int]]]] = None,
+        decoder_input_token_ids: Optional[Union[List[int],
+                                                Sequence[List[int]]]] = None,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -346,24 +425,43 @@ class BaseLLM:
                 Scheduling parameters. Defaults to None.
             cache_salt (str, Sequence[str], optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
             priority (float, List[float]): The scheduling priority for the request(s), in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
+            encoder_inputs (tensorrt_llm.inputs.data.PromptInputs, Sequence[tensorrt_llm.inputs.data.PromptInputs], optional): Encoder-side inputs for encoder-decoder models. Defaults to None.
+            encoder_input_token_ids (List[int], Sequence[List[int]], optional): Encoder-side token IDs for encoder-decoder models. Defaults to None.
+            decoder_input_token_ids (List[int], Sequence[List[int]], optional): Decoder-side token IDs for encoder-decoder models. Defaults to None.
+
         Returns:
             Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.
         """
-        unbatched = not isinstance(inputs, list)
-        if not unbatched:
+        unbatched = self._is_unbatched_optional_inputs(
+            inputs,
+            encoder_inputs,
+            encoder_input_token_ids,
+            decoder_input_token_ids,
+        )
+        if inputs is not None and not unbatched:
             if isinstance(inputs[0], int):
                 unbatched = True
 
-        if unbatched:
+        if unbatched and inputs is not None:
             inputs = [inputs]
 
-        inputs = [prompt_inputs(i) for i in inputs]
+        if inputs is None:
+            batch_len = 1
+            for value in (encoder_inputs, encoder_input_token_ids,
+                          decoder_input_token_ids):
+                if isinstance(value,
+                              list) and not self._is_token_id_list(value):
+                    batch_len = len(value)
+                    break
+            request_inputs_list = [None] * batch_len
+        else:
+            request_inputs_list = [prompt_inputs(i) for i in inputs]
 
         if isinstance(priority, list):
-            if len(priority) != len(inputs):
+            if len(priority) != len(request_inputs_list):
                 raise ValueError(
                     f"priority list length ({len(priority)}) does not match "
-                    f"number of prompts ({len(inputs)})")
+                    f"number of prompts ({len(request_inputs_list)})")
             for p in priority:
                 if not (0.0 <= p <= 1.0):
                     raise ValueError(
@@ -373,25 +471,26 @@ class BaseLLM:
                 raise ValueError(
                     f"priority must be a float in [0.0, 1.0], got {priority}")
 
-        def _item_at(maybe_batched: Union[Any, Sequence[Any]], pos: int) -> Any:
-            if isinstance(maybe_batched, list):
-                return maybe_batched[pos]
-            else:
-                return maybe_batched
-
         futures = []
-        for i, request_inputs in enumerate(inputs):
+        for i, request_input in enumerate(request_inputs_list):
             future = self.generate_async(
-                request_inputs,
-                sampling_params=_item_at(sampling_params, i),
-                lora_request=_item_at(lora_request, i),
-                prompt_adapter_request=_item_at(prompt_adapter_request, i),
-                kv_cache_retention_config=_item_at(kv_cache_retention_config,
-                                                   i),
-                disaggregated_params=_item_at(disaggregated_params, i),
-                scheduling_params=_item_at(scheduling_params, i),
-                cache_salt=_item_at(cache_salt, i),
-                priority=_item_at(priority, i),
+                request_input,
+                sampling_params=self._item_at(sampling_params, i),
+                lora_request=self._item_at(lora_request, i),
+                prompt_adapter_request=self._item_at(prompt_adapter_request, i),
+                kv_cache_retention_config=self._item_at(
+                    kv_cache_retention_config, i),
+                disaggregated_params=self._item_at(disaggregated_params, i),
+                scheduling_params=self._item_at(scheduling_params, i),
+                cache_salt=self._item_at(cache_salt, i),
+                encoder_inputs=self._item_at(encoder_inputs,
+                                             i,
+                                             token_ids_are_scalar=True),
+                encoder_input_token_ids=self._item_at(
+                    encoder_input_token_ids, i, token_ids_are_scalar=True),
+                decoder_input_token_ids=self._item_at(
+                    decoder_input_token_ids, i, token_ids_are_scalar=True),
+                priority=self._item_at(priority, i),
                 streaming=False,
             )
             futures.append(future)
@@ -422,6 +521,9 @@ class BaseLLM:
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt: Optional[str] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        encoder_inputs: Optional[PromptInputs] = None,
+        encoder_input_token_ids: Optional[List[int]] = None,
+        decoder_input_token_ids: Optional[List[int]] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -439,10 +541,13 @@ class BaseLLM:
             scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.
             cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
             priority (float): The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
+            encoder_inputs (tensorrt_llm.inputs.data.PromptInputs, optional): Encoder-side input for encoder-decoder models. Defaults to None.
+            encoder_input_token_ids (List[int], optional): Encoder-side token IDs for encoder-decoder models. Defaults to None.
+            decoder_input_token_ids (List[int], optional): Decoder-side token IDs for encoder-decoder models. Defaults to None.
+
         Returns:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
         """
-
         # Check if the worker is shutting down
         if self._executor is None or self._executor.is_shutdown():
             raise RuntimeError("LLM is shutting down")
@@ -461,13 +566,48 @@ class BaseLLM:
             sampling_params.max_tokens = 1
 
         if isinstance(inputs, PreprocessedInputs):
+            if encoder_inputs is not None:
+                raise ValueError(
+                    "encoder_inputs cannot be used when inputs is PreprocessedInputs. "
+                    "Preprocess encoder inputs first or pass encoder_input_token_ids."
+                )
+            if decoder_input_token_ids is not None:
+                raise ValueError(
+                    "decoder_input_token_ids cannot be used when inputs is "
+                    "PreprocessedInputs. Store decoder tokens in "
+                    "PreprocessedInputs.prompt_token_ids.")
+
             prompt_token_ids = inputs.prompt_token_ids
             prompt = None
             query_token_ids = inputs.query_token_ids
             multimodal_params = inputs.multimodal_params
+            preprocessed_encoder_input_token_ids = inputs.encoder_input_token_ids
+            if preprocessed_encoder_input_token_ids is not None:
+                preprocessed_encoder_input_token_ids = self._normalize_token_ids(
+                    preprocessed_encoder_input_token_ids,
+                    "inputs.encoder_input_token_ids")
+            if encoder_input_token_ids is not None:
+                normalized_encoder_input_token_ids = self._normalize_token_ids(
+                    encoder_input_token_ids, "encoder_input_token_ids")
+                if (preprocessed_encoder_input_token_ids is not None
+                        and normalized_encoder_input_token_ids
+                        != preprocessed_encoder_input_token_ids):
+                    raise ValueError(
+                        "Conflicting encoder_input_token_ids were provided in "
+                        "PreprocessedInputs and generate_async.")
+                encoder_input_token_ids = normalized_encoder_input_token_ids
+            else:
+                encoder_input_token_ids = preprocessed_encoder_input_token_ids
         else:
-            prompt_token_ids, prompt, query_token_ids, multimodal_params = (
-                self._preprocess(inputs, sampling_params, disaggregated_params))
+            (prompt_token_ids, prompt, query_token_ids, multimodal_params,
+             encoder_input_token_ids) = self._preprocess(
+                 inputs,
+                 sampling_params,
+                 disaggregated_params,
+                 encoder_inputs=encoder_inputs,
+                 encoder_input_token_ids=encoder_input_token_ids,
+                 decoder_input_token_ids=decoder_input_token_ids,
+             )
 
         arrival_time = steady_clock_now(
         ) if self.args.return_perf_metrics else None
@@ -495,6 +635,7 @@ class BaseLLM:
             scheduling_params=scheduling_params,
             cache_salt_id=cache_salt_id,
             arrival_time=arrival_time,
+            encoder_input_token_ids=encoder_input_token_ids,
             priority=priority,
         )
 
@@ -507,19 +648,78 @@ class BaseLLM:
 
     def _preprocess(
         self,
-        inputs: PromptInputs,
+        inputs: Optional[PromptInputs],
         sampling_params: SamplingParams,
         disaggregated_params: Optional[DisaggregatedParams] = None,
+        encoder_inputs: Optional[PromptInputs] = None,
+        encoder_input_token_ids: Optional[List[int]] = None,
+        decoder_input_token_ids: Optional[List[int]] = None,
     ) -> Tuple[List[int], Optional[str], Optional[List[int]],
-               Optional[MultimodalParams]]:
+               Optional[MultimodalParams], Optional[List[int]]]:
         """Preprocess raw prompts into token IDs and multimodal params.
 
         This is the CPU-heavy portion of generate_async (tokenization,
         multimodal processing, hash computation).
 
         Returns:
-            `(prompt_token_ids, prompt, query_token_ids, multimodal_params)`
+            `(prompt_token_ids, prompt, query_token_ids, multimodal_params, encoder_input_token_ids)`
         """
+        if isinstance(inputs, dict):
+            inputs = self._copy_prompt_inputs(inputs)
+            if encoder_inputs is None:
+                encoder_inputs = inputs.pop("encoder_inputs", None)
+            else:
+                inputs.pop("encoder_inputs", None)
+            if encoder_input_token_ids is None:
+                encoder_input_token_ids = inputs.pop("encoder_input_token_ids",
+                                                     None)
+            else:
+                inputs.pop("encoder_input_token_ids", None)
+            if decoder_input_token_ids is None:
+                decoder_input_token_ids = inputs.pop("decoder_input_token_ids",
+                                                     None)
+            else:
+                inputs.pop("decoder_input_token_ids", None)
+
+        if encoder_inputs is not None and encoder_input_token_ids is not None:
+            raise ValueError(
+                "Specify only one of encoder_inputs and encoder_input_token_ids."
+            )
+
+        normalized_encoder_input_token_ids = None
+        if encoder_input_token_ids is not None:
+            normalized_encoder_input_token_ids = self._normalize_token_ids(
+                encoder_input_token_ids, "encoder_input_token_ids")
+        elif encoder_inputs is not None:
+            (normalized_encoder_input_token_ids, _encoder_prompt,
+             encoder_query_token_ids, encoder_multimodal_params,
+             nested_encoder_input_token_ids) = self._preprocess(
+                 encoder_inputs,
+                 sampling_params,
+                 disaggregated_params,
+             )
+            if (encoder_query_token_ids is not None
+                    or encoder_multimodal_params is not None
+                    or nested_encoder_input_token_ids is not None):
+                raise ValueError(
+                    "encoder_inputs must describe a text or tokenized encoder prompt."
+                )
+
+        if decoder_input_token_ids is not None:
+            return (self._normalize_token_ids(decoder_input_token_ids,
+                                              "decoder_input_token_ids"), None,
+                    None, None, normalized_encoder_input_token_ids)
+
+        if inputs is None or (isinstance(inputs, dict)
+                              and "prompt" not in inputs
+                              and "prompt_token_ids" not in inputs):
+            if normalized_encoder_input_token_ids is not None:
+                return ([self._get_decoder_start_token_id()], None, None, None,
+                        normalized_encoder_input_token_ids)
+            raise TypeError(
+                f"The inputs must be type str or list of int, but got {type(inputs)}"
+            )
+
         inputs = prompt_inputs(inputs)
 
         # A fast path for token IDs & MM data is available for a VLM if the input processor has the following methods.
@@ -683,7 +883,8 @@ class BaseLLM:
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
             )
 
-        return prompt_token_ids, prompt, query_token_ids, multimodal_params
+        return (prompt_token_ids, prompt, query_token_ids, multimodal_params,
+                normalized_encoder_input_token_ids)
 
     @set_api_status("prototype")
     def preprocess(
@@ -691,6 +892,9 @@ class BaseLLM:
         inputs: PromptInputs,
         sampling_params: Optional[SamplingParams] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
+        encoder_inputs: Optional[PromptInputs] = None,
+        encoder_input_token_ids: Optional[List[int]] = None,
+        decoder_input_token_ids: Optional[List[int]] = None,
     ) -> PreprocessedInputs:
         """Preprocess raw prompts into token IDs and multimodal params.
 
@@ -699,19 +903,30 @@ class BaseLLM:
             sampling_params (tensorrt_llm.sampling_params.SamplingParams, optional): The sampling params for the generation. Defaults to None.
                 A default one will be used if not provided.
             disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
+            encoder_inputs (tensorrt_llm.inputs.data.PromptInputs, optional): Encoder-side input for encoder-decoder models. Defaults to None.
+            encoder_input_token_ids (List[int], optional): Encoder-side token IDs for encoder-decoder models. Defaults to None.
+            decoder_input_token_ids (List[int], optional): Decoder-side token IDs for encoder-decoder models. Defaults to None.
 
         Returns:
             tensorrt_llm.llmapi.llm.PreprocessedInputs: A preprocessed-inputs object that can be
                 passed directly to :meth:`generate_async` as ``inputs``.
         """
         sampling_params = self._prepare_sampling_params(sampling_params)
-        prompt_token_ids, _prompt, query_token_ids, multimodal_params = (
-            self._preprocess(inputs, sampling_params, disaggregated_params))
+        (prompt_token_ids, _prompt, query_token_ids, multimodal_params,
+         encoder_input_token_ids) = self._preprocess(
+             inputs,
+             sampling_params,
+             disaggregated_params,
+             encoder_inputs=encoder_inputs,
+             encoder_input_token_ids=encoder_input_token_ids,
+             decoder_input_token_ids=decoder_input_token_ids,
+         )
 
         return PreprocessedInputs(
             prompt_token_ids=prompt_token_ids,
             query_token_ids=query_token_ids,
             multimodal_params=multimodal_params,
+            encoder_input_token_ids=encoder_input_token_ids,
         )
 
     @set_api_status("beta")
