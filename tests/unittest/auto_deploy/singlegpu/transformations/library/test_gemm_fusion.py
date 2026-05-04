@@ -14,8 +14,10 @@ from _torch_test_utils import all_close, fp8_compatible, reset_parameters
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 (registers torch_attention op)
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 torch.manual_seed(0)
 
@@ -834,3 +836,113 @@ def test_fuse_meta_val_propagation(model_cls, model_kwargs):
             f"Fused linear output dim {fused_val.shape[-1]} != "
             f"sum of narrow sizes {total_narrow_size}"
         )
+
+
+@torch.inference_mode()
+def test_fuse_qkv_with_trtllm_cache_insertion():
+    """Chain QKV fusion → TRT-LLM cache insertion and verify the pipeline works.
+
+    This tests that fuse_gemms_mixed_children produces correct meta['val']
+    shapes that the insert_cached_attention transform can consume when using
+    the TRT-LLM attention backend.
+    """
+    model = QKVAttentionModel(hidden_size=64, num_heads=4).to(device="cuda", dtype=torch.float16)
+    x = model.get_input(device="cuda", dtype=torch.float16)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    gm = InferenceOptimizer(
+        None,
+        {"fuse_gemms_mixed_children": {"stage": "post_load_fusion"}},
+    )(None, gm)
+
+    assert _count_split_output_nodes(gm) == 3
+    assert sum(is_linear_op(n) for n in gm.graph.nodes) == 2
+
+    kv_cache_config = KvCacheConfig(
+        tokens_per_block=32,
+        max_tokens=128,
+        free_gpu_memory_fraction=0.0,
+    )
+    cm = CachedSequenceInterface(
+        max_seq_len=64,
+        max_batch_size=4,
+        device="cuda",
+        kv_cache_config=kv_cache_config,
+    )
+
+    gm = InferenceOptimizer(
+        None,
+        {"insert_cached_attention": {"stage": "cache_init", "backend": "trtllm"}},
+    )(cm, gm)
+
+    cached_attn_nodes = [
+        n
+        for n in gm.graph.nodes
+        if is_op(n, torch.ops.auto_deploy.trtllm_attention_mha_with_cache.default)
+    ]
+    assert len(cached_attn_nodes) == 1, (
+        f"Expected 1 trtllm_attention_mha_with_cache node, got {len(cached_attn_nodes)}"
+    )
+
+    prep_meta_nodes = [
+        n
+        for n in gm.graph.nodes
+        if is_op(n, torch.ops.auto_deploy.trtllm_attention_prepare_metadata.default)
+    ]
+    assert len(prep_meta_nodes) == 1, (
+        f"Expected 1 prepare_metadata node, got {len(prep_meta_nodes)}"
+    )
+
+    assert _count_split_output_nodes(gm) == 3
+
+
+@torch.inference_mode()
+def test_fuse_qkv_gqa_with_trtllm_cache_insertion():
+    """Same pipeline but with GQA (num_kv_heads < num_heads).
+
+    Verifies that asymmetric Q/KV projection sizes work through the full
+    fusion → cache insertion pipeline.
+    """
+    model = QKVAttentionModel(
+        hidden_size=64,
+        num_heads=4,
+        num_kv_heads=2,
+    ).to(device="cuda", dtype=torch.float16)
+    x = model.get_input(device="cuda", dtype=torch.float16)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    gm = InferenceOptimizer(
+        None,
+        {"fuse_gemms_mixed_children": {"stage": "post_load_fusion"}},
+    )(None, gm)
+
+    assert _count_split_output_nodes(gm) == 3
+
+    narrow_sizes = sorted([n.args[3] for n in _get_narrow_nodes(gm)])
+    assert narrow_sizes == [32, 32, 64], f"Unexpected narrow sizes for GQA: {narrow_sizes}"
+
+    kv_cache_config = KvCacheConfig(
+        tokens_per_block=32,
+        max_tokens=128,
+        free_gpu_memory_fraction=0.0,
+    )
+    cm = CachedSequenceInterface(
+        max_seq_len=64,
+        max_batch_size=4,
+        device="cuda",
+        kv_cache_config=kv_cache_config,
+    )
+
+    gm = InferenceOptimizer(
+        None,
+        {"insert_cached_attention": {"stage": "cache_init", "backend": "trtllm"}},
+    )(cm, gm)
+
+    cached_attn_nodes = [
+        n
+        for n in gm.graph.nodes
+        if is_op(n, torch.ops.auto_deploy.trtllm_attention_mha_with_cache.default)
+    ]
+    assert len(cached_attn_nodes) == 1
