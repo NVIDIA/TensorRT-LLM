@@ -35,6 +35,7 @@
 #include <torch/custom_class.h>
 #include <torch/python.h>
 #include <type_traits>
+#include <unordered_set>
 #include <vector>
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
@@ -286,11 +287,12 @@ private:
     // raw pointer is still dereferenced by checkGenTransferStatus /
     // checkContextTransferStatus (the UAF forensically confirmed via
     // MALLOC_PERTURB_=85 producing mRequestId=0x5555555555555555). Entries are
-    // erased only in the normal eviction paths (completion, deadline,
-    // exception), ensuring the request outlives every C++ access but doesn't
-    // leak past the transfer lifecycle.
+    // erased only after completion, exception, or timeout plus worker-future
+    // readiness. A timeout/cancel request is not a quiescence proof, so the
+    // tracker must keep the shared_ptr until the worker future resolves.
     std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mSenderFutures;
     std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mRequesterFutures;
+    std::unordered_set<LlmRequest::RequestIdType> mTimedOutRequesterIds;
     mpi::MpiComm const* mMpiWorldComm{nullptr};
 
     std::shared_ptr<CacheTransceiverComm> mGroupComm;
