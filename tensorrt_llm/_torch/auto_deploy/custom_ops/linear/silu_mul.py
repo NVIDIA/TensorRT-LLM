@@ -35,6 +35,18 @@ except ImportError:
     _flashinfer_silu_and_mul = None
 
 
+def _resolve_out_dtype(out_dtype: Optional[str]) -> Optional[torch.dtype]:
+    """Resolve a torch dtype name (e.g. ``"float8_e4m3fn"``) to ``torch.dtype``."""
+    if out_dtype is None:
+        return None
+    try:
+        return getattr(torch, out_dtype)
+    except AttributeError as e:
+        raise RuntimeError(
+            f"Unsupported out_dtype={out_dtype!r}; expected a valid torch dtype name."
+        ) from e
+
+
 @torch.library.custom_op("auto_deploy::flashinfer_silu_and_mul", mutates_args=())
 def flashinfer_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
     """Fused SiLU+Mul using FlashInfer's kernel (fallback to manual implementation)."""
@@ -55,20 +67,22 @@ def _flashinfer_fake(x: torch.Tensor) -> torch.Tensor:
 def trtllm_silu_and_mul(
     x: torch.Tensor,
     scale: Optional[torch.Tensor] = None,
-    dtype: Optional[int] = None,
+    out_dtype: Optional[str] = None,
 ) -> torch.Tensor:
     """Fused SiLU+Mul using TRT-LLM's Triton kernel.
 
-    Supports optional fused FP8 quantization: when ``scale`` and ``dtype`` are provided,
-    the output is quantized to the given dtype in-kernel (avoiding a separate quant pass).
+    Supports optional fused FP8 output quantization: when ``scale`` and
+    ``out_dtype`` are provided, the kernel quantizes the output to the given
+    dtype in-place (avoiding a separate quant pass).
 
     Args:
         x: Input tensor of shape ``(..., 2*D)``.
-        scale: Optional quantization scale tensor for fused output quantization.
-        dtype: Optional output dtype encoded as int (use ``_DTYPE_TO_INT``/``_INT_TO_DTYPE``).
-              When set with ``scale``, output is quantized in-kernel.
+        scale: Optional per-tensor quantization scale.
+        out_dtype: Optional output dtype as a ``torch`` attribute name
+            (e.g. ``"float8_e4m3fn"``).  When set together with ``scale``, the
+            kernel produces a quantized output of this dtype.
     """
-    torch_dtype = _INT_TO_DTYPE.get(dtype) if dtype is not None else None
+    torch_dtype = _resolve_out_dtype(out_dtype)
     # trtllm::silu_and_mul expects 2D (rows, 2*D). Flatten higher dims and restore.
     orig_shape = x.shape
     x_2d = x.reshape(-1, orig_shape[-1])
@@ -80,18 +94,8 @@ def trtllm_silu_and_mul(
 def _trtllm_fake(
     x: torch.Tensor,
     scale: Optional[torch.Tensor] = None,
-    dtype: Optional[int] = None,
+    out_dtype: Optional[str] = None,
 ) -> torch.Tensor:
     half_size = x.shape[-1] // 2
     output_shape = list(x.shape[:-1]) + [half_size]
-    out_dtype = _INT_TO_DTYPE.get(dtype, x.dtype) if dtype is not None else x.dtype
-    return x.new_empty(output_shape, dtype=out_dtype)
-
-
-# Dtype encoding for custom op (torch.dtype is not supported in custom op schemas).
-_DTYPE_TO_INT = {
-    torch.float8_e4m3fn: 1,
-    torch.bfloat16: 2,
-    torch.float16: 3,
-}
-_INT_TO_DTYPE = {v: k for k, v in _DTYPE_TO_INT.items()}
+    return x.new_empty(output_shape, dtype=_resolve_out_dtype(out_dtype) or x.dtype)

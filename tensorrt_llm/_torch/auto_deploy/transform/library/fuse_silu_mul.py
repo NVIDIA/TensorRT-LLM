@@ -43,11 +43,7 @@ from pydantic import Field
 from torch.fx import GraphModule, Node
 
 # Import to ensure the custom ops are registered
-from ...custom_ops.linear.silu_mul import (  # noqa: F401
-    _DTYPE_TO_INT,
-    flashinfer_silu_and_mul,
-    trtllm_silu_and_mul,
-)
+from ...custom_ops.linear.silu_mul import flashinfer_silu_and_mul, trtllm_silu_and_mul  # noqa: F401
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import is_op
@@ -272,9 +268,8 @@ class FuseSiluMul(BaseTransform):
             scale_node = graph.create_node("get_attr", input_scale.target)
         scale_node.meta = dict(input_scale.meta)
 
-        # Rewrite: silu_and_mul(x) → silu_and_mul(x, scale=scale_node, dtype=fp8_int)
-        fp8_dtype_int = _DTYPE_TO_INT[torch.float8_e4m3fn]
-        silu_node.args = (silu_node.args[0], scale_node, fp8_dtype_int)
+        # Rewrite: silu_and_mul(x) → silu_and_mul(x, scale=scale_node, out_dtype="float8_e4m3fn")
+        silu_node.args = (silu_node.args[0], scale_node, "float8_e4m3fn")
 
         # Update meta to reflect FP8 output dtype
         ref_val = silu_node.meta.get("val")
