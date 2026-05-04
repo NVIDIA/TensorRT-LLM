@@ -70,6 +70,10 @@ def _build_getitem_silu_mul_graph():
     graph.output(mul)
     gm = torch.fx.GraphModule(torch.nn.Module(), graph)
     for n in gm.graph.nodes:
+        # Placeholder is the (..., 2*D) parent; the matcher needs its meta
+        # to verify ``parent.shape[-1] == 2 * gate_size`` before fusing.
+        if n.op == "placeholder":
+            n.meta["val"] = torch.empty(2, fused_size, dtype=torch.float16, device="meta")
         # Set a val on each getitem so _get_narrow_info can read sizes from meta
         if n.op == "call_function" and n.target == operator.getitem:
             n.meta["val"] = torch.empty(2, _HALF, dtype=torch.float16, device="meta")

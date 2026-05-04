@@ -946,3 +946,96 @@ def test_fuse_qkv_gqa_with_trtllm_cache_insertion():
         if is_op(n, torch.ops.auto_deploy.trtllm_attention_mha_with_cache.default)
     ]
     assert len(cached_attn_nodes) == 1
+
+
+class QKVRopeAttentionModel(QKVAttentionModel):
+    """``QKVAttentionModel`` with HF-style explicit cos/sin RoPE on Q and K.
+
+    This shape is what ``fuse_rope_into_trtllm_attention`` looks for: a
+    ``torch_rope_with_explicit_cos_sin`` node sits between Q/K projections
+    and the ``torch_attention`` call, and Q/K/V all trace back to the same
+    fused QKV GEMM output so the QKV-passthrough leg can fire.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # ``fuse_rope_into_trtllm_attention`` reads cos/sin as 2D
+        # ``[max_pos, head_dim]`` buffers (HF-style table).
+        self.register_buffer(
+            "rope_cos_table",
+            torch.zeros(self.seq_len, self.head_dim),
+            persistent=False,
+        )
+        self.register_buffer(
+            "rope_sin_table",
+            torch.zeros(self.seq_len, self.head_dim),
+            persistent=False,
+        )
+
+    def forward(self, x):
+        b, s, _ = x.shape
+        # Index cos/sin tables by position so the extractor can trace through
+        # ``aten.index.Tensor`` back to the underlying 2D table.
+        position_ids = torch.arange(s, device=x.device)
+        cos = self.rope_cos_table[position_ids].unsqueeze(0).expand(b, -1, -1)
+        sin = self.rope_sin_table[position_ids].unsqueeze(0).expand(b, -1, -1)
+        q = self.q_proj(x).view(b, s, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(b, s, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(x).view(b, s, self.num_kv_heads, self.head_dim)
+        q, k = torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin.default(q, k, cos, sin, 2)
+        attn = torch.ops.auto_deploy.torch_attention.default(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
+            scale=None,
+            sinks=None,
+            sliding_window=None,
+            logit_cap=None,
+            layout="bsnd",
+        )
+        out = attn.reshape(b, s, self.hidden_size)
+        return self.o_proj(out)
+
+
+@torch.inference_mode()
+def test_fuse_qkv_passthrough_with_rope():
+    """Exercise the QKV-passthrough leg of fuse_rope_into_trtllm_attention.
+
+    Builds a graph where Q/K/V come from a fused QKV GEMM and Q/K go
+    through ``torch_rope_with_explicit_cos_sin`` before attention.  After
+    rope fusion the ``torch_attention`` node must carry the
+    ``_trtllm_fused_qkv`` marker plus non-zero head/dim hints — proving
+    that the passthrough actually fired.
+    """
+    model = QKVRopeAttentionModel(hidden_size=64, num_heads=4).to(
+        device="cuda", dtype=torch.float16
+    )
+    x = model.get_input(device="cuda", dtype=torch.float16)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    gm = InferenceOptimizer(
+        None,
+        {
+            "fuse_gemms_mixed_children": {"stage": "post_load_fusion"},
+            "fuse_rope_into_trtllm_attention": {"stage": "post_load_fusion"},
+        },
+    )(None, gm)
+
+    # The torch_attention node should now carry passthrough metadata.
+    torch_attn_nodes = [
+        n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention.default)
+    ]
+    assert len(torch_attn_nodes) == 1
+    src = torch_attn_nodes[0]
+    assert src.meta.get("_trtllm_fused_qkv") is True, (
+        "fuse_rope_into_trtllm_attention should have set _trtllm_fused_qkv"
+    )
+    assert src.meta.get("_trtllm_num_heads") == 4
+    assert src.meta.get("_trtllm_num_kv_heads") == 4
+    assert src.meta.get("_trtllm_head_dim") == 16
+    # Q/K/V args must all alias the same fused-QKV node.
+    assert src.args[0] is src.args[1] is src.args[2]

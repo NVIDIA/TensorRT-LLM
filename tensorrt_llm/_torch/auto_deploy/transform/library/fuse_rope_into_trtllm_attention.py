@@ -349,6 +349,21 @@ def _find_inv_freq_tensor(
     return next(iter(candidates.values()))
 
 
+def _unwrap_contiguous(node: Node) -> Node:
+    """Skip past any chain of ``contiguous`` calls, in either ``aten``
+    overload form or the Python-level ``Tensor.contiguous`` method form."""
+    current = node
+    while isinstance(current, Node) and current.op == "call_function":
+        is_aten_contig = is_op(current, torch.ops.aten.contiguous.default)
+        is_method_contig = getattr(current.target, "__name__", "") == "contiguous"
+        if not (is_aten_contig or is_method_contig):
+            break
+        if not isinstance(current.args[0], Node):
+            break
+        current = current.args[0]
+    return current
+
+
 def _try_trace_to_fused_qkv(
     pre_rope_q: Node, pre_rope_k: Node, bind_v: Node
 ) -> Optional[Tuple[Node, int, int, int]]:
@@ -367,13 +382,7 @@ def _try_trace_to_fused_qkv(
     """
 
     def _trace_split(node: Node):
-        current = node
-        if (
-            current.op == "call_function"
-            and getattr(current.target, "__name__", "") == "contiguous"
-        ):
-            if isinstance(current.args[0], Node):
-                current = current.args[0]
+        current = _unwrap_contiguous(node)
         if not (
             is_op(current, torch.ops.aten.view.default)
             or is_op(current, torch.ops.aten.reshape.default)
@@ -408,19 +417,7 @@ def _try_trace_to_fused_qkv(
         return fused_node, getitem_idx, nh * hd, nh, hd
 
     def _trace_narrow(node: Node):
-        current = node
-        while (
-            isinstance(current, Node)
-            and current.op == "call_function"
-            and getattr(current.target, "__name__", "") == "contiguous"
-        ):
-            if isinstance(current.args[0], Node):
-                current = current.args[0]
-            else:
-                break
-        if is_op(current, torch.ops.aten.contiguous.default):
-            if isinstance(current.args[0], Node):
-                current = current.args[0]
+        current = _unwrap_contiguous(node)
         if not (
             is_op(current, torch.ops.aten.view.default)
             or is_op(current, torch.ops.aten.reshape.default)

@@ -353,4 +353,15 @@ class FuseSiluMul(BaseTransform):
         if gate_size != up_size:
             return None
 
+        # Only fuse when the two narrows together cover the parent's full last
+        # dim (i.e. parent.shape[-1] == 2 * gate_size).  Otherwise the fused
+        # silu_and_mul kernel — which always splits its input at half — would
+        # operate on a different slice than the two narrows describe.
+        parent_val = gate_parent.meta.get("val")
+        if parent_val is None:
+            return None
+        parent_last_dim = parent_val.shape[-1]
+        if not isinstance(parent_last_dim, int) or parent_last_dim != 2 * gate_size:
+            return None
+
         return gate_parent, gate_size
