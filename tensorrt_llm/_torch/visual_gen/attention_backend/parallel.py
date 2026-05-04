@@ -458,6 +458,8 @@ class RingAttention(AttentionBackend):
         inner_backend: AttentionBackend,
         process_group: dist.ProcessGroup,
     ):
+        # Invariant: only instantiated when ring_size > 1 (see attention.py),
+        # so distributed must be initialized and the group must be non-trivial.
         if not type(inner_backend).support_lse():
             raise ValueError(
                 f"RingAttention requires an LSE-capable inner backend (FA4); "

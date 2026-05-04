@@ -477,7 +477,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
             if self.world_size == 1:
                 return SingleProcessGroup.get_group()
             return None
-        if self.ring_size * self.ulysses_size == 1:
+        if self.cp_size * self.ulysses_size == 1:
             # Degenerate: single rank along both dims.  Fall back to the
             # ulysses group (equivalent at size-1) to keep call sites simple.
             return self._group("ulysses")
