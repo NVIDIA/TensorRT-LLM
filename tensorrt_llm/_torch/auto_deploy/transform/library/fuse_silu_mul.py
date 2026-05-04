@@ -284,11 +284,7 @@ class FuseSiluMul(BaseTransform):
         silu_input = silu_node.args[0]
         silu_input_val = silu_input.meta.get("val") if isinstance(silu_input, Node) else None
         orig_dtype = silu_input_val.dtype if silu_input_val is not None else torch.bfloat16
-        dtype_str = {
-            torch.bfloat16: "bfloat16",
-            torch.float16: "float16",
-            torch.float32: "float32",
-        }.get(orig_dtype, "bfloat16")
+        dtype_str = str(orig_dtype).removeprefix("torch.")
 
         # Set out_dtype on the FP8 linear (arg[5] for trtllm, not present for torch variant)
         user_args = list(user.args)
