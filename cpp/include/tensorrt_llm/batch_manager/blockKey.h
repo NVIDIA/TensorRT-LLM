@@ -37,8 +37,8 @@ using MmKey = tensorrt_llm::executor::MmKey;
 //! \param startTokenIdx First token index in the cache block relative to the prompt.
 //! \param endTokenIdx One-past-last token index in the cache block relative to the prompt.
 //! \return Vector of MmKey entries for multimodal items overlapping the block.
-//! \details When exact multimodal item runs are present, each hash applies only to those sparse prompt positions.
-//! Otherwise this falls back to the legacy contiguous [position, position + length) span.
+//! \details Each hash applies only to the sparse prompt positions described by exact multimodal item runs.
+//! Requests with multimodal hashes but without item runs fail validation.
 std::vector<MmKey> generateBlockHashExtraKeys(
     tensorrt_llm::batch_manager::LlmRequest const& llmRequest, SizeType32 startTokenIdx, SizeType32 endTokenIdx);
 

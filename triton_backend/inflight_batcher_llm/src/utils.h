@@ -1,4 +1,4 @@
-// Copyright 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -108,8 +108,7 @@ struct InputFieldsNames
 
     // MultimodalInput
     static constexpr char const* multimodalHashes = "multimodal_hashes";
-    static constexpr char const* multimodalPositions = "multimodal_positions";
-    static constexpr char const* multimodalLengths = "multimodal_lengths";
+    static constexpr char const* multimodalItemRuns = "multimodal_item_runs";
 
     // LoraConfig
     static constexpr char const* loraTaskId = "lora_task_id";

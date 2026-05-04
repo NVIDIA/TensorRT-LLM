@@ -1,4 +1,4 @@
-// Copyright 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -1039,32 +1039,71 @@ std::vector<executor::Request> createRequestsFromInputTensors(std::vector<InputT
 
         // Multimodal input construction
         std::optional<executor::MultimodalInput> multimodalInputOpt{std::nullopt};
-        if (inputTensors.count(InputFieldsNames::multimodalHashes)
-            && inputTensors.count(InputFieldsNames::multimodalPositions)
-            && inputTensors.count(InputFieldsNames::multimodalLengths))
+        auto const hasMultimodalHashes = inputTensors.count(InputFieldsNames::multimodalHashes) > 0;
+        auto const hasMultimodalItemRuns = inputTensors.count(InputFieldsNames::multimodalItemRuns) > 0;
+        TLLM_CHECK_WITH_INFO(hasMultimodalHashes == hasMultimodalItemRuns,
+            "multimodal_hashes and multimodal_item_runs must be provided together");
+        if (hasMultimodalHashes)
         {
             std::vector<std::vector<executor::SizeType32>> multimodalHashes;
-            std::vector<executor::SizeType32> multimodalPositions;
-            std::vector<executor::SizeType32> multimodalLengths;
             // Extract multimodalHashes as a vector of vectors (2D tensor with [num_tokens, hash_len])
             auto const& hashesTensor = inputTensors.at(InputFieldsNames::multimodalHashes).tensor;
+            utils::squeezeTensor(hashesTensor, 2);
             auto hashesShape = hashesTensor->getShape();
             TLLM_CHECK_WITH_INFO(hashesShape.nbDims == 2, "multimodal_hashes tensor must be 2D (num_tokens, hash_len)");
-            int64_t numTokens = hashesShape.d[0];
+            int64_t numItems = hashesShape.d[0];
             int64_t hashLen = hashesShape.d[1];
             auto* data = static_cast<executor::SizeType32*>(hashesTensor->data());
-            multimodalHashes.resize(numTokens);
-            for (int64_t i = 0; i < numTokens; ++i)
+            multimodalHashes.resize(numItems);
+            for (int64_t i = 0; i < numItems; ++i)
             {
                 multimodalHashes[i].resize(hashLen);
                 std::memcpy(multimodalHashes[i].data(), data + i * hashLen, hashLen * sizeof(executor::SizeType32));
             }
-            // Extract positions and lengths as 1D vectors
-            utils::extractVector<executor::SizeType32>(
-                inputTensors, InputFieldsNames::multimodalPositions, multimodalPositions);
-            utils::extractVector<executor::SizeType32>(
-                inputTensors, InputFieldsNames::multimodalLengths, multimodalLengths);
-            multimodalInputOpt = executor::MultimodalInput(multimodalHashes, multimodalPositions, multimodalLengths);
+
+            auto const& itemRunsTensor = inputTensors.at(InputFieldsNames::multimodalItemRuns).tensor;
+            utils::squeezeTensor(itemRunsTensor, 3);
+            auto itemRunsShape = itemRunsTensor->getShape();
+            TLLM_CHECK_WITH_INFO(itemRunsShape.nbDims == 3 && itemRunsShape.d[2] == 2,
+                "multimodal_item_runs tensor must be 3D (num_items, max_runs, 2)");
+            TLLM_CHECK_WITH_INFO(itemRunsShape.d[0] == numItems,
+                "multimodal_item_runs and multimodal_hashes must have the same number of items");
+
+            executor::MultimodalItemRuns multimodalItemRuns(numItems);
+            auto const maxRuns = itemRunsShape.d[1];
+            auto* itemRunsData = static_cast<executor::SizeType32*>(itemRunsTensor->data());
+            for (int64_t itemIdx = 0; itemIdx < numItems; ++itemIdx)
+            {
+                bool reachedPadding = false;
+                for (int64_t runIdx = 0; runIdx < maxRuns; ++runIdx)
+                {
+                    auto const runDataOffset = (itemIdx * maxRuns + runIdx) * 2;
+                    auto const runStart = itemRunsData[runDataOffset];
+                    auto const runLength = itemRunsData[runDataOffset + 1];
+                    if (runLength == 0)
+                    {
+                        reachedPadding = true;
+                        continue;
+                    }
+
+                    TLLM_CHECK_WITH_INFO(
+                        !reachedPadding, "multimodal_item_runs entries must use only trailing zero-length padding");
+                    TLLM_CHECK_WITH_INFO(
+                        runStart >= 0, "multimodal_item_runs must contain non-negative prompt positions");
+                    TLLM_CHECK_WITH_INFO(runLength > 0, "multimodal_item_runs must contain positive lengths");
+                    if (!multimodalItemRuns[itemIdx].empty())
+                    {
+                        auto const& previousRun = multimodalItemRuns[itemIdx].back();
+                        auto const previousEnd = std::get<0>(previousRun) + std::get<1>(previousRun);
+                        TLLM_CHECK_WITH_INFO(runStart >= previousEnd,
+                            "multimodal_item_runs must be ordered and non-overlapping within each item");
+                    }
+                    multimodalItemRuns[itemIdx].emplace_back(runStart, runLength, std::vector<executor::SizeType32>{});
+                }
+                TLLM_CHECK_WITH_INFO(
+                    !multimodalItemRuns[itemIdx].empty(), "multimodal_item_runs must include a run for every item");
+            }
+            multimodalInputOpt = executor::MultimodalInput(std::move(multimodalHashes), std::move(multimodalItemRuns));
         }
 
         auto request = executor::Request(inputTokens, maxNewTokens, streaming, samplingConfig, outConfig, endId, padId,
