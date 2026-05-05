@@ -39,6 +39,8 @@ ARG CUBLAS_VER
 ARG TORCH_INSTALL_TYPE="skip"
 RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
     echo "Using GitHub mirror: ${GITHUB_MIRROR}" && \
     echo "Using Python version: ${PYTHON_VERSION}" && \
     GITHUB_MIRROR=${GITHUB_MIRROR} \
@@ -56,13 +58,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip3 uninstall -y tornado black nbconvert pillow nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base || true && \
     # Remove any leftover namespace dirs or dist-info that pip missed
     rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl* && \
-    pip3 install --ignore-installed --no-cache-dir -r /tmp/constraints.txt && \
+    pip3 install --ignore-installed -r /tmp/constraints.txt && \
     rm /tmp/constraints.txt
 
 # Install UCX, NIXL, etcd
 # TODO: Combine these into the main install.sh script
 RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
     GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_ucx.sh && \
     GITHUB_MIRROR=${GITHUB_MIRROR} bash /opt/docker/common/install_nixl.sh && \
     bash /opt/docker/common/install_etcd.sh && \

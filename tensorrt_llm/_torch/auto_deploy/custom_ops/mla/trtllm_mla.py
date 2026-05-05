@@ -123,6 +123,18 @@ def get_trtllm_mla_rope_info(attn_node: Node) -> Optional[dict]:
 # resolving `host_pool_mapping[mLayerIdx]` → (pool_index=0, within=0).
 _CONTEXT_LAYER_OFFSET = 1
 
+# Chunked-prefill loop budget.  See ``_handle_prefill_thop_cached_kv``: the
+# cache-reused-prefill path loops over past KV in slices bounded by
+# ``_TRTLLM_MLA_CHUNK_BATCH_SIZE * chunk_size`` tokens per ``thop.attention``
+# call.  The C++ FP8 context-MLA buffer (``fp8_k_buf`` / ``fp8_v_buf``) is
+# sized as ``chunked_prefill_buffer_batch_size * max_num_tokens * dims``,
+# so passing N=4 here matches PT BE's default and keeps each iteration's
+# K/V write bounded.  We use ``max_context_length`` (= ``max_seq_len``) as
+# the packer's chunk_size — a safe lower bound on the kernel's
+# ``max_num_tokens`` for any standard config (typically
+# ``max_num_tokens >= max_seq_len``).
+_TRTLLM_MLA_CHUNK_BATCH_SIZE = 4
+
 
 # =============================================================================
 # Module-level planner
@@ -183,6 +195,28 @@ class _TrtllmMLAPlanner:
         self.max_input_uncached_seq_len: int = 0
         self.max_ctx_kv_len: int = 0
         self.num_full_ctx_tokens: int = 0
+        # Chunked-prefill scratch (cache-reused / chunked path).  See
+        # ``_handle_prefill_thop_cached_kv``: when prefill seqs carry past_kv,
+        # past KV is processed in N=4-chunk iterations with softmax-stats
+        # merging, then a final causal pass handles the uncached new tokens.
+        self.chunked_loop_num: int = 0
+        self.max_chunk_len_per_loop: list[int] = []
+        self.max_q_seq_len: int = 0
+        self.chunked_seq_len: Optional[torch.Tensor] = None  # device int32 [L, max_batch]
+        self._chunked_seq_len_host: Optional[torch.Tensor] = None  # cpu pinned int32 [L, max_batch]
+        self.cu_chunked_seq_len: Optional[torch.Tensor] = None  # device int64 [L, max_batch+1]
+        self._cu_chunked_seq_len_host: Optional[torch.Tensor] = None  # cpu int64 shadow
+        self.chunked_global_offset: Optional[torch.Tensor] = None  # device int64 [L, max_batch]
+        self._chunked_global_offset_host: Optional[torch.Tensor] = None  # cpu int64 shadow
+        self.merge_op_tensor: Optional[torch.Tensor] = None  # device int64 [L+1, max_batch]
+        self._merge_op_tensor_host: Optional[torch.Tensor] = None  # cpu int64 shadow
+        self.chunk_total_kv_lens_host: Optional[torch.Tensor] = None  # cpu pinned int32 [L+1, 2]
+        self.cu_q_seq_len: Optional[torch.Tensor] = None  # device int64 [max_batch+1]
+        self._cu_q_seq_len_host: Optional[torch.Tensor] = None  # cpu pinned int64 [max_batch+1]
+        self.zero_past_kv_lengths_host: Optional[torch.Tensor] = (
+            None  # cpu pinned int32 [max_batch]
+        )
+        self._max_chunked_loop_num: int = 0  # static upper bound (filled in reset)
         self.block_offsets: Optional[torch.Tensor] = None
         self.block_ids_per_seq: Optional[torch.Tensor] = None
         self.kv_scale_orig_quant: Optional[torch.Tensor] = None
@@ -280,6 +314,45 @@ class _TrtllmMLAPlanner:
         )
         self.fmha_scheduler_counter_decode = torch.zeros(1, dtype=torch.uint32, device=device)
 
+        # Chunked-prefill metadata (cache-reused / chunked-prefill path).
+        # Upper bound on iteration count: with chunk_size = max_seq_len (set in
+        # ``plan_host``), each iteration's K/V budget is
+        # ``N * chunk_size = N * max_seq_len`` tokens, and ``total_past_kv`` is
+        # bounded by ``max_batch * max_seq_len`` — so
+        # ``chunked_loop_num <= ceil(max_batch / N)``.  The runtime check in
+        # ``_pack_chunked_prefill_metadata`` guards against any future change
+        # that would violate this bound.
+        N = _TRTLLM_MLA_CHUNK_BATCH_SIZE
+        self._max_chunked_loop_num = (max_batch + N - 1) // N
+        L = self._max_chunked_loop_num
+        self.chunked_seq_len = torch.zeros(L, max_batch, dtype=torch.int32, device=device)
+        self._chunked_seq_len_host = torch.zeros(
+            L, max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+        )
+        self.cu_chunked_seq_len = torch.zeros(L, max_batch + 1, dtype=torch.int64, device=device)
+        self._cu_chunked_seq_len_host = torch.zeros(
+            L, max_batch + 1, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
+        )
+        self.chunked_global_offset = torch.zeros(L, max_batch, dtype=torch.int64, device=device)
+        self._chunked_global_offset_host = torch.zeros(
+            L, max_batch, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
+        )
+        # ``+1`` row holds the merge op for the final (uncached) pass.
+        self.merge_op_tensor = torch.zeros(L + 1, max_batch, dtype=torch.int64, device=device)
+        self._merge_op_tensor_host = torch.zeros(
+            L + 1, max_batch, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
+        )
+        self.chunk_total_kv_lens_host = torch.zeros(
+            L + 1, 2, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+        )
+        self.cu_q_seq_len = torch.zeros(max_batch + 1, dtype=torch.int64, device=device)
+        self._cu_q_seq_len_host = torch.zeros(
+            max_batch + 1, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
+        )
+        self.zero_past_kv_lengths_host = torch.zeros(
+            max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+        )
+
         # Flash MLA: allocate metadata buffers for SM90 + head_dim=576.
         # The standard FMHA doesn't support FP8 KV cache + MLA on SM90;
         # Flash MLA provides this capability.
@@ -303,6 +376,155 @@ class _TrtllmMLAPlanner:
         if torch.cuda.is_current_stream_capturing() or cuda_graph_state.in_warm_up():
             return self.cuda_graph_workspace
         return self.workspace
+
+    def _pack_chunked_prefill_metadata(
+        self,
+        num_prefill: int,
+        past_kv_per_seq: torch.Tensor,
+        new_kv_per_seq: torch.Tensor,
+        chunk_size: int,
+    ) -> int:
+        """Greedy bin-packer for the cache-reused-prefill chunk loop.
+
+        Mirrors PT BE's ``_pre_process_chunked_prefill_metadata``: distributes
+        each prefill seq's cached past KV across loop iterations bounded by
+        ``N * chunk_size`` tokens, where ``N = _TRTLLM_MLA_CHUNK_BATCH_SIZE``
+        matches the ``chunked_prefill_buffer_batch_size`` passed to
+        ``thop.attention``.  The kernel's ``fp8_k_buf`` is sized for
+        ``N * max_num_tokens`` tokens; using ``chunk_size = max_context_length``
+        is a safe under-bound when ``max_num_tokens >= max_seq_len`` (typical).
+
+        Populates the planner's per-iteration metadata (host shadows then
+        bulk-copies to device).  Always populates ``cu_q_seq_len`` /
+        ``max_q_seq_len`` for the new tokens (used by the final-pass merge),
+        even when ``chunked_loop_num`` is 0.
+
+        Returns ``chunked_loop_num``.
+        """
+        # New-Q metadata (always populated, regardless of past KV presence).
+        cu_q_h = self._cu_q_seq_len_host[: num_prefill + 1]
+        cu_q_h[0] = 0
+        if num_prefill > 0:
+            cu_q_h[1:].copy_(new_kv_per_seq.long().cumsum(0))
+            self.max_q_seq_len = int(new_kv_per_seq.max().item())
+            num_new_total = int(cu_q_h[num_prefill].item())
+        else:
+            self.max_q_seq_len = 0
+            num_new_total = 0
+        self.cu_q_seq_len[: num_prefill + 1].copy_(cu_q_h, non_blocking=True)
+
+        if num_prefill == 0:
+            self.chunked_loop_num = 0
+            self.max_chunk_len_per_loop = []
+            return 0
+        total_past = int(past_kv_per_seq.sum().item())
+        if total_past == 0:
+            # No past KV anywhere: chunk loop is empty, only the final-pass
+            # runs.  Still need to populate the final-pass merge_op row.
+            self._merge_op_tensor_host[0, :num_prefill].fill_(2)  # all "copy_only"
+            self.merge_op_tensor[0, :num_prefill].copy_(
+                self._merge_op_tensor_host[0, :num_prefill], non_blocking=True
+            )
+            # Final-pass host_total_kv_lens row: [num_new_tokens, 0].
+            self.chunk_total_kv_lens_host[0, 0] = num_new_total
+            self.chunk_total_kv_lens_host[0, 1] = 0
+            self.chunked_loop_num = 0
+            self.max_chunk_len_per_loop = []
+            return 0
+
+        chunk_batch_size = _TRTLLM_MLA_CHUNK_BATCH_SIZE
+        total_chunk_size = chunk_batch_size * chunk_size
+        chunked_loop_num = (total_past + total_chunk_size - 1) // total_chunk_size
+        if chunked_loop_num > self._max_chunked_loop_num:
+            raise RuntimeError(
+                f"chunked_loop_num {chunked_loop_num} exceeds pre-allocated "
+                f"max {self._max_chunked_loop_num}; bump _max_chunked_loop_num"
+            )
+
+        # Reset only the active windows of host shadows.
+        chunked_seq_len_h = self._chunked_seq_len_host[:chunked_loop_num, :num_prefill]
+        chunked_seq_len_h.zero_()
+        chunked_global_offset_h = self._chunked_global_offset_host[:chunked_loop_num, :num_prefill]
+        chunked_global_offset_h.zero_()
+        merge_h = self._merge_op_tensor_host[: chunked_loop_num + 1, :num_prefill]
+        merge_h.zero_()
+
+        # Greedy pack: walk seqs, fill iterations until each seq's past KV
+        # is exhausted.  Inner Python loop bounded by num_prefill *
+        # ceil(max_seq_len / total_chunk_size) — a few hundred at worst.
+        self.max_chunk_len_per_loop = []
+        iter_max = 0
+        cur_iter = 0
+        remain = total_chunk_size
+        for batch_idx in range(num_prefill):
+            cached_len = int(past_kv_per_seq[batch_idx].item())
+            running_offset = 0
+            while cached_len > 0:
+                used = min(remain, cached_len)
+                chunked_seq_len_h[cur_iter, batch_idx] = used
+                chunked_global_offset_h[cur_iter, batch_idx] = running_offset
+                if used > iter_max:
+                    iter_max = used
+                running_offset += used
+                cached_len -= used
+                remain -= used
+                if remain == 0 and (cur_iter + 1) < chunked_loop_num:
+                    self.max_chunk_len_per_loop.append(iter_max)
+                    iter_max = 0
+                    cur_iter += 1
+                    remain = total_chunk_size
+        self.max_chunk_len_per_loop.append(iter_max)
+
+        # cu_chunked_seq_len[loop, :] = cumsum across seqs (int64).
+        cu_h = self._cu_chunked_seq_len_host[:chunked_loop_num, : num_prefill + 1]
+        cu_h.zero_()
+        torch.cumsum(chunked_seq_len_h.long(), dim=1, out=cu_h[:, 1:])
+
+        # chunk_total_kv_lens_host[loop] = [chunk_total_kv_tokens, 0].
+        # Row [chunked_loop_num] is the final-pass total = num_new_total.
+        self.chunk_total_kv_lens_host[:chunked_loop_num, 0].copy_(
+            cu_h[:, num_prefill].to(torch.int32)
+        )
+        self.chunk_total_kv_lens_host[:chunked_loop_num, 1] = 0
+        self.chunk_total_kv_lens_host[chunked_loop_num, 0] = num_new_total
+        self.chunk_total_kv_lens_host[chunked_loop_num, 1] = 0
+
+        # merge_op_tensor:
+        #   row [loop, b] = 0  if chunked_seq_len[loop, b] == 0
+        #                   2  if first iter where seq b has a chunk
+        #                   1  if continuing from a previous chunk
+        # Final row [chunked_loop_num, b]:
+        #   2 if past_kv[b] == 0 (no chunks ran for this seq)
+        #   1 if past_kv[b] > 0  (merge final pass with chunked past)
+        has_chunk = chunked_seq_len_h > 0
+        prev_zero = torch.cat(
+            [
+                torch.ones(1, num_prefill, dtype=torch.bool),
+                ~has_chunk[:-1],
+            ],
+            dim=0,
+        )
+        is_first = has_chunk & prev_zero
+        is_continued = has_chunk & ~prev_zero
+        merge_h[:chunked_loop_num].masked_fill_(is_first, 2)
+        merge_h[:chunked_loop_num].masked_fill_(is_continued, 1)
+        final_row = merge_h[chunked_loop_num]
+        has_past = past_kv_per_seq > 0
+        final_row.masked_fill_(~has_past, 2)
+        final_row.masked_fill_(has_past, 1)
+
+        # Bulk-copy host shadows to device.
+        self.chunked_seq_len[:chunked_loop_num, :num_prefill].copy_(
+            chunked_seq_len_h, non_blocking=True
+        )
+        self.chunked_global_offset[:chunked_loop_num, :num_prefill].copy_(
+            chunked_global_offset_h, non_blocking=True
+        )
+        self.cu_chunked_seq_len[:chunked_loop_num, : num_prefill + 1].copy_(cu_h, non_blocking=True)
+        self.merge_op_tensor[: chunked_loop_num + 1, :num_prefill].copy_(merge_h, non_blocking=True)
+
+        self.chunked_loop_num = chunked_loop_num
+        return chunked_loop_num
 
     def ensure_decode_buffers(
         self,
@@ -397,6 +619,14 @@ class _TrtllmMLAPlanner:
                 self.cu_seq_lens_prefill[: num_prefill + 1].copy_(
                     cu_full_host[: num_prefill + 1], non_blocking=True
                 )
+                # Chunk packer with worst-case past = new = max_context_length per seq.
+                _wcase = torch.full((num_prefill,), max_context_length, dtype=torch.int32)
+                self._pack_chunked_prefill_metadata(
+                    num_prefill=num_prefill,
+                    past_kv_per_seq=_wcase,
+                    new_kv_per_seq=_wcase,
+                    chunk_size=max_context_length,
+                )
             if num_decode > 0:
                 cu_kv = self._cu_kv_decode_host
                 for i in range(num_decode):
@@ -434,12 +664,22 @@ class _TrtllmMLAPlanner:
                 self.cu_seq_lens_prefill[: num_prefill + 1].copy_(
                     cu_full_host[: num_prefill + 1], non_blocking=True
                 )
+                # Pack chunked-prefill iterations using real per-seq past KV.
+                self._pack_chunked_prefill_metadata(
+                    num_prefill=num_prefill,
+                    past_kv_per_seq=past_pf,
+                    new_kv_per_seq=new_pf,
+                    chunk_size=max_context_length,
+                )
             else:
                 self.ctx_total_kv_lens_host[0] = 0
                 self.ctx_total_kv_lens_host[1] = 0
                 self.max_input_uncached_seq_len = 0
                 self.max_ctx_kv_len = 0
                 self.num_full_ctx_tokens = 0
+                self.chunked_loop_num = 0
+                self.max_chunk_len_per_loop = []
+                self.max_q_seq_len = 0
             if num_decode > 0:
                 cu_kv = self._cu_kv_decode_host
                 decode_lens = seq_len_with_cache_host[num_prefill:num_seq]
@@ -895,27 +1135,31 @@ def _handle_prefill_thop_cached_kv(
 ) -> torch.Tensor:
     """Cache-reused / chunked-prefill MLA attention.
 
-    Mirrors ``MLA.forward_context_with_cached_kv`` from the main PyTorch
-    backend (``tensorrt_llm/_torch/modules/attention.py``).  Required when any
-    prefill seq has ``host_past_kv > 0`` — the fresh-prefill kernel path
-    misbehaves under that config because it would re-RoPE/append the new
-    tokens via ``invokeMLARopeContext`` while the FMHA expects K/V to already
-    cover the full ``[past + new]`` range.
+    Mirrors ``MLA.forward_context_with_chunked_prefill`` from the main
+    PyTorch backend (``tensorrt_llm/_torch/modules/attention.py``).  Required
+    when any prefill seq has ``host_past_kv > 0`` — the fresh-prefill kernel
+    path misbehaves under that config because it would re-RoPE/append the
+    new tokens via ``invokeMLARopeContext`` while the FMHA expects K/V to
+    already cover the full ``[past + new]`` range.
 
     Steps:
 
       1. ``mla_rope_append_paged_kv_assign_q`` — RoPE the new tokens'
          ``q_pe`` in-place into ``q`` and append the (RoPE'd) compressed_kv +
          k_pe to the paged KV cache at the correct per-seq offset.
-      2. ``load_paged_kv_cache_for_mla`` — read the full ``[past + new]``
-         compressed_kv and k_pe back out of the paged cache as contiguous
-         tensors.
-      3. Project the full compressed_kv via ``kv_b_proj`` (using the cached
-         grouped-by-dim weight layout) to get full ``K_nope`` and full ``V``.
-         Build full ``K = concat(K_nope, K_pe)``.
-      4. ``thop.attention(... latent_cache=None ...)`` with full K/V — the
-         kernel skips its internal RoPE/append (already done in step 1) and
-         runs FMHA over ``[past + new]`` K/V for the new Q positions only.
+      2. **Chunk loop**: for each of ``planner.chunked_loop_num`` iterations,
+         ``load_chunked_kv_cache_for_mla`` reads a slice of past KV from the
+         paged cache, project via ``kv_b_proj``, run ``thop.attention(
+         mask=padding/FULL, latent_cache=None, softmax_stats=...)`` over the
+         slice, and merge into the running output via
+         ``merge_chunked_attention_for_mla``.  The packer guarantees each
+         iteration's K/V tokens ≤ ``N * chunk_size``, bounding ``fp8_k_buf``.
+      3. **Final pass**: project the post-step-1 latent_cache (the new,
+         post-RoPE tokens) via ``kv_b_proj``, run
+         ``thop.attention(mask=causal, latent_cache=None,
+         softmax_stats=...)`` and merge.  The merge yields attention over
+         the full ``[past + new]`` range, mirroring what the prior one-shot
+         ``thop.attention`` over ``full_k/full_v`` produced.
     """
     dtype = q_nope_flat.dtype
     device = q_nope_flat.device
@@ -972,33 +1216,18 @@ def _handle_prefill_thop_cached_kv(
         quant_mode,
     )
 
-    # Step 2: Load full [past + new] compressed_kv and k_pe from the paged
-    # cache as contiguous tensors.
-    full_compressed_kv, full_k_pe = torch.ops.trtllm.load_paged_kv_cache_for_mla(
-        dtype,
-        pf,
-        planner.num_full_ctx_tokens,
-        planner.max_ctx_kv_len,
-        planner.cu_seq_lens_prefill[: pf + 1],
-        kv_cache_block_offsets,
-        host_kv_cache_pool_pointers,
-        planner.host_pool_mapping,
-        planner.kv_scale_orig_quant,
-        planner.kv_scale_quant_orig,
-        _CONTEXT_LAYER_OFFSET,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        tokens_per_block,
-        max_context_length,
-        0,
-        1,
-        quant_mode,
-    )
-    num_full_tokens = full_compressed_kv.shape[0]
+    # Initialize running output and softmax stats for the merge-based
+    # multi-pass attention.  ``merge_chunked_attention_for_mla`` writes
+    # output in-place per seq using a copy_only/merge op; the value of
+    # output before the first pass for any given seq is irrelevant.
+    output.zero_()
+    softmax_stats = torch.empty(num_tokens, num_heads, 2, dtype=torch.float32, device=device)
+    temp_softmax_stats = torch.empty(num_tokens, num_heads, 2, dtype=torch.float32, device=device)
+    temp_attn_output = torch.empty(num_tokens, num_heads * v_head_dim, dtype=dtype, device=device)
 
-    # Step 3: Project full compressed_kv via kv_b_proj using the cached
-    # grouped-by-dim weight layout (see ``_handle_prefill_thop`` for the
-    # rationale of this permutation).
+    # Cache the grouped kv_b_proj weight layout (see ``_handle_prefill_thop``
+    # for the rationale of this permutation).  Reused for both chunk-loop
+    # and final-pass projection.
     w_src = (
         kv_b_proj_weight.to(dtype)
         if kv_b_proj_weight.dtype == torch.float8_e4m3fn
@@ -1014,23 +1243,8 @@ def _handle_prefill_thop_cached_kv(
         w_v = w_reshaped[:, qk_nope_head_dim:, :].reshape(num_heads * v_head_dim, kv_lora_rank)
         w_grouped = torch.cat([w_nope, w_v], dim=0).contiguous()
         planner._kv_b_proj_grouped_cache[perm_cache_key] = w_grouped
-    full_kv = torch.nn.functional.linear(full_compressed_kv, w_grouped)
-    full_kv_2d = full_kv.view(num_full_tokens, num_heads * (qk_nope_head_dim + v_head_dim))
-    full_k_nope_2d, full_v = full_kv_2d.split(
-        [num_heads * qk_nope_head_dim, num_heads * v_head_dim], dim=-1
-    )
-    full_k_nope = full_k_nope_2d.view(num_full_tokens, num_heads, qk_nope_head_dim)
-    full_k_pe_expanded = full_k_pe.view(num_full_tokens, 1, qk_rope_head_dim).expand(
-        -1, num_heads, -1
-    )
-    full_k = torch.cat([full_k_nope, full_k_pe_expanded], dim=-1).view(
-        num_full_tokens, num_heads * qk_head_dim
-    )
 
-    # Step 4: thop.attention over full K/V with latent_cache=None.  The kernel
-    # skips ``invokeMLARopeContext`` (already done in step 1) and runs FMHA
-    # over [past + new] K/V for the new Q positions.  ``q_2d`` already has the
-    # RoPE'd q_pe written into its rope slice by the step-1 kernel.
+    # Constants reused across all thop.attention calls below.
     sm_version = get_sm_version()
     rotary_embedding_scales = [1.0, 1.0, 1.0]
     rotary_embedding_max_position_info = [max_context_length, max_context_length]
@@ -1039,102 +1253,269 @@ def _handle_prefill_thop_cached_kv(
     if sm_version >= 89:
         spec_decoding_tensor_params.extend([None, None, None])
     mla_tensor_params = [None, None]
+    workspace = planner._select_workspace()
+
+    chunked_loop_num = planner.chunked_loop_num
+
+    # Step 2: Chunk loop over past KV.  Each iteration reads a slice of the
+    # paged cache, projects via kv_b_proj, runs FMHA with mask=padding (FULL)
+    # against the new Q tokens, and merges the partial result into ``output``
+    # using ``merge_chunked_attention_for_mla``.  The packer (run from
+    # ``plan_host``) guarantees each slice's K/V token count ≤
+    # ``_TRTLLM_MLA_CHUNK_BATCH_SIZE * max_context_length``, which is a
+    # safe under-bound for the kernel's ``fp8_k_buf`` budget when
+    # ``max_num_tokens >= max_seq_len`` (typical config).
+    for loop_idx in range(chunked_loop_num):
+        chunked_max_seq_len = planner.max_chunk_len_per_loop[loop_idx]
+        chunk_total_kv = int(planner.chunk_total_kv_lens_host[loop_idx, 0].item())
+        chunk_compressed_kv, chunk_k_pe = torch.ops.trtllm.load_chunked_kv_cache_for_mla(
+            dtype,
+            pf,
+            chunk_total_kv,
+            planner.cu_chunked_seq_len[loop_idx],
+            planner.chunked_global_offset[loop_idx],
+            kv_cache_block_offsets,
+            host_kv_cache_pool_pointers,
+            planner.host_pool_mapping,
+            planner.kv_scale_orig_quant,
+            planner.kv_scale_quant_orig,
+            _CONTEXT_LAYER_OFFSET,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            tokens_per_block,
+            chunked_max_seq_len,
+            max_context_length,
+            0,
+            1,
+            quant_mode,
+        )
+        chunk_kv = torch.nn.functional.linear(chunk_compressed_kv, w_grouped)
+        chunk_kv_2d = chunk_kv.view(chunk_total_kv, num_heads * (qk_nope_head_dim + v_head_dim))
+        chunk_k_nope_2d, chunk_v = chunk_kv_2d.split(
+            [num_heads * qk_nope_head_dim, num_heads * v_head_dim], dim=-1
+        )
+        chunk_k_nope = chunk_k_nope_2d.view(chunk_total_kv, num_heads, qk_nope_head_dim)
+        chunk_k_pe_expanded = chunk_k_pe.view(chunk_total_kv, 1, qk_rope_head_dim).expand(
+            -1, num_heads, -1
+        )
+        chunk_k = torch.cat([chunk_k_nope, chunk_k_pe_expanded], dim=-1).view(
+            chunk_total_kv, num_heads * qk_head_dim
+        )
+
+        thop.attention(
+            q_2d,  # q
+            chunk_k,  # k
+            chunk_v,  # v
+            temp_attn_output,  # output (per-iteration partial)
+            None,  # output_sf
+            workspace,
+            planner.chunked_seq_len[loop_idx, :pf],  # sequence_length = chunk's per-seq KV count
+            planner.zero_past_kv_lengths_host[
+                :pf
+            ],  # host_past_key_value_lengths = 0 (no past beyond this slice)
+            planner.chunk_total_kv_lens_host[loop_idx],  # host_total_kv_lens [chunk_total, 0]
+            context_lengths[:pf],
+            host_context_lengths[:pf],
+            host_request_types[:pf],
+            kv_cache_block_offsets,
+            host_kv_cache_pool_pointers,
+            planner.host_pool_mapping,
+            None,  # cache_indirection
+            planner.kv_scale_orig_quant,
+            planner.kv_scale_quant_orig,
+            None,  # out_scale
+            planner.rotary_inv_freq,
+            planner.identity_cos_sin,
+            None,  # latent_cache=None — RoPE/append already done in step 1
+            None,  # q_pe
+            planner.block_ids_per_seq,
+            None,  # attention_sinks
+            False,  # is_fused_qkv
+            True,  # update_kv_cache
+            1,  # predicted_tokens_per_seq
+            _CONTEXT_LAYER_OFFSET,
+            num_heads,
+            num_heads,
+            qk_nope_head_dim + qk_rope_head_dim,
+            tokens_per_block,
+            max_num_requests,
+            max_context_length,
+            max_context_length,
+            0,  # sink_token_length
+            1,  # beam_width
+            int(AttentionMaskType.padding),  # FULL mask: every Q attends to every K in this chunk
+            quant_mode,
+            q_scaling,
+            int(PositionEmbeddingType.yarn),
+            qk_rope_head_dim,
+            10000.0,
+            5,
+            rotary_embedding_scales,
+            rotary_embedding_max_position_info,
+            True,  # use_paged_context_fmha
+            int(AttentionInputType.context_only),
+            True,  # is_mla_enable
+            _TRTLLM_MLA_CHUNK_BATCH_SIZE,  # chunked_prefill_buffer_batch_size
+            0,  # q_lora_rank
+            kv_lora_rank,
+            qk_nope_head_dim,
+            qk_rope_head_dim,
+            v_head_dim,
+            None,  # mrope_rotary_cos_sin
+            None,  # mrope_position_deltas
+            mla_tensor_params,
+            None,  # attention_chunk_size
+            temp_softmax_stats,  # softmax_stats_tensor (per-iteration output)
+            spec_decoding_bool_params,
+            spec_decoding_tensor_params,
+            None,  # sparse_kv_indices
+            None,  # sparse_kv_offsets
+            None,  # sparse_attn_indices
+            None,  # sparse_attn_offsets
+            1,  # sparse_attn_indices_block_size
+            0,  # sparse_mla_topk
+            None,  # skip_softmax_threshold_scale_factor_prefill
+            None,  # skip_softmax_threshold_scale_factor_decode
+            None,  # skip_softmax_stat
+            None,  # cu_q_seqlens
+            None,  # cu_kv_seqlens
+            None,  # fmha_scheduler_counter
+            None,  # mla_bmm1_scale
+            None,  # mla_bmm2_scale
+            None,  # quant_q_buffer
+            None,  # flash_mla_tile_scheduler_metadata
+            None,  # flash_mla_num_splits
+            num_contexts=pf,
+            num_ctx_tokens=num_tokens,
+        )
+
+        torch.ops.trtllm.merge_chunked_attention_for_mla(
+            output,
+            temp_attn_output,
+            softmax_stats,
+            temp_softmax_stats,
+            pf,
+            planner.cu_q_seq_len[: pf + 1],
+            planner.max_q_seq_len,
+            planner.merge_op_tensor[loop_idx, :pf],
+            num_heads,
+            v_head_dim,
+        )
+
+    # Step 3: Final pass over the (uncached) new K/V with mask=causal.  After
+    # step 1, ``latent_cache`` holds the post-RoPE compressed_kv (first
+    # ``kv_lora_rank`` cols) and post-RoPE k_pe (last ``qk_rope_head_dim``
+    # cols) for the new tokens.  Slice to the prefill range — the caller
+    # passes the full-batch ``latent_cache`` (prefill + decode rows).
+    new_compressed_kv = latent_cache[:num_tokens, :kv_lora_rank]
+    new_k_pe = latent_cache[:num_tokens, kv_lora_rank:]
+    new_kv = torch.nn.functional.linear(new_compressed_kv, w_grouped)
+    new_kv_2d = new_kv.view(num_tokens, num_heads * (qk_nope_head_dim + v_head_dim))
+    new_k_nope_2d, new_v = new_kv_2d.split(
+        [num_heads * qk_nope_head_dim, num_heads * v_head_dim], dim=-1
+    )
+    new_k_nope = new_k_nope_2d.view(num_tokens, num_heads, qk_nope_head_dim)
+    new_k_pe_expanded = new_k_pe.view(num_tokens, 1, qk_rope_head_dim).expand(-1, num_heads, -1)
+    new_k = torch.cat([new_k_nope, new_k_pe_expanded], dim=-1).view(
+        num_tokens, num_heads * qk_head_dim
+    )
 
     thop.attention(
         q_2d,  # q
-        full_k,  # k
-        full_v,  # v
-        output,  # output
+        new_k,  # k
+        new_v,  # v
+        temp_attn_output,  # output
         None,  # output_sf
-        planner._select_workspace(),  # workspace
-        sequence_length[:pf],  # sequence_length (past + new tokens)
-        host_past_kv_lengths[:pf],  # host_past_key_value_lengths (real)
-        planner.ctx_total_kv_lens_host,  # host_total_kv_lens
-        context_lengths[:pf],  # context_lengths (new tokens only)
-        host_context_lengths[:pf],  # host_context_lengths (new tokens only)
-        host_request_types[:pf],  # host_request_types
-        kv_cache_block_offsets,  # kv_cache_block_offsets
-        host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
-        planner.host_pool_mapping,  # host_kv_cache_pool_mapping
-        None,  # cache_indirection
-        planner.kv_scale_orig_quant,  # kv_scale_orig_quant
-        planner.kv_scale_quant_orig,  # kv_scale_quant_orig
-        None,  # out_scale
-        planner.rotary_inv_freq,  # rotary_inv_freq
-        # rotary_cos_sin is unused when latent_cache=None (kernel skips
-        # invokeMLARopeContext), but pass identity for safety.
-        planner.identity_cos_sin,  # rotary_cos_sin
-        None,  # latent_cache=None — RoPE/append already done in step 1
+        workspace,
+        context_lengths[:pf],  # sequence_length = new tokens per seq
+        planner.zero_past_kv_lengths_host[:pf],  # host_past_key_value_lengths = 0
+        planner.chunk_total_kv_lens_host[chunked_loop_num],  # [num_new_total, 0]
+        context_lengths[:pf],
+        host_context_lengths[:pf],
+        host_request_types[:pf],
+        kv_cache_block_offsets,
+        host_kv_cache_pool_pointers,
+        planner.host_pool_mapping,
+        None,
+        planner.kv_scale_orig_quant,
+        planner.kv_scale_quant_orig,
+        None,
+        planner.rotary_inv_freq,
+        planner.identity_cos_sin,
+        None,  # latent_cache=None
         None,  # q_pe
-        planner.block_ids_per_seq,  # block_ids_per_seq
-        None,  # attention_sinks
-        False,  # is_fused_qkv
-        True,  # update_kv_cache
-        1,  # predicted_tokens_per_seq
-        _CONTEXT_LAYER_OFFSET,  # layer_idx (constant: prefill bucket)
-        num_heads,  # num_heads
-        num_heads,  # num_kv_heads (context: expanded)
-        qk_nope_head_dim + qk_rope_head_dim,  # head_size (192)
-        tokens_per_block,  # tokens_per_block
-        max_num_requests,  # max_num_requests
-        max_context_length,  # max_context_length
-        max_context_length,  # attention_window_size
-        0,  # sink_token_length
-        1,  # beam_width
-        int(AttentionMaskType.causal),  # mask_type
-        quant_mode,  # quant_mode
-        q_scaling,  # q_scaling
-        int(PositionEmbeddingType.yarn),  # position_embedding_type
-        qk_rope_head_dim,  # rotary_embedding_dim
-        10000.0,  # rotary_embedding_base
-        5,  # rotary_embedding_scale_type (YaRN)
+        planner.block_ids_per_seq,
+        None,
+        False,
+        True,
+        1,
+        _CONTEXT_LAYER_OFFSET,
+        num_heads,
+        num_heads,
+        qk_nope_head_dim + qk_rope_head_dim,
+        tokens_per_block,
+        max_num_requests,
+        max_context_length,
+        max_context_length,
+        0,
+        1,
+        int(AttentionMaskType.causal),  # CAUSAL: new Q tokens with causal mask over new K/V
+        quant_mode,
+        q_scaling,
+        int(PositionEmbeddingType.yarn),
+        qk_rope_head_dim,
+        10000.0,
+        5,
         rotary_embedding_scales,
         rotary_embedding_max_position_info,
-        True,  # use_paged_context_fmha
-        int(AttentionInputType.context_only),  # attention_input_type
-        True,  # is_mla_enable
-        # FP8 context-MLA workspace (``fp8_k_buf`` / ``fp8_v_buf``) is sized
-        # to ``chunked_prefill_buffer_batch_size * max_num_tokens`` tokens.
-        # The cache-reused-prefill path passes the FULL ``[past + new]`` K/V
-        # in one call; ``num_full_tokens`` can exceed ``max_num_tokens`` at
-        # high prefill concurrency (e.g. 84 prefill seqs × 1003 tokens =
-        # 84252 vs ``max_num_tokens=15360`` at bs=256, isl=1000).  Hard-
-        # coding ``1`` caused IMA inside ``AttentionOp::enqueueContext``.
-        # Use ``16`` — covers up to ``16 * max_num_tokens`` tokens of FP8
-        # K/V scratch, ~1 GiB extra workspace at our config, while leaving
-        # KV-cache budget intact.
-        16,  # chunked_prefill_buffer_batch_size
-        0,  # q_lora_rank
+        True,
+        int(AttentionInputType.context_only),
+        True,
+        _TRTLLM_MLA_CHUNK_BATCH_SIZE,
+        0,
         kv_lora_rank,
         qk_nope_head_dim,
         qk_rope_head_dim,
         v_head_dim,
-        None,  # mrope_rotary_cos_sin
-        None,  # mrope_position_deltas
+        None,
+        None,
         mla_tensor_params,
-        None,  # attention_chunk_size
-        None,  # softmax_stats_tensor
+        None,
+        temp_softmax_stats,
         spec_decoding_bool_params,
         spec_decoding_tensor_params,
-        None,  # sparse_kv_indices
-        None,  # sparse_kv_offsets
-        None,  # sparse_attn_indices
-        None,  # sparse_attn_offsets
-        1,  # sparse_attn_indices_block_size
-        0,  # sparse_mla_topk
-        None,  # skip_softmax_threshold_scale_factor_prefill
-        None,  # skip_softmax_threshold_scale_factor_decode
-        None,  # skip_softmax_stat
-        None,  # cu_q_seqlens
-        None,  # cu_kv_seqlens
-        None,  # fmha_scheduler_counter
-        None,  # mla_bmm1_scale
-        None,  # mla_bmm2_scale
-        None,  # quant_q_buffer
-        None,  # flash_mla_tile_scheduler_metadata
-        None,  # flash_mla_num_splits
+        None,
+        None,
+        None,
+        None,
+        1,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
         num_contexts=pf,
         num_ctx_tokens=num_tokens,
+    )
+
+    torch.ops.trtllm.merge_chunked_attention_for_mla(
+        output,
+        temp_attn_output,
+        softmax_stats,
+        temp_softmax_stats,
+        pf,
+        planner.cu_q_seq_len[: pf + 1],
+        planner.max_q_seq_len,
+        planner.merge_op_tensor[chunked_loop_num, :pf],
+        num_heads,
+        v_head_dim,
     )
 
     return output
