@@ -677,9 +677,9 @@ std::pair<int, int64_t> CacheLevelStorage::grainsToSlots(
         int poolSzSum = 0;
         for (size_t k = j; k < poolOrder.size(); ++k)
             poolSzSum += slotSizeList[poolOrder[k]];
-        float poolFrac = (poolSzSum > 0) ? static_cast<float>(slotSz) / static_cast<float>(poolSzSum) : 1.f;
-        int64_t poolGrains
-            = std::max(minPoolGrains[pool], static_cast<int64_t>(std::round(remainingPgGrains * poolFrac)));
+        double poolFrac = (poolSzSum > 0) ? static_cast<double>(slotSz) / static_cast<double>(poolSzSum) : 1.0;
+        int64_t poolGrains = std::max(minPoolGrains[pool],
+            static_cast<int64_t>(std::nearbyint(static_cast<double>(remainingPgGrains) * poolFrac)));
         numSlots = std::min(numSlots, static_cast<int>(poolGrains * granularity / slotSz));
         remainingPgGrains -= poolGrains;
     }
@@ -749,11 +749,12 @@ std::vector<int> CacheLevelStorage::ratioToSlotCountList(size_t quota, std::vect
         for (size_t i = 0; i < idxLst.size(); ++i)
         {
             size_t idx = idxLst[i];
-            float ratioSum = 0.f;
+            double ratioSum = 0.0;
             for (size_t j = i; j < idxLst.size(); ++j)
-                ratioSum += activeRatio[idxLst[j]];
-            float pct = (ratioSum > 0.f) ? activeRatio[idx] / ratioSum : 1.f;
-            auto [slots, used] = grainsToSlots(std::llround(budget * pct), sizeLists[activePgs[idx]], g);
+                ratioSum += static_cast<double>(activeRatio[idxLst[j]]);
+            double pct = (ratioSum > 0.0) ? static_cast<double>(activeRatio[idx]) / ratioSum : 1.0;
+            auto [slots, used] = grainsToSlots(
+                static_cast<int64_t>(std::nearbyint(static_cast<double>(budget) * pct)), sizeLists[activePgs[idx]], g);
             slotsForActive[idx] = slots;
             grainsForActive[idx] = used;
             budget -= used;

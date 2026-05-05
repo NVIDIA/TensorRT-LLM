@@ -31,11 +31,9 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 
 // ---------------------------------------------------------------------------
 // Debug flag — mirrors TLLM_KV_CACHE_MANAGER_V2_DEBUG env var.
-// Set at startup once by calling initNdebug().
+// Initialized from the environment at load time.
 // ---------------------------------------------------------------------------
-extern bool gNdebug; // true == release mode (assertions skipped)
-
-void initNdebug();
+extern bool const gNdebug; // true == release mode (assertions skipped)
 
 // ---------------------------------------------------------------------------
 // Enumerations

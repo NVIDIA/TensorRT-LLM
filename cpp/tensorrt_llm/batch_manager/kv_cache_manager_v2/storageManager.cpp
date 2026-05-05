@@ -382,9 +382,10 @@ void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, Cac
         int fallenHeld = 0;
         if (isLast)
         {
-            // Separate held pages from fallen_pages.
+            // Separate held pages from fallen_pages. Python remove_if is stable,
+            // and last-level acceptance takes pages from the tail below.
             auto& fp = fallenPages.at(static_cast<size_t>(pg));
-            auto it = std::partition(
+            auto it = std::stable_partition(
                 fp.begin(), fp.end(), [](std::shared_ptr<Page> const& p) { return p->status() != PageStatus::HELD; });
             for (auto jt = it; jt != fp.end(); ++jt)
                 heldPages.at(static_cast<size_t>(pg)).push_back(*jt);
@@ -657,6 +658,18 @@ StorageStatistics StorageManager::getStatistics(CacheLevel level, PoolGroupIndex
     int evictable = lvl.controller.numEvictablePages(pgIdx);
     auto sizes = lvl.storage->slotSize(pgIdx);
     return StorageStatistics{sizes, totalSlots, freeSlots, evictable};
+}
+
+std::vector<float> StorageManager::getUtilization(CacheLevel level) const
+{
+    std::vector<float> result;
+    result.reserve(static_cast<size_t>(numPoolGroups()));
+    for (int pg = 0; pg < numPoolGroups(); ++pg)
+    {
+        auto const s = getStatistics(level, static_cast<PoolGroupIndex>(pg));
+        result.push_back(s.total > 0 ? static_cast<float>(s.unavailable()) / static_cast<float>(s.total) : 0.f);
+    }
+    return result;
 }
 
 float StorageManager::getOverallUtilization(CacheLevel level) const

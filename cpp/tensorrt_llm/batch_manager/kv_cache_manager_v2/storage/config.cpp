@@ -107,6 +107,10 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
 
     // Map: lifeCycleId → (bufferSize → list of BufferId).
     // Outer map key is LifeCycleId; inner map key is expanded buffer size.
+    // NOTE: Python uses insertion-ordered dict/defaultdict here. The std::map
+    // grouping below intentionally remains sorted, which can make observable
+    // pool-group indices/layout order differ from Python. Later lookups use
+    // StorageConfig mappings, so this is not expected to affect correctness.
     std::map<LifeCycleId, std::map<size_t, std::vector<BufferId>>> bufferGroups;
     std::unordered_map<BufferId, int, BufferIdHash> expansionMap;
 

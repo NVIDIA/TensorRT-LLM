@@ -202,6 +202,7 @@ public:
     // C++ takes a single pgIdx for flexibility; the nanobind wrapper loops over
     // all pool groups to match Python's signature.
     StorageStatistics getStatistics(CacheLevel level = kGpuLevel, PoolGroupIndex pgIdx = 0) const;
+    std::vector<float> getUtilization(CacheLevel level = kGpuLevel) const;
     float getOverallUtilization(CacheLevel level = kGpuLevel) const;
 
     // Pool-group slot count (number of pages).

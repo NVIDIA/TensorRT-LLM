@@ -108,7 +108,7 @@ public:
     // physMemAllocator: shared allocator for physical chunks.
     // initNumPhysMem: number of physical chunks to map immediately.
     VirtMem(size_t vmSize, PooledPhysMemAllocator& physMemAllocator, int initNumPhysMem = 0);
-    ~VirtMem();
+    ~VirtMem() noexcept;
 
     VirtMem(VirtMem const&) = delete;
     VirtMem& operator=(VirtMem const&) = delete;

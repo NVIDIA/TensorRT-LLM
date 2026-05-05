@@ -115,14 +115,9 @@ CUstream KvCache::cudaStream() const
     return *mCudaStream;
 }
 
-CachedCudaEvent KvCache::finishEvent()
+CachedCudaEvent KvCache::finishEvent() const
 {
-    assert(mCudaStream.has_value() && "finishEvent called on inactive KvCache");
-    // Lazily record one shared event per operation — mirrors Python's _record_event() context.
-    // CachedCudaEvent is copyable; all callers share the same underlying CUevent.
-    if (!mFinishEvent.has_value())
-        mFinishEvent = CachedCudaEvent(reinterpret_cast<CudaStream>(*mCudaStream));
-    return *mFinishEvent;
+    return mFinishEvent.value();
 }
 
 Priority KvCache::getPriority(BlockOrdinal ordinal, LifeCycleId lc) const
@@ -230,9 +225,12 @@ bool KvCache::resume(std::optional<CUstream> stream)
     assert(mCudaStream.has_value() && "cuda_stream is never set");
 
     // Check utilization against threshold.
-    float utilization = mManager->storage().getOverallUtilization(kGpuLevel);
+    auto const utilizations = mManager->storage().getUtilization(kGpuLevel);
+    float const utilization = utilizations.empty() ? 0.f : *std::max_element(utilizations.begin(), utilizations.end());
     if (utilization > mManager->config().maxUtilForResume)
+    {
         return false;
+    }
 
     auto& storageMgr = mManager->storage();
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
@@ -474,9 +472,8 @@ void KvCache::_snapshotSsmToTreeBlock(std::shared_ptr<Block> const& treeBlock, L
     auto srcPage = ssmLock->page();
     PoolGroupIndex pgIdx = static_cast<PoolGroupIndex>(storageMgr.getPoolGroupIndex(ssmLcId));
 
-    for (int lvlOff = 0; lvlOff < storageMgr.numCacheLevels(); ++lvlOff)
+    for (int lvlInt = static_cast<int>(srcPage->cacheLevel); lvlInt < storageMgr.numCacheLevels(); ++lvlInt)
     {
-        int lvlInt = (static_cast<int>(srcPage->cacheLevel) + lvlOff) % storageMgr.numCacheLevels();
         CacheLevel lvl = static_cast<CacheLevel>(lvlInt);
 
         Slot newSlot;
@@ -682,7 +679,6 @@ void KvCache::_increaseCapacity(int newNumBlocks, int newHistoryLength)
 
 void KvCache::_decreaseCapacity(int newNumBlocks)
 {
-    _resizePageIndexBuffers(newNumBlocks);
     while (static_cast<int>(mBlocks.size()) > newNumBlocks)
     {
         auto& sb = mBlocks.back();
@@ -692,6 +688,7 @@ void KvCache::_decreaseCapacity(int newNumBlocks)
         sb.treeBlock.reset();
         mBlocks.pop_back();
     }
+    _resizePageIndexBuffers(newNumBlocks);
 }
 
 HalfOpenRange KvCache::_getStaleRange(int historyLength, LifeCycle const& lc) const
@@ -1412,6 +1409,11 @@ void KvCache::setBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t*
         return;
     }
 
+    if (len < numBlocks)
+    {
+        throw std::invalid_argument("setBasePageIndexBuf: buffer length must be >= num_blocks");
+    }
+
     // Copy current indices into the external buffer (mirrors Python: buf[:length] = old_indices[:length]).
     int const* oldData = nullptr;
     int oldLen = 0;
@@ -1426,7 +1428,7 @@ void KvCache::setBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t*
         oldData = span.data();
         oldLen = span.len;
     }
-    int copyLen = std::min(oldLen, len);
+    int copyLen = std::min(oldLen, numBlocks);
     std::copy(oldData, oldData + copyLen, buf);
     std::fill(buf + copyLen, buf + len, kBadPageIndex);
     slot = Span<int>{buf, len};

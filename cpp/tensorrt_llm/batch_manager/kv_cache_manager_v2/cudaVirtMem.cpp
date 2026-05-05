@@ -119,9 +119,17 @@ VirtMem::VirtMem(size_t vmSize, PooledPhysMemAllocator& physMemAllocator, int in
     extend(initNumPhysMem);
 }
 
-VirtMem::~VirtMem()
+VirtMem::~VirtMem() noexcept
 {
-    destroy();
+    try
+    {
+        destroy();
+    }
+    catch (...)
+    {
+        // Destructors cannot surface CUDA cleanup failures. Explicit destroy()
+        // still reports them to match Python VirtMem.destroy().
+    }
 }
 
 void VirtMem::push(PooledPhysMemAllocator::PooledPhysMem handle)
@@ -195,12 +203,12 @@ void VirtMem::destroy()
     {
         return;
     }
-    cuCtxSynchronize();
+    cuCheck(cuCtxSynchronize());
     while (!mPhysHandles.empty())
     {
         pop();
     }
-    cuMemAddressFree(mAddr, mVmSize);
+    cuCheck(cuMemAddressFree(mAddr, mVmSize));
     mAddr = 0;
     mVmSize = 0;
 }

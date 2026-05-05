@@ -289,7 +289,7 @@ public:
         mCudaStream = stream;
     }
 
-    CachedCudaEvent finishEvent();
+    CachedCudaEvent finishEvent() const;
 
     // RAII scope guard for _record_event() context manager.
     // Sets mFinishEvent on construction, clears it on destruction (= Python's finally).

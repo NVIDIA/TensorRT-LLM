@@ -37,6 +37,7 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
+#include <optional>
 
 namespace nb = nanobind;
 namespace kv = tensorrt_llm::batch_manager::kv_cache_manager_v2;
@@ -44,18 +45,20 @@ namespace kv = tensorrt_llm::batch_manager::kv_cache_manager_v2;
 namespace tensorrt_llm::nanobind::batch_manager
 {
 
-// Helper: convert Python list of int|bytes to vector<TokenIdExt>.
+// Helper: convert a Python iterable of int|bytes to vector<TokenIdExt>.
 // nanobind's variant caster can't auto-convert bytes → DigestToken.
-static std::vector<kv::TokenIdExt> castTokenList(nb::list tokens)
+static std::vector<kv::TokenIdExt> castTokenIterable(nb::handle tokens)
 {
     std::vector<kv::TokenIdExt> vec;
-    vec.reserve(nb::len(tokens));
-    for (auto item : tokens)
+    for (auto item : nb::cast<nb::iterable>(tokens))
     {
         if (nb::isinstance<nb::bytes>(item))
         {
             auto b = nb::cast<nb::bytes>(item);
-            assert(nb::len(b) == kv::kDIGEST_LEN);
+            if (nb::len(b) != kv::kDIGEST_LEN)
+            {
+                throw std::invalid_argument("Token bytes must have length kDIGEST_LEN");
+            }
             kv::Digest d;
             std::memcpy(d.data(), b.c_str(), kv::kDIGEST_LEN);
             vec.emplace_back(kv::DigestToken(d));
@@ -68,8 +71,40 @@ static std::vector<kv::TokenIdExt> castTokenList(nb::list tokens)
     return vec;
 }
 
+static nb::object castLifeCycle(kv::LifeCycle const& lifeCycle)
+{
+    return std::visit([](auto const& concreteLifeCycle) { return nb::cast(concreteLifeCycle); }, lifeCycle);
+}
+
+static kv::KvCache::PriorityCb castPriorityCallback(kv::KvCacheManager const& manager, nb::object callback)
+{
+    if (callback.is_none())
+    {
+        return {};
+    }
+    if (!PyCallable_Check(callback.ptr()))
+    {
+        throw std::invalid_argument("custom_priority_callback must be callable");
+    }
+
+    kv::LifeCycleRegistry const* lifeCycles = &manager.lifeCycles();
+    return [callback = std::move(callback), lifeCycles](kv::BlockOrdinal ordinal, kv::LifeCycleId lifeCycleId)
+    {
+        nb::gil_scoped_acquire acquire;
+        return nb::cast<kv::Priority>(callback(ordinal, castLifeCycle(lifeCycles->getLifeCycle(lifeCycleId))));
+    };
+}
+
+static nb::tuple bufferIdTuple(kv::BufferId const& self)
+{
+    return nb::make_tuple(self.layerId, self.role);
+}
+
 void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 {
+    // Export the C++ debug mode as an immutable Python bool snapshot.
+    m.attr("NDEBUG") = nb::bool_(kv::gNdebug);
+
     // ---- Exceptions --------------------------------------------------------
     static nb::object sOutOfMemoryError = nb::exception<kv::OutOfMemoryError>(m, "OutOfMemoryError");
     static nb::object sHostOOMError = nb::exception<kv::HostOOMError>(m, "HostOOMError");
@@ -104,12 +139,87 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                              .value("SUSPENDED", kv::KvCache::Status::SUSPENDED)
                              .value("CLOSED", kv::KvCache::Status::CLOSED);
 
+    // ---- Life cycle helpers ------------------------------------------------
+    nb::class_<kv::HalfOpenRange>(m, "HalfOpenRange")
+        .def(nb::init<int, int>(), nb::arg("beg"), nb::arg("end"))
+        .def_ro("beg", &kv::HalfOpenRange::beg)
+        .def_ro("end", &kv::HalfOpenRange::end)
+        .def("__bool__", [](kv::HalfOpenRange const& self) { return static_cast<bool>(self); })
+        .def("__len__", &kv::HalfOpenRange::length)
+        .def("__eq__", &kv::HalfOpenRange::operator==);
+
+    nb::class_<kv::AttnLifeCycle>(m, "AttnLifeCycle")
+        .def(nb::init<std::optional<int>, int>(), nb::arg("window_size"), nb::arg("num_sink_blocks"))
+        .def_prop_ro("window_size", [](kv::AttnLifeCycle const& self) { return self.windowSize; })
+        .def_ro("num_sink_blocks", &kv::AttnLifeCycle::numSinkBlocks)
+        .def("get_stale_range", &kv::AttnLifeCycle::getStaleRange, nb::arg("history_length"),
+            nb::arg("tokens_per_block"))
+        .def("__eq__", &kv::AttnLifeCycle::operator==);
+
+    nb::class_<kv::SsmLifeCycle>(m, "SsmLifeCycle")
+        .def(nb::init<>())
+        .def(
+            "get_stale_range", &kv::SsmLifeCycle::getStaleRange, nb::arg("history_length"), nb::arg("tokens_per_block"))
+        .def("__eq__", &kv::SsmLifeCycle::operator==);
+
+    // ---- CUDA event --------------------------------------------------------
+    auto cachedCudaEvent
+        = nb::class_<kv::CachedCudaEvent>(m, "CachedCudaEvent")
+              .def(nb::init<kv::CudaStream>(), nb::arg("stream"))
+              .def("query_complete", &kv::CachedCudaEvent::queryComplete, nb::call_guard<nb::gil_scoped_release>())
+              .def("synchronize", &kv::CachedCudaEvent::synchronize, nb::call_guard<nb::gil_scoped_release>())
+              .def(
+                  "wait_in_stream",
+                  [](kv::CachedCudaEvent const& self, kv::CudaStream stream) { self.waitInStream(stream); },
+                  nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>())
+              .def("close", &kv::CachedCudaEvent::close)
+              .def("is_closed", &kv::CachedCudaEvent::isClosed);
+    cachedCudaEvent.attr("NULL") = kv::CachedCudaEvent::makeNull();
+
     // ---- BufferId ----------------------------------------------------------
     nb::class_<kv::BufferId>(m, "BufferId")
         .def(nb::init<kv::LayerId, kv::DataRole>(), nb::arg("layer_id"), nb::arg("role"))
-        .def_rw("layer_id", &kv::BufferId::layerId)
-        .def_rw("role", &kv::BufferId::role)
-        .def("__eq__", &kv::BufferId::operator==);
+        .def_ro("layer_id", &kv::BufferId::layerId)
+        .def_ro("role", &kv::BufferId::role)
+        .def("__len__", [](kv::BufferId const&) { return 2; })
+        .def(
+            "__getitem__",
+            [](kv::BufferId const& self, int index) -> nb::object
+            {
+                if (index < 0)
+                {
+                    index += 2;
+                }
+                if (index == 0)
+                {
+                    return nb::cast(self.layerId);
+                }
+                if (index == 1)
+                {
+                    return nb::cast(self.role);
+                }
+                throw nb::index_error("BufferId index out of range");
+            },
+            nb::arg("index"))
+        .def("__iter__",
+            [](kv::BufferId const& self)
+            { return nb::steal<nb::iterator>(PyObject_GetIter(bufferIdTuple(self).ptr())); })
+        .def("__hash__", [](kv::BufferId const& self) { return PyObject_Hash(bufferIdTuple(self).ptr()); })
+        .def(
+            "__eq__",
+            [](kv::BufferId const& self, nb::object other) -> nb::object
+            {
+                if (nb::isinstance<kv::BufferId>(other))
+                {
+                    return nb::bool_(self == nb::cast<kv::BufferId>(other));
+                }
+                if (PyTuple_Check(other.ptr()) && PyTuple_GET_SIZE(other.ptr()) == 2)
+                {
+                    return nb::bool_(PyObject_RichCompareBool(bufferIdTuple(self).ptr(), other.ptr(), Py_EQ) == 1);
+                }
+                return nb::not_implemented();
+            },
+            nb::arg("other"));
 
     // ---- Config structs ----------------------------------------------------
     // Helper: add __copy__ and __deepcopy__ for aggregate config types.
@@ -121,16 +231,22 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     nb::class_<kv::GpuCacheTierConfig>(m, "GpuCacheTierConfig")
         .def(nb::init<size_t>(), nb::arg("quota"))
-        .def_rw("quota", &kv::GpuCacheTierConfig::quota) DEF_COPY(kv::GpuCacheTierConfig);
+        .def_rw("quota", &kv::GpuCacheTierConfig::quota)
+        .def_prop_ro("tier", &kv::GpuCacheTierConfig::tier)
+        .def("assert_valid", &kv::GpuCacheTierConfig::assertValid) DEF_COPY(kv::GpuCacheTierConfig);
 
     nb::class_<kv::HostCacheTierConfig>(m, "HostCacheTierConfig")
         .def(nb::init<size_t>(), nb::arg("quota"))
-        .def_rw("quota", &kv::HostCacheTierConfig::quota) DEF_COPY(kv::HostCacheTierConfig);
+        .def_rw("quota", &kv::HostCacheTierConfig::quota)
+        .def_prop_ro("tier", &kv::HostCacheTierConfig::tier)
+        .def("assert_valid", &kv::HostCacheTierConfig::assertValid) DEF_COPY(kv::HostCacheTierConfig);
 
     nb::class_<kv::DiskCacheTierConfig>(m, "DiskCacheTierConfig")
         .def(nb::init<size_t, std::string>(), nb::arg("quota"), nb::arg("path"))
         .def_rw("quota", &kv::DiskCacheTierConfig::quota)
-        .def_rw("path", &kv::DiskCacheTierConfig::path) DEF_COPY(kv::DiskCacheTierConfig);
+        .def_rw("path", &kv::DiskCacheTierConfig::path)
+        .def_prop_ro("tier", &kv::DiskCacheTierConfig::tier)
+        .def("assert_valid", &kv::DiskCacheTierConfig::assertValid) DEF_COPY(kv::DiskCacheTierConfig);
 
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
         .def(nb::init<kv::DataRole, size_t, std::optional<int>>(), nb::arg("role"), nb::arg("size"),
@@ -176,13 +292,22 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("kv_caches", &kv::BatchDesc::kvCaches)
         .def_rw("system_prompt_length", &kv::BatchDesc::systemPromptLength) DEF_COPY(kv::BatchDesc);
 
+    nb::class_<kv::HelixConfig>(m, "HelixConfig")
+        .def(nb::init<int, int, int, int>(), nb::arg("helix_group_size"), nb::arg("helix_gpu_rank"),
+            nb::arg("helix_shard_size"), nb::arg("shared_comm_port"))
+        .def_rw("helix_group_size", &kv::HelixConfig::helixGroupSize)
+        .def_rw("helix_gpu_rank", &kv::HelixConfig::helixGpuRank)
+        .def_rw("helix_shard_size", &kv::HelixConfig::helixShardSize)
+        .def_rw("shared_comm_port", &kv::HelixConfig::sharedCommPort) DEF_COPY(kv::HelixConfig);
+
     nb::class_<kv::KVCacheManagerConfig>(m, "KVCacheManagerConfig")
         .def(
             "__init__",
             [](kv::KVCacheManagerConfig* cfg, int tokensPerBlock, int vocabSize,
                 std::vector<kv::CacheTierConfig> cacheTiers, nb::list layers, float maxUtilForResume,
                 bool enablePartialReuse, std::optional<kv::BatchDesc> typicalStep,
-                std::vector<kv::BatchDesc> constraints, int ssmReuseInterval)
+                std::vector<kv::BatchDesc> constraints, int ssmReuseInterval,
+                std::optional<kv::HelixConfig> helixConfig)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -201,11 +326,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->typicalStep = std::move(typicalStep);
                 cfg->constraints = std::move(constraints);
                 cfg->ssmReuseInterval = ssmReuseInterval;
+                cfg->helixConfig = std::move(helixConfig);
             },
             nb::arg("tokens_per_block"), nb::arg("vocab_size"), nb::arg("cache_tiers"), nb::arg("layers"),
             nb::arg("max_util_for_resume") = 0.97f, nb::arg("enable_partial_reuse") = true,
             nb::arg("typical_step") = std::nullopt, nb::arg("constraints") = std::vector<kv::BatchDesc>{},
-            nb::arg("ssm_reuse_interval") = 512)
+            nb::arg("ssm_reuse_interval") = 512, nb::arg("helix_config").none() = std::nullopt)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("vocab_size", &kv::KVCacheManagerConfig::vocabSize)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
@@ -215,6 +341,26 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
         .def_rw("ssm_reuse_interval", &kv::KVCacheManagerConfig::ssmReuseInterval)
+        .def_prop_rw(
+            "helix_config",
+            [](kv::KVCacheManagerConfig const& self) -> nb::object
+            {
+                if (!self.helixConfig.has_value())
+                {
+                    return nb::none();
+                }
+                return nb::cast(*self.helixConfig);
+            },
+            [](kv::KVCacheManagerConfig& self, nb::handle value)
+            {
+                if (value.is_none())
+                {
+                    self.helixConfig.reset();
+                    return;
+                }
+                self.helixConfig = nb::cast<kv::HelixConfig>(value);
+            },
+            nb::arg("helix_config").none())
         .def("validate", &kv::KVCacheManagerConfig::validate) DEF_COPY(kv::KVCacheManagerConfig);
 
 #undef DEF_COPY
@@ -241,13 +387,22 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("capacity"), nb::arg("history_length") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "commit",
-            [](kv::KvCache& self, nb::list tokens)
+            [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices)
             {
-                auto vec = castTokenList(tokens);
+                auto vec = castTokenIterable(acceptedInputTokens);
+                if (vec.empty())
+                {
+                    return;
+                }
+                if (!beamSearchIndices.is_none())
+                {
+                    PyErr_SetString(PyExc_AssertionError, "beam_search_indices must be None");
+                    throw nb::python_error();
+                }
                 nb::gil_scoped_release release;
                 self.commit(vec);
             },
-            nb::arg("tokens"))
+            nb::arg("accepted_input_tokens"), nb::arg("beam_search_indices").none() = nb::none())
         .def("stop_committing", &kv::KvCache::stopCommitting, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_base_page_indices",
@@ -260,6 +415,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 }
                 // Zero-copy: return a read-only numpy ndarray referencing the internal buffer.
                 // nb::handle() = no owner; the returned array does not own the data.
+                // Contract: callers must keep the KvCache alive and must not mutate/resize it
+                // while using this view. The view is intended for read-only use, matching the
+                // practical use of Python's array.array/memoryview index buffers.
                 // TODO(yaoy): switch to nb::ndarray<nb::memview> when we have nanobind >= 2.9.0,
                 // or nb::memoryview for nanobind >= 2.12.0.
                 return nb::ndarray<nb::numpy, int const, nb::ndim<1>>(
@@ -269,6 +427,21 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("get_ssm_block_base_index", &kv::KvCache::getSsmBlockBaseIndex, nb::arg("layer_group_id"),
             nb::arg("beam_id") = 0, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("status", [](kv::KvCache const& kvc) { return kvc.status(); })
+        .def_prop_ro("is_active", &kv::KvCache::isActive)
+        .def_prop_ro("finish_event",
+            [](kv::KvCache const& self)
+            {
+                try
+                {
+                    return self.finishEvent();
+                }
+                catch (std::bad_optional_access const&)
+                {
+                    // Python unwrap_optional(None) raises ValueError with this message.
+                    PyErr_SetString(PyExc_ValueError, "Expected non-None value");
+                    throw nb::python_error();
+                }
+            })
         .def_prop_ro("num_blocks", &kv::KvCache::numBlocks)
         .def_prop_ro("num_committed_blocks", &kv::KvCache::numCommittedBlocks)
         .def_prop_ro("num_committed_tokens", &kv::KvCache::numCommittedTokens)
@@ -367,6 +540,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "get_ratio_list",
             [](kv::StorageManager const& self, kv::CacheLevel level) { return self.getRatioList(level); },
             nb::arg("level") = kv::kGpuLevel, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "get_utilization",
+            [](kv::StorageManager const& self, kv::CacheLevel level) { return self.getUtilization(level); },
+            nb::arg("level") = kv::kGpuLevel, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("num_pool_groups", [](kv::StorageManager const& self) { return self.numPoolGroups(); })
         .def_prop_ro("num_cache_levels", [](kv::StorageManager const& self) { return self.numCacheLevels(); });
 
@@ -379,16 +556,19 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "create_kv_cache",
             [](kv::KvCacheManager& self, std::optional<int64_t> loraTaskId, nb::object inputTokens,
-                std::optional<int64_t> id, kv::KvCache::PriorityCb priorityCb)
+                std::optional<int64_t> id, nb::object customPriorityCallback)
             {
                 std::vector<kv::TokenIdExt> tokens;
-                if (!inputTokens.is_none() && nb::isinstance<nb::list>(inputTokens))
-                    tokens = castTokenList(nb::cast<nb::list>(inputTokens));
+                if (!inputTokens.is_none())
+                {
+                    tokens = castTokenIterable(inputTokens);
+                }
+                kv::KvCache::PriorityCb priorityCb = castPriorityCallback(self, std::move(customPriorityCallback));
                 nb::gil_scoped_release release;
                 return self.createKvCache(loraTaskId, tokens, id, std::move(priorityCb));
             },
             nb::arg("lora_task_id") = std::nullopt, nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,
-            nb::arg("priority_cb") = kv::KvCache::PriorityCb{})
+            nb::arg("custom_priority_callback") = nb::none())
         .def("get_mem_pool_base_address", &kv::KvCacheManager::getMemPoolBaseAddress, nb::arg("layer_id"),
             nb::arg("data_role"), nb::call_guard<nb::gil_scoped_release>())
         .def("get_page_stride", &kv::KvCacheManager::getPageStride, nb::arg("layer_id"), nb::arg("data_role"))
@@ -403,6 +583,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("all_buffer_ids", &kv::KvCacheManager::allBufferIds)
         .def("clamp_max_seq_len_for_mem", &kv::KvCacheManager::clampMaxSeqLenForMem, nb::arg("batch_size"),
             nb::arg("token_num_upper_bound"), nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("allow_seq_rebasing", &kv::KvCacheManager::allowSeqRebasing)
         .def_prop_ro("enable_partial_match", &kv::KvCacheManager::enablePartialMatch)
         .def_prop_ro("ssm_reuse_interval", &kv::KvCacheManager::ssmReuseInterval)
         .def_prop_ro("num_layers", &kv::KvCacheManager::numLayers)
@@ -424,6 +605,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 return self.getAggregatedPages(ids);
             },
             nb::arg("buffers"))
+        .def("adjust", &kv::KvCacheManager::adjust, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("need_adjustment", &kv::KvCacheManager::needAdjustment)
         .def_prop_ro(
             "_radix_tree", [](kv::KvCacheManager& self) -> kv::BlockRadixTree& { return self.radixTree(); },
             nb::rv_policy::reference_internal)
