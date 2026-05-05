@@ -495,11 +495,14 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         // 5. send the buffer to the corresponding target. Ideally, we send only once (one buffer) for each target.
 
         // RAII wrapper mirrors the receiver-side pattern. Happy-path calls
-        // sendHolder.release() after sendAllBuffers returns; any other exit
-        // between acquire and release auto-releases via ~BufferIndexHolder.
-        // The send-pool CV wait inside assignBufferIndexForSend observes the
-        // session's per-request cancel flag and throws on cancel (parity
-        // with the recv side).
+        // sendHolder.release() after sendAllBuffers returns. If sendAllBuffers
+        // exits through an exception while an AgentConnection (NIXL) is
+        // active, transport quiescence is unknown and the catch block below
+        // poisons the held slot instead of returning it to the pool; on the
+        // direct-UCX path (no AgentConnection) the holder's destructor falls
+        // back to release. The send-pool CV wait inside
+        // assignBufferIndexForSend observes the session's per-request cancel
+        // flag and throws on cancel (parity with the recv side).
         auto const sendReqIdForLog = std::make_optional(static_cast<uint64_t>(llmRequest.mRequestId));
         auto const* sendCancelFlag = &session.getDataContext().getTransferTerminate();
         auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend(
