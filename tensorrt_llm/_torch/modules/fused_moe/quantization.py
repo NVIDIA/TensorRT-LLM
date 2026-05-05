@@ -1109,21 +1109,58 @@ class TritonFP8BlockScaleFusedMoEMethod(DeepSeekFP8BlockScalesFusedMoEMethod):
     eplb_support_status = EplbSupportStatus.NOT_VERIFIED
 
     def post_load_weights(self, module: torch.nn.Module):
-        # Ensure all four tensors are .contiguous() — Kernel B/C wrappers wrap
-        # them via DLPack and call `.is_contiguous()` assertions.
+        # Pre-split w3_w1 into gate (= w1) + up (= w3) and store as separate
+        # contiguous tensors on the module so that `_forward_glm5_fused()`
+        # doesn't re-slice + .contiguous() every call.
+        #
+        # Without this, slicing `[:, N:, :]` returns a non-contiguous view
+        # and `.contiguous()` allocates ~768 MB FP8 + 384 MB FP8 fresh per
+        # call.  Multiplied by 78 MoE layers and CUDA Graph capture for
+        # multiple warmup shapes, the engine OOMs at executor init
+        # (observed: 178 GiB / 178 GiB used). See MOE_FUSION_DESIGN.md
+        # §7.14 for the diagnosis.
         super().post_load_weights(module)
-        for attr in (
-                "w3_w1_weight",
-                "w2_weight",
-                "w3_w1_weight_scaling_factor",
-                "w2_weight_scaling_factor",
-        ):
-            t = getattr(module, attr, None)
-            if t is None:
-                continue
-            data = t.data if hasattr(t, "data") else t
-            if not data.is_contiguous():
-                data.copy_(data.contiguous())
+
+        N = module.intermediate_size_per_partition
+        N_blk = N // 128
+
+        # `w3_w1_weight` layout from `load_expert_all_weight_scale_fp8_block_scale`
+        # is `[E, 2N, H]` with the first N rows = w3 (up_proj) and the next
+        # N rows = w1 (gate_proj).  Same chunk(2, dim=0) ordering for the
+        # block-scale tensor.
+        w3_w1 = module.w3_w1_weight  # [E, 2N, H] fp8
+        w3_w1_scale = module.w3_w1_weight_scaling_factor  # [E, 2*N_blk, H_blk] fp32
+
+        # Use .clone() to get a fresh contiguous tensor (rather than
+        # `.contiguous()` + the original alias).  Pre-allocated once per
+        # module at load time.
+        gate_weight = w3_w1[:, N:, :].clone().contiguous()  # = w1 (gate_proj)
+        up_weight = w3_w1[:, :N, :].clone().contiguous()  # = w3 (up_proj)
+        gate_scale = w3_w1_scale[:, N_blk:, :].clone().contiguous()
+        up_scale = w3_w1_scale[:, :N_blk, :].clone().contiguous()
+
+        # Store as Parameters so they're recognized in the module state dict
+        # and survive .to(device) calls, but mark requires_grad=False.
+        module._glm5_gate_weight = torch.nn.Parameter(gate_weight,
+                                                      requires_grad=False)
+        module._glm5_up_weight = torch.nn.Parameter(up_weight,
+                                                    requires_grad=False)
+        module._glm5_gate_scale = torch.nn.Parameter(gate_scale,
+                                                     requires_grad=False)
+        module._glm5_up_scale = torch.nn.Parameter(up_scale,
+                                                   requires_grad=False)
+
+        # Free the original concatenated w3_w1 / w3_w1_scale: the GLM-5
+        # fused path reads only the pre-split tensors above; the fallback
+        # (quant_method.apply for M > 16) also doesn't yet consume them
+        # successfully (raises NotImplementedError — separate Phase-3.1
+        # followup, see §7.14).  Reclaiming this memory is what makes the
+        # engine init fit in 178 GiB after the per-layer pre-split copies.
+        module.w3_w1_weight = None
+        module.w3_w1_weight_scaling_factor = None
+
+        # w2_weight and its scale stay as-is — Kernel C consumes them
+        # directly with no slicing.
 
 
 def resmooth_and_transform_fp8_scale(

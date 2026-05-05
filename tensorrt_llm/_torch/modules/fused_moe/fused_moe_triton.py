@@ -1589,13 +1589,10 @@ class TritonFusedMoE(MoE):
         assert use_dp_padding is None or not use_dp_padding, \
             "TritonFusedMoE does not support use_dp_padding=True"
 
-        # GLM-5 fused path is decode-only (M ≤ 16). Prefill warmup passes
-        # M=8192 etc. through here too — kernels B/C were not validated above
-        # M=16 and crash with CUDA_ERROR_ILLEGAL_ADDRESS at large M (see
-        # MOE_FUSION_DESIGN.md §7.13 Phase 3 known-issue). Fall through to
-        # quant_method for those.
-        _M = x.shape[0]
-        if getattr(self, "_glm5_fused_path", False) and _M <= 16:
+        # GLM-5 fused path now chunks-by-16 internally (see _forward_glm5_fused),
+        # so it handles any M.  The fallback path was used while we worked out
+        # the prefill story; it remains for non-GLM-5 cases.
+        if getattr(self, "_glm5_fused_path", False):
             hidden_states = self._forward_glm5_fused(x, router_logits)
         else:
             hidden_states = self.quant_method.apply(self, x, router_logits)
@@ -1634,37 +1631,69 @@ class TritonFusedMoE(MoE):
             self.routing_method.routing_impl.routed_scaling_factor)
         top_k = self.routing_method.top_k
 
-        # Slice w3_w1 = [E, 2N, H] into gate (= w1 half = upper half) and
-        # up (= w3 half = lower half) per the chunk(2, dim=0) ordering used
-        # by `DeepSeekFP8BlockScalesFusedMoEMethod.load_expert_all_weight_scale_fp8_block_scale`.
-        N = self.intermediate_size_per_partition
-        w3_w1 = self.w3_w1_weight  # [E, 2N, H]  fp8
-        w3_w1_scale = self.w3_w1_weight_scaling_factor  # [E, 2*(N//128), H//128] fp32
+        # Read pre-split contiguous tensors that
+        # `TritonFP8BlockScaleFusedMoEMethod.post_load_weights()` set up
+        # at load time.  This avoids re-slicing + .contiguous() per call,
+        # which would allocate fresh FP8 weight copies (~768 MB / call)
+        # under CUDA Graph capture and OOM the executor at engine init.
+        # See MOE_FUSION_DESIGN.md §7.14.
+        gate_weight = self._glm5_gate_weight
+        up_weight = self._glm5_up_weight
+        gate_scale = self._glm5_gate_scale
+        up_scale = self._glm5_up_scale
 
-        gate_weight = w3_w1[:, N:, :].contiguous()  # = w1 (gate_proj)
-        up_weight = w3_w1[:, :N, :].contiguous()  # = w3 (up_proj)
-        N_blk = N // 128
-        gate_scale = w3_w1_scale[:, N_blk:, :].contiguous()
-        up_scale = w3_w1_scale[:, :N_blk, :].contiguous()
+        # Kernels B/C were validated only at M ∈ {1,4,8,16} (per
+        # MOE_FUSION_DESIGN.md §7.8 §7.9).  Engine warmup runs prefill at
+        # M=8192 which would crash the kernels.  Chunk inputs to ≤16-token
+        # batches so any M works; this is fine for warmup (one-shot init
+        # cost) and for real prefill (1024-token prompt → 64 chunks ×
+        # ~14 µs/layer = ~70 ms total prefill MoE — non-critical path).
+        # AllReduce is still done ONCE after this function returns (in
+        # `forward_impl` via `reducescatter_or_allreduce`).
+        x_2d_c = x_2d.contiguous()
+        # Router logits are flat in M too (already [M, E]).
+        if router_logits.dim() == 3:
+            rl_2d = router_logits.view(-1, router_logits.shape[-1])
+        else:
+            rl_2d = router_logits
 
-        # Pass `residual=None` so Kernel C does NOT add the input as a
-        # residual — the TRT-LLM MoE contract returns only the MoE
-        # contribution; the surrounding decoder layer (DecoderLayer.forward)
-        # adds the residual.
-        out = glm5_fused_moe_apply(
-            x=x_2d.contiguous(),
-            router_logits=router_logits,
-            e_score_correction_bias=bias,
-            gate_weight_per_expert=gate_weight,
-            up_weight_per_expert=up_weight,
-            gate_scale_per_expert=gate_scale,
-            up_scale_per_expert=up_scale,
-            down_weight_per_expert=self.w2_weight,
-            down_scale_per_expert=self.w2_weight_scaling_factor,
-            residual=None,
-            top_k=top_k,
-            routed_scaling_factor=routed_scaling_factor,
-        )
+        M_total = x_2d_c.shape[0]
+        CHUNK = 16
+        if M_total <= CHUNK:
+            out = glm5_fused_moe_apply(
+                x=x_2d_c,
+                router_logits=rl_2d,
+                e_score_correction_bias=bias,
+                gate_weight_per_expert=gate_weight,
+                up_weight_per_expert=up_weight,
+                gate_scale_per_expert=gate_scale,
+                up_scale_per_expert=up_scale,
+                down_weight_per_expert=self.w2_weight,
+                down_scale_per_expert=self.w2_weight_scaling_factor,
+                residual=None,
+                top_k=top_k,
+                routed_scaling_factor=routed_scaling_factor,
+            )
+        else:
+            chunks = []
+            for start in range(0, M_total, CHUNK):
+                end = min(start + CHUNK, M_total)
+                chunks.append(
+                    glm5_fused_moe_apply(
+                        x=x_2d_c[start:end],
+                        router_logits=rl_2d[start:end],
+                        e_score_correction_bias=bias,
+                        gate_weight_per_expert=gate_weight,
+                        up_weight_per_expert=up_weight,
+                        gate_scale_per_expert=gate_scale,
+                        up_scale_per_expert=up_scale,
+                        down_weight_per_expert=self.w2_weight,
+                        down_scale_per_expert=self.w2_weight_scaling_factor,
+                        residual=None,
+                        top_k=top_k,
+                        routed_scaling_factor=routed_scaling_factor,
+                    ))
+            out = torch.cat(chunks, dim=0)
         # Restore original input rank if caller passed [B, S, H].
         if x.dim() == 3:
             return out.view(x.shape)
