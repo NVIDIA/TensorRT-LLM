@@ -2145,6 +2145,9 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         elif audios is not None:
             modality_type = "audio"
             input_ids, modality_data = self._process_audio(text_prompt, audios)
+            modality_data["evs_ids"] = (
+                input_ids[0].to(torch.int32) if self.video_pruning_rate > 0 else None
+            )
 
         # Will package inputs for language model forward in AGGREGATE mode.
         multimodal_data = {}
@@ -2514,20 +2517,26 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         if "video" not in modalities:
             return input_ids
 
-        evs_ids_lst = [
-            multimodal_data[modality]["evs_ids"]
-            for modality, multimodal_data in zip(modalities, multimodal_data_lst)
-        ]
+        evs_ids_lst = []
+        for modality, multimodal_data in zip(modalities, multimodal_data_lst, strict=True):
+            if modality not in ("image", "video", "audio"):
+                raise ValueError(f"Unsupported modality for EVS merge: {modality}")
+            evs_ids = multimodal_data[modality].get("evs_ids")
+            if evs_ids is None:
+                raise ValueError(
+                    f"Missing evs_ids for {modality} modality while merging EVS inputs."
+                )
+            evs_ids_lst.append(evs_ids)
         # Iterate over batch, replacing video_context_token_id placeholders with
         # the actual per-tubelet img_context_token counts from EVS.
         context_parts = []
         for multimodal_param, evs_ids, modality, num_tokens_in_video in zip(
-            multimodal_params, evs_ids_lst, modalities, num_tokens_in_videos
+            multimodal_params, evs_ids_lst, modalities, num_tokens_in_videos, strict=True
         ):
-            # Image modality: keep input_ids unchanged during inflight-batching.
-            if modality == "image":
+            # Image/audio modalities: keep input_ids unchanged during inflight-batching.
+            if modality in ("image", "audio"):
                 context_ids = evs_ids
-            else:
+            elif modality == "video":
                 # evs_ids is a flat 1-D tensor built at token-ID level.
                 # Find placeholder positions and replace each with the EVS count.
                 request_context_parts = []
@@ -2555,6 +2564,8 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                 if prev_end < len(evs_ids):
                     request_context_parts.append(evs_ids[prev_end:])
                 context_ids = torch.cat(request_context_parts, dim=0)
+            else:
+                raise ValueError(f"Unsupported modality for EVS merge: {modality}")
 
             runtime = multimodal_param.multimodal_runtime
             if runtime is not None:

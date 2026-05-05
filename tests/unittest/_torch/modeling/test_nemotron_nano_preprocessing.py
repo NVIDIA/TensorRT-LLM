@@ -520,6 +520,21 @@ class TestAudioInputProcessor:
             "audio_num_clips",
         } <= audio_inputs.keys()
 
+    def test_call_audio_stashes_evs_ids_when_evs_enabled(self):
+        proc = _make_audio_processor()
+        proc.video_pruning_rate = 0.5
+        audio = np.random.randn(16000).astype(np.float32)
+        inputs = {
+            "prompt": f"Listen: {AUDIO_PLACEHOLDER}",
+            "multi_modal_data": {"audio": [(audio, 16000)]},
+        }
+
+        input_ids, extra_inputs = proc(inputs, None)
+
+        evs_ids = extra_inputs["multimodal_data"]["audio"]["evs_ids"]
+        assert evs_ids.dtype == torch.int32
+        assert evs_ids.tolist() == input_ids
+
     def test_process_audio_raises_without_sound_config(self):
         proc = _make_audio_processor()
         proc._audio_extractor = None
@@ -799,6 +814,9 @@ class TestGetNumTokensPerVideoTemporal:
 # Arbitrary token IDs used across the merge_evs tests.
 _IMG_CTX_ID = 20
 _VIDEO_CTX_ID = 21
+_SOUND_CTX_ID = 30
+_SOUND_START = 200
+_SOUND_END = 201
 _TEXT_TOKEN = 99  # stand-in for any non-special token
 _IMG_START = 50
 _IMG_END = 51
@@ -809,6 +827,7 @@ def _make_merge_model():
     model = mock.MagicMock(spec=NemotronH_Nano_VL_V2)
     model.img_context_token_id = _IMG_CTX_ID
     model.video_context_token_id = _VIDEO_CTX_ID
+    model.sound_context_token_id = _SOUND_CTX_ID
     return model
 
 
@@ -907,6 +926,43 @@ class TestMergeEvsMMEmbeds:
             + [_IMG_END]
             # Image: passthrough
             + [10, 11],
+            dtype=torch.long,
+        )
+        assert result.shape == input_ids.shape
+        assert (result[: len(expected)] == expected).all()
+
+    def test_mixed_audio_video_batch(self):
+        """Audio entry passes through; video entry gets placeholders replaced."""
+        model = _make_merge_model()
+        video_evs = torch.tensor(
+            [
+                _TEXT_TOKEN,
+                _IMG_START,
+                _VIDEO_CTX_ID,
+                _IMG_END,
+            ],
+            dtype=torch.long,
+        )
+        audio_evs = torch.tensor(
+            [_SOUND_START, _SOUND_CTX_ID, _SOUND_CTX_ID, _SOUND_END],
+            dtype=torch.long,
+        )
+        params = [
+            _make_mm_param("video", video_evs),
+            _make_mm_param("audio", audio_evs),
+        ]
+        num_tokens_in_videos = [torch.tensor([2]), None]
+        input_ids = torch.zeros(20, dtype=torch.long)
+
+        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+            model, num_tokens_in_videos, params, input_ids
+        )
+
+        expected = torch.tensor(
+            [_TEXT_TOKEN, _IMG_START]
+            + [_IMG_CTX_ID] * 2
+            + [_IMG_END]
+            + [_SOUND_START, _SOUND_CTX_ID, _SOUND_CTX_ID, _SOUND_END],
             dtype=torch.long,
         )
         assert result.shape == input_ids.shape
