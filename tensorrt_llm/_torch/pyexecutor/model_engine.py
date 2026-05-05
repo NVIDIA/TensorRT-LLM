@@ -4152,16 +4152,14 @@ class PyTorchModelEngine(ModelEngine):
         """Apply logit post processors (in-place modify outputs Tensors) if any.
 
         For beam search (beam_width > 1), iterates over all beams for each
-        request and passes per-beam token histories to the callback.  The
-        logits tensor has ``beam_width`` rows per generation request, laid
+        request and passes coherent per-beam token histories to the callback.
+        The logits tensor has ``beam_width`` rows per generation request, laid
         out as ``[ctx_0, ..., gen_0_beam_0, gen_0_beam_1, ..., gen_1_beam_0, ...]``.
 
-        Note: ``request.get_tokens(beam)`` returns slot-accumulated histories
-        that are NOT coherent after beam reassignment.  Logits processors
-        that need coherent histories must track beam ancestry internally
-        (e.g., via ``on_beam_reassignment`` callbacks).  The processor
-        receives ``client_id=beam_idx`` so it knows which beam is being
-        processed.
+        Coherent histories are built by PyExecutor._update_requests using
+        predecessor_beams tracing, stored in ``request.py_coherent_beam_tokens``.
+        This gives logits processors the same semantics as HF beam search:
+        each beam's token_ids is the true ancestral token path.
 
         Args:
             skip_beam_search: When True, skip requests with beam_width > 1.
@@ -4228,16 +4226,22 @@ class PyTorchModelEngine(ModelEngine):
                 logits_block = logits_tensor[logit_row:logit_row + beam_width]
                 # Shape: [1, beam_width, vocab] to match TRT backend convention.
                 logits_block_3d = logits_block.view(1, beam_width, vocab_size)
-                all_beam_token_ids = [
-                    request.get_tokens(beam) for beam in range(beam_width)
-                ]
-                # Pass predecessor beam indices (set by PyExecutor._update_requests
-                # after the previous sampling step) so the logits processor can
-                # correctly remap per-beam state after beam reassignment.
-                predecessor_beams = getattr(request, 'py_predecessor_beams', None)
+
+                # Use coherent per-beam token histories (built by
+                # PyExecutor._update_requests using predecessor_beams
+                # tracing) so logits processors see correct ancestral
+                # paths — same semantics as HF's beam search input_ids.
+                # Falls back to raw slot histories for the first call
+                # (before any beam reassignment has occurred).
+                coherent = getattr(request, 'py_coherent_beam_tokens', None)
+                if coherent is not None and len(coherent) == beam_width:
+                    all_beam_token_ids = coherent
+                else:
+                    all_beam_token_ids = [
+                        request.get_tokens(beam) for beam in range(beam_width)
+                    ]
+
                 for lp in logits_processors:
-                    if predecessor_beams is not None and hasattr(lp, 'set_predecessor_beams'):
-                        lp.set_predecessor_beams(predecessor_beams)
                     lp_params = inspect.signature(lp).parameters
                     assert 4 <= len(lp_params) <= 5, (
                         "Logit post processor signature must match the `LogitsProcessor` interface "
