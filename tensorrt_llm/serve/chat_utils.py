@@ -149,8 +149,8 @@ def parse_chat_message_content_part(
         str_content = cast(str, content)
         image_kwargs = resolve_media_io_kwargs(
             mm_data_tracker._multimodal_server_config,
-            mm_data_tracker._request_media_io_kwargs, "image")
-        logger.debug("effective image_kwargs: %s", image_kwargs)
+            mm_data_tracker.request_media_io_kwargs, "image")
+        logger.debug("effective image_kwargs keys: %s", sorted(image_kwargs))
         return MultimodalData(modality="image",
                               data=async_load_image(str_content,
                                                     **image_kwargs),
@@ -170,8 +170,8 @@ def parse_chat_message_content_part(
         str_content = cast(str, content)
         video_kwargs = resolve_media_io_kwargs(
             mm_data_tracker._multimodal_server_config,
-            mm_data_tracker._request_media_io_kwargs, "video")
-        logger.debug("effective video_kwargs: %s", video_kwargs)
+            mm_data_tracker.request_media_io_kwargs, "video")
+        logger.debug("effective video_kwargs keys: %s", sorted(video_kwargs))
         return MultimodalData(modality="video",
                               data=async_load_video(str_content,
                                                     **video_kwargs),
@@ -181,8 +181,8 @@ def parse_chat_message_content_part(
         str_content = cast(str, content)
         audio_kwargs = resolve_media_io_kwargs(
             mm_data_tracker._multimodal_server_config,
-            mm_data_tracker._request_media_io_kwargs, "audio")
-        logger.debug("effective audio_kwargs: %s", audio_kwargs)
+            mm_data_tracker.request_media_io_kwargs, "audio")
+        logger.debug("effective audio_kwargs keys: %s", sorted(audio_kwargs))
         return MultimodalData(modality="audio",
                               data=async_load_audio(str_content,
                                                     **audio_kwargs),

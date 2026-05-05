@@ -618,6 +618,11 @@ class MultimodalDataTracker:
         # time; see `resolve_media_io_kwargs` in `serve/chat_utils.py`.
         self._request_media_io_kwargs = request_media_io_kwargs
 
+    @property
+    def request_media_io_kwargs(self) -> Optional[Dict[str, Dict[str, Any]]]:
+        """Per-request `media_io_kwargs` override, or `None` if not set."""
+        return self._request_media_io_kwargs
+
     async def retrieve_all_async(
         self
     ) -> tuple[Optional[Dict[str, List[Any]]], Optional[Dict[str, List[Any]]]]:

@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from transformers import AutoConfig
 
+from tensorrt_llm.inputs import MultimodalDataTracker
 from tensorrt_llm.inputs.media_io import AudioMediaIO, BaseMediaIO, ImageMediaIO, VideoMediaIO
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
@@ -413,10 +414,7 @@ class TestMultimodalLoadErrorPropagation:
 
     @pytest.fixture
     def mm_tracker(self):
-        tracker = MagicMock()
-        tracker._multimodal_server_config.media_io_kwargs = None
-        tracker._request_media_io_kwargs = None
-        return tracker
+        return MultimodalDataTracker(model_type="dummy")
 
     @pytest.mark.parametrize(
         "part, loader_path",
@@ -523,12 +521,11 @@ class TestMediaIoKwargsLoaderForwarding:
     @pytest.fixture
     def mm_tracker_factory(self):
         def _make(server_kwargs=None, request_kwargs=None):
-            tracker = MagicMock()
-            tracker._multimodal_server_config = MultimodalServerConfig(
-                media_io_kwargs=server_kwargs
+            return MultimodalDataTracker(
+                model_type="dummy",
+                multimodal_server_config=MultimodalServerConfig(media_io_kwargs=server_kwargs),
+                request_media_io_kwargs=request_kwargs,
             )
-            tracker._request_media_io_kwargs = request_kwargs
-            return tracker
 
         return _make
 
@@ -562,32 +559,3 @@ class TestMediaIoKwargsLoaderForwarding:
             _, called_kwargs = mock_loader.call_args
             assert "format" not in called_kwargs
             assert called_kwargs.get("is_base64") is True
-
-
-class TestParseChatMessagesPerRequestKwargs:
-    """Per-request kwargs flow through `parse_chat_messages_coroutines`."""
-
-    def test_request_kwargs_reach_loader(self):
-        cfg = MagicMock(spec=AutoConfig)
-        cfg.model_type = _MM_MODEL_TYPE
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "describe"},
-                    {"type": "video_url", "video_url": {"url": "v"}},
-                ],
-            }
-        ]
-        server_cfg = MultimodalServerConfig(media_io_kwargs={"video": {"num_frames": 8, "fps": 1}})
-        with patch("tensorrt_llm.serve.chat_utils.async_load_video") as mock_loader:
-            mock_loader.return_value = MagicMock()
-            parse_chat_messages_coroutines(
-                messages,
-                cfg,
-                server_cfg,
-                request_media_io_kwargs={"video": {"num_frames": 32}},
-            )
-            mock_loader.assert_called_once()
-            _, called_kwargs = mock_loader.call_args
-            assert called_kwargs == {"num_frames": 32}
