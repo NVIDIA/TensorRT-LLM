@@ -29,7 +29,7 @@ from pydantic import Field
 from torch.fx import GraphModule, Node
 
 try:
-    from .....quantization.utils.fp8_utils import (
+    from tensorrt_llm.quantization.utils.fp8_utils import (
         resmooth_to_fp8_e8m0,
         transform_sf_into_required_layout,
     )
