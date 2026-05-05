@@ -329,6 +329,49 @@ def test_mhc_pre_mapping(n: int, hidden_size: int, hc_mult: int):
     torch.testing.assert_close(layer_input_ref, layer_input_cuda, rtol=1e-4, atol=1e-3)
 
 
+@pytest.mark.parametrize("n", [64])
+@pytest.mark.parametrize("hidden_size", [7168])
+@pytest.mark.parametrize("hc_mult", [4])
+def test_mhc_pre_mapping_pro_hidden_size(n: int, hidden_size: int, hc_mult: int):
+    test_data = generate_pre_data(
+        n=n,
+        hc_mult=hc_mult,
+        hidden_size=hidden_size,
+    )
+
+    test_module = mHC(
+        mult=hc_mult,
+        hidden_size=hidden_size,
+        sinkhorn_iters=test_data["sinkhorn_repeat"],
+        dtype=None,
+        eps=test_data["hc_pre_eps"],
+        norm_eps=test_data["rms_eps"],
+        post_mult_value=test_data["hc_post_mult_value"],
+    ).cuda()
+    test_module.fn.copy_(test_data["fn"])
+    test_module.scale.copy_(test_data["hc_scale"])
+    test_module.base.copy_(test_data["hc_base"])
+
+    residual = test_data["residual"]
+
+    post_mix_cuda, comb_mix_cuda, layer_input_cuda = test_module.pre_mapping(residual)
+    post_mix_ref, comb_mix_ref, layer_input_ref = vanilla_pre_mapping(
+        residual,
+        test_data["fn"],
+        test_data["hc_scale"],
+        test_data["hc_base"],
+        hc_mult,
+        test_data["rms_eps"],
+        test_data["hc_pre_eps"],
+        test_data["hc_sinkhorn_eps"],
+        test_data["hc_post_mult_value"],
+        test_data["sinkhorn_repeat"],
+    )
+    torch.testing.assert_close(post_mix_ref, post_mix_cuda, rtol=1e-4, atol=1e-3)
+    torch.testing.assert_close(comb_mix_ref, comb_mix_cuda, rtol=1e-3, atol=5e-3)
+    torch.testing.assert_close(layer_input_ref, layer_input_cuda, rtol=1e-4, atol=1e-3)
+
+
 @pytest.mark.parametrize("n", [64, 128, 4096, 8192])
 @pytest.mark.parametrize("hidden_size", [7168])
 @pytest.mark.parametrize("hc_mult", [4])
@@ -476,8 +519,26 @@ _BACKEND_TACTICS_BY_M = {
 }
 
 
+def test_mhc_fused_hc_mma_tactic_filter_hidden_sizes():
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import (
+        _FUSED_HC_HALF_MMA_KS,
+        _fused_hc_mma_ks_supported,
+    )
+
+    supported_by_hidden_size = {
+        hidden_size: {
+            ks for ks in _FUSED_HC_HALF_MMA_KS if _fused_hc_mma_ks_supported(hidden_size, ks)
+        }
+        for hidden_size in (4096, 7168, 8192)
+    }
+
+    assert supported_by_hidden_size[4096] == {1, 2, 4, 8, 16, 32, 64}
+    assert supported_by_hidden_size[7168] == {1, 2, 4, 8, 16}
+    assert supported_by_hidden_size[8192] == set()
+
+
 @pytest.mark.parametrize("n", list(_BACKEND_TACTICS_BY_M.keys()))
-@pytest.mark.parametrize("hidden_size", [4096])
+@pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("hc_mult", [4])
 def test_mhc_fused_hc_backends(n: int, hidden_size: int, hc_mult: int):
     """Every wired fused_hc backend sees bit-identical input and is checked
@@ -556,13 +617,12 @@ def test_mhc_fused_hc_backends(n: int, hidden_size: int, hc_mult: int):
             cur_module.base.detach().clone(),
         ]
 
-    backend_outputs = {}
+    tactic_outputs = {}
     for tactic in _BACKEND_TACTICS_BY_M[n]:
-        backend = tactic[0]
         residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur = runner(
             inputs=make_runner_inputs(), tactic=tactic
         )
-        backend_outputs[backend] = (
+        tactic_outputs[tactic] = (
             residual_cur,
             post_mix_cur.view(n, hc_mult, 1),
             comb_mix_cur.view(n, hc_mult, hc_mult),
@@ -577,74 +637,77 @@ def test_mhc_fused_hc_backends(n: int, hidden_size: int, hc_mult: int):
     fp32_tol = dict(rtol=1e-3, atol=5e-3)
 
     # (1) Every backend must match the torch reference.
-    for backend, (
+    for tactic, (
         residual_cur,
         post_mix_cur,
         comb_mix_cur,
         layer_input_cur,
-    ) in backend_outputs.items():
+    ) in tactic_outputs.items():
         torch.testing.assert_close(
             residual_cur_ref,
             residual_cur,
             **bf16_tol,
-            msg=f"[vs torch-ref] backend={backend} n={n} residual mismatch",
+            msg=f"[vs torch-ref] tactic={tactic} n={n} hidden={hidden_size} residual mismatch",
         )
         torch.testing.assert_close(
             post_mix_ref,
             post_mix_cur,
             **fp32_tol,
-            msg=f"[vs torch-ref] backend={backend} n={n} post_mix mismatch",
+            msg=f"[vs torch-ref] tactic={tactic} n={n} hidden={hidden_size} post_mix mismatch",
         )
         torch.testing.assert_close(
             comb_mix_ref,
             comb_mix_cur,
             **fp32_tol,
-            msg=f"[vs torch-ref] backend={backend} n={n} comb_mix mismatch",
+            msg=f"[vs torch-ref] tactic={tactic} n={n} hidden={hidden_size} comb_mix mismatch",
         )
         torch.testing.assert_close(
             layer_input_ref,
             layer_input_cur,
             **bf16_tol,
-            msg=f"[vs torch-ref] backend={backend} n={n} layer_input mismatch",
+            msg=f"[vs torch-ref] tactic={tactic} n={n} hidden={hidden_size} layer_input mismatch",
         )
 
     # (2) All backends must agree with one golden backend at the same tolerance
     # as vs the torch ref. Different backends vary only in tile shape and
     # reduction order, so cross-backend divergence would indicate a kernel
     # correctness bug rather than expected rounding drift.
-    gold = "fused_half_mma" if "fused_half_mma" in backend_outputs else next(iter(backend_outputs))
-    gr, gpm, gcm, gli = backend_outputs[gold]
-    for backend, (
+    gold = next(
+        (tactic for tactic in tactic_outputs if tactic[0] == "fused_half_mma"),
+        next(iter(tactic_outputs)),
+    )
+    gr, gpm, gcm, gli = tactic_outputs[gold]
+    for tactic, (
         residual_cur,
         post_mix_cur,
         comb_mix_cur,
         layer_input_cur,
-    ) in backend_outputs.items():
-        if backend == gold:
+    ) in tactic_outputs.items():
+        if tactic == gold:
             continue
         torch.testing.assert_close(
             gr,
             residual_cur,
             **bf16_tol,
-            msg=f"[vs {gold}] backend={backend} n={n} residual mismatch",
+            msg=f"[vs {gold}] tactic={tactic} n={n} hidden={hidden_size} residual mismatch",
         )
         torch.testing.assert_close(
             gpm,
             post_mix_cur,
             **fp32_tol,
-            msg=f"[vs {gold}] backend={backend} n={n} post_mix mismatch",
+            msg=f"[vs {gold}] tactic={tactic} n={n} hidden={hidden_size} post_mix mismatch",
         )
         torch.testing.assert_close(
             gcm,
             comb_mix_cur,
             **fp32_tol,
-            msg=f"[vs {gold}] backend={backend} n={n} comb_mix mismatch",
+            msg=f"[vs {gold}] tactic={tactic} n={n} hidden={hidden_size} comb_mix mismatch",
         )
         torch.testing.assert_close(
             gli,
             layer_input_cur,
             **bf16_tol,
-            msg=f"[vs {gold}] backend={backend} n={n} layer_input mismatch",
+            msg=f"[vs {gold}] tactic={tactic} n={n} hidden={hidden_size} layer_input mismatch",
         )
 
 
@@ -657,13 +720,13 @@ def test_mhc_fused_hc_backends(n: int, hidden_size: int, hc_mult: int):
         ("fused_all_fma", 2, 1, 0, 1),
     ],
 )
-def test_mhc_fused_hc_realistic_scale_regression(tactic):
+@pytest.mark.parametrize("hidden_size", [4096, 7168])
+def test_mhc_fused_hc_realistic_scale_regression(tactic, hidden_size: int):
     """Real-scale mHC data catches fused_hc RMS normalization regressions."""
     from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
 
     n = 16
     hc_mult = 4
-    hidden_size = 4096
     pre_data = generate_realistic_pre_data(n=n, hc_mult=hc_mult, hidden_size=hidden_size)
 
     torch.random.manual_seed(17)
@@ -723,7 +786,7 @@ def test_mhc_fused_hc_realistic_scale_regression(tactic):
 
 
 @pytest.mark.parametrize("n", [128, 2048])
-@pytest.mark.parametrize("hidden_size", [4096])
+@pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("hc_mult", [4])
 def test_mhc_fused_hc_cuda_graph(n: int, hidden_size: int, hc_mult: int):
     """CUDA-graph capture/replay of mHC.fused_hc.
@@ -845,7 +908,7 @@ def test_mhc_fused_hc_cuda_graph(n: int, hidden_size: int, hc_mult: int):
 
 
 @pytest.mark.parametrize("m", [64, 128, 4096, 8192])
-@pytest.mark.parametrize("hidden_size", [4096])
+@pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("hc_mult", [4])
 def test_hc_head(m: int, hidden_size: int, hc_mult: int):
     test_data = generate_head_data(
