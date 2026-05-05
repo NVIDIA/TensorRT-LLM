@@ -9547,10 +9547,10 @@ std::unique_ptr<KVCacheManager> makeConnectorTestKVCacheManager(
     auto mgr
         = std::make_unique<KVCacheManager>(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock,
             blocksPerWindow, maxNumSequences, beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow},
-            /*tempAttentionWindowInputs*/ std::nullopt,
             /*dtype*/ nvinfer1::DataType::kHALF,
             /*sinkTokenLength*/ 0, stream,
             /*maxSequenceLength*/ maxAttentionWindow,
+            /*chunkSize*/ maxAttentionWindow,
             /*enableBlockReuse*/ true,
             /*cacheType*/ CacheType::kSELF,
             /*secondaryOffloadMinPriority*/ std::nullopt,
