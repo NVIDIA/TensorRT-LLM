@@ -944,13 +944,15 @@ class PyExecutor:
         def profile_step():
             nonlocal it, enabled, start_time, start_event_1, end_event_1, start_event_2, end_event_2, prev_device_step_time
             calibrator.post_step(it)
-            if it in self.profile_stop_iters and not self.is_warmup:
+            if (self.iter_counter in self.profile_stop_iters
+                    and not self.is_warmup):
                 assert enabled, "Inconsistent CUDA profiling state"
                 if enable_torch_trace:
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(torch_trace_path)
-                    logger.info(f"Profiling stopped at iteration {it}, "
-                                f"trace saved to {torch_trace_path}")
+                    logger.info(
+                        f"Profiling stopped at iteration {self.iter_counter}, "
+                        f"trace saved to {torch_trace_path}")
                 torch.cuda.cudart().cudaProfilerStop()
                 calibrator.stop()
                 enabled = False
@@ -992,13 +994,15 @@ class PyExecutor:
 
             it += 1
 
-            if it in self.profile_start_iters and not self.is_warmup:
+            if (self.iter_counter in self.profile_start_iters
+                    and not self.is_warmup):
                 assert not enabled, "Inconsistent CUDA profiling state"
                 calibrator.start()
                 torch.cuda.cudart().cudaProfilerStart()
                 if enable_torch_trace:
                     torch_profiler.start()
-                logger.info(f"Profiling started at iteration {it}.")
+                logger.info(
+                    f"Profiling started at iteration {self.iter_counter}.")
                 enabled = True
             calibrator.pre_step(it)
             start_time = time.time()
