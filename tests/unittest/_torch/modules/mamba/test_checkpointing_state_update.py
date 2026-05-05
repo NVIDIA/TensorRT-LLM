@@ -108,9 +108,14 @@ def _maybe_skip_dtype(state_dtype, use_sr):
     ],
     ids=["write", "no_write_replay", "no_write_rectangle"],
 )
+@pytest.mark.parametrize(
+    "mode",
+    ["monolithic", "dynamic", "doublelaunch", "dlgrouped", "maindl"],
+    ids=["monolithic", "dynamic", "doublelaunch", "dlgrouped", "maindl"],
+)
 def test_checkpointing_state_update(
     nheads, head_dim, d_state, ngroups, state_dtype, paged_cache, T,
-    write_checkpoint, rectangle_for_nowrite,
+    write_checkpoint, rectangle_for_nowrite, mode,
 ):
     """
     Verify that:
@@ -326,6 +331,7 @@ def test_checkpointing_state_update(
             state_scales=test_scales,
             write_checkpoint=write_checkpoint,
             rectangle_for_nowrite=rectangle_for_nowrite,
+            mode=mode,
         )
 
         # Tolerance rationale: the replay kernel uses bf16 tl.dot for four
@@ -533,6 +539,193 @@ def test_checkpointing_state_update(
                 old_dA_cumsum_w[slot, 1 - wb], old_dA_cumsum[slot, 1 - wb],
                 rtol=0, atol=0,
                 msg=f"old_dA_cumsum inactive buf modified at k={k} write={write_checkpoint}",
+            )
+
+
+@pytest.mark.parametrize(
+    "mode,rectangle_for_nowrite",
+    [
+        ("dynamic", False),
+        ("dynamic", True),
+        ("doublelaunch", False),
+        ("doublelaunch", True),
+        ("dlgrouped", False),
+        ("dlgrouped", True),
+        ("maindl", False),
+        ("maindl", True),
+    ],
+    ids=[
+        "dynamic_replay",
+        "dynamic_rectangle",
+        "doublelaunch_replay",
+        "doublelaunch_rectangle",
+        "dlgrouped_replay",
+        "dlgrouped_rectangle",
+        "maindl_replay",
+        "maindl_rectangle",
+    ],
+)
+def test_checkpointing_state_update_mixed_mode(mode, rectangle_for_nowrite):
+    """
+    Mixed-mode dispatch: a batch where some slots have PNAT triggering
+    write and others triggering nowrite, exercising the per-slot dispatch
+    of mode={dynamic, doublelaunch}.
+
+    Setup: 4 slots, max_window=16, T=6.
+      pnat_per_slot = [3, 10, 12, 16]
+        slots 0, 1: nowrite (pnat + T <= max_window)
+        slots 2, 3: write   (pnat + T  > max_window)
+
+    Reference: per-slot post-replay state computed from the captured
+    state evolution, then selective_state_update for the new step.
+    Output and post-replay state are verified per-slot.
+    """
+    nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
+    T = 6
+    max_window = 16
+    batch = 4
+    cache_size = batch
+    device = "cuda"
+    dtype = torch.bfloat16
+    state_dtype = torch.bfloat16
+
+    # PNAT mix: write threshold is pnat + T > max_window  →  pnat >= 11.
+    pnat_per_slot = torch.tensor([3, 10, 12, 16], device=device, dtype=torch.int32)
+    # Per-slot dispatch destinations under each mode (for the postcondition checks).
+    pnat_means_write = (pnat_per_slot + T > max_window).tolist()  # [F, F, T, T]
+
+    torch.manual_seed(42)
+
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+    D_base = torch.randn(nheads, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+
+    state0 = torch.randn(
+        cache_size, nheads, head_dim, d_state, device=device, dtype=state_dtype
+    )
+    ref_input_state = state0.float()
+
+    # Old inputs spanning the full window (so any pnat 0..max_window is exercised).
+    step1_T = max_window
+    x1 = torch.randn(batch, step1_T, nheads, head_dim, device=device, dtype=dtype)
+    dt1_base = torch.randn(batch, step1_T, nheads, device=device, dtype=dtype)
+    dt1_input = repeat(dt1_base, "b t h -> b t h p", p=head_dim)
+    B1 = torch.randn(batch, step1_T, ngroups, d_state, device=device, dtype=dtype)
+    C1 = torch.randn(batch, step1_T, ngroups, d_state, device=device, dtype=dtype)
+
+    # Capture per-step intermediate SSM states across the window.
+    states_buffer_f32 = torch.zeros(
+        cache_size, step1_T, nheads, head_dim, d_state, device=device, dtype=torch.float32
+    )
+    cache_idx_for_capture = torch.arange(batch, device=device, dtype=torch.int32)
+    out1 = torch.zeros(batch, step1_T, nheads, head_dim, device=device, dtype=dtype)
+    selective_state_update(
+        ref_input_state.clone(),
+        x1, dt1_input, A, B1, C1,
+        D=D, dt_bias=dt_bias, dt_softplus=True,
+        state_batch_indices=cache_idx_for_capture,
+        intermediate_states_buffer=states_buffer_f32,
+        cache_steps=step1_T,
+        out=out1,
+        disable_state_update=True,
+    )
+
+    # Build the cache tensors with old data on each slot's active buffer.
+    old_x = torch.zeros(cache_size, max_window, nheads, head_dim, device=device, dtype=dtype)
+    old_B = torch.randn(cache_size, 2, max_window, ngroups, d_state, device=device, dtype=dtype)
+    old_dt = torch.randn(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    old_dA_cumsum = torch.randn(
+        cache_size, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    cache_buf_idx = torch.randint(0, 2, (cache_size,), device=device, dtype=torch.int32)
+
+    old_x[:, :step1_T] = x1
+    dt1_processed = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
+    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1_processed, dim=1)
+    for i in range(cache_size):
+        buf = cache_buf_idx[i].item()
+        old_B[i, buf, :step1_T] = B1[i]
+        old_dt[i, buf, :, :step1_T] = dt1_processed[i].T
+        old_dA_cumsum[i, buf, :, :step1_T] = dA_cumsum1[i].T
+
+    # New-step inputs.
+    torch.manual_seed(123)
+    x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    dt2_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+    dt2 = repeat(dt2_base, "b t h -> b t h p", p=head_dim)
+    B2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+    C2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+
+    # Reference: per-slot post-replay state, then selective_state_update.
+    ref_state_f32 = ref_input_state.clone()
+    for i in range(cache_size):
+        k_i = pnat_per_slot[i].item()
+        if k_i > 0:
+            ref_state_f32[i] = states_buffer_f32[i, k_i - 1]
+    ref_state_after_replay = ref_state_f32.clone()
+
+    ref_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    selective_state_update(
+        ref_state_f32,
+        x2, dt2, A, B2, C2,
+        D=D, dt_bias=dt_bias, dt_softplus=True,
+        state_batch_indices=None,
+        out=ref_out,
+    )
+
+    # Kernel call.
+    test_state = state0.clone()
+    test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    old_x_w = old_x.clone()
+    old_B_w = old_B.clone()
+    old_dt_w = old_dt.clone()
+    old_dA_cumsum_w = old_dA_cumsum.clone()
+    cache_buf_idx_w = cache_buf_idx.clone()
+
+    checkpointing_state_update(
+        test_state,
+        old_x_w, old_B_w, old_dt_w, old_dA_cumsum_w,
+        cache_buf_idx_w,
+        pnat_per_slot,
+        x=x2, dt=dt2, A=A, B=B2, C=C2,
+        out=test_out,
+        D=D, dt_bias=dt_bias, dt_softplus=True,
+        state_batch_indices=None,
+        rectangle_for_nowrite=rectangle_for_nowrite,
+        mode=mode,
+        # write_checkpoint is ignored in dynamic / doublelaunch.
+    )
+
+    # Output: every slot must match its reference (bf16 atol consistent
+    # with existing tests).
+    torch.testing.assert_close(
+        test_out.float(), ref_out.float(),
+        atol=1.0, rtol=0.05,
+        msg=f"Output mismatch (mode={mode}, rect={rectangle_for_nowrite})",
+    )
+
+    # State postconditions per slot:
+    #   write slots (pnat + T > max_window): state in HBM is the post-replay
+    #     fp32 reference (cast back to state_dtype with bf16 atol).
+    #   nowrite slots: HBM state is unchanged (still state0 bitwise).
+    for i in range(cache_size):
+        if pnat_means_write[i]:
+            torch.testing.assert_close(
+                test_state[i].float(),
+                ref_state_after_replay[i].float(),
+                atol=1.0, rtol=0.05,
+                msg=f"Write slot {i}: state mismatch (mode={mode})",
+            )
+        else:
+            torch.testing.assert_close(
+                test_state[i], state0[i],
+                rtol=0, atol=0,
+                msg=f"Nowrite slot {i}: state HBM was modified (mode={mode})",
             )
 
 

@@ -82,11 +82,8 @@ def _stochastic_round_fp8x4_e4m3(x: tl.tensor, rand: tl.tensor) -> tl.tensor:
 # Grid: (batch, nheads // HEADS_PER_BLOCK).
 
 
-@triton.heuristics({"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
-@triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
-@triton.heuristics({"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
 @triton.jit()
-def _checkpointing_precompute_kernel(
+def _replay_precompute_impl(
     # Input pointers
     dt_ptr,
     dt_bias_ptr,
@@ -164,11 +161,15 @@ def _checkpointing_precompute_kernel(
     BLOCK_SIZE_DSTATE: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
-    LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
     HEADS_PER_BLOCK: tl.constexpr,
     # Checkpointing flag — selects target buffer + offset for new-token
     # cache writes.  See "Cache write semantics" block below.
-    WRITE_CHECKPOINT: tl.constexpr,
+    # Runtime (not constexpr): the only WRITE_CHECKPOINT-dependent code in
+    # this body is the write_buf/write_offset selection, which is plain
+    # arithmetic — no constexpr-shaped tile or whole-block gate.  Letting
+    # it be runtime lets the dynamic dispatch kernel call us once with the
+    # per-slot needs_write flag instead of inlining two specializations.
+    write_checkpoint,
 ):
     pid_b = tl.program_id(axis=0)
     pid_hg = tl.program_id(axis=1)  # head-group index
@@ -182,13 +183,6 @@ def _checkpointing_precompute_kernel(
     else:
         cache_batch_idx = pid_b.to(tl.int64)
 
-    # Signal main kernel to start (internal PDL).  Main's replay phase
-    # reads only from the READ buffer (written by the PREVIOUS step) —
-    # safe even if conv1d and this kernel are still running.  Main's
-    # gdc_wait() gates the output phase, which reads conv1d outputs
-    # (x, C) and this kernel's outputs (cb_scaled, decay_vec).
-    if LAUNCH_DEPENDENT_KERNELS:
-        tl.extra.cuda.gdc_launch_dependents()
 
     # --- Cache write semantics ---
     # cache_buf_idx names this step's "active" buffer — the one with the
@@ -206,7 +200,7 @@ def _checkpointing_precompute_kernel(
     #       kernel behavior exactly.
     buf_active = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
     prev_num_accepted_tokens = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
-    if WRITE_CHECKPOINT:
+    if write_checkpoint:
         write_buf = 1 - buf_active
         write_offset = 0
     else:
@@ -352,6 +346,173 @@ def _checkpointing_precompute_kernel(
         )
 
 
+# Replay-style precompute kernel.  Thin wrapper around _replay_precompute_impl
+# that carries the @triton.heuristics for constexpr derivation; called from
+# the Python wrapper on the replay-style path (write or replay-nowrite).
+@triton.heuristics({"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
+@triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
+@triton.heuristics({"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
+@triton.jit()
+def _checkpointing_precompute_kernel(
+    # Input pointers
+    dt_ptr,
+    dt_bias_ptr,
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    # Output pointers
+    cb_scaled_ptr,
+    decay_vec_ptr,
+    # Cache pointers
+    old_B_ptr,
+    old_dt_ptr,
+    old_dA_cumsum_ptr,
+    cache_buf_idx_ptr,
+    prev_num_accepted_tokens_ptr,
+    state_batch_indices_ptr,
+    pad_slot_id,
+    # Dimensions
+    T: tl.constexpr,
+    MAX_REPLAY_BUFFER_LENGTH: tl.constexpr,
+    dstate: tl.constexpr,
+    nheads_ngroups_ratio: tl.constexpr,
+    # dt strides
+    stride_dt_batch,
+    stride_dt_T,
+    stride_dt_head,
+    stride_dt_bias_head,
+    stride_A_head,
+    # B strides
+    stride_B_batch,
+    stride_B_T,
+    stride_B_group,
+    stride_B_dstate,
+    # C strides
+    stride_C_batch,
+    stride_C_T,
+    stride_C_group,
+    stride_C_dstate,
+    # cb_scaled strides
+    stride_cb_batch,
+    stride_cb_head,
+    stride_cb_t,
+    stride_cb_j,
+    # decay_vec strides
+    stride_dv_batch,
+    stride_dv_head,
+    stride_dv_t,
+    # old_B strides
+    stride_old_B_cache,
+    stride_old_B_dbuf,
+    stride_old_B_T,
+    stride_old_B_group,
+    stride_old_B_dstate,
+    # old_dt strides
+    stride_old_dt_cache,
+    stride_old_dt_dbuf,
+    stride_old_dt_head,
+    stride_old_dt_T,
+    # old_dA_cumsum strides
+    stride_old_dA_cumsum_cache,
+    stride_old_dA_cumsum_dbuf,
+    stride_old_dA_cumsum_head,
+    stride_old_dA_cumsum_T,
+    # Meta-parameters
+    DT_SOFTPLUS: tl.constexpr,
+    HAS_DT_BIAS: tl.constexpr,
+    HAS_CACHE_BATCH_INDICES: tl.constexpr,
+    BLOCK_SIZE_DSTATE: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
+    LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
+    HEADS_PER_BLOCK: tl.constexpr,
+    WRITE_CHECKPOINT: tl.constexpr,
+    EARLY_OUT: tl.constexpr,
+):
+    # Hoisted PDL signal: fire as the first thing every program does, so
+    # main can start its setup regardless of how this program ends (pad,
+    # early-out, or full body).  PDL signals are idempotent; main's
+    # gdc_wait still gates on prerequisite-kernel completion for
+    # correctness.
+    if LAUNCH_DEPENDENT_KERNELS:
+        tl.extra.cuda.gdc_launch_dependents()
+    # Per-program early-out gate (option-2 double-launch).  When EARLY_OUT
+    # is False the entire block is constexpr-folded out and the wrapper is
+    # just an impl call.  When True, this kernel only runs for slots whose
+    # (PNAT + T > MAX) status matches WRITE_CHECKPOINT.
+    if EARLY_OUT:
+        pid_b_eo = tl.program_id(axis=0)
+        if HAS_CACHE_BATCH_INDICES:
+            cbi_eo = tl.load(state_batch_indices_ptr + pid_b_eo).to(tl.int64)
+            if cbi_eo == pad_slot_id:
+                return
+        else:
+            cbi_eo = pid_b_eo.to(tl.int64)
+        pnat_eo = tl.load(prev_num_accepted_tokens_ptr + cbi_eo)
+        if (pnat_eo + T > MAX_REPLAY_BUFFER_LENGTH) != WRITE_CHECKPOINT:
+            return
+    _replay_precompute_impl(
+        dt_ptr,
+        dt_bias_ptr,
+        A_ptr,
+        B_ptr,
+        C_ptr,
+        cb_scaled_ptr,
+        decay_vec_ptr,
+        old_B_ptr,
+        old_dt_ptr,
+        old_dA_cumsum_ptr,
+        cache_buf_idx_ptr,
+        prev_num_accepted_tokens_ptr,
+        state_batch_indices_ptr,
+        pad_slot_id,
+        T,
+        dstate,
+        nheads_ngroups_ratio,
+        stride_dt_batch,
+        stride_dt_T,
+        stride_dt_head,
+        stride_dt_bias_head,
+        stride_A_head,
+        stride_B_batch,
+        stride_B_T,
+        stride_B_group,
+        stride_B_dstate,
+        stride_C_batch,
+        stride_C_T,
+        stride_C_group,
+        stride_C_dstate,
+        stride_cb_batch,
+        stride_cb_head,
+        stride_cb_t,
+        stride_cb_j,
+        stride_dv_batch,
+        stride_dv_head,
+        stride_dv_t,
+        stride_old_B_cache,
+        stride_old_B_dbuf,
+        stride_old_B_T,
+        stride_old_B_group,
+        stride_old_B_dstate,
+        stride_old_dt_cache,
+        stride_old_dt_dbuf,
+        stride_old_dt_head,
+        stride_old_dt_T,
+        stride_old_dA_cumsum_cache,
+        stride_old_dA_cumsum_dbuf,
+        stride_old_dA_cumsum_head,
+        stride_old_dA_cumsum_T,
+        DT_SOFTPLUS,
+        HAS_DT_BIAS,
+        HAS_CACHE_BATCH_INDICES,
+        BLOCK_SIZE_DSTATE,
+        BLOCK_SIZE_T,
+        LAUNCH_WITH_PDL,
+        HEADS_PER_BLOCK,
+        WRITE_CHECKPOINT,
+    )
+
+
 # Rectangle precompute kernel: produces a (T, K) CB rectangle that combines
 # old-token (B from cache, k ∈ [0, PNAT)) and new-token (B from input, k ∈
 # [MAX-T, MAX) at compile-time-static shift) contributions in a single matmul.
@@ -363,15 +524,8 @@ def _checkpointing_precompute_kernel(
 # can skip materializing a state_prev_decayed (M, dstate) tile.
 
 
-@triton.heuristics({"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
-@triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
-@triton.heuristics({"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
-@triton.heuristics(
-    {"BLOCK_SIZE_K": lambda args: max(
-        triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), 16)}
-)
 @triton.jit()
-def _rectangle_precompute_kernel(
+def _rectangle_precompute_impl(
     # Input pointers
     dt_ptr,
     dt_bias_ptr,
@@ -445,7 +599,6 @@ def _rectangle_precompute_kernel(
     BLOCK_SIZE_T: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
-    LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
     HEADS_PER_BLOCK: tl.constexpr,
 ):
     pid_b = tl.program_id(axis=0)
@@ -458,9 +611,6 @@ def _rectangle_precompute_kernel(
             return
     else:
         cache_batch_idx = pid_b.to(tl.int64)
-
-    if LAUNCH_DEPENDENT_KERNELS:
-        tl.extra.cuda.gdc_launch_dependents()
 
     # Nowrite-only: write_buf = active, write_offset = PNAT.  No flip after.
     buf_active = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
@@ -761,30 +911,419 @@ def _rectangle_precompute_kernel(
         )
 
 
+# Rectangle precompute kernel.  Thin wrapper around _rectangle_precompute_impl
+# that carries the @triton.heuristics for constexpr derivation; called from
+# the Python wrapper on the rectangle nowrite path.
+@triton.heuristics({"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
+@triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
+@triton.heuristics({"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
+@triton.heuristics(
+    {"BLOCK_SIZE_K": lambda args: max(
+        triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), 16)}
+)
+@triton.jit()
+def _rectangle_precompute_kernel(
+    # Input pointers
+    dt_ptr,
+    dt_bias_ptr,
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    # Output pointers
+    cb_scaled_ptr,
+    decay_vec_ptr,
+    # Cache pointers
+    old_B_ptr,
+    old_dt_ptr,
+    old_dA_cumsum_ptr,
+    cache_buf_idx_ptr,
+    prev_num_accepted_tokens_ptr,
+    state_batch_indices_ptr,
+    pad_slot_id,
+    # Dimensions
+    T: tl.constexpr,
+    MAX_REPLAY_BUFFER_LENGTH: tl.constexpr,
+    dstate: tl.constexpr,
+    nheads_ngroups_ratio: tl.constexpr,
+    # dt strides
+    stride_dt_batch,
+    stride_dt_T,
+    stride_dt_head,
+    stride_dt_bias_head,
+    stride_A_head,
+    # B strides
+    stride_B_batch,
+    stride_B_T,
+    stride_B_group,
+    stride_B_dstate,
+    # C strides
+    stride_C_batch,
+    stride_C_T,
+    stride_C_group,
+    stride_C_dstate,
+    # cb_scaled strides
+    stride_cb_batch,
+    stride_cb_head,
+    stride_cb_t,
+    stride_cb_j,
+    # decay_vec strides
+    stride_dv_batch,
+    stride_dv_head,
+    stride_dv_t,
+    # old_B strides
+    stride_old_B_cache,
+    stride_old_B_dbuf,
+    stride_old_B_T,
+    stride_old_B_group,
+    stride_old_B_dstate,
+    # old_dt strides
+    stride_old_dt_cache,
+    stride_old_dt_dbuf,
+    stride_old_dt_head,
+    stride_old_dt_T,
+    # old_dA_cumsum strides
+    stride_old_dA_cumsum_cache,
+    stride_old_dA_cumsum_dbuf,
+    stride_old_dA_cumsum_head,
+    stride_old_dA_cumsum_T,
+    # Meta-parameters
+    DT_SOFTPLUS: tl.constexpr,
+    HAS_DT_BIAS: tl.constexpr,
+    HAS_CACHE_BATCH_INDICES: tl.constexpr,
+    BLOCK_SIZE_DSTATE: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
+    LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
+    HEADS_PER_BLOCK: tl.constexpr,
+    EARLY_OUT: tl.constexpr,
+):
+    # Hoisted PDL signal: fire as the first thing every program does, so
+    # main can start its setup regardless of how this program ends.
+    if LAUNCH_DEPENDENT_KERNELS:
+        tl.extra.cuda.gdc_launch_dependents()
+    # Per-program early-out gate.  Rectangle is nowrite-only, so EARLY_OUT
+    # skips slots whose PNAT + T > MAX (slots that would need write).
+    if EARLY_OUT:
+        pid_b_eo = tl.program_id(axis=0)
+        if HAS_CACHE_BATCH_INDICES:
+            cbi_eo = tl.load(state_batch_indices_ptr + pid_b_eo).to(tl.int64)
+            if cbi_eo == pad_slot_id:
+                return
+        else:
+            cbi_eo = pid_b_eo.to(tl.int64)
+        pnat_eo = tl.load(prev_num_accepted_tokens_ptr + cbi_eo)
+        if pnat_eo + T > MAX_REPLAY_BUFFER_LENGTH:
+            return
+    _rectangle_precompute_impl(
+        dt_ptr,
+        dt_bias_ptr,
+        A_ptr,
+        B_ptr,
+        C_ptr,
+        cb_scaled_ptr,
+        decay_vec_ptr,
+        old_B_ptr,
+        old_dt_ptr,
+        old_dA_cumsum_ptr,
+        cache_buf_idx_ptr,
+        prev_num_accepted_tokens_ptr,
+        state_batch_indices_ptr,
+        pad_slot_id,
+        T,
+        MAX_REPLAY_BUFFER_LENGTH,
+        dstate,
+        nheads_ngroups_ratio,
+        stride_dt_batch,
+        stride_dt_T,
+        stride_dt_head,
+        stride_dt_bias_head,
+        stride_A_head,
+        stride_B_batch,
+        stride_B_T,
+        stride_B_group,
+        stride_B_dstate,
+        stride_C_batch,
+        stride_C_T,
+        stride_C_group,
+        stride_C_dstate,
+        stride_cb_batch,
+        stride_cb_head,
+        stride_cb_t,
+        stride_cb_j,
+        stride_dv_batch,
+        stride_dv_head,
+        stride_dv_t,
+        stride_old_B_cache,
+        stride_old_B_dbuf,
+        stride_old_B_T,
+        stride_old_B_group,
+        stride_old_B_dstate,
+        stride_old_dt_cache,
+        stride_old_dt_dbuf,
+        stride_old_dt_head,
+        stride_old_dt_T,
+        stride_old_dA_cumsum_cache,
+        stride_old_dA_cumsum_dbuf,
+        stride_old_dA_cumsum_head,
+        stride_old_dA_cumsum_T,
+        DT_SOFTPLUS,
+        HAS_DT_BIAS,
+        HAS_CACHE_BATCH_INDICES,
+        BLOCK_SIZE_DSTATE,
+        BLOCK_SIZE_T,
+        BLOCK_SIZE_K,
+        LAUNCH_WITH_PDL,
+        HEADS_PER_BLOCK,
+    )
+
+
+# Dynamic precompute kernel.  Single launchable kernel that, per program,
+# reads PNAT and dispatches to one of the existing impls:
+#
+#   if pnat + T > MAX:  replay_precompute_impl(WRITE_CHECKPOINT=True)
+#   else if RECTANGLE:  rectangle_precompute_impl
+#   else:               replay_precompute_impl(WRITE_CHECKPOINT=False)
+#
+# RECTANGLE is constexpr (compile-time tuning param); the inner branch
+# is folded so only one of the two nowrite paths is emitted per
+# specialization.  Reg envelope = max(replay_write, X) where X depends
+# on RECTANGLE.  cb_scaled is allocated (T, K) by the wrapper regardless;
+# replay paths write to the first T columns, rectangle writes the full K.
+@triton.heuristics({"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
+@triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
+@triton.heuristics({"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
+@triton.heuristics(
+    {"BLOCK_SIZE_K": lambda args: max(
+        triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), 16)}
+)
+@triton.jit()
+def _dynamic_precompute_kernel(
+    # Input pointers
+    dt_ptr,
+    dt_bias_ptr,
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    # Output pointers
+    cb_scaled_ptr,
+    decay_vec_ptr,
+    # Cache pointers
+    old_B_ptr,
+    old_dt_ptr,
+    old_dA_cumsum_ptr,
+    cache_buf_idx_ptr,
+    prev_num_accepted_tokens_ptr,
+    state_batch_indices_ptr,
+    pad_slot_id,
+    # Dimensions
+    T: tl.constexpr,
+    MAX_REPLAY_BUFFER_LENGTH: tl.constexpr,
+    dstate: tl.constexpr,
+    nheads_ngroups_ratio: tl.constexpr,
+    # dt strides
+    stride_dt_batch,
+    stride_dt_T,
+    stride_dt_head,
+    stride_dt_bias_head,
+    stride_A_head,
+    # B strides
+    stride_B_batch,
+    stride_B_T,
+    stride_B_group,
+    stride_B_dstate,
+    # C strides
+    stride_C_batch,
+    stride_C_T,
+    stride_C_group,
+    stride_C_dstate,
+    # cb_scaled strides — wrapper allocates (T, K), so stride_cb_t = K
+    stride_cb_batch,
+    stride_cb_head,
+    stride_cb_t,
+    stride_cb_j,
+    # decay_vec strides
+    stride_dv_batch,
+    stride_dv_head,
+    stride_dv_t,
+    # old_B strides
+    stride_old_B_cache,
+    stride_old_B_dbuf,
+    stride_old_B_T,
+    stride_old_B_group,
+    stride_old_B_dstate,
+    # old_dt strides
+    stride_old_dt_cache,
+    stride_old_dt_dbuf,
+    stride_old_dt_head,
+    stride_old_dt_T,
+    # old_dA_cumsum strides
+    stride_old_dA_cumsum_cache,
+    stride_old_dA_cumsum_dbuf,
+    stride_old_dA_cumsum_head,
+    stride_old_dA_cumsum_T,
+    # Meta-parameters
+    DT_SOFTPLUS: tl.constexpr,
+    HAS_DT_BIAS: tl.constexpr,
+    HAS_CACHE_BATCH_INDICES: tl.constexpr,
+    BLOCK_SIZE_DSTATE: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
+    LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
+    HEADS_PER_BLOCK: tl.constexpr,
+    # Compile-time pick: rectangle (with replay-write fallback) vs replay-only.
+    RECTANGLE: tl.constexpr,
+):
+    # Hoisted PDL signal: fire as the first thing every program does.
+    if LAUNCH_DEPENDENT_KERNELS:
+        tl.extra.cuda.gdc_launch_dependents()
+
+    pid_b = tl.program_id(axis=0)
+    if HAS_CACHE_BATCH_INDICES:
+        cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
+        if cache_batch_idx == pad_slot_id:
+            return
+    else:
+        cache_batch_idx = pid_b.to(tl.int64)
+
+    pnat_local = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
+    needs_write_runtime = pnat_local + T > MAX_REPLAY_BUFFER_LENGTH
+    # write_checkpoint is now runtime in replay precompute, so a single
+    # call site handles both write and nowrite for the replay branch.
+    # Take rectangle only when RECTANGLE is True AND this slot doesn't
+    # need write; everything else funnels into replay.
+    if needs_write_runtime or not RECTANGLE:
+        _replay_precompute_impl(
+            dt_ptr,
+            dt_bias_ptr,
+            A_ptr,
+            B_ptr,
+            C_ptr,
+            cb_scaled_ptr,
+            decay_vec_ptr,
+            old_B_ptr,
+            old_dt_ptr,
+            old_dA_cumsum_ptr,
+            cache_buf_idx_ptr,
+            prev_num_accepted_tokens_ptr,
+            state_batch_indices_ptr,
+            pad_slot_id,
+            T,
+            dstate,
+            nheads_ngroups_ratio,
+            stride_dt_batch,
+            stride_dt_T,
+            stride_dt_head,
+            stride_dt_bias_head,
+            stride_A_head,
+            stride_B_batch,
+            stride_B_T,
+            stride_B_group,
+            stride_B_dstate,
+            stride_C_batch,
+            stride_C_T,
+            stride_C_group,
+            stride_C_dstate,
+            stride_cb_batch,
+            stride_cb_head,
+            stride_cb_t,
+            stride_cb_j,
+            stride_dv_batch,
+            stride_dv_head,
+            stride_dv_t,
+            stride_old_B_cache,
+            stride_old_B_dbuf,
+            stride_old_B_T,
+            stride_old_B_group,
+            stride_old_B_dstate,
+            stride_old_dt_cache,
+            stride_old_dt_dbuf,
+            stride_old_dt_head,
+            stride_old_dt_T,
+            stride_old_dA_cumsum_cache,
+            stride_old_dA_cumsum_dbuf,
+            stride_old_dA_cumsum_head,
+            stride_old_dA_cumsum_T,
+            DT_SOFTPLUS,
+            HAS_DT_BIAS,
+            HAS_CACHE_BATCH_INDICES,
+            BLOCK_SIZE_DSTATE,
+            BLOCK_SIZE_T,
+            LAUNCH_WITH_PDL,
+            HEADS_PER_BLOCK,
+            needs_write_runtime,
+        )
+    else:
+        _rectangle_precompute_impl(
+            dt_ptr,
+            dt_bias_ptr,
+            A_ptr,
+            B_ptr,
+            C_ptr,
+            cb_scaled_ptr,
+            decay_vec_ptr,
+            old_B_ptr,
+            old_dt_ptr,
+            old_dA_cumsum_ptr,
+            cache_buf_idx_ptr,
+            prev_num_accepted_tokens_ptr,
+            state_batch_indices_ptr,
+            pad_slot_id,
+            T,
+            MAX_REPLAY_BUFFER_LENGTH,
+            dstate,
+            nheads_ngroups_ratio,
+            stride_dt_batch,
+            stride_dt_T,
+            stride_dt_head,
+            stride_dt_bias_head,
+            stride_A_head,
+            stride_B_batch,
+            stride_B_T,
+            stride_B_group,
+            stride_B_dstate,
+            stride_C_batch,
+            stride_C_T,
+            stride_C_group,
+            stride_C_dstate,
+            stride_cb_batch,
+            stride_cb_head,
+            stride_cb_t,
+            stride_cb_j,
+            stride_dv_batch,
+            stride_dv_head,
+            stride_dv_t,
+            stride_old_B_cache,
+            stride_old_B_dbuf,
+            stride_old_B_T,
+            stride_old_B_group,
+            stride_old_B_dstate,
+            stride_old_dt_cache,
+            stride_old_dt_dbuf,
+            stride_old_dt_head,
+            stride_old_dt_T,
+            stride_old_dA_cumsum_cache,
+            stride_old_dA_cumsum_dbuf,
+            stride_old_dA_cumsum_head,
+            stride_old_dA_cumsum_T,
+            DT_SOFTPLUS,
+            HAS_DT_BIAS,
+            HAS_CACHE_BATCH_INDICES,
+            BLOCK_SIZE_DSTATE,
+            BLOCK_SIZE_T,
+            BLOCK_SIZE_K,
+            LAUNCH_WITH_PDL,
+            HEADS_PER_BLOCK,
+        )
+
+
 # Main kernel: tl.dot replay + precomputed CB output.
 # Grid: (cdiv(dim, M), batch, nheads).
 
 
-@triton.heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
-@triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
-@triton.heuristics(
-    {"HAS_CACHE_BATCH_INDICES": lambda args: args["state_batch_indices_ptr"] is not None}
-)
-@triton.heuristics({"USE_RS_ROUNDING": lambda args: args["rand_seed_ptr"] is not None})
-@triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
-@triton.heuristics({"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
-# Replay axis: separate from the T-output axis.  Sized to MAX_REPLAY_BUFFER_LENGTH
-# so the kernel can iterate over up to PNAT old-cache positions independent of
-# the new-token T axis.  In production T=6, MAX=16 → BLOCK_SIZE_T=16,
-# BLOCK_SIZE_WINDOW=16 (coincidentally equal); separating them is the
-# semantically correct fix and avoids the prior `offs_t < T` masking bug
-# that under-read old data when PNAT > T-1.
-@triton.heuristics(
-    {"BLOCK_SIZE_WINDOW": lambda args: max(
-        triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), 16)}
-)
 @triton.jit()
-def _checkpointing_main_kernel(
+def _replay_main_impl(
     # Pointers
     state_ptr,
     # Per-(cache, head, dim) decode scale, fp32, only consulted when QUANT_MAX>0.
@@ -902,7 +1441,19 @@ def _checkpointing_main_kernel(
                                       # The rectangle non-checkpoint path is implemented in
                                       # _rectangle_main_kernel (separate kernel pair, picked by
                                       # the wrapper via rectangle_for_nowrite=True).
+    # When True: signal PDL dependents at the very top of every program
+    # (including pad/early-out programs).  Used by doublelaunch and maindl
+    # so the next kernel (the second main, or the second precompute) can
+    # start its setup while this main is still computing.  Default False
+    # for monolithic / dynamic / the LAST main in dl/maindl chains.
+    LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
 ):
+    # Hoisted PDL signal: fire as the first thing every program does, so
+    # downstream kernels can start setup regardless of how this program
+    # ends (pad / early-out / full body).
+    if LAUNCH_DEPENDENT_KERNELS:
+        tl.extra.cuda.gdc_launch_dependents()
+
     # Compile-time invariant: QUANT_MAX > 0 must coincide with a quantized
     # state dtype (int8 / int16 / float8e4nv) and only those.  Cheap
     # insurance against a wrapper bug that desynchronizes the two.
@@ -1232,6 +1783,231 @@ def _checkpointing_main_kernel(
         tl.store(out_all_ptrs, out_all, mask=t_mask[:, None] & m_mask[None, :])
 
 
+# Replay-style main kernel.  Thin wrapper around _replay_main_impl that carries
+# the @triton.heuristics for constexpr derivation; called from the Python
+# wrapper on the replay-style path (write or replay-nowrite).
+@triton.heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
+@triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
+@triton.heuristics(
+    {"HAS_CACHE_BATCH_INDICES": lambda args: args["state_batch_indices_ptr"] is not None}
+)
+@triton.heuristics({"USE_RS_ROUNDING": lambda args: args["rand_seed_ptr"] is not None})
+@triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
+@triton.heuristics({"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
+@triton.heuristics(
+    {"BLOCK_SIZE_WINDOW": lambda args: max(
+        triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), 16)}
+)
+@triton.jit()
+def _checkpointing_main_kernel(
+    # Pointers
+    state_ptr,
+    state_scales_ptr,
+    old_x_ptr,
+    old_B_ptr,
+    old_dt_ptr,
+    old_dA_cumsum_ptr,
+    prev_num_accepted_tokens_ptr,
+    cache_buf_idx_ptr,
+    x_ptr,
+    C_ptr,
+    D_ptr,
+    z_ptr,
+    out_ptr,
+    cb_scaled_ptr,
+    decay_vec_ptr,
+    state_batch_indices_ptr,
+    rand_seed_ptr,
+    pad_slot_id,
+    # Dimensions
+    T: tl.constexpr,
+    MAX_REPLAY_BUFFER_LENGTH: tl.constexpr,
+    dim: tl.constexpr,
+    dstate: tl.constexpr,
+    nheads_ngroups_ratio: tl.constexpr,
+    # state strides
+    stride_state_batch,
+    stride_state_head,
+    stride_state_dim,
+    stride_state_dstate,
+    # state_scales strides
+    stride_state_scales_cache,
+    stride_state_scales_head,
+    stride_state_scales_dim,
+    # old_x strides
+    stride_old_x_cache,
+    stride_old_x_T,
+    stride_old_x_head,
+    stride_old_x_dim,
+    # old_B strides
+    stride_old_B_cache,
+    stride_old_B_dbuf,
+    stride_old_B_T,
+    stride_old_B_group,
+    stride_old_B_dstate,
+    # old_dt strides
+    stride_old_dt_cache,
+    stride_old_dt_dbuf,
+    stride_old_dt_head,
+    stride_old_dt_T,
+    # old_dA_cumsum strides
+    stride_old_dA_cumsum_cache,
+    stride_old_dA_cumsum_dbuf,
+    stride_old_dA_cumsum_head,
+    stride_old_dA_cumsum_T,
+    # x strides
+    stride_x_batch,
+    stride_x_T,
+    stride_x_head,
+    stride_x_dim,
+    # C strides
+    stride_C_batch,
+    stride_C_T,
+    stride_C_group,
+    stride_C_dstate,
+    # D strides
+    stride_D_head,
+    stride_D_dim,
+    # z strides
+    stride_z_batch,
+    stride_z_T,
+    stride_z_head,
+    stride_z_dim,
+    # out strides
+    stride_out_batch,
+    stride_out_T,
+    stride_out_head,
+    stride_out_dim,
+    # cb_scaled strides
+    stride_cb_batch,
+    stride_cb_head,
+    stride_cb_t,
+    stride_cb_j,
+    # decay_vec strides
+    stride_dv_batch,
+    stride_dv_head,
+    stride_dv_t,
+    # Meta
+    BLOCK_SIZE_M: tl.constexpr,
+    HAS_D: tl.constexpr,
+    HAS_Z: tl.constexpr,
+    HAS_CACHE_BATCH_INDICES: tl.constexpr,
+    BLOCK_SIZE_DSTATE: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    BLOCK_SIZE_WINDOW: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
+    USE_RS_ROUNDING: tl.constexpr,
+    PHILOX_ROUNDS: tl.constexpr,
+    QUANT_MAX: tl.constexpr,
+    WRITE_CHECKPOINT: tl.constexpr,
+    EARLY_OUT: tl.constexpr,
+    LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
+):
+    # Hoisted PDL signal: fire as the first thing every program does.
+    if LAUNCH_DEPENDENT_KERNELS:
+        tl.extra.cuda.gdc_launch_dependents()
+    # Per-program early-out gate.  Signal-then-skip lets the next kernel
+    # in dl/maindl chains start regardless of early-out outcome.
+    if EARLY_OUT:
+        pid_b_eo = tl.program_id(axis=1)
+        if HAS_CACHE_BATCH_INDICES:
+            cbi_eo = tl.load(state_batch_indices_ptr + pid_b_eo).to(tl.int64)
+            if cbi_eo == pad_slot_id:
+                return
+        else:
+            cbi_eo = pid_b_eo.to(tl.int64)
+        pnat_eo = tl.load(prev_num_accepted_tokens_ptr + cbi_eo)
+        if (pnat_eo + T > MAX_REPLAY_BUFFER_LENGTH) != WRITE_CHECKPOINT:
+            return
+    _replay_main_impl(
+        state_ptr,
+        state_scales_ptr,
+        old_x_ptr,
+        old_B_ptr,
+        old_dt_ptr,
+        old_dA_cumsum_ptr,
+        prev_num_accepted_tokens_ptr,
+        cache_buf_idx_ptr,
+        x_ptr,
+        C_ptr,
+        D_ptr,
+        z_ptr,
+        out_ptr,
+        cb_scaled_ptr,
+        decay_vec_ptr,
+        state_batch_indices_ptr,
+        rand_seed_ptr,
+        pad_slot_id,
+        T,
+        MAX_REPLAY_BUFFER_LENGTH,
+        dim,
+        dstate,
+        nheads_ngroups_ratio,
+        stride_state_batch,
+        stride_state_head,
+        stride_state_dim,
+        stride_state_dstate,
+        stride_state_scales_cache,
+        stride_state_scales_head,
+        stride_state_scales_dim,
+        stride_old_x_cache,
+        stride_old_x_T,
+        stride_old_x_head,
+        stride_old_x_dim,
+        stride_old_B_cache,
+        stride_old_B_dbuf,
+        stride_old_B_T,
+        stride_old_B_group,
+        stride_old_B_dstate,
+        stride_old_dt_cache,
+        stride_old_dt_dbuf,
+        stride_old_dt_head,
+        stride_old_dt_T,
+        stride_old_dA_cumsum_cache,
+        stride_old_dA_cumsum_dbuf,
+        stride_old_dA_cumsum_head,
+        stride_old_dA_cumsum_T,
+        stride_x_batch,
+        stride_x_T,
+        stride_x_head,
+        stride_x_dim,
+        stride_C_batch,
+        stride_C_T,
+        stride_C_group,
+        stride_C_dstate,
+        stride_D_head,
+        stride_D_dim,
+        stride_z_batch,
+        stride_z_T,
+        stride_z_head,
+        stride_z_dim,
+        stride_out_batch,
+        stride_out_T,
+        stride_out_head,
+        stride_out_dim,
+        stride_cb_batch,
+        stride_cb_head,
+        stride_cb_t,
+        stride_cb_j,
+        stride_dv_batch,
+        stride_dv_head,
+        stride_dv_t,
+        BLOCK_SIZE_M,
+        HAS_D,
+        HAS_Z,
+        HAS_CACHE_BATCH_INDICES,
+        BLOCK_SIZE_DSTATE,
+        BLOCK_SIZE_T,
+        BLOCK_SIZE_WINDOW,
+        LAUNCH_WITH_PDL,
+        USE_RS_ROUNDING,
+        PHILOX_ROUNDS,
+        QUANT_MAX,
+        WRITE_CHECKPOINT,
+        LAUNCH_DEPENDENT_KERNELS,
+    )
+
+
 # Rectangle main kernel (nowrite-only): no replay step, no state HBM write,
 # no SR codegen.  state_out is computed from state_prev directly using the
 # precomp-folded decay_vec_full; token_out is a single rectangle matmul over
@@ -1239,19 +2015,8 @@ def _checkpointing_main_kernel(
 # `_rectangle_precompute_kernel`.
 
 
-@triton.heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
-@triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
-@triton.heuristics(
-    {"HAS_CACHE_BATCH_INDICES": lambda args: args["state_batch_indices_ptr"] is not None}
-)
-@triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
-@triton.heuristics({"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
-@triton.heuristics(
-    {"BLOCK_SIZE_K": lambda args: max(
-        triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), 16)}
-)
 @triton.jit()
-def _rectangle_main_kernel(
+def _rectangle_main_impl(
     # Pointers
     state_ptr,
     state_scales_ptr,        # only consulted when QUANT_MAX > 0
@@ -1329,7 +2094,11 @@ def _rectangle_main_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
     QUANT_MAX: tl.constexpr,
+    LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
 ):
+    if LAUNCH_DEPENDENT_KERNELS:
+        tl.extra.cuda.gdc_launch_dependents()
+
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)
@@ -1487,6 +2256,583 @@ def _rectangle_main_kernel(
         tl.store(out_all_ptrs, out_all, mask=t_mask[:, None] & m_mask[None, :])
 
 
+# Rectangle main kernel.  Thin wrapper around _rectangle_main_impl that carries
+# the @triton.heuristics for constexpr derivation; called from the Python
+# wrapper on the rectangle nowrite path.
+@triton.heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
+@triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
+@triton.heuristics(
+    {"HAS_CACHE_BATCH_INDICES": lambda args: args["state_batch_indices_ptr"] is not None}
+)
+@triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
+@triton.heuristics({"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
+@triton.heuristics(
+    {"BLOCK_SIZE_K": lambda args: max(
+        triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), 16)}
+)
+@triton.jit()
+def _rectangle_main_kernel(
+    # Pointers
+    state_ptr,
+    state_scales_ptr,
+    old_x_ptr,
+    prev_num_accepted_tokens_ptr,
+    cache_buf_idx_ptr,
+    x_ptr,
+    C_ptr,
+    D_ptr,
+    z_ptr,
+    out_ptr,
+    cb_scaled_ptr,
+    decay_vec_ptr,
+    state_batch_indices_ptr,
+    pad_slot_id,
+    # Dimensions
+    T: tl.constexpr,
+    MAX_REPLAY_BUFFER_LENGTH: tl.constexpr,
+    dim: tl.constexpr,
+    dstate: tl.constexpr,
+    nheads_ngroups_ratio: tl.constexpr,
+    # state strides
+    stride_state_batch,
+    stride_state_head,
+    stride_state_dim,
+    stride_state_dstate,
+    # state_scales strides
+    stride_state_scales_cache,
+    stride_state_scales_head,
+    stride_state_scales_dim,
+    # old_x strides
+    stride_old_x_cache,
+    stride_old_x_T,
+    stride_old_x_head,
+    stride_old_x_dim,
+    # x strides
+    stride_x_batch,
+    stride_x_T,
+    stride_x_head,
+    stride_x_dim,
+    # C strides
+    stride_C_batch,
+    stride_C_T,
+    stride_C_group,
+    stride_C_dstate,
+    # D strides
+    stride_D_head,
+    stride_D_dim,
+    # z strides
+    stride_z_batch,
+    stride_z_T,
+    stride_z_head,
+    stride_z_dim,
+    # out strides
+    stride_out_batch,
+    stride_out_T,
+    stride_out_head,
+    stride_out_dim,
+    # cb_scaled strides
+    stride_cb_batch,
+    stride_cb_head,
+    stride_cb_t,
+    stride_cb_j,
+    # decay_vec strides
+    stride_dv_batch,
+    stride_dv_head,
+    stride_dv_t,
+    # Meta
+    BLOCK_SIZE_M: tl.constexpr,
+    HAS_D: tl.constexpr,
+    HAS_Z: tl.constexpr,
+    HAS_CACHE_BATCH_INDICES: tl.constexpr,
+    BLOCK_SIZE_DSTATE: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
+    QUANT_MAX: tl.constexpr,
+    EARLY_OUT: tl.constexpr,
+    LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
+):
+    if LAUNCH_DEPENDENT_KERNELS:
+        tl.extra.cuda.gdc_launch_dependents()
+    # Per-program early-out gate.  Rectangle is nowrite-only.
+    if EARLY_OUT:
+        pid_b_eo = tl.program_id(axis=1)
+        if HAS_CACHE_BATCH_INDICES:
+            cbi_eo = tl.load(state_batch_indices_ptr + pid_b_eo).to(tl.int64)
+            if cbi_eo == pad_slot_id:
+                return
+        else:
+            cbi_eo = pid_b_eo.to(tl.int64)
+        pnat_eo = tl.load(prev_num_accepted_tokens_ptr + cbi_eo)
+        if pnat_eo + T > MAX_REPLAY_BUFFER_LENGTH:
+            return
+    _rectangle_main_impl(
+        state_ptr,
+        state_scales_ptr,
+        old_x_ptr,
+        prev_num_accepted_tokens_ptr,
+        cache_buf_idx_ptr,
+        x_ptr,
+        C_ptr,
+        D_ptr,
+        z_ptr,
+        out_ptr,
+        cb_scaled_ptr,
+        decay_vec_ptr,
+        state_batch_indices_ptr,
+        pad_slot_id,
+        T,
+        MAX_REPLAY_BUFFER_LENGTH,
+        dim,
+        dstate,
+        nheads_ngroups_ratio,
+        stride_state_batch,
+        stride_state_head,
+        stride_state_dim,
+        stride_state_dstate,
+        stride_state_scales_cache,
+        stride_state_scales_head,
+        stride_state_scales_dim,
+        stride_old_x_cache,
+        stride_old_x_T,
+        stride_old_x_head,
+        stride_old_x_dim,
+        stride_x_batch,
+        stride_x_T,
+        stride_x_head,
+        stride_x_dim,
+        stride_C_batch,
+        stride_C_T,
+        stride_C_group,
+        stride_C_dstate,
+        stride_D_head,
+        stride_D_dim,
+        stride_z_batch,
+        stride_z_T,
+        stride_z_head,
+        stride_z_dim,
+        stride_out_batch,
+        stride_out_T,
+        stride_out_head,
+        stride_out_dim,
+        stride_cb_batch,
+        stride_cb_head,
+        stride_cb_t,
+        stride_cb_j,
+        stride_dv_batch,
+        stride_dv_head,
+        stride_dv_t,
+        BLOCK_SIZE_M,
+        HAS_D,
+        HAS_Z,
+        HAS_CACHE_BATCH_INDICES,
+        BLOCK_SIZE_DSTATE,
+        BLOCK_SIZE_T,
+        BLOCK_SIZE_K,
+        LAUNCH_WITH_PDL,
+        QUANT_MAX,
+        LAUNCH_DEPENDENT_KERNELS,
+    )
+
+
+# Dynamic main kernel.  Single launchable kernel that, per program, reads
+# PNAT and dispatches to one of the existing impls:
+#
+#   if pnat + T > MAX:          replay_main_impl(WRITE_CHECKPOINT=True)
+#   elif RECTANGLE (constexpr): rectangle_main_impl
+#   else:                        replay_main_impl(WRITE_CHECKPOINT=False)
+#
+# Unlike precompute, WRITE_CHECKPOINT stays constexpr in the main impl —
+# the body has constexpr-gated state-write code (quant + Philox + HBM
+# store) where folding meaningfully shrinks the codegen.  So this kernel
+# has TWO replay call sites (one per WRITE_CHECKPOINT specialization)
+# both inlined, with a runtime branch picking which runs.  Reg envelope =
+# max(replay_write, X) where X = rectangle_nowrite (RECTANGLE=True) or
+# replay_nowrite (RECTANGLE=False).  cb_scaled is allocated (T, K) by the
+# wrapper regardless.
+@triton.heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
+@triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
+@triton.heuristics(
+    {"HAS_CACHE_BATCH_INDICES": lambda args: args["state_batch_indices_ptr"] is not None}
+)
+@triton.heuristics({"USE_RS_ROUNDING": lambda args: args["rand_seed_ptr"] is not None})
+@triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
+@triton.heuristics({"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
+@triton.heuristics(
+    {"BLOCK_SIZE_WINDOW": lambda args: max(
+        triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), 16)}
+)
+@triton.heuristics(
+    {"BLOCK_SIZE_K": lambda args: max(
+        triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), 16)}
+)
+@triton.jit()
+def _dynamic_main_kernel(
+    # Pointers — union of replay-main and rectangle-main pointer args.
+    state_ptr,
+    state_scales_ptr,
+    old_x_ptr,
+    old_B_ptr,
+    old_dt_ptr,
+    old_dA_cumsum_ptr,
+    prev_num_accepted_tokens_ptr,
+    cache_buf_idx_ptr,
+    x_ptr,
+    C_ptr,
+    D_ptr,
+    z_ptr,
+    out_ptr,
+    cb_scaled_ptr,
+    decay_vec_ptr,
+    state_batch_indices_ptr,
+    rand_seed_ptr,
+    pad_slot_id,
+    # Dimensions
+    T: tl.constexpr,
+    MAX_REPLAY_BUFFER_LENGTH: tl.constexpr,
+    dim: tl.constexpr,
+    dstate: tl.constexpr,
+    nheads_ngroups_ratio: tl.constexpr,
+    # state strides
+    stride_state_batch,
+    stride_state_head,
+    stride_state_dim,
+    stride_state_dstate,
+    # state_scales strides
+    stride_state_scales_cache,
+    stride_state_scales_head,
+    stride_state_scales_dim,
+    # old_x strides
+    stride_old_x_cache,
+    stride_old_x_T,
+    stride_old_x_head,
+    stride_old_x_dim,
+    # old_B strides (replay only; passed but unused on rectangle path)
+    stride_old_B_cache,
+    stride_old_B_dbuf,
+    stride_old_B_T,
+    stride_old_B_group,
+    stride_old_B_dstate,
+    # old_dt strides (replay only)
+    stride_old_dt_cache,
+    stride_old_dt_dbuf,
+    stride_old_dt_head,
+    stride_old_dt_T,
+    # old_dA_cumsum strides (replay only)
+    stride_old_dA_cumsum_cache,
+    stride_old_dA_cumsum_dbuf,
+    stride_old_dA_cumsum_head,
+    stride_old_dA_cumsum_T,
+    # x strides
+    stride_x_batch,
+    stride_x_T,
+    stride_x_head,
+    stride_x_dim,
+    # C strides
+    stride_C_batch,
+    stride_C_T,
+    stride_C_group,
+    stride_C_dstate,
+    # D strides
+    stride_D_head,
+    stride_D_dim,
+    # z strides
+    stride_z_batch,
+    stride_z_T,
+    stride_z_head,
+    stride_z_dim,
+    # out strides
+    stride_out_batch,
+    stride_out_T,
+    stride_out_head,
+    stride_out_dim,
+    # cb_scaled strides — wrapper allocates (T, K), so stride_cb_t = K
+    stride_cb_batch,
+    stride_cb_head,
+    stride_cb_t,
+    stride_cb_j,
+    # decay_vec strides
+    stride_dv_batch,
+    stride_dv_head,
+    stride_dv_t,
+    # Meta
+    BLOCK_SIZE_M: tl.constexpr,
+    HAS_D: tl.constexpr,
+    HAS_Z: tl.constexpr,
+    HAS_CACHE_BATCH_INDICES: tl.constexpr,
+    BLOCK_SIZE_DSTATE: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    BLOCK_SIZE_WINDOW: tl.constexpr,  # for replay path
+    BLOCK_SIZE_K: tl.constexpr,       # for rectangle path
+    LAUNCH_WITH_PDL: tl.constexpr,
+    USE_RS_ROUNDING: tl.constexpr,
+    PHILOX_ROUNDS: tl.constexpr,
+    QUANT_MAX: tl.constexpr,
+    # Compile-time pick: rectangle (with replay-write fallback) vs replay-only.
+    RECTANGLE: tl.constexpr,
+    # Default False — dynamic main is normally terminal in its chain.
+    LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
+):
+    if LAUNCH_DEPENDENT_KERNELS:
+        tl.extra.cuda.gdc_launch_dependents()
+    pid_b = tl.program_id(axis=1)
+    if HAS_CACHE_BATCH_INDICES:
+        cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
+        if cache_batch_idx == pad_slot_id:
+            return
+    else:
+        cache_batch_idx = pid_b.to(tl.int64)
+
+    pnat_local = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
+    if pnat_local + T > MAX_REPLAY_BUFFER_LENGTH:
+        # Write slot — replay-style write (WRITE_CHECKPOINT=True constexpr).
+        _replay_main_impl(
+            state_ptr,
+            state_scales_ptr,
+            old_x_ptr,
+            old_B_ptr,
+            old_dt_ptr,
+            old_dA_cumsum_ptr,
+            prev_num_accepted_tokens_ptr,
+            cache_buf_idx_ptr,
+            x_ptr,
+            C_ptr,
+            D_ptr,
+            z_ptr,
+            out_ptr,
+            cb_scaled_ptr,
+            decay_vec_ptr,
+            state_batch_indices_ptr,
+            rand_seed_ptr,
+            pad_slot_id,
+            T,
+            MAX_REPLAY_BUFFER_LENGTH,
+            dim,
+            dstate,
+            nheads_ngroups_ratio,
+            stride_state_batch,
+            stride_state_head,
+            stride_state_dim,
+            stride_state_dstate,
+            stride_state_scales_cache,
+            stride_state_scales_head,
+            stride_state_scales_dim,
+            stride_old_x_cache,
+            stride_old_x_T,
+            stride_old_x_head,
+            stride_old_x_dim,
+            stride_old_B_cache,
+            stride_old_B_dbuf,
+            stride_old_B_T,
+            stride_old_B_group,
+            stride_old_B_dstate,
+            stride_old_dt_cache,
+            stride_old_dt_dbuf,
+            stride_old_dt_head,
+            stride_old_dt_T,
+            stride_old_dA_cumsum_cache,
+            stride_old_dA_cumsum_dbuf,
+            stride_old_dA_cumsum_head,
+            stride_old_dA_cumsum_T,
+            stride_x_batch,
+            stride_x_T,
+            stride_x_head,
+            stride_x_dim,
+            stride_C_batch,
+            stride_C_T,
+            stride_C_group,
+            stride_C_dstate,
+            stride_D_head,
+            stride_D_dim,
+            stride_z_batch,
+            stride_z_T,
+            stride_z_head,
+            stride_z_dim,
+            stride_out_batch,
+            stride_out_T,
+            stride_out_head,
+            stride_out_dim,
+            stride_cb_batch,
+            stride_cb_head,
+            stride_cb_t,
+            stride_cb_j,
+            stride_dv_batch,
+            stride_dv_head,
+            stride_dv_t,
+            BLOCK_SIZE_M,
+            HAS_D,
+            HAS_Z,
+            HAS_CACHE_BATCH_INDICES,
+            BLOCK_SIZE_DSTATE,
+            BLOCK_SIZE_T,
+            BLOCK_SIZE_WINDOW,
+            LAUNCH_WITH_PDL,
+            USE_RS_ROUNDING,
+            PHILOX_ROUNDS,
+            QUANT_MAX,
+            True,  # WRITE_CHECKPOINT (constexpr)
+            False,  # LAUNCH_DEPENDENT_KERNELS — already signaled at top
+        )
+    else:
+        if RECTANGLE:
+            _rectangle_main_impl(
+                state_ptr,
+                state_scales_ptr,
+                old_x_ptr,
+                prev_num_accepted_tokens_ptr,
+                cache_buf_idx_ptr,
+                x_ptr,
+                C_ptr,
+                D_ptr,
+                z_ptr,
+                out_ptr,
+                cb_scaled_ptr,
+                decay_vec_ptr,
+                state_batch_indices_ptr,
+                pad_slot_id,
+                T,
+                MAX_REPLAY_BUFFER_LENGTH,
+                dim,
+                dstate,
+                nheads_ngroups_ratio,
+                stride_state_batch,
+                stride_state_head,
+                stride_state_dim,
+                stride_state_dstate,
+                stride_state_scales_cache,
+                stride_state_scales_head,
+                stride_state_scales_dim,
+                stride_old_x_cache,
+                stride_old_x_T,
+                stride_old_x_head,
+                stride_old_x_dim,
+                stride_x_batch,
+                stride_x_T,
+                stride_x_head,
+                stride_x_dim,
+                stride_C_batch,
+                stride_C_T,
+                stride_C_group,
+                stride_C_dstate,
+                stride_D_head,
+                stride_D_dim,
+                stride_z_batch,
+                stride_z_T,
+                stride_z_head,
+                stride_z_dim,
+                stride_out_batch,
+                stride_out_T,
+                stride_out_head,
+                stride_out_dim,
+                stride_cb_batch,
+                stride_cb_head,
+                stride_cb_t,
+                stride_cb_j,
+                stride_dv_batch,
+                stride_dv_head,
+                stride_dv_t,
+                BLOCK_SIZE_M,
+                HAS_D,
+                HAS_Z,
+                HAS_CACHE_BATCH_INDICES,
+                BLOCK_SIZE_DSTATE,
+                BLOCK_SIZE_T,
+                BLOCK_SIZE_K,
+                LAUNCH_WITH_PDL,
+                QUANT_MAX,
+                False,  # LAUNCH_DEPENDENT_KERNELS — already signaled at top
+            )
+        else:
+            # Replay-style nowrite (WRITE_CHECKPOINT=False constexpr).
+            _replay_main_impl(
+                state_ptr,
+                state_scales_ptr,
+                old_x_ptr,
+                old_B_ptr,
+                old_dt_ptr,
+                old_dA_cumsum_ptr,
+                prev_num_accepted_tokens_ptr,
+                cache_buf_idx_ptr,
+                x_ptr,
+                C_ptr,
+                D_ptr,
+                z_ptr,
+                out_ptr,
+                cb_scaled_ptr,
+                decay_vec_ptr,
+                state_batch_indices_ptr,
+                rand_seed_ptr,
+                pad_slot_id,
+                T,
+                MAX_REPLAY_BUFFER_LENGTH,
+                dim,
+                dstate,
+                nheads_ngroups_ratio,
+                stride_state_batch,
+                stride_state_head,
+                stride_state_dim,
+                stride_state_dstate,
+                stride_state_scales_cache,
+                stride_state_scales_head,
+                stride_state_scales_dim,
+                stride_old_x_cache,
+                stride_old_x_T,
+                stride_old_x_head,
+                stride_old_x_dim,
+                stride_old_B_cache,
+                stride_old_B_dbuf,
+                stride_old_B_T,
+                stride_old_B_group,
+                stride_old_B_dstate,
+                stride_old_dt_cache,
+                stride_old_dt_dbuf,
+                stride_old_dt_head,
+                stride_old_dt_T,
+                stride_old_dA_cumsum_cache,
+                stride_old_dA_cumsum_dbuf,
+                stride_old_dA_cumsum_head,
+                stride_old_dA_cumsum_T,
+                stride_x_batch,
+                stride_x_T,
+                stride_x_head,
+                stride_x_dim,
+                stride_C_batch,
+                stride_C_T,
+                stride_C_group,
+                stride_C_dstate,
+                stride_D_head,
+                stride_D_dim,
+                stride_z_batch,
+                stride_z_T,
+                stride_z_head,
+                stride_z_dim,
+                stride_out_batch,
+                stride_out_T,
+                stride_out_head,
+                stride_out_dim,
+                stride_cb_batch,
+                stride_cb_head,
+                stride_cb_t,
+                stride_cb_j,
+                stride_dv_batch,
+                stride_dv_head,
+                stride_dv_t,
+                BLOCK_SIZE_M,
+                HAS_D,
+                HAS_Z,
+                HAS_CACHE_BATCH_INDICES,
+                BLOCK_SIZE_DSTATE,
+                BLOCK_SIZE_T,
+                BLOCK_SIZE_WINDOW,
+                LAUNCH_WITH_PDL,
+                USE_RS_ROUNDING,
+                PHILOX_ROUNDS,
+                QUANT_MAX,
+                False,  # WRITE_CHECKPOINT (constexpr)
+                False,  # LAUNCH_DEPENDENT_KERNELS — already signaled at top
+            )
+
+
 # Python wrapper
 
 
@@ -1524,6 +2870,7 @@ def checkpointing_state_update(
     use_internal_pdl=True,
     write_checkpoint: bool = True,
     rectangle_for_nowrite: bool = False,
+    mode: str = "monolithic",
     _block_size_m: int | None = None,
     _num_warps: int | None = None,
     _num_stages: int | None = None,
@@ -1602,13 +2949,32 @@ def checkpointing_state_update(
         launch_with_pdl = False
         use_internal_pdl = False
 
-    # Path selection:
-    #   write_checkpoint=True,  rectangle_for_nowrite=*      → checkpoint step
-    #       (replay-style write kernel; rectangle_for_nowrite ignored).
-    #   write_checkpoint=False, rectangle_for_nowrite=False  → non-checkpoint step
-    #       via replay-style nowrite kernel.
-    #   write_checkpoint=False, rectangle_for_nowrite=True   → non-checkpoint step
-    #       via dedicated rectangle nowrite kernel (single fused old+new matmul).
+    # Mode selection:
+    #   mode="monolithic" (default): today's behavior.  write_checkpoint and
+    #       rectangle_for_nowrite together pick a single kernel pair for the
+    #       whole batch.  Calls the corresponding kernel pair with EARLY_OUT=False.
+    #   mode="dynamic": single kernel pair (_dynamic_*_kernel) that dispatches
+    #       per-slot at runtime based on PNAT.  RECTANGLE constexpr (=
+    #       rectangle_for_nowrite) picks whether the nowrite path is rectangle
+    #       or replay-nowrite.  write_checkpoint is ignored (per-slot from PNAT).
+    #   mode="doublelaunch": two kernel pairs launched in sequence, each with
+    #       EARLY_OUT=True, partitioning the batch by PNAT-derived mode.
+    #       Write half: replay-write.  Nowrite half: rectangle if
+    #       rectangle_for_nowrite else replay-nowrite.  write_checkpoint ignored.
+    #   mode="dlgrouped": same 4 kernels as doublelaunch, but reordered to
+    #       launch both precomputes first, then both mains.  Lets the GPU
+    #       run precomp1 || precomp2 in parallel before the mains start.
+    #       write_checkpoint ignored.
+    #   mode="maindl": shared (dynamic) precompute + doublelaunched main.
+    #       One precompute call (_dynamic_precompute_kernel) handles per-slot
+    #       dispatch, then two main kernels with EARLY_OUT=True for the write
+    #       and nowrite halves.  Strictly fewer kernel launches than
+    #       doublelaunch (3 vs 4) at the cost of dispatch precompute's wider
+    #       reg envelope.  write_checkpoint ignored.
+    assert mode in ("monolithic", "dynamic", "doublelaunch", "dlgrouped", "maindl"), (
+        f"unknown mode {mode!r}; expected one of "
+        "'monolithic', 'dynamic', 'doublelaunch', 'dlgrouped', or 'maindl'"
+    )
     use_rectangle = rectangle_for_nowrite and not write_checkpoint
 
     # --- Hardware support gates ---
@@ -1737,11 +3103,13 @@ def checkpointing_state_update(
     # so the launch sites can refer to it; only used on the rectangle path.
     BLOCK_SIZE_K = max(triton.next_power_of_2(max_window), 16)
 
-    # Allocate precomputed intermediates (per-call, not cached).  CB shape
-    # depends on path: replay-style is square (T, T); rectangle is (T, K).
-    cb_T_dim = BLOCK_SIZE_K if use_rectangle else BLOCK_SIZE_T
+    # Allocate precomputed intermediates (per-call, not cached).  Always
+    # allocate (T, K) — the largest layout that any path uses.  Replay-style
+    # paths only touch the first T columns; rectangle/dynamic use the full K.
+    # The few extra unused columns per row are negligible (~6KB per layer at
+    # production sizes) and let the dispatch helpers share one buffer.
     cb_scaled = torch.empty(
-        batch, nheads, BLOCK_SIZE_T, cb_T_dim, device=device, dtype=torch.float32
+        batch, nheads, BLOCK_SIZE_T, BLOCK_SIZE_K, device=device, dtype=torch.float32
     )
     decay_vec = torch.empty(batch, nheads, BLOCK_SIZE_T, device=device, dtype=torch.float32)
 
@@ -1863,346 +3231,305 @@ def checkpointing_state_update(
 
     HAS_CACHE_BATCH_INDICES = state_batch_indices is not None
 
-    with torch.cuda.device(device.index):
-        # --- Precompute kernel ---
-        assert nheads % heads_per_block == 0, (
-            f"nheads ({nheads}) must be divisible by heads_per_block ({heads_per_block})"
+    assert nheads % heads_per_block == 0, (
+        f"nheads ({nheads}) must be divisible by heads_per_block ({heads_per_block})"
+    )
+    assert heads_per_block <= heads_per_group, (
+        f"heads_per_block ({heads_per_block}) must not cross group boundary ({heads_per_group})"
+    )
+
+    # state_scales pointer + strides: real tensor when quantized, otherwise
+    # zero-strided dummy (kernel never reads it because QUANT_MAX==0.0).
+    if is_quantized:
+        state_scales_arg = state_scales
+        state_scales_strides = (
+            state_scales.stride(0),
+            state_scales.stride(1),
+            state_scales.stride(2),
         )
-        assert heads_per_block <= heads_per_group, (
-            f"heads_per_block ({heads_per_block}) must not cross group boundary ({heads_per_group})"
-        )
+    else:
+        state_scales_arg = state  # any valid ptr — gated by QUANT_MAX==0
+        state_scales_strides = (0, 0, 0)
 
-        # state_scales pointer + strides: real tensor when quantized, otherwise
-        # zero-strided dummy (kernel never reads it because QUANT_MAX==0.0).
-        # Hoisted out of the branch so both kernels can share.
-        if is_quantized:
-            state_scales_arg = state_scales
-            state_scales_strides = (
-                state_scales.stride(0),
-                state_scales.stride(1),
-                state_scales.stride(2),
-            )
-        else:
-            state_scales_arg = state  # any valid ptr — gated by QUANT_MAX==0
-            state_scales_strides = (0, 0, 0)
+    # Grid for main kernels (M tiling × batch × nheads).
+    def main_grid(META):
+        return (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
 
-        if use_rectangle:
-            _rectangle_precompute_kernel[(batch, nheads // heads_per_block)](
-                dt,
-                dt_bias,
-                A,
-                B,
-                C,
-                cb_scaled,
-                decay_vec,
-                old_B,
-                old_dt,
-                old_dA_cumsum,
-                cache_buf_idx,
-                prev_num_accepted_tokens,
-                state_batch_indices,
-                pad_slot_id,
-                T,
-                max_window,                      # MAX_REPLAY_BUFFER_LENGTH
-                dstate,
-                nheads // ngroups,
-                # dt strides
-                dt.stride(0),
-                dt.stride(1),
-                dt.stride(2),
-                dt_bias.stride(0) if dt_bias is not None else 0,
-                A.stride(0),
-                # B strides
-                B.stride(0),
-                B.stride(1),
-                B.stride(2),
-                B.stride(3),
-                # C strides
-                C.stride(0),
-                C.stride(1),
-                C.stride(2),
-                C.stride(3),
-                # cb_scaled strides (rectangle)
-                cb_scaled.stride(0),
-                cb_scaled.stride(1),
-                cb_scaled.stride(2),
-                cb_scaled.stride(3),
-                # decay_vec strides
-                decay_vec.stride(0),
-                decay_vec.stride(1),
-                decay_vec.stride(2),
-                # old_B strides
-                old_B.stride(0),
-                old_B.stride(1),
-                old_B.stride(2),
-                old_B.stride(3),
-                old_B.stride(4),
-                # old_dt strides
-                old_dt.stride(0),
-                old_dt.stride(1),
-                old_dt.stride(2),
-                old_dt.stride(3),
-                # old_dA_cumsum strides
-                old_dA_cumsum.stride(0),
-                old_dA_cumsum.stride(1),
-                old_dA_cumsum.stride(2),
-                old_dA_cumsum.stride(3),
-                dt_softplus,
-                HAS_CACHE_BATCH_INDICES=HAS_CACHE_BATCH_INDICES,
-                LAUNCH_WITH_PDL=launch_with_pdl,
-                LAUNCH_DEPENDENT_KERNELS=use_internal_pdl,
-                HEADS_PER_BLOCK=heads_per_block,
-                num_warps=precompute_num_warps,
-                **({"num_stages": _precompute_num_stages} if _precompute_num_stages else {}),
-                launch_pdl=launch_with_pdl,
-            )
+    precomp_grid = (batch, nheads // heads_per_block)
+    d_strides = (D.stride(0), D.stride(1)) if D is not None else (0, 0)
 
-            def grid(META):
-                return (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
+    # ---- Launch helpers (close over locals) -------------------------------
+    # Each helper is a thin closure that calls one Triton kernel with the
+    # full positional + kwarg argument list.  Mode-dependent constexprs
+    # (write_checkpoint, early_out, rectangle) are passed in.
 
-            _rectangle_main_kernel[grid](
-                state,
-                state_scales_arg,
-                old_x,
-                prev_num_accepted_tokens,
-                cache_buf_idx,
-                x,
-                C,
-                D,
-                z,
-                out,
-                cb_scaled,
-                decay_vec,
-                state_batch_indices,
-                pad_slot_id,
-                T,
-                max_window,                      # MAX_REPLAY_BUFFER_LENGTH
-                dim,
-                dstate,
-                nheads // ngroups,
-                # state strides
-                state.stride(0),
-                state.stride(1),
-                state.stride(2),
-                state.stride(3),
-                # state_scales strides (cache, head, dim)
-                state_scales_strides[0],
-                state_scales_strides[1],
-                state_scales_strides[2],
-                # old_x strides
-                old_x.stride(0),
-                old_x.stride(1),
-                old_x.stride(2),
-                old_x.stride(3),
-                # x strides
-                x.stride(0),
-                x.stride(1),
-                x.stride(2),
-                x.stride(3),
-                # C strides
-                C.stride(0),
-                C.stride(1),
-                C.stride(2),
-                C.stride(3),
-                # D strides
-                *(D.stride(0), D.stride(1)) if D is not None else (0, 0),
-                # z strides
-                z_strides[0],
-                z_strides[1],
-                z_strides[2],
-                z_strides[3],
-                # out strides
-                out.stride(0),
-                out.stride(1),
-                out.stride(2),
-                out.stride(3),
-                # cb_scaled strides
-                cb_scaled.stride(0),
-                cb_scaled.stride(1),
-                cb_scaled.stride(2),
-                cb_scaled.stride(3),
-                # decay_vec strides
-                decay_vec.stride(0),
-                decay_vec.stride(1),
-                decay_vec.stride(2),
-                BLOCK_SIZE_M,
-                LAUNCH_WITH_PDL=use_internal_pdl,
-                QUANT_MAX=quant_max,
-                num_warps=num_warps,
-                **({"num_stages": _num_stages} if _num_stages else {}),
-                **({"num_ctas": _num_ctas} if _num_ctas else {}),
-                **({"maxnreg": _maxnreg} if _maxnreg else {}),
-                launch_pdl=use_internal_pdl,
-            )
-            return  # rectangle path done; skip the replay-style launches below
-
-        _checkpointing_precompute_kernel[(batch, nheads // heads_per_block)](
-            dt,
-            dt_bias,
-            A,
-            B,
-            C,
-            cb_scaled,
-            decay_vec,
-            old_B,
-            old_dt,
-            old_dA_cumsum,
-            cache_buf_idx,
-            prev_num_accepted_tokens,
-            state_batch_indices,
-            pad_slot_id,
-            T,
-            dstate,
-            nheads // ngroups,
-            # dt strides
-            dt.stride(0),
-            dt.stride(1),
-            dt.stride(2),
+    def launch_replay_precompute(write_checkpoint: bool, early_out: bool):
+        _checkpointing_precompute_kernel[precomp_grid](
+            dt, dt_bias, A, B, C,
+            cb_scaled, decay_vec,
+            old_B, old_dt, old_dA_cumsum,
+            cache_buf_idx, prev_num_accepted_tokens,
+            state_batch_indices, pad_slot_id,
+            T, max_window, dstate, nheads // ngroups,
+            dt.stride(0), dt.stride(1), dt.stride(2),
             dt_bias.stride(0) if dt_bias is not None else 0,
             A.stride(0),
-            # B strides
-            B.stride(0),
-            B.stride(1),
-            B.stride(2),
-            B.stride(3),
-            # C strides
-            C.stride(0),
-            C.stride(1),
-            C.stride(2),
-            C.stride(3),
-            # cb_scaled strides
-            cb_scaled.stride(0),
-            cb_scaled.stride(1),
-            cb_scaled.stride(2),
-            cb_scaled.stride(3),
-            # decay_vec strides
-            decay_vec.stride(0),
-            decay_vec.stride(1),
-            decay_vec.stride(2),
-            # old_B strides
-            old_B.stride(0),
-            old_B.stride(1),
-            old_B.stride(2),
-            old_B.stride(3),
-            old_B.stride(4),
-            # old_dt strides
-            old_dt.stride(0),
-            old_dt.stride(1),
-            old_dt.stride(2),
-            old_dt.stride(3),
-            # old_dA_cumsum strides
-            old_dA_cumsum.stride(0),
-            old_dA_cumsum.stride(1),
-            old_dA_cumsum.stride(2),
-            old_dA_cumsum.stride(3),
+            B.stride(0), B.stride(1), B.stride(2), B.stride(3),
+            C.stride(0), C.stride(1), C.stride(2), C.stride(3),
+            cb_scaled.stride(0), cb_scaled.stride(1),
+            cb_scaled.stride(2), cb_scaled.stride(3),
+            decay_vec.stride(0), decay_vec.stride(1), decay_vec.stride(2),
+            old_B.stride(0), old_B.stride(1), old_B.stride(2),
+            old_B.stride(3), old_B.stride(4),
+            old_dt.stride(0), old_dt.stride(1),
+            old_dt.stride(2), old_dt.stride(3),
+            old_dA_cumsum.stride(0), old_dA_cumsum.stride(1),
+            old_dA_cumsum.stride(2), old_dA_cumsum.stride(3),
             dt_softplus,
             HAS_CACHE_BATCH_INDICES=HAS_CACHE_BATCH_INDICES,
             LAUNCH_WITH_PDL=launch_with_pdl,
             LAUNCH_DEPENDENT_KERNELS=use_internal_pdl,
             HEADS_PER_BLOCK=heads_per_block,
             WRITE_CHECKPOINT=write_checkpoint,
+            EARLY_OUT=early_out,
             num_warps=precompute_num_warps,
             **({"num_stages": _precompute_num_stages} if _precompute_num_stages else {}),
             launch_pdl=launch_with_pdl,
         )
 
-        # --- Main kernel ---
-        def grid(META):
-            return (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
+    def launch_rectangle_precompute(early_out: bool):
+        _rectangle_precompute_kernel[precomp_grid](
+            dt, dt_bias, A, B, C,
+            cb_scaled, decay_vec,
+            old_B, old_dt, old_dA_cumsum,
+            cache_buf_idx, prev_num_accepted_tokens,
+            state_batch_indices, pad_slot_id,
+            T, max_window, dstate, nheads // ngroups,
+            dt.stride(0), dt.stride(1), dt.stride(2),
+            dt_bias.stride(0) if dt_bias is not None else 0,
+            A.stride(0),
+            B.stride(0), B.stride(1), B.stride(2), B.stride(3),
+            C.stride(0), C.stride(1), C.stride(2), C.stride(3),
+            cb_scaled.stride(0), cb_scaled.stride(1),
+            cb_scaled.stride(2), cb_scaled.stride(3),
+            decay_vec.stride(0), decay_vec.stride(1), decay_vec.stride(2),
+            old_B.stride(0), old_B.stride(1), old_B.stride(2),
+            old_B.stride(3), old_B.stride(4),
+            old_dt.stride(0), old_dt.stride(1),
+            old_dt.stride(2), old_dt.stride(3),
+            old_dA_cumsum.stride(0), old_dA_cumsum.stride(1),
+            old_dA_cumsum.stride(2), old_dA_cumsum.stride(3),
+            dt_softplus,
+            HAS_CACHE_BATCH_INDICES=HAS_CACHE_BATCH_INDICES,
+            LAUNCH_WITH_PDL=launch_with_pdl,
+            LAUNCH_DEPENDENT_KERNELS=use_internal_pdl,
+            HEADS_PER_BLOCK=heads_per_block,
+            EARLY_OUT=early_out,
+            num_warps=precompute_num_warps,
+            **({"num_stages": _precompute_num_stages} if _precompute_num_stages else {}),
+            launch_pdl=launch_with_pdl,
+        )
 
-        _checkpointing_main_kernel[grid](
-            state,
-            state_scales_arg,
-            old_x,
-            old_B,
-            old_dt,
-            old_dA_cumsum,
-            prev_num_accepted_tokens,
-            cache_buf_idx,
-            x,
-            C,
-            D,
-            z,
-            out,
-            cb_scaled,
-            decay_vec,
-            state_batch_indices,
-            rand_seed,
-            pad_slot_id,
-            T,
-            max_window,                      # MAX_REPLAY_BUFFER_LENGTH
-            dim,
-            dstate,
-            nheads // ngroups,
-            # state strides
-            state.stride(0),
-            state.stride(1),
-            state.stride(2),
-            state.stride(3),
-            # state_scales strides (cache, head, dim)
-            state_scales_strides[0],
-            state_scales_strides[1],
-            state_scales_strides[2],
-            # old_x strides (single-buffered: cache, T, nheads, dim)
-            old_x.stride(0),
-            old_x.stride(1),
-            old_x.stride(2),
-            old_x.stride(3),
-            # old_B strides
-            old_B.stride(0),
-            old_B.stride(1),
-            old_B.stride(2),
-            old_B.stride(3),
-            old_B.stride(4),
-            # old_dt strides
-            old_dt.stride(0),
-            old_dt.stride(1),
-            old_dt.stride(2),
-            old_dt.stride(3),
-            # old_dA_cumsum strides
-            old_dA_cumsum.stride(0),
-            old_dA_cumsum.stride(1),
-            old_dA_cumsum.stride(2),
-            old_dA_cumsum.stride(3),
-            # x strides
-            x.stride(0),
-            x.stride(1),
-            x.stride(2),
-            x.stride(3),
-            # C strides
-            C.stride(0),
-            C.stride(1),
-            C.stride(2),
-            C.stride(3),
-            # D strides
-            *(D.stride(0), D.stride(1)) if D is not None else (0, 0),
-            # z strides
-            z_strides[0],
-            z_strides[1],
-            z_strides[2],
-            z_strides[3],
-            # out strides
-            out.stride(0),
-            out.stride(1),
-            out.stride(2),
-            out.stride(3),
-            # cb_scaled strides
-            cb_scaled.stride(0),
-            cb_scaled.stride(1),
-            cb_scaled.stride(2),
-            cb_scaled.stride(3),
-            # decay_vec strides
-            decay_vec.stride(0),
-            decay_vec.stride(1),
-            decay_vec.stride(2),
+    def launch_dynamic_precompute(rectangle: bool):
+        _dynamic_precompute_kernel[precomp_grid](
+            dt, dt_bias, A, B, C,
+            cb_scaled, decay_vec,
+            old_B, old_dt, old_dA_cumsum,
+            cache_buf_idx, prev_num_accepted_tokens,
+            state_batch_indices, pad_slot_id,
+            T, max_window, dstate, nheads // ngroups,
+            dt.stride(0), dt.stride(1), dt.stride(2),
+            dt_bias.stride(0) if dt_bias is not None else 0,
+            A.stride(0),
+            B.stride(0), B.stride(1), B.stride(2), B.stride(3),
+            C.stride(0), C.stride(1), C.stride(2), C.stride(3),
+            cb_scaled.stride(0), cb_scaled.stride(1),
+            cb_scaled.stride(2), cb_scaled.stride(3),
+            decay_vec.stride(0), decay_vec.stride(1), decay_vec.stride(2),
+            old_B.stride(0), old_B.stride(1), old_B.stride(2),
+            old_B.stride(3), old_B.stride(4),
+            old_dt.stride(0), old_dt.stride(1),
+            old_dt.stride(2), old_dt.stride(3),
+            old_dA_cumsum.stride(0), old_dA_cumsum.stride(1),
+            old_dA_cumsum.stride(2), old_dA_cumsum.stride(3),
+            dt_softplus,
+            HAS_CACHE_BATCH_INDICES=HAS_CACHE_BATCH_INDICES,
+            LAUNCH_WITH_PDL=launch_with_pdl,
+            LAUNCH_DEPENDENT_KERNELS=use_internal_pdl,
+            HEADS_PER_BLOCK=heads_per_block,
+            RECTANGLE=rectangle,
+            num_warps=precompute_num_warps,
+            **({"num_stages": _precompute_num_stages} if _precompute_num_stages else {}),
+            launch_pdl=launch_with_pdl,
+        )
+
+    def launch_replay_main(write_checkpoint: bool, early_out: bool,
+                           launch_dependent_kernels: bool = False):
+        _checkpointing_main_kernel[main_grid](
+            state, state_scales_arg, old_x,
+            old_B, old_dt, old_dA_cumsum,
+            prev_num_accepted_tokens, cache_buf_idx,
+            x, C, D, z, out,
+            cb_scaled, decay_vec,
+            state_batch_indices, rand_seed, pad_slot_id,
+            T, max_window, dim, dstate, nheads // ngroups,
+            state.stride(0), state.stride(1), state.stride(2), state.stride(3),
+            state_scales_strides[0], state_scales_strides[1], state_scales_strides[2],
+            old_x.stride(0), old_x.stride(1), old_x.stride(2), old_x.stride(3),
+            old_B.stride(0), old_B.stride(1), old_B.stride(2),
+            old_B.stride(3), old_B.stride(4),
+            old_dt.stride(0), old_dt.stride(1),
+            old_dt.stride(2), old_dt.stride(3),
+            old_dA_cumsum.stride(0), old_dA_cumsum.stride(1),
+            old_dA_cumsum.stride(2), old_dA_cumsum.stride(3),
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            C.stride(0), C.stride(1), C.stride(2), C.stride(3),
+            d_strides[0], d_strides[1],
+            z_strides[0], z_strides[1], z_strides[2], z_strides[3],
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            cb_scaled.stride(0), cb_scaled.stride(1),
+            cb_scaled.stride(2), cb_scaled.stride(3),
+            decay_vec.stride(0), decay_vec.stride(1), decay_vec.stride(2),
             BLOCK_SIZE_M,
             LAUNCH_WITH_PDL=use_internal_pdl,
             PHILOX_ROUNDS=philox_rounds if rand_seed is not None else 0,
             QUANT_MAX=quant_max,
             WRITE_CHECKPOINT=write_checkpoint,
+            EARLY_OUT=early_out,
+            LAUNCH_DEPENDENT_KERNELS=launch_dependent_kernels and use_internal_pdl,
             num_warps=num_warps,
             **({"num_stages": _num_stages} if _num_stages else {}),
             **({"num_ctas": _num_ctas} if _num_ctas else {}),
             **({"maxnreg": _maxnreg} if _maxnreg else {}),
             launch_pdl=use_internal_pdl,
         )
+
+    def launch_rectangle_main(early_out: bool,
+                              launch_dependent_kernels: bool = False):
+        _rectangle_main_kernel[main_grid](
+            state, state_scales_arg, old_x,
+            prev_num_accepted_tokens, cache_buf_idx,
+            x, C, D, z, out,
+            cb_scaled, decay_vec,
+            state_batch_indices, pad_slot_id,
+            T, max_window, dim, dstate, nheads // ngroups,
+            state.stride(0), state.stride(1), state.stride(2), state.stride(3),
+            state_scales_strides[0], state_scales_strides[1], state_scales_strides[2],
+            old_x.stride(0), old_x.stride(1), old_x.stride(2), old_x.stride(3),
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            C.stride(0), C.stride(1), C.stride(2), C.stride(3),
+            d_strides[0], d_strides[1],
+            z_strides[0], z_strides[1], z_strides[2], z_strides[3],
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            cb_scaled.stride(0), cb_scaled.stride(1),
+            cb_scaled.stride(2), cb_scaled.stride(3),
+            decay_vec.stride(0), decay_vec.stride(1), decay_vec.stride(2),
+            BLOCK_SIZE_M,
+            LAUNCH_WITH_PDL=use_internal_pdl,
+            QUANT_MAX=quant_max,
+            EARLY_OUT=early_out,
+            LAUNCH_DEPENDENT_KERNELS=launch_dependent_kernels and use_internal_pdl,
+            num_warps=num_warps,
+            **({"num_stages": _num_stages} if _num_stages else {}),
+            **({"num_ctas": _num_ctas} if _num_ctas else {}),
+            **({"maxnreg": _maxnreg} if _maxnreg else {}),
+            launch_pdl=use_internal_pdl,
+        )
+
+    def launch_dynamic_main(rectangle: bool,
+                            launch_dependent_kernels: bool = False):
+        _dynamic_main_kernel[main_grid](
+            state, state_scales_arg, old_x,
+            old_B, old_dt, old_dA_cumsum,
+            prev_num_accepted_tokens, cache_buf_idx,
+            x, C, D, z, out,
+            cb_scaled, decay_vec,
+            state_batch_indices, rand_seed, pad_slot_id,
+            T, max_window, dim, dstate, nheads // ngroups,
+            state.stride(0), state.stride(1), state.stride(2), state.stride(3),
+            state_scales_strides[0], state_scales_strides[1], state_scales_strides[2],
+            old_x.stride(0), old_x.stride(1), old_x.stride(2), old_x.stride(3),
+            old_B.stride(0), old_B.stride(1), old_B.stride(2),
+            old_B.stride(3), old_B.stride(4),
+            old_dt.stride(0), old_dt.stride(1),
+            old_dt.stride(2), old_dt.stride(3),
+            old_dA_cumsum.stride(0), old_dA_cumsum.stride(1),
+            old_dA_cumsum.stride(2), old_dA_cumsum.stride(3),
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            C.stride(0), C.stride(1), C.stride(2), C.stride(3),
+            d_strides[0], d_strides[1],
+            z_strides[0], z_strides[1], z_strides[2], z_strides[3],
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            cb_scaled.stride(0), cb_scaled.stride(1),
+            cb_scaled.stride(2), cb_scaled.stride(3),
+            decay_vec.stride(0), decay_vec.stride(1), decay_vec.stride(2),
+            BLOCK_SIZE_M,
+            LAUNCH_WITH_PDL=use_internal_pdl,
+            PHILOX_ROUNDS=philox_rounds if rand_seed is not None else 0,
+            QUANT_MAX=quant_max,
+            RECTANGLE=rectangle,
+            LAUNCH_DEPENDENT_KERNELS=launch_dependent_kernels and use_internal_pdl,
+            num_warps=num_warps,
+            **({"num_stages": _num_stages} if _num_stages else {}),
+            **({"num_ctas": _num_ctas} if _num_ctas else {}),
+            **({"maxnreg": _maxnreg} if _maxnreg else {}),
+            launch_pdl=use_internal_pdl,
+        )
+
+    # ---- Mode dispatch ----------------------------------------------------
+    with torch.cuda.device(device.index):
+        if mode == "monolithic":
+            if use_rectangle:
+                launch_rectangle_precompute(early_out=False)
+                launch_rectangle_main(early_out=False)
+            else:
+                launch_replay_precompute(write_checkpoint=write_checkpoint, early_out=False)
+                launch_replay_main(write_checkpoint=write_checkpoint, early_out=False)
+        elif mode == "dynamic":
+            launch_dynamic_precompute(rectangle=rectangle_for_nowrite)
+            launch_dynamic_main(rectangle=rectangle_for_nowrite)
+        elif mode == "maindl":
+            # Shared dispatch precompute, doublelaunched main.  Precompute
+            # runs once with per-slot dispatch (saves the second precomp
+            # empty-grid tax of doublelaunch).  Mains stay split with
+            # EARLY_OUT so each retains its constexpr-specialized reg
+            # envelope.  First main signals PDL dependents so the second
+            # main can start its setup while the first is still computing.
+            launch_dynamic_precompute(rectangle=rectangle_for_nowrite)
+            launch_replay_main(write_checkpoint=True, early_out=True,
+                               launch_dependent_kernels=True)
+            if rectangle_for_nowrite:
+                launch_rectangle_main(early_out=True)
+            else:
+                launch_replay_main(write_checkpoint=False, early_out=True)
+        elif mode == "dlgrouped":
+            # Same 4 kernels as doublelaunch but reordered: both precomputes
+            # first, then both mains.  Lets the GPU run precomp1 || precomp2
+            # in parallel (they're tiny grids) before the mains start, vs
+            # doublelaunch's interleaved precomp1→main1→precomp2→main2.
+            # First main signals PDL so the second main's setup overlaps.
+            launch_replay_precompute(write_checkpoint=True, early_out=True)
+            if rectangle_for_nowrite:
+                launch_rectangle_precompute(early_out=True)
+            else:
+                launch_replay_precompute(write_checkpoint=False, early_out=True)
+            launch_replay_main(write_checkpoint=True, early_out=True,
+                               launch_dependent_kernels=True)
+            if rectangle_for_nowrite:
+                launch_rectangle_main(early_out=True)
+            else:
+                launch_replay_main(write_checkpoint=False, early_out=True)
+        else:  # mode == "doublelaunch"
+            # Write half: always replay-style write.  First main signals
+            # PDL dependents so the second precompute can start its setup
+            # while the first main is still computing.
+            launch_replay_precompute(write_checkpoint=True, early_out=True)
+            launch_replay_main(write_checkpoint=True, early_out=True,
+                               launch_dependent_kernels=True)
+            # Nowrite half: rectangle if asked, else replay-nowrite.
+            if rectangle_for_nowrite:
+                launch_rectangle_precompute(early_out=True)
+                launch_rectangle_main(early_out=True)
+            else:
+                launch_replay_precompute(write_checkpoint=False, early_out=True)
+                launch_replay_main(write_checkpoint=False, early_out=True)
