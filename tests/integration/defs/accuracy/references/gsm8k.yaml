@@ -200,6 +200,10 @@ Qwen/Qwen3.5-4B:
   - quant_algo: FP8_BLOCK_SCALES
     kv_cache_quant_algo: FP8
     accuracy: 80.5
+  - spec_dec_algo: DFlash
+    quant_algo: FP8_BLOCK_SCALES
+    kv_cache_quant_algo: FP8
+    accuracy: 80.5
 Qwen/Qwen3.5-35B-A3B:
   - dtype: bfloat16
     accuracy: 89.196
