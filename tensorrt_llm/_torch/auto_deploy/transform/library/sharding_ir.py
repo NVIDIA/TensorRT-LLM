@@ -984,8 +984,8 @@ def _apply_simple_shard(gm: GraphModule, dc: DistConfig) -> int:
                 gm, dc, weight_nodes, dim=SplitDimension.COLUMN, min_shape=1, fused=None
             )
         # torch_dist_all_gather is the demollm backend op; signature is
-        # (tensor, dim=0) — plain torch.distributed all_gather, no strategy
-        # or symm_mem support (use the trtllm backend for those).
+        # (tensor, dim=0, sizes=None) — plain torch.distributed all_gather,
+        # no strategy or symm_mem support (use the trtllm backend for those).
         with gm.graph.inserting_after(node):
             gather_node = gm.graph.call_function(
                 torch.ops.auto_deploy.torch_dist_all_gather.default,

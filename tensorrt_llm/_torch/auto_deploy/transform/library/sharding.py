@@ -932,7 +932,8 @@ class BMMShardingInfo(ShardingTransformInfo):
         # Add all_gather node after BMM to collect results.
         # BMM sharding always uses the torch (demollm) backend, which is a
         # plain torch.distributed all_gather and has no strategy/symm_mem
-        # knobs. Op signature is (tensor, dim=0).
+        # knobs. Op signature is (tensor, dim=0, sizes=None); `sizes` is
+        # unused on the torch backend (kept only for parity with trtllm).
         with gm.graph.inserting_after(node):
             gather_node = gm.graph.call_function(
                 torch.ops.auto_deploy.torch_dist_all_gather.default,
@@ -1823,7 +1824,7 @@ def _shard_parameter_node(
     all_gather_op, all_reduce_op = _get_dist_ops(config.dist_backend)
     # Per-backend allgather op signatures:
     #   trtllm_dist_all_gather(tensor, strategy, dim=0, sizes=None, workspace_id=0)
-    #   torch_dist_all_gather(tensor, dim=0)   # demollm only — no strategy
+    #   torch_dist_all_gather(tensor, dim=0, sizes=None)   # demollm only, no strategy
     # `strategy` is required on the trtllm op (no default) so the caller cannot
     # accidentally drop the AD-config-selected strategy. The torch op is a plain
     # torch.distributed all_gather and intentionally has no strategy/symm_mem.
