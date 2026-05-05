@@ -75,6 +75,9 @@ public:
         std::optional<uint64_t> requestIdForLog = std::nullopt) noexcept
         : mMgr(&mgr)
         , mIndex(index)
+        // mHeld means this object is responsible for either releasing a
+        // concrete preallocated slot or poisoning dynamic transfer memory on an
+        // unsafe exit. It is therefore true even when index == std::nullopt.
         , mHeld(true)
         , mIsRecv(isRecv)
         , mRequestIdForLog(requestIdForLog)
@@ -123,6 +126,9 @@ public:
         return mIndex;
     }
 
+    /// @brief Whether this holder still owns release/poison responsibility.
+    ///        For dynamic-buffer paths, mIndex can be std::nullopt while this
+    ///        remains true so poison() can still fail closed on unsafe exits.
     [[nodiscard]] bool held() const noexcept
     {
         return mHeld;

@@ -990,9 +990,11 @@ public:
 
     // Overload that takes caller-acquired buffer indices (wrapped in
     // BufferIndexHolders at the call site). requestSync uses this variant so
-    // RAII covers all non-happy-path exits (not-ready, cancel, throw). The
-    // preAcquiredCacheBufferIds vector must have one entry per cache
-    // transfer buffer manager (aligned with
+    // every non-happy-path exit is covered: explicit not-ready releases via
+    // ~BufferIndexHolder, while cancel and exception poison the holders
+    // before the stack unwinds (transport quiescence is unknown on those
+    // paths). The preAcquiredCacheBufferIds vector must have one entry per
+    // cache transfer buffer manager (aligned with
     // AgentConnectionManager::getCacheTransBufferManagers()).
     TransferSession sendRequestInfo(LlmRequest const& llmRequest, std::atomic<bool> const& perRequestCancel,
         std::vector<std::optional<size_t>> preAcquiredCacheBufferIds)
@@ -1037,9 +1039,12 @@ public:
             if (!preAcquiredCacheBufferIds.empty())
             {
                 // requestSync already acquired these indices under RAII
-                // holders — use them as-is so receiveSync's formatter
-                // releases via the existing path while any non-happy-path
-                // exit from requestSync releases via ~BufferIndexHolder.
+                // holders — use them as-is. On the happy path receiveSync's
+                // formatter releases each slot via freeBufferIndexForRecv
+                // and requestSync detaches the holder. On cancel / exception
+                // requestSync explicitly poisons the holders before the
+                // stack unwinds; only the explicit not-ready path falls
+                // through to ~BufferIndexHolder for a normal release.
                 cacheBufferIds = std::move(preAcquiredCacheBufferIds);
                 TLLM_CHECK(!cacheBufferIds.empty());
             }

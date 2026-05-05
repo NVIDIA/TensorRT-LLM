@@ -286,10 +286,19 @@ private:
     // _terminate_request can drop its pybind shared_ptr while the C++ side's
     // raw pointer is still dereferenced by checkGenTransferStatus /
     // checkContextTransferStatus (the UAF forensically confirmed via
-    // MALLOC_PERTURB_=85 producing mRequestId=0x5555555555555555). Entries are
-    // erased only after completion, exception, or timeout plus worker-future
-    // readiness. A timeout/cancel request is not a quiescence proof, so the
-    // tracker must keep the shared_ptr until the worker future resolves.
+    // MALLOC_PERTURB_=85 producing mRequestId=0x5555555555555555).
+    //
+    // Eviction policy is asymmetric:
+    // - mRequesterFutures (gen side): on timeout, keep the entry tracked
+    //   via mTimedOutRequesterIds until the worker future resolves. A
+    //   timeout/cancel is not a quiescence proof on the recv side, so the
+    //   advertised receive buffers may still be written to until the worker
+    //   unwinds. See checkGenTransferStatus.
+    // - mSenderFutures (ctx side): erased immediately on completion,
+    //   exception, or timeout. Sender zombies empirically unwind on peer
+    //   teardown (decode-pod restart), and CacheSender::cancelRequest is
+    //   only required to clear bookkeeping for telemetry / re-enqueue
+    //   paths. See checkContextTransferStatus.
     std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mSenderFutures;
     std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mRequesterFutures;
     std::unordered_set<LlmRequest::RequestIdType> mTimedOutRequesterIds;
