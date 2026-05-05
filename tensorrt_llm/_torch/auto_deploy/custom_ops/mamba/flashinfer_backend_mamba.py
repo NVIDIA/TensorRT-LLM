@@ -182,6 +182,10 @@ def _flashinfer_cached_ssm(
         if use_replay:
             # Replay path: fast-forward SSM state via tl.dot on cached values.
             # State is updated in-place; no disable_state_update needed.
+            # x_extend/B_extend/C_extend are non-contiguous views from the CUDA graph's
+            # preallocated buffer (stride_T > nheads × head_dim). The Triton kernel
+            # handles arbitrary strides via pointer arithmetic; skipping .contiguous()
+            # avoids a captured BF16 copy kernel and reduces GPU time by ~5%.
             replay_selective_state_update(
                 ssm_state_cache,
                 replay_old_x,
@@ -190,17 +194,17 @@ def _flashinfer_cached_ssm(
                 replay_old_da_cumsum,
                 replay_cache_buf_idx,
                 replay_prev_num_accepted,
-                x_extend.contiguous(),
+                x_extend,
                 dt_extend,
                 A_full,
-                B_extend.contiguous(),
-                C_extend.contiguous(),
+                B_extend,
+                C_extend,
                 out=preallocated_ssm_out_e,
                 D=D_full,
                 dt_bias=dt_bias_hp,
                 dt_softplus=True,
                 state_batch_indices=slot_idx_extend_i32,
-                launch_with_pdl=False,  # TODO: enable PDL when conv1d chain is wired
+                launch_with_pdl=False,  # TODO: enable when conv1d PDL chain is wired
             )
         else:
             if intermediate_ssm_state_cache.size(1) < tokens_per_extend:
