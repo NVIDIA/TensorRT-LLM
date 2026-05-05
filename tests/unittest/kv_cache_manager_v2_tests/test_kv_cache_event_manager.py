@@ -482,6 +482,9 @@ def test_v1_and_v2_managers_emit_same_v1_hash_stored_events():
     import tensorrt_llm
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
     from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager as KVCacheManagerV1
+    from tensorrt_llm.bindings.internal.testing import (
+        simulate_prefill_completion_only_use_for_testing,
+    )
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
     from tensorrt_llm.mapping import Mapping
     from tensorrt_llm.sampling_params import SamplingParams
@@ -501,7 +504,6 @@ def test_v1_and_v2_managers_emit_same_v1_hash_stored_events():
         kv_cache_config_v1 = KvCacheConfig(
             event_buffer_max_size=event_buffer_max_size,
             enable_block_reuse=True,
-            onboard_blocks=True,
             max_tokens=256,
             use_kv_cache_manager_v2=False,
         )
@@ -530,6 +532,7 @@ def test_v1_and_v2_managers_emit_same_v1_hash_stored_events():
             is_streaming=False,
         )
         manager_v1.impl.add_sequence(req.py_request_id, req.prompt_len, 1, req)
+        simulate_prefill_completion_only_use_for_testing(req)
         manager_v1.free_resources(req)
         manager_v1.flush_iteration_events()
         v1_events = KVCacheEventSerializer.serialize(manager_v1.get_latest_events(10))
