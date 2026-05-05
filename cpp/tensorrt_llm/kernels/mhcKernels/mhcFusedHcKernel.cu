@@ -565,10 +565,10 @@ void mhcFusedHcAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* 
             hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, stream);
         return;
     case static_cast<int>(FHC_HIDDEN_PRO):
-        mhcFusedHcAllInOneLaunchImpl<FHC_HIDDEN_PRO>(x_prev, residual_prev, post_mix_prev, comb_mix_prev, w_t,
-            hc_scale, hc_base, residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur, y_acc_workspace,
-            r_acc_workspace, done_counter_workspace, M, hidden_size, hc_mult, num_k_splits, rms_eps, hc_pre_eps,
-            hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, stream);
+        mhcFusedHcAllInOneLaunchImpl<FHC_HIDDEN_PRO>(x_prev, residual_prev, post_mix_prev, comb_mix_prev, w_t, hc_scale,
+            hc_base, residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur, y_acc_workspace, r_acc_workspace,
+            done_counter_workspace, M, hidden_size, hc_mult, num_k_splits, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
+            hc_post_mult_value, sinkhorn_repeat, stream);
         return;
     default: return;
     }

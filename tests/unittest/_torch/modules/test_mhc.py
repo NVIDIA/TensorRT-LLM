@@ -619,7 +619,6 @@ def test_mhc_fused_hc_backends(n: int, hidden_size: int, hc_mult: int):
 
     tactic_outputs = {}
     for tactic in _BACKEND_TACTICS_BY_M[n]:
-        backend = tactic[0]
         residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur = runner(
             inputs=make_runner_inputs(), tactic=tactic
         )
