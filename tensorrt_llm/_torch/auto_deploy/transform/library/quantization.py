@@ -13,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+from collections.abc import Sequence
 from functools import partial
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -34,6 +35,7 @@ from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     WeightBiasInfoCache,
     extract_op_args,
+    extract_weight_name,
     extract_weight_nodes,
     get_quantization_params_from_linear_node,
     is_bmm_op,
@@ -174,6 +176,7 @@ class Quantization(BaseTransform):
         gm: GraphModule,
         node: Node,
         is_quantized_graph: bool = False,
+        load_hook_kwargs: Optional[Dict[str, object]] = None,
     ):
         """Replaces the matmul node with a new custom quantized linear node.
 
@@ -218,7 +221,11 @@ class Quantization(BaseTransform):
             lin_weight.submod.register_buffer(scale_name, scale)
 
         gm._register_load_state_dict_pre_hook(
-            partial(self.load_hook, weight_name=lin_weight.node_key)
+            partial(
+                self.load_hook,
+                weight_name=lin_weight.node_key,
+                **(load_hook_kwargs or {}),
+            )
         )
         post_load_hook = getattr(type(self), "post_load_hook", None)
         if post_load_hook is not None and post_load_hook is not Quantization.post_load_hook:
@@ -865,6 +872,11 @@ class FineGrainedFP8LinearQuantization(Quantization):
 
     algo_name = "fp8"
 
+    def _post_init(self):
+        self._weight_block_size = (128, 128)
+        self._runtime_scale_name = "weight_scale_inv"
+        self._default_scales_layout = None
+
     def target_op(self):
         return torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear.default
 
@@ -872,37 +884,110 @@ class FineGrainedFP8LinearQuantization(Quantization):
         return torch.empty_like(w, dtype=torch.float8_e4m3fn, device=w.device)
 
     def scale_names(self) -> List[str]:
-        return ["weight_scale_inv"]
+        return [self._runtime_scale_name]
 
     def default_scales(self, original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
-        # Default block size is 128x128 for FineGrained FP8
+        if self._default_scales_layout is not None:
+            return self._default_scales_layout.default_scales(original_weight_shape)
+
         N, K = original_weight_shape
-        block_n, block_k = 128, 128
+        block_n, block_k = self._weight_block_size
         # Use ceil to handle dimensions smaller than or not divisible by block size
         # (e.g. after TP sharding or small projection weights).
         scale_shape = (math.ceil(N / block_n), math.ceil(K / block_k))
-        return {"weight_scale_inv": torch.ones(scale_shape, dtype=torch.bfloat16)}
+        return {self._runtime_scale_name: torch.ones(scale_shape, dtype=torch.float32)}
 
     def build_custom_args_for_linear(self, scales: Dict[str, Node]) -> Tuple:
-        return ([], [scales["weight_scale_inv"]], [], [])
+        return ([], [scales[self.scale_names()[0]]], [], [])
 
-    def load_hook(self, state_dict, prefix, *args, weight_name: str):
+    @staticmethod
+    def _get_finegrained_fp8_layout(qcfg: Dict):
+        checkpoint_layout = qcfg.get("checkpoint_layout")
+        if checkpoint_layout is None:
+            return None
+        return getattr(checkpoint_layout, "finegrained_fp8", None)
+
+    @staticmethod
+    def _normalize_weight_block_size(block_size: object) -> Tuple[int, int]:
+        if (
+            isinstance(block_size, Sequence)
+            and not isinstance(block_size, str)
+            and len(block_size) == 2
+        ):
+            return int(block_size[0]), int(block_size[1])
+        raise ValueError(f"FineGrained FP8 weight_block_size must have two dims, got {block_size}")
+
+    @staticmethod
+    def _resolve_weight_block_size(qcfg: Dict, checkpoint_layout: object) -> Tuple[int, int]:
+        if checkpoint_layout is not None:
+            return FineGrainedFP8LinearQuantization._normalize_weight_block_size(
+                checkpoint_layout.weight_block_size
+            )
+        if qcfg.get("weight_block_size") is not None:
+            return FineGrainedFP8LinearQuantization._normalize_weight_block_size(
+                qcfg["weight_block_size"]
+            )
+        return 128, 128
+
+    @staticmethod
+    def _add_prefix(prefix: str, name: str) -> str:
+        if prefix and not name.startswith(prefix):
+            return prefix + name
+        return name
+
+    def load_hook(self, state_dict, prefix, *args, weight_name: str, checkpoint_layout=None):
         """Load hook to handle FineGrainedFP8 checkpoint format.
 
         FineGrained FP8 checkpoints store:
         - weight: float8_e4m3fn tensor
         - weight_scale_inv: per-block scale tensor
         """
-        if weight_name not in state_dict:
+        prefix = prefix or ""
+        weight_key = prefix + weight_name
+        if weight_key not in state_dict and weight_name in state_dict:
+            weight_key = weight_name
+        if weight_key not in state_dict:
             return
 
-        weight = state_dict[weight_name]
-        if weight.dtype == torch.float8_e4m3fn:
-            scale_inv_name = weight_name + "_scale_inv"
+        weight = state_dict[weight_key]
+        if weight.dtype != torch.float8_e4m3fn:
+            return
+
+        active_prefix = prefix if weight_key == prefix + weight_name else ""
+        mod_prefix = weight_key.rsplit(".", 1)[0]
+        if checkpoint_layout is None:
+            scale_inv_name = weight_key + "_scale_inv"
             if scale_inv_name in state_dict:
-                # Rename to match our buffer name
-                mod_prefix = weight_name.rsplit(".", 1)[0]
+                # Rename to match our buffer name.
                 state_dict[mod_prefix + ".weight_scale_inv"] = state_dict[scale_inv_name]
+            return
+
+        layout_weight_name = weight_name
+        if weight_key != weight_name and not checkpoint_layout.is_target_weight_name(
+            layout_weight_name
+        ):
+            layout_weight_name = weight_key
+
+        source_name = checkpoint_layout.checkpoint_scale_name(layout_weight_name)
+        target_name = checkpoint_layout.scale_target_name(layout_weight_name)
+        scale_key = self._add_prefix(active_prefix, source_name)
+        if scale_key not in state_dict and source_name in state_dict:
+            scale_key = source_name
+        if scale_key not in state_dict:
+            return
+
+        target_key = self._add_prefix(active_prefix, target_name)
+        scale = state_dict[scale_key]
+        checkpoint_layout.validate_weight_scale_shape(
+            weight_key,
+            weight,
+            scale_key,
+            scale,
+        )
+        decoded_scale = checkpoint_layout.decode_scale(scale)
+        if scale_key != target_key:
+            state_dict.pop(scale_key)
+        state_dict[target_key] = decoded_scale
 
     # NOTE: post_load_hook intentionally inherited as None from the base
     # `Quantization`. UE8M0 conversion + TMA col-major layout for DeepGEMM is
@@ -935,26 +1020,58 @@ class FineGrainedFP8LinearQuantization(Quantization):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
+        checkpoint_layout = self._get_finegrained_fp8_layout(qcfg)
         quant_method = str(qcfg.get("quant_method", "")).lower()
-        if quant_method != self.algo_name:
+        if quant_method != self.algo_name and checkpoint_layout is None:
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
-        if qcfg.get("weight_block_size") is None:
+        if qcfg.get("weight_block_size") is None and checkpoint_layout is None:
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
-        excluded = qcfg.get("modules_to_not_convert", [])
+        self._weight_block_size = self._resolve_weight_block_size(qcfg, checkpoint_layout)
+        self._default_scales_layout = checkpoint_layout
+        self._runtime_scale_name = (
+            checkpoint_layout.runtime_scale_name
+            if checkpoint_layout is not None
+            else "weight_scale_inv"
+        )
+        if checkpoint_layout is not None:
+            excluded = list(
+                dict.fromkeys(
+                    [
+                        *(qcfg.get("exclude_modules") or []),
+                        *(qcfg.get("modules_to_not_convert") or []),
+                    ]
+                )
+            )
+        else:
+            excluded = qcfg.get("modules_to_not_convert") or []
 
         cnt = 0
         with WeightBiasInfoCache():
             for n in gm.graph.nodes:
                 if not is_linear_op(n):
                     continue
-                if should_skip_quantization(n, excluded):
-                    continue
-                self._insert_quantized_linear(gm, n, is_quantized_graph=False)
+                load_hook_kwargs = None
+                if checkpoint_layout is not None:
+                    weight_name = extract_weight_name(n)
+                    if not isinstance(weight_name, str):
+                        continue
+                    if not checkpoint_layout.is_weight_targeted(weight_name, excluded):
+                        continue
+                    load_hook_kwargs = {"checkpoint_layout": checkpoint_layout}
+                else:
+                    if should_skip_quantization(n, excluded):
+                        continue
+                self._insert_quantized_linear(
+                    gm,
+                    n,
+                    is_quantized_graph=False,
+                    load_hook_kwargs=load_hook_kwargs,
+                )
                 cnt += 1
 
         return gm, TransformInfo(

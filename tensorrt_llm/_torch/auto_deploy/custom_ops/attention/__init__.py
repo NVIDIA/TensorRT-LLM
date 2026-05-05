@@ -24,6 +24,7 @@ This module provides various attention implementations and backends:
 """
 
 __all__ = [
+    "deepseek_v4_sparse_attention",
     "torch_attention",
     "torch_backend_attention",
     "flashinfer_attention",

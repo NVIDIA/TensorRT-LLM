@@ -23,10 +23,18 @@ quantization producers by delegating parsing logic to dedicated subclasses.
 import json
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import Any, Callable, Dict, Optional, Tuple, Type
 
 from .._compat import is_modelopt_quant_config, read_modelopt_quant_config
 from ..utils.logger import ad_logger
+from .quant_checkpoint_layout import (
+    QuantCheckpointLayoutRegistry,
+    QuantizedCheckpointLayout,
+    QuantizedCheckpointLayoutError,
+    has_safetensors_metadata,
+    read_safetensors_metadata,
+)
 
 
 class QuantConfigReader(ABC):
@@ -56,7 +64,9 @@ class QuantConfigReader(ABC):
 
     @classmethod
     @abstractmethod
-    def from_file(cls, file_path: str) -> Optional[Tuple["QuantConfigReader", Dict[str, Any]]]:
+    def from_file(
+        cls, file_path: str, require_checkpoint_metadata: bool = True
+    ) -> Optional[Tuple["QuantConfigReader", Dict[str, Any]]]:
         """
         Load and parse a quantization config file from disk.
 
@@ -64,6 +74,8 @@ class QuantConfigReader(ABC):
 
         Args:
             file_path: Path to the quant config JSON file.
+            require_checkpoint_metadata: Whether checkpoint metadata required by the reader must
+                be present during detection.
 
         Returns:
             A (reader, extra_model_kwargs) tuple, or None if the file doesn't exist.
@@ -185,17 +197,20 @@ class ModelOPTQuantConfigReader(QuantConfigReader):
 
     @classmethod
     def from_file(
-        cls, ckpt_dir: str
+        cls, ckpt_dir: str, require_checkpoint_metadata: bool = True
     ) -> Optional[Tuple["ModelOPTQuantConfigReader", Dict[str, Any]]]:
         """
         Load and parse a modelopt-style quantization config from a checkpoint directory.
 
         Args:
             ckpt_dir: Path to the root directory containing the checkpoint.
+            require_checkpoint_metadata: Ignored; ModelOPT quant config detection does not read
+                checkpoint metadata.
 
         Returns:
             An initialized ModelOPTQuantConfigReader instance, or None if the file doesn't exist.
         """
+        _ = require_checkpoint_metadata
         quant_file = os.path.join(ckpt_dir, "hf_quant_config.json")
         if not os.path.exists(quant_file):
             return None
@@ -226,6 +241,18 @@ class HFQuantConfigReader(QuantConfigReader):
         if not qconf:
             raise ValueError("HF quantization_config not found.")
 
+        layout = self._get_checkpoint_layout(config)
+        if layout is not None:
+            tensor_metadata = config.get("checkpoint_tensor_metadata")
+            if not isinstance(tensor_metadata, Mapping):
+                raise QuantizedCheckpointLayoutError(
+                    "HF quantized checkpoint layout requires checkpoint_tensor_metadata."
+                )
+            layout.validate_consumed_metadata(tensor_metadata)
+            self._quant_config = layout.apply_to_quant_config(qconf)
+            self._hf_quantizer = None
+            return {}
+
         # Inject default exclusion, add "model.embed_tokens" for "tie_word_embedding:true" case
         excludes = qconf.get("exclude_modules", [])
         qconf["exclude_modules"] = excludes + [n for n in self._ALWAYS_EXCLUDE if n not in excludes]
@@ -240,8 +267,17 @@ class HFQuantConfigReader(QuantConfigReader):
 
         return {}
 
+    @staticmethod
+    def _get_checkpoint_layout(config: Mapping[str, object]) -> QuantizedCheckpointLayout | None:
+        layout = config.get("checkpoint_layout")
+        if isinstance(layout, QuantizedCheckpointLayout):
+            return layout
+        return QuantCheckpointLayoutRegistry.build_from_config(config)
+
     @classmethod
-    def from_file(cls, ckpt_dir: str) -> Optional[Tuple["HFQuantConfigReader", Dict[str, Any]]]:
+    def from_file(
+        cls, ckpt_dir: str, require_checkpoint_metadata: bool = True
+    ) -> Optional[Tuple["HFQuantConfigReader", Dict[str, Any]]]:
         config_file = os.path.join(ckpt_dir, "config.json")
         if not os.path.exists(config_file):
             return None
@@ -256,6 +292,17 @@ class HFQuantConfigReader(QuantConfigReader):
         quant_method = str(qconf.get("quant_method", "")).lower()
         if quant_method not in cls._SUPPORTED_QUANT_METHODS:
             return None
+
+        layout = QuantCheckpointLayoutRegistry.build_from_config(raw)
+        if layout is not None:
+            if not require_checkpoint_metadata and not has_safetensors_metadata(ckpt_dir):
+                return None
+            raw = dict(raw)
+            raw["checkpoint_layout"] = layout
+            raw["checkpoint_tensor_metadata"] = read_safetensors_metadata(ckpt_dir)
+            reader = cls()
+            extra_model_kwargs = reader.read_config(raw)
+            return reader, extra_model_kwargs
 
         # Validate GPTQ config: currently only INT4 with group_size=128 is supported
         if quant_method == "gptq":
@@ -287,15 +334,22 @@ class HFQuantConfigReader(QuantConfigReader):
 
 def autodetect_quant_config_reader(
     fetched_dir: str,
+    require_checkpoint_metadata: bool = True,
 ) -> Optional[Tuple["QuantConfigReader", Dict[str, Any]]]:
     """Try ModelOPT first; if not found, fall back to HF. Returns (reader, extra_kwargs) or None."""
     reader_cls = QuantConfigReaderRegistry.get("modelopt")
-    result = reader_cls.from_file(fetched_dir)
+    result = reader_cls.from_file(
+        fetched_dir, require_checkpoint_metadata=require_checkpoint_metadata
+    )
     # Fallback to HF reader if ModelOPT not present
     if result is None:
         hf_cls = QuantConfigReaderRegistry.get("hf")
         try:
-            result = hf_cls.from_file(fetched_dir)
+            result = hf_cls.from_file(
+                fetched_dir, require_checkpoint_metadata=require_checkpoint_metadata
+            )
+        except QuantizedCheckpointLayoutError:
+            raise
         except Exception:
             # Skip HF reader if it errors out during probing
             result = None

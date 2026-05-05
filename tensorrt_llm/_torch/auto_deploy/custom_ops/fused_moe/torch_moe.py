@@ -189,6 +189,18 @@ def _resolve_torch_fn(act_fn: ActivationType) -> Callable[[torch.Tensor], torch.
     return torch_fn
 
 
+def _gated_mlp_product(
+    gate_out: torch.Tensor,
+    up_out: torch.Tensor,
+    torch_act_fn: Callable[[torch.Tensor], torch.Tensor],
+    swiglu_limit: float,
+) -> torch.Tensor:
+    if swiglu_limit > 0.0:
+        gate_out = gate_out.clamp(max=swiglu_limit)
+        up_out = up_out.clamp(min=-swiglu_limit, max=swiglu_limit)
+    return torch_act_fn(gate_out) * up_out
+
+
 def _template_moe(
     x: torch.Tensor,
     selected_experts: torch.Tensor,
@@ -283,6 +295,7 @@ def torch_moe(
     w3_weight: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    swiglu_limit: float = 0.0,
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
@@ -306,6 +319,7 @@ def torch_moe(
         is_gated_mlp: If True, use a gated MLP. If False, use a simple MLP.
         act_fn: Activation function applied inside the expert MLP.
             Supported: ActivationType.Silu (default), ActivationType.Relu2 (ReLU then square).
+        swiglu_limit: If positive, clamp gated MLP gate and up projections before the activation/product.
         apply_routing_on_input: If True, multiply routing weights with INPUT before MLP
                                 This means: silu(input * routing_weight)
                                 If False, multiply routing weights with OUTPUT after MLP
@@ -326,7 +340,13 @@ def torch_moe(
             W2 = w2_weight[i]  # (H, I)
             W3 = w3_weight[i]  # (I, H)
             return lambda inp: F.linear(
-                torch_act_fn(F.linear(inp.to(W1.dtype), W1)) * F.linear(inp.to(W3.dtype), W3), W2
+                _gated_mlp_product(
+                    F.linear(inp.to(W1.dtype), W1),
+                    F.linear(inp.to(W3.dtype), W3),
+                    torch_act_fn,
+                    swiglu_limit,
+                ),
+                W2,
             )
 
         mlps = [make_mlp(i) for i in range(len(w1_weight))]
@@ -361,6 +381,7 @@ def torch_moe_fake(
     w3_weight: List[torch.Tensor],
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    swiglu_limit: float = 0.0,
     mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,

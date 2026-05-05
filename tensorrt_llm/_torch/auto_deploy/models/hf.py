@@ -489,7 +489,9 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         # at this point it should be a directory (either the original one or the download dir)
         assert os.path.isdir(fetched_dir), f"Checkpoint path {fetched_dir} is not a directory."
 
-        self._load_quantization_config(fetched_dir)
+        self._load_quantization_config(
+            fetched_dir, require_checkpoint_metadata=not skip_prefetch_weights
+        )
 
         return fetched_dir
 
@@ -615,11 +617,13 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
 
         return all_weights
 
-    def _load_quantization_config(self, fetched_dir: str):
+    def _load_quantization_config(self, fetched_dir: str, require_checkpoint_metadata: bool = True):
         """Load the quantization config from the model directory if not done already."""
         if self._quant_config_reader is not None:
             return
-        result = autodetect_quant_config_reader(fetched_dir)
+        result = autodetect_quant_config_reader(
+            fetched_dir, require_checkpoint_metadata=require_checkpoint_metadata
+        )
         if result is None:
             return
         reader, extra_model_kwargs = result
