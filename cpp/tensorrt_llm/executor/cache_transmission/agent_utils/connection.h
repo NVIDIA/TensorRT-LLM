@@ -25,9 +25,22 @@
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include <map>
+#include <stdexcept>
 
 namespace tensorrt_llm::executor::kv_cache
 {
+
+class AgentTransferCancelledMidTransfer : public std::runtime_error
+{
+public:
+    using std::runtime_error::runtime_error;
+};
+
+class AgentTransferCancelledAfterComplete : public std::runtime_error
+{
+public:
+    using std::runtime_error::runtime_error;
+};
 
 // Generate a unique agent name for NIXL/UCX connection identity.
 // Format: {hostname}_{pid}_{random64}_{counter}
@@ -264,9 +277,14 @@ public:
     // non-null and flipped true before notifySyncMessage runs, the function
     // throws so requestSync can unwind instead of blocking inside a NIXL
     // backend notify call with no visibility into cancellation.
+    //
+    // `advertisedAnyBuffer`, when non-null, is set just before the notify call
+    // that advertises receive-buffer addresses to the peer. Callers use it to
+    // distinguish safe pre-advertise cancellation from unknown-quiescence
+    // cancellation after a peer may have seen writable buffer addresses.
     void sendRequestAndBufferInfo(batch_manager::RequestInfo& requestInfo,
         std::vector<std::optional<size_t>> const& cacheBufferIds, int validConnectionIdx,
-        std::atomic<bool> const* perRequestCancel = nullptr);
+        std::atomic<bool> const* perRequestCancel = nullptr, bool* advertisedAnyBuffer = nullptr);
     void setSenderState(std::vector<MemoryDesc> cacheReceiverBufferDescs, int valideSegmentIdx,
         std::vector<std::pair<size_t, size_t>> offsetRatios, std::vector<uint8_t> bufferKinds);
     void setHasLoadRemoteAgent(bool hasLoadRemoteAgent);

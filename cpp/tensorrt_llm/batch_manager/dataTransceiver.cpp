@@ -995,7 +995,7 @@ public:
     // transfer buffer manager (aligned with
     // AgentConnectionManager::getCacheTransBufferManagers()).
     TransferSession sendRequestInfo(LlmRequest const& llmRequest, std::atomic<bool> const& perRequestCancel,
-        std::vector<std::optional<size_t>> preAcquiredCacheBufferIds)
+        std::vector<std::optional<size_t>> preAcquiredCacheBufferIds, bool* advertisedAnyBuffer = nullptr)
     {
         uint64_t requestId = llmRequest.getContextPhaseParams().value().getReqId();
         auto const& contextState = llmRequest.getDataTransceiverState();
@@ -1149,7 +1149,8 @@ public:
                 TLLM_CHECK(agentConnection != nullptr);
 
                 const_cast<executor::kv_cache::AgentConnection*>(agentConnection)
-                    ->sendRequestAndBufferInfo(requestInfo, idsForRank, validConnectionIdx, &perRequestCancel);
+                    ->sendRequestAndBufferInfo(
+                        requestInfo, idsForRank, validConnectionIdx, &perRequestCancel, advertisedAnyBuffer);
             }
             else
             {
@@ -1434,9 +1435,10 @@ private:
             }
         };
 
+        bool advertisedAnyBuffer = false;
         try
         {
-            auto session = sendRequestInfo(llmRequest, perRequestCancel, std::move(cacheBufferIds));
+            auto session = sendRequestInfo(llmRequest, perRequestCancel, std::move(cacheBufferIds), &advertisedAnyBuffer);
             session.setTime(TransferSession::kTimeRequestInfo);
             // receiveReadySignal blocks inside AgentConnectionManager::waitForNotification's
             // polling loop until the peer sends the ready notification OR the
@@ -1474,7 +1476,7 @@ private:
         }
         catch (...)
         {
-            if (agentConnectionManagerForAcq)
+            if (agentConnectionManagerForAcq && advertisedAnyBuffer)
             {
                 poisonRecvHolders();
             }

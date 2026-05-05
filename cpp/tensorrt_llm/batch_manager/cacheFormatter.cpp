@@ -442,7 +442,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         int deviceId = mCacheManager->getBlockManager().getStreamDevice();
         auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
 
-        if (common::getEnvTryZCopyForKVCacheTransfer()
+        if (cache_formatter_utils::useZeroCopyForCancellableTransfer()
             && (destConfig.getParallelConfig().mPipelineParallelism
                 == selfConfig.getParallelConfig().mPipelineParallelism)
             && (destConfig.getParallelConfig().mTensorParallelism == selfConfig.getParallelConfig().mTensorParallelism))
@@ -451,10 +451,6 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             NVTX3_SCOPED_RANGE(sendBufferFun);
 
             TLLM_CHECK(pickUpConnections.size() == 1);
-            TLLM_CHECK_WITH_INFO(false,
-                "Zero-copy KV cache transfer sends directly from request-owned KV blocks. It is disabled for "
-                "cancellable disaggregated transfers until KV-block leases can prove the peer has stopped reading "
-                "from those blocks before the request is freed.");
 
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
             for (size_t i = 0; i < pickUpConnections.size(); i++)
@@ -574,6 +570,18 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         {
             sendAllBuffers(session, deviceId, outputSplitCaches, bufferCoverTargetNum, preAllocSendBuffer,
                 bufferManager, targetInfo, pickUpConnections);
+        }
+        catch (executor::kv_cache::AgentTransferCancelledAfterComplete const&)
+        {
+            throw;
+        }
+        catch (executor::kv_cache::AgentTransferCancelledMidTransfer const&)
+        {
+            if (agentConnection != nullptr)
+            {
+                sendHolder.poison();
+            }
+            throw;
         }
         catch (...)
         {
@@ -731,7 +739,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
             // non-layer-wise
             int deviceId = bufferManager.getStream().getDevice();
 
-            if (common::getEnvTryZCopyForKVCacheTransfer() && destConfig == selfConfig)
+            if (cache_formatter_utils::useZeroCopyForCancellableTransfer() && destConfig == selfConfig)
             {
                 TLLM_LOG_DEBUG("try zcopy for KV cache");
                 NVTX3_SCOPED_RANGE(recvBufferFun);

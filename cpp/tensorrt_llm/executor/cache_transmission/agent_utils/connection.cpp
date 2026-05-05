@@ -166,7 +166,7 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
                 ctx.getTag(), mRemoteAgentName.c_str(), released);
             TLLM_CHECK_WITH_INFO(
                 released, "AgentConnection::send cancel could not release the backend transfer handle");
-            TLLM_THROW("AgentConnection::send cancelled mid-transfer");
+            throw AgentTransferCancelledMidTransfer("AgentConnection::send cancelled mid-transfer");
         }
     }
     TLLM_CHECK_WITH_INFO(transferState == TransferState::kSUCCESS, "AgentConnection::send failed");
@@ -183,7 +183,7 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
             ctx.getTag(), mRemoteAgentName.c_str(), released);
         TLLM_CHECK_WITH_INFO(
             released, "AgentConnection::send pre-notify cancel could not release the backend transfer handle");
-        TLLM_THROW("AgentConnection::send cancelled pre-notify");
+        throw AgentTransferCancelledAfterComplete("AgentConnection::send cancelled after transfer completed before notify");
     }
     // TODO: there is a bug in request_with_notify https://github.com/ai-dynamo/nixl/pull/252
     mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
@@ -202,10 +202,8 @@ void AgentConnection::recv(DataContext const& ctx, void* data, size_t size) cons
 
 void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& requestInfo,
     std::vector<std::optional<size_t>> const& cacheBufferIds, int connectionIdx,
-    std::atomic<bool> const* perRequestCancel)
+    std::atomic<bool> const* perRequestCancel, bool* advertisedAnyBuffer)
 {
-    TLLM_CHECK(!common::getEnvTryZCopyForKVCacheTransfer());
-
     TLLM_CHECK(!cacheBufferIds.empty());
     TLLM_CHECK(cacheBufferIds.size() <= mCacheTransBufferManagers.size());
 
@@ -265,6 +263,10 @@ void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& reque
             "AgentConnection::sendRequestAndBufferInfo cancelled via perRequestCancel before notify (remote=%s)",
             mRemoteAgentName.c_str());
         TLLM_THROW("sendRequestAndBufferInfo cancelled pre-notify");
+    }
+    if (advertisedAnyBuffer != nullptr)
+    {
+        *advertisedAnyBuffer = true;
     }
     mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
 }

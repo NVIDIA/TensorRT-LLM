@@ -203,7 +203,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         TLLM_CHECK(blockNum > 0);
         int deviceId = mCacheManager->getBlockManager().getStreamDevice();
 
-        if (common::getEnvTryZCopyForKVCacheTransfer()
+        if (cache_formatter_utils::useZeroCopyForCancellableTransfer()
             && destConfig.getParallelConfig().mPipelineParallelism
                 == selfConfig.getParallelConfig().mPipelineParallelism)
         {
@@ -472,7 +472,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
 
         std::optional<int> cacheBufferId = std::nullopt;
 
-        if (common::getEnvTryZCopyForKVCacheTransfer()
+        if (cache_formatter_utils::useZeroCopyForCancellableTransfer()
             && destConfig.getParallelConfig().mPipelineParallelism
                 == selfConfig.getParallelConfig().mPipelineParallelism)
         {

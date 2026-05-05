@@ -29,6 +29,7 @@
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <NvInferRuntimeBase.h>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -118,6 +119,23 @@ inline std::vector<size_t> pickSendConnections(size_t numConnections, CacheState
 {
     return pickSendConnections(numConnections, selfConfig, selfIdx, destConfig, counterPartRanks,
         executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx));
+}
+
+inline bool useZeroCopyForCancellableTransfer()
+{
+    if (!common::getEnvTryZCopyForKVCacheTransfer())
+    {
+        return false;
+    }
+    static std::atomic_bool warned{false};
+    if (!warned.exchange(true, std::memory_order_relaxed))
+    {
+        TLLM_LOG_WARNING(
+            "Ignoring TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER for cancellable disaggregated transfers. "
+            "Zero-copy sends directly to/from request-owned cache memory and cannot be safely reused after timeout "
+            "cancellation without a transport quiescence proof; using staged transfer buffers instead.");
+    }
+    return false;
 }
 
 /**

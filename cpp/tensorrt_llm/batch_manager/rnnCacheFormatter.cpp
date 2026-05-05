@@ -80,7 +80,7 @@ void RnnCacheFormatter::format(TransferSession& session)
     auto const& selfLayersPerPP = selfConfig.getRnnCacheState().mLayerNumPerPP;
     SizeType32 const numLocalLayers = selfLayersPerPP[selfPPRank];
 
-    if (common::getEnvTryZCopyForKVCacheTransfer() && destConfig == selfConfig)
+    if (cache_formatter_utils::useZeroCopyForCancellableTransfer() && destConfig == selfConfig)
     {
         TLLM_LOG_DEBUG("Try using zero-copy for the RNN cache.");
         NVTX3_SCOPED_RANGE(RnnZeroCopySend);
@@ -245,7 +245,7 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     auto const& selfLayersPerPP = selfConfig.getRnnCacheState().mLayerNumPerPP;
     SizeType32 const numLocalLayers = selfLayersPerPP[selfPPRank];
 
-    if (common::getEnvTryZCopyForKVCacheTransfer() && destConfig == selfConfig)
+    if (cache_formatter_utils::useZeroCopyForCancellableTransfer() && destConfig == selfConfig)
     {
         TLLM_LOG_DEBUG("try zcopy for RNN cache");
         NVTX3_SCOPED_RANGE(RnnZeroCopyRecv);
