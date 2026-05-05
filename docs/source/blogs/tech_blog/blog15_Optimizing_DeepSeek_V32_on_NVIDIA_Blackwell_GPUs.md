@@ -198,6 +198,8 @@ We use the data that is exported from real datasets across different layers. The
 
 Overall, by replacing the DE-version Top-K from PyTorch with our customized non-DE Top-K kernel, which brings 25%~40% and 14%~24% e2e speedup for the low latency and throughput scenarios.
 
+Follow-up work further optimizes this decode-stage selector with Guess-Verify-Refine (GVR) Top-K, which reuses temporal correlation between consecutive decode steps and dispatches between GVR and the production radix path with hardware-aware thresholds. See [Tech Blog 21](blog21_Temporal_Correlation_Meets_Sparse_Attention.md) for the newer GVR path and its enablement details.
+
 #### DeepGEMM MQA Kernel
 The DeepGEMM MQA kernel computes logits for the Top-K selection process. To enhance efficiency on Blackwell GPUs, several optimizations were implemented targeting both performance and ease of use:
 

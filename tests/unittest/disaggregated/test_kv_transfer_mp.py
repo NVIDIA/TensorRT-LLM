@@ -11,7 +11,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus
+from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus, TokenRange
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -331,11 +331,15 @@ def worker_fn(
                 kv_cache_manager.get_batch_cache_indices([ctx_request.py_request_id])[0],
                 dtype=np.int64,
             )
-            send_kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[block_ids])
-            send_future = sender_session.send(send_kv_slice)
+            send_kv_slice = KVSlice(
+                is_last_slice=True,
+                block_ids_per_layer_groups=[block_ids],
+                token_range=TokenRange(start=0, end=req_len),
+            )
+            sender_session.send(send_kv_slice)
 
             # Wait for send to complete
-            send_future.result()
+            sender_session.wait_complete()
             assert sender_session.status == SessionStatus.KV_TRANSFERRED
 
             # Get block data for verification
@@ -373,11 +377,15 @@ def worker_fn(
                 kv_cache_manager.get_batch_cache_indices([gen_request.py_request_id])[0],
                 dtype=np.int64,
             )
-            recv_kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[block_ids])
-            recv_future = receiver_session.receive(recv_kv_slice)
+            recv_kv_slice = KVSlice(
+                is_last_slice=True,
+                block_ids_per_layer_groups=[block_ids],
+                token_range=TokenRange(start=0, end=req_len),
+            )
+            receiver_session.receive(recv_kv_slice)
 
             # Wait for receive to complete
-            recv_future.result()
+            receiver_session.wait_complete(blocking=True)
             assert receiver_session.status == SessionStatus.KV_TRANSFERRED
 
             # Get block data for verification

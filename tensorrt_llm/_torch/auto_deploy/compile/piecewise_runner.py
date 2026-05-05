@@ -313,6 +313,22 @@ class ADPiecewiseRunner(nn.Module):
         """
         self._next_dynamic_out_infos[dynamic_submod_id] = info
 
+    def finalize_capture(self, num_tokens: int) -> None:
+        """Release strong dynamic output refs after downstream captures finish.
+
+        Dynamic output buffers are allocated inside the preceding static runner's
+        graph capture, but following static runners consume them as inputs during
+        the same split-graph capture.  Keep the real tensor objects live until
+        that whole bucket capture finishes so the shared graph pool cannot reuse
+        their addresses for downstream graph outputs.  Runtime only needs stable
+        addresses, so weak refs are enough after capture.
+        """
+        entry = self.entries.get(num_tokens)
+        if entry is None:
+            return
+        for submod_id, buf in list(entry.dynamic_out_bufs.items()):
+            entry.dynamic_out_bufs[submod_id] = make_weak_ref(buf)
+
     def get_dynamic_out_buf(
         self, num_tokens: int, dynamic_submod_id: int
     ) -> Optional[torch.Tensor]:
@@ -383,7 +399,7 @@ class ADPiecewiseRunner(nn.Module):
             entry.cuda_graph = graph
             entry.static_output = make_weak_ref(output)
             for submod_id, buf in dynamic_out_bufs.items():
-                entry.dynamic_out_bufs[submod_id] = make_weak_ref(buf)
+                entry.dynamic_out_bufs[submod_id] = buf
 
             # Debug: record input addresses for assertion in replay
             flat_args, _ = tree_flatten((args, kwargs))

@@ -1,9 +1,10 @@
 import dataclasses
+import inspect
 from abc import ABC, abstractmethod
 from collections import namedtuple
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Set
+from typing import Any, Callable, Optional, Set, TypeAlias, TypeVar
 
 from strenum import StrEnum
 
@@ -15,6 +16,38 @@ from tensorrt_llm.logger import logger
 from ..llm_request import LlmRequest, LlmRequestState
 
 RequestList = list[LlmRequest]
+PrefixReuseSummary: TypeAlias = tb_internal.batch_manager.PrefixReuseSummary
+PrefixSummaryCache: TypeAlias = dict[int, PrefixReuseSummary]
+T = TypeVar("T")
+
+
+def _call_with_optional_summary(
+    fn: Callable[..., T],
+    *args: Any,
+    cached_summary: Optional[PrefixReuseSummary] = None,
+) -> T:
+    """Call ``fn(*args)`` and, if supported, pass ``cached_summary`` as a kwarg.
+
+    The nanobind binding for ``get_remaining_blocks_to_completion`` and
+    ``get_needed_blocks_one_step`` accepts ``cached_summary: PrefixReuseSummary | None = None``
+    so the C++ side can skip a redundant radix-tree walk. Test mocks may not
+    accept this kwarg yet; inspect the callable before passing it so real
+    ``TypeError`` exceptions from inside ``fn`` are not hidden.
+    """
+    if cached_summary is None:
+        return fn(*args)
+
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn(*args, cached_summary=cached_summary)
+    if not any(
+        param.name == "cached_summary" or param.kind == inspect.Parameter.VAR_KEYWORD
+        for param in signature.parameters.values()
+    ):
+        return fn(*args)
+    return fn(*args, cached_summary=cached_summary)
+
 
 SchedulerOutput = namedtuple(
     "SchedulerOutput",
@@ -435,7 +468,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                     # No Chunking: Schedule full context
                     # C++ uses getNumTokens(beam=0) which is tokens.size() - numPreDecodedTokens
                     base_tokens = req.get_num_tokens(0)
-                    draft_tokens = req.num_draft_tokens if req.has_draft_tokens else 0
+                    draft_tokens = req.num_draft_tokens if req.has_draft_tokens() else 0
                     req_num_tokens = base_tokens + draft_tokens
 
                     context_compute = _reuse_adjusted_compute(
@@ -464,7 +497,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
 
                     draft_tokens = (
                         req.num_draft_tokens
-                        if (req.is_last_context_chunk and req.has_draft_tokens)
+                        if (req.is_last_context_chunk and req.has_draft_tokens())
                         else 0
                     )
                     # Compute cost: context compute + draft tokens
@@ -788,7 +821,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         )
 
         for req in requests:
-            if req.is_last_context_chunk and req.has_draft_tokens:
+            if req.is_last_context_chunk and req.has_draft_tokens():
                 remainder = req.context_chunk_size % unit_size
                 remaining_space = 0 if remainder == 0 else unit_size - remainder
 
@@ -796,11 +829,18 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                     remaining_context_len = self.max_context_length - req.context_chunk_size
                     remaining_space = min(remaining_space, remaining_context_len)
 
-                if capacity is not None:
-                    remaining_space = min(remaining_space, capacity - num_ctx_tokens)
-                    num_ctx_tokens += remaining_space
+                remaining_space = max(0, remaining_space)
+                kept_drafts = min(req.num_draft_tokens, remaining_space)
 
-                draft_discard = req.num_draft_tokens - remaining_space
+                if capacity is not None:
+                    # capacity - num_ctx_tokens can go negative if the request
+                    # batch has already overshot the compute budget. Clamp at 0
+                    # and only charge the draft tokens that actually remain
+                    # attached to this request.
+                    kept_drafts = max(0, min(kept_drafts, capacity - num_ctx_tokens))
+                    num_ctx_tokens += kept_drafts
+
+                draft_discard = req.num_draft_tokens - kept_drafts
                 if draft_discard > 0:
                     logger.debug(f"Discarding {draft_discard} draft tokens")
                     req.discard_draft_tokens(draft_discard)
@@ -876,6 +916,11 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
 
         newly_contributed_context_blocks: Set = set()
         newly_contributed_cross_context_blocks: Set = set()
+        # Summary caches are populated lazily by _beneficial_to_skip during the
+        # pending-loop; enough_available_blocks / decrement_reserved_blocks read
+        # them via .get() so only requests that actually walked the tree pay
+        # the cost. Mirrors C++ capacityScheduler.cpp's single-walk-per-request.
+        summary_by_req, cross_summary_by_req = scheduler._make_prefix_summary_caches()
         if not self.static_batch and skipping_is_relevant:
             newly_contributed_context_blocks, newly_contributed_cross_context_blocks = (
                 scheduler._prefill_contributed_blocks(active_requests)
@@ -936,6 +981,8 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                             req,
                             newly_contributed_context_blocks,
                             newly_contributed_cross_context_blocks,
+                            summary_by_req=summary_by_req,
+                            cross_summary_by_req=cross_summary_by_req,
                         )
                     ):
                         continue
@@ -943,11 +990,25 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                     if len(scheduled_requests) >= scheduler.max_num_requests:
                         break
 
+                    # Read cache AFTER _beneficial_to_skip so the
+                    # now-populated PrefixReuseSummary is reused by
+                    # enough_available_blocks / decrement_reserved_blocks.
+                    # Mirrors the inline pattern used by
+                    # MaxUtilizationPolicy.schedule and the C++
+                    # single-walk-per-request convention.
+                    req_id = req.py_request_id
+                    cached_summary = summary_by_req.get(req_id)
+                    cached_cross_summary = cross_summary_by_req.get(req_id)
+
                     if req.is_context_init_state or req.is_disagg_generation_init_state:
-                        enough_blocks = reserved_blocks.enough_available_blocks(req)
+                        enough_blocks = reserved_blocks.enough_available_blocks(
+                            req, cached_summary=cached_summary
+                        )
                         enough_cross_blocks = True
                         if reserved_cross_blocks is not None:
-                            enough_cross_blocks = reserved_cross_blocks.enough_available_blocks(req)
+                            enough_cross_blocks = reserved_cross_blocks.enough_available_blocks(
+                                req, cached_summary=cached_cross_summary
+                            )
 
                         if not enough_blocks or not enough_cross_blocks:
                             break
@@ -964,9 +1025,13 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                                 uniq_task_ids.add(lora_task_id)
 
                         scheduled_requests.append(req)
-                        reserved_blocks.decrement_reserved_blocks(req)
+                        reserved_blocks.decrement_reserved_blocks(
+                            req, cached_summary=cached_summary
+                        )
                         if reserved_cross_blocks is not None:
-                            reserved_cross_blocks.decrement_reserved_blocks(req)
+                            reserved_cross_blocks.decrement_reserved_blocks(
+                                req, cached_summary=cached_cross_summary
+                            )
 
         return scheduled_requests, []
 
@@ -992,6 +1057,10 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
         seen_task_ids: set[int] = set()
 
         newly_contributed_context_blocks, _ = scheduler._prefill_contributed_blocks(active_requests)
+        # Summary cache populated lazily by _beneficial_to_skip; consumed by
+        # prepare_blocks_if_schedulable. See comment in
+        # GuaranteedNoEvictPolicy.schedule for rationale.
+        summary_by_req, _ = scheduler._make_prefix_summary_caches()
 
         def is_started_request(req: LlmRequest) -> bool:
             if not scheduler._can_be_scheduled(req):
@@ -1020,7 +1089,10 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
                 continue
 
             if skipping_is_relevant and scheduler._beneficial_to_skip(
-                req, newly_contributed_context_blocks, set()
+                req,
+                newly_contributed_context_blocks,
+                set(),
+                summary_by_req=summary_by_req,
             ):
                 req_it += 1
                 continue
@@ -1032,6 +1104,7 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
                 scheduled_blocks_manager,
                 num_scheduled_peft_pages,
                 seen_task_ids,
+                cached_summary=summary_by_req.get(req.py_request_id),
             )
 
             if was_scheduled:
@@ -1065,11 +1138,14 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
         scheduled_blocks_manager: "MaxUtilizationScheduledBlocksManager",
         num_scheduled_peft_pages: int,
         seen_task_ids: set[int],
+        cached_summary: Optional[PrefixReuseSummary] = None,
     ) -> bool:
         if len(scheduled_requests) >= scheduler.max_num_requests:
             return False
 
-        blocks_if_scheduled = scheduled_blocks_manager.prepare_blocks_if_schedulable(req)
+        blocks_if_scheduled = scheduled_blocks_manager.prepare_blocks_if_schedulable(
+            req, cached_summary=cached_summary
+        )
         if blocks_if_scheduled is None:
             return False
 
@@ -1113,22 +1189,43 @@ class NoEvictScheduledBlocksManager:
         stats = kv_cache_manager.get_kv_cache_stats()
         self.available_blocks: dict[int, int] = dict(stats.num_free_blocks_per_window_size)
 
-    def decrement_reserved_blocks(self, req: LlmRequest) -> None:
+    def decrement_reserved_blocks(
+        self, req: LlmRequest, cached_summary: Optional[PrefixReuseSummary] = None
+    ) -> None:
         """
         Decrement available blocks by the blocks needed to complete this request.
+
+        If ``cached_summary`` (a ``PrefixReuseSummary``) is provided, it is forwarded to
+        ``get_remaining_blocks_to_completion`` so the C++ side skips re-walking the radix tree.
         C++ reference: scheduledBlocksManager.h:40-46
         """
         for window_size in self.available_blocks:
-            needed = self.kv_cache_manager.get_remaining_blocks_to_completion(req, window_size)
+            needed = _call_with_optional_summary(
+                self.kv_cache_manager.get_remaining_blocks_to_completion,
+                req,
+                window_size,
+                cached_summary=cached_summary,
+            )
             self.available_blocks[window_size] -= needed
 
-    def enough_available_blocks(self, req: LlmRequest) -> bool:
+    def enough_available_blocks(
+        self, req: LlmRequest, cached_summary: Optional[PrefixReuseSummary] = None
+    ) -> bool:
         """
         Check if there are enough available blocks for this request across all window sizes.
+
+        If ``cached_summary`` (a ``PrefixReuseSummary``) is provided, it is forwarded to
+        ``get_remaining_blocks_to_completion`` so the C++ side skips re-walking the radix tree.
         C++ reference: scheduledBlocksManager.h:48-57
         """
         return all(
-            self.kv_cache_manager.get_remaining_blocks_to_completion(req, ws) <= avail
+            _call_with_optional_summary(
+                self.kv_cache_manager.get_remaining_blocks_to_completion,
+                req,
+                ws,
+                cached_summary=cached_summary,
+            )
+            <= avail
             for ws, avail in self.available_blocks.items()
         )
 
@@ -1151,16 +1248,25 @@ class MaxUtilizationScheduledBlocksManager:
         window_sizes = set(kv_cache_manager.max_attention_window_vec)
         self.num_scheduled_blocks: dict[int, int] = {ws: 0 for ws in window_sizes}
 
-    def prepare_blocks_if_schedulable(self, req: LlmRequest) -> Optional[dict[int, int]]:
+    def prepare_blocks_if_schedulable(
+        self, req: LlmRequest, cached_summary: Optional[PrefixReuseSummary] = None
+    ) -> Optional[dict[int, int]]:
         """
         Check if request can be scheduled and return new block counts if so.
         Returns None if request cannot fit.
+
+        If ``cached_summary`` (a ``PrefixReuseSummary``) is provided, it is forwarded to
+        ``get_needed_blocks_one_step`` so the C++ side skips re-walking the radix tree.
         C++ reference: scheduledBlocksManager.h:80-100
         """
         blocks_if_scheduled = {}
         for window_size, num_scheduled in self.num_scheduled_blocks.items():
-            required = self.kv_cache_manager.get_needed_blocks_one_step(
-                req, self.two_steps_look_ahead, window_size
+            required = _call_with_optional_summary(
+                self.kv_cache_manager.get_needed_blocks_one_step,
+                req,
+                self.two_steps_look_ahead,
+                window_size,
+                cached_summary=cached_summary,
             )
             logger.debug(
                 f"MaxUtilizationScheduler: request ID {req.request_id} "
@@ -1330,11 +1436,17 @@ class PyCapacityScheduler:
 
         return newly_contributed_context_blocks, newly_contributed_cross_context_blocks
 
+    def _make_prefix_summary_caches(self) -> tuple[PrefixSummaryCache, PrefixSummaryCache]:
+        """Build empty caches for `PrefixReuseSummary` keyed by `py_request_id`."""
+        return {}, {}
+
     def _beneficial_to_skip(
         self,
         req: LlmRequest,
         newly_contributed_context_blocks: set,
         newly_contributed_cross_context_blocks: set,
+        summary_by_req: Optional[PrefixSummaryCache] = None,
+        cross_summary_by_req: Optional[PrefixSummaryCache] = None,
     ) -> bool:
         """
         Check if it's beneficial to skip this request.
@@ -1351,10 +1463,19 @@ class PyCapacityScheduler:
 
         ctx_new_block = None
         cross_new_block = None
+        req_id = req.py_request_id
 
         if self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse:
-            unique_tokens = req.get_unique_tokens(0)
-            summary = self.kv_cache_manager.analyze_prefix_reuse(unique_tokens, req)
+            # Use the cached summary when present; otherwise walk the tree
+            # once and stash the result so later helpers
+            # (`enough_available_blocks`, `decrement_reserved_blocks`) can
+            # reuse it. This mirrors C++ capacityScheduler.cpp:295-302.
+            summary = summary_by_req.get(req_id) if summary_by_req is not None else None
+            if summary is None:
+                unique_tokens = req.get_unique_tokens(0)
+                summary = self.kv_cache_manager.analyze_prefix_reuse(unique_tokens, req)
+                if summary_by_req is not None:
+                    summary_by_req[req_id] = summary
             if summary.first_new_block is not None:
                 if summary.first_new_block in newly_contributed_context_blocks:
                     return True
@@ -1364,15 +1485,19 @@ class PyCapacityScheduler:
             self.cross_kv_cache_manager is not None
             and self.cross_kv_cache_manager.enable_block_reuse
         ):
-            encoder_unique_tokens = req.get_encoder_unique_tokens()
-            if encoder_unique_tokens is not None:
-                summary = self.cross_kv_cache_manager.analyze_prefix_reuse(
-                    encoder_unique_tokens, req
-                )
-                if summary.first_new_block is not None:
-                    if summary.first_new_block in newly_contributed_cross_context_blocks:
-                        return True
-                    cross_new_block = summary.first_new_block
+            summary = cross_summary_by_req.get(req_id) if cross_summary_by_req is not None else None
+            if summary is None:
+                encoder_unique_tokens = req.get_encoder_unique_tokens()
+                if encoder_unique_tokens is not None:
+                    summary = self.cross_kv_cache_manager.analyze_prefix_reuse(
+                        encoder_unique_tokens, req
+                    )
+                    if cross_summary_by_req is not None:
+                        cross_summary_by_req[req_id] = summary
+            if summary is not None and summary.first_new_block is not None:
+                if summary.first_new_block in newly_contributed_cross_context_blocks:
+                    return True
+                cross_new_block = summary.first_new_block
 
         # Request is NOT skipped — register contributions so subsequent duplicate
         # requests can be deferred correctly.

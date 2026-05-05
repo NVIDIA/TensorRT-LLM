@@ -236,6 +236,9 @@ transforms:
   fuse_rope_into_trtllm_attention:
     stage: post_load_fusion
     enabled: false
+  fuse_rope_into_trtllm_mla:
+    stage: post_load_fusion
+    enabled: false
   optimize_rope:
     stage: post_load_fusion
   ############################################################################################

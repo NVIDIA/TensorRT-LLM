@@ -80,3 +80,24 @@ jobs:
               repo: context.repo.repo,
               body: helpMessage
             });
+
+  Bot-command-leading-whitespace:
+    name: Bot command leading whitespace warning
+    if: |
+      !startsWith(github.event.comment.body, '/bot') &&
+      contains(github.event.comment.body, '/bot')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Warn about leading whitespace
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const body = context.payload.comment.body;
+            if (/^\s+\/bot\b/.test(body)) {
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: ":warning: **Bot command ignored**: The `/bot` command must appear at the very beginning of the comment (no leading blank lines or spaces). Please post a new comment with `/bot` as the first character."
+              });
+            }

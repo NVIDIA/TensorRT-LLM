@@ -3,8 +3,8 @@ import torch
 from utils.util import skip_pre_hopper
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy._compat import ActivationType  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.load_moe_align import moe_align_block_size
-from tensorrt_llm._torch.utils import ActivationType  # noqa: F401
 
 
 def _pack_routed_tokens_reference(
