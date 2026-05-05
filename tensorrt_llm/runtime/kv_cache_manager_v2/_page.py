@@ -478,36 +478,6 @@ def batched_lock_to_gpu(
 
 
 @dataclass(slots=True)
-class TempSlotLock:
-    "Just allocated and not yet assigned to kv_cache. So no event sync required."
-
-    slot: Slot
-    manager: ReferenceType["StorageManager"]
-    level: CacheLevel
-    life_cycle: LifeCycleId
-
-    def __init__(
-        self, slot: Slot, manager: "StorageManager", level: CacheLevel, life_cycle: LifeCycleId
-    ):
-        self.slot = slot.move_to_new_slot()
-        self.manager = rawref.ref(manager)
-        self.level = level
-        self.life_cycle = life_cycle
-
-    def detach_slot(self) -> Slot:
-        assert self.slot.has_valid_slot
-        return self.slot.move_to_new_slot()
-
-    def unlock(self):
-        assert self.slot.has_valid_slot
-        unwrap_rawref(self.manager).release_slot(self.life_cycle, self.level, self.slot)
-
-    def __del__(self):
-        if self.slot.has_valid_slot:
-            self.unlock()
-
-
-@dataclass(slots=True)
 class ScratchSlotLock:
     slot: Slot
     owner: rawref.ref["_KVCache"]
@@ -536,11 +506,3 @@ class ScratchSlotLock:
     def __del__(self):
         if self.slot.has_valid_slot:
             self.unlock()
-
-    @staticmethod
-    def from_TempSlotLock(
-        src: TempSlotLock, kv_cache: "_KVCache", skip_wait: bool = False
-    ) -> "ScratchSlotLock":
-        "src.slot will be invalid after this"
-        assert src.level == GPU_LEVEL
-        return ScratchSlotLock(src.slot, kv_cache, src.life_cycle, skip_wait)

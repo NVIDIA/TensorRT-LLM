@@ -42,7 +42,14 @@ from .._common import (
 )
 from .._copy_engine import CopyTask, batched_copy
 from .._exceptions import LogicError, OutOfPagesError
-from .._life_cycle_registry import AttnLifeCycle, LayerGroupId, LifeCycle, LifeCycleId, SsmLifeCycle
+from .._life_cycle_registry import (
+    AttnLifeCycle,
+    LayerGroupId,
+    LifeCycle,
+    LifeCycleId,
+    SsmLifeCycle,
+    compute_scratch_range,
+)
 from .._page import (
     BatchedLockTarget,
     BlockPage,
@@ -63,7 +70,6 @@ from .._utils import (
     expect_type,
     filled_list,
     find_index,
-    intersect,
     make_typed,
     map_optional,
     stream_wait_events,
@@ -408,6 +414,8 @@ class _KVCache:
         The returned ScratchDesc contains the scratch block ordinal range and the
         slot IDs for the scratch coalesced slots. Pass this to PageIndexConverter
         together with get_base_page_indices() to produce per-layer page indices.
+
+        The returned ScratchDesc is invalidated by the next capacity/history_length update.
         """
         lc = self.manager._life_cycles[layer_group_id]
         sr = self._get_scratch_range(lc)
@@ -425,9 +433,12 @@ class _KVCache:
         """True if this KV cache currently has scratch slots allocated."""
         return any(len(s) > 0 for s in self._scratch_slots)
 
-    @property
-    def page_index_mode(self) -> PageIndexMode:
-        return PageIndexMode.PER_LAYER if self.has_scratch_slots else PageIndexMode.SHARED
+    def supports_index_mode(self, mode: PageIndexMode) -> bool:
+        match mode:
+            case PageIndexMode.PER_LAYER:
+                return True
+            case PageIndexMode.SHARED:
+                return not self.has_scratch_slots
 
     # reserve space for next inference. Request new blocks from KVCacheManager if necessary.
     # if capacity is increased and beam_width > 1, blocks containing new tokens should be allocated for each beam.
@@ -1328,21 +1339,11 @@ class _KVCache:
           for the current chunk. Blocks before this range already contain real KV data
           from previous chunks and must not be overwritten.
         """
-        if (
-            not self.manager.enable_swa_scratch_reuse
-            or not isinstance(life_cycle, AttnLifeCycle)
-            or life_cycle.window_size is None
-        ):
+        if not self.manager.enable_swa_scratch_reuse:
             return HalfOpenRange(BlockOrdinal(0), BlockOrdinal(0))
         history_length = value_or(history_length_override, self.history_length)
         capacity = value_or(capacity_override, self.capacity)
-        tokens_per_block = self.tokens_per_block
-        cap_stale = life_cycle.get_stale_range(capacity, tokens_per_block)
-        input_range = HalfOpenRange(
-            BlockOrdinal(div_up(history_length, tokens_per_block)),
-            BlockOrdinal(div_up(capacity, tokens_per_block)),
-        )
-        return intersect(cap_stale, input_range)
+        return compute_scratch_range(life_cycle, history_length, capacity, self.tokens_per_block)
 
     @staticmethod
     def _get_stale_range(

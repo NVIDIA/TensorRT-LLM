@@ -30,7 +30,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         TokenIdExt,
         _KVCache,
     )
-    from kv_cache_manager_v2._common import BAD_PAGE_INDEX, NDEBUG, MemAddress
+    from kv_cache_manager_v2._common import BAD_PAGE_INDEX, NDEBUG, MemAddress, PageIndexMode
     from kv_cache_manager_v2._utils import (
         HalfOpenRange,
         div_up,
@@ -53,7 +53,12 @@ else:
         TokenIdExt,
         _KVCache,
     )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX, NDEBUG, MemAddress
+    from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
+        BAD_PAGE_INDEX,
+        NDEBUG,
+        MemAddress,
+        PageIndexMode,
+    )
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
         HalfOpenRange,
         div_up,
@@ -149,7 +154,11 @@ class FakeEngine:
         is_ssm = isinstance(layer_cfg, SsmLayerConfig)
         tokens_per_block = 1 if is_ssm else self.tokens_per_block_map[layer_id][buf_id]
         token_bytes = buf.size if is_ssm else exact_div(buf.size, tokens_per_block)
-        index_mode = kv_cache.page_index_mode
+        index_mode = (
+            PageIndexMode.SHARED
+            if kv_cache.supports_index_mode(PageIndexMode.SHARED)
+            else PageIndexMode.PER_LAYER
+        )
         pool = manager.get_mem_pool_base_address(layer_id, role, index_mode)
         stride = manager.get_page_stride(layer_id, role)
         lc_id = manager._storage._layer_to_life_cycle_ids[layer_id]
@@ -221,7 +230,11 @@ class FakeEngine:
         is_ssm = isinstance(layer_cfg, SsmLayerConfig)
         tokens_per_block = 1 if is_ssm else self.tokens_per_block_map[layer_id][buf_id]
         token_bytes = buf.size if is_ssm else exact_div(buf.size, tokens_per_block)
-        index_mode = kv_cache.page_index_mode
+        index_mode = (
+            PageIndexMode.SHARED
+            if kv_cache.supports_index_mode(PageIndexMode.SHARED)
+            else PageIndexMode.PER_LAYER
+        )
         pool = manager.get_mem_pool_base_address(layer_id, role, index_mode)
         stride = manager.get_page_stride(layer_id, role)
         lc_id = manager._storage._layer_to_life_cycle_ids[layer_id]

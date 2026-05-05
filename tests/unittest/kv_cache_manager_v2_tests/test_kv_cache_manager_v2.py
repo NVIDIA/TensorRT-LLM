@@ -56,6 +56,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         GPU_LEVEL,
         CacheTier,
         MemAddress,
+        PageIndexMode,
         PageStatus,
         SlidingWindowSize,
     )
@@ -105,6 +106,7 @@ else:
         GPU_LEVEL,
         CacheTier,
         MemAddress,
+        PageIndexMode,
         PageStatus,
         SlidingWindowSize,
     )
@@ -1571,35 +1573,50 @@ class TestInitRatioConfig(unittest.TestCase):
         typical_step: BatchDesc | None = None,
         constraints: list[BatchDesc] | None = None,
         host_quota: int = 0,
+        num_windowed_layers: int = 1,
+        num_full_layers: int = 1,
+        enable_swa_scratch_reuse: bool = False,
     ) -> KVCacheManagerConfig:
         """Create a config with two pool groups (windowed vs non-windowed).
 
         Uses large, non-power-of-2 buffer sizes so 2MB granularity rounding
         is non-trivial and constraint clamping is exercised.
+
+        With num_windowed_layers / num_full_layers > 1 and
+        enable_swa_scratch_reuse=True, multiple layers per lifecycle give
+        frac_max < 1, making scratch savings visible in capacity planning.
         """
-        windowed_buf = [BufferConfig(role=Role.KEY, size=self.PG0_SLOT_SIZE)]
-        full_buf = [BufferConfig(role=Role.KEY, size=self.PG1_SLOT_SIZE)]
         cache_tiers: list = [GpuCacheTierConfig(quota=gpu_quota)]
         if host_quota > 0:
             cache_tiers.append(HostCacheTierConfig(quota=host_quota))
+        layers: list = []
+        lid = 0
+        for _ in range(num_windowed_layers):
+            layers.append(
+                AttentionLayerConfig(
+                    layer_id=LayerId(lid),
+                    buffers=[BufferConfig(role=Role.KEY, size=self.PG0_SLOT_SIZE)],
+                    sliding_window_size=self.WINDOW_SIZE,
+                    num_sink_tokens=self.SINK_TOKENS,
+                )
+            )
+            lid += 1
+        for _ in range(num_full_layers):
+            layers.append(
+                AttentionLayerConfig(
+                    layer_id=LayerId(lid),
+                    buffers=[BufferConfig(role=Role.KEY, size=self.PG1_SLOT_SIZE)],
+                )
+            )
+            lid += 1
         return KVCacheManagerConfig(
             tokens_per_block=self.TOKENS_PER_BLOCK,
             vocab_size=4096,
             cache_tiers=cache_tiers,
-            layers=[
-                AttentionLayerConfig(
-                    layer_id=LayerId(0),
-                    buffers=deepcopy(windowed_buf),
-                    sliding_window_size=self.WINDOW_SIZE,
-                    num_sink_tokens=self.SINK_TOKENS,
-                ),
-                AttentionLayerConfig(
-                    layer_id=LayerId(1),
-                    buffers=deepcopy(full_buf),
-                ),
-            ],
+            layers=layers,
             typical_step=typical_step,
             constraints=constraints or [],
+            enable_swa_scratch_reuse=enable_swa_scratch_reuse,
         )
 
     def test_default_init_ratio(self):
@@ -1863,6 +1880,119 @@ class TestInitRatioConfig(unittest.TestCase):
         mgr_no_constraint.shutdown()
         mgr_with_constraint.shutdown()
 
+    # ----- scratch-aware capacity planning tests -----
+
+    def test_typical_step_scratch_reduces_windowed_ratio(self):
+        """With scratch reuse, windowed PG needs fewer slots during prefill.
+
+        16 SWA layers (frac_max=1/16) + 16 full layers.
+        Typical step: 4 prefill requests (history=0, capacity=4096).
+
+        Without scratch: both PGs need the same block count; ratio reflects
+        the buffer-size difference only.
+        With scratch: PG0 needs far fewer slots -> ratio shifts toward PG1.
+        """
+        step = BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=0)] * 4)
+        multi = dict(num_windowed_layers=16, num_full_layers=16)
+        cfg_no = self._make_config(typical_step=step, enable_swa_scratch_reuse=False, **multi)
+        cfg_yes = self._make_config(typical_step=step, enable_swa_scratch_reuse=True, **multi)
+        mgr_no = KVCacheManager(cfg_no)
+        mgr_yes = KVCacheManager(cfg_yes)
+        ratio_no = mgr_no._current_gpu_ratio
+        ratio_yes = mgr_yes._current_gpu_ratio
+
+        # With scratch: PG0 (windowed) needs far fewer slots.
+        self.assertLess(ratio_yes[0], ratio_no[0])
+        self.assertGreater(ratio_yes[1], ratio_no[1])
+
+        mgr_no.shutdown()
+        mgr_yes.shutdown()
+
+    def test_constraint_with_scratch_accounts_for_scratch(self):
+        """Constraint clamping uses scratch-aware slot counts.
+
+        Tight quota computed from scratch-aware slot needs.  The batch runs
+        successfully because constraint clamping allocates the right number
+        of slots per pool group.
+        """
+        tpb = self.TOKENS_PER_BLOCK
+        num_windowed = 16
+        num_full = 16
+        num_requests = 4
+        capacity = 512
+        history = 0
+        granularity = 2 << 20
+
+        total_blocks = div_up(capacity, tpb)  # 16
+
+        # PG1 (non-windowed): no stale blocks.
+        slots_pg1 = num_requests * total_blocks
+
+        # PG0 (windowed) with scratch.
+        # stale_at_capacity = [sink_blocks, (cap+1-window)//tpb)
+        num_sink_blocks = div_up(self.SINK_TOKENS, tpb)  # 1
+        stale_beg = min(total_blocks, num_sink_blocks)  # 1
+        stale_end_at_cap = max(stale_beg, (capacity + 1 - self.WINDOW_SIZE) // tpb)  # 12
+        # scratch = intersect([1,12), [0,16)) = [1,12) -> 11 blocks
+        num_scratch_blocks = stale_end_at_cap - stale_beg
+        # frac_max = 1/num_windowed, so scratch_slots = ceil(N / num_windowed)
+        scratch_slots_per_req = div_up(num_scratch_blocks, num_windowed)  # ceil(11/16)=1
+        normal_blocks = total_blocks - num_scratch_blocks  # 5
+        slots_pg0 = num_requests * (normal_blocks + scratch_slots_per_req)
+
+        # Slot sizes: num_layers_in_group * per-layer buffer size.
+        pg0_slot_size = num_windowed * self.PG0_SLOT_SIZE
+        pg1_slot_size = num_full * self.PG1_SLOT_SIZE
+
+        pg0_bytes = round_up(slots_pg0 * pg0_slot_size, granularity)
+        pg1_bytes = round_up(slots_pg1 * pg1_slot_size, granularity)
+        gpu_quota = pg0_bytes + pg1_bytes
+
+        constraint = BatchDesc(
+            kv_caches=[KVCacheDesc(capacity=capacity, history_length=history)] * num_requests,
+        )
+        # typical_step: long-sequence decode (pushes ratio away from PG0).
+        typical = BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=4000)])
+
+        cfg = self._make_config(
+            gpu_quota=gpu_quota,
+            typical_step=typical,
+            constraints=[constraint],
+            enable_swa_scratch_reuse=True,
+            host_quota=gpu_quota,
+            num_windowed_layers=num_windowed,
+            num_full_layers=num_full,
+        )
+        manager = KVCacheManager(cfg)
+
+        # Verify constraint clamping: each pool group has enough slots.
+        stats = manager._storage.get_statistics()
+        self.assertGreaterEqual(
+            stats[0].total,
+            slots_pg0,
+            f"Pool group 0 must have >= {slots_pg0} slots for constraint batch",
+        )
+        self.assertGreaterEqual(
+            stats[1].total,
+            slots_pg1,
+            f"Pool group 1 must have >= {slots_pg1} slots for constraint batch",
+        )
+
+        # Run the constrained batch to verify it actually works.
+        # With scratch reuse enabled, must use resize() instead of capacity setter.
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        kv_caches = []
+        for _ in range(num_requests):
+            kv = manager.create_kv_cache()
+            kv.resume(stream)
+            success = kv.resize(capacity)
+            self.assertTrue(success, "resize should succeed with scratch-aware constraint")
+            kv_caches.append(kv)
+        for kv in kv_caches:
+            kv.close()
+        manager.shutdown()
+
 
 class TestScratchReuse(TestKVCacheManagerV2):
     """Tests for SWA prefill memory reuse (scratch slots)."""
@@ -2062,7 +2192,7 @@ class TestScratchReuse(TestKVCacheManagerV2):
             # Verify PageIndexConverter.convert_all produces correct per-layer indices
             layer_id = LayerId(0)
             converter = self.manager.get_page_index_converter(layer_id, DataRole("key"))
-            page_indices = converter(indices, kv.page_index_mode, scratch_desc)
+            page_indices = converter(indices, PageIndexMode.PER_LAYER, scratch_desc)
             # All scratch blocks should produce valid (non-BAD) page indices
             for i in range(scratch_desc.range.beg, scratch_desc.range.end):
                 self.assertNotEqual(

@@ -115,12 +115,15 @@ class ScratchDesc:
     range: HalfOpenRange[BlockOrdinal]  # block ordinal range [beg, end)
     slot_ids: Sequence[int]  # scratch slot IDs, length = ceil(num_scratch_blocks / scale)
 
+    def __bool__(self) -> bool:
+        return bool(self.range)
+
 
 @dataclass(slots=True, frozen=True)
 class PageIndexConverter:
     scale: int
     expansion: int
-    layer_offset: int | None  # sub-page offset within coalesced slot
+    layer_offset: int  # sub-page offset within coalesced slot
     scratch_pages_per_block: int = 1
 
     def __call__(
@@ -142,28 +145,23 @@ class PageIndexConverter:
 
         Args:
             base_indices: Per-block base page indices (slot IDs), from get_base_page_indices().
-            index_mode: Optional index mode, must be provided if layer_offset is not None.
+            index_mode: Page index mode. None defaults to SHARED; must be explicit when
+                scratch is active (scratch requires PER_LAYER).
             scratch: Optional scratch metadata from _KVCache.get_scratch_desc().
         """
-        if self.layer_offset is None:
-            assert index_mode is None or index_mode == PageIndexMode.SHARED, (
-                "index_mode must be SHARED when layer_offset is None"
-            )
+        if index_mode is None:
+            assert not scratch, "index_mode must be provided when scratch is active"
             index_mode = PageIndexMode.SHARED
-        elif index_mode is None:
-            raise ValueError("index_mode must be provided when layer_offset is not None")
 
         scale = self.scale
         expansion = self.expansion
-        applied_layer_offset = (
-            (self.layer_offset or 0) if index_mode == PageIndexMode.PER_LAYER else 0
-        )
+        applied_layer_offset = self.layer_offset if index_mode == PageIndexMode.PER_LAYER else 0
         scratch_pages = self.scratch_pages_per_block
         result = list[int]()
 
         for ordinal, base_index in enumerate(base_indices):
             index: int
-            if scratch is not None and ordinal in scratch.range:
+            if scratch and ordinal in scratch.range:
                 # Scratch block: slot IDs come from ScratchDesc, not base_indices
                 block_pos = ordinal - scratch.range.beg
                 total_offset = block_pos * scratch_pages
@@ -230,6 +228,7 @@ class KVCacheManager:
             self._life_cycles,
             storage_config,
             config.tokens_per_block,
+            config.enable_swa_scratch_reuse,
             typical_batch=config.typical_step,
             constraints=config.constraints,
         )
@@ -328,12 +327,14 @@ class KVCacheManager:
         """
         Get the converter to convert from base page indices to per-layer page indices
         expected by operators/kernels.
+
+        The returned converter is constant and usable by all kv cache instances.
         """
         storage = self._storage
         attr = storage.get_buffer_attr(layer_id, data_role)
         layer_attr = storage.get_layer_attr(layer_id)
         scale = storage._slot_to_page_indices[attr.life_cycle_id][attr.pool_index]
-        layer_offset = exact_div(attr.offset, attr.size) if self.enable_swa_scratch_reuse else None
+        layer_offset = exact_div(attr.offset, attr.size)
         return PageIndexConverter(
             scale, attr.expansion, layer_offset, layer_attr.slot_util[attr.pool_index]
         )
@@ -410,6 +411,20 @@ class KVCacheManager:
     @property
     def enable_swa_scratch_reuse(self) -> bool:
         return self._init_config.enable_swa_scratch_reuse
+
+    def supports_index_mode(self, mode: PageIndexMode) -> bool | None:
+        """Whether managed KV caches support the given page index mode.
+
+        Returns:
+            True  — the mode is supported by every KV cache.
+            False — the mode is not supported by any KV cache.
+            None  — support is per-instance; check _KVCache.supports_index_mode().
+        """
+        match mode:
+            case PageIndexMode.PER_LAYER:
+                return True
+            case PageIndexMode.SHARED:
+                return None if self.enable_swa_scratch_reuse else True
 
     @property
     def num_layers(self) -> int:

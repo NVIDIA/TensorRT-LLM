@@ -26,6 +26,7 @@ from ._common import (
     GPU_LEVEL,
     NDEBUG,
     Address,
+    BlockOrdinal,
     CacheLevel,
     CacheTier,
     LayerId,
@@ -36,7 +37,7 @@ from ._config import BatchDesc, CacheTierConfig, DataRole, DiskCacheTierConfig, 
 from ._copy_engine import CopyTask, batched_copy
 from ._eviction_controller import EvictablePage, PerLevelEvictionController
 from ._exceptions import OutOfPagesError
-from ._life_cycle_registry import LifeCycleId, LifeCycleRegistry
+from ._life_cycle_registry import LifeCycleId, LifeCycleRegistry, compute_scratch_range
 from ._page import Page
 from ._storage import CacheLevelStorage
 from ._storage._config import BufferAttr, BufferId, LayerAttr, SlotDesc, StorageConfig
@@ -188,6 +189,7 @@ class StorageManager:
         life_cycles: LifeCycleRegistry,
         config: StorageConfig,
         tokens_per_block: int,
+        enable_swa_scratch_reuse: bool,
         typical_batch: BatchDesc | None = None,
         constraints: list[BatchDesc] | None = None,
     ) -> None:
@@ -214,12 +216,14 @@ class StorageManager:
         gpu_granularity = CacheLevelManager.cache_tier_granularity(CacheTier.GPU_MEM, gpu_quota)
 
         self._min_slots = self._compute_min_slots_from_constraints(
-            constraints or [], tokens_per_block
+            constraints or [], tokens_per_block, enable_swa_scratch_reuse
         )
 
         # Compute init_ratio from typical_batch, constraints, or fallback.
         if typical_batch is not None:
-            init_ratio = self.ratio_from_batch(typical_batch, tokens_per_block, gpu_granularity)
+            init_ratio = self.ratio_from_batch(
+                typical_batch, tokens_per_block, enable_swa_scratch_reuse, gpu_granularity
+            )
         elif constraints:
             # Use the constraint slot counts as the ratio basis.
             min_bytes = self._slots_to_bytes(self._min_slots, gpu_granularity)
@@ -229,6 +233,7 @@ class StorageManager:
             init_ratio = self.ratio_from_batch(
                 BatchDesc([KVCacheDesc(capacity=2049, history_length=2048)]),
                 tokens_per_block,
+                enable_swa_scratch_reuse,
                 gpu_granularity,
             )
 
@@ -740,17 +745,21 @@ class StorageManager:
         return typed_map(num_bytes, lambda x: x / total)
 
     def ratio_from_batch(
-        self, batch: BatchDesc, tokens_per_block: int, granularity: int
+        self,
+        batch: BatchDesc,
+        tokens_per_block: int,
+        enable_swa_scratch_reuse: bool,
+        granularity: int,
     ) -> TypedIndexList[PoolGroupIndex, float]:
         """Compute the ratio of bytes needed per pool group for a batch described by a BatchDesc."""
-        num_slots = self._compute_slots_for_batch(batch, tokens_per_block)
+        num_slots = self._compute_slots_for_batch(batch, tokens_per_block, enable_swa_scratch_reuse)
         num_bytes = self._slots_to_bytes(num_slots, granularity)
         total = sum(num_bytes)
         assert total > 0
         return typed_map(num_bytes, lambda x: x / total)
 
     def _compute_min_slots_from_constraints(
-        self, constraints: list[BatchDesc], tokens_per_block: int
+        self, constraints: list[BatchDesc], tokens_per_block: int, enable_swa_scratch_reuse: bool
     ) -> TypedIndexList[PoolGroupIndex, int]:
         """Compute the minimum slots per pool group across all constraints (element-wise max).
 
@@ -761,13 +770,13 @@ class StorageManager:
         for pg_idx in self._life_cycle_grouping:
             max_slots[pg_idx] += 1
         for batch in constraints:
-            slots = self._compute_slots_for_batch(batch, tokens_per_block)
+            slots = self._compute_slots_for_batch(batch, tokens_per_block, enable_swa_scratch_reuse)
             for pg_idx in typed_range(self.num_pool_groups):
                 max_slots[pg_idx] = max(max_slots[pg_idx], slots[pg_idx])
         return max_slots
 
     def _compute_slots_for_batch(
-        self, batch: BatchDesc, tokens_per_block: int
+        self, batch: BatchDesc, tokens_per_block: int, enable_swa_scratch_reuse: bool
     ) -> TypedIndexList[PoolGroupIndex, int]:
         """Compute the minimum number of slots per pool group to support a BatchDesc."""
         num_slots = filled_list(0, self.num_pool_groups)
@@ -782,7 +791,7 @@ class StorageManager:
             # Shared sys blocks (counted once): union of non-stale sys blocks across all requests.
             # A sys block needs memory if it's non-stale for ANY request.
             # = sys_blocks - (blocks stale for ALL requests within [0, sys_blocks))
-            sys_range = HalfOpenRange(0, sys_blocks)
+            sys_range = HalfOpenRange(BlockOrdinal(0), BlockOrdinal(sys_blocks))
             # Intersection of per-request stale ranges, clamped to sys_range.
             stale_intersection = sys_range
             for kv in batch.kv_caches:
@@ -796,7 +805,20 @@ class StorageManager:
                 non_stale = total_blocks - len(stale)
                 # Non-stale sys blocks for this request.
                 non_stale_sys = sys_blocks - len(intersect(stale, sys_range))
-                num_slots[pg_idx] += max(0, non_stale - non_stale_sys)
+                unique_non_stale = max(0, non_stale - non_stale_sys)
+                if enable_swa_scratch_reuse:
+                    scratch = compute_scratch_range(
+                        lc, kv.history_length, kv.capacity, tokens_per_block
+                    )
+                    # Scratch blocks are always input blocks, so they never
+                    # overlap with shared sys blocks (which are history).
+                    num_scratch = len(scratch)
+                    frac_max = self._slot_util_frac_max[lc_idx]
+                    num_slots[pg_idx] += (unique_non_stale - num_scratch) + math.ceil(
+                        num_scratch * frac_max
+                    )
+                else:
+                    num_slots[pg_idx] += unique_non_stale
         return num_slots
 
     def _slots_to_bytes(
