@@ -74,20 +74,36 @@ StagingBuffer::StagingBuffer(StagingBufferManager& manager, size_t minSize, size
     , mStream(stream)
 {
     if (minSize > manager.totalSize())
+    {
         throw std::invalid_argument("StagingBuffer: minSize exceeds total staging buffer size");
+    }
 
     std::unique_lock<std::mutex> lock(mManager.mMutex);
 
-    // Compute how many grains to use.
-    size_t available = mManager.suggestNextMaxGrains() * kGranularity;
+    // Compute how many contiguous grains to use. If the suffix cannot satisfy
+    // the required minimum, skip it and wrap before allocating.
+    size_t const minGrains = divUp(minSize, kGranularity);
+    size_t availableGrains = mManager.suggestNextMaxGrains();
+    if (minGrains > availableGrains)
+    {
+        mManager.mNext = 0;
+        availableGrains = mManager.suggestNextMaxGrains();
+    }
+    assert(minGrains <= availableGrains);
+
+    size_t const available = availableGrains * kGranularity;
     size_t actualSize = std::min(maxSize, available);
     actualSize = std::max(actualSize, minSize);
     mNumGrains = divUp(actualSize, kGranularity);
+    assert(mNumGrains <= availableGrains);
     mSize = mNumGrains * kGranularity;
     mStartGrain = mManager.mNext;
     mManager.mNext += mNumGrains;
-    if (mManager.mNext >= mManager.numGrains())
+    assert(mManager.mNext <= mManager.numGrains());
+    if (mManager.mNext == mManager.numGrains())
+    {
         mManager.mNext = 0;
+    }
 
     mAddress = mManager.baseAddress() + mStartGrain * kGranularity;
     lock.unlock();

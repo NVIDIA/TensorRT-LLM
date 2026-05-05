@@ -994,9 +994,9 @@ class _KVCache:
         ssm_lock = expect_type(_SharedPageLock, self._ssm_blocks[beam_idx][ssm_lc_id])
         src_page = ssm_lock.page
         pg_idx = storage.get_pool_group_index(ssm_lc_id)
-        # Try to find a slot in any cache level, starting from the source page's level
-        for i in range(storage.num_cache_levels):
-            lvl = CacheLevel(i + src_page.cache_level)
+        # Try levels from the source page's level through the coldest level.
+        for lvl_int in range(src_page.cache_level, storage.num_cache_levels):
+            lvl = CacheLevel(lvl_int)
             try:
                 new_slot = storage.new_slots_for_pool_group(lvl, pg_idx, 1)[0]
             except OutOfPagesError:

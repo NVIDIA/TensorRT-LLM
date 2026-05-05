@@ -59,6 +59,7 @@ if _BACKEND == "python":
         DataRole,
         DiskCacheTierConfig,
         GpuCacheTierConfig,
+        HelixConfig,
         HostCacheTierConfig,
         KVCacheDesc,
         KVCacheManagerConfig,
@@ -68,6 +69,7 @@ if _BACKEND == "python":
         DEFAULT_BEAM_INDEX,
         AggregatedPageDesc,
         BeamIndex,
+        ExpandedBuffer,
         KVCacheManager,
         PageIndexConverter,
         ScratchDesc,
@@ -80,12 +82,13 @@ if _BACKEND == "python":
 else:
     from . import rawref  # noqa: F401
     from ._block_radix_tree import gen_multi_modal_tokens  # noqa: F401
-    from ._common import BAD_PAGE_INDEX, GPU_LEVEL, NDEBUG, PageIndexMode  # noqa: F401
+    from ._common import PageIndexMode  # noqa: F401
     from ._core import ScratchDesc  # noqa: F401
 
     # C++ nanobind backend — import heavy classes from bindings
     if "tensorrt_llm" in sys.modules:
         from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2 import (  # noqa: F401
+            NDEBUG,
             AggregatedPageDesc,
             AttentionLayerConfig,
             BatchDesc,
@@ -94,7 +97,9 @@ else:
             BufferId,
             CacheTier,
             DiskCacheTierConfig,
+            ExpandedBuffer,
             GpuCacheTierConfig,
+            HelixConfig,
             HostCacheTierConfig,
             KVCacheDesc,
             KVCacheManager,
@@ -113,6 +118,7 @@ else:
         sys.path.insert(0, _trtllm_root)
         try:
             from bindings.internal.batch_manager.kv_cache_manager_v2 import (  # noqa: F401
+                NDEBUG,
                 AggregatedPageDesc,
                 AttentionLayerConfig,
                 BatchDesc,
@@ -121,7 +127,9 @@ else:
                 BufferId,
                 CacheTier,
                 DiskCacheTierConfig,
+                ExpandedBuffer,
                 GpuCacheTierConfig,
+                HelixConfig,
                 HostCacheTierConfig,
                 KVCacheDesc,
                 KVCacheManager,
@@ -150,7 +158,9 @@ else:
     SlidingWindowSize = Optional[int]
     TokenId = int
     TokenIdExt = Union[int, bytes]
+    BAD_PAGE_INDEX = -1
     DEFAULT_BEAM_INDEX = 0
+    GPU_LEVEL = 0
 
 __all__ = [
     "AggregatedPageDesc",
@@ -168,8 +178,10 @@ __all__ = [
     "DEFAULT_BEAM_INDEX",
     "DataRole",
     "DiskCacheTierConfig",
+    "ExpandedBuffer",
     "GPU_LEVEL",
     "GpuCacheTierConfig",
+    "HelixConfig",
     "HostCacheTierConfig",
     "KVCacheDesc",
     "KVCacheManager",

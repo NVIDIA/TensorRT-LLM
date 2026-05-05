@@ -22,12 +22,12 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
-bool gNdebug = true; // default: release mode
-
-void initNdebug()
+bool const gNdebug = []() noexcept
 {
+    // Accepted translation mismatch: Python computes this at module import
+    // time, while C++ snapshots it when the shared library is loaded.
     char const* val = std::getenv("TLLM_KV_CACHE_MANAGER_V2_DEBUG");
-    gNdebug = !(val && std::stoi(val) != 0);
-}
+    return val == nullptr or std::atoi(val) == 0;
+}();
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
