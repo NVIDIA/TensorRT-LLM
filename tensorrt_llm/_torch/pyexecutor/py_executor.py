@@ -3681,9 +3681,8 @@ class PyExecutor:
         if self._fatal_error is not None:
             self.executor_request_queue.enqueue_shutdown_request()
 
-    def _has_unquiesced_disagg_transfers(self,
-                                         requests: Iterable[LlmRequest]
-                                         ) -> bool:
+    def _has_unquiesced_disagg_transfers(
+            self, requests: Iterable[LlmRequest]) -> bool:
         return any(req.is_disagg_generation_transmission_in_progress
                    or req.is_disagg_context_transmission_state
                    for req in requests)
@@ -3719,6 +3718,7 @@ class PyExecutor:
         self.request_accumulated.clear()
         self.control_requests.clear()
         self.is_shutdown = True
+        self.shutdown_event.set()
         self._enqueue_responses(list(error_responses.items()))
         with self.response_cv:
             self.response_cv.notify_all()

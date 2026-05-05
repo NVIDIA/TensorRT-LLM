@@ -272,7 +272,17 @@ public:
     void setHasLoadRemoteAgent(bool hasLoadRemoteAgent);
     [[nodiscard]] bool hasLoadRemoteAgent() const;
     void sendReadySignal(DataContext const& ctx, bool isReady) const;
+    /// @brief Wait for the peer's ready signal. Returns the peer's ready
+    ///        bit, collapsing cancel/no-signal into `false`. Callers that
+    ///        need to distinguish "peer said not-ready" from "wait was
+    ///        cancelled" must use `recvReadySignalWithStatus`.
     bool recvReadySignal(DataContext const& ctx) const;
+    /// @brief Tri-state variant of `recvReadySignal`. Returns the peer's
+    ///        ready bit when a signal arrived, or `std::nullopt` if the
+    ///        wait unwound without a notification (e.g. the per-request
+    ///        cancel flag flipped before the peer sent ready). Callers
+    ///        treat `std::nullopt` as "transport quiescence is unknown"
+    ///        and must fail closed (poison receive buffers, etc.).
     std::optional<bool> recvReadySignalWithStatus(DataContext const& ctx) const;
 
     void activateBuffer(uint8_t kind) const override;
