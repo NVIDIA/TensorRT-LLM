@@ -73,6 +73,7 @@ from ..modules.fused_moe import (
     create_moe,
     get_moe_cls,
 )
+from ..modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
 from ..modules.linear import Linear
 from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
@@ -1404,6 +1405,8 @@ class DeepseekV4MoE(nn.Module):
                 CutlassFusedMoE,
                 TritonFusedMoE,
                 TRTLLMGenFusedMoE,
+                WideEPMoE,
+                DeepGemmFusedMoE,
             )
             if supports_swiglu_limit:
                 moe_load_balancer_config = getattr(model_config, "moe_load_balancer", None)

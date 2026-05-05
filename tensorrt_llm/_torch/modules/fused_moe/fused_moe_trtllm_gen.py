@@ -90,11 +90,18 @@ class TRTLLMGenFusedMoE(MoE):
     }
 
     # Quantization algorithms that support swiglu_gptoss_style
+    # FP8_BLOCK_SCALES is included for swiglu_limit only via the
+    # DeepSeek FP8 separate-activation path
+    # (DevKernel.cu::activationDeepSeekKernel reads gemm1_clamp_limit
+    # when MoERunnerArgs supplies it). bias and swiglu_alpha/beta still
+    # require GEMM-fused activation cubins, which are NVFP4/MXFP4 only
+    # — _check_configs gates those separately.
     _GPTOSS_SUPPORTED_ALGOS = {
         QuantAlgo.NVFP4,
         QuantAlgo.W4A16_MXFP4,
         QuantAlgo.W4A8_MXFP4_FP8,
         QuantAlgo.W4A8_MXFP4_MXFP8,
+        QuantAlgo.FP8_BLOCK_SCALES,
     }
 
     @classmethod
@@ -379,8 +386,17 @@ class TRTLLMGenFusedMoE(MoE):
             or self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_nvfp4_fp8 \
             or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4, w4a8_mxfp4_fp8 and w4a8_mxfp4_mxfp8 dtypes."
 
-        if self.bias or self.swiglu_alpha is not None or self.swiglu_beta is not None or self.swiglu_limit is not None:
-            assert self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE supports bias/swiglu only for nvfp4 and mxfp4 variants."
+        if self.bias or self.swiglu_alpha is not None or self.swiglu_beta is not None:
+            assert self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, \
+                "TRTLLMGenFusedMoE supports bias/swiglu_alpha/swiglu_beta only for nvfp4 and mxfp4 variants."
+        if self.swiglu_limit is not None:
+            # swiglu_limit additionally goes through the DeepSeek FP8
+            # separate-activation path
+            # (DevKernel.cu::activationDeepSeekKernel) when
+            # has_deepseek_fp8_block_scales.
+            assert self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 \
+                or self.has_w4a8_mxfp4_mxfp8 or self.has_deepseek_fp8_block_scales, \
+                "TRTLLMGenFusedMoE supports swiglu_limit only for nvfp4, mxfp4, and fp8_block_scale variants."
 
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
@@ -623,6 +639,7 @@ class TRTLLMGenFusedMoE(MoE):
                 self.routing_method.routing_method_type,
                 topk_weights=token_final_scales,
                 topk_ids=token_selected_experts,
+                gemm1_clamp_limit=self.swiglu_limit,
                 output=moe_output,
             )
             # When output is provided, use it directly as the result

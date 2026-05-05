@@ -354,6 +354,15 @@ struct Data
     int32_t* expandedIdxToPermutedIdx;
 
     int32_t const* totalNumPaddedTokens;
+
+    // Optional device pointer to a per-expert swiglu clamp limit (fp32). When
+    // non-null, the activation kernel reads element [0] (FP8 path treats the
+    // limit as uniform across experts) and applies gate.clamp(max=limit) plus
+    // up.clamp(-limit, limit) before silu/mul, matching the swiglu_torch
+    // reference. NVFP4 still consumes this per-expert via fused-activation
+    // GEMM cubins; FP8's separate activation kernel only honors a uniform
+    // limit today.
+    float const* swigluLimitPtr = nullptr;
 };
 
 template <typename Type_, int32_t NumTokensPerCta_, bool UsePdl_>
@@ -376,6 +385,8 @@ struct KernelParams
 
     int32_t const* totalNumPaddedTokens;
 
+    float const* swigluLimitPtr = nullptr;
+
     static KernelParams setKernelParams(Data const& data)
     {
         KernelParams params;
@@ -391,6 +402,8 @@ struct KernelParams
         params.numTokens = data.numTokens;
         params.topK = data.topK;
         params.totalNumPaddedTokens = data.totalNumPaddedTokens;
+
+        params.swigluLimitPtr = data.swigluLimitPtr;
 
         return params;
     }

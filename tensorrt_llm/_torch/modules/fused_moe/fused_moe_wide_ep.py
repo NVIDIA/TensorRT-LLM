@@ -62,6 +62,7 @@ class WideEPMoE(MoE):
         VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
+        swiglu_limit: Optional[torch.Tensor] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
     ):
 
@@ -75,6 +76,7 @@ class WideEPMoE(MoE):
             model_config=model_config,
             aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
+            swiglu_limit=swiglu_limit,
             layer_idx=layer_idx,
             activation_type=activation_type,
         )
