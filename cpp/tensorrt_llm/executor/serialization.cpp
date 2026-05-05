@@ -340,6 +340,30 @@ size_t Serialization::serializedSize(PromptTuningConfig const& config)
 }
 
 // MultimodalInput
+MultimodalItemRun Serialization::deserializeMultimodalItemRun(std::istream& is)
+{
+    auto promptStart = su::deserialize<SizeType32>(is);
+    auto runLength = su::deserialize<SizeType32>(is);
+    auto nonEmbedOffsets = su::deserialize<std::vector<SizeType32>>(is);
+    return MultimodalItemRun{promptStart, runLength, std::move(nonEmbedOffsets)};
+}
+
+void Serialization::serialize(MultimodalItemRun const& multimodalItemRun, std::ostream& os)
+{
+    su::serialize(multimodalItemRun.promptStart, os);
+    su::serialize(multimodalItemRun.runLength, os);
+    su::serialize(multimodalItemRun.nonEmbedOffsets, os);
+}
+
+size_t Serialization::serializedSize(MultimodalItemRun const& multimodalItemRun)
+{
+    size_t totalSize = 0;
+    totalSize += su::serializedSize(multimodalItemRun.promptStart);
+    totalSize += su::serializedSize(multimodalItemRun.runLength);
+    totalSize += su::serializedSize(multimodalItemRun.nonEmbedOffsets);
+    return totalSize;
+}
+
 MultimodalInput Serialization::deserializeMultimodalInput(std::istream& is)
 {
     auto magic = su::deserialize<std::uint32_t>(is);

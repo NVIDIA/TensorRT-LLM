@@ -406,45 +406,18 @@ TEST_F(BlockKeyTest, BuildBlockKeysStressRepeatedHashesAndSparsePositionIdentity
     EXPECT_NE(hashBlockKeySequence(keysWithRepeatedHash), hashBlockKeySequence(differentHashKeys));
 }
 
-TEST_F(BlockKeyTest, MultimodalExtraKeysRejectInvalidItemRuns)
+TEST_F(BlockKeyTest, MultimodalExtraKeysRejectContractMismatches)
 {
     auto const hashParts = std::vector<SizeType32>{
         0x01020304, 0x05060708, 0x11121314, 0x15161718, 0x21222324, 0x25262728, 0x31323334, 0x35363738};
 
-    auto makeInvalidRequest = [&](ItemRuns runs)
-    {
-        return makeMultimodalRequest(std::vector<TokenIdType>{11, 999, 77, 999, 12},
-            std::vector<std::vector<SizeType32>>{hashParts}, std::move(runs));
-    };
+    auto const missingRuns = makeMultimodalRequest(
+        std::vector<TokenIdType>{11, 999, 77}, std::vector<std::vector<SizeType32>>{hashParts}, std::nullopt);
+    EXPECT_THROW((void) generateBlockHashExtraKeys(missingRuns, 1, 2), std::exception);
 
-    auto const emptyOuterRuns = makeMultimodalRequest(
-        std::vector<TokenIdType>{11, 999, 77, 999, 12}, std::vector<std::vector<SizeType32>>{hashParts}, ItemRuns{});
-    EXPECT_THROW((void) generateBlockHashExtraKeys(emptyOuterRuns, 1, 2), std::exception);
-
-    EXPECT_THROW((void) generateBlockHashExtraKeys(makeInvalidRequest(ItemRuns{{}}), 1, 2), std::exception);
-    EXPECT_THROW((void) generateBlockHashExtraKeys(makeInvalidRequest(ItemRuns{{makeRun(1, 0), makeRun(3, 2)}}), 1, 2),
-        std::exception);
-    EXPECT_THROW((void) generateBlockHashExtraKeys(makeInvalidRequest(ItemRuns{{makeRun(-1, 1), makeRun(3, 1)}}), 1, 2),
-        std::exception);
-    EXPECT_THROW((void) generateBlockHashExtraKeys(makeInvalidRequest(ItemRuns{{makeRun(1, 1), makeRun(5, 1)}}), 1, 2),
-        std::exception);
-    EXPECT_THROW((void) generateBlockHashExtraKeys(makeInvalidRequest(ItemRuns{{makeRun(1, 2), makeRun(2, 1)}}), 1, 2),
-        std::exception);
-    auto const overlappingItems = makeMultimodalRequest(std::vector<TokenIdType>{11, 999, 77, 999, 12},
-        std::vector<std::vector<SizeType32>>{hashParts, makeHashParts(0x11121300)},
-        ItemRuns{{makeRun(1, 2)}, {makeRun(2, 1)}});
-    EXPECT_THROW((void) generateBlockHashExtraKeys(overlappingItems, 1, 3), std::exception);
-    EXPECT_NO_THROW(
-        (void) generateBlockHashExtraKeys(makeInvalidRequest(ItemRuns{{makeRun(2, 1), makeRun(3, 1)}}), 1, 2));
-    EXPECT_NO_THROW((void) generateBlockHashExtraKeys(makeInvalidRequest(ItemRuns{{makeRun(1, 1)}}), 1, 2));
-    EXPECT_THROW(
-        (void) generateBlockHashExtraKeys(makeInvalidRequest(ItemRuns{{makeRun(1, 2, {-1})}}), 1, 2), std::exception);
-    EXPECT_THROW(
-        (void) generateBlockHashExtraKeys(makeInvalidRequest(ItemRuns{{makeRun(1, 2, {2})}}), 1, 2), std::exception);
-    EXPECT_THROW(
-        (void) generateBlockHashExtraKeys(makeInvalidRequest(ItemRuns{{makeRun(1, 3, {2, 1})}}), 1, 2), std::exception);
-    EXPECT_THROW(
-        (void) generateBlockHashExtraKeys(makeInvalidRequest(ItemRuns{{makeRun(1, 3, {1, 1})}}), 1, 2), std::exception);
+    auto const wrongHashWidth = makeMultimodalRequest(std::vector<TokenIdType>{11, 999, 77},
+        std::vector<std::vector<SizeType32>>{{1, 2, 3}}, ItemRuns{{makeRun(1, 1)}});
+    EXPECT_THROW((void) generateBlockHashExtraKeys(wrongHashWidth, 1, 2), std::exception);
 
     auto const outerMismatch = makeMultimodalRequest(std::vector<TokenIdType>{11, 999, 77, 999, 12},
         std::vector<std::vector<SizeType32>>{hashParts, makeHashParts(0x11121300)}, ItemRuns{{makeRun(1, 1)}});

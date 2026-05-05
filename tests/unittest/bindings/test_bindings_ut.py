@@ -424,7 +424,11 @@ def test_llm_request_multimodal_item_runs_abi():
     sampling_config = _tb.SamplingConfig()
     multimodal_embedding = torch.arange(4, dtype=torch.float32).reshape(2, 2)
     multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8]]
-    multimodal_item_runs = [[(1, 2, [])]]
+    multimodal_item_runs = [[
+        _tb.executor.MultimodalItemRun(prompt_start=1,
+                                       run_length=2,
+                                       non_embed_offsets=[])
+    ]]
     multimodal_uuids = ["image-0"]
 
     llm_request = _tb.internal.batch_manager.LlmRequest(
@@ -450,7 +454,12 @@ def test_llm_request_multimodal_item_runs_abi():
     )
 
     assert torch.equal(llm_request.multimodal_embedding, multimodal_embedding)
-    assert llm_request.multimodal_item_runs == multimodal_item_runs
+    item_run = llm_request.multimodal_item_runs[0][0]
+    assert item_run.prompt_start == 1
+    assert item_run.run_length == 2
+    assert item_run.non_embed_offsets == []
+    with pytest.raises(AttributeError):
+        item_run.prompt_start = 7
 
     llm_request_keyword = _tb.internal.batch_manager.LlmRequest(
         request_id=2,
@@ -466,7 +475,7 @@ def test_llm_request_multimodal_item_runs_abi():
 
     assert torch.equal(llm_request_keyword.multimodal_embedding,
                        multimodal_embedding)
-    assert llm_request_keyword.multimodal_item_runs == multimodal_item_runs
+    assert llm_request_keyword.multimodal_item_runs[0][0].prompt_start == 1
 
     with pytest.raises(RuntimeError,
                        match="multimodal_positions and multimodal_lengths"):

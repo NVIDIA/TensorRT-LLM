@@ -49,8 +49,30 @@ namespace tensorrt_llm::executor
 {
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
+
 /// @brief Prompt span plus local offsets that do not consume encoder-output rows.
-using MultimodalItemRun = std::tuple<SizeType32, SizeType32, std::vector<SizeType32>>;
+struct MultimodalItemRun
+{
+    MultimodalItemRun() = default;
+
+    MultimodalItemRun(SizeType32 promptStart_, SizeType32 runLength_, std::vector<SizeType32> nonEmbedOffsets_)
+        : promptStart{promptStart_}
+        , runLength{runLength_}
+        , nonEmbedOffsets{std::move(nonEmbedOffsets_)}
+    {
+    }
+
+    bool operator==(MultimodalItemRun const& other) const
+    {
+        return promptStart == other.promptStart && runLength == other.runLength
+            && nonEmbedOffsets == other.nonEmbedOffsets;
+    }
+
+    SizeType32 promptStart{};
+    SizeType32 runLength{};
+    std::vector<SizeType32> nonEmbedOffsets;
+};
+
 using MultimodalItemRuns = std::vector<std::vector<MultimodalItemRun>>;
 
 /// @brief Version of TRT-LLM
@@ -302,7 +324,8 @@ class MultimodalInput
 public:
     explicit MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
         MultimodalItemRuns multimodalItemRuns,
-        std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt);
+        std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt,
+        std::optional<SizeType32> promptLen = std::nullopt);
 
     [[nodiscard]] std::vector<std::vector<SizeType32>> getMultimodalHashes() const;
     [[nodiscard]] std::optional<std::vector<std::optional<std::string>>> const& getMultimodalUuids() const;

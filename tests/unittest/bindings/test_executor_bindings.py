@@ -1006,13 +1006,41 @@ def test_multimodal_embedding():
 
 
 def test_multimodal_input():
-    multimodal_hashes = [[1, 2, 3], [4, 5, 6]]
-    multimodal_item_runs = [[(1, 2, [])], [(4, 5, [])]]
+    multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]]
+    multimodal_item_runs = [[
+        trtllm.MultimodalItemRun(prompt_start=1,
+                                 run_length=2,
+                                 non_embed_offsets=[])
+    ],
+                            [
+                                trtllm.MultimodalItemRun(prompt_start=4,
+                                                         run_length=5,
+                                                         non_embed_offsets=[])
+                            ]]
     config = trtllm.MultimodalInput(multimodal_hashes, multimodal_item_runs)
     assert config.multimodal_hashes == multimodal_hashes
     # Default value for multimodal_uuids should be None
     assert config.multimodal_uuids is None
-    assert config.multimodal_item_runs == multimodal_item_runs
+    item_run = config.multimodal_item_runs[0][0]
+    assert item_run.prompt_start == 1
+    assert item_run.run_length == 2
+    assert item_run.non_embed_offsets == []
+    with pytest.raises(AttributeError):
+        item_run.run_length = 7
+
+
+def _binding_item_runs_to_tuples(multimodal_item_runs):
+    return [[(run.prompt_start, run.run_length, list(run.non_embed_offsets))
+             for run in item_runs] for item_runs in multimodal_item_runs]
+
+
+def _binding_item_runs(multimodal_item_runs):
+    return [[
+        trtllm.MultimodalItemRun(prompt_start=start,
+                                 run_length=length,
+                                 non_embed_offsets=offsets)
+        for start, length, offsets in item_runs
+    ] for item_runs in multimodal_item_runs]
 
 
 @pytest.mark.parametrize(
@@ -1032,19 +1060,22 @@ def test_multimodal_input():
 def test_multimodal_input_with_uuids(multimodal_uuids, expected_uuids):
     """Test MultimodalInput with user-provided UUIDs."""
     multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]]
-    multimodal_item_runs = [[(10, 50, [])], [(100, 60, [])]]
+    multimodal_item_runs = _binding_item_runs([[(10, 50, [])], [(100, 60, [])]])
 
     config = trtllm.MultimodalInput(multimodal_hashes, multimodal_item_runs,
                                     multimodal_uuids)
     assert config.multimodal_hashes == multimodal_hashes
-    assert config.multimodal_item_runs == multimodal_item_runs
+    assert _binding_item_runs_to_tuples(config.multimodal_item_runs) == [[
+        (10, 50, [])
+    ], [(100, 60, [])]]
     assert config.multimodal_uuids == expected_uuids
 
 
 def test_multimodal_input_pickle_with_uuids():
     """Test pickling and unpickling of MultimodalInput with UUIDs."""
     multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]]
-    multimodal_item_runs = [[(10, 50, [])], [(100, 60, [])]]
+    expected_item_runs = [[(10, 50, [])], [(100, 60, [])]]
+    multimodal_item_runs = _binding_item_runs(expected_item_runs)
     multimodal_uuids = ["test-uuid-1", None]
 
     config = trtllm.MultimodalInput(multimodal_hashes, multimodal_item_runs,
@@ -1055,7 +1086,8 @@ def test_multimodal_input_pickle_with_uuids():
     restored = pickle.loads(pickled)
 
     assert restored.multimodal_hashes == multimodal_hashes
-    assert restored.multimodal_item_runs == multimodal_item_runs
+    assert _binding_item_runs_to_tuples(
+        restored.multimodal_item_runs) == expected_item_runs
     assert restored.multimodal_uuids == multimodal_uuids
 
     # Test with None UUIDs
@@ -1070,15 +1102,18 @@ def test_multimodal_input_with_item_runs():
     """Test MultimodalInput with compact multimodal hash token-position runs."""
     multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8]]
     multimodal_uuids = ["test-uuid-1"]
-    multimodal_item_runs = [[(1, 1, []), (3, 1, [])]]
+    expected_item_runs = [[(1, 1, []), (3, 1, [])]]
+    multimodal_item_runs = _binding_item_runs(expected_item_runs)
 
     config = trtllm.MultimodalInput(multimodal_hashes, multimodal_item_runs,
                                     multimodal_uuids)
 
-    assert config.multimodal_item_runs == multimodal_item_runs
+    assert _binding_item_runs_to_tuples(
+        config.multimodal_item_runs) == expected_item_runs
 
     restored = pickle.loads(pickle.dumps(config))
-    assert restored.multimodal_item_runs == multimodal_item_runs
+    assert _binding_item_runs_to_tuples(
+        restored.multimodal_item_runs) == expected_item_runs
 
 
 def test_mrope_config():

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -29,6 +29,7 @@ target_link_libraries(executorTestSmallArbitraryOutputTensors
 
 add_gtest(executorConfigTest executorConfigTest.cpp)
 add_gtest(executorTensorTest tensorTest.cpp)
+add_gtest(multimodalInputTest multimodalInputTest.cpp)
 add_gtest(serializeUtilsTest serializeUtilsTest.cpp)
 add_gtest(requestWithIdTest requestWithIdTest.cpp)
 add_gtest(loraConfigTest loraConfigTest.cpp)

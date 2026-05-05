@@ -72,6 +72,28 @@ void initRequestBindings(nb::module_& m)
         .value("GDS", tle::KvCacheTransferMode::GDS)
         .value("POSIX_DEBUG_FALLBACK", tle::KvCacheTransferMode::POSIX_DEBUG_FALLBACK);
 
+    nb::class_<tle::MultimodalItemRun>(m, "MultimodalItemRun")
+        .def(nb::init<SizeType32, SizeType32, std::vector<SizeType32>>(), nb::arg("prompt_start"),
+            nb::arg("run_length"), nb::arg("non_embed_offsets"))
+        .def_ro("prompt_start", &tle::MultimodalItemRun::promptStart)
+        .def_ro("run_length", &tle::MultimodalItemRun::runLength)
+        .def_ro("non_embed_offsets", &tle::MultimodalItemRun::nonEmbedOffsets)
+        .def("__eq__",
+            [](tle::MultimodalItemRun const& self, tle::MultimodalItemRun const& other) { return self == other; })
+        .def("__getstate__",
+            [](tle::MultimodalItemRun const& self)
+            { return nb::make_tuple(self.promptStart, self.runLength, self.nonEmbedOffsets); })
+        .def("__setstate__",
+            [](tle::MultimodalItemRun& self, nb::tuple const& state)
+            {
+                if (state.size() != 3)
+                {
+                    throw std::runtime_error("Invalid MultimodalItemRun state!");
+                }
+                new (&self) tle::MultimodalItemRun(nb::cast<SizeType32>(state[0]), nb::cast<SizeType32>(state[1]),
+                    nb::cast<std::vector<SizeType32>>(state[2]));
+            });
+
     auto samplingConfigGetstate = [](tle::SamplingConfig const& self)
     {
         return nb::make_tuple(self.getBeamWidth(), self.getTopK(), self.getTopP(), self.getTopPMin(),

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -77,6 +77,9 @@ public:
     [[nodiscard]] static size_t serializedSize(PromptTuningConfig const& config);
 
     // MultimodalInput
+    [[nodiscard]] static MultimodalItemRun deserializeMultimodalItemRun(std::istream& is);
+    static void serialize(MultimodalItemRun const& multimodalItemRun, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(MultimodalItemRun const& multimodalItemRun);
     [[nodiscard]] static MultimodalInput deserializeMultimodalInput(std::istream& is);
     static void serialize(MultimodalInput const& multimodalInput, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(MultimodalInput const& multimodalInput);

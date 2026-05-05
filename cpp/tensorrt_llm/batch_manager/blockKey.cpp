@@ -65,19 +65,16 @@ std::vector<MmKey> generateBlockHashExtraKeys(
         TLLM_CHECK_WITH_INFO(false, "Multimodal hashes require multimodal item runs");
     }
 
-    auto const promptLen = llmRequest.getPromptLen();
     TLLM_CHECK_WITH_INFO((*multimodalHashes)->size() == (*multimodalItemRuns)->size(),
         "Multimodal hash arrays and item-run arrays have mismatched sizes");
 
     std::vector<MmKey> extraKeys;
     extraKeys.reserve((*multimodalHashes)->size());
-    std::vector<std::pair<SizeType32, SizeType32>> occupiedRuns;
 
     for (size_t i = 0; i < (*multimodalHashes)->size(); ++i)
     {
         auto const mmHashArray = makeHashArray((*(*multimodalHashes))[i]);
         auto const& positionRuns = (*(*multimodalItemRuns))[i];
-        TLLM_CHECK_WITH_INFO(!positionRuns.empty(), "Multimodal item runs must not be empty");
 
         std::optional<std::string> uuid = std::nullopt;
         if (multimodalUuids && *multimodalUuids && i < (*multimodalUuids)->size())
@@ -97,40 +94,12 @@ std::vector<MmKey> generateBlockHashExtraKeys(
         };
 
         SizeType32 consumedLength = 0;
-        std::optional<SizeType32> previousRunEnd = std::nullopt;
-        for (size_t runIdx = 0; runIdx < positionRuns.size(); ++runIdx)
+        for (auto const& run : positionRuns)
         {
-            auto const& [runStart, runLength, nonEmbedOffsets] = positionRuns[runIdx];
-            TLLM_CHECK_WITH_INFO(runLength > 0, "Multimodal item run length must be positive, got %d", runLength);
-            TLLM_CHECK_WITH_INFO(runStart >= 0 && runLength <= promptLen && runStart <= promptLen - runLength,
-                "Multimodal item run [%d, %d) is outside prompt token range [0, %d)", runStart, runStart + runLength,
-                promptLen);
-            std::optional<SizeType32> previousOffset = std::nullopt;
-            for (auto const offset : nonEmbedOffsets)
-            {
-                // Non-embed offsets are metadata for downstream consumers. Cache hashing still covers the
-                // entire prompt-owned run, so these offsets are validated but not filtered out here.
-                TLLM_CHECK_WITH_INFO(offset >= 0 && offset < runLength,
-                    "Multimodal item run non-embed offset %d is outside run length %d", offset, runLength);
-                TLLM_CHECK_WITH_INFO(!previousOffset || offset > *previousOffset,
-                    "Multimodal item run non-embed offsets must be ordered and unique");
-                previousOffset = offset;
-            }
-            if (previousRunEnd)
-            {
-                TLLM_CHECK_WITH_INFO(
-                    runStart >= *previousRunEnd, "Multimodal item runs must be ordered and non-overlapping");
-            }
-            auto const runEnd = runStart + runLength;
-            for (auto const& [occupiedStart, occupiedEnd] : occupiedRuns)
-            {
-                TLLM_CHECK_WITH_INFO(runStart >= occupiedEnd || occupiedStart >= runEnd,
-                    "Multimodal item runs must be globally non-overlapping");
-            }
+            auto const runStart = run.promptStart;
+            auto const runLength = run.runLength;
             emitRegion(runStart, runLength, consumedLength);
             consumedLength += runLength;
-            previousRunEnd = runEnd;
-            occupiedRuns.emplace_back(runStart, runEnd);
         }
     }
 

@@ -1024,12 +1024,23 @@ TEST_F(TrtGptModelTest, PauseRequestStats)
     auto maxNewTokens = 3;
     auto tokens = std::make_shared<std::vector<int32_t>>(std::initializer_list<int32_t>{1, 2, 3, 4});
     auto llmRequest = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false,
-        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false,
-        std::nullopt, false, std::nullopt, false, std::nullopt, executor::Request::kDefaultPriority, std::nullopt,
-        std::nullopt, std::nullopt, LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, 1,
-        std::nullopt, std::nullopt, true /* returnPerfMetrics */);
+        /*endId=*/std::nullopt, /*padId=*/std::nullopt, /*embeddingBias=*/std::nullopt,
+        /*badWordsList=*/std::nullopt, /*stopWordsList=*/std::nullopt, /*positionIds=*/std::nullopt,
+        /*promptEmbeddingTable=*/std::nullopt, /*promptVocabSize=*/std::nullopt,
+        /*multimodalHashes=*/std::nullopt, /*multimodalUuids=*/std::nullopt,
+        /*multimodalEmbedding=*/std::nullopt, /*multimodalItemRuns=*/std::nullopt,
+        /*mropeRotaryCosSin=*/std::nullopt, /*mropePositionDeltas=*/std::nullopt,
+        /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
+        /*lookaheadConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt,
+        /*returnLogProbs=*/false, /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
+        /*draftTokens=*/std::nullopt, /*draftLogits=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*logitsPostProcessor=*/std::nullopt, /*applyLogitsPostProcessorBatched=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*clientId=*/std::nullopt,
+        executor::Request::kDefaultPriority, /*encoderInputFeatures=*/std::nullopt,
+        /*encoderOutputLength=*/std::nullopt, /*crossAttentionMask=*/std::nullopt,
+        LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt,
+        /*numReturnSequences=*/1, /*eagleConfig=*/std::nullopt, /*skipCrossAttnBlocks=*/std::nullopt,
+        /*returnPerfMetrics=*/true);
 
     RequestList requestList{llmRequest};
 
