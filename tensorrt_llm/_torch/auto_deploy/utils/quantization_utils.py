@@ -48,8 +48,15 @@ def ensure_tma_col_major(t: torch.Tensor) -> torch.Tensor:
     UE8M0 (torch.int) col-major only in that configuration. On other GPUs
     or without DeepGEMM, scales remain torch.float and this is a no-op.
     """
-    if t.dtype != torch.int or t.stride(-2) == 1:
-        return t  # Not UE8M0 or already column-major
+    if t.dtype != torch.int:
+        return t  # Not UE8M0
+    # Both stride(-2) and stride(-1) must match the col-major TMA-aligned
+    # layout DeepGEMM expects. When size(-1) == 1, a row-major contiguous
+    # tensor has stride(-2) == 1 too, so checking stride(-2) alone would
+    # incorrectly short-circuit and leave stride(-1) un-aligned.
+    expected_inner = ((t.size(-2) + 3) // 4) * 4
+    if t.stride(-2) == 1 and t.stride(-1) == expected_inner:
+        return t  # Already column-major and TMA-aligned
 
     remove_dim = False
     if t.dim() == 2:

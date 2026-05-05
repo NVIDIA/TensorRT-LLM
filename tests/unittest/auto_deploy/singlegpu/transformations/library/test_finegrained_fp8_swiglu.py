@@ -442,6 +442,13 @@ def test_finegrained_fp8_swiglu_deepgemm_scale_layout():
     torch.manual_seed(0)
     model = FineGrainedFP8SwiGLUTestModel().to("cuda")
 
+    # Reference output is computed BEFORE _simulate_post_load_hook because the
+    # hook mutates scales to UE8M0 packed-int, which the eager
+    # torch_fake_quant_finegrained_fp8_linear kernel cannot consume (it expects
+    # raw fp32 per-block scales).
+    x = torch.randn(2, 256, device="cuda", dtype=torch.bfloat16)
+    y_ref = model(x)
+
     # Simulate post_load_hook: convert scales to UE8M0 col-major
     _simulate_post_load_hook(model.mlp)
 
@@ -451,7 +458,6 @@ def test_finegrained_fp8_swiglu_deepgemm_scale_layout():
         assert scale.dtype == torch.int, f"{proj}_weight_scale should be torch.int after hook"
         assert scale.stride(-2) == 1, f"{proj}_weight_scale should be col-major after hook"
 
-    x = torch.randn(2, 256, device="cuda", dtype=torch.bfloat16)
     gm = torch_export_to_gm(model, args=(x,), clone=True, dynamic_shapes=({0: Dim.DYNAMIC},))
 
     # Apply pattern matching + fusion
@@ -484,7 +490,6 @@ def test_finegrained_fp8_swiglu_deepgemm_scale_layout():
                 f"got stride={buf.stride()}"
             )
 
-    # Verify numerical correctness (DeepGEMM path)
+    # Verify numerical correctness (DeepGEMM path) against the pre-hook reference.
     y_fused = gm_fused(x)
-    y_ref = model(x)
     torch.testing.assert_close(y_fused, y_ref, atol=0.15, rtol=0.05)
