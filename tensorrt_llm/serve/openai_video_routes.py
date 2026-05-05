@@ -78,11 +78,11 @@ class _VideoRoutesMixin:
                 format=resolved_fmt,
                 audio_sample_rate=output.audio_sample_rate or 24000,
             )
-            e2e_ms = (time.perf_counter() - sync_video_start) * 1000.0
+            latency = time.perf_counter() - sync_video_start  # seconds
             logger.info(
                 f"Video {video_id} generated and encoded: "
-                f"e2e_ms={e2e_ms:.1f} pipeline_ms={getattr(output.metrics, 'pipeline_ms', 0.0):.1f} "
-                f"denoise_ms={getattr(output.metrics, 'denoise_ms', 0.0):.1f}"
+                f"latency={latency:.3f}s pipeline={getattr(output.metrics, 'pipeline', 0.0):.3f}s "
+                f"denoise={getattr(output.metrics, 'denoise', 0.0):.3f}s"
             )
 
             # Determine media type based on actual output file extension
@@ -267,11 +267,11 @@ class _VideoRoutesMixin:
                 format=resolved_fmt,
                 audio_sample_rate=output.audio_sample_rate or 24000,
             )
-            e2e_ms = (time.perf_counter() - background_start) * 1000.0
+            latency = time.perf_counter() - background_start  # seconds
             logger.info(
                 f"Video {video_id} async-generated and encoded: "
-                f"e2e_ms={e2e_ms:.1f} pipeline_ms={getattr(output.metrics, 'pipeline_ms', 0.0):.1f} "
-                f"denoise_ms={getattr(output.metrics, 'denoise_ms', 0.0):.1f}"
+                f"latency={latency:.3f}s pipeline={getattr(output.metrics, 'pipeline', 0.0):.3f}s "
+                f"denoise={getattr(output.metrics, 'denoise', 0.0):.3f}s"
             )
             job = await VIDEO_STORE.get(video_id)
             if job:

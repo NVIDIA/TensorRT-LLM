@@ -739,9 +739,9 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
 
         _assert_resolution(height, width, is_two_stage=True)
         pipeline_start = time.time()
-        # Two-stage timing: stage 1 is reported as ``denoise_ms``; stage 2
+        # Two-stage timing: stage 1 is reported as ``denoise``; stage 2
         # (spatial upsample + refinement denoise + decode) folds into
-        # ``post_denoise_ms``. Only the outer timer's numbers reach
+        # ``post_denoise``. Only the outer timer's numbers reach
         # ``PipelineOutput``.
         timer = CudaPhaseTimer()
         timer.mark_pre_start()

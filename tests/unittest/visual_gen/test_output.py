@@ -100,17 +100,17 @@ def test_visual_gen_metrics_field_set():
     """VisualGenMetrics has exactly four float fields with 0.0 defaults."""
     assert is_dataclass(VisualGenMetrics)
     field_names = {f.name for f in fields(VisualGenMetrics)}
-    assert field_names == {"pipeline_ms", "pre_denoise_ms", "denoise_ms", "post_denoise_ms"}
+    assert field_names == {"pipeline", "pre_denoise", "denoise", "post_denoise"}
     m = VisualGenMetrics()
-    assert m.pipeline_ms == 0.0
-    assert m.pre_denoise_ms == 0.0
-    assert m.denoise_ms == 0.0
-    assert m.post_denoise_ms == 0.0
+    assert m.pipeline == 0.0
+    assert m.pre_denoise == 0.0
+    assert m.denoise == 0.0
+    assert m.post_denoise == 0.0
 
 
 def test_error_response_yields_metrics_none():
     """An error wire response produces metrics is None on the public output."""
-    resp = DiffusionResponse(request_id=42, error_msg="boom", pipeline_ms=0.0)
+    resp = DiffusionResponse(request_id=42, error_msg="boom", pipeline=0.0)
     out = to_visual_gen_output(resp)
     assert out.error == "boom"
     assert out.image is None
@@ -119,29 +119,29 @@ def test_error_response_yields_metrics_none():
     assert out.metrics is None
 
 
-def test_sub_phase_sum_bounded_by_pipeline_ms():
-    """Sub-phase sum ``pre + denoise + post`` stays within ``pipeline_ms + slack``.
+def test_sub_phase_sum_bounded_by_pipeline():
+    """Sub-phase sum ``pre + denoise + post`` stays within ``pipeline + slack``.
 
     Sub-phase events measure GPU-stream time only; small host-side work
     (tokenization, scheduler updates) shows up as
-    ``pipeline_ms - (pre + denoise + post)`` and stays non-negative on a real
+    ``pipeline - (pre + denoise + post)`` and stays non-negative on a real
     run. This pins the relationship at the public-output factory boundary.
     """
     pipeline_out = PipelineOutput(
         image=torch.zeros(1, 4, 4, 3, dtype=torch.uint8),
-        pre_denoise_ms=5.0,
-        denoise_ms=42.0,
-        post_denoise_ms=3.0,
+        pre_denoise=5.0,
+        denoise=42.0,
+        post_denoise=3.0,
     )
-    # Executor measures pipeline_ms with a slightly larger envelope (host
+    # Executor measures pipeline with a slightly larger envelope (host
     # wall-clock around pipeline.infer()), so the sub-phase sum stays under
-    # pipeline_ms.
-    resp = DiffusionResponse(request_id=11, output=pipeline_out, pipeline_ms=55.0)
+    # pipeline.
+    resp = DiffusionResponse(request_id=11, output=pipeline_out, pipeline=55.0)
     out = to_visual_gen_output(resp)
-    sub_sum = out.metrics.pre_denoise_ms + out.metrics.denoise_ms + out.metrics.post_denoise_ms
-    slack_ms = 1.0
-    assert sub_sum <= out.metrics.pipeline_ms + slack_ms, (
-        f"sub-phase sum {sub_sum} > pipeline_ms+slack {out.metrics.pipeline_ms + slack_ms}"
+    sub_sum = out.metrics.pre_denoise + out.metrics.denoise + out.metrics.post_denoise
+    slack = 1.0
+    assert sub_sum <= out.metrics.pipeline + slack, (
+        f"sub-phase sum {sub_sum} > pipeline+slack {out.metrics.pipeline + slack}"
     )
 
 
@@ -155,25 +155,25 @@ def _make_image_pipeline_output() -> PipelineOutput:
     image = torch.full((1, 8, 8, 3), 200, dtype=torch.uint8)
     return PipelineOutput(
         image=image,
-        pre_denoise_ms=5.0,
-        denoise_ms=42.0,
-        post_denoise_ms=3.0,
+        pre_denoise=5.0,
+        denoise=42.0,
+        post_denoise=3.0,
     )
 
 
 def test_from_response_success_image():
     """Success path populates request_id, media tensor, and four metrics."""
     pipeline_out = _make_image_pipeline_output()
-    resp = DiffusionResponse(request_id=11, output=pipeline_out, pipeline_ms=55.5)
+    resp = DiffusionResponse(request_id=11, output=pipeline_out, pipeline=55.5)
     out = to_visual_gen_output(resp)
     assert out.request_id == 11
     assert out.image is pipeline_out.image
     assert out.error is None
     assert out.metrics is not None
-    assert out.metrics.pipeline_ms == 55.5
-    assert out.metrics.pre_denoise_ms == 5.0
-    assert out.metrics.denoise_ms == 42.0
-    assert out.metrics.post_denoise_ms == 3.0
+    assert out.metrics.pipeline == 55.5
+    assert out.metrics.pre_denoise == 5.0
+    assert out.metrics.denoise == 42.0
+    assert out.metrics.post_denoise == 3.0
 
 
 def test_from_response_success_video_with_rates():
@@ -185,17 +185,17 @@ def test_from_response_success_video_with_rates():
         audio=audio,
         frame_rate=24.0,
         audio_sample_rate=48000,
-        pre_denoise_ms=1.0,
-        denoise_ms=10.0,
-        post_denoise_ms=2.0,
+        pre_denoise=1.0,
+        denoise=10.0,
+        post_denoise=2.0,
     )
-    resp = DiffusionResponse(request_id=3, output=pipeline_out, pipeline_ms=20.0)
+    resp = DiffusionResponse(request_id=3, output=pipeline_out, pipeline=20.0)
     out = to_visual_gen_output(resp)
     assert out.frame_rate == 24.0
     assert out.audio_sample_rate == 48000
     assert out.video is video
     assert out.audio is audio
-    assert out.metrics.pipeline_ms == 20.0
+    assert out.metrics.pipeline == 20.0
 
 
 # ---------------------------------------------------------------------------
@@ -213,11 +213,11 @@ def test_batch_split_success_image():
                 torch.full((4, 4, 3), 30, dtype=torch.uint8),
             ]
         ),
-        pre_denoise_ms=1.0,
-        denoise_ms=2.0,
-        post_denoise_ms=3.0,
+        pre_denoise=1.0,
+        denoise=2.0,
+        post_denoise=3.0,
     )
-    resp = DiffusionResponse(request_id=99, output=pipeline_out, pipeline_ms=10.0)
+    resp = DiffusionResponse(request_id=99, output=pipeline_out, pipeline=10.0)
     items = split_visual_gen_output(resp, batch_size=3)
     assert len(items) == 3
     for i, item in enumerate(items):
@@ -229,7 +229,7 @@ def test_batch_split_success_image():
         assert int(item.image[0, 0, 0]) == (i + 1) * 10
         # Metrics shared across items (single batched inference).
         assert item.metrics is not None
-        assert item.metrics.pipeline_ms == 10.0
+        assert item.metrics.pipeline == 10.0
 
 
 def test_batch_split_full_batch_failure():
@@ -359,7 +359,7 @@ class _FakeExecutor:
 @pytest.fixture()
 def fake_image_executor():
     pipe = _make_image_pipeline_output()
-    resp = DiffusionResponse(request_id=10, output=pipe, pipeline_ms=12.5)
+    resp = DiffusionResponse(request_id=10, output=pipe, pipeline=12.5)
     fx = _FakeExecutor(resp)
     yield fx
     fx.stop()
@@ -380,7 +380,7 @@ def test_aresult_matches_await():
     from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
 
     pipe = _make_image_pipeline_output()
-    resp = DiffusionResponse(request_id=11, output=pipe, pipeline_ms=7.0)
+    resp = DiffusionResponse(request_id=11, output=pipe, pipeline=7.0)
     fx = _FakeExecutor(resp)
     try:
 
@@ -401,7 +401,7 @@ def test_sync_result_is_blocking_value():
     from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
 
     pipe = _make_image_pipeline_output()
-    resp = DiffusionResponse(request_id=12, output=pipe, pipeline_ms=1.0)
+    resp = DiffusionResponse(request_id=12, output=pipe, pipeline=1.0)
     fx = _FakeExecutor(resp)
     try:
         handle = VisualGenResult(request_id=12, executor=fx, batch_size=None)
@@ -424,7 +424,7 @@ def test_batch_handle_resolves_to_list():
             ]
         ),
     )
-    resp = DiffusionResponse(request_id=13, output=pipe, pipeline_ms=3.0)
+    resp = DiffusionResponse(request_id=13, output=pipe, pipeline=3.0)
     fx = _FakeExecutor(resp)
     try:
         handle = VisualGenResult(request_id=13, executor=fx, batch_size=2)
@@ -472,7 +472,7 @@ def test_awaiting_sync_result_raises_typeerror():
     from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
 
     pipe = _make_image_pipeline_output()
-    resp = DiffusionResponse(request_id=16, output=pipe, pipeline_ms=0.5)
+    resp = DiffusionResponse(request_id=16, output=pipe, pipeline=0.5)
     fx = _FakeExecutor(resp)
     try:
         handle = VisualGenResult(request_id=16, executor=fx, batch_size=None)
@@ -712,9 +712,9 @@ def test_pipeline_output_has_eight_fields():
         "audio",
         "frame_rate",
         "audio_sample_rate",
-        "pre_denoise_ms",
-        "denoise_ms",
-        "post_denoise_ms",
+        "pre_denoise",
+        "denoise",
+        "post_denoise",
     }
 
 
@@ -726,9 +726,9 @@ def test_pipeline_output_default_construction():
     assert p.audio is None
     assert p.frame_rate is None
     assert p.audio_sample_rate is None
-    assert p.pre_denoise_ms == 0.0
-    assert p.denoise_ms == 0.0
-    assert p.post_denoise_ms == 0.0
+    assert p.pre_denoise == 0.0
+    assert p.denoise == 0.0
+    assert p.post_denoise == 0.0
 
 
 def test_media_output_unimportable():

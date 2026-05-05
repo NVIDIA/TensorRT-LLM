@@ -55,16 +55,16 @@ class PipelineOutput:
         audio_sample_rate: Audio sample rate in Hz. Populated by LTX-2 from
             its audio config (no hard-coded literal). ``None`` for pipelines
             without audio.
-        pre_denoise_ms: Wall-clock GPU-stream time before the denoising loop
-            (text encoding, latent prep, conditioning), measured by CUDA
-            events. ``0.0`` if not measured.
-        denoise_ms: Wall-clock GPU-stream time of the denoising loop,
-            measured by CUDA events. For LTX-2's two-stage pipeline this
-            tracks only the first stage; the second stage rolls into
-            ``post_denoise_ms``.
-        post_denoise_ms: Wall-clock GPU-stream time after the denoising loop
-            (VAE decode, format conversion, audio decode), measured by CUDA
-            events. ``0.0`` if not measured.
+        pre_denoise: Wall-clock GPU-stream time (seconds) before the
+            denoising loop (text encoding, latent prep, conditioning),
+            measured by CUDA events. ``0.0`` if not measured.
+        denoise: Wall-clock GPU-stream time (seconds) of the denoising
+            loop, measured by CUDA events. For LTX-2's two-stage pipeline
+            this tracks only the first stage; the second stage rolls into
+            ``post_denoise``.
+        post_denoise: Wall-clock GPU-stream time (seconds) after the
+            denoising loop (VAE decode, format conversion, audio decode),
+            measured by CUDA events. ``0.0`` if not measured.
     """
 
     image: Optional[torch.Tensor] = None
@@ -72,9 +72,9 @@ class PipelineOutput:
     audio: Optional[torch.Tensor] = None
     frame_rate: Optional[float] = None
     audio_sample_rate: Optional[int] = None
-    pre_denoise_ms: float = 0.0
-    denoise_ms: float = 0.0
-    post_denoise_ms: float = 0.0
+    pre_denoise: float = 0.0
+    denoise: float = 0.0
+    post_denoise: float = 0.0
 
 
 class CudaPhaseTimer:
@@ -130,12 +130,18 @@ class CudaPhaseTimer:
             self._end.record()
 
     def fill(self, output: "PipelineOutput") -> "PipelineOutput":
-        """Populate the three ``*_ms`` fields on ``output``; safe on non-CUDA."""
+        """Populate the three sub-phase fields (in seconds); safe on non-CUDA.
+
+        ``cuda.Event.elapsed_time`` returns milliseconds; we divide by 1000
+        once at this boundary so the field on ``PipelineOutput`` and every
+        downstream type carries seconds throughout.
+        """
         if not self._enabled:
             return output
-        output.pre_denoise_ms = float(self._pre_start.elapsed_time(self._denoise_start))
-        output.denoise_ms = float(self._denoise_start.elapsed_time(self._post_start))
-        output.post_denoise_ms = float(self._post_start.elapsed_time(self._end))
+        ms_to_s = 1.0 / 1000.0
+        output.pre_denoise = float(self._pre_start.elapsed_time(self._denoise_start)) * ms_to_s
+        output.denoise = float(self._denoise_start.elapsed_time(self._post_start)) * ms_to_s
+        output.post_denoise = float(self._post_start.elapsed_time(self._end)) * ms_to_s
         return output
 
 
@@ -153,10 +159,10 @@ def to_visual_gen_output(resp: "DiffusionResponse") -> "VisualGenOutput":
         return VisualGenOutput(request_id=resp.request_id, error=resp.error_msg)
     out = resp.output
     metrics = VisualGenMetrics(
-        pipeline_ms=resp.pipeline_ms,
-        pre_denoise_ms=out.pre_denoise_ms,
-        denoise_ms=out.denoise_ms,
-        post_denoise_ms=out.post_denoise_ms,
+        pipeline=resp.pipeline,
+        pre_denoise=out.pre_denoise,
+        denoise=out.denoise,
+        post_denoise=out.post_denoise,
     )
     return VisualGenOutput(
         request_id=resp.request_id,
@@ -205,10 +211,10 @@ def split_visual_gen_output(resp: "DiffusionResponse", batch_size: int) -> List[
             f"audio leading dim {out.audio.shape[0]} != batch_size {batch_size}"
         )
     metrics = VisualGenMetrics(
-        pipeline_ms=resp.pipeline_ms,
-        pre_denoise_ms=out.pre_denoise_ms,
-        denoise_ms=out.denoise_ms,
-        post_denoise_ms=out.post_denoise_ms,
+        pipeline=resp.pipeline,
+        pre_denoise=out.pre_denoise,
+        denoise=out.denoise,
+        post_denoise=out.post_denoise,
     )
     results: List["VisualGenOutput"] = []
     for i in range(batch_size):

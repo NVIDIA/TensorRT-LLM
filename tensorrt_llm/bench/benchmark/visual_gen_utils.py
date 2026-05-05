@@ -21,8 +21,6 @@ from typing import Optional
 
 import numpy as np
 
-SECONDS_TO_MILLISECONDS = 1000
-
 
 @dataclass
 class VisualGenSampleRequest:
@@ -35,16 +33,16 @@ class VisualGenSampleRequest:
 class VisualGenRequestOutput:
     """Timing and status result for a single visual generation request.
 
-    ``e2e_latency`` is wall-clock time around the generate (and save, if
-    measured by the caller). ``pipeline_ms`` and ``denoise_ms`` come from
-    the engine-side ``VisualGenOutput.metrics`` and are populated when the
-    request succeeds.
+    All timings are wall-clock seconds. ``latency`` is measured around
+    ``generate()`` (and the save step, if persisted by the caller).
+    ``pipeline`` and ``denoise`` come from the engine-side
+    ``VisualGenOutput.metrics`` and are populated when the request succeeds.
     """
 
     success: bool = False
-    e2e_latency: float = 0.0
-    pipeline_ms: float = 0.0
-    denoise_ms: float = 0.0
+    latency: float = 0.0
+    pipeline: float = 0.0
+    denoise: float = 0.0
     ttff: float = -1.0
     gen_fps: float = -1.0
     error: str = ""
@@ -53,20 +51,23 @@ class VisualGenRequestOutput:
 
 @dataclass
 class VisualGenBenchmarkMetrics:
-    """Aggregated benchmark metrics across all requests."""
+    """Aggregated benchmark metrics across all requests.
+
+    All ``*_latency`` fields are wall-clock seconds.
+    """
 
     completed: int
     total_requests: int
     request_throughput: float
-    mean_e2e_latency_ms: float
-    median_e2e_latency_ms: float
-    std_e2e_latency_ms: float
-    min_e2e_latency_ms: float
-    max_e2e_latency_ms: float
-    percentiles_e2e_latency_ms: list[tuple[float, float]]
+    mean_latency: float
+    median_latency: float
+    std_latency: float
+    min_latency: float
+    max_latency: float
+    percentiles_latency: list[tuple[float, float]]
     num_gpus: int = 1
     per_gpu_throughput: float = 0.0
-    mean_ttff_ms: float = -1.0
+    mean_ttff: float = -1.0
     mean_gen_fps: float = -1.0
 
 
@@ -77,7 +78,7 @@ def calculate_metrics(
     num_gpus: int = 1,
 ) -> VisualGenBenchmarkMetrics:
     """Compute aggregate metrics from per-request outputs."""
-    e2e_latencies: list[float] = []
+    latencies: list[float] = []
     error_counts: dict[str, int] = {}
     completed = 0
 
@@ -85,7 +86,7 @@ def calculate_metrics(
         if out.exception_type:
             error_counts[out.exception_type] = error_counts.get(out.exception_type, 0) + 1
         if out.success:
-            e2e_latencies.append(out.e2e_latency)
+            latencies.append(out.latency)
             completed += 1
 
     total_error_count = sum(error_counts.values())
@@ -101,21 +102,19 @@ def calculate_metrics(
             stacklevel=2,
         )
 
-    e2e_ms = [v * SECONDS_TO_MILLISECONDS for v in e2e_latencies]
-
     request_throughput = completed / dur_s if dur_s > 0 else 0
     return VisualGenBenchmarkMetrics(
         completed=completed,
         total_requests=len(outputs),
         request_throughput=request_throughput,
-        mean_e2e_latency_ms=float(np.mean(e2e_ms)) if e2e_ms else 0,
-        median_e2e_latency_ms=float(np.median(e2e_ms)) if e2e_ms else 0,
-        std_e2e_latency_ms=float(np.std(e2e_ms)) if e2e_ms else 0,
-        min_e2e_latency_ms=float(np.min(e2e_ms)) if e2e_ms else 0,
-        max_e2e_latency_ms=float(np.max(e2e_ms)) if e2e_ms else 0,
-        percentiles_e2e_latency_ms=(
-            [(p, float(np.percentile(e2e_ms, p))) for p in selected_percentiles]
-            if e2e_ms
+        mean_latency=float(np.mean(latencies)) if latencies else 0,
+        median_latency=float(np.median(latencies)) if latencies else 0,
+        std_latency=float(np.std(latencies)) if latencies else 0,
+        min_latency=float(np.min(latencies)) if latencies else 0,
+        max_latency=float(np.max(latencies)) if latencies else 0,
+        percentiles_latency=(
+            [(p, float(np.percentile(latencies, p))) for p in selected_percentiles]
+            if latencies
             else [(p, 0.0) for p in selected_percentiles]
         ),
         num_gpus=num_gpus,
@@ -149,18 +148,18 @@ def print_visual_gen_results(
         )
         print("=" * 60)
 
-    print("{s:{c}^{n}}".format(s=" E2E Latency ", n=60, c="-"))
-    print("{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms))
-    print("{:<40} {:<10.2f}".format("Median E2E Latency (ms):", metrics.median_e2e_latency_ms))
-    print("{:<40} {:<10.2f}".format("Std Dev E2E Latency (ms):", metrics.std_e2e_latency_ms))
-    print("{:<40} {:<10.2f}".format("Min E2E Latency (ms):", metrics.min_e2e_latency_ms))
-    print("{:<40} {:<10.2f}".format("Max E2E Latency (ms):", metrics.max_e2e_latency_ms))
-    for p, v in metrics.percentiles_e2e_latency_ms:
+    print("{s:{c}^{n}}".format(s=" Latency ", n=60, c="-"))
+    print("{:<40} {:<10.4f}".format("Mean Latency (s):", metrics.mean_latency))
+    print("{:<40} {:<10.4f}".format("Median Latency (s):", metrics.median_latency))
+    print("{:<40} {:<10.4f}".format("Std Dev Latency (s):", metrics.std_latency))
+    print("{:<40} {:<10.4f}".format("Min Latency (s):", metrics.min_latency))
+    print("{:<40} {:<10.4f}".format("Max Latency (s):", metrics.max_latency))
+    for p, v in metrics.percentiles_latency:
         p_word = str(int(p)) if int(p) == p else str(p)
-        print("{:<40} {:<10.2f}".format(f"P{p_word} E2E Latency (ms):", v))
+        print("{:<40} {:<10.4f}".format(f"P{p_word} Latency (s):", v))
 
     print("{s:{c}^{n}}".format(s=" Placeholder Metrics ", n=60, c="-"))
-    print("{:<40} {:<10}".format("TTFF (ms):", "N/A (placeholder)"))
+    print("{:<40} {:<10}".format("TTFF (s):", "N/A (placeholder)"))
     print("{:<40} {:<10}".format("GenFPS:", "N/A (placeholder)"))
     print("=" * 60)
 
@@ -226,15 +225,15 @@ def build_visual_gen_result_dict(
         "completed": metrics.completed,
         "request_throughput": metrics.request_throughput,
         "per_gpu_throughput": metrics.per_gpu_throughput,
-        "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
-        "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
-        "std_e2e_latency_ms": metrics.std_e2e_latency_ms,
-        "min_e2e_latency_ms": metrics.min_e2e_latency_ms,
-        "max_e2e_latency_ms": metrics.max_e2e_latency_ms,
-        "percentiles_e2e_latency_ms": {
-            f"p{int(p) if int(p) == p else p}": v for p, v in metrics.percentiles_e2e_latency_ms
+        "mean_latency": metrics.mean_latency,
+        "median_latency": metrics.median_latency,
+        "std_latency": metrics.std_latency,
+        "min_latency": metrics.min_latency,
+        "max_latency": metrics.max_latency,
+        "percentiles_latency": {
+            f"p{int(p) if int(p) == p else p}": v for p, v in metrics.percentiles_latency
         },
-        "e2e_latencies": [out.e2e_latency for out in outputs],
+        "latencies": [out.latency for out in outputs],
         "errors": [out.error for out in outputs],
         "gen_params": gen_params,
     }

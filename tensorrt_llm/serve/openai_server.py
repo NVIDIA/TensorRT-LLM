@@ -979,8 +979,7 @@ class OpenAIServer(_VideoRoutesMixin):
         return chat_response
 
     async def _iteration_stats_collector_loop(self):
-        """
-        Background task that continuously collects iteration statistics from the LLM engine.
+        """Background task that continuously collects iteration statistics from the LLM engine.
 
         This task runs in the background for the lifetime of the server and drains iteration
         stats from the engine's stats queue, logging every stat to Prometheus.  Gauges
@@ -1485,8 +1484,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def chat_harmony(self, request: ChatCompletionRequest,
                            raw_request: Request) -> Response:
-        """
-        Chat Completion API with harmony format support.
+        """Chat Completion API with harmony format support.
         Supports both streaming and non-streaming modes.
         """
 
@@ -1841,11 +1839,11 @@ class OpenAIServer(_VideoRoutesMixin):
                 return self._create_not_supported_error(
                     "URL mode is not supported for image generation")
 
-            e2e_ms = (time.perf_counter() - image_gen_start) * 1000.0
+            latency = time.perf_counter() - image_gen_start  # seconds
             logger.info(
                 f"Image {image_id} generated and encoded: "
-                f"e2e_ms={e2e_ms:.1f} pipeline_ms={getattr(output.metrics, 'pipeline_ms', 0.0):.1f} "
-                f"denoise_ms={getattr(output.metrics, 'denoise_ms', 0.0):.1f}")
+                f"latency={latency:.3f}s pipeline={getattr(output.metrics, 'pipeline', 0.0):.3f}s "
+                f"denoise={getattr(output.metrics, 'denoise', 0.0):.3f}s")
 
             return JSONResponse(content=response.model_dump())
 

@@ -23,24 +23,24 @@ from tensorrt_llm.llmapi.utils import set_api_status
 class VisualGenMetrics:
     """Engine-side timing measurements for a single VisualGen request.
 
-    All four timings are wall-clock milliseconds. ``pipeline_ms`` is measured
-    by the executor as host wall-clock around ``pipeline.infer()``. The three
+    All four timings are wall-clock seconds. ``pipeline`` is measured by the
+    executor as host wall-clock around ``pipeline.infer()``. The three
     sub-phase numbers are measured on the GPU stream via
     ``torch.cuda.Event(enable_timing=True)`` records; events are recorded
     asynchronously so the pipeline does not stall, and ``event.elapsed_time``
     performs an implicit sync amortized into the executor-side sync that
     already occurs when the response is consumed. The sub-phases account for
     GPU-stream time only, so small host-side work shows up as
-    ``pipeline_ms - (pre_denoise_ms + denoise_ms + post_denoise_ms)``.
+    ``pipeline - (pre_denoise + denoise + post_denoise)``.
 
-    For LTX-2's two-stage pipeline, ``denoise_ms`` covers the first stage and
-    the second stage rolls into ``post_denoise_ms``.
+    For LTX-2's two-stage pipeline, ``denoise`` covers the first stage and
+    the second stage rolls into ``post_denoise``.
     """
 
-    pipeline_ms: float = 0.0
-    pre_denoise_ms: float = 0.0
-    denoise_ms: float = 0.0
-    post_denoise_ms: float = 0.0
+    pipeline: float = 0.0
+    pre_denoise: float = 0.0
+    denoise: float = 0.0
+    post_denoise: float = 0.0
 
 
 @set_api_status("prototype")
@@ -97,8 +97,6 @@ class VisualGenOutput:
                 output carries no media tensor at all.
             NotImplementedError: When the output is audio-only.
         """
-        # The encoding import is lazy to keep the encoding stack out of
-        # import time for users who only construct outputs.
         from tensorrt_llm.media.encoding import save_image, save_video
 
         if self.error is not None:
