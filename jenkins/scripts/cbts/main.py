@@ -12,28 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CBTS entry point — consumed by Jenkins Groovy helper `getCbtsResult`.
+"""CBTS entry point.
 
-Two invocation modes (see README.md for full context):
-
+Modes:
   python3 main.py --list-needed-diffs
-      Print the union of all rules' `needs_diff_for` patterns, one per line.
-      Groovy uses this to decide which changed files to fetch diffs for.
-
+      Print the union of rules' `needs_diff_for` patterns, one per line.
   python3 main.py INPUT_JSON
-      Run decision logic. Groovy passes a JSON file containing only PR data:
-        - changed_files: list[str]
-        - diffs: {path: diff_content}
-      Python self-sources everything else from the repo:
-        - stage configs: parsed from jenkins/L0_Test.groovy
-        - test-db YAMLs: loaded from tests/integration/test_lists/test-db/
-      Output is a JSON blob on stdout with fields `scope`, `affected_stages`,
-      `reasons`, `test_db_dir_override`, `affected_stage_test_counts`. Consumed
-      by `_cbtsParseSelectionResult`
-      on the Groovy side.
+      INPUT_JSON: {changed_files: [...], diffs: {path: diff}, post_merge: bool}.
+      Stages are parsed from jenkins/L0_Test.groovy; YAMLs from
+      tests/integration/test_lists/test-db/. Decision JSON goes to stdout
+      with keys: scope, affected_stages, reasons, test_db_dir_override,
+      affected_stage_test_counts.
 
-Invocation assumes the current working directory is the TRT-LLM repo root,
-or that --repo-root is passed explicitly.
+Run from the TRT-LLM repo root or pass --repo-root.
 """
 
 from __future__ import annotations
@@ -73,23 +64,14 @@ def build_rules(yaml_index: YAMLIndex, stages: dict[str, Stage]) -> list[Rule]:
 
 @dataclass
 class SelectionResult:
-    """Final aggregated decision.
-
-    `block_filters` and `test_db_dir_override` drive CBTS Layer 3 (within-stage
-    test filtering). After the Selector aggregates per-rule `block_filters`,
-    `main.py` writes a tmp test-db dir with each affected block's `tests:`
-    array narrowed to entries in the per-block filter prefix subtree, then
-    sets `test_db_dir_override` so Groovy points trt-test-db at it.
-    """
+    """Aggregated CBTS decision serialized to JSON for Groovy."""
 
     scope: Optional[str]
     affected_stages: set[str] = field(default_factory=set)
     reasons: list[str] = field(default_factory=list)
     block_filters: dict[tuple[str, int], dict[str, set[str]]] = field(default_factory=dict)
     test_db_dir_override: Optional[str] = None
-    # Per-stage narrowed test count (sum across blocks the stage's mako
-    # matches, post-keep-filter). Groovy launchTestJobs uses this to
-    # collapse splits to 1 when the count is below the 20-test threshold.
+    # Per-stage narrowed test count, used by Layer 2.5 split-collapse.
     affected_stage_test_counts: dict[str, int] = field(default_factory=dict)
 
     def to_json(self) -> str:
@@ -104,12 +86,7 @@ class SelectionResult:
 
 
 def _combine_scopes(scopes: list[str]) -> Optional[str]:
-    """Combine scope labels from multiple rules.
-
-    v0: single rule => passthrough.
-    Multi-rule future: when all scopes agree, use that scope; otherwise return
-    None (no-decision / full run) until an explicit priority table is added.
-    """
+    """Return the common scope if all agree, else None."""
     if not scopes:
         return None
     if len(set(scopes)) == 1:
@@ -149,13 +126,9 @@ class Selector:
         for _, r in pairs:
             affected_stages |= r.affected_stages
 
-        # Safety net: if rules fired but no Jenkins stages resolved (waive ids
-        # missed both exact and parent-chain lookups in the YAML index), fall
-        # back to baseline by returning scope=None. This guarantees an
-        # invariant the Groovy side relies on: any cbts result with
-        # scope!=None has a non-empty pre-filter `affected_stages` set, so
-        # post-filter emptiness unambiguously means trigger-mode mismatch
-        # (Layer 2 falls back to PackageSanityCheck only).
+        # If rules fired but no stages resolved, return scope=None so
+        # downstream falls back to baseline. Maintains the invariant that any
+        # scope!=None result has a non-empty pre-filter affected_stages set.
         if not affected_stages:
             return SelectionResult(
                 scope=None,
@@ -166,8 +139,7 @@ class Selector:
                 ],
             )
 
-        # Aggregate per-block prefix->{waive_ids} maps across rules. Same
-        # block keyed by multiple rules: union the waive_ids per prefix.
+        # Aggregate per-block prefix->{waive_ids} across rules.
         block_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
         for _, r in pairs:
             for key, prefix_to_waives in r.block_filters.items():
@@ -267,18 +239,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     yaml_index = YAMLIndex.load(test_db_dir)
-    # Include post-merge stages so waives on post-merge-only tests resolve.
-    # Layer 2 in L0_Test.groovy decides what to run with the post-merge
-    # subset based on the user's --post-merge flag.
+    # Include post-merge stages; the trigger-mode filter below selects the
+    # subset matching the user's flag.
     stages = parse_stages_from_groovy(groovy_path, include_post_merge=True)
     pr = _load_pr_inputs(input_path)
     rules = build_rules(yaml_index, stages)
     result = Selector(stages).run(pr, rules)
 
-    # Layer 3: if any block has filter prefixes, write a tmp test-db so
-    # trt-test-db downstream renders a narrower testDBList for the affected
-    # stages. The path is relative to repo_root so Groovy can resolve it as
-    # `${LLM_ROOT}/cbts_test_db`.
+    # Layer 3: write narrowed test-db when any block was filtered.
     if result.scope is not None and result.block_filters:
         out_dir_name = "cbts_test_db"
         write_filtered_test_db(
@@ -287,8 +255,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             block_filters=result.block_filters,
         )
         result.test_db_dir_override = out_dir_name
-        # Per-stage narrowed test count for the launchTestJobs split-collapse
-        # heuristic (collapse pytest-split to splits=1 when count < 20).
         result.affected_stage_test_counts = compute_stage_test_counts(
             yaml_index=yaml_index,
             stages=stages,
@@ -296,27 +262,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             block_filters=result.block_filters,
         )
 
-    # Trigger-mode filter: drop affected_stages incompatible with the user's
-    # /bot run [--post-merge] flag. Done in Python (not Groovy) so the JSON
-    # contract Groovy reads already reflects "stages that should run NOW",
-    # and Layer 2 in Groovy stays scope/mode-agnostic. Narrowed YAML output
-    # (cbts_test_db) is unaffected — runtime mako matching there picks the
-    # right block per stage.
+    # Filter affected_stages by trigger mode; recompute derived counts.
     pre_filter_stages = set(result.affected_stages)
     if pr.post_merge:
         result.affected_stages = {s for s in pre_filter_stages if "Post-Merge" in s}
     else:
         result.affected_stages = {s for s in pre_filter_stages if "Post-Merge" not in s}
-    # Recompute derived fields against the filtered set.
     result.affected_stage_test_counts = {
         k: v for k, v in result.affected_stage_test_counts.items() if k in result.affected_stages
     }
-    # Note: empty `affected_stages` here (after the trigger-mode filter, with
-    # `scope != None`) means "rules resolved stages but none match the user's
-    # trigger mode" — a.k.a. trigger-mode mismatch. Layer 2 in Groovy detects
-    # this with `affected_stages.isEmpty()` and falls back to PackageSanityCheck
-    # only. The Selector safety-net above ensures we never reach this point
-    # with `affected_stages` empty BEFORE the filter.
 
     _log_decision_to_stderr(stages, result, pr, pre_filter_stages)
     sys.stdout.write(result.to_json())
@@ -329,18 +283,7 @@ def _log_decision_to_stderr(
     pr: PRInputs,
     pre_filter_stages: set[str],
 ) -> None:
-    """Dump the full CBTS decision to stderr for Jenkins console diagnostics.
-
-    stdout carries the JSON consumed by Groovy `getCbtsResult`, so all
-    human-readable detail goes to stderr to avoid corrupting that contract.
-    Each affected stage is annotated with its yaml_stem so blocks-vs-stages
-    mismatches (e.g. a stage matched by an unexpected YAML) are obvious.
-
-    `pre_filter_stages` is the affected_stages set BEFORE the trigger-mode
-    filter (pre-merge vs post-merge). Stages dropped by the filter are
-    listed separately so reviewers can see why a stage CBTS narrowed to
-    isn't actually running.
-    """
+    """Print the CBTS decision to stderr for Jenkins console diagnostics."""
     out = sys.stderr
     mode = "post_merge" if pr.post_merge else "pre_merge"
     dropped = sorted(pre_filter_stages - set(result.affected_stages))

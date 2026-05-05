@@ -2607,24 +2607,13 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     }
 
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
-    // CBTS Layer 3: use the narrowed test-db when CBTS provides one.
-    // Perf stages are excluded at Layer 2 (launchTestJobs) and never
-    // reach this path with cbts != null, so no perfMode guard is needed here.
+    // CBTS Layer 3: regenerate cbts_test_db/ on this stage agent from the
+    // piggybacked input JSON if not already present.
     def cbts = testFilter[(CBTS_RESULT)]
-    // Regenerate cbts_test_db/ on this stage's agent. L0_MergeRequest's
-    // getCbtsResult ran main.py on its own pod and produced the dir there,
-    // but L0_Test stages run in separate Kubernetes pods that never receive
-    // that dir. Re-running main.py here with the piggybacked input JSON is
-    // deterministic — output matches what L0_MergeRequest produced.
-    // Idempotent: only runs when cbts_test_db/ doesn't already exist.
     if (cbts != null && cbts.test_db_dir_override && cbts.cbts_input_json) {
         def overrideDir = "${llmSrc}/${cbts.test_db_dir_override}"
         def dirExists = sh(returnStdout: true, script: "test -d ${overrideDir} && echo yes || echo no").trim()
         if (dirExists != "yes") {
-            // Write input JSON to a JNLP-writable temp location instead of
-            // ${llmSrc}/, which the build container created as root and
-            // would reject writeFile() with AccessDeniedException. Matches
-            // the scriptLaunch*PathLocal pattern used in the SLURM path.
             def cbtsInputLocal = Utils.createTempLocation(pipeline, "./cbts_input.json")
             pipeline.writeFile(file: cbtsInputLocal, text: cbts.cbts_input_json)
             sh "apt-get update -qq && apt-get install -y -qq python3-yaml || true"
@@ -2657,8 +2646,6 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     ].join(" ")
 
     sh(label: "Render test list from test-db", script: testDBQueryCmd)
-    // CBTS diagnostics: show how many tests survived the trt-test-db query
-    // and which test-db source was used, to make empty-list bugs visible.
     def testCount = sh(returnStdout: true, script: "wc -l < ${testList} | tr -d ' '").trim()
     def testDBLabel = (cbts != null && cbts.test_db_dir_override) ? "CBTS-narrowed [${cbts.scope}]" : "source"
     echo "renderTestDB: stage=${stageName} context=${testContext} test-db=${testDBLabel} dir=${testDBPath} -> ${testCount} tests"
@@ -4491,29 +4478,9 @@ def launchTestJobs(pipeline, testFilter)
         checkStageNameSet(testFilter[(EXTRA_STAGE_LIST)], fullSet, EXTRA_STAGE_LIST)
     }
 
-    // CBTS Layer 2: stage-level filter. Runs AFTER all existing filter rules
-    // so unknown / no-decision paths fall through naturally. CBTS narrows
-    // *test stages* only — Build always runs (the L0_MergeRequest arch-track
-    // skip was removed deliberately so the wheel and PackageSanityCheck path
-    // are never disturbed by CBTS). See jenkins/scripts/cbts/README.md.
-    //
-    // - Perf stages: excluded. They have their own trigger model and need
-    //   full test lists.
-    // - PackageSanityCheck stages: force-kept. Their stage names are built
-    //   at runtime so the CBTS Python parser cannot see them, and they are
-    //   wheel/image gates that should always run after Build.
-    // - Trigger-mode mismatch (affectedSet empty after Python's pre/post
-    //   filter): rules resolved stages but none match the user's
-    //   /bot run [--post-merge] mode. The filter naturally collapses to
-    //   PackageSanityCheck only — equivalent to "build + sanity, no test
-    //   cases", in spirit similar to /bot run --stage-list "". The Python
-    //   safety net guarantees pre-filter `affected_stages` is non-empty
-    //   whenever `cbts != null`, so empty here unambiguously means mismatch.
-    //
-    // Pre-merge vs Post-Merge filtering already happened in Python
-    // (main.py applies it based on the post_merge flag plumbed through
-    // cbts_input.json), so `cbts.affected_stages` here is already
-    // restricted to the user's trigger mode.
+    // CBTS Layer 2: replace `parallelJobsFiltered` with affected stages plus
+    // PackageSanityCheck (force-kept); Perf is excluded. Empty affectedSet
+    // means trigger-mode mismatch → PackageSanityCheck only.
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts != null) {
         def affectedSet = (cbts.affected_stages ?: []) as Set

@@ -22,15 +22,7 @@ from typing import Optional
 
 @dataclass
 class PRInputs:
-    """Inputs about the PR that rules can query.
-
-    `post_merge` reflects the user's `/bot run [--post-merge]` flag. Rules
-    themselves don't consult it (their narrowing is mode-agnostic); main.py
-    uses it after `Selector.run` to drop `affected_stages` entries that
-    don't match the trigger mode (pre-merge vs Post-Merge by stage-name
-    convention). See `main.py::main` for the filter; default False keeps
-    backward compat with older Groovy that didn't pass the field.
-    """
+    """PR data rules query. `post_merge` reflects /bot run --post-merge."""
 
     changed_files: list[str]
     diffs: dict[str, str]
@@ -39,15 +31,10 @@ class PRInputs:
 
 @dataclass
 class RuleResult:
-    """What a single rule contributes when it applies to a PR.
+    """One rule's contribution.
 
-    `block_filters` (CBTS Layer 3): per-block map of filter prefix -> set of
-    waive ids that resolved to that prefix. Each affected block (keyed by
-    `(yaml_stem, block_index)`) maps to {prefix: {waive_id, ...}}. The
-    Selector aggregates this across rules and `write_filtered_test_db`
-    uses both the prefix (subtree match) AND the waive ids (to skip YAML
-    entries whose `-k "<keyword>"` filter doesn't match the waived test).
-    Empty when the rule doesn't produce Layer 3 narrowing.
+    `block_filters` is per-block `{filter_prefix: {originating_waive_id, ...}}`
+    for Layer 3 narrowing.
     """
 
     handled_files: set[str]
@@ -58,15 +45,11 @@ class RuleResult:
 
 
 class Rule(ABC):
-    """Base class for all CBTS rules.
+    """Base class for CBTS rules.
 
-    A rule declares:
-      - `name`: identifier used in logs/reasons
-      - `needs_diff_for`: file paths / glob patterns whose diffs this rule consumes
-                         (Groovy uses this to decide which files to fetch diffs for)
-
-    Subclasses implement `apply(pr)` returning either None (not applicable) or
-    a RuleResult.
+    `name`: log/reason identifier.
+    `needs_diff_for`: file paths/globs whose diffs the rule consumes.
+    `apply(pr)`: return RuleResult or None (not applicable).
     """
 
     name: str = ""

@@ -703,15 +703,10 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
 // ============================================================================
 // CBTS (Change-Based Testing Selection)
 //
-// Upstream decision point. Calls jenkins/scripts/cbts/main.py with the PR's
-// changed_files + diffs; Python self-sources stage configs from L0_Test.groovy
-// and YAML blocks from test-db. Returns a dict {scope, affected_stages,
-// reasons, test_db_dir_override, affected_stage_test_counts} or null
-// (= no decision / fall back to the existing filter chain).
-//
-// See jenkins/scripts/cbts/README.md for the consumption model. CBTS only
-// narrows test cases (Layer 2 stage filter + Layer 3 within-stage filter);
-// it never affects Build, so the wheel always exists.
+// Calls jenkins/scripts/cbts/main.py with PR changed_files + diffs and returns
+// a result map (or null = defer to existing filter chain). Result keys:
+// scope, affected_stages, reasons, test_db_dir_override, affected_stage_test_counts.
+// CBTS narrows test cases only — Build always runs. See cbts/README.md.
 // ============================================================================
 
 def getCbtsResult(pipeline, testFilter, globalVars)
@@ -737,19 +732,15 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     }
 
     try {
-        // 0. Ensure pyyaml is available on the Jenkins agent (blocks.py needs it
-        //    to parse test-db YAMLs). buildpack-deps has no pip3 by default,
-        //    so install the Debian python3-yaml package directly.
+        // pyyaml is needed by main.py's blocks.py to parse test-db YAMLs.
         sh "apt-get update -qq && apt-get install -y -qq python3-yaml"
 
-        // 1. Ask Python for the union of needs_diff_for patterns across all rules.
+        // Ask Python which file patterns need diffs, fetch them.
         def patternsOut = sh(
             script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py --list-needed-diffs",
             returnStdout: true,
         ).trim()
         def needsDiffFor = patternsOut ? patternsOut.readLines().collect { it.trim() }.findAll { it } : []
-
-        // 2. For each changed file matching a needs_diff_for pattern, pull the diff.
         def diffs = [:]
         for (f in changedFiles) {
             if (_cbtsMatchesAnyPattern(f, needsDiffFor)) {
@@ -757,10 +748,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
             }
         }
 
-        // 3. Write INPUT_JSON (PR data only; Python reads stages/yaml itself).
-        // `post_merge` lets Python apply the trigger-mode filter on
-        // affected_stages before returning the JSON, so Layer 2 in Groovy
-        // (L0_Test.groovy::launchTestJobs) stays scope-/mode-agnostic.
+        // Write INPUT_JSON; Python reads stages/yaml itself.
         def inputJson = groovy.json.JsonOutput.toJson([
             changed_files: changedFiles,
             diffs: diffs,
@@ -769,30 +757,20 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         def inputPath = "${LLM_ROOT}/cbts_input.json"
         writeFile file: inputPath, text: inputJson
 
-        // 4. Run Python; capture stdout.
         def output = sh(
             script: "cd ${LLM_ROOT} && python3 jenkins/scripts/cbts/main.py cbts_input.json",
             returnStdout: true,
         )
 
-        // 5. Parse stdout into the map shape consumed by Layer 2/2.5/3.
         def result = _cbtsParseSelectionResult(output)
         if (result.scope == null) {
             pipeline.echo("CBTS: deferring — Python returned scope=null. " +
                           "Reasons: ${result.reasons.join('; ')}")
             return null
         }
-        // Layer 3 cross-job seed: piggyback the input JSON on testFilter so
-        // each L0_Test stage agent can re-run main.py locally and regenerate
-        // its own copy of cbts_test_db/. The directory written here lives on
-        // the L0_MergeRequest agent and never reaches downstream pods.
-        //
-        // Hard cap to keep us well below ARG_MAX (~2 MB on most kernels) and
-        // Jenkins's per-parameter handling. CACHED_CHANGED_FILE_LIST already
-        // hits "Argument list too long" at smaller sizes (see comment on
-        // launchJob), so 256 KB is conservative. If we exceed it, drop the
-        // piggyback — Layer 2 stage filtering still applies, and renderTestDB
-        // falls back to the source test-db automatically.
+        // Piggyback input JSON on testFilter so each L0_Test stage agent can
+        // re-run main.py and regenerate cbts_test_db/ locally. Capped at
+        // 256 KB; oversize → drop piggyback, Layer 3 falls back to source.
         final int CBTS_INPUT_PIGGYBACK_MAX_BYTES = 256000
         def inputJsonSize = inputJson.length()
         if (inputJsonSize <= CBTS_INPUT_PIGGYBACK_MAX_BYTES) {
@@ -813,25 +791,17 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     }
 }
 
-// Translate an Ant-style glob to a regex.
-//   **/   zero or more path segments
-//   **    any chars (including /)
-//   *     any chars except /
-//   ?     single char except /
-// Implemented in pure Groovy — `hudson.util.AntPathMatcher` is not visible
-// to the Jenkins script sandbox classpath. Exact paths (no glob meta) round-
-// trip to a literal regex, so existing rules with literal needs_diff_for keep
-// working without changes.
+// Translate an Ant-style glob to a regex:
+//   **/  zero or more path segments
+//   **   any chars (including /)
+//   *    any chars except /
+//   ?    single char except /
 def _cbtsGlobToRegex(String glob)
 {
-    // 1. Escape regex specials, except glob metas (* and ?) which we handle below.
     def escaped = glob.collect { c ->
         (c == '*' || c == '?') ? c
             : ('.+()[]{}|^$\\'.contains(c) ? '\\' + c : c)
     }.join('')
-    // 2. Translate glob metas. Use unambiguous text sentinels so cascading
-    //    replaces don't double-match. Avoid unicode-escape placeholders
-    //    because the Groovy lexer expands those even inside string literals.
     return '^' + escaped
         .replace('**/', '__CBTSDOUBLESLASH__')
         .replace('**',  '__CBTSDOUBLESTAR__')
@@ -846,15 +816,9 @@ def _cbtsMatchesAnyPattern(String filePath, List patterns)
     return patterns.any { filePath ==~ _cbtsGlobToRegex(it) }
 }
 
-// CBTS only activates on `/bot run` and `/bot run --post-merge`. Any other
-// stage-selection flag makes it defer to the user's explicit choice.
-// Orthogonal flags (REUSE_*, DEBUG_MODE, DETAILED_LOG) and IS_POST_MERGE are
-// intentionally not in this list — they either don't affect stage selection
-// or are handled specially in Layer 2. Adding a new stage-selection flag in
-// the future means adding one entry here; nothing else changes.
-//
-// All defer flags default to falsy (false / null), so a single truthy check
-// captures both boolean and list-typed flags.
+// Returns user-set stage-selection flags that should force CBTS to defer.
+// IS_POST_MERGE and orthogonal flags (REUSE_*, DEBUG_MODE, DETAILED_LOG, ...)
+// are intentionally absent.
 def _cbtsTriggeredUserFlags(testFilter)
 {
     def deferFlags = [
@@ -865,9 +829,8 @@ def _cbtsTriggeredUserFlags(testFilter)
                      .collect { "${it}=${testFilter[it]}" }
 }
 
-// Parse CBTS JSON stdout into the shape consumed by Layer 2/2.5/3. Always
-// returns a map; `scope == null` means "no decision" (caller should log the
-// reasons and treat as defer).
+// Parse CBTS JSON stdout into a map. `scope == null` → no decision; caller
+// logs reasons and defers.
 def _cbtsParseSelectionResult(String text)
 {
     def data = new groovy.json.JsonSlurper().parseText(text)
@@ -875,10 +838,7 @@ def _cbtsParseSelectionResult(String text)
         scope: data.scope,
         affected_stages: data.affected_stages ?: [],
         reasons: data.reasons ?: [],
-        test_db_dir_override: data.test_db_dir_override,  // Layer 3: tmp test-db path
-        // Layer 3 split-collapse heuristic: per-stage narrowed test count.
-        // launchTestJobs reads this to drop excess pytest-split groups when
-        // the affected stage's narrowed count falls below the 20-test threshold.
+        test_db_dir_override: data.test_db_dir_override,
         affected_stage_test_counts: data.affected_stage_test_counts ?: [:],
     ]
 }

@@ -25,13 +25,7 @@ WAIVES_FILE = "tests/integration/test_lists/waives.txt"
 
 
 def _extract_test_id(line: str) -> Optional[str]:
-    """Extract the normalized test identifier from a waives.txt line.
-
-    Returns None if the line doesn't look like a waive entry (empty / pure
-    comment line). Trailing `SKIP`/`TIMEOUT` annotations, `# comment`s, and
-    leading `full:<gpu>/` prefix are stripped via `normalize_test_id` so the
-    result matches the same key used by `YAMLIndex`.
-    """
+    """Return the normalized test id from a waives.txt line, or None."""
     s = line.strip()
     if not s or s.startswith("#"):
         return None
@@ -40,11 +34,7 @@ def _extract_test_id(line: str) -> Optional[str]:
 
 
 def parse_waives_diff(diff: str) -> tuple[set[str], set[str]]:
-    """Parse a unified diff of waives.txt.
-
-    Returns (added, removed) sets of normalized test identifiers ready to look
-    up against `YAMLIndex.blocks_containing_test`.
-    """
+    """Return (added, removed) normalized test ids from a waives.txt diff."""
     added: set[str] = set()
     removed: set[str] = set()
     for line in diff.splitlines():
@@ -66,8 +56,7 @@ class WaivesRule(Rule):
 
     def __init__(self, yaml_index: YAMLIndex, stages: dict[str, Stage]) -> None:
         self.yaml_index = yaml_index
-        # Group stages by YAML stem so block->stage lookup is O(stages_in_yaml)
-        # instead of O(total_stages) per block.
+        # Group stages by YAML stem for O(stages_in_yaml) per-block lookup.
         self._stages_by_yaml: dict[str, list[tuple[str, Stage]]] = {}
         for name, stage in stages.items():
             self._stages_by_yaml.setdefault(stage.yaml_stem, []).append((name, stage))
@@ -87,13 +76,9 @@ class WaivesRule(Rule):
                 reason="waives.txt: no actionable test ids in diff",
             )
 
-        # For each waive, walk the parent chain looking for the first level
-        # where a YAML entry actually applies (-k keyword check included).
-        # Any unmatchable waive triggers full fallback — better safe than to
-        # silently drop CI for a typo'd or out-of-tree waive id.
-        # Record (prefix -> {waive_ids that resolved to it}) per block so
-        # write_filtered_test_db can re-check `-k` keywords against the
-        # original waive ids when narrowing entries.
+        # Walk each waive's parent chain to the first matching YAML level;
+        # any miss → scope=None (fallback). Record per-block prefix →
+        # {originating waive ids} for write_filtered_test_db's `-k` re-check.
         block_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
         affected_blocks: list[Block] = []
         seen_block_keys: set[tuple[str, int]] = set()
