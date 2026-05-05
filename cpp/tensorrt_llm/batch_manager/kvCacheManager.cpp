@@ -2071,6 +2071,23 @@ void WindowBlockManager::refreshBlocks()
     mTransferManager->syncTransfers();
 }
 
+void WindowBlockManager::truncateBlocks(
+    LlmRequest::VecTokens const& /*targetTokens*/, SizeType32 /*numTokensToKeep*/)
+{
+    // intentional stub; implementation arrives in a follow-up commit (Task 5).
+}
+
+void WindowBlockManager::releaseSubtree(BlockPtr const& /*block*/)
+{
+    // intentional stub; implementation arrives in a follow-up commit (Task 5).
+}
+
+void BlockManager::truncateBlocks(
+    LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep, SizeType32 windowSize)
+{
+    mWindowBlockManagers.at(windowSize).truncateBlocks(targetTokens, numTokensToKeep);
+}
+
 std::vector<WindowBlockManager::BatchSeqStats> BlockManager::addSequenceBatch(
     std::vector<GenerationRequest*> const& sequences, std::vector<SizeType32> const& inputLengths,
     std::vector<SizeType32> const& numContextBlocksVec,
@@ -3679,6 +3696,15 @@ std::vector<KVCacheBlock::IdType> KVCacheManager::storeBlocksForReuse(
     auto pinnedBlockIds = mBlockManager.storeBlocksForReuse(sequence, llmRequest, pinBlocks);
     TLLM_LOG_TRACE("[%s]::%s stop", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
     return pinnedBlockIds;
+}
+
+void KVCacheManager::truncateBlocks(
+    LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep)
+{
+    for (auto const& [windowSize, _] : mBlockManager.getWindowSizesMetadata())
+    {
+        mBlockManager.truncateBlocks(targetTokens, numTokensToKeep, windowSize);
+    }
 }
 
 void KVCacheManager::schedulingRemoveSequence(RequestIdType requestId)

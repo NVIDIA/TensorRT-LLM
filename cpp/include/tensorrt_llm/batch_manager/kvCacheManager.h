@@ -1136,6 +1136,14 @@ public:
     //! \brief Unpin blocks by block ids directly
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
+    //! \brief Release cached blocks for a token sequence beyond a given prefix length.
+    //! \details Stub at this point — full algorithm is implemented in a follow-up commit.
+    //! Intent: walk the per-window cached-block chain from mCachedBlocksRoot following
+    //! \p targetTokens; when cumulative matched tokens first exceed \p numTokensToKeep,
+    //! release the matching block and all its descendants back to the eviction policy
+    //! at min retention priority. The boundary block spanning the threshold is preserved.
+    void truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep);
+
     void resetReuseState()
     {
         std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
@@ -1223,6 +1231,11 @@ private:
     }
 
 private:
+    //! \brief Detach \p block and all its descendants from the lookup tree, and return
+    //! unreferenced blocks to the eviction policy at min retention priority.
+    //! \details Caller must hold mLookupTree->getMutex().
+    void releaseSubtree(BlockPtr const& block);
+
     nvinfer1::DataType mDataType;
     SizeType32 mWindowSize;
 
@@ -1411,6 +1424,10 @@ public:
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
     void releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize);
+
+    //! \brief Release cached blocks for \p windowSize beyond \p numTokensToKeep tokens.
+    //! \details Forwards to WindowBlockManager::truncateBlocks for the named window.
+    void truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep, SizeType32 windowSize);
 
     void setOffsets(kernels::KVCacheIndex* offsetsPtr, nvinfer1::Dims const& offsetsShape, SizeType32 beamIdx,
         SizeType32 blockIdx, KVCacheBlock::IdType blockId, SizeType32 windowSize) const;
@@ -2017,6 +2034,14 @@ public:
 
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
 
+    /// @brief Release cached blocks for a token sequence beyond a given prefix length.
+    /// @param targetTokens The full token sequence whose cached blocks are walked.
+    /// @param numTokensToKeep Number of prefix tokens to retain. Blocks whose cumulative
+    ///        token count exceeds this threshold (and all their descendants) are released.
+    ///        Because truncation operates at block granularity, the boundary block that
+    ///        spans the threshold is preserved.
+    virtual void truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep) = 0;
+
     //! @brief Get the retention priority of a block by its ID.
     //! @param blockId The ID of the block.
     //! @param windowSize The attention window size this block belongs to.
@@ -2322,6 +2347,10 @@ public:
     void pinBlocks(LlmRequest::RequestIdType requestId) override;
 
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) override;
+
+    /// @brief Release cached blocks for a token sequence beyond a given prefix length.
+    /// @copydetails BaseKVCacheManager::truncateBlocks
+    void truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep) override;
 
     [[nodiscard]] executor::RetentionPriority getPriorityByBlockId(
         KVCacheBlock::IdType blockId, SizeType32 windowSize) const override;
