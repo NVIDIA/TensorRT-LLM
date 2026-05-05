@@ -1657,6 +1657,42 @@ class TestExpandPromptTokenIdsForMM:
         assert 200 in result  # sound_start_token_id
         assert 201 in result  # sound_end_token_id
 
+    def test_evs_dispatch_returns_image_evs_ids_in_mm_data_updates(self):
+        proc = _make_fast_path_processor()
+        proc.video_pruning_rate = 0.5
+        img_ctx = proc.img_context_token_id
+        prompt = [1, img_ctx, 2]
+
+        result, mm_data_updates = proc.expand_prompt_token_ids_for_mm(
+            prompt,
+            [5],
+            mm_data={"image": [object()]},
+        )
+
+        assert mm_data_updates is not None
+        evs_ids = mm_data_updates["image"]["evs_ids"]
+        assert isinstance(evs_ids, torch.Tensor)
+        assert evs_ids.dtype == torch.long
+        assert evs_ids.tolist() == result
+
+    def test_evs_dispatch_returns_audio_evs_ids_in_mm_data_updates(self):
+        proc = _make_fast_path_audio_processor()
+        proc.video_pruning_rate = 0.5
+        snd_ctx = proc._sound_context_token_id
+        prompt = [1, snd_ctx, 2]
+
+        result, mm_data_updates = proc.expand_prompt_token_ids_for_mm(
+            prompt,
+            [5],
+            mm_data={"audio": [object()]},
+        )
+
+        assert mm_data_updates is not None
+        evs_ids = mm_data_updates["audio"]["evs_ids"]
+        assert isinstance(evs_ids, torch.Tensor)
+        assert evs_ids.dtype == torch.long
+        assert evs_ids.tolist() == result
+
     def test_no_placeholders_returns_unchanged(self):
         proc = _make_fast_path_processor()
         prompt = [1, 2, 3, 4]

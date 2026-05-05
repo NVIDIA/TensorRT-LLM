@@ -1251,8 +1251,8 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
                 video).
                 `mm_data_updates` (Optional[Dict]) — additional fields to
                 merge into `extra_processed_inputs["multimodal_data"]`.
-                Currently only non-None for EVS-enabled video, in which case
-                it is `{"video": {"evs_ids": evs_ids_tensor}}`.
+                Currently non-None for EVS-enabled image/audio/video requests,
+                in which case it carries a modality-specific `evs_ids` tensor.
         """
         # Detect modality primarily from `mm_data`, which is authoritative and
         # independent of tokenizer quirks. The token-scanning fallback is only
@@ -1286,12 +1286,26 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             expanded = self._expand_image_placeholders_in_token_ids(
                 prompt_token_ids, num_mm_tokens_per_placeholder
             )
-            return expanded, None
+            mm_data_updates = None
+            if self.video_pruning_rate > 0:
+                mm_data_updates = {
+                    "image": {
+                        "evs_ids": torch.tensor(expanded, dtype=torch.long),
+                    },
+                }
+            return expanded, mm_data_updates
         if has_audio:
             expanded = self._expand_audio_placeholders_in_token_ids(
                 prompt_token_ids, num_mm_tokens_per_placeholder
             )
-            return expanded, None
+            mm_data_updates = None
+            if self.video_pruning_rate > 0:
+                mm_data_updates = {
+                    "audio": {
+                        "evs_ids": torch.tensor(expanded, dtype=torch.long),
+                    },
+                }
+            return expanded, mm_data_updates
         # has_video -- reuse `mm_data` already extracted above for detection.
         expanded_ids, evs_ids_tensor = self._expand_video_placeholders_in_token_ids(
             prompt_token_ids, num_mm_tokens_per_placeholder, mm_data or None
