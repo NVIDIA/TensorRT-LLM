@@ -512,7 +512,16 @@ class TestImageGeneration:
 
 
 class TestImageEdit:
-    def test_basic_image_edit(self, image_client):
+    """``/v1/images/edits`` returns 501 NotImplemented in the current release.
+
+    No in-tree pipeline implements image editing: Flux/Flux2 are
+    text-to-image only and ignore ``params.image``; Wan and LTX-2 produce
+    video, not edited images. Restore the full happy-path coverage when an
+    edit-capable pipeline lands.
+    """
+
+    def test_image_edit_returns_not_implemented(self, image_client):
+        """Valid request body still short-circuits to 501 NotImplemented."""
         b64_img = _b64_white_png_1x1()
         resp = image_client.post(
             "/v1/images/edits",
@@ -522,85 +531,14 @@ class TestImageEdit:
                 "num_inference_steps": 10,
             },
         )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "data" in data
-        assert len(data["data"]) >= 1
-        assert data["data"][0]["b64_json"] is not None
-
-    def test_image_edit_with_list_images(self, image_client):
-        b64_img = _b64_white_png_1x1()
-        resp = image_client.post(
-            "/v1/images/edits",
-            json={
-                "image": [b64_img, b64_img],
-                "prompt": "Merge them",
-                "num_inference_steps": 10,
-            },
-        )
-        assert resp.status_code == 200
-
-    def test_image_edit_with_mask(self, image_client):
-        b64_img = _b64_white_png_1x1()
-        b64_mask = _b64_white_png_1x1()
-        resp = image_client.post(
-            "/v1/images/edits",
-            json={
-                "image": b64_img,
-                "prompt": "Remove object",
-                "mask": b64_mask,
-                "num_inference_steps": 10,
-            },
-        )
-        assert resp.status_code == 200
-
-        # Verify image + mask were base64-decoded and forwarded.
-        params = image_client.mock_gen.last_params
-        expected_bytes = base64.b64decode(b64_img)
-        assert params.image == [expected_bytes]
-        assert params.mask == base64.b64decode(b64_mask)
-        assert params.num_inference_steps == 10
-
-    def test_image_edit_with_optional_params(self, image_client):
-        b64_img = _b64_white_png_1x1()
-        resp = image_client.post(
-            "/v1/images/edits",
-            json={
-                "image": b64_img,
-                "prompt": "Enhance colors",
-                "size": "128x128",
-                "guidance_scale": 8.0,
-                "num_inference_steps": 15,
-                "seed": 42,
-                "negative_prompt": "dark",
-            },
-        )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["size"] == "128x128"
-
-        params = image_client.mock_gen.last_params
-        assert params.width == 128
-        assert params.height == 128
-        assert params.guidance_scale == 8.0
-        assert params.num_inference_steps == 15
-        assert params.negative_prompt == "dark"
-        assert params.image == [base64.b64decode(b64_img)]
-
-    def test_image_edit_failure(self, failing_client):
-        b64_img = _b64_white_png_1x1()
-        resp = failing_client.post(
-            "/v1/images/edits",
-            json={
-                "image": b64_img,
-                "prompt": "Edit this",
-                "num_inference_steps": 10,
-            },
-        )
-        assert resp.status_code == 500
+        assert resp.status_code == 501
+        body = resp.json()
+        assert body.get("type") == "NotImplementedError"
+        assert "not supported" in body.get("message", "").lower()
 
     def test_missing_image_for_edit(self, image_client):
-        """Missing required field → RequestValidationError → custom handler → 400."""
+        """Missing required field is rejected by FastAPI request validation
+        (400) before the 501 short-circuit, so this contract is unchanged."""
         resp = image_client.post(
             "/v1/images/edits",
             json={
@@ -608,24 +546,6 @@ class TestImageEdit:
             },
         )
         assert resp.status_code == 400
-
-    def test_image_edit_b64_no_save_image(self, image_client, tmp_path):
-        """NVBug 6064029: /v1/images/edits had the same redundant
-        ``save_image()`` call on the b64 path. The fix removed it entirely
-        (the edit endpoint has no url branch)."""
-        b64_img = _b64_white_png_1x1()
-        with patch("tensorrt_llm.serve.openai_server.save_image") as mock_save:
-            resp = image_client.post(
-                "/v1/images/edits",
-                json={
-                    "image": b64_img,
-                    "prompt": "Make it blue",
-                    "num_inference_steps": 10,
-                },
-            )
-        assert resp.status_code == 200
-        mock_save.assert_not_called()
-        assert list(tmp_path.glob("*.png")) == []
 
 
 # =========================================================================

@@ -241,17 +241,13 @@ class DiffusionExecutor:
     def _validate_request(self, req: DiffusionRequest):
         """Validate *req.params* against the loaded pipeline's declared parameters.
 
-        Raises ``VisualGenParamsError`` on:
+        Raises ``ValueError`` on:
         - Unknown ``extra_params`` keys
         - Universal fields (e.g. ``num_frames``) set by the user but not
           declared in the pipeline's ``default_generation_params``
         - Type mismatches for ``extra_params`` values
         - Out-of-range ``extra_params`` values
         """
-        # Lazy import to avoid circular dependency
-        # (executor → visual_gen.visual_gen → _torch.visual_gen → executor)
-        from tensorrt_llm.visual_gen.visual_gen import VisualGenParamsError
-
         params = req.params
         errors: list[str] = []
         pipeline_name = self.pipeline.__class__.__name__
@@ -310,7 +306,7 @@ class DiffusionExecutor:
             msg = f"Parameter validation failed for {pipeline_name}:\n" + "\n".join(
                 f"  - {e}" for e in errors
             )
-            raise VisualGenParamsError(msg)
+            raise ValueError(msg)
 
     def process_request(self, req: DiffusionRequest):
         """Process a single request."""

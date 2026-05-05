@@ -92,16 +92,17 @@ class VisualGenOutput:
             :class:`pathlib.Path` of the saved file.
 
         Raises:
-            VisualGenError: When the output carries an error, when no media
-                tensor is present, or when video output lacks a frame rate.
+            RuntimeError: When the output carries an upstream error.
+            ValueError: When video output lacks a frame rate, or when the
+                output carries no media tensor at all.
+            NotImplementedError: When the output is audio-only.
         """
-        # Lazy imports keep the encoding stack and the engine error type out
-        # of import time for users who only construct outputs.
+        # The encoding import is lazy to keep the encoding stack out of
+        # import time for users who only construct outputs.
         from tensorrt_llm.media.encoding import save_image, save_video
-        from tensorrt_llm.visual_gen.visual_gen import VisualGenError
 
         if self.error is not None:
-            raise VisualGenError(
+            raise RuntimeError(
                 f"Cannot save output: request {self.request_id} failed with error: {self.error}"
             )
 
@@ -112,7 +113,7 @@ class VisualGenOutput:
         if self.video is not None:
             fr = frame_rate if frame_rate is not None else self.frame_rate
             if fr is None:
-                raise VisualGenError(
+                raise ValueError(
                     "Cannot save video: frame_rate is not set on the output and was not "
                     "provided as a keyword argument."
                 )
@@ -128,9 +129,9 @@ class VisualGenOutput:
             return Path(saved)
 
         if self.audio is not None:
-            raise VisualGenError("Saving audio-only outputs is not supported in this release.")
+            raise NotImplementedError("Saving audio-only outputs is not supported in this release.")
 
-        raise VisualGenError(
+        raise ValueError(
             f"Cannot save output: request {self.request_id} carries no media "
             "(image/video/audio are all None)."
         )

@@ -298,32 +298,26 @@ def test_save_video_kwarg_overrides_rate(tmp_path):
 
 
 def test_save_errored_output_raises(tmp_path):
-    """save() on an errored output raises VisualGenError mentioning the error."""
-    from tensorrt_llm.visual_gen import VisualGenError
-
+    """save() on an errored output raises RuntimeError mentioning the error."""
     out = VisualGenOutput(request_id=3, error="kernel launch failed")
-    with pytest.raises(VisualGenError, match="kernel launch failed"):
+    with pytest.raises(RuntimeError, match="kernel launch failed"):
         out.save(tmp_path / "x.png")
 
 
 def test_save_video_without_rate_raises(tmp_path):
-    """Video output without frame_rate (and no kwarg) raises VisualGenError."""
-    from tensorrt_llm.visual_gen import VisualGenError
-
+    """Video output without frame_rate (and no kwarg) raises ValueError."""
     out = VisualGenOutput(
         request_id=4,
         video=torch.zeros(4, 8, 8, 3, dtype=torch.uint8),
     )
-    with pytest.raises(VisualGenError, match="frame_rate"):
+    with pytest.raises(ValueError, match="frame_rate"):
         out.save(tmp_path / "x.mp4")
 
 
 def test_save_no_media_raises(tmp_path):
-    """save() with no media tensor raises VisualGenError."""
-    from tensorrt_llm.visual_gen import VisualGenError
-
+    """save() with no media tensor raises ValueError."""
     out = VisualGenOutput(request_id=5)
-    with pytest.raises(VisualGenError, match="no media"):
+    with pytest.raises(ValueError, match="no media"):
         out.save(tmp_path / "x.png")
 
 
@@ -459,16 +453,15 @@ def test_batch_error_yields_error_per_item():
         fx.stop()
 
 
-def test_single_error_raises_visual_gen_error():
-    """Awaiting a single-prompt handle whose response errored raises VisualGenError."""
-    from tensorrt_llm.visual_gen import VisualGenError
+def test_single_error_raises_runtime_error():
+    """Awaiting a single-prompt handle whose response errored raises RuntimeError."""
     from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
 
     resp = DiffusionResponse(request_id=15, error_msg="boom")
     fx = _FakeExecutor(resp)
     try:
         handle = VisualGenResult(request_id=15, executor=fx, batch_size=None)
-        with pytest.raises(VisualGenError, match="boom"):
+        with pytest.raises(RuntimeError, match="boom"):
             asyncio.run(handle.aresult())
     finally:
         fx.stop()
@@ -513,6 +506,142 @@ def test_params_list_raises_not_implemented():
     fake.generate_async = VisualGen.generate_async.__get__(fake, VisualGen)
     with pytest.raises(NotImplementedError, match="Per-item params"):
         fake.generate_async(inputs="a cat", params=[VisualGenParams()])
+
+
+# ---------------------------------------------------------------------------
+# Timeout-leak fix: abandon_request_id contract on DiffusionRemoteClient
+# ---------------------------------------------------------------------------
+
+
+class _TimeoutFakeExecutor(_FakeExecutor):
+    """Fake executor that simulates a timeout.
+
+    ``await_responses`` returns ``None`` and ``abandon_request_id``
+    invocations are recorded for later assertion.
+    """
+
+    def __init__(self):
+        super().__init__(response=None)
+        self.abandoned: list[int] = []
+
+    async def await_responses(self, request_id, timeout=None):
+        return None
+
+    async def abandon_request_id(self, request_id):
+        self.abandoned.append(request_id)
+
+
+def test_aresult_timeout_invokes_abandon_request_id():
+    """The aresult timeout branch must abandon the request id.
+
+    Without this, a late-arriving response would pin a PipelineOutput
+    tensor in completed_responses for the process lifetime.
+    """
+    from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
+
+    fx = _TimeoutFakeExecutor()
+    try:
+        handle = VisualGenResult(request_id=99, executor=fx, batch_size=None)
+        with pytest.raises(RuntimeError, match="timed out"):
+            asyncio.run(handle.aresult(timeout=0.01))
+        assert fx.abandoned == [99]
+        # Replays the same outcome via the _finished fast path without
+        # re-entering await_responses or abandoning twice.
+        with pytest.raises(RuntimeError, match="timed out"):
+            asyncio.run(handle.aresult(timeout=0.01))
+        assert fx.abandoned == [99]
+    finally:
+        fx.stop()
+
+
+def test_aresult_timeout_batch_invokes_abandon_request_id():
+    """Same as the single-prompt case but for batch handles."""
+    from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
+
+    fx = _TimeoutFakeExecutor()
+    try:
+        handle = VisualGenResult(request_id=100, executor=fx, batch_size=3)
+        out = asyncio.run(handle.aresult(timeout=0.01))
+        assert isinstance(out, list) and len(out) == 3
+        for item in out:
+            assert item.error == "Generation timed out"
+        assert fx.abandoned == [100]
+    finally:
+        fx.stop()
+
+
+def _make_minimal_client_state():
+    """Build a minimal DiffusionRemoteClient stub for direct method tests.
+
+    Carries only the dict + lock state that abandon_request_id and
+    _store_response touch, without spawning the worker process or
+    background thread.
+    """
+    from tensorrt_llm.visual_gen.visual_gen import DiffusionRemoteClient
+
+    client = DiffusionRemoteClient.__new__(DiffusionRemoteClient)
+    client.completed_responses = {}
+    client._abandoned_request_ids = set()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        client.lock = asyncio.Lock()
+        client.response_event = asyncio.Event()
+    finally:
+        asyncio.set_event_loop(None)
+    return client, loop
+
+
+def test_abandon_drops_already_stored_response():
+    """abandon_request_id pops a response that arrived before timeout.
+
+    Case A: race where the worker delivered between the await break and
+    the abandon call.
+    """
+    client, loop = _make_minimal_client_state()
+    try:
+        resp = DiffusionResponse(request_id=42, error_msg="late arrival")
+        loop.run_until_complete(client._store_response(resp))
+        assert 42 in client.completed_responses
+
+        loop.run_until_complete(client.abandon_request_id(42))
+        assert 42 not in client.completed_responses
+        assert 42 in client._abandoned_request_ids
+    finally:
+        loop.close()
+
+
+def test_store_drops_response_for_abandoned_id():
+    """_store_response drops a response whose id has been abandoned.
+
+    Case B: worker delivered after the caller gave up. The abandoned-id
+    entry is discarded so the set does not grow forever.
+    """
+    client, loop = _make_minimal_client_state()
+    try:
+        loop.run_until_complete(client.abandon_request_id(7))
+        assert 7 in client._abandoned_request_ids
+
+        resp = DiffusionResponse(request_id=7, error_msg="late arrival")
+        loop.run_until_complete(client._store_response(resp))
+        assert 7 not in client.completed_responses
+        assert 7 not in client._abandoned_request_ids
+    finally:
+        loop.close()
+
+
+def test_store_unrelated_response_unaffected_by_abandon():
+    """An abandoned id must not block storage of responses for other ids."""
+    client, loop = _make_minimal_client_state()
+    try:
+        loop.run_until_complete(client.abandon_request_id(1))
+        resp = DiffusionResponse(request_id=2, error_msg="ok")
+        loop.run_until_complete(client._store_response(resp))
+        assert 2 in client.completed_responses
+        assert 1 in client._abandoned_request_ids
+    finally:
+        loop.close()
 
 
 # ---------------------------------------------------------------------------

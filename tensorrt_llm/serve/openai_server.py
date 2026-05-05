@@ -1859,53 +1859,15 @@ class OpenAIServer(_VideoRoutesMixin):
 
         Follows the OpenAI Images API specification for image editing.
         Creates an edited or extended image given an original image and a prompt.
+
+        No in-tree pipeline implements image editing today: Flux/Flux2 are
+        text-to-image only and ignore ``params.image``; Wan and LTX-2 produce
+        video, not edited images. Return 501 here so callers get an honest
+        NotImplemented signal instead of a 500 from a downstream None check.
+        Re-enable the full handler when an edit-capable pipeline lands.
         """
-        try:
-            image_id = f"image_{uuid.uuid4().hex}"
-            params = parse_visual_gen_params(request, image_id, self.generator)
-            logger.info(
-                f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
-            )
-
-            image_edit_start = time.perf_counter()
-            output = self.generator.generate(inputs=request.prompt,
-                                             params=params)
-            if output.image is None:
-                return self.create_error_response(
-                    message="Image editing failed",
-                    err_type="InternalServerError",
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
-
-            # Build response
-            output_images = _normalize_image_output(output.image)
-
-            response = ImageGenerationResponse(
-                created=int(time.time()),
-                data=[
-                    ImageObject(
-                        b64_json=base64.b64encode(
-                            image_to_bytes(image)).decode('utf-8'),
-                        revised_prompt=request.prompt,
-                    ) for image in output_images
-                ],
-                size=f"{params.width}x{params.height}",
-            )
-
-            e2e_ms = (time.perf_counter() - image_edit_start) * 1000.0
-            logger.info(
-                f"Image {image_id} encoded: "
-                f"e2e_ms={e2e_ms:.1f} pipeline_ms={getattr(output.metrics, 'pipeline_ms', 0.0):.1f} "
-                f"denoise_ms={getattr(output.metrics, 'denoise_ms', 0.0):.1f}")
-
-            return JSONResponse(content=response.model_dump())
-
-        except Exception as e:
-            logger.error(traceback.format_exc())
-            return self.create_error_response(
-                message=str(e),
-                err_type="InternalServerError",
-                status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        return self._create_not_supported_error(
+            "Image editing is not supported by any in-tree pipeline yet.")
 
     async def __call__(self,
                        host,

@@ -39,12 +39,16 @@ class PipelineOutput:
     three CUDA-event-measured timing phases that decompose ``pipeline.infer()``.
 
     Attributes:
-        image: Generated image as ``torch.Tensor`` shape ``(H, W, C)`` or
-            ``(B, H, W, C)``, dtype ``uint8``. Populated by Flux pipelines.
-        video: Generated video as ``torch.Tensor`` shape ``(T, H, W, C)`` or
-            ``(B, T, H, W, C)``, dtype ``uint8``. Populated by Wan and LTX-2.
-        audio: Generated audio as ``torch.Tensor``, dtype ``float32``.
-            Populated by LTX-2.
+        image: Generated image as ``torch.Tensor`` shape ``(B, H, W, C)``,
+            dtype ``uint8``. Populated by Flux pipelines. The leading batch
+            dim is always present, even for single-prompt requests (size 1).
+        video: Generated video as ``torch.Tensor`` shape ``(B, T, H, W, C)``,
+            dtype ``uint8``. Populated by Wan and LTX-2. The leading batch
+            dim is always present, even for single-prompt requests (size 1).
+        audio: Generated audio as ``torch.Tensor`` shape
+            ``(B, channels, T_audio)``, dtype ``float32``. Populated by LTX-2.
+            The leading batch dim is always present, even for single-prompt
+            requests (size 1).
         frame_rate: Video frame rate in fps. Populated by video pipelines
             (Wan T2V/I2V emit ``16.0``; LTX-2 emits ``params.frame_rate``).
             ``None`` for image-only pipelines.
@@ -185,6 +189,21 @@ def split_visual_gen_output(resp: "DiffusionResponse", batch_size: int) -> List[
             for _ in range(batch_size)
         ]
     out = resp.output
+    # Enforce the batched-shape contract loudly so a pipeline that returns
+    # an unbatched tensor fails here instead of silently corrupting per-item
+    # outputs by indexing along the wrong dim.
+    if out.image is not None:
+        assert out.image.shape[0] == batch_size, (
+            f"image leading dim {out.image.shape[0]} != batch_size {batch_size}"
+        )
+    if out.video is not None:
+        assert out.video.shape[0] == batch_size, (
+            f"video leading dim {out.video.shape[0]} != batch_size {batch_size}"
+        )
+    if out.audio is not None:
+        assert out.audio.shape[0] == batch_size, (
+            f"audio leading dim {out.audio.shape[0]} != batch_size {batch_size}"
+        )
     metrics = VisualGenMetrics(
         pipeline_ms=resp.pipeline_ms,
         pre_denoise_ms=out.pre_denoise_ms,

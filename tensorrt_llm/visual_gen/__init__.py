@@ -15,22 +15,14 @@
 from .args import VisualGenArgs
 from .output import VisualGenMetrics, VisualGenOutput
 from .params import VisualGenParams
-from .visual_gen import (
-    ExtraParamSchema,
-    VisualGen,
-    VisualGenError,
-    VisualGenParamsError,
-    VisualGenResult,
-)
+from .visual_gen import ExtraParamSchema, VisualGen, VisualGenResult
 
 __all__ = [
     "VisualGen",
     "VisualGenArgs",
     "ExtraParamSchema",
-    "VisualGenError",
     "VisualGenMetrics",
     "VisualGenOutput",
-    "VisualGenParamsError",
     "VisualGenParams",
     "VisualGenResult",
 ]

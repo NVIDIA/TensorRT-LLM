@@ -24,7 +24,7 @@ import time
 import traceback
 import weakref
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Set, Tuple, Union
 
 import torch.multiprocessing as mp
 import zmq
@@ -41,8 +41,6 @@ __all__ = [
     "VisualGen",
     "VisualGenParams",
     "ExtraParamSchema",
-    "VisualGenError",
-    "VisualGenParamsError",
     "VisualGenResult",
 ]
 from tensorrt_llm.executor.ipc import ZeroMqQueue
@@ -118,22 +116,6 @@ def _detect_external_launch() -> Optional[Tuple[int, int, int, str, int]]:
     return None
 
 
-@set_api_status("prototype")
-class VisualGenError(RuntimeError):
-    """Base exception for all VisualGen operations."""
-
-
-@set_api_status("prototype")
-class VisualGenParamsError(ValueError):
-    """Raised when request parameters fail validation.
-
-    This covers unknown parameter keys, unsupported universal fields
-    for the loaded pipeline, type mismatches, and out-of-range values.
-    Caught by the executor so it returns an error response rather than
-    crashing the server.
-    """
-
-
 class DiffusionRemoteClient:
     """Client proxy for remote DiffusionExecutor in worker processes.
 
@@ -203,6 +185,11 @@ class DiffusionRemoteClient:
         self.responses_ipc = None
         self.pending_requests = queue.Queue()
         self.completed_responses: Dict[int, DiffusionResponse] = {}
+        # Request ids the caller has given up on (e.g., aresult timed out).
+        # _store_response drops late-arriving responses for these ids so a
+        # full PipelineOutput tensor does not pin in completed_responses for
+        # the process lifetime.
+        self._abandoned_request_ids: Set[int] = set()
 
         # We'll create asyncio primitives in the background thread's event loop
         self._event_loop = None
@@ -406,10 +393,34 @@ class DiffusionRemoteClient:
             logger.error(f"DiffusionClient: Error processing response: {e}")
 
     async def _store_response(self, response: DiffusionResponse):
-        """Store response in the completed_responses dict (async helper)."""
+        """Store response in the completed_responses dict (async helper).
+
+        Drops the response if the request id has been abandoned so that
+        late-arriving responses for timed-out requests do not leak into
+        ``completed_responses`` for the process lifetime.
+        """
         async with self.lock:
+            if response.request_id in self._abandoned_request_ids:
+                self._abandoned_request_ids.discard(response.request_id)
+                return
             self.completed_responses[response.request_id] = response
         self.response_event.set()
+
+    async def abandon_request_id(self, request_id: int):
+        """Mark a request id as abandoned and drop any cached response.
+
+        Called from the result handle's timeout branch to prevent the
+        executor from holding a full ``PipelineOutput`` for a request whose
+        caller has stopped waiting. Handles both orderings:
+
+        - Response already arrived between the timeout firing and the
+          abandon call → ``pop`` releases it here.
+        - Response arrives after the abandon call → ``_store_response``
+          checks the abandoned set and drops it on arrival.
+        """
+        async with self.lock:
+            self.completed_responses.pop(request_id, None)
+            self._abandoned_request_ids.add(request_id)
 
     def _cleanup_ipc(self):
         """Cleanup IPC."""
@@ -542,7 +553,7 @@ class VisualGenResult:
     A single instance backs both single-prompt and batch-prompt requests:
 
     - Single prompt: ``await handle`` resolves to a :class:`VisualGenOutput`.
-      Underlying-request failure raises :class:`VisualGenError`.
+      Underlying-request failure raises :class:`RuntimeError`.
     - Batch prompt: ``await handle`` resolves to ``List[VisualGenOutput]``.
       Per-item or whole-batch failure never raises; failed items carry
       ``error != None`` (Option B semantics).
@@ -582,7 +593,7 @@ class VisualGenResult:
         """Wait for the underlying request and return the resolved value.
 
         For single-prompt requests, returns a :class:`VisualGenOutput`. Raises
-        :class:`VisualGenError` on underlying-request failure.
+        :class:`RuntimeError` on underlying-request failure.
 
         For batch-prompt requests, returns ``List[VisualGenOutput]``. Never
         raises; failed items carry ``error != None``.
@@ -597,9 +608,17 @@ class VisualGenResult:
         response = await asyncio.wrap_future(future)
 
         if response is None:
-            # Timeout before any response. Persist as resolved error state so
-            # that subsequent aresult()/result() calls replay the same outcome
+            # Timeout before any response. Tell the executor to drop any
+            # late-arriving response for this id so a full PipelineOutput
+            # tensor does not leak into completed_responses for the process
+            # lifetime, then persist the timeout as resolved error state so
+            # subsequent aresult()/result() calls replay the same outcome
             # via the ``self._finished`` fast path instead of returning None.
+            abandon_future = asyncio.run_coroutine_threadsafe(
+                self.executor.abandon_request_id(self.request_id),
+                self.executor._event_loop,
+            )
+            await asyncio.wrap_future(abandon_future)
             if self._batch_size is None:
                 self._resolved = VisualGenOutput(
                     request_id=self.request_id, error="Generation timed out"
@@ -639,11 +658,11 @@ class VisualGenResult:
         return split_visual_gen_output(response, self._batch_size)
 
     def _resolved_value(self):
-        # For single prompts, surface failure via VisualGenError. For batch,
+        # For single prompts, surface failure via RuntimeError. For batch,
         # return the list as-is so callers can inspect per-item ``error``.
         if self._batch_size is None and isinstance(self._resolved, VisualGenOutput):
             if self._resolved.error is not None:
-                raise VisualGenError(f"Generation failed: {self._resolved.error}")
+                raise RuntimeError(f"Generation failed: {self._resolved.error}")
         return self._resolved
 
 
@@ -755,7 +774,7 @@ class VisualGen:
             prompts, ``List[VisualGenOutput]`` of the same length.
 
         Raises:
-            VisualGenError: Single-prompt path on underlying-request failure.
+            RuntimeError: Single-prompt path on underlying-request failure.
                 The batch path never raises on per-item or whole-batch
                 failure; failed items carry ``error != None``.
             NotImplementedError: ``params`` is a list (per-item parameters
