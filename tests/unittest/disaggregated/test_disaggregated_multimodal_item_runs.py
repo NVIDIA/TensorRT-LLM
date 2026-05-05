@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -48,12 +51,12 @@ def test_disaggregated_params_accepts_embedding_handles_without_hashes():
 
 
 def test_disaggregated_params_rejects_hashes_without_item_runs():
-    with pytest.raises(AssertionError, match="multimodal_hashes requires multimodal_item_runs"):
+    with pytest.raises(ValueError, match="multimodal_hashes requires multimodal_item_runs"):
         DisaggregatedParams(multimodal_hashes=MM_HASHES)
 
 
 def test_disaggregated_params_rejects_handles_and_hashes_without_item_runs():
-    with pytest.raises(AssertionError, match="multimodal_hashes requires multimodal_item_runs"):
+    with pytest.raises(ValueError, match="multimodal_hashes requires multimodal_item_runs"):
         DisaggregatedParams(
             multimodal_embedding_handles=MM_HANDLES,
             multimodal_hashes=MM_HASHES,
@@ -61,24 +64,52 @@ def test_disaggregated_params_rejects_handles_and_hashes_without_item_runs():
 
 
 def test_disaggregated_params_rejects_item_runs_without_hashes():
-    with pytest.raises(AssertionError, match="multimodal_item_runs requires multimodal_hashes"):
+    with pytest.raises(ValueError, match="multimodal_item_runs requires multimodal_hashes"):
         DisaggregatedParams(multimodal_item_runs=MM_ITEM_RUNS)
 
 
 def test_disaggregated_params_rejects_item_run_count_mismatch():
-    with pytest.raises(AssertionError, match="multimodal_item_runs and multimodal_hashes"):
+    with pytest.raises(ValueError, match="same length"):
         DisaggregatedParams(
             multimodal_hashes=MM_HASHES,
             multimodal_item_runs=[MM_ITEM_RUNS[0], [(5, 1, [])]],
         )
 
 
-def test_disaggregated_params_rejects_globally_overlapping_item_runs():
-    with pytest.raises(AssertionError, match="globally non-overlapping"):
+def test_disaggregated_params_defers_item_run_semantics_to_runtime_boundary():
+    item_runs = [[(1, 2, [])], [(2, 1, [])]]
+
+    params = DisaggregatedParams(
+        multimodal_hashes=MM_HASHES + [[8, 7, 6, 5, 4, 3, 2, 1]],
+        multimodal_item_runs=item_runs,
+    )
+
+    assert params.multimodal_item_runs == item_runs
+
+
+def test_disaggregated_params_rejects_pairing_mismatch_under_optimized_python():
+    code = textwrap.dedent("""
+        from tensorrt_llm.disaggregated_params import DisaggregatedParams
+
         DisaggregatedParams(
-            multimodal_hashes=MM_HASHES + [[8, 7, 6, 5, 4, 3, 2, 1]],
-            multimodal_item_runs=[[(1, 2, [])], [(2, 1, [])]],
+            multimodal_hashes=[
+                [1, 2, 3, 4, 5, 6, 7, 8],
+                [8, 7, 6, 5, 4, 3, 2, 1],
+            ],
+            multimodal_item_runs=[[(1, 2, [])]],
         )
+    """)
+
+    result = subprocess.run(
+        [sys.executable, "-O", "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0, result.stdout
+    assert "ValueError" in result.stderr
+    assert "same length" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -88,12 +119,13 @@ def test_disaggregated_params_rejects_globally_overlapping_item_runs():
         [[((1, 1), []), ((3, 1), [])]],
     ],
 )
-def test_disaggregated_params_rejects_non_canonical_item_run_shapes(item_runs):
-    with pytest.raises(AssertionError, match="prompt_start, run_length, non_embed_offsets"):
-        DisaggregatedParams(
-            multimodal_hashes=MM_HASHES,
-            multimodal_item_runs=item_runs,
-        )
+def test_disaggregated_params_preserves_non_canonical_item_run_shapes(item_runs):
+    params = DisaggregatedParams(
+        multimodal_hashes=MM_HASHES,
+        multimodal_item_runs=item_runs,
+    )
+
+    assert params.multimodal_item_runs == item_runs
 
 
 def _response(
@@ -230,7 +262,7 @@ def test_llm_preprocess_rejects_out_of_prompt_disaggregated_item_runs():
         multimodal_item_runs=[[(99, 1, [])]],
     )
 
-    with pytest.raises(AssertionError, match="exceeding input sequence length"):
+    with pytest.raises(ValueError, match="exceeding input sequence length"):
         BaseLLM._preprocess(
             llm, {"prompt": "describe image"}, SamplingParams(max_tokens=1), disaggregated_params
         )

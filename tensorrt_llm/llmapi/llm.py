@@ -18,8 +18,7 @@ from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.inputs.data import TextPrompt
-from tensorrt_llm.inputs.multimodal import (MultimodalInput, MultimodalParams,
-                                            validate_mm_item_runs)
+from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
 from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
                                           DefaultInputProcessor)
 from tensorrt_llm.llmapi import tracing
@@ -465,7 +464,6 @@ class BaseLLM:
         Returns:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
         """
-
         if self._encode_only:
             raise RuntimeError(
                 "generate_async() is not available when encode_only=True. "
@@ -614,10 +612,10 @@ class BaseLLM:
                         raise ValueError(
                             "multimodal_item_runs must be provided with multimodal hashes"
                         )
-                    validate_mm_item_runs(prompt_token_ids, mm_hashes,
-                                          mm_item_runs)
                     multimodal_input = MultimodalInput.from_components(
-                        mm_hashes, mm_item_runs)
+                        mm_hashes,
+                        mm_item_runs,
+                        prompt_len=len(prompt_token_ids))
                 multimodal_data = {"multimodal_embedding": mm_handles}
                 if disaggregated_params.mrope_position_ids_handle is not None:
                     # NOTE: `PyTorchModelEngine` assumes both are present when using mrope.

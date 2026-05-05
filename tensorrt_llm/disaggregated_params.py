@@ -110,63 +110,19 @@ class DisaggregatedParams:
                 )
         if self.multimodal_embedding_handles is not None:
             if self.multimodal_hashes is not None:
-                assert len(self.multimodal_embedding_handles) == len(self.multimodal_hashes), (
-                    "multimodal_embedding_handles and multimodal_hashes must have the same length"
-                )
+                if len(self.multimodal_embedding_handles) != len(self.multimodal_hashes):
+                    raise ValueError(
+                        "multimodal_embedding_handles and multimodal_hashes must have the same length"
+                    )
 
         if self.multimodal_hashes is not None:
-            for mm_hash in self.multimodal_hashes:
-                assert isinstance(mm_hash, list), "mm_hash must be a list"
-                assert len(mm_hash) == 8, "mm_hash must be a list of 8 integers"
-                assert all(isinstance(x, int) for x in mm_hash), "mm_hash must contain integers"
-            assert self.multimodal_item_runs is not None, (
-                "multimodal_hashes requires multimodal_item_runs"
-            )
+            if self.multimodal_item_runs is None:
+                raise ValueError("multimodal_hashes requires multimodal_item_runs")
 
         if self.multimodal_item_runs is not None:
-            assert self.multimodal_hashes is not None, (
-                "multimodal_item_runs requires multimodal_hashes"
-            )
-            assert len(self.multimodal_item_runs) == len(self.multimodal_hashes), (
-                "multimodal_item_runs and multimodal_hashes must have the same length"
-            )
-            occupied_runs: List[Tuple[int, int, int, int]] = []
-            for item_idx, item_runs in enumerate(self.multimodal_item_runs):
-                assert isinstance(item_runs, list), "multimodal_item_runs item must be a list"
-                assert len(item_runs) > 0, "multimodal_item_runs item must not be empty"
-                previous_end = None
-                for run_idx, run in enumerate(item_runs):
-                    assert isinstance(run, (list, tuple)) and len(run) == 3, (
-                        "multimodal_item_runs entries must be "
-                        "(prompt_start, run_length, non_embed_offsets) tuples"
-                    )
-                    start, length, non_embed_offsets = run
-                    assert isinstance(start, int) and isinstance(length, int), (
-                        "multimodal_item_runs must contain integers"
-                    )
-                    assert start >= 0, "multimodal_item_runs must contain non-negative positions"
-                    assert length > 0, "multimodal_item_runs must contain positive lengths"
-                    assert isinstance(non_embed_offsets, list), (
-                        "multimodal_item_runs non-embed offsets must be a list"
-                    )
-                    assert all(isinstance(offset, int) for offset in non_embed_offsets), (
-                        "multimodal_item_runs non-embed offsets must contain integers"
-                    )
-                    assert non_embed_offsets == sorted(set(non_embed_offsets)), (
-                        "multimodal_item_runs non-embed offsets must be ordered and unique"
-                    )
-                    assert all(0 <= offset < length for offset in non_embed_offsets), (
-                        "multimodal_item_runs non-embed offsets must be within the run"
-                    )
-                    assert previous_end is None or start >= previous_end, (
-                        "multimodal_item_runs must be ordered and non-overlapping"
-                    )
-                    end = start + length
-                    for prev_item_idx, prev_run_idx, prev_start, prev_end in occupied_runs:
-                        assert start >= prev_end or prev_start >= end, (
-                            "multimodal_item_runs must be globally non-overlapping "
-                            f"but [{item_idx}][{run_idx}] overlaps "
-                            f"[{prev_item_idx}][{prev_run_idx}]"
-                        )
-                    previous_end = start + length
-                    occupied_runs.append((item_idx, run_idx, start, end))
+            if self.multimodal_hashes is None:
+                raise ValueError("multimodal_item_runs requires multimodal_hashes")
+            if len(self.multimodal_item_runs) != len(self.multimodal_hashes):
+                raise ValueError(
+                    "multimodal_item_runs and multimodal_hashes must have the same length"
+                )
