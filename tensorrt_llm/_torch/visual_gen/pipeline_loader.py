@@ -113,6 +113,8 @@ class PipelineLoader:
                 tp_size=self.args.parallel.dit_tp_size,
                 ulysses_size=self.args.parallel.dit_ulysses_size,
                 ring_size=self.args.parallel.dit_ring_size,
+                attn2d_row_size=self.args.parallel.dit_attn2d_row_size,
+                attn2d_col_size=self.args.parallel.dit_attn2d_col_size,
                 order=self.args.parallel.dit_dim_order,
             )
         else:

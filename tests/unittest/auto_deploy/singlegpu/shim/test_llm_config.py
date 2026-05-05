@@ -39,6 +39,14 @@ def test_custom_values():
     assert args.transforms["insert_cached_attention"]["backend"] == "flashinfer"
 
 
+def test_requires_uniform_kv_caches_follows_attention_backend():
+    """TRTLLM requires stricter KV cache compatibility than FlashInfer."""
+    assert LlmArgs(model="test-model", attn_backend="TRTLLM").requires_uniform_kv_caches is True
+    assert (
+        LlmArgs(model="test-model", attn_backend="flashinfer").requires_uniform_kv_caches is False
+    )
+
+
 # ================================
 # Config Flow Tests
 # ================================

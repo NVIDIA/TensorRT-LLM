@@ -29,6 +29,7 @@ from _torch_test_utils import all_close
 
 # Register all auto_deploy custom ops
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
 from tensorrt_llm._torch.auto_deploy.models.factory import (
     FullModelExportInfo,
     ModelFactory,
@@ -36,7 +37,6 @@ from tensorrt_llm._torch.auto_deploy.models.factory import (
 )
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 # ---------------------------------------------------------------------------
 # Dummy factory (same pattern as test_kv_cache.py)

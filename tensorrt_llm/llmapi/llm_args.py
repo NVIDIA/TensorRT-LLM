@@ -344,9 +344,11 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
     enable_heuristic_topk: bool = Field(
         default=False,
         description=
-        "Whether to reuse previous step's TopK indices as heuristic hints "
-        "for the decode indexer TopK kernel, reducing threshold search iterations."
-    )
+        "Whether to enable Guess-Verify-Refine (GVR) Top-K for the DSA decode "
+        "indexer. GVR reuses previous-step Top-K indices as hints to reduce "
+        "threshold search iterations. Currently supported for index_topk=2048 "
+        "on Blackwell (SM100+) and falls back to the production insertion/radix "
+        "Top-K path when prerequisites are not met.")
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -624,6 +626,29 @@ class AttentionDpConfig(StrictBaseModel):
         description=
         "Weight (beta) for the load-balance term in KV cache-aware routing. "
         "Higher values prioritize load balance over cache affinity. "
+        "Only used when enable_kv_cache_aware_routing is True.")
+    kv_cache_routing_match_rate_threshold: float = Field(
+        default=0.1,
+        description=
+        "Cache-affinity gate in KV cache-aware routing. For each request, "
+        "match_len contributes to scoring only when max(match_len) / "
+        "request_tokens across eligible ranks is strictly above this "
+        "threshold; otherwise match_len is forced to 0 so routing is driven "
+        "purely by load. Default 0.1 requires at least a 10% hit rate before "
+        "cache affinity kicks in, which prevents a small universal prefix "
+        "(e.g. a shared system prompt) from pinning all traffic to the "
+        "first warm ranks. Set to 0.0 to honour any nonzero match. "
+        "Only used when enable_kv_cache_aware_routing is True.")
+    kv_cache_routing_fair_share_multiplier: float = Field(
+        default=2.0,
+        description=
+        "Loose per-rank active-request cap in KV cache-aware routing, "
+        "expressed as a multiplier of the ceil fair-share "
+        "(ceil((total_active + new) / tp_size)). Once a rank hits this cap "
+        "within a scheduling batch it is removed from the eligible set for "
+        "the remainder of the batch. Default 2.0 permits a 2x slack so "
+        "cache affinity can dominate while preventing runaway concentration "
+        "on a single rank. Set to 1.0 for strict fair share. "
         "Only used when enable_kv_cache_aware_routing is True.")
 
     @model_validator(mode='after')
@@ -3821,6 +3846,19 @@ class TorchLlmArgs(BaseLlmArgs):
         description="If true, use CuTe DSL fp8 blockscaling bmm implementation.",
         status="prototype",
     )
+    # bf16 cute dsl configs
+    use_cute_dsl_bf16_bmm: bool = Field(
+        default=False,
+        description=
+        "If true, use CuTe DSL bf16 persistent GEMM for BMM on Blackwell.",
+        status="prototype",
+    )
+    use_cute_dsl_bf16_gemm: bool = Field(
+        default=False,
+        description=
+        "If true, use CuTe DSL bf16 persistent GEMM for Linear layers on Blackwell.",
+        status="prototype",
+    )
 
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
@@ -4103,6 +4141,18 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError(
                 "ray_placement_config is only supported with orchestrator_type='ray'"
             )
+        return self
+
+    @model_validator(mode='after')
+    def validate_cute_dsl_bf16(self) -> 'TorchLlmArgs':
+        if self.use_cute_dsl_bf16_bmm or self.use_cute_dsl_bf16_gemm:
+            major, minor = torch.cuda.get_device_capability()
+            sm = major * 10 + minor
+            if sm < 100:
+                raise ValueError(
+                    f"use_cute_dsl_bf16_bmm and use_cute_dsl_bf16_gemm are only "
+                    f"supported on Blackwell (sm >= 100), but current device has "
+                    f"sm {sm}.")
         return self
 
     def get_executor_config(
