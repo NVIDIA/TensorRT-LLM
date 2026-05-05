@@ -4495,19 +4495,30 @@ def launchTestJobs(pipeline, testFilter)
     // existing filter rules so unknown / no-decision paths fall through
     // naturally. Perf stages are excluded — they have their own trigger
     // model and need full test lists. See jenkins/scripts/cbts/README.md.
+    //
+    // Pre-merge vs Post-Merge filtering already happened in Python
+    // (main.py applies it based on the post_merge flag plumbed through
+    // cbts_input.json), so `cbts.affected_stages` here is already
+    // restricted to the user's trigger mode. No-op if empty: matches
+    // README's "/bot run [--post-merge] with no relevant hit -> no-op"
+    // semantic, symmetrically for both modes.
     def cbts = testFilter[(CBTS_RESULT)]
-    if (cbts != null && cbts.affected_stages) {
-        def affectedSet = cbts.affected_stages as Set
+    if (cbts != null) {
+        // Always assign parallelJobsFiltered from CBTS result (rather than
+        // falling through to the prior filter chain) — even when the CBTS-
+        // narrowed set is empty after Python's trigger-mode filter. Empty
+        // = "CBTS narrowed something, but nothing matches the user's trigger
+        // mode" → no-op (don't run anything). Falling through to baseline
+        // here would defeat CBTS's whole point. scope=null cases never
+        // reach this block: getCbtsResult returns null and cbts is null.
+        def affectedSet = (cbts.affected_stages ?: []) as Set
         parallelJobsFiltered = parallelJobs.findAll { key, _ ->
             affectedSet.contains(key) && !(key =~ /Perf/)
         }
-        // Under `/bot run --post-merge`, keep only post-merge hits; if none,
-        // no-op (no fallback to full post-merge).
-        if (testFilter[(IS_POST_MERGE)]) {
-            parallelJobsFiltered = parallelJobsFiltered.findAll { it.key.contains("Post-Merge") }
-            echo "CBTS [${cbts.scope}] (--post-merge): keeping ${parallelJobsFiltered.size()} affected post-merge stages"
-        } else {
+        if (parallelJobsFiltered) {
             echo "CBTS [${cbts.scope}]: limiting to ${parallelJobsFiltered.size()} affected stages"
+        } else {
+            echo "CBTS [${cbts.scope}]: no stages match trigger mode → no-op (no fallback to baseline)"
         }
     }
 

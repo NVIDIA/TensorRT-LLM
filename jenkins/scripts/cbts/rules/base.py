@@ -22,10 +22,19 @@ from typing import Optional
 
 @dataclass
 class PRInputs:
-    """Inputs about the PR that rules can query."""
+    """Inputs about the PR that rules can query.
+
+    `post_merge` reflects the user's `/bot run [--post-merge]` flag. Rules
+    themselves don't consult it (their narrowing is mode-agnostic); main.py
+    uses it after `Selector.run` to drop `affected_stages` entries that
+    don't match the trigger mode (pre-merge vs Post-Merge by stage-name
+    convention). See `main.py::main` for the filter; default False keeps
+    backward compat with older Groovy that didn't pass the field.
+    """
 
     changed_files: list[str]
     diffs: dict[str, str]
+    post_merge: bool = False
 
 
 @dataclass

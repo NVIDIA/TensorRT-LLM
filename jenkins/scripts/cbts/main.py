@@ -200,6 +200,7 @@ def _load_pr_inputs(input_json_path: Path) -> PRInputs:
     return PRInputs(
         changed_files=list(data.get("changed_files", [])),
         diffs=dict(data.get("diffs", {})),
+        post_merge=bool(data.get("post_merge", False)),
     )
 
 
@@ -304,25 +305,63 @@ def main(argv: Optional[list[str]] = None) -> int:
             block_filters=result.block_filters,
         )
 
-    _log_decision_to_stderr(stages, result)
+    # Trigger-mode filter: drop affected_stages incompatible with the user's
+    # /bot run [--post-merge] flag. Done in Python (not Groovy) so the JSON
+    # contract Groovy reads already reflects "stages that should run NOW",
+    # and Layer 2 in Groovy stays scope/mode-agnostic. Narrowed YAML output
+    # (cbts_test_db) is unaffected — runtime mako matching there picks the
+    # right block per stage.
+    pre_filter_stages = set(result.affected_stages)
+    if pr.post_merge:
+        result.affected_stages = {s for s in pre_filter_stages if "Post-Merge" in s}
+    else:
+        result.affected_stages = {s for s in pre_filter_stages if "Post-Merge" not in s}
+    # Recompute derived fields against the filtered set.
+    result.affected_cpu_arch = {
+        stages[name].cpu_arch for name in result.affected_stages if name in stages
+    }
+    result.affected_stage_test_counts = {
+        k: v for k, v in result.affected_stage_test_counts.items() if k in result.affected_stages
+    }
+
+    _log_decision_to_stderr(stages, result, pr, pre_filter_stages)
     sys.stdout.write(result.to_json())
     return 0
 
 
-def _log_decision_to_stderr(stages: dict[str, Stage], result: SelectionResult) -> None:
+def _log_decision_to_stderr(
+    stages: dict[str, Stage],
+    result: SelectionResult,
+    pr: PRInputs,
+    pre_filter_stages: set[str],
+) -> None:
     """Dump the full CBTS decision to stderr for Jenkins console diagnostics.
 
     stdout carries the JSON consumed by Groovy `getCbtsResult`, so all
     human-readable detail goes to stderr to avoid corrupting that contract.
     Each affected stage is annotated with its yaml_stem so blocks-vs-stages
     mismatches (e.g. a stage matched by an unexpected YAML) are obvious.
+
+    `pre_filter_stages` is the affected_stages set BEFORE the trigger-mode
+    filter (pre-merge vs post-merge). Stages dropped by the filter are
+    listed separately so reviewers can see why a stage CBTS narrowed to
+    isn't actually running.
     """
     out = sys.stderr
+    mode = "post_merge" if pr.post_merge else "pre_merge"
+    dropped = sorted(pre_filter_stages - set(result.affected_stages))
     print("=" * 64, file=out)
-    print("CBTS decision (diagnostic; stderr only):", file=out)
+    print(f"CBTS decision (diagnostic; stderr only) [trigger mode: {mode}]:", file=out)
     print(f"  scope: {result.scope}", file=out)
     print(f"  test_db_dir_override: {result.test_db_dir_override}", file=out)
     print(f"  affected_cpu_arch: {sorted(result.affected_cpu_arch)}", file=out)
+    if dropped:
+        print(
+            f"  stages dropped by trigger-mode filter ({len(dropped)}, would run if mode flipped):",
+            file=out,
+        )
+        for s in dropped:
+            print(f"    - {s}", file=out)
     if result.reasons:
         print("  reasons:", file=out)
         for r in result.reasons:

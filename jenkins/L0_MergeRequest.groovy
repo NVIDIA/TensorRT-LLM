@@ -756,9 +756,13 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         }
 
         // 3. Write INPUT_JSON (PR data only; Python reads stages/yaml itself).
+        // `post_merge` lets Python apply the trigger-mode filter on
+        // affected_stages before returning the JSON, so Layer 2 in Groovy
+        // (L0_Test.groovy::launchTestJobs) stays scope-/mode-agnostic.
         def inputJson = groovy.json.JsonOutput.toJson([
             changed_files: changedFiles,
             diffs: diffs,
+            post_merge: testFilter[(IS_POST_MERGE)] ?: false,
         ])
         def inputPath = "${LLM_ROOT}/cbts_input.json"
         writeFile file: inputPath, text: inputJson
