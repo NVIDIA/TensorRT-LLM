@@ -60,7 +60,22 @@ def _make_mock_comm_world():
     sub_comm = MagicMock()
     comm_world.Create_group.return_value = sub_comm
     comm_world.group.Incl.return_value = MagicMock()  # a group handle
+    comm_world.Get_size.return_value = 1024
     return comm_world, sub_comm
+
+
+def _configure_mock_comm_world(mock_comm_world, world_size: int = 1024):
+    """Configure a class-decorator-patched COMM_WORLD mock with sensible defaults.
+
+    Tests that construct a real DwdpManager need both ``Create_group`` (returns
+    the dwdp sub-comm) and ``Get_size`` (used by num_groups validation) to be
+    set; raw MagicMock returns from ``Get_size`` would fail integer comparison.
+    """
+    sub_comm = MagicMock()
+    mock_comm_world.Create_group.return_value = sub_comm
+    mock_comm_world.group.Incl.return_value = MagicMock()
+    mock_comm_world.Get_size.return_value = world_size
+    return sub_comm
 
 
 @patch("tensorrt_llm._torch.pyexecutor.dwdp.setup_dwdp")
@@ -83,6 +98,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
         sub_comm = MagicMock()
         mock_comm_world.Create_group.return_value = sub_comm
         mock_comm_world.group.Incl.return_value = MagicMock()
+        mock_comm_world.Get_size.return_value = 1024
 
         mgr = DwdpManager(
             config=_make_config(dwdp_size=2),
@@ -98,6 +114,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
     def test_init_rejects_non_mpi_dist(self, mock_comm_world, _rank, _setup):
         mock_comm_world.Create_group.return_value = MagicMock()
         mock_comm_world.group.Incl.return_value = MagicMock()
+        mock_comm_world.Get_size.return_value = 1024
         with self.assertRaises(RuntimeError):
             DwdpManager(
                 config=_make_config(),
@@ -108,6 +125,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
     def test_init_rejects_non_dwdp_mapping(self, mock_comm_world, _rank, _setup):
         mock_comm_world.Create_group.return_value = MagicMock()
         mock_comm_world.group.Incl.return_value = MagicMock()
+        mock_comm_world.Get_size.return_value = 1024
         non_dwdp_mapping = Mapping(world_size=1, rank=0, tp_size=1)
         with self.assertRaises(RuntimeError):
             DwdpManager(
@@ -117,12 +135,80 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             )
 
     # ------------------------------------------------------------------
+    # num_groups topology validation (was a dead schema field through 1fbc0d49)
+    # ------------------------------------------------------------------
+
+    def test_init_rejects_non_positive_num_groups(self, mock_comm_world, _rank, _setup):
+        _configure_mock_comm_world(mock_comm_world)
+        bad_config = DwdpConfig(
+            dwdp_size=2,
+            num_groups=0,  # invalid
+            num_experts_per_worker=4,
+            num_prefetch_experts=4,
+        )
+        with self.assertRaisesRegex(ValueError, "num_groups must be positive"):
+            DwdpManager(
+                config=bad_config,
+                dist=MagicMock(spec=MPIDist),
+                mapping=_make_mapping(),
+            )
+
+    def test_init_rejects_group_id_exceeding_num_groups(
+            self, mock_comm_world, mock_rank, _setup):
+        # rank=4, dwdp_size=2 -> group_id=2; with num_groups=2 group_id must be < 2.
+        # Override the class-level rank mock to test out-of-range group_id.
+        mock_rank.return_value = 4
+        _configure_mock_comm_world(mock_comm_world)
+        with self.assertRaisesRegex(ValueError, "group_id=2"):
+            DwdpManager(
+                config=DwdpConfig(
+                    dwdp_size=2,
+                    num_groups=2,  # only allows group_ids 0, 1
+                    num_experts_per_worker=4,
+                    num_prefetch_experts=4,
+                ),
+                dist=MagicMock(spec=MPIDist),
+                mapping=_make_mapping(),
+            )
+
+    def test_init_rejects_world_smaller_than_topology(self, mock_comm_world, _rank, _setup):
+        # num_groups=4, dwdp_size=2 declares 8 CTX workers, but world has only 2.
+        _configure_mock_comm_world(mock_comm_world, world_size=2)
+        with self.assertRaisesRegex(ValueError, "MPI world size is only 2"):
+            DwdpManager(
+                config=DwdpConfig(
+                    dwdp_size=2,
+                    num_groups=4,
+                    num_experts_per_worker=4,
+                    num_prefetch_experts=4,
+                ),
+                dist=MagicMock(spec=MPIDist),
+                mapping=_make_mapping(),
+            )
+
+    def test_init_accepts_multi_group_topology(self, mock_comm_world, _rank, _setup):
+        # num_groups=2, dwdp_size=2 -> 4 CTX ranks total. World >= 4 is fine.
+        _configure_mock_comm_world(mock_comm_world, world_size=8)
+        mgr = DwdpManager(
+            config=DwdpConfig(
+                dwdp_size=2,
+                num_groups=2,  # valid: this rank (0) is in group 0
+                num_experts_per_worker=4,
+                num_prefetch_experts=4,
+            ),
+            dist=MagicMock(spec=MPIDist),
+            mapping=_make_mapping(),
+        )
+        self.assertEqual(mgr.num_groups, 2)
+
+    # ------------------------------------------------------------------
     # Global singleton + enter/exit
     # ------------------------------------------------------------------
 
     def test_enter_registers_global(self, mock_comm_world, _rank, _setup):
         mock_comm_world.Create_group.return_value = MagicMock()
         mock_comm_world.group.Incl.return_value = MagicMock()
+        mock_comm_world.Get_size.return_value = 1024
         mgr = DwdpManager(
             config=_make_config(),
             dist=MagicMock(spec=MPIDist),
@@ -137,6 +223,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
     def test_duplicate_enter_raises(self, mock_comm_world, _rank, _setup):
         mock_comm_world.Create_group.return_value = MagicMock()
         mock_comm_world.group.Incl.return_value = MagicMock()
+        mock_comm_world.Get_size.return_value = 1024
         mgr1 = DwdpManager(
             config=_make_config(),
             dist=MagicMock(spec=MPIDist),
@@ -157,6 +244,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
         sub_comm = MagicMock()
         mock_comm_world.Create_group.return_value = sub_comm
         mock_comm_world.group.Incl.return_value = MagicMock()
+        mock_comm_world.Get_size.return_value = 1024
         mgr = DwdpManager(
             config=_make_config(),
             dist=MagicMock(spec=MPIDist),
@@ -177,6 +265,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             self, mock_comm_world, _rank, _setup):
         mock_comm_world.Create_group.return_value = MagicMock()
         mock_comm_world.group.Incl.return_value = MagicMock()
+        mock_comm_world.Get_size.return_value = 1024
         mgr = DwdpManager(
             config=_make_config(),
             dist=MagicMock(spec=MPIDist),
@@ -191,6 +280,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             self, mock_comm_world, _rank, _setup):
         mock_comm_world.Create_group.return_value = MagicMock()
         mock_comm_world.group.Incl.return_value = MagicMock()
+        mock_comm_world.Get_size.return_value = 1024
         mgr = DwdpManager(
             config=_make_config(),
             dist=MagicMock(spec=MPIDist),
@@ -209,6 +299,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
         sub_comm = MagicMock()
         mock_comm_world.Create_group.return_value = sub_comm
         mock_comm_world.group.Incl.return_value = MagicMock()
+        mock_comm_world.Get_size.return_value = 1024
         fake_weight_manager = MagicMock()
         mock_setup.return_value = fake_weight_manager
 
@@ -251,6 +342,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             self, mock_comm_world, _rank, _setup):
         mock_comm_world.Create_group.return_value = MagicMock()
         mock_comm_world.group.Incl.return_value = MagicMock()
+        mock_comm_world.Get_size.return_value = 1024
         mgr = DwdpManager(
             config=_make_config(),
             dist=MagicMock(spec=MPIDist),
@@ -267,6 +359,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             self, mock_comm_world, _rank, mock_setup):
         mock_comm_world.Create_group.return_value = MagicMock()
         mock_comm_world.group.Incl.return_value = MagicMock()
+        mock_comm_world.Get_size.return_value = 1024
         fake_wm = MagicMock()
         fake_wm.first_moe_layer.return_value = 3
         fake_wm.next_moe_layer.return_value = 5
@@ -292,6 +385,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             self, mock_comm_world, _rank, mock_setup):
         mock_comm_world.Create_group.return_value = MagicMock()
         mock_comm_world.group.Incl.return_value = MagicMock()
+        mock_comm_world.Get_size.return_value = 1024
         fake_wm = MagicMock()
         fake_wm.next_moe_layer.return_value = 9
         mock_setup.return_value = fake_wm
@@ -314,6 +408,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             self, mock_comm_world, _rank, mock_setup):
         mock_comm_world.Create_group.return_value = MagicMock()
         mock_comm_world.group.Incl.return_value = MagicMock()
+        mock_comm_world.Get_size.return_value = 1024
         fake_wm = MagicMock()
         fake_wm.next_moe_layer.return_value = None
         mock_setup.return_value = fake_wm
@@ -335,6 +430,7 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
             self, mock_comm_world, _rank, mock_setup):
         mock_comm_world.Create_group.return_value = MagicMock()
         mock_comm_world.group.Incl.return_value = MagicMock()
+        mock_comm_world.Get_size.return_value = 1024
         fake_wm = MagicMock()
         mock_setup.return_value = fake_wm
         mgr = DwdpManager(

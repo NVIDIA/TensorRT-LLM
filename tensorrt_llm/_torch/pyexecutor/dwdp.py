@@ -83,6 +83,37 @@ class DwdpManager:
                 f"got dwdp_size={mapping.dwdp_size}"
             )
 
+        # Validate DwdpConfig topology against the actual MPI launch.
+        # `num_groups` declares the user's intended topology — that the launch
+        # contains `num_groups × dwdp_size` CTX worker ranks, partitioned into
+        # `num_groups` independent DWDP groups of `dwdp_size` ranks each.
+        # Without this validation `num_groups` is a dead schema field, which
+        # is how it was treated up through commit `1fbc0d49`.
+        if config.num_groups <= 0:
+            raise ValueError(
+                f"DwdpConfig.num_groups must be positive, got {config.num_groups}"
+            )
+        self.rank = global_mpi_rank()
+        group_id = self.rank // mapping.dwdp_size
+        if group_id >= config.num_groups:
+            raise ValueError(
+                f"DwdpManager rank {self.rank} computes group_id={group_id} "
+                f"(rank // dwdp_size={mapping.dwdp_size}) which is >= "
+                f"DwdpConfig.num_groups ({config.num_groups}). The launch "
+                f"started more CTX workers than fit in {config.num_groups} × "
+                f"{mapping.dwdp_size} = {config.num_groups * mapping.dwdp_size} "
+                f"ranks, or num_groups in the YAML is set too small."
+            )
+        expected_min_world = config.num_groups * mapping.dwdp_size
+        actual_world = COMM_WORLD.Get_size()
+        if actual_world < expected_min_world:
+            raise ValueError(
+                f"DwdpConfig declares {config.num_groups} groups × dwdp_size "
+                f"{mapping.dwdp_size} = {expected_min_world} CTX workers, but "
+                f"MPI world size is only {actual_world}. Either the launch's "
+                f"--ntasks is too small, or num_groups is set too high."
+            )
+
         self.config = config
         self.dist = dist
         self._mapping = mapping
@@ -92,7 +123,6 @@ class DwdpManager:
         self.num_groups = config.num_groups
         self.num_prefetch_experts = config.num_prefetch_experts
 
-        self.rank = global_mpi_rank()
         self.dwdp_group = self._create_dwdp_comm()
 
         # SSOT for MoE layer indices; populated by configurable_moe.add_layer()
