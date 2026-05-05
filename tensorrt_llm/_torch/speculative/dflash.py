@@ -409,7 +409,12 @@ class DFlashWorker(SpecWorkerBase):
             attn_metadata, num_accepted_tokens, num_contexts, batch_size
         )
 
-        position_ids = position_ids.squeeze(0)
+        # Collapse mrope [3, 1, N] to 1D by taking the first (temporal) dimension.
+        # The draft model uses standard 1D RoPE, so only scalar positions are needed.
+        if position_ids.ndim == 3:
+            position_ids = position_ids[0, 0]
+        else:
+            position_ids = position_ids.squeeze(0)
 
         # Get total tokens processed by target model (for hidden state extraction)
         total_target_tokens = input_ids.shape[0]
