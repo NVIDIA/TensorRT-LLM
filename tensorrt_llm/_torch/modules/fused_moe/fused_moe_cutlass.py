@@ -111,9 +111,14 @@ class CutlassFusedMoE(MoE):
             "sm_constraint": ("in", {100, 103}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float32},
         },
-        # W4A8_MXFP4_MXFP8: SM in {100, 103}
+        # W4A8_MXFP4_MXFP8: SM in {100, 103, 120, 121}
+        # SM120/121 added by commit 27a5091f ([None][feat] GPT-OSS Sm120/Sm121
+        # Support); the C++ isValidSM120MOESpecialisation<T=FP8, WeightType=FP4>
+        # path covers MXFP4_MXFP8 since use_wfp4afp8 is type-defined as
+        # (T==FP8 && WeightType==FP4), and the runtime block-scaling type for
+        # use_wfp4afp8 is hard-wired to MXFPX in moe_gemm_template_dispatch.h.
         QuantAlgo.W4A8_MXFP4_MXFP8: {
-            "sm_constraint": ("in", {100, 103}),
+            "sm_constraint": ("in", {100, 103, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16},
         },
     }
@@ -140,7 +145,7 @@ class CutlassFusedMoE(MoE):
         - W8A16: SM >= 80
         - W4A16_MXFP4: SM == 90 only
         - W4A8_MXFP4_FP8: SM in {100, 103}
-        - W4A8_MXFP4_MXFP8: SM in {100, 103}
+        - W4A8_MXFP4_MXFP8: SM in {100, 103, 120, 121}
 
         Args:
             quant_algo: The quantization algorithm to check (None for unquantized)
