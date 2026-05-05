@@ -57,24 +57,9 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
     }
     else if (routing_logits.has_value())
     {
-        if (use_routing_scales_on_input)
-        {
-            TORCH_CHECK(
-                routing_logits.value().scalar_type() == at::ScalarType::BFloat16, "routing_logits must be bfloat16.");
-        }
-        else
-        {
-            if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3)
-            {
-                TORCH_CHECK(
-                    routing_logits.value().scalar_type() == at::ScalarType::Float, "routing_logits must be float");
-            }
-            else
-            {
-                TORCH_CHECK(routing_logits.value().scalar_type() == at::ScalarType::BFloat16,
-                    "routing_logits must be bfloat16");
-            }
-        }
+        TORCH_CHECK(routing_logits.value().scalar_type() == at::ScalarType::BFloat16
+                || routing_logits.value().scalar_type() == at::ScalarType::Float,
+            "routing_logits must be bfloat16 or float32");
         TORCH_CHECK(routing_logits.value().dim() == 2, "routing_logits must be 2D.");
         TORCH_CHECK(routing_logits.value().sizes()[1] == num_experts, "routing_logits has incorrect shape.");
     }
@@ -102,7 +87,9 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
 
     if (routing_bias.has_value())
     {
-        TORCH_CHECK(routing_bias.value().scalar_type() == at::ScalarType::BFloat16, "routing_bias must be bfloat16.");
+        TORCH_CHECK(routing_bias.value().scalar_type() == at::ScalarType::BFloat16
+                || routing_bias.value().scalar_type() == at::ScalarType::Float,
+            "routing_bias must be bfloat16 or float32.");
         TORCH_CHECK(routing_bias.value().dim() == 1, "routing_bias must be 1D.");
         TORCH_CHECK(routing_bias.value().sizes()[0] == num_experts, "routing_bias has incorrect shape.");
     }
@@ -132,7 +119,6 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
             "Current routing kernel (no groups, renormalize) only supports top_k<=32 && top_k>0.");
     }
 
-    TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");
     TORCH_CHECK(num_experts > top_k, "num_experts must be greater than top_k");
 
     // If both routing inputs are provided, they must be on the same device
@@ -146,7 +132,10 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::MoEWorkspace workspace;
 
     // setup args
+    auto const routing_bias_dtype
+        = routing_bias.has_value() ? routing_bias.value().scalar_type() : at::ScalarType::BFloat16;
     args.mDtypeElt = btg::Dtype::E4m3;
+    args.mDtypeBias = routing_bias_dtype == at::ScalarType::Float ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
     args.routing_logits = routing_logits.has_value() ? routing_logits.value().data_ptr() : nullptr;
     args.routing_bias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
 
@@ -194,8 +183,25 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
         = at::detail::empty_cuda({args.num_tokens * args.top_k}, at::ScalarType::Int, routing_device, std::nullopt);
     at::Tensor permuted_idx_to_token_idx
         = at::detail::empty_cuda({max_num_padded_tokens}, at::ScalarType::Int, routing_device, std::nullopt);
-    at::Tensor expert_weights
-        = at::detail::empty_cuda({args.num_tokens, args.top_k}, at::ScalarType::BFloat16, routing_device, std::nullopt);
+    // expert_weights is the routing kernel's topk-weights output and is consumed by moe_finalize,
+    // which requires `dtype == scale_dtype` against gemm2_output. Track args.mDtypeOut so the two
+    // buffers stay in lock-step automatically; do NOT tie this to the bias dtype, which is allowed
+    // to differ.
+    auto const expert_weights_scalar_type = [&]()
+    {
+        switch (args.mDtypeOut)
+        {
+        case btg::Dtype::Bfloat16: return at::ScalarType::BFloat16;
+        case btg::Dtype::Fp16: return at::ScalarType::Half;
+        case btg::Dtype::Fp32: return at::ScalarType::Float;
+        default:
+            TORCH_CHECK(false,
+                "Unsupported MoE output dtype for expert_weights allocation: ", btg::dtypeToString(args.mDtypeOut),
+                ". Expected Bfloat16/Fp16/Fp32.");
+        }
+    }();
+    at::Tensor expert_weights = at::detail::empty_cuda(
+        {args.num_tokens, args.top_k}, expert_weights_scalar_type, routing_device, std::nullopt);
     at::Tensor expert_indexes
         = at::detail::empty_cuda({args.num_tokens, args.top_k}, at::ScalarType::Int, routing_device, std::nullopt);
 
@@ -230,6 +236,9 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
     tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::Routing::Runner routing_runner(tile_tokens_dim);
     auto const& stream = at::cuda::getCurrentCUDAStream(
         routing_logits.has_value() ? routing_logits.value().get_device() : topk_ids.value().get_device());
+    auto const dtypeRoutingLogits = routing_logits.has_value()
+        ? (routing_logits.value().scalar_type() == at::ScalarType::Float ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16)
+        : btg::Dtype::Bfloat16;
     routing_runner.run(args.routing_logits, args.routing_bias, args.num_tokens, args.num_experts, args.top_k,
         args.n_group, args.topk_group, args.local_expert_offset, args.local_num_experts, args.routed_scaling_factor,
         expert_indexes.data_ptr<int>(), expert_count_histogram.data_ptr<int>(), total_num_padded_tokens.data_ptr<int>(),
@@ -238,7 +247,7 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
         num_tokens_per_expert.data_ptr<int>(), cta_idx_xy_to_batch_idx.data_ptr<int>(),
         cta_idx_xy_to_mn_limit.data_ptr<int>(), num_non_exiting_ctas.data_ptr<int>(), args.mDtypeElt,
         use_routing_scales_on_input, false /* use_deep_seek_fp8 */, static_cast<RoutingMethodType>(routing_method_type),
-        stream);
+        stream, dtypeRoutingLogits, args.mDtypeBias);
 
     // MoE kernel except routing
     TORCH_CHECK(hidden_states.scalar_type() == at::ScalarType::Float8_e4m3fn, "hidden_states must be fp8.");
