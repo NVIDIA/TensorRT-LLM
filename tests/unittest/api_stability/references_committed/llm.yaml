@@ -43,6 +43,9 @@ methods:
       moe_expert_parallel_size:
         annotation: Optional[int]
         default: null
+      enable_attention_dp:
+        annotation: bool
+        default: False
       # LoRA
       enable_lora:
         annotation: bool
