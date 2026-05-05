@@ -423,7 +423,6 @@ test_e2e.py::test_multi_nodes_eval[Kimi-K2-Thinking-NVFP4-tp16-mmlu] SKIP (https
 test_e2e.py::test_multi_nodes_eval[nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-tp16-mmlu] SKIP (https://nvbugs/6114608)
 test_e2e.py::test_multi_nodes_eval[Qwen3/Qwen3-235B-A22B-tp16-mmlu] SKIP (https://nvbugs/6115560)
 accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[tp1-cutlass] SKIP (https://nvbugs/6116088)
-test_e2e.py::test_openai_disagg_multi_nodes_completion_service_discovery[http] SKIP (https://nvbugs/6115562)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_python_scheduler[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-enable_chunked_prefill=False] SKIP (https://nvbugs/5981122)
 accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_kv_cache_v2_nixl_python SKIP (https://nvbugs/6117811)
 accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[True] SKIP (https://nvbugs/6117811)
