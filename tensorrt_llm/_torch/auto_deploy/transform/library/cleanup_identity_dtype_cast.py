@@ -8,26 +8,6 @@ from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import is_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
-# Positional argument indices for aten.to.dtype:
-#   to.dtype(Tensor self, ScalarType dtype, bool non_blocking=False,
-#            bool copy=False, MemoryFormat? memory_format=None)
-_TO_DTYPE_ARG_SELF = 0
-_TO_DTYPE_ARG_DTYPE = 1
-_TO_DTYPE_ARG_NON_BLOCKING = 2
-_TO_DTYPE_ARG_COPY = 3
-_TO_DTYPE_ARG_MEMORY_FORMAT = 4
-
-# Positional argument indices for prims.convert_element_type.default:
-#   convert_element_type(Tensor a, ScalarType dtype) -> Tensor
-_CONVERT_ELEMENT_TYPE_ARG_SELF = 0
-_CONVERT_ELEMENT_TYPE_ARG_DTYPE = 1
-
-# aten._to_copy.default signature (all kwargs aside from self):
-#   _to_copy(Tensor self, *, ScalarType? dtype=None, Layout? layout=None,
-#            Device? device=None, bool? pin_memory=None, bool non_blocking=False,
-#            MemoryFormat? memory_format=None)
-_TO_COPY_ARG_SELF = 0
-
 
 def _get_positional_or_kwarg(node: Node, pos: int, name: str, default: Any = None) -> Any:
     """Return ``node.args[pos]`` if present, else ``node.kwargs[name]`` (or default).
@@ -109,11 +89,13 @@ class CleanupIdentityDtypeCast(BaseTransform):
     # ------------------------------------------------------------------
 
     def _try_eliminate_to_dtype(self, node: Node) -> Optional[Node]:
-        if len(node.args) < _TO_DTYPE_ARG_DTYPE + 1:
+        # to.dtype(Tensor self, ScalarType dtype, bool non_blocking=False,
+        #          bool copy=False, MemoryFormat? memory_format=None)
+        if len(node.args) < 2:
             return None
 
-        input_node = node.args[_TO_DTYPE_ARG_SELF]
-        target_dtype = node.args[_TO_DTYPE_ARG_DTYPE]
+        input_node = node.args[0]
+        target_dtype = node.args[1]
 
         input_dtype = _get_input_dtype(input_node)
         if input_dtype is None or input_dtype != target_dtype:
@@ -123,13 +105,11 @@ class CleanupIdentityDtypeCast(BaseTransform):
         # change the tensor's stride layout, both of which are observable
         # even when the source and target dtypes match. Skip elimination
         # in those cases to preserve semantics.
-        copy = _get_positional_or_kwarg(node, _TO_DTYPE_ARG_COPY, "copy", False)
+        copy = _get_positional_or_kwarg(node, 3, "copy", False)
         if copy:
             return None
 
-        memory_format = _get_positional_or_kwarg(
-            node, _TO_DTYPE_ARG_MEMORY_FORMAT, "memory_format", None
-        )
+        memory_format = _get_positional_or_kwarg(node, 4, "memory_format", None)
         if memory_format is not None:
             return None
 
@@ -140,9 +120,12 @@ class CleanupIdentityDtypeCast(BaseTransform):
     # ------------------------------------------------------------------
 
     def _try_eliminate_to_copy(self, node: Node) -> Optional[Node]:
+        # _to_copy(Tensor self, *, ScalarType? dtype=None, Layout? layout=None,
+        #          Device? device=None, bool? pin_memory=None, bool non_blocking=False,
+        #          MemoryFormat? memory_format=None)
         if len(node.args) < 1:
             return None
-        input_node = node.args[_TO_COPY_ARG_SELF]
+        input_node = node.args[0]
 
         input_meta = _get_val_meta(input_node)
         if input_meta is None or not hasattr(input_meta, "dtype"):
@@ -181,11 +164,12 @@ class CleanupIdentityDtypeCast(BaseTransform):
     # ------------------------------------------------------------------
 
     def _try_eliminate_convert_element_type(self, node: Node) -> Optional[Node]:
-        if len(node.args) < _CONVERT_ELEMENT_TYPE_ARG_DTYPE + 1:
+        # convert_element_type(Tensor a, ScalarType dtype) -> Tensor
+        if len(node.args) < 2:
             return None
 
-        input_node = node.args[_CONVERT_ELEMENT_TYPE_ARG_SELF]
-        target_dtype = node.args[_CONVERT_ELEMENT_TYPE_ARG_DTYPE]
+        input_node = node.args[0]
+        target_dtype = node.args[1]
 
         input_dtype = _get_input_dtype(input_node)
         if input_dtype is None or input_dtype != target_dtype:
