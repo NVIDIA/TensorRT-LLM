@@ -81,7 +81,7 @@ class _VideoRoutesMixin:
             latency = time.perf_counter() - sync_video_start  # seconds
             logger.info(
                 f"Video {video_id} generated and encoded: "
-                f"latency={latency:.3f}s pipeline={getattr(output.metrics, 'pipeline', 0.0):.3f}s "
+                f"latency={latency:.3f}s generation={getattr(output.metrics, 'generation', 0.0):.3f}s "
                 f"denoise={getattr(output.metrics, 'denoise', 0.0):.3f}s"
             )
 
@@ -270,7 +270,7 @@ class _VideoRoutesMixin:
             latency = time.perf_counter() - background_start  # seconds
             logger.info(
                 f"Video {video_id} async-generated and encoded: "
-                f"latency={latency:.3f}s pipeline={getattr(output.metrics, 'pipeline', 0.0):.3f}s "
+                f"latency={latency:.3f}s generation={getattr(output.metrics, 'generation', 0.0):.3f}s "
                 f"denoise={getattr(output.metrics, 'denoise', 0.0):.3f}s"
             )
             job = await VIDEO_STORE.get(video_id)

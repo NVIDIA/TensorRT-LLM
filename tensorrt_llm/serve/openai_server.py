@@ -1842,7 +1842,7 @@ class OpenAIServer(_VideoRoutesMixin):
             latency = time.perf_counter() - image_gen_start  # seconds
             logger.info(
                 f"Image {image_id} generated and encoded: "
-                f"latency={latency:.3f}s pipeline={getattr(output.metrics, 'pipeline', 0.0):.3f}s "
+                f"latency={latency:.3f}s generation={getattr(output.metrics, 'generation', 0.0):.3f}s "
                 f"denoise={getattr(output.metrics, 'denoise', 0.0):.3f}s")
 
             return JSONResponse(content=response.model_dump())

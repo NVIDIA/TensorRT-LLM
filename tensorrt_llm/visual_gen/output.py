@@ -23,24 +23,33 @@ from tensorrt_llm.llmapi.utils import set_api_status
 class VisualGenMetrics:
     """Engine-side timing measurements for a single VisualGen request.
 
-    All four timings are wall-clock seconds. ``pipeline`` is measured by the
-    executor as host wall-clock around ``pipeline.infer()``. The three
-    sub-phase numbers are measured on the GPU stream via
-    ``torch.cuda.Event(enable_timing=True)`` records; events are recorded
-    asynchronously so the pipeline does not stall, and ``event.elapsed_time``
-    performs an implicit sync amortized into the executor-side sync that
-    already occurs when the response is consumed. The sub-phases account for
-    GPU-stream time only, so small host-side work shows up as
-    ``pipeline - (pre_denoise + denoise + post_denoise)``.
-
-    For LTX-2's two-stage pipeline, ``denoise`` covers the first stage and
-    the second stage rolls into ``post_denoise``.
+    All timings are wall-clock seconds. The three sub-phase numbers are
+    measured on the GPU stream via ``torch.cuda.Event(enable_timing=True)``
+    records; events are recorded asynchronously so generation does not
+    stall, and ``event.elapsed_time`` performs an implicit sync amortized
+    into the executor-side sync that already occurs when the response is
+    consumed. The sub-phases account for GPU-stream time only, so small
+    host-side work shows up as
+    ``generation - (pre_denoise + denoise + post_denoise)``.
     """
 
-    pipeline: float = 0.0
+    generation: float = 0.0
+    """Host wall-clock the executor measured around the engine's inference
+    call — what producing the output costs, before any encoding or
+    persistence."""
+
     pre_denoise: float = 0.0
+    """GPU-stream time before the denoising loop (text encoding, latent
+    prep, conditioning). ``0.0`` if not measured."""
+
     denoise: float = 0.0
+    """GPU-stream time of the denoising loop. For LTX-2's two-stage
+    pipeline this covers only the first stage; the second stage rolls into
+    ``post_denoise``."""
+
     post_denoise: float = 0.0
+    """GPU-stream time after the denoising loop (VAE decode, format
+    conversion, audio decode). ``0.0`` if not measured."""
 
 
 @set_api_status("prototype")

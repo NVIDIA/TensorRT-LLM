@@ -395,7 +395,7 @@ def _run_sequential(
             output.latency = time.perf_counter() - st
             output.success = True
             if result.metrics is not None:
-                output.pipeline = result.metrics.pipeline
+                output.generation = result.metrics.generation
                 output.denoise = result.metrics.denoise
         except Exception as e:
             output.latency = time.perf_counter() - st
@@ -429,7 +429,7 @@ async def _run_concurrent(
                 output.latency = time.perf_counter() - st
                 output.success = True
                 if result.metrics is not None:
-                    output.pipeline = result.metrics.pipeline
+                    output.generation = result.metrics.generation
                     output.denoise = result.metrics.denoise
             except Exception as e:
                 output.latency = time.perf_counter() - st

@@ -46,16 +46,17 @@ class DiffusionResponse:
             model-specific fields populated. Set to ``None`` on the error
             path; on the READY signal it carries a ``dict`` instead.
         error_msg: Error message if generation failed.
-        pipeline: Wall-clock time the executor measured around
-            ``pipeline.infer()`` (host ``time.perf_counter()``), in seconds.
-            Default ``0.0`` so the dataclass round-trips through pickling
-            across worker/client; the error path leaves it at ``0.0``.
+        generation: Wall-clock time the executor measured around the
+            engine's inference call (host ``time.perf_counter()``), in
+            seconds. Default ``0.0`` so the dataclass round-trips through
+            pickling across worker/client; the error path leaves it at
+            ``0.0``.
     """
 
     request_id: int
     output: Optional[PipelineOutput] = None
     error_msg: Optional[str] = None
-    pipeline: float = 0.0
+    generation: float = 0.0
 
 
 # Python type name → accepted Python types for ExtraParamSchema validation.
@@ -326,15 +327,15 @@ class DiffusionExecutor:
             # syncs at the end (decode_latents path), so this captures the
             # full executor-side envelope including any pre/post-pipeline work
             # that the per-phase CUDA-event timings on PipelineOutput do not.
-            pipeline_start = time.perf_counter()
+            generation_start = time.perf_counter()
             output = self.pipeline.infer(req)
-            pipeline = time.perf_counter() - pipeline_start  # seconds
+            generation = time.perf_counter() - generation_start  # seconds
             if self.rank == 0:
                 self.response_queue.put(
                     DiffusionResponse(
                         request_id=req.request_id,
                         output=output,
-                        pipeline=pipeline,
+                        generation=generation,
                     )
                 )
         except Exception as e:

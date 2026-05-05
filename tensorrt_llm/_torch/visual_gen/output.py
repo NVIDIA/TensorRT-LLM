@@ -159,7 +159,7 @@ def to_visual_gen_output(resp: "DiffusionResponse") -> "VisualGenOutput":
         return VisualGenOutput(request_id=resp.request_id, error=resp.error_msg)
     out = resp.output
     metrics = VisualGenMetrics(
-        pipeline=resp.pipeline,
+        generation=resp.generation,
         pre_denoise=out.pre_denoise,
         denoise=out.denoise,
         post_denoise=out.post_denoise,
@@ -211,7 +211,7 @@ def split_visual_gen_output(resp: "DiffusionResponse", batch_size: int) -> List[
             f"audio leading dim {out.audio.shape[0]} != batch_size {batch_size}"
         )
     metrics = VisualGenMetrics(
-        pipeline=resp.pipeline,
+        generation=resp.generation,
         pre_denoise=out.pre_denoise,
         denoise=out.denoise,
         post_denoise=out.post_denoise,

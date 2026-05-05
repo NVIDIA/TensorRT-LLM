@@ -100,9 +100,9 @@ def test_visual_gen_metrics_field_set():
     """VisualGenMetrics has exactly four float fields with 0.0 defaults."""
     assert is_dataclass(VisualGenMetrics)
     field_names = {f.name for f in fields(VisualGenMetrics)}
-    assert field_names == {"pipeline", "pre_denoise", "denoise", "post_denoise"}
+    assert field_names == {"generation", "pre_denoise", "denoise", "post_denoise"}
     m = VisualGenMetrics()
-    assert m.pipeline == 0.0
+    assert m.generation == 0.0
     assert m.pre_denoise == 0.0
     assert m.denoise == 0.0
     assert m.post_denoise == 0.0
@@ -110,7 +110,7 @@ def test_visual_gen_metrics_field_set():
 
 def test_error_response_yields_metrics_none():
     """An error wire response produces metrics is None on the public output."""
-    resp = DiffusionResponse(request_id=42, error_msg="boom", pipeline=0.0)
+    resp = DiffusionResponse(request_id=42, error_msg="boom", generation=0.0)
     out = to_visual_gen_output(resp)
     assert out.error == "boom"
     assert out.image is None
@@ -119,13 +119,14 @@ def test_error_response_yields_metrics_none():
     assert out.metrics is None
 
 
-def test_sub_phase_sum_bounded_by_pipeline():
-    """Sub-phase sum ``pre + denoise + post`` stays within ``pipeline + slack``.
+def test_sub_phase_sum_bounded_by_generation():
+    """Sub-phase sum ``pre + denoise + post`` stays within ``generation + slack``.
 
     Sub-phase events measure GPU-stream time only; small host-side work
     (tokenization, scheduler updates) shows up as
-    ``pipeline - (pre + denoise + post)`` and stays non-negative on a real
-    run. This pins the relationship at the public-output factory boundary.
+    ``generation - (pre + denoise + post)`` and stays non-negative on a
+    real run. This pins the relationship at the public-output factory
+    boundary.
     """
     pipeline_out = PipelineOutput(
         image=torch.zeros(1, 4, 4, 3, dtype=torch.uint8),
@@ -133,15 +134,15 @@ def test_sub_phase_sum_bounded_by_pipeline():
         denoise=42.0,
         post_denoise=3.0,
     )
-    # Executor measures pipeline with a slightly larger envelope (host
-    # wall-clock around pipeline.infer()), so the sub-phase sum stays under
-    # pipeline.
-    resp = DiffusionResponse(request_id=11, output=pipeline_out, pipeline=55.0)
+    # Executor measures ``generation`` with a slightly larger envelope (host
+    # wall-clock around the inference call), so the sub-phase sum stays
+    # under it.
+    resp = DiffusionResponse(request_id=11, output=pipeline_out, generation=55.0)
     out = to_visual_gen_output(resp)
     sub_sum = out.metrics.pre_denoise + out.metrics.denoise + out.metrics.post_denoise
     slack = 1.0
-    assert sub_sum <= out.metrics.pipeline + slack, (
-        f"sub-phase sum {sub_sum} > pipeline+slack {out.metrics.pipeline + slack}"
+    assert sub_sum <= out.metrics.generation + slack, (
+        f"sub-phase sum {sub_sum} > generation+slack {out.metrics.generation + slack}"
     )
 
 
@@ -164,13 +165,13 @@ def _make_image_pipeline_output() -> PipelineOutput:
 def test_from_response_success_image():
     """Success path populates request_id, media tensor, and four metrics."""
     pipeline_out = _make_image_pipeline_output()
-    resp = DiffusionResponse(request_id=11, output=pipeline_out, pipeline=55.5)
+    resp = DiffusionResponse(request_id=11, output=pipeline_out, generation=55.5)
     out = to_visual_gen_output(resp)
     assert out.request_id == 11
     assert out.image is pipeline_out.image
     assert out.error is None
     assert out.metrics is not None
-    assert out.metrics.pipeline == 55.5
+    assert out.metrics.generation == 55.5
     assert out.metrics.pre_denoise == 5.0
     assert out.metrics.denoise == 42.0
     assert out.metrics.post_denoise == 3.0
@@ -189,13 +190,13 @@ def test_from_response_success_video_with_rates():
         denoise=10.0,
         post_denoise=2.0,
     )
-    resp = DiffusionResponse(request_id=3, output=pipeline_out, pipeline=20.0)
+    resp = DiffusionResponse(request_id=3, output=pipeline_out, generation=20.0)
     out = to_visual_gen_output(resp)
     assert out.frame_rate == 24.0
     assert out.audio_sample_rate == 48000
     assert out.video is video
     assert out.audio is audio
-    assert out.metrics.pipeline == 20.0
+    assert out.metrics.generation == 20.0
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +218,7 @@ def test_batch_split_success_image():
         denoise=2.0,
         post_denoise=3.0,
     )
-    resp = DiffusionResponse(request_id=99, output=pipeline_out, pipeline=10.0)
+    resp = DiffusionResponse(request_id=99, output=pipeline_out, generation=10.0)
     items = split_visual_gen_output(resp, batch_size=3)
     assert len(items) == 3
     for i, item in enumerate(items):
@@ -229,7 +230,7 @@ def test_batch_split_success_image():
         assert int(item.image[0, 0, 0]) == (i + 1) * 10
         # Metrics shared across items (single batched inference).
         assert item.metrics is not None
-        assert item.metrics.pipeline == 10.0
+        assert item.metrics.generation == 10.0
 
 
 def test_batch_split_full_batch_failure():
@@ -359,7 +360,7 @@ class _FakeExecutor:
 @pytest.fixture()
 def fake_image_executor():
     pipe = _make_image_pipeline_output()
-    resp = DiffusionResponse(request_id=10, output=pipe, pipeline=12.5)
+    resp = DiffusionResponse(request_id=10, output=pipe, generation=12.5)
     fx = _FakeExecutor(resp)
     yield fx
     fx.stop()
@@ -380,7 +381,7 @@ def test_aresult_matches_await():
     from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
 
     pipe = _make_image_pipeline_output()
-    resp = DiffusionResponse(request_id=11, output=pipe, pipeline=7.0)
+    resp = DiffusionResponse(request_id=11, output=pipe, generation=7.0)
     fx = _FakeExecutor(resp)
     try:
 
@@ -401,7 +402,7 @@ def test_sync_result_is_blocking_value():
     from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
 
     pipe = _make_image_pipeline_output()
-    resp = DiffusionResponse(request_id=12, output=pipe, pipeline=1.0)
+    resp = DiffusionResponse(request_id=12, output=pipe, generation=1.0)
     fx = _FakeExecutor(resp)
     try:
         handle = VisualGenResult(request_id=12, executor=fx, batch_size=None)
@@ -424,7 +425,7 @@ def test_batch_handle_resolves_to_list():
             ]
         ),
     )
-    resp = DiffusionResponse(request_id=13, output=pipe, pipeline=3.0)
+    resp = DiffusionResponse(request_id=13, output=pipe, generation=3.0)
     fx = _FakeExecutor(resp)
     try:
         handle = VisualGenResult(request_id=13, executor=fx, batch_size=2)
@@ -472,7 +473,7 @@ def test_awaiting_sync_result_raises_typeerror():
     from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
 
     pipe = _make_image_pipeline_output()
-    resp = DiffusionResponse(request_id=16, output=pipe, pipeline=0.5)
+    resp = DiffusionResponse(request_id=16, output=pipe, generation=0.5)
     fx = _FakeExecutor(resp)
     try:
         handle = VisualGenResult(request_id=16, executor=fx, batch_size=None)

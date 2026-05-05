@@ -33,15 +33,17 @@ class VisualGenSampleRequest:
 class VisualGenRequestOutput:
     """Timing and status result for a single visual generation request.
 
-    All timings are wall-clock seconds. ``latency`` is measured around
-    ``generate()`` (and the save step, if persisted by the caller).
-    ``pipeline`` and ``denoise`` come from the engine-side
-    ``VisualGenOutput.metrics`` and are populated when the request succeeds.
+    All timings are wall-clock seconds. ``latency`` is the externally
+    observed total measured around ``generate()`` (and the save step, if
+    persisted by the caller). ``generation`` and ``denoise`` come from the
+    engine-side ``VisualGenOutput.metrics`` and are populated when the
+    request succeeds; ``generation`` is the engine's wall-clock around its
+    inference call (no encode / persist / IPC).
     """
 
     success: bool = False
     latency: float = 0.0
-    pipeline: float = 0.0
+    generation: float = 0.0
     denoise: float = 0.0
     ttff: float = -1.0
     gen_fps: float = -1.0
@@ -53,7 +55,11 @@ class VisualGenRequestOutput:
 class VisualGenBenchmarkMetrics:
     """Aggregated benchmark metrics across all requests.
 
-    All ``*_latency`` fields are wall-clock seconds.
+    All ``*_latency`` and ``*_generation`` fields are wall-clock seconds.
+    The relationship ``latency >= generation`` should hold per request;
+    the gap is the encode + persist + IPC overhead the bench measures
+    around the engine, and is the headroom available for overlap-style
+    optimizations.
     """
 
     completed: int
@@ -65,6 +71,12 @@ class VisualGenBenchmarkMetrics:
     min_latency: float
     max_latency: float
     percentiles_latency: list[tuple[float, float]]
+    mean_generation: float
+    median_generation: float
+    std_generation: float
+    min_generation: float
+    max_generation: float
+    percentiles_generation: list[tuple[float, float]]
     num_gpus: int = 1
     per_gpu_throughput: float = 0.0
     mean_ttff: float = -1.0
@@ -79,6 +91,12 @@ def calculate_metrics(
 ) -> VisualGenBenchmarkMetrics:
     """Compute aggregate metrics from per-request outputs."""
     latencies: list[float] = []
+    # ``generation`` defaults to 0.0 and is only populated when the engine
+    # supplied metrics (``result.metrics is not None`` in the bench loop).
+    # Filter zeros so the aggregate reports only what was actually measured;
+    # otherwise a backend that doesn't report metrics would push the mean
+    # toward zero and obscure the latency comparison.
+    generations: list[float] = []
     error_counts: dict[str, int] = {}
     completed = 0
 
@@ -87,6 +105,8 @@ def calculate_metrics(
             error_counts[out.exception_type] = error_counts.get(out.exception_type, 0) + 1
         if out.success:
             latencies.append(out.latency)
+            if out.generation > 0:
+                generations.append(out.generation)
             completed += 1
 
     total_error_count = sum(error_counts.values())
@@ -102,6 +122,11 @@ def calculate_metrics(
             stacklevel=2,
         )
 
+    def _pcts(samples: list[float]) -> list[tuple[float, float]]:
+        if samples:
+            return [(p, float(np.percentile(samples, p))) for p in selected_percentiles]
+        return [(p, 0.0) for p in selected_percentiles]
+
     request_throughput = completed / dur_s if dur_s > 0 else 0
     return VisualGenBenchmarkMetrics(
         completed=completed,
@@ -112,11 +137,13 @@ def calculate_metrics(
         std_latency=float(np.std(latencies)) if latencies else 0,
         min_latency=float(np.min(latencies)) if latencies else 0,
         max_latency=float(np.max(latencies)) if latencies else 0,
-        percentiles_latency=(
-            [(p, float(np.percentile(latencies, p))) for p in selected_percentiles]
-            if latencies
-            else [(p, 0.0) for p in selected_percentiles]
-        ),
+        percentiles_latency=_pcts(latencies),
+        mean_generation=float(np.mean(generations)) if generations else 0,
+        median_generation=float(np.median(generations)) if generations else 0,
+        std_generation=float(np.std(generations)) if generations else 0,
+        min_generation=float(np.min(generations)) if generations else 0,
+        max_generation=float(np.max(generations)) if generations else 0,
+        percentiles_generation=_pcts(generations),
         num_gpus=num_gpus,
         per_gpu_throughput=request_throughput / num_gpus,
     )
@@ -157,6 +184,16 @@ def print_visual_gen_results(
     for p, v in metrics.percentiles_latency:
         p_word = str(int(p)) if int(p) == p else str(p)
         print("{:<40} {:<10.4f}".format(f"P{p_word} Latency (s):", v))
+
+    print("{s:{c}^{n}}".format(s=" Generation ", n=60, c="-"))
+    print("{:<40} {:<10.4f}".format("Mean Generation (s):", metrics.mean_generation))
+    print("{:<40} {:<10.4f}".format("Median Generation (s):", metrics.median_generation))
+    print("{:<40} {:<10.4f}".format("Std Dev Generation (s):", metrics.std_generation))
+    print("{:<40} {:<10.4f}".format("Min Generation (s):", metrics.min_generation))
+    print("{:<40} {:<10.4f}".format("Max Generation (s):", metrics.max_generation))
+    for p, v in metrics.percentiles_generation:
+        p_word = str(int(p)) if int(p) == p else str(p)
+        print("{:<40} {:<10.4f}".format(f"P{p_word} Generation (s):", v))
 
     print("{s:{c}^{n}}".format(s=" Placeholder Metrics ", n=60, c="-"))
     print("{:<40} {:<10}".format("TTFF (s):", "N/A (placeholder)"))
@@ -233,7 +270,16 @@ def build_visual_gen_result_dict(
         "percentiles_latency": {
             f"p{int(p) if int(p) == p else p}": v for p, v in metrics.percentiles_latency
         },
+        "mean_generation": metrics.mean_generation,
+        "median_generation": metrics.median_generation,
+        "std_generation": metrics.std_generation,
+        "min_generation": metrics.min_generation,
+        "max_generation": metrics.max_generation,
+        "percentiles_generation": {
+            f"p{int(p) if int(p) == p else p}": v for p, v in metrics.percentiles_generation
+        },
         "latencies": [out.latency for out in outputs],
+        "generations": [out.generation for out in outputs],
         "errors": [out.error for out in outputs],
         "gen_params": gen_params,
     }

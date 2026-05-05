@@ -398,7 +398,7 @@ def _generate_ltx2_video(llm_venv, output_subdir, linear_type="default"):
         assert output.frame_rate == LTX2_T2V_FRAME_RATE
         assert output.audio_sample_rate is not None and output.audio_sample_rate > 0
         assert output.metrics is not None
-        assert output.metrics.pipeline > 0
+        assert output.metrics.generation > 0
         assert output.metrics.denoise > 0
         assert output.metrics.pre_denoise >= 0
         assert output.metrics.post_denoise >= 0
@@ -484,7 +484,7 @@ def _generate_ltx2_two_stage_video(llm_venv, output_subdir, linear_type="default
         assert output.video is not None
         assert output.frame_rate == LTX2_T2V_FRAME_RATE
         assert output.metrics is not None
-        assert output.metrics.pipeline > 0
+        assert output.metrics.generation > 0
         assert output.metrics.denoise > 0
         assert output.metrics.post_denoise >= 0
         output.save(output_path, frame_rate=LTX2_T2V_FRAME_RATE)

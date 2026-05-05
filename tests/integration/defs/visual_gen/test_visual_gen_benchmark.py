@@ -256,6 +256,7 @@ def test_online_benchmark(
     assert "completed" in data
     assert data["completed"] >= 1
     assert "mean_latency" in data
+    assert "mean_generation" in data
 
 
 # ===========================================================================
@@ -320,3 +321,4 @@ def test_offline_benchmark(tmp_path):
     assert "completed" in data
     assert data["completed"] >= 1
     assert "mean_latency" in data
+    assert "mean_generation" in data
