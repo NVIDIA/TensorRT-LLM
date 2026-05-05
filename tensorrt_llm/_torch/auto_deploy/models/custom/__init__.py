@@ -20,7 +20,6 @@ _MODEL_MODULES = {
     "modeling_nemotron_h": ["NemotronHForCausalLM"],
     "modeling_qwen3_5_moe": ["Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration"],
     "modeling_qwen3_moe": ["Qwen3MoeForCausalLM"],
-    "modeling_qwen3_next": ["Qwen3NextForCausalLM"],
     "modeling_starcoder2": ["Starcoder2ForCausalLM"],
 }
 
