@@ -19,6 +19,8 @@ This module defines atomic distributed ops - each op uses a specific backend
 (torch.distributed or TRT-LLM) without internal dispatch logic.
 """
 
+from typing import List, Optional
+
 import torch
 
 from ...distributed import common as dist
@@ -29,12 +31,12 @@ from ...distributed import common as dist
 
 
 @torch.library.custom_op("auto_deploy::torch_dist_all_gather", mutates_args=(), device_types="cuda")
-def torch_dist_all_gather(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
-    """Plain torch.distributed all_gather + concat along *dim* (demollm mode).
+def torch_dist_all_gather(
+    tensor: torch.Tensor, dim: int = 0, sizes: Optional[List[int]] = None
+) -> torch.Tensor:
+    """All gather using PyTorch distributed backend.
 
-    Intentionally minimal: no strategy selection, no symmetric memory, no
-    uneven-split (sizes) support. The TRT-LLM backend (trtllm_dist_all_gather)
-    is the place to add such optimizations.
+    This op always uses torch.distributed.all_gather and is used in demollm mode.
     """
     tl = [torch.zeros_like(tensor) for _ in range(dist.get_world_size())]
     dist.all_gather(tl, tensor)
@@ -42,7 +44,7 @@ def torch_dist_all_gather(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
 
 
 @torch_dist_all_gather.register_fake
-def torch_dist_all_gather_fake(tensor, dim=0):
+def torch_dist_all_gather_fake(tensor, dim=0, sizes=None):
     return torch.cat([torch.empty_like(tensor) for _ in range(dist.get_world_size())], dim=dim)
 
 
