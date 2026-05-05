@@ -73,6 +73,9 @@ class SelectionResult:
     test_db_dir_override: Optional[str] = None
     # Per-stage narrowed test count, used by Layer 2.5 split-collapse.
     affected_stage_test_counts: dict[str, int] = field(default_factory=dict)
+    # Aggregated `any(rule.sanity_relevant)` across fired rules. Default
+    # True is safe; Groovy Layer 2 keeps PackageSanityCheck only when True.
+    sanity_required: bool = True
 
     def to_json(self) -> str:
         data = {
@@ -81,6 +84,7 @@ class SelectionResult:
             "reasons": list(self.reasons),
             "test_db_dir_override": self.test_db_dir_override,
             "affected_stage_test_counts": dict(self.affected_stage_test_counts),
+            "sanity_required": self.sanity_required,
         }
         return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
@@ -149,11 +153,14 @@ class Selector:
                 for prefix, waives in prefix_to_waives.items():
                     dst.setdefault(prefix, set()).update(waives)
 
+        sanity_required = any(r.sanity_relevant for _, r in pairs)
+
         return SelectionResult(
             scope=scope,
             affected_stages=affected_stages,
             reasons=reasons,
             block_filters=block_filters,
+            sanity_required=sanity_required,
         )
 
 

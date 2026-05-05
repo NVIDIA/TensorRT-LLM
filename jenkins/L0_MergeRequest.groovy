@@ -840,6 +840,8 @@ def _cbtsParseSelectionResult(String text)
         reasons: data.reasons ?: [],
         test_db_dir_override: data.test_db_dir_override,
         affected_stage_test_counts: data.affected_stage_test_counts ?: [:],
+        // Explicit null check preserves `false`; default True is safe.
+        sanity_required: data.sanity_required != null ? data.sanity_required : true,
     ]
 }
 

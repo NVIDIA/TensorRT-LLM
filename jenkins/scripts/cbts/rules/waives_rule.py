@@ -118,6 +118,7 @@ class WaivesRule(Rule):
             affected_stages=affected_stage_names,
             scope="waiveonly",
             block_filters=block_filters,
+            sanity_relevant=any(b.yaml_stem == "l0_sanity_check" for b in affected_blocks),
             reason=(
                 f"waives.txt: +{len(added)} / -{len(removed)} → "
                 f"{len(affected_blocks)} blocks, {len(affected_stage_names)} stages"

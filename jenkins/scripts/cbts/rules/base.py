@@ -35,6 +35,10 @@ class RuleResult:
 
     `block_filters` is per-block `{filter_prefix: {originating_waive_id, ...}}`
     for Layer 3 narrowing.
+
+    `sanity_relevant` (default True = safe): set False when this rule's
+    matched changes have nothing the wheel-sanity check would verify, so
+    PackageSanityCheck can be skipped.
     """
 
     handled_files: set[str]
@@ -42,6 +46,7 @@ class RuleResult:
     scope: Optional[str]
     reason: str
     block_filters: dict[tuple[str, int], dict[str, set[str]]] = field(default_factory=dict)
+    sanity_relevant: bool = True
 
 
 class Rule(ABC):
