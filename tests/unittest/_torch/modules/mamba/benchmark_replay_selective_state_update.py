@@ -402,6 +402,8 @@ def _time_kernel_cuda_graph(
     run_fn,
     reset_fn,
     tag: str,
+    pre_iter_fn=None,
+    iters_override: int | None = None,
 ) -> tuple[float, float, float]:
     """
     All-in-one CUDA graph timing.
@@ -409,15 +411,26 @@ def _time_kernel_cuda_graph(
     Captures a single graph containing warmup iterations followed by timed
     iterations with per-iteration event pairs recorded inside the graph.
     One replay, one sync, then all timings are read.
+
+    ``pre_iter_fn(i)`` (if not None) is invoked inside the captured graph
+    before each iteration's run_fn().  Used by mix-mode benchmarking to
+    inject per-iter prev_tokens copies from a pre-baked samples tensor
+    (each call captures a copy from samples[i] into the graph).
+
+    ``iters_override`` (if not None) overrides ``args.iters`` for this
+    call.  Used to give mix scenarios a higher iter count than pure
+    (more iters = more independent mix draws averaged in).
     """
     warmup = args.warmup
-    iters = args.iters
+    iters = iters_override if iters_override is not None else args.iters
 
     start_events = [torch.cuda.Event(enable_timing=True, external=True) for _ in range(iters)]
     end_events = [torch.cuda.Event(enable_timing=True, external=True) for _ in range(iters)]
 
     # Eager warmup before graph capture (triggers Triton autotune if active)
     reset_fn()
+    if pre_iter_fn is not None:
+        pre_iter_fn(0)
     run_fn()
     torch.cuda.synchronize()
 
@@ -426,18 +439,24 @@ def _time_kernel_cuda_graph(
 
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        # Warmup iterations (unrolled into the graph)
-        for _ in range(warmup):
+        # Warmup iterations (unrolled into the graph) — use the FIRST
+        # `warmup` samples so they don't share data with timed iters.
+        for i in range(warmup):
             reset_fn()
             if args.l2_flush:
                 _l2_flush.fill_(0.0)
+            if pre_iter_fn is not None:
+                pre_iter_fn(i)
             run_fn()
 
-        # Timed iterations with events inside the graph
+        # Timed iterations with events inside the graph — use samples
+        # [warmup, warmup+iters), distinct from the warmup samples.
         for i in range(iters):
             reset_fn()
             if args.l2_flush:
                 _l2_flush.fill_(0.0)
+            if pre_iter_fn is not None:
+                pre_iter_fn(warmup + i)
             start_events[i].record()
             run_fn()
             end_events[i].record()
@@ -459,11 +478,16 @@ def _time_kernel_eager(
     run_fn,
     reset_fn,
     tag: str,
+    pre_iter_fn=None,
+    iters_override: int | None = None,
 ) -> tuple[float, float, float]:
     """Non-CUDA-graph timing path (for debugging, ncu, etc.)."""
+    iters = iters_override if iters_override is not None else args.iters
     # Warmup
-    for _ in range(args.warmup):
+    for i in range(args.warmup):
         reset_fn()
+        if pre_iter_fn is not None:
+            pre_iter_fn(i)
         run_fn()
     torch.cuda.synchronize()
 
@@ -472,10 +496,12 @@ def _time_kernel_eager(
 
     latencies_us: list[float] = []
     torch.cuda.nvtx.range_push(tag)
-    for _ in range(args.iters):
+    for i in range(iters):
         reset_fn()
         if args.l2_flush:
             _flush_l2()  # includes synchronize
+        if pre_iter_fn is not None:
+            pre_iter_fn(args.warmup + i)
         start_event.record()
         run_fn()
         end_event.record()
@@ -486,11 +512,16 @@ def _time_kernel_eager(
     return _compute_stats(latencies_us)
 
 
-def _time_kernel(args, run_fn, reset_fn, tag: str) -> tuple[float, float, float]:
+def _time_kernel(args, run_fn, reset_fn, tag: str, pre_iter_fn=None,
+                 iters_override: int | None = None) -> tuple[float, float, float]:
     """Dispatch to CUDA-graph or eager timing path."""
     if args.cuda_graph:
-        return _time_kernel_cuda_graph(args, run_fn, reset_fn, tag)
-    return _time_kernel_eager(args, run_fn, reset_fn, tag)
+        return _time_kernel_cuda_graph(args, run_fn, reset_fn, tag,
+                                       pre_iter_fn=pre_iter_fn,
+                                       iters_override=iters_override)
+    return _time_kernel_eager(args, run_fn, reset_fn, tag,
+                              pre_iter_fn=pre_iter_fn,
+                              iters_override=iters_override)
 
 
 # Per-config benchmark (consolidated baseline + replay)
@@ -515,6 +546,7 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
 
     rect_list = getattr(args, "rectangle_for_nowrite_list", [False])
     write_modes_list = getattr(args, "write_modes_list", [args.write_checkpoint])
+    modes_list = getattr(args, "modes_list", ["monolithic"])
 
     configs = []
     for batch in batch_sizes:
@@ -523,26 +555,33 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
             for state_dtype in state_dtypes:
                 for act_dtype in act_dtypes:
                     for sr_mode in sr_modes_list:
-                        for write_ckpt in write_modes_list:
-                            # Rectangle is only meaningful for nowrite cells.
-                            effective_rect_list = (
-                                [False] if write_ckpt else rect_list
+                        for mode in modes_list:
+                            effective_write_modes = (
+                                write_modes_list if mode == "monolithic" else [True]
                             )
-                            for rect in effective_rect_list:
-                                configs.append((
-                                    batch, mtp_len, prev_ks, state_dtype, act_dtype,
-                                    sr_mode, rect, write_ckpt,
-                                ))
+                            for write_ckpt in effective_write_modes:
+                                if mode == "monolithic":
+                                    effective_rect_list = (
+                                        [False] if write_ckpt else rect_list
+                                    )
+                                else:
+                                    effective_rect_list = rect_list
+                                for rect in effective_rect_list:
+                                    configs.append((
+                                        batch, mtp_len, prev_ks, state_dtype, act_dtype,
+                                        sr_mode, rect, write_ckpt, mode,
+                                    ))
 
     print(f"[compile-warmup] {len(configs)} configs across {max_workers} threads")
     t0 = time.perf_counter()
 
     def _warm(cfg):
-        batch, mtp_len, prev_ks, state_dtype, act_dtype, sr_mode, rect, write_ckpt = cfg
+        (batch, mtp_len, prev_ks, state_dtype, act_dtype, sr_mode,
+         rect, write_ckpt, mode) = cfg
         _bench_config(
             args, batch, mtp_len, prev_ks, state_dtype, act_dtype, baseline_fn,
             sr_mode=sr_mode, rectangle_for_nowrite=rect,
-            write_checkpoint=write_ckpt, warmup_only=True,
+            write_checkpoint=write_ckpt, mode=mode, warmup_only=True,
         )
 
     errors = []
@@ -574,6 +613,9 @@ def _bench_config(
     sr_mode: str = "RN",
     rectangle_for_nowrite: bool = False,
     write_checkpoint: bool = True,
+    mode: str = "monolithic",
+    mix_samples_cpu=None,
+    mix_label: str = "",
     warmup_only: bool = False,
 ) -> None:
     """
@@ -831,18 +873,59 @@ def _bench_config(
     maxnreg_values = _parse_sweep(args.maxnreg)
     num_ctas_values = _parse_sweep(args.num_ctas)
 
-    # --- Replay kernel, one row per prev_k ---
+    # --- Replay kernel ---
     # Cache T-axis capacity (for prev_k validity check on the nowrite path).
     max_window = getattr(args, "max_window", 0) or mtp_len
+
+    # Build the list of scenarios to time.  A scenario is one cell in the
+    # output: pure-mode scenarios fill prev_tokens with one constant before
+    # the timing loop; mix-mode scenarios feed a pre-baked per-iter samples
+    # tensor, with the per-iter copy captured inside the CUDA graph.  Pure
+    # and mix can coexist in one call so a single nsys trace covers both.
+    scenarios = []
     for prev_k in prev_ks:
-        # On the nowrite path, new tokens append at [prev_k, prev_k+T) of the
-        # active buffer, so prev_k+T must fit within max_window.  Skip
-        # silently for combinations that don't satisfy this — lets a single
-        # nsys run sweep both write modes against a shared prev_k list.
-        if not write_checkpoint and prev_k + mtp_len > max_window:
+        # On the nowrite path, new tokens append at [prev_k, prev_k+T) of
+        # the active buffer, so prev_k+T must fit within max_window.
+        # mode != monolithic dispatches per-slot from PNAT, so any
+        # prev_k <= max_window is valid for those modes.
+        if mode == "monolithic" and not write_checkpoint and prev_k + mtp_len > max_window:
             continue
-        prev_tokens.fill_(prev_k)
-        tag = f"incr_b{batch}_mtp{mtp_len}_k{prev_k}_s{state_dtype_name}_a{act_dtype_name}"
+        scenarios.append({
+            "label": f"k{prev_k}",
+            "print_label": prev_k,
+            "fill": prev_k,
+            "pre_iter": None,
+            "iters": None,  # use args.iters
+        })
+    # Mix scenario: skip on monolithic (mono on mixed PNAT corrupts the
+    # wrong-mode slots).  prev_tokens varies per iter; the per-iter copy
+    # is captured inside the CUDA graph from a pre-baked GPU samples
+    # tensor (warmup samples distinct from timed-iter samples so any
+    # nsys-included warmup leaks aren't biased).
+    if mix_samples_cpu is not None and mode != "monolithic":
+        device = state_work.device
+        samples_gpu = torch.from_numpy(mix_samples_cpu).to(device=device, dtype=torch.int32)
+
+        def _mix_pre_iter(i, _s=samples_gpu, _pt=prev_tokens):
+            _pt.copy_(_s[i])
+
+        # Mix iters override: if --mix-iters set, use it; else use args.iters.
+        mix_iters = getattr(args, "mix_iters", None)
+        scenarios.append({
+            "label": f"mix{mix_label}",
+            "print_label": "mix",
+            "fill": None,
+            "pre_iter": _mix_pre_iter,
+            "iters": mix_iters,  # None => use args.iters
+        })
+
+    for scn in scenarios:
+        if scn["fill"] is not None:
+            prev_tokens.fill_(scn["fill"])
+        prev_k_for_print = scn["print_label"]
+        scenario_pre_iter = scn["pre_iter"]
+        scenario_iters = scn.get("iters")  # None => use args.iters
+        tag = f"incr_b{batch}_mtp{mtp_len}_{scn['label']}_s{state_dtype_name}_a{act_dtype_name}"
 
         for (
             block_size_m,
@@ -865,7 +948,6 @@ def _bench_config(
         ):
 
             def _run_incr(
-                prev_k=prev_k,
                 block_size_m=block_size_m,
                 num_warps=num_warps,
                 num_stages=num_stages,
@@ -889,6 +971,7 @@ def _bench_config(
                 if args.variant == "checkpointing":
                     extra_kwargs["write_checkpoint"] = write_checkpoint
                     extra_kwargs["rectangle_for_nowrite"] = rectangle_for_nowrite
+                    extra_kwargs["mode"] = mode
                     if state_scales_work is not None:
                         extra_kwargs["state_scales"] = state_scales_work
                 variant_fn(
@@ -943,23 +1026,30 @@ def _bench_config(
             parts.append(f"SR={1 if use_philox else 0}")
             parts.append(f"RECT={1 if rectangle_for_nowrite else 0}")
             parts.append(f"WC={1 if write_checkpoint else 0}")
+            parts.append(f"MODE={mode}")
             sweep_suffix = (" " + ",".join(parts)) if parts else ""
             sweep_tag = tag + sweep_suffix.replace(" ", "_").replace(",", "_")
 
             reset_fn = _reset_conv1d_realistic if with_conv1d else _reset
             if warmup_only:
                 reset_fn()
+                if scenario_pre_iter is not None:
+                    scenario_pre_iter(0)
                 _run_incr()
                 torch.cuda.synchronize()
             else:
-                median_us, p95_us, p99_us = _time_kernel(args, _run_incr, reset_fn, sweep_tag)
+                median_us, p95_us, p99_us = _time_kernel(
+                    args, _run_incr, reset_fn, sweep_tag,
+                    pre_iter_fn=scenario_pre_iter,
+                    iters_override=scenario_iters,
+                )
 
                 _print_row(
                     show_kernel_col,
                     args.variant,
                     batch,
                     mtp_len,
-                    prev_k,
+                    prev_k_for_print,
                     state_dtype_name,
                     act_dtype_name,
                     median_us,
@@ -1067,26 +1157,69 @@ def _run_benchmark(args) -> None:
     sr_modes_list = getattr(args, "sr_modes_list", ["RN"])
     rect_list = getattr(args, "rectangle_for_nowrite_list", [False])
     write_modes_list = getattr(args, "write_modes_list", [args.write_checkpoint])
+    modes_list = getattr(args, "modes_list", ["monolithic"])
+
+    # Pre-load AL distribution for mix mode (if --mix-csv set).
+    mix_al = None
+    mix_label = ""
+    if args.mix_csv is not None:
+        from pathlib import Path as _Path
+        from checkpoint_mix_sim import load_al_distribution as _load_al
+        mix_label = _Path(args.mix_csv).stem
+        # T (= mtp_len) varies per cell; load once with the LARGEST mtp so
+        # we have enough columns; the loader normalizes the dist anyway.
+        mix_al = _load_al(_Path(args.mix_csv), T=max(mtp_lengths), column=args.mix_csv_column)
 
     for batch in batch_sizes:
         for mtp_len in mtp_lengths:
             # Resolve prev_k fractions → clamped integers in [0, mtp_len]
             prev_ks = _resolve_prev_ks(args, mtp_len)
+
+            # Pre-generate mix samples once per (batch, mtp_len) cell so all
+            # tuning configs see the same per-iter prev_tokens vectors —
+            # tuning differences become signal, mix-noise is shared.
+            # Size the sample buffer for the LARGER of args.iters and
+            # args.mix_iters since mix scenarios use mix_iters.
+            mix_samples_cpu = None
+            if mix_al is not None:
+                from checkpoint_mix_sim import sample_steady_state_pnat as _sample_pnat
+                _max_window = getattr(args, "max_window", 0) or mtp_len
+                _max_iters = max(args.iters, getattr(args, "mix_iters", None) or args.iters)
+                mix_samples_cpu = _sample_pnat(
+                    mix_al, T=mtp_len, window=_max_window, batch=batch,
+                    K=args.warmup + _max_iters, seed=args.mix_seed,
+                )
+
             for state_dtype in state_dtypes:
                 for act_dtype in act_dtypes:
                     for sr_mode in sr_modes_list:
-                        for write_ckpt in write_modes_list:
-                            # Rectangle only meaningful for nowrite cells.
-                            effective_rect_list = (
-                                [False] if write_ckpt else rect_list
+                        for mode in modes_list:
+                            # Non-monolithic modes ignore write_checkpoint
+                            # (per-slot from PNAT) — collapse the sweep so we
+                            # don't duplicate identical cells.
+                            effective_write_modes = (
+                                write_modes_list if mode == "monolithic" else [True]
                             )
-                            for rect in effective_rect_list:
-                                _bench_config(
-                                    args, batch, mtp_len, prev_ks, state_dtype, act_dtype,
-                                    baseline_fn, sr_mode=sr_mode,
-                                    rectangle_for_nowrite=rect,
-                                    write_checkpoint=write_ckpt,
-                                )
+                            for write_ckpt in effective_write_modes:
+                                # Rectangle is meaningful for: nowrite cells in
+                                # monolithic; always for dynamic / doublelaunch
+                                # (constexpr knob).
+                                if mode == "monolithic":
+                                    effective_rect_list = (
+                                        [False] if write_ckpt else rect_list
+                                    )
+                                else:
+                                    effective_rect_list = rect_list
+                                for rect in effective_rect_list:
+                                    _bench_config(
+                                        args, batch, mtp_len, prev_ks, state_dtype, act_dtype,
+                                        baseline_fn, sr_mode=sr_mode,
+                                        rectangle_for_nowrite=rect,
+                                        write_checkpoint=write_ckpt,
+                                        mode=mode,
+                                        mix_samples_cpu=mix_samples_cpu,
+                                        mix_label=mix_label,
+                                    )
 
     if args.profile:
         torch.cuda.cudart().cudaProfilerStop()
@@ -1324,6 +1457,58 @@ def _parse_args() -> argparse.Namespace:
         "checkpointing variant.",
     )
     parser.add_argument(
+        "--modes",
+        type=str,
+        default="monolithic",
+        help="Comma-separated dispatch modes to sweep, any of "
+        "{monolithic,dynamic,doublelaunch}.  monolithic = today's behavior "
+        "(one kernel pair, write_checkpoint applied to whole batch); "
+        "dynamic = single kernel pair that dispatches per-slot at runtime "
+        "based on PNAT (rectangle_for_nowrite picks RECTANGLE constexpr); "
+        "doublelaunch = two kernel pairs launched in sequence with "
+        "EARLY_OUT=True, each handling slots whose mode matches it.  "
+        "Only applies to the checkpointing variant; non-monolithic modes "
+        "ignore --write-modes (per-slot from PNAT).",
+    )
+    parser.add_argument(
+        "--mix-csv",
+        type=str,
+        default=None,
+        help="Path to AL histogram CSV (cols: AL, count).  When set, an "
+        "additional 'mix' cell is emitted per (batch, mtp, dtype, sr, "
+        "mode, RECT, M, W, ...) combo where prev_tokens varies per iter, "
+        "drawn from the steady-state PNAT distribution induced by the "
+        "AL histogram.  Mix cells run only on dynamic and doublelaunch "
+        "modes (mono on a mixed batch corrupts wrong-mode slots).  "
+        "Each iteration of the captured CUDA graph has a different "
+        "pre-baked prev_tokens vector; warmup iters use distinct samples "
+        "from the timed iters so nsys-included warmup leaks don't bias.",
+    )
+    parser.add_argument(
+        "--mix-csv-column",
+        type=int,
+        default=1,
+        help="Column index (0-based) in the AL histogram CSV for the "
+        "count/probability column.  Default 1 (second column).",
+    )
+    parser.add_argument(
+        "--mix-seed",
+        type=int,
+        default=42,
+        help="RNG seed for the steady-state PNAT sampler.  Same seed "
+        "across runs => same per-slot samples for reproducible "
+        "comparisons.",
+    )
+    parser.add_argument(
+        "--mix-iters",
+        type=int,
+        default=None,
+        help="Iteration count override for mix scenarios (each iter is a "
+        "different per-slot prev_tokens draw).  Default (None) uses "
+        "--iters.  Mix scenarios benefit from more iters since each "
+        "iter samples a different mix; pure scenarios don't.",
+    )
+    parser.add_argument(
         "--philox-rounding",
         action="store_true",
         help="DEPRECATED — equivalent to --sr-modes SR.  Retained for "
@@ -1393,6 +1578,15 @@ def _parse_args() -> argparse.Namespace:
         args.write_modes_list = write_list
     else:
         args.write_modes_list = [args.write_checkpoint]
+
+    modes_raw = [v.strip() for v in args.modes.split(",") if v.strip()]
+    valid_modes = {"monolithic", "dynamic", "doublelaunch", "dlgrouped", "maindl"}
+    for m in modes_raw:
+        if m not in valid_modes:
+            parser.error(
+                f"--modes value must be one of {sorted(valid_modes)}, got {m!r}"
+            )
+    args.modes_list = modes_raw or ["monolithic"]
     return args
 
 
