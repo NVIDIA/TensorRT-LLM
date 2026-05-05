@@ -23,6 +23,7 @@ from torch._prims_common import DeviceLikeType
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.autotuner import AutoTuner
+from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.models.modeling_speculative import Eagle3ForCausalLM
 from tensorrt_llm._torch.pyexecutor._util import (
     _create_kv_cache_manager,
@@ -32,11 +33,28 @@ from tensorrt_llm._torch.pyexecutor._util import (
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import BaseMambaCacheManager
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import get_guided_decoding_config
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    BaseResourceManager,
+    KVCacheManager,
+    ResourceManager,
+    ResourceManagerType,
+)
+from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler, TRTLLMSampler
+from tensorrt_llm._torch.pyexecutor.scheduler import (
+    BindCapacityScheduler,
+    BindMicroBatchScheduler,
+    RequestList,
+    ScheduledRequests,
+    SimpleScheduler,
+)
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._torch.speculative import get_spec_drafter
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSampler, Eagle3ResourceManager
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import get_free_port, mpi_rank, mpi_world_size, nvtx_range
 from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData, check_mm_embed_cumsum_if_needed
 from tensorrt_llm.llmapi.llm_args import (
     ContextChunkingPolicy,
@@ -47,27 +65,8 @@ from tensorrt_llm.llmapi.llm_args import (
     TorchLlmArgs,
 )
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
+from tensorrt_llm.mapping import Mapping
 
-from ...._utils import get_free_port, mpi_rank, mpi_world_size
-from ....mapping import Mapping
-from ...distributed import Distributed
-from ...pyexecutor.mamba_cache_manager import BaseMambaCacheManager
-from ...pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
-from ...pyexecutor.py_executor import PyExecutor
-from ...pyexecutor.resource_manager import (
-    BaseResourceManager,
-    KVCacheManager,
-    ResourceManager,
-    ResourceManagerType,
-)
-from ...pyexecutor.sampler import TorchSampler, TRTLLMSampler
-from ...pyexecutor.scheduler import (
-    BindCapacityScheduler,
-    BindMicroBatchScheduler,
-    RequestList,
-    ScheduledRequests,
-    SimpleScheduler,
-)
 from ..distributed.common import initialize_or_skip
 from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
@@ -771,6 +770,7 @@ class ADEngine(ModelEngine):
         extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
         prompt_lens: List[int] = []
         dummy_token = -1
+        has_context_multimodal_data = False
 
         # look at context requests first
         for request in context_requests:
@@ -793,6 +793,7 @@ class ADEngine(ModelEngine):
 
             # store extra arguments
             if request.py_multimodal_data is not None:
+                has_context_multimodal_data = True
                 for k, v in request.py_multimodal_data.items():
                     if k in _RESERVED_MM_DATA_KEYS:
                         continue
@@ -910,6 +911,7 @@ class ADEngine(ModelEngine):
 
         self.iter_states["num_ctx_requests"] = num_prefill
         self.iter_states["num_ctx_tokens"] = num_prefill_tokens
+        self.iter_states["has_context_multimodal_data"] = has_context_multimodal_data
         # TODO: handle extend requests and draft requests for specdec
         self.iter_states["num_generation_tokens"] = num_decode_tokens + num_extend_tokens
         self.iter_states["ordered_requests"] = ordered_requests
@@ -923,6 +925,12 @@ class ADEngine(ModelEngine):
             model_output = self.model(**csi.named_args, cache_seq_interface=csi)
         else:
             model_output = self.model(**csi.named_args)
+        if self.iter_states.get("has_context_multimodal_data", False):
+            # Multimodal prefill can leave image/context work in flight on the execution
+            # stream after model.forward returns. Synchronize before the overlap scheduler
+            # advances to the next step so later batch-state reuse does not race that work
+            # and surface as a delayed CUDA illegal memory access.
+            torch.cuda.current_stream().synchronize()
 
         # construct output dictionary
         if isinstance(model_output, abc.Mapping):

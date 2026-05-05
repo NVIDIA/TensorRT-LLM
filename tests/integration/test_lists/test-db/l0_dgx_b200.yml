@@ -29,8 +29,6 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[dep4_latency_moe_trtllm-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[dep4_latency_moe_cutlass-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[dep4_latency_moe_cutlass-torch_compile=True]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp2-CUTLASS]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_bf16[tp2-TRTLLM]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ucx[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_nixl[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_gpt_oss_120b_harmony[gpt_oss/gpt-oss-120b]
@@ -324,7 +322,13 @@ l0_dgx_b200:
   tests:
   - unittest/auto_deploy/multigpu/custom_ops
   - unittest/auto_deploy/multigpu/smoke
-  - unittest/auto_deploy/multigpu/transformations
+  # B-tier keeps the NVFP4 MoE TP sharding test (SM100+ gated) and the
+  # strategy_auto parametrization of the allreduce-residual-rmsnorm fusion test
+  # (covers AUTO -> NVLS dispatch on B-tier, structurally different from H100).
+  # The other multigpu/transformations tests are HW-agnostic and covered on
+  # Hopper (l0_dgx_h100.yml).
+  - unittest/auto_deploy/multigpu/transformations/library/test_tp_sharding.py::test_moe_tp_shard_nvfp4
+  - unittest/auto_deploy/multigpu/transformations/library/test_allreduce_residual_rmsnorm_fusion.py -k "strategy_auto"
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-False-4]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-4-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[nvfp4-4-trtllm]

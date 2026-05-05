@@ -1312,7 +1312,8 @@ class LTX2Pipeline(BasePipeline):
         # STG/modality passes run on every GPU before the guidance formula.
         vgm = self.model_config.visual_gen_mapping
         cfg_size = vgm.cfg_size if vgm else 1
-        ulysses_size = vgm.ulysses_size if vgm else 1
+        attn2d_size = (vgm.attn2d_row_size * vgm.attn2d_col_size) if vgm else 1
+        seq_parallel_size = attn2d_size if attn2d_size > 1 else (vgm.ulysses_size if vgm else 1)
         do_cfg_parallel_mm = use_multi_modal_guidance and cfg_size >= 2 and do_cfg
         if do_cfg_parallel_mm and cfg_size != 2:
             raise ValueError(
@@ -1324,7 +1325,7 @@ class LTX2Pipeline(BasePipeline):
         if do_cfg_parallel_mm and self.rank == 0:
             logger.info(
                 f"CFG parallel (multi-modal guidance): cfg_size={cfg_size}, "
-                f"ulysses_size={ulysses_size}"
+                f"seq_parallel_size={seq_parallel_size}"
             )
 
         # ---- 0. Optional prompt enhancement -----------------------------

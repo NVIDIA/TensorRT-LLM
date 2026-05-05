@@ -448,7 +448,7 @@ async def async_load_video(video: str,
         return await asyncio.to_thread(_load_from_bytes, decoded_video)
     else:
         return await asyncio.to_thread(_load_video_by_cv2, video, num_frames,
-                                       fps, format, device)
+                                       fps, format, device, extract_audio)
 
 
 def _normalize_file_uri(uri: str) -> str:

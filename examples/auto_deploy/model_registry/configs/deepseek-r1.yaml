@@ -2,6 +2,7 @@
 compile_backend: torch-cudagraph
 max_batch_size: 64
 max_seq_len: 8192
+max_num_tokens: 15360
 enable_chunked_prefill: true
 # Opt into FP8 KV cache for ~2x capacity; default ("auto") keeps bf16.
 kv_cache_config:
@@ -25,3 +26,6 @@ transforms:
   multi_stream_mla_attn:
     stage: compile
     enabled: true
+  compile_model:
+    piecewise_enabled: true
+    piecewise_num_tokens: [256, 512, 1024, 2048, 3072, 4096, 5120, 6144, 8192]

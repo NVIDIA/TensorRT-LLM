@@ -61,7 +61,6 @@ _METADATA_PREP_OPS = [
     "auto_deploy::flashinfer_attention_prepare_metadata",
     "auto_deploy::flashinfer_mla_prepare_metadata",
     "auto_deploy::triton_paged_prepare_metadata",
-    "auto_deploy::trtllm_mla_prepare_metadata",
     "auto_deploy::mamba_ssm_prepare_metadata",
 ]
 
@@ -77,6 +76,7 @@ _LOGITS_GATHER_OPS = [
 # DynamicOpWrapper (no fresh allocation, returns persistent buffer directly).
 _PERSISTENT_BUFFER_OPS = [
     "auto_deploy::trtllm_attention_prepare_metadata",
+    "auto_deploy::trtllm_mla_prepare_metadata",
 ]
 
 # Inplace dynamic ops: these ops mutate their input tensor and return None,

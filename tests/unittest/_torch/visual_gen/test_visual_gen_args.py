@@ -187,6 +187,39 @@ class TestParallelConfigValidation:
         with pytest.raises(ValueError, match="exceeds world_size"):
             pc.validate_world_size(4)
 
+    def test_attn2d_config_basic(self):
+        pc = ParallelConfig(dit_attn2d_row_size=2, dit_attn2d_col_size=2)
+        assert pc.seq_parallel_size == 4
+        assert pc.total_parallel_size == 4
+        assert pc.n_workers == 4
+
+    def test_attn2d_with_cfg(self):
+        pc = ParallelConfig(dit_cfg_size=2, dit_attn2d_row_size=2, dit_attn2d_col_size=2)
+        assert pc.seq_parallel_size == 4
+        assert pc.total_parallel_size == 8
+        assert pc.n_workers == 8
+
+    def test_attn2d_validate_world_size_passes(self):
+        pc = ParallelConfig(dit_cfg_size=2, dit_attn2d_row_size=2, dit_attn2d_col_size=2)
+        pc.validate_world_size(8)
+
+    def test_attn2d_validate_world_size_fails(self):
+        pc = ParallelConfig(dit_cfg_size=2, dit_attn2d_row_size=2, dit_attn2d_col_size=2)
+        with pytest.raises(ValueError, match="exceeds world_size"):
+            pc.validate_world_size(4)
+
+    def test_attn2d_asymmetric_mesh(self):
+        pc = ParallelConfig(dit_attn2d_row_size=1, dit_attn2d_col_size=4)
+        assert pc.seq_parallel_size == 4
+
+    def test_seq_parallel_size_ulysses(self):
+        pc = ParallelConfig(dit_ulysses_size=4)
+        assert pc.seq_parallel_size == 4
+
+    def test_attn2d_default_is_disabled(self):
+        pc = ParallelConfig()
+        assert pc.seq_parallel_size == 1
+
 
 class TestVisualGenArgsPickle:
     """VisualGenArgs must survive pickle round-trip (mp.Process spawn)."""
