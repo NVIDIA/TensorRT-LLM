@@ -1,4 +1,4 @@
-// Copyright 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// Copyright 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions
@@ -30,6 +30,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <optional>
+#include <vector>
 
 #include "utils.h"
 
@@ -598,6 +599,52 @@ TEST(UtilsTest, createRequestFromInputTensors)
 {
     auto request = getRequest(executor::ModelType::kDECODER_ONLY, 2);
     checkRequest(request.value(), executor::ModelType::kDECODER_ONLY, 2);
+}
+
+TEST(UtilsTest, createRequestFromInputTensorsWithMultimodalItemRuns)
+{
+    auto makeInputs
+        = [](std::vector<int32_t> inputTokens, std::vector<int64_t> hashShape, std::vector<int32_t> hashData,
+              std::vector<int64_t> itemRunShape, std::vector<int32_t> itemRunData)
+    {
+        InputTensors inputsTensors;
+        pushTensor<int32_t>(inputsTensors, InputFieldsNames::inputTokens, nvinfer1::DataType::kINT32,
+            {static_cast<int64_t>(inputTokens.size())}, inputTokens);
+        pushTensor<int32_t>(inputsTensors, InputFieldsNames::maxNewTokens, nvinfer1::DataType::kINT32, {1}, {8});
+        pushTensor<int32_t>(
+            inputsTensors, InputFieldsNames::multimodalHashes, nvinfer1::DataType::kINT32, hashShape, hashData);
+        pushTensor<int32_t>(
+            inputsTensors, InputFieldsNames::multimodalItemRuns, nvinfer1::DataType::kINT32, itemRunShape, itemRunData);
+        return inputsTensors;
+    };
+    auto makeRequests = [](InputTensors inputsTensors)
+    {
+        return createRequestsFromInputTensors({std::move(inputsTensors)}, /*paramExcludeInputFromOutput=*/true,
+            /*isDecoupled=*/false, /*streaming=*/false, executor::ModelType::kDECODER_ONLY,
+            executor::RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION, /*isOrchestrator=*/false,
+            /*specDecFastLogits=*/false, std::nullopt);
+    };
+
+    auto requests = makeRequests(
+        makeInputs({11, 999, 77, 999, 12}, {1, 8}, {1, 2, 3, 4, 5, 6, 7, 8}, {1, 3, 2}, {1, 1, 3, 1, 0, 0}));
+    ASSERT_EQ(requests.size(), 1);
+    auto multimodalInput = requests[0].getMultimodalInput();
+    ASSERT_TRUE(multimodalInput);
+    auto const& itemRuns = multimodalInput->getMultimodalItemRuns();
+    ASSERT_EQ(itemRuns.size(), 1);
+    ASSERT_EQ(itemRuns[0].size(), 2);
+    EXPECT_EQ(itemRuns[0][0].promptStart, 1);
+    EXPECT_EQ(itemRuns[0][1].promptStart, 3);
+
+    EXPECT_THROW((void) makeRequests(makeInputs(
+                     {11, 999, 77, 999, 12}, {1, 8}, {1, 2, 3, 4, 5, 6, 7, 8}, {1, 3, 2}, {1, 1, 0, 0, 3, 1})),
+        std::exception);
+    EXPECT_THROW(
+        (void) makeRequests(makeInputs({11, 999, 77, 999, 12}, {1, 8}, {1, 2, 3, 4, 5, 6, 7, 8}, {1, 1, 2}, {4, 2})),
+        std::exception);
+    EXPECT_THROW((void) makeRequests(makeInputs({11, 999, 77, 999, 12}, {2, 8},
+                     {1, 2, 3, 4, 5, 6, 7, 8, 8, 7, 6, 5, 4, 3, 2, 1}, {2, 1, 2}, {1, 2, 2, 1})),
+        std::exception);
 }
 
 TEST(UtilsTest, createRequestFromInputTensorsEncoderOnly)

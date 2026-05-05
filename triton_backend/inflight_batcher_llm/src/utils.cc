@@ -1088,22 +1088,11 @@ std::vector<executor::Request> createRequestsFromInputTensors(std::vector<InputT
 
                     TLLM_CHECK_WITH_INFO(
                         !reachedPadding, "multimodal_item_runs entries must use only trailing zero-length padding");
-                    TLLM_CHECK_WITH_INFO(
-                        runStart >= 0, "multimodal_item_runs must contain non-negative prompt positions");
-                    TLLM_CHECK_WITH_INFO(runLength > 0, "multimodal_item_runs must contain positive lengths");
-                    if (!multimodalItemRuns[itemIdx].empty())
-                    {
-                        auto const& previousRun = multimodalItemRuns[itemIdx].back();
-                        auto const previousEnd = std::get<0>(previousRun) + std::get<1>(previousRun);
-                        TLLM_CHECK_WITH_INFO(runStart >= previousEnd,
-                            "multimodal_item_runs must be ordered and non-overlapping within each item");
-                    }
                     multimodalItemRuns[itemIdx].emplace_back(runStart, runLength, std::vector<executor::SizeType32>{});
                 }
-                TLLM_CHECK_WITH_INFO(
-                    !multimodalItemRuns[itemIdx].empty(), "multimodal_item_runs must include a run for every item");
             }
-            multimodalInputOpt = executor::MultimodalInput(std::move(multimodalHashes), std::move(multimodalItemRuns));
+            multimodalInputOpt = executor::MultimodalInput(std::move(multimodalHashes), std::move(multimodalItemRuns),
+                std::nullopt, static_cast<executor::SizeType32>(inputTokens.size()));
         }
 
         auto request = executor::Request(inputTokens, maxNewTokens, streaming, samplingConfig, outConfig, endId, padId,
