@@ -371,6 +371,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             max_batch_size=max_batch_size,
             max_seq_len=max_seq_len,
             max_num_tokens=max_num_tokens,
+            enable_autotuner=True,
             cuda_graph_config=None,
         )
         model_engine = DummyModelEngine(llm_args, torch.half)
