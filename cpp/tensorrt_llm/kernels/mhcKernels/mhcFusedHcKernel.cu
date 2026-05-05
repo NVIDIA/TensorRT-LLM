@@ -51,9 +51,8 @@ namespace kernels::mhc
 namespace
 {
 
-__global__ void fhcZeroWorkspacesKernel(
-    float* __restrict__ y_acc, uint32_t y_elems, float* __restrict__ r_acc, uint32_t r_elems,
-    int* __restrict__ done_counter, uint32_t done_elems)
+__global__ void fhcZeroWorkspacesKernel(float* __restrict__ y_acc, uint32_t y_elems, float* __restrict__ r_acc,
+    uint32_t r_elems, int* __restrict__ done_counter, uint32_t done_elems)
 {
     uint32_t const tid = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t const stride = gridDim.x * blockDim.x;
@@ -74,8 +73,8 @@ __global__ void fhcZeroWorkspacesKernel(
     }
 }
 
-inline void fhcZeroWorkspaces(float* y_acc, uint32_t y_elems, float* r_acc, uint32_t r_elems,
-    int* done_counter, uint32_t done_elems, cudaStream_t stream)
+inline void fhcZeroWorkspaces(float* y_acc, uint32_t y_elems, float* r_acc, uint32_t r_elems, int* done_counter,
+    uint32_t done_elems, cudaStream_t stream)
 {
     uint32_t const total = y_elems + r_elems + (done_counter != nullptr ? done_elems : 0u);
     if (total == 0u)
@@ -90,7 +89,6 @@ inline void fhcZeroWorkspaces(float* y_acc, uint32_t y_elems, float* r_acc, uint
 }
 
 } // namespace
-
 
 // ---- mHC fused kernel shape constants (mirrors the Python module) ----
 static constexpr uint32_t FHC_SHAPE_N = 24;  // HC_MULT * (2 + HC_MULT) = 4 * 6 = 24

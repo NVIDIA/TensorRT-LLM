@@ -2726,8 +2726,8 @@ static-analysis-files: &static_analysis_files |
         tests/unittest/_torch/sampler/test_beam_search_util.py |
     )$
 
-# Global exclude: vendored code + trtllm-gen FMHA artifacts (cubin pointers, export headers, cuda_ptx)
-exclude: '(^triton_kernels/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/)'
+# Global exclude: vendored code + trtllm-gen generated artifacts (cubin pointers, export headers, cuda_ptx)
+exclude: '(^triton_kernels/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/)'
 
 default_install_hook_types: [pre-commit, commit-msg]
 repos:

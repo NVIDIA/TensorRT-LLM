@@ -6,8 +6,8 @@ from tensorrt_llm.tokenizer import (TLLM_INCREMENTAL_DETOKENIZATION_BACKEND,
                                     _llguidance_tokenizer_info,
                                     _xgrammar_tokenizer_info, load_hf_tokenizer,
                                     tokenizer_factory)
-from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
+from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 
 __all__ = [
     "TLLM_INCREMENTAL_DETOKENIZATION_BACKEND",

@@ -814,8 +814,7 @@ __launch_bounds__(256) __global__ void fused_pmap_gemm_fma_allinone(__nv_bfloat1
                     = y_local[2 * HC_MULT + lane * HC_MULT + k] * rstd * s2 + hc_base[2 * HC_MULT + lane * HC_MULT + k];
 
             constexpr unsigned LANE_MASK = (1u << HC_MULT) - 1;
-            float const rowMax
-                = fmaxf(fmaxf(cm_vals[0], cm_vals[1]), fmaxf(cm_vals[2], cm_vals[3]));
+            float const rowMax = fmaxf(fmaxf(cm_vals[0], cm_vals[1]), fmaxf(cm_vals[2], cm_vals[3]));
 #pragma unroll
             for (int k = 0; k < HC_MULT; k++)
                 cm_vals[k] = expf(cm_vals[k] - rowMax);

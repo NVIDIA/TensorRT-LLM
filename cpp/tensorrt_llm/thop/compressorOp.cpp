@@ -46,9 +46,9 @@ void compressorPagedKvCompressOp(torch::Tensor kv_score, // [m, 2*state_dim] bf1
     tk::pagedKvCompressLaunch(kv_score.data_ptr(), ape.data_ptr<float>(), paged_kv.data_ptr(), paged_score.data_ptr(),
         block_table_kv.data_ptr<int32_t>(), block_table_score.data_ptr<int32_t>(), output.data_ptr(),
         kv_lens.data_ptr<int32_t>(), start_pos.data_ptr<int32_t>(), cu_seq_lens.data_ptr<int32_t>(),
-        cu_kv_comp.data_ptr<int32_t>(),
-        static_cast<int>(batch_size), static_cast<int>(page_size), static_cast<int>(block_table_kv.size(1)),
-        static_cast<int>(head_dim), static_cast<int>(compress_ratio), static_cast<int>(next_n), io_eb, out_eb, stream);
+        cu_kv_comp.data_ptr<int32_t>(), static_cast<int>(batch_size), static_cast<int>(page_size),
+        static_cast<int>(block_table_kv.size(1)), static_cast<int>(head_dim), static_cast<int>(compress_ratio),
+        static_cast<int>(next_n), io_eb, out_eb, stream);
 }
 
 // Prefill kernel: bulk compression with state update
@@ -64,10 +64,9 @@ void compressorPrefillReductionOp(torch::Tensor kv_score, torch::Tensor ape, tor
     tk::prefillReductionLaunch(kv_score.data_ptr(), ape.data_ptr<float>(), paged_kv.data_ptr(), paged_score.data_ptr(),
         block_table_kv.data_ptr<int32_t>(), block_table_score.data_ptr<int32_t>(), output.data_ptr(),
         kv_lens.data_ptr<int32_t>(), start_pos.data_ptr<int32_t>(), cu_seq_lens.data_ptr<int32_t>(),
-        cu_kv_comp.data_ptr<int32_t>(),
-        static_cast<int>(batch_size), static_cast<int>(page_size), static_cast<int>(block_table_kv.size(1)),
-        static_cast<int>(head_dim), static_cast<int>(compress_ratio), static_cast<int>(max_outputs), io_eb, out_eb,
-        stream);
+        cu_kv_comp.data_ptr<int32_t>(), static_cast<int>(batch_size), static_cast<int>(page_size),
+        static_cast<int>(block_table_kv.size(1)), static_cast<int>(head_dim), static_cast<int>(compress_ratio),
+        static_cast<int>(max_outputs), io_eb, out_eb, stream);
 }
 
 // Fused postprocess + scatter: RMSNorm + RoPE + Hadamard + paged scatter in one kernel
@@ -89,21 +88,19 @@ void compressorPostProcessScatterOp(torch::Tensor kv_comp, // [total_tokens, hea
 {
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    TORCH_CHECK(cos_sin_table.scalar_type() == at::kFloat,
-        "cos_sin_table must be float32, got ", cos_sin_table.scalar_type());
+    TORCH_CHECK(
+        cos_sin_table.scalar_type() == at::kFloat, "cos_sin_table must be float32, got ", cos_sin_table.scalar_type());
     TORCH_CHECK(cos_sin_table.is_contiguous(), "cos_sin_table must be contiguous");
-    TORCH_CHECK(position_ids.scalar_type() == at::kInt,
-        "position_ids must be int32, got ", position_ids.scalar_type());
+    TORCH_CHECK(position_ids.scalar_type() == at::kInt, "position_ids must be int32, got ", position_ids.scalar_type());
     TORCH_CHECK(position_ids.is_contiguous(), "position_ids must be contiguous");
-    TORCH_CHECK(compressed_mask.scalar_type() == at::kBool,
-        "compressed_mask must be bool, got ", compressed_mask.scalar_type());
+    TORCH_CHECK(compressed_mask.scalar_type() == at::kBool, "compressed_mask must be bool, got ",
+        compressed_mask.scalar_type());
 
     tk::postProcessScatterLaunch(kv_comp.data_ptr(), kv_out.has_value() ? kv_out->data_ptr() : nullptr,
         rms_weight.data_ptr(), static_cast<float>(rms_eps), cos_sin_table.data_ptr<float>(),
-        position_ids.data_ptr<int32_t>(), static_cast<int>(nope_dim), static_cast<int>(rope_dim),
-        kv_cache.data_ptr(), num_outputs.data_ptr<int32_t>(), cu_kv_comp.data_ptr<int32_t>(),
-        start_pos.data_ptr<int32_t>(), block_offsets.data_ptr<int32_t>(),
-        reinterpret_cast<bool const*>(compressed_mask.data_ptr()),
+        position_ids.data_ptr<int32_t>(), static_cast<int>(nope_dim), static_cast<int>(rope_dim), kv_cache.data_ptr(),
+        num_outputs.data_ptr<int32_t>(), cu_kv_comp.data_ptr<int32_t>(), start_pos.data_ptr<int32_t>(),
+        block_offsets.data_ptr<int32_t>(), reinterpret_cast<bool const*>(compressed_mask.data_ptr()),
         static_cast<int>(num_outputs.size(0)),    // batch_size
         static_cast<int>(tokens_per_block),
         static_cast<int>(kv_comp.size(1)),        // head_dim

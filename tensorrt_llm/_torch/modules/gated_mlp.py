@@ -43,7 +43,8 @@ class GatedMLP(nn.Module):
         self.intermediate_size = intermediate_size
         self.activation = activation
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
-        self.swiglu_limit = float(swiglu_limit) if swiglu_limit is not None else None
+        self.swiglu_limit = float(
+            swiglu_limit) if swiglu_limit is not None else None
 
         config = config or ModelConfig()
         self.mapping = config.mapping

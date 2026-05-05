@@ -475,8 +475,7 @@ void gate_forward(void* scores_in, // [batch_size, nExperts] - pre-computed from
                 scores, bias_ptr, nullptr, nullptr, weights, indices, batch_size, route_scale, stream);
         }
         break;
-    default:
-        TLLM_CHECK_WITH_INFO(false, "gate_forward only supports n_experts 256 or 384");
+    default: TLLM_CHECK_WITH_INFO(false, "gate_forward only supports n_experts 256 or 384");
     }
     sync_check_cuda_error(stream);
 }
