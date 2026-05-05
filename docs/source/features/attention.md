@@ -101,7 +101,7 @@ Its `forward` accepts the following arguments:
 | ctx | AttentionForwardContext | Optional per-forward arguments such as the attention mask, output buffers and scales, RoPE and MRoPE inputs, MLA buffers, and sparse-attention inputs. |
 | **kwargs | Any | Temporary compatibility path for fields declared by `AttentionForwardContext`; unknown fields raise an error. |
 
-For example, the FlashInfer backend calls `append_paged_kv_cache` when it owns the KV-cache update, then calls FlashInfer's prefill, decode, or ragged-prefill `wrapper.run` using the plan cached in `FlashInferAttentionMetadata`. This is the FlashInfer library wrapper, not the removed TRT-LLM attention wrapper.
+For example, the FlashInfer backend calls `append_paged_kv_cache` when it owns the KV-cache update, then calls the prefill, decode, or ragged-prefill wrapper's `run` method using the plan cached in `FlashInferAttentionMetadata`.
 
 
 ## The Features of the `TrtllmAttention` Backend
