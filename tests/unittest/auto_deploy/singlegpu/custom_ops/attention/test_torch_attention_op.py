@@ -10,6 +10,288 @@ import tensorrt_llm._torch.auto_deploy  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 
 
+@torch.inference_mode()
+def test_gemma4_multimodal_mask_source_op():
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64)
+    mm_token_positions = torch.tensor([1, 3], dtype=torch.int32)
+    mm_token_lengths = torch.tensor([2, 2], dtype=torch.int32)
+    mm_item_cu_seqlen = torch.tensor([0, 2], dtype=torch.int32)
+
+    actual = torch.ops.auto_deploy.gemma4_multimodal_mask.default(
+        input_ids,
+        mm_token_positions,
+        mm_token_lengths,
+        mm_item_cu_seqlen,
+    )
+
+    expected = torch.tensor(
+        [
+            [
+                [
+                    [True, False, False, False, False],
+                    [True, True, True, False, False],
+                    [True, True, True, False, False],
+                    [True, True, True, True, True],
+                    [True, True, True, True, True],
+                ]
+            ]
+        ],
+        dtype=torch.bool,
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+@torch.inference_mode()
+def test_gemma4_prepare_multimodal_mask_chunked_prefill():
+    batch_info = BatchInfo()
+    batch_info.update([1, 3, 0, 0, 0, 0])
+    batch_info_host = batch_info.serialize()
+    cu_seqlen = torch.tensor([0, 3], dtype=torch.int32)
+    input_pos = torch.tensor([2], dtype=torch.int32)
+    mm_token_positions = torch.tensor([1], dtype=torch.int32)
+    mm_token_lengths = torch.tensor([3], dtype=torch.int32)
+    mm_item_cu_seqlen = torch.tensor([0, 1], dtype=torch.int32)
+
+    actual = torch.ops.auto_deploy.gemma4_prepare_multimodal_mask.default(
+        batch_info_host,
+        cu_seqlen,
+        input_pos,
+        mm_token_positions,
+        mm_token_lengths,
+        mm_item_cu_seqlen,
+    )
+
+    expected = torch.tensor(
+        [
+            [
+                [
+                    [True, True, True, True, False],
+                    [True, True, True, True, False],
+                    [True, True, True, True, True],
+                ]
+            ]
+        ],
+        dtype=torch.bool,
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+@torch.inference_mode()
+def test_torch_attention_explicit_mask_is_authoritative():
+    torch.manual_seed(0)
+    q = torch.randn(1, 3, 2, 4, dtype=torch.float32)
+    k = torch.randn(1, 3, 2, 4, dtype=torch.float32)
+    v = torch.randn(1, 3, 2, 4, dtype=torch.float32)
+    attn_mask = torch.ones(1, 1, 3, 3, dtype=torch.bool)
+
+    actual = torch.ops.auto_deploy.torch_attention(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        is_causal=True,
+        layout="bsnd",
+    )
+    expected = torch.ops.auto_deploy.torch_attention(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        is_causal=False,
+        layout="bsnd",
+    )
+    causal_only = torch.ops.auto_deploy.torch_attention(
+        q,
+        k,
+        v,
+        is_causal=True,
+        layout="bsnd",
+    )
+
+    torch.testing.assert_close(actual, expected)
+    assert not torch.allclose(actual, causal_only)
+
+
+@torch.inference_mode()
+def test_torch_backend_attention_custom_bool_mask_context():
+    device = "cuda"
+    dtype = torch.float16
+    batch_size, seq_len, num_heads, head_dim = 1, 5, 2, 8
+    scale = 1.0 / math.sqrt(head_dim)
+
+    q = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+    k_cache = torch.zeros(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+    v_cache = torch.zeros(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+
+    token_type_ids = torch.tensor([[0, 1, 1, 2, 2]], device=device, dtype=torch.int64)
+    non_text = token_type_ids != 0
+    prev = torch.cat(
+        [
+            torch.zeros(batch_size, 1, device=device, dtype=token_type_ids.dtype),
+            token_type_ids[:, :-1],
+        ],
+        dim=1,
+    )
+    blob_starts = non_text & (token_type_ids != prev)
+    blob_ids = torch.cumsum(blob_starts.to(torch.int64), dim=1)
+    token_blob_ids = torch.where(non_text, blob_ids, torch.zeros_like(blob_ids))
+    media_mask = (token_blob_ids.unsqueeze(2) == token_blob_ids.unsqueeze(1)) & (
+        token_blob_ids.unsqueeze(2) != 0
+    )
+    positions = torch.arange(seq_len, device=device)
+    attn_mask = (positions.unsqueeze(0) <= positions.unsqueeze(1)).unsqueeze(0) | media_mask
+    attn_mask = attn_mask.unsqueeze(1)
+
+    batch_info = BatchInfo()
+    batch_info.update([batch_size, batch_size * seq_len, 0, 0, 0, 0])
+    seq_len_tensor = torch.tensor([seq_len], device=device, dtype=torch.int32)
+    input_positions = torch.tensor([0], device=device, dtype=torch.int32)
+    slot_idx = torch.tensor([0], device=device, dtype=torch.int32)
+    seq_start = torch.tensor([0], device=device, dtype=torch.int32)
+
+    expected = torch.ops.auto_deploy.torch_attention(
+        q, k, v, attn_mask=attn_mask, is_causal=False, scale=scale, layout="bsnd"
+    )
+    actual = torch.ops.auto_deploy.torch_cached_attention_with_cache.default(
+        q,
+        k,
+        v,
+        batch_info.serialize(),
+        seq_len_tensor,
+        input_positions,
+        slot_idx,
+        seq_start,
+        k_cache,
+        v_cache,
+        scale=scale,
+        custom_attn_mask=attn_mask,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+
+
+@torch.inference_mode()
+def test_torch_backend_attention_custom_bool_mask_with_sliding_window_context():
+    device = "cuda"
+    dtype = torch.float16
+    batch_size, seq_len, num_heads, head_dim = 1, 6, 2, 8
+    scale = 1.0 / math.sqrt(head_dim)
+    sliding_window_size = 3
+
+    q = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+    k_cache = torch.zeros(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+    v_cache = torch.zeros(batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
+
+    token_type_ids = torch.tensor([[0, 1, 1, 1, 2, 2]], device=device, dtype=torch.int64)
+    non_text = token_type_ids != 0
+    prev = torch.cat(
+        [
+            torch.zeros(batch_size, 1, device=device, dtype=token_type_ids.dtype),
+            token_type_ids[:, :-1],
+        ],
+        dim=1,
+    )
+    blob_starts = non_text & (token_type_ids != prev)
+    blob_ids = torch.cumsum(blob_starts.to(torch.int64), dim=1)
+    token_blob_ids = torch.where(non_text, blob_ids, torch.zeros_like(blob_ids))
+    media_mask = (token_blob_ids.unsqueeze(2) == token_blob_ids.unsqueeze(1)) & (
+        token_blob_ids.unsqueeze(2) != 0
+    )
+    positions = torch.arange(seq_len, device=device)
+    attn_mask = (positions.unsqueeze(0) <= positions.unsqueeze(1)).unsqueeze(0) | media_mask
+    attn_mask = attn_mask.unsqueeze(1)
+
+    batch_info = BatchInfo()
+    batch_info.update([batch_size, batch_size * seq_len, 0, 0, 0, 0])
+    seq_len_tensor = torch.tensor([seq_len], device=device, dtype=torch.int32)
+    input_positions = torch.tensor([0], device=device, dtype=torch.int32)
+    slot_idx = torch.tensor([0], device=device, dtype=torch.int32)
+    seq_start = torch.tensor([0], device=device, dtype=torch.int32)
+
+    expected = torch.ops.auto_deploy.torch_attention(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        is_causal=False,
+        scale=scale,
+        sliding_window=sliding_window_size,
+        layout="bsnd",
+    )
+    actual = torch.ops.auto_deploy.torch_cached_attention_with_cache.default(
+        q,
+        k,
+        v,
+        batch_info.serialize(),
+        seq_len_tensor,
+        input_positions,
+        slot_idx,
+        seq_start,
+        k_cache,
+        v_cache,
+        scale=scale,
+        sliding_window_size=sliding_window_size,
+        custom_attn_mask=attn_mask,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+
+
+@torch.inference_mode()
+def test_torch_backend_attention_custom_mask_is_authoritative_in_readonly_context():
+    device = "cuda"
+    dtype = torch.float16
+    batch_size, query_len, total_kv_len, num_heads, head_dim = 1, 2, 4, 2, 8
+    scale = 1.0 / math.sqrt(head_dim)
+
+    q = torch.randn(batch_size, query_len, num_heads, head_dim, device=device, dtype=dtype)
+    k_cache = torch.randn(batch_size, total_kv_len, num_heads, head_dim, device=device, dtype=dtype)
+    v_cache = torch.randn(batch_size, total_kv_len, num_heads, head_dim, device=device, dtype=dtype)
+    dummy_k = torch.zeros_like(q)
+    dummy_v = torch.zeros_like(q)
+    custom_attn_mask = torch.ones(
+        batch_size, 1, query_len, total_kv_len, device=device, dtype=torch.bool
+    )
+
+    batch_info = BatchInfo()
+    batch_info.update([batch_size, batch_size * query_len, 0, 0, 0, 0])
+    seq_len_tensor = torch.tensor([query_len], device=device, dtype=torch.int32)
+    input_positions = torch.tensor([total_kv_len - query_len], device=device, dtype=torch.int32)
+    slot_idx = torch.tensor([0], device=device, dtype=torch.int32)
+    seq_start = torch.tensor([0], device=device, dtype=torch.int32)
+
+    expected = torch.ops.auto_deploy.torch_attention(
+        q,
+        k_cache[:, :total_kv_len],
+        v_cache[:, :total_kv_len],
+        attn_mask=custom_attn_mask,
+        is_causal=False,
+        scale=scale,
+        layout="bsnd",
+    )
+    actual = torch.ops.auto_deploy.torch_cached_attention_with_cache.default(
+        q,
+        dummy_k,
+        dummy_v,
+        batch_info.serialize(),
+        seq_len_tensor,
+        input_positions,
+        slot_idx,
+        seq_start,
+        k_cache,
+        v_cache,
+        scale=scale,
+        read_cache_only=True,
+        custom_attn_mask=custom_attn_mask,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=5e-2)
+
+
 def numpy_attention_reference(
     q,
     k,
@@ -301,7 +583,9 @@ class TestTorchBackendAttention:
             scale,
             sinks,
             sliding_window_size,
-            logit_cap,  # Updated parameter order
+            logit_cap,
+            # OPTIONAL INPUTS
+            custom_attn_mask=None,
         )
 
     def test_basic_functionality(self):
@@ -319,6 +603,42 @@ class TestTorchBackendAttention:
         )
 
         # Verify output is not NaN or Inf
+        assert torch.isfinite(output).all(), "Output contains NaN or Inf values"
+
+    def test_accepts_positional_constants_with_keyword_custom_mask(self):
+        """Regression test for transform-emitted call style."""
+        batch_size, seq_len, n_heads, n_kv_heads, d_head, max_seq_len = 2, 4, 8, 4, 32, 128
+        data = self._create_test_data(batch_size, seq_len, n_heads, n_kv_heads, d_head, max_seq_len)
+        custom_attn_mask = torch.ones(
+            batch_size,
+            1,
+            seq_len,
+            seq_len,
+            dtype=torch.bool,
+            device=self.device,
+        )
+
+        output = torch.ops.auto_deploy.torch_cached_attention_with_cache(
+            data["q"],
+            data["k"],
+            data["v"],
+            data["batch_info_host"],
+            data["seq_len"],
+            data["input_pos"],
+            data["cache_loc"],
+            data["seq_start"],
+            data["k_cache"],
+            data["v_cache"],
+            None,
+            None,
+            None,
+            None,
+            False,
+            custom_attn_mask=custom_attn_mask,
+        )
+
+        expected_shape = data["q"].shape[:2] + (n_heads * d_head,)
+        assert output.shape == expected_shape
         assert torch.isfinite(output).all(), "Output contains NaN or Inf values"
 
     @pytest.mark.parametrize("logit_cap", [None, 5.0])

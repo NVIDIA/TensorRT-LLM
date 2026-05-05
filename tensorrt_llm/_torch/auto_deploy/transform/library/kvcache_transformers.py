@@ -247,6 +247,7 @@ class HFReplaceCachedAttn(_InsertCachedOperator):
         meta_nodes_extra: List[Node],
         cache_nodes: List[Node],
         constants: List[Constant],
+        prepared_attn_mask: Optional[Node] = None,
     ):
         """Here we now need to actually do the correct mapping of the cached attn nodes."""
         # store reference to metadata, caches, and constants for this attn node

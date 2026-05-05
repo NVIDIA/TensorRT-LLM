@@ -310,6 +310,7 @@ class BaseMultimodalInputProcessor(ABC):
         self,
         *,
         video: List[Union[Image.Image, torch.Tensor]],
+        video_metadata: Optional[dict] = None,
         **kwargs,
     ):
         """
@@ -321,6 +322,11 @@ class BaseMultimodalInputProcessor(ABC):
         Returns the token count for the given video.
         Example: for a video item, return the prompt-side token count for that
         one video unit, not the number of video frames.
+
+        `video_metadata` is consumed here (not forwarded into
+        `get_num_multimodal_tokens`) so subclasses that don't need are unaffected.
+        Subclasses that need `video_metadata` (e.g. Nemotron Nano
+        accounting for audio extracted from video) override this method.
 
         Subclasses can override this method to provide custom logic to calculate the number of tokens.
         """
@@ -859,10 +865,25 @@ def create_input_processor_with_hash(
                 "tokenized_multimodal_process: find_mm_token_lengths returned "
                 "no token lengths for the provided multi_modal_data.")
 
-        expanded_ids = input_processor.expand_prompt_token_ids_for_mm(
+        expanded_ids, mm_data_updates = input_processor.expand_prompt_token_ids_for_mm(
             prompt_token_ids,
             num_mm_tokens,
-            hf_processor_mm_kwargs=inputs.get("mm_processor_kwargs"))
+            hf_processor_mm_kwargs=inputs.get("mm_processor_kwargs"),
+            mm_data=mm_data,
+        )
+
+        # Merge any model-specific auxiliary streams (e.g. video evs_ids for
+        # EVS-enabled runs) into extra_processed_inputs["multimodal_data"].
+        # The dummy-placeholder pass above produced these against the synthetic
+        # placeholder text, so they're stale w.r.t. the real prompt; overwrite
+        # them with the values rebuilt from `prompt_token_ids` here so
+        # `merge_evs_mm_embeds` picks up the correct stream at LLM forward time.
+        if mm_data_updates:
+            mm_container = extra_processed_inputs.setdefault(
+                "multimodal_data", {})
+            for modality, field_updates in mm_data_updates.items():
+                mm_container.setdefault(modality, {}).update(field_updates)
+
         return multimodal_hashing_process(
             inputs,
             sampling_params,
