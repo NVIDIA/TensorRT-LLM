@@ -47,26 +47,35 @@ def parse_args():
     )
 
     # Generation Params
-    parser.add_argument("--height", type=int, default=720, help="Video height")
-    parser.add_argument("--width", type=int, default=1280, help="Video width")
-    parser.add_argument("--num_frames", type=int, default=81, help="Number of frames to generate")
+    parser.add_argument(
+        "--height", type=int, default=None, help="Video height (default: auto-detect)"
+    )
+    parser.add_argument(
+        "--width", type=int, default=None, help="Video width (default: auto-detect)"
+    )
+    parser.add_argument(
+        "--num_frames",
+        type=int,
+        default=None,
+        help="Number of frames to generate (default: auto-detect)",
+    )
     parser.add_argument(
         "--steps",
         type=int,
         default=None,
-        help="Number of denoising steps (default: auto-detect, 50 for Wan2.1, 40 for Wan2.2)",
+        help="Number of denoising steps (default: auto-detect, 50 for Wan2.1 and Wan 2.2 5B, 40 for Wan2.2 A14B)",
     )
     parser.add_argument(
         "--guidance_scale",
         type=float,
         default=None,
-        help="Guidance scale (default: auto-detect, 5.0 for Wan2.1, 4.0 for Wan2.2)",
+        help="Guidance scale (default: auto-detect, 5.0 for Wan2.1 and Wan 2.2 5B, 4.0 for Wan2.2 A14B)",
     )
     parser.add_argument(
         "--guidance_scale_2",
         type=float,
         default=None,
-        help="Second-stage guidance scale for Wan2.2 two-stage denoising (default: 3.0)",
+        help="Second-stage guidance scale for Wan2.2 A14B two-stage denoising (default: 3.0)",
     )
     parser.add_argument(
         "--boundary_ratio",
@@ -352,11 +361,19 @@ def main():
     )
 
     try:
-        logger.info(f"Generating video for prompt: '{args.prompt}'")
-        logger.info(f"Negative prompt: '{args.negative_prompt}'")
-        logger.info(
-            f"Resolution: {args.height}x{args.width}, Frames: {args.num_frames}, Steps: {args.steps}"
+        defaults = visual_gen.default_params
+        negative_prompt_log = (
+            args.negative_prompt if args.negative_prompt is not None else "[model default]"
         )
+        height = args.height if args.height is not None else defaults.height
+        width = args.width if args.width is not None else defaults.width
+        num_frames = args.num_frames if args.num_frames is not None else defaults.num_frames
+        steps = args.steps if args.steps is not None else defaults.num_inference_steps
+        frame_rate = defaults.frame_rate
+
+        logger.info(f"Generating video for prompt: '{args.prompt}'")
+        logger.info(f"Negative prompt: '{negative_prompt_log}'")
+        logger.info(f"Resolution: {height}x{width}, Frames: {num_frames}, Steps: {steps}")
 
         start_time = time.time()
 
@@ -375,6 +392,7 @@ def main():
                 guidance_scale=args.guidance_scale,
                 seed=args.seed,
                 num_frames=args.num_frames,
+                frame_rate=frame_rate,
                 negative_prompt=args.negative_prompt,
                 extra_params=extra_params if extra_params else None,
             ),
@@ -382,7 +400,9 @@ def main():
 
         logger.info(f"Generation completed in {time.time() - start_time:.2f}s")
 
-        MediaStorage.save_video(output.video, args.output_path, audio=output.audio, frame_rate=16.0)
+        MediaStorage.save_video(
+            output.video, args.output_path, audio=output.audio, frame_rate=frame_rate
+        )
 
     finally:
         visual_gen.shutdown()

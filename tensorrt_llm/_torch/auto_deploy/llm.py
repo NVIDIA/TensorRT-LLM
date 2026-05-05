@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import types
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -156,6 +157,20 @@ class LLM(_TorchLLM):
 
     def _validate_args_for_torch_backend(self, kwargs: dict) -> None:
         """We don't need to validate args for AutoDeploy backend for now."""
+        pass
+
+    @property
+    def _hf_model_dir(self):
+        return (
+            Path(self.factory._prefetched_model_path)
+            if self.factory._prefetched_model_path is not None
+            else None
+        )
+
+    @_hf_model_dir.setter
+    def _hf_model_dir(self, value):
+        # Parent class assigns this in __init__ and _build_model();
+        # AutoDeploy derives it from factory._prefetched_model_path instead.
         pass
 
     def _create_input_processor(self) -> ADInputProcessor:
