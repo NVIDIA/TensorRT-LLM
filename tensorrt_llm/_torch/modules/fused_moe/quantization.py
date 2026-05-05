@@ -1082,6 +1082,50 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
         super().post_load_weights(module)
 
 
+class TritonFP8BlockScaleFusedMoEMethod(DeepSeekFP8BlockScalesFusedMoEMethod):
+    """FP8 block-scale weight handling for the GLM-5 fused-MoE Triton path.
+
+    The on-device weight layouts produced by `DeepSeekFP8BlockScalesFusedMoEMethod`
+    happen to already match what the GLM-5 fused kernels (Kernel B + Kernel C
+    per `MOE_FUSION_DESIGN.md` §7.8 / §7.9) consume:
+
+      * `module.w3_w1_weight: [E, 2*N, H]  fp8e4m3` — concatenated `[w3 | w1]`
+        along axis 1.  Kernel B's wrapper splits this into `gate_weight` (= w1
+        half = `[:, N:, :]`) and `up_weight` (= w3 half = `[:, :N, :]`).
+
+      * `module.w3_w1_weight_scaling_factor: [E, 2*N//128, H//128]  fp32` —
+        likewise split into `gate_scale` / `up_scale` halves.
+
+      * `module.w2_weight: [E, H, N]  fp8e4m3` — directly consumed by Kernel C
+        as `mat_in[E, N=H, K=intermediate]`.
+
+      * `module.w2_weight_scaling_factor: [E, H//128, N//128]  fp32` —
+        directly consumed by Kernel C as `mat_scale`.
+
+    This class therefore inherits load/storage from the DeepSeek class and
+    simply records the backend selector so downstream code can branch.
+    """
+
+    eplb_support_status = EplbSupportStatus.NOT_VERIFIED
+
+    def post_load_weights(self, module: torch.nn.Module):
+        # Ensure all four tensors are .contiguous() — Kernel B/C wrappers wrap
+        # them via DLPack and call `.is_contiguous()` assertions.
+        super().post_load_weights(module)
+        for attr in (
+                "w3_w1_weight",
+                "w2_weight",
+                "w3_w1_weight_scaling_factor",
+                "w2_weight_scaling_factor",
+        ):
+            t = getattr(module, attr, None)
+            if t is None:
+                continue
+            data = t.data if hasattr(t, "data") else t
+            if not data.is_contiguous():
+                data.copy_(data.contiguous())
+
+
 def resmooth_and_transform_fp8_scale(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
