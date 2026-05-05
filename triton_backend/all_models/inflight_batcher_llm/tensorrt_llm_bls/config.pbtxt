@@ -135,6 +135,12 @@ input [
     optional: true
   },
   {
+    name: "early_stopping"
+    data_type: TYPE_INT32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
     name: "prompt_ignore_length"
     data_type: TYPE_INT32
     dims: [ 1 ]
