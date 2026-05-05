@@ -93,6 +93,14 @@ struct KvCachePoolPointers
     void* secondaryBlockScalePoolPtr{nullptr};
 };
 
+struct KvCachePoolMapping
+{
+    int32_t poolIndex{0};
+    int32_t layerIdxInCachePool{0};
+};
+
+KvCachePoolMapping readKvCachePoolMapping(at::Tensor const& hostKvCachePoolMapping, int64_t layerIdx);
+
 KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPointers, int32_t poolIndex,
     int64_t intraPoolOffset, int64_t blockSize, int32_t layerIdxInCachePool, int32_t kvFactor, bool isFp4KvCache);
 
