@@ -101,7 +101,7 @@ th::Tensor dsv3_router_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b,
             reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
             reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
     }
-    else
+    else // fallback to cublas, can be slow
     {
         cublas_mm_out(mat_a, mat_b, bias, out);
     }
