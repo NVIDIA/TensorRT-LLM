@@ -1,5 +1,7 @@
 import asyncio
 import gc
+import importlib
+import inspect
 import json
 import os
 import secrets
@@ -50,6 +52,25 @@ from tensorrt_llm.visual_gen import VisualGen
 
 # Global variable to store the Popen object of the child process
 _child_p_global: Optional[subprocess.Popen] = None
+
+
+def _apply_fastapi_middlewares(app, middlewares: Sequence[str]) -> None:
+    """Import and register middleware objects on a FastAPI app."""
+    for middleware in middlewares:
+        try:
+            module_path, object_name = middleware.rsplit(".", 1)
+        except ValueError as e:
+            raise ValueError(f"Invalid middleware import path '{middleware}'. "
+                             "Expected format: <module>.<object>.") from e
+
+        imported = getattr(importlib.import_module(module_path), object_name)
+        if inspect.isclass(imported):
+            app.add_middleware(imported)
+        elif inspect.iscoroutinefunction(imported):
+            app.middleware("http")(imported)
+        else:
+            raise ValueError(f"Invalid middleware {middleware}. "
+                             "Must be a class or an async function.")
 
 
 def help_info_with_stability_tag(
@@ -272,6 +293,7 @@ def launch_server(
         port: int,
         llm_args: dict,
         tool_parser: Optional[str] = None,
+        middleware: Sequence[str] = (),
         chat_template: Optional[str] = None,
         metadata_server_cfg: Optional[MetadataServerConfig] = None,
         server_role: Optional[ServerRole] = None,
@@ -320,6 +342,7 @@ def launch_server(
                               disagg_cluster_config=disagg_cluster_config,
                               multimodal_server_config=multimodal_server_config,
                               chat_template=chat_template)
+        _apply_fastapi_middlewares(server.app, middleware)
 
         # Optionally disable GC (default: not disabled)
         if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
@@ -471,11 +494,12 @@ def launch_mm_encoder_server(
 
 
 def launch_visual_gen_server(
-    host: str,
-    port: int,
-    model: str,
-    diffusion_args: Optional[VisualGenArgs] = None,
-    metadata_server_cfg: Optional[MetadataServerConfig] = None,
+        host: str,
+        port: int,
+        model: str,
+        diffusion_args: Optional[VisualGenArgs] = None,
+        metadata_server_cfg: Optional[MetadataServerConfig] = None,
+        middleware: Sequence[str] = (),
 ):
     """Launch a VISUAL_GEN model server for image/video generation.
 
@@ -501,6 +525,7 @@ def launch_visual_gen_server(
                           server_role=ServerRole.VISUAL_GEN,
                           metadata_server_cfg=metadata_server_cfg,
                           tool_parser=None)
+    _apply_fastapi_middlewares(server.app, middleware)
     asyncio.run(server(host, port))
 
 
@@ -774,6 +799,15 @@ class ChoiceWithAlias(click.Choice):
                   "Can be a file path or one-liner template string",
                   "prototype"))
 @click.option(
+    "--middleware",
+    multiple=True,
+    type=str,
+    help=help_info_with_stability_tag(
+        "FastAPI middleware import path to add to the server app. "
+        "Can be specified multiple times. Each value must point to either "
+        "a middleware class or an async HTTP middleware function.",
+        "prototype"))
+@click.option(
     "--grpc",
     is_flag=True,
     default=False,
@@ -810,7 +844,7 @@ def serve(
         enable_attention_dp: bool, disagg_cluster_uri: Optional[str],
         media_io_kwargs: Optional[str], video_pruning_rate: Optional[float],
         telemetry: bool, custom_module_dirs: list[Path],
-        chat_template: Optional[str], grpc: bool,
+        chat_template: Optional[str], middleware: tuple[str, ...], grpc: bool,
         served_model_name: Optional[str],
         extra_visual_gen_options: Optional[str]):
     """Running an OpenAI API compatible server
@@ -950,6 +984,7 @@ def serve(
             # Check for unsupported arguments that are silently ignored in gRPC mode
             unsupported_args = {
                 "tool_parser": tool_parser,
+                "middleware": middleware if middleware else None,
                 "chat_template": chat_template,
                 "metadata_server_config_file": metadata_server_config_file,
                 "server_role": server_role,
@@ -971,6 +1006,7 @@ def serve(
                           port,
                           llm_args,
                           tool_parser,
+                          middleware,
                           chat_template,
                           metadata_server_cfg,
                           server_role,
@@ -990,7 +1026,7 @@ def serve(
             metadata_server_config_file)
 
         launch_visual_gen_server(host, port, model, diffusion_args,
-                                 metadata_server_cfg)
+                                 metadata_server_cfg, middleware)
 
     is_visual_gen = extra_visual_gen_options is not None or get_is_diffusion_model(
         model)

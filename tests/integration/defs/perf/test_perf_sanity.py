@@ -50,6 +50,7 @@ MODEL_PATH_DICT = {
     "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",  # Qwen3-235B-A22B-FP4
     "super_nvfp4": "NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",  # Super (Nemotron-H SSM+MoE) NvFP4
     "super_fp8": "NVIDIA-Nemotron-3-Super-120B-A12B-FP8",
+    "super_bf16": "NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
     "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",  # Qwen3-235B-A22B-FP8
     "qwen3_32b_fp8": "Qwen3/Qwen3-32B-FP8",
     "llama_v3.3_70b_instruct_fp4": "llama-3.3-models/Llama-3.3-70B-Instruct-FP4",

@@ -28,6 +28,7 @@ from transformers import AutoConfig, PretrainedConfig
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.utils import ActivationType, relu2
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 
@@ -62,6 +63,7 @@ class MLPLayer(MLP):
         model_config: ModelConfig[NemotronHConfig],
         layer_idx: int,
         reduce_output: bool = True,
+        use_custom_cublas_mm: bool = False,
     ):
         config = model_config.pretrained_config
         if isinstance(config.intermediate_size, list):
@@ -80,6 +82,7 @@ class MLPLayer(MLP):
             dtype=config.torch_dtype,
             config=model_config,
             reduce_output=reduce_output,
+            use_custom_cublas_mm=use_custom_cublas_mm,
         )
         self.layer_idx = layer_idx
 
@@ -100,6 +103,7 @@ class TransformerLayer(Attention):
         model_config: ModelConfig[NemotronHConfig],
         layer_idx: int,
         reduce_output: bool = False,
+        use_custom_cublas_mm: bool = False,
     ):
         config = model_config.pretrained_config
 
@@ -114,6 +118,7 @@ class TransformerLayer(Attention):
             dtype=config.torch_dtype,
             config=model_config,
             reduce_output=reduce_output,
+            use_custom_cublas_mm=use_custom_cublas_mm,
         )
 
     def forward(
@@ -139,6 +144,7 @@ class NemotronHMOE(nn.Module):
         layer_idx: int,
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
         reduce_output: bool = False,
+        use_custom_cublas_mm: bool = False,
     ):
         super().__init__()
 
@@ -194,6 +200,7 @@ class NemotronHMOE(nn.Module):
                 # Use shared expert LoRA types (distinct dimensions from routed MoE experts)
                 lora_up_module_type=LoraModuleType.SHARED_EXPERT_H_TO_4H,
                 lora_down_module_type=LoraModuleType.SHARED_EXPERT_4H_TO_H,
+                use_custom_cublas_mm=use_custom_cublas_mm,
             )
         # Setup MoE gate.
         self.gate = DeepseekV3Gate(
@@ -263,6 +270,7 @@ class NemotronHMOE(nn.Module):
                 skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
                 lora=self.fc1_latent_lora,
+                use_custom_cublas_mm=use_custom_cublas_mm,
             )
             self.fc2_latent_lora = None
             if model_config.lora_config is not None:
@@ -277,6 +285,7 @@ class NemotronHMOE(nn.Module):
                 skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
                 lora=self.fc2_latent_lora,
+                use_custom_cublas_mm=use_custom_cublas_mm,
             )
         else:
             self.fc1_latent_proj = None
@@ -387,6 +396,7 @@ class NemotronHLayer(DecoderLayer):
         layer_type: str,
         aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
         fuse_allreduce_norm: bool = False,
+        use_custom_cublas_mm: bool = False,
     ):
         super().__init__()
 
@@ -468,6 +478,7 @@ class NemotronHLayer(DecoderLayer):
                 rms_norm_eps=config.rms_norm_eps,
                 dtype=config.torch_dtype,
                 config=model_config,
+                use_custom_cublas_mm=use_custom_cublas_mm,
             )
             if fuse_allreduce_norm:
                 self.mixer.out_proj.reduce_output = False
@@ -476,12 +487,14 @@ class NemotronHLayer(DecoderLayer):
                 model_config,
                 layer_idx,
                 reduce_output=not fuse_allreduce_norm,
+                use_custom_cublas_mm=use_custom_cublas_mm,
             )
         elif layer_type == "*":
             self.mixer = TransformerLayer(
                 model_config,
                 layer_idx,
                 reduce_output=has_tp_allreduce,
+                use_custom_cublas_mm=use_custom_cublas_mm,
             )
         elif layer_type == "E":
             self.mixer = NemotronHMOE(
@@ -489,6 +502,7 @@ class NemotronHLayer(DecoderLayer):
                 layer_idx=layer_idx,
                 aux_stream_dict=aux_stream_dict,
                 reduce_output=has_tp_allreduce,
+                use_custom_cublas_mm=use_custom_cublas_mm,
             )
         else:
             raise ValueError(f"{layer_type} is not supported")
@@ -603,6 +617,8 @@ class NemotronHModel(DecoderModel):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
 
+        self.use_custom_cublas_mm = get_sm_version() == 121
+
         aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
         self.aux_stream_dict = {
             # TODO: add attention stream.
@@ -647,6 +663,7 @@ class NemotronHModel(DecoderModel):
                     layer_type,
                     aux_stream_dict=self.aux_stream_dict,
                     fuse_allreduce_norm=self.fuse_allreduce_norm,
+                    use_custom_cublas_mm=self.use_custom_cublas_mm,
                 ))
         self.layers = nn.ModuleList(layers)
         self.num_hidden_layers = config.num_hidden_layers
@@ -845,12 +862,14 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
         has_start_projections: bool,
         has_end_norm: bool,
         layer_type: str,
+        use_custom_cublas_mm: bool = False,
     ) -> None:
         super().__init__(
             model_config=model_config,
             layer_idx=layer_idx,
             layer_type=layer_type,
             aux_stream_dict=aux_stream_dict,
+            use_custom_cublas_mm=use_custom_cublas_mm,
         )
         self.model_nextn = 0
         if (model_config.spec_config is not None
@@ -909,6 +928,7 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
                     quant_config=model_config.quant_config,
                     skip_create_weights_in_init=model_config.
                     skip_create_weights_in_init,
+                    use_custom_cublas_mm=use_custom_cublas_mm,
                 )
             else:
                 self.eh_proj = Linear(
@@ -922,6 +942,7 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
                     reduce_output=True,
                     skip_create_weights_in_init=model_config.
                     skip_create_weights_in_init,
+                    use_custom_cublas_mm=use_custom_cublas_mm,
                 )
 
         if has_end_norm:
@@ -997,6 +1018,7 @@ class NemotronHMTP(nn.Module):
         self.model_config = model_config
         self.config = config
         self.layer_idx = layer_idx
+        self.use_custom_cublas_mm = get_sm_version() == 121
 
         # Pattern configuration
         self.pattern_str = config.mtp_hybrid_override_pattern
@@ -1031,6 +1053,7 @@ class NemotronHMTP(nn.Module):
                 has_start_projections=is_start_of_step,
                 has_end_norm=is_end_of_step,
                 layer_type=char,
+                use_custom_cublas_mm=self.use_custom_cublas_mm,
             )
 
         # Add shared_head for MTP, following DeepseekV3MTP pattern

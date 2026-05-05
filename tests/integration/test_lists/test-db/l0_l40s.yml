@@ -28,6 +28,9 @@ l0_l40s:
   # MMMU sanity check
   - accuracy/test_llm_api_pytorch_multimodal.py::TestQwen2_5_VL_7B::test_auto_dtype
   - accuracy/test_llm_api_pytorch_multimodal.py::TestVILA1_5_3B::test_auto_dtype
+  # AutoDeploy: Nemotron-Nano-V3 on Ada uses flashinfer; trtllm has no
+  # (E4M3 input, BF16 output, paged_kv, head_dim=128, sm_89) FMHA cubin.
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-flashinfer]
 - condition:
     ranges:
       system_gpu_count:
