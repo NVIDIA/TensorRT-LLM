@@ -95,11 +95,14 @@ class CudaPhaseTimer:
     On non-CUDA runs (CPU only) the markers are no-ops and the timing fields
     on ``PipelineOutput`` keep their ``0.0`` defaults.
 
-    Timing methodology: the helper does not call ``torch.cuda.synchronize`` or
-    ``Event.synchronize`` itself. ``Event.elapsed_time`` performs whatever
-    implicit sync is required when ``fill`` is invoked, and that cost is
-    amortized into the post-decode CPU transfer the pipeline already performs
-    before returning.
+    Timing methodology: ``fill`` synchronizes on the final ``_end`` event
+    before reading ``Event.elapsed_time`` — without this, ``cudaEventElapsedTime``
+    raises ``cudaErrorNotReady`` whenever the GPU stream still has pending work
+    (which happens whenever the pipeline returns the output tensor while it is
+    still resident on the device). Because the four events are recorded on the
+    default stream in order, syncing on ``_end`` waits for all earlier events
+    too. The sync cost is amortized into the executor-side device→host transfer
+    that already follows ``fill``.
     """
 
     def __init__(self) -> None:
@@ -138,6 +141,9 @@ class CudaPhaseTimer:
         """
         if not self._enabled:
             return output
+        # elapsed_time raises if the events have not yet completed on the GPU;
+        # syncing the last event also covers the earlier ones (same stream).
+        self._end.synchronize()
         ms_to_s = 1.0 / 1000.0
         output.pre_denoise = float(self._pre_start.elapsed_time(self._denoise_start)) * ms_to_s
         output.denoise = float(self._denoise_start.elapsed_time(self._post_start)) * ms_to_s

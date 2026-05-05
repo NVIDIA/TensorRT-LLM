@@ -26,11 +26,11 @@ class VisualGenMetrics:
     All timings are wall-clock seconds. The three sub-phase numbers are
     measured on the GPU stream via ``torch.cuda.Event(enable_timing=True)``
     records; events are recorded asynchronously so generation does not
-    stall, and ``event.elapsed_time`` performs an implicit sync amortized
-    into the executor-side sync that already occurs when the response is
-    consumed. The sub-phases account for GPU-stream time only, so small
-    host-side work shows up as
-    ``generation - (pre_denoise + denoise + post_denoise)``.
+    stall. The pipeline synchronizes on the final event before reading
+    ``event.elapsed_time``, and that sync cost is amortized into the
+    executor-side device→host transfer that already follows the read. The
+    sub-phases account for GPU-stream time only, so small host-side work
+    shows up as ``generation - (pre_denoise + denoise + post_denoise)``.
     """
 
     generation: float = 0.0
