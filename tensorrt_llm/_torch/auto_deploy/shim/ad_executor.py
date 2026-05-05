@@ -628,46 +628,36 @@ class ADEngine(ModelEngine):
             item_mm_offset = 0
 
             for item_idx, item_runs in enumerate(item_runs_by_item):
-                if not item_runs:
-                    raise ValueError(f"multimodal_item_runs[{item_idx}] must not be empty")
-
                 item_start: Optional[int] = None
                 item_length = 0
-                expected_run_start: Optional[int] = None
                 for run_idx, run in enumerate(item_runs):
-                    if not isinstance(run, (list, tuple)) or len(run) != 3:
+                    if all(
+                        hasattr(run, attr)
+                        for attr in ("prompt_start", "run_length", "non_embed_offsets")
+                    ):
+                        run_start = run.prompt_start
+                        run_length = run.run_length
+                        non_embed_offsets = run.non_embed_offsets
+                    elif isinstance(run, (list, tuple)) and len(run) == 3:
+                        run_start, run_length, non_embed_offsets = run
+                    else:
                         raise TypeError(
                             f"multimodal_item_runs[{item_idx}][{run_idx}] must be a "
+                            "MultimodalItemRun or "
                             "(prompt_start, run_length, non_embed_offsets) tuple"
                         )
-                    run_start, run_length, non_embed_offsets = run
                     run_start = int(run_start)
                     run_length = int(run_length)
-                    if run_length <= 0:
-                        raise ValueError(
-                            f"multimodal_item_runs[{item_idx}][{run_idx}] must have positive length"
-                        )
                     if item_start is None:
                         item_start = run_start
-                    if expected_run_start is not None and run_start < expected_run_start:
-                        raise ValueError(
-                            f"multimodal_item_runs[{item_idx}][{run_idx}] overlaps or "
-                            "is not sorted after the previous run"
-                        )
 
                     local_non_embed_offsets = as_int_list(non_embed_offsets)
                     for local_offset in local_non_embed_offsets:
-                        if local_offset < 0 or local_offset >= run_length:
-                            raise ValueError(
-                                f"multimodal_item_runs[{item_idx}][{run_idx}] non-embed "
-                                "offsets must be within the run"
-                            )
                         non_embed_offsets_flat.append(item_mm_offset + item_length + local_offset)
 
                     item_length += run_length
                     run_token_positions.append(run_start)
                     run_token_lengths.append(run_length)
-                    expected_run_start = run_start + run_length
 
                 token_positions.append(int(item_start))
                 token_lengths.append(item_length)

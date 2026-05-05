@@ -55,6 +55,10 @@ from transformers.utils import ModelOutput
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401, I001 -- register all ops
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_qwen3_5_moe_utils import (
+    compute_request_chunk_mrope_positions,
+    select_request_chunk_multimodal_embeds,
+)
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
 from tensorrt_llm._torch.auto_deploy.models.hf import (
     AutoModelForCausalLMFactory,
@@ -1988,178 +1992,6 @@ class Qwen3_5MoeModel(nn.Module):
         )
         return special_image_mask, special_video_mask
 
-    @staticmethod
-    def _build_request_item_runs(
-        req_mm_positions: Sequence[int],
-        req_mm_lengths: Sequence[int],
-        req_mm_item_run_cu_seqlen: Optional[Sequence[int]] = None,
-        req_mm_run_positions: Optional[Sequence[int]] = None,
-        req_mm_run_lengths: Optional[Sequence[int]] = None,
-    ) -> List[List[Tuple[int, int, int]]]:
-        if (
-            req_mm_item_run_cu_seqlen is None
-            and req_mm_run_positions is None
-            and req_mm_run_lengths is None
-        ):
-            return [
-                [(int(mm_start), int(mm_len), 0)]
-                for mm_start, mm_len in zip(req_mm_positions, req_mm_lengths)
-            ]
-        if (
-            req_mm_item_run_cu_seqlen is None
-            or req_mm_run_positions is None
-            or req_mm_run_lengths is None
-        ):
-            raise ValueError("Incomplete multimodal item-run metadata for Qwen3.5 chunk")
-        if len(req_mm_item_run_cu_seqlen) != len(req_mm_positions) + 1:
-            raise ValueError(
-                "mm_item_run_cu_seqlen must have one more entry than request items: "
-                f"cu={len(req_mm_item_run_cu_seqlen)}, items={len(req_mm_positions)}"
-            )
-        if len(req_mm_run_positions) != len(req_mm_run_lengths):
-            raise ValueError(
-                "Mismatch between mm_run_token_positions and mm_run_token_lengths: "
-                f"positions={len(req_mm_run_positions)}, lengths={len(req_mm_run_lengths)}"
-            )
-        if int(req_mm_item_run_cu_seqlen[-1]) != len(req_mm_run_positions):
-            raise ValueError(
-                "mm_item_run_cu_seqlen final value must match number of run entries: "
-                f"final={int(req_mm_item_run_cu_seqlen[-1])}, runs={len(req_mm_run_positions)}"
-            )
-
-        item_runs: List[List[Tuple[int, int, int]]] = []
-        for item_idx, mm_len in enumerate(req_mm_lengths):
-            run_start_idx = int(req_mm_item_run_cu_seqlen[item_idx])
-            run_end_idx = int(req_mm_item_run_cu_seqlen[item_idx + 1])
-            if run_start_idx == run_end_idx:
-                raise ValueError(f"Qwen3.5 multimodal item {item_idx} has no run entries")
-            item_length = 0
-            previous_run_end: Optional[int] = None
-            runs: List[Tuple[int, int, int]] = []
-            for run_idx in range(run_start_idx, run_end_idx):
-                run_start = int(req_mm_run_positions[run_idx])
-                run_length = int(req_mm_run_lengths[run_idx])
-                if run_length <= 0:
-                    raise ValueError(
-                        f"Qwen3.5 multimodal item {item_idx} run {run_idx} "
-                        "must have positive length"
-                    )
-                if previous_run_end is not None and run_start < previous_run_end:
-                    raise ValueError(
-                        f"Qwen3.5 multimodal item {item_idx} run {run_idx} overlaps "
-                        "or is not sorted after the previous run"
-                    )
-                runs.append((run_start, run_length, item_length))
-                item_length += run_length
-                previous_run_end = run_start + run_length
-            if item_length != int(mm_len):
-                raise ValueError(
-                    "Qwen3.5 multimodal item run lengths do not match item length: "
-                    f"item={item_idx}, runs={item_length}, item_length={int(mm_len)}"
-                )
-            item_runs.append(runs)
-        return item_runs
-
-    def _select_request_chunk_multimodal_embeds(
-        self,
-        req_input_pos: int,
-        req_seq_len: int,
-        req_mm_item_types: Sequence[int],
-        req_mm_positions: Sequence[int],
-        req_mm_lengths: Sequence[int],
-        req_special_offsets: Sequence[int],
-        image_embeds_list: Optional[Sequence[torch.Tensor]],
-        video_embeds_list: Optional[Sequence[torch.Tensor]],
-        req_mm_item_run_cu_seqlen: Optional[Sequence[int]] = None,
-        req_mm_run_positions: Optional[Sequence[int]] = None,
-        req_mm_run_lengths: Optional[Sequence[int]] = None,
-    ) -> torch.Tensor:
-        chunk_end = req_input_pos + req_seq_len
-        mm_cumulative_offset = 0
-        img_idx = 0
-        vid_idx = 0
-        chunks: list[torch.Tensor] = []
-        hidden_size = self.config.text_config.hidden_size
-        special_offsets_set = set(int(x) for x in req_special_offsets)
-        item_runs_by_item = self._build_request_item_runs(
-            req_mm_positions,
-            req_mm_lengths,
-            req_mm_item_run_cu_seqlen,
-            req_mm_run_positions,
-            req_mm_run_lengths,
-        )
-
-        for item_idx, (item_type, mm_len) in enumerate(zip(req_mm_item_types, req_mm_lengths)):
-            item_mm_offset = mm_cumulative_offset
-            item_mm_len = int(mm_len)
-            item_runs = item_runs_by_item[item_idx]
-
-            if item_type == 0:
-                if image_embeds_list is None:
-                    raise ValueError("Missing image embeddings for image multimodal item")
-                item_embeds = image_embeds_list[img_idx]
-                img_idx += 1
-            elif item_type == 1:
-                if video_embeds_list is None:
-                    raise ValueError("Missing video embeddings for video multimodal item")
-                item_embeds = video_embeds_list[vid_idx]
-                vid_idx += 1
-            else:
-                raise ValueError(f"Unsupported multimodal item type: {item_type}")
-
-            local_to_feature_idx: list[Optional[int]] = []
-            feature_idx = 0
-            for rel in range(item_mm_len):
-                if item_mm_offset + rel in special_offsets_set:
-                    local_to_feature_idx.append(None)
-                else:
-                    local_to_feature_idx.append(feature_idx)
-                    feature_idx += 1
-
-            if feature_idx != item_embeds.shape[0]:
-                raise ValueError(
-                    "Multimodal embedding length mismatch for Qwen3.5 item: "
-                    f"type={item_type}, expected={feature_idx}, actual={item_embeds.shape[0]}, "
-                    f"mm_len={item_mm_len}, item_runs={item_runs}, "
-                    f"special_offsets={sorted(special_offsets_set)}"
-                )
-
-            selected_indices: list[int] = []
-            for run_start, run_length, item_local_start in item_runs:
-                overlap_start = max(req_input_pos, run_start)
-                overlap_end = min(chunk_end, run_start + run_length)
-                if overlap_start >= overlap_end:
-                    continue
-                selected_indices.extend(
-                    feature_idx
-                    for feature_idx in (
-                        local_to_feature_idx[item_local_start + rel]
-                        for rel in range(overlap_start - run_start, overlap_end - run_start)
-                    )
-                    if feature_idx is not None
-                )
-            if selected_indices:
-                chunks.append(item_embeds[selected_indices])
-
-            mm_cumulative_offset += item_mm_len
-
-        if chunks:
-            return torch.cat(chunks, dim=0)
-
-        device = None
-        dtype = None
-        if image_embeds_list:
-            device = image_embeds_list[0].device
-            dtype = image_embeds_list[0].dtype
-        elif video_embeds_list:
-            device = video_embeds_list[0].device
-            dtype = video_embeds_list[0].dtype
-        if device is None or dtype is None:
-            raise ValueError(
-                "Cannot build empty multimodal chunk without image or video embeddings"
-            )
-        return torch.empty(0, hidden_size, device=device, dtype=dtype)
-
     def _expand_video_embeds_by_span(
         self,
         video_embeds_list: Optional[Sequence[torch.Tensor]],
@@ -2250,7 +2082,7 @@ class Qwen3_5MoeModel(nn.Module):
             img_idx += num_images
             vid_idx += num_videos
 
-            req_chunk_embeds = self._select_request_chunk_multimodal_embeds(
+            req_chunk_embeds = select_request_chunk_multimodal_embeds(
                 req_input_pos=int(input_pos[i].item()),
                 req_seq_len=int(seq_len[i].item()),
                 req_mm_item_types=req_mm_item_types,
@@ -2259,6 +2091,7 @@ class Qwen3_5MoeModel(nn.Module):
                 req_special_offsets=req_special_offsets,
                 image_embeds_list=req_image_embeds,
                 video_embeds_list=req_video_embeds,
+                hidden_size=self.config.text_config.hidden_size,
                 req_mm_item_run_cu_seqlen=req_item_run_cu_seqlen,
                 req_mm_run_positions=req_run_positions,
                 req_mm_run_lengths=req_run_lengths,
@@ -2644,7 +2477,7 @@ class Qwen3_5MoeModel(nn.Module):
                     ]
                     vid_grid_idx += num_videos
 
-                pos_3d = self._compute_request_chunk_mrope_positions(
+                pos_3d = compute_request_chunk_mrope_positions(
                     req_input_pos=req_input_pos,
                     req_seq_len=req_seq_len,
                     req_mm_item_types=req_mm_item_types,
@@ -2656,6 +2489,7 @@ class Qwen3_5MoeModel(nn.Module):
                     req_mm_run_lengths=req_run_lengths,
                     image_grid_thw=req_img_grid,
                     video_grid_thw=req_vid_grid,
+                    spatial_merge_size=self.config.vision_config.spatial_merge_size,
                     dtype=input_ids.dtype,
                     device=input_ids.device,
                 )
@@ -2687,139 +2521,6 @@ class Qwen3_5MoeModel(nn.Module):
             return torch.cat([prefill_pos, decode_pos_3d], dim=-1)
 
         return prefill_pos
-
-    def _compute_request_chunk_mrope_positions(
-        self,
-        req_input_pos: int,
-        req_seq_len: int,
-        req_mm_item_types: Sequence[int],
-        req_mm_positions: Sequence[int],
-        req_mm_lengths: Sequence[int],
-        req_special_offsets: Sequence[int],
-        req_mm_item_run_cu_seqlen: Optional[Sequence[int]],
-        req_mm_run_positions: Optional[Sequence[int]],
-        req_mm_run_lengths: Optional[Sequence[int]],
-        image_grid_thw: Optional[torch.Tensor],
-        video_grid_thw: Optional[torch.Tensor],
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Compute chunk-local 3D mRoPE positions for one request in absolute coordinates."""
-        chunk_end = req_input_pos + req_seq_len
-        out = torch.empty((3, 1, req_seq_len), dtype=dtype, device=device)
-        special_offsets_set = set(int(x) for x in req_special_offsets)
-        mm_cumulative_offset = 0
-        abs_cursor = 0
-        comp_cursor = 0
-        img_idx = 0
-        vid_idx = 0
-        item_runs_by_item = self._build_request_item_runs(
-            req_mm_positions,
-            req_mm_lengths,
-            req_mm_item_run_cu_seqlen,
-            req_mm_run_positions,
-            req_mm_run_lengths,
-        )
-
-        def fill_text(abs_start: int, abs_end: int, comp_start: int) -> None:
-            ov_start = max(req_input_pos, abs_start)
-            ov_end = min(chunk_end, abs_end)
-            if ov_start >= ov_end:
-                return
-            start_pos = comp_start + (ov_start - abs_start)
-            text_pos = torch.arange(
-                start_pos, start_pos + (ov_end - ov_start), device=device, dtype=dtype
-            )
-            out[:, 0, ov_start - req_input_pos : ov_end - req_input_pos] = text_pos.unsqueeze(
-                0
-            ).expand(3, -1)
-
-        def build_vision_positions(grid: torch.Tensor, comp_start: int) -> Tuple[torch.Tensor, int]:
-            t, h, w = [int(v) for v in grid.tolist()]
-            llm_grid_t = int(t)
-            llm_grid_h = int(h) // self.config.vision_config.spatial_merge_size
-            llm_grid_w = int(w) // self.config.vision_config.spatial_merge_size
-
-            t_index = (
-                torch.arange(llm_grid_t, device=device, dtype=dtype)
-                .view(-1, 1)
-                .expand(-1, llm_grid_h * llm_grid_w)
-                .flatten()
-            )
-            h_index = (
-                torch.arange(llm_grid_h, device=device, dtype=dtype)
-                .view(1, -1, 1)
-                .expand(llm_grid_t, -1, llm_grid_w)
-                .flatten()
-            )
-            w_index = (
-                torch.arange(llm_grid_w, device=device, dtype=dtype)
-                .view(1, 1, -1)
-                .expand(llm_grid_t, llm_grid_h, -1)
-                .flatten()
-            )
-            positions = torch.stack([t_index, h_index, w_index]) + comp_start
-            return positions, comp_start + max(llm_grid_t, llm_grid_h, llm_grid_w)
-
-        for item_idx, (item_type, mm_len) in enumerate(zip(req_mm_item_types, req_mm_lengths)):
-            item_mm_offset = mm_cumulative_offset
-            item_runs = item_runs_by_item[item_idx]
-            vision_abs_positions: list[int] = []
-            for run_start, run_length, item_local_start in item_runs:
-                for rel in range(run_length):
-                    item_local_offset = item_local_start + rel
-                    if item_mm_offset + item_local_offset not in special_offsets_set:
-                        vision_abs_positions.append(run_start + rel)
-
-            if not vision_abs_positions:
-                item_abs_end = max(run_start + run_length for run_start, run_length, _ in item_runs)
-                fill_text(abs_cursor, item_abs_end, comp_cursor)
-                comp_cursor += item_abs_end - abs_cursor
-                abs_cursor = item_abs_end
-                mm_cumulative_offset += int(mm_len)
-                continue
-
-            first_vision_abs_start = vision_abs_positions[0]
-            fill_text(abs_cursor, first_vision_abs_start, comp_cursor)
-            comp_cursor += first_vision_abs_start - abs_cursor
-
-            if item_type == 0:
-                if image_grid_thw is None:
-                    raise ValueError("Missing image_grid_thw for image multimodal item")
-                grid = image_grid_thw[img_idx]
-                img_idx += 1
-            elif item_type == 1:
-                if video_grid_thw is None:
-                    raise ValueError("Missing video_grid_thw for video multimodal item")
-                grid = video_grid_thw[vid_idx]
-                vid_idx += 1
-            else:
-                raise ValueError(f"Unsupported multimodal item type: {item_type}")
-
-            vision_positions, next_comp_cursor = build_vision_positions(grid, comp_cursor)
-            if vision_positions.shape[1] != len(vision_abs_positions):
-                raise ValueError(
-                    "Qwen3.5 vision grid length does not match exact item runs: "
-                    f"grid_tokens={vision_positions.shape[1]}, run_tokens={len(vision_abs_positions)}"
-                )
-
-            text_cursor = first_vision_abs_start
-            text_comp_cursor = next_comp_cursor
-            for vision_idx, vision_abs_pos in enumerate(vision_abs_positions):
-                fill_text(text_cursor, vision_abs_pos, text_comp_cursor)
-                text_comp_cursor += vision_abs_pos - text_cursor
-                if req_input_pos <= vision_abs_pos < chunk_end:
-                    out[:, 0, vision_abs_pos - req_input_pos] = vision_positions[:, vision_idx]
-                text_cursor = vision_abs_pos + 1
-
-            item_abs_end = max(run_start + run_length for run_start, run_length, _ in item_runs)
-            fill_text(text_cursor, item_abs_end, text_comp_cursor)
-            comp_cursor = text_comp_cursor + item_abs_end - text_cursor
-            abs_cursor = item_abs_end
-            mm_cumulative_offset += int(mm_len)
-
-        fill_text(abs_cursor, chunk_end, comp_cursor)
-        return out
 
     def _build_mixed_positions(
         self,
