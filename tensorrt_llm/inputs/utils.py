@@ -602,9 +602,11 @@ class MultimodalDataTracker:
     """Tracks and manages multimodal data for both sync and async processing."""
 
     def __init__(
-            self,
-            model_type: str,
-            multimodal_server_config: Optional[MultimodalServerConfig] = None):
+        self,
+        model_type: str,
+        multimodal_server_config: Optional[MultimodalServerConfig] = None,
+        request_media_io_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+    ):
         self._model_type = model_type
         self._data = defaultdict[str, list](list)
         self._embeddings = defaultdict[str, list](list)
@@ -612,6 +614,9 @@ class MultimodalDataTracker:
         self._placeholder_to_modality: dict[str, str] = {}
         self._multimodal_server_config = multimodal_server_config if multimodal_server_config is not None else MultimodalServerConfig(
         )
+        # Per-request override merged with the server default at media-load
+        # time; see `resolve_media_io_kwargs` in `serve/chat_utils.py`.
+        self._request_media_io_kwargs = request_media_io_kwargs
 
     async def retrieve_all_async(
         self

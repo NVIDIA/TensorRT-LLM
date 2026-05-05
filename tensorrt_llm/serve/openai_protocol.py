@@ -744,6 +744,19 @@ class ChatCompletionRequest(OpenAIBaseModel):
                      "Will be accessible by the chat template."),
     )
 
+    media_io_kwargs: Optional[Dict[str, Dict[str, Any]]] = Field(
+        default=None,
+        description=(
+            "Per-request override for the server's `--media_io_kwargs`. "
+            "Shape: `{modality: {kwarg: value}}` with modality in "
+            "{\"image\", \"video\", \"audio\"}. Per modality, request kwargs "
+            "are shallow-merged onto the server defaults (request wins per "
+            "key). For `video`, overriding only one of `fps`/`num_frames` "
+            "drops the other from the server default so the loader's "
+            "built-in is used. "
+            "Example: `{\"video\": {\"num_frames\": 32}}`."),
+    )
+
     disaggregated_params: Optional[DisaggregatedParams] = Field(
         default=None,
         description=("Parameters for disaggregated serving"),
