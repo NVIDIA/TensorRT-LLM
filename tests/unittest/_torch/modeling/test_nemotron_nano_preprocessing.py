@@ -1,3 +1,4 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Preprocessing unit tests for modeling_nemotron_nano.py."""
 
 import functools
@@ -25,6 +26,7 @@ from tensorrt_llm._torch.models.modeling_nemotron_nano import (
 )
 from tensorrt_llm.inputs.multimodal import (
     MultimodalParams,
+    MultimodalRuntimeData,
     _compute_mm_masks,
     _find_mm_token_start_pos_from_masks,
 )
@@ -810,13 +812,22 @@ def _make_merge_model():
     return model
 
 
-def _make_mm_param(modality: str, evs_ids):
+def _make_runtime(past_seen_token_num: int, chunk_end_pos: int, prompt_len: int):
+    return MultimodalRuntimeData(
+        past_seen_token_num=past_seen_token_num,
+        chunk_end_pos=chunk_end_pos,
+        embed_mask_cumsum=torch.zeros(prompt_len, dtype=torch.int64),
+    )
+
+
+def _make_mm_param(modality: str, evs_ids, runtime=None):
     """Build a MultimodalParams for merge_evs_mm_embeds."""
     return MultimodalParams(
         multimodal_data={
             "modality_type": modality,
             modality: {"evs_ids": evs_ids},
-        }
+        },
+        multimodal_runtime=runtime,
     )
 
 
@@ -922,6 +933,96 @@ class TestMergeEvsMMEmbeds:
         )
         assert result.shape == input_ids.shape
         assert (result[: len(expected)] == expected).all()
+
+    def test_chunked_prefill_uses_current_context_slice(self):
+        """Chunked prefill should write only the active context window."""
+        model = _make_merge_model()
+        evs_ids = torch.tensor(
+            [
+                _TEXT_TOKEN,
+                _IMG_START,
+                _VIDEO_CTX_ID,
+                _IMG_END,
+                88,
+                _IMG_START,
+                _VIDEO_CTX_ID,
+                _IMG_END,
+                77,
+            ],
+            dtype=torch.long,
+        )
+        full_context = torch.tensor(
+            [_TEXT_TOKEN, _IMG_START]
+            + [_IMG_CTX_ID] * 3
+            + [_IMG_END, 88, _IMG_START]
+            + [_IMG_CTX_ID] * 2
+            + [_IMG_END, 77],
+            dtype=torch.long,
+        )
+        runtime = _make_runtime(
+            past_seen_token_num=4,
+            chunk_end_pos=9,
+            prompt_len=len(full_context),
+        )
+        param = _make_mm_param("video", evs_ids, runtime=runtime)
+        num_tokens_in_videos = [torch.tensor([3, 2])]
+        generation_tail = torch.tensor([700, 701], dtype=torch.long)
+        input_ids = torch.cat([torch.zeros(5, dtype=torch.long), generation_tail.clone()])
+
+        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+            model, num_tokens_in_videos, [param], input_ids
+        )
+
+        expected_context_chunk = full_context[4:9]
+        assert result.shape == input_ids.shape
+        assert (result[: len(expected_context_chunk)] == expected_context_chunk).all()
+        assert (result[len(expected_context_chunk) :] == generation_tail).all()
+        assert runtime.num_cached_mm_tokens == 2
+        assert runtime.num_mm_tokens_in_chunk == 2
+        assert runtime.total_embeds_in_request == 5
+
+    def test_chunked_prefill_first_chunk_can_be_shorter_than_full_context(self):
+        """A full EVS context longer than input_ids must not be assigned wholesale."""
+        model = _make_merge_model()
+        evs_ids = torch.tensor(
+            [
+                _TEXT_TOKEN,
+                _IMG_START,
+                _VIDEO_CTX_ID,
+                _IMG_END,
+                _IMG_START,
+                _VIDEO_CTX_ID,
+                _IMG_END,
+                _TEXT_TOKEN,
+            ],
+            dtype=torch.long,
+        )
+        full_context = torch.tensor(
+            [_TEXT_TOKEN, _IMG_START]
+            + [_IMG_CTX_ID] * 5
+            + [_IMG_END, _IMG_START]
+            + [_IMG_CTX_ID] * 4
+            + [_IMG_END, _TEXT_TOKEN],
+            dtype=torch.long,
+        )
+        runtime = _make_runtime(
+            past_seen_token_num=0,
+            chunk_end_pos=4,
+            prompt_len=len(full_context),
+        )
+        param = _make_mm_param("video", evs_ids, runtime=runtime)
+        num_tokens_in_videos = [torch.tensor([5, 4])]
+        input_ids = torch.zeros(4, dtype=torch.long)
+
+        result = NemotronH_Nano_VL_V2.merge_evs_mm_embeds(
+            model, num_tokens_in_videos, [param], input_ids
+        )
+
+        assert result.shape == input_ids.shape
+        assert (result == full_context[:4]).all()
+        assert runtime.num_cached_mm_tokens == 0
+        assert runtime.num_mm_tokens_in_chunk == 2
+        assert runtime.total_embeds_in_request == 9
 
 
 class TestProcessVideoPromptsEvs:
