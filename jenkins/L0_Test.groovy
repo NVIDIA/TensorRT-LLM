@@ -4491,34 +4491,39 @@ def launchTestJobs(pipeline, testFilter)
         checkStageNameSet(testFilter[(EXTRA_STAGE_LIST)], fullSet, EXTRA_STAGE_LIST)
     }
 
-    // CBTS Layer 2: stage-level short-circuit override. Runs AFTER all
-    // existing filter rules so unknown / no-decision paths fall through
-    // naturally. Perf stages are excluded — they have their own trigger
-    // model and need full test lists. See jenkins/scripts/cbts/README.md.
+    // CBTS Layer 2: stage-level filter. Runs AFTER all existing filter rules
+    // so unknown / no-decision paths fall through naturally. CBTS narrows
+    // *test stages* only — Build always runs (the L0_MergeRequest arch-track
+    // skip was removed deliberately so the wheel and PackageSanityCheck path
+    // are never disturbed by CBTS). See jenkins/scripts/cbts/README.md.
+    //
+    // - Perf stages: excluded. They have their own trigger model and need
+    //   full test lists.
+    // - PackageSanityCheck stages: force-kept. Their stage names are built
+    //   at runtime so the CBTS Python parser cannot see them, and they are
+    //   wheel/image gates that should always run after Build.
+    // - Trigger-mode mismatch (cbts.trigger_mode_mismatch): rules resolved
+    //   stages but none match the user's /bot run [--post-merge] mode. The
+    //   filter naturally collapses to PackageSanityCheck only — equivalent
+    //   to "build + sanity, no test cases", similar to /bot run --stage-list "".
     //
     // Pre-merge vs Post-Merge filtering already happened in Python
     // (main.py applies it based on the post_merge flag plumbed through
     // cbts_input.json), so `cbts.affected_stages` here is already
-    // restricted to the user's trigger mode. No-op if empty: matches
-    // README's "/bot run [--post-merge] with no relevant hit -> no-op"
-    // semantic, symmetrically for both modes.
+    // restricted to the user's trigger mode.
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts != null) {
-        // Always assign parallelJobsFiltered from CBTS result (rather than
-        // falling through to the prior filter chain) — even when the CBTS-
-        // narrowed set is empty after Python's trigger-mode filter. Empty
-        // = "CBTS narrowed something, but nothing matches the user's trigger
-        // mode" → no-op (don't run anything). Falling through to baseline
-        // here would defeat CBTS's whole point. scope=null cases never
-        // reach this block: getCbtsResult returns null and cbts is null.
         def affectedSet = (cbts.affected_stages ?: []) as Set
         parallelJobsFiltered = parallelJobs.findAll { key, _ ->
-            affectedSet.contains(key) && !(key =~ /Perf/)
+            (affectedSet.contains(key) || key =~ /PackageSanityCheck/) && !(key =~ /Perf/)
         }
-        if (parallelJobsFiltered) {
+        if (cbts.trigger_mode_mismatch) {
+            echo "CBTS [${cbts.scope}]: trigger-mode mismatch — running only " +
+                 "${parallelJobsFiltered.size()} PackageSanityCheck stage(s); no test cases"
+        } else if (parallelJobsFiltered) {
             echo "CBTS [${cbts.scope}]: limiting to ${parallelJobsFiltered.size()} affected stages"
         } else {
-            echo "CBTS [${cbts.scope}]: no stages match trigger mode → no-op (no fallback to baseline)"
+            echo "CBTS [${cbts.scope}]: empty stage set after filtering"
         }
     }
 

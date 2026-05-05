@@ -709,7 +709,9 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
 // affected_stages, affected_tests, reasons} or null (= no decision / fall
 // back to the existing filter chain).
 //
-// See jenkins/scripts/cbts/README.md for the two-layer consumption model.
+// See jenkins/scripts/cbts/README.md for the consumption model. CBTS only
+// narrows test cases (Layer 2 stage filter + Layer 3 within-stage filter);
+// it never affects Build, so the wheel always exists.
 // ============================================================================
 
 def getCbtsResult(pipeline, testFilter, globalVars)
@@ -773,7 +775,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
             returnStdout: true,
         )
 
-        // 5. Parse stdout into the map shape consumed by Layer 1/2/3.
+        // 5. Parse stdout into the map shape consumed by Layer 2/2.5/3.
         def result = _cbtsParseSelectionResult(output)
         if (result.scope == null) {
             pipeline.echo("CBTS: deferring — Python returned scope=null. " +
@@ -865,7 +867,7 @@ def _cbtsTriggeredUserFlags(testFilter)
                      .collect { "${it}=${testFilter[it]}" }
 }
 
-// Parse CBTS JSON stdout into the shape consumed by Layer 1/2/3. Always
+// Parse CBTS JSON stdout into the shape consumed by Layer 2/2.5/3. Always
 // returns a map; `scope == null` means "no decision" (caller should log the
 // reasons and treat as defer).
 def _cbtsParseSelectionResult(String text)
@@ -882,6 +884,10 @@ def _cbtsParseSelectionResult(String text)
         // launchTestJobs reads this to drop excess pytest-split groups when
         // the affected stage's narrowed count falls below the 20-test threshold.
         affected_stage_test_counts: data.affected_stage_test_counts ?: [:],
+        // True when Python's trigger-mode filter dropped every resolved stage.
+        // Layer 2 reads this to log "build only, no test cases" explicitly,
+        // instead of inferring it from `affected_stages.empty`.
+        trigger_mode_mismatch: data.trigger_mode_mismatch ?: false,
     ]
 }
 
@@ -1272,14 +1278,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         },
         "x86_64-Linux": {
             script {
-                // CBTS Layer 1: skip entire x86 track when no x86 stages are affected.
-                // Scope-agnostic: any non-null cbts result means CBTS produced a decision;
-                // we trust its affected_cpu_arch regardless of which rule fired.
-                def cbts = testFilter[(CBTS_RESULT)]
-                if (cbts != null && !("x86" in cbts.affected_cpu_arch)) {
-                    echo "CBTS [${cbts.scope}]: no x86 stages affected, skipping x86_64-Linux track"
-                    return
-                }
+                // CBTS deliberately does NOT short-circuit at the arch / Build
+                // layer. Build always runs so a wheel exists for sanity checks
+                // and post-merge consumers; case-level narrowing happens later
+                // in L0_Test.groovy::launchTestJobs (Layer 2) and renderTestDB
+                // (Layer 3).
                 def testStageName = "[Build-x86_64] Remote Run"
                 stage(testStageName) {
                     def additionalParameters = [
@@ -1391,13 +1394,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
                     return
                 }
-                // CBTS Layer 1: skip entire SBSA track when no sbsa stages are affected.
-                // Scope-agnostic — see x86 track above for the rationale.
-                def cbts = testFilter[(CBTS_RESULT)]
-                if (cbts != null && !("sbsa" in cbts.affected_cpu_arch)) {
-                    echo "CBTS [${cbts.scope}]: no sbsa stages affected, skipping SBSA-Linux track"
-                    return
-                }
+                // CBTS deliberately does NOT short-circuit the SBSA Build —
+                // see x86 track above for the rationale.
 
                 def testStageName = "[Build-SBSA] Remote Run"
                 stage(testStageName) {

@@ -9,12 +9,27 @@ consumes the data directly.**
 
 ## Consumption layers
 
+CBTS narrows **test cases only**. Build always runs (`L0_MergeRequest.groovy`
+arch-track skipping was removed deliberately) so the wheel exists for sanity
+checks and post-merge consumers.
+
 | Layer | Where | Action |
 |---|---|---|
-| **1. Arch track** | `L0_MergeRequest.groovy::launchStages` | Skip x86 / SBSA track when no stage on that arch is affected |
-| **2. Stage** | `L0_Test.groovy::launchTestJobs` (end of filter chain) | Replace `parallelJobsFiltered` with the CBTS-selected subset (Perf stages excluded — they have their own trigger model and need full lists) |
+| **2. Stage** | `L0_Test.groovy::launchTestJobs` (end of filter chain) | Replace `parallelJobsFiltered` with the CBTS-selected subset. Perf stages are excluded (they have their own trigger model and need full lists); `*-PackageSanityCheck-*` stages are force-kept (their names are runtime-built and invisible to the CBTS Python parser, and they are wheel/image gates that should always run after Build). |
 | **2.5. Split-collapse** | `L0_Test.groovy::runLLMTestlistOnSlurm` and `runLLMTestlistOnPlatform` entries | When the affected stage's narrowed test count is < 20, collapse pytest-split's splits to 1 — only group 1 runs everything; groups 2..N skip without allocating a machine. At/above 20 the stage's default splits stand and pytest-split parallelizes normally. |
 | **3. Within-stage tests** | `L0_Test.groovy::renderTestDB` | Point trt-test-db at the CBTS-narrowed tmp test-db. Each affected block's `tests:` array is filtered to entries in the per-block filter prefix subtree, **and unaffected blocks are dropped entirely** so a `/bot run --post-merge` can't accidentally activate post-merge blocks the PR never touched. |
+
+(Layer 1 in earlier revisions skipped the entire arch track / Build when no
+stage on that arch was affected. Removed: see
+`L0_MergeRequest.groovy::launchStages`. CBTS no longer touches Build.)
+
+### Trigger-mode mismatch
+
+If `/bot run` is issued but every CBTS-resolved stage is post-merge (or the
+symmetric case with `--post-merge`), `main.py` records this as
+`trigger_mode_mismatch: true` in its JSON output. Layer 2 then narrows to
+the PackageSanityCheck stages only — equivalent to a build-and-sanity-only
+run, in spirit similar to `/bot run --stage-list ""`.
 
 CBTS only **subtracts** stages and tests, never adds. Anything it can't
 narrow → full fallback to the existing filter chain.

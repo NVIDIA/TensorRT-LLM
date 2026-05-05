@@ -92,6 +92,12 @@ class SelectionResult:
     # matches, post-keep-filter). Groovy launchTestJobs uses this to
     # collapse splits to 1 when the count is below the 20-test threshold.
     affected_stage_test_counts: dict[str, int] = field(default_factory=dict)
+    # True iff CBTS resolved at least one stage but the trigger-mode filter
+    # (pre-merge vs post-merge) dropped them all. Distinguishes "this PR's
+    # narrow has nothing in the user's trigger mode" from "no narrow at all".
+    # Layer 2 in Groovy uses this to gate the diagnostic message and to
+    # express the "build only, no cases" no-op explicitly.
+    trigger_mode_mismatch: bool = False
 
     def to_json(self) -> str:
         data = {
@@ -102,6 +108,7 @@ class SelectionResult:
             "reasons": list(self.reasons),
             "test_db_dir_override": self.test_db_dir_override,
             "affected_stage_test_counts": dict(self.affected_stage_test_counts),
+            "trigger_mode_mismatch": self.trigger_mode_mismatch,
         }
         return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
@@ -156,9 +163,10 @@ class Selector:
 
         # Safety net: if rules fired but no Jenkins stages resolved (waive ids
         # missed both exact and parent-chain lookups in the YAML index), fall
-        # back to baseline. Returning a non-None scope with empty stages would
-        # let Layer 1 in Groovy mistake `affected_cpu_arch=∅` for "no arch
-        # needed" and silently skip both x86 and SBSA tracks.
+        # back to baseline. Returning a non-None scope with empty stages here
+        # is distinct from a trigger-mode mismatch: it means CBTS has nothing
+        # actionable, so we want the existing filter chain to run normally
+        # rather than CBTS-narrowing to PackageSanityCheck only.
         if not affected_stages:
             return SelectionResult(
                 scope=None,
@@ -323,6 +331,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     result.affected_stage_test_counts = {
         k: v for k, v in result.affected_stage_test_counts.items() if k in result.affected_stages
     }
+    # Flag the "build only, no test cases" no-op: rules resolved stages, but
+    # none survive the user's trigger-mode filter. Surfaced to Groovy so the
+    # Layer 2 log can say why — and so future consumers can branch on it
+    # instead of inferring from `not affected_stages`.
+    result.trigger_mode_mismatch = bool(pre_filter_stages and not result.affected_stages)
 
     _log_decision_to_stderr(stages, result, pr, pre_filter_stages)
     sys.stdout.write(result.to_json())
