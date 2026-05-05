@@ -385,6 +385,8 @@ def resolve_video_format(output_format) -> Tuple[str, str]:
         )
     elif output_format == "avi":
         return "avi", ".avi"
+    elif output_format == "raw":
+        return "raw", ".rgb.bin"
     elif output_format == "auto":
         if _check_ffmpeg_available():
             return "mp4", ".mp4"
@@ -559,6 +561,22 @@ def save_video(
 
     if format in ("mp4", "avi"):
         return _save_encoded_video(video, audio, output_path, frame_rate, audio_sample_rate)
+    if format == "raw":
+        # No encoding: dump uint8 RGB bytes directly (T*H*W*3 layout).
+        # Audio is dropped — raw mode only carries video pixel data.
+        tensor = video
+        if hasattr(tensor, "detach"):
+            tensor = tensor.detach()
+        if hasattr(tensor, "cpu"):
+            tensor = tensor.cpu()
+        if getattr(tensor, "dtype", None) is not None and tensor.dtype != torch.uint8:
+            if tensor.dtype.is_floating_point:
+                tensor = (tensor.clamp(0, 1) * 255.0).to(torch.uint8)
+            else:
+                tensor = tensor.to(torch.uint8)
+        with open(output_path, "wb") as f:
+            f.write(tensor.contiguous().numpy().tobytes())
+        return output_path
     logger.warning(f"Unsupported video format: {format}, defaulting to mp4")
     output_path = output_path.rsplit(".", 1)[0] + ".mp4"
     return _save_encoded_video(video, audio, output_path, frame_rate, audio_sample_rate)

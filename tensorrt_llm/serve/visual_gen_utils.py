@@ -32,6 +32,11 @@ def parse_visual_gen_params(
         params.guidance_scale = request.guidance_scale
     if request.guidance_rescale is not None:
         params.extra_params["guidance_rescale"] = request.guidance_rescale
+    if isinstance(request, VideoGenerationRequest):
+        if request.guidance_scale_2 is not None:
+            params.extra_params["guidance_scale_2"] = request.guidance_scale_2
+        if request.boundary_ratio is not None:
+            params.extra_params["boundary_ratio"] = request.boundary_ratio
 
     if isinstance(request, (ImageGenerationRequest, ImageEditRequest)):
         if request.num_inference_steps is not None:
@@ -70,7 +75,10 @@ def parse_visual_gen_params(
             params.image = ref_path
 
         params.frame_rate = request.fps
-        params.num_frames = int(request.seconds * request.fps)
+        if request.num_frames is not None:
+            params.num_frames = int(request.num_frames)
+        else:
+            params.num_frames = int(request.seconds * request.fps)
 
         if request.seed is not None:
             params.seed = int(request.seed)
