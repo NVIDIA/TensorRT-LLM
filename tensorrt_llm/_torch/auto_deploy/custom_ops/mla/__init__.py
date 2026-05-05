@@ -10,8 +10,7 @@ Exports:
 - flashinfer_mla_with_cache: Cached backend op using FlashInfer MLA kernels
 - flashinfer_trtllm_mla_with_cache: Cached backend op using FlashInfer Path 2 kernels
 - triton_cached_mla_with_cache: Cached backend op using Triton kernels
-- TrtllmMLAAttention: Attention descriptor for TRT-LLM MLA (registered as "trtllm_mla")
-- trtllm_mla_with_cache: Cached backend op using TRT-LLM thop.attention with MLA
+- trtllm_mla: TRT-LLM thop.attention-based MLA (requires tensorrt_llm, discovered individually)
 """
 
 from .flashinfer_mla import FlashInferMLAAttention, flashinfer_mla_with_cache
@@ -19,7 +18,6 @@ from .flashinfer_trtllm_mla import FlashInferTrtllmMLAAttention, flashinfer_trtl
 from .torch_backend_mla import TorchBackendMLAAttention, torch_backend_mla_with_cache
 from .torch_mla import torch_mla
 from .triton_mla import TritonMLAAttention, triton_cached_mla_with_cache
-from .trtllm_mla import TrtllmMLAAttention, prepare_trtllm_mla_metadata, trtllm_mla_with_cache
 
 __all__ = [
     "TorchBackendMLAAttention",
@@ -31,7 +29,4 @@ __all__ = [
     "flashinfer_mla_with_cache",
     "flashinfer_trtllm_mla_with_cache",
     "triton_cached_mla_with_cache",
-    "TrtllmMLAAttention",
-    "trtllm_mla_with_cache",
-    "prepare_trtllm_mla_metadata",
 ]
