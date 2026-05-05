@@ -530,11 +530,8 @@ class RopeParams:
             rope_params.alpha = rope_scaling.get("alpha", 1.0)
             rotary_scaling_type = rope_scaling.get(
                 "type", None) or rope_scaling.get("rope_type")
-            if rotary_scaling_type in (None, "default"):
-                rope_params.scale_type = RotaryScalingType.none
-            else:
-                rope_params.scale_type = RotaryScalingType.from_string(
-                    rotary_scaling_type)
+            rope_params.scale_type = RotaryScalingType.from_string(
+                rotary_scaling_type)
             rope_params.scale = rope_scaling.get("factor", 1.0)
             rope_params.low_freq_factor = rope_scaling.get(
                 "low_freq_factor", 1.0)
