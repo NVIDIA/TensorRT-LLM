@@ -8,10 +8,12 @@ import tensorrt_llm.inputs.multimodal as multimodal_module
 from tensorrt_llm.inputs.multimodal import (
     MultimodalInput,
     MultimodalRuntimeData,
-    _find_mm_token_start_pos_from_masks,
+    _find_mm_special_token_offsets_from_masks,
     find_mm_token_item_runs,
     get_multimodal_embedding_lengths,
-    validate_mm_item_runs,
+    get_multimodal_item_run_spans,
+    prepare_multimodal_item_runs,
+    validate_multimodal_hashes_and_item_runs,
 )
 from tensorrt_llm.inputs.registry import create_input_processor_with_hash
 
@@ -38,18 +40,14 @@ class _HashingTestInputProcessor:
         return None
 
 
-def test_find_mm_token_start_pos_from_masks_returns_two_lists_for_all_text():
-    # Regression: an all-False `mm_mask` (text-only prompt) must return the
-    # declared `(start_positions, start_special_token_positions)` 2-tuple so
-    # the caller's tuple unpack stays valid.
+def test_find_mm_special_token_offsets_from_masks_returns_empty_for_all_text():
+    # Regression: an all-False `mm_mask` (text-only prompt) must return an
+    # empty special-token offset list.
     mm_mask = torch.zeros(5, dtype=torch.bool)
     special_mask = torch.zeros(5, dtype=torch.bool)
 
-    start_positions, start_special_token_positions = _find_mm_token_start_pos_from_masks(
-        mm_mask, special_mask, num_mm_tokens=[]
-    )
+    start_special_token_positions = _find_mm_special_token_offsets_from_masks(mm_mask, special_mask)
 
-    assert start_positions == []
     assert start_special_token_positions == []
 
 
@@ -62,6 +60,7 @@ def test_find_mm_token_item_runs_preserves_sparse_prompt_coverage():
 
     assert item_runs == [[(1, 1, []), (3, 1, [])]]
     assert [runs[0][0] for runs in item_runs] == [1]
+    assert get_multimodal_item_run_spans(item_runs) == [[(1, 1), (3, 1)]]
 
 
 def test_find_mm_token_item_runs_preserves_non_embed_offsets():
@@ -76,37 +75,54 @@ def test_find_mm_token_item_runs_preserves_non_embed_offsets():
 
     assert item_runs == [[(1, 5, [2, 4])]]
     assert get_multimodal_embedding_lengths(item_runs) == [3]
+    assert get_multimodal_item_run_spans(item_runs) == [[(1, 5)]]
 
 
-def test_validate_mm_item_runs_rejects_prompt_overflow():
-    with pytest.raises(AssertionError, match="exceeding input sequence length"):
-        validate_mm_item_runs(
-            prompt_token_ids=[11, 999],
-            mm_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
-            mm_item_runs=[[(1, 2, [])]],
-        )
-
-
-def test_validate_mm_item_runs_rejects_global_overlap():
-    with pytest.raises(AssertionError, match="globally non-overlapping"):
-        validate_mm_item_runs(
-            prompt_token_ids=[999, 999, 999],
-            mm_hashes=[
-                [1, 2, 3, 4, 5, 6, 7, 8],
-                [8, 7, 6, 5, 4, 3, 2, 1],
-            ],
-            mm_item_runs=[[(1, 2, [])], [(2, 1, [])]],
-        )
-
-
-def test_validate_mm_item_runs_allows_interleaved_non_overlapping_items():
-    validate_mm_item_runs(
-        prompt_token_ids=[999, 999, 999, 999, 999],
-        mm_hashes=[
+def test_prepare_multimodal_item_runs_derives_metadata_in_one_pass():
+    prepared = prepare_multimodal_item_runs(
+        [
             [1, 2, 3, 4, 5, 6, 7, 8],
             [8, 7, 6, 5, 4, 3, 2, 1],
         ],
-        mm_item_runs=[[(1, 1, []), (4, 1, [])], [(3, 1, [])]],
+        [[(1, 1, []), (5, 3, [1])], [(3, 1, [])]],
+        prompt_len=8,
+    )
+
+    assert prepared.multimodal_item_runs == [[(1, 1, []), (5, 3, [1])], [(3, 1, [])]]
+    assert prepared.multimodal_embedding_lengths == [3, 1]
+    assert prepared.multimodal_prompt_lengths == [4, 1]
+    assert prepared.multimodal_item_run_spans == [[(1, 1), (5, 3)], [(3, 1)]]
+
+
+def test_validate_multimodal_hashes_and_item_runs_rejects_prompt_overflow():
+    with pytest.raises(ValueError, match="exceeding input sequence length"):
+        validate_multimodal_hashes_and_item_runs(
+            [[1, 2, 3, 4, 5, 6, 7, 8]],
+            [[(1, 2, [])]],
+            prompt_len=2,
+        )
+
+
+def test_validate_multimodal_hashes_and_item_runs_rejects_global_overlap():
+    with pytest.raises(ValueError, match="globally non-overlapping"):
+        validate_multimodal_hashes_and_item_runs(
+            [
+                [1, 2, 3, 4, 5, 6, 7, 8],
+                [8, 7, 6, 5, 4, 3, 2, 1],
+            ],
+            [[(1, 2, [])], [(2, 1, [])]],
+            prompt_len=3,
+        )
+
+
+def test_validate_multimodal_hashes_and_item_runs_allows_interleaved_items():
+    validate_multimodal_hashes_and_item_runs(
+        [
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            [8, 7, 6, 5, 4, 3, 2, 1],
+        ],
+        [[(1, 1, []), (4, 1, [])], [(3, 1, [])]],
+        prompt_len=5,
     )
 
 
@@ -121,6 +137,15 @@ def test_multimodal_input_from_components_preserves_uuid():
     assert mm_input.multimodal_item_runs == mm_item_runs
     assert mm_input.multimodal_embedding_lengths == [2]
     assert mm_input.multimodal_prompt_lengths == [2]
+
+
+def test_multimodal_input_from_components_validates_prompt_bounds():
+    with pytest.raises(ValueError, match="exceeding input sequence length"):
+        MultimodalInput.from_components(
+            [[1, 2, 3, 4, 5, 6, 7, 8]],
+            [[(1, 2, [])]],
+            prompt_len=2,
+        )
 
 
 def test_multimodal_input_accepts_item_runs():
@@ -174,15 +199,17 @@ def test_multimodal_input_requires_item_runs():
 
 
 def test_multimodal_input_stores_lengths_from_item_runs_once(monkeypatch):
-    mm_input = MultimodalInput(
-        multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
-        multimodal_item_runs=[[(1, 1, []), (3, 1, [])]],
-    )
-
     def fail_on_recompute(item_runs):
         raise AssertionError("multimodal lengths should be cached")
 
     monkeypatch.setattr(multimodal_module, "get_multimodal_embedding_lengths", fail_on_recompute)
+    monkeypatch.setattr(multimodal_module, "get_multimodal_prompt_lengths", fail_on_recompute)
+    monkeypatch.setattr(multimodal_module, "get_multimodal_item_run_spans", fail_on_recompute)
+
+    mm_input = MultimodalInput(
+        multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+        multimodal_item_runs=[[(1, 1, []), (3, 1, [])]],
+    )
 
     assert mm_input.multimodal_embedding_lengths == [2]
     assert mm_input.multimodal_prompt_lengths == [2]

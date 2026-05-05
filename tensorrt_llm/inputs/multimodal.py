@@ -2,7 +2,7 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Multimodal utilities for handling images and other media types in TensorRT-LLM."""
 
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -17,36 +17,108 @@ from tensorrt_llm.logger import logger
 # Default hasher
 default_hasher = blake3
 
-MultimodalItemRun = Tuple[int, int, List[int]]
+MultimodalItemRun = Tuple[
+    int, int, List[int]]  # (prompt_start, run_length, non_embed_offsets)
 MultimodalItemRuns = List[List[MultimodalItemRun]]
 
 
-def _normalize_item_runs(
-        runs_by_item: MultimodalItemRuns,
-        field_name: str,
-        expected_items: Optional[int] = None) -> MultimodalItemRuns:
-    if not isinstance(runs_by_item, list):
+@dataclass
+class PreparedMultimodalItemRuns:
+    multimodal_item_runs: MultimodalItemRuns
+    multimodal_embedding_lengths: List[int]
+    multimodal_prompt_lengths: List[int]
+    multimodal_item_run_spans: List[List[Tuple[int, int]]]
+
+
+def _unpack_item_run(run: Any, field_name: str, item_idx: int,
+                     run_idx: int) -> Tuple[Any, Any, Any]:
+    if all(
+            hasattr(run, attr)
+            for attr in ("prompt_start", "run_length", "non_embed_offsets")):
+        return run.prompt_start, run.run_length, run.non_embed_offsets
+    if isinstance(run, (list, tuple)) and len(run) == 3:
+        return run
+    raise TypeError(f"{field_name}[{item_idx}][{run_idx}] must be a "
+                    "MultimodalItemRun or "
+                    "(prompt_start, run_length, non_embed_offsets) tuple")
+
+
+def to_binding_multimodal_item_runs(
+    runs_by_item: Optional[MultimodalItemRuns], ) -> Optional[List[List[Any]]]:
+    if runs_by_item is None:
+        return None
+
+    from tensorrt_llm.bindings import executor as tllm_executor
+
+    binding_run_type = tllm_executor.MultimodalItemRun
+    binding_runs = []
+    for item_idx, item_runs in enumerate(runs_by_item):
+        binding_item_runs = []
+        for run_idx, run in enumerate(item_runs):
+            if isinstance(run, binding_run_type):
+                binding_item_runs.append(run)
+                continue
+            prompt_start, run_length, non_embed_offsets = _unpack_item_run(
+                run, "multimodal_item_runs", item_idx, run_idx)
+            if non_embed_offsets is None:
+                non_embed_offsets = []
+            binding_item_runs.append(
+                binding_run_type(prompt_start=int(prompt_start),
+                                 run_length=int(run_length),
+                                 non_embed_offsets=list(non_embed_offsets)))
+        binding_runs.append(binding_item_runs)
+    return binding_runs
+
+
+def _validate_multimodal_hashes(mm_hashes: List[List[int]]) -> None:
+    if not isinstance(mm_hashes, list):
+        raise TypeError("multimodal_hashes must be a list")
+    for item_idx, mm_hash in enumerate(mm_hashes):
+        if not isinstance(mm_hash, list):
+            raise TypeError(f"multimodal_hashes[{item_idx}] must be a list")
+        if len(mm_hash) != 8:
+            raise ValueError(
+                f"multimodal_hashes[{item_idx}] must be a list of 8 integers")
+        if not all(isinstance(hash_part, int) for hash_part in mm_hash):
+            raise TypeError(
+                f"multimodal_hashes[{item_idx}] must contain only integers")
+
+
+def prepare_multimodal_item_runs(
+        mm_hashes: Optional[List[List[int]]],
+        mm_item_runs: MultimodalItemRuns,
+        prompt_len: Optional[int] = None) -> PreparedMultimodalItemRuns:
+    """Validate and derive multimodal item-run metadata in one pass."""
+    if mm_hashes is not None:
+        _validate_multimodal_hashes(mm_hashes)
+    field_name = "multimodal_item_runs"
+    if not isinstance(mm_item_runs, list):
         raise TypeError(f"{field_name} must be a list")
-    if expected_items is not None and len(runs_by_item) != expected_items:
+    if mm_hashes is not None and len(mm_item_runs) != len(mm_hashes):
         raise ValueError(
-            f"{field_name} length ({len(runs_by_item)}) must match "
-            f"multimodal_hashes length ({expected_items})")
+            f"{field_name} length ({len(mm_item_runs)}) must match "
+            f"multimodal_hashes length ({len(mm_hashes)})")
 
     normalized_runs: MultimodalItemRuns = []
-    for item_idx, item_runs in enumerate(runs_by_item):
+    embedding_lengths: List[int] = []
+    prompt_lengths: List[int] = []
+    item_run_spans: List[List[Tuple[int, int]]] = []
+    occupied_runs: List[Tuple[int, int, int, int]] = []
+
+    for item_idx, item_runs in enumerate(mm_item_runs):
         if not isinstance(item_runs, list):
             raise TypeError(f"{field_name}[{item_idx}] must be a list")
         if len(item_runs) == 0:
             raise ValueError(f"{field_name}[{item_idx}] must not be empty")
 
         normalized_item_runs: List[MultimodalItemRun] = []
+        item_embedding_length = 0
+        item_prompt_length = 0
+        item_spans: List[Tuple[int, int]] = []
         previous_end: Optional[int] = None
         for run_idx, run in enumerate(item_runs):
-            if not isinstance(run, (list, tuple)) or len(run) != 3:
-                raise TypeError(
-                    f"{field_name}[{item_idx}][{run_idx}] must be a "
-                    "(prompt_start, run_length, non_embed_offsets) tuple")
-            prompt_start, run_length, non_embed_offsets = run
+            prompt_start, run_length, non_embed_offsets = _unpack_item_run(
+                run, field_name, item_idx, run_idx)
             if not isinstance(prompt_start, int) or not isinstance(
                     run_length, int):
                 raise TypeError(
@@ -60,6 +132,11 @@ def _normalize_item_runs(
                 raise ValueError(
                     f"{field_name}[{item_idx}][{run_idx}] must have positive length"
                 )
+            run_end = prompt_start + run_length
+            if prompt_len is not None and run_end > prompt_len:
+                raise ValueError(
+                    f"{field_name}[{item_idx}][{run_idx}] ends at "
+                    f"{run_end}, exceeding input sequence length {prompt_len}")
             if non_embed_offsets is None:
                 non_embed_offsets = []
             if not isinstance(non_embed_offsets, (list, tuple)):
@@ -85,12 +162,46 @@ def _normalize_item_runs(
                 raise ValueError(
                     f"{field_name}[{item_idx}] must be ordered and non-overlapping"
                 )
+
             normalized_item_runs.append(
                 (prompt_start, run_length, normalized_offsets))
-            previous_end = prompt_start + run_length
-        normalized_runs.append(normalized_item_runs)
+            item_embedding_length += run_length - len(normalized_offsets)
+            item_prompt_length += run_length
+            item_spans.append((prompt_start, run_length))
+            occupied_runs.append((prompt_start, run_end, item_idx, run_idx))
+            previous_end = run_end
 
-    return normalized_runs
+        normalized_runs.append(normalized_item_runs)
+        embedding_lengths.append(item_embedding_length)
+        prompt_lengths.append(item_prompt_length)
+        item_run_spans.append(item_spans)
+
+    occupied_runs.sort()
+    for (_prev_start, prev_end, prev_item_idx,
+         prev_run_idx), (run_start, _, item_idx,
+                         run_idx) in zip(occupied_runs,
+                                         occupied_runs[1:],
+                                         strict=False):
+        if run_start < prev_end:
+            raise ValueError(f"{field_name} must be globally non-overlapping "
+                             f"but [{item_idx}][{run_idx}] overlaps "
+                             f"[{prev_item_idx}][{prev_run_idx}]")
+
+    return PreparedMultimodalItemRuns(
+        multimodal_item_runs=normalized_runs,
+        multimodal_embedding_lengths=embedding_lengths,
+        multimodal_prompt_lengths=prompt_lengths,
+        multimodal_item_run_spans=item_run_spans,
+    )
+
+
+def validate_multimodal_hashes_and_item_runs(
+        mm_hashes: List[List[int]],
+        mm_item_runs: MultimodalItemRuns,
+        prompt_len: Optional[int] = None) -> MultimodalItemRuns:
+    """Validate multimodal hashes and canonical item-run layout metadata."""
+    return prepare_multimodal_item_runs(
+        mm_hashes, mm_item_runs, prompt_len=prompt_len).multimodal_item_runs
 
 
 def _item_run_total_length(item_runs: List[MultimodalItemRun]) -> int:
@@ -142,13 +253,6 @@ def _positions_to_item_runs(
     return runs_by_item
 
 
-def _item_runs_to_positions(item_runs: List[MultimodalItemRun]) -> List[int]:
-    return [
-        position for run_start, run_length, _ in item_runs
-        for position in range(run_start, run_start + run_length)
-    ]
-
-
 def get_multimodal_embedding_lengths(
         item_runs_by_item: MultimodalItemRuns) -> List[int]:
     """Return per-item encoder-output row counts from canonical item runs.
@@ -167,6 +271,13 @@ def get_multimodal_prompt_lengths(
     return [
         _item_run_total_length(item_runs) for item_runs in item_runs_by_item
     ]
+
+
+def get_multimodal_item_run_spans(
+        item_runs_by_item: MultimodalItemRuns) -> List[List[Tuple[int, int]]]:
+    """Return per-item `(prompt_start, run_length)` spans from item runs."""
+    return [[(run_start, run_length) for run_start, run_length, _ in item_runs]
+            for item_runs in item_runs_by_item]
 
 
 def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
@@ -225,37 +336,31 @@ class MultimodalInput:
     returned in KV cache events.
     """
 
+    prompt_len: InitVar[Optional[int]] = None
+    """Optional prompt length used to validate item-run prompt bounds."""
+
     multimodal_embedding_lengths: List[int] = field(init=False)
     """Per-item encoder-output row counts, precomputed from item runs."""
 
     multimodal_prompt_lengths: List[int] = field(init=False)
     """Per-item prompt-owned token counts, precomputed from item runs."""
 
-    def __post_init__(self):
+    multimodal_item_run_spans: List[List[Tuple[int, int]]] = field(init=False)
+    """Per-item prompt spans, precomputed from item runs."""
+
+    def __post_init__(self, prompt_len: Optional[int]):
         """Validate input data structure and consistency."""
-        # Validate multimodal_hashes
-        if not isinstance(self.multimodal_hashes, list):
-            raise TypeError("multimodal_hashes must be a list")
-
-        # Check that hashes are lists of consistent length containing integers
-        if not all(isinstance(h, list) for h in self.multimodal_hashes):
-            raise TypeError("Each element in multimodal_hashes must be a list")
-
-        # Check consistent length of hash arrays
-        hash_lengths = [len(h) for h in self.multimodal_hashes]
-        if min(hash_lengths) != max(hash_lengths):
-            raise ValueError(
-                f"All hash arrays must have the same length, got lengths: {hash_lengths}"
-            )
-
-        self.multimodal_item_runs = _normalize_item_runs(
+        prepared_item_runs = prepare_multimodal_item_runs(
+            self.multimodal_hashes,
             self.multimodal_item_runs,
-            "multimodal_item_runs",
-            expected_items=len(self.multimodal_hashes))
-        self.multimodal_embedding_lengths = get_multimodal_embedding_lengths(
-            self.multimodal_item_runs)
-        self.multimodal_prompt_lengths = get_multimodal_prompt_lengths(
-            self.multimodal_item_runs)
+            prompt_len=prompt_len)
+        self.multimodal_item_runs = prepared_item_runs.multimodal_item_runs
+        self.multimodal_embedding_lengths = (
+            prepared_item_runs.multimodal_embedding_lengths)
+        self.multimodal_prompt_lengths = (
+            prepared_item_runs.multimodal_prompt_lengths)
+        self.multimodal_item_run_spans = (
+            prepared_item_runs.multimodal_item_run_spans)
 
         # Validate multimodal_uuids if provided
         if self.multimodal_uuids is not None:
@@ -277,11 +382,13 @@ class MultimodalInput:
         mm_hashes: List[List[int]],
         mm_item_runs: MultimodalItemRuns,
         mm_uuids: Optional[List[Optional[str]]] = None,
+        prompt_len: Optional[int] = None,
     ) -> 'MultimodalInput':
         return cls(
             multimodal_hashes=mm_hashes,
             multimodal_item_runs=mm_item_runs,
             multimodal_uuids=mm_uuids,
+            prompt_len=prompt_len,
         )
 
 
@@ -1108,7 +1215,7 @@ def find_mm_token_item_runs(
     mm_positions = torch.where(mm_mask)[0].tolist()
     assert len(mm_positions) == sum(
         num_mm_tokens
-    ), f"Number of multimodal tokens does not match sum of all lengths"
+    ), "Number of multimodal tokens does not match sum of all lengths"
 
     mm_embed_flags = embed_mask[mm_mask].tolist()
     item_positions = []
@@ -1124,73 +1231,24 @@ def find_mm_token_item_runs(
     return _positions_to_item_runs(item_positions, item_embed_flags)
 
 
-def _find_mm_token_start_pos_from_masks(
+def _find_mm_special_token_offsets_from_masks(
     mm_mask: torch.Tensor,
     special_mask: Optional[torch.Tensor],
-    num_mm_tokens: List[int],
-) -> Tuple[List[int], List[int]]:
-    """Compute indices where each logical multimodal unit starts from precomputed masks.
+) -> List[int]:
+    """Compute special-token offsets within the flattened multimodal token stream.
 
     Args:
         mm_mask: Boolean tensor; True for multimodal tokens.
         special_mask: Optional boolean tensor for special MM tokens.
-        num_mm_tokens: List of multimodal tokens per logical unit.
 
     Returns:
-        start_positions: Indices where each logical MM unit starts.
-        start_special_token_positions: Indices (within MM tokens) of special tokens.
+        Indices within the flattened MM-token stream where special MM tokens appear.
 
     Example: if MM prompt positions are `[1, 2, 3, 4, 5]` and prompt
-    positions `[3, 5]` are special, returns `start_positions=[1]` and
-    `start_special_token_positions=[2, 4]`.
+    positions `[3, 5]` are special, returns `[2, 4]`.
     """
-    if not torch.any(mm_mask):
-        # Preserve the declared 2-tuple return type so callers can unpack unconditionally.
-        return [], []
+    if not torch.any(mm_mask) or special_mask is None:
+        return []
 
     mm_positions = torch.where(mm_mask)[0]
-
-    if special_mask is not None:
-        start_special_token_positions = torch.where(
-            special_mask[mm_positions])[0].tolist()
-    else:
-        start_special_token_positions = []
-
-    lengths_t = torch.tensor(num_mm_tokens)
-    assert mm_positions.numel() == lengths_t.sum().item(), (
-        f"Number of multimodal tokens ({mm_positions.numel()}) does not match "
-        f"sum of per-unit lengths ({lengths_t.sum().item()}): "
-        f"num_mm_tokens={num_mm_tokens}")
-
-    offsets = torch.zeros(len(num_mm_tokens), dtype=torch.long)
-    if len(num_mm_tokens) > 1:
-        torch.cumsum(lengths_t[:-1], dim=0, out=offsets[1:])
-    start_positions = mm_positions[offsets].tolist()
-
-    return start_positions, start_special_token_positions
-
-
-def validate_mm_item_runs(prompt_token_ids: Union[torch.Tensor, List[int],
-                                                  np.ndarray],
-                          mm_hashes: List[List[int]],
-                          mm_item_runs: MultimodalItemRuns) -> None:
-    """Validate hash-to-item-run alignment and prompt bounds."""
-    normalized_runs = _normalize_item_runs(mm_item_runs,
-                                           "multimodal_item_runs",
-                                           expected_items=len(mm_hashes))
-    prompt_len = len(prompt_token_ids)
-    occupied_runs: List[Tuple[int, int, int, int]] = []
-    for item_idx, item_runs in enumerate(normalized_runs):
-        for run_idx, (run_start, run_length, _) in enumerate(item_runs):
-            run_end = run_start + run_length
-            if run_end > prompt_len:
-                raise AssertionError(
-                    f"multimodal_item_runs[{item_idx}][{run_idx}] ends at "
-                    f"{run_end}, exceeding input sequence length {prompt_len}")
-            for prev_item_idx, prev_run_idx, prev_start, prev_end in occupied_runs:
-                if run_start < prev_end and prev_start < run_end:
-                    raise AssertionError(
-                        "multimodal_item_runs must be globally non-overlapping "
-                        f"but [{item_idx}][{run_idx}] overlaps "
-                        f"[{prev_item_idx}][{prev_run_idx}]")
-            occupied_runs.append((item_idx, run_idx, run_start, run_end))
+    return torch.where(special_mask[mm_positions])[0].tolist()

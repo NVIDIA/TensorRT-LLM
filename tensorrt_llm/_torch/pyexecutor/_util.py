@@ -11,6 +11,7 @@ from tensorrt_llm._torch.models.modeling_utils import \
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
+from tensorrt_llm.inputs.multimodal import to_binding_multimodal_item_runs
 
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
@@ -232,7 +233,8 @@ class KvCacheCreator:
                 req_mm_input = trtllm.MultimodalInput(
                     multimodal_hashes=multimodal_input.multimodal_hashes,
                     multimodal_uuids=multimodal_input.multimodal_uuids,
-                    multimodal_item_runs=multimodal_input.multimodal_item_runs,
+                    multimodal_item_runs=to_binding_multimodal_item_runs(
+                        multimodal_input.multimodal_item_runs),
                 ) if multimodal_input else None
 
                 request = trtllm.Request(prompt_token_ids,
@@ -275,10 +277,9 @@ class KvCacheCreator:
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
         requests = []
-        if (not self._is_disagg
-                and hasattr(self._model_engine.model, "original_arch")
-                and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
-                    self._model_engine.model.original_arch, None)):
+        if hasattr(self._model_engine.model,
+                   "original_arch") and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
+                       self._model_engine.model.original_arch, None):
             requests = self._create_dummy_mm_context_request(input_seq_len)
         # if succeed profiling with multimodal requests then return, otherwise profile
         # with default case

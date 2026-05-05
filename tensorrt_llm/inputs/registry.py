@@ -20,10 +20,10 @@ from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
 from .data import TextPrompt
 from .multimodal import (MultimodalInput, _as_cpu_tensor, _compute_mm_masks,
-                         _find_mm_token_start_pos_from_masks, apply_mm_hashes,
-                         default_hasher, find_mm_token_item_runs,
-                         find_mm_token_lengths, hexdigest_to_int32,
-                         validate_mm_item_runs)
+                         _find_mm_special_token_offsets_from_masks,
+                         apply_mm_hashes, default_hasher,
+                         find_mm_token_item_runs, find_mm_token_lengths,
+                         hexdigest_to_int32)
 
 N = TypeVar("N", bound=Type[nn.Module])
 
@@ -31,8 +31,7 @@ ExtraProcessedInputs = Dict[str, Any]
 
 
 class InputProcessor(Protocol):
-    """
-    Protocol for InputProcessor classes.
+    """Protocol for InputProcessor classes.
     InputProcessor's functions are more relevant to multimodal use cases:
         - Preprocess: extra steps to manipulate the prompts.
         - Forward: the main logic to process the inputs. In multimodal cases, this may run a multimodal encoder model.
@@ -123,8 +122,7 @@ class DefaultInputProcessor(InputProcessor):
 
 
 class BaseMultimodalInputProcessor(ABC):
-    """
-    Base class for multimodal input processors with default implementations
+    """Base class for multimodal input processors with default implementations
     of get_num_tokens_per_image and get_num_tokens_per_video methods.
 
     This class provides default implementations that work with most AutoProcessor-based
@@ -156,8 +154,7 @@ class BaseMultimodalInputProcessor(ABC):
         multimodal_embedding: Dict[str, List[torch.Tensor]],
         sampling_params: SamplingParams,
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        """
-        Handle externally provided multimodal input embeddings.
+        """Handle externally provided multimodal input embeddings.
 
         While inputs["multi_modal_data"] is handled by __call__, this method is intended to process
         inputs["multi_modal_embeddings"].
@@ -197,16 +194,14 @@ class BaseMultimodalInputProcessor(ABC):
 
     @property
     def use_fast(self) -> bool:
-        """
-        Whether to use fast tokenizer for AutoProcessor.
+        """Whether to use fast tokenizer for AutoProcessor.
         Default is True for most multimodal models.
         """
         return self._use_fast
 
     @property
     def multimodal_hashing_supported(self) -> Optional[bool]:
-        """
-        Whether multimodal hashing is supported for this processor.
+        """Whether multimodal hashing is supported for this processor.
 
         Returns None if unknown (will be detected at runtime),
         True if supported, False if not supported.
@@ -269,8 +264,7 @@ class BaseMultimodalInputProcessor(ABC):
 
     @property
     def get_num_multimodal_tokens(self):
-        """
-        Get the Hugging Face processor's '_get_num_multimodal_tokens' method.
+        """Get the Hugging Face processor's '_get_num_multimodal_tokens' method.
         """
         if hasattr(self.processor, '_get_num_multimodal_tokens'):
             return self.processor._get_num_multimodal_tokens
@@ -286,8 +280,7 @@ class BaseMultimodalInputProcessor(ABC):
         image: Union[Image.Image, torch.Tensor],
         **kwargs,
     ):
-        """
-        Calculate the number of tokens generated for an image.
+        """Calculate the number of tokens generated for an image.
 
         This (default) method delegates to the Hugging Face processor's '_get_num_multimodal_tokens' method.
         Accepts either a PIL Image or a CHW `torch.Tensor` — the hashing path
@@ -313,8 +306,7 @@ class BaseMultimodalInputProcessor(ABC):
         video: List[Union[Image.Image, torch.Tensor]],
         **kwargs,
     ):
-        """
-        Calculate the number of tokens generated for a video.
+        """Calculate the number of tokens generated for a video.
 
         This (default) method delegates to the Hugging Face processor's '_get_num_multimodal_tokens' method.
         Accepts a list of PIL Images or CHW `torch.Tensor` frames.
@@ -347,8 +339,7 @@ class BaseMultimodalInputProcessor(ABC):
 
 
 class BaseMultimodalDummyInputsBuilder(ABC):
-    """
-    Base class for generating dummy inputs. Specially for profiling
+    """Base class for generating dummy inputs. Specially for profiling
     """
 
     DEFAULT_IMAGE_MAX_DIM = 16384
@@ -423,10 +414,9 @@ class BaseMultimodalDummyInputsBuilder(ABC):
 
 
 class MultimodalPlaceholderPlacement(enum.Enum):
-    """
-    The placement of the multimodal placeholder in the prompt. Valid values are:
-        - BEFORE_TEXT: the placeholders are placed before the text prompt.
-        - AFTER_TEXT: the placeholders are placed after the text prompt.
+    """The placement of the multimodal placeholder in the prompt. Valid values are:
+    - BEFORE_TEXT: the placeholders are placed before the text prompt.
+    - AFTER_TEXT: the placeholders are placed after the text prompt.
     """
     INVALID = -1
     BEFORE_TEXT = 0
@@ -435,31 +425,30 @@ class MultimodalPlaceholderPlacement(enum.Enum):
 
 @dataclass(frozen=True)
 class MultimodalPlaceholderMetadata:
-    """
-    Metadata for the multimodal placeholder. It has 5 components:
-        - placeholder_map:
-            A mapping from modality to placeholder string.
-            Modality can be "image", "video", "audio", etc.
-        - placeholder_placement:
-            The placement of the placeholders, e.g. before or after the text prompt.
-            Only used when interleave_placeholders is False (the default).
-            Ignored when interleave_placeholders is True.
-        - placeholders_separator:
-            The separator between the placeholders, e.g. some models use "\n" to separate the placeholders.
-        - content_format:
-            Optional override for the content format expected by the chat template.
-            ContentFormat.OPENAI means the template handles multimodal content dicts natively.
-            ContentFormat.STRING means the template expects plain string content.
-            ContentFormat.PASSTHROUGH skips chat template rendering entirely.
-            None means auto-detect at runtime via Jinja AST analysis.
-        - interleave_placeholders:
-            When True and content_parts is available, placeholders are inserted
-            at the exact media positions within the text (interleaved).
-            In this mode, placeholder_placement is ignored - the position of
-            each placeholder is determined by where the media appears in the
-            user's message.
-            When False (default), placeholders are bulk-prepended or appended
-            according to placeholder_placement.
+    """Metadata for the multimodal placeholder. It has 5 components:
+    - placeholder_map:
+        A mapping from modality to placeholder string.
+        Modality can be "image", "video", "audio", etc.
+    - placeholder_placement:
+        The placement of the placeholders, e.g. before or after the text prompt.
+        Only used when interleave_placeholders is False (the default).
+        Ignored when interleave_placeholders is True.
+    - placeholders_separator:
+        The separator between the placeholders, e.g. some models use "\n" to separate the placeholders.
+    - content_format:
+        Optional override for the content format expected by the chat template.
+        ContentFormat.OPENAI means the template handles multimodal content dicts natively.
+        ContentFormat.STRING means the template expects plain string content.
+        ContentFormat.PASSTHROUGH skips chat template rendering entirely.
+        None means auto-detect at runtime via Jinja AST analysis.
+    - interleave_placeholders:
+        When True and content_parts is available, placeholders are inserted
+        at the exact media positions within the text (interleaved).
+        In this mode, placeholder_placement is ignored - the position of
+        each placeholder is determined by where the media appears in the
+        user's message.
+        When False (default), placeholders are bulk-prepended or appended
+        according to placeholder_placement.
     """
     placeholder_map: Dict[str, str] = field(default_factory=dict)
     placeholder_placement: MultimodalPlaceholderPlacement = MultimodalPlaceholderPlacement.AFTER_TEXT
@@ -469,8 +458,7 @@ class MultimodalPlaceholderMetadata:
 
 
 class MultimodalPlaceholderRegistry:
-    """
-    Registry for the multimodal models to keep track of the placeholder information.
+    """Registry for the multimodal models to keep track of the placeholder information.
     """
 
     def __init__(self) -> None:
@@ -586,8 +574,7 @@ INPUT_PROCESSOR_REGISTRY = InputProcessorRegistry()
 
 
 def support_multimodal_disaggregated(model_cls: Type[nn.Module]):
-    """
-    Model-class decorator to declare support for multimodal disaggregated inputs.
+    """Model-class decorator to declare support for multimodal disaggregated inputs.
 
     Apply this to a model class AFTER its input processor has been registered via
     @register_input_processor. The decorator will locate the processor class,
@@ -619,9 +606,9 @@ def register_input_processor(
         processor_cls: Type[InputProcessor],
         model_type: str,
         placeholder_metadata: MultimodalPlaceholderMetadata = None):
-    """
-    Register an input processor to a model class.
-    NOTE:
+    """Register an input processor to a model class.
+
+    Note:
         1. Since this API is only used for multimodal models, we are checking
            the model type only for that.
         2. If this is used for other models in the future, this logic needs to be
@@ -752,7 +739,7 @@ def _get_single_mm_token_lengths(
     if not num_mm_tokens_by_key:
         return None
     # find_mm_token_lengths returns Dict[modality, List[int]], e.g. {"image": [2928, 2928]}.
-    # We need the list of per-item lengths (for _find_mm_token_start_pos_from_masks). We take
+    # We need the list of per-item lengths (for find_mm_token_item_runs). We take
     # the first modality's list; multi-modality is not yet supported
     # (see TODO in multimodal_hashing_process).
     num_mm_tokens = next(iter(num_mm_tokens_by_key.values()))
@@ -824,8 +811,7 @@ def create_input_processor_with_hash(
     def tokenized_multimodal_process(
         inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        """
-        Process prompt_token_ids and multi_modal_data without detokenizing.
+        """Process prompt_token_ids and multi_modal_data without detokenizing.
 
         Runs the input processor with dummy text placeholders for multi-modal slots,
         then replaces placeholder token IDs with the actual feature token IDs and
@@ -880,8 +866,7 @@ def create_input_processor_with_hash(
         precomputed_extra: Optional[ExtraProcessedInputs] = None,
         precomputed_num_mm_tokens: Optional[List[int]] = None,
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        """
-        Process multimodal hashing for media tokens if possible.
+        """Process multimodal hashing for media tokens if possible.
 
         precomputed_token_ids and precomputed_extra must be provided together or
         both be None. When both are provided (tokenized+MM path), skips the
@@ -954,29 +939,31 @@ def create_input_processor_with_hash(
             extra_processed_inputs["multimodal_data"].setdefault(
                 "multimodal_embed_mask_cumsum",
                 embed_mask.cumsum(0, dtype=torch.int64))
-            _, start_special_token_positions = (
-                _find_mm_token_start_pos_from_masks(mm_mask, special_mask,
-                                                    num_mm_tokens))
+            start_special_token_positions = (
+                _find_mm_special_token_offsets_from_masks(
+                    mm_mask, special_mask))
         # Store special token offsets if available
         if len(start_special_token_positions
                ) > 0 and mm_special_token_ids is not None:
             extra_processed_inputs["multimodal_data"][
                 "special_token_offsets"] = start_special_token_positions
-        # flatten the hashes from dict to a single list
-        mm_hashes_flat = [h for hashes in mm_hashes.values() for h in hashes]
-        mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes_flat
-                           ]  # nested list w/ multiple int32 per hash
+        # Flatten and normalize hashes once for validation and request construction.
+        mm_hashes_int32 = [
+            hexdigest_to_int32(h) for hashes in mm_hashes.values()
+            for h in hashes
+        ]
         mm_item_runs = find_mm_token_item_runs(
             input_ids=prompt_token_ids,
             num_mm_tokens=num_mm_tokens,
             vocab_size=vocab_size,
             mm_token_ids=mm_ids,
             mm_special_token_ids=mm_special_token_ids)
-        validate_mm_item_runs(prompt_token_ids, mm_hashes_flat, mm_item_runs)
-
         extra_processed_inputs[
             "multimodal_input"] = MultimodalInput.from_components(
-                mm_hashes_int32, mm_item_runs, mm_uuid_list)
+                mm_hashes_int32,
+                mm_item_runs,
+                mm_uuid_list,
+                prompt_len=len(prompt_token_ids))
         return prompt_token_ids, extra_processed_inputs
 
     def process_tokenized_prompt_maybe_hash(

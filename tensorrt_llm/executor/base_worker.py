@@ -18,6 +18,7 @@ from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
+from ..inputs.multimodal import to_binding_multimodal_item_runs
 from ..llmapi.llm_args import BaseLlmArgs, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
@@ -428,8 +429,8 @@ class BaseWorker(GenerationExecutor):
                 multimodal_input = tllm.MultimodalInput(
                     multimodal_hashes=py_multimodal_input.multimodal_hashes,
                     multimodal_uuids=py_multimodal_input.multimodal_uuids,
-                    multimodal_item_runs=py_multimodal_input.
-                    multimodal_item_runs)
+                    multimodal_item_runs=to_binding_multimodal_item_runs(
+                        py_multimodal_input.multimodal_item_runs))
             # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
             request.multimodal_params.multimodal_input = None
 
