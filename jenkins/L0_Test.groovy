@@ -4502,10 +4502,13 @@ def launchTestJobs(pipeline, testFilter)
     // - PackageSanityCheck stages: force-kept. Their stage names are built
     //   at runtime so the CBTS Python parser cannot see them, and they are
     //   wheel/image gates that should always run after Build.
-    // - Trigger-mode mismatch (cbts.trigger_mode_mismatch): rules resolved
-    //   stages but none match the user's /bot run [--post-merge] mode. The
-    //   filter naturally collapses to PackageSanityCheck only — equivalent
-    //   to "build + sanity, no test cases", similar to /bot run --stage-list "".
+    // - Trigger-mode mismatch (affectedSet empty after Python's pre/post
+    //   filter): rules resolved stages but none match the user's
+    //   /bot run [--post-merge] mode. The filter naturally collapses to
+    //   PackageSanityCheck only — equivalent to "build + sanity, no test
+    //   cases", in spirit similar to /bot run --stage-list "". The Python
+    //   safety net guarantees pre-filter `affected_stages` is non-empty
+    //   whenever `cbts != null`, so empty here unambiguously means mismatch.
     //
     // Pre-merge vs Post-Merge filtering already happened in Python
     // (main.py applies it based on the post_merge flag plumbed through
@@ -4517,7 +4520,7 @@ def launchTestJobs(pipeline, testFilter)
         parallelJobsFiltered = parallelJobs.findAll { key, _ ->
             (affectedSet.contains(key) || key =~ /PackageSanityCheck/) && !(key =~ /Perf/)
         }
-        if (cbts.trigger_mode_mismatch) {
+        if (affectedSet.isEmpty()) {
             echo "CBTS [${cbts.scope}]: trigger-mode mismatch — running only " +
                  "${parallelJobsFiltered.size()} PackageSanityCheck stage(s); no test cases"
         } else if (parallelJobsFiltered) {

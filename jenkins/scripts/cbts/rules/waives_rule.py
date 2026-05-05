@@ -82,7 +82,6 @@ class WaivesRule(Rule):
         if not changed_test_ids:
             return RuleResult(
                 handled_files={WAIVES_FILE},
-                tests=set(),
                 affected_stages=set(),
                 scope="waiveonly",
                 reason="waives.txt: no actionable test ids in diff",
@@ -118,7 +117,6 @@ class WaivesRule(Rule):
             more = f" (+{len(misses) - 3} more)" if len(misses) > 3 else ""
             return RuleResult(
                 handled_files={WAIVES_FILE},
-                tests=changed_test_ids,
                 affected_stages=set(),
                 scope=None,  # Selector treats this as "no decision" → fallback
                 reason=f"waives.txt: {len(misses)} unmatchable waive(s): {preview}{more}",
@@ -132,7 +130,6 @@ class WaivesRule(Rule):
 
         return RuleResult(
             handled_files={WAIVES_FILE},
-            tests=changed_test_ids,
             affected_stages=affected_stage_names,
             scope="waiveonly",
             block_filters=block_filters,

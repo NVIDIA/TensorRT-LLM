@@ -705,9 +705,9 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
 //
 // Upstream decision point. Calls jenkins/scripts/cbts/main.py with the PR's
 // changed_files + diffs; Python self-sources stage configs from L0_Test.groovy
-// and YAML blocks from test-db. Returns a dict {scope, affected_cpu_arch,
-// affected_stages, affected_tests, reasons} or null (= no decision / fall
-// back to the existing filter chain).
+// and YAML blocks from test-db. Returns a dict {scope, affected_stages,
+// reasons, test_db_dir_override, affected_stage_test_counts} or null
+// (= no decision / fall back to the existing filter chain).
 //
 // See jenkins/scripts/cbts/README.md for the consumption model. CBTS only
 // narrows test cases (Layer 2 stage filter + Layer 3 within-stage filter);
@@ -805,9 +805,7 @@ def getCbtsResult(pipeline, testFilter, globalVars)
                           "(Layer 2 stage filtering still applies)")
         }
         pipeline.echo("CBTS: scope=${result.scope}, " +
-                      "archs=${result.affected_cpu_arch}, " +
-                      "stages=${result.affected_stages.size()}, " +
-                      "tests=${result.affected_tests.size()}")
+                      "stages=${result.affected_stages.size()}")
         return result
     } catch (Exception e) {
         pipeline.echo("CBTS failed, falling back to full run: ${e}")
@@ -875,19 +873,13 @@ def _cbtsParseSelectionResult(String text)
     def data = new groovy.json.JsonSlurper().parseText(text)
     return [
         scope: data.scope,
-        affected_cpu_arch: data.affected_cpu_arch ?: [],
         affected_stages: data.affected_stages ?: [],
-        affected_tests: data.tests ?: [],
         reasons: data.reasons ?: [],
         test_db_dir_override: data.test_db_dir_override,  // Layer 3: tmp test-db path
         // Layer 3 split-collapse heuristic: per-stage narrowed test count.
         // launchTestJobs reads this to drop excess pytest-split groups when
         // the affected stage's narrowed count falls below the 20-test threshold.
         affected_stage_test_counts: data.affected_stage_test_counts ?: [:],
-        // True when Python's trigger-mode filter dropped every resolved stage.
-        // Layer 2 reads this to log "build only, no test cases" explicitly,
-        // instead of inferring it from `affected_stages.empty`.
-        trigger_mode_mismatch: data.trigger_mode_mismatch ?: false,
     ]
 }
 

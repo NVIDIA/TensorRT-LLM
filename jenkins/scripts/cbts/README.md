@@ -26,10 +26,13 @@ stage on that arch was affected. Removed: see
 ### Trigger-mode mismatch
 
 If `/bot run` is issued but every CBTS-resolved stage is post-merge (or the
-symmetric case with `--post-merge`), `main.py` records this as
-`trigger_mode_mismatch: true` in its JSON output. Layer 2 then narrows to
-the PackageSanityCheck stages only — equivalent to a build-and-sanity-only
-run, in spirit similar to `/bot run --stage-list ""`.
+symmetric case with `--post-merge`), Python's trigger-mode filter empties
+`affected_stages` while leaving `scope != null`. The Selector safety-net
+guarantees `affected_stages` is never empty BEFORE the filter when
+`scope != null`, so Layer 2 detects the mismatch unambiguously with
+`affectedSet.isEmpty()` and narrows to the PackageSanityCheck stages only
+— equivalent to a build-and-sanity-only run, in spirit similar to
+`/bot run --stage-list ""`.
 
 CBTS only **subtracts** stages and tests, never adds. Anything it can't
 narrow → full fallback to the existing filter chain.
@@ -127,9 +130,7 @@ Decision JSON:
 ```json
 {
   "scope": "waiveonly",
-  "affected_cpu_arch": ["x86"],
   "affected_stages": ["A10-PyTorch-1", "A10-PyTorch-2"],
-  "tests": ["unittest/utils/test_util.py"],
   "reasons": ["[waives] waives.txt: +1 / -0 → 1 blocks, 2 stages"],
   "test_db_dir_override": "cbts_test_db",
   "affected_stage_test_counts": {"A10-PyTorch-1": 5, "A10-PyTorch-2": 5}
@@ -223,9 +224,9 @@ what trt-test-db will eventually render.
 
 2. **Register in `main.py`**: add to `RULE_CLASSES` and `build_rules()`.
 
-3. **No Groovy edits needed.** Layers 1 / 2 / 2.5 / 3 are scope-agnostic and
-   consume `affected_cpu_arch` / `affected_stages` / `block_filters` /
-   `affected_stage_test_counts` directly.
+3. **No Groovy edits needed.** Layers 2 / 2.5 / 3 are scope-agnostic and
+   consume `affected_stages` / `block_filters` / `affected_stage_test_counts`
+   directly.
 
 Rule order is irrelevant. `Selector` unions `affected_stages` and
 `block_filters`; scopes are combined via `_combine_scopes` (all-agree → that

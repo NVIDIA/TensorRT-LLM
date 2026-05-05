@@ -27,8 +27,9 @@ Two invocation modes (see README.md for full context):
       Python self-sources everything else from the repo:
         - stage configs: parsed from jenkins/L0_Test.groovy
         - test-db YAMLs: loaded from tests/integration/test_lists/test-db/
-      Output is a JSON blob on stdout with fields `scope`, `affected_cpu_arch`,
-      `affected_stages`, `tests`, `reasons`. Consumed by `_cbtsParseSelectionResult`
+      Output is a JSON blob on stdout with fields `scope`, `affected_stages`,
+      `reasons`, `test_db_dir_override`, `affected_stage_test_counts`. Consumed
+      by `_cbtsParseSelectionResult`
       on the Groovy side.
 
 Invocation assumes the current working directory is the TRT-LLM repo root,
@@ -83,8 +84,6 @@ class SelectionResult:
 
     scope: Optional[str]
     affected_stages: set[str] = field(default_factory=set)
-    affected_cpu_arch: set[str] = field(default_factory=set)
-    tests: set[str] = field(default_factory=set)
     reasons: list[str] = field(default_factory=list)
     block_filters: dict[tuple[str, int], dict[str, set[str]]] = field(default_factory=dict)
     test_db_dir_override: Optional[str] = None
@@ -92,23 +91,14 @@ class SelectionResult:
     # matches, post-keep-filter). Groovy launchTestJobs uses this to
     # collapse splits to 1 when the count is below the 20-test threshold.
     affected_stage_test_counts: dict[str, int] = field(default_factory=dict)
-    # True iff CBTS resolved at least one stage but the trigger-mode filter
-    # (pre-merge vs post-merge) dropped them all. Distinguishes "this PR's
-    # narrow has nothing in the user's trigger mode" from "no narrow at all".
-    # Layer 2 in Groovy uses this to gate the diagnostic message and to
-    # express the "build only, no cases" no-op explicitly.
-    trigger_mode_mismatch: bool = False
 
     def to_json(self) -> str:
         data = {
             "scope": self.scope,
-            "affected_cpu_arch": sorted(self.affected_cpu_arch),
             "affected_stages": sorted(self.affected_stages),
-            "tests": sorted(self.tests),
             "reasons": list(self.reasons),
             "test_db_dir_override": self.test_db_dir_override,
             "affected_stage_test_counts": dict(self.affected_stage_test_counts),
-            "trigger_mode_mismatch": self.trigger_mode_mismatch,
         }
         return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
@@ -156,17 +146,16 @@ class Selector:
             return SelectionResult(scope=None, reasons=reasons + ["Scopes cannot be combined"])
 
         affected_stages: set[str] = set()
-        tests: set[str] = set()
         for _, r in pairs:
             affected_stages |= r.affected_stages
-            tests |= r.tests
 
         # Safety net: if rules fired but no Jenkins stages resolved (waive ids
         # missed both exact and parent-chain lookups in the YAML index), fall
-        # back to baseline. Returning a non-None scope with empty stages here
-        # is distinct from a trigger-mode mismatch: it means CBTS has nothing
-        # actionable, so we want the existing filter chain to run normally
-        # rather than CBTS-narrowing to PackageSanityCheck only.
+        # back to baseline by returning scope=None. This guarantees an
+        # invariant the Groovy side relies on: any cbts result with
+        # scope!=None has a non-empty pre-filter `affected_stages` set, so
+        # post-filter emptiness unambiguously means trigger-mode mismatch
+        # (Layer 2 falls back to PackageSanityCheck only).
         if not affected_stages:
             return SelectionResult(
                 scope=None,
@@ -176,10 +165,6 @@ class Selector:
                     "granularity mismatch); falling back to baseline."
                 ],
             )
-
-        affected_cpu_arch = {
-            self.stages[name].cpu_arch for name in affected_stages if name in self.stages
-        }
 
         # Aggregate per-block prefix->{waive_ids} maps across rules. Same
         # block keyed by multiple rules: union the waive_ids per prefix.
@@ -193,8 +178,6 @@ class Selector:
         return SelectionResult(
             scope=scope,
             affected_stages=affected_stages,
-            affected_cpu_arch=affected_cpu_arch,
-            tests=tests,
             reasons=reasons,
             block_filters=block_filters,
         )
@@ -325,17 +308,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     else:
         result.affected_stages = {s for s in pre_filter_stages if "Post-Merge" not in s}
     # Recompute derived fields against the filtered set.
-    result.affected_cpu_arch = {
-        stages[name].cpu_arch for name in result.affected_stages if name in stages
-    }
     result.affected_stage_test_counts = {
         k: v for k, v in result.affected_stage_test_counts.items() if k in result.affected_stages
     }
-    # Flag the "build only, no test cases" no-op: rules resolved stages, but
-    # none survive the user's trigger-mode filter. Surfaced to Groovy so the
-    # Layer 2 log can say why — and so future consumers can branch on it
-    # instead of inferring from `not affected_stages`.
-    result.trigger_mode_mismatch = bool(pre_filter_stages and not result.affected_stages)
+    # Note: empty `affected_stages` here (after the trigger-mode filter, with
+    # `scope != None`) means "rules resolved stages but none match the user's
+    # trigger mode" — a.k.a. trigger-mode mismatch. Layer 2 in Groovy detects
+    # this with `affected_stages.isEmpty()` and falls back to PackageSanityCheck
+    # only. The Selector safety-net above ensures we never reach this point
+    # with `affected_stages` empty BEFORE the filter.
 
     _log_decision_to_stderr(stages, result, pr, pre_filter_stages)
     sys.stdout.write(result.to_json())
@@ -367,7 +348,6 @@ def _log_decision_to_stderr(
     print(f"CBTS decision (diagnostic; stderr only) [trigger mode: {mode}]:", file=out)
     print(f"  scope: {result.scope}", file=out)
     print(f"  test_db_dir_override: {result.test_db_dir_override}", file=out)
-    print(f"  affected_cpu_arch: {sorted(result.affected_cpu_arch)}", file=out)
     if dropped:
         print(
             f"  stages dropped by trigger-mode filter ({len(dropped)}, would run if mode flipped):",
@@ -379,9 +359,6 @@ def _log_decision_to_stderr(
         print("  reasons:", file=out)
         for r in result.reasons:
             print(f"    - {r}", file=out)
-    print(f"  affected_tests ({len(result.tests)}):", file=out)
-    for t in sorted(result.tests):
-        print(f"    - {t}", file=out)
     print(f"  block_filters ({len(result.block_filters)} blocks):", file=out)
     for (yaml_stem, idx), prefix_to_waives in sorted(result.block_filters.items()):
         print(f"    - {yaml_stem}#{idx}:", file=out)

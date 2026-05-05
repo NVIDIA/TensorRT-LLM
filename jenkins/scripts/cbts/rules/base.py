@@ -51,7 +51,6 @@ class RuleResult:
     """
 
     handled_files: set[str]
-    tests: set[str]
     affected_stages: set[str]
     scope: Optional[str]
     reason: str
