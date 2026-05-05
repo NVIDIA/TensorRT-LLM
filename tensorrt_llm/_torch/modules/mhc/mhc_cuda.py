@@ -32,14 +32,17 @@ from tensorrt_llm._utils import get_sm_version
 
 @lru_cache(maxsize=1)
 def _fused_hc_mma_supported() -> bool:
-    """tcgen05 TF32 MMA paths (Path B / Path D, "fused_*_mma") require SM100+.
+    """tcgen05 TF32 MMA paths (Path B / Path D, "fused_*_mma") require SM100.
 
-    On pre-SM100 GPUs only the FMA paths (Path E / Path F, "fused_*_fma") are
-    safe to run. Called lazily so the module can still be imported on a host
-    without a CUDA device (e.g. CPU-only lint / typecheck).
+    Match the C++ compile guard for the tcgen05 kernels:
+    __CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1100. On other GPU generations,
+    only the FMA paths (Path E / Path F, "fused_*_fma") are safe to run.
+    Called lazily so the module can still be imported on a host without a CUDA
+    device (e.g. CPU-only lint / typecheck).
     """
     try:
-        return get_sm_version() >= 100
+        sm_version = get_sm_version()
+        return 100 <= sm_version < 110
     except Exception:
         return False
 
@@ -516,6 +519,33 @@ _FUSED_HC_BACKEND_CODE = {
     "fused_all_fma": 3,  # 1-kernel fp32 FMA all-in-one    (Path F)
 }
 
+# The SM100/tcgen05 MMA fused-HC C++ kernels are statically instantiated.
+# FMA fused-HC paths use runtime hidden_size, but MMA paths must be explicitly
+# compiled for each supported hidden size.
+_FUSED_HC_MMA_SUPPORTED_HIDDEN_SIZES = {4096, 7168}
+
+
+def _fused_hc_mma_ks_supported(hidden_size: int, ks: int) -> bool:
+    if hidden_size not in _FUSED_HC_MMA_SUPPORTED_HIDDEN_SIZES:
+        return False
+
+    block_k = 64
+    block_m = 64
+    num_warps = 8
+    warp_size = 32
+    bf16_vec = 8
+
+    if hidden_size % block_k != 0:
+        return False
+    h_tiles = hidden_size // block_k
+    if h_tiles % ks != 0:
+        return False
+
+    toks_per_cta = (block_m + ks - 1) // ks
+    warps_per_tok = num_warps // toks_per_cta if num_warps > toks_per_cta else 1
+    return hidden_size % (warps_per_tok * warp_size * bf16_vec) == 0
+
+
 # Tactics supported by the half-fused FMA path in `mhcFusedHcFmaLaunch`
 # (must stay in sync with the C++ pickFhcFma() table).
 _FUSED_HC_HALF_FMA_TN_KS = (
@@ -733,12 +763,11 @@ _FUSED_HC_FALLBACK_TACTIC_MMA = ("fused_half_mma", 0, 0, 0, 1)
 _FUSED_HC_FALLBACK_TACTIC_FMA = ("fused_half_fma", 2, 1, 256, 1)
 
 
-def _get_fused_hc_fallback_tactic():
-    return (
-        _FUSED_HC_FALLBACK_TACTIC_MMA
-        if _fused_hc_mma_supported()
-        else _FUSED_HC_FALLBACK_TACTIC_FMA
-    )
+def _get_fused_hc_fallback_tactic(hidden_size: int | None = None):
+    mma_ok = _fused_hc_mma_supported()
+    if hidden_size is not None:
+        mma_ok = mma_ok and hidden_size in _FUSED_HC_MMA_SUPPORTED_HIDDEN_SIZES
+    return _FUSED_HC_FALLBACK_TACTIC_MMA if mma_ok else _FUSED_HC_FALLBACK_TACTIC_FMA
 
 
 class MhcFusedHcRunner(TunableRunner):
@@ -810,7 +839,10 @@ class MhcFusedHcRunner(TunableRunner):
         tactics = []
         # The MMA (tcgen05) paths require SM100+. On older archs only the FMA
         # paths are compilable/runnable — we simply never emit MMA tactics.
-        mma_ok = _fused_hc_mma_supported()
+        mma_ks = tuple(
+            ks for ks in _FUSED_HC_HALF_MMA_KS if _fused_hc_mma_ks_supported(self.hidden_size, ks)
+        )
+        mma_ok = _fused_hc_mma_supported() and bool(mma_ks)
         # Path F (fused_all_fma, 1-kernel FMA) — preferred at small M (<=32)
         # where MMA can't fill BLOCK_M=64. Include for M <= 64 as the
         # crossover is measured per-M.
@@ -826,7 +858,7 @@ class MhcFusedHcRunner(TunableRunner):
         # M (>=64). Include when M >= 48 to overlap with Path F at the
         # crossover boundary.
         if mma_ok and M >= 48:
-            for ks in _FUSED_HC_ALL_MMA_KS:
+            for ks in mma_ks:
                 m_tiles = (M + 63) // 64
                 if m_tiles * ks > 148 * 4:
                     continue
@@ -842,7 +874,7 @@ class MhcFusedHcRunner(TunableRunner):
         # Half-fused MMA path (2-kernel) — always an option when tcgen05 is
         # available.
         if mma_ok:
-            for ks in _FUSED_HC_HALF_MMA_KS:
+            for ks in mma_ks:
                 m_tiles = (M + 63) // 64
                 if m_tiles * ks > 148 * 4:
                     continue
@@ -870,7 +902,7 @@ class MhcFusedHcRunner(TunableRunner):
         hc_base_cur = hc_base_cur.to(torch.float32).contiguous()
 
         if tactic == -1:
-            tactic = _get_fused_hc_fallback_tactic()
+            tactic = _get_fused_hc_fallback_tactic(self.hidden_size)
         backend, tile_n, num_k_splits, bigfuse_bs, tile_m = tactic
         backend_code = _FUSED_HC_BACKEND_CODE[backend]
 
