@@ -38,8 +38,8 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.utils import ModelOutput
 
-import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 -- register all ops
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
+from ... import custom_ops  # noqa: F401 -- register all ops
+from ..hf import AutoModelForCausalLMFactory
 
 
 class Qwen3RMSNorm(nn.Module):

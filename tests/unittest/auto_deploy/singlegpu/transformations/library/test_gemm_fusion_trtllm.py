@@ -14,11 +14,11 @@ import torch.nn as nn
 from test_gemm_fusion import TestModel  # type: ignore
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 (registers torch_attention op)
+from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 torch.manual_seed(0)
 

@@ -2,7 +2,6 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
-from tensorrt_llm._torch.modules.linear import W4A16_AWQ_LinearMethod
 
 from ..base_weight_mapper import BaseWeightMapper
 
@@ -57,18 +56,18 @@ class HfWeightMapper(BaseWeightMapper):
 
         return super().should_skip_module(module_name)
 
+    @property
+    def _num_kv_heads(self) -> int:
+        config = self.model.config
+        if hasattr(config, 'num_key_value_heads'
+                   ) and config.num_key_value_heads is not None:
+            return config.num_key_value_heads
+        return config.num_attention_heads
+
     def _duplicate_kv_weights(self, module: nn.Module, new_name: str,
                               weights: dict):
         if new_name in ['k_proj', 'v_proj']:
-            if "weight" not in weights and "bias" not in weights:
-                return weights
-            # k_proj and v_proj shape is [num_kv_heads*head_dim, hidden_dim]
-            kv_shape = weights['weight'].shape[
-                0] if "weight" in weights else weights['bias'].shape[0]
-            if isinstance(module.quant_method, W4A16_AWQ_LinearMethod):
-                num_kv_heads = kv_shape * 2 // self._head_dim
-            else:
-                num_kv_heads = kv_shape // self._head_dim
+            num_kv_heads = self._num_kv_heads
 
             duplicated_keys = ["weight", "bias"]
             if module.quant_config.quant_mode.has_nvfp4():

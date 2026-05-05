@@ -276,7 +276,7 @@ def _create_trtllm_paged_metadata(
     }
 
 
-def _run_trtllm_mla(inputs, meta, kv_lora_rank):
+def _run_trtllm_mla(inputs, meta, kv_lora_rank, rotary_cos_sin=None, out=None):
     """Run the trtllm_mla_with_cache op with proper planner setup."""
     # Reset planner so it re-initializes
     _GlobalTrtllmMLAPlanner.__init__()
@@ -315,6 +315,8 @@ def _run_trtllm_mla(inputs, meta, kv_lora_rank):
         meta["kv_cache"],
         None,  # scale
         kv_lora_rank,
+        rotary_cos_sin=rotary_cos_sin,
+        out=out,
     )
 
 
@@ -359,6 +361,266 @@ def test_trtllm_mla_multi_step(num_heads, batch_size, dtype, device):
         num_decode_steps,
         dtype,
         device,
+    )
+
+
+@pytest.mark.parametrize("num_heads", [4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("device", ["cuda"])
+def test_trtllm_mla_out_buffer_padding(num_heads, dtype, device):
+    """PWCG passes padded inputs and an out= buffer; real-token output must match."""
+    qk_nope_head_dim = 128
+    qk_rope_head_dim = 64
+    kv_lora_rank = 512
+    v_head_dim = 128
+    batch_size = 4
+    prefill_len = 16
+    total_tokens = batch_size * prefill_len
+    padded_tokens = 128
+    page_size = _MLA_TOKENS_PER_BLOCK
+    max_num_pages = batch_size * (prefill_len // page_size + 2)
+
+    inputs = _create_mla_inputs(
+        batch_size,
+        prefill_len,
+        num_heads,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        kv_lora_rank,
+        v_head_dim,
+        dtype,
+        device,
+    )
+
+    real_inputs = {
+        "q_nope": inputs["q_nope"].reshape(1, total_tokens, num_heads, qk_nope_head_dim),
+        "q_pe": inputs["q_pe"].reshape(1, total_tokens, num_heads, qk_rope_head_dim),
+        "compressed_kv": inputs["compressed_kv"].reshape(1, total_tokens, kv_lora_rank),
+        "kpe": inputs["kpe"].reshape(1, total_tokens, 1, qk_rope_head_dim),
+        "kv_b_proj_weight": inputs["kv_b_proj_weight"],
+    }
+    padded_inputs = {
+        name: torch.zeros(
+            1,
+            padded_tokens,
+            *value.shape[2:],
+            dtype=value.dtype,
+            device=value.device,
+        )
+        if name != "kv_b_proj_weight"
+        else value
+        for name, value in real_inputs.items()
+    }
+    for name, value in real_inputs.items():
+        if name != "kv_b_proj_weight":
+            padded_inputs[name][:, :total_tokens].copy_(value)
+
+    real_meta = _create_trtllm_paged_metadata(
+        batch_size,
+        max_num_pages,
+        page_size,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        dtype,
+        device,
+        [prefill_len] * batch_size,
+        [0] * batch_size,
+    )
+    padded_meta = _create_trtllm_paged_metadata(
+        batch_size,
+        max_num_pages,
+        page_size,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        dtype,
+        device,
+        [prefill_len] * batch_size,
+        [0] * batch_size,
+    )
+
+    real_out = _run_trtllm_mla(real_inputs, real_meta, kv_lora_rank)
+    bucket_out = torch.empty(1, padded_tokens, num_heads, v_head_dim, dtype=dtype, device=device)
+    bucket_result = _run_trtllm_mla(real_inputs, real_meta, kv_lora_rank, out=bucket_out)
+
+    assert bucket_result.numel() == 0
+    torch.testing.assert_close(
+        bucket_out[:, :total_tokens],
+        real_out,
+        atol=2e-2,
+        rtol=2e-2,
+    )
+    torch.testing.assert_close(
+        bucket_out[:, total_tokens:],
+        torch.zeros_like(bucket_out[:, total_tokens:]),
+        atol=0,
+        rtol=0,
+    )
+
+    out = torch.empty(1, padded_tokens, num_heads, v_head_dim, dtype=dtype, device=device)
+    out_result = _run_trtllm_mla(padded_inputs, padded_meta, kv_lora_rank, out=out)
+
+    assert out_result.numel() == 0
+    torch.testing.assert_close(
+        out[:, :total_tokens],
+        real_out,
+        atol=2e-2,
+        rtol=2e-2,
+    )
+    torch.testing.assert_close(
+        out[:, total_tokens:],
+        torch.zeros_like(out[:, total_tokens:]),
+        atol=0,
+        rtol=0,
+    )
+
+
+@pytest.mark.parametrize("num_heads", [4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("device", ["cuda"])
+def test_trtllm_mla_fused_rope_out_buffer_padding(num_heads, dtype, device):
+    """Fused-RoPE PWCG path should match pre-rotated MLA while writing out=."""
+    qk_nope_head_dim = 128
+    qk_rope_head_dim = 64
+    kv_lora_rank = 512
+    v_head_dim = 128
+    batch_size = 4
+    prefill_len = 16
+    total_tokens = batch_size * prefill_len
+    padded_tokens = 128
+    page_size = _MLA_TOKENS_PER_BLOCK
+    max_num_pages = batch_size * (prefill_len // page_size + 2)
+
+    inputs = _create_mla_inputs(
+        batch_size,
+        prefill_len,
+        num_heads,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        kv_lora_rank,
+        v_head_dim,
+        dtype,
+        device,
+    )
+
+    positions = torch.arange(prefill_len, device=device).repeat(batch_size)
+    inv_freq = 1.0 / (
+        10000.0
+        ** (
+            torch.arange(0, qk_rope_head_dim // 2, dtype=torch.float32, device=device)
+            / (qk_rope_head_dim // 2)
+        )
+    )
+    freqs = torch.outer(torch.arange(prefill_len, dtype=torch.float32, device=device), inv_freq)
+    emb = torch.cat([freqs, freqs], dim=-1)
+    cos = emb.cos()
+    sin = emb.sin()
+    rotary_cos_sin = torch.stack([cos, sin], dim=-1).reshape(1, -1).contiguous()
+
+    def apply_neox_rope(x):
+        cos_pos = cos[positions].view(1, total_tokens, 1, qk_rope_head_dim).to(x.dtype)
+        sin_pos = sin[positions].view(1, total_tokens, 1, qk_rope_head_dim).to(x.dtype)
+        x_flat = x.reshape(1, total_tokens, *x.shape[2:])
+        x1 = x_flat[..., : qk_rope_head_dim // 2]
+        x2 = x_flat[..., qk_rope_head_dim // 2 :]
+        rotated = torch.cat((-x2, x1), dim=-1)
+        return x_flat * cos_pos + rotated * sin_pos
+
+    pre_rope_inputs = {
+        "q_nope": inputs["q_nope"].reshape(1, total_tokens, num_heads, qk_nope_head_dim),
+        "q_pe": inputs["q_pe"].reshape(1, total_tokens, num_heads, qk_rope_head_dim),
+        "compressed_kv": inputs["compressed_kv"].reshape(1, total_tokens, kv_lora_rank),
+        "kpe": inputs["kpe"].reshape(1, total_tokens, 1, qk_rope_head_dim),
+        "kv_b_proj_weight": inputs["kv_b_proj_weight"],
+    }
+    post_rope_inputs = {
+        **pre_rope_inputs,
+        "q_pe": apply_neox_rope(inputs["q_pe"]),
+        "kpe": apply_neox_rope(inputs["kpe"]),
+    }
+    padded_inputs = {
+        name: torch.zeros(
+            1,
+            padded_tokens,
+            *value.shape[2:],
+            dtype=value.dtype,
+            device=value.device,
+        )
+        if name != "kv_b_proj_weight"
+        else value
+        for name, value in pre_rope_inputs.items()
+    }
+    for name, value in pre_rope_inputs.items():
+        if name != "kv_b_proj_weight":
+            padded_inputs[name][:, :total_tokens].copy_(value)
+
+    real_meta = _create_trtllm_paged_metadata(
+        batch_size,
+        max_num_pages,
+        page_size,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        dtype,
+        device,
+        [prefill_len] * batch_size,
+        [0] * batch_size,
+    )
+    padded_meta = _create_trtllm_paged_metadata(
+        batch_size,
+        max_num_pages,
+        page_size,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        dtype,
+        device,
+        [prefill_len] * batch_size,
+        [0] * batch_size,
+    )
+
+    real_out = _run_trtllm_mla(post_rope_inputs, real_meta, kv_lora_rank)
+    bucket_out = torch.empty(1, padded_tokens, num_heads, v_head_dim, dtype=dtype, device=device)
+    bucket_result = _run_trtllm_mla(
+        pre_rope_inputs,
+        real_meta,
+        kv_lora_rank,
+        rotary_cos_sin=rotary_cos_sin,
+        out=bucket_out,
+    )
+
+    assert bucket_result.numel() == 0
+    torch.testing.assert_close(
+        bucket_out[:, :total_tokens],
+        real_out,
+        atol=2e-2,
+        rtol=2e-2,
+    )
+    torch.testing.assert_close(
+        bucket_out[:, total_tokens:],
+        torch.zeros_like(bucket_out[:, total_tokens:]),
+        atol=0,
+        rtol=0,
+    )
+
+    out = torch.empty(1, padded_tokens, num_heads, v_head_dim, dtype=dtype, device=device)
+    out_result = _run_trtllm_mla(
+        padded_inputs,
+        padded_meta,
+        kv_lora_rank,
+        rotary_cos_sin=rotary_cos_sin,
+        out=out,
+    )
+
+    assert out_result.numel() == 0
+    torch.testing.assert_close(
+        out[:, :total_tokens],
+        real_out,
+        atol=2e-2,
+        rtol=2e-2,
+    )
+    torch.testing.assert_close(
+        out[:, total_tokens:],
+        torch.zeros_like(out[:, total_tokens:]),
+        atol=0,
+        rtol=0,
     )
 
 

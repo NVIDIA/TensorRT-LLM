@@ -71,7 +71,7 @@ class TestConstruction:
         assert vgm.world_size == 1
         assert vgm.cfg_size == 1
         assert vgm.tp_size == 1
-        assert vgm.ring_size == 1
+        assert vgm.cp_size == 1
         assert vgm.ulysses_size == 1
 
     def test_stores_sizes(self):
@@ -84,9 +84,20 @@ class TestConstruction:
         )
         assert vgm.cfg_size == 2
         assert vgm.tp_size == 2
-        assert vgm.ring_size == 1
+        assert vgm.cp_size == 1
         assert vgm.ulysses_size == 2
         assert vgm.world_size == 8
+
+    def test_stores_attn2d_sizes(self):
+        vgm = VisualGenMapping(
+            world_size=4,
+            rank=0,
+            attn2d_row_size=2,
+            attn2d_col_size=2,
+        )
+        assert vgm.attn2d_row_size == 2
+        assert vgm.attn2d_col_size == 2
+        assert vgm.cp_size == 4
 
     def test_product_mismatch_raises(self):
         with pytest.raises(ValueError, match="!= world_size"):
@@ -101,8 +112,8 @@ class TestConstruction:
             VisualGenMapping(world_size=1, rank=0, order="cfg-cfg-tp-ulysses")
 
     def test_custom_order_stored(self):
-        vgm = VisualGenMapping(world_size=1, rank=0, order="ulysses-ring-tp-cfg")
-        assert vgm._dim_names == ("ulysses", "ring", "tp", "cfg")
+        vgm = VisualGenMapping(world_size=1, rank=0, order="ulysses-cp-tp-cfg")
+        assert vgm._dim_names == ("ulysses", "cp", "tp", "cfg")
 
     def test_all_valid_orders(self):
         for perm in itertools.permutations(sorted(_VALID_DIM_NAMES)):
@@ -110,14 +121,41 @@ class TestConstruction:
             vgm = VisualGenMapping(world_size=1, rank=0, order=order)
             assert vgm._dim_names == perm
 
+    def test_ulysses_and_attn2d_raises(self):
+        """Combining Attention2D and Ulysses raises NotImplementedError."""
+        with pytest.raises(NotImplementedError, match="not yet supported"):
+            VisualGenMapping(
+                world_size=4,
+                rank=0,
+                ulysses_size=2,
+                attn2d_row_size=2,
+                attn2d_col_size=1,
+            )
+
+    def test_ring_and_attn2d_raises(self):
+        """Combining ring and Attention2D raises ValueError (both shard the sequence axis)."""
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            VisualGenMapping(
+                world_size=8,
+                rank=0,
+                ring_size=2,
+                attn2d_row_size=2,
+                attn2d_col_size=2,
+            )
+
 
 class TestSingleGPURanksAndGroups:
     def test_ranks_are_zero(self):
         vgm = VisualGenMapping(world_size=1, rank=0)
         assert vgm.cfg_rank == 0
         assert vgm.tp_rank == 0
-        assert vgm.ring_rank == 0
+        assert vgm.cp_rank == 0
         assert vgm.ulysses_rank == 0
+        assert vgm.attn2d_mesh_rank == 0
+
+    def test_attn2d_mesh_rank_aliases_cp_rank(self):
+        vgm = VisualGenMapping(world_size=1, rank=0)
+        assert vgm.attn2d_mesh_rank == vgm.cp_rank
 
     def test_is_cfg_conditional(self):
         vgm = VisualGenMapping(world_size=1, rank=0)
@@ -126,9 +164,15 @@ class TestSingleGPURanksAndGroups:
     def test_groups_return_single_process_group(self):
         vgm = VisualGenMapping(world_size=1, rank=0)
         assert vgm.ulysses_group is not None
-        assert vgm.ring_group is not None
+        assert vgm.cp_group is not None
         assert vgm.tp_group_pg is not None
         assert vgm.cfg_group is not None
+
+    def test_attn2d_row_col_groups_none_without_attn2d(self):
+        """Row/col groups are None when Attention2D is not active."""
+        vgm = VisualGenMapping(world_size=1, rank=0)
+        assert vgm.attn2d_row_group is None
+        assert vgm.attn2d_col_group is None
 
 
 class TestToLlmMapping:
@@ -162,7 +206,7 @@ class TestToLlmMapping:
 
 
 def _logic_default_order_cfg2_ulysses2(rank, world_size):
-    """Default order cfg-tp-ring-ulysses with cfg=2, ulysses=2 on 4 GPUs.
+    """Default order cfg-tp-cp-ulysses with cfg=2, ulysses=2 on 4 GPUs.
 
     Expected rank layout (outermost=cfg, innermost=ulysses):
         Rank 0: cfg=0, ulysses=0  (conditional, ulysses group 0)
@@ -184,7 +228,7 @@ def _logic_default_order_cfg2_ulysses2(rank, world_size):
     assert vgm.cfg_rank == rank // 2
     assert vgm.ulysses_rank == rank % 2
     assert vgm.tp_rank == 0
-    assert vgm.ring_rank == 0
+    assert vgm.cp_rank == 0
     assert vgm.is_cfg_conditional == (rank < 2)
 
     assert vgm.cfg_group is not None
@@ -200,7 +244,7 @@ def _logic_default_order_cfg2_ulysses2(rank, world_size):
 
 
 def _logic_custom_order_ulysses_outermost(rank, world_size):
-    """Custom order ulysses-ring-tp-cfg with cfg=2, ulysses=2 on 4 GPUs.
+    """Custom order ulysses-cp-tp-cfg with cfg=2, ulysses=2 on 4 GPUs.
 
     Expected rank layout (outermost=ulysses, innermost=cfg):
         Rank 0: ulysses=0, cfg=0
@@ -217,7 +261,7 @@ def _logic_custom_order_ulysses_outermost(rank, world_size):
         rank=rank,
         cfg_size=2,
         ulysses_size=2,
-        order="ulysses-ring-tp-cfg",
+        order="ulysses-cp-tp-cfg",
     )
 
     assert vgm.ulysses_rank == rank // 2
@@ -233,7 +277,7 @@ def _logic_custom_order_ulysses_outermost(rank, world_size):
 def _logic_allreduce_over_tp_group(rank, world_size):
     """Verify TP group works for collective ops (tp=2, ulysses=2 on 4 GPUs).
 
-    Default order cfg-tp-ring-ulysses with cfg=1, tp=2, ring=1, ulysses=2:
+    Default order cfg-tp-cp-ulysses with cfg=1, tp=2, cp=1, ulysses=2:
         Rank 0: tp=0, ulysses=0
         Rank 1: tp=0, ulysses=1
         Rank 2: tp=1, ulysses=0
@@ -268,6 +312,47 @@ def _logic_allreduce_over_tp_group(rank, world_size):
     )
 
 
+def _logic_attn2d_mesh_rank_and_group(rank, world_size):
+    """attn2d_mesh_rank aliases cp_rank and attn2d_mesh_group works for collectives (2x2 mesh).
+
+    Default order cfg-tp-cp-ulysses with attn2d 2x2 (cp_size=4), cfg=1, tp=1, ulysses=1:
+        Rank 0: cp=0  (attn2d_mesh_rank=0)
+        Rank 1: cp=1  (attn2d_mesh_rank=1)
+        Rank 2: cp=2  (attn2d_mesh_rank=2)
+        Rank 3: cp=3  (attn2d_mesh_rank=3)
+    All 4 ranks are in a single CP group covering the full attn2d mesh.
+    """
+    from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
+
+    DeviceMeshTopologyImpl.device_mesh = None
+
+    vgm = VisualGenMapping(
+        world_size=world_size,
+        rank=rank,
+        attn2d_row_size=2,
+        attn2d_col_size=2,
+    )
+
+    # attn2d_mesh_rank must equal cp_rank on every rank
+    assert vgm.attn2d_mesh_rank == vgm.cp_rank, (
+        f"Rank {rank}: attn2d_mesh_rank={vgm.attn2d_mesh_rank} != cp_rank={vgm.cp_rank}"
+    )
+    assert vgm.cp_rank == rank, f"Rank {rank}: expected cp_rank={rank}, got {vgm.cp_rank}"
+
+    # attn2d_mesh_group must span all 4 ranks (full CP group)
+    assert vgm.attn2d_mesh_group is not None
+    cp_pg_size = dist.get_world_size(vgm.attn2d_mesh_group)
+    assert cp_pg_size == 4, f"Rank {rank}: expected cp group size 4, got {cp_pg_size}"
+
+    # Verify attn2d_mesh_group works for actual collective ops
+    device = torch.device(f"cuda:{rank}")
+    tensor = torch.ones(1, device=device)
+    dist.all_reduce(tensor, group=vgm.attn2d_mesh_group)
+    assert tensor.item() == float(world_size), (
+        f"Rank {rank}: expected all_reduce sum {world_size}, got {tensor.item()}"
+    )
+
+
 @pytest.mark.skipif(not MODULES_AVAILABLE, reason="Modules not available")
 class TestMultiGPU:
     def test_default_order_cfg2_ulysses2(self):
@@ -278,3 +363,7 @@ class TestMultiGPU:
 
     def test_allreduce_over_tp_group(self):
         _run_multi_gpu(4, _logic_allreduce_over_tp_group)
+
+    def test_attn2d_mesh_rank_and_group(self):
+        """attn2d_mesh_rank aliases cp_rank and attn2d_mesh_group supports collectives."""
+        _run_multi_gpu(4, _logic_attn2d_mesh_rank_and_group)
