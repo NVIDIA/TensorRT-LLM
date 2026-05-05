@@ -46,8 +46,8 @@ from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 
-from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
-                      prefer_pinned)
+from .._utils import (_str_to_torch_dtype_dict, is_device_integrated, is_sm_100f,
+                      mpi_rank, prefer_pinned)
 
 # yapf: disable
 # isort: off
@@ -3213,6 +3213,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "but increase compute cost. Only used when mamba_ssm_stochastic_rounding is enabled."
     )
 
+    unified_memory_detected: Optional[bool] = Field(
+        default=None,
+        description=
+        "Whether this device has unified CPU-GPU memory (e.g. DGX Spark, Jetson). "
+        "When None (default), auto-detects via is_device_integrated(). "
+        "When True, host_cache_size is forced to 0 since there is no separate "
+        "host DRAM to offload to.")
+
     tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
 
@@ -3367,6 +3375,33 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "kv_cache_config.max_util_for_resume must be between 0 and 1")
         return v
+
+    @model_validator(mode='after')
+    def apply_unified_memory_defaults(self) -> 'KvCacheConfig':
+        """Auto-detect unified memory and adjust KV cache defaults.
+
+        On unified memory systems (e.g. Grace Blackwell / DGX Spark), CPU and GPU
+        share the same physical LPDDR5x pool. KV cache offload is a no-op and the
+        host_cache_size budget should be folded into the primary GPU pool. The C++
+        runtime handles the actual optimization transparently; this validator logs
+        the detection and adjusts Python-level defaults for clarity.
+        """
+        if self.unified_memory_detected is None:
+            try:
+                unified = is_device_integrated()
+            except RuntimeError:
+                logger.debug("Unified-memory auto-detection failed; "
+                             "defaulting to disabled")
+                unified = False
+            object.__setattr__(self, 'unified_memory_detected', unified)
+
+        if self.unified_memory_detected:
+            if self.host_cache_size and self.host_cache_size > 0:
+                logger.info(
+                    "Unified memory detected: setting host_cache_size to 0 "
+                    "(secondary pool is meaningless on unified memory)")
+                object.__setattr__(self, "host_cache_size", 0)
+        return self
 
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
