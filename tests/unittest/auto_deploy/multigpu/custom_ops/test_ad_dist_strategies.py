@@ -15,6 +15,7 @@ from utils.cpp_paths import llm_root  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     AllGatherStrategy,
+    DistBackend,
     ShardingTransformConfig,
     ShardingTransformContainer,
     SplitDimension,
@@ -417,10 +418,15 @@ def test_allgather_strategy_propagation(strategy):
 
     Mirrors test_allreduce_strategy_propagation: when we set an
     allgather_strategy on the ShardingConfig, it must reach the
-    torch_dist_all_gather (or trtllm_dist_all_gather) node's args at
-    the position the dist op expects (2nd positional, immediately after
-    the input tensor — strategy is required and intentionally placed
-    early so callers can't drop it by accident).
+    trtllm_dist_all_gather node's args at the position the dist op
+    expects (2nd positional, immediately after the input tensor —
+    strategy is required and intentionally placed early so callers
+    can't drop it by accident).
+
+    The test forces dist_backend=TRTLLM because only the TRT-LLM
+    allgather op carries a strategy — the torch (demollm) backend op is
+    a plain torch.distributed all_gather with signature (tensor, dim=0)
+    and intentionally exposes no strategy/symm_mem knobs.
     """
 
     # Same SimpleMLP as the allreduce variant — keeps the two tests symmetric.
@@ -445,11 +451,15 @@ def test_allgather_strategy_propagation(strategy):
     linear1_node, _ = linear_nodes[0], linear_nodes[1]
 
     rank, world_size = 0, 4
+    # Force the trtllm backend so the emitter takes the strategy-bearing path
+    # regardless of whether the test runs under MPI (single-process pytest
+    # would otherwise fall back to the torch backend, which is now strategy-free).
     config = ShardingTransformConfig(
         rank=rank,
         world_size=world_size,
         stage="sharding",
         allgather_strategy=AllGatherStrategy[strategy],
+        dist_backend=DistBackend.TRTLLM,
     )
     sharding_container = ShardingTransformContainer(config=config)
 
@@ -481,19 +491,15 @@ def test_allgather_strategy_propagation(strategy):
 
     recompile(gm)
 
-    # _get_dist_ops uses TRT-LLM ops only when running under MPI
-    # (is_ompi()); single-process pytest falls back to torch_dist_*.
-    # Accept either op so the test stays correct in both runners.
+    # We forced dist_backend=TRTLLM above, so the emitted op must be the
+    # TRT-LLM allgather regardless of MPI availability.
     allgather_nodes = [
-        node
-        for node in gm.graph.nodes
-        if is_op(node, torch.ops.auto_deploy.torch_dist_all_gather)
-        or is_op(node, torch.ops.auto_deploy.trtllm_dist_all_gather)
+        node for node in gm.graph.nodes if is_op(node, torch.ops.auto_deploy.trtllm_dist_all_gather)
     ]
     assert len(allgather_nodes) == 1, f"Expected 1 allgather node, found {len(allgather_nodes)}"
     allgather_node = allgather_nodes[0]
 
-    # Op signature: (tensor, strategy, dim=0, sizes=None, workspace_id=0).
+    # trtllm_dist_all_gather signature: (tensor, strategy, dim=0, sizes=None, workspace_id=0).
     # The column+all_gather emit path passes (input, strategy_name, -1,
     # None); workspace_id may or may not be explicit, so accept either 4
     # or 5 positional args.

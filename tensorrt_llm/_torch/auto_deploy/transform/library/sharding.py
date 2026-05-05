@@ -930,15 +930,13 @@ class BMMShardingInfo(ShardingTransformInfo):
         handle_tensor(node, rhs_tensor, 1, self.start_idx, self.end_idx)
 
         # Add all_gather node after BMM to collect results.
-        # NOTE: BMM sharding is not backend-aware (always torch_dist_all_gather),
-        # but we still honor the user-configured allgather_strategy from the
-        # ShardingTransformConfig. The op signature is
-        # (tensor, strategy, dim=0, ...); strategy is required.
-        allgather_strategy = self.config.allgather_strategy.name
+        # BMM sharding always uses the torch (demollm) backend, which is a
+        # plain torch.distributed all_gather and has no strategy/symm_mem
+        # knobs. Op signature is (tensor, dim=0).
         with gm.graph.inserting_after(node):
             gather_node = gm.graph.call_function(
                 torch.ops.auto_deploy.torch_dist_all_gather.default,
-                args=(node, allgather_strategy, 0),  # Gather along batch dim (0)
+                args=(node, 0),  # Gather along batch dimension (0)
             )
             node.replace_all_uses_with(gather_node)
             gather_node.replace_input_with(gather_node, node)
@@ -1823,12 +1821,18 @@ def _shard_parameter_node(
 
     # figure out the right dist op (backend-aware) — strategies flow as op args
     all_gather_op, all_reduce_op = _get_dist_ops(config.dist_backend)
-    allgather_strategy = config.allgather_strategy.name
-    # all_gather op signature: (tensor, strategy, dim=0, sizes=None, workspace_id=0).
-    # strategy is required (no default) so the caller cannot accidentally drop
-    # the AD-config-selected strategy when emitting the op into the graph.
+    # Per-backend allgather op signatures:
+    #   trtllm_dist_all_gather(tensor, strategy, dim=0, sizes=None, workspace_id=0)
+    #   torch_dist_all_gather(tensor, dim=0)   # demollm only — no strategy
+    # `strategy` is required on the trtllm op (no default) so the caller cannot
+    # accidentally drop the AD-config-selected strategy. The torch op is a plain
+    # torch.distributed all_gather and intentionally has no strategy/symm_mem.
+    if all_gather_op is torch.ops.auto_deploy.trtllm_dist_all_gather.default:
+        allgather_args = (config.allgather_strategy.name, -1, None)
+    else:
+        allgather_args = (-1,)
     dist_lookup = {
-        0: (all_gather_op, allgather_strategy, -1, None),
+        0: (all_gather_op, *allgather_args),
         1: (all_reduce_op, allreduce_strategy),
     }
     fn_dist, *dist_args = dist_lookup[dim]
