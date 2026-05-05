@@ -38,8 +38,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, TokenIdExt,
                                                       _KVCache)
-from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
-    gen_multi_modal_tokens
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import (BAD_PAGE_INDEX,
                                                               GPU_LEVEL)
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
@@ -2459,10 +2457,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
         Multimodal placeholder tokens (e.g. image_token_id) share the same ID
         regardless of the underlying content. This method replaces each
-        multimodal token region with TokenIdExt values produced by
-        gen_multi_modal_tokens(), embedding the content digest (Blake3 hash)
-        into the token sequence so that the radix tree can distinguish blocks
-        belonging to different images/videos.
+        multimodal token region with TokenIdExt values that embed the content
+        digest (Blake3 hash) into the token sequence so that the radix tree can
+        distinguish blocks belonging to different images/videos.
 
         When *start*/*end* are given, only the slice ``tokens[start:end]`` is
         materialized and returned. This avoids re-augmenting the full prompt
@@ -2474,10 +2471,12 @@ class KVCacheManagerV2(BaseResourceManager):
             end = len(tokens)
         is_sliced = start != 0 or end != len(tokens)
 
-        if req.multimodal_hashes is None:
+        multimodal_hashes = req.multimodal_hashes
+        if multimodal_hashes is None:
             return tokens[start:end] if is_sliced else tokens
 
         result: list[TokenIdExt] = list(tokens[start:end])
+        vocab_size = self.vocab_size
 
         def _hash_ints_to_digest(hash_ints: Sequence[int]) -> bytes:
             # Convert 8 x int32 hash to 32-byte digest (big-endian,
@@ -2488,34 +2487,47 @@ class KVCacheManagerV2(BaseResourceManager):
             return b''.join(
                 v.to_bytes(4, 'big', signed=True) for v in hash_ints)
 
+        def _multi_modal_token_slice(digest: bytes, mm_offset: int,
+                                     length: int) -> list[TokenIdExt]:
+            mm_tokens = list(
+                range(vocab_size + mm_offset, vocab_size + mm_offset + length))
+            if mm_offset == 0:
+                mm_tokens[0] = digest
+            return mm_tokens
+
         multimodal_prompt_lengths = getattr(req, "multimodal_prompt_lengths",
                                             None)
-        item_run_spans = getattr(req, "py_multimodal_item_run_spans", None)
+        item_run_spans = getattr(req, "multimodal_item_run_spans", None)
         if multimodal_prompt_lengths is None or item_run_spans is None:
             raise ValueError(
                 "multimodal item-run span metadata must be prevalidated on LlmRequest before block reuse"
             )
+        if len(multimodal_prompt_lengths) != len(multimodal_hashes):
+            raise ValueError(
+                "multimodal prompt length count must match multimodal hash count"
+            )
 
-        for hash_ints, item_length, run_spans in zip(req.multimodal_hashes,
-                                                     multimodal_prompt_lengths,
-                                                     item_run_spans,
-                                                     strict=True):
-            digest = _hash_ints_to_digest(hash_ints)
-            mm_tokens = gen_multi_modal_tokens(self.vocab_size, digest,
-                                               item_length)
+        for hash_ints, run_spans in zip(multimodal_hashes,
+                                        item_run_spans,
+                                        strict=True):
+            digest = None
             hash_offset = 0
             for run_start, run_length in run_spans:
                 run_end = run_start + run_length
-                if run_end <= start or run_start >= end:
+                if run_end <= start:
                     hash_offset += run_length
                     continue
+                if run_start >= end:
+                    break
                 overlap_start = max(run_start, start)
                 overlap_end = min(run_end, end)
                 result_offset = overlap_start - start
                 mm_offset = hash_offset + overlap_start - run_start
                 n = overlap_end - overlap_start
+                if digest is None:
+                    digest = _hash_ints_to_digest(hash_ints)
                 result[result_offset:result_offset +
-                       n] = mm_tokens[mm_offset:mm_offset + n]
+                       n] = _multi_modal_token_slice(digest, mm_offset, n)
                 hash_offset += run_length
         return result
 

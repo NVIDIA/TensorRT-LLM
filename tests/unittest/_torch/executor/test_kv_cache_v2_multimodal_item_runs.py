@@ -46,6 +46,7 @@ OTHER_HASH_INTS = [
     0x3A3B3C3D,
     0x3E3F4041,
 ]
+_DEFAULT_MM_HASHES = object()
 
 
 def _digest(hash_ints):
@@ -72,7 +73,7 @@ def _make_request(
         multimodal_hashes=multimodal_hashes,
         multimodal_item_runs=multimodal_item_runs,
         multimodal_prompt_lengths=multimodal_prompt_lengths,
-        py_multimodal_item_run_spans=item_run_spans,
+        multimodal_item_run_spans=item_run_spans,
         sampling_config=sampling_config,
     )
 
@@ -96,7 +97,9 @@ def _derive_prompt_metadata(multimodal_item_runs):
     return multimodal_prompt_lengths, item_run_spans
 
 
-def _make_llm_request(multimodal_item_runs, multimodal_hashes=None):
+def _make_llm_request(multimodal_item_runs, multimodal_hashes=_DEFAULT_MM_HASHES):
+    if multimodal_hashes is _DEFAULT_MM_HASHES:
+        multimodal_hashes = [HASH_INTS]
     sampling_config = tensorrt_llm.bindings.SamplingConfig(SamplingParams()._get_sampling_config())
     return LlmRequest(
         request_id=0,
@@ -106,7 +109,7 @@ def _make_llm_request(multimodal_item_runs, multimodal_hashes=None):
         is_streaming=False,
         end_id=2,
         pad_id=0,
-        multimodal_hashes=multimodal_hashes or [HASH_INTS],
+        multimodal_hashes=multimodal_hashes,
         multimodal_uuids=None,
         multimodal_item_runs=multimodal_item_runs,
     )
@@ -120,14 +123,14 @@ class _RequestLike:
         multimodal_hashes=None,
         multimodal_item_runs=None,
         multimodal_prompt_lengths=None,
-        py_multimodal_item_run_spans=None,
+        multimodal_item_run_spans=None,
         sampling_config=None,
     ):
         self._prompt_tokens = prompt_tokens
         self.multimodal_hashes = multimodal_hashes
         self.multimodal_item_runs = multimodal_item_runs
         self.multimodal_prompt_lengths = multimodal_prompt_lengths
-        self.py_multimodal_item_run_spans = py_multimodal_item_run_spans
+        self.multimodal_item_run_spans = multimodal_item_run_spans
         self.sampling_config = sampling_config
 
     def get_tokens(self, beam_idx):
@@ -151,6 +154,26 @@ def test_item_runs_replace_only_exact_sparse_prompt_coverage():
     assert _augment(req, start=3, end=4) == [DIGEST_TOKENS[1]]
 
 
+def test_block_reuse_uses_prederived_public_item_run_spans():
+    # Intentional mismatch: resource_manager must consume the public
+    # LlmRequest-derived span cache, not recompute spans from item runs.
+    req = _RequestLike(
+        PROMPT_TOKENS,
+        multimodal_hashes=[HASH_INTS],
+        multimodal_item_runs=[[(1, 2, [])]],
+        multimodal_prompt_lengths=[2],
+        multimodal_item_run_spans=[[(1, 1), (3, 1)]],
+    )
+
+    assert _augment(req) == [
+        TEXT_BEFORE,
+        DIGEST_TOKENS[0],
+        TEXT_GAP,
+        DIGEST_TOKENS[1],
+        TEXT_AFTER,
+    ]
+
+
 def test_non_embed_offsets_do_not_reduce_cache_hash_prompt_coverage():
     prompt_tokens = [TEXT_BEFORE, MM_PLACEHOLDER, 777, MM_PLACEHOLDER, TEXT_AFTER]
     req = _RequestLike(
@@ -158,7 +181,7 @@ def test_non_embed_offsets_do_not_reduce_cache_hash_prompt_coverage():
         multimodal_hashes=[HASH_INTS],
         multimodal_item_runs=[[(1, 3, [1])]],
         multimodal_prompt_lengths=[3],
-        py_multimodal_item_run_spans=[[(1, 3)]],
+        multimodal_item_run_spans=[[(1, 3)]],
     )
 
     assert _augment(req) == [
@@ -228,8 +251,8 @@ def test_multiple_items_replace_sparse_runs_across_slices():
     [
         ([[(1, 1), (3, 1)]], "prompt_start, run_length, non_embed_offsets"),
         ([[((1, 1), []), ((3, 1), [])]], "prompt_start, run_length, non_embed_offsets"),
-        ([[(1, 1, []), (99, 1, [])]], "outside prompt"),
-        ([[(-1, 1, []), (3, 1, [])]], "outside prompt"),
+        ([[(1, 1, []), (99, 1, [])]], "exceeding input sequence length"),
+        ([[(-1, 1, []), (3, 1, [])]], "negative positions"),
         ([[(1, 2, []), (2, 1, [])]], "ordered and non-overlapping"),
         ([[(1, 0, []), (3, 1, [])]], "positive length"),
     ],
@@ -245,6 +268,16 @@ def test_direct_llm_request_rejects_global_item_run_overlap():
             [[(1, 2, [])], [(2, 1, [])]],
             multimodal_hashes=[HASH_INTS, OTHER_HASH_INTS],
         )
+
+
+def test_direct_llm_request_allows_item_runs_without_hashes_as_cache_fallback():
+    req = _make_llm_request([[(1, 1, [])]], multimodal_hashes=None)
+
+    assert req.multimodal_hashes is None
+    assert req.multimodal_embedding_lengths == [1]
+    assert req.multimodal_prompt_lengths == [1]
+    assert req.multimodal_item_run_spans == [[(1, 1)]]
+    assert _augment(req) == PROMPT_TOKENS
 
 
 def test_same_hash_with_different_exact_runs_has_distinct_cache_keys():
