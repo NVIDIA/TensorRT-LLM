@@ -10,6 +10,8 @@ from tensorrt_llm._torch.models.modeling_llava_next import \
     LlavaNextInputProcessor
 from tensorrt_llm._torch.models.modeling_qwen2vl import \
     Qwen2VLInputProcessorBase
+from tensorrt_llm._torch.models.modeling_qwen3vl import \
+    Qwen3VLInputProcessorBase
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.inputs import default_multimodal_input_loader
 from tensorrt_llm.inputs.utils import load_image, load_video
@@ -41,6 +43,11 @@ def multimodal_model_configs():
             'hf_model_dir': 'Qwen/Qwen2.5-VL-3B-Instruct',
             'model_dir': llm_models_root() / "Qwen2.5-VL-3B-Instruct",
             'model_type': 'qwen2_5_vl',
+        },
+        'qwen3-vl': {
+            'hf_model_dir': 'Qwen/Qwen3-VL-8B-Instruct',
+            'model_dir': llm_models_root() / "Qwen3" / "Qwen3-VL-8B-Instruct",
+            'model_type': 'qwen3_vl',
         },
     }
     return model_configs
@@ -160,6 +167,7 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
 
 @pytest.mark.parametrize("model_key", [
     "qwen2.5-vl",
+    "qwen3-vl",
 ])
 def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
     """Test that get_num_tokens_per_video predicts the correct number of tokens.
@@ -200,6 +208,12 @@ def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
                 trust_remote_code=True)
         elif model_type == 'qwen2_5_vl':
             input_processor = Qwen2VLInputProcessorBase(
+                model_path=encoder_model_dir,
+                config=model_config_dict,
+                tokenizer=tokenizer,
+                trust_remote_code=True)
+        elif model_type == 'qwen3_vl':
+            input_processor = Qwen3VLInputProcessorBase(
                 model_path=encoder_model_dir,
                 config=model_config_dict,
                 tokenizer=tokenizer,
@@ -250,6 +264,9 @@ def test_get_num_tokens_per_video(model_key, multimodal_model_configs):
                 predicted_num_tokens = input_processor.get_num_tokens_per_video(
                     video=video_data.frames)
             elif model_type == 'qwen2_5_vl':
+                predicted_num_tokens = input_processor.get_num_tokens_per_video(
+                    video=video_data.frames)
+            elif model_type == 'qwen3_vl':
                 predicted_num_tokens = input_processor.get_num_tokens_per_video(
                     video=video_data.frames)
 

@@ -14,19 +14,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Create a standalone auto_deploy package from the TensorRT-LLM source tree.
+"""Create a standalone llmc package from the TensorRT-LLM source tree.
 
-This script copies auto_deploy source files and tests into a standalone
-pip-installable package. The output directory can be pushed directly to the
-standalone repository.
+This script copies the ``tensorrt_llm/_torch/auto_deploy`` source tree and
+tests into a standalone pip-installable package. The output directory can
+be pushed directly to the read-only standalone repository.
 
 Usage:
     python create_standalone_package.py [--output-dir /path/to/output]
 
-The generated package uses ``auto_deploy`` as the top-level package name:
+The generated package uses ``llmc`` as the top-level Python package name and
+``nvidia-llmc`` as the distribution name:
 
-    from auto_deploy._compat import TRTLLM_AVAILABLE
-    from auto_deploy.custom_ops.attention_interface import SequenceInfo
+    from llmc._compat import TRTLLM_AVAILABLE
+    from llmc.custom_ops.attention_interface import SequenceInfo
+
+The ``auto_deploy`` source tree itself is copied verbatim — internal imports
+must already be relative (enforced by the
+``auto-deploy-import-discipline`` pre-commit hook), so no source rewriting
+is required. Test files use absolute ``tensorrt_llm._torch.auto_deploy``
+imports by design and ARE rewritten to ``llmc`` on copy.
 """
 
 import argparse
@@ -36,18 +43,24 @@ import shutil
 import sys
 import textwrap
 
+from _license_data import VENDORED_PROJECTS, generate_attributions, generate_license
+
 # ---------------------------------------------------------------------------
 # Path constants
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
+REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", ".."))
 AUTO_DEPLOY_SRC = os.path.join(REPO_ROOT, "tensorrt_llm", "_torch", "auto_deploy")
 TRTLLM_REQUIREMENTS = os.path.join(REPO_ROOT, "requirements.txt")
 TRTLLM_DEV_REQUIREMENTS = os.path.join(REPO_ROOT, "requirements-dev.txt")
 TRTLLM_LICENSE = os.path.join(REPO_ROOT, "LICENSE")
 TRTLLM_GITIGNORE = os.path.join(REPO_ROOT, ".gitignore")
-AD_README = os.path.join(SCRIPT_DIR, "README.md")
-AD_CONTRIBUTING = os.path.join(SCRIPT_DIR, "CONTRIBUTING.md")
+TRTLLM_EDITORCONFIG = os.path.join(REPO_ROOT, ".editorconfig")
+TRTLLM_CODE_OF_CONDUCT = os.path.join(REPO_ROOT, "CODE_OF_CONDUCT.md")
+TRTLLM_SECURITY = os.path.join(REPO_ROOT, "SECURITY.md")
+TRTLLM_ATTRIBUTIONS_PYTHON = os.path.join(REPO_ROOT, "ATTRIBUTIONS-Python.md")
+LLMC_README = os.path.join(SCRIPT_DIR, "README.md")
+LLMC_CONTRIBUTING = os.path.join(SCRIPT_DIR, "CONTRIBUTING.md")
 
 # Test source directories
 AD_TESTS_DIR = os.path.join(REPO_ROOT, "tests", "unittest", "auto_deploy")
@@ -104,6 +117,7 @@ EXCLUDE_TEST_FILES = {
     "test_trtllm_attention_op.py",
     "test_fla_cached_gated_delta_rule.py",
     "test_flashinfer_trtllm_mla_op.py",
+    "test_trtllm_mla_op.py",
     "test_fuse_trtllm_attention_quant_fp8.py",
     "test_fuse_relu2_quant_nvfp4.py",
     "test_moe_fusion.py",
@@ -155,20 +169,26 @@ EXCLUDE_TEST_FILES = {
     "test_export_glm4_moe_lite.py",
 }
 
-# Import path rewrite: old -> new
+# Import path rewrite: old -> new (applied to test files only).
 _IMPORT_REWRITE = "tensorrt_llm._torch.auto_deploy"
-_IMPORT_TARGET = "auto_deploy"
+_IMPORT_TARGET = "llmc"
 
 # Paths that the script owns and regenerates on every run.
-# Everything else in the output directory (e.g., .git/, .github/) is preserved.
+# Everything else in the output directory (e.g., .git/, .github/) is preserved
+# and owned by the standalone repo itself.
 _MANAGED_PATHS = [
-    "auto_deploy",
+    "llmc",
     "tests",
     "pyproject.toml",
     "README.md",
     "LICENSE",
+    "ATTRIBUTIONS-Python.md",
     "CONTRIBUTING.md",
     ".gitignore",
+    ".editorconfig",
+    "CODE_OF_CONDUCT.md",
+    "SECURITY.md",
+    "ATTRIBUTIONS-Python.md",
 ]
 
 
@@ -201,31 +221,24 @@ def _copy_tree(src_dir: str, dst_dir: str) -> int:
 
 
 def _rewrite_imports_in_file(filepath: str) -> int:
-    """Rewrite imports in a copied file for standalone mode.
+    """Rewrite imports in a copied test file for standalone mode.
 
-    Handles:
-    - tensorrt_llm._torch.auto_deploy.X -> auto_deploy.X
-    - from tensorrt_llm.llmapi.llm_args import KvCacheConfig -> from auto_deploy._compat import KvCacheConfig
-    - from tensorrt_llm._torch.utils import ActivationType -> from auto_deploy._compat import ActivationType
+    Source files inside ``tensorrt_llm/_torch/auto_deploy`` already use
+    relative imports (enforced by the ``auto-deploy-import-discipline``
+    pre-commit hook), so no rewriting is needed for them. Tests, however,
+    are written against the canonical absolute path
+    ``tensorrt_llm._torch.auto_deploy`` and need to be rewritten to
+    ``llmc``. Cross-package types (e.g. ``KvCacheConfig``,
+    ``ActivationType``) are sourced via ``..._torch.auto_deploy._compat``,
+    so the primary rewrite handles them too.
 
-    Returns the number of replacements made.
+    Returns the number of line-level changes made.
     """
     with open(filepath) as f:
         content = f.read()
 
     original = content
-    # Primary rewrite: tensorrt_llm._torch.auto_deploy -> auto_deploy
     content = content.replace(_IMPORT_REWRITE, _IMPORT_TARGET)
-    # Test files that import KvCacheConfig from tensorrt_llm.llmapi
-    content = content.replace(
-        "from tensorrt_llm.llmapi.llm_args import KvCacheConfig",
-        "from auto_deploy._compat import KvCacheConfig",
-    )
-    # Test files that import ActivationType from tensorrt_llm._torch.utils
-    content = content.replace(
-        "from tensorrt_llm._torch.utils import ActivationType",
-        "from auto_deploy._compat import ActivationType",
-    )
 
     replacements = sum(1 for a, b in zip(original, content) if a != b)  # rough count
     if content != original:
@@ -412,9 +425,10 @@ def _create_pyproject_toml(output_dir: str, dependencies: list, dev_dependencies
         'build-backend = "setuptools.build_meta"\n'
         "\n"
         "[project]\n"
-        'name = "llm-compiler"\n'
+        'name = "nvidia-llmc"\n'
         'version = "0.1.0"\n'
-        'description = "LLM Compiler (llmc): Automatic model optimization and deployment for LLM inference"\n'
+        'description = "llmc: standalone LLM compiler — '
+        'automatic model optimization and deployment for LLM inference"\n'
         'readme = "README.md"\n'
         'license = {text = "Apache-2.0"}\n'
         'requires-python = ">=3.10"\n'
@@ -428,7 +442,7 @@ def _create_pyproject_toml(output_dir: str, dependencies: list, dev_dependencies
         "]\n"
         "\n"
         "[tool.setuptools.packages.find]\n"
-        'include = ["auto_deploy*"]\n'
+        'include = ["llmc*"]\n'
         "\n"
         "[tool.pytest.ini_options]\n"
         'testpaths = ["tests"]\n'
@@ -439,7 +453,7 @@ def _create_pyproject_toml(output_dir: str, dependencies: list, dev_dependencies
 
 
 def create_standalone_package(output_dir: str) -> None:
-    """Create the standalone auto_deploy package at the given output directory.
+    """Create the standalone llmc package at the given output directory.
 
     Safe to run against an existing git repository: only the managed paths
     (source, tests, and packaging files) are deleted and regenerated. The .git
@@ -462,12 +476,14 @@ def create_standalone_package(output_dir: str) -> None:
 
     print(f"Creating standalone package at: {output_dir}")
 
-    # 1. Copy auto_deploy source as top-level `auto_deploy/` package
-    ad_dst = os.path.join(output_dir, "auto_deploy")
+    # 1. Copy auto_deploy source as top-level `llmc/` package. No import
+    #    rewriting is needed: in-package imports are relative (enforced by
+    #    the auto-deploy-import-discipline pre-commit hook).
+    ad_dst = os.path.join(output_dir, "llmc")
     count = _copy_tree(AUTO_DEPLOY_SRC, ad_dst)
-    print(f"  Copied {count} source files to auto_deploy/")
+    print(f"  Copied {count} source files to llmc/")
 
-    # 2. Copy and rewrite tests
+    # 2. Copy and rewrite tests (tests use absolute self-imports by design).
     test_count = _copy_tests(output_dir)
     rewrite_count = _rewrite_imports_in_dir(os.path.join(output_dir, "tests"))
     print(f"  Copied {test_count} test files to tests/ ({rewrite_count} import rewrites)")
@@ -482,25 +498,42 @@ def create_standalone_package(output_dir: str) -> None:
     _create_pyproject_toml(output_dir, dependencies, dev_dependencies)
     print(f"  Created pyproject.toml ({len(dependencies)} deps + {len(dev_dependencies)} dev deps)")
 
-    # 4. Copy LICENSE
-    if os.path.exists(TRTLLM_LICENSE):
-        shutil.copy2(TRTLLM_LICENSE, os.path.join(output_dir, "LICENSE"))
-        print("  Copied LICENSE")
+    # 4. Generate standalone LICENSE (only vendored projects in auto_deploy)
+    generate_license(output_dir)
+    print(f"  Generated LICENSE ({len(VENDORED_PROJECTS)} vendored projects)")
 
-    # 5. Copy README
-    if os.path.exists(AD_README):
-        shutil.copy2(AD_README, os.path.join(output_dir, "README.md"))
+    # 5. Generate ATTRIBUTIONS-Python.md (direct dependency licenses)
+    generate_attributions(output_dir, dependencies)
+    print(f"  Generated ATTRIBUTIONS-Python.md ({len(dependencies)} direct deps)")
+
+    # 6. Copy README
+    if os.path.exists(LLMC_README):
+        shutil.copy2(LLMC_README, os.path.join(output_dir, "README.md"))
         print("  Copied README.md")
 
-    # 6. Copy CONTRIBUTING.md
-    if os.path.exists(AD_CONTRIBUTING):
-        shutil.copy2(AD_CONTRIBUTING, os.path.join(output_dir, "CONTRIBUTING.md"))
+    # 7. Copy CONTRIBUTING.md
+    if os.path.exists(LLMC_CONTRIBUTING):
+        shutil.copy2(LLMC_CONTRIBUTING, os.path.join(output_dir, "CONTRIBUTING.md"))
         print("  Copied CONTRIBUTING.md")
 
-    # 7. Copy .gitignore
+    # 8. Copy .gitignore
     if os.path.exists(TRTLLM_GITIGNORE):
         shutil.copy2(TRTLLM_GITIGNORE, os.path.join(output_dir, ".gitignore"))
         print("  Copied .gitignore")
+
+    # 9. Copy .editorconfig
+    if os.path.exists(TRTLLM_EDITORCONFIG):
+        shutil.copy2(TRTLLM_EDITORCONFIG, os.path.join(output_dir, ".editorconfig"))
+        print("  Copied .editorconfig")
+
+    # 10. Copy OSS compliance files (CODE_OF_CONDUCT, SECURITY)
+    for src, name in (
+        (TRTLLM_CODE_OF_CONDUCT, "CODE_OF_CONDUCT.md"),
+        (TRTLLM_SECURITY, "SECURITY.md"),
+    ):
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(output_dir, name))
+            print(f"  Copied {name}")
 
     print(f"\nStandalone package created at: {output_dir}")
     print("\nTo install:")
@@ -510,18 +543,18 @@ def create_standalone_package(output_dir: str) -> None:
     print("  uv pip install -e '.[dev]'")
     print("\nTo run tests:     pytest tests/")
     print(
-        'To verify:        python -c "from auto_deploy._compat import TRTLLM_AVAILABLE; print(TRTLLM_AVAILABLE)"'
+        'To verify:        python -c "from llmc._compat import TRTLLM_AVAILABLE; print(TRTLLM_AVAILABLE)"'
     )
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Create a standalone auto_deploy package from TensorRT-LLM source.",
+        description="Create a standalone llmc package from TensorRT-LLM source.",
     )
     parser.add_argument(
         "--output-dir",
-        default=os.path.join(REPO_ROOT, "build", "auto_deploy_standalone"),
-        help="Output directory for the standalone package (default: build/auto_deploy_standalone)",
+        default=os.path.join(REPO_ROOT, "build", "llmc_standalone"),
+        help="Output directory for the standalone package (default: build/llmc_standalone)",
     )
     args = parser.parse_args()
     create_standalone_package(os.path.abspath(args.output_dir))

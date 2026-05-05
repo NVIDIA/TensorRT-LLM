@@ -729,16 +729,15 @@ class KvCacheCreator:
         )
 
     def _split_kv_cache_budget_for_draft(self) -> Optional[KvCacheConfig]:
-        """Split max_gpu_total_bytes between target and draft KV caches.
+        """Split KV cache budgets between target and draft KV caches.
 
         When using KVCacheManagerV2 with a separate draft KV cache,
-        max_gpu_total_bytes represents the total budget for both target and
-        draft combined.  This method splits the budget proportionally based
-        on their per-token KV cache sizes.
+        max_gpu_total_bytes and host_cache_size each represent the total
+        budget for both target and draft combined.  This method splits both
+        budgets proportionally based on their per-token KV cache sizes.
 
         Returns a cloned KvCacheConfig for the draft, or None if no split is
-        needed.  Also modifies self._kv_cache_config.max_gpu_total_bytes
-        in-place for the target.
+        needed.  Also modifies self._kv_cache_config in-place for the target.
         """
         total_budget = self._kv_cache_config.max_gpu_total_bytes
         if total_budget is None or total_budget <= 0:
@@ -753,7 +752,9 @@ class KvCacheCreator:
         if total_kv <= 0 or draft_kv <= 0:
             return None
 
-        draft_budget = int(total_budget * draft_kv / total_kv)
+        draft_ratio = draft_kv / total_kv
+
+        draft_budget = int(total_budget * draft_ratio)
         target_budget = total_budget - draft_budget
 
         logger.info(
@@ -765,6 +766,18 @@ class KvCacheCreator:
 
         draft_kv_cache_config = self._kv_cache_config.model_copy()
         draft_kv_cache_config.max_gpu_total_bytes = draft_budget
+
+        host_budget = self._kv_cache_config.host_cache_size
+        if host_budget is not None and host_budget > 0:
+            draft_host_budget = int(host_budget * draft_ratio)
+            target_host_budget = host_budget - draft_host_budget
+            self._kv_cache_config.host_cache_size = target_host_budget
+            draft_kv_cache_config.host_cache_size = draft_host_budget
+            logger.info(
+                f"Splitting KV cache host budget: total={host_budget / GB:.2f} GiB, "
+                f"target={target_host_budget / GB:.2f} GiB, "
+                f"draft={draft_host_budget / GB:.2f} GiB")
+
         return draft_kv_cache_config
 
     def build_managers(self,
