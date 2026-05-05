@@ -373,7 +373,8 @@ class PyExecutor:
                 ResourceManagerType.DRAFT_KV_CACHE_MANAGER: set(),
             }
         self._disagg_gen_kv_recv_started_ids: set[int] = set()
-        self._disagg_timed_out_kv_cancelled_ids: set[int] = set()
+        self._disagg_timed_out_ctx_cancelled_ids: set[int] = set()
+        self._disagg_timed_out_gen_cancelled_ids: set[int] = set()
 
         # Rolling acceptance tracking for spec decode (disable speculation if rolling acceptance is below threshold)
         spec_config = getattr(self.model_engine, 'spec_config', None)
@@ -3388,23 +3389,18 @@ class PyExecutor:
         for request_id in list(requests_in_transfer.keys()):
             request = requests_in_transfer[request_id]
             if request.py_kv_transfer_timed_out and request_id not in completed_req_ids:
-                # The previous "defer Python cleanup while
-                # DISAGG_CONTEXT_TRANS_IN_PROGRESS" guard existed to avoid a
-                # UAF on CacheTransceiver::mSenderFutures's raw LlmRequest*.
-                # mSenderFutures now holds std::shared_ptr<LlmRequest>, so the
-                # LlmRequest outlives every C++ access regardless of when
-                # Python drops its pybind reference — the UAF class is gone
-                # and the guard is no longer needed. Running cancel_request +
-                # end_transfer here recovers the KV blocks promptly even when
-                # the C++ deadline check cannot reach the entry (orphan class).
-                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
-                # If cancel is successful, mark as complete so it can be cleaned up
-                # Otherwise, try at next iteration
-                if is_cancelled:
-                    request.py_kv_transfer_start_time = None
-                    request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
-
-                    self._end_transfer_and_maybe_terminate(request)
+                # Ask C++ to cancel once, but do not free Python-side
+                # resources until C++ reports the transfer in finished/error
+                # status. cancel_request() is not a transport-quiescence proof.
+                if request_id not in self._disagg_timed_out_ctx_cancelled_ids:
+                    is_cancelled = self.kv_cache_transceiver.cancel_request(
+                        request)
+                    if is_cancelled:
+                        self._disagg_timed_out_ctx_cancelled_ids.add(request_id)
+                        logger.warning(
+                            f"Cancelled timed-out context KV transfer for "
+                            f"request {request.py_request_id}; waiting for "
+                            "C++ transfer status to report final cleanup")
 
         self._check_cache_transfer_errors("context requests")
 
@@ -3747,7 +3743,8 @@ class PyExecutor:
         for prepared_ids in self._disagg_gen_init_prepared_ids.values():
             prepared_ids.discard(request.py_request_id)
         self._disagg_gen_kv_recv_started_ids.discard(request.py_request_id)
-        self._disagg_timed_out_kv_cancelled_ids.discard(request.py_request_id)
+        self._disagg_timed_out_ctx_cancelled_ids.discard(request.py_request_id)
+        self._disagg_timed_out_gen_cancelled_ids.discard(request.py_request_id)
 
     def _is_request_in_transmission(self, request) -> bool:
         """Check if a request is currently in transmission state."""
@@ -3894,11 +3891,11 @@ class PyExecutor:
             # Check if generation request needs cleanup due to KV cache transfer timeout.
             if request.py_kv_transfer_timed_out:
                 if (request.py_request_id
-                        not in self._disagg_timed_out_kv_cancelled_ids):
+                        not in self._disagg_timed_out_gen_cancelled_ids):
                     is_cancelled = self.kv_cache_transceiver.cancel_request(
                         request)
                     if is_cancelled:
-                        self._disagg_timed_out_kv_cancelled_ids.add(
+                        self._disagg_timed_out_gen_cancelled_ids.add(
                             request.py_request_id)
                         logger.warning(
                             f"Cancelled timed-out generation KV transfer for "
@@ -3971,15 +3968,6 @@ class PyExecutor:
                 # If partial reuse is enabled, and the KV cache manager is not VSWA, and the PP size is 1,
                 # then we need to terminate the request. TODO: Remove this once disagg support from KVCache reuse
                 # path is fixed.
-                # Note: the previous "elif request.is_disagg_context_transmission_state:
-                # pass" guard existed to avoid a UAF on the C++
-                # CacheTransceiver::mSenderFutures's raw LlmRequest*. Since
-                # mSenderFutures now holds std::shared_ptr<LlmRequest>, the
-                # LlmRequest outlives every C++ access regardless of when
-                # Python drops its pybind reference, so the guard is no
-                # longer needed and was actively turning C++ tracker
-                # orphans into permanent KV-block leaks (the deadline check
-                # cannot reach orphaned entries).
                 force_terminate_for_partial_reuse = (
                     self.enable_partial_reuse_for_disagg
                     and not self.kv_cache_manager.is_vswa
