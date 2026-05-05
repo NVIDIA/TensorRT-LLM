@@ -586,6 +586,10 @@ class LTX2Pipeline(BasePipeline):
         the reference ``LTXModelConfigurator.from_config()``.  Missing keys
         fall back to the same defaults the reference uses.
         """
+        attn_cfg = getattr(self.model_config, "attention", None)
+        if attn_cfg is not None and getattr(attn_cfg, "sage_attention_config", None) is not None:
+            raise NotImplementedError("SageAttention is not yet supported for the LTX-2 pipeline.")
+
         cfg = self.model_config.pretrained_config
 
         rope_type = LTXRopeType(getattr(cfg, "rope_type", "interleaved"))
