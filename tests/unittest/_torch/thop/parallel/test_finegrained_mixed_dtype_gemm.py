@@ -51,8 +51,9 @@ def test_matmul_activation_int4_input(m, n, k, group_size, activation_dtype,
     torch.manual_seed(0)
     device = "cuda"
 
-    max_sm = (FinegrainedMixedDtypeGemm.MAX_SUPPORTED_SM_VERSION if use_w4a8_awq
-              else FinegrainedMixedDtypeGemm.MAX_SUPPORTED_SM_VERSION_W4A16)
+    max_sm = (FinegrainedMixedDtypeGemm.MAX_SUPPORTED_SM_VERSION_W4A8
+              if use_w4a8_awq else
+              FinegrainedMixedDtypeGemm.MAX_SUPPORTED_SM_VERSION_W4A16)
     if get_sm_version() > max_sm:
         pytest.skip(
             f"W4A16/W4A8 not supported for SM version {get_sm_version()}")

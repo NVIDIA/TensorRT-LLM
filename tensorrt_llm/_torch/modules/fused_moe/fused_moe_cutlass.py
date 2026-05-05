@@ -84,9 +84,6 @@ class CutlassFusedMoE(MoE):
             "dtypes": {torch.bfloat16},
         },
         # NVFP4: SM in {100, 103, 120, 121}
-        # SM 120 = desktop Blackwell (e.g. RTX 5090 / GB202)
-        # SM 121 = GB10 / DGX Spark
-        # C++ kernel: isValidSM120MOESpecialisation() supports FP4xFP4 and FP8xFP4
         QuantAlgo.NVFP4: {
             "sm_constraint": ("in", {100, 103, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
@@ -112,11 +109,6 @@ class CutlassFusedMoE(MoE):
             "dtypes": {torch.float16, torch.bfloat16, torch.float32},
         },
         # W4A8_MXFP4_MXFP8: SM in {100, 103, 120, 121}
-        # SM120/121 added by commit 27a5091f ([None][feat] GPT-OSS Sm120/Sm121
-        # Support); the C++ isValidSM120MOESpecialisation<T=FP8, WeightType=FP4>
-        # path covers MXFP4_MXFP8 since use_wfp4afp8 is type-defined as
-        # (T==FP8 && WeightType==FP4), and the runtime block-scaling type for
-        # use_wfp4afp8 is hard-wired to MXFPX in moe_gemm_template_dispatch.h.
         QuantAlgo.W4A8_MXFP4_MXFP8: {
             "sm_constraint": ("in", {100, 103, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16},

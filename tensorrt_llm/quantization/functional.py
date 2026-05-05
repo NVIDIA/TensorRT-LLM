@@ -960,16 +960,12 @@ def preprocess_weights_for_mixed_gemm(
     if len(tensor.shape) == 2:
         tensor = tensor.unsqueeze(0)
     elif sm_ >= 90:
-        # 3-D inputs (MoE expert weights) have no specialised Hopper/Blackwell
-        # kernels and fall back to the SM80 interleaved layout, mirroring the
+        # 3-D inputs (MoE) fall back to SM80 interleaved layout, mirroring the
         # `force_interleave && arch >= 90` clause in the C++ preprocessor.
         sm_ = 80
     if sm_ >= 120:
-        # SM120/SM121 (RTX 5090 / 5080) reuse the SM80 layout for both 2-D and
-        # 3-D inputs because the SM120 dispatch routes through cutlass::arch::Sm80.
-        # Without this, vanilla 2-D Linear weights on SM120 skipped both row
-        # permutation (gated sm_ < 100) and column interleave (gated sm_ < 90)
-        # and produced wrong-layout weights for the Sm80 finegrained kernel.
+        # SM120/SM121 dispatch through cutlass::arch::Sm80; reuse SM80 layout
+        # for both 2-D and 3-D inputs.
         sm_ = 80
     if sm_ == 100 or sm_ == 103:
         do_weight_interleave = False
