@@ -1036,9 +1036,9 @@ def mla_custom_op_inplace(
     metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
     if mla_layer.is_deepseek_v4:
         mla_layer.forward_impl_with_deepseek_v4(position_ids,
-                                           hidden_states,
-                                           metadata,
-                                           output=output)
+                                                hidden_states,
+                                                metadata,
+                                                output=output)
     else:
         mla_layer.forward_impl(position_ids,
                                hidden_states,
@@ -1508,7 +1508,8 @@ class MLA(nn.Module):
             kv_lora_rank=self.kv_lora_rank,
             qk_nope_head_dim=self.qk_nope_head_dim,
             qk_rope_head_dim=self.qk_rope_head_dim,
-            v_head_dim=self.v_head_dim if self.is_deepseek_v4 else self.kv_lora_rank,
+            v_head_dim=self.v_head_dim
+            if self.is_deepseek_v4 else self.kv_lora_rank,
             hidden_size=self.hidden_size,
             predicted_tokens_per_seq=self.predicted_tokens_per_seq,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
@@ -1767,7 +1768,7 @@ class MLA(nn.Module):
         return q
 
     def _deepseek_v4_o_proj(self, attn_out_latent: torch.Tensor,
-                       position_ids: torch.Tensor) -> torch.Tensor:
+                            position_ids: torch.Tensor) -> torch.Tensor:
         num_tokens = attn_out_latent.shape[0]
         attn_out_latent = attn_out_latent.view(num_tokens, self.num_heads_tp,
                                                -1)
@@ -1977,8 +1978,7 @@ class MLA(nn.Module):
         assert self.mqa is not None, "DSA is only supported in MQA mode"
 
         q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
-            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim],
-            -1)
+            [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1)
 
         q, compressed_kv = maybe_execute_in_parallel(
             lambda: self.q_a_layernorm(q),
@@ -2114,10 +2114,11 @@ class MLA(nn.Module):
                 topk_indices=topk_indices[num_ctx_tokens:num_tokens, :],
             )
 
-    def forward_impl_with_deepseek_v4(self, position_ids: Optional[torch.Tensor],
-                                 hidden_states: torch.Tensor,
-                                 attn_metadata: AttentionMetadata,
-                                 output: torch.Tensor) -> None:
+    def forward_impl_with_deepseek_v4(self,
+                                      position_ids: Optional[torch.Tensor],
+                                      hidden_states: torch.Tensor,
+                                      attn_metadata: AttentionMetadata,
+                                      output: torch.Tensor) -> None:
         """
         Forward pass for the MLA module with DeepSeek-V4 (always in MQA mode).
 
@@ -2140,9 +2141,8 @@ class MLA(nn.Module):
         if position_ids is not None:
             position_ids = position_ids[..., :num_tokens]
 
-        q, kv = self.kv_a_proj_with_mqa(hidden_states).split([
-            self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim
-        ], -1)
+        q, kv = self.kv_a_proj_with_mqa(hidden_states).split(
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], -1)
 
         q, kv = maybe_execute_in_parallel(
             lambda: self.q_a_layernorm(q),
@@ -3281,9 +3281,9 @@ class MLA(nn.Module):
                                        output=attn_output)
         elif self.is_deepseek_v4:
             self.forward_impl_with_deepseek_v4(position_ids,
-                                          hidden_states,
-                                          attn_metadata,
-                                          output=attn_output)
+                                               hidden_states,
+                                               attn_metadata,
+                                               output=attn_output)
         else:
             self.forward_impl(position_ids,
                               hidden_states,

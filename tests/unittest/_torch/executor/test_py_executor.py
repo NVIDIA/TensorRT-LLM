@@ -186,8 +186,6 @@ def test_getter_methods(mock_executor):
     assert mock_executor.get_waiting_queue_size() == 1
 
 
-
-
 def _classify_termination(request, enable_partial_reuse_for_disagg, is_vswa, pp_size):
     """Reproduce the termination logic from _handle_responses (py_executor.py).
 

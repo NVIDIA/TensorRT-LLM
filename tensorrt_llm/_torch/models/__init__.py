@@ -11,6 +11,7 @@ from .modeling_bert import BertForSequenceClassification
 from .modeling_clip import CLIPVisionModel
 from .modeling_cohere2 import Cohere2ForCausalLM
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
+from .modeling_deepseekv4 import DeepseekV4ForCausalLM
 from .modeling_exaone4 import Exaone4ForCausalLM
 from .modeling_exaone4_5 import Exaone4_5_ForConditionalGeneration
 from .modeling_exaone_moe import ExaoneMoeForCausalLM
@@ -25,7 +26,6 @@ from .modeling_kimi_k25 import KimiK25ForConditionalGeneration
 from .modeling_laguna import LagunaForCausalLM
 from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
-from .modeling_deepseekv4 import DeepseekV4ForCausalLM
 from .modeling_minimaxm2 import MiniMaxM2ForCausalLM
 from .modeling_mistral import Mistral3VLM, MistralForCausalLM
 from .modeling_mixtral import MixtralForCausalLM

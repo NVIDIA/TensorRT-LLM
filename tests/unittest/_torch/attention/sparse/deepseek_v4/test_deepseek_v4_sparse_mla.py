@@ -21,14 +21,16 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
     DeepseekV4CacheManager,
     DeepseekV4TrtllmAttention,
 )
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import DeepseekV4TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
+    DeepseekV4TrtllmAttentionMetadata,
+)
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, DeepSeekV4SparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 

@@ -3568,7 +3568,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             longest_stop_word_len = cast(
                 int, np.max(np.diff(cumsum_arr, prepend=0), initial=0).item()
             )
-            return longest_stop_word_len > 1
+            return bool(longest_stop_word_len > 1)
         return False
 
     def _predict_beam_search_is_likely_finishing(

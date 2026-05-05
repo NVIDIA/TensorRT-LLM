@@ -2682,8 +2682,7 @@ class PyExecutor:
             # otherwise look like a stall. With ADP, requests are sharded
             # across TP ranks so the comparison must use the global count
             # (allgather) against the global target.
-            if (self.is_benchmark_disagg
-                    and self._benchmark_fill_phase_active
+            if (self.is_benchmark_disagg and self._benchmark_fill_phase_active
                     and not self.is_warmup):
                 # NOTE: keep the gate condition free of any per-rank state
                 # (e.g. `fitting_disagg_gen_init_requests`).  The

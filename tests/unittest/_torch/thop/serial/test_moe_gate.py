@@ -189,8 +189,12 @@ class TestMoeGate:
 
         if is_hash:
             vocab_size = 1024
-            input_ids = torch.randint(0, vocab_size, (batch_size,), dtype=torch.int32, device="cuda")
-            tid2eid = torch.randint(0, N_EXPERTS_PRO, (vocab_size, TOPK), dtype=torch.int32, device="cuda")
+            input_ids = torch.randint(
+                0, vocab_size, (batch_size,), dtype=torch.int32, device="cuda"
+            )
+            tid2eid = torch.randint(
+                0, N_EXPERTS_PRO, (vocab_size, TOPK), dtype=torch.int32, device="cuda"
+            )
             bias = torch.empty(0, dtype=torch.float32, device="cuda")
             ref_weights, ref_indices = pytorch_gate_forward(
                 scores, input_ids=input_ids, tid2eid=tid2eid, route_scale=route_scale, is_hash=True

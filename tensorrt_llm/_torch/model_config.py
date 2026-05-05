@@ -752,9 +752,8 @@ class ModelConfig(Generic[TConfig]):
                         pretrained_config, 'compress_ratios', None)
                     num_base_layers = pretrained_config.num_hidden_layers
                     spec_config = kwargs.get('spec_config', None)
-                    mtp_enabled = (
-                        spec_config is not None
-                        and spec_config.spec_dec_mode.is_mtp_one_model())
+                    mtp_enabled = (spec_config is not None and
+                                   spec_config.spec_dec_mode.is_mtp_one_model())
                     sparse_attention_config = kwargs.get(
                         'sparse_attention_config')
                     checkpoint_window_size = getattr(
@@ -773,12 +772,14 @@ class ModelConfig(Generic[TConfig]):
 
                     if (checkpoint_compress_ratios is not None
                             and (compress_ratios is None
-                                 or len(checkpoint_compress_ratios) >
-                                 len(compress_ratios))):
+                                 or len(checkpoint_compress_ratios)
+                                 > len(compress_ratios))):
                         compress_ratios = checkpoint_compress_ratios
 
                     if window_size is None:
                         window_size = checkpoint_window_size
+                    if window_size is None:
+                        window_size = pretrained_config.sliding_window
 
                     # Normalize checkpoint-facing ratio 0 (SWA-only/uncompressed)
                     # to 1 internally so cache allocation math works. The

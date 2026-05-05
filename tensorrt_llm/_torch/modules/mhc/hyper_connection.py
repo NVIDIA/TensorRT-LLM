@@ -49,11 +49,10 @@ class HCState:
     ) -> "HCState":
         return cls(residual=residual, post_mix=post_mix, comb_mix=comb_mix, x_prev=x_prev)
 
+
 try:
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import mhc_fused_hc as mhc_fused_hc_cuda
     from tensorrt_llm._torch.modules.mhc.mhc_cuda import mhc_hc_head_cuda, mhc_post_mapping_cuda
-    from tensorrt_llm._torch.modules.mhc.mhc_cuda import (
-        mhc_fused_hc as mhc_fused_hc_cuda,
-    )
     from tensorrt_llm._torch.modules.mhc.mhc_cuda import (
         mhc_pre_mapping_fused as mhc_pre_mapping_fused_cuda,
     )

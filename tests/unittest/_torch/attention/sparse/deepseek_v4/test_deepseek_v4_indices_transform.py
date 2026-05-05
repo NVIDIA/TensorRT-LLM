@@ -9,17 +9,17 @@ import pytest
 import torch
 from utils.util import skip_pre_blackwell
 
-from tensorrt_llm._torch.attention_backend.sparse.kernel import deepseek_v4_local_to_global_indices
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
     DeepseekV4AttentionType,
     DeepseekV4CacheManager,
 )
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import get_token_bytes
+from tensorrt_llm._torch.attention_backend.sparse.kernel import deepseek_v4_local_to_global_indices
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, DeepSeekV4SparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 
