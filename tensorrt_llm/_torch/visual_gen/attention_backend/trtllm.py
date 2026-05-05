@@ -85,9 +85,12 @@ class TrtllmAttentionMetadata:
         )
 
     def _needs_prepare(self, batch_size: int, seq_lens: torch.Tensor) -> bool:
-        """Check if the shared metadata object needs prepare().
+        """Check if we need to call prepare() (current request seq_lens or shared metadata object seq_lens changed).
 
-        Multiple visual-gen attention modules share one metadata object.  A
+        Assumes uniform sequence length per batch; if per-sample lengths vary,
+        we may need to check seq_lens tensor instead.
+
+        In addition, multiple visual gen attention modules share one metadata object.  A
         different module may have prepared it for another sequence length even
         when this wrapper's local cached seq_lens are unchanged.
         """
