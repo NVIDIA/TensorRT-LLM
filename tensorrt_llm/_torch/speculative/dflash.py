@@ -25,6 +25,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
+from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.resource_manager import BaseResourceManager
 from .interface import SpecMetadata, SpecWorkerBase
 
@@ -396,6 +397,14 @@ class DFlashWorker(SpecWorkerBase):
         accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
             logits_for_accept, draft_tokens, num_contexts, batch_size, spec_metadata
         )
+
+        # Update GDN/Mamba recurrent states to the accepted token's state.
+        if num_gens > 0 and isinstance(attn_metadata.kv_cache_manager, MambaHybridCacheManager):
+            attn_metadata.kv_cache_manager.update_mamba_states(
+                attn_metadata=attn_metadata,
+                num_accepted_tokens=num_accepted_tokens,
+                state_indices=attn_metadata.mamba_metadata.state_indices,
+            )
 
         # Pad accepted_tokens from (batch, K+1) to (batch, 2K) to match sampler buffer
         if K > 1:
