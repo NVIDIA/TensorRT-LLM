@@ -1852,6 +1852,7 @@ def test_gemma4_text_export_uses_semantic_multimodal_mask():
         attention_mask_arg = attention_nodes[0].args[3]
     assert attention_mask_arg is semantic_nodes[0]
 
+
 def test_e2b_like_full_attention_uses_distinct_v_proj():
     config = _small_e2b_text_config()
     full_layer_idx = 3

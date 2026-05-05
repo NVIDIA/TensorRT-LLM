@@ -281,6 +281,74 @@ class TestCapturedGraphCapture:
 
         assert compiled_model.model.seen == [(2, 2)]
 
+    def test_auto_batched_inputs_keep_explicit_resources_static(self, monkeypatch):
+        class ModelWithInterleavedKwargs(nn.Module):
+            def forward(self, runtime_a, explicit_cache, runtime_b):
+                del explicit_cache
+                return runtime_a + runtime_b
+
+        compiled_model = CapturedGraph(
+            ModelWithInterleavedKwargs(),
+            resource_input_names={"explicit_cache"},
+        )
+        cache = torch.zeros(8, 2)
+        captured_kwarg_orders = []
+
+        def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
+            del args, refresh_args_static
+            captured_kwarg_orders.append(tuple(kwargs))
+            return object()
+
+        monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
+
+        def get_args_kwargs(bs):
+            return (), {
+                "runtime_a": torch.ones(bs, 2),
+                "explicit_cache": cache,
+                "runtime_b": torch.full((bs, 2), 2.0),
+            }
+
+        compiled_model.capture_graph(get_args_kwargs, [4])
+
+        assert compiled_model.num_batched_inputs == 2
+        assert compiled_model.dynamic_dims == [0, 0]
+        assert [tuple(buf.shape) for buf in compiled_model._input_buffers] == [(4, 2), (4, 2)]
+        assert captured_kwarg_orders == [("runtime_a", "runtime_b", "explicit_cache")]
+
+    def test_auto_batched_inputs_do_not_guess_legacy_cache_names(self, monkeypatch):
+        class ModelWithLegacyCacheName(nn.Module):
+            def forward(self, runtime_a, r0_cache, runtime_b):
+                return runtime_a + r0_cache[: runtime_a.shape[0]] + runtime_b
+
+        compiled_model = CapturedGraph(ModelWithLegacyCacheName())
+        cache = torch.zeros(8, 2)
+        captured_kwarg_orders = []
+
+        def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
+            del args, refresh_args_static
+            captured_kwarg_orders.append(tuple(kwargs))
+            return object()
+
+        monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
+
+        def get_args_kwargs(bs):
+            return (), {
+                "runtime_a": torch.ones(bs, 2),
+                "r0_cache": cache,
+                "runtime_b": torch.full((bs, 2), 2.0),
+            }
+
+        compiled_model.capture_graph(get_args_kwargs, [4])
+
+        assert compiled_model.num_batched_inputs == 3
+        assert compiled_model.dynamic_dims == [0, 0, 0]
+        assert [tuple(buf.shape) for buf in compiled_model._input_buffers] == [
+            (4, 2),
+            (8, 2),
+            (4, 2),
+        ]
+        assert captured_kwarg_orders == [("runtime_a", "r0_cache", "runtime_b")]
+
 
 # ============================================================================
 # Helpers for piecewise / submod_has_cuda_ops tests
@@ -742,6 +810,7 @@ class TestCompileModelGraphModuleTargetCollection:
         cm.info.max_batch_size = 8
         cm.info.max_num_tokens = 64
         cm.named_args = {}
+        cm.resource_names = ("explicit_cache",)
         return cm
 
     @pytest.mark.parametrize("backend", ["torch-cudagraph", "torch-opt"])
@@ -813,6 +882,40 @@ class TestCompileModelGraphModuleTargetCollection:
         assert mod_compiled is wrapper
         assert info.skipped is False
         assert compiled_models == [wrapper.child]
+
+    def test_compile_model_passes_resource_names_to_backend(self, monkeypatch):
+        wrapper = self._make_wrapper_with_graphmodule_child()
+        compiler_kwargs_seen = []
+
+        class FakeBackend:
+            def __init__(self, model, **compiler_kwargs):
+                del model
+                compiler_kwargs_seen.append(compiler_kwargs)
+
+            def compile(self):
+                return wrapper.child
+
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.auto_deploy.transform.library.compile_model.CompileBackendRegistry.get",
+            lambda backend: FakeBackend,
+        )
+
+        transform = CompileModel.from_kwargs(
+            stage="compile",
+            backend="torch-cudagraph",
+            piecewise_enabled=True,
+        )
+        cm = self._make_cm()
+
+        transform._apply_to_full_model(
+            wrapper,
+            cm=cm,
+            factory=MagicMock(),
+            shared_config=MagicMock(),
+        )
+
+        assert compiler_kwargs_seen[0]["resource_input_names"] == ("explicit_cache",)
+        assert compiler_kwargs_seen[0]["num_batched_inputs"] is None
 
     @pytest.mark.parametrize(
         "backend", ["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"]

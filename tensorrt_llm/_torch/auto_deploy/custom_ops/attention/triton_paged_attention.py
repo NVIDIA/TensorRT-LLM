@@ -1288,7 +1288,6 @@ def triton_paged_context_with_custom_mask(
     return output
 
 
-
 @torch.library.custom_op("auto_deploy::triton_paged_prepare_metadata", mutates_args=())
 def prepare_triton_paged_metadata(
     position_ids: torch.Tensor,
@@ -1351,8 +1350,8 @@ def triton_paged_mha_with_cache(
     scale: Optional[float] = None,
     sliding_window: Optional[int] = None,
     # OPTIONAL INPUTS
-    custom_attn_mask: Optional[torch.Tensor] = None,
     read_cache_only: bool = False,
+    custom_attn_mask: Optional[torch.Tensor] = None,
     # OPTIONAL PRE-ALLOCATED OUTPUT
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -1466,8 +1465,8 @@ def triton_paged_mha_with_cache_fake(
     kv_cache: torch.Tensor,
     scale: Optional[float] = None,
     sliding_window: Optional[int] = None,
-    custom_attn_mask: Optional[torch.Tensor] = None,
     read_cache_only: bool = False,
+    custom_attn_mask: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if out is not None:

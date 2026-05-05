@@ -56,8 +56,13 @@ class CompileModelConfig(TransformConfig):
     cuda_graph_batch_sizes: Optional[List[int]] = Field(
         default=None, description="The batch sizes to use for CUDA graphs."
     )
-    num_batched_inputs: int = Field(
-        default=2, description="The number of batched inputs to use for CUDA graphs."
+    num_batched_inputs: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "The number of batched inputs to use for CUDA graphs. If unset, infer it "
+            "from runtime inputs by excluding explicit cache/resource inputs."
+        ),
     )
     backend: Literal["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"] = Field(
         description="The backend to use for compiling the model."
@@ -111,7 +116,7 @@ class CompileModel(BaseTransform):
             cm.info.set_capture_batch(batch_size=bs)
             return (), cm.named_args
 
-        extra_kwargs = {}
+        extra_kwargs = {"resource_input_names": cm.resource_names}
         config_overrides = {}
         if self.config.piecewise_enabled:
             extra_kwargs["piecewise_seq_info"] = cm.info
