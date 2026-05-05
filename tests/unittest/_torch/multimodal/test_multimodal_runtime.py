@@ -5,11 +5,11 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
-    find_input_mm_embeds, get_multimodal_embeddings)
-from tensorrt_llm.inputs.multimodal import (MultimodalParams,
-                                            MultimodalRuntimeData,
-                                            _as_cpu_tensor, _compute_mm_masks,
-                                            _find_mm_token_start_pos_from_masks)
+    find_input_mm_embeds, get_handoff_multimodal_embeddings,
+    get_multimodal_embeddings)
+from tensorrt_llm.inputs.multimodal import (
+    MultimodalParams, MultimodalRuntimeData, _as_cpu_tensor, _compute_mm_masks,
+    _find_mm_special_token_offsets_from_masks)
 from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
                                           maybe_compute_mm_embed_cumsum)
 
@@ -157,10 +157,24 @@ class TestFindInputMmEmbed:
         param = _make_multimodal_params(2, 6, [10])
         param.multimodal_data["multimodal_embedding"] = cached
 
-        result = find_input_mm_embeds([], [param])
+        mm_embeds = get_handoff_multimodal_embeddings([param])
+        result = find_input_mm_embeds(mm_embeds, [param])
 
         assert len(result) == 1
         torch.testing.assert_close(result[0], cached[2:8])
+
+    def test_find_input_mm_embeds_does_not_resolve_handoff_embeddings(self):
+        """find_input_mm_embeds slices supplied tensors; callers resolve sources."""
+        param = _make_multimodal_params(2, 6, [10])
+        param.multimodal_data["multimodal_embedding"] = torch.randn(
+            10, _EMBED_DIM)
+
+        with pytest.raises(
+                ValueError,
+                match=
+                "No multimodal embeddings were provided for active multimodal params"
+        ):
+            find_input_mm_embeds([], [param])
 
     def test_missing_disagg_handoff_raises_value_error(self):
         """Missing E/P/D embeddings should not surface as list indexing."""
@@ -685,13 +699,24 @@ def _find_mm_token_start_positions(input_ids,
         return [], []
     mm_mask, _, special_mask = _compute_mm_masks(ids, vocab_size, mm_token_ids,
                                                  mm_special_token_ids)
-    return _find_mm_token_start_pos_from_masks(mm_mask, special_mask,
-                                               num_mm_tokens)
+    mm_positions = torch.where(mm_mask)[0]
+    if mm_positions.numel() == 0:
+        return [], []
+
+    lengths_t = torch.tensor(num_mm_tokens)
+    assert mm_positions.numel() == lengths_t.sum().item()
+    offsets = torch.zeros(len(num_mm_tokens), dtype=torch.long)
+    if len(num_mm_tokens) > 1:
+        torch.cumsum(lengths_t[:-1], dim=0, out=offsets[1:])
+    return (
+        mm_positions[offsets].tolist(),
+        _find_mm_special_token_offsets_from_masks(mm_mask, special_mask),
+    )
 
 
 class TestFindMmTokenStartPositions:
     """Integration tests for the intake position-finding composition:
-    `_compute_mm_masks` + `_find_mm_token_start_pos_from_masks`.
+    `_compute_mm_masks` plus the local test-only position derivation.
     Verifies the 2-tuple `(start_positions, special_positions)` returned
     by composing the two helpers via `_find_mm_token_start_positions`."""
 

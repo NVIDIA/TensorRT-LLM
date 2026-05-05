@@ -191,8 +191,9 @@ def get_multimodal_embeddings(
     return [all_embeddings]
 
 
-def _get_cached_input_mm_embeds(
+def get_handoff_multimodal_embeddings(
         multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+    """Collect E/P/D handoff embeddings carried on multimodal params."""
     cached_mm_embeds = []
     for param in multimodal_params:
         if param.multimodal_runtime is None:
@@ -264,11 +265,9 @@ def find_input_mm_embeds(
         return []
 
     if len(mm_embeds) == 0:
-        mm_embeds = _get_cached_input_mm_embeds(multimodal_params)
-        if len(mm_embeds) == 0:
-            raise ValueError(
-                "No multimodal embeddings were provided for active multimodal params. "
-                "The encoder handoff may be missing or malformed.")
+        raise ValueError(
+            "No multimodal embeddings were provided for active multimodal params. "
+            "The encoder handoff may be missing or malformed.")
 
     if total_mm_tokens == sum(mm_embed.shape[0] for mm_embed in mm_embeds):
         return mm_embeds

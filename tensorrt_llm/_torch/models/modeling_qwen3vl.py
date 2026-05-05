@@ -46,6 +46,7 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (
     find_input_mm_embeds,
     fuse_input_embeds,
+    get_handoff_multimodal_embeddings,
     get_multimodal_embeddings,
 )
 from .modeling_qwen2vl import Qwen2_5_VLVisionAttention
@@ -1111,6 +1112,8 @@ class Qwen3VLModelBase(PreTrainedModel):
                     f"{type(self)} does not support disaggregated inference yet. Please unset "
                     "the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
                 )
+            else:
+                mm_embeds = get_handoff_multimodal_embeddings(mm_multimodal_params)
             mm_embeds = find_input_mm_embeds(mm_embeds, mm_multimodal_params)
 
             if self.use_deepstack:
