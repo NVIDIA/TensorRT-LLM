@@ -1,7 +1,9 @@
 import asyncio
 import time
 
+import numpy as np
 import pytest
+from PIL import Image
 from utils.util import skip_single_gpu
 
 import tensorrt_llm
@@ -11,6 +13,8 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import KVCacheEventSerializer
 from tensorrt_llm.bindings.internal.testing import \
     simulate_prefill_completion_only_use_for_testing
+from tensorrt_llm.inputs.multimodal import apply_mm_hashes
+from tensorrt_llm.inputs.utils import VideoData
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
@@ -312,12 +316,6 @@ def test_apply_mm_hashes_uuid_content_combined():
 
 def test_apply_mm_hashes_video_audio_metadata_affects_hash():
     """VideoData hashes include extracted audio when it affects model inputs."""
-    import numpy as np
-    from PIL import Image
-
-    from tensorrt_llm.inputs.multimodal import apply_mm_hashes
-    from tensorrt_llm.inputs.utils import VideoData
-
     frames = [
         Image.new("RGB", (2, 2), (10, 20, 30)),
         Image.new("RGB", (2, 2), (40, 50, 60)),
