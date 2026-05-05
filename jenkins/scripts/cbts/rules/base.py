@@ -47,6 +47,9 @@ class RuleResult:
     reason: str
     block_filters: dict[tuple[str, int], dict[str, set[str]]] = field(default_factory=dict)
     sanity_relevant: bool = True
+    # True (safe default) iff this rule's matched changes might affect perf
+    # benchmarks. Set False when matched changes are pure test infra.
+    perfsanity_relevant: bool = True
 
 
 class Rule(ABC):

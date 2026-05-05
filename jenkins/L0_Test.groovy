@@ -4479,25 +4479,30 @@ def launchTestJobs(pipeline, testFilter)
     }
 
     // CBTS Layer 2: replace `parallelJobsFiltered` with affected stages plus
-    // PackageSanityCheck (kept iff sanity_required); Perf is excluded.
+    // PackageSanityCheck (kept iff sanity_required) and PerfSanity (kept iff
+    // perfsanity_required). Pure -Perf- stages always excluded (own trigger
+    // model, full-list benchmarks).
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts != null) {
         def affectedSet = (cbts.affected_stages ?: []) as Set
         def needsSanity = cbts.sanity_required
+        def needsPerfSanity = cbts.perfsanity_required
         parallelJobsFiltered = parallelJobs.findAll { key, _ ->
-            (affectedSet.contains(key) || (needsSanity && key =~ /PackageSanityCheck/))
-                && !(key =~ /Perf/)
+            if (key =~ /-Perf-/) return false
+            return affectedSet.contains(key) ||
+                   (needsSanity && key =~ /PackageSanityCheck/) ||
+                   (needsPerfSanity && key =~ /PerfSanity/)
         }
         if (affectedSet.isEmpty()) {
             if (parallelJobsFiltered.isEmpty()) {
-                echo "CBTS [${cbts.scope}]: trigger-mode mismatch + sanity not required → no-op"
+                echo "CBTS [${cbts.scope}]: trigger-mode mismatch + nothing force-kept → no-op"
             } else {
                 echo "CBTS [${cbts.scope}]: trigger-mode mismatch — running " +
-                     "${parallelJobsFiltered.size()} sanity stage(s) only"
+                     "${parallelJobsFiltered.size()} force-kept stage(s) only"
             }
         } else if (parallelJobsFiltered) {
             echo "CBTS [${cbts.scope}]: limiting to ${parallelJobsFiltered.size()} stages " +
-                 "(sanity_required=${needsSanity})"
+                 "(sanity_required=${needsSanity}, perfsanity_required=${needsPerfSanity})"
         } else {
             echo "CBTS [${cbts.scope}]: empty stage set after filtering"
         }

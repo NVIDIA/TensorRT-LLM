@@ -842,6 +842,7 @@ def _cbtsParseSelectionResult(String text)
         affected_stage_test_counts: data.affected_stage_test_counts ?: [:],
         // Explicit null check preserves `false`; default True is safe.
         sanity_required: data.sanity_required != null ? data.sanity_required : true,
+        perfsanity_required: data.perfsanity_required != null ? data.perfsanity_required : true,
     ]
 }
 

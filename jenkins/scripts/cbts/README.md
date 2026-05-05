@@ -11,7 +11,7 @@ CBTS narrows test cases only; Build always runs.
 
 | Layer | Where | Action |
 |---|---|---|
-| **2. Stage** | `L0_Test.groovy::launchTestJobs` | Set `parallelJobsFiltered` to affected stages plus PackageSanityCheck (kept iff `sanity_required`). Perf stages are excluded. Empty affectedSet + `sanity_required=False` → no-op; empty + `sanity_required=True` → sanity-only. |
+| **2. Stage** | `L0_Test.groovy::launchTestJobs` | Set `parallelJobsFiltered` to affected stages plus PackageSanityCheck (kept iff `sanity_required`) and PerfSanity (kept iff `perfsanity_required`). Pure `-Perf-` stages always excluded. Empty affectedSet + nothing force-kept → no-op. |
 | **2.5. Split-collapse** | `L0_Test.groovy::runLLMTestlistOn*` entries | Narrowed test count < 20 → collapse pytest-split to splits=1 (only group 1 runs); else default splits stand. |
 | **3. Within-stage tests** | `L0_Test.groovy::renderTestDB` | Point trt-test-db at the narrowed `cbts_test_db/`. Each affected block's `tests:` is restricted to entries in the filter prefix subtree; unaffected blocks are dropped. |
 

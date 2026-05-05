@@ -76,6 +76,9 @@ class SelectionResult:
     # Aggregated `any(rule.sanity_relevant)` across fired rules. Default
     # True is safe; Groovy Layer 2 keeps PackageSanityCheck only when True.
     sanity_required: bool = True
+    # Aggregated `any(rule.perfsanity_relevant)`. Groovy Layer 2 keeps
+    # *-PerfSanity-* stages only when True.
+    perfsanity_required: bool = True
 
     def to_json(self) -> str:
         data = {
@@ -85,6 +88,7 @@ class SelectionResult:
             "test_db_dir_override": self.test_db_dir_override,
             "affected_stage_test_counts": dict(self.affected_stage_test_counts),
             "sanity_required": self.sanity_required,
+            "perfsanity_required": self.perfsanity_required,
         }
         return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
@@ -154,6 +158,7 @@ class Selector:
                     dst.setdefault(prefix, set()).update(waives)
 
         sanity_required = any(r.sanity_relevant for _, r in pairs)
+        perfsanity_required = any(r.perfsanity_relevant for _, r in pairs)
 
         return SelectionResult(
             scope=scope,
@@ -161,6 +166,7 @@ class Selector:
             reasons=reasons,
             block_filters=block_filters,
             sanity_required=sanity_required,
+            perfsanity_required=perfsanity_required,
         )
 
 
