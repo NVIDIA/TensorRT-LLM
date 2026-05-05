@@ -225,6 +225,57 @@ def get_guided_decoding_config(guided_decoding_backend: str,
     return guided_decoding_config
 
 
+def _load_config_and_create_checkpoint_loader(
+        llm_args: TorchLlmArgs, checkpoint_dir: Optional[str] = None):
+    torch.cuda.set_per_process_memory_fraction(1.0)
+    checkpoint_loader = _construct_checkpoint_loader(llm_args.backend,
+                                                     llm_args.checkpoint_loader,
+                                                     llm_args.checkpoint_format)
+    llm_args = ModelLoader.load_config_and_apply_defaults(
+        checkpoint_dir, llm_args, checkpoint_loader)
+    return llm_args, checkpoint_loader
+
+
+def create_encoder_executor(
+    llm_args: TorchLlmArgs,
+    checkpoint_dir: Optional[str] = None,
+):
+    """Create an EncoderExecutor for models using the encode-only path.
+
+    Handles model loading and model_engine creation, then wraps in a
+    lightweight EncoderExecutor. Skips all decoder infrastructure
+    (KV cache, scheduler, sampler, drafter, speculative decoding).
+
+    Args:
+        llm_args: Configuration arguments.
+        checkpoint_dir: Path to model checkpoint.
+
+    Returns:
+        An EncoderExecutor instance ready for batch_forward() calls.
+    """
+    from .encoder_executor import EncoderExecutor
+
+    llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
+        llm_args, checkpoint_dir)
+
+    mapping = _get_mapping(llm_args.parallel_config.to_mapping())
+    dist = Distributed.get(mapping)
+
+    model_engine = PyTorchModelEngine(
+        model_path=checkpoint_dir,
+        llm_args=llm_args,
+        mapping=mapping,
+        dist=dist,
+        spec_config=None,
+        checkpoint_loader=checkpoint_loader,
+    )
+
+    return EncoderExecutor(
+        model_engine=model_engine,
+        dist=dist,
+    )
+
+
 def log_memory_usage(stage: str):
     GB = 1 << 30
     torch.cuda.empty_cache()
