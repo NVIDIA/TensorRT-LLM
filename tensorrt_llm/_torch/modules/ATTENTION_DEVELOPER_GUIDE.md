@@ -196,10 +196,6 @@ the fused TRTLLM path is too restrictive.
 
 **`FlashInferAttentionMetadata`** adds a planning-oriented contract with
 workspace, page-table KV metadata, and prefill/decode wrapper state.
-`FlashInferAttention.forward` merges per-forward options from
-`AttentionForwardContext`, updates KV cache with `append_paged_kv_cache` when
-needed, then executes the planned prefill, decode, or ragged-prefill wrapper's
-`run` method.
 
 **Sparse metadata** families extend the base backend metadata with
 sparse-specific runtime state (indexer buffers, routing state, side-cache
