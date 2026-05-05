@@ -1725,6 +1725,14 @@ class KVCacheManager(BaseResourceManager):
                 self.host_kv_cache_block_offsets[pool_idx, :num_seqs],
                 non_blocking=True)
 
+    def truncate_blocks(self, target_tokens: List[int],
+                        num_tokens_to_keep: int):
+        """Release cached blocks beyond a given prefix length.
+
+        See ``BaseKVCacheManager::truncateBlocks`` for semantics.
+        """
+        self.impl.truncate_blocks(target_tokens, num_tokens_to_keep)
+
     def reset_reuse_state(self):
         """Reset the reuse state of the KV cache manager."""
         self.impl.reset_reuse_state()
