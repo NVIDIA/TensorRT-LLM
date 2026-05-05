@@ -1468,18 +1468,7 @@ def _get_dist_ops(backend: str):
     if hasattr(backend, "value"):
         backend = backend.value
 
-    if backend == "trtllm":
-        return (
-            torch.ops.auto_deploy.trtllm_dist_all_gather.default,
-            torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
-        )
-    if backend == "torch":
-        return (
-            torch.ops.auto_deploy.torch_dist_all_gather.default,
-            torch.ops.auto_deploy.torch_dist_all_reduce.default,
-        )
-    # auto
-    if is_trtllm_op_available():
+    if backend == "trtllm" or is_trtllm_op_available():
         return (
             torch.ops.auto_deploy.trtllm_dist_all_gather.default,
             torch.ops.auto_deploy.trtllm_dist_all_reduce.default,

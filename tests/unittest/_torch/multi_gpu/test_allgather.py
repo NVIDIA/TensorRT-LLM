@@ -40,10 +40,7 @@ from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import allgather
-from tensorrt_llm._torch.distributed.symm_mem_allgather import (
-    SYMM_MEM_AVAILABLE,
-    SymmetricMemoryAllGather,
-)
+from tensorrt_llm._torch.distributed.symm_mem_allgather import SymmetricMemoryAllGather
 from tensorrt_llm.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -260,14 +257,11 @@ def test_allgather_correctness(world_size, dtype, strategy):
     """Correctness across strategies. Skip when GPUs / capability insufficient."""
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"need {world_size} GPUs, have {torch.cuda.device_count()}")
-    if strategy == "SYMM_MEM":
-        if not SYMM_MEM_AVAILABLE:
-            pytest.skip("PyTorch symmetric memory not available")
-        if not _supports_multimem(world_size):
-            pytest.skip(
-                f"MULTIMEM not supported for (world_size={world_size}, "
-                f"capability={torch.cuda.get_device_capability(0)})"
-            )
+    if strategy == "SYMM_MEM" and not _supports_multimem(world_size):
+        pytest.skip(
+            f"MULTIMEM not supported for (world_size={world_size}, "
+            f"capability={torch.cuda.get_device_capability(0)})"
+        )
 
     with MPIPoolExecutor(max_workers=world_size) as ex:
         results = ex.map(
@@ -290,8 +284,6 @@ def test_allgather_cuda_graph(world_size, dtype, strategy):
     """
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"need {world_size} GPUs, have {torch.cuda.device_count()}")
-    if not SYMM_MEM_AVAILABLE:
-        pytest.skip("PyTorch symmetric memory not available")
     if not _supports_multimem(world_size):
         pytest.skip(
             f"MULTIMEM not supported for (world_size={world_size}, "

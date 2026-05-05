@@ -16,20 +16,11 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as torch_symm_mem
 from torch import nn
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-
-try:
-    import torch.distributed._symmetric_memory as torch_symm_mem
-
-    SYMM_MEM_AVAILABLE = True
-except ImportError:
-    SYMM_MEM_AVAILABLE = False
-    logger.warning(
-        "PyTorch symmetric memory not available. Install PyTorch >= 2.8 for MULTIMEM support."
-    )
 
 
 class SymmetricMemoryAllGather(nn.Module):
@@ -91,10 +82,6 @@ class SymmetricMemoryAllGather(nn.Module):
         self.world_size = mapping.tp_size
         self.group_name_str: Optional[str] = None
         self._symm_mem = None
-
-        if not SYMM_MEM_AVAILABLE:
-            logger.warning("SymmetricMemoryAllGather: PyTorch symm_mem not available")
-            return
 
         if not torch.cuda.is_available():
             logger.warning("SymmetricMemoryAllGather: CUDA not available")

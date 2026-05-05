@@ -610,8 +610,8 @@ def trtllm_fp8_deepgemm(
     Keeping this as its own op avoids per-call `is_sm_100f()` / dtype branching
     inside `trtllm_finegrained_fp8_linear` and makes the graph shape explicit.
     """
-    if input.dtype == torch.float8_e4m3fn:
-        raise ValueError("trtllm_fp8_deepgemm expects bfloat16 input, not FP8")
+    if input.dtype != torch.bfloat16:
+        raise ValueError("trtllm_fp8_deepgemm expects bfloat16 input")
 
     input_shape = input.shape
     N = weight.shape[0]

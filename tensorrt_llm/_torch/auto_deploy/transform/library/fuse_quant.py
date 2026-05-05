@@ -5,6 +5,11 @@ import torch.nn as nn
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
+from tensorrt_llm.quantization.utils.fp8_utils import (
+    resmooth_to_fp8_e8m0,
+    transform_sf_into_required_layout,
+)
+
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
@@ -17,15 +22,6 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
-
-try:
-    from tensorrt_llm.quantization.utils.fp8_utils import (
-        resmooth_to_fp8_e8m0,
-        transform_sf_into_required_layout,
-    )
-except ImportError:
-    resmooth_to_fp8_e8m0 = None
-    transform_sf_into_required_layout = None
 
 
 # with bias=None
@@ -471,11 +467,6 @@ class FuseFineGrainedFP8LinearConfig(TransformConfig):
     )
 
 
-# Positional index of weight_scale in trtllm_finegrained_fp8_linear signature:
-#   (input, weight, bias, weight_scale, tp_mode=..., ...)
-_TRTLLM_FG_FP8_WEIGHT_SCALE_ARG = 3
-
-
 def _resolve_attr_tensor(gm: GraphModule, attr_node: Node) -> Optional[torch.Tensor]:
     """Resolve a get_attr node's target to the live tensor on `gm`, or None.
 
@@ -570,23 +561,24 @@ def _dispatch_trtllm_finegrained_fp8_to_deepgemm(gm: GraphModule) -> int:
 
     if not is_sm_100f():
         return 0
+    # Positional index of weight_scale in trtllm_finegrained_fp8_linear signature:
+    #   (input, weight, bias, weight_scale, tp_mode=..., ...)
+    weight_scale_arg = 3
 
     src_op = torch.ops.auto_deploy.trtllm_finegrained_fp8_linear
     dst_op = getattr(torch.ops.auto_deploy, "trtllm_fp8_deepgemm", None)
     if dst_op is None:
-        return 0
-    if resmooth_to_fp8_e8m0 is None or transform_sf_into_required_layout is None:
         return 0
 
     num_rewrites = 0
     for node in gm.graph.nodes:
         if not is_op(node, src_op):
             continue
-        if len(node.args) <= _TRTLLM_FG_FP8_WEIGHT_SCALE_ARG:
+        if len(node.args) <= weight_scale_arg:
             continue
 
         weight_arg = node.args[1]
-        scale_arg = node.args[_TRTLLM_FG_FP8_WEIGHT_SCALE_ARG]
+        scale_arg = node.args[weight_scale_arg]
 
         weight_tensor = _resolve_attr_tensor(gm, weight_arg)
         scale_tensor = _resolve_attr_tensor(gm, scale_arg)
