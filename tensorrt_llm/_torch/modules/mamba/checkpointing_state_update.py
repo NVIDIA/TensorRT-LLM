@@ -364,6 +364,16 @@ def _checkpointing_precompute_kernel(
 @triton.heuristics({"USE_RS_ROUNDING": lambda args: args["rand_seed_ptr"] is not None})
 @triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
+# Replay axis: separate from the T-output axis.  Sized to MAX_REPLAY_BUFFER_LENGTH
+# so the kernel can iterate over up to PNAT old-cache positions independent of
+# the new-token T axis.  In production T=6, MAX=16 → BLOCK_SIZE_T=16,
+# BLOCK_SIZE_WINDOW=16 (coincidentally equal); separating them is the
+# semantically correct fix and avoids the prior `offs_t < T` masking bug
+# that under-read old data when PNAT > T-1.
+@triton.heuristics(
+    {"BLOCK_SIZE_WINDOW": lambda args: max(
+        triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), 16)}
+)
 @triton.jit()
 def _checkpointing_main_kernel(
     # Pointers
@@ -394,6 +404,7 @@ def _checkpointing_main_kernel(
     pad_slot_id,
     # Dimensions
     T: tl.constexpr,
+    MAX_REPLAY_BUFFER_LENGTH: tl.constexpr,  # cache T-axis capacity (= max_window)
     dim: tl.constexpr,
     dstate: tl.constexpr,
     nheads_ngroups_ratio: tl.constexpr,
@@ -466,6 +477,7 @@ def _checkpointing_main_kernel(
     HAS_CACHE_BATCH_INDICES: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
+    BLOCK_SIZE_WINDOW: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
     USE_RS_ROUNDING: tl.constexpr,
     PHILOX_ROUNDS: tl.constexpr,
@@ -522,6 +534,9 @@ def _checkpointing_main_kernel(
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
     offs_t = tl.arange(0, BLOCK_SIZE_T)
+    # Replay axis: separate from offs_t.  Spans [0, BLOCK_SIZE_WINDOW) ⊇
+    # [0, MAX_REPLAY_BUFFER_LENGTH); used for old-token loads (mask: offs_window < PNAT).
+    offs_window = tl.arange(0, BLOCK_SIZE_WINDOW)
     m_mask = offs_m < dim
     n_mask = offs_n < dstate
     t_mask = offs_t < T
@@ -551,16 +566,21 @@ def _checkpointing_main_kernel(
     # Phase 1: Replay via tl.dot fast-forward (reads from active_buf)
     group_idx = pid_h // nheads_ngroups_ratio
 
-    # Load precomputed dt and dA_cumsum from READ buffer
+    # Old-token mask along the WINDOW (replay) axis.  PNAT ≤ MAX ≤
+    # BLOCK_SIZE_WINDOW, so this enables all valid old-cache positions.
+    # (Distinct from t_mask = offs_t < T which gates output T-rows only.)
+    old_window_mask = offs_window < prev_num_accepted_tokens
+
+    # Load precomputed dt and dA_cumsum from READ buffer at [0, PNAT).
     old_dt_base = (
         old_dt_ptr
         + cache_batch_idx * stride_old_dt_cache
         + active_buf * stride_old_dt_dbuf
         + pid_h * stride_old_dt_head
     )
-    old_dt_all = tl.load(old_dt_base + offs_t * stride_old_dt_T, mask=t_mask, other=0.0).to(
-        tl.float32
-    )
+    old_dt_all = tl.load(
+        old_dt_base + offs_window * stride_old_dt_T, mask=old_window_mask, other=0.0
+    ).to(tl.float32)
 
     old_dA_cumsum_base = (
         old_dA_cumsum_ptr
@@ -569,31 +589,33 @@ def _checkpointing_main_kernel(
         + pid_h * stride_old_dA_cumsum_head
     )
     old_dA_cumsum_all = tl.load(
-        old_dA_cumsum_base + offs_t * stride_old_dA_cumsum_T, mask=t_mask, other=0.0
+        old_dA_cumsum_base + offs_window * stride_old_dA_cumsum_T,
+        mask=old_window_mask, other=0.0,
     ).to(tl.float32)
 
     # Load dA_cumsum at prev_k-1 directly via pointer math (avoids masked reduction).
-    # Clamp to [0, T-1] defensively — out-of-contract PNAT > T would read OOB.
-    prev_k_idx = tl.minimum(tl.maximum(prev_num_accepted_tokens - 1, 0), T - 1)
+    # Clamp to [0, MAX-1] defensively — caller contract gives PNAT ≤ MAX.
+    prev_k_idx = tl.minimum(
+        tl.maximum(prev_num_accepted_tokens - 1, 0), MAX_REPLAY_BUFFER_LENGTH - 1
+    )
     total_dA_cumsum = tl.load(old_dA_cumsum_base + prev_k_idx * stride_old_dA_cumsum_T).to(
         tl.float32
     )
 
     # Step 0 invariant: PNAT=0 means `state` is already last step's state (not
-    # two back).  coeff is all-zero (offs_t < 0), total_decay is 1.0, so the
-    # replay leaves `state` unchanged — cache contents don't matter on step 0.
+    # two back).  coeff is all-zero (old_window_mask all-false), total_decay
+    # is 1.0, so the replay leaves `state` unchanged — cache contents don't matter.
     coeff = tl.exp(total_dA_cumsum - old_dA_cumsum_all) * old_dt_all
-    coeff = tl.where(offs_t < prev_num_accepted_tokens, coeff, 0.0)
 
-    # Load old_x: (BLOCK_SIZE_T, BLOCK_SIZE_M) — single-buffered
+    # Load old_x at [0, PNAT) of the WINDOW axis (single-buffered cache).
     old_x_base = old_x_ptr + cache_batch_idx * stride_old_x_cache + pid_h * stride_old_x_head
     old_x_all = tl.load(
-        old_x_base + offs_t[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
-        mask=t_mask[:, None] & m_mask[None, :],
+        old_x_base + offs_window[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
+        mask=old_window_mask[:, None] & m_mask[None, :],
         other=0.0,
     )
 
-    # Load old_B from READ buffer: (BLOCK_SIZE_T, BLOCK_SIZE_DSTATE)
+    # Load old_B from READ buffer at [0, PNAT) of the WINDOW axis.
     old_B_base = (
         old_B_ptr
         + cache_batch_idx * stride_old_B_cache
@@ -601,8 +623,8 @@ def _checkpointing_main_kernel(
         + group_idx * stride_old_B_group
     )
     old_B_all = tl.load(
-        old_B_base + offs_t[:, None] * stride_old_B_T + offs_n[None, :] * stride_old_B_dstate,
-        mask=t_mask[:, None] & n_mask[None, :],
+        old_B_base + offs_window[:, None] * stride_old_B_T + offs_n[None, :] * stride_old_B_dstate,
+        mask=old_window_mask[:, None] & n_mask[None, :],
         other=0.0,
     ).to(tl.float32)
 
@@ -1292,6 +1314,7 @@ def checkpointing_state_update(
             rand_seed,
             pad_slot_id,
             T,
+            max_window,                      # MAX_REPLAY_BUFFER_LENGTH
             dim,
             dstate,
             nheads // ngroups,

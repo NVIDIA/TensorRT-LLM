@@ -172,23 +172,27 @@ def test_checkpointing_state_update(
         state0_scales = None
         ref_input_state = state0.float()
 
-    # Old inputs: T tokens per batch request
-    x1 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
-    dt1_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+    # Old inputs: up to `max_window` tokens per batch request, so the test
+    # loop can probe PNAT > T-1 (which the prior T-token setup couldn't
+    # reach).  step1_T = max_window covers the full PNAT range we sweep.
+    step1_T = max_window
+    x1 = torch.randn(batch, step1_T, nheads, head_dim, device=device, dtype=dtype)
+    dt1_base = torch.randn(batch, step1_T, nheads, device=device, dtype=dtype)
     dt1 = repeat(dt1_base, "b t h -> b t h p", p=head_dim)  # stride(-1)=0
-    B1 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
-    C1 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+    B1 = torch.randn(batch, step1_T, ngroups, d_state, device=device, dtype=dtype)
+    C1 = torch.randn(batch, step1_T, ngroups, d_state, device=device, dtype=dtype)
 
-    # Capture intermediate SSM states using selective_state_update.
+    # Capture intermediate SSM states using selective_state_update across
+    # all step1_T positions — gives us reference states for k ∈ [0, step1_T].
     states_buffer_f32 = torch.zeros(
-        cache_size, T, nheads, head_dim, d_state, device=device, dtype=torch.float32
+        cache_size, step1_T, nheads, head_dim, d_state, device=device, dtype=torch.float32
     )
     cache_idx_for_capture = (
         state_batch_indices
         if paged_cache
         else torch.arange(batch, device=device, dtype=torch.int32)
     )
-    out1 = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    out1 = torch.zeros(batch, step1_T, nheads, head_dim, device=device, dtype=dtype)
     selective_state_update(
         ref_input_state.clone(),
         x1,
@@ -201,7 +205,7 @@ def test_checkpointing_state_update(
         dt_softplus=True,
         state_batch_indices=cache_idx_for_capture,
         intermediate_states_buffer=states_buffer_f32,
-        cache_steps=T,
+        cache_steps=step1_T,
         out=out1,
         disable_state_update=True,
     )
@@ -219,11 +223,11 @@ def test_checkpointing_state_update(
     cache_buf_idx = torch.randint(0, 2, (cache_size,), device=device, dtype=torch.int32)
 
     # Fill each slot's active buffer (= cache_buf_idx) with step 1's data at
-    # positions [0:T).  Positions [T:max_window) stay as torch.randn garbage —
-    # they're outside the test's PNAT range, kernel doesn't read them.
-    # The OTHER (inactive) buffer has random garbage to catch indexing bugs.
+    # positions [0:step1_T) = [0:max_window).  Whole buffer covered so PNAT
+    # values up to max_window are exercised.  Inactive buffer has random
+    # garbage to catch indexing bugs.
     slots = state_batch_indices if paged_cache else slice(None)
-    old_x[slots, :T] = x1
+    old_x[slots, :step1_T] = x1
 
     # Compute processed dt and dA_cumsum for step 1
     dt1 = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
@@ -234,16 +238,25 @@ def test_checkpointing_state_update(
     for i, slot in enumerate(slot_indices):
         buf = cache_buf_idx[slot].item()
         batch_idx = i  # maps slot back to the batch index
-        old_B[slot, buf, :T] = B1[batch_idx]
-        old_dt[slot, buf, :, :T] = dt1[batch_idx].T  # (T, nheads) → (nheads, T)
-        old_dA_cumsum[slot, buf, :, :T] = dA_cumsum1[batch_idx].T  # (T, nheads) → (nheads, T)
+        old_B[slot, buf, :step1_T] = B1[batch_idx]
+        old_dt[slot, buf, :, :step1_T] = dt1[batch_idx].T  # (step1_T, nheads) → (nheads, step1_T)
+        old_dA_cumsum[slot, buf, :, :step1_T] = dA_cumsum1[batch_idx].T
 
-    # Main loop: test each k (number of old tokens replayed).  For
-    # write_checkpoint=False, the kernel writes new tokens at [k:k+T) of the
-    # active buffer — skip k where this would exceed max_window.
-    for k in range(T + 1):
-        if not write_checkpoint and k + T > max_window:
-            continue
+    # Main loop: test each k (number of old tokens replayed).
+    #   write_checkpoint=False (nowrite): k ∈ [0, max_window-T] — new tokens
+    #     append at [k, k+T) of the active buffer; need k+T ≤ max_window.
+    #   write_checkpoint=True  (write):   k ∈ [max_window-T+1, max_window] —
+    #     new tokens land in the staging buffer at [0, T); k > max_window-T
+    #     captures the overflow case that triggers a checkpoint in production.
+    # Combined sweep covers the full k ∈ [0, max_window] with the
+    # appropriate boundary handling per mode.
+    if write_checkpoint:
+        k_lo = max(0, max_window - T + 1)
+        k_hi = max_window + 1  # exclusive
+    else:
+        k_lo = 0
+        k_hi = max_window - T + 1  # exclusive
+    for k in range(k_lo, k_hi):
         torch.manual_seed(k + 100)
 
         x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
