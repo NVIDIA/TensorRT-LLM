@@ -984,7 +984,13 @@ class MXFP4EPShardingInfo(EPShardingInfo):
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """Validate the transformation configuration."""
-        if not is_op(node, torch.ops.auto_deploy.triton_mxfp4_moe):
+        if not is_op(
+            node,
+            [
+                torch.ops.auto_deploy.torch_mxfp4_moe,
+                torch.ops.auto_deploy.triton_mxfp4_moe,
+            ],
+        ):
             ad_logger.warning(f"EP sharding is only supported for MOE nodes. Skipping {self}.")
             return False
         return True
@@ -1062,6 +1068,7 @@ EP_SHARDING_RULES = [
         FineGrainedFP8EPShardingInfo,
     ),
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_moe), EPShardingInfo),
+    (lambda n: is_op(n, torch.ops.auto_deploy.torch_mxfp4_moe), MXFP4EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.triton_mxfp4_moe), MXFP4EPShardingInfo),
 ]
 
@@ -2241,9 +2248,9 @@ def _insert_sharded_mxfp4_mlp_ep(
     config: ShardingTransformConfig,
 ):
     """
-    Transform a call to auto_deploy::triton_mxfp4_moe into:
+    Transform a call to auto_deploy::torch_mxfp4_moe or auto_deploy::triton_mxfp4_moe into:
       - sharded expert parameters along dim 0 (this rank's slice),
-      - call to auto_deploy::triton_mxfp4_moe_ep(..., local_lo, local_hi),
+      - call to the matching *_mxfp4_moe_ep op,
       - followed by torch_dist_all_reduce.
 
     Expects the original op signature:
@@ -2277,7 +2284,10 @@ def _insert_sharded_mxfp4_mlp_ep(
     args[IDX_DOWN_SCALES] = _slice_expert_dim(gm, args[IDX_DOWN_SCALES], local_lo, local_hi)
 
     args_ep = tuple(args) + (int(world_size), int(rank))
-    node.target = torch.ops.auto_deploy.triton_mxfp4_moe_ep.default
+    if is_op(node, torch.ops.auto_deploy.torch_mxfp4_moe):
+        node.target = torch.ops.auto_deploy.torch_mxfp4_moe_ep.default
+    else:
+        node.target = torch.ops.auto_deploy.triton_mxfp4_moe_ep.default
     node.args = args_ep
 
     # Add a dist all-reduce after the op (sum partial results across EP ranks)

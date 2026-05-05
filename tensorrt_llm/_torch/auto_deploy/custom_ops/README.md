@@ -59,6 +59,10 @@ The table below lists the operators grouped by category.
 | `torch.ops.auto_deploy.torch_moe_dense_mlp` | Dense MLP implementation for MoE (PyTorch backend) |
 | `torch.ops.auto_deploy.torch_quant_fp8_moe` | FP8 quantized MoE (PyTorch backend) |
 | `torch.ops.auto_deploy.torch_quant_nvfp4_moe` | NVFP4 quantized MoE (PyTorch backend) |
+| `torch.ops.auto_deploy.torch_mxfp4_moe` | MXFP4 MoE reference implementation (PyTorch backend) |
+| `torch.ops.auto_deploy.torch_mxfp4_moe_from_routing` | Routing-driven MXFP4 MoE reference implementation (PyTorch backend) |
+| `torch.ops.auto_deploy.torch_mxfp4_moe_from_routing_ep` | Routing-driven MXFP4 MoE reference implementation with Expert Parallelism (PyTorch backend) |
+| `torch.ops.auto_deploy.torch_mxfp4_moe_ep` | MXFP4 MoE reference implementation with Expert Parallelism (PyTorch backend) |
 | `torch.ops.auto_deploy.triton_moe_fused` | Fused MoE (Triton backend) |
 | `torch.ops.auto_deploy.triton_quant_fp8_moe` | FP8 quantized MoE (Triton backend) |
 | `torch.ops.auto_deploy.triton_mxfp4_moe` | MXFP4 MoE with triton-kernels matmul_ogs |

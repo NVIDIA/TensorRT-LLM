@@ -15,6 +15,7 @@
 
 import json
 import math
+import os
 import struct
 from pathlib import Path
 
@@ -31,6 +32,8 @@ from tensorrt_llm._torch.auto_deploy.models.quant_config_reader import (
     HFQuantConfigReader,
     autodetect_quant_config_reader,
 )
+
+_DEEPSEEK_V4_FLASH_ENV_VARS = ("DEEPSEEK_V4_FLASH_MODEL_DIR", "DEEPSEEK_V4_MODEL_DIR")
 
 
 def _deepseek_v4_config() -> dict[str, object]:
@@ -167,6 +170,37 @@ def _assert_deepseek_v4_checkpoint_layout(checkpoint_layout: object) -> None:
     assert isinstance(checkpoint_layout.packed_mxfp4_experts, PackedMxfp4ExpertsCheckpointLayout)
 
 
+def _deepseek_v4_flash_checkpoint_or_skip() -> Path:
+    candidates: list[Path] = []
+    for env_var in _DEEPSEEK_V4_FLASH_ENV_VARS:
+        value = os.environ.get(env_var)
+        if value:
+            candidates.append(Path(value))
+
+    models_root = os.environ.get("LLM_MODELS_ROOT")
+    if models_root:
+        root = Path(models_root)
+        candidates.extend(
+            (
+                root / "DeepSeek-V4-Flash",
+                root / "DeepSeek-V4" / "DeepSeek-V4-Flash",
+                root / "deepseek-ai" / "DeepSeek-V4-Flash",
+            )
+        )
+
+    for candidate in candidates:
+        has_safetensors = (candidate / "model.safetensors.index.json").is_file() or any(
+            candidate.glob("*.safetensors")
+        )
+        if (candidate / "config.json").is_file() and has_safetensors:
+            return candidate
+
+    pytest.skip(
+        "DeepSeek-V4-Flash checkpoint not found; set DEEPSEEK_V4_FLASH_MODEL_DIR "
+        "or LLM_MODELS_ROOT to enable this metadata validation."
+    )
+
+
 def test_deepseek_v4_checkpoint_layout_is_registered() -> None:
     checkpoint_layout = QuantCheckpointLayoutRegistry.build_from_config(_deepseek_v4_config())
 
@@ -217,7 +251,7 @@ def test_deepseek_v4_hf_reader_returns_normalized_quant_config(tmp_path: Path) -
 
     assert result is not None
     reader, extra_model_kwargs = result
-    assert extra_model_kwargs == {}
+    assert extra_model_kwargs == {"ad_use_mxfp4_experts": True}
     qcfg = reader.get_config()
     assert qcfg["quant_method"] == "fp8"
     assert qcfg["scale_fmt"] == "ue8m0"
@@ -353,6 +387,32 @@ def test_deepseek_v4_layout_validates_scale_shapes(
         HFQuantConfigReader.from_file(str(tmp_path))
 
 
+def test_deepseek_v4_layout_requires_fp8_companion_scale_metadata(tmp_path: Path) -> None:
+    tensor_metadata = _deepseek_v4_tensor_metadata()
+    del tensor_metadata["layers.0.attn.wq_a.scale"]
+    _write_deepseek_v4_checkpoint_fixture(tmp_path, tensor_metadata)
+
+    with pytest.raises(ValueError, match=r"wq_a\.weight is missing companion scale"):
+        HFQuantConfigReader.from_file(str(tmp_path))
+
+
+def test_deepseek_v4_layout_skips_mtp_metadata_without_companion_scale(
+    tmp_path: Path,
+) -> None:
+    tensor_metadata = _deepseek_v4_tensor_metadata()
+    tensor_metadata["mtp.0.layers.0.attn.wq_a.weight"] = {
+        "dtype": "F8_E4M3",
+        "shape": [1024, 4096],
+    }
+    _write_deepseek_v4_checkpoint_fixture(tmp_path, tensor_metadata)
+
+    result = HFQuantConfigReader.from_file(str(tmp_path))
+
+    assert result is not None
+    reader, _ = result
+    assert "mtp.*" in reader.get_config()["exclude_modules"]
+
+
 def test_deepseek_v4_layout_requires_complete_mxfp4_expert_projection_metadata(
     tmp_path: Path,
 ) -> None:
@@ -372,6 +432,20 @@ def test_autodetect_preserves_deepseek_v4_metadata_errors(tmp_path: Path) -> Non
 
     with pytest.raises(ValueError, match=r"expected (?:\(8, 32\)|\[8, 32\])"):
         autodetect_quant_config_reader(str(tmp_path))
+
+
+def test_deepseek_v4_flash_real_checkpoint_metadata_validates_when_available() -> None:
+    checkpoint_dir = _deepseek_v4_flash_checkpoint_or_skip()
+
+    result = HFQuantConfigReader.from_file(str(checkpoint_dir))
+
+    assert result is not None
+    reader, extra_model_kwargs = result
+    assert extra_model_kwargs == {"ad_use_mxfp4_experts": True}
+    qcfg = reader.get_config()
+    _assert_deepseek_v4_checkpoint_layout(qcfg["checkpoint_layout"])
+    assert qcfg["scale_fmt"] == "ue8m0"
+    assert qcfg["expert_quant_method"] == "mxfp4"
 
 
 def test_non_deepseek_fp8_config_uses_generic_hf_behavior() -> None:

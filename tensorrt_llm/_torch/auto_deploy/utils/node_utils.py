@@ -680,6 +680,8 @@ def is_any_moe_op(node: Node) -> bool:
                 _auto_deploy_op("torch_quant_fp8_moe"),
                 _auto_deploy_op("torch_quant_nvfp4_moe"),
                 _auto_deploy_op("torch_quant_finegrained_fp8_moe"),
+                _auto_deploy_op("torch_mxfp4_moe"),
+                _auto_deploy_op("torch_mxfp4_moe_from_routing"),
                 _auto_deploy_op("triton_mxfp4_moe"),
                 _auto_deploy_op("torch_moe_fused"),
                 _auto_deploy_op("torch_moe_dense_mlp"),

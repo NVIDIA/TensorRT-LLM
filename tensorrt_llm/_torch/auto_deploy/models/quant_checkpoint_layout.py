@@ -24,7 +24,7 @@ import operator
 import re
 import struct
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypeAlias
 
@@ -666,6 +666,7 @@ class QuantizedCheckpointLayout:
 
     finegrained_fp8: FineGrainedFP8CheckpointLayout | None = None
     packed_mxfp4_experts: PackedMxfp4ExpertsCheckpointLayout | None = None
+    extra_model_kwargs: Mapping[str, object] = field(default_factory=dict)
 
     def validate_checkpoint_metadata(self, tensor_metadata: CheckpointMetadata) -> None:
         if self.finegrained_fp8 is not None:
@@ -675,6 +676,9 @@ class QuantizedCheckpointLayout:
 
     def validate_consumed_metadata(self, tensor_metadata: CheckpointMetadata) -> None:
         self.validate_checkpoint_metadata(tensor_metadata)
+
+    def model_kwargs(self) -> dict[str, object]:
+        return dict(self.extra_model_kwargs)
 
     def apply_to_quant_config(self, quant_config: Mapping[str, object]) -> dict[str, object]:
         normalized = dict(quant_config)

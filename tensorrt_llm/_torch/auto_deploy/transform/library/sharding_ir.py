@@ -27,7 +27,7 @@ for background.
 import operator
 from abc import ABC, abstractmethod
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Type
 
 import torch
 from pydantic import Field, field_validator
@@ -466,19 +466,58 @@ class ViewShardableNode(ShardableNode):
         return True
 
     def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
-        [tp_scaled_dim, view_shape] = extract_op_args(self.node, "tp_scaled_dim", "shape")
+        [tp_scaled_dim, view_shape, tp_min_local_shape] = extract_op_args(
+            self.node, "tp_scaled_dim", "shape", "tp_min_local_shape"
+        )
         if tp_scaled_dim == -1:
             return 0
 
         view_shape = list(view_shape)
         if tp_scaled_dim < 0:
             tp_scaled_dim = len(view_shape) + tp_scaled_dim
+        modified = self._shard_parameter_input(gm, dc, tp_scaled_dim, tp_min_local_shape)
         if tp_scaled_dim < len(view_shape) and isinstance(view_shape[tp_scaled_dim], int):
             view_shape[tp_scaled_dim] = -1
             set_op_args(self.node, shape=view_shape)
             ad_logger.debug(f"  updated view shape at dim {tp_scaled_dim} to -1 (inferred)")
-            return 1
-        return 0
+            modified = 1
+        return modified
+
+    def _shard_parameter_input(
+        self,
+        gm: GraphModule,
+        dc: DistConfig,
+        tp_scaled_dim: int,
+        tp_min_local_shape: Optional[int],
+    ) -> int:
+        """Shard get_attr tensors that are reshaped by a sharding-aware view."""
+        view_input = self.node.args[0]
+        if not isinstance(view_input, Node) or view_input.op != "get_attr":
+            return 0
+        if tp_scaled_dim != 0:
+            raise RuntimeError(
+                "Parameter sharding through auto_deploy.view currently supports "
+                f"tp_scaled_dim=0, got {tp_scaled_dim} on {self.node.name}."
+            )
+
+        weight_nodes = extract_weight_nodes(view_input)
+        shardable = weight_nodes.weights + weight_nodes.biases
+        if not shardable:
+            return 0
+
+        min_shape = tp_min_local_shape if tp_min_local_shape else 1
+        for wn in shardable:
+            shard_weight_tensor(
+                gm=gm,
+                weight_tensor=wn.tensor,
+                param_key=wn.node_key,
+                dim=0,
+                rank=dc.tp_rank,
+                world_size=dc.tp_size,
+                min_local_shape=min_shape,
+            )
+        ad_logger.debug(f"  sharded {len(shardable)} parameter(s) feeding view {self.node.name}")
+        return 1
 
 
 @ShardableNode.register(torch.ops.auto_deploy.split_with_sizes)
@@ -631,7 +670,7 @@ class WeightedParamShardableNode(ShardableNode):
 
 
 @ShardableNode.register(torch.ops.auto_deploy.torch_attention)
-class AttentionSinksShardableNode(ShardableNode):
+class AttentionSinkShardableNode(ShardableNode):
     """``torch_attention`` with per-head ``sinks``: shard sinks along the head dim.
 
     Attention-sink models (e.g. GPT-OSS) add a learnable per-head sink scalar
@@ -647,6 +686,11 @@ class AttentionSinksShardableNode(ShardableNode):
     def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
         if dc.tp_size <= 1:
             return 0
+
+        [enable_sharding] = extract_op_args(self.node, "enable_sharding")
+        if enable_sharding is False:
+            return 0
+
         count = 0
         for wn in extract_weight_nodes(self.node).weights:
             # Only the per-head ``sinks`` (1-D) follows the head split; never a 2-D weight.
@@ -670,6 +714,18 @@ class AttentionSinksShardableNode(ShardableNode):
         # Leave ``torch_attention`` untouched at strip time: its ``layer_type`` is a
         # benign op default that downstream backend selection reads as-is.
         return False
+
+
+for _sparse_attention_op_name in (
+    "torch_deepseek_v4_sparse_attention",
+    "torch_deepseek_v4_sparse_attention_with_cache",
+):
+    try:
+        ShardableNode.register(getattr(torch.ops.auto_deploy, _sparse_attention_op_name))(
+            AttentionSinkShardableNode
+        )
+    except AttributeError:
+        pass
 
 
 @ShardableNode.register(*_auto_deploy_ops("torch_rmsnorm_gated", "triton_rmsnorm_gated"))
@@ -903,6 +959,14 @@ class MoEShardableNode(ShardableNode):
             self._localize_expert_indices(
                 gm, selected_experts, routing_weights, experts_per_rank, ep_rank, ep_size
             )
+            _, all_reduce_op = _get_dist_ops("auto")
+            with gm.graph.inserting_after(self.node):
+                red = gm.graph.call_function(
+                    all_reduce_op,
+                    args=(self.node, dc.allreduce_strategy),
+                )
+                self.node.replace_all_uses_with(red)
+                red.replace_input_with(red, self.node)
 
         ad_logger.debug(
             f"  sharded MoE: {num_experts} experts, ep={ep_size}, ep_rank={ep_rank}, "
@@ -953,6 +1017,31 @@ class MoEShardableNode(ShardableNode):
         )
 
 
+class _StackedMoESchema(NamedTuple):
+    """Argument layout for stacked-expert MoE custom ops."""
+
+    expert_arg_names: Tuple[str, ...]
+    optional_trailing_arg_names: Tuple[str, ...]
+
+
+_STACKED_MOE_EXPERT_ARGS = (
+    "gate_up_blocks",
+    "gate_up_bias",
+    "gate_up_scales",
+    "down_blocks",
+    "down_bias",
+    "down_scales",
+)
+_ROUTER_STACKED_MOE_SCHEMA = _StackedMoESchema(
+    expert_arg_names=_STACKED_MOE_EXPERT_ARGS,
+    optional_trailing_arg_names=("layer_type",),
+)
+_ROUTING_DRIVEN_STACKED_MOE_SCHEMA = _StackedMoESchema(
+    expert_arg_names=_STACKED_MOE_EXPERT_ARGS,
+    optional_trailing_arg_names=("gate_up_order", "swiglu_mode", "layer_type"),
+)
+
+
 class StackedMoEShardableNode(ShardableNode):
     """Stacked-tensor MoE EP sharding: slice along the expert dimension and rewrite.
 
@@ -961,18 +1050,128 @@ class StackedMoEShardableNode(ShardableNode):
     stacked into 3-D tensors (``Tensor[num_experts, ...]``).  Sharding slices
     along dim 0 to select the local expert partition.
 
-    Currently the only registered variant is ``triton_mxfp4_moe`` (MXFP4
-    quantized), but the approach generalises to any stacked-tensor MoE op.
-    The op is rewritten to ``triton_mxfp4_moe_ep`` with an explicit
+    Registered MXFP4 variants carry explicit argument schemas.  This covers both
+    router-style ops that compute top-k internally and routing-driven ops that
+    receive ``selected_experts``/``routing_weights`` from a separate router.
+    Each variant rewrites to its matching ``*_ep`` op with an explicit
     ``all_reduce`` after the node.
     """
 
-    _IDX_GATE_UP_BLOCKS = 4
-    _IDX_GATE_UP_BIAS = 5
-    _IDX_GATE_UP_SCALES = 6
-    _IDX_DOWN_BLOCKS = 9
-    _IDX_DOWN_BIAS = 10
-    _IDX_DOWN_SCALES = 11
+    _EP_TARGET_BY_BASE: Dict[Any, OpOverload] = {}
+    _SCHEMA_BY_BASE: Dict[Any, _StackedMoESchema] = {}
+
+    @classmethod
+    def register_variant(
+        cls,
+        base_target,
+        ep_target: OpOverload,
+        schema: Optional[_StackedMoESchema] = None,
+    ) -> None:
+        """Register one stacked MXFP4 MoE op and remember its matching EP op."""
+        schema = schema or cls._infer_schema(base_target)
+        ShardableNode.register(base_target)(cls)
+        cls._EP_TARGET_BY_BASE[base_target] = ep_target
+        cls._SCHEMA_BY_BASE[base_target] = schema
+        if isinstance(base_target, OpOverloadPacket):
+            for overload_name in base_target.overloads():
+                overload = getattr(base_target, overload_name)
+                cls._EP_TARGET_BY_BASE[overload] = ep_target
+                cls._SCHEMA_BY_BASE[overload] = schema
+
+    @classmethod
+    def _arg_positions(cls, target) -> Dict[str, int]:
+        overload = (
+            getattr(target, "default", target) if isinstance(target, OpOverloadPacket) else target
+        )
+        schema = getattr(overload, "_schema", None)
+        if schema is None:
+            return {}
+        return {arg.name: idx for idx, arg in enumerate(schema.arguments)}
+
+    @classmethod
+    def _infer_schema(cls, target) -> _StackedMoESchema:
+        arg_positions = cls._arg_positions(target)
+        if not arg_positions:
+            raise RuntimeError(f"Cannot infer stacked MoE schema for op {target}")
+
+        if not all(arg_name in arg_positions for arg_name in _STACKED_MOE_EXPERT_ARGS):
+            raise RuntimeError(f"Op {target} does not match the stacked MXFP4 MoE expert schema")
+
+        if {"selected_experts", "routing_weights"}.issubset(arg_positions):
+            return _ROUTING_DRIVEN_STACKED_MOE_SCHEMA
+        if {"router_weight", "router_bias", "top_k"}.issubset(arg_positions):
+            return _ROUTER_STACKED_MOE_SCHEMA
+        raise RuntimeError(f"Op {target} does not expose a supported stacked MXFP4 routing schema")
+
+    @classmethod
+    def _ep_target_for(cls, target) -> Optional[OpOverload]:
+        ep_target = cls._EP_TARGET_BY_BASE.get(target)
+        if ep_target is None and isinstance(target, OpOverloadPacket):
+            ep_target = cls._EP_TARGET_BY_BASE.get(getattr(target, "default", None))
+        return ep_target
+
+    @classmethod
+    def _schema_for(cls, target) -> Optional[_StackedMoESchema]:
+        schema = cls._SCHEMA_BY_BASE.get(target)
+        if schema is None and isinstance(target, OpOverloadPacket):
+            schema = cls._SCHEMA_BY_BASE.get(getattr(target, "default", None))
+        return schema
+
+    @classmethod
+    def _move_optional_args_to_kwargs(
+        cls,
+        args: List[Any],
+        kwargs: Dict[str, Any],
+        base_target,
+        ep_target,
+        arg_names: Tuple[str, ...],
+    ) -> Tuple[List[Any], Dict[str, Any]]:
+        base_positions = cls._arg_positions(base_target)
+        ep_positions = cls._arg_positions(ep_target)
+        ordered_names = sorted(
+            arg_names,
+            key=lambda name: base_positions.get(name, -1),
+            reverse=True,
+        )
+        for arg_name in ordered_names:
+            base_pos = base_positions.get(arg_name)
+            if base_pos is None:
+                continue
+            if arg_name not in ep_positions:
+                if arg_name in kwargs or base_pos < len(args):
+                    raise RuntimeError(
+                        f"Cannot preserve argument '{arg_name}' when rewriting "
+                        f"{base_target} to {ep_target}: EP op does not accept it."
+                    )
+                continue
+            if arg_name in kwargs:
+                continue
+            if base_pos < len(args):
+                kwargs[arg_name] = args.pop(base_pos)
+        return args, kwargs
+
+    @classmethod
+    def _ep_topology_args(
+        cls, ep_target: OpOverload, expert_start: int, ep_size: int, ep_rank: int
+    ) -> Dict[str, int]:
+        ep_positions = cls._arg_positions(ep_target)
+        topology_args: Dict[str, int] = {}
+        if "expert_start" in ep_positions:
+            topology_args["expert_start"] = int(expert_start)
+
+        has_ep_size = "ep_size" in ep_positions
+        has_ep_rank = "ep_rank" in ep_positions
+        if has_ep_size or has_ep_rank:
+            if not (has_ep_size and has_ep_rank):
+                raise RuntimeError(f"EP op {ep_target} must accept both ep_size and ep_rank")
+            topology_args["ep_size"] = int(ep_size)
+            topology_args["ep_rank"] = int(ep_rank)
+
+        if not topology_args:
+            raise RuntimeError(
+                f"EP op {ep_target} must accept expert_start or ep_size/ep_rank topology args"
+            )
+        return topology_args
 
     def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
         ep_size = dc.moe_ep_size
@@ -980,10 +1179,19 @@ class StackedMoEShardableNode(ShardableNode):
 
         if ep_size <= 1:
             return 0
+        ep_target = self._ep_target_for(self.node.target)
+        if ep_target is None:
+            raise RuntimeError(f"No EP target registered for stacked MoE op {self.node.target}")
+        schema = self._schema_for(self.node.target)
+        if schema is None:
+            raise RuntimeError(f"No stacked MoE schema registered for op {self.node.target}")
 
-        expert_shape = shape(self.node.args[self._IDX_GATE_UP_BLOCKS])
+        expert_args = extract_op_args(self.node, *schema.expert_arg_names)
+        first_expert_name = schema.expert_arg_names[0]
+        first_expert_arg = expert_args[0]
+        expert_shape = shape(first_expert_arg)
         assert expert_shape is not None, (
-            f"Cannot determine num_experts: gate_up_blocks arg has no shape metadata "
+            f"Cannot determine num_experts: {first_expert_name} arg has no shape metadata "
             f"(node: {self.node.name})"
         )
         num_experts = expert_shape[0]
@@ -991,23 +1199,37 @@ class StackedMoEShardableNode(ShardableNode):
         lo = base * ep_rank
         hi = num_experts if ep_rank == ep_size - 1 else base * (ep_rank + 1)
 
-        args = list(self.node.args)
-        for idx in (
-            self._IDX_GATE_UP_BLOCKS,
-            self._IDX_GATE_UP_BIAS,
-            self._IDX_GATE_UP_SCALES,
-            self._IDX_DOWN_BLOCKS,
-            self._IDX_DOWN_BIAS,
-            self._IDX_DOWN_SCALES,
-        ):
-            with gm.graph.inserting_after(args[idx]):
-                args[idx] = gm.graph.call_function(
+        sliced_expert_args = {}
+        for arg_name, arg in zip(schema.expert_arg_names, expert_args):
+            with gm.graph.inserting_before(self.node):
+                sliced_expert_args[arg_name] = gm.graph.call_function(
                     torch.ops.aten.slice.Tensor,
-                    args=(args[idx], 0, lo, hi, 1),
+                    args=(arg, 0, lo, hi, 1),
                 )
+        set_op_args(self.node, **sliced_expert_args)
 
-        self.node.target = torch.ops.auto_deploy.triton_mxfp4_moe_ep.default
-        self.node.args = tuple(args) + (int(ep_size), int(ep_rank))
+        args = list(self.node.args)
+        kwargs = dict(self.node.kwargs or {})
+        args, kwargs = self._move_optional_args_to_kwargs(
+            args,
+            kwargs,
+            self.node.target,
+            ep_target,
+            schema.optional_trailing_arg_names,
+        )
+
+        self.node.target = ep_target
+        self.node.args = tuple(args)
+        self.node.kwargs = kwargs
+        set_op_args(
+            self.node,
+            **self._ep_topology_args(
+                ep_target=ep_target,
+                expert_start=lo,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+            ),
+        )
 
         _, all_reduce_op = _get_dist_ops("auto")
         with gm.graph.inserting_after(self.node):
@@ -1024,13 +1246,27 @@ class StackedMoEShardableNode(ShardableNode):
         return 1
 
 
-# MXFP4 MoE ops depend on triton_kernels + TRT-LLM internals that aren't in the
-# standalone package, so the op may not be registered at import time. Register
-# only when the op is actually available.
-try:
-    ShardableNode.register(torch.ops.auto_deploy.triton_mxfp4_moe)(StackedMoEShardableNode)
-except AttributeError:
-    pass
+def _register_stacked_mxfp4_moe_variant(base_name: str, ep_name: str) -> None:
+    """Register an optional stacked MXFP4 MoE op pair when both schemas exist."""
+    try:
+        base_target = getattr(torch.ops.auto_deploy, base_name)
+        ep_target = getattr(torch.ops.auto_deploy, ep_name).default
+    except AttributeError:
+        return
+    StackedMoEShardableNode.register_variant(base_target, ep_target)
+
+
+for _base_name, _ep_name in (
+    ("triton_mxfp4_moe", "triton_mxfp4_moe_ep"),
+    ("torch_mxfp4_moe", "torch_mxfp4_moe_ep"),
+    ("triton_mxfp4_moe_from_routing", "triton_mxfp4_moe_from_routing_ep"),
+    ("torch_mxfp4_moe_from_routing", "torch_mxfp4_moe_from_routing_ep"),
+    ("triton_mxfp4_moe_routing", "triton_mxfp4_moe_routing_ep"),
+    ("torch_mxfp4_moe_routing", "torch_mxfp4_moe_routing_ep"),
+    ("triton_mxfp4_moe_with_routing", "triton_mxfp4_moe_with_routing_ep"),
+    ("torch_mxfp4_moe_with_routing", "torch_mxfp4_moe_with_routing_ep"),
+):
+    _register_stacked_mxfp4_moe_variant(_base_name, _ep_name)
 
 
 # =============================================================================

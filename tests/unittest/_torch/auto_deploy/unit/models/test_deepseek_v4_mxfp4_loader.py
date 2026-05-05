@@ -19,6 +19,11 @@ from collections.abc import Sequence
 import pytest
 import torch
 
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
+    DeepseekV4Config,
+    DeepseekV4ForCausalLM,
+    DeepseekV4MoE,
+)
 from tensorrt_llm._torch.auto_deploy.models.quant_checkpoint_layout import (
     PackedMxfp4ExpertsCheckpointLayout,
 )
@@ -26,6 +31,27 @@ from tensorrt_llm._torch.auto_deploy.models.quant_checkpoint_layout import (
 HIDDEN_SIZE = 64
 INTERMEDIATE_SIZE = 32
 LAYER = 3
+_E2M1_VALUES = torch.tensor(
+    [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ],
+    dtype=torch.float32,
+)
 
 
 def _layout() -> PackedMxfp4ExpertsCheckpointLayout:
@@ -40,6 +66,39 @@ def _layout() -> PackedMxfp4ExpertsCheckpointLayout:
     )
 
 
+def _small_deepseek_v4_config(**overrides: object) -> DeepseekV4Config:
+    values = {
+        "vocab_size": 16,
+        "hidden_size": HIDDEN_SIZE,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 1,
+        "head_dim": 16,
+        "q_lora_rank": 16,
+        "qk_rope_head_dim": 8,
+        "o_lora_rank": 16,
+        "o_groups": 2,
+        "sliding_window": 4,
+        "compress_ratios": (0,),
+        "index_n_heads": 2,
+        "index_head_dim": 16,
+        "index_topk": 2,
+        "moe_intermediate_size": INTERMEDIATE_SIZE,
+        "n_routed_experts": 2,
+        "n_shared_experts": 1,
+        "num_experts_per_tok": 1,
+        "num_hash_layers": 0,
+        "max_position_embeddings": 16,
+        "ad_rope_cache_len": 16,
+        "ad_compress_max_seq_len": 16,
+        "hc_mult": 1,
+        "hc_sinkhorn_iters": 1,
+        "ad_use_mxfp4_experts": True,
+    }
+    values.update(overrides)
+    return DeepseekV4Config(**values)
+
+
 def _key(layer: int, expert: int, weight_name: str, tensor_kind: str) -> str:
     return f"layers.{layer}.ffn.experts.{expert}.{weight_name}.{tensor_kind}"
 
@@ -47,6 +106,39 @@ def _key(layer: int, expert: int, weight_name: str, tensor_kind: str) -> str:
 def _raw_bytes(shape: Sequence[int], offset: int) -> torch.Tensor:
     values = (torch.arange(math.prod(shape), dtype=torch.int64) + offset) % 256
     return values.to(torch.uint8).reshape(tuple(shape))
+
+
+def _controlled_mxfp4_weight(
+    shape: tuple[int, int], offset: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, cols = shape
+    assert cols % 32 == 0
+    codes = (torch.arange(rows * cols, dtype=torch.int64) + offset) % len(_E2M1_VALUES)
+    codes = codes.reshape(rows, cols).to(torch.uint8)
+    block_codes = codes.reshape(rows, cols // 32, 32)
+    packed = (block_codes[..., 0::2] | (block_codes[..., 1::2] << 4)).to(torch.uint8)
+    scales = torch.full((rows, cols // 32), 127, dtype=torch.uint8)
+    return packed.reshape(rows, cols // 2), scales
+
+
+def _controlled_mxfp4_state(
+    *,
+    experts: Sequence[int],
+    layer: int,
+    hidden_size: int = HIDDEN_SIZE,
+    intermediate_size: int = INTERMEDIATE_SIZE,
+) -> dict[str, torch.Tensor]:
+    state = {}
+    for expert in experts:
+        for projection, shape, offset in (
+            ("w1", (intermediate_size, hidden_size), 3),
+            ("w2", (hidden_size, intermediate_size), 7),
+            ("w3", (intermediate_size, hidden_size), 11),
+        ):
+            weight, scales = _controlled_mxfp4_weight(shape, offset + 17 * expert)
+            state[_key(layer, expert, projection, "weight")] = weight
+            state[_key(layer, expert, projection, "scale")] = scales
+    return state
 
 
 def _raw_uint8(tensor: torch.Tensor) -> torch.Tensor:
@@ -421,3 +513,105 @@ def test_explicit_expert_subset_order() -> None:
     assert subset.expert_indices == (3, 1)
     assert torch.equal(subset.down_scales[0], _scale(state, 3, "w2"))
     assert torch.equal(subset.down_scales[1], _scale(state, 1, "w2"))
+
+
+def test_deepseek_v4_load_state_dict_skips_mtp_checkpoint_keys() -> None:
+    model = DeepseekV4ForCausalLM(_small_deepseek_v4_config(ad_use_mxfp4_experts=False)).eval()
+
+    incompatible = model.load_state_dict(
+        {"model.mtp.0.attn.wq_a.weight": torch.empty(1)},
+        strict=False,
+    )
+
+    assert incompatible.unexpected_keys == []
+
+
+def test_deepseek_v4_load_state_dict_accepts_packed_mxfp4_runtime_buffers() -> None:
+    layer = 0
+    source_state = {
+        name: tensor
+        for name, tensor in _state_dict(experts=(0, 1), layer=layer).items()
+        if f"layers.{layer}.ffn.experts." in name and ".w4." not in name
+    }
+    expected = _layout().pack_experts(
+        source_state,
+        layer=layer,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE,
+        num_experts=2,
+    )
+    checkpoint_state = {f"model.{name}": tensor for name, tensor in source_state.items()}
+    model = DeepseekV4ForCausalLM(_small_deepseek_v4_config()).eval()
+
+    incompatible = model.load_state_dict(checkpoint_state, strict=False)
+
+    assert incompatible.unexpected_keys == []
+    moe = model.layers[layer].ffn
+    assert torch.equal(moe.experts.gate_up_proj_blocks, expected.gate_up_blocks)
+    assert torch.equal(moe.experts.gate_up_proj_scales, expected.gate_up_scales)
+    assert torch.equal(moe.experts.down_proj_blocks, expected.down_blocks)
+    assert torch.equal(moe.experts.down_proj_scales, expected.down_scales)
+
+
+def test_deepseek_v4_moe_forward_uses_routing_driven_packed_mxfp4_experts() -> None:
+    layer = 0
+    config = _small_deepseek_v4_config(
+        num_experts_per_tok=2,
+        num_hash_layers=1,
+        swiglu_limit=0.75,
+    )
+    moe = DeepseekV4MoE(config, layer_idx=layer).eval()
+    source_state = _controlled_mxfp4_state(experts=(0, 1), layer=layer)
+    packed = _layout().pack_experts(
+        source_state,
+        layer=layer,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE,
+        num_experts=2,
+    )
+    moe.experts.gate_up_proj_blocks = packed.gate_up_blocks
+    moe.experts.gate_up_proj_scales = packed.gate_up_scales
+    moe.experts.down_proj_blocks = packed.down_blocks
+    moe.experts.down_proj_scales = packed.down_scales
+
+    for expert in moe.experts:
+        expert.w1.weight.data.zero_()
+        expert.w2.weight.data.zero_()
+        expert.w3.weight.data.zero_()
+    for param in moe.shared_experts.parameters():
+        param.data.zero_()
+    moe.gate.weight.data.zero_()
+    tid2eid = torch.zeros_like(moe.gate.tid2eid)
+    tid2eid[:, 0] = torch.arange(tid2eid.shape[0], dtype=torch.long) % 2
+    tid2eid[:, 1] = 1 - tid2eid[:, 0]
+    moe.gate.tid2eid.copy_(tid2eid)
+
+    hidden_states = torch.linspace(
+        -0.25,
+        0.25,
+        steps=3 * HIDDEN_SIZE,
+        dtype=torch.float32,
+    ).reshape(1, 3, HIDDEN_SIZE)
+    input_ids = torch.tensor([[0, 1, 2]], dtype=torch.long)
+    hidden_states_flat = hidden_states.reshape(-1, HIDDEN_SIZE)
+    selected_experts, routing_weights = moe.gate(hidden_states_flat, input_ids.reshape(-1))
+
+    expected = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing(
+        hidden_states_flat,
+        selected_experts,
+        routing_weights.to(hidden_states.dtype),
+        packed.gate_up_blocks,
+        moe.experts.gate_up_proj_bias,
+        packed.gate_up_scales,
+        1.0,
+        config.swiglu_limit,
+        packed.down_blocks,
+        moe.experts.down_proj_bias,
+        packed.down_scales,
+        "up_gate",
+        "deepseek",
+    ).reshape_as(hidden_states)
+    actual = moe(hidden_states, input_ids)
+
+    assert expected.abs().max() > 0
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)

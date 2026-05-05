@@ -251,7 +251,7 @@ class HFQuantConfigReader(QuantConfigReader):
             layout.validate_consumed_metadata(tensor_metadata)
             self._quant_config = layout.apply_to_quant_config(qconf)
             self._hf_quantizer = None
-            return {}
+            return layout.model_kwargs()
 
         # Inject default exclusion, add "model.embed_tokens" for "tie_word_embedding:true" case
         excludes = qconf.get("exclude_modules", [])

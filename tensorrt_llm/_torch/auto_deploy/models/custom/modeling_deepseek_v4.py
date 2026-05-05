@@ -17,7 +17,7 @@
 
 The implementation keeps the DeepSeek reference hierarchy
 ``embed`` / ``layers`` / ``norm`` / ``head`` so checkpoint-facing names remain
-auditable. It intentionally omits cached decode, Triton kernels, sharding IR, and
+auditable. It intentionally omits cached decode, Triton kernels, CUDA graph, and
 MTP modules. Sparse attention uses the narrow source-op boundary: this model
 forms Q/KV, compressor rows, and top-k indices; the source op owns only attention
 over those already-formed tensors plus the sink term.
@@ -99,6 +99,7 @@ class DeepseekV4Config(PretrainedConfig):
         hc_eps: float = 1e-6,
         ad_rope_cache_len: Optional[int] = None,
         ad_compress_max_seq_len: Optional[int] = None,
+        ad_use_mxfp4_experts: bool = False,
         skip_mtp: bool = True,
         use_cache: bool = False,
         attention_bias: bool = False,
@@ -155,6 +156,7 @@ class DeepseekV4Config(PretrainedConfig):
         self.hc_eps = hc_eps
         self.ad_rope_cache_len = ad_rope_cache_len or min(max_position_embeddings, 4096)
         self.ad_compress_max_seq_len = ad_compress_max_seq_len or self.ad_rope_cache_len
+        self.ad_use_mxfp4_experts = ad_use_mxfp4_experts
         self.skip_mtp = skip_mtp
         self.use_cache = use_cache
         self.attention_bias = attention_bias
@@ -202,6 +204,19 @@ _DEEPSEEK_V4_MXFP4_EXPERT_PATTERN = (
     r"(?P<projection>w[123])\.(?P<kind>weight|scale)"
 )
 _DEEPSEEK_V4_MXFP4_EXPERT_TEMPLATE = "layers.{layer}.ffn.experts.{expert}.{projection}.{kind}"
+
+
+def _deepseek_v4_packed_mxfp4_experts_layout(
+    scale_fmt: str = "ue8m0",
+) -> PackedMxfp4ExpertsCheckpointLayout:
+    return PackedMxfp4ExpertsCheckpointLayout(
+        expert_key_pattern=_DEEPSEEK_V4_MXFP4_EXPERT_PATTERN,
+        key_template=_DEEPSEEK_V4_MXFP4_EXPERT_TEMPLATE,
+        runtime_gate_up_order=("w3", "w1"),
+        runtime_down_projection="w2",
+        expert_block_size=32,
+        scale_fmt=scale_fmt,
+    )
 
 
 def _deepseek_v4_scale_fmt(qconf: Mapping[str, object]) -> str:
@@ -273,14 +288,8 @@ def _build_deepseek_v4_checkpoint_layout(
             runtime_scale_name="weight_scale_inv",
             scale_fmt=scale_fmt,
         ),
-        packed_mxfp4_experts=PackedMxfp4ExpertsCheckpointLayout(
-            expert_key_pattern=_DEEPSEEK_V4_MXFP4_EXPERT_PATTERN,
-            key_template=_DEEPSEEK_V4_MXFP4_EXPERT_TEMPLATE,
-            runtime_gate_up_order=("w3", "w1"),
-            runtime_down_projection="w2",
-            expert_block_size=32,
-            scale_fmt=scale_fmt,
-        ),
+        packed_mxfp4_experts=_deepseek_v4_packed_mxfp4_experts_layout(scale_fmt),
+        extra_model_kwargs={"ad_use_mxfp4_experts": True},
     )
 
 
@@ -387,9 +396,15 @@ def _linear(
     bias: Optional[torch.Tensor] = None,
     tp_mode: str = "none",
     layer_type: str = "unknown",
+    tp_min_local_shape: int = 1,
 ) -> torch.Tensor:
     return torch.ops.auto_deploy.torch_linear_simple(
-        x, weight, bias, tp_mode=tp_mode, layer_type=layer_type
+        x,
+        weight,
+        bias,
+        tp_mode=tp_mode,
+        layer_type=layer_type,
+        tp_min_local_shape=tp_min_local_shape,
     )
 
 
@@ -398,8 +413,16 @@ def _linear_module(
     module: nn.Linear,
     tp_mode: str = "none",
     layer_type: str = "unknown",
+    tp_min_local_shape: int = 1,
 ) -> torch.Tensor:
-    return _linear(x, module.weight, module.bias, tp_mode=tp_mode, layer_type=layer_type)
+    return _linear(
+        x,
+        module.weight,
+        module.bias,
+        tp_mode=tp_mode,
+        layer_type=layer_type,
+        tp_min_local_shape=tp_min_local_shape,
+    )
 
 
 def _rope_scaling_value(config: PretrainedConfig, key: str, default):
@@ -584,6 +607,7 @@ def _sparse_attention(
         attn_sink,
         topk_idxs,
         softmax_scale,
+        enable_sharding=True,
         layer_idx=layer_idx,
         layer_type="mla",
         window_size=window_size,
@@ -682,6 +706,7 @@ class DeepseekV4MLP(nn.Module):
             up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
         hidden = (F.silu(gate.float()) * up.float()).to(self.w2.weight.dtype)
         down = _linear_module(hidden, self.w2, tp_mode="rowwise", layer_type="moe")
+        down = torch.ops.auto_deploy.all_reduce(down, layer_type="moe")
         return down.to(x.dtype)
 
 
@@ -734,7 +759,12 @@ class DeepseekV4MoEGate(nn.Module):
 class DeepseekV4MoE(nn.Module):
     def __init__(self, config: DeepseekV4Config, layer_idx: int) -> None:
         super().__init__()
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.moe_intermediate_size
+        self.n_routed_experts = config.n_routed_experts
         self.swiglu_limit = config.swiglu_limit
+        self.ad_use_mxfp4_experts = bool(getattr(config, "ad_use_mxfp4_experts", False))
         self.gate = DeepseekV4MoEGate(config, layer_idx)
         self.experts = nn.ModuleList(
             [
@@ -746,6 +776,8 @@ class DeepseekV4MoE(nn.Module):
                 for _ in range(config.n_routed_experts)
             ]
         )
+        if self.ad_use_mxfp4_experts:
+            self._register_mxfp4_runtime_buffers()
         shared_intermediate_size = config.moe_intermediate_size * config.n_shared_experts
         self.shared_experts = DeepseekV4MLP(
             config.hidden_size,
@@ -753,22 +785,113 @@ class DeepseekV4MoE(nn.Module):
             swiglu_limit=0.0,
         )
 
+    def _register_mxfp4_runtime_buffers(self) -> None:
+        for name in (
+            "gate_up_proj_blocks",
+            "gate_up_proj_scales",
+            "down_proj_blocks",
+            "down_proj_scales",
+        ):
+            self.experts.register_buffer(name, torch.empty(0, dtype=torch.uint8), persistent=True)
+        self.experts.register_buffer(
+            "gate_up_proj_bias",
+            torch.zeros(
+                self.n_routed_experts,
+                2 * self.intermediate_size,
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.experts.register_buffer(
+            "down_proj_bias",
+            torch.zeros(self.n_routed_experts, self.hidden_size, dtype=torch.float32),
+            persistent=False,
+        )
+
+    def load_mxfp4_runtime_buffers(self, state_dict: dict[str, torch.Tensor]) -> None:
+        if not self.ad_use_mxfp4_experts:
+            return
+
+        layout = _deepseek_v4_packed_mxfp4_experts_layout()
+        has_layer_expert_tensor = False
+        for name in state_dict:
+            parsed = layout.parse_key(name)
+            if parsed is not None and parsed.layer == self.layer_idx:
+                has_layer_expert_tensor = True
+                break
+        if not has_layer_expert_tensor:
+            return
+
+        target_prefix = f"layers.{self.layer_idx}.ffn.experts."
+        layout.load_runtime_buffers(
+            state_dict,
+            "",
+            layer=self.layer_idx,
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+            target_gate_up_blocks=f"{target_prefix}gate_up_proj_blocks",
+            target_gate_up_scales=f"{target_prefix}gate_up_proj_scales",
+            target_down_blocks=f"{target_prefix}down_proj_blocks",
+            target_down_scales=f"{target_prefix}down_proj_scales",
+            num_experts=self.n_routed_experts,
+        )
+        self._resize_mxfp4_runtime_buffer(
+            "gate_up_proj_blocks", state_dict[f"{target_prefix}gate_up_proj_blocks"]
+        )
+        self._resize_mxfp4_runtime_buffer(
+            "gate_up_proj_scales", state_dict[f"{target_prefix}gate_up_proj_scales"]
+        )
+        self._resize_mxfp4_runtime_buffer(
+            "down_proj_blocks", state_dict[f"{target_prefix}down_proj_blocks"]
+        )
+        self._resize_mxfp4_runtime_buffer(
+            "down_proj_scales", state_dict[f"{target_prefix}down_proj_scales"]
+        )
+
+    def _resize_mxfp4_runtime_buffer(self, name: str, loaded: torch.Tensor) -> None:
+        current = getattr(self.experts, name)
+        if current.shape == loaded.shape and current.dtype == loaded.dtype:
+            return
+        setattr(
+            self.experts,
+            name,
+            torch.empty(loaded.shape, dtype=loaded.dtype, device=current.device),
+        )
+
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         original_shape = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, original_shape[-1])
         selected_experts, routing_weights = self.gate(hidden_states_flat, input_ids.reshape(-1))
-        routed = torch.ops.auto_deploy.torch_moe(
-            hidden_states_flat,
-            selected_experts,
-            routing_weights.to(hidden_states_flat.dtype),
-            w1_weight=[expert.w1.weight for expert in self.experts],
-            w2_weight=[expert.w2.weight for expert in self.experts],
-            w3_weight=[expert.w3.weight for expert in self.experts],
-            is_gated_mlp=True,
-            act_fn=int(ActivationType.Silu),
-            swiglu_limit=self.swiglu_limit,
-            layer_type="moe",
-        )
+        if self.ad_use_mxfp4_experts:
+            routed = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing(
+                hidden_states_flat,
+                selected_experts,
+                routing_weights.to(hidden_states_flat.dtype),
+                self.experts.gate_up_proj_blocks,
+                self.experts.gate_up_proj_bias,
+                self.experts.gate_up_proj_scales,
+                1.0,
+                float(self.swiglu_limit),
+                self.experts.down_proj_blocks,
+                self.experts.down_proj_bias,
+                self.experts.down_proj_scales,
+                "up_gate",
+                "deepseek",
+                "moe",
+            )
+        else:
+            routed = torch.ops.auto_deploy.torch_moe(
+                hidden_states_flat,
+                selected_experts,
+                routing_weights.to(hidden_states_flat.dtype),
+                w1_weight=[expert.w1.weight for expert in self.experts],
+                w2_weight=[expert.w2.weight for expert in self.experts],
+                w3_weight=[expert.w3.weight for expert in self.experts],
+                is_gated_mlp=True,
+                act_fn=int(ActivationType.Silu),
+                swiglu_limit=self.swiglu_limit,
+                layer_type="moe",
+            )
         return routed.view(*original_shape).to(hidden_states.dtype) + self.shared_experts(
             hidden_states
         )
@@ -898,8 +1021,19 @@ class DeepseekV4Indexer(nn.Module):
         offset: int,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
-        q = _linear_module(q_lora, self.wq_b, tp_mode="colwise", layer_type="mla")
-        q = q.reshape(batch_size, seq_len, self.index_n_heads, self.index_head_dim)
+        q = _linear_module(
+            q_lora,
+            self.wq_b,
+            tp_mode="colwise",
+            layer_type="mla",
+            tp_min_local_shape=self.index_head_dim,
+        )
+        q = torch.ops.auto_deploy.view(
+            q,
+            [batch_size, seq_len, self.index_n_heads, self.index_head_dim],
+            tp_scaled_dim=2,
+            layer_type="mla",
+        )
         q_nope, q_pe = torch.split(
             q,
             [self.index_head_dim - self.rope_head_dim, self.rope_head_dim],
@@ -910,12 +1044,16 @@ class DeepseekV4Indexer(nn.Module):
 
         index_k = self.compressor(hidden_states, cos_table, sin_table, position_ids)
         weights = _linear_module(
-            hidden_states, self.weights_proj, tp_mode="colwise", layer_type="mla"
+            hidden_states,
+            self.weights_proj,
+            tp_mode="colwise",
+            layer_type="mla",
         )
         weights = weights.float() * (self.softmax_scale * self.index_n_heads**-0.5)
 
         index_score = torch.einsum("bshd,btd->bsht", q, index_k).float()
         index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
+        index_score = torch.ops.auto_deploy.all_reduce(index_score, layer_type="mla")
 
         compressed_positions = torch.arange(
             self.compressor.max_compressed_len,
@@ -1007,8 +1145,19 @@ class DeepseekV4Attention(nn.Module):
 
         q_lora = _linear_module(hidden_states, self.wq_a, layer_type="mla")
         q_lora = self.q_norm(q_lora)
-        q = _linear_module(q_lora, self.wq_b, tp_mode="colwise", layer_type="mla")
-        q = q.reshape(batch_size, seq_len, self.n_heads, self.head_dim)
+        q = _linear_module(
+            q_lora,
+            self.wq_b,
+            tp_mode="colwise",
+            layer_type="mla",
+            tp_min_local_shape=self.head_dim,
+        )
+        q = torch.ops.auto_deploy.view(
+            q,
+            [batch_size, seq_len, self.n_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mla",
+        )
         q = q * torch.rsqrt(q.float().square().mean(-1, keepdim=True) + self.rms_eps).to(q.dtype)
 
         kv = _linear_module(hidden_states, self.wkv, layer_type="mla")
@@ -1085,10 +1234,22 @@ class DeepseekV4Attention(nn.Module):
         )
         out_pe = _apply_interleaved_rope(out_pe, cos.unsqueeze(2), sin.unsqueeze(2), inverse=True)
         attn_output = torch.cat((out_nope, out_pe), dim=-1)
-        attn_output = attn_output.reshape(batch_size, seq_len, self.n_groups, -1)
-        wo_a = self.wo_a.weight.view(self.n_groups, self.o_lora_rank, -1)
+        attn_output = torch.ops.auto_deploy.view(
+            attn_output,
+            [batch_size, seq_len, self.n_groups, self.group_head_width],
+            tp_scaled_dim=2,
+            layer_type="mla",
+        )
+        wo_a = torch.ops.auto_deploy.view(
+            self.wo_a.weight,
+            [self.n_groups, self.o_lora_rank, self.group_head_width],
+            tp_scaled_dim=0,
+            layer_type="mla",
+            tp_min_local_shape=self.o_lora_rank,
+        )
         attn_output = torch.einsum("bsgd,grd->bsgr", attn_output, wo_a).flatten(2)
         attn_output = _linear_module(attn_output, self.wo_b, tp_mode="rowwise", layer_type="mla")
+        attn_output = torch.ops.auto_deploy.all_reduce(attn_output, layer_type="mla")
         return attn_output
 
 
@@ -1208,10 +1369,15 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
         prefix: str,
         *args,
     ) -> None:
-        del module, args
+        del args
         if prefix:
             return
         _remap_deepseek_v4_checkpoint_keys(state_dict)
+        for layer in getattr(module, "layers", ()):
+            ffn = getattr(layer, "ffn", None)
+            load_mxfp4_runtime_buffers = getattr(ffn, "load_mxfp4_runtime_buffers", None)
+            if load_mxfp4_runtime_buffers is not None:
+                load_mxfp4_runtime_buffers(state_dict)
 
     def _init_weights(self, module: nn.Module) -> None:
         std = getattr(self.config, "initializer_range", 0.02)

@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from functools import partial
 from typing import Literal, Optional, Tuple, Type
 
 import torch
@@ -20,9 +21,13 @@ from pydantic import Field
 from torch.fx import GraphModule, Node
 
 from ..._compat import get_sm_version
+from ...models.quant_checkpoint_layout import (
+    PackedMXFP4ExpertCheckpointLayout,
+    load_packed_mxfp4_expert_tensors,
+)
 from ...utils.logger import ad_logger
 from ...utils.module import get_submodule_of_param
-from ...utils.node_utils import is_op
+from ...utils.node_utils import extract_op_args, is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
 
@@ -31,6 +36,16 @@ from ..interface import BaseTransform, TransformConfig, TransformInfo, Transform
 # in ``QuantizeMXFP4MOE._apply_trtllm``.
 _MXFP4_SCALING_VECTOR_SIZE = 32
 _WEIGHT_ALIGNMENT = 128
+_MXFP4_LAYOUT_ARG_NAMES = (
+    "gate_up_blocks",
+    "gate_up_scales",
+    "down_blocks",
+    "down_scales",
+)
+_MXFP4_RUNTIME_OPS = (
+    torch.ops.auto_deploy.triton_mxfp4_moe,
+    torch.ops.auto_deploy.torch_mxfp4_moe_from_routing,
+)
 
 # Backend selection for MXFP4 MoE quantization.
 # - "triton": use the triton_mxfp4_moe kernel (Ampere/Hopper compatible).
@@ -167,6 +182,140 @@ def _get_topk_from_router(node: Node) -> int:
     if "top_k" in node.kwargs:
         return int(node.kwargs["top_k"])
     return int(node.args[3]) if len(node.args) >= 4 else 2
+
+
+def _get_packed_mxfp4_expert_layout(
+    qcfg: dict,
+) -> PackedMXFP4ExpertCheckpointLayout | None:
+    checkpoint_layout = qcfg.get("checkpoint_layout")
+    if checkpoint_layout is None:
+        return None
+    for consumer in getattr(checkpoint_layout, "checkpoint_consumers", ()):
+        if (
+            isinstance(consumer, PackedMXFP4ExpertCheckpointLayout)
+            and consumer.quant_method == "mxfp4"
+        ):
+            return consumer
+    return None
+
+
+def _layout_layer_from_names(
+    checkpoint_layout: PackedMXFP4ExpertCheckpointLayout,
+    source_names: dict[str, str],
+) -> int | None:
+    for source_name in source_names.values():
+        layer = checkpoint_layout.layer_from_runtime_name(source_name)
+        if layer is not None:
+            return layer
+    return None
+
+
+def _get_attr_tensor(gm: GraphModule, target: str) -> torch.Tensor:
+    mod_name, _, attr_name = target.rpartition(".")
+    submod = gm.get_submodule(mod_name)
+    tensor = getattr(submod, attr_name)
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError(f"Expected get_attr target {target} to be a tensor, got {type(tensor)}.")
+    return tensor
+
+
+def _mxfp4_target_names_from_node(node: Node) -> dict[str, str] | None:
+    if not is_op(node, _MXFP4_RUNTIME_OPS):
+        return None
+
+    expert_args = extract_op_args(node, *_MXFP4_LAYOUT_ARG_NAMES)
+    target_names: dict[str, str] = {}
+    for name, arg in zip(_MXFP4_LAYOUT_ARG_NAMES, expert_args):
+        if not isinstance(arg, Node) or arg.op != "get_attr":
+            return None
+        target_names[name] = str(arg.target)
+    return target_names
+
+
+def _load_mxfp4_expert_layout_hook(
+    state_dict,
+    prefix,
+    *args,
+    checkpoint_layout: PackedMXFP4ExpertCheckpointLayout,
+    target_names: dict[str, str],
+    layer: int,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+) -> None:
+    load_packed_mxfp4_expert_tensors(
+        state_dict,
+        prefix,
+        checkpoint_layout=checkpoint_layout,
+        target_names=target_names,
+        layer=layer,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+
+
+def _register_mxfp4_expert_layout_hook(
+    gm: GraphModule,
+    checkpoint_layout: PackedMXFP4ExpertCheckpointLayout,
+    target_names: dict[str, str],
+    *,
+    registered_targets: set[tuple[str, str, str, str]] | None = None,
+) -> bool:
+    target_key = (
+        target_names["gate_up_blocks"],
+        target_names["gate_up_scales"],
+        target_names["down_blocks"],
+        target_names["down_scales"],
+    )
+    if registered_targets is not None:
+        if target_key in registered_targets:
+            return False
+        registered_targets.add(target_key)
+
+    layer = _layout_layer_from_names(checkpoint_layout, target_names)
+    if layer is None:
+        return False
+    gate_up_blocks = _get_attr_tensor(gm, target_names["gate_up_blocks"])
+    down_blocks = _get_attr_tensor(gm, target_names["down_blocks"])
+    if gate_up_blocks.dim() < 4 or down_blocks.dim() < 4:
+        raise ValueError(
+            "MXFP4 expert runtime buffers should be at least rank 4, got "
+            f"{gate_up_blocks.shape} and {down_blocks.shape}."
+        )
+    gm._register_load_state_dict_pre_hook(
+        partial(
+            _load_mxfp4_expert_layout_hook,
+            checkpoint_layout=checkpoint_layout,
+            target_names=target_names,
+            layer=layer,
+            num_experts=int(gate_up_blocks.shape[0]),
+            hidden_size=int(down_blocks.shape[1]),
+            intermediate_size=int(gate_up_blocks.shape[1] // 2),
+        )
+    )
+    return True
+
+
+def _register_existing_mxfp4_expert_layout_hooks(
+    gm: GraphModule,
+    checkpoint_layout: PackedMXFP4ExpertCheckpointLayout,
+    *,
+    registered_targets: set[tuple[str, str, str, str]],
+) -> int:
+    num_hooks = 0
+    for node in gm.graph.nodes:
+        target_names = _mxfp4_target_names_from_node(node)
+        if target_names is None:
+            continue
+        if _register_mxfp4_expert_layout_hook(
+            gm,
+            checkpoint_layout,
+            target_names,
+            registered_targets=registered_targets,
+        ):
+            num_hooks += 1
+    return num_hooks
 
 
 def _register_mxfp4_expert_params(
@@ -511,21 +660,47 @@ class QuantizeMXFP4MOE(BaseTransform):
         2. Resolves the backend (``triton`` | ``trtllm``) and dispatches.
         """
         qcfg = factory.get_quant_config()
-        if not qcfg or qcfg.get("quant_method", "") != self.algo_name:
+        if not qcfg:
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+        checkpoint_layout = _get_packed_mxfp4_expert_layout(qcfg)
+        num_existing_hooks = 0
+        if checkpoint_layout is not None:
+            num_existing_hooks = _register_existing_mxfp4_expert_layout_hooks(
+                gm,
+                checkpoint_layout,
+                registered_targets=set(),
+            )
+
+        if qcfg.get("quant_method", "") != self.algo_name:
+            return gm, TransformInfo(
+                skipped=num_existing_hooks == 0,
+                num_matches=num_existing_hooks,
+                is_clean=num_existing_hooks == 0,
+                has_valid_shapes=num_existing_hooks == 0,
             )
 
         backend = self._resolve_backend()
         ad_logger.info(f"quantize_mxfp4_moe: dispatching to backend={backend!r}")
 
         if backend == "triton":
-            return self._apply_triton(gm, cm, factory, shared_config)
+            gm, info = self._apply_triton(gm, cm, factory, shared_config)
         elif backend == "trtllm":
-            return self._apply_trtllm(gm, cm, factory, shared_config)
+            gm, info = self._apply_trtllm(gm, cm, factory, shared_config)
         else:
             # _resolve_backend should only return "triton" or "trtllm".
             raise ValueError(f"Unexpected backend resolved: {backend!r}")
+
+        if num_existing_hooks == 0:
+            return gm, info
+        num_matches = info.num_matches + num_existing_hooks
+        return gm, TransformInfo(
+            skipped=False,
+            num_matches=num_matches,
+            is_clean=info.is_clean and num_matches == 0,
+            has_valid_shapes=info.has_valid_shapes and num_matches == 0,
+        )
 
     def _apply_triton(
         self,

@@ -1524,7 +1524,10 @@ def test_export_dynamic_shapes_finite_logits_and_expected_ops() -> None:
         for name in target_names
         if name.startswith("auto_deploy.") and not name.startswith("auto_deploy.torch_")
     )
-    assert non_torch_ad_ops == []
+    assert non_torch_ad_ops == [
+        "auto_deploy.all_reduce.default",
+        "auto_deploy.view.default",
+    ]
 
 
 def test_factory_registration() -> None:

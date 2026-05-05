@@ -43,11 +43,20 @@ __all__ = [
 
 _SPARSE_ATTENTION_CHUNK_TARGET_BYTES = 512 * 1024 * 1024
 _SPARSE_ATTENTION_MAX_CHUNK_TOKENS = 64
+_SUPPORTED_COMPRESS_RATIOS = (0, 4, 128)
 
 
 def _validate_rank(name: str, tensor: torch.Tensor, rank: int) -> None:
     if tensor.dim() != rank:
         raise ValueError(f"{name} must have rank {rank}, got rank {tensor.dim()}")
+
+
+def _validate_compress_ratio(compress_ratio: int) -> None:
+    if compress_ratio not in _SUPPORTED_COMPRESS_RATIOS:
+        raise ValueError(
+            "DeepSeek V4 cached sparse attention supports "
+            f"compress_ratio in {_SUPPORTED_COMPRESS_RATIOS}, got {compress_ratio}"
+        )
 
 
 def _validate_deepseek_v4_sparse_attention_inputs(
@@ -182,6 +191,26 @@ def _prefill_kv_source(
     return kv_seq.unsqueeze(0)
 
 
+def _slice_sequence_kv_rows(
+    kv: torch.Tensor,
+    seq_idx: int,
+    flat_start: int,
+    seq_len: int,
+    num_seq: int,
+    compress_ratio: int,
+) -> torch.Tensor:
+    if compress_ratio == 0:
+        return _slice_sequence_tokens(kv, seq_idx, flat_start, seq_len)
+    if kv.shape[0] > seq_idx and kv.shape[0] != 1:
+        return kv[seq_idx]
+    if num_seq == 1:
+        return kv.reshape(-1, kv.shape[-1])
+    raise ValueError(
+        "Flattened compressed DeepSeek V4 sparse attention KV rows are not supported; "
+        f"pass batched kv for compress_ratio={compress_ratio}."
+    )
+
+
 def _cached_sparse_attention_from_positions(
     q_token: torch.Tensor,
     attn_sink: torch.Tensor,
@@ -189,15 +218,23 @@ def _cached_sparse_attention_from_positions(
     slot_idx: int,
     positions: torch.Tensor,
     softmax_scale: float,
+    max_position_exclusive: Optional[int] = None,
 ) -> torch.Tensor:
     positions_long = positions.to(torch.long)
-    gather_positions = positions_long.clamp(min=0)
-    if gather_positions.numel() > 0 and int(gather_positions.max().item()) >= swa_cache.shape[1]:
-        raise ValueError(
-            f"topk/cache position {int(gather_positions.max().item())} exceeds SWA cache "
-            f"length {swa_cache.shape[1]}"
-        )
+    valid_positions = positions_long[positions_long >= 0]
+    if valid_positions.numel() > 0:
+        max_position = int(valid_positions.max().item())
+        if max_position >= swa_cache.shape[1]:
+            raise ValueError(
+                f"topk/cache position {max_position} exceeds SWA cache length {swa_cache.shape[1]}"
+            )
+        if max_position_exclusive is not None and max_position >= max_position_exclusive:
+            raise ValueError(
+                f"topk/cache position {max_position} must be less than current sequence "
+                f"cache write end {max_position_exclusive}"
+            )
 
+    gather_positions = positions_long.clamp(min=0)
     selected_kv = swa_cache[slot_idx, gather_positions].to(q_token.dtype).unsqueeze(0)
     local_topk = torch.arange(positions_long.numel(), dtype=torch.long, device=q_token.device).view(
         1, 1, -1
@@ -247,6 +284,7 @@ def _cached_topk_attention(
     topk_seq: torch.Tensor,
     swa_cache: torch.Tensor,
     slot_idx: int,
+    cache_end_pos: int,
     softmax_scale: float,
 ) -> torch.Tensor:
     outputs = []
@@ -259,6 +297,7 @@ def _cached_topk_attention(
                 slot_idx,
                 topk_seq[token_offset],
                 softmax_scale,
+                cache_end_pos,
             )
         )
     if not outputs:
@@ -433,20 +472,14 @@ def torch_deepseek_v4_sparse_attention_with_cache(
 ) -> torch.Tensor:
     """Reference cached DeepSeek V4 sparse attention.
 
-    This PR3 validation path supports uncompressed ratio-0 sparse/SWA layers.
-    Compressed ratio-4 and ratio-128 decode require compressor/indexer cache
-    state that is intentionally outside this minimal reference op.
+    The model forms query, KV, and top-k tensors before this op. The cached op
+    writes those formed KV rows to the unpaged cache and evaluates sparse
+    attention either directly for prefill or by reading cache-position top-k
+    entries for decode.
     """
     _validate_deepseek_v4_sparse_attention_inputs(q, kv, attn_sink, topk_idxs)
-    _validate_topk_idx_bounds(topk_idxs, kv.shape[1])
     _validate_swa_cache_inputs(q, kv, swa_cache)
-
-    if compress_ratio != 0:
-        raise NotImplementedError(
-            "DeepSeek V4 compressed sparse-attention cache is not implemented in the "
-            "minimal PR3 reference path. Only compress_ratio=0 SWA/local-window cache "
-            "validation is supported; ratio-4 and ratio-128 decode need compressor/indexer state."
-        )
+    _validate_compress_ratio(compress_ratio)
     if window_size is not None and window_size <= 0:
         raise ValueError(f"window_size must be positive when provided, got {window_size}")
 
@@ -476,23 +509,24 @@ def torch_deepseek_v4_sparse_attention_with_cache(
         slot_idx_i = int(slot_idx_host[seq_idx].item())
         if slot_idx_i < 0 or slot_idx_i >= swa_cache.shape[0]:
             raise ValueError(f"slot_idx must be in [0, {swa_cache.shape[0]}), got {slot_idx_i}")
-        if window_size is None and input_pos_i > 0:
-            raise NotImplementedError(
-                "DeepSeek V4 cached sparse decode without window_size is not supported "
-                "by the minimal PR3 reference path because topk_idxs has no unambiguous "
-                "cache-position namespace after prior cached tokens."
-            )
-
         q_seq = q_flat[flat_start : flat_start + seq_len_i]
-        kv_seq = _slice_sequence_tokens(kv, seq_idx, flat_start, seq_len_i)
+        kv_seq = _slice_sequence_kv_rows(
+            kv,
+            seq_idx,
+            flat_start,
+            seq_len_i,
+            num_seq,
+            compress_ratio,
+        )
         topk_seq = _slice_sequence_tokens(topk_idxs, seq_idx, flat_start, seq_len_i)
         if q_seq.shape[0] != seq_len_i:
             raise ValueError(
                 f"Sequence {seq_idx} q slice has length {q_seq.shape[0]}, expected {seq_len_i}"
             )
-        if kv_seq.shape[0] != seq_len_i:
+        if kv_seq.shape[0] < seq_len_i:
             raise ValueError(
-                f"Sequence {seq_idx} kv slice has length {kv_seq.shape[0]}, expected {seq_len_i}"
+                f"Sequence {seq_idx} kv slice has length {kv_seq.shape[0]}, "
+                f"expected at least {seq_len_i}"
             )
         if topk_seq.shape[0] != seq_len_i:
             raise ValueError(
@@ -503,6 +537,7 @@ def torch_deepseek_v4_sparse_attention_with_cache(
 
         if input_pos_i == 0:
             kv_source = _prefill_kv_source(kv, kv_seq, seq_idx, num_seq)
+            _validate_topk_idx_bounds(topk_seq.unsqueeze(0), kv_source.shape[1])
             output_flat[flat_start : flat_start + seq_len_i] = torch_deepseek_v4_sparse_attention(
                 q_seq.unsqueeze(0),
                 kv_source,
@@ -510,7 +545,7 @@ def torch_deepseek_v4_sparse_attention_with_cache(
                 topk_seq.unsqueeze(0),
                 softmax_scale,
             ).squeeze(0)
-        elif window_size is not None:
+        elif compress_ratio == 0 and window_size is not None:
             output_flat[flat_start : flat_start + seq_len_i] = _cached_local_window_attention(
                 q_seq,
                 attn_sink,
@@ -527,6 +562,7 @@ def torch_deepseek_v4_sparse_attention_with_cache(
                 topk_seq,
                 swa_cache,
                 slot_idx_i,
+                input_pos_i + kv_seq.shape[0],
                 softmax_scale,
             )
 
@@ -551,6 +587,7 @@ def torch_deepseek_v4_sparse_attention_with_cache_fake(
     window_size: Optional[int] = None,
     compress_ratio: int = 0,
 ) -> torch.Tensor:
+    _validate_compress_ratio(compress_ratio)
     _validate_rank("q", q, 4)
     _validate_rank("kv", kv, 3)
     _validate_rank("attn_sink", attn_sink, 1)
@@ -633,10 +670,9 @@ class DeepSeekV4SparseAttention(AttentionDescriptor):
                 "DeepSeek V4 sparse attention source node must carry a literal "
                 f"int compress_ratio, got {compress_ratio!r}."
             )
-        if compress_ratio != 0:
+        if compress_ratio not in _SUPPORTED_COMPRESS_RATIOS:
             raise RuntimeError(
-                "DeepSeek V4 compressed sparse attention cache insertion is not supported "
-                "by the minimal PR3 reference path. Only compress_ratio=0 SWA/local-window "
-                f"validation is supported, got compress_ratio={compress_ratio}."
+                "DeepSeek V4 sparse attention cache insertion supports "
+                f"compress_ratio in {_SUPPORTED_COMPRESS_RATIOS}, got {compress_ratio}."
             )
         return [softmax_scale, window_size, compress_ratio]

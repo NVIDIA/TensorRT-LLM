@@ -32,6 +32,7 @@ def view(
     shape: List[int],
     tp_scaled_dim: int = -1,
     layer_type: str = "unknown",
+    tp_min_local_shape: int = 1,
 ) -> torch.Tensor:
     """Sharding-aware view/reshape.
 
@@ -49,10 +50,12 @@ def view(
         layer_type: Layer classification for selective sharding via ``shard_layers``
             config. Values: ``"mha"``, ``"mla"``, ``"mlp"``, ``"moe"``, ``"ssm"``,
             ``"delta"``, ``"unknown"``.
+        tp_min_local_shape: Minimum chunk size used when the view input is a
+            parameter that should be TP-sharded along the scaled dimension.
 
     Sharding hint arguments (graph-level metadata for ``apply_sharding_hints``):
-        ``tp_scaled_dim`` and ``layer_type`` are hints only; they do not change the
-        unsharded reshape result.
+        ``tp_scaled_dim``, ``layer_type``, and ``tp_min_local_shape`` are hints only;
+        they do not change the unsharded reshape result.
 
     Returns:
         Reshaped tensor, same values as ``x.reshape(shape)`` up to clone semantics.
@@ -66,6 +69,7 @@ def _view_fake(
     shape: List[int],
     tp_scaled_dim: int = -1,
     layer_type: str = "unknown",
+    tp_min_local_shape: int = 1,
 ) -> torch.Tensor:
     return x.reshape(shape).clone()
 
