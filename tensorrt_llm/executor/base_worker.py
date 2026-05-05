@@ -612,6 +612,8 @@ class BaseWorker(GenerationExecutor):
             executor_request.py_num_logprobs = request.sampling_params.logprobs
             executor_request.py_lora_path = py_lora_path
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
+            executor_request.py_logprobs_simple_format = (
+                request.sampling_params.logprobs_simple_format)
 
             # here we add executor_request.py_disaggregated_params= request.disaggregated_params for python cache transceiver
             if self._is_pytorch_backend and request.disaggregated_params is not None:
@@ -1084,9 +1086,15 @@ def _compute_pytorch_prompt_logprobs(
     prompt_token_ids = generation_result._generation_request.prompt_token_ids[
         1:] + first_generation_token
 
-    logprobs_result = compute_logprobs(logprob_params.prompt_logprobs, None,
-                                       context_logits, None, None,
-                                       prompt_token_ids)
+    logprobs_result = compute_logprobs(
+        logprob_params.prompt_logprobs,
+        None,
+        context_logits,
+        None,
+        None,
+        prompt_token_ids,
+        simple_prompt_logprobs=logprob_params.prompt_logprobs_simple_format,
+    )
     if generation_result._streaming:
         generation_result._cached_prompt_logprobs = logprobs_result.prompt
 
@@ -1125,11 +1133,15 @@ def _get_logprobs(worker,
                 return logprobs_result
 
         # TRT backend: compute both prompt and generation logprobs from logits
-        logprobs_result = compute_logprobs(logprob_params.prompt_logprobs,
-                                           logprob_params.logprobs,
-                                           response.result.context_logits,
-                                           response.result.generation_logits,
-                                           response.result.output_token_ids[0])
+        logprobs_result = compute_logprobs(
+            logprob_params.prompt_logprobs,
+            logprob_params.logprobs,
+            response.result.context_logits,
+            response.result.generation_logits,
+            response.result.output_token_ids[0],
+            simple_prompt_logprobs=logprob_params.prompt_logprobs_simple_format,
+            simple_logprobs=logprob_params.logprobs_simple_format,
+        )
 
         if logprob_params.drop_context_logits:
             response.clear_context_logits()

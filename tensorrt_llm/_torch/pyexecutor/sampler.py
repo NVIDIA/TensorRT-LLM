@@ -69,7 +69,7 @@ from tensorrt_llm.bindings.internal.runtime import (
     DecoderState,
     GptDecoderBatched,
 )
-from tensorrt_llm.executor.result import Logprob
+from tensorrt_llm.executor.result import Logprob, SimpleTokenLogprobs, TokenLogprobs
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -2600,10 +2600,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         beam_width: int,
         count: int,
         num_topk_logprobs: int,
-    ) -> list[list[dict[int, Logprob]]]:
-        """Convert the LogProbsStateList object to a list of lists of dictionaries of Logprob objects
+        simple_format: bool = False,
+    ) -> list[list[dict[int, Logprob]]] | list[list[float]]:
+        """Convert the LogProbsStateList object to per-token logprobs.
 
-        Logprobs storage expects logprobs as a list[list[dict[int, Logprob]]] object
+        By default returns ``list[list[dict[int, Logprob]]]``. When
+        ``simple_format`` is True and ``num_topk_logprobs == 0`` the result is a
+        flat ``list[list[float]]`` (one logprob per generated token, per beam).
 
         args:
             logprobs_state_list: LogProbsStateList. Contains the topk indices, topk values,
@@ -2612,17 +2615,27 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             beam_width: int. The beam width of the request.
             count: int. The number of tokens to store.
             num_topk_logprobs: int. The number of topk logprobs of each token.
+            simple_format: bool. If True (and num_topk_logprobs == 0), return
+                ``list[list[float]]`` instead of the dict format. Avoids per-token
+                dict allocation when only the sampled-token logprob is needed.
         output:
-            list[list[dict[int, Logprob]]]. Shape: (beam_width, count)
+            list[list[dict[int, Logprob]]] (default) or list[list[float]] (simple format).
+            Shape: (beam_width, count)
         """
 
         sampled_log_probs_indices_list = logprobs_state_list.sampled_indices[req_seq_slot]
         sampled_log_probs_vals_list = logprobs_state_list.sampled_vals[req_seq_slot]
         sampled_log_probs_rank_list = logprobs_state_list.sampled_rank[req_seq_slot]
 
-        token_log_probs: list[list[dict[int, Logprob]]]
         if num_topk_logprobs == 0:
-            token_log_probs = [
+            if simple_format:
+                token_log_probs_simple: list[list[float]] = [
+                    [sampled_log_probs_vals_list[beam_idx][step_idx] for step_idx in range(count)]
+                    for beam_idx in range(beam_width)
+                ]
+                return token_log_probs_simple
+
+            token_log_probs: list[list[dict[int, Logprob]]] = [
                 [
                     {
                         sampled_log_probs_indices_list[beam_idx][step_idx]: Logprob(
@@ -2677,7 +2690,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             assert logprobs_state_list is not None, "logprobs_state_list must be provided"
             assert request.py_seq_slot is not None
             token_log_probs = self._store_logprobs_list_to_request(
-                logprobs_state_list, request.py_seq_slot, beam_width, count, request.py_num_logprobs
+                logprobs_state_list,
+                request.py_seq_slot,
+                beam_width,
+                count,
+                request.py_num_logprobs,
+                simple_format=request.py_logprobs_simple_format,
             )
             request.py_result.append_log_probs(token_log_probs)
 
@@ -3132,12 +3150,24 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if logprobs_tensor.numel() > 0:
             logprobs_list = request.py_result.log_probs
             assert logprobs_list is not None
-            for beam_idx, beam_logprobs in enumerate(logprobs_list):
-                for token_idx, token_logprobs in enumerate(beam_logprobs):
-                    for key, value in token_logprobs.items():
-                        assert value.rank is not None
-                        logprobs_tensor[beam_idx, token_idx, value.rank - 1] = value.logprob
-                        logprobs_indices_tensor[beam_idx, token_idx, value.rank - 1] = key
+
+            if request.py_logprobs_simple_format:
+                tokens = request.get_tokens()
+                for beam_idx, beam_logprobs in enumerate(logprobs_list):
+                    beam_logprobs = cast(SimpleTokenLogprobs, beam_logprobs)
+                    for token_idx, token_logprobs_simple in enumerate(beam_logprobs):
+                        logprobs_tensor[beam_idx, token_idx, 0] = token_logprobs_simple
+                        logprobs_indices_tensor[beam_idx, token_idx, 0] = tokens[beam_idx][
+                            token_idx
+                        ]
+            else:
+                for beam_idx, beam_logprobs in enumerate(logprobs_list):
+                    beam_logprobs = cast(TokenLogprobs, beam_logprobs)
+                    for token_idx, token_logprobs in enumerate(beam_logprobs):
+                        for key, value in token_logprobs.items():
+                            assert value.rank is not None
+                            logprobs_tensor[beam_idx, token_idx, value.rank - 1] = value.logprob
+                            logprobs_indices_tensor[beam_idx, token_idx, value.rank - 1] = key
         return logprobs_tensor_full, logprobs_indices_tensor_full
 
     def _prepare_beam_history(
