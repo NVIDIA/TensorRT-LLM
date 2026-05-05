@@ -1012,14 +1012,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         self.position_embedding_type = int(
             pos_embd_params.type) if pos_embd_params is not None else 0
-        self.rotary_embedding_dim = self.rope_params.dim
-        self.rotary_embedding_base = self.rope_params.theta
-        self.rotary_embedding_scale_type = int(self.rope_params.scale_type)
-        self.rotary_embedding_scale = self.rope_params.scale
-        self.rotary_embedding_short_m_scale = self.rope_params.short_m_scale
-        self.rotary_embedding_long_m_scale = self.rope_params.long_m_scale
-        self.rotary_embedding_max_positions = self.rope_params.max_positions
-        self.rotary_embedding_original_max_positions = self.rope_params.original_max_positions
         self.skip_softmax_stat = torch.zeros(2,
                                              dtype=torch.uint32,
                                              device='cuda')
@@ -1276,13 +1268,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mask_type = self._get_mask_type(ctx.attention_mask)
         self._ensure_rope_table_size(metadata.max_seq_len)
 
+        rotary_embedding_dim = self.rope_params.dim
+        rotary_embedding_base = self.rope_params.theta
+        rotary_embedding_scale_type = int(self.rope_params.scale_type)
         rotary_embedding_scales = [
-            self.rotary_embedding_scale, self.rotary_embedding_short_m_scale,
-            self.rotary_embedding_long_m_scale
+            self.rope_params.scale, self.rope_params.short_m_scale,
+            self.rope_params.long_m_scale
         ]
         rotary_embedding_max_position_info = [
-            self.rotary_embedding_max_positions,
-            self.rotary_embedding_original_max_positions
+            self.rope_params.max_positions,
+            self.rope_params.original_max_positions
         ]
         spec_decoding_bool_params = [
             metadata.is_spec_decoding_enabled, metadata.use_spec_decoding,
@@ -1406,9 +1401,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 self.quant_mode,
                 self.q_scaling,
                 self.position_embedding_type,
-                self.rotary_embedding_dim,
-                self.rotary_embedding_base,
-                self.rotary_embedding_scale_type,
+                rotary_embedding_dim,
+                rotary_embedding_base,
+                rotary_embedding_scale_type,
                 rotary_embedding_scales,
                 rotary_embedding_max_position_info,
                 use_paged_context_fmha,
@@ -1492,9 +1487,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 self.quant_mode,
                 self.q_scaling,
                 self.position_embedding_type,
-                self.rotary_embedding_dim,
-                self.rotary_embedding_base,
-                self.rotary_embedding_scale_type,
+                rotary_embedding_dim,
+                rotary_embedding_base,
+                rotary_embedding_scale_type,
                 rotary_embedding_scales,
                 rotary_embedding_max_position_info,
                 use_paged_context_fmha,
@@ -1786,8 +1781,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert metadata.kv_cache_manager is not None
 
         # Ensure RoPE cos/sin table covers the sequence length before the
-        # kernel reads it.  plan() also calls ensure_rope_table_size, but it
-        # runs AFTER this method in the MLA context path.
+        # kernel reads it.
         self._ensure_rope_table_size(metadata.kv_cache_manager.max_seq_len)
 
         sink_token_length = 0
@@ -1900,8 +1894,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         sink_token_length = 0
 
         # Ensure RoPE cos/sin table covers the sequence length before the
-        # kernel reads it.  plan() also calls ensure_rope_table_size, but it
-        # runs AFTER this method in the MLA generation path.
+        # kernel reads it.
         self._ensure_rope_table_size(metadata.max_seq_len)
 
         helix_tensor_params = [
