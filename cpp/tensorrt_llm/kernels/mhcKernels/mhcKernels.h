@@ -51,7 +51,10 @@ void mhcPostMappingLaunch(__nv_bfloat16 const* residual, __nv_bfloat16 const* x,
 //   y_acc_workspace: fp32 [M, 24]
 //   r_acc_workspace: fp32 [M]
 //
-// Shape constraints (B200 / sm_100a): hidden_size == 4096, hc_mult == 4.
+// Shape constraints (B200/B300 / sm_100a):
+//   hc_mult == 4
+//   hidden_size in {4096, 7168} for SM100/tcgen05 MMA fused-HC paths.
+// FMA fused-HC paths use runtime hidden_size but still require hidden_size % 64 == 0.
 // Passing num_k_splits == 0 or bigfuse_block_size == 0 falls back to the
 // internal heuristics.
 void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual_prev, float const* post_mix_prev,
@@ -101,7 +104,10 @@ void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* resid
 //   r_acc_workspace: fp32 [M]
 //   done_counter_workspace: int32 [ceil(M / 64)]
 //
-// Shape constraints (B200 / sm_100a): hidden_size == 4096, hc_mult == 4.
+// Shape constraints (B200/B300 / sm_100a):
+//   hc_mult == 4
+//   hidden_size in {4096, 7168} for SM100/tcgen05 MMA fused-HC paths.
+// FMA fused-HC paths use runtime hidden_size but still require hidden_size % 64 == 0.
 // Passing num_k_splits == 0 falls back to internal heuristics.
 void mhcFusedHcAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual_prev,
     float const* post_mix_prev, float const* comb_mix_prev, float const* w_t, float const* hc_scale,
