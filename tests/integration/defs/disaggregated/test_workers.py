@@ -21,9 +21,11 @@ from tensorrt_llm import logger
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_protocol import (CompletionRequest,
                                                 DisaggregatedParams)
-from tensorrt_llm.serve.router import (KvCacheAwareRouter,
+from tensorrt_llm.serve.router import (KV_CACHE_HASH_ALGO_V1,
+                                       KV_CACHE_HASH_ALGO_V2,
+                                       KvCacheAwareRouter,
                                        KvCacheAwareServerState, ServerRole,
-                                       block_key_hasher)
+                                       block_key_hasher, v2_sha256_block_hasher)
 
 
 def build_worker_config(base_config, server_type_config, disagg_cluster):
@@ -165,6 +167,8 @@ class BasicWorkerTester:
         events = []
         for event_raw in events_raw:
             event = {"id": event_raw["event_id"]} | event_raw["data"]
+            if "hash_algo" in event_raw:
+                event["hash_algo"] = event_raw["hash_algo"]
             if event["type"] == "stored":
                 for block in event["blocks"]:
                     block["token_id"] = [
@@ -179,6 +183,27 @@ class BasicWorkerTester:
                     del block["tokens"]
             events.append(event)
         return events
+
+    @staticmethod
+    def compute_block_hashes(tokens: list[int], tokens_per_block: int,
+                             hash_algo: str):
+        block_hashes = []
+        if hash_algo == KV_CACHE_HASH_ALGO_V1:
+            block_hasher = block_key_hasher
+        elif hash_algo == KV_CACHE_HASH_ALGO_V2:
+            block_hasher = v2_sha256_block_hasher
+        else:
+            raise ValueError(
+                f"Unsupported KV cache hash algorithm: {hash_algo}")
+        for t in range(0, len(tokens) - 1, tokens_per_block):
+            t_end = min(t + tokens_per_block, len(tokens) - 1)
+            if t_end - t < tokens_per_block:
+                # partial block
+                break
+            block_hashes.append(
+                block_hasher(tokens[t:t_end],
+                             None if t == 0 else block_hashes[-1]))
+        return block_hashes
 
 
 class ConditionalWorkerTester(BasicWorkerTester):
@@ -293,17 +318,16 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
         for i in range(max_rounds):
             # split tokens into blocks and check block match count by hash
             tokens = self.tokenizer(request["prompt"])["input_ids"]
-            block_hashes = []
-            for t in range(0, len(tokens) - 1, tokens_per_block):
-                t_end = min(t + tokens_per_block, len(tokens) - 1)
-                if t_end - t < tokens_per_block:
-                    # partial block
-                    break
-                block_hashes.append(
-                    block_key_hasher(tokens[t:t_end],
-                                     None if t == 0 else block_hashes[-1]))
-            ctx_match_count = await ctx_blocks.matched_tokens([block_hashes])
-            gen_match_count = await gen_blocks.matched_tokens([block_hashes])
+            block_hashes_by_algo = {}
+            for hash_algo in {ctx_blocks.hash_algo, gen_blocks.hash_algo}:
+                block_hashes_by_algo[hash_algo] = self.compute_block_hashes(
+                    tokens, tokens_per_block, hash_algo)
+            ctx_match_count = await ctx_blocks.matched_tokens(
+                [block_hashes_by_algo[ctx_blocks.hash_algo]],
+                hash_algo=ctx_blocks.hash_algo)
+            gen_match_count = await gen_blocks.matched_tokens(
+                [block_hashes_by_algo[gen_blocks.hash_algo]],
+                hash_algo=gen_blocks.hash_algo)
             ctx_evicted = False
             gen_evicted = False
             for event in ctx_events:

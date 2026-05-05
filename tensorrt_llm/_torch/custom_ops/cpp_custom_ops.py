@@ -592,6 +592,17 @@ def _register_fake():
         scale_out = pe.new_empty((M, 1), dtype=torch.float32)
         return fp8_out, scale_out
 
+    @torch.library.register_fake("trtllm::fp8_quantize_1x128_packed_ue8m0")
+    def _(input: torch.Tensor):
+        # Returns (fp8_e4m3 [m, k], packed_ue8m0_int32 [m, packed_sf_k])
+        # matching deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor's return shape.
+        m, k = input.shape[0], input.shape[1]
+        num_n_blocks = (k + 127) // 128
+        num_packed_sf_k = (num_n_blocks + 3) // 4
+        return torch.empty_like(input,
+                                dtype=torch.float8_e4m3fn), input.new_empty(
+                                    (m, num_packed_sf_k), dtype=torch.int32)
+
     @torch.library.register_fake("trtllm::causal_conv1d_fwd")
     def _(
         x: torch.Tensor,

@@ -1147,6 +1147,12 @@ class KVCacheEventSerializer:
             "data": event_serialize_func(event.data),
             "window_size": event.window_size,
         }
+        hash_algo = getattr(event, "hash_algo", None)
+        if hash_algo is not None:
+            json_str["hash_algo"] = hash_algo
+        layer_group_id = getattr(event, "layer_group_id", None)
+        if layer_group_id is not None:
+            json_str["layer_group_id"] = layer_group_id
         if event.attention_dp_rank is not None:
             json_str["attention_dp_rank"] = event.attention_dp_rank
 

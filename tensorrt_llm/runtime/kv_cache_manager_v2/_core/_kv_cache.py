@@ -162,6 +162,7 @@ class _KVCache:
         "id",
         "_manager",
         "_lora_task_id",
+        "_cache_salt_id",
         "_get_priority",
         "_cuda_stream",
         "_status",
@@ -187,6 +188,7 @@ class _KVCache:
     id: int | None
     _manager: "KVCacheManager"
     _lora_task_id: int | None
+    _cache_salt_id: int | None
     _get_priority: Callable[[BlockOrdinal, LifeCycle], Priority]
     _cuda_stream: CudaStream | None
     _status: _Status
@@ -223,10 +225,12 @@ class _KVCache:
         input_tokens: Sequence[TokenIdExt] | None,
         id: int | None,
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority],
+        cache_salt_id: int | None,
     ):
         self.id = id
         self._manager = manager
         self._lora_task_id = lora_task_id
+        self._cache_salt_id = cache_salt_id
         self._get_priority = custom_priority_callback
         self._cuda_stream = None
         self._status = self.Status.SUSPENDED
@@ -724,7 +728,9 @@ class _KVCache:
             raise LogicError("Cannot commit block that is not full except last block")
         prev: RootBlock | Block
         if ordinal == 0:
-            prev = self.manager._radix_tree.add_or_get_existing(self._lora_task_id)
+            prev = self.manager._radix_tree.add_or_get_existing(
+                self._lora_task_id, self._cache_salt_id
+            )
         else:
             prev = self._get_tree_block(BlockOrdinal(ordinal - 1))
         try:
@@ -757,8 +763,12 @@ class _KVCache:
             seq_block.tree_block = tree_block
             assert self._get_tree_block(ordinal) is tree_block
             self._num_committed_blocks = BlockOrdinal(ordinal + 1)
+            event_manager = self.manager.event_manager
+            if event_manager is not None:
+                event_manager.add_stored_block_event_from_block(tree_block)
         elif tree_block.is_full and self.manager.allow_seq_rebasing:
-            # try to replace our pages with pages from the existing block.
+            # Happens when a concurrent request committed the same tokens before us.
+            # Try to replace our pages with pages from the existing block to save memory.
             reuse_list = list[tuple[LifeCycleId, CommittedPage]]()
             for lc in typed_range(typed_len(beam_block)):
                 if lc == ssm_lc_id:
@@ -772,6 +782,9 @@ class _KVCache:
                     page = cast(UncommittedPage, cast(_SharedPageLock, beam_block[lc]).page)
                     beam_block[lc] = None
                     p = page.convert_to_committed(tree_block)
+                    event_manager = self.manager.event_manager
+                    if event_manager is not None:
+                        event_manager.add_stored_life_cycle_event_from_block(tree_block, int(lc))
                     # The page comes from uncommitted page of self, so safe to skip wait.
                     beam_block[lc] = (
                         p.lock(self, beam_idx, ordinal, lc, skip_wait=True) if locked else p.hold()
@@ -975,7 +988,10 @@ class _KVCache:
         lora_task_id = self._lora_task_id
         matched = list(
             manager._radix_tree.match(
-                lora_task_id, input_tokens or [], manager.enable_partial_match
+                lora_task_id,
+                input_tokens or [],
+                manager.enable_partial_match,
+                cache_salt_id=self._cache_salt_id,
             )
         )
         tokens_per_block = manager.tokens_per_block

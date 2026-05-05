@@ -22,9 +22,12 @@ from ._life_cycle_registry import AttnLifeCycle, LifeCycle, LifeCycleId, LifeCyc
 from ._utils import TypedIndexList, chunked, filled_list, unwrap_rawref
 
 if TYPE_CHECKING:
+    from ._event_manager import KVCacheEventManager
     from ._page import CommittedPage
 
 BlockKey = bytes
+_ROOT_KEY_LORA_TASK_ID_TAG = b"trtllm_kv_cache_v2_root_lora_task_id"
+_ROOT_KEY_CACHE_SALT_ID_TAG = b"trtllm_kv_cache_v2_root_cache_salt_id"
 
 
 # id_offset is usually vocab_size
@@ -74,10 +77,22 @@ class Hasher:
 TokenBlock = list[TokenIdExt]
 
 
+def _make_root_key(lora_task_id: int | None, cache_salt_id: int | None = None) -> BlockKey:
+    hasher = Hasher()
+    if lora_task_id is not None:
+        hasher.update(_ROOT_KEY_LORA_TASK_ID_TAG).update(lora_task_id)
+    if cache_salt_id is not None:
+        hasher.update(_ROOT_KEY_CACHE_SALT_ID_TAG).update(cache_salt_id)
+    return hasher.digest
+
+
 def sequence_to_blockchain_keys(
-    tokens_per_block: int, lora_task_id: int | None, tokens: Sequence[TokenIdExt]
+    tokens_per_block: int,
+    lora_task_id: int | None,
+    tokens: Sequence[TokenIdExt],
+    cache_salt_id: int | None = None,
 ) -> Iterator[tuple[TokenBlock, BlockKey]]:
-    digest = Hasher(lora_task_id).digest
+    digest = _make_root_key(lora_task_id, cache_salt_id)
     yield [], digest
     for token_block in chunked(tokens, tokens_per_block):
         digest = Hasher(digest).update(token_block).digest
@@ -99,12 +114,15 @@ def remove_subtree(root: "RootBlock | Block") -> list[rawref.ref["CommittedPage"
     # taking O(1) space
     # remove leaf blocks one by one, in post-order
     ret: list[rawref.ref["CommittedPage"]] = []
+    removed_block_hashes: list[BlockKey] = []
+    event_manager = get_tree(root).event_manager
     block: "RootBlock | Block" = root
     while True:
         if block.next:
             block = next(iter(block.next.values()))
         else:
             if isinstance(block, Block):
+                removed_block_hashes.append(block.key)
                 ret.extend(p for p in block.storage if p is not None)
                 block.storage = filled_list(None, block.num_life_cycles)
             assert isinstance(block, RootBlock) or all(page is None for page in block.storage), (
@@ -122,6 +140,8 @@ def remove_subtree(root: "RootBlock | Block") -> list[rawref.ref["CommittedPage"
                 break
             assert not isinstance(prev_block, BlockRadixTree)
             block = prev_block
+    if event_manager is not None:
+        event_manager.add_removed_event(removed_block_hashes)
     return ret
 
 
@@ -198,17 +218,24 @@ def _add_or_get_existing(
 
 
 class RootBlock:
-    __slots__ = ("_prev", "key", "next", "lora_task_id", "__rawref__")
+    __slots__ = ("_prev", "key", "next", "lora_task_id", "cache_salt_id", "__rawref__")
     key: BlockKey
     lora_task_id: int | None
+    cache_salt_id: int | None
     _prev: rawref.ref["BlockRadixTree"]
     next: Children["Block"]
     __rawref__: rawref.ref["RootBlock"]
 
-    def __init__(self, lora_task_id: int | None, prev: "BlockRadixTree") -> None:
-        self.key = self.make_key(lora_task_id)
+    def __init__(
+        self,
+        lora_task_id: int | None,
+        prev: "BlockRadixTree",
+        cache_salt_id: int | None = None,
+    ) -> None:
+        self.key = self.make_key(lora_task_id, cache_salt_id)
         assert self.key not in prev.next, "Root block already exists"
         self.lora_task_id = lora_task_id
+        self.cache_salt_id = cache_salt_id
         self._prev = rawref.ref(prev)
         self.next = {}
         self.__rawref__ = rawref.NULL
@@ -234,8 +261,8 @@ class RootBlock:
         return self.prev.tokens_per_block
 
     @staticmethod
-    def make_key(lora_task_id: int | None) -> BlockKey:
-        return Hasher(lora_task_id).digest
+    def make_key(lora_task_id: int | None, cache_salt_id: int | None = None) -> BlockKey:
+        return _make_root_key(lora_task_id, cache_salt_id)
 
 
 class Block:
@@ -282,8 +309,11 @@ class Block:
             if len(b.tokens) < len(tokens) and tokens[: len(b.tokens)] == b.tokens:
                 assert NDEBUG or (not b.is_full and b is not self and b.key == k and not b.next)
                 to_remove.append(k)
+        event_manager = get_tree(prev).event_manager if to_remove else None
         for k in to_remove:
             b = prev.next.pop(k)
+            if event_manager is not None:
+                event_manager.add_removed_event(b.key)
             assert b.is_orphan  # _KVCache may still hold it.
         # prev.next keeps a strong ref to this _Block, so no need to remove self from prev.next in __del__().
         prev.next[self.key] = self
@@ -319,6 +349,7 @@ class Block:
     def unset_page(self, lc_idx: LifeCycleId, lc: LifeCycle) -> None:
         if self.storage[lc_idx] is None:
             return
+        event_manager = get_tree(self).event_manager
         ordinal = self.ordinal
         self.storage[lc_idx] = None
         assert type(lc) is AttnLifeCycle, "Reuse for SSM layers is not supported yet"
@@ -330,6 +361,8 @@ class Block:
                     assert page.status == PageStatus.DROPPABLE
                     if page.scheduled_for_eviction:
                         page.manager.exclude_from_eviction(page)
+        elif event_manager is not None:
+            event_manager.add_removed_life_cycle_event(self.key, int(lc_idx))
         # It's possible to implement more sophisticated logic to remove useless blocks for SWA, e.g.
         # check if consecutive available blocks is sufficient for window_size. (TRTLLM-8802)
         # But for simplicity, we leave it for now.
@@ -341,6 +374,8 @@ class Block:
         ):
             if curr.key in curr.prev.next:
                 curr.prev.next.pop(curr.key)
+                if event_manager is not None:
+                    event_manager.add_removed_event(curr.key)
             curr = curr.prev
 
     @property
@@ -359,26 +394,41 @@ class Block:
 
 
 class BlockRadixTree:
-    __slots__ = ("_life_cycles", "_tokens_per_block", "next", "__rawref__")
+    __slots__ = (
+        "_life_cycles",
+        "_tokens_per_block",
+        "_event_manager",
+        "next",
+        "__rawref__",
+    )
     _life_cycles: LifeCycleRegistry
     _tokens_per_block: int
+    _event_manager: "KVCacheEventManager | None"
     next: Children[RootBlock]
     __rawref__: rawref.ref["BlockRadixTree"]
 
-    def __init__(self, life_cycles: LifeCycleRegistry, tokens_per_block: int) -> None:
+    def __init__(
+        self,
+        life_cycles: LifeCycleRegistry,
+        tokens_per_block: int,
+        event_manager: "KVCacheEventManager | None" = None,
+    ) -> None:
         self._life_cycles = life_cycles
         self._tokens_per_block = tokens_per_block
+        self._event_manager = event_manager
         self.next = {}
         self.__rawref__ = rawref.NULL
 
     def __del__(self) -> None:
         self.__rawref__.invalidate()
 
-    def add_or_get_existing(self, lora_task_id: int | None) -> RootBlock:
-        key = RootBlock.make_key(lora_task_id)
+    def add_or_get_existing(
+        self, lora_task_id: int | None, cache_salt_id: int | None = None
+    ) -> RootBlock:
+        key = RootBlock.make_key(lora_task_id, cache_salt_id)
         if key in self.next:
             return self.next[key]
-        return RootBlock(lora_task_id, self)
+        return RootBlock(lora_task_id, self, cache_salt_id)
 
     @property
     def tokens_per_block(self) -> int:
@@ -387,6 +437,10 @@ class BlockRadixTree:
     @property
     def life_cycles(self) -> LifeCycleRegistry:
         return self._life_cycles
+
+    @property
+    def event_manager(self) -> "KVCacheEventManager | None":
+        return self._event_manager
 
     @property
     def num_life_cycles(self) -> LifeCycleId:
@@ -409,11 +463,12 @@ class BlockRadixTree:
         lora_task_id: int | None,
         tokens: Sequence[TokenIdExt],
         enable_partial_match: bool = False,
+        cache_salt_id: int | None = None,
     ) -> Iterator[tuple[Block, int]]:
         block: Block | RootBlock | BlockRadixTree = self
         mismatched_token_block: TokenBlock = []
         for token_block, key in sequence_to_blockchain_keys(
-            self._tokens_per_block, lora_task_id, tokens
+            self._tokens_per_block, lora_task_id, tokens, cache_salt_id
         ):
             if key in block.next:
                 block = block.next[key]

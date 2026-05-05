@@ -6,16 +6,28 @@ from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Union
 import aiohttp
 from transformers import AutoTokenizer
 
-from tensorrt_llm.bindings.internal.batch_manager import (BlockKey,
-                                                          BlockKeyHasher)
 from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig,
                                               RouterConfig, ServerRole)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.runtime import kv_cache_hash
+from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
+    Block as V2Block
+from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
+    RootBlock as V2RootBlock
 from tensorrt_llm.serve.metadata_server import JsonDictionary
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 CompletionRequest)
 
+KV_CACHE_HASH_ALGO_DEFAULT = kv_cache_hash.KV_CACHE_HASH_ALGO_DEFAULT
+KV_CACHE_HASH_ALGO_V1 = kv_cache_hash.KV_CACHE_HASH_ALGO_V1
+KV_CACHE_HASH_ALGO_V2 = kv_cache_hash.KV_CACHE_HASH_ALGO_V2
+KV_CACHE_HASH_ALGO_V2_SHA256_64 = kv_cache_hash.KV_CACHE_HASH_ALGO_V2_SHA256_64
+get_cache_salt_id = kv_cache_hash.get_cache_salt_id
+hash_v1_block_key = kv_cache_hash.hash_v1_block_key
+truncate_sha256_hash_to_int64 = kv_cache_hash.truncate_sha256_hash_to_int64
+
 OpenAIRequest = Union[CompletionRequest, ChatCompletionRequest]
+BlockHash = Union[int, str]
 
 
 def get_request_num_tokens(request: OpenAIRequest) -> int:
@@ -80,16 +92,52 @@ class KvCacheAwareServerState(ServerState):
                  use_tokens: bool = False,
                  tokens_per_block: int = 32):
         super().__init__(server, use_tokens)
-        self._kv_cache_block_table: set[int] = set()
+        self._kv_cache_block_table: set[BlockHash] = set()
+        self._kv_cache_block_tables: dict[str, set[BlockHash]] = {
+            KV_CACHE_HASH_ALGO_V1: self._kv_cache_block_table
+        }
+        self._kv_cache_hash_algo = KV_CACHE_HASH_ALGO_DEFAULT
         self._tokens_per_block = tokens_per_block
 
-    def add_blocks(self, block_hashes: Iterable[int]):
-        for hash in block_hashes:
-            self._kv_cache_block_table.add(hash)
+    @property
+    def hash_algo(self) -> str:
+        return self._kv_cache_hash_algo
 
-    def remove_blocks(self, block_hashes: Iterable[int]):
-        for hash in block_hashes:
-            self._kv_cache_block_table.discard(hash)
+    def _block_table(self, hash_algo: str) -> set[BlockHash]:
+        if hash_algo not in self._kv_cache_block_tables:
+            self._kv_cache_block_tables[hash_algo] = set()
+        return self._kv_cache_block_tables[hash_algo]
+
+    def set_hash_algo(self, hash_algo: str):
+        self._kv_cache_hash_algo = hash_algo
+        self._block_table(hash_algo)
+
+    async def get_hash_algo(self, hash_algo: Optional[str] = None) -> str:
+        async with self._lock:
+            if hash_algo is not None:
+                self.set_hash_algo(hash_algo)
+            return self._kv_cache_hash_algo
+
+    def _resolve_hash_algo(self, hash_algo: Optional[str]) -> str:
+        return self._kv_cache_hash_algo if hash_algo is None else hash_algo
+
+    def add_blocks(self,
+                   block_hashes: Iterable[BlockHash],
+                   hash_algo: Optional[str] = None):
+        hash_algo = self._resolve_hash_algo(hash_algo)
+        self.set_hash_algo(hash_algo)
+        block_table = self._block_table(hash_algo)
+        for block_hash in block_hashes:
+            block_table.add(block_hash)
+
+    def remove_blocks(self,
+                      block_hashes: Iterable[BlockHash],
+                      hash_algo: Optional[str] = None):
+        hash_algo = self._resolve_hash_algo(hash_algo)
+        self.set_hash_algo(hash_algo)
+        block_table = self._block_table(hash_algo)
+        for block_hash in block_hashes:
+            block_table.discard(block_hash)
 
     def update_with_events(self, events: Iterable[dict]):
         # event_raw: {"id": <id>, "data": <event body>}
@@ -99,24 +147,33 @@ class KvCacheAwareServerState(ServerState):
             else:
                 event = event_raw
 
+            hash_algo = event_raw.get(
+                "hash_algo", event.get("hash_algo", KV_CACHE_HASH_ALGO_DEFAULT))
+            if event["type"] == "created":
+                self.set_hash_algo(hash_algo)
             if event["type"] == "stored":
-                self.add_blocks(block["block_hash"]
-                                for block in event["blocks"])
+                self.add_blocks(
+                    (block["block_hash"] for block in event["blocks"]),
+                    hash_algo=hash_algo)
             elif event["type"] == "removed":
-                self.remove_blocks(event["block_hashes"])
+                self.remove_blocks(event["block_hashes"], hash_algo=hash_algo)
 
     async def poll_events(self, session: aiohttp.ClientSession):
         async with session.post(self._server + "/kv_cache_events") as response:
             events_raw = await response.json()
         return events_raw
 
-    async def matched_tokens(self, block_hashes: list[list[int]]) -> int:
+    async def matched_tokens(
+            self,
+            block_hashes: list[list[BlockHash]],
+            hash_algo: str = KV_CACHE_HASH_ALGO_DEFAULT) -> int:
         match_count = 0
         async with self._lock:
+            block_table = self._block_table(hash_algo)
             for hash_list in block_hashes:
-                for hash in hash_list:
+                for block_hash in hash_list:
                     # TODO: 1) parent hash verification, 2) partial matching
-                    if hash in self._kv_cache_block_table:
+                    if block_hash in block_table:
                         match_count += self._tokens_per_block
                     else:
                         break
@@ -126,10 +183,13 @@ class KvCacheAwareServerState(ServerState):
                              request: OpenAIRequest,
                              session: Optional[aiohttp.ClientSession] = None):
         num_tokens = get_request_num_tokens(request) if self._use_tokens else 0
+        events_raw = None
         if session is not None:
-            events_raw = await self.poll_events(session)
-        else:
-            events_raw = None
+            try:
+                events_raw = await self.poll_events(session)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to poll KV cache events from {self._server}: {e}")
         async with self._lock:
             self._num_active_requests -= 1
             self._num_active_tokens -= num_tokens
@@ -250,7 +310,9 @@ class Router(ABC):
         '''Select server by request and return some intermediate information, exclude_server is a server to exclude from the selection'''
 
     @abstractmethod
-    async def finish_request(self, request: OpenAIRequest):
+    async def finish_request(self,
+                             request: OpenAIRequest,
+                             session: Optional[aiohttp.ClientSession] = None):
         pass
 
     async def start_server_monitoring(self, poll_interval: float = 10.0):
@@ -507,8 +569,10 @@ class RoundRobinRouter(Router):
                     )
         return server, {"server_info": self._server_info.get(server, {})}
 
-    async def finish_request(self, request: OpenAIRequest):
-        pass
+    async def finish_request(self,
+                             request: OpenAIRequest,
+                             session: Optional[aiohttp.ClientSession] = None):
+        del request, session
 
 
 class LoadBalancingRouter(Router):
@@ -598,7 +662,10 @@ class LoadBalancingRouter(Router):
         return self._server_state[server]._num_active_tokens if self._use_tokens \
             else self._server_state[server]._num_active_requests
 
-    async def finish_request(self, request: OpenAIRequest):
+    async def finish_request(self,
+                             request: OpenAIRequest,
+                             session: Optional[aiohttp.ClientSession] = None):
+        del session
         async with self._lock:
             server = self._req_routing_table[id(request)]
             await self._server_state[server].decrement_load(request)
@@ -608,10 +675,20 @@ class LoadBalancingRouter(Router):
 
 
 def block_key_hasher(token_ids: list[int],
-                     parent_hash: Optional[int] = None) -> int:
-    block_key = BlockKey(token_ids)
-    return BlockKeyHasher.hash(block_key,
-                               0 if parent_hash is None else parent_hash)
+                     parent_hash: Optional[int] = None,
+                     cache_salt_id: Optional[int] = None) -> int:
+    return hash_v1_block_key(
+        token_ids,
+        parent_hash=0 if parent_hash is None else parent_hash,
+        cache_salt_id=cache_salt_id)
+
+
+def v2_sha256_block_hasher(token_ids: list[int],
+                           parent_hash: Optional[str] = None,
+                           cache_salt_id: Optional[int] = None) -> str:
+    parent_key = (V2RootBlock.make_key(None, cache_salt_id)
+                  if parent_hash is None else bytes.fromhex(parent_hash))
+    return V2Block.make_key(parent_key, token_ids).hex()
 
 
 class KvCacheAwareRouter(Router):
@@ -629,10 +706,12 @@ class KvCacheAwareRouter(Router):
                          metadata_server, **kwargs)
         self._lock = asyncio.Lock()
         self._use_tokens = use_tokens
+        self._tokens_per_block = tokens_per_block
 
         # Load map between servers and their number of tokens processed
         self._server_state: dict[str, KvCacheAwareServerState] = {
-            server: KvCacheAwareServerState(server, use_tokens)
+            server: KvCacheAwareServerState(server, use_tokens,
+                                            tokens_per_block)
             for server in servers or []
         }
 
@@ -642,7 +721,6 @@ class KvCacheAwareRouter(Router):
         self._tokenizers = {}
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size
-        self._tokens_per_block = tokens_per_block
 
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
         prompts = request.prompt
@@ -662,6 +740,55 @@ class KvCacheAwareRouter(Router):
         tokenizer = self._tokenizers[request.model]
         return [tokenizer(prompt)["input_ids"] for prompt in prompts]
 
+    async def _get_server_hash_algo(self, server: str) -> str:
+        server_info = self._server_info.get(server, {})
+        hash_algo = server_info.get("kv_cache_hash_algo")
+        return await self._server_state[server].get_hash_algo(hash_algo)
+
+    def _compute_block_hashes(
+        self,
+        token_lists: list[list[int]],
+        hash_algo: str = KV_CACHE_HASH_ALGO_DEFAULT,
+        cache_salt_id: Optional[int] = None,
+    ) -> list[list[BlockHash]]:
+        if hash_algo == KV_CACHE_HASH_ALGO_V1:
+            block_hasher = block_key_hasher
+        elif hash_algo == KV_CACHE_HASH_ALGO_V2:
+            block_hasher = v2_sha256_block_hasher
+        elif hash_algo == KV_CACHE_HASH_ALGO_V2_SHA256_64:
+            block_hashes: list[list[BlockHash]] = []
+            for token_list in token_lists:
+                hash_list = []
+                parent_key = V2RootBlock.make_key(None, cache_salt_id)
+                for t in range(0, len(token_list) - 1, self._tokens_per_block):
+                    t_end = min(t + self._tokens_per_block, len(token_list) - 1)
+                    parent_key = V2Block.make_key(parent_key,
+                                                  token_list[t:t_end])
+                    hash_list.append(truncate_sha256_hash_to_int64(parent_key))
+                block_hashes.append(hash_list)
+            return block_hashes
+        else:
+            raise ValueError(
+                f"Unsupported KV cache hash algorithm: {hash_algo}")
+
+        block_hashes: list[list[BlockHash]] = []
+        for token_list in token_lists:
+            hash_list = []
+            # in KvCacheManager, the last token is not included in the block key
+            for t in range(0, len(token_list) - 1, self._tokens_per_block):
+                t_end = min(t + self._tokens_per_block, len(token_list) - 1)
+                hash_list.append(
+                    block_hasher(token_list[t:t_end],
+                                 None if t == 0 else hash_list[-1],
+                                 cache_salt_id))
+            block_hashes.append(hash_list)
+        return block_hashes
+
+    @staticmethod
+    def _get_request_cache_salt_id(request: OpenAIRequest) -> Optional[int]:
+        cache_salt = getattr(request, "cache_salt", None)
+        return None if cache_salt is None else get_cache_salt_id(cache_salt)
+
     async def get_next_server(
             self,
             request: OpenAIRequest,
@@ -671,42 +798,57 @@ class KvCacheAwareRouter(Router):
                 server for server in self._server_state.keys()
                 if server != exclude_server
             ])
+            if not servers:
+                raise ValueError(
+                    f"No available servers after excluding {exclude_server}")
         token_lists = self._tokenize(request)
-        block_hashes: list[list[int]] = []
-        for token_list in token_lists:
-            hash_list = []
-            # in KvCacheManager, the last token is not included in the block key
-            for t in range(0, len(token_list) - 1, self._tokens_per_block):
-                t_end = min(t + self._tokens_per_block, len(token_list) - 1)
-                hash_list.append(
-                    block_key_hasher(token_list[t:t_end],
-                                     None if t == 0 else hash_list[-1]))
-            block_hashes.append(hash_list)
-        padded_tokens = sum(
-            len(hash_list)
-            for hash_list in block_hashes) * self._tokens_per_block
+        cache_salt_id = self._get_request_cache_salt_id(request)
+        hash_algo_by_server = {
+            server: await self._get_server_hash_algo(server)
+            for server in servers
+        }
+        block_hashes_by_algo = {
+            hash_algo:
+            self._compute_block_hashes(token_lists,
+                                       hash_algo,
+                                       cache_salt_id=cache_salt_id)
+            for hash_algo in set(hash_algo_by_server.values())
+        }
+        padded_tokens_by_algo = {
+            hash_algo:
+            max(
+                sum(len(hash_list)
+                    for hash_list in block_hashes) * self._tokens_per_block, 1)
+            for hash_algo, block_hashes in block_hashes_by_algo.items()
+        }
         # select the server by (KV match - load)
         # TODO: more options
         workloads = [
-            state.num_active_requests()
-            for state in self._server_state.values()
+            self._server_state[server].num_active_requests()
+            for server in servers
         ]
         scores = []
         matches = []
         for i in range(len(servers)):
             server = servers[i]
+            hash_algo = hash_algo_by_server[server]
+            block_hashes = block_hashes_by_algo[hash_algo]
+            padded_tokens = padded_tokens_by_algo[hash_algo]
             # https://github.com/ai-dynamo/dynamo/blob/main/docs/kv_cache_routing.md#kv-cache-routing-and-load-balancing
-            matches.append(
-                await self._server_state[server].matched_tokens(block_hashes))
+            matches.append(await self._server_state[server].matched_tokens(
+                block_hashes, hash_algo))
             score = matches[-1] / padded_tokens - workloads[
                 i] / self._max_batch_size
             scores.append(score)
         server = servers[scores.index(max(scores))]
+        hash_algo = hash_algo_by_server[server]
+        block_hashes = block_hashes_by_algo[hash_algo]
         async with self._lock:
             await self._server_state[server].increment_load(request)
             self._req_routing_table[id(request)] = server
         return server, {
-            "block_hashes": block_hashes,  # list[list[int]]
+            "block_hashes": block_hashes,  # list[list[int | str]]
+            "hash_algo": hash_algo,
             "token_lists": token_lists,  # list[list[int]]
             "matches": matches,  # list[int]
             "server_info": self._server_info.get(server, {}),
@@ -718,14 +860,14 @@ class KvCacheAwareRouter(Router):
         async with self._lock:
             server = self._req_routing_table[id(request)]
             del self._req_routing_table[id(request)]
-            if server in self._server_state:
-                await self._server_state[server].decrement_load(request,
-                                                                session=session)
+            server_state = self._server_state.get(server)
+        if server_state is not None:
+            await server_state.decrement_load(request, session=session)
 
     def _on_servers_updated(self, old_servers, new_servers):
         for new_server in new_servers:
             self._server_state[new_server] = KvCacheAwareServerState(
-                new_server, self._use_tokens)
+                new_server, self._use_tokens, self._tokens_per_block)
         for old_server in old_servers:
             self._server_state.pop(old_server, None)
 
