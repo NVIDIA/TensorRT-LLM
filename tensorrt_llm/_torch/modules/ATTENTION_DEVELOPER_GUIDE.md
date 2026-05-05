@@ -62,7 +62,9 @@ appends, and reuses KV cache, especially during decode.
 - optional unfused Rotary Position Embedding (RoPE)
 - optional output gating
 - optional LoRA injection
-- passing masks, sinks, and metadata into the backend
+- collecting masks, sinks, output buffers, and other per-forward options into
+  `AttentionForwardContext`
+- passing Q/K/V, metadata, and `AttentionForwardContext` into the backend
 
 At a high level:
 
@@ -147,12 +149,18 @@ All backends implement the `AttentionBackend` interface.
 
 The core contract is:
 
-- `forward(q, k, v, metadata, attention_mask=..., **kwargs)`
+- `forward(q, k, v, metadata, ctx=..., **kwargs)`
 - `Metadata` subtype
+- `AttentionForwardContext` for per-forward optional arguments such as masks,
+  output buffers, scales, RoPE/mRoPE inputs, MLA buffers, and sparse inputs
 - coarse capability hooks:
   - `support_fused_rope()`
   - `support_fused_qkv()`
   - `support_mla()`
+
+`**kwargs` is only a temporary compatibility path. It is merged into
+`AttentionForwardContext`, rejects unknown fields, and must not be mixed with
+an explicit `ctx`.
 
 Those capability hooks are coarse checks. They do not prove that every
 required operator or sparse path already exists.
@@ -187,7 +195,12 @@ cache-index information. Use it when the `Attention` module boundary fits but
 the fused TRTLLM path is too restrictive.
 
 **`FlashInferAttentionMetadata`** adds a planning-oriented contract with
-workspace, page-table KV metadata, and prefill/decode wrapper state.
+workspace, page-table KV metadata, and FlashInfer library prefill/decode
+wrapper state. Those wrappers are part of FlashInfer's plan-and-run API:
+`FlashInferAttention.forward` merges per-forward options from
+`AttentionForwardContext`, updates KV cache with `append_paged_kv_cache` when
+needed, then executes the planned FlashInfer prefill, decode, or ragged-prefill
+`wrapper.run` path.
 
 **Sparse metadata** families extend the base backend metadata with
 sparse-specific runtime state (indexer buffers, routing state, side-cache
