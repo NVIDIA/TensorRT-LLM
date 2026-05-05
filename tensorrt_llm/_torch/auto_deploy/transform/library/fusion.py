@@ -20,6 +20,7 @@ from ...utils.node_utils import (
     is_linear_op,
     is_op,
 )
+from ...utils.quantization_utils import ensure_tma_col_major
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
@@ -550,32 +551,6 @@ class FuseFP4Gemms(QuantizationFusionMixin, BaseTransform):
         return self._apply_fusion_pass(gm, cm, factory, shared_config)
 
 
-def _ensure_tma_col_major(t: torch.Tensor) -> torch.Tensor:
-    """Re-apply TMA-aligned column-major layout after torch.cat on packed int32 scales.
-
-    torch.cat always produces contiguous (row-major) output, which violates
-    DeepGEMM's stride(-2)==1 requirement. Creates a fresh column-major buffer.
-    """
-    if t.dtype != torch.int or t.stride(-2) == 1:
-        return t
-
-    remove_dim = False
-    if t.dim() == 2:
-        t = t.unsqueeze(0)
-        remove_dim = True
-
-    b, mn, k = t.shape
-    aligned_mn = ((mn + 3) // 4) * 4
-
-    col_major = torch.transpose(
-        torch.empty((b, k, aligned_mn), device=t.device, dtype=torch.int), 1, 2
-    )
-    col_major[:, :mn, :] = t
-    result = col_major[:, :mn, :]
-
-    return result.squeeze(0) if remove_dim else result
-
-
 @TransformRegistry.register("fuse_finegrained_fp8_gemms")
 class FuseFineGrainedFP8Gemms(QuantizationFusionMixin, BaseTransform):
     """Fuse FineGrained (block-wise) FP8 GEMMs sharing the same input activation.
@@ -616,7 +591,7 @@ class FuseFineGrainedFP8Gemms(QuantizationFusionMixin, BaseTransform):
         fused_weights = torch.cat(weights, dim=0)
 
         fused_weight_scale_inv = torch.cat(weight_scale_inv, dim=0)
-        fused_weight_scale_inv = _ensure_tma_col_major(fused_weight_scale_inv)
+        fused_weight_scale_inv = ensure_tma_col_major(fused_weight_scale_inv)
 
         return fused_weights, {"weight_scale_inv": fused_weight_scale_inv}
 

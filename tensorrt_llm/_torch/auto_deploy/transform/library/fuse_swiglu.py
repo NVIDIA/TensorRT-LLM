@@ -49,6 +49,7 @@ from ...utils._graph import (
 )
 from ...utils.node_utils import is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
+from ...utils.quantization_utils import ensure_tma_col_major
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -56,39 +57,6 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
-
-
-def _ensure_tma_col_major(t: torch.Tensor) -> torch.Tensor:
-    """Re-apply TMA-aligned column-major layout to a torch.int scale tensor.
-
-    torch.cat always produces contiguous (row-major) output, which violates
-    DeepGEMM's stride(-2) == 1 requirement. This function re-creates the
-    column-major layout.
-
-    Only affects Blackwell + DeepGEMM: post_load_hook converts scales to
-    UE8M0 (torch.int) col-major only in that configuration. On other GPUs
-    or without DeepGEMM, scales remain torch.float and this is a no-op.
-    """
-    if t.dtype != torch.int or t.stride(-2) == 1:
-        return t  # Not UE8M0 or already column-major
-
-    remove_dim = False
-    if t.dim() == 2:
-        t = t.unsqueeze(0)
-        remove_dim = True
-
-    b, mn, k = t.shape
-    # TMA alignment: 16 bytes / 4 bytes per int32 = 4 elements
-    aligned_mn = ((mn + 3) // 4) * 4
-
-    # Create column-major buffer via transpose trick (same as get_col_major_tma_aligned_packed_tensor)
-    col_major = torch.transpose(
-        torch.empty((b, k, aligned_mn), device=t.device, dtype=torch.int), 1, 2
-    )
-    col_major[:, :mn, :] = t
-    result = col_major[:, :mn, :]
-
-    return result.squeeze(0) if remove_dim else result
 
 
 def _maybe_to_deepgemm_layout(
@@ -958,10 +926,10 @@ class FuseFineGrainedFP8SwiGLU(BaseTransform):
 
             # If we did NOT convert (raw FP32 path), torch.cat still produced a
             # row-major result, so re-apply col-major for the trtllm
-            # fp8_block_scaling kernel. _ensure_tma_col_major is a no-op when
+            # fp8_block_scaling kernel. ensure_tma_col_major is a no-op when
             # the scale is already col-major (the deepgemm conversion above
             # produces col-major already).
-            gate_up_weight_scale = _ensure_tma_col_major(gate_up_weight_scale)
+            gate_up_weight_scale = ensure_tma_col_major(gate_up_weight_scale)
 
             # Register fused buffers
             prefix = f"fused_finegrained_fp8_swiglu_{fused_weight_idx}"
