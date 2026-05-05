@@ -1,7 +1,7 @@
 ---
 name: ad-run-agent
 description: Run AutoDeploy build and run command for a given model
-tools: Read, Grep, Glob, Bash, Write, Edit
+tools: ["Read", "Grep", "Glob", "Bash", "Write", "Edit"]
 model: sonnet
 license: Apache-2.0
 metadata:

@@ -27,6 +27,7 @@ from tensorrt_llm.serve.tool_parser.core_types import (StreamingParseResult,
 from tensorrt_llm.serve.tool_parser.deepseekv3_parser import DeepSeekV3Parser
 from tensorrt_llm.serve.tool_parser.deepseekv31_parser import DeepSeekV31Parser
 from tensorrt_llm.serve.tool_parser.deepseekv32_parser import DeepSeekV32Parser
+from tensorrt_llm.serve.tool_parser.gemma4_parser import Gemma4ToolParser
 from tensorrt_llm.serve.tool_parser.glm4_parser import Glm4ToolParser
 from tensorrt_llm.serve.tool_parser.glm47_parser import Glm47ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
@@ -2976,6 +2977,166 @@ class TestBuildToolStrictGuidedDecoding:
         assert fmt["type"] == "triggered_tags"
         assert len(fmt["tags"]) == 1
         assert "calculate" in fmt["tags"][0]["begin"]
+
+
+# ============================================================================
+# Gemma 4 Tool Parser Tests
+# ============================================================================
+
+
+class TestGemma4ToolParser:
+    """Test suite for Gemma4ToolParser."""
+
+    def _call(self, name: str, args_body: str) -> str:
+        return f"<|tool_call>call:{name}{args_body}<tool_call|>"
+
+    def test_has_tool_call(self):
+        parser = Gemma4ToolParser()
+        assert parser.has_tool_call("plain text") is False
+        assert parser.has_tool_call(self._call("f", "{x:1}")) is True
+
+    def test_needs_raw_special_tokens(self):
+        """Delimiters are special tokens; skip_special_tokens must be off."""
+        assert Gemma4ToolParser.needs_raw_special_tokens is True
+
+    def test_detect_and_parse_no_tool_call(self, sample_tools):
+        parser = Gemma4ToolParser()
+        result = parser.detect_and_parse("hello", sample_tools)
+        assert result.normal_text == "hello"
+        assert result.calls == []
+
+    def test_detect_and_parse_string_arg(self, sample_tools):
+        parser = Gemma4ToolParser()
+        text = self._call("get_weather", '{location:<|"|>San Francisco<|"|>}')
+        result = parser.detect_and_parse(text, sample_tools)
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {
+            "location": "San Francisco"
+        }
+
+    def test_detect_and_parse_mixed_arg_types(self, sample_tools):
+        parser = Gemma4ToolParser()
+        # String, number, boolean, nested object, array.
+        args = ('{active:true,count:3,'
+                'location:<|"|>NYC<|"|>,'
+                'meta:{key:<|"|>v<|"|>},'
+                'tags:[<|"|>a<|"|>,<|"|>b<|"|>]}')
+        result = parser.detect_and_parse(self._call("get_weather", args),
+                                         sample_tools)
+        assert len(result.calls) == 1
+        parsed = json.loads(result.calls[0].parameters)
+        assert parsed == {
+            "active": True,
+            "count": 3,
+            "location": "NYC",
+            "meta": {
+                "key": "v"
+            },
+            "tags": ["a", "b"],
+        }
+
+    def test_detect_and_parse_multiple_calls(self, sample_tools):
+        parser = Gemma4ToolParser()
+        text = (self._call("get_weather", '{location:<|"|>SF<|"|>}') +
+                self._call("search_web", '{query:<|"|>gemma<|"|>}'))
+        result = parser.detect_and_parse(text, sample_tools)
+        assert len(result.calls) == 2
+        assert result.calls[0].name == "get_weather"
+        assert json.loads(result.calls[0].parameters) == {"location": "SF"}
+        assert result.calls[1].name == "search_web"
+        assert json.loads(result.calls[1].parameters) == {"query": "gemma"}
+
+    def test_detect_and_parse_preserves_prefix(self, sample_tools):
+        parser = Gemma4ToolParser()
+        text = "some prefix text  " + self._call("get_weather",
+                                                 '{location:<|"|>SF<|"|>}')
+        result = parser.detect_and_parse(text, sample_tools)
+        assert result.normal_text == "some prefix text"
+        assert len(result.calls) == 1
+
+    def test_streaming_simple(self, sample_tools):
+        parser = Gemma4ToolParser()
+        chunks = [
+            "prefix",
+            "<|tool_call>call:get_weather{loca",
+            'tion:<|"|>SF<|"|>}',
+            "<tool_call|>",
+            "tail",
+        ]
+        normal_text = ""
+        calls: list = []
+        for chunk in chunks:
+            r = parser.parse_streaming_increment(chunk, sample_tools)
+            normal_text += r.normal_text
+            calls.extend(r.calls)
+        assert normal_text == "prefixtail"
+        # Emitted as: (name, ""), (None, args_json).
+        assert len(calls) == 2
+        assert calls[0].name == "get_weather"
+        assert calls[0].parameters == ""
+        assert calls[1].name is None
+        assert json.loads(calls[1].parameters) == {"location": "SF"}
+        assert calls[0].tool_index == calls[1].tool_index == 0
+
+    def test_streaming_holds_partial_bot_token(self, sample_tools):
+        parser = Gemma4ToolParser()
+        # Partial open tag at end should be buffered, not leaked as normal.
+        r1 = parser.parse_streaming_increment("text<|tool_", sample_tools)
+        assert r1.normal_text == "text"
+        assert r1.calls == []
+        r2 = parser.parse_streaming_increment(
+            'call>call:search_web{query:<|"|>q<|"|>}<tool_call|>', sample_tools)
+        assert r2.normal_text == ""
+        assert len(r2.calls) == 2
+        assert r2.calls[0].name == "search_web"
+        assert json.loads(r2.calls[1].parameters) == {"query": "q"}
+
+    def test_structure_info(self):
+        parser = Gemma4ToolParser()
+        info = parser.structure_info()("my_func")
+        assert info.begin == "<|tool_call>call:my_func{"
+        assert info.end == "}<tool_call|>"
+        assert info.trigger == "<|tool_call>"
+
+    def test_supports_structural_tag_disabled(self):
+        """Structural-tag guided decoding is disabled for the custom format.
+
+        Gemma 4 argument bodies are not standard JSON, so guided decoding via
+        structural tags would not produce valid output.
+        """
+        assert Gemma4ToolParser().supports_structural_tag() is False
+
+
+class TestGemma4ArgsToJson:
+    """Test the gemma4 args-to-JSON conversion helper."""
+
+    def test_empty_object(self):
+        from tensorrt_llm.serve.tool_parser.gemma4_parser import \
+            _gemma4_args_to_json
+        assert json.loads(_gemma4_args_to_json("{}")) == {}
+
+    def test_string_with_special_chars(self):
+        from tensorrt_llm.serve.tool_parser.gemma4_parser import \
+            _gemma4_args_to_json
+
+        # Ensure braces/commas inside a string literal are not treated as
+        # structural tokens.
+        body = '{msg:<|"|>hello, {world}<|"|>}'
+        assert json.loads(_gemma4_args_to_json(body)) == {
+            "msg": "hello, {world}"
+        }
+
+    def test_nested_bare_keys(self):
+        from tensorrt_llm.serve.tool_parser.gemma4_parser import \
+            _gemma4_args_to_json
+        body = '{outer:{inner:<|"|>v<|"|>,n:1}}'
+        assert json.loads(_gemma4_args_to_json(body)) == {
+            "outer": {
+                "inner": "v",
+                "n": 1
+            }
+        }
 
 
 if __name__ == "__main__":

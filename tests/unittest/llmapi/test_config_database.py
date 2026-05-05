@@ -19,8 +19,13 @@ from unittest import mock
 
 import pytest
 import yaml
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
+from tensorrt_llm.commands.serve import _apply_fastapi_middlewares
 from tensorrt_llm.commands.serve import main as serve_main
 from tensorrt_llm.llmapi import llm_args as llm_args_module
 
@@ -41,6 +46,19 @@ CURATED_CONFIGS = collect_yaml_files(CURATED_DIR, "**/*.yaml", exclude_names={"l
 DATABASE_CONFIGS = collect_yaml_files(DATABASE_DIR, "**/*.yaml", exclude_names={"lookup.yaml"})
 ALL_CONFIGS = sorted(CURATED_CONFIGS + DATABASE_CONFIGS)
 ALL_LOOKUP_PATHS = sorted((DATABASE_DIR / "lookup.yaml", CURATED_DIR / "lookup.yaml"))
+
+
+class _HeaderMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers["x-class-middleware"] = "enabled"
+        return response
+
+
+async def _header_middleware(request, call_next):
+    response = await call_next(request)
+    response.headers["x-function-middleware"] = "enabled"
+    return response
 
 
 def _load_config_path_to_lookup_entry() -> dict[str, dict]:
@@ -219,3 +237,68 @@ def test_database_yaml_config_serve_cli(config_path: Path):
     mock_pytorch_llm.assert_called_once()
     call_kwargs = mock_pytorch_llm.call_args[1]
     llm_args_module.TorchLlmArgs(**call_kwargs)
+
+
+def test_apply_fastapi_middlewares_supports_class_and_function():
+    app = FastAPI()
+
+    @app.get("/health")
+    async def health():
+        return JSONResponse({"ok": True})
+
+    _apply_fastapi_middlewares(
+        app,
+        [
+            f"{__name__}._HeaderMiddleware",
+            f"{__name__}._header_middleware",
+        ],
+    )
+
+    client = TestClient(app)
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.headers["x-class-middleware"] == "enabled"
+    assert response.headers["x-function-middleware"] == "enabled"
+
+
+def test_serve_cli_passes_middlewares_to_launch_server():
+    middleware = (
+        f"{__name__}._HeaderMiddleware",
+        f"{__name__}._header_middleware",
+    )
+
+    with (
+        mock.patch("tensorrt_llm.commands.serve.get_is_diffusion_model", return_value=False),
+        mock.patch("tensorrt_llm.commands.serve.device_count", return_value=1),
+        mock.patch("tensorrt_llm.commands.serve.launch_server") as mock_launch_server,
+    ):
+        serve_main(
+            args=[
+                "dummy/model",
+                "--middleware",
+                middleware[0],
+                "--middleware",
+                middleware[1],
+            ],
+            standalone_mode=False,
+        )
+
+    assert mock_launch_server.call_count == 1
+    assert mock_launch_server.call_args.args[4] == middleware
+
+
+def test_serve_cli_rejects_middleware_with_grpc():
+    with (
+        mock.patch("tensorrt_llm.commands.serve.get_is_diffusion_model", return_value=False),
+        mock.patch("tensorrt_llm.commands.serve.device_count", return_value=1),
+    ):
+        with pytest.raises(ValueError, match="Argument 'middleware' is not supported"):
+            serve_main(
+                args=[
+                    "dummy/model",
+                    "--grpc",
+                    "--middleware",
+                    f"{__name__}._HeaderMiddleware",
+                ],
+                standalone_mode=False,
+            )

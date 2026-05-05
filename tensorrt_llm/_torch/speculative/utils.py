@@ -11,6 +11,7 @@ from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
 from ..speculative.interface import SpecMetadata
+from .dflash import DFlashSpecMetadata, DFlashWorker
 from .draft_target import (DraftTargetOneModelSampler,
                            DraftTargetOneModelSpecMetadata,
                            DraftTargetOneModelWorker)
@@ -104,6 +105,19 @@ def get_spec_metadata(spec_config,
             max_num_requests=max_num_requests,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
             spec_resource_manager=spec_resource_manager,
+        )
+    if spec_config.spec_dec_mode.is_dflash():
+        target_layer_ids = getattr(spec_config, 'target_layer_ids', None)
+        return DFlashSpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+            allow_advanced_sampling=spec_config.allow_advanced_sampling,
+            layers_to_capture=target_layer_ids,
+            hidden_size=model_config.hidden_size,
+            max_num_tokens=max_num_tokens,
+            dtype=model_config.torch_dtype,
         )
     if spec_config.spec_dec_mode.is_draft_target_one_model():
         return DraftTargetOneModelSpecMetadata(
@@ -225,7 +239,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_num_requests,
             max_num_tokens,
         )
-    if spec_dec_mode.is_pard():
+    if spec_dec_mode.is_parallel_draft():
         sa_cfg = getattr(spec_config, 'sa_config', None)
         if sa_cfg is not None:
             return SuffixAutomatonManager(sa_cfg, max_num_requests, max_seq_len)
@@ -253,7 +267,7 @@ def get_spec_decoder(
         return TorchSampler(sampler_args)
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelSampler(sampler_args, spec_config=spec_config)
-    if spec_config.spec_dec_mode.is_pard():
+    if spec_config.spec_dec_mode.is_parallel_draft():
         return MTPSampler(sampler_args,
                           nextn=spec_config.tokens_per_gen_step - 1)
     if spec_config.spec_dec_mode.is_sa():
@@ -322,6 +336,8 @@ def get_spec_worker(spec_config,
                                     use_separate_draft_kv_cache)
     if spec_dec_mode.is_pard():
         return PARDWorker(spec_config, mapping, use_separate_draft_kv_cache)
+    if spec_dec_mode.is_dflash():
+        return DFlashWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_sa():
         return SAWorker(spec_config, model_config)
     if spec_dec_mode.is_draft_target_one_model():
