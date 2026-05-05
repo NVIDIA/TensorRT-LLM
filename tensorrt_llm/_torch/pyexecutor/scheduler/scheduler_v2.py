@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -102,6 +102,19 @@ class BudgetTracker:
             return None
         return required
 
+    def pre_claim_peft(self, req: LlmRequest) -> None:
+        """Reserve PEFT pages for a non-scheduled request whose adapter is
+        still loaded on device (e.g. GENERATION_TO_COMPLETE in the overlap
+        executor — not yet terminated, so ensure_batch cannot evict it)."""
+        if self._peft_cache_manager is None:
+            return
+        lora_task_id = getattr(req, "lora_task_id", None)
+        if lora_task_id is None or lora_task_id in self._seen_peft_task_ids:
+            return
+        pages = self._peft_cache_manager.determine_num_pages(req)
+        self._claimed_peft_pages += pages
+        self._seen_peft_task_ids.add(lora_task_id)
+
 
 class KVCacheV2Scheduler(RequestScheduler):
     """Interleaved scheduler for KV Cache Manager V2.
@@ -168,6 +181,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._context_init_state_value = LlmRequestState.CONTEXT_INIT.value
         self._encoder_init_state_value = LlmRequestState.ENCODER_INIT.value
         self._disagg_gen_init_state_value = LlmRequestState.DISAGG_GENERATION_INIT.value
+        self._gen_to_complete_state_value = LlmRequestState.GENERATION_TO_COMPLETE.value
 
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -217,6 +231,27 @@ class KVCacheV2Scheduler(RequestScheduler):
         req_it_end = len(requests_list)
         req_it = 0
 
+        # Context requests are always deferred to a second phase so that
+        # generation requests are fully accounted for in the budget before
+        # any context request competes for resources.  This mirrors the
+        # two-phase approach of the old KVCacheV2DummyScheduler and
+        # prevents PEFT adapter eviction failures when gen requests hold
+        # adapters that can't be evicted mid-iteration.
+        pending_ctx: RequestList = []
+
+        # Pre-claim PEFT pages for GENERATION_TO_COMPLETE requests.
+        # In the overlap executor these requests are no longer scheduled
+        # (state outside schedulable range) but their adapters haven't
+        # been released yet (mark_request_done runs after prepare_resources
+        # in the next iteration).  Without this, the budget would appear
+        # empty and context requests with a different adapter could be
+        # admitted, causing ensure_batch to crash when it can't evict the
+        # still-active adapter.
+        for req in requests_list:
+            if req.state_value == self._gen_to_complete_state_value:
+                budget.pre_claim_peft(req)
+
+        # --- Phase 1: generation / disagg only ---
         while req_it < req_it_end:
             if budget.requests_full:
                 break
@@ -230,8 +265,19 @@ class KVCacheV2Scheduler(RequestScheduler):
 
             req_state_value = req.state_value
 
-            # Disagg gen init bypasses normal state gating (same as C++ / V1 scheduler)
+            # Disagg gen init bypasses normal state gating (same as C++ / V1 scheduler),
+            # but the V2 scheduler owns inline KV allocation so we must allocate here.
+            # V1 defers allocation to prepare_resources; V2 prepare_resources is a no-op
+            # for the primary manager, so allocation must happen in the scheduling loop.
             if req_state_value == self._disagg_gen_init_state_value:
+                if not self.kv_cache_manager.prepare_context(req):
+                    req_it += 1
+                    continue
+                if not self.kv_cache_manager.resize_context(
+                    req, req.context_remaining_length + get_draft_token_length(req)
+                ):
+                    req_it += 1
+                    continue
                 disagg_candidates.append(req)
                 req_it += 1
                 continue
@@ -243,30 +289,20 @@ class KVCacheV2Scheduler(RequestScheduler):
                 req_it += 1
                 continue
 
-            peft_pages = budget.peft_pages_needed(req)
-            if peft_pages is None:
-                break
-
             # --- Dispatch by request type ---
-            if req_state_value == self._encoder_init_state_value:
-                action, tokens = self._try_schedule_encoder(req, budget)
-                if action is ScheduleAction.STOP:
-                    break
-                scheduled_ctx.append(req)
-                budget.commit(req, tokens, peft_pages)
-
-            elif req_state_value == self._context_init_state_value:
-                action, tokens, chunking_flag = self._try_schedule_context(req, budget)
-                if action is ScheduleAction.STOP:
-                    break
-                if action is ScheduleAction.SKIP:
-                    req_it += 1
-                    continue
-                has_chunking = has_chunking or chunking_flag
-                scheduled_ctx.append(req)
-                budget.commit(req, tokens, peft_pages)
+            if (
+                req_state_value == self._encoder_init_state_value
+                or req_state_value == self._context_init_state_value
+            ):
+                # Defer to phase 2 so gen PEFT budget is settled first.
+                pending_ctx.append(req)
+                req_it += 1
+                continue
 
             else:
+                peft_pages = budget.peft_pages_needed(req)
+                if peft_pages is None:
+                    break
                 action, tokens, scheduled_beam_width, req_it_end = self._try_schedule_generation(
                     req,
                     budget,
@@ -285,6 +321,53 @@ class KVCacheV2Scheduler(RequestScheduler):
                 budget.commit(req, tokens, peft_pages)
 
             req_it += 1
+
+        # --- Phase 2: schedule deferred context / encoder requests ---
+        # Generation PEFT pages are now fully committed in the budget.
+        for req in pending_ctx:
+            if budget.requests_full:
+                break
+            peft_pages = budget.peft_pages_needed(req)
+            if peft_pages is None:
+                continue
+            if req.state_value == self._encoder_init_state_value:
+                action, tokens = self._try_schedule_encoder(req, budget)
+                if action is ScheduleAction.STOP:
+                    break
+                scheduled_ctx.append(req)
+                budget.commit(req, tokens, peft_pages)
+            else:
+                action, tokens, chunking_flag = self._try_schedule_context(req, budget)
+                if action is ScheduleAction.STOP:
+                    break
+                if action is ScheduleAction.SKIP:
+                    continue
+                has_chunking = has_chunking or chunking_flag
+                scheduled_ctx.append(req)
+                budget.commit(req, tokens, peft_pages)
+
+        # Deadlock detection: if generation requests exist but none were
+        # scheduled and none were evicted, no forward pass will run and no
+        # KV cache pages will ever be freed — the scheduler will spin
+        # forever.  This typically happens when the KV cache pool is
+        # exhausted and no host cache tier is available for suspend/resume.
+        if not scheduled_gen and not scheduled_ctx:
+            num_gen_candidates = sum(
+                1
+                for r in active_requests
+                if r.is_generation_in_progress_state
+                and not r.is_generation_to_complete_state
+                and r.request_id not in inflight_request_ids
+            )
+            if num_gen_candidates > 0 and not evicted:
+                raise RuntimeError(
+                    f"V2 scheduler deadlock: {num_gen_candidates} generation "
+                    f"request(s) active but none could be scheduled or "
+                    f"evicted. KV cache pool is likely exhausted with no "
+                    f"host cache tier for suspend/resume offload. "
+                    f"Configure kv_cache_config.host_cache_size or increase "
+                    f"kv_cache_config.max_tokens."
+                )
 
         return scheduled_ctx, scheduled_gen, evicted, disagg_candidates, has_chunking
 
@@ -479,7 +562,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         ) or req.is_generation_in_progress_state
 
     def _suspend_request(self, req: LlmRequest) -> None:
-        """Suspend a request's KV cache in both main and draft managers."""
+        """Suspend a request's KV cache in both main and draft managers.
+
+        TODO: Also release PEFT resources (mark_request_done) for the
+        suspended request so the C++ PeftCacheManager can evict its
+        adapter pages.  Currently only KV cache is freed; the adapter
+        remains "active" on device, which could cause ensure_batch to
+        fail if it needs to load a different adapter into a full cache.
+        """
         self.kv_cache_manager.suspend_request(req)
         if self.draft_kv_cache_manager is not None:
             self.draft_kv_cache_manager.suspend_request(req)

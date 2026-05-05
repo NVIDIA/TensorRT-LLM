@@ -99,7 +99,7 @@ def make_encoder_request(request_id, encoder_output_len, lora_task_id=None):
     return req
 
 
-def make_disagg_request(request_id):
+def make_disagg_request(request_id, context_remaining_length=1, num_draft_tokens=0):
     req = Mock()
     req.request_id = request_id
     req.py_request_id = request_id
@@ -107,6 +107,10 @@ def make_disagg_request(request_id):
     req.is_context_init_state = False
     req.is_generation_in_progress_state = False
     req.is_first_context_chunk = True
+    req.context_remaining_length = context_remaining_length
+    req.num_draft_tokens = num_draft_tokens
+    req.has_draft_tokens = num_draft_tokens > 0
+    req.py_draft_tokens = [0] * num_draft_tokens if num_draft_tokens > 0 else []
     return req
 
 
@@ -1005,15 +1009,19 @@ class TestEncoder:
         assert ids(out.context_requests) == [0, 1]
 
     def test_encoder_counts_toward_batch(self):
+        """Gen wins phase 1; encoder scheduled in phase 2 still occupies a batch slot."""
         mgr = make_kv_cache_manager()
-        sched = make_encoder_scheduler(mgr, max_batch_size=1, max_num_tokens=1000)
+        sched = make_encoder_scheduler(mgr, max_batch_size=2, max_num_tokens=1000)
         reqs = [
             make_encoder_request(0, encoder_output_len=50),
             make_gen_request(1),
+            make_encoder_request(2, encoder_output_len=50),
         ]
         out = sched.schedule_request(reqs, set())
+        # gen(1) scheduled first (phase 1), encoder(0) fills remaining slot (phase 2)
+        assert ids(out.generation_requests) == [1]
         assert ids(out.context_requests) == [0]
-        assert len(out.generation_requests) == 0
+        # encoder(2) excluded — encoder(0) counted toward batch
 
 
 # ===========================================================================

@@ -93,14 +93,19 @@ def test_merge_helix_requests_with_padding():
 
         assert isinstance(llm_request, LlmRequest)
         assert llm_request.request_id == 1
+        # Round-robin block distribution across 4 CP ranks (7 blocks total, 2 tokens/block):
+        #   rank 0 owns blocks {0, 4} -> tokens [1,2, 9,10]
+        #   rank 1 owns blocks {1, 5} -> tokens [3,4, 11,12]
+        #   rank 2 owns blocks {2, 6} -> tokens [5,6, 13]  (block 6 is the last block; padding stripped)
+        #   rank 3 owns block  {3}    -> tokens [7,8]
         if rank == 0:
-            assert llm_request.get_tokens(0) == [1, 2, 3, 4]
+            assert llm_request.get_tokens(0) == [1, 2, 9, 10]
         elif rank == 1:
-            assert llm_request.get_tokens(0) == [5, 6, 7, 8]
+            assert llm_request.get_tokens(0) == [3, 4, 11, 12]
         elif rank == 2:
-            assert llm_request.get_tokens(0) == [9, 10, 11, 12]
+            assert llm_request.get_tokens(0) == [5, 6, 13]
         else:
-            assert llm_request.get_tokens(0) == [13]
+            assert llm_request.get_tokens(0) == [7, 8]
 
 
 def test_merge_helix_requests_without_padding():
@@ -139,10 +144,13 @@ def test_merge_helix_requests_without_padding():
 
         assert isinstance(llm_request, LlmRequest)
         assert llm_request.request_id == 1
+        # Round-robin block distribution across 2 CP ranks (3 blocks total, 4 tokens/block):
+        #   rank 0 owns blocks {0, 2} -> tokens [1,2,3,4, 9,10,11,12]
+        #   rank 1 owns block  {1}    -> tokens [5,6,7,8]
         if rank == 0:
-            assert llm_request.get_tokens(0) == [1, 2, 3, 4, 5, 6, 7, 8]
+            assert llm_request.get_tokens(0) == [1, 2, 3, 4, 9, 10, 11, 12]
         else:
-            assert llm_request.get_tokens(0) == [9, 10, 11, 12]
+            assert llm_request.get_tokens(0) == [5, 6, 7, 8]
 
 
 def test_merge_helix_requests_insufficient_blocks_error():
@@ -231,14 +239,19 @@ def test_merge_requests_with_helix_cp_config():
 
         assert isinstance(llm_request, LlmRequest)
         assert llm_request.request_id == 1
+        # Round-robin block distribution across 4 CP ranks (7 blocks total, 2 tokens/block):
+        #   rank 0 owns blocks {0, 4} -> tokens [1,2, 9,10]
+        #   rank 1 owns blocks {1, 5} -> tokens [3,4, 11,12]
+        #   rank 2 owns blocks {2, 6} -> tokens [5,6, 13]  (block 6 is the last block; padding stripped)
+        #   rank 3 owns block  {3}    -> tokens [7,8]
         if rank == 0:
-            assert llm_request.get_tokens(0) == [1, 2, 3, 4]
+            assert llm_request.get_tokens(0) == [1, 2, 9, 10]
         elif rank == 1:
-            assert llm_request.get_tokens(0) == [5, 6, 7, 8]
+            assert llm_request.get_tokens(0) == [3, 4, 11, 12]
         elif rank == 2:
-            assert llm_request.get_tokens(0) == [9, 10, 11, 12]
+            assert llm_request.get_tokens(0) == [5, 6, 13]
         else:
-            assert llm_request.get_tokens(0) == [13]
+            assert llm_request.get_tokens(0) == [7, 8]
 
 
 def test_get_from_waiting_queue():

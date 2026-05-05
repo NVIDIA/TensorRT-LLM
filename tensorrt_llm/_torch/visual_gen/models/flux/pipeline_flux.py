@@ -12,11 +12,14 @@ from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
 
+from tensorrt_llm._torch.visual_gen.cache.teacache import (
+    ExtractorConfig,
+    register_extractor_from_config,
+)
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
-from tensorrt_llm._torch.visual_gen.teacache import ExtractorConfig, register_extractor_from_config
 from tensorrt_llm.logger import logger
 
 from .transformer_flux import FluxTransformer2DModel
@@ -226,27 +229,29 @@ class FluxPipeline(BasePipeline):
                 )
             )
 
-            # Enable TeaCache with FLUX.1-specific polynomial coefficients
-            self._setup_teacache(self.transformer, FLUX_TEACACHE_COEFFICIENTS)
+            # TeaCache or Cache-DiT
+            self._setup_cache_acceleration(self.transformer, FLUX_TEACACHE_COEFFICIENTS)
 
-    DEFAULT_GENERATION_PARAMS = {
-        "height": 1024,
-        "width": 1024,
-        "num_inference_steps": 50,
-        "guidance_scale": 3.5,
-        "max_sequence_length": 512,
-    }
+    @property
+    def default_generation_params(self):
+        return {
+            "height": 1024,
+            "width": 1024,
+            "num_inference_steps": 50,
+            "guidance_scale": 3.5,
+            "max_sequence_length": 512,
+        }
 
     def infer(self, req):
         """Run inference from DiffusionRequest."""
         return self.forward(
             prompt=req.prompt,
-            height=req.height,
-            width=req.width,
-            num_inference_steps=req.num_inference_steps,
-            guidance_scale=req.guidance_scale,
-            seed=req.seed,
-            max_sequence_length=req.max_sequence_length,
+            height=req.params.height,
+            width=req.params.width,
+            num_inference_steps=req.params.num_inference_steps,
+            guidance_scale=req.params.guidance_scale,
+            seed=req.params.seed,
+            max_sequence_length=req.params.max_sequence_length,
         )
 
     @torch.inference_mode()
@@ -311,6 +316,7 @@ class FluxPipeline(BasePipeline):
             self.scheduler.set_timesteps(sigmas=sigmas, device=self.device, mu=mu)
 
         timesteps = self.scheduler.timesteps
+        self.scheduler.set_begin_index(0)
 
         # Prepare guidance (embedded guidance for FLUX)
         guidance = None

@@ -42,7 +42,7 @@ from transformers.models.gemma3n.configuration_gemma3n import (
 )
 from transformers.utils import ModelOutput
 
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
+from ..hf import AutoModelForCausalLMFactory
 
 
 def _build_rope_cache(

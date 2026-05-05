@@ -15,6 +15,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     ADPRouter,
     DefaultADPRouter,
+    KVCacheAwareADPRouter,
     RankState,
 )
 
@@ -822,3 +823,137 @@ def test_balance_requests_across_ranks_token_count_sorting():
     assert result[0][0] == req2
     assert result[1][0] == req3
     assert result[2][0] == req1
+
+
+class TestKVCacheAwareADPRouterRouting:
+    """Routing behavior of KVCacheAwareADPRouter."""
+
+    def _make_router(
+        self,
+        tp_size=2,
+        tp_rank=0,
+        lbw=1.0,
+        match_rate_threshold=0.1,
+        fair_share_multiplier=2.0,
+        prefix_matches=None,
+    ):
+        dist = _mock_dist(tp_rank=tp_rank, tp_size=tp_size)
+        dist.tp_allgather = lambda data: [list(data) for _ in range(tp_size)]
+        kv_cache_manager = MagicMock()
+        kv_cache_manager.enable_block_reuse = True
+        router = KVCacheAwareADPRouter(
+            dist=dist,
+            kv_cache_manager=kv_cache_manager,
+            load_balance_weight=lbw,
+            match_rate_threshold=match_rate_threshold,
+            fair_share_multiplier=fair_share_multiplier,
+        )
+        if prefix_matches is None:
+            # Default: rank 0 has 0 match, rank 1 has 50 match on req 1.
+            prefix_matches = [
+                {0: 0, 1: 0},
+                {0: 0, 1: 50},
+            ]
+        router._all_ranks_prefix_matches = prefix_matches
+        return router
+
+    def _rank_states(self, tp_size, active_reqs=None, active_tokens=None):
+        active_reqs = active_reqs or [0] * tp_size
+        active_tokens = active_tokens or [0] * tp_size
+        return [
+            RankState(
+                rank=r, num_active_requests=active_reqs[r], num_active_tokens=active_tokens[r]
+            )
+            for r in range(tp_size)
+        ]
+
+    def test_cache_affinity_wins(self):
+        """50/100 = 50% match is well above the 0.1 default gate, so the
+        request must land on the rank holding the cache (rank 1)."""
+        router = self._make_router(tp_size=2, lbw=0.5)
+        req = _make_request_item(req_id=1, num_tokens=100)
+        result, _ = router.route_requests(self._rank_states(2), [req], max_num_active_requests=10)
+        assert result[0] == []
+        assert result[1] == [req]
+
+    def test_match_rate_threshold_gates_cache_affinity(self):
+        """With rank 0 loaded but holding cache, and rank 1 idle with no
+        cache:
+        - threshold below the hit rate (0.5 < 0.6) keeps cache affinity
+          active and routes to rank 0.
+        - threshold above the hit rate (0.7 >= 0.6) suppresses affinity
+          and the idle rank 1 wins on load.
+        """
+        prefix_matches = [{1: 60}, {1: 0}]
+        states = [
+            RankState(rank=0, num_active_requests=1, num_active_tokens=100),
+            RankState(rank=1, num_active_requests=0, num_active_tokens=0),
+        ]
+
+        router_active = self._make_router(
+            tp_size=2,
+            lbw=0.1,
+            match_rate_threshold=0.5,
+            prefix_matches=prefix_matches,
+        )
+        req = _make_request_item(req_id=1, num_tokens=100)
+        result_active, _ = router_active.route_requests(states, [req], max_num_active_requests=10)
+        assert result_active[0] == [req]
+        assert result_active[1] == []
+
+        router_gated = self._make_router(
+            tp_size=2,
+            lbw=0.1,
+            match_rate_threshold=0.7,
+            prefix_matches=prefix_matches,
+        )
+        req = _make_request_item(req_id=1, num_tokens=100)
+        result_gated, _ = router_gated.route_requests(states, [req], max_num_active_requests=10)
+        assert result_gated[0] == []
+        assert result_gated[1] == [req]
+
+    def test_fair_share_multiplier_caps_per_rank(self):
+        """With 8 requests all preferring rank 0 (cache hit), a loose
+        multiplier lets rank 0 absorb them all; a strict multiplier=1.0
+        evicts rank 0 at the fair share and spreads the remainder across
+        the other ranks."""
+        tp_size = 4
+        # rank 0 has an 80-token match on every req; other ranks have none.
+        prefix_matches = [{i: 80 for i in range(8)}] + [
+            {i: 0 for i in range(8)} for _ in range(tp_size - 1)
+        ]
+        states = [
+            RankState(rank=r, num_active_requests=0, num_active_tokens=0) for r in range(tp_size)
+        ]
+
+        # Loose (multiplier=4.0 -> cap = 4 * ceil(8/4) = 8): rank 0 takes all.
+        router_loose = self._make_router(
+            tp_size=tp_size,
+            lbw=0.1,
+            match_rate_threshold=0.0,
+            fair_share_multiplier=4.0,
+            prefix_matches=prefix_matches,
+        )
+        reqs_loose = [_make_request_item(req_id=i, num_tokens=100) for i in range(8)]
+        result_loose, _ = router_loose.route_requests(
+            states, reqs_loose, max_num_active_requests=100
+        )
+        assert len(result_loose[0]) == 8
+        for r in range(1, tp_size):
+            assert result_loose[r] == []
+
+        # Strict (multiplier=1.0 -> cap = ceil(8/4) = 2): rank 0 evicted
+        # after 2; remaining 6 spread across ranks 1..3.
+        router_strict = self._make_router(
+            tp_size=tp_size,
+            lbw=0.1,
+            match_rate_threshold=0.0,
+            fair_share_multiplier=1.0,
+            prefix_matches=prefix_matches,
+        )
+        reqs_strict = [_make_request_item(req_id=i, num_tokens=100) for i in range(8)]
+        result_strict, _ = router_strict.route_requests(
+            states, reqs_strict, max_num_active_requests=100
+        )
+        assert len(result_strict[0]) == 2
+        assert sum(len(result_strict[r]) for r in range(1, tp_size)) == 6

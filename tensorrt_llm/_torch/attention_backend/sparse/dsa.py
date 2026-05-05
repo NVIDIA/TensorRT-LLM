@@ -1,10 +1,12 @@
 """Dense Sparse Attention (DSA) backend for TRT-LLM with indexer-based TopK selection."""
 import math
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import tensorrt_llm
 import tensorrt_llm.bindings
@@ -309,7 +311,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     # 2. Intra-request: Split large requests into Q-blocks when seq_len > max_chunk_size
     indexer_max_chunk_size: int
     # Topk for sparse MLA
-    sparse_mla_topk: int
+    num_sparse_topk: int
     # max number of draft tokens
     max_draft_tokens: int = 0
     # Enable indexer skip for short sequences
@@ -348,7 +350,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """Allocate indexer K-cache buffers and heuristic TopK metadata."""
         super().__post_init__()
 
-        self.sparse_mla_topk = self.sparse_attention_config.index_topk
+        self.num_sparse_topk = self.sparse_attention_config.index_topk
         self.enable_indexer_skip = self.sparse_attention_config.skip_indexer_for_short_seqs
         capture_graph = self.is_cuda_graph
 
@@ -489,7 +491,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if self.enable_indexer_skip:
             self.topk_indices_buffer = self.get_empty(
                 self.cuda_graph_buffers,
-                (self.max_num_tokens, self.sparse_mla_topk),
+                (self.max_num_tokens, self.num_sparse_topk),
                 cache_name="topk_indices_buffer",
                 dtype=torch.int32,
                 capture_graph=capture_graph,
@@ -511,7 +513,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.heuristic_prev_topk = self.get_empty(
                 self.cuda_graph_buffers,
                 (num_local_layers, self.max_num_sequences,
-                 self.sparse_mla_topk),
+                 self.num_sparse_topk),
                 cache_name="heuristic_prev_topk",
                 dtype=torch.int32,
                 capture_graph=capture_graph,
@@ -528,7 +530,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                                                        self.max_draft_tokens)
             self.heuristic_scratch_values = self.get_empty(
                 self.cuda_graph_buffers,
-                (max_gen_tokens, self.sparse_mla_topk),
+                (max_gen_tokens, self.num_sparse_topk),
                 cache_name="heuristic_scratch_values",
                 dtype=torch.float32,
                 capture_graph=capture_graph,
@@ -597,15 +599,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         model_is_wrapped: bool = False,
         spec_metadata: Optional['SpecMetadata'] = None,
         spec_tree_manager: Optional['SpecTreeManager'] = None,
-        spec_decoding_tensor: Optional['SpecDecodingTensor'] = None,
     ):
         """Update speculative decoding parameters and create expanded buffers."""
         super().update_spec_dec_param(batch_size, is_spec_decoding_enabled,
                                       is_spec_dec_tree,
                                       is_spec_dec_dynamic_tree, max_draft_len,
                                       max_total_draft_tokens, model_is_wrapped,
-                                      spec_metadata, spec_tree_manager,
-                                      spec_decoding_tensor)
+                                      spec_metadata, spec_tree_manager)
         self.max_draft_tokens = max_draft_len
         init_shape = self.kv_lens_expanded_host.shape[0]
         if self.max_num_sequences * (1 + self.max_draft_tokens) != init_shape:
@@ -617,7 +617,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     1 + self.max_draft_tokens)
                 self.heuristic_scratch_values = self.get_empty(
                     self.cuda_graph_buffers,
-                    (max_gen_tokens, self.sparse_mla_topk),
+                    (max_gen_tokens, self.num_sparse_topk),
                     cache_name="heuristic_scratch_values",
                     dtype=torch.float32,
                     capture_graph=capture_graph,
@@ -681,7 +681,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         repeated_offsets = per_seq_offsets[batch_indices]
         position_ids = global_indices + repeated_offsets
         # get the dense topk indices with causal mask
-        range_row = torch.arange(self.sparse_mla_topk, device=device)
+        range_row = torch.arange(self.num_sparse_topk, device=device)
         mask = range_row <= position_ids.unsqueeze(1)
         return torch.where(mask, range_row, -1)
 
@@ -782,7 +782,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             # Minus the number of extra KV tokens because when using one-model MTP, the
             # draft layers needs more KV tokens for the next draft forwards.
             self.skip_indexer_for_ctx_reqs = kv_lens[:self.num_contexts].max(
-            ).item() <= self.sparse_mla_topk - num_extra_kv_tokens
+            ).item() <= self.num_sparse_topk - num_extra_kv_tokens
         else:
             self.skip_indexer_for_ctx_reqs = False
 
@@ -791,7 +791,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             # draft layers needs more KV tokens for the next draft forwards.
             self.skip_indexer_for_gen_reqs = kv_lens[
                 self.num_contexts:self.num_seqs].max().item(
-                ) <= self.sparse_mla_topk - num_extra_kv_tokens
+                ) <= self.num_sparse_topk - num_extra_kv_tokens
         else:
             self.skip_indexer_for_gen_reqs = False
         self.prepare_dense_topk_indices(kv_lens)
@@ -1044,6 +1044,23 @@ def _to_float(hidden_states: torch.Tensor) -> torch.Tensor:
     return hidden_states.float()
 
 
+@contextmanager
+def _tf32_matmul_enabled():
+    """Temporarily enable TF32 tensor cores for FP32 matmul in this scope.
+
+    Forces PyTorch/cuBLASLt to use CUBLAS_COMPUTE_32F_FAST_TF32, which
+    guarantees TF32 tensor cores. Plain CUBLAS_COMPUTE_32F (used by
+    torch.ops.trtllm.cublas_mm) falls back to SIMT SGEMM on CUDA cores
+    based on cuBLASLt heuristics for small M.
+    """
+    prev = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev
+
+
 class Indexer(nn.Module):
     """DSA sparse attention indexer that selects top-K KV cache entries per token."""
 
@@ -1092,8 +1109,8 @@ class Indexer(nn.Module):
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True)
 
-        # Fused wk + weights_proj weight for single FP32 cuBLAS GEMM
-        # (populated in post_load_weights; maps to TF32 tensor cores on Ampere+)
+        # Fused wk + weights_proj weight for single F.linear FP32 GEMM under allow_tf32.
+        # Maps to TF32 tensor cores on Ampere+.
         self._fused_wk_wp_weight: Optional[torch.Tensor] = None
 
         indexer_rope_interleave = getattr(sparse_attention_config,
@@ -1125,8 +1142,15 @@ class Indexer(nn.Module):
             cute_dsl_custom_ops.warmup_cute_dsl_indexer_topk(
                 dtype=torch.float32, top_k=self.index_topk)
 
+        if self._enable_heuristic_topk and layer_idx == 0:
+            # Populate static caches (sm_count, L2 cache size) inside the C++
+            # Scheme X dispatcher before any CUDA Graph capture so the host
+            # attribute queries do not end up frozen into a captured graph.
+            from tensorrt_llm._torch.custom_ops import cpp_custom_ops
+            cpp_custom_ops.warmup_heuristic_topk_decode(top_k=self.index_topk)
+
     def post_load_weights(self):
-        """Fuse wk + weights_proj into single FP32 weight for cuBLAS GEMM (TF32 on Ampere+)."""
+        """Fuse wk + weights_proj into single FP32 weight for F.linear GEMM under allow_tf32 (TF32 tensor cores on Ampere+)."""
         # wk: [head_dim, hidden_size] + weights_proj: [n_heads, hidden_size]
         # → fused: [head_dim + n_heads, hidden_size]
         self._fused_wk_wp_weight = torch.cat(
@@ -1800,10 +1824,13 @@ class Indexer(nn.Module):
         assert self._fused_wk_wp_weight is not None, \
             "post_load_weights() must be called before forward()"
         hidden_float = _to_float(hidden_states)
-        fused_out = torch.ops.trtllm.cublas_mm(hidden_float,
-                                               self._fused_wk_wp_weight.t(),
-                                               None,
-                                               out_dtype=None)
+        with _tf32_matmul_enabled():
+            # F.linear computes input @ weight.T internally; no explicit .t() needed.
+            # _fused_wk_wp_weight is [head_dim + n_heads, hidden_size] (nn.Linear convention).
+            # Goes through PyTorch's cuBLAS handle which respects allow_tf32 and
+            # dispatches CUBLAS_COMPUTE_32F_FAST_TF32, unlike torch.ops.trtllm.cublas_mm
+            # which uses its own handle and always falls back to CUDA-core SGEMM.
+            fused_out = F.linear(hidden_float, self._fused_wk_wp_weight)
         indexer_k, weights = fused_out.split([self.head_dim, self.n_heads],
                                              dim=-1)
         # Cast indexer_k back to model dtype for downstream ops (k_norm, RoPE, FP8 quantize)

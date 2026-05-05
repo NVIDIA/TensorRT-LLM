@@ -13,7 +13,8 @@ import os
 import json
 import struct
 
-from tensorrt_llm._torch.pyexecutor.config_utils import load_pretrained_config
+from tensorrt_llm._torch.pyexecutor.config_utils import (
+    load_pretrained_config, get_qwen3_hybrid_layer_types)
 
 
 def parse_safetensors_file_metadata(model_path, filename):
@@ -113,8 +114,9 @@ def get_safetensors_metadata(model_name_or_path):
 
 
 class ModelConfig(BaseModel):
-    """ Model specific configurations. The parameters are needed in engine
-        setting calculation.
+    """Model specific configurations.
+
+    The parameters are needed in engine setting calculation.
     """
     name: str
     model_type: str
@@ -250,6 +252,58 @@ class NemotronHybridConfig(ModelConfig):
 
     def cache_memory_fraction(self, cache_memory_fraction):
         # Each mamba cache entry is pretty large (~50MB for 8B model), so we are more conservative when estimating the max batch size
+        return cache_memory_fraction**2
+
+    def set_mamba_ssm_cache_dtype(self, mamba_ssm_cache_dtype: str):
+        self.mamba_ssm_cache_dtype = mamba_ssm_cache_dtype
+
+
+class Qwen3HybridConfig(ModelConfig):
+    """Config for Qwen3 hybrid models (full-attention + linear-attention layers).
+
+    Maps Qwen3.5 linear-attention parameters to the same cache estimation
+    formulas used by NemotronHybridConfig.
+    """
+    linear_key_head_dim: int  # d_state
+    linear_conv_kernel_dim: int  # d_conv
+    linear_num_value_heads: int  # num_heads (mamba_num_heads)
+    linear_num_key_heads: int  # n_groups
+    linear_value_head_dim: int  # head_dim (mamba_head_dim)
+    num_linear_attention_layers: Optional[int] = Field(default=None)
+    mamba_ssm_cache_dtype: Optional[str] = Field(default="auto")
+
+    @model_validator(mode="after")
+    def set_values_if_none(self):
+        """Derive num_attention_layers and num_linear_attention_layers.
+
+        Uses the HF config's layer_types / full_attention_interval.
+        """
+        if self.num_linear_attention_layers is None or self.num_attention_layers is None:
+            pretrained_config = load_pretrained_config(self.name,
+                                                       trust_remote_code=True)
+            layer_types = get_qwen3_hybrid_layer_types(pretrained_config)
+            if self.num_attention_layers is None:
+                self.num_attention_layers = sum(1 for lt in layer_types
+                                                if lt == "full_attention")
+            if self.num_linear_attention_layers is None:
+                self.num_linear_attention_layers = sum(
+                    1 for lt in layer_types if lt == "linear_attention")
+
+        super().set_values_if_none()
+        return self
+
+    def extra_model_cache_in_gb(self, bytes_per_elem, target_seq_len=None):
+        d_inner = self.linear_value_head_dim * self.linear_num_value_heads
+        conv_dim = d_inner + 2 * self.linear_num_key_heads * self.linear_key_head_dim
+        conv_state_elems = conv_dim * (self.linear_conv_kernel_dim - 1)
+        ssm_state_elems = (self.linear_num_value_heads *
+                           self.linear_value_head_dim *
+                           self.linear_key_head_dim)
+        gb_per_cache = bytes_per_elem * self.num_linear_attention_layers * (
+            conv_state_elems + ssm_state_elems) / (1024**3)
+        return gb_per_cache
+
+    def cache_memory_fraction(self, cache_memory_fraction):
         return cache_memory_fraction**2
 
     def set_mamba_ssm_cache_dtype(self, mamba_ssm_cache_dtype: str):

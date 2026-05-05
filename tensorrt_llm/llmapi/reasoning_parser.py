@@ -182,6 +182,7 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "deepseek_v3": "deepseek-r1",
     "deepseek_v32": "deepseek-r1",
     "nemotron_h": "nano-v3",
+    "gemma4": "gemma4",
 }
 
 _QWEN3_MODEL_TYPES = frozenset({
@@ -363,6 +364,119 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
 
     def parse(self, text: str) -> ReasoningParserResult:
         return self._maybe_swap_content(super().parse(text))
+
+
+@register_reasoning_parser("gemma4")
+class Gemma4ReasoningParser(BaseReasoningParser):
+    r"""Reasoning parser for Gemma 4.
+
+    Gemma 4 emits reasoning inside a channel block delimited by the
+    ``<|channel>`` and ``<channel|>`` special tokens, e.g.::
+
+        <|channel>thought
+        REASONING_CONTENT<channel|>VISIBLE_CONTENT
+
+    When the chat template is rendered with ``enable_thinking=False``, the
+    server prefills ``<|channel>thought\n<channel|>`` so the model emits
+    content directly without a reasoning block. When ``enable_thinking=True``,
+    the model decides when to open/close the channel and may emit multiple
+    channel blocks interleaved with content.
+
+    Because ``<|channel>`` / ``<channel|>`` are registered special tokens in
+    the Gemma 4 tokenizer, callers must set ``skip_special_tokens=False`` (or
+    use a tool parser with ``needs_raw_special_tokens=True``) to ensure the
+    delimiters appear in the decoded text stream.
+    """
+
+    CHANNEL_OPEN = "<|channel>"
+    CHANNEL_CLOSE = "<channel|>"
+
+    def __init__(self,
+                 *,
+                 chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
+        super().__init__(chat_template_kwargs=chat_template_kwargs)
+        self.in_reasoning = False
+        self._buffer = ""
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        i = 0
+        n = len(text)
+        while i < n:
+            open_idx = text.find(self.CHANNEL_OPEN, i)
+            if open_idx == -1:
+                content_parts.append(text[i:])
+                break
+            content_parts.append(text[i:open_idx])
+            body_start = open_idx + len(self.CHANNEL_OPEN)
+            close_idx = text.find(self.CHANNEL_CLOSE, body_start)
+            if close_idx == -1:
+                # Unterminated channel: remainder is reasoning.
+                reasoning_parts.append(text[body_start:])
+                i = n
+                break
+            reasoning_parts.append(text[body_start:close_idx])
+            i = close_idx + len(self.CHANNEL_CLOSE)
+        return ReasoningParserResult(
+            content="".join(content_parts),
+            reasoning_content="".join(reasoning_parts),
+        )
+
+    @staticmethod
+    def _partial_suffix_len(buf: str, tag: str) -> int:
+        """Return length of the longest suffix of ``buf`` that is a prefix of ``tag``.
+
+        Used to hold back potential partial delimiters during streaming.
+        """
+        max_len = min(len(buf), len(tag) - 1)
+        for k in range(max_len, 0, -1):
+            if tag.startswith(buf[-k:]):
+                return k
+        return 0
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        self._buffer += delta_text
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        while True:
+            if not self.in_reasoning:
+                idx = self._buffer.find(self.CHANNEL_OPEN)
+                if idx == -1:
+                    hold = self._partial_suffix_len(self._buffer,
+                                                    self.CHANNEL_OPEN)
+                    emit_len = len(self._buffer) - hold
+                    content_parts.append(self._buffer[:emit_len])
+                    self._buffer = self._buffer[emit_len:]
+                    break
+                content_parts.append(self._buffer[:idx])
+                self._buffer = self._buffer[idx + len(self.CHANNEL_OPEN):]
+                self.in_reasoning = True
+            else:
+                idx = self._buffer.find(self.CHANNEL_CLOSE)
+                if idx == -1:
+                    hold = self._partial_suffix_len(self._buffer,
+                                                    self.CHANNEL_CLOSE)
+                    emit_len = len(self._buffer) - hold
+                    reasoning_parts.append(self._buffer[:emit_len])
+                    self._buffer = self._buffer[emit_len:]
+                    break
+                reasoning_parts.append(self._buffer[:idx])
+                self._buffer = self._buffer[idx + len(self.CHANNEL_CLOSE):]
+                self.in_reasoning = False
+        return ReasoningParserResult(
+            content="".join(content_parts),
+            reasoning_content="".join(reasoning_parts),
+        )
+
+    def finish(self) -> ReasoningParserResult:
+        remaining = self._buffer
+        self._buffer = ""
+        if not remaining:
+            return ReasoningParserResult()
+        if self.in_reasoning:
+            return ReasoningParserResult(reasoning_content=remaining)
+        return ReasoningParserResult(content=remaining)
 
 
 @register_reasoning_parser("kimi_k2")

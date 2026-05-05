@@ -415,8 +415,8 @@ class FlashinferOpBackend(MoEOpBackend):
         import flashinfer.fused_moe as _flashinfer_fused_moe
         from flashinfer.fp4_quantization import fp4_quantize as _flashinfer_fp4_quantize
         from flashinfer.fp8_quantization import mxfp8_quantize as _flashinfer_mxfp8_quantize
+        from flashinfer.fused_moe import RoutingMethodType as _flashinfer_routing_method_type
         from flashinfer.fused_moe.core import ActivationType as _flashinfer_activation_type
-        from flashinfer.fused_moe.core import RoutingMethodType as _flashinfer_routing_method_type
 
         from ..fused_moe.routing import RoutingMethodType as _trtllmgen_routing_method_type
 

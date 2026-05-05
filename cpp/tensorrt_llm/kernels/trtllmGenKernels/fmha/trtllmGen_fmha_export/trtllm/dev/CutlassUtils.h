@@ -996,21 +996,6 @@ inline __device__ uint32_t make_utcmma_desc_block(uint32_t fmtSf,
 // out.
 template <int GroupSize, int GroupStride>
 inline __device__ float reduce_group_max_abs_f32(float value, int laneIdx) {
-  // CREDUX is a whole warp reduction. Reduction for smaller group size N is emulated by:
-  //  - FSEL (only participating threads contribute to the reduction)
-  //  - CREDUX (actual reduction)
-  //  - IMAD.MOV (move the result)
-  // Times that with the number of groups in the warp to get rough number of instructions.
-  // On ther other hand, SHFL-based reduction is a log2(N) operation. In that sense:
-  //  - When N = 32, CREDUX 1 instruction. SHFL 5 instructions.
-  //  - When N = 16, CREDUX 3*2 instructions. SHFL 4 instructions.
-  //  - When N = 8, CREDUX 3*4 instructions. SHFL 3 instructions.
-  // And so on. Taking account of the actual IPC on SM100 where FSEL/CREDUX/IMAD take 2 cycles and
-  // SHFL takes 4 cycles:
-  //  - When N = 32, CREDUX 2 cycles. SHFL 20 cycles.
-  //  - When N = 16, CREDUX 12 cycles. SHFL 16 cycles.
-  //  - When N = 8, CREDUX 24 cycles. SHFL 12 cycles.
-  // As result, CREDUX is better when group size >= 16.
 #if __CUDA_HAS_ARCH_FAMILY_SPECIFIC(100)
   constexpr bool UseRedux = (GroupSize >= 16);
 #else

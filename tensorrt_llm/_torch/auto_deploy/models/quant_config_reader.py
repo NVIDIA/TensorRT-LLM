@@ -11,7 +11,7 @@ import os
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional, Tuple, Type
 
-from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
+from ..utils.logger import ad_logger
 
 
 class QuantConfigReader(ABC):
