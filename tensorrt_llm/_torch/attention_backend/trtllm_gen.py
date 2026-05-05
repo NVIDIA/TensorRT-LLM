@@ -38,7 +38,7 @@ if IS_FLASHINFER_AVAILABLE:
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionInputType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, nvtx_range
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
@@ -440,6 +440,7 @@ class EnqueueParams:
     q_scaling: float = 1.0
     latent_cache: Optional[torch.Tensor] = None
     num_layers: int = 0
+    multi_processor_count: int = 0
     batch_size: int = 0
     mrope_rotary_cos_sin: Optional[torch.Tensor] = None
     beam_width: int = 1
@@ -471,6 +472,7 @@ class FlashInferTrtllmGenAttention:
         self._kv_pool_cache = {}
         self._pool_idx_cache = {}
         self._block_tables_cache = {}
+        self._multi_processor_count_cache = {}
         self._enable_pdl = get_env_enable_pdl()
         missing_ops = self._missing_fused_nanobind_ops()
         if missing_ops:
@@ -491,6 +493,21 @@ class FlashInferTrtllmGenAttention:
         if not kwargs.get("use_paged_kv_cache", True):
             return False, "trtllm-gen requires paged KV cache."
         return self._checker.is_supported(**kwargs)
+
+    def _get_multi_processor_count(self, device: torch.device) -> int:
+        device = torch.device(device)
+        if device.type != "cuda":
+            raise RuntimeError("trtllm-gen requires CUDA tensors.")
+        device_index = device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        multi_processor_count = self._multi_processor_count_cache.get(device_index)
+        if multi_processor_count is None:
+            multi_processor_count = torch.cuda.get_device_properties(
+                device_index
+            ).multi_processor_count
+            self._multi_processor_count_cache[device_index] = multi_processor_count
+        return multi_processor_count
 
     def attention(
         self,
@@ -712,6 +729,7 @@ class FlashInferTrtllmGenAttention:
             num_layers=host_kv_cache_pool_mapping.size(0)
             if host_kv_cache_pool_mapping is not None
             else 0,
+            multi_processor_count=self._get_multi_processor_count(q.device),
         )
 
         if num_contexts > 0 and attn_input_type != AttentionInputType.generation_only:
@@ -991,232 +1009,242 @@ class FlashInferTrtllmGenAttention:
         kv_factor = 0
         total_num_blocks = 0
         # KV metadata is cached in Python; these satisfy the fused op signature.
-        kv_cache, block_tables = self._get_kv_cache_and_block_tables(
-            kv_cache_block_offsets=params.kv_cache_block_offsets,
-            host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
-            host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
-            layer_idx=params.layer_idx,
-            num_kv_heads=params.num_kv_heads,
-            tokens_per_block=params.tokens_per_block,
-            head_dim=params.head_size,
-            kv_cache_quant_mode=params.kv_cache_quant_mode,
-            batch_start=params.seq_offset,
-            batch_size=params.batch_size,
-            dtype=params.qkv_input.dtype,
-            is_mla_enable=params.is_mla_enable,
-        )
-        (
-            q_processed,
-            _kv_pool,
-            _block_tables,
-            fmha_workspace,
-            cu_q_seqlens,
-            cu_kv_seqlens,
-            max_q_len,
-            max_kv_len,
-            window_left,
-        ) = thop.trtllm_gen_context_preprocess(
-            qkv_input=params.qkv_input,
-            workspace=params.workspace,
-            sequence_lengths=params.sequence_lengths,
-            context_lengths=params.context_lengths,
-            kv_cache_block_offsets=params.kv_cache_block_offsets,
-            host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
-            host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
-            kv_scale_orig_quant=params.kv_scale_orig_quant,
-            kv_scale_quant_orig=params.kv_scale_quant_orig,
-            attention_output_orig_quant=params.attention_output_orig_quant,
-            rotary_inv_freq=params.rotary_inv_freq,
-            rotary_cos_sin=params.rotary_cos_sin,
-            mrope_rotary_cos_sin=params.mrope_rotary_cos_sin,
-            layer_idx=params.layer_idx,
-            num_heads=params.num_heads,
-            num_kv_heads=params.num_kv_heads,
-            head_size=params.head_size,
-            tokens_per_block=params.tokens_per_block,
-            mask_type=params.mask_type,
-            kv_cache_quant_mode=params.kv_cache_quant_mode,
-            max_attention_window_size=params.max_attention_window_size,
-            cyclic_attention_window_size=params.cyclic_attention_window_size,
-            sink_token_length=params.sink_token_length,
-            num_tokens=params.num_tokens,
-            batch_size=params.batch_size,
-            input_seq_length=params.input_seq_length,
-            max_past_kv_length=params.max_past_kv_length,
-            rotary_embedding_dim=params.rotary_embedding_dim,
-            rotary_embedding_base=params.rotary_embedding_base,
-            rotary_embedding_scale_type=params.rotary_embedding_scale_type,
-            rotary_embedding_scale=params.rotary_embedding_scale,
-            rotary_embedding_max_positions=params.rotary_embedding_max_positions,
-            position_embedding_type=params.position_embedding_type,
-            bmm1_scale=params.bmm1_scale,
-            bmm2_scale=params.bmm2_scale,
-            attention_chunk_size=params.attention_chunk_size,
-            fp8_context_fmha=params.fp8_context_fmha,
-            paged_context_fmha=params.paged_context_fmha,
-            is_mla_enable=params.is_mla_enable,
-            total_num_blocks=total_num_blocks,
-            kv_factor=kv_factor,
-            need_build_kv_cache_metadata=False,
-        )
+        with nvtx_range("trtllm_gen.context.kv_metadata", color="blue"):
+            kv_cache, block_tables = self._get_kv_cache_and_block_tables(
+                kv_cache_block_offsets=params.kv_cache_block_offsets,
+                host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
+                layer_idx=params.layer_idx,
+                num_kv_heads=params.num_kv_heads,
+                tokens_per_block=params.tokens_per_block,
+                head_dim=params.head_size,
+                kv_cache_quant_mode=params.kv_cache_quant_mode,
+                batch_start=params.seq_offset,
+                batch_size=params.batch_size,
+                dtype=params.qkv_input.dtype,
+                is_mla_enable=params.is_mla_enable,
+            )
+        with nvtx_range("trtllm_gen.context.preprocess", color="purple"):
+            (
+                q_processed,
+                _kv_pool,
+                _block_tables,
+                fmha_workspace,
+                cu_q_seqlens,
+                cu_kv_seqlens,
+                max_q_len,
+                max_kv_len,
+                window_left,
+            ) = thop.trtllm_gen_context_preprocess(
+                qkv_input=params.qkv_input,
+                workspace=params.workspace,
+                sequence_lengths=params.sequence_lengths,
+                context_lengths=params.context_lengths,
+                kv_cache_block_offsets=params.kv_cache_block_offsets,
+                host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
+                kv_scale_orig_quant=params.kv_scale_orig_quant,
+                kv_scale_quant_orig=params.kv_scale_quant_orig,
+                attention_output_orig_quant=params.attention_output_orig_quant,
+                rotary_inv_freq=params.rotary_inv_freq,
+                rotary_cos_sin=params.rotary_cos_sin,
+                mrope_rotary_cos_sin=params.mrope_rotary_cos_sin,
+                layer_idx=params.layer_idx,
+                num_heads=params.num_heads,
+                num_kv_heads=params.num_kv_heads,
+                head_size=params.head_size,
+                tokens_per_block=params.tokens_per_block,
+                mask_type=params.mask_type,
+                kv_cache_quant_mode=params.kv_cache_quant_mode,
+                max_attention_window_size=params.max_attention_window_size,
+                cyclic_attention_window_size=params.cyclic_attention_window_size,
+                sink_token_length=params.sink_token_length,
+                num_tokens=params.num_tokens,
+                batch_size=params.batch_size,
+                input_seq_length=params.input_seq_length,
+                max_past_kv_length=params.max_past_kv_length,
+                rotary_embedding_dim=params.rotary_embedding_dim,
+                rotary_embedding_base=params.rotary_embedding_base,
+                rotary_embedding_scale_type=params.rotary_embedding_scale_type,
+                rotary_embedding_scale=params.rotary_embedding_scale,
+                rotary_embedding_max_positions=params.rotary_embedding_max_positions,
+                position_embedding_type=params.position_embedding_type,
+                bmm1_scale=params.bmm1_scale,
+                bmm2_scale=params.bmm2_scale,
+                attention_chunk_size=params.attention_chunk_size,
+                fp8_context_fmha=params.fp8_context_fmha,
+                paged_context_fmha=params.paged_context_fmha,
+                is_mla_enable=params.is_mla_enable,
+                multi_processor_count=params.multi_processor_count,
+                total_num_blocks=total_num_blocks,
+                kv_factor=kv_factor,
+                need_build_kv_cache_metadata=False,
+            )
 
-        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
-            query=q_processed,
-            kv_cache=kv_cache,
-            workspace_buffer=fmha_workspace,
-            block_tables=block_tables,
-            seq_lens=params.sequence_lengths,
-            max_q_len=max_q_len,
-            max_kv_len=max_kv_len,
-            bmm1_scale=params.bmm1_scale,
-            bmm2_scale=params.bmm2_scale,
-            batch_size=params.batch_size,
-            cum_seq_lens_q=cu_q_seqlens,
-            cum_seq_lens_kv=cu_kv_seqlens,
-            window_left=window_left,
-            out=params.context_buf,
-            kv_layout=self._layout,
-            sinks=params.attention_sinks,
-            uses_shared_paged_kv_idx=False,
-            enable_pdl=self._enable_pdl,
-        )
+        with nvtx_range("trtllm_gen.context.flashinfer", color="green"):
+            flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+                query=q_processed,
+                kv_cache=kv_cache,
+                workspace_buffer=fmha_workspace,
+                block_tables=block_tables,
+                seq_lens=params.sequence_lengths,
+                max_q_len=max_q_len,
+                max_kv_len=max_kv_len,
+                bmm1_scale=params.bmm1_scale,
+                bmm2_scale=params.bmm2_scale,
+                batch_size=params.batch_size,
+                cum_seq_lens_q=cu_q_seqlens,
+                cum_seq_lens_kv=cu_kv_seqlens,
+                window_left=window_left,
+                out=params.context_buf,
+                kv_layout=self._layout,
+                sinks=params.attention_sinks,
+                uses_shared_paged_kv_idx=False,
+                enable_pdl=self._enable_pdl,
+            )
 
-        thop.trtllm_gen_context_postprocess(
-            qkv_input=params.qkv_input,
-            workspace=params.workspace,
-            sequence_lengths=params.sequence_lengths,
-            context_lengths=params.context_lengths,
-            kv_cache_block_offsets=params.kv_cache_block_offsets,
-            host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
-            host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
-            kv_scale_orig_quant=params.kv_scale_orig_quant,
-            kv_scale_quant_orig=params.kv_scale_quant_orig,
-            attention_output_orig_quant=params.attention_output_orig_quant,
-            rotary_cos_sin=params.rotary_cos_sin,
-            mrope_rotary_cos_sin=params.mrope_rotary_cos_sin,
-            layer_idx=params.layer_idx,
-            num_heads=params.num_heads,
-            num_kv_heads=params.num_kv_heads,
-            head_size=params.head_size,
-            tokens_per_block=params.tokens_per_block,
-            mask_type=params.mask_type,
-            kv_cache_quant_mode=params.kv_cache_quant_mode,
-            max_attention_window_size=params.max_attention_window_size,
-            cyclic_attention_window_size=params.cyclic_attention_window_size,
-            sink_token_length=params.sink_token_length,
-            num_tokens=params.num_tokens,
-            batch_size=params.batch_size,
-            input_seq_length=params.input_seq_length,
-            max_past_kv_length=params.max_past_kv_length,
-            rotary_embedding_dim=params.rotary_embedding_dim,
-            rotary_embedding_base=params.rotary_embedding_base,
-            rotary_embedding_scale_type=params.rotary_embedding_scale_type,
-            rotary_embedding_scale=params.rotary_embedding_scale,
-            rotary_embedding_max_positions=params.rotary_embedding_max_positions,
-            position_embedding_type=params.position_embedding_type,
-            bmm1_scale=params.bmm1_scale,
-            fp8_context_fmha=params.fp8_context_fmha,
-            paged_context_fmha=params.paged_context_fmha,
-            is_mla_enable=params.is_mla_enable,
-            attention_chunk_size=params.attention_chunk_size,
-        )
+        with nvtx_range("trtllm_gen.context.postprocess", color="orange"):
+            thop.trtllm_gen_context_postprocess(
+                qkv_input=params.qkv_input,
+                workspace=params.workspace,
+                sequence_lengths=params.sequence_lengths,
+                context_lengths=params.context_lengths,
+                kv_cache_block_offsets=params.kv_cache_block_offsets,
+                host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
+                kv_scale_orig_quant=params.kv_scale_orig_quant,
+                kv_scale_quant_orig=params.kv_scale_quant_orig,
+                attention_output_orig_quant=params.attention_output_orig_quant,
+                rotary_cos_sin=params.rotary_cos_sin,
+                mrope_rotary_cos_sin=params.mrope_rotary_cos_sin,
+                layer_idx=params.layer_idx,
+                num_heads=params.num_heads,
+                num_kv_heads=params.num_kv_heads,
+                head_size=params.head_size,
+                tokens_per_block=params.tokens_per_block,
+                mask_type=params.mask_type,
+                kv_cache_quant_mode=params.kv_cache_quant_mode,
+                max_attention_window_size=params.max_attention_window_size,
+                cyclic_attention_window_size=params.cyclic_attention_window_size,
+                sink_token_length=params.sink_token_length,
+                num_tokens=params.num_tokens,
+                batch_size=params.batch_size,
+                input_seq_length=params.input_seq_length,
+                max_past_kv_length=params.max_past_kv_length,
+                rotary_embedding_dim=params.rotary_embedding_dim,
+                rotary_embedding_base=params.rotary_embedding_base,
+                rotary_embedding_scale_type=params.rotary_embedding_scale_type,
+                rotary_embedding_scale=params.rotary_embedding_scale,
+                rotary_embedding_max_positions=params.rotary_embedding_max_positions,
+                position_embedding_type=params.position_embedding_type,
+                bmm1_scale=params.bmm1_scale,
+                fp8_context_fmha=params.fp8_context_fmha,
+                paged_context_fmha=params.paged_context_fmha,
+                is_mla_enable=params.is_mla_enable,
+                attention_chunk_size=params.attention_chunk_size,
+                multi_processor_count=params.multi_processor_count,
+            )
 
     def run_generation(self, params: EnqueueParams):
         batch_beam = params.num_requests * params.beam_width
         kv_factor = 0
         total_num_blocks = 0
         # KV metadata is cached in Python; these satisfy the fused op signature.
-        kv_cache, block_tables = self._get_kv_cache_and_block_tables(
-            kv_cache_block_offsets=params.kv_cache_block_offsets,
-            host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
-            host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
-            layer_idx=params.layer_idx,
-            num_kv_heads=params.num_kv_heads,
-            tokens_per_block=params.tokens_per_block,
-            head_dim=params.head_size,
-            kv_cache_quant_mode=params.kv_cache_quant_mode,
-            batch_start=params.seq_offset,
-            batch_size=batch_beam,
-            dtype=params.qkv_input.dtype,
-            is_mla_enable=params.is_mla_enable,
-        )
-        (
-            q_processed,
-            _kv_pool,
-            _block_tables,
-            fmha_workspace,
-            cu_seqlens,
-            max_q_len,
-            max_kv_len,
-            window_left,
-            is_multi_token_gen,
-        ) = thop.trtllm_gen_generation_preprocess(
-            qkv_input=params.qkv_input,
-            workspace=params.workspace,
-            sequence_lengths=params.sequence_lengths,
-            spec_decoding_generation_lengths=params.spec_decoding_generation_lengths,
-            spec_decoding_position_offsets=params.spec_decoding_position_offsets,
-            kv_cache_block_offsets=params.kv_cache_block_offsets,
-            host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
-            host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
-            kv_scale_orig_quant=params.kv_scale_orig_quant,
-            kv_scale_quant_orig=params.kv_scale_quant_orig,
-            attention_output_orig_quant=params.attention_output_orig_quant,
-            rotary_inv_freq=params.rotary_inv_freq,
-            rotary_cos_sin=params.rotary_cos_sin,
-            layer_idx=params.layer_idx,
-            seq_offset=params.seq_offset,
-            num_heads=params.num_heads,
-            num_kv_heads=params.num_kv_heads,
-            head_size=params.head_size,
-            tokens_per_block=params.tokens_per_block,
-            kv_cache_quant_mode=params.kv_cache_quant_mode,
-            max_attention_window_size=params.max_attention_window_size,
-            cyclic_attention_window_size=params.cyclic_attention_window_size,
-            sink_token_length=params.sink_token_length,
-            num_tokens=params.num_tokens,
-            batch_beam=batch_beam,
-            input_seq_length=params.input_seq_length,
-            max_past_kv_length=params.max_past_kv_length,
-            rotary_embedding_dim=params.rotary_embedding_dim,
-            rotary_embedding_base=params.rotary_embedding_base,
-            rotary_embedding_scale_type=params.rotary_embedding_scale_type,
-            rotary_embedding_scale=params.rotary_embedding_scale,
-            rotary_embedding_max_positions=params.rotary_embedding_max_positions,
-            position_embedding_type=params.position_embedding_type,
-            bmm1_scale=params.bmm1_scale,
-            bmm2_scale=params.bmm2_scale,
-            fp8_context_fmha=params.fp8_context_fmha,
-            predicted_tokens_per_seq=params.predicted_tokens_per_seq,
-            attention_chunk_size=params.attention_chunk_size,
-            total_num_blocks=total_num_blocks,
-            kv_factor=kv_factor,
-            need_build_kv_cache_metadata=False,
-        )
+        with nvtx_range("trtllm_gen.generation.kv_metadata", color="blue"):
+            kv_cache, block_tables = self._get_kv_cache_and_block_tables(
+                kv_cache_block_offsets=params.kv_cache_block_offsets,
+                host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
+                layer_idx=params.layer_idx,
+                num_kv_heads=params.num_kv_heads,
+                tokens_per_block=params.tokens_per_block,
+                head_dim=params.head_size,
+                kv_cache_quant_mode=params.kv_cache_quant_mode,
+                batch_start=params.seq_offset,
+                batch_size=batch_beam,
+                dtype=params.qkv_input.dtype,
+                is_mla_enable=params.is_mla_enable,
+            )
+        with nvtx_range("trtllm_gen.generation.preprocess", color="purple"):
+            (
+                q_processed,
+                _kv_pool,
+                _block_tables,
+                fmha_workspace,
+                cu_seqlens,
+                max_q_len,
+                max_kv_len,
+                window_left,
+                is_multi_token_gen,
+            ) = thop.trtllm_gen_generation_preprocess(
+                qkv_input=params.qkv_input,
+                workspace=params.workspace,
+                sequence_lengths=params.sequence_lengths,
+                spec_decoding_generation_lengths=params.spec_decoding_generation_lengths,
+                spec_decoding_position_offsets=params.spec_decoding_position_offsets,
+                kv_cache_block_offsets=params.kv_cache_block_offsets,
+                host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
+                kv_scale_orig_quant=params.kv_scale_orig_quant,
+                kv_scale_quant_orig=params.kv_scale_quant_orig,
+                attention_output_orig_quant=params.attention_output_orig_quant,
+                rotary_inv_freq=params.rotary_inv_freq,
+                rotary_cos_sin=params.rotary_cos_sin,
+                layer_idx=params.layer_idx,
+                seq_offset=params.seq_offset,
+                num_heads=params.num_heads,
+                num_kv_heads=params.num_kv_heads,
+                head_size=params.head_size,
+                tokens_per_block=params.tokens_per_block,
+                kv_cache_quant_mode=params.kv_cache_quant_mode,
+                max_attention_window_size=params.max_attention_window_size,
+                cyclic_attention_window_size=params.cyclic_attention_window_size,
+                sink_token_length=params.sink_token_length,
+                num_tokens=params.num_tokens,
+                batch_beam=batch_beam,
+                input_seq_length=params.input_seq_length,
+                max_past_kv_length=params.max_past_kv_length,
+                rotary_embedding_dim=params.rotary_embedding_dim,
+                rotary_embedding_base=params.rotary_embedding_base,
+                rotary_embedding_scale_type=params.rotary_embedding_scale_type,
+                rotary_embedding_scale=params.rotary_embedding_scale,
+                rotary_embedding_max_positions=params.rotary_embedding_max_positions,
+                position_embedding_type=params.position_embedding_type,
+                bmm1_scale=params.bmm1_scale,
+                bmm2_scale=params.bmm2_scale,
+                fp8_context_fmha=params.fp8_context_fmha,
+                predicted_tokens_per_seq=params.predicted_tokens_per_seq,
+                attention_chunk_size=params.attention_chunk_size,
+                multi_processor_count=params.multi_processor_count,
+                total_num_blocks=total_num_blocks,
+                kv_factor=kv_factor,
+                need_build_kv_cache_metadata=False,
+            )
 
         q_len_per_req = None if is_multi_token_gen else params.input_seq_length
         decode_max_q_len = max_q_len if is_multi_token_gen else None
         decode_cu_seqlens = cu_seqlens if is_multi_token_gen else None
-        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-            query=q_processed,
-            kv_cache=kv_cache,
-            workspace_buffer=fmha_workspace,
-            block_tables=block_tables,
-            seq_lens=params.sequence_lengths,
-            max_seq_len=max_kv_len,
-            out=params.context_buf,
-            bmm1_scale=params.bmm1_scale,
-            bmm2_scale=params.bmm2_scale,
-            window_left=window_left,
-            kv_layout=self._layout,
-            sinks=params.attention_sinks,
-            q_len_per_req=q_len_per_req,
-            max_q_len=decode_max_q_len,
-            cum_seq_lens_q=decode_cu_seqlens,
-            uses_shared_paged_kv_idx=False,
-            enable_pdl=self._enable_pdl,
-            backend="trtllm-gen",
-        )
+        with nvtx_range("trtllm_gen.generation.flashinfer", color="green"):
+            flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                query=q_processed,
+                kv_cache=kv_cache,
+                workspace_buffer=fmha_workspace,
+                block_tables=block_tables,
+                seq_lens=params.sequence_lengths,
+                max_seq_len=max_kv_len,
+                out=params.context_buf,
+                bmm1_scale=params.bmm1_scale,
+                bmm2_scale=params.bmm2_scale,
+                window_left=window_left,
+                kv_layout=self._layout,
+                sinks=params.attention_sinks,
+                q_len_per_req=q_len_per_req,
+                max_q_len=decode_max_q_len,
+                cum_seq_lens_q=decode_cu_seqlens,
+                uses_shared_paged_kv_idx=False,
+                enable_pdl=self._enable_pdl,
+                backend="trtllm-gen",
+            )
 
     def run_mla_generation(self, params: EnqueueParams) -> None:
         """MLA generation decode using flashinfer MLA kernel."""
@@ -1228,60 +1256,66 @@ class FlashInferTrtllmGenAttention:
             raise NotImplementedError("Chunked-attention is not supported by MLA decode path.")
 
         batch_beam = params.num_requests * params.beam_width
-        kv_cache_tuple, block_tables = self._get_kv_cache_and_block_tables(
-            kv_cache_block_offsets=params.kv_cache_block_offsets,
-            host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
-            host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
-            layer_idx=params.layer_idx,
-            num_kv_heads=params.num_kv_heads,
-            tokens_per_block=params.tokens_per_block,
-            head_dim=params.head_size,
-            kv_cache_quant_mode=params.kv_cache_quant_mode,
-            batch_start=params.seq_offset,
-            batch_size=batch_beam,
-            dtype=params.attention_input.dtype,
-            is_mla_enable=params.is_mla_enable,
-        )
+        with nvtx_range("trtllm_gen.mla.kv_metadata", color="blue"):
+            kv_cache_tuple, block_tables = self._get_kv_cache_and_block_tables(
+                kv_cache_block_offsets=params.kv_cache_block_offsets,
+                host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
+                layer_idx=params.layer_idx,
+                num_kv_heads=params.num_kv_heads,
+                tokens_per_block=params.tokens_per_block,
+                head_dim=params.head_size,
+                kv_cache_quant_mode=params.kv_cache_quant_mode,
+                batch_start=params.seq_offset,
+                batch_size=batch_beam,
+                dtype=params.attention_input.dtype,
+                is_mla_enable=params.is_mla_enable,
+            )
 
-        # MLA decode API takes a single kv tensor [num_pages, 1, page_size, head_dim],
-        # not the (K_pool, V_pool) tuple.
-        kv_cache = kv_cache_tuple[0]
+            # MLA decode API takes a single kv tensor [num_pages, 1, page_size, head_dim],
+            # not the (K_pool, V_pool) tuple.
+            kv_cache = kv_cache_tuple[0]
 
-        pages_per_superblock = 128 // params.tokens_per_block
-        if pages_per_superblock > 1:
-            num_blocks = block_tables.size(-1)
-            remainder = num_blocks % pages_per_superblock
-            if remainder != 0:
-                pad = pages_per_superblock - remainder
-                block_tables = torch.nn.functional.pad(block_tables, (0, pad), value=0)
+        with nvtx_range("trtllm_gen.mla.block_table_pad", color="yellow"):
+            pages_per_superblock = 128 // params.tokens_per_block
+            if pages_per_superblock > 1:
+                num_blocks = block_tables.size(-1)
+                remainder = num_blocks % pages_per_superblock
+                if remainder != 0:
+                    pad = pages_per_superblock - remainder
+                    block_tables = torch.nn.functional.pad(block_tables, (0, pad), value=0)
 
-        mla_head_dim_qk = params.kv_lora_rank + params.qk_rope_head_dim
-        q_len_per_req = params.num_tokens // batch_beam if batch_beam > 0 else 1
+        with nvtx_range("trtllm_gen.mla.prepare", color="purple"):
+            mla_head_dim_qk = params.kv_lora_rank + params.qk_rope_head_dim
+            q_len_per_req = params.num_tokens // batch_beam if batch_beam > 0 else 1
 
-        query = params.qkv_input.view(batch_beam, q_len_per_req, params.num_heads, mla_head_dim_qk)
+            query = params.qkv_input.view(
+                batch_beam, q_len_per_req, params.num_heads, mla_head_dim_qk
+            )
 
-        bmm1_scale = 1.0 / (
-            params.q_scaling * math.sqrt(params.qk_nope_head_dim + params.qk_rope_head_dim)
-        )
-        bmm2_scale = 1.0
+            bmm1_scale = 1.0 / (
+                params.q_scaling * math.sqrt(params.qk_nope_head_dim + params.qk_rope_head_dim)
+            )
+            bmm2_scale = 1.0
 
-        flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
-            query=query,
-            kv_cache=kv_cache,
-            workspace_buffer=params.workspace.view(-1, 4),
-            qk_nope_head_dim=params.qk_nope_head_dim,
-            kv_lora_rank=params.kv_lora_rank,
-            qk_rope_head_dim=params.qk_rope_head_dim,
-            block_tables=block_tables,
-            seq_lens=params.sequence_lengths,
-            max_seq_len=params.max_past_kv_length,
-            out=params.context_buf.view(
-                batch_beam, q_len_per_req, params.num_heads, params.kv_lora_rank
-            ),
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
-            sinks=params.attention_sinks,
-            uses_shared_paged_kv_idx=False,
-            enable_pdl=self._enable_pdl,
-            backend="trtllm-gen",
-        )
+        with nvtx_range("trtllm_gen.mla.flashinfer", color="green"):
+            flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
+                query=query,
+                kv_cache=kv_cache,
+                workspace_buffer=params.workspace.view(-1, 4),
+                qk_nope_head_dim=params.qk_nope_head_dim,
+                kv_lora_rank=params.kv_lora_rank,
+                qk_rope_head_dim=params.qk_rope_head_dim,
+                block_tables=block_tables,
+                seq_lens=params.sequence_lengths,
+                max_seq_len=params.max_past_kv_length,
+                out=params.context_buf.view(
+                    batch_beam, q_len_per_req, params.num_heads, params.kv_lora_rank
+                ),
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                sinks=params.attention_sinks,
+                uses_shared_paged_kv_idx=False,
+                enable_pdl=self._enable_pdl,
+                backend="trtllm-gen",
+            )
