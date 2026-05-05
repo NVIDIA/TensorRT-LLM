@@ -43,6 +43,7 @@ def _fused_hc_mma_supported() -> bool:
     except Exception:
         return False
 
+
 _DG_NUM_SPLITS = 16
 
 
@@ -719,9 +720,7 @@ def _alloc_fused_hc_outputs(
     B: int, n: int, hidden_size: int, num_k_splits: int, tile_m: int, device
 ):
     """Uncached fallback (kept for API compatibility)."""
-    return _FusedHcWorkspaceCache(n=n, hidden_size=hidden_size).get(
-        B, num_k_splits, tile_m, device
-    )
+    return _FusedHcWorkspaceCache(n=n, hidden_size=hidden_size).get(B, num_k_splits, tile_m, device)
 
 
 # Fallback tactic: backend, tile_n, num_k_splits, bigfuse_bs, tile_m.

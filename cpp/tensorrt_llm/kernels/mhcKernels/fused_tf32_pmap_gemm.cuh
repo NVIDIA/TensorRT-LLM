@@ -1229,8 +1229,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
                     + hc_base[2 * HC_MULT + lane_bf * HC_MULT + k];
 
             constexpr unsigned LANE_MASK = (1u << HC_MULT) - 1;
-            float const rowMax
-                = fmaxf(fmaxf(cm_vals[0], cm_vals[1]), fmaxf(cm_vals[2], cm_vals[3]));
+            float const rowMax = fmaxf(fmaxf(cm_vals[0], cm_vals[1]), fmaxf(cm_vals[2], cm_vals[3]));
 #pragma unroll
             for (uint32_t k = 0; k < HC_MULT; ++k)
                 cm_vals[k] = __expf(cm_vals[k] - rowMax);

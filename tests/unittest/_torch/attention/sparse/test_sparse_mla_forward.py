@@ -13,9 +13,9 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionBackend, PositionalEmbeddingParams, RopeParams)
-from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import \
     DeepseekV4CacheManager
+from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -24,8 +24,8 @@ from tensorrt_llm._utils import (get_sm_version, str_dtype_to_binding,
                                  torch_dtype_to_str)
 from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils
 from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
-                                          KvCacheConfig,
-                                          DeepSeekV4SparseAttentionConfig)
+                                          DeepSeekV4SparseAttentionConfig,
+                                          KvCacheConfig)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -380,23 +380,23 @@ def calculate_reference_output_mixed(q_ctx, q_gen, kv_c_all, k_pe_all, W_UK,
 
 
 def calculate_reference_output_deepseek_v4_prefill(hidden_states,
-                                              indices,
-                                              seq_lens,
-                                              q,
-                                              kv_data,
-                                              freqs_cis,
-                                              ref_compressor,
-                                              num_heads,
-                                              qk_nope_head_dim,
-                                              qk_rope_head_dim,
-                                              v_head_dim,
-                                              softmax_scale,
-                                              device,
-                                              o_a_proj,
-                                              o_b_proj_weight,
-                                              n_local_groups,
-                                              window_size=512,
-                                              compress_ratio=4):
+                                                   indices,
+                                                   seq_lens,
+                                                   q,
+                                                   kv_data,
+                                                   freqs_cis,
+                                                   ref_compressor,
+                                                   num_heads,
+                                                   qk_nope_head_dim,
+                                                   qk_rope_head_dim,
+                                                   v_head_dim,
+                                                   softmax_scale,
+                                                   device,
+                                                   o_a_proj,
+                                                   o_b_proj_weight,
+                                                   n_local_groups,
+                                                   window_size=512,
+                                                   compress_ratio=4):
     """Reference for deepseek_v4 prefill.
 
     Implements attention over:
@@ -435,8 +435,7 @@ def calculate_reference_output_deepseek_v4_prefill(hidden_states,
                 # fp32-throughout postprocess); cast to the attention dtype
                 # before concatenation.
                 kv_combined = torch.cat(
-                    [kv_seq, compressed_kv.to(kv_seq.dtype)],
-                    dim=1).squeeze(0)
+                    [kv_seq, compressed_kv.to(kv_seq.dtype)], dim=1).squeeze(0)
             else:
                 kv_combined = kv_seq.squeeze(0)
                 num_compressed = 0
@@ -492,24 +491,24 @@ def calculate_reference_output_deepseek_v4_prefill(hidden_states,
 
 
 def calculate_reference_output_deepseek_v4_generation(hidden_states,
-                                                 gen_indices,
-                                                 seq_lens,
-                                                 q,
-                                                 kv_data,
-                                                 freqs_cis,
-                                                 ref_compressor,
-                                                 num_contexts,
-                                                 num_heads,
-                                                 qk_nope_head_dim,
-                                                 qk_rope_head_dim,
-                                                 v_head_dim,
-                                                 softmax_scale,
-                                                 device,
-                                                 o_a_proj,
-                                                 o_b_proj_weight,
-                                                 n_local_groups,
-                                                 window_size=512,
-                                                 compress_ratio=4):
+                                                      gen_indices,
+                                                      seq_lens,
+                                                      q,
+                                                      kv_data,
+                                                      freqs_cis,
+                                                      ref_compressor,
+                                                      num_contexts,
+                                                      num_heads,
+                                                      qk_nope_head_dim,
+                                                      qk_rope_head_dim,
+                                                      v_head_dim,
+                                                      softmax_scale,
+                                                      device,
+                                                      o_a_proj,
+                                                      o_b_proj_weight,
+                                                      n_local_groups,
+                                                      window_size=512,
+                                                      compress_ratio=4):
     """Reference for deepseek_v4 generation with cached window_kv and compressed_kv.
 
     For generation, we have:
@@ -636,26 +635,26 @@ def calculate_reference_output_deepseek_v4_generation(hidden_states,
 
 
 def calculate_reference_output_deepseek_v4_mixed(hidden_states,
-                                            q_ctx,
-                                            q_gen,
-                                            kv_data,
-                                            freqs_cis,
-                                            ref_compressor,
-                                            ctx_indices,
-                                            gen_indices,
-                                            seq_lens,
-                                            query_lens,
-                                            num_heads,
-                                            qk_nope_head_dim,
-                                            qk_rope_head_dim,
-                                            v_head_dim,
-                                            softmax_scale,
-                                            device,
-                                            o_a_proj,
-                                            o_b_proj_weight,
-                                            n_local_groups,
-                                            window_size=512,
-                                            compress_ratio=4):
+                                                 q_ctx,
+                                                 q_gen,
+                                                 kv_data,
+                                                 freqs_cis,
+                                                 ref_compressor,
+                                                 ctx_indices,
+                                                 gen_indices,
+                                                 seq_lens,
+                                                 query_lens,
+                                                 num_heads,
+                                                 qk_nope_head_dim,
+                                                 qk_rope_head_dim,
+                                                 v_head_dim,
+                                                 softmax_scale,
+                                                 device,
+                                                 o_a_proj,
+                                                 o_b_proj_weight,
+                                                 n_local_groups,
+                                                 window_size=512,
+                                                 compress_ratio=4):
     """Reference for deepseek_v4 mixed batch (combines context and generation)."""
     ref_results = [None] * len(seq_lens)
 
@@ -1081,10 +1080,9 @@ def populate_gen_deepseek_v4_kv_cache(
             sparse_attention_config=sparse_config,
         )
         cached_metadata.prepare()
-        _ = mla_forward_impl_with_deepseek_v4_wo_linear(mla, cached_metadata, q, qr,
-                                                   compressed_kv, k_pe,
-                                                   latent_cache, hidden_states,
-                                                   position_ids, dtype, device)
+        _ = mla_forward_impl_with_deepseek_v4_wo_linear(
+            mla, cached_metadata, q, qr, compressed_kv, k_pe, latent_cache,
+            hidden_states, position_ids, dtype, device)
 
     kv_cache_for_ref = {}
     kv_cache_for_ref["window_kv"] = all_ref_window_kv  # Window KV for reference
@@ -1157,9 +1155,9 @@ def mla_forward_impl_with_dsa_wo_linear(mla, attn_metadata, q, qr,
 
 
 def mla_forward_impl_with_deepseek_v4_wo_linear(mla, attn_metadata, q, qr,
-                                           compressed_kv, k_pe, latent_cache,
-                                           hidden_states, position_ids, dtype,
-                                           device):
+                                                compressed_kv, k_pe,
+                                                latent_cache, hidden_states,
+                                                position_ids, dtype, device):
     """Forward implementation for deepseek_v4 sparse attention.
 
     For deepseek_v4, compressed_kv is actually the nope part of KV (qk_nope_head_dim),
