@@ -31,6 +31,8 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             StaticBatchingStats)
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
+from tensorrt_llm.executor.request import (KVCacheHintRequest,
+                                           TruncateKVCacheRequest)
 from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
@@ -544,6 +546,9 @@ class PyExecutor:
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
 
+        # Control queue for the executor loop
+        self.control_queue: Queue[KVCacheHintRequest] = Queue()
+
         self.stats_lock = threading.Lock()
         self.stats = []
         self._latest_kv_iter_stats = None
@@ -911,6 +916,43 @@ class PyExecutor:
             with self.response_cv:
                 self.result_wait_queues[req_id] = result_wait_queue
         return req_id
+
+    def enqueue_kv_cache_hint_request(self, request: KVCacheHintRequest):
+        """Thread-safe entry point: enqueue a KV-cache hint to be applied
+        before the next executor iteration."""
+        self.control_queue.put(request)
+
+    def _drain_kv_cache_hints(self):
+        """Drain self.control_queue and apply any pending KV-cache hints.
+
+        Called at the start of each executor iteration so that hints take
+        effect before the next forward step. Safe no-op when:
+          - the queue is empty (qsize()==0)
+          - kv_cache_manager is None (e.g. block reuse disabled)
+          - the active manager doesn't support the hint (e.g. KVCacheManagerV2
+            does not implement truncate_blocks)
+        Unsupported hint types raise ValueError to surface programming errors.
+        """
+        while self.control_queue.qsize() > 0:
+            request = self.control_queue.get_nowait()
+            if request is None:
+                continue
+            if isinstance(request, TruncateKVCacheRequest):
+                if self.kv_cache_manager is None:
+                    logger.warning(
+                        "Ignoring TruncateKVCacheRequest: kv_cache_manager is not initialized."
+                    )
+                    continue
+                if not hasattr(self.kv_cache_manager, "truncate_blocks"):
+                    logger.warning(
+                        "Ignoring TruncateKVCacheRequest: %s does not implement truncate_blocks.",
+                        type(self.kv_cache_manager).__name__,
+                    )
+                    continue
+                self.kv_cache_manager.truncate_blocks(
+                    request.messages, len(request.messages_to_retain))
+            else:
+                raise ValueError(f"Invalid request type: {type(request)}.")
 
     def set_gather_responses(self, gather_all_responses):
         self.gather_all_responses = gather_all_responses
@@ -1497,6 +1539,12 @@ class PyExecutor:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
+
+                # NOTE: in PP mode, KVCacheHintRequest is delivered to
+                # rank-0 only (see worker_main / leader gating). Non-zero
+                # PP ranks observe an empty queue here. Cross-rank
+                # broadcast is deferred to a follow-up.
+                self._drain_kv_cache_hints()
 
                 # Fetch new requests from request queue
                 new_requests = self._fetch_and_activate_new_requests()
@@ -2192,6 +2240,8 @@ class PyExecutor:
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
+                self._drain_kv_cache_hints()
+
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 self._handle_control_request()
 
@@ -2435,6 +2485,8 @@ class PyExecutor:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
+
+                self._drain_kv_cache_hints()
 
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
                 self._handle_control_request()
