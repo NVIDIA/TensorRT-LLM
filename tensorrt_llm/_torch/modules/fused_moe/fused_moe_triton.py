@@ -1589,7 +1589,13 @@ class TritonFusedMoE(MoE):
         assert use_dp_padding is None or not use_dp_padding, \
             "TritonFusedMoE does not support use_dp_padding=True"
 
-        if getattr(self, "_glm5_fused_path", False):
+        # GLM-5 fused path is decode-only (M ≤ 16). Prefill warmup passes
+        # M=8192 etc. through here too — kernels B/C were not validated above
+        # M=16 and crash with CUDA_ERROR_ILLEGAL_ADDRESS at large M (see
+        # MOE_FUSION_DESIGN.md §7.13 Phase 3 known-issue). Fall through to
+        # quant_method for those.
+        _M = x.shape[0]
+        if getattr(self, "_glm5_fused_path", False) and _M <= 16:
             hidden_states = self._forward_glm5_fused(x, router_logits)
         else:
             hidden_states = self.quant_method.apply(self, x, router_logits)
