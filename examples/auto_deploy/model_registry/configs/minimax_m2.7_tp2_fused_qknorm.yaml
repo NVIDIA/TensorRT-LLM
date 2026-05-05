@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# MiniMax-M2.7 (256 experts, top-8, FP8 quantized) — standalone AD serving config.
-# 62 layers, GQA (48 Q / 8 KV heads), head_dim=128, partial RoPE.
+# MiniMax-M2.7 (256 experts, top-8, FP8 quantized) — TP=2 with fused Lamport QK-norm.
+# Uses lamport_sharded_qk_rmsnorm: one NVLink barrier on packed [N,2] variance scalars
+# instead of two separate NCCL allreduces (one for Q, one for K).
 model_factory: AutoModelForCausalLM
 tokenizer: MiniMaxAI/MiniMax-M2.7
 attn_backend: trtllm
@@ -11,16 +12,19 @@ world_size: 4
 
 max_seq_len: 2048
 max_num_tokens: 16384
-max_batch_size: 512
+max_batch_size: 32
 enable_chunked_prefill: true
 
 cuda_graph_config:
-  batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+  batch_sizes: [1, 2, 4, 8, 16, 32]
 
 kv_cache_config:
   enable_block_reuse: true
-  free_gpu_memory_fraction: 0.80
+  free_gpu_memory_fraction: 0.90
   tokens_per_block: 32
+
+model_kwargs:
+  num_hidden_layers: 5
 
 transforms:
   fuse_trtllm_attn_quant_fp8:
@@ -35,6 +39,11 @@ transforms:
     stage: post_load_fusion
     enabled: true
   bypass_qk_split_for_lamport:
+    # Feeds narrow views of the fused Q+K+V GEMM output directly into the
+    # lamport_sharded_qk_rmsnorm op (whose body now runs the packed NCCL pre/post
+    # Triton path). The lamport CUDA kernel that used to cause a rank barrier
+    # imbalance here is disabled, so no rank-sync concern. Eliminates the Q and
+    # K .contiguous() copies from split_output (~5us/layer saved).
     stage: post_load_fusion
     enabled: true
   gather_logits_before_lm_head:
@@ -51,10 +60,10 @@ transforms:
   compile_model:
     piecewise_enabled: true
   detect_sharding:
-    # use_allgather_qk_norm: true
     use_fused_qk_norm: true
     allreduce_strategy: SYMM_MEM
-    # TP-shard lm_head (column split + all_gather) — weight is BF16 and unsharded
-    # by default; dominates decode memory bandwidth. ~2x speedup on lm_head step.
+    # lm_head weight is BF16 and 1.23GB unsharded — dominates decode memory
+    # bandwidth. Column-shard by vocab dim + AllGather outputs → ~2x speedup
+    # (187us -> ~94us per decode step).
     shard_all_unprocessed: true
     simple_shard_filter: "lm_head"

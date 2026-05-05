@@ -11,16 +11,19 @@ world_size: 4
 
 max_seq_len: 2048
 max_num_tokens: 16384
-max_batch_size: 512
+max_batch_size: 32
 enable_chunked_prefill: true
 
 cuda_graph_config:
-  batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+  batch_sizes: [1, 2, 4, 8, 16, 32]
 
 kv_cache_config:
   enable_block_reuse: true
-  free_gpu_memory_fraction: 0.80
+  free_gpu_memory_fraction: 0.90
   tokens_per_block: 32
+
+model_kwargs:
+  num_hidden_layers: 5
 
 transforms:
   fuse_trtllm_attn_quant_fp8:
@@ -29,12 +32,6 @@ transforms:
     stage: post_load_fusion
     enabled: true
   fuse_rmsnorm_fp8_finegrained:
-    stage: post_load_fusion
-    enabled: true
-  fuse_fp8_prequant_shared:
-    stage: post_load_fusion
-    enabled: true
-  bypass_qk_split_for_lamport:
     stage: post_load_fusion
     enabled: true
   gather_logits_before_lm_head:
@@ -51,10 +48,5 @@ transforms:
   compile_model:
     piecewise_enabled: true
   detect_sharding:
-    # use_allgather_qk_norm: true
-    use_fused_qk_norm: true
+    use_allgather_qk_norm: true
     allreduce_strategy: SYMM_MEM
-    # TP-shard lm_head (column split + all_gather) — weight is BF16 and unsharded
-    # by default; dominates decode memory bandwidth. ~2x speedup on lm_head step.
-    shard_all_unprocessed: true
-    simple_shard_filter: "lm_head"

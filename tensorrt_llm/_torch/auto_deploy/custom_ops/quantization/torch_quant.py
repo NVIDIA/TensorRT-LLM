@@ -677,3 +677,57 @@ def _trtllm_finegrained_fp8_linear_fake(
     """Fake implementation for torch.export tracing."""
     out_features = weight.shape[0]
     return torch.empty((*input.shape[:-1], out_features), dtype=input.dtype, device=input.device)
+
+
+@torch.library.custom_op("auto_deploy::trtllm_finegrained_fp8_linear_prequant", mutates_args=())
+def trtllm_finegrained_fp8_linear_prequant(
+    input_fp8: torch.Tensor,  # [..., K] float8_e4m3fn (pre-quantized)
+    act_sf: torch.Tensor,  # [K//128, M] float32 per-block activation scales
+    weight: torch.Tensor,  # [N, K] float8_e4m3fn
+    bias: Optional[torch.Tensor],  # [N] or None
+    weight_scale: torch.Tensor,  # [ceil(N/128), ceil(K/128)] per-block weight scale
+) -> torch.Tensor:
+    """FineGrainedFP8 linear with pre-quantized input.
+
+    Skips the dynamic fp8_quantize_1x128 step and calls fp8_block_scaling_gemm
+    directly with the provided activation scale factors. Intended to be used
+    after rms_norm_fp8_1x128 which already computed (fp8_input, act_sf).
+
+    Args:
+        input_fp8:   [..., K] float8_e4m3fn — pre-quantized activations.
+        act_sf:      [K//128, M] float32 — per-block scales, M = prod(...).
+        weight:      [N, K] float8_e4m3fn — pre-quantized weight.
+        bias:        [N] or None.
+        weight_scale:[ceil(N/128), ceil(K/128)] float32 or bfloat16.
+
+    Returns:
+        [..., N] bfloat16 output, same batch dims as input_fp8.
+    """
+    if weight_scale.dtype != torch.float32:
+        weight_scale = weight_scale.float()
+
+    input_shape = input_fp8.shape
+    K = input_shape[-1]
+    M = input_fp8.numel() // K
+    N = weight.shape[0]
+
+    input_2d = input_fp8.reshape(M, K)
+    output = torch.ops.trtllm.fp8_block_scaling_gemm(input_2d, weight, act_sf, weight_scale)
+
+    if bias is not None:
+        output = output + bias
+
+    return output.reshape(*input_shape[:-1], N)
+
+
+@trtllm_finegrained_fp8_linear_prequant.register_fake
+def _trtllm_finegrained_fp8_linear_prequant_fake(
+    input_fp8: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Fake implementation for torch.export tracing."""
+    N = weight.shape[0]
+    return torch.empty((*input_fp8.shape[:-1], N), dtype=torch.bfloat16, device=input_fp8.device)

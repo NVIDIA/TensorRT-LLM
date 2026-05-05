@@ -169,3 +169,99 @@ def test_sharded_rmsnorm_different_dtypes(mpi_pool_executor, dtype_str):
     )
     for r in results:
         assert r is True
+
+
+def _run_allgather_rmsnorm_test(
+    tensor_parallel_size: int,
+    batch_size: int = 2,
+    seq_len: int = 8,
+    hidden_size: int = 64,
+    eps: float = 1e-6,
+    dtype_str: str = "float16",
+):
+    """Test AllGather QK RMSNorm against a full-tensor reference.
+
+    Each rank:
+    1. Creates identical full input and weight tensors
+    2. Column-shards the activation for this rank
+    3. All-gathers the local shard to reconstruct the full activation
+    4. Applies the selected RMSNorm op to the full activation
+    5. Slices the local shard back out and compares the reconstructed output
+       against the corresponding full-tensor reference
+    """
+    import tensorrt_llm
+    import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+
+    rank = tensorrt_llm.mpi_rank()
+    world_size = tensor_parallel_size
+    torch.cuda.set_device(rank)
+
+    if not is_initialized():
+        initialize(rank, port=29500)
+
+    dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16}
+    dtype = dtype_map[dtype_str]
+
+    try:
+        torch.manual_seed(42)
+
+        full_input = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=dtype)
+        full_weight = torch.randn(hidden_size, device="cuda", dtype=dtype)
+
+        reference_output = _reference_rmsnorm(full_input, full_weight, eps)
+
+        local_hidden_size = hidden_size // world_size
+        start_idx = rank * local_hidden_size
+        end_idx = start_idx + local_hidden_size
+        local_input = full_input[..., start_idx:end_idx].contiguous()
+
+        gathered_inputs = [torch.zeros_like(local_input) for _ in range(world_size)]
+        dist.all_gather(gathered_inputs, local_input)
+        gathered_input = torch.cat(gathered_inputs, dim=-1)
+
+        rmsnorm_op = getattr(getattr(torch, "ops"), "auto_deploy")
+        full_output = rmsnorm_op.torch_rmsnorm(gathered_input, full_weight, eps)
+        assert full_output.dtype == dtype
+
+        local_output = torch.chunk(full_output, world_size, dim=-1)[rank].contiguous()
+
+        gathered_outputs = [torch.zeros_like(local_output) for _ in range(world_size)]
+        dist.all_gather(gathered_outputs, local_output)
+        reconstructed_output = torch.cat(gathered_outputs, dim=-1)
+
+        torch.testing.assert_close(
+            reconstructed_output,
+            reference_output,
+            atol=1e-2,
+            rtol=1e-2,
+            msg=f"AllGather RMSNorm result doesn't match reference (rank={rank})",
+        )
+    except Exception:
+        traceback.print_exc()
+        raise
+
+    return True
+
+
+def _run_allgather_rmsnorm_hidden_size_test(tensor_parallel_size: int, hidden_size: int):
+    """Worker function for hidden-size-parametrized AllGather RMSNorm tests."""
+    return _run_allgather_rmsnorm_test(
+        tensor_parallel_size,
+        hidden_size=hidden_size,
+    )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 GPUs for this test")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+@pytest.mark.parametrize("hidden_size", [64, 128, 256])
+def test_allgather_rmsnorm_different_hidden_sizes(mpi_pool_executor, hidden_size):
+    """Test the AllGather QK RMSNorm path across hidden sizes."""
+    torch.manual_seed(0)
+    tensor_parallel_size = mpi_pool_executor.num_workers
+
+    results = mpi_pool_executor.map(
+        _run_allgather_rmsnorm_hidden_size_test,
+        *zip(*[(tensor_parallel_size, hidden_size)] * tensor_parallel_size),
+    )
+    for r in results:
+        assert r is True

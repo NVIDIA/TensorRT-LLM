@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -74,18 +74,14 @@ def apply_rotary_pos_emb(
 
     Only the first ``rotary_dim`` dimensions are rotated; the rest pass through.
     ``unsqueeze_dim=2`` broadcasts over the head dimension (N) in bsnd.
+
+    Uses the fused Triton kernel (``auto_deploy.partial_rope_fused``) which
+    replaces the slice + flashinfer_rope + cat pattern with a single kernel
+    launch per tensor. The expected cos/sin layout is bsnd with Dr == cos.shape[-1]
+    and unsqueeze_dim == 2 (broadcast over the head dimension).
     """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-
-    rotary_dim = cos.shape[-1]
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-
-    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
-    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
-
-    return torch.cat([q_embed, q_pass], dim=-1), torch.cat([k_embed, k_pass], dim=-1)
+    assert unsqueeze_dim == 2, "partial_rope_fused expects bsnd layout with unsqueeze_dim=2"
+    return torch.ops.auto_deploy.partial_rope_fused(q, k, cos, sin)
 
 
 # ---------------------------------------------------------------------------
@@ -172,14 +168,39 @@ class MiniMaxM2SparseMoeBlock(nn.Module):
         bsz, seq_len, hidden_dim = hidden_states.shape
         hidden_flat = hidden_states.view(-1, hidden_dim)
 
-        # Sigmoid routing with bias correction and top-k selection
-        router_logits = self.gate(hidden_flat)
-        routing_weights = torch.sigmoid(router_logits.float())
-        scores = routing_weights + self.e_score_correction_bias
-        _, top_k_indices = torch.topk(scores, self.top_k, dim=-1, sorted=False)
-        top_k_weights = routing_weights.gather(1, top_k_indices)
-        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
-        top_k_weights = top_k_weights.to(hidden_flat.dtype)
+        can_use_fused_router = hidden_flat.is_cuda
+        if can_use_fused_router and self.gate.weight.dtype != torch.float32:
+            router_logits = torch.ops.trtllm.dsv3_router_gemm_op(
+                hidden_flat, self.gate.weight.t(), bias=None, out_dtype=torch.float32
+            )
+        else:
+            router_logits = self.gate(hidden_flat)
+
+        top_k_weights, top_k_indices = torch.ops.trtllm.noaux_tc_op(
+            router_logits,
+            self.e_score_correction_bias,
+            1,
+            1,
+            self.top_k,
+            1.0,
+        )
+
+        # if can_use_fused_router:
+        #     top_k_weights, top_k_indices = torch.ops.trtllm.noaux_tc_op(
+        #         router_logits,
+        #         self.e_score_correction_bias,
+        #         1,
+        #         1,
+        #         self.top_k,
+        #         1.0,
+        #     )
+        # else:
+        #     routing_weights = torch.sigmoid(router_logits)
+        #     scores = routing_weights + self.e_score_correction_bias
+        #     _, top_k_indices = torch.topk(scores, self.top_k, dim=-1, sorted=False)
+        #     top_k_weights = routing_weights.gather(1, top_k_indices)
+        #     top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
+        #     top_k_weights = top_k_weights.to(hidden_flat.dtype)
 
         # Dispatch via AD canonical MoE op
         output = torch.ops.auto_deploy.torch_moe(

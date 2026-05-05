@@ -2832,6 +2832,14 @@ def _stack_finegrained_fp8_moe_weights(gm: GraphModule) -> int:
         fc2_expert_weights = w2_stacked
         fc2_weight_scale = w2_scale_stacked
 
+        # Pre-cast to float32 at load time — the fused FP8 MoE C++ runner requires
+        # fp32 scales. Doing it once here eliminates a wasted per-forward-pass
+        # weight-scale cast kernel inside trtllm_quant_finegrained_fp8_moe_fused{,_prequant}.
+        if fc1_weight_scale.dtype != torch.float32:
+            fc1_weight_scale = fc1_weight_scale.to(torch.float32).contiguous()
+        if fc2_weight_scale.dtype != torch.float32:
+            fc2_weight_scale = fc2_weight_scale.to(torch.float32).contiguous()
+
         del w1_stacked, w2_stacked, w3_stacked
         del w1_scale_stacked, w2_scale_stacked, w3_scale_stacked
 

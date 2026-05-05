@@ -15,6 +15,8 @@
 
 """Custom operator for FlashInfer and Triton RMSNorm implementation."""
 
+from typing import Tuple
+
 import flashinfer
 import torch
 import torch.distributed as dist
@@ -35,6 +37,7 @@ try:
 except (ModuleNotFoundError, ImportError):
     _layer_norm_fwd = None
 from .triton_rms_norm import rms_norm
+from .triton_sharded_qk_norm import triton_fused_sharded_qk_norm
 
 
 @torch.library.custom_op("auto_deploy::flashinfer_rms_norm", mutates_args=())
@@ -351,3 +354,114 @@ def sharded_rmsnorm(
 def _(input: torch.Tensor, weight: torch.Tensor, eps: float, world_size: int) -> torch.Tensor:
     """Fake implementation for tracing."""
     return torch.empty_like(input)
+
+
+@torch.library.custom_op("auto_deploy::fused_sharded_qk_rmsnorm", mutates_args=())
+def fused_sharded_qk_rmsnorm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weight_q: torch.Tensor,
+    weight_k: torch.Tensor,
+    eps: float,
+    world_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused sharded QK RMSNorm with packed variance allreduce.
+
+    Normalizes Q and K (both sharded along head dim) using a single allreduce
+    on packed variance scalars instead of two separate allreduces.
+    """
+    return triton_fused_sharded_qk_norm(q, k, weight_q, weight_k, eps, world_size)
+
+
+@fused_sharded_qk_rmsnorm.register_fake
+def _(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weight_q: torch.Tensor,
+    weight_k: torch.Tensor,
+    eps: float,
+    world_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fake implementation for tracing."""
+    return torch.empty_like(q), torch.empty_like(k)
+
+
+@torch.library.custom_op("auto_deploy::lamport_sharded_qk_rmsnorm", mutates_args=())
+def lamport_sharded_qk_rmsnorm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weight_q: torch.Tensor,
+    weight_k: torch.Tensor,
+    eps: float,
+    world_size: int,
+    rank: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused QK RMSNorm using NVLink cross-GPU barrier on packed variance scalars.
+
+    Normalizes Q and K (both column-sharded across tensor-parallel ranks) using a
+    single NVLink barrier on packed [N_tokens, 2] float32 variance scalars via
+    the SyncComm/Barrier infrastructure (st.global.release.sys / ld.global.acquire.sys).
+    This avoids NCCL entirely and reduces collective overhead to a single barrier
+    round-trip over NVLink.
+
+    Args:
+        q: Local Q shard [..., local_q_dim] (fp16 or bf16).
+        k: Local K shard [..., local_k_dim] (fp16 or bf16).
+        weight_q: RMSNorm weight for Q [local_q_dim] (float32).
+        weight_k: RMSNorm weight for K [local_k_dim] (float32).
+        eps: Small constant for numerical stability.
+        world_size: Tensor parallel size.
+        rank: This rank's index.
+
+    Returns:
+        Tuple of (q_norm, k_norm) with same shapes and dtypes as q and k.
+    """
+    # Preconditions (enforced by the sharding transform):
+    #   - Weights are fp32 (pre-cast at weight-load time in FusedQKNormShardingInfo).
+    #
+    # Always uses the packed pre + NCCL AR + post flow (3 Triton + 1 NCCL kernel
+    # per call, captured per piecewise bucket — no runtime Python branch). Works
+    # at any n_tokens and has no rank-barrier dependency.
+    #
+    # NOTE: the lamport CUDA path (trtllm.lamport_sharded_qk_rmsnorm) exists but is
+    # commented out below — it shows a severe e2e regression (80 → 25 tok/s on
+    # MiniMax M2.7 TP=2) that is not yet root-caused. Re-enable only after the
+    # regression is understood (likely a rank-barrier scheduling issue, not the
+    # kernel itself).
+    #
+    # Lamport CUDA path (disabled):
+    # _LAMPORT_MAX_TOKENS = 256
+    # n_tokens = q.numel() // q.shape[-1]
+    # if n_tokens <= _LAMPORT_MAX_TOKENS:
+    #     from tensorrt_llm._torch.distributed.ops import get_allreduce_workspace
+    #     from tensorrt_llm.mapping import Mapping
+    #
+    #     mapping = Mapping(world_size=world_size, rank=rank, tp_size=world_size)
+    #     workspace = get_allreduce_workspace(mapping)
+    #     q_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    #     k_out = torch.empty(k.shape, dtype=k.dtype, device=k.device)
+    #     torch.ops.trtllm.lamport_sharded_qk_rmsnorm(
+    #         q, k, weight_q, weight_k, q_out, k_out, workspace,
+    #         float(eps), world_size, rank,
+    #     )
+    #     return q_out, k_out
+
+    packed = torch.ops.auto_deploy.qk_rms_sum_sq_pack(q, k)
+    dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+    return torch.ops.auto_deploy.qk_rms_norm_from_packed(
+        q, k, packed, weight_q, weight_k, float(eps), world_size
+    )
+
+
+@lamport_sharded_qk_rmsnorm.register_fake
+def _(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weight_q: torch.Tensor,
+    weight_k: torch.Tensor,
+    eps: float,
+    world_size: int,
+    rank: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fake implementation for tracing."""
+    return torch.empty_like(q), torch.empty_like(k)

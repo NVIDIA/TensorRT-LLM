@@ -27,4 +27,5 @@ __all__ = [
     "flashinfer_rope",
     "triton_rope",
     "triton_rope_kernel",
+    "partial_rope_fused",
 ]
