@@ -1137,11 +1137,11 @@ public:
     void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds);
 
     //! \brief Release cached blocks for a token sequence beyond a given prefix length.
-    //! \details Stub at this point — full algorithm is implemented in a follow-up commit.
-    //! Intent: walk the per-window cached-block chain from mCachedBlocksRoot following
-    //! \p targetTokens; when cumulative matched tokens first exceed \p numTokensToKeep,
-    //! release the matching block and all its descendants back to the eviction policy
-    //! at min retention priority. The boundary block spanning the threshold is preserved.
+    //! \details Walks the per-window cached-block chain from mCachedBlocksRoot following
+    //! \p targetTokens. When the cumulative matched tokens first exceed \p numTokensToKeep,
+    //! the matching block and all its descendants are released back to the eviction policy
+    //! at minimum retention priority. The boundary block whose token range spans the
+    //! threshold is preserved.
     void truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep);
 
     void resetReuseState()
