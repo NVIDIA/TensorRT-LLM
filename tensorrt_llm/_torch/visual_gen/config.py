@@ -895,6 +895,8 @@ class DiffusionModelConfig(BaseModel):
                     transformer_2_spec = model_index.get("transformer_2")
                     if transformer_2_spec and transformer_2_spec[0] is not None:
                         pretrained_config.boundary_ratio = model_index["boundary_ratio"]
+                if "expand_timesteps" in model_index:
+                    pretrained_config.expand_timesteps = bool(model_index["expand_timesteps"])
         else:
             # ---------- Single safetensors ----------
             native_config = cls._try_load_safetensors_config(checkpoint_path)
