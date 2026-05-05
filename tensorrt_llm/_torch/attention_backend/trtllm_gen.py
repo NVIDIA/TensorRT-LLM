@@ -113,6 +113,70 @@ class TrtllmGenSupportChecker:
     # Supported tokens_per_block values for trtllm-gen kernels
     SUPPORTED_TOKENS_PER_BLOCK = {16, 32, 64}
 
+    # MLA shapes accepted by FlashInfer's trtllm-gen wrapper/launcher. The decode API
+    # uses kv_lora_rank as headDimV and kv_lora_rank + qk_rope_head_dim as headDimQk.
+    SUPPORTED_MLA_GENERATION_HEAD_DIMS = {
+        (320, 256),
+        (576, 512),
+    }
+
+    # Known FlashInfer package gap: this shape can pass the coarse checks but then fail
+    # in the TRTLLM-GEN launcher with "Missing TRTLLM-GEN kernel".
+    MISSING_MLA_GENERATION_KERNELS = {
+        (576, 512, 32),
+    }
+
+    @classmethod
+    def _check_mla_generation_support(
+        cls,
+        head_size: int,
+        tokens_per_block: int,
+        kv_lora_rank: Optional[int],
+        qk_rope_head_dim: Optional[int],
+    ) -> Tuple[bool, str]:
+        missing_params = [
+            name
+            for name, value in (
+                ("kv_lora_rank", kv_lora_rank),
+                ("qk_rope_head_dim", qk_rope_head_dim),
+            )
+            if value is None or value <= 0
+        ]
+        if missing_params:
+            return (
+                False,
+                f"[Generation][MLA] Missing required MLA parameter(s): {', '.join(missing_params)}.",
+            )
+
+        kv_rank = int(kv_lora_rank)
+        qk_rope_dim = int(qk_rope_head_dim)
+        head_dim_qk = kv_rank + qk_rope_dim
+        head_dim_v = kv_rank
+        if head_size != head_dim_qk:
+            return (
+                False,
+                f"[Generation][MLA] head_size ({head_size}) must match "
+                f"kv_lora_rank + qk_rope_head_dim ({head_dim_qk}).",
+            )
+
+        if (head_dim_qk, head_dim_v) not in cls.SUPPORTED_MLA_GENERATION_HEAD_DIMS:
+            supported = sorted(cls.SUPPORTED_MLA_GENERATION_HEAD_DIMS)
+            return (
+                False,
+                f"[Generation][MLA] Unsupported head dimensions: "
+                f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
+            )
+
+        if (head_dim_qk, head_dim_v, tokens_per_block) in cls.MISSING_MLA_GENERATION_KERNELS:
+            return (
+                False,
+                f"[Generation][MLA] Missing TRTLLM-GEN decode kernel for "
+                f"headDimQk={head_dim_qk}, headDimV={head_dim_v}, "
+                f"tokens_per_block={tokens_per_block}.",
+            )
+
+        return True, ""
+
     @classmethod
     def is_supported(
         cls,
@@ -129,6 +193,8 @@ class TrtllmGenSupportChecker:
         tokens_per_block: Optional[int] = 64,
         use_paged_kv_cache: bool = True,
         is_mla_enable: bool = False,
+        kv_lora_rank: Optional[int] = None,
+        qk_rope_head_dim: Optional[int] = None,
         is_fused_qkv: bool = True,
         update_kv_cache: bool = True,
         cross_attention: bool = False,
@@ -255,6 +321,15 @@ class TrtllmGenSupportChecker:
                 return False, (
                     f"[Generation] Unsupported dtype combination: Q={q_dtype}, KV={kv_cache_dtype}, O={o_dtype}."
                 )
+            if is_mla_enable:
+                supported, reason = cls._check_mla_generation_support(
+                    head_size=head_size,
+                    tokens_per_block=tokens_per_block,
+                    kv_lora_rank=kv_lora_rank,
+                    qk_rope_head_dim=qk_rope_head_dim,
+                )
+                if not supported:
+                    return False, reason
 
         if use_paged_kv_cache:
             if tokens_per_block <= 0:
@@ -1491,6 +1566,8 @@ def is_supported(
     cross_attention: bool = False,
     is_spec_decoding: bool = False,
     is_mla_enable: bool = False,
+    kv_lora_rank: Optional[int] = None,
+    qk_rope_head_dim: Optional[int] = None,
     is_fused_qkv: bool = True,
     update_kv_cache: bool = True,
     has_cross_kv: bool = False,
@@ -1524,6 +1601,8 @@ def is_supported(
         cross_attention: Whether cross attention is used.
         is_spec_decoding: Whether speculative decoding is enabled.
         is_mla_enable: Whether MLA is enabled.
+        kv_lora_rank: LoRA rank for key-value projection (MLA).
+        qk_rope_head_dim: Rotary positional head dimension for QK (MLA).
         is_fused_qkv: Whether QKV is fused.
         update_kv_cache: Whether KV cache update is enabled.
         has_cross_kv: Whether cross KV is provided.
@@ -1560,6 +1639,8 @@ def is_supported(
         tokens_per_block=tokens_per_block,
         use_paged_kv_cache=use_paged_kv_cache,
         is_mla_enable=is_mla_enable,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
         is_fused_qkv=is_fused_qkv,
         update_kv_cache=update_kv_cache,
         cross_attention=cross_attention or has_cross_kv,

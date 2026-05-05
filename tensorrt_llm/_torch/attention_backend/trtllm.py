@@ -1363,6 +1363,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 cross_attention=False,
                 is_spec_decoding=metadata.is_spec_decoding_enabled,
                 is_mla_enable=self.is_mla_enable,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
                 is_fused_qkv=is_fused_qkv,
                 update_kv_cache=update_kv_cache,
                 has_cross_kv=False,
