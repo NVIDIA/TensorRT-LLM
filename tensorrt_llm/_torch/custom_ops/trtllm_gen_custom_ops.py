@@ -566,7 +566,6 @@ class FP8BlockScaleMoEInputs:
     gemm2_weights_scale: torch.Tensor
     topk_weights: Optional[torch.Tensor] = None
     topk_ids: Optional[torch.Tensor] = None
-    gemm1_clamp_limit: Optional[torch.Tensor] = None
 
 
 class FP8BlockScaleMoERunner(TunableRunner):
@@ -586,6 +585,7 @@ class FP8BlockScaleMoERunner(TunableRunner):
         routed_scaling_factor: Optional[float],
         routing_method_type: int,
         act_type: int,
+        gemm1_clamp_limit_value: Optional[float] = None,
     ):
 
         self.num_experts = num_experts
@@ -598,6 +598,10 @@ class FP8BlockScaleMoERunner(TunableRunner):
         self.routed_scaling_factor = routed_scaling_factor
         self.routing_method_type = routing_method_type
         self.act_type = 0
+        # Uniform-across-experts swiglu_limit. Passed by value to the C++
+        # binding (not part of the autotuner's tensor input list, since it
+        # doesn't influence tactic validity).
+        self.gemm1_clamp_limit_value = gemm1_clamp_limit_value
         self.tuning_config = FP8BlockScaleMoERunner.get_tuning_config(
             self.num_experts // self.local_num_experts)
 
@@ -634,7 +638,8 @@ class FP8BlockScaleMoERunner(TunableRunner):
             self.n_group, self.topk_group, self.intermediate_size,
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type, tactic,
-            args.topk_weights, args.topk_ids, args.gemm1_clamp_limit, output)
+            args.topk_weights, args.topk_ids, self.gemm1_clamp_limit_value,
+            output)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -749,7 +754,7 @@ def fp8_block_scale_moe_runner(
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None,
         act_type: int = 0,
-        gemm1_clamp_limit: Optional[torch.Tensor] = None,
+        gemm1_clamp_limit: Optional[float] = None,
         output: Optional[torch.Tensor] = None) -> torch.Tensor:
 
     tuner = AutoTuner.get()
@@ -764,6 +769,7 @@ def fp8_block_scale_moe_runner(
         routed_scaling_factor,
         routing_method_type,
         act_type,
+        gemm1_clamp_limit_value=gemm1_clamp_limit,
     )
 
     # Prepare dummy topk tensors and hook for AutoTuner profiling
@@ -794,7 +800,6 @@ def fp8_block_scale_moe_runner(
         gemm2_weights_scale,
         topk_weights_for_tuner,
         topk_ids_for_tuner,
-        gemm1_clamp_limit,
     ]
 
     kernel_runner, best_tactic = tuner.choose_one(
@@ -807,9 +812,8 @@ def fp8_block_scale_moe_runner(
     input_tensors = input_tensors_for_tuner
     input_tensors[
         0] = routing_logits  # replace dummy routing logits with actual routing logits
-    input_tensors[-3] = topk_weights  # replace dummy topk_weights with actual
-    input_tensors[-2] = topk_ids  # replace dummy topk_ids with actual
-    # input_tensors[-1] is gemm1_clamp_limit (no dummy stand-in, used as-is).
+    input_tensors[-2] = topk_weights  # replace dummy topk_weights with actual
+    input_tensors[-1] = topk_ids  # replace dummy topk_ids with actual
     result = kernel_runner(
         input_tensors,
         tactic=[-1, -1] if best_tactic == -1 else best_tactic,
@@ -844,7 +848,7 @@ def _(routing_logits: torch.Tensor,
       topk_weights: Optional[torch.Tensor] = None,
       topk_ids: Optional[torch.Tensor] = None,
       act_type: int = 0,
-      gemm1_clamp_limit: Optional[torch.Tensor] = None,
+      gemm1_clamp_limit: Optional[float] = None,
       output: Optional[torch.Tensor] = None) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
     hidden_size = hidden_states.shape[1] * 2

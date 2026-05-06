@@ -69,12 +69,12 @@ __global__ void activationKernel(KernelParams params)
     }
 #endif
 
-    // FP8 separate-activation path treats swiglu_limit as uniform across
-    // experts: load element [0] once (or skip clamp entirely if pointer null)
-    // and apply gate.clamp(max=limit) / up.clamp(-limit, limit) before
-    // silu/mul. Per-expert non-uniform limits are not supported here.
-    bool const hasSwigluLimit = (params.swigluLimitPtr != nullptr);
-    float const swigluLimit = hasSwigluLimit ? params.swigluLimitPtr[0] : 0.0f;
+    // FP8 separate-activation path: swiglu_limit is uniform across experts,
+    // passed by value via KernelParams::swigluLimit (gated by hasSwigluLimit).
+    // Apply gate.clamp(max=limit) / up.clamp(-limit, limit) before silu/mul.
+    // Per-expert non-uniform limits are not supported here.
+    bool const hasSwigluLimit = params.hasSwigluLimit;
+    float const swigluLimit = params.swigluLimit;
 
     for (int tokenIdx = blockIdx.z; tokenIdx < params.numTokens; tokenIdx += gridDim.z)
     {
@@ -256,13 +256,13 @@ __global__ void activationDeepSeekKernel(KernelParams params)
     // The largest (finite) value that can be represented using E4m3.
     float constexpr E4m3MaxVal{448.f};
 
-    // FP8 separate-activation path treats swiglu_limit as uniform across
-    // experts: load element [0] once (or skip clamp entirely if pointer null)
-    // and apply gate.clamp(max=limit) / up.clamp(-limit, limit) AFTER
+    // FP8 separate-activation path: swiglu_limit is uniform across experts,
+    // passed by value via KernelParams::swigluLimit (gated by hasSwigluLimit).
+    // Apply gate.clamp(max=limit) / up.clamp(-limit, limit) AFTER
     // dequantization but BEFORE silu/mul. Per-expert non-uniform limits are
     // not supported here.
-    bool const hasSwigluLimit = (params.swigluLimitPtr != nullptr);
-    float const swigluLimit = hasSwigluLimit ? params.swigluLimitPtr[0] : 0.0f;
+    bool const hasSwigluLimit = params.hasSwigluLimit;
+    float const swigluLimit = params.swigluLimit;
 
     int const totalNumPaddedTokens = params.totalNumPaddedTokens[0];
     // Loop over tokens

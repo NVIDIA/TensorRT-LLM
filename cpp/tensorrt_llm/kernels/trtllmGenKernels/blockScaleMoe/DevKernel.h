@@ -355,14 +355,15 @@ struct Data
 
     int32_t const* totalNumPaddedTokens;
 
-    // Optional device pointer to a per-expert swiglu clamp limit (fp32). When
-    // non-null, the activation kernel reads element [0] (FP8 path treats the
-    // limit as uniform across experts) and applies gate.clamp(max=limit) plus
-    // up.clamp(-limit, limit) before silu/mul, matching the swiglu_torch
-    // reference. NVFP4 still consumes this per-expert via fused-activation
-    // GEMM cubins; FP8's separate activation kernel only honors a uniform
-    // limit today.
-    float const* swigluLimitPtr = nullptr;
+    // Optional swiglu clamp limit (fp32, uniform across experts on the FP8
+    // separate-activation path). When `hasSwigluLimit` is true, the kernel
+    // applies gate.clamp(max=swigluLimit) and up.clamp(-swigluLimit,
+    // swigluLimit) before silu/mul, matching the swiglu_torch reference.
+    // NVFP4 still consumes a per-expert tensor via fused-activation GEMM
+    // cubins (see MoERunnerArgs::gemm1_clamp_limit); this scalar is only
+    // for the FP8 separate-activation kernel.
+    float swigluLimit = 0.0f;
+    bool hasSwigluLimit = false;
 };
 
 template <typename Type_, int32_t NumTokensPerCta_, bool UsePdl_>
@@ -385,7 +386,8 @@ struct KernelParams
 
     int32_t const* totalNumPaddedTokens;
 
-    float const* swigluLimitPtr = nullptr;
+    float swigluLimit = 0.0f;
+    bool hasSwigluLimit = false;
 
     static KernelParams setKernelParams(Data const& data)
     {
@@ -403,7 +405,8 @@ struct KernelParams
         params.topK = data.topK;
         params.totalNumPaddedTokens = data.totalNumPaddedTokens;
 
-        params.swigluLimitPtr = data.swigluLimitPtr;
+        params.swigluLimit = data.swigluLimit;
+        params.hasSwigluLimit = data.hasSwigluLimit;
 
         return params;
     }

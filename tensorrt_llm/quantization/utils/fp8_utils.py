@@ -291,7 +291,6 @@ def _silu_and_mul_post_quant_kernel(
     stride_output_scale_1,
     stride_output_scale_2,
     masked_m_ptr,
-    swiglu_limit_ptr,
     size_k,
     fp8_max,
     fp8_min,
@@ -299,6 +298,7 @@ def _silu_and_mul_post_quant_kernel(
     NUM_STAGE: tl.constexpr,
     SCALE_UE8M0: tl.constexpr,
     HAS_SWIGLU_LIMIT: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr,
 ):
     expert_id = tl.program_id(2)
     token_id = tl.program_id(1)
@@ -307,12 +307,6 @@ def _silu_and_mul_post_quant_kernel(
     block_num_per_expert = tl.num_programs(1)
 
     token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
-
-    if HAS_SWIGLU_LIMIT:
-        # Per-expert swiglu_limit, fp32. Matches the gpt-oss/swiglu_torch
-        # convention: gate input clamped to (-inf, limit] before silu, up
-        # branch clamped to [-limit, limit] before multiply.
-        limit = tl.load(swiglu_limit_ptr + expert_id).to(tl.float32)
 
     stride_input_0 = tl.cast(stride_input_0, dtype=tl.int64)
     stride_output_0 = tl.cast(stride_output_0, dtype=tl.int64)
@@ -345,10 +339,14 @@ def _silu_and_mul_post_quant_kernel(
                 other=0.0,
             ).to(tl.float32)
             if HAS_SWIGLU_LIMIT:
-                gate = tl.minimum(gate, limit)
-                up_f32 = up.to(tl.float32)
-                up_f32 = tl.maximum(tl.minimum(up_f32, limit), -limit)
-                up = up_f32.to(input_ptr.dtype.element_ty)
+                # gate is fp32; clamp directly. up is in input dtype (bf16/fp16);
+                # cast the limit constant to that dtype to avoid a fp32 round-trip
+                # on every element.
+                gate = tl.minimum(gate, SWIGLU_LIMIT)
+                limit_native = tl.cast(SWIGLU_LIMIT, input_ptr.dtype.element_ty)
+                neg_limit_native = tl.cast(-SWIGLU_LIMIT,
+                                           input_ptr.dtype.element_ty)
+                up = tl.maximum(tl.minimum(up, limit_native), neg_limit_native)
             gate = gate / (1 + tl.exp(-gate))
             gate = gate.to(input_ptr.dtype.element_ty)
             gate_up = up * gate
@@ -379,7 +377,7 @@ def silu_and_mul_masked_post_quant_fwd(
     quant_group_size: int,
     masked_m: torch.Tensor,
     scale_ue8m0: bool = False,
-    swiglu_limit: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[float] = None,
 ):
     """
     input shape [g, m, k]
@@ -387,9 +385,11 @@ def silu_and_mul_masked_post_quant_fwd(
     output_scale [g, k // 4, m // 2 // 128], dtype int32
     quant_group_size int
     masked_m shape [g]
-    swiglu_limit optional fp32 tensor of shape [g] (per-expert clamp); when
-        provided, the gate input is clamped to (-inf, limit] before silu and
-        the up branch is clamped to [-limit, limit] before the multiply.
+    swiglu_limit optional Python float (uniform across experts); when provided,
+        the gate input is clamped to (-inf, limit] before silu and the up
+        branch is clamped to [-limit, limit] before the multiply. Baked into
+        the kernel as a constexpr — caller supplies a host-side float, no
+        per-expert tensor / global load.
     """
 
     assert input.is_contiguous()
@@ -423,11 +423,7 @@ def silu_and_mul_masked_post_quant_fwd(
         expert_num,
     )
     has_swiglu_limit = swiglu_limit is not None
-    if has_swiglu_limit:
-        assert swiglu_limit.shape == (g, ), \
-            f"swiglu_limit must have shape ({g},), got {tuple(swiglu_limit.shape)}"
-        assert swiglu_limit.dtype == torch.float32, \
-            f"swiglu_limit must be float32, got {swiglu_limit.dtype}"
+    swiglu_limit_value = float(swiglu_limit) if has_swiglu_limit else 0.0
     _silu_and_mul_post_quant_kernel[grid](
         input,
         *input.stride(),
@@ -436,7 +432,6 @@ def silu_and_mul_masked_post_quant_fwd(
         output_scale,
         *output_scale.stride(),
         masked_m,
-        swiglu_limit if has_swiglu_limit else masked_m,
         k,
         fp8_max,
         fp8_min,
@@ -445,6 +440,7 @@ def silu_and_mul_masked_post_quant_fwd(
         num_warps=num_warps,
         SCALE_UE8M0=scale_ue8m0,
         HAS_SWIGLU_LIMIT=has_swiglu_limit,
+        SWIGLU_LIMIT=swiglu_limit_value,
     )
     output_scale = output_scale.transpose(1, 2)[:, :m, :]
     check_sf_layout(

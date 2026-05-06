@@ -44,7 +44,7 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
     int64_t const intermediate_size, int64_t const local_expert_offset, int64_t const local_num_experts,
     std::optional<double> const routed_scaling_factor, int64_t const tile_tokens_dim, int64_t const routing_method_type,
     MoeRunnerType& moe_runner, int64_t moeConfigIndex, std::optional<at::Tensor> const& topk_weights,
-    std::optional<at::Tensor> const& topk_ids, std::optional<at::Tensor> const& gemm1_clamp_limit = std::nullopt,
+    std::optional<at::Tensor> const& topk_ids, std::optional<double> const& gemm1_clamp_limit = std::nullopt,
     std::optional<at::Tensor> const& out_tensor = std::nullopt)
 {
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(), "Only SM100f is supported by FP8 block scale MOE");
@@ -176,18 +176,15 @@ at::Tensor run_fp8_block_scale_moe(at::optional<at::Tensor> const& routing_logit
 
     if (gemm1_clamp_limit.has_value())
     {
-        TORCH_CHECK(gemm1_clamp_limit.value().scalar_type() == at::ScalarType::Float,
-            "gemm1_clamp_limit must be float32, got %s.", c10::toString(gemm1_clamp_limit.value().scalar_type()));
-        TORCH_CHECK(gemm1_clamp_limit.value().dim() == 1, "gemm1_clamp_limit must be 1D.");
-        TORCH_CHECK(gemm1_clamp_limit.value().sizes()[0] == local_num_experts,
-            "gemm1_clamp_limit must have shape [local_num_experts]; got dim 0 = %ld, expected %ld.",
-            gemm1_clamp_limit.value().sizes()[0], local_num_experts);
         // FP8 path's separate activation kernel honors a single uniform clamp;
-        // see DevKernel.h::activation::Data::swigluLimitPtr. NVFP4 path's
-        // fused-activation cubins consume per-expert. If non-uniform usage
-        // becomes necessary on the FP8 path, extend the activation kernel
-        // with a permutedIdx -> expertIdx lookup before lifting this.
-        args.gemm1_clamp_limit = gemm1_clamp_limit.value().data_ptr<float>();
+        // see DevKernel.h::activation::Data::swigluLimit. NVFP4 path's
+        // fused-activation cubins consume a per-expert tensor via
+        // args.gemm1_clamp_limit (kept for API symmetry, populated by
+        // run_fp4_block_scale_moe). If non-uniform usage becomes necessary on
+        // the FP8 path, extend the activation kernel with a
+        // permutedIdx -> expertIdx lookup and surface a tensor variant here.
+        args.gemm1_clamp_limit_value = static_cast<float>(gemm1_clamp_limit.value());
+        args.has_gemm1_clamp_limit_value = true;
     }
 
     // allocate workspace for routing kernel
@@ -391,7 +388,7 @@ public:
         int64_t const local_expert_offset, int64_t const local_num_experts,
         std::optional<double> const routed_scaling_factor, int64_t routing_method_type,
         std::vector<int64_t> tile_config_pair, std::optional<at::Tensor> const& topk_weights,
-        std::optional<at::Tensor> const& topk_ids, std::optional<at::Tensor> const& gemm1_clamp_limit = std::nullopt,
+        std::optional<at::Tensor> const& topk_ids, std::optional<double> const& gemm1_clamp_limit = std::nullopt,
         std::optional<at::Tensor> const& output = std::nullopt)
     {
         // tile_config_pair corresponds to pair (tileN, config)

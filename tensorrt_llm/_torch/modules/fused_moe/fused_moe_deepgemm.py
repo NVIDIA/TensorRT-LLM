@@ -458,6 +458,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
+        swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = True,
         without_comm: bool = False,
     ):
@@ -488,6 +489,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
             swiglu_limit=swiglu_limit,
+            swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
         )
@@ -721,7 +723,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             quant_group_size=128,
             masked_m=masked_m,
             scale_ue8m0=True,
-            swiglu_limit=self.swiglu_limit)
+            swiglu_limit=self.swiglu_limit_scalar)
 
         # Grouped gemm 2
         h3 = set_strides(workspace["workspace_1"],

@@ -1440,6 +1440,7 @@ class DeepseekV4MoE(nn.Module):
                 else MoEWeightLoadingMode.VANILLA
             ),
             swiglu_limit=moe_swiglu_limit,
+            swiglu_limit_scalar=(float(swiglu_limit) if swiglu_limit is not None else None),
         )
 
         self.mapping = model_config.mapping

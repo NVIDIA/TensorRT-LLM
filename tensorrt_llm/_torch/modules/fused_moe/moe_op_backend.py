@@ -115,7 +115,7 @@ class MoEOpBackend:
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None,
         gated_act_type: int = 0,
-        gemm1_clamp_limit: Optional[torch.Tensor] = None,
+        gemm1_clamp_limit: Optional[float] = None,
         output: Optional[torch.Tensor] = None,
         use_shuffled_weight: bool = False,
         weight_layout: int = 0,

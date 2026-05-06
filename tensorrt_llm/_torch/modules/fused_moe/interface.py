@@ -220,6 +220,7 @@ class MoE(nn.Module):
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
+        swiglu_limit_scalar: Optional[float] = None,
         layer_idx: Optional[int] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
         init_load_balancer: bool = True,
@@ -238,6 +239,12 @@ class MoE(nn.Module):
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
         self.swiglu_limit = swiglu_limit
+        # Uniform-across-experts scalar variant of swiglu_limit, consumed by
+        # FP8 paths (DeepGEMM Triton kernel, TRTLLMGen FP8 separate-activation
+        # kernel) that don't actually need a per-expert tensor. Distinct from
+        # `swiglu_limit` (kept for NVFP4 fused-activation cubins that *do*
+        # consume per-expert values via fc31_alpha rescaling).
+        self.swiglu_limit_scalar = swiglu_limit_scalar
         self.layer_idx = layer_idx
         self.layer_idx_str = str(layer_idx) if layer_idx is not None else None
         self.activation_type = int(activation_type)
