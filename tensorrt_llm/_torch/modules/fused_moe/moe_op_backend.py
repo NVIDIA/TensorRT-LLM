@@ -648,7 +648,7 @@ class FlashinferOpBackend(MoEOpBackend):
                 topk_group=topk_group,
                 intermediate_size=intermediate_size,
                 local_expert_offset=local_expert_offset,
-                local_num_experts=num_experts,
+                local_num_experts=local_num_experts,
                 routed_scaling_factor=routed_scaling_factor,
                 routing_method_type=self.cvt_routing_method_type(routing_method_type),
                 use_shuffled_weight=use_shuffled_weight,
@@ -772,6 +772,14 @@ class FlashinferOpBackend(MoEOpBackend):
         if not do_finalize:
             if outputs[2].dim() != 2:
                 outputs[2] = outputs[2].view(-1, top_k)
+            # WAR: flashinfer FP4 wrapper allocates expert_weights with
+            # routing_logits.dtype (float32 for DSV3) but the routing kernel
+            # always writes bf16 (mDtypeExpW = Bfloat16). Reinterpret bytes to
+            # bf16 so downstream consumers (e.g. moe_finalize_allreduce dispatch)
+            # see the right scalar_type. Underlying bytes/data_ptr are unchanged
+            # and downstream kernels use flat (token*top_k+k) indexing.
+            if outputs[1].dtype != torch.bfloat16:
+                outputs[1] = outputs[1].view(torch.bfloat16)
             return outputs
         else:
             final_hidden_states = outputs[0]
