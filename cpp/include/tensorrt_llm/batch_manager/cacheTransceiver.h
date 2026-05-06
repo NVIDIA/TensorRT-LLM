@@ -200,6 +200,60 @@ struct RequestStatuses
     std::unordered_set<LlmRequest::RequestIdType> errorRequestIds;
 };
 
+/// Structured outcome of a cancellation request. Replaces the historical
+/// boolean return that conflated "Python may free request resources" with
+/// "C++ has nothing to do." Only @c kCancelledBeforeAdvertise and
+/// @c kAlreadyComplete imply that downstream cleanup may proceed
+/// immediately. The other states require Python to leave the request owned
+/// by C++ until a final transfer state is observed (or the transceiver
+/// reports unhealthy).
+enum class TransferCancelResult : uint8_t
+{
+    /// Request is unknown to the transceiver (already cleaned up or never
+    /// registered).
+    kNotFound = 0,
+    /// Request has already reached worker-final state; the future is ready
+    /// and any allocated buffers have been released.
+    kAlreadyComplete = 1,
+    /// Request was queued but no transfer buffer/handle was advertised to
+    /// a peer yet. Memory is safe to release immediately.
+    kCancelledBeforeAdvertise = 2,
+    /// Cancellation was accepted but the worker is still in flight. The
+    /// transceiver retains ownership of the request and its future until a
+    /// final state is observed; Python must not free request resources.
+    kCancelRequestedInFlight = 3,
+    /// The transceiver is unhealthy (quarantine budget exceeded or no
+    /// backend progress past the global deadline). Orchestration should
+    /// restart the worker.
+    kBackendUnhealthy = 4,
+    /// Cancellation cannot be performed at this point (e.g., the sender is
+    /// in the middle of advertising the buffer to a peer). Retry later.
+    kNotCancellable = 5,
+};
+
+/// Health snapshot exposed for observability. All counters are best-effort
+/// approximations updated on the executor thread; they are not real-time
+/// kernel-level metrics.
+struct TransceiverHealth
+{
+    bool isHealthy{true};
+    /// Number of in-flight transfers that have exceeded their per-request
+    /// timeout but whose worker future has not yet reached a final state.
+    /// These transfers are tracked but their request resources are kept
+    /// pinned by C++ — Python must not free them.
+    size_t quarantinedTransferCount{0};
+    /// Maximum number of quarantined transfers permitted before the
+    /// transceiver is flipped to unhealthy.
+    size_t quarantineBudget{0};
+    /// Wall-clock seconds since the last observed worker future
+    /// transition. Only meaningful when the transceiver has tracked at
+    /// least one transfer.
+    double secondsSinceLastProgress{0.0};
+    /// Wall-clock seconds beyond which "no progress" is treated as a
+    /// global backend wedge.
+    double globalProgressDeadlineSeconds{0.0};
+};
+
 class BaseCacheTransceiver
 {
 public:
@@ -212,16 +266,66 @@ public:
     virtual void requestAndReceiveSync(LlmRequest* llmRequest) = 0;
     virtual void requestAndReceiveAsync(LlmRequest* llmRequest) = 0;
 
-    /// Check all requests transferring context, and return the requests that have completed or encountered an error.
+    /// Non-blocking poll. Returns the requests that have completed or
+    /// encountered an error since the last call. With
+    /// @c atLeastRequestNum unset the call defaults to a pure poll: it
+    /// must @b never block on an unready future on the executor thread.
+    /// Callers that genuinely need to drain (shutdown only) must use
+    /// @ref drainContextTransferStatus instead.
     virtual RequestStatuses checkContextTransferStatus(
         std::optional<int> const& atLeastRequestNum = std::nullopt, bool markComplete = false)
         = 0;
 
+    /// Non-blocking poll. Same contract as @ref checkContextTransferStatus.
     virtual void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) = 0;
+
+    /// Blocking drain — @b only safe on dedicated drain/shutdown paths.
+    /// The default forwards to the polling variant for backward
+    /// compatibility; subclasses that own worker futures override this to
+    /// actually wait for completion.
+    virtual RequestStatuses drainContextTransferStatus(bool markComplete = false)
+    {
+        return checkContextTransferStatus(std::nullopt, markComplete);
+    }
+
+    /// Blocking drain — @b only safe on dedicated drain/shutdown paths.
+    virtual void drainGenTransferStatus()
+    {
+        checkGenTransferStatus(std::nullopt);
+    }
 
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
 
+    /// Structured cancellation. See @ref TransferCancelResult for the full
+    /// contract. Subclasses override this; the boolean wrapper below maps
+    /// the structured result onto the historical "is the request safe to
+    /// release now" bool.
+    virtual TransferCancelResult cancelRequestStructured(LlmRequest* llmRequest)
+    {
+        return cancelRequest(llmRequest) ? TransferCancelResult::kCancelledBeforeAdvertise
+                                         : TransferCancelResult::kNotFound;
+    }
+
+    /// Backward-compatible wrapper: returns true only when Python is safe
+    /// to free the request's resources immediately (pre-advertise cancel
+    /// or already-complete worker). Callers that need to distinguish
+    /// in-flight cancellation from "nothing to do" should use
+    /// @ref cancelRequestStructured.
     virtual bool cancelRequest(LlmRequest* llmRequest) = 0;
+
+    /// Whether the transceiver is currently healthy. Flips to false when
+    /// quarantined transfers exceed the budget or when no backend
+    /// progress has been observed past the global deadline.
+    [[nodiscard]] virtual bool isHealthy() const
+    {
+        return true;
+    }
+
+    /// Health snapshot for orchestration / metrics.
+    [[nodiscard]] virtual TransceiverHealth getHealth() const
+    {
+        return {};
+    }
 };
 
 class CacheTransceiver : public BaseCacheTransceiver
@@ -265,20 +369,89 @@ public:
 
     void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override;
 
+    /// Blocking drain — only invoked from shutdown/teardown.
+    RequestStatuses drainContextTransferStatus(bool markComplete = false) override;
+
+    /// Blocking drain — only invoked from shutdown/teardown.
+    void drainGenTransferStatus() override;
+
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
+    TransferCancelResult cancelRequestStructured(LlmRequest* llmRequest) override;
+
     virtual bool cancelRequest(LlmRequest* llmRequest) override;
+
+    [[nodiscard]] bool isHealthy() const override;
+
+    [[nodiscard]] TransceiverHealth getHealth() const override;
 
 private:
     void initializeCommState();
 
     void setContextState(LlmRequest* llmRequest);
 
+    /// Per-entry tracking for tracked worker futures. We keep the future
+    /// pinned until the worker reaches a final state, even after the
+    /// per-request deadline elapses, so that cancelling a still-running
+    /// worker never frees its KV/buffer resources prematurely.
+    struct TrackedFuture
+    {
+        LlmRequest* request;
+        std::future<void> future;
+        std::chrono::steady_clock::time_point deadline;
+        /// True once the per-request timeout has fired and we have flipped
+        /// the request to an error state. The entry stays in the vector
+        /// (and the future stays pinned) until the worker actually
+        /// finishes — possibly forever if the backend is wedged, in which
+        /// case the global progress deadline raises an unhealthy signal.
+        bool quarantined{false};
+        /// True once we have already advertised a buffer/handle to a
+        /// peer. Pre-advertise cancellation can release normally; post-
+        /// advertise cancellation must wait for worker quiescence.
+        bool advertised{false};
+    };
+
+    /// Update the global "last progress" timestamp and re-evaluate the
+    /// transceiver health flag against the quarantine budget and the
+    /// global progress deadline. Caller must hold @ref mHealthMutex.
+    void updateHealthLocked();
+
+    /// Drop a TrackedFuture entry from a vector. Decrements the
+    /// quarantine counter if the entry was quarantined, marks progress.
+    void releaseTrackedFutureLocked(std::vector<TrackedFuture>& vec, size_t index);
+
+    /// Apply per-entry timeout policy: if the configured
+    /// kvTransferTimeoutMs has elapsed and the future is not yet ready,
+    /// flip the entry to quarantined and surface an error to the caller.
+    /// Returns true if the entry was newly quarantined.
+    bool maybeQuarantineLocked(TrackedFuture& entry, RequestStatuses* outStatus);
+
+    /// Internal worker for the public polling and drain entry points.
+    /// @c allowBlocking is true only on shutdown drain — that is the one
+    /// path where waiting on a worker future is acceptable.
+    RequestStatuses checkContextTransferStatusImpl(
+        std::optional<int> const& atLeastRequestNum, bool markComplete, bool allowBlocking);
+    void checkGenTransferStatusImpl(std::optional<int> const& atLeastRequestNum, bool allowBlocking);
+
+    /// Compute the per-entry deadline for a tracked transfer.
+    [[nodiscard]] std::chrono::steady_clock::time_point computeTrackedFutureDeadline(
+        std::chrono::steady_clock::time_point requestStart) const;
+
     std::unique_ptr<CacheSender> mCacheSender;
     std::unique_ptr<CacheReceiver> mCacheReceiver;
-    std::vector<std::pair<LlmRequest*, std::future<void>>> mSenderFutures;
-    std::vector<std::pair<LlmRequest*, std::future<void>>> mRequesterFutures;
+    std::vector<TrackedFuture> mSenderFutures;
+    std::vector<TrackedFuture> mRequesterFutures;
     mpi::MpiComm const* mMpiWorldComm{nullptr};
+
+    /// Health/quarantine accounting. The mutex protects only this small
+    /// block; the executor thread is the sole writer/reader of the future
+    /// vectors above.
+    mutable std::mutex mHealthMutex;
+    size_t mQuarantinedTransferCount{0};
+    size_t mQuarantineBudget{16};
+    std::chrono::steady_clock::time_point mLastProgressTime{std::chrono::steady_clock::now()};
+    std::chrono::milliseconds mGlobalProgressDeadlineMs{60'000};
+    bool mIsHealthy{true};
 
     std::shared_ptr<CacheTransceiverComm> mGroupComm;
     std::shared_ptr<CacheTransceiverComm> mGroupTensorParaComm, mGroupPipeParaComm, mGroupDataComm, mGroupTPInDPComm;

@@ -18,6 +18,12 @@ AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 CacheTransBufferManagerCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransBufferManager
 BackendTypeCpp = tensorrt_llm.bindings.executor.CacheTransceiverBackendType
 
+# Re-export the structured cancel-result enum so the rest of the Python
+# executor can match on it without reaching into the bindings module
+# directly.
+TransferCancelResult = tensorrt_llm.bindings.internal.batch_manager.TransferCancelResult
+TransceiverHealth = tensorrt_llm.bindings.internal.batch_manager.TransceiverHealth
+
 
 def mapping_to_world_config(mapping: Mapping) -> WorldConfig:
 
@@ -122,6 +128,32 @@ class KvCacheTransceiver(ABC):
     def cancel_request(self, req: LlmRequest):
         raise NotImplementedError
 
+    def cancel_request_structured(self, req: LlmRequest):
+        """Structured cancel result.
+
+        Default implementation maps the historical bool result onto the
+        enum so subclasses (e.g., the Python transceiver) keep working
+        without changes. The C++ binding overrides this with a real
+        implementation that distinguishes pre-advertise cancellation from
+        in-flight cancellation.
+        """
+        cancelled = self.cancel_request(req)
+        return TransferCancelResult.CancelledBeforeAdvertise if cancelled else TransferCancelResult.NotFound
+
+    def is_healthy(self) -> bool:
+        """Whether the transceiver is currently healthy.
+
+        Defaults to True; subclasses with a real health signal override.
+        """
+        return True
+
+    def get_health(self):
+        """Return a TransceiverHealth snapshot. Defaults to a healthy
+        snapshot for transceivers that have not yet implemented health
+        accounting.
+        """
+        return None
+
     @abstractmethod
     def prepare_context_requests(self, requests: List[LlmRequest]):
         """
@@ -204,6 +236,15 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
 
     def cancel_request(self, req: LlmRequest):
         return self.impl.cancel_request(req)
+
+    def cancel_request_structured(self, req: LlmRequest):
+        return self.impl.cancel_request_structured(req)
+
+    def is_healthy(self) -> bool:
+        return self.impl.is_healthy()
+
+    def get_health(self):
+        return self.impl.get_health()
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
         # not implemented, an empty placeholder to allow being invoked unconditionally

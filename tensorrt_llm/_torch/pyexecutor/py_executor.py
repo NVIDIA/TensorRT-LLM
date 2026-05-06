@@ -55,7 +55,7 @@ from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
 from .hang_detector import HangDetector
-from .kv_cache_transceiver import KvCacheTransceiver
+from .kv_cache_transceiver import KvCacheTransceiver, TransferCancelResult
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, get_draft_token_length)
 from .model_engine import ModelEngine
@@ -414,6 +414,21 @@ class PyExecutor:
         self.max_num_active_requests = model_engine.get_max_num_sequences()
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
+        # Buffer for transfer-completion responses created inside
+        # _end_transfer_and_maybe_terminate. With ADP enabled,
+        # _enqueue_responses runs a tp_gather collective; calling it from
+        # _send_kv_async causes a collective mismatch because only the
+        # owning DP rank reaches that point. Buffering and flushing at a
+        # synchronised loop point (where every DP rank participates)
+        # avoids the deadlock.
+        self._pending_transfer_responses: List[Tuple[int, LlmResponse]] = []
+        # Requests whose transfer timed out and we have already issued a
+        # cancel_request to C++. We must not call _terminate_request on
+        # these until C++ reports a final transfer state, otherwise we
+        # would free request resources while NIXL/UCX may still be
+        # writing into them. Keyed by py_request_id to survive request
+        # state transitions.
+        self._inflight_cancel_requested_ids: set[int] = set()
         # TODO: Remove the condition on the PP size once disagg support from KVCache reuse
         # path is fixed.
         self.async_transfer_manager = AsyncTransferManager(
@@ -634,7 +649,14 @@ class PyExecutor:
             response = request.create_response(False, self.dist.rank)
             if response:
                 response.result.cached_tokens = request.cached_tokens
-                self._enqueue_responses([(request.py_request_id, response)])
+                # Buffer the response instead of enqueueing immediately.
+                # _enqueue_responses runs a tp_gather collective when ADP
+                # is enabled; calling it here would deadlock because only
+                # the owning DP rank reaches this point. The buffer is
+                # flushed later at _flush_pending_transfer_responses
+                # where all ranks participate.
+                self._pending_transfer_responses.append(
+                    (request.py_request_id, response))
             if self.async_transfer_manager.end_transfer(request):
                 self.active_requests.remove(request)
                 self._terminate_request(request)
@@ -646,6 +668,20 @@ class PyExecutor:
             # termination to avoid double free_resources calls.
             if not self.async_transfer_manager.should_store_blocks:
                 self._terminate_request(request)
+
+    def _flush_pending_transfer_responses(self):
+        """Enqueue buffered transfer-completion responses.
+
+        Must be called at a point where ALL DP ranks execute in lockstep so
+        the tp_gather inside _enqueue_responses cannot deadlock.
+        """
+        responses = self._pending_transfer_responses
+        self._pending_transfer_responses = []
+        # Even when this rank has nothing to enqueue, we must still call
+        # _enqueue_responses with an empty list so that other DP ranks'
+        # tp_gather can complete. The collective is symmetric.
+        if responses or self.enable_attention_dp:
+            self._enqueue_responses(responses)
 
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
@@ -1700,6 +1736,7 @@ class PyExecutor:
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
+                self._flush_pending_transfer_responses()
                 self._handle_canceled_requests()
 
                 finished_requests = self._handle_responses()
@@ -2174,6 +2211,7 @@ class PyExecutor:
                     self._update_requests(sample_state, self.resource_manager)
 
                     self._send_kv_async(scheduled_batch.all_requests())
+                    self._flush_pending_transfer_responses()
 
                     self._handle_canceled_requests()
                     finished_requests = self._handle_responses()
@@ -2420,6 +2458,11 @@ class PyExecutor:
 
                     self._send_kv_async(
                         self.previous_batch.scheduled_requests.all_requests())
+
+                # Flush outside the conditional so all DP ranks participate
+                # in the tp_gather collective even when
+                # should_process_previous_batch differs between ranks.
+                self._flush_pending_transfer_responses()
 
                 if self.drafter is not None and self.use_spec_decode and should_process_previous_batch:
                     # Cleanup previous draft resources used in the draft model
@@ -3331,6 +3374,11 @@ class PyExecutor:
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
         )
 
+        # Worker reached a final state — clear any pending in-flight cancel
+        # bookkeeping for those requests.
+        if completed_req_ids:
+            self._inflight_cancel_requested_ids -= completed_req_ids
+
         for request_id in completed_req_ids:
 
             if request_id not in requests_in_transfer:
@@ -3349,14 +3397,42 @@ class PyExecutor:
         for request_id in list(requests_in_transfer.keys()):
             request = requests_in_transfer[request_id]
             if request.py_kv_transfer_timed_out and request_id not in completed_req_ids:
-                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
-                # If cancel is successful, mark as complete so it can be cleaned up
-                # Otherwise, try at next iteration
-                if is_cancelled:
+                # Use structured cancel so we can distinguish
+                # "safe-to-free" from "cancellation accepted but worker
+                # still in flight". For the in-flight case we keep the
+                # request owned by C++ until a final transfer state is
+                # observed; freeing it now would let NIXL/UCX overwrite
+                # released memory.
+                cancel_result = self.kv_cache_transceiver.cancel_request_structured(
+                    request)
+                if cancel_result in (
+                        TransferCancelResult.CancelledBeforeAdvertise,
+                        TransferCancelResult.AlreadyComplete,
+                        TransferCancelResult.NotFound):
+                    # NotFound at this point means the C++ worker future
+                    # has already reached a final state and was erased
+                    # by check_context_transfer_status above; continue
+                    # cleanup as if it were AlreadyComplete.
                     request.py_kv_transfer_start_time = None
                     request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
-
+                    self._inflight_cancel_requested_ids.discard(request_id)
                     self._end_transfer_and_maybe_terminate(request)
+                elif cancel_result == TransferCancelResult.CancelRequestedInFlight:
+                    # Cancellation accepted but the worker is still
+                    # touching the buffer/KV memory. Mark the request as
+                    # in-flight-cancel so _do_terminate_request defers
+                    # freeing resources, and re-check next iteration.
+                    self._inflight_cancel_requested_ids.add(request_id)
+                elif cancel_result == TransferCancelResult.BackendUnhealthy:
+                    # Soft signal — the transceiver is unhealthy. We do
+                    # not touch this request; orchestration health checks
+                    # will restart the worker once the global deadline
+                    # elapses.
+                    logger.warning(
+                        f"Transceiver reports unhealthy while cancelling "
+                        f"context request {request_id}; deferring to "
+                        f"health-driven restart.")
+                    self._inflight_cancel_requested_ids.add(request_id)
 
         self._check_cache_transfer_errors("context requests")
 
@@ -3568,6 +3644,33 @@ class PyExecutor:
         for request in failed_requests:
             self._terminate_request(request)
 
+    def _can_terminate_request_now(self, request: LlmRequest) -> bool:
+        """Return False if the request still has an in-flight C++
+        transfer that may write to its KV/buffer memory.
+
+        Calling _do_terminate_request on such a request would let
+        free_resources() return KV blocks to the pool while NIXL/UCX is
+        still writing into them. We instead leave the request owned by
+        C++ until cancel_request_structured reports CancelledBefore-
+        Advertise / AlreadyComplete, or the transceiver is flipped to
+        unhealthy and orchestration restarts the worker.
+        """
+        if self.kv_cache_transceiver is None:
+            return True
+        if request.is_dummy_request:
+            return True
+        # Active disagg transfer state: the C++ worker future is still
+        # tracked. Don't free.
+        if (request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+                or request.state ==
+                LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS):
+            return False
+        # We have already issued a cancel for this request and C++ has
+        # not yet returned a final state. Do not free.
+        if request.py_request_id in self._inflight_cancel_requested_ids:
+            return False
+        return True
+
     def _terminate_request(self, request: LlmRequest):
         # Dummy requests don't participate in disagg KV cache transfers,
         # so they must bypass the PP termination handler to avoid stale
@@ -3580,6 +3683,17 @@ class PyExecutor:
             self._do_terminate_request(request)
 
     def _do_terminate_request(self, request: LlmRequest):
+        if not self._can_terminate_request_now(request):
+            # Defer: the C++ worker future is still alive. We will retry
+            # termination on the next iteration once the structured
+            # cancel result transitions to CancelledBeforeAdvertise /
+            # AlreadyComplete, or the request reaches a final transfer
+            # state via _check_disagg_ctx_cache_transfer_status /
+            # check_gen_transfer_status.
+            logger.debug(
+                f"Deferring _do_terminate_request for {request.py_request_id}: "
+                f"transfer still in flight (state={request.state})")
+            return
         self.resource_manager.free_resources(request)
 
         if self.gather_all_responses or self.dist.rank == 0:
@@ -3729,11 +3843,38 @@ class PyExecutor:
 
             # Check if generation request needs cleanup due to KV cache transfer timeout
             if request.py_kv_transfer_timed_out:
-                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
-                if is_cancelled:
+                # Use structured cancel so an "accepted but worker
+                # in-flight" outcome does not free request resources
+                # while NIXL/UCX may still write into them.
+                cancel_result = self.kv_cache_transceiver.cancel_request_structured(
+                    request)
+                if cancel_result in (
+                        TransferCancelResult.CancelledBeforeAdvertise,
+                        TransferCancelResult.AlreadyComplete,
+                        TransferCancelResult.NotFound):
+                    # NotFound at this stage means C++ already moved the
+                    # request to a final state (worker future ready and
+                    # erased by check_gen_transfer_status); treat the
+                    # same as AlreadyComplete so we surface the timeout
+                    # error to the user and free resources.
+                    self._inflight_cancel_requested_ids.discard(req_id)
                     self._handle_errors(
                         error_msg=f"Request {request.py_request_id} timed out",
                         requests=[request])
+                elif cancel_result == TransferCancelResult.CancelRequestedInFlight:
+                    # Worker still touching buffers — keep the request
+                    # active so we re-poll next iteration. Once C++
+                    # transitions the worker future to a final state we
+                    # will see NotFound / AlreadyComplete and clean up.
+                    self._inflight_cancel_requested_ids.add(req_id)
+                    new_active_requests.append(request)
+                elif cancel_result == TransferCancelResult.BackendUnhealthy:
+                    logger.warning(
+                        f"Transceiver reports unhealthy while cancelling "
+                        f"generation request {req_id}; deferring to "
+                        f"health-driven restart.")
+                    self._inflight_cancel_requested_ids.add(req_id)
+                    new_active_requests.append(request)
                 continue
 
             if request.is_generation_only_request() and not request.is_finished:

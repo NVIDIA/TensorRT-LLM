@@ -17,8 +17,10 @@
 
 #include "cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
+#include "tensorrt_llm/batch_manager/contextProgress.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/bindingUtils.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
@@ -49,6 +51,14 @@ public:
     void respondAndSendAsync(tb::LlmRequest* llmRequest) override
     {
         NB_OVERRIDE_PURE(respondAndSendAsync, llmRequest);
+    }
+
+    void respondAndSendLayerWise(
+        tb::RequestVector const& /*requests*/, std::shared_ptr<tb::ContextProgress> const& /*progress*/) override
+    {
+        // Layer-wise sender path is not exposed to Python overrides; this is
+        // a stub so the trampoline class is fully concrete.
+        TLLM_THROW("respondAndSendLayerWise is not overridable from Python");
     }
 
     void requestAndReceiveSync(tb::LlmRequest* llmRequest) override
@@ -86,31 +96,64 @@ public:
 
 void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
 {
+    nb::enum_<tb::TransferCancelResult>(m, "TransferCancelResult")
+        .value("NotFound", tb::TransferCancelResult::kNotFound)
+        .value("AlreadyComplete", tb::TransferCancelResult::kAlreadyComplete)
+        .value("CancelledBeforeAdvertise", tb::TransferCancelResult::kCancelledBeforeAdvertise)
+        .value("CancelRequestedInFlight", tb::TransferCancelResult::kCancelRequestedInFlight)
+        .value("BackendUnhealthy", tb::TransferCancelResult::kBackendUnhealthy)
+        .value("NotCancellable", tb::TransferCancelResult::kNotCancellable);
+
+    nb::class_<tb::TransceiverHealth>(m, "TransceiverHealth")
+        .def_ro("is_healthy", &tb::TransceiverHealth::isHealthy)
+        .def_ro("quarantined_transfer_count", &tb::TransceiverHealth::quarantinedTransferCount)
+        .def_ro("quarantine_budget", &tb::TransceiverHealth::quarantineBudget)
+        .def_ro("seconds_since_last_progress", &tb::TransceiverHealth::secondsSinceLastProgress)
+        .def_ro("global_progress_deadline_seconds", &tb::TransceiverHealth::globalProgressDeadlineSeconds);
+
+    auto checkContextStatusLambda
+        = [](tb::BaseCacheTransceiver& self, std::optional<int> const& atLeastRequestNum, bool markComplete)
+    {
+        RequestStatuses result;
+        {
+            nb::gil_scoped_release release;
+            result = self.checkContextTransferStatus(atLeastRequestNum, markComplete);
+        }
+        auto completedRequestIds
+            = std::vector<int64_t>(result.completedRequestIds.begin(), result.completedRequestIds.end());
+        auto errorRequestIds = std::vector<int64_t>(result.errorRequestIds.begin(), result.errorRequestIds.end());
+        return nb::make_tuple(completedRequestIds, errorRequestIds);
+    };
+
+    auto drainContextStatusLambda = [](tb::BaseCacheTransceiver& self, bool markComplete)
+    {
+        RequestStatuses result;
+        {
+            nb::gil_scoped_release release;
+            result = self.drainContextTransferStatus(markComplete);
+        }
+        auto completedRequestIds
+            = std::vector<int64_t>(result.completedRequestIds.begin(), result.completedRequestIds.end());
+        auto errorRequestIds = std::vector<int64_t>(result.errorRequestIds.begin(), result.errorRequestIds.end());
+        return nb::make_tuple(completedRequestIds, errorRequestIds);
+    };
+
     nb::class_<tb::BaseCacheTransceiver, PyCacheTransceiver>(m, "BaseCacheTransceiver")
         .def("respond_and_send_async", &BaseCacheTransceiver::respondAndSendAsync)
         .def("request_and_receive_sync", &BaseCacheTransceiver::requestAndReceiveSync)
         .def("request_and_receive_async", &BaseCacheTransceiver::requestAndReceiveAsync)
-        .def(
-            "check_context_transfer_status",
-            [](tb::BaseCacheTransceiver& self, std::optional<int> const& atLeastRequestNum, bool markComplete = false)
-            {
-                RequestStatuses result;
-                {
-                    nb::gil_scoped_release release;
-                    result = self.checkContextTransferStatus(atLeastRequestNum, markComplete);
-                }
-
-                auto completedRequestIds
-                    = std::vector<int64_t>(result.completedRequestIds.begin(), result.completedRequestIds.end());
-                auto errorRequestIds
-                    = std::vector<int64_t>(result.errorRequestIds.begin(), result.errorRequestIds.end());
-                return nb::make_tuple(completedRequestIds, errorRequestIds);
-            },
+        .def("check_context_transfer_status", checkContextStatusLambda,
             nb::arg("at_least_request_num") = std::nullopt, nb::arg("mark_complete") = false)
+        .def("drain_context_transfer_status", drainContextStatusLambda, nb::arg("mark_complete") = false)
         .def("check_gen_transfer_status", &BaseCacheTransceiver::checkGenTransferStatus,
             nb::call_guard<nb::gil_scoped_release>())
+        .def("drain_gen_transfer_status", &BaseCacheTransceiver::drainGenTransferStatus,
+            nb::call_guard<nb::gil_scoped_release>())
         .def("check_gen_transfer_complete", &BaseCacheTransceiver::checkGenTransferComplete)
-        .def("cancel_request", &BaseCacheTransceiver::cancelRequest);
+        .def("cancel_request", &BaseCacheTransceiver::cancelRequest)
+        .def("cancel_request_structured", &BaseCacheTransceiver::cancelRequestStructured)
+        .def("is_healthy", &BaseCacheTransceiver::isHealthy)
+        .def("get_health", &BaseCacheTransceiver::getHealth);
 
     nb::enum_<executor::kv_cache::CacheState::AttentionType>(m, "AttentionType")
         .value("DEFAULT", executor::kv_cache::CacheState::AttentionType::kDEFAULT)
