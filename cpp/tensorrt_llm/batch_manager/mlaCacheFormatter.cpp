@@ -17,6 +17,7 @@
 
 #include "mlaCacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
+#include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/dataType.h"
@@ -162,6 +163,16 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     auto const ppSize = selfConfig.getParallelConfig().mPipelineParallelism;
     auto blockRange
         = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd, recvSideHasCP, ppSize);
+    // logBlockIds("send", llmRequest, selfIdx, blockRange);
+    // MLA does not currently combine with Mamba / linear-attention, so placeholder blocks
+    // (negative ids) must not appear here. Reject explicitly rather than silently mishandling.
+    for (auto const& [windowSize, blockIds] : blockRange.getBlockIdsPerWindow())
+    {
+        for (auto const id : blockIds)
+        {
+            TLLM_CHECK_WITH_INFO(id >= 0, "MLACacheFormatter does not support placeholder blocks");
+        }
+    }
     auto const& windowSizes = blockRange.getWindowSizes();
     TLLM_CHECK_WITH_INFO(
         static_cast<int>(windowSizes.size()) == numPools, "window sizes should be the same as numPools");
@@ -416,6 +427,14 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
     auto const srcPpSize = destConfig.getParallelConfig().mPipelineParallelism;
     auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest, destConfig.getEnableBlockReuse(),
         destConfig.getEnablePartialReuse(), recvSideHasCP, srcPpSize);
+    // logBlockIds("recv", llmRequest, selfIdx, blockRange);
+    for (auto const& [windowSize, blockIds] : blockRange.getBlockIdsPerWindow())
+    {
+        for (auto const id : blockIds)
+        {
+            TLLM_CHECK_WITH_INFO(id >= 0, "MLACacheFormatter does not support placeholder blocks");
+        }
+    }
     auto const numPools = mCacheManager->getBlockManager().getNumPools(
         /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     auto const& windowSizes = blockRange.getWindowSizes();

@@ -33,6 +33,7 @@
 #include <future>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <unordered_map>
 
 namespace tensorrt_llm::batch_manager
@@ -841,6 +842,24 @@ public:
             int32_t requestedBlockSize = requestedBlockRange.getBlockIdsPerWindow().begin()->second.size();
             TLLM_CHECK_WITH_INFO(requestedBlockSize > 0, "requestedBlockSize must be > 0");
             int32_t indexFromEnd = requestedBlockSize - 1;
+            {
+                // Log the full requested block id list (placeholders have negative ids) so sender
+                // and receiver logs can be compared side-by-side to confirm layout symmetry.
+                std::ostringstream idsOss;
+                idsOss << '[';
+                auto const& idList = requestedBlockRange.getBlockIdsPerWindow().begin()->second;
+                for (size_t k = 0; k < idList.size(); ++k)
+                {
+                    if (k > 0)
+                    {
+                        idsOss << ", ";
+                    }
+                    idsOss << idList[k];
+                }
+                idsOss << ']';
+                TLLM_LOG_INFO("[disagg-sendRequestInfo] req=%lu requestedBlockSize=%d indexFromEnd=%d blockIds=%s",
+                    requestId, requestedBlockSize, indexFromEnd, idsOss.str().c_str());
+            }
 
             requestInfo = RequestInfo(requestId, mSelfState, indexFromEnd, lastBlockKey);
         }

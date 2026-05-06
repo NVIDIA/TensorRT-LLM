@@ -7551,7 +7551,10 @@ void testKVCacheManagerLinearAttention_BlockCopying(
 
     char* poolBaseAddr
         = reinterpret_cast<char*>(kvCacheManager.getBlockManager().getRecurrentStatesPool().primaryPtr->data());
-    // memory layout of the pool: [numLayers, blocksInPrimaryPool, 1 (kvFactor), sizePerBlock]
+    // memory layout of the pool: [blocksInPrimaryPool, numLayers, 1 (kvFactor), sizePerBlock]
+    // (layer-first layout is currently disabled; see allocatePools()).
+    // setOffsets writes blockIdx * numLayers, and allRecurrentStatesBytes is the per-layer stride,
+    // so (blockOffset * allRecurrentStatesBytes) points to the start of layer 0 of block blockIdx.
     size_t const strideBlockId = linearAttentionMetadata.allRecurrentStatesBytes;
     std::unique_ptr<char[]> hostBuffer(new char[strideBlockId]);
 

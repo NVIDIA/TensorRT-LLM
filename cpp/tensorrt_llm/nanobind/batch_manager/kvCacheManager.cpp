@@ -497,7 +497,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                 auto pool_layer_idx = self.getPoolLayerIdx(layer_idx);
                 if (self.isPoolLayerFirst(layer_idx))
                 {
-                    // Layer-first layout: pool[pool_layer_idx, :]
+                    // Layer-first layout: pool[pool_layer_idx, :].
+                    // Currently dead because allocatePools forces layerFirstLayout = false.
                     return pool.index({pool_layer_idx});
                 }
                 // Standard layout: pool[:, pool_layer_idx]

@@ -840,9 +840,9 @@ class ModelConfig(Generic[TConfig]):
         use_disagg = is_disagg or os.environ.get('TRTLLM_USE_CPP_MAMBA',
                                                  '0') == '1'
         use_reuse = kv_cache_config is not None and kv_cache_config.enable_block_reuse
-        use_spec = spec_config is not None
+        spec_config is not None
 
-        use_v1_mamba_manager = use_disagg or use_spec
+        use_v1_mamba_manager = False
         if is_hybrid_linear(
                 self.pretrained_config) and use_v1_mamba_manager and use_reuse:
             logger.warning(

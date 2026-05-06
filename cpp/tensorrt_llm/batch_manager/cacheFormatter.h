@@ -180,6 +180,11 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager
 BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
     BlockKey const& lastBlockKey, SizeType32 indexFromEnd, bool recvSideHasCP = false, SizeType32 ppSize = 1);
 
+// Emit an INFO-level log line listing the block ids in the given BlockRange. Placeholder blocks
+// (negative ids) are surfaced with a [P] tag so sender/receiver logs can be visually compared
+// to confirm the placeholder layout is symmetric across executors.
+void logBlockIds(char const* direction, LlmRequest const& llmRequest, SizeType32 selfIdx, BlockRange const& blockRange);
+
 using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
 using Connection = tensorrt_llm::executor::kv_cache::Connection;
 using SizeType32 = tensorrt_llm::runtime::SizeType32;

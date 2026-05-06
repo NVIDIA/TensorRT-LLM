@@ -107,9 +107,12 @@ private:
         int32_t indexFromEnd, SizeType32 windowSize)
     {
         int32_t const numBlocksToCollect = indexFromEnd + 1;
+        TLLM_CHECK_WITH_INFO(numBlocksToCollect >= 0,
+            "fromReuseTree: numBlocksToCollect=%d (indexFromEnd=%d) would underflow reserve() to a huge size_t",
+            numBlocksToCollect, indexFromEnd);
 
         std::vector<SizeType32> blockIds;
-        blockIds.reserve(numBlocksToCollect);
+        blockIds.reserve(static_cast<size_t>(numBlocksToCollect));
         for (int32_t i = 0; i < numBlocksToCollect; ++i)
         {
             TLLM_CHECK_WITH_INFO(
@@ -316,9 +319,16 @@ private:
             {
                 BlockPtr const& block = mRange->mCacheManager->getBlockManager().getBlockById(
                     mRange->mBlockIds.at(mIdx), mRange->mWindowSize);
-                TLLM_CHECK_WITH_INFO(block->isPrimary(), "cache transceiver only supports primary blocks");
-                auto const blockOffset = block->getMemoryPoolBlockIndex();
-                mCurrent = runtime::ITensor::slice(mRange->mPool, blockOffset, 1);
+                if (block->isPlaceholder())
+                {
+                    mCurrent = nullptr;
+                }
+                else
+                {
+                    TLLM_CHECK_WITH_INFO(block->isPrimary(), "cache transceiver only supports primary blocks");
+                    auto const blockOffset = block->getMemoryPoolBlockIndex();
+                    mCurrent = runtime::ITensor::slice(mRange->mPool, blockOffset, 1);
+                }
             }
             else
             {

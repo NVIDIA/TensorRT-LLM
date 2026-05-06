@@ -36,7 +36,8 @@ from .dwdp import DwdpManager
 from .guided_decoder import GuidedDecoder
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse
-from .mamba_cache_manager import BaseMambaCacheManager, MambaHybridCacheManager
+from .mamba_cache_manager import (MambaHybridCacheManager,
+                                  MixedMambaHybridCacheManager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, KVCacheManagerV2,
@@ -1457,7 +1458,7 @@ def create_py_executor_instance(
 
     # For hybrid models, this has both impl and mamba_impl
     mamba_cache_manager = None
-    if isinstance(kv_cache_manager, BaseMambaCacheManager):
+    if isinstance(kv_cache_manager, MixedMambaHybridCacheManager):
         mamba_cache_manager = kv_cache_manager
 
     kv_cache_transceiver = create_kv_cache_transceiver(

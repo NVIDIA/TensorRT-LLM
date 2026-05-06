@@ -114,7 +114,8 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
             auto const& pool = pools[poolIdx];
 
             // For layer-first layout pools, block data is non-contiguous across layers.
-            // Copy each layer's block data separately.
+            // Copy each layer's block data separately. Currently dead because
+            // allocatePools forces layerFirstLayout = false.
             if (pool.layerFirstLayout)
             {
                 auto srcPool = src->isPrimary() ? pool.primaryPtr : pool.secondaryPtr;

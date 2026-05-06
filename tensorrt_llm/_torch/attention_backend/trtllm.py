@@ -321,6 +321,7 @@ class TrtllmAttentionWrapper:
         self.kv_cache_block_offsets = kv_cache_block_offsets
         self.host_kv_cache_pool_pointers = host_kv_cache_pool_pointers
         self.host_kv_cache_pool_mapping = host_kv_cache_pool_mapping
+        print(f"host_kv_cache_pool_mapping: {host_kv_cache_pool_mapping}")
         self.workspace = workspace
         self.cache_indirection = cache_indirection
         self.kv_scale_orig_quant = kv_scale_orig_quant if kv_scales_sf_inv is None else kv_scales_sf_inv

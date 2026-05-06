@@ -1068,13 +1068,13 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         for layer_idx in self.pp_layers:
             if mamba_layer_mask[layer_idx]:
                 self.mamba_pp_layers.append(layer_idx)
+        self.num_mamba_layers = mamba_num_layers
         self.local_num_mamba_layers = len(self.mamba_pp_layers)
 
         assert self.local_num_mamba_layers > 0, "At least one mamba layer is required"
         self.mamba_layer_offsets = {}
         for idx, layer_id in enumerate(self.mamba_pp_layers):
             self.mamba_layer_offsets[layer_id] = idx
-
         self.host_block_offsets = torch.zeros([
             self.impl.num_pools, self.max_batch_size, 2, self.max_blocks_per_seq
         ],
@@ -1164,10 +1164,13 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         )
 
     def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
-        return self.all_ssm_states[self.mamba_layer_offsets[layer_idx]]
+        # all_ssm_states layout: [num_blocks, num_layers, *ssm_shape].
+        # Slice dim 1 so callers can still index by state (block) index.
+        return self.all_ssm_states[:, self.mamba_layer_offsets[layer_idx]]
 
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
-        return self.all_conv_states[self.mamba_layer_offsets[layer_idx]]
+        # all_conv_states layout: [num_blocks, num_layers, *conv_shape].
+        return self.all_conv_states[:, self.mamba_layer_offsets[layer_idx]]
 
     def mamba_layer_cache(
             self, layer_idx: int) -> Union[PythonMambaCacheManager.State, None]:
@@ -1199,12 +1202,23 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
                                          dtype=torch.int32,
                                          device="cpu")
         for i in range(len(self.requests)):
-            # With layer-first pool layout, setOffsets produces the block index directly
-            # (no longer multiplied by num_local_mamba_layers)
-            value = self.host_block_offsets[self.recurrent_states_pool_index, i,
-                                            0, block_indices[i]]
+            # With block-first pool layout, setOffsets writes blockIdx * num_mamba_layers
+            # (the flat offset to the start of layer 0 of that block). Divide by
+            # num_mamba_layers here to recover the raw block index used by
+            # all_ssm_states / all_conv_states.
+            raw_value = self.host_block_offsets[
+                self.recurrent_states_pool_index, i, 0, block_indices[i]]
             max_blocks = self.blocks_per_window[
                 LinearCacheType.RECURRENT_STATES.value][0]
+            if raw_value < 0:
+                value = raw_value
+            else:
+                if raw_value % self.local_num_mamba_layers != 0:
+                    raise RuntimeError(
+                        f"Recurrent state block offset {raw_value} is not a "
+                        f"multiple of num_mamba_layers ({self.local_num_mamba_layers}) "
+                        f"for request {i}")
+                value = raw_value // self.local_num_mamba_layers
             if value < 0 or value >= max_blocks:
                 raise RuntimeError(
                     f"Invalid recurrent state block index {value} "
@@ -1253,21 +1267,23 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
         return prompt_len - current
 
     def _setup_states_views(self) -> None:
-        # Pool layout: {numLocalLayers, numBlocks, ssm_bytes + conv_bytes} (as uint8)
+        # Pool layout: {numBlocks, numLayers, ssm_bytes + conv_bytes} (as uint8).
+        # Views keep the pool layout so that state_indices (block index) slices the
+        # first (block) dim and layer_idx slices the second dim.
         pool: torch.Tensor = self.impl.get_recurrent_states_pool().view(
-            torch.uint8).reshape(self.local_num_mamba_layers, -1,
+            torch.uint8).reshape(-1, self.local_num_mamba_layers,
                                  self.ssm_bytes + self.conv_bytes)
-        num_blocks_in_pool = pool.shape[1]
-        self.all_ssm_states = pool[:, :, :self.ssm_bytes].view(
-            self.ssm_state_dtype).view(
-                [self.local_num_mamba_layers, num_blocks_in_pool] +
-                self.ssm_state_shape)
-        self.all_conv_states = pool[:, :, self.ssm_bytes:self.ssm_bytes +
-                                    self.conv_bytes].view(
-                                        self.conv_state_dtype).view([
-                                            self.local_num_mamba_layers,
-                                            num_blocks_in_pool
-                                        ] + self.conv_state_shape)
+        num_blocks_in_pool = pool.shape[0]
+        self.all_ssm_states = pool[:, :, self.conv_bytes:self.conv_bytes +
+                                   self.ssm_bytes].view(
+                                       self.ssm_state_dtype).view([
+                                           num_blocks_in_pool,
+                                           self.local_num_mamba_layers
+                                       ] + self.ssm_state_shape)
+        self.all_conv_states = pool[:, :, :self.conv_bytes].view(
+            self.conv_state_dtype).view(
+                [num_blocks_in_pool, self.local_num_mamba_layers] +
+                self.conv_state_shape)
 
     def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
         return self.ssm_state_dtype
@@ -1338,8 +1354,12 @@ class MambaHybridCacheManager(metaclass=_MambaHybridCacheManagerMeta):
         )
 
         spec_config = kwargs.get('spec_config', None)
-        use_v1 = (is_disagg or use_cpp_mamba_cache_manager()
-                  or spec_config is not None)
+        use_v1 = (spec_config is not None)
+        if mamba_num_layers == 0:
+            logger.info(
+                "mamba_num_layers is 0, using KVCacheManager without mamba caching"
+            )
+            return KVCacheManager(kv_cache_config, kv_cache_type, **kwargs)
 
         if use_v1:
             logger.info(

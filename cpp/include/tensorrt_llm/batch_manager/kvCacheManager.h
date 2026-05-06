@@ -680,7 +680,9 @@ public:
 
     // When true, pool tensor is laid out as {numLayers, numBlocks, kvFactor, blockSize}
     // instead of the default {numBlocks, numLayers, kvFactor, blockSize}.
-    // Used for recurrent state (linear attention) pools.
+    // This path is currently disabled (always false) but the supporting code
+    // is kept in place so layer-first layout can be re-enabled for recurrent
+    // state (linear attention) pools in the future. See allocatePools().
     bool layerFirstLayout;
 
     KVCacheBlockPool(SizeType32 numLayers, SizeType32 kvFactor, SizeType32 numKvHeads, SizeType32 sizePerHead,

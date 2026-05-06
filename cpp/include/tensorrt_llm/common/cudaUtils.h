@@ -181,7 +181,18 @@ inline bool doCheckError(cudaStream_t stream)
 
 inline void syncAndCheck(cudaStream_t stream, char const* const file, int const line)
 {
-    if (doCheckError(stream))
+    bool doCheck = false;
+    try
+    {
+        doCheck = doCheckError(stream);
+    }
+    catch (TllmException& e)
+    {
+        TLLM_THROW(
+            fmtstr("[TensorRT-LLM][ERROR] Failed to determine if CUDA stream is capturing. Original caller: %s:%d.",
+                file, line));
+    }
+    if (doCheck)
     {
         cudaStreamSynchronize(stream);
         check(cudaGetLastError(), "cudaGetLastError", file, line);

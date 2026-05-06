@@ -1074,10 +1074,13 @@ void WindowBlockManager::allocatePools(bool useUvm)
             poolDtype = nvinfer1::DataType::kUINT8;
         }
 
-        nvinfer1::Dims cacheShape = isRecurrentState()
+        // Linear-attention (recurrent state) pools could optionally use a
+        // layer-first layout. That path is currently disabled; toggle the
+        // flag below (e.g. back to `isRecurrentState()`) to re-enable it.
+        pool.layerFirstLayout = false;
+        nvinfer1::Dims cacheShape = pool.layerFirstLayout
             ? ITensor::makeShape({pool.numLayers, mNumPrimaryBlocks, mKVFactor, blockSize})
             : ITensor::makeShape({mNumPrimaryBlocks, pool.numLayers, mKVFactor, blockSize});
-        pool.layerFirstLayout = isRecurrentState();
 
         TLLM_LOG_DEBUG(
             "[%s] Allocating primary pool with %d blocks for %d layers with %d kv heads, shape={%d, %d, %d, %d}%s",
@@ -1090,7 +1093,7 @@ void WindowBlockManager::allocatePools(bool useUvm)
             pool.primaryPtr = mBufferManager.gpuSync(cacheShape, poolDtype);
         if (mNumSecondaryBlocks > 0)
         {
-            nvinfer1::Dims cacheShapeOffload = isRecurrentState()
+            nvinfer1::Dims cacheShapeOffload = pool.layerFirstLayout
                 ? ITensor::makeShape({pool.numLayers, mNumSecondaryBlocks, mKVFactor, blockSize})
                 : ITensor::makeShape({mNumSecondaryBlocks, pool.numLayers, mKVFactor, blockSize});
             TLLM_LOG_DEBUG("[%s] Allocating secondary pool with %d blocks for %d layers with %d kv heads",
@@ -1252,7 +1255,8 @@ void WindowBlockManager::setOffsets(tk::KVCacheIndex* offsetsPtr, nvinfer1::Dims
                 if (pool.layerFirstLayout)
                 {
                     // Layer-first layout: {numLayers, numBlocks, kvFactor, blockSize}
-                    // Flat index: layerIdx * numBlocks * kvFactor + blockIdx * kvFactor + fieldIdx
+                    // Flat index: layerIdx * numBlocks * kvFactor + blockIdx * kvFactor + fieldIdx.
+                    // Currently dead because allocatePools forces layerFirstLayout = false.
                     return tk::KVCacheIndex{common::flat_index3(
                         layerIdx, block->getMemoryPoolBlockIndex(), fieldIdx, mNumPrimaryBlocks, mKVFactor)};
                 }

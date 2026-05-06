@@ -94,7 +94,7 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(C
         ? false
         : reinterpret_cast<bool*>(params.has_initial_state_ptr)[batch_id];
 
-    int cache_index;
+    int64_t cache_index;
     if constexpr (kHasConvStateIndices)
     {
         cache_index = reinterpret_cast<int*>(params.cache_indices_ptr)[batch_id];
@@ -379,10 +379,11 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_update_kerne
     if (channel_id >= params.dim)
         return;
 
+    assert(batch_id < params.batch);
     input_t* x
         = reinterpret_cast<input_t*>(params.x_ptr) + batch_id * params.x_batch_stride + channel_id * params.x_c_stride;
 
-    int conv_state_batch_coord;
+    int64_t conv_state_batch_coord;
     if constexpr (kHasConvStateIndices)
     {
         conv_state_batch_coord = params.conv_state_indices_ptr[batch_id];
