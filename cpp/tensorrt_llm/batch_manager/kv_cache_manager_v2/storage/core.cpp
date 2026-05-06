@@ -698,7 +698,7 @@ int64_t CacheLevelStorage::grainsForSlots(int numSlots, std::vector<int> const& 
 {
     int64_t total = 0;
     for (auto s : slotSizeList)
-        total += divUp(numSlots * s, granularity);
+        total += divUp(static_cast<int64_t>(numSlots) * s, static_cast<int64_t>(granularity));
     return total;
 }
 
