@@ -1666,7 +1666,11 @@ class DeepseekV4Indexer(nn.Module):
         seq_len: int,
         offset: int,
     ) -> torch.Tensor:
-        index_score = torch.einsum("bshd,btd->bsht", q, index_k).float()
+        index_score = torch.matmul(
+            q.transpose(1, 2),
+            index_k.transpose(1, 2).unsqueeze(1),
+        ).transpose(1, 2)
+        index_score = index_score.float()
         index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
         index_score = torch.ops.auto_deploy.all_reduce(index_score, layer_type="mla")
 
@@ -1940,7 +1944,14 @@ class DeepseekV4Attention(nn.Module):
             layer_type="mla",
             tp_min_local_shape=self.o_lora_rank,
         )
-        attn_output = torch.einsum("bsgd,grd->bsgr", attn_output, wo_a).flatten(2)
+        attn_output = torch.ops.auto_deploy.torch_grouped_linear(
+            attn_output,
+            wo_a,
+            None,
+            tp_mode="colwise",
+            layer_type="mla",
+            tp_min_local_shape=self.o_lora_rank,
+        )
         attn_output = _linear_module(attn_output, self.wo_b, tp_mode="rowwise", layer_type="mla")
         attn_output = torch.ops.auto_deploy.all_reduce(attn_output, layer_type="mla")
         return attn_output

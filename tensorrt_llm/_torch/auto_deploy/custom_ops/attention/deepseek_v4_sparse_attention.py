@@ -724,7 +724,7 @@ def _select_ratio4_indexer_rows(
         ],
         dim=0,
     )
-    index_score = torch.einsum("hd,td->ht", q_index, index_k).float()
+    index_score = torch.matmul(q_index, index_k.transpose(-1, -2)).float()
     index_score = (index_score.relu() * indexer_weights.float().unsqueeze(-1)).sum(dim=0)
     if dist_common.is_initialized() and dist_common.get_world_size() > 1:
         dist_common.all_reduce(index_score, op=dist_common.ReduceOp.SUM)
@@ -992,7 +992,7 @@ def torch_deepseek_v4_sparse_attention(
         )
         q_compute = q_flat[start:end].to(compute_dtype)
 
-        logits = torch.einsum("thd,tkd->thk", q_compute, selected_kv_compute)
+        logits = torch.matmul(q_compute, selected_kv_compute.transpose(-1, -2))
         logits = logits * softmax_scale
         logits = logits.masked_fill((topk_chunk < 0).unsqueeze(1), float("-inf"))
         chunk_sink_logits = sink_logits.expand(end - start, num_heads, 1)
@@ -1000,7 +1000,7 @@ def torch_deepseek_v4_sparse_attention(
 
         weights_with_sink = torch.softmax(logits_with_sink, dim=-1, dtype=torch.float32)
         weights = weights_with_sink[..., :-1].to(compute_dtype)
-        chunk_output = torch.einsum("thk,tkd->thd", weights, selected_kv_compute)
+        chunk_output = torch.matmul(weights, selected_kv_compute)
         output_flat[start:end].copy_(chunk_output.to(q.dtype))
 
     return output

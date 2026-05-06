@@ -106,67 +106,6 @@ def _is_static_dim_value(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def _is_grouped_finegrained_fp8_einsum_node(node: Node) -> bool:
-    if not isinstance(node, Node) or node.op != "call_function":
-        return False
-    return node.target in {
-        torch.einsum,
-        torch.functional.einsum,
-        torch.ops.aten.einsum.default,
-    }
-
-
-def _extract_grouped_finegrained_fp8_einsum_operands(node: Node) -> Tuple[Node, Node] | None:
-    if not _is_grouped_finegrained_fp8_einsum_node(node) or not node.args:
-        return None
-    if node.args[0] != "bsgd,grd->bsgr":
-        return None
-
-    if len(node.args) >= 3:
-        input_node = node.args[1]
-        weight_view = node.args[2]
-    elif len(node.args) >= 2 and isinstance(node.args[1], (list, tuple)):
-        operands = node.args[1]
-        if len(operands) != 2:
-            return None
-        input_node, weight_view = operands
-    else:
-        return None
-
-    if not isinstance(input_node, Node) or not isinstance(weight_view, Node):
-        return None
-    return input_node, weight_view
-
-
-def _flatten_args(node: Node) -> Tuple[object, object] | None:
-    if node.op == "call_method" and node.target == "flatten":
-        start_dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("start_dim", 0)
-        end_dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("end_dim", -1)
-        return start_dim, end_dim
-    if node.op == "call_function" and (
-        node.target is torch.flatten or is_op(node, torch.ops.aten.flatten)
-    ):
-        start_dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("start_dim", 0)
-        end_dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("end_dim", -1)
-        return start_dim, end_dim
-    return None
-
-
-def _is_flatten_from_grouped_output(node: Node) -> bool:
-    flatten_args = _flatten_args(node)
-    if flatten_args is None:
-        return False
-    start_dim, end_dim = flatten_args
-    return start_dim == 2 and end_dim == -1
-
-
-def _single_flatten_user(node: Node) -> Node | None:
-    flatten_users = [user for user in list(node.users) if _is_flatten_from_grouped_output(user)]
-    if len(flatten_users) != 1 or len(node.users) != 1:
-        return None
-    return flatten_users[0]
-
-
 def _extract_layer_type_hint(node: Node, default: str = "unknown") -> str:
     if not isinstance(node, Node):
         return default
@@ -1025,18 +964,19 @@ class FineGrainedFP8LinearQuantization(Quantization):
     def build_custom_args_for_linear(self, scales: Dict[str, Node]) -> Tuple:
         return ([], [scales[self.scale_names()[0]]], [], [])
 
-    def _extract_grouped_einsum_match(
+    def _extract_grouped_linear_match(
         self,
         node: Node,
         checkpoint_layout: object,
         excluded: List[str],
-    ) -> Tuple[Node, Node, Node, str, int] | None:
-        operands = _extract_grouped_finegrained_fp8_einsum_operands(node)
-        if operands is None:
+    ) -> Tuple[Node, Node, object, Node, str, int] | None:
+        if not is_op(node, torch.ops.auto_deploy.torch_grouped_linear):
             return None
-        input_node, weight_view = operands
-        flatten_node = _single_flatten_user(node)
-        if flatten_node is None:
+
+        input_node, weight_view, bias_node = extract_op_args(node, "input", "weight", "bias")
+        if not isinstance(input_node, Node) or not isinstance(weight_view, Node):
+            return None
+        if bias_node is not None and not isinstance(bias_node, Node):
             return None
         if not _is_view_or_reshape_node(weight_view):
             return None
@@ -1060,13 +1000,14 @@ class FineGrainedFP8LinearQuantization(Quantization):
         if _is_static_dim_value(input_shape[2]) and input_shape[2] != num_groups:
             return None
 
-        return flatten_node, input_node, weight_base, weight_name, rank
+        return node, input_node, bias_node, weight_base, weight_name, rank
 
     def _insert_grouped_quantized_linear(
         self,
         gm: GraphModule,
-        flatten_node: Node,
+        source_node: Node,
         input_node: Node,
+        bias_node: object,
         weight_node: Node,
         weight_name: str,
         rank: int,
@@ -1095,14 +1036,14 @@ class FineGrainedFP8LinearQuantization(Quantization):
 
         scale_name = self.scale_names()[0]
         scale_target = f"{modname}.{scale_name}" if modname else scale_name
-        layer_type = _extract_layer_type_hint(input_node)
+        layer_type = _extract_layer_type_hint(source_node, _extract_layer_type_hint(input_node))
 
-        with gm.graph.inserting_before(flatten_node):
+        with gm.graph.inserting_before(source_node):
             scale_node = gm.graph.create_node("get_attr", scale_target)
             scale_node.meta["val"] = getattr(submod, scale_name).detach()
             grouped_node = gm.graph.call_function(
                 self.grouped_target_op(),
-                args=(input_node, weight_node, None, [], [scale_node], [], []),
+                args=(input_node, weight_node, bias_node, [], [scale_node], [], []),
                 kwargs={
                     "tp_mode": "colwise",
                     "output_sizes": None,
@@ -1112,8 +1053,8 @@ class FineGrainedFP8LinearQuantization(Quantization):
                 },
             )
 
-        flatten_node.replace_all_uses_with(grouped_node)
-        gm.graph.erase_node(flatten_node)
+        source_node.replace_all_uses_with(grouped_node)
+        gm.graph.erase_node(source_node)
 
     @staticmethod
     def _get_finegrained_fp8_layout(qcfg: Dict):
@@ -1303,16 +1244,19 @@ class FineGrainedFP8LinearQuantization(Quantization):
             if checkpoint_layout is not None:
                 load_hook_kwargs = {"checkpoint_layout": checkpoint_layout}
                 for n in list(gm.graph.nodes):
-                    grouped_match = self._extract_grouped_einsum_match(
+                    grouped_match = self._extract_grouped_linear_match(
                         n, checkpoint_layout, excluded
                     )
                     if grouped_match is None:
                         continue
-                    flatten_node, input_node, weight_node, weight_name, rank = grouped_match
+                    source_node, input_node, bias_node, weight_node, weight_name, rank = (
+                        grouped_match
+                    )
                     self._insert_grouped_quantized_linear(
                         gm,
-                        flatten_node,
+                        source_node,
                         input_node,
+                        bias_node,
                         weight_node,
                         weight_name,
                         rank,

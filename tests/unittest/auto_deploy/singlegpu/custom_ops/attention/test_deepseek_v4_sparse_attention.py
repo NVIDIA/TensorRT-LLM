@@ -118,14 +118,14 @@ def _sparse_attention_reference(
     compute_dtype = torch.float32 if q.dtype in (torch.float16, torch.bfloat16) else q.dtype
     gather_idxs = topk_idxs.to(torch.long).clamp(min=0)
     selected_kv = kv[batch_idx, gather_idxs].to(compute_dtype)
-    logits = torch.einsum("bshd,bskd->bshk", q.to(compute_dtype), selected_kv)
+    logits = torch.matmul(q.to(compute_dtype), selected_kv.transpose(-1, -2))
     logits = logits * softmax_scale
     logits = logits.masked_fill((topk_idxs < 0).unsqueeze(2), float("-inf"))
 
     sink_logits = attn_sink.to(dtype=compute_dtype).view(1, 1, num_heads, 1)
     sink_logits = sink_logits.expand(batch_size, seq_len, num_heads, 1)
     weights = torch.softmax(torch.cat([logits, sink_logits], dim=-1), dim=-1)
-    output = torch.einsum("bshk,bskd->bshd", weights[..., :-1], selected_kv)
+    output = torch.matmul(weights[..., :-1], selected_kv)
     return output.to(q.dtype)
 
 

@@ -457,11 +457,11 @@ def _grouped_finegrained_fp8_dense_dequant_ref(
     weight_scale = weight_scale[: weight_fp8.shape[0], : weight_fp8.shape[1]]
     weight_dequant = (weight_fp8.float() * weight_scale).to(input_tensor.dtype)
     weight_grouped = weight_dequant.view(num_groups, rank, input_tensor.shape[-1])
-    output = torch.einsum(
-        "...gk,grk->...gr",
-        input_dequant.to(input_tensor.dtype),
-        weight_grouped,
-    ).flatten(-2)
+    output = torch.matmul(
+        input_dequant.to(input_tensor.dtype).unsqueeze(-2),
+        weight_grouped.transpose(-1, -2),
+    ).squeeze(-2)
+    output = output.flatten(-2)
     if bias is not None:
         output = output + bias.reshape(weight_fp8.shape[0]).to(output.dtype)
     return output

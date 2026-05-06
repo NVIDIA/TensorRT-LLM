@@ -100,3 +100,48 @@ def simple_fake(
 ):
     """Fake implementation of simple_linear."""
     return torch.ops.aten.linear(input, weight, bias)
+
+
+def _grouped_linear(input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]):
+    output = torch.matmul(input.unsqueeze(-2), weight.transpose(-1, -2)).squeeze(-2)
+    if bias is not None:
+        output = output + bias.reshape(weight.shape[0], weight.shape[1]).to(output.dtype)
+    return output.flatten(-2)
+
+
+@torch.library.custom_op("auto_deploy::torch_grouped_linear", mutates_args=())
+def grouped(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    tp_mode: str = "none",
+    output_sizes: Optional[List[int]] = None,
+    tp_min_local_shape: int = 1,
+    layer_type: str = "unknown",
+) -> torch.Tensor:
+    """Grouped linear projection over ``input[..., group, in_features]``.
+
+    ``weight`` is shaped ``[group, out_features_per_group, in_features]``.
+    The result is flattened over group and per-group output dimensions, yielding
+    ``input.shape[:-2] + [group * out_features_per_group]``.
+
+    Sharding hint arguments follow :func:`simple`.
+    """
+    del tp_mode, output_sizes, tp_min_local_shape, layer_type
+    return _grouped_linear(input, weight, bias)
+
+
+@grouped.register_fake
+def grouped_fake(
+    input,
+    weight,
+    bias,
+    tp_mode="none",
+    output_sizes=None,
+    tp_min_local_shape=1,
+    layer_type="unknown",
+):
+    """Fake implementation of grouped linear."""
+    del bias, tp_mode, output_sizes, tp_min_local_shape, layer_type
+    out_features = weight.shape[0] * weight.shape[1]
+    return torch.empty((*input.shape[:-2], out_features), dtype=input.dtype, device=input.device)

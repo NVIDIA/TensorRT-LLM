@@ -125,7 +125,14 @@ class DeepSeekV4IRContractBlock(nn.Module):
             layer_type="mla",
             tp_min_local_shape=DSV4_O_RANK,
         )
-        attn_output = torch.einsum("bsgd,grd->bsgr", attn_output, wo_a).flatten(2)
+        attn_output = torch.ops.auto_deploy.torch_grouped_linear(
+            attn_output,
+            wo_a,
+            None,
+            tp_mode="colwise",
+            layer_type="mla",
+            tp_min_local_shape=DSV4_O_RANK,
+        )
         attn_output = torch.ops.auto_deploy.torch_linear_simple(
             attn_output,
             self.wo_b.weight,

@@ -168,7 +168,7 @@ def _build_graph_module(weight_names: tuple[str, ...]) -> GraphModule:
     return GraphModule(model, graph)
 
 
-def _build_grouped_einsum_graph_module(weight_name: str) -> GraphModule:
+def _build_grouped_linear_graph_module(weight_name: str) -> GraphModule:
     batch_size, seq_len, num_groups, rank, group_width = 2, 3, 4, 8, 16
     model = _DeepSeekLinearSurface()
     modname, _, attrname = weight_name.rpartition(".")
@@ -199,11 +199,15 @@ def _build_grouped_einsum_graph_module(weight_name: str) -> GraphModule:
             "tp_min_local_shape": rank,
         },
     )
-    einsum = graph.call_function(
-        torch.ops.aten.einsum.default,
-        args=("bsgd,grd->bsgr", [input_view, weight_view]),
+    output = graph.call_function(
+        torch.ops.auto_deploy.torch_grouped_linear.default,
+        args=(input_view, weight_view, None),
+        kwargs={
+            "tp_mode": "colwise",
+            "layer_type": "mla",
+            "tp_min_local_shape": rank,
+        },
     )
-    output = graph.call_method("flatten", args=(einsum, 2))
     graph.output(output)
     return GraphModule(model, graph)
 
@@ -348,9 +352,9 @@ def test_layout_config_quantizes_only_direct_finegrained_fp8_linear_paths() -> N
         assert scale_name not in buffers
 
 
-def test_layout_config_quantizes_targeted_grouped_einsum_with_ue8m0_scale_fmt() -> None:
+def test_layout_config_quantizes_targeted_grouped_linear_with_ue8m0_scale_fmt() -> None:
     weight_name = "layers.0.attn.wo_a.weight"
-    gm = _build_grouped_einsum_graph_module(weight_name)
+    gm = _build_grouped_linear_graph_module(weight_name)
     qcfg = {
         "quant_method": "fp8",
         "weight_block_size": [128, 128],
@@ -370,8 +374,7 @@ def test_layout_config_quantizes_targeted_grouped_einsum_with_ue8m0_scale_fmt() 
     assert grouped_node.kwargs["tp_mode"] == "colwise"
     assert grouped_node.kwargs["tp_min_local_shape"] == 8
     assert ShardableNode.from_node(grouped_node) is not None
-    assert not _call_function_nodes(gm, torch.ops.aten.einsum)
-    assert all(node.target != "flatten" for node in gm.graph.nodes if node.op == "call_method")
+    assert not _call_function_nodes(gm, torch.ops.auto_deploy.torch_grouped_linear)
 
     buffers = dict(gm.named_buffers())
     scale_name = weight_name.removesuffix(".weight") + ".weight_scale_inv"
@@ -379,8 +382,8 @@ def test_layout_config_quantizes_targeted_grouped_einsum_with_ue8m0_scale_fmt() 
     assert buffers[scale_name].dtype == torch.float32
 
 
-def test_layout_config_preserves_exported_positional_view_layer_type_on_grouped_einsum() -> None:
-    class _ExportedGroupedEinsum(nn.Module):
+def test_layout_config_preserves_exported_positional_view_layer_type_on_grouped_linear() -> None:
+    class _ExportedGroupedLinear(nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.layers = nn.ModuleList([nn.Module()])
@@ -396,9 +399,11 @@ def test_layout_config_preserves_exported_positional_view_layer_type_on_grouped_
                 "mla",
                 8,
             )
-            return torch.einsum("bsgd,grd->bsgr", x, weight).flatten(2)
+            return torch.ops.auto_deploy.torch_grouped_linear(
+                x, weight, None, "colwise", None, 8, "mla"
+            )
 
-    gm = torch.export.export(_ExportedGroupedEinsum(), (torch.randn(2, 3, 4, 16),)).module()
+    gm = torch.export.export(_ExportedGroupedLinear(), (torch.randn(2, 3, 4, 16),)).module()
     qcfg = {
         "quant_method": "fp8",
         "weight_block_size": [128, 128],
@@ -415,8 +420,8 @@ def test_layout_config_preserves_exported_positional_view_layer_type_on_grouped_
     assert grouped_nodes[0].kwargs["layer_type"] == "mla"
 
 
-def test_layout_config_leaves_non_targeted_grouped_einsum_untouched() -> None:
-    gm = _build_grouped_einsum_graph_module("layers.0.attn.compressor.wkv.weight")
+def test_layout_config_leaves_non_targeted_grouped_linear_untouched() -> None:
+    gm = _build_grouped_linear_graph_module("layers.0.attn.compressor.wkv.weight")
     qcfg = {
         "quant_method": "fp8",
         "weight_block_size": [128, 128],
@@ -429,8 +434,7 @@ def test_layout_config_leaves_non_targeted_grouped_einsum_untouched() -> None:
 
     assert info.num_matches == 0
     assert not _call_function_nodes(gm, grouped_op)
-    assert len(_call_function_nodes(gm, torch.ops.aten.einsum)) == 1
-    assert any(node.target == "flatten" for node in gm.graph.nodes if node.op == "call_method")
+    assert len(_call_function_nodes(gm, torch.ops.auto_deploy.torch_grouped_linear)) == 1
     assert "layers.0.attn.compressor.wkv.weight_scale_inv" not in dict(gm.named_buffers())
 
 

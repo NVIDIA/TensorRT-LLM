@@ -576,7 +576,11 @@ def _ref_indexer(
     weights = _linear_ref(hidden_states, indexer.weights_proj).float()
     weights = weights * (indexer.softmax_scale * indexer.index_n_heads**-0.5)
 
-    index_score = torch.einsum("bshd,btd->bsht", q, index_k).float()
+    index_score = torch.matmul(
+        q.transpose(1, 2),
+        index_k.transpose(1, 2).unsqueeze(1),
+    ).transpose(1, 2)
+    index_score = index_score.float()
     index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
 
     compressed_positions = torch.arange(
@@ -622,14 +626,14 @@ def _ref_sparse_attention(
     compute_dtype = torch.float32 if q.dtype in (torch.float16, torch.bfloat16) else q.dtype
     gather_idxs = topk_idxs.to(torch.long).clamp(min=0)
     selected_kv = kv[batch_idx, gather_idxs].to(compute_dtype)
-    logits = torch.einsum("bshd,bskd->bshk", q.to(compute_dtype), selected_kv)
+    logits = torch.matmul(q.to(compute_dtype), selected_kv.transpose(-1, -2))
     logits = logits * softmax_scale
     logits = logits.masked_fill((topk_idxs < 0).unsqueeze(2), float("-inf"))
 
     sink_logits = attn_sink.to(dtype=compute_dtype).view(1, 1, num_heads, 1)
     sink_logits = sink_logits.expand(batch_size, seq_len, num_heads, 1)
     weights = torch.softmax(torch.cat([logits, sink_logits], dim=-1), dim=-1)
-    output = torch.einsum("bshk,bskd->bshd", weights[..., :-1], selected_kv)
+    output = torch.matmul(weights[..., :-1], selected_kv)
     return output.to(q.dtype)
 
 
@@ -948,7 +952,9 @@ class HFDeepseekV4Attention(nn.Module):
             )
         else:
             kv_heads = kv.unsqueeze(2).expand(batch_size, seq_len, self.n_heads, self.head_dim)
-            scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), kv_heads.float())
+            q_bh = q.transpose(1, 2).float()
+            kv_bh = kv_heads.transpose(1, 2).float()
+            scores = torch.matmul(q_bh, kv_bh.transpose(-1, -2))
             scores = scores * self.softmax_scale
             query_pos = position_ids[:, :, None]
             key_pos = position_ids[:, None, :]
@@ -958,9 +964,7 @@ class HFDeepseekV4Attention(nn.Module):
             sink_logits = self.attn_sink.float().view(1, self.n_heads, 1, 1)
             sink_logits = sink_logits.expand(batch_size, self.n_heads, seq_len, 1)
             weights = torch.softmax(torch.cat([scores, sink_logits], dim=-1), dim=-1)[..., :-1]
-            attn_output = torch.einsum("bhqk,bkhd->bqhd", weights, kv_heads.float()).to(
-                hidden_states.dtype
-            )
+            attn_output = torch.matmul(weights, kv_bh).transpose(1, 2).to(hidden_states.dtype)
 
         out_nope, out_pe = torch.split(
             attn_output,
@@ -971,7 +975,11 @@ class HFDeepseekV4Attention(nn.Module):
         attn_output = torch.cat((out_nope, out_pe), dim=-1)
         attn_output = attn_output.view(batch_size, seq_len, self.n_groups, -1)
         wo_a = self.wo_a.weight.float().view(self.n_groups, self.o_lora_rank, -1)
-        attn_output = torch.einsum("bsgd,grd->bsgr", attn_output.float(), wo_a).flatten(2)
+        attn_output = torch.matmul(
+            attn_output.float().unsqueeze(-2),
+            wo_a.transpose(-1, -2),
+        ).squeeze(-2)
+        attn_output = attn_output.flatten(2)
         return _linear_ref(attn_output.to(hidden_states.dtype), self.wo_b)
 
 
@@ -1030,7 +1038,7 @@ def _ref_dense_attention(
     group_width = (num_heads * head_dim) // group_count
     out = out.reshape(bsz, seq_len, group_count, group_width)
     wo_a_weight = attn.wo_a.weight.float().view(group_count, config.o_lora_rank, group_width)
-    out = torch.einsum("bsgd,grd->bsgr", out.float(), wo_a_weight)
+    out = torch.matmul(out.float().unsqueeze(-2), wo_a_weight.transpose(-1, -2)).squeeze(-2)
     return _linear_ref(out.reshape(bsz, seq_len, group_count * config.o_lora_rank), attn.wo_b)
 
 

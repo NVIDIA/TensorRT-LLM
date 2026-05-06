@@ -755,9 +755,8 @@ def torch_fake_quant_grouped_finegrained_fp8_linear(
 ) -> torch.Tensor:
     """Grouped FineGrainedFP8 projection for flattened checkpoint weights.
 
-    Computes ``einsum("...gk,grk->...gr").flatten(-2)`` while consuming a
-    flattened checkpoint weight layout ``[G * R, K]`` and matching per-block
-    ``weight_scale_inv`` buffers.
+    Consumes a flattened checkpoint weight layout ``[G * R, K]`` and matching
+    per-block ``weight_scale_inv`` buffers.
     """
     del input_scale, input_zp, weight_zp, tp_mode, output_sizes, tp_min_local_shape, layer_type
     if input.dim() < 2:
@@ -798,7 +797,11 @@ def torch_fake_quant_grouped_finegrained_fp8_linear(
     )
     rank = out_rows // num_groups
     weight_grouped = weight_dequant.view(num_groups, rank, in_features)
-    output = torch.einsum("...gk,grk->...gr", input_dequant, weight_grouped).flatten(-2)
+    output = torch.matmul(
+        input_dequant.unsqueeze(-2),
+        weight_grouped.transpose(-1, -2),
+    ).squeeze(-2)
+    output = output.flatten(-2)
     if bias is not None:
         output = output + bias.reshape(out_rows).to(output.dtype)
     return output.to(dtype=input.dtype)
