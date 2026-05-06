@@ -839,9 +839,7 @@ def test_stacked_mxfp4_rank1_deepseek_graph_pack_loads_high_expert_slice():
     """DeepSeek graph packing emits full buffers before sharding hooks split rank 1."""
     from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
         DeepseekV4PreTrainedModel,
-    )
-    from tensorrt_llm._torch.auto_deploy.models.quant_checkpoint_layout import (
-        PackedMxfp4ExpertsCheckpointLayout,
+        build_deepseek_v4_packed_mxfp4_experts_layout,
     )
 
     base_op = _optional_auto_deploy_default("triton_mxfp4_moe")
@@ -874,16 +872,7 @@ def test_stacked_mxfp4_rank1_deepseek_graph_pack_loads_high_expert_slice():
         **raw_expert_state,
     }
 
-    layout = PackedMxfp4ExpertsCheckpointLayout(
-        expert_key_pattern=(
-            r"layers\.(?P<layer>\d+)\.ffn\.experts\.(?P<expert>\d+)\."
-            r"(?P<projection>w[123])\.(?P<kind>weight|scale)"
-        ),
-        key_template="layers.{layer}.ffn.experts.{expert}.{projection}.{kind}",
-        runtime_gate_up_order=("w3", "w1"),
-        runtime_down_projection="w2",
-        expert_block_size=32,
-    )
+    layout = build_deepseek_v4_packed_mxfp4_experts_layout()
     expected_full = layout.pack_experts(
         raw_expert_state,
         layer=layer,
@@ -924,7 +913,7 @@ def test_stacked_mxfp4_rank1_deepseek_flat_graph_pack_loads_high_expert_slice():
     """Root FX buffers are packed before sharding hooks split rank 1."""
     from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
         DeepseekV4PreTrainedModel,
-        _deepseek_v4_packed_mxfp4_experts_layout,
+        build_deepseek_v4_packed_mxfp4_experts_layout,
     )
 
     base_op = _optional_auto_deploy_default("torch_mxfp4_moe_from_routing")
@@ -942,7 +931,7 @@ def test_stacked_mxfp4_rank1_deepseek_flat_graph_pack_loads_high_expert_slice():
     raw_expert_state = _make_deepseek_mxfp4_raw_state(
         layer, num_experts, hidden_size, intermediate_size
     )
-    layout = _deepseek_v4_packed_mxfp4_experts_layout()
+    layout = build_deepseek_v4_packed_mxfp4_experts_layout()
     expected_full = layout.pack_experts(
         raw_expert_state,
         layer=layer,
@@ -1017,7 +1006,7 @@ def test_stacked_mxfp4_deepseek_flat_graph_loads_production_shaped_rank7_slice()
     """Root FX buffers load the final EP slice for 256-expert routing-driven graphs."""
     from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
         DeepseekV4PreTrainedModel,
-        _deepseek_v4_packed_mxfp4_experts_layout,
+        build_deepseek_v4_packed_mxfp4_experts_layout,
     )
 
     base_op = _optional_auto_deploy_default("torch_mxfp4_moe_from_routing")
@@ -1035,7 +1024,7 @@ def test_stacked_mxfp4_deepseek_flat_graph_loads_production_shaped_rank7_slice()
     raw_expert_state = _make_deepseek_mxfp4_raw_state(
         layer, num_experts, hidden_size, intermediate_size
     )
-    layout = _deepseek_v4_packed_mxfp4_experts_layout()
+    layout = build_deepseek_v4_packed_mxfp4_experts_layout()
     expected_full = layout.pack_experts(
         raw_expert_state,
         layer=layer,

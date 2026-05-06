@@ -1187,13 +1187,13 @@ class FineGrainedFP8LinearQuantization(Quantization):
             return
 
         layout_weight_name = weight_name
-        if weight_key != weight_name and not checkpoint_layout.is_target_weight_name(
+        if weight_key != weight_name and not checkpoint_layout.is_weight_targeted(
             layout_weight_name
         ):
             layout_weight_name = weight_key
 
-        source_name = checkpoint_layout.checkpoint_scale_name(layout_weight_name)
-        target_name = checkpoint_layout.scale_target_name(layout_weight_name)
+        source_name = checkpoint_layout.scale_name_for_weight(layout_weight_name)
+        target_name = checkpoint_layout.runtime_scale_name_for_weight(layout_weight_name)
         scale_key = self._add_prefix(active_prefix, source_name)
         if scale_key not in state_dict and source_name in state_dict:
             scale_key = source_name
@@ -1202,11 +1202,11 @@ class FineGrainedFP8LinearQuantization(Quantization):
 
         target_key = self._add_prefix(active_prefix, target_name)
         scale = state_dict[scale_key]
-        checkpoint_layout.validate_weight_scale_shape(
+        checkpoint_layout.validate_scale_shape(
             weight_key,
-            weight,
+            weight.shape,
             scale_key,
-            scale,
+            scale.shape,
         )
         decoded_scale = checkpoint_layout.decode_scale(scale)
         if scale_key != target_key:

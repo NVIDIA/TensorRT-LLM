@@ -23,9 +23,8 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
     DeepseekV4Config,
     DeepseekV4ForCausalLM,
     DeepseekV4MoE,
-)
-from tensorrt_llm._torch.auto_deploy.models.quant_checkpoint_layout import (
-    PackedMxfp4ExpertsCheckpointLayout,
+    DeepseekV4PackedMxfp4ExpertsCheckpointLayout,
+    build_deepseek_v4_packed_mxfp4_experts_layout,
 )
 
 HIDDEN_SIZE = 64
@@ -54,16 +53,8 @@ _E2M1_VALUES = torch.tensor(
 )
 
 
-def _layout() -> PackedMxfp4ExpertsCheckpointLayout:
-    return PackedMxfp4ExpertsCheckpointLayout(
-        expert_key_pattern=(
-            r"layers\.(?P<layer>\d+)\.ffn\.experts\.(?P<expert>\d+)\."
-            r"(?P<projection>w[123])\.(?P<tensor_kind>weight|scale)"
-        ),
-        runtime_gate_up_order=("w3", "w1"),
-        runtime_down_projection="w2",
-        expert_block_size=32,
-    )
+def _layout() -> DeepseekV4PackedMxfp4ExpertsCheckpointLayout:
+    return build_deepseek_v4_packed_mxfp4_experts_layout()
 
 
 def _small_deepseek_v4_config(**overrides: object) -> DeepseekV4Config:
@@ -581,7 +572,9 @@ def test_deepseek_v4_mxfp4_runtime_buffers_are_shape_complete_for_export() -> No
     )
 
 
-def test_deepseek_v4_remap_hook_finds_mxfp4_loader_under_non_iterable_layers() -> None:
+def test_deepseek_v4_remap_hook_loads_packed_mxfp4_runtime_buffers_under_non_iterable_layers() -> (
+    None
+):
     layer = 0
     source_state = {
         name: tensor

@@ -28,12 +28,11 @@ from typing import Any, Callable, Dict, Optional, Tuple, Type
 
 from .._compat import is_modelopt_quant_config, read_modelopt_quant_config
 from ..utils.logger import ad_logger
+from .checkpoint_metadata import has_safetensors_metadata, read_safetensors_metadata
 from .quant_checkpoint_layout import (
     QuantCheckpointLayoutRegistry,
     QuantizedCheckpointLayout,
     QuantizedCheckpointLayoutError,
-    has_safetensors_metadata,
-    read_safetensors_metadata,
 )
 
 
@@ -248,10 +247,10 @@ class HFQuantConfigReader(QuantConfigReader):
                 raise QuantizedCheckpointLayoutError(
                     "HF quantized checkpoint layout requires checkpoint_tensor_metadata."
                 )
-            layout.validate_consumed_metadata(tensor_metadata)
+            layout.validate_checkpoint_metadata(tensor_metadata)
             self._quant_config = layout.apply_to_quant_config(qconf)
             self._hf_quantizer = None
-            return layout.model_kwargs()
+            return dict(layout.extra_model_kwargs)
 
         # Inject default exclusion, add "model.embed_tokens" for "tie_word_embedding:true" case
         excludes = qconf.get("exclude_modules", [])

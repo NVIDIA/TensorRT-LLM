@@ -17,8 +17,9 @@ import torch
 import torch.nn.functional as F
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
-from tensorrt_llm._torch.auto_deploy.models.quant_checkpoint_layout import (
-    PackedMxfp4ExpertsCheckpointLayout,
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
+    DeepseekV4PackedMxfp4ExpertsCheckpointLayout,
+    build_deepseek_v4_packed_mxfp4_experts_layout,
 )
 from tensorrt_llm._torch.auto_deploy.transform.interface import Stages
 from tensorrt_llm._torch.auto_deploy.transform.library.mxfp4_moe import (
@@ -89,16 +90,8 @@ def _make_mxfp4_checkpoint_weight(
     return dense, blocks.reshape(shape[0], shape[1] // 2), scales
 
 
-def _deepseek_layout() -> PackedMxfp4ExpertsCheckpointLayout:
-    return PackedMxfp4ExpertsCheckpointLayout(
-        expert_key_pattern=(
-            r"layers\.(?P<layer>\d+)\.ffn\.experts\.(?P<expert>\d+)\."
-            r"(?P<projection>w[123])\.(?P<tensor_kind>weight|scale)"
-        ),
-        runtime_gate_up_order=("w3", "w1"),
-        runtime_down_projection="w2",
-        expert_block_size=32,
-    )
+def _deepseek_layout() -> DeepseekV4PackedMxfp4ExpertsCheckpointLayout:
+    return build_deepseek_v4_packed_mxfp4_experts_layout()
 
 
 def _deepseek_expert_key(layer: int, expert: int, projection: str, tensor_kind: str) -> str:

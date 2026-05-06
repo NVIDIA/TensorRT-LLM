@@ -21,10 +21,12 @@ from pathlib import Path
 
 import pytest
 
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
+    DeepseekV4PackedMxfp4ExpertsCheckpointLayout,
+)
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm._torch.auto_deploy.models.quant_checkpoint_layout import (
     FineGrainedFP8CheckpointLayout,
-    PackedMxfp4ExpertsCheckpointLayout,
     QuantCheckpointLayoutRegistry,
     QuantizedCheckpointLayout,
 )
@@ -167,7 +169,10 @@ def _write_safetensors_header(path: Path, tensor_metadata: dict[str, dict[str, o
 def _assert_deepseek_v4_checkpoint_layout(checkpoint_layout: object) -> None:
     assert isinstance(checkpoint_layout, QuantizedCheckpointLayout)
     assert isinstance(checkpoint_layout.finegrained_fp8, FineGrainedFP8CheckpointLayout)
-    assert isinstance(checkpoint_layout.packed_mxfp4_experts, PackedMxfp4ExpertsCheckpointLayout)
+    assert any(
+        isinstance(consumer, DeepseekV4PackedMxfp4ExpertsCheckpointLayout)
+        for consumer in checkpoint_layout.checkpoint_consumers
+    )
 
 
 def _deepseek_v4_flash_checkpoint_or_skip() -> Path:

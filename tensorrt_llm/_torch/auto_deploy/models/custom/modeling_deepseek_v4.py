@@ -28,7 +28,7 @@ import operator
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, ClassVar, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -43,11 +43,12 @@ from ..._compat import ActivationType
 from ..factory import ModelFactoryRegistry
 from ..hf import AutoModelForCausalLMFactory
 from ..quant_checkpoint_layout import (
+    CheckpointMetadata,
     FineGrainedFP8CheckpointLayout,
-    PackedMxfp4ExpertsCheckpointLayout,
     QuantCheckpointLayoutRegistry,
     QuantizedCheckpointLayout,
     QuantizedCheckpointLayoutError,
+    TensorMetadata,
 )
 
 
@@ -199,13 +200,19 @@ _DEEPSEEK_V4_EXCLUDED_MODULES = (
     "*.attn_sink",
     "mtp.*",
 )
-_DEEPSEEK_V4_MXFP4_EXPERT_PATTERN = (
+
+_E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", None)
+
+_DEEPSEEK_V4_MXFP4_EXPERT_RE = re.compile(
     r"layers\.(?P<layer>\d+)\.ffn\.experts\.(?P<expert>\d+)\."
     r"(?P<projection>w[123])\.(?P<kind>weight|scale)"
 )
-_DEEPSEEK_V4_MXFP4_EXPERT_TEMPLATE = "layers.{layer}.ffn.experts.{expert}.{projection}.{kind}"
-_DEEPSEEK_V4_MXFP4_LAYER_NAME_PATTERN = r"(?:^|[._])layers[._](?P<layer>\d+)[._]ffn[._]"
-_DEEPSEEK_V4_MXFP4_RUNTIME_BUFFER_SUFFIXES = (
+_DEEPSEEK_V4_MXFP4_KEY_TEMPLATE = "layers.{layer}.ffn.experts.{expert}.{projection}.{kind}"
+_DEEPSEEK_V4_MXFP4_LAYER_NAME_RE = re.compile(r"(?:^|[._])layers[._](?P<layer>\d+)[._]ffn[._]")
+_DEEPSEEK_V4_MXFP4_PROJECTIONS = ("w1", "w2", "w3")
+_DEEPSEEK_V4_MXFP4_GATE_UP_ORDER = ("w3", "w1")
+_DEEPSEEK_V4_MXFP4_DOWN_PROJECTION = "w2"
+DEEPSEEK_V4_MXFP4_RUNTIME_BUFFER_SUFFIXES = (
     "gate_up_proj_blocks",
     "gate_up_proj_scales",
     "down_proj_blocks",
@@ -213,18 +220,505 @@ _DEEPSEEK_V4_MXFP4_RUNTIME_BUFFER_SUFFIXES = (
 )
 
 
-def _deepseek_v4_packed_mxfp4_experts_layout(
-    scale_fmt: str = "ue8m0",
-) -> PackedMxfp4ExpertsCheckpointLayout:
-    return PackedMxfp4ExpertsCheckpointLayout(
-        expert_key_pattern=_DEEPSEEK_V4_MXFP4_EXPERT_PATTERN,
-        key_template=_DEEPSEEK_V4_MXFP4_EXPERT_TEMPLATE,
-        runtime_gate_up_order=("w3", "w1"),
-        runtime_down_projection="w2",
-        expert_block_size=32,
-        scale_fmt=scale_fmt,
-        layer_name_pattern=_DEEPSEEK_V4_MXFP4_LAYER_NAME_PATTERN,
+@dataclass(frozen=True)
+class DeepseekV4PackedExpertTensorKey:
+    """Parsed DeepSeek V4 packed expert tensor key."""
+
+    layer: int
+    expert: int
+    projection: str
+    tensor_kind: str
+
+
+@dataclass(frozen=True)
+class DeepseekV4PackedMxfp4Experts:
+    """DeepSeek V4 packed MXFP4 expert tensors in runtime layout."""
+
+    gate_up_blocks: torch.Tensor
+    gate_up_scales: torch.Tensor
+    down_blocks: torch.Tensor
+    down_scales: torch.Tensor
+    expert_indices: tuple[int, ...]
+    hidden_size: int
+    intermediate_size: int
+
+
+@dataclass(frozen=True)
+class DeepseekV4PackedMxfp4ExpertsCheckpointLayout:
+    """Checkpoint layout for DeepSeek V4 packed MXFP4 routed expert tensors."""
+
+    expert_block_size: ClassVar[int] = 32
+    weight_dtypes: ClassVar[tuple[str, ...]] = ("I8",)
+    scale_dtype: ClassVar[str] = "F8_E8M0"
+    quant_method: ClassVar[str] = "mxfp4"
+
+    def parse_key(self, name: str) -> DeepseekV4PackedExpertTensorKey | None:
+        match = _DEEPSEEK_V4_MXFP4_EXPERT_RE.fullmatch(name)
+        if match is None:
+            return None
+        return DeepseekV4PackedExpertTensorKey(
+            layer=int(match.group("layer")),
+            expert=int(match.group("expert")),
+            projection=match.group("projection"),
+            tensor_kind=match.group("kind"),
+        )
+
+    def layer_from_runtime_name(self, name: str) -> int | None:
+        match = _DEEPSEEK_V4_MXFP4_LAYER_NAME_RE.search(name)
+        if match is None:
+            return None
+        return int(match.group("layer"))
+
+    def validate_checkpoint_metadata(self, tensor_metadata: CheckpointMetadata) -> int:
+        parsed_metadata: dict[tuple[int, int, str], dict[str, TensorMetadata]] = {}
+        expert_projections: dict[tuple[int, int], set[str]] = {}
+        for name, metadata in tensor_metadata.items():
+            parsed = self.parse_key(name)
+            if parsed is None:
+                continue
+            if not isinstance(metadata, Mapping):
+                raise QuantizedCheckpointLayoutError(f"Invalid metadata for tensor {name}.")
+            key = (parsed.layer, parsed.expert, parsed.projection)
+            parsed_metadata.setdefault(key, {})[parsed.tensor_kind] = metadata
+            expert_projections.setdefault((parsed.layer, parsed.expert), set()).add(
+                parsed.projection
+            )
+
+        for (layer, expert, projection), tensors in parsed_metadata.items():
+            weight_name = self.format_key(layer, expert, projection, "weight")
+            scale_name = self.format_key(layer, expert, projection, "scale")
+            weight_metadata = tensors.get("weight")
+            scale_metadata = tensors.get("scale")
+            if not isinstance(weight_metadata, Mapping):
+                raise QuantizedCheckpointLayoutError(
+                    f"{scale_name} is missing companion weight {weight_name}."
+                )
+            if not isinstance(scale_metadata, Mapping):
+                raise QuantizedCheckpointLayoutError(
+                    f"{weight_name} is missing companion scale {scale_name}."
+                )
+            self._validate_weight_metadata(weight_name, weight_metadata)
+            self._validate_scale_metadata(weight_name, weight_metadata, scale_name, scale_metadata)
+
+        for (layer, expert), projections in expert_projections.items():
+            for projection in _required_projection_names():
+                if projection in projections:
+                    continue
+                weight_name = self.format_key(layer, expert, projection, "weight")
+                scale_name = self.format_key(layer, expert, projection, "scale")
+                raise QuantizedCheckpointLayoutError(
+                    "Packed MXFP4 expert metadata is missing required projection "
+                    f"{projection} for layer {layer}, expert {expert}: "
+                    f"{weight_name} and {scale_name}."
+                )
+
+        if not parsed_metadata:
+            raise QuantizedCheckpointLayoutError(
+                "Checkpoint metadata has no packed MXFP4 expert tensors."
+            )
+        return len(parsed_metadata)
+
+    def format_key(self, layer: int, expert: int, projection: str, tensor_kind: str) -> str:
+        return _DEEPSEEK_V4_MXFP4_KEY_TEMPLATE.format(
+            layer=layer,
+            expert=expert,
+            projection=projection,
+            kind=tensor_kind,
+        )
+
+    def pack_experts(
+        self,
+        state_dict: Mapping[str, torch.Tensor],
+        *,
+        layer: int,
+        hidden_size: int,
+        intermediate_size: int,
+        expert_indices: Sequence[int] | None = None,
+        num_experts: int | None = None,
+    ) -> DeepseekV4PackedMxfp4Experts:
+        layer = _validate_nonnegative_int("layer", layer)
+        hidden_size = _validate_positive_divisible_by(
+            "hidden_size", hidden_size, self.expert_block_size
+        )
+        intermediate_size = _validate_positive_divisible_by(
+            "intermediate_size", intermediate_size, self.expert_block_size
+        )
+
+        expert_tensors = self._collect_expert_tensors(state_dict, layer)
+        expert_order = _normalize_expert_order(
+            expert_tensors,
+            expert_indices=expert_indices,
+            num_experts=num_experts,
+        )
+
+        gate_up_blocks = []
+        gate_up_scales = []
+        down_blocks = []
+        down_scales = []
+        for expert in expert_order:
+            expert_map = self._get_required_expert_map(expert_tensors, layer, expert)
+            gate_up_blocks.append(
+                torch.cat(
+                    [
+                        self._load_weight_blocks(
+                            expert_map,
+                            layer,
+                            expert,
+                            projection,
+                            expected_shape=(intermediate_size, hidden_size // 2),
+                            packed_shape=self._packed_shape(intermediate_size, hidden_size),
+                        )
+                        for projection in _DEEPSEEK_V4_MXFP4_GATE_UP_ORDER
+                    ],
+                    dim=0,
+                )
+            )
+            gate_up_scales.append(
+                torch.cat(
+                    [
+                        self._load_scales(
+                            expert_map,
+                            layer,
+                            expert,
+                            projection,
+                            expected_shape=(
+                                intermediate_size,
+                                hidden_size // self.expert_block_size,
+                            ),
+                        )
+                        for projection in _DEEPSEEK_V4_MXFP4_GATE_UP_ORDER
+                    ],
+                    dim=0,
+                )
+            )
+            down_blocks.append(
+                self._load_weight_blocks(
+                    expert_map,
+                    layer,
+                    expert,
+                    _DEEPSEEK_V4_MXFP4_DOWN_PROJECTION,
+                    expected_shape=(hidden_size, intermediate_size // 2),
+                    packed_shape=self._packed_shape(hidden_size, intermediate_size),
+                )
+            )
+            down_scales.append(
+                self._load_scales(
+                    expert_map,
+                    layer,
+                    expert,
+                    _DEEPSEEK_V4_MXFP4_DOWN_PROJECTION,
+                    expected_shape=(hidden_size, intermediate_size // self.expert_block_size),
+                )
+            )
+
+        return DeepseekV4PackedMxfp4Experts(
+            gate_up_blocks=torch.stack(gate_up_blocks, dim=0),
+            gate_up_scales=torch.stack(gate_up_scales, dim=0),
+            down_blocks=torch.stack(down_blocks, dim=0),
+            down_scales=torch.stack(down_scales, dim=0),
+            expert_indices=expert_order,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        )
+
+    def load_runtime_buffers(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        *,
+        layer: int,
+        hidden_size: int,
+        intermediate_size: int,
+        target_gate_up_blocks: str,
+        target_gate_up_scales: str,
+        target_down_blocks: str,
+        target_down_scales: str,
+        expert_indices: Sequence[int] | None = None,
+        num_experts: int | None = None,
+    ) -> None:
+        source_state = _strip_prefix_from_state_dict(state_dict, prefix)
+        packed = self.pack_experts(
+            source_state,
+            layer=layer,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            expert_indices=expert_indices,
+            num_experts=num_experts,
+        )
+        for source_key in self._source_keys_for_packed_experts(layer, packed.expert_indices):
+            state_dict.pop(prefix + source_key, None)
+        state_dict[prefix + target_gate_up_blocks] = packed.gate_up_blocks
+        state_dict[prefix + target_gate_up_scales] = packed.gate_up_scales
+        state_dict[prefix + target_down_blocks] = packed.down_blocks
+        state_dict[prefix + target_down_scales] = packed.down_scales
+
+    def _collect_expert_tensors(
+        self,
+        state_dict: Mapping[str, torch.Tensor],
+        layer: int,
+    ) -> dict[int, dict[str, dict[str, torch.Tensor]]]:
+        expert_tensors: dict[int, dict[str, dict[str, torch.Tensor]]] = {}
+        for name, tensor in state_dict.items():
+            parsed = self.parse_key(name)
+            if parsed is None or parsed.layer != layer:
+                continue
+            if not isinstance(tensor, torch.Tensor):
+                raise QuantizedCheckpointLayoutError(f"{name} should be a torch.Tensor.")
+            weight_tensors = expert_tensors.setdefault(parsed.expert, {})
+            tensor_kinds = weight_tensors.setdefault(parsed.projection, {})
+            tensor_kinds[parsed.tensor_kind] = tensor
+        return expert_tensors
+
+    def _get_required_expert_map(
+        self,
+        expert_tensors: Mapping[int, dict[str, dict[str, torch.Tensor]]],
+        layer: int,
+        expert: int,
+    ) -> dict[str, dict[str, torch.Tensor]]:
+        expert_map = expert_tensors.get(expert)
+        if expert_map is None:
+            first_missing = self.format_key(
+                layer, expert, _DEEPSEEK_V4_MXFP4_GATE_UP_ORDER[0], "weight"
+            )
+            raise QuantizedCheckpointLayoutError(f"Missing packed MXFP4 tensor {first_missing}.")
+        return expert_map
+
+    def _load_weight_blocks(
+        self,
+        expert_map: Mapping[str, Mapping[str, torch.Tensor]],
+        layer: int,
+        expert: int,
+        projection: str,
+        *,
+        expected_shape: tuple[int, int],
+        packed_shape: tuple[int, int, int],
+    ) -> torch.Tensor:
+        name = self.format_key(layer, expert, projection, "weight")
+        tensor = self._get_required_tensor(expert_map, layer, expert, projection, "weight")
+        _validate_tensor_shape(name, tensor, expected_shape)
+        return self._reinterpret_weight_as_uint8(name, tensor).view(packed_shape)
+
+    def _load_scales(
+        self,
+        expert_map: Mapping[str, Mapping[str, torch.Tensor]],
+        layer: int,
+        expert: int,
+        projection: str,
+        *,
+        expected_shape: tuple[int, int],
+    ) -> torch.Tensor:
+        name = self.format_key(layer, expert, projection, "scale")
+        tensor = self._get_required_tensor(expert_map, layer, expert, projection, "scale")
+        _validate_tensor_shape(name, tensor, expected_shape)
+        return self._reinterpret_scale_as_uint8(name, tensor).view(expected_shape)
+
+    def _get_required_tensor(
+        self,
+        expert_map: Mapping[str, Mapping[str, torch.Tensor]],
+        layer: int,
+        expert: int,
+        projection: str,
+        tensor_kind: str,
+    ) -> torch.Tensor:
+        tensor = expert_map.get(projection, {}).get(tensor_kind)
+        if tensor is None:
+            name = self.format_key(layer, expert, projection, tensor_kind)
+            raise QuantizedCheckpointLayoutError(f"Missing packed MXFP4 tensor {name}.")
+        return tensor
+
+    def _packed_shape(self, rows: int, logical_cols: int) -> tuple[int, int, int]:
+        return (rows, logical_cols // self.expert_block_size, self.expert_block_size // 2)
+
+    def _source_keys_for_packed_experts(
+        self, layer: int, expert_indices: Sequence[int]
+    ) -> tuple[str, ...]:
+        return tuple(
+            self.format_key(layer, expert, projection, tensor_kind)
+            for expert in expert_indices
+            for projection in _required_projection_names()
+            for tensor_kind in ("weight", "scale")
+        )
+
+    def _validate_weight_metadata(self, name: str, metadata: TensorMetadata) -> None:
+        dtype = _get_dtype(name, metadata)
+        if dtype not in self.weight_dtypes:
+            raise QuantizedCheckpointLayoutError(
+                f"{name} should be packed FP4 with dtype {self.weight_dtypes}, got {dtype}."
+            )
+        _require_2d(name, _get_shape(name, metadata))
+
+    def _validate_scale_metadata(
+        self,
+        weight_name: str,
+        weight_metadata: TensorMetadata,
+        scale_name: str,
+        scale_metadata: TensorMetadata,
+    ) -> None:
+        dtype = _get_dtype(scale_name, scale_metadata)
+        if dtype != self.scale_dtype:
+            raise QuantizedCheckpointLayoutError(
+                f"{scale_name} should be {self.scale_dtype} scale, got {dtype}."
+            )
+        weight_shape = _get_shape(weight_name, weight_metadata)
+        _require_2d(weight_name, weight_shape)
+        expected = [weight_shape[0], math.ceil(weight_shape[1] * 2 / self.expert_block_size)]
+        shape = _get_shape(scale_name, scale_metadata)
+        if shape != expected:
+            raise QuantizedCheckpointLayoutError(
+                f"{scale_name} has shape {shape}, expected {expected} for packed FP4 {weight_name}."
+            )
+
+    def _reinterpret_weight_as_uint8(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.dtype not in (torch.int8, torch.uint8):
+            raise QuantizedCheckpointLayoutError(
+                f"{name} should be packed FP4 bytes with dtype torch.int8 or torch.uint8, "
+                f"got {tensor.dtype}."
+            )
+        return _view_as_uint8(tensor)
+
+    def _reinterpret_scale_as_uint8(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.dtype == torch.uint8 or (_E8M0_DTYPE is not None and tensor.dtype == _E8M0_DTYPE):
+            return _view_as_uint8(tensor)
+        expected = "torch.uint8"
+        if _E8M0_DTYPE is not None:
+            expected += " or torch.float8_e8m0fnu"
+        raise QuantizedCheckpointLayoutError(
+            f"{name} should contain raw E8M0 scale bytes with dtype {expected}, got {tensor.dtype}."
+        )
+
+
+def build_deepseek_v4_packed_mxfp4_experts_layout() -> DeepseekV4PackedMxfp4ExpertsCheckpointLayout:
+    return DeepseekV4PackedMxfp4ExpertsCheckpointLayout()
+
+
+def _required_projection_names() -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys((*_DEEPSEEK_V4_MXFP4_GATE_UP_ORDER, _DEEPSEEK_V4_MXFP4_DOWN_PROJECTION))
     )
+
+
+def _strip_prefix_from_state_dict(
+    state_dict: Mapping[str, torch.Tensor], prefix: str
+) -> dict[str, torch.Tensor]:
+    if not prefix:
+        return dict(state_dict)
+    return {
+        key.removeprefix(prefix): tensor
+        for key, tensor in state_dict.items()
+        if key.startswith(prefix)
+    }
+
+
+def _get_dtype(name: str, metadata: TensorMetadata) -> str:
+    dtype = metadata.get("dtype")
+    if not isinstance(dtype, str) or not dtype:
+        raise QuantizedCheckpointLayoutError(f"Tensor {name} is missing dtype metadata.")
+    return dtype.upper()
+
+
+def _get_shape(name: str, metadata: TensorMetadata) -> list[int]:
+    shape = metadata.get("shape")
+    if not isinstance(shape, Sequence) or isinstance(shape, str):
+        raise QuantizedCheckpointLayoutError(f"Tensor {name} is missing shape metadata.")
+    try:
+        return [int(dim) for dim in shape]
+    except (TypeError, ValueError) as error:
+        raise QuantizedCheckpointLayoutError(
+            f"Tensor {name} has invalid shape metadata {shape}."
+        ) from error
+
+
+def _require_2d(name: str, shape: Sequence[int]) -> None:
+    if len(shape) != 2:
+        raise QuantizedCheckpointLayoutError(
+            f"Tensor {name} should be 2D, got shape {list(shape)}."
+        )
+
+
+def _validate_tensor_shape(
+    name: str, tensor: torch.Tensor, expected_shape: tuple[int, int]
+) -> None:
+    actual_shape = tuple(tensor.shape)
+    if actual_shape != expected_shape:
+        raise QuantizedCheckpointLayoutError(
+            f"{name} has shape {list(actual_shape)}, expected {list(expected_shape)}."
+        )
+
+
+def _view_as_uint8(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.dtype == torch.uint8 and tensor.is_contiguous():
+        return tensor
+    return tensor.contiguous().view(torch.uint8)
+
+
+def _normalize_expert_order(
+    expert_tensors: Mapping[int, object],
+    *,
+    expert_indices: Sequence[int] | None,
+    num_experts: int | None,
+) -> tuple[int, ...]:
+    if num_experts is not None:
+        num_experts = _validate_positive_int("num_experts", num_experts)
+
+    if expert_indices is None:
+        if num_experts is not None:
+            expert_order = tuple(range(num_experts))
+        else:
+            expert_order = tuple(sorted(expert_tensors))
+    else:
+        expert_order = tuple(
+            _validate_nonnegative_int("expert_indices", idx) for idx in expert_indices
+        )
+
+    if not expert_tensors:
+        raise QuantizedCheckpointLayoutError("No packed MXFP4 routed expert tensors were found.")
+    if not expert_order:
+        raise QuantizedCheckpointLayoutError("No packed MXFP4 expert indices were selected.")
+    if len(set(expert_order)) != len(expert_order):
+        raise QuantizedCheckpointLayoutError(
+            f"expert_indices should not contain duplicates, got {expert_order}."
+        )
+    if num_experts is not None:
+        invalid_indices = [expert for expert in expert_order if expert >= num_experts]
+        if invalid_indices:
+            raise QuantizedCheckpointLayoutError(
+                f"expert_indices should be less than num_experts={num_experts}, got {invalid_indices}."
+            )
+    return expert_order
+
+
+def _validate_positive_divisible_by(name: str, value: int, divisor: int) -> int:
+    value = _validate_positive_int(name, value)
+    if value % divisor != 0:
+        raise QuantizedCheckpointLayoutError(
+            f"{name} should be divisible by {divisor}, got {value}."
+        )
+    return value
+
+
+def _validate_positive_int(name: str, value: int) -> int:
+    value = _validate_int(name, value)
+    if value <= 0:
+        raise QuantizedCheckpointLayoutError(f"{name} should be positive, got {value}.")
+    return value
+
+
+def _validate_nonnegative_int(name: str, value: int) -> int:
+    value = _validate_int(name, value)
+    if value < 0:
+        raise QuantizedCheckpointLayoutError(f"{name} should be non-negative, got {value}.")
+    return value
+
+
+def _validate_int(name: str, value: int) -> int:
+    if isinstance(value, bool):
+        raise QuantizedCheckpointLayoutError(f"{name} should be an integer, got {value}.")
+    try:
+        return operator.index(value)
+    except TypeError as error:
+        raise QuantizedCheckpointLayoutError(
+            f"{name} should be an integer, got {type(value).__name__}."
+        ) from error
 
 
 def _deepseek_v4_scale_fmt(qconf: Mapping[str, object]) -> str:
@@ -284,6 +778,7 @@ def _build_deepseek_v4_checkpoint_layout(
         return None
     scale_fmt = _deepseek_v4_scale_fmt(qconf)
     weight_block_size = _deepseek_v4_weight_block_size(qconf)
+    expert_layout = build_deepseek_v4_packed_mxfp4_experts_layout()
 
     return QuantizedCheckpointLayout(
         finegrained_fp8=FineGrainedFP8CheckpointLayout(
@@ -296,8 +791,12 @@ def _build_deepseek_v4_checkpoint_layout(
             runtime_scale_name="weight_scale_inv",
             scale_fmt=scale_fmt,
         ),
-        packed_mxfp4_experts=_deepseek_v4_packed_mxfp4_experts_layout(scale_fmt),
+        checkpoint_consumers=(expert_layout,),
         extra_model_kwargs={"ad_use_mxfp4_experts": True},
+        extra_quant_config={
+            "expert_quant_method": expert_layout.quant_method,
+            "expert_block_size": expert_layout.expert_block_size,
+        },
     )
 
 
@@ -868,7 +1367,7 @@ class DeepseekV4MoE(nn.Module):
         if not self.ad_use_mxfp4_experts:
             return
 
-        layout = _deepseek_v4_packed_mxfp4_experts_layout()
+        layout = build_deepseek_v4_packed_mxfp4_experts_layout()
         has_layer_expert_tensor = False
         for name in state_dict:
             parsed = layout.parse_key(name)
@@ -1421,10 +1920,10 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
         module: nn.Module,
         state_dict: dict[str, torch.Tensor],
     ) -> None:
-        layout = _deepseek_v4_packed_mxfp4_experts_layout()
+        layout = build_deepseek_v4_packed_mxfp4_experts_layout()
         buffer_groups: dict[str, dict[str, torch.Tensor]] = {}
         for buffer_name, tensor in module.named_buffers():
-            for suffix in _DEEPSEEK_V4_MXFP4_RUNTIME_BUFFER_SUFFIXES:
+            for suffix in DEEPSEEK_V4_MXFP4_RUNTIME_BUFFER_SUFFIXES:
                 if not buffer_name.endswith(suffix):
                     continue
                 target_prefix = buffer_name[: -len(suffix)]
