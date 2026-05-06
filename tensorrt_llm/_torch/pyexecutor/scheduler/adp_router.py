@@ -115,8 +115,7 @@ class RankState:
             raise ValueError("RankState payload is missing required field rank")
         if len(values) > max_field_count:
             raise ValueError(
-                f"RankState payload has {len(values)} fields, expected at most "
-                f"{max_field_count}"
+                f"RankState payload has {len(values)} fields, expected at most {max_field_count}"
             )
         rank_values = values[:rank_state_prefix_field_count]
         for field_info in rank_state_fields[len(rank_values) :]:
@@ -130,9 +129,7 @@ class RankState:
             rank=rank_values[0],
             num_active_requests=rank_values[1],
             num_active_tokens=rank_values[2],
-            iter_stats=RankIterStatsPayload.deserialize(
-                values[rank_state_prefix_field_count:]
-            ),
+            iter_stats=RankIterStatsPayload.deserialize(values[rank_state_prefix_field_count:]),
         )
 
 

@@ -87,11 +87,7 @@ class _StubRequest:
 
     @property
     def is_dummy(self) -> bool:
-        return (
-            self.is_attention_dp_dummy
-            or self.is_cuda_graph_dummy
-            or self.is_dummy_request
-        )
+        return self.is_attention_dp_dummy or self.is_cuda_graph_dummy or self.is_dummy_request
 
     def get_num_tokens(self, beam: int = 0) -> int:
         return self._num_tokens

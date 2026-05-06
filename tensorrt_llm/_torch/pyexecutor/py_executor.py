@@ -1196,10 +1196,10 @@ class PyExecutor:
 
         def is_stats_dummy_request(req) -> bool:
             return bool(
-                getattr(req, "is_dummy", False) or
-                getattr(req, "is_attention_dp_dummy", False) or
-                getattr(req, "is_cuda_graph_dummy", False) or
-                getattr(req, "is_dummy_request", False))
+                getattr(req, "is_dummy", False)
+                or getattr(req, "is_attention_dp_dummy", False)
+                or getattr(req, "is_cuda_graph_dummy", False)
+                or getattr(req, "is_dummy_request", False))
 
         # Attention-DP may add dummy requests to keep ranks aligned during
         # distributed scheduling. CUDA graph padding can add dummies too.
@@ -1215,9 +1215,9 @@ class PyExecutor:
             num_gen_requests = sum(
                 1 for req in scheduled_batch.generation_requests
                 if not is_stats_dummy_request(req))
-            num_paused_requests = sum(
-                1 for req in scheduled_batch.paused_requests
-                if not is_stats_dummy_request(req))
+            num_paused_requests = sum(1
+                                      for req in scheduled_batch.paused_requests
+                                      if not is_stats_dummy_request(req))
         else:
             num_context_requests = scheduled_batch.num_context_requests
             num_gen_requests = scheduled_batch.num_generation_requests
@@ -1489,18 +1489,18 @@ class PyExecutor:
 
         stats = IterationStats()
         for attr in (
-            "timestamp",
-            "iter",
-            "iter_latency_ms",
-            "new_active_requests_queue_latency_ms",
-            "num_new_active_requests",
-            "num_active_requests",
-            "num_queued_requests",
-            "num_completed_requests",
-            "max_num_active_requests",
-            "gpu_mem_usage",
-            "cpu_mem_usage",
-            "pinned_mem_usage",
+                "timestamp",
+                "iter",
+                "iter_latency_ms",
+                "new_active_requests_queue_latency_ms",
+                "num_new_active_requests",
+                "num_active_requests",
+                "num_queued_requests",
+                "num_completed_requests",
+                "max_num_active_requests",
+                "gpu_mem_usage",
+                "cpu_mem_usage",
+                "pinned_mem_usage",
         ):
             setattr(stats, attr, getattr(rank0_stats, attr))
 
@@ -1592,8 +1592,7 @@ class PyExecutor:
                 return
 
             req_stats = self._pending_adp_req_stats.get(iter_stats_iter)
-            kv_iter_stats = self._pending_adp_kv_iter_stats.get(
-                iter_stats_iter)
+            kv_iter_stats = self._pending_adp_kv_iter_stats.get(iter_stats_iter)
 
             for rank_state in sorted(matching_states, key=lambda s: s.rank):
                 rank = rank_state.rank
@@ -3153,12 +3152,10 @@ class PyExecutor:
             # When iteration stats are enabled, piggyback this rank's oldest
             # pending payload and use the gathered states below to fan out or
             # clear stats once every rank is aligned.
-            iter_stats_payload = (
-                self._next_adp_iter_stats_payload()
-                if self.enable_iter_perf_stats else None)
+            iter_stats_payload = (self._next_adp_iter_stats_payload()
+                                  if self.enable_iter_perf_stats else None)
             all_rank_states = self.adp_router.gather_all_rank_states(
-                active_requests,
-                iter_stats_payload=iter_stats_payload)
+                active_requests, iter_stats_payload=iter_stats_payload)
             if self.enable_iter_perf_stats:
                 self._finalize_pending_adp_iter_stats(all_rank_states)
             all_ranks_num_active_requests = [
