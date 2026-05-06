@@ -50,10 +50,17 @@ For each file under `tests/` in the diff:
    (bidirectional pytest-tree lineage) for each anchor; matches feed
    `block_filters`. For non-`test_*.py` paths, the lookup walks up
    enclosing directories to the narrowest YAML-covered ancestor — so
-   `accuracy/references/mmlu.yaml` lifts to `accuracy/`,
    `disaggregated/test_configs/foo.yaml` lifts to `disaggregated/`,
    `unittest/api_stability/references/llmapi.yaml` lifts to
    `unittest/api_stability/`.
+
+`accuracy/references/*.yaml` gets a finer-grained refinement: each
+top-level YAML key is a HF model name, mapped (via AST scan of
+`accuracy/test_*.py` for `MODEL_NAME = "<hf>"` literals) to test
+classes. A diff under `meta-llama/Llama-3.1-8B-Instruct:` narrows to
+`accuracy/test_*.py::TestLlama3_1_8BInstruct` rather than the whole
+`accuracy/` subtree. Models with no matching test class fall back to
+the dir-level anchor.
 
 Outcomes:
 

@@ -43,6 +43,9 @@ from .base import PRInputs, Rule, RuleResult
 # common.py, …) are too broad to narrow usefully and trigger fallback.
 BLAST_RADIUS_FRACTION = 0.8
 
+ACCURACY_REFS_PREFIX = "tests/integration/defs/accuracy/references/"
+ACCURACY_DIR = "tests/integration/defs/accuracy"
+
 
 def _map_lines_to_pytest_scopes(content: str, line_numbers: set[int]) -> Optional[set[str]]:
     """Resolve each line to its enclosing pytest scope.
@@ -93,6 +96,23 @@ def _is_perf_stem(stem: str) -> bool:
     return stem == "l0_perf" or "perf_sanity" in stem
 
 
+def _yaml_top_keys_for_lines(content: str, line_numbers: set[int]) -> set[str]:
+    """Return the set of top-level YAML keys whose section contains any line in `line_numbers`.
+
+    A "top-level key" is an unindented line of the form `<key>:`
+    (optional trailing comment).
+    """
+    keys: list[Optional[str]] = []
+    current: Optional[str] = None
+    for raw in content.splitlines():
+        if raw and not raw[0].isspace() and not raw.lstrip().startswith("#"):
+            stripped = raw.split("#", 1)[0].rstrip()
+            if stripped.endswith(":"):
+                current = stripped[:-1].strip().strip("'\"")
+        keys.append(current)
+    return {keys[i - 1] for i in line_numbers if 1 <= i <= len(keys) and keys[i - 1]}
+
+
 class TestsDefRule(Rule):
     name = "testdef"
     needs_diff_for: tuple[str, ...] = ("tests/**/*",)
@@ -112,8 +132,12 @@ class TestsDefRule(Rule):
         """Return lookup anchors for one file.
 
         File-level fallback when no diff, file unreadable, AST parse
-        fails, or any line is module-level.
+        fails, or any line is module-level. accuracy/references/*.yaml
+        diffs are refined to per-test-class anchors via the model-name
+        mapping in `_compute_accuracy_reference_anchors`.
         """
+        if git_path.startswith(ACCURACY_REFS_PREFIX) and git_path.endswith((".yaml", ".yml")):
+            return self._compute_accuracy_reference_anchors(git_path, yaml_path, diff)
         if not diff:
             return [yaml_path]
         try:
@@ -127,6 +151,69 @@ class TestsDefRule(Rule):
         if scopes is None:
             return [yaml_path]
         return [f"{yaml_path}::{s}" for s in sorted(scopes)]
+
+    def _compute_accuracy_reference_anchors(
+        self, git_path: str, yaml_path: str, diff: str
+    ) -> list[str]:
+        """Map a `references/<dataset>.yaml` diff to per-class anchors.
+
+        Each top-level YAML key is a HF model name; map those to test
+        classes via the `MODEL_NAME = "<hf>"` literal in
+        `accuracy/test_*.py`. Class-level anchors let
+        `find_match_for_path`'s lineage walk match every parametrization
+        of those classes. Falls back to `[yaml_path]` (→ dir walk-up to
+        `accuracy/`) when refinement isn't possible.
+        """
+        if not diff:
+            return [yaml_path]
+        line_numbers = iter_diff_post_line_numbers(diff)
+        if not line_numbers:
+            return [yaml_path]
+        try:
+            content = (self._repo_root / git_path).read_text(encoding="utf-8")
+        except OSError:
+            return [yaml_path]
+        changed_models = _yaml_top_keys_for_lines(content, line_numbers)
+        if not changed_models:
+            return [yaml_path]
+        model_map = self._accuracy_model_to_classes()
+        anchors = sorted({a for m in changed_models for a in model_map.get(m, ())})
+        return anchors or [yaml_path]
+
+    def _accuracy_model_to_classes(self) -> dict[str, list[str]]:
+        """Cached: HF model name → list of `accuracy/test_X.py::ClassName`.
+
+        Built by AST-scanning `accuracy/test_*.py` for `class TestX:` with
+        a literal `MODEL_NAME = "<hf>"` assignment.
+        """
+        cached = getattr(self, "_acc_model_map", None)
+        if cached is not None:
+            return cached
+        out: dict[str, list[str]] = {}
+        acc_dir = self._repo_root / ACCURACY_DIR
+        if acc_dir.is_dir():
+            for py in sorted(acc_dir.glob("test_*.py")):
+                try:
+                    tree = ast.parse(py.read_text(encoding="utf-8"))
+                except (OSError, SyntaxError):
+                    continue
+                rel = f"accuracy/{py.name}"
+                for node in tree.body:
+                    if not isinstance(node, ast.ClassDef) or not node.name.startswith("Test"):
+                        continue
+                    for child in node.body:
+                        if not isinstance(child, ast.Assign):
+                            continue
+                        if not any(
+                            isinstance(t, ast.Name) and t.id == "MODEL_NAME" for t in child.targets
+                        ):
+                            continue
+                        v = child.value
+                        if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                            out.setdefault(v.value, []).append(f"{rel}::{node.name}")
+                            break
+        self._acc_model_map = out
+        return out
 
     def apply(self, pr: PRInputs) -> Optional[RuleResult]:
         candidates = [f for f in pr.changed_files if f.startswith("tests/")]
