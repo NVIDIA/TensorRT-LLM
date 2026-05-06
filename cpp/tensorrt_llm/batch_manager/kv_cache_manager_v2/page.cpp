@@ -390,6 +390,10 @@ std::vector<SharedPageLock> batchedLockToGpu(KvCache& kvCache, std::vector<Batch
 {
     auto storeMgr = kvCache.storageManager().lock();
     assert(storeMgr);
+    // All pages must belong to the same storage manager.
+    assert(targets.empty()
+        || std::all_of(targets.begin(), targets.end(),
+            [&](auto const& t) { return t.page->manager.lock().get() == storeMgr.get(); }));
 
     // Determine how many GPU slots are needed per pool group.
     std::vector<int> requirements(static_cast<size_t>(storeMgr->numPoolGroups()), 0);
