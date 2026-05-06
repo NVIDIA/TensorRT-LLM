@@ -1011,7 +1011,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, compress_ratio):
         num_contexts=batch_size,
         num_generations=0,
         seq_lens=context_lens_context.clone(),
-        kv_lens=num_ctx_kv_tokens.clone(),
+        kv_lens=context_lens_context.clone(),
         num_cached_tokens=[0] * batch_size,
         cache_manager=cache_manager,
         num_ctx_tokens=total_context_tokens,
@@ -1036,7 +1036,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, compress_ratio):
         num_contexts=0,
         num_generations=batch_size,
         seq_lens=torch.tensor([num_gen_tokens] * batch_size, dtype=torch.int32, device="cpu"),
-        kv_lens=final_kv_lens.clone(),
+        kv_lens=final_lens.clone(),
         num_cached_tokens=context_lens_context.tolist(),
         cache_manager=cache_manager,
         num_ctx_tokens=0,
@@ -1058,7 +1058,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, compress_ratio):
 
     if not metadata_gen.use_expanded_buffers_for_mtp:
         q_fp8 = q_fp8
-        context_lens = metadata_gen.kv_lens_cuda_runtime[0:batch_size]
+        context_lens = metadata_gen.gen_indexer_kv_lens_cuda_runtime
         block_table = metadata_gen.indexer_k_cache_block_offsets[0:batch_size]
         if q_fp8.shape[1] == 4:
             scheduler_metadata_buffer = metadata_gen.scheduler_metadata_buffer_mtp3
@@ -1125,7 +1125,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, compress_ratio):
         gen_offset += seq_gen_len
 
     num_tokens_cuda = final_lens.cuda()
-    num_kv_tokens_cuda = metadata_gen.kv_lens_cuda_runtime
+    num_kv_tokens_cuda = final_kv_lens.cuda()
     ref_logits = _ref_fp8_paged_mqa_logits(
         q,
         kv_cache_bf16,

@@ -361,6 +361,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     compress_ratios: List[int] = [1]
     # Number of compressed KV tokens for context requests
     num_ctx_kv_tokens: int = 0
+    gen_indexer_kv_lens_cuda_runtime: Optional[torch.Tensor] = None
 
     def __init__(self, *args, **kwargs):
         self.num_sms = tensorrt_llm.deep_gemm.get_num_sms()
@@ -546,6 +547,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 out=self.gen_cached_token_indptr[1:self.num_generations + 1])
             gen_kv_lens = self.kv_lens_cuda[self.num_contexts:self.num_seqs]
             gen_indexer_kv_lens = self.get_indexer_kv_lens(gen_kv_lens)
+            self.gen_indexer_kv_lens_cuda_runtime = gen_indexer_kv_lens
             scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
                 gen_indexer_kv_lens, self._tokens_per_block, self.num_sms)
             self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
@@ -1553,6 +1555,7 @@ class Indexer(nn.Module):
             gen_seq_lens = metadata.get_indexer_kv_lens(
                 metadata.kv_lens_cuda_runtime[num_contexts:num_contexts +
                                               num_generations])
+            metadata.gen_indexer_kv_lens_cuda_runtime = gen_seq_lens
             scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
                 gen_seq_lens, tokens_per_block, metadata.num_sms)
             metadata.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
@@ -1919,9 +1922,8 @@ class Indexer(nn.Module):
             # and expand the corresponding metadata.
             if not metadata.use_expanded_buffers_for_mtp or next_n == 1:
                 q_decode = q_decode.view(num_generations, -1, *q_fp8.shape[1:])
-                raw_context_lens = metadata.kv_lens_cuda_runtime[
-                    num_contexts:num_contexts + num_generations]
-                context_lens = metadata.get_indexer_kv_lens(raw_context_lens)
+                context_lens = metadata.gen_indexer_kv_lens_cuda_runtime
+                assert context_lens is not None
                 block_table = metadata.indexer_k_cache_block_offsets[
                     num_contexts:num_contexts + num_generations]
                 if q_decode.shape[1] == 4:
