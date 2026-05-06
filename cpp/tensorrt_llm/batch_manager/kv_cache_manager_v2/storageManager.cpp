@@ -198,6 +198,7 @@ void StorageManager::destroy()
     for (auto& lvl : mLevels)
         if (lvl.storage)
             lvl.storage->destroy();
+    mLevels.clear();
 }
 
 // ---------------------------------------------------------------------------
