@@ -813,19 +813,10 @@ std::vector<KvCache::TakenPage> KvCache::_takeUncommittedPage(
 void KvCache::_commitBlock(int ord, bool isLast)
 {
     assert(mCommitState == CommitState::ALLOWED);
+    assert(ord == mNumCommittedBlocks);
 
     auto& sb = mBlocks.at(static_cast<size_t>(ord));
-
-    if (sb.isCommitted())
-    {
-        ++mNumCommittedBlocks;
-        if (isLast)
-        {
-            mCommitState = CommitState::USER_STOP;
-            _onStopCommitting();
-        }
-        return;
-    }
+    assert(sb.pages.size() == 1 && "Must have 1 beam only");
 
     // Build token block — always slice up to tokens_per_block; is_full tells us
     // whether we got a full block's worth.  Mirrors Python's:
@@ -870,6 +861,9 @@ void KvCache::_commitBlock(int ord, bool isLast)
         blockIsNew = false;
     }
     assert(newBlock);
+    assert(newBlock->tokensPerBlock() == mTokensPerBlock);
+    // In reuse case, verify token match (mirrors Python: tree_block.tokens[:num_tokens] == tokens).
+    assert(blockIsNew || std::equal(tokenBlock.begin(), tokenBlock.end(), newBlock->tokens.begin()));
 
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
 
