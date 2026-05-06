@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End-to-end test for the standalone auto_deploy package.
+"""End-to-end test for the standalone llmc package.
 
 This test:
 1. Runs create_standalone_package.py to generate the standalone package
@@ -35,7 +35,9 @@ import textwrap
 import pytest
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
-CREATE_SCRIPT = os.path.join(REPO_ROOT, "examples", "auto_deploy", "create_standalone_package.py")
+CREATE_SCRIPT = os.path.join(
+    REPO_ROOT, "examples", "auto_deploy", "llmc", "create_standalone_package.py"
+)
 
 
 def _find_uv():
@@ -107,19 +109,19 @@ class TestStandalonePackage:
         result = _run_isolated(
             standalone_package,
             """
-            from auto_deploy._compat import TRTLLM_AVAILABLE
+            from llmc._compat import TRTLLM_AVAILABLE
             assert not TRTLLM_AVAILABLE, f"Got {TRTLLM_AVAILABLE}"
             print("OK")
             """,
         )
         assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
 
-    def test_import_auto_deploy(self, standalone_package):
-        """The full auto_deploy module should import."""
+    def test_import_llmc(self, standalone_package):
+        """The full llmc module should import."""
         result = _run_isolated(
             standalone_package,
             """
-            import auto_deploy
+            import llmc
             print("OK")
             """,
         )
@@ -131,7 +133,7 @@ class TestStandalonePackage:
             standalone_package,
             """
             import torch
-            import auto_deploy
+            import llmc
             ops = [n for n in dir(torch.ops.auto_deploy) if not n.startswith('_')]
             assert len(ops) > 0, f"No ops: {ops}"
             print(f"{len(ops)} ops")
@@ -144,10 +146,10 @@ class TestStandalonePackage:
         result = _run_isolated(
             standalone_package,
             """
-            from auto_deploy._compat import (
+            from llmc._compat import (
                 ActivationType, KvCacheConfig, str_dtype_to_torch,
             )
-            from auto_deploy.utils.dist_config import DistConfig
+            from llmc.utils.dist_config import DistConfig
             import torch
             assert ActivationType.Silu == 4
             assert KvCacheConfig().tokens_per_block == 32
@@ -161,7 +163,7 @@ class TestStandalonePackage:
     def test_run_unit_tests(self, standalone_package):
         """Run the copied unit tests from the standalone package's tests/ dir.
 
-        Tests have been import-rewritten to use `auto_deploy` instead of
+        Tests have been import-rewritten to use `llmc` instead of
         `tensorrt_llm._torch.auto_deploy`, so they run directly against the
         standalone package.
         """
@@ -173,8 +175,8 @@ class TestStandalonePackage:
             pytest.skip("No tests directory in standalone package")
 
         # Pass through the host env but override PYTHONPATH to use standalone tests.
-        # The venv's pip install already put auto_deploy in the venv's site-packages,
-        # so `import auto_deploy` resolves there (not to the host TRT-LLM).
+        # The venv's pip install already put llmc in the venv's site-packages,
+        # so `import llmc` resolves there (not to the host TRT-LLM).
         standalone_env = {
             **os.environ,
             "PYTHONPATH": tests_dir + os.pathsep + os.path.join(tests_dir, "_utils_test"),

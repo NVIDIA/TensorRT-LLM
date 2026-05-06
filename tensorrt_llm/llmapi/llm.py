@@ -38,7 +38,7 @@ from ..executor.utils import (RequestError, create_mpi_comm_session,
                               get_spawn_proxy_process_env)
 from ..inputs import (PromptInputs, create_input_processor,
                       create_input_processor_with_hash, get_cache_salt_id,
-                      prompt_inputs)
+                      maybe_compute_mm_embed_cumsum, prompt_inputs)
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from ..scheduling_params import SchedulingParams
@@ -150,8 +150,7 @@ class PreprocessedInputs:
 
 
 class BaseLLM:
-    """
-    The base class for all LLM classes.
+    """The base class for all LLM classes.
     """
 
     def __init__(self,
@@ -244,11 +243,11 @@ class BaseLLM:
             if not self.mpi_session:
                 mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
                 if not mpi_process_pre_spawned:
-                    logger_debug(f"LLM create MpiPoolSession\n", "yellow")
+                    logger_debug("LLM create MpiPoolSession\n", "yellow")
                     self.mpi_session = MpiPoolSession(
                         n_workers=self.args.parallel_config.world_size)
                 else:
-                    logger_debug(f"LLM create MpiCommSession\n", "yellow")
+                    logger_debug("LLM create MpiCommSession\n", "yellow")
                     self.mpi_session = create_mpi_comm_session(
                         self.args.parallel_config.world_size)
 
@@ -619,6 +618,11 @@ class BaseLLM:
                     mrope_config[
                         "mrope_position_deltas"] = disaggregated_params.mrope_position_deltas_handle
                     multimodal_data["mrope_config"] = mrope_config
+                # Backfill multimodal_embed_mask_cumsum so downstream chunked-prefill
+                # logic can slice the pre-computed embeddings correctly.
+                maybe_compute_mm_embed_cumsum(
+                    prompt_token_ids, {"multimodal_data": multimodal_data},
+                    cast(BaseMultimodalInputProcessor, self.input_processor))
                 multimodal_params = MultimodalParams(
                     multimodal_input=multimodal_input,
                     multimodal_data=multimodal_data,
@@ -669,6 +673,9 @@ class BaseLLM:
                     BaseMultimodalInputProcessor,
                     self.input_processor).attach_multimodal_embeddings(
                         inputs, mm_embedding_info, sampling_params)
+                maybe_compute_mm_embed_cumsum(
+                    prompt_token_ids, extra_processed_inputs,
+                    cast(BaseMultimodalInputProcessor, self.input_processor))
             else:
                 with nvtx_range_debug("input_processor"):
                     prompt_token_ids, extra_processed_inputs = self.input_processor(
@@ -730,7 +737,7 @@ class BaseLLM:
 
         Returns:
             tensorrt_llm.llmapi.llm.PreprocessedInputs: A preprocessed-inputs object that can be
-                passed directly to :meth:`generate_async` as ``inputs``.
+                passed directly to :meth:`generate_async` as `inputs`.
         """
         sampling_params = self._prepare_sampling_params(sampling_params)
         prompt_token_ids, _prompt, query_token_ids, multimodal_params = (
@@ -875,7 +882,7 @@ class BaseLLM:
 
     @set_api_status("beta")
     def get_stats(self, timeout: Optional[float] = 2) -> List[dict]:
-        '''Get iteration statistics from the runtime.
+        """Get iteration statistics from the runtime.
         To collect statistics, call this function after prompts have been submitted with LLM().generate().
 
         Args:
@@ -884,7 +891,7 @@ class BaseLLM:
         Returns:
             List[dict]: A list of runtime stats as dicts.
                 e.g., [{"cpuMemUsage": ..., "iter": 0, ...}, {"cpuMemUsage": ..., "iter": 1, ...}]
-        '''
+        """
         if self._encode_only:
             raise RuntimeError(
                 "get_stats() is not available when encode_only=True. "
@@ -893,7 +900,7 @@ class BaseLLM:
 
     @set_api_status("beta")
     def get_stats_async(self, timeout: Optional[float] = 2) -> IterationResult:
-        '''Get iteration statistics from the runtime.
+        """Get iteration statistics from the runtime.
         To collect statistics, you can call this function in an async coroutine or the /metrics endpoint (if you're using trtllm-serve)
         after prompts have been submitted.
 
@@ -902,7 +909,7 @@ class BaseLLM:
 
         Returns:
             tensorrt_llm.executor.result.IterationResult: An async iterable object containing runtime stats.
-        '''
+        """
         if self._encode_only:
             raise RuntimeError(
                 "get_stats_async() is not available when encode_only=True. "
@@ -911,7 +918,7 @@ class BaseLLM:
 
     @set_api_status("beta")
     def get_kv_cache_events(self, timeout: Optional[float] = 2) -> List[dict]:
-        '''Get iteration KV events from the runtime.
+        """Get iteration KV events from the runtime.
 
         KV events are used to track changes and operations within the KV Cache. Types of events:
             - KVCacheCreatedData: Indicates the creation of cache blocks.
@@ -928,7 +935,7 @@ class BaseLLM:
 
         Returns:
             List[dict]: A list of runtime events as dict.
-        '''
+        """
         if self._encode_only:
             raise RuntimeError("get_kv_cache_events() is not available when "
                                "encode_only=True.")
@@ -938,7 +945,7 @@ class BaseLLM:
     def get_kv_cache_events_async(self,
                                   timeout: Optional[float] = 2
                                   ) -> IterationResult:
-        '''Get iteration KV events from the runtime.
+        """Get iteration KV events from the runtime.
 
         KV events are used to track changes and operations within the KV Cache. Types of events:
             - KVCacheCreatedData: Indicates the creation of cache blocks.
@@ -955,7 +962,7 @@ class BaseLLM:
 
         Returns:
             tensorrt_llm.executor.result.IterationResult: An async iterable object containing runtime events.
-        '''
+        """
         if self._encode_only:
             raise RuntimeError(
                 "get_kv_cache_events_async() is not available when "
@@ -1209,7 +1216,7 @@ class _TrtLLM(BaseLLM):
     """LLM class is the main class for running a LLM model using TensorRT LLM backend.
 
     Parameters:
-"""
+    """
 
     def __init__(self,
                  model: Union[str, Path],
@@ -1398,7 +1405,7 @@ class _TorchLLM(BaseLLM):
     """LLM class is the main class for running a LLM model using PyTorch backend.
 
     Parameters:
-"""
+    """
 
     def __init__(self,
                  model: Union[str, Path],
@@ -1439,8 +1446,7 @@ class _TorchLLM(BaseLLM):
             non_block: bool = False,
             unique_reply_rank: Optional[int] = None,
             target_ranks: int | list[int] | None = None) -> list[Any]:
-        """
-        Execute an RPC call on all GPU workers. Currently, this is only supported for RayExecutor.
+        """Execute an RPC call on all GPU workers. Currently, this is only supported for RayExecutor.
 
         Args:
             method (str): The name of the worker method to execute.
@@ -1582,7 +1588,7 @@ class LLM(_TorchLLM):
 
 # sphinx will ignore the LLM's docstring if it is not explicitly set
 LLM.__doc__ = \
-    f"""LLM class is the main class for running a LLM model.
+    """LLM class is the main class for running a LLM model.
 
     For more details about the arguments, please refer to :class:`TorchLlmArgs`.
 
