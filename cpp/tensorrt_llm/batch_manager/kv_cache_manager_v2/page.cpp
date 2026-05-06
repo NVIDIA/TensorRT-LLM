@@ -350,8 +350,11 @@ std::shared_ptr<Page> SharedPageLock::unlock()
     assert(mUniqLock);
 
     // Record finish event from the KvCache stream.
-    if (auto kvc = mUser.kvCache.lock())
-        mUniqLock->notifyFinish(kvc->finishEvent());
+    // Python uses unwrap_rawref() which crashes on dead weak ref — match that by throwing LogicError.
+    auto kvc = mUser.kvCache.lock();
+    if (!kvc)
+        throw LogicError("SharedPageLock::unlock: KvCache already destroyed (lifecycle ordering bug)");
+    mUniqLock->notifyFinish(kvc->finishEvent());
 
     releasePageIndex();
     auto p = page(); // copy shared_ptr before reset
@@ -361,22 +364,25 @@ std::shared_ptr<Page> SharedPageLock::unlock()
 
 void SharedPageLock::acquirePageIndex()
 {
-    if (auto kvc = mUser.kvCache.lock())
-    {
-        auto& pg = *page();
-        int old = kvc->updateBasePageIndex(mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, pg.slotId());
-        // Mirrors Python assertion: old base index must be BAD (prevents double-locking same slot).
-        assert(old == kBadPageIndex && "Double-lock: page index already acquired for this (beam, ordinal, lc)");
-        (void) old;
-    }
+    auto kvc = mUser.kvCache.lock();
+    if (!kvc)
+        throw LogicError("SharedPageLock::acquirePageIndex: KvCache already destroyed (lifecycle ordering bug)");
+    auto& pg = *page();
+    int old = kvc->updateBasePageIndex(mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, pg.slotId());
+    // Mirrors Python assertion: old base index must be BAD (prevents double-locking same slot).
+    assert(old == kBadPageIndex && "Double-lock: page index already acquired for this (beam, ordinal, lc)");
+    (void) old;
 }
 
 void SharedPageLock::releasePageIndex()
 {
-    if (auto kvc = mUser.kvCache.lock())
-    {
-        kvc->updateBasePageIndex(mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, /*BAD=*/-1);
-    }
+    auto kvc = mUser.kvCache.lock();
+    if (!kvc)
+        throw LogicError("SharedPageLock::releasePageIndex: KvCache already destroyed (lifecycle ordering bug)");
+    int oldBaseIndex = kvc->updateBasePageIndex(mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, /*BAD=*/-1);
+    // Mirrors Python assertion: old base index must match this page's slot ID.
+    assert(oldBaseIndex == page()->slotId());
+    (void) oldBaseIndex;
 }
 
 // ---------------------------------------------------------------------------
