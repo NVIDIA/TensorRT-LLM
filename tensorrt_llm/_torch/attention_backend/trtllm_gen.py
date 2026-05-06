@@ -909,10 +909,15 @@ class FlashInferTrtllmGenAttention:
     def _get_kv_cache_metadata(self, is_mla_enable: bool) -> Tuple[int, int]:
         """Return (kv_factor, total_num_blocks) for building KV cache views."""
         kv_factor = 1 if is_mla_enable else 2
+        blocks_in_primary_pool = getattr(self._kv_cache_manager, "blocks_in_primary_pool", None)
+        if blocks_in_primary_pool is None:
+            blocks_per_window = getattr(self._kv_cache_manager, "blocks_per_window", None)
+            if blocks_per_window:
+                blocks_in_primary_pool = max(
+                    int(primary) for primary, _ in blocks_per_window.values()
+                )
         total_num_blocks = (
-            self._kv_cache_manager.blocks_in_primary_pool
-            * self._kv_cache_manager.num_local_layers
-            * kv_factor
+            int(blocks_in_primary_pool) * self._kv_cache_manager.num_local_layers * kv_factor
         )
         return kv_factor, total_num_blocks
 
