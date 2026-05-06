@@ -1547,18 +1547,22 @@ def test_llm_context_only_timed_out(transceiver_runtime):
                                disaggregated_params=disaggregated_params):
         print(output)
 
+    # Wait until the context-only request has allocated KV cache blocks
     max_retries = 10
+    all_results = []
     for _ in range(max_retries):
         results = llm.get_stats(2)
-        if len(results) == 1:
+        all_results.extend(results)
+        if all_results and all_results[-1]["kvCacheStats"]["usedNumBlocks"] > 0:
             break
         time.sleep(1)
     else:
         pytest.fail(
-            f"Failed to get stats with len==1 after {max_retries} retries")
+            f"Context-only KV cache blocks not allocated after {max_retries} retries"
+        )
+    results = all_results
 
-    assert len(results) == 1
-    context_only_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
+    context_only_used_num_blocks = results[-1]["kvCacheStats"]["usedNumBlocks"]
     print(f"Context only used num blocks: {context_only_used_num_blocks}")
 
     # Sleep 5 seconds to allow context only request to time out
@@ -1568,11 +1572,21 @@ def test_llm_context_only_timed_out(transceiver_runtime):
     for output in llm.generate(prompts0, sampling_params=sampling_params):
         print(output)
 
-    # Get number of allocated blocks
-    results = llm.get_stats(2)
-    assert len(results) == 1
-    final_used_num_blocks = results[0]["kvCacheStats"]["usedNumBlocks"]
+    # Wait until KV cache blocks are released (usedNumBlocks == 0)
+    max_retries = 10
+    all_results = []
+    for _ in range(max_retries):
+        results = llm.get_stats(2)
+        all_results.extend(results)
+        if all_results and all_results[-1]["kvCacheStats"]["usedNumBlocks"] == 0:
+            break
+        time.sleep(1)
+    else:
+        pytest.fail(
+            f"KV cache blocks not released after {max_retries} retries")
+    results = all_results
 
+    final_used_num_blocks = results[-1]["kvCacheStats"]["usedNumBlocks"]
     assert final_used_num_blocks == 0
 
 
