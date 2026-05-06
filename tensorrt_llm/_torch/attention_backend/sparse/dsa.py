@@ -243,6 +243,18 @@ def split_prefill_chunks(
     return chunk_groups
 
 
+def _select_indexer_compress_ratio(compress_ratios: List[int]) -> int:
+    if 4 in compress_ratios:
+        return 4
+    if 1 in compress_ratios:
+        return 1
+    return 0
+
+
+def _effective_compress_ratio_divisor(compress_ratio: int) -> int:
+    return compress_ratio if compress_ratio > 1 else 1
+
+
 def compute_cu_seqlen_kv_bounds_with_cache(
     seq_lens: torch.Tensor,
     num_contexts: int,
@@ -388,11 +400,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # (tokens_per_block // compress_ratio), so slot mappings must be built
         # against that stride — not kv_cache_manager.tokens_per_block directly.
         tpb = self.kv_cache_manager.tokens_per_block
-        self._indexer_compress_ratio = 1
+        self._indexer_compress_ratio = _select_indexer_compress_ratio(
+            self.compress_ratios)
         if hasattr(self.kv_cache_manager, 'compressed_block_sizes'):
-            compress_ratio = 4 if 4 in self.compress_ratios else 1
-            self._indexer_compress_ratio = compress_ratio
-            tpb = tpb // compress_ratio
+            tpb = tpb // _effective_compress_ratio_divisor(
+                self._indexer_compress_ratio)
         self._tokens_per_block = tpb
 
         self.create_buffers_for_mla_rope_append(capture_graph=capture_graph)
@@ -438,11 +450,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         Indexer.prepare(metadata=self)
 
     def get_indexer_kv_lens(self, kv_lens: torch.Tensor) -> torch.Tensor:
-        if self._indexer_compress_ratio == 1:
+        if self._indexer_compress_ratio <= 1:
             return kv_lens
         return kv_lens // self._indexer_compress_ratio
 
     def get_indexer_max_seq_len(self) -> int:
+        if self._indexer_compress_ratio <= 1:
+            return self.kv_cache_manager.max_seq_len
         return max(
             1,
             self.kv_cache_manager.max_seq_len // self._indexer_compress_ratio)
@@ -1254,8 +1268,8 @@ class Indexer(nn.Module):
         Note: Cached token counts are derived from metadata.host_ctx_cached_token_indptr
         """
         device = metadata.cu_seqlen_ks.device
-        # Only support compression ratio of 4 and 1 for now
-        compress_ratio = 4 if 4 in metadata.compress_ratios else 1
+        compress_ratio = _effective_compress_ratio_divisor(
+            _select_indexer_compress_ratio(metadata.compress_ratios))
         if len(chunk_specs) == 1:
             # Single request or intra-request Q-block
             req_idx, token_start_in_req, token_end_in_req, req_cum_start = chunk_specs[
@@ -1586,8 +1600,8 @@ class Indexer(nn.Module):
         head_dim = metadata.indexer_head_dim
         quant_block_size = metadata.indexer_quant_block_size
         num_past_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
-        # Only support compression ratio of 4 and 1 for now
-        compress_ratio = 4 if 4 in metadata.compress_ratios else 1
+        compress_ratio = _effective_compress_ratio_divisor(
+            _select_indexer_compress_ratio(metadata.compress_ratios))
 
         indexer_params = IndexerParams(
             num_contexts=num_contexts,

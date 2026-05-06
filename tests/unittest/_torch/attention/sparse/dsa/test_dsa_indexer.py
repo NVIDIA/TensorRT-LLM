@@ -22,6 +22,8 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     DSACacheManager,
     DSAtrtllmAttentionMetadata,
     Indexer,
+    _effective_compress_ratio_divisor,
+    _select_indexer_compress_ratio,
     compute_cu_seqlen_kv_bounds_with_cache,
     split_prefill_chunks,
 )
@@ -432,9 +434,9 @@ def _create_mock_metadata(
             # Effective tokens-per-block for the indexer k-cache slot mapping,
             # mirroring DSAtrtllmAttentionMetadata.__post_init__ (dsa.py).
             tpb = self.kv_cache_manager.tokens_per_block
+            self._indexer_compress_ratio = _select_indexer_compress_ratio(self.compress_ratios)
             if hasattr(self.kv_cache_manager, "compressed_block_sizes"):
-                _cr = 4 if 4 in self.compress_ratios else 1
-                tpb = tpb // _cr
+                tpb = tpb // _effective_compress_ratio_divisor(self._indexer_compress_ratio)
             self._tokens_per_block = tpb
             self.kv_lens_cuda_runtime = kv_lens.cuda()
             self.indexer_k_cache_block_offsets = torch.zeros(
@@ -619,6 +621,22 @@ def _create_mock_metadata(
             return self._num_seqs
 
     return MockMetadata()
+
+
+@pytest.mark.parametrize("disabled_ratio", [0, 1])
+def test_indexer_compress_ratio_zero_or_one_means_uncompressed(disabled_ratio):
+    metadata = object.__new__(DSAtrtllmAttentionMetadata)
+    metadata.kv_cache_manager = Mock()
+    metadata.kv_cache_manager.max_seq_len = 4096
+
+    kv_lens = torch.tensor([0, 1, 128, 4096], dtype=torch.int32)
+    metadata._indexer_compress_ratio = disabled_ratio
+    assert torch.equal(metadata.get_indexer_kv_lens(kv_lens), kv_lens)
+    assert metadata.get_indexer_max_seq_len() == 4096
+
+    metadata._indexer_compress_ratio = 4
+    assert torch.equal(metadata.get_indexer_kv_lens(kv_lens), kv_lens // 4)
+    assert metadata.get_indexer_max_seq_len() == 1024
 
 
 def validate_topk_indices(topk_indices_0, topk_indices_1, total_tokens):
