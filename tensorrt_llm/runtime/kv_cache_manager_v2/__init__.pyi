@@ -149,7 +149,10 @@ class KVCacheManagerConfig:
 
 # From _block_radix_tree.py
 def gen_multi_modal_tokens(
-    id_offset: int, multi_modal_data_digest: bytes, num_tokens: int
+    id_offset: int,
+    multi_modal_data_digest: bytes,
+    num_tokens: int,
+    token_offset: int = 0,
 ) -> list[TokenIdExt]: ...
 
 # From _core/_kv_cache.py

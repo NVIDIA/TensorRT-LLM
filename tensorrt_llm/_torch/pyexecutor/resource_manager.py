@@ -90,13 +90,10 @@ class Role:
 
 
 class _MmRunMetadata(NamedTuple):
-    item_run_cu_seqlen: torch.Tensor
     run_positions: torch.Tensor
-    run_lengths: torch.Tensor
     run_ends: torch.Tensor
     run_item_indices: torch.Tensor
     run_item_offsets: torch.Tensor
-    item_lengths: torch.Tensor
 
 
 def _hash_to_digest(hash_ints: Sequence[int]) -> bytes:
@@ -113,7 +110,7 @@ def _as_int64_cpu_tensor(values: Sequence[int] | torch.Tensor) -> torch.Tensor:
 
 
 def _resolve_multimodal_run_metadata(
-        req: LlmRequest, item_count: int) -> Optional[_MmRunMetadata]:
+        req: LlmRequest) -> Optional[_MmRunMetadata]:
     # NOTE: the following optional fields help in exact mm token position mixing in blockhash key generation
     item_run_cu_seqlen = getattr(req, "multimodal_item_run_cu_seqlen", None)
     run_positions = getattr(req, "multimodal_run_positions", None)
@@ -137,37 +134,19 @@ def _resolve_multimodal_run_metadata(
     cumulative_run_lengths = torch.cat(
         (torch.zeros(1, dtype=torch.int64), torch.cumsum(run_lengths, dim=0)))
     item_starts = item_run_cu_seqlen[:-1]
-    item_ends = item_run_cu_seqlen[1:]
-    item_lengths = cumulative_run_lengths[item_ends] - cumulative_run_lengths[
-        item_starts]
     run_item_indices = torch.repeat_interleave(
-        torch.arange(item_count, dtype=torch.int64), item_run_counts)
+        torch.arange(item_run_counts.numel(), dtype=torch.int64),
+        item_run_counts)
     run_item_offsets = (cumulative_run_lengths[:-1] -
                         cumulative_run_lengths[item_starts][run_item_indices])
     run_ends = run_positions + run_lengths
 
     return _MmRunMetadata(
-        item_run_cu_seqlen=item_run_cu_seqlen,
         run_positions=run_positions,
-        run_lengths=run_lengths,
         run_ends=run_ends,
         run_item_indices=run_item_indices,
         run_item_offsets=run_item_offsets,
-        item_lengths=item_lengths,
     )
-
-
-def _copy_token_spans(result: list[TokenIdExt],
-                      source_tokens: Sequence[TokenIdExt],
-                      result_offsets: torch.Tensor,
-                      source_offsets: torch.Tensor,
-                      lengths: torch.Tensor) -> None:
-    for result_offset, source_offset, length in zip(result_offsets.tolist(),
-                                                    source_offsets.tolist(),
-                                                    lengths.tolist(),
-                                                    strict=True):
-        result[result_offset:result_offset +
-               length] = source_tokens[source_offset:source_offset + length]
 
 
 def _augment_tokens_with_mm_run_metadata(vocab_size: int,
@@ -181,29 +160,31 @@ def _augment_tokens_with_mm_run_metadata(vocab_size: int,
     if overlap_run_indices.numel() == 0:
         return result
 
-    overlap_item_indices = torch.unique_consecutive(
-        metadata.run_item_indices[overlap_run_indices])
+    overlap_run_item_indices = metadata.run_item_indices[overlap_run_indices]
+    overlap_item_indices = torch.unique_consecutive(overlap_run_item_indices)
     for item_idx in overlap_item_indices.tolist():
-        item_run_start = metadata.item_run_cu_seqlen[item_idx].item()
-        item_run_end = metadata.item_run_cu_seqlen[item_idx + 1].item()
-        item_overlap_run_indices = overlap_run_indices[
-            (overlap_run_indices >= item_run_start)
-            & (overlap_run_indices < item_run_end)]
+        item_overlap_run_indices = overlap_run_indices[overlap_run_item_indices
+                                                       == item_idx]
 
-        mm_tokens = gen_multi_modal_tokens(
-            vocab_size, _hash_to_digest(multimodal_hashes[item_idx]),
-            metadata.item_lengths[item_idx].item())
+        digest = _hash_to_digest(multimodal_hashes[item_idx])
         overlap_starts = torch.clamp(
             metadata.run_positions[item_overlap_run_indices], min=start)
         overlap_ends = torch.clamp(metadata.run_ends[item_overlap_run_indices],
                                    max=end)
-        source_offsets = (metadata.run_item_offsets[item_overlap_run_indices] +
-                          overlap_starts -
-                          metadata.run_positions[item_overlap_run_indices])
+        token_offsets = (metadata.run_item_offsets[item_overlap_run_indices] +
+                         overlap_starts -
+                         metadata.run_positions[item_overlap_run_indices])
         result_offsets = overlap_starts - start
         lengths = overlap_ends - overlap_starts
-        _copy_token_spans(result, mm_tokens, result_offsets, source_offsets,
-                          lengths)
+        for result_offset, token_offset, length in zip(result_offsets.tolist(),
+                                                       token_offsets.tolist(),
+                                                       lengths.tolist(),
+                                                       strict=True):
+            result[result_offset:result_offset +
+                   length] = gen_multi_modal_tokens(vocab_size,
+                                                    digest,
+                                                    length,
+                                                    token_offset=token_offset)
 
     return result
 
@@ -220,29 +201,23 @@ def _augment_tokens_with_contiguous_mm_metadata(
     positions = _as_int64_cpu_tensor(multimodal_positions)
     lengths = _as_int64_cpu_tensor(multimodal_lengths)
 
-    if positions.ndim != 1 or lengths.ndim != 1 or positions.numel() != len(
-            multimodal_hashes) or positions.numel() != lengths.numel():
-        logger.warning(
-            "Invalid multimodal metadata shape; skipping multimodal token augmentation for block reuse"
-        )
-        return result
-
     item_ends = positions + lengths
     overlap_mask = (item_ends > start) & (positions < end)
     overlap_item_indices = torch.nonzero(overlap_mask).flatten()
     for item_idx in overlap_item_indices.tolist():
         pos = positions[item_idx].item()
         length = lengths[item_idx].item()
-        mm_tokens = gen_multi_modal_tokens(
-            vocab_size, _hash_to_digest(multimodal_hashes[item_idx]), length)
         overlap_start = max(pos, start)
         overlap_end = min(pos + length, end)
         source_offset = overlap_start - pos
         result_offset = overlap_start - start
         overlap_length = overlap_end - overlap_start
         result[result_offset:result_offset +
-               overlap_length] = mm_tokens[source_offset:source_offset +
-                                           overlap_length]
+               overlap_length] = gen_multi_modal_tokens(
+                   vocab_size,
+                   _hash_to_digest(multimodal_hashes[item_idx]),
+                   overlap_length,
+                   token_offset=source_offset)
 
     return result
 
@@ -2779,8 +2754,7 @@ class KVCacheManagerV2(BaseResourceManager):
             return tokens[start:end] if is_sliced else tokens
 
         result: list[TokenIdExt] = list(tokens[start:end])
-        run_metadata = _resolve_multimodal_run_metadata(
-            req, len(req.multimodal_hashes))
+        run_metadata = _resolve_multimodal_run_metadata(req)
         if run_metadata is not None:
             return _augment_tokens_with_mm_run_metadata(self.vocab_size, result,
                                                         req.multimodal_hashes,
