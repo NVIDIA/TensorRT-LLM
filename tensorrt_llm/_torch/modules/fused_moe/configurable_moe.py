@@ -515,6 +515,7 @@ class ConfigurableMoE(MoE):
             return self._forward_chunk_mega_impl(
                 x,
                 router_logits,
+                input_ids=input_ids,
                 output_dtype=output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens,
                 do_finalize=do_finalize,
@@ -652,6 +653,7 @@ class ConfigurableMoE(MoE):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
         *,
+        input_ids: Optional[torch.IntTensor] = None,
         output_dtype: Optional[torch.dtype],
         all_rank_num_tokens: Optional[List[int]],
         do_finalize: bool,
@@ -709,7 +711,8 @@ class ConfigurableMoE(MoE):
         router_logits_real = router_logits[:num_tokens]
 
         if num_tokens > 0:
-            topk_idx, topk_weights = self.routing_method.apply(router_logits_real)
+            input_ids_real = input_ids[:num_tokens] if input_ids is not None else None
+            topk_idx, topk_weights = self.routing_method.apply(router_logits_real, input_ids_real)
             topk_idx = topk_idx.to(torch.int64)
             topk_weights = topk_weights.to(torch.float32)
             x_fp8, x_sf = self.backend.quantize_input(x_real)

@@ -55,11 +55,14 @@
 #include <cuda_bf16.h>
 #include <cutlass/arch/barrier.h>
 
+#include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/reduction.cuh>
 #include <deep_gemm/common/sm100_utils.cuh>
 #include <deep_gemm/common/sm90_utils.cuh>
 #include <deep_gemm/common/tma_utils.cuh>
 #include <deep_gemm/common/utils.cuh>
+#include <deep_gemm/ptx/ld_st.cuh>
+#include <deep_gemm/ptx/utils.cuh>
 
 namespace fused_mhc
 {
@@ -71,9 +74,10 @@ using deep_gemm::sm100::tcgen05_before_thread_sync;
 using deep_gemm::sm100::tcgen05_after_thread_sync;
 using deep_gemm::sm100::advance_umma_desc_lo;
 using deep_gemm::tma_copy;
-using deep_gemm::PatternVisitor;
-using deep_gemm::constexpr_ceil_div;
-using deep_gemm::get_lane_idx;
+using deep_gemm::utils::PatternVisitor;
+using deep_gemm::math::constexpr_ceil_div;
+using deep_gemm::ptx::get_lane_idx;
+using deep_gemm::ptx::st_shared;
 
 template <uint32_t kSwizzleMode, uint32_t kSwizzleBase = 16>
 __device__ __forceinline__ uint32_t get_swizzled_smem_offset(uint32_t const& offset, uint32_t const& lane_idx)
@@ -358,7 +362,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
             cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_addr, values[0], values[1], values[2], values[3]);
             cutlass::arch::fence_view_async_tmem_load();
             if (BLOCK_M == 128 or (BLOCK_M == 64 and lane_idx < 16))
-                deep_gemm::st_shared(smem_ptr, values[0], values[1], values[2], values[3]);
+                st_shared(smem_ptr, values[0], values[1], values[2], values[3]);
             if constexpr (BLOCK_M == 64)
                 __syncwarp();
         }
@@ -885,7 +889,7 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             cute::SM100_TMEM_LOAD_32dp32b4x::copy(tmem_addr, values[0], values[1], values[2], values[3]);
             cutlass::arch::fence_view_async_tmem_load();
             if (BLOCK_M == 128 or (BLOCK_M == 64 and lane_idx < 16))
-                deep_gemm::st_shared(smem_ptr, values[0], values[1], values[2], values[3]);
+                st_shared(smem_ptr, values[0], values[1], values[2], values[3]);
             if constexpr (BLOCK_M == 64)
                 __syncwarp();
         }

@@ -214,9 +214,12 @@ def create_moe_backend(
             "Both swiglu_alpha and swiglu_beta must be provided."
 
     if swiglu_limit is not None or swiglu_limit_scalar is not None:
+        # Lazy import — MegaMoE pulls DG which we don't want at import time
+        # for non-MegaMoE backends.
+        from .mega_moe import MegaMoEDeepGemmFusedMoE
         assert moe_cls in [
             CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE, WideEPMoE,
-            DeepGemmFusedMoE
+            DeepGemmFusedMoE, MegaMoEDeepGemmFusedMoE
         ], f"swiglu_limit is not supported in {moe_cls.__name__}."
 
     if moe_cls == TRTLLMGenFusedMoE:
@@ -371,6 +374,12 @@ def create_moe_backend(
         # that don't use this backend.
         from .mega_moe import MegaMoEDeepGemmFusedMoE
         if moe_cls is MegaMoEDeepGemmFusedMoE:
+            activation_clamp = None
+            if swiglu_limit is not None:
+                if isinstance(swiglu_limit, torch.Tensor):
+                    activation_clamp = float(swiglu_limit.flatten()[0].item())
+                else:
+                    activation_clamp = float(swiglu_limit)
             return moe_cls(
                 routing_method=routing_method,
                 num_experts=num_experts,
@@ -386,6 +395,7 @@ def create_moe_backend(
                 init_load_balancer=init_load_balancer,
                 without_comm=without_comm,
                 activation_type=activation_type,
+                activation_clamp=activation_clamp,
             )
         raise ValueError(f"Unsupported moe backend: {moe_cls}")
 

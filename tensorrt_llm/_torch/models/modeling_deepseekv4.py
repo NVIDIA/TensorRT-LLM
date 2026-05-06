@@ -1403,12 +1403,15 @@ class DeepseekV4MoE(nn.Module):
             # TRTLLM/CUTEDSL/DENSEGEMM dropping back to CutlassFusedMoE on
             # unsupported quant) are handled correctly.
             moe_cls = get_moe_cls(model_config, override_quant_config=experts_quant_config)
+            from ..modules.fused_moe.mega_moe import MegaMoEDeepGemmFusedMoE
+
             supports_swiglu_limit = moe_cls in (
                 CutlassFusedMoE,
                 TritonFusedMoE,
                 TRTLLMGenFusedMoE,
                 WideEPMoE,
                 DeepGemmFusedMoE,
+                MegaMoEDeepGemmFusedMoE,
             )
             if supports_swiglu_limit:
                 moe_load_balancer_config = getattr(model_config, "moe_load_balancer", None)
@@ -1626,14 +1629,17 @@ class DeepseekV4MoE(nn.Module):
             return routed_output
 
         # NOTE: define compiled helpers at module scope to avoid defining decorators inside compiled frames
-
-        routed_output, shared_output = maybe_execute_in_parallel(
-            _compute_routed_output,
-            _compute_shared_output,
-            self.event_dict[EventType.Main],
-            self.event_dict[EventType.MoeShared],
-            self.aux_stream,
-        )
+        if self.aux_stream is not None:
+            self.event_dict[EventType.Main].record()
+            shared_output = _compute_shared_output()
+            with torch.cuda.stream(self.aux_stream):
+                self.event_dict[EventType.Main].wait()
+                routed_output = _compute_routed_output()
+                self.event_dict[EventType.MoeShared].record()
+            self.event_dict[EventType.MoeShared].wait()
+        else:
+            routed_output = _compute_routed_output()
+            shared_output = _compute_shared_output()
 
         if not do_finalize:
             return [shared_output, *routed_output]

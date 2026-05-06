@@ -53,6 +53,7 @@ of ``MoE.forward_fake`` and ``ConfigurableMoE._forward_chunk_impl``.
 
 from __future__ import annotations
 
+import os
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -146,6 +147,67 @@ class _MegaMoEUnavailable(RuntimeError):
     """
 
 
+def _lazy_init_torch_distributed_from_mpi() -> None:
+    """Bootstrap ``torch.distributed`` from MPI when running under mpirun/SLURM.
+
+    PR #13384's MegaMoE design assumes Ray (DeviceMesh pre-initializes
+    torch.distributed). The disagg / MPI path uses TRT-LLM's own MPIDist +
+    NCCL infra and never calls ``init_process_group``. This helper plugs
+    that gap: rank 0 picks a port, broadcasts ``(host, port)`` over MPI,
+    every rank sets ``MASTER_ADDR``/``MASTER_PORT`` + ``RANK``/``WORLD_SIZE``
+    and joins an NCCL ProcessGroup.
+    """
+    if dist.is_initialized():
+        return
+
+    from mpi4py import MPI
+
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    world_size = comm.Get_size()
+
+    if rank == 0:
+        host = os.environ.get("MASTER_ADDR")
+        if not host:
+            import socket
+
+            host = socket.gethostbyname(socket.gethostname())
+        port = os.environ.get("MASTER_PORT")
+        if not port:
+            import socket as _s
+
+            sock = _s.socket()
+            sock.bind(("", 0))
+            port = str(sock.getsockname()[1])
+            sock.close()
+        addr = (host, port)
+    else:
+        addr = None
+
+    host, port = comm.bcast(addr, root=0)
+    os.environ["MASTER_ADDR"] = host
+    os.environ["MASTER_PORT"] = port
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    if torch.cuda.is_available():
+        local_rank = int(
+            os.environ.get("LOCAL_RANK")
+            or os.environ.get("SLURM_LOCALID")
+            or os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK")
+            or rank % max(torch.cuda.device_count(), 1)
+        )
+        torch.cuda.set_device(local_rank)
+
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    dist.init_process_group(backend=backend, init_method="env://", rank=rank, world_size=world_size)
+    logger.info(
+        f"[MegaMoE] lazy-initialized torch.distributed "
+        f"(backend={backend}, rank={rank}, world={world_size}, "
+        f"master={host}:{port})"
+    )
+
+
 def _ue8m0_uint8_to_fp32(sf_uint8: torch.Tensor) -> torch.Tensor:
     """Convert UE8M0 stored as uint8 → fp32 with matching numeric value.
 
@@ -234,9 +296,9 @@ class MegaMoEDeepGemmFusedMoE(MoE):
         intermediate_size: Optional[int] = None,
     ) -> Tuple[bool, Optional[str]]:
         sm = get_sm_version()
-        if sm != 100:
+        if sm < 100:
             return False, (
-                f"MegaMoEDeepGemmFusedMoE requires SM100 (only arch with "
+                f"MegaMoEDeepGemmFusedMoE requires SM100+ (only arch with "
                 f"sm100_fp8_fp4_mega_moe.cuh in DeepGEMM); got SM{sm}"
             )
         if dtype_activation not in cls._SUPPORTED_ACTIVATION_DTYPES:
@@ -405,10 +467,7 @@ class MegaMoEDeepGemmFusedMoE(MoE):
         at ``mpi_disabled=1`` / Ray as the supported path.
         """
         if not dist.is_initialized():
-            raise RuntimeError(
-                "MegaMoEDeepGemmFusedMoE requires torch.distributed to be "
-                "initialized before module construction (mpirun or Ray)."
-            )
+            _lazy_init_torch_distributed_from_mpi()
         # Preferred: reuse the existing PG from the mapping (Ray / DeviceMesh).
         try:
             pg = self.mapping.moe_ep_group_pg

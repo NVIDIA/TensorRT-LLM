@@ -26,8 +26,39 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
     CacheType as CacheTypeCpp
-from tensorrt_llm.deep_gemm import (fp8_mqa_logits, fp8_paged_mqa_logits,
-                                    get_paged_mqa_logits_metadata)
+from tensorrt_llm.deep_gemm import fp8_mqa_logits
+from tensorrt_llm.deep_gemm import \
+    fp8_paged_mqa_logits as _fp8_paged_mqa_logits_raw
+from tensorrt_llm.deep_gemm import \
+    get_paged_mqa_logits_metadata as _get_paged_mqa_logits_metadata_raw
+
+
+def get_paged_mqa_logits_metadata(context_lens, block_kv, *args, **kwargs):
+    """Wrapper that adapts call sites to the bumped DeepGEMM contract.
+
+    The DeepGEMM bump (``deepseek-ai/c491439``) tightened the API:
+    - ``context_lens`` must be 2D ``(batch, next_n)`` (was 1D-tolerant).
+    - ``block_kv`` must be 32 or 64 — this is the *kernel scheduling*
+      block, not the KV cache page size. TRT-LLM call sites historically
+      pass ``kv_cache_manager.tokens_per_block`` (128/256 on DSv4); clamp
+      to 64 so the kernel-side assert (``attention.hpp:210``) holds.
+    """
+    if context_lens.dim() == 1:
+        context_lens = context_lens.unsqueeze(-1)
+    if block_kv not in (32, 64):
+        block_kv = 64
+    return _get_paged_mqa_logits_metadata_raw(context_lens, block_kv, *args,
+                                              **kwargs)
+
+
+def fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, *args, **kwargs):
+    """Wrapper: bumped DeepGEMM requires ``context_lens`` to be 2D ``(batch, next_n)``."""
+    if context_lens.dim() == 1:
+        context_lens = context_lens.unsqueeze(-1)
+    return _fp8_paged_mqa_logits_raw(q, kv_cache, weights, context_lens, *args,
+                                     **kwargs)
+
+
 from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -1883,7 +1914,7 @@ class Indexer(nn.Module):
 
                     logits = fp8_mqa_logits(
                         q_fp8[chunk.token_start:chunk.token_end, ...],
-                        (chunk_k_fp8, chunk_k_scale),
+                        (chunk_k_fp8, chunk_k_scale.view(-1)),
                         weights[chunk.token_start:chunk.token_end, ...],
                         chunk.cu_seqlen_ks,
                         chunk.cu_seqlen_ke,
@@ -1924,7 +1955,7 @@ class Indexer(nn.Module):
                 logits = fp8_mqa_logits(
                     q_fp8[:num_ctx_tokens, ...],
                     (k_fp8[:num_ctx_kv_tokens, ...], k_scale[:num_ctx_kv_tokens,
-                                                             ...]),
+                                                             ...].view(-1)),
                     weights[:num_ctx_tokens, ...],
                     cu_seqlen_ks,
                     cu_seqlen_ke,
