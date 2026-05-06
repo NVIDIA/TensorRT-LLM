@@ -32,15 +32,15 @@ from triton_kernels.tensor_details import layout
 
 from ...model_config import ModelConfig
 from ..linear import TensorParallelMode, load_weight_shard
+from .fused_moe_cute_dsl_glm5 import glm5_fused_moe_apply, is_glm5_fused_shape
+from .fused_moe_cute_dsl_glm5 import kernels_available as glm5_kernels_available
 from .interface import MoE
-from .quantization import (FusedMoEMethodBase, MoEWeightLoadingMode,
-                           TritonFP8BlockScaleFusedMoEMethod,
-                           load_activation_scales_fp8_qdq,
+from .quantization import (FusedMoEMethodBase,
+                           GLM5CuteDslFP8BlockScalesFusedMoEMethod,
+                           MoEWeightLoadingMode, load_activation_scales_fp8_qdq,
                            requantize_expert_w3_w1_weight_fp8_qdq)
 from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
                       RenormalizeMoeRoutingMethod)
-from .triton_kernels_glm import glm5_fused_moe_apply, is_glm5_fused_shape
-from .triton_kernels_glm import kernels_available as glm5_kernels_available
 
 
 # Triton kernels has hardcoded beta = 1, so we use this implementation when beta is not 1
@@ -1395,8 +1395,7 @@ class TritonFusedMoE(MoE):
         # The DSv3 routing affinity isn't visible from this classmethod (we
         # only see quant_algo here), so we approve the FP8_BLOCK_SCALES quant
         # on SM100 unconditionally; the runtime check in __init__ /
-        # forward_impl decides whether the fused path actually runs.  See
-        # MOE_FUSION_DESIGN.md §7.11.4.
+        # forward_impl decides whether the fused path actually runs.
         if sm_version == 100 and quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
             return True, None
 
@@ -1469,11 +1468,11 @@ class TritonFusedMoE(MoE):
             raise NotImplementedError(
                 "TritonFusedMoE is only supported on Hopper with EP size > 1.")
 
-        # Detect the GLM-5 fused-MoE fast path (Kernel B + Kernel C, FP8 block
-        # scales, DeepSeek-V3 routing).  See MOE_FUSION_DESIGN.md §7.11.4.
-        # When this path is selected, we bypass the renormalize-routing
-        # assertion below because the kernel applies sigmoid+bias+topK
-        # internally per `DeepSeekV3MoeRoutingMethod` semantics.
+        # Detect the GLM-5 fused-MoE fast path (FP8 block scales,
+        # DeepSeek-V3 routing).  When selected we bypass the
+        # renormalize-routing assertion below: the GLM-5 up/gate/silu kernel
+        # applies sigmoid + bias + topK internally per
+        # `DeepSeekV3MoeRoutingMethod` semantics.
         self._glm5_fused_path = self._detect_glm5_fused_path()
 
         if not self._glm5_fused_path:
@@ -1550,7 +1549,7 @@ class TritonFusedMoE(MoE):
     def _get_quant_method(self):
         # GLM-5 fused FP8-block-scale path takes precedence when active.
         if getattr(self, "_glm5_fused_path", False):
-            return TritonFP8BlockScaleFusedMoEMethod()
+            return GLM5CuteDslFP8BlockScalesFusedMoEMethod()
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
                 exclude_kv_cache=True):
             if self.quant_config.layer_quant_mode.has_fp8_qdq():
@@ -1589,9 +1588,8 @@ class TritonFusedMoE(MoE):
         assert use_dp_padding is None or not use_dp_padding, \
             "TritonFusedMoE does not support use_dp_padding=True"
 
-        # GLM-5 fused path now chunks-by-16 internally (see _forward_glm5_fused),
-        # so it handles any M.  The fallback path was used while we worked out
-        # the prefill story; it remains for non-GLM-5 cases.
+        # GLM-5 fused path chunks-by-16 internally (see
+        # `_forward_glm5_fused`) so it handles any M.
         if getattr(self, "_glm5_fused_path", False):
             hidden_states = self._forward_glm5_fused(x, router_logits)
         else:
@@ -1609,12 +1607,14 @@ class TritonFusedMoE(MoE):
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor:
-        """GLM-5 fused-MoE path (Kernel B + Kernel C; allreduce stays
-        external).  Per `MOE_FUSION_DESIGN.md` §7.8 / §7.9 / §7.11.4.
+        """GLM-5 fused-MoE path (up/gate/silu + down/combine; allreduce
+        stays external — handled by the caller via
+        `reducescatter_or_allreduce`).
 
         Inputs:
-          x             [M, H] bf16  — RMSNorm'd activation (Kernel A is
-                        handled upstream in `DeepseekV3Gate.forward`).
+          x             [M, H] bf16  — RMSNorm'd activation (RMSNorm and
+                        the router GEMM are handled upstream in
+                        `DeepseekV3Gate.forward`).
           router_logits [M, E] fp32 (or bf16) — DSv3 pre-sigmoid logits.
 
         Returns:
@@ -1631,25 +1631,21 @@ class TritonFusedMoE(MoE):
             self.routing_method.routing_impl.routed_scaling_factor)
         top_k = self.routing_method.top_k
 
-        # Read pre-split contiguous tensors that
-        # `TritonFP8BlockScaleFusedMoEMethod.post_load_weights()` set up
-        # at load time.  This avoids re-slicing + .contiguous() per call,
-        # which would allocate fresh FP8 weight copies (~768 MB / call)
-        # under CUDA Graph capture and OOM the executor at engine init.
-        # See MOE_FUSION_DESIGN.md §7.14.
+        # Read the pre-split contiguous tensors that
+        # `GLM5CuteDslFP8BlockScalesFusedMoEMethod.post_load_weights()` set up at
+        # load time.  Slicing the concatenated `w3_w1` per call would force
+        # a fresh `.contiguous()` allocation of the FP8 weights, which
+        # under CUDA Graph capture is enough to OOM the executor at engine
+        # init.
         gate_weight = self._glm5_gate_weight
         up_weight = self._glm5_up_weight
         gate_scale = self._glm5_gate_scale
         up_scale = self._glm5_up_scale
 
-        # Kernels B/C were validated only at M ∈ {1,4,8,16} (per
-        # MOE_FUSION_DESIGN.md §7.8 §7.9).  Engine warmup runs prefill at
-        # M=8192 which would crash the kernels.  Chunk inputs to ≤16-token
-        # batches so any M works; this is fine for warmup (one-shot init
-        # cost) and for real prefill (1024-token prompt → 64 chunks ×
-        # ~14 µs/layer = ~70 ms total prefill MoE — non-critical path).
-        # AllReduce is still done ONCE after this function returns (in
-        # `forward_impl` via `reducescatter_or_allreduce`).
+        # The GLM-5 fused kernels are validated at M in {1, 4, 8, 16};
+        # chunk inputs to ≤16-token batches so any M (e.g. prefill / warmup)
+        # works.  AllReduce is still done once after this function returns
+        # (in `forward_impl` via `reducescatter_or_allreduce`).
         x_2d_c = x_2d.contiguous()
         # Router logits are flat in M too (already [M, E]).
         if router_logits.dim() == 3:

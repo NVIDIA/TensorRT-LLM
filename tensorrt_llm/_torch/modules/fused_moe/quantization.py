@@ -1082,65 +1082,65 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
         super().post_load_weights(module)
 
 
-class TritonFP8BlockScaleFusedMoEMethod(DeepSeekFP8BlockScalesFusedMoEMethod):
-    """FP8 block-scale weight handling for the GLM-5 fused-MoE Triton path.
+class GLM5CuteDslFP8BlockScalesFusedMoEMethod(
+        DeepSeekFP8BlockScalesFusedMoEMethod):
+    """FP8 block-scale weight handling for the GLM-5 fused-MoE CuTe DSL path.
 
-    The on-device weight layouts produced by `DeepSeekFP8BlockScalesFusedMoEMethod`
-    happen to already match what the GLM-5 fused kernels (Kernel B + Kernel C
-    per `MOE_FUSION_DESIGN.md` §7.8 / §7.9) consume:
+    The on-device weight layouts produced by
+    `DeepSeekFP8BlockScalesFusedMoEMethod` already match what the GLM-5
+    fused kernels consume:
 
-      * `module.w3_w1_weight: [E, 2*N, H]  fp8e4m3` — concatenated `[w3 | w1]`
-        along axis 1.  Kernel B's wrapper splits this into `gate_weight` (= w1
-        half = `[:, N:, :]`) and `up_weight` (= w3 half = `[:, :N, :]`).
+      * `module.w3_w1_weight: [E, 2*N, H] fp8e4m3` — concatenated
+        `[w3 | w1]` along axis 1.  Pre-split here into `gate_weight`
+        (= `w1` half = `[:, N:, :]`) and `up_weight` (= `w3` half =
+        `[:, :N, :]`) for the up/gate/silu kernel.
 
-      * `module.w3_w1_weight_scaling_factor: [E, 2*N//128, H//128]  fp32` —
-        likewise split into `gate_scale` / `up_scale` halves.
+      * `module.w3_w1_weight_scaling_factor: [E, 2*N//128, H//128] fp32`
+        — likewise split into `gate_scale` / `up_scale` halves.
 
-      * `module.w2_weight: [E, H, N]  fp8e4m3` — directly consumed by Kernel C
-        as `mat_in[E, N=H, K=intermediate]`.
+      * `module.w2_weight: [E, H, N] fp8e4m3` — consumed by the
+        down/combine kernel directly as `mat_in[E, N=H, K=intermediate]`
+        (no slicing).
 
-      * `module.w2_weight_scaling_factor: [E, H//128, N//128]  fp32` —
-        directly consumed by Kernel C as `mat_scale`.
+      * `module.w2_weight_scaling_factor: [E, H//128, N//128] fp32` —
+        consumed by the down/combine kernel directly as `mat_scale`.
 
-    This class therefore inherits load/storage from the DeepSeek class and
-    simply records the backend selector so downstream code can branch.
+    This class inherits load/storage from the DeepSeek class and pre-splits
+    the gate/up halves once at load time so the per-call hot path can read
+    contiguous tensors without re-allocating them.
     """
 
     eplb_support_status = EplbSupportStatus.NOT_VERIFIED
 
     def post_load_weights(self, module: torch.nn.Module):
-        # Pre-split w3_w1 into gate (= w1) + up (= w3) and store as separate
-        # contiguous tensors on the module so that `_forward_glm5_fused()`
-        # doesn't re-slice + .contiguous() every call.
-        #
-        # Without this, slicing `[:, N:, :]` returns a non-contiguous view
-        # and `.contiguous()` allocates ~768 MB FP8 + 384 MB FP8 fresh per
-        # call.  Multiplied by 78 MoE layers and CUDA Graph capture for
-        # multiple warmup shapes, the engine OOMs at executor init
-        # (observed: 178 GiB / 178 GiB used). See MOE_FUSION_DESIGN.md
-        # §7.14 for the diagnosis.
+        # Pre-split w3_w1 into gate (= w1) + up (= w3) once at load time so
+        # `_forward_glm5_fused()` doesn't re-slice + `.contiguous()` each
+        # call.  Slicing `[:, N:, :]` on the concatenated tensor returns a
+        # non-contiguous view, so per-call `.contiguous()` would allocate
+        # fresh FP8 weight copies on every iteration.  Under CUDA Graph
+        # capture this multiplies across warmup shapes and MoE layers and
+        # is enough to OOM the executor at engine init.
         super().post_load_weights(module)
 
         N = module.intermediate_size_per_partition
         N_blk = N // 128
 
-        # `w3_w1_weight` layout from `load_expert_all_weight_scale_fp8_block_scale`
-        # is `[E, 2N, H]` with the first N rows = w3 (up_proj) and the next
-        # N rows = w1 (gate_proj).  Same chunk(2, dim=0) ordering for the
-        # block-scale tensor.
+        # `w3_w1_weight` layout is `[E, 2N, H]` with the first N rows =
+        # w3 (up_proj) and the next N rows = w1 (gate_proj); the block-scale
+        # tensor follows the same row ordering.
         w3_w1 = module.w3_w1_weight  # [E, 2N, H] fp8
         w3_w1_scale = module.w3_w1_weight_scaling_factor  # [E, 2*N_blk, H_blk] fp32
 
-        # Use .clone() to get a fresh contiguous tensor (rather than
-        # `.contiguous()` + the original alias).  Pre-allocated once per
-        # module at load time.
+        # Clone produces a fresh contiguous tensor independent of the
+        # concatenated allocation, so freeing `w3_w1` below reclaims its
+        # storage.
         gate_weight = w3_w1[:, N:, :].clone().contiguous()  # = w1 (gate_proj)
         up_weight = w3_w1[:, :N, :].clone().contiguous()  # = w3 (up_proj)
         gate_scale = w3_w1_scale[:, N_blk:, :].clone().contiguous()
         up_scale = w3_w1_scale[:, :N_blk, :].clone().contiguous()
 
-        # Store as Parameters so they're recognized in the module state dict
-        # and survive .to(device) calls, but mark requires_grad=False.
+        # Register as Parameters so they're tracked in the state dict and
+        # survive `.to(device)`; mark `requires_grad=False`.
         module._glm5_gate_weight = torch.nn.Parameter(gate_weight,
                                                       requires_grad=False)
         module._glm5_up_weight = torch.nn.Parameter(up_weight,
@@ -1150,17 +1150,15 @@ class TritonFP8BlockScaleFusedMoEMethod(DeepSeekFP8BlockScalesFusedMoEMethod):
         module._glm5_up_scale = torch.nn.Parameter(up_scale,
                                                    requires_grad=False)
 
-        # Free the original concatenated w3_w1 / w3_w1_scale: the GLM-5
-        # fused path reads only the pre-split tensors above; the fallback
-        # (quant_method.apply for M > 16) also doesn't yet consume them
-        # successfully (raises NotImplementedError — separate Phase-3.1
-        # followup, see §7.14).  Reclaiming this memory is what makes the
-        # engine init fit in 178 GiB after the per-layer pre-split copies.
+        # Free the original concatenated tensors: the GLM-5 fused path only
+        # reads the pre-split tensors above.  Reclaiming this memory keeps
+        # engine init within budget once the per-layer pre-split copies
+        # exist alongside the originals.
         module.w3_w1_weight = None
         module.w3_w1_weight_scaling_factor = None
 
-        # w2_weight and its scale stay as-is — Kernel C consumes them
-        # directly with no slicing.
+        # `w2_weight` and its scale stay as-is — the down/combine kernel
+        # consumes them directly with no slicing.
 
 
 def resmooth_and_transform_fp8_scale(
