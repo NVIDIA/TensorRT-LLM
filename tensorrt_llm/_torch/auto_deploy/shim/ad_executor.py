@@ -844,6 +844,24 @@ class ADEngine(ModelEngine):
         cu_num_pages: List[int] = [0]
         extra_page_per_seq: List[int] = []
         state_slot_idx: List[int] = []
+
+        # Batch the per-request cache-indices fetch into a single C++ call. Going
+        # through `get_batch_cache_indices(ids)` instead of N individual
+        # `get_cache_indices(request)` calls cuts the cross-language transition
+        # cost in this loop substantially -- line_profiler had this line at ~10%
+        # of `_prepare_inputs` (4.85 us x 64 requests at conc=64).
+        batch_cache_indices = None
+        get_batch_cache_indices = getattr(kv_cache_manager, "get_batch_cache_indices", None)
+        if get_batch_cache_indices is not None:
+            try:
+                batch_cache_indices = get_batch_cache_indices(
+                    [r.py_request_id for r in ordered_requests]
+                )
+            except Exception:
+                # Some kv-cache backends (e.g. mamba) don't implement the batch
+                # API; fall back to per-request calls.
+                batch_cache_indices = None
+
         for i, request in enumerate(ordered_requests):
             # store seq slot idx (use mamba_cache_index if available)
             request.py_batch_idx = request.py_seq_slot
@@ -860,7 +878,10 @@ class ADEngine(ModelEngine):
             num_active_blocks_i = (end_compute_i + _tokens_per_block - 1) // _tokens_per_block
 
             # construct cache information for the current request
-            cache_indices = kv_cache_manager.get_cache_indices(request)
+            if batch_cache_indices is not None:
+                cache_indices = batch_cache_indices[i]
+            else:
+                cache_indices = kv_cache_manager.get_cache_indices(request)
             cache_loc.extend(cache_indices[:num_active_blocks_i])
             cu_num_pages.append(cu_num_pages[i] + num_active_blocks_i)
             if len(cache_indices) > num_active_blocks_i:
