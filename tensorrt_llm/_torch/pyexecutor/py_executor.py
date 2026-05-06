@@ -59,6 +59,7 @@ from .hang_detector import HangDetector
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse, get_draft_token_length)
+from .mamba_cache_manager import MambaHybridCacheManager
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
@@ -936,6 +937,14 @@ class PyExecutor:
         prev_device_step_time = None
 
         torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
+        if torch_trace_path is not None:
+            # Append the rank so each rank writes to its own file. Without
+            # this, TP/PP/DP > 1 runs have every rank calling
+            # torch_profiler.export_chrome_trace() on the same path
+            # concurrently, producing interleaved output that fails to
+            # parse in Chrome tracing / Perfetto.
+            trace_base, trace_ext = os.path.splitext(torch_trace_path)
+            torch_trace_path = f"{trace_base}-rank-{self.global_rank}{trace_ext}"
         profile_start_stop = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME,
                                             None)
         enable_torch_trace = bool(torch_trace_path and profile_start_stop)
@@ -3126,12 +3135,20 @@ class PyExecutor:
                 scheduler_output.context_requests,
                 scheduler_output.generation_requests)
 
+        num_fitting = scheduler_output.num_fitting_requests
+        #TODO(TRTLLM-12359): remove the WAR when PythonMambaCacheManager is deprecated.
+        if isinstance(self.kv_cache_manager,
+                      MambaHybridCacheManager) and self.kv_cache_transceiver:
+            if len(scheduled_context_requests) > 0:
+                scheduled_context_requests = self.kv_cache_manager.filter_ctx_requests_by_capacity(
+                    scheduled_context_requests)
+                num_fitting = len(scheduled_context_requests)
         scheduled_requests = ScheduledRequests()
         scheduled_requests.reset_context_requests(scheduled_context_requests)
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
 
-        return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, scheduler_output.num_fitting_requests
+        return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, num_fitting
 
     @nvtx_range("_check_disagg_gen_transfer_status")
     def _check_disagg_gen_transfer_status(self):
@@ -3327,6 +3344,7 @@ class PyExecutor:
                 req.decoding_iter = 1
                 req.py_decoding_iter = 1
                 req.py_kv_transfer_start_time = None
+                req.py_kv_transfer_timed_out = False
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
                 ctx_draft_tokens = req.context_phase_params.draft_tokens
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
@@ -3505,7 +3523,14 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_gen_cache_transfer_status")
     def _check_disagg_gen_cache_transfer_status(self, atLeastNum: int = 0):
-        self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
+        result = self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
+        if isinstance(result, tuple):
+            _, _, cancelled_reqs = result
+            user_canceled_set = set(self.canceled_req_ids)
+            for req in cancelled_reqs:
+                req_id = req.py_request_id if not req.is_child else req.parent_request_id
+                if req_id not in user_canceled_set:
+                    req.state = LlmRequestState.DISAGG_TRANS_ERROR
         self._check_cache_transfer_errors("generation requests")
 
     def _forward_step(

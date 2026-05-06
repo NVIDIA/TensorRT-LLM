@@ -167,6 +167,8 @@ l0_b200:
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_long_context
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_rapid_fire
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_field_completeness
+  # ------------- Prefix-aware scheduling E2E tests ---------------
+  - kv_cache/test_prefix_aware_scheduling.py::TestServePrefixAwareScheduling::test_multi_round_qa_shared_prefix_smoke
   # ------------- Visual Gen tests ---------------
   - unittest/_torch/visual_gen/test_visual_gen_args.py
   - unittest/_torch/visual_gen/test_visual_gen_params.py

@@ -652,6 +652,12 @@ class Attention(nn.Module):
         if hasattr(self.attn, 'has_nvfp4'
                    ) and self.attn.has_nvfp4 and not self.o_proj.has_nvfp4:
             return False
+
+        # If o_proj does dynamic activation quantization, it computes its own scales
+        # at runtime from a BF16 input — attention must NOT pre-quantize output
+        if self.o_proj.force_dynamic_quantization:
+            return False
+
         # If no quant is applied, no need to quantize the output
         if self.quant_config is not None and not self.quant_config.layer_quant_mode.has_any_quant(
                 exclude_kv_cache=True):
