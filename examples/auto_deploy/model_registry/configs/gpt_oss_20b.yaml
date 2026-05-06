@@ -9,7 +9,7 @@ model_factory: AutoModelForCausalLM
 attn_backend: trtllm
 compile_backend: torch-cudagraph
 skip_loading_weights: false
-world_size: 2
+world_size: 1
 max_batch_size: 128
 max_seq_len: 4096
 max_num_tokens: 8192
