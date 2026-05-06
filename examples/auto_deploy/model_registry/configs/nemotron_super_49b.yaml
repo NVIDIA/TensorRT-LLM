@@ -1,0 +1,11 @@
+# Configuration for nvidia/Llama-3_3-Nemotron-Super-49B-v1 (DeciLM / Nemotron-NAS)
+#
+# This 49B model with TP=8 leaves ~7GB free per GPU after weight loading + compile.
+# The default max_batch_size=128 from dashboard_default.yaml causes OOM during
+# KV cache allocation. Reduced to max_batch_size=4 with smaller sequence/token
+# limits to fit within available GPU memory on 8x H100 80GB.
+
+max_batch_size: 4
+max_num_tokens: 1024
+max_seq_len: 2048
+cuda_graph_batch_sizes: [1, 2, 4]

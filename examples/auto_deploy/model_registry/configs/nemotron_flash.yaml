@@ -1,0 +1,14 @@
+compile_backend: torch-cudagraph
+max_batch_size: 384
+max_seq_len: 2097152
+max_num_tokens: 8192
+enable_chunked_prefill: true
+model_factory: NemotronFlashForCausalLM
+cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 24, 32, 64, 96, 128, 256, 320, 384]
+transforms:
+  gather_logits_before_lm_head:
+    # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
+    enabled: true
+  fuse_mamba_a_log:
+    stage: post_load_fusion
+    enabled: true

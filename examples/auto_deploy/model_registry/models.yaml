@@ -397,8 +397,8 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 # --- Tencent Hunyuan (2025) ---
 - name: tencent/Hunyuan-A13B-Instruct
-  config_id: default_ws_8
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+  config_id: hunyuan_a13b_ep
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'hunyuan_a13b_ep.yaml']
 - name: tencent/Hunyuan-7B-Instruct
   config_id: default_ws_1
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
@@ -412,10 +412,10 @@ models:
 # --- Granite 4.0 (2025) - hybrid Mamba/Transformer ---
 - name: ibm-granite/granite-4.0-micro
   config_id: granite_4_0_micro
-  yaml_extra: ['granite_4.0_micro.yaml']
+  yaml_extra: ['world_size_1.yaml', 'granite_4.0_micro.yaml']
 - name: ibm-granite/granite-4.0-h-small
-  config_id: default_ws_4
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+  config_id: granite_4_0_h_small
+  yaml_extra: ['world_size_4.yaml', 'granite_4.0_h_small.yaml']
 # --- AI21 Jamba (2025) - hybrid SSM-Transformer ---
 - name: ai21labs/AI21-Jamba-Large-1.7
   config_id: default_ws_8
@@ -655,8 +655,8 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml', 'qwen3_vl.yaml']
 # --- Granite 4.0 tiny (2025) ---
 - name: ibm-granite/granite-4.0-tiny-preview
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: granite_4_0_tiny_preview
+  yaml_extra: ['world_size_1.yaml', 'granite_4.0_tiny_preview.yaml']
 # --- OLMo 3 Think 7B (2025) ---
 - name: allenai/Olmo-3-7B-Think
   config_id: default_ws_1
