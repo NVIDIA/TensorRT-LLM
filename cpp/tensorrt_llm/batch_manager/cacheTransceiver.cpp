@@ -364,8 +364,34 @@ void CacheTransceiver::respondAndSendLayerWise(
 void CacheTransceiver::requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isGenerationOnlyRequest());
+    auto const reqId = llmRequest->mRequestId;
     {
         auto future = mCacheReceiver->receiveAsync(llmRequest);
+
+        // [wedge-trace] turn the previously unbounded future.get() into a
+        // wait_for(interval) loop so the executor thread can log a
+        // heartbeat when this synchronous gen-side path
+        // (TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1) is blocked. The
+        // worker thread's own heartbeats will tell us whether the wedge
+        // is in NIXL/UCX or somewhere downstream. See
+        // docs/source/features/disagg-kv-transfer-wedge-trace-logs.md.
+        auto const heartbeatIntervalMs = common::getEnvDisaggWedgeTraceIntervalMs();
+        if (heartbeatIntervalMs > 0)
+        {
+            auto const startTime = std::chrono::steady_clock::now();
+            while (future.wait_for(std::chrono::milliseconds(heartbeatIntervalMs)) != std::future_status::ready)
+            {
+                auto const elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - startTime)
+                                           .count();
+                TLLM_LOG_WARNING(
+                    "[wedge-trace] CacheTransceiver::requestAndReceiveSync executor thread blocked on "
+                    "future.get for request %ld for %lld ms (TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP path). "
+                    "Worker thread should be emitting its own [wedge-trace] heartbeat for the actual "
+                    "wedge location.",
+                    reqId, static_cast<long long>(elapsedMs));
+            }
+        }
         future.get();
     }
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);

@@ -18,6 +18,7 @@
 #include "connection.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
+#include <chrono>
 #include <random>
 #include <string>
 #include <unistd.h>
@@ -585,6 +586,12 @@ template <typename NotificationType>
 void AgentConnectionManager::waitForNotification(
     std::string const& remoteAgentName, NotificationType& expectedInfo, std::atomic<bool> const& terminateFlag)
 {
+    auto const startTime = std::chrono::steady_clock::now();
+    auto lastHeartbeat = startTime;
+    auto const heartbeatIntervalMs = common::getEnvDisaggWedgeTraceIntervalMs();
+    char const* notificationKindName
+        = std::is_same_v<NotificationType, NotificationSyncInfo> ? "NotificationSyncInfo" : "ReadySignalInfo";
+
     while (!terminateFlag.load())
     {
 
@@ -593,6 +600,30 @@ void AgentConnectionManager::waitForNotification(
             return;
         }
         updateUnhandledNotifications();
+
+        // [wedge-trace] periodic heartbeat for the receiver-side
+        // getNotifs poll loop. Fires when no matching notification has
+        // arrived for more than the configured interval. See
+        // docs/source/features/disagg-kv-transfer-wedge-trace-logs.md.
+        if (heartbeatIntervalMs > 0)
+        {
+            auto const now = std::chrono::steady_clock::now();
+            auto const sinceHeartbeatMs
+                = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastHeartbeat).count();
+            if (sinceHeartbeatMs >= static_cast<int64_t>(heartbeatIntervalMs))
+            {
+                auto const elapsedMs
+                    = std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime).count();
+                TLLM_LOG_WARNING(
+                    "[wedge-trace] AgentConnectionManager::waitForNotification still pending after %lld ms "
+                    "(remoteAgent='%s' expectedTag=%d kind=%s). Receiver-side getNotifs poll is not making "
+                    "progress; sender may have crashed or its notification was lost.",
+                    static_cast<long long>(elapsedMs), remoteAgentName.c_str(),
+                    static_cast<int>(expectedInfo.mContext.getTag()), notificationKindName);
+                lastHeartbeat = now;
+            }
+        }
+
         std::scoped_lock lock(mNotificationMutex);
         auto it = mUnhandledNotifications.begin();
         while (it != mUnhandledNotifications.end())

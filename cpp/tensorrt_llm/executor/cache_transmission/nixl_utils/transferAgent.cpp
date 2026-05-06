@@ -484,7 +484,9 @@ NixlTransferStatus::NixlTransferStatus(nixlAgent* agent, nixlXferReqH* handle)
 
 TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
 {
-    auto startTime = std::chrono::steady_clock::now();
+    auto const startTime = std::chrono::steady_clock::now();
+    auto lastHeartbeat = startTime;
+    auto const heartbeatIntervalMs = common::getEnvDisaggWedgeTraceIntervalMs();
 
     while (true)
     {
@@ -496,6 +498,29 @@ TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
         else if (status != NIXL_IN_PROG)
         {
             return TransferState::kFAILURE;
+        }
+
+        // [wedge-trace] periodic heartbeat for the sender-side
+        // getXferStatus poll loop. Fires when the same nixlXferReqH has
+        // been NIXL_IN_PROG for more than the configured interval. See
+        // docs/source/features/disagg-kv-transfer-wedge-trace-logs.md.
+        if (heartbeatIntervalMs > 0)
+        {
+            auto const now = std::chrono::steady_clock::now();
+            auto const sinceHeartbeatMs
+                = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastHeartbeat).count();
+            if (sinceHeartbeatMs >= static_cast<int64_t>(heartbeatIntervalMs))
+            {
+                auto const elapsedMs
+                    = std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime).count();
+                TLLM_LOG_WARNING(
+                    "[wedge-trace] NixlTransferStatus::wait still NIXL_IN_PROG after %lld ms "
+                    "(handle=%p, requested timeout_ms=%lld). Sender-side getXferStatus poll "
+                    "is not making progress; peer or UCX endpoint may be wedged.",
+                    static_cast<long long>(elapsedMs), static_cast<void const*>(mHandle),
+                    static_cast<long long>(timeout_ms));
+                lastHeartbeat = now;
+            }
         }
 
         // If timeout_ms < 0, wait indefinitely until status is not NIXL_IN_PROG

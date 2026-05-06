@@ -115,6 +115,13 @@ std::string const& getEnvKVCacheTimeOutputPath();
 
 bool getEnvTryZCopyForKVCacheTransfer();
 
+/// Periodic [wedge-trace] heartbeat interval (ms) for the disaggregated
+/// KV transfer wedge points (NixlTransferStatus::wait,
+/// waitForNotification, assignBufferIndex CV wait,
+/// requestAndReceiveSync future.get). When set to 0 the heartbeats are
+/// disabled. Default: 5000 ms.
+size_t getEnvDisaggWedgeTraceIntervalMs();
+
 // Force deterministic behavior for all kernels.
 bool getEnvForceDeterministic();
 

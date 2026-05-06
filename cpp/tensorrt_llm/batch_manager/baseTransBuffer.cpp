@@ -21,6 +21,7 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/opUtils.h"
 
+#include <chrono>
 #include <mutex>
 
 namespace tensorrt_llm::batch_manager
@@ -233,8 +234,41 @@ std::optional<int> BaseTransBufferManager::assignBufferIndex(
         return std::nullopt;
     }
     std::unique_lock lk(resource.mBuffersMutex);
-    resource.mBuffersCV.wait(
-        lk, [&resource, bufferCount]() { return static_cast<size_t>(resource.mConcurrence) < bufferCount; });
+
+    // [wedge-trace] convert the unbounded CV wait into wait_for(interval)
+    // so we can periodically log when a thread has been blocked waiting
+    // for a slot. Slot exhaustion at this layer is the downstream
+    // symptom of a stuck transfer (slot held by a wedged worker thread)
+    // — see docs/source/features/disagg-kv-transfer-debug-stuck-slot.md.
+    auto const heartbeatIntervalMs = common::getEnvDisaggWedgeTraceIntervalMs();
+    auto const haveSlot
+        = [&resource, bufferCount]() { return static_cast<size_t>(resource.mConcurrence) < bufferCount; };
+    if (heartbeatIntervalMs > 0)
+    {
+        auto const startTime = std::chrono::steady_clock::now();
+        auto lastHeartbeat = startTime;
+        while (!haveSlot())
+        {
+            if (resource.mBuffersCV.wait_for(lk, std::chrono::milliseconds(heartbeatIntervalMs), haveSlot))
+            {
+                break;
+            }
+            auto const now = std::chrono::steady_clock::now();
+            auto const elapsedMs
+                = std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime).count();
+            TLLM_LOG_WARNING(
+                "[wedge-trace] BaseTransBufferManager::assignBufferIndex blocked waiting for a slot "
+                "for %lld ms (concurrence=%d budget=%zu). The slot is most likely held by a wedged "
+                "worker thread; check sender/receiver heartbeats and run the stuck-slot diagnosis.",
+                static_cast<long long>(elapsedMs), static_cast<int>(resource.mConcurrence), bufferCount);
+            lastHeartbeat = now;
+            (void) lastHeartbeat;
+        }
+    }
+    else
+    {
+        resource.mBuffersCV.wait(lk, haveSlot);
+    }
     int bufferId = -1;
     for (size_t i = 0; i < bufferCount; i++)
     {

@@ -454,6 +454,13 @@ std::string const& getEnvKVCacheTimeOutputPath()
     return outputPath;
 }
 
+size_t getEnvDisaggWedgeTraceIntervalMs()
+{
+    // Default: 5 s. Set TRTLLM_DISAGG_WEDGE_TRACE_INTERVAL_MS=0 to disable.
+    static size_t const intervalMs = getUInt64Env("TRTLLM_DISAGG_WEDGE_TRACE_INTERVAL_MS").value_or(5000);
+    return intervalMs;
+}
+
 bool getEnvKVCacheTransferUseAsyncBuffer()
 {
 
