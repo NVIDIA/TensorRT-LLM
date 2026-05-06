@@ -7822,6 +7822,80 @@ INSTANTIATE_TEST_SUITE_P(BlockManagerLinearAttention, LinearAttentionBlockCopyin
         std::make_tuple(4, 97, 35)               // normal case beamWidth > 1
         ));
 
+TEST_F(KVCacheManagerTest, StaticLinearHybridAllocationTest)
+{
+    auto constexpr numLayers = 12;
+    auto constexpr numKvHeads = 6;
+    auto constexpr sizePerHead = 128;
+    auto constexpr tokensPerBlock = 32;
+    auto constexpr maxBatchSize = 20;
+    auto constexpr kvFactor = 2;
+
+    auto constexpr maxAttentionWindow = 1024;
+    SizeType32 constexpr linearWindowSizeCode = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+
+    LinearAttentionMetadata const linearAttentionMetadata{
+        .linearLayerIndices = {2, 5, 8, 11},
+        .cacheType = linearWindowSizeCode,
+        .allRecurrentStatesBytes = 1 * 1024, // dummy value
+        .statesSnapshotInterval = tokensPerBlock * 2,
+        .saveLastSnapshot = true,
+        .numPlaceholderBlocks = std::nullopt,
+    };
+
+    // 12 layers total: layers 2, 5, 8, 11 are linear-attention layers; the rest use maxAttentionWindow.
+    std::vector<SizeType32> const linearLayerIndices = linearAttentionMetadata.linearLayerIndices;
+    std::set<SizeType32> const linearLayerSet(linearLayerIndices.begin(), linearLayerIndices.end());
+    std::vector<SizeType32> regularLayerIndices;
+    for (SizeType32 layer = 0; layer < numLayers; ++layer)
+    {
+        if (linearLayerSet.find(layer) == linearLayerSet.end())
+        {
+            regularLayerIndices.push_back(layer);
+        }
+    }
+    std::map<SizeType32, std::vector<SizeType32>> const windowSizeToLayers{
+        {maxAttentionWindow, regularLayerIndices},
+        {linearWindowSizeCode, linearLayerIndices},
+    };
+    std::vector<SizeType32> const numKvHeadsPerLayer(numLayers, numKvHeads);
+
+    // Sized to comfortably exceed the static reservation
+    // (maxBatchSize * allRecurrentStatesBytes = 20 KiB) plus dynamic blocks for the regular window.
+    uint64_t constexpr allottedPrimaryMemBytes = 64ULL * 1024ULL * 1024ULL;
+    uint64_t constexpr allottedSecondaryMemBytes = 0;
+    size_t constexpr extraCostMemory = 0;
+
+    tensorrt_llm::runtime::WorldConfig const worldConfig{};
+
+    // Static-hybrid path requires block reuse to be disabled.
+    tle::KvCacheConfig const kvCacheConfigDisabledReuse{/*enableBlockReuse=*/false};
+    auto const blocksPerWindow
+        = KVCacheManager::calculateMaxNumBlocks(kvCacheConfigDisabledReuse, nvinfer1::DataType::kHALF,
+            numKvHeadsPerLayer, sizePerHead, tokensPerBlock, worldConfig, windowSizeToLayers, allottedPrimaryMemBytes,
+            allottedSecondaryMemBytes, extraCostMemory, kvFactor, maxBatchSize, linearAttentionMetadata);
+
+    // Linear-attention pool gets exactly maxBatchSize blocks (statically reserved).
+    ASSERT_EQ(blocksPerWindow.count(linearWindowSizeCode), 1);
+    EXPECT_EQ(std::get<0>(blocksPerWindow.at(linearWindowSizeCode)), maxBatchSize);
+    // No secondary memory was provided, so secondary block count is zero.
+    EXPECT_EQ(std::get<1>(blocksPerWindow.at(linearWindowSizeCode)), 0);
+
+    // The regular window must still receive a positive number of dynamic blocks
+    // after the static reservation is subtracted from the primary memory budget.
+    ASSERT_EQ(blocksPerWindow.count(maxAttentionWindow), 1);
+    EXPECT_GT(std::get<0>(blocksPerWindow.at(maxAttentionWindow)), 0);
+
+    // Sanity check: when block reuse is enabled, the static-hybrid path is not taken,
+    // so the linear pool falls back to memory-budget-based sizing rather than maxBatchSize.
+    tle::KvCacheConfig const kvCacheConfigEnabledReuse{/*enableBlockReuse=*/true};
+    auto const dynamicBlocksPerWindow
+        = KVCacheManager::calculateMaxNumBlocks(kvCacheConfigEnabledReuse, nvinfer1::DataType::kHALF,
+            numKvHeadsPerLayer, sizePerHead, tokensPerBlock, worldConfig, windowSizeToLayers, allottedPrimaryMemBytes,
+            allottedSecondaryMemBytes, extraCostMemory, kvFactor, maxBatchSize, linearAttentionMetadata);
+    EXPECT_NE(std::get<0>(dynamicBlocksPerWindow.at(linearWindowSizeCode)), maxBatchSize);
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // addSequenceBatch corner-case tests
 //
