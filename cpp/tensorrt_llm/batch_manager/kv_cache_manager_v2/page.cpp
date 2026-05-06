@@ -140,7 +140,39 @@ UncommittedPage::UncommittedPage(KvCache& kvc, BlockOrdinal ord, LifeCycleId lc,
 
 UncommittedPage::~UncommittedPage()
 {
-    // Delegate to Page::~Page().
+    // Mirrors Python UncommittedPage.__del__: for attention LCs, the page must be either:
+    //  - part of an SSM lifecycle (different rules),
+    //  - at an ordinal beyond the current block list (block already removed),
+    //  - the slot at this position is null, CommittedPage, or this page itself (self-destruction).
+    // The "p == this" condition is C++-specific: std::variant destroys the old value before
+    // switching to monostate, so during destruction the slot still references this page.
+    if (!gNdebug)
+    {
+        if (auto mgr = manager.lock())
+        {
+            auto ssmLcId = mgr->lifeCycles().ssmLifeCycleId();
+            bool isSsm = ssmLcId.has_value() && lifeCycle == *ssmLcId;
+            if (!isSsm)
+            {
+                if (auto kvc = kvCache.lock())
+                {
+                    [[maybe_unused]] bool blockRemoved = static_cast<int>(kvc->blocks().size()) <= ordinal;
+                    [[maybe_unused]] bool pageOk = true;
+                    if (!blockRemoved)
+                    {
+                        auto const& bp = kvc->blocks()[static_cast<size_t>(ordinal)]
+                                             .pages[static_cast<size_t>(beamIndex)][static_cast<size_t>(lifeCycle)];
+                        auto page = blockPageGetPage(bp);
+                        pageOk = blockPageIsNull(bp) || page.get() == this
+                            || std::dynamic_pointer_cast<CommittedPage>(page) != nullptr;
+                    }
+                    assert((blockRemoved || pageOk)
+                        && "UncommittedPage destroyed but slot still holds a different uncommitted page");
+                }
+            }
+        }
+    }
+    // Delegate slot release to Page::~Page().
 }
 
 std::shared_ptr<CommittedPage> UncommittedPage::convertToCommitted(std::shared_ptr<Block> blk, CachedCudaEvent readyEv)
@@ -164,6 +196,7 @@ std::shared_ptr<CommittedPage> UncommittedPage::convertToCommitted(std::shared_p
     readyEvent = CachedCudaEvent::makeNull();
 
     assert(!hasValidSlot() && readyEvent.isNull());
+    assert(committed->hasValidSlot() && "committed page must have a valid slot after transfer");
 
     // Register in block storage.
     blk->storage.at(static_cast<size_t>(lifeCycle)) = committed;

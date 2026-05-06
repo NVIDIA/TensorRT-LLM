@@ -16,6 +16,7 @@
  */
 
 #include "kv_cache_manager_v2/storage/config.h"
+#include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/utils/math.h"
 
 #include <algorithm>
@@ -175,6 +176,23 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         SlotDesc sd;
         sd.variants = std::move(variants);
         out.slotDescList.push_back(std::move(sd));
+    }
+
+    // A21: Assert all life_cycle_ids across all SlotDescVariants are unique.
+    // Mirrors Python StorageConfig.__post_init__:
+    //   all_life_cycle_ids = [lc_id for variant in self.slot_desc_list for lc_id in variant.life_cycle_ids]
+    //   assert len(all_life_cycle_ids) == len(set(all_life_cycle_ids))
+    if (!gNdebug)
+    {
+        std::unordered_set<LifeCycleId> allLcIds;
+        for (auto const& sd : out.slotDescList)
+        {
+            for (auto const& variant : sd.variants)
+            {
+                [[maybe_unused]] bool inserted = allLcIds.insert(variant.lifeCycleId).second;
+                assert(inserted && "Duplicate life_cycle_id across SlotDescVariants");
+            }
+        }
     }
 
     return out;

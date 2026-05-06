@@ -371,6 +371,12 @@ std::shared_ptr<Block> addOrGetExistingBlock(std::unordered_map<BlockKey, std::s
     BlockKey const& parentKey, int numLifeCycles, int tokensPerBlock, std::vector<TokenIdExt> tokens,
     RootBlock* parentRoot, Block* parentBlock, bool* isNew)
 {
+    // Parent must be a full block (mirrors Python: "prev must be a full block").
+    if (parentBlock)
+    {
+        assert(parentBlock->isFull() && "prev must be a full block");
+    }
+
     BlockKey newKey = Block::makeKey(parentKey, tokens.data(), tokens.size());
 
     // Exact match: return existing block (not new — mirrors Python's UselessBlockError path).
@@ -404,7 +410,13 @@ std::shared_ptr<Block> addOrGetExistingBlock(std::unordered_map<BlockKey, std::s
         }
     }
     for (auto const& k : toRemove)
-        parentNext.erase(k);
+    {
+        auto erased = parentNext.find(k);
+        assert(erased != parentNext.end());
+        auto erasedBlock = erased->second;
+        parentNext.erase(erased);
+        assert(erasedBlock->isOrphan() && "erased sibling must be orphan after removal");
+    }
 
     // Create the new block.
     auto block = std::make_shared<Block>();
@@ -448,6 +460,12 @@ std::vector<std::weak_ptr<CommittedPage>> removeSubtree(
 
         // Clear storage.
         block->storage.assign(block->storage.size(), {});
+        if (!gNdebug)
+        {
+            assert(
+                std::all_of(block->storage.begin(), block->storage.end(), [](auto const& wp) { return wp.expired(); })
+                && "storage must be cleared after assign");
+        }
 
         // Push children (they will be destroyed when removed from parent's next).
         for (auto& [k, child] : block->next)
@@ -589,6 +607,7 @@ std::vector<std::weak_ptr<CommittedPage>> BlockRadixTree::clear()
         }
     }
 
+    assert(mRoots.empty() && "mRoots must be empty after clear");
     return ret;
 }
 
