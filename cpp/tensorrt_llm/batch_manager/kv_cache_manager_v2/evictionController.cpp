@@ -22,6 +22,7 @@
 
 #include <cassert>
 #include <numeric>
+#include <set>
 #include <stdexcept>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -133,6 +134,10 @@ PerLevelEvictionController::PerLevelEvictionController(
         if (g + 1 > numPoolGroups)
             numPoolGroups = g + 1;
     }
+    // Pool group indices must be contiguous 0..N-1.
+    assert(numPoolGroups
+        == static_cast<PoolGroupIndex>(
+            std::set<PoolGroupIndex>(mLifeCycleGrouping.begin(), mLifeCycleGrouping.end()).size()));
     mPolicies.resize(static_cast<size_t>(numPoolGroups));
 }
 
