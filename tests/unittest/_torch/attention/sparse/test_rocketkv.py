@@ -8,8 +8,7 @@ from utils.util import getSMVersion
 
 import tensorrt_llm
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.attention_backend.interface import \
-    AttentionForwardContext
+from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
 from tensorrt_llm._torch.attention_backend.sparse.rocket import (
     RocketKVCacheManager, RocketTrtllmAttention, RocketTrtllmAttentionMetadata,
     RocketVanillaAttention, RocketVanillaAttentionMetadata)
@@ -260,10 +259,10 @@ def test_sparse_kv_predict(batch_size, num_contexts):
     qkv = torch.randn(total_tokens, (num_heads + 2 * num_kv_heads) * head_dim,
                       dtype=dtype,
                       device=device)
-    ctx = AttentionForwardContext()
+    forward_args = AttentionForwardArgs()
 
     trtllm_sparse_kv_indices, trtllm_sparse_kv_offsets = trtllm_attn.sparse_kv_predict(
-        qkv, None, trtllm_metadata, ctx)
+        qkv, None, trtllm_metadata, forward_args)
 
     vanilla_sparse_kv_indices_list = []
     offset = 0
@@ -526,9 +525,10 @@ def test_sparse_attn_predict(batch_size, num_contexts):
 
                 kt_token_idx += kt_tokens_in_this_block
 
-    ctx = AttentionForwardContext()
+    forward_args = AttentionForwardArgs()
     trtllm_sparse_attn_indices, trtllm_sparse_attn_offsets = (
-        trtllm_attn.sparse_attn_predict(qkv, None, trtllm_metadata, ctx))
+        trtllm_attn.sparse_attn_predict(qkv, None, trtllm_metadata,
+                                        forward_args))
 
     vanilla_sparse_attn_indices_list = []
     offset = sum(seq_lens[:num_contexts])  # Skip context tokens

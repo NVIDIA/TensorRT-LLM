@@ -11,7 +11,7 @@ import torch.nn.functional as F
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.interface import (
-    AttentionForwardContext, MLAParams, PositionalEmbeddingParams)
+    AttentionForwardArgs, MLAParams, PositionalEmbeddingParams)
 from tensorrt_llm._torch.attention_backend.trtllm import (
     TrtllmAttention, TrtllmAttentionMetadata)
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
@@ -1917,13 +1917,13 @@ class DSATrtllmAttention(TrtllmAttention):
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         metadata: DSAtrtllmAttentionMetadata,
-        ctx: AttentionForwardContext,
+        forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Transform local TopK indices to global paged KV cache indices."""
         # Transform the local topk indices to global topk indices in paged kv cache
         topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
-            ctx.topk_indices, metadata, self.get_local_layer_idx(metadata),
-            ctx.is_generation)
+            forward_args.topk_indices, metadata,
+            self.get_local_layer_idx(metadata), forward_args.is_generation)
 
         # TODO: Use sparse_attn_indexer to predict the indices for DSA attention
         # return self.indexer(q, k, metadata, hidden_states, qr, position_ids)
@@ -1934,7 +1934,7 @@ class DSATrtllmAttention(TrtllmAttention):
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         metadata: DSAtrtllmAttentionMetadata,
-        ctx: AttentionForwardContext,
+        forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """No-op KV prediction; DSA uses indexer-based selection instead."""
         return None, None

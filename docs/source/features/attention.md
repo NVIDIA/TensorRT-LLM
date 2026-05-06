@@ -98,8 +98,8 @@ Its `forward` accepts the following arguments:
 | k | Tensor | Key tensor with shape `(num_tokens, num_kv_heads * head_dim)`. |
 | v | Tensor | Value tensor with shape `(num_tokens, num_kv_heads * head_dim)`. |
 | metadata | AttentionMetadata | Metadata for the attention operation. |
-| ctx | AttentionForwardContext | Optional per-forward arguments such as the attention mask, output buffers and scales, RoPE and MRoPE inputs, MLA buffers, and sparse-attention inputs. |
-| **kwargs | Any | Temporary compatibility path for fields declared by `AttentionForwardContext`; unknown fields raise an error. |
+| forward_args | AttentionForwardArgs | Optional per-forward arguments such as the attention mask, output buffers and scales, RoPE and MRoPE inputs, MLA buffers, and sparse-attention inputs. |
+| **kwargs | Any | Temporary compatibility path for fields declared by `AttentionForwardArgs`; unknown fields raise an error. |
 
 For example, the FlashInfer backend calls `append_paged_kv_cache` when it owns the KV-cache update, then calls the prefill, decode, or ragged-prefill wrapper's `run` method using the plan cached in `FlashInferAttentionMetadata`.
 

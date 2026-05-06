@@ -14,10 +14,9 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..metadata import KVCacheParams
 from ..utils import get_global_attrs, get_model_extra_attrs
-from .interface import (AttentionBackend, AttentionForwardContext,
+from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionMetadata, CustomAttentionMask,
-                        PredefinedAttentionMask,
-                        merge_attention_forward_context)
+                        PredefinedAttentionMask, merge_attention_forward_args)
 
 try:
     check_cuda_arch()
@@ -749,32 +748,32 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 k: Optional[torch.Tensor],
                 v: Optional[torch.Tensor],
                 metadata: FlashInferAttentionMetadata,
-                ctx: Optional[AttentionForwardContext] = None,
+                forward_args: Optional[AttentionForwardArgs] = None,
                 **kwargs) -> torch.Tensor:
-        ctx = merge_attention_forward_context(ctx, kwargs)
+        forward_args = merge_attention_forward_args(forward_args, kwargs)
 
-        attention_mask_data = ctx.attention_mask_data
-        if ctx.attention_mask == CustomAttentionMask.CUSTOM:
+        attention_mask_data = forward_args.attention_mask_data
+        if forward_args.attention_mask == CustomAttentionMask.CUSTOM:
             assert attention_mask_data is not None, "attention_mask_data is required for custom attention mask."
             attention_mask_type = int(AttentionMaskType.custom_mask)
             attention_mask_data = attention_mask_data if attention_mask_data.ndim == 1 else attention_mask_data.flatten(
             )
-        elif ctx.attention_mask == PredefinedAttentionMask.CAUSAL:
+        elif forward_args.attention_mask == PredefinedAttentionMask.CAUSAL:
             attention_mask_type = int(AttentionMaskType.causal)
             attention_mask_data = None
-        elif ctx.attention_mask == PredefinedAttentionMask.FULL:
+        elif forward_args.attention_mask == PredefinedAttentionMask.FULL:
             attention_mask_type = int(AttentionMaskType.padding)
             attention_mask_data = None
         else:
             raise ValueError("Unexpected attention mask type")
 
-        output = ctx.output
+        output = forward_args.output
         if output is None:
             output = torch.empty_like(q)
 
         # FlashInfer's sliding window attention is inclusive, while the attention window size defined in TRTLLM is exclusive.
         # So we need to subtract 1 from the attention window size for a consistent behavior.
-        attention_window_size = ctx.attention_window_size
+        attention_window_size = forward_args.attention_window_size
         if attention_window_size is not None:
             attention_window_size = attention_window_size - 1
 

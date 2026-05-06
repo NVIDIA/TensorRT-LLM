@@ -11,10 +11,9 @@ try:
 except ImportError:
     AttentionMaskConverter = None
 
-from .interface import (AttentionBackend, AttentionForwardContext,
-                        AttentionMask, AttentionMetadata,
-                        PredefinedAttentionMask,
-                        merge_attention_forward_context)
+from .interface import (AttentionBackend, AttentionForwardArgs, AttentionMask,
+                        AttentionMetadata, PredefinedAttentionMask,
+                        merge_attention_forward_args)
 from .sparse.kernel import triton_index_gather
 
 
@@ -380,21 +379,22 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 k: Optional[torch.Tensor],
                 v: Optional[torch.Tensor],
                 metadata: VanillaAttentionMetadata,
-                ctx: Optional[AttentionForwardContext] = None,
+                forward_args: Optional[AttentionForwardArgs] = None,
                 **kwargs) -> torch.Tensor:
-        ctx = merge_attention_forward_context(ctx, kwargs)
+        forward_args = merge_attention_forward_args(forward_args, kwargs)
         if metadata.kv_cache_manager is None:
             # NOTE: WAR for no kv cache attn e.g. BERT,
             # try to separate the kv cache estimation path from no kv cache attn.
             num_heads = self.num_heads
             num_kv_heads = self.num_kv_heads
-            return self.no_kv_cache_forward(q=q,
-                                            k=k,
-                                            v=v,
-                                            num_heads=num_heads,
-                                            num_kv_heads=num_kv_heads,
-                                            metadata=metadata,
-                                            attention_mask=ctx.attention_mask)
+            return self.no_kv_cache_forward(
+                q=q,
+                k=k,
+                v=v,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                metadata=metadata,
+                attention_mask=forward_args.attention_mask)
 
         past_seen_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
         cache_indices = [
@@ -424,9 +424,9 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             cache_idx = cache_indices[sample_idx]
 
             attn_output = self._single_request_forward(
-                single_q, single_k, single_v, ctx.attention_mask,
+                single_q, single_k, single_v, forward_args.attention_mask,
                 kv_cache_tensor, past_seen_token, cache_idx, sample_idx,
-                metadata, ctx.attention_window_size)
+                metadata, forward_args.attention_window_size)
 
             attn_outputs.append(attn_output)
 

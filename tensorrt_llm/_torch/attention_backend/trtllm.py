@@ -20,11 +20,11 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
                      get_model_extra_attrs)
-from .interface import (AttentionBackend, AttentionForwardContext,
+from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
                         PredefinedAttentionMask, RopeParams,
-                        merge_attention_forward_context)
+                        merge_attention_forward_args)
 from .trtllm_gen import trtllm_gen_attention
 
 # Enable TRTLLM-Gen attention backend via environment variable (default: off).
@@ -1203,7 +1203,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         output: torch.Tensor,
         output_sf: Optional[torch.Tensor],
         metadata: TrtllmAttentionMetadata,
-        ctx: AttentionForwardContext,
+        forward_args: AttentionForwardArgs,
         use_paged_context_fmha: bool,
         sparse_kv_indices: Optional[torch.Tensor],
         sparse_kv_offsets: Optional[torch.Tensor],
@@ -1220,7 +1220,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 and v is None) or (not is_fused_qkv and k is not None
                                    and v is not None)
 
-        attention_input_type = ctx.attention_input_type
+        attention_input_type = forward_args.attention_input_type
         if not self.is_mla_enable:
             if is_fused_qkv:
                 qkv_hidden_size = (self.num_heads +
@@ -1265,7 +1265,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert metadata.prompt_lens_cpu_runtime.shape[0] == batch_size
         assert metadata.host_request_types_runtime.shape[0] == batch_size
 
-        mask_type = self._get_mask_type(ctx.attention_mask)
+        mask_type = self._get_mask_type(forward_args.attention_mask)
         self._ensure_rope_table_size(metadata.max_seq_len)
 
         rotary_embedding_dim = self.rope_params.dim
@@ -1312,19 +1312,27 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.skip_softmax_stat.zero_()
 
         use_nvfp4_output = output_sf is not None
-        out_scale = ctx.out_scale_sf if use_nvfp4_output else ctx.out_scale
-        kv_scale_orig_quant = self.kv_scale_orig_quant if ctx.kv_scales_sf_inv is None else ctx.kv_scales_sf_inv
-        kv_scale_quant_orig = self.kv_scale_quant_orig if ctx.kv_scales_sf is None else ctx.kv_scales_sf
-        mrope_rotary_cos_sin = ctx.mrope_config.get(
-            'mrope_rotary_cos_sin') if ctx.mrope_config is not None else None
-        mrope_position_deltas = ctx.mrope_config.get(
-            'mrope_position_deltas') if ctx.mrope_config is not None else None
+        out_scale = (forward_args.out_scale_sf
+                     if use_nvfp4_output else forward_args.out_scale)
+        kv_scale_orig_quant = (self.kv_scale_orig_quant
+                               if forward_args.kv_scales_sf_inv is None else
+                               forward_args.kv_scales_sf_inv)
+        kv_scale_quant_orig = (self.kv_scale_quant_orig
+                               if forward_args.kv_scales_sf is None else
+                               forward_args.kv_scales_sf)
+        mrope_rotary_cos_sin = forward_args.mrope_config.get(
+            'mrope_rotary_cos_sin'
+        ) if forward_args.mrope_config is not None else None
+        mrope_position_deltas = forward_args.mrope_config.get(
+            'mrope_position_deltas'
+        ) if forward_args.mrope_config is not None else None
         workspace = metadata.workspace if not metadata.is_cuda_graph else metadata.cuda_graph_workspace
         flash_mla_tile_scheduler_metadata = (
             metadata.flash_mla_tile_scheduler_metadata
             if metadata.enable_flash_mla else None)
         flash_mla_num_splits = metadata.flash_mla_num_splits if metadata.enable_flash_mla else None
-        attention_window_size = ctx.attention_window_size or metadata.max_seq_len
+        attention_window_size = (forward_args.attention_window_size
+                                 or metadata.max_seq_len)
         max_context_length = min(metadata.max_seq_len - 1,
                                  metadata.max_num_tokens)
 
@@ -1380,10 +1388,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 out_scale,
                 self.rotary_inv_freq,
                 self.rotary_cos_sin,
-                ctx.latent_cache,
-                ctx.q_pe,
+                forward_args.latent_cache,
+                forward_args.q_pe,
                 metadata.block_ids_per_seq,
-                ctx.attention_sinks,
+                forward_args.attention_sinks,
                 is_fused_qkv,
                 update_kv_cache,
                 self.predicted_tokens_per_seq,
@@ -1409,7 +1417,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 use_paged_context_fmha,
                 int(attention_input_type),
                 self.is_mla_enable,
-                ctx.chunked_prefill_buffer_batch_size,
+                forward_args.chunked_prefill_buffer_batch_size,
                 self.q_lora_rank,
                 self.kv_lora_rank,
                 self.qk_nope_head_dim,
@@ -1419,7 +1427,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 mrope_position_deltas,
                 helix_tensor_params,
                 self.attention_chunk_size,
-                ctx.softmax_stats_tensor,
+                forward_args.softmax_stats_tensor,
                 spec_decoding_bool_params,
                 spec_decoding_tensor_params,
                 sparse_kv_indices,
@@ -1431,12 +1439,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 skip_softmax_threshold_scale_factor_prefill,
                 skip_softmax_threshold_scale_factor_decode,
                 self.skip_softmax_stat,
-                ctx.cu_q_seqlens,
-                ctx.cu_kv_seqlens,
-                ctx.fmha_scheduler_counter,
-                ctx.mla_bmm1_scale,
-                ctx.mla_bmm2_scale,
-                ctx.quant_q_buffer,
+                forward_args.cu_q_seqlens,
+                forward_args.cu_kv_seqlens,
+                forward_args.fmha_scheduler_counter,
+                forward_args.mla_bmm1_scale,
+                forward_args.mla_bmm2_scale,
+                forward_args.quant_q_buffer,
                 self.quant_config,
                 metadata.kv_cache_manager,
                 metadata.num_contexts,
@@ -1466,10 +1474,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 out_scale,
                 self.rotary_inv_freq,
                 self.rotary_cos_sin,
-                ctx.latent_cache,
-                ctx.q_pe,
+                forward_args.latent_cache,
+                forward_args.q_pe,
                 metadata.block_ids_per_seq,
-                ctx.attention_sinks,
+                forward_args.attention_sinks,
                 is_fused_qkv,
                 update_kv_cache,
                 self.predicted_tokens_per_seq,
@@ -1495,7 +1503,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 use_paged_context_fmha,
                 int(attention_input_type),
                 self.is_mla_enable,
-                ctx.chunked_prefill_buffer_batch_size,
+                forward_args.chunked_prefill_buffer_batch_size,
                 self.q_lora_rank,
                 self.kv_lora_rank,
                 self.qk_nope_head_dim,
@@ -1505,7 +1513,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 mrope_position_deltas,
                 helix_tensor_params,
                 self.attention_chunk_size,
-                ctx.softmax_stats_tensor,
+                forward_args.softmax_stats_tensor,
                 spec_decoding_bool_params,
                 spec_decoding_tensor_params,
                 sparse_kv_indices,
@@ -1517,18 +1525,18 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 skip_softmax_threshold_scale_factor_prefill,
                 skip_softmax_threshold_scale_factor_decode,
                 self.skip_softmax_stat,
-                ctx.cu_q_seqlens,
-                ctx.cu_kv_seqlens,
-                ctx.fmha_scheduler_counter,
-                ctx.mla_bmm1_scale,
-                ctx.mla_bmm2_scale,
-                ctx.quant_q_buffer,
+                forward_args.cu_q_seqlens,
+                forward_args.cu_kv_seqlens,
+                forward_args.fmha_scheduler_counter,
+                forward_args.mla_bmm1_scale,
+                forward_args.mla_bmm2_scale,
+                forward_args.quant_q_buffer,
                 flash_mla_tile_scheduler_metadata,
                 flash_mla_num_splits,
-                ctx.sage_attn_num_elts_per_blk_q,
-                ctx.sage_attn_num_elts_per_blk_k,
-                ctx.sage_attn_num_elts_per_blk_v,
-                ctx.sage_attn_qk_int8,
+                forward_args.sage_attn_num_elts_per_blk_q,
+                forward_args.sage_attn_num_elts_per_blk_k,
+                forward_args.sage_attn_num_elts_per_blk_v,
+                forward_args.sage_attn_qk_int8,
                 num_contexts=metadata.num_contexts,
                 num_ctx_tokens=metadata.num_ctx_tokens,
             )
@@ -1546,11 +1554,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         k: Optional[torch.Tensor],
         v: Optional[torch.Tensor],
         metadata: TrtllmAttentionMetadata,
-        ctx: Optional[AttentionForwardContext] = None,
+        forward_args: Optional[AttentionForwardArgs] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Execute the TRTLLM attention backend."""
-        ctx = merge_attention_forward_context(ctx, kwargs)
+        forward_args = merge_attention_forward_args(forward_args, kwargs)
         assert isinstance(
             metadata,
             TrtllmAttentionMetadata,
@@ -1578,16 +1586,17 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             # Context MLA uses separate qkv instead of paged_context_fmha
             use_paged_context_fmha = False
 
-        output = ctx.output
-        output_sf = ctx.output_sf
+        output = forward_args.output
+        output_sf = forward_args.output_sf
         if output is None:
             # Output is not provided.
-            is_gen_only = ctx.attention_input_type == AttentionInputType.generation_only
+            is_gen_only = (forward_args.attention_input_type ==
+                           AttentionInputType.generation_only)
             outputs = self.create_output(
                 q,
-                is_quantize_output=ctx.out_scale is not None,
+                is_quantize_output=forward_args.out_scale is not None,
                 metadata=metadata,
-                attention_mask=ctx.attention_mask,
+                attention_mask=forward_args.attention_mask,
                 use_paged_context_fmha=use_paged_context_fmha,
                 is_mla_enable=self.is_mla_enable,
                 is_gen_only=is_gen_only,
@@ -1608,9 +1617,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
             else:
                 sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
-                    q, k, metadata, ctx)
+                    q, k, metadata, forward_args)
                 sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
-                    q, k, metadata, ctx)
+                    q, k, metadata, forward_args)
                 sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
                 )
         num_sparse_topk = getattr(metadata, 'num_sparse_topk', 0)
@@ -1619,8 +1628,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # The flag is reset in prepare_flash_mla() and update_for_spec_dec() to trigger
         # recomputation when cache_seq_lens change. The metadata must always match the
         # compacted generation sub-batch, which is also the layout used by block_ids_per_seq.
-        if (metadata.enable_flash_mla
-                and ctx.attention_input_type != AttentionInputType.context_only
+        if (metadata.enable_flash_mla and forward_args.attention_input_type
+                != AttentionInputType.context_only
                 and metadata.num_generations > 0
                 and not metadata._flash_mla_metadata_valid):
             self._compute_flash_mla_metadata(metadata)
@@ -1633,7 +1642,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                and metadata._seq_lens_cuda is not None):
             metadata.update_blackwell_first_sparse_mask_offset()
 
-        self._run(q, k, v, output, output_sf, metadata, ctx,
+        self._run(q, k, v, output, output_sf, metadata, forward_args,
                   use_paged_context_fmha, sparse_kv_indices, sparse_kv_offsets,
                   sparse_attn_indices, sparse_attn_offsets,
                   sparse_attn_indices_block_size, num_sparse_topk,
@@ -1842,7 +1851,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         metadata: TrtllmAttentionMetadata,
-        ctx: AttentionForwardContext,
+        forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
             Predict sparse kv indices. It's implemented in the derived class.
@@ -1854,7 +1863,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         metadata: TrtllmAttentionMetadata,
-        ctx: AttentionForwardContext,
+        forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
             Predict sparse attn indices. It's implemented in the derived class.

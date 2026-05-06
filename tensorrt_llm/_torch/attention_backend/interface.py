@@ -674,7 +674,7 @@ AttentionMask = Union[PredefinedAttentionMask, CustomAttentionMask]
 
 
 @dataclass(kw_only=True, slots=True)
-class AttentionForwardContext:
+class AttentionForwardArgs:
     """Per-forward optional arguments for attention backends."""
 
     output: Optional[torch.Tensor] = None
@@ -716,29 +716,29 @@ class AttentionForwardContext:
     is_generation: bool = False
 
 
-_ATTENTION_FORWARD_CONTEXT_FIELDS = frozenset(
-    AttentionForwardContext.__dataclass_fields__)
+_ATTENTION_FORWARD_ARGS_FIELDS = frozenset(
+    AttentionForwardArgs.__dataclass_fields__)
 
 
-def merge_attention_forward_context(
-    ctx: Optional[AttentionForwardContext],
+def merge_attention_forward_args(
+    forward_args: Optional[AttentionForwardArgs],
     kwargs: Dict[str, Any],
-) -> AttentionForwardContext:
-    """Merge legacy attention kwargs into an explicit context."""
+) -> AttentionForwardArgs:
+    """Merge legacy attention kwargs into explicit forward arguments."""
 
-    unknown_kwargs = sorted(set(kwargs) - _ATTENTION_FORWARD_CONTEXT_FIELDS)
+    unknown_kwargs = sorted(set(kwargs) - _ATTENTION_FORWARD_ARGS_FIELDS)
     if unknown_kwargs:
         raise ValueError(
             f"Unknown attention forward arguments: {unknown_kwargs}")
 
-    if ctx is not None:
+    if forward_args is not None:
         if kwargs:
             raise ValueError(
-                "Pass attention forward options either through ctx or as "
-                f"legacy kwargs, not both: {sorted(kwargs)}")
-        return ctx
+                "Pass attention forward options either through forward_args "
+                f"or as legacy kwargs, not both: {sorted(kwargs)}")
+        return forward_args
 
-    return AttentionForwardContext(**kwargs)
+    return AttentionForwardArgs(**kwargs)
 
 
 class AttentionBackend(Generic[TMetadata]):
@@ -787,7 +787,7 @@ class AttentionBackend(Generic[TMetadata]):
                 k: Optional[torch.Tensor],
                 v: Optional[torch.Tensor],
                 metadata: TMetadata,
-                ctx: Optional[AttentionForwardContext] = None,
+                forward_args: Optional[AttentionForwardArgs] = None,
                 **kwargs) -> torch.Tensor:
         """
         Update KV Cache and perform the attention operation.
@@ -800,7 +800,7 @@ class AttentionBackend(Generic[TMetadata]):
             v (Optional[torch.Tensor]): Value tensor with shape (num_new_kv_tokens, num_kv_heads * head_dim),
                                         or None if QKV tensor is provided, or there's no new kv token.
             metadata (AttentionMetadata): Metadata for the attention operation.
-            ctx (AttentionForwardContext): Per-forward optional attention arguments.
+            forward_args (AttentionForwardArgs): Per-forward optional attention arguments.
         Returns:
             torch.Tensor with shape (num_q_tokens, num_heads * head_dim)
         """

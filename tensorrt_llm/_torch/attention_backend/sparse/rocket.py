@@ -8,7 +8,7 @@ from triton import next_power_of_2
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.interface import (
-    AttentionForwardContext, AttentionMetadata)
+    AttentionForwardArgs, AttentionMetadata)
 from tensorrt_llm._torch.attention_backend.trtllm import (
     TrtllmAttention, TrtllmAttentionMetadata)
 from tensorrt_llm._torch.attention_backend.vanilla import (
@@ -356,7 +356,7 @@ class RocketTrtllmAttention(TrtllmAttention):
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         metadata: TrtllmAttentionMetadata,
-        ctx: AttentionForwardContext,
+        forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Predict sparse KV indices using optimized SnapKV algorithm.
@@ -514,7 +514,7 @@ class RocketTrtllmAttention(TrtllmAttention):
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         metadata: TrtllmAttentionMetadata,
-        ctx: AttentionForwardContext,
+        forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         if metadata.num_generations == 0:
             return None, None

@@ -14,7 +14,7 @@ from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import (AttentionForwardContext, AttentionInputType,
+from ..attention_backend import (AttentionForwardArgs, AttentionInputType,
                                  AttentionMetadata, FlashInferAttentionMetadata,
                                  TrtllmAttention, TrtllmAttentionMetadata)
 from ..attention_backend.interface import (AttentionBackend, AttentionMask,
@@ -737,7 +737,7 @@ class Attention(nn.Module):
                 k,
                 v,
                 attn_metadata,
-                ctx=AttentionForwardContext(
+                forward_args=AttentionForwardArgs(
                     attention_mask=attention_mask,
                     mrope_config=mrope_config,
                     attention_window_size=attention_window_size,
@@ -771,7 +771,7 @@ class Attention(nn.Module):
             k,
             v,
             attn_metadata,
-            ctx=AttentionForwardContext(
+            forward_args=AttentionForwardArgs(
                 out_scale=out_scale,
                 out_scale_sf=out_scale_sf,
                 kv_scales_sf=kv_scales_sf,
@@ -1594,7 +1594,7 @@ class MLA(nn.Module):
                 k,
                 v,
                 attn_metadata,
-                ctx=AttentionForwardContext(**kwargs),
+                forward_args=AttentionForwardArgs(**kwargs),
             )
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
@@ -1608,7 +1608,7 @@ class MLA(nn.Module):
                 k,
                 v,
                 attn_metadata,
-                ctx=AttentionForwardContext(**kwargs),
+                forward_args=AttentionForwardArgs(**kwargs),
             )
             return attn_output
 
@@ -1956,7 +1956,7 @@ class MLA(nn.Module):
             k,
             v,
             attn_metadata,
-            ctx=AttentionForwardContext(
+            forward_args=AttentionForwardArgs(
                 attention_input_type=AttentionInputType.context_only,
                 latent_cache=latent_cache,
                 out_scale=self.out_scale,
@@ -2128,7 +2128,7 @@ class MLA(nn.Module):
             full_k,
             full_v,
             attn_metadata,
-            ctx=AttentionForwardContext(
+            forward_args=AttentionForwardArgs(
                 attention_input_type=AttentionInputType.context_only,
                 latent_cache=None,
                 out_scale=self.out_scale,
@@ -2235,7 +2235,7 @@ class MLA(nn.Module):
                 chunked_k,
                 chunked_v,
                 attn_metadata,
-                ctx=AttentionForwardContext(
+                forward_args=AttentionForwardArgs(
                     attention_input_type=AttentionInputType.context_only,
                     latent_cache=None,
                     out_scale=self.out_scale,
@@ -2288,7 +2288,7 @@ class MLA(nn.Module):
             k,
             v,
             attn_metadata,
-            ctx=AttentionForwardContext(
+            forward_args=AttentionForwardArgs(
                 attention_input_type=AttentionInputType.context_only,
                 latent_cache=None,
                 out_scale=self.out_scale,

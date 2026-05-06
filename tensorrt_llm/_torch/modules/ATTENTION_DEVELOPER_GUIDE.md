@@ -63,8 +63,8 @@ appends, and reuses KV cache, especially during decode.
 - optional output gating
 - optional LoRA injection
 - collecting masks, sinks, output buffers, and other per-forward options into
-  `AttentionForwardContext`
-- passing Q/K/V, metadata, and `AttentionForwardContext` into the backend
+  `AttentionForwardArgs`
+- passing Q/K/V, metadata, and `AttentionForwardArgs` into the backend
 
 At a high level:
 
@@ -149,9 +149,9 @@ All backends implement the `AttentionBackend` interface.
 
 The core contract is:
 
-- `forward(q, k, v, metadata, ctx=..., **kwargs)`
+- `forward(q, k, v, metadata, forward_args=..., **kwargs)`
 - `Metadata` subtype
-- `AttentionForwardContext` for per-forward optional arguments such as masks,
+- `AttentionForwardArgs` for per-forward optional arguments such as masks,
   output buffers, scales, RoPE/mRoPE inputs, MLA buffers, and sparse inputs
 - coarse capability hooks:
   - `support_fused_rope()`
@@ -159,8 +159,8 @@ The core contract is:
   - `support_mla()`
 
 `**kwargs` is only a temporary compatibility path. It is merged into
-`AttentionForwardContext`, rejects unknown fields, and must not be mixed with
-an explicit `ctx`.
+`AttentionForwardArgs`, rejects unknown fields, and must not be mixed with
+an explicit `forward_args`.
 
 Those capability hooks are coarse checks. They do not prove that every
 required operator or sparse path already exists.
