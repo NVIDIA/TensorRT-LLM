@@ -28,6 +28,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cuda_bf16.h> // 4d: bf16 dispatcher overload
+#include <cuda_fp16.h> // 4d: fp16 dispatcher overload
 #include <mutex>
 
 namespace cg = cooperative_groups;
@@ -888,6 +890,116 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
             multipleBlocksPerRowConfig * topK, 1, topK, next_n, nullptr, multipleBlocksPerRowConfig, outIndicesAux);
     }
     sync_check_cuda_error(stream);
+}
+
+// ============================================================================
+// bf16 / fp16 dispatcher overloads (4d_multi_dtype_unified, 2026-05-06)
+// ============================================================================
+// Reuse Scheme X v1.1 BS-threshold + v1.2 small-N axis (kBsLarge, kSeqSmall)
+// from the fp32 dispatcher, except kBsL2 uses 2 bytes/element instead of 4
+// (L2 footprint is half) — this means bf16/fp16 path remains valid for
+// LARGER BS than fp32, anticipating the Stage C re-tune.
+//
+// bf16/fp16 input has NO radix fallback — the production radix kernel
+// (topKPerRowDecode) is fp32-only. If GVR-Heuristic preconditions are not
+// met (preIdx missing, BS too large, N too small), this overload aborts
+// with a TLLM_CHECK error instead of casting to fp32 silently. Callers
+// must either (a) ensure GVR conditions are met, or (b) explicitly cast
+// logits to fp32 and call the fp32 entry.
+
+namespace
+{
+
+template <typename InputT>
+void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
+    int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n, int const topK,
+    int const* preIdx, int const preIdxStride, int const preIdxCount, InputT* heuristicScratch,
+    cudaStream_t const stream)
+{
+    static_assert(std::is_same_v<InputT, __nv_bfloat16> || std::is_same_v<InputT, __half>,
+        "invokeIndexerTopKDecodeDtype is for bf16/fp16 only");
+
+    constexpr int kDefaultSplitWorkThreshold = 200 * 1000;
+    int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
+
+    // Hardware caching — share with fp32 dispatcher's once_flag would require
+    // hoisting; cheaper to use a new once_flag per dtype overload.
+    static std::once_flag sHwOnceFlag;
+    static int sCachedSmCount = 0;
+    static int sCachedL2Bytes = 0;
+    std::call_once(sHwOnceFlag,
+        []()
+        {
+            int dev = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&sCachedSmCount, cudaDevAttrMultiProcessorCount, dev);
+            cudaDeviceGetAttribute(&sCachedL2Bytes, cudaDevAttrL2CacheSize, dev);
+        });
+
+    int const kBsWave = (sCachedSmCount > 0) ? (sCachedSmCount * 3 - sCachedSmCount / 8) : 426;
+    // bf16/fp16: bytes_per_element = sizeof(InputT) = 2 → kBsL2 doubles vs fp32.
+    int const bytesPerElem = static_cast<int>(sizeof(InputT));
+    int const kBsL2 = (sCachedL2Bytes > 0 && numColumns > 0)
+        ? (int) ((int64_t) sCachedL2Bytes * 9 / 10 / ((int64_t) numColumns * bytesPerElem))
+        : kBsWave;
+    int const kBsLarge = std::min(kBsWave, kBsL2 > 0 ? kBsL2 : kBsWave);
+
+    static std::once_flag sNMinOnceFlag;
+    static int sCachedNMin = 0;
+    std::call_once(sNMinOnceFlag,
+        []()
+        {
+            constexpr int kSeqSmallDefault = 12288;
+            char const* env = std::getenv("TRTLLM_HEURISTIC_NMIN");
+            if (env != nullptr)
+            {
+                int const v = std::atoi(env);
+                sCachedNMin = (v >= 1024 && v <= 200000) ? v : kSeqSmallDefault;
+            }
+            else
+            {
+                sCachedNMin = kSeqSmallDefault;
+            }
+        });
+    int const kSeqSmall = sCachedNMin;
+
+    bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && topK == kHeuristicTopK
+        && preIdxCount == kHeuristicSize && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold
+        && numColumns >= kSeqSmall && heuristicScratch != nullptr && numRows < kBsLarge;
+
+    TLLM_CHECK_WITH_INFO(canUseHeuristic,
+        "indexer_topk_decode bf16/fp16 path requires GVR-Heuristic preconditions: preIdx != nullptr, "
+        "stride1 == 1, topK == 2048, preIdxCount == 2048, kSeqSmall=%d <= numColumns < kSplitWork=%d, "
+        "numRows < kBsLarge=%d, heuristicScratch != nullptr. "
+        "Got numRows=%d numColumns=%d preIdx=%s heuristicScratch=%s. "
+        "(bf16/fp16 has no radix fallback — caller must cast to fp32 if conditions not met.)",
+        kSeqSmall, effectiveSplitWorkThreshold, kBsLarge, numRows, numColumns, preIdx ? "ok" : "null",
+        heuristicScratch ? "ok" : "null");
+
+    launchHeuristicTopKDecode(logits, seqLens, preIdx, indices, heuristicScratch, stride0, next_n, topK, preIdxStride,
+        preIdxCount, numRows, stream);
+
+    sync_check_cuda_error(stream);
+}
+
+} // anonymous namespace
+
+void invokeIndexerTopKDecode(__nv_bfloat16 const* logits, int const* seqLens, int* indices,
+    int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0, int const stride1,
+    int const next_n, int const topK, int const* preIdx, int const preIdxStride, int const preIdxCount,
+    __nv_bfloat16* heuristicScratch, cudaStream_t const stream)
+{
+    invokeIndexerTopKDecodeDtype<__nv_bfloat16>(logits, seqLens, indices, splitWorkThreshold, numRows, numColumns,
+        stride0, stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, stream);
+}
+
+void invokeIndexerTopKDecode(__half const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
+    int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n, int const topK,
+    int const* preIdx, int const preIdxStride, int const preIdxCount, __half* heuristicScratch,
+    cudaStream_t const stream)
+{
+    invokeIndexerTopKDecodeDtype<__half>(logits, seqLens, indices, splitWorkThreshold, numRows, numColumns, stride0,
+        stride1, next_n, topK, preIdx, preIdxStride, preIdxCount, heuristicScratch, stream);
 }
 
 void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int const* rowEnds, int* indices,
