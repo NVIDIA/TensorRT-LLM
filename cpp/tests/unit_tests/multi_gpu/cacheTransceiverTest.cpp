@@ -347,11 +347,11 @@ protected:
                     TLLM_CUDA_CHECK(cudaMemset(it->data(), llmRequest->getPromptLen(), it->getSizeInBytes()));
                 }
             }
-            mFutures.emplace_back(mSender->sendAsync(*llmRequest));
+            mFutures.emplace_back(mSender->sendAsync(llmRequest));
         }
         else
         {
-            auto future = mRequester->receiveAsync(*llmRequest);
+            auto future = mRequester->receiveAsync(llmRequest);
             future.get();
             TLLM_CUDA_CHECK(cudaDeviceSynchronize());
             auto blockRange = BlockRange::fromAllBlockIds(*mManager, llmRequest->mRequestId);
@@ -970,7 +970,7 @@ protected:
         auto const onlyWindowSize = blockManager.getPoolWindowSize(0);
 
         blockManager.getBufferManager(onlyWindowSize).getStream().synchronize();
-        auto future = mSender->sendAsync(*llmRequest);
+        auto future = mSender->sendAsync(llmRequest);
         return future;
     }
 
@@ -980,7 +980,7 @@ protected:
         auto constexpr beamWidth{1};
         auto& llmRequest = request->mLlmRequest;
         mManager->addSequence(llmRequest->mRequestId, llmRequest->getNumTokens(beamIdx), beamWidth, llmRequest);
-        return mRequester->receiveAsync(*llmRequest);
+        return mRequester->receiveAsync(llmRequest);
     }
 
     void generationVerifyKVCache(std::shared_ptr<WrappedLlmRequest> const& request)

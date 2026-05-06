@@ -882,57 +882,48 @@ TransferCancelResult CacheTransceiver::cancelRequestStructured(std::shared_ptr<L
 {
     TLLM_CHECK(llmRequest != nullptr);
 
-    if (!isHealthy())
+    auto const reqId = llmRequest->mRequestId;
+    bool const sender = llmRequest->isContextOnlyRequest();
+    bool const receiver = llmRequest->isGenerationOnlyRequest();
+    if (!sender && !receiver)
     {
-        return TransferCancelResult::kBackendUnhealthy;
+        return TransferCancelResult::kNotCancellable;
     }
 
-    auto const reqId = llmRequest->mRequestId;
-    if (llmRequest->isContextOnlyRequest())
+    // Pre-advertise check first: a request that is still queued in the
+    // sender / receiver's pending list has not exposed any buffer to a
+    // peer and is always safe to release — even when the transceiver
+    // is otherwise unhealthy. Releasing pre-advertise requests during
+    // an unhealthy window reduces the resource pressure on the wedged
+    // backend rather than adding to it.
+    if (sender && mCacheSender->cancelRequest(*llmRequest))
     {
-        // Pre-advertise: the sender's queue still owns the request.
-        if (mCacheSender->cancelRequest(*llmRequest))
-        {
-            return TransferCancelResult::kCancelledBeforeAdvertise;
-        }
-        // Did the worker future already finish?
-        for (size_t i = 0; i < mSenderFutures.size(); ++i)
-        {
-            if (mSenderFutures[i].request->mRequestId != reqId)
-            {
-                continue;
-            }
-            auto status = mSenderFutures[i].future.wait_for(std::chrono::milliseconds(0));
-            if (status == std::future_status::ready)
-            {
-                return TransferCancelResult::kAlreadyComplete;
-            }
-            return TransferCancelResult::kCancelRequestedInFlight;
-        }
-        return TransferCancelResult::kNotFound;
+        return TransferCancelResult::kCancelledBeforeAdvertise;
     }
-    if (llmRequest->isGenerationOnlyRequest())
+    if (receiver && mCacheReceiver->cancelRequest(*llmRequest))
     {
-        if (mCacheReceiver->cancelRequest(*llmRequest))
-        {
-            return TransferCancelResult::kCancelledBeforeAdvertise;
-        }
-        for (size_t i = 0; i < mRequesterFutures.size(); ++i)
-        {
-            if (mRequesterFutures[i].request->mRequestId != reqId)
-            {
-                continue;
-            }
-            auto status = mRequesterFutures[i].future.wait_for(std::chrono::milliseconds(0));
-            if (status == std::future_status::ready)
-            {
-                return TransferCancelResult::kAlreadyComplete;
-            }
-            return TransferCancelResult::kCancelRequestedInFlight;
-        }
-        return TransferCancelResult::kNotFound;
+        return TransferCancelResult::kCancelledBeforeAdvertise;
     }
-    return TransferCancelResult::kNotCancellable;
+
+    auto& futures = sender ? mSenderFutures : mRequesterFutures;
+    for (size_t i = 0; i < futures.size(); ++i)
+    {
+        if (futures[i].request->mRequestId != reqId)
+        {
+            continue;
+        }
+        auto status = futures[i].future.wait_for(std::chrono::milliseconds(0));
+        if (status == std::future_status::ready)
+        {
+            return TransferCancelResult::kAlreadyComplete;
+        }
+        // Worker is mid-flight. If the transceiver is unhealthy the
+        // caller must defer cleanup pending an orchestration restart;
+        // otherwise it is just a normal in-flight cancel.
+        return isHealthy() ? TransferCancelResult::kCancelRequestedInFlight
+                           : TransferCancelResult::kBackendUnhealthy;
+    }
+    return TransferCancelResult::kNotFound;
 }
 
 bool CacheTransceiver::cancelRequest(std::shared_ptr<LlmRequest> llmRequest)

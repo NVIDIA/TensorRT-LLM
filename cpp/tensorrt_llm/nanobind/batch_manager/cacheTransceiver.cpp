@@ -46,7 +46,9 @@ class PyCacheTransceiver : public tb::BaseCacheTransceiver
 {
 public:
     // using BaseCacheTransceiver::BaseCacheTransceiver; // Inherit constructors
-    NB_TRAMPOLINE(tb::BaseCacheTransceiver, 6);
+    // 7 NB_OVERRIDE_PURE entries below; the historical value was 6 which
+    // under-allocates the dispatch table (latent pre-existing bug).
+    NB_TRAMPOLINE(tb::BaseCacheTransceiver, 7);
 
     void respondAndSendAsync(std::shared_ptr<tb::LlmRequest> llmRequest) override
     {
