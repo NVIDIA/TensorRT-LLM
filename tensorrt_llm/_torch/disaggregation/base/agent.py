@@ -89,6 +89,9 @@ class TransferStatus(ABC):
     @abstractmethod
     def wait(self, timeout_ms: int | None = None) -> bool: ...
 
+    def release(self) -> bool:
+        return False
+
 
 class BaseTransferAgent(ABC):
     @abstractmethod
