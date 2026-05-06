@@ -482,7 +482,6 @@ class MockPadDummyExecutor:
         self.benchmark_req_queues_size = benchmark_req_queues_size
         self.max_total_draft_tokens = 0
         self._adp_dummy_is_gen = True
-        self._adp_dummy_role_locked = False
         self.max_num_tokens = None
 
         self.dist = Mock()

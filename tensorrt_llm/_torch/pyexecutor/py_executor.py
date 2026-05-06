@@ -411,10 +411,7 @@ class PyExecutor:
         self.max_num_active_requests = model_engine.get_max_num_sequences()
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
-        # ADP dummy role for _pad_attention_dp_dummy_request; locked to
-        # this worker's disagg role on first observation. Default is_gen=True.
         self._adp_dummy_is_gen: bool = True
-        self._adp_dummy_role_locked: bool = False
         # TODO: Remove PP size == 1 gate for disagg + block reuse with PP > 1.
         # Buffer for responses generated inside _end_transfer_and_maybe_terminate.
         # With ADP, _enqueue_responses does a tp_gather collective.  When called
@@ -2922,7 +2919,7 @@ class PyExecutor:
             all_new_flat = [
                 req for reqs in all_ranks_new_requests for req in reqs
             ]
-            self._lock_adp_dummy_role(all_new_flat)
+            self._update_adp_dummy_role(all_new_flat)
 
             # Update per-rank counter for DP
             self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
@@ -3284,19 +3281,16 @@ class PyExecutor:
                     f"num_schedulable_requests={num_schedulable_requests}")
         return True
 
-    def _lock_adp_dummy_role(self, candidates: List[LlmRequest]) -> None:
-        if (not self.enable_attention_dp or self.kv_cache_transceiver is None
-                or self._adp_dummy_role_locked):
+    def _update_adp_dummy_role(self, candidates: List[LlmRequest]) -> None:
+        if not self.enable_attention_dp or self.kv_cache_transceiver is None:
             return
         for req in candidates:
             rt = getattr(req, "llm_request_type", None)
             if rt == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY:
                 self._adp_dummy_is_gen = False
-                self._adp_dummy_role_locked = True
                 return
             if rt == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
                 self._adp_dummy_is_gen = True
-                self._adp_dummy_role_locked = True
                 return
 
     @nvtx_range("_pad_attention_dp_dummy_request")
