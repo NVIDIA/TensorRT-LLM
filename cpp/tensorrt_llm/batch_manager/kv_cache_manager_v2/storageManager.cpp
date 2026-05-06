@@ -428,8 +428,8 @@ void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, Cac
             if (numAccepted > 0)
             {
                 acceptedPages.at(static_cast<size_t>(pg)).assign(fp.end() - numAccepted, fp.end());
-                fp.erase(fp.end() - numAccepted, fp.end());
             }
+            fp.clear();
         }
     }
     else
