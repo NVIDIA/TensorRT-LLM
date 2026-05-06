@@ -96,6 +96,7 @@ class SlotAllocator
 {
 public:
     explicit SlotAllocator(int capacity);
+    ~SlotAllocator();
 
     int numFreeSlots() const noexcept;
     int numOccupiedSlots() const noexcept;
@@ -120,6 +121,22 @@ public:
     }
 
     std::vector<SlotId> getSlotsBlockingShrink() const;
+
+    // Read-only accessors for debug assertions (mirrors Python's direct attribute access).
+    int numOverflowSlots() const noexcept
+    {
+        return static_cast<int>(mOverflowSlots.size());
+    }
+
+    int numActiveSlots() const noexcept
+    {
+        return mNumActiveSlots;
+    }
+
+    int targetCapacity() const noexcept
+    {
+        return mTargetCapacity;
+    }
 
     void synchronize();
 
@@ -299,6 +316,9 @@ public:
     }
 
 protected:
+    // Mirrors Python _get_num_slots_from_pools: min(p.num_slots for p in pools).
+    int getNumSlotsFromPools() const noexcept;
+
     SlotAllocator mSlotAllocator;
     std::vector<std::unique_ptr<SlotPoolBase>> mPools;
     bool mDestroyed = false;

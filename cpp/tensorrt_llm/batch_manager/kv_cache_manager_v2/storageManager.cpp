@@ -215,6 +215,13 @@ std::vector<std::vector<Slot>> StorageManager::newSlots(CacheLevel level, std::v
     if (needMore)
         prepareFreeSlots(level, pgNumSlots);
 
+    // A14: post-condition — free-slot counts satisfy requirements.
+    for (int pg = 0; pg < numPoolGroups(); ++pg)
+    {
+        assert(pgNumSlots[pg] <= storage.numFreeSlots(static_cast<PoolGroupIndex>(pg))
+            && "Free slot count does not satisfy requirement after prepareFreeSlots");
+    }
+
     // Allocate.
     std::vector<std::vector<Slot>> ret(static_cast<size_t>(numLifeCycles()));
     try
@@ -353,6 +360,28 @@ void StorageManager::forceEvict(CacheLevel level, std::vector<int> const& minNum
 void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, CacheLevel lvlId,
     std::vector<std::vector<std::shared_ptr<Page>>>& fallenPages)
 {
+    // A7: goals dimensions must match [numCacheLevels][numPoolGroups].
+    if (!gNdebug)
+    {
+        assert(static_cast<int>(goals.size()) == numCacheLevels() && "goals.rows must equal numCacheLevels");
+        for (auto const& row : goals)
+        {
+            assert(static_cast<int>(row.size()) == numPoolGroups() && "goals.cols must equal numPoolGroups");
+        }
+    }
+
+    // A8: all fallen pages must come from upper cache levels (cache_level < lvlId).
+    if (!gNdebug)
+    {
+        for (auto const& pages : fallenPages)
+        {
+            for (auto const& p : pages)
+            {
+                assert(p->cacheLevel < lvlId && "Fallen pages must come from upper cache levels");
+            }
+        }
+    }
+
     auto& lvl = mLevels.at(static_cast<size_t>(lvlId));
     auto& storage = *lvl.storage;
     auto& ctrl = lvl.controller;
@@ -398,10 +427,22 @@ void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, Cac
             auto& ev = evicted.at(static_cast<size_t>(pg));
             int oldFree = storage.numFreeSlots(static_cast<PoolGroupIndex>(pg));
             int numEvicted = static_cast<int>(ev.size());
+            // A9: all evicted pages at last level must be DROPPABLE.
+            if (!gNdebug)
+            {
+                for (auto const& p : ev)
+                {
+                    assert(p->status() == PageStatus::DROPPABLE && "Evicted page at last level must be DROPPABLE");
+                }
+            }
             // Drop droppable evicted pages (GC).
             ev.clear();
             int newFree = storage.numFreeSlots(static_cast<PoolGroupIndex>(pg));
             assert(newFree >= numEvicted + oldFree);
+
+            // A10: held_pages count must not exceed new_free.
+            assert(static_cast<int>(heldPages.at(static_cast<size_t>(pg)).size()) <= newFree
+                && "held_pages count exceeds new free slot count");
 
             // Add held pages from upper levels.
             auto& hp = heldPages.at(static_cast<size_t>(pg));
@@ -411,6 +452,8 @@ void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, Cac
 
             int goal = goals.at(static_cast<size_t>(lvlId)).at(static_cast<size_t>(pg));
             int numAccepted = std::min(newFree - goal, static_cast<int>(fp.size()));
+            // A11: numAccepted must be non-negative (last-level path).
+            assert(numAccepted >= 0 && "numAccepted must be >= 0");
             if (numAccepted > 0)
             {
                 acceptedPages.at(static_cast<size_t>(pg)).assign(fp.end() - numAccepted, fp.end());
@@ -420,6 +463,15 @@ void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, Cac
     }
     else
     {
+        // A12: no held pages at non-last level.
+        if (!gNdebug)
+        {
+            for (auto const& hp : heldPages)
+            {
+                assert(hp.empty() && "held_pages must be empty at non-last level");
+            }
+        }
+
         CacheLevel nextLvl = static_cast<CacheLevel>(lvlId + 1);
         for (int pg = 0; pg < numPoolGroups(); ++pg)
         {
@@ -432,6 +484,8 @@ void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, Cac
 
             int goal = goals.at(static_cast<size_t>(lvlId)).at(static_cast<size_t>(pg));
             int numAccepted = std::min(oldFree + numEvicted - goal, static_cast<int>(fp.size()));
+            // A11: numAccepted must be non-negative (non-last-level path).
+            assert(numAccepted >= 0 && "numAccepted must be >= 0");
             if (numAccepted > 0)
             {
                 acceptedPages.at(static_cast<size_t>(pg)).assign(fp.end() - numAccepted, fp.end());
@@ -439,6 +493,15 @@ void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, Cac
             }
         }
         _prepareFreeSlots(goals, nextLvl, fallenPages);
+    }
+
+    // A13: all fallen pages must have been consumed.
+    if (!gNdebug)
+    {
+        for (auto const& fp : fallenPages)
+        {
+            assert(fp.empty() && "All fallen pages must be consumed after level loop");
+        }
     }
 
     // Migrate accepted pages into lvlId.
@@ -480,6 +543,8 @@ void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, 
         throw OutOfPagesError("Not enough free slots for migration");
 
     auto dstSlots = dstPoolGroup.allocateMultiple(numSlots);
+    // A15: allocated slot count must match the request.
+    assert(static_cast<int>(dstSlots.size()) == numSlots && "dst_slots size mismatch");
     try
     {
         CacheTier dstTier = mLevels.at(static_cast<size_t>(dstLevel)).cacheTier;
@@ -695,6 +760,18 @@ void StorageManager::shrinkPoolGroup(
     auto& ctrl = mLevels.at(static_cast<size_t>(level)).controller;
     assert(newNumSlots < pg.numSlots());
 
+    // A16: persistent_pages preconditions.
+    assert(static_cast<int>(persistentPages.size()) <= newNumSlots && "Not enough slots to hold all persistent pages");
+    if (!gNdebug)
+    {
+        for (auto const& p : persistentPages)
+        {
+            assert(p->cacheLevel == level && "Persistent page cache level mismatch");
+            assert(mLifeCycleGrouping.at(static_cast<size_t>(p->lifeCycle)) == pgIdx
+                && "Persistent page pool group mismatch");
+        }
+    }
+
     // Find overflow pages: scheduled pages with slot_id >= newNumSlots.
     auto gen = ctrl.pageGenerator(pgIdx);
     std::deque<std::pair<int, std::shared_ptr<Page>>> overflowSlots;
@@ -716,6 +793,12 @@ void StorageManager::shrinkPoolGroup(
             overflowPersistent.push_back(p);
     }
     int numOverflowPersistent = static_cast<int>(overflowPersistent.size());
+
+    // A2: RUNTIME check — persistent overflow pages must fit in the new capacity.
+    if (numOverflowPersistent > newNumSlots)
+    {
+        throw OutOfPagesError("Not enough slots to hold all persistent pages");
+    }
 
     // Mark the allocator for shrink.
     allocator.prepareForShrink(newNumSlots);
@@ -752,8 +835,21 @@ void StorageManager::shrinkPoolGroup(
     reqs[static_cast<size_t>(pgIdx)] = static_cast<int>(overflowPages.size());
     prepareFreeSlots(level, reqs);
 
+    // A17: all overflow pages must be at the expected cache level.
+    if (!gNdebug)
+    {
+        for (auto const& p : overflowPages)
+        {
+            assert(p->cacheLevel == level && "Overflow page cache level mismatch");
+        }
+    }
+
     // Defragment: migrate overflow pages to free slots within the same level.
     _batchedMigrate(pgIdx, level, level, overflowPages, /*updateSrc=*/true, /*defrag=*/true);
+
+    // A18: post-defrag overflow assertion — overflow slot count matches expectations.
+    assert(allocator.numOverflowSlots() == allocator.numActiveSlots() - allocator.targetCapacity()
+        && "Post-defrag overflow slot count mismatch");
 
     // Finalize shrink and resize pools.
     allocator.finishShrink();

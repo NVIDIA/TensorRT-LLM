@@ -24,6 +24,7 @@
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 
+#include <cassert>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -76,7 +77,34 @@ struct SeqBlock
 
     bool isCommitted() const noexcept
     {
-        return treeBlock != nullptr;
+        bool ret = treeBlock != nullptr;
+        if (!gNdebug)
+        {
+            // When committed: must have 1 beam, all non-null pages must be CommittedPage.
+            if (ret)
+            {
+                assert(pages.size() == 1);
+                for (auto const& beamBlock : pages)
+                    for (auto const& bp : beamBlock)
+                        if (!blockPageIsNull(bp))
+                        {
+                            auto pg = blockPageGetPage(bp);
+                            assert(!pg || std::dynamic_pointer_cast<CommittedPage>(pg));
+                        }
+            }
+            else
+            {
+                // When not committed: all non-null pages must be UncommittedPage.
+                for (auto const& beamBlock : pages)
+                    for (auto const& bp : beamBlock)
+                        if (!blockPageIsNull(bp))
+                        {
+                            auto pg = blockPageGetPage(bp);
+                            assert(!pg || std::dynamic_pointer_cast<UncommittedPage>(pg));
+                        }
+            }
+        }
+        return ret;
     }
 };
 
@@ -400,6 +428,10 @@ private:
     // Returns one TakenPage per lifecycle. Mirrors Python's _take_uncommitted_page().
     std::vector<TakenPage> _takeUncommittedPage(
         SeqBlock& sb, BeamIndex beamIdx, std::optional<LifeCycleId> skipLc = std::nullopt);
+
+    // Get and validate the tree block at a committed ordinal.
+    // Mirrors Python's _get_tree_block(). Asserts committed pages reference the correct block.
+    std::shared_ptr<Block> const& _getTreeBlock(BlockOrdinal ordinal) const;
 
     // Comprehensive sanity check of KvCache invariants.
     // Mirrors Python's _check_sanity(). Returns true on success (asserts internally).

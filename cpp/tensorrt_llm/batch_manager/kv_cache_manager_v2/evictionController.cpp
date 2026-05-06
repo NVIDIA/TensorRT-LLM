@@ -34,6 +34,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 
 NodeRef LRUEvictionPolicy::push(std::shared_ptr<Page> page, bool evictFirst)
 {
+    assert(!page->nodeRef.has_value() && "page must not already be scheduled for eviction");
     if (evictFirst)
     {
         mQueue.push_front(std::move(page));
@@ -59,6 +60,7 @@ std::shared_ptr<Page> LRUEvictionPolicy::pop()
 std::shared_ptr<Page> LRUEvictionPolicy::remove(NodeRef node)
 {
     auto page = *node;
+    assert(page->nodeRef.has_value() && page->nodeRef.value() == node && "node's page must reference this node");
     mQueue.erase(node);
     return page;
 }
@@ -171,6 +173,7 @@ void PerLevelEvictionController::scheduleForEviction(Page& page, bool evictFirst
     auto sharedPage = page.shared_from_this();
     NodeRef ref = getPolicy(page.lifeCycle).push(sharedPage, evictFirst);
     page.nodeRef = ref;
+    assert(*ref == sharedPage && "stored iterator must dereference to this page");
 }
 
 std::vector<std::vector<std::shared_ptr<Page>>> PerLevelEvictionController::evict(std::vector<int> const& minNumPages)
@@ -230,7 +233,8 @@ std::vector<std::vector<std::shared_ptr<Page>>> PerLevelEvictionController::evic
 void PerLevelEvictionController::remove(NodeRef node)
 {
     auto page = *node;
-    assert(page->nodeRef.has_value());
+    assert(page->nodeRef.has_value() && page->nodeRef.value() == node
+        && "page's nodeRef must match the node being removed");
     getPolicy(page->lifeCycle).remove(node);
     page->nodeRef = std::nullopt;
 }

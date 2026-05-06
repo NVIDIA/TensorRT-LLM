@@ -21,6 +21,7 @@
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
 
+#include <cassert>
 #include <cuda.h>
 #include <memory>
 #include <mutex>
@@ -126,6 +127,7 @@ public:
 
     size_t totalSize() const noexcept
     {
+        assert(mGrains.size() * kGranularity == mBuffer.size() && "grain count * granularity must equal buffer size");
         return mBuffer.size();
     }
 

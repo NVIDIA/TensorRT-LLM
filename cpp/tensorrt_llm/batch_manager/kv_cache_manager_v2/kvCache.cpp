@@ -204,6 +204,7 @@ void KvCache::activate()
         size_t idx = 0;
         for (auto& t : targets)
         {
+            assert(gNdebug || t.page == locks[idx].page());
             int bi = static_cast<int>(t.beamIndex);
             int lc = static_cast<int>(t.lifeCycle);
             if (t.ordinal == kBadBlockOrdinal)
@@ -224,6 +225,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
         setCudaStream(*stream);
     }
     assert(mCudaStream.has_value() && "cuda_stream is never set");
+    assert(!mFinishEvent.has_value());
 
     // Check utilization against threshold.
     auto const utilizations = mManager->storage().getUtilization(kGpuLevel);
@@ -387,6 +389,7 @@ void KvCache::suspend()
 {
     assert(mStatus == Status::ACTIVE);
     assert(_checkSanity());
+    assert(!mFinishEvent.has_value());
 
     // Copy data from external buffers back to internal vectors (mirrors Python's suspend).
     for (int bi = 0; bi < mBeamWidth; ++bi)
@@ -648,14 +651,35 @@ void KvCache::_increaseCapacity(int newNumBlocks, int newHistoryLength)
             continue;
         staleRanges[static_cast<size_t>(lc)] = _getStaleRange(newHistoryLength, lcs.getLifeCycle(lc));
         auto [staleBeg, staleEnd] = staleRanges[static_cast<size_t>(lc)];
-        int numNewBlocks = (curNumBlocks < staleBeg) ? (staleBeg - curNumBlocks) + (newNumBlocks - staleEnd)
-                                                     : newNumBlocks - std::max(staleEnd, curNumBlocks);
+        int numNewBlocks;
+        if (curNumBlocks < staleBeg)
+        {
+            assert(newNumBlocks >= staleEnd);
+            numNewBlocks = (staleBeg - curNumBlocks) + (newNumBlocks - staleEnd);
+        }
+        else
+        {
+            numNewBlocks = newNumBlocks - std::max(staleEnd, curNumBlocks);
+        }
         numSlotsPerLc[static_cast<size_t>(lc)] = numNewBlocks * mBeamWidth;
     }
 
     // SSM slots are now allocated lazily in resume() via deferred copy, not here.
 
     auto allSlots = mManager->storage().newGpuSlots(numSlotsPerLc);
+
+    // Assert that internal index buffer sizes match expected old_num_blocks (mirrors Python line ~463).
+    if (!gNdebug)
+    {
+        for (auto const& beamIndices : mBasePageIndices)
+        {
+            for (auto const& buf : beamIndices)
+            {
+                if (auto const* vec = std::get_if<std::vector<int>>(&buf))
+                    assert(static_cast<int>(vec->size()) == curNumBlocks);
+            }
+        }
+    }
 
     // Create SeqBlocks for the new ordinals.
     std::vector<size_t> slotCounters(static_cast<size_t>(numLc), 0);
@@ -685,6 +709,12 @@ void KvCache::_increaseCapacity(int newNumBlocks, int newHistoryLength)
                 = page->lock(*this, 0, static_cast<BlockOrdinal>(ord), static_cast<LifeCycleId>(lc));
         }
         mBlocks.push_back(std::move(sb));
+    }
+    // Assert all allocated slots were consumed (mirrors Python line ~488).
+    if (!gNdebug)
+    {
+        for (int lc = 0; lc < numLc; ++lc)
+            assert(slotCounters[static_cast<size_t>(lc)] == allSlots[static_cast<size_t>(lc)].size());
     }
 }
 
@@ -906,6 +936,7 @@ void KvCache::_commitBlock(int ord, bool isLast)
                 newBlock->storage[static_cast<size_t>(*ssmLcId)].reset();
             }
         }
+        assert(gNdebug || _getTreeBlock(static_cast<BlockOrdinal>(ord)) == newBlock);
         ++mNumCommittedBlocks;
     }
     else if (newBlock->isFull() && mManager->allowSeqRebasing() && isFull)
@@ -974,6 +1005,7 @@ void KvCache::_commitBlock(int ord, bool isLast)
         }
         // Don't clear SSM storage on rebase — the existing block may have a valid snapshot.
         sb.treeBlock = newBlock;
+        assert(gNdebug || _getTreeBlock(static_cast<BlockOrdinal>(ord)) == newBlock);
         ++mNumCommittedBlocks;
     }
     else
@@ -1041,6 +1073,7 @@ void KvCache::commit(std::vector<TokenIdExt> const& tokens)
 
 void KvCache::stopCommitting()
 {
+    assert(mStatus != Status::CLOSED);
     if (mCommitState == CommitState::USER_STOP)
         return;
     assert(gNdebug || _checkSanity());
@@ -1097,7 +1130,7 @@ void KvCache::_onStopCommitting()
             for (auto& beamPages : sb.pages)
             {
                 auto& bp = beamPages[static_cast<size_t>(lcIdx)];
-                assert(!gNdebug || std::holds_alternative<std::shared_ptr<PageHolder>>(bp) || blockPageIsNull(bp));
+                assert(gNdebug || std::holds_alternative<std::shared_ptr<PageHolder>>(bp) || blockPageIsNull(bp));
                 bp = std::monostate{};
             }
         }
@@ -1112,6 +1145,12 @@ void KvCache::_onStopCommitting()
 void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
 {
     auto matched = mManager->radixTree().match(mLoraTaskId, inputTokens, mManager->enablePartialMatch());
+    // Assert all non-last matched blocks are full (mirrors Python line ~1113).
+    if (!gNdebug && matched.size() > 1)
+    {
+        for (size_t i = 0; i + 1 < matched.size(); ++i)
+            assert(matched[i].numMatchedTokens == mTokensPerBlock);
+    }
     auto& lifeCycles = mManager->lifeCycles();
     auto const& allLc = lifeCycles.getAll();
     int numLc = lifeCycles.size();
@@ -1297,6 +1336,37 @@ void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
 }
 
 // ---------------------------------------------------------------------------
+// _getTreeBlock — get and validate the tree block at a committed ordinal.
+// Mirrors Python's _get_tree_block().
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<Block> const& KvCache::_getTreeBlock(BlockOrdinal ordinal) const
+{
+    assert(mBlocks[static_cast<size_t>(ordinal)].isCommitted());
+    auto const& ret = mBlocks[static_cast<size_t>(ordinal)].treeBlock;
+    assert(ret);
+    if (!gNdebug)
+    {
+        auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
+        auto const& beamBlock = mBlocks[static_cast<size_t>(ordinal)].pages[0];
+        for (int lc = 0; lc < static_cast<int>(beamBlock.size()); ++lc)
+        {
+            if (ssmLcId.has_value() && lc == *ssmLcId)
+            {
+                assert(blockPageIsNull(beamBlock[lc]) && "SSM pages live in mSsmBlocks");
+            }
+            else if (!blockPageIsNull(beamBlock[lc]))
+            {
+                auto page = blockPageGetPage(beamBlock[lc]);
+                auto committed = std::dynamic_pointer_cast<CommittedPage>(page);
+                assert(committed && committed->block.lock() == ret);
+            }
+        }
+    }
+    return ret;
+}
+
+// ---------------------------------------------------------------------------
 // _checkSanity — comprehensive invariant check.
 // Mirrors Python's _check_sanity().
 // ---------------------------------------------------------------------------
@@ -1387,6 +1457,12 @@ void KvCache::_resizePageIndexBuffers(int newNumBlocks)
             auto& buf = mBasePageIndices[bi][lc];
             if (auto* vec = std::get_if<std::vector<int>>(&buf))
             {
+                // When shrinking, assert tail entries are already BAD (mirrors Python line ~432).
+                if (!gNdebug && newNumBlocks < static_cast<int>(vec->size()))
+                {
+                    for (int i = newNumBlocks; i < static_cast<int>(vec->size()); ++i)
+                        assert((*vec)[i] == kBadPageIndex);
+                }
                 // Growing fills new entries with kBadPageIndex; shrinking truncates.
                 vec->resize(static_cast<size_t>(newNumBlocks), kBadPageIndex);
             }
@@ -1432,11 +1508,20 @@ int KvCache::updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc,
 Span<int const> KvCache::getBasePageIndices(LayerGroupId lgId, BeamIndex beamIdx) const
 {
     auto const& buf = mBasePageIndices.at(static_cast<size_t>(beamIdx)).at(static_cast<size_t>(lgId));
-    return std::visit(
+    auto result = std::visit(
         [](auto const& b) -> Span<int const> {
             return {b.data(), static_cast<int32_t>(b.size())};
         },
         buf);
+    // Cross-validate cached indices against freshly computed reference (mirrors Python lines ~350-354).
+    if (!gNdebug && isActive())
+    {
+        auto ref = getAggregatedPageIndices(lgId, beamIdx);
+        int len = std::min(result.len, static_cast<int32_t>(ref.size()));
+        for (int i = 0; i < len; ++i)
+            assert(result[i] == ref[i]);
+    }
+    return result;
 }
 
 std::vector<int> KvCache::getAggregatedPageIndices(LayerGroupId lgId, BeamIndex beamIdx, bool validOnly) const

@@ -77,6 +77,8 @@ public:
 
     PoolGroupIndex numPoolGroups() const noexcept
     {
+        assert(storage->numPoolGroups() == controller.numPoolGroups()
+            && "Storage and controller disagree on numPoolGroups");
         return controller.numPoolGroups();
     }
 };
