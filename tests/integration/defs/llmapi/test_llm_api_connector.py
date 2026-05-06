@@ -156,6 +156,7 @@ def test_connector_simple(enforce_single_worker, model_with_connector,
 @pytest.mark.parametrize("use_overlap_scheduler", [True, False])
 def test_connector_async_onboard(enforce_single_worker, model_with_connector,
                                  use_overlap_scheduler):
+    pytest.fail("Connection failed")
     NUM_TOKENS = 8
 
     model_fn, scheduler, worker = model_with_connector

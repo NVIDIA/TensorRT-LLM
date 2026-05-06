@@ -152,6 +152,7 @@ class TestVILA1_5_3B(LlmapiAccuracyTestHarness):
     )
 
     def test_auto_dtype(self):
+        pytest.fail("ImagePullBackOff")
         with LLM(
             self.MODEL_PATH,
             max_num_tokens=self.MAX_NUM_TOKENS,
