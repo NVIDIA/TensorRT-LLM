@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from transformers import AutoConfig
@@ -535,14 +535,16 @@ class TestMediaIoKwargsLoaderForwarding:
             request_kwargs={"image": {"format": "pt"}},
         )
         part = {"type": "image_url", "image_url": {"url": "i"}}
-        with patch("tensorrt_llm.serve.chat_utils.async_load_image") as mock_loader:
-            mock_loader.return_value = MagicMock()
+        with patch(
+            "tensorrt_llm.serve.chat_utils.async_load_image", return_value=MagicMock()
+        ) as mock_loader:
             parse_chat_message_content_part(part, tracker)
-            mock_loader.assert_called_once()
-            _, called_kwargs = mock_loader.call_args
-            assert called_kwargs == {"format": "pt", "device": "cuda"}
+        mock_loader.assert_called_once()
+        _, called_kwargs = mock_loader.call_args
+        assert called_kwargs == {"format": "pt", "device": "cuda"}
 
-    def test_input_audio_bypasses_media_io_kwargs(self, mm_tracker_factory):
+    @pytest.mark.asyncio
+    async def test_input_audio_bypasses_media_io_kwargs(self, mm_tracker_factory):
         """`input_audio` is base64-decoded inline; merged `audio` kwargs must not reach the loader."""
         tracker = mm_tracker_factory(
             server_kwargs={"audio": {"format": "pil"}},
@@ -552,10 +554,12 @@ class TestMediaIoKwargsLoaderForwarding:
             "type": "input_audio",
             "input_audio": {"data": "AAAA", "format": "wav"},
         }
-        with patch("tensorrt_llm.serve.chat_utils.async_load_audio") as mock_loader:
-            mock_loader.return_value = MagicMock()
-            parse_chat_message_content_part(part, tracker)
-            mock_loader.assert_called_once()
-            _, called_kwargs = mock_loader.call_args
-            assert "format" not in called_kwargs
-            assert called_kwargs.get("is_base64") is True
+        with patch(
+            "tensorrt_llm.serve.chat_utils.async_load_audio", new_callable=AsyncMock
+        ) as mock_loader:
+            result = parse_chat_message_content_part(part, tracker)
+            await result["data"]
+        mock_loader.assert_called_once()
+        _, called_kwargs = mock_loader.call_args
+        assert "format" not in called_kwargs
+        assert called_kwargs.get("is_base64") is True

@@ -1,21 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Per-modality merge rules for `media_io_kwargs`.
+"""Generic I/O interfaces for the supported multimodal modalities."""
 
-One subclass per modality; default is a shallow merge with runtime keys
-winning. Subclasses override `merge_kwargs` for kwargs with semantic
-interactions (e.g. video `fps` / `num_frames`). Loading itself still
-lives in the free functions in `tensorrt_llm/inputs/utils.py`.
-"""
+from types import MappingProxyType
+from typing import Any, Dict, Literal, Mapping, Optional, Type
 
-from typing import Any, Dict, Optional, Type
+# Canonical set of supported media modalities for Pydantic field validation.
+MediaModality = Literal["image", "video", "audio"]
 
 
 class BaseMediaIO:
-    """Default merge semantics for a media modality.
+    """Per-modality I/O interface.
 
-    Subclass per modality and override `merge_kwargs` to encode kwarg
-    interactions specific to that modality.
+    Subclass per modality and override methods to customize behavior.
+    Today the interface exposes only `merge_kwargs`; future I/O hooks
+    (e.g. fetch/decode) belong on this base class.
     """
 
     @classmethod
@@ -32,15 +31,15 @@ class BaseMediaIO:
 
 
 class ImageMediaIO(BaseMediaIO):
-    """Image kwargs (`format`, `device`) are independent; default merge."""
+    """I/O for the image modality; uses default merge (kwargs are independent)."""
 
 
 class AudioMediaIO(BaseMediaIO):
-    """Audio kwargs (`format`, `device`) are independent; default merge."""
+    """I/O for the audio modality; uses default merge (kwargs are independent)."""
 
 
 class VideoMediaIO(BaseMediaIO):
-    """Video kwargs include `fps` and `num_frames`, which interact."""
+    """I/O for the video modality; customizes merge for `fps`/`num_frames` coupling."""
 
     @classmethod
     def merge_kwargs(
@@ -62,8 +61,10 @@ class VideoMediaIO(BaseMediaIO):
         return merged
 
 
-MEDIA_IO_REGISTRY: Dict[str, Type[BaseMediaIO]] = {
-    "image": ImageMediaIO,
-    "video": VideoMediaIO,
-    "audio": AudioMediaIO,
-}
+MEDIA_IO_REGISTRY: Mapping[MediaModality, Type[BaseMediaIO]] = MappingProxyType(
+    {
+        "image": ImageMediaIO,
+        "video": VideoMediaIO,
+        "audio": AudioMediaIO,
+    }
+)

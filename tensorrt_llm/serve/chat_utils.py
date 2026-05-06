@@ -105,7 +105,7 @@ def resolve_media_io_kwargs(
     """
     server_kwargs = server_config.media_io_kwargs if server_config else None
     default_kwargs = (server_kwargs or {}).get(modality, {})
-    runtime_kwargs = (request_kwargs or {}).get(modality)
+    runtime_kwargs = (request_kwargs or {}).get(modality, {})
     media_io_cls = MEDIA_IO_REGISTRY.get(modality, BaseMediaIO)
     return media_io_cls.merge_kwargs(default_kwargs, runtime_kwargs)
 
@@ -321,8 +321,25 @@ def parse_chat_messages_coroutines(
                                                                       int]]]:
     """Parse multiple chat messages and return conversation and coroutine.
 
-    `request_media_io_kwargs` overrides the server's `media_io_kwargs`
-    per modality; see `resolve_media_io_kwargs` for the merge rule.
+    Multimodal items across all messages share one
+    `MultimodalDataTracker` so they fetch and decode concurrently when
+    the coroutine is awaited.
+
+    Args:
+        messages: Chat messages with text or multimodal parts.
+        model_config: HF `AutoConfig`; selects the model's placeholder
+            strategy via `MULTIMODAL_PLACEHOLDER_REGISTRY`.
+        multimodal_server_config: Server-level multimodal config
+            (e.g. `--media_io_kwargs`); defaults to empty.
+        request_media_io_kwargs: Per-request override merged per
+            modality with the server default via
+            `resolve_media_io_kwargs`.
+
+    Returns:
+        `(conversation, mm_coroutine, mm_placeholder_counts)` where
+        `mm_coroutine` yields `(mm_data, mm_embeddings)` when awaited
+        and `mm_placeholder_counts` has one entry per message mapping
+        placeholder string -> count.
     """
     conversation = []
     mm_placeholder_counts = []

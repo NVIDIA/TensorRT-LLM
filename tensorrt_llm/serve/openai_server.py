@@ -1103,7 +1103,7 @@ class OpenAIServer:
                     raw_messages,
                     self.model_config,
                     self.multimodal_server_config,
-                    request_media_io_kwargs=raw_body.get("media_io_kwargs"))
+                    request_media_io_kwargs=request.media_io_kwargs)
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
@@ -1249,7 +1249,7 @@ class OpenAIServer:
                     raw_messages,
                     self.model_config,
                     self.multimodal_server_config,
-                    request_media_io_kwargs=raw_body.get("media_io_kwargs"))
+                    request_media_io_kwargs=request.media_io_kwargs)
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
