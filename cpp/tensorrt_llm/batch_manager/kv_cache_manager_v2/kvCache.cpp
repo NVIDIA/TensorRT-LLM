@@ -573,7 +573,9 @@ void KvCache::setCapacity(int cap)
 
 void KvCache::setHistoryLength(int hist)
 {
-    resize(std::nullopt, hist);
+    bool success = resize(std::nullopt, hist);
+    assert(success);
+    (void) success;
 }
 
 bool KvCache::_shortcutSetCapacity(int newCap)
