@@ -210,6 +210,30 @@ TEST_F(BlockKeyTest, GenerateExtraKeysUsesExactMultimodalRuns)
     EXPECT_EQ(secondRunKeys[0].uuid.value(), "item-0");
 }
 
+TEST_F(BlockKeyTest, GenerateExtraKeysDisablesHashingForIncompleteRunMetadata)
+{
+    using tensorrt_llm::batch_manager::LlmRequest;
+    using tensorrt_llm::executor::MultimodalInput;
+    using tensorrt_llm::executor::OutputConfig;
+    using tensorrt_llm::executor::Request;
+    using tensorrt_llm::executor::SamplingConfig;
+
+    MultimodalInput multimodalInput({{1, 2, 3, 4, 5, 6, 7, 8}},
+        /*multimodalPositions=*/{1},
+        /*multimodalLengths=*/{4},
+        /*multimodalUuids=*/std::nullopt,
+        /*multimodalItemRunCuSeqlen=*/std::vector<SizeType32>{0, 1});
+
+    Request executorRequest({0, 1, 2, 3, 4}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(), OutputConfig(),
+        /*endId=*/std::nullopt, /*padId=*/std::nullopt, /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt,
+        /*stopWords=*/std::nullopt, /*embeddingBias=*/std::nullopt, /*externalDraftTokensConfig=*/std::nullopt,
+        /*pTuningConfig=*/std::nullopt, multimodalInput);
+    LlmRequest llmRequest(/*requestId=*/0, executorRequest);
+
+    auto keys = generateBlockHashExtraKeys(llmRequest, /*startTokenIdx=*/1, /*endTokenIdx=*/2);
+    EXPECT_TRUE(keys.empty());
+}
+
 // ---------------------------------------------------------------------------
 // numMatchingTokens edge cases
 // ---------------------------------------------------------------------------
