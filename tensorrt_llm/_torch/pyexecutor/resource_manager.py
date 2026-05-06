@@ -4,8 +4,8 @@ import math
 import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
-from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
-                    Set, Tuple, Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional,
+                    Sequence, Set, Tuple, Union)
 
 import torch
 from mpi4py import MPI
@@ -87,6 +87,164 @@ class Role:
     KEY_BLOCK_SCALE = DataRole("key_block_scale")
     VALUE_BLOCK_SCALE = DataRole("value_block_scale")
     ALL = DataRole("all")
+
+
+class _MmRunMetadata(NamedTuple):
+    item_run_cu_seqlen: torch.Tensor
+    run_positions: torch.Tensor
+    run_lengths: torch.Tensor
+    run_ends: torch.Tensor
+    run_item_indices: torch.Tensor
+    run_item_offsets: torch.Tensor
+    item_lengths: torch.Tensor
+
+
+def _hash_to_digest(hash_ints: Sequence[int]) -> bytes:
+    # Convert 8 x int32 hash to 32-byte digest (big-endian, matching v1 C++
+    # getNthByte which extracts MSB first).
+    assert len(
+        hash_ints) == 8, f"Expected 8 int32 hash values, got {len(hash_ints)}"
+    return b''.join(v.to_bytes(4, 'big', signed=True) for v in hash_ints)
+
+
+def _as_int64_cpu_tensor(values: Sequence[int] | torch.Tensor) -> torch.Tensor:
+    # int64 is expected dtype for tensor indexing
+    return torch.as_tensor(values, dtype=torch.int64).cpu()
+
+
+def _resolve_multimodal_run_metadata(
+        req: LlmRequest, item_count: int) -> Optional[_MmRunMetadata]:
+    # NOTE: the following optional fields help in exact mm token position mixing in blockhash key generation
+    item_run_cu_seqlen = getattr(req, "multimodal_item_run_cu_seqlen", None)
+    run_positions = getattr(req, "multimodal_run_positions", None)
+    run_lengths = getattr(req, "multimodal_run_lengths", None)
+
+    if all(field is None
+           for field in (item_run_cu_seqlen, run_positions, run_lengths)):
+        return None
+
+    if (item_run_cu_seqlen is None or run_positions is None
+            or run_lengths is None):
+        raise ValueError(
+            "multimodal run metadata must be validated before block reuse and provided together"
+        )
+
+    item_run_cu_seqlen = _as_int64_cpu_tensor(item_run_cu_seqlen)
+    run_positions = _as_int64_cpu_tensor(run_positions)
+    run_lengths = _as_int64_cpu_tensor(run_lengths)
+
+    item_run_counts = item_run_cu_seqlen[1:] - item_run_cu_seqlen[:-1]
+    cumulative_run_lengths = torch.cat(
+        (torch.zeros(1, dtype=torch.int64), torch.cumsum(run_lengths, dim=0)))
+    item_starts = item_run_cu_seqlen[:-1]
+    item_ends = item_run_cu_seqlen[1:]
+    item_lengths = cumulative_run_lengths[item_ends] - cumulative_run_lengths[
+        item_starts]
+    run_item_indices = torch.repeat_interleave(
+        torch.arange(item_count, dtype=torch.int64), item_run_counts)
+    run_item_offsets = (cumulative_run_lengths[:-1] -
+                        cumulative_run_lengths[item_starts][run_item_indices])
+    run_ends = run_positions + run_lengths
+
+    return _MmRunMetadata(
+        item_run_cu_seqlen=item_run_cu_seqlen,
+        run_positions=run_positions,
+        run_lengths=run_lengths,
+        run_ends=run_ends,
+        run_item_indices=run_item_indices,
+        run_item_offsets=run_item_offsets,
+        item_lengths=item_lengths,
+    )
+
+
+def _copy_token_spans(result: list[TokenIdExt],
+                      source_tokens: Sequence[TokenIdExt],
+                      result_offsets: torch.Tensor,
+                      source_offsets: torch.Tensor,
+                      lengths: torch.Tensor) -> None:
+    for result_offset, source_offset, length in zip(result_offsets.tolist(),
+                                                    source_offsets.tolist(),
+                                                    lengths.tolist(),
+                                                    strict=True):
+        result[result_offset:result_offset +
+               length] = source_tokens[source_offset:source_offset + length]
+
+
+def _augment_tokens_with_mm_run_metadata(vocab_size: int,
+                                         result: list[TokenIdExt],
+                                         multimodal_hashes: Sequence[
+                                             Sequence[int]],
+                                         metadata: _MmRunMetadata, start: int,
+                                         end: int) -> list[TokenIdExt]:
+    overlap_mask = (metadata.run_ends > start) & (metadata.run_positions < end)
+    overlap_run_indices = torch.nonzero(overlap_mask).flatten()
+    if overlap_run_indices.numel() == 0:
+        return result
+
+    overlap_item_indices = torch.unique_consecutive(
+        metadata.run_item_indices[overlap_run_indices])
+    for item_idx in overlap_item_indices.tolist():
+        item_run_start = metadata.item_run_cu_seqlen[item_idx].item()
+        item_run_end = metadata.item_run_cu_seqlen[item_idx + 1].item()
+        item_overlap_run_indices = overlap_run_indices[
+            (overlap_run_indices >= item_run_start)
+            & (overlap_run_indices < item_run_end)]
+
+        mm_tokens = gen_multi_modal_tokens(
+            vocab_size, _hash_to_digest(multimodal_hashes[item_idx]),
+            metadata.item_lengths[item_idx].item())
+        overlap_starts = torch.clamp(
+            metadata.run_positions[item_overlap_run_indices], min=start)
+        overlap_ends = torch.clamp(metadata.run_ends[item_overlap_run_indices],
+                                   max=end)
+        source_offsets = (metadata.run_item_offsets[item_overlap_run_indices] +
+                          overlap_starts -
+                          metadata.run_positions[item_overlap_run_indices])
+        result_offsets = overlap_starts - start
+        lengths = overlap_ends - overlap_starts
+        _copy_token_spans(result, mm_tokens, result_offsets, source_offsets,
+                          lengths)
+
+    return result
+
+
+def _augment_tokens_with_contiguous_mm_metadata(
+        vocab_size: int, result: list[TokenIdExt],
+        multimodal_hashes: Sequence[Sequence[int]],
+        multimodal_positions: Sequence[int] | torch.Tensor,
+        multimodal_lengths: Sequence[int] | torch.Tensor, start: int,
+        end: int) -> list[TokenIdExt]:
+    # we assume multimodal chunks are contiguous
+    # so mm_token_end_position = mm_token_start_position + mm_token_length
+    # this assumption is not valid for video data, which may contain interleaved text tokens
+    positions = _as_int64_cpu_tensor(multimodal_positions)
+    lengths = _as_int64_cpu_tensor(multimodal_lengths)
+
+    if positions.ndim != 1 or lengths.ndim != 1 or positions.numel() != len(
+            multimodal_hashes) or positions.numel() != lengths.numel():
+        logger.warning(
+            "Invalid multimodal metadata shape; skipping multimodal token augmentation for block reuse"
+        )
+        return result
+
+    item_ends = positions + lengths
+    overlap_mask = (item_ends > start) & (positions < end)
+    overlap_item_indices = torch.nonzero(overlap_mask).flatten()
+    for item_idx in overlap_item_indices.tolist():
+        pos = positions[item_idx].item()
+        length = lengths[item_idx].item()
+        mm_tokens = gen_multi_modal_tokens(
+            vocab_size, _hash_to_digest(multimodal_hashes[item_idx]), length)
+        overlap_start = max(pos, start)
+        overlap_end = min(pos + length, end)
+        source_offset = overlap_start - pos
+        result_offset = overlap_start - start
+        overlap_length = overlap_end - overlap_start
+        result[result_offset:result_offset +
+               overlap_length] = mm_tokens[source_offset:source_offset +
+                                           overlap_length]
+
+    return result
 
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
@@ -2621,99 +2779,17 @@ class KVCacheManagerV2(BaseResourceManager):
             return tokens[start:end] if is_sliced else tokens
 
         result: list[TokenIdExt] = list(tokens[start:end])
+        run_metadata = _resolve_multimodal_run_metadata(
+            req, len(req.multimodal_hashes))
+        if run_metadata is not None:
+            return _augment_tokens_with_mm_run_metadata(self.vocab_size, result,
+                                                        req.multimodal_hashes,
+                                                        run_metadata, start,
+                                                        end)
 
-        def hash_to_digest(hash_ints: Sequence[int]) -> bytes:
-            # Convert 8 x int32 hash to 32-byte digest (big-endian,
-            # matching v1 C++ getNthByte which extracts MSB first).
-            assert len(
-                hash_ints
-            ) == 8, f"Expected 8 int32 hash values, got {len(hash_ints)}"
-            return b''.join(
-                v.to_bytes(4, 'big', signed=True) for v in hash_ints)
-
-        item_run_cu_seqlen = getattr(req, "multimodal_item_run_cu_seqlen", None)
-        run_positions = getattr(req, "multimodal_run_positions", None)
-        run_lengths = getattr(req, "multimodal_run_lengths", None)
-        if any(field is not None
-               for field in (item_run_cu_seqlen, run_positions, run_lengths)):
-            if (item_run_cu_seqlen is None or run_positions is None
-                    or run_lengths is None):
-                logger.warning(
-                    "Incomplete multimodal run metadata; skipping multimodal token augmentation for block reuse"
-                )
-                return result
-            if (len(item_run_cu_seqlen) != len(req.multimodal_hashes) + 1
-                    or item_run_cu_seqlen[0] != 0
-                    or item_run_cu_seqlen[-1] != len(run_positions)
-                    or len(run_positions) != len(run_lengths)):
-                logger.warning(
-                    "Invalid multimodal run metadata shape; skipping multimodal token augmentation for block reuse"
-                )
-                return result
-
-            for item_idx, hash_ints in enumerate(req.multimodal_hashes):
-                run_begin = item_run_cu_seqlen[item_idx]
-                run_end = item_run_cu_seqlen[item_idx + 1]
-                if run_begin < 0 or run_end < run_begin or run_end > len(
-                        run_positions):
-                    logger.warning(
-                        "Invalid multimodal run prefix sum; skipping multimodal token augmentation for block reuse"
-                    )
-                    return result
-
-                total_item_length = sum(run_lengths[run_begin:run_end])
-                if total_item_length <= 0:
-                    logger.warning(
-                        "Invalid multimodal run length; skipping multimodal token augmentation for block reuse"
-                    )
-                    return result
-
-                digest = hash_to_digest(hash_ints)
-                mm_tokens = gen_multi_modal_tokens(self.vocab_size, digest,
-                                                   total_item_length)
-                item_offset = 0
-                for run_idx in range(run_begin, run_end):
-                    pos = run_positions[run_idx]
-                    length = run_lengths[run_idx]
-                    if pos < 0 or length <= 0:
-                        logger.warning(
-                            "Invalid multimodal run range; skipping multimodal token augmentation for block reuse"
-                        )
-                        return result
-                    mm_end = pos + length
-                    if mm_end <= start or pos >= end:
-                        item_offset += length
-                        continue
-
-                    overlap_start = max(pos, start)
-                    overlap_end = min(mm_end, end)
-                    mm_offset = item_offset + overlap_start - pos
-                    result_offset = overlap_start - start
-                    n = overlap_end - overlap_start
-                    result[result_offset:result_offset +
-                           n] = mm_tokens[mm_offset:mm_offset + n]
-                    item_offset += length
-            return result
-
-        for hash_ints, pos, length in zip(req.multimodal_hashes,
-                                          req.multimodal_positions,
-                                          req.multimodal_lengths,
-                                          strict=True):
-            mm_end = pos + length
-            # Skip multimodal items outside [start, end).
-            if mm_end <= start or pos >= end:
-                continue
-            digest = hash_to_digest(hash_ints)
-            mm_tokens = gen_multi_modal_tokens(self.vocab_size, digest, length)
-            # Overlap between [pos, mm_end) and [start, end).
-            overlap_start = max(pos, start)
-            overlap_end = min(mm_end, end)
-            mm_offset = overlap_start - pos
-            result_offset = overlap_start - start
-            n = overlap_end - overlap_start
-            result[result_offset:result_offset +
-                   n] = mm_tokens[mm_offset:mm_offset + n]
-        return result
+        return _augment_tokens_with_contiguous_mm_metadata(
+            self.vocab_size, result, req.multimodal_hashes,
+            req.multimodal_positions, req.multimodal_lengths, start, end)
 
     def get_kv_cache_stats(self):
         kv_cache_stats = KvCacheStats()

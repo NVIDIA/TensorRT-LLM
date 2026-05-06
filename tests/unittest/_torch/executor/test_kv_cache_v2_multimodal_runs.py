@@ -3,19 +3,23 @@
 
 from types import SimpleNamespace
 
+import pytest
+
+import tensorrt_llm._torch.pyexecutor.resource_manager as resource_manager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import gen_multi_modal_tokens
+
+_HASH_INTS = [1, 2, 3, 4, 5, 6, 7, 8]
 
 
 def test_augment_tokens_for_block_reuse_uses_exact_multimodal_runs():
     vocab_size = 1000
-    hash_ints = [1, 2, 3, 4, 5, 6, 7, 8]
-    digest = b"".join(v.to_bytes(4, "big", signed=True) for v in hash_ints)
+    digest = b"".join(v.to_bytes(4, "big", signed=True) for v in _HASH_INTS)
     mm_tokens = gen_multi_modal_tokens(vocab_size, digest, 4)
 
     manager = SimpleNamespace(vocab_size=vocab_size)
     req = SimpleNamespace(
-        multimodal_hashes=[hash_ints],
+        multimodal_hashes=[_HASH_INTS],
         multimodal_positions=[1],
         multimodal_lengths=[4],
         multimodal_item_run_cu_seqlen=[0, 2],
@@ -31,3 +35,59 @@ def test_augment_tokens_for_block_reuse_uses_exact_multimodal_runs():
 
     sliced = KVCacheManagerV2._augment_tokens_for_block_reuse(manager, tokens, req, start=7, end=10)
     assert sliced == [tokens[7], mm_tokens[2], mm_tokens[3]]
+
+
+def test_augment_tokens_for_block_reuse_skips_out_of_slice_runs(monkeypatch):
+    calls = []
+
+    def fake_gen_multi_modal_tokens(vocab_size, digest, num_tokens):
+        calls.append((vocab_size, digest, num_tokens))
+        return [digest, *range(vocab_size + 1, vocab_size + num_tokens)]
+
+    monkeypatch.setattr(resource_manager, "gen_multi_modal_tokens", fake_gen_multi_modal_tokens)
+
+    manager = SimpleNamespace(vocab_size=1000)
+    req = SimpleNamespace(
+        multimodal_hashes=[_HASH_INTS],
+        multimodal_positions=[1],
+        multimodal_lengths=[4],
+        multimodal_item_run_cu_seqlen=[0, 2],
+        multimodal_run_positions=[1, 8],
+        multimodal_run_lengths=[2, 2],
+    )
+
+    tokens = list(range(12))
+    sliced = KVCacheManagerV2._augment_tokens_for_block_reuse(manager, tokens, req, start=3, end=8)
+    assert sliced == tokens[3:8]
+    assert calls == []
+
+
+def test_augment_tokens_for_block_reuse_rejects_incomplete_run_metadata():
+    manager = SimpleNamespace(vocab_size=1000)
+    req = SimpleNamespace(
+        multimodal_hashes=[_HASH_INTS],
+        multimodal_positions=[1],
+        multimodal_lengths=[4],
+        multimodal_item_run_cu_seqlen=[0, 1],
+    )
+
+    tokens = list(range(8))
+    with pytest.raises(ValueError, match="provided together"):
+        KVCacheManagerV2._augment_tokens_for_block_reuse(manager, tokens, req, start=1, end=3)
+
+
+def test_augment_tokens_for_block_reuse_keeps_contiguous_metadata_path():
+    vocab_size = 1000
+    digest = b"".join(v.to_bytes(4, "big", signed=True) for v in _HASH_INTS)
+    mm_tokens = gen_multi_modal_tokens(vocab_size, digest, 3)
+
+    manager = SimpleNamespace(vocab_size=vocab_size)
+    req = SimpleNamespace(
+        multimodal_hashes=[_HASH_INTS],
+        multimodal_positions=[2],
+        multimodal_lengths=[3],
+    )
+
+    tokens = list(range(8))
+    sliced = KVCacheManagerV2._augment_tokens_for_block_reuse(manager, tokens, req, start=1, end=5)
+    assert sliced == [tokens[1], *mm_tokens]
