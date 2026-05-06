@@ -3,7 +3,6 @@
 Single-GPU tests run without dist. Multi-GPU tests use mp.spawn with NCCL.
 """
 
-import itertools
 import os
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
@@ -14,7 +13,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 try:
-    from tensorrt_llm._torch.visual_gen.mapping import _VALID_DIM_NAMES, VisualGenMapping
+    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
     from tensorrt_llm._utils import get_free_port
 
     MODULES_AVAILABLE = True
@@ -122,24 +121,10 @@ class TestConstruction:
     def test_parallel_vae_size_cannot_exceed_world_size(self):
         with pytest.raises(ValueError, match="cannot exceed world_size"):
             VisualGenMapping(world_size=1, rank=0, parallel_vae_size=2)
-
-    def test_invalid_order_raises(self):
-        with pytest.raises(ValueError, match="permutation"):
-            VisualGenMapping(world_size=1, rank=0, order="cfg-tp-ulysses")
-
-    def test_duplicate_dim_raises(self):
-        with pytest.raises(ValueError, match="permutation"):
-            VisualGenMapping(world_size=1, rank=0, order="cfg-cfg-tp-ulysses")
-
-    def test_custom_order_stored(self):
-        vgm = VisualGenMapping(world_size=1, rank=0, order="ulysses-cp-tp-cfg")
-        assert vgm._dim_names == ("ulysses", "cp", "tp", "cfg")
-
-    def test_all_valid_orders(self):
-        for perm in itertools.permutations(sorted(_VALID_DIM_NAMES)):
-            order = "-".join(perm)
-            vgm = VisualGenMapping(world_size=1, rank=0, order=order)
-            assert vgm._dim_names == perm
+    
+    def test_internal_dim_order(self):
+        vgm = VisualGenMapping(world_size=1, rank=0)
+        assert vgm._dim_names == ("cfg", "tp", "cp", "ulysses")
 
     def test_ulysses_and_attn2d_raises(self):
         """Combining Attention2D and Ulysses raises NotImplementedError."""
@@ -261,37 +246,6 @@ def _logic_default_order_cfg2_ulysses2(rank, world_size):
 
     m = vgm.to_llm_mapping()
     assert m.tp_size == 1
-
-
-def _logic_custom_order_ulysses_outermost(rank, world_size):
-    """Custom order ulysses-cp-tp-cfg with cfg=2, ulysses=2 on 4 GPUs.
-
-    Expected rank layout (outermost=ulysses, innermost=cfg):
-        Rank 0: ulysses=0, cfg=0
-        Rank 1: ulysses=0, cfg=1
-        Rank 2: ulysses=1, cfg=0
-        Rank 3: ulysses=1, cfg=1
-    """
-    from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
-
-    DeviceMeshTopologyImpl.device_mesh = None
-
-    vgm = VisualGenMapping(
-        world_size=world_size,
-        rank=rank,
-        cfg_size=2,
-        ulysses_size=2,
-        order="ulysses-cp-tp-cfg",
-    )
-
-    assert vgm.ulysses_rank == rank // 2
-    assert vgm.cfg_rank == rank % 2
-    assert vgm.is_cfg_conditional == (rank % 2 == 0)
-
-    cfg_pg_size = dist.get_world_size(vgm.cfg_group)
-    ulysses_pg_size = dist.get_world_size(vgm.ulysses_group)
-    assert cfg_pg_size == 2
-    assert ulysses_pg_size == 2
 
 
 def _logic_allreduce_over_tp_group(rank, world_size):
@@ -440,9 +394,6 @@ def _logic_vae_group_full_world_cfg2_ulysses2(rank, world_size):
 class TestMultiGPU:
     def test_default_order_cfg2_ulysses2(self):
         _run_multi_gpu(4, _logic_default_order_cfg2_ulysses2)
-
-    def test_custom_order_ulysses_outermost(self):
-        _run_multi_gpu(4, _logic_custom_order_ulysses_outermost)
 
     def test_allreduce_over_tp_group(self):
         _run_multi_gpu(4, _logic_allreduce_over_tp_group)

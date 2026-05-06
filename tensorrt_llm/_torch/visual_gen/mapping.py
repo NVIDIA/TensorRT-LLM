@@ -21,7 +21,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 _VALID_DIM_NAMES = frozenset({"cfg", "tp", "cp", "ulysses"})
-DEFAULT_DIM_ORDER = "cfg-tp-cp-ulysses"
+# Outermost-to-innermost for init_device_mesh
+_DEVICE_MESH_DIM_ORDER = "cfg-tp-cp-ulysses"
 
 
 class VisualGenMapping(DeviceMeshTopologyImpl):
@@ -47,15 +48,14 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
             attn2d: 2D mesh; Q all-gathered within row group, K/V within col group.
           ulysses: Shards heads via all-to-all (head-sharding, not sequence-sharding).
 
-    Ordering rationale (default ``"cfg-tp-cp-ulysses"``):
+    Fixed mesh axis ordering (implementation detail, see
+    ``_DEVICE_MESH_DIM_ORDER``):
     - Ulysses innermost: all-to-all is latency-sensitive, contiguous ranks
     - CP next: KV streaming (ring) or sequence shard communication (Attention2D)
     - TP next: all-reduce for Linear
     - CFG outermost: independent until final all-gather
 
-    The *order* string maps directly to ``init_device_mesh``'s
-    ``mesh_shape`` tuple (first = outermost / slowest-varying, last =
-    innermost / most contiguous).
+    Callers should use rank and process-group properties only, not mesh layout.
     """
 
     # Flattened (cp, ulysses) mesh, cached after build_mesh().  Shared
@@ -73,7 +73,6 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         attn2d_row_size: int = 1,
         attn2d_col_size: int = 1,
         parallel_vae_size: int = 1,
-        order: str = DEFAULT_DIM_ORDER,
     ):
         # cp_size unifies ring and Attention2D under one context-parallelism mesh dimension.
         # Ring and Attention2D are mutually exclusive: both shard the sequence axis.
@@ -113,12 +112,8 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
                 f"parallel_vae_size ({parallel_vae_size}) cannot exceed world_size ({world_size})"
             )
 
-        dims = order.split("-")
-        if set(dims) != _VALID_DIM_NAMES or len(dims) != len(_VALID_DIM_NAMES):
-            raise ValueError(
-                f"order must be a '-'-separated permutation of "
-                f"{sorted(_VALID_DIM_NAMES)}, got '{order}'"
-            )
+        dims = _DEVICE_MESH_DIM_ORDER.split("-")
+        assert set(dims) == _VALID_DIM_NAMES and len(dims) == len(_VALID_DIM_NAMES)
 
         self.world_size = world_size
         self._rank = rank
@@ -135,7 +130,6 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         self._vae_adj_groups: list[Optional[ProcessGroup]] = []
         self._attn2d_row_group: Optional[ProcessGroup] = None
         self._attn2d_col_group: Optional[ProcessGroup] = None
-        self._order = order
         self._dim_names = tuple(dims)
         # cp_size covers both ring (1D) and Attention2D (2D, row_size * col_size).
         # For Attention2D, _build_attn2d_groups() creates row/col sub-groups;
@@ -172,14 +166,14 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
 
         # Combined sequence-parallel mesh (cp × ulysses) for token sharding (e.g. WAN).
         # ``_flatten`` is collective; every rank must call with the same dim names/order.
-        # Requires ``cp`` and ``ulysses`` adjacent (default ``cfg-tp-cp-ulysses``).
+        # Requires ``cp`` and ``ulysses`` adjacent in ``_DEVICE_MESH_DIM_ORDER``.
         if self.cp_size * self.ulysses_size > 1:
             cp_idx = self._dim_names.index("cp")
             uly_idx = self._dim_names.index("ulysses")
             if abs(cp_idx - uly_idx) != 1:
-                raise ValueError(
-                    "seq_group construction requires cp and ulysses dims to be adjacent "
-                    f"in the mesh, got order={self._order}"
+                raise RuntimeError(
+                    "seq_group requires cp and ulysses adjacent; "
+                    f"fix _DEVICE_MESH_DIM_ORDER (got {self._dim_names!r})"
                 )
             # Linearisation: seq_rank = cp_rank * ulysses_size + ulysses_rank (cp outer).
             VisualGenMapping.seq_mesh = cls.device_mesh["cp", "ulysses"]._flatten(

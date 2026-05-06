@@ -671,8 +671,7 @@ class WanTransformer3DModel(nn.Module):
             # batch_size, seq_len, 6, hidden_size
             temb_proj = temb_proj.unflatten(2, (6, self.config.hidden_size))
             # Shard per-patch temb_proj to match the local sequence chunk
-            if chunk_size is not None:
-                temb_proj = temb_proj[:, chunk_start:chunk_end]
+            temb_proj = self.sharder.shard(temb_proj, dim=1, expected_seq_len=seq_len)
         else:
             # batch_size, 6, hidden_size
             temb_proj = temb_proj.unflatten(1, (6, self.config.hidden_size))

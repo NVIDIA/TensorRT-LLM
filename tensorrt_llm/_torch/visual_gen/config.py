@@ -23,7 +23,6 @@ import yaml
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic import Field as PydanticField
 
-from tensorrt_llm._torch.visual_gen.mapping import DEFAULT_DIM_ORDER
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.logger import logger
@@ -194,13 +193,6 @@ class ParallelConfig(StrictBaseModel):
     dit_attn2d_col_size: int = PydanticField(1, ge=1)  # Supported
     dit_cfg_size: int = PydanticField(1, ge=1)  # Supported
     dit_fsdp_size: int = PydanticField(1, ge=1)
-    dit_dim_order: str = PydanticField(
-        DEFAULT_DIM_ORDER,
-        description=(
-            "Outermost-to-innermost ordering of parallelism axes for the "
-            "DeviceMesh. Innermost = most contiguous ranks."
-        ),
-    )
 
     # Refiner Parallelism (Optional)
     refiner_dit_dp_size: int = 1
