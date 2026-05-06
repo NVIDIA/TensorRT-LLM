@@ -233,6 +233,7 @@ SharedPageLock PageHolder::lock(
     {
         if (auto mgr = page->manager.lock())
             mgr->excludeFromEviction(*page);
+        assert(!page->scheduledForEviction());
     }
 
     return ul->share(kvCache, beamIndex, ordinal, lc, skipWait);
