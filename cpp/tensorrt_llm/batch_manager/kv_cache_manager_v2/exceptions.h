@@ -140,6 +140,19 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// Helper: unwrap a weak_ptr, throw LogicError on dangling reference.
+// Mirrors Python's unwrap_rawref(_utils.py:163).
+// ---------------------------------------------------------------------------
+template <typename T>
+std::shared_ptr<T> unwrap(std::weak_ptr<T> const& ref)
+{
+    auto ptr = ref.lock();
+    if (!ptr)
+        throw LogicError("Dereferencing a dangling weak_ptr");
+    return ptr;
+}
+
+// ---------------------------------------------------------------------------
 // Helper: unwrap CUresult, throw CuError/CuOOMError on failure.
 // ---------------------------------------------------------------------------
 inline void cuCheck(CUresult result)
