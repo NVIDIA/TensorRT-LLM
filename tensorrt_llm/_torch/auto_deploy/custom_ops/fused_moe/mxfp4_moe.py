@@ -31,6 +31,7 @@ from triton_kernels.matmul_ogs import (
 )
 from triton_kernels.numerics import InFlexData
 from triton_kernels.swiglu import swiglu_fn
+from triton_kernels.target_info import cuda_capability_geq
 from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
 from triton_kernels.tensor_details import layout
 from triton_kernels.tensor_details.layout import StridedLayout
@@ -39,8 +40,17 @@ from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import TritonEPRoute
 
 
 # copied from transformers.integrations.mxfp4::swizzle_mxfp4 with minor modification
+def _mxfp4_value_layout(mx_axis: int):
+    # Blackwell's default value layout is only supported by the persistent TMA
+    # kernel. GPT-OSS MoE can select the non-persistent kernel for small shapes,
+    # where unswizzled values use the native MXFP4 dot_scaled path.
+    if cuda_capability_geq(10):
+        return StridedLayout, {}
+    return layout.make_default_matmul_mxfp4_w_layout(mx_axis=mx_axis)
+
+
 def _swizzle_mxfp4(w, w_scale):
-    value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(mx_axis=1)
+    value_layout, value_layout_opts = _mxfp4_value_layout(mx_axis=1)
     w = convert_layout(wrap_torch_tensor(w, dtype=FP4), value_layout, **value_layout_opts)
     w_scale = convert_layout(wrap_torch_tensor(w_scale), StridedLayout)
     return w, w_scale
