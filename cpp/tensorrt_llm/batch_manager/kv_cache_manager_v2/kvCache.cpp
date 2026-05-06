@@ -1049,20 +1049,16 @@ void KvCache::stopCommitting()
     int tokensLeft = static_cast<int>(mCommittedTokens.size()) - mNumCommittedBlocks * mTokensPerBlock;
     if (tokensLeft > 0 && mNumCommittedBlocks < static_cast<int>(mBlocks.size()))
     {
-        auto& sb = mBlocks.at(static_cast<size_t>(mNumCommittedBlocks));
-        if (!sb.isCommitted())
-        {
-            auto scope = recordEventScope();
-            // isLast=true: _commitBlock handles USER_STOP + _onStopCommitting() internally.
-            _commitBlock(mNumCommittedBlocks, /*isLast=*/true);
-            return;
-        }
+        auto scope = recordEventScope();
+        // isLast=true: _commitBlock handles USER_STOP + _onStopCommitting() internally.
+        _commitBlock(mNumCommittedBlocks, /*isLast=*/true);
     }
-
-    // No partial block to commit (or block was already committed).
-    // Mirrors Python's else branch in stop_committing().
-    mCommitState = CommitState::USER_STOP;
-    _onStopCommitting();
+    else
+    {
+        mCommitState = CommitState::USER_STOP;
+        _onStopCommitting();
+    }
+    assert(mCommitState == CommitState::USER_STOP);
 }
 
 // ---------------------------------------------------------------------------
