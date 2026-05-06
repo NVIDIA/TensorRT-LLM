@@ -151,9 +151,7 @@ TemporaryCudaStream::TemporaryCudaStream(std::vector<CachedCudaEvent const*> con
     : mStream()
 {
     CudaStream cs = reinterpret_cast<CudaStream>(mStream.handle());
-    for (auto const* ev : priorEvents)
-        if (ev)
-            ev->waitInStream(cs);
+    streamWaitEvents(cs, priorEvents);
 }
 
 // ---------------------------------------------------------------------------
