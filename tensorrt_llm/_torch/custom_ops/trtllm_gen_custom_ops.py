@@ -218,8 +218,9 @@ def prepare_dummy_topk_and_hook(
         if routing_method_type == RoutingMethodType.MiniMax2:
             routing_cls_kwargs.update({
                 'callable_e_score_correction_bias':
-                lambda: torch.randn(
-                    num_experts, dtype=torch.bfloat16, device=hidden_states.device),
+                lambda: torch.randn(num_experts,
+                                    dtype=torch.bfloat16,
+                                    device=hidden_states.device),
                 'num_experts':
                 num_experts,
             })
