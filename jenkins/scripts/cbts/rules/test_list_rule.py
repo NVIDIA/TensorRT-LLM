@@ -94,24 +94,32 @@ class TestListRule(Rule):
             )
 
         if not added:
+            # Only removals (or comment/whitespace-only edits) → no new
+            # tests to verify; claim as noop so other rules union normally.
             note = f" ({len(removed)} removed entries don't need verification)" if removed else ""
             return RuleResult(
                 handled_files=set(touched),
                 affected_stages=set(),
-                scope="testlistonly",
+                scope="noop",
+                sanity_relevant=False,
+                perfsanity_relevant=False,
                 reason=f"testlist: no additions across {len(touched)} file(s){note}",
             )
 
         block_filters, misses = lookup_ids_into_block_filters(self.yaml_index, added)
-        if misses:
+        if not block_filters:
+            # All added entries unresolvable → no narrow contribution; claim
+            # as noop (analogous to waivesonly all-miss).
             preview = ", ".join(sorted(misses)[:3])
             more = f" (+{len(misses) - 3} more)" if len(misses) > 3 else ""
             return RuleResult(
                 handled_files=set(touched),
                 affected_stages=set(),
-                scope=None,
+                scope="noop",
+                sanity_relevant=False,
+                perfsanity_relevant=False,
                 reason=(
-                    f"testlist: {len(misses)} added entry/entries don't resolve "
+                    f"testlist: all {len(misses)} added entry/entries don't resolve "
                     f"to any post-PR YAML block: {preview}{more}"
                 ),
             )
@@ -121,6 +129,12 @@ class TestListRule(Rule):
         )
         sanity_relevant = any(stem == "l0_sanity_check" for stem, _ in block_filters)
         perfsanity_relevant = any(_is_perf_stem(stem) for stem, _ in block_filters)
+
+        miss_note = ""
+        if misses:
+            preview = ", ".join(sorted(misses)[:3])
+            more = f" (+{len(misses) - 3} more)" if len(misses) > 3 else ""
+            miss_note = f"; {len(misses)} unresolved entry/entries ignored: {preview}{more}"
 
         return RuleResult(
             handled_files=set(touched),
@@ -133,5 +147,6 @@ class TestListRule(Rule):
                 f"testlist: +{len(added)} / -{len(removed)} across "
                 f"{len(touched)} file(s) → narrow on +{len(added)} → "
                 f"{len(block_filters)} blocks, {len(affected_stages)} stages"
+                f"{miss_note}"
             ),
         )

@@ -132,17 +132,25 @@ class TestsDefRule(Rule):
 
         block_filters: dict[tuple[str, int], dict[str, set[str]]] = {}
         narrowed: set[str] = set()
-        handled: set[str] = set()
+        handled: set[str] = set(candidates)
+        out_of_namespace: set[str] = set()
+        no_match: set[str] = set()
 
         for git_path in candidates:
             yaml_path = self.yaml_index.git_path_to_yaml_key(git_path)
             if yaml_path is None:
-                continue  # outside any YAML namespace → Selector reports unhandled
+                # Outside any YAML namespace (e.g. tests/unittest/...) →
+                # cannot affect integration test selection; claim as noop
+                # contribution.
+                out_of_namespace.add(git_path)
+                continue
             anchors = self._compute_anchors(git_path, yaml_path, pr.diffs.get(git_path, ""))
             file_bf, _ = lookup_paths_into_block_filters(self.yaml_index, anchors)
             if not file_bf:
-                continue  # no covering YAML entry → don't claim
-            handled.add(git_path)
+                # In-namespace but no YAML entry covers this path → no
+                # narrow contribution; still claimed as noop.
+                no_match.add(git_path)
+                continue
             narrowed.add(git_path)
             for key, prefix_to_ids in file_bf.items():
                 dst = block_filters.setdefault(key, {})
@@ -150,7 +158,22 @@ class TestsDefRule(Rule):
                     dst.setdefault(prefix, set()).update(ids)
 
         if not block_filters:
-            return None
+            # Rule fired (files matched pattern) but no narrow contribution:
+            # files are claimed and treated as no-impact for selection.
+            parts: list[str] = []
+            if out_of_namespace:
+                parts.append(f"{len(out_of_namespace)} out-of-namespace")
+            if no_match:
+                parts.append(f"{len(no_match)} no covering YAML entry")
+            detail = ", ".join(parts) if parts else "no narrow"
+            return RuleResult(
+                handled_files=handled,
+                affected_stages=set(),
+                scope="noop",
+                sanity_relevant=False,
+                perfsanity_relevant=False,
+                reason=f"testdef: {len(handled)} path(s) → {detail}",
+            )
 
         if (
             self._total_blocks > 0
@@ -173,6 +196,11 @@ class TestsDefRule(Rule):
         sanity_relevant = any(stem == "l0_sanity_check" for stem, _ in block_filters)
         perfsanity_relevant = any(_is_perf_stem(stem) for stem, _ in block_filters)
 
+        nonarrow_note = ""
+        nonarrow = out_of_namespace | no_match
+        if nonarrow:
+            nonarrow_note = f"; {len(nonarrow)} path(s) with no narrow contribution"
+
         return RuleResult(
             handled_files=handled,
             affected_stages=affected_stages,
@@ -183,5 +211,6 @@ class TestsDefRule(Rule):
             reason=(
                 f"testdef: {len(narrowed)} path(s) → "
                 f"{len(block_filters)} blocks, {len(affected_stages)} stages"
+                f"{nonarrow_note}"
             ),
         )
