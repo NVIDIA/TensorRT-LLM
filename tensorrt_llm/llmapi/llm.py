@@ -595,8 +595,12 @@ class BaseLLM:
                     "Multimodal disaggregated inference is not supported for this model"
                 )
             mm_handles = disaggregated_params.multimodal_embedding_handles
-            prompt_token_ids, _, _ = self.input_processor.get_prompt_token_ids(
-                inputs, mm_handles)
+            mm_item_runs = disaggregated_params.multimodal_item_runs
+            if inputs.get("prompt_token_ids") is not None:
+                prompt_token_ids = inputs["prompt_token_ids"]
+            else:
+                prompt_token_ids = self.input_processor.get_prompt_token_ids(
+                    inputs, mm_handles, mm_item_runs=mm_item_runs)
             prompt = inputs.get("prompt", None)
             query_token_ids = inputs.get("query_token_ids", None)
             if is_gen_only:
@@ -605,7 +609,6 @@ class BaseLLM:
                 )
             else:
                 mm_hashes = disaggregated_params.multimodal_hashes
-                mm_item_runs = disaggregated_params.multimodal_item_runs
                 multimodal_input = None
                 if mm_hashes is not None:
                     if mm_item_runs is None:

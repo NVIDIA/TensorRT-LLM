@@ -4070,10 +4070,6 @@ class PyTorchModelEngine(ModelEngine):
         ) == 1, "mm_embeddings should be a 1-element list, mix modality (video+image) is not supported"
 
         if multimodal_chunks:
-            if len(multimodal_chunks) != len(multimodal_params):
-                raise ValueError("multimodal embedding split count mismatch: "
-                                 f"{len(multimodal_chunks)} request chunks for "
-                                 f"{len(multimodal_params)} multimodal params")
             mm_embeddings = list(
                 torch.split(mm_embeddings[0], multimodal_chunks, dim=0))
         else:

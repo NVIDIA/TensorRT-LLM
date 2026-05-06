@@ -358,11 +358,6 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
                 raise ValueError(
                     f"request {request.py_request_id} has no multimodal embedding lengths"
                 )
-            expected_num_embeddings = sum(multimodal_embedding_lengths)
-            if len(mm_embedding) != expected_num_embeddings:
-                raise ValueError(
-                    f"mm_embedding shape mismatch: {len(mm_embedding)} != {expected_num_embeddings}"
-                )
 
             request.py_result.append_mm_embeddings(mm_embedding, multimodal_embedding_lengths)
 

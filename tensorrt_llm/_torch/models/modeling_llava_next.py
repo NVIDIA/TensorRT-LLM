@@ -264,9 +264,11 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         return fused_input_ids, mm_features
 
     def get_prompt_token_ids(
-        self, inputs: Union[TextPrompt, TokensPrompt],
-        mm_handles: List[Dict[str,
-                              Any]]) -> Tuple[List[int], List[int], List[int]]:
+        self,
+        inputs: Union[TextPrompt, TokensPrompt],
+        mm_handles: List[Dict[str, Any]],
+        mm_item_runs: Optional[List[List[Any]]] = None,
+    ) -> List[int]:
         """
         Build input token ids with multimodal placeholders expanded to the number of MM tokens.
 
@@ -275,12 +277,12 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         Args:
             inputs: Inputs containing an already tokenized text prompt or a text prompt string.
             mm_handles: List of multimodal embedding handles.
+            mm_item_runs: Optional multimodal item-run layout. Llava-Next's
+                disaggregated prompt expansion remains contiguous and does not
+                consume this layout.
 
         Returns:
-            Tuple[List[int], List[int], List[int]]:
-                - expanded_ids: token ids with each image token expanded to a placeholder repeated per MM token
-                - mm_token_length: per-image MM token lengths
-                - mm_token_offsets: start offsets (positions) for each image's MM tokens within expanded_ids
+            expanded_ids: token ids with each image token expanded to a placeholder repeated per MM token
         """
         # TODO: Move this function to the base input processor class when extending for more models
         text_prompt = inputs.get("prompt")
@@ -304,9 +306,8 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                 )
 
         num_mm_tokens_per_image = [h["tensor_size"][0] for h in mm_handles]
-        expanded_ids, mm_token_length, mm_token_offsets = (
-            self._expand_image_placeholders_in_token_ids(
-                prompt_token_ids, num_mm_tokens_per_image))
+        expanded_ids, _, _ = self._expand_image_placeholders_in_token_ids(
+            prompt_token_ids, num_mm_tokens_per_image)
 
         # Final assertions to check the correctness of the expanded ids.
         final_length = len(expanded_ids)
@@ -316,13 +317,8 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         assert final_length == expected_final_length, (
             f"Write position mismatch: {final_length} != {expected_final_length}"
         )
-        if mm_token_length:
-            assert mm_token_length[-1] + mm_token_offsets[-1] <= final_length, (
-                f"mm_token_length[-1] + mm_token_offsets[-1] "
-                f"({mm_token_length[-1] + mm_token_offsets[-1]}) should be less "
-                f"than or equal to final_length ({final_length})")
 
-        return expanded_ids, mm_token_length, mm_token_offsets
+        return expanded_ids
 
     def attach_multimodal_embeddings(
         self, inputs: TextPrompt,

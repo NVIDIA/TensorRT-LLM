@@ -18,6 +18,7 @@
 
 import math
 import os
+from itertools import chain
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 
 import torch
@@ -27,7 +28,8 @@ from PIL import Image
 from torchvision.transforms import Normalize, Resize, ToTensor
 
 from tensorrt_llm._torch.modules.embedding import Embedding
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import (MultimodalParams, _as_cpu_tensor,
+                                            unpack_multimodal_item_run)
 from tensorrt_llm.logger import logger
 
 _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
@@ -36,6 +38,140 @@ _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
 # Make this a runtime lookup rather than a module-wide constant for easier unit testing.
 def _is_disagg() -> bool:
     return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
+
+
+def _ensure_cpu_token_list(input_ids: torch.Tensor) -> List[int]:
+    # Keep prompt expansion CPU-side; the LLM API consumes a Python token list.
+    return _as_cpu_tensor(input_ids).tolist()
+
+
+def _replace_marker_segments(input_id_list: List[int],
+                             marker_positions: List[int],
+                             replacements: List[List[int]]) -> List[int]:
+    read_start = 0
+    segments = []
+    for marker_position, replacement in zip(marker_positions, replacements):
+        segments.extend(
+            [input_id_list[read_start:marker_position], replacement])
+        read_start = marker_position + 1
+    segments.append(input_id_list[read_start:])
+    return list(chain.from_iterable(segments))
+
+
+def _build_disagg_item_run_tokens(item_idx: int, item_runs: List[Any],
+                                  mm_handle: Dict[str, Any],
+                                  marker_token_id: int, placeholder_id: int,
+                                  prompt_start: int) -> List[int]:
+    item_tokens = []
+    item_embedding_tokens = 0
+    write_pos = prompt_start
+    for run_idx, run in enumerate(item_runs):
+        run_start, run_length, non_embed_offsets = unpack_multimodal_item_run(
+            run, "mm_item_runs", item_idx, run_idx)
+        if run_length <= 0:
+            raise ValueError("Multimodal item run length must be positive")
+        if non_embed_offsets is None:
+            non_embed_offsets = ()
+        non_embed_offsets = tuple(non_embed_offsets)
+        non_embed_offset_set = set(non_embed_offsets)
+        if len(non_embed_offset_set) != len(non_embed_offsets):
+            raise ValueError(
+                "Multimodal item run non-embed offsets must be unique")
+        if any(offset < 0 or offset >= run_length
+               for offset in non_embed_offset_set):
+            raise ValueError(
+                "Multimodal item run non-embed offsets must be within the run length"
+            )
+        if write_pos != run_start:
+            raise ValueError(
+                f"Multimodal item run starts at {run_start}, but prompt expansion would place it at {write_pos}"
+            )
+
+        run_tokens = [placeholder_id] * run_length
+        for offset in non_embed_offsets:
+            run_tokens[offset] = marker_token_id
+        item_tokens.extend(run_tokens)
+        item_embedding_tokens += run_length - len(non_embed_offset_set)
+        write_pos += run_length
+
+    expected_embedding_tokens = mm_handle["tensor_size"][0]
+    if item_embedding_tokens != expected_embedding_tokens:
+        raise ValueError(
+            f"Multimodal item {item_idx} has {item_embedding_tokens} embedding tokens from item runs, but handle reports {expected_embedding_tokens}"
+        )
+    return item_tokens
+
+
+def expand_mm_prompt_token_ids_for_disagg(
+    input_ids: torch.Tensor,
+    *,
+    multimodal_token_ids: List[int],
+    mm_handles: List[Dict[str, Any]],
+    placeholder_id: int,
+    mm_item_runs: Optional[List[List[Any]]] = None,
+) -> List[int]:
+    """Expand mm placeholders to be embedding-sized.
+    Validated for both image and video (non-contiguous) embedding transport.
+
+    `input_ids` must be a CPU tensor because LLM preprocessing consumes a
+    Python token list. Without `mm_item_runs`, each marker expands to the
+    corresponding handle's embedding length. With `mm_item_runs`, the prompt
+    must contain one marker per multimodal item in prompt order; the item runs
+    drive the exact placeholder/special-token layout for that item.
+    """
+    input_id_list = _ensure_cpu_token_list(input_ids)
+    marker_token_ids = set(multimodal_token_ids)
+    marker_positions = [
+        idx for idx, token_id in enumerate(input_id_list)
+        if token_id in marker_token_ids
+    ]
+
+    if mm_item_runs is None:
+        if len(marker_positions) != len(mm_handles):
+            raise ValueError(
+                f"Number of multimodal placeholders ({len(marker_positions)}) must match number of mm_handles ({len(mm_handles)})"
+            )
+        replacements = [[placeholder_id] * mm_handle["tensor_size"][0]
+                        for mm_handle in mm_handles]
+        return _replace_marker_segments(input_id_list, marker_positions,
+                                        replacements)
+
+    if len(mm_item_runs) != len(mm_handles):
+        raise ValueError(
+            f"Number of multimodal item runs ({len(mm_item_runs)}) must match number of mm_handles ({len(mm_handles)})"
+        )
+
+    if len(marker_positions) != len(mm_item_runs):
+        raise ValueError(
+            f"Number of multimodal placeholders ({len(marker_positions)}) must match number of multimodal items ({len(mm_item_runs)})"
+        )
+
+    replacements = []
+    write_pos = 0
+    read_start = 0
+    # Item-runs are already ordered by prompt position, so no marker lookup map is needed.
+    for item_idx, (read_pos, item_runs, mm_handle) in enumerate(
+            zip(marker_positions, mm_item_runs, mm_handles)):
+        write_pos += read_pos - read_start
+        replacement = _build_disagg_item_run_tokens(
+            item_idx,
+            item_runs,
+            mm_handle,
+            marker_token_id=input_id_list[read_pos],
+            placeholder_id=placeholder_id,
+            prompt_start=write_pos,
+        )
+        replacements.append(replacement)
+        write_pos += len(replacement)
+        read_start = read_pos + 1
+    write_pos += len(input_id_list) - read_start
+
+    expanded_ids = _replace_marker_segments(input_id_list, marker_positions,
+                                            replacements)
+    if len(expanded_ids) != write_pos:
+        raise RuntimeError(
+            f"Write position mismatch: {len(expanded_ids)} != {write_pos}")
+    return expanded_ids
 
 
 def _get_uncached_multimodal_params(

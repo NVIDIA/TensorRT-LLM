@@ -37,7 +37,7 @@ class DisaggregatedParams:
 
         multimodal_embedding_handles (List[Dict[str, Any]]): The resulting multimodal embedding handles from ViT.
         multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.
-         Requires multimodal_item_runs so cache keys know the exact prompt coverage.
+         Pairs with multimodal_item_runs when cache keys need exact prompt coverage.
         multimodal_item_runs (List[List[Tuple[int, int, List[int]]]]): Exact prompt token runs covered by each
          multimodal item. The third tuple element lists local non-embed offsets for that run.
     """
@@ -110,19 +110,11 @@ class DisaggregatedParams:
                 )
         if self.multimodal_embedding_handles is not None:
             if self.multimodal_hashes is not None:
-                if len(self.multimodal_embedding_handles) != len(self.multimodal_hashes):
-                    raise ValueError(
-                        "multimodal_embedding_handles and multimodal_hashes must have the same length"
-                    )
-
-        if self.multimodal_hashes is not None:
-            if self.multimodal_item_runs is None:
-                raise ValueError("multimodal_hashes requires multimodal_item_runs")
-
-        if self.multimodal_item_runs is not None:
-            if self.multimodal_hashes is None:
-                raise ValueError("multimodal_item_runs requires multimodal_hashes")
-            if len(self.multimodal_item_runs) != len(self.multimodal_hashes):
-                raise ValueError(
-                    "multimodal_item_runs and multimodal_hashes must have the same length"
+                # if mm hashes are provided, kvcache reuse can be enabled
+                assert len(self.multimodal_embedding_handles) == len(self.multimodal_hashes), (
+                    "multimodal_embedding_handles and multimodal_hashes must have the same length"
                 )
+                for mm_hash in self.multimodal_hashes:
+                    assert isinstance(mm_hash, list), "mm_hash must be a list"
+                    assert len(mm_hash) == 8, "mm_hash must be a list of 8 integers"
+                    assert all(isinstance(x, int) for x in mm_hash), "mm_hash must contain integers"

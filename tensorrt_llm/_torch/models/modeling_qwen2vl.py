@@ -42,7 +42,8 @@ from ..attention_backend.utils import get_attention_backend
 from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
+from .modeling_multimodal_utils import (expand_mm_prompt_token_ids_for_disagg,
+                                        find_input_mm_embeds, fuse_input_embeds,
                                         get_handoff_multimodal_embeddings,
                                         get_multimodal_embeddings)
 from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
@@ -1064,21 +1065,23 @@ class Qwen2VLModel(Qwen2VLModelBase):
 class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
 
     def get_prompt_token_ids(
-        self, inputs: TextPrompt,
-        mm_handles: List[Dict[str,
-                              Any]]) -> Tuple[List[int], List[int], List[int]]:
+        self,
+        inputs: TextPrompt,
+        mm_handles: List[Dict[str, Any]],
+        mm_item_runs: Optional[List[List[Any]]] = None,
+    ) -> List[int]:
         """
         Build input token ids with multimodal placeholders expanded to the number of MM tokens.
 
         Args:
             inputs: Text prompt input container. Must contain a non-empty prompt string.
             mm_handles: List of multimodal embedding handles.
+            mm_item_runs: Optional multimodal item-run layout for sparse
+                image/video embeddings.
 
         Returns:
-            Tuple[List[int], List[int], List[int]]:
-                - expanded_ids: token ids with each image token expanded to a placeholder repeated per MM token
-                - mm_token_length: per-image MM token lengths
-                - mm_token_offsets: start offsets (positions) for each image's MM tokens within expanded_ids
+            expanded_ids: token ids with each image/video token expanded to
+                multimodal placeholder ids.
         """
         # TODO: Move this function to the base input processor class when extending for more models
         text_prompt = inputs.get("prompt")
@@ -1098,45 +1101,18 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
         input_ids = self.tokenizer(text_prompt,
                                    return_tensors="pt").input_ids[0]
 
-        image_token_index = self.config.image_token_id
-
-        image_mask = input_ids == image_token_index
-        image_positions = torch.where(image_mask)[0]
-        num_images = len(image_positions)
-        assert num_images == len(
-            mm_handles), "Number of images must match number of mm_handles"
-        total_mm_tokens = sum(mm_handle["tensor_size"][0]
-                              for mm_handle in mm_handles)
-        final_length = len(input_ids) - num_images + total_mm_tokens
-        # Create output tensor
-        expanded_ids = torch.empty(final_length, dtype=input_ids.dtype)
-        placeholder_id = self.tllm_multimodal_token_id
-
-        # Fill the expanded sequence
-        write_pos = 0
-        image_cnt = 0
-        mm_token_length = []
-        mm_token_offsets = []
-        for read_pos in range(len(input_ids)):
-            if input_ids[read_pos] == image_token_index:
-                # Replace with placeholder id
-                mm_token_num = mm_handles[image_cnt]["tensor_size"][0]
-                expanded_ids[write_pos:write_pos + mm_token_num] = \
-                    placeholder_id
-                mm_token_offsets.append(write_pos)
-                mm_token_length.append(mm_token_num)
-                write_pos += mm_token_num
-                image_cnt += 1
-            else:
-                # Copy text token as-is
-                expanded_ids[write_pos] = input_ids[read_pos]
-                write_pos += 1
-
-        assert write_pos == final_length, f"Write position mismatch: {write_pos} != {final_length}"
-        assert mm_token_length[-1] + mm_token_offsets[
-            -1] <= final_length, f"mm_token_length[-1] + mm_token_offsets[-1] ({mm_token_length[-1] + mm_token_offsets[-1]}) should be less than or equal to final_length ({final_length})"
-        return expanded_ids.to(
-            torch.int32).tolist(), mm_token_length, mm_token_offsets
+        return expand_mm_prompt_token_ids_for_disagg(
+            input_ids,
+            multimodal_token_ids=[
+                token_id for token_id in [
+                    self.config.image_token_id,
+                    getattr(self.config, "video_token_id", None),
+                ] if token_id is not None
+            ],
+            mm_handles=mm_handles,
+            placeholder_id=self.tllm_multimodal_token_id,
+            mm_item_runs=mm_item_runs,
+        )
 
 
 @support_multimodal_disaggregated
