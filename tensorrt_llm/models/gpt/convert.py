@@ -29,8 +29,14 @@ import torch
 import torch.nn as nn
 import yaml
 from tqdm import tqdm
-from transformers import (AutoModelForCausalLM, AutoModelForVision2Seq,
-                          AutoTokenizer)
+
+try:
+    from transformers import AutoModelForVision2Seq
+except ImportError:
+    # Transformers v5+: vision-to-seq auto models use AutoModelForImageTextToText
+    from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
+
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 from transformers.pytorch_utils import Conv1D
 
