@@ -220,7 +220,6 @@ def pulseScanSourceCode(llmRepo, ref) {
                         "PULSE_NSPECT_ID=NSPECT-95LK-6FZF",
                         "PULSE_BEARER_TOKEN=${token}",
                         "PULSE_REPO_URL=${llmRepo}",
-                        "PULSE_REPO_BRANCH=${(params.repoUrlKey == "github_fork") ? "" : ref}",
                         "PULSE_SCAN_PROJECT=TRT-LLM",
                         "PULSE_SCAN_PROJECT_VERSION=${version}",
                         "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json",

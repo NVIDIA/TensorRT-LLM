@@ -304,6 +304,7 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.5-fp8kv=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.9-fp8kv=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention_4gpus[target_sparsity_0.9-fp8kv=True]
+  - disaggregated/test_disaggregated.py::test_disaggregated_mamba_conc_greater_than_mbs[NVIDIA-Nemotron-3-Super-120B-A12B-FP8]
 # ------------- AutoDeploy Backend Stages ---------------
 - condition:
     ranges:
