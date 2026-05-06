@@ -4,10 +4,10 @@ This folder contains test definition which is consumed by `trt-test-db` tool bas
 
 ## Installation
 
-Install `trt-test-db` using the following command:
+Install `trt-test-db` using the following command (substitute `TRT_TEST_DB_VERSION` with the version from `jenkins/ci_versions.properties`):
 
 ```bash
-pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7
+pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==<TRT_TEST_DB_VERSION>
 ```
 
 ## Test Definition
