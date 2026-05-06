@@ -430,6 +430,28 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             .get("_name_or_path", ""),
         )
         hf_processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
+        # transformers 5.x's ``ProcessorMixin._merge_kwargs`` validates
+        # per-modality output kwargs against a strict TypedDict. Some
+        # checkpoints (e.g., Qwen2.5-VL) ship a tokenizer whose
+        # ``init_kwargs`` carries processor-output keys like
+        # ``video_grid_thw`` / ``image_grid_thw`` (or include
+        # ``model_input_names`` containing them) that propagate into
+        # ``output_kwargs[modality]`` and trip the strict validator. Strip
+        # processor-output keys defensively so the validator only sees
+        # genuine input kwargs.
+        _PROCESSOR_OUTPUT_KEYS = {
+            "image_grid_thw",
+            "video_grid_thw",
+            "pixel_values",
+            "pixel_values_videos",
+            "second_per_grid_ts",
+            "mm_token_type_ids",
+        }
+        tokenizer_init_kwargs = getattr(hf_processor.tokenizer, "init_kwargs", None)
+        if isinstance(tokenizer_init_kwargs, dict):
+            for k in list(tokenizer_init_kwargs):
+                if k in _PROCESSOR_OUTPUT_KEYS:
+                    tokenizer_init_kwargs.pop(k, None)
         inputs = default_multimodal_input_loader(
             tokenizer=hf_processor.tokenizer,
             model_dir=model_path,

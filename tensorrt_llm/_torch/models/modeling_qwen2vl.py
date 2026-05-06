@@ -286,13 +286,31 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             do_rescale = False
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
+        # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly
+        # validates kwargs against the processor's TypedDict. The grid_thw /
+        # pixel_values keys are processor *outputs*, not inputs, and rejecting
+        # them is a regression vs. earlier behavior. Strip them defensively so
+        # callers that round-trip processor outputs back through
+        # ``mm_processor_kwargs`` don't trigger validation errors.
+        _PROCESSOR_OUTPUT_KEYS = (
+            "image_grid_thw",
+            "video_grid_thw",
+            "pixel_values",
+            "pixel_values_videos",
+            "second_per_grid_ts",
+        )
+        sanitized_kwargs = {
+            k: v
+            for k, v in mm_processor_kwargs.items()
+            if k not in _PROCESSOR_OUTPUT_KEYS
+        }
         return self.processor(text=[text],
                               images=images,
                               videos=videos,
                               padding=True,
                               do_rescale=do_rescale,
                               return_tensors='pt',
-                              **mm_processor_kwargs)
+                              **sanitized_kwargs)
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
         masks = (input_ids == self.config.image_token_id) | (
