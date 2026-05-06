@@ -254,7 +254,7 @@ class Starcoder2Model(PreTrainedModel):
         self.rotary_emb = Starcoder2RotaryEmbedding(
             head_dim,
             max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
+            base=config.rope_parameters["rope_theta"],
         )
 
         self.post_init()
