@@ -16,6 +16,7 @@
  */
 
 #include "kv_cache_manager_v2/storage/config.h"
+#include "kv_cache_manager_v2/utils/math.h"
 
 #include <algorithm>
 #include <cassert>
@@ -125,7 +126,7 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
                 for (auto const& buf : cfg.buffers)
                 {
                     int tpbo = buf.tokensPerBlockOverride.value_or(tokensPerBlock);
-                    int exp = tokensPerBlock / tpbo;
+                    int exp = exactDiv(tokensPerBlock, tpbo);
                     size_t expandedSize = buf.size * static_cast<size_t>(exp);
 
                     BufferId bid{cfg.layerId, buf.role};

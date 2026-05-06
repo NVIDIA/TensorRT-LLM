@@ -490,6 +490,29 @@ RootBlock& BlockRadixTree::addOrGetExisting(std::optional<int64_t> loraTaskId)
     return newIt->second;
 }
 
+// Among all child nodes, find the one whose tokens have the longest leading match.
+// Returns (block, numMatchedTokens) or (nullptr, 0) if no match.
+// Mirrors Python's find_best_partial_match_in_next_nodes().
+std::pair<Block*, int> findBestPartialMatchInNextNodes(
+    std::unordered_map<BlockKey, std::shared_ptr<Block>> const& nextMap, TokenIdExt const* tokens, size_t tokenCount)
+{
+    // Skip heuristic: too many children would be slow to iterate.
+    if (nextMap.size() >= 32)
+        return {nullptr, 0};
+    Block* best = nullptr;
+    int bestMatch = 0;
+    for (auto const& [k, child] : nextMap)
+    {
+        int m = child->partialMatchThisNode(tokens, tokenCount);
+        if (m > bestMatch)
+        {
+            bestMatch = m;
+            best = child.get();
+        }
+    }
+    return {best, bestMatch};
+}
+
 std::vector<BlockRadixTree::MatchResult> BlockRadixTree::match(
     std::optional<int64_t> loraTaskId, std::vector<TokenIdExt> const& tokens, bool enablePartialMatch) const
 {
@@ -529,23 +552,12 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::match(
     }
 
     // Partial match in children of current node.
-    if (missed && enablePartialMatch && currentNext->size() < 32)
+    if (missed && enablePartialMatch)
     {
         size_t beg = static_cast<size_t>(ordinal) * static_cast<size_t>(mTokensPerBlock);
         size_t missedCount = std::min(static_cast<size_t>(mTokensPerBlock), tokens.size() - beg);
-
-        Block* best = nullptr;
-        int bestMatch = 0;
-        for (auto const& [k, child] : *currentNext)
-        {
-            int m = child->partialMatchThisNode(tokens.data() + beg, missedCount);
-            if (m > bestMatch)
-            {
-                bestMatch = m;
-                best = child.get();
-            }
-        }
-        if (best && bestMatch > 0)
+        auto [best, bestMatch] = findBestPartialMatchInNextNodes(*currentNext, tokens.data() + beg, missedCount);
+        if (best)
             results.push_back({best, bestMatch});
     }
 

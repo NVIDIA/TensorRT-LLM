@@ -401,6 +401,10 @@ private:
     std::vector<TakenPage> _takeUncommittedPage(
         SeqBlock& sb, BeamIndex beamIdx, std::optional<LifeCycleId> skipLc = std::nullopt);
 
+    // Comprehensive sanity check of KvCache invariants.
+    // Mirrors Python's _check_sanity(). Returns true on success (asserts internally).
+    bool _checkSanity() const;
+
     // Page index table management.
     // _basePageIndices[beamIdx][lcId][blockOrdinal] = slotId or BAD
     void _resizePageIndexBuffers(int newNumBlocks);
