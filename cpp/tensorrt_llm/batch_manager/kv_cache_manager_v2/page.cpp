@@ -87,7 +87,10 @@ std::shared_ptr<PageHolder> Page::hold()
         if (auto mgr = manager.lock())
         {
             if (!mgr->isEvictable(*this))
+            {
                 mgr->excludeFromEviction(*this);
+                assert(!scheduledForEviction());
+            }
         }
     }
     return h;
