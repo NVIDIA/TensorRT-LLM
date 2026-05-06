@@ -65,9 +65,12 @@ the dir-level anchor.
 Outcomes:
 
 - Path is out-of-namespace (`git_path_to_yaml_key` returns `None`):
-  unhandled — Selector reports it and falls back. The file lives in
-  `tests/` but YAML's namespace doesn't see it; could be implicitly
-  imported (top-level conftest, sys-path helpers, test input fixtures).
+  - basename is `test_*.py`: claimed as noop — pytest doesn't auto-import
+    test files into other tests, so an L0-unreferenced standalone test
+    file has no impact on what L0 runs.
+  - basename is conftest / `__init__` / a helper / data file: unhandled
+    — Selector reports it and falls back. Could be implicitly imported
+    (top-level conftest, sys-path helpers, test input fixtures).
 - Path is in-namespace but no YAML-covered ancestor exists at any
   walk-up level: claimed as no-narrow contribution (`scope=noop` if
   all paths are like this; a miss-note in the reason on partial-narrow

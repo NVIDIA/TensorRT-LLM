@@ -229,9 +229,17 @@ class TestsDefRule(Rule):
         for git_path in candidates:
             yaml_path = self.yaml_index.git_path_to_yaml_key(git_path)
             if yaml_path is None:
-                # Outside any YAML namespace — could still impact selection
-                # via implicit pytest discovery (top-level conftest, helper
-                # modules outside YAML's view). Don't claim; let Selector
+                base = git_path.rsplit("/", 1)[-1]
+                if base.startswith("test_") and base.endswith(".py"):
+                    # Standalone test_*.py not referenced by any L0 YAML —
+                    # pytest doesn't auto-import test files into other
+                    # tests, so this file's edits can't affect what L0
+                    # runs. Claim as noop contribution.
+                    handled.add(git_path)
+                    no_match.add(git_path)
+                    continue
+                # conftest / __init__ / helper / data — could impact
+                # selection via implicit pytest discovery; let Selector
                 # report it as Unhandled → fallback.
                 out_of_namespace.add(git_path)
                 continue
@@ -288,7 +296,7 @@ class TestsDefRule(Rule):
 
         nonarrow_note = ""
         if no_match:
-            nonarrow_note = f"; {len(no_match)} in-namespace path(s) with no covering YAML entry"
+            nonarrow_note = f"; {len(no_match)} path(s) not in any L0 YAML"
 
         return RuleResult(
             handled_files=handled,
