@@ -42,11 +42,9 @@ Page::Page(std::shared_ptr<StorageManager> mgr, LifeCycleId lc, CacheLevel level
 
 Page::~Page()
 {
-    if (!gNdebug)
-    {
-        assert(status() == PageStatus::DROPPABLE && !scheduledForEviction()
-            && "Page destroyed while still held or scheduled for eviction");
-    }
+    assert(gNdebug
+        || (status() == PageStatus::DROPPABLE && !scheduledForEviction()
+            && "Page destroyed while still held or scheduled for eviction"));
     if (hasValidSlot())
     {
         if (auto mgr = manager.lock())
@@ -215,8 +213,7 @@ PageHolder::PageHolder(std::shared_ptr<Page> p)
 
 PageHolder::~PageHolder()
 {
-    if (!gNdebug)
-        assert(uniqLock.expired() && "PageHolder destroyed while lock still active");
+    assert(gNdebug || (uniqLock.expired() && "PageHolder destroyed while lock still active"));
 
     page->holder.reset(); // clear back-reference
 
@@ -286,10 +283,7 @@ UniqPageLock::UniqPageLock(std::shared_ptr<PageHolder> h)
 UniqPageLock::~UniqPageLock()
 {
     Page& p = *page();
-    if (!gNdebug)
-    {
-        assert(p.cacheLevel == kGpuLevel && !p.scheduledForEviction());
-    }
+    assert(gNdebug || (p.cacheLevel == kGpuLevel && !p.scheduledForEviction()));
     // Merge finish events and set on the page (mirrors Python's merge_events()).
     p.readyEvent = mergeEvents(finishEvents);
 
