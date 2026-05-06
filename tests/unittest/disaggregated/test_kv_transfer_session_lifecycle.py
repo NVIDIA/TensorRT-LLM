@@ -62,6 +62,15 @@ class _FakeRequest:
 
 
 @dataclass
+class _FakeHealth:
+    is_healthy: bool = True
+    quarantined_transfer_count: int = 0
+    quarantine_budget: int = 16
+    seconds_since_last_progress: float = 0.0
+    global_progress_deadline_seconds: float = 60.0
+
+
+@dataclass
 class _FakeTransceiver:
     """Programmable stand-in for the C++-backed KvCacheTransceiver. The
     test sets `next_cancel_results` to a list keyed by request id; each
@@ -69,6 +78,7 @@ class _FakeTransceiver:
     next_cancel_results: dict = field(default_factory=dict)
     cancel_calls: List[int] = field(default_factory=list)
     healthy: bool = True
+    health: _FakeHealth = field(default_factory=_FakeHealth)
 
     def cancel_request_structured(self, req: _FakeRequest):
         self.cancel_calls.append(req.py_request_id)
@@ -77,6 +87,9 @@ class _FakeTransceiver:
 
     def is_healthy(self) -> bool:
         return self.healthy
+
+    def get_health(self) -> _FakeHealth:
+        return self.health
 
 
 def _make_executor_under_test():
@@ -88,6 +101,10 @@ def _make_executor_under_test():
     obj.kv_cache_transceiver = _FakeTransceiver()
     obj._inflight_cancel_requested_ids = set()
     obj._pending_transfer_responses = []
+    obj._pending_resource_release = []
+    obj._transceiver_unhealthy_since = None
+    obj.is_shutdown = False
+    obj.shutdown_event = None
     obj.enable_attention_dp = False
     obj.active_requests = []
     obj.terminated_request_ids = []
@@ -125,12 +142,58 @@ def _make_executor_under_test():
         if responses or self.enable_attention_dp:
             self._enqueue_responses(responses)
 
+    def _defer_resource_release_for_inflight_transfer(self, request):
+        self._inflight_cancel_requested_ids.add(request.py_request_id)
+        if request not in self._pending_resource_release:
+            self._pending_resource_release.append(request)
+
+    def _maybe_release_pending_resources(self):
+        if not self._pending_resource_release or self.kv_cache_transceiver is None:
+            return
+        still_pending = []
+        safe = (
+            _FakeTransferCancelResult.AlreadyComplete,
+            _FakeTransferCancelResult.NotFound,
+            _FakeTransferCancelResult.CancelledBeforeAdvertise,
+        )
+        for request in self._pending_resource_release:
+            cancel = self.kv_cache_transceiver.cancel_request_structured(request)
+            if cancel in safe:
+                self._inflight_cancel_requested_ids.discard(request.py_request_id)
+                self._do_terminate_request(request)
+            else:
+                still_pending.append(request)
+        self._pending_resource_release = still_pending
+
+    def _check_transceiver_health(self):
+        if self.kv_cache_transceiver is None:
+            return
+        if self.kv_cache_transceiver.is_healthy():
+            self._transceiver_unhealthy_since = None
+            return
+        import time as _time
+        now = _time.time()
+        if self._transceiver_unhealthy_since is None:
+            self._transceiver_unhealthy_since = now
+            return
+        elapsed = now - self._transceiver_unhealthy_since
+        health = self.kv_cache_transceiver.get_health()
+        grace = 2.0 * float(getattr(health, "global_progress_deadline_seconds", 60.0))
+        if elapsed > grace and not self.is_shutdown:
+            self.is_shutdown = True
+
     obj._can_terminate_request_now = types.MethodType(
         _can_terminate_request_now, obj)
     obj._do_terminate_request = types.MethodType(_do_terminate_request, obj)
     obj._enqueue_responses = types.MethodType(_enqueue_responses, obj)
     obj._flush_pending_transfer_responses = types.MethodType(
         _flush_pending_transfer_responses, obj)
+    obj._defer_resource_release_for_inflight_transfer = types.MethodType(
+        _defer_resource_release_for_inflight_transfer, obj)
+    obj._maybe_release_pending_resources = types.MethodType(
+        _maybe_release_pending_resources, obj)
+    obj._check_transceiver_health = types.MethodType(
+        _check_transceiver_health, obj)
     return obj
 
 
@@ -346,3 +409,98 @@ def test_unhealthy_transceiver_keeps_request_pinned():
     assert 33 in executor._inflight_cancel_requested_ids
     executor._do_terminate_request(request)
     assert executor.terminated_request_ids == []
+
+
+# ---------------------------------------------------------------------------
+# Deferred-resource-release polling
+# ---------------------------------------------------------------------------
+
+
+def test_defer_resource_release_holds_until_quiesced():
+    """Replay the full recovery sequence: timeout fires, error response
+    is surfaced, KV cleanup is deferred. Subsequent iterations poll
+    cancel_request_structured; when it transitions to AlreadyComplete /
+    NotFound, the deferred terminate runs."""
+    executor = _make_executor_under_test()
+    request = _FakeRequest(py_request_id=77, state="DISAGG_TRANS_ERROR")
+    executor._defer_resource_release_for_inflight_transfer(request)
+
+    # Iteration 1: worker still in flight — must NOT free.
+    executor.kv_cache_transceiver.next_cancel_results[77] = (
+        _FakeTransferCancelResult.CancelRequestedInFlight)
+    executor._maybe_release_pending_resources()
+    assert executor.terminated_request_ids == []
+    assert request in executor._pending_resource_release
+    assert 77 in executor._inflight_cancel_requested_ids
+
+    # Iteration 2: still in flight.
+    executor._maybe_release_pending_resources()
+    assert executor.terminated_request_ids == []
+
+    # Iteration 3: worker finally quiesced.
+    executor.kv_cache_transceiver.next_cancel_results[77] = (
+        _FakeTransferCancelResult.AlreadyComplete)
+    executor._maybe_release_pending_resources()
+    assert executor.terminated_request_ids == [77]
+    assert request not in executor._pending_resource_release
+    assert 77 not in executor._inflight_cancel_requested_ids
+
+
+def test_defer_resource_release_handles_not_found_as_safe():
+    """C++ may erase the worker entry between iterations; NotFound at
+    that point means the worker is gone and resources are safe to
+    free."""
+    executor = _make_executor_under_test()
+    request = _FakeRequest(py_request_id=88, state="DISAGG_TRANS_ERROR")
+    executor._defer_resource_release_for_inflight_transfer(request)
+
+    executor.kv_cache_transceiver.next_cancel_results[88] = (
+        _FakeTransferCancelResult.NotFound)
+    executor._maybe_release_pending_resources()
+    assert executor.terminated_request_ids == [88]
+
+
+def test_defer_resource_release_no_op_when_empty():
+    executor = _make_executor_under_test()
+    executor._maybe_release_pending_resources()
+    assert executor.terminated_request_ids == []
+
+
+# ---------------------------------------------------------------------------
+# Health-driven shutdown escape
+# ---------------------------------------------------------------------------
+
+
+def test_check_transceiver_health_resets_on_recovery():
+    executor = _make_executor_under_test()
+    executor.kv_cache_transceiver.healthy = False
+    executor._check_transceiver_health()
+    assert executor._transceiver_unhealthy_since is not None
+
+    # Recovery before grace period elapses — clear the timestamp,
+    # do not shut down.
+    executor.kv_cache_transceiver.healthy = True
+    executor._check_transceiver_health()
+    assert executor._transceiver_unhealthy_since is None
+    assert not executor.is_shutdown
+
+
+def test_check_transceiver_health_triggers_shutdown_after_grace():
+    executor = _make_executor_under_test()
+    # Set an extremely short deadline so the grace period (2x) is
+    # easy to exceed in a unit test.
+    executor.kv_cache_transceiver.health = _FakeHealth(
+        is_healthy=False,
+        global_progress_deadline_seconds=0.01,
+    )
+    executor.kv_cache_transceiver.healthy = False
+
+    # First call records the timestamp, does not shut down yet.
+    executor._check_transceiver_health()
+    assert not executor.is_shutdown
+    assert executor._transceiver_unhealthy_since is not None
+
+    # Move the recorded timestamp into the past beyond the grace period.
+    executor._transceiver_unhealthy_since = executor._transceiver_unhealthy_since - 1.0
+    executor._check_transceiver_health()
+    assert executor.is_shutdown

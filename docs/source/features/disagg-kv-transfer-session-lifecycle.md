@@ -112,6 +112,21 @@ locally.
 `seconds_since_last_progress`, and `global_progress_deadline_seconds`
 for metrics / observability.
 
+## Recovery model
+
+When a per-request KV transfer exceeds `kvTransferTimeoutMs`, three
+things must happen, on three different timescales:
+
+| Concern | Path | Timing |
+|---|---|---|
+| **User-visible error response** | C++ `maybeQuarantineLocked` adds the request to `errorRequestIds`; Python's `_check_disagg_ctx_cache_transfer_status` / `_handle_responses` surfaces the error via `_handle_errors` / `_end_transfer_and_maybe_terminate`. | Immediate (next polling iteration). |
+| **KV / buffer resource release** | Python registers the request in `_pending_resource_release` and `_inflight_cancel_requested_ids`. Each iteration `_maybe_release_pending_resources` polls `cancelRequestStructured`; only when it returns `AlreadyComplete` / `NotFound` / `CancelledBeforeAdvertise` does Python actually call `free_resources()`. The C++ shared_ptr in `mSenderFutures` keeps the LlmRequest alive until then. | Bounded by worker quiescence — could be the rest of `kvTransferTimeoutMs`, or longer if the backend is genuinely wedged. |
+| **Worker restart on persistent wedge** | C++ `getHealth().is_healthy` flips false when the quarantine budget overflows or the global progress deadline elapses. Python's `_check_transceiver_health` watches that flag and sets `is_shutdown = True` after a grace period (default `2 * mGlobalProgressDeadlineMs`). Orchestration's existing process-restart path / k8s liveness probe / `disagg_auto_scaling.py` then restarts the worker. | Bounded by the global progress deadline + grace period (default 60 s + 120 s). |
+
+This separation is what makes the recovery deterministic without
+either freeing memory the transport may still write into or hanging
+the user's request indefinitely.
+
 ## Python policy
 
 The `PyExecutor` keeps these responsibilities only:

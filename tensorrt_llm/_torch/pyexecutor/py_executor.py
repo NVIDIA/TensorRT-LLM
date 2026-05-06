@@ -429,6 +429,20 @@ class PyExecutor:
         # writing into them. Keyed by py_request_id to survive request
         # state transitions.
         self._inflight_cancel_requested_ids: set[int] = set()
+        # Requests whose timeout error response has already been surfaced
+        # to the user but whose KV / buffer resources cannot yet be
+        # released because the C++ worker has not quiesced. The request
+        # is no longer in active_requests, so the executor does not see
+        # it again — _maybe_release_pending_resources is the only place
+        # that polls C++ and triggers the deferred free once the worker
+        # reaches a final state.
+        self._pending_resource_release: List[LlmRequest] = []
+        # Wall-clock deadline tracker for the transceiver-unhealthy
+        # signal. None while the transceiver is healthy; set when
+        # transceiver.is_healthy() first flips false. If it stays false
+        # longer than the configured grace period we set is_shutdown
+        # so orchestration restarts the worker.
+        self._transceiver_unhealthy_since: Optional[float] = None
         # TODO: Remove the condition on the PP size once disagg support from KVCache reuse
         # path is fixed.
         self.async_transfer_manager = AsyncTransferManager(
@@ -682,6 +696,100 @@ class PyExecutor:
         # tp_gather can complete. The collective is symmetric.
         if responses or self.enable_attention_dp:
             self._enqueue_responses(responses)
+
+    def _defer_resource_release_for_inflight_transfer(
+            self, request: LlmRequest) -> None:
+        """Mark a timed-out transfer's resources for deferred release.
+
+        Called from the timeout-error paths when C++ structured cancel
+        reports the worker is still in flight. The request has already
+        been removed from active_requests by _handle_errors and the user
+        has been told the request errored; we still must not call
+        free_resources() until the worker quiesces, otherwise NIXL/UCX
+        could write into KV blocks that have been returned to the pool.
+        """
+        req_id = request.py_request_id
+        self._inflight_cancel_requested_ids.add(req_id)
+        if request not in self._pending_resource_release:
+            self._pending_resource_release.append(request)
+
+    def _maybe_release_pending_resources(self):
+        """Drain _pending_resource_release for requests whose C++ worker
+        has finally reached a final state.
+
+        Each iteration we ask the transceiver whether each pending
+        request is still in flight. AlreadyComplete / NotFound mean the
+        worker has quiesced (future was either ready or already erased
+        by check_*_transfer_status), so it is now safe to free
+        request-owned KV blocks. Any other result keeps the request on
+        the deferred list — we will retry next iteration.
+        """
+        if (not self._pending_resource_release
+                or self.kv_cache_transceiver is None):
+            return
+        still_pending: List[LlmRequest] = []
+        for request in self._pending_resource_release:
+            cancel = self.kv_cache_transceiver.cancel_request_structured(
+                request)
+            if cancel in (TransferCancelResult.AlreadyComplete,
+                          TransferCancelResult.NotFound,
+                          TransferCancelResult.CancelledBeforeAdvertise):
+                req_id = request.py_request_id
+                self._inflight_cancel_requested_ids.discard(req_id)
+                # _do_terminate_request now passes the guard because the
+                # request is no longer in _inflight_cancel_requested_ids
+                # and its state is no longer DISAGG_*_TRANS_IN_PROGRESS.
+                self._do_terminate_request(request)
+            else:
+                still_pending.append(request)
+        self._pending_resource_release = still_pending
+
+    def _check_transceiver_health(self):
+        """Watch the C++ transceiver's health signal and trigger an
+        executor shutdown if it stays unhealthy past the grace period.
+
+        The C++ side flips `is_healthy() == False` only after the
+        quarantine budget has been exceeded or no worker has reached a
+        final state for longer than mGlobalProgressDeadlineMs. That is
+        already a strong signal; we wait an additional grace period
+        (default: 2 * deadline) before forcing shutdown so that brief
+        transient unhealthy windows during heavy cancellation traffic do
+        not cause a restart loop.
+        """
+        if self.kv_cache_transceiver is None:
+            return
+        if self.kv_cache_transceiver.is_healthy():
+            self._transceiver_unhealthy_since = None
+            return
+        now = time.time()
+        if self._transceiver_unhealthy_since is None:
+            self._transceiver_unhealthy_since = now
+            health = self.kv_cache_transceiver.get_health()
+            logger.warning(
+                f"KV cache transceiver flipped UNHEALTHY at {now:.3f}: "
+                f"quarantined={getattr(health, 'quarantined_transfer_count', '?')} "
+                f"budget={getattr(health, 'quarantine_budget', '?')} "
+                f"seconds_since_last_progress="
+                f"{getattr(health, 'seconds_since_last_progress', '?')}. "
+                f"Will trigger executor shutdown if it stays unhealthy.")
+            return
+        elapsed = now - self._transceiver_unhealthy_since
+        # Grace period: 2x the global progress deadline reported by C++.
+        # Fall back to 120s if the snapshot is unavailable.
+        try:
+            health = self.kv_cache_transceiver.get_health()
+            grace_period = 2.0 * float(
+                getattr(health, 'global_progress_deadline_seconds', 60.0))
+        except Exception:
+            grace_period = 120.0
+        if elapsed > grace_period and not self.is_shutdown:
+            logger.error(
+                f"KV cache transceiver has been UNHEALTHY for {elapsed:.1f}s "
+                f"(grace period {grace_period:.1f}s). Setting is_shutdown so "
+                f"orchestration can restart the worker.")
+            self.is_shutdown = True
+            if self.shutdown_event is not None:
+                self.shutdown_event.set()
 
     # Performance metrics methods are in PerfMetricsManager (self.perf_manager)
 
@@ -1367,6 +1475,8 @@ class PyExecutor:
             # Let cache transceiver finish at least one cache transmission and release requests' KV cache resources
             self._check_disagg_ctx_cache_transfer_status(1)
             self._check_kv_transfer_timeout()
+            self._maybe_release_pending_resources()
+            self._check_transceiver_health()
         else:
             raise RuntimeError(
                 f"Reach maximum PP retry count ({self.pp_scheduler_max_retry_count}) but still cannot run first PP's schedule result. Please consider increasing the KV cache size by setting `free_gpu_memory_fraction` to a larger value. Or you can set `TLLM_PP_SCHEDULER_MAX_RETRY_COUNT` to a larger value to allow more retries."
@@ -1759,6 +1869,8 @@ class PyExecutor:
         if self.kv_cache_transceiver and self.async_transfer_manager.has_any_inflight_requests(
         ):
             self._check_kv_transfer_timeout()
+            self._maybe_release_pending_resources()
+            self._check_transceiver_health()
 
         if self._disagg_pp_termination_handler is not None:
             self._disagg_pp_termination_handler.terminate_pending_requests()
@@ -1867,6 +1979,8 @@ class PyExecutor:
             self._check_disagg_ctx_schedulable_status(new_requests)
             self._check_disagg_gen_transfer_status()
             self._check_kv_transfer_timeout()
+            self._maybe_release_pending_resources()
+            self._check_transceiver_health()
 
         iter_stats = None
         if self.enable_iter_perf_stats:
@@ -2236,6 +2350,8 @@ class PyExecutor:
                 if self.kv_cache_transceiver and self.async_transfer_manager.has_any_inflight_requests(
                 ):
                     self._check_kv_transfer_timeout()
+                self._maybe_release_pending_resources()
+                self._check_transceiver_health()
 
                 self._kv_connector_terminate_requests()
 
@@ -2529,6 +2645,8 @@ class PyExecutor:
                 if self.kv_cache_transceiver and self.async_transfer_manager.has_any_inflight_requests(
                 ):
                     self._check_kv_transfer_timeout()
+                self._maybe_release_pending_resources()
+                self._check_transceiver_health()
 
                 self._kv_connector_terminate_requests()
 
@@ -3374,10 +3492,12 @@ class PyExecutor:
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
         )
 
-        # Worker reached a final state — clear any pending in-flight cancel
-        # bookkeeping for those requests.
-        if completed_req_ids:
-            self._inflight_cancel_requested_ids -= completed_req_ids
+        # Worker reached a final state for entries that came back as
+        # completed (future ready). Quarantined-but-error entries have
+        # NOT actually quiesced; we keep their inflight-cancel bookkeeping.
+        finished_set = set(finished_requests)
+        if finished_set:
+            self._inflight_cancel_requested_ids -= finished_set
 
         for request_id in completed_req_ids:
 
@@ -3387,6 +3507,23 @@ class PyExecutor:
                 continue
 
             request = requests_in_transfer[request_id]
+
+            # If the request errored because of timeout / quarantine
+            # rather than worker completion, the C++ worker may still be
+            # in flight (the future is pinned in mSenderFutures). Defer
+            # the free_resources() call by adding the request to
+            # _pending_resource_release before _end_transfer_and_maybe_-
+            # terminate hits _do_terminate_request. The deferred entry
+            # will be drained by _maybe_release_pending_resources once
+            # the structured-cancel result transitions to a safe state.
+            if request_id in set(error_requests):
+                cancel = self.kv_cache_transceiver.cancel_request_structured(
+                    request)
+                if cancel in (
+                        TransferCancelResult.CancelRequestedInFlight,
+                        TransferCancelResult.BackendUnhealthy):
+                    self._defer_resource_release_for_inflight_transfer(
+                        request)
 
             self._end_transfer_and_maybe_terminate(request)
 
@@ -3417,22 +3554,26 @@ class PyExecutor:
                     request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
                     self._inflight_cancel_requested_ids.discard(request_id)
                     self._end_transfer_and_maybe_terminate(request)
-                elif cancel_result == TransferCancelResult.CancelRequestedInFlight:
-                    # Cancellation accepted but the worker is still
-                    # touching the buffer/KV memory. Mark the request as
-                    # in-flight-cancel so _do_terminate_request defers
-                    # freeing resources, and re-check next iteration.
-                    self._inflight_cancel_requested_ids.add(request_id)
-                elif cancel_result == TransferCancelResult.BackendUnhealthy:
-                    # Soft signal — the transceiver is unhealthy. We do
-                    # not touch this request; orchestration health checks
-                    # will restart the worker once the global deadline
-                    # elapses.
-                    logger.warning(
-                        f"Transceiver reports unhealthy while cancelling "
-                        f"context request {request_id}; deferring to "
-                        f"health-driven restart.")
-                    self._inflight_cancel_requested_ids.add(request_id)
+                elif cancel_result in (
+                        TransferCancelResult.CancelRequestedInFlight,
+                        TransferCancelResult.BackendUnhealthy):
+                    # Worker is still touching buffers (or transceiver is
+                    # unhealthy). Defer the actual free_resources() to
+                    # _maybe_release_pending_resources by registering the
+                    # request BEFORE the cleanup path. The user-visible
+                    # error response is still surfaced via the normal
+                    # transfer-error flow on a subsequent iteration once
+                    # C++ confirms quiescence.
+                    request.py_kv_transfer_start_time = None
+                    request.state = LlmRequestState.DISAGG_TRANS_ERROR
+                    self._defer_resource_release_for_inflight_transfer(
+                        request)
+                    if cancel_result == TransferCancelResult.BackendUnhealthy:
+                        logger.warning(
+                            f"Transceiver reports unhealthy while cancelling "
+                            f"context request {request_id}; deferring resource "
+                            f"release to health-driven restart.")
+                    self._end_transfer_and_maybe_terminate(request)
 
         self._check_cache_transfer_errors("context requests")
 
@@ -3861,20 +4002,27 @@ class PyExecutor:
                     self._handle_errors(
                         error_msg=f"Request {request.py_request_id} timed out",
                         requests=[request])
-                elif cancel_result == TransferCancelResult.CancelRequestedInFlight:
-                    # Worker still touching buffers — keep the request
-                    # active so we re-poll next iteration. Once C++
-                    # transitions the worker future to a final state we
-                    # will see NotFound / AlreadyComplete and clean up.
-                    self._inflight_cancel_requested_ids.add(req_id)
-                    new_active_requests.append(request)
-                elif cancel_result == TransferCancelResult.BackendUnhealthy:
-                    logger.warning(
-                        f"Transceiver reports unhealthy while cancelling "
-                        f"generation request {req_id}; deferring to "
-                        f"health-driven restart.")
-                    self._inflight_cancel_requested_ids.add(req_id)
-                    new_active_requests.append(request)
+                elif cancel_result in (
+                        TransferCancelResult.CancelRequestedInFlight,
+                        TransferCancelResult.BackendUnhealthy):
+                    # Worker still touching buffers (or transceiver
+                    # unhealthy). Surface the timeout error to the user
+                    # immediately, but defer free_resources() to
+                    # _maybe_release_pending_resources, which polls
+                    # cancel_request_structured each iteration and frees
+                    # only once the worker quiesces. We register the
+                    # request BEFORE _handle_errors so _do_terminate_-
+                    # request's guard sees req_id in the inflight set.
+                    self._defer_resource_release_for_inflight_transfer(
+                        request)
+                    if cancel_result == TransferCancelResult.BackendUnhealthy:
+                        logger.warning(
+                            f"Transceiver reports unhealthy while cancelling "
+                            f"generation request {req_id}; deferring resource "
+                            f"release to health-driven restart.")
+                    self._handle_errors(
+                        error_msg=f"Request {request.py_request_id} timed out",
+                        requests=[request])
                 continue
 
             if request.is_generation_only_request() and not request.is_finished:
