@@ -222,53 +222,62 @@ def _checkpointing_precompute_kernel(
     causal_mask = offs_t[:, None] >= offs_t[None, :]
     valid_mask = causal_mask & t_mask[:, None] & t_mask[None, :]
 
-    # --- Loop 1: compute per-head dt/dA_cumsum/decay BEFORE gdc_wait ---
-    # These only depend on dt (from in_proj, not conv1d) and parameters (A, dt_bias).
-    # Store to cache; will reload after the wait for CB scaling.
-    for h_local in range(HEADS_PER_BLOCK):
-        head_idx = first_head + h_local
+    # --- Vectorized pre-wait phase across HEADS_PER_BLOCK heads ---
+    # Compute dt, dA_cumsum, decay_vec as (H, T) tiles.  Pre-compute
+    # scale_combo = decay_matrix * dt[:, None, :] as an (H, T, T) tile that
+    # stays in registers across gdc_wait — eliminates the post-wait reload
+    # of dt + dA_cumsum and the per-head loop.
+    offs_h = tl.arange(0, HEADS_PER_BLOCK)
+    heads_block = first_head + offs_h  # (H,)
 
-        dt_base = dt_ptr + pid_b * stride_dt_batch + head_idx * stride_dt_head
-        dt = tl.load(dt_base + offs_t * stride_dt_T, mask=t_mask, other=0.0).to(tl.float32)
-        if HAS_DT_BIAS:
-            dt_bias = tl.load(dt_bias_ptr + head_idx * stride_dt_bias_head).to(tl.float32)
-            dt = dt + dt_bias
-        if DT_SOFTPLUS:
-            dt = softplus(dt)
+    # Load dt (H, T)
+    dt_addrs = (
+        dt_ptr + pid_b * stride_dt_batch
+        + heads_block[:, None] * stride_dt_head
+        + offs_t[None, :] * stride_dt_T
+    )
+    dt = tl.load(dt_addrs, mask=t_mask[None, :], other=0.0).to(tl.float32)
+    if HAS_DT_BIAS:
+        dt_bias = tl.load(dt_bias_ptr + heads_block * stride_dt_bias_head).to(tl.float32)
+        dt = dt + dt_bias[:, None]
+    if DT_SOFTPLUS:
+        dt = softplus(dt)
 
-        A = tl.load(A_ptr + head_idx * stride_A_head).to(tl.float32)
-        dA_cumsum = tl.cumsum(A * dt, axis=0)
-        decay_vec = tl.exp(dA_cumsum)
+    A = tl.load(A_ptr + heads_block * stride_A_head).to(tl.float32)  # (H,)
+    dA_cumsum = tl.cumsum(A[:, None] * dt, axis=1)  # (H, T)
+    decay_vec = tl.exp(dA_cumsum)  # (H, T)
 
-        # Store dt, dA_cumsum to cache at [write_offset : write_offset+T) of
-        # write_buf (selected by WRITE_CHECKPOINT — see top of kernel).
-        old_dt_base = (
-            old_dt_ptr
-            + cache_batch_idx * stride_old_dt_cache
-            + write_buf * stride_old_dt_dbuf
-            + head_idx * stride_old_dt_head
-        )
-        tl.store(
-            old_dt_base + (write_offset + offs_t) * stride_old_dt_T,
-            dt,
-            mask=t_mask,
-        )
+    # Store dt, dA_cumsum to cache at [write_offset : write_offset+T) of write_buf.
+    old_dt_addrs = (
+        old_dt_ptr
+        + cache_batch_idx * stride_old_dt_cache
+        + write_buf * stride_old_dt_dbuf
+        + heads_block[:, None] * stride_old_dt_head
+        + (write_offset + offs_t)[None, :] * stride_old_dt_T
+    )
+    tl.store(old_dt_addrs, dt, mask=t_mask[None, :])
 
-        old_dA_cumsum_base = (
-            old_dA_cumsum_ptr
-            + cache_batch_idx * stride_old_dA_cumsum_cache
-            + write_buf * stride_old_dA_cumsum_dbuf
-            + head_idx * stride_old_dA_cumsum_head
-        )
-        tl.store(
-            old_dA_cumsum_base + (write_offset + offs_t) * stride_old_dA_cumsum_T,
-            dA_cumsum,
-            mask=t_mask,
-        )
+    old_dA_cumsum_addrs = (
+        old_dA_cumsum_ptr
+        + cache_batch_idx * stride_old_dA_cumsum_cache
+        + write_buf * stride_old_dA_cumsum_dbuf
+        + heads_block[:, None] * stride_old_dA_cumsum_head
+        + (write_offset + offs_t)[None, :] * stride_old_dA_cumsum_T
+    )
+    tl.store(old_dA_cumsum_addrs, dA_cumsum, mask=t_mask[None, :])
 
-        # decay_vec is per-call scratch (not cached); always write at offs_t.
-        decay_vec_base = decay_vec_ptr + pid_b * stride_dv_batch + head_idx * stride_dv_head
-        tl.store(decay_vec_base + offs_t * stride_dv_t, decay_vec, mask=t_mask)
+    # decay_vec scratch — always at offs_t.
+    decay_vec_addrs = (
+        decay_vec_ptr + pid_b * stride_dv_batch
+        + heads_block[:, None] * stride_dv_head
+        + offs_t[None, :] * stride_dv_t
+    )
+    tl.store(decay_vec_addrs, decay_vec, mask=t_mask[None, :])
+
+    # scale_combo (H, T, T) = exp(dA_cumsum[h, t1] - dA_cumsum[h, t2]) * dt[h, t2]
+    # Stays live across gdc_wait — used post-wait to compute CB_scaled.
+    decay_matrix = tl.exp(dA_cumsum[:, :, None] - dA_cumsum[:, None, :])  # (H, T, T)
+    scale_combo = decay_matrix * dt[:, None, :]  # (H, T, T)
 
     # --- Wait for upstream kernel (external PDL) before loading B and C ---
     # All dt processing above is independent of conv1d outputs.
@@ -310,46 +319,25 @@ def _checkpointing_precompute_kernel(
             mask=t_mask[:, None] & n_mask[None, :],
         )
 
-    # --- Loop 2: reload per-head dA_cumsum/dt from cache, scale CB ---
-    # Reload from where loop 1 stored: write_buf at [write_offset, write_offset+T).
-    for h_local in range(HEADS_PER_BLOCK):
-        head_idx = first_head + h_local
-
-        # Reload dt and dA_cumsum from cache (just written in loop 1)
-        old_dt_base = (
-            old_dt_ptr
-            + cache_batch_idx * stride_old_dt_cache
-            + write_buf * stride_old_dt_dbuf
-            + head_idx * stride_old_dt_head
-        )
-        dt = tl.load(
-            old_dt_base + (write_offset + offs_t) * stride_old_dt_T,
-            mask=t_mask,
-            other=0.0,
-        ).to(tl.float32)
-
-        old_dA_cumsum_base = (
-            old_dA_cumsum_ptr
-            + cache_batch_idx * stride_old_dA_cumsum_cache
-            + write_buf * stride_old_dA_cumsum_dbuf
-            + head_idx * stride_old_dA_cumsum_head
-        )
-        dA_cumsum = tl.load(
-            old_dA_cumsum_base + (write_offset + offs_t) * stride_old_dA_cumsum_T,
-            mask=t_mask,
-            other=0.0,
-        ).to(tl.float32)
-
-        # Scale raw_CB with per-head decay and dt
-        decay_matrix = tl.exp(dA_cumsum[:, None] - dA_cumsum[None, :])
-        CB_scaled = tl.where(valid_mask, raw_CB * decay_matrix * dt[None, :], 0.0)
-
-        cb_scaled_base = cb_scaled_ptr + pid_b * stride_cb_batch + head_idx * stride_cb_head
-        tl.store(
-            cb_scaled_base + offs_t[:, None] * stride_cb_t + offs_t[None, :] * stride_cb_j,
-            CB_scaled,
-            mask=(offs_t[:, None] < BLOCK_SIZE_T) & (offs_t[None, :] < BLOCK_SIZE_T),
-        )
+    # --- Vectorized post-wait phase: scale_combo (H, T, T) is still live in
+    # registers from pre-wait; multiply by raw_CB (T, T), apply causal mask,
+    # store as one (H, T, T) tile. ---
+    CB_scaled_block = tl.where(
+        valid_mask[None, :, :],
+        raw_CB[None, :, :] * scale_combo,
+        0.0,
+    )  # (H, T, T)
+    cb_scaled_addrs = (
+        cb_scaled_ptr + pid_b * stride_cb_batch
+        + heads_block[:, None, None] * stride_cb_head
+        + offs_t[None, :, None] * stride_cb_t
+        + offs_t[None, None, :] * stride_cb_j
+    )  # (H, T, T)
+    cb_store_mask = (
+        (offs_t[None, :, None] < BLOCK_SIZE_T)
+        & (offs_t[None, None, :] < BLOCK_SIZE_T)
+    )
+    tl.store(cb_scaled_addrs, CB_scaled_block, mask=cb_store_mask)
 
 
 # Rectangle precompute kernel: produces a (T, K) CB rectangle that combines
