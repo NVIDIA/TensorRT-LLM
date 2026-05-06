@@ -37,6 +37,7 @@ from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._torch.speculative import get_spec_drafter
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSampler, Eagle3ResourceManager
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.executor.utils import unpack_multimodal_item_run
 from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData, check_mm_embed_cumsum_if_needed
 from tensorrt_llm.llmapi.llm_args import (
     ContextChunkingPolicy,
@@ -600,9 +601,6 @@ class ADEngine(ModelEngine):
         mm_item_types_flat: List[int] = []
         mm_token_positions_flat: List[int] = []
         mm_token_lengths_flat: List[int] = []
-        mm_item_run_cu_seqlen: List[int] = [0]
-        mm_run_token_positions_flat: List[int] = []
-        mm_run_token_lengths_flat: List[int] = []
         mm_special_offsets_cu_seqlen: List[int] = [0]
         mm_special_offsets_flat: List[int] = []
         flat_start_list: List[int] = []
@@ -616,62 +614,46 @@ class ADEngine(ModelEngine):
                 return [int(value) for value in values.reshape(-1).tolist()]
             return [int(value) for value in values]
 
-        def flatten_item_runs(
-            item_runs_by_item,
-        ) -> Tuple[List[int], List[int], List[int], List[int], List[int], List[int]]:
+        # Qwen preprocessing already splits media into synthetic prompt spans;
+        # this boundary only unpacks those spans into AD positions/lengths/offsets.
+        def unpack_item_runs(item_runs_by_item) -> Tuple[List[int], List[int], List[int]]:
             token_positions: List[int] = []
             token_lengths: List[int] = []
-            run_counts: List[int] = []
-            run_token_positions: List[int] = []
-            run_token_lengths: List[int] = []
             non_embed_offsets_flat: List[int] = []
             item_mm_offset = 0
 
             for item_idx, item_runs in enumerate(item_runs_by_item):
-                item_start: Optional[int] = None
-                item_length = 0
-                for run_idx, run in enumerate(item_runs):
-                    if all(
-                        hasattr(run, attr)
-                        for attr in ("prompt_start", "run_length", "non_embed_offsets")
-                    ):
-                        run_start = run.prompt_start
-                        run_length = run.run_length
-                        non_embed_offsets = run.non_embed_offsets
-                    elif isinstance(run, (list, tuple)) and len(run) == 3:
-                        run_start, run_length, non_embed_offsets = run
-                    else:
-                        raise TypeError(
-                            f"multimodal_item_runs[{item_idx}][{run_idx}] must be a "
-                            "MultimodalItemRun or "
-                            "(prompt_start, run_length, non_embed_offsets) tuple"
+                item_runs_list = list(item_runs)
+                if len(item_runs_list) != 1:
+                    raise ValueError(
+                        "AutoDeploy currently supports only single-run multimodal items; "
+                        f"item {item_idx} has {len(item_runs_list)} runs"
+                    )
+
+                run_start, run_length, non_embed_offsets = unpack_multimodal_item_run(
+                    item_runs_list[0], "multimodal_item_runs", item_idx, 0
+                )
+                run_start = int(run_start)
+                run_length = int(run_length)
+                if run_length <= 0:
+                    raise ValueError(
+                        "AutoDeploy multimodal item runs must have positive length; "
+                        f"item {item_idx} has length {run_length}"
+                    )
+
+                token_positions.append(run_start)
+                token_lengths.append(run_length)
+                for local_offset in as_int_list(non_embed_offsets):
+                    if local_offset < 0 or local_offset >= run_length:
+                        raise ValueError(
+                            "AutoDeploy multimodal item run non_embed_offsets must be "
+                            f"within the run; item {item_idx} has offset {local_offset} "
+                            f"for length {run_length}"
                         )
-                    run_start = int(run_start)
-                    run_length = int(run_length)
-                    if item_start is None:
-                        item_start = run_start
+                    non_embed_offsets_flat.append(item_mm_offset + local_offset)
+                item_mm_offset += run_length
 
-                    local_non_embed_offsets = as_int_list(non_embed_offsets)
-                    for local_offset in local_non_embed_offsets:
-                        non_embed_offsets_flat.append(item_mm_offset + item_length + local_offset)
-
-                    item_length += run_length
-                    run_token_positions.append(run_start)
-                    run_token_lengths.append(run_length)
-
-                token_positions.append(int(item_start))
-                token_lengths.append(item_length)
-                run_counts.append(len(item_runs))
-                item_mm_offset += item_length
-
-            return (
-                token_positions,
-                token_lengths,
-                run_counts,
-                run_token_positions,
-                run_token_lengths,
-                non_embed_offsets_flat,
-            )
+            return token_positions, token_lengths, non_embed_offsets_flat
 
         for i, req in enumerate(prefill_requests):
             begin_compute = input_pos[i]
@@ -686,17 +668,8 @@ class ADEngine(ModelEngine):
             mm_item_types = layout_metadata.get("item_types", []) if layout_metadata else []
             mm_item_runs_list = list(mm_item_runs) if mm_item_runs is not None else []
             mm_item_types_list = as_int_list(mm_item_types)
-            (
-                mm_pos_list,
-                mm_len_list,
-                mm_run_counts,
-                mm_run_pos_list,
-                mm_run_len_list,
-                mm_special_offsets_list,
-            ) = (
-                flatten_item_runs(mm_item_runs_list)
-                if mm_item_runs_list
-                else ([], [], [], [], [], [])
+            mm_pos_list, mm_len_list, mm_special_offsets_list = (
+                unpack_item_runs(mm_item_runs_list) if mm_item_runs_list else ([], [], [])
             )
             if len(mm_item_types_list) != len(mm_pos_list):
                 raise ValueError(
@@ -708,10 +681,6 @@ class ADEngine(ModelEngine):
             mm_item_types_flat.extend(mm_item_types_list)
             mm_token_positions_flat.extend(mm_pos_list)
             mm_token_lengths_flat.extend(mm_len_list)
-            for run_count in mm_run_counts:
-                mm_item_run_cu_seqlen.append(mm_item_run_cu_seqlen[-1] + run_count)
-            mm_run_token_positions_flat.extend(mm_run_pos_list)
-            mm_run_token_lengths_flat.extend(mm_run_len_list)
 
             mm_data = req.py_multimodal_data or {}
             flat_cumsum = mm_data.get("multimodal_embed_mask_cumsum")
@@ -762,15 +731,6 @@ class ADEngine(ModelEngine):
         ]
         extra_args["mm_token_lengths"] = [
             torch.tensor(mm_token_lengths_flat, dtype=torch.int32, device="cpu")
-        ]
-        extra_args["mm_item_run_cu_seqlen"] = [
-            torch.tensor(mm_item_run_cu_seqlen, dtype=torch.int32, device="cpu")
-        ]
-        extra_args["mm_run_token_positions"] = [
-            torch.tensor(mm_run_token_positions_flat, dtype=torch.int32, device="cpu")
-        ]
-        extra_args["mm_run_token_lengths"] = [
-            torch.tensor(mm_run_token_lengths_flat, dtype=torch.int32, device="cpu")
         ]
         extra_args["mm_special_offsets_cu_seqlen"] = [
             torch.tensor(mm_special_offsets_cu_seqlen, dtype=torch.int32, device="cpu")

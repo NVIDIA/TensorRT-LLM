@@ -298,6 +298,9 @@ def test_ad_engine_chunked_prefill_stages_multimodal_runtime_metadata():
     assert "mm_token_lengths" in named_args
     assert "mm_special_offsets_cu_seqlen" in named_args
     assert "mm_special_offsets" in named_args
+    assert "mm_item_run_cu_seqlen" not in named_args
+    assert "mm_run_token_positions" not in named_args
+    assert "mm_run_token_lengths" not in named_args
 
     torch.testing.assert_close(
         named_args["mm_item_cu_seqlen"].cpu(), torch.tensor([0, 1], dtype=torch.int32)
@@ -354,6 +357,9 @@ def test_ad_engine_skips_multimodal_runtime_metadata_when_no_multimodal_requests
     assert "mm_special_offsets" not in named_args
     assert "mm_chunk_flat_start" not in named_args
     assert "mm_chunk_count" not in named_args
+    assert "mm_item_run_cu_seqlen" not in named_args
+    assert "mm_run_token_positions" not in named_args
+    assert "mm_run_token_lengths" not in named_args
 
     cache_seq_interface.shutdown()
 
@@ -403,6 +409,9 @@ def test_ad_engine_stages_mm_chunk_bounds_for_multimodal_block_reuse():
     named_args = cache_seq_interface.named_args
     assert "mm_chunk_flat_start" in named_args
     assert "mm_chunk_count" in named_args
+    assert "mm_item_run_cu_seqlen" not in named_args
+    assert "mm_run_token_positions" not in named_args
+    assert "mm_run_token_lengths" not in named_args
     torch.testing.assert_close(
         named_args["mm_chunk_flat_start"].cpu(), torch.tensor([2], dtype=torch.int64)
     )
@@ -467,8 +476,8 @@ def test_ad_engine_derives_mm_special_offsets_from_item_runs():
     cache_seq_interface.shutdown()
 
 
-def test_ad_engine_stages_sparse_same_item_runs():
-    """Executor metadata should preserve exact sparse runs for one logical item."""
+def test_ad_engine_rejects_sparse_same_item_runs():
+    """AutoDeploy keeps the existing single-span model ABI for each multimodal item."""
     device = torch.device("cuda")
     max_seq_len = 64
     max_batch_size = 8
@@ -501,33 +510,13 @@ def test_ad_engine_stages_sparse_same_item_runs():
 
     scheduled_requests = ScheduledRequests()
     scheduled_requests.context_requests_last_chunk.append(req)
-    engine._prepare_inputs(scheduled_requests, resource_manager, new_tokens=None)
 
-    named_args = cache_seq_interface.named_args
-    torch.testing.assert_close(
-        named_args["mm_item_cu_seqlen"].cpu(), torch.tensor([0, 1], dtype=torch.int32)
-    )
-    torch.testing.assert_close(
-        named_args["mm_token_positions"].cpu(), torch.tensor([1], dtype=torch.int32)
-    )
-    torch.testing.assert_close(
-        named_args["mm_token_lengths"].cpu(), torch.tensor([2], dtype=torch.int32)
-    )
-    torch.testing.assert_close(
-        named_args["mm_item_run_cu_seqlen"].cpu(), torch.tensor([0, 2], dtype=torch.int32)
-    )
-    torch.testing.assert_close(
-        named_args["mm_run_token_positions"].cpu(), torch.tensor([1, 3], dtype=torch.int32)
-    )
-    torch.testing.assert_close(
-        named_args["mm_run_token_lengths"].cpu(), torch.tensor([1, 1], dtype=torch.int32)
-    )
-    torch.testing.assert_close(
-        named_args["mm_chunk_flat_start"].cpu(), torch.tensor([1], dtype=torch.int64)
-    )
-    torch.testing.assert_close(
-        named_args["mm_chunk_count"].cpu(), torch.tensor([0], dtype=torch.int64)
-    )
+    with pytest.raises(
+        ValueError,
+        match="AutoDeploy currently supports only single-run multimodal items; item 0 has 2 runs",
+    ):
+        engine._prepare_inputs(scheduled_requests, resource_manager, new_tokens=None)
+
     cache_seq_interface.shutdown()
 
 
