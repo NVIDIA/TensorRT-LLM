@@ -21,6 +21,7 @@
 
 #include <cuda.h>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -362,9 +363,16 @@ public:
     explicit TemporaryCudaStream(std::vector<CachedCudaEvent const*> const& priorEvents);
 
     // Begin a scoped block. Destructor records the finish event (= Python __exit__).
+    // Skips recording during stack unwinding to match Python's `if not exc_type:` guard.
     [[nodiscard]] auto enter()
     {
-        return FuncGuard([this]() { mFinishEvent = mStream.recordEvent(); });
+        int const exCount = std::uncaught_exceptions();
+        return FuncGuard(
+            [this, exCount]()
+            {
+                if (std::uncaught_exceptions() == exCount)
+                    mFinishEvent = mStream.recordEvent();
+            });
     }
 
     [[nodiscard]] CUstream get() const noexcept
