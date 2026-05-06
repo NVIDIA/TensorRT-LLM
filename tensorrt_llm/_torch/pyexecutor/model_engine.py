@@ -538,9 +538,11 @@ class PyTorchModelEngine(ModelEngine):
             max_lora_size = lora_config.max_loras or 8  # Default fallback
             max_batch_size = self.batch_size  # Use engine's max batch size
 
-            # For spec decode, each generation request contributes
-            # max_draft_len + 1 tokens per forward pass.
-            max_tokens_per_seq = (self.original_max_draft_len +
+            # For spec decode, each generation request can contribute up to
+            # tokens_per_gen_step tokens per forward pass. This is larger than
+            # max_draft_len + 1 for modes like PARD, which use extra mask
+            # tokens in the same generation step.
+            max_tokens_per_seq = (self.original_max_total_draft_tokens +
                                   1) if self.is_spec_decode else 1
             self.cuda_graph_lora_manager = CudaGraphLoraManager(
                 max_lora_size=max_lora_size,
