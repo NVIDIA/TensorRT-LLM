@@ -4612,23 +4612,23 @@ test = ["psleak", "pytest", "pytest-instafail", "pytest-xdist", "pywin32 ; os_na
 
 [[package]]
 name = "pulp"
-version = "3.3.0"
+version = "3.3.1"
 description = "PuLP is an LP modeler written in python. PuLP can generate MPS or LP files and call GLPK, COIN CLP/CBC, CPLEX, and GUROBI to solve linear problems."
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "pulp-3.3.0-py3-none-any.whl", hash = "sha256:dd6ad2d63f196d1254eddf9dcff5cd224912c1f046120cb7c143c5b0eda63fae"},
-    {file = "pulp-3.3.0.tar.gz", hash = "sha256:7eb99b9ce7beeb8bbb7ea9d1c919f02f003ab7867e0d1e322f2f2c26dd31c8ba"},
+    {file = "pulp-3.3.1-py3-none-any.whl", hash = "sha256:45aa73db3368eb13b156564e092784c8fa0c1feefa64c2afb0410d9dc0bb5cd9"},
+    {file = "pulp-3.3.1.tar.gz", hash = "sha256:a9ec237a56981b11c2096e8ba6bb72006833410ba5b400aa257426f85df5e293"},
 ]
 
 [package.extras]
 copt = ["coptpy"]
 cplex = ["cplex ; sys_platform != \"darwin\" or python_full_version < \"3.12.0\""]
 gurobi = ["gurobipy"]
-highs = ["highspy"]
+highs = ["highspy (==1.13)"]
 mosek = ["mosek"]
-open-py = ["cylp", "highspy", "pyscipopt"]
+open-py = ["highspy (==1.13)", "pyscipopt"]
 public-py = ["coptpy", "cplex ; sys_platform != \"darwin\" or python_full_version < \"3.12.0\"", "gurobipy", "xpress"]
 scip = ["pyscipopt"]
 xpress = ["xpress"]
@@ -7069,4 +7069,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "c15114708c1a78159dd302ab5b481c919bb4ba4ae62b15c3c3fb1340a9cf8616"
+content-hash = "d824b17429423ee8083f8439d392035efc8dbdc18aa715bd069caf6f19d20949"

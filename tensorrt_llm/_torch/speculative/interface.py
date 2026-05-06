@@ -7,6 +7,7 @@ from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Type
 
 import torch
+from packaging.version import Version
 from torch import nn
 
 from tensorrt_llm.logger import logger
@@ -517,7 +518,8 @@ class SpecWorkerBase(nn.Module, ABC):
         super().__init__()
         self.guided_decoder: Optional["CapturableGuidedDecoder"] = None
         self.force_num_accepted_tokens = get_force_num_accepted_tokens()
-        self.use_flashinfer = IS_FLASHINFER_AVAILABLE and flashinfer.__version__ >= "0.6.4"
+        self.use_flashinfer = IS_FLASHINFER_AVAILABLE and Version(
+            flashinfer.__version__) >= Version("0.6.4")
         self.seed: Optional[torch.Tensor] = None
         self.offset: Optional[torch.Tensor] = None
         self.use_separate_draft_kv_cache = use_separate_draft_kv_cache

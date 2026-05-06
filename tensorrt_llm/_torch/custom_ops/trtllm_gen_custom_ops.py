@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import List, Optional, Tuple, Union
@@ -13,6 +14,11 @@ from tensorrt_llm._torch.utils import (ActType_TrtllmGen, Fp4QuantizedTensor,
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                          OptimizationProfile, TunableRunner, TuningConfig)
 
+_MOE_AUTOTUNE_DUMMY_DISTRIBUTION_ENV = (
+    "TRTLLM_GEN_MOE_AUTOTUNE_DUMMY_DISTRIBUTION")
+_BALANCED = "balanced"
+_RANDOM = "random"
+
 
 def prepare_dummy_topk_and_hook(
     topk_weights: Optional[torch.Tensor],
@@ -23,6 +29,7 @@ def prepare_dummy_topk_and_hook(
     base_tuning_config: TuningConfig,
     top_k: int,
     num_experts: int,
+    local_num_experts: int,
     n_group: Optional[int],
     topk_group: Optional[int],
     routed_scaling_factor: Optional[float],
@@ -49,6 +56,8 @@ def prepare_dummy_topk_and_hook(
         base_tuning_config: Base tuning config to add hook to
         top_k: Number of top experts to select
         num_experts: Total number of experts
+        local_num_experts: Number of experts owned by this rank (for the
+            balanced dummy-topk stride; ignored by the random distribution)
         hidden_states_index: Index of hidden_states in input_tensors list (default: 2)
 
     Returns:
@@ -59,6 +68,119 @@ def prepare_dummy_topk_and_hook(
     tuner = AutoTuner.get()
     if not tuner.is_tuning_mode:
         return routing_logits, topk_weights, topk_ids, base_tuning_config
+
+    need_dummy_topk = (topk_weights is not None or topk_ids is not None)
+    autotune_distribution = os.environ.get(_MOE_AUTOTUNE_DUMMY_DISTRIBUTION_ENV,
+                                           _RANDOM).lower()
+    supported_distributions = {_BALANCED, _RANDOM}
+    if autotune_distribution not in supported_distributions:
+        raise ValueError(
+            f"Unsupported {_MOE_AUTOTUNE_DUMMY_DISTRIBUTION_ENV}={autotune_distribution!r}; "
+            f"expected one of {sorted(supported_distributions)}")
+
+    def make_balanced_dummy_topk(
+            num_tokens: int,
+            device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Build deterministic topk_ids of shape [num_tokens, top_k] that are
+        perfectly balanced over [0, num_experts) and round-robin across ranks,
+        so each token's top_k experts fan out across EP ranks instead of
+        clumping onto consecutive ids.
+
+        Formula: topk_ids[t, k] = (t + k * stride) % num_experts,
+        with stride = min(local_num_experts, num_experts // top_k).
+
+        The min() has two regimes:
+          * top_k <= ep_size: stride == local_num_experts, so each k slot
+            lands on a distinct rank and every token touches top_k ranks.
+          * top_k  > ep_size: stride == num_experts // top_k, which keeps
+            top_k * stride <= num_experts so row entries stay distinct; each
+            token hits each rank ~top_k/ep_size times.
+
+        Example (ep_size=2, num_experts=8, local_num_experts=4, top_k=2,
+        num_tokens=4):
+            stride = min(4, 4) = 4
+            base   = [0, 4]
+            topk_ids = [[0, 4],
+                        [1, 5],
+                        [2, 6],
+                        [3, 7]]
+        Each token sends one expert to rank 0 (ids 0-3) and one to rank 1
+        (ids 4-7); every local expert receives exactly one token. Globally
+        uniform per-expert load matches the balanced attention-DP case.
+
+        Precondition: num_experts >= top_k. Real MoE configs always satisfy
+        this; the assertion catches degenerate tuning configurations that
+        would otherwise produce in-row duplicates.
+        """
+        assert num_experts >= top_k, (
+            f"make_balanced_dummy_topk requires num_experts >= top_k; "
+            f"got num_experts={num_experts}, top_k={top_k}")
+        stride = max(1, min(local_num_experts, num_experts // top_k))
+        base = torch.arange(top_k, device=device, dtype=torch.int32) * stride
+        token_idx = torch.arange(num_tokens, device=device,
+                                 dtype=torch.int32).unsqueeze(1)
+        topk_ids = (base + token_idx) % num_experts
+        topk_weights = torch.ones(num_tokens,
+                                  top_k,
+                                  dtype=torch.bfloat16,
+                                  device=device)
+        return topk_weights, topk_ids
+
+    def make_selected_dummy_topk(
+            num_tokens: int, device: torch.device,
+            logits: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if autotune_distribution == _RANDOM:
+            return make_routing_dummy_topk(num_tokens, device, logits)
+        elif autotune_distribution == _BALANCED:
+            return make_balanced_dummy_topk(num_tokens, device)
+        else:
+            raise ValueError(
+                f"Unsupported autotune distribution {autotune_distribution!r}")
+
+    def make_routing_method():
+        routing_cls_kwargs = {}
+        if routing_method_type == RoutingMethodType.DeepSeekV3:
+            routing_cls_kwargs.update({
+                'n_group':
+                n_group,
+                'topk_group':
+                topk_group,
+                'routed_scaling_factor':
+                routed_scaling_factor,
+                'is_fused':
+                False,
+                'callable_e_score_correction_bias':
+                lambda: torch.randn(num_experts,
+                                    dtype=torch.bfloat16,
+                                    device=hidden_states.device)
+            })
+        if routing_method_type == RoutingMethodType.MiniMax2:
+            routing_cls_kwargs.update({
+                'callable_e_score_correction_bias':
+                lambda: torch.randn(num_experts,
+                                    dtype=torch.bfloat16,
+                                    device=hidden_states.device),
+                'num_experts':
+                num_experts,
+            })
+        return ROUTING_METHOD_TYPE_TO_CLASS[routing_method_type](
+            top_k=top_k, **routing_cls_kwargs)
+
+    def make_routing_dummy_topk(
+        num_tokens: int,
+        device: torch.device,
+        logits: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        routing_method = make_routing_method()
+        if logits is None or logits.shape[0] != num_tokens:
+            logits = torch.randn(num_tokens,
+                                 num_experts,
+                                 dtype=torch.bfloat16,
+                                 device=device)
+        topk_ids, topk_weights = routing_method.apply(logits)
+        return topk_weights.to(torch.bfloat16), topk_ids
 
     if routing_logits is None:
         routing_logits_for_tuner = torch.randn(hidden_states.shape[0],
@@ -109,9 +231,9 @@ def prepare_dummy_topk_and_hook(
     # Create dummy topk tensors for attention DP scenario
     if need_dummy_topk:
         # Attention DP: topk is pre-computed, no routing needed
-        topk_ids_for_tuner, topk_weights_for_tuner = routing_method.apply(
+        topk_weights_for_tuner, topk_ids_for_tuner = make_selected_dummy_topk(
+            hidden_states.shape[0], hidden_states.device,
             routing_logits_for_tuner)
-        topk_weights_for_tuner = topk_weights_for_tuner.to(torch.bfloat16)
         # Don't pass routing_logits to avoid C++ warning about all three being provided
         routing_logits_for_tuner = None
     else:
@@ -126,13 +248,6 @@ def prepare_dummy_topk_and_hook(
             inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         """Recreate dummy topk tensors if token count changed during profiling."""
         current_num_tokens = inputs[hidden_states_index].shape[0]
-        # Recreate routing logits if token count changed
-        if inputs[0] is None or inputs[0].shape[0] != current_num_tokens:
-            routing_logits_for_tuner = torch.randn(
-                current_num_tokens,
-                num_experts,
-                dtype=torch.bfloat16,
-                device=inputs[hidden_states_index].device)
 
         # Only recreate if we originally created dummies
         if need_dummy_topk:
@@ -140,12 +255,19 @@ def prepare_dummy_topk_and_hook(
             if inputs[-1] is not None and inputs[-1].shape[
                     0] != current_num_tokens:
                 # Recreate with new shape
-                topk_ids_for_tuner, topk_weights_for_tuner = routing_method.apply(
-                    routing_logits_for_tuner)
+                topk_weights_for_tuner, topk_ids_for_tuner = make_selected_dummy_topk(
+                    current_num_tokens, inputs[hidden_states_index].device,
+                    None)
                 inputs[-1] = topk_ids_for_tuner
-                inputs[-2] = topk_weights_for_tuner.to(torch.bfloat16)
+                inputs[-2] = topk_weights_for_tuner
             # Note: routing_logits is None in attention DP, no need to adjust
             assert inputs[0] is None
+        # Recreate routing logits if token count changed
+        elif inputs[0] is None or inputs[0].shape[0] != current_num_tokens:
+            inputs[0] = torch.randn(current_num_tokens,
+                                    num_experts,
+                                    dtype=torch.bfloat16,
+                                    device=inputs[hidden_states_index].device)
 
         return inputs
 
@@ -441,6 +563,7 @@ def fp4_block_scale_moe_runner(
             base_tuning_config=kernel_runner.tuning_config,
             top_k=top_k,
             num_experts=num_experts,
+            local_num_experts=local_num_experts,
             n_group=n_group,
             topk_group=topk_group,
             routed_scaling_factor=routed_scaling_factor,
@@ -789,6 +912,7 @@ def fp8_block_scale_moe_runner(
             base_tuning_config=kernel_runner.tuning_config,
             top_k=top_k,
             num_experts=num_experts,
+            local_num_experts=local_num_experts,
             n_group=n_group,
             topk_group=topk_group,
             routed_scaling_factor=routed_scaling_factor,
@@ -1117,6 +1241,7 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
             base_tuning_config=kernel_runner.tuning_config,
             top_k=top_k,
             num_experts=num_experts,
+            local_num_experts=local_num_experts,
             n_group=n_group,
             topk_group=topk_group,
             routed_scaling_factor=routed_scaling_factor,
@@ -1405,6 +1530,7 @@ def e4m3_mxe2m1_block_scale_moe_runner(
             base_tuning_config=kernel_runner.tuning_config,
             top_k=top_k,
             num_experts=num_experts,
+            local_num_experts=local_num_experts,
             n_group=n_group,
             topk_group=topk_group,
             routed_scaling_factor=routed_scaling_factor,
@@ -1690,6 +1816,7 @@ def bf16_mxe2m1_block_scale_moe_runner(
             base_tuning_config=kernel_runner.tuning_config,
             top_k=top_k,
             num_experts=num_experts,
+            local_num_experts=local_num_experts,
             n_group=n_group,
             topk_group=topk_group,
             routed_scaling_factor=routed_scaling_factor,
@@ -1960,6 +2087,7 @@ def fp8_fp4_block_scale_moe_runner(
             base_tuning_config=kernel_runner.tuning_config,
             top_k=top_k,
             num_experts=num_experts,
+            local_num_experts=local_num_experts,
             n_group=n_group,
             topk_group=topk_group,
             routed_scaling_factor=routed_scaling_factor,
