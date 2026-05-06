@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 from ._eviction_controller import NodeRef
 from ._exceptions import LogicError
 from ._life_cycle_registry import LifeCycleId
+from ._stats import KVCacheStatsScope
 from ._storage._core import Slot
 from ._utils import (
     CachedCudaEvent,
@@ -154,6 +155,7 @@ class UncommittedPage(Page):
             self,
             None,
             CachedCudaEvent.NULL,
+            False,
             rawref.ref(manager._storage),
             life_cycle,
             cache_level,
@@ -162,6 +164,7 @@ class UncommittedPage(Page):
             None,
         )
         self.set_slot(slot)
+        self.had_reusable_data = False
 
     def convert_to_committed(self, block: Block, ready_event: CachedCudaEvent) -> "CommittedPage":
         """
@@ -223,6 +226,7 @@ class CommittedPage(Page):
             self,
             None,
             CachedCudaEvent.NULL,
+            False,
             rawref.ref(storage),
             life_cycle,
             cache_level,
@@ -231,6 +235,7 @@ class CommittedPage(Page):
             None,
         )
         self.set_slot(slot)
+        self.had_reusable_data = True
 
     def __del__(self) -> None:
         block = self.block()
@@ -438,7 +443,9 @@ class BatchedLockTarget(NamedTuple):
 
 
 def batched_lock_to_gpu(
-    kv_cache: "_KVCache", tasks: Sequence[BatchedLockTarget]
+    kv_cache: "_KVCache",
+    tasks: Sequence[BatchedLockTarget],
+    stats_scope: KVCacheStatsScope = KVCacheStatsScope.NONE,
 ) -> list["_SharedPageLock"]:
     "Lock pages after migrating all pages to GPU. If migration fails, no locking happens."
     storage = kv_cache.manager._storage
@@ -459,8 +466,18 @@ def batched_lock_to_gpu(
         for (lvl, pg_idx), part in partitioned.items():
             if lvl == GPU_LEVEL:
                 continue
+            pages = [p.page for p in part]
             storage._batched_migrate(
-                pg_idx, GPU_LEVEL, lvl, [p.page for p in part], update_src=True
+                pg_idx,
+                GPU_LEVEL,
+                lvl,
+                pages,
+                update_src=True,
+                allocation_recorder=(
+                    lambda src_pages, dst_slots: kv_cache._record_migrated_slots(
+                        src_pages, dst_slots, stats_scope
+                    )
+                ),
             )
     except Exception:
         for t, e in zip(tasks, scheduled_for_eviction):

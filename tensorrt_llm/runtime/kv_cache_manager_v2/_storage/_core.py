@@ -251,6 +251,7 @@ class Slot:
     #  When passed to release(), it indicates finish of usage by the current owners of the slot.
     _slot_id: SlotId | None
     ready_event: CachedCudaEvent
+    had_reusable_data: bool
 
     @property
     def slot_id(self) -> SlotId:
@@ -271,7 +272,7 @@ class Slot:
         return self._slot_id is not None
 
     def move_to_new_slot(self) -> "Slot":
-        ret = Slot(None, CachedCudaEvent.NULL)
+        ret = Slot(None, CachedCudaEvent.NULL, False)
         ret.set_slot(self)
         return ret
 
@@ -280,8 +281,10 @@ class Slot:
             raise LogicError("Slot is already set.")
         self._slot_id = slot.slot_id
         self.ready_event = slot.ready_event
+        self.had_reusable_data = slot.had_reusable_data
         slot._slot_id = None
         slot.ready_event = CachedCudaEvent.NULL
+        slot.had_reusable_data = False
 
     def __del__(self) -> None:
         if self.has_valid_slot:
@@ -358,7 +361,7 @@ class SlotAllocator:
             self._num_ready_recycled_slots -= 1
             assert slot.ready_event is CachedCudaEvent.NULL
         elif self._num_active_slots < min(self.num_slots, self._target_capacity):
-            slot = Slot(SlotId(self._num_active_slots), CachedCudaEvent.NULL)
+            slot = Slot(SlotId(self._num_active_slots), CachedCudaEvent.NULL, False)
             self._num_active_slots += 1
         else:
             slot = self._recycled_slots.popleft()

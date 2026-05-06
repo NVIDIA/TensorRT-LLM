@@ -45,11 +45,13 @@ from .._page import (
     BatchedLockTarget,
     BlockPage,
     CommittedPage,
+    Page,
     UncommittedPage,
     _PageHolder,
     _SharedPageLock,
     batched_lock_to_gpu,
 )
+from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta, KVCacheStatsScope
 from .._storage._core import Slot
 from .._storage_manager import StorageManager
 from .._utils import (
@@ -179,6 +181,14 @@ class _KVCache:
         "_avg_capacity",
         "_ssm_blocks",
         "_never_resumed",
+        "_pending_context_stats",
+        "_pending_global_stats",
+        "_pending_generation_stats",
+        "_pending_iteration_stats_by_window",
+        "_pending_generation_iteration_stats_by_window",
+        "_committed_request_stats",
+        "_context_counted_slot_keys",
+        "_slot_alloc_new_by_key",
         "__rawref__",
     )
 
@@ -217,6 +227,14 @@ class _KVCache:
 
     _ssm_blocks: TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId, BlockPage]]
     _never_resumed: bool
+    _pending_context_stats: KVCacheStatsDelta
+    _pending_global_stats: KVCacheStatsDelta
+    _pending_generation_stats: KVCacheStatsDelta
+    _pending_iteration_stats_by_window: dict[int, KVCacheIterationStatsDelta]
+    _pending_generation_iteration_stats_by_window: dict[int, KVCacheIterationStatsDelta]
+    _committed_request_stats: KVCacheStatsDelta
+    _context_counted_slot_keys: set[tuple[int, int, int]]
+    _slot_alloc_new_by_key: dict[tuple[int, int, int], bool]
 
     def __init__(
         self,
@@ -250,6 +268,14 @@ class _KVCache:
             self.beam_width,
         )
         self._never_resumed = True
+        self._pending_context_stats = KVCacheStatsDelta()
+        self._pending_global_stats = KVCacheStatsDelta()
+        self._pending_generation_stats = KVCacheStatsDelta()
+        self._pending_iteration_stats_by_window = {}
+        self._pending_generation_iteration_stats_by_window = {}
+        self._committed_request_stats = KVCacheStatsDelta()
+        self._context_counted_slot_keys = set()
+        self._slot_alloc_new_by_key = {}
         self.__rawref__ = rawref.NULL
         if input_tokens is not None:
             self._setup_for_reuse(input_tokens)
@@ -309,6 +335,214 @@ class _KVCache:
     @property
     def num_blocks(self) -> int:
         return len(self._blocks)
+
+    def commit_pending_stats(self) -> KVCacheStatsDelta:
+        self.manager.commit_stats(
+            self._pending_global_stats, self._pending_iteration_stats_by_window
+        )
+        request_stats = self._pending_context_stats.copy()
+        self._committed_request_stats.add(request_stats)
+        self._pending_global_stats.clear()
+        self._pending_context_stats.clear()
+        self._pending_generation_stats.clear()
+        self._pending_iteration_stats_by_window.clear()
+        self._pending_generation_iteration_stats_by_window.clear()
+        self.manager.clear_stats_dirty(self.id)
+        return request_stats
+
+    def discard_pending_generation_stats(self) -> None:
+        self._pending_global_stats.subtract(self._pending_generation_stats)
+        self._pending_generation_stats.clear()
+        for (
+            window_size,
+            generation_stats,
+        ) in self._pending_generation_iteration_stats_by_window.items():
+            pending_stats = self._pending_iteration_stats_by_window.get(window_size)
+            if pending_stats is None:
+                continue
+            pending_stats.subtract(generation_stats)
+            if pending_stats.empty:
+                del self._pending_iteration_stats_by_window[window_size]
+        self._pending_generation_iteration_stats_by_window.clear()
+        self._refresh_stats_dirty_state()
+
+    def discard_pending_stats(self) -> None:
+        self._pending_context_stats.clear()
+        self._pending_global_stats.clear()
+        self._pending_generation_stats.clear()
+        self._pending_iteration_stats_by_window.clear()
+        self._pending_generation_iteration_stats_by_window.clear()
+        self.manager.clear_stats_dirty(self.id)
+
+    def _has_pending_stats(self) -> bool:
+        return (
+            not self._pending_context_stats.empty
+            or not self._pending_global_stats.empty
+            or not self._pending_generation_stats.empty
+            or bool(self._pending_iteration_stats_by_window)
+            or bool(self._pending_generation_iteration_stats_by_window)
+        )
+
+    def _refresh_stats_dirty_state(self) -> None:
+        if self._has_pending_stats():
+            self.manager.mark_stats_dirty(self.id)
+        else:
+            self.manager.clear_stats_dirty(self.id)
+
+    def _record_pending_stats(
+        self,
+        stats: KVCacheStatsDelta,
+        stats_scope: KVCacheStatsScope,
+        *,
+        count_for_request: bool,
+        iteration_stats: KVCacheIterationStatsDelta | None = None,
+        window_size: int | None = None,
+    ) -> None:
+        if stats_scope == KVCacheStatsScope.NONE:
+            return
+        has_request_stats = not stats.empty
+        has_iteration_stats = (
+            iteration_stats is not None and not iteration_stats.empty and window_size is not None
+        )
+        if not has_request_stats and not has_iteration_stats:
+            return
+        if has_request_stats:
+            self._pending_global_stats.add(stats)
+            if stats_scope == KVCacheStatsScope.GENERATION:
+                self._pending_generation_stats.add(stats)
+            if count_for_request:
+                self._pending_context_stats.add(stats)
+        if has_iteration_stats:
+            assert iteration_stats is not None and window_size is not None
+            pending_iteration_stats = self._pending_iteration_stats_by_window.setdefault(
+                window_size, KVCacheIterationStatsDelta()
+            )
+            pending_iteration_stats.add(iteration_stats)
+            if stats_scope == KVCacheStatsScope.GENERATION:
+                generation_iteration_stats = (
+                    self._pending_generation_iteration_stats_by_window.setdefault(
+                        window_size, KVCacheIterationStatsDelta()
+                    )
+                )
+                generation_iteration_stats.add(iteration_stats)
+        self.manager.mark_stats_dirty(self.id)
+
+    def _is_attention_life_cycle(self, life_cycle: LifeCycleId) -> bool:
+        return isinstance(self.manager._life_cycles.get_life_cycle(life_cycle), AttnLifeCycle)
+
+    def _stats_window_key(self, life_cycle: LifeCycleId) -> int | None:
+        life_cycle_obj = self.manager._life_cycles.get_life_cycle(life_cycle)
+        if not isinstance(life_cycle_obj, AttnLifeCycle):
+            return None
+        return -1 if life_cycle_obj.window_size is None else int(life_cycle_obj.window_size)
+
+    @staticmethod
+    def _stats_slot_key(
+        ordinal: BlockOrdinal,
+        beam_index: BeamIndex,
+        life_cycle: LifeCycleId,
+    ) -> tuple[int, int, int]:
+        return (int(ordinal), int(beam_index), int(life_cycle))
+
+    def _record_slot_allocation(
+        self,
+        life_cycle: LifeCycleId,
+        slot: Slot,
+        stats_scope: KVCacheStatsScope,
+        *,
+        count_for_request: bool = False,
+        count_as_missed: bool = False,
+        count_as_generation_alloc: bool = True,
+        iteration_stats_extra: KVCacheIterationStatsDelta | None = None,
+        slot_key: tuple[int, int, int] | None = None,
+    ) -> None:
+        window_size = self._stats_window_key(life_cycle)
+        if stats_scope == KVCacheStatsScope.NONE or window_size is None:
+            return
+        alloc_new = not slot.had_reusable_data
+        if slot_key is not None:
+            self._slot_alloc_new_by_key[slot_key] = alloc_new
+        stats = KVCacheStatsDelta(
+            alloc_total_blocks=1,
+            alloc_new_blocks=0 if slot.had_reusable_data else 1,
+            missed_blocks=1 if count_as_missed else 0,
+        )
+        iteration_stats = KVCacheIterationStatsDelta(
+            iter_alloc_total_blocks=1,
+            iter_alloc_new_blocks=1 if alloc_new else 0,
+            iter_missed_blocks=1 if count_as_missed else 0,
+            iter_gen_alloc_blocks=(
+                1
+                if stats_scope == KVCacheStatsScope.GENERATION and count_as_generation_alloc
+                else 0
+            ),
+        )
+        if iteration_stats_extra is not None:
+            iteration_stats.add(iteration_stats_extra)
+        self._record_pending_stats(
+            stats,
+            stats_scope,
+            count_for_request=count_for_request,
+            iteration_stats=iteration_stats,
+            window_size=window_size,
+        )
+        if count_for_request and slot_key is not None:
+            self._context_counted_slot_keys.add(slot_key)
+
+    def _record_context_counted_existing_slots(
+        self,
+        request_counted_blocks: BlockOrdinal | None,
+    ) -> None:
+        if request_counted_blocks is None:
+            return
+        stats = KVCacheStatsDelta()
+        beam_idx = DEFAULT_BEAM_INDEX
+        for ordinal in typed_range(min(request_counted_blocks, typed_len(self._blocks))):
+            block = self._block(ordinal, beam_idx)
+            for lc_idx, _ in self.manager._life_cycles.attention_life_cycles():
+                key = _KVCache._stats_slot_key(ordinal, beam_idx, lc_idx)
+                if key in self._context_counted_slot_keys:
+                    continue
+                if key not in self._slot_alloc_new_by_key:
+                    continue
+                stats.alloc_total_blocks += 1
+                if self._slot_alloc_new_by_key[key]:
+                    stats.alloc_new_blocks += 1
+                stats.missed_blocks += 1
+                self._context_counted_slot_keys.add(key)
+                if block[lc_idx] is None:
+                    raise LogicError("Missing context-counted KV cache page")
+        if not stats.empty:
+            self._pending_context_stats.add(stats)
+            self.manager.mark_stats_dirty(self.id)
+
+    def _record_migrated_slots(
+        self,
+        pages: Sequence[Page],
+        slots: Sequence[Slot],
+        stats_scope: KVCacheStatsScope,
+    ) -> None:
+        if stats_scope == KVCacheStatsScope.NONE:
+            return
+        for page, slot in zip(pages, slots):
+            pg_idx = self.manager._storage.get_pool_group_index(page.life_cycle)
+            page_size = sum(self.manager._storage.slot_size(pg_idx))
+            transfer_stats = KVCacheIterationStatsDelta()
+            if page.cache_level > GPU_LEVEL:
+                transfer_stats.iter_onboard_blocks = 1
+                transfer_stats.iter_onboard_bytes = page_size
+            elif page.cache_level == GPU_LEVEL:
+                transfer_stats.iter_intra_device_copy_blocks = 1
+                transfer_stats.iter_intra_device_copy_bytes = page_size
+            self._record_slot_allocation(
+                page.life_cycle,
+                slot,
+                stats_scope,
+                count_for_request=stats_scope == KVCacheStatsScope.CONTEXT,
+                count_as_missed=False,
+                count_as_generation_alloc=False,
+                iteration_stats_extra=transfer_stats,
+            )
 
     # destroy ownership of memory blocks, so KV cache manager can decide to evict or drop them. After
     # close, uncommitted data in blocks for (beam_index >= beam_width) will be lost.
@@ -398,7 +632,13 @@ class _KVCache:
     # two APIs) where we use more pages than necessary for SWA layers. So we use a single API to avoid
     # this. Usually this is a concern only for prefill phase where we create many tokens in one step. For
     # other cases, we can just set the capacity and history_length properties instead.
-    def resize(self, capacity: int | None, history_length: int | None = None) -> bool:
+    def resize(
+        self,
+        capacity: int | None,
+        history_length: int | None = None,
+        stats_scope: KVCacheStatsScope = KVCacheStatsScope.NONE,
+        request_counted_capacity: int | None = None,
+    ) -> bool:
         assert self.status == self.Status.ACTIVE
         tokens_per_block = self.tokens_per_block
         assert div_up(self._capacity, tokens_per_block) == len(self._blocks)
@@ -414,9 +654,16 @@ class _KVCache:
             raise ValueError("History length cannot be decreased")
         if capacity < history_length:
             raise ValueError("History length cannot be greater than capacity")
+        request_counted_blocks = (
+            BlockOrdinal(div_up(request_counted_capacity, tokens_per_block))
+            if request_counted_capacity is not None
+            else None
+        )
         if self._shortcut_set_capacity(capacity) and self._shortcut_set_history_length(
             history_length
         ):
+            if stats_scope == KVCacheStatsScope.CONTEXT:
+                self._record_context_counted_existing_slots(request_counted_blocks)
             return True
         ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
         beam_width = self.beam_width
@@ -480,12 +727,28 @@ class _KVCache:
                         if stale_beg <= ordinal < stale_end:
                             continue
                         slot = slots[lc].pop()
+                        count_for_request = (
+                            stats_scope == KVCacheStatsScope.CONTEXT
+                            and request_counted_blocks is not None
+                            and ordinal < request_counted_blocks
+                        )
+                        slot_key = _KVCache._stats_slot_key(ordinal, beam_index, lc)
+                        self._record_slot_allocation(
+                            lc,
+                            slot,
+                            stats_scope,
+                            count_for_request=count_for_request,
+                            count_as_missed=count_for_request,
+                            slot_key=slot_key,
+                        )
                         # We have already waited for ready_event of the slots.
                         block[beam_index][lc] = UncommittedPage(
                             self, ordinal, lc, GPU_LEVEL, slot, beam_index
                         ).lock(self, beam_index, ordinal, lc, skip_wait=True)
                 self._blocks.append(SeqBlock(block, None))
             assert all(len(slots[lc]) == 0 for lc in typed_range(num_life_cycles))
+        if stats_scope == KVCacheStatsScope.CONTEXT:
+            self._record_context_counted_existing_slots(request_counted_blocks)
         self._capacity = capacity
         self._history_length = history_length
         assert NDEBUG or self._check_sanity()
@@ -614,7 +877,11 @@ class _KVCache:
         self._status = self.Status.SUSPENDED
 
     # Resume, migrate buffers to GPU memory.
-    def resume(self, cuda_stream: CudaStream | None = None) -> bool:
+    def resume(
+        self,
+        cuda_stream: CudaStream | None = None,
+        stats_scope: KVCacheStatsScope = KVCacheStatsScope.NONE,
+    ) -> bool:
         assert self.status == self.Status.SUSPENDED
         if cuda_stream is not None:
             self.cuda_stream = cuda_stream
@@ -658,7 +925,7 @@ class _KVCache:
             page = expect_type(_PageHolder, beam_block[lc_idx]).page
             tasks.append(BatchedLockTarget(page, beam_idx, ordinal, lc_idx))
         try:
-            locks = batched_lock_to_gpu(self, tasks)
+            locks = batched_lock_to_gpu(self, tasks, stats_scope)
         except OutOfPagesError:
             for lc_idx, slot in typed_enumerate(deferred_slots):
                 if slot is not None:
@@ -713,6 +980,18 @@ class _KVCache:
                         slot_size[p],
                         [CopyTask(dst, src)],
                         self.cuda_stream,
+                    )
+                window_size = self._stats_window_key(lc_idx)
+                if window_size is not None:
+                    self._record_pending_stats(
+                        KVCacheStatsDelta(),
+                        stats_scope,
+                        count_for_request=False,
+                        iteration_stats=KVCacheIterationStatsDelta(
+                            iter_intra_device_copy_blocks=1,
+                            iter_intra_device_copy_bytes=sum(storage.slot_size(pg_idx)),
+                        ),
+                        window_size=window_size,
                     )
             # Unlock source pages — _record_event captures all prior cuda work
             # so the original pages know when we're done reading from them.
@@ -1230,6 +1509,30 @@ class _KVCache:
             )
             snapshot_holder = unwrap_rawref(snapshot_ref).hold()
             self._ssm_blocks[DEFAULT_BEAM_INDEX][ssm_lc_id] = snapshot_holder
+        reuse_stats_by_window: dict[int, KVCacheIterationStatsDelta] = {}
+        for lc_idx, lc in life_cycles.attention_life_cycles():
+            window_size = -1 if lc.window_size is None else int(lc.window_size)
+            for ordinal, seq_block in typed_enumerate(self._blocks):
+                holder = seq_block.pages[DEFAULT_BEAM_INDEX][lc_idx]
+                if holder is not None:
+                    block, num_matched_tokens = matched[ordinal]
+                    is_full_reuse = num_matched_tokens == tokens_per_block and block.is_full
+                    reuse_stats = reuse_stats_by_window.setdefault(
+                        window_size, KVCacheIterationStatsDelta()
+                    )
+                    reuse_stats.iter_reused_blocks += 1
+                    if is_full_reuse:
+                        reuse_stats.iter_full_reused_blocks += 1
+                    else:
+                        reuse_stats.iter_partial_reused_blocks += 1
+        for window_size, reuse_stats in reuse_stats_by_window.items():
+            self._record_pending_stats(
+                KVCacheStatsDelta(reused_blocks=reuse_stats.iter_reused_blocks),
+                KVCacheStatsScope.CONTEXT,
+                count_for_request=True,
+                iteration_stats=reuse_stats,
+                window_size=window_size,
+            )
         self._num_committed_blocks = BlockOrdinal(len(self._committed_tokens) // tokens_per_block)
         for beam_indices in self._base_page_indices:
             for indices in beam_indices:

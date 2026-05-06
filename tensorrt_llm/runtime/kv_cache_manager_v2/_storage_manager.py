@@ -18,7 +18,7 @@ import os
 import warnings
 from collections import deque
 from dataclasses import dataclass
-from typing import Iterator, Sequence, cast
+from typing import Callable, Iterator, Sequence, cast
 
 from . import rawref
 from ._common import (
@@ -475,6 +475,7 @@ class StorageManager:
         src_pages: Sequence[Page],
         update_src: bool,
         defrag: bool = False,  # we are doing defragmentation
+        allocation_recorder: Callable[[Sequence[Page], Sequence[Slot]], None] | None = None,
     ) -> Sequence[Slot] | None:
         "Free slots must be prepared before calling this function."
         assert defrag or dst_level != src_level, (
@@ -517,6 +518,12 @@ class StorageManager:
                 for pool_idx, tasks in typed_enumerate(tasks_per_pool):
                     batched_copy(dst_tier, src_tier, slot_sizes[pool_idx], tasks, stream.get())
             finish_event = stream.take_finish_event()
+            for src, dst in zip(src_pages, dst_slots):
+                reusable = src.is_committed()
+                src.had_reusable_data = reusable
+                dst.had_reusable_data = reusable
+            if allocation_recorder is not None:
+                allocation_recorder(src_pages, dst_slots)
             for src, dst in zip(src_pages, dst_slots):
                 dst.ready_event = finish_event
                 src.ready_event = (

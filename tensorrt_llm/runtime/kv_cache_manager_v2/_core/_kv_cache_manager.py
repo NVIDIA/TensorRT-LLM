@@ -38,6 +38,7 @@ from .._common import (
 from .._config import DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._page import Page, _PageHolder
+from .._stats import KVCacheIterationStatsDelta, KVCacheStatsDelta
 from .._storage._config import BufferId, create_storage_config
 from .._storage._core import PoolGroupIndex, PoolIndex, SlotId
 from .._storage_manager import StorageManager
@@ -133,6 +134,9 @@ class KVCacheManager:
         "_num_closed_kv_caches",
         "_last_adjustment_time",
         "_last_update_num_closed_requests",
+        "_committed_stats",
+        "_iteration_stats_by_window",
+        "_dirty_stats_kv_cache_ids",
     )
     _init_config: KVCacheManagerConfig
     _life_cycles: LifeCycleRegistry
@@ -155,6 +159,9 @@ class KVCacheManager:
     _num_closed_kv_caches: int
     _last_adjustment_time: float
     _last_update_num_closed_requests: int
+    _committed_stats: KVCacheStatsDelta
+    _iteration_stats_by_window: dict[int, KVCacheIterationStatsDelta]
+    _dirty_stats_kv_cache_ids: set[int]
 
     def __init__(self, config: KVCacheManagerConfig) -> None:
         init_cuda_once()
@@ -181,6 +188,9 @@ class KVCacheManager:
         self._num_closed_kv_caches = 0
         self._last_adjustment_time = time.monotonic()
         self._last_update_num_closed_requests = 0
+        self._committed_stats = KVCacheStatsDelta()
+        self._iteration_stats_by_window = {}
+        self._dirty_stats_kv_cache_ids = set()
 
     def __del__(self) -> None:
         try:
@@ -301,6 +311,44 @@ class KVCacheManager:
 
     def get_quota(self, cache_level: CacheLevel) -> int:
         return self._storage._levels[cache_level].storage.total_quota
+
+    def commit_stats(
+        self,
+        stats: KVCacheStatsDelta,
+        iteration_stats_by_window: dict[int, KVCacheIterationStatsDelta] | None = None,
+    ) -> None:
+        self._committed_stats.add(stats)
+        if iteration_stats_by_window is not None:
+            for window_size, iteration_stats in iteration_stats_by_window.items():
+                if iteration_stats.empty:
+                    continue
+                destination = self._iteration_stats_by_window.setdefault(
+                    window_size, KVCacheIterationStatsDelta()
+                )
+                destination.add(iteration_stats)
+
+    def get_committed_stats(self) -> KVCacheStatsDelta:
+        return self._committed_stats.copy()
+
+    def get_and_reset_iteration_stats(self) -> dict[int, KVCacheIterationStatsDelta]:
+        stats = {
+            window_size: delta.copy()
+            for window_size, delta in self._iteration_stats_by_window.items()
+            if not delta.empty
+        }
+        self._iteration_stats_by_window.clear()
+        return stats
+
+    def mark_stats_dirty(self, kv_cache_id: int | None) -> None:
+        if kv_cache_id is not None:
+            self._dirty_stats_kv_cache_ids.add(kv_cache_id)
+
+    def clear_stats_dirty(self, kv_cache_id: int | None) -> None:
+        if kv_cache_id is not None:
+            self._dirty_stats_kv_cache_ids.discard(kv_cache_id)
+
+    def get_dirty_stats_kv_cache_ids(self) -> set[int]:
+        return self._dirty_stats_kv_cache_ids.copy()
 
     # sorted by CacheLevel from warm to cold
     @property

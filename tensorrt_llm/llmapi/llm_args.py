@@ -2530,6 +2530,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         status="prototype",
         description="Whether to use the KV cache manager v2 (experimental).")
 
+    enable_kv_cache_manager_v2_stats: bool = Field(
+        default=True,
+        status="prototype",
+        description="Whether to collect KV cache stats in KV cache manager v2. "
+        "Disabling this avoids v2 per-request KV cache stats accounting overhead."
+    )
+
     max_util_for_resume: float = Field(
         default=0.95,
         ge=0,

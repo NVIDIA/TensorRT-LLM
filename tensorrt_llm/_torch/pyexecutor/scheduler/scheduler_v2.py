@@ -547,6 +547,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             )
             self._suspend_request(req)
             evicted.append(req)
+        self.kv_cache_manager.discard_generation_kv_cache_stats(req)
 
         return ScheduleAction.STOP, 0, scheduled_beam_width, req_it_end
 
