@@ -192,13 +192,15 @@ def _target_in_filter_subtree(target: str, filter_prefix: str) -> bool:
 def _path_lookup_anchor(yaml_path: str) -> str:
     """Return the lineage anchor for a YAML-namespace path.
 
-    `conftest.py` / `__init__.py` anchor on their enclosing directory
-    (pytest applies a conftest's fixtures to that subtree). Other files
-    anchor on themselves. Top-level conftest with no enclosing dir
-    returns "" — caller treats as no-match.
+    Files whose basename does not start with `test_` (conftest.py,
+    __init__.py, helper modules like `disagg_test_utils.py`) anchor on
+    their enclosing directory: they're typically imported by tests in
+    the same dir; the blast-radius cap protects against helpers that
+    cover most blocks. Test files anchor on themselves. A top-level
+    helper with no enclosing dir returns "" — caller treats as no-match.
     """
     base = yaml_path.rsplit("/", 1)[-1]
-    if base in ("conftest.py", "__init__.py"):
+    if not base.startswith("test_"):
         return yaml_path.rsplit("/", 1)[0] if "/" in yaml_path else ""
     return yaml_path
 
@@ -255,9 +257,9 @@ class YAMLIndex:
                         seen.add(key)
                         self._test_to_blocks.setdefault(key, []).append(block)
                 if canonical:
-                    first = canonical.split("/", 1)[0]
-                    if first and "::" not in first and "[" not in first:
-                        self._yaml_first_components.add(first)
+                    head = canonical.split("/", 1)[0].split("::", 1)[0].split("[", 1)[0]
+                    if head:
+                        self._yaml_first_components.add(head)
 
     def find_match_for_waive(self, waive_id: str) -> Optional[tuple[str, list[Block]]]:
         """Walk up the pytest parent chain; first level with a match wins.
