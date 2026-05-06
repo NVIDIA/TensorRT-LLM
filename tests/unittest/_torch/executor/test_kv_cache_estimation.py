@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -68,6 +69,13 @@ def _make_creator(
     c._kv_cache_config = Mock(
         free_gpu_memory_fraction=0.9, max_attention_window=max_attention_window
     )
+
+    # _get_token_num_for_estimation gates pool-group scaling on V2 (the
+    # split-pool layout that motivates the scaling). Mamba hybrid uses
+    # MambaHybridCacheManager and must NOT scale. These tests target V2
+    # behavior; production sets this in __init__ via
+    # _get_model_kv_cache_manager_cls(), which we bypass here.
+    c._kv_cache_manager_cls = KVCacheManagerV2
 
     return c
 
