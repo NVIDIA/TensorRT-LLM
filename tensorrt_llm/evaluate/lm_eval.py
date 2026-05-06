@@ -862,6 +862,24 @@ class GPQAMain(LmEvalEvaluator):
                   type=str,
                   default=None,
                   help="Directory to save the task infos.")
+    @click.option("--temperature",
+                  type=float,
+                  default=None,
+                  help="Sampling temperature. Overrides task yaml gen_kwargs.")
+    @click.option(
+        "--top_p",
+        type=float,
+        default=None,
+        help="Nucleus sampling top_p. Overrides task yaml gen_kwargs.")
+    @click.option("--top_k",
+                  type=int,
+                  default=None,
+                  help="Top-k sampling. Overrides task yaml gen_kwargs.")
+    @click.option("--sampling_seed",
+                  type=int,
+                  default=None,
+                  help="Random seed for generation sampling "
+                  "(per-request; does not affect dataset order).")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
@@ -924,6 +942,24 @@ class GPQAExtended(LmEvalEvaluator):
                   type=str,
                   default=None,
                   help="Directory to save the task infos.")
+    @click.option("--temperature",
+                  type=float,
+                  default=None,
+                  help="Sampling temperature. Overrides task yaml gen_kwargs.")
+    @click.option(
+        "--top_p",
+        type=float,
+        default=None,
+        help="Nucleus sampling top_p. Overrides task yaml gen_kwargs.")
+    @click.option("--top_k",
+                  type=int,
+                  default=None,
+                  help="Top-k sampling. Overrides task yaml gen_kwargs.")
+    @click.option("--sampling_seed",
+                  type=int,
+                  default=None,
+                  help="Random seed for generation sampling "
+                  "(per-request; does not affect dataset order).")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:

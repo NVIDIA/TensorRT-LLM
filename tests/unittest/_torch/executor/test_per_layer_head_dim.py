@@ -87,6 +87,32 @@ class TestPerLayerHeadDimBasic(unittest.TestCase):
         finally:
             mgr.shutdown()
 
+    def test_nvfp4_per_layer_odd_head_dim_raises(self):
+        """NVFP4 KV cache requires every per-layer head_dim to be divisible by
+        2 (block-scale layout). A heterogeneous list with one odd entry must
+        assert at construction rather than silently produce a misaligned
+        scale-factor pool."""
+        kv_cache_config = KvCacheConfigV2(
+            max_tokens=1024,
+            enable_block_reuse=False,
+            dtype="nvfp4",
+        )
+        mapping = Mapping(world_size=1, tp_size=1, rank=0)
+        with self.assertRaises(AssertionError):
+            KVCacheManagerV2(
+                kv_cache_config,
+                CacheType.SELF,
+                num_layers=2,
+                num_kv_heads=4,
+                head_dim=[64, 65],
+                tokens_per_block=8,
+                max_seq_len=256,
+                max_batch_size=4,
+                mapping=mapping,
+                dtype=DataType.NVFP4,
+                vocab_size=32000,
+            )
+
     def test_uniform_head_dim_list(self):
         """Test passing a list with uniform values behaves like int."""
         mgr = _create_kv_cache_manager_v2(

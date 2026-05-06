@@ -132,6 +132,7 @@ class KvCacheCreator:
         self._skip_est = skip_est
 
     def _get_model_kv_cache_manager_cls(self, model_engine: PyTorchModelEngine):
+        config = model_engine.model.model_config.pretrained_config
         cls = get_kv_cache_manager_cls(model_engine.model.model_config,
                                        self._kv_cache_config)
         if cls == KVCacheManagerV2:
@@ -140,6 +141,18 @@ class KvCacheCreator:
                     > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
                         self._cache_transceiver_config is not None
                         and self._cache_transceiver_config.backend is not None):
+                # Per-layer head_dim models (e.g., Gemma4 hybrid) require V2's
+                # split-pool layout. KVCacheManager (V1) coerces head_dim list
+                # to max(head_dim), changing per-layer KV byte sizes — which
+                # breaks correctness, not just efficiency. Fail fast here
+                # rather than silently producing wrong outputs.
+                if is_gemma4_hybrid(config):
+                    raise NotImplementedError(
+                        "Gemma4 hybrid attention requires KVCacheManagerV2, "
+                        "which is not yet supported with kv_connector_manager, "
+                        "beam_width > 1, event_buffer_max_size > 0, or "
+                        "cache_transceiver. Disable these features to run "
+                        "Gemma4 hybrid models.")
                 logger.warning(
                     "KVCacheManagerV2 is not supported with kv_connector_manager, beam width > 1, "
                     "event buffer max size > 0, or cache transceiver. Falling back to KVCacheManager."
@@ -381,17 +394,21 @@ class KvCacheCreator:
         # proportional split. Inferred from the model config since the hybrid
         # max_attention_window hasn't been populated in kv_cache_config yet at
         # this stage (it's filled in later by _create_kv_cache_manager).
+        # Only V2 has split-pool semantics — Mamba hybrid (which also has
+        # heterogeneous layer_types) uses MambaHybridCacheManager and would
+        # have its max_tokens estimate inflated incorrectly otherwise.
         num_pool_groups = 1
-        model_cfg = self._model_engine.model.model_config.pretrained_config
-        layer_types = getattr(model_cfg, "layer_types", None)
-        if isinstance(layer_types, (list, tuple)):
-            distinct = len(set(layer_types))
-            if distinct > 1:
-                num_pool_groups = distinct
-        elif (self._kv_cache_config.max_attention_window is not None
-              and len(set(self._kv_cache_config.max_attention_window)) > 1):
-            num_pool_groups = len(
-                set(self._kv_cache_config.max_attention_window))
+        if self._kv_cache_manager_cls == KVCacheManagerV2:
+            model_cfg = self._model_engine.model.model_config.pretrained_config
+            layer_types = getattr(model_cfg, "layer_types", None)
+            if isinstance(layer_types, (list, tuple)):
+                distinct = len(set(layer_types))
+                if distinct > 1:
+                    num_pool_groups = distinct
+            elif (self._kv_cache_config.max_attention_window is not None
+                  and len(set(self._kv_cache_config.max_attention_window)) > 1):
+                num_pool_groups = len(
+                    set(self._kv_cache_config.max_attention_window))
         num_cache_blocks *= num_pool_groups
 
         free_mem, total_mem = torch.cuda.mem_get_info()
