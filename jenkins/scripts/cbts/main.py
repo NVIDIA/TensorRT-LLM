@@ -47,6 +47,7 @@ from blocks import (  # noqa: E402
     write_filtered_test_db,
 )
 from rules.base import PRInputs, Rule, RuleResult  # noqa: E402
+from rules.out_of_scope_rule import OutOfScopeRule  # noqa: E402
 from rules.test_list_rule import TestListRule  # noqa: E402
 from rules.tests_def_rule import TestsDefRule  # noqa: E402
 from rules.waives_rule import WaivesRule  # noqa: E402
@@ -54,7 +55,7 @@ from rules.waives_rule import WaivesRule  # noqa: E402
 # --- Rule registry -----------------------------------------------------------
 
 # Classes are used for `--list-needed-diffs` (no need to construct).
-RULE_CLASSES: list[type[Rule]] = [WaivesRule, TestsDefRule, TestListRule]
+RULE_CLASSES: list[type[Rule]] = [WaivesRule, TestsDefRule, TestListRule, OutOfScopeRule]
 
 
 def build_rules(
@@ -66,6 +67,7 @@ def build_rules(
         WaivesRule(yaml_index, stages),
         TestsDefRule(yaml_index, stages, repo_root=repo_root),
         TestListRule(yaml_index, stages),
+        OutOfScopeRule(yaml_index, stages),
     ]
 
 
@@ -109,10 +111,19 @@ _TESTSONLY_FAMILY: frozenset[str] = frozenset({"waiveonly", "testdefonly", "test
 
 
 def _combine_scopes(scopes: list[str]) -> Optional[str]:
-    """Return the common scope, "testsonly" for testsonly-family mix, else None."""
+    """Combine rule scopes.
+
+    Rules with scope="noop" (out-of-scope claims) give way to any
+    actionable rule that also fired. When only noop fired, returns
+    "noop". Otherwise: identical scopes pass through; testsonly-family
+    mixes combine to "testsonly"; anything else returns None.
+    """
     if not scopes:
         return None
-    s = set(scopes)
+    real = [s for s in scopes if s != "noop"]
+    if not real:
+        return "noop"
+    s = set(real)
     if len(s) == 1:
         return next(iter(s))
     if s <= _TESTSONLY_FAMILY:
@@ -153,9 +164,12 @@ class Selector:
             affected_stages |= r.affected_stages
 
         # If rules fired but no stages resolved, return scope=None so
-        # downstream falls back to baseline. Maintains the invariant that any
-        # scope!=None result has a non-empty pre-filter affected_stages set.
-        if not affected_stages:
+        # downstream falls back to baseline. Exception: scope="noop" — the
+        # rule explicitly claimed files that need no test stages (e.g. QA
+        # test-list edits the pre-merge pipeline doesn't consume), so the
+        # empty stage set is intentional and gets preserved through to
+        # Groovy Layer 2.
+        if not affected_stages and scope != "noop":
             return SelectionResult(
                 scope=None,
                 reasons=reasons
