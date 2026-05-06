@@ -47,16 +47,26 @@ from blocks import (  # noqa: E402
     write_filtered_test_db,
 )
 from rules.base import PRInputs, Rule, RuleResult  # noqa: E402
+from rules.test_list_rule import TestListRule  # noqa: E402
+from rules.tests_def_rule import TestsDefRule  # noqa: E402
 from rules.waives_rule import WaivesRule  # noqa: E402
 
 # --- Rule registry -----------------------------------------------------------
 
 # Classes are used for `--list-needed-diffs` (no need to construct).
-RULE_CLASSES: list[type[Rule]] = [WaivesRule]
+RULE_CLASSES: list[type[Rule]] = [WaivesRule, TestsDefRule, TestListRule]
 
 
-def build_rules(yaml_index: YAMLIndex, stages: dict[str, Stage]) -> list[Rule]:
-    return [WaivesRule(yaml_index, stages)]
+def build_rules(
+    yaml_index: YAMLIndex,
+    stages: dict[str, Stage],
+    repo_root: Path,
+) -> list[Rule]:
+    return [
+        WaivesRule(yaml_index, stages),
+        TestsDefRule(yaml_index, stages, repo_root=repo_root),
+        TestListRule(yaml_index, stages),
+    ]
 
 
 # --- Selector ---------------------------------------------------------------
@@ -93,12 +103,20 @@ class SelectionResult:
         return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
 
+# Scopes that compose: a PR mixing waive + test-def + test-list edits
+# combines to a single "testsonly" scope rather than falling back.
+_TESTSONLY_FAMILY: frozenset[str] = frozenset({"waiveonly", "testdefonly", "testlistonly"})
+
+
 def _combine_scopes(scopes: list[str]) -> Optional[str]:
-    """Return the common scope if all agree, else None."""
+    """Return the common scope, "testsonly" for testsonly-family mix, else None."""
     if not scopes:
         return None
-    if len(set(scopes)) == 1:
-        return scopes[0]
+    s = set(scopes)
+    if len(s) == 1:
+        return next(iter(s))
+    if s <= _TESTSONLY_FAMILY:
+        return "testsonly"
     return None
 
 
@@ -256,7 +274,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     # subset matching the user's flag.
     stages = parse_stages_from_groovy(groovy_path, include_post_merge=True)
     pr = _load_pr_inputs(input_path)
-    rules = build_rules(yaml_index, stages)
+    rules = build_rules(yaml_index, stages, repo_root)
     result = Selector(stages).run(pr, rules)
 
     # Layer 3: write narrowed test-db when any block was filtered.
