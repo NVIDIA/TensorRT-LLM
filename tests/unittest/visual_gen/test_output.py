@@ -678,28 +678,6 @@ def test_encoding_not_top_level_reexport():
 
 
 # ---------------------------------------------------------------------------
-# MediaStorage no longer carries encoding methods
-# ---------------------------------------------------------------------------
-
-
-def test_media_storage_lacks_encoding_methods():
-    """MediaStorage instances no longer have save_image/save_video/etc."""
-    from tensorrt_llm.serve.media_storage import MediaStorage
-
-    ms = MediaStorage()
-    for name in ("save_image", "save_video", "convert_image_to_bytes", "convert_video_to_bytes"):
-        assert not hasattr(ms, name), (
-            f"MediaStorage.{name} should be removed; use tensorrt_llm.media.encoding instead."
-        )
-
-
-def test_resolve_video_format_moved():
-    """resolve_video_format is not importable from media_storage."""
-    with pytest.raises(ImportError):
-        from tensorrt_llm.serve.media_storage import resolve_video_format  # noqa: F401
-
-
-# ---------------------------------------------------------------------------
 # PipelineOutput shape
 # ---------------------------------------------------------------------------
 

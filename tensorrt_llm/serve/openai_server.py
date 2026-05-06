@@ -41,7 +41,7 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
-from tensorrt_llm.media.encoding import image_to_bytes, save_image
+from tensorrt_llm.media.encoding import image_to_bytes
 from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.sampling_params import GuidedDecodingParams
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
@@ -1831,10 +1831,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 )
 
             elif request.response_format == "url":
-                save_image(
-                    output_images[0],
-                    self.media_storage_path / f"{image_id}.png",
-                )
+                output.save(self.media_storage_path / f"{image_id}.png")
                 # TODO: Support URL mode
                 return self._create_not_supported_error(
                     "URL mode is not supported for image generation")

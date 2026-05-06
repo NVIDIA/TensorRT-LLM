@@ -22,7 +22,7 @@ from fastapi import Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.media.encoding import resolve_video_format, save_video
+from tensorrt_llm.media.encoding import resolve_video_format
 from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest, VideoJob, VideoJobList
 from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE, parse_visual_gen_params
 from tensorrt_llm.visual_gen.params import VisualGenParams
@@ -70,13 +70,10 @@ class _VideoRoutesMixin:
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
-            actual_output_path = save_video(
-                video=output.video,
-                output_path=self.media_storage_path / f"{video_id}{resolved_ext}",
-                audio=output.audio,
-                frame_rate=output.frame_rate or request.fps or params.frame_rate,
+            actual_output_path = output.save(
+                self.media_storage_path / f"{video_id}{resolved_ext}",
                 format=resolved_fmt,
-                audio_sample_rate=output.audio_sample_rate or 24000,
+                frame_rate=output.frame_rate or request.fps or params.frame_rate,
             )
             latency = time.perf_counter() - sync_video_start  # seconds
             logger.info(
@@ -259,13 +256,10 @@ class _VideoRoutesMixin:
                     await VIDEO_STORE.upsert(video_id, job)
                 return
 
-            actual_output_path = save_video(
-                video=output.video,
-                output_path=self.media_storage_path / f"{video_id}{resolved_ext}",
-                audio=output.audio,
-                frame_rate=output.frame_rate or request.fps or params.frame_rate,
+            actual_output_path = output.save(
+                self.media_storage_path / f"{video_id}{resolved_ext}",
                 format=resolved_fmt,
-                audio_sample_rate=output.audio_sample_rate or 24000,
+                frame_rate=output.frame_rate or request.fps or params.frame_rate,
             )
             latency = time.perf_counter() - background_start  # seconds
             logger.info(
