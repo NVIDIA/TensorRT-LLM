@@ -375,6 +375,7 @@ class PyExecutor:
                 ResourceManagerType.DRAFT_KV_CACHE_MANAGER: set(),
             }
         self._disagg_gen_kv_recv_started_ids: set[int] = set()
+        self._disagg_timed_out_kv_cancelled_ids: set[int] = set()
 
         # Rolling acceptance tracking for spec decode (disable speculation if rolling acceptance is below threshold)
         spec_config = getattr(self.model_engine, 'spec_config', None)
@@ -3561,10 +3562,10 @@ class PyExecutor:
                 # If cancel is successful, mark as complete so it can be cleaned up
                 # Otherwise, try at next iteration
                 if is_cancelled:
-                    self._fail_closed_for_unquiesced_disagg_transfer(
-                        f"Context request {request.py_request_id} timed out "
-                        "while KV transfer quiescence is unknown", [request])
-                    return
+                    request.py_kv_transfer_start_time = None
+                    request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+
+                    self._end_transfer_and_maybe_terminate(request)
 
         self._check_cache_transfer_errors("context requests")
 
@@ -3856,10 +3857,26 @@ class PyExecutor:
 
         failed_requests = (list(self.active_requests)
                            if requests is None else list(requests))
-        if self._has_unquiesced_disagg_transfers(failed_requests):
-            self._fail_closed_for_unquiesced_disagg_transfer(
-                error_msg, failed_requests)
-            return
+        deferred_requests = [
+            request for request in failed_requests
+            if self._is_unquiesced_disagg_transfer(request)
+        ]
+        if deferred_requests:
+            logger.warning(
+                "Deferring error cleanup for disaggregated KV transfers still "
+                "in flight. C++ transfer status remains the source of truth "
+                "for final cleanup. request_ids=%s, error=%s",
+                [request.py_request_id for request in deferred_requests],
+                error_msg)
+            failed_requests = [
+                request for request in failed_requests
+                if request not in deferred_requests
+            ]
+            if not failed_requests:
+                if self._fatal_error is not None:
+                    self.executor_request_queue.enqueue_shutdown_request()
+                return
+
         for request in failed_requests:
             req_id = request.py_request_id
             if not request.is_disagg_context_transmission_state:
@@ -3869,11 +3886,11 @@ class PyExecutor:
                 error_msg=error_msg,
                 client_id=request.py_client_id)
         if requests is None:
-            self.active_requests.clear()
+            self.active_requests = deferred_requests
         else:
             self.active_requests = [
                 request for request in self.active_requests
-                if request not in requests
+                if request not in failed_requests
             ]
         self._enqueue_responses(list(error_responses.items()))
         for request in failed_requests:
@@ -3882,47 +3899,9 @@ class PyExecutor:
         if self._fatal_error is not None:
             self.executor_request_queue.enqueue_shutdown_request()
 
-    def _has_unquiesced_disagg_transfers(
-            self, requests: Iterable[LlmRequest]) -> bool:
-        return any(req.is_disagg_generation_transmission_in_progress
-                   or req.is_disagg_context_transmission_state
-                   for req in requests)
-
-    def _fail_closed_for_unquiesced_disagg_transfer(
-            self, error_msg: str, requests: Iterable[LlmRequest]):
-        failed_requests = list(requests)
-        in_flight_req_ids = [
-            req.py_request_id for req in failed_requests
-            if req.is_disagg_generation_transmission_in_progress
-            or req.is_disagg_context_transmission_state
-        ]
-        logger.error(
-            "Fatal executor error while disaggregated KV transfer is in flight. "
-            "Failing closed without freeing active request resources because "
-            "transport quiescence is unknown. "
-            f"in_flight_request_ids={in_flight_req_ids}, error={error_msg}")
-
-        error_responses: Dict[int, LlmResponse] = {}
-        response_requests = {
-            request.py_request_id: request
-            for request in list(self.active_requests) + failed_requests
-        }
-        for request in response_requests.values():
-            req_id = request.py_request_id
-            error_responses[req_id] = LlmResponse(
-                request_id=req_id,
-                error_msg=error_msg,
-                client_id=request.py_client_id)
-
-        self.active_requests.clear()
-        self.waiting_queue.clear()
-        self.request_accumulated.clear()
-        self.control_requests.clear()
-        self.is_shutdown = True
-        self.shutdown_event.set()
-        self._enqueue_responses(list(error_responses.items()))
-        with self.response_cv:
-            self.response_cv.notify_all()
+    def _is_unquiesced_disagg_transfer(self, request: LlmRequest) -> bool:
+        return (request.is_disagg_generation_transmission_in_progress
+                or request.is_disagg_context_transmission_state)
 
     def _can_terminate_request_now(self, request: LlmRequest) -> bool:
         if request.is_disagg_context_transmission_state:
@@ -3931,9 +3910,9 @@ class PyExecutor:
                 "because context KV transfer is still in progress")
             return False
         if request.is_disagg_generation_transmission_in_progress:
-            self._fail_closed_for_unquiesced_disagg_transfer(
-                f"Attempted to terminate generation request {request.py_request_id} "
-                "while KV transfer is still in progress", [request])
+            logger.warning(
+                f"Deferring termination for request {request.py_request_id} "
+                "because generation KV transfer is still in progress")
             return False
         return True
 
@@ -3969,6 +3948,7 @@ class PyExecutor:
         for prepared_ids in self._disagg_gen_init_prepared_ids.values():
             prepared_ids.discard(request.py_request_id)
         self._disagg_gen_kv_recv_started_ids.discard(request.py_request_id)
+        self._disagg_timed_out_kv_cancelled_ids.discard(request.py_request_id)
 
     def _is_request_in_transmission(self, request) -> bool:
         """Check if a request is currently in transmission state."""
@@ -4114,12 +4094,17 @@ class PyExecutor:
 
             # Check if generation request needs cleanup due to KV cache transfer timeout.
             if request.py_kv_transfer_timed_out:
-                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
-                if is_cancelled:
-                    self._fail_closed_for_unquiesced_disagg_transfer(
-                        f"Generation request {request.py_request_id} timed out "
-                        "while KV transfer quiescence is unknown", [request])
-                    return requests_to_terminate
+                if (request.py_request_id
+                        not in self._disagg_timed_out_kv_cancelled_ids):
+                    is_cancelled = self.kv_cache_transceiver.cancel_request(
+                        request)
+                    if is_cancelled:
+                        self._disagg_timed_out_kv_cancelled_ids.add(
+                            request.py_request_id)
+                        logger.warning(
+                            f"Cancelled timed-out generation KV transfer for "
+                            f"request {request.py_request_id}; waiting for "
+                            "C++ transfer status to report final cleanup")
                 continue
 
             if request.is_generation_only_request() and not request.is_finished:
