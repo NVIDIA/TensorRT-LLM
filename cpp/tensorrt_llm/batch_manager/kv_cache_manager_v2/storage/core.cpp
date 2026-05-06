@@ -119,6 +119,7 @@ void SlotAllocator::release(Slot slot)
         mOverflowSlots.push_back(std::move(slot));
     }
     scrubEvents();
+    assert(check());
 }
 
 void SlotAllocator::expand(int newNumSlots)
