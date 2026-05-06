@@ -183,8 +183,8 @@ def launch_disaggregated_llm(
     disagg_cluster = {
         "cluster_uri": cluster_uri,
         "cluster_name": "test_cluster",
-        "heartbeat_interval_sec": 1,
-        "inactive_timeout_sec": 2,
+        "heartbeat_interval_sec": 5,
+        "inactive_timeout_sec": 10,
     }
 
     # Auto-deduce minimal_instances from num_instances
@@ -365,13 +365,9 @@ def launch_disaggregated_llm(
     with (
             MyThreadPoolExecutor(max_workers=max_workers) as thread_pool,
             temp_dir,
-            multi_popen(ctx_servers, "ctx",
-                        enable_redirect_log=False) as ctx_processes,
-            multi_popen(gen_servers, "gen", enable_redirect_log=False) as
-            gen_processes,
-            multi_popen([(base_env, server_cmd)],
-                        "disagg",
-                        enable_redirect_log=False) as server_processes,
+            multi_popen(ctx_servers, "ctx") as ctx_processes,
+            multi_popen(gen_servers, "gen") as gen_processes,
+            multi_popen([(base_env, server_cmd)], "disagg") as server_processes,
     ):
         start_time = time.time()
         server_is_ready = False
@@ -1845,7 +1841,9 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "ctx_tp1pp1", "ctx_tp1pp2", "ctx_tp2pp1", "ctx_tp2pp2", "ctx_tp1pp4"
         ],
     )
-    def test_gen_first(self, ctx_tp_pp, gen_tp_pp):
+    @pytest.mark.parametrize("enable_attention_dp", [False, True],
+                             ids=["noadp", "adp"])
+    def test_gen_first(self, ctx_tp_pp, gen_tp_pp, enable_attention_dp):
         ctx_tp, ctx_pp = ctx_tp_pp
         gen_tp, gen_pp = gen_tp_pp
         total_gpus = ctx_tp * ctx_pp + gen_tp * gen_pp
@@ -1860,6 +1858,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         ctx_server_config = {
             "tensor_parallel_size": ctx_tp,
             "pipeline_parallel_size": ctx_pp,
+            "enable_attention_dp": enable_attention_dp,
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
@@ -1871,6 +1870,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "tensor_parallel_size": gen_tp,
             "pipeline_parallel_size": gen_pp,
+            "enable_attention_dp": enable_attention_dp,
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {

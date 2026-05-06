@@ -96,6 +96,7 @@ struct InputFieldsNames
     static constexpr char const* beamSearchDiversityRate = "beam_search_diversity_rate";
     static constexpr char const* presencePenalty = "presence_penalty";
     static constexpr char const* frequencyPenalty = "frequency_penalty";
+    static constexpr char const* promptIgnoreLength = "prompt_ignore_length";
     static constexpr char const* seed = "seed";
 
     // PromptTuningConfig

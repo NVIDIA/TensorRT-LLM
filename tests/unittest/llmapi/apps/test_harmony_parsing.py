@@ -36,7 +36,8 @@ try:
         get_harmony_adapter,
         handle_streaming_response,
     )
-    from tensorrt_llm.serve.openai_protocol import StreamOptions
+    from tensorrt_llm.serve.openai_protocol import StreamOptions, _logit_bias_to_embedding_bias
+    from tensorrt_llm.serve.openai_server import OpenAIServer
 
     _harmony_available = True
 except (ImportError, ModuleNotFoundError):
@@ -1190,6 +1191,14 @@ class TestStreamOptionsUsage:
         finally:
             if request_id in harmony_adapter._stream_states:
                 harmony_adapter.cleanup_stream_state(request_id)
+
+
+def test_none_tokenizer_num_postprocess_workers():
+    server = object.__new__(OpenAIServer)
+    server.tokenizer = None
+    assert server._vocab_size is None
+    with pytest.raises(ValueError, match="logit_bias requires a tokenizer"):
+        _logit_bias_to_embedding_bias({"0": 1.0}, vocab_size=None)
 
 
 if __name__ == "__main__":

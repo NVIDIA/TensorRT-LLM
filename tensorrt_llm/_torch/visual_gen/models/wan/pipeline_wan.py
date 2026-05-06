@@ -2,6 +2,7 @@ import time
 from typing import List, Optional, Union
 
 import diffusers
+import PIL.Image
 import torch
 from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
@@ -17,6 +18,7 @@ from tensorrt_llm._torch.visual_gen.models.wan.defaults import (
     get_wan_default_params,
     get_wan_extra_param_specs,
 )
+from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_utils import retrieve_latents
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
@@ -26,10 +28,11 @@ from tensorrt_llm.logger import logger
 
 from .transformer_wan import WanTransformer3DModel
 
-# Supported Wan T2V models:
+# Supported Wan models:
 # - Wan2.1-T2V-14B: Single-stage text-to-video (14B parameters)
 # - Wan2.1-T2V-1.3B: Single-stage text-to-video (1.3B parameters)
 # - Wan2.2-T2V-A14B: Two-stage text-to-video (14B, boundary_ratio for high/low-noise stages; supports 480P & 720P)
+# - Wan2.2-TI2V-5B: Single-stage, text-to-video and image-to-video (5B; supports 720P)
 
 WAN_TEACACHE_COEFFICIENTS = {
     "1.3B": {
@@ -79,15 +82,18 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
 @register_pipeline("WanPipeline")
 class WanPipeline(BasePipeline):
     def __init__(self, model_config):
-        # Wan2.2 two-stage denoising parameters
+        # Wan2.2 A14B two-stage denoising parameters
         self.transformer_2 = None
         self.boundary_ratio = getattr(model_config.pretrained_config, "boundary_ratio", None)
-        self.is_wan22 = self.boundary_ratio is not None
+        self.expand_timesteps = getattr(model_config.pretrained_config, "expand_timesteps", False)
+        # Derived model type flags
+        self.is_wan22_14b = self.boundary_ratio is not None
+        self.is_wan22_5b = self.expand_timesteps
 
         # Validate TeaCache compatibility before allocating GPU memory
-        if self.is_wan22 and model_config.cache_backend == "teacache":
+        if (self.is_wan22_14b or self.is_wan22_5b) and model_config.cache_backend == "teacache":
             raise ValueError(
-                "TeaCache is not supported for Wan 2.2 T2V models. "
+                "TeaCache is not supported for Wan 2.2 models. "
                 "Use cache_backend='none' or 'cache_dit' (not 'teacache')."
             )
 
@@ -133,15 +139,20 @@ class WanPipeline(BasePipeline):
 
     @property
     def default_warmup_resolutions(self):
+        if self.is_wan22_5b:
+            # The 720p resolution of Wan2.2 TI2V 5B model is 704x1280
+            return [(704, 1280)]
         return [(480, 832), (720, 1280)]
 
     @property
     def default_warmup_num_frames(self):
+        if self.is_wan22_5b:
+            return [33, 121]
         return [33, 81]
 
     @property
     def default_warmup_steps(self):
-        return 4 if self.is_wan22 else 2
+        return 4 if self.is_wan22_14b else 2
 
     @property
     def resolution_multiple_of(self):
@@ -159,9 +170,9 @@ class WanPipeline(BasePipeline):
         logger.info("Creating WAN transformer with quantization support...")
         self.transformer = WanTransformer3DModel(model_config=self.model_config)
 
-        # Wan2.2: create second transformer for two-stage denoising
-        if self.boundary_ratio is not None:
-            logger.info("Creating second transformer for Wan2.2 two-stage denoising...")
+        # Wan2.2 A14B: create second transformer for two-stage denoising
+        if self.is_wan22_14b:
+            logger.info("Creating second transformer for Wan2.2 A14B two-stage denoising...")
             self.transformer_2 = WanTransformer3DModel(model_config=self.model_config)
 
     def load_standard_components(
@@ -180,14 +191,17 @@ class WanPipeline(BasePipeline):
             )
 
         # Detect model version
-        if self.is_wan22:
-            logger.info("Detected Wan 2.2 T2V (two-stage denoising)")
+        if self.is_wan22_14b:
+            logger.info("Detected Wan 2.2 A14B T2V (two-stage denoising)")
+        elif self.is_wan22_5b:
+            logger.info("Detected Wan 2.2 5B TI2V (single-stage denoising)")
         else:
             logger.info("Detected Wan 2.1 T2V (single-stage denoising)")
 
         # Set default VAE scale factors (will be overridden if VAE is loaded)
+        default_vae_scale_factor_spatial = 16 if self.is_wan22_5b else 8
         self.vae_scale_factor_temporal = 4
-        self.vae_scale_factor_spatial = 8
+        self.vae_scale_factor_spatial = default_vae_scale_factor_spatial
 
         if PipelineComponent.TOKENIZER not in skip_components:
             logger.info("Loading tokenizer...")
@@ -213,7 +227,11 @@ class WanPipeline(BasePipeline):
             ).to(device)
 
             self.vae_scale_factor_temporal = getattr(self.vae.config, "scale_factor_temporal", 4)
-            self.vae_scale_factor_spatial = getattr(self.vae.config, "scale_factor_spatial", 8)
+            self.vae_scale_factor_spatial = getattr(
+                self.vae.config,
+                "scale_factor_spatial",
+                default_vae_scale_factor_spatial,
+            )
 
         if PipelineComponent.SCHEDULER not in skip_components:
             logger.info("Loading scheduler...")
@@ -247,12 +265,12 @@ class WanPipeline(BasePipeline):
             self.transformer.load_weights(transformer_weights)
             logger.info("Transformer weights loaded successfully.")
 
-        # Wan2.2: Load weights for second transformer if it exists
+        # Wan2.2 A14B: Load weights for second transformer if it exists
         if self.transformer_2 is not None and hasattr(self.transformer_2, "load_weights"):
-            logger.info("Loading transformer_2 weights for Wan2.2...")
+            logger.info("Loading transformer_2 weights for Wan2.2 A14B...")
             if not has_separate_weights:
                 raise ValueError(
-                    "Wan2.2 model requires separate 'transformer' and 'transformer_2' weights in checkpoint, "
+                    "Wan2.2 A14B model requires separate 'transformer' and 'transformer_2' weights in checkpoint, "
                     f"but only found: {list(weights.keys())}. "
                     "Two-stage denoising requires distinct weights for high-noise and low-noise transformers."
                 )
@@ -282,7 +300,7 @@ class WanPipeline(BasePipeline):
                     )
                 )
 
-            if not self.is_wan22:
+            if not self.is_wan22_14b:
                 self._setup_cache_acceleration(
                     self.transformer, coefficients=WAN_TEACACHE_COEFFICIENTS
                 )
@@ -314,18 +332,28 @@ class WanPipeline(BasePipeline):
     @property
     def default_generation_params(self):
         return get_wan_default_params(
-            is_wan22=self.is_wan22,
+            is_wan22_14b=self.is_wan22_14b,
+            is_wan22_5b=self.is_wan22_5b,
             name_or_path=getattr(self.config, "_name_or_path", ""),
             num_heads=getattr(self.config, "num_attention_heads", 40),
         )
 
     @property
     def extra_param_specs(self):
-        return get_wan_extra_param_specs(self.is_wan22)
+        return get_wan_extra_param_specs(self.is_wan22_14b)
 
     def infer(self, req):
         """Run inference with request parameters."""
         extra = req.params.extra_params or {}
+        # Wan 2.2 TI2V-5B takes one conditioning image if provided
+        image = req.params.image
+        if isinstance(image, list):
+            if len(image) != 1:
+                raise ValueError(
+                    f"WanPipeline I2V expects a single image, got list of {len(image)}."
+                )
+            image = image[0]
+
         return self.forward(
             prompt=req.prompt,
             negative_prompt=req.params.negative_prompt,
@@ -338,6 +366,7 @@ class WanPipeline(BasePipeline):
             boundary_ratio=extra.get("boundary_ratio"),
             seed=req.params.seed,
             max_sequence_length=req.params.max_sequence_length,
+            image=image,
         )
 
     @nvtx_range("WanPipeline.forward")
@@ -355,8 +384,17 @@ class WanPipeline(BasePipeline):
         boundary_ratio: Optional[float] = None,
         seed: int = 42,
         max_sequence_length: int = 512,
+        image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
     ):
         pipeline_start = time.time()
+
+        # WanPipeline supports I2V for Wan 2.2 TI2V-5B. Use WanImageToVideoPipeline for Wan 2.1 I2V and Wan 2.2 A14B I2V
+        is_i2v = image is not None
+        if is_i2v and not self.is_wan22_5b:
+            raise ValueError(
+                "WanPipeline only supports image conditioning for Wan 2.2 TI2V-5B. "
+                "For Wan 2.1 I2V or Wan 2.2 A14B I2V, use WanImageToVideoPipeline."
+            )
 
         # Determine batch size
         if isinstance(prompt, str):
@@ -370,10 +408,10 @@ class WanPipeline(BasePipeline):
         # Use user-provided boundary_ratio if given, otherwise fall back to model config
         boundary_ratio = boundary_ratio if boundary_ratio is not None else self.boundary_ratio
 
-        # Validate that Wan 2.2 models have boundary_ratio set
+        # Validate that Wan 2.2 A14B models have boundary_ratio set
         if self.transformer_2 is not None and boundary_ratio is None:
             raise ValueError(
-                "Wan 2.2 models require boundary_ratio to be set. "
+                "Wan 2.2 A14B models require boundary_ratio to be set. "
                 "boundary_ratio was not found in model config. "
                 "Please pass boundary_ratio as a parameter."
             )
@@ -383,18 +421,26 @@ class WanPipeline(BasePipeline):
             negative_prompt = WAN_DEFAULT_NEGATIVE_PROMPT
 
         # Set model-specific defaults based on Wan version
+        mode_str = "I2V" if is_i2v else "T2V"
+        if self.is_wan22_14b:
+            logger.info(f"Detected Wan 2.2 A14B {mode_str} (two-stage denoising)")
+        elif self.is_wan22_5b:
+            logger.info(f"Detected Wan 2.2 5B {mode_str} (single-stage denoising)")
+        else:
+            logger.info(f"Detected Wan 2.1 {mode_str} (single-stage denoising)")
         logger.info(
-            f"Running {'Wan 2.2' if self.is_wan22 else 'Wan 2.1'} T2V inference"
+            f"Running {mode_str} inference "
             f"(boundary_ratio={boundary_ratio}, has_transformer_2={self.transformer_2 is not None})"
         )
 
+        # Set model-specific defaults if not provided
+        defaults = self.default_generation_params
         if num_inference_steps is None:
-            num_inference_steps = 40 if self.is_wan22 else 50
-
+            num_inference_steps = defaults["num_inference_steps"]
         if guidance_scale is None:
-            guidance_scale = 4.0 if self.is_wan22 else 5.0
+            guidance_scale = defaults["guidance_scale"]
 
-        if self.is_wan22 and guidance_scale_2 is None:
+        if self.is_wan22_14b and guidance_scale_2 is None:
             guidance_scale_2 = guidance_scale  # Match HF: default to guidance_scale when unset
 
         # Validate two-stage denoising configuration
@@ -414,18 +460,25 @@ class WanPipeline(BasePipeline):
         )
         logger.info(f"Prompt encoding completed in {time.time() - encode_start:.2f}s")
 
-        # Prepare Latents
-        latents = self._prepare_latents(batch_size, height, width, num_frames, generator)
+        # Prepare Latents. Pure noise for T2V. Image-conditioned latent for Wan 2.25B I2V
+        i2v_condition = None
+        i2v_first_frame_mask = None
+        if is_i2v:
+            latents, i2v_condition, i2v_first_frame_mask = self._prepare_latents_wan22_5B_i2v(
+                batch_size, image, height, width, num_frames, generator
+            )
+        else:
+            latents = self._prepare_latents(batch_size, height, width, num_frames, generator)
         logger.debug(f"Latents shape: {latents.shape}")
 
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
 
-        # Wan2.2: Calculate boundary timestep for two-stage denoising
+        # Wan2.2 A14B: Calculate boundary timestep for two-stage denoising
         boundary_timestep = None
         if boundary_ratio is not None and self.transformer_2 is not None:
             boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
             logger.info(
-                f"Wan2.2 two-stage denoising: boundary_timestep={boundary_timestep:.1f}, "
+                f"Wan2.2 A14B two-stage denoising: boundary_timestep={boundary_timestep:.1f}, "
                 f"guidance_scale={guidance_scale}, guidance_scale_2={guidance_scale_2}"
             )
 
@@ -440,10 +493,12 @@ class WanPipeline(BasePipeline):
 
             extra_stream_latents and extra_tensors are unused for WAN (single stream, no additional embeddings).
             """
+
+            # Extract scalar timestep
+            current_t = timestep if timestep.dim() == 0 else timestep[0]
+
             # Select model based on timestep (if two-stage denoising is enabled)
             if boundary_timestep is not None and self.transformer_2 is not None:
-                # Extract scalar timestep for comparison
-                current_t = timestep if timestep.dim() == 0 else timestep[0]
                 if current_t >= boundary_timestep:
                     current_model = self.transformer
                     model_name = "transformer (high-noise)"
@@ -459,11 +514,33 @@ class WanPipeline(BasePipeline):
             else:
                 current_model = self.transformer
 
+            # Build per-patch 2D timestep for Wan 2.2 TI2V-5B
+            if self.is_wan22_5b:
+                _, ph, pw = self.transformer.config.patch_size
+                nf = latents.shape[2]
+                nh = latents.shape[3] // ph
+                nw = latents.shape[4] // pw
+                if is_i2v:
+                    # I2V: timestep 0 for reference image, current_t for noisy frames
+                    patch_ts = i2v_first_frame_mask[0, 0, :, ::ph, ::pw] * current_t
+                    timestep = patch_ts.flatten().unsqueeze(0).expand(latents.shape[0], -1)
+                else:
+                    # T2V: current_t for all frames
+                    timestep = current_t.reshape(1, 1).expand(latents.shape[0], nf * nh * nw)
+
             return current_model(
                 hidden_states=latents,
                 timestep=timestep,
                 encoder_hidden_states=encoder_hidden_states,
             )
+
+        # Pin reference image to latent after each scheduler step (Wan 2.2 5B I2V only)
+        def _pin_i2v_first_frame(x):
+            return ((1 - i2v_first_frame_mask) * i2v_condition + i2v_first_frame_mask * x).to(
+                self.dtype
+            )
+
+        post_step_fn = _pin_i2v_first_frame if (self.is_wan22_5b and is_i2v) else None
 
         # Two-stage denoising: model switching in forward_fn, guidance scale switching in denoise()
         latents = self.denoise(
@@ -475,6 +552,7 @@ class WanPipeline(BasePipeline):
             forward_fn=forward_fn,
             guidance_scale_2=guidance_scale_2,
             boundary_timestep=boundary_timestep,
+            post_step_fn=post_step_fn,
         )
 
         # Decode
@@ -549,7 +627,7 @@ class WanPipeline(BasePipeline):
         generator: torch.Generator,
     ) -> torch.Tensor:
         """Prepare random latents for video generation."""
-        num_channels_latents = 16
+        num_channels_latents = getattr(self.transformer.config, "in_channels", 16)
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
 
         shape = (
@@ -561,6 +639,76 @@ class WanPipeline(BasePipeline):
         )
 
         return randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
+
+    # Adapted from diffusers.pipelines.wan.pipeline_wan_i2v
+    # https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/wan/pipeline_wan_i2v.py
+    @nvtx_range("_prepare_latents_wan22_5B_i2v", color="blue")
+    def _prepare_latents_wan22_5B_i2v(
+        self,
+        batch_size: int,
+        image: Union[PIL.Image.Image, torch.Tensor, str],
+        height: int,
+        width: int,
+        num_frames: int,
+        generator: torch.Generator,
+    ):
+        """Prepare latents with first-frame image conditioning for Wan 2.2 TI2V-5B.
+
+        Returns (latents, latent_condition, first_frame_mask). The 5B model blends the
+        image into the first frame in-channel (no mask channel concat) and uses a
+        mask-aware timestep during denoising.
+        """
+        num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
+        latent_height = height // self.vae_scale_factor_spatial
+        latent_width = width // self.vae_scale_factor_spatial
+
+        num_channels_latents = getattr(self.transformer.config, "in_channels", 48)
+        shape = (batch_size, num_channels_latents, num_latent_frames, latent_height, latent_width)
+        latents = randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
+
+        # Load and preprocess image
+        if isinstance(image, str):
+            image = PIL.Image.open(image).convert("RGB")
+        image = (
+            self.video_processor.preprocess(image, height=height, width=width)
+            .to(self.device, dtype=self.vae.dtype)
+            .unsqueeze(2)
+        )
+
+        # Encode video condition through VAE
+        latent_condition = retrieve_latents(self.vae.encode(image), sample_mode="argmax").to(
+            self.dtype
+        )
+        if batch_size > 1:
+            latent_condition = latent_condition.repeat(batch_size, 1, 1, 1, 1)
+
+        # Normalize latents to match diffusion model's latent space
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(latents.device, latents.dtype)
+        )
+        latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
+            1, self.vae.config.z_dim, 1, 1, 1
+        ).to(latents.device, latents.dtype)
+        latent_condition = (latent_condition - latents_mean) * latents_std
+
+        # Create first-frame mask
+        first_frame_mask = torch.ones(
+            1,
+            1,
+            num_latent_frames,
+            latent_height,
+            latent_width,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        first_frame_mask[:, :, 0] = 0
+
+        # Blend latent condition into latents
+        latents = (1 - first_frame_mask) * latent_condition + first_frame_mask * latents
+
+        return latents, latent_condition, first_frame_mask
 
     @nvtx_range("_decode_latents", color="blue")
     def _decode_latents(self, latents: torch.Tensor) -> torch.Tensor:

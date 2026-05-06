@@ -18,12 +18,13 @@ import itertools
 import os
 import queue
 import socket
+import sys
 import threading
 import time
 import traceback
 import weakref
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch.multiprocessing as mp
 import zmq
@@ -73,6 +74,50 @@ def get_ip_address() -> str:
         s.close()
 
 
+def _detect_external_launch() -> Optional[Tuple[int, int, int, str, int]]:
+    """Detect whether the process was launched by an external distributed launcher.
+
+    Checks for torchrun (``RANK`` + ``WORLD_SIZE``) and then SLURM
+    (``SLURM_PROCID`` + ``SLURM_NTASKS``).  Returns a
+    ``(rank, local_rank, world_size, master_addr, master_port)`` tuple when a
+    multi-process launcher is detected (world_size > 1), or ``None`` for
+    single-process / single-node ``mp.Process`` mode.
+    """
+    # torchrun / torchelastic sets RANK and WORLD_SIZE
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        if world_size > 1:
+            local_rank = int(os.environ.get("LOCAL_RANK", rank))
+            master_addr = os.environ.get("MASTER_ADDR")
+            if master_addr is None:
+                raise RuntimeError(
+                    "MASTER_ADDR must be set for multi-node torchrun runs. "
+                    "Add --master-addr=<node0-ip> to your torchrun command, or set "
+                    "MASTER_ADDR in the environment before launching."
+                )
+            master_port = int(os.environ.get("MASTER_PORT", 29500))
+            return rank, local_rank, world_size, master_addr, master_port
+
+    # SLURM: srun --ntasks-per-node=GPUS_PER_NODE sets SLURM_PROCID / SLURM_NTASKS
+    if "SLURM_PROCID" in os.environ and "SLURM_NTASKS" in os.environ:
+        rank = int(os.environ["SLURM_PROCID"])
+        world_size = int(os.environ["SLURM_NTASKS"])
+        if world_size > 1:
+            local_rank = int(os.environ.get("SLURM_LOCALID", rank))
+            master_addr = os.environ.get("MASTER_ADDR")
+            if master_addr is None:
+                raise RuntimeError(
+                    "MASTER_ADDR must be set for multi-node SLURM runs. "
+                    "Add to your sbatch script:\n"
+                    "  MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -1)"
+                )
+            master_port = int(os.environ.get("MASTER_PORT", 29500))
+            return rank, local_rank, world_size, master_addr, master_port
+
+    return None
+
+
 @set_api_status("prototype")
 class VisualGenError(RuntimeError):
     """Base exception for all VisualGen operations."""
@@ -90,7 +135,27 @@ class VisualGenParamsError(ValueError):
 
 
 class DiffusionRemoteClient:
-    """Client proxy for remote DiffusionExecutor in worker processes."""
+    """Client proxy for remote DiffusionExecutor in worker processes.
+
+    Supports two launch modes:
+
+    **Single-node (default)**
+        ``VisualGen`` is called from an ordinary Python script.
+        ``DiffusionRemoteClient`` spawns all worker processes locally via
+        ``mp.Process`` with ``master_addr=127.0.0.1``.
+
+    **Multi-node (external launcher)**
+        The script is launched by ``torchrun`` or ``srun --ntasks-per-node=GPUS``.
+        Each rank runs the same script; ``RANK`` / ``WORLD_SIZE`` / ``MASTER_ADDR``
+        / ``MASTER_PORT`` are already set in the environment.
+
+        - Rank 0: becomes the request coordinator.  It creates the ZMQ server
+          sockets and starts its own worker in a background thread, then returns
+          to the caller so the user script can call ``generate()``.
+        - Rank > 0: handled by ``VisualGen.__init__`` before this class is
+          instantiated — they call ``run_diffusion_worker`` directly and exit
+          via ``sys.exit(0)``.  These ranks never reach ``DiffusionRemoteClient``.
+    """
 
     def __init__(
         self,
@@ -99,18 +164,35 @@ class DiffusionRemoteClient:
         self.args = args
         self.n_workers = args.parallel.n_workers
 
-        # Setup distributed env
-        self.master_addr = "127.0.0.1"
-        self.master_port = find_free_port()
+        # --- Detect external launcher (torchrun / srun) ---
+        ext = _detect_external_launch()
 
-        # Setup IPC addresses
-        self.host_ip = get_ip_address()
-        req_port, resp_port = find_free_port(), find_free_port()
+        if ext is None:
+            # Single-node: coordinator spawns all workers locally
+            # Setup distributed env
+            self.master_addr = "127.0.0.1"
+            self.master_port = find_free_port()
 
-        self.request_queue_addr = f"tcp://0.0.0.0:{req_port}"
-        self.response_queue_addr = f"tcp://0.0.0.0:{resp_port}"
-        self.req_addr_connect = f"tcp://{self.host_ip}:{req_port}"
-        self.resp_addr_connect = f"tcp://{self.host_ip}:{resp_port}"
+            # Setup IPC addresses
+            self.host_ip = get_ip_address()
+            req_port, resp_port = find_free_port(), find_free_port()
+
+            self.request_queue_addr = f"tcp://0.0.0.0:{req_port}"
+            self.response_queue_addr = f"tcp://0.0.0.0:{resp_port}"
+            self.req_addr_connect = f"tcp://{self.host_ip}:{req_port}"
+            self.resp_addr_connect = f"tcp://{self.host_ip}:{resp_port}"
+
+        else:
+            # rank == 0 guaranteed — ranks 1..N-1 exited in VisualGen.__init__
+            rank, local_rank, world_size, master_addr, master_port = ext
+            req_port = find_free_port()
+            resp_port = find_free_port()
+            self.master_addr = master_addr
+            self.master_port = master_port
+            self.request_queue_addr = f"tcp://0.0.0.0:{req_port}"
+            self.response_queue_addr = f"tcp://0.0.0.0:{resp_port}"
+            self.req_addr_connect = f"tcp://{master_addr}:{req_port}"
+            self.resp_addr_connect = f"tcp://{master_addr}:{resp_port}"
 
         # Generate shared HMAC keys for IPC authentication
         self.req_hmac_key = os.urandom(32)
@@ -140,29 +222,54 @@ class DiffusionRemoteClient:
         self.default_generation_params: Dict = {}
         self.extra_param_specs: Dict = {}
 
-        # Launch workers (VisualGenArgs is pickled via mp.Process spawn context)
-        n_workers = self.n_workers
-        logger.info(f"DiffusionClient: Launching {n_workers} workers")
-        ctx = mp.get_context("spawn")
+        # --- Launch workers ---
         self.worker_processes = []
-        for rank in range(n_workers):
-            p = ctx.Process(
+        self._ext_worker_thread: Optional[threading.Thread] = None
+
+        if ext is None:
+            logger.info(f"DiffusionClient: Launching {self.n_workers} workers")
+            ctx = mp.get_context("spawn")
+            for rank in range(self.n_workers):
+                p = ctx.Process(
+                    target=run_diffusion_worker,
+                    kwargs={
+                        "rank": rank,
+                        "world_size": self.n_workers,
+                        "master_addr": self.master_addr,
+                        "master_port": self.master_port,
+                        "request_queue_addr": self.req_addr_connect,
+                        "response_queue_addr": self.resp_addr_connect,
+                        "diffusion_args": self.args,
+                        "req_hmac_key": self.req_hmac_key,
+                        "resp_hmac_key": self.resp_hmac_key,
+                        "log_level": logger.level,
+                        "local_rank": rank,
+                    },
+                )
+                p.start()
+                self.worker_processes.append(p)
+        else:
+            # External launch: rank 0 runs its own worker in a background thread.
+            # Other nodes' workers are already running (they were launched by the
+            # external launcher and will connect to our ZMQ server once it binds).
+            self._ext_worker_thread = threading.Thread(
                 target=run_diffusion_worker,
                 kwargs={
                     "rank": rank,
-                    "world_size": n_workers,
-                    "master_addr": self.master_addr,
-                    "master_port": self.master_port,
+                    "world_size": self.n_workers,
+                    "master_addr": master_addr,
+                    "master_port": master_port,
                     "request_queue_addr": self.req_addr_connect,
                     "response_queue_addr": self.resp_addr_connect,
                     "diffusion_args": self.args,
                     "req_hmac_key": self.req_hmac_key,
                     "resp_hmac_key": self.resp_hmac_key,
                     "log_level": logger.level,
+                    "local_rank": local_rank,
                 },
+                daemon=True,
             )
-            p.start()
-            self.worker_processes.append(p)
+            self._ext_worker_thread.start()
 
         self._wait_ready()
 
@@ -368,6 +475,10 @@ class DiffusionRemoteClient:
                     p.kill()
                     p.join(timeout=WORKER_TIMEOUT)
 
+        # External-launch mode: join rank-0 worker thread
+        if self._ext_worker_thread is not None and self._ext_worker_thread.is_alive():
+            self._ext_worker_thread.join(timeout=WORKER_TIMEOUT)
+
     def _wait_ready(self):
         """Wait for workers to be ready (sync wrapper for async operation)."""
         logger.info("DiffusionClient: Waiting for workers")
@@ -404,7 +515,11 @@ class DiffusionRemoteClient:
                     logger.info(f"DiffusionClient: Workers ready ({elapsed:.1f}s)")
                     return
 
-            if any(not p.is_alive() for p in self.worker_processes):
+            worker_dead = any(not p.is_alive() for p in self.worker_processes)
+            ext_dead = (
+                self._ext_worker_thread is not None and not self._ext_worker_thread.is_alive()
+            )
+            if worker_dead or ext_dead:
                 raise RuntimeError("DiffusionClient: Worker died during initialization")
 
             now = time.time()
@@ -490,6 +605,40 @@ class VisualGen:
     ):
         self.model = str(model)
         self.args = (args or VisualGenArgs()).model_copy(update={"checkpoint_path": self.model})
+
+        # In external-launch mode (torchrun/srun), ranks 1..N-1 run as pure
+        # workers and never return to user code.
+        ext = _detect_external_launch()
+        if ext is not None:
+            rank, local_rank, world_size, master_addr, master_port = ext
+            n_workers = self.args.parallel.n_workers
+            if world_size != n_workers:
+                raise ValueError(
+                    f"Launcher world_size ({world_size}) does not match "
+                    f"n_workers ({n_workers}). "
+                    "Launch exactly n_workers tasks."
+                )
+            if rank != 0:
+                logger.info(
+                    f"VisualGen: rank {rank}/{world_size}, local_rank {local_rank} — "
+                    "starting as worker (external launch mode)"
+                )
+                run_diffusion_worker(
+                    rank=rank,
+                    world_size=n_workers,
+                    master_addr=master_addr,
+                    master_port=master_port,
+                    request_queue_addr=None,  # unused: non-zero ranks receive requests via dist.broadcast_object_list
+                    response_queue_addr=None,  # unused: only rank 0 sends responses over ZMQ
+                    diffusion_args=self.args,
+                    req_hmac_key=None,
+                    resp_hmac_key=None,
+                    local_rank=local_rank,
+                )
+                sys.exit(0)
+            logger.info(
+                f"VisualGen: rank 0/{world_size} — coordinator + worker (external launch mode)"
+            )
 
         self.executor = DiffusionRemoteClient(
             args=self.args,

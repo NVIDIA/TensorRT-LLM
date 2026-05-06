@@ -323,15 +323,19 @@ if(UNIX)
   set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -fno-inline")
 endif()
 
-# Note: The following are desirable settings that should be enabled if we
-# decrease shared library size. See e.g.
-# https://github.com/rapidsai/cudf/pull/6134 for a similar issue in another
-# project.
-
-# set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO}
-# --generate-line-info")
-
-# set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} -G")
+# Emit CUDA line info for Debug and RelWithDebInfo so nsys/ncu can map samples
+# back to source. This inflates section sizes significantly, so building these
+# configurations for all CUDA architectures at once will fail to link --
+# build_wheel.py enforces that a specific --cuda_architectures must be passed in
+# that case. Note: full device debug info (-G) is intentionally NOT enabled by
+# default for Debug -- it can make ptxas memory usage explode on some kernels
+# and get OOM-killed in CI. Developers who need cuda-gdb stepping can opt in via
+# `build_wheel.py --extra-cmake-vars CMAKE_CUDA_FLAGS_DEBUG=-G` on a host with
+# enough memory for ptxas.
+# cmake-format: off
+set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} --generate-line-info")
+set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} --generate-line-info")
+# cmake-format: on
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss ")
 

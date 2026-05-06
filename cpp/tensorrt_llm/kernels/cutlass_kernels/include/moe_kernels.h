@@ -308,6 +308,17 @@ struct QuantParams
 
         GemmInputs fc1;
         GemmInputs fc2;
+
+        // Dynamic fc2 input scale: compute fc2 input scale from intermediate activation at runtime.
+        // Only used when enabled = true; all pointers are nullptr otherwise.
+        struct DynamicFc2InputScale
+        {
+            bool enabled = false;
+            float* amax = nullptr;                 // [1] global amax output
+            float* alpha = nullptr;                // [num_experts] dynamic alpha output
+            void* bf16_buffer = nullptr;           // bf16 intermediate buffer
+            float const* weight_scale_2 = nullptr; // [num_experts] per-expert weight_scale_2 for fc2
+        } dynamic_fc2_input_scale;
     } fp4;
 
     // GPTQ/AWQ quantization params

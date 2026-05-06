@@ -13,12 +13,12 @@ from torch.nn import functional as F
 from utils.util import skip_pre_hopper
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy._compat import ActivationType
 from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import (
     TRTLLM_NVFP4_COLUMN_SIZE,
     TRTLLM_NVFP4_ROW_SIZE,
     TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
 )
-from tensorrt_llm._torch.utils import ActivationType
 
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FLOAT4_E2M1_MAX = 6.0

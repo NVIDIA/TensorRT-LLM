@@ -548,6 +548,14 @@ def test_moe_backend(
         if hasattr(quantize_util, "weight_loading_mode"):
             weight_loading_mode = quantize_util.weight_loading_mode
 
+        # Clear class-level permute indices cache between parametrized test cases
+        # to work around a B200-specific kernel bug (tactic [32,5] illegal memory access)
+        from tensorrt_llm._torch.modules.fused_moe.quantization import (
+            NVFP4TRTLLMGenFusedMoEBaseMethod,
+        )
+
+        NVFP4TRTLLMGenFusedMoEBaseMethod._cache_permute_indices.clear()
+
         # Create backend first (needed for MXFP4_MXFP8 to get shapes)
         backend = create_test_backend(
             backend_type=backend_type,

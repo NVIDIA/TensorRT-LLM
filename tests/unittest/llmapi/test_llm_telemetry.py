@@ -41,7 +41,7 @@ _kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4)
 def _get_model_path():
     root = llm_models_root()
     assert root is not None, (
-        "LLM_MODELS_ROOT must be set or /home/scratch.trt_llm_data must be "
+        "LLM_MODELS_ROOT must be set or /home/scratch.trt_llm_data_ci must be "
         "accessible to run telemetry integration tests"
     )
     return str(root / MODEL_NAME)
