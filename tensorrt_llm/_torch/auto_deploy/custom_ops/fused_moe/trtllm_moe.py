@@ -1329,8 +1329,9 @@ def trtllm_nvfp4_trtllm_gen_moe_fused_fake(
 @torch.library.custom_op("auto_deploy::trtllm_mxfp4_w4a16_moe_fused", mutates_args=())
 def trtllm_mxfp4_w4a16_moe_fused(
     x: torch.Tensor,
-    selected_experts: torch.Tensor,
-    routing_weights: torch.Tensor,
+    router_weight: torch.Tensor,
+    router_bias: torch.Tensor,
+    top_k: int,
     fc1_weights_mxfp4: torch.Tensor,
     fc2_weights_mxfp4: torch.Tensor,
     fc1_weights_scale_ue8m0: torch.Tensor,
@@ -1350,14 +1351,19 @@ def trtllm_mxfp4_w4a16_moe_fused(
 
     Kernel: ``torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner``.
 
+    The op accepts the **raw router weight + bias** and computes the top-k
+    routing internally (matching ``RenormalizeMoeRoutingMethod`` semantics:
+    ``softmax(topk(F.linear(x, w, b)))``). It then dispatches to the trtllm-gen
+    bf16xMxE2m1 kernel with pre-computed topk indices and weights — exactly
+    the path PT exercises via ``W4A16MXFP4TRTLLMGenFusedMoEMethod``.
+
     Args:
         x: BF16/FP16 hidden states, shape ``(B, S, H)`` or ``(B*S, H)``.
             ``H`` may be smaller than the kernel's expected (padded) hidden — the
             op zero-pads on entry and slices the output back to ``valid_hidden_size``.
-        selected_experts: Pre-computed top-k expert IDs, ``int32``,
-            shape ``(num_tokens, top_k)``.
-        routing_weights: Pre-computed top-k routing scales, ``bf16``,
-            shape ``(num_tokens, top_k)``.
+        router_weight: ``[E_total, H]`` BF16/FP16 router projection.
+        router_bias: ``[E_total]`` BF16/FP16 router bias.
+        top_k: number of experts activated per token (4 for gpt-oss-120b).
         fc1_weights_mxfp4: ``[E_local, 2*I_pad, H_pad/2]`` ``uint8`` (MXFP4 packed,
             already pad+shard+shuffled for the kernel; col-parallel along ``2*I``).
         fc2_weights_mxfp4: ``[E_local, H_pad, I_pad/2]`` ``uint8`` (row-parallel
@@ -1385,6 +1391,13 @@ def trtllm_mxfp4_w4a16_moe_fused(
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
 
+    # Top-k routing (RenormalizeMoeRoutingMethod): logits -> topk -> softmax-of-topk.
+    # Done outside the kernel because bf16_mxe2m1_block_scale_moe_runner expects
+    # pre-computed topk_weights / topk_ids when routing_logits is None.
+    router_logits = torch.nn.functional.linear(x2d, router_weight, router_bias)
+    topk_vals, topk_ids = torch.topk(router_logits, top_k, dim=-1)
+    topk_weights = torch.nn.functional.softmax(topk_vals, dim=-1)
+
     # Pad activations to the kernel's expected hidden (H_pad, multiple of 512).
     # The kernel reads `expected_hidden = fc1_weights.shape[-1] * 2` bytes of input.
     expected_hidden = int(fc1_weights_mxfp4.shape[-1] * 2)
@@ -1392,11 +1405,10 @@ def trtllm_mxfp4_w4a16_moe_fused(
     if pad_size > 0:
         x2d = torch.nn.functional.pad(x2d, (0, pad_size))
 
-    num_experts_total = int(fc1_weights_mxfp4.shape[0])
+    num_experts_total = int(router_weight.shape[0])
     if local_num_experts < 0:
-        local_num_experts = num_experts_total
+        local_num_experts = int(fc1_weights_mxfp4.shape[0])
 
-    top_k = int(routing_weights.shape[-1])
     # intermediate_size_padded = (2 * I_pad) // 2 = I_pad
     intermediate_size_padded = int(fc1_weights_mxfp4.shape[1] // 2)
 
@@ -1414,7 +1426,7 @@ def trtllm_mxfp4_w4a16_moe_fused(
         fc2_weights_scale_ue8m0,  # gemm2_weights_scale
         fc2_bias_f32,  # gemm2_bias
         num_experts_total,
-        top_k,
+        int(top_k),
         None,  # n_group
         None,  # topk_group
         intermediate_size_padded,
@@ -1425,8 +1437,8 @@ def trtllm_mxfp4_w4a16_moe_fused(
         None,  # routed_scaling_factor
         routing_method_type,
         0,  # act_type = SwiGlu
-        topk_weights=routing_weights.to(torch.bfloat16),
-        topk_ids=selected_experts.to(torch.int32),
+        topk_weights=topk_weights.to(torch.bfloat16),
+        topk_ids=topk_ids.to(torch.int32),
     )
     if result.shape[-1] > valid_hidden_size:
         result = result[..., :valid_hidden_size].contiguous()
@@ -1436,8 +1448,9 @@ def trtllm_mxfp4_w4a16_moe_fused(
 @trtllm_mxfp4_w4a16_moe_fused.register_fake
 def trtllm_mxfp4_w4a16_moe_fused_fake(
     x: torch.Tensor,
-    selected_experts: torch.Tensor,
-    routing_weights: torch.Tensor,
+    router_weight: torch.Tensor,
+    router_bias: torch.Tensor,
+    top_k: int,
     fc1_weights_mxfp4: torch.Tensor,
     fc2_weights_mxfp4: torch.Tensor,
     fc1_weights_scale_ue8m0: torch.Tensor,
