@@ -130,11 +130,7 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
         kv_cache = self._mgr.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
             return
-        if req.context_current_position > kv_cache.num_committed_tokens:
-            kv_cache.commit(
-                req.get_tokens(0)[kv_cache.num_committed_tokens : req.context_current_position]
-            )
-            kv_cache.stop_committing()
+        self._mgr.try_commit_blocks_for_reuse(req, kv_cache)
 
 
 def create_cache_reuse_adapter(

@@ -160,7 +160,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         adapter = self._reuse_adapter
         tpb = adapter.tokens_per_block
 
-        is_gen_only = req.is_generation_only_request
+        is_gen_only = req.is_generation_only_request()
         cached_tokens = adapter.get_cached_token_count(req) if is_gen_only else 0
         num_cached_blocks = cached_tokens // tpb
 
@@ -639,9 +639,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"cp_size: {self._mapping.cp_size}"
             )
 
-    @property
-    def reuse_adapter(self) -> CacheReuseAdapter:
-        return self._reuse_adapter
+    def commit_blocks_for_reuse(self, req) -> None:
+        self._reuse_adapter.commit_blocks_for_reuse(req)
 
     def get_context_state(self):
         raise NotImplementedError("get_context_state is not implemented")

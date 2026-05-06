@@ -3340,10 +3340,8 @@ class PyExecutor:
             if req.is_disagg_generation_transmission_complete:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.context_current_position = req.prompt_len
-                if self.kv_cache_transceiver is not None and hasattr(
-                        self.kv_cache_transceiver, 'reuse_adapter'):
-                    self.kv_cache_transceiver.reuse_adapter.commit_blocks_for_reuse(
-                        req)
+                if self.kv_cache_transceiver is not None:
+                    self.kv_cache_transceiver.commit_blocks_for_reuse(req)
                 req.decoding_iter = 1
                 req.py_decoding_iter = 1
                 req.py_kv_transfer_start_time = None
