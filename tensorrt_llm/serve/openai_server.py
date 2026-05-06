@@ -506,6 +506,8 @@ class OpenAIServer:
         if raw_request is None:
             return
         while not await raw_request.is_disconnected():
+            if promise.finished:
+                return
             await asyncio.sleep(1)
         if not promise.finished:
             promise.abort()
