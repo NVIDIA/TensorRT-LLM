@@ -11,7 +11,7 @@ for the overall CBTS architecture.
 | `waives_rule.py` | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `tests_def_rule.py` | `TestsDefRule` | `testdefonly` | `tests/**/*.py` |
 | `test_list_rule.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
-| `out_of_scope_rule.py` | `OutOfScopeRule` | `noop` | `tests/integration/test_lists/qa/**` |
+| `out_of_scope_rule.py` | `OutOfScopeRule` | `noop` | `tests/integration/test_lists/qa/**`, `tests/**/*.md` |
 
 ## WaivesRule
 
@@ -88,9 +88,14 @@ Outcomes:
 
 ## OutOfScopeRule
 
-Pure pattern match. Any changed file under `tests/integration/test_lists/qa/`
-is claimed and contributes nothing (`scope=noop`). The QA test lists
-aren't consumed by pre-merge CI, so changes there can't affect what runs.
+Pure pattern match. Claims a changed file as `scope=noop` when:
+
+- it lives under `tests/integration/test_lists/qa/` (QA test lists, run by
+  post-merge / nightly QA workflows), or
+- it lives under `tests/` and has the `.md` suffix (Markdown docs).
+
+`OUT_OF_SCOPE_PREFIXES` and `OUT_OF_SCOPE_TESTS_SUFFIXES` in
+`out_of_scope_rule.py` list the patterns.
 
 ## Helpers (`_helpers.py`)
 

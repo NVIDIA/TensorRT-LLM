@@ -32,6 +32,17 @@ from .base import PRInputs, Rule, RuleResult
 #   nightly QA workflows.
 OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = ("tests/integration/test_lists/qa/",)
 
+# Path suffixes (extensions) under tests/ with no test-execution impact.
+OUT_OF_SCOPE_TESTS_SUFFIXES: tuple[str, ...] = (".md",)
+
+
+def _is_out_of_scope(path: str) -> bool:
+    if any(path.startswith(p) for p in OUT_OF_SCOPE_PREFIXES):
+        return True
+    if path.startswith("tests/") and path.endswith(OUT_OF_SCOPE_TESTS_SUFFIXES):
+        return True
+    return False
+
 
 class OutOfScopeRule(Rule):
     name = "outofscope"
@@ -42,9 +53,7 @@ class OutOfScopeRule(Rule):
         self.yaml_index = yaml_index
 
     def apply(self, pr: PRInputs) -> Optional[RuleResult]:
-        claimed = {
-            f for f in pr.changed_files if any(f.startswith(p) for p in OUT_OF_SCOPE_PREFIXES)
-        }
+        claimed = {f for f in pr.changed_files if _is_out_of_scope(f)}
         if not claimed:
             return None
         return RuleResult(
@@ -53,5 +62,5 @@ class OutOfScopeRule(Rule):
             scope="noop",
             sanity_relevant=False,
             perfsanity_relevant=False,
-            reason=f"outofscope: {len(claimed)} file(s) match no-pre-merge-impact prefix",
+            reason=f"outofscope: {len(claimed)} file(s) match no-pre-merge-impact pattern",
         )
