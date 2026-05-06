@@ -3084,7 +3084,7 @@ class PyExecutor:
         return
 
     @nvtx_range("_check_kv_transfer_timeout")
-    def _check_kv_transfer_timeout(self) -> None:
+    def _check_kv_transfer_timeout(self):
         if not self.kv_cache_transceiver:
             return
         timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
@@ -3391,28 +3391,17 @@ class PyExecutor:
                 f"Error in kv cache transfer for {error_msg_prefix}",
                 requests=error_requests)
 
-    def _complete_context_transfer_with_error(self, request: LlmRequest,
-                                              error_msg: str) -> None:
-        request.py_kv_transfer_start_time = None
-        request.state = LlmRequestState.DISAGG_TRANS_ERROR
-        self.async_transfer_manager.end_transfer(request)
-        if request in self.active_requests:
-            self._handle_errors(error_msg=error_msg, requests=[request])
-
     @nvtx_range("_check_disagg_ctx_cache_transfer_status")
-    def _check_disagg_ctx_cache_transfer_status(self,
-                                                atLeastNum: int = 0) -> None:
+    def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):
         finished_requests, error_requests = self.kv_cache_transceiver.check_context_transfer_status(
             atLeastNum)
 
-        finished_req_ids = set(finished_requests)
-        error_req_ids = set(error_requests)
-        completed_req_ids = finished_req_ids | error_req_ids
+        completed_req_ids = set(finished_requests + error_requests)
 
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
         )
 
-        for request_id in finished_req_ids:
+        for request_id in completed_req_ids:
 
             if request_id not in requests_in_transfer:
                 logger.warning(
@@ -3421,24 +3410,7 @@ class PyExecutor:
 
             request = requests_in_transfer[request_id]
 
-            if request.py_kv_transfer_timed_out:
-                self._complete_context_transfer_with_error(
-                    request,
-                    f"Context KV cache transfer completed after timeout for request {request_id}"
-                )
-            else:
-                self._end_transfer_and_maybe_terminate(request)
-
-        for request_id in error_req_ids:
-            if request_id not in requests_in_transfer:
-                logger.warning(
-                    f"Request {request_id} not found in transfer manager")
-                continue
-
-            request = requests_in_transfer[request_id]
-            self._complete_context_transfer_with_error(
-                request,
-                f"Error in kv cache transfer for context request {request_id}")
+            self._end_transfer_and_maybe_terminate(request)
 
         # The set of requests in transfer may have changed since we terminated some requests.
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
@@ -3448,14 +3420,13 @@ class PyExecutor:
             request = requests_in_transfer[request_id]
             if request.py_kv_transfer_timed_out and request_id not in completed_req_ids:
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
-                # If cancel is successful, mark as transfer error so metrics and
-                # cleanup do not report this as a clean context completion.
-                # Otherwise, try at next iteration.
+                # If cancel is successful, mark as complete so it can be cleaned up
+                # Otherwise, try at next iteration
                 if is_cancelled:
-                    self._complete_context_transfer_with_error(
-                        request,
-                        f"Context KV cache transfer timed out for request {request_id}"
-                    )
+                    request.py_kv_transfer_start_time = None
+                    request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+
+                    self._end_transfer_and_maybe_terminate(request)
 
         self._check_cache_transfer_errors("context requests")
 

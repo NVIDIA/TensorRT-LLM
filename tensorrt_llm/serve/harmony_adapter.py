@@ -519,90 +519,6 @@ class HarmonyAdapter:
 
         return self.encoding.decode(tokens)
 
-    def _strip_harmony_stream_control_text(self, text: str) -> str:
-        """Strip Harmony framing tokens from best-effort streaming fallback text."""
-        if not text:
-            return ""
-        if not any(marker in text for marker in self._harmony_special_tokens):
-            return text
-
-        cleaned = text
-        for marker in self._harmony_special_tokens:
-            cleaned = cleaned.replace(marker, "\n")
-
-        # Remove Harmony header-only lines while preserving real content lines.
-        cleaned = re.sub(
-            r"(?m)^\s*(assistant|analysis|commentary|final|system|developer|user)(?:\s+to=[^\n]*)?\s*$\n?",
-            "", cleaned)
-        cleaned = re.sub(r"(?m)^\s*(json|code)\s*$\n?", "", cleaned)
-        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-        cleaned = cleaned.strip("\n")
-        if not cleaned.strip():
-            return ""
-        return cleaned
-
-    def _decode_streaming_fallback_text(self, request_id: str,
-                                        tokens: list[int]) -> str:
-        """Decode a failed streaming batch as visible text when Harmony parsing fails."""
-        try:
-            decoded_text = self._safe_decode_utf8(tokens)
-        except (HarmonyError, UnicodeDecodeError, ValueError) as decode_error:
-            logger.error(
-                f"Streaming: Failed to decode fallback text for request {request_id}: "
-                f"{type(decode_error).__name__}: {decode_error}")
-            logger.debug(
-                f"Problematic fallback streaming tokens for request {request_id}: {tokens}"
-            )
-            return ""
-
-        return self._strip_harmony_stream_control_text(decoded_text)
-
-    def _streaming_error_state_summary(
-            self, stream_state: HarmonyStreamState | None) -> dict[str, Any]:
-        """Return compact parser state for streaming parse-failure logs."""
-        if stream_state is None:
-            return {}
-
-        debug_info = stream_state.get_debug_info()
-        return {
-            "tokens_processed": debug_info.get("tokens_processed"),
-            "current_channel": debug_info.get("current_channel"),
-            "current_recipient": debug_info.get("current_recipient"),
-            "current_channel_state": debug_info.get("current_channel_state"),
-            "generated_channels": debug_info.get("generated_channels"),
-            "channel_started": debug_info.get("channel_started"),
-            "has_preamble_content": debug_info.get("has_preamble_content"),
-            "should_filter_tools": debug_info.get("should_filter_tools"),
-        }
-
-    def _handle_streaming_parse_error(
-            self, request_id: str, tokens: list[int],
-            available_tools: list[dict[str, Any]] | None,
-            tool_choice: str | None, parse_error: Exception,
-            stream_state: HarmonyStreamState | None) -> str:
-        """Log, decode, and reset parser state after a streaming Harmony parse error."""
-        token_sample = {
-            "count": len(tokens),
-            "first": tokens[:8],
-            "last": tokens[-8:],
-        }
-        fallback_text = self._decode_streaming_fallback_text(request_id, tokens)
-        logger.error(
-            f"Streaming: Failed to process token batch for request {request_id}: "
-            f"{type(parse_error).__name__}: {parse_error}; "
-            f"fallback_chars={len(fallback_text)}; "
-            f"token_sample={token_sample}; "
-            f"state={self._streaming_error_state_summary(stream_state)}")
-        logger.debug(
-            f"Problematic streaming tokens for request {request_id}: {tokens}")
-
-        # A StreamableParser can remain poisoned after a parse exception. Reset it so
-        # later batches still have a chance to parse normally.
-        self.cleanup_stream_state(request_id)
-        self.create_stream_state(request_id, available_tools, tool_choice)
-
-        return fallback_text
-
     def harmony_system_message(self,
                                reasoning_effort: ReasoningEffort | None = None,
                                system_instructions: list[str] = []) -> Message:
@@ -1460,17 +1376,14 @@ class HarmonyAdapter:
             deltas = stream_state.process_token_batch(tokens)
             # logger.info(">> GENERATED DELTAS: %s", deltas)
             return deltas
-        except (HarmonyError, UnicodeDecodeError, ValueError) as parse_error:
-            fallback_text = self._handle_streaming_parse_error(
-                request_id=request_id,
-                tokens=tokens,
-                available_tools=available_tools,
-                tool_choice=tool_choice,
-                parse_error=parse_error,
-                stream_state=stream_state)
-            if not fallback_text:
-                return []
-            return [{"content": fallback_text}]
+        except (HarmonyError, UnicodeDecodeError, ValueError):
+            logger.error(
+                f"Streaming: Failed to process token batch of {len(tokens)} tokens for request {request_id}"
+            )
+            logger.debug(f"Problematic streaming tokens: {tokens}")
+
+            # Return empty deltas to continue processing
+            return []
 
     def stateful_stream_harmony_tokens_to_openai_messages(
             self,
@@ -1500,20 +1413,13 @@ class HarmonyAdapter:
         try:
             messages = stream_state.process_token_batch_to_messages(tokens)
             return messages
-        except (HarmonyError, UnicodeDecodeError, ValueError) as parse_error:
-            fallback_text = self._handle_streaming_parse_error(
-                request_id=request_id,
-                tokens=tokens,
-                available_tools=available_tools,
-                tool_choice=tool_choice,
-                parse_error=parse_error,
-                stream_state=stream_state)
-            if not fallback_text:
-                return []
-            return [
-                Message.from_role_and_content(
-                    Role.ASSISTANT, fallback_text).with_channel("final")
-            ]
+        except (HarmonyError, UnicodeDecodeError, ValueError):
+            logger.error(
+                f"Streaming: Failed to process token batch of {len(tokens)} tokens for request {request_id}",
+            )
+            logger.debug(f"Problematic streaming tokens: {tokens}")
+
+            return []
 
     def create_openai_streaming_response(
             self,
