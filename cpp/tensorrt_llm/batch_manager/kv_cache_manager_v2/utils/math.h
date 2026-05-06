@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -69,6 +70,18 @@ template <typename T>
     T lo = a.first > b.first ? a.first : b.first;
     T hi = a.second < b.second ? a.second : b.second;
     return {lo, hi};
+}
+
+// Extract an attribute from the first element and assert (debug) all elements agree.
+// Mirrors Python's get_uniform_attribute(_utils.py:202).
+template <typename Range, typename Func>
+[[nodiscard]] auto getUniformAttribute(Range const& range, Func&& func) -> decltype(func(*range.begin()))
+{
+    auto it = range.begin();
+    assert(it != range.end());
+    auto result = func(*it);
+    assert(std::all_of(range.begin(), range.end(), [&](auto const& item) { return func(item) == result; }));
+    return result;
 }
 
 // ---------------------------------------------------------------------------

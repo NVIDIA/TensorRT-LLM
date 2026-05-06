@@ -183,8 +183,9 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
             mLifeCycleGrouping, static_cast<CacheLevel>(i), config.cacheTiers[i], config, slotCountList);
     }
 
-    assert(numPoolGroups()
-        == static_cast<int>(mLevels.empty() ? 0 : static_cast<size_t>(mLevels[0].storage->numPoolGroups())));
+    assert(mLevels.empty()
+        || numPoolGroups()
+            == getUniformAttribute(mLevels, [](auto const& lvl) { return lvl.storage->numPoolGroups(); }));
 }
 
 StorageManager::~StorageManager()
@@ -609,10 +610,9 @@ int StorageManager::getPoolGroupIndex(LifeCycleId lc) const
 
 int StorageManager::mNumPools(PoolGroupIndex pgIdx) const
 {
-    // All levels must agree on numPools per pool group.
     if (mLevels.empty())
         return 0;
-    return mLevels[0].storage->numPools(pgIdx);
+    return getUniformAttribute(mLevels, [pgIdx](auto const& lvl) { return lvl.storage->numPools(pgIdx); });
 }
 
 int StorageManager::numPools(PoolGroupIndex pgIdx) const

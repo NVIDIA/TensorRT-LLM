@@ -21,9 +21,6 @@
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 
-#include <algorithm>
-#include <cassert>
-#include <functional>
 #include <map>
 #include <unordered_map>
 #include <vector>
@@ -124,7 +121,7 @@ struct SlotDesc
 
     std::vector<size_t> slotSizeList() const
     {
-        return variants.at(0).slotSizeList();
+        return getUniformAttribute(variants, [](auto const& v) { return v.slotSizeList(); });
     }
 };
 
