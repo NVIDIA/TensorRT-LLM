@@ -276,6 +276,21 @@ def create_encoder_executor(
     )
 
 
+def log_memory_usage(stage: str):
+    GB = 1 << 30
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    end, total_gpu_memory = torch.cuda.mem_get_info()
+    total_used_bytes = total_gpu_memory - end
+    model_bytes = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+    logger.info(
+        f"Memory used at {stage} (inside torch) in memory usage profiling: {model_bytes / (GB):.2f} GiB"
+    )
+    logger.info(
+        f"Memory used at {stage} (outside torch) in memory usage profiling: {((total_used_bytes - model_bytes) if total_used_bytes > model_bytes else 0) / (GB):.2f} GiB"
+    )
+
+
 def create_py_executor(
     llm_args: TorchLlmArgs,
     checkpoint_dir: Optional[str] = None,
@@ -608,6 +623,17 @@ def create_py_executor(
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64
+            # Propagate the override back to kv_cache_config so any consumer
+            # that later reads llm_args.kv_cache_config.tokens_per_block sees
+            # the effective value. KvCacheConnectorScheduler subclasses
+            # (LMCache, Dynamo KVBM) are instantiated further down via
+            # scheduler_cls(llm_args) and size their block pools from
+            # llm_args.kv_cache_config.tokens_per_block. Without this the
+            # connector's block size desynced from the KVCacheManager's
+            # actual tokens_per_block (user-set or default 32 vs. FlashMLA's
+            # forced 64), producing a frozen cache_block_ids view to the
+            # connector and silently-corrupted decode KV (#13320).
+            kv_cache_config.tokens_per_block = tokens_per_block
             logger.info(
                 f"Change tokens_per_block to: {tokens_per_block} for using FlashMLA"
             )
@@ -824,6 +850,9 @@ def create_py_executor(
             skip_est=skip_est,
             is_disagg=is_disagg,
         )
+
+        if not skip_est:
+            log_memory_usage("after loading weights")
 
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
 

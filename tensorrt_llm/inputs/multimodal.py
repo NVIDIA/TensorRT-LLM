@@ -629,6 +629,14 @@ def apply_mm_hashes(
                 if isinstance(frame, torch.Tensor):
                     frame = frame.detach().cpu().contiguous()
                 hasher.update(serialize_item(frame))
+            # TODO(TRTLLM-12297): also fold metadata["audio_samples"] /
+            # metadata["audio_sample_rate"] into the hash when present.
+            # extract_audio=true makes audio affect token counts and
+            # embeddings (see modeling_nemotron_nano.py
+            # _expand_video_placeholders_in_token_ids and
+            # get_num_tokens_per_video), but two videos with identical
+            # frames and different audio currently share the same MM hash —
+            # KV-cache reuse can return stale audio-conditioned states.
         else:
             hasher.update(serialize_item(item))
 
@@ -783,10 +791,18 @@ def find_mm_token_lengths(
                     image=item, )
                 modality_token_lengths.append(num_tokens)
             elif modality == "video":
+                video_metadata = None
                 if isinstance(item, tensorrt_llm.inputs.utils.VideoData):
+                    video_metadata = item.metadata
                     item = item.frames
                 assert isinstance(item, list), "Video must be a list of frames"
                 call_kwargs = {"video": item}
+                if video_metadata is not None:
+                    # Used by per-model overrides that need to account for
+                    # video-derived auxiliary modalities (e.g. Nemotron Nano
+                    # adds <so_*> token slots when metadata carries
+                    # `audio_samples` from extract_audio=true).
+                    call_kwargs["video_metadata"] = video_metadata
                 if video_grid_thw_for_items is not None:
                     # TODO(TRTLLM-11951): Replace this Qwen-VL-specific
                     # metadata wiring with a generic per-item processed

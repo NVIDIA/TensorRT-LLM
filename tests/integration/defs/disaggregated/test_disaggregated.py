@@ -263,6 +263,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_cancel_stress_test_large.yaml",
         "llama31_8b_ucx":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b_ucx.yaml",
+        "mamba_conc_greater_than_mbs":
+        f"{test_configs_root}/disagg_config_mamba_conc_greater_than_mbs.yaml",
     }
 
     if test_desc not in config_map:
@@ -2474,3 +2476,40 @@ def test_disaggregated_cancel_large_context_requests_long(
                                   requests_per_burst=32,
                                   model_path=model_dir,
                                   cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(8)
+@skip_pre_blackwell
+@pytest.mark.parametrize("model_path",
+                         ['NVIDIA-Nemotron-3-Super-120B-A12B-FP8'])
+def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
+                                                   llm_venv, model_path,
+                                                   benchmark_root,
+                                                   shared_gpt_path):
+    model_dir = f"{llm_models_root()}/{model_path}"
+    setup_model_symlink(llm_venv, model_dir, model_path)
+
+    config_file = get_test_config("mamba_conc_greater_than_mbs",
+                                  disaggregated_example_root,
+                                  os.path.dirname(__file__))
+
+    env = llm_venv._new_env.copy()
+    # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
+    env["UCX_TLS"] = "^ib"
+    e2el, ttft = run_disaggregated_benchmark(
+        disaggregated_example_root,
+        config_file,
+        benchmark_root,
+        model_dir,
+        shared_gpt_path,
+        env=env,
+        num_prompts=40,
+        max_concurrency=4,
+        random_input_len=1024,
+        random_output_len=1024,
+        skip_warmup=True,
+        model_path=model_dir,
+        cwd=llm_venv.get_working_directory())
+    print(f"E2EL: {e2el} ms, TTFT: {ttft} ms")
+
+    assert e2el > 0 and ttft > 0
