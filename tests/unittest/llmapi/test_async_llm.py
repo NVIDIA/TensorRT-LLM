@@ -138,7 +138,6 @@ async def test_async_llm_placement_api(setup_ray_cluster, monkeypatch):
             remove_placement_group(pg)
 
 
-@pytest.mark.skip(reason="kv_cache_metrics.num_reused_blocks not yet supported under v2 KV cache")
 @pytest.mark.ray
 @pytest.mark.asyncio
 async def test_async_llm_reset_prefix_cache():

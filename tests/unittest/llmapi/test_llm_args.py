@@ -322,9 +322,11 @@ def test_KvCacheConfig_declaration():
                            event_buffer_max_size=0,
                            enable_partial_reuse=True,
                            copy_on_partial_reuse=True,
-                           attention_dp_events_gather_period_ms=10)
+                           attention_dp_events_gather_period_ms=10,
+                           enable_kv_cache_manager_v2_stats=False)
 
     pybind_config = config._to_pybind()
+    assert not config.enable_kv_cache_manager_v2_stats
     assert pybind_config.enable_block_reuse == True
     assert pybind_config.max_tokens == 1024
     assert pybind_config.max_attention_window == [1024, 1024, 1024]
