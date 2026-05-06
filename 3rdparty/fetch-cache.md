@@ -138,6 +138,49 @@ Submodules always route to `full/`. cmake `FetchContent` does not pass
 `--depth` to its `git submodule update --init` invocation, so submodule
 clones are non-shallow by construction.
 
+### LFS pool
+
+Each bare keeps a parallel LFS object pool at
+`<bare>/lfs/objects/<2>/<2>/<oid>`, mirroring git-LFS's own sharding
+layout. `git clone --reference` only shares git objects (alternates);
+LFS-managed payloads live in a separate content store that the smudge
+filter consults at checkout time, so a `--reference` clone alone still
+refetches every LFS object over the network. The pool exists to give
+sandboxed consumers a local content store they can graft onto their
+own `<gitdir>/lfs/objects/` without copying:
+
+```
+<consumer-gitdir>/.git/lfs/objects/<2>/<2>/<oid>
+   -> symlink to <bare>/lfs/objects/<2>/<2>/<oid>
+```
+
+`git lfs smudge` follows symlinks transparently, so a pre-clone
+symlink farm hands every checkout a pre-populated LFS store with
+zero per-byte cost. The pool is read-only from a consumer's
+perspective; new LFS objects go to the consumer's own writable
+storage and converge into the pool on the next writer-side update.
+
+Symlinks rather than hardlinks: a hardlink from
+`<bare>/lfs/objects/<oid>` into the consumer's gitdir requires both
+to share an `st_dev`, which sandboxed consumers commonly do not,
+and git-LFS's `CopyOrLinkFile` falls back to a full copy on EXDEV.
+Symlinks are device-agnostic.
+
+Writer-side maintenance: every `update --src` walks
+`<src_git>/lfs/objects/`, validates each `<oid>`-named file's
+SHA-256, hardlinks (or copies on EXDEV) into a sibling tempfile, and
+atomically renames into `<bare>/lfs/objects/<2>/<2>/<oid>`.
+Already-present oids are skipped — same SHA-256 implies same bytes,
+so re-ingest would only duplicate work.
+
+Pool location is per-bare on purpose. The bare's basename is already
+the cache key (chosen from src's `remote.origin.url`); reusing it for
+the LFS pool's parent means LFS objects inherit the same pool
+routing (shallow/full split) as the git objects they accompany. Same
+oid populated under two pools costs one extra copy per pool, which
+matches the disk-amplification accounting already accepted for the
+shallow/full split.
+
 ## Threat model
 
 ### Why this exists
@@ -165,15 +208,24 @@ user's cache entry.
   writer and the reader, never derived from src. Attacker-chosen content
   can only land under `$CACHE_DIR/shallow/` or `$CACHE_DIR/full/`; it
   cannot escape those two subdirectories.
+* SHA-256 collision resistance, as the LFS pool's content addressing.
+  Two writers landing the same `<oid>` from independent srcs are
+  guaranteed to land identical bytes, so the rename-overwrite race
+  collapses to a no-op. SHA-1DC (below) handles the same role for git
+  objects.
 
 **Untrusted (everything else):**
 
 * The entire `_deps/<name>-src` directory: contents, `.git/config`,
   `refs/`, `objects/`, hooks, and the presence/contents of
   `.git/shallow`.
+* `<src_git>/lfs/objects/<2>/<2>/<oid>` files and directory shape:
+  the filename's claim that the file's bytes hash to `<oid>`, the
+  shard layout, and whether any path component is a symlink.
 * The **cache key** (bare's basename). The writer takes it from src's
   `remote.origin.url`; attacker controls that value and therefore picks
-  which `<name>.git` the bare becomes.
+  which `<name>.git` the bare becomes — and, by extension, which bare's
+  LFS pool receives their objects.
 * Whether src is shallow or not. Attacker can plant or remove
   `.git/shallow` to steer which pool their content lands in.
 * The dep name handed to `FetchContent_MakeAvailable`. A change to
@@ -229,6 +281,21 @@ delete entries from the advertisement namespace without breaking
 legitimate anchors — `have/<sha>` survives and still makes upstream
 recognize the SHA.
 
+The LFS pool is append-only by the same construction:
+
+* Filename **equals** the SHA-256 of the file's contents → distinct
+  contents necessarily get distinct filenames; same content is
+  idempotent.
+* `_ingest_lfs_object` skips any oid already present and validates
+  SHA-256 of the staged tempfile *after* the link/copy, so the bytes
+  that get hashed are the bytes that land at the pool path.
+  `os.rename(tmp, dst)` is atomic on the same filesystem; under
+  SHA-256 collision resistance two racing writers necessarily stage
+  byte-identical content, so the silent overwrite that POSIX rename
+  performs is a no-op.
+* SHA-256 collision resistance prevents content forgery for a chosen
+  oid.
+
 **I3. Untrusted src does not trigger code execution in the update
 process.**
 
@@ -244,8 +311,14 @@ src:
   those refs are written into the standin's `packed-refs`.
 * `_update_submodules` discovers submodule git dirs by filesystem
   probing (`HEAD` + `objects/`), never via `git rev-parse`.
+* `_walk_src_lfs_objects` traverses `<src_git>/lfs/objects/` with
+  `os.scandir` and `is_dir(follow_symlinks=False)` /
+  `is_file(follow_symlinks=False)` at every level. A symlinked shard
+  dir or oid file is rejected before any I/O against its contents,
+  so an attacker-planted symlink cannot redirect `os.link` or `open`
+  out of the src tree.
 
-These three close the **static** config-loading surface.
+These four close the **static** config-loading surface.
 
 The remaining surface is `git fetch` over git's local transport, which
 forks `upload-pack` with `GIT_DIR=<src>/.git`. Upload-pack loads src's
@@ -313,6 +386,13 @@ and locks:
 * `git init --bare`, `git config`, and `git fetch` are each
   independently idempotent.
 
+LFS pool writes follow the same tmp+rename pattern (sequence and
+paths in [LFS pool](#lfs-pool)). Two writers racing on the same oid
+stage independent tempfiles; under SHA-256 collision resistance both
+stage byte-identical content, so the silent rename overwrite is
+content-preserving. Readers see either the complete file or no file,
+never a partial.
+
 We deliberately do **not** hold our own lock and do **not** `rmtree` a
 half-built bare on failure. Leaving a partial bare lets the next update
 resume; deleting it would race against a concurrent fetch writing into
@@ -328,6 +408,9 @@ choose the pool but cannot make a single code path write to both.
 Reader routing (`lookup_cache`): `ns.depth is not None` picks the pool.
 A shallow consumer reads only the shallow pool; a non-shallow consumer
 reads only the full pool.
+
+The LFS pool inherits the same split — its location is per-bare
+(see [LFS pool](#lfs-pool)), so no code path links across pools.
 
 Writer defense on the full pool:
 
@@ -378,11 +461,12 @@ point at a nonexistent object, and the code path that writes
 
 | Mechanism                                      | Role                              |
 | ---------------------------------------------- | --------------------------------- |
-| SHA-1DC                                        | Object hash collision resistance  |
+| SHA-1DC                                        | Git object hash collision resistance |
+| SHA-256                                        | LFS object hash collision resistance |
 | `transfer.fsckObjects` / `fetch.fsckObjects`   | Inbound object structural check   |
 | `update-ref <ref> <new> ""`                    | Atomic create-only CAS            |
 | `packed-refs.lock` + `<ref>.lock`              | Ref-write serialization           |
-| Tmp+rename on pack and loose objects           | Atomic object writes              |
+| Tmp+rename on pack, loose objects, and LFS pool | Atomic object writes             |
 
 ### Accepted residual risks (DoS, do not break correctness)
 
@@ -400,6 +484,20 @@ point at a nonexistent object, and the code path that writes
   racing between a fetch and its prune can see unvalidated
   `refs/fetch-cache/{heads,remotes,tags}/*` tips. Vacuous under
   current git; see I5 for the future-git scenario.
+* LFS size-cap bypass via TOCTOU on the src dentry. Between
+  `_ingest_lfs_object`'s `os.stat` and the subsequent link-or-copy,
+  an attacker can swap in a multi-TB file. On the hardlink path
+  there is no extra disk consumption (inodes are shared); on the
+  EXDEV-fallback copy path the writer copies the giant file before
+  the SHA-256 mismatch reject. Closing this would require fd-based
+  link/stat (`linkat` from an `O_NOFOLLOW` fd) on every ingest, a
+  cost we don't pay because the failure mode is bounded by external
+  disk quota.
+* Leaked `.lfs-tmp.<oid_prefix>.<random>` siblings under
+  `<bare>/lfs/objects/<2>/<2>/` after `SIGKILL` mid-ingest. Names
+  fail the OID regex, so neither the walker nor `git lfs smudge`
+  picks them up; safe to sweep out of band, same posture as
+  `.fc-standin-<random>`.
 
 ### Explicit non-goals
 

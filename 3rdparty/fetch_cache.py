@@ -28,9 +28,14 @@ Two ``update`` modes:
   completes (walks the dep's ``.git/modules/`` too).  Primary path.
 * ``--build-dir <path>`` — walks ``_deps/`` in bulk.  Manual repair
   or reseed from an existing build tree.
+
+Both modes also mirror src's git-LFS objects into the bare's LFS pool;
+see ``3rdparty/fetch-cache.md`` "LFS pool" for the design treatment.
 """
 
 import argparse
+import errno
+import hashlib
 import logging
 import os
 import re
@@ -71,6 +76,163 @@ def _run_git(args, **kwargs):
 def _apply_safety_config(bare_dir: str) -> None:
     for key, val in SAFETY_CONFIG.items():
         _run_git(["config", key, val], cwd=bare_dir)
+
+
+# ---------------------------------------------------------------------------
+# LFS pool helpers — see fetch-cache.md "LFS pool" for the design treatment
+# (layout, consumer pattern, why the pool exists separately from alternates).
+# ---------------------------------------------------------------------------
+
+_OID_RE = re.compile(r"^[0-9a-f]{64}$")
+_HEX2_RE = re.compile(r"^[0-9a-f]{2}$")
+# 16x headroom over real-world LFS payloads while still rejecting an
+# attacker-crafted src advertising a multi-TB "object".
+_LFS_MAX_SIZE = 64 * (1 << 30)
+_LFS_BUFSIZE = 1 << 20
+
+
+def _sha256_regular_file(path: str) -> str | None:
+    """Hex-encoded SHA-256 of *path*'s contents, or None on read error."""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fp:
+            while True:
+                chunk = fp.read(_LFS_BUFSIZE)
+                if not chunk:
+                    break
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def _walk_src_lfs_objects(src_git: str):
+    """Yield ``(oid, abs_path)`` for each plausible LFS object under
+    ``<src_git>/lfs/objects/``.
+
+    Pre-filtered to the LFS-standard ``<2>/<2>/<64-hex>`` layout; symlinks
+    are rejected at every level (I3).  SHA-256 verification still runs
+    per-file in :func:`_ingest_lfs_object`.
+    """
+    lfs_root = os.path.join(src_git, "lfs", "objects")
+    try:
+        s1_it = os.scandir(lfs_root)
+    except OSError:
+        return
+    with s1_it:
+        for s1 in s1_it:
+            if not _HEX2_RE.match(s1.name) or not s1.is_dir(follow_symlinks=False):
+                continue
+            try:
+                s2_it = os.scandir(s1.path)
+            except OSError:
+                continue
+            with s2_it:
+                for s2 in s2_it:
+                    if not _HEX2_RE.match(s2.name) or not s2.is_dir(follow_symlinks=False):
+                        continue
+                    try:
+                        f_it = os.scandir(s2.path)
+                    except OSError:
+                        continue
+                    with f_it:
+                        for f in f_it:
+                            oid = f.name
+                            if not _OID_RE.match(oid):
+                                continue
+                            if not oid.startswith(s1.name + s2.name):
+                                continue
+                            if not f.is_file(follow_symlinks=False):
+                                continue
+                            yield oid, f.path
+
+
+def _ingest_lfs_object(src_path: str, dst_path: str, oid: str) -> bool:
+    """Place src_path's contents at *dst_path* iff its SHA-256 matches *oid*.
+
+    Sequence: (1) hardlink src into a sibling tempfile, falling back to
+    copy on EXDEV; (2) re-hash the staged file and compare to *oid*; (3)
+    atomic rename into place (I2).
+
+    Hardlink first because LFS payloads are commonly hundreds of MB; on
+    same-FS deployments a link is constant-time, while a copy is
+    O(filesize).
+    """
+    dst_dir = os.path.dirname(dst_path)
+    os.makedirs(dst_dir, exist_ok=True)
+
+    try:
+        st = os.stat(src_path, follow_symlinks=False)
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        return False
+    if st.st_size > _LFS_MAX_SIZE:
+        logger.warning(
+            "lfs %s: %d bytes exceeds %d cap, skipping",
+            oid, st.st_size, _LFS_MAX_SIZE,
+        )
+        return False
+
+    fd, tmp_path = tempfile.mkstemp(prefix=f".lfs-tmp.{oid[:16]}.", dir=dst_dir)
+    os.close(fd)
+    # link(2) refuses an existing target.
+    os.unlink(tmp_path)
+    try:
+        try:
+            os.link(src_path, tmp_path)
+        except OSError as e:
+            if e.errno != errno.EXDEV:
+                logger.warning("lfs link %s: %s", oid, e)
+                return False
+            try:
+                with open(src_path, "rb") as src, open(tmp_path, "wb") as dst:
+                    shutil.copyfileobj(src, dst, _LFS_BUFSIZE)
+            except OSError as e:
+                logger.warning("lfs copy %s: %s", oid, e)
+                return False
+
+        actual = _sha256_regular_file(tmp_path)
+        if actual != oid:
+            logger.warning(
+                "lfs %s: content hashes to %s, dropping",
+                oid, actual,
+            )
+            return False
+
+        try:
+            os.rename(tmp_path, dst_path)
+        except OSError as e:
+            logger.warning("lfs rename %s: %s", oid, e)
+            return False
+        return True
+    finally:
+        # Success path already renamed tmp_path away; cleanup is a no-op
+        # there and a recovery on every error path.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _update_lfs_pool(src_git: str, bare: str) -> None:
+    """Mirror src's LFS objects into ``<bare>/lfs/objects/`` (I2)."""
+    pool = os.path.join(bare, "lfs", "objects")
+    ingested = skipped = failed = 0
+    for oid, src_path in _walk_src_lfs_objects(src_git):
+        dst_path = os.path.join(pool, oid[:2], oid[2:4], oid)
+        if os.path.isfile(dst_path):
+            skipped += 1
+            continue
+        if _ingest_lfs_object(src_path, dst_path, oid):
+            ingested += 1
+        else:
+            failed += 1
+    if ingested or failed:
+        logger.info(
+            "lfs pool: %d ingested, %d already cached, %d rejected -> %s",
+            ingested, skipped, failed, pool,
+        )
 
 
 _SECTION_RE = re.compile(r'^\[\s*([^"\]\s]+)(?:\s+"([^"]*)")?\s*\]\s*$')
@@ -255,6 +417,27 @@ def _prune_disconnected_fetch_refs(bare: str, verified: set[str]) -> None:
             _run_git(["update-ref", "-d", refname, sha], cwd=bare)
 
 
+def _src_has_no_own_objects(src_git: str) -> bool:
+    """Return True iff src has no objects of its own — ``objects/``
+    holds nothing but at most an ``info/alternates`` pointer.
+
+    Pure FS probe (I3).  Conservative by design: any file under
+    ``objects/`` other than ``info/alternates`` (a pack, a loose
+    object, a ``commit-graph``, anything) makes this return False and
+    the caller falls back to the regular standin fetch.  We don't try
+    to decide whether such a file is content the bare already has —
+    the slow path is itself a safe no-op when content is genuinely
+    cached, so over-bailing costs us at most one redundant fetch.
+    """
+    objects_dir = os.path.join(src_git, "objects")
+    alt_path = os.path.join(objects_dir, "info", "alternates")
+    for dirpath, _, filenames in os.walk(objects_dir):
+        for fn in filenames:
+            if os.path.join(dirpath, fn) != alt_path:
+                return False
+    return True
+
+
 def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
     """Create or update a bare cache repo from untrusted *src_dir*.
 
@@ -286,8 +469,35 @@ def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
     shallow = _src_is_shallow(src_git)
     subdir = "shallow" if shallow else "full"
     bare_parent = os.path.join(cache_dir, subdir)
-    os.makedirs(bare_parent, exist_ok=True)
     bare = os.path.join(bare_parent, f"{name}.git")
+
+    # Up-to-date short-circuit.  When src has no objects of its own,
+    # the regular update would fetch zero git bytes — there is simply
+    # nothing for src to contribute to the git side.  Skip the entire
+    # standin / fetch / replicate / safety-config pass.  SAFETY_CONFIG
+    # only affects fetch-time behavior (fsck on inbound objects, gc
+    # disabled), and we are doing neither; any newly-added safety key
+    # gets picked up the next time real content arrives (slow path).
+    # Missing refs/fetch-cache/have/ anchors likewise stay missing.
+    # ``clone --reference`` walks the alternate's refs via
+    # ``for_each_alternate_ref`` and folds each ref's SHA into the
+    # negotiation as a "have" advertisement, so a missing anchor
+    # only loses the corresponding have-line and costs a few extra
+    # bytes on the next clone.  The objects themselves are in the
+    # alternate's ``objects/`` regardless, so correctness is
+    # unchanged; the next real update fills the anchors in.  LFS
+    # objects are orthogonal: a consumer that ran ``git lfs pull``
+    # after a ``--reference`` clone has no own git objects but may
+    # carry new LFS payloads, so the LFS pool walk runs on this
+    # path too.  Cold caches (no HEAD yet) bypass this branch and
+    # fall through below.
+    if (os.path.isfile(os.path.join(bare, "HEAD"))
+            and _src_has_no_own_objects(src_git)):
+        _update_lfs_pool(src_git, bare)
+        logger.info("up-to-date %s/%s.git <- %s", subdir, name, src_dir)
+        return bare
+
+    os.makedirs(bare_parent, exist_ok=True)
 
     if not os.path.isfile(os.path.join(bare, "HEAD")):
         r = _run_git(["init", "--bare", bare])
@@ -313,6 +523,7 @@ def _ensure_cache(src_dir: str, cache_dir: str) -> str | None:
         verified = _existing_have_shas(bare)
         _prune_disconnected_fetch_refs(bare, verified)
         _replicate_src_refs_checked(src_git, bare, verified)
+    _update_lfs_pool(src_git, bare)
     logger.info("updated %s/%s.git <- %s", subdir, name, src_dir)
     return bare
 
