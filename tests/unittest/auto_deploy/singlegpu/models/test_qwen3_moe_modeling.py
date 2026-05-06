@@ -225,7 +225,9 @@ def test_qwen3_moe_attention_equivalence(B, S, dtype):
     # Compute custom position embeddings (pre-sliced by position_ids)
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
     custom_rotary = Qwen3MoeRotaryEmbedding(
-        head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
+        head_dim,
+        max_position_embeddings=config.max_position_embeddings,
+        base=config.rope_parameters["rope_theta"],
     )
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)
@@ -331,7 +333,9 @@ def test_qwen3_moe_decoder_layer_equivalence(B, S, dtype):
     # Compute custom position embeddings (pre-sliced by position_ids)
     head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
     custom_rotary = Qwen3MoeRotaryEmbedding(
-        head_dim, max_position_embeddings=config.max_position_embeddings, base=config.rope_theta
+        head_dim,
+        max_position_embeddings=config.max_position_embeddings,
+        base=config.rope_parameters["rope_theta"],
     )
     custom_rotary.to(device=device, dtype=dtype)
     custom_cos, custom_sin = custom_rotary(x, position_ids)
