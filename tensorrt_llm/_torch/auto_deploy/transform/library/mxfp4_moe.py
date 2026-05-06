@@ -330,3 +330,238 @@ class InsertMXFP4MLP(BaseTransform):
             has_valid_shapes=num_matches == 0,
         )
         return gm, info
+
+
+# ============================================================================
+# Step-3: rewrite triton_mxfp4_moe -> trtllm_mxfp4_w4a16_moe_fused (V4)
+# ============================================================================
+#
+# Runs in `post_load_fusion` stage (after weights are loaded). Picks up the
+# MXFP4 params that quantize_mxfp4_moe registered, runs the trtllm-gen
+# weight prep (pad + shuffle), registers prepared params on the experts
+# module, and replaces the triton_mxfp4_moe call with the new op that
+# dispatches to torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner.
+#
+# Step-3 scope: supports the non-EP triton_mxfp4_moe path only (tp_size=1).
+# triton_mxfp4_moe_ep is left untouched -- TP for the new op arrives in
+# step 5 alongside MXFP4TRTLLMGenSharding.
+
+
+_GPTOSS_GLU_ALPHA: float = 1.702
+_GPTOSS_GLU_BETA: float = 1.0
+_GPTOSS_GLU_LIMIT: float = 7.0
+
+
+def _make_swiglu_param(
+    num_local_experts: int, value: float, *, dtype=torch.float32
+) -> nn.Parameter:
+    return nn.Parameter(
+        torch.full((num_local_experts,), value, dtype=dtype),
+        requires_grad=False,
+    )
+
+
+def _delete_module_attr(module: nn.Module, name: str) -> None:
+    """Remove a parameter/buffer/attr from a Module if present."""
+    if name in module._parameters:
+        del module._parameters[name]
+    elif name in module._buffers:
+        del module._buffers[name]
+    elif hasattr(module, name):
+        delattr(module, name)
+
+
+@TransformRegistry.register("quantize_mxfp4_moe_trtllm_gen")
+class QuantizeMXFP4MoETrtllmGen(BaseTransform):
+    """Replace ``triton_mxfp4_moe`` with the trtllm-gen ``w4a16_mxfp4`` op.
+
+    Mirrors the ``W4A16MXFP4TRTLLMGenFusedMoEMethod`` path PT uses for
+    gpt-oss-120b on B200 by default. Requires that ``quantize_mxfp4_moe``
+    has already run (so the MXFP4 ``_blocks``/``_scales``/``_bias`` params
+    exist) and that weights have been loaded.
+
+    Only handles the EP=1 path (``triton_mxfp4_moe`` without ``_ep``).
+    """
+
+    algo_name: str = "mxfp4"
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm,
+        factory,
+        shared_config,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        qcfg = factory.get_quant_config()
+        if not qcfg or qcfg.get("quant_method", "") != self.algo_name:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        # Local import: weight-prep helper from step 2.
+        from ...custom_ops.fused_moe.mxfp4_weight_prep import prepare_mxfp4_weights_for_trtllm_gen
+
+        num_matches = 0
+
+        for n in list(gm.graph.nodes):
+            if not is_op(n, torch.ops.auto_deploy.triton_mxfp4_moe):
+                continue
+            # Step-3 V4 scope: skip the EP variant (covered by step 5).
+            if is_op(n, torch.ops.auto_deploy.triton_mxfp4_moe_ep):
+                continue
+
+            # triton_mxfp4_moe(
+            #   hidden, router_w, router_b, top_k,
+            #   gate_up_blocks, gate_up_bias, gate_up_scales,
+            #   alpha, limit,
+            #   down_blocks, down_bias, down_scales,
+            #   layer_type="moe")
+            args = n.args
+            if len(args) < 12:
+                continue
+            (
+                hidden_node,
+                router_w_node,
+                router_b_node,
+                top_k_arg,
+                gu_blocks_node,
+                gu_bias_node,
+                gu_scales_node,
+                _alpha,
+                _limit,
+                dn_blocks_node,
+                dn_bias_node,
+                dn_scales_node,
+            ) = args[:12]
+
+            # Resolve param names
+            for nm, nd in [
+                ("gu_blocks", gu_blocks_node),
+                ("gu_bias", gu_bias_node),
+                ("gu_scales", gu_scales_node),
+                ("dn_blocks", dn_blocks_node),
+                ("dn_bias", dn_bias_node),
+                ("dn_scales", dn_scales_node),
+            ]:
+                if not isinstance(nd, Node) or nd.op != "get_attr":
+                    raise ValueError(f"Expected {nm} arg to be a get_attr node, got {nd!r}")
+
+            # Fetch loaded tensors and run the prep
+            gu_blocks_t = gm.get_parameter(gu_blocks_node.target)
+            gu_bias_t = gm.get_parameter(gu_bias_node.target)
+            gu_scales_t = gm.get_parameter(gu_scales_node.target)
+            dn_blocks_t = gm.get_parameter(dn_blocks_node.target)
+            dn_bias_t = gm.get_parameter(dn_bias_node.target)
+            dn_scales_t = gm.get_parameter(dn_scales_node.target)
+
+            # Infer hidden / intermediate from down: [E, H, I/32, 16] or [E, H, I/2]
+            hidden_size = int(dn_blocks_t.shape[1])
+            two_i = int(gu_blocks_t.shape[1])
+            intermediate_size = two_i // 2
+
+            prep = prepare_mxfp4_weights_for_trtllm_gen(
+                gu_blocks_t,
+                gu_scales_t,
+                gu_bias_t,
+                dn_blocks_t,
+                dn_scales_t,
+                dn_bias_t,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                tp_size=1,
+            )
+
+            # Locate the experts module that owned the original MXFP4 params,
+            # so we can register the new ones in the same place.
+            experts_mod, experts_path, _ = get_submodule_of_param(gm, gu_blocks_node.target)
+            num_local_experts = int(prep.fc1_weights_mxfp4.shape[0])
+
+            new_param_specs = [
+                ("fc1_w_trtllm_gen", prep.fc1_weights_mxfp4),
+                ("fc2_w_trtllm_gen", prep.fc2_weights_mxfp4),
+                ("fc1_w_scale_trtllm_gen", prep.fc1_weights_scale_ue8m0),
+                ("fc2_w_scale_trtllm_gen", prep.fc2_weights_scale_ue8m0),
+                ("fc1_bias_trtllm_gen", prep.fc1_bias_f32),
+                ("fc2_bias_trtllm_gen", prep.fc2_bias_f32),
+            ]
+            new_attr_paths = []
+            for short, tensor in new_param_specs:
+                experts_mod.register_parameter(
+                    short, nn.Parameter(tensor.contiguous(), requires_grad=False)
+                )
+                new_attr_paths.append((experts_path + "." if experts_path else "") + short)
+
+            sa_short, sb_short, sl_short = (
+                "swiglu_alpha_trtllm_gen",
+                "swiglu_beta_trtllm_gen",
+                "swiglu_limit_trtllm_gen",
+            )
+            experts_mod.register_parameter(
+                sa_short, _make_swiglu_param(num_local_experts, _GPTOSS_GLU_ALPHA)
+            )
+            experts_mod.register_parameter(
+                sb_short, _make_swiglu_param(num_local_experts, _GPTOSS_GLU_BETA)
+            )
+            experts_mod.register_parameter(
+                sl_short, _make_swiglu_param(num_local_experts, _GPTOSS_GLU_LIMIT)
+            )
+            sa_path = (experts_path + "." if experts_path else "") + sa_short
+            sb_path = (experts_path + "." if experts_path else "") + sb_short
+            sl_path = (experts_path + "." if experts_path else "") + sl_short
+
+            # Build get_attr nodes for the new params.
+            with gm.graph.inserting_before(n):
+                attr_nodes = [gm.graph.create_node("get_attr", p) for p in new_attr_paths]
+                sa_node = gm.graph.create_node("get_attr", sa_path)
+                sb_node = gm.graph.create_node("get_attr", sb_path)
+                sl_node = gm.graph.create_node("get_attr", sl_path)
+            (fc1_w_n, fc2_w_n, fc1_s_n, fc2_s_n, fc1_b_n, fc2_b_n) = attr_nodes
+
+            # Rewrite the op call.
+            n.target = torch.ops.auto_deploy.trtllm_mxfp4_w4a16_moe_fused.default
+            n.kwargs = {}
+            n.args = (
+                hidden_node,
+                router_w_node,
+                router_b_node,
+                int(top_k_arg),
+                fc1_w_n,
+                fc2_w_n,
+                fc1_s_n,
+                fc2_s_n,
+                fc1_b_n,
+                fc2_b_n,
+                sa_node,
+                sb_node,
+                sl_node,
+                int(prep.valid_hidden_size),
+                int(prep.valid_intermediate_size),
+                0,  # local_expert_offset
+                num_local_experts,
+                1,  # routing_method_type = RoutingMethodType.Renormalize
+            )
+
+            # Free original MXFP4 params + erase their get_attr nodes.
+            for old_node in [
+                gu_blocks_node,
+                gu_bias_node,
+                gu_scales_node,
+                dn_blocks_node,
+                dn_bias_node,
+                dn_scales_node,
+            ]:
+                old_name = old_node.target
+                owner_mod, _path, attr_short = get_submodule_of_param(gm, old_name)
+                _delete_module_attr(owner_mod, attr_short)
+                if len(old_node.users) == 0:
+                    gm.graph.erase_node(old_node)
+
+            num_matches += 1
+
+        info = TransformInfo(
+            skipped=(num_matches == 0),
+            num_matches=num_matches,
+            is_clean=num_matches == 0,
+            has_valid_shapes=num_matches == 0,
+        )
+        return gm, info
