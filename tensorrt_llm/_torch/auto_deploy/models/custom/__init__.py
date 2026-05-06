@@ -9,18 +9,27 @@ _logger = logging.getLogger(__name__)
 # other models from loading in standalone mode.
 _MODEL_MODULES = {
     "modeling_deepseek": ["DeepSeekV3ForCausalLM"],
+    "modeling_deepseek_v2": ["DeepSeekV2ForCausalLM"],
+    "modeling_exaone": ["ExaoneForCausalLM"],
     "modeling_gemma3n": ["Gemma3nForCausalLM", "Gemma3nForConditionalGeneration"],
     "modeling_gemma4": ["Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"],
     "modeling_glm4_moe_lite": ["Glm4MoeLiteForCausalLM"],
     "modeling_gpt_oss": ["GptOssForCausalLM"],
+    "modeling_granite_moe_hybrid": ["GraniteMoeHybridForCausalLM"],
+    "modeling_hunyuan_dense": ["HunYuanDenseForCausalLM"],
+    "modeling_internlm3": ["InternLM3ForCausalLM"],
     "modeling_kimi_k2": ["KimiK2ForCausalLM", "KimiK25ForConditionalGeneration"],
+    "modeling_llama3": ["Llama3ForCausalLM"],
     "modeling_llama4": ["Llama4ForCausalLM", "Llama4ForConditionalGeneration"],
     "modeling_minimax_m2": ["MiniMaxM2ForCausalLM"],
     "modeling_mistral3": ["Mistral3ForConditionalGenerationAD", "Mistral4ForCausalLM"],
     "modeling_nemotron_flash": ["NemotronFlashForCausalLM", "NemotronFlashPreTrainedTokenizerFast"],
     "modeling_nemotron_h": ["NemotronHForCausalLM"],
+    "modeling_olmo3": ["Olmo3ForCausalLM"],
+    "modeling_openelm": ["OpenELMForCausalLM"],
     "modeling_qwen3_5_moe": ["Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration"],
     "modeling_qwen3_moe": ["Qwen3MoeForCausalLM"],
+    "modeling_smollm3": ["SmolLM3ForCausalLM"],
     "modeling_starcoder2": ["Starcoder2ForCausalLM"],
 }
 

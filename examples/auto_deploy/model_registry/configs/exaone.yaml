@@ -1,0 +1,14 @@
+# Configuration for EXAONE 3.5 models
+# The HF checkpoint bundles a configuration_exaone.py that imports RopeParameters
+# from transformers, which is unavailable in some transformers versions. Setting
+# trust_remote_code: false forces use of our bundled ExaoneConfig (registered via
+# AutoConfig.register in modeling_exaone.py).
+# The EXAONE checkpoint defaults to float32; force bfloat16 for AD kernels.
+# model_kwargs.dtype ensures _from_config initializes the model with bfloat16
+# weights so that torch.export traces the graph with bfloat16 meta tensors.
+# Without this, flashinfer_rms_norm fails to dispatch (it only supports fp16/bf16).
+
+trust_remote_code: false
+dtype: bfloat16
+model_kwargs:
+  dtype: bfloat16
