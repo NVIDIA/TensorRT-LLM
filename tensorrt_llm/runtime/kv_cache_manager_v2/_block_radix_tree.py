@@ -51,16 +51,15 @@ class ReuseScope(NamedTuple):
 
 
 # id_offset is usually vocab_size
-def gen_multi_modal_tokens(
+def gen_multimodal_cache_key_tokens(
     id_offset: int, multi_modal_data_digest: bytes, num_tokens: int, token_offset: int = 0
 ) -> list[TokenIdExt]:
+    """Create synthetic tokens used only when building multimodal KV-cache keys.
+
+    Item-local token 0 carries the content digest; later offsets use deterministic IDs above the vocab.
+    """
     assert num_tokens > 0
     assert token_offset >= 0
-    # Alternatively, we could also use (multi_modal_data_digest + i.to_bytes(8, 'little')) or its hash
-    # digest as token id.
-    # The implementation below is faster and also works because KV cache reuse of a token is with a
-    # precondition that all previous tokens also match. So only the first multi-modal token id needs to
-    # be unique.
     return [
         multi_modal_data_digest if token_offset + i == 0 else TokenId(id_offset + token_offset + i)
         for i in range(num_tokens)

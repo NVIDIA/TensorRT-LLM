@@ -148,7 +148,7 @@ class KVCacheManagerConfig:
     enable_swa_scratch_reuse: bool = False
 
 # From _block_radix_tree.py
-def gen_multi_modal_tokens(
+def gen_multimodal_cache_key_tokens(
     id_offset: int,
     multi_modal_data_digest: bytes,
     num_tokens: int,

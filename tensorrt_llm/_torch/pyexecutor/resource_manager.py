@@ -38,7 +38,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import \
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, TokenIdExt,
                                                       _KVCache)
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
-    gen_multi_modal_tokens
+    gen_multimodal_cache_key_tokens
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import (BAD_PAGE_INDEX,
                                                               GPU_LEVEL)
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
@@ -181,10 +181,8 @@ def _augment_tokens_with_mm_run_metadata(vocab_size: int,
                                                        lengths.tolist(),
                                                        strict=True):
             result[result_offset:result_offset +
-                   length] = gen_multi_modal_tokens(vocab_size,
-                                                    digest,
-                                                    length,
-                                                    token_offset=token_offset)
+                   length] = gen_multimodal_cache_key_tokens(
+                       vocab_size, digest, length, token_offset=token_offset)
 
     return result
 
@@ -213,7 +211,7 @@ def _augment_tokens_with_contiguous_mm_metadata(
         result_offset = overlap_start - start
         overlap_length = overlap_end - overlap_start
         result[result_offset:result_offset +
-               overlap_length] = gen_multi_modal_tokens(
+               overlap_length] = gen_multimodal_cache_key_tokens(
                    vocab_size,
                    _hash_to_digest(multimodal_hashes[item_idx]),
                    overlap_length,
@@ -2735,9 +2733,9 @@ class KVCacheManagerV2(BaseResourceManager):
         Multimodal placeholder tokens (e.g. image_token_id) share the same ID
         regardless of the underlying content. This method replaces each
         multimodal token region with TokenIdExt values produced by
-        gen_multi_modal_tokens(), embedding the content digest (Blake3 hash)
-        into the token sequence so that the radix tree can distinguish blocks
-        belonging to different images/videos.
+        gen_multimodal_cache_key_tokens(), embedding the content digest
+        (Blake3 hash) into the token sequence so that the radix tree can
+        distinguish blocks belonging to different images/videos.
 
         When *start*/*end* are given, only the slice ``tokens[start:end]`` is
         materialized and returned. This avoids re-augmenting the full prompt
