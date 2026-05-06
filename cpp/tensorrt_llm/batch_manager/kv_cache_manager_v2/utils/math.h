@@ -96,15 +96,20 @@ template <typename Iter, typename Pred>
 }
 
 // Steal items matching predicate from the container and return them (stable).
-// Mirrors Python's remove_if(_utils.py:174).
+// Single-pass O(n), mirrors Python's remove_if(_utils.py:174).
 template <typename T, typename Pred>
 std::vector<T> stealIf(std::vector<T>& original, Pred pred)
 {
     std::vector<T> removed;
-    auto it = std::stable_partition(original.begin(), original.end(), [&](T const& item) { return !pred(item); });
-    for (auto jt = it; jt != original.end(); ++jt)
-        removed.push_back(std::move(*jt));
-    original.erase(it, original.end());
+    size_t writeIdx = 0;
+    for (size_t i = 0; i < original.size(); ++i)
+    {
+        if (pred(original[i]))
+            removed.push_back(std::move(original[i]));
+        else
+            original[writeIdx++] = std::move(original[i]);
+    }
+    original.erase(original.begin() + static_cast<ptrdiff_t>(writeIdx), original.end());
     return removed;
 }
 
