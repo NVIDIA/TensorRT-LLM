@@ -61,19 +61,39 @@ class WaivesRule(Rule):
         changed_test_ids = added | removed
 
         if not changed_test_ids:
+            # Whitespace / comment-only diff -> no test selection impact.
             return RuleResult(
                 handled_files={WAIVES_FILE},
                 affected_stages=set(),
-                scope="waiveonly",
+                scope="noop",
+                sanity_relevant=False,
+                perfsanity_relevant=False,
                 reason="waives.txt: no actionable test ids in diff",
             )
 
         # Unmatchable waives (no YAML entry shares lineage) are pre-merge
         # no-ops: the test isn't in any pre-merge YAML test list, so
-        # adding/removing its SKIP doesn't affect what runs. Don't veto
-        # the whole PR via scope=None; just contribute the matched ids'
-        # narrow and let other rules (testdef / testlist) union normally.
+        # adding/removing its SKIP doesn't affect what runs.
         block_filters, misses = lookup_ids_into_block_filters(self.yaml_index, changed_test_ids)
+
+        if not block_filters:
+            # All waives unmatchable -> scope="noop" so other rules can
+            # union normally and pure-waives all-miss PRs pass through to
+            # Groovy as a no-op rather than tripping Selector's empty-
+            # stages safety net.
+            preview = ", ".join(sorted(misses)[:3])
+            more = f" (+{len(misses) - 3} more)" if len(misses) > 3 else ""
+            return RuleResult(
+                handled_files={WAIVES_FILE},
+                affected_stages=set(),
+                scope="noop",
+                sanity_relevant=False,
+                perfsanity_relevant=False,
+                reason=f"waives.txt: all {len(misses)} waive(s) unmatchable: {preview}{more}",
+            )
+
+        # Some matched -> normal narrow path; any unmatchable misses are
+        # ignored (they don't affect pre-merge) and noted in the reason.
         affected_stages = resolve_affected_stages(
             block_filters, self.yaml_index, self._stages_by_yaml
         )
