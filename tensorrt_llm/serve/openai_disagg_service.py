@@ -313,25 +313,14 @@ class OpenAIDisaggregatedService(OpenAIService):
     def _get_ctx_request(
         self, request: UCompletionRequest, disagg_request_id: Optional[int]
     ) -> UCompletionRequest:
-        if request.disaggregated_params is not None:
-            disaggregated_params = request.disaggregated_params.model_copy(
-                update={
-                    "request_type": "context_only",
-                    "disagg_request_id": disagg_request_id,
-                    "schedule_style": self._schedule_style,
-                    "conversation_id": self._get_conversation_id(request),
-                }
-            )
-        else:
-            disaggregated_params = DisaggregatedParams(
-                request_type="context_only",
-                disagg_request_id=disagg_request_id,
-                schedule_style=self._schedule_style,
-                conversation_id=self._get_conversation_id(request),
-            )
         ctx_request = request.model_copy(
             update={
-                "disaggregated_params": disaggregated_params,
+                "disaggregated_params": DisaggregatedParams(
+                    request_type="context_only",
+                    disagg_request_id=disagg_request_id,
+                    schedule_style=self._schedule_style,
+                    conversation_id=self._get_conversation_id(request),
+                ),
                 "stream": False,
                 "stream_options": None,
             }
