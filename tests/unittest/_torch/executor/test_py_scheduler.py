@@ -2177,6 +2177,31 @@ class TestPyCapacitySchedulerLora:
         # First task: 10 pages, second task: 10 pages, total 20 > 15
         assert len(fitting) == 1
 
+    def test_max_utilization_peft_page_accumulation(self):
+        """
+        MAX_UTILIZATION policy must accumulate scheduled PEFT pages across
+        requests so the per-batch page cap is enforced.
+
+        With max_pages=25 and 10 pages per new task:
+          req 0 (task 1): total =  0+10 = 10 <= 25 -> admit
+          req 1 (task 2): total = 10+10 = 20 <= 25 -> admit
+          req 2 (task 3): total = 20+10 = 30  > 25 -> reject
+        """
+        kv = MockKVCacheManager(num_free_blocks=100, blocks_per_request=5)
+        peft = MockPeftCacheManager(max_pages=25, pages_per_request=10)
+        scheduler = PyCapacityScheduler(
+            max_num_requests=4,
+            kv_cache_manager=kv,
+            peft_cache_manager=peft,
+            scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+        )
+        r0 = _make_request(0, lora_task_id=1)
+        r1 = _make_request(1, lora_task_id=2)
+        r2 = _make_request(2, lora_task_id=3)
+        fitting, _disagg, _paused = scheduler.schedule_request([r0, r1, r2])
+        # 2 tasks x 10 pages = 20 <= 25; 3rd task would push to 30 > 25
+        assert len(fitting) == 2
+
 
 # ############################################################################
 #

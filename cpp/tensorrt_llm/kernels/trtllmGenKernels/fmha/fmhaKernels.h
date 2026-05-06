@@ -213,6 +213,12 @@ public:
         }
     }
 
+    static bool shouldUseNvrtc(FmhaOptions const& options)
+    {
+        return options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration
+            && options.mDtypeKv != tg::Dtype::E2m1;
+    }
+
     std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const
     {
         // Some conditions to check if the kernel is supported.
@@ -259,6 +265,12 @@ public:
         // The number of CtasQ and CtasKv per sequence, Ctas in the Y dimension, and Ctas in the Z
         // dimension.
         computeNumCtas(options, params.mMultiProcessorCount);
+
+        if (shouldUseNvrtc(options))
+        {
+            // For the NVRTC path, we return supported as long as autotuner successfully selected a kernel config.
+            return std::make_pair(true, "NVRTC path is supported");
+        }
 
         // Check if a precompiled cubin exists for this configuration (same lookup as run()).
         // If not, return (false, info) so the dispatcher can fall back to unfused MHA like on main.
@@ -336,14 +348,8 @@ public:
 
         FmhaData fmhaData;
         setFmhaData(params, options, fmhaData);
-        bool isLlama70bFp4Tp4 = options.mHeadDimQk == 128 && options.mHeadDimV == 128
-            && options.mDtypeK == tg::Dtype::E4m3 && options.mNumHeadsQ == 16 && options.mNumHeadsQPerKv == 8;
 
-        bool shouldUseNvrtc = options.mFmhaKernelType == FmhaKernelType::SwapsMmaAbForGeneration && !options.mIsMlaGen
-            && options.mDtypeK != tg::Dtype::E2m1 && options.mHeadDimQk != 64 && !isLlama70bFp4Tp4
-            && !isTokenSparse(options.mSparseType);
-
-        if (shouldUseNvrtc)
+        if (shouldUseNvrtc(options))
         {
             // nvrtc path - uses mFmhaInterface member for kernel caching
             FmhaConfig fmhaConfig;

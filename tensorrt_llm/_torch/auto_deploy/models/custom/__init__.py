@@ -13,11 +13,14 @@ _MODEL_MODULES = {
     "modeling_gemma4": ["Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"],
     "modeling_glm4_moe_lite": ["Glm4MoeLiteForCausalLM"],
     "modeling_kimi_k2": ["KimiK2ForCausalLM", "KimiK25ForConditionalGeneration"],
+    "modeling_llama4": ["Llama4ForCausalLM", "Llama4ForConditionalGeneration"],
     "modeling_minimax_m2": ["MiniMaxM2ForCausalLM"],
     "modeling_mistral3": ["Mistral3ForConditionalGenerationAD", "Mistral4ForCausalLM"],
     "modeling_nemotron_flash": ["NemotronFlashForCausalLM", "NemotronFlashPreTrainedTokenizerFast"],
     "modeling_nemotron_h": ["NemotronHForCausalLM"],
     "modeling_qwen3_5_moe": ["Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration"],
+    "modeling_qwen3_moe": ["Qwen3MoeForCausalLM"],
+    "modeling_starcoder2": ["Starcoder2ForCausalLM"],
 }
 
 if os.environ.get("AD_USE_IR_MODELS"):
