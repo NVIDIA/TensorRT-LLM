@@ -263,6 +263,16 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
     def processor(self):
         return self._processor
 
+    def get_vocab_size(self) -> Optional[int]:
+        # Gemma4Config exposes vocab_size only on text_config; the base class
+        # default also calls tokenizer.vocab_size which raises
+        # NotImplementedError on transformers>=5.5 base PreTrainedTokenizerBase.
+        text_config = getattr(self._config, "text_config", self._config)
+        vocab_size = getattr(text_config, "vocab_size", None)
+        if vocab_size is not None:
+            return int(vocab_size)
+        return super().get_vocab_size()
+
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
