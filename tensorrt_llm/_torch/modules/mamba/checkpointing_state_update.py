@@ -1170,13 +1170,13 @@ def _checkpointing_main_kernel(
         out_all = out_all + x_all * D[None, :]
 
     if HAS_Z:
-        for t in range(T):
-            z_t = tl.load(
-                z_ptr + t * stride_z_T + offs_m * stride_z_dim, mask=m_mask, other=0.0
-            ).to(tl.float32)
-            out_t = tl.sum(tl.where((offs_t == t)[:, None], out_all, 0.0), axis=0)
-            out_t = out_t * z_t * tl.sigmoid(z_t)
-            tl.store(out_ptr + t * stride_out_T + offs_m * stride_out_dim, out_t, mask=m_mask)
+        z_all = tl.load(
+            z_ptr + offs_t[:, None] * stride_z_T + offs_m[None, :] * stride_z_dim,
+            mask=t_mask[:, None] & m_mask[None, :], other=0.0,
+        ).to(tl.float32)
+        out_all_z = out_all * z_all * tl.sigmoid(z_all)
+        out_all_ptrs = out_ptr + offs_t[:, None] * stride_out_T + offs_m[None, :] * stride_out_dim
+        tl.store(out_all_ptrs, out_all_z, mask=t_mask[:, None] & m_mask[None, :])
     else:
         out_all_ptrs = out_ptr + offs_t[:, None] * stride_out_T + offs_m[None, :] * stride_out_dim
         tl.store(out_all_ptrs, out_all, mask=t_mask[:, None] & m_mask[None, :])
@@ -1425,13 +1425,13 @@ def _rectangle_main_kernel(
         out_all = out_all + x_all * D[None, :]
 
     if HAS_Z:
-        for t in range(T):
-            z_t = tl.load(
-                z_ptr + t * stride_z_T + offs_m * stride_z_dim, mask=m_mask, other=0.0
-            ).to(tl.float32)
-            out_t = tl.sum(tl.where((offs_t == t)[:, None], out_all, 0.0), axis=0)
-            out_t = out_t * z_t * tl.sigmoid(z_t)
-            tl.store(out_ptr + t * stride_out_T + offs_m * stride_out_dim, out_t, mask=m_mask)
+        z_all = tl.load(
+            z_ptr + offs_t[:, None] * stride_z_T + offs_m[None, :] * stride_z_dim,
+            mask=t_mask[:, None] & m_mask[None, :], other=0.0,
+        ).to(tl.float32)
+        out_all_z = out_all * z_all * tl.sigmoid(z_all)
+        out_all_ptrs = out_ptr + offs_t[:, None] * stride_out_T + offs_m[None, :] * stride_out_dim
+        tl.store(out_all_ptrs, out_all_z, mask=t_mask[:, None] & m_mask[None, :])
     else:
         out_all_ptrs = out_ptr + offs_t[:, None] * stride_out_T + offs_m[None, :] * stride_out_dim
         tl.store(out_all_ptrs, out_all, mask=t_mask[:, None] & m_mask[None, :])
