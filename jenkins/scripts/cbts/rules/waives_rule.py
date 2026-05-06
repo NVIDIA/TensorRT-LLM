@@ -68,23 +68,22 @@ class WaivesRule(Rule):
                 reason="waives.txt: no actionable test ids in diff",
             )
 
-        # Any unmatchable waive id triggers fallback rather than silently
-        # dropping CI for a typo'd or out-of-tree id.
+        # Unmatchable waives (no YAML entry shares lineage) are pre-merge
+        # no-ops: the test isn't in any pre-merge YAML test list, so
+        # adding/removing its SKIP doesn't affect what runs. Don't veto
+        # the whole PR via scope=None; just contribute the matched ids'
+        # narrow and let other rules (testdef / testlist) union normally.
         block_filters, misses = lookup_ids_into_block_filters(self.yaml_index, changed_test_ids)
-        if misses:
-            preview = ", ".join(sorted(misses)[:3])
-            more = f" (+{len(misses) - 3} more)" if len(misses) > 3 else ""
-            return RuleResult(
-                handled_files={WAIVES_FILE},
-                affected_stages=set(),
-                scope=None,
-                reason=f"waives.txt: {len(misses)} unmatchable waive(s): {preview}{more}",
-            )
-
         affected_stages = resolve_affected_stages(
             block_filters, self.yaml_index, self._stages_by_yaml
         )
         sanity_relevant = any(stem == "l0_sanity_check" for stem, _ in block_filters)
+
+        miss_note = ""
+        if misses:
+            preview = ", ".join(sorted(misses)[:3])
+            more = f" (+{len(misses) - 3} more)" if len(misses) > 3 else ""
+            miss_note = f"; {len(misses)} unmatchable waive(s) ignored: {preview}{more}"
 
         return RuleResult(
             handled_files={WAIVES_FILE},
@@ -95,6 +94,6 @@ class WaivesRule(Rule):
             perfsanity_relevant=False,
             reason=(
                 f"waives.txt: +{len(added)} / -{len(removed)} → "
-                f"{len(block_filters)} blocks, {len(affected_stages)} stages"
+                f"{len(block_filters)} blocks, {len(affected_stages)} stages{miss_note}"
             ),
         )
