@@ -89,3 +89,5 @@ etcd-sdk-python==0.0.7
 python-multipart
 smg-grpc-proto>=0.4.2
 cache-dit>=1.3.5
+nltk==3.9.4
+better_profanity==0.7.0
