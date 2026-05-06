@@ -12,8 +12,8 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
-from tensorrt_llm.inputs.multimodal import (prepare_multimodal_item_runs,
-                                            to_binding_multimodal_item_runs)
+from tensorrt_llm.executor.utils import to_binding_multimodal_item_runs
+from tensorrt_llm.inputs.multimodal import prepare_multimodal_item_runs
 from tensorrt_llm.sampling_params import LogprobMode
 
 SamplingConfig = tensorrt_llm.bindings.SamplingConfig
@@ -674,24 +674,17 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_end_id = self.end_id
         self.py_prompt_len = self.prompt_len
         self.py_orig_prompt_len = self.orig_prompt_len
-        if prepared_multimodal_item_runs is None:
-            multimodal_item_runs = self.multimodal_item_runs
-            if multimodal_item_runs is not None:
-                prepared_multimodal_item_runs = prepare_multimodal_item_runs(
-                    self.multimodal_hashes,
-                    multimodal_item_runs,
-                    prompt_len=self.py_prompt_len)
-        if prepared_multimodal_item_runs is None:
-            self.multimodal_embedding_lengths = None
-            self.multimodal_prompt_lengths = None
-            self.multimodal_item_run_spans = None
-        else:
+        if prepared_multimodal_item_runs is not None:
             self.multimodal_embedding_lengths = (
                 prepared_multimodal_item_runs.multimodal_embedding_lengths)
             self.multimodal_prompt_lengths = (
                 prepared_multimodal_item_runs.multimodal_prompt_lengths)
             self.multimodal_item_run_spans = (
                 prepared_multimodal_item_runs.multimodal_item_run_spans)
+        else:
+            self.multimodal_embedding_lengths = None
+            self.multimodal_prompt_lengths = None
+            self.multimodal_item_run_spans = None
         self.py_max_new_tokens = self.max_new_tokens
         self.py_min_length = self.sampling_config.min_length
         # `seqlen_this_rank_cp`, `total_input_len_cp`, and `py_helix_is_inactive_rank` are relevant to helix parallelism.

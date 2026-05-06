@@ -18,7 +18,6 @@ from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
-from ..inputs.multimodal import to_binding_multimodal_item_runs
 from ..llmapi.llm_args import BaseLlmArgs, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
@@ -37,7 +36,7 @@ from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_logprobs)
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
-                    is_llm_response)
+                    is_llm_response, to_binding_multimodal_input)
 
 if TYPE_CHECKING:
     from ..disaggregated_params import DisaggregatedParams
@@ -426,11 +425,8 @@ class BaseWorker(GenerationExecutor):
         ):
             if request.multimodal_params.multimodal_input is not None:
                 py_multimodal_input = request.multimodal_params.multimodal_input
-                multimodal_input = tllm.MultimodalInput(
-                    multimodal_hashes=py_multimodal_input.multimodal_hashes,
-                    multimodal_uuids=py_multimodal_input.multimodal_uuids,
-                    multimodal_item_runs=to_binding_multimodal_item_runs(
-                        py_multimodal_input.multimodal_item_runs))
+                multimodal_input = to_binding_multimodal_input(
+                    py_multimodal_input)
             # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
             request.multimodal_params.multimodal_input = None
 

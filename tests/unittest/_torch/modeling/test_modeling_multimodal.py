@@ -385,7 +385,10 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
                 full_mask = torch.zeros(prompt_len, dtype=torch.bool)
                 covered_prompt_len = 0
                 for item_runs in mi.multimodal_item_runs:
-                    for pos, length, non_embed_offsets in item_runs:
+                    for run in item_runs:
+                        pos = run.prompt_start
+                        length = run.run_length
+                        non_embed_offsets = run.non_embed_offsets
                         covered_prompt_len += length
                         full_mask[pos : pos + length] = True
                         for offset in non_embed_offsets:

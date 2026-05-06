@@ -17,8 +17,14 @@ from tensorrt_llm.logger import logger
 # Default hasher
 default_hasher = blake3
 
-MultimodalItemRun = Tuple[
-    int, int, List[int]]  # (prompt_start, run_length, non_embed_offsets)
+
+@dataclass(frozen=True)
+class MultimodalItemRun:
+    prompt_start: int
+    run_length: int
+    non_embed_offsets: Tuple[int, ...] = ()
+
+
 MultimodalItemRuns = List[List[MultimodalItemRun]]
 
 
@@ -30,8 +36,9 @@ class PreparedMultimodalItemRuns:
     multimodal_item_run_spans: List[List[Tuple[int, int]]]
 
 
-def _unpack_item_run(run: Any, field_name: str, item_idx: int,
-                     run_idx: int) -> Tuple[Any, Any, Any]:
+def unpack_multimodal_item_run(run: Any, field_name: str, item_idx: int,
+                               run_idx: int) -> Tuple[Any, Any, Any]:
+    """Return a multimodal item-run tuple from dataclass or tuple-shaped input."""
     if all(
             hasattr(run, attr)
             for attr in ("prompt_start", "run_length", "non_embed_offsets")):
@@ -41,33 +48,6 @@ def _unpack_item_run(run: Any, field_name: str, item_idx: int,
     raise TypeError(f"{field_name}[{item_idx}][{run_idx}] must be a "
                     "MultimodalItemRun or "
                     "(prompt_start, run_length, non_embed_offsets) tuple")
-
-
-def to_binding_multimodal_item_runs(
-    runs_by_item: Optional[MultimodalItemRuns], ) -> Optional[List[List[Any]]]:
-    if runs_by_item is None:
-        return None
-
-    from tensorrt_llm.bindings import executor as tllm_executor
-
-    binding_run_type = tllm_executor.MultimodalItemRun
-    binding_runs = []
-    for item_idx, item_runs in enumerate(runs_by_item):
-        binding_item_runs = []
-        for run_idx, run in enumerate(item_runs):
-            if isinstance(run, binding_run_type):
-                binding_item_runs.append(run)
-                continue
-            prompt_start, run_length, non_embed_offsets = _unpack_item_run(
-                run, "multimodal_item_runs", item_idx, run_idx)
-            if non_embed_offsets is None:
-                non_embed_offsets = []
-            binding_item_runs.append(
-                binding_run_type(prompt_start=int(prompt_start),
-                                 run_length=int(run_length),
-                                 non_embed_offsets=list(non_embed_offsets)))
-        binding_runs.append(binding_item_runs)
-    return binding_runs
 
 
 def _validate_multimodal_hashes(mm_hashes: List[List[int]]) -> None:
@@ -117,8 +97,8 @@ def prepare_multimodal_item_runs(
         item_spans: List[Tuple[int, int]] = []
         previous_end: Optional[int] = None
         for run_idx, run in enumerate(item_runs):
-            prompt_start, run_length, non_embed_offsets = _unpack_item_run(
-                run, field_name, item_idx, run_idx)
+            prompt_start, run_length, non_embed_offsets = (
+                unpack_multimodal_item_run(run, field_name, item_idx, run_idx))
             if not isinstance(prompt_start, int) or not isinstance(
                     run_length, int):
                 raise TypeError(
@@ -138,12 +118,12 @@ def prepare_multimodal_item_runs(
                     f"{field_name}[{item_idx}][{run_idx}] ends at "
                     f"{run_end}, exceeding input sequence length {prompt_len}")
             if non_embed_offsets is None:
-                non_embed_offsets = []
+                non_embed_offsets = ()
             if not isinstance(non_embed_offsets, (list, tuple)):
                 raise TypeError(
                     f"{field_name}[{item_idx}][{run_idx}] non-embed offsets must be a list"
                 )
-            normalized_offsets = list(non_embed_offsets)
+            normalized_offsets = tuple(non_embed_offsets)
             if not all(
                     isinstance(offset, int) for offset in normalized_offsets):
                 raise TypeError(
@@ -154,7 +134,7 @@ def prepare_multimodal_item_runs(
                 raise ValueError(
                     f"{field_name}[{item_idx}][{run_idx}] non-embed offsets must be within the run"
                 )
-            if normalized_offsets != sorted(set(normalized_offsets)):
+            if normalized_offsets != tuple(sorted(set(normalized_offsets))):
                 raise ValueError(
                     f"{field_name}[{item_idx}][{run_idx}] non-embed offsets must be ordered and unique"
                 )
@@ -163,9 +143,13 @@ def prepare_multimodal_item_runs(
                     f"{field_name}[{item_idx}] must be ordered and non-overlapping"
                 )
 
-            normalized_item_runs.append(
-                (prompt_start, run_length, normalized_offsets))
-            item_embedding_length += run_length - len(normalized_offsets)
+            normalized_run = MultimodalItemRun(
+                prompt_start=prompt_start,
+                run_length=run_length,
+                non_embed_offsets=normalized_offsets)
+            normalized_item_runs.append(normalized_run)
+            item_embedding_length += run_length - len(
+                normalized_run.non_embed_offsets)
             item_prompt_length += run_length
             item_spans.append((prompt_start, run_length))
             occupied_runs.append((prompt_start, run_end, item_idx, run_idx))
@@ -193,24 +177,6 @@ def prepare_multimodal_item_runs(
         multimodal_prompt_lengths=prompt_lengths,
         multimodal_item_run_spans=item_run_spans,
     )
-
-
-def validate_multimodal_hashes_and_item_runs(
-        mm_hashes: List[List[int]],
-        mm_item_runs: MultimodalItemRuns,
-        prompt_len: Optional[int] = None) -> MultimodalItemRuns:
-    """Validate multimodal hashes and canonical item-run layout metadata."""
-    return prepare_multimodal_item_runs(
-        mm_hashes, mm_item_runs, prompt_len=prompt_len).multimodal_item_runs
-
-
-def _item_run_total_length(item_runs: List[MultimodalItemRun]) -> int:
-    return sum(run_length for _, run_length, _ in item_runs)
-
-
-def _item_run_embed_length(item_runs: List[MultimodalItemRun]) -> int:
-    return sum(run_length - len(non_embed_offsets)
-               for _, run_length, non_embed_offsets in item_runs)
 
 
 def _positions_to_item_runs(
@@ -243,41 +209,21 @@ def _positions_to_item_runs(
                     non_embed_offsets.append(run_length)
                 run_length += 1
             else:
-                item_runs.append((run_start, run_length, non_embed_offsets))
+                item_runs.append(
+                    MultimodalItemRun(
+                        prompt_start=run_start,
+                        run_length=run_length,
+                        non_embed_offsets=tuple(non_embed_offsets)))
                 run_start = position
                 run_length = 1
                 non_embed_offsets = [] if is_embed else [0]
             previous_position = position
-        item_runs.append((run_start, run_length, non_embed_offsets))
+        item_runs.append(
+            MultimodalItemRun(prompt_start=run_start,
+                              run_length=run_length,
+                              non_embed_offsets=tuple(non_embed_offsets)))
         runs_by_item.append(item_runs)
     return runs_by_item
-
-
-def get_multimodal_embedding_lengths(
-        item_runs_by_item: MultimodalItemRuns) -> List[int]:
-    """Return per-item encoder-output row counts from canonical item runs.
-
-    Callers are expected to pass item runs that were already normalized by
-    `MultimodalInput` construction.
-    """
-    return [
-        _item_run_embed_length(item_runs) for item_runs in item_runs_by_item
-    ]
-
-
-def get_multimodal_prompt_lengths(
-        item_runs_by_item: MultimodalItemRuns) -> List[int]:
-    """Return per-item prompt-owned token counts from canonical item runs."""
-    return [
-        _item_run_total_length(item_runs) for item_runs in item_runs_by_item
-    ]
-
-
-def get_multimodal_item_run_spans(
-        item_runs_by_item: MultimodalItemRuns) -> List[List[Tuple[int, int]]]:
-    """Return per-item `(prompt_start, run_length)` spans from item runs."""
-    return [[(run_start, run_length) for run_start, run_length, _ in item_runs]
-            for item_runs in item_runs_by_item]
 
 
 def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
@@ -314,10 +260,10 @@ class MultimodalInput:
     """Exact prompt token runs covered by each multimodal item.
 
     The outer list must match ``multimodal_hashes``. Each inner list contains
-    compact ``(prompt_start, run_length, non_embed_offsets)`` runs for that
-    multimodal item. ``non_embed_offsets`` are local offsets inside the run that
-    belong to the multimodal prompt layout but do not consume encoder-output
-    embedding rows. Empty offsets mean the full run maps to embeddings.
+    compact ``MultimodalItemRun`` entries for that multimodal item.
+    ``non_embed_offsets`` are local offsets inside the run that belong to the
+    multimodal prompt layout but do not consume encoder-output embedding rows.
+    Empty offsets mean the full run maps to embeddings.
     """
 
     multimodal_uuids: Optional[List[Optional[str]]] = None
@@ -1198,24 +1144,40 @@ def _compute_mm_masks(
 
 
 def find_mm_token_item_runs(
-        input_ids: Union[torch.Tensor, List[int], np.ndarray],
-        num_mm_tokens: List[int],
-        vocab_size: Optional[int] = None,
-        mm_token_ids: Optional[torch.Tensor] = None,
-        mm_special_token_ids: Optional[torch.Tensor] = None
+    input_ids: Union[torch.Tensor, List[int], np.ndarray],
+    num_mm_tokens: List[int],
+    vocab_size: Optional[int] = None,
+    mm_token_ids: Optional[torch.Tensor] = None,
+    mm_special_token_ids: Optional[torch.Tensor] = None,
+    *,
+    precomputed_masks: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 ) -> MultimodalItemRuns:
     """Get exact prompt token runs for each multimodal item."""
-    input_ids_tensor = _as_cpu_tensor(input_ids)
-    mm_mask, embed_mask, _ = _compute_mm_masks(input_ids_tensor, vocab_size,
-                                               mm_token_ids,
-                                               mm_special_token_ids)
+    if precomputed_masks is None:
+        input_ids_tensor = _as_cpu_tensor(input_ids)
+        mm_mask, embed_mask, _ = _compute_mm_masks(input_ids_tensor, vocab_size,
+                                                   mm_token_ids,
+                                                   mm_special_token_ids)
+    else:
+        mm_mask, embed_mask = precomputed_masks
+        if mm_mask.dtype != torch.bool or embed_mask.dtype != torch.bool:
+            raise ValueError(
+                "precomputed multimodal masks must be bool tensors")
+        if mm_mask.device.type != "cpu" or embed_mask.device.type != "cpu":
+            raise ValueError(
+                "precomputed multimodal masks must be CPU-resident")
+        if mm_mask.shape != embed_mask.shape:
+            raise ValueError(
+                "precomputed multimodal masks must have matching shapes")
     if not torch.any(mm_mask):
         return []
 
     mm_positions = torch.where(mm_mask)[0].tolist()
-    assert len(mm_positions) == sum(
-        num_mm_tokens
-    ), "Number of multimodal tokens does not match sum of all lengths"
+    expected_mm_tokens = sum(num_mm_tokens)
+    if len(mm_positions) != expected_mm_tokens:
+        raise ValueError(
+            "Number of multimodal tokens does not match sum of all lengths: "
+            f"found {len(mm_positions)}, expected {expected_mm_tokens}")
 
     mm_embed_flags = embed_mask[mm_mask].tolist()
     item_positions = []

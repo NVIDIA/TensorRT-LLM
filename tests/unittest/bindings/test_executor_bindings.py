@@ -1074,7 +1074,7 @@ def test_multimodal_input_with_uuids(multimodal_uuids, expected_uuids):
 def test_multimodal_input_pickle_with_uuids():
     """Test pickling and unpickling of MultimodalInput with UUIDs."""
     multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]]
-    expected_item_runs = [[(10, 50, [])], [(100, 60, [])]]
+    expected_item_runs = [[(10, 20, []), (40, 30, [])], [(100, 60, [])]]
     multimodal_item_runs = _binding_item_runs(expected_item_runs)
     multimodal_uuids = ["test-uuid-1", None]
 
@@ -1096,24 +1096,6 @@ def test_multimodal_input_pickle_with_uuids():
     pickled_no_uuids = pickle.dumps(config_no_uuids)
     restored_no_uuids = pickle.loads(pickled_no_uuids)
     assert restored_no_uuids.multimodal_uuids is None
-
-
-def test_multimodal_input_with_item_runs():
-    """Test MultimodalInput with compact multimodal hash token-position runs."""
-    multimodal_hashes = [[1, 2, 3, 4, 5, 6, 7, 8]]
-    multimodal_uuids = ["test-uuid-1"]
-    expected_item_runs = [[(1, 1, []), (3, 1, [])]]
-    multimodal_item_runs = _binding_item_runs(expected_item_runs)
-
-    config = trtllm.MultimodalInput(multimodal_hashes, multimodal_item_runs,
-                                    multimodal_uuids)
-
-    assert _binding_item_runs_to_tuples(
-        config.multimodal_item_runs) == expected_item_runs
-
-    restored = pickle.loads(pickle.dumps(config))
-    assert _binding_item_runs_to_tuples(
-        restored.multimodal_item_runs) == expected_item_runs
 
 
 def test_mrope_config():

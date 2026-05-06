@@ -11,6 +11,7 @@ from typing import Any, Callable, List, NamedTuple, Optional
 from strenum import StrEnum
 
 from tensorrt_llm._utils import mpi_rank
+from tensorrt_llm.inputs.multimodal import unpack_multimodal_item_run
 from tensorrt_llm.llmapi.utils import enable_llm_debug, logger_debug
 
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
@@ -27,6 +28,43 @@ class LlmLauncherEnvs(StrEnum):
 
     # Whether to use periodical responses handler in await_responses
     TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT = "TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT"
+
+
+def to_binding_multimodal_item_runs(
+        runs_by_item: Optional[List[List[Any]]]) -> Optional[List[List[Any]]]:
+    if runs_by_item is None:
+        return None
+
+    from tensorrt_llm.bindings import executor as tllm_executor
+
+    binding_run_type = tllm_executor.MultimodalItemRun
+    binding_runs = []
+    for item_idx, item_runs in enumerate(runs_by_item):
+        binding_item_runs = []
+        for run_idx, run in enumerate(item_runs):
+            if isinstance(run, binding_run_type):
+                binding_item_runs.append(run)
+                continue
+            prompt_start, run_length, non_embed_offsets = (
+                unpack_multimodal_item_run(run, "multimodal_item_runs",
+                                           item_idx, run_idx))
+            if non_embed_offsets is None:
+                non_embed_offsets = ()
+            binding_item_runs.append(
+                binding_run_type(prompt_start=int(prompt_start),
+                                 run_length=int(run_length),
+                                 non_embed_offsets=list(non_embed_offsets)))
+        binding_runs.append(binding_item_runs)
+    return binding_runs
+
+
+def to_binding_multimodal_input(multimodal_input: Any) -> Any:
+    from tensorrt_llm.bindings import executor as tllm_executor
+
+    return tllm_executor.MultimodalInput(
+        multimodal_input.multimodal_hashes,
+        to_binding_multimodal_item_runs(multimodal_input.multimodal_item_runs),
+        multimodal_input.multimodal_uuids)
 
 
 def get_spawn_proxy_process_ipc_addr_env() -> str | None:

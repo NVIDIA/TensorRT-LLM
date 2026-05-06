@@ -11,7 +11,7 @@ from tensorrt_llm._torch.models.modeling_utils import \
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
-from tensorrt_llm.inputs.multimodal import to_binding_multimodal_item_runs
+from tensorrt_llm.executor.utils import to_binding_multimodal_input
 
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
@@ -230,12 +230,8 @@ class KvCacheCreator:
                 multimodal_input = extra_processed_inputs.get(
                     'multimodal_input')
                 multimodal_data = extra_processed_inputs.get('multimodal_data')
-                req_mm_input = trtllm.MultimodalInput(
-                    multimodal_hashes=multimodal_input.multimodal_hashes,
-                    multimodal_uuids=multimodal_input.multimodal_uuids,
-                    multimodal_item_runs=to_binding_multimodal_item_runs(
-                        multimodal_input.multimodal_item_runs),
-                ) if multimodal_input else None
+                req_mm_input = to_binding_multimodal_input(
+                    multimodal_input) if multimodal_input else None
 
                 request = trtllm.Request(prompt_token_ids,
                                          max_tokens=1,

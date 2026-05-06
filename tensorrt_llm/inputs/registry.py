@@ -606,9 +606,9 @@ def register_input_processor(
         processor_cls: Type[InputProcessor],
         model_type: str,
         placeholder_metadata: MultimodalPlaceholderMetadata = None):
-    """Register an input processor to a model class.
-
-    Note:
+    """
+    Register an input processor to a model class.
+    NOTE:
         1. Since this API is only used for multimodal models, we are checking
            the model type only for that.
         2. If this is used for other models in the future, this logic needs to be
@@ -811,7 +811,8 @@ def create_input_processor_with_hash(
     def tokenized_multimodal_process(
         inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        """Process prompt_token_ids and multi_modal_data without detokenizing.
+        """
+        Process prompt_token_ids and multi_modal_data without detokenizing.
 
         Runs the input processor with dummy text placeholders for multi-modal slots,
         then replaces placeholder token IDs with the actual feature token IDs and
@@ -866,7 +867,8 @@ def create_input_processor_with_hash(
         precomputed_extra: Optional[ExtraProcessedInputs] = None,
         precomputed_num_mm_tokens: Optional[List[int]] = None,
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        """Process multimodal hashing for media tokens if possible.
+        """
+        Process multimodal hashing for media tokens if possible.
 
         precomputed_token_ids and precomputed_extra must be provided together or
         both be None. When both are provided (tokenized+MM path), skips the
@@ -927,6 +929,7 @@ def create_input_processor_with_hash(
         # subsequent maybe_compute_mm_embed_cumsum call short-circuits via
         # its idempotency guard, avoiding a second full-sequence isin pass.
         input_ids_tensor = _as_cpu_tensor(prompt_token_ids)
+        precomputed_masks = None
         if input_ids_tensor.numel() == 0:
             start_special_token_positions = []
         else:
@@ -942,6 +945,7 @@ def create_input_processor_with_hash(
             start_special_token_positions = (
                 _find_mm_special_token_offsets_from_masks(
                     mm_mask, special_mask))
+            precomputed_masks = (mm_mask, embed_mask)
         # Store special token offsets if available
         if len(start_special_token_positions
                ) > 0 and mm_special_token_ids is not None:
@@ -957,7 +961,8 @@ def create_input_processor_with_hash(
             num_mm_tokens=num_mm_tokens,
             vocab_size=vocab_size,
             mm_token_ids=mm_ids,
-            mm_special_token_ids=mm_special_token_ids)
+            mm_special_token_ids=mm_special_token_ids,
+            precomputed_masks=precomputed_masks)
         extra_processed_inputs[
             "multimodal_input"] = MultimodalInput.from_components(
                 mm_hashes_int32,

@@ -398,7 +398,9 @@ def test_multimodal_input_from_components_with_uuids():
                                                mm_uuids)
 
     assert mm_input.multimodal_hashes == mm_hashes
-    assert mm_input.multimodal_item_runs == mm_item_runs
+    assert [[(run.prompt_start, run.run_length, list(run.non_embed_offsets))
+             for run in item_runs]
+            for item_runs in mm_input.multimodal_item_runs] == mm_item_runs
     assert mm_input.multimodal_embedding_lengths == [49, 58]
     assert mm_input.multimodal_prompt_lengths == [50, 60]
     assert mm_input.multimodal_uuids == mm_uuids
