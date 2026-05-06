@@ -18,7 +18,9 @@
 #pragma once
 
 #include "kv_cache_manager_v2/common.h"
+#include "kv_cache_manager_v2/exceptions.h"
 
+#include <algorithm>
 #include <cuda.h>
 #include <deque>
 #include <exception>
@@ -281,6 +283,13 @@ public:
     // Release the event back to pool. Visible to ALL copies sharing this event.
     void close();
 
+    // Raw CUevent handle. Returns nullptr for NULL/closed events.
+    // Also serves as identity key for deduplication.
+    [[nodiscard]] CUevent handle() const noexcept
+    {
+        return isClosed() ? nullptr : mEvent->get();
+    }
+
 private:
     explicit CachedCudaEvent() noexcept = default; // used by makeNull()
 
@@ -293,14 +302,42 @@ private:
 // Stream-level helpers.
 // ---------------------------------------------------------------------------
 
-// Wait for all events in the range on the given stream.
-template <typename EventRange>
-void streamWaitEvents(CudaStream stream, EventRange&& events)
+// Wait for all events on the given stream. Deduplicates internally.
+// Mirrors Python's stream_wait_events() which converts to set() before iterating.
+inline void streamWaitEvents(CudaStream stream, std::vector<CachedCudaEvent const*> const& events)
 {
-    for (auto& ev : events)
+    thread_local std::vector<CUevent> handles;
+    handles.clear();
+    handles.reserve(events.size());
+    for (auto const* ev : events)
     {
-        ev.waitInStream(stream);
+        if (ev && !ev->isClosed())
+            handles.push_back(ev->handle());
     }
+    std::sort(handles.begin(), handles.end());
+    handles.erase(std::unique(handles.begin(), handles.end()), handles.end());
+    for (CUevent h : handles)
+        cuCheck(cuStreamWaitEvent(reinterpret_cast<CUstream>(stream), h, 0));
+}
+
+// Synchronize and close all events. Deduplicates internally.
+// Mirrors Python's set()-based synchronization pattern.
+inline void synchronizeAll(std::vector<CachedCudaEvent*> const& events)
+{
+    thread_local std::vector<CUevent> handles;
+    handles.clear();
+    handles.reserve(events.size());
+    for (auto* ev : events)
+    {
+        if (!ev->isClosed())
+            handles.push_back(ev->handle());
+    }
+    std::sort(handles.begin(), handles.end());
+    handles.erase(std::unique(handles.begin(), handles.end()), handles.end());
+    for (CUevent h : handles)
+        cuCheck(cuEventSynchronize(h));
+    for (auto* ev : events)
+        ev->close();
 }
 
 // ---------------------------------------------------------------------------
@@ -328,11 +365,10 @@ public:
         event.waitInStream(reinterpret_cast<CudaStream>(handle()));
     }
 
-    // Wait for all events in a range on this stream.
-    template <typename EventRange>
-    void waitEvents(EventRange&& events)
+    // Wait for all events on this stream. Deduplicates internally.
+    void waitEvents(std::vector<CachedCudaEvent const*> const& events)
     {
-        streamWaitEvents(reinterpret_cast<CudaStream>(handle()), std::forward<EventRange>(events));
+        streamWaitEvents(reinterpret_cast<CudaStream>(handle()), events);
     }
 
     CachedCudaEvent recordEvent();

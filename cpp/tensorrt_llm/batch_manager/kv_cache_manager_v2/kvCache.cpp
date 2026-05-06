@@ -301,11 +301,15 @@ bool KvCache::resume(std::optional<CUstream> stream)
         int lastOrdinal = mBlocks.empty() ? 0 : (numCommittedTokens() - 1) / mTokensPerBlock;
         CUstream cudaStr = cudaStream();
 
-        // Wait for all new slots to be ready.
-        for (auto& optSlot : deferredSlots)
+        // Wait for all new slots to be ready (deduplicated).
         {
-            if (optSlot.has_value())
-                optSlot->readyEvent.waitInStream(reinterpret_cast<CudaStream>(cudaStr));
+            std::vector<CachedCudaEvent const*> slotEvents;
+            for (auto& optSlot : deferredSlots)
+            {
+                if (optSlot.has_value())
+                    slotEvents.push_back(&optSlot->readyEvent);
+            }
+            streamWaitEvents(reinterpret_cast<CudaStream>(cudaStr), slotEvents);
         }
 
         // Phase 1: Copy GPU→GPU from locked source pages to pre-allocated slots.

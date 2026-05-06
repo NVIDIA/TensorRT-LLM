@@ -419,9 +419,14 @@ std::vector<SharedPageLock> batchedLockToGpu(KvCache& kvCache, std::vector<Batch
         throw;
     }
 
-    // Wait for all ready events on KvCache's stream.
-    for (auto const& t : targets)
-        t.page->readyEvent.waitInStream(reinterpret_cast<CudaStream>(kvCache.cudaStream()));
+    // Wait for all ready events on KvCache's stream (deduplicated).
+    {
+        std::vector<CachedCudaEvent const*> readyEvents;
+        readyEvents.reserve(targets.size());
+        for (auto const& t : targets)
+            readyEvents.push_back(&t.page->readyEvent);
+        streamWaitEvents(reinterpret_cast<CudaStream>(kvCache.cudaStream()), readyEvents);
+    }
 
     // Lock all pages.
     std::vector<SharedPageLock> locks;

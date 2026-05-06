@@ -177,12 +177,16 @@ bool SlotAllocator::finishShrink()
             assert(static_cast<int>(ids.size()) == static_cast<int>(mOverflowSlots.size())
                 && "Duplicate slot IDs in overflow slots");
         }
-        // Synchronize all overflow events.
-        for (auto& s : mOverflowSlots)
+        // Synchronize overflow events (deduplicated — slots often share events).
         {
-            s.readyEvent.synchronize();
-            s.resetSlot();
+            std::vector<CachedCudaEvent*> overflowEvents;
+            overflowEvents.reserve(mOverflowSlots.size());
+            for (auto& s : mOverflowSlots)
+                overflowEvents.push_back(&s.readyEvent);
+            synchronizeAll(overflowEvents);
         }
+        for (auto& s : mOverflowSlots)
+            s.resetSlot();
         mOverflowSlots.clear();
         mCapacity = mTargetCapacity;
         mNumActiveSlots = std::min(mNumActiveSlots, mCapacity);
