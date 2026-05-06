@@ -894,32 +894,6 @@ class FlashInferTrtllmGenAttention:
             return cyclic_attention_window_size - 1
         return -1
 
-    def _build_kv_pool(
-        self,
-        layer_idx: int,
-        num_kv_heads: int,
-        tokens_per_block: int,
-    ) -> torch.Tensor:
-        kv_cache = self._kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
-        block_elems = kv_cache.shape[2] * kv_cache.shape[3] * kv_cache.shape[4]
-        storage_numel = kv_cache.untyped_storage().nbytes() // kv_cache.element_size()
-        available_blocks = (storage_numel - kv_cache.storage_offset()) // block_elems
-
-        if kv_cache.shape[2] != num_kv_heads or kv_cache.shape[3] != tokens_per_block:
-            raise RuntimeError(
-                "Invalid trtllm-gen KV cache view shape: "
-                f"shape={tuple(kv_cache.shape)}, num_kv_heads={num_kv_heads}, "
-                f"tokens_per_block={tokens_per_block}."
-            )
-
-        kv_pool = kv_cache.as_strided(
-            (available_blocks, kv_cache.shape[2], kv_cache.shape[3], kv_cache.shape[4]),
-            (block_elems, kv_cache.shape[3] * kv_cache.shape[4], kv_cache.shape[4], 1),
-        )
-        if kv_pool.data_ptr() != kv_cache.data_ptr():
-            raise RuntimeError("Failed to create a no-copy trtllm-gen KV cache pool view.")
-        return kv_pool
-
     @staticmethod
     def _missing_fused_nanobind_ops() -> List[str]:
         required_ops = (
@@ -928,6 +902,7 @@ class FlashInferTrtllmGenAttention:
             "trtllm_gen_context_preprocess",
             "trtllm_gen_context_postprocess",
             "trtllm_gen_generation_preprocess",
+            "build_trtllm_gen_kv_cache_metadata",
         )
         return [op for op in required_ops if not hasattr(thop, op)]
 
@@ -1158,16 +1133,23 @@ class FlashInferTrtllmGenAttention:
             raise NotImplementedError("Chunked-attention is not supported by MLA decode path.")
 
         batch_beam = params.num_requests * params.beam_width
+        kv_factor, total_num_blocks = self._get_kv_cache_metadata(params.is_mla_enable)
         with nvtx_range("trtllm_gen.mla.kv_metadata", color="blue"):
-            kv_cache = self._build_kv_pool(
+            kv_cache, block_tables = thop.build_trtllm_gen_kv_cache_metadata(
+                host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
+                kv_cache_block_offsets=params.kv_cache_block_offsets,
                 layer_idx=params.layer_idx,
                 num_kv_heads=params.num_kv_heads,
                 tokens_per_block=params.tokens_per_block,
+                head_dim=params.head_size,
+                kv_factor=kv_factor,
+                total_num_blocks=total_num_blocks,
+                kv_cache_quant_mode=params.kv_cache_quant_mode,
+                batch_start=params.seq_offset,
+                batch_size=batch_beam,
+                dtype=params.attention_input.dtype,
             )
-            pool_idx = int(params.host_kv_cache_pool_mapping[params.layer_idx, 0])
-            block_tables = params.kv_cache_block_offsets[
-                pool_idx, params.seq_offset : params.seq_offset + batch_beam
-            ]
 
         with nvtx_range("trtllm_gen.mla.block_table_pad", color="yellow"):
             pages_per_superblock = 128 // params.tokens_per_block

@@ -283,6 +283,27 @@ void initBindings(nb::module_& m)
         nb::arg("multi_processor_count"), "Fused nanobind context postprocess for trtllm-gen attention.",
         nb::call_guard<nb::gil_scoped_release>());
 
+    m.def(
+        "build_trtllm_gen_kv_cache_metadata",
+        [](torch::Tensor host_kv_cache_pool_pointers, torch::Tensor host_kv_cache_pool_mapping,
+            torch::Tensor kv_cache_block_offsets, int64_t layer_idx, int64_t num_kv_heads, int64_t tokens_per_block,
+            int64_t head_dim, int64_t kv_factor, int64_t total_num_blocks, int64_t kv_cache_quant_mode,
+            int64_t batch_start, int64_t batch_size, at::ScalarType dtype) -> nb::tuple
+        {
+            nb::gil_scoped_release release;
+            auto kvPool = torch_ext::buildFlashinferTrtllmGenPagedKvCacheBuffers(host_kv_cache_pool_pointers,
+                host_kv_cache_pool_mapping, layer_idx, num_kv_heads, tokens_per_block, head_dim, kv_factor,
+                total_num_blocks, kv_cache_quant_mode, dtype);
+            auto const mapping = torch_ext::readKvCachePoolMapping(host_kv_cache_pool_mapping, layer_idx);
+            auto blockTables = kv_cache_block_offsets.select(0, mapping.poolIndex).narrow(0, batch_start, batch_size);
+            return nb::make_tuple(nb::cast(kvPool), nb::cast(blockTables));
+        },
+        nb::arg("host_kv_cache_pool_pointers"), nb::arg("host_kv_cache_pool_mapping"),
+        nb::arg("kv_cache_block_offsets"), nb::arg("layer_idx"), nb::arg("num_kv_heads"), nb::arg("tokens_per_block"),
+        nb::arg("head_dim"), nb::arg("kv_factor"), nb::arg("total_num_blocks"), nb::arg("kv_cache_quant_mode"),
+        nb::arg("batch_start"), nb::arg("batch_size"), nb::arg("dtype"),
+        "Build flashinfer-style KV cache pool view and slice block tables for a given layer.");
+
     m.def("trtllm_gen_generation_preprocess", &trtllmGenGenerationPreprocessBinding, nb::arg("qkv_input"),
         nb::arg("workspace"), nb::arg("sequence_lengths"), nb::arg("spec_decoding_generation_lengths").none(),
         nb::arg("spec_decoding_position_offsets").none(), nb::arg("kv_cache_block_offsets").none(),
