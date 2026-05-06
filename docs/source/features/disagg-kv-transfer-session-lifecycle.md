@@ -31,17 +31,34 @@ duration of an in-flight transfer:
   `requestAndReceiveSync`, `requestAndReceiveAsync`, and `cancelRequest`
   / `cancelRequestStructured` all take `std::shared_ptr<LlmRequest>`.
 * The tracked-future vectors (`mSenderFutures`, `mRequesterFutures`)
-  store the same shared_ptr, so the C++ object outlives every worker
-  thread access regardless of when Python's `_terminate_request` drops
-  its pybind reference.
+  store the same shared_ptr.
+* Each worker queue **also** stores a `std::shared_ptr<LlmRequest>` —
+  `CacheSender::Impl::Response::mRequest` and
+  `CacheReceiver::Impl::RequestAndPromise::mRequest`. The worker thread
+  thus pins the LlmRequest independently of the executor, so a wedged
+  worker cannot be freed by the executor erasing its tracking entry.
 
-This closes the historical "raw `LlmRequest*` use-after-free" class
-(`mRequestId == 0x5555555555555555` field traces). The Python-side
+Together this closes the historical "raw `LlmRequest*` use-after-free"
+class (`mRequestId == 0x5555555555555555` field traces). The Python-side
 `_can_terminate_request_now` guard remains in place — but its job is
 now memory *quiescence*, not lifetime: even with the request object
 pinned, `free_resources()` would release KV blocks back to the pool
 while the transport may still be writing into them, so termination
 must still wait for the structured cancel result to signal safety.
+
+`CacheSender::Impl::handleAsyncSend` materialises the request id into
+a local before `std::move(resp)` to avoid a C++ argument-eval-order
+bug — once `Response::mRequest` is a `shared_ptr`, the previous
+one-liner `sendAndRemoveResponse(resp.mRequest->mRequestId, std::move(resp))`
+became undefined behaviour because the compiler may evaluate the move
+first and leave `resp.mRequest` empty when reading `mRequestId`. Field
+traces of PR #13713 had a SIGSEGV at exactly that argument
+construction; the materialised-id pattern fixes it.
+
+`TransferSession::mRequest` is an ephemeral `LlmRequest const*` that is
+only set inside `sendSync` and used during measurement / formatter
+calls within the same worker frame; the worker still holds the
+shared_ptr at that point, so the observer is safe by construction.
 
 ## Status polling is non-blocking by default
 

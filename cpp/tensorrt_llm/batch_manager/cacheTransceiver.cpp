@@ -338,9 +338,9 @@ void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmReques
         return;
     }
     setContextState(llmRequest.get());
-    auto future = mCacheSender->sendAsync(*llmRequest);
+    auto future = mCacheSender->sendAsync(llmRequest);
     auto const deadline = computeTrackedFutureDeadline(/*requestStart=*/std::chrono::steady_clock::now());
-    mSenderFutures.push_back(TrackedFuture{llmRequest, std::move(future), deadline, false, false});
+    mSenderFutures.push_back(TrackedFuture{std::move(llmRequest), std::move(future), deadline, false, false});
 }
 
 void CacheTransceiver::respondAndSendLayerWise(
@@ -355,7 +355,7 @@ void CacheTransceiver::respondAndSendLayerWise(
 
         llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
         setContextState(llmRequest.get());
-        auto future = mCacheSender->sendAsync(*llmRequest);
+        auto future = mCacheSender->sendAsync(llmRequest);
         auto const deadline = computeTrackedFutureDeadline(/*requestStart=*/std::chrono::steady_clock::now());
         mSenderFutures.push_back(TrackedFuture{llmRequest, std::move(future), deadline, false, false});
     }
@@ -365,7 +365,7 @@ void CacheTransceiver::requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequ
 {
     TLLM_CHECK(llmRequest && llmRequest->isGenerationOnlyRequest());
     {
-        auto future = mCacheReceiver->receiveAsync(*llmRequest);
+        auto future = mCacheReceiver->receiveAsync(llmRequest);
         future.get();
     }
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
@@ -384,10 +384,10 @@ void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmReq
         return;
     }
 
-    auto future = mCacheReceiver->receiveAsync(*llmRequest);
+    auto future = mCacheReceiver->receiveAsync(llmRequest);
     auto const deadline = computeTrackedFutureDeadline(/*requestStart=*/std::chrono::steady_clock::now());
-    mRequesterFutures.push_back(TrackedFuture{llmRequest, std::move(future), deadline, false, false});
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
+    mRequesterFutures.push_back(TrackedFuture{std::move(llmRequest), std::move(future), deadline, false, false});
 }
 
 std::vector<LlmRequest::RequestIdType> gatherRequestIds(

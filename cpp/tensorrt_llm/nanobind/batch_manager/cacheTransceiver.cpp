@@ -87,7 +87,7 @@ public:
         NB_OVERRIDE_PURE(checkGenTransferComplete);
     }
 
-    bool cancelRequest(tb::LlmRequest* llmRequest) override
+    bool cancelRequest(std::shared_ptr<tb::LlmRequest> llmRequest) override
     {
         NB_OVERRIDE_PURE(cancelRequest, llmRequest);
     }

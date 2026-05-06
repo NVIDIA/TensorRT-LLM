@@ -256,10 +256,11 @@ public:
     CacheSender() = default;
 
     /// @brief Asynchronously respond to the request and send data.
-    /// @param llmRequest Request object. Its data should be ready when called, and the data for this request
-    /// should remain valid until future synchronization.
+    /// @param llmRequest Request object. The transceiver pins the LlmRequest
+    /// for the lifetime of the worker future via the shared_ptr, so the
+    /// caller may drop its own strong reference once this returns.
     /// @return Once the data is fully sent, the future object will become valid.
-    [[nodiscard]] virtual std::future<void> sendAsync(LlmRequest& llmRequest) const;
+    [[nodiscard]] virtual std::future<void> sendAsync(std::shared_ptr<LlmRequest> llmRequest) const;
 
     /// @brief Return the internal communicator status.
     /// @return The communicator status.
@@ -313,10 +314,11 @@ public:
     CacheReceiver() = default;
 
     /// @brief Asynchronously send a request to receive data.
-    /// @param llmRequest Request object. Its data should be in an allocated but unwritten state when called, and the
-    /// data for this request should remain intact only after future synchronization.
+    /// @param llmRequest Request object. The transceiver pins the LlmRequest
+    /// for the lifetime of the worker future via the shared_ptr, so the
+    /// caller may drop its own strong reference once this returns.
     /// @return Once the data is fully received, the future object will become valid.
-    [[nodiscard]] virtual std::future<void> receiveAsync(LlmRequest& llmRequest) const;
+    [[nodiscard]] virtual std::future<void> receiveAsync(std::shared_ptr<LlmRequest> llmRequest) const;
 
     virtual TransferSession sendRequestInfo(LlmRequest const& llmRequest);
 

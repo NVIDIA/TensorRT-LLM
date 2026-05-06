@@ -296,16 +296,17 @@ public:
         }
     }
 
-    [[nodiscard]] std::future<void> sendAsync(LlmRequest& llmRequest)
+    [[nodiscard]] std::future<void> sendAsync(std::shared_ptr<LlmRequest> llmRequest)
     {
+        TLLM_CHECK(llmRequest);
         std::promise<void> promise;
         auto future = promise.get_future();
-        llmRequest.setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
+        llmRequest->setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
+        auto const reqId = llmRequest->mRequestId;
         {
             {
                 std::scoped_lock lkResp(mSenderMutex);
-                mReadyResponses.emplace(
-                    llmRequest.mRequestId, Response{std::addressof(llmRequest), std::move(promise)});
+                mReadyResponses.emplace(reqId, Response{std::move(llmRequest), std::move(promise)});
             }
             std::unique_lock lkCond(mCondMutex);
             mAnyReady = true;
@@ -477,7 +478,11 @@ public:
 private:
     struct Response
     {
-        LlmRequest* mRequest;
+        // shared_ptr so the LlmRequest stays alive as long as the worker
+        // queue holds the response, independently of the executor's
+        // mSenderFutures tracking. Closes the raw-pointer UAF surface in
+        // the worker thread.
+        std::shared_ptr<LlmRequest> mRequest;
         std::promise<void> mPromise;
     };
 
@@ -511,7 +516,12 @@ private:
                 resp = std::move(resource.mSendQueue.front());
                 resource.mSendQueue.pop_front();
             }
-            sendAndRemoveResponse(resp.mRequest->mRequestId, std::move(resp));
+            // Materialize the request id before std::move(resp) — C++
+            // argument evaluation order is unspecified, so reading
+            // resp.mRequest->mRequestId after the move would dereference
+            // an empty shared_ptr.
+            auto const reqId = resp.mRequest->mRequestId;
+            sendAndRemoveResponse(reqId, std::move(resp));
         }
     }
 
@@ -753,23 +763,29 @@ public:
         TLLM_CUDA_CHECK(cudaGetDevice(&mDeviceId));
     }
 
-    [[nodiscard]] std::future<void> receiveAsync(LlmRequest& llmRequest)
+    [[nodiscard]] std::future<void> receiveAsync(std::shared_ptr<LlmRequest> llmRequest)
     {
+        TLLM_CHECK(llmRequest);
         // TODO: Modify the implementation here to avoid frequent thread creation.
-        return std::async(std::launch::async, &CacheReceiver::Impl::requestSync, this, std::ref(llmRequest));
+        // The worker captures the shared_ptr by value, pinning the LlmRequest
+        // for the lifetime of the request worker independently of the
+        // executor-side tracking.
+        return std::async(std::launch::async,
+            [this, llmRequest = std::move(llmRequest)]() mutable { this->requestSync(*llmRequest); });
     }
 
-    [[nodiscard]] std::future<void> requestAndReceiveAsyncMultiThreads(LlmRequest& llmRequest)
+    [[nodiscard]] std::future<void> requestAndReceiveAsyncMultiThreads(std::shared_ptr<LlmRequest> llmRequest)
     {
+        TLLM_CHECK(llmRequest);
         try
         {
             auto promise = std::make_unique<std::promise<void>>();
             auto future = promise->get_future();
-            TLLM_CHECK(llmRequest.getDataTransceiverState().getCommState().has_value());
+            TLLM_CHECK(llmRequest->getDataTransceiverState().getCommState().has_value());
             std::string processInfo = kDefaultProcessInfo;
             if (common::getEnvRequestKVCacheConcurrent())
             {
-                processInfo = llmRequest.getDataTransceiverState().getCommState()->toString();
+                processInfo = llmRequest->getDataTransceiverState().getCommState()->toString();
             }
             if (mInstanceToAsyncResource.find(processInfo) == mInstanceToAsyncResource.end())
             {
@@ -782,7 +798,7 @@ public:
             auto& asyncResource = mInstanceToAsyncResource.at(processInfo);
             {
                 std::unique_lock<std::mutex> lck(asyncResource->mMtxForQueue);
-                asyncResource->mRequestsQueue.emplace_back(std::addressof(llmRequest), std::move(promise));
+                asyncResource->mRequestsQueue.emplace_back(std::move(llmRequest), std::move(promise));
             }
             asyncResource->mCVforQueue.notify_all();
             return future;
@@ -1074,47 +1090,24 @@ private:
 
     struct RequestAndPromise
     {
-        LlmRequest* mRequest;
+        // shared_ptr so the LlmRequest stays alive while the worker queue
+        // holds it, independently of the executor's mRequesterFutures
+        // tracking.
+        std::shared_ptr<LlmRequest> mRequest;
         std::unique_ptr<std::promise<void>> mPromise;
 
-        RequestAndPromise()
-            : mRequest(nullptr)
-            , mPromise(nullptr)
-        {
-        }
+        RequestAndPromise() = default;
 
-        RequestAndPromise(LlmRequest* request, std::unique_ptr<std::promise<void>>&& promise)
-            : mRequest(request)
+        RequestAndPromise(std::shared_ptr<LlmRequest> request, std::unique_ptr<std::promise<void>>&& promise)
+            : mRequest(std::move(request))
             , mPromise(std::move(promise))
         {
         }
 
         RequestAndPromise(RequestAndPromise const&) = delete;
-
-        RequestAndPromise(RequestAndPromise&& other) noexcept
-            : mRequest(other.mRequest)
-            , mPromise(std::move(other.mPromise))
-        {
-            other.mRequest = nullptr;
-        }
-
-        RequestAndPromise& operator=(RequestAndPromise&& other) noexcept
-        {
-            if (this != &other)
-            {
-                mRequest = nullptr;
-                if (mPromise)
-                {
-                    mPromise.reset();
-                }
-
-                mRequest = other.mRequest;
-                mPromise = std::move(other.mPromise);
-
-                other.mRequest = nullptr;
-            }
-            return *this;
-        }
+        RequestAndPromise& operator=(RequestAndPromise const&) = delete;
+        RequestAndPromise(RequestAndPromise&&) noexcept = default;
+        RequestAndPromise& operator=(RequestAndPromise&&) noexcept = default;
     };
 
     struct AsyncResource
@@ -1209,9 +1202,9 @@ CacheSender::CacheSender(
 {
 }
 
-std::future<void> CacheSender::sendAsync(LlmRequest& llmRequest) const
+std::future<void> CacheSender::sendAsync(std::shared_ptr<LlmRequest> llmRequest) const
 {
-    return mImpl->sendAsync(llmRequest);
+    return mImpl->sendAsync(std::move(llmRequest));
 }
 
 executor::kv_cache::CommState const& CacheSender::getCommState() const
@@ -1252,9 +1245,9 @@ CacheReceiver::CacheReceiver(
 {
 }
 
-std::future<void> CacheReceiver::receiveAsync(LlmRequest& llmRequest) const
+std::future<void> CacheReceiver::receiveAsync(std::shared_ptr<LlmRequest> llmRequest) const
 {
-    return mImpl->requestAndReceiveAsyncMultiThreads(llmRequest);
+    return mImpl->requestAndReceiveAsyncMultiThreads(std::move(llmRequest));
 }
 
 CacheReceiver::~CacheReceiver() = default;
