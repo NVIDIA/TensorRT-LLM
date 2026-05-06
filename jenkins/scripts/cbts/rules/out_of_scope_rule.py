@@ -27,10 +27,21 @@ from blocks import Stage, YAMLIndex
 
 from .base import PRInputs, Rule, RuleResult
 
-# Path prefixes whose changes the pre-merge pipeline does not consume.
-# - tests/integration/test_lists/qa/  : QA test lists, run by post-merge /
+# Path prefixes whose changes neither pre-merge nor post-merge L0 consumes.
+# - tests/integration/test_lists/qa/   : QA test lists, run by separate
 #   nightly QA workflows.
-OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = ("tests/integration/test_lists/qa/",)
+# - tests/integration/test_lists/dev/  : developer-side artifacts, not
+#   consumed by any L0 pipeline.
+# - tests/integration/defs/.test_durations : pytest-split timing cache;
+#   used at runtime, doesn't affect test selection.
+# - tests/microbenchmarks/             : benchmarking scripts, not run
+#   by any L0 stage.
+OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = (
+    "tests/integration/test_lists/qa/",
+    "tests/integration/test_lists/dev/",
+    "tests/integration/defs/.test_durations",
+    "tests/microbenchmarks/",
+)
 
 # Path suffixes (extensions) under tests/ with no test-execution impact.
 OUT_OF_SCOPE_TESTS_SUFFIXES: tuple[str, ...] = (".md",)

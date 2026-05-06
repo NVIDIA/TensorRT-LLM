@@ -11,7 +11,7 @@ for the overall CBTS architecture.
 | `waives_rule.py` | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `tests_def_rule.py` | `TestsDefRule` | `testdefonly` | `tests/**/*` (any file under tests/) |
 | `test_list_rule.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
-| `out_of_scope_rule.py` | `OutOfScopeRule` | `noop` | `tests/integration/test_lists/qa/**`, `tests/**/*.md` |
+| `out_of_scope_rule.py` | `OutOfScopeRule` | `noop` | `tests/integration/test_lists/{qa,dev}/**`, `tests/integration/defs/.test_durations*`, `tests/microbenchmarks/**`, `tests/**/*.md` |
 
 ## WaivesRule
 
@@ -102,11 +102,16 @@ Outcomes:
 
 ## OutOfScopeRule
 
-Pure pattern match. Claims a changed file as `scope=noop` when:
+Pure pattern match. Claims a changed file as `scope=noop` when it lives
+in any subtree neither pre-merge nor post-merge L0 consumes:
 
-- it lives under `tests/integration/test_lists/qa/` (QA test lists, run by
-  post-merge / nightly QA workflows), or
-- it lives under `tests/` and has the `.md` suffix (Markdown docs).
+- `tests/integration/test_lists/qa/` — QA-only test lists, separate
+  nightly workflows.
+- `tests/integration/test_lists/dev/` — developer-side artifacts, no L0
+  consumer.
+- `tests/integration/defs/.test_durations` — pytest-split timing cache.
+- `tests/microbenchmarks/` — benchmarking scripts, no L0 stage.
+- `tests/**/*.md` — Markdown docs.
 
 `OUT_OF_SCOPE_PREFIXES` and `OUT_OF_SCOPE_TESTS_SUFFIXES` in
 `out_of_scope_rule.py` list the patterns.

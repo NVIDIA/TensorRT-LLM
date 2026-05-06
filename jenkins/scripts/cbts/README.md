@@ -27,7 +27,7 @@ Four rules, registered in `main.py::RULE_CLASSES`:
 | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `TestsDefRule` | `testdefonly` | `tests/**/*` (.py via AST; data files via dir walk-up) |
 | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
-| `OutOfScopeRule` | `noop` | `tests/integration/test_lists/qa/**`, `tests/**/*.md` |
+| `OutOfScopeRule` | `noop` | QA / dev test lists, `.test_durations`, `microbenchmarks/`, `tests/**/*.md` |
 
 See `rules/README.md` for per-rule logic.
 
