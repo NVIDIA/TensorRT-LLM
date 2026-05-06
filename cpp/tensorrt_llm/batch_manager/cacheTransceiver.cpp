@@ -323,7 +323,7 @@ void CacheTransceiver::setContextState(LlmRequest* llmRequest)
     }
 }
 
-void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
+void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isContextOnlyRequest());
     llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS);
@@ -337,7 +337,7 @@ void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
         }
         return;
     }
-    setContextState(llmRequest);
+    setContextState(llmRequest.get());
     auto future = mCacheSender->sendAsync(*llmRequest);
     auto const deadline = computeTrackedFutureDeadline(/*requestStart=*/std::chrono::steady_clock::now());
     mSenderFutures.push_back(TrackedFuture{llmRequest, std::move(future), deadline, false, false});
@@ -357,11 +357,11 @@ void CacheTransceiver::respondAndSendLayerWise(
         setContextState(llmRequest.get());
         auto future = mCacheSender->sendAsync(*llmRequest);
         auto const deadline = computeTrackedFutureDeadline(/*requestStart=*/std::chrono::steady_clock::now());
-        mSenderFutures.push_back(TrackedFuture{llmRequest.get(), std::move(future), deadline, false, false});
+        mSenderFutures.push_back(TrackedFuture{llmRequest, std::move(future), deadline, false, false});
     }
 }
 
-void CacheTransceiver::requestAndReceiveSync(LlmRequest* llmRequest)
+void CacheTransceiver::requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isGenerationOnlyRequest());
     {
@@ -371,15 +371,16 @@ void CacheTransceiver::requestAndReceiveSync(LlmRequest* llmRequest)
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
 }
 
-void CacheTransceiver::requestAndReceiveAsync(LlmRequest* llmRequest)
+void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isGenerationOnlyRequest());
 
+    auto const reqId = llmRequest->mRequestId;
     if (std::find_if(mRequesterFutures.begin(), mRequesterFutures.end(),
-            [llmRequest](auto const& entry) { return entry.request->mRequestId == llmRequest->mRequestId; })
+            [reqId](auto const& entry) { return entry.request->mRequestId == reqId; })
         != mRequesterFutures.end())
     {
-        TLLM_LOG_WARNING("Request ID %zu is already in mRequestFutures.", llmRequest->mRequestId);
+        TLLM_LOG_WARNING("Request ID %zu is already in mRequestFutures.", reqId);
         return;
     }
 
@@ -822,7 +823,7 @@ void CacheTransceiver::checkGenTransferStatusImpl(std::optional<int> const& atLe
                 entry.request->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
                 if (!common::getEnvKVCacheTimeOutputPath().empty())
                 {
-                    updateKVCacheTransferBW(syncComm, entry.request);
+                    updateKVCacheTransferBW(syncComm, entry.request.get());
                 }
             }
             catch (std::exception const& e)
@@ -844,7 +845,7 @@ void CacheTransceiver::checkGenTransferStatusImpl(std::optional<int> const& atLe
                 entry.request->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
                 if (!common::getEnvKVCacheTimeOutputPath().empty())
                 {
-                    updateKVCacheTransferBW(syncComm, entry.request);
+                    updateKVCacheTransferBW(syncComm, entry.request.get());
                 }
             }
             catch (std::exception const& e)
@@ -877,7 +878,7 @@ bool CacheTransceiver::checkGenTransferComplete() const
     return mRequesterFutures.empty();
 }
 
-TransferCancelResult CacheTransceiver::cancelRequestStructured(LlmRequest* llmRequest)
+TransferCancelResult CacheTransceiver::cancelRequestStructured(std::shared_ptr<LlmRequest> llmRequest)
 {
     TLLM_CHECK(llmRequest != nullptr);
 
@@ -886,6 +887,7 @@ TransferCancelResult CacheTransceiver::cancelRequestStructured(LlmRequest* llmRe
         return TransferCancelResult::kBackendUnhealthy;
     }
 
+    auto const reqId = llmRequest->mRequestId;
     if (llmRequest->isContextOnlyRequest())
     {
         // Pre-advertise: the sender's queue still owns the request.
@@ -896,7 +898,7 @@ TransferCancelResult CacheTransceiver::cancelRequestStructured(LlmRequest* llmRe
         // Did the worker future already finish?
         for (size_t i = 0; i < mSenderFutures.size(); ++i)
         {
-            if (mSenderFutures[i].request->mRequestId != llmRequest->mRequestId)
+            if (mSenderFutures[i].request->mRequestId != reqId)
             {
                 continue;
             }
@@ -917,7 +919,7 @@ TransferCancelResult CacheTransceiver::cancelRequestStructured(LlmRequest* llmRe
         }
         for (size_t i = 0; i < mRequesterFutures.size(); ++i)
         {
-            if (mRequesterFutures[i].request->mRequestId != llmRequest->mRequestId)
+            if (mRequesterFutures[i].request->mRequestId != reqId)
             {
                 continue;
             }
@@ -933,9 +935,9 @@ TransferCancelResult CacheTransceiver::cancelRequestStructured(LlmRequest* llmRe
     return TransferCancelResult::kNotCancellable;
 }
 
-bool CacheTransceiver::cancelRequest(LlmRequest* llmRequest)
+bool CacheTransceiver::cancelRequest(std::shared_ptr<LlmRequest> llmRequest)
 {
-    auto result = cancelRequestStructured(llmRequest);
+    auto result = cancelRequestStructured(std::move(llmRequest));
     return result == TransferCancelResult::kCancelledBeforeAdvertise || result == TransferCancelResult::kAlreadyComplete;
 }
 

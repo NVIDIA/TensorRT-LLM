@@ -48,7 +48,7 @@ public:
     // using BaseCacheTransceiver::BaseCacheTransceiver; // Inherit constructors
     NB_TRAMPOLINE(tb::BaseCacheTransceiver, 6);
 
-    void respondAndSendAsync(tb::LlmRequest* llmRequest) override
+    void respondAndSendAsync(std::shared_ptr<tb::LlmRequest> llmRequest) override
     {
         NB_OVERRIDE_PURE(respondAndSendAsync, llmRequest);
     }
@@ -61,12 +61,12 @@ public:
         TLLM_THROW("respondAndSendLayerWise is not overridable from Python");
     }
 
-    void requestAndReceiveSync(tb::LlmRequest* llmRequest) override
+    void requestAndReceiveSync(std::shared_ptr<tb::LlmRequest> llmRequest) override
     {
         NB_OVERRIDE_PURE(requestAndReceiveSync, llmRequest);
     }
 
-    void requestAndReceiveAsync(tb::LlmRequest* llmRequest) override
+    void requestAndReceiveAsync(std::shared_ptr<tb::LlmRequest> llmRequest) override
     {
         NB_OVERRIDE_PURE(requestAndReceiveAsync, llmRequest);
     }

@@ -258,13 +258,20 @@ class BaseCacheTransceiver
 {
 public:
     virtual ~BaseCacheTransceiver() = default;
-    virtual void respondAndSendAsync(LlmRequest* llmRequest) = 0;
+
+    // Methods take std::shared_ptr<LlmRequest> so the transceiver and its
+    // worker threads pin the LlmRequest's lifetime independently of when
+    // Python's _terminate_request drops the pybind reference. This closes
+    // the use-after-free class on raw LlmRequest* observed in the field
+    // (mRequestId reads as 0x5555555555555555 after Python free) without
+    // changing the Python policy layer's contract.
+    virtual void respondAndSendAsync(std::shared_ptr<LlmRequest> llmRequest) = 0;
     virtual void respondAndSendLayerWise(
         RequestVector const& requests, std::shared_ptr<ContextProgress> const& progress)
         = 0;
 
-    virtual void requestAndReceiveSync(LlmRequest* llmRequest) = 0;
-    virtual void requestAndReceiveAsync(LlmRequest* llmRequest) = 0;
+    virtual void requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest) = 0;
+    virtual void requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmRequest) = 0;
 
     /// Non-blocking poll. Returns the requests that have completed or
     /// encountered an error since the last call. With
@@ -300,7 +307,7 @@ public:
     /// contract. Subclasses override this; the boolean wrapper below maps
     /// the structured result onto the historical "is the request safe to
     /// release now" bool.
-    virtual TransferCancelResult cancelRequestStructured(LlmRequest* llmRequest)
+    virtual TransferCancelResult cancelRequestStructured(std::shared_ptr<LlmRequest> llmRequest)
     {
         return cancelRequest(llmRequest) ? TransferCancelResult::kCancelledBeforeAdvertise
                                          : TransferCancelResult::kNotFound;
@@ -311,7 +318,7 @@ public:
     /// or already-complete worker). Callers that need to distinguish
     /// in-flight cancellation from "nothing to do" should use
     /// @ref cancelRequestStructured.
-    virtual bool cancelRequest(LlmRequest* llmRequest) = 0;
+    virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) = 0;
 
     /// Whether the transceiver is currently healthy. Flips to false when
     /// quarantined transfers exceed the budget or when no backend
@@ -356,13 +363,13 @@ public:
 
     virtual ~CacheTransceiver();
 
-    void respondAndSendAsync(LlmRequest* llmRequest) override;
+    void respondAndSendAsync(std::shared_ptr<LlmRequest> llmRequest) override;
 
     void respondAndSendLayerWise(
         RequestVector const& requests, std::shared_ptr<ContextProgress> const& progress) override;
 
-    void requestAndReceiveSync(LlmRequest* llmRequest) override;
-    void requestAndReceiveAsync(LlmRequest* llmRequest) override;
+    void requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest) override;
+    void requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmRequest) override;
 
     RequestStatuses checkContextTransferStatus(
         std::optional<int> const& atLeastRequestNum = std::nullopt, bool markComplete = false) override;
@@ -377,9 +384,9 @@ public:
 
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
-    TransferCancelResult cancelRequestStructured(LlmRequest* llmRequest) override;
+    TransferCancelResult cancelRequestStructured(std::shared_ptr<LlmRequest> llmRequest) override;
 
-    virtual bool cancelRequest(LlmRequest* llmRequest) override;
+    virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) override;
 
     [[nodiscard]] bool isHealthy() const override;
 
@@ -393,10 +400,15 @@ private:
     /// Per-entry tracking for tracked worker futures. We keep the future
     /// pinned until the worker reaches a final state, even after the
     /// per-request deadline elapses, so that cancelling a still-running
-    /// worker never frees its KV/buffer resources prematurely.
+    /// worker never frees its KV/buffer resources prematurely. The
+    /// shared_ptr also pins the LlmRequest object's lifetime — Python
+    /// may drop its pybind reference at any time, but the C++ worker
+    /// thread (and any asynchronous queue inside CacheSender /
+    /// CacheReceiver) can dereference the request safely as long as the
+    /// transceiver has not erased this entry.
     struct TrackedFuture
     {
-        LlmRequest* request;
+        std::shared_ptr<LlmRequest> request;
         std::future<void> future;
         std::chrono::steady_clock::time_point deadline;
         /// True once the per-request timeout has fired and we have flipped

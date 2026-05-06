@@ -22,6 +22,27 @@ mechanism that this codebase actually implements.
 | Resource quiescence | C++ transceiver    | Worker future stays pinned until ready / error / quarantine. |
 | Process health    | C++ transceiver      | Quarantine budget + global progress deadline → `isHealthy() == false`. |
 
+### Object lifetime
+
+The C++ transceiver takes ownership of the `LlmRequest` for the
+duration of an in-flight transfer:
+
+* `BaseCacheTransceiver::respondAndSendAsync`,
+  `requestAndReceiveSync`, `requestAndReceiveAsync`, and `cancelRequest`
+  / `cancelRequestStructured` all take `std::shared_ptr<LlmRequest>`.
+* The tracked-future vectors (`mSenderFutures`, `mRequesterFutures`)
+  store the same shared_ptr, so the C++ object outlives every worker
+  thread access regardless of when Python's `_terminate_request` drops
+  its pybind reference.
+
+This closes the historical "raw `LlmRequest*` use-after-free" class
+(`mRequestId == 0x5555555555555555` field traces). The Python-side
+`_can_terminate_request_now` guard remains in place — but its job is
+now memory *quiescence*, not lifetime: even with the request object
+pinned, `free_resources()` would release KV blocks back to the pool
+while the transport may still be writing into them, so termination
+must still wait for the structured cancel result to signal safety.
+
 ## Status polling is non-blocking by default
 
 `BaseCacheTransceiver::checkContextTransferStatus` and
