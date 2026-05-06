@@ -34,6 +34,10 @@ struct WorkspaceSlice
     size_t size{};
 };
 
+// NOTE: Each Sizes/Layout/Views triplet (e.g. AttentionContextWorkspace{Sizes,Layout,Views})
+// must be kept in sync: adding a field to Sizes requires a matching field in Layout and Views,
+// and the buildXxxLayout() / materializeXxx() methods must process them in the same order.
+// Tests in attentionWorkspaceTest.cpp verify consistency across these structs.
 struct AttentionContextWorkspaceSizes
 {
     size_t cublasWorkspace{CUBLAS_WORKSPACE_SIZE};

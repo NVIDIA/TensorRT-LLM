@@ -544,9 +544,6 @@ class FlashInferTrtllmGenAttention:
         self._layout = self.DEFAULT_KV_LAYOUT
         self._kv_cache_manager = kv_cache_manager
         self._quant_config = quant_config
-        self._kv_pool_cache = {}
-        self._pool_idx_cache = {}
-        self._block_tables_cache = {}
         self._multi_processor_count_cache = {}
         self._enable_pdl = get_env_enable_pdl()
         missing_ops = self._missing_fused_nanobind_ops()
@@ -897,92 +894,12 @@ class FlashInferTrtllmGenAttention:
             return cyclic_attention_window_size - 1
         return -1
 
-    def _get_kv_cache_and_block_tables(
+    def _build_kv_pool(
         self,
-        kv_cache_block_offsets,
-        host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping,
         layer_idx: int,
         num_kv_heads: int,
         tokens_per_block: int,
-        head_dim: int,
-        kv_cache_quant_mode: int,
-        batch_start: int,
-        batch_size: int,
-        dtype: torch.dtype,
-        is_mla_enable: bool = False,
-    ):
-        """Get FlashInfer kv_cache and block_tables.
-
-        The kv_cache tensor is a flat-block view of the per-layer KV cache pool.
-
-        Shape: [total_blocks, num_kv_heads, tokens_per_block, head_dim]
-        where each dim-0 element = one single K or V block.
-
-        FlashInfer receives kv_cache as a tuple (kv_pool, kv_pool) where
-        K and V share the same pool tensor. With uses_shared_paged_kv_idx=
-        False (flashinfer PR #2770), the kernel reads K/V offsets separately
-        from block_tables[batch, 2, max_blocks] and computes:
-            K_addr = pool_ptr + K_offset * block_size
-            V_addr = pool_ptr + V_offset * block_size
-
-        Raw block offsets are used directly as indices -- no division needed.
-
-        block_tables is a lightweight Python tensor slice (no C++ op call),
-        computed fresh each forward pass since batch composition changes.
-        """
-        if kv_cache_block_offsets is None:
-            return None, None
-
-        kv_pool = self._get_or_build_kv_pool(
-            host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
-            host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
-            layer_idx=layer_idx,
-            num_kv_heads=num_kv_heads,
-            tokens_per_block=tokens_per_block,
-            head_dim=head_dim,
-            kv_cache_quant_mode=kv_cache_quant_mode,
-            dtype=dtype,
-            is_mla_enable=is_mla_enable,
-        )
-        block_tables = self._slice_block_tables(
-            kv_cache_block_offsets=kv_cache_block_offsets,
-            host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
-            layer_idx=layer_idx,
-            batch_start=batch_start,
-            batch_size=batch_size,
-        )
-
-        return (kv_pool, kv_pool), block_tables
-
-    def _get_or_build_kv_pool(
-        self,
-        *,
-        host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping,
-        layer_idx: int,
-        num_kv_heads: int,
-        tokens_per_block: int,
-        head_dim: int,
-        kv_cache_quant_mode: int,
-        dtype: torch.dtype,
-        is_mla_enable: bool = False,
     ) -> torch.Tensor:
-        cache_scope = self._get_kv_pool_cache_scope(
-            host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
-            host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
-            num_kv_heads=num_kv_heads,
-            tokens_per_block=tokens_per_block,
-            head_dim=head_dim,
-            kv_cache_quant_mode=kv_cache_quant_mode,
-            dtype=dtype,
-            is_mla_enable=is_mla_enable,
-        )
-        cache_key = (layer_idx, cache_scope)
-        cached_kv_pool = self._kv_pool_cache.get(cache_key)
-        if cached_kv_pool is not None:
-            return cached_kv_pool
-
         kv_cache = self._kv_cache_manager.get_buffers(layer_idx, kv_layout="HND")
         block_elems = kv_cache.shape[2] * kv_cache.shape[3] * kv_cache.shape[4]
         storage_numel = kv_cache.untyped_storage().nbytes() // kv_cache.element_size()
@@ -1001,73 +918,7 @@ class FlashInferTrtllmGenAttention:
         )
         if kv_pool.data_ptr() != kv_cache.data_ptr():
             raise RuntimeError("Failed to create a no-copy trtllm-gen KV cache pool view.")
-        self._kv_pool_cache[cache_key] = kv_pool
         return kv_pool
-
-    def _get_kv_pool_cache_scope(
-        self,
-        *,
-        host_kv_cache_pool_pointers,
-        host_kv_cache_pool_mapping,
-        num_kv_heads: int,
-        tokens_per_block: int,
-        head_dim: int,
-        kv_cache_quant_mode: int,
-        dtype: torch.dtype,
-        is_mla_enable: bool,
-    ):
-        blocks_in_primary_pool = getattr(self._kv_cache_manager, "blocks_in_primary_pool", None)
-        if blocks_in_primary_pool is None:
-            blocks_per_window = getattr(self._kv_cache_manager, "blocks_per_window", None)
-            if blocks_per_window:
-                blocks_in_primary_pool = max(
-                    int(primary_blocks) for primary_blocks, _ in blocks_per_window.values()
-                )
-        if blocks_in_primary_pool is not None:
-            blocks_in_primary_pool = int(blocks_in_primary_pool)
-
-        return (
-            host_kv_cache_pool_pointers.data_ptr(),
-            host_kv_cache_pool_pointers._version,
-            host_kv_cache_pool_mapping.data_ptr(),
-            host_kv_cache_pool_mapping._version,
-            blocks_in_primary_pool,
-            int(getattr(self._kv_cache_manager, "num_local_layers", 0) or 0),
-            num_kv_heads,
-            tokens_per_block,
-            head_dim,
-            kv_cache_quant_mode,
-            dtype,
-            is_mla_enable,
-        )
-
-    def _slice_block_tables(
-        self,
-        *,
-        kv_cache_block_offsets,
-        host_kv_cache_pool_mapping,
-        layer_idx: int,
-        batch_start: int,
-        batch_size: int,
-    ):
-        cache_key = (host_kv_cache_pool_mapping.data_ptr(), layer_idx)
-        pool_idx = self._pool_idx_cache.get(cache_key)
-        if pool_idx is None:
-            pool_idx = int(host_kv_cache_pool_mapping[layer_idx, 0])
-            self._pool_idx_cache[cache_key] = pool_idx
-        block_tables_key = (
-            kv_cache_block_offsets.data_ptr(),
-            tuple(kv_cache_block_offsets.shape),
-            tuple(kv_cache_block_offsets.stride()),
-            pool_idx,
-            batch_start,
-            batch_size,
-        )
-        block_tables = self._block_tables_cache.get(block_tables_key)
-        if block_tables is None:
-            block_tables = kv_cache_block_offsets[pool_idx, batch_start : batch_start + batch_size]
-            self._block_tables_cache[block_tables_key] = block_tables
-        return block_tables
 
     @staticmethod
     def _missing_fused_nanobind_ops() -> List[str]:
@@ -1080,30 +931,23 @@ class FlashInferTrtllmGenAttention:
         )
         return [op for op in required_ops if not hasattr(thop, op)]
 
+    def _get_kv_cache_metadata(self, is_mla_enable: bool) -> Tuple[int, int]:
+        """Return (kv_factor, total_num_blocks) for building KV cache views."""
+        kv_factor = 1 if is_mla_enable else 2
+        total_num_blocks = (
+            self._kv_cache_manager.blocks_in_primary_pool
+            * self._kv_cache_manager.num_local_layers
+            * kv_factor
+        )
+        return kv_factor, total_num_blocks
+
     def run_context(self, params: EnqueueParams):
-        kv_factor = 0
-        total_num_blocks = 0
-        # KV metadata is cached in Python; these satisfy the fused op signature.
-        with nvtx_range("trtllm_gen.context.kv_metadata", color="blue"):
-            kv_cache, block_tables = self._get_kv_cache_and_block_tables(
-                kv_cache_block_offsets=params.kv_cache_block_offsets,
-                host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
-                host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
-                layer_idx=params.layer_idx,
-                num_kv_heads=params.num_kv_heads,
-                tokens_per_block=params.tokens_per_block,
-                head_dim=params.head_size,
-                kv_cache_quant_mode=params.kv_cache_quant_mode,
-                batch_start=params.seq_offset,
-                batch_size=params.batch_size,
-                dtype=params.qkv_input.dtype,
-                is_mla_enable=params.is_mla_enable,
-            )
+        kv_factor, total_num_blocks = self._get_kv_cache_metadata(params.is_mla_enable)
         with nvtx_range("trtllm_gen.context.preprocess", color="purple"):
             (
                 q_processed,
-                _kv_pool,
-                _block_tables,
+                kv_pool,
+                block_tables,
                 fmha_workspace,
                 cu_q_seqlens,
                 cu_kv_seqlens,
@@ -1153,13 +997,13 @@ class FlashInferTrtllmGenAttention:
                 multi_processor_count=params.multi_processor_count,
                 total_num_blocks=total_num_blocks,
                 kv_factor=kv_factor,
-                need_build_kv_cache_metadata=False,
+                need_build_kv_cache_metadata=True,
             )
 
         with nvtx_range("trtllm_gen.context.flashinfer", color="green"):
             flashinfer.prefill.trtllm_batch_context_with_kv_cache(
                 query=q_processed,
-                kv_cache=kv_cache,
+                kv_cache=(kv_pool, kv_pool),
                 workspace_buffer=fmha_workspace,
                 block_tables=block_tables,
                 seq_lens=params.sequence_lengths,
@@ -1222,29 +1066,12 @@ class FlashInferTrtllmGenAttention:
 
     def run_generation(self, params: EnqueueParams):
         batch_beam = params.num_requests * params.beam_width
-        kv_factor = 0
-        total_num_blocks = 0
-        # KV metadata is cached in Python; these satisfy the fused op signature.
-        with nvtx_range("trtllm_gen.generation.kv_metadata", color="blue"):
-            kv_cache, block_tables = self._get_kv_cache_and_block_tables(
-                kv_cache_block_offsets=params.kv_cache_block_offsets,
-                host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
-                host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
-                layer_idx=params.layer_idx,
-                num_kv_heads=params.num_kv_heads,
-                tokens_per_block=params.tokens_per_block,
-                head_dim=params.head_size,
-                kv_cache_quant_mode=params.kv_cache_quant_mode,
-                batch_start=params.seq_offset,
-                batch_size=batch_beam,
-                dtype=params.qkv_input.dtype,
-                is_mla_enable=params.is_mla_enable,
-            )
+        kv_factor, total_num_blocks = self._get_kv_cache_metadata(params.is_mla_enable)
         with nvtx_range("trtllm_gen.generation.preprocess", color="purple"):
             (
                 q_processed,
-                _kv_pool,
-                _block_tables,
+                kv_pool,
+                block_tables,
                 fmha_workspace,
                 cu_seqlens,
                 max_q_len,
@@ -1293,7 +1120,7 @@ class FlashInferTrtllmGenAttention:
                 multi_processor_count=params.multi_processor_count,
                 total_num_blocks=total_num_blocks,
                 kv_factor=kv_factor,
-                need_build_kv_cache_metadata=False,
+                need_build_kv_cache_metadata=True,
             )
 
         q_len_per_req = None if is_multi_token_gen else params.input_seq_length
@@ -1302,7 +1129,7 @@ class FlashInferTrtllmGenAttention:
         with nvtx_range("trtllm_gen.generation.flashinfer", color="green"):
             flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=q_processed,
-                kv_cache=kv_cache,
+                kv_cache=(kv_pool, kv_pool),
                 workspace_buffer=fmha_workspace,
                 block_tables=block_tables,
                 seq_lens=params.sequence_lengths,
@@ -1332,24 +1159,15 @@ class FlashInferTrtllmGenAttention:
 
         batch_beam = params.num_requests * params.beam_width
         with nvtx_range("trtllm_gen.mla.kv_metadata", color="blue"):
-            kv_cache_tuple, block_tables = self._get_kv_cache_and_block_tables(
-                kv_cache_block_offsets=params.kv_cache_block_offsets,
-                host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
-                host_kv_cache_pool_mapping=params.host_kv_cache_pool_mapping,
+            kv_cache = self._build_kv_pool(
                 layer_idx=params.layer_idx,
                 num_kv_heads=params.num_kv_heads,
                 tokens_per_block=params.tokens_per_block,
-                head_dim=params.head_size,
-                kv_cache_quant_mode=params.kv_cache_quant_mode,
-                batch_start=params.seq_offset,
-                batch_size=batch_beam,
-                dtype=params.attention_input.dtype,
-                is_mla_enable=params.is_mla_enable,
             )
-
-            # MLA decode API takes a single kv tensor [num_pages, 1, page_size, head_dim],
-            # not the (K_pool, V_pool) tuple.
-            kv_cache = kv_cache_tuple[0]
+            pool_idx = int(params.host_kv_cache_pool_mapping[params.layer_idx, 0])
+            block_tables = params.kv_cache_block_offsets[
+                pool_idx, params.seq_offset : params.seq_offset + batch_beam
+            ]
 
         with nvtx_range("trtllm_gen.mla.block_table_pad", color="yellow"):
             pages_per_superblock = 128 // params.tokens_per_block
