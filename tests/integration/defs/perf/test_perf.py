@@ -1491,6 +1491,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     def generate_trtllm_custom_dataset(self, dst_dataset_path: str,
                                        input_len: int, output_len: int,
                                        dataset_source: str):
+        if os.path.exists(dst_dataset_path) and os.path.getsize(
+                dst_dataset_path) > 0:
+            return
         # Currently only support cnn_dailymail dataset source.
         if dataset_source != "cnn_dailymail":
             raise ValueError(
