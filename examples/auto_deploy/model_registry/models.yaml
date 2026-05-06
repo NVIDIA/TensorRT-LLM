@@ -309,6 +309,9 @@ models:
 - name: deepseek-ai/DeepSeek-R1-0528
   config_id: deepseek_r1
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek-r1.yaml', 'enable_sharder_ir.yaml']
+- name: deepseek-ai/DeepSeek-V4-Flash
+  config_id: deepseek_v4_pr1_5layer
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek_v4_pr1_5layer.yaml']
 # OOM during AutoDeploy run.
 # - name: deepseek-ai/DeepSeek-Coder-V2-Instruct
 #   config_id: deepseek_v2_ep

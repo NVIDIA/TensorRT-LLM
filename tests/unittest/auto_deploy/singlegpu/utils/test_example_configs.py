@@ -20,6 +20,8 @@ as a yaml_extra for LlmArgs, which is the dry-run equivalent of:
 """
 
 import pathlib
+import sys
+from collections.abc import Callable
 
 import pytest
 import yaml
@@ -35,10 +37,26 @@ _AD_EXAMPLES_DIR = _REPO_ROOT / "examples" / "auto_deploy"
 _EXCLUDED_FILES = {
     "models.yaml",  # model registry index, not an LlmArgs config
     "flux_transforms.yaml",  # for build_and_run_flux.py, different schema
+    "nemotron_fp8_ir_test.yaml",  # full ExperimentConfig with top-level model/args
 }
 
 # Dummy model name used during validation (model path is not resolved during construction)
 _DUMMY_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+_DEEPSEEK_V4_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+_DEEPSEEK_V4_CONFIG_ID = "deepseek_v4_pr1_5layer"
+
+
+def _import_build_and_run_ad() -> tuple[type, Callable[[str, str | None], list[str]]]:
+    ad_examples_dir = str(_AD_EXAMPLES_DIR)
+    added_to_path = ad_examples_dir not in sys.path
+    if added_to_path:
+        sys.path.insert(0, ad_examples_dir)
+    try:
+        from build_and_run_ad import ExperimentConfig, get_registry_yaml_extra
+    finally:
+        if added_to_path:
+            sys.path.remove(ad_examples_dir)
+    return ExperimentConfig, get_registry_yaml_extra
 
 
 def _find_config_yamls():
@@ -116,3 +134,54 @@ def test_config_yaml_dry_run_ingestion(config_yaml_path):
     except ValidationError as e:
         if not _is_tolerable_validation_error(e):
             raise
+
+
+def test_deepseek_v4_pr1_registry_dry_run() -> None:
+    """DeepSeek V4 PR1 registry entry resolves to the expected dry-run config."""
+    ExperimentConfig, get_registry_yaml_extra = _import_build_and_run_ad()
+
+    yaml_extra = get_registry_yaml_extra(_DEEPSEEK_V4_MODEL, _DEEPSEEK_V4_CONFIG_ID)
+    assert [pathlib.Path(path).name for path in yaml_extra] == [
+        "dashboard_default.yaml",
+        "world_size_8.yaml",
+        "deepseek_v4_pr1_5layer.yaml",
+    ]
+
+    config = ExperimentConfig(
+        model=_DEEPSEEK_V4_MODEL,
+        use_registry=True,
+        registry_config_id=_DEEPSEEK_V4_CONFIG_ID,
+        dry_run=True,
+        prompt={"batch_size": 1},
+    )
+
+    args = config.args
+    assert args.model == _DEEPSEEK_V4_MODEL
+    assert args.model_factory == "DeepseekV4AutoModelForCausalLM"
+    assert args.attn_backend == "deepseek_v4_sparse"
+    assert args.compile_backend == "torch-simple"
+    assert not args.is_cuda_graph_enabled()
+    assert args.max_batch_size == 1
+    assert args.max_seq_len == 512
+    assert args.max_num_tokens == 512
+    assert args.model_kwargs["num_hidden_layers"] == 5
+    assert args.model_kwargs["skip_mtp"] is True
+    assert args.model_kwargs["ad_rope_cache_len"] == 512
+    assert args.model_kwargs["ad_compress_max_seq_len"] == 512
+
+    transforms = args.transforms
+    assert transforms["insert_cached_attention"]["backend"] == "deepseek_v4_sparse"
+    assert transforms["load_weights"]["disable_preload"] is True
+    assert transforms["quantize_finegrained_fp8_linear_from_config"]["enabled"] is True
+    assert transforms["quantize_mxfp4_moe"]["enabled"] is True
+    assert transforms["compile_model"]["backend"] == "torch-simple"
+
+    sharding = transforms["apply_sharding_hints"]
+    assert sharding["enabled"] is True
+    assert sharding["dist_mapping"] == {
+        "tp": 8,
+        "moe_ep": 8,
+        "moe_tp": 1,
+        "moe_cluster": 1,
+    }
+    assert sharding["shard_layers"] == ["mla", "moe"]

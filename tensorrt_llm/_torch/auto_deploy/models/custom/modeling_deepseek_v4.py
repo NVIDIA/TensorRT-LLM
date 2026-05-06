@@ -19,8 +19,8 @@ The implementation keeps the DeepSeek reference hierarchy
 ``embed`` / ``layers`` / ``norm`` / ``head`` so checkpoint-facing names remain
 auditable. It intentionally omits cached decode, Triton kernels, CUDA graph, and
 MTP modules. Sparse attention uses the narrow source-op boundary: this model
-forms Q/KV, compressor rows, and top-k indices; the source op owns only attention
-over those already-formed tensors plus the sink term.
+forms Q/KV, raw compressor projections, and top-k indices; the source op owns
+compressed-row construction plus attention over those rows and the sink term.
 """
 
 import math
@@ -1111,22 +1111,55 @@ def _sparse_attention(
     kv: torch.Tensor,
     attn_sink: torch.Tensor,
     topk_idxs: torch.Tensor,
+    compressor_kv: torch.Tensor,
+    compressor_gate: torch.Tensor,
+    compressor_ape: torch.Tensor,
+    compressor_norm_weight: torch.Tensor,
+    cos_compress_table: torch.Tensor,
+    sin_compress_table: torch.Tensor,
+    position_ids: torch.Tensor,
+    indexer_q: torch.Tensor,
+    indexer_weights: torch.Tensor,
+    indexer_compressor_kv: torch.Tensor,
+    indexer_compressor_gate: torch.Tensor,
+    indexer_compressor_ape: torch.Tensor,
+    indexer_compressor_norm_weight: torch.Tensor,
     softmax_scale: float,
     layer_idx: int,
     window_size: int,
     compress_ratio: int,
+    max_compressed_len: Optional[int],
+    rope_dim: Optional[int],
+    rms_norm_eps: float,
 ) -> torch.Tensor:
-    return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention(
+    return torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2(
         q,
         kv,
         attn_sink,
         topk_idxs,
+        compressor_kv,
+        compressor_gate,
+        compressor_ape,
+        compressor_norm_weight,
+        cos_compress_table,
+        sin_compress_table,
+        position_ids,
+        indexer_q,
+        indexer_weights,
+        indexer_compressor_kv,
+        indexer_compressor_gate,
+        indexer_compressor_ape,
+        indexer_compressor_norm_weight,
         softmax_scale,
         enable_sharding=True,
         layer_idx=layer_idx,
         layer_type="mla",
         window_size=window_size,
         compress_ratio=compress_ratio,
+        max_compressed_len=max_compressed_len,
+        head_dim=kv.shape[-1],
+        rope_dim=rope_dim,
+        rms_norm_eps=rms_norm_eps,
     )
 
 
@@ -1482,28 +1515,33 @@ class DeepseekV4Compressor(nn.Module):
         self.wgate = nn.Linear(self.hidden_size, channels * self.head_dim, bias=False)
         self.norm = DeepseekV4RMSNorm(self.head_dim, config.rms_norm_eps)
 
-    def forward(
+    def project(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        kv_all = _linear_module(hidden_states, self.wkv, layer_type="mla").float()
+        score_all = _linear_module(hidden_states, self.wgate, layer_type="mla").float()
+        return kv_all, score_all
+
+    def compress_projected(
         self,
-        hidden_states: torch.Tensor,
+        kv_all: torch.Tensor,
+        score_all: torch.Tensor,
         cos_table: torch.Tensor,
         sin_table: torch.Tensor,
         position_ids: torch.Tensor,
+        output_dtype: torch.dtype,
     ) -> torch.Tensor:
-        batch_size, seq_len, _ = hidden_states.shape
+        batch_size, seq_len, _ = kv_all.shape
         ratio = self.compress_ratio
         assert seq_len <= self.max_compressed_tokens, (
             "DeepSeek V4 compressor sequence length exceeds ad_compress_max_seq_len"
         )
 
-        row_offsets = torch.arange(self.max_compressed_len, device=hidden_states.device)
-        token_offsets = torch.arange(ratio, device=hidden_states.device)
+        row_offsets = torch.arange(self.max_compressed_len, device=kv_all.device)
+        token_offsets = torch.arange(ratio, device=kv_all.device)
         gather_idxs = row_offsets.unsqueeze(1) * ratio + token_offsets
         valid = gather_idxs < seq_len
         gather_idxs = torch.where(valid, gather_idxs, torch.zeros_like(gather_idxs))
         flat_idxs = gather_idxs.reshape(-1)
 
-        kv_all = _linear_module(hidden_states, self.wkv, layer_type="mla").float()
-        score_all = _linear_module(hidden_states, self.wgate, layer_type="mla").float()
         kv = kv_all[:, flat_idxs].view(batch_size, self.max_compressed_len, ratio, -1)
         score = score_all[:, flat_idxs].view(batch_size, self.max_compressed_len, ratio, -1)
         score = score + self.ape
@@ -1516,7 +1554,7 @@ class DeepseekV4Compressor(nn.Module):
             kv = _overlap_transform(kv, self.head_dim, 0.0)
             score = _overlap_transform(score, self.head_dim, -1.0e20)
 
-        compressed = (kv * score.softmax(dim=2)).sum(dim=2).to(hidden_states.dtype)
+        compressed = (kv * score.softmax(dim=2)).sum(dim=2).to(output_dtype)
         compressed = self.norm(compressed)
 
         row_start = row_offsets * ratio
@@ -1543,6 +1581,23 @@ class DeepseekV4Compressor(nn.Module):
         nope = _fake_fp8_act_quant(nope, block_size=64)
         return torch.cat((nope, pe), dim=-1)
 
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cos_table: torch.Tensor,
+        sin_table: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        kv_all, score_all = self.project(hidden_states)
+        return self.compress_projected(
+            kv_all,
+            score_all,
+            cos_table,
+            sin_table,
+            position_ids,
+            hidden_states.dtype,
+        )
+
 
 class DeepseekV4Indexer(nn.Module):
     def __init__(self, config: DeepseekV4Config, compress_ratio: int) -> None:
@@ -1564,17 +1619,13 @@ class DeepseekV4Indexer(nn.Module):
             rotate=True,
         )
 
-    def forward(
+    def project(
         self,
         hidden_states: torch.Tensor,
         q_lora: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        cos_table: torch.Tensor,
-        sin_table: torch.Tensor,
-        position_ids: torch.Tensor,
-        offset: int,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
         q = _linear_module(
             q_lora,
@@ -1597,7 +1648,6 @@ class DeepseekV4Indexer(nn.Module):
         q_pe = _apply_interleaved_rope(q_pe, cos.unsqueeze(2), sin.unsqueeze(2))
         q = _fake_fp4_act_quant(_hadamard_rotate(torch.cat((q_nope, q_pe), dim=-1)), block_size=32)
 
-        index_k = self.compressor(hidden_states, cos_table, sin_table, position_ids)
         weights = _linear_module(
             hidden_states,
             self.weights_proj,
@@ -1605,16 +1655,27 @@ class DeepseekV4Indexer(nn.Module):
             layer_type="mla",
         )
         weights = weights.float() * (self.softmax_scale * self.index_n_heads**-0.5)
+        compressor_kv, compressor_gate = self.compressor.project(hidden_states)
+        return q, weights, compressor_kv, compressor_gate
 
+    def select_topk(
+        self,
+        q: torch.Tensor,
+        index_k: torch.Tensor,
+        weights: torch.Tensor,
+        seq_len: int,
+        offset: int,
+    ) -> torch.Tensor:
         index_score = torch.einsum("bshd,btd->bsht", q, index_k).float()
         index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
         index_score = torch.ops.auto_deploy.all_reduce(index_score, layer_type="mla")
 
+        batch_size = q.shape[0]
         compressed_positions = torch.arange(
             self.compressor.max_compressed_len,
-            device=hidden_states.device,
+            device=q.device,
         )
-        valid_lengths = torch.arange(1, seq_len + 1, device=hidden_states.device).unsqueeze(1)
+        valid_lengths = torch.arange(1, seq_len + 1, device=q.device).unsqueeze(1)
         valid_lengths = valid_lengths // self.compress_ratio
         index_score = index_score.masked_fill(
             (compressed_positions.unsqueeze(0) >= valid_lengths).unsqueeze(0),
@@ -1622,9 +1683,7 @@ class DeepseekV4Indexer(nn.Module):
         )
 
         if self.index_topk == 0:
-            return torch.empty(
-                batch_size, seq_len, 0, device=hidden_states.device, dtype=torch.int64
-            )
+            return torch.empty(batch_size, seq_len, 0, device=q.device, dtype=torch.int64)
 
         topk_count = min(self.index_topk, self.compressor.max_compressed_len)
         topk_idxs = index_score.topk(topk_count, dim=-1).indices
@@ -1634,11 +1693,33 @@ class DeepseekV4Indexer(nn.Module):
             pad = torch.full(
                 (batch_size, seq_len, self.index_topk - topk_count),
                 -1,
-                device=hidden_states.device,
+                device=q.device,
                 dtype=topk_idxs.dtype,
             )
             topk_idxs = torch.cat((topk_idxs, pad), dim=-1)
         return topk_idxs.to(torch.int64)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        q_lora: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cos_table: torch.Tensor,
+        sin_table: torch.Tensor,
+        position_ids: torch.Tensor,
+        offset: int,
+    ) -> torch.Tensor:
+        q, weights, compressor_kv, compressor_gate = self.project(hidden_states, q_lora, cos, sin)
+        index_k = self.compressor.compress_projected(
+            compressor_kv,
+            compressor_gate,
+            cos_table,
+            sin_table,
+            position_ids,
+            hidden_states.dtype,
+        )
+        return self.select_topk(q, index_k, weights, hidden_states.shape[1], offset)
 
 
 class DeepseekV4Attention(nn.Module):
@@ -1726,25 +1807,53 @@ class DeepseekV4Attention(nn.Module):
         q = torch.cat((q_nope, q_pe), dim=-1)
         kv = torch.cat((kv_nope, kv_pe), dim=-1)
 
+        empty_compressor_state = kv.new_empty(batch_size, seq_len, 0)
+        empty_compressor_ape = kv.new_empty(0, 0)
+        empty_compressor_norm_weight = kv.new_empty(0)
+        empty_rope_table = kv.new_empty(0, 0)
+        empty_indexer_q = q.new_empty(batch_size, seq_len, 0, 0)
+        empty_indexer_weights = q.new_empty(batch_size, seq_len, 0)
         if self.compress_ratio:
             window_idxs = _window_topk_idxs(
                 self.window_size, batch_size, seq_len, hidden_states.device
             )
-            compressed_kv = self.compressor(
-                hidden_states, cos_compress_table, sin_compress_table, position_ids
-            )
+            compressor_kv, compressor_gate = self.compressor.project(hidden_states)
             if self.indexer is not None:
-                compressed_idxs = self.indexer(
+                (
+                    indexer_q,
+                    indexer_weights,
+                    indexer_compressor_kv,
+                    indexer_compressor_gate,
+                ) = self.indexer.project(
                     hidden_states,
                     q_lora,
                     cos_compress,
                     sin_compress,
+                )
+                index_k = self.indexer.compressor.compress_projected(
+                    indexer_compressor_kv,
+                    indexer_compressor_gate,
                     cos_compress_table,
                     sin_compress_table,
                     position_ids,
+                    hidden_states.dtype,
+                )
+                compressed_idxs = self.indexer.select_topk(
+                    indexer_q,
+                    index_k,
+                    indexer_weights,
+                    seq_len,
                     seq_len,
                 )
+                indexer_compressor_ape = self.indexer.compressor.ape
+                indexer_compressor_norm_weight = self.indexer.compressor.norm.weight
             else:
+                indexer_q = empty_indexer_q
+                indexer_weights = empty_indexer_weights
+                indexer_compressor_kv = empty_compressor_state
+                indexer_compressor_gate = empty_compressor_state
+                indexer_compressor_ape = empty_compressor_ape
+                indexer_compressor_norm_weight = empty_compressor_norm_weight
                 compressed_idxs = _compress_topk_idxs(
                     self.compress_ratio,
                     batch_size,
@@ -1753,17 +1862,32 @@ class DeepseekV4Attention(nn.Module):
                     self.compressor.max_compressed_len,
                     hidden_states.device,
                 )
-            kv_for_attention = torch.cat((kv, compressed_kv), dim=1)
             topk_idxs = torch.cat((window_idxs, compressed_idxs), dim=-1).to(torch.int64)
             attn_output = _sparse_attention(
                 q,
-                kv_for_attention,
+                kv,
                 self.attn_sink,
                 topk_idxs,
+                compressor_kv,
+                compressor_gate,
+                self.compressor.ape,
+                self.compressor.norm.weight,
+                cos_compress_table,
+                sin_compress_table,
+                position_ids,
+                indexer_q,
+                indexer_weights,
+                indexer_compressor_kv,
+                indexer_compressor_gate,
+                indexer_compressor_ape,
+                indexer_compressor_norm_weight,
                 self.softmax_scale,
                 self.layer_idx,
                 self.window_size,
                 self.compress_ratio,
+                self.compressor.max_compressed_len,
+                self.rope_head_dim,
+                self.rms_eps,
             )
         else:
             topk_idxs = _window_topk_idxs(
@@ -1774,10 +1898,26 @@ class DeepseekV4Attention(nn.Module):
                 kv,
                 self.attn_sink,
                 topk_idxs,
+                empty_compressor_state,
+                empty_compressor_state,
+                empty_compressor_ape,
+                empty_compressor_norm_weight,
+                empty_rope_table,
+                empty_rope_table,
+                position_ids,
+                empty_indexer_q,
+                empty_indexer_weights,
+                empty_compressor_state,
+                empty_compressor_state,
+                empty_compressor_ape,
+                empty_compressor_norm_weight,
                 self.softmax_scale,
                 self.layer_idx,
                 self.window_size,
                 self.compress_ratio,
+                None,
+                None,
+                self.rms_eps,
             )
 
         out_nope, out_pe = torch.split(

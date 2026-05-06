@@ -26,6 +26,7 @@ from torch import nn
 from torch.export import Dim
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+import tensorrt_llm._torch.auto_deploy.transform.library  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models import custom as custom_models
 from tensorrt_llm._torch.auto_deploy.models.custom import modeling_deepseek_v4 as dsv4
@@ -42,6 +43,10 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
 )
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
+from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig
+from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
+from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_op_args, is_op
 
 DeepseekV4Router = (
     getattr(dsv4, "DeepseekV4Router", None)
@@ -104,6 +109,36 @@ def _small_config(**overrides) -> DeepseekV4Config:
     }
     values.update(overrides)
     return DeepseekV4Config(**values)
+
+
+def _make_apply_sharding_hints_optimizer(
+    world_size: int,
+    rank: int,
+    dist_backend: str | None = None,
+) -> InferenceOptimizer:
+    apply_config = {"stage": "sharding"}
+    if dist_backend is not None:
+        apply_config["dist_backend"] = dist_backend
+
+    opt = InferenceOptimizer(
+        factory=None,
+        config={"apply_sharding_hints": apply_config},
+    )
+    opt.shared_config = SharedConfig(
+        local_rank=rank,
+        world_size=world_size,
+        dist_config=DistConfig(
+            world_size=world_size,
+            rank=rank,
+            tp_size=world_size,
+            moe_ep_size=world_size,
+        ),
+    )
+    return opt
+
+
+def _call_nodes(gm: torch.fx.GraphModule, op) -> list[torch.fx.Node]:
+    return [node for node in gm.graph.nodes if is_op(node, op)]
 
 
 def _position_ids(batch: int, seq: int, device: torch.device | str) -> torch.Tensor:
@@ -1662,7 +1697,7 @@ def test_export_dynamic_shapes_finite_logits_and_expected_ops() -> None:
     assert torch.isfinite(out_2).all()
 
     target_names = [str(node.target) for node in gm.graph.nodes if node.op == "call_function"]
-    assert target_names.count("auto_deploy.torch_deepseek_v4_sparse_attention.default") == 2
+    assert target_names.count("auto_deploy.torch_deepseek_v4_sparse_attention_v2.default") == 2
     assert "auto_deploy.torch_linear_simple.default" in target_names
     assert "auto_deploy.torch_moe.default" in target_names
     assert "auto_deploy.torch_attention.default" not in target_names
@@ -1675,6 +1710,166 @@ def test_export_dynamic_shapes_finite_logits_and_expected_ops() -> None:
         "auto_deploy.all_reduce.default",
         "auto_deploy.view.default",
     ]
+
+
+def test_export_mxfp4_experts_apply_sharding_hints_rank1_ep_graph() -> None:
+    config = _small_config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=8,
+        q_lora_rank=8,
+        qk_rope_head_dim=4,
+        o_groups=2,
+        o_lora_rank=8,
+        compress_ratios=(0,),
+        moe_intermediate_size=64,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        num_hash_layers=0,
+        ad_rope_cache_len=16,
+        ad_compress_max_seq_len=16,
+        max_position_embeddings=16,
+        ad_use_mxfp4_experts=True,
+    )
+    model = DeepseekV4ForCausalLM(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (2, 4))
+    position_ids = _position_ids(2, 4, input_ids.device)
+
+    gm = torch_export_to_gm(
+        model,
+        args=(input_ids,),
+        kwargs={"position_ids": position_ids},
+        strict=False,
+    )
+
+    base_op = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing.default
+    ep_op = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing_ep.default
+    assert len(_call_nodes(gm, base_op)) == 1
+
+    gm_out = _make_apply_sharding_hints_optimizer(
+        world_size=2,
+        rank=1,
+        dist_backend="torch",
+    )(None, gm)
+
+    assert len(_call_nodes(gm_out, base_op)) == 0
+    ep_nodes = _call_nodes(gm_out, ep_op)
+    assert len(ep_nodes) == 1
+    ep_node = ep_nodes[0]
+
+    [expert_start, gate_up_blocks] = extract_op_args(
+        ep_node,
+        "expert_start",
+        "gate_up_blocks",
+    )
+    assert expert_start == 2
+    assert getattr(gate_up_blocks, "op", None) == "get_attr"
+    assert gm_out.get_buffer(gate_up_blocks.target).shape[0] == 2
+
+    dist_all_reduce_op = torch.ops.auto_deploy.torch_dist_all_reduce.default
+    all_reduce_nodes = _call_nodes(gm_out, dist_all_reduce_op)
+    assert len(all_reduce_nodes) == 3
+    assert any(node.args[0] is ep_node for node in all_reduce_nodes)
+    assert len(_call_nodes(gm_out, torch.ops.auto_deploy.all_reduce.default)) == 0
+
+    layer = gm_out.get_submodule("layers.0")
+    assert layer.attn.attn_sink.shape == (config.num_attention_heads // 2,)
+    assert layer.attn.wq_b.weight.shape == (
+        config.num_attention_heads * config.head_dim // 2,
+        config.q_lora_rank,
+    )
+    assert layer.attn.wo_a.weight.shape == (
+        config.o_lora_rank,
+        config.num_attention_heads * config.head_dim // config.o_groups,
+    )
+    assert layer.attn.wo_b.weight.shape == (
+        config.hidden_size,
+        config.o_groups * config.o_lora_rank // 2,
+    )
+
+    sparse_nodes = _call_nodes(
+        gm_out,
+        torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2.default,
+    )
+    assert len(sparse_nodes) == 1
+    attn_sink = sparse_nodes[0].args[2]
+    assert getattr(attn_sink, "op", None) == "get_attr"
+    assert gm_out.get_parameter(attn_sink.target).shape == (config.num_attention_heads // 2,)
+
+    group_width = config.num_attention_heads * config.head_dim // config.o_groups
+    view_shapes = [
+        extract_op_args(node, "shape")[0]
+        for node in _call_nodes(gm_out, torch.ops.auto_deploy.view.default)
+    ]
+    assert [2, 4, -1, config.head_dim] in view_shapes
+    assert [2, 4, -1, group_width] in view_shapes
+    assert [-1, config.o_lora_rank, group_width] in view_shapes
+
+
+def test_ratio4_sparse_attention_sharding_only_splits_sink() -> None:
+    config = _small_config(
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=8,
+        q_lora_rank=8,
+        qk_rope_head_dim=4,
+        o_groups=2,
+        o_lora_rank=8,
+        compress_ratios=(4,),
+        index_n_heads=2,
+        index_head_dim=8,
+        index_topk=2,
+        moe_intermediate_size=64,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        num_hash_layers=0,
+        ad_rope_cache_len=16,
+        ad_compress_max_seq_len=16,
+        max_position_embeddings=16,
+    )
+    model = DeepseekV4ForCausalLM(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (2, 4))
+    position_ids = _position_ids(2, 4, input_ids.device)
+
+    gm = torch_export_to_gm(
+        model,
+        args=(input_ids,),
+        kwargs={"position_ids": position_ids},
+        strict=False,
+    )
+    gm_out = _make_apply_sharding_hints_optimizer(
+        world_size=2,
+        rank=1,
+        dist_backend="torch",
+    )(None, gm)
+
+    layer = gm_out.get_submodule("layers.0")
+    assert layer.attn.attn_sink.shape == (config.num_attention_heads // 2,)
+    assert layer.attn.compressor.norm.weight.shape == (config.head_dim,)
+    assert layer.attn.indexer.compressor.norm.weight.shape == (config.index_head_dim,)
+
+    sparse_nodes = _call_nodes(
+        gm_out,
+        torch.ops.auto_deploy.torch_deepseek_v4_sparse_attention_v2.default,
+    )
+    assert len(sparse_nodes) == 1
+    attn_sink = sparse_nodes[0].args[2]
+    compressor_norm = sparse_nodes[0].args[7]
+    indexer_norm = sparse_nodes[0].args[16]
+    assert getattr(attn_sink, "op", None) == "get_attr"
+    assert getattr(compressor_norm, "op", None) == "get_attr"
+    assert getattr(indexer_norm, "op", None) == "get_attr"
+    assert gm_out.get_parameter(attn_sink.target).shape == (config.num_attention_heads // 2,)
+    assert gm_out.get_parameter(compressor_norm.target).shape == (config.head_dim,)
+    assert gm_out.get_parameter(indexer_norm.target).shape == (config.index_head_dim,)
 
 
 def test_factory_registration() -> None:

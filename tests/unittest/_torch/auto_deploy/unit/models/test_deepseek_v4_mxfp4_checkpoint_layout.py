@@ -13,11 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import math
+import os
 from collections.abc import Sequence
+from pathlib import Path
 
 import pytest
 import torch
+from safetensors import safe_open
 
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
     DeepseekV4Config,
@@ -30,6 +34,7 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
 HIDDEN_SIZE = 64
 INTERMEDIATE_SIZE = 32
 LAYER = 3
+_DEEPSEEK_V4_FLASH_ENV_VARS = ("DEEPSEEK_V4_FLASH_MODEL_DIR", "DEEPSEEK_V4_MODEL_DIR")
 _E2M1_VALUES = torch.tensor(
     [
         0.0,
@@ -92,6 +97,76 @@ def _small_deepseek_v4_config(**overrides: object) -> DeepseekV4Config:
 
 def _key(layer: int, expert: int, weight_name: str, tensor_kind: str) -> str:
     return f"layers.{layer}.ffn.experts.{expert}.{weight_name}.{tensor_kind}"
+
+
+def _deepseek_v4_flash_checkpoint_or_skip() -> Path:
+    candidates: list[Path] = []
+    for env_var in _DEEPSEEK_V4_FLASH_ENV_VARS:
+        value = os.environ.get(env_var)
+        if value:
+            candidate = Path(value)
+            candidates.append(candidate)
+            candidates.append(candidate / "DeepSeek-V4-Flash")
+
+    models_root = os.environ.get("LLM_MODELS_ROOT")
+    if models_root:
+        root = Path(models_root)
+        candidates.extend(
+            (
+                root / "DeepSeek-V4-Flash",
+                root / "DeepSeek-V4" / "DeepSeek-V4-Flash",
+                root / "deepseek-ai" / "DeepSeek-V4-Flash",
+                root / "deepseek-ai__DeepSeek-V4-Flash",
+            )
+        )
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if (candidate / "model.safetensors.index.json").is_file():
+            return candidate
+
+    pytest.skip(
+        "DeepSeek-V4-Flash checkpoint not found; set DEEPSEEK_V4_FLASH_MODEL_DIR, "
+        "DEEPSEEK_V4_MODEL_DIR, or LLM_MODELS_ROOT to enable this MXFP4 layout check."
+    )
+
+
+def _load_real_checkpoint_layer0_expert0_mxfp4_state(
+    checkpoint_dir: Path,
+) -> dict[str, torch.Tensor]:
+    layer = 0
+    expert = 0
+    tensor_names = [
+        _key(layer, expert, projection, tensor_kind)
+        for projection in ("w1", "w2", "w3")
+        for tensor_kind in ("weight", "scale")
+    ]
+    index_path = checkpoint_dir / "model.safetensors.index.json"
+    with index_path.open(encoding="utf-8") as index_file:
+        index = json.load(index_file)
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict):
+        pytest.skip(f"DeepSeek-V4-Flash checkpoint index is missing weight_map: {index_path}")
+
+    shard_to_tensor_names: dict[str, list[str]] = {}
+    for tensor_name in tensor_names:
+        shard_name = weight_map.get(tensor_name)
+        if not isinstance(shard_name, str):
+            pytest.skip(f"DeepSeek-V4-Flash checkpoint is missing tensor {tensor_name}")
+        shard_to_tensor_names.setdefault(shard_name, []).append(tensor_name)
+
+    state: dict[str, torch.Tensor] = {}
+    for shard_name, shard_tensor_names in shard_to_tensor_names.items():
+        shard_path = checkpoint_dir / shard_name
+        if not shard_path.is_file():
+            pytest.skip(f"DeepSeek-V4-Flash checkpoint is missing shard {shard_path}")
+        with safe_open(shard_path, framework="pt", device="cpu") as shard:
+            for tensor_name in shard_tensor_names:
+                state[tensor_name] = shard.get_tensor(tensor_name)
+    return state
 
 
 def _raw_bytes(shape: Sequence[int], offset: int) -> torch.Tensor:
@@ -321,6 +396,66 @@ def test_layout_preserves_float8_e8m0_scale_raw_bytes_when_dtype_exists() -> Non
     assert torch.equal(packed.gate_up_scales[0, :INTERMEDIATE_SIZE], _scale(state, 0, "w3"))
     assert torch.equal(packed.gate_up_scales[0, INTERMEDIATE_SIZE:], _scale(state, 0, "w1"))
     assert torch.equal(packed.down_scales[0], _scale(state, 0, "w2"))
+
+
+def test_deepseek_v4_flash_real_checkpoint_layer0_expert0_mxfp4_layout() -> None:
+    checkpoint_dir = _deepseek_v4_flash_checkpoint_or_skip()
+    state = _load_real_checkpoint_layer0_expert0_mxfp4_state(checkpoint_dir)
+    hidden_size = 4096
+    intermediate_size = 2048
+    expert = 0
+
+    packed = build_deepseek_v4_packed_mxfp4_experts_layout().pack_experts(
+        state,
+        layer=0,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        expert_indices=(expert,),
+        num_experts=256,
+    )
+
+    assert packed.expert_indices == (expert,)
+    assert packed.gate_up_blocks.shape == (1, 2 * intermediate_size, hidden_size // 32, 16)
+    assert packed.gate_up_scales.shape == (1, 2 * intermediate_size, hidden_size // 32)
+    assert packed.down_blocks.shape == (1, hidden_size, intermediate_size // 32, 16)
+    assert packed.down_scales.shape == (1, hidden_size, intermediate_size // 32)
+    assert packed.gate_up_blocks.dtype == torch.uint8
+    assert packed.gate_up_scales.dtype == torch.uint8
+    assert packed.down_blocks.dtype == torch.uint8
+    assert packed.down_scales.dtype == torch.uint8
+
+    w3_blocks = _raw_uint8(state[_key(0, expert, "w3", "weight")]).view(
+        intermediate_size, hidden_size // 32, 16
+    )
+    w1_blocks = _raw_uint8(state[_key(0, expert, "w1", "weight")]).view(
+        intermediate_size, hidden_size // 32, 16
+    )
+    w2_blocks = _raw_uint8(state[_key(0, expert, "w2", "weight")]).view(
+        hidden_size, intermediate_size // 32, 16
+    )
+    w3_scales = _raw_uint8(state[_key(0, expert, "w3", "scale")]).view(
+        intermediate_size, hidden_size // 32
+    )
+    w1_scales = _raw_uint8(state[_key(0, expert, "w1", "scale")]).view(
+        intermediate_size, hidden_size // 32
+    )
+    w2_scales = _raw_uint8(state[_key(0, expert, "w2", "scale")]).view(
+        hidden_size, intermediate_size // 32
+    )
+
+    assert torch.equal(packed.gate_up_blocks[0, :intermediate_size], w3_blocks)
+    assert torch.equal(packed.gate_up_blocks[0, intermediate_size:], w1_blocks)
+    assert torch.equal(packed.down_blocks[0], w2_blocks)
+    assert torch.equal(packed.gate_up_scales[0, :intermediate_size], w3_scales)
+    assert torch.equal(packed.gate_up_scales[0, intermediate_size:], w1_scales)
+    assert torch.equal(packed.down_scales[0], w2_scales)
+    assert torch.equal(
+        _unpack_nibbles(packed.gate_up_blocks[0, 0, 0, :4]),
+        _unpack_nibbles(w3_blocks[0, 0, :4]),
+    )
+    assert torch.equal(packed.gate_up_scales[0, 0, :8], w3_scales[0, :8])
+    assert torch.equal(packed.gate_up_scales[0, intermediate_size, :8], w1_scales[0, :8])
+    assert torch.equal(packed.down_scales[0, 0, :8], w2_scales[0, :8])
 
 
 @pytest.mark.parametrize(

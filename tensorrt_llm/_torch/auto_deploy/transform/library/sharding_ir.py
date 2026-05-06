@@ -918,13 +918,48 @@ class AttentionSinkShardableNode(ShardableNode):
         return False
 
 
+class DeepSeekV4AttentionSinkShardableNode(ShardableNode):
+    """DeepSeek V4 sparse attention: shard only the per-head sink tensor."""
+
+    def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
+        if dc.tp_size <= 1:
+            return 0
+
+        [enable_sharding] = extract_op_args(self.node, "enable_sharding")
+        if enable_sharding is False:
+            return 0
+
+        [attn_sink_node] = extract_op_args(self.node, "attn_sink")
+        if not isinstance(attn_sink_node, Node):
+            return 0
+
+        weight_nodes = extract_weight_nodes(attn_sink_node)
+        count = 0
+        for wn in weight_nodes.weights:
+            shard_weight_tensor(
+                gm=gm,
+                weight_tensor=wn.tensor,
+                param_key=wn.node_key,
+                dim=0,
+                rank=dc.tp_rank,
+                world_size=dc.tp_size,
+            )
+            count += 1
+
+        if count:
+            ad_logger.debug(f"  sharded {count} DeepSeek V4 attention sink tensor(s)")
+        return 1 if count > 0 else 0
+
+
 for _sparse_attention_op_name in (
     "torch_deepseek_v4_sparse_attention",
+    "torch_deepseek_v4_sparse_attention_v2",
     "torch_deepseek_v4_sparse_attention_with_cache",
+    "torch_deepseek_v4_sparse_attention_v2_with_cache",
 ):
     try:
         ShardableNode.register(getattr(torch.ops.auto_deploy, _sparse_attention_op_name))(
-            AttentionSinkShardableNode
+            DeepSeekV4AttentionSinkShardableNode
         )
     except AttributeError:
         pass
