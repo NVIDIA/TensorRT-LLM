@@ -32,7 +32,7 @@ refactors, renamed attributes, or silent unit changes in the populate
 block.
 
 Attention-DP-specific cases verify that dummy padding is excluded from
-planner/FPM metrics and that rank-local iter-stats payloads are aggregated
+planner/FPM metrics and that rank-local iter-stats payloads are emitted
 only when all ranks line up on the same iteration.
 """
 
@@ -67,6 +67,8 @@ class _StubRequest:
         context_current_position: int = 0,
         num_tokens: int = 0,
         is_attention_dp_dummy: bool = False,
+        is_cuda_graph_dummy: bool = False,
+        is_dummy_request: bool = False,
     ):
         self.context_current_position = context_current_position
         # py_last_context_chunk = (begin_compute, end_compute). For a fresh
@@ -80,6 +82,16 @@ class _StubRequest:
             self.py_last_context_chunk = None
         self._num_tokens = num_tokens
         self.is_attention_dp_dummy = is_attention_dp_dummy
+        self.is_cuda_graph_dummy = is_cuda_graph_dummy
+        self.is_dummy_request = is_dummy_request
+
+    @property
+    def is_dummy(self) -> bool:
+        return (
+            self.is_attention_dp_dummy
+            or self.is_cuda_graph_dummy
+            or self.is_dummy_request
+        )
 
     def get_num_tokens(self, beam: int = 0) -> int:
         return self._num_tokens
@@ -380,8 +392,8 @@ def test_paused_decode_requests():
     assert ifb.num_paused_kv_tokens == 1100
 
 
-def test_attention_dp_dummy_filtering_on_kv_token_fields():
-    # Dummy-padding added by ``_pad_attention_dp_dummy_request`` must not
+def test_dummy_filtering_on_kv_token_fields():
+    # Dummy-padding added by Attention-DP or CUDA graph capture must not
     # contribute to the KV-token-weighted fields under test
     # (num_ctx_kv_tokens, num_gen_kv_tokens, num_paused_kv_tokens).
     # The existing count fields (num_context_requests / num_gen_requests /
@@ -395,10 +407,21 @@ def test_attention_dp_dummy_filtering_on_kv_token_fields():
             context_current_position=0,
             is_attention_dp_dummy=True,
         ),
+        _StubRequest(
+            context_chunk_size=300,
+            context_current_position=75,
+            is_cuda_graph_dummy=True,
+        ),
         _StubRequest(context_chunk_size=200, context_current_position=50),
     ]
-    gen = [_StubRequest(num_tokens=1024, is_attention_dp_dummy=True)]
-    paused = [_StubRequest(num_tokens=500, is_attention_dp_dummy=True)]
+    gen = [
+        _StubRequest(num_tokens=1024, is_attention_dp_dummy=True),
+        _StubRequest(num_tokens=2048, is_cuda_graph_dummy=True),
+    ]
+    paused = [
+        _StubRequest(num_tokens=500, is_attention_dp_dummy=True),
+        _StubRequest(num_tokens=700, is_cuda_graph_dummy=True),
+    ]
     stats = _invoke_update_iter_stats(
         _StubScheduledBatch(context_reqs=ctx, gen_reqs=gen, paused_reqs=paused),
         [],
@@ -406,9 +429,9 @@ def test_attention_dp_dummy_filtering_on_kv_token_fields():
     )
     ifb = stats.inflight_batching_stats
     # Count fields include dummies (populated directly from scheduled_batch).
-    assert ifb.num_context_requests == 2
-    assert ifb.num_gen_requests == 1
-    assert ifb.num_paused_requests == 1
+    assert ifb.num_context_requests == 3
+    assert ifb.num_gen_requests == 2
+    assert ifb.num_paused_requests == 2
     # KV-token-weighted new fields filter dummies.
     assert ifb.num_ctx_kv_tokens == 50  # only the non-dummy's start
     assert ifb.num_gen_kv_tokens == 0  # dummy gen filtered
@@ -416,22 +439,29 @@ def test_attention_dp_dummy_filtering_on_kv_token_fields():
 
 
 def test_attention_dp_dummy_filtering_on_count_fields():
-    # Under attention-DP, the rank-local payload that will be summed across
-    # ranks must exclude dummy padding from request counts too.
+    # Under attention-DP, the rank-local payload emitted for each rank must
+    # exclude ADP and CUDA graph dummy padding from request counts too.
     ctx = [
         _StubRequest(
             context_chunk_size=100,
             context_current_position=0,
             is_attention_dp_dummy=True,
         ),
+        _StubRequest(
+            context_chunk_size=150,
+            context_current_position=25,
+            is_cuda_graph_dummy=True,
+        ),
         _StubRequest(context_chunk_size=200, context_current_position=50),
     ]
     gen = [
         _StubRequest(num_tokens=1024, is_attention_dp_dummy=True),
+        _StubRequest(num_tokens=1536, is_cuda_graph_dummy=True),
         _StubRequest(num_tokens=2048),
     ]
     paused = [
         _StubRequest(num_tokens=500, is_attention_dp_dummy=True),
+        _StubRequest(num_tokens=600, is_cuda_graph_dummy=True),
         _StubRequest(num_tokens=700),
     ]
 
@@ -504,8 +534,8 @@ def test_num_ctx_kv_tokens_ignores_iter_states_side_channel():
 
 
 # ---------------------------------------------------------------------------
-# Attention-DP aggregation tests: completed rank-local payloads are carried
-# by the next ADP allgather, then rank 0 appends one engine-wide aggregate.
+# Attention-DP fanout tests: completed rank-local payloads are carried by the
+# next ADP allgather, then rank 0 appends one row per ADP rank.
 # ---------------------------------------------------------------------------
 
 
@@ -553,6 +583,7 @@ def _build_adp_stats_harness(pending_stats, *, rank=0, tp_rank=0):
 
     harness = _AdpStatsHarness()
     harness.dist = types.SimpleNamespace(rank=rank, tp_rank=tp_rank)
+    harness.enable_attention_dp = True
     harness.stats_lock = threading.Lock()
     harness.stats = []
     harness.max_stats_len = 64
@@ -571,12 +602,12 @@ def _build_adp_stats_harness(pending_stats, *, rank=0, tp_rank=0):
     )
 
     for method_name in (
-        "_aggregate_adp_iter_stats",
         "_append_iter_stats",
         "_clear_pending_adp_iter_stats_through",
         "_drop_pending_adp_iter_stats_before",
         "_ensure_adp_zero_iter_stats_payload",
         "_finalize_pending_adp_iter_stats",
+        "_make_adp_rank_iter_stats",
         "_make_adp_iter_stats_payload",
         "_next_adp_iter_stats_payload",
         "_queue_adp_iter_stats",
@@ -590,9 +621,10 @@ def _build_adp_stats_harness(pending_stats, *, rank=0, tp_rank=0):
     return harness
 
 
-def test_attention_dp_aggregation_sums_rank_local_fields_only():
-    # Rank 0 emits the planner-visible aggregate; each ADP rank contributes
-    # only rank-local scheduled work, while queued fields remain rank-0-owned.
+def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
+    # Rank 0 emits one stats row per ADP rank. Scheduled fields stay
+    # rank-local so FPM can reveal load imbalance, while queued fields remain
+    # rank-0-owned because the executor request queue lives on rank 0.
     rank0_stats = _make_adp_iteration_stats(
         iter_id=9,
         num_context_requests=1,
@@ -607,6 +639,7 @@ def test_attention_dp_aggregation_sums_rank_local_fields_only():
         num_queued_gen_requests=8,
         num_queued_gen_kv_tokens=800,
     )
+    rank0_stats.iter_latency_ms = 12.5
     harness = _build_adp_stats_harness(rank0_stats)
     rank0_state = RankState(rank=0, iter_stats=harness._next_adp_iter_stats_payload())
     rank1_state = RankState(
@@ -626,29 +659,52 @@ def test_attention_dp_aggregation_sums_rank_local_fields_only():
 
     harness._finalize_pending_adp_iter_stats([rank0_state, rank1_state])
 
-    assert len(harness.stats) == 1
-    appended_stats, req_stats, kv_iter_stats = harness.stats[0]
-    ifb = appended_stats.inflight_batching_stats
-    assert ifb.num_context_requests == 4
-    assert ifb.num_ctx_tokens == 400
-    assert ifb.num_ctx_kv_tokens == 40
-    assert ifb.num_gen_requests == 6
-    assert ifb.num_gen_kv_tokens == 60
-    assert ifb.num_paused_requests == 3
-    assert ifb.num_paused_kv_tokens == 30
-    assert ifb.num_scheduled_requests == 10
+    assert len(harness.stats) == 2
 
-    # Queued fields are engine-global on rank 0 and must not be summed.
-    assert ifb.num_queued_context_requests == 7
-    assert ifb.num_queued_ctx_tokens == 700
-    assert ifb.num_queued_gen_requests == 8
-    assert ifb.num_queued_gen_kv_tokens == 800
-    assert req_stats == ["req-stats"]
-    assert kv_iter_stats == "pending-kv"
+    rank0_row, rank0_req_stats, rank0_kv_iter_stats, rank0_tag = harness.stats[0]
+    rank0_ifb = rank0_row.inflight_batching_stats
+    assert rank0_tag == 0
+    assert rank0_row.iter_latency_ms == 12.5
+    assert rank0_ifb.num_context_requests == 1
+    assert rank0_ifb.num_ctx_tokens == 100
+    assert rank0_ifb.num_ctx_kv_tokens == 10
+    assert rank0_ifb.num_gen_requests == 2
+    assert rank0_ifb.num_gen_kv_tokens == 20
+    assert rank0_ifb.num_paused_requests == 1
+    assert rank0_ifb.num_paused_kv_tokens == 5
+    assert rank0_ifb.num_scheduled_requests == 3
+    assert rank0_ifb.num_queued_context_requests == 7
+    assert rank0_ifb.num_queued_ctx_tokens == 700
+    assert rank0_ifb.num_queued_gen_requests == 8
+    assert rank0_ifb.num_queued_gen_kv_tokens == 800
+    assert rank0_req_stats == ["req-stats"]
+    assert rank0_kv_iter_stats == "pending-kv"
+
+    rank1_row, rank1_req_stats, rank1_kv_iter_stats, rank1_tag = harness.stats[1]
+    rank1_ifb = rank1_row.inflight_batching_stats
+    assert rank1_tag == 1
+    assert rank1_row.iter_latency_ms == 12.5
+    assert rank1_ifb.num_context_requests == 3
+    assert rank1_ifb.num_ctx_tokens == 300
+    assert rank1_ifb.num_ctx_kv_tokens == 30
+    assert rank1_ifb.num_gen_requests == 4
+    assert rank1_ifb.num_gen_kv_tokens == 40
+    assert rank1_ifb.num_paused_requests == 2
+    assert rank1_ifb.num_paused_kv_tokens == 25
+    assert rank1_ifb.num_scheduled_requests == 7
+    # Expected to be zero/None because queued/request/KV stats are reported
+    # only on rank 0.
+    assert rank1_ifb.num_queued_context_requests == 0
+    assert rank1_ifb.num_queued_ctx_tokens == 0
+    assert rank1_ifb.num_queued_gen_requests == 0
+    assert rank1_ifb.num_queued_gen_kv_tokens == 0
+    assert rank1_req_stats is None
+    assert rank1_kv_iter_stats is None
+
     assert harness._pending_adp_iter_stats_payloads == {}
 
 
-def test_attention_dp_aggregation_waits_for_complete_matching_payloads():
+def test_attention_dp_fanout_waits_for_complete_matching_payloads():
     rank0_stats = _make_adp_iteration_stats(iter_id=9, num_context_requests=1)
     harness = _build_adp_stats_harness(rank0_stats)
     rank0_state = RankState(rank=0, iter_stats=harness._next_adp_iter_stats_payload())
@@ -674,7 +730,7 @@ def test_attention_dp_aggregation_waits_for_complete_matching_payloads():
     assert harness._next_adp_iter_stats_payload() is rank0_state.iter_stats
 
 
-def test_attention_dp_aggregation_buffers_multiple_pending_payloads():
+def test_attention_dp_fanout_buffers_multiple_pending_payloads():
     rank0_stats_9 = _make_adp_iteration_stats(iter_id=9, num_context_requests=1)
     rank0_stats_10 = _make_adp_iteration_stats(iter_id=10, num_context_requests=2)
     harness = _build_adp_stats_harness(rank0_stats_9)
@@ -685,7 +741,7 @@ def test_attention_dp_aggregation_buffers_multiple_pending_payloads():
     assert harness._next_adp_iter_stats_payload().iter_stats_iter == 9
 
 
-def test_attention_dp_aggregation_aligns_non_rank0_to_rank0_iter():
+def test_attention_dp_fanout_aligns_non_rank0_to_rank0_iter():
     rank1_stats = _make_adp_iteration_stats(iter_id=10, num_context_requests=3)
     harness = _build_adp_stats_harness(rank1_stats, rank=1, tp_rank=1)
     rank0_state = RankState(

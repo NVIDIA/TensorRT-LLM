@@ -196,3 +196,11 @@ class TestStatsSerializer:
         result = BaseWorker._stats_serializer((iter_stats, None))
         d = json.loads(result)
         assert "kvCacheIterationStats" not in d
+
+    def test_serializer_attention_dp_rank_tag(self):
+        """ADP 4-tuple should carry the supplied attention-DP rank."""
+        iter_stats = _make_mock_iteration_stats()
+
+        result = BaseWorker._stats_serializer((iter_stats, None, None, 3))
+        d = json.loads(result)
+        assert d["attentionDpRank"] == 3

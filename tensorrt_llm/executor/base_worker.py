@@ -664,14 +664,13 @@ class BaseWorker(GenerationExecutor):
     def _stats_serializer(stats) -> str:
         iteration_stats, req_stats = stats[0], stats[1]
         kv_iter_stats = stats[2] if len(stats) > 2 else None
+        attention_dp_rank = stats[3] if len(stats) > 3 else 0
 
         stats_dict = json.loads(iteration_stats.to_json_str())
-        # Tag with dp_rank=0 so Dynamo's adapter can always read
-        # stat["attentionDpRank"] without a missing-key branch. Under
-        # attention-DP, rank 0 emits one engine-wide aggregate; if rank 0
-        # stalls, stats emission is silent with the rest of the rank-0 RPC
-        # path.
-        stats_dict.setdefault("attentionDpRank", 0)
+        # Always tag the row so Dynamo's adapter can read
+        # stat["attentionDpRank"] without a missing-key branch. Non-ADP stats
+        # default to rank 0; ADP stats carry the rank supplied by PyExecutor.
+        stats_dict["attentionDpRank"] = attention_dp_rank
 
         if req_stats is not None and len(req_stats) > 0:
             stats_dict["requestStats"] = []

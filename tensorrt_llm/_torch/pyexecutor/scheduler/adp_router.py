@@ -108,15 +108,17 @@ class RankState:
     def deserialize(cls, data: list[int]) -> RankState:
         """Deserialize from a flat list received via allgather."""
         values = list(data)
-        rank_state_fields = fields(cls)[:3]
+        rank_state_prefix_field_count = 3
+        rank_state_fields = fields(cls)[:rank_state_prefix_field_count]
+        max_field_count = rank_state_prefix_field_count + len(fields(RankIterStatsPayload))
         if len(values) < 1:
             raise ValueError("RankState payload is missing required field rank")
-        if len(values) > 3 + len(fields(RankIterStatsPayload)):
+        if len(values) > max_field_count:
             raise ValueError(
                 f"RankState payload has {len(values)} fields, expected at most "
-                f"{3 + len(fields(RankIterStatsPayload))}"
+                f"{max_field_count}"
             )
-        rank_values = values[:3]
+        rank_values = values[:rank_state_prefix_field_count]
         for field_info in rank_state_fields[len(rank_values) :]:
             if field_info.default is not MISSING:
                 rank_values.append(field_info.default)
@@ -128,7 +130,9 @@ class RankState:
             rank=rank_values[0],
             num_active_requests=rank_values[1],
             num_active_tokens=rank_values[2],
-            iter_stats=RankIterStatsPayload.deserialize(values[3:]),
+            iter_stats=RankIterStatsPayload.deserialize(
+                values[rank_state_prefix_field_count:]
+            ),
         )
 
 

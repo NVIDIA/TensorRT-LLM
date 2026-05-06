@@ -560,11 +560,10 @@ class PyExecutor:
         # Iteration IDs whose pending payload is an explicit zero placeholder,
         # not real measured local stats.
         self._synthetic_adp_iter_stats_iters: Set[int] = set()
-        # Rank 0 only: full IterationStats objects waiting for ADP aggregation.
+        # Rank 0 only: full IterationStats objects waiting for ADP fanout.
         self._pending_adp_iter_stats: Dict[int, IterationStats] = {}
-        # Rank 0 only: per-request stats preserved for compatibility. TODO:
-        # aggregate RequestStats across ADP ranks before treating them as
-        # engine-wide request details.
+        # Rank 0 only: per-request stats preserved for compatibility.
+        # RequestStats remain rank-0-owned under Attention-DP.
         self._pending_adp_req_stats: Dict[int,
                                           Optional[List[RequestStats]]] = {}
         # Rank 0 only: KV iteration stats captured with pending IterationStats.
@@ -1195,22 +1194,30 @@ class PyExecutor:
             else:
                 self._latest_kv_iter_stats = None
 
+        def is_stats_dummy_request(req) -> bool:
+            return bool(
+                getattr(req, "is_dummy", False) or
+                getattr(req, "is_attention_dp_dummy", False) or
+                getattr(req, "is_cuda_graph_dummy", False) or
+                getattr(req, "is_dummy_request", False))
+
         # Attention-DP may add dummy requests to keep ranks aligned during
-        # distributed scheduling. Those placeholders are not user work, so
-        # count the request lists with a filter instead of using the cached
-        # batch counters, which include every scheduled item.
+        # distributed scheduling. CUDA graph padding can add dummies too.
+        # Those placeholders are not user work, so count the request lists
+        # with a filter instead of using the cached batch counters, which
+        # include every scheduled item.
         if getattr(self, "enable_attention_dp", False):
             # The sum(...) scans are small and keep planner-facing metrics
-            # from treating Attention-DP dummy requests as real load.
+            # from treating dummy requests as real load.
             num_context_requests = sum(
                 1 for req in scheduled_batch.context_requests
-                if not getattr(req, "is_attention_dp_dummy", False))
+                if not is_stats_dummy_request(req))
             num_gen_requests = sum(
                 1 for req in scheduled_batch.generation_requests
-                if not getattr(req, "is_attention_dp_dummy", False))
+                if not is_stats_dummy_request(req))
             num_paused_requests = sum(
                 1 for req in scheduled_batch.paused_requests
-                if not getattr(req, "is_attention_dp_dummy", False))
+                if not is_stats_dummy_request(req))
         else:
             num_context_requests = scheduled_batch.num_context_requests
             num_gen_requests = scheduled_batch.num_generation_requests
@@ -1293,7 +1300,7 @@ class PyExecutor:
         # RuntimeError on a mutated request.
         num_ctx_kv_tokens = 0
         for req in scheduled_batch.context_requests:
-            if getattr(req, "is_attention_dp_dummy", False):
+            if is_stats_dummy_request(req):
                 continue
             last_chunk = getattr(req, "py_last_context_chunk", None)
             if last_chunk is not None and last_chunk[0] is not None:
@@ -1310,7 +1317,7 @@ class PyExecutor:
         # summed across scheduled generation requests.
         num_gen_kv_tokens = 0
         for req in scheduled_batch.generation_requests:
-            if getattr(req, "is_attention_dp_dummy", False):
+            if is_stats_dummy_request(req):
                 continue
             try:
                 num_gen_kv_tokens += req.get_num_tokens(0)
@@ -1362,7 +1369,7 @@ class PyExecutor:
         # pool for this iteration.
         num_paused_kv_tokens = 0
         for req in scheduled_batch.paused_requests:
-            if getattr(req, "is_attention_dp_dummy", False):
+            if is_stats_dummy_request(req):
                 continue
             try:
                 num_paused_kv_tokens += req.get_num_tokens(0)
@@ -1417,7 +1424,7 @@ class PyExecutor:
             self._pending_adp_iter_stats[iter_id] = stats
             self._pending_adp_req_stats[iter_id] = req_stats
             # Capture KV iteration stats with this IterationStats object.
-            # ADP aggregation happens on a later allgather, when
+            # ADP fanout happens on a later allgather, when
             # _latest_kv_iter_stats may already refer to a newer iteration.
             self._pending_adp_kv_iter_stats[
                 iter_id] = self._latest_kv_iter_stats
@@ -1430,7 +1437,11 @@ class PyExecutor:
         return self._pending_adp_iter_stats_payloads[iter_id]
 
     def _ensure_adp_zero_iter_stats_payload(self, iter_id: int) -> None:
-        """All ranks: add a zero payload when this rank had no work for iter."""
+        """All ranks: add zero payload when this rank had no work for iter.
+
+        This can happen when rank 0 advances an iteration but another ADP rank
+        has no scheduled real work for that iteration, e.g. concurrency < dpSize.
+        """
         if iter_id in self._pending_adp_iter_stats_payloads:
             return
         self._pending_adp_iter_stats_payloads[iter_id] = RankIterStatsPayload(
@@ -1439,52 +1450,104 @@ class PyExecutor:
         )
         self._synthetic_adp_iter_stats_iters.add(iter_id)
 
+    def _discard_pending_adp_iter_stats(self, iter_id: int) -> None:
+        self._pending_adp_iter_stats_payloads.pop(iter_id, None)
+        self._synthetic_adp_iter_stats_iters.discard(iter_id)
+        self._pending_adp_iter_stats.pop(iter_id, None)
+        self._pending_adp_req_stats.pop(iter_id, None)
+        self._pending_adp_kv_iter_stats.pop(iter_id, None)
+
     def _drop_pending_adp_iter_stats_before(self, iter_id: int) -> None:
         """All ranks: discard local pending stats older than rank 0's target."""
         for pending_iter in list(self._pending_adp_iter_stats_payloads):
             if pending_iter >= iter_id:
                 continue
-            self._pending_adp_iter_stats_payloads.pop(pending_iter, None)
-            self._synthetic_adp_iter_stats_iters.discard(pending_iter)
-            self._pending_adp_iter_stats.pop(pending_iter, None)
-            self._pending_adp_req_stats.pop(pending_iter, None)
-            self._pending_adp_kv_iter_stats.pop(pending_iter, None)
+            self._discard_pending_adp_iter_stats(pending_iter)
 
     def _clear_pending_adp_iter_stats_through(self, iter_id: int) -> None:
-        """All ranks: clear local ADP stats once aggregation has caught up."""
+        """All ranks: clear local ADP stats once fanout has caught up."""
         for pending_iter in list(self._pending_adp_iter_stats_payloads):
             if pending_iter > iter_id:
                 continue
-            self._pending_adp_iter_stats_payloads.pop(pending_iter, None)
-            self._synthetic_adp_iter_stats_iters.discard(pending_iter)
-            self._pending_adp_iter_stats.pop(pending_iter, None)
-            self._pending_adp_req_stats.pop(pending_iter, None)
-            self._pending_adp_kv_iter_stats.pop(pending_iter, None)
+            self._discard_pending_adp_iter_stats(pending_iter)
 
-    def _aggregate_adp_iter_stats(self, stats: IterationStats,
-                                  all_rank_states: List[RankState]) -> None:
-        """Rank 0 only: sum per-rank payloads into one engine-wide stat."""
-        ifb = stats.inflight_batching_stats
-        ifb.num_context_requests = sum(s.iter_stats.num_context_requests
-                                       for s in all_rank_states)
-        ifb.num_ctx_tokens = sum(s.iter_stats.num_ctx_tokens
-                                 for s in all_rank_states)
-        ifb.num_ctx_kv_tokens = sum(s.iter_stats.num_ctx_kv_tokens
-                                    for s in all_rank_states)
-        ifb.num_gen_requests = sum(s.iter_stats.num_gen_requests
-                                   for s in all_rank_states)
-        ifb.num_gen_kv_tokens = sum(s.iter_stats.num_gen_kv_tokens
-                                    for s in all_rank_states)
-        ifb.num_paused_requests = sum(s.iter_stats.num_paused_requests
-                                      for s in all_rank_states)
-        ifb.num_paused_kv_tokens = sum(s.iter_stats.num_paused_kv_tokens
-                                       for s in all_rank_states)
+    def _make_adp_rank_iter_stats(
+        self,
+        rank0_stats: IterationStats,
+        rank_state: RankState,
+    ) -> IterationStats:
+        """Rank 0 only: build one IterationStats row for an ADP rank.
+
+        Attention-DP emits one stats row per rank so downstream FPM consumers
+        can see scheduling distribution and diagnose load imbalance. Scheduled
+        fields are rank-local. Queued fields remain rank-0/global because the
+        executor request queue lives on rank 0.
+        """
+        rank = rank_state.rank
+        payload = rank_state.iter_stats
+        source_ifb = rank0_stats.inflight_batching_stats
+
+        stats = IterationStats()
+        for attr in (
+            "timestamp",
+            "iter",
+            "iter_latency_ms",
+            "new_active_requests_queue_latency_ms",
+            "num_new_active_requests",
+            "num_active_requests",
+            "num_queued_requests",
+            "num_completed_requests",
+            "max_num_active_requests",
+            "gpu_mem_usage",
+            "cpu_mem_usage",
+            "pinned_mem_usage",
+        ):
+            setattr(stats, attr, getattr(rank0_stats, attr))
+
+        # Optional nested stats are copied as-is. KV iteration deltas are
+        # attached separately in _append_iter_stats and remain rank-0-only to
+        # avoid double-logging global KV-cache deltas.
+        stats.kv_cache_stats = rank0_stats.kv_cache_stats
+        stats.cross_kv_cache_stats = rank0_stats.cross_kv_cache_stats
+        stats.static_batching_stats = rank0_stats.static_batching_stats
+        stats.specdec_stats = rank0_stats.specdec_stats
+
+        ifb = InflightBatchingStats()
+        ifb.num_context_requests = payload.num_context_requests
+        ifb.num_ctx_tokens = payload.num_ctx_tokens
+        ifb.num_ctx_kv_tokens = payload.num_ctx_kv_tokens
+        ifb.num_gen_requests = payload.num_gen_requests
+        ifb.num_gen_kv_tokens = payload.num_gen_kv_tokens
+        ifb.num_paused_requests = payload.num_paused_requests
+        ifb.num_paused_kv_tokens = payload.num_paused_kv_tokens
         ifb.num_scheduled_requests = (ifb.num_context_requests +
                                       ifb.num_gen_requests)
 
+        if source_ifb is not None:
+            ifb.micro_batch_id = source_ifb.micro_batch_id
+            ifb.avg_num_decoded_tokens_per_iter = (
+                source_ifb.avg_num_decoded_tokens_per_iter)
+            if rank == 0:
+                ifb.num_queued_context_requests = (
+                    source_ifb.num_queued_context_requests)
+                ifb.num_queued_ctx_tokens = source_ifb.num_queued_ctx_tokens
+                ifb.num_queued_gen_requests = (
+                    source_ifb.num_queued_gen_requests)
+                ifb.num_queued_gen_kv_tokens = (
+                    source_ifb.num_queued_gen_kv_tokens)
+
+        if rank != 0:
+            stats.num_queued_requests = 0
+            stats.num_completed_requests = 0
+            stats.num_new_active_requests = 0
+            stats.new_active_requests_queue_latency_ms = 0.0
+
+        stats.inflight_batching_stats = ifb
+        return stats
+
     def _finalize_pending_adp_iter_stats(
             self, all_rank_states: List[RankState]) -> None:
-        """All ranks: align payloads; rank 0 appends aggregate when ready."""
+        """All ranks: align payloads; rank 0 appends per-rank rows when ready."""
         pending_states = [
             s for s in all_rank_states if s.iter_stats.has_iter_stats
         ]
@@ -1495,7 +1558,7 @@ class PyExecutor:
         if rank0_state is None or not rank0_state.iter_stats.has_iter_stats:
             logger.debug(
                 "Waiting for rank 0 attention-DP IterationStats payload before "
-                "aggregation")
+                "fanout")
             return
 
         # Rank 0 owns the stats queue consumed by get_stats(), so converge all
@@ -1520,32 +1583,34 @@ class PyExecutor:
             return
 
         if self.dist.rank == 0:
-            stats = self._pending_adp_iter_stats.get(iter_stats_iter)
-            if stats is None:
+            rank0_stats = self._pending_adp_iter_stats.get(iter_stats_iter)
+            if rank0_stats is None:
                 logger.warning(
-                    "Skipping attention-DP IterationStats aggregation on "
+                    "Skipping attention-DP IterationStats fanout on "
                     f"rank 0: pending IterationStats object is missing for "
                     f"iter {iter_stats_iter}")
                 return
 
-            self._aggregate_adp_iter_stats(stats, all_rank_states)
-            # TODO: RequestStats are still rank-0-only under Attention-DP.
-            # Preserve the existing get_stats() shape for compatibility, but
-            # do not treat these request details as engine-wide.
             req_stats = self._pending_adp_req_stats.get(iter_stats_iter)
-            self._append_iter_stats(
-                stats,
-                req_stats,
-                kv_iter_stats=self._pending_adp_kv_iter_stats.get(
-                    iter_stats_iter),
-            )
+            kv_iter_stats = self._pending_adp_kv_iter_stats.get(
+                iter_stats_iter)
+
+            for rank_state in sorted(matching_states, key=lambda s: s.rank):
+                rank = rank_state.rank
+                self._append_iter_stats(
+                    self._make_adp_rank_iter_stats(rank0_stats, rank_state),
+                    req_stats if rank == 0 else None,
+                    kv_iter_stats=kv_iter_stats if rank == 0 else None,
+                    attention_dp_rank=rank,
+                )
 
         self._clear_pending_adp_iter_stats_through(iter_stats_iter)
 
     def _append_iter_stats(self,
                            stats: IterationStats,
                            req_stats: Optional[List[RequestStats]] = None,
-                           kv_iter_stats=None):
+                           kv_iter_stats=None,
+                           attention_dp_rank: Optional[int] = None):
         """ADP rank 0 or non-ADP path: append finalized stats for get_stats()."""
         # Non-ADP appends immediately, so the latest KV stats belong to this
         # IterationStats. ADP appends later and passes the saved iter-matched
@@ -1556,7 +1621,10 @@ class PyExecutor:
         with self.stats_lock:
             if len(self.stats) > self.max_stats_len:
                 self.stats.pop(0)
-            self.stats.append((stats, req_stats, kv_iter_stats))
+            entry = (stats, req_stats, kv_iter_stats)
+            if attention_dp_rank is not None:
+                entry = (stats, req_stats, kv_iter_stats, attention_dp_rank)
+            self.stats.append(entry)
 
     def _process_iter_stats(
         self,
@@ -1565,7 +1633,7 @@ class PyExecutor:
         batch_state: BatchState,
         micro_batch_id: int = 0,
     ):
-        """All ranks: build local stats; ADP queues them for later aggregation."""
+        """All ranks: build local stats; ADP queues them for later fanout."""
         iter_end_time = time.time()
         iter_latency_ms = (iter_end_time - batch_state.iter_start_time) * 1e3
         if batch_state.iter_stats is None:
@@ -3081,13 +3149,18 @@ class PyExecutor:
             # (e.g. KV-cache-aware) that need new_requests to gather additional
             # info, the allgather position may need to be revisited.
 
-            # Piggyback this rank's oldest pending IterationStats payload on
-            # the ADP rank-state allgather, then use the gathered states below
-            # to aggregate/clear stats once every rank is aligned.
+            # The rank-state allgather is always required for ADP routing.
+            # When iteration stats are enabled, piggyback this rank's oldest
+            # pending payload and use the gathered states below to fan out or
+            # clear stats once every rank is aligned.
+            iter_stats_payload = (
+                self._next_adp_iter_stats_payload()
+                if self.enable_iter_perf_stats else None)
             all_rank_states = self.adp_router.gather_all_rank_states(
                 active_requests,
-                iter_stats_payload=self._next_adp_iter_stats_payload())
-            self._finalize_pending_adp_iter_stats(all_rank_states)
+                iter_stats_payload=iter_stats_payload)
+            if self.enable_iter_perf_stats:
+                self._finalize_pending_adp_iter_stats(all_rank_states)
             all_ranks_num_active_requests = [
                 s.num_active_requests for s in all_rank_states
             ]
