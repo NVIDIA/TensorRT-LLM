@@ -340,8 +340,12 @@ MultimodalInput Serialization::deserializeMultimodalInput(std::istream& is)
     auto multimodalPositions = su::deserialize<std::vector<SizeType32>>(is);
     auto multimodalLengths = su::deserialize<std::vector<SizeType32>>(is);
     auto multimodalUuids = su::deserialize<std::optional<std::vector<std::optional<std::string>>>>(is);
+    auto multimodalItemRunCuSeqlen = su::deserialize<std::optional<std::vector<SizeType32>>>(is);
+    auto multimodalRunPositions = su::deserialize<std::optional<std::vector<SizeType32>>>(is);
+    auto multimodalRunLengths = su::deserialize<std::optional<std::vector<SizeType32>>>(is);
     return MultimodalInput{std::move(multimodalHashes), std::move(multimodalPositions), std::move(multimodalLengths),
-        std::move(multimodalUuids)};
+        std::move(multimodalUuids), std::move(multimodalItemRunCuSeqlen), std::move(multimodalRunPositions),
+        std::move(multimodalRunLengths)};
 }
 
 void Serialization::serialize(MultimodalInput const& multimodalInput, std::ostream& os)
@@ -350,6 +354,9 @@ void Serialization::serialize(MultimodalInput const& multimodalInput, std::ostre
     su::serialize(multimodalInput.mMultimodalPositions, os);
     su::serialize(multimodalInput.mMultimodalLengths, os);
     su::serialize(multimodalInput.mMultimodalUuids, os);
+    su::serialize(multimodalInput.mMultimodalItemRunCuSeqlen, os);
+    su::serialize(multimodalInput.mMultimodalRunPositions, os);
+    su::serialize(multimodalInput.mMultimodalRunLengths, os);
 }
 
 size_t Serialization::serializedSize(MultimodalInput const& multimodalInput)
@@ -359,6 +366,9 @@ size_t Serialization::serializedSize(MultimodalInput const& multimodalInput)
     totalSize += su::serializedSize(multimodalInput.mMultimodalPositions);
     totalSize += su::serializedSize(multimodalInput.mMultimodalLengths);
     totalSize += su::serializedSize(multimodalInput.mMultimodalUuids);
+    totalSize += su::serializedSize(multimodalInput.mMultimodalItemRunCuSeqlen);
+    totalSize += su::serializedSize(multimodalInput.mMultimodalRunPositions);
+    totalSize += su::serializedSize(multimodalInput.mMultimodalRunLengths);
     return totalSize;
 }
 

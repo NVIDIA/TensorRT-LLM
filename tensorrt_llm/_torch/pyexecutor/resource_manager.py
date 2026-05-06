@@ -2621,6 +2621,80 @@ class KVCacheManagerV2(BaseResourceManager):
             return tokens[start:end] if is_sliced else tokens
 
         result: list[TokenIdExt] = list(tokens[start:end])
+
+        def hash_to_digest(hash_ints: Sequence[int]) -> bytes:
+            # Convert 8 x int32 hash to 32-byte digest (big-endian,
+            # matching v1 C++ getNthByte which extracts MSB first).
+            assert len(
+                hash_ints
+            ) == 8, f"Expected 8 int32 hash values, got {len(hash_ints)}"
+            return b''.join(
+                v.to_bytes(4, 'big', signed=True) for v in hash_ints)
+
+        item_run_cu_seqlen = getattr(req, "multimodal_item_run_cu_seqlen", None)
+        run_positions = getattr(req, "multimodal_run_positions", None)
+        run_lengths = getattr(req, "multimodal_run_lengths", None)
+        if any(field is not None
+               for field in (item_run_cu_seqlen, run_positions, run_lengths)):
+            if (item_run_cu_seqlen is None or run_positions is None
+                    or run_lengths is None):
+                logger.warning(
+                    "Incomplete multimodal run metadata; skipping multimodal token augmentation for block reuse"
+                )
+                return result
+            if (len(item_run_cu_seqlen) != len(req.multimodal_hashes) + 1
+                    or item_run_cu_seqlen[0] != 0
+                    or item_run_cu_seqlen[-1] != len(run_positions)
+                    or len(run_positions) != len(run_lengths)):
+                logger.warning(
+                    "Invalid multimodal run metadata shape; skipping multimodal token augmentation for block reuse"
+                )
+                return result
+
+            for item_idx, hash_ints in enumerate(req.multimodal_hashes):
+                run_begin = item_run_cu_seqlen[item_idx]
+                run_end = item_run_cu_seqlen[item_idx + 1]
+                if run_begin < 0 or run_end < run_begin or run_end > len(
+                        run_positions):
+                    logger.warning(
+                        "Invalid multimodal run prefix sum; skipping multimodal token augmentation for block reuse"
+                    )
+                    return result
+
+                total_item_length = sum(run_lengths[run_begin:run_end])
+                if total_item_length <= 0:
+                    logger.warning(
+                        "Invalid multimodal run length; skipping multimodal token augmentation for block reuse"
+                    )
+                    return result
+
+                digest = hash_to_digest(hash_ints)
+                mm_tokens = gen_multi_modal_tokens(self.vocab_size, digest,
+                                                   total_item_length)
+                item_offset = 0
+                for run_idx in range(run_begin, run_end):
+                    pos = run_positions[run_idx]
+                    length = run_lengths[run_idx]
+                    if pos < 0 or length <= 0:
+                        logger.warning(
+                            "Invalid multimodal run range; skipping multimodal token augmentation for block reuse"
+                        )
+                        return result
+                    mm_end = pos + length
+                    if mm_end <= start or pos >= end:
+                        item_offset += length
+                        continue
+
+                    overlap_start = max(pos, start)
+                    overlap_end = min(mm_end, end)
+                    mm_offset = item_offset + overlap_start - pos
+                    result_offset = overlap_start - start
+                    n = overlap_end - overlap_start
+                    result[result_offset:result_offset +
+                           n] = mm_tokens[mm_offset:mm_offset + n]
+                    item_offset += length
+            return result
+
         for hash_ints, pos, length in zip(req.multimodal_hashes,
                                           req.multimodal_positions,
                                           req.multimodal_lengths,
@@ -2629,13 +2703,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # Skip multimodal items outside [start, end).
             if mm_end <= start or pos >= end:
                 continue
-            # Convert 8 x int32 hash to 32-byte digest (big-endian,
-            # matching v1 C++ getNthByte which extracts MSB first).
-            assert len(
-                hash_ints
-            ) == 8, f"Expected 8 int32 hash values, got {len(hash_ints)}"
-            digest = b''.join(
-                v.to_bytes(4, 'big', signed=True) for v in hash_ints)
+            digest = hash_to_digest(hash_ints)
             mm_tokens = gen_multi_modal_tokens(self.vocab_size, digest, length)
             # Overlap between [pos, mm_end) and [start, end).
             overlap_start = max(pos, start)

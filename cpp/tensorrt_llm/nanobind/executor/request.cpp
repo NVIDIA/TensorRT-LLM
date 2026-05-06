@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -307,27 +307,40 @@ void initRequestBindings(nb::module_& m)
     auto multimodalInputGetstate = [](tle::MultimodalInput const& self)
     {
         return nb::make_tuple(self.getMultimodalHashes(), self.getMultimodalPositions(), self.getMultimodalLengths(),
-            self.getMultimodalUuids());
+            self.getMultimodalUuids(), self.getMultimodalItemRunCuSeqlen(), self.getMultimodalRunPositions(),
+            self.getMultimodalRunLengths());
     };
     auto multimodalInputSetstate = [](tle::MultimodalInput& multimodalInput, nb::tuple const& state)
     {
-        if (state.size() != 4)
+        if (state.size() != 4 && state.size() != 7)
         {
             throw std::runtime_error("Invalid MultimodalInput state!");
         }
+        auto multimodalItemRunCuSeqlen = state.size() == 7 ? nb::cast<std::optional<std::vector<SizeType32>>>(state[4])
+                                                           : std::optional<std::vector<SizeType32>>(std::nullopt);
+        auto multimodalRunPositions = state.size() == 7 ? nb::cast<std::optional<std::vector<SizeType32>>>(state[5])
+                                                        : std::optional<std::vector<SizeType32>>(std::nullopt);
+        auto multimodalRunLengths = state.size() == 7 ? nb::cast<std::optional<std::vector<SizeType32>>>(state[6])
+                                                      : std::optional<std::vector<SizeType32>>(std::nullopt);
         new (&multimodalInput) tle::MultimodalInput(nb::cast<std::vector<std::vector<SizeType32>>>(state[0]),
             nb::cast<std::vector<SizeType32>>(state[1]), nb::cast<std::vector<SizeType32>>(state[2]),
-            nb::cast<std::optional<std::vector<std::optional<std::string>>>>(state[3]));
+            nb::cast<std::optional<std::vector<std::optional<std::string>>>>(state[3]),
+            std::move(multimodalItemRunCuSeqlen), std::move(multimodalRunPositions), std::move(multimodalRunLengths));
     };
     nb::class_<tle::MultimodalInput>(m, "MultimodalInput")
         .def(nb::init<std::vector<std::vector<SizeType32>>, std::vector<SizeType32>, std::vector<SizeType32>,
-                 std::optional<std::vector<std::optional<std::string>>>>(),
+                 std::optional<std::vector<std::optional<std::string>>>, std::optional<std::vector<SizeType32>>,
+                 std::optional<std::vector<SizeType32>>, std::optional<std::vector<SizeType32>>>(),
             nb::arg("multimodal_hashes"), nb::arg("multimodal_positions"), nb::arg("multimodal_lengths"),
-            nb::arg("multimodal_uuids") = nb::none())
+            nb::arg("multimodal_uuids") = nb::none(), nb::arg("multimodal_item_run_cu_seqlen") = nb::none(),
+            nb::arg("multimodal_run_positions") = nb::none(), nb::arg("multimodal_run_lengths") = nb::none())
         .def_prop_ro("multimodal_hashes", &tle::MultimodalInput::getMultimodalHashes)
         .def_prop_ro("multimodal_positions", &tle::MultimodalInput::getMultimodalPositions)
         .def_prop_ro("multimodal_lengths", &tle::MultimodalInput::getMultimodalLengths)
         .def_prop_ro("multimodal_uuids", &tle::MultimodalInput::getMultimodalUuids)
+        .def_prop_ro("multimodal_item_run_cu_seqlen", &tle::MultimodalInput::getMultimodalItemRunCuSeqlen)
+        .def_prop_ro("multimodal_run_positions", &tle::MultimodalInput::getMultimodalRunPositions)
+        .def_prop_ro("multimodal_run_lengths", &tle::MultimodalInput::getMultimodalRunLengths)
         .def("__getstate__", multimodalInputGetstate)
         .def("__setstate__", multimodalInputSetstate);
 

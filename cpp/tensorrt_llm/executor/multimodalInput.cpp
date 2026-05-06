@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,11 +22,17 @@ namespace tensorrt_llm::executor
 {
 MultimodalInput::MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
     std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths,
-    std::optional<std::vector<std::optional<std::string>>> multimodalUuids)
+    std::optional<std::vector<std::optional<std::string>>> multimodalUuids,
+    std::optional<std::vector<SizeType32>> multimodalItemRunCuSeqlen,
+    std::optional<std::vector<SizeType32>> multimodalRunPositions,
+    std::optional<std::vector<SizeType32>> multimodalRunLengths)
     : mMultimodalHashes(std::move(multimodalHashes))
     , mMultimodalPositions(std::move(multimodalPositions))
     , mMultimodalLengths(std::move(multimodalLengths))
     , mMultimodalUuids(std::move(multimodalUuids))
+    , mMultimodalItemRunCuSeqlen(std::move(multimodalItemRunCuSeqlen))
+    , mMultimodalRunPositions(std::move(multimodalRunPositions))
+    , mMultimodalRunLengths(std::move(multimodalRunLengths))
 {
 }
 
@@ -48,6 +54,21 @@ std::vector<SizeType32> MultimodalInput::getMultimodalLengths() const
 std::optional<std::vector<std::optional<std::string>>> const& MultimodalInput::getMultimodalUuids() const
 {
     return mMultimodalUuids;
+}
+
+std::optional<std::vector<SizeType32>> const& MultimodalInput::getMultimodalItemRunCuSeqlen() const
+{
+    return mMultimodalItemRunCuSeqlen;
+}
+
+std::optional<std::vector<SizeType32>> const& MultimodalInput::getMultimodalRunPositions() const
+{
+    return mMultimodalRunPositions;
+}
+
+std::optional<std::vector<SizeType32>> const& MultimodalInput::getMultimodalRunLengths() const
+{
+    return mMultimodalRunLengths;
 }
 
 } // namespace tensorrt_llm::executor

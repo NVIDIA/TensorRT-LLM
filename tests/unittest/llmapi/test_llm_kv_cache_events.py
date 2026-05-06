@@ -474,6 +474,54 @@ def test_multimodal_input_from_components_with_uuids():
     assert mm_input_no_uuids.multimodal_uuids is None
 
 
+def test_multimodal_input_exact_run_buffers():
+    """Test optional exact run buffers on Python MultimodalInput."""
+    import torch
+
+    from tensorrt_llm.inputs.multimodal import (MultimodalInput,
+                                                _find_mm_token_runs_from_mask)
+
+    mm_mask = torch.tensor(
+        [False, True, True, False, False, True, False, False, True, True])
+    item_run_cu, run_positions, run_lengths = _find_mm_token_runs_from_mask(
+        mm_mask, [3, 2])
+
+    assert item_run_cu == [0, 2, 3]
+    assert run_positions == [1, 5, 8]
+    assert run_lengths == [2, 1, 2]
+
+    mm_input = MultimodalInput.from_components(
+        [[1, 2, 3, 4, 5, 6, 7, 8], [8, 7, 6, 5, 4, 3, 2, 1]],
+        [1, 8],
+        [3, 2],
+        ["item-a", None],
+        item_run_cu,
+        run_positions,
+        run_lengths,
+    )
+    assert mm_input.multimodal_item_run_cu_seqlen == item_run_cu
+    assert mm_input.multimodal_run_positions == run_positions
+    assert mm_input.multimodal_run_lengths == run_lengths
+
+    with pytest.raises(ValueError, match="must be provided together"):
+        MultimodalInput(
+            multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+            multimodal_positions=[1],
+            multimodal_lengths=[2],
+            multimodal_item_run_cu_seqlen=[0, 1],
+        )
+
+    with pytest.raises(ValueError, match="sum to 3, expected 2"):
+        MultimodalInput(
+            multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+            multimodal_positions=[1],
+            multimodal_lengths=[2],
+            multimodal_item_run_cu_seqlen=[0, 1],
+            multimodal_run_positions=[1],
+            multimodal_run_lengths=[3],
+        )
+
+
 def test_apply_mm_hashes_uuid_length_mismatch():
     """Test apply_mm_hashes raises error on UUID list length mismatch."""
     import torch
