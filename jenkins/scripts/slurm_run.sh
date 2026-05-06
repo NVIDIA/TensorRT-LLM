@@ -111,10 +111,6 @@ perf_report_exit_code=0
 
 # Use unified run_tests.py for test execution, rerun, and result merging
 runTestsScript="$llmSrcNode/jenkins/scripts/run_tests.py"
-perfModeFlag=""
-if [ "$perfMode" = "true" ]; then
-    perfModeFlag="--perf-mode"
-fi
 
 # Build the run_tests.py arguments array for proper quoting
 runTestsArgs=(
@@ -123,7 +119,6 @@ runTestsArgs=(
     --test-db-list "$testListPathNode"
     --splits "${testSplits:-1}"
     --group "${testGroup:-1}"
-    $perfModeFlag
     --pytest-base-cmd "$pytestCommand"
     --stage-name "$stageName"
     --output-dir "$jobWorkspace"
@@ -131,6 +126,9 @@ runTestsArgs=(
     --fail-signatures "${failSignaturesList:-}"
     --max-rerun-tests 5
 )
+if [ "$perfMode" = "true" ]; then
+    runTestsArgs+=(--perf-mode)
+fi
 
 # For multi-node runs, wrap run_tests.py with the MPI launcher so that
 # worker nodes stay alive across all pytest invocations (regular, isolated,
