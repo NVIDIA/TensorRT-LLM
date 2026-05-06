@@ -394,7 +394,7 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
         with LLM(
             self.MODEL_PATH,
             max_num_tokens=self.MAX_NUM_TOKENS,
-            checkpoint_format="mistral",
+            checkpoint_format="mistral_large_3",
             tensor_parallel_size=tp_size,
             pipeline_parallel_size=pp_size,
             moe_expert_parallel_size=ep_size,

@@ -22,12 +22,12 @@ hitting any external endpoint.
 
 Requirements:
     - GPU (loads TinyLlama via PyTorch backend)
-    - LLM_MODELS_ROOT set (or /home/scratch.trt_llm_data accessible)
+    - LLM_MODELS_ROOT set (or /home/scratch.trt_llm_data_ci accessible)
     - Must be run with TRTLLM_USAGE_FORCE_ENABLED=1 to bypass pytest
       auto-detection (conftest or env)
 
 Usage:
-    TRTLLM_USAGE_FORCE_ENABLED=1 LLM_MODELS_ROOT=/home/scratch.trt_llm_data/llm-models \
+    TRTLLM_USAGE_FORCE_ENABLED=1 LLM_MODELS_ROOT=/home/scratch.trt_llm_data_ci/llm-models \
         python -m pytest tests/unittest/usage/test_e2e_capture.py -v -s
 """
 
@@ -51,7 +51,7 @@ def _get_model_path():
     root = os.environ.get("LLM_MODELS_ROOT")
     if root is None:
         # Fallback to standard scratch path
-        fallback = Path("/home/scratch.trt_llm_data/llm-models")
+        fallback = Path("/home/scratch.trt_llm_data_ci/llm-models")
         if fallback.exists():
             root = str(fallback)
     if root is None:
