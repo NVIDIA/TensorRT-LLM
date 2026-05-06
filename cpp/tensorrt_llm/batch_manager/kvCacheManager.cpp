@@ -581,7 +581,8 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
     std::optional<BaseAgentConfig> agentConfig, bool enableIndexerKCache, SizeType32 indexerKCacheQuantBlockSize,
-    SizeType32 indexerKCacheIndexHeadDim, std::optional<LinearAttentionMetadata> linearAttentionMetadata)
+    SizeType32 indexerKCacheIndexHeadDim, bool indexerKCacheUseFp4,
+    std::optional<LinearAttentionMetadata> linearAttentionMetadata)
     : mNumLayers{static_cast<SizeType32>(numKvHeadsPerLayer.size())}
     , mTokensPerBlock{tokensPerBlock}
     , mEventManager{std::move(eventManager)}
@@ -590,6 +591,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     , mIsEnableIndexerKCache{enableIndexerKCache}
     , mIndexerKCacheQuantBlockSize{indexerKCacheQuantBlockSize}
     , mIndexerKCacheIndexHeadDim{indexerKCacheIndexHeadDim}
+    , mIndexerKCacheUseFp4{indexerKCacheUseFp4}
     , mLinearAttentionMetadata{linearAttentionMetadata}
 {
     if (mLinearAttentionMetadata.has_value())
@@ -661,7 +663,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
             /*isSWA=*/(windowSize < maxSequenceLength) && (windowSize >= 0), allottedPrimaryBlocks,
             allottedSecondaryBlocks, maxNumSequences, stream, cacheType, secondaryOffloadMinPriority, mEventManager,
             enablePartialReuse, copyOnPartialReuse, kvCacheConnectorManager, mLookupTree, mLoopbackAgent,
-            enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim,
+            enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, indexerKCacheUseFp4,
             LinearAttentionMetadata::hasLinearCache(windowSize) ? linearAttentionMetadata : std::nullopt,
             numPlaceholderBlocks);
     }
@@ -717,7 +719,8 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
     radix_block_tree::UnifiedBlockTree& lookupTree, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent,
     bool enableIndexerKCache, SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
-    std::optional<LinearAttentionMetadata> linearAttentionMetadata, SizeType32 numPlaceholderBlocks)
+    bool indexerKCacheUseFp4, std::optional<LinearAttentionMetadata> linearAttentionMetadata,
+    SizeType32 numPlaceholderBlocks)
     : mDataType{dtype}
     , mWindowSize{windowSize}
     , mNumPrimaryBlocks{blocksInPrimaryPool}
@@ -756,6 +759,7 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mEnableIndexerKCache{enableIndexerKCache}
     , mIndexerKCacheQuantBlockSize{indexerKCacheQuantBlockSize}
     , mIndexerKCacheIndexHeadDim{indexerKCacheIndexHeadDim}
+    , mIndexerKCacheUseFp4{indexerKCacheUseFp4}
     , mLinearAttentionMetadata{std::move(linearAttentionMetadata)}
 {
     TLLM_LOG_DEBUG("Creating WindowBlockManager for windowSize=%d", windowSize);
@@ -1030,10 +1034,15 @@ void WindowBlockManager::createIndexerKCachePools()
         {
             continue;
         }
+        // scaleSize evaluates to 4 at indexHeadDim=128 / quantBlockSize=128 for both
+        // FP8 (float32 scale) and FP4 (packed UE8M0 x4 stored as one int32). The
+        // data size is either indexHeadDim bytes (one FP8 byte per element) or
+        // indexHeadDim / 2 bytes (two packed FP4 E2M1 codes per byte).
         SizeType32 scaleSize = mIndexerKCacheIndexHeadDim / mIndexerKCacheQuantBlockSize * 4;
+        SizeType32 dataSize = mIndexerKCacheUseFp4 ? mIndexerKCacheIndexHeadDim / 2 : mIndexerKCacheIndexHeadDim;
+        SizeType32 perTokenSize = scaleSize + dataSize;
 
-        mPools.emplace_back(kvPool.numLayers, kvPool.kvFactor, 1, scaleSize + mIndexerKCacheIndexHeadDim,
-            kvPool.tokensPerBlock,
+        mPools.emplace_back(kvPool.numLayers, kvPool.kvFactor, 1, perTokenSize, kvPool.tokensPerBlock,
             /*primaryPool=*/nullptr,
             /*secondaryPool=*/nullptr,
             /*containsBlockScales=*/false,
@@ -3007,12 +3016,13 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
     SizeType32 sinkTokenLength, int64_t stream, runtime::SizeType32 maxSequenceLength, SizeType32 chunkSize,
     bool enableBlockReuse, CacheType cacheType, bool enablePartialReuse, bool copyOnPartialReuse,
     bool enableIndexerKCache, SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
-    std::optional<LinearAttentionMetadata> linearAttentionMetadata)
+    bool indexerKCacheUseFp4, std::optional<LinearAttentionMetadata> linearAttentionMetadata)
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, maxBeamWidth, maxAttentionWindowVec, dtype, sinkTokenLength,
         std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength, chunkSize,
         enableBlockReuse, cacheType, std::nullopt, nullptr, enablePartialReuse, copyOnPartialReuse, nullptr,
-        enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, linearAttentionMetadata)
+        enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, indexerKCacheUseFp4,
+        linearAttentionMetadata)
 {
 }
 
@@ -3023,14 +3033,14 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     bool enableBlockReuse, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool enableIndexerKCache,
-    SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
+    SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim, bool indexerKCacheUseFp4,
     std::optional<LinearAttentionMetadata> linearAttentionMetadata)
     : KVCacheManager(numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences, maxBeamWidth,
         maxAttentionWindowVec, dtype, sinkTokenLength,
         std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength, chunkSize,
         enableBlockReuse, cacheType, secondaryOffloadMinPriority, eventManager, enablePartialReuse, copyOnPartialReuse,
         kvCacheConnectorManager, enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim,
-        linearAttentionMetadata)
+        indexerKCacheUseFp4, linearAttentionMetadata)
 {
 }
 
@@ -3041,7 +3051,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     bool enableBlockReuse, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool enableIndexerKCache,
-    SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
+    SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim, bool indexerKCacheUseFp4,
     std::optional<LinearAttentionMetadata> linearAttentionMetadata)
     : mMaxBeamWidth(maxBeamWidth)
     , mDataType(dtype)
@@ -3054,7 +3064,7 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
           std::move(stream), maxSequenceLength, maxBeamWidth, maxAttentionWindowVec, dtype, mSinkBubbleLength,
           mChunkSize, cacheType, secondaryOffloadMinPriority, std::move(eventManager), enablePartialReuse,
           copyOnPartialReuse, std::move(kvCacheConnectorManager), std::nullopt, enableIndexerKCache,
-          indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, linearAttentionMetadata)
+          indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, indexerKCacheUseFp4, linearAttentionMetadata)
     // disable block reuse for sink bubble since chopVectorIntoBlocks does not match KV cache blocks in this case
     , mEnableBlockReuse{mSinkBubbleLength > 0 ? false : enableBlockReuse}
 {
@@ -3081,13 +3091,13 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
     bool enableBlockReuse, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager, bool enableIndexerKCache,
-    SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
+    SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim, bool indexerKCacheUseFp4,
     std::optional<LinearAttentionMetadata> linearAttentionMetadata)
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
         maxNumSequences, maxBeamWidth, maxAttentionWindowVec, dtype, sinkTokenLength, std::move(stream),
         maxSequenceLength, chunkSize, enableBlockReuse, cacheType, secondaryOffloadMinPriority, std::move(eventManager),
         enablePartialReuse, copyOnPartialReuse, std::move(kvCacheConnectorManager), enableIndexerKCache,
-        indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, linearAttentionMetadata)
+        indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, indexerKCacheUseFp4, linearAttentionMetadata)
 {
 }
 

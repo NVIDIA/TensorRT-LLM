@@ -7067,7 +7067,7 @@ void testBlockManagerLinearAttention_ContextNoReuse(int beamWidth, int numTokens
         maxNumSequences, stream, maxAttentionWindow, beamWidth,
         std::vector<BlockManager::SizeType32>{linearWindowSizeCode, maxAttentionWindow}, nvinfer1::DataType::kHALF, 0,
         /*chunkSize*/ 0, CacheType::kSELF, std::nullopt, nullptr, false, true, nullptr, std::nullopt, false, 128, 0,
-        linearAttentionMetadata);
+        false, linearAttentionMetadata);
     blockManager.allocatePools(false);
 
     ASSERT_EQ(blockManager.getTokensPerBlock(), tokensPerBlock);
@@ -7212,7 +7212,7 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
         maxNumSequences, stream, maxAttentionWindow, beamWidth,
         std::vector<BlockManager::SizeType32>{linearWindowSizeCode, maxAttentionWindow}, nvinfer1::DataType::kHALF, 0,
         /*chunkSize*/ 0, CacheType::kSELF, std::nullopt, nullptr, false, true, nullptr, std::nullopt, false, 128, 0,
-        linearAttentionMetadata);
+        false, linearAttentionMetadata);
     blockManager.allocatePools(false);
 
     auto inputTokens0 = std::make_shared<VecTokens>();
@@ -7449,6 +7449,7 @@ void testKVCacheManagerLinearAttention_DecodingBlockGrowth(
         /*enableIndexerKCache*/ false,
         /*indexerKCacheQuantBlockSize*/ 128,
         /*indexerKCacheIndexHeadDim*/ 0,
+        /*indexerKCacheUseFp4=*/false,
         /*linearAttentionMetadata*/ linearAttentionMetadata);
 
     auto inputTokens0 = std::make_shared<VecTokens>();
@@ -7546,7 +7547,7 @@ void testKVCacheManagerLinearAttention_BlockCopying(
     KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
         beamWidth, std::vector<BlockManager::SizeType32>{linearWindowSizeCode, maxAttentionWindow},
         nvinfer1::DataType::kHALF, sinkTokenLen, stream, maxAttentionWindow, /*chunkSize*/ 0, enableContextReuse,
-        CacheType::kSELF, std::nullopt, nullptr, false, true, nullptr, false, 128, 0, linearAttentionMetadata);
+        CacheType::kSELF, std::nullopt, nullptr, false, true, nullptr, false, 128, 0, false, linearAttentionMetadata);
     kvCacheManager.allocatePools(false);
 
     char* poolBaseAddr

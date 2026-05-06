@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -552,6 +552,7 @@ kv_cache::CacheState Serialization::deserializeCacheState(std::istream& is)
     auto hasIndexerKCache = su::deserialize<bool>(is);
     auto indexerDimPerHead = su::deserialize<decltype(CacheState::ModelConfig::mSizePerHead)>(is);
     auto indexerKCacheQuantBlockSize = su::deserialize<decltype(CacheState::ModelConfig::mTokensPerBlock)>(is);
+    auto indexerKCacheUseFp4 = su::deserialize<bool>(is);
     // RNN config (optional)
     auto hasRnnConfig = su::deserialize<bool>(is);
     std::optional<CacheState::RnnModelConfig> rnnModelConfig;
@@ -576,7 +577,8 @@ kv_cache::CacheState Serialization::deserializeCacheState(std::istream& is)
     }
     CacheState cacheState{nbKvHeadsPerLayer, sizePerHead, tokensPerBlock, tensorParallelism, pipelineParallelism,
         contextParallelism, attentionLayerNumPerPP, dataType, attentionType, kvFactor, enableAttentionDP, DPrank,
-        DPsize, enableBlockReuse, enablePartialReuse, hasIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize};
+        DPsize, enableBlockReuse, enablePartialReuse, hasIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize,
+        indexerKCacheUseFp4};
     if (rnnModelConfig.has_value())
     {
         cacheState.setRnnConfig(
@@ -605,6 +607,7 @@ void Serialization::serialize(kv_cache::CacheState const& state, std::ostream& o
     su::serialize(state.getHasIndexerKCache(), os);
     su::serialize(state.getIndexerDimPerHead(), os);
     su::serialize(state.getIndexerKCacheQuantBlockSize(), os);
+    su::serialize(state.getIndexerKCacheUseFp4(), os);
     // RNN config (optional)
     su::serialize(state.mRnnCacheState.has_value(), os);
     if (state.mRnnCacheState.has_value())
@@ -645,6 +648,7 @@ size_t Serialization::serializedSize(kv_cache::CacheState const& state)
     totalSize += su::serializedSize(state.getHasIndexerKCache());
     totalSize += su::serializedSize(state.getIndexerDimPerHead());
     totalSize += su::serializedSize(state.getIndexerKCacheQuantBlockSize());
+    totalSize += su::serializedSize(state.getIndexerKCacheUseFp4());
     // RNN config (optional)
     totalSize += su::serializedSize(state.mRnnCacheState.has_value());
     if (state.mRnnCacheState.has_value())

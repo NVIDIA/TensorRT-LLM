@@ -349,6 +349,42 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         "threshold search iterations. Currently supported for index_topk=2048 "
         "on Blackwell (SM100+) and falls back to the production insertion/radix "
         "Top-K path when prerequisites are not met.")
+    indexer_k_dtype: Literal["fp8", "fp4"] = Field(
+        default="fp8",
+        description=
+        "Data type used for the indexer K cache. `fp4` requires Blackwell+ "
+        "(SM>=100) and index_head_dim=128, it can halve the indexer K cache "
+        "per-token footprint from 132 B to 68 B.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_indexer_k_dtype(self):
+        """Reject fp4 on pre-Blackwell or non-128 index_head_dim.
+
+        DeepGEMM's fp8_fp4_mqa_logits / fp8_fp4_paged_mqa_logits kernels
+        require SM>=100, and invokeFusedCatFp4 hard-asserts head_dim==128.
+        Surface both as Pydantic errors so invalid configs fail fast at
+        construction instead of with a cryptic kernel-launch failure.
+
+        The SM check is skipped when CUDA is unavailable (config
+        construction on CPU-only hosts or at doc-gen time), leaving the
+        runtime kernel assertion as the final line of defense.
+        """
+        if self.indexer_k_dtype == "fp4":
+            if self.index_head_dim is not None and self.index_head_dim != 128:
+                raise ValueError(
+                    f"indexer_k_dtype='fp4' requires index_head_dim=128, "
+                    f"got {self.index_head_dim}. Set indexer_k_dtype='fp8' "
+                    f"for non-128 indexer head dims.")
+            if torch.cuda.is_available():
+                from tensorrt_llm._utils import get_sm_version
+                sm = get_sm_version()
+                if sm < 100:
+                    raise ValueError(
+                        f"indexer_k_dtype='fp4' requires SM>=100 (Blackwell); "
+                        f"current device is SM{sm}. Set indexer_k_dtype='fp8' "
+                        f"for non-Blackwell GPUs.")
+        return self
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
