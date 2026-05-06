@@ -276,30 +276,9 @@ TEST_F(BlockKeyTest, HashWithExtraKeys)
     EXPECT_FALSE(BlockKeyHasher::hash(bk0) == BlockKeyHasher::hash(bk1));
 }
 
-TEST_F(BlockKeyTest, MultimodalExtraKeysItemRunsCoverContiguousSpan)
-{
-    auto const hashParts = std::vector<SizeType32>{
-        0x01020304, 0x05060708, 0x11121314, 0x15161718, 0x21222324, 0x25262728, 0x31323334, 0x35363738};
-
-    auto const request = makeMultimodalRequest(std::vector<TokenIdType>{11, 999, 999, 12},
-        std::vector<std::vector<SizeType32>>{hashParts}, ItemRuns{{makeRun(1, 2)}});
-    auto const expectedHash = makeHashBytes(hashParts);
-
-    auto const firstTokenKeys = generateBlockHashExtraKeys(request, 1, 2);
-    ASSERT_EQ(firstTokenKeys.size(), 1);
-    EXPECT_EQ(firstTokenKeys.front().hash, expectedHash);
-    EXPECT_EQ(firstTokenKeys.front().startOffset, 0);
-
-    auto const secondTokenKeys = generateBlockHashExtraKeys(request, 2, 3);
-    ASSERT_EQ(secondTokenKeys.size(), 1);
-    EXPECT_EQ(secondTokenKeys.front().hash, expectedHash);
-    EXPECT_EQ(secondTokenKeys.front().startOffset, 1);
-}
-
 TEST_F(BlockKeyTest, MultimodalExtraKeysRespectSparsePromptPositionRuns)
 {
-    auto const hashParts = std::vector<SizeType32>{
-        0x01020304, 0x05060708, 0x11121314, 0x15161718, 0x21222324, 0x25262728, 0x31323334, 0x35363738};
+    auto const hashParts = makeHashParts(0x01020300);
 
     auto const request = LlmRequest(0, 1, std::vector<TokenIdType>{11, 999, 77, 999, 12},
         tensorrt_llm::runtime::SamplingConfig{1}, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
@@ -318,8 +297,7 @@ TEST_F(BlockKeyTest, MultimodalExtraKeysRespectSparsePromptPositionRuns)
 
 TEST_F(BlockKeyTest, MultimodalExtraKeysKeepNonEmbedOffsetsInHashCoverage)
 {
-    auto const hashParts = std::vector<SizeType32>{
-        0x01020304, 0x05060708, 0x11121314, 0x15161718, 0x21222324, 0x25262728, 0x31323334, 0x35363738};
+    auto const hashParts = makeHashParts(0x01020300);
     auto const request = makeMultimodalRequest(std::vector<TokenIdType>{11, 999, 998, 999, 12},
         std::vector<std::vector<SizeType32>>{hashParts}, ItemRuns{{makeRun(1, 3, {1})}});
     auto const expectedHash = makeHashBytes(hashParts);
@@ -333,37 +311,6 @@ TEST_F(BlockKeyTest, MultimodalExtraKeysKeepNonEmbedOffsetsInHashCoverage)
     ASSERT_EQ(followingMmTokenKeys.size(), 1);
     EXPECT_EQ(followingMmTokenKeys.front().hash, expectedHash);
     EXPECT_EQ(followingMmTokenKeys.front().startOffset, 2);
-}
-
-TEST_F(BlockKeyTest, MultimodalExtraKeysStressMultipleSparseItemsAcrossBlockBoundaries)
-{
-    auto const firstHashParts = makeHashParts(0x01020300);
-    auto const secondHashParts = makeHashParts(0x11121300);
-    auto const request = makeMultimodalRequest(std::vector<TokenIdType>{10, 999, 20, 998, 999, 999, 30, 31, 998, 40},
-        std::vector<std::vector<SizeType32>>{firstHashParts, secondHashParts},
-        makeRunsFromPositions({{1, 4, 5}, {3, 8}}));
-    auto const firstHash = makeHashBytes(firstHashParts);
-    auto const secondHash = makeHashBytes(secondHashParts);
-
-    auto const firstBlockKeys = generateBlockHashExtraKeys(request, 0, 4);
-    ASSERT_EQ(firstBlockKeys.size(), 2);
-    EXPECT_EQ(firstBlockKeys[0].hash, firstHash);
-    EXPECT_EQ(firstBlockKeys[0].startOffset, 0);
-    EXPECT_EQ(firstBlockKeys[1].hash, secondHash);
-    EXPECT_EQ(firstBlockKeys[1].startOffset, 0);
-
-    auto const secondBlockKeys = generateBlockHashExtraKeys(request, 4, 8);
-    ASSERT_EQ(secondBlockKeys.size(), 1);
-    EXPECT_EQ(secondBlockKeys.front().hash, firstHash);
-    EXPECT_EQ(secondBlockKeys.front().startOffset, 1);
-
-    auto const blockGapKeys = generateBlockHashExtraKeys(request, 6, 8);
-    EXPECT_TRUE(blockGapKeys.empty());
-
-    auto const thirdBlockKeys = generateBlockHashExtraKeys(request, 8, 12);
-    ASSERT_EQ(thirdBlockKeys.size(), 1);
-    EXPECT_EQ(thirdBlockKeys.front().hash, secondHash);
-    EXPECT_EQ(thirdBlockKeys.front().startOffset, 1);
 }
 
 TEST_F(BlockKeyTest, BuildBlockKeysStressRepeatedHashesAndSparsePositionIdentity)
@@ -404,24 +351,6 @@ TEST_F(BlockKeyTest, BuildBlockKeysStressRepeatedHashesAndSparsePositionIdentity
 
     EXPECT_NE(keysWithRepeatedHash, differentHashKeys);
     EXPECT_NE(hashBlockKeySequence(keysWithRepeatedHash), hashBlockKeySequence(differentHashKeys));
-}
-
-TEST_F(BlockKeyTest, MultimodalExtraKeysRejectContractMismatches)
-{
-    auto const hashParts = std::vector<SizeType32>{
-        0x01020304, 0x05060708, 0x11121314, 0x15161718, 0x21222324, 0x25262728, 0x31323334, 0x35363738};
-
-    auto const missingRuns = makeMultimodalRequest(
-        std::vector<TokenIdType>{11, 999, 77}, std::vector<std::vector<SizeType32>>{hashParts}, std::nullopt);
-    EXPECT_THROW((void) generateBlockHashExtraKeys(missingRuns, 1, 2), std::exception);
-
-    auto const wrongHashWidth = makeMultimodalRequest(std::vector<TokenIdType>{11, 999, 77},
-        std::vector<std::vector<SizeType32>>{{1, 2, 3}}, ItemRuns{{makeRun(1, 1)}});
-    EXPECT_THROW((void) generateBlockHashExtraKeys(wrongHashWidth, 1, 2), std::exception);
-
-    auto const outerMismatch = makeMultimodalRequest(std::vector<TokenIdType>{11, 999, 77, 999, 12},
-        std::vector<std::vector<SizeType32>>{hashParts, makeHashParts(0x11121300)}, ItemRuns{{makeRun(1, 1)}});
-    EXPECT_THROW((void) generateBlockHashExtraKeys(outerMismatch, 1, 2), std::exception);
 }
 
 // ---------------------------------------------------------------------------

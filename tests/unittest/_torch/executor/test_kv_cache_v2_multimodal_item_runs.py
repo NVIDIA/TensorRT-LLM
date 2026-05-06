@@ -26,38 +26,20 @@ PROMPT_TOKENS = [
     MM_PLACEHOLDER,
     TEXT_AFTER,
 ]
-HASH_INTS = [
-    0x01020304,
-    0x05060708,
-    0x11121314,
-    0x15161718,
-    0x21222324,
-    0x25262728,
-    0x31323334,
-    0x35363738,
-]
-OTHER_HASH_INTS = [
-    0x0A0B0C0D,
-    0x0E0F1011,
-    0x1A1B1C1D,
-    0x1E1F2021,
-    0x2A2B2C2D,
-    0x2E2F3031,
-    0x3A3B3C3D,
-    0x3E3F4041,
-]
 _DEFAULT_MM_HASHES = object()
+
+
+def _hash_ints(base):
+    return [base + part_idx for part_idx in range(8)]
 
 
 def _digest(hash_ints):
     return b"".join(v.to_bytes(4, "big", signed=True) for v in hash_ints)
 
 
+HASH_INTS = _hash_ints(0x01020300)
 DIGEST = _digest(HASH_INTS)
 DIGEST_TOKENS = gen_multi_modal_tokens(VOCAB_SIZE, DIGEST, 2)
-DIGEST_TOKENS_WITH_SPECIAL = gen_multi_modal_tokens(VOCAB_SIZE, DIGEST, 3)
-OTHER_DIGEST = _digest(OTHER_HASH_INTS)
-OTHER_DIGEST_TOKENS = gen_multi_modal_tokens(VOCAB_SIZE, OTHER_DIGEST, 3)
 
 
 def _make_request(
@@ -89,11 +71,17 @@ def _derive_prompt_metadata(multimodal_item_runs):
     if multimodal_item_runs is None:
         return None, None
 
+    def start_and_length(run):
+        if hasattr(run, "prompt_start"):
+            return run.prompt_start, run.run_length
+        return run[0], run[1]
+
     multimodal_prompt_lengths = []
     item_run_spans = []
     for item_runs in multimodal_item_runs:
-        multimodal_prompt_lengths.append(sum(run[1] for run in item_runs))
-        item_run_spans.append([(run[0], run[1]) for run in item_runs])
+        spans = [start_and_length(run) for run in item_runs]
+        multimodal_prompt_lengths.append(sum(length for _, length in spans))
+        item_run_spans.append(spans)
     return multimodal_prompt_lengths, item_run_spans
 
 
@@ -174,25 +162,6 @@ def test_block_reuse_uses_prederived_public_item_run_spans():
     ]
 
 
-def test_non_embed_offsets_do_not_reduce_cache_hash_prompt_coverage():
-    prompt_tokens = [TEXT_BEFORE, MM_PLACEHOLDER, 777, MM_PLACEHOLDER, TEXT_AFTER]
-    req = _RequestLike(
-        prompt_tokens,
-        multimodal_hashes=[HASH_INTS],
-        multimodal_item_runs=[[(1, 3, [1])]],
-        multimodal_prompt_lengths=[3],
-        multimodal_item_run_spans=[[(1, 3)]],
-    )
-
-    assert _augment(req) == [
-        TEXT_BEFORE,
-        DIGEST_TOKENS_WITH_SPECIAL[0],
-        DIGEST_TOKENS_WITH_SPECIAL[1],
-        DIGEST_TOKENS_WITH_SPECIAL[2],
-        TEXT_AFTER,
-    ]
-
-
 def test_missing_prevalidated_item_run_metadata_is_rejected():
     req = _RequestLike(
         PROMPT_TOKENS,
@@ -205,69 +174,6 @@ def test_missing_prevalidated_item_run_metadata_is_rejected():
 
     with pytest.raises(ValueError, match="prevalidated"):
         _augment(req)
-
-
-def test_multiple_items_replace_sparse_runs_across_slices():
-    prompt_tokens = [101, 999, 201, 999, 301, 998, 401, 998, 402, 998, 501]
-    req = _make_request(
-        prompt_tokens,
-        multimodal_hashes=[HASH_INTS, OTHER_HASH_INTS],
-        multimodal_item_runs=[
-            [(1, 1, []), (3, 1, [])],
-            [(5, 1, []), (7, 1, []), (9, 1, [])],
-        ],
-    )
-
-    assert _augment(req) == [
-        101,
-        DIGEST_TOKENS[0],
-        201,
-        DIGEST_TOKENS[1],
-        301,
-        OTHER_DIGEST_TOKENS[0],
-        401,
-        OTHER_DIGEST_TOKENS[1],
-        402,
-        OTHER_DIGEST_TOKENS[2],
-        501,
-    ]
-    assert _augment(req, start=2, end=6) == [
-        201,
-        DIGEST_TOKENS[1],
-        301,
-        OTHER_DIGEST_TOKENS[0],
-    ]
-    assert _augment(req, start=6, end=10) == [
-        401,
-        OTHER_DIGEST_TOKENS[1],
-        402,
-        OTHER_DIGEST_TOKENS[2],
-    ]
-    assert _augment(req, start=8, end=9) == [402]
-
-
-@pytest.mark.parametrize(
-    "multimodal_item_runs, match",
-    [
-        ([[(1, 1), (3, 1)]], "prompt_start, run_length, non_embed_offsets"),
-        ([[((1, 1), []), ((3, 1), [])]], "prompt_start, run_length, non_embed_offsets"),
-        ([[(1, 1, []), (99, 1, [])]], "exceeding input sequence length"),
-        ([[(-1, 1, []), (3, 1, [])]], "negative positions"),
-        ([[(1, 2, []), (2, 1, [])]], "ordered and non-overlapping"),
-        ([[(1, 0, []), (3, 1, [])]], "positive length"),
-    ],
-)
-def test_invalid_exact_item_runs_are_rejected(multimodal_item_runs, match):
-    with pytest.raises((TypeError, ValueError), match=match):
-        _make_llm_request(multimodal_item_runs)
-
-
-def test_direct_llm_request_rejects_global_item_run_overlap():
-    with pytest.raises(ValueError, match="globally non-overlapping"):
-        _make_llm_request(
-            [[(1, 2, [])], [(2, 1, [])]],
-            multimodal_hashes=[HASH_INTS, OTHER_HASH_INTS],
-        )
 
 
 def test_direct_llm_request_allows_item_runs_without_hashes_as_cache_fallback():

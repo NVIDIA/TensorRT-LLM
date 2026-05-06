@@ -37,7 +37,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import \
 from tensorrt_llm.runtime.kv_cache_manager_v2 import \
     KVCacheManagerConfig as KVCacheManagerConfigPy
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (LayerId, TokenIdExt,
-                                                      _KVCache)
+                                                      _KVCache,
+                                                      gen_multi_modal_tokens)
 from tensorrt_llm.runtime.kv_cache_manager_v2._common import (BAD_PAGE_INDEX,
                                                               GPU_LEVEL)
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
@@ -2487,17 +2488,8 @@ class KVCacheManagerV2(BaseResourceManager):
             return b''.join(
                 v.to_bytes(4, 'big', signed=True) for v in hash_ints)
 
-        def _multi_modal_token_slice(digest: bytes, mm_offset: int,
-                                     length: int) -> list[TokenIdExt]:
-            mm_tokens = list(
-                range(vocab_size + mm_offset, vocab_size + mm_offset + length))
-            if mm_offset == 0:
-                mm_tokens[0] = digest
-            return mm_tokens
-
-        multimodal_prompt_lengths = getattr(req, "multimodal_prompt_lengths",
-                                            None)
-        item_run_spans = getattr(req, "multimodal_item_run_spans", None)
+        multimodal_prompt_lengths = req.multimodal_prompt_lengths
+        item_run_spans = req.multimodal_item_run_spans
         if multimodal_prompt_lengths is None or item_run_spans is None:
             raise ValueError(
                 "multimodal item-run span metadata must be prevalidated on LlmRequest before block reuse"
@@ -2527,7 +2519,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 if digest is None:
                     digest = _hash_ints_to_digest(hash_ints)
                 result[result_offset:result_offset +
-                       n] = _multi_modal_token_slice(digest, mm_offset, n)
+                       n] = gen_multi_modal_tokens(vocab_size,
+                                                   digest,
+                                                   n,
+                                                   token_offset=mm_offset)
                 hash_offset += run_length
         return result
 
