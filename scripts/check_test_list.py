@@ -527,17 +527,41 @@ def validate_test_lists(test_lists_dir: str, test_base_dir: str):
 # =============================================================================
 
 
+def _get_trt_test_db_version():
+    """Read TRT_TEST_DB_VERSION from jenkins/ci_versions.properties."""
+    props_file = Path(
+        __file__).resolve().parent.parent / "jenkins" / "ci_versions.properties"
+    with open(props_file) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("TRT_TEST_DB_VERSION="):
+                return line.split("=", 1)[1]
+    raise RuntimeError(f"TRT_TEST_DB_VERSION not found in {props_file}")
+
+
 def install_python_dependencies(llm_src):
     subprocess.run(f"cd {llm_src} && pip3 install -r requirements-dev.txt",
                    shell=True,
                    check=True)
+
+    whl = glob.glob(f"{llm_src}/../tensorrt_llm-*.whl")
+    if whl:
+        subprocess.run(f"pip3 install --force-reinstall --no-deps {whl[0]}",
+                       shell=True,
+                       check=True)
+    else:
+        # No pre-built wheel available — editable install with precompiled
+        # bindings downloaded from PyPI (avoids C++ compilation).
+        env = {**os.environ, "TRTLLM_USE_PRECOMPILED": "1"}
+        subprocess.run(f"cd {llm_src} && pip3 install --no-deps -e .",
+                       shell=True,
+                       check=True,
+                       env=env)
+
+    trt_test_db_ver = _get_trt_test_db_version()
     subprocess.run(
-        f"pip3 install --force-reinstall --no-deps {llm_src}/../tensorrt_llm-*.whl",
-        shell=True,
-        check=True)
-    subprocess.run(
-        "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple "
-        "--ignore-installed trt-test-db==1.8.5+bc6df7",
+        f"pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple "
+        f"--ignore-installed trt-test-db=={trt_test_db_ver}",
         shell=True,
         check=True)
 
@@ -765,7 +789,6 @@ def main():
     script_dir = os.path.dirname(os.path.realpath(__file__))
     llm_src = os.path.abspath(os.path.join(script_dir, "../"))
 
-    # Only skip installing dependencies if ONLY --check-duplicates or --validate is used
     if args.l0 or args.qa or args.waive:
         install_python_dependencies(llm_src)
 
