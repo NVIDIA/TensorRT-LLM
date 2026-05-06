@@ -10,13 +10,13 @@ import os
 import re
 import types
 from abc import abstractmethod
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import safetensors.torch
 import torch
 import torch.nn as nn
-from accelerate import init_empty_weights
+from accelerate import init_empty_weights, load_checkpoint_in_model
 from accelerate.utils import modeling
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.utils import HFValidationError, filter_repo_objects, validate_repo_id
@@ -51,6 +51,38 @@ from .factory import (
     SubModuleExportInfo,
 )
 from .quant_config_reader import QuantConfigReader, autodetect_quant_config_reader
+
+
+@contextmanager
+def hf_load_state_dict_with_device(device: DeviceLikeType):
+    """Patch HF loading utilities according to our needs.
+
+    Following patches are applied:
+        1. load_state_dict to use provided device. NOTE (lucaslie): this function is called by
+           ``load_checkpoint_in_model``. We provide the device map here as a patch instead of going
+           through ``load_checkpoint_in_model``. This is because otherwise
+           ``load_checkpoint_in_model`` will execute its own state_dict loading logic instead of
+           calling ``nn.Module.load_state_dict``. However, we rely on the state dict loading hooks
+           in ``nn.Module.load_state_dict`` to correctly load the weights. By providing the device
+           map here, we can ensure that ``load_checkpoint_in_model`` will call
+           ``nn.Module.load_state_dict``.
+        2. change logging level of logger to ERROR to avoid logging warnings from HF state_dict
+           loading for missing/unexpected keys (happens for MoE expert-sharded layers for example).
+    """
+    original_load_state_dict = modeling.load_state_dict
+    original_logger_level = modeling.logger.level
+
+    def load_state_dict_with_device(checkpoint_file, device_map=None):
+        return original_load_state_dict(checkpoint_file, device_map={"": device})
+
+    modeling.load_state_dict = load_state_dict_with_device
+    modeling.logger.setLevel("ERROR")
+
+    try:
+        yield
+    finally:
+        modeling.load_state_dict = original_load_state_dict
+        modeling.logger.setLevel(original_logger_level)
 
 
 # TODO (lucaslie): continue working on the base class
@@ -373,6 +405,48 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
 
         return ignore_patterns
 
+    def _get_checkpoint_file(self, checkpoint: Union[str, os.PathLike]) -> Union[str, os.PathLike]:
+        """Get the most relevant checkpoint file from the HF checkpoint directory."""
+        checkpoint = os.fspath(checkpoint)
+
+        if os.path.isfile(checkpoint):
+            return checkpoint
+
+        if not os.path.isdir(checkpoint):
+            raise ValueError(
+                f"Checkpoint path '{checkpoint}' is neither a file nor a directory, or does not exist."
+            )
+
+        safe_weights_index_path = os.path.join(checkpoint, SAFE_WEIGHTS_INDEX_NAME)
+        if os.path.isfile(safe_weights_index_path):
+            return safe_weights_index_path
+
+        safe_weights_path = os.path.join(checkpoint, SAFE_WEIGHTS_NAME)
+        if os.path.isfile(safe_weights_path):
+            return safe_weights_path
+
+        weights_index_path = os.path.join(checkpoint, WEIGHTS_INDEX_NAME)
+        if os.path.isfile(weights_index_path):
+            return weights_index_path
+
+        weights_path = os.path.join(checkpoint, WEIGHTS_NAME)
+        if os.path.isfile(weights_path):
+            return weights_path
+
+        potential_index = [f for f in os.listdir(checkpoint) if f.endswith(".index.json")]
+        if len(potential_index) == 1:
+            return os.path.join(checkpoint, potential_index[0])
+        if len(potential_index) > 1:
+            raise ValueError(
+                f"{checkpoint} containing more than one `.index.json` file, delete the irrelevant ones."
+            )
+
+        raise ValueError(
+            f"Could not find any model weights in {checkpoint}. "
+            f"Expected one of the following files: {SAFE_WEIGHTS_INDEX_NAME}, {SAFE_WEIGHTS_NAME}, "
+            f"{WEIGHTS_INDEX_NAME}, or {WEIGHTS_NAME}."
+        )
+
     def _get_checkpoint_files(self, checkpoint: Union[str, os.PathLike]) -> List[str]:
         """Get checkpoint weight files from an HF checkpoint path.
 
@@ -479,8 +553,6 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         self, model: nn.Module, device: DeviceLikeType, disable_preload: bool = False
     ):
         """Load the checkpoint into the model."""
-        checkpoint_files = self._get_checkpoint_files(self.model)
-
         load_handle = model.register_load_state_dict_pre_hook(self._remap_param_names_load_hook)
         # Ensure it's the first one.
         model._load_state_dict_pre_hooks.move_to_end(key=load_handle.id, last=False)
@@ -493,8 +565,14 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
 
         try:
             if disable_preload:
-                self._load_checkpoint_with_streaming(model, checkpoint_files, device)
+                ckpt_file = self._get_checkpoint_file(self.model)
+                ad_logger.info(
+                    "disable_preload=True: Using accelerate's load_checkpoint_in_model (no CPU preload)"
+                )
+                with hf_load_state_dict_with_device(device):
+                    load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
             else:
+                checkpoint_files = self._get_checkpoint_files(self.model)
                 # Preload checkpoint files to CPU
                 ad_logger.info("Preloading checkpoint files to CPU")
                 self._load_checkpoint_with_preload(model, checkpoint_files, device)
@@ -511,22 +589,6 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         model.load_state_dict(all_weights, strict=False)
 
         ad_logger.info("Checkpoint loading completed")
-
-    def _load_checkpoint_with_streaming(
-        self, model: nn.Module, checkpoint_files: List[str], device: DeviceLikeType
-    ) -> None:
-        """Load checkpoint files one at a time through ``nn.Module.load_state_dict``."""
-        num_files = len(checkpoint_files)
-        ad_logger.info(f"disable_preload=True: streaming checkpoint load from {num_files} file(s)")
-        for i, checkpoint_file in enumerate(checkpoint_files, start=1):
-            ad_logger.info(
-                f"Streaming checkpoint file {i}/{num_files}: {os.path.basename(checkpoint_file)}"
-            )
-            file_weights = modeling.load_state_dict(checkpoint_file, device_map={"": device})
-            model.load_state_dict(file_weights, strict=False)
-            del file_weights
-
-        ad_logger.info("Streaming checkpoint loading completed")
 
     def _load_full_checkpoint_to_cpu(self, checkpoint_files: List[str]) -> dict:
         """Load checkpoint files into CPU memory."""
