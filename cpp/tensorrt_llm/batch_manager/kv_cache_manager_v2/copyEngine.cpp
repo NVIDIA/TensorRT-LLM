@@ -96,7 +96,7 @@ StagingBuffer::StagingBuffer(StagingBufferManager& manager, size_t minSize, size
     actualSize = std::max(actualSize, minSize);
     mNumGrains = divUp(actualSize, kGranularity);
     assert(mNumGrains <= availableGrains);
-    mSize = mNumGrains * kGranularity;
+    mSize = actualSize;
     mStartGrain = mManager.mNext;
     mManager.mNext += mNumGrains;
     assert(mManager.mNext <= mManager.numGrains());
