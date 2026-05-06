@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <cassert>
+
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
@@ -80,7 +82,8 @@ public:
 
     double value() const noexcept
     {
-        return mCount > 0 ? mSum / mCount : 0.0;
+        assert(mCount > 0);
+        return mSum / mCount;
     }
 
     int count() const noexcept
