@@ -21,6 +21,9 @@
 #include "kv_cache_manager_v2/config.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 
+#include <algorithm>
+#include <cassert>
+#include <functional>
 #include <map>
 #include <unordered_map>
 #include <vector>
@@ -104,6 +107,8 @@ struct SlotDescVariant
         out.reserve(coalescedBuffers.size());
         for (auto const& cb : coalescedBuffers)
             out.push_back(cb.size());
+        // Coalesced buffers must be sorted in descending size order.
+        assert(std::is_sorted(out.begin(), out.end(), std::greater<>()));
         return out;
     }
 };
