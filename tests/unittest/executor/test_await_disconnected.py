@@ -54,6 +54,7 @@ class MockOpenAIServer:
     """
 
     async def await_disconnected(self, raw_request, promise):
+        """Poll for client disconnect; exit early when generation is done."""
         if raw_request is None:
             return
         while not await raw_request.is_disconnected():
@@ -136,6 +137,7 @@ class TestAwaitDisconnected:
         poll_count = 0
 
         async def _is_disconnected():
+            """Simulate keep-alive: never disconnect, finish after 3 polls."""
             nonlocal poll_count
             poll_count += 1
             if poll_count >= 3:
@@ -159,6 +161,7 @@ class TestAwaitDisconnected:
         poll_count = 0
 
         async def _is_disconnected():
+            """Simulate client disconnect on the 3rd poll."""
             nonlocal poll_count
             poll_count += 1
             return poll_count >= 3
@@ -201,7 +204,7 @@ class TestAwaitDisconnected:
                 asyncio.create_task(
                     server.await_disconnected(request, promise)))
 
-        done, pending = await asyncio.wait(tasks, timeout=2.0)
+        _, pending = await asyncio.wait(tasks, timeout=2.0)
         assert len(pending) == 0, (
             f"{len(pending)} await_disconnected tasks still running despite "
             f"promise.finished=True — would cause memory leak with "
