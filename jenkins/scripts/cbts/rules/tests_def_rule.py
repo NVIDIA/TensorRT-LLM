@@ -11,13 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TestsDefRule — narrows CI when .py test files under tests/ change.
+"""TestsDefRule — narrows CI when files under tests/ change.
 
-YAMLIndex is the source of truth for what's narrowable; this rule does
-not classify files by name. AST scope mapping yields function-level
-anchors (`file::TestC::test_m`) when every changed line lands in a
-pytest test scope; otherwise falls back to file-level. conftest.py and
-__init__.py anchor on their enclosing directory.
+Handles any path under `tests/` whose first component (after the
+`tests/integration/defs/` strip) appears in some YAML entry's namespace.
+For `test_*.py` files, AST scope mapping yields function-level anchors
+(`file::TestC::test_m`) when every changed line lands in a pytest scope;
+otherwise file-level. For non-test_*.py paths (conftest, helpers, data
+files like `references/*.yaml` or `disaggregated/test_configs/*.yaml`),
+`find_match_for_path` walks up enclosing directories to the narrowest
+YAML-covered ancestor.
 """
 
 from __future__ import annotations
@@ -92,7 +95,7 @@ def _is_perf_stem(stem: str) -> bool:
 
 class TestsDefRule(Rule):
     name = "testdef"
-    needs_diff_for: tuple[str, ...] = ("tests/**/*.py",)
+    needs_diff_for: tuple[str, ...] = ("tests/**/*",)
 
     def __init__(
         self,
@@ -126,7 +129,7 @@ class TestsDefRule(Rule):
         return [f"{yaml_path}::{s}" for s in sorted(scopes)]
 
     def apply(self, pr: PRInputs) -> Optional[RuleResult]:
-        candidates = [f for f in pr.changed_files if f.endswith(".py") and f.startswith("tests/")]
+        candidates = [f for f in pr.changed_files if f.startswith("tests/")]
         if not candidates:
             return None
 

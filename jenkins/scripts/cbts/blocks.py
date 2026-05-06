@@ -323,19 +323,7 @@ class YAMLIndex:
                 return "/".join(parts[i:])
         return None
 
-    def find_match_for_path(self, path: str) -> Optional[list[tuple[Block, str]]]:
-        """Find YAML entries that share pytest-tree lineage with `path`.
-
-        Returns per-block (Block, filter_prefix) pairs, or None if no
-        entry covers `path`. Per block, prefix is the most-ancestral
-        covering target (clamped at the anchor when only descendants
-        match). `path` is in YAML namespace; translate via
-        `git_path_to_yaml_key` upstream. conftest/__init__.py paths
-        anchor on their enclosing directory via `_path_lookup_anchor`.
-        """
-        anchor = _path_lookup_anchor(path)
-        if not anchor:
-            return None
+    def _lookup_at_anchor(self, anchor: str) -> Optional[list[tuple[Block, str]]]:
         result: list[tuple[Block, str]] = []
         for block in self.blocks:
             covering: list[str] = []
@@ -349,6 +337,33 @@ class YAMLIndex:
             prefix = min(ancestors, key=len) if ancestors else anchor
             result.append((block, prefix))
         return result or None
+
+    def find_match_for_path(self, path: str) -> Optional[list[tuple[Block, str]]]:
+        """Find YAML entries that share pytest-tree lineage with `path`.
+
+        Returns per-block (Block, filter_prefix) pairs, or None if no
+        entry covers `path`. Per block, prefix is the most-ancestral
+        covering target (clamped at the anchor when only descendants
+        match). `path` is in YAML namespace; translate via
+        `git_path_to_yaml_key` upstream.
+
+        For non-`test_*.py` paths (conftest.py, helpers, data files like
+        `references/*.yaml`), the lookup walks up enclosing directories
+        until one is covered by some YAML entry, picking the narrowest
+        such ancestor. `test_*.py` paths anchor on the file itself
+        without walking up.
+        """
+        anchor = _path_lookup_anchor(path)
+        if not anchor:
+            return None
+        is_file_anchor = anchor == path
+        while True:
+            matches = self._lookup_at_anchor(anchor)
+            if matches is not None:
+                return matches
+            if is_file_anchor or "/" not in anchor:
+                return None
+            anchor = anchor.rsplit("/", 1)[0]
 
     def all_test_ids(self) -> Iterable[str]:
         return self._test_to_blocks.keys()

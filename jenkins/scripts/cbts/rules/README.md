@@ -9,7 +9,7 @@ for the overall CBTS architecture.
 | File | Class | Scope | Triggers on |
 |---|---|---|---|
 | `waives_rule.py` | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
-| `tests_def_rule.py` | `TestsDefRule` | `testdefonly` | `tests/**/*.py` |
+| `tests_def_rule.py` | `TestsDefRule` | `testdefonly` | `tests/**/*` (any file under tests/) |
 | `test_list_rule.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
 | `out_of_scope_rule.py` | `OutOfScopeRule` | `noop` | `tests/integration/test_lists/qa/**`, `tests/**/*.md` |
 
@@ -33,31 +33,38 @@ Outcomes:
 
 ## TestsDefRule
 
-For each `tests/**/*.py` file in the diff:
+For each file under `tests/` in the diff:
 
 1. `git_path_to_yaml_key` translates the repo path to a YAML namespace
-   key, or returns `None` for paths outside YAML's view (e.g. top-level
-   integration `conftest.py`, helper modules under directories no YAML
-   entry mentions).
+   key, or returns `None` for paths outside YAML's view (top-level
+   integration `conftest.py`, dirs no YAML entry references such as
+   `tests/integration/test_input_files/`).
 2. `_compute_anchors` parses the diff's post-image line numbers and maps
    them through the file's AST to produce one of:
    - function-level anchors `path::Class::method` (every changed line
      lands in a `test_*` function inside a `Test*` class), or
    - file-level anchor `path` (any line lands at module scope, AST parse
-     fails, or the file is unreadable).
+     fails, or the file is unreadable — the latter covers .yaml/.txt/
+     .json/etc. data files).
 3. `lookup_paths_into_block_filters` calls `find_match_for_path`
    (bidirectional pytest-tree lineage) for each anchor; matches feed
-   `block_filters`.
+   `block_filters`. For non-`test_*.py` paths, the lookup walks up
+   enclosing directories to the narrowest YAML-covered ancestor — so
+   `accuracy/references/mmlu.yaml` lifts to `accuracy/`,
+   `disaggregated/test_configs/foo.yaml` lifts to `disaggregated/`,
+   `unittest/api_stability/references/llmapi.yaml` lifts to
+   `unittest/api_stability/`.
 
 Outcomes:
 
 - Path is out-of-namespace (`git_path_to_yaml_key` returns `None`):
   unhandled — Selector reports it and falls back. The file lives in
   `tests/` but YAML's namespace doesn't see it; could be implicitly
-  imported (top-level conftest, sys-path helpers).
-- Path is in-namespace but no YAML entry covers it: claimed as
-  no-narrow contribution (`scope=noop` if all paths are like this; a
-  miss-note in the reason on partial-narrow runs).
+  imported (top-level conftest, sys-path helpers, test input fixtures).
+- Path is in-namespace but no YAML-covered ancestor exists at any
+  walk-up level: claimed as no-narrow contribution (`scope=noop` if
+  all paths are like this; a miss-note in the reason on partial-narrow
+  runs).
 - Block-filter coverage ≥ `BLAST_RADIUS_FRACTION` (0.8) of total YAML
   blocks: `scope=None` (rule cannot usefully narrow — fallback).
 - `sanity_relevant` / `perfsanity_relevant` follow from the matched

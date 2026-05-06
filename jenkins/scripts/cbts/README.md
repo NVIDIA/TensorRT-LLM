@@ -25,7 +25,7 @@ Four rules, registered in `main.py::RULE_CLASSES`:
 | Rule | Scope | Files |
 |---|---|---|
 | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
-| `TestsDefRule` | `testdefonly` | `tests/**/*.py` |
+| `TestsDefRule` | `testdefonly` | `tests/**/*` (.py via AST; data files via dir walk-up) |
 | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
 | `OutOfScopeRule` | `noop` | `tests/integration/test_lists/qa/**`, `tests/**/*.md` |
 
@@ -98,8 +98,10 @@ test).
 tree lineage. For an anchor `path::Class::method`, matches YAML entries
 that share any common ancestor (sibling methods, sibling classes within
 the same file, sibling files within the same dir). Files whose basename
-doesn't start with `test_` (conftest.py, __init__.py, helper modules)
-anchor on their enclosing dir.
+doesn't start with `test_` (conftest.py, __init__.py, helper modules,
+data files like `references/*.yaml` or `test_configs/*.yaml`) anchor on
+their enclosing dir; if no YAML entry covers that dir, the lookup walks
+up one directory at a time to the narrowest YAML-covered ancestor.
 
 `YAMLIndex.git_path_to_yaml_key` (testdef path translation): maps a repo-
 relative git path to its YAML namespace form by finding the first path
