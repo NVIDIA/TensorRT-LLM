@@ -460,12 +460,9 @@ std::vector<std::weak_ptr<CommittedPage>> removeSubtree(
 
         // Clear storage.
         block->storage.assign(block->storage.size(), {});
-        if (!gNdebug)
-        {
-            assert(
-                std::all_of(block->storage.begin(), block->storage.end(), [](auto const& wp) { return wp.expired(); })
-                && "storage must be cleared after assign");
-        }
+        assert(gNdebug
+            || (std::all_of(block->storage.begin(), block->storage.end(), [](auto const& wp) { return wp.expired(); })
+                && "storage must be cleared after assign"));
 
         // Push children (they will be destroyed when removed from parent's next).
         for (auto& [k, child] : block->next)

@@ -481,7 +481,7 @@ int PoolGroupBase::numSlots() const noexcept
     if (!gNdebug)
     {
         // Mirrors Python PoolGroupBase.num_slots: assert num_slots <= self._get_num_slots_from_pools()
-        int poolSlots = getNumSlotsFromPools();
+        [[maybe_unused]] int poolSlots = getNumSlotsFromPools();
         assert(n <= poolSlots && "SlotAllocator capacity exceeds pool capacity");
     }
     return n;
@@ -523,12 +523,10 @@ void PoolGroupBase::resizePools(std::optional<int> newNumSlots)
     for (auto& p : mPools)
         p->resize(n);
     // Mirrors Python PoolGroupBase.resize_pools: assert NDEBUG or self._check(True)
-    if (!gNdebug)
-    {
-        // After resize, allocator capacity must not exceed pool capacity (allow mismatch).
-        assert(mSlotAllocator.numSlots() <= getNumSlotsFromPools()
-            && "After resizePools: allocator capacity exceeds pool capacity");
-    }
+    // After resize, allocator capacity must not exceed pool capacity (allow mismatch).
+    assert(gNdebug
+        || (mSlotAllocator.numSlots() <= getNumSlotsFromPools()
+            && "After resizePools: allocator capacity exceeds pool capacity"));
 }
 
 std::vector<Address> PoolGroupBase::slotAddress(SlotId slotId) const
@@ -776,7 +774,7 @@ std::vector<int> CacheLevelStorage::ratioToSlotCountList(size_t quota, std::vect
     assert(static_cast<int>(ratioList.size()) == numPg);
     if (!gNdebug)
     {
-        for (auto x : ratioList)
+        for ([[maybe_unused]] auto x : ratioList)
         {
             assert(x > 0 && "ratioToSlotCountList: all ratios must be positive");
         }
@@ -785,7 +783,7 @@ std::vector<int> CacheLevelStorage::ratioToSlotCountList(size_t quota, std::vect
     int64_t totalGrains = static_cast<int64_t>(quota) / granularity;
     if (!gNdebug)
     {
-        int64_t minGrains = 0;
+        [[maybe_unused]] int64_t minGrains = 0;
         for (auto const& sizes : sizeLists)
             minGrains += static_cast<int64_t>(sizes.size());
         assert(totalGrains >= minGrains
