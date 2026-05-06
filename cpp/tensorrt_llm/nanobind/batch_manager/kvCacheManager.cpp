@@ -49,7 +49,6 @@ using VecUniqueTokens = tensorrt_llm::runtime::VecUniqueTokens;
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using TokenIdType = tensorrt_llm::runtime::TokenIdType;
 using VecTokens = std::vector<TokenIdType>;
-using CacheSaltIDType = tensorrt_llm::runtime::CacheSaltIDType;
 using CudaStreamPtr = std::shared_ptr<tensorrt_llm::runtime::CudaStream>;
 using CacheBlockIds = std::vector<std::vector<SizeType32>>;
 
@@ -401,17 +400,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("__hash__", [](tbk::BlockKey const& key) -> size_t { return tbk::BlockKeyHasher{}(key); });
 
     nb::class_<tbk::BlockKeyHasher>(m, "BlockKeyHasher")
-        .def_static("hash", &tbk::BlockKeyHasher::hash, nb::arg("block_key"), nb::arg("parent_hash") = 0)
-        .def_static(
-            "hash_token_ids",
-            [](VecTokens const& tokenIds, std::size_t parentHash,
-                std::optional<CacheSaltIDType> cacheSaltID) -> std::size_t
-            {
-                auto blockKey = BlockKey(tokenIds);
-                blockKey.cacheSaltID = cacheSaltID;
-                return tbk::BlockKeyHasher::hash(blockKey, parentHash);
-            },
-            nb::arg("token_ids"), nb::arg("parent_hash") = 0, nb::arg("cache_salt_id") = std::nullopt);
+        .def_static("hash", &tbk::BlockKeyHasher::hash, nb::arg("block_key"), nb::arg("parent_hash") = 0);
 
     nb::class_<tbk::KVCacheEventManager>(m, "KVCacheEventManager")
         .def(nb::init<size_t, std::optional<SizeType32>, std::optional<SizeType32>, SizeType32>(),

@@ -838,7 +838,7 @@ class KVCacheManager(BaseResourceManager):
     def update_resources(self,
                          scheduled_batch: ScheduledRequests,
                          attn_metadata: "AttentionMetadata" = None,
-                         kv_cache_dtype_byte_size: float = None) -> None:
+                         kv_cache_dtype_byte_size: float = None):
         if not self.is_draft:
             _update_kv_cache_draft_token_location(self, scheduled_batch,
                                                   attn_metadata,
@@ -862,10 +862,6 @@ class KVCacheManager(BaseResourceManager):
         # storing, so that SWA windows are safe to store — blocks won't go out-of-window
         # and be evicted while the context is still in-flight.
         for request in scheduled_batch.context_requests:
-            if (request.is_disagg_context_transmission_state
-                    and self.enable_partial_reuse and not self.is_vswa
-                    and self.mapping.pp_size == 1):
-                continue
             self.impl.store_context_blocks(request)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
