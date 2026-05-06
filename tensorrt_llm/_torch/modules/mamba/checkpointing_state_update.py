@@ -555,91 +555,100 @@ def _rectangle_precompute_kernel(
         other=0.0,
     )
 
-    # Per-head pre-wait: compute decay_vec_full AND combo = factor_dt * exp_diff,
-    # storing both to scratch (combo overlays cb_scaled — overwritten post-wait
-    # with rect_CB_scaled).  This pulls all factor_dt / exp_diff math out of
-    # the post-wait loop, which becomes a single load + multiply + masked store
-    # per head.  Loads of old_dt/old_dA_cumsum/dt_at_kn/dA_cumsum_at_kn that
-    # used to be L1 warmers are now real consumers (no fake-keep wraparound).
+    # Pre-wait: vectorized across HEADS_PER_BLOCK heads.  Compute decay_vec_full
+    # (H, T) and combo = factor_dt * exp_diff (H, T, K).  Store decay_vec_full;
+    # combo_block stays in registers across gdc_wait — used directly post-wait
+    # to compute rect_CB_scaled without a global memory roundtrip.
     prev_k_idx = tl.minimum(
         tl.maximum(prev_num_accepted_tokens - 1, 0), MAX_REPLAY_BUFFER_LENGTH - 1
     )
-    for h_local in range(HEADS_PER_BLOCK):
-        head_idx = first_head + h_local
-        old_dt_read_base_h = (
-            old_dt_ptr
-            + cache_batch_idx * stride_old_dt_cache
-            + buf_active * stride_old_dt_dbuf
-            + head_idx * stride_old_dt_head
-        )
-        old_dA_cumsum_read_base_h = (
-            old_dA_cumsum_ptr
-            + cache_batch_idx * stride_old_dA_cumsum_cache
-            + buf_active * stride_old_dA_cumsum_dbuf
-            + head_idx * stride_old_dA_cumsum_head
-        )
-        old_dt_write_base_h = (
-            old_dt_ptr
-            + cache_batch_idx * stride_old_dt_cache
-            + write_buf * stride_old_dt_dbuf
-            + head_idx * stride_old_dt_head
-        )
-        old_dA_cumsum_write_base_h = (
-            old_dA_cumsum_ptr
-            + cache_batch_idx * stride_old_dA_cumsum_cache
-            + write_buf * stride_old_dA_cumsum_dbuf
-            + head_idx * stride_old_dA_cumsum_head
-        )
-        old_dt_all_h = tl.load(
-            old_dt_read_base_h + safe_old_k * stride_old_dt_T,
-            mask=is_old_k, other=0.0,
-        ).to(tl.float32)
-        old_dA_cumsum_all_h = tl.load(
-            old_dA_cumsum_read_base_h + safe_old_k * stride_old_dA_cumsum_T,
-            mask=is_old_k, other=0.0,
-        ).to(tl.float32)
-        total_dA_cumsum_h = tl.load(
-            old_dA_cumsum_read_base_h + prev_k_idx * stride_old_dA_cumsum_T
-        ).to(tl.float32)
-        dA_cumsum_new_h = tl.load(
-            old_dA_cumsum_write_base_h + (write_offset + offs_t) * stride_old_dA_cumsum_T,
-            mask=t_mask, other=0.0,
-        ).to(tl.float32)
-        dt_at_kn_h = tl.load(
-            old_dt_write_base_h + (write_offset + safe_k_new) * stride_old_dt_T,
-            mask=is_new_k, other=0.0,
-        ).to(tl.float32)
-        dA_cumsum_at_kn_h = tl.load(
-            old_dA_cumsum_write_base_h + (write_offset + safe_k_new) * stride_old_dA_cumsum_T,
-            mask=is_new_k, other=0.0,
-        ).to(tl.float32)
+    offs_h = tl.arange(0, HEADS_PER_BLOCK)
+    heads_block = first_head + offs_h  # (H,)
 
-        # decay_vec_full = total_decay * exp(cumAdt_new)
-        total_decay_h = tl.where(
-            prev_num_accepted_tokens > 0, tl.exp(total_dA_cumsum_h), 1.0
-        )
-        decay_vec_full_h = total_decay_h * tl.exp(dA_cumsum_new_h)
-        decay_vec_base_h = decay_vec_ptr + pid_b * stride_dv_batch + head_idx * stride_dv_head
-        tl.store(
-            decay_vec_base_h + offs_t * stride_dv_t, decay_vec_full_h, mask=t_mask
-        )
+    # Per-head bases (H,) — broadcast with offs_k or offs_t for 2D loads.
+    old_dt_read_h = (
+        old_dt_ptr
+        + cache_batch_idx * stride_old_dt_cache
+        + buf_active * stride_old_dt_dbuf
+        + heads_block * stride_old_dt_head
+    )
+    old_dA_cumsum_read_h = (
+        old_dA_cumsum_ptr
+        + cache_batch_idx * stride_old_dA_cumsum_cache
+        + buf_active * stride_old_dA_cumsum_dbuf
+        + heads_block * stride_old_dA_cumsum_head
+    )
+    old_dt_write_h = (
+        old_dt_ptr
+        + cache_batch_idx * stride_old_dt_cache
+        + write_buf * stride_old_dt_dbuf
+        + heads_block * stride_old_dt_head
+    )
+    old_dA_cumsum_write_h = (
+        old_dA_cumsum_ptr
+        + cache_batch_idx * stride_old_dA_cumsum_cache
+        + write_buf * stride_old_dA_cumsum_dbuf
+        + heads_block * stride_old_dA_cumsum_head
+    )
 
-        # combo = factor_dt * exp_diff — stored to cb_scaled scratch (overwritten
-        # post-wait with rect_CB_scaled = where(causal, raw_rect_CB * combo, 0)).
-        factor_dt_h = tl.where(is_old_k, old_dt_all_h, dt_at_kn_h)
-        s_k_h = tl.where(
-            is_old_k, total_dA_cumsum_h - old_dA_cumsum_all_h, -dA_cumsum_at_kn_h
-        )
-        exp_diff_h = tl.exp(s_k_h[None, :] + dA_cumsum_new_h[:, None])
-        combo_h = factor_dt_h[None, :] * exp_diff_h
-        cb_scaled_base_h = (
-            cb_scaled_ptr + pid_b * stride_cb_batch + head_idx * stride_cb_head
-        )
-        tl.store(
-            cb_scaled_base_h + offs_t[:, None] * stride_cb_t + offs_k[None, :] * stride_cb_j,
-            combo_h,
-            mask=(offs_t[:, None] < BLOCK_SIZE_T) & (offs_k[None, :] < BLOCK_SIZE_K),
-        )
+    # (H, K) loads at [0, PNAT) — old data from previous step.
+    hk_mask = is_old_k[None, :]  # (1, K)
+    old_dt_all = tl.load(
+        old_dt_read_h[:, None] + safe_old_k[None, :] * stride_old_dt_T,
+        mask=hk_mask, other=0.0,
+    ).to(tl.float32)
+    old_dA_cumsum_all = tl.load(
+        old_dA_cumsum_read_h[:, None] + safe_old_k[None, :] * stride_old_dA_cumsum_T,
+        mask=hk_mask, other=0.0,
+    ).to(tl.float32)
+    # (H,) scalar-per-head: total_dA_cumsum at prev_k_idx.
+    total_dA_cumsum = tl.load(
+        old_dA_cumsum_read_h + prev_k_idx * stride_old_dA_cumsum_T
+    ).to(tl.float32)
+    # (H, T) loads at [PNAT, PNAT+T) — this step's dA_cumsum_new from loop 1.
+    ht_mask = t_mask[None, :]  # (1, T)
+    dA_cumsum_new = tl.load(
+        old_dA_cumsum_write_h[:, None]
+        + (write_offset + offs_t)[None, :] * stride_old_dA_cumsum_T,
+        mask=ht_mask, other=0.0,
+    ).to(tl.float32)
+    # (H, K) loads at K_NEW_SHIFT-shifted positions for new tokens.
+    hkn_mask = is_new_k[None, :]
+    dt_at_kn = tl.load(
+        old_dt_write_h[:, None]
+        + (write_offset + safe_k_new)[None, :] * stride_old_dt_T,
+        mask=hkn_mask, other=0.0,
+    ).to(tl.float32)
+    dA_cumsum_at_kn = tl.load(
+        old_dA_cumsum_write_h[:, None]
+        + (write_offset + safe_k_new)[None, :] * stride_old_dA_cumsum_T,
+        mask=hkn_mask, other=0.0,
+    ).to(tl.float32)
+
+    # decay_vec_full = total_decay * exp(cumAdt_new).  (H, T).
+    total_decay = tl.where(
+        prev_num_accepted_tokens > 0, tl.exp(total_dA_cumsum), 1.0
+    )  # (H,)
+    decay_vec_full_block = total_decay[:, None] * tl.exp(dA_cumsum_new)  # (H, T)
+    decay_vec_addrs = (
+        decay_vec_ptr
+        + pid_b * stride_dv_batch
+        + heads_block[:, None] * stride_dv_head
+        + offs_t[None, :] * stride_dv_t
+    )  # (H, T)
+    tl.store(decay_vec_addrs, decay_vec_full_block, mask=ht_mask)
+
+    # combo_block = factor_dt * exp_diff — (H, T, K).  Stays in registers
+    # across gdc_wait.
+    factor_dt = tl.where(is_old_k[None, :], old_dt_all, dt_at_kn)  # (H, K)
+    s_k = tl.where(
+        is_old_k[None, :],
+        total_dA_cumsum[:, None] - old_dA_cumsum_all,
+        -dA_cumsum_at_kn,
+    )  # (H, K)
+    # exp_diff (H, T, K) = exp(s_k (H, 1, K) + dA_cumsum_new (H, T, 1)).
+    exp_diff = tl.exp(s_k[:, None, :] + dA_cumsum_new[:, :, None])
+    combo_block = factor_dt[:, None, :] * exp_diff  # (H, T, K)
 
     # ---- gdc_wait: from here on we depend on conv1d's outputs ----
     if LAUNCH_WITH_PDL:
@@ -692,28 +701,26 @@ def _rectangle_precompute_kernel(
     is_new_causal_2d = (k_new_idx_2d >= 0) & (k_new_idx_2d < T) & (k_new_idx_2d <= t_idx_2d)
     causal_combined = (is_old_k_2d | is_new_causal_2d) & t_mask[:, None]
 
-    # Per-head post-wait: load pre-computed combo (factor_dt * exp_diff) from
-    # cb_scaled scratch, apply causal mask × raw_rect_CB, write rect_CB_scaled
-    # back to the same address.  All factor_dt / exp_diff math happened
-    # pre-wait above; this loop is pure load + multiply + masked store.
-    for h_local in range(HEADS_PER_BLOCK):
-        head_idx = first_head + h_local
-        cb_scaled_base = cb_scaled_ptr + pid_b * stride_cb_batch + head_idx * stride_cb_head
-        cb_load_mask = (offs_t[:, None] < BLOCK_SIZE_T) & (offs_k[None, :] < BLOCK_SIZE_K)
-        combo_loaded = tl.load(
-            cb_scaled_base + offs_t[:, None] * stride_cb_t + offs_k[None, :] * stride_cb_j,
-            mask=cb_load_mask, other=0.0,
-        )
-        rect_CB_scaled = tl.where(
-            causal_combined,
-            raw_rect_CB * combo_loaded,
-            0.0,
-        )
-        tl.store(
-            cb_scaled_base + offs_t[:, None] * stride_cb_t + offs_k[None, :] * stride_cb_j,
-            rect_CB_scaled,
-            mask=cb_load_mask,
-        )
+    # Post-wait vectorized: combo_block (H, T, K) is still live in registers.
+    # rect_CB_scaled = where(causal, raw_rect_CB * combo_block, 0); store as
+    # one (H, T, K) tile.
+    rect_CB_scaled_block = tl.where(
+        causal_combined[None, :, :],
+        raw_rect_CB[None, :, :] * combo_block,
+        0.0,
+    )  # (H, T, K)
+    cb_scaled_addrs = (
+        cb_scaled_ptr
+        + pid_b * stride_cb_batch
+        + heads_block[:, None, None] * stride_cb_head
+        + offs_t[None, :, None] * stride_cb_t
+        + offs_k[None, None, :] * stride_cb_j
+    )  # (H, T, K)
+    cb_store_mask_3d = (
+        (offs_t[None, :, None] < BLOCK_SIZE_T)
+        & (offs_k[None, None, :] < BLOCK_SIZE_K)
+    )  # (1, T, K) → broadcasts to (H, T, K)
+    tl.store(cb_scaled_addrs, rect_CB_scaled_block, mask=cb_store_mask_3d)
 
 
 # Main kernel: tl.dot replay + precomputed CB output.
