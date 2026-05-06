@@ -571,8 +571,20 @@ class BaseLLM:
                     "Multimodal disaggregated inference is not supported for this model"
                 )
             mm_handles = disaggregated_params.multimodal_embedding_handles
-            prompt_token_ids, mm_token_length, mm_token_positions = self.input_processor.get_prompt_token_ids(
+            prompt_token_result = self.input_processor.get_prompt_token_ids(
                 inputs, mm_handles)
+            if len(prompt_token_result) == 3:
+                prompt_token_ids, mm_token_length, mm_token_positions = (
+                    prompt_token_result)
+                mm_layout_metadata = {}
+            elif len(prompt_token_result) == 4:
+                prompt_token_ids, mm_token_length, mm_token_positions, mm_layout_metadata = (
+                    prompt_token_result)
+            else:
+                raise ValueError(
+                    "get_prompt_token_ids must return either "
+                    "(prompt_token_ids, mm_token_length, mm_token_positions) "
+                    "or those values plus multimodal layout metadata")
             prompt = inputs.get("prompt", None)
             query_token_ids = inputs.get("query_token_ids", None)
             if is_gen_only:
@@ -582,8 +594,29 @@ class BaseLLM:
             else:
                 mm_hashes = disaggregated_params.multimodal_hashes
                 multimodal_input = MultimodalInput.from_components(
-                    mm_hashes, mm_token_positions, mm_token_length)
+                    mm_hashes,
+                    mm_token_positions,
+                    mm_token_length,
+                    mm_item_run_cu_seqlen=mm_layout_metadata.get(
+                        "multimodal_item_run_cu_seqlen"),
+                    mm_run_positions=mm_layout_metadata.get(
+                        "multimodal_run_positions"),
+                    mm_run_lengths=mm_layout_metadata.get(
+                        "multimodal_run_lengths"))
                 multimodal_data = {"multimodal_embedding": mm_handles}
+                if "multimodal_embedding_lengths" in mm_layout_metadata:
+                    multimodal_data["multimodal_embedding_lengths"] = (
+                        mm_layout_metadata["multimodal_embedding_lengths"])
+                if "special_token_offsets" in mm_layout_metadata:
+                    multimodal_data["special_token_offsets"] = (
+                        mm_layout_metadata["special_token_offsets"])
+                layout_metadata = {
+                    key: mm_layout_metadata[key]
+                    for key in ("item_types", "special_token_offsets")
+                    if key in mm_layout_metadata
+                }
+                if layout_metadata:
+                    multimodal_data["layout_metadata"] = layout_metadata
                 if disaggregated_params.mrope_position_ids_handle is not None:
                     # NOTE: `PyTorchModelEngine` assumes both are present when using mrope.
                     assert disaggregated_params.mrope_position_deltas_handle is not None

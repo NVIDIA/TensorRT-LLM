@@ -13,8 +13,8 @@
 import types
 from collections import abc, defaultdict
 from dataclasses import dataclass
-from types import SimpleNamespace
-from typing import Dict, List, Optional, Sequence, Tuple
+from types import MethodType, SimpleNamespace
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from strenum import StrEnum
@@ -70,6 +70,16 @@ _RESERVED_MM_DATA_KEYS = frozenset(
         "multimodal_embed_mask_cumsum",
     }
 )
+
+
+def _metadata_to_list(value: Any) -> List[int]:
+    if value is None:
+        return []
+    if torch.is_tensor(value):
+        value = value.detach().cpu().tolist()
+        if not isinstance(value, list):
+            return [int(value)]
+    return list(value)
 
 
 @dataclass
@@ -593,7 +603,7 @@ class ADEngine(ModelEngine):
             mm_item_types = layout_metadata.get("item_types", []) if layout_metadata else []
             mm_pos_list = list(mm_pos) if mm_pos is not None else []
             mm_len_list = list(mm_len) if mm_len is not None else []
-            mm_item_types_list = list(mm_item_types)
+            mm_item_types_list = _metadata_to_list(mm_item_types)
             if len(mm_pos_list) != len(mm_len_list):
                 raise ValueError(
                     "Mismatch between multimodal_positions and multimodal_lengths in "
@@ -614,10 +624,10 @@ class ADEngine(ModelEngine):
             flat_cumsum = mm_data.get("multimodal_embed_mask_cumsum")
             # special_token_offsets indices into the dense MM-token-list (which includes both embeds and specials).
             # It does not index into the prompt-position-indexed cumsum.
-            special_offsets = list(
-                mm_data.get("special_token_offsets")
-                or (layout_metadata or {}).get("special_token_offsets", [])
-            )
+            special_offsets_source = mm_data.get("special_token_offsets")
+            if special_offsets_source is None and layout_metadata:
+                special_offsets_source = layout_metadata.get("special_token_offsets")
+            special_offsets = _metadata_to_list(special_offsets_source)
             mm_special_offsets_cu_seqlen.append(
                 mm_special_offsets_cu_seqlen[-1] + len(special_offsets)
             )

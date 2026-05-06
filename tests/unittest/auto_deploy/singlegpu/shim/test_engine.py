@@ -550,7 +550,7 @@ def test_ad_engine_mm_special_offsets_for_non_contiguous_unit():
         )
         .to(torch.int64)
         .cumsum(0),
-        "special_token_offsets": [2],
+        "special_token_offsets": torch.tensor([2], dtype=torch.int32),
     }
 
     scheduled_requests = ScheduledRequests()

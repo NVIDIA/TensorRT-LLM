@@ -401,12 +401,8 @@ class PyResult:
         Args:
             mm_embeddings: Concatenated multimodal embeddings tensor of shape
                 [total_tokens, hidden_dim].
-            multimodal_lengths: Current per-item split lengths.
+            multimodal_lengths: Per-item encoder-output embedding lengths.
         """
-        # TODO(TRTLLM-12175): callers currently pass request.multimodal_lengths,
-        # a prompt-side MM-token count that may include non-embedding
-        # special/framing tokens. This split needs per-item encoder-output
-        # embedding lengths instead.
         split_embeddings = torch.split(mm_embeddings, multimodal_lengths, dim=0)
 
         # Create a SharedTensorContainer handle for each split
@@ -939,6 +935,58 @@ def convert_wordlist(word_list) -> List[List[int]]:
     if len(tokens) > len(offsets):
         offsets.extend([-1] * (len(tokens) - len(offsets)))
     return [tokens, offsets]
+
+
+def _optional_int_list(values: Any, field_name: str) -> Optional[List[int]]:
+    if values is None:
+        return None
+    if torch.is_tensor(values):
+        values = values.detach().cpu().tolist()
+    try:
+        return [int(value) for value in values]
+    except TypeError as exc:
+        raise TypeError(f"{field_name} must be iterable") from exc
+
+
+def _get_multimodal_embedding_lengths_metadata(request: Any) -> Any:
+    py_multimodal_data = getattr(request, "py_multimodal_data", None)
+    if not isinstance(py_multimodal_data, dict):
+        return None
+
+    value = py_multimodal_data.get("multimodal_embedding_lengths")
+    if value is not None:
+        return value
+
+    layout_metadata = py_multimodal_data.get("layout_metadata")
+    if isinstance(layout_metadata, dict):
+        return layout_metadata.get("multimodal_embedding_lengths")
+    return None
+
+
+def get_multimodal_embedding_lengths(request: Any) -> Optional[List[int]]:
+    """Return per-item encoder-output lengths for a multimodal request."""
+    multimodal_lengths = _optional_int_list(
+        getattr(request, "multimodal_lengths", None), "multimodal_lengths")
+    multimodal_embedding_lengths = _optional_int_list(
+        _get_multimodal_embedding_lengths_metadata(request),
+        "multimodal_embedding_lengths")
+    if multimodal_embedding_lengths is None:
+        return multimodal_lengths
+
+    if any(length < 0 for length in multimodal_embedding_lengths):
+        raise ValueError("multimodal_embedding_lengths must be non-negative")
+    if multimodal_lengths is not None:
+        if len(multimodal_embedding_lengths) != len(multimodal_lengths):
+            raise ValueError("multimodal_embedding_lengths length must match "
+                             "multimodal_lengths")
+        for item_idx, (embedding_length, prompt_length) in enumerate(
+                zip(multimodal_embedding_lengths, multimodal_lengths)):
+            if embedding_length > prompt_length:
+                raise ValueError(
+                    f"multimodal_embedding_lengths[{item_idx}] exceeds "
+                    f"multimodal_lengths[{item_idx}]")
+
+    return multimodal_embedding_lengths
 
 
 def executor_request_to_llm_request(

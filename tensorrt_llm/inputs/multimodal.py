@@ -329,6 +329,7 @@ class MultimodalRuntimeData:
 # Extend only after auditing each key's consumers.
 _CPU_ONLY_MULTIMODAL_DATA_KEYS = frozenset({
     "multimodal_embed_mask_cumsum",
+    "multimodal_embedding_lengths",
 })
 
 
@@ -896,6 +897,7 @@ def find_mm_token_lengths(
 _MM_METADATA_ONLY_KEYS = frozenset({
     "mrope_config",
     "multimodal_embed_mask_cumsum",
+    "multimodal_embedding_lengths",
     "special_token_offsets",
     "layout_metadata",
 })
