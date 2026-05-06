@@ -354,8 +354,13 @@ std::shared_ptr<Page> SharedPageLock::unlock()
     assert(mUniqLock);
 
     // Record finish event from the KvCache stream.
-    auto kvc = unwrap(mUser.kvCache);
-    mUniqLock->notifyFinish(kvc->finishEvent());
+    // Use lock() instead of unwrap(): during ~KvCache, member destruction
+    // destroys SharedPageLocks after the KvCache's weak_ptr has expired.
+    // Throwing from a destructor would call std::terminate().
+    if (auto kvc = mUser.kvCache.lock())
+    {
+        mUniqLock->notifyFinish(kvc->finishEvent());
+    }
 
     releasePageIndex();
     auto p = page(); // copy shared_ptr before reset
@@ -375,11 +380,14 @@ void SharedPageLock::acquirePageIndex()
 
 void SharedPageLock::releasePageIndex()
 {
-    auto kvc = unwrap(mUser.kvCache);
-    int oldBaseIndex = kvc->updateBasePageIndex(mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, /*BAD=*/-1);
-    // Mirrors Python assertion: old base index must match this page's slot ID.
-    assert(oldBaseIndex == page()->slotId());
-    (void) oldBaseIndex;
+    // Use lock() instead of unwrap() — may be called from destructor path.
+    if (auto kvc = mUser.kvCache.lock())
+    {
+        int oldBaseIndex = kvc->updateBasePageIndex(mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, /*BAD=*/-1);
+        // Mirrors Python assertion: old base index must match this page's slot ID.
+        assert(oldBaseIndex == page()->slotId());
+        (void) oldBaseIndex;
+    }
 }
 
 // ---------------------------------------------------------------------------
