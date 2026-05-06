@@ -2919,6 +2919,11 @@ class PyExecutor:
                     self.max_num_active_requests)
             new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
+            all_new_flat = [
+                req for reqs in all_ranks_new_requests for req in reqs
+            ]
+            self._lock_adp_dummy_role(all_new_flat)
+
             # Update per-rank counter for DP
             self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
 
@@ -2991,20 +2996,6 @@ class PyExecutor:
             request for request in new_requests_cur_rank
             if not _respond_if_invalid(request)
         ]
-
-        # Lock the ADP dummy role to match this worker's disagg role.
-        if (self.enable_attention_dp and self.kv_cache_transceiver is not None
-                and not self._adp_dummy_role_locked):
-            for request in validated_requests:
-                rt = getattr(request, "llm_request_type", None)
-                if rt == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY:
-                    self._adp_dummy_is_gen = False
-                    self._adp_dummy_role_locked = True
-                    break
-                if rt == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
-                    self._adp_dummy_is_gen = True
-                    self._adp_dummy_role_locked = True
-                    break
 
         self.active_requests.extend(validated_requests)
         return validated_requests
@@ -3292,6 +3283,21 @@ class PyExecutor:
                     f"num_fetch_requests={self.num_fetch_requests}, "
                     f"num_schedulable_requests={num_schedulable_requests}")
         return True
+
+    def _lock_adp_dummy_role(self, candidates: List[LlmRequest]) -> None:
+        if (not self.enable_attention_dp or self.kv_cache_transceiver is None
+                or self._adp_dummy_role_locked):
+            return
+        for req in candidates:
+            rt = getattr(req, "llm_request_type", None)
+            if rt == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY:
+                self._adp_dummy_is_gen = False
+                self._adp_dummy_role_locked = True
+                return
+            if rt == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
+                self._adp_dummy_is_gen = True
+                self._adp_dummy_role_locked = True
+                return
 
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):

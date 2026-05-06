@@ -451,23 +451,7 @@ def _run_pad(stub):
 
 
 def _run_role_lock(stub, validated_requests):
-    from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
-
-    if (
-        stub.enable_attention_dp
-        and stub.kv_cache_transceiver is not None
-        and not stub._adp_dummy_role_locked
-    ):
-        for request in validated_requests:
-            rt = getattr(request, "llm_request_type", None)
-            if rt == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY:
-                stub._adp_dummy_is_gen = False
-                stub._adp_dummy_role_locked = True
-                break
-            if rt == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
-                stub._adp_dummy_is_gen = True
-                stub._adp_dummy_role_locked = True
-                break
+    PyExecutor._lock_adp_dummy_role(stub, validated_requests)
 
 
 def test_adp_dummy_role_locks_to_ctx_on_first_context_only_request():
