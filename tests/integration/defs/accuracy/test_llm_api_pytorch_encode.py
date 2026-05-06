@@ -120,7 +120,7 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("model_name,model_path", PER_TOKEN_REWARD_MODELS)
     def test_encode_matches_huggingface_per_token_reward(self, model_name, model_path):
         """Per-token reward models: last-content-token argmax per prompt."""
-        from transformers import AutoModel, AutoTokenizer
+        from transformers import AutoConfig, AutoModel, AutoTokenizer
 
         # Resolve the checkpoint's native precision.
         torch_dtype, llm_dtype = _resolve_checkpoint_dtype(model_path, trust_remote_code=True)
@@ -129,8 +129,26 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
             outs = llm.encode(PROMPTS)
 
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        # Qwen2.5-Math-PRM-7B's vendored modeling_qwen2_rm.py reads
+        # ``config.pad_token_id`` directly. In transformers >=5.x the base
+        # config no longer auto-exposes ``pad_token_id`` and the vendored
+        # ``Qwen2RMConfig`` doesn't declare it, so the bare attribute access
+        # raises AttributeError. Inject it from the tokenizer (or fall back
+        # to eos) before instantiating the HF model.
+        hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        if not hasattr(hf_config, "pad_token_id") or hf_config.pad_token_id is None:
+            hf_config.pad_token_id = (
+                getattr(tokenizer, "pad_token_id", None)
+                or getattr(hf_config, "eos_token_id", None)
+                or 0
+            )
         hf_model = (
-            AutoModel.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch_dtype)
+            AutoModel.from_pretrained(
+                model_path,
+                config=hf_config,
+                trust_remote_code=True,
+                torch_dtype=torch_dtype,
+            )
             .cuda()
             .eval()
         )
