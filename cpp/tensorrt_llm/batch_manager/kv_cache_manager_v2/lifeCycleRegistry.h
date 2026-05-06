@@ -63,6 +63,10 @@ struct AttnLifeCycle
 
     static AttnLifeCycle make(std::optional<int> ws, std::optional<int> numSinkTokens, int tokensPerBlock)
     {
+        assert(tokensPerBlock > 0);
+        assert(!ws.has_value() || *ws > 0);
+        assert(!numSinkTokens.has_value() || *numSinkTokens >= 0);
+        assert((!numSinkTokens.has_value() || *numSinkTokens == 0) || ws.has_value());
         int sinkBlocks = divUp(numSinkTokens.value_or(0), tokensPerBlock);
         return AttnLifeCycle{ws, sinkBlocks};
     }
