@@ -427,21 +427,10 @@ setup(
     scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
     extras_require={
         "devel": devel_deps,
-        # NOTE: The MX (modelexpress) Python package used by
-        # tensorrt_llm._torch.models.checkpoints.mx is intentionally NOT
-        # declared as an ``[mx]`` extra while this integration is at
-        # prototype status. ``modelexpress`` v0.3.0 is on PyPI
-        # (Apache-2.0) but is brand-new (Beta status, single release) and
-        # still needs onboarding into NVIDIA's OSS package allowlist.
-        #
-        # Until allowlisting is complete, users who want to exercise the
-        # MX code path install the dependency manually:
-        #
-        #     pip install "modelexpress>=0.3.0,<0.4.0"
-        #
-        # Restoring one-line ``pip install tensorrt_llm[mx]`` ergonomics
-        # is a single revert of this hunk once the OSS-allowlist step is
-        # complete (tracked in §15 of the design doc as MX-7).
+        # MX remains prototype-only and is intentionally not declared as an
+        # optional package extra until its external dependency completes OSS
+        # allowlist onboarding. Keep install instructions in docs/PR text
+        # rather than packaging metadata.
     },
     zip_safe=True,
     install_requires=required_deps,

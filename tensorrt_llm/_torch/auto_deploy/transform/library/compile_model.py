@@ -102,9 +102,13 @@ class CompileModel(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[nn.Module, TransformInfo]:
         cm.info.reset()
+        spec_config = cm._spec_config
 
         def _get_args_kwargs(bs: int) -> ArgsKwargs:
-            cm.info.set_generate_only_batch(bs)
+            if spec_config is not None:
+                cm.info.set_capture_batch(batch_size=bs, max_draft_len=spec_config.max_draft_len)
+                return (), {**cm.named_args, "cache_seq_interface": cm}
+            cm.info.set_capture_batch(batch_size=bs)
             return (), cm.named_args
 
         extra_kwargs = {}

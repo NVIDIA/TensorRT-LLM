@@ -74,6 +74,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
     MiniMaxM2MoeRoutingMethod,
     RenormalizeMoeRoutingMethod,
     RenormalizeNaiveMoeRoutingMethod,
+    SigmoidRenormMoeRoutingMethod,
     create_moe,
 )
 from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
@@ -370,6 +371,13 @@ def _create_routing_method(routing_method_cls, top_k, num_experts, dtype):
             callable_e_score_correction_bias=lambda: e_score_correction_bias,
         )
 
+    # SigmoidRenorm routing method requires num_experts
+    if routing_method_cls == SigmoidRenormMoeRoutingMethod:
+        return routing_method_cls(
+            top_k=top_k,
+            num_experts=num_experts,
+        )
+
     # Fallback: try with just top_k
     return routing_method_cls(top_k=top_k)
 
@@ -390,6 +398,7 @@ def _test_moe_worker(
     swiglu_alpha: float = 1,
     swiglu_beta: float = 0,
     swiglu_limit: float = float("inf"),
+    bias_dtype: Optional[torch.dtype] = None,
 ):
     """
     Test MoE module worker function.
@@ -407,6 +416,8 @@ def _test_moe_worker(
         swiglu_alpha: SwiGLU alpha parameter (default=1, non-gptoss)
         swiglu_beta: SwiGLU beta parameter (default=0, non-gptoss)
         swiglu_limit: SwiGLU limit parameter (default=inf, non-gptoss)
+        bias_dtype: Data type for routing bias (default: same as dtype).
+                    Use torch.float32 to test fp32 bias plumbing.
     """
     try:
         _test_moe_worker_impl(
@@ -425,6 +436,7 @@ def _test_moe_worker(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            bias_dtype=bias_dtype,
         )
     except Exception:
         traceback.print_exc()
@@ -447,6 +459,7 @@ def _test_moe_worker_impl(
     swiglu_alpha: float = 1,
     swiglu_beta: float = 0,
     swiglu_limit: float = float("inf"),
+    bias_dtype: Optional[torch.dtype] = None,
 ):
     """Actual implementation of _test_moe_worker."""
     # Default routing logits dtype to model dtype if not specified
@@ -472,8 +485,9 @@ def _test_moe_worker_impl(
         torch.cuda.manual_seed(0)
 
         # Create routing method and input tensors
+        effective_bias_dtype = bias_dtype if bias_dtype is not None else dtype
         routing_method = _create_routing_method(
-            routing_method_cls, top_k=top_k, num_experts=num_experts, dtype=dtype
+            routing_method_cls, top_k=top_k, num_experts=num_experts, dtype=effective_bias_dtype
         )
         x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
         if enable_eplb:
@@ -787,6 +801,7 @@ ROUTING_METHODS = [
     Llama4RenormalizeMoeRoutingMethod,  # Top1 -> Sigmoid (Llama4)
     DeepSeekV3MoeRoutingMethod,  # Sigmoid -> BiasAdd -> Group TopK (DeepSeek-V3)
     MiniMaxM2MoeRoutingMethod,  # Sigmoid -> BiasAdd -> TopK -> Renormalize (MiniMax-M2)
+    SigmoidRenormMoeRoutingMethod,  # Sigmoid -> TopK -> Renormalize
 ]
 
 
@@ -1149,6 +1164,111 @@ def test_configurable_moe_single_gpu(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
+    )
+
+
+# ============================================================================
+# FP32 Routing Bias Tests
+# ============================================================================
+# MiniMax-M2 and DeepSeek models can have fp32 routing_bias with bf16 model dtype.
+# These tests verify that the trtllmGen MoE backend correctly handles fp32 bias
+# across all quantization paths (fp4, fp8, mxfp4, fp8_per_tensor).
+
+
+def _create_routing_method_with_bias(routing_method_cls, top_k, num_experts, bias_tensor):
+    """Create routing method with a specific bias tensor."""
+    if routing_method_cls == DeepSeekV3MoeRoutingMethod:
+        n_group = max(1, num_experts // 32)
+        topk_group = min(n_group, max(1, n_group // 2))
+        return routing_method_cls(
+            top_k=top_k,
+            n_group=n_group,
+            topk_group=topk_group,
+            routed_scaling_factor=1.0,
+            callable_e_score_correction_bias=lambda: bias_tensor,
+            is_fused=False,
+        )
+    elif routing_method_cls == MiniMaxM2MoeRoutingMethod:
+        return routing_method_cls(
+            top_k=top_k,
+            num_experts=num_experts,
+            callable_e_score_correction_bias=lambda: bias_tensor,
+        )
+    else:
+        raise ValueError(f"Unsupported routing method for bias test: {routing_method_cls}")
+
+
+@pytest.mark.parametrize(
+    "routing_method_cls,moe_model_config",
+    [
+        (MiniMaxM2MoeRoutingMethod, MoeModelConfig(256, 6, 2048, 1408)),
+        (DeepSeekV3MoeRoutingMethod, MoeModelConfig(256, 8, 7168, 2048, n_group=8, topk_group=4)),
+    ],
+)
+@pytest.mark.parametrize(
+    "quant_algo",
+    [
+        QuantAlgo.NVFP4,
+        QuantAlgo.FP8_BLOCK_SCALES,
+        QuantAlgo.W4A8_MXFP4_MXFP8,
+        QuantAlgo.FP8,
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_trtllm_gen_fp32_routing_bias(routing_method_cls, moe_model_config, quant_algo, dtype):
+    """
+    Test that trtllmGen MoE backend correctly handles fp32 routing_bias.
+
+    MiniMax-M2 and DeepSeek models emit fp32 routing_bias from trust_remote_code
+    model definitions. This test verifies that the fp32 bias is correctly plumbed
+    through the thop boundary (TORCH_CHECK), Runner::run() (dtypeRoutingBias),
+    and routing kernels (mDtypeBias) without silent corruption (reading fp32 as bf16).
+
+    Compares fused trtllmGen output against the PyTorch reference module.
+    """
+    moe_backend = MoeBackendType.TRTLLM.value
+    backend_type = MoeBackendType.TRTLLM
+
+    ci_skip = should_skip_to_accelerate_ci(
+        backend_type=backend_type,
+        quant_algo=quant_algo,
+        model_config=moe_model_config,
+        routing_method_cls=routing_method_cls,
+        dtype=dtype,
+    )
+    if ci_skip:
+        pytest.skip(ci_skip)
+
+    skip_reason = should_skip_trtllm(
+        backend_type, quant_algo, moe_model_config, routing_method_cls=routing_method_cls
+    )
+    if skip_reason:
+        pytest.skip(skip_reason)
+
+    skip_if_insufficient_gpu_memory(
+        moe_model_config.num_experts,
+        moe_model_config.hidden_size,
+        moe_model_config.intermediate_size,
+        dtype,
+    )
+
+    dtype_routing_logits = None
+    if (
+        moe_backend == MoeBackendType.TRTLLM.value
+        and routing_method_cls == DeepSeekV3MoeRoutingMethod
+    ):
+        dtype_routing_logits = torch.float32
+
+    _test_moe_worker(
+        moe_backend=moe_backend,
+        dtype=dtype,
+        quant_algo=quant_algo,
+        model_config=moe_model_config,
+        seq_len=8,
+        enable_autotune=True,
+        routing_method_cls=routing_method_cls,
+        dtype_routing_logits=dtype_routing_logits,
+        bias_dtype=torch.float32,
     )
 
 

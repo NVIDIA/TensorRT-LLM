@@ -23,6 +23,7 @@ from torch._prims_common import DeviceLikeType
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.autotuner import AutoTuner
+from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.models.modeling_speculative import Eagle3ForCausalLM
 from tensorrt_llm._torch.pyexecutor._util import (
     _create_kv_cache_manager,
@@ -32,12 +33,29 @@ from tensorrt_llm._torch.pyexecutor._util import (
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import BaseMambaCacheManager
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import get_guided_decoding_config
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    BaseResourceManager,
+    KVCacheManager,
+    ResourceManager,
+    ResourceManagerType,
+)
+from tensorrt_llm._torch.pyexecutor.sampler import TorchSampler, TRTLLMSampler
+from tensorrt_llm._torch.pyexecutor.scheduler import (
+    BindCapacityScheduler,
+    BindMicroBatchScheduler,
+    RequestList,
+    ScheduledRequests,
+    SimpleScheduler,
+)
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._torch.speculative import get_spec_drafter
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSampler, Eagle3ResourceManager
-from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData
+from tensorrt_llm._utils import get_free_port, mpi_rank, mpi_world_size, nvtx_range
+from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData, check_mm_embed_cumsum_if_needed
 from tensorrt_llm.llmapi.llm_args import (
     ContextChunkingPolicy,
     EagleDecodingConfig,
@@ -47,27 +65,8 @@ from tensorrt_llm.llmapi.llm_args import (
     TorchLlmArgs,
 )
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase
+from tensorrt_llm.mapping import Mapping
 
-from ...._utils import get_free_port, mpi_rank, mpi_world_size
-from ....mapping import Mapping
-from ...distributed import Distributed
-from ...pyexecutor.mamba_cache_manager import BaseMambaCacheManager
-from ...pyexecutor.model_engine import ModelEngine, PyTorchModelEngine
-from ...pyexecutor.py_executor import PyExecutor
-from ...pyexecutor.resource_manager import (
-    BaseResourceManager,
-    KVCacheManager,
-    ResourceManager,
-    ResourceManagerType,
-)
-from ...pyexecutor.sampler import TorchSampler, TRTLLMSampler
-from ...pyexecutor.scheduler import (
-    BindCapacityScheduler,
-    BindMicroBatchScheduler,
-    RequestList,
-    ScheduledRequests,
-    SimpleScheduler,
-)
 from ..distributed.common import initialize_or_skip
 from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
@@ -76,9 +75,16 @@ from ..utils.dist_config import DistConfig
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
 
-# `layout_metadata` is a reserved multimodal payload used to carry request-level
-# layout semantics that the wrapper reconstructs into tensor kwargs separately.
-_RESERVED_MM_DATA_KEYS = frozenset({"layout_metadata"})
+# Non-tensor multimodal metadata consumed by _store_prefill_multimodal_metadata.
+# These keys must NOT leak into the generic extra_args dict — entries there
+# are expected to be tensors, and these are lists or nested dicts.
+_RESERVED_MM_DATA_KEYS = frozenset(
+    {
+        "layout_metadata",
+        "special_token_offsets",
+        "multimodal_embed_mask_cumsum",
+    }
+)
 
 
 @dataclass
@@ -406,7 +412,7 @@ def maybe_pad_for_cuda_graph(func):
 class ADEngine(ModelEngine):
     """The AutoDeploy Engine (ADEngine) is the main engine interface to execute AutoDeploy models.
 
-    It follows the ``ModelEngine`` abstractions and is responsible for building the ad-optimized
+    It follows the `ModelEngine` abstractions and is responsible for building the ad-optimized
     model, converting TRT-LLM scheduled requests into ad-native (pytorch-native) inputs, running
     the model, and returning correctly formatted logits.
     """
@@ -444,6 +450,7 @@ class ADEngine(ModelEngine):
             max_num_tokens=ad_config.max_num_tokens,
             vocab_size_padded=factory.vocab_size_padded,
             spec_config=ad_config.speculative_config,
+            requires_uniform_kv_caches=ad_config.requires_uniform_kv_caches,
         )
 
         reporting_info = ReportingInfo(
@@ -609,9 +616,6 @@ class ADEngine(ModelEngine):
                     "layout_metadata", req.py_multimodal_data
                 )
             mm_item_types = layout_metadata.get("item_types", []) if layout_metadata else []
-            special_offsets = (
-                layout_metadata.get("special_token_offsets", []) if layout_metadata else []
-            )
             mm_pos_list = list(mm_pos) if mm_pos is not None else []
             mm_len_list = list(mm_len) if mm_len is not None else []
             mm_item_types_list = list(mm_item_types)
@@ -630,32 +634,50 @@ class ADEngine(ModelEngine):
             mm_item_types_flat.extend(mm_item_types_list)
             mm_token_positions_flat.extend(mm_pos_list)
             mm_token_lengths_flat.extend(mm_len_list)
+
+            mm_data = req.py_multimodal_data or {}
+            flat_cumsum = mm_data.get("multimodal_embed_mask_cumsum")
+            # special_token_offsets indices into the dense MM-token-list (which includes both embeds and specials).
+            # It does not index into the prompt-position-indexed cumsum.
+            special_offsets = list(
+                mm_data.get("special_token_offsets")
+                or (layout_metadata or {}).get("special_token_offsets", [])
+            )
             mm_special_offsets_cu_seqlen.append(
                 mm_special_offsets_cu_seqlen[-1] + len(special_offsets)
             )
-            mm_special_offsets_flat.extend(list(special_offsets))
+            mm_special_offsets_flat.extend(special_offsets)
+
             if not mm_pos or not mm_len:
                 flat_start_list.append(0)
                 count_list.append(0)
                 continue
 
+            all_prompt_tokens = req.get_tokens(0)
+            check_mm_embed_cumsum_if_needed(
+                req.py_multimodal_data,
+                begin_compute=begin_compute,
+                end_compute=end_compute,
+                prompt_len=len(all_prompt_tokens),
+            )
+            if flat_cumsum is None:
+                # Leave flat_start / count at 0 so concatenated cursors don't advance.
+                flat_start_list.append(0)
+                count_list.append(0)
+                continue
+
+            assert flat_cumsum.numel() == len(all_prompt_tokens), (
+                f"embed_mask_cumsum length {flat_cumsum.numel()} != prompt length "
+                f"{len(all_prompt_tokens)} for request {i}"
+            )
             runtime = MultimodalRuntimeData(
                 past_seen_token_num=begin_compute,
-                mm_token_positions=list(mm_pos),
-                mm_token_lengths=list(mm_len),
                 chunk_end_pos=end_compute,
-                special_token_offsets=list(special_offsets),
+                embed_mask_cumsum=flat_cumsum,
             )
-            num_unseen = runtime.num_unseen_mm_tokens
-            num_in_chunk = runtime.num_mm_tokens_in_chunk
-            num_unseen_special = runtime.num_unseen_special_tokens
-            num_special_in_chunk = runtime.num_special_tokens_in_chunk
-            total_mm_i = runtime.total_mm_tokens_in_request
-            total_special_i = runtime.total_special_tokens_in_request
-            flat_start_i = cumsum_total_mm + num_unseen - num_unseen_special
-            flat_start_list.append(flat_start_i)
-            count_list.append(num_in_chunk - num_special_in_chunk)
-            cumsum_total_mm += total_mm_i - total_special_i
+            flat_start_list.append(cumsum_total_mm + runtime.num_cached_mm_tokens)
+            count_list.append(runtime.num_mm_tokens_in_chunk)
+            cumsum_total_mm += runtime.total_embeds_in_request
 
         extra_args["mm_item_cu_seqlen"] = [
             torch.tensor(mm_item_cu_seqlen, dtype=torch.int32, device="cpu")
@@ -718,6 +740,13 @@ class ADEngine(ModelEngine):
         generation_requests = [
             r for r in scheduled_requests.generation_requests if get_draft_token_length(r) == 0
         ]
+
+        # This sanity checks our one-model spec dec flow, where extend requests are only present when doing spec dec
+        # and take the place of generation requests.
+        # This also makes sure that dummy requests, which are at the end of schedulred_requests.generation_requests,
+        # end up at the end of gen_requests.
+        assert len(extend_requests) == 0 or len(generation_requests) == 0
+
         gen_requests = extend_requests + generation_requests
         ordered_requests = context_requests + gen_requests
 
@@ -739,7 +768,9 @@ class ADEngine(ModelEngine):
         flat_gather_indices: List[int] = [] if has_new_tokens else None
         mask_scatter_indices: List[int] = [] if has_new_tokens else None
         extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
+        prompt_lens: List[int] = []
         dummy_token = -1
+        has_context_multimodal_data = False
 
         # look at context requests first
         for request in context_requests:
@@ -755,8 +786,14 @@ class ADEngine(ModelEngine):
             cu_seqlen.append(len(input_ids))
             input_pos.append(begin_compute)
 
+            # For prefill requests, prompt_lens stores the context chunk size.
+            # This is expected by the TRTLLM Attention backend where the prompt length
+            # is used.
+            prompt_lens.append(request.context_chunk_size)
+
             # store extra arguments
             if request.py_multimodal_data is not None:
+                has_context_multimodal_data = True
                 for k, v in request.py_multimodal_data.items():
                     if k in _RESERVED_MM_DATA_KEYS:
                         continue
@@ -790,16 +827,19 @@ class ADEngine(ModelEngine):
                 slot_gather_indices.append(start)
                 flat_gather_indices.extend(range(start, start + (1 + draft_len) * stride, stride))
             else:
-                input_ids.append(request.get_token(0, request.get_num_tokens(0) - 1))
+                input_ids.append(request.get_last_tokens(0))
                 input_ids.extend([] if draft_len == 0 else request.py_draft_tokens)
 
             cu_seqlen.append(len(input_ids))
             input_pos.append(num_tokens_seen)
+            prompt_lens.append(request.py_prompt_len)
 
             if is_overlap:
                 mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
 
         # store cache information for all requests now
+        _tokens_per_block = kv_cache_manager.tokens_per_block
+        _use_mamba = hasattr(kv_cache_manager, "mamba_cache_index")
         cache_loc: List[int] = []
         cu_num_pages: List[int] = [0]
         extra_page_per_seq: List[int] = []
@@ -807,7 +847,7 @@ class ADEngine(ModelEngine):
         for i, request in enumerate(ordered_requests):
             # store seq slot idx (use mamba_cache_index if available)
             request.py_batch_idx = request.py_seq_slot
-            if hasattr(kv_cache_manager, "mamba_cache_index"):
+            if _use_mamba:
                 state_slot_idx_i = kv_cache_manager.mamba_cache_index[request.py_request_id]
             else:
                 state_slot_idx_i = request.py_seq_slot
@@ -816,7 +856,8 @@ class ADEngine(ModelEngine):
             # get some info on the current request
             seq_len_i = cu_seqlen[i + 1] - cu_seqlen[i]
             end_compute_i = input_pos[i] + seq_len_i
-            num_active_blocks_i = kv_cache_manager.get_num_kv_blocks(end_compute_i)
+            # Inline get_num_kv_blocks (pure Python, saves function-call overhead per request)
+            num_active_blocks_i = (end_compute_i + _tokens_per_block - 1) // _tokens_per_block
 
             # construct cache information for the current request
             cache_indices = kv_cache_manager.get_cache_indices(request)
@@ -854,6 +895,7 @@ class ADEngine(ModelEngine):
             cu_num_pages=cu_num_pages,
             extra_page_per_seq=extra_page_per_seq,
             slot_idx=state_slot_idx,
+            prompt_lens=prompt_lens,
             gather_context_logits=gather_context_logits,
             _gather_idx=flat_gather_indices,
             _mask_scatter_indices=mask_scatter_indices,
@@ -872,6 +914,7 @@ class ADEngine(ModelEngine):
 
         self.iter_states["num_ctx_requests"] = num_prefill
         self.iter_states["num_ctx_tokens"] = num_prefill_tokens
+        self.iter_states["has_context_multimodal_data"] = has_context_multimodal_data
         # TODO: handle extend requests and draft requests for specdec
         self.iter_states["num_generation_tokens"] = num_decode_tokens + num_extend_tokens
         self.iter_states["ordered_requests"] = ordered_requests
@@ -879,11 +922,18 @@ class ADEngine(ModelEngine):
     @nvtx_range("ad_run_forward")
     def _run_forward(self) -> Dict[str, Optional[torch.Tensor]]:
         """Run model forward and return outputs."""
-        # TODO (lucaslie): revisit this logic as part of spec dec cudagraph support...
-        if getattr(self.model, "_requires_csi", False):
-            model_output = self.model(cache_seq_interface=self.cache_seq_interface)
+        csi = self.cache_seq_interface
+
+        if self.spec_config is not None:
+            model_output = self.model(**csi.named_args, cache_seq_interface=csi)
         else:
-            model_output = self.model(**self.cache_seq_interface.named_args)
+            model_output = self.model(**csi.named_args)
+        if self.iter_states.get("has_context_multimodal_data", False):
+            # Multimodal prefill can leave image/context work in flight on the execution
+            # stream after model.forward returns. Synchronize before the overlap scheduler
+            # advances to the next step so later batch-state reuse does not race that work
+            # and surface as a delayed CUDA illegal memory access.
+            torch.cuda.current_stream().synchronize()
 
         # construct output dictionary
         if isinstance(model_output, abc.Mapping):

@@ -18,6 +18,19 @@ cd $llmSrcNode/tests/integration/defs
 # Turn off "exit on error" so the following lines always run
 set +e
 
+# For disaggregated benchmark/server runs, clear all environment variables
+# related to Slurm and MPI. This prevents test processes (e.g., pytest) from
+# incorrectly initializing MPI when running under srun --overlap without
+# --mpi=pmix. (Same fix as jenkins/scripts/slurm_run.sh)
+if [ "${DISAGG_SERVING_TYPE:-}" == "BENCHMARK" ] || \
+   [ "${DISAGG_SERVING_TYPE:-}" == "DISAGG_SERVER" ]; then
+    for v in ${!PMI@} ${!PMIX@} ${!MPI@} ${!OMPI@} ${!SLURM@}; do
+        if [ "$v" != "SLURM_PROCID" ]; then
+            unset "$v"
+        fi
+    done
+fi
+
 pytest_exit_code=0
 
 eval $pytestCommand
