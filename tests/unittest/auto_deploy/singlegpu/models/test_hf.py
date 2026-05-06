@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
-from unittest.mock import MagicMock, patch
+import json
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -21,11 +22,9 @@ import torch.nn as nn
 from accelerate.utils import modeling
 from transformers import AutoModelForCausalLM
 from transformers.models.llama4.configuration_llama4 import Llama4Config
+from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_NAME
 
-from tensorrt_llm._torch.auto_deploy.models.hf import (
-    AutoModelForCausalLMFactory,
-    hf_load_state_dict_with_device,
-)
+from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 
 
 class SimpleModel(nn.Module):
@@ -41,45 +40,6 @@ def restore_custom_model_mapping():
     AutoModelForCausalLMFactory._custom_model_mapping = old_mapping
 
 
-def test_hf_load_state_dict_with_device():
-    """Test that hf_load_state_dict_with_device correctly patches modeling.load_state_dict."""
-    # Create mock for original load_state_dict
-    original_load_state_dict = MagicMock()
-
-    # Test with CPU device
-    with patch.object(modeling, "load_state_dict", original_load_state_dict):
-        with hf_load_state_dict_with_device(device="cpu"):
-            # Call the patched function
-            modeling.load_state_dict("dummy_checkpoint")
-
-            # Check that device was set correctly
-            original_load_state_dict.assert_called_once_with(
-                "dummy_checkpoint", device_map={"": "cpu"}
-            )
-
-            # Reset mock for next test
-            original_load_state_dict.reset_mock()
-
-        # Check that original behavior is restored
-        modeling.load_state_dict("dummy_checkpoint", device_map="original_device_map")
-        original_load_state_dict.assert_called_once_with(
-            "dummy_checkpoint", device_map="original_device_map"
-        )
-        original_load_state_dict.reset_mock()
-
-    # Test with CUDA device (if available)
-    if torch.cuda.is_available():
-        with patch.object(modeling, "load_state_dict", original_load_state_dict):
-            with hf_load_state_dict_with_device(device="cuda"):
-                # Call the patched function
-                modeling.load_state_dict("dummy_checkpoint")
-
-                # Check that device was set correctly
-                original_load_state_dict.assert_called_once_with(
-                    "dummy_checkpoint", device_map={"": "cuda"}
-                )
-
-
 @pytest.fixture
 def mock_factory():
     with (
@@ -91,6 +51,77 @@ def mock_factory():
         # Set model path directly to avoid prefetch
         factory._prefetched_model_path = "/dummy/path"
         yield factory
+
+
+def test_get_checkpoint_files_from_single_file_folder(mock_factory, tmp_path):
+    checkpoint_file = tmp_path / SAFE_WEIGHTS_NAME
+    checkpoint_file.touch()
+
+    assert mock_factory._get_checkpoint_files(tmp_path) == [str(checkpoint_file)]
+
+
+def test_get_checkpoint_files_from_pytorch_bin_folder(mock_factory, tmp_path):
+    checkpoint_file = tmp_path / WEIGHTS_NAME
+    checkpoint_file.touch()
+
+    assert mock_factory._get_checkpoint_files(tmp_path) == [str(checkpoint_file)]
+
+
+def test_get_checkpoint_files_from_sharded_index_are_sorted(mock_factory, tmp_path):
+    shard_1 = tmp_path / "model-00001-of-00002.safetensors"
+    shard_2 = tmp_path / "model-00002-of-00002.safetensors"
+    index = {
+        "weight_map": {
+            "model.layers.1.weight": shard_2.name,
+            "model.layers.0.weight": shard_1.name,
+        }
+    }
+    (tmp_path / SAFE_WEIGHTS_INDEX_NAME).write_text(json.dumps(index), encoding="utf-8")
+
+    assert mock_factory._get_checkpoint_files(tmp_path) == [str(shard_1), str(shard_2)]
+
+
+def test_streaming_checkpoint_load_runs_model_load_state_dict_hooks(mock_factory, tmp_path):
+    model = SimpleModel()
+    hook_seen_keys = []
+
+    def remap_weight_hook(module, state_dict, *args, **kwargs):
+        hook_seen_keys.append(tuple(state_dict.keys()))
+        state_dict["linear.weight"] = state_dict.pop("renamed_weight")
+
+    hook_handle = model.register_load_state_dict_pre_hook(remap_weight_hook)
+    shard_1 = str(tmp_path / "model-00001-of-00002.safetensors")
+    shard_2 = str(tmp_path / "model-00002-of-00002.safetensors")
+    shard_1_weight = torch.full_like(model.linear.weight, 1.0)
+    shard_2_weight = torch.full_like(model.linear.weight, 2.0)
+    checkpoint_weights = {
+        shard_1: {"renamed_weight": shard_1_weight},
+        shard_2: {"renamed_weight": shard_2_weight},
+    }
+
+    def load_checkpoint_file(checkpoint_file, device_map=None):
+        assert device_map == {"": "cpu"}
+        return checkpoint_weights[checkpoint_file]
+
+    try:
+        with (
+            patch.object(mock_factory, "_get_checkpoint_files", return_value=[shard_1, shard_2]),
+            patch.object(
+                modeling, "load_state_dict", side_effect=load_checkpoint_file
+            ) as load_mock,
+            patch.object(model, "load_state_dict", wraps=model.load_state_dict) as model_load_mock,
+        ):
+            mock_factory._load_checkpoint(model, "cpu", disable_preload=True)
+    finally:
+        hook_handle.remove()
+
+    assert load_mock.call_args_list == [
+        call(shard_1, device_map={"": "cpu"}),
+        call(shard_2, device_map={"": "cpu"}),
+    ]
+    assert model_load_mock.call_count == 2
+    assert hook_seen_keys == [("renamed_weight",), ("renamed_weight",)]
+    torch.testing.assert_close(model.linear.weight, shard_2_weight)
 
 
 def test_recursive_update_config(mock_factory):

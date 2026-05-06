@@ -665,6 +665,7 @@ def is_finegrained_fp8_linear_op(node: Node) -> bool:
         node,
         [
             torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear,
+            torch.ops.auto_deploy.torch_fake_quant_grouped_finegrained_fp8_linear,
             torch.ops.auto_deploy.trtllm_finegrained_fp8_linear,
         ],
     )

@@ -22,7 +22,7 @@ support for graph-level metadata (e.g., MoE all-to-all dispatch).
 """
 
 import json
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -41,6 +41,7 @@ class DistConfig(BaseModel):
     moe_cluster_size: int = Field(default=1, ge=1)
     enable_attention_dp: bool = Field(default=False)
     allreduce_strategy: str = Field(default="NCCL")
+    dist_backend: Literal["auto", "torch", "trtllm"] = Field(default="auto")
 
     @model_validator(mode="after")
     def _validate_grid(self) -> "DistConfig":
@@ -93,6 +94,7 @@ class DistConfig(BaseModel):
             "moe_cluster_size": self.moe_cluster_size,
             "enable_attention_dp": self.enable_attention_dp,
             "allreduce_strategy": self.allreduce_strategy,
+            "dist_backend": self.dist_backend,
         }
 
     @classmethod
@@ -123,6 +125,7 @@ class DistConfig(BaseModel):
             moe_ep_size=mapping.moe_ep_size,
             moe_cluster_size=mapping.moe_cluster_size,
             enable_attention_dp=mapping.enable_attention_dp,
+            dist_backend=getattr(mapping, "dist_backend", "auto"),
         )
 
     @classmethod

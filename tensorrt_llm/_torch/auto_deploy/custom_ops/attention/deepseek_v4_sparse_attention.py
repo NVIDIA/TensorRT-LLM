@@ -305,6 +305,30 @@ def _cached_topk_attention(
     return torch.stack(outputs, dim=0)
 
 
+def _cached_decode_topk_positions(
+    topk_seq: torch.Tensor,
+    input_pos: int,
+    window_size: Optional[int],
+    compress_ratio: int,
+) -> torch.Tensor:
+    if compress_ratio == 0 or window_size is None:
+        return topk_seq
+
+    local_window_cols = min(window_size, topk_seq.shape[-1])
+    if local_window_cols == 0:
+        return topk_seq
+
+    token_offsets = torch.arange(topk_seq.shape[0], device=topk_seq.device).unsqueeze(1)
+    query_positions = input_pos + token_offsets
+    window_offsets = torch.arange(local_window_cols, device=topk_seq.device)
+    local_topk = query_positions - local_window_cols + 1 + window_offsets
+    local_topk = torch.where(local_topk < 0, -1, local_topk)
+    local_topk = local_topk.to(topk_seq.dtype)
+    if local_window_cols == topk_seq.shape[-1]:
+        return local_topk
+    return torch.cat((local_topk, topk_seq[..., local_window_cols:]), dim=-1)
+
+
 def _sparse_attention_query_chunk_size(
     num_tokens: int,
     num_heads: int,
@@ -556,10 +580,16 @@ def torch_deepseek_v4_sparse_attention_with_cache(
                 softmax_scale,
             )
         else:
+            cached_topk_seq = _cached_decode_topk_positions(
+                topk_seq,
+                input_pos_i,
+                window_size,
+                compress_ratio,
+            )
             output_flat[flat_start : flat_start + seq_len_i] = _cached_topk_attention(
                 q_seq,
                 attn_sink,
-                topk_seq,
+                cached_topk_seq,
                 swa_cache,
                 slot_idx_i,
                 input_pos_i + kv_seq.shape[0],

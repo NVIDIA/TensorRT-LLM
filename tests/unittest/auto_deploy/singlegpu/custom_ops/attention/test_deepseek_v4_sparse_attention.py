@@ -30,6 +30,9 @@ sys.path.append(str(_UTILS_DIR))
 from _model_test_utils import assert_rmse_close  # noqa: E402
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: E402, F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention.deepseek_v4_sparse_attention import (  # noqa: E402
+    _cached_decode_topk_positions,
+)
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo  # noqa: E402
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm  # noqa: E402
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface  # noqa: E402
@@ -442,7 +445,6 @@ def test_cached_compressed_decode_uses_cache_position_topk(compress_ratio: int) 
         topk_decode,
         _decode_meta(input_pos=3),
         swa_cache,
-        window_size=2,
         compress_ratio=compress_ratio,
     )
 
@@ -456,6 +458,67 @@ def test_cached_compressed_decode_uses_cache_position_topk(compress_ratio: int) 
         rmse_ratio_tol=1e-6,
         msg=f"cached ratio-{compress_ratio} decode: ",
     )
+
+
+@pytest.mark.parametrize("compress_ratio", [4, 128])
+def test_cached_compressed_decode_rebuilds_source_local_window_topk(
+    compress_ratio: int,
+) -> None:
+    q_prefill = torch.zeros(1, 1, 1, 2)
+    kv_prefill = torch.tensor([[[1.0, 0.0], [2.0, 0.0], [3.0, 0.0], [4.0, 0.0]]])
+    attn_sink = torch.tensor([-20.0])
+    swa_cache = torch.empty(1, 8, 2)
+
+    _run_cached_sparse_attention(
+        q_prefill,
+        kv_prefill,
+        attn_sink,
+        torch.tensor([[[0]]], dtype=torch.int64),
+        _context_meta(seq_len=1),
+        swa_cache,
+        window_size=2,
+        compress_ratio=compress_ratio,
+    )
+
+    q_decode = torch.tensor([[[[1.0, 0.0]]]])
+    kv_decode = torch.tensor([[[5.0, 0.0]]])
+    topk_decode = torch.tensor([[[-1, 0, 2]]], dtype=torch.int64)
+
+    output = _run_cached_sparse_attention(
+        q_decode,
+        kv_decode,
+        attn_sink,
+        topk_decode,
+        _decode_meta(input_pos=4),
+        swa_cache,
+        window_size=2,
+        compress_ratio=compress_ratio,
+    )
+
+    expected_kv = torch.cat((kv_prefill, kv_decode), dim=1)
+    expected_topk = torch.tensor([[[3, 4, 2]]], dtype=torch.int64)
+    expected = _sparse_attention_reference(q_decode, expected_kv, attn_sink, expected_topk, 1.0)
+
+    torch.testing.assert_close(swa_cache[0, :5], expected_kv[0])
+    assert_rmse_close(
+        output,
+        expected,
+        rmse_ratio_tol=1e-6,
+        msg=f"cached ratio-{compress_ratio} source local window decode: ",
+    )
+
+
+def test_cached_compressed_decode_rebuilds_early_local_window_padding() -> None:
+    topk_decode = torch.tensor([[0, 1, 2, 3]], dtype=torch.int64)
+
+    cached_topk = _cached_decode_topk_positions(
+        topk_decode,
+        input_pos=1,
+        window_size=4,
+        compress_ratio=4,
+    )
+
+    torch.testing.assert_close(cached_topk, torch.tensor([[-1, -1, 0, 1]], dtype=torch.int64))
 
 
 def test_cached_compressed_batched_multi_sequence_prefill_and_decode() -> None:
@@ -508,7 +571,6 @@ def test_cached_compressed_batched_multi_sequence_prefill_and_decode() -> None:
         topk_decode,
         _multi_decode_meta([4, 4]),
         swa_cache,
-        window_size=2,
         compress_ratio=4,
     )
     expected_kv = torch.cat((kv_prefill, kv_decode), dim=1)

@@ -1683,8 +1683,11 @@ def shard_weight_tensor(
         Tuple of (sharded_tensor, sharded_shape)
     """
 
+    if custom_shard_fn is not None:
+        f_split = custom_shard_fn
+
     # Handle fused weights
-    if fused_weight_dims is not None:
+    elif fused_weight_dims is not None:
 
         def f_split(
             t: torch.Tensor,

@@ -553,6 +553,196 @@ def test_deepseek_v4_load_state_dict_accepts_packed_mxfp4_runtime_buffers() -> N
     assert torch.equal(moe.experts.down_proj_scales, expected.down_scales)
 
 
+def test_deepseek_v4_mxfp4_runtime_buffers_are_shape_complete_for_export() -> None:
+    config = _small_deepseek_v4_config()
+    moe = DeepseekV4MoE(config, layer_idx=0).eval()
+
+    assert moe.experts.gate_up_proj_blocks.shape == (
+        config.n_routed_experts,
+        2 * config.moe_intermediate_size,
+        config.hidden_size // 32,
+        16,
+    )
+    assert moe.experts.gate_up_proj_scales.shape == (
+        config.n_routed_experts,
+        2 * config.moe_intermediate_size,
+        config.hidden_size // 32,
+    )
+    assert moe.experts.down_proj_blocks.shape == (
+        config.n_routed_experts,
+        config.hidden_size,
+        config.moe_intermediate_size // 32,
+        16,
+    )
+    assert moe.experts.down_proj_scales.shape == (
+        config.n_routed_experts,
+        config.hidden_size,
+        config.moe_intermediate_size // 32,
+    )
+
+
+def test_deepseek_v4_remap_hook_finds_mxfp4_loader_under_non_iterable_layers() -> None:
+    layer = 0
+    source_state = {
+        name: tensor
+        for name, tensor in _state_dict(experts=(0, 1), layer=layer).items()
+        if f"layers.{layer}.ffn.experts." in name and ".w4." not in name
+    }
+    expected = _layout().pack_experts(
+        source_state,
+        layer=layer,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE,
+        num_experts=2,
+    )
+    checkpoint_state = {f"model.{name}": tensor for name, tensor in source_state.items()}
+    config = _small_deepseek_v4_config()
+    moe = DeepseekV4MoE(config, layer_idx=layer).eval()
+    container = torch.nn.Module()
+    container.layers = torch.nn.Module()
+    container.layers.block = torch.nn.Module()
+    container.layers.block.ffn = moe
+
+    DeepseekV4ForCausalLM._remap_load_state_hook(container, checkpoint_state, "")
+
+    assert torch.equal(
+        checkpoint_state["layers.0.ffn.experts.gate_up_proj_blocks"],
+        expected.gate_up_blocks,
+    )
+    assert torch.equal(
+        checkpoint_state["layers.0.ffn.experts.gate_up_proj_scales"],
+        expected.gate_up_scales,
+    )
+    assert torch.equal(
+        checkpoint_state["layers.0.ffn.experts.down_proj_blocks"],
+        expected.down_blocks,
+    )
+    assert torch.equal(
+        checkpoint_state["layers.0.ffn.experts.down_proj_scales"],
+        expected.down_scales,
+    )
+    assert moe.experts.gate_up_proj_blocks.shape == expected.gate_up_blocks.shape
+    assert moe.experts.down_proj_blocks.shape == expected.down_blocks.shape
+
+
+def test_deepseek_v4_remap_hook_packs_graph_module_style_mxfp4_buffers() -> None:
+    layer = 0
+    source_state = {
+        name: tensor
+        for name, tensor in _state_dict(experts=(0, 1), layer=layer).items()
+        if f"layers.{layer}.ffn.experts." in name and ".w4." not in name
+    }
+    expected = _layout().pack_experts(
+        source_state,
+        layer=layer,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE,
+        num_experts=2,
+    )
+    checkpoint_state = {f"model.{name}": tensor for name, tensor in source_state.items()}
+
+    experts = torch.nn.Module()
+    experts.register_buffer(
+        "gate_up_proj_blocks",
+        torch.empty(expected.gate_up_blocks.shape, dtype=torch.uint8),
+    )
+    experts.register_buffer(
+        "gate_up_proj_scales",
+        torch.empty(expected.gate_up_scales.shape, dtype=torch.uint8),
+    )
+    experts.register_buffer(
+        "down_proj_blocks",
+        torch.empty(expected.down_blocks.shape, dtype=torch.uint8),
+    )
+    experts.register_buffer(
+        "down_proj_scales",
+        torch.empty(expected.down_scales.shape, dtype=torch.uint8),
+    )
+    block = torch.nn.Module()
+    block.ffn = torch.nn.Module()
+    block.ffn.experts = experts
+    container = torch.nn.Module()
+    container.layers = torch.nn.ModuleList([block])
+
+    DeepseekV4ForCausalLM._remap_load_state_hook(container, checkpoint_state, "")
+
+    assert torch.equal(
+        checkpoint_state["layers.0.ffn.experts.gate_up_proj_blocks"],
+        expected.gate_up_blocks,
+    )
+    assert torch.equal(
+        checkpoint_state["layers.0.ffn.experts.gate_up_proj_scales"],
+        expected.gate_up_scales,
+    )
+    assert torch.equal(
+        checkpoint_state["layers.0.ffn.experts.down_proj_blocks"],
+        expected.down_blocks,
+    )
+    assert torch.equal(
+        checkpoint_state["layers.0.ffn.experts.down_proj_scales"],
+        expected.down_scales,
+    )
+
+
+def test_deepseek_v4_graph_mxfp4_hook_packs_full_expert_count_for_local_buffers() -> None:
+    layer = 0
+    source_state = {
+        name: tensor
+        for name, tensor in _state_dict(experts=(0, 1, 2, 3), layer=layer).items()
+        if f"layers.{layer}.ffn.experts." in name and ".w4." not in name
+    }
+    expected = _layout().pack_experts(
+        source_state,
+        layer=layer,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE,
+        num_experts=4,
+    )
+    checkpoint_state = {f"model.{name}": tensor for name, tensor in source_state.items()}
+
+    experts = torch.nn.Module()
+    experts.register_buffer(
+        "gate_up_proj_blocks",
+        torch.empty(expected.gate_up_blocks[2:4].shape, dtype=torch.uint8),
+    )
+    experts.register_buffer(
+        "gate_up_proj_scales",
+        torch.empty(expected.gate_up_scales[2:4].shape, dtype=torch.uint8),
+    )
+    experts.register_buffer(
+        "down_proj_blocks",
+        torch.empty(expected.down_blocks[2:4].shape, dtype=torch.uint8),
+    )
+    experts.register_buffer(
+        "down_proj_scales",
+        torch.empty(expected.down_scales[2:4].shape, dtype=torch.uint8),
+    )
+    block = torch.nn.Module()
+    block.ffn = torch.nn.Module()
+    block.ffn.experts = experts
+    container = torch.nn.Module()
+    container.layers = torch.nn.ModuleList([block])
+
+    DeepseekV4ForCausalLM._remap_load_state_hook(container, checkpoint_state, "")
+
+    assert torch.equal(
+        checkpoint_state["layers.0.ffn.experts.gate_up_proj_blocks"],
+        expected.gate_up_blocks,
+    )
+    assert torch.equal(
+        checkpoint_state["layers.0.ffn.experts.gate_up_proj_scales"],
+        expected.gate_up_scales,
+    )
+    assert torch.equal(
+        checkpoint_state["layers.0.ffn.experts.down_proj_blocks"],
+        expected.down_blocks,
+    )
+    assert torch.equal(
+        checkpoint_state["layers.0.ffn.experts.down_proj_scales"],
+        expected.down_scales,
+    )
+
+
 def test_deepseek_v4_moe_forward_uses_routing_driven_packed_mxfp4_experts() -> None:
     layer = 0
     config = _small_deepseek_v4_config(

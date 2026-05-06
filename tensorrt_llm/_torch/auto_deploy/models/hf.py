@@ -10,13 +10,13 @@ import os
 import re
 import types
 from abc import abstractmethod
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import safetensors.torch
 import torch
 import torch.nn as nn
-from accelerate import init_empty_weights, load_checkpoint_in_model
+from accelerate import init_empty_weights
 from accelerate.utils import modeling
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.utils import HFValidationError, filter_repo_objects, validate_repo_id
@@ -51,47 +51,6 @@ from .factory import (
     SubModuleExportInfo,
 )
 from .quant_config_reader import QuantConfigReader, autodetect_quant_config_reader
-
-
-@contextmanager
-def hf_load_state_dict_with_device(device: DeviceLikeType):
-    """Patch HF loading utilities according to our needs.
-
-    Following patches are applied:
-        1. load_state_dict to use provided device. NOTE (lucaslie): this function is called by
-           ``load_checkpoint_in_model``. We provide the device map here as a patch instead of going
-           through ``load_checkpoint_in_model``. This is because otherwise
-           ``load_checkpoint_in_model`` will execute its own state_dict loading logic instead of
-           calling ``nn.Module.load_state_dict``. However, we rely on the state dict loading hooks
-           in ``nn.Module.load_state_dict`` to correctly load the weights. By providing the device
-           map here, we can ensure that ``load_checkpoint_in_model`` will call
-           ``nn.Module.load_state_dict``.
-        2. change logging level of logger to ERROR to avoid logging warnings from HF state_dict
-           loading for missing/unexpected keys (happens for MoE expert-sharded layers for example).
-    """
-    # save the original load_state_dict method
-    original_load_state_dict = modeling.load_state_dict
-
-    # save the original logger level
-    original_logger_level = modeling.logger.level
-
-    # Define and apply the patched version
-    def load_state_dict_with_device(checkpoint_file, device_map=None):
-        return original_load_state_dict(checkpoint_file, device_map={"": device})
-
-    # Apply the patch
-    modeling.load_state_dict = load_state_dict_with_device
-
-    # Change the logger level to ERROR
-    modeling.logger.setLevel("ERROR")
-
-    try:
-        yield
-    finally:
-        # Restore the original method, even if an exception occurred
-        modeling.load_state_dict = original_load_state_dict
-        # Restore the original logger level
-        modeling.logger.setLevel(original_logger_level)
 
 
 # TODO (lucaslie): continue working on the base class
@@ -414,27 +373,29 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
 
         return ignore_patterns
 
-    def _get_checkpoint_file(self, checkpoint: Union[str, os.PathLike]) -> Union[str, os.PathLike]:
-        """Get the most relevant checkpoint file from the HF checkpoint directory.
+    def _get_checkpoint_files(self, checkpoint: Union[str, os.PathLike]) -> List[str]:
+        """Get checkpoint weight files from an HF checkpoint path.
 
         Args:
             checkpoint: The path to the checkpoint directory or file.
 
         Returns:
-            The path to the most relevant checkpoint file.
+            The checkpoint weight files to load.
 
-        Following order of precedence for the checkpoint file:
+        Following order of precedence for checkpoint directories:
 
             1. checkpoint is a file
             2. checkpoint dir contains SAFE_WEIGHTS_INDEX_NAME
             3. checkpoint dir contains SAFE_WEIGHTS_NAME
             4. checkpoint dir contains WEIGHTS_INDEX_NAME
             5. checkpoint dir contains WEIGHTS_NAME
-
         """
+        checkpoint = os.fspath(checkpoint)
 
         if os.path.isfile(checkpoint):
-            return checkpoint
+            if checkpoint.endswith(".index.json"):
+                return self._get_sharded_checkpoint_files(checkpoint)
+            return [checkpoint]
 
         # Verify that checkpoint is a directory
         if not os.path.isdir(checkpoint):
@@ -445,25 +406,44 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         # now check which is the most relevant checkpoint file
         safe_weights_index_path = os.path.join(checkpoint, SAFE_WEIGHTS_INDEX_NAME)
         if os.path.isfile(safe_weights_index_path):
-            return safe_weights_index_path
+            return self._get_sharded_checkpoint_files(safe_weights_index_path)
 
         safe_weights_path = os.path.join(checkpoint, SAFE_WEIGHTS_NAME)
         if os.path.isfile(safe_weights_path):
-            return safe_weights_path
+            return [safe_weights_path]
 
         weights_index_path = os.path.join(checkpoint, WEIGHTS_INDEX_NAME)
         if os.path.isfile(weights_index_path):
-            return weights_index_path
+            return self._get_sharded_checkpoint_files(weights_index_path)
 
         weights_path = os.path.join(checkpoint, WEIGHTS_NAME)
         if os.path.isfile(weights_path):
-            return weights_path
+            return [weights_path]
+
+        potential_index = [f for f in os.listdir(checkpoint) if f.endswith(".index.json")]
+        if len(potential_index) == 1:
+            return self._get_sharded_checkpoint_files(os.path.join(checkpoint, potential_index[0]))
+        if len(potential_index) > 1:
+            raise ValueError(
+                f"{checkpoint} containing more than one `.index.json` file, delete the irrelevant ones."
+            )
 
         raise ValueError(
             f"Could not find any model weights in {checkpoint}. "
             f"Expected one of the following files: {SAFE_WEIGHTS_INDEX_NAME}, {SAFE_WEIGHTS_NAME}, "
             f"{WEIGHTS_INDEX_NAME}, or {WEIGHTS_NAME}."
         )
+
+    @staticmethod
+    def _get_sharded_checkpoint_files(index_filename: str) -> List[str]:
+        """Get deterministically ordered checkpoint shard files from a sharded index."""
+        checkpoint_folder = os.path.dirname(index_filename)
+        with open(index_filename, "r", encoding="utf-8") as f:
+            index = json.load(f)
+
+        if "weight_map" in index:
+            index = index["weight_map"]
+        return [os.path.join(checkpoint_folder, f) for f in sorted(set(index.values()))]
 
     def _prefetch_checkpoint(self, model_name_or_path: str, skip_prefetch_weights: bool) -> str:
         """Prefetch checkpoint from a HF repo if needed.
@@ -499,8 +479,7 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         self, model: nn.Module, device: DeviceLikeType, disable_preload: bool = False
     ):
         """Load the checkpoint into the model."""
-        # identify the most relevant checkpoint file
-        ckpt_file = self._get_checkpoint_file(self.model)
+        checkpoint_files = self._get_checkpoint_files(self.model)
 
         load_handle = model.register_load_state_dict_pre_hook(self._remap_param_names_load_hook)
         # Ensure it's the first one.
@@ -514,98 +493,47 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
 
         try:
             if disable_preload:
-                # Load checkpoint directly to GPU using accelerate's load_checkpoint_in_model (no CPU preload)
-                ad_logger.info(
-                    "disable_preload=True: Using accelerate's load_checkpoint_in_model (no CPU preload)"
-                )
-                with hf_load_state_dict_with_device(device):
-                    load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
+                self._load_checkpoint_with_streaming(model, checkpoint_files, device)
             else:
                 # Preload checkpoint files to CPU
                 ad_logger.info("Preloading checkpoint files to CPU")
-                self._load_checkpoint_with_preload(model, ckpt_file, device)
+                self._load_checkpoint_with_preload(model, checkpoint_files, device)
         finally:
             load_handle.remove()
             get_handle.remove()
 
     def _load_checkpoint_with_preload(
-        self, model: nn.Module, ckpt_file: str, device: DeviceLikeType
+        self, model: nn.Module, checkpoint_files: List[str], device: DeviceLikeType
     ):
-        all_weights = self._load_full_checkpoint_to_cpu(ckpt_file)
+        all_weights = self._load_full_checkpoint_to_cpu(checkpoint_files)
 
         ad_logger.info(f"Loading weights into model (device: {device})...")
         model.load_state_dict(all_weights, strict=False)
 
         ad_logger.info("Checkpoint loading completed")
 
-    def _load_full_checkpoint_to_cpu(self, checkpoint: str) -> dict:
-        """Load the full checkpoint to CPU memory.
-
-        Args:
-            checkpoint: Can be:
-                - a path to a file containing a whole model state dict
-                - a path to a `.json` file containing the index to a sharded checkpoint
-                - a path to a folder containing a unique `.index.json` file and the shards
-                - a path to a folder containing a unique pytorch_model.bin or model.safetensors
-        """
-        checkpoint_files = None
-        index_filename = None
-
-        # Fast path: Direct .index.json file (most common case for sharded checkpoints)
-        if os.path.isfile(checkpoint):
-            if checkpoint.endswith(".index.json"):
-                index_filename = checkpoint
-            else:
-                checkpoint_files = [checkpoint]
-        elif os.path.isdir(checkpoint):
-            # Check if the whole state dict is present (priority order matches accelerate)
-            potential_state_bin = [f for f in os.listdir(checkpoint) if f == WEIGHTS_NAME]
-            potential_state_safetensor = [
-                f for f in os.listdir(checkpoint) if f == SAFE_WEIGHTS_NAME
-            ]
-
-            # Case 1: pytorch_model.bin (WEIGHTS_NAME)
-            if len(potential_state_bin) == 1:
-                checkpoint_files = [os.path.join(checkpoint, potential_state_bin[0])]
-            # Case 2: model.safetensors (SAFE_WEIGHTS_NAME)
-            elif len(potential_state_safetensor) == 1:
-                checkpoint_files = [os.path.join(checkpoint, potential_state_safetensor[0])]
-            else:
-                # Case 3: Otherwise check for sharded checkpoints
-                potential_index = [f for f in os.listdir(checkpoint) if f.endswith(".index.json")]
-                if len(potential_index) == 0:
-                    raise ValueError(
-                        f"{checkpoint} is not a folder containing a `.index.json` file or a "
-                        f"{WEIGHTS_NAME} or a {SAFE_WEIGHTS_NAME} file"
-                    )
-                elif len(potential_index) == 1:
-                    index_filename = os.path.join(checkpoint, potential_index[0])
-                else:
-                    raise ValueError(
-                        f"{checkpoint} containing more than one `.index.json` file, delete the irrelevant ones."
-                    )
-        else:
-            raise ValueError(
-                f"`checkpoint` should be the path to a file containing a whole state dict, or the index of a sharded "
-                f"checkpoint, or a folder containing a sharded checkpoint or the whole state dict, but got "
-                f"{checkpoint}."
+    def _load_checkpoint_with_streaming(
+        self, model: nn.Module, checkpoint_files: List[str], device: DeviceLikeType
+    ) -> None:
+        """Load checkpoint files one at a time through ``nn.Module.load_state_dict``."""
+        num_files = len(checkpoint_files)
+        ad_logger.info(f"disable_preload=True: streaming checkpoint load from {num_files} file(s)")
+        for i, checkpoint_file in enumerate(checkpoint_files, start=1):
+            ad_logger.info(
+                f"Streaming checkpoint file {i}/{num_files}: {os.path.basename(checkpoint_file)}"
             )
+            file_weights = modeling.load_state_dict(checkpoint_file, device_map={"": device})
+            model.load_state_dict(file_weights, strict=False)
+            del file_weights
 
-        # Load checkpoint files from index if needed
-        if index_filename is not None:
-            checkpoint_folder = os.path.dirname(index_filename)
-            with open(index_filename, "r") as f:
-                index = json.load(f)
+        ad_logger.info("Streaming checkpoint loading completed")
 
-            if "weight_map" in index:
-                index = index["weight_map"]
-            checkpoint_files = list(set(index.values()))
-            checkpoint_files = [os.path.join(checkpoint_folder, f) for f in checkpoint_files]
-
-        # Load all weights
+    def _load_full_checkpoint_to_cpu(self, checkpoint_files: List[str]) -> dict:
+        """Load checkpoint files into CPU memory."""
         all_weights = {}
-        for checkpoint_file in checkpoint_files:
-            ad_logger.info(f"Loading weight file: {checkpoint_file}")
+        num_files = len(checkpoint_files)
+        for i, checkpoint_file in enumerate(checkpoint_files, start=1):
+            ad_logger.info(f"Loading checkpoint file {i}/{num_files}: {checkpoint_file}")
             if checkpoint_file.endswith(".safetensors"):
                 file_weights = safetensors.torch.load_file(checkpoint_file, device="cpu")
             elif checkpoint_file.endswith((".bin", ".pth")):

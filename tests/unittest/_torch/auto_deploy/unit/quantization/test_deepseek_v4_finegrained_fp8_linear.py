@@ -16,7 +16,7 @@
 import pytest
 import torch
 import torch.nn as nn
-from torch.fx import Graph, GraphModule
+from torch.fx import Graph, GraphModule, Node
 
 import tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.models.quant_checkpoint_layout import (
@@ -32,6 +32,7 @@ from tensorrt_llm._torch.auto_deploy.transform.interface import (
 from tensorrt_llm._torch.auto_deploy.transform.library.quantization import (
     FineGrainedFP8LinearQuantization,
 )
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding_ir import ShardableNode
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 _FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
@@ -167,8 +168,56 @@ def _build_graph_module(weight_names: tuple[str, ...]) -> GraphModule:
     return GraphModule(model, graph)
 
 
+def _build_grouped_einsum_graph_module(weight_name: str) -> GraphModule:
+    batch_size, seq_len, num_groups, rank, group_width = 2, 3, 4, 8, 16
+    model = _DeepSeekLinearSurface()
+    modname, _, attrname = weight_name.rpartition(".")
+    submod = model.get_submodule(modname)
+    setattr(
+        submod,
+        attrname,
+        nn.Parameter(torch.empty(num_groups * rank, group_width, dtype=torch.float16)),
+    )
+    params = dict(model.named_parameters())
+
+    graph = Graph()
+    x = graph.placeholder("x")
+    x.meta["val"] = torch.empty(batch_size, seq_len, num_groups, group_width, dtype=torch.float16)
+    input_view = graph.call_function(
+        torch.ops.auto_deploy.view.default,
+        args=(x, [batch_size, seq_len, num_groups, group_width]),
+        kwargs={"tp_scaled_dim": 2, "layer_type": "mla"},
+    )
+    weight = graph.get_attr(weight_name)
+    weight.meta["val"] = params[weight_name]
+    weight_view = graph.call_function(
+        torch.ops.auto_deploy.view.default,
+        args=(weight, [num_groups, rank, group_width]),
+        kwargs={
+            "tp_scaled_dim": 0,
+            "layer_type": "mla",
+            "tp_min_local_shape": rank,
+        },
+    )
+    einsum = graph.call_function(
+        torch.ops.aten.einsum.default,
+        args=("bsgd,grd->bsgr", [input_view, weight_view]),
+    )
+    output = graph.call_method("flatten", args=(einsum, 2))
+    graph.output(output)
+    return GraphModule(model, graph)
+
+
 def _linear_weight_names(gm: GraphModule, op: object) -> set[str]:
     return {node.args[1].target for node in gm.graph.nodes if is_op(node, op)}
+
+
+def _linear_nodes(gm: GraphModule, op: object) -> list[Node]:
+    return [node for node in gm.graph.nodes if is_op(node, op)]
+
+
+def _call_function_nodes(gm: GraphModule, op: object) -> list[Node]:
+    return [node for node in gm.graph.nodes if is_op(node, op)]
 
 
 def test_layout_scale_alias_loads_weight_scale_inv_and_removes_alias() -> None:
@@ -285,6 +334,8 @@ def test_layout_config_quantizes_only_direct_finegrained_fp8_linear_paths() -> N
     assert info.num_matches == len(expected_quantized)
     assert _linear_weight_names(gm, quant_op) == expected_quantized
     assert _linear_weight_names(gm, torch.ops.aten.linear) == expected_skipped
+    for node in _linear_nodes(gm, quant_op):
+        assert node.kwargs["input_scale_fmt"] == "ue8m0"
 
     buffers = dict(gm.named_buffers())
     for weight_name in expected_quantized:
@@ -295,6 +346,92 @@ def test_layout_config_quantizes_only_direct_finegrained_fp8_linear_paths() -> N
     for weight_name in expected_skipped:
         scale_name = weight_name.removesuffix(".weight") + ".weight_scale_inv"
         assert scale_name not in buffers
+
+
+def test_layout_config_quantizes_targeted_grouped_einsum_with_ue8m0_scale_fmt() -> None:
+    weight_name = "layers.0.attn.wo_a.weight"
+    gm = _build_grouped_einsum_graph_module(weight_name)
+    qcfg = {
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+        "scale_fmt": "ue8m0",
+        "checkpoint_layout": _deepseek_v4_checkpoint_layout(),
+    }
+    grouped_op = torch.ops.auto_deploy.torch_fake_quant_grouped_finegrained_fp8_linear.default
+
+    gm, info = _transform()._apply(gm, None, _Factory(qcfg), SharedConfig())
+
+    grouped_nodes = _call_function_nodes(gm, grouped_op)
+    assert info.num_matches == 1
+    assert len(grouped_nodes) == 1
+    grouped_node = grouped_nodes[0]
+    assert grouped_node.args[1].target == weight_name
+    assert grouped_node.kwargs["input_scale_fmt"] == "ue8m0"
+    assert grouped_node.kwargs["tp_mode"] == "colwise"
+    assert grouped_node.kwargs["tp_min_local_shape"] == 8
+    assert ShardableNode.from_node(grouped_node) is not None
+    assert not _call_function_nodes(gm, torch.ops.aten.einsum)
+    assert all(node.target != "flatten" for node in gm.graph.nodes if node.op == "call_method")
+
+    buffers = dict(gm.named_buffers())
+    scale_name = weight_name.removesuffix(".weight") + ".weight_scale_inv"
+    assert buffers[scale_name].shape == (1, 1)
+    assert buffers[scale_name].dtype == torch.float32
+
+
+def test_layout_config_preserves_exported_positional_view_layer_type_on_grouped_einsum() -> None:
+    class _ExportedGroupedEinsum(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Module()])
+            self.layers[0].attn = nn.Module()
+            self.layers[0].attn.wo_a = _WeightOnlyLinear(out_features=32, in_features=16)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            x = torch.ops.auto_deploy.view(x, [2, 3, 4, 16], 2, "mla")
+            weight = torch.ops.auto_deploy.view(
+                self.layers[0].attn.wo_a.weight,
+                [4, 8, 16],
+                0,
+                "mla",
+                8,
+            )
+            return torch.einsum("bsgd,grd->bsgr", x, weight).flatten(2)
+
+    gm = torch.export.export(_ExportedGroupedEinsum(), (torch.randn(2, 3, 4, 16),)).module()
+    qcfg = {
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+        "scale_fmt": "ue8m0",
+        "checkpoint_layout": _deepseek_v4_checkpoint_layout(),
+    }
+    grouped_op = torch.ops.auto_deploy.torch_fake_quant_grouped_finegrained_fp8_linear.default
+
+    gm, info = _transform()._apply(gm, None, _Factory(qcfg), SharedConfig())
+
+    grouped_nodes = _call_function_nodes(gm, grouped_op)
+    assert info.num_matches == 1
+    assert len(grouped_nodes) == 1
+    assert grouped_nodes[0].kwargs["layer_type"] == "mla"
+
+
+def test_layout_config_leaves_non_targeted_grouped_einsum_untouched() -> None:
+    gm = _build_grouped_einsum_graph_module("layers.0.attn.compressor.wkv.weight")
+    qcfg = {
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+        "scale_fmt": "ue8m0",
+        "checkpoint_layout": _deepseek_v4_checkpoint_layout(),
+    }
+    grouped_op = torch.ops.auto_deploy.torch_fake_quant_grouped_finegrained_fp8_linear.default
+
+    gm, info = _transform()._apply(gm, None, _Factory(qcfg), SharedConfig())
+
+    assert info.num_matches == 0
+    assert not _call_function_nodes(gm, grouped_op)
+    assert len(_call_function_nodes(gm, torch.ops.aten.einsum)) == 1
+    assert any(node.target == "flatten" for node in gm.graph.nodes if node.op == "call_method")
+    assert "layers.0.attn.compressor.wkv.weight_scale_inv" not in dict(gm.named_buffers())
 
 
 def test_layout_config_skips_linear_without_extractable_weight() -> None:
@@ -316,6 +453,22 @@ def test_layout_config_skips_linear_without_extractable_weight() -> None:
     assert info.num_matches == 0
     assert _linear_weight_names(gm, quant_op) == set()
     assert any(is_op(node, torch.ops.aten.linear) for node in gm.graph.nodes)
+
+
+def test_generic_config_quantized_linear_uses_default_input_scale_fmt() -> None:
+    gm = _build_graph_module(("layers.0.attn.wq_a.weight",))
+    qcfg = {
+        "quant_method": "fp8",
+        "weight_block_size": [128, 128],
+    }
+    quant_op = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear.default
+
+    gm, info = _transform()._apply(gm, None, _Factory(qcfg), SharedConfig())
+
+    assert info.num_matches == 1
+    quant_nodes = _linear_nodes(gm, quant_op)
+    assert len(quant_nodes) == 1
+    assert quant_nodes[0].kwargs["input_scale_fmt"] == ""
 
 
 def test_generic_fp8_uses_scale_inv_and_does_not_consume_scale_alias() -> None:

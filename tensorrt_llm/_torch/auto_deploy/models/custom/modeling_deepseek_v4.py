@@ -204,6 +204,13 @@ _DEEPSEEK_V4_MXFP4_EXPERT_PATTERN = (
     r"(?P<projection>w[123])\.(?P<kind>weight|scale)"
 )
 _DEEPSEEK_V4_MXFP4_EXPERT_TEMPLATE = "layers.{layer}.ffn.experts.{expert}.{projection}.{kind}"
+_DEEPSEEK_V4_MXFP4_LAYER_NAME_PATTERN = r"(?:^|[._])layers[._](?P<layer>\d+)[._]ffn[._]"
+_DEEPSEEK_V4_MXFP4_RUNTIME_BUFFER_SUFFIXES = (
+    "gate_up_proj_blocks",
+    "gate_up_proj_scales",
+    "down_proj_blocks",
+    "down_proj_scales",
+)
 
 
 def _deepseek_v4_packed_mxfp4_experts_layout(
@@ -216,6 +223,7 @@ def _deepseek_v4_packed_mxfp4_experts_layout(
         runtime_down_projection="w2",
         expert_block_size=32,
         scale_fmt=scale_fmt,
+        layer_name_pattern=_DEEPSEEK_V4_MXFP4_LAYER_NAME_PATTERN,
     )
 
 
@@ -510,7 +518,7 @@ def _fake_fp8_act_quant(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
 
     dtype = x.dtype
     x_float = x.float()
-    grouped = x_float.reshape(*x_float.shape[:-1], dim // block_size, block_size)
+    grouped = x_float.reshape(-1, dim // block_size, block_size)
     scale = _ceil_pow2_scale(grouped.abs().amax(dim=-1, keepdim=True), 448.0, 1.0e-4)
     quant = torch.clamp(grouped / scale, -448.0, 448.0).to(dtype).float()
     return (quant * scale).reshape_as(x_float).to(dtype)
@@ -523,12 +531,21 @@ def _fake_fp4_act_quant(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
 
     dtype = x.dtype
     x_float = x.float()
-    grouped = x_float.reshape(*x_float.shape[:-1], dim // block_size, block_size)
+    grouped = x_float.reshape(-1, dim // block_size, block_size)
     scale = _ceil_pow2_scale(grouped.abs().amax(dim=-1, keepdim=True), 6.0, 6.0 * 2.0**-126)
     normalized = torch.clamp(grouped / scale, -6.0, 6.0)
-    levels = normalized.new_tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
-    level_idx = (normalized.abs().unsqueeze(-1) - levels).abs().argmin(dim=-1)
-    quant = levels[level_idx] * normalized.sign()
+    abs_normalized = normalized.abs()
+    quant_abs = torch.zeros_like(abs_normalized)
+    # Nearest E2M1 level. Use strict midpoint thresholds to match table argmin tie behavior:
+    # exact midpoint ties stay on the lower level.
+    quant_abs = torch.where(abs_normalized > 0.25, torch.full_like(quant_abs, 0.5), quant_abs)
+    quant_abs = torch.where(abs_normalized > 0.75, torch.full_like(quant_abs, 1.0), quant_abs)
+    quant_abs = torch.where(abs_normalized > 1.25, torch.full_like(quant_abs, 1.5), quant_abs)
+    quant_abs = torch.where(abs_normalized > 1.75, torch.full_like(quant_abs, 2.0), quant_abs)
+    quant_abs = torch.where(abs_normalized > 2.5, torch.full_like(quant_abs, 3.0), quant_abs)
+    quant_abs = torch.where(abs_normalized > 3.5, torch.full_like(quant_abs, 4.0), quant_abs)
+    quant_abs = torch.where(abs_normalized > 5.0, torch.full_like(quant_abs, 6.0), quant_abs)
+    quant = quant_abs * normalized.sign()
     return (quant * scale).reshape_as(x_float).to(dtype)
 
 
@@ -539,16 +556,15 @@ def _hadamard_rotate(x: torch.Tensor) -> torch.Tensor:
     if dim & (dim - 1):
         raise ValueError(f"Hadamard rotation requires power-of-two dimension, got {dim}.")
 
-    original_shape = x.shape
-    out = x.float()
+    out = x.reshape(-1, dim).float()
     width = 1
     while width < dim:
-        out = out.reshape(*out.shape[:-1], dim // (2 * width), 2, width)
+        out = out.reshape(-1, dim // (2 * width), 2, width)
         left = out[..., 0, :]
         right = out[..., 1, :]
-        out = torch.cat((left + right, left - right), dim=-1).reshape(original_shape)
+        out = torch.cat((left + right, left - right), dim=-1).flatten(-2)
         width *= 2
-    return (out * (dim**-0.5)).to(x.dtype)
+    return (out * (dim**-0.5)).reshape_as(x).to(x.dtype)
 
 
 def _window_topk_idxs(
@@ -786,13 +802,53 @@ class DeepseekV4MoE(nn.Module):
         )
 
     def _register_mxfp4_runtime_buffers(self) -> None:
-        for name in (
+        if self.hidden_size % 32 != 0 or self.intermediate_size % 32 != 0:
+            raise ValueError(
+                "DeepSeek V4 MXFP4 experts require hidden_size and "
+                "moe_intermediate_size to be divisible by 32."
+            )
+        self.experts.register_buffer(
             "gate_up_proj_blocks",
+            torch.zeros(
+                self.n_routed_experts,
+                2 * self.intermediate_size,
+                self.hidden_size // 32,
+                16,
+                dtype=torch.uint8,
+            ),
+            persistent=True,
+        )
+        self.experts.register_buffer(
             "gate_up_proj_scales",
+            torch.zeros(
+                self.n_routed_experts,
+                2 * self.intermediate_size,
+                self.hidden_size // 32,
+                dtype=torch.uint8,
+            ),
+            persistent=True,
+        )
+        self.experts.register_buffer(
             "down_proj_blocks",
+            torch.zeros(
+                self.n_routed_experts,
+                self.hidden_size,
+                self.intermediate_size // 32,
+                16,
+                dtype=torch.uint8,
+            ),
+            persistent=True,
+        )
+        self.experts.register_buffer(
             "down_proj_scales",
-        ):
-            self.experts.register_buffer(name, torch.empty(0, dtype=torch.uint8), persistent=True)
+            torch.zeros(
+                self.n_routed_experts,
+                self.hidden_size,
+                self.intermediate_size // 32,
+                dtype=torch.uint8,
+            ),
+            persistent=True,
+        )
         self.experts.register_buffer(
             "gate_up_proj_bias",
             torch.zeros(
@@ -1211,20 +1267,18 @@ class DeepseekV4Attention(nn.Module):
                 self.compress_ratio,
             )
         else:
-            kv_for_attention = kv.unsqueeze(2)
-            attn_output = torch.ops.auto_deploy.torch_attention(
+            topk_idxs = _window_topk_idxs(
+                self.window_size, batch_size, seq_len, hidden_states.device
+            ).to(torch.int64)
+            attn_output = _sparse_attention(
                 q,
-                kv_for_attention,
-                kv_for_attention,
-                attn_mask=None,
-                dropout_p=0.0,
-                is_causal=True,
-                scale=self.softmax_scale,
-                sinks=self.attn_sink,
-                sliding_window=self.window_size,
-                layout="bsnd",
-                layer_idx=self.layer_idx,
-                layer_type="mla",
+                kv,
+                self.attn_sink,
+                topk_idxs,
+                self.softmax_scale,
+                self.layer_idx,
+                self.window_size,
+                self.compress_ratio,
             )
 
         out_nope, out_pe = torch.split(
@@ -1363,6 +1417,63 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
         self.register_load_state_dict_pre_hook(self._remap_load_state_hook)
 
     @staticmethod
+    def _load_graph_mxfp4_runtime_buffers(
+        module: nn.Module,
+        state_dict: dict[str, torch.Tensor],
+    ) -> None:
+        layout = _deepseek_v4_packed_mxfp4_experts_layout()
+        buffer_groups: dict[str, dict[str, torch.Tensor]] = {}
+        for buffer_name, tensor in module.named_buffers():
+            for suffix in _DEEPSEEK_V4_MXFP4_RUNTIME_BUFFER_SUFFIXES:
+                if not buffer_name.endswith(suffix):
+                    continue
+                target_prefix = buffer_name[: -len(suffix)]
+                buffer_groups.setdefault(target_prefix, {})[suffix] = tensor
+
+        for target_prefix, buffers in buffer_groups.items():
+            gate_up_blocks = buffers.get("gate_up_proj_blocks")
+            gate_up_scales = buffers.get("gate_up_proj_scales")
+            down_blocks = buffers.get("down_proj_blocks")
+            down_scales = buffers.get("down_proj_scales")
+            if not all(
+                isinstance(tensor, torch.Tensor)
+                for tensor in (gate_up_blocks, gate_up_scales, down_blocks, down_scales)
+            ):
+                continue
+            if gate_up_blocks.dim() < 4 or gate_up_scales.dim() < 3:
+                continue
+            if down_blocks.dim() < 4 or down_scales.dim() < 3:
+                continue
+
+            target_gate_up_blocks = f"{target_prefix}gate_up_proj_blocks"
+            layer = layout.layer_from_runtime_name(target_gate_up_blocks)
+            if layer is None:
+                continue
+            if target_gate_up_blocks in state_dict:
+                continue
+            max_expert = -1
+            for key in state_dict:
+                parsed = layout.parse_key(key)
+                if parsed is not None and parsed.layer == layer:
+                    max_expert = max(max_expert, parsed.expert)
+            if max_expert < 0:
+                continue
+            num_experts = max_expert + 1
+
+            layout.load_runtime_buffers(
+                state_dict,
+                "",
+                layer=layer,
+                hidden_size=int(down_blocks.shape[1]),
+                intermediate_size=int(gate_up_blocks.shape[1] // 2),
+                target_gate_up_blocks=target_gate_up_blocks,
+                target_gate_up_scales=f"{target_prefix}gate_up_proj_scales",
+                target_down_blocks=f"{target_prefix}down_proj_blocks",
+                target_down_scales=f"{target_prefix}down_proj_scales",
+                num_experts=num_experts,
+            )
+
+    @staticmethod
     def _remap_load_state_hook(
         module: nn.Module,
         state_dict: dict[str, torch.Tensor],
@@ -1373,11 +1484,17 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
         if prefix:
             return
         _remap_deepseek_v4_checkpoint_keys(state_dict)
-        for layer in getattr(module, "layers", ()):
-            ffn = getattr(layer, "ffn", None)
-            load_mxfp4_runtime_buffers = getattr(ffn, "load_mxfp4_runtime_buffers", None)
-            if load_mxfp4_runtime_buffers is not None:
-                load_mxfp4_runtime_buffers(state_dict)
+        seen: set[int] = set()
+        for submodule in module.modules():
+            load_mxfp4_runtime_buffers = getattr(submodule, "load_mxfp4_runtime_buffers", None)
+            if load_mxfp4_runtime_buffers is None:
+                continue
+            submodule_id = id(submodule)
+            if submodule_id in seen:
+                continue
+            seen.add(submodule_id)
+            load_mxfp4_runtime_buffers(state_dict)
+        DeepseekV4PreTrainedModel._load_graph_mxfp4_runtime_buffers(module, state_dict)
 
     def _init_weights(self, module: nn.Module) -> None:
         std = getattr(self.config, "initializer_range", 0.02)

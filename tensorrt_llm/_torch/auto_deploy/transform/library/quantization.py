@@ -40,6 +40,7 @@ from ...utils.node_utils import (
     get_quantization_params_from_linear_node,
     is_bmm_op,
     is_linear_op,
+    is_op,
 )
 from ...utils.quantization_utils import (
     fp4_global_scale,
@@ -59,6 +60,124 @@ try:
     from tensorrt_llm.quantization.utils.fp4_utils import float4_sf_dtype
 except ImportError:
     float4_sf_dtype = None
+
+
+def _is_view_or_reshape_node(node: Node) -> bool:
+    if not isinstance(node, Node):
+        return False
+    if node.op == "call_method":
+        return node.target in {"view", "reshape"}
+    return is_op(
+        node,
+        [
+            torch.ops.aten.view,
+            torch.ops.aten.reshape,
+            torch.ops.auto_deploy.view,
+        ],
+    )
+
+
+def _view_base_and_shape(node: Node) -> Tuple[object, Tuple[object, ...]]:
+    if node.op == "call_method":
+        base = node.args[0]
+        shape_args = node.args[1:]
+    elif is_op(node, torch.ops.auto_deploy.view):
+        base = node.args[0]
+        shape_args = (node.args[1],)
+    else:
+        base = node.args[0]
+        shape_args = node.args[1:]
+    if len(shape_args) == 1 and isinstance(shape_args[0], (list, tuple)):
+        shape_args = tuple(shape_args[0])
+    return base, tuple(shape_args)
+
+
+def _shape_from_view_or_meta(node: Node) -> Tuple[object, ...] | None:
+    if _is_view_or_reshape_node(node):
+        _, view_shape = _view_base_and_shape(node)
+        return view_shape
+    meta_val = node.meta.get("val") if isinstance(node, Node) else None
+    if meta_val is not None and hasattr(meta_val, "shape"):
+        return tuple(meta_val.shape)
+    return None
+
+
+def _is_static_dim_value(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_grouped_finegrained_fp8_einsum_node(node: Node) -> bool:
+    if not isinstance(node, Node) or node.op != "call_function":
+        return False
+    return node.target in {
+        torch.einsum,
+        torch.functional.einsum,
+        torch.ops.aten.einsum.default,
+    }
+
+
+def _extract_grouped_finegrained_fp8_einsum_operands(node: Node) -> Tuple[Node, Node] | None:
+    if not _is_grouped_finegrained_fp8_einsum_node(node) or not node.args:
+        return None
+    if node.args[0] != "bsgd,grd->bsgr":
+        return None
+
+    if len(node.args) >= 3:
+        input_node = node.args[1]
+        weight_view = node.args[2]
+    elif len(node.args) >= 2 and isinstance(node.args[1], (list, tuple)):
+        operands = node.args[1]
+        if len(operands) != 2:
+            return None
+        input_node, weight_view = operands
+    else:
+        return None
+
+    if not isinstance(input_node, Node) or not isinstance(weight_view, Node):
+        return None
+    return input_node, weight_view
+
+
+def _flatten_args(node: Node) -> Tuple[object, object] | None:
+    if node.op == "call_method" and node.target == "flatten":
+        start_dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("start_dim", 0)
+        end_dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("end_dim", -1)
+        return start_dim, end_dim
+    if node.op == "call_function" and (
+        node.target is torch.flatten or is_op(node, torch.ops.aten.flatten)
+    ):
+        start_dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("start_dim", 0)
+        end_dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("end_dim", -1)
+        return start_dim, end_dim
+    return None
+
+
+def _is_flatten_from_grouped_output(node: Node) -> bool:
+    flatten_args = _flatten_args(node)
+    if flatten_args is None:
+        return False
+    start_dim, end_dim = flatten_args
+    return start_dim == 2 and end_dim == -1
+
+
+def _single_flatten_user(node: Node) -> Node | None:
+    flatten_users = [user for user in list(node.users) if _is_flatten_from_grouped_output(user)]
+    if len(flatten_users) != 1 or len(node.users) != 1:
+        return None
+    return flatten_users[0]
+
+
+def _extract_layer_type_hint(node: Node, default: str = "unknown") -> str:
+    if not isinstance(node, Node):
+        return default
+    if node.op == "call_function":
+        try:
+            [layer_type] = extract_op_args(node, "layer_type")
+        except RuntimeError:
+            layer_type = None
+        if layer_type is not None:
+            return layer_type
+    return node.kwargs.get("layer_type", default)
 
 
 class Quantization(BaseTransform):
@@ -177,6 +296,7 @@ class Quantization(BaseTransform):
         node: Node,
         is_quantized_graph: bool = False,
         load_hook_kwargs: Optional[Dict[str, object]] = None,
+        custom_kwargs: Optional[Dict[str, object]] = None,
     ):
         """Replaces the matmul node with a new custom quantized linear node.
 
@@ -253,6 +373,7 @@ class Quantization(BaseTransform):
             "output_sizes": output_sizes,
             "tp_min_local_shape": tp_min_local_shape,
             "layer_type": layer_type,
+            **(custom_kwargs or {}),
         }
 
     def _insert_quantized_bmm(
@@ -876,9 +997,13 @@ class FineGrainedFP8LinearQuantization(Quantization):
         self._weight_block_size = (128, 128)
         self._runtime_scale_name = "weight_scale_inv"
         self._default_scales_layout = None
+        self._input_scale_fmt = ""
 
     def target_op(self):
         return torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear.default
+
+    def grouped_target_op(self):
+        return torch.ops.auto_deploy.torch_fake_quant_grouped_finegrained_fp8_linear.default
 
     def quantize_weight(self, w: torch.Tensor) -> torch.Tensor:
         return torch.empty_like(w, dtype=torch.float8_e4m3fn, device=w.device)
@@ -899,6 +1024,96 @@ class FineGrainedFP8LinearQuantization(Quantization):
 
     def build_custom_args_for_linear(self, scales: Dict[str, Node]) -> Tuple:
         return ([], [scales[self.scale_names()[0]]], [], [])
+
+    def _extract_grouped_einsum_match(
+        self,
+        node: Node,
+        checkpoint_layout: object,
+        excluded: List[str],
+    ) -> Tuple[Node, Node, Node, str, int] | None:
+        operands = _extract_grouped_finegrained_fp8_einsum_operands(node)
+        if operands is None:
+            return None
+        input_node, weight_view = operands
+        flatten_node = _single_flatten_user(node)
+        if flatten_node is None:
+            return None
+        if not _is_view_or_reshape_node(weight_view):
+            return None
+
+        weight_base, weight_shape = _view_base_and_shape(weight_view)
+        if not isinstance(weight_base, Node) or weight_base.op != "get_attr":
+            return None
+        if not isinstance(weight_base.target, str):
+            return None
+        weight_name = weight_base.target
+        if not checkpoint_layout.is_weight_targeted(weight_name, excluded):
+            return None
+
+        input_shape = _shape_from_view_or_meta(input_node)
+        if input_shape is None or len(input_shape) != 4 or len(weight_shape) != 3:
+            return None
+        num_groups = weight_shape[0]
+        rank = weight_shape[1]
+        if not _is_static_dim_value(num_groups) or not _is_static_dim_value(rank):
+            return None
+        if _is_static_dim_value(input_shape[2]) and input_shape[2] != num_groups:
+            return None
+
+        return flatten_node, input_node, weight_base, weight_name, rank
+
+    def _insert_grouped_quantized_linear(
+        self,
+        gm: GraphModule,
+        flatten_node: Node,
+        input_node: Node,
+        weight_node: Node,
+        weight_name: str,
+        rank: int,
+        load_hook_kwargs: Optional[Dict[str, object]] = None,
+    ) -> None:
+        original_weight = gm.get_parameter(weight_name)
+        new_param = nn.Parameter(self.quantize_weight(original_weight), requires_grad=False)
+        modname, _, attrname = weight_name.rpartition(".")
+        submod = gm.get_submodule(modname)
+        setattr(submod, attrname, new_param)
+        weight_node.meta["val"] = new_param.detach()
+
+        for scale_name, scale in self.default_scales(original_weight.shape).items():
+            if scale_name in submod._buffers:
+                submod._buffers[scale_name] = scale
+            else:
+                submod.register_buffer(scale_name, scale)
+
+        gm._register_load_state_dict_pre_hook(
+            partial(
+                self.load_hook,
+                weight_name=weight_name,
+                **(load_hook_kwargs or {}),
+            )
+        )
+
+        scale_name = self.scale_names()[0]
+        scale_target = f"{modname}.{scale_name}" if modname else scale_name
+        layer_type = _extract_layer_type_hint(input_node)
+
+        with gm.graph.inserting_before(flatten_node):
+            scale_node = gm.graph.create_node("get_attr", scale_target)
+            scale_node.meta["val"] = getattr(submod, scale_name).detach()
+            grouped_node = gm.graph.call_function(
+                self.grouped_target_op(),
+                args=(input_node, weight_node, None, [], [scale_node], [], []),
+                kwargs={
+                    "tp_mode": "colwise",
+                    "output_sizes": None,
+                    "tp_min_local_shape": rank,
+                    "layer_type": layer_type,
+                    "input_scale_fmt": self._input_scale_fmt,
+                },
+            )
+
+        flatten_node.replace_all_uses_with(grouped_node)
+        gm.graph.erase_node(flatten_node)
 
     @staticmethod
     def _get_finegrained_fp8_layout(qcfg: Dict):
@@ -928,6 +1143,15 @@ class FineGrainedFP8LinearQuantization(Quantization):
                 qcfg["weight_block_size"]
             )
         return 128, 128
+
+    @staticmethod
+    def _resolve_input_scale_fmt(qcfg: Dict, checkpoint_layout: object) -> str:
+        scale_fmt = getattr(checkpoint_layout, "scale_fmt", None)
+        if scale_fmt is None:
+            scale_fmt = qcfg.get("scale_fmt")
+        if scale_fmt is None:
+            return ""
+        return str(scale_fmt).lower()
 
     @staticmethod
     def _add_prefix(prefix: str, name: str) -> str:
@@ -1038,6 +1262,7 @@ class FineGrainedFP8LinearQuantization(Quantization):
             if checkpoint_layout is not None
             else "weight_scale_inv"
         )
+        self._input_scale_fmt = self._resolve_input_scale_fmt(qcfg, checkpoint_layout)
         if checkpoint_layout is not None:
             excluded = list(
                 dict.fromkeys(
@@ -1071,8 +1296,34 @@ class FineGrainedFP8LinearQuantization(Quantization):
                     n,
                     is_quantized_graph=False,
                     load_hook_kwargs=load_hook_kwargs,
+                    custom_kwargs={"input_scale_fmt": self._input_scale_fmt},
                 )
                 cnt += 1
+
+            if checkpoint_layout is not None:
+                load_hook_kwargs = {"checkpoint_layout": checkpoint_layout}
+                for n in list(gm.graph.nodes):
+                    grouped_match = self._extract_grouped_einsum_match(
+                        n, checkpoint_layout, excluded
+                    )
+                    if grouped_match is None:
+                        continue
+                    flatten_node, input_node, weight_node, weight_name, rank = grouped_match
+                    self._insert_grouped_quantized_linear(
+                        gm,
+                        flatten_node,
+                        input_node,
+                        weight_node,
+                        weight_name,
+                        rank,
+                        load_hook_kwargs=load_hook_kwargs,
+                    )
+                    cnt += 1
+
+        if cnt:
+            gm.graph.eliminate_dead_code()
+            gm.graph.lint()
+            gm.recompile()
 
         return gm, TransformInfo(
             skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=(cnt == 0)

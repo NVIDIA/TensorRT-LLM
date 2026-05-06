@@ -218,7 +218,7 @@ def torch_attention(
         sinks = torch.exp(sinks_expanded - logits_max)
         unnormalized_scores = torch.exp(attn_scores - logits_max)
         normalizer = unnormalized_scores.sum(dim=-1, keepdim=True) + sinks
-        scores = unnormalized_scores / normalizer
+        scores = (unnormalized_scores / normalizer).to(value_t.dtype)
         # Use only the non-sink portion for computing output
         # We added exactly 1 column, so remove exactly 1 column
         attn_out = torch.matmul(scores, value_t)  # [b, n_heads, s_q, v_head_dim]

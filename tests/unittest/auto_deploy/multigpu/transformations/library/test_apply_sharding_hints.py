@@ -27,15 +27,17 @@ import torch
 import torch.nn as nn
 from _dist_test_utils import get_device_counts
 from _graph_test_helpers import run_test_transformed_gm
+from torch.fx import Graph, GraphModule
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 import tensorrt_llm._torch.auto_deploy.transform.library  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding import _get_dist_ops
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
-from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_op_args, is_op
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_op_args, is_op, shape
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
@@ -175,10 +177,22 @@ def test_sharding(world_size: int):
 # ---------------------------------------------------------------------------
 
 
-def _make_optimizer(world_size: int, rank: int = 0):
+def _make_optimizer(
+    world_size: int,
+    rank: int = 0,
+    dist_backend: str | None = None,
+    *,
+    simple_shard_only: bool = False,
+):
+    apply_config = {"stage": "sharding"}
+    if dist_backend is not None:
+        apply_config["dist_backend"] = dist_backend
+    if simple_shard_only:
+        apply_config["simple_shard_only"] = True
+
     opt = InferenceOptimizer(
         factory=None,
-        config={"apply_sharding_hints": {"stage": "sharding"}},
+        config={"apply_sharding_hints": apply_config},
     )
     opt.shared_config = SharedConfig(
         local_rank=rank,
@@ -229,6 +243,122 @@ def _export_deepseek_v4_contract_block():
 
 def _call_nodes(gm, op):
     return [node for node in gm.graph.nodes if is_op(node, op)]
+
+
+def _make_grouped_fp8_quantized_graph(*, num_groups=4, with_group_view=True):
+    batch_size, seq_len, rank, group_width = 2, 3, 8, 16
+
+    class Shell(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(
+                torch.empty(num_groups * rank, group_width, dtype=torch.float8_e4m3fn)
+            )
+            self.register_buffer("weight_scale_inv", torch.ones(num_groups, 1))
+
+    root = Shell()
+    graph = Graph()
+    x = graph.placeholder("x")
+    x.meta["val"] = torch.empty(batch_size, seq_len, num_groups, group_width)
+    input_node = x
+    if with_group_view:
+        input_node = graph.call_function(
+            torch.ops.auto_deploy.view.default,
+            args=(x, [batch_size, seq_len, num_groups, group_width]),
+            kwargs={"tp_scaled_dim": 2, "layer_type": "mla"},
+        )
+        input_node.meta["val"] = torch.empty(batch_size, seq_len, num_groups, group_width)
+    weight = graph.get_attr("weight")
+    scale = graph.get_attr("weight_scale_inv")
+    out = graph.call_function(
+        torch.ops.auto_deploy.torch_fake_quant_grouped_finegrained_fp8_linear.default,
+        args=(input_node, weight, None, [], [scale], [], []),
+        kwargs={
+            "tp_mode": "colwise",
+            "tp_min_local_shape": rank,
+            "layer_type": "mla",
+            "input_scale_fmt": "ue8m0",
+        },
+    )
+    out.meta["val"] = torch.empty(batch_size, seq_len, num_groups * rank)
+    graph.output(out)
+    return GraphModule(root, graph), num_groups, rank
+
+
+def test_apply_hints_grouped_fp8_linear_trusts_group_sharded_view_input():
+    gm, num_groups, rank = _make_grouped_fp8_quantized_graph(num_groups=8, with_group_view=True)
+
+    gm_out = _make_optimizer(world_size=8, rank=7)(None, gm)
+
+    grouped_nodes = _call_nodes(
+        gm_out,
+        torch.ops.auto_deploy.torch_fake_quant_grouped_finegrained_fp8_linear.default,
+    )
+    assert len(grouped_nodes) == 1
+    grouped_node = grouped_nodes[0]
+    grouped_input = grouped_node.args[0]
+    local_groups = num_groups // 8
+
+    assert is_op(grouped_input, torch.ops.auto_deploy.view.default)
+    assert not is_op(grouped_input, torch.ops.aten.slice.Tensor)
+    assert shape(grouped_input)[2] == local_groups
+    assert grouped_input.args[1][2] == -1
+    assert gm_out.weight.shape == (local_groups * rank, 16)
+    assert gm_out.weight_scale_inv.shape == (local_groups, 1)
+    assert grouped_node.meta["val"].shape == (2, 3, local_groups * rank)
+
+
+def test_apply_hints_grouped_fp8_linear_slices_plain_global_input_groups():
+    gm, num_groups, rank = _make_grouped_fp8_quantized_graph(with_group_view=False)
+
+    gm_out = _make_optimizer(world_size=2, rank=1)(None, gm)
+
+    grouped_nodes = _call_nodes(
+        gm_out,
+        torch.ops.auto_deploy.torch_fake_quant_grouped_finegrained_fp8_linear.default,
+    )
+    assert len(grouped_nodes) == 1
+    grouped_node = grouped_nodes[0]
+    grouped_input = grouped_node.args[0]
+    local_groups = num_groups // 2
+
+    assert is_op(grouped_input, torch.ops.aten.slice.Tensor)
+    assert grouped_input.args[1:5] == (2, local_groups, num_groups, 1)
+    assert gm_out.weight.shape == (local_groups * rank, 16)
+    assert gm_out.weight_scale_inv.shape == (local_groups, 1)
+    assert grouped_node.meta["val"].shape == (2, 3, local_groups * rank)
+
+
+def test_simple_shard_only_does_not_ordinary_shard_grouped_fp8_linear():
+    gm, _, _ = _make_grouped_fp8_quantized_graph()
+
+    gm_out = _make_optimizer(world_size=2, rank=1, simple_shard_only=True)(None, gm)
+
+    info = gm_out.meta["_autodeploy"]["transform_history"]["apply_sharding_hints"]
+    assert info.num_matches == 0
+    assert gm_out.weight.shape == (32, 16)
+    assert gm_out.weight_scale_inv.shape == (4, 1)
+    assert not _call_nodes(gm_out, torch.ops.auto_deploy.torch_dist_all_gather.default)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_apply_hints_default_dist_backend_uses_auto_selection():
+    """Default IR sharding backend remains the existing auto-selected collective."""
+    gm, _, _ = _export_hinted_mlp()
+    gm_out = _make_optimizer(world_size=2)(None, gm)
+
+    _, expected_all_reduce = _get_dist_ops("auto")
+    assert len(_call_nodes(gm_out, expected_all_reduce)) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_apply_hints_torch_dist_backend_forces_torch_all_reduce():
+    """Forcing dist_backend='torch' lowers all_reduce placeholders to torch collectives."""
+    gm, _, _ = _export_hinted_mlp()
+    gm_out = _make_optimizer(world_size=2, dist_backend="torch")(None, gm)
+
+    assert len(_call_nodes(gm_out, torch.ops.auto_deploy.torch_dist_all_reduce.default)) == 1
+    assert len(_call_nodes(gm_out, torch.ops.auto_deploy.trtllm_dist_all_reduce.default)) == 0
 
 
 def test_deepseek_v4_ir_contract_linear_view_sparse_attention():
@@ -334,7 +464,29 @@ def _optional_auto_deploy_default(name):
         return None
 
 
-def _make_stacked_mxfp4_graph(base_op, routing_driven=False, include_optionals=False):
+_STACKED_MOE_EXPERT_ARG_NAMES = (
+    "gate_up_blocks",
+    "gate_up_bias",
+    "gate_up_scales",
+    "down_blocks",
+    "down_bias",
+    "down_scales",
+)
+
+
+def _make_stacked_test_tensor(shape, dtype=torch.float32):
+    numel = 1
+    for dim in shape:
+        numel *= dim
+    values = torch.arange(numel, dtype=torch.float32).reshape(shape)
+    if dtype == torch.uint8:
+        return values.remainder(251).to(torch.uint8)
+    return values.to(dtype)
+
+
+def _make_stacked_mxfp4_graph(
+    base_op, routing_driven=False, include_optionals=False, expert_args_as_attrs=True
+):
     num_experts = 4
     hidden_size = 4
     intermediate_size = 3
@@ -342,21 +494,34 @@ def _make_stacked_mxfp4_graph(base_op, routing_driven=False, include_optionals=F
     tensors = {
         "selected_experts": torch.tensor([[0], [3]], dtype=torch.int64),
         "routing_weights": torch.ones(2, 1),
-        "router_weight": torch.randn(num_experts, hidden_size),
-        "router_bias": torch.randn(num_experts),
-        "gate_up_blocks": torch.empty(num_experts, 2 * intermediate_size, 1, 16, dtype=torch.uint8),
-        "gate_up_bias": torch.randn(num_experts, 2 * intermediate_size),
-        "gate_up_scales": torch.empty(num_experts, 2 * intermediate_size, 1, dtype=torch.uint8),
-        "down_blocks": torch.empty(num_experts, hidden_size, 1, 16, dtype=torch.uint8),
-        "down_bias": torch.randn(num_experts, hidden_size),
-        "down_scales": torch.empty(num_experts, hidden_size, 1, dtype=torch.uint8),
+        "router_weight": _make_stacked_test_tensor((num_experts, hidden_size)),
+        "router_bias": _make_stacked_test_tensor((num_experts,)),
+        "gate_up_blocks": _make_stacked_test_tensor(
+            (num_experts, 2 * intermediate_size, 1, 16), dtype=torch.uint8
+        ),
+        "gate_up_bias": _make_stacked_test_tensor((num_experts, 2 * intermediate_size)),
+        "gate_up_scales": _make_stacked_test_tensor(
+            (num_experts, 2 * intermediate_size, 1), dtype=torch.uint8
+        ),
+        "down_blocks": _make_stacked_test_tensor(
+            (num_experts, hidden_size, 1, 16), dtype=torch.uint8
+        ),
+        "down_bias": _make_stacked_test_tensor((num_experts, hidden_size)),
+        "down_scales": _make_stacked_test_tensor((num_experts, hidden_size, 1), dtype=torch.uint8),
     }
     for name, tensor in tensors.items():
+        if name in _STACKED_MOE_EXPERT_ARG_NAMES and not expert_args_as_attrs:
+            continue
         root.register_buffer(name, tensor)
 
     graph = torch.fx.Graph()
     x = _annotate(graph.placeholder("x"), torch.empty(2, hidden_size))
-    attrs = {name: _make_attr(graph, name, tensor) for name, tensor in tensors.items()}
+    attrs = {}
+    for name, tensor in tensors.items():
+        if name in _STACKED_MOE_EXPERT_ARG_NAMES and not expert_args_as_attrs:
+            attrs[name] = _annotate(graph.placeholder(name), tensor)
+        else:
+            attrs[name] = _make_attr(graph, name, tensor)
     if routing_driven:
         args = (
             x,
@@ -402,6 +567,203 @@ def _make_stacked_mxfp4_graph(base_op, routing_driven=False, include_optionals=F
     return gm
 
 
+def _ensure_submodule(root, path):
+    submod = root
+    for name in path.split("."):
+        child = getattr(submod, name, None)
+        if child is None:
+            child = nn.Module()
+            submod.add_module(name, child)
+        submod = child
+    return submod
+
+
+def _register_nested_buffer(root, target, tensor):
+    mod_name, _, attr_name = target.rpartition(".")
+    submod = _ensure_submodule(root, mod_name)
+    submod.register_buffer(attr_name, tensor)
+
+
+def _make_deepseek_graph_mxfp4_graph(base_op, layer=3, num_experts=4):
+    hidden_size = 32
+    intermediate_size = 32
+    expert_targets = {
+        "gate_up_blocks": f"layers.{layer}.ffn.experts.gate_up_proj_blocks",
+        "gate_up_scales": f"layers.{layer}.ffn.experts.gate_up_proj_scales",
+        "down_blocks": f"layers.{layer}.ffn.experts.down_proj_blocks",
+        "down_scales": f"layers.{layer}.ffn.experts.down_proj_scales",
+    }
+    tensors = {
+        "router_weight": _make_stacked_test_tensor((num_experts, hidden_size)),
+        "router_bias": _make_stacked_test_tensor((num_experts,)),
+        "gate_up_blocks": _make_stacked_test_tensor(
+            (num_experts, 2 * intermediate_size, hidden_size // 32, 16), dtype=torch.uint8
+        ),
+        "gate_up_bias": _make_stacked_test_tensor((num_experts, 2 * intermediate_size)),
+        "gate_up_scales": _make_stacked_test_tensor(
+            (num_experts, 2 * intermediate_size, hidden_size // 32), dtype=torch.uint8
+        ),
+        "down_blocks": _make_stacked_test_tensor(
+            (num_experts, hidden_size, intermediate_size // 32, 16), dtype=torch.uint8
+        ),
+        "down_bias": _make_stacked_test_tensor((num_experts, hidden_size)),
+        "down_scales": _make_stacked_test_tensor(
+            (num_experts, hidden_size, intermediate_size // 32), dtype=torch.uint8
+        ),
+    }
+    root = nn.Module()
+    root.register_buffer("router_weight", tensors["router_weight"])
+    root.register_buffer("router_bias", tensors["router_bias"])
+    for name, target in expert_targets.items():
+        _register_nested_buffer(root, target, tensors[name])
+    root.register_buffer("gate_up_bias", tensors["gate_up_bias"])
+    root.register_buffer("down_bias", tensors["down_bias"])
+
+    graph = torch.fx.Graph()
+    x = _annotate(graph.placeholder("x"), torch.empty(2, hidden_size))
+    attrs = {
+        "router_weight": _make_attr(graph, "router_weight", tensors["router_weight"]),
+        "router_bias": _make_attr(graph, "router_bias", tensors["router_bias"]),
+        "gate_up_bias": _make_attr(graph, "gate_up_bias", tensors["gate_up_bias"]),
+        "down_bias": _make_attr(graph, "down_bias", tensors["down_bias"]),
+    }
+    for name, target in expert_targets.items():
+        attrs[name] = _make_attr(graph, target, tensors[name])
+    moe = graph.call_function(
+        base_op,
+        args=(
+            x,
+            attrs["router_weight"],
+            attrs["router_bias"],
+            1,
+            attrs["gate_up_blocks"],
+            attrs["gate_up_bias"],
+            attrs["gate_up_scales"],
+            1.0,
+            10.0,
+            attrs["down_blocks"],
+            attrs["down_bias"],
+            attrs["down_scales"],
+        ),
+    )
+    moe.meta["val"] = torch.empty(2, hidden_size)
+    graph.output(moe)
+    gm = torch.fx.GraphModule(root, graph)
+    gm.graph.lint()
+    gm.recompile()
+    return gm, expert_targets, hidden_size, intermediate_size
+
+
+def _make_deepseek_flat_mxfp4_routing_graph(base_op, layer=3, num_experts=4):
+    hidden_size = 32
+    intermediate_size = 32
+    expert_targets = {
+        "gate_up_blocks": f"layers_{layer}_ffn_experts_gate_up_proj_blocks",
+        "gate_up_scales": f"layers_{layer}_ffn_experts_gate_up_proj_scales",
+        "down_blocks": f"layers_{layer}_ffn_experts_down_proj_blocks",
+        "down_scales": f"layers_{layer}_ffn_experts_down_proj_scales",
+    }
+    tensors = {
+        "selected_experts": torch.tensor([[0], [3]], dtype=torch.int64),
+        "routing_weights": torch.ones(2, 1),
+        "gate_up_blocks": _make_stacked_test_tensor(
+            (num_experts, 2 * intermediate_size, hidden_size // 32, 16), dtype=torch.uint8
+        ),
+        "gate_up_bias": _make_stacked_test_tensor((num_experts, 2 * intermediate_size)),
+        "gate_up_scales": _make_stacked_test_tensor(
+            (num_experts, 2 * intermediate_size, hidden_size // 32), dtype=torch.uint8
+        ),
+        "down_blocks": _make_stacked_test_tensor(
+            (num_experts, hidden_size, intermediate_size // 32, 16), dtype=torch.uint8
+        ),
+        "down_bias": _make_stacked_test_tensor((num_experts, hidden_size)),
+        "down_scales": _make_stacked_test_tensor(
+            (num_experts, hidden_size, intermediate_size // 32), dtype=torch.uint8
+        ),
+    }
+    root = nn.Module()
+    root.register_buffer("selected_experts", tensors["selected_experts"])
+    root.register_buffer("routing_weights", tensors["routing_weights"])
+    root.register_buffer("gate_up_bias", tensors["gate_up_bias"])
+    root.register_buffer("down_bias", tensors["down_bias"])
+    for name, target in expert_targets.items():
+        root.register_buffer(target, tensors[name])
+
+    graph = torch.fx.Graph()
+    x = _annotate(graph.placeholder("x"), torch.empty(2, hidden_size))
+    attrs = {
+        "selected_experts": _make_attr(graph, "selected_experts", tensors["selected_experts"]),
+        "routing_weights": _make_attr(graph, "routing_weights", tensors["routing_weights"]),
+        "gate_up_bias": _make_attr(graph, "gate_up_bias", tensors["gate_up_bias"]),
+        "down_bias": _make_attr(graph, "down_bias", tensors["down_bias"]),
+    }
+    for name, target in expert_targets.items():
+        attrs[name] = _make_attr(graph, target, tensors[name])
+    moe = graph.call_function(
+        base_op,
+        args=(
+            x,
+            attrs["selected_experts"],
+            attrs["routing_weights"],
+            attrs["gate_up_blocks"],
+            attrs["gate_up_bias"],
+            attrs["gate_up_scales"],
+            1.0,
+            10.0,
+            attrs["down_blocks"],
+            attrs["down_bias"],
+            attrs["down_scales"],
+            "up_gate",
+            "deepseek",
+            "moe",
+        ),
+    )
+    moe.meta["val"] = torch.empty(2, hidden_size)
+    graph.output(moe)
+    gm = torch.fx.GraphModule(root, graph)
+    gm.graph.lint()
+    gm.recompile()
+    return gm, expert_targets, hidden_size, intermediate_size
+
+
+def _make_deepseek_mxfp4_raw_state(layer, num_experts, hidden_size, intermediate_size):
+    def key(expert, projection, kind):
+        return f"layers.{layer}.ffn.experts.{expert}.{projection}.{kind}"
+
+    def tensor(shape, offset):
+        numel = 1
+        for dim in shape:
+            numel *= dim
+        values = (torch.arange(numel, dtype=torch.int64) + offset) % 251
+        return values.to(torch.uint8).reshape(shape)
+
+    state = {}
+    for expert in range(num_experts):
+        for projection, weight_shape, scale_shape, offset in (
+            (
+                "w1",
+                (intermediate_size, hidden_size // 2),
+                (intermediate_size, hidden_size // 32),
+                17,
+            ),
+            (
+                "w2",
+                (hidden_size, intermediate_size // 2),
+                (hidden_size, intermediate_size // 32),
+                89,
+            ),
+            (
+                "w3",
+                (intermediate_size, hidden_size // 2),
+                (intermediate_size, hidden_size // 32),
+                151,
+            ),
+        ):
+            state[key(expert, projection, "weight")] = tensor(weight_shape, offset + expert)
+            state[key(expert, projection, "scale")] = tensor(scale_shape, offset + 31 + expert)
+    return state
+
+
 def test_stacked_mxfp4_ir_contract_rewrites_to_matching_ep_variant():
     """Stacked MXFP4 MoE sharding is schema-based and rewrites to the matching EP op."""
     base_op = _optional_auto_deploy_default("triton_mxfp4_moe")
@@ -419,8 +781,318 @@ def test_stacked_mxfp4_ir_contract_rewrites_to_matching_ep_variant():
 
     slice_nodes = _call_nodes(gm_out, torch.ops.aten.slice.Tensor)
     expert_slices = [node for node in slice_nodes if node.args[1:5] == (0, 0, 2, 1)]
-    assert len(expert_slices) == 6
+    assert len(expert_slices) == 0
+    expert_args = extract_op_args(ep_nodes[0], *_STACKED_MOE_EXPERT_ARG_NAMES)
+    assert all(getattr(arg, "op", None) == "get_attr" for arg in expert_args)
+    for name in _STACKED_MOE_EXPERT_ARG_NAMES:
+        assert getattr(gm_out, name).shape[0] == 2
     assert len(_call_nodes(gm_out, torch.ops.auto_deploy.torch_dist_all_reduce)) == 1
+
+
+def test_stacked_mxfp4_get_attr_expert_buffers_load_full_checkpoint_slices():
+    """Full checkpoint buffers are split by load hooks after physical EP sharding."""
+    base_op = _optional_auto_deploy_default("triton_mxfp4_moe")
+    if base_op is None or _optional_auto_deploy_default("triton_mxfp4_moe_ep") is None:
+        pytest.skip("MXFP4 MoE custom ops are not registered in this environment")
+
+    rank = 1
+    world_size = 2
+    gm = _make_stacked_mxfp4_graph(base_op)
+    full_state = {name: tensor.clone() for name, tensor in gm.state_dict().items()}
+    gm_out = _make_optimizer(world_size=world_size, rank=rank)(None, gm)
+
+    for name in _STACKED_MOE_EXPERT_ARG_NAMES:
+        getattr(gm_out, name).zero_()
+
+    load_result = gm_out.load_state_dict(
+        {name: tensor.clone() for name, tensor in full_state.items()}
+    )
+    assert load_result.missing_keys == []
+    assert load_result.unexpected_keys == []
+
+    start = 2
+    end = 4
+    for name in _STACKED_MOE_EXPERT_ARG_NAMES:
+        assert torch.equal(getattr(gm_out, name), full_state[name][start:end])
+
+
+def test_stacked_mxfp4_non_attr_expert_args_keep_runtime_slices():
+    """Dynamic expert tensors keep the old aten.slice runtime behavior."""
+    base_op = _optional_auto_deploy_default("triton_mxfp4_moe")
+    ep_op = _optional_auto_deploy_default("triton_mxfp4_moe_ep")
+    if base_op is None or ep_op is None:
+        pytest.skip("MXFP4 MoE custom ops are not registered in this environment")
+
+    gm = _make_stacked_mxfp4_graph(base_op, expert_args_as_attrs=False)
+    gm_out = _make_optimizer(world_size=2)(None, gm)
+    ep_nodes = _call_nodes(gm_out, ep_op)
+    assert len(ep_nodes) == 1
+
+    slice_nodes = _call_nodes(gm_out, torch.ops.aten.slice.Tensor)
+    expert_slices = [node for node in slice_nodes if node.args[1:5] == (0, 0, 2, 1)]
+    assert len(expert_slices) == 6
+    expert_args = extract_op_args(ep_nodes[0], *_STACKED_MOE_EXPERT_ARG_NAMES)
+    assert all(getattr(arg, "target", None) == torch.ops.aten.slice.Tensor for arg in expert_args)
+
+
+def test_stacked_mxfp4_rank1_deepseek_graph_pack_loads_high_expert_slice():
+    """DeepSeek graph packing emits full buffers before sharding hooks split rank 1."""
+    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
+        DeepseekV4PreTrainedModel,
+    )
+    from tensorrt_llm._torch.auto_deploy.models.quant_checkpoint_layout import (
+        PackedMxfp4ExpertsCheckpointLayout,
+    )
+
+    base_op = _optional_auto_deploy_default("triton_mxfp4_moe")
+    if base_op is None or _optional_auto_deploy_default("triton_mxfp4_moe_ep") is None:
+        pytest.skip("MXFP4 MoE custom ops are not registered in this environment")
+
+    layer = 3
+    rank = 1
+    world_size = 2
+    num_experts = 4
+    gm, expert_targets, hidden_size, intermediate_size = _make_deepseek_graph_mxfp4_graph(
+        base_op, layer=layer, num_experts=num_experts
+    )
+
+    def pack_graph_buffers(state_dict, prefix, *args):
+        del args
+        if prefix:
+            return
+        DeepseekV4PreTrainedModel._load_graph_mxfp4_runtime_buffers(gm, state_dict)
+
+    gm._register_load_state_dict_pre_hook(pack_graph_buffers)
+    raw_expert_state = _make_deepseek_mxfp4_raw_state(
+        layer, num_experts, hidden_size, intermediate_size
+    )
+    checkpoint = {
+        "router_weight": gm.router_weight.clone(),
+        "router_bias": gm.router_bias.clone(),
+        "gate_up_bias": gm.gate_up_bias.clone(),
+        "down_bias": gm.down_bias.clone(),
+        **raw_expert_state,
+    }
+
+    layout = PackedMxfp4ExpertsCheckpointLayout(
+        expert_key_pattern=(
+            r"layers\.(?P<layer>\d+)\.ffn\.experts\.(?P<expert>\d+)\."
+            r"(?P<projection>w[123])\.(?P<kind>weight|scale)"
+        ),
+        key_template="layers.{layer}.ffn.experts.{expert}.{projection}.{kind}",
+        runtime_gate_up_order=("w3", "w1"),
+        runtime_down_projection="w2",
+        expert_block_size=32,
+    )
+    expected_full = layout.pack_experts(
+        raw_expert_state,
+        layer=layer,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+    )
+
+    gm_out = _make_optimizer(world_size=world_size, rank=rank)(None, gm)
+    experts = gm_out.get_submodule(f"layers.{layer}.ffn.experts")
+    assert experts.gate_up_proj_blocks.shape[0] == num_experts // world_size
+
+    result = gm_out.load_state_dict(checkpoint)
+    assert result.missing_keys == []
+    assert result.unexpected_keys == []
+
+    lo = num_experts // world_size
+    hi = num_experts
+    assert torch.equal(
+        gm_out.get_buffer(expert_targets["gate_up_blocks"]),
+        expected_full.gate_up_blocks[lo:hi],
+    )
+    assert torch.equal(
+        gm_out.get_buffer(expert_targets["gate_up_scales"]),
+        expected_full.gate_up_scales[lo:hi],
+    )
+    assert torch.equal(
+        gm_out.get_buffer(expert_targets["down_blocks"]),
+        expected_full.down_blocks[lo:hi],
+    )
+    assert torch.equal(
+        gm_out.get_buffer(expert_targets["down_scales"]),
+        expected_full.down_scales[lo:hi],
+    )
+
+
+def test_stacked_mxfp4_rank1_deepseek_flat_graph_pack_loads_high_expert_slice():
+    """Root FX buffers are packed before sharding hooks split rank 1."""
+    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
+        DeepseekV4PreTrainedModel,
+        _deepseek_v4_packed_mxfp4_experts_layout,
+    )
+
+    base_op = _optional_auto_deploy_default("torch_mxfp4_moe_from_routing")
+    ep_op = _optional_auto_deploy_default("torch_mxfp4_moe_from_routing_ep")
+    if base_op is None or ep_op is None:
+        pytest.skip("routing-driven MXFP4 MoE custom ops are not registered in this environment")
+
+    layer = 3
+    rank = 1
+    world_size = 2
+    num_experts = 4
+    gm, expert_targets, hidden_size, intermediate_size = _make_deepseek_flat_mxfp4_routing_graph(
+        base_op, layer=layer, num_experts=num_experts
+    )
+    raw_expert_state = _make_deepseek_mxfp4_raw_state(
+        layer, num_experts, hidden_size, intermediate_size
+    )
+    layout = _deepseek_v4_packed_mxfp4_experts_layout()
+    expected_full = layout.pack_experts(
+        raw_expert_state,
+        layer=layer,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+    )
+
+    direct_state = {name: tensor.clone() for name, tensor in raw_expert_state.items()}
+    DeepseekV4PreTrainedModel._load_graph_mxfp4_runtime_buffers(gm, direct_state)
+    for target in expert_targets.values():
+        assert target in direct_state
+    dotted_targets = {
+        "gate_up_blocks": f"layers.{layer}.ffn.experts.gate_up_proj_blocks",
+        "gate_up_scales": f"layers.{layer}.ffn.experts.gate_up_proj_scales",
+        "down_blocks": f"layers.{layer}.ffn.experts.down_proj_blocks",
+        "down_scales": f"layers.{layer}.ffn.experts.down_proj_scales",
+    }
+    for target in dotted_targets.values():
+        assert target not in direct_state
+    assert not any(name in direct_state for name in raw_expert_state)
+    assert torch.equal(direct_state[expert_targets["gate_up_blocks"]], expected_full.gate_up_blocks)
+    assert torch.equal(direct_state[expert_targets["gate_up_scales"]], expected_full.gate_up_scales)
+    assert torch.equal(direct_state[expert_targets["down_blocks"]], expected_full.down_blocks)
+    assert torch.equal(direct_state[expert_targets["down_scales"]], expected_full.down_scales)
+
+    def pack_graph_buffers(state_dict, prefix, *args):
+        del args
+        if prefix:
+            return
+        DeepseekV4PreTrainedModel._load_graph_mxfp4_runtime_buffers(gm, state_dict)
+
+    gm._register_load_state_dict_pre_hook(pack_graph_buffers)
+    checkpoint = {
+        "selected_experts": gm.selected_experts.clone(),
+        "routing_weights": gm.routing_weights.clone(),
+        "gate_up_bias": gm.gate_up_bias.clone(),
+        "down_bias": gm.down_bias.clone(),
+        **raw_expert_state,
+    }
+
+    gm_out = _make_optimizer(world_size=world_size, rank=rank)(None, gm)
+    assert gm_out.get_buffer(expert_targets["gate_up_blocks"]).shape[0] == (
+        num_experts // world_size
+    )
+
+    result = gm_out.load_state_dict(checkpoint)
+    assert result.missing_keys == []
+    assert result.unexpected_keys == []
+
+    lo = num_experts // world_size
+    hi = num_experts
+    assert torch.equal(
+        gm_out.get_buffer(expert_targets["gate_up_blocks"]),
+        expected_full.gate_up_blocks[lo:hi],
+    )
+    assert torch.equal(
+        gm_out.get_buffer(expert_targets["gate_up_scales"]),
+        expected_full.gate_up_scales[lo:hi],
+    )
+    assert torch.equal(
+        gm_out.get_buffer(expert_targets["down_blocks"]),
+        expected_full.down_blocks[lo:hi],
+    )
+    assert torch.equal(
+        gm_out.get_buffer(expert_targets["down_scales"]),
+        expected_full.down_scales[lo:hi],
+    )
+
+
+def test_stacked_mxfp4_deepseek_flat_graph_loads_production_shaped_rank7_slice():
+    """Root FX buffers load the final EP slice for 256-expert routing-driven graphs."""
+    from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
+        DeepseekV4PreTrainedModel,
+        _deepseek_v4_packed_mxfp4_experts_layout,
+    )
+
+    base_op = _optional_auto_deploy_default("torch_mxfp4_moe_from_routing")
+    ep_op = _optional_auto_deploy_default("torch_mxfp4_moe_from_routing_ep")
+    if base_op is None or ep_op is None:
+        pytest.skip("routing-driven MXFP4 MoE custom ops are not registered in this environment")
+
+    layer = 3
+    rank = 7
+    world_size = 8
+    num_experts = 256
+    gm, expert_targets, hidden_size, intermediate_size = _make_deepseek_flat_mxfp4_routing_graph(
+        base_op, layer=layer, num_experts=num_experts
+    )
+    raw_expert_state = _make_deepseek_mxfp4_raw_state(
+        layer, num_experts, hidden_size, intermediate_size
+    )
+    layout = _deepseek_v4_packed_mxfp4_experts_layout()
+    expected_full = layout.pack_experts(
+        raw_expert_state,
+        layer=layer,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+    )
+
+    def pack_graph_buffers(state_dict, prefix, *args):
+        del args
+        if prefix:
+            return
+        DeepseekV4PreTrainedModel._load_graph_mxfp4_runtime_buffers(gm, state_dict)
+
+    gm._register_load_state_dict_pre_hook(pack_graph_buffers)
+    checkpoint = {
+        "selected_experts": gm.selected_experts.clone(),
+        "routing_weights": gm.routing_weights.clone(),
+        "gate_up_bias": gm.gate_up_bias.clone(),
+        "down_bias": gm.down_bias.clone(),
+        **raw_expert_state,
+    }
+
+    gm_out = _make_optimizer(world_size=world_size, rank=rank)(None, gm)
+    ep_nodes = _call_nodes(gm_out, ep_op)
+    assert len(ep_nodes) == 1
+    [expert_start] = extract_op_args(ep_nodes[0], "expert_start")
+    assert expert_start == 224
+
+    local_experts = num_experts // world_size
+    for target in expert_targets.values():
+        local_buffer = gm_out.get_buffer(target)
+        assert local_buffer.shape[0] == local_experts
+        local_buffer.zero_()
+
+    result = gm_out.load_state_dict(checkpoint)
+    assert result.missing_keys == []
+    assert result.unexpected_keys == []
+
+    lo = expert_start
+    hi = num_experts
+    assert torch.equal(
+        gm_out.get_buffer(expert_targets["gate_up_blocks"]),
+        expected_full.gate_up_blocks[lo:hi],
+    )
+    assert torch.equal(
+        gm_out.get_buffer(expert_targets["gate_up_scales"]),
+        expected_full.gate_up_scales[lo:hi],
+    )
+    assert torch.equal(
+        gm_out.get_buffer(expert_targets["down_blocks"]),
+        expected_full.down_blocks[lo:hi],
+    )
+    assert torch.equal(
+        gm_out.get_buffer(expert_targets["down_scales"]),
+        expected_full.down_scales[lo:hi],
+    )
 
 
 def test_stacked_mxfp4_routing_driven_ir_contract_rewrites_to_matching_ep_variant():
@@ -465,5 +1137,25 @@ def test_stacked_mxfp4_routing_driven_ir_contract_rewrites_to_matching_ep_varian
 
     slice_nodes = _call_nodes(gm_out, torch.ops.aten.slice.Tensor)
     expert_slices = [node for node in slice_nodes if node.args[1:5] == (0, 0, 2, 1)]
-    assert len(expert_slices) == 6
+    assert len(expert_slices) == 0
+    expert_args = extract_op_args(ep_nodes[0], *_STACKED_MOE_EXPERT_ARG_NAMES)
+    assert all(getattr(arg, "op", None) == "get_attr" for arg in expert_args)
     assert len(_call_nodes(gm_out, torch.ops.auto_deploy.torch_dist_all_reduce)) == 1
+
+
+def test_stacked_mxfp4_routing_driven_rank1_preserves_expert_start_with_torch_backend():
+    """Rank 1 routing-driven MXFP4 EP rewrite keeps expert_start and torch all_reduce."""
+    base_op = _optional_auto_deploy_default("torch_mxfp4_moe_from_routing")
+    ep_op = _optional_auto_deploy_default("torch_mxfp4_moe_from_routing_ep")
+    if base_op is None or ep_op is None:
+        pytest.skip("routing-driven MXFP4 MoE custom ops are not registered in this environment")
+
+    gm = _make_stacked_mxfp4_graph(base_op, routing_driven=True, include_optionals=True)
+    gm_out = _make_optimizer(world_size=2, rank=1, dist_backend="torch")(None, gm)
+
+    ep_nodes = _call_nodes(gm_out, ep_op)
+    assert len(ep_nodes) == 1
+    [expert_start] = extract_op_args(ep_nodes[0], "expert_start")
+    assert expert_start == 2
+    assert len(_call_nodes(gm_out, torch.ops.auto_deploy.torch_dist_all_reduce.default)) == 1
+    assert len(_call_nodes(gm_out, torch.ops.auto_deploy.trtllm_dist_all_reduce.default)) == 0

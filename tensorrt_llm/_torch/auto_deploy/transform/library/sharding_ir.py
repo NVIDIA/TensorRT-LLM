@@ -27,7 +27,7 @@ for background.
 import operator
 from abc import ABC, abstractmethod
 from functools import partial
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Type
+from typing import Any, Dict, List, Literal, NamedTuple, Optional, Tuple, Type
 
 import torch
 from pydantic import Field, field_validator
@@ -46,6 +46,7 @@ from ...utils.node_utils import (
     _get_op_schema,
     extract_op_args,
     extract_weight_nodes,
+    get_param_or_buffer,
     invalidate_weight_node_cache,
     is_any_lin_op,
     set_op_args,
@@ -177,6 +178,80 @@ def _replicate_rowwise_bias(bn: WeightNode, rank: int) -> None:
         partial(_rowwise_bias_load_hook, rank=rank, param_key=pname)
     )
     setattr(bn.submod, pname, torch.nn.Parameter(new_bias.detach().clone(), requires_grad=False))
+
+
+def _assert_divisible(value: int, divisor: int, msg: str) -> None:
+    assert value % divisor == 0, f"{msg}: {value} is not divisible by {divisor}"
+
+
+def _contiguous_partition(total: int, world_size: int, rank: int) -> Tuple[int, int]:
+    _assert_divisible(total, world_size, "contiguous partition")
+    part = total // world_size
+    return rank * part, (rank + 1) * part
+
+
+def _split_flattened_groups(
+    tensor: torch.Tensor,
+    *,
+    num_groups: int,
+    rank: int,
+    world_size: int,
+) -> torch.Tensor:
+    """Split a row-major ``[num_groups * rows_per_group, ...]`` tensor by group."""
+    _assert_divisible(num_groups, world_size, "group count")
+    _assert_divisible(int(tensor.shape[0]), num_groups, "flattened grouped rows")
+    group_lo, group_hi = _contiguous_partition(num_groups, world_size, rank)
+    rows_per_group = int(tensor.shape[0]) // num_groups
+    grouped = tensor.reshape(num_groups, rows_per_group, *tensor.shape[1:])
+    return grouped[group_lo:group_hi].reshape(-1, *tensor.shape[1:]).contiguous()
+
+
+def _split_grouped_fp8_scale(
+    tensor: torch.Tensor,
+    *,
+    num_groups: int,
+    rank: int,
+    world_size: int,
+) -> torch.Tensor:
+    if int(tensor.shape[0]) % num_groups == 0:
+        return _split_flattened_groups(
+            tensor,
+            num_groups=num_groups,
+            rank=rank,
+            world_size=world_size,
+        )
+    return _split_fp8_block_scale(tensor, dim=0, rank=rank, world_size=world_size)
+
+
+def _slice_group_range(tensor: torch.Tensor, group_lo: int, group_hi: int) -> torch.Tensor:
+    return tensor[group_lo:group_hi].contiguous()
+
+
+def _get_attr_tensor(gm: GraphModule, node: Node, arg_name: str) -> Tuple[str, torch.Tensor]:
+    assert isinstance(node, Node) and node.op == "get_attr" and isinstance(node.target, str), (
+        f"Expected {arg_name} to be a get_attr node, got {node!r}"
+    )
+    return node.target, get_param_or_buffer(node.target, gm)
+
+
+def _weight_node_from_attr(gm: GraphModule, node: Node, tensor: torch.Tensor) -> WeightNode:
+    node_key = str(node.target)
+    return WeightNode(
+        node=node,
+        node_key=node_key,
+        tensor=tensor,
+        submod=gm.get_submodule(node_key.rpartition(".")[0]),
+    )
+
+
+def _set_node_meta_shape(node: Node, new_shape: Tuple[int, ...]) -> None:
+    meta_val = node.meta.get("val")
+    if isinstance(meta_val, torch.Tensor):
+        node.meta["val"] = torch.empty(
+            new_shape,
+            dtype=meta_val.dtype,
+            device=meta_val.device,
+        )
 
 
 _SHARDING_HINT_NAMES = frozenset(
@@ -420,6 +495,133 @@ class FineGrainedFP8LinearShardableNode(LinearShardableNode):
             )
 
 
+@ShardableNode.register(torch.ops.auto_deploy.torch_fake_quant_grouped_finegrained_fp8_linear)
+class GroupedFineGrainedFP8LinearShardableNode(ShardableNode):
+    """Grouped FineGrained FP8 linear: shard by whole output group boundaries."""
+
+    @staticmethod
+    def _input_is_tp_scaled_group_view(input_node: Node, group_dim: int) -> bool:
+        if not (
+            isinstance(input_node, Node)
+            and input_node.op == "call_function"
+            and input_node.target == torch.ops.auto_deploy.view.default
+        ):
+            return False
+
+        [tp_scaled_dim, view_shape] = extract_op_args(input_node, "tp_scaled_dim", "shape")
+        if tp_scaled_dim == -1:
+            return False
+        if tp_scaled_dim < 0:
+            tp_scaled_dim = len(view_shape) + tp_scaled_dim
+        return tp_scaled_dim == group_dim
+
+    def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
+        if dc.tp_size <= 1:
+            return 0
+
+        [input_node, weight_node, bias_node, weight_scale, tp_min_local_shape] = extract_op_args(
+            self.node,
+            "input",
+            "weight_quantized",
+            "bias",
+            "weight_scale",
+            "tp_min_local_shape",
+        )
+        assert isinstance(weight_scale, (list, tuple)) and len(weight_scale) == 1, (
+            "Grouped FineGrained FP8 linear expects a single weight_scale_inv tensor."
+        )
+        scale_node = weight_scale[0]
+        weight_name, weight_tensor = _get_attr_tensor(gm, weight_node, "weight_quantized")
+        _, scale_tensor = _get_attr_tensor(gm, scale_node, "weight_scale")
+
+        rank = int(tp_min_local_shape) if tp_min_local_shape else 1
+        _assert_divisible(int(weight_tensor.shape[0]), rank, "grouped FP8 weight rows")
+        num_groups = int(weight_tensor.shape[0]) // rank
+        _assert_divisible(num_groups, dc.tp_size, "grouped FP8 output groups")
+        local_groups = num_groups // dc.tp_size
+        group_lo, group_hi = _contiguous_partition(num_groups, dc.tp_size, dc.tp_rank)
+
+        input_shape = shape(input_node)
+        assert input_shape is not None and len(input_shape) >= 2, (
+            f"Cannot determine grouped FP8 input shape for node {self.node.name}."
+        )
+        group_dim = len(input_shape) - 2
+        observed_groups = int(input_shape[group_dim])
+        assert observed_groups in (num_groups, local_groups), (
+            "Grouped FineGrained FP8 input group count must match either global groups "
+            f"({num_groups}) or TP-local groups ({local_groups}), got {observed_groups}."
+        )
+
+        split_groups = partial(
+            _split_flattened_groups,
+            num_groups=num_groups,
+            rank=dc.tp_rank,
+            world_size=dc.tp_size,
+        )
+        shard_weight_tensor(
+            gm=gm,
+            weight_tensor=weight_tensor,
+            param_key=weight_name,
+            dim=SplitDimension.COLUMN,
+            rank=dc.tp_rank,
+            world_size=dc.tp_size,
+            custom_shard_fn=split_groups,
+        )
+
+        if isinstance(bias_node, Node):
+            bias_name, bias_tensor = _get_attr_tensor(gm, bias_node, "bias")
+            bias_split = (
+                split_groups
+                if bias_tensor.ndim == 1
+                else partial(_slice_group_range, group_lo=group_lo, group_hi=group_hi)
+            )
+            shard_weight_tensor(
+                gm=gm,
+                weight_tensor=bias_tensor,
+                param_key=bias_name,
+                dim=SplitDimension.COLUMN,
+                rank=dc.tp_rank,
+                world_size=dc.tp_size,
+                custom_shard_fn=bias_split,
+            )
+
+        scale_split = partial(
+            _split_grouped_fp8_scale,
+            num_groups=num_groups,
+            rank=dc.tp_rank,
+            world_size=dc.tp_size,
+        )
+        scale_weight_node = _weight_node_from_attr(gm, scale_node, scale_tensor)
+        _shard_scale_and_hook(gm, scale_weight_node, scale_split(scale_tensor), scale_split)
+
+        view_localizes_groups = self._input_is_tp_scaled_group_view(input_node, group_dim)
+        if view_localizes_groups:
+            local_input_shape = list(input_shape)
+            local_input_shape[group_dim] = local_groups
+            _set_node_meta_shape(input_node, tuple(local_input_shape))
+        elif observed_groups == num_groups:
+            with gm.graph.inserting_before(self.node):
+                local_input = gm.graph.call_function(
+                    torch.ops.aten.slice.Tensor,
+                    args=(input_node, group_dim, group_lo, group_hi, 1),
+                )
+            local_shape = list(input_shape)
+            local_shape[group_dim] = local_groups
+            _set_node_meta_shape(local_input, tuple(local_shape))
+            set_op_args(self.node, input=local_input)
+
+        output_shape = shape(self.node)
+        if output_shape is not None:
+            local_output_shape = list(output_shape)
+            local_output_shape[-1] = local_groups * rank
+            _set_node_meta_shape(self.node, tuple(local_output_shape))
+
+        ad_logger.debug(
+            f"  sharded grouped FP8 linear groups [{group_lo}:{group_hi}] / {num_groups}"
+        )
+        return 1
+
+
 @ShardableNode.register(
     torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear,
     torch.ops.auto_deploy.torch_quant_nvfp4_linear,
@@ -568,7 +770,7 @@ class AllReduceShardableNode(ShardableNode):
         if dc.tp_size <= 1:
             return 0
 
-        _, all_reduce_op = _get_dist_ops("auto")
+        _, all_reduce_op = _get_dist_ops(dc.dist_backend)
         [x] = extract_op_args(self.node, "x")
         self.node.target = all_reduce_op
         self.node.args = (x, dc.allreduce_strategy)
@@ -959,7 +1161,7 @@ class MoEShardableNode(ShardableNode):
             self._localize_expert_indices(
                 gm, selected_experts, routing_weights, experts_per_rank, ep_rank, ep_size
             )
-            _, all_reduce_op = _get_dist_ops("auto")
+            _, all_reduce_op = _get_dist_ops(dc.dist_backend)
             with gm.graph.inserting_after(self.node):
                 red = gm.graph.call_function(
                     all_reduce_op,
@@ -1173,6 +1375,54 @@ class StackedMoEShardableNode(ShardableNode):
             )
         return topology_args
 
+    @staticmethod
+    def _slice_experts(tensor: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
+        return tensor[lo:hi]
+
+    @classmethod
+    def _shard_get_attr_expert_arg(cls, gm: GraphModule, arg: Node, lo: int, hi: int) -> Node:
+        mod_name, _, attr_name = arg.target.rpartition(".")
+        submod = gm.get_submodule(mod_name)
+        tensor = getattr(submod, attr_name)
+        local_tensor = cls._slice_experts(tensor, lo, hi).detach().clone()
+
+        if attr_name in submod._buffers:
+            persistent = attr_name not in submod._non_persistent_buffers_set
+            submod.register_buffer(attr_name, local_tensor, persistent=persistent)
+        elif attr_name in submod._parameters:
+            requires_grad = submod._parameters[attr_name].requires_grad
+            setattr(
+                submod,
+                attr_name,
+                torch.nn.Parameter(local_tensor, requires_grad=requires_grad),
+            )
+        else:
+            setattr(submod, attr_name, local_tensor)
+
+        arg.meta["val"] = local_tensor
+        f_split = partial(cls._slice_experts, lo=lo, hi=hi)
+        submod._register_load_state_dict_pre_hook(
+            partial(
+                _load_hook,
+                f_split=f_split,
+                param_key=attr_name,
+                param_shape=local_tensor.shape,
+            )
+        )
+        invalidate_weight_node_cache(gm)
+        return arg
+
+    @classmethod
+    def _local_expert_arg(cls, gm: GraphModule, node: Node, arg: Any, lo: int, hi: int) -> Any:
+        if isinstance(arg, Node) and arg.op == "get_attr":
+            return cls._shard_get_attr_expert_arg(gm, arg, lo, hi)
+
+        with gm.graph.inserting_before(node):
+            return gm.graph.call_function(
+                torch.ops.aten.slice.Tensor,
+                args=(arg, 0, lo, hi, 1),
+            )
+
     def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
         ep_size = dc.moe_ep_size
         ep_rank = dc.moe_ep_rank
@@ -1201,11 +1451,7 @@ class StackedMoEShardableNode(ShardableNode):
 
         sliced_expert_args = {}
         for arg_name, arg in zip(schema.expert_arg_names, expert_args):
-            with gm.graph.inserting_before(self.node):
-                sliced_expert_args[arg_name] = gm.graph.call_function(
-                    torch.ops.aten.slice.Tensor,
-                    args=(arg, 0, lo, hi, 1),
-                )
+            sliced_expert_args[arg_name] = self._local_expert_arg(gm, self.node, arg, lo, hi)
         set_op_args(self.node, **sliced_expert_args)
 
         args = list(self.node.args)
@@ -1231,7 +1477,7 @@ class StackedMoEShardableNode(ShardableNode):
             ),
         )
 
-        _, all_reduce_op = _get_dist_ops("auto")
+        _, all_reduce_op = _get_dist_ops(dc.dist_backend)
         with gm.graph.inserting_after(self.node):
             red = gm.graph.call_function(
                 all_reduce_op,
@@ -1299,6 +1545,7 @@ class IRShardingConfig(TransformConfig):
         "lm_head vocab projection, which the hint-driven sharder would otherwise replicate.",
     )
     enable_attention_dp: bool = Field(default=False)
+    dist_backend: Literal["auto", "torch", "trtllm"] = Field(default="auto")
     dist_mapping: dict[str, int] = Field(default_factory=dict)
     dist_config: DistConfig = Field(default_factory=DistConfig)
 
@@ -1322,6 +1569,7 @@ class IRShardingConfig(TransformConfig):
             dist_mapping=self.dist_mapping,
             enable_attention_dp=self.enable_attention_dp,
             allreduce_strategy=self.allreduce_strategy.name,
+            dist_backend=self.dist_backend,
         )
 
 
@@ -1336,7 +1584,7 @@ def _log_sharding_prelude(dc: DistConfig) -> None:
     ad_logger.info(
         f"apply_sharding_hints{skip}: tp_size={dc.tp_size}, tp_rank={dc.tp_rank}, "
         f"moe grid: [ep x tp] = [{dc.moe_ep_size} x {dc.moe_tp_size}], "
-        f"strategy={dc.allreduce_strategy}"
+        f"strategy={dc.allreduce_strategy}, backend={dc.dist_backend}"
     )
 
 
@@ -1494,6 +1742,7 @@ class ApplyShardingHints(BaseTransform):
             self.config._init_dist_config(shared_config.local_rank, shared_config.world_size)
 
         dc = self.config.dist_config
+        dc.dist_backend = self.config.dist_backend
         _log_sharding_prelude(dc)
 
         if shared_config.world_size < 2:
