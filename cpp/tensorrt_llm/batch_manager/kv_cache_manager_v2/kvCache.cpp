@@ -90,6 +90,7 @@ KvCache::KvCache(KvCacheManager& manager, std::optional<int64_t> loraTaskId, std
 
     mManager->registerKvCache(this);
     mManager->updateAvgReusedLength(static_cast<double>(mHistoryLength));
+    assert(gNdebug || _checkSanity());
 }
 
 KvCache::~KvCache()
@@ -385,6 +386,7 @@ bool KvCache::resume(std::optional<CUstream> stream)
 void KvCache::suspend()
 {
     assert(mStatus == Status::ACTIVE);
+    assert(_checkSanity());
 
     // Copy data from external buffers back to internal vectors (mirrors Python's suspend).
     for (int bi = 0; bi < mBeamWidth; ++bi)
@@ -426,10 +428,12 @@ void KvCache::suspend()
 
 void KvCache::close()
 {
+    assert(gNdebug || _checkSanity());
     if (mStatus == Status::CLOSED)
         return;
 
     stopCommitting();
+    assert(gNdebug || _checkSanity());
 
     mManager->updateAvgSqrCapacity(mAvgCapacity.value() * mAvgCapacity.value());
     mManager->updateAvgSqrHistoryLength(mAvgHistoryLength.value() * mAvgHistoryLength.value());
@@ -562,6 +566,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
     mHistoryLength = newHist;
 
     _evictOutOfWindowBlocks(newHist);
+    assert(gNdebug || _checkSanity());
     return true;
 }
 
@@ -1038,6 +1043,7 @@ void KvCache::stopCommitting()
 {
     if (mCommitState == CommitState::USER_STOP)
         return;
+    assert(gNdebug || _checkSanity());
 
     // Mirrors Python's stop_committing() which calls _commit_block(ordinal, True).
     if (mCommitState == CommitState::VIRTUAL_STOP)
@@ -1096,6 +1102,7 @@ void KvCache::_onStopCommitting()
             }
         }
     }
+    assert(gNdebug || _checkSanity());
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,18 +1127,6 @@ void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
 
     auto hasPage = [](Block const& blk, LifeCycleId lcId) -> bool
     { return !blk.storage.at(static_cast<size_t>(lcId)).expired(); };
-
-    // Helper: find first index where predicate is true (like Python's find_index).
-    auto findIndex = [](auto begin, auto end, auto pred) -> int
-    {
-        int idx = 0;
-        for (auto it = begin; it != end; ++it, ++idx)
-        {
-            if (pred(*it))
-                return idx;
-        }
-        return idx;
-    };
 
     // Use attentionLifeCycles() for full-attention and SWA checks.
     auto attnLcs = lifeCycles.attentionLifeCycles();
@@ -1299,6 +1294,84 @@ void KvCache::_setupForReuse(std::vector<TokenIdExt> const& inputTokens)
     mNumCommittedBlocks = numTokens / mTokensPerBlock;
     mHistoryLength = numTokens;
     mCapacity = numTokens;
+}
+
+// ---------------------------------------------------------------------------
+// _checkSanity — comprehensive invariant check.
+// Mirrors Python's _check_sanity().
+// ---------------------------------------------------------------------------
+
+bool KvCache::_checkSanity() const
+{
+    if (mStatus == Status::CLOSED)
+        return numBlocks() == 0;
+
+    assert(numCommittedTokens() <= mHistoryLength && mHistoryLength <= mCapacity);
+    assert(numBlocks() == divUp(mCapacity, mTokensPerBlock));
+
+    auto const& lcs = mManager->lifeCycles();
+    int numLc = mManager->storage().numLifeCycles();
+    auto ssmLcId = lcs.ssmLifeCycleId();
+
+    // Precompute stale ranges for each lifecycle.
+    std::vector<HalfOpenRange> staleRanges(static_cast<size_t>(numLc));
+    for (int lc = 0; lc < numLc; ++lc)
+    {
+        auto const& lifecycle = lcs.getLifeCycle(static_cast<LifeCycleId>(lc));
+        staleRanges[lc] = _getStaleRange(mHistoryLength, lifecycle);
+    }
+
+    for (int ordinal = 0; ordinal < numBlocks(); ++ordinal)
+    {
+        auto const& block = mBlocks[static_cast<size_t>(ordinal)];
+        bool isCommitted = ordinal < mNumCommittedBlocks;
+        assert(isCommitted == block.isCommitted());
+
+        for (auto const& beamBlock : block.pages)
+        {
+            assert(static_cast<int>(beamBlock.size()) == numLc);
+            for (int lc = 0; lc < numLc; ++lc)
+            {
+                auto const& bp = beamBlock[lc];
+                if (ssmLcId.has_value() && lc == *ssmLcId)
+                {
+                    // SSM pages live in mSsmBlocks, not in mBlocks.
+                    assert(blockPageIsNull(bp));
+                    continue;
+                }
+
+                auto const& staleRange = staleRanges[lc];
+                if (staleRange.beg <= ordinal && ordinal < staleRange.end)
+                {
+                    if (isCommitted || mCommitState != CommitState::ALLOWED)
+                    {
+                        assert(blockPageIsNull(bp));
+                    }
+                    else
+                    {
+                        // For the decoder-side disagg case, for the first step, we will skip the
+                        // out-of-window blocks.
+                        assert(std::holds_alternative<std::shared_ptr<PageHolder>>(bp)
+                            || (blockPageIsNull(bp) && mCommittedTokens.empty()));
+                    }
+                }
+                else
+                {
+                    if (mStatus == Status::ACTIVE)
+                        assert(std::holds_alternative<SharedPageLock>(bp));
+                    else
+                        assert(std::holds_alternative<std::shared_ptr<PageHolder>>(bp));
+                }
+
+                if (!blockPageIsNull(bp))
+                {
+                    auto page = blockPageGetPage(bp);
+                    assert(isCommitted == (std::dynamic_pointer_cast<CommittedPage>(page) != nullptr));
+                }
+            }
+        }
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------

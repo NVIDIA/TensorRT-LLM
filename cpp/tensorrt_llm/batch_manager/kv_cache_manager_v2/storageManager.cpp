@@ -107,18 +107,6 @@ std::vector<std::vector<int>> computeSlotToPageIndices(StorageConfig const& conf
 // StorageManager
 // ---------------------------------------------------------------------------
 
-// Normalize a vector of values to a ratio vector summing to 1.0.
-template <typename T>
-static std::vector<float> normalizeToRatio(std::vector<T> const& values)
-{
-    auto total = std::accumulate(values.begin(), values.end(), static_cast<T>(0));
-    assert(total > 0);
-    std::vector<float> ratio(values.size());
-    for (size_t i = 0; i < values.size(); ++i)
-        ratio[i] = static_cast<float>(values[i]) / static_cast<float>(total);
-    return ratio;
-}
-
 StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfig const& config, int tokensPerBlock,
     std::optional<BatchDesc> const& typicalBatch, std::vector<BatchDesc> const& constraints)
     : mLifeCycles(lifeCycles)
@@ -384,14 +372,10 @@ void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, Cac
         int fallenHeld = 0;
         if (isLast)
         {
-            // Separate held pages from fallen_pages. Python remove_if is stable,
-            // and last-level acceptance takes pages from the tail below.
+            // Separate held pages from fallen_pages (mirrors Python's remove_if).
             auto& fp = fallenPages.at(static_cast<size_t>(pg));
-            auto it = std::stable_partition(
-                fp.begin(), fp.end(), [](std::shared_ptr<Page> const& p) { return p->status() != PageStatus::HELD; });
-            for (auto jt = it; jt != fp.end(); ++jt)
-                heldPages.at(static_cast<size_t>(pg)).push_back(*jt);
-            fp.erase(it, fp.end());
+            heldPages.at(static_cast<size_t>(pg))
+                = stealIf(fp, [](std::shared_ptr<Page> const& p) { return p->status() == PageStatus::HELD; });
             fallenHeld = static_cast<int>(heldPages.at(static_cast<size_t>(pg)).size());
 
             if (fallenHeld > oldFree + evictable)
@@ -460,10 +444,9 @@ void StorageManager::_prepareFreeSlots(std::vector<std::vector<int>>& goals, Cac
     // Migrate accepted pages into lvlId.
     for (int pg = 0; pg < numPoolGroups(); ++pg)
     {
-        // Group by source level.
-        std::map<CacheLevel, std::vector<std::shared_ptr<Page>>> bySrcLevel;
-        for (auto const& p : acceptedPages.at(static_cast<size_t>(pg)))
-            bySrcLevel[p->cacheLevel].push_back(p);
+        // Group by source level (mirrors Python's partition()).
+        auto bySrcLevel = partition(
+            acceptedPages.at(static_cast<size_t>(pg)), [](std::shared_ptr<Page> const& p) { return p->cacheLevel; });
 
         for (auto& [srcLvl, pages] : bySrcLevel)
         {

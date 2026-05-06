@@ -21,6 +21,8 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <numeric>
 #include <stdexcept>
 #include <vector>
 
@@ -82,6 +84,54 @@ template <typename Range, typename Func>
     auto result = func(*it);
     assert(std::all_of(range.begin(), range.end(), [&](auto const& item) { return func(item) == result; }));
     return result;
+}
+
+// Find the first index in [begin, end) where predicate is true.
+// Returns distance(begin, end) if not found.
+// Mirrors Python's find_index(_utils.py:366).
+template <typename Iter, typename Pred>
+[[nodiscard]] int findIndex(Iter begin, Iter end, Pred pred)
+{
+    return static_cast<int>(std::distance(begin, std::find_if(begin, end, pred)));
+}
+
+// Steal items matching predicate from the container and return them (stable).
+// Mirrors Python's remove_if(_utils.py:174).
+template <typename T, typename Pred>
+std::vector<T> stealIf(std::vector<T>& original, Pred pred)
+{
+    std::vector<T> removed;
+    auto it = std::stable_partition(original.begin(), original.end(), [&](T const& item) { return !pred(item); });
+    for (auto jt = it; jt != original.end(); ++jt)
+        removed.push_back(std::move(*jt));
+    original.erase(it, original.end());
+    return removed;
+}
+
+// Group items by a classifier function, returning a map of key → vector of items.
+// Mirrors Python's partition(_utils.py:195).
+template <typename T, typename Classifier>
+auto partition(std::vector<T> const& items, Classifier classifier)
+    -> std::map<decltype(classifier(std::declval<T const&>())), std::vector<T>>
+{
+    using Key = decltype(classifier(std::declval<T const&>()));
+    std::map<Key, std::vector<T>> result;
+    for (auto const& item : items)
+        result[classifier(item)].push_back(item);
+    return result;
+}
+
+// Normalize a vector of values to a ratio vector summing to 1.0.
+// Mirrors Python's typed_map(values, lambda x: x / total).
+template <typename T>
+[[nodiscard]] std::vector<float> normalizeToRatio(std::vector<T> const& values)
+{
+    auto total = std::accumulate(values.begin(), values.end(), static_cast<T>(0));
+    assert(total > 0);
+    std::vector<float> ratio(values.size());
+    for (size_t i = 0; i < values.size(); ++i)
+        ratio[i] = static_cast<float>(values[i]) / static_cast<float>(total);
+    return ratio;
 }
 
 // ---------------------------------------------------------------------------
