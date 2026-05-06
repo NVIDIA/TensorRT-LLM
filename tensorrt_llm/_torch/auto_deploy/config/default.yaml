@@ -191,6 +191,14 @@ transforms:
   fuse_finegrained_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
+  # V4 (gpt-oss): rewrite triton_mxfp4_moe -> trtllm-gen MXFP4 MoE
+  # (auto_deploy::trtllm_mxfp4_w4a16_moe_fused). Disabled by default;
+  # enable via per-model YAML to swap MXFP4 MoE onto TRT-LLM-Gen's
+  # bf16_mxe2m1_block_scale_moe_runner.
+  quantize_mxfp4_moe_trtllm_gen:
+    stage: post_load_fusion
+    expect_mem_change: true
+    enabled: false
   fuse_moe:
     stage: post_load_fusion
     expect_mem_change: true
