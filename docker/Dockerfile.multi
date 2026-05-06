@@ -54,7 +54,7 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
 # Install constraints after install.sh so cleanup() doesn't delete the file mid-RUN
 COPY constraints.txt /tmp/constraints.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 install --no-cache-dir -r /tmp/constraints.txt && \
+    pip3 install -r /tmp/constraints.txt && \
     rm /tmp/constraints.txt
 
 # Install UCX, NIXL, etcd
