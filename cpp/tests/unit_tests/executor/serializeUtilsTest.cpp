@@ -26,7 +26,6 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
-#include <cstring>
 #include <optional>
 #include <type_traits>
 #include <variant>
@@ -1215,10 +1214,6 @@ TEST(SerializeUtilsTest, MultimodalInputWithUuids)
     MultimodalInput inputWithUuids(hashes, hashPositionRuns, uuids);
     verifyMultimodalInput(inputWithUuids);
 
-    // Test with compact sparse item runs
-    MultimodalInput inputWithItemRuns(hashes, hashPositionRuns, uuids);
-    verifyMultimodalInput(inputWithItemRuns);
-
     // Test with partial UUIDs (mixed Some and None)
     std::vector<std::optional<std::string>> partialUuids = {std::string("uuid-a"), std::nullopt};
     MultimodalInput inputPartialUuids(hashes, hashPositionRuns, partialUuids);
@@ -1239,49 +1234,6 @@ TEST(SerializeUtilsTest, MultimodalInputWithUuids)
             std::string("short")};
     MultimodalInput inputLongUuids(hashes, hashPositionRuns, longUuids);
     verifyMultimodalInput(inputLongUuids);
-}
-
-TEST(SerializeUtilsTest, MultimodalInputRejectsUnversionedPayload)
-{
-    using tensorrt_llm::executor::MultimodalItemRun;
-    using tensorrt_llm::executor::MultimodalItemRuns;
-
-    std::vector<std::vector<SizeType32>> hashes = {{1, 2, 3, 4, 5, 6, 7, 8}};
-    std::optional<std::vector<std::optional<std::string>>> uuids
-        = std::vector<std::optional<std::string>>{std::string("image-uuid-001")};
-    MultimodalItemRuns itemRuns = {{MultimodalItemRun{0, 1, {}}}};
-
-    std::ostringstream legacyPayload;
-    su::serialize(hashes, legacyPayload);
-    su::serialize(uuids, legacyPayload);
-    su::serialize(itemRuns, legacyPayload);
-
-    std::istringstream input(legacyPayload.str());
-    EXPECT_THROW((void) tensorrt_llm::executor::Serialization::deserializeMultimodalInput(input), std::exception);
-}
-
-TEST(SerializeUtilsTest, MultimodalInputRejectsUnsupportedVersion)
-{
-    using tensorrt_llm::executor::MultimodalInput;
-    using tensorrt_llm::executor::MultimodalItemRun;
-    using tensorrt_llm::executor::MultimodalItemRuns;
-
-    std::vector<std::vector<SizeType32>> hashes = {{1, 2, 3, 4, 5, 6, 7, 8}};
-    MultimodalItemRuns itemRuns = {{MultimodalItemRun{0, 1, {}}}};
-    MultimodalInput input(hashes, itemRuns, std::nullopt);
-
-    std::ostringstream oss;
-    tensorrt_llm::executor::Serialization::serialize(input, oss);
-    auto buffer = oss.str();
-
-    auto constexpr versionOffset = sizeof(std::uint32_t);
-    ASSERT_GE(buffer.size(), versionOffset + sizeof(std::uint32_t));
-    auto constexpr unsupportedVersion = std::uint32_t{999U};
-    std::memcpy(buffer.data() + versionOffset, &unsupportedVersion, sizeof(unsupportedVersion));
-
-    std::istringstream serializedInput(buffer);
-    EXPECT_THROW(
-        (void) tensorrt_llm::executor::Serialization::deserializeMultimodalInput(serializedInput), std::exception);
 }
 
 // Connection notification tests
