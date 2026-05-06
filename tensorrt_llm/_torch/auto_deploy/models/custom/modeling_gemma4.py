@@ -1355,6 +1355,7 @@ class Gemma4TextOutput(ModelOutput):
 @dataclass
 class Gemma4CausalLMOutput(ModelOutput):
     logits: Optional[torch.FloatTensor] = None
+    last_hidden_state: Optional[torch.FloatTensor] = None
 
 
 @dataclass
@@ -1731,6 +1732,7 @@ class Gemma4ForCausalLM(Gemma4TextPreTrainedModel, GenerationMixin):
 
         assert inputs_embeds is not None
         per_layer_inputs = self.project_per_layer_inputs(inputs_embeds, per_layer_inputs)
+        has_multimodal_spans = mm_token_positions is not None and mm_token_positions.numel() > 0
         mm_tensors = _canonicalize_mm_span_tensors(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -1741,20 +1743,22 @@ class Gemma4ForCausalLM(Gemma4TextPreTrainedModel, GenerationMixin):
             mm_special_offsets_cu_seqlen=mm_special_offsets_cu_seqlen,
             mm_special_offsets=mm_special_offsets,
         )
-        mask_input_ids = input_ids
-        if mask_input_ids is None:
-            mask_input_ids = torch.zeros(
-                inputs_embeds.shape[:2], dtype=torch.int64, device=inputs_embeds.device
+        attention_mask = None
+        if has_multimodal_spans:
+            mask_input_ids = input_ids
+            if mask_input_ids is None:
+                mask_input_ids = torch.zeros(
+                    inputs_embeds.shape[:2], dtype=torch.int64, device=inputs_embeds.device
+                )
+            attention_mask = torch.ops.auto_deploy.gemma4_multimodal_mask.default(
+                mask_input_ids,
+                mm_tensors["mm_token_positions"],
+                mm_tensors["mm_token_lengths"],
+                mm_tensors["mm_item_cu_seqlen"],
+                mm_tensors["mm_item_types"],
+                mm_tensors["mm_special_offsets_cu_seqlen"],
+                mm_tensors["mm_special_offsets"],
             )
-        attention_mask = torch.ops.auto_deploy.gemma4_multimodal_mask.default(
-            mask_input_ids,
-            mm_tensors["mm_token_positions"],
-            mm_tensors["mm_token_lengths"],
-            mm_tensors["mm_item_cu_seqlen"],
-            mm_tensors["mm_item_types"],
-            mm_tensors["mm_special_offsets_cu_seqlen"],
-            mm_tensors["mm_special_offsets"],
-        )
         pos_emb_global = self.rotary_emb_global(inputs_embeds, position_ids)
         pos_emb_local = self.rotary_emb_local(inputs_embeds, position_ids)
 
@@ -1782,7 +1786,7 @@ class Gemma4ForCausalLM(Gemma4TextPreTrainedModel, GenerationMixin):
             logits = logits / self.config.final_logit_softcapping
             logits = torch.tanh(logits)
             logits = logits * self.config.final_logit_softcapping
-        return Gemma4CausalLMOutput(logits=logits)
+        return Gemma4CausalLMOutput(logits=logits, last_hidden_state=hidden_states)
 
 
 # ---------------------------------------------------------------------------
@@ -1878,7 +1882,14 @@ class Gemma4Model(Gemma4PreTrainedModel):
             return input_ids == self.config.image_token_id
         if inputs_embeds is None:
             raise ValueError("Either input_ids or inputs_embeds must be provided")
-        image_embedding = self.get_input_embeddings()(
+        input_embeddings = self.get_input_embeddings()
+        if self.config.image_token_id >= input_embeddings.num_embeddings:
+            return torch.zeros(
+                inputs_embeds.shape[:-1],
+                dtype=torch.bool,
+                device=inputs_embeds.device,
+            )
+        image_embedding = input_embeddings(
             torch.tensor(self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
         )
         return (inputs_embeds == image_embedding).all(-1)

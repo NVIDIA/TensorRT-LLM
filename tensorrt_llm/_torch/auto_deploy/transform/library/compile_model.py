@@ -116,7 +116,10 @@ class CompileModel(BaseTransform):
             cm.info.set_capture_batch(batch_size=bs)
             return (), cm.named_args
 
-        extra_kwargs = {"resource_input_names": cm.resource_names}
+        resource_input_names = list(cm.resource_names)
+        if spec_config is not None and "cache_seq_interface" not in resource_input_names:
+            resource_input_names.append("cache_seq_interface")
+        extra_kwargs = {"resource_input_names": tuple(resource_input_names)}
         config_overrides = {}
         if self.config.piecewise_enabled:
             extra_kwargs["piecewise_seq_info"] = cm.info

@@ -315,6 +315,42 @@ class TestCapturedGraphCapture:
         assert [tuple(buf.shape) for buf in compiled_model._input_buffers] == [(4, 2), (4, 2)]
         assert captured_kwarg_orders == [("runtime_a", "runtime_b", "explicit_cache")]
 
+    def test_auto_batched_inputs_keep_cache_seq_interface_static(self, monkeypatch):
+        class Interface:
+            pass
+
+        class ModelWithCacheSeqInterface(nn.Module):
+            def forward(self, runtime_a, cache_seq_interface):
+                del cache_seq_interface
+                return runtime_a
+
+        compiled_model = CapturedGraph(
+            ModelWithCacheSeqInterface(),
+            resource_input_names={"cache_seq_interface"},
+        )
+        interface = Interface()
+        captured_kwarg_orders = []
+
+        def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
+            del args, refresh_args_static
+            captured_kwarg_orders.append(tuple(kwargs))
+            return object()
+
+        monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
+
+        def get_args_kwargs(bs):
+            return (), {
+                "runtime_a": torch.ones(bs, 2),
+                "cache_seq_interface": interface,
+            }
+
+        compiled_model.capture_graph(get_args_kwargs, [4])
+
+        assert compiled_model.num_batched_inputs == 1
+        assert compiled_model.dynamic_dims == [0]
+        assert [tuple(buf.shape) for buf in compiled_model._input_buffers] == [(4, 2)]
+        assert captured_kwarg_orders == [("runtime_a", "cache_seq_interface")]
+
     def test_auto_batched_inputs_do_not_guess_legacy_cache_names(self, monkeypatch):
         class ModelWithLegacyCacheName(nn.Module):
             def forward(self, runtime_a, r0_cache, runtime_b):
@@ -811,6 +847,7 @@ class TestCompileModelGraphModuleTargetCollection:
         cm.info.max_num_tokens = 64
         cm.named_args = {}
         cm.resource_names = ("explicit_cache",)
+        cm._spec_config = None
         return cm
 
     @pytest.mark.parametrize("backend", ["torch-cudagraph", "torch-opt"])
@@ -915,6 +952,44 @@ class TestCompileModelGraphModuleTargetCollection:
         )
 
         assert compiler_kwargs_seen[0]["resource_input_names"] == ("explicit_cache",)
+        assert compiler_kwargs_seen[0]["num_batched_inputs"] is None
+
+    def test_compile_model_marks_cache_seq_interface_static_for_spec_decode(self, monkeypatch):
+        wrapper = self._make_wrapper_with_graphmodule_child()
+        compiler_kwargs_seen = []
+
+        class FakeBackend:
+            def __init__(self, model, **compiler_kwargs):
+                del model
+                compiler_kwargs_seen.append(compiler_kwargs)
+
+            def compile(self):
+                return wrapper.child
+
+        monkeypatch.setattr(
+            "tensorrt_llm._torch.auto_deploy.transform.library.compile_model.CompileBackendRegistry.get",
+            lambda backend: FakeBackend,
+        )
+
+        transform = CompileModel.from_kwargs(
+            stage="compile",
+            backend="torch-cudagraph",
+            piecewise_enabled=True,
+        )
+        cm = self._make_cm()
+        cm._spec_config = MagicMock()
+
+        transform._apply_to_full_model(
+            wrapper,
+            cm=cm,
+            factory=MagicMock(),
+            shared_config=MagicMock(),
+        )
+
+        assert compiler_kwargs_seen[0]["resource_input_names"] == (
+            "explicit_cache",
+            "cache_seq_interface",
+        )
         assert compiler_kwargs_seen[0]["num_batched_inputs"] is None
 
     @pytest.mark.parametrize(

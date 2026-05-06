@@ -2028,4 +2028,4 @@ def test_e2b_like_hf_per_layer_state_dict_keys_are_present_and_loadable():
     assert not unexpected
     assert set(per_layer_state) == expected_per_layer_keys
     assert not (expected_per_layer_keys & set(missing))
-    assert "lm_head.weight" in missing
+    assert "model.language_model.lm_head.weight" in missing
