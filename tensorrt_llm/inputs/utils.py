@@ -1,14 +1,16 @@
 import asyncio
 import base64
+import ipaddress
 import math
 import os
+import socket
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Optional, Tuple, TypedDict, Union
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import aiohttp
 import numpy as np
@@ -111,6 +113,157 @@ def convert_image_mode(image: Image.Image, to_mode: str) -> Image.Image:
         return image.convert(to_mode)
 
 
+# Maximum allowed response size for remote fetches (200 MB).
+_MAX_RESPONSE_BYTES = 200 * 1024 * 1024
+
+# Chunk size used while enforcing the response size cap.
+_RESPONSE_CHUNK_BYTES = 1024 * 1024
+
+# Maximum number of redirects allowed for remote fetches.
+_MAX_REDIRECTS = 5
+
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+
+
+def _validate_url(url: str) -> None:
+    """Validate that *url* points to a public, non-internal HTTP(S) resource.
+
+    Raises ``RuntimeError`` for URLs that target non-global addresses or that
+    use a scheme other than http / https.
+
+    Note: validation is performed at DNS-resolution time. A DNS-rebinding
+    attack (TTL=0, resolves to a public IP during validation then a private IP
+    during the actual TCP connect) could bypass this check. For strict
+    isolation, supplement with network-level egress filtering that blocks
+    non-global address ranges at the host firewall.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise RuntimeError(
+            f"Only http and https URLs are allowed, got: {parsed.scheme!r}")
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise RuntimeError("URL has no hostname")
+
+    # Resolve to IP and check address range.
+    try:
+        infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise RuntimeError(f"Could not resolve hostname {hostname!r}") from exc
+
+    for _family, _type, _proto, _canon, sockaddr in infos:
+        ip = ipaddress.ip_address(sockaddr[0])
+        if not ip.is_global or ip.is_multicast:
+            raise RuntimeError(f"URL resolves to a non-public address ({ip})")
+
+
+def _buffer_requests_response(resp: "requests.Response") -> "requests.Response":
+    """Read a requests response with a hard size limit."""
+    content = BytesIO()
+    total = 0
+    try:
+        for chunk in resp.iter_content(chunk_size=_RESPONSE_CHUNK_BYTES):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > _MAX_RESPONSE_BYTES:
+                raise RuntimeError("Response exceeds maximum allowed size")
+            content.write(chunk)
+    except Exception:
+        resp.close()
+        raise
+
+    data = content.getvalue()
+    resp._content = data
+    resp.raw = BytesIO(data)
+    return resp
+
+
+def _safe_request_get(url: str,
+                      *,
+                      stream: bool = False,
+                      timeout: int = 30) -> "requests.Response":
+    """``requests.get`` wrapper that validates URLs and bounds response size."""
+    del stream  # Kept for API compatibility; responses are always bounded.
+
+    current_url = url
+    _validate_url(current_url)
+
+    for redirect_count in range(_MAX_REDIRECTS + 1):
+        resp = requests.get(
+            current_url,
+            stream=True,
+            timeout=timeout,
+            allow_redirects=False,
+        )
+        if resp.status_code not in _REDIRECT_STATUSES:
+            try:
+                resp.raise_for_status()
+            except Exception:
+                resp.close()
+                raise
+            return _buffer_requests_response(resp)
+
+        if redirect_count == _MAX_REDIRECTS:
+            resp.close()
+            raise RuntimeError("Too many redirects")
+
+        redirect_url = resp.headers.get("Location", "")
+        next_url = urljoin(current_url, redirect_url)
+        resp.close()
+        _validate_url(next_url)
+        current_url = next_url
+
+    raise RuntimeError("Too many redirects")
+
+
+async def _read_aiohttp_content(response: aiohttp.ClientResponse) -> bytes:
+    """Read an aiohttp response to EOF with a hard size limit."""
+    content = BytesIO()
+    total = 0
+    while True:
+        chunk = await response.content.read(_RESPONSE_CHUNK_BYTES)
+        if not chunk:
+            return content.getvalue()
+        total += len(chunk)
+        if total > _MAX_RESPONSE_BYTES:
+            raise RuntimeError("Response exceeds maximum allowed size")
+        content.write(chunk)
+
+
+async def _safe_aiohttp_get(
+        url: str,
+        timeout_sec: int = 30,
+        session: Optional[aiohttp.ClientSession] = None) -> bytes:
+    """Aiohttp GET wrapper that validates every redirect hop before following."""
+    await asyncio.to_thread(_validate_url, url)
+    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+
+    async def _fetch(fetch_session: aiohttp.ClientSession) -> bytes:
+        current_url = url
+        for _ in range(_MAX_REDIRECTS + 1):
+            async with fetch_session.get(current_url,
+                                         timeout=timeout,
+                                         allow_redirects=False) as response:
+                if response.status in _REDIRECT_STATUSES:
+                    redirect_url = response.headers.get("Location", "")
+                    current_url = urljoin(current_url, redirect_url)
+                    await asyncio.to_thread(_validate_url, current_url)
+                    continue
+                maybe_coro = response.raise_for_status()
+                if asyncio.iscoroutine(maybe_coro):
+                    await maybe_coro
+                return await _read_aiohttp_content(response)
+        raise RuntimeError("Too many redirects")
+
+    if session is not None:
+        return await _fetch(session)
+
+    async with aiohttp.ClientSession(timeout=timeout) as owned_session:
+        return await _fetch(owned_session)
+
+
 def _load_and_convert_image(image):
     image = Image.open(image)
     image.load()
@@ -150,12 +303,14 @@ def load_image(image: Union[str, Image.Image],
     parsed_url = urlparse(image)
 
     if parsed_url.scheme in ["http", "https"]:
-        image = requests.get(image, stream=True, timeout=10).raw
-        image = _load_and_convert_image(image)
+        resp = _safe_request_get(image, stream=True)
+        image = _load_and_convert_image(resp.raw)
     elif parsed_url.scheme == "data":
         image = load_base64_image(parsed_url)
-    else:
+    elif parsed_url.scheme in ("", "file"):
         image = _load_and_convert_image(image)
+    else:
+        raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
     if format == "pt":
         return ToTensor()(image).to(device=device)
@@ -176,15 +331,16 @@ async def async_load_image(
 
     if parsed_url.scheme in ["http", "https"]:
         session = await _get_aiohttp_session()
-        async with session.get(image) as response:
-            content = await response.read()
+        content = await _safe_aiohttp_get(image, session=session)
         image = await asyncio.to_thread(_load_and_convert_image,
                                         BytesIO(content))
     elif parsed_url.scheme == "data":
         image = await asyncio.to_thread(load_base64_image, parsed_url)
-    else:
+    elif parsed_url.scheme in ("", "file"):
         image = await asyncio.to_thread(_load_and_convert_image,
                                         Path(parsed_url.path))
+    else:
+        raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
     if format == "pt":
         return await asyncio.to_thread(lambda: ToTensor()
@@ -394,7 +550,19 @@ def load_video(video: str,
                device: str = "cpu",
                extract_audio: bool = False) -> VideoData:
     parsed_url = urlparse(video)
-    if parsed_url.scheme in ["http", "https", ""]:
+    if parsed_url.scheme in ["http", "https"]:
+        resp = _safe_request_get(video, stream=False)
+        with tempfile.NamedTemporaryFile(delete=True,
+                                         suffix=".mp4") as tmp_file:
+            tmp_file.write(resp.content)
+            tmp_file.flush()
+            return _load_video_by_cv2(tmp_file.name,
+                                      num_frames,
+                                      fps,
+                                      format,
+                                      device,
+                                      extract_audio=extract_audio)
+    elif parsed_url.scheme in ("", "file"):
         return _load_video_by_cv2(video,
                                   num_frames,
                                   fps,
@@ -440,15 +608,21 @@ async def async_load_video(video: str,
 
     if parsed_url.scheme in ["http", "https"]:
         session = await _get_aiohttp_session()
-        async with session.get(video) as response:
-            content = await response.content.read()
-        return await asyncio.to_thread(_load_from_bytes, content)
+        video_data = await _safe_aiohttp_get(video, session=session)
+        return await asyncio.to_thread(_load_from_bytes, video_data)
     elif parsed_url.scheme == "data":
-        decoded_video = load_base64_video(video)
+        decoded_video = await asyncio.to_thread(load_base64_video, video)
         return await asyncio.to_thread(_load_from_bytes, decoded_video)
+    elif parsed_url.scheme in ("", "file"):
+        return await asyncio.to_thread(_load_video_by_cv2,
+                                       video,
+                                       num_frames,
+                                       fps,
+                                       format,
+                                       device,
+                                       extract_audio=extract_audio)
     else:
-        return await asyncio.to_thread(_load_video_by_cv2, video, num_frames,
-                                       fps, format, device, extract_audio)
+        raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
 
 def _normalize_file_uri(uri: str) -> str:
@@ -466,10 +640,13 @@ def load_audio(
 ) -> Tuple[np.ndarray, int]:
     parsed_url = urlparse(audio)
     if parsed_url.scheme in ["http", "https"]:
-        audio = requests.get(audio, stream=True, timeout=10)
-        audio = BytesIO(audio.content)
-    elif parsed_url.scheme == "file":
-        audio = _normalize_file_uri(audio)
+        resp = _safe_request_get(audio, stream=False)
+        audio = BytesIO(resp.content)
+    elif parsed_url.scheme in ("", "file"):
+        audio = _normalize_file_uri(
+            audio) if parsed_url.scheme == "file" else audio
+    else:
+        raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
     audio = soundfile.read(audio)
     return audio
@@ -489,12 +666,13 @@ async def async_load_audio(
 
     if parsed_url.scheme in ["http", "https"]:
         session = await _get_aiohttp_session()
-        async with session.get(audio) as response:
-            content = await response.content.read()
-        # Offload CPU-bound soundfile decoding to thread pool
-        return await asyncio.to_thread(soundfile.read, BytesIO(content))
-    elif parsed_url.scheme == "file":
-        audio = _normalize_file_uri(audio)
+        audio_data = await _safe_aiohttp_get(audio, session=session)
+        audio = BytesIO(audio_data)
+    elif parsed_url.scheme in ("", "file"):
+        audio = _normalize_file_uri(
+            audio) if parsed_url.scheme == "file" else audio
+    else:
+        raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
     return await asyncio.to_thread(soundfile.read, audio)
 
@@ -502,9 +680,8 @@ async def async_load_audio(
 def encode_base64_content_from_url(content_url: str) -> str:
     """Encode a content retrieved from a remote url to base64 format."""
 
-    with requests.get(content_url, timeout=10) as response:
-        response.raise_for_status()
-        result = base64.b64encode(response.content).decode('utf-8')
+    resp = _safe_request_get(content_url, stream=False)
+    result = base64.b64encode(resp.content).decode('utf-8')
 
     return result
 

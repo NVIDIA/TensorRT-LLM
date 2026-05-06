@@ -1097,7 +1097,7 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
                 req_it += 1
                 continue
 
-            was_scheduled = self._try_scheduling_request(
+            was_scheduled, num_scheduled_peft_pages = self._try_scheduling_request(
                 scheduler,
                 req,
                 scheduled_requests,
@@ -1139,15 +1139,15 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
         num_scheduled_peft_pages: int,
         seen_task_ids: set[int],
         cached_summary: Optional[PrefixReuseSummary] = None,
-    ) -> bool:
+    ) -> tuple[bool, int]:
         if len(scheduled_requests) >= scheduler.max_num_requests:
-            return False
+            return False, num_scheduled_peft_pages
 
         blocks_if_scheduled = scheduled_blocks_manager.prepare_blocks_if_schedulable(
             req, cached_summary=cached_summary
         )
         if blocks_if_scheduled is None:
-            return False
+            return False, num_scheduled_peft_pages
 
         # PEFT check only when needed
         if scheduler.peft_cache_manager is not None:
@@ -1160,16 +1160,17 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
             )
             max_peft_pages = scheduler._get_max_peft_pages()
             if num_required_peft_pages + num_scheduled_peft_pages > max_peft_pages:
-                return False
+                return False, num_scheduled_peft_pages
             logger.debug(
                 f"MaxUtilizationScheduler: scheduled peft pages: {num_required_peft_pages}"
             )
+            num_scheduled_peft_pages += num_required_peft_pages
             if is_new_task:
                 seen_task_ids.add(lora_task_id)
 
         scheduled_blocks_manager.update_scheduled_blocks(blocks_if_scheduled)
         scheduled_requests.append(req)
-        return True
+        return True, num_scheduled_peft_pages
 
 
 class NoEvictScheduledBlocksManager:
