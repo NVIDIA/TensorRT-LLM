@@ -55,9 +55,10 @@
 //   per position but improves compression quality.
 //
 // Template parameters:
-//   HEAD_DIM   — Head dimension (128 or 512)
-//   ELEM_BYTES — Element size in bytes (2=bf16, 4=fp32)
-//   SCALE_TYPE — Output cache scale/dtype for postProcessScatterKernel
+//   HEAD_DIM            — Head dimension (128 or 512)
+//   KV_SCORE_ELEM_BYTES — kv_score element size (2=bf16, 4=fp32)
+//   STATE_ELEM_BYTES    — compressor state element size (2=bf16, 4=fp32)
+//   SCALE_TYPE          — Output cache scale/dtype for postProcessScatterKernel
 // ============================================================================
 
 #include "tensorrt_llm/kernels/compressorKernels/compressorKernels.h"
@@ -211,7 +212,7 @@ enum class CacheScaleType
 // ============================================================================
 // Decode Kernel: pagedKvCompressKernel
 //
-// Template: <HEAD_DIM, IO_ELEM_BYTES, NEXT_N>
+// Template: <HEAD_DIM, KV_SCORE_ELEM_BYTES, STATE_ELEM_BYTES, NEXT_N>
 //   NEXT_N: number of new tokens per sequence in this decode step (1-4)
 //
 // Grid:  (batch_size) — one block per batch element
@@ -241,7 +242,7 @@ enum class CacheScaleType
 // online softmax accumulators (rmax, rsum, rwsum) per element.
 // APE is already baked into paged_score (added during Phase 1), so no APE
 // addition is performed here.
-template <int HEAD_DIM, int IO_ELEM_BYTES>
+template <int HEAD_DIM, int STATE_ELEM_BYTES, int VEC>
 __device__ __forceinline__ void decodeSoftmaxVec(void const* __restrict__ paged_kv_raw,
     void const* __restrict__ paged_score_raw,
     int64_t page_sd, // page_size * state_dim (in elements)
@@ -252,21 +253,19 @@ __device__ __forceinline__ void decodeSoftmaxVec(void const* __restrict__ paged_
     int kv_col_off,  // column offset (0 or HEAD_DIM)
     int tid, float* __restrict__ rmax, float* __restrict__ rsum, float* __restrict__ rwsum)
 {
-    using IoElemT = typename std::conditional<IO_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
-    constexpr int MAX_VEC = 16 / IO_ELEM_BYTES;
-    constexpr int VEC = (HEAD_DIM / MAX_VEC >= 32) ? MAX_VEC : (HEAD_DIM / 32);
-    using IoVecT = typename VecType<VEC * IO_ELEM_BYTES>::type;
+    using StateElemT = typename std::conditional<STATE_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
+    using StateVecT = typename VecType<VEC * STATE_ELEM_BYTES>::type;
 
-    auto const* kv = reinterpret_cast<IoElemT const*>(paged_kv_raw);
-    auto const* sc = reinterpret_cast<IoElemT const*>(paged_score_raw);
+    auto const* kv = reinterpret_cast<StateElemT const*>(paged_kv_raw);
+    auto const* sc = reinterpret_cast<StateElemT const*>(paged_score_raw);
 
     int64_t base_kv = static_cast<int64_t>(phys_kv) * page_sd + blk_off * state_dim + kv_col_off;
     int64_t base_sc = static_cast<int64_t>(phys_sc) * page_sd + blk_off * state_dim + kv_col_off;
 
-    IoVecT k_raw = reinterpret_cast<IoVecT const*>(&kv[base_kv])[tid];
-    IoVecT s_raw = reinterpret_cast<IoVecT const*>(&sc[base_sc])[tid];
-    IoElemT const* ke = reinterpret_cast<IoElemT const*>(&k_raw);
-    IoElemT const* se = reinterpret_cast<IoElemT const*>(&s_raw);
+    StateVecT k_raw = reinterpret_cast<StateVecT const*>(&kv[base_kv])[tid];
+    StateVecT s_raw = reinterpret_cast<StateVecT const*>(&sc[base_sc])[tid];
+    StateElemT const* ke = reinterpret_cast<StateElemT const*>(&k_raw);
+    StateElemT const* se = reinterpret_cast<StateElemT const*>(&s_raw);
 
 #pragma unroll
     for (int i = 0; i < VEC; i += 4)
@@ -292,26 +291,31 @@ __device__ __forceinline__ void decodeSoftmaxVec(void const* __restrict__ paged_
     }
 }
 
-template <int HEAD_DIM, int IO_ELEM_BYTES, int COMPRESS_RATIO, int NEXT_N, int NUM_RED_WARPS = 1>
+template <int HEAD_DIM, int KV_SCORE_ELEM_BYTES, int STATE_ELEM_BYTES, int COMPRESS_RATIO, int NEXT_N,
+    int NUM_RED_WARPS = 1>
 __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, float const* __restrict__ ape,
     void* __restrict__ paged_kv_raw, void* __restrict__ paged_score_raw, int32_t const* __restrict__ block_table_kv,
     int32_t const* __restrict__ block_table_score, void* __restrict__ output_raw, int32_t const* __restrict__ kv_lens,
-    int32_t const* __restrict__ start_pos_arr, int32_t const* __restrict__ cu_seq_lens,
-    int32_t const* __restrict__ cu_kv_comp, int page_size, int max_blocks, int out_elem_bytes)
+    int32_t const* __restrict__ cu_seq_lens, int32_t const* __restrict__ cu_kv_comp, int page_size, int max_blocks,
+    int out_elem_bytes)
 {
-    using IoElemT = typename std::conditional<IO_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
+    using KvScoreElemT = typename std::conditional<KV_SCORE_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
+    using StateElemT = typename std::conditional<STATE_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
     // DeepSeek-V4 model configures compress_ratio to be 4 or 128.
     static_assert(COMPRESS_RATIO == 4 || COMPRESS_RATIO == 128, "Unsupported COMPRESS_RATIO");
     constexpr bool IS_OVERLAP = (COMPRESS_RATIO == 4);
-    constexpr int MAX_VEC = 16 / IO_ELEM_BYTES;
+    constexpr int ELEM_BYTES_FOR_VEC
+        = (KV_SCORE_ELEM_BYTES > STATE_ELEM_BYTES) ? KV_SCORE_ELEM_BYTES : STATE_ELEM_BYTES;
+    constexpr int MAX_VEC = 16 / ELEM_BYTES_FOR_VEC;
     constexpr int VEC = (HEAD_DIM / MAX_VEC >= 32) ? MAX_VEC : (HEAD_DIM / 32);
-    using IoVecT = typename VecType<VEC * IO_ELEM_BYTES>::type;
+    using KvScoreVecT = typename VecType<VEC * KV_SCORE_ELEM_BYTES>::type;
+    using StateVecT = typename VecType<VEC * STATE_ELEM_BYTES>::type;
     static_assert(VEC >= 4, "VEC must be >= 4 for float4 ape loads");
 
     // HEAD_BLOCKS: split head_dim across blockIdx.y for better SM utilisation.
-    // For HD=512 bf16: NTHRD_BASE=64 → HEAD_BLOCKS=2, NTHRD_INNER=32.
-    // For HD=128 bf16: NTHRD_BASE=32 → HEAD_BLOCKS=1, NTHRD_INNER=32.
-    // For HD=512 fp32: NTHRD_BASE=128 → HEAD_BLOCKS=4, NTHRD_INNER=32.
+    // For HD=512 and max elem size 2: NTHRD_BASE=64 → HEAD_BLOCKS=2, NTHRD_INNER=32.
+    // For HD=128 and max elem size 2/4: NTHRD_BASE=32 → HEAD_BLOCKS=1, NTHRD_INNER=32.
+    // For HD=512 and max elem size 4: NTHRD_BASE=128 → HEAD_BLOCKS=4, NTHRD_INNER=32.
     constexpr int NTHRD_BASE = HEAD_DIM / VEC;
     constexpr int HEAD_BLOCKS = (NTHRD_BASE > 32) ? (NTHRD_BASE / 32) : 1;
     constexpr int NTHRD_INNER = NTHRD_BASE / HEAD_BLOCKS; // always <= 32
@@ -332,15 +336,15 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
     int const head_blk = blockIdx.y;
     int const eff_tid = head_blk * NTHRD_INNER + tid;
 
-    int const sp = start_pos_arr[batch_idx];
     int const kv_len = kv_lens[batch_idx];
+    int const sp = kv_len - NEXT_N;
     int const in_off = cu_seq_lens[batch_idx];
     int const out_off = cu_kv_comp[batch_idx];
     int64_t const page_sd = static_cast<int64_t>(page_size) * STATE_DIM;
 
-    auto const* kv_score = reinterpret_cast<IoElemT const*>(kv_score_raw);
-    auto* paged_kv = reinterpret_cast<IoElemT*>(paged_kv_raw);
-    auto* paged_score = reinterpret_cast<IoElemT*>(paged_score_raw);
+    auto const* kv_score = reinterpret_cast<KvScoreElemT const*>(kv_score_raw);
+    auto* paged_kv = reinterpret_cast<StateElemT*>(paged_kv_raw);
+    auto* paged_score = reinterpret_cast<StateElemT*>(paged_score_raw);
 
     // ================================================================
     // Phase 1: Write NEXT_N new tokens' KV and score state to paged cache.
@@ -369,25 +373,33 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
                     int64_t const dkv = static_cast<int64_t>(phys_kv) * page_sd + blk_off * STATE_DIM + col;
                     int64_t const dsc = static_cast<int64_t>(phys_sc) * page_sd + blk_off * STATE_DIM + col;
 
-                    IoVecT kv_raw = reinterpret_cast<IoVecT const*>(&kv_score[src])[eff_tid];
-                    IoVecT sc_raw = reinterpret_cast<IoVecT const*>(&kv_score[src + STATE_DIM])[eff_tid];
+                    KvScoreVecT kv_raw = reinterpret_cast<KvScoreVecT const*>(&kv_score[src])[eff_tid];
+                    KvScoreVecT sc_raw = reinterpret_cast<KvScoreVecT const*>(&kv_score[src + STATE_DIM])[eff_tid];
 
-                    reinterpret_cast<IoVecT*>(&paged_kv[dkv])[eff_tid] = kv_raw;
+                    KvScoreElemT const* kv_e = reinterpret_cast<KvScoreElemT const*>(&kv_raw);
+                    StateVecT kv_out;
+                    StateElemT* kv_o = reinterpret_cast<StateElemT*>(&kv_out);
+#pragma unroll
+                    for (int i = 0; i < VEC; i++)
+                    {
+                        kv_o[i] = static_cast<StateElemT>(static_cast<float>(kv_e[i]));
+                    }
+                    reinterpret_cast<StateVecT*>(&paged_kv[dkv])[eff_tid] = kv_out;
 
-                    IoElemT const* sc_e = reinterpret_cast<IoElemT const*>(&sc_raw);
-                    IoVecT sc_out;
-                    IoElemT* sc_o = reinterpret_cast<IoElemT*>(&sc_out);
+                    KvScoreElemT const* sc_e = reinterpret_cast<KvScoreElemT const*>(&sc_raw);
+                    StateVecT sc_out;
+                    StateElemT* sc_o = reinterpret_cast<StateElemT*>(&sc_out);
 #pragma unroll
                     for (int i = 0; i < VEC; i += 4)
                     {
                         float4 av
                             = *reinterpret_cast<float4 const*>(&ape[ape_idx * STATE_DIM + col + eff_tid * VEC + i]);
-                        sc_o[i] = static_cast<IoElemT>(static_cast<float>(sc_e[i]) + av.x);
-                        sc_o[i + 1] = static_cast<IoElemT>(static_cast<float>(sc_e[i + 1]) + av.y);
-                        sc_o[i + 2] = static_cast<IoElemT>(static_cast<float>(sc_e[i + 2]) + av.z);
-                        sc_o[i + 3] = static_cast<IoElemT>(static_cast<float>(sc_e[i + 3]) + av.w);
+                        sc_o[i] = static_cast<StateElemT>(static_cast<float>(sc_e[i]) + av.x);
+                        sc_o[i + 1] = static_cast<StateElemT>(static_cast<float>(sc_e[i + 1]) + av.y);
+                        sc_o[i + 2] = static_cast<StateElemT>(static_cast<float>(sc_e[i + 2]) + av.z);
+                        sc_o[i + 3] = static_cast<StateElemT>(static_cast<float>(sc_e[i + 3]) + av.w);
                     }
-                    reinterpret_cast<IoVecT*>(&paged_score[dsc])[eff_tid] = sc_out;
+                    reinterpret_cast<StateVecT*>(&paged_score[dsc])[eff_tid] = sc_out;
                 }
             }
         }
@@ -446,8 +458,8 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
                     int chunk_off_prev = prev_start % page_size;
                     for (int r = my_r_start; r < my_r_end; r++)
                     {
-                        decodeSoftmaxVec<HEAD_DIM, IO_ELEM_BYTES>(paged_kv_raw, paged_score_raw, page_sd, STATE_DIM,
-                            phys_kv_prev, phys_sc_prev, chunk_off_prev + r, 0, eff_tid, rmax, rsum, rwsum);
+                        decodeSoftmaxVec<HEAD_DIM, STATE_ELEM_BYTES, VEC>(paged_kv_raw, paged_score_raw, page_sd,
+                            STATE_DIM, phys_kv_prev, phys_sc_prev, chunk_off_prev + r, 0, eff_tid, rmax, rsum, rwsum);
                     }
                 }
                 else
@@ -459,8 +471,8 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
                         int blk_off = pos % page_size;
                         int phys_kv = block_table_kv[batch_idx * max_blocks + log_blk];
                         int phys_sc = block_table_score[batch_idx * max_blocks + log_blk];
-                        decodeSoftmaxVec<HEAD_DIM, IO_ELEM_BYTES>(paged_kv_raw, paged_score_raw, page_sd, STATE_DIM,
-                            phys_kv, phys_sc, blk_off, 0, eff_tid, rmax, rsum, rwsum);
+                        decodeSoftmaxVec<HEAD_DIM, STATE_ELEM_BYTES, VEC>(paged_kv_raw, paged_score_raw, page_sd,
+                            STATE_DIM, phys_kv, phys_sc, blk_off, 0, eff_tid, rmax, rsum, rwsum);
                     }
                 }
             }
@@ -473,7 +485,7 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
                 int chunk_off_cur = curr_chunk_start % page_size;
                 for (int r = my_r_start; r < my_r_end; r++)
                 {
-                    decodeSoftmaxVec<HEAD_DIM, IO_ELEM_BYTES>(paged_kv_raw, paged_score_raw, page_sd, STATE_DIM,
+                    decodeSoftmaxVec<HEAD_DIM, STATE_ELEM_BYTES, VEC>(paged_kv_raw, paged_score_raw, page_sd, STATE_DIM,
                         phys_kv_cur, phys_sc_cur, chunk_off_cur + r, HEAD_DIM, eff_tid, rmax, rsum, rwsum);
                 }
             }
@@ -486,7 +498,7 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
                     int blk_off = pos % page_size;
                     int phys_kv = block_table_kv[batch_idx * max_blocks + log_blk];
                     int phys_sc = block_table_score[batch_idx * max_blocks + log_blk];
-                    decodeSoftmaxVec<HEAD_DIM, IO_ELEM_BYTES>(paged_kv_raw, paged_score_raw, page_sd, STATE_DIM,
+                    decodeSoftmaxVec<HEAD_DIM, STATE_ELEM_BYTES, VEC>(paged_kv_raw, paged_score_raw, page_sd, STATE_DIM,
                         phys_kv, phys_sc, blk_off, HEAD_DIM, eff_tid, rmax, rsum, rwsum);
                 }
             }
@@ -501,7 +513,7 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
                 int chunk_off = curr_chunk_start % page_size;
                 for (int r = my_r_start; r < my_r_end; r++)
                 {
-                    decodeSoftmaxVec<HEAD_DIM, IO_ELEM_BYTES>(paged_kv_raw, paged_score_raw, page_sd, STATE_DIM,
+                    decodeSoftmaxVec<HEAD_DIM, STATE_ELEM_BYTES, VEC>(paged_kv_raw, paged_score_raw, page_sd, STATE_DIM,
                         phys_kv, phys_sc, chunk_off + r, 0, eff_tid, rmax, rsum, rwsum);
                 }
             }
@@ -514,7 +526,7 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
                     int blk_off = pos % page_size;
                     int phys_kv = block_table_kv[batch_idx * max_blocks + log_blk];
                     int phys_sc = block_table_score[batch_idx * max_blocks + log_blk];
-                    decodeSoftmaxVec<HEAD_DIM, IO_ELEM_BYTES>(paged_kv_raw, paged_score_raw, page_sd, STATE_DIM,
+                    decodeSoftmaxVec<HEAD_DIM, STATE_ELEM_BYTES, VEC>(paged_kv_raw, paged_score_raw, page_sd, STATE_DIM,
                         phys_kv, phys_sc, blk_off, 0, eff_tid, rmax, rsum, rwsum);
                 }
             }
@@ -599,38 +611,47 @@ __global__ void pagedKvCompressKernel(void const* __restrict__ kv_score_raw, flo
 }
 
 // Explicit instantiations for decode kernel (NUM_RED_WARPS defaults to 1)
-#define INST_DECODE(HD, EB, CR, NN, NRW)                                                                               \
-    template __global__ void pagedKvCompressKernel<HD, EB, CR, NN, NRW>(void const*, float const*, void*, void*,       \
-        int32_t const*, int32_t const*, void*, int32_t const*, int32_t const*, int32_t const*, int32_t const*, int,    \
-        int, int);
+#define INST_DECODE(HD, KV_EB, STATE_EB, CR, NN, NRW)                                                                  \
+    template __global__ void pagedKvCompressKernel<HD, KV_EB, STATE_EB, CR, NN, NRW>(void const*, float const*, void*, \
+        void*, int32_t const*, int32_t const*, void*, int32_t const*, int32_t const*, int32_t const*, int, int, int);
 
-#define INST_DECODE_NN(HD, EB, CR)                                                                                     \
-    INST_DECODE(HD, EB, CR, 1, 1)                                                                                      \
-    INST_DECODE(HD, EB, CR, 2, 1) INST_DECODE(HD, EB, CR, 3, 1) INST_DECODE(HD, EB, CR, 4, 1)
+#define INST_DECODE_NN(HD, KV_EB, STATE_EB, CR)                                                                        \
+    INST_DECODE(HD, KV_EB, STATE_EB, CR, 1, 1)                                                                         \
+    INST_DECODE(HD, KV_EB, STATE_EB, CR, 2, 1)                                                                         \
+    INST_DECODE(HD, KV_EB, STATE_EB, CR, 3, 1) INST_DECODE(HD, KV_EB, STATE_EB, CR, 4, 1)
 
-INST_DECODE_NN(128, 2, 4)
-INST_DECODE_NN(128, 2, 128)
-INST_DECODE_NN(128, 4, 4)
-INST_DECODE_NN(128, 4, 128)
-INST_DECODE_NN(512, 2, 4)
-INST_DECODE_NN(512, 2, 128)
-INST_DECODE_NN(512, 4, 4)
-INST_DECODE_NN(512, 4, 128)
+#define INST_DECODE_DTYPES(HD, CR)                                                                                     \
+    INST_DECODE_NN(HD, 2, 2, CR)                                                                                       \
+    INST_DECODE_NN(HD, 2, 4, CR) INST_DECODE_NN(HD, 4, 2, CR) INST_DECODE_NN(HD, 4, 4, CR)
+
+INST_DECODE_DTYPES(128, 4)
+INST_DECODE_DTYPES(128, 128)
+INST_DECODE_DTYPES(512, 4)
+INST_DECODE_DTYPES(512, 128)
 
 // 4-warp parallel reduction variants for large compress_ratio.
 // HD=128: ELEM_PER_BLOCK=128, smem = 3*4*128*4 = 6 KB.
 // HD=512 bf16: ELEM_PER_BLOCK=256, smem = 3*4*256*4 = 12 KB.
 // HD=512 fp32: ELEM_PER_BLOCK=128, smem = 3*4*128*4 = 6 KB.
 // NEXT_N=1 (single-token decode) and NEXT_N=2 (MTP speculative decode).
-INST_DECODE(128, 2, 128, 1, 4)
-INST_DECODE(128, 4, 128, 1, 4)
-INST_DECODE(128, 2, 128, 2, 4)
-INST_DECODE(128, 4, 128, 2, 4)
-INST_DECODE(512, 2, 128, 1, 4)
-INST_DECODE(512, 4, 128, 1, 4)
-INST_DECODE(512, 2, 128, 2, 4)
-INST_DECODE(512, 4, 128, 2, 4)
+INST_DECODE(128, 2, 2, 128, 1, 4)
+INST_DECODE(128, 2, 4, 128, 1, 4)
+INST_DECODE(128, 4, 2, 128, 1, 4)
+INST_DECODE(128, 4, 4, 128, 1, 4)
+INST_DECODE(128, 2, 2, 128, 2, 4)
+INST_DECODE(128, 2, 4, 128, 2, 4)
+INST_DECODE(128, 4, 2, 128, 2, 4)
+INST_DECODE(128, 4, 4, 128, 2, 4)
+INST_DECODE(512, 2, 2, 128, 1, 4)
+INST_DECODE(512, 2, 4, 128, 1, 4)
+INST_DECODE(512, 4, 2, 128, 1, 4)
+INST_DECODE(512, 4, 4, 128, 1, 4)
+INST_DECODE(512, 2, 2, 128, 2, 4)
+INST_DECODE(512, 2, 4, 128, 2, 4)
+INST_DECODE(512, 4, 2, 128, 2, 4)
+INST_DECODE(512, 4, 4, 128, 2, 4)
 
+#undef INST_DECODE_DTYPES
 #undef INST_DECODE_NN
 #undef INST_DECODE
 
@@ -644,22 +665,26 @@ INST_DECODE(512, 4, 128, 2, 4)
 // ============================================================================
 
 // Forward declaration (defined in prefill section below).
-static inline int prefillNthreads(int head_dim, int io_elem_bytes);
+static inline int prefillNthreads(int head_dim, int elem_bytes_for_vec);
 
 void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_kv, void* paged_score,
     int32_t const* block_table_kv, int32_t const* block_table_score, void* output, int32_t const* kv_lens,
-    int32_t const* start_pos, int32_t const* cu_seq_lens, int32_t const* cu_kv_comp, int batch_size, int page_size,
-    int max_blocks, int head_dim, int compress_ratio, int next_n, int io_elem_bytes, int out_elem_bytes,
+    int32_t const* cu_seq_lens, int32_t const* cu_kv_comp, int batch_size, int page_size, int max_blocks, int head_dim,
+    int compress_ratio, int next_n, int kv_score_elem_bytes, int state_elem_bytes, int out_elem_bytes,
     cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(
         compress_ratio == 4 || compress_ratio == 128, "pagedKvCompressLaunch only supports compress_ratio 4 or 128");
+    TLLM_CHECK_WITH_INFO(
+        (kv_score_elem_bytes == 2 || kv_score_elem_bytes == 4) && (state_elem_bytes == 2 || state_elem_bytes == 4),
+        "pagedKvCompressLaunch only supports bf16/fp32 kv_score and paged state");
 
     // Compute HEAD_BLOCKS: mirrors the compile-time constant in the kernel.
     // VEC = max_vec if HEAD_DIM/max_vec >= 32, else HEAD_DIM/32.
     // NTHRD_BASE = HEAD_DIM / VEC; HEAD_BLOCKS = NTHRD_BASE / 32 (or 1 if <= 32).
     // This spreads the head_dim across multiple blocks for better SM utilisation.
-    int const max_vec_elem = 16 / io_elem_bytes;
+    int const elem_bytes_for_vec = max(kv_score_elem_bytes, state_elem_bytes);
+    int const max_vec_elem = 16 / elem_bytes_for_vec;
     int const vec = (head_dim / max_vec_elem >= 32) ? max_vec_elem : (head_dim / 32);
     int const nthrd_base = head_dim / vec;               // mirrors kernel's NTHRD_BASE = HEAD_DIM / VEC
     int const head_blocks = (nthrd_base > 32) ? (nthrd_base / 32) : 1;
@@ -672,8 +697,8 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
     // smem per block = 3 * MULTI_WARP * ELEM_PER_BLOCK * sizeof(float)
     //   where ELEM_PER_BLOCK = nthreads_inner * vec = HEAD_DIM / HEAD_BLOCKS.
     // HD=128: ELEM_PER_BLOCK=128 → 6 KB.
-    // HD=512 bf16 (vec=8, HEAD_BLOCKS=2): ELEM_PER_BLOCK=256 → 12 KB.
-    // HD=512 fp32 (vec=4, HEAD_BLOCKS=4): ELEM_PER_BLOCK=128 →  6 KB.
+    // HD=512 with max elem size 2 (vec=8, HEAD_BLOCKS=2): ELEM_PER_BLOCK=256 → 12 KB.
+    // HD=512 with max elem size 4 (vec=4, HEAD_BLOCKS=4): ELEM_PER_BLOCK=128 →  6 KB.
     constexpr int MULTI_WARP = 4;
     bool const use_multi_warp = (compress_ratio == 128 && next_n <= 2);
     int const num_red_warps = use_multi_warp ? MULTI_WARP : 1;
@@ -683,106 +708,89 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
 
     dim3 grid(batch_size, head_blocks);
 
-#define LAUNCH_DECODE(HD, EB, CR, NN)                                                                                  \
-    pagedKvCompressKernel<HD, EB, CR, NN><<<grid, nthreads, smem_bytes, stream>>>(kv_score, ape, paged_kv,             \
-        paged_score, block_table_kv, block_table_score, output, kv_lens, start_pos, cu_seq_lens, cu_kv_comp,           \
+#define LAUNCH_DECODE(HD, KV_EB, STATE_EB, CR, NN)                                                                     \
+    pagedKvCompressKernel<HD, KV_EB, STATE_EB, CR, NN><<<grid, nthreads, smem_bytes, stream>>>(kv_score, ape,          \
+        paged_kv, paged_score, block_table_kv, block_table_score, output, kv_lens, cu_seq_lens, cu_kv_comp, page_size, \
+        max_blocks, out_elem_bytes)
+
+#define LAUNCH_DECODE_MW(HD, KV_EB, STATE_EB, CR, NN)                                                                  \
+    pagedKvCompressKernel<HD, KV_EB, STATE_EB, CR, NN, MULTI_WARP><<<grid, nthreads, smem_bytes, stream>>>(kv_score,   \
+        ape, paged_kv, paged_score, block_table_kv, block_table_score, output, kv_lens, cu_seq_lens, cu_kv_comp,       \
         page_size, max_blocks, out_elem_bytes)
 
-#define LAUNCH_DECODE_MW(HD, EB, CR, NN)                                                                               \
-    pagedKvCompressKernel<HD, EB, CR, NN, MULTI_WARP><<<grid, nthreads, smem_bytes, stream>>>(kv_score, ape, paged_kv, \
-        paged_score, block_table_kv, block_table_score, output, kv_lens, start_pos, cu_seq_lens, cu_kv_comp,           \
-        page_size, max_blocks, out_elem_bytes)
-
-#define DISPATCH_NN_MW(HD, EB, CR)                                                                                     \
+#define DISPATCH_NN_MW(HD, KV_EB, STATE_EB, CR)                                                                        \
     switch (next_n)                                                                                                    \
     {                                                                                                                  \
-    case 2: LAUNCH_DECODE_MW(HD, EB, CR, 2); break;                                                                    \
-    default: LAUNCH_DECODE_MW(HD, EB, CR, 1); break;                                                                   \
+    case 2: LAUNCH_DECODE_MW(HD, KV_EB, STATE_EB, CR, 2); break;                                                       \
+    default: LAUNCH_DECODE_MW(HD, KV_EB, STATE_EB, CR, 1); break;                                                      \
     }
 
-#define DISPATCH_NN(HD, EB, CR)                                                                                        \
+#define DISPATCH_NN(HD, KV_EB, STATE_EB, CR)                                                                           \
     switch (next_n)                                                                                                    \
     {                                                                                                                  \
-    case 1: LAUNCH_DECODE(HD, EB, CR, 1); break;                                                                       \
-    case 2: LAUNCH_DECODE(HD, EB, CR, 2); break;                                                                       \
-    case 3: LAUNCH_DECODE(HD, EB, CR, 3); break;                                                                       \
-    default: LAUNCH_DECODE(HD, EB, CR, 4); break;                                                                      \
+    case 1: LAUNCH_DECODE(HD, KV_EB, STATE_EB, CR, 1); break;                                                          \
+    case 2: LAUNCH_DECODE(HD, KV_EB, STATE_EB, CR, 2); break;                                                          \
+    case 3: LAUNCH_DECODE(HD, KV_EB, STATE_EB, CR, 3); break;                                                          \
+    default: LAUNCH_DECODE(HD, KV_EB, STATE_EB, CR, 4); break;                                                         \
     }
+
+#define DISPATCH_DTYPE(HD, CR, DISPATCH_MACRO)                                                                         \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (kv_score_elem_bytes == 4 && state_elem_bytes == 4)                                                         \
+        {                                                                                                              \
+            DISPATCH_MACRO(HD, 4, 4, CR);                                                                              \
+        }                                                                                                              \
+        else if (kv_score_elem_bytes == 2 && state_elem_bytes == 4)                                                    \
+        {                                                                                                              \
+            DISPATCH_MACRO(HD, 2, 4, CR);                                                                              \
+        }                                                                                                              \
+        else if (kv_score_elem_bytes == 4 && state_elem_bytes == 2)                                                    \
+        {                                                                                                              \
+            DISPATCH_MACRO(HD, 4, 2, CR);                                                                              \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            DISPATCH_MACRO(HD, 2, 2, CR);                                                                              \
+        }                                                                                                              \
+    } while (false)
 
     if (use_multi_warp)
     {
         // Multi-warp path: HD=128 or HD=512, NEXT_N=1 or NEXT_N=2, CR=128.
-        if (io_elem_bytes == 4)
+        if (head_dim == 512)
         {
-            if (head_dim == 512)
-            {
-                DISPATCH_NN_MW(512, 4, 128);
-            }
-            else
-            {
-                DISPATCH_NN_MW(128, 4, 128);
-            }
+            DISPATCH_DTYPE(512, 128, DISPATCH_NN_MW);
         }
         else
         {
-            if (head_dim == 512)
-            {
-                DISPATCH_NN_MW(512, 2, 128);
-            }
-            else
-            {
-                DISPATCH_NN_MW(128, 2, 128);
-            }
+            DISPATCH_DTYPE(128, 128, DISPATCH_NN_MW);
         }
     }
     else if (compress_ratio == 4)
     {
-        if (io_elem_bytes == 4)
-        {
-            if (head_dim == 512)
-            {
-                DISPATCH_NN(512, 4, 4);
-            }
-            else
-            {
-                DISPATCH_NN(128, 4, 4);
-            }
-        }
-        else
-        {
-            if (head_dim == 512)
-            {
-                DISPATCH_NN(512, 2, 4);
-            }
-            else
-            {
-                DISPATCH_NN(128, 2, 4);
-            }
-        }
-    }
-    else if (io_elem_bytes == 4)
-    {
         if (head_dim == 512)
         {
-            DISPATCH_NN(512, 4, 128);
+            DISPATCH_DTYPE(512, 4, DISPATCH_NN);
         }
         else
         {
-            DISPATCH_NN(128, 4, 128);
+            DISPATCH_DTYPE(128, 4, DISPATCH_NN);
         }
     }
     else
     {
         if (head_dim == 512)
         {
-            DISPATCH_NN(512, 2, 128);
+            DISPATCH_DTYPE(512, 128, DISPATCH_NN);
         }
         else
         {
-            DISPATCH_NN(128, 2, 128);
+            DISPATCH_DTYPE(128, 128, DISPATCH_NN);
         }
     }
 
+#undef DISPATCH_DTYPE
 #undef DISPATCH_NN
 #undef DISPATCH_NN_MW
 #undef LAUNCH_DECODE_MW
@@ -792,7 +800,7 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
 // ============================================================================
 // Prefill Kernel: prefillReductionKernel
 //
-// Template: <HEAD_DIM, IO_ELEM_BYTES>
+// Template: <HEAD_DIM, KV_SCORE_ELEM_BYTES, STATE_ELEM_BYTES>
 //
 // Grid:  (batch_size, max_outputs_per_batch) — one block per compressed output
 // Block: (NTHRD) where NTHRD = HEAD_DIM / VEC (>= 32 threads)
@@ -816,24 +824,22 @@ void pagedKvCompressLaunch(void const* kv_score, float const* ape, void* paged_k
 // Per-element online softmax step on VEC elements via 128-bit vectorized loads.
 // Reads directly from the kv_score input buffer (not paged state) since prefill
 // has the full sequence available.
-template <int HEAD_DIM, int IO_ELEM_BYTES>
+template <int HEAD_DIM, int KV_SCORE_ELEM_BYTES, int VEC>
 __device__ __forceinline__ void prefillSoftmaxVec(void const* __restrict__ kv_score_raw, float const* __restrict__ ape,
     int64_t row_elem, // (input_offset + row_idx) * two_sd
     int kv_col_off,   // column offset into kv_score row (0 or HEAD_DIM)
     int ape_base,     // r * state_dim + ape_col_off
     int state_dim, int tid, float* __restrict__ rmax, float* __restrict__ rsum, float* __restrict__ rwsum)
 {
-    using IoElemT = typename std::conditional<IO_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
-    constexpr int MAX_VEC = 16 / IO_ELEM_BYTES;
-    constexpr int VEC = (HEAD_DIM / MAX_VEC >= 32) ? MAX_VEC : (HEAD_DIM / 32);
-    using IoVecT = typename VecType<VEC * IO_ELEM_BYTES>::type;
+    using KvScoreElemT = typename std::conditional<KV_SCORE_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
+    using KvScoreVecT = typename VecType<VEC * KV_SCORE_ELEM_BYTES>::type;
 
-    auto const* kv = reinterpret_cast<IoElemT const*>(kv_score_raw);
+    auto const* kv = reinterpret_cast<KvScoreElemT const*>(kv_score_raw);
 
-    IoVecT k_raw = reinterpret_cast<IoVecT const*>(&kv[row_elem + kv_col_off])[tid];
-    IoVecT s_raw = reinterpret_cast<IoVecT const*>(&kv[row_elem + state_dim + kv_col_off])[tid];
-    IoElemT const* ke = reinterpret_cast<IoElemT const*>(&k_raw);
-    IoElemT const* se = reinterpret_cast<IoElemT const*>(&s_raw);
+    KvScoreVecT k_raw = reinterpret_cast<KvScoreVecT const*>(&kv[row_elem + kv_col_off])[tid];
+    KvScoreVecT s_raw = reinterpret_cast<KvScoreVecT const*>(&kv[row_elem + state_dim + kv_col_off])[tid];
+    KvScoreElemT const* ke = reinterpret_cast<KvScoreElemT const*>(&k_raw);
+    KvScoreElemT const* se = reinterpret_cast<KvScoreElemT const*>(&s_raw);
 
 #pragma unroll
     for (int i = 0; i < VEC; i += 4)
@@ -856,20 +862,24 @@ __device__ __forceinline__ void prefillSoftmaxVec(void const* __restrict__ kv_sc
     }
 }
 
-template <int HEAD_DIM, int IO_ELEM_BYTES, int COMPRESS_RATIO>
+template <int HEAD_DIM, int KV_SCORE_ELEM_BYTES, int STATE_ELEM_BYTES, int COMPRESS_RATIO>
 __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, float const* __restrict__ ape,
     void* __restrict__ paged_kv_raw, void* __restrict__ paged_score_raw, int32_t const* __restrict__ block_table_kv,
     int32_t const* __restrict__ block_table_score, void* __restrict__ output_raw, int32_t const* __restrict__ kv_lens,
     int32_t const* __restrict__ start_pos_arr, int32_t const* __restrict__ cu_seq_lens,
     int32_t const* __restrict__ cu_kv_comp, int page_size, int state_dim, int max_blocks, int out_elem_bytes)
 {
-    using IoElemT = typename std::conditional<IO_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
+    using KvScoreElemT = typename std::conditional<KV_SCORE_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
+    using StateElemT = typename std::conditional<STATE_ELEM_BYTES == 2, __nv_bfloat16, float>::type;
     static_assert(COMPRESS_RATIO == 4 || COMPRESS_RATIO == 128, "Unsupported COMPRESS_RATIO");
     constexpr bool IS_OVERLAP = (COMPRESS_RATIO == 4);
 
-    constexpr int MAX_VEC = 16 / IO_ELEM_BYTES;
+    constexpr int ELEM_BYTES_FOR_VEC
+        = (KV_SCORE_ELEM_BYTES > STATE_ELEM_BYTES) ? KV_SCORE_ELEM_BYTES : STATE_ELEM_BYTES;
+    constexpr int MAX_VEC = 16 / ELEM_BYTES_FOR_VEC;
     constexpr int VEC = (HEAD_DIM / MAX_VEC >= 32) ? MAX_VEC : (HEAD_DIM / 32);
-    using IoVecT = typename VecType<VEC * IO_ELEM_BYTES>::type;
+    using KvScoreVecT = typename VecType<VEC * KV_SCORE_ELEM_BYTES>::type;
+    using StateVecT = typename VecType<VEC * STATE_ELEM_BYTES>::type;
     static_assert(VEC >= 4, "VEC must be >= 4 for float4 ape loads");
 
     int const tid = threadIdx.x;
@@ -900,9 +910,9 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
     int const abs_idx = first_abs_idx + local_output_idx;
     int const win_start = abs_idx * COMPRESS_RATIO;
 
-    auto const* kv_score = reinterpret_cast<IoElemT const*>(kv_score_raw);
-    auto* paged_kv = reinterpret_cast<IoElemT*>(paged_kv_raw);
-    auto* paged_score = reinterpret_cast<IoElemT*>(paged_score_raw);
+    auto const* kv_score = reinterpret_cast<KvScoreElemT const*>(kv_score_raw);
+    auto* paged_kv = reinterpret_cast<StateElemT*>(paged_kv_raw);
+    auto* paged_score = reinterpret_cast<StateElemT*>(paged_score_raw);
 
     int64_t const two_sd = 2 * state_dim;
     int64_t const page_sd = static_cast<int64_t>(page_size) * state_dim;
@@ -939,23 +949,32 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
                 int64_t const dkv = static_cast<int64_t>(phys_kv) * page_sd + blk_off * state_dim + col;
                 int64_t const dsc = static_cast<int64_t>(phys_sc) * page_sd + blk_off * state_dim + col;
 
-                IoVecT kv_raw = reinterpret_cast<IoVecT const*>(&kv_score[src])[tid];
-                IoVecT sc_raw = reinterpret_cast<IoVecT const*>(&kv_score[src + state_dim])[tid];
-                reinterpret_cast<IoVecT*>(&paged_kv[dkv])[tid] = kv_raw;
+                KvScoreVecT kv_raw = reinterpret_cast<KvScoreVecT const*>(&kv_score[src])[tid];
+                KvScoreVecT sc_raw = reinterpret_cast<KvScoreVecT const*>(&kv_score[src + state_dim])[tid];
 
-                IoElemT const* sc_e = reinterpret_cast<IoElemT const*>(&sc_raw);
-                IoVecT sc_out;
-                IoElemT* sc_o = reinterpret_cast<IoElemT*>(&sc_out);
+                KvScoreElemT const* kv_e = reinterpret_cast<KvScoreElemT const*>(&kv_raw);
+                StateVecT kv_out;
+                StateElemT* kv_o = reinterpret_cast<StateElemT*>(&kv_out);
+#pragma unroll
+                for (int i = 0; i < VEC; i++)
+                {
+                    kv_o[i] = static_cast<StateElemT>(static_cast<float>(kv_e[i]));
+                }
+                reinterpret_cast<StateVecT*>(&paged_kv[dkv])[tid] = kv_out;
+
+                KvScoreElemT const* sc_e = reinterpret_cast<KvScoreElemT const*>(&sc_raw);
+                StateVecT sc_out;
+                StateElemT* sc_o = reinterpret_cast<StateElemT*>(&sc_out);
 #pragma unroll
                 for (int i = 0; i < VEC; i += 4)
                 {
                     float4 av = *reinterpret_cast<float4 const*>(&ape[r * state_dim + col + tid * VEC + i]);
-                    sc_o[i] = static_cast<IoElemT>(static_cast<float>(sc_e[i]) + av.x);
-                    sc_o[i + 1] = static_cast<IoElemT>(static_cast<float>(sc_e[i + 1]) + av.y);
-                    sc_o[i + 2] = static_cast<IoElemT>(static_cast<float>(sc_e[i + 2]) + av.z);
-                    sc_o[i + 3] = static_cast<IoElemT>(static_cast<float>(sc_e[i + 3]) + av.w);
+                    sc_o[i] = static_cast<StateElemT>(static_cast<float>(sc_e[i]) + av.x);
+                    sc_o[i + 1] = static_cast<StateElemT>(static_cast<float>(sc_e[i + 1]) + av.y);
+                    sc_o[i + 2] = static_cast<StateElemT>(static_cast<float>(sc_e[i + 2]) + av.z);
+                    sc_o[i + 3] = static_cast<StateElemT>(static_cast<float>(sc_e[i + 3]) + av.w);
                 }
-                reinterpret_cast<IoVecT*>(&paged_score[dsc])[tid] = sc_out;
+                reinterpret_cast<StateVecT*>(&paged_score[dsc])[tid] = sc_out;
             }
         }
     };
@@ -1022,8 +1041,8 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
             int blk_off = pos % page_size;
             int phys_kv = block_table_kv[batch_idx * max_blocks + log_blk];
             int phys_sc = block_table_score[batch_idx * max_blocks + log_blk];
-            decodeSoftmaxVec<HEAD_DIM, IO_ELEM_BYTES>(paged_kv_raw, paged_score_raw, page_sd, state_dim, phys_kv,
-                phys_sc, blk_off, kv_col_off, tid, rmax, rsum, rwsum);
+            decodeSoftmaxVec<HEAD_DIM, STATE_ELEM_BYTES, VEC>(paged_kv_raw, paged_score_raw, page_sd, state_dim,
+                phys_kv, phys_sc, blk_off, kv_col_off, tid, rmax, rsum, rwsum);
         }
 
         // New-token portion — read from kv_score and add APE live.
@@ -1032,7 +1051,7 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
             int const pos = range_start + r;
             int const input_row = pos - sp;
             int64_t const row = static_cast<int64_t>(input_offset + input_row) * two_sd;
-            prefillSoftmaxVec<HEAD_DIM, IO_ELEM_BYTES>(
+            prefillSoftmaxVec<HEAD_DIM, KV_SCORE_ELEM_BYTES, VEC>(
                 kv_score_raw, ape, row, kv_col_off, r * state_dim + ape_col_off, state_dim, tid, rmax, rsum, rwsum);
         }
     };
@@ -1083,19 +1102,20 @@ __global__ void prefillReductionKernel(void const* __restrict__ kv_score_raw, fl
 }
 
 // Explicit instantiations
-#define INST_PREFILL(HD, EB, CR)                                                                                       \
-    template __global__ void prefillReductionKernel<HD, EB, CR>(void const*, float const*, void*, void*,               \
+#define INST_PREFILL(HD, KV_EB, STATE_EB, CR)                                                                          \
+    template __global__ void prefillReductionKernel<HD, KV_EB, STATE_EB, CR>(void const*, float const*, void*, void*,  \
         int32_t const*, int32_t const*, void*, int32_t const*, int32_t const*, int32_t const*, int32_t const*, int,    \
         int, int, int);
 
-INST_PREFILL(128, 2, 4)
-INST_PREFILL(128, 2, 128)
-INST_PREFILL(128, 4, 4)
-INST_PREFILL(128, 4, 128)
-INST_PREFILL(512, 2, 4)
-INST_PREFILL(512, 2, 128)
-INST_PREFILL(512, 4, 4)
-INST_PREFILL(512, 4, 128)
+#define INST_PREFILL_DTYPES(HD, CR)                                                                                    \
+    INST_PREFILL(HD, 2, 2, CR)                                                                                         \
+    INST_PREFILL(HD, 2, 4, CR) INST_PREFILL(HD, 4, 2, CR) INST_PREFILL(HD, 4, 4, CR)
+
+INST_PREFILL_DTYPES(128, 4)
+INST_PREFILL_DTYPES(128, 128)
+INST_PREFILL_DTYPES(512, 4)
+INST_PREFILL_DTYPES(512, 128)
+#undef INST_PREFILL_DTYPES
 #undef INST_PREFILL
 
 // ============================================================================
@@ -1106,9 +1126,9 @@ INST_PREFILL(512, 4, 128)
 // ============================================================================
 
 // Compute threads per block: mirrors compile-time NTHRD = HEAD_DIM / VEC.
-static inline int prefillNthreads(int head_dim, int io_elem_bytes)
+static inline int prefillNthreads(int head_dim, int elem_bytes_for_vec)
 {
-    int max_vec = 16 / io_elem_bytes;
+    int max_vec = 16 / elem_bytes_for_vec;
     int vec = (head_dim / max_vec >= 32) ? max_vec : (head_dim / 32);
     return head_dim / vec;
 }
@@ -1116,57 +1136,63 @@ static inline int prefillNthreads(int head_dim, int io_elem_bytes)
 void prefillReductionLaunch(void const* kv_score, float const* ape, void* paged_kv, void* paged_score,
     int32_t const* block_table_kv, int32_t const* block_table_score, void* output, int32_t const* kv_lens,
     int32_t const* start_pos, int32_t const* cu_seq_lens, int32_t const* cu_kv_comp, int batch_size, int page_size,
-    int max_blocks, int head_dim, int compress_ratio, int max_outputs, int io_elem_bytes, int out_elem_bytes,
-    cudaStream_t stream)
+    int max_blocks, int head_dim, int compress_ratio, int max_outputs, int kv_score_elem_bytes, int state_elem_bytes,
+    int out_elem_bytes, cudaStream_t stream)
 {
     bool const overlap = (compress_ratio == 4);
     TLLM_CHECK_WITH_INFO(
         compress_ratio == 4 || compress_ratio == 128, "prefillReductionLaunch only supports compress_ratio 4 or 128");
-    int const nthreads = prefillNthreads(head_dim, io_elem_bytes);
+    TLLM_CHECK_WITH_INFO(
+        (kv_score_elem_bytes == 2 || kv_score_elem_bytes == 4) && (state_elem_bytes == 2 || state_elem_bytes == 4),
+        "prefillReductionLaunch only supports bf16/fp32 kv_score and paged state");
+    int const elem_bytes_for_vec = max(kv_score_elem_bytes, state_elem_bytes);
+    int const nthreads = prefillNthreads(head_dim, elem_bytes_for_vec);
     int const coff = overlap ? 2 : 1;
     int const state_dim = coff * head_dim;
     dim3 grid(batch_size, max(max_outputs, 1));
 
-#define LAUNCH_PREFILL(HD, EB, CR)                                                                                     \
-    prefillReductionKernel<HD, EB, CR><<<grid, nthreads, 0, stream>>>(kv_score, ape, paged_kv, paged_score,            \
-        block_table_kv, block_table_score, output, kv_lens, start_pos, cu_seq_lens, cu_kv_comp, page_size, state_dim,  \
-        max_blocks, out_elem_bytes)
+#define LAUNCH_PREFILL(HD, KV_EB, STATE_EB, CR)                                                                        \
+    prefillReductionKernel<HD, KV_EB, STATE_EB, CR><<<grid, nthreads, 0, stream>>>(kv_score, ape, paged_kv,            \
+        paged_score, block_table_kv, block_table_score, output, kv_lens, start_pos, cu_seq_lens, cu_kv_comp,           \
+        page_size, state_dim, max_blocks, out_elem_bytes)
 
-    if (io_elem_bytes == 4)
+#define DISPATCH_PREFILL_DTYPE(HD, CR)                                                                                 \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        if (kv_score_elem_bytes == 4 && state_elem_bytes == 4)                                                         \
+        {                                                                                                              \
+            LAUNCH_PREFILL(HD, 4, 4, CR);                                                                              \
+        }                                                                                                              \
+        else if (kv_score_elem_bytes == 2 && state_elem_bytes == 4)                                                    \
+        {                                                                                                              \
+            LAUNCH_PREFILL(HD, 2, 4, CR);                                                                              \
+        }                                                                                                              \
+        else if (kv_score_elem_bytes == 4 && state_elem_bytes == 2)                                                    \
+        {                                                                                                              \
+            LAUNCH_PREFILL(HD, 4, 2, CR);                                                                              \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            LAUNCH_PREFILL(HD, 2, 2, CR);                                                                              \
+        }                                                                                                              \
+    } while (false)
+
+    if (head_dim == 512)
     {
-        if (head_dim == 512)
-        {
-            if (compress_ratio == 4)
-                LAUNCH_PREFILL(512, 4, 4);
-            else
-                LAUNCH_PREFILL(512, 4, 128);
-        }
+        if (compress_ratio == 4)
+            DISPATCH_PREFILL_DTYPE(512, 4);
         else
-        {
-            if (compress_ratio == 4)
-                LAUNCH_PREFILL(128, 4, 4);
-            else
-                LAUNCH_PREFILL(128, 4, 128);
-        }
+            DISPATCH_PREFILL_DTYPE(512, 128);
     }
     else
     {
-        if (head_dim == 512)
-        {
-            if (compress_ratio == 4)
-                LAUNCH_PREFILL(512, 2, 4);
-            else
-                LAUNCH_PREFILL(512, 2, 128);
-        }
+        if (compress_ratio == 4)
+            DISPATCH_PREFILL_DTYPE(128, 4);
         else
-        {
-            if (compress_ratio == 4)
-                LAUNCH_PREFILL(128, 2, 4);
-            else
-                LAUNCH_PREFILL(128, 2, 128);
-        }
+            DISPATCH_PREFILL_DTYPE(128, 128);
     }
 
+#undef DISPATCH_PREFILL_DTYPE
 #undef LAUNCH_PREFILL
 }
 
