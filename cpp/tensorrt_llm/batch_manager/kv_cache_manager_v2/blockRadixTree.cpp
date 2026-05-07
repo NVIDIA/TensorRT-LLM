@@ -208,15 +208,6 @@ int RootBlock::tokensPerBlock() const
 namespace
 {
 
-static void tryExcludeFromEviction(std::weak_ptr<CommittedPage> const& weakPage)
-{
-    auto page = weakPage.lock();
-    if (page && page->status() == PageStatus::DROPPABLE && page->nodeRef.has_value())
-    {
-        page->manager->excludeFromEviction(*page);
-    }
-}
-
 static bool isPrefix(std::vector<TokenIdExt> const& prefix, std::vector<TokenIdExt> const& full)
 {
     if (prefix.size() > full.size())
@@ -241,11 +232,16 @@ BlockKey Block::makeKey(BlockKey const& prevKey, TokenIdExt const* tokens, size_
 
 Block::~Block()
 {
-    // If we have cached pages that are droppable+scheduled, exclude them from eviction.
-    // This mirrors Python Block.__del__.
+    // Mirrors Python Block.__del__: for each stored page, if alive and
+    // DROPPABLE and scheduled for eviction, exclude from eviction.
     for (auto const& weakPage : storage)
     {
-        tryExcludeFromEviction(weakPage);
+        auto const page = unwrap(weakPage);
+        if (page->status() == PageStatus::DROPPABLE)
+        {
+            if (page->scheduledForEviction())
+                page->manager->excludeFromEviction(*page);
+        }
     }
     // If we're the last child of a root block, remove the root block from the tree.
     // Mirrors Python: `self.prev.prev.next.pop(self.prev.key)`
@@ -314,33 +310,25 @@ void Block::unsetPage(LifeCycleId lcIdx, LifeCycle const& lc)
 
     // Reuse cleanup only applies to attention lifecycles.
     // SSM lifecycles are allowed in the tree but don't trigger subtree eviction.
-    if (auto const* alc = std::get_if<AttnLifeCycle>(&lc))
+    auto const alc = std::get_if<AttnLifeCycle>(&lc);
+
+    // If this is a non-sink block with no window (or sink block): evict subtree.
+    // Mirrors Python: pages = remove_subtree(self)
+    if (alc && (!alc->windowSize.has_value() || ordinal < alc->numSinkBlocks))
     {
-        // If this is a non-sink block with no window (or sink block): evict descendants.
-        // Mirrors Python's remove_subtree(self), which clears ALL storage on self and descendants.
-        if (!alc->windowSize.has_value() || ordinal < alc->numSinkBlocks)
+        auto const self = shared_from_this(); // prevent destruction during removeSubtree
+        auto& parentMap = *parentNextMap();
+        assert(parentMap);
+        auto const allPages = removeSubtree(parentMap, key);
+
+        for (auto const& weakPage : allPages)
         {
-            std::vector<BlockKey> childKeys;
-            childKeys.reserve(next.size());
-            for (auto const& [k, child] : next)
-                childKeys.push_back(k);
-
-            for (auto const& k : childKeys)
+            auto pg = weakPage.lock();
+            if (pg)
             {
-                auto pages = removeSubtree(next, k);
-                for (auto const& weakPage : pages)
-                    tryExcludeFromEviction(weakPage);
-            }
-
-            // Also clear self's storage for OTHER lifecycles (Python's remove_subtree(self)
-            // clears all entries in self.storage, not just lcIdx).
-            for (size_t i = 0; i < storage.size(); ++i)
-            {
-                if (i != static_cast<size_t>(lcIdx))
-                {
-                    tryExcludeFromEviction(storage[i]);
-                    storage[i].reset();
-                }
+                assert(pg->status() == PageStatus::DROPPABLE);
+                if (pg->scheduledForEviction())
+                    pg->manager->excludeFromEviction(*pg);
             }
         }
     }
