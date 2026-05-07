@@ -23,14 +23,14 @@ namespace tensorrt_llm::executor
 MultimodalInput::MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
     std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths,
     std::optional<std::vector<std::optional<std::string>>> multimodalUuids,
-    std::optional<std::vector<SizeType32>> multimodalItemRunCuSeqlen,
+    std::optional<std::vector<SizeType32>> multimodalItemRunCuOffsets,
     std::optional<std::vector<SizeType32>> multimodalRunPositions,
     std::optional<std::vector<SizeType32>> multimodalRunLengths)
     : mMultimodalHashes(std::move(multimodalHashes))
     , mMultimodalPositions(std::move(multimodalPositions))
     , mMultimodalLengths(std::move(multimodalLengths))
     , mMultimodalUuids(std::move(multimodalUuids))
-    , mMultimodalItemRunCuSeqlen(std::move(multimodalItemRunCuSeqlen))
+    , mMultimodalItemRunCuOffsets(std::move(multimodalItemRunCuOffsets))
     , mMultimodalRunPositions(std::move(multimodalRunPositions))
     , mMultimodalRunLengths(std::move(multimodalRunLengths))
 {
@@ -56,9 +56,9 @@ std::optional<std::vector<std::optional<std::string>>> const& MultimodalInput::g
     return mMultimodalUuids;
 }
 
-std::optional<std::vector<SizeType32>> const& MultimodalInput::getMultimodalItemRunCuSeqlen() const
+std::optional<std::vector<SizeType32>> const& MultimodalInput::getMultimodalItemRunCuOffsets() const
 {
-    return mMultimodalItemRunCuSeqlen;
+    return mMultimodalItemRunCuOffsets;
 }
 
 std::optional<std::vector<SizeType32>> const& MultimodalInput::getMultimodalRunPositions() const

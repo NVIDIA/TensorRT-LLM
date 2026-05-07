@@ -129,7 +129,7 @@ std::shared_ptr<tb::LlmRequest> LlmRequest::toTrtLlm() const
         mContextPhaseParams,                                       //
         mCacheSaltID,                                              //
         mPerfMetrics.timingMetrics.arrivalTime,                    //
-        mMultimodalItemRunCuSeqlen,                                //
+        mMultimodalItemRunCuOffsets,                               //
         mMultimodalRunPositions,                                   //
         mMultimodalRunLengths                                      //
     );

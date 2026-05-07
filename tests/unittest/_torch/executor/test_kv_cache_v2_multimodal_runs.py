@@ -35,7 +35,7 @@ def test_augment_tokens_for_block_reuse_uses_exact_multimodal_runs():
         multimodal_hashes=[_HASH_INTS],
         multimodal_positions=[1],
         multimodal_lengths=[4],
-        multimodal_item_run_cu_seqlen=[0, 2],
+        multimodal_item_run_cu_offsets=[0, 2],
         multimodal_run_positions=[1, 8],
         multimodal_run_lengths=[2, 2],
     )
@@ -66,7 +66,7 @@ def test_augment_tokens_for_block_reuse_skips_out_of_slice_runs(monkeypatch):
         multimodal_hashes=[_HASH_INTS],
         multimodal_positions=[1],
         multimodal_lengths=[4],
-        multimodal_item_run_cu_seqlen=[0, 2],
+        multimodal_item_run_cu_offsets=[0, 2],
         multimodal_run_positions=[1, 8],
         multimodal_run_lengths=[2, 2],
     )
@@ -83,7 +83,7 @@ def test_augment_tokens_for_block_reuse_rejects_incomplete_run_metadata():
         multimodal_hashes=[_HASH_INTS],
         multimodal_positions=[1],
         multimodal_lengths=[4],
-        multimodal_item_run_cu_seqlen=[0, 1],
+        multimodal_item_run_cu_offsets=[0, 1],
     )
 
     tokens = list(range(8))

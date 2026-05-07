@@ -112,28 +112,28 @@ def _as_int64_cpu_tensor(values: Sequence[int] | torch.Tensor) -> torch.Tensor:
 def _resolve_multimodal_run_metadata(
         req: LlmRequest) -> Optional[_MmRunMetadata]:
     # NOTE: the following optional fields help in exact mm token position mixing in blockhash key generation
-    item_run_cu_seqlen = getattr(req, "multimodal_item_run_cu_seqlen", None)
+    item_run_cu_offsets = getattr(req, "multimodal_item_run_cu_offsets", None)
     run_positions = getattr(req, "multimodal_run_positions", None)
     run_lengths = getattr(req, "multimodal_run_lengths", None)
 
     if all(field is None
-           for field in (item_run_cu_seqlen, run_positions, run_lengths)):
+           for field in (item_run_cu_offsets, run_positions, run_lengths)):
         return None
 
-    if (item_run_cu_seqlen is None or run_positions is None
+    if (item_run_cu_offsets is None or run_positions is None
             or run_lengths is None):
         raise ValueError(
             "multimodal run metadata must be validated before block reuse and provided together"
         )
 
-    item_run_cu_seqlen = _as_int64_cpu_tensor(item_run_cu_seqlen)
+    item_run_cu_offsets = _as_int64_cpu_tensor(item_run_cu_offsets)
     run_positions = _as_int64_cpu_tensor(run_positions)
     run_lengths = _as_int64_cpu_tensor(run_lengths)
 
-    item_run_counts = item_run_cu_seqlen[1:] - item_run_cu_seqlen[:-1]
+    item_run_counts = item_run_cu_offsets[1:] - item_run_cu_offsets[:-1]
     cumulative_run_lengths = torch.cat(
         (torch.zeros(1, dtype=torch.int64), torch.cumsum(run_lengths, dim=0)))
-    item_starts = item_run_cu_seqlen[:-1]
+    item_starts = item_run_cu_offsets[:-1]
     run_item_indices = torch.repeat_interleave(
         torch.arange(item_run_counts.numel(), dtype=torch.int64),
         item_run_counts)

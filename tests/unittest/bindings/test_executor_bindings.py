@@ -1016,7 +1016,7 @@ def test_multimodal_input():
     assert config.multimodal_lengths == multimodal_lengths
     # Default value for multimodal_uuids should be None
     assert config.multimodal_uuids is None
-    assert config.multimodal_item_run_cu_seqlen is None
+    assert config.multimodal_item_run_cu_offsets is None
     assert config.multimodal_run_positions is None
     assert config.multimodal_run_lengths is None
 
@@ -1055,7 +1055,7 @@ def test_multimodal_input_with_exact_run_buffers():
     multimodal_positions = [1, 8]
     multimodal_lengths = [3, 2]
     multimodal_uuids = ["item-a", None]
-    item_run_cu_seqlen = [0, 2, 3]
+    item_run_cu_offsets = [0, 2, 3]
     run_positions = [1, 5, 8]
     run_lengths = [2, 1, 2]
 
@@ -1064,7 +1064,7 @@ def test_multimodal_input_with_exact_run_buffers():
         multimodal_positions,
         multimodal_lengths,
         multimodal_uuids,
-        item_run_cu_seqlen,
+        item_run_cu_offsets,
         run_positions,
         run_lengths,
     )
@@ -1072,7 +1072,7 @@ def test_multimodal_input_with_exact_run_buffers():
     assert config.multimodal_positions == multimodal_positions
     assert config.multimodal_lengths == multimodal_lengths
     assert config.multimodal_uuids == multimodal_uuids
-    assert config.multimodal_item_run_cu_seqlen == item_run_cu_seqlen
+    assert config.multimodal_item_run_cu_offsets == item_run_cu_offsets
     assert config.multimodal_run_positions == run_positions
     assert config.multimodal_run_lengths == run_lengths
 
@@ -1095,11 +1095,11 @@ def test_multimodal_input_pickle_with_uuids():
     assert restored.multimodal_positions == multimodal_positions
     assert restored.multimodal_lengths == multimodal_lengths
     assert restored.multimodal_uuids == multimodal_uuids
-    assert restored.multimodal_item_run_cu_seqlen is None
+    assert restored.multimodal_item_run_cu_offsets is None
     assert restored.multimodal_run_positions is None
     assert restored.multimodal_run_lengths is None
 
-    item_run_cu_seqlen = [0, 2, 3]
+    item_run_cu_offsets = [0, 2, 3]
     run_positions = [10, 20, 100]
     run_lengths = [5, 45, 60]
     config_with_runs = trtllm.MultimodalInput(
@@ -1107,12 +1107,12 @@ def test_multimodal_input_pickle_with_uuids():
         multimodal_positions,
         multimodal_lengths,
         multimodal_uuids,
-        item_run_cu_seqlen,
+        item_run_cu_offsets,
         run_positions,
         run_lengths,
     )
     restored_with_runs = pickle.loads(pickle.dumps(config_with_runs))
-    assert restored_with_runs.multimodal_item_run_cu_seqlen == item_run_cu_seqlen
+    assert restored_with_runs.multimodal_item_run_cu_offsets == item_run_cu_offsets
     assert restored_with_runs.multimodal_run_positions == run_positions
     assert restored_with_runs.multimodal_run_lengths == run_lengths
 

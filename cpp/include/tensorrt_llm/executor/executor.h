@@ -299,7 +299,7 @@ public:
     explicit MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
         std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths,
         std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt,
-        std::optional<std::vector<SizeType32>> multimodalItemRunCuSeqlen = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalItemRunCuOffsets = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalRunPositions = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalRunLengths = std::nullopt);
 
@@ -307,7 +307,7 @@ public:
     [[nodiscard]] std::vector<SizeType32> getMultimodalPositions() const;
     [[nodiscard]] std::vector<SizeType32> getMultimodalLengths() const;
     [[nodiscard]] std::optional<std::vector<std::optional<std::string>>> const& getMultimodalUuids() const;
-    [[nodiscard]] std::optional<std::vector<SizeType32>> const& getMultimodalItemRunCuSeqlen() const;
+    [[nodiscard]] std::optional<std::vector<SizeType32>> const& getMultimodalItemRunCuOffsets() const;
     [[nodiscard]] std::optional<std::vector<SizeType32>> const& getMultimodalRunPositions() const;
     [[nodiscard]] std::optional<std::vector<SizeType32>> const& getMultimodalRunLengths() const;
 
@@ -322,8 +322,8 @@ private:
     /// @brief Optional user-provided UUIDs for multimodal items.
     /// When provided, these are returned in KV cache events instead of content hashes.
     std::optional<std::vector<std::optional<std::string>>> mMultimodalUuids;
-    /// @brief Optional prefix sum indexing the flat exact multimodal run arrays per item.
-    std::optional<std::vector<SizeType32>> mMultimodalItemRunCuSeqlen;
+    /// @brief Optional offsets indexing the flat exact multimodal run arrays per item.
+    std::optional<std::vector<SizeType32>> mMultimodalItemRunCuOffsets;
     /// @brief Optional prompt start positions for flat exact multimodal token runs.
     std::optional<std::vector<SizeType32>> mMultimodalRunPositions;
     /// @brief Optional lengths for flat exact multimodal token runs.

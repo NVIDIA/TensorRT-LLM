@@ -16,6 +16,7 @@ from tensorrt_llm.logger import logger
 
 # Default hasher
 default_hasher = blake3
+_INT32_MAX = 2_147_483_647
 
 
 def strip_mm_data_for_generation(mm_data: Dict[str, Any]) -> None:
@@ -86,12 +87,12 @@ class MultimodalInput:
     returned in KV cache events.
     """
 
-    multimodal_item_run_cu_seqlen: Optional[List[int]] = None
-    """Optional prefix sum over the flat multimodal run arrays.
+    multimodal_item_run_cu_offsets: Optional[List[int]] = None
+    """Optional offsets into the flat multimodal run arrays.
 
     Length is ``len(multimodal_hashes) + 1``. Runs for item ``i`` live in
-    ``multimodal_run_positions[cu[i]:cu[i + 1]]`` and the matching slice of
-    ``multimodal_run_lengths``.
+    ``multimodal_run_positions[offsets[i]:offsets[i + 1]]`` and the matching
+    slice of ``multimodal_run_lengths``.
     """
 
     multimodal_run_positions: Optional[List[int]] = None
@@ -149,7 +150,7 @@ class MultimodalInput:
 
     def _validate_multimodal_runs(self) -> None:
         run_fields = (
-            self.multimodal_item_run_cu_seqlen,
+            self.multimodal_item_run_cu_offsets,
             self.multimodal_run_positions,
             self.multimodal_run_lengths,
         )
@@ -157,33 +158,33 @@ class MultimodalInput:
             return
         if any(field is None for field in run_fields):
             raise ValueError(
-                "multimodal_item_run_cu_seqlen, multimodal_run_positions, "
+                "multimodal_item_run_cu_offsets, multimodal_run_positions, "
                 "and multimodal_run_lengths must be provided together")
 
-        assert self.multimodal_item_run_cu_seqlen is not None
+        assert self.multimodal_item_run_cu_offsets is not None
         assert self.multimodal_run_positions is not None
         assert self.multimodal_run_lengths is not None
 
-        if len(self.multimodal_item_run_cu_seqlen) != len(
+        if len(self.multimodal_item_run_cu_offsets) != len(
                 self.multimodal_hashes) + 1:
-            raise ValueError("multimodal_item_run_cu_seqlen length must be "
+            raise ValueError("multimodal_item_run_cu_offsets length must be "
                              "len(multimodal_hashes) + 1")
-        if self.multimodal_item_run_cu_seqlen[0] != 0:
-            raise ValueError("multimodal_item_run_cu_seqlen must start at 0")
+        if self.multimodal_item_run_cu_offsets[0] != 0:
+            raise ValueError("multimodal_item_run_cu_offsets must start at 0")
         if len(self.multimodal_run_positions) != len(
                 self.multimodal_run_lengths):
             raise ValueError(
                 "multimodal_run_positions and multimodal_run_lengths must "
                 "have the same length")
-        if self.multimodal_item_run_cu_seqlen[-1] != len(
+        if self.multimodal_item_run_cu_offsets[-1] != len(
                 self.multimodal_run_positions):
             raise ValueError(
-                "multimodal_item_run_cu_seqlen[-1] must equal the number of "
+                "multimodal_item_run_cu_offsets[-1] must equal the number of "
                 "flat multimodal runs")
 
         for field_name, values in (
-            ("multimodal_item_run_cu_seqlen",
-             self.multimodal_item_run_cu_seqlen),
+            ("multimodal_item_run_cu_offsets",
+             self.multimodal_item_run_cu_offsets),
             ("multimodal_run_positions", self.multimodal_run_positions),
             ("multimodal_run_lengths", self.multimodal_run_lengths),
         ):
@@ -191,20 +192,31 @@ class MultimodalInput:
                 raise TypeError(f"{field_name} must be a list")
             if not all(isinstance(x, int) for x in values):
                 raise TypeError(f"{field_name} must contain only integers")
+            if any(value > _INT32_MAX for value in values):
+                raise ValueError(f"{field_name} values must fit in int32")
 
-        if not all(self.multimodal_item_run_cu_seqlen[i] <=
-                   self.multimodal_item_run_cu_seqlen[i + 1]
-                   for i in range(len(self.multimodal_item_run_cu_seqlen) - 1)):
+        if not all(
+                self.multimodal_item_run_cu_offsets[i] <=
+                self.multimodal_item_run_cu_offsets[i + 1]
+                for i in range(len(self.multimodal_item_run_cu_offsets) - 1)):
             raise ValueError(
-                "multimodal_item_run_cu_seqlen must be non-decreasing")
+                "multimodal_item_run_cu_offsets must be non-decreasing")
         if any(pos < 0 for pos in self.multimodal_run_positions):
             raise ValueError("multimodal_run_positions must be non-negative")
         if any(length <= 0 for length in self.multimodal_run_lengths):
             raise ValueError("multimodal_run_lengths must be positive")
+        for run_idx, (position, length) in enumerate(
+                zip(self.multimodal_run_positions,
+                    self.multimodal_run_lengths)):
+            if position + length > _INT32_MAX:
+                raise ValueError(
+                    f"multimodal run {run_idx} end position exceeds int32 "
+                    f"range: position={position}, length={length}, "
+                    f"max={_INT32_MAX}")
 
         for item_idx, expected_length in enumerate(self.multimodal_lengths):
-            run_begin = self.multimodal_item_run_cu_seqlen[item_idx]
-            run_end = self.multimodal_item_run_cu_seqlen[item_idx + 1]
+            run_begin = self.multimodal_item_run_cu_offsets[item_idx]
+            run_end = self.multimodal_item_run_cu_offsets[item_idx + 1]
             actual_length = sum(self.multimodal_run_lengths[run_begin:run_end])
             if actual_length != expected_length:
                 raise ValueError(
@@ -226,7 +238,7 @@ class MultimodalInput:
         mm_positions: List[int],
         mm_lengths: List[int],
         mm_uuids: Optional[List[Optional[str]]] = None,
-        mm_item_run_cu_seqlen: Optional[List[int]] = None,
+        mm_item_run_cu_offsets: Optional[List[int]] = None,
         mm_run_positions: Optional[List[int]] = None,
         mm_run_lengths: Optional[List[int]] = None,
     ) -> 'MultimodalInput':
@@ -234,7 +246,7 @@ class MultimodalInput:
                    multimodal_positions=mm_positions,
                    multimodal_lengths=mm_lengths,
                    multimodal_uuids=mm_uuids,
-                   multimodal_item_run_cu_seqlen=mm_item_run_cu_seqlen,
+                   multimodal_item_run_cu_offsets=mm_item_run_cu_offsets,
                    multimodal_run_positions=mm_run_positions,
                    multimodal_run_lengths=mm_run_lengths)
 
@@ -1079,9 +1091,9 @@ def _find_mm_token_runs_from_mask(
     num_mm_tokens: List[int],
 ) -> Tuple[List[int], List[int], List[int]]:
     """Compute flat exact prompt token runs for each logical multimodal item."""
-    item_run_cu_seqlen = [0]
+    item_run_cu_offsets = [0]
     if not torch.any(mm_mask):
-        return item_run_cu_seqlen, [], []
+        return item_run_cu_offsets, [], []
 
     mm_positions = torch.where(mm_mask)[0]
     lengths_t = torch.tensor(num_mm_tokens)
@@ -1097,7 +1109,7 @@ def _find_mm_token_runs_from_mask(
         item_positions = mm_positions[offset:offset + item_length].tolist()
         offset += item_length
         if len(item_positions) == 0:
-            item_run_cu_seqlen.append(len(run_positions))
+            item_run_cu_offsets.append(len(run_positions))
             continue
 
         run_start = item_positions[0]
@@ -1115,9 +1127,9 @@ def _find_mm_token_runs_from_mask(
 
         run_positions.append(run_start)
         run_lengths.append(run_length)
-        item_run_cu_seqlen.append(len(run_positions))
+        item_run_cu_offsets.append(len(run_positions))
 
-    return item_run_cu_seqlen, run_positions, run_lengths
+    return item_run_cu_offsets, run_positions, run_lengths
 
 
 def validate_mm_inputs(prompt_token_ids: Union[torch.Tensor, List[int],

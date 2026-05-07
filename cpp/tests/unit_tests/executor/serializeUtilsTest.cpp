@@ -1204,7 +1204,7 @@ TEST(SerializeUtilsTest, MultimodalInputWithUuids)
             }
         }
 
-        EXPECT_EQ(original.getMultimodalItemRunCuSeqlen(), deserialized.getMultimodalItemRunCuSeqlen());
+        EXPECT_EQ(original.getMultimodalItemRunCuOffsets(), deserialized.getMultimodalItemRunCuOffsets());
         EXPECT_EQ(original.getMultimodalRunPositions(), deserialized.getMultimodalRunPositions());
         EXPECT_EQ(original.getMultimodalRunLengths(), deserialized.getMultimodalRunLengths());
     };
@@ -1222,10 +1222,10 @@ TEST(SerializeUtilsTest, MultimodalInputWithUuids)
     MultimodalInput inputWithUuids(hashes, positions, lengths, uuids);
     verifyMultimodalInput(inputWithUuids);
 
-    std::vector<SizeType32> itemRunCuSeqlen = {0, 2, 3};
+    std::vector<SizeType32> itemRunCuOffsets = {0, 2, 3};
     std::vector<SizeType32> runPositions = {0, 40, 100};
     std::vector<SizeType32> runLengths = {20, 30, 75};
-    MultimodalInput inputWithRuns(hashes, positions, lengths, uuids, itemRunCuSeqlen, runPositions, runLengths);
+    MultimodalInput inputWithRuns(hashes, positions, lengths, uuids, itemRunCuOffsets, runPositions, runLengths);
     verifyMultimodalInput(inputWithRuns);
 
     // Test with partial UUIDs (mixed Some and None)

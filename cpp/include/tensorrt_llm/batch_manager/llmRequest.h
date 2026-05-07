@@ -149,7 +149,7 @@ public:
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
         std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt,
         std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy = std::nullopt,
-        std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalItemRunCuSeqlen = std::nullopt,
+        std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalItemRunCuOffsets = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalRunPositions = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalRunLengths = std::nullopt)
         : mRequestId(requestId)
@@ -175,7 +175,7 @@ public:
         , mMultimodalPositions(std::move(multimodalPositions))
         , mMultimodalLengths(std::move(multimodalLengths))
         , mMultimodalUuids(std::move(multimodalUuids))
-        , mMultimodalItemRunCuSeqlen(std::move(multimodalItemRunCuSeqlen))
+        , mMultimodalItemRunCuOffsets(std::move(multimodalItemRunCuOffsets))
         , mMultimodalRunPositions(std::move(multimodalRunPositions))
         , mMultimodalRunLengths(std::move(multimodalRunLengths))
         , mMultimodalEmbedding(std::move(multimodalEmbedding))
@@ -416,10 +416,10 @@ public:
             {
                 mMultimodalUuids = std::make_shared<std::vector<std::optional<std::string>>>(multimodalUuids.value());
             }
-            if (auto const& multimodalItemRunCuSeqlen = multimodalInput->getMultimodalItemRunCuSeqlen())
+            if (auto const& multimodalItemRunCuOffsets = multimodalInput->getMultimodalItemRunCuOffsets())
             {
-                mMultimodalItemRunCuSeqlen
-                    = std::make_shared<std::vector<SizeType32>>(multimodalItemRunCuSeqlen.value());
+                mMultimodalItemRunCuOffsets
+                    = std::make_shared<std::vector<SizeType32>>(multimodalItemRunCuOffsets.value());
             }
             if (auto const& multimodalRunPositions = multimodalInput->getMultimodalRunPositions())
             {
@@ -960,9 +960,9 @@ public:
         return mMultimodalUuids;
     }
 
-    [[nodiscard]] std::optional<std::shared_ptr<std::vector<SizeType32>>> getMultimodalItemRunCuSeqlen() const
+    [[nodiscard]] std::optional<std::shared_ptr<std::vector<SizeType32>>> getMultimodalItemRunCuOffsets() const
     {
-        return mMultimodalItemRunCuSeqlen;
+        return mMultimodalItemRunCuOffsets;
     }
 
     [[nodiscard]] std::optional<std::shared_ptr<std::vector<SizeType32>>> getMultimodalRunPositions() const
@@ -2075,7 +2075,7 @@ protected:
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalPositions{std::nullopt};
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalLengths{std::nullopt};
     std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>> mMultimodalUuids{std::nullopt};
-    std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalItemRunCuSeqlen{std::nullopt};
+    std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalItemRunCuOffsets{std::nullopt};
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalRunPositions{std::nullopt};
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalRunLengths{std::nullopt};
     std::optional<TensorPtr> mMultimodalEmbedding{std::nullopt};
@@ -2396,7 +2396,7 @@ public:
         std::optional<executor::ContextPhaseParams> const& contextPhaseParams = std::nullopt,
         std::optional<CacheSaltIDType> cacheSaltID = std::nullopt, std::optional<TimePoint> arrivalTime = std::nullopt,
         std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy = std::nullopt,
-        std::optional<std::vector<SizeType32>> multimodalItemRunCuSeqlen = std::nullopt,
+        std::optional<std::vector<SizeType32>> multimodalItemRunCuOffsets = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalRunPositions = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalRunLengths = std::nullopt)
         : Base(requestId, maxNewTokens, std::make_shared<std::vector<TokenIdType>>(std::move(inputTokens)),
@@ -2433,8 +2433,8 @@ public:
             numReturnSequences, std::move(eagleConfig), skipCrossAttnBlocks, returnPerfMetrics,
             std::move(guidedDecodingParams), languageAdapterUid, allottedTimeMs, contextPhaseParams, cacheSaltID,
             arrivalTime, std::move(agent_hierarchy),
-            multimodalItemRunCuSeqlen.has_value()
-                ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalItemRunCuSeqlen.value()))
+            multimodalItemRunCuOffsets.has_value()
+                ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalItemRunCuOffsets.value()))
                 : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
             multimodalRunPositions.has_value()
                 ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalRunPositions.value()))

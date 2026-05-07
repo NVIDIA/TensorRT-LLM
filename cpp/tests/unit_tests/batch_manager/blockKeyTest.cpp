@@ -183,7 +183,7 @@ TEST_F(BlockKeyTest, GenerateExtraKeysUsesExactMultimodalRuns)
         /*multimodalPositions=*/{1},
         /*multimodalLengths=*/{4},
         /*multimodalUuids=*/std::vector<std::optional<std::string>>{std::string("item-0")},
-        /*multimodalItemRunCuSeqlen=*/std::vector<SizeType32>{0, 2},
+        /*multimodalItemRunCuOffsets=*/std::vector<SizeType32>{0, 2},
         /*multimodalRunPositions=*/std::vector<SizeType32>{1, 8},
         /*multimodalRunLengths=*/std::vector<SizeType32>{2, 2});
 
@@ -222,7 +222,7 @@ TEST_F(BlockKeyTest, GenerateExtraKeysDisablesHashingForIncompleteRunMetadata)
         /*multimodalPositions=*/{1},
         /*multimodalLengths=*/{4},
         /*multimodalUuids=*/std::nullopt,
-        /*multimodalItemRunCuSeqlen=*/std::vector<SizeType32>{0, 1});
+        /*multimodalItemRunCuOffsets=*/std::vector<SizeType32>{0, 1});
 
     Request executorRequest({0, 1, 2, 3, 4}, /*maxTokens=*/1, /*streaming=*/false, SamplingConfig(), OutputConfig(),
         /*endId=*/std::nullopt, /*padId=*/std::nullopt, /*positionIds=*/std::nullopt, /*badWords=*/std::nullopt,

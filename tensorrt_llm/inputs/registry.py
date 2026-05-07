@@ -1017,7 +1017,7 @@ def create_input_processor_with_hash(
         input_ids_tensor = _as_cpu_tensor(prompt_token_ids)
         if input_ids_tensor.numel() == 0:
             start_positions, start_special_token_positions = [], []
-            item_run_cu_seqlen, run_positions, run_lengths = [0], [], []
+            item_run_cu_offsets, run_positions, run_lengths = [0], [], []
         else:
             mm_mask, embed_mask, special_mask = _compute_mm_masks(
                 input_ids_tensor,
@@ -1031,7 +1031,7 @@ def create_input_processor_with_hash(
             start_positions, start_special_token_positions = (
                 _find_mm_token_start_pos_from_masks(mm_mask, special_mask,
                                                     num_mm_tokens))
-            item_run_cu_seqlen, run_positions, run_lengths = (
+            item_run_cu_offsets, run_positions, run_lengths = (
                 _find_mm_token_runs_from_mask(mm_mask, num_mm_tokens))
         # Store special token offsets if available
         if len(start_special_token_positions
@@ -1048,7 +1048,7 @@ def create_input_processor_with_hash(
         extra_processed_inputs[
             "multimodal_input"] = MultimodalInput.from_components(
                 mm_hashes_int32, start_positions, num_mm_tokens, mm_uuid_list,
-                item_run_cu_seqlen, run_positions, run_lengths)
+                item_run_cu_offsets, run_positions, run_lengths)
         return prompt_token_ids, extra_processed_inputs
 
     def process_tokenized_prompt_maybe_hash(

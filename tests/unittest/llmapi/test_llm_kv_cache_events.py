@@ -483,10 +483,10 @@ def test_multimodal_input_exact_run_buffers():
 
     mm_mask = torch.tensor(
         [False, True, True, False, False, True, False, False, True, True])
-    item_run_cu, run_positions, run_lengths = _find_mm_token_runs_from_mask(
+    item_run_cu_offsets, run_positions, run_lengths = _find_mm_token_runs_from_mask(
         mm_mask, [3, 2])
 
-    assert item_run_cu == [0, 2, 3]
+    assert item_run_cu_offsets == [0, 2, 3]
     assert run_positions == [1, 5, 8]
     assert run_lengths == [2, 1, 2]
 
@@ -495,11 +495,11 @@ def test_multimodal_input_exact_run_buffers():
         [1, 8],
         [3, 2],
         ["item-a", None],
-        item_run_cu,
+        item_run_cu_offsets,
         run_positions,
         run_lengths,
     )
-    assert mm_input.multimodal_item_run_cu_seqlen == item_run_cu
+    assert mm_input.multimodal_item_run_cu_offsets == item_run_cu_offsets
     assert mm_input.multimodal_run_positions == run_positions
     assert mm_input.multimodal_run_lengths == run_lengths
 
@@ -508,7 +508,7 @@ def test_multimodal_input_exact_run_buffers():
             multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
             multimodal_positions=[1],
             multimodal_lengths=[2],
-            multimodal_item_run_cu_seqlen=[0, 1],
+            multimodal_item_run_cu_offsets=[0, 1],
         )
 
     with pytest.raises(ValueError, match="sum to 3, expected 2"):
@@ -516,10 +516,34 @@ def test_multimodal_input_exact_run_buffers():
             multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
             multimodal_positions=[1],
             multimodal_lengths=[2],
-            multimodal_item_run_cu_seqlen=[0, 1],
+            multimodal_item_run_cu_offsets=[0, 1],
             multimodal_run_positions=[1],
             multimodal_run_lengths=[3],
         )
+
+
+def test_multimodal_input_rejects_exact_run_int32_overflow():
+    from tensorrt_llm.inputs.multimodal import MultimodalInput
+
+    int32_max = 2_147_483_647
+    with pytest.raises(ValueError, match="end position exceeds int32"):
+        MultimodalInput(
+            multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+            multimodal_positions=[int32_max - 1],
+            multimodal_lengths=[2],
+            multimodal_item_run_cu_offsets=[0, 1],
+            multimodal_run_positions=[int32_max - 1],
+            multimodal_run_lengths=[2],
+        )
+
+    MultimodalInput(
+        multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+        multimodal_positions=[int32_max - 1],
+        multimodal_lengths=[1],
+        multimodal_item_run_cu_offsets=[0, 1],
+        multimodal_run_positions=[int32_max - 1],
+        multimodal_run_lengths=[1],
+    )
 
 
 def test_apply_mm_hashes_uuid_length_mismatch():
