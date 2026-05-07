@@ -42,7 +42,7 @@ else
     nsys_prefix="nsys profile -o ${nsys_file} -f true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=none"
 fi
 
-${nsys_prefix} trtllm-llmapi-launch ${numa_bind_cmd} \
+${nsys_prefix} ${numa_bind_cmd} trtllm-llmapi-launch \
     trtllm-serve ${model_path} \
         --host $(hostname) --port ${port} \
         --config ${config_file}
