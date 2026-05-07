@@ -2957,6 +2957,635 @@ _QUANT_MAX_BY_DTYPE = {
 }
 
 
+# ============================================================================
+# Persistent main kernel — 1D grid, persistent CTA loop with tl.range
+# ============================================================================
+#
+# Design (see ~/dev/scripts/mamba_replay/kernel_microbenchmarks/PERSISTENT_KERNELS.md
+# for the full strawman):
+#
+# * Outer 1D grid of `NUM_PERSISTENT` CTAs (start at NUM_SMS, sweep upward).
+# * Inside the kernel, a `tl.range(pid, total_work, NUM_PERSISTENT, flatten=True,
+#   num_stages=NUM_STAGES)` loop iterates over (slot, M_tile, head) work units.
+# * Hard-sort PNAT host-side and pass `n_writes` as a runtime int32 scalar:
+#   the launcher invokes the kernel twice — once with slot_offset=0,
+#   n_slots=n_writes, WRITE_CHECKPOINT=True, and once with
+#   slot_offset=n_writes, n_slots=B-n_writes, WRITE_CHECKPOINT=False.
+# * `_persistent_main_impl` is a copy of `_replay_main_impl`'s body with the
+#   program_id reads replaced by parameters and the slot_perm logic moved into
+#   the persistent loop wrapper.  No code shared with the existing kernels;
+#   easy to delete if the experiment is abandoned.
+#
+# Notes:
+# * `flatten=True` is canonical for Triton 3.6 persistent kernels (matches the
+#   upstream `_p_matmul_ogs.py` and tutorial 09).  Combined with `num_stages=2`
+#   it pipelines the loop body — but watch open issue triton-lang/triton#8259
+#   which reports this combo can corrupt stores in non-dot loops.  First run
+#   correctness check is critical.
+# * Warp specialization (`warp_specialize=True`) is NOT enabled — Triton 3.6
+#   only supports it for simple matmul loops and our scan won't pattern-match.
+# * No 2CTA cluster mode — that's dot-only per the kernel-tileir-optimization
+#   skill classification.
+
+
+@triton.jit()
+def _persistent_main_impl(
+    # Per-work-unit indices (computed by the persistent wrapper).
+    # `pid_b` is the post-perm slot index (caller has already applied any
+    # slot permutation and slot_offset).
+    pid_m,
+    pid_b,
+    pid_h,
+    # Pointers
+    state_ptr,
+    state_scales_ptr,
+    old_x_ptr,
+    old_B_ptr,
+    old_dt_ptr,
+    old_dA_cumsum_ptr,
+    prev_num_accepted_tokens_ptr,
+    cache_buf_idx_ptr,
+    x_ptr,
+    C_ptr,
+    D_ptr,
+    z_ptr,
+    out_ptr,
+    cb_scaled_ptr,
+    decay_vec_ptr,
+    state_batch_indices_ptr,
+    rand_seed_ptr,
+    pad_slot_id,
+    # Dimensions
+    T: tl.constexpr,
+    MAX_REPLAY_BUFFER_LENGTH: tl.constexpr,
+    dim: tl.constexpr,
+    dstate: tl.constexpr,
+    nheads_ngroups_ratio: tl.constexpr,
+    # state strides
+    stride_state_batch,
+    stride_state_head,
+    stride_state_dim,
+    stride_state_dstate,
+    # state_scales strides
+    stride_state_scales_cache,
+    stride_state_scales_head,
+    stride_state_scales_dim,
+    # old_x strides
+    stride_old_x_cache,
+    stride_old_x_T,
+    stride_old_x_head,
+    stride_old_x_dim,
+    # old_B strides
+    stride_old_B_cache,
+    stride_old_B_dbuf,
+    stride_old_B_T,
+    stride_old_B_group,
+    stride_old_B_dstate,
+    # old_dt strides
+    stride_old_dt_cache,
+    stride_old_dt_dbuf,
+    stride_old_dt_head,
+    stride_old_dt_T,
+    # old_dA_cumsum strides
+    stride_old_dA_cumsum_cache,
+    stride_old_dA_cumsum_dbuf,
+    stride_old_dA_cumsum_head,
+    stride_old_dA_cumsum_T,
+    # x strides
+    stride_x_batch,
+    stride_x_T,
+    stride_x_head,
+    stride_x_dim,
+    # C strides
+    stride_C_batch,
+    stride_C_T,
+    stride_C_group,
+    stride_C_dstate,
+    # D strides
+    stride_D_head,
+    stride_D_dim,
+    # z strides
+    stride_z_batch,
+    stride_z_T,
+    stride_z_head,
+    stride_z_dim,
+    # out strides
+    stride_out_batch,
+    stride_out_T,
+    stride_out_head,
+    stride_out_dim,
+    # cb_scaled strides
+    stride_cb_batch,
+    stride_cb_head,
+    stride_cb_t,
+    stride_cb_j,
+    # decay_vec strides
+    stride_dv_batch,
+    stride_dv_head,
+    stride_dv_t,
+    # Meta
+    BLOCK_SIZE_M: tl.constexpr,
+    HAS_D: tl.constexpr,
+    HAS_Z: tl.constexpr,
+    HAS_CACHE_BATCH_INDICES: tl.constexpr,
+    BLOCK_SIZE_DSTATE: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    BLOCK_SIZE_WINDOW: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
+    USE_RS_ROUNDING: tl.constexpr,
+    PHILOX_ROUNDS: tl.constexpr,
+    QUANT_MAX: tl.constexpr,
+    WRITE_CHECKPOINT: tl.constexpr,
+):
+    # Compile-time invariant: QUANT_MAX > 0 must coincide with a quantized
+    # state dtype (int8 / int16 / float8e4nv) and only those.
+    tl.static_assert(
+        (QUANT_MAX > 0.0)
+        == (
+            (state_ptr.dtype.element_ty == tl.int8)
+            or (state_ptr.dtype.element_ty == tl.int16)
+            or (state_ptr.dtype.element_ty == tl.float8e4nv)
+        ),
+        "QUANT_MAX > 0.0 must coincide with int8 / int16 / float8e4nv state dtype.",
+    )
+
+    if HAS_CACHE_BATCH_INDICES:
+        cache_batch_idx = tl.load(state_batch_indices_ptr + pid_b).to(tl.int64)
+        if cache_batch_idx == pad_slot_id:
+            return
+    else:
+        cache_batch_idx = pid_b.to(tl.int64)
+
+    active_buf = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
+    prev_num_accepted_tokens = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
+    if WRITE_CHECKPOINT:
+        write_buf = 1 - active_buf  # noqa: F841
+        write_offset = 0
+    else:
+        write_buf = active_buf  # noqa: F841
+        write_offset = prev_num_accepted_tokens
+
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_n = tl.arange(0, BLOCK_SIZE_DSTATE)
+    offs_t = tl.arange(0, BLOCK_SIZE_T)
+    offs_window = tl.arange(0, BLOCK_SIZE_WINDOW)
+    m_mask = offs_m < dim
+    n_mask = offs_n < dstate
+    t_mask = offs_t < T
+
+    # Load state
+    state_ptr += cache_batch_idx * stride_state_batch + pid_h * stride_state_head
+    state_ptrs = (
+        state_ptr + offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
+    )
+    state_mask = m_mask[:, None] & n_mask[None, :]
+    state = tl.load(state_ptrs, mask=state_mask, other=0.0).to(tl.float32)
+    if QUANT_MAX > 0.0:
+        state_scales_base = (
+            state_scales_ptr
+            + cache_batch_idx * stride_state_scales_cache
+            + pid_h * stride_state_scales_head
+        )
+        decode_scale = tl.load(
+            state_scales_base + offs_m * stride_state_scales_dim,
+            mask=m_mask,
+            other=1.0,
+        ).to(tl.float32)
+        state = state * decode_scale[:, None]
+
+    # Phase 1: Replay via tl.dot fast-forward (reads from active_buf)
+    group_idx = pid_h // nheads_ngroups_ratio
+
+    old_window_mask = offs_window < prev_num_accepted_tokens
+
+    old_dt_base = (
+        old_dt_ptr
+        + cache_batch_idx * stride_old_dt_cache
+        + active_buf * stride_old_dt_dbuf
+        + pid_h * stride_old_dt_head
+    )
+    old_dt_all = tl.load(
+        old_dt_base + offs_window * stride_old_dt_T, mask=old_window_mask, other=0.0
+    ).to(tl.float32)
+
+    old_dA_cumsum_base = (
+        old_dA_cumsum_ptr
+        + cache_batch_idx * stride_old_dA_cumsum_cache
+        + active_buf * stride_old_dA_cumsum_dbuf
+        + pid_h * stride_old_dA_cumsum_head
+    )
+    old_dA_cumsum_all = tl.load(
+        old_dA_cumsum_base + offs_window * stride_old_dA_cumsum_T,
+        mask=old_window_mask, other=0.0,
+    ).to(tl.float32)
+
+    prev_k_idx = tl.minimum(
+        tl.maximum(prev_num_accepted_tokens - 1, 0), MAX_REPLAY_BUFFER_LENGTH - 1
+    )
+    total_dA_cumsum = tl.load(old_dA_cumsum_base + prev_k_idx * stride_old_dA_cumsum_T).to(
+        tl.float32
+    )
+
+    coeff = tl.exp(total_dA_cumsum - old_dA_cumsum_all) * old_dt_all
+
+    old_x_base = old_x_ptr + cache_batch_idx * stride_old_x_cache + pid_h * stride_old_x_head
+    old_x_all = tl.load(
+        old_x_base + offs_window[:, None] * stride_old_x_T + offs_m[None, :] * stride_old_x_dim,
+        mask=old_window_mask[:, None] & m_mask[None, :],
+        other=0.0,
+    )
+
+    old_B_base = (
+        old_B_ptr
+        + cache_batch_idx * stride_old_B_cache
+        + active_buf * stride_old_B_dbuf
+        + group_idx * stride_old_B_group
+    )
+    old_B_all = tl.load(
+        old_B_base + offs_window[:, None] * stride_old_B_T + offs_n[None, :] * stride_old_B_dstate,
+        mask=old_window_mask[:, None] & n_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+
+    dB_scaled = coeff[:, None] * old_B_all
+
+    total_decay = tl.where(prev_num_accepted_tokens > 0, tl.exp(total_dA_cumsum), 1.0)
+    state *= total_decay
+
+    state += tl.dot(tl.trans(old_x_all).to(tl.bfloat16), dB_scaled.to(tl.bfloat16))
+
+    if WRITE_CHECKPOINT:
+        if USE_RS_ROUNDING:
+            rand_seed = tl.load(rand_seed_ptr)
+            base_rand = cache_batch_idx * stride_state_batch + pid_h * stride_state_head
+            offs_n_q = tl.arange(0, BLOCK_SIZE_DSTATE // 4)
+            rand_offsets_q = (
+                base_rand
+                + offs_m[:, None] * stride_state_dim
+                + offs_n_q[None, :] * (stride_state_dstate * 4)
+            )
+            if PHILOX_ROUNDS > 0:
+                r0, r1, r2, r3 = tl.randint4x(rand_seed, rand_offsets_q, PHILOX_ROUNDS)
+            else:
+                r0, r1, r2, r3 = tl.randint4x(rand_seed, rand_offsets_q)
+            r01 = tl.join(r0, r1)
+            r23 = tl.join(r2, r3)
+            r0123 = tl.join(r01, r23)
+            rand = tl.reshape(r0123, (BLOCK_SIZE_M, BLOCK_SIZE_DSTATE))
+
+        if QUANT_MAX > 0.0:
+            amax = tl.max(tl.abs(state), axis=1)
+            encode_scale = tl.where(amax == 0.0, 1.0, QUANT_MAX / amax)
+            decode_scale = 1.0 / encode_scale
+            state_scales_ptrs = (
+                state_scales_ptr
+                + cache_batch_idx * stride_state_scales_cache
+                + pid_h * stride_state_scales_head
+                + offs_m * stride_state_scales_dim
+            )
+            tl.store(state_scales_ptrs, decode_scale, mask=m_mask)
+            state_q = state * encode_scale[:, None]
+            if USE_RS_ROUNDING and (state_ptrs.dtype.element_ty == tl.float8e4nv):
+                tl.store(
+                    state_ptrs,
+                    _stochastic_round_fp8x4_e4m3(state_q, rand),
+                    mask=state_mask,
+                )
+            else:
+                if USE_RS_ROUNDING:
+                    tl.static_assert(
+                        (state_ptrs.dtype.element_ty == tl.int8)
+                        or (state_ptrs.dtype.element_ty == tl.int16),
+                        "Quantized SR fall-through expects int8 or int16; "
+                        "fp8 SR is handled by the prior branch.",
+                    )
+                    rand01 = (rand & 0x00FFFFFF).to(tl.float32) * (1.0 / float(1 << 24))
+                    state_q = tl.extra.cuda.libdevice.floor(state_q + rand01)
+                elif state_ptrs.dtype.element_ty != tl.float8e4nv:
+                    tl.static_assert(
+                        (state_ptrs.dtype.element_ty == tl.int8)
+                        or (state_ptrs.dtype.element_ty == tl.int16),
+                        "Quantized RN with explicit round() expects int8 or int16.",
+                    )
+                    state_q = tl.extra.cuda.libdevice.round(state_q)
+                state_q = tl.minimum(tl.maximum(state_q, -QUANT_MAX), QUANT_MAX)
+                tl.store(
+                    state_ptrs,
+                    state_q.to(state_ptrs.dtype.element_ty),
+                    mask=state_mask,
+                )
+        elif USE_RS_ROUNDING:
+            tl.static_assert(
+                state_ptrs.dtype.element_ty == tl.float16,
+                "Non-quantized SR only supports fp16 state.",
+            )
+            tl.store(state_ptrs, _stochastic_round_fp16x2(state, rand), mask=state_mask)
+        else:
+            tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=state_mask)
+
+    # Phase 2: Output
+    x_ptr_local = x_ptr + pid_b * stride_x_batch + pid_h * stride_x_head
+    C_ptr_local = C_ptr + pid_b * stride_C_batch + group_idx * stride_C_group
+    if HAS_Z:
+        z_ptr_local = z_ptr + pid_b * stride_z_batch + pid_h * stride_z_head
+    out_ptr_local = out_ptr + pid_b * stride_out_batch + pid_h * stride_out_head
+
+    if HAS_D:
+        D = tl.load(
+            D_ptr + pid_h * stride_D_head + offs_m * stride_D_dim, mask=m_mask, other=0.0
+        ).to(tl.float32)
+
+    if LAUNCH_WITH_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    C_all = tl.load(
+        C_ptr_local + offs_t[:, None] * stride_C_T + offs_n[None, :] * stride_C_dstate,
+        mask=t_mask[:, None] & n_mask[None, :],
+        other=0.0,
+    )
+
+    x_all = tl.load(
+        x_ptr_local + offs_t[:, None] * stride_x_T + offs_m[None, :] * stride_x_dim,
+        mask=t_mask[:, None] & m_mask[None, :],
+        other=0.0,
+    )
+    tl.store(
+        old_x_base
+        + (write_offset + offs_t)[:, None] * stride_old_x_T
+        + offs_m[None, :] * stride_old_x_dim,
+        x_all,
+        mask=t_mask[:, None] & m_mask[None, :],
+    )
+    x_all = x_all.to(tl.float32)
+
+    cb_scaled_base = cb_scaled_ptr + pid_b * stride_cb_batch + pid_h * stride_cb_head
+    CB_scaled = tl.load(
+        cb_scaled_base + offs_t[:, None] * stride_cb_t + offs_t[None, :] * stride_cb_j,
+        mask=(offs_t[:, None] < BLOCK_SIZE_T) & (offs_t[None, :] < BLOCK_SIZE_T),
+        other=0.0,
+    ).to(tl.float32)
+
+    decay_vec_base = decay_vec_ptr + pid_b * stride_dv_batch + pid_h * stride_dv_head
+    decay_vec = tl.load(decay_vec_base + offs_t * stride_dv_t, mask=t_mask, other=0.0).to(
+        tl.float32
+    )
+
+    init_out = tl.dot(C_all.to(tl.bfloat16), tl.trans(state).to(tl.bfloat16)) * decay_vec[:, None]
+    cb_out = tl.dot(CB_scaled.to(tl.bfloat16), x_all.to(tl.bfloat16))
+    out_all = init_out + cb_out
+
+    if HAS_D:
+        out_all = out_all + x_all * D[None, :]
+
+    if HAS_Z:
+        for t in range(T):
+            z_t = tl.load(
+                z_ptr_local + t * stride_z_T + offs_m * stride_z_dim, mask=m_mask, other=0.0
+            ).to(tl.float32)
+            out_t = tl.sum(tl.where((offs_t == t)[:, None], out_all, 0.0), axis=0)
+            out_t = out_t * z_t * tl.sigmoid(z_t)
+            tl.store(out_ptr_local + t * stride_out_T + offs_m * stride_out_dim, out_t, mask=m_mask)
+    else:
+        out_all_ptrs = (
+            out_ptr_local + offs_t[:, None] * stride_out_T + offs_m[None, :] * stride_out_dim
+        )
+        tl.store(out_all_ptrs, out_all, mask=t_mask[:, None] & m_mask[None, :])
+
+
+# Persistent main kernel: 1D grid, persistent CTA loop.
+# Heuristics mirror those of `_checkpointing_main_kernel`.
+@triton.heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
+@triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
+@triton.heuristics(
+    {"HAS_CACHE_BATCH_INDICES": lambda args: args["state_batch_indices_ptr"] is not None}
+)
+@triton.heuristics({"USE_RS_ROUNDING": lambda args: args["rand_seed_ptr"] is not None})
+@triton.heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
+@triton.heuristics({"BLOCK_SIZE_T": lambda args: max(triton.next_power_of_2(args["T"]), 16)})
+@triton.heuristics(
+    {"BLOCK_SIZE_WINDOW": lambda args: max(
+        triton.next_power_of_2(args["MAX_REPLAY_BUFFER_LENGTH"]), 16)}
+)
+@triton.heuristics(
+    {"NUM_PID_M_BLOCKS": lambda args: triton.cdiv(args["dim"], args["BLOCK_SIZE_M"])}
+)
+@triton.jit()
+def _persistent_main_kernel(
+    # Pointers
+    state_ptr,
+    state_scales_ptr,
+    old_x_ptr,
+    old_B_ptr,
+    old_dt_ptr,
+    old_dA_cumsum_ptr,
+    prev_num_accepted_tokens_ptr,
+    cache_buf_idx_ptr,
+    x_ptr,
+    C_ptr,
+    D_ptr,
+    z_ptr,
+    out_ptr,
+    cb_scaled_ptr,
+    decay_vec_ptr,
+    state_batch_indices_ptr,
+    slot_perm_ptr,
+    rand_seed_ptr,
+    pad_slot_id,
+    # Persistent-loop work-distribution scalars.  Caller pre-sorts the batch
+    # write-first; the kernel uses (n_writes, batch_total, WRITE_CHECKPOINT)
+    # to derive its own slot range.  Write half processes [0, n_writes),
+    # nowrite half processes [n_writes, batch_total).
+    n_writes,       # int32: count of write-mode slots in the pre-sorted batch
+    batch_total,    # int32: total slot count
+    nheads,         # int32: total head count (== _replay_main_impl's program_id axis 2 count)
+    # Dimensions
+    T: tl.constexpr,
+    MAX_REPLAY_BUFFER_LENGTH: tl.constexpr,
+    dim: tl.constexpr,
+    dstate: tl.constexpr,
+    nheads_ngroups_ratio: tl.constexpr,
+    # state strides
+    stride_state_batch,
+    stride_state_head,
+    stride_state_dim,
+    stride_state_dstate,
+    # state_scales strides
+    stride_state_scales_cache,
+    stride_state_scales_head,
+    stride_state_scales_dim,
+    # old_x strides
+    stride_old_x_cache,
+    stride_old_x_T,
+    stride_old_x_head,
+    stride_old_x_dim,
+    # old_B strides
+    stride_old_B_cache,
+    stride_old_B_dbuf,
+    stride_old_B_T,
+    stride_old_B_group,
+    stride_old_B_dstate,
+    # old_dt strides
+    stride_old_dt_cache,
+    stride_old_dt_dbuf,
+    stride_old_dt_head,
+    stride_old_dt_T,
+    # old_dA_cumsum strides
+    stride_old_dA_cumsum_cache,
+    stride_old_dA_cumsum_dbuf,
+    stride_old_dA_cumsum_head,
+    stride_old_dA_cumsum_T,
+    # x strides
+    stride_x_batch,
+    stride_x_T,
+    stride_x_head,
+    stride_x_dim,
+    # C strides
+    stride_C_batch,
+    stride_C_T,
+    stride_C_group,
+    stride_C_dstate,
+    # D strides
+    stride_D_head,
+    stride_D_dim,
+    # z strides
+    stride_z_batch,
+    stride_z_T,
+    stride_z_head,
+    stride_z_dim,
+    # out strides
+    stride_out_batch,
+    stride_out_T,
+    stride_out_head,
+    stride_out_dim,
+    # cb_scaled strides
+    stride_cb_batch,
+    stride_cb_head,
+    stride_cb_t,
+    stride_cb_j,
+    # decay_vec strides
+    stride_dv_batch,
+    stride_dv_head,
+    stride_dv_t,
+    # Meta
+    BLOCK_SIZE_M: tl.constexpr,
+    HAS_D: tl.constexpr,
+    HAS_Z: tl.constexpr,
+    HAS_CACHE_BATCH_INDICES: tl.constexpr,
+    BLOCK_SIZE_DSTATE: tl.constexpr,
+    BLOCK_SIZE_T: tl.constexpr,
+    BLOCK_SIZE_WINDOW: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
+    USE_RS_ROUNDING: tl.constexpr,
+    PHILOX_ROUNDS: tl.constexpr,
+    QUANT_MAX: tl.constexpr,
+    WRITE_CHECKPOINT: tl.constexpr,
+    LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
+    USE_PERM: tl.constexpr,
+    NUM_PERSISTENT: tl.constexpr,
+    NUM_LOOP_STAGES: tl.constexpr,
+    NUM_PID_M_BLOCKS: tl.constexpr,
+    FLATTEN: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr,
+):
+    # PDL signal: fire once at kernel entry (not per work unit).
+    if LAUNCH_DEPENDENT_KERNELS:
+        tl.extra.cuda.gdc_launch_dependents()
+
+    # Derive this kernel's slot range from (n_writes, batch_total, WRITE_CHECKPOINT).
+    # Hard-sort contract: caller has pre-sorted so [0, n_writes) are write-mode
+    # and [n_writes, batch_total) are nowrite-mode.  Each launch knows which
+    # half it owns from its WRITE_CHECKPOINT constexpr.
+    if WRITE_CHECKPOINT:
+        slot_lo = 0
+        slot_hi = n_writes
+    else:
+        slot_lo = n_writes
+        slot_hi = batch_total
+    n_slots_local = slot_hi - slot_lo
+
+    pid = tl.program_id(axis=0)
+    total_work = n_slots_local * NUM_PID_M_BLOCKS * nheads
+
+    # Persistent loop.  Decompose tile_id into (pid_h, pid_b_local, pid_m)
+    # with pid_m varying fastest (M-tile cache locality on state load), then
+    # slot, then head — mirrors the existing 3D grid's axis ordering
+    # (axis=0 fastest = pid_m).
+    for tile_id in tl.range(
+        pid, total_work, NUM_PERSISTENT,
+        flatten=FLATTEN, num_stages=NUM_LOOP_STAGES, warp_specialize=WARP_SPECIALIZE,
+    ):
+        pid_m = tile_id % NUM_PID_M_BLOCKS
+        pid_b_local = (tile_id // NUM_PID_M_BLOCKS) % n_slots_local
+        pid_h = tile_id // (NUM_PID_M_BLOCKS * n_slots_local)
+        # Translate local slot index → global slot index.  When USE_PERM is
+        # set, the caller-provided slot_perm gives the original slot index
+        # for the post-sort position.
+        pid_b_grid = pid_b_local + slot_lo
+        if USE_PERM:
+            pid_b = tl.load(slot_perm_ptr + pid_b_grid)
+        else:
+            pid_b = pid_b_grid
+
+        _persistent_main_impl(
+            pid_m, pid_b, pid_h,
+            state_ptr,
+            state_scales_ptr,
+            old_x_ptr,
+            old_B_ptr,
+            old_dt_ptr,
+            old_dA_cumsum_ptr,
+            prev_num_accepted_tokens_ptr,
+            cache_buf_idx_ptr,
+            x_ptr,
+            C_ptr,
+            D_ptr,
+            z_ptr,
+            out_ptr,
+            cb_scaled_ptr,
+            decay_vec_ptr,
+            state_batch_indices_ptr,
+            rand_seed_ptr,
+            pad_slot_id,
+            T,
+            MAX_REPLAY_BUFFER_LENGTH,
+            dim,
+            dstate,
+            nheads_ngroups_ratio,
+            stride_state_batch, stride_state_head, stride_state_dim, stride_state_dstate,
+            stride_state_scales_cache, stride_state_scales_head, stride_state_scales_dim,
+            stride_old_x_cache, stride_old_x_T, stride_old_x_head, stride_old_x_dim,
+            stride_old_B_cache, stride_old_B_dbuf, stride_old_B_T,
+            stride_old_B_group, stride_old_B_dstate,
+            stride_old_dt_cache, stride_old_dt_dbuf, stride_old_dt_head, stride_old_dt_T,
+            stride_old_dA_cumsum_cache, stride_old_dA_cumsum_dbuf,
+            stride_old_dA_cumsum_head, stride_old_dA_cumsum_T,
+            stride_x_batch, stride_x_T, stride_x_head, stride_x_dim,
+            stride_C_batch, stride_C_T, stride_C_group, stride_C_dstate,
+            stride_D_head, stride_D_dim,
+            stride_z_batch, stride_z_T, stride_z_head, stride_z_dim,
+            stride_out_batch, stride_out_T, stride_out_head, stride_out_dim,
+            stride_cb_batch, stride_cb_head, stride_cb_t, stride_cb_j,
+            stride_dv_batch, stride_dv_head, stride_dv_t,
+            BLOCK_SIZE_M,
+            HAS_D,
+            HAS_Z,
+            HAS_CACHE_BATCH_INDICES,
+            BLOCK_SIZE_DSTATE,
+            BLOCK_SIZE_T,
+            BLOCK_SIZE_WINDOW,
+            LAUNCH_WITH_PDL,
+            USE_RS_ROUNDING,
+            PHILOX_ROUNDS,
+            QUANT_MAX,
+            WRITE_CHECKPOINT,
+        )
+
+
+# ============================================================================
+# Python wrapper
+# ============================================================================
+
+
 def checkpointing_state_update(
     state: torch.Tensor,
     old_x: torch.Tensor,
@@ -3004,6 +3633,26 @@ def checkpointing_state_update(
     _heads_per_block: int | None = None,
     _maxnreg: int | None = None,
     _num_ctas: int | None = None,
+    # Persistent-mode bench kwargs (only consulted when mode == "persistent_main"):
+    # _n_writes : int — count of write-mode slots in the (pre-sorted) batch.
+    #   Required when mode == "persistent_main"; the persistent kernel uses
+    #   it as a runtime int32 to compute total_work for write/nowrite halves.
+    # _cta_per_sm : int — CTAs per SM in the 1D persistent grid.  Internally
+    #   expanded to `num_persistent = _cta_per_sm × NUM_SMS`.  Default = 1.
+    # _num_loop_stages : int — `num_stages` arg on the inner `tl.range(...)`
+    #   persistent loop.  Note: this is loop-level, NOT the kernel-arg
+    #   `num_stages` (which only pipelines dot-feeding loads).  Default 2.
+    # _flatten : bool — `flatten` arg on `tl.range(...)`.  Default True
+    #   (the canonical Triton 3.6 persistent idiom).
+    # _warp_specialize : bool — `warp_specialize` arg on `tl.range(...)`.
+    #   Default False.  Triton 3.6 only supports it on simple matmul loops;
+    #   our scan loop probably won't pattern-match — but exposed as a knob
+    #   for sweep experiments.  Requires num_warps >= 4 if True.
+    _n_writes: int | None = None,
+    _cta_per_sm: int | None = None,
+    _num_loop_stages: int | None = None,
+    _flatten: bool | None = None,
+    _warp_specialize: bool | None = None,
 ):
     """
     Replay SSM state update with precomputed CB and tl.dot fast-forward.
@@ -3096,9 +3745,13 @@ def checkpointing_state_update(
     #       and nowrite halves.  Strictly fewer kernel launches than
     #       doublelaunch (3 vs 4) at the cost of dispatch precompute's wider
     #       reg envelope.  write_checkpoint ignored.
-    assert mode in ("monolithic", "dynamic", "doublelaunch", "dlgrouped", "maindl", "dl_write_only"), (
+    assert mode in (
+        "monolithic", "dynamic", "doublelaunch", "dlgrouped", "maindl",
+        "dl_write_only", "persistent_main",
+    ), (
         f"unknown mode {mode!r}; expected one of "
-        "'monolithic', 'dynamic', 'doublelaunch', 'dlgrouped', or 'maindl'"
+        "'monolithic', 'dynamic', 'doublelaunch', 'dlgrouped', 'maindl', "
+        "'dl_write_only', or 'persistent_main'"
     )
     use_rectangle = rectangle_for_nowrite and not write_checkpoint
 
@@ -3631,6 +4284,79 @@ def checkpointing_state_update(
             launch_pdl=use_internal_pdl,
         )
 
+    # ---- launch_persistent_main ------------------------------------------
+    # Persistent-CTA main kernel.  Single launch covers `n_slots` slots
+    # starting at `slot_offset`.  Caller invokes twice: once for the write
+    # half (slot_offset=0, n_slots=n_writes, write_checkpoint=True) and
+    # once for the nowrite half (slot_offset=n_writes,
+    # n_slots=batch-n_writes, write_checkpoint=False).  Hard-sort
+    # contract: caller has pre-sorted slots so [0, n_writes) are writes
+    # and [n_writes, batch) are nowrites.
+
+    # Resolve persistent-mode bench knobs.  Defaults: cta_per_sm = 1
+    # (one CTA per SM, matches upstream `_p_matmul_ogs.py`); num_loop_stages
+    # = 2 (matches in-tree `swiglu` precedent for non-dot persistent loops);
+    # flatten = True (canonical Triton 3.6 idiom); warp_specialize = False.
+    _num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    cta_per_sm_arg = _cta_per_sm if _cta_per_sm else 1
+    num_persistent_arg = cta_per_sm_arg * _num_sms
+    num_loop_stages_arg = _num_loop_stages if _num_loop_stages else 2
+    flatten_arg = True if _flatten is None else bool(_flatten)
+    warp_specialize_arg = False if _warp_specialize is None else bool(_warp_specialize)
+
+    def launch_persistent_main(write_checkpoint: bool, n_writes: int,
+                               launch_dependent_kernels: bool = False):
+        # This launch's effective slot count: n_writes for write half,
+        # batch - n_writes for nowrite half.  Skip the launch entirely if
+        # it has no work — empty halves are normal at the boundaries.
+        n_slots_for_kernel = n_writes if write_checkpoint else (batch - n_writes)
+        if n_slots_for_kernel <= 0:
+            return
+        grid = (num_persistent_arg,)
+        _persistent_main_kernel[grid](
+            state, state_scales_arg, old_x,
+            old_B, old_dt, old_dA_cumsum,
+            prev_num_accepted_tokens, cache_buf_idx,
+            x, C, D, z, out,
+            cb_scaled, decay_vec,
+            state_batch_indices, slot_perm_arg, rand_seed, pad_slot_id,
+            n_writes, batch, nheads,
+            T, max_window, dim, dstate, nheads // ngroups,
+            state.stride(0), state.stride(1), state.stride(2), state.stride(3),
+            state_scales_strides[0], state_scales_strides[1], state_scales_strides[2],
+            old_x.stride(0), old_x.stride(1), old_x.stride(2), old_x.stride(3),
+            old_B.stride(0), old_B.stride(1), old_B.stride(2),
+            old_B.stride(3), old_B.stride(4),
+            old_dt.stride(0), old_dt.stride(1),
+            old_dt.stride(2), old_dt.stride(3),
+            old_dA_cumsum.stride(0), old_dA_cumsum.stride(1),
+            old_dA_cumsum.stride(2), old_dA_cumsum.stride(3),
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            C.stride(0), C.stride(1), C.stride(2), C.stride(3),
+            d_strides[0], d_strides[1],
+            z_strides[0], z_strides[1], z_strides[2], z_strides[3],
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            cb_scaled.stride(0), cb_scaled.stride(1),
+            cb_scaled.stride(2), cb_scaled.stride(3),
+            decay_vec.stride(0), decay_vec.stride(1), decay_vec.stride(2),
+            BLOCK_SIZE_M,
+            LAUNCH_WITH_PDL=use_internal_pdl,
+            PHILOX_ROUNDS=philox_rounds if rand_seed is not None else 0,
+            QUANT_MAX=quant_max,
+            WRITE_CHECKPOINT=write_checkpoint,
+            LAUNCH_DEPENDENT_KERNELS=launch_dependent_kernels and use_internal_pdl,
+            USE_PERM=use_perm,
+            NUM_PERSISTENT=num_persistent_arg,
+            NUM_LOOP_STAGES=num_loop_stages_arg,
+            FLATTEN=flatten_arg,
+            WARP_SPECIALIZE=warp_specialize_arg,
+            num_warps=num_warps,
+            **({"num_stages": _num_stages} if _num_stages else {}),
+            **({"num_ctas": _num_ctas} if _num_ctas else {}),
+            **({"maxnreg": _maxnreg} if _maxnreg else {}),
+            launch_pdl=use_internal_pdl,
+        )
+
     # ---- Mode dispatch ----------------------------------------------------
     with torch.cuda.device(device.index):
         if mode == "monolithic":
@@ -3689,6 +4415,37 @@ def checkpointing_state_update(
             launch_replay_precompute(write_checkpoint=True, early_out=True)
             launch_replay_main(write_checkpoint=True, early_out=True,
                                launch_dependent_kernels=False)
+        elif mode == "persistent_main":
+            # Experimental: persistent-CTA main kernel.  Reuses maindl's
+            # precompute structure (one shared dynamic_precompute that
+            # dispatches per-slot at runtime based on PNAT) followed by two
+            # persistent_main launches (write half + nowrite half).
+            #
+            # Hard-sort contract: caller has pre-sorted slots host-side so
+            # PNAT is monotone (writes first).  Pass the perm via
+            # slot_perm + USE_PERM and the count via _n_writes.
+            #
+            # The persistent main kernel takes (n_writes, batch_total,
+            # WRITE_CHECKPOINT) and computes its own slot range.  Each
+            # launch is skipped at the Python level if its half is empty
+            # (n_writes=0 or n_writes=batch), so degenerate batches
+            # incur zero kernel launch overhead on the empty side.
+            assert _n_writes is not None, (
+                "mode='persistent_main' requires _n_writes (count of write "
+                "slots in the pre-sorted batch).  Provide via the bench's "
+                "--hardcode-sort path."
+            )
+            assert 0 <= _n_writes <= batch, (
+                f"_n_writes={_n_writes} must be in [0, batch={batch}]"
+            )
+            n_writes_v = _n_writes
+            launch_dynamic_precompute(rectangle=False)
+            launch_persistent_main(write_checkpoint=True,
+                                   n_writes=n_writes_v,
+                                   launch_dependent_kernels=True)
+            launch_persistent_main(write_checkpoint=False,
+                                   n_writes=n_writes_v,
+                                   launch_dependent_kernels=False)
         else:  # mode == "doublelaunch"
             # Write half: always replay-style write.  First main signals
             # PDL dependents so the second precompute can start its setup
