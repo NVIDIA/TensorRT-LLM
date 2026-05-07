@@ -1,3 +1,4 @@
+import math
 import os
 import time
 from typing import List, Optional, Union
@@ -17,6 +18,7 @@ from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
+from .defaults import COSMOS3_720P_PARAMS, COSMOS3_EXTRA_SPECS
 from .guardrails import (
     build_text_guardrail,
     build_video_guardrail,
@@ -25,11 +27,19 @@ from .guardrails import (
 )
 from .transformer_cosmos3 import Cosmos3VFMTransformer
 
-COSMOS3_DEFAULT_NEGATIVE_PROMPT = ""
+COSMOS3_DEFAULT_NEGATIVE_PROMPT = (
+    "The video captures a series of frames showing ugly scenes, static with no motion, motion blur, "
+    "over-saturation, shaky footage, low resolution, grainy texture, pixelated images, poorly lit areas, "
+    "underexposed and overexposed scenes, poor color balance, washed out colors, choppy sequences, jerky movements, "
+    "low frame rate, artifacting, color banding, unnatural transitions, outdated special effects, fake elements, "
+    "unconvincing visuals, poorly edited content, jump cuts, visual noise, and flickering. Overall, the video is of "
+    "poor quality."
+)
 COSMOS3_DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant who will generate videos from a given prompt."
 )
-COSMOS3_DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of {fps} FPS."
+COSMOS3_DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
+COSMOS3_DEFAULT_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
 TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
 
 
@@ -76,9 +86,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 checkpoint_dir,
                 subfolder=PipelineComponent.SCHEDULER,
             )
-            self.scheduler = UniPCMultistepScheduler.from_config(
-                self.scheduler.config, flow_shift=5.0
-            )  # for 720p trained checkpoint
 
         # load guardrails by default
         if (
@@ -100,6 +107,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     def default_warmup_num_frames(self):
         return [61, 81]
 
+    @property
+    def default_generation_params(self):
+        return dict(COSMOS3_720P_PARAMS)
+
+    @property
+    def extra_param_specs(self):
+        return dict(COSMOS3_EXTRA_SPECS)
+
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         with torch.no_grad():
             self.forward(
@@ -109,9 +124,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 width=width,
                 num_frames=num_frames,
                 num_inference_steps=steps,
-                guidance_scale=4.0,
+                guidance_scale=COSMOS3_720P_PARAMS["guidance_scale"],
                 seed=42,
-                max_sequence_length=256,
+                max_sequence_length=COSMOS3_720P_PARAMS["max_sequence_length"],
                 use_guardrails=False,
                 image=None,
             )
@@ -130,9 +145,50 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             max_sequence_length=req.params.max_sequence_length,
             frame_rate=req.params.frame_rate,
             use_duration_template=req.params.extra_params.get("use_duration_template", True),
+            use_resolution_template=req.params.extra_params.get("use_resolution_template", True),
             use_system_prompt=req.params.extra_params.get("use_system_prompt", False),
             use_guardrails=req.params.extra_params.get("use_guardrails", True),
         )
+
+    def _format_prompt_with_template(
+        self,
+        prompt: str,
+        *,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        use_duration_template: bool = True,
+        use_resolution_template: bool = True,
+    ) -> str:
+        prompt = prompt.strip()
+
+        if use_duration_template and num_frames > 1:
+            duration = num_frames / frame_rate
+            dur_text = COSMOS3_DURATION_TEMPLATE.format(duration=duration, fps=frame_rate)
+            prompt = prompt.rstrip(".") + ". " + dur_text
+
+        prompt = prompt.strip()
+        if use_resolution_template:
+            res_text = COSMOS3_DEFAULT_RESOLUTION_TEMPLATE.format(height=height, width=width)
+            prompt = prompt.rstrip(".") + ". " + res_text
+
+        return prompt
+
+    def _resize_and_center_crop_image(
+        self, image: PIL.Image.Image, height: int, width: int
+    ) -> PIL.Image.Image:
+        """Match Cosmos3 reference preprocessing for conditioning images."""
+        orig_w, orig_h = image.size
+        scaling_ratio = max(width / orig_w, height / orig_h)
+        resize_w = int(math.ceil(scaling_ratio * orig_w))
+        resize_h = int(math.ceil(scaling_ratio * orig_h))
+
+        image = image.resize((resize_w, resize_h), PIL.Image.Resampling.LANCZOS)
+
+        left = max((resize_w - width) // 2, 0)
+        top = max((resize_h - height) // 2, 0)
+        return image.crop((left, top, left + width, top + height))
 
     @nvtx_range("_tokenize_prompt", color="blue")
     def _tokenize_prompt(
@@ -338,17 +394,18 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         prompt: Union[str, List[str]],
         negative_prompt: Optional[str] = None,
         image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
-        height: int = 720,
-        width: int = 1280,
-        num_frames: int = 81,
-        num_inference_steps: int = 35,
-        guidance_scale: float = 4.0,
+        height: int = COSMOS3_720P_PARAMS["height"],
+        width: int = COSMOS3_720P_PARAMS["width"],
+        num_frames: int = COSMOS3_720P_PARAMS["num_frames"],
+        num_inference_steps: int = COSMOS3_720P_PARAMS["num_inference_steps"],
+        guidance_scale: float = COSMOS3_720P_PARAMS["guidance_scale"],
         seed: int = 42,
-        max_sequence_length: int = 256,
-        frame_rate: float = 24.0,
-        use_duration_template: bool = True,
-        use_system_prompt: bool = False,
-        use_guardrails: bool = True,
+        max_sequence_length: int = COSMOS3_720P_PARAMS["max_sequence_length"],
+        frame_rate: float = COSMOS3_720P_PARAMS["frame_rate"],
+        use_duration_template: bool = COSMOS3_EXTRA_SPECS["use_duration_template"].default,
+        use_resolution_template: bool = COSMOS3_EXTRA_SPECS["use_resolution_template"].default,
+        use_system_prompt: bool = COSMOS3_EXTRA_SPECS["use_system_prompt"].default,
+        use_guardrails: bool = COSMOS3_EXTRA_SPECS["use_guardrails"].default,
     ):
         pipeline_start = time.time()
         use_guardrails = use_guardrails and not TRTLLM_DISABLE_COSMOS3_GUARDRAILS
@@ -381,11 +438,29 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         if negative_prompt is None:
             negative_prompt = COSMOS3_DEFAULT_NEGATIVE_PROMPT
 
-        if use_duration_template and num_frames > 1:
-            duration = num_frames / frame_rate
-            suffix = COSMOS3_DURATION_TEMPLATE.format(duration=duration, fps=frame_rate)
-            prompt = [f"{p} {suffix}" for p in prompt]
-            logger.info(f"Prompt with duration: '{prompt}'")
+        negative_prompt = self._format_prompt_with_template(
+            negative_prompt,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            use_duration_template=use_duration_template,
+            use_resolution_template=use_resolution_template,
+        )
+
+        prompt = [
+            self._format_prompt_with_template(
+                p,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                frame_rate=frame_rate,
+                use_duration_template=use_duration_template,
+                use_resolution_template=use_resolution_template,
+            )
+            for p in prompt
+        ]
+        logger.info(f"Prompt with metadata: '{prompt}'")
 
         prompt = prompt[0]
 
@@ -403,7 +478,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
             if isinstance(image, PIL.Image.Image):
                 image = image.convert("RGB")
-                image = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+                image = self._resize_and_center_crop_image(image, height=height, width=width)
                 image = self.video_processor.preprocess(
                     image,
                     height=height,
