@@ -3096,7 +3096,7 @@ def checkpointing_state_update(
     #       and nowrite halves.  Strictly fewer kernel launches than
     #       doublelaunch (3 vs 4) at the cost of dispatch precompute's wider
     #       reg envelope.  write_checkpoint ignored.
-    assert mode in ("monolithic", "dynamic", "doublelaunch", "dlgrouped", "maindl"), (
+    assert mode in ("monolithic", "dynamic", "doublelaunch", "dlgrouped", "maindl", "dl_write_only"), (
         f"unknown mode {mode!r}; expected one of "
         "'monolithic', 'dynamic', 'doublelaunch', 'dlgrouped', or 'maindl'"
     )
@@ -3681,6 +3681,14 @@ def checkpointing_state_update(
             else:
                 launch_replay_main(write_checkpoint=False, early_out=True,
                                    reverse_perm=reverse_nowrite)
+        elif mode == "dl_write_only":
+            # Debug-only: just the write half of doublelaunch.  EARLY_OUT=True
+            # means nowrite slots still pay the EO-gate tax (PNAT load + branch),
+            # but no nowrite-side kernels run.  Used to isolate "is the sort
+            # regression in the write-side kernels?".
+            launch_replay_precompute(write_checkpoint=True, early_out=True)
+            launch_replay_main(write_checkpoint=True, early_out=True,
+                               launch_dependent_kernels=False)
         else:  # mode == "doublelaunch"
             # Write half: always replay-style write.  First main signals
             # PDL dependents so the second precompute can start its setup

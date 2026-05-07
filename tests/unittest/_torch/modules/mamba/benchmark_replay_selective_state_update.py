@@ -578,7 +578,8 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
                                     effective_rect_list = rect_list
                                 for rect in effective_rect_list:
                                     is_dl_family = mode in (
-                                        "doublelaunch", "dlgrouped", "maindl"
+                                        "doublelaunch", "dlgrouped", "maindl",
+                                        "dl_write_only",
                                     )
                                     # Match the timed-run skip: sort=1 only
                                     # makes sense when there's a mix scenario.
@@ -1315,7 +1316,8 @@ def _run_benchmark(args) -> None:
                                     # dynamic also skip sort=1; reverse=1
                                     # with sort=0 is a no-op (skip).
                                     is_dl_family = mode in (
-                                        "doublelaunch", "dlgrouped", "maindl"
+                                        "doublelaunch", "dlgrouped", "maindl",
+                                        "dl_write_only",
                                     )
                                     can_sort = (
                                         is_dl_family and mix_samples_cpu is not None
@@ -1778,7 +1780,7 @@ def _parse_args() -> argparse.Namespace:
         args.write_modes_list = [args.write_checkpoint]
 
     modes_raw = [v.strip() for v in args.modes.split(",") if v.strip()]
-    valid_modes = {"monolithic", "dynamic", "doublelaunch", "dlgrouped", "maindl"}
+    valid_modes = {"monolithic", "dynamic", "doublelaunch", "dlgrouped", "maindl", "dl_write_only"}
     for m in modes_raw:
         if m not in valid_modes:
             parser.error(
