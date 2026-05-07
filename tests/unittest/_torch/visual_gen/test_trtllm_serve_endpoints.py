@@ -445,7 +445,7 @@ class TestImageGeneration:
         The b64_json hot path must not call ``save_image()``, which caused a
         redundant PNG encode plus an unnecessary disk write before fix #12903.
         """
-        with patch("tensorrt_llm.serve.openai_server.save_image") as mock_save:
+        with patch("tensorrt_llm.media.encoding.save_image") as mock_save:
             resp = image_client.post(
                 "/v1/images/generations",
                 json={
@@ -484,7 +484,7 @@ class TestImageGeneration:
                     "tensorrt_llm.serve.openai_server.image_to_bytes",
                     wraps=image_to_bytes,
                 ) as mock_cvt,
-                patch("tensorrt_llm.serve.openai_server.save_image") as mock_save,
+                patch("tensorrt_llm.media.encoding.save_image") as mock_save,
             ):
                 resp = client.post(
                     "/v1/images/generations",
