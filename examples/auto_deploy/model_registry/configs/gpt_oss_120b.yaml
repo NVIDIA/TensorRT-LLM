@@ -9,7 +9,7 @@ model_factory: AutoModelForCausalLM
 attn_backend: trtllm
 compile_backend: torch-cudagraph
 skip_loading_weights: false
-world_size: 4
+world_size: 1
 max_batch_size: 128
 max_seq_len: 4096
 max_num_tokens: 8192
@@ -19,3 +19,6 @@ cuda_graph_config:
 kv_cache_config:
   enable_block_reuse: false
   free_gpu_memory_fraction: 0.8
+transforms:
+  quantize_mxfp4_moe_trtllm_gen:
+    enabled: true
