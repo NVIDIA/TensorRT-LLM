@@ -20,6 +20,7 @@
 
 #include <cassert>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <cuda.h>
 #include <fcntl.h>
@@ -46,9 +47,10 @@ MemAddress hostMmap(size_t size)
 
 void hostMunmap(MemAddress ptr, size_t size) noexcept
 {
-    if (ptr && size)
+    int ret = ::munmap(reinterpret_cast<void*>(ptr), size);
+    if (ret != 0)
     {
-        ::munmap(reinterpret_cast<void*>(ptr), size);
+        std::fprintf(stderr, "munmap failed with errno %d\n", errno);
     }
 }
 
