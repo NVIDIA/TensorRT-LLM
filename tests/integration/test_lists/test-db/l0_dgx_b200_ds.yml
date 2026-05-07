@@ -16,6 +16,7 @@ l0_dgx_b200_ds:
       orchestrator: mpi
   tests:
   - unittest/_torch/modeling/test_modeling_deepseekv4.py
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_auto_dtype
   # V4-Flash NVFP4 aggregate smoke (TP=4, no EPLB): integration-test mode
   # (1 MMLU sample, no GSM8K reference required). Validates the basic
   # forward path without disagg or EPLB complexity.

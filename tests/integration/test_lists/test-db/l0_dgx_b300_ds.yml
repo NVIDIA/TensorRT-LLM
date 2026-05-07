@@ -16,6 +16,7 @@ l0_dgx_b300_ds:
       backend: pytorch
       orchestrator: mpi
   tests:
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_auto_dtype
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_kv_cache_v2_nixl_python
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_kv_cache_v2_nixl_python
   - accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_kv_cache_v2_nixl_python
