@@ -113,7 +113,6 @@ public:
     void expand(int newNumSlots);
     void prepareForShrink(int newNumSlots);
     bool finishShrink();
-    void forceFinishShrink() noexcept; // for use in destroy() — does not throw
 
     bool shrinkInProgress() const noexcept
     {

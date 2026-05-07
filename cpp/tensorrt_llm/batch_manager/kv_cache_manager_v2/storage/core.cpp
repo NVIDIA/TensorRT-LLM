@@ -264,29 +264,6 @@ bool SlotAllocator::check() const noexcept
     return true;
 }
 
-void SlotAllocator::forceFinishShrink() noexcept
-{
-    // Force-complete a pending shrink without throwing.
-    // Used in destroy() paths where we cannot propagate exceptions.
-    if (!shrinkInProgress())
-        return;
-    // Synchronize and discard all overflow slots.
-    for (auto& s : mOverflowSlots)
-    {
-        try
-        {
-            s.readyEvent.synchronize();
-        }
-        catch (...)
-        {
-        }
-        s.resetSlot();
-    }
-    mOverflowSlots.clear();
-    mCapacity = mTargetCapacity;
-    mNumActiveSlots = std::min(mNumActiveSlots, mCapacity);
-}
-
 void SlotAllocator::scrubEvents()
 {
     int num = mNumReadyRecycledSlots;
