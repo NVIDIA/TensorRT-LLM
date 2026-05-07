@@ -155,7 +155,7 @@ def make_kv_cache_manager(
     mgr.tokens_per_block = tokens_per_block
     mgr.kv_cache_map = _KVCacheMap()
     mgr.prepare_context.side_effect = prepare_context_fn or (lambda req: True)
-    mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)
+    mgr.resize_context.side_effect = resize_context_fn or (lambda req, n, history_length=None: True)
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
     mgr.suspend_request.return_value = None
     mgr.is_request_active.side_effect = lambda req_id: mgr.kv_cache_map[req_id].is_active
@@ -1160,7 +1160,7 @@ class TestDisagg:
         """resize_context failure skips the request, loop continues."""
         call_count = [0]
 
-        def resize_fn(req, n):
+        def resize_fn(req, n, history_length=None):
             call_count[0] += 1
             return call_count[0] > 1  # first fails, second succeeds
 
@@ -1169,6 +1169,24 @@ class TestDisagg:
         reqs = [make_disagg_request(0), make_disagg_request(1)]
         out = sched.schedule_request(reqs, set())
         assert ids(out.fitting_disagg_gen_init_requests) == [1]
+
+    def test_disagg_resize_context_passes_history_length(self):
+        """Disagg init forwards history_length=prompt_len to resize_context."""
+        captured = {}
+
+        def resize_fn(req, n, history_length=None):
+            captured[req.py_request_id] = history_length
+            return True
+
+        mgr = make_kv_cache_manager(resize_context_fn=resize_fn)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        reqs = [
+            make_disagg_request(0, context_remaining_length=200),
+            make_disagg_request(1, context_remaining_length=512),
+        ]
+        sched.schedule_request(reqs, set())
+        assert captured[0] == 200
+        assert captured[1] == 512
 
     def test_disagg_exceeds_max_batch_size(self):
         """Disagg count can exceed max_batch_size since it bypasses budget."""

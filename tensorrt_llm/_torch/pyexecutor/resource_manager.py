@@ -3025,13 +3025,14 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return self._resume_and_restore(req.py_request_id, kv_cache)
 
-    def resize_context(self, req: LlmRequest, num_tokens: int) -> bool:
+    def resize_context(self,
+                       req: LlmRequest,
+                       num_tokens: int,
+                       history_length: int | None = None) -> bool:
         """Resize KV cache to cover context_current_position + num_tokens.
 
-        num_tokens is the number of tokens to be processed (i.e.,
-        context_remaining_length or a chunk thereof). The target capacity is
-        computed as context_current_position + num_tokens so that block reuse
-        overlaps with existing capacity are handled correctly.
+        history_length, when set, lets SWA life cycles compute their stale
+        range at allocation time so pre-window blocks are never allocated.
         Returns True on success, False if resize failed (first chunk is
         suspended on failure).
 
@@ -3047,7 +3048,7 @@ class KVCacheManagerV2(BaseResourceManager):
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
 
-        if not kv_cache.resize(capacity):
+        if not kv_cache.resize(capacity, history_length):
             if req.is_first_context_chunk:
                 kv_cache.suspend()
             return False
