@@ -2506,6 +2506,101 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
 
+    def _build_evs_adjusted_context_ids(
+        self,
+        evs_ids: torch.Tensor,
+        modality: str,
+        num_tokens_in_video: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Build full per-request token IDs after EVS placeholder expansion.
+
+        Args:
+            evs_ids: Full per-request token IDs from preprocessing. For video,
+                this contains one video placeholder per tubelet before final EVS
+                expansion. For image/audio, this is already the final token ID layout.
+            modality: Request modality, one of "image", "video", or "audio".
+            num_tokens_in_video: Per-tubelet retained image-token counts after
+                EVS for video requests. Unused for image/audio requests.
+
+        Returns:
+            Full per-request token IDs with video placeholders replaced by the
+            post-EVS number of image context tokens.
+        """
+        if modality in ("image", "audio"):
+            return evs_ids
+        if modality != "video":
+            raise ValueError(f"Unsupported modality for EVS merge: {modality}")
+
+        # evs_ids is a flat 1-D tensor built at token-ID level. Replace each
+        # video placeholder with the post-EVS count for the corresponding tubelet.
+        request_context_parts = []
+        placeholder_mask = evs_ids == self.video_context_token_id
+        placeholder_positions = placeholder_mask.nonzero(as_tuple=True)[0]
+        image_idx = 0
+        prev_end = 0
+        for pos in placeholder_positions:
+            pos = pos.item()
+            if pos > prev_end:
+                request_context_parts.append(evs_ids[prev_end:pos])
+            request_context_parts.append(
+                torch.full(
+                    (int(num_tokens_in_video[image_idx]),),
+                    fill_value=self.img_context_token_id,
+                    dtype=evs_ids.dtype,
+                    device=evs_ids.device,
+                )
+            )
+            image_idx += 1
+            prev_end = pos + 1
+        if prev_end < len(evs_ids):
+            request_context_parts.append(evs_ids[prev_end:])
+        return torch.cat(request_context_parts, dim=0)
+
+    def _refresh_evs_runtime_and_slice_context_ids(
+        self,
+        context_ids: torch.Tensor,
+        multimodal_param: MultimodalParams,
+    ) -> torch.Tensor:
+        """Refresh runtime MM counters and slice to the current context chunk.
+
+        Args:
+            context_ids: Full per-request token IDs after EVS adjustment.
+            multimodal_param: Per-request multimodal parameters. When
+                `multimodal_runtime` is present, its MM-token counters are
+                updated from `context_ids`.
+
+        Returns:
+            `context_ids` narrowed to the current context chunk when runtime
+            metadata is present; otherwise the original `context_ids`.
+        """
+        runtime = multimodal_param.multimodal_runtime
+        if runtime is None:
+            return context_ids
+        if runtime.chunk_end_pos > context_ids.shape[0]:
+            raise ValueError(
+                "EVS context chunk end position "
+                f"({runtime.chunk_end_pos}) exceeds full context "
+                f"length ({context_ids.shape[0]})."
+            )
+
+        embed_mask = context_ids == self.img_context_token_id
+        sound_context_token_id = getattr(self, "sound_context_token_id", None)
+        if sound_context_token_id is not None:
+            embed_mask = torch.logical_or(embed_mask, context_ids == sound_context_token_id)
+        embed_mask_cumsum = embed_mask.cumsum(0, dtype=torch.int64)
+        runtime.num_cached_mm_tokens = (
+            int(embed_mask_cumsum[runtime.past_seen_token_num - 1])
+            if runtime.past_seen_token_num > 0
+            else 0
+        )
+        runtime.num_mm_tokens_in_chunk = (
+            int(embed_mask_cumsum[runtime.chunk_end_pos - 1]) - runtime.num_cached_mm_tokens
+            if runtime.chunk_end_pos > 0
+            else 0
+        )
+        runtime.total_embeds_in_request = int(embed_mask_cumsum[-1])
+        return context_ids[runtime.past_seen_token_num : runtime.chunk_end_pos]
+
     def merge_evs_mm_embeds(
         self,
         num_tokens_in_videos: List[int],
@@ -2547,68 +2642,14 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         for multimodal_param, evs_ids, modality, num_tokens_in_video in zip(
             multimodal_params, evs_ids_lst, modalities, num_tokens_in_videos, strict=True
         ):
-            # Image/audio modalities: keep input_ids unchanged during inflight-batching.
-            if modality in ("image", "audio"):
-                context_ids = evs_ids
-            elif modality == "video":
-                # evs_ids is a flat 1-D tensor built at token-ID level.
-                # Find placeholder positions and replace each with the EVS count.
-                request_context_parts = []
-                placeholder_mask = evs_ids == self.video_context_token_id
-                placeholder_positions = placeholder_mask.nonzero(as_tuple=True)[0]
-                image_idx = 0
-                prev_end = 0
-                for pos in placeholder_positions:
-                    pos = pos.item()
-                    # Append tokens before this placeholder.
-                    if pos > prev_end:
-                        request_context_parts.append(evs_ids[prev_end:pos])
-                    # Replace placeholder with actual img_context_token count.
-                    request_context_parts.append(
-                        torch.full(
-                            (int(num_tokens_in_video[image_idx]),),
-                            fill_value=self.img_context_token_id,
-                            dtype=evs_ids.dtype,
-                            device=evs_ids.device,
-                        )
-                    )
-                    image_idx += 1
-                    prev_end = pos + 1
-                # Append remaining tokens after the last placeholder.
-                if prev_end < len(evs_ids):
-                    request_context_parts.append(evs_ids[prev_end:])
-                context_ids = torch.cat(request_context_parts, dim=0)
-            else:
-                raise ValueError(f"Unsupported modality for EVS merge: {modality}")
-
-            runtime = multimodal_param.multimodal_runtime
-            if runtime is not None:
-                if runtime.chunk_end_pos > context_ids.shape[0]:
-                    raise ValueError(
-                        "EVS context chunk end position "
-                        f"({runtime.chunk_end_pos}) exceeds full context "
-                        f"length ({context_ids.shape[0]})."
-                    )
-                # EVS can redistribute image tokens across tubelets, so refresh
-                # runtime counters (that were originally computed from the dummy/pre-EVS
-                # token layout) from the post-EVS layout before slicing embeddings.
-                embed_mask = context_ids == self.img_context_token_id
-                sound_context_token_id = getattr(self, "sound_context_token_id", None)
-                if sound_context_token_id is not None:
-                    embed_mask = torch.logical_or(embed_mask, context_ids == sound_context_token_id)
-                embed_mask_cumsum = embed_mask.cumsum(0, dtype=torch.int64)
-                runtime.num_cached_mm_tokens = (
-                    int(embed_mask_cumsum[runtime.past_seen_token_num - 1])
-                    if runtime.past_seen_token_num > 0
-                    else 0
-                )
-                runtime.num_mm_tokens_in_chunk = (
-                    int(embed_mask_cumsum[runtime.chunk_end_pos - 1]) - runtime.num_cached_mm_tokens
-                    if runtime.chunk_end_pos > 0
-                    else 0
-                )
-                runtime.total_embeds_in_request = int(embed_mask_cumsum[-1])
-                context_ids = context_ids[runtime.past_seen_token_num : runtime.chunk_end_pos]
+            context_ids = self._build_evs_adjusted_context_ids(
+                evs_ids, modality, num_tokens_in_video
+            )
+            # EVS can redistribute image tokens across tubelets, so refresh
+            # runtime counters from the post-EVS layout before slicing embeddings.
+            context_ids = self._refresh_evs_runtime_and_slice_context_ids(
+                context_ids, multimodal_param
+            )
             context_parts.append(context_ids)
 
         if not context_parts:

@@ -823,11 +823,17 @@ _IMG_END = 51
 
 
 def _make_merge_model():
-    """Create a minimal mock with the two token-ID attrs that `merge_evs_mm_embeds` reads."""
+    """Create a minimal mock with the attrs/helpers that `merge_evs_mm_embeds` reads."""
     model = mock.MagicMock(spec=NemotronH_Nano_VL_V2)
     model.img_context_token_id = _IMG_CTX_ID
     model.video_context_token_id = _VIDEO_CTX_ID
     model.sound_context_token_id = _SOUND_CTX_ID
+    model._build_evs_adjusted_context_ids = functools.partial(
+        NemotronH_Nano_VL_V2._build_evs_adjusted_context_ids, model
+    )
+    model._refresh_evs_runtime_and_slice_context_ids = functools.partial(
+        NemotronH_Nano_VL_V2._refresh_evs_runtime_and_slice_context_ids, model
+    )
     return model
 
 
