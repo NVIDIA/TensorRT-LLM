@@ -3864,6 +3864,226 @@ class TestGLM4_5Air(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+@skip_pre_blackwell
+class TestGLM47FlashNVFP4(LlmapiAccuracyTestHarness):
+    """Stress coverage for GLM-4.7-Flash NVFP4 (MoE lite) under chunked prefill + KV reuse.
+
+    RCCA: https://nvbugspro.nvidia.com/bug/6025177 (TRTLLM-11688).
+    """
+
+    MODEL_NAME = "zai-org/GLM-4.7-Flash"
+
+    @staticmethod
+    def _llm_kwargs_nvbug_6025177(model_path: str) -> dict:
+        """Shared ``LLM`` kwargs aligned with NVBug 6025177 StepsToReproduce server YAML.
+
+        RCCA: https://nvbugspro.nvidia.com/bug/6025177
+        """
+        kv_cache_config = KvCacheConfig(
+            dtype="fp8",
+            free_gpu_memory_fraction=0.4,
+            enable_block_reuse=True,
+            enable_partial_reuse=False,
+            event_buffer_max_size=16384,
+            host_cache_size=100_000_000_000,
+        )
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=3,
+                                       mtp_eagle_one_model=False,
+                                       speculative_model=model_path)
+        return dict(
+            tensor_parallel_size=4,
+            moe_expert_parallel_size=1,
+            moe_config=MoeConfig(backend="TRTLLM",
+                                 use_low_precision_moe_combine=True),
+            enable_chunked_prefill=True,
+            trust_remote_code=True,
+            kv_cache_config=kv_cache_config,
+            max_num_tokens=8192,
+            max_seq_len=202752,
+            max_batch_size=8,
+            speculative_config=mtp_config,
+            cuda_graph_config=CudaGraphConfig(enable_padding=False),
+            enable_iter_perf_stats=True,
+            guided_decoding_backend="xgrammar",
+        )
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.timeout(14400)
+    @pytest.mark.filterwarnings(
+        "ignore:.*Calling super.*encode.*add_special_tokens.*:UserWarning")
+    @pytest.mark.filterwarnings(
+        "ignore:.*configuration is not supported by the fused routing kernel.*:UserWarning"
+    )
+    def test_nvfp4_chunked_prefill_kv_reuse_stress(self, mocker):
+        """Aligns with NVBug 6025177 / TRTLLM-11688 server StepsToReproduce (PyTorch).
+
+        RCCA: https://nvbugspro.nvidia.com/bug/6025177
+
+        Matches the checked-in YAML: PDL, chunked prefill, FP8 KV, block reuse,
+        MTP x3, TRTLLM MoE + low-precision combine, cuda graphs without padding,
+        iter perf stats, xgrammar, KV host tier size, tp=4 / ep=1, max batch 8,
+        max_seq_len / max_num_tokens 8192 as in the bug (model checkpoint differs:
+        ``GLM-4.7-Flash-NVFP4`` under LLM_MODELS_ROOT vs customer ``baseten-admin/glm-4.7-fp4``).
+
+        For cancellation + async overlap (customer probe behavior), see
+        ``test_nvfp4_async_stream_cancel_probe``.
+        """
+        patch_mpi_pool_session_for_env(mocker, {"TRTLLM_ENABLE_PDL": "1"})
+        model_path = f"{llm_models_root()}/GLM-4.7-Flash-NVFP4"
+        target_len = 49152
+
+        with LLM(model_path,
+                 **self._llm_kwargs_nvbug_6025177(model_path)) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+            tokenizer = llm.tokenizer
+            dataset_path = (f"{llm_models_root()}/datasets/Crystalcareai/"
+                            "Code-feedback-sharegpt-renamed")
+            dataset = load_dataset(dataset_path, split="train[:2000]")
+            long_token_list = []
+            for row in dataset:
+                msg = row["messages"][0]["value"]
+                tokens = tokenizer.encode(msg, add_special_tokens=False)
+                if not tokens:
+                    continue
+                repeat = target_len // len(tokens) + 1
+                long_tokens = (tokens * repeat)[:target_len]
+                long_token_list.append(long_tokens)
+            assert long_token_list, "No valid samples found"
+
+            samples_per_batch = 8
+            sampling_params_greedy = SamplingParams(max_tokens=8)
+            sampling_params_sampling = SamplingParams(max_tokens=8,
+                                                      temperature=0.8,
+                                                      top_p=0.95)
+
+            num_samples = len(long_token_list)
+            max_batch_count = 12
+
+            for batch_idx in range(max_batch_count):
+                start_idx = (batch_idx * samples_per_batch) % num_samples
+                indices = [(start_idx + i) % num_samples
+                           for i in range(samples_per_batch)]
+                batch_inputs = [long_token_list[i] for i in indices]
+
+                for output in llm.generate(
+                        batch_inputs, sampling_params=sampling_params_greedy):
+                    token_ids = output.outputs[0].token_ids
+                    assert len(token_ids) > 0
+                    assert not all(tid == 0 for tid in token_ids)
+
+                for output in llm.generate(
+                        batch_inputs, sampling_params=sampling_params_sampling):
+                    token_ids = output.outputs[0].token_ids
+                    assert len(token_ids) > 0
+                    assert not all(tid == 0 for tid in token_ids)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.timeout(14400)
+    @pytest.mark.filterwarnings(
+        "ignore:.*Calling super.*encode.*add_special_tokens.*:UserWarning")
+    @pytest.mark.filterwarnings(
+        "ignore:.*configuration is not supported by the fused routing kernel.*:UserWarning"
+    )
+    def test_nvfp4_async_stream_cancel_probe(self, mocker):
+        """Async streaming with early client cancel; post-check ``generate``.
+
+        RCCA: https://nvbugspro.nvidia.com/bug/6025177
+
+        Mirrors the customer probe stress axis (concurrent in-flight decode + ~20%
+        cancellations during long chunked prefill) using the same server-side
+        settings as ``_llm_kwargs_nvbug_6025177``. Does not implement HTTP
+        ``ALL_SAME`` pool detection; it targets the executor/KV path under cancel.
+        """
+        patch_mpi_pool_session_for_env(mocker, {"TRTLLM_ENABLE_PDL": "1"})
+        model_path = f"{llm_models_root()}/GLM-4.7-Flash-NVFP4"
+        target_len = 49152
+
+        with LLM(model_path,
+                 **self._llm_kwargs_nvbug_6025177(model_path)) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+            tokenizer = llm.tokenizer
+            dataset_path = (f"{llm_models_root()}/datasets/Crystalcareai/"
+                            "Code-feedback-sharegpt-renamed")
+            dataset = load_dataset(dataset_path, split="train[:2000]")
+            long_token_list = []
+            for row in dataset:
+                msg = row["messages"][0]["value"]
+                tokens = tokenizer.encode(msg, add_special_tokens=False)
+                if not tokens:
+                    continue
+                repeat = target_len // len(tokens) + 1
+                long_tokens = (tokens * repeat)[:target_len]
+                long_token_list.append(long_tokens)
+            assert long_token_list, "No valid samples found"
+
+            async_batch_size = 8
+            num_async_batches = 4
+            cancel_ratio = 0.2
+            num_samples = len(long_token_list)
+            cancel_count = max(1, round(async_batch_size * cancel_ratio))
+
+            async def handle_one_request(async_gen, should_cancel):
+                chunks_received = 0
+                max_chunks_before_cancel = 5
+                try:
+                    async for chunk in async_gen:
+                        chunks_received += 1
+                        if chunk.outputs:
+                            token_ids = chunk.outputs[0].token_ids
+                            assert len(token_ids) > 0
+                            assert not all(tid == 0 for tid in token_ids)
+                        if should_cancel and chunks_received >= max_chunks_before_cancel:
+                            break
+                except Exception:
+                    if not should_cancel:
+                        raise
+
+            async def run_streaming_with_cancellation():
+                for async_batch_idx in range(num_async_batches):
+                    start_idx = (async_batch_idx *
+                                 async_batch_size) % num_samples
+                    indices = [(start_idx + i) % num_samples
+                               for i in range(async_batch_size)]
+                    batch_inputs = [long_token_list[i] for i in indices]
+
+                    sampling_params = SamplingParams(max_tokens=50,
+                                                     temperature=0.8,
+                                                     top_p=0.95)
+                    async_results = [
+                        llm.generate_async(inp,
+                                           sampling_params=sampling_params,
+                                           streaming=True)
+                        for inp in batch_inputs
+                    ]
+
+                    tasks = [
+                        asyncio.create_task(
+                            handle_one_request(gen, idx < cancel_count))
+                        for idx, gen in enumerate(async_results)
+                    ]
+
+                    await asyncio.wait_for(asyncio.gather(*tasks), timeout=300)
+
+            asyncio.run(run_streaming_with_cancellation())
+
+            verify_batch_size = 4
+            verify_inputs = [
+                long_token_list[i % num_samples]
+                for i in range(verify_batch_size)
+            ]
+            verify_params = SamplingParams(max_tokens=16)
+
+            for output in llm.generate(verify_inputs,
+                                       sampling_params=verify_params):
+                token_ids = output.outputs[0].token_ids
+                assert len(token_ids) > 0
+                assert not all(tid == 0 for tid in token_ids)
+
+
 @pytest.mark.timeout(10800)
 @pytest.mark.skip_less_device_memory(100000)
 class TestKimiK2(LlmapiAccuracyTestHarness):
