@@ -204,6 +204,12 @@ target_compile_options(
 target_compile_definitions(
   deep_ep_cpp_tllm PRIVATE DISABLE_AGGRESSIVE_PTX_INSTRS
                            TORCH_EXTENSION_NAME=deep_ep_cpp_tllm)
+# Newer CUDA containers provide NVSHMEM headers in the default CUDA include
+# directory. DeepEP must compile against the vendored NVSHMEM headers because it
+# links the vendored NVSHMEM static library below.
+target_include_directories(
+  deep_ep_cpp_tllm BEFORE
+  PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/nvshmem-build/src/include)
 target_link_libraries(
   deep_ep_cpp_tllm PRIVATE nvshmem_project::nvshmem ${TORCH_LIBRARIES}
                            ${TORCH_PYTHON_LIB})
