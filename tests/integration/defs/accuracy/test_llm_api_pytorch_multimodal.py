@@ -152,6 +152,11 @@ class TestVILA1_5_3B(LlmapiAccuracyTestHarness):
     )
 
     def test_auto_dtype(self):
+        # Force the container to be OOMKilled by the kubelet so the K8s
+        # infra-retry path (K8S_INFRA_FAILURE_PATTERNS = "OOMKilled") fires.
+        # Allocate well above the pod's memory limit in one shot.
+        _ = bytearray(64 * 1024 * 1024 * 1024)
+        pytest.fail("should have been OOMKilled before this line")
         with LLM(
             self.MODEL_PATH,
             max_num_tokens=self.MAX_NUM_TOKENS,
