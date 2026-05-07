@@ -245,6 +245,18 @@ def split_prefill_chunks(
     return chunk_groups
 
 
+def _select_indexer_compress_ratio(compress_ratios: List[int]) -> int:
+    if 4 in compress_ratios:
+        return 4
+    if 1 in compress_ratios:
+        return 1
+    return 0
+
+
+def _effective_compress_ratio_divisor(compress_ratio: int) -> int:
+    return compress_ratio if compress_ratio > 1 else 1
+
+
 def compute_cu_seqlen_kv_bounds_with_cache(
     seq_lens: torch.Tensor,
     num_contexts: int,
@@ -357,6 +369,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     compress_ratios: List[int] = [1]
     # Number of compressed KV tokens for context requests
     num_ctx_kv_tokens: int = 0
+    gen_indexer_kv_lens_cuda_runtime: Optional[torch.Tensor] = None
 
     def __init__(self, *args, **kwargs):
         """Initialize DSA metadata with SM count and indexer chunk size."""
@@ -400,9 +413,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # (tokens_per_block // compress_ratio), so slot mappings must be built
         # against that stride — not kv_cache_manager.tokens_per_block directly.
         tpb = self.kv_cache_manager.tokens_per_block
+        self._indexer_compress_ratio = _select_indexer_compress_ratio(
+            self.compress_ratios)
         if hasattr(self.kv_cache_manager, 'compressed_block_sizes'):
-            compress_ratio = 4 if 4 in self.compress_ratios else 1
-            tpb = tpb // compress_ratio
+            tpb = tpb // _effective_compress_ratio_divisor(
+                self._indexer_compress_ratio)
         self._tokens_per_block = tpb
 
         self.create_buffers_for_mla_rope_append(capture_graph=capture_graph)
@@ -446,6 +461,18 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         # Prepare metadata for indexer
         Indexer.prepare(metadata=self)
+
+    def get_indexer_kv_lens(self, kv_lens: torch.Tensor) -> torch.Tensor:
+        if self._indexer_compress_ratio <= 1:
+            return kv_lens
+        return kv_lens // self._indexer_compress_ratio
+
+    def get_indexer_max_seq_len(self) -> int:
+        if self._indexer_compress_ratio <= 1:
+            return self.kv_cache_manager.max_seq_len
+        return max(
+            1,
+            self.kv_cache_manager.max_seq_len // self._indexer_compress_ratio)
 
     # This function is only used to create the expanded buffers when the max_draft_tokens is changed.
     # TODO: remove this function once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
@@ -538,30 +565,31 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dim=0,
                 dtype=torch.int64,
                 out=self.gen_cached_token_indptr[1:self.num_generations + 1])
+            gen_kv_lens = self.kv_lens_cuda[self.num_contexts:self.num_seqs]
+            gen_indexer_kv_lens = self.get_indexer_kv_lens(gen_kv_lens)
+            self.gen_indexer_kv_lens_cuda_runtime = gen_indexer_kv_lens
             scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
-                self.kv_lens_cuda[self.num_contexts:self.num_seqs],
-                self.kv_cache_manager.tokens_per_block, self.num_sms)
+                gen_indexer_kv_lens, self._tokens_per_block, self.num_sms)
             self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
                                                  non_blocking=True)
             if self.use_expanded_buffers_for_mtp:
                 num_draft_tokens = 1 + self.max_draft_tokens
                 num_tokens = self.num_generations * num_draft_tokens
-                gen_kv_lens = self.kv_lens_cuda[self.num_contexts:self.num_seqs]
-                kv_lens_expanded = torch.stack([gen_kv_lens] * num_draft_tokens,
+                kv_lens_expanded = torch.stack([gen_indexer_kv_lens] *
+                                               num_draft_tokens,
                                                dim=0)
                 self.kv_lens_expanded_cuda[:num_tokens] = \
                     kv_lens_expanded.transpose(0, 1).contiguous().flatten()
                 # Expand schedule metadata buffer (only generation)
                 kv_lens_expanded = self.kv_lens_expanded_cuda[:num_tokens]
                 scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
-                    kv_lens_expanded, self.kv_cache_manager.tokens_per_block,
-                    self.num_sms)
+                    kv_lens_expanded, self._tokens_per_block, self.num_sms)
                 self.scheduler_metadata_buffer_expanded.copy_(
                     scheduler_metadata_buffer_expanded, non_blocking=True)
             elif self.max_draft_tokens == 3:
                 scheduler_metadata_buffer_mtp3 = get_paged_mqa_logits_metadata(
-                    self.kv_lens_cuda[self.num_contexts:self.num_seqs],
-                    self.kv_cache_manager.tokens_per_block, self.num_sms // 2)
+                    gen_indexer_kv_lens, self._tokens_per_block,
+                    self.num_sms // 2)
                 self.scheduler_metadata_buffer_mtp3.copy_(
                     scheduler_metadata_buffer_mtp3, non_blocking=True)
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
@@ -959,7 +987,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if self.use_expanded_buffers_for_mtp:
             # Expand kv_lens_cuda (only generation)
             num_tokens = self.num_generations * (1 + self.max_draft_tokens)
-            gen_kv_lens = kv_lens[self.num_contexts:self.num_seqs]
+            gen_kv_lens = self.get_indexer_kv_lens(
+                kv_lens[self.num_contexts:self.num_seqs])
             gen_kv_lens_expanded = torch.stack([gen_kv_lens] *
                                                (1 + self.max_draft_tokens),
                                                dim=0)
@@ -1306,8 +1335,8 @@ class Indexer(nn.Module):
         Note: Cached token counts are derived from metadata.host_ctx_cached_token_indptr
         """
         device = metadata.cu_seqlen_ks.device
-        # Only support compression ratio of 4 and 1 for now
-        compress_ratio = 4 if 4 in metadata.compress_ratios else 1
+        compress_ratio = _effective_compress_ratio_divisor(
+            _select_indexer_compress_ratio(metadata.compress_ratios))
         if len(chunk_specs) == 1:
             # Single request or intra-request Q-block
             req_idx, token_start_in_req, token_end_in_req, req_cum_start = chunk_specs[
@@ -1586,10 +1615,12 @@ class Indexer(nn.Module):
         """
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
-        tokens_per_block = metadata.kv_cache_manager.tokens_per_block
+        tokens_per_block = metadata._tokens_per_block
         if not metadata.use_expanded_buffers_for_mtp:
-            gen_seq_lens = metadata.kv_lens_cuda_runtime[
-                num_contexts:num_contexts + num_generations]
+            gen_seq_lens = metadata.get_indexer_kv_lens(
+                metadata.kv_lens_cuda_runtime[num_contexts:num_contexts +
+                                              num_generations])
+            metadata.gen_indexer_kv_lens_cuda_runtime = gen_seq_lens
             scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
                 gen_seq_lens, tokens_per_block, metadata.num_sms)
             metadata.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
@@ -1637,8 +1668,8 @@ class Indexer(nn.Module):
         head_dim = metadata.indexer_head_dim
         quant_block_size = metadata.indexer_quant_block_size
         num_past_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
-        # Only support compression ratio of 4 and 1 for now
-        compress_ratio = 4 if 4 in metadata.compress_ratios else 1
+        compress_ratio = _effective_compress_ratio_divisor(
+            _select_indexer_compress_ratio(metadata.compress_ratios))
 
         indexer_params = IndexerParams(
             num_contexts=num_contexts,
@@ -1924,7 +1955,6 @@ class Indexer(nn.Module):
                 metadata.topk_indices_buffer[:num_ctx_tokens, :]
 
         if has_decode and not metadata.skip_indexer_for_gen_reqs:
-            max_seq_len = metadata.kv_cache_manager.max_seq_len
             # Get decode lengths per request (from seq_lens) for validation
             gen_seq_lens = metadata.seq_lens[num_contexts:num_contexts +
                                              num_generations]
@@ -1942,8 +1972,8 @@ class Indexer(nn.Module):
             # and expand the corresponding metadata.
             if not metadata.use_expanded_buffers_for_mtp or next_n == 1:
                 q_decode = q_decode.view(num_generations, -1, *q_fp8.shape[1:])
-                context_lens = metadata.kv_lens_cuda_runtime[
-                    num_contexts:num_contexts + num_generations]
+                context_lens = metadata.gen_indexer_kv_lens_cuda_runtime
+                assert context_lens is not None
                 block_table = metadata.indexer_k_cache_block_offsets[
                     num_contexts:num_contexts + num_generations]
                 if q_decode.shape[1] == 4:
@@ -1965,11 +1995,9 @@ class Indexer(nn.Module):
             # [num_blocks, tokens_per_block, 1, head_dim + scale_size]
             k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
                 self.layer_idx)
-            logits_decode = fp8_paged_mqa_logits(q_decode, k_cache,
-                                                 weights_decode, context_lens,
-                                                 block_table,
-                                                 scheduler_metadata_buffer,
-                                                 max_seq_len)
+            logits_decode = fp8_paged_mqa_logits(
+                q_decode, k_cache, weights_decode, context_lens, block_table,
+                scheduler_metadata_buffer, metadata.get_indexer_max_seq_len())
 
             if use_custom_topk:
                 # Kernel expects kv_lens (total cache length), not seq_lens (new tokens)
@@ -1995,9 +2023,11 @@ class Indexer(nn.Module):
                 # so we cap it at 256 for now and fall back to the CUDA C++
                 # indexer_topk_decode. This limit can be removed if GPU memory
                 # is not a bottleneck.
-                if self.use_cute_dsl_topk and num_gen_tokens <= 256:
+                if (self.use_cute_dsl_topk and num_gen_tokens <= 256
+                        and (self.compress_ratio == 1 or next_n == 1)):
                     torch.ops.trtllm.cute_dsl_indexer_topk_decode(
-                        logits_decode, gen_kv_lens_cuda,
+                        logits_decode, context_lens
+                        if self.compress_ratio > 1 else gen_kv_lens_cuda,
                         topk_indices_buffer[num_ctx_tokens:num_ctx_tokens +
                                             num_gen_tokens, :], self.index_topk,
                         next_n)
@@ -2015,15 +2045,15 @@ class Indexer(nn.Module):
             else:
                 # padded
                 positions = torch.arange(
-                    max_seq_len, device=q_decode.device).unsqueeze(0).expand(
+                    logits_decode.shape[-1],
+                    device=q_decode.device).unsqueeze(0).expand(
                         num_gen_tokens, -1)
                 row_indices = torch.arange(num_gen_tokens,
                                            device=q_decode.device) // next_n
                 next_n_offset = torch.arange(num_gen_tokens,
                                              device=q_decode.device) % next_n
-                index_end_pos = (
-                    metadata.kv_lens_cuda_runtime[num_contexts + row_indices] -
-                    next_n + next_n_offset).unsqueeze(1)
+                index_end_pos = (context_lens[row_indices] - next_n +
+                                 next_n_offset).unsqueeze(1)
                 # index_end_pos: [B * N, 1]
                 mask = positions <= index_end_pos
                 # mask: [B * N, L]

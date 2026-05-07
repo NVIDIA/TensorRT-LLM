@@ -22,6 +22,8 @@ from tensorrt_llm._torch.attention_backend.sparse.dsa import (
     DSACacheManager,
     DSAtrtllmAttentionMetadata,
     Indexer,
+    _effective_compress_ratio_divisor,
+    _select_indexer_compress_ratio,
     compute_cu_seqlen_kv_bounds_with_cache,
     split_prefill_chunks,
 )
@@ -447,9 +449,9 @@ def _create_mock_metadata(
             # Effective tokens-per-block for the indexer k-cache slot mapping,
             # mirroring DSAtrtllmAttentionMetadata.__post_init__ (dsa.py).
             tpb = self.kv_cache_manager.tokens_per_block
+            self._indexer_compress_ratio = _select_indexer_compress_ratio(self.compress_ratios)
             if hasattr(self.kv_cache_manager, "compressed_block_sizes"):
-                _cr = 4 if 4 in self.compress_ratios else 1
-                tpb = tpb // _cr
+                tpb = tpb // _effective_compress_ratio_divisor(self._indexer_compress_ratio)
             self._tokens_per_block = tpb
             self.kv_lens_cuda_runtime = kv_lens.cuda()
             self.indexer_k_cache_block_offsets = torch.zeros(
@@ -637,6 +639,22 @@ def _create_mock_metadata(
             return self._num_seqs
 
     return MockMetadata()
+
+
+@pytest.mark.parametrize("disabled_ratio", [0, 1])
+def test_indexer_compress_ratio_zero_or_one_means_uncompressed(disabled_ratio):
+    metadata = object.__new__(DSAtrtllmAttentionMetadata)
+    metadata.kv_cache_manager = Mock()
+    metadata.kv_cache_manager.max_seq_len = 4096
+
+    kv_lens = torch.tensor([0, 1, 128, 4096], dtype=torch.int32)
+    metadata._indexer_compress_ratio = disabled_ratio
+    assert torch.equal(metadata.get_indexer_kv_lens(kv_lens), kv_lens)
+    assert metadata.get_indexer_max_seq_len() == 4096
+
+    metadata._indexer_compress_ratio = 4
+    assert torch.equal(metadata.get_indexer_kv_lens(kv_lens), kv_lens // 4)
+    assert metadata.get_indexer_max_seq_len() == 1024
 
 
 def validate_topk_indices(topk_indices_0, topk_indices_1, total_tokens):
@@ -1017,7 +1035,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, compress_ratio):
         num_contexts=batch_size,
         num_generations=0,
         seq_lens=context_lens_context.clone(),
-        kv_lens=num_ctx_kv_tokens.clone(),
+        kv_lens=context_lens_context.clone(),
         num_cached_tokens=[0] * batch_size,
         cache_manager=cache_manager,
         num_ctx_tokens=total_context_tokens,
@@ -1042,7 +1060,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, compress_ratio):
         num_contexts=0,
         num_generations=batch_size,
         seq_lens=torch.tensor([num_gen_tokens] * batch_size, dtype=torch.int32, device="cpu"),
-        kv_lens=final_kv_lens.clone(),
+        kv_lens=final_lens.clone(),
         num_cached_tokens=context_lens_context.tolist(),
         cache_manager=cache_manager,
         num_ctx_tokens=0,
@@ -1064,7 +1082,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, compress_ratio):
 
     if not metadata_gen.use_expanded_buffers_for_mtp:
         q_fp8 = q_fp8
-        context_lens = metadata_gen.kv_lens_cuda_runtime[0:batch_size]
+        context_lens = metadata_gen.gen_indexer_kv_lens_cuda_runtime
         block_table = metadata_gen.indexer_k_cache_block_offsets[0:batch_size]
         if q_fp8.shape[1] == 4:
             scheduler_metadata_buffer = metadata_gen.scheduler_metadata_buffer_mtp3
@@ -1131,7 +1149,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, compress_ratio):
         gen_offset += seq_gen_len
 
     num_tokens_cuda = final_lens.cuda()
-    num_kv_tokens_cuda = metadata_gen.kv_lens_cuda_runtime
+    num_kv_tokens_cuda = final_kv_lens.cuda()
     ref_logits = _ref_fp8_paged_mqa_logits(
         q,
         kv_cache_bf16,

@@ -3514,6 +3514,26 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
 
+    @pytest.mark.skip_less_mpi_world_size(4)
+    def test_fp8_chunked_prefill(self):
+        kv_cache_config = KvCacheConfig(dtype="fp8",
+                                        free_gpu_memory_fraction=0.5,
+                                        enable_block_reuse=False)
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=4,
+                 moe_expert_parallel_size=4,
+                 moe_config=MoeConfig(backend="WIDEEP"),
+                 cuda_graph_config=CudaGraphConfig(max_batch_size=16,
+                                                   enable_padding=True),
+                 enable_attention_dp=True,
+                 enable_chunked_prefill=True,
+                 max_batch_size=16,
+                 max_num_tokens=128,
+                 max_seq_len=4096,
+                 kv_cache_config=kv_cache_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, is_integration_test=True)
+
     # CUTLASS is omitted: V4 Flash-Base FP8 block-scale weights take a
     # Hopper-only kernel path (CutlassFp8BlockScaleGemmRunner::moeGemm) that
     # fails on Blackwell. WIDEEP avoids that path and works on B200/B300.
