@@ -642,8 +642,7 @@ void initRequestBindings(nb::module_& m)
             nb::cast<std::optional<tle::Tensor>>(state[29]), 1, nb::cast<std::optional<tle::EagleConfig>>(state[30]),
             nb::cast<std::optional<tle::Tensor>>(state[31]),
             nb::cast<std::optional<tle::GuidedDecodingParams>>(state[32]), std::nullopt, std::nullopt,
-            nb::cast<std::optional<tle::IdType>>(state[33]),
-            nb::cast<std::optional<std::string>>(state[34]));
+            nb::cast<std::optional<tle::IdType>>(state[33]), nb::cast<std::optional<std::string>>(state[34]));
     };
 
     nb::class_<tle::Request> request(m, "Request", nb::dynamic_attr());
