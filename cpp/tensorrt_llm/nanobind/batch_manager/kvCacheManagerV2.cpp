@@ -29,6 +29,7 @@
 
 #include <cassert>
 #include <cstring>
+#include <memory>
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/function.h>
@@ -666,17 +667,27 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::Block const& self)
             {
                 nb::list lst;
-                for (auto const& wp : self.storage)
+                for (auto const& weakPage : self.storage)
                 {
-                    auto sp = wp.lock();
-                    if (!sp)
+                    auto page = weakPage.lock();
+                    if (!page)
+                    {
                         lst.append(nb::none());
+                    }
                     else
                     {
                         // Return a callable: page() returns the Page object.
                         // This matches the rawref.ref[Page] protocol used in Python.
-                        auto page = std::static_pointer_cast<kv::Page>(sp);
-                        lst.append(nb::cpp_function([page]() { return page; }));
+                        lst.append(nb::cpp_function(
+                            [weakPage]() -> nb::object
+                            {
+                                auto strongPage = weakPage.lock();
+                                if (strongPage)
+                                {
+                                    return nb::cast(std::static_pointer_cast<kv::Page>(strongPage));
+                                }
+                                return nb::none();
+                            }));
                     }
                 }
                 return lst;

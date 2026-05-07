@@ -113,7 +113,7 @@ void KvCacheManager::clearReusableBlocks()
     assert(mRadixTree);
 
     auto refs = mRadixTree->clear();
-    for (auto& weakPage : refs)
+    for (auto const& weakPage : refs)
     {
         auto page = weakPage.lock();
         assert(page);
