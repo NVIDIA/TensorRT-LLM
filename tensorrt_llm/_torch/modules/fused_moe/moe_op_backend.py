@@ -115,6 +115,7 @@ class MoEOpBackend:
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None,
         gated_act_type: int = 0,
+        gemm1_clamp_limit: Optional[float] = None,
         output: Optional[torch.Tensor] = None,
         use_shuffled_weight: bool = False,
         weight_layout: int = 0,
@@ -225,6 +226,7 @@ class TRTLLMOpBackend(MoEOpBackend):
         topk_weights=None,
         topk_ids=None,
         gated_act_type=0,
+        gemm1_clamp_limit=None,
         output=None,
         use_shuffled_weight=False,
         weight_layout=0,
@@ -252,6 +254,7 @@ class TRTLLMOpBackend(MoEOpBackend):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             act_type=gated_act_type,
+            gemm1_clamp_limit=gemm1_clamp_limit,
             output=output,
         )
 
@@ -514,12 +517,18 @@ class FlashinferOpBackend(MoEOpBackend):
         topk_weights=None,
         topk_ids=None,
         gated_act_type=0,
+        gemm1_clamp_limit=None,
         output=None,
         use_shuffled_weight=False,
         weight_layout=0,
         enable_pdl=None,
         tune_max_num_tokens=8192,
     ):
+        if gemm1_clamp_limit is not None:
+            raise NotImplementedError(
+                "FlashinferOpBackend.run_fp8_block_scale_moe does not yet "
+                "forward gemm1_clamp_limit; use the trtllm op backend."
+            )
         if router_logits is not None:
             return self._fused_moe.trtllm_fp8_block_scale_moe(
                 router_logits,

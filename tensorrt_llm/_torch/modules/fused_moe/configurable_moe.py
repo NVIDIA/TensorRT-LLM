@@ -203,6 +203,7 @@ class ConfigurableMoE(MoE):
                 swiglu_alpha=kwargs.get("swiglu_alpha"),
                 swiglu_beta=kwargs.get("swiglu_beta"),
                 swiglu_limit=kwargs.get("swiglu_limit"),
+                swiglu_limit_scalar=kwargs.get("swiglu_limit_scalar"),
                 init_load_balancer=False,
                 without_comm=True,
                 activation_type=self.activation_type,

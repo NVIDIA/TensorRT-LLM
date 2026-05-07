@@ -262,7 +262,8 @@ class DeepGemmMoEOp(MoEOp):
             input=h1,
             quant_group_size=128,
             masked_m=masked_m,
-            scale_ue8m0=True)
+            scale_ue8m0=True,
+            swiglu_limit=getattr(module, "swiglu_limit_scalar", None))
 
         # Second grouped GEMM (w2)
         h3 = set_strides(workspace["workspace_1"], expert_size_per_partition,

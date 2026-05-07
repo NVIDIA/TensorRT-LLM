@@ -297,6 +297,8 @@ def _silu_and_mul_post_quant_kernel(
     BLOCK: tl.constexpr,
     NUM_STAGE: tl.constexpr,
     SCALE_UE8M0: tl.constexpr,
+    HAS_SWIGLU_LIMIT: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr,
 ):
     expert_id = tl.program_id(2)
     token_id = tl.program_id(1)
@@ -336,6 +338,15 @@ def _silu_and_mul_post_quant_kernel(
                 mask=local_mask < size_k,
                 other=0.0,
             ).to(tl.float32)
+            if HAS_SWIGLU_LIMIT:
+                # gate is fp32; clamp directly. up is in input dtype (bf16/fp16);
+                # cast the limit constant to that dtype to avoid a fp32 round-trip
+                # on every element.
+                gate = tl.minimum(gate, SWIGLU_LIMIT)
+                limit_native = tl.cast(SWIGLU_LIMIT, input_ptr.dtype.element_ty)
+                neg_limit_native = tl.cast(-SWIGLU_LIMIT,
+                                           input_ptr.dtype.element_ty)
+                up = tl.maximum(tl.minimum(up, limit_native), neg_limit_native)
             gate = gate / (1 + tl.exp(-gate))
             gate = gate.to(input_ptr.dtype.element_ty)
             gate_up = up * gate
@@ -366,6 +377,7 @@ def silu_and_mul_masked_post_quant_fwd(
     quant_group_size: int,
     masked_m: torch.Tensor,
     scale_ue8m0: bool = False,
+    swiglu_limit: Optional[float] = None,
 ):
     """
     input shape [g, m, k]
@@ -373,6 +385,11 @@ def silu_and_mul_masked_post_quant_fwd(
     output_scale [g, k // 4, m // 2 // 128], dtype int32
     quant_group_size int
     masked_m shape [g]
+    swiglu_limit optional Python float (uniform across experts); when provided,
+        the gate input is clamped to (-inf, limit] before silu and the up
+        branch is clamped to [-limit, limit] before the multiply. Baked into
+        the kernel as a constexpr — caller supplies a host-side float, no
+        per-expert tensor / global load.
     """
 
     assert input.is_contiguous()
@@ -405,6 +422,8 @@ def silu_and_mul_masked_post_quant_fwd(
         BLOCK_NUM_PER_EXPERT,
         expert_num,
     )
+    has_swiglu_limit = swiglu_limit is not None
+    swiglu_limit_value = float(swiglu_limit) if has_swiglu_limit else 0.0
     _silu_and_mul_post_quant_kernel[grid](
         input,
         *input.stride(),
@@ -420,6 +439,8 @@ def silu_and_mul_masked_post_quant_fwd(
         NUM_STAGE=NUM_STAGES,
         num_warps=num_warps,
         SCALE_UE8M0=scale_ue8m0,
+        HAS_SWIGLU_LIMIT=has_swiglu_limit,
+        SWIGLU_LIMIT=swiglu_limit_value,
     )
     output_scale = output_scale.transpose(1, 2)[:, :m, :]
     check_sf_layout(
