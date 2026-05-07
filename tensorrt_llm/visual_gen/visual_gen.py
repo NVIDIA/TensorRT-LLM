@@ -641,11 +641,16 @@ class VisualGenResult:
         Internally dispatches to the executor's background event loop, so it
         works even when called from inside a different event loop's thread.
         """
+        # Only the inner ``aresult`` carries a timeout; it owns the
+        # ``abandon_request_id`` cleanup on the timeout branch. A second
+        # ``timeout`` on ``future.result`` would let the cross-thread wait
+        # raise before that cleanup runs, so a late-arriving response could
+        # leak into ``completed_responses``.
         future = asyncio.run_coroutine_threadsafe(
             self.aresult(timeout=timeout),
             self.executor._event_loop,
         )
-        return future.result(timeout=timeout)
+        return future.result()
 
     def cancel(self):
         raise NotImplementedError("Cancel request (not yet implemented).")
