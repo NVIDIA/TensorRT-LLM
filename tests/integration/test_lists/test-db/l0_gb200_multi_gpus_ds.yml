@@ -16,3 +16,4 @@ l0_gb200_multi_gpus_ds:
   tests:
   - unittest/_torch/modules/test_engram.py
   - unittest/_torch/modules/test_mhc.py
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_auto_dtype
