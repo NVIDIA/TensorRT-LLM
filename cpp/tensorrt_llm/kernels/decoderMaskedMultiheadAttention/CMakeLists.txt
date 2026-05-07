@@ -88,3 +88,11 @@ target_link_libraries(decoder_attention_src PUBLIC nvrtc_wrapper_src
 set_property(TARGET decoder_attention_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET decoder_attention_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS
                                                    ON)
+
+# Embed cubins via INCBIN. Replaces the bin2c-style hex-array .cpp stubs that
+# previously lived under cubin/ and bloated the source tree by ~166 MB.
+include(tllm_cubin_archive)
+tllm_add_cubin_archive_sources(
+  decoder_attention_src "${CMAKE_CURRENT_SOURCE_DIR}/cubin"
+  ARCHS 80 86 89 90 120
+  IMPLICIT_FAMILY)

@@ -31,3 +31,11 @@ set_property(TARGET trtllm_gen_gemm_gated_act PROPERTY POSITION_INDEPENDENT_CODE
                                                        ON)
 set_property(TARGET trtllm_gen_gemm_gated_act
              PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+# Embed cubins via INCBIN.
+include(tllm_cubin_archive)
+tllm_add_cubin_archive_sources(
+  trtllm_gen_gemm_gated_act
+  "${CMAKE_CURRENT_SOURCE_DIR}/trtllmGen_gatedAct_export/cubins"
+  NAMESPACE gemmGatedAct tensorrt_llm kernels
+  ARCHS 100f)

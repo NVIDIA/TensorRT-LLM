@@ -139,7 +139,8 @@ Functions
 
   Removes source files targeting disabled CUDA architectures from the
   source list. Files are matched by patterns like ``sm80``, ``sm_80``,
-  ``SM80``, etc. in their filenames (for ``.cu`` and ``cubin.cpp`` files).
+  ``SM80``, etc. in their filenames (for ``.cu``, ``.cubin.cpp``, and
+  ``.cubin.tar.zst`` files).
 
   ``SOURCE_LIST <variable>``
     Name of the variable containing the list of source files.
@@ -619,7 +620,8 @@ function(filter_source_cuda_architectures)
           set(ARCH_FOR_DEFINE "${BASE_ARCH}F")
           # Match "sm${BASE_ARCH}f" - straightforward match, no exclusion
           # pattern needed
-          set(MATCH_PATTERN ".*[Ss][Mm]_?${BASE_ARCH}f.*(cubin\.cpp|\.cu)$")
+          set(MATCH_PATTERN
+              ".*[Ss][Mm]_?${BASE_ARCH}f.*(cubin\.cpp|\.cu|cubin\.tar\.zst)$")
         endif()
       else()
         # ARCH is NOT suffixed by 'f' (e.g., "80")
@@ -627,8 +629,10 @@ function(filter_source_cuda_architectures)
           set(SHOULD_FILTER TRUE)
           set(ARCH_FOR_DEFINE "${ARCH}")
           # Match "sm${ARCH}" but NOT "sm${ARCH}f"
-          set(MATCH_PATTERN ".*[Ss][Mm]_?${ARCH}.*(cubin\.cpp|\.cu)$")
-          set(EXCLUDE_PATTERN ".*[Ss][Mm]_?${ARCH}f.*(cubin\.cpp|\.cu)$")
+          set(MATCH_PATTERN
+              ".*[Ss][Mm]_?${ARCH}.*(cubin\.cpp|\.cu|cubin\.tar\.zst)$")
+          set(EXCLUDE_PATTERN
+              ".*[Ss][Mm]_?${ARCH}f.*(cubin\.cpp|\.cu|cubin\.tar\.zst)$")
         endif()
       endif()
     else()
@@ -639,8 +643,10 @@ function(filter_source_cuda_architectures)
           set(SHOULD_FILTER TRUE)
           set(ARCH_FOR_DEFINE "${ARCH}")
           # Match "sm${ARCH}" but NOT "sm${ARCH}a"
-          set(MATCH_PATTERN ".*[Ss][Mm]_?${ARCH}.*(cubin\.cpp|\.cu)$")
-          set(EXCLUDE_PATTERN ".*[Ss][Mm]_?${ARCH}a.*(cubin\.cpp|\.cu)$")
+          set(MATCH_PATTERN
+              ".*[Ss][Mm]_?${ARCH}.*(cubin\.cpp|\.cu|cubin\.tar\.zst)$")
+          set(EXCLUDE_PATTERN
+              ".*[Ss][Mm]_?${ARCH}a.*(cubin\.cpp|\.cu|cubin\.tar\.zst)$")
         endif()
       else()
         # ARCH < CMAKE_CUDA_MIN_ARCHITECTURE_HAS_FAMILY
@@ -648,7 +654,8 @@ function(filter_source_cuda_architectures)
           set(SHOULD_FILTER TRUE)
           set(ARCH_FOR_DEFINE "${ARCH}")
           # Match "sm${ARCH}" - no exclusion pattern needed
-          set(MATCH_PATTERN ".*[Ss][Mm]_?${ARCH}.*(cubin\.cpp|\.cu)$")
+          set(MATCH_PATTERN
+              ".*[Ss][Mm]_?${ARCH}.*(cubin\.cpp|\.cu|cubin\.tar\.zst)$")
         endif()
       endif()
     endif()

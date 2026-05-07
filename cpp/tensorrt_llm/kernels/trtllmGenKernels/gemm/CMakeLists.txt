@@ -30,3 +30,10 @@ target_compile_definitions(trtllm_gen_gemm PUBLIC TLLM_GEN_EXPORT_INTERFACE
 
 set_property(TARGET trtllm_gen_gemm PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET trtllm_gen_gemm PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
+# Embed cubins via INCBIN.
+include(tllm_cubin_archive)
+tllm_add_cubin_archive_sources(
+  trtllm_gen_gemm "${CMAKE_CURRENT_SOURCE_DIR}/trtllmGen_gemm_export/cubins"
+  NAMESPACE gemm tensorrt_llm kernels
+  ARCHS 100 103 100f)
