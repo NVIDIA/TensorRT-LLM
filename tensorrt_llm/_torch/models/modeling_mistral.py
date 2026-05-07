@@ -7,7 +7,6 @@ import torch
 from mistral_common.tokens.tokenizers.multimodal import ImageEncoder
 from PIL import Image
 from torch import nn
-
 from transformers import (AutoProcessor, AutoTokenizer, Mistral3Config,
                           MistralConfig, PretrainedConfig, PreTrainedModel)
 from transformers.activations import ACT2FN
@@ -53,6 +52,7 @@ from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.logger import logger
 
 torchvision = lazy.load("torchvision")
+
 
 class MistralAttention(Attention):
 

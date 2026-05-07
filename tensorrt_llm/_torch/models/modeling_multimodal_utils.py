@@ -632,7 +632,8 @@ def dynamic_preprocess_dispatch(image,
 
     if use_fast:
         return dynamic_preprocess_torch(
-            torchvision.transforms.ToTensor()(image) if isinstance(image, Image.Image) else image,
+            torchvision.transforms.ToTensor()(image) if isinstance(
+                image, Image.Image) else image,
             image_processor,
             min_num=min_num,
             max_num=max_num,
@@ -821,7 +822,8 @@ def dynamic_s2_preprocess_dispatch(image,
 
     if use_fast:
         return dynamic_s2_preprocess_torch(
-            torchvision.transforms.ToTensor()(image) if isinstance(image, Image.Image) else image,
+            torchvision.transforms.ToTensor()(image) if isinstance(
+                image, Image.Image) else image,
             image_processor,
             s2_scales=s2_scales,
             max_num=max_num,
