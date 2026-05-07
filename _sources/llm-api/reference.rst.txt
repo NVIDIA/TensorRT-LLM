@@ -281,6 +281,14 @@ API Reference
     :member-order: groupwise
     :inherited-members:
 
+.. autoclass:: tensorrt_llm.llmapi.DFlashDecodingConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
 .. autoclass:: tensorrt_llm.llmapi.SADecodingConfig
     :members:
     :undoc-members:
@@ -336,7 +344,7 @@ API Reference
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
-    :exclude-members: model_construct,model_computed_fields,update_forward_refs,construct,model_validate_strings,model_copy,json,model_extra,parse_raw,dict,model_parametrized_name,parse_obj,model_fields_set,model_validate_json,schema,model_json_schema,model_post_init,from_orm,model_validate,copy,model_dump,model_dump_json,parse_file,model_rebuild,model_config,model_fields,schema_json,validate
+    :exclude-members: construct,parse_obj,model_json_schema,model_config,parse_file,model_post_init,schema_json,model_validate,model_validate_json,schema,update_forward_refs,model_construct,model_dump_json,model_computed_fields,json,parse_raw,model_dump,validate,model_fields_set,model_fields,copy,model_rebuild,model_parametrized_name,model_copy,model_extra,from_orm,model_validate_strings,dict
 
 .. autoclass:: tensorrt_llm.llmapi.TrtLlmArgs
     :members:
@@ -345,7 +353,7 @@ API Reference
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
-    :exclude-members: model_construct,model_computed_fields,update_forward_refs,construct,model_validate_strings,model_copy,json,model_extra,parse_raw,dict,model_parametrized_name,parse_obj,model_fields_set,model_validate_json,schema,model_json_schema,model_post_init,from_orm,model_validate,copy,model_dump,model_dump_json,parse_file,model_rebuild,model_config,model_fields,schema_json,validate
+    :exclude-members: construct,parse_obj,model_json_schema,model_config,parse_file,model_post_init,schema_json,model_validate,model_validate_json,schema,update_forward_refs,model_construct,model_dump_json,model_computed_fields,json,parse_raw,model_dump,validate,model_fields_set,model_fields,copy,model_rebuild,model_parametrized_name,model_copy,model_extra,from_orm,model_validate_strings,dict
 
 .. autoclass:: tensorrt_llm.llmapi.AutoDecodingConfig
     :members:

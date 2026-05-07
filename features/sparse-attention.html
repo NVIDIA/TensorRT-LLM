@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.17.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc13';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc14';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc13" />
+  <meta name="docsearch:version" content="1.3.0rc14" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -459,6 +459,8 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
@@ -648,6 +650,13 @@
 <span class="p">)</span>
 </pre></div>
 </div>
+<p>For DeepSeek-V3.2 style DSA decode on Blackwell GPUs, you can optionally enable Guess-Verify-Refine (GVR) Top-K. GVR reuses the previous decode step’s Top-K indices as hints for the exact indexer Top-K selector. The current implementation supports <code class="docutils literal notranslate"><span class="pre">index_topk=2048</span></code>; <code class="docutils literal notranslate"><span class="pre">index_topk=512</span></code> and <code class="docutils literal notranslate"><span class="pre">index_topk=1024</span></code> are planned future extensions. Other <code class="docutils literal notranslate"><span class="pre">index_topk</span></code> values fall back automatically to the production CUDA C++ insertion/radix path, as do cases where the GVR prerequisites or hardware-aware dispatcher thresholds are not satisfied.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">sparse_attention_config</span> <span class="o">=</span> <span class="n">DeepSeekSparseAttentionConfig</span><span class="p">(</span>
+    <span class="n">index_topk</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span>
+    <span class="n">enable_heuristic_topk</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+<span class="p">)</span>
+</pre></div>
+</div>
 </section>
 <section id="skip-softmax-attention">
 <h4>Skip Softmax Attention<a class="headerlink" href="#skip-softmax-attention" title="Link to this heading">#</a></h4>
@@ -689,6 +698,14 @@
 <span class="w">  </span><span class="nt">index_topk</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">64</span>
 </pre></div>
 </div>
+<p>Optional GVR Top-K acceleration for DSA decode:</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">sparse_attention_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">dsa</span>
+<span class="w">  </span><span class="nt">index_topk</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2048</span>
+<span class="w">  </span><span class="nt">enable_heuristic_topk</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+</pre></div>
+</div>
+<p>GVR is an opt-in PyTorch-backend DSA decode optimization for Blackwell (<code class="docutils literal notranslate"><span class="pre">sm_100+</span></code>) GPUs. Today the GVR fast path is enabled only for <code class="docutils literal notranslate"><span class="pre">index_topk=2048</span></code>; planned <code class="docutils literal notranslate"><span class="pre">512</span></code> and <code class="docutils literal notranslate"><span class="pre">1024</span></code> support should not be treated as available yet. The runtime uses a hardware-aware GVR dispatcher to route each <code class="docutils literal notranslate"><span class="pre">(batch</span> <span class="pre">size,</span> <span class="pre">sequence</span> <span class="pre">length)</span></code> cell between GVR and the original insertion/radix Top-K fallback. For benchmarking, <code class="docutils literal notranslate"><span class="pre">TRTLLM_HEURISTIC_NMIN</span></code> overrides the small-sequence lower bound, and <code class="docutils literal notranslate"><span class="pre">TRTLLM_SCHEMEX_DEBUG=1</span></code> prints the GVR dispatcher decision.</p>
 <p><strong>Skip Softmax Attention</strong></p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">attn_backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">TRTLLM</span>
 <span class="nt">sparse_attention_config</span><span class="p">:</span>
@@ -1104,9 +1121,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on April 26, 2026.</p>
+  <p>Last updated on May 06, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b9ce4b6">b9ce4b6</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/93cb651">93cb651</a>.</p>
   
 </div></div>
       

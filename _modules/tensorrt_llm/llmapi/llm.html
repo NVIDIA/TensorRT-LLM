@@ -498,7 +498,7 @@ window.runMermaid = runMermaid;</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.17.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc13';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc14';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +512,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc13" />
+  <meta name="docsearch:version" content="1.3.0rc14" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -888,6 +888,8 @@ window.runMermaid = runMermaid;</script>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog21_Temporal_Correlation_Meets_Sparse_Attention.html">Temporal Correlation Meets Sparse Attention: Guess-Verify-Refine Top-K for Blackwell</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog20_Tuning_CUDA_Graph_Batch_Sizes_for_Higher_Output_Throughput.html">Tuning CUDA Graph Batch Sizes for Higher Output Throughput</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Performance_LLM_Inference_on_NVL72.html">DWDP: Distributed Weight Data Parallelism for High-Performance LLM Inference on NVL72</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html">Optimizing MoE Communication with One-Sided AlltoAll Over NVLink</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
@@ -991,6 +993,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">,</span> <span class="n">Tuple</span><span class="p">,</span> <span class="n">Union</span><span class="p">,</span> <span class="n">cast</span>
 
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">transformers</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tqdm</span><span class="w"> </span><span class="kn">import</span> <span class="n">tqdm</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">PreTrainedTokenizerBase</span>
@@ -1017,7 +1020,7 @@ window.runMermaid = runMermaid;</script>
                               <span class="n">get_spawn_proxy_process_env</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..inputs</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">PromptInputs</span><span class="p">,</span> <span class="n">create_input_processor</span><span class="p">,</span>
                       <span class="n">create_input_processor_with_hash</span><span class="p">,</span> <span class="n">get_cache_salt_id</span><span class="p">,</span>
-                      <span class="n">prompt_inputs</span><span class="p">)</span>
+                      <span class="n">maybe_compute_mm_embed_cumsum</span><span class="p">,</span> <span class="n">prompt_inputs</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..sampling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..scheduling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">SchedulingParams</span>
@@ -1087,6 +1090,23 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">EncoderOutput</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Output from an encoder-only model.</span>
+
+<span class="sd">    Attributes:</span>
+<span class="sd">        logits (torch.Tensor): Model output tensor. Shape depends on model:</span>
+<span class="sd">            - Classification: [num_classes]</span>
+<span class="sd">            - Per-token scoring: [seq_len, num_labels]</span>
+<span class="sd">            - Embeddings: [hidden_size]</span>
+<span class="sd">        prompt_token_ids (List[int]): The tokenized input IDs.</span>
+<span class="sd">        prompt (Optional[str]): The original text prompt, if provided as string.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">logits</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span>
+    <span class="n">prompt_token_ids</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
+    <span class="n">prompt</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+
+
 <span class="n">TRT_LLM_DOCSTRING</span> <span class="o">=</span> <span class="n">TRT_LLMARGS_EXPLICIT_DOCSTRING</span> <span class="o">+</span> <span class="s2">&quot;&quot;&quot;</span>
 
 <span class="s2">    Attributes:</span>
@@ -1118,8 +1138,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">BaseLLM</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">    The base class for all LLM classes.</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;The base class for all LLM classes.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
@@ -1212,11 +1231,11 @@ window.runMermaid = runMermaid;</script>
             <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="p">:</span>
                 <span class="n">mpi_process_pre_spawned</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">get_spawn_proxy_process_env</span><span class="p">()</span>
                 <span class="k">if</span> <span class="ow">not</span> <span class="n">mpi_process_pre_spawned</span><span class="p">:</span>
-                    <span class="n">logger_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;LLM create MpiPoolSession</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span> <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
+                    <span class="n">logger_debug</span><span class="p">(</span><span class="s2">&quot;LLM create MpiPoolSession</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span> <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="o">=</span> <span class="n">MpiPoolSession</span><span class="p">(</span>
                         <span class="n">n_workers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
                 <span class="k">else</span><span class="p">:</span>
-                    <span class="n">logger_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;LLM create MpiCommSession</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span> <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
+                    <span class="n">logger_debug</span><span class="p">(</span><span class="s2">&quot;LLM create MpiCommSession</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span> <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="o">=</span> <span class="n">create_mpi_comm_session</span><span class="p">(</span>
                         <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
 
@@ -1224,6 +1243,8 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># Due to the Executor can only accept a engine path, we need to save the engine to a directory</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Path</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">GenerationExecutor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_encode_only</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_encoder_executor</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_trt_backend</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span> <span class="o">=</span> <span class="n">tempfile</span><span class="o">.</span><span class="n">TemporaryDirectory</span><span class="p">(</span>
                     <span class="n">suffix</span><span class="o">=</span><span class="s2">&quot;-llm-workspace&quot;</span><span class="p">,</span> <span class="nb">dir</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">workspace</span><span class="p">)</span>
@@ -1333,6 +1354,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">                Scheduling parameters. Defaults to None.</span>
 <span class="sd">            cache_salt (str, Sequence[str], optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.</span>
 <span class="sd">            priority (float, List[float]): The scheduling priority for the request(s), in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.</span>
+
 <span class="sd">        Returns:</span>
 <span class="sd">            Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
@@ -1426,9 +1448,15 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">            scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.</span>
 <span class="sd">            cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.</span>
 <span class="sd">            priority (float): The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.</span>
+
 <span class="sd">        Returns:</span>
 <span class="sd">            tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_encode_only</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                <span class="s2">&quot;generate_async() is not available when encode_only=True. &quot;</span>
+                <span class="s2">&quot;Use llm.encode() for encoder-only models.&quot;</span><span class="p">)</span>
 
         <span class="c1"># Check if the worker is shutting down</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">is_shutdown</span><span class="p">():</span>
@@ -1578,6 +1606,11 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">mrope_config</span><span class="p">[</span>
                         <span class="s2">&quot;mrope_position_deltas&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">disaggregated_params</span><span class="o">.</span><span class="n">mrope_position_deltas_handle</span>
                     <span class="n">multimodal_data</span><span class="p">[</span><span class="s2">&quot;mrope_config&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">mrope_config</span>
+                <span class="c1"># Backfill multimodal_embed_mask_cumsum so downstream chunked-prefill</span>
+                <span class="c1"># logic can slice the pre-computed embeddings correctly.</span>
+                <span class="n">maybe_compute_mm_embed_cumsum</span><span class="p">(</span>
+                    <span class="n">prompt_token_ids</span><span class="p">,</span> <span class="p">{</span><span class="s2">&quot;multimodal_data&quot;</span><span class="p">:</span> <span class="n">multimodal_data</span><span class="p">},</span>
+                    <span class="n">cast</span><span class="p">(</span><span class="n">BaseMultimodalInputProcessor</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">))</span>
                 <span class="n">multimodal_params</span> <span class="o">=</span> <span class="n">MultimodalParams</span><span class="p">(</span>
                     <span class="n">multimodal_input</span><span class="o">=</span><span class="n">multimodal_input</span><span class="p">,</span>
                     <span class="n">multimodal_data</span><span class="o">=</span><span class="n">multimodal_data</span><span class="p">,</span>
@@ -1628,6 +1661,9 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">BaseMultimodalInputProcessor</span><span class="p">,</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">)</span><span class="o">.</span><span class="n">attach_multimodal_embeddings</span><span class="p">(</span>
                         <span class="n">inputs</span><span class="p">,</span> <span class="n">mm_embedding_info</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+                <span class="n">maybe_compute_mm_embed_cumsum</span><span class="p">(</span>
+                    <span class="n">prompt_token_ids</span><span class="p">,</span> <span class="n">extra_processed_inputs</span><span class="p">,</span>
+                    <span class="n">cast</span><span class="p">(</span><span class="n">BaseMultimodalInputProcessor</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">))</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="k">with</span> <span class="n">nvtx_range_debug</span><span class="p">(</span><span class="s2">&quot;input_processor&quot;</span><span class="p">):</span>
                     <span class="n">prompt_token_ids</span><span class="p">,</span> <span class="n">extra_processed_inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">(</span>
@@ -1689,7 +1725,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">        Returns:</span>
 <span class="sd">            tensorrt_llm.llmapi.llm.PreprocessedInputs: A preprocessed-inputs object that can be</span>
-<span class="sd">                passed directly to :meth:`generate_async` as ``inputs``.</span>
+<span class="sd">                passed directly to :meth:`generate_async` as `inputs`.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="n">sampling_params</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_sampling_params</span><span class="p">(</span><span class="n">sampling_params</span><span class="p">)</span>
         <span class="n">prompt_token_ids</span><span class="p">,</span> <span class="n">_prompt</span><span class="p">,</span> <span class="n">query_token_ids</span><span class="p">,</span> <span class="n">multimodal_params</span> <span class="o">=</span> <span class="p">(</span>
@@ -1701,9 +1737,140 @@ window.runMermaid = runMermaid;</script>
             <span class="n">multimodal_params</span><span class="o">=</span><span class="n">multimodal_params</span><span class="p">,</span>
         <span class="p">)</span>
 
+    <span class="nd">@set_api_status</span><span class="p">(</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">encode</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span>
+        <span class="n">inputs</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="n">PromptInputs</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">PromptInputs</span><span class="p">]],</span>
+        <span class="n">add_special_tokens</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+        <span class="o">**</span><span class="n">model_kwargs</span><span class="p">:</span> <span class="n">Any</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Union</span><span class="p">[</span><span class="n">EncoderOutput</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="n">EncoderOutput</span><span class="p">]]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Encode inputs using an encoder-only model (PyTorch backend only).</span>
+
+<span class="sd">        Only available when encode_only=True is set in the LLM constructor.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            inputs (tensorrt_llm.inputs.data.PromptInputs, Sequence[tensorrt_llm.inputs.data.PromptInputs]): The prompt text or token ids.</span>
+<span class="sd">                It can be a single prompt or batched prompts.</span>
+<span class="sd">            add_special_tokens (bool): Whether to add special tokens (e.g., [CLS]/[SEP]) during tokenization. Defaults to True.</span>
+<span class="sd">            model_kwargs (Any): Model-specific inputs passed through to the model&#39;s forward(). Examples: token_type_ids (BERT),</span>
+<span class="sd">                inputs_embeds (reward models).</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput]]: The encoder output(s) containing logits or embeddings.</span>
+
+<span class="sd">        Raises:</span>
+<span class="sd">            RuntimeError: If encode_only mode is not enabled.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_encode_only</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">&quot;encode() requires encode_only=True. &quot;</span>
+                               <span class="s2">&quot;Set encode_only=True in the LLM() constructor.&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_encoder_executor</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                <span class="s2">&quot;LLM is shut down or not initialized. Please recreate the LLM object.&quot;</span>
+            <span class="p">)</span>
+
+        <span class="n">unbatched</span> <span class="o">=</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="nb">list</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">unbatched</span><span class="p">:</span>
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="nb">int</span><span class="p">):</span>
+                <span class="n">unbatched</span> <span class="o">=</span> <span class="kc">True</span>
+        <span class="k">if</span> <span class="n">unbatched</span><span class="p">:</span>
+            <span class="n">inputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">inputs</span><span class="p">]</span>
+
+        <span class="n">engine</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_encoder_executor</span><span class="o">.</span><span class="n">model_engine</span>
+        <span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">max_seq_len</span>
+        <span class="n">max_num_tokens</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">max_num_tokens</span>
+        <span class="n">max_batch_size</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">batch_size</span>
+
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">max_batch_size</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;Batch size (</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span><span class="si">}</span><span class="s2">) exceeds max_batch_size &quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;(</span><span class="si">{</span><span class="n">max_batch_size</span><span class="si">}</span><span class="s2">). Split inputs into smaller batches.&quot;</span><span class="p">)</span>
+
+        <span class="c1"># Tokenize each input (reuses existing input_processor)</span>
+        <span class="n">token_ids_list</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">prompts</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">add_special_tokens</span><span class="o">=</span><span class="n">add_special_tokens</span><span class="p">)</span>
+
+        <span class="n">total_tokens</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="n">max_seq_len_batch</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="k">for</span> <span class="n">inp</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">:</span>
+            <span class="n">inp</span> <span class="o">=</span> <span class="n">prompt_inputs</span><span class="p">(</span><span class="n">inp</span><span class="p">)</span>
+            <span class="k">if</span> <span class="s2">&quot;prompt_token_ids&quot;</span> <span class="ow">in</span> <span class="n">inp</span><span class="p">:</span>
+                <span class="n">token_ids_list</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">inp</span><span class="p">[</span><span class="s2">&quot;prompt_token_ids&quot;</span><span class="p">])</span>
+                <span class="n">seq_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">inp</span><span class="p">[</span><span class="s2">&quot;prompt_token_ids&quot;</span><span class="p">])</span>
+                <span class="n">total_tokens</span> <span class="o">+=</span> <span class="n">seq_len</span>
+                <span class="n">max_seq_len_batch</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">max_seq_len_batch</span><span class="p">,</span> <span class="n">seq_len</span><span class="p">)</span>
+                <span class="n">prompts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="kc">None</span><span class="p">)</span>
+            <span class="k">elif</span> <span class="s2">&quot;prompt&quot;</span> <span class="ow">in</span> <span class="n">inp</span><span class="p">:</span>
+                <span class="n">token_ids</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="p">(</span><span class="n">inp</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">)</span>
+                <span class="n">token_ids_list</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">token_ids</span><span class="p">)</span>
+                <span class="n">seq_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">token_ids</span><span class="p">)</span>
+                <span class="n">total_tokens</span> <span class="o">+=</span> <span class="n">seq_len</span>
+                <span class="n">max_seq_len_batch</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">max_seq_len_batch</span><span class="p">,</span> <span class="n">seq_len</span><span class="p">)</span>
+                <span class="n">prompts</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">inp</span><span class="p">[</span><span class="s2">&quot;prompt&quot;</span><span class="p">])</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">TypeError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unsupported input type: </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">inp</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="c1"># Validate inputs against model capacity</span>
+        <span class="k">if</span> <span class="n">total_tokens</span> <span class="o">&gt;</span> <span class="n">max_num_tokens</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;Total tokens (</span><span class="si">{</span><span class="n">total_tokens</span><span class="si">}</span><span class="s2">) across the batch exceeds &quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;max_num_tokens (</span><span class="si">{</span><span class="n">max_num_tokens</span><span class="si">}</span><span class="s2">). Reduce batch size or &quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;sequence lengths.&quot;</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">max_seq_len_batch</span> <span class="o">&gt;</span> <span class="n">max_seq_len</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;Max sequence length (</span><span class="si">{</span><span class="n">max_seq_len_batch</span><span class="si">}</span><span class="s2">) exceeds &quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;max_seq_len (</span><span class="si">{</span><span class="n">max_seq_len</span><span class="si">}</span><span class="s2">). Truncate the input or increase &quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;max_seq_len.&quot;</span><span class="p">)</span>
+
+        <span class="c1"># Pack into flat tensors</span>
+        <span class="n">seq_lens</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="nb">len</span><span class="p">(</span><span class="n">t</span><span class="p">)</span> <span class="k">for</span> <span class="n">t</span> <span class="ow">in</span> <span class="n">token_ids_list</span><span class="p">],</span>
+                                <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+        <span class="n">flat_token_ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span>
+            <span class="p">[</span><span class="n">tid</span> <span class="k">for</span> <span class="n">tids</span> <span class="ow">in</span> <span class="n">token_ids_list</span> <span class="k">for</span> <span class="n">tid</span> <span class="ow">in</span> <span class="n">tids</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+
+        <span class="c1"># Build inputs dict — common + model-specific kwargs.</span>
+        <span class="c1"># Filter keys that are set internally by _prepare_encoder_inputs or</span>
+        <span class="c1"># _forward_step to avoid &quot;multiple values for keyword argument&quot; errors.</span>
+        <span class="n">_RESERVED_KEYS</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s1">&#39;input_ids&#39;</span><span class="p">,</span>
+            <span class="s1">&#39;seq_lens&#39;</span><span class="p">,</span>
+            <span class="s1">&#39;attn_metadata&#39;</span><span class="p">,</span>
+            <span class="s1">&#39;return_context_logits&#39;</span><span class="p">,</span>
+        <span class="p">}</span>
+        <span class="n">filtered_kwargs</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="n">k</span><span class="p">:</span> <span class="n">v</span>
+            <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">model_kwargs</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">_RESERVED_KEYS</span>
+        <span class="p">}</span>
+        <span class="n">forward_inputs</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s1">&#39;input_ids&#39;</span><span class="p">:</span> <span class="n">flat_token_ids</span><span class="p">,</span>
+            <span class="s1">&#39;seq_lens&#39;</span><span class="p">:</span> <span class="n">seq_lens</span><span class="p">,</span>
+            <span class="o">**</span><span class="n">filtered_kwargs</span><span class="p">,</span>
+        <span class="p">}</span>
+
+        <span class="c1"># Single forward pass</span>
+        <span class="n">outputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_encoder_executor</span><span class="o">.</span><span class="n">batch_forward</span><span class="p">(</span><span class="n">forward_inputs</span><span class="p">)</span>
+
+        <span class="c1"># Package as EncoderOutput.</span>
+        <span class="c1"># NOTE: logits[i] assumes batch-indexed output (e.g., BERT classification</span>
+        <span class="c1"># returns [batch_size, num_classes]). Per-token models that return packed</span>
+        <span class="c1"># [total_tokens, hidden_size] would need cumulative-sum slicing instead.</span>
+        <span class="n">logits</span> <span class="o">=</span> <span class="n">outputs</span><span class="p">[</span><span class="s1">&#39;logits&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span>
+        <span class="n">results</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">token_ids_list</span><span class="p">)):</span>
+            <span class="n">results</span><span class="o">.</span><span class="n">append</span><span class="p">(</span>
+                <span class="n">EncoderOutput</span><span class="p">(</span>
+                    <span class="n">logits</span><span class="o">=</span><span class="n">logits</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="k">if</span> <span class="n">logits</span><span class="o">.</span><span class="n">dim</span><span class="p">()</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="k">else</span> <span class="n">logits</span><span class="p">,</span>
+                    <span class="n">prompt_token_ids</span><span class="o">=</span><span class="n">token_ids_list</span><span class="p">[</span><span class="n">i</span><span class="p">],</span>
+                    <span class="n">prompt</span><span class="o">=</span><span class="n">prompts</span><span class="p">[</span><span class="n">i</span><span class="p">],</span>
+                <span class="p">))</span>
+
+        <span class="k">return</span> <span class="n">results</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="n">unbatched</span> <span class="k">else</span> <span class="n">results</span>
+
     <span class="nd">@set_api_status</span><span class="p">(</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_stats</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="mi">2</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">dict</span><span class="p">]:</span>
-<span class="w">        </span><span class="sd">&#39;&#39;&#39;Get iteration statistics from the runtime.</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Get iteration statistics from the runtime.</span>
 <span class="sd">        To collect statistics, call this function after prompts have been submitted with LLM().generate().</span>
 
 <span class="sd">        Args:</span>
@@ -1712,12 +1879,16 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        Returns:</span>
 <span class="sd">            List[dict]: A list of runtime stats as dicts.</span>
 <span class="sd">                e.g., [{&quot;cpuMemUsage&quot;: ..., &quot;iter&quot;: 0, ...}, {&quot;cpuMemUsage&quot;: ..., &quot;iter&quot;: 1, ...}]</span>
-<span class="sd">        &#39;&#39;&#39;</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_encode_only</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                <span class="s2">&quot;get_stats() is not available when encode_only=True. &quot;</span>
+                <span class="s2">&quot;Use llm.encode() for encoder-only models.&quot;</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">get_stats</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout</span><span class="p">)</span>
 
     <span class="nd">@set_api_status</span><span class="p">(</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_stats_async</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="mi">2</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">IterationResult</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&#39;&#39;&#39;Get iteration statistics from the runtime.</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Get iteration statistics from the runtime.</span>
 <span class="sd">        To collect statistics, you can call this function in an async coroutine or the /metrics endpoint (if you&#39;re using trtllm-serve)</span>
 <span class="sd">        after prompts have been submitted.</span>
 
@@ -1726,12 +1897,16 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">        Returns:</span>
 <span class="sd">            tensorrt_llm.executor.result.IterationResult: An async iterable object containing runtime stats.</span>
-<span class="sd">        &#39;&#39;&#39;</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_encode_only</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                <span class="s2">&quot;get_stats_async() is not available when encode_only=True. &quot;</span>
+                <span class="s2">&quot;Use llm.encode() for encoder-only models.&quot;</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">aget_stats</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout</span><span class="p">)</span>
 
     <span class="nd">@set_api_status</span><span class="p">(</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_kv_cache_events</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="mi">2</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="nb">dict</span><span class="p">]:</span>
-<span class="w">        </span><span class="sd">&#39;&#39;&#39;Get iteration KV events from the runtime.</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Get iteration KV events from the runtime.</span>
 
 <span class="sd">        KV events are used to track changes and operations within the KV Cache. Types of events:</span>
 <span class="sd">            - KVCacheCreatedData: Indicates the creation of cache blocks.</span>
@@ -1748,14 +1923,17 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">        Returns:</span>
 <span class="sd">            List[dict]: A list of runtime events as dict.</span>
-<span class="sd">        &#39;&#39;&#39;</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_encode_only</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">&quot;get_kv_cache_events() is not available when &quot;</span>
+                               <span class="s2">&quot;encode_only=True.&quot;</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">get_kv_events</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout</span><span class="p">)</span>
 
     <span class="nd">@set_api_status</span><span class="p">(</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_kv_cache_events_async</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                                   <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="mi">2</span>
                                   <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">IterationResult</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&#39;&#39;&#39;Get iteration KV events from the runtime.</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Get iteration KV events from the runtime.</span>
 
 <span class="sd">        KV events are used to track changes and operations within the KV Cache. Types of events:</span>
 <span class="sd">            - KVCacheCreatedData: Indicates the creation of cache blocks.</span>
@@ -1772,7 +1950,11 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">        Returns:</span>
 <span class="sd">            tensorrt_llm.executor.result.IterationResult: An async iterable object containing runtime events.</span>
-<span class="sd">        &#39;&#39;&#39;</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_encode_only</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                <span class="s2">&quot;get_kv_cache_events_async() is not available when &quot;</span>
+                <span class="s2">&quot;encode_only=True.&quot;</span><span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">aget_kv_events</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_process_env_overrides</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
@@ -1969,6 +2151,11 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="o">=</span> <span class="kc">None</span>
 
+        <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                   <span class="s2">&quot;_encoder_executor&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_encoder_executor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_encoder_executor</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_encoder_executor</span> <span class="o">=</span> <span class="kc">None</span>
+
         <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">&#39;mpi_session&#39;</span><span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="o">=</span> <span class="kc">None</span>
@@ -1977,10 +2164,13 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Check if the LLM is healthy.</span>
 
 <span class="sd">        Returns:</span>
-<span class="sd">            bool: True if the executor is running and not shutdown, False otherwise.</span>
+<span class="sd">            bool: True if the executor is running and healthy, False otherwise.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_encode_only</span><span class="p">:</span>
+            <span class="k">return</span> <span class="p">(</span><span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">&quot;_encoder_executor&quot;</span><span class="p">)</span>
+                    <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_encoder_executor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">)</span>
         <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">&quot;_executor&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">return</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">is_shutdown</span><span class="p">()</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">check_health</span><span class="p">()</span>
 
         <span class="k">return</span> <span class="kc">False</span>
 
@@ -2014,7 +2204,7 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;LLM class is the main class for running a LLM model using TensorRT LLM backend.</span>
 
 <span class="sd">    Parameters:</span>
-<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    &quot;&quot;&quot;</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">model</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">],</span>
@@ -2203,7 +2393,7 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;LLM class is the main class for running a LLM model using PyTorch backend.</span>
 
 <span class="sd">    Parameters:</span>
-<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    &quot;&quot;&quot;</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">model</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">],</span>
@@ -2244,8 +2434,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">non_block</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
             <span class="n">unique_reply_rank</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
             <span class="n">target_ranks</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">Any</span><span class="p">]:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">        Execute an RPC call on all GPU workers. Currently, this is only supported for RayExecutor.</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Execute an RPC call on all GPU workers. Currently, this is only supported for RayExecutor.</span>
 
 <span class="sd">        Args:</span>
 <span class="sd">            method (str): The name of the worker method to execute.</span>
@@ -2258,6 +2447,9 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        Returns:</span>
 <span class="sd">            list[Any]: A list of results from each worker.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_encode_only</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                <span class="s2">&quot;_collective_rpc() is not available when encode_only=True.&quot;</span><span class="p">)</span>
         <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="p">,</span> <span class="s1">&#39;collective_rpc&#39;</span><span class="p">):</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">collective_rpc</span><span class="p">(</span><span class="n">method</span><span class="p">,</span> <span class="n">args</span><span class="p">,</span> <span class="n">kwargs</span><span class="p">,</span>
                                                  <span class="n">non_block</span><span class="p">,</span> <span class="n">unique_reply_rank</span><span class="p">,</span>
@@ -2291,6 +2483,37 @@ window.runMermaid = runMermaid;</script>
                                                       <span class="o">**</span><span class="n">input_processor_kwargs</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_tokenizer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="o">.</span><span class="n">tokenizer</span>
 
+        <span class="c1"># Resolve encode_only mode (opt-in only)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_encode_only</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">encode_only</span> <span class="ow">is</span> <span class="kc">True</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_encode_only</span><span class="p">:</span>
+            <span class="c1"># Create ONLY the EncoderExecutor — skip decoder infrastructure.</span>
+            <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.pyexecutor.py_executor_creator</span><span class="w"> </span><span class="kn">import</span> \
+                <span class="n">create_encoder_executor</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_encoder_executor</span> <span class="o">=</span> <span class="n">create_encoder_executor</span><span class="p">(</span>
+                <span class="n">llm_args</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span>
+                <span class="n">checkpoint_dir</span><span class="o">=</span><span class="nb">str</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">)</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                <span class="s2">&quot;encode_only=True: using EncoderExecutor. Only llm.encode() &quot;</span>
+                <span class="s2">&quot;is available. generate()/generate_async() are not supported.&quot;</span><span class="p">)</span>
+            <span class="k">return</span>  <span class="c1"># Skip _executor creation</span>
+
+        <span class="c1"># Hint: if this looks like an encoder model, suggest encode()</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">encode_only</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">mm_encoder_only</span><span class="p">:</span>
+            <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.model_config</span><span class="w"> </span><span class="kn">import</span> <span class="n">ModelConfig</span>
+            <span class="n">architectures</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_config</span><span class="p">,</span> <span class="s1">&#39;architectures&#39;</span><span class="p">,</span>
+                                    <span class="kc">None</span><span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_config</span> <span class="k">else</span> <span class="kc">None</span>
+            <span class="k">if</span> <span class="n">architectures</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">ModelConfig</span><span class="o">.</span><span class="n">is_generation_model</span><span class="p">(</span>
+                    <span class="n">architectures</span><span class="p">):</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                    <span class="s2">&quot;Detected encoder-only model architecture (</span><span class="si">%s</span><span class="s2">). Consider &quot;</span>
+                    <span class="s2">&quot;using LLM(model=..., encode_only=True) with &quot;</span>
+                    <span class="s2">&quot;llm.encode() for optimized batch-forward inference that &quot;</span>
+                    <span class="s2">&quot;bypasses the decoder scheduler.&quot;</span><span class="p">,</span> <span class="n">architectures</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+
+        <span class="c1"># Create the standard executor for generate()/generate_async()</span>
         <span class="c1"># TODO: revisit gather_context_logits</span>
         <span class="n">return_logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">gather_generation_logits</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor_cls</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
@@ -2359,12 +2582,12 @@ window.runMermaid = runMermaid;</script>
 
 <span class="c1"># sphinx will ignore the LLM&#39;s docstring if it is not explicitly set</span>
 <span class="n">LLM</span><span class="o">.</span><span class="vm">__doc__</span> <span class="o">=</span> \
-    <span class="sa">f</span><span class="s2">&quot;&quot;&quot;LLM class is the main class for running a LLM model.</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;LLM class is the main class for running a LLM model.</span>
 
-<span class="s2">    For more details about the arguments, please refer to :class:`TorchLlmArgs`.</span>
+<span class="sd">    For more details about the arguments, please refer to :class:`TorchLlmArgs`.</span>
 
-<span class="s2">    Parameters:</span>
-<span class="s2">&quot;&quot;&quot;</span> <span class="o">+</span> <span class="n">TORCH_LLM_DOCSTRING</span>
+<span class="sd">    Parameters:</span>
+<span class="sd">&quot;&quot;&quot;</span> <span class="o">+</span> <span class="n">TORCH_LLM_DOCSTRING</span>
 </pre></div>
 
                 </article>
@@ -2473,9 +2696,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on April 26, 2026.</p>
+  <p>Last updated on May 06, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/b9ce4b6">b9ce4b6</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/93cb651">93cb651</a>.</p>
   
 </div></div>
       
