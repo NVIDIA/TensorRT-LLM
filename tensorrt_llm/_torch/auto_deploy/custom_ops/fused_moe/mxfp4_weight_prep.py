@@ -55,7 +55,6 @@ from typing import Dict, Tuple
 import torch
 
 from tensorrt_llm._torch.modules.fused_moe.quantization import (
-    _get_weight_alignment,
     maybe_pad_for_mxfp4,
     trtllmgen_maybe_get_cached_w2_permute_indices,
     trtllmgen_maybe_get_cached_w3_w1_permute_indices,
@@ -115,8 +114,16 @@ def _pad_per_expert_2d(
 def _shuffle_per_expert_w3_w1(
     stacked: torch.Tensor,  # [E, 2I_pad, X]   uint8  (X = H_pad/2 or H_pad/32)
     num_elts_per_sf: int | None = None,
+    is_scale: bool = False,
 ) -> torch.Tensor:
     """Apply the gated-GEMM shuffle (used for both w3/w1 weight and its scale).
+
+    For scales (``is_scale=True``), additionally apply
+    ``torch.ops.trtllm.block_scale_interleave`` after shuffling — PT's
+    ``MXFP4WeightTRTLLMGenFusedMoEMethod.load_expert_w3_w1_weight_scale_mxfp4``
+    (quantization.py:4382) does both steps; the kernel reads scales in this
+    interleaved layout. Without it the dequantization scaling is wrong and
+    output logits are garbage.
 
     Looping over experts because the PT permute-index helpers compute indices
     from a 2-D shape; applying them slice-by-slice avoids ambiguity at the
@@ -133,6 +140,8 @@ def _shuffle_per_expert_w3_w1(
             num_elts_per_sf=num_elts_per_sf,
         )
         shuffled = torch.ops.trtllm.shuffle_matrix(slc, perm.to(slc.device))
+        if is_scale:
+            shuffled = torch.ops.trtllm.block_scale_interleave(shuffled).reshape(slc.shape)
         out.append(shuffled.view(slc.dtype))
     return torch.stack(out, dim=0).contiguous()
 
@@ -140,6 +149,7 @@ def _shuffle_per_expert_w3_w1(
 def _shuffle_per_expert_w2(
     stacked: torch.Tensor,  # [E, H_pad, X]   uint8  (X = I_pad/2 or I_pad/32)
     num_elts_per_sf: int | None = None,
+    is_scale: bool = False,
 ) -> torch.Tensor:
     e = stacked.size(0)
     out = []
@@ -152,6 +162,8 @@ def _shuffle_per_expert_w2(
             num_elts_per_sf=num_elts_per_sf,
         )
         shuffled = torch.ops.trtllm.shuffle_matrix(slc, perm.to(slc.device))
+        if is_scale:
+            shuffled = torch.ops.trtllm.block_scale_interleave(shuffled).reshape(slc.shape)
         out.append(shuffled.view(slc.dtype))
     return torch.stack(out, dim=0).contiguous()
 
@@ -190,67 +202,141 @@ def prepare_mxfp4_weights_for_trtllm_gen(
     gu_3d = _flatten_block_dim(gate_up_blocks)  # [E, 2I, H/2]
     dn_3d = _flatten_block_dim(down_blocks)  # [E, H,  I/2]
 
+    # 1a. De-interleave w1 (gate) and w3 (up) into SEPARATE per-half tensors.
+    #
+    # Rationale: HF's gpt-oss-120b dense ``gate_up_proj`` is ``[E, H, 2I]``
+    # with gate at even indices and up at odd indices on the last dim
+    # (``torch_moe_dense_mlp`` line ~765 splits via
+    # ``gate, up = gate_up[..., ::2], gate_up[..., 1::2]``).
+    # The MXFP4 quantization moves that 2I axis to dim 1, preserving the
+    # *interleaving* across rows: row 0 = gate0, row 1 = up0, row 2 = gate1,
+    # row 3 = up1, ...
+    #
+    # PT's ``MXFP4WeightTRTLLMGenFusedMoEMethod.load_expert_w3_w1_weight``
+    # writes a separated layout (see line 4256 in quantization.py):
+    #     dst_w3_weight, dst_w1_weight = dst_w3_w1_weight.chunk(2, dim=0)
+    #     dst_w3_weight.copy_(w3_weight); dst_w1_weight.copy_(w1_weight)
+    # So the trtllm-gen kernel expects rows 0..I_pad-1 = w3 (up),
+    # I_pad..2*I_pad-1 = w1 (gate). We keep up and gate separate through the
+    # row-padding so the zero-pad rows go INSIDE each half (not at the very
+    # end), then stack as [up | gate] before col-padding and shuffling.
+    gate_rows_w = gu_3d[:, 0::2, :].contiguous()  # [E, I, H/2]
+    up_rows_w = gu_3d[:, 1::2, :].contiguous()  # [E, I, H/2]
+    gate_rows_s = gate_up_scales[:, 0::2, :].contiguous()  # [E, I, H/32]
+    up_rows_s = gate_up_scales[:, 1::2, :].contiguous()  # [E, I, H/32]
+    gate_b = gate_up_bias[:, 0::2].contiguous()  # [E, I]
+    up_b = gate_up_bias[:, 1::2].contiguous()  # [E, I]
+
     # 2. Determine per-rank dims (no shard at tp=1).
     valid_hidden = hidden_size
     valid_intermediate = intermediate_size
 
     # 3. Pad weights.
-    #    PT alignment derivation (quantization.py:4221) is per-rank;
-    #    at tp=1 it reduces to max(weight_alignment, scaling_vector_size).
-    weight_align_w1 = _get_weight_alignment(
-        _WEIGHT_ALIGNMENT,
-        _MXFP4_SCALING_VECTOR_SIZE,
-        tp_size,
-        gu_3d.shape[1],  # 2I
-    )
-    # gate_up: cols = H/2 (need pad to input_hidden_alignment//2),
-    #          rows = 2I (need pad to weight_align_w1)
-    gu_padded = _pad_per_expert_2d(gu_3d, _INPUT_HIDDEN_ALIGNMENT // 2, weight_align_w1)
+    #
+    # PT pads on the per-expert *I* (intermediate, line 3712-3713 in
+    # quantization.py) and *H* (hidden, line 3715/3717) before constructing
+    # the buffer shape — the ``2I`` row dim of w1 is then ``I_pad * 2``,
+    # NOT ``round_up(2I, weight_alignment)``.
+    #
+    # That distinction matters for gpt-oss-120b: I=2880 is not 128-aligned
+    # (2880 % 128 = 64), so PT's I_pad = 2944. w1's 2I row dim therefore
+    # becomes 5888 (= 2*2944), and w2's I/2 col dim becomes 1472 (= 2944/2).
+    # Both reflect the same I_pad — kernel sees a consistent intermediate
+    # dim. If we instead pad ``2I = 5760`` directly, weight_alignment=128
+    # leaves 5760 unchanged (already 128-aligned), so w1's I_pad stays at
+    # 2880 while w2's I_pad jumps to 2944 from the col padding. The kernel
+    # then mixes 2880 (w1) and 2944 (w2) for the *same* intermediate dim and
+    # the autotune cubin lookup finds no config.
+    #
+    # Same idea for the hidden axis: PT pads w1.K to 512 (input_hidden_align)
+    # and w2.N to 128 (weight_align). H=2880 → w1.K=3072, w2.N=2944.
+    # We replicate that exactly so the kernel's args.hidden_size /
+    # output_hidden_size match what PT's ``MXFP4WeightTRTLLMGenFusedMoEMethod``
+    # exercises.
+    intermediate_size_pad = (
+        (intermediate_size + _WEIGHT_ALIGNMENT - 1) // _WEIGHT_ALIGNMENT
+    ) * _WEIGHT_ALIGNMENT
+    hidden_w1_pad = (
+        (hidden_size + _INPUT_HIDDEN_ALIGNMENT - 1) // _INPUT_HIDDEN_ALIGNMENT
+    ) * _INPUT_HIDDEN_ALIGNMENT
+    hidden_w2_pad = ((hidden_size + _WEIGHT_ALIGNMENT - 1) // _WEIGHT_ALIGNMENT) * _WEIGHT_ALIGNMENT
 
-    # down: cols = I/2 (need pad to weight_alignment//2),
-    #       rows = H   (need pad to weight_alignment)
-    dn_padded = _pad_per_expert_2d(dn_3d, _WEIGHT_ALIGNMENT // 2, _WEIGHT_ALIGNMENT)
+    # gate_up weights — pad each half [E, I, H/2] to [E, I_pad, H_w1_pad/2]
+    # SEPARATELY so the zero-pad rows live inside each half, then stack as
+    # [up | gate]. PT's gpt-oss loader (modeling_gpt_oss.py:695-706 +
+    # quantization.py:4252-4258) ends up with ``dst_w3 = up`` in the first
+    # half and ``dst_w1 = gate`` in the second half via this exact
+    # de-interleave + chunk dance.
+    up_padded_w = _pad_per_expert_2d(up_rows_w, hidden_w1_pad // 2, intermediate_size_pad)
+    gate_padded_w = _pad_per_expert_2d(gate_rows_w, hidden_w1_pad // 2, intermediate_size_pad)
+    gu_padded = torch.cat(
+        [up_padded_w, gate_padded_w], dim=1
+    ).contiguous()  # [E, 2I_pad, H_w1_pad/2]
 
-    # 4. Pad scales (col_alignment uses scaling-vector size).
-    gu_scale_padded = _pad_per_expert_2d(
-        gate_up_scales,
-        _INPUT_HIDDEN_ALIGNMENT // _MXFP4_SCALING_VECTOR_SIZE,
-        weight_align_w1,
+    # down: rows = H, cols = I/2. Target shape [E, H_w2_pad, I_pad/2 = 1472].
+    # PT pads w2's I/2 axis to ``alignment // 2`` where alignment=128,
+    # giving 64-multiple (quantization.py:4287). For I/2=1440 → 1472.
+    # The kernel then asserts ``gemm2_weights.shape[2] == intermediate_size / 2``,
+    # so I_pad_w2 must match I_pad_w1 (both 2944).
+    dn_padded = _pad_per_expert_2d(dn_3d, intermediate_size_pad // 2, hidden_w2_pad)
+
+    # 4. Pad scales — same per-half logic for w1; col_alignment uses
+    #    scaling-vector size.
+    up_padded_s = _pad_per_expert_2d(
+        up_rows_s, hidden_w1_pad // _MXFP4_SCALING_VECTOR_SIZE, intermediate_size_pad
     )
+    gate_padded_s = _pad_per_expert_2d(
+        gate_rows_s, hidden_w1_pad // _MXFP4_SCALING_VECTOR_SIZE, intermediate_size_pad
+    )
+    gu_scale_padded = torch.cat([up_padded_s, gate_padded_s], dim=1).contiguous()
     dn_scale_padded = _pad_per_expert_2d(
         down_scales,
-        _WEIGHT_ALIGNMENT // _MXFP4_SCALING_VECTOR_SIZE,
-        _WEIGHT_ALIGNMENT,
+        intermediate_size_pad // _MXFP4_SCALING_VECTOR_SIZE,
+        hidden_w2_pad,
     )
 
     # 5. Shuffle weights + scales for the kernel's TMA layout.
     fc1_weights = _shuffle_per_expert_w3_w1(gu_padded)
     fc1_weights_scale = _shuffle_per_expert_w3_w1(
-        gu_scale_padded, num_elts_per_sf=_MXFP4_SCALING_VECTOR_SIZE
+        gu_scale_padded, num_elts_per_sf=_MXFP4_SCALING_VECTOR_SIZE, is_scale=True
     )
     fc2_weights = _shuffle_per_expert_w2(dn_padded)
     fc2_weights_scale = _shuffle_per_expert_w2(
-        dn_scale_padded, num_elts_per_sf=_MXFP4_SCALING_VECTOR_SIZE
+        dn_scale_padded, num_elts_per_sf=_MXFP4_SCALING_VECTOR_SIZE, is_scale=True
     )
 
     # 6. Bias: convert to float32. For w2, divide by tp_size (no-op at tp=1).
-    #    Pad to the same row count as the weights.
-    fc1_bias_padded = (
+    #    Pad each half separately so the [up | gate] split matches the
+    #    weights' row layout.
+    up_bias_padded = (
         _pad_per_expert_2d(
-            gate_up_bias.unsqueeze(-1),  # [E, 2I, 1]
+            up_b.unsqueeze(-1),  # [E, I, 1]
             col_alignment=1,
-            row_alignment=weight_align_w1,
+            row_alignment=intermediate_size_pad,
         )
         .squeeze(-1)
         .float()
         .contiguous()
-    )  # [E, 2I_pad] float32
+    )  # [E, I_pad] float32
+    gate_bias_padded = (
+        _pad_per_expert_2d(
+            gate_b.unsqueeze(-1),
+            col_alignment=1,
+            row_alignment=intermediate_size_pad,
+        )
+        .squeeze(-1)
+        .float()
+        .contiguous()
+    )
+    fc1_bias_padded = torch.cat(
+        [up_bias_padded, gate_bias_padded], dim=1
+    ).contiguous()  # [E, 2I_pad]
 
     fc2_bias_padded = (
         _pad_per_expert_2d(
             down_bias.unsqueeze(-1),
             col_alignment=1,
-            row_alignment=_WEIGHT_ALIGNMENT,
+            row_alignment=hidden_w2_pad,
         )
         .squeeze(-1)
         .float()
