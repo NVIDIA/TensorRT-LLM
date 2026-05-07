@@ -25,10 +25,10 @@ def router_gemm_ref(input, weight, bias, dtype):
 @pytest.mark.parametrize(
     "num_tokens", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
 @pytest.mark.parametrize("num_experts", [256])
-@pytest.mark.parametrize("hidden_size",
-                         [7168, 6144, 4096])  # 4096 will enter fallback kernel
+@pytest.mark.parametrize("hidden_size", [7168, 6144, 4096])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_router_gemm_run(num_tokens, num_experts, hidden_size, dtype):
+    """Correctness test for the custom kernel path across supported hidden dims."""
     torch.manual_seed(24)
     torch.cuda.manual_seed(24)
 
@@ -38,6 +38,6 @@ def test_router_gemm_run(num_tokens, num_experts, hidden_size, dtype):
     bias = None
     logits = torch.ops.trtllm.dsv3_router_gemm_op(input, weight.t(), bias,
                                                   torch.float32)
-    logtis_ref = router_gemm_ref(input.float(),
+    logits_ref = router_gemm_ref(input.float(),
                                  weight.t().float(), bias, torch.float32)
-    assert torch.allclose(logits, logtis_ref, rtol=5e-2)
+    assert torch.allclose(logits, logits_ref, rtol=5e-2)
