@@ -59,6 +59,44 @@ def _resolve_checkpoint_dtype(model_path: str, trust_remote_code: bool = False):
     return torch_dtype, llm_dtype
 
 
+def _reinit_uninitialized_rotary_buffers(hf_model: torch.nn.Module) -> None:
+    """Re-initialize uninitialized rotary-embedding buffers in vendored remote-code modules.
+
+    transformers 5.x's ``from_pretrained`` no longer fills *non-persistent*
+    buffers (those declared with ``persistent=False``) when a vendored
+    ``trust_remote_code`` module registers them inside ``__init__`` and
+    derives them from constants like ``base`` / ``dim`` (e.g. RoPE
+    ``inv_freq`` and the ``cos_cached`` / ``sin_cached`` tables). The
+    buffer's storage is allocated but never written, leaving uninitialized
+    memory that produces NaN cos/sin and propagates to logits.
+
+    Walk every submodule that looks like a Mixtral/Llama-style RoPE module
+    (``inv_freq`` + ``base`` + ``dim`` + ``_set_cos_sin_cache``), recompute
+    ``inv_freq`` from the constants, and rebuild the cos/sin caches.
+    """
+    for module in hf_model.modules():
+        if not (
+            hasattr(module, "inv_freq")
+            and hasattr(module, "_set_cos_sin_cache")
+            and hasattr(module, "base")
+            and hasattr(module, "dim")
+            and hasattr(module, "max_seq_len_cached")
+        ):
+            continue
+        device = module.inv_freq.device
+        new_inv_freq = 1.0 / (
+            module.base
+            ** (torch.arange(0, module.dim, 2, dtype=torch.int64).float().to(device) / module.dim)
+        )
+        module.inv_freq.data.copy_(new_inv_freq)
+        cache_dtype = (
+            module.cos_cached.dtype if hasattr(module, "cos_cached") else torch.get_default_dtype()
+        )
+        module._set_cos_sin_cache(
+            seq_len=module.max_seq_len_cached, device=device, dtype=cache_dtype
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Encoder-only models (non-multimodal)
 # --------------------------------------------------------------------------- #
@@ -158,6 +196,15 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
         # exists. A single-prefill logits comparison needs no KV cache anyway;
         # disabling it sidesteps the vendored-code incompatibility.
         hf_model.config.use_cache = False
+
+        # transformers 5.x doesn't fill non-persistent buffers (e.g. RoPE
+        # ``inv_freq`` / cos / sin caches) registered inside vendored
+        # remote-code modules during ``from_pretrained``. The vendored
+        # ``Qwen2RotaryEmbedding`` derives these from constants in
+        # ``__init__``, so the buffer storage is allocated but never written
+        # — producing NaN cos/sin and NaN logits. Recompute them from the
+        # constants after loading.
+        _reinit_uninitialized_rotary_buffers(hf_model)
 
         # Tokenize and run HF one prompt at a time, matching TRT-LLM's per-prompt semantics.
         for i, prompt in enumerate(PROMPTS):
