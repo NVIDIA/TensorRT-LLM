@@ -38,19 +38,21 @@ namespace
 
 using heuristic_topk::BLOCK_SIZE;
 using heuristic_topk::GvrDtypeTraits;
+using heuristic_topk::GvrParams;
 using heuristic_topk::gvrTopKJob;
 using heuristic_topk::gvrTopKJobDtype;
-using heuristic_topk::KernelSmem;
-using heuristic_topk::KernelSmemTpl;
-using heuristic_topk::TOP_K;
+using heuristic_topk::KernelSmemTplK;
 
-// heuristicTopKMultiRowKernel — outer multi-row launch wrapper (1 CTA per row).
-// Computes per-row parameters, then dispatches to the GVR micro-kernel
-// (gvrTopKJob, single-CTA single-row, independently optimized device function).
+// 4d.D: heuristicTopKMultiRowKernel templated on TopK so launcher can
+// dispatch K=512/1024/2048 to the same kernel template. Smem layout
+// derived from GvrParams<float, TopK> at compile time.
+template <int TopK>
 __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernel(float const* __restrict__ logits,
     int const* __restrict__ seqLens, int const* __restrict__ preIdx, float* __restrict__ scratchValues,
     int* __restrict__ outIndices, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount)
 {
+    using SmemT = KernelSmemTplK<float, GvrParams<float, TopK>::kC, GvrParams<float, TopK>::kNumBins>;
+
     int const rowIdx = blockIdx.x;
     int const seq_len = seqLens[rowIdx / next_n];
     int const N = seq_len - next_n + (rowIdx % next_n) + 1;
@@ -61,7 +63,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernel(float 
     int* __restrict__ outputIndices = outIndices + static_cast<int64_t>(rowIdx) * topK;
 
     extern __shared__ unsigned char smem_raw[];
-    auto* smem = reinterpret_cast<KernelSmem*>(smem_raw);
+    auto* smem = reinterpret_cast<SmemT*>(smem_raw);
 
     if (N <= topK)
     {
@@ -85,7 +87,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernel(float 
     // +1 accounts for the temporal shift: prev_topk indices were computed at
     // seq_len-1, but the current step has one additional KV token appended.
     int const preIdxOffset = (rowIdx % next_n) + 1;
-    gvrTopKJob(input, N, rowPreIdx, preIdxCount, topK, outputValues, outputIndices, smem, preIdxOffset);
+    gvrTopKJob<TopK>(input, N, rowPreIdx, preIdxCount, topK, outputValues, outputIndices, smem, preIdxOffset);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
@@ -99,12 +101,15 @@ __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernel(float 
 // only the input/output dtype, the smem-key dtype, and the GVR job called
 // (gvrTopKJobDtype<InputT>) differ.
 
-template <typename InputT>
+// 4d.D: dtype multi-row kernel templated on (InputT, TopK). Smem layout
+// derived from GvrParams<InputT, TopK>.
+template <typename InputT, int TopK>
 __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernelDtype(InputT const* __restrict__ logits,
     int const* __restrict__ seqLens, int const* __restrict__ preIdx, InputT* __restrict__ scratchValues,
     int* __restrict__ outIndices, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount)
 {
     using SmemKey = typename GvrDtypeTraits<InputT>::SmemKey;
+    using SmemT = KernelSmemTplK<SmemKey, GvrParams<InputT, TopK>::kC, GvrParams<InputT, TopK>::kNumBins>;
 
     int const rowIdx = blockIdx.x;
     int const seq_len = seqLens[rowIdx / next_n];
@@ -116,7 +121,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernelDtype(I
     int* __restrict__ outputIndices = outIndices + static_cast<int64_t>(rowIdx) * topK;
 
     extern __shared__ unsigned char smem_raw[];
-    auto* smem = reinterpret_cast<KernelSmemTpl<SmemKey>*>(smem_raw);
+    auto* smem = reinterpret_cast<SmemT*>(smem_raw);
 
     if (N <= topK)
     {
@@ -139,36 +144,44 @@ __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernelDtype(I
     }
 
     int const preIdxOffset = (rowIdx % next_n) + 1;
-    gvrTopKJobDtype<InputT>(input, N, rowPreIdx, preIdxCount, topK, outputValues, outputIndices, smem, preIdxOffset);
+    gvrTopKJobDtype<InputT, TopK>(
+        input, N, rowPreIdx, preIdxCount, topK, outputValues, outputIndices, smem, preIdxOffset);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
-// Explicit instantiations for the two non-fp32 dtypes used at launch time
-// (kept inside the anonymous namespace so they share the function-pointer
-// identities used by cudaFuncSetAttribute / cudaLaunchKernelEx below).
-template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16>(
+// Explicit instantiations — 6 (dtype × K) combos. Launchers dispatch on
+// runtime topK via switch, so all 6 must be available at link time.
+template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 512>(
     __nv_bfloat16 const*, int const*, int const*, __nv_bfloat16*, int*, int, int, int, int, int);
-template __global__ void heuristicTopKMultiRowKernelDtype<__half>(
+template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 1024>(
+    __nv_bfloat16 const*, int const*, int const*, __nv_bfloat16*, int*, int, int, int, int, int);
+template __global__ void heuristicTopKMultiRowKernelDtype<__nv_bfloat16, 2048>(
+    __nv_bfloat16 const*, int const*, int const*, __nv_bfloat16*, int*, int, int, int, int, int);
+template __global__ void heuristicTopKMultiRowKernelDtype<__half, 512>(
     __half const*, int const*, int const*, __half*, int*, int, int, int, int, int);
+template __global__ void heuristicTopKMultiRowKernelDtype<__half, 1024>(
+    __half const*, int const*, int const*, __half*, int*, int, int, int, int, int);
+template __global__ void heuristicTopKMultiRowKernelDtype<__half, 2048>(
+    __half const*, int const*, int const*, __half*, int*, int, int, int, int, int);
+template __global__ void heuristicTopKMultiRowKernel<512>(
+    float const*, int const*, int const*, float*, int*, int, int, int, int, int);
+template __global__ void heuristicTopKMultiRowKernel<1024>(
+    float const*, int const*, int const*, float*, int*, int, int, int, int, int);
+template __global__ void heuristicTopKMultiRowKernel<2048>(
+    float const*, int const*, int const*, float*, int*, int, int, int, int, int);
 
+// 4d.D: dispatch on topK at runtime — each TopK-instantiation gets its own
+// smem size (driven by GvrParams<InputT, TopK>::kC/kNumBins) and own kfn
+// pointer (cudaFuncSetAttribute / cudaLaunchKernelEx target the right kernel).
 template <typename InputT>
 void launchHeuristicTopKDecodeDtype(InputT const* logits, int const* seqLens, int const* preIdx, int* outIndices,
     InputT* scratchValues, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount, int numRows,
     cudaStream_t stream)
 {
-    TLLM_CHECK_WITH_INFO(topK == TOP_K, "heuristicTopKDecode requires topK == 2048 (compile-time constant)");
-
-    using SmemKey = typename GvrDtypeTraits<InputT>::SmemKey;
-    size_t const smemSize = sizeof(KernelSmemTpl<SmemKey>);
-
-    auto kfn = heuristicTopKMultiRowKernelDtype<InputT>;
-
-    if (smemSize > 48u * 1024u)
-    {
-        cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smemSize));
-    }
+    TLLM_CHECK_WITH_INFO(
+        topK == 512 || topK == 1024 || topK == 2048, "heuristicTopKDecode requires topK ∈ {512, 1024, 2048}");
 
     // 8-wide vector loads require 16-byte-aligned row pointers (8 × 2-byte = 16-byte).
     // In TRT-LLM the logits stride is always a multiple of tokens_per_block (≥64),
@@ -176,19 +189,40 @@ void launchHeuristicTopKDecodeDtype(InputT const* logits, int const* seqLens, in
     TLLM_CHECK_WITH_INFO(stride0 % 8 == 0 || numRows <= 1,
         "heuristicTopKDecode (bf16/fp16) requires logits stride0 divisible by 8 for multi-row launch");
 
-    cudaLaunchConfig_t config;
-    config.gridDim = numRows;
-    config.blockDim = BLOCK_SIZE;
-    config.dynamicSmemBytes = smemSize;
-    config.stream = stream;
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
-    config.numAttrs = 1;
-    config.attrs = attrs;
+    auto launchOne = [&]<int TopK>()
+    {
+        using SmemKey = typename GvrDtypeTraits<InputT>::SmemKey;
+        using SmemT = KernelSmemTplK<SmemKey, GvrParams<InputT, TopK>::kC, GvrParams<InputT, TopK>::kNumBins>;
+        size_t const smemSize = sizeof(SmemT);
 
-    cudaLaunchKernelEx(&config, kfn, logits, seqLens, preIdx, scratchValues, outIndices, stride0, next_n, topK,
-        preIdxStride, preIdxCount);
+        auto kfn = heuristicTopKMultiRowKernelDtype<InputT, TopK>;
+
+        if (smemSize > 48u * 1024u)
+        {
+            cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smemSize));
+        }
+
+        cudaLaunchConfig_t config;
+        config.gridDim = numRows;
+        config.blockDim = BLOCK_SIZE;
+        config.dynamicSmemBytes = smemSize;
+        config.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.numAttrs = 1;
+        config.attrs = attrs;
+
+        cudaLaunchKernelEx(&config, kfn, logits, seqLens, preIdx, scratchValues, outIndices, stride0, next_n, topK,
+            preIdxStride, preIdxCount);
+    };
+
+    switch (topK)
+    {
+    case 512: launchOne.template operator()<512>(); break;
+    case 1024: launchOne.template operator()<1024>(); break;
+    case 2048: launchOne.template operator()<2048>(); break;
+    }
 }
 
 } // anonymous namespace
@@ -197,17 +231,8 @@ void launchHeuristicTopKDecode(float const* logits, int const* seqLens, int cons
     float* scratchValues, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount, int numRows,
     cudaStream_t stream)
 {
-    TLLM_CHECK_WITH_INFO(topK == TOP_K, "heuristicTopKDecode requires topK == 2048 (compile-time constant)");
-
-    size_t const smemSize = sizeof(KernelSmem);
-
-    // Opt-in to extended shared memory. cudaFuncSetAttribute is device-scoped
-    // and cheap — call unconditionally to be safe across multi-GPU processes.
-    if (smemSize > 48u * 1024u)
-    {
-        cudaFuncSetAttribute(
-            heuristicTopKMultiRowKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smemSize));
-    }
+    TLLM_CHECK_WITH_INFO(
+        topK == 512 || topK == 1024 || topK == 2048, "heuristicTopKDecode requires topK ∈ {512, 1024, 2048}");
 
     // float4 loads require 16-byte-aligned (4-float) row pointers.
     // In TRT-LLM the logits stride is always a multiple of tokens_per_block (≥64),
@@ -215,19 +240,39 @@ void launchHeuristicTopKDecode(float const* logits, int const* seqLens, int cons
     TLLM_CHECK_WITH_INFO(stride0 % 4 == 0 || numRows <= 1,
         "heuristicTopKDecode requires logits stride0 divisible by 4 for multi-row launch");
 
-    cudaLaunchConfig_t config;
-    config.gridDim = numRows;
-    config.blockDim = BLOCK_SIZE;
-    config.dynamicSmemBytes = smemSize;
-    config.stream = stream;
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
-    config.numAttrs = 1;
-    config.attrs = attrs;
+    auto launchOne = [&]<int TopK>()
+    {
+        using SmemT = KernelSmemTplK<float, GvrParams<float, TopK>::kC, GvrParams<float, TopK>::kNumBins>;
+        size_t const smemSize = sizeof(SmemT);
 
-    cudaLaunchKernelEx(&config, heuristicTopKMultiRowKernel, logits, seqLens, preIdx, scratchValues, outIndices,
-        stride0, next_n, topK, preIdxStride, preIdxCount);
+        auto kfn = heuristicTopKMultiRowKernel<TopK>;
+
+        if (smemSize > 48u * 1024u)
+        {
+            cudaFuncSetAttribute(kfn, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smemSize));
+        }
+
+        cudaLaunchConfig_t config;
+        config.gridDim = numRows;
+        config.blockDim = BLOCK_SIZE;
+        config.dynamicSmemBytes = smemSize;
+        config.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.numAttrs = 1;
+        config.attrs = attrs;
+
+        cudaLaunchKernelEx(&config, kfn, logits, seqLens, preIdx, scratchValues, outIndices, stride0, next_n, topK,
+            preIdxStride, preIdxCount);
+    };
+
+    switch (topK)
+    {
+    case 512: launchOne.template operator()<512>(); break;
+    case 1024: launchOne.template operator()<1024>(); break;
+    case 2048: launchOne.template operator()<2048>(); break;
+    }
 }
 
 void launchHeuristicTopKDecode(__nv_bfloat16 const* logits, int const* seqLens, int const* preIdx, int* outIndices,
