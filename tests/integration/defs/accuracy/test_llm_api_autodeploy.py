@@ -18,16 +18,15 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
-from defs.conftest import (get_llm_root, get_sm_version, skip_pre_ada,
-                           skip_pre_blackwell, skip_pre_hopper)
-from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
+from defs.conftest import (get_device_count, get_llm_root, llm_models_root,
+                           skip_pre_ada, skip_pre_blackwell, skip_pre_hopper)
+from test_common.llm_data import hf_id_to_local_model_dir
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.llmapi import Eagle3DecodingConfig
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..conftest import get_device_count, llm_models_root, skip_pre_blackwell
 from .accuracy_core import (GSM8K, MMLU, MMMU, CnnDailymail,
                             LlmapiAccuracyTestHarness)
 
@@ -557,20 +556,24 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
     @pytest.mark.parametrize("world_size", [1, 2, 4])
-    @pytest.mark.parametrize("model_id", ["bf16", "fp8", "nvfp4"])
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "bf16",
+            pytest.param("fp8", marks=skip_pre_hopper),
+            pytest.param("nvfp4", marks=skip_pre_blackwell),
+        ],
+    )
     def test_accuracy(self, model_id, world_size, attn_backend):
-        if model_id == "nvfp4" and get_sm_version() < 100:
-            pytest.skip("NVFP4 requires Blackwell or later")
-        if model_id == "fp8" and get_sm_version() < 90:
-            pytest.skip("FP8 requires Hopper or later")
         if world_size > get_device_count():
             pytest.skip(f"Not enough devices for world_size={world_size}")
         model_path = self.MODEL_PATHS[model_id]
         kwargs = {}
-        # bf16 always needs low-memory overrides; on Ada (sm_89, e.g. L40S
-        # ~44 GB) the quantized variants do too, since the 30B FP8 / NVFP4
+        free_memory_mib = torch.cuda.mem_get_info(0)[0] / 1024**2
+        # bf16 always needs low-memory overrides; below H100-class free memory,
+        # the quantized variants do too, since the 30B FP8 / NVFP4
         # weights leave too little headroom for the nano_v3.yaml defaults.
-        if model_id == "bf16" or get_sm_version() < 90:
+        if model_id == "bf16" or free_memory_mib < 80000:
             low_memory_overrides(kwargs)
         kwargs["attn_backend"] = attn_backend
 
@@ -622,7 +625,14 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("enable_attention_dp", [False, True],
                              ids=["attn_dp_off", "attn_dp_on"])
     @pytest.mark.parametrize("world_size", [1, 4, 8])
-    @pytest.mark.parametrize("model_id", ["bf16", "fp8", "nvfp4"])
+    @pytest.mark.parametrize(
+        "model_id",
+        [
+            "bf16",
+            pytest.param("fp8", marks=skip_pre_hopper),
+            pytest.param("nvfp4", marks=skip_pre_blackwell),
+        ],
+    )
     def test_accuracy(self, model_id, world_size, enable_attention_dp,
                       attn_backend):
         if get_device_count() < world_size:
@@ -1113,6 +1123,7 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
             },
         }
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device(4)
     def test_finegrained_fp8(self):
         kwargs = self.get_default_kwargs()
@@ -1262,7 +1273,7 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
             "meta-llama/Llama-3.3-70B-Instruct",
             {},
             [MMLU, GSM8K],
-            marks=pytest.mark.skip_less_device_memory(80000),
+            marks=(pytest.mark.skip_less_device_memory(80000), skip_pre_hopper),
             id="meta-llama_Llama-3.3-70B-Instruct",
         ),
         pytest.param(
@@ -1366,6 +1377,7 @@ class TestNemotronSuperV3_IR(LlmapiAccuracyTestHarness):
         eos_id = -1
         return SamplingParams(end_id=eos_id, pad_id=eos_id)
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(65000)
     @pytest.mark.parametrize("world_size", [4, 8])
     @pytest.mark.parametrize("model_id", ["fp8"])
@@ -1418,6 +1430,7 @@ class TestQwen3_5_MoE_IR(LlmapiAccuracyTestHarness):
         eos_id = -1
         return SamplingParams(end_id=eos_id, pad_id=eos_id)
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("world_size", [4])
     @pytest.mark.parametrize("model_id", ["fp8"])
