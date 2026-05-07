@@ -168,8 +168,11 @@ Symlinks are device-agnostic.
 
 Writer-side maintenance: every `update --src` walks
 `<src_git>/lfs/objects/`, validates each `<oid>`-named file's
-SHA-256, hardlinks (or copies on EXDEV) into a sibling tempfile, and
-atomically renames into `<bare>/lfs/objects/<2>/<2>/<oid>`.
+SHA-256, copies into a sibling tempfile, and atomically renames into
+`<bare>/lfs/objects/<2>/<2>/<oid>`. The cache entry's inode is
+independent of src, so post-ingest writes to src under the same oid
+name cannot mutate cached bytes and break the oid-name ↔
+content-hash binding.
 Already-present oids are skipped — same SHA-256 implies same bytes,
 so re-ingest would only duplicate work.
 
@@ -287,7 +290,7 @@ The LFS pool is append-only by the same construction:
   contents necessarily get distinct filenames; same content is
   idempotent.
 * `_ingest_lfs_object` skips any oid already present and validates
-  SHA-256 of the staged tempfile *after* the link/copy, so the bytes
+  SHA-256 of the staged tempfile *after* the copy, so the bytes
   that get hashed are the bytes that land at the pool path.
   `os.rename(tmp, dst)` is atomic on the same filesystem; under
   SHA-256 collision resistance two racing writers necessarily stage
@@ -315,8 +318,8 @@ src:
   `os.scandir` and `is_dir(follow_symlinks=False)` /
   `is_file(follow_symlinks=False)` at every level. A symlinked shard
   dir or oid file is rejected before any I/O against its contents,
-  so an attacker-planted symlink cannot redirect `os.link` or `open`
-  out of the src tree.
+  so an attacker-planted symlink cannot redirect the subsequent
+  `open(src_path, "rb")` out of the src tree.
 
 These four close the **static** config-loading surface.
 
@@ -485,14 +488,12 @@ point at a nonexistent object, and the code path that writes
   `refs/fetch-cache/{heads,remotes,tags}/*` tips. Vacuous under
   current git; see I5 for the future-git scenario.
 * LFS size-cap bypass via TOCTOU on the src dentry. Between
-  `_ingest_lfs_object`'s `os.stat` and the subsequent link-or-copy,
-  an attacker can swap in a multi-TB file. On the hardlink path
-  there is no extra disk consumption (inodes are shared); on the
-  EXDEV-fallback copy path the writer copies the giant file before
+  `_ingest_lfs_object`'s `os.stat` and the subsequent copy, an
+  attacker can swap in a multi-TB file; the writer copies it before
   the SHA-256 mismatch reject. Closing this would require fd-based
-  link/stat (`linkat` from an `O_NOFOLLOW` fd) on every ingest, a
-  cost we don't pay because the failure mode is bounded by external
-  disk quota.
+  stat (`fstat` on an `O_NOFOLLOW` fd) on every ingest, a cost we
+  don't pay because the failure mode is bounded by external disk
+  quota.
 * Leaked `.lfs-tmp.<oid_prefix>.<random>` siblings under
   `<bare>/lfs/objects/<2>/<2>/` after `SIGKILL` mid-ingest. Names
   fail the OID regex, so neither the walker nor `git lfs smudge`

@@ -34,7 +34,6 @@ see ``3rdparty/fetch-cache.md`` "LFS pool" for the design treatment.
 """
 
 import argparse
-import errno
 import hashlib
 import logging
 import os
@@ -150,13 +149,8 @@ def _walk_src_lfs_objects(src_git: str):
 def _ingest_lfs_object(src_path: str, dst_path: str, oid: str) -> bool:
     """Place src_path's contents at *dst_path* iff its SHA-256 matches *oid*.
 
-    Sequence: (1) hardlink src into a sibling tempfile, falling back to
-    copy on EXDEV; (2) re-hash the staged file and compare to *oid*; (3)
-    atomic rename into place (I2).
-
-    Hardlink first because LFS payloads are commonly hundreds of MB; on
-    same-FS deployments a link is constant-time, while a copy is
-    O(filesize).
+    Sequence: (1) copy src into a sibling tempfile; (2) re-hash the
+    staged file and compare to *oid*; (3) atomic rename into place (I2).
     """
     dst_dir = os.path.dirname(dst_path)
     os.makedirs(dst_dir, exist_ok=True)
@@ -175,22 +169,13 @@ def _ingest_lfs_object(src_path: str, dst_path: str, oid: str) -> bool:
         return False
 
     fd, tmp_path = tempfile.mkstemp(prefix=f".lfs-tmp.{oid[:16]}.", dir=dst_dir)
-    os.close(fd)
-    # link(2) refuses an existing target.
-    os.unlink(tmp_path)
     try:
         try:
-            os.link(src_path, tmp_path)
+            with os.fdopen(fd, "wb") as dst, open(src_path, "rb") as src:
+                shutil.copyfileobj(src, dst, _LFS_BUFSIZE)
         except OSError as e:
-            if e.errno != errno.EXDEV:
-                logger.warning("lfs link %s: %s", oid, e)
-                return False
-            try:
-                with open(src_path, "rb") as src, open(tmp_path, "wb") as dst:
-                    shutil.copyfileobj(src, dst, _LFS_BUFSIZE)
-            except OSError as e:
-                logger.warning("lfs copy %s: %s", oid, e)
-                return False
+            logger.warning("lfs copy %s: %s", oid, e)
+            return False
 
         actual = _sha256_regular_file(tmp_path)
         if actual != oid:
