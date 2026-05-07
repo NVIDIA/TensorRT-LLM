@@ -2,7 +2,7 @@ Curl Responses Client
 =====================
 Refer to the `trtllm-serve documentation <https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html>`_ for starting a server.
 
-Source https://github.com/NVIDIA/TensorRT-LLM/blob/b9ce4b69d12fe5ba65d13893111b1a2ea29413ee/examples/serve/curl_responses_client.sh.
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/93cb6518b6d6dbd6095748189e626db731f44545/examples/serve/curl_responses_client.sh.
 
 .. literalinclude:: ../../../examples/serve/curl_responses_client.sh
     :lines: 1-9
