@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Optional, Tuple, TypedDict, Union
 from urllib.parse import urlparse
 
+import lazy_loader as lazy
 import numpy as np
 import soundfile
 import torch
@@ -26,6 +27,7 @@ from tensorrt_llm.inputs.media_io import (_get_aiohttp_session,
                                           _safe_aiohttp_get, _safe_request_get)
 from tensorrt_llm.inputs.media_io import \
     convert_image_mode as convert_image_mode
+
 from tensorrt_llm.inputs.multimodal import (MultimodalServerConfig,
                                             default_hasher)
 from tensorrt_llm.inputs.multimodal_data import \
@@ -37,6 +39,7 @@ from tensorrt_llm.llmapi.llm_utils import ModelLoader
 from tensorrt_llm.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 
+torchvision = lazy.load("torchvision")
 logger = logging.get_logger(__name__)
 
 
@@ -82,9 +85,8 @@ def load_image(image: Union[str, Image.Image],
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
-    from torchvision.transforms import ToTensor
     if format == "pt":
-        return ToTensor()(image).to(device=device)
+        return torchvision.transforms.ToTensor()(image).to(device=device)
     else:
         return image
 
@@ -113,10 +115,9 @@ async def async_load_image(
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
-    from torchvision.transforms import ToTensor
     if format == "pt":
-        return await asyncio.to_thread(lambda: ToTensor()
-                                       (image).to(device=device))
+        return await asyncio.to_thread(
+            lambda: torchvision.transforms.ToTensor()(image).to(device=device))
     else:
         return image
 

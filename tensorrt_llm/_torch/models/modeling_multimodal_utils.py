@@ -21,6 +21,7 @@ import math
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 
+import lazy_loader as lazy
 import torch
 import torch.nn.functional as F
 from einops import rearrange
@@ -29,6 +30,8 @@ from PIL import Image
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
+
+torchvision = lazy.load("torchvision")
 
 _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
 
@@ -465,17 +468,17 @@ def preprocess_dispatch(image,
                         use_fast: bool = True):
 
     if use_fast:
-        from torchvision.transforms import Normalize, Resize, ToTensor
-        image = ToTensor()(image) if isinstance(image, Image.Image) else image
+        T = torchvision.transforms
+        image = T.ToTensor()(image) if isinstance(image, Image.Image) else image
         if device is not None or dtype is not None:
             image = image.to(device=device, dtype=dtype)
         if image.shape[1] != image_processor.size["height"] or image.shape[
                 2] != image_processor.size["width"]:
-            image = Resize((image_processor.size["height"],
-                            image_processor.size["width"]))(image)
-        image = Normalize(image_processor.image_mean,
-                          image_processor.image_std,
-                          inplace=True)(image)
+            image = T.Resize((image_processor.size["height"],
+                              image_processor.size["width"]))(image)
+        image = T.Normalize(image_processor.image_mean,
+                            image_processor.image_std,
+                            inplace=True)(image)
     else:
         image = image_processor.preprocess(
             image, return_tensors="pt", device=device)["pixel_values"][0].to(
@@ -609,10 +612,9 @@ def dynamic_preprocess_torch(image,
         processed_images.append(thumbnail_img)
 
     images = torch.cat(processed_images, dim=0)
-    from torchvision.transforms import Normalize
-    images = Normalize(image_processor.image_mean,
-                       image_processor.image_std,
-                       inplace=True)(images)
+    images = torchvision.transforms.Normalize(image_processor.image_mean,
+                                              image_processor.image_std,
+                                              inplace=True)(images)
 
     return images
 
@@ -629,9 +631,8 @@ def dynamic_preprocess_dispatch(image,
                                 use_fast: bool = True):
 
     if use_fast:
-        from torchvision.transforms import ToTensor
         return dynamic_preprocess_torch(
-            ToTensor()(image) if isinstance(image, Image.Image) else image,
+            torchvision.transforms.ToTensor()(image) if isinstance(image, Image.Image) else image,
             image_processor,
             min_num=min_num,
             max_num=max_num,
@@ -801,10 +802,9 @@ def dynamic_s2_preprocess_torch(image,
         processed_images.append(split_img)
 
     images = torch.cat(processed_images, dim=0)
-    from torchvision.transforms import Normalize
-    images = Normalize(image_processor.image_mean,
-                       image_processor.image_std,
-                       inplace=True)(images)
+    images = torchvision.transforms.Normalize(image_processor.image_mean,
+                                              image_processor.image_std,
+                                              inplace=True)(images)
 
     return images, (target_aspect_ratio[1], target_aspect_ratio[0])
 
@@ -820,9 +820,8 @@ def dynamic_s2_preprocess_dispatch(image,
                                    use_fast: bool = True):
 
     if use_fast:
-        from torchvision.transforms import ToTensor
         return dynamic_s2_preprocess_torch(
-            ToTensor()(image) if isinstance(image, Image.Image) else image,
+            torchvision.transforms.ToTensor()(image) if isinstance(image, Image.Image) else image,
             image_processor,
             s2_scales=s2_scales,
             max_num=max_num,

@@ -17,6 +17,7 @@ from pathlib import Path
 from types import MethodType
 from typing import Dict, List, Optional, Tuple, Union
 
+import lazy_loader as lazy
 import torch
 import transformers
 from einops import rearrange
@@ -43,6 +44,8 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
                                         get_multimodal_embeddings)
 from .modeling_utils import register_auto_model
+
+torchvision = lazy.load("torchvision")
 
 # Special token ids from the original Phi-4-multimodal-instruct implementation
 # Hardcoded in https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/processing_phi4mm.py#L44.
@@ -335,10 +338,8 @@ def dynamic_preprocess(
 
     Ref code: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/processing_phi4mm.py#L201
     """
-    from torchvision.transforms.functional import get_image_size, pad, resize
-
     # Get target_width, target_height and target_aspect_ratio.
-    orig_width, orig_height = get_image_size(image)
+    orig_width, orig_height = torchvision.transforms.functional.get_image_size(image)
     w_crop_num = math.ceil(orig_width / float(image_size))
     h_crop_num = math.ceil(orig_height / float(image_size))
     if w_crop_num * h_crop_num > max_num:
@@ -379,9 +380,9 @@ def dynamic_preprocess(
             f'The aspect ratio is very extreme {new_size} and not supported.')
 
     if return_image:
-        image = resize(image, [new_size[1], new_size[0]])
+        image = torchvision.transforms.functional.resize(image, [new_size[1], new_size[0]])
         fill_values = [255, 255, 255] if is_pil_image(image) else 1.0
-        resized_img = pad(image, [0, 0, padding_width, padding_height],
+        resized_img = torchvision.transforms.functional.pad(image, [0, 0, padding_width, padding_height],
                           fill=fill_values)
     else:
         resized_img = None
@@ -441,7 +442,6 @@ def image_preprocess(
 
     Ref code: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/processing_phi4mm.py#L161
     """
-    import torchvision
     images = make_list_of_images(images)
     if not valid_images(images):
         raise TypeError(

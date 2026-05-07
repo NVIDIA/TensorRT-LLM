@@ -2,10 +2,12 @@ import copy
 import dataclasses
 from typing import Any, Dict, List, Sequence, Tuple
 
+import lazy_loader as lazy
 import torch
 from mistral_common.tokens.tokenizers.multimodal import ImageEncoder
 from PIL import Image
 from torch import nn
+
 from transformers import (AutoProcessor, AutoTokenizer, Mistral3Config,
                           MistralConfig, PretrainedConfig, PreTrainedModel)
 from transformers.activations import ACT2FN
@@ -50,6 +52,7 @@ from tensorrt_llm.inputs.utils import encode_base64_image
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.logger import logger
 
+torchvision = lazy.load("torchvision")
 
 class MistralAttention(Attention):
 
@@ -900,7 +903,6 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         # computed above. Note that as far as this function is concerned, the original sizes for
         # batching purposes can be deduced from looking at the tensors in `pixel_values`, NOT in
         # `image_sizes`.
-        import torchvision
         pixel_values = [
             torchvision.transforms.v2.functional.pad(
                 image,
