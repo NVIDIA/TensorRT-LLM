@@ -118,13 +118,18 @@ class FusableModel2_FP8(FusableModel2):
 
 
 class FusableModel3(FusableModel):
-    """Same as FusableModel1 except one GEMM is not fusable due to missing bias support."""
+    """Mixed bias state: fc1, fc2 are bias-less; fc3 has bias.
+
+    fuse_gemms now supports bias but requires uniform bias state across
+    siblings; mixed-bias siblings remain non-fusable (skip). The expected
+    after-fusion GEMM count is 2 (fc1+fc2 fuse into 1, fc3 stays alone).
+    """
 
     def __init__(self, cls=nn.Linear, **kwargs):
         super().__init__(**kwargs)
         self.fc1 = cls(self.in_features, self.out_features, bias=False)
         self.fc2 = cls(self.in_features, self.out_features, bias=False)
-        self.fc3 = cls(self.in_features, self.out_features, bias=True)  # no bias support yet
+        self.fc3 = cls(self.in_features, self.out_features, bias=True)
 
     def forward(self, x):
         y1 = self.fc1(x)
@@ -135,6 +140,50 @@ class FusableModel3(FusableModel):
     @property
     def num_gemms_after_fusion(self) -> int:
         return 2
+
+
+class FusableModel5(FusableModel):
+    """All siblings have bias (uniform bias state). Should fuse into 1 GEMM."""
+
+    def __init__(self, cls=nn.Linear, **kwargs):
+        super().__init__(**kwargs)
+        self.fc1 = cls(self.in_features, self.out_features, bias=True)
+        self.fc2 = cls(self.in_features, self.out_features, bias=True)
+
+    def forward(self, x):
+        y1 = self.fc1(x)
+        y2 = self.fc2(x)
+        return torch.cat([y1, y2], dim=-1)
+
+    @property
+    def num_gemms_after_fusion(self) -> int:
+        return 1
+
+
+class FusableModel6(FusableModel):
+    """Three siblings (mimics Q/K/V), all with bias, different out_features.
+
+    Mirrors the gpt-oss attention pattern: Q [hidden -> N_h * D],
+    K [hidden -> N_kv * D], V [hidden -> N_kv * D] with N_h != N_kv.
+    Should fuse into 1 GEMM with stacked weight + stacked bias.
+    """
+
+    def __init__(self, cls=nn.Linear, **kwargs):
+        super().__init__(**kwargs)
+        # mimic GQA: Q = 4096, K = V = 512 (gpt-oss-120b attention dims)
+        self.fc1 = cls(self.in_features, 4 * self.out_features, bias=True)  # Q
+        self.fc2 = cls(self.in_features, self.out_features, bias=True)  # K
+        self.fc3 = cls(self.in_features, self.out_features, bias=True)  # V
+
+    def forward(self, x):
+        q = self.fc1(x)
+        k = self.fc2(x)
+        v = self.fc3(x)
+        return torch.cat([q, k, v], dim=-1)
+
+    @property
+    def num_gemms_after_fusion(self) -> int:
+        return 1
 
 
 class FusableModel3_FP8(FusableModel3):
@@ -203,6 +252,12 @@ class FusableModel4_FP8(FusableModel4):
         (FusableModel2, "bfloat16"),
         (FusableModel3, "bfloat16"),
         (FusableModel4, "bfloat16"),
+        # Bias-aware fusion: uniform bias state across siblings.
+        (FusableModel5, "float16"),
+        (FusableModel5, "bfloat16"),
+        # Q/K/V-style 3-sibling fusion with bias and different out_features.
+        (FusableModel6, "float16"),
+        (FusableModel6, "bfloat16"),
         pytest.param(
             FusableModel1_M_FP8,
             "fp8",
@@ -295,6 +350,74 @@ def test_fusion(get_model: Callable[[], TestModel], dtype: str):
     reset_parameters(gm_transformed)
     y_random = gm_transformed(x)
     assert not all_close(y_model, y_random)
+
+
+# ===========================================================================
+# Bias-aware fusion guard tests (fuse_gemms): mixed-bias / non-per-channel
+# bias / dim-mismatch must not be fused.
+# ===========================================================================
+
+
+def _count_linears(gm) -> int:
+    return sum(1 for n in gm.graph.nodes if is_linear_op(n))
+
+
+def _build_two_linear_gm(bias_a, bias_b, dtype=torch.float16, hidden=16, out_a=32, out_b=32):
+    """Build a tiny GraphModule with two sibling linears sharing input x.
+
+    bias_{a,b} are torch.Tensor or None. The GraphModule registers the weights
+    and biases as get_attr buffers so fuse_gemms can read them.
+    """
+
+    class _M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w_a = nn.Parameter(torch.randn(out_a, hidden, dtype=dtype), requires_grad=False)
+            self.w_b = nn.Parameter(torch.randn(out_b, hidden, dtype=dtype), requires_grad=False)
+            if bias_a is not None:
+                self.b_a = nn.Parameter(bias_a.detach().clone(), requires_grad=False)
+            if bias_b is not None:
+                self.b_b = nn.Parameter(bias_b.detach().clone(), requires_grad=False)
+
+        def forward(self, x):
+            ya = F.linear(x, self.w_a, self.b_a if bias_a is not None else None)
+            yb = F.linear(x, self.w_b, self.b_b if bias_b is not None else None)
+            return torch.cat([ya, yb], dim=-1)
+
+    m = _M().to(device="cuda")
+    x = torch.randn(2, hidden, dtype=dtype, device="cuda")
+    return torch_export_to_gm(m, args=(x,), clone=True), m, x
+
+
+@torch.inference_mode()
+def test_fuse_gemms_skips_mixed_bias_state():
+    """Sibling A has bias, sibling B doesn't -> fusion must be skipped."""
+    bias_a = torch.randn(32, dtype=torch.float16, device="cuda")
+    gm, _, _ = _build_two_linear_gm(bias_a=bias_a, bias_b=None)
+    n_before = _count_linears(gm)
+    assert n_before == 2
+
+    gm_after = InferenceOptimizer(None, {"fuse_gemms": {"stage": "post_load_fusion"}})(None, gm)
+    assert _count_linears(gm_after) == 2, "Mixed bias state should not be fused"
+
+
+@torch.inference_mode()
+def test_fuse_gemms_fuses_uniform_bias():
+    """All siblings have per-channel 1D bias -> fusion must succeed."""
+    bias_a = torch.randn(32, dtype=torch.float16, device="cuda")
+    bias_b = torch.randn(32, dtype=torch.float16, device="cuda")
+    gm, model, x = _build_two_linear_gm(bias_a=bias_a, bias_b=bias_b)
+    assert _count_linears(gm) == 2
+
+    y_ref = model(x)
+
+    gm_after = InferenceOptimizer(None, {"fuse_gemms": {"stage": "post_load_fusion"}})(None, gm)
+    assert _count_linears(gm_after) == 1, "Uniform-bias siblings should fuse to 1 linear"
+
+    y_fused = gm_after(x)
+    assert all_close(y_ref, y_fused, atol=1e-3, rtol=1e-3), (
+        "Fused output must match unfused reference within tolerance"
+    )
 
 
 # ===========================================================================

@@ -385,11 +385,20 @@ class FuseGemms(BaseTransform):
                 if not check_same_children(parent_node, is_linear_op):
                     # Mixed children (e.g., quantized or non-linear) — skip fusion
                     continue
-                # linear nodes to fuse (split+copy for contiguous outputs)
-                if _insert_fused_gemm(
-                    gm, idx := idx + 1, parent_node, lin_children, allow_not_contigous=False
-                ):
-                    num_matches += 1
+
+                # Group siblings by uniform bias state so each subgroup
+                # (all-no-bias / all-with-bias) can fuse independently.
+                no_bias_group = [c for c in lin_children if c.args[2] is None]
+                with_bias_group = [c for c in lin_children if c.args[2] is not None]
+
+                for group in (no_bias_group, with_bias_group):
+                    if len(group) < 2:
+                        continue
+                    # linear nodes to fuse (split+copy for contiguous outputs)
+                    if _insert_fused_gemm(
+                        gm, idx := idx + 1, parent_node, group, allow_not_contigous=False
+                    ):
+                        num_matches += 1
 
         torch.cuda.empty_cache()
 

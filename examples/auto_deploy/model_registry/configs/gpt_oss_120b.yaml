@@ -1,9 +1,9 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
-# OpenAI GPT-OSS-120B (128 experts, top-4, MXFP4 quantized) — standalone AD serving config.
-# 36 layers (alternating sliding/full), GQA (64 Q / 8 KV heads), head_dim=64, hidden=2880.
-# Weights are stored in MXFP4 on HF; AD's quantize_mxfp4_moe transform handles it.
+# V4 + fuse_gemms_mixed_children + fuse_gemms.
+# Q/K/V (and possibly other co-located linears) get stacked into a single
+# GEMM call.  At BS=1 / conc=1 thin-decode this saves launch overhead +
+# HBM read traffic (input read once instead of 3× for Q/K/V).
+# fuse_gemms is default-disabled due to OOM concern (issue #4674); V4 is
+# single-GPU with plenty of memory so OOM risk is low.
 runtime: trtllm
 model_factory: AutoModelForCausalLM
 attn_backend: trtllm
@@ -21,4 +21,8 @@ kv_cache_config:
   free_gpu_memory_fraction: 0.8
 transforms:
   quantize_mxfp4_moe_trtllm_gen:
+    enabled: true
+  fuse_gemms_mixed_children:
+    enabled: true
+  fuse_gemms:
     enabled: true
