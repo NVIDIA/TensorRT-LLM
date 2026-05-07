@@ -60,7 +60,7 @@ void copySlotData(StorageManager& storageMgr, CacheLevel dstLevel, CacheLevel sr
 KvCache::KvCache(KvCacheManager& manager, std::optional<int64_t> loraTaskId, std::vector<TokenIdExt> const& inputTokens,
     std::optional<int64_t> mId, PriorityCb priorityCb)
     : id(mId)
-    , mManager(manager.shared_from_this())
+    , mManager(&manager)
     , mLoraTaskId(loraTaskId)
     , mPriorityCb(priorityCb ? std::move(priorityCb) : [](BlockOrdinal, LifeCycleId) { return kPriorityDefault; })
     , mStatus(Status::SUSPENDED)
