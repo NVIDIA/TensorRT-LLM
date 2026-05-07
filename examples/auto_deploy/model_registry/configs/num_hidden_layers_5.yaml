@@ -1,4 +1,2 @@
-# Configuration for DeepSeek V3 and R1 with reduced layers
-# Full models are too large, so we test with limited layers
-model_kwargs:
-  num_hidden_layers: 5
+# AD-specific config — moved to internal registry.
+# See tensorrt_llm/_torch/auto_deploy/config/model_registry_internal/configs/num_hidden_layers_5_ad.yaml

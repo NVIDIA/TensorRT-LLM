@@ -1,0 +1,2 @@
+# Configuration for multimodal (vision + text) models
+model_factory: AutoModelForImageTextToText

@@ -1,5 +1,2 @@
-# Configuration for models that require simple sharding only
-# Used for very large models with specific sharding requirements
-transforms:
-  detect_sharding:
-    simple_shard_only: true
+# AD-specific config — moved to internal registry.
+# See tensorrt_llm/_torch/auto_deploy/config/model_registry_internal/configs/simple_shard_only_ad.yaml

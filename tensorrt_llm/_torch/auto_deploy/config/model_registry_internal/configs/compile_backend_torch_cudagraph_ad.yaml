@@ -1,0 +1,2 @@
+# Configuration to override compile backend
+compile_backend: torch-cudagraph

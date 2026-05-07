@@ -1,2 +1,2 @@
-# Configuration for multimodal (vision + text) models
-model_factory: AutoModelForImageTextToText
+# AD-specific config — moved to internal registry.
+# See tensorrt_llm/_torch/auto_deploy/config/model_registry_internal/configs/multimodal_ad.yaml

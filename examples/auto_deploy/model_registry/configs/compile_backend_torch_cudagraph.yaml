@@ -1,4 +1,2 @@
-# Default configuration for all AutoDeploy dashboard tests
-# These are baseline settings that apply to all models unless overridden
-
-compile_backend: torch-cudagraph
+# AD-specific config — moved to internal registry.
+# See tensorrt_llm/_torch/auto_deploy/config/model_registry_internal/configs/compile_backend_torch_cudagraph_ad.yaml

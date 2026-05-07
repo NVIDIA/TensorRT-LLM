@@ -23,6 +23,8 @@ from defs.conftest import (get_llm_root, get_sm_version, skip_pre_ada,
 from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+from tensorrt_llm._torch.auto_deploy.config.model_registry_internal import (
+    get_registry_yaml_extra, get_world_size)
 from tensorrt_llm.llmapi import Eagle3DecodingConfig
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
@@ -33,33 +35,12 @@ from .accuracy_core import (GSM8K, MMLU, MMMU, CnnDailymail,
 
 _AD_CONFIGS_DIR = (Path(get_llm_root()) / 'examples' / 'auto_deploy' /
                    'model_registry' / 'configs')
-_AD_MODEL_REGISTRY_DIR = Path(
-    get_llm_root()) / 'examples' / 'auto_deploy' / 'model_registry'
 
 
 def _load_ad_config(config_name):
     """Load a YAML config from the AutoDeploy model registry configs directory."""
     with open(_AD_CONFIGS_DIR / config_name) as f:
         return yaml.safe_load(f)
-
-
-def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
-    """Return (yaml_extra paths, world_size) from the AutoDeploy model registry."""
-    with open(_AD_MODEL_REGISTRY_DIR / "models.yaml") as f:
-        registry = yaml.safe_load(f)
-    for entry in registry["models"]:
-        if entry["name"] != model_name:
-            continue
-        config_dir = _AD_MODEL_REGISTRY_DIR / "configs"
-        paths = [str(config_dir / cfg) for cfg in entry["yaml_extra"]]
-        world_size = 1
-        for cfg in entry["yaml_extra"]:
-            cfg_name = str(cfg)
-            if "world_size_" in cfg_name and cfg_name.endswith(".yaml"):
-                world_size = int(
-                    cfg_name.replace("world_size_", "").replace(".yaml", ""))
-        return paths, world_size
-    raise ValueError(f"Model '{model_name}' not found in model registry")
 
 
 def _set_quant_config(llm, model_id: str) -> None:
@@ -947,9 +928,8 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
         kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
         model_path = hf_id_to_local_model_dir(self.MODEL_NAME)
-        yaml_paths, registry_world_size = _get_registry_yaml_extra(
-            self.MODEL_NAME)
-        assert registry_world_size == world_size
+        yaml_paths = get_registry_yaml_extra(self.MODEL_NAME)
+        assert get_world_size(self.MODEL_NAME) == world_size
         with AutoDeployLLM(model=model_path,
                            tokenizer=model_path,
                            dtype="bfloat16",
@@ -972,9 +952,8 @@ class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
             pytest.skip("Not enough devices for world size, skipping test")
         kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
-        yaml_paths, registry_world_size = _get_registry_yaml_extra(
-            self.MODEL_NAME)
-        assert registry_world_size == world_size
+        yaml_paths = get_registry_yaml_extra(self.MODEL_NAME)
+        assert get_world_size(self.MODEL_NAME) == world_size
         model_path = hf_id_to_local_model_dir(self.MODEL_NAME_NVFP4)
         with AutoDeployLLM(model=model_path,
                            tokenizer=model_path,
@@ -1143,15 +1122,15 @@ class TestGemma4MoE(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(80000)
     def test_bf16(self):
-        yaml_paths, registry_world_size = _get_registry_yaml_extra(
-            self.MODEL_NAME)
-        if get_device_count() < registry_world_size:
+        yaml_paths = get_registry_yaml_extra(self.MODEL_NAME)
+        world_size = get_world_size(self.MODEL_NAME)
+        if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
 
         sampling_params = self.get_default_sampling_params()
-        with AutoDeployLLM(model=self.MODEL_PATH,
-                           tokenizer=self.MODEL_PATH,
-                           world_size=registry_world_size,
+        with AutoDeployLLM(model=self.MODEL_NAME,
+                           tokenizer=self.MODEL_NAME,
+                           world_size=world_size,
                            yaml_extra=yaml_paths) as llm:
             task = MMMU(self.MODEL_NAME)  # noqa: F821
             task.evaluate(
@@ -1233,9 +1212,9 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
     def test_autodeploy_from_registry(self, model_name, config_overrides, tasks,
                                       accuracy_check):
         model_path = hf_id_to_local_model_dir(model_name)
-        yaml_paths, registry_world_size = _get_registry_yaml_extra(model_name)
+        yaml_paths = get_registry_yaml_extra(model_name)
         effective_world_size = config_overrides.get("world_size",
-                                                    registry_world_size)
+                                                    get_world_size(model_name))
         if get_device_count() < effective_world_size:
             pytest.skip("Not enough devices for world size, skipping test")
         sampling_params = self.get_default_sampling_params()
