@@ -192,6 +192,12 @@ def setup(app):
     generate_llmapi()
     update_version()
 
+    try:
+        from generate_transforms_doc import generate_transforms_reference
+        generate_transforms_reference()
+    except Exception as e:
+        print(f"Warning: transforms doc generation failed: {e}")
+
 
 def gen_cpp_doc(ofile_name: str, header_dir: str, summary: str):
     cpp_header_files = [
