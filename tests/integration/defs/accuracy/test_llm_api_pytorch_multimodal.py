@@ -480,6 +480,8 @@ class TestQwen3VL(LlmapiAccuracyTestHarness):
         max_tokens=MAX_NUM_TOKENS, truncate_prompt_tokens=MMMU.MAX_INPUT_LEN, stop="<|endoftext|>"
     )
 
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+
     @pytest.mark.parametrize(
         "enable_chunked_prefill,max_num_tokens",
         [
@@ -493,6 +495,7 @@ class TestQwen3VL(LlmapiAccuracyTestHarness):
             self.MODEL_PATH,
             enable_chunked_prefill=enable_chunked_prefill,
             max_num_tokens=max_num_tokens,
+            kv_cache_config=self.kv_cache_config,
         ) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
