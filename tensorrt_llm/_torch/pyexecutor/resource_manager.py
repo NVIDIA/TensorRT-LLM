@@ -695,7 +695,7 @@ class KVCacheManager(BaseResourceManager):
                 'cp_type']
 
             for req in scheduled_batch.context_requests:
-                req_beam_width = req.sampling_config.beam_width
+                req_beam_width = req.py_beam_width
                 if is_star_cp:
                     if req.ctx_iters == 0:
                         seq_len = sum(

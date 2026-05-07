@@ -2636,7 +2636,7 @@ class PyTorchModelEngine(ModelEngine):
         _n_gen = len(generation_requests)
         if _n_gen > 0:
             # All generation requests have the same beam width
-            beam_width = generation_requests[0].sampling_config.beam_width
+            beam_width = generation_requests[0].py_beam_width
 
             # Pre-extend constant-value lists to avoid per-request append
             # overhead (saves ~3 append calls per request).
