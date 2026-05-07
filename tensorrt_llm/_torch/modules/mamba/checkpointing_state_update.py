@@ -467,10 +467,11 @@ def _rectangle_precompute_kernel(
     t_mask = offs_t < T
     n_mask = offs_n < dstate
 
-    # K-axis masks
+    # K-axis masks (approach C: runtime PNAT-offset instead of K_NEW_SHIFT)
+    # Old at [0, PNAT), new at [PNAT, PNAT+T).  Cache and matmul share rows.
     is_old_k = offs_k < prev_num_accepted_tokens
     safe_old_k = tl.where(is_old_k, offs_k, 0)
-    k_new_idx = offs_k - K_NEW_SHIFT
+    k_new_idx = offs_k - prev_num_accepted_tokens
     is_new_k = (k_new_idx >= 0) & (k_new_idx < T)
     safe_k_new = tl.where(is_new_k, k_new_idx, 0)
 
@@ -682,10 +683,11 @@ def _rectangle_precompute_kernel(
         )
 
     # Causal mask (BLOCK_SIZE_T × BLOCK_SIZE_K, shared across heads).
+    # Approach C: new tokens at runtime [PNAT, PNAT+T) instead of K_NEW_SHIFT.
     t_idx_2d = offs_t[:, None]
     k_idx_2d = offs_k[None, :]
     is_old_k_2d = k_idx_2d < prev_num_accepted_tokens
-    k_new_idx_2d = k_idx_2d - K_NEW_SHIFT
+    k_new_idx_2d = k_idx_2d - prev_num_accepted_tokens
     is_new_causal_2d = (k_new_idx_2d >= 0) & (k_new_idx_2d < T) & (k_new_idx_2d <= t_idx_2d)
     causal_combined = (is_old_k_2d | is_new_causal_2d) & t_mask[:, None]
 
@@ -1307,10 +1309,11 @@ def _rectangle_main_kernel(
     n_mask = offs_n < dstate
     t_mask = offs_t < T
 
-    # K-axis masks
+    # K-axis masks (approach C: PNAT-runtime offset, matches precompute).
+    # Old at [0, PNAT), new at [PNAT, PNAT+T).  Cache and matmul share rows.
     is_old_k = offs_k < prev_num_accepted_tokens
     safe_old_k = tl.where(is_old_k, offs_k, 0)
-    k_new_idx = offs_k - K_NEW_SHIFT
+    k_new_idx = offs_k - prev_num_accepted_tokens
     is_new_k = (k_new_idx >= 0) & (k_new_idx < T)
     safe_k_new = tl.where(is_new_k, k_new_idx, 0)
 
@@ -1369,31 +1372,36 @@ def _rectangle_main_kernel(
         mask=t_mask[:, None] & n_mask[None, :],
         other=0.0,
     )
-    x_all = tl.load(
-        x_ptr + offs_t[:, None] * stride_x_T + offs_m[None, :] * stride_x_dim,
-        mask=t_mask[:, None] & m_mask[None, :],
-        other=0.0,
-    )
-    # Append new x to cache at [PNAT, PNAT+T) of the active buffer.
-    tl.store(
-        old_x_base
-        + (write_offset + offs_t)[:, None] * stride_old_x_T
-        + offs_m[None, :] * stride_old_x_dim,
-        x_all,
-        mask=t_mask[:, None] & m_mask[None, :],
-    )
-    x_all = x_all.to(tl.float32)
-
-    # Build x_combined for the rectangle token_out matmul (STATIC layout).
-    # old_x_load is from cache (loaded above gdc_wait); new_x_shifted reads
-    # x (conv1d output) at compile-time-shifted [K_NEW_SHIFT, K_NEW_SHIFT+T).
-    # Disjoint masks → safe to add.
-    new_x_shifted = tl.load(
+    # Single (BLOCK_K, M) load at PNAT-offset positions (approach C):
+    # K-axis [PNAT, PNAT+T) gets new tokens directly from x[0:T, :] via
+    # safe_k_new = offs_k - PNAT.  Cache layout matches K-axis layout, so
+    # one load serves both matmul and cache write.
+    x_K = tl.load(
         x_ptr + safe_k_new[:, None] * stride_x_T + offs_m[None, :] * stride_x_dim,
         mask=is_new_k[:, None] & m_mask[None, :],
         other=0.0,
-    ).to(tl.float32)
-    x_combined = old_x_load + new_x_shifted  # (BLOCK_SIZE_K, BLOCK_SIZE_M)
+    )
+    # Cache write: store at offs_k directly (is_new_k mask makes offs_k land
+    # at [PNAT, PNAT+T) in the cache, which is exactly write_offset+0..T-1).
+    tl.store(
+        old_x_base
+        + offs_k[:, None] * stride_old_x_T
+        + offs_m[None, :] * stride_old_x_dim,
+        x_K,
+        mask=is_new_k[:, None] & m_mask[None, :],
+    )
+
+    x_K_f32 = x_K.to(tl.float32)
+    # Matmul side: K-axis aligned; sum with old_x_load.
+    x_combined = old_x_load + x_K_f32
+
+    # T-axis view for D feedthrough / Z-gating: extract via (T, K) selection.
+    # Only materialized when needed.
+    if HAS_D or HAS_Z:
+        sel_tk = (offs_t[:, None] == (offs_k[None, :] - prev_num_accepted_tokens))
+        x_all = tl.dot(sel_tk.to(tl.bfloat16), x_K.to(tl.bfloat16))
+    else:
+        x_all = x_K_f32  # placeholder; unused
 
     # Load precomputed rectangle CB and folded decay_vec.
     cb_scaled_base = cb_scaled_ptr + pid_b * stride_cb_batch + pid_h * stride_cb_head
