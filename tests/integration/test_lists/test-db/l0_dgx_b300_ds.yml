@@ -24,7 +24,15 @@ l0_dgx_b300_ds:
   # smoke fit at TP=4. (Same tests at TP=8 would also fit on 8x B200, but a
   # dedicated 8-GPU B200 stage is not currently provisioned.)
   # V4-Flash-Base FP8 aggregate smoke (TP=4, no EPLB): 1 MMLU sample.
-  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_auto_dtype TIMEOUT (60)
+  # TRTLLMGen FP8 backend selected here: it is the user-facing default on
+  # Blackwell (model_config.py::resolve_moe_backend) and ~7% faster per step
+  # than WIDEEP in our measurements. WIDEEP variant of the same test is
+  # currently held out of CI (see test_auto_dtype[moe_backend=WIDEEP]).
+  # TODO: re-enable once DeepSeek-V4-Flash-Base is uploaded to the CI model
+  # share at /scratch.trt_llm_data/llm-models/DeepSeek-V4-Flash-Base. The
+  # model is currently missing on B300 CI workers, so LLM(...) treats the
+  # path as an HF repo id and HFValidationError fires.
+  # - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_auto_dtype[moe_backend=TRTLLM] TIMEOUT (60)
   # V4-Flash NVFP4 static EPLB sanity. WIDEEP backend is skipped at the
   # test level because V4-Flash MXFP4 routed experts are unsupported by
   # WIDEEP (raises "Unsupported quantization mode: [65536]"); TRTLLM is the
