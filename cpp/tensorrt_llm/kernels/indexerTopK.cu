@@ -788,9 +788,10 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
         });
     int const kSeqSmall = sCachedNMin;
 
-    bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && topK == kHeuristicTopK
-        && preIdxCount == kHeuristicSize && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold
-        && numColumns >= kSeqSmall && heuristicScratch != nullptr && numRows < kBsLarge;
+    bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
+    bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && isSupportedTopK && preIdxCount == topK
+        && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold && numColumns >= kSeqSmall
+        && heuristicScratch != nullptr && numRows < kBsLarge;
 
     // Optional env-gated dispatch trace (set TRTLLM_SCHEMEX_DEBUG=1 to enable)
     {
@@ -963,18 +964,19 @@ void invokeIndexerTopKDecodeDtype(InputT const* logits, int const* seqLens, int*
         });
     int const kSeqSmall = sCachedNMin;
 
-    bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && topK == kHeuristicTopK
-        && preIdxCount == kHeuristicSize && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold
-        && numColumns >= kSeqSmall && heuristicScratch != nullptr && numRows < kBsLarge;
+    bool const isSupportedTopK = (topK == 512 || topK == 1024 || topK == 2048);
+    bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && isSupportedTopK && preIdxCount == topK
+        && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold && numColumns >= kSeqSmall
+        && heuristicScratch != nullptr && numRows < kBsLarge;
 
     TLLM_CHECK_WITH_INFO(canUseHeuristic,
         "indexer_topk_decode bf16/fp16 path requires GVR-Heuristic preconditions: preIdx != nullptr, "
-        "stride1 == 1, topK == 2048, preIdxCount == 2048, kSeqSmall=%d <= numColumns < kSplitWork=%d, "
-        "numRows < kBsLarge=%d, heuristicScratch != nullptr. "
-        "Got numRows=%d numColumns=%d preIdx=%s heuristicScratch=%s. "
+        "stride1 == 1, topK ∈ {512, 1024, 2048}, preIdxCount == topK, "
+        "kSeqSmall=%d <= numColumns < kSplitWork=%d, numRows < kBsLarge=%d, heuristicScratch != nullptr. "
+        "Got topK=%d preIdxCount=%d numRows=%d numColumns=%d preIdx=%s heuristicScratch=%s. "
         "(bf16/fp16 has no radix fallback — caller must cast to fp32 if conditions not met.)",
-        kSeqSmall, effectiveSplitWorkThreshold, kBsLarge, numRows, numColumns, preIdx ? "ok" : "null",
-        heuristicScratch ? "ok" : "null");
+        kSeqSmall, effectiveSplitWorkThreshold, kBsLarge, topK, preIdxCount, numRows, numColumns,
+        preIdx ? "ok" : "null", heuristicScratch ? "ok" : "null");
 
     launchHeuristicTopKDecode(logits, seqLens, preIdx, indices, heuristicScratch, stride0, next_n, topK, preIdxStride,
         preIdxCount, numRows, stream);
