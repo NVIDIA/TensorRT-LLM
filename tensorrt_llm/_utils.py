@@ -796,6 +796,18 @@ def is_sm_100f(sm_version=None):
     return sm_version == 100 or sm_version == 103
 
 
+def is_sm_120f(sm_version=None):
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version == 120 or sm_version == 121
+
+
+def is_blackwell(sm_version=None):
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return is_sm_100f(sm_version) or is_sm_120f(sm_version)
+
+
 def print_all_stacks():
     """Print stack traces for all threads"""
     for thread_id, frame in sys._current_frames().items():
