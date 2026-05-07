@@ -1317,11 +1317,25 @@ class SequenceInfo:
 
         This function will assume that we are in a generate-only batch.
         """
-        torch.ops.auto_deploy.triton_utils_fused_gather_scatter(
-            ungathered_input=ungathered_input_ids,
-            gather_ids=self.get_arg("_gather_idx", truncate=True),
-            mask_indices=self.get_arg("_mask_scatter_indices", truncate=True),
-            out=self.get_arg("input_ids", truncate=True, unflatten=False),
+        # Bypass the torch.ops custom-op dispatcher at runtime. Going through the dispatcher
+        # for a mutating op forces PyTorch's tensor stream tracker to emit cross-stream
+        # cudaEvent {Create, Record, WaitEvent, Destroy} groups for each input — the kernel
+        # itself is ~1 µs but the dispatcher path is ~95 µs/iter on this workload.
+        from .utils.triton_utils import _fused_gather_scatter_kernel
+
+        gather_ids = self.get_arg("_gather_idx", truncate=True)
+        mask_indices = self.get_arg("_mask_scatter_indices", truncate=True)
+        out = self.get_arg("input_ids", truncate=True, unflatten=False)
+        n = gather_ids.numel()
+        BLOCK_SIZE = 256
+        grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+        _fused_gather_scatter_kernel[grid](
+            ungathered_input_ids,
+            gather_ids,
+            mask_indices,
+            out,
+            n,
+            BLOCK_SIZE=BLOCK_SIZE,
         )
 
     # TODO: remove once https://github.com/NVIDIA/TensorRT-LLM/issues/9878 is fixed and
