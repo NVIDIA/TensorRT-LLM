@@ -302,7 +302,7 @@ class Starcoder2ForCausalLM(PreTrainedModel, GenerationMixin):
     base_model_prefix = "model"
     _no_split_modules = ["Starcoder2DecoderLayer"]
     supports_gradient_checkpointing = False
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: Starcoder2Config, **kwargs):
         super().__init__(config)
