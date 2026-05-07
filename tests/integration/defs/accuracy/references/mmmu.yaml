@@ -32,11 +32,22 @@ Efficient-Large-Model/NVILA-8B:
   - accuracy: 47.77
 Efficient-Large-Model/VILA1.5-3b:
   - accuracy: 32.33
-# MMMU for Nemotron-Nano-12B-v2-VL-BF16 requires reasoning on.
-# While enabling reasoning for current test harness is not supported,
-# the metric here is for model sanity checking.
+# MMMU for Nemotron-Nano-* models require reasoning on.
+# While enabling reasoning for current test harness is not supported, the metric here is for model
+# regression testing, not an indicator of official benchmark results.
+# See code comments in `test_llm_api_pytorch_multimodal.py` for more details.
 nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16:
   - accuracy: 26.67
+nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16:
+  - accuracy: 39.0
+nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8:
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 39.0
+nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4:
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 38.0
 microsoft/Phi-4-multimodal-instruct:
   - accuracy: 53.67
 Qwen/Qwen3-VL-30B-A3B-Instruct:

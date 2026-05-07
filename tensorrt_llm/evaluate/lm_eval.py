@@ -206,16 +206,20 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             output_dir: Directory to save the task infos.
             sampling_override: If True, sampling_params override task gen_kwargs.
         """
-        super().__init__(llm,
-                         sampling_params,
-                         streaming,
-                         output_dir=output_dir,
-                         sampling_override=sampling_override)
+        super().__init__(
+            llm,
+            sampling_params=sampling_params,
+            streaming=streaming,
+            chat_template_kwargs=chat_template_kwargs,
+            model_type=model_type,
+            is_force_single_image=is_force_single_image,
+            output_dir=output_dir,
+            sampling_override=sampling_override,
+        )
 
         # NOTE: Required by lm_eval to identify this as a multimodal model
         self.MULTIMODAL = True
         self.max_images = max_images
-        self.chat_template_kwargs = chat_template_kwargs
         self.model_type = model_type if model_type is not None else self._get_model_type(
             llm)
         self.is_force_single_image = is_force_single_image

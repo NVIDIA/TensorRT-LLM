@@ -464,3 +464,102 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
         ) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+class TestNanoV3Omni(LlmapiAccuracyTestHarness):
+    # The score here may be lower than VLMEvalKitMcore (official) runs. This path uses
+    # lm_eval's MMMU task, prompt formatting, and scoring, while VLMEvalKitMcore
+    # uses MMMU_DEV_VAL with its own MCQ prompt builder, answer extraction, and
+    # explicit image tiling/token accounting in the Mcore wrapper.
+    # We also keep the generation budget small for CI speed, and this evaluator
+    # does not strip reasoning traces after </think> before scoring. If the model
+    # ignores the non-thinking directive, answer extraction may see the reasoning.
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        is_multimodal=True,
+    )
+
+    # NOTE: MMMU adds <|endoftext|> to the stop token.
+    sampling_params = SamplingParams(
+        max_tokens=MMMU.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endoftext|>",
+        temperature=0.0,
+        top_k=1,
+    )
+
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.parametrize(
+        "model_name,model_path,kv_cache_config,max_batch_size,expected_quant_algo",
+        [
+            pytest.param(
+                "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16",
+                KvCacheConfig(
+                    free_gpu_memory_fraction=0.8,
+                    mamba_ssm_cache_dtype="float32",
+                    enable_block_reuse=False,
+                ),
+                32,
+                None,
+                id="bf16",
+            ),
+            pytest.param(
+                "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-FP8",
+                KvCacheConfig(
+                    free_gpu_memory_fraction=0.8,
+                    mamba_ssm_cache_dtype="float32",
+                    enable_block_reuse=False,
+                    dtype="fp8",
+                ),
+                64,
+                QuantAlgo.FP8,
+                marks=skip_pre_hopper,
+                id="fp8",
+            ),
+            pytest.param(
+                "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
+                KvCacheConfig(
+                    free_gpu_memory_fraction=0.8,
+                    mamba_ssm_cache_dtype="float32",
+                    enable_block_reuse=False,
+                    dtype="fp8",
+                ),
+                128,
+                QuantAlgo.MIXED_PRECISION,
+                marks=skip_pre_blackwell,
+                id="nvfp4",
+            ),
+        ],
+    )
+    def test_auto_dtype(
+        self,
+        model_name: str,
+        model_path: str,
+        kv_cache_config: KvCacheConfig,
+        max_batch_size: int,
+        expected_quant_algo: QuantAlgo | None,
+    ) -> None:
+        task = MMMU(model_name)
+
+        with LLM(
+            model_path,
+            kv_cache_config=kv_cache_config,
+            enable_chunked_prefill=True,
+            # Keep the integration test fast; full benchmark-style runs may use
+            # a larger generation budget.
+            max_num_tokens=512,
+            # The amount of memory pre-allocated for mamba SSM states is proportional to the below,
+            # so lower it from its default of 2048.
+            # Quantized variants fit larger batches within the CI GPU memory budget.
+            max_batch_size=max_batch_size,
+        ) as llm:
+            if expected_quant_algo is not None:
+                assert llm.args.quant_config.quant_algo == expected_quant_algo
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
