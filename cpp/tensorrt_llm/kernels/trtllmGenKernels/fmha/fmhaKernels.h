@@ -249,19 +249,7 @@ public:
         checkFmhaOptions(options, optionsFromArgs);
         // Update the options if needed.
         updateFmhaOptions(options, optionsFromArgs);
-        // HOTFIX: FmhaDispatcher path may leave multiCtasKvCounter/Scratch null when use GmemReduction. Force Disabled
-        // here so as to avoid crashing.
-        // TODO: add scratch allocation and re-enable GmemReduction.
-        if (options.mMultiCtasKvMode == tensorrt_llm::kernels::MultiCtasKvMode::GmemReduction
-            || options.mMultiCtasKvMode == tensorrt_llm::kernels::MultiCtasKvMode::GmemReductionWithSeparateKernel)
-        {
-            if (params.multiCtasKvScratchPtr == nullptr || params.multiCtasKvCounterPtr == nullptr)
-            {
-                TLLM_LOG_DEBUG(
-                    "MultiCtasKvScratchPtr/MultiCtasKvCounterPtr is null, forcing MultiCtasKvMode to Disabled");
-                options.mMultiCtasKvMode = tensorrt_llm::kernels::MultiCtasKvMode::Disabled;
-            }
-        }
+
         // The number of CtasQ and CtasKv per sequence, Ctas in the Y dimension, and Ctas in the Z
         // dimension.
         computeNumCtas(options, params.mMultiProcessorCount);
@@ -315,23 +303,20 @@ public:
         checkFmhaOptions(options, optionsFromArgs);
         // Update the options if needed.
         updateFmhaOptions(options, optionsFromArgs);
-        // The number of CtasQ and CtasKv per sequence, Ctas in the Y dimension, and Ctas in the Z
-        // dimension.
 
-        // HOTFIX: FmhaDispatcher path may leave multiCtasKvCounter/Scratch null when use GmemReduction. Force Disabled
-        // here so as to avoid crashing.
-        // TODO: add scratch allocation and re-enable GmemReduction.
+        // Any caller that selects MultiCtasKvMode must supply the partial-reduction scratch pool
+        // and per-CTA counter; fail fast here instead of silently falling back to Disabled.
         if (options.mMultiCtasKvMode == tensorrt_llm::kernels::MultiCtasKvMode::GmemReduction
             || options.mMultiCtasKvMode == tensorrt_llm::kernels::MultiCtasKvMode::GmemReductionWithSeparateKernel)
         {
-            if (params.multiCtasKvScratchPtr == nullptr || params.multiCtasKvCounterPtr == nullptr)
-            {
-                TLLM_LOG_DEBUG(
-                    "MultiCtasKvScratchPtr/MultiCtasKvCounterPtr is null, forcing MultiCtasKvMode to Disabled");
-                options.mMultiCtasKvMode = tensorrt_llm::kernels::MultiCtasKvMode::Disabled;
-            }
+            TLLM_CHECK_WITH_INFO(params.multiCtasKvScratchPtr != nullptr && params.multiCtasKvCounterPtr != nullptr,
+                "MultiCtasKvScratchPtr/MultiCtasKvCounterPtr must be non-null when fmha kernel uses gmem-based "
+                "multi-CTA reduction. "
+                "The dispatcher must allocate and pass these buffers.");
         }
 
+        // The number of CtasQ and CtasKv per sequence, Ctas in the Y dimension, and Ctas in the Z
+        // dimension.
         auto [numCtasX, numCtasY, numCtasZ] = computeNumCtas(options, params.mMultiProcessorCount);
 
         // Set the launch grid size.

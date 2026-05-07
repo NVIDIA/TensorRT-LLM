@@ -3555,6 +3555,50 @@ class LoadFormat(Enum):
     VISION_ONLY = 2
 
 
+class ModelExpressConfig(StrictBaseModel):
+    """Prototype configuration for ModelExpress (MX) weight transfer."""
+
+    server_url: Optional[str] = Field(
+        default=None,
+        description="URL of the MX (ModelExpress) server for P2P weight "
+        "transfer. When set together with checkpoint_format='MX', enables "
+        "GPU-to-GPU weight transfer from a running source instance, bypassing "
+        "disk I/O. When the server is unreachable, loading falls back to the "
+        "standard HuggingFace checkpoint path.",
+        status="prototype",
+    )
+
+    server_query_timeout_s: Optional[NonNegativeInt] = Field(
+        default=None,
+        description="Timeout in seconds for upstream MxLiveWeightLoader source "
+        "discovery. When unset, TRT-LLM first probes for existing sources: "
+        "no source uses a short 30-second fallback cap, while an existing "
+        "source uses modelexpress's default wait for long donor loads.",
+        status="prototype",
+    )
+
+    preshard_strategy: str = Field(
+        default="per_module",
+        description="How to inform TRT-LLM that MX-delivered weights are already "
+        "TP-sharded for the local rank. Only 'per_module' is supported in "
+        "this MX-only PR; 'global' requires LoadFormat.PRESHARDED.",
+        status="prototype",
+    )
+
+    @model_validator(mode="after")
+    def validate_preshard_strategy(self) -> 'ModelExpressConfig':
+        if self.preshard_strategy not in ("per_module", "global"):
+            raise ValueError(
+                f"mx_config.preshard_strategy must be 'per_module' or 'global', "
+                f"got '{self.preshard_strategy}'.")
+        if self.preshard_strategy == "global":
+            raise ValueError(
+                "mx_config.preshard_strategy='global' requires "
+                "LoadFormat.PRESHARDED, which is not yet available in "
+                "TRT-LLM main. Use preshard_strategy='per_module' instead.")
+        return self
+
+
 class SamplerType(StrEnum):
     """Enum for sampler type options."""
     TRTLLMSampler = "TRTLLMSampler"
@@ -3781,6 +3825,12 @@ class TorchLlmArgs(BaseLlmArgs):
         "If neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF "
         "and the default HfCheckpointLoader will be used.\n"
         "If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
+        status="prototype",
+    )
+
+    mx_config: ModelExpressConfig = Field(
+        default_factory=ModelExpressConfig,
+        description="ModelExpress (MX) P2P checkpoint loading config.",
         status="prototype",
     )
 
@@ -4042,6 +4092,29 @@ class TorchLlmArgs(BaseLlmArgs):
                 "checkpoint_format will be set to HF.")
             self.checkpoint_format = "HF"
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_mx_config(self) -> 'TorchLlmArgs':
+        # When MX is the active checkpoint format and the user did not
+        # explicitly set ``mx_config.server_url``, honor the ``MODEL_EXPRESS_URL``
+        # env var that the upstream ``modelexpress`` library reads. This
+        # lets orchestrators configure MX via the environment while keeping
+        # the resolved value visible on ``llm_args.mx_config.server_url``.
+        if self.checkpoint_format == "MX" and self.mx_config.server_url is None:
+            env_url = os.environ.get("MODEL_EXPRESS_URL")
+            if env_url:
+                logger.info(
+                    "mx_config.server_url not set; using MODEL_EXPRESS_URL=%s "
+                    "from environment.", env_url)
+                self.mx_config.server_url = env_url
+
+        if self.mx_config.server_url is not None and self.checkpoint_format != "MX":
+            logger.warning(
+                "mx_config.server_url is set but checkpoint_format is '%s', not "
+                "'MX'. The MX config will be ignored. Set "
+                "checkpoint_format='MX' to enable MX P2P weight transfer.",
+                self.checkpoint_format)
         return self
 
     @model_validator(mode="after")

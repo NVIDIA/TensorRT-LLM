@@ -16,7 +16,8 @@ l0_gb300_multi_gpus:
       backend: pytorch
   tests:
   - unittest/_torch/attention
-  - unittest/_torch/thop
+  - unittest/_torch/thop/parallel
+  - unittest/_torch/thop/serial
   - unittest/_torch/executor
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_mla_helix.py

@@ -14,9 +14,9 @@ from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import (AttentionInputType, AttentionMetadata,
-                                 FlashInferAttentionMetadata, TrtllmAttention,
-                                 TrtllmAttentionMetadata)
+from ..attention_backend import (AttentionForwardArgs, AttentionInputType,
+                                 AttentionMetadata, FlashInferAttentionMetadata,
+                                 TrtllmAttention, TrtllmAttentionMetadata)
 from ..attention_backend.interface import (AttentionBackend, AttentionMask,
                                            CustomAttentionMask,
                                            PositionalEmbeddingParams,
@@ -737,12 +737,14 @@ class Attention(nn.Module):
                 k,
                 v,
                 attn_metadata,
-                attention_mask=attention_mask,
-                mrope_config=mrope_config,
-                attention_window_size=attention_window_size,
-                attention_mask_data=attention_mask_data,
-                softmax_stats_tensor=softmax_stats,
-                attention_sinks=attention_sinks)
+                forward_args=AttentionForwardArgs(
+                    attention_mask=attention_mask,
+                    mrope_config=mrope_config,
+                    attention_window_size=attention_window_size,
+                    attention_mask_data=attention_mask_data,
+                    softmax_stats_tensor=softmax_stats,
+                    attention_sinks=attention_sinks,
+                ))
             if isinstance(attn_output, tuple):
                 attn_output = attn_output[0]
             attn_output = self._helix_post_process(attn_output, softmax_stats)
@@ -769,17 +771,19 @@ class Attention(nn.Module):
             k,
             v,
             attn_metadata,
-            out_scale=out_scale,
-            out_scale_sf=out_scale_sf,
-            kv_scales_sf=kv_scales_sf,
-            kv_scales_sf_inv=kv_scales_sf_inv,
-            attention_mask=attention_mask,
-            mrope_config=mrope_config,
-            attention_window_size=attention_window_size,
-            attention_mask_data=attention_mask_data,
-            output=output[:num_tokens, :] if output is not None else None,
-            output_sf=output_sf,
-            attention_sinks=attention_sinks)
+            forward_args=AttentionForwardArgs(
+                out_scale=out_scale,
+                out_scale_sf=out_scale_sf,
+                kv_scales_sf=kv_scales_sf,
+                kv_scales_sf_inv=kv_scales_sf_inv,
+                attention_mask=attention_mask,
+                mrope_config=mrope_config,
+                attention_window_size=attention_window_size,
+                attention_mask_data=attention_mask_data,
+                output=output[:num_tokens, :] if output is not None else None,
+                output_sf=output_sf,
+                attention_sinks=attention_sinks,
+            ))
         if isinstance(attn_output, tuple):
             assert len(
                 attn_output
@@ -1584,13 +1588,13 @@ class MLA(nn.Module):
             softmax_stats = torch.empty((q.shape[0], self.num_heads_tp, 2),
                                         device=q.device,
                                         dtype=torch.float32)
+            kwargs["softmax_stats_tensor"] = softmax_stats
             partial_o = attn_backend.forward(
                 q,
                 k,
                 v,
                 attn_metadata,
-                softmax_stats_tensor=softmax_stats,
-                **kwargs,
+                forward_args=AttentionForwardArgs(**kwargs),
             )
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
@@ -1599,7 +1603,13 @@ class MLA(nn.Module):
                                        self.num_heads_tp_cp, kv_lora_rank,
                                        self.aux_stream, self.ln_events)
         else:
-            attn_output = attn_backend.forward(q, k, v, attn_metadata, **kwargs)
+            attn_output = attn_backend.forward(
+                q,
+                k,
+                v,
+                attn_metadata,
+                forward_args=AttentionForwardArgs(**kwargs),
+            )
             return attn_output
 
     def create_output(self, hidden_states: torch.Tensor, num_contexts: int):
@@ -1946,10 +1956,12 @@ class MLA(nn.Module):
             k,
             v,
             attn_metadata,
-            attention_input_type=AttentionInputType.context_only,
-            latent_cache=latent_cache,
-            out_scale=self.out_scale,
-            output=output,
+            forward_args=AttentionForwardArgs(
+                attention_input_type=AttentionInputType.context_only,
+                latent_cache=latent_cache,
+                out_scale=self.out_scale,
+                output=output,
+            ),
         )
 
         return attn_output
@@ -2116,10 +2128,12 @@ class MLA(nn.Module):
             full_k,
             full_v,
             attn_metadata,
-            attention_input_type=AttentionInputType.context_only,
-            latent_cache=None,
-            out_scale=self.out_scale,
-            output=output,
+            forward_args=AttentionForwardArgs(
+                attention_input_type=AttentionInputType.context_only,
+                latent_cache=None,
+                out_scale=self.out_scale,
+                output=output,
+            ),
         )
 
         return attn_output
@@ -2221,14 +2235,16 @@ class MLA(nn.Module):
                 chunked_k,
                 chunked_v,
                 attn_metadata,
-                attention_input_type=AttentionInputType.context_only,
-                latent_cache=None,
-                out_scale=self.out_scale,
-                attention_mask=PredefinedAttentionMask.FULL,
-                softmax_stats_tensor=self.temp_softmax_stats_tensor,
-                chunked_prefill_buffer_batch_size=attn_metadata.
-                runtime_features.chunked_prefill_buffer_batch_size,
-                output=temp_attn_output,
+                forward_args=AttentionForwardArgs(
+                    attention_input_type=AttentionInputType.context_only,
+                    latent_cache=None,
+                    out_scale=self.out_scale,
+                    attention_mask=PredefinedAttentionMask.FULL,
+                    softmax_stats_tensor=self.temp_softmax_stats_tensor,
+                    chunked_prefill_buffer_batch_size=attn_metadata.
+                    runtime_features.chunked_prefill_buffer_batch_size,
+                    output=temp_attn_output,
+                ),
             )
             # merge attn result
             temp_merge_op = attn_metadata.merge_op_tensor[loop_idx]
@@ -2272,13 +2288,15 @@ class MLA(nn.Module):
             k,
             v,
             attn_metadata,
-            attention_input_type=AttentionInputType.context_only,
-            latent_cache=None,
-            out_scale=self.out_scale,
-            softmax_stats_tensor=self.temp_softmax_stats_tensor,
-            chunked_prefill_buffer_batch_size=attn_metadata.runtime_features.
-            chunked_prefill_buffer_batch_size,
-            output=temp_attn_output,
+            forward_args=AttentionForwardArgs(
+                attention_input_type=AttentionInputType.context_only,
+                latent_cache=None,
+                out_scale=self.out_scale,
+                softmax_stats_tensor=self.temp_softmax_stats_tensor,
+                chunked_prefill_buffer_batch_size=attn_metadata.
+                runtime_features.chunked_prefill_buffer_batch_size,
+                output=temp_attn_output,
+            ),
         )
         temp_merge_op = attn_metadata.merge_op_tensor[chunked_loop_num]
         trtllm_attention.merge_attention_for_mla(attn_output, temp_attn_output,

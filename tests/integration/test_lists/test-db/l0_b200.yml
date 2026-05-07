@@ -123,7 +123,7 @@ l0_b200:
   # The other 5 multimodal files are HW-agnostic Python plumbing and run on Hopper only.
   - unittest/_torch/multimodal/test_mm_encoder_standalone.py -k "qwen3_30b_a3b_fp8"
   - unittest/_torch/sampler
-  - unittest/_torch/speculative
+  - unittest/_torch/speculative/test_eagle3.py
   - unittest/_torch/thop/parallel TIMEOUT (90)
   - unittest/_torch/thop/serial
   - unittest/_torch/modeling -k "modeling_llama"
@@ -193,6 +193,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan21_t2v_pipeline.py
   - unittest/_torch/visual_gen/test_wan22_i2v_pipeline.py
   - unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py
+  - unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py
   - unittest/_torch/visual_gen/test_wan21_i2v_teacache.py
   - unittest/_torch/visual_gen/test_wan21_t2v_teacache.py
   - unittest/_torch/visual_gen/test_wan_transformer.py
