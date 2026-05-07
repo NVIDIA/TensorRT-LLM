@@ -2027,16 +2027,18 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                                  requires_grad=False)
         module.register_parameter("fc2_alpha", fc2_alpha)
 
-        # Per-expert weight_scale_2 for dynamic quantization (fixed address for CUDA graph)
-        fc31_weight_scale_2 = nn.Parameter(torch.ones(
-            module.expert_size_per_partition, dtype=torch.float32),
-                                           requires_grad=False)
-        module.register_parameter("fc31_weight_scale_2", fc31_weight_scale_2)
+        # Per-expert weight_scale_2 is only needed for dynamic quantization.
+        if getattr(module, 'force_dynamic_quantization', False):
+            fc31_weight_scale_2 = nn.Parameter(torch.ones(
+                module.expert_size_per_partition, dtype=torch.float32),
+                                               requires_grad=False)
+            module.register_parameter("fc31_weight_scale_2",
+                                      fc31_weight_scale_2)
 
-        fc2_weight_scale_2 = nn.Parameter(torch.ones(
-            module.expert_size_per_partition, dtype=torch.float32),
-                                          requires_grad=False)
-        module.register_parameter("fc2_weight_scale_2", fc2_weight_scale_2)
+            fc2_weight_scale_2 = nn.Parameter(torch.ones(
+                module.expert_size_per_partition, dtype=torch.float32),
+                                              requires_grad=False)
+            module.register_parameter("fc2_weight_scale_2", fc2_weight_scale_2)
 
         # Optional per-channel act scale for NVFP4_AWQ (pre_quant_scale support)
         # This will be initialized in load_quant_scales if pre_quant_scale exists
@@ -2305,10 +2307,14 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                                               local_shared_w2_scale_tensors,
                                               module.tmp_shared_weight_scale_2)
 
-    def _reconcile_and_compute_alphas(self, module: torch.nn.Module,
-                                      tmp_weight_scale_2: Dict,
-                                      dst_fc31_alpha: torch.Tensor,
-                                      dst_fc2_alpha: torch.Tensor):
+    def _reconcile_and_compute_alphas(
+            self,
+            module: torch.nn.Module,
+            tmp_weight_scale_2: Dict,
+            dst_fc31_alpha: torch.Tensor,
+            dst_fc2_alpha: torch.Tensor,
+            dst_fc31_weight_scale_2: Optional[torch.Tensor] = None,
+            dst_fc2_weight_scale_2: Optional[torch.Tensor] = None):
         """Reconcile w1/w3 weight_scale_2 and compute alphas for each expert.
 
         For each expert, reconciles w1 and w3 weight_scale_2 (taking the max
@@ -2336,11 +2342,12 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                                              module.fc2_input_scale.data,
                                              dst_fc2_alpha[expert_idx])
 
-            # Store per-expert weight_scale_2 for dynamic quantization
-            module.fc31_weight_scale_2.data[expert_idx] = w1_ws2[...].reshape(
-                []).float()
-            module.fc2_weight_scale_2.data[expert_idx] = w2_ws2[...].reshape(
-                []).float()
+            if dst_fc31_weight_scale_2 is not None:
+                dst_fc31_weight_scale_2[expert_idx] = w1_ws2[...].reshape(
+                    []).float()
+            if dst_fc2_weight_scale_2 is not None:
+                dst_fc2_weight_scale_2[expert_idx] = w2_ws2[...].reshape(
+                    []).float()
 
     def _finalize_pre_quant_scales(self, module: torch.nn.Module):
         """Verify pre_quant_scale consistency across experts and compute fc31_act_scale."""
@@ -2421,9 +2428,12 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         self._finalize_pre_quant_scales(module)
 
         # Step 3: Reconcile weight_scale_2 and compute alphas
-        self._reconcile_and_compute_alphas(module, module.tmp_weight_scale_2,
-                                           module.fc31_alpha.data,
-                                           module.fc2_alpha.data)
+        self._reconcile_and_compute_alphas(
+            module, module.tmp_weight_scale_2, module.fc31_alpha.data,
+            module.fc2_alpha.data, module.fc31_weight_scale_2.data if hasattr(
+                module, 'fc31_weight_scale_2') else None,
+            module.fc2_weight_scale_2.data
+            if hasattr(module, 'fc2_weight_scale_2') else None)
         delattr(module, 'tmp_weight_scale_2')
 
         # Step 4: Finalize shared weight alphas if needed
@@ -2437,16 +2447,34 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 (num_shared, ) + module.fc2_alpha.data.shape[1:],
                 dtype=module.fc2_alpha.data.dtype,
                 device='cpu')
+            shared_fc31_weight_scale_2 = None
+            shared_fc2_weight_scale_2 = None
+            if hasattr(module, 'fc31_weight_scale_2'):
+                shared_fc31_weight_scale_2 = torch.empty(
+                    (num_shared, ) + module.fc31_weight_scale_2.data.shape[1:],
+                    dtype=module.fc31_weight_scale_2.data.dtype,
+                    device='cpu')
+            if hasattr(module, 'fc2_weight_scale_2'):
+                shared_fc2_weight_scale_2 = torch.empty(
+                    (num_shared, ) + module.fc2_weight_scale_2.data.shape[1:],
+                    dtype=module.fc2_weight_scale_2.data.dtype,
+                    device='cpu')
             self._reconcile_and_compute_alphas(module,
                                                module.tmp_shared_weight_scale_2,
                                                shared_fc31_alpha,
-                                               shared_fc2_alpha)
+                                               shared_fc2_alpha,
+                                               shared_fc31_weight_scale_2,
+                                               shared_fc2_weight_scale_2)
             weight_fns = {
                 'w3_w1_weight_scale': module.local_shared_w3_w1_scale_tensors,
                 'w2_weight_scale': module.local_shared_w2_scale_tensors,
                 'fc31_alpha': shared_fc31_alpha,
                 'fc2_alpha': shared_fc2_alpha,
             }
+            if shared_fc31_weight_scale_2 is not None:
+                weight_fns['fc31_weight_scale_2'] = shared_fc31_weight_scale_2
+            if shared_fc2_weight_scale_2 is not None:
+                weight_fns['fc2_weight_scale_2'] = shared_fc2_weight_scale_2
             module.register_all_parameter_slot_and_to_fix_weight_fns(weight_fns)
             delattr(module, 'tmp_shared_weight_scale_2')
             delattr(module, 'local_shared_w3_w1_scale_tensors')
