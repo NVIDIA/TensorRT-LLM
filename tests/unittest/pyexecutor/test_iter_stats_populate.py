@@ -600,6 +600,7 @@ def _build_adp_stats_harness(pending_stats, *, rank=0, tp_rank=0):
     for method_name in (
         "_append_iter_stats",
         "_clear_pending_adp_iter_stats_through",
+        "_discard_pending_adp_iter_stats",
         "_drop_pending_adp_iter_stats_before",
         "_ensure_adp_zero_iter_stats_payload",
         "_finalize_pending_adp_iter_stats",
@@ -735,6 +736,28 @@ def test_attention_dp_fanout_buffers_multiple_pending_payloads():
 
     assert sorted(harness._pending_adp_iter_stats_payloads) == [9, 10]
     assert harness._next_adp_iter_stats_payload().iter_stats_iter == 9
+
+
+def test_attention_dp_fanout_clears_when_rank0_stats_object_missing():
+    rank0_stats = _make_adp_iteration_stats(iter_id=9, num_context_requests=1)
+    harness = _build_adp_stats_harness(rank0_stats)
+    rank0_state = RankState(rank=0, iter_stats=harness._next_adp_iter_stats_payload())
+    rank1_state = RankState(
+        rank=1,
+        iter_stats=RankIterStatsPayload(
+            has_iter_stats=1,
+            iter_stats_iter=9,
+            num_context_requests=2,
+        ),
+    )
+    harness._pending_adp_iter_stats.pop(9)
+
+    harness._finalize_pending_adp_iter_stats([rank0_state, rank1_state])
+
+    assert harness.stats == []
+    assert harness._pending_adp_iter_stats_payloads == {}
+    assert harness._pending_adp_req_stats == {}
+    assert harness._pending_adp_kv_iter_stats == {}
 
 
 def test_attention_dp_fanout_aligns_non_rank0_to_rank0_iter():

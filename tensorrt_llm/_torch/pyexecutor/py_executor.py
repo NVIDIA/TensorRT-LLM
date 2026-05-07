@@ -1504,13 +1504,18 @@ class PyExecutor:
         ):
             setattr(stats, attr, getattr(rank0_stats, attr))
 
-        # Optional nested stats are copied as-is. KV iteration deltas are
-        # attached separately in _append_iter_stats and remain rank-0-only to
-        # avoid double-logging global KV-cache deltas.
-        stats.kv_cache_stats = rank0_stats.kv_cache_stats
-        stats.cross_kv_cache_stats = rank0_stats.cross_kv_cache_stats
-        stats.static_batching_stats = rank0_stats.static_batching_stats
-        stats.specdec_stats = rank0_stats.specdec_stats
+        # Optional nested stats are copied when present. KV iteration deltas
+        # are attached separately in _append_iter_stats and remain rank-0-only
+        # to avoid double-logging global KV-cache deltas.
+        for attr in (
+                "kv_cache_stats",
+                "cross_kv_cache_stats",
+                "static_batching_stats",
+                "specdec_stats",
+        ):
+            nested_stats = getattr(rank0_stats, attr)
+            if nested_stats is not None:
+                setattr(stats, attr, nested_stats)
 
         ifb = InflightBatchingStats()
         ifb.num_context_requests = payload.num_context_requests
@@ -1589,6 +1594,7 @@ class PyExecutor:
                     "Skipping attention-DP IterationStats fanout on "
                     f"rank 0: pending IterationStats object is missing for "
                     f"iter {iter_stats_iter}")
+                self._clear_pending_adp_iter_stats_through(iter_stats_iter)
                 return
 
             req_stats = self._pending_adp_req_stats.get(iter_stats_iter)
