@@ -558,6 +558,55 @@ def test_validate_checkpoint_metadata_accepts_complete_projection_sets() -> None
     assert _layout().validate_checkpoint_metadata(metadata) == 6
 
 
+def test_validate_checkpoint_metadata_rejects_inconsistent_gate_up_shapes() -> None:
+    metadata = _metadata_from_state(_state_dict(experts=(0,)))
+    metadata[_key(LAYER, 0, "w3", "weight")]["shape"] = [INTERMEDIATE_SIZE * 2, HIDDEN_SIZE // 2]
+    metadata[_key(LAYER, 0, "w3", "scale")]["shape"] = [
+        INTERMEDIATE_SIZE * 2,
+        HIDDEN_SIZE // 32,
+    ]
+
+    with pytest.raises(ValueError, match="inconsistent gate/up shapes"):
+        _layout().validate_checkpoint_metadata(metadata)
+
+
+def test_validate_checkpoint_metadata_rejects_inconsistent_down_shape() -> None:
+    metadata = _metadata_from_state(_state_dict(experts=(0,)))
+    metadata[_key(LAYER, 0, "w2", "weight")]["shape"] = [
+        HIDDEN_SIZE,
+        INTERMEDIATE_SIZE // 2 + 1,
+    ]
+    metadata[_key(LAYER, 0, "w2", "scale")]["shape"] = [
+        HIDDEN_SIZE,
+        math.ceil((INTERMEDIATE_SIZE + 2) / 32),
+    ]
+
+    with pytest.raises(ValueError, match="inconsistent down projection shape"):
+        _layout().validate_checkpoint_metadata(metadata)
+
+
+def test_validate_checkpoint_metadata_rejects_unaligned_logical_hidden_size() -> None:
+    metadata = _metadata_from_state(_state_dict(experts=(0,)))
+    hidden_size = HIDDEN_SIZE + 2
+    for projection in ("w1", "w3"):
+        metadata[_key(LAYER, 0, projection, "weight")]["shape"] = [
+            INTERMEDIATE_SIZE,
+            hidden_size // 2,
+        ]
+        metadata[_key(LAYER, 0, projection, "scale")]["shape"] = [
+            INTERMEDIATE_SIZE,
+            math.ceil(hidden_size / 32),
+        ]
+    metadata[_key(LAYER, 0, "w2", "weight")]["shape"] = [hidden_size, INTERMEDIATE_SIZE // 2]
+    metadata[_key(LAYER, 0, "w2", "scale")]["shape"] = [
+        hidden_size,
+        INTERMEDIATE_SIZE // 32,
+    ]
+
+    with pytest.raises(ValueError, match="hidden_size.*divisible by 32"):
+        _layout().validate_checkpoint_metadata(metadata)
+
+
 def test_load_runtime_buffers_removes_consumed_source_keys_and_keeps_unrelated_keys() -> None:
     layout = _layout()
     source_state = _state_dict(experts=(0, 1))

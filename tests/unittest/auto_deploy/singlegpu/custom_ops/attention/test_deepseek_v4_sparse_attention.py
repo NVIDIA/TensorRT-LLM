@@ -347,6 +347,7 @@ def _compressor_case(
     seq_len: int,
     *,
     compressed_capacity_tokens: int | None = None,
+    batch_size: int = 1,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -372,10 +373,10 @@ def _compressor_case(
         ad_rope_cache_len=max(capacity, seq_len, 1),
     )
     compressor = DeepseekV4Compressor(config, compress_ratio, head_dim).eval()
-    hidden_states = torch.randn(1, seq_len, hidden_size)
+    hidden_states = torch.randn(batch_size, seq_len, hidden_size)
     compressor_kv, compressor_gate = compressor.project(hidden_states)
     cos_table, sin_table = _rope_tables(max(capacity, seq_len, 1), rope_dim)
-    position_ids = torch.arange(seq_len).unsqueeze(0)
+    position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1).contiguous()
     compressed_kv = compressor(hidden_states, cos_table, sin_table, position_ids)
     return (
         compressor_kv,
@@ -415,12 +416,14 @@ def _make_v2_caches(
     head_dim: int,
     compressor_state_dim: int,
     fill_value: float = 0.0,
+    *,
+    num_slots: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
-        torch.full((1, max_seq_len, head_dim), fill_value),
-        torch.full((1, max_seq_len, head_dim), fill_value),
-        torch.full((1, max_seq_len, compressor_state_dim), fill_value),
-        torch.full((1, max_seq_len, compressor_state_dim), fill_value),
+        torch.full((num_slots, max_seq_len, head_dim), fill_value),
+        torch.full((num_slots, max_seq_len, head_dim), fill_value),
+        torch.full((num_slots, max_seq_len, compressor_state_dim), fill_value),
+        torch.full((num_slots, max_seq_len, compressor_state_dim), fill_value),
     )
 
 
@@ -811,6 +814,127 @@ def test_cached_ratio128_token_input_pos_matches_full_v2_source() -> None:
         expected,
         rmse_ratio_tol=1e-6,
         msg="cached token input_pos ratio-128: ",
+    )
+
+
+def test_cached_ratio128_multi_decode_metadata_matches_source_and_writes_slots() -> None:
+    torch.manual_seed(217)
+    batch_size = 2
+    compress_ratio = 128
+    total_len = 128
+    prefill_len = total_len - 1
+    window_size = 4
+    compressed_capacity_tokens = 256
+    q = torch.randn(batch_size, total_len, 1, 8)
+    kv = torch.randn(batch_size, total_len, 8)
+    attn_sink = torch.tensor([-0.5])
+    (
+        compressor_kv,
+        compressor_gate,
+        compressed_kv,
+        compressor,
+        cos_table,
+        sin_table,
+        position_ids,
+    ) = _compressor_case(
+        compress_ratio,
+        total_len,
+        compressed_capacity_tokens=compressed_capacity_tokens,
+        batch_size=batch_size,
+    )
+    swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = _make_v2_caches(
+        compressed_capacity_tokens,
+        kv.shape[-1],
+        compressor_kv.shape[-1],
+        fill_value=777.0,
+        num_slots=batch_size,
+    )
+
+    topk_prefill = _visible_source_topk(
+        prefill_len,
+        0,
+        prefill_len,
+        window_size,
+        compress_ratio,
+        compressor.max_compressed_len,
+        q.device,
+    ).expand(batch_size, -1, -1)
+    _run_cached_sparse_attention_v2(
+        q[:, :prefill_len],
+        kv[:, :prefill_len],
+        attn_sink,
+        topk_prefill,
+        compressor_kv[:, :prefill_len],
+        compressor_gate[:, :prefill_len],
+        compressor,
+        cos_table,
+        sin_table,
+        position_ids[:, :prefill_len],
+        _multi_context_meta([prefill_len, prefill_len]),
+        swa_cache,
+        mhc_cache,
+        compressor_kv_cache,
+        compressor_gate_cache,
+        window_size=window_size,
+        compress_ratio=compress_ratio,
+    )
+    torch.testing.assert_close(mhc_cache[:, 0], torch.full_like(mhc_cache[:, 0], 777.0))
+
+    output = _run_cached_sparse_attention_v2(
+        q[:, prefill_len:],
+        kv[:, prefill_len:],
+        attn_sink,
+        torch.zeros(batch_size, 1, 1, dtype=torch.int64),
+        compressor_kv[:, prefill_len:],
+        compressor_gate[:, prefill_len:],
+        compressor,
+        cos_table,
+        sin_table,
+        position_ids[:, prefill_len:],
+        _multi_decode_meta([prefill_len, prefill_len]),
+        swa_cache,
+        mhc_cache,
+        compressor_kv_cache,
+        compressor_gate_cache,
+        window_size=window_size,
+        compress_ratio=compress_ratio,
+    )
+    expected_topk = _visible_source_topk(
+        1,
+        prefill_len,
+        total_len,
+        window_size,
+        compress_ratio,
+        compressor.max_compressed_len,
+        q.device,
+    ).expand(batch_size, -1, -1)
+    expected = _run_sparse_attention_v2(
+        q[:, prefill_len:],
+        kv,
+        attn_sink,
+        expected_topk,
+        compressor_kv,
+        compressor_gate,
+        compressor,
+        cos_table,
+        sin_table,
+        position_ids,
+        window_size=window_size,
+        compress_ratio=compress_ratio,
+    )
+
+    for slot_idx in range(batch_size):
+        torch.testing.assert_close(swa_cache[slot_idx, :total_len], kv[slot_idx])
+        torch.testing.assert_close(mhc_cache[slot_idx, 0], compressed_kv[slot_idx, 0])
+        torch.testing.assert_close(
+            mhc_cache[slot_idx, 1],
+            torch.full_like(mhc_cache[slot_idx, 1], 777.0),
+        )
+    assert_rmse_close(
+        output,
+        expected,
+        rmse_ratio_tol=1e-6,
+        msg="cached ratio-128 multi decode: ",
     )
 
 

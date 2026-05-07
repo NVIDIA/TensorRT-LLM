@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -25,6 +26,7 @@ from tensorrt_llm._torch.auto_deploy.transform.interface import Stages
 from tensorrt_llm._torch.auto_deploy.transform.library.mxfp4_moe import (
     InsertMXFP4MLP,
     MXFP4MLPConfig,
+    _resolve_mxfp4_expert_block_size,
 )
 
 _E2M1_VALUES = torch.tensor(
@@ -92,6 +94,49 @@ def _make_mxfp4_checkpoint_weight(
 
 def _deepseek_layout() -> DeepseekV4PackedMxfp4ExpertsCheckpointLayout:
     return build_deepseek_v4_packed_mxfp4_experts_layout()
+
+
+class _UnsupportedBlockSizeLayout:
+    expert_block_size = 64
+
+
+class _QuantConfigFactory:
+    def __init__(self, qcfg: dict[str, object]) -> None:
+        self._qcfg = qcfg
+
+    def get_quant_config(self) -> dict[str, object]:
+        return self._qcfg
+
+
+class _DenseMoeTransformModule(torch.nn.Module):
+    def __init__(self, hidden_size: int, intermediate_size: int, num_experts: int = 2) -> None:
+        super().__init__()
+        self.router_weight = torch.nn.Parameter(torch.randn(num_experts, hidden_size))
+        self.router_bias = torch.nn.Parameter(torch.randn(num_experts))
+        self.gate_up_w = torch.nn.Parameter(
+            torch.randn(num_experts, hidden_size, 2 * intermediate_size)
+        )
+        self.gate_up_b = torch.nn.Parameter(torch.randn(num_experts, 2 * intermediate_size))
+        self.down_w = torch.nn.Parameter(torch.randn(num_experts, intermediate_size, hidden_size))
+        self.down_b = torch.nn.Parameter(torch.randn(num_experts, hidden_size))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        routing_weights = torch.ops.auto_deploy.torch_moe_router(
+            hidden_states,
+            self.router_weight,
+            self.router_bias,
+            1,
+        )
+        return torch.ops.auto_deploy.torch_moe_dense_mlp(
+            hidden_states,
+            routing_weights,
+            self.gate_up_w,
+            self.gate_up_b,
+            self.down_w,
+            self.down_b,
+            1.0,
+            10.0,
+        )
 
 
 def _deepseek_expert_key(layer: int, expert: int, projection: str, tensor_kind: str) -> str:
@@ -531,3 +576,58 @@ def test_mxfp4_transform_backend_selector_prefers_torch_for_checkpoint_layout() 
         )._resolve_backend({"expert_quant_method": "mxfp4"}, object())
         == "triton"
     )
+
+
+def test_mxfp4_transform_resolves_expert_block_size_and_rejects_unsupported() -> None:
+    layout = _deepseek_layout()
+
+    assert _resolve_mxfp4_expert_block_size({}, None) == _MXFP4_BLOCK_SIZE
+    assert _resolve_mxfp4_expert_block_size({}, layout) == _MXFP4_BLOCK_SIZE
+    assert (
+        _resolve_mxfp4_expert_block_size({"expert_block_size": _MXFP4_BLOCK_SIZE}, layout)
+        == _MXFP4_BLOCK_SIZE
+    )
+
+    with pytest.raises(ValueError, match="supports expert_block_size=32.*got 64"):
+        _resolve_mxfp4_expert_block_size({"expert_block_size": 64}, None)
+
+    with pytest.raises(ValueError, match="supports expert_block_size=32.*got 64"):
+        _resolve_mxfp4_expert_block_size({}, _UnsupportedBlockSizeLayout())
+
+
+@pytest.mark.parametrize(
+    ("qcfg", "checkpoint_layout", "expected_message"),
+    (
+        ({"expert_block_size": True}, None, "should be an integer"),
+        ({"expert_block_size": 0}, None, "should be positive"),
+        ({"expert_block_size": 32.0}, None, "should be an integer"),
+        ({"expert_block_size": 32}, _UnsupportedBlockSizeLayout(), "mismatch"),
+    ),
+)
+def test_mxfp4_transform_rejects_invalid_expert_block_size_config(
+    qcfg: dict[str, object],
+    checkpoint_layout: object | None,
+    expected_message: str,
+) -> None:
+    with pytest.raises(ValueError, match=expected_message):
+        _resolve_mxfp4_expert_block_size(qcfg, checkpoint_layout)
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "intermediate_size", "expected_name"),
+    (
+        (31, 32, "hidden_size"),
+        (32, 31, "intermediate_size"),
+    ),
+)
+def test_mxfp4_transform_rejects_expert_dims_not_divisible_by_block_size(
+    hidden_size: int,
+    intermediate_size: int,
+    expected_name: str,
+) -> None:
+    gm = torch.fx.symbolic_trace(_DenseMoeTransformModule(hidden_size, intermediate_size))
+    transform = InsertMXFP4MLP(MXFP4MLPConfig(stage=Stages.PATTERN_MATCHER))
+    factory = _QuantConfigFactory({"quant_method": "mxfp4", "expert_block_size": 32})
+
+    with pytest.raises(ValueError, match=f"{expected_name}.*divisible.*32"):
+        transform._apply(gm, cm=None, factory=factory, shared_config=None)

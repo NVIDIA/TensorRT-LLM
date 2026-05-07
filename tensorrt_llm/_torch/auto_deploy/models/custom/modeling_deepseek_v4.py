@@ -13,13 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Semantic prefill-only DeepSeek V4 model for AutoDeploy export.
+"""Semantic DeepSeek V4 model for AutoDeploy export.
 
 The implementation keeps the DeepSeek reference hierarchy
 ``embed`` / ``layers`` / ``norm`` / ``head`` so checkpoint-facing names remain
-auditable. It intentionally omits cached decode, Triton kernels, CUDA graph, and
-MTP modules. Sparse attention uses the narrow source-op boundary: this model
-forms Q/KV, raw compressor projections, and top-k indices; the source op owns
+auditable. It intentionally omits Triton kernels, CUDA graph, and MTP modules.
+Sparse attention uses the narrow source-op boundary: this model forms Q/KV, raw
+compressor projections, and top-k indices; the source/cache ops own
 compressed-row construction plus attention over those rows and the sink term.
 """
 
@@ -306,6 +306,7 @@ class DeepseekV4PackedMxfp4ExpertsCheckpointLayout(PackedMXFP4ExpertCheckpointLa
                     f"{projection} for layer {layer}, expert {expert}: "
                     f"{weight_name} and {scale_name}."
                 )
+            self._validate_expert_projection_shapes(parsed_metadata, layer, expert)
 
         if not parsed_metadata:
             raise QuantizedCheckpointLayoutError(
@@ -561,6 +562,42 @@ class DeepseekV4PackedMxfp4ExpertsCheckpointLayout(PackedMXFP4ExpertCheckpointLa
         if shape != expected:
             raise QuantizedCheckpointLayoutError(
                 f"{scale_name} has shape {shape}, expected {expected} for packed FP4 {weight_name}."
+            )
+
+    def _validate_expert_projection_shapes(
+        self,
+        parsed_metadata: Mapping[tuple[int, int, str], Mapping[str, TensorMetadata]],
+        layer: int,
+        expert: int,
+    ) -> None:
+        weight_shapes = {
+            projection: _get_shape(
+                self.format_key(layer, expert, projection, "weight"),
+                parsed_metadata[(layer, expert, projection)]["weight"],
+            )
+            for projection in _required_projection_names()
+        }
+        w1_shape = weight_shapes["w1"]
+        w2_shape = weight_shapes["w2"]
+        w3_shape = weight_shapes["w3"]
+        if w1_shape != w3_shape:
+            raise QuantizedCheckpointLayoutError(
+                "Packed MXFP4 expert metadata has inconsistent gate/up shapes for "
+                f"layer {layer}, expert {expert}: w1 {w1_shape}, w3 {w3_shape}."
+            )
+
+        intermediate_size = w1_shape[0]
+        hidden_size = w1_shape[1] * 2
+        _validate_positive_divisible_by("hidden_size", hidden_size, self.expert_block_size)
+        _validate_positive_divisible_by(
+            "intermediate_size", intermediate_size, self.expert_block_size
+        )
+        expected_w2_shape = [hidden_size, intermediate_size // 2]
+        if w2_shape != expected_w2_shape:
+            raise QuantizedCheckpointLayoutError(
+                "Packed MXFP4 expert metadata has inconsistent down projection shape for "
+                f"layer {layer}, expert {expert}: w2 {w2_shape}, expected {expected_w2_shape} "
+                f"from w1/w3 shapes {w1_shape}."
             )
 
     def _reinterpret_weight_as_uint8(self, name: str, tensor: torch.Tensor) -> torch.Tensor:

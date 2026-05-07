@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import operator
 from functools import partial
 from typing import Literal, Optional, Tuple, Type
 
@@ -36,6 +37,8 @@ from ..interface import BaseTransform, TransformConfig, TransformInfo, Transform
 # in ``QuantizeMXFP4MOE._apply_trtllm``.
 _MXFP4_SCALING_VECTOR_SIZE = 32
 _WEIGHT_ALIGNMENT = 128
+_MXFP4_DEFAULT_EXPERT_BLOCK_SIZE = 32
+_MXFP4_SUPPORTED_EXPERT_BLOCK_SIZE = 32
 _MXFP4_LAYOUT_ARG_NAMES = (
     "gate_up_blocks",
     "gate_up_scales",
@@ -197,6 +200,57 @@ def _get_packed_mxfp4_expert_layout(
         ):
             return consumer
     return None
+
+
+def _normalize_mxfp4_expert_block_size(source: str, value: object) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"MXFP4 {source} should be an integer, got {value}.")
+    try:
+        block_size = operator.index(value)
+    except TypeError as error:
+        raise ValueError(
+            f"MXFP4 {source} should be an integer, got {type(value).__name__}."
+        ) from error
+    if block_size <= 0:
+        raise ValueError(f"MXFP4 {source} should be positive, got {block_size}.")
+    return block_size
+
+
+def _resolve_mxfp4_expert_block_size(
+    qcfg: dict,
+    checkpoint_layout: object | None,
+) -> int:
+    candidates = []
+    if qcfg.get("expert_block_size") is not None:
+        candidates.append(("quant config expert_block_size", qcfg["expert_block_size"]))
+
+    layout_block_size = (
+        getattr(checkpoint_layout, "expert_block_size", None)
+        if checkpoint_layout is not None
+        else None
+    )
+    if layout_block_size is not None:
+        candidates.append(("checkpoint layout expert_block_size", layout_block_size))
+
+    if not candidates:
+        block_size = _MXFP4_DEFAULT_EXPERT_BLOCK_SIZE
+    else:
+        source, value = candidates[0]
+        block_size = _normalize_mxfp4_expert_block_size(source, value)
+        for other_source, other_value in candidates[1:]:
+            other_block_size = _normalize_mxfp4_expert_block_size(other_source, other_value)
+            if other_block_size != block_size:
+                raise ValueError(
+                    "MXFP4 expert_block_size mismatch: "
+                    f"{source} is {block_size}, but {other_source} is {other_block_size}."
+                )
+
+    if block_size != _MXFP4_SUPPORTED_EXPERT_BLOCK_SIZE:
+        raise ValueError(
+            "MXFP4 MoE supports expert_block_size=32 because the kernels decode "
+            f"32 values per scale block, got {block_size}."
+        )
+    return block_size
 
 
 def _layout_layer_from_names(
@@ -667,6 +721,8 @@ class QuantizeMXFP4MOE(BaseTransform):
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
         checkpoint_layout = _get_packed_mxfp4_expert_layout(qcfg)
+        if checkpoint_layout is not None or qcfg.get("expert_block_size") is not None:
+            _resolve_mxfp4_expert_block_size(qcfg, checkpoint_layout)
         num_existing_hooks = 0
         if checkpoint_layout is not None:
             num_existing_hooks = _register_existing_mxfp4_expert_layout_hooks(
