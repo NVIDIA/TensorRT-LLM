@@ -2571,6 +2571,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :param stream: CUDA stream
         :type stream: cuda.CUstream
         """
+        # Cast Int64 → Int32 so all derived tensor shapes and cute.size() calls stay in 32-bit,
+        # which is required by cutlass.range(). The wrapper accepts Int64 for API compatibility
+        # but practical tensor dimensions always fit in Int32.
+        m = cutlass.Int32(m)
+        n = cutlass.Int32(n)
+        k = cutlass.Int32(k)
+        l = cutlass.Int32(l)  # noqa: E741
         scale_k = k // scaling_vector_size
 
         # Create A tensor (M, K, L) - K-major
