@@ -545,6 +545,7 @@ class ModelConfig(Generic[TConfig]):
                         use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
                         q_split_threshold = sparse_attention_config.q_split_threshold
                         enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
+                        indexer_k_dtype = sparse_attention_config.indexer_k_dtype
                     else:
                         index_n_heads = pretrained_config.index_n_heads
                         index_head_dim = pretrained_config.index_head_dim
@@ -554,6 +555,7 @@ class ModelConfig(Generic[TConfig]):
                         use_cute_dsl_topk = False
                         q_split_threshold = 8192
                         enable_heuristic_topk = False
+                        indexer_k_dtype = "fp8"
                     kwargs[
                         'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
                             index_n_heads=index_n_heads,
@@ -565,7 +567,8 @@ class ModelConfig(Generic[TConfig]):
                             use_cute_dsl_topk=use_cute_dsl_topk,
                             q_split_threshold=q_split_threshold,
                             indexer_rope_interleave=indexer_rope_interleave,
-                            enable_heuristic_topk=enable_heuristic_topk)
+                            enable_heuristic_topk=enable_heuristic_topk,
+                            indexer_k_dtype=indexer_k_dtype)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."

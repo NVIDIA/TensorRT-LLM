@@ -19,3 +19,6 @@ transforms:
     enabled: true
   fuse_rope_into_trtllm_attention:
     enabled: true
+  fuse_silu_mul:
+    enabled: true
+    backend: trtllm

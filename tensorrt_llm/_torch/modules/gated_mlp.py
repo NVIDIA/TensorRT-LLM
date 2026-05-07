@@ -41,6 +41,7 @@ class GatedMLP(nn.Module):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.activation = activation
+        self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
 
         config = config or ModelConfig()
         self.mapping = config.mapping
@@ -154,6 +155,94 @@ class GatedMLP(nn.Module):
                 f"Activation {self.activation} not yet implemented for fused GatedMLP"
             )
 
+    def _can_fuse_gate_up_swiglu(self):
+        """Check if fused GEMM + SwiGLU path is available.
+
+        Returns True when all conditions are met:
+        - CuteDSL blockscaling mode is enabled (implies Blackwell + CuteDSL)
+        - Activation is SwiGLU (F.silu)
+        - gate_up_proj uses NVFP4 quantization
+        - gate_up_proj has no bias (bias not supported in fused kernel)
+        """
+        return (self.use_cute_dsl_blockscaling_mm and self.activation == F.silu
+                and self.gate_up_proj.has_nvfp4
+                and not self.gate_up_proj.has_bias)
+
+    def _can_fuse_gate_up_swiglu_fp4out(self):
+        """Check if fused GEMM + SwiGLU with FP4 output path is available.
+
+        Extends _can_fuse_gate_up_swiglu with additional conditions:
+        - down_proj also uses NVFP4 (so it can consume FP4 input)
+        - down_proj has static input_scale (needed as norm_const for SFC)
+        - down_proj does not use dynamic quantization
+        """
+        if not self._can_fuse_gate_up_swiglu():
+            return False
+        if not self.down_proj.has_nvfp4:
+            return False
+        if self.down_proj.force_dynamic_quantization:
+            return False
+        if self.down_proj.input_scale is None:
+            return False
+        return True
+
+    def _fused_gate_up_swiglu(self, x, fp4_out=False):
+        """Fused FC1 GEMM + SwiGLU using CuteDSL dense kernel.
+
+        Bypasses the separate gate_up_proj GEMM and swiglu Triton kernel,
+        fusing them into a single CuteDSL kernel with SwiGLU in the epilogue.
+
+        Args:
+            x: Input tensor or Fp4QuantizedTensor.
+            fp4_out: If True, produce FP4 output with scale factors,
+                eliminating the bf16→fp4 requantization between FC1 and FC2.
+
+        Returns:
+            If fp4_out is False: Output tensor [m, intermediate_size/tp] in bfloat16.
+            If fp4_out is True: Fp4QuantizedTensor with fused SwiGLU output.
+        """
+        module = self.gate_up_proj
+
+        # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
+        original_shape = None
+        if not isinstance(x, (tuple, Fp4QuantizedTensor)) and x.dim() > 2:
+            original_shape = x.shape
+            x = x.reshape(-1, x.shape[-1])
+
+        # Get quantized inputs from Linear's NVFP4 pipeline
+        act_fp4, act_sf, alpha = module.quant_method._input_prepare(module, x)
+
+        if fp4_out:
+            # FC2's input_scale serves as norm_const for SFC quantization
+            global_sf = self.down_proj.input_scale
+            fp4_output, out_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_fp4out_blackwell(
+                act_fp4, module.weight, act_sf, module.weight_scale, alpha,
+                global_sf)
+            if original_shape is not None:
+                fp4_output = fp4_output.reshape(*original_shape[:-1],
+                                                fp4_output.shape[-1])
+            return Fp4QuantizedTensor(fp4_output, out_sf)
+
+        # BF16 output path
+        output = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_blackwell(
+            act_fp4, module.weight, act_sf, module.weight_scale, alpha,
+            module.dtype)
+
+        # Trim padding if weight was padded beyond logical out_features
+        expected_out = module.out_features // 2
+        if output.shape[-1] > expected_out:
+            output = output[..., :expected_out].contiguous()
+
+        if original_shape is not None:
+            output = output.reshape(*original_shape[:-1], output.shape[-1])
+
+        return output
+
+    # Minimum M dimension for the fp4out CuTe DSL kernel.
+    # Below this, the kernel's SFC epilogue may write out-of-bounds
+    # because the CTA tile height exceeds the output allocation.
+    _FP4OUT_MIN_M = 128
+
     def forward(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -166,8 +255,21 @@ class GatedMLP(nn.Module):
             return self.forward_lora(x, all_rank_num_tokens,
                                      final_all_reduce_params, lora_params)
 
-        h1 = self.gate_up_proj(x)
-        h2 = self._apply_activation(h1)
+        if self._can_fuse_gate_up_swiglu_fp4out():
+            # Get token count for minimum-M check
+            if isinstance(x, (tuple, Fp4QuantizedTensor)):
+                m = x[0].shape[0] if isinstance(x, tuple) else x.shape[0]
+            else:
+                m = x.reshape(
+                    -1, x.shape[-1]).shape[0] if x.dim() > 2 else x.shape[0]
+            h2 = self._fused_gate_up_swiglu(x,
+                                            fp4_out=m >= GatedMLP._FP4OUT_MIN_M)
+        elif self._can_fuse_gate_up_swiglu():
+            h2 = self._fused_gate_up_swiglu(x)
+        else:
+            h1 = self.gate_up_proj(x)
+            h2 = self._apply_activation(h1)
+
         output = self.down_proj(h2,
                                 all_reduce_params=final_all_reduce_params,
                                 layer_idx=self.layer_idx)
