@@ -318,8 +318,7 @@ class ModelConfig(Generic[TConfig]):
                         f"The kvcache config in 'quant_cfg.json', {kv_quant_lhs},"
                         f"is different from 'hf_quant_config.json', {kv_quant_rhs}!"
                     )
-            quant_config.kv_cache_quant_algo = json_quant_configs[
-                "kv_cache_quant_algo"]
+            quant_config.kv_cache_quant_algo = kv_cache_quant_algo
             for layer in mixed_quant_configs:
                 config = QuantConfig()
                 config.kv_cache_quant_algo = kv_cache_quant_algo
