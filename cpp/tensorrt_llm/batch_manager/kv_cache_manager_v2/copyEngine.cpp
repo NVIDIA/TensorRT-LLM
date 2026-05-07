@@ -108,18 +108,20 @@ StagingBuffer::StagingBuffer(StagingBufferManager& manager, size_t minSize, size
     mAddress = mManager.baseAddress() + mStartGrain * kGranularity;
     lock.unlock();
 
-    // Lock grains and drain their ready events before we can use the buffer.
+    // Lock grains and collect their ready events for deduplicated waiting.
+    // Mirrors Python's stream_wait_events(stream, lock_and_consume_events()) which
+    // deduplicates via set() — adjacent grains often share the same event.
+    std::vector<CachedCudaEvent const*> readyEvents;
+    readyEvents.reserve(mNumGrains);
     for (size_t i = 0; i < mNumGrains; ++i)
     {
         GrainMetadata& g = mManager.mGrains[mStartGrain + i];
         g.mutex.lock();
-        // Wait for the previous user's event before we start writing.
-        if (!g.readyEvent.isClosed())
-        {
-            g.readyEvent.waitInStream(reinterpret_cast<CudaStream>(mStream));
-            g.readyEvent.close();
-        }
+        readyEvents.push_back(&g.readyEvent);
     }
+    streamWaitEvents(reinterpret_cast<CudaStream>(mStream), readyEvents);
+    for (size_t i = 0; i < mNumGrains; ++i)
+        mManager.mGrains[mStartGrain + i].readyEvent.close();
 }
 
 StagingBuffer::~StagingBuffer()
@@ -201,7 +203,7 @@ static void twoHopTransfer(
 }
 
 void CopyEngine::transfer(
-    CacheTier dstTier, CacheTier srcTier, size_t numBytes, std::vector<CopyTask> tasks, CUstream stream)
+    CacheTier dstTier, CacheTier srcTier, size_t numBytes, std::vector<CopyTask> const& tasks, CUstream stream)
 {
     constexpr auto G = CacheTier::GPU_MEM;
     constexpr auto H = CacheTier::HOST_MEM;
