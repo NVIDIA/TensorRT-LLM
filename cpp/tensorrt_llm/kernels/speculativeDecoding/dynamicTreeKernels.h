@@ -156,7 +156,7 @@ void invokeVerifyDynamicTreeRejection(int64_t* acceptIndex, int64_t* acceptToken
 torch::Tensor computeDraftProbsForDynamicTreeRejection(torch::Tensor const& draftLogits,
     torch::Tensor const& temperatures, runtime::SizeType32 numDraftProbRows, torch::optional<torch::Tensor> const& topK,
     torch::optional<torch::Tensor> const& topP, runtime::SizeType32 targetVocabSize, bool skipTemperature,
-    torch::optional<torch::Tensor> const& d2t, runtime::SizeType32 kMax = 0);
+    torch::optional<torch::Tensor> const& d2t, runtime::SizeType32 kMax = 0, bool skipAllSamplingParams = false);
 
 //! \brief Compute target probabilities for dynamic-tree rejection sampling from logits.
 //! \param targetLogits [batchSize * numDraftTokens, targetVocabSize], on GPU.
@@ -175,7 +175,7 @@ torch::Tensor computeDraftProbsForDynamicTreeRejection(torch::Tensor const& draf
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> computeTargetProbsForDynamicTreeRejection(
     torch::Tensor const& targetLogits, torch::Tensor const& temperatures, runtime::SizeType32 numDraftTokens,
     torch::optional<torch::Tensor> const& topK, torch::optional<torch::Tensor> const& topP, bool skipTemperature,
-    runtime::SizeType32 kMax = 0);
+    runtime::SizeType32 kMax = 0, bool skipAllSamplingParams = false);
 
 } // namespace kernels::speculative_decoding
 

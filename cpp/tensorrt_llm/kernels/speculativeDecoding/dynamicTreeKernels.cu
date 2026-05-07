@@ -27,9 +27,12 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/common/vec_dtypes.cuh"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <algorithm>
+#include <cfloat>
+#include <cstdint>
 #include <limits>
 #include <torch/extension.h>
 TRTLLM_NAMESPACE_BEGIN
@@ -307,7 +310,7 @@ constexpr double kGreedyTempThreshold = 1e-4;
 
 bool isTopPEnabled(torch::optional<torch::Tensor> const& topP)
 {
-    return topP.has_value() && topP->defined();
+    return topP.has_value() && topP->defined() && topP->lt(1.0).any().item<bool>();
 }
 
 torch::Tensor computeSoftmaxForProbOp(torch::Tensor logits)
@@ -334,6 +337,110 @@ torch::Tensor computeSoftmaxForProbOp(torch::Tensor logits)
     return probs;
 }
 
+struct DraftProbMaxFloatOp
+{
+    __device__ __forceinline__ float operator()(float a, float b) const
+    {
+        return a > b ? a : b;
+    }
+};
+
+template <int32_t BLOCK_SIZE>
+__global__ void computeDraftProbsSkipAllKernel(float const* draftLogits, int32_t const* d2t, float* draftProbs,
+    int32_t nRows, int32_t draftVocabSize, int32_t targetVocabSize)
+{
+    int32_t const rowId = static_cast<int32_t>(blockIdx.x);
+    int32_t const tid = static_cast<int32_t>(threadIdx.x);
+    if (rowId >= nRows)
+    {
+        return;
+    }
+
+    using BlockReduce = cub::BlockReduce<float, BLOCK_SIZE>;
+    __shared__ typename BlockReduce::TempStorage tempStorage;
+    __shared__ float sMaxLogit;
+    __shared__ float sExpSum;
+
+    float const* rowLogits = draftLogits + static_cast<int64_t>(rowId) * draftVocabSize;
+    float* rowProbs = draftProbs + static_cast<int64_t>(rowId) * targetVocabSize;
+
+    for (int32_t v = tid; v < targetVocabSize; v += BLOCK_SIZE)
+    {
+        rowProbs[v] = 0.0f;
+    }
+
+    float localMax = -FLT_MAX;
+    for (int32_t v = tid; v < draftVocabSize; v += BLOCK_SIZE)
+    {
+        localMax = fmaxf(localMax, rowLogits[v]);
+    }
+
+    float const blockMax = BlockReduce(tempStorage).Reduce(localMax, DraftProbMaxFloatOp{});
+    if (tid == 0)
+    {
+        sMaxLogit = blockMax;
+    }
+    __syncthreads();
+
+    float localSum = 0.0f;
+    for (int32_t v = tid; v < draftVocabSize; v += BLOCK_SIZE)
+    {
+        localSum += __expf(rowLogits[v] - sMaxLogit);
+    }
+
+    float const blockSum = BlockReduce(tempStorage).Sum(localSum);
+    if (tid == 0)
+    {
+        constexpr float kFloatSoftmaxEpsilon = 1e-6f;
+        sExpSum = blockSum + kFloatSoftmaxEpsilon;
+    }
+    __syncthreads();
+
+    for (int32_t v = tid; v < draftVocabSize; v += BLOCK_SIZE)
+    {
+        int64_t const targetIdx
+            = d2t != nullptr ? static_cast<int64_t>(v) + static_cast<int64_t>(d2t[v]) : static_cast<int64_t>(v);
+        if (targetIdx >= 0 && targetIdx < targetVocabSize)
+        {
+            rowProbs[targetIdx] = __expf(rowLogits[v] - sMaxLogit) / sExpSum;
+        }
+    }
+}
+
+torch::Tensor computeDraftProbsSkipAllForDynamicTreeRejection(torch::Tensor const& draftLogits, int64_t batchSize,
+    SizeType32 const numDraftProbRows, SizeType32 const targetVocabSize, torch::optional<torch::Tensor> const& d2t)
+{
+    auto const draftVocabSize = draftLogits.size(1);
+    bool const hasD2T = d2t.has_value() && d2t->defined();
+
+    auto draftLogitsFloat = draftLogits.contiguous().to(torch::kFloat32);
+    if (!hasD2T && draftVocabSize == targetVocabSize)
+    {
+        return computeSoftmaxForProbOp(draftLogitsFloat).reshape({batchSize, numDraftProbRows, targetVocabSize});
+    }
+
+    auto fullDraftProbs = torch::empty({draftLogitsFloat.size(0), targetVocabSize},
+        torch::TensorOptions().dtype(torch::kFloat32).device(draftLogitsFloat.device()));
+    torch::Tensor d2tInt;
+    int32_t const* d2tPtr = nullptr;
+    if (hasD2T)
+    {
+        d2tInt = d2t->contiguous().to(torch::kInt32);
+        d2tPtr = d2tInt.data_ptr<int32_t>();
+    }
+
+    constexpr int32_t kBlockSize = 1024;
+    dim3 grid(draftLogitsFloat.size(0));
+    dim3 block(kBlockSize);
+    auto stream = at::cuda::getCurrentCUDAStream(draftLogitsFloat.device().index());
+    computeDraftProbsSkipAllKernel<kBlockSize><<<grid, block, 0, stream>>>(draftLogitsFloat.data_ptr<float>(), d2tPtr,
+        fullDraftProbs.data_ptr<float>(), static_cast<int32_t>(draftLogitsFloat.size(0)),
+        static_cast<int32_t>(draftVocabSize), static_cast<int32_t>(targetVocabSize));
+    sync_check_cuda_error(stream);
+
+    return fullDraftProbs.reshape({batchSize, numDraftProbRows, targetVocabSize});
+}
+
 // Fast path for top-K (and optional top-P) filtering using torch::topk instead of a
 // full vocab-size sort.  kMax must be provided as a CPU integer (the caller computes it
 // via topK.max().item() on the Python side).  When kMax == 0 or kMax >= vocabSize the
@@ -347,15 +454,16 @@ torch::Tensor computeSoftmaxForProbOp(torch::Tensor logits)
 torch::Tensor applyTopKTopPForProbOp(torch::Tensor logits, torch::optional<torch::Tensor> const& topK,
     torch::optional<torch::Tensor> const& topP, int32_t kMax)
 {
-    bool const hasTopK = topK.has_value() && topK->defined();
-    bool const hasTopP = isTopPEnabled(topP);
+    int64_t const vocabSize = logits.size(1);
+    bool const hasTopK = topK.has_value() && topK->defined()
+        && torch::logical_and(topK->gt(0), topK->lt(vocabSize)).any().item<bool>();
+    bool const hasTopP = topP.has_value() && topP->defined() && topP->lt(1.0).any().item<bool>();
 
     if (!hasTopK && !hasTopP)
     {
         return logits;
     }
 
-    int64_t const vocabSize = logits.size(1);
     torch::Tensor effectiveTopK;
     bool hasDisabledTopKRows = false;
     if (hasTopK)
@@ -463,10 +571,11 @@ torch::Tensor computeProbsFromLogits(torch::Tensor const& logits, torch::Tensor 
     auto scaledLogits
         = (skipTemperature ? logits : logits.div(safeTemperatures.unsqueeze(1))).contiguous().to(torch::kFloat32);
 
-    bool const hasTopK = topK.has_value() && topK->defined();
-    bool const hasTopP = isTopPEnabled(topP);
     int64_t const vocabSize = scaledLogits.size(1);
     int64_t const nRows = scaledLogits.size(0);
+    bool const hasTopK = topK.has_value() && topK->defined()
+        && torch::logical_and(topK->gt(0), topK->lt(vocabSize)).any().item<bool>();
+    bool const hasTopP = topP.has_value() && topP->defined() && topP->lt(1.0).any().item<bool>();
 
     torch::Tensor maskedLogits;
     if (hasTopK && kMax > 0 && kMax < vocabSize)
@@ -496,7 +605,7 @@ torch::Tensor computeProbsFromLogits(torch::Tensor const& logits, torch::Tensor 
 torch::Tensor computeDraftProbsForDynamicTreeRejection(torch::Tensor const& draftLogits,
     torch::Tensor const& temperatures, SizeType32 const numDraftProbRows, torch::optional<torch::Tensor> const& topK,
     torch::optional<torch::Tensor> const& topP, SizeType32 const targetVocabSize, bool skipTemperature,
-    torch::optional<torch::Tensor> const& d2t, SizeType32 const kMax)
+    torch::optional<torch::Tensor> const& d2t, SizeType32 const kMax, bool skipAllSamplingParams)
 {
     TORCH_CHECK(draftLogits.is_cuda(), "draftLogits must be a CUDA tensor");
     TORCH_CHECK(temperatures.is_cuda(), "temperatures must be a CUDA tensor");
@@ -529,6 +638,12 @@ torch::Tensor computeDraftProbsForDynamicTreeRejection(torch::Tensor const& draf
         TORCH_CHECK(d2t->is_cuda(), "d2t must be a CUDA tensor");
         TORCH_CHECK(d2t->dim() == 1, "d2t must be a 1D tensor");
         TORCH_CHECK(d2t->size(0) >= draftVocabSize, "d2t size mismatch");
+    }
+
+    if (skipAllSamplingParams)
+    {
+        return computeDraftProbsSkipAllForDynamicTreeRejection(
+            draftLogits, batchSize, numDraftProbRows, targetVocabSize, d2t);
     }
 
     auto draftTemps = temperatures.repeat_interleave(numDraftProbRows);
@@ -568,7 +683,7 @@ torch::Tensor computeDraftProbsForDynamicTreeRejection(torch::Tensor const& draf
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> computeTargetProbsForDynamicTreeRejection(
     torch::Tensor const& targetLogits, torch::Tensor const& temperatures, SizeType32 const numDraftTokens,
     torch::optional<torch::Tensor> const& topK, torch::optional<torch::Tensor> const& topP, bool skipTemperature,
-    SizeType32 const kMax)
+    SizeType32 const kMax, bool skipAllSamplingParams)
 {
     TORCH_CHECK(targetLogits.is_cuda(), "targetLogits must be a CUDA tensor");
     TORCH_CHECK(temperatures.is_cuda(), "temperatures must be a CUDA tensor");
@@ -595,6 +710,17 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> computeTargetProbsForDyn
         TORCH_CHECK(topP->is_cuda(), "top_p must be a CUDA tensor");
         TORCH_CHECK(topP->dim() == 1, "top_p must be a 1D tensor");
         TORCH_CHECK(topP->size(0) == batchSize, "top_p size mismatch");
+    }
+
+    if (skipAllSamplingParams)
+    {
+        auto targetSupportIndices
+            = torch::empty({0}, torch::TensorOptions().dtype(torch::kInt32).device(targetLogits.device()));
+        auto targetSupportLengths
+            = torch::empty({0}, torch::TensorOptions().dtype(torch::kInt32).device(targetLogits.device()));
+        auto targetProbs = computeSoftmaxForProbOp(targetLogits);
+        return std::make_tuple(targetProbs.reshape({batchSize, numDraftTokens, targetVocabSize}), targetSupportIndices,
+            targetSupportLengths);
     }
 
     auto targetTemps = temperatures.repeat_interleave(numDraftTokens);
@@ -1152,7 +1278,7 @@ void invokeVerifyDynamicTreeGreedy(int64_t* predicts, int64_t* acceptIndex, int6
 __device__ __forceinline__ float curand_uniform_open_right(curandStatePhilox4_32_10_t& state)
 {
     float u = curand_uniform(&state); // (0, 1]
-    return u < 1.0f ? u : 0.0f;      // [0, 1)
+    return u < 1.0f ? u : 0.0f;       // [0, 1)
 }
 
 __device__ int64_t sampleFromDistribution(curandStatePhilox4_32_10_t& state, float const* probs, uint32_t vocabSize)
@@ -1211,6 +1337,37 @@ __device__ int64_t sampleFromIndexedDistribution(curandStatePhilox4_32_10_t& sta
     return sampledTok;
 }
 
+struct MinInt32Op
+{
+    __device__ __forceinline__ int32_t operator()(int32_t a, int32_t b) const
+    {
+        return a < b ? a : b;
+    }
+};
+
+struct MaxInt32Op
+{
+    __device__ __forceinline__ int32_t operator()(int32_t a, int32_t b) const
+    {
+        return a > b ? a : b;
+    }
+};
+
+struct MaxFloatOp
+{
+    __device__ __forceinline__ float operator()(float a, float b) const
+    {
+        return a > b ? a : b;
+    }
+};
+
+struct SoftmaxStats
+{
+    float maxVal;
+    float sumVal;
+    int32_t argmax;
+};
+
 //! \param acceptIndex          [out] accepted path as tree positions [bs, numSpecStep]. int64.
 //! \param acceptTokenNum       [out] number of accepted draft tokens (excl. root) [bs]. int64.
 //! \param acceptToken          [out] emitted token ids [bs, numSpecStep]. int64.
@@ -1233,27 +1390,31 @@ __device__ int64_t sampleFromIndexedDistribution(curandStatePhilox4_32_10_t& sta
 //! \param vocabSize            vocabulary size.
 //! \param seed                 [1] int64 on GPU. Philox RNG seed.
 //! \param offset               [1] int64 on GPU. Philox RNG offset.
-template <int32_t BLOCK_SIZE>
+template <int32_t BLOCK_SIZE, bool USE_LOGITS>
 __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* acceptTokenNum, int64_t* acceptToken,
-    int64_t const* candidates, float const* draftProbs, float const* targetProbs, int32_t const* targetSupportIndices,
+    int64_t const* candidates, float const* draftInputs, float const* targetInputs, int32_t const* targetSupportIndices,
     int32_t const* targetSupportLengths, int32_t const* draftProbIndices, int32_t const* retrieveNextToken,
     int32_t const* retrieveNextSibling, bool const* treeValid, uint32_t batchSize, uint32_t numDraftProbRows,
     uint32_t maxTargetSupportSize, uint32_t numSpeculativeTokens, uint32_t numDraftTokens, uint32_t vocabSize,
-    int64_t const* seed, int64_t const* offset)
+    uint32_t draftVocabSize, int32_t const* targetToDraft, int64_t const* seed, int64_t const* offset,
+    float const* temperatures)
 {
     uint32_t bx = blockIdx.x;
     int32_t const tid = static_cast<int32_t>(threadIdx.x);
+    constexpr uint32_t kVecSize = 4;
     if (bx >= batchSize)
     {
         return;
     }
 
     using BlockReduce = cub::BlockReduce<float, BLOCK_SIZE>;
+    using BlockReduceInt = cub::BlockReduce<int32_t, BLOCK_SIZE>;
     using BlockScan = cub::BlockScan<float, BLOCK_SIZE>;
 
     __shared__ union
     {
         typename BlockReduce::TempStorage reduce;
+        typename BlockReduceInt::TempStorage reduceInt;
         typename BlockScan::TempStorage scan;
     } tempStorage;
 
@@ -1265,14 +1426,15 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
     __shared__ float sTargetMass;
     __shared__ float sPrefixBase;
     __shared__ int32_t sWinnerIndex;
+    __shared__ int32_t sLastValidIndex;
     __shared__ int64_t sSampledToken;
+    __shared__ float sLogitsMax;
+    __shared__ float sLogitsSum;
+    __shared__ int32_t sLogitsArgmax;
 
-    // Independent sibling testing: collect all accepted siblings at each depth,
-    // then select one weighted by target probability to remove ordering bias.
-    static constexpr int32_t kMaxSiblingsPerDepth = 64;
-    __shared__ int32_t sAccSibIdx[kMaxSiblingsPerDepth];
-    __shared__ int64_t sAccSibTok[kMaxSiblingsPerDepth];
-    __shared__ float sAccSibQProb[kMaxSiblingsPerDepth];
+    // The first sibling that passes the rejection test at the current depth.
+    __shared__ int32_t sAccSibIdx;
+    __shared__ int64_t sAccSibTok;
     __shared__ int32_t sNumAccSiblings;
 
     uint32_t batchOffset = bx * numDraftTokens;
@@ -1285,29 +1447,497 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
     }
     __syncthreads();
     bool const hasCompactTargetSupport = targetSupportIndices != nullptr && targetSupportLengths != nullptr;
+    bool const isGreedyRequest
+        = USE_LOGITS && temperatures != nullptr && temperatures[bx] <= static_cast<float>(kGreedyTempThreshold);
+    float const* draftProbs = draftInputs;
+    float const* targetProbs = targetInputs;
+    uint32_t const draftRowStride = USE_LOGITS ? draftVocabSize : vocabSize;
+
+    auto canVectorizeLoad = [&](float const* probs, uint32_t rowSize) -> bool
+    {
+        constexpr uint32_t kLoadAlignmentBytes = kVecSize * sizeof(float);
+        return (rowSize % kVecSize == 0) && (reinterpret_cast<std::uintptr_t>(probs) % kLoadAlignmentBytes == 0);
+    };
+
+    auto loadProbVec = [&](float const* probs, uint32_t base, bool useVectorizedLoads, uint32_t rowSize)
+    {
+        flashinfer::vec_t<float, kVecSize> probVec;
+        probVec.fill(0.0f);
+        if (useVectorizedLoads && base + kVecSize <= rowSize)
+        {
+            probVec.cast_load(probs + base);
+        }
+        else
+        {
+#pragma unroll
+            for (uint32_t j = 0; j < kVecSize; ++j)
+            {
+                uint32_t const v = base + j;
+                if (v < rowSize)
+                {
+                    probVec[j] = probs[v];
+                }
+            }
+        }
+        return probVec;
+    };
+
+    auto computeLogitsStats = [&](float const* logitsRow, uint32_t rowSize) -> SoftmaxStats
+    {
+        float threadMax = -FLT_MAX;
+        for (uint32_t v = static_cast<uint32_t>(tid); v < rowSize; v += BLOCK_SIZE)
+        {
+            threadMax = fmaxf(threadMax, logitsRow[v]);
+        }
+
+        float const blockMax = BlockReduce(tempStorage.reduce).Reduce(threadMax, MaxFloatOp{});
+        if (tid == 0)
+        {
+            sLogitsMax = blockMax;
+        }
+        __syncthreads();
+
+        float threadSum = 0.0f;
+        int32_t localArgmax = static_cast<int32_t>(rowSize);
+        for (uint32_t v = static_cast<uint32_t>(tid); v < rowSize; v += BLOCK_SIZE)
+        {
+            float const logit = logitsRow[v];
+            threadSum += __expf(logit - sLogitsMax);
+            if (logit == sLogitsMax && localArgmax == static_cast<int32_t>(rowSize))
+            {
+                localArgmax = static_cast<int32_t>(v);
+            }
+        }
+
+        float const blockSum = BlockReduce(tempStorage.reduce).Sum(threadSum);
+        __syncthreads();
+        int32_t const blockArgmax = BlockReduceInt(tempStorage.reduceInt).Reduce(localArgmax, MinInt32Op{});
+        if (tid == 0)
+        {
+            sLogitsSum = blockSum;
+            sLogitsArgmax = blockArgmax;
+        }
+        __syncthreads();
+
+        return SoftmaxStats{sLogitsMax, sLogitsSum, sLogitsArgmax};
+    };
+
+    auto probFromLogits = [&](float const* logitsRow, uint32_t tokenId, uint32_t rowSize, SoftmaxStats stats) -> float
+    {
+        if (tokenId >= rowSize)
+        {
+            return 0.0f;
+        }
+        if (isGreedyRequest)
+        {
+            return tokenId == static_cast<uint32_t>(stats.argmax) ? 1.0f : 0.0f;
+        }
+        constexpr float kFloatSoftmaxEpsilon = 1e-6f;
+        return __expf(logitsRow[tokenId] - stats.maxVal) / (stats.sumVal + kFloatSoftmaxEpsilon);
+    };
+
+    auto targetTokenToDraftToken = [&](uint32_t targetTokenId) -> int32_t
+    {
+        if (targetTokenId >= vocabSize)
+        {
+            return -1;
+        }
+        if (targetToDraft != nullptr)
+        {
+            return targetToDraft[targetTokenId];
+        }
+        return targetTokenId < draftVocabSize ? static_cast<int32_t>(targetTokenId) : -1;
+    };
+
+    auto draftProbFromTargetToken
+        = [&](float const* draftLogitsRow, uint32_t targetTokenId, SoftmaxStats stats) -> float
+    {
+        int32_t const draftTokenId = targetTokenToDraftToken(targetTokenId);
+        if (draftTokenId < 0)
+        {
+            return 0.0f;
+        }
+        return probFromLogits(draftLogitsRow, static_cast<uint32_t>(draftTokenId), draftVocabSize, stats);
+    };
+
+    auto sampleProbTile = [&](float(&value)[kVecSize], uint32_t base) -> bool
+    {
+        float const tileSum = BlockReduce(tempStorage.reduce).template Sum<kVecSize>(value);
+        if (tid == 0)
+        {
+            sDiffSum = tileSum;
+        }
+        __syncthreads();
+
+        int32_t localLastValid = -1;
+#pragma unroll
+        for (uint32_t j = 0; j < kVecSize; ++j)
+        {
+            uint32_t const v = base + j;
+            if (v < vocabSize && value[j] > 0.0f)
+            {
+                localLastValid = static_cast<int32_t>(v);
+            }
+        }
+        int32_t const blockLastValid = BlockReduceInt(tempStorage.reduceInt).Reduce(localLastValid, MaxInt32Op{});
+        if (tid == 0 && blockLastValid >= 0)
+        {
+            sLastValidIndex = blockLastValid;
+        }
+        __syncthreads();
+
+        if (sPrefixBase + sDiffSum > sTargetMass)
+        {
+            float inclusive[kVecSize];
+            BlockScan(tempStorage.scan).template InclusiveSum<kVecSize>(value, inclusive);
+            __syncthreads();
+
+            int32_t localWinner = static_cast<int32_t>(vocabSize);
+#pragma unroll
+            for (uint32_t j = 0; j < kVecSize; ++j)
+            {
+                uint32_t const v = base + j;
+                if (v < vocabSize && value[j] > 0.0f && sPrefixBase + inclusive[j] > sTargetMass)
+                {
+                    localWinner = static_cast<int32_t>(v);
+                    break;
+                }
+            }
+
+            int32_t const blockWinner = BlockReduceInt(tempStorage.reduceInt).Reduce(localWinner, MinInt32Op{});
+            if (tid == 0)
+            {
+                sWinnerIndex = blockWinner;
+                sSampledToken = blockWinner < static_cast<int32_t>(vocabSize) ? static_cast<int64_t>(blockWinner)
+                                                                              : static_cast<int64_t>(vocabSize) - 1;
+            }
+            __syncthreads();
+            return true;
+        }
+
+        if (tid == 0)
+        {
+            sPrefixBase += sDiffSum;
+        }
+        __syncthreads();
+        return false;
+    };
+
+    auto sampleTargetFullVocab = [&](float const* tProbs)
+    {
+        bool const useVectorizedLoads = canVectorizeLoad(tProbs, vocabSize);
+        uint32_t const numIters = (vocabSize + BLOCK_SIZE * kVecSize - 1) / (BLOCK_SIZE * kVecSize);
+        if (tid == 0)
+        {
+            sPrefixBase = 0.0f;
+            sWinnerIndex = static_cast<int32_t>(vocabSize);
+            sLastValidIndex = -1;
+            sSampledToken = static_cast<int64_t>(vocabSize) - 1;
+            sTargetMass = curand_uniform_open_right(state);
+        }
+        __syncthreads();
+
+#pragma unroll 2
+        for (uint32_t i = 0; i < numIters; ++i)
+        {
+            uint32_t const base = (i * BLOCK_SIZE + static_cast<uint32_t>(tid)) * kVecSize;
+            auto const qVec = loadProbVec(tProbs, base, useVectorizedLoads, vocabSize);
+            float value[kVecSize];
+#pragma unroll
+            for (uint32_t j = 0; j < kVecSize; ++j)
+            {
+                value[j] = qVec[j];
+            }
+
+            if (sampleProbTile(value, base))
+            {
+                break;
+            }
+        }
+
+        if (tid == 0 && sWinnerIndex >= static_cast<int32_t>(vocabSize) && sLastValidIndex >= 0)
+        {
+            sSampledToken = static_cast<int64_t>(sLastValidIndex);
+        }
+        __syncthreads();
+    };
+
+    auto sampleResidualFullVocab = [&](float const* tProbs, float const* dProbs)
+    {
+        bool const useVectorizedTargetLoads = canVectorizeLoad(tProbs, vocabSize);
+        bool const useVectorizedDraftLoads = canVectorizeLoad(dProbs, vocabSize);
+        uint32_t const numIters = (vocabSize + BLOCK_SIZE * kVecSize - 1) / (BLOCK_SIZE * kVecSize);
+        float totalSum = 0.0f;
+#pragma unroll 2
+        for (uint32_t i = 0; i < numIters; ++i)
+        {
+            uint32_t const base = (i * BLOCK_SIZE + static_cast<uint32_t>(tid)) * kVecSize;
+            auto const qVec = loadProbVec(tProbs, base, useVectorizedTargetLoads, vocabSize);
+            auto const pVec = loadProbVec(dProbs, base, useVectorizedDraftLoads, vocabSize);
+            float value[kVecSize];
+#pragma unroll
+            for (uint32_t j = 0; j < kVecSize; ++j)
+            {
+                value[j] = fmaxf(qVec[j] - pVec[j], 0.0f);
+            }
+            totalSum += BlockReduce(tempStorage.reduce).template Sum<kVecSize>(value);
+            __syncthreads();
+        }
+
+        if (tid == 0)
+        {
+            sDiffSum = totalSum;
+            sPrefixBase = 0.0f;
+            sWinnerIndex = static_cast<int32_t>(vocabSize);
+            sLastValidIndex = -1;
+            sSampledToken = static_cast<int64_t>(vocabSize) - 1;
+            sTargetMass = totalSum > 1e-10f ? curand_uniform_open_right(state) * totalSum : 0.0f;
+            if (totalSum <= 1e-10f)
+            {
+                sSampledToken = sampleFromDistribution(state, tProbs, vocabSize);
+            }
+        }
+        __syncthreads();
+
+        if (sDiffSum <= 1e-10f)
+        {
+            return;
+        }
+
+#pragma unroll 2
+        for (uint32_t i = 0; i < numIters; ++i)
+        {
+            uint32_t const base = (i * BLOCK_SIZE + static_cast<uint32_t>(tid)) * kVecSize;
+            auto const qVec = loadProbVec(tProbs, base, useVectorizedTargetLoads, vocabSize);
+            auto const pVec = loadProbVec(dProbs, base, useVectorizedDraftLoads, vocabSize);
+            float value[kVecSize];
+#pragma unroll
+            for (uint32_t j = 0; j < kVecSize; ++j)
+            {
+                value[j] = fmaxf(qVec[j] - pVec[j], 0.0f);
+            }
+
+            if (sampleProbTile(value, base))
+            {
+                break;
+            }
+        }
+
+        if (tid == 0 && sWinnerIndex >= static_cast<int32_t>(vocabSize) && sLastValidIndex >= 0)
+        {
+            sSampledToken = static_cast<int64_t>(sLastValidIndex);
+        }
+        __syncthreads();
+    };
+
+    auto sampleTargetLogitsFullVocabWithStats = [&](float const* tLogits, SoftmaxStats targetStats)
+    {
+        if (tid == 0)
+        {
+            constexpr float kFloatSoftmaxEpsilon = 1e-6f;
+            sPrefixBase = 0.0f;
+            sWinnerIndex = static_cast<int32_t>(vocabSize);
+            sLastValidIndex = -1;
+            sSampledToken = static_cast<int64_t>(vocabSize) - 1;
+            sTargetMass = isGreedyRequest
+                ? 0.0f
+                : curand_uniform_open_right(state) * (targetStats.sumVal + kFloatSoftmaxEpsilon);
+            if (isGreedyRequest)
+            {
+                sSampledToken = static_cast<int64_t>(targetStats.argmax);
+            }
+        }
+        __syncthreads();
+
+        if (isGreedyRequest)
+        {
+            return;
+        }
+
+        bool const useVectorizedLoads = canVectorizeLoad(tLogits, vocabSize);
+        uint32_t const numIters = (vocabSize + BLOCK_SIZE * kVecSize - 1) / (BLOCK_SIZE * kVecSize);
+#pragma unroll 2
+        for (uint32_t i = 0; i < numIters; ++i)
+        {
+            uint32_t const base = (i * BLOCK_SIZE + static_cast<uint32_t>(tid)) * kVecSize;
+            auto const qVec = loadProbVec(tLogits, base, useVectorizedLoads, vocabSize);
+            float value[kVecSize];
+#pragma unroll
+            for (uint32_t j = 0; j < kVecSize; ++j)
+            {
+                uint32_t const v = base + j;
+                value[j] = v < vocabSize ? __expf(qVec[j] - targetStats.maxVal) : 0.0f;
+            }
+
+            if (sampleProbTile(value, base))
+            {
+                break;
+            }
+        }
+
+        if (tid == 0 && sWinnerIndex >= static_cast<int32_t>(vocabSize) && sLastValidIndex >= 0)
+        {
+            sSampledToken = static_cast<int64_t>(sLastValidIndex);
+        }
+        __syncthreads();
+    };
+
+    auto sampleTargetLogitsFullVocab = [&](float const* tLogits)
+    {
+        auto const targetStats = computeLogitsStats(tLogits, vocabSize);
+        sampleTargetLogitsFullVocabWithStats(tLogits, targetStats);
+    };
+
+    auto sampleResidualLogitsFullVocab
+        = [&](float const* tLogits, float const* dLogits, SoftmaxStats targetStats, SoftmaxStats draftStats)
+    {
+        if (isGreedyRequest)
+        {
+            if (tid == 0)
+            {
+                sSampledToken = static_cast<int64_t>(targetStats.argmax);
+            }
+            __syncthreads();
+            return;
+        }
+
+        bool const useVectorizedTargetLoads = canVectorizeLoad(tLogits, vocabSize);
+        bool const useVectorizedDraftLoads = targetToDraft == nullptr && canVectorizeLoad(dLogits, draftVocabSize);
+        uint32_t const numIters = (vocabSize + BLOCK_SIZE * kVecSize - 1) / (BLOCK_SIZE * kVecSize);
+        constexpr float kFloatSoftmaxEpsilon = 1e-6f;
+        float totalSum = 0.0f;
+#pragma unroll 2
+        for (uint32_t i = 0; i < numIters; ++i)
+        {
+            uint32_t const base = (i * BLOCK_SIZE + static_cast<uint32_t>(tid)) * kVecSize;
+            auto const qVec = loadProbVec(tLogits, base, useVectorizedTargetLoads, vocabSize);
+            flashinfer::vec_t<float, kVecSize> pVec;
+            pVec.fill(0.0f);
+            if (targetToDraft == nullptr)
+            {
+                pVec = loadProbVec(dLogits, base, useVectorizedDraftLoads, draftVocabSize);
+            }
+            float value[kVecSize];
+#pragma unroll
+            for (uint32_t j = 0; j < kVecSize; ++j)
+            {
+                uint32_t const v = base + j;
+                if (v < vocabSize)
+                {
+                    float const q = __expf(qVec[j] - targetStats.maxVal) / (targetStats.sumVal + kFloatSoftmaxEpsilon);
+                    int32_t const draftTokenId = targetTokenToDraftToken(v);
+                    float p = 0.0f;
+                    if (draftTokenId >= 0 && draftTokenId < static_cast<int32_t>(draftVocabSize))
+                    {
+                        float const draftLogit = targetToDraft == nullptr ? pVec[j] : dLogits[draftTokenId];
+                        p = __expf(draftLogit - draftStats.maxVal) / (draftStats.sumVal + kFloatSoftmaxEpsilon);
+                    }
+                    value[j] = fmaxf(q - p, 0.0f);
+                }
+                else
+                {
+                    value[j] = 0.0f;
+                }
+            }
+            totalSum += BlockReduce(tempStorage.reduce).template Sum<kVecSize>(value);
+            __syncthreads();
+        }
+
+        if (tid == 0)
+        {
+            sDiffSum = totalSum;
+            sPrefixBase = 0.0f;
+            sWinnerIndex = static_cast<int32_t>(vocabSize);
+            sLastValidIndex = -1;
+            sSampledToken = static_cast<int64_t>(vocabSize) - 1;
+            sTargetMass = totalSum > 1e-10f ? curand_uniform_open_right(state) * totalSum : 0.0f;
+        }
+        __syncthreads();
+
+        if (sDiffSum <= 1e-10f)
+        {
+            sampleTargetLogitsFullVocabWithStats(tLogits, targetStats);
+            return;
+        }
+
+#pragma unroll 2
+        for (uint32_t i = 0; i < numIters; ++i)
+        {
+            uint32_t const base = (i * BLOCK_SIZE + static_cast<uint32_t>(tid)) * kVecSize;
+            auto const qVec = loadProbVec(tLogits, base, useVectorizedTargetLoads, vocabSize);
+            flashinfer::vec_t<float, kVecSize> pVec;
+            pVec.fill(0.0f);
+            if (targetToDraft == nullptr)
+            {
+                pVec = loadProbVec(dLogits, base, useVectorizedDraftLoads, draftVocabSize);
+            }
+            float value[kVecSize];
+#pragma unroll
+            for (uint32_t j = 0; j < kVecSize; ++j)
+            {
+                uint32_t const v = base + j;
+                if (v < vocabSize)
+                {
+                    float const q = __expf(qVec[j] - targetStats.maxVal) / (targetStats.sumVal + kFloatSoftmaxEpsilon);
+                    int32_t const draftTokenId = targetTokenToDraftToken(v);
+                    float p = 0.0f;
+                    if (draftTokenId >= 0 && draftTokenId < static_cast<int32_t>(draftVocabSize))
+                    {
+                        float const draftLogit = targetToDraft == nullptr ? pVec[j] : dLogits[draftTokenId];
+                        p = __expf(draftLogit - draftStats.maxVal) / (draftStats.sumVal + kFloatSoftmaxEpsilon);
+                    }
+                    value[j] = fmaxf(q - p, 0.0f);
+                }
+                else
+                {
+                    value[j] = 0.0f;
+                }
+            }
+
+            if (sampleProbTile(value, base))
+            {
+                break;
+            }
+        }
+
+        if (tid == 0 && sWinnerIndex >= static_cast<int32_t>(vocabSize) && sLastValidIndex >= 0)
+        {
+            sSampledToken = static_cast<int64_t>(sLastValidIndex);
+        }
+        __syncthreads();
+    };
 
     // First-gen or dummy request: no valid tree exists yet. Sample directly
     // from the target distribution at the root and skip tree traversal.
     if (treeValid != nullptr && !treeValid[bx])
     {
-        if (tid == 0)
+        float const* tProbs = targetProbs + static_cast<uint64_t>(bx) * numDraftTokens * vocabSize;
+        if (hasCompactTargetSupport)
         {
-            float const* tProbs = targetProbs + static_cast<uint64_t>(bx) * numDraftTokens * vocabSize;
-            int64_t sampledToken;
-            if (hasCompactTargetSupport)
+            if (tid == 0)
             {
                 uint32_t const supportOffset = static_cast<uint64_t>(bx) * numDraftTokens * maxTargetSupportSize;
                 uint32_t const supportSize = static_cast<uint32_t>(targetSupportLengths[batchOffset]);
-                sampledToken = sampleFromIndexedDistribution(
+                sSampledToken = sampleFromIndexedDistribution(
                     state, tProbs, targetSupportIndices + supportOffset, supportSize, vocabSize);
+            }
+        }
+        else
+        {
+            if constexpr (USE_LOGITS)
+            {
+                sampleTargetLogitsFullVocab(tProbs);
             }
             else
             {
-                sampledToken = sampleFromDistribution(state, tProbs, vocabSize);
+                sampleTargetFullVocab(tProbs);
             }
+        }
+        if (tid == 0)
+        {
             acceptIndex[bx * numSpeculativeTokens] = 0;
             acceptTokenNum[bx] = 0;
-            acceptToken[bx * numSpeculativeTokens] = sampledToken;
+            acceptToken[bx * numSpeculativeTokens] = sSampledToken;
         }
         return;
     }
@@ -1359,48 +1989,71 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
         // Emit bonus token from the target distribution at the last accepted position.
         if (sFirstChild == -1)
         {
-            if (tid == 0)
+            float const* tProbs
+                = targetProbs + (static_cast<uint64_t>(bx) * numDraftTokens + sLastAcceptedLocalIdx) * vocabSize;
+            if (hasCompactTargetSupport)
             {
-                float const* tProbs = targetProbs
-                    + (static_cast<uint64_t>(bx) * numDraftTokens + sLastAcceptedLocalIdx) * vocabSize;
-                if (hasCompactTargetSupport)
+                if (tid == 0)
                 {
                     uint32_t const supportOffset
                         = (static_cast<uint64_t>(bx) * numDraftTokens + sLastAcceptedLocalIdx) * maxTargetSupportSize;
                     uint32_t const supportSize
                         = static_cast<uint32_t>(targetSupportLengths[batchOffset + sLastAcceptedLocalIdx]);
-                    acceptToken[bx * numSpeculativeTokens + sNumAcceptedTokens] = sampleFromIndexedDistribution(
+                    sSampledToken = sampleFromIndexedDistribution(
                         state, tProbs, targetSupportIndices + supportOffset, supportSize, vocabSize);
+                }
+            }
+            else
+            {
+                if constexpr (USE_LOGITS)
+                {
+                    sampleTargetLogitsFullVocab(tProbs);
                 }
                 else
                 {
-                    acceptToken[bx * numSpeculativeTokens + sNumAcceptedTokens]
-                        = sampleFromDistribution(state, tProbs, vocabSize);
+                    sampleTargetFullVocab(tProbs);
                 }
+            }
+            if (tid == 0)
+            {
+                acceptToken[bx * numSpeculativeTokens + sNumAcceptedTokens] = sSampledToken;
                 sHasTerminalToken = true;
             }
             __syncthreads();
             break;
         }
 
-        // ---- Phase 1: Independently test ALL siblings with Bernoulli rejection ----
-        // Unlike sequential testing which accepts the first passing sibling
-        // (creating ordering bias), we test every sibling and collect all that
-        // pass.  This removes the systematic preference for earlier siblings in
-        // the linked list and produces output closer to the target distribution.
+        // Test siblings in linked-list order. Once a sibling passes the
+        // Bernoulli rejection test, accept it immediately and skip the rest.
+        int32_t const firstDraftProbRow = draftProbIndices[batchOffset + sFirstChild];
+        float const* siblingTargetRow
+            = targetProbs + (static_cast<uint64_t>(bx) * numDraftTokens + sLastAcceptedLocalIdx) * vocabSize;
+        float const* siblingDraftRow
+            = draftProbs + (static_cast<uint64_t>(bx) * numDraftProbRows + firstDraftProbRow) * draftRowStride;
+        SoftmaxStats siblingTargetStats{};
+        SoftmaxStats siblingDraftStats{};
+        if constexpr (USE_LOGITS)
+        {
+            siblingTargetStats = computeLogitsStats(siblingTargetRow, vocabSize);
+            siblingDraftStats = computeLogitsStats(siblingDraftRow, draftVocabSize);
+        }
+
         if (tid == 0)
         {
             sNumAccSiblings = 0;
             int32_t childIdx = sFirstChild;
-            while (childIdx != -1 && sNumAccSiblings < kMaxSiblingsPerDepth)
+            while (childIdx != -1)
             {
                 int64_t const draftTokenId = candidates[batchOffset + childIdx];
                 int32_t const draftProbRow = draftProbIndices[batchOffset + childIdx];
-                float const pDraft
-                    = draftProbs[(static_cast<uint64_t>(bx) * numDraftProbRows + draftProbRow) * vocabSize
+                uint32_t const tokenId = static_cast<uint32_t>(draftTokenId);
+                float const pDraft = USE_LOGITS
+                    ? draftProbFromTargetToken(siblingDraftRow, tokenId, siblingDraftStats)
+                    : draftProbs[(static_cast<uint64_t>(bx) * numDraftProbRows + draftProbRow) * vocabSize
                         + draftTokenId];
-                float const pTarget
-                    = targetProbs[(static_cast<uint64_t>(bx) * numDraftTokens + sLastAcceptedLocalIdx) * vocabSize
+                float const pTarget = USE_LOGITS
+                    ? probFromLogits(siblingTargetRow, tokenId, vocabSize, siblingTargetStats)
+                    : targetProbs[(static_cast<uint64_t>(bx) * numDraftTokens + sLastAcceptedLocalIdx) * vocabSize
                         + draftTokenId];
 
                 float const acceptProb = fminf(1.0f, pTarget / (pDraft + 1e-10f));
@@ -1408,47 +2061,23 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
 
                 if (u < acceptProb)
                 {
-                    int32_t const idx = sNumAccSiblings++;
-                    sAccSibIdx[idx] = childIdx;
-                    sAccSibTok[idx] = draftTokenId;
-                    sAccSibQProb[idx] = pTarget;
+                    sAccSibIdx = childIdx;
+                    sAccSibTok = draftTokenId;
+                    sNumAccSiblings = 1;
+                    break;
                 }
                 childIdx = retrieveNextSibling[batchOffset + childIdx];
             }
         }
         __syncthreads();
 
-        // ---- Phase 2: Select among accepted siblings or emit correction ----
+        // Select the first accepted sibling or emit correction when all siblings reject.
         if (sNumAccSiblings > 0)
         {
-            // At least one sibling accepted.  Select one weighted by target
-            // probability q(ci) so that the choice follows the target distribution.
             if (tid == 0)
             {
-                int32_t selectedIdx = 0;
-                if (sNumAccSiblings > 1)
-                {
-                    float totalQ = 0.0f;
-                    for (int32_t i = 0; i < sNumAccSiblings; ++i)
-                    {
-                        totalQ += sAccSibQProb[i];
-                    }
-                    float const r = curand_uniform_open_right(state) * totalQ;
-                    float cumsum = 0.0f;
-                    selectedIdx = sNumAccSiblings - 1; // fallback
-                    for (int32_t i = 0; i < sNumAccSiblings; ++i)
-                    {
-                        cumsum += sAccSibQProb[i];
-                        if (r < cumsum)
-                        {
-                            selectedIdx = i;
-                            break;
-                        }
-                    }
-                }
-
-                int32_t const childIdx = sAccSibIdx[selectedIdx];
-                acceptToken[bx * numSpeculativeTokens + sNumAcceptedTokens] = sAccSibTok[selectedIdx];
+                int32_t const childIdx = sAccSibIdx;
+                acceptToken[bx * numSpeculativeTokens + sNumAcceptedTokens] = sAccSibTok;
                 ++sNumAcceptedTokens;
                 acceptIndex[bx * numSpeculativeTokens + sNumAcceptedTokens] = childIdx;
                 sLastAcceptedLocalIdx = childIdx;
@@ -1463,7 +2092,7 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
                 float const* tProbs
                     = targetProbs + (static_cast<uint64_t>(bx) * numDraftTokens + sLastAcceptedLocalIdx) * vocabSize;
                 float const* dProbs
-                    = draftProbs + (static_cast<uint64_t>(bx) * numDraftProbRows + draftProbRow) * vocabSize;
+                    = draftProbs + (static_cast<uint64_t>(bx) * numDraftProbRows + draftProbRow) * draftRowStride;
                 int32_t const* tProbIndices = nullptr;
                 uint32_t targetSupportSize = vocabSize;
                 if (hasCompactTargetSupport)
@@ -1521,73 +2150,13 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
                 }
                 else
                 {
-                    float threadDiffSum = 0.0f;
-                    for (uint32_t v = static_cast<uint32_t>(tid); v < targetSupportSize; v += BLOCK_SIZE)
+                    if constexpr (USE_LOGITS)
                     {
-                        float const diff = tProbs[v] - dProbs[v];
-                        if (diff > 0.0f)
-                        {
-                            threadDiffSum += diff;
-                        }
+                        sampleResidualLogitsFullVocab(tProbs, dProbs, siblingTargetStats, siblingDraftStats);
                     }
-
-                    float const diffSum = BlockReduce(tempStorage.reduce).Sum(threadDiffSum);
-                    if (tid == 0)
+                    else
                     {
-                        sDiffSum = diffSum;
-                        sPrefixBase = 0.0f;
-                        sWinnerIndex = static_cast<int32_t>(targetSupportSize);
-                        sSampledToken = static_cast<int64_t>(vocabSize) - 1;
-                        if (diffSum > 1e-10f)
-                        {
-                            sTargetMass = curand_uniform_open_right(state) * diffSum;
-                        }
-                        else
-                        {
-                            sSampledToken = sampleFromDistribution(state, tProbs, vocabSize);
-                        }
-                    }
-                    __syncthreads();
-
-                    if (sDiffSum > 1e-10f)
-                    {
-                        for (uint32_t tileStart = 0; tileStart < targetSupportSize; tileStart += BLOCK_SIZE)
-                        {
-                            float value = 0.0f;
-                            uint32_t const v = tileStart + static_cast<uint32_t>(tid);
-                            if (v < targetSupportSize)
-                            {
-                                float const diff = tProbs[v] - dProbs[v];
-                                value = diff > 0.0f ? diff : 0.0f;
-                            }
-
-                            float inclusive = 0.0f;
-                            float tileSum = 0.0f;
-                            BlockScan(tempStorage.scan).InclusiveSum(value, inclusive, tileSum);
-                            float const threshold = sTargetMass;
-                            float const prefixBase = sPrefixBase;
-
-                            if (value > 0.0f && prefixBase + inclusive >= threshold)
-                            {
-                                atomicMin(&sWinnerIndex, static_cast<int32_t>(v));
-                            }
-                            __syncthreads();
-
-                            if (tid == 0)
-                            {
-                                if (sWinnerIndex < static_cast<int32_t>(targetSupportSize))
-                                {
-                                    sSampledToken = static_cast<int64_t>(sWinnerIndex);
-                                }
-                                sPrefixBase += tileSum;
-                            }
-                            __syncthreads();
-
-                            if (sWinnerIndex < static_cast<int32_t>(targetSupportSize))
-                            {
-                                break;
-                            }
-                        }
+                        sampleResidualFullVocab(tProbs, dProbs);
                     }
 
                     if (tid == 0)
@@ -1606,24 +2175,34 @@ __global__ void verifyDynamicTreeRejectionKernel(int64_t* acceptIndex, int64_t* 
     {
         // Reached max speculative depth while continuing to accept the draft path.
         // Emit the final bonus token from the last accepted position.
-        if (tid == 0)
+        float const* tProbs
+            = targetProbs + (static_cast<uint64_t>(bx) * numDraftTokens + sLastAcceptedLocalIdx) * vocabSize;
+        if (hasCompactTargetSupport)
         {
-            float const* tProbs
-                = targetProbs + (static_cast<uint64_t>(bx) * numDraftTokens + sLastAcceptedLocalIdx) * vocabSize;
-            if (hasCompactTargetSupport)
+            if (tid == 0)
             {
                 uint32_t const supportOffset
                     = (static_cast<uint64_t>(bx) * numDraftTokens + sLastAcceptedLocalIdx) * maxTargetSupportSize;
                 uint32_t const supportSize
                     = static_cast<uint32_t>(targetSupportLengths[batchOffset + sLastAcceptedLocalIdx]);
-                acceptToken[bx * numSpeculativeTokens + sNumAcceptedTokens] = sampleFromIndexedDistribution(
+                sSampledToken = sampleFromIndexedDistribution(
                     state, tProbs, targetSupportIndices + supportOffset, supportSize, vocabSize);
+            }
+        }
+        else
+        {
+            if constexpr (USE_LOGITS)
+            {
+                sampleTargetLogitsFullVocab(tProbs);
             }
             else
             {
-                acceptToken[bx * numSpeculativeTokens + sNumAcceptedTokens]
-                    = sampleFromDistribution(state, tProbs, vocabSize);
+                sampleTargetFullVocab(tProbs);
             }
+        }
+        if (tid == 0)
+        {
+            acceptToken[bx * numSpeculativeTokens + sNumAcceptedTokens] = sSampledToken;
         }
     }
 
@@ -1640,14 +2219,15 @@ void invokeVerifyDynamicTreeRejection(int64_t* acceptIndex, int64_t* acceptToken
     SizeType32 maxTargetSupportSize, SizeType32 numDraftTokens, SizeType32 numSpecStep, SizeType32 vocabSize,
     int64_t const* seed, int64_t const* offset, cudaStream_t stream)
 {
-    constexpr int32_t kVerifyDynamicTreeRejectionBlockSize = 128;
+    constexpr int32_t kVerifyDynamicTreeRejectionBlockSize = 1024;
     dim3 grid(batchSize);
     dim3 block(kVerifyDynamicTreeRejectionBlockSize);
 
-    verifyDynamicTreeRejectionKernel<kVerifyDynamicTreeRejectionBlockSize><<<grid, block, 0, stream>>>(acceptIndex,
-        acceptTokenNum, acceptToken, candidates, draftProbs, targetProbs, targetSupportIndices, targetSupportLengths,
-        draftProbIndices, retrieveNextToken, retrieveNextSibling, treeValid, batchSize, numDraftProbRows,
-        maxTargetSupportSize, numSpecStep, numDraftTokens, vocabSize, seed, offset);
+    verifyDynamicTreeRejectionKernel<kVerifyDynamicTreeRejectionBlockSize, false><<<grid, block, 0, stream>>>(
+        acceptIndex, acceptTokenNum, acceptToken, candidates, draftProbs, targetProbs, targetSupportIndices,
+        targetSupportLengths, draftProbIndices, retrieveNextToken, retrieveNextSibling, treeValid, batchSize,
+        numDraftProbRows, maxTargetSupportSize, numSpecStep, numDraftTokens, vocabSize, vocabSize,
+        /*targetToDraft=*/nullptr, seed, offset, nullptr);
 
     sync_check_cuda_error(stream);
 }

@@ -814,6 +814,13 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 if not skip_top_p and spec_metadata.request_top_ps is not None:
                     top_ps = spec_metadata.request_top_ps[gen_slice]
 
+                skip_all_sampling_params = (
+                    skip_temperature
+                    and skip_top_k
+                    and skip_top_p
+                    and not getattr(spec_metadata, "has_greedy_requests", False)
+                )
+
                 # Lazily initialize seed/offset tensors on correct device
                 if self.seed is None:
                     self.seed = torch.tensor([0], dtype=torch.int64, device=device)
@@ -839,6 +846,7 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                         seed=self.seed,
                         offset=self.offset,
                         d2t=self._d2t,
+                        skip_all_sampling_params=skip_all_sampling_params,
                     )
                 )
 

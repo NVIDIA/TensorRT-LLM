@@ -257,6 +257,7 @@ class DynamicTreeOpsConverter:
         seed: int | torch.Tensor = 0,
         offset: int | torch.Tensor = 0,
         d2t: torch.Tensor | None = None,
+        skip_all_sampling_params: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Tree-aware rejection sampling from logits (three CUDA ops).
 
@@ -303,6 +304,7 @@ class DynamicTreeOpsConverter:
                 skip_temperature,
                 d2t=d2t,
                 top_k_max=top_k_max,
+                skip_all_sampling_params=skip_all_sampling_params,
             )
 
             (
@@ -317,6 +319,7 @@ class DynamicTreeOpsConverter:
                 top_p,
                 skip_temperature,
                 top_k_max=top_k_max,
+                skip_all_sampling_params=skip_all_sampling_params,
             )
 
             torch.ops.trtllm.verify_dynamic_tree_rejection_out_op(

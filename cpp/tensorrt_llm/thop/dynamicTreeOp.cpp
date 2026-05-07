@@ -35,10 +35,10 @@ void invokeBuildDraftProbIndices(int64_t const* topkScoreIndices, int32_t* draft
 th::Tensor computeDraftProbsForDynamicTreeRejection(th::Tensor const& draftLogits, th::Tensor const& temperatures,
     runtime::SizeType32 numDraftProbRows, th::optional<th::Tensor> const& topK, th::optional<th::Tensor> const& topP,
     runtime::SizeType32 targetVocabSize, bool skipTemperature, th::optional<th::Tensor> const& d2t,
-    runtime::SizeType32 kMax);
+    runtime::SizeType32 kMax, bool skipAllSamplingParams);
 std::tuple<th::Tensor, th::Tensor, th::Tensor> computeTargetProbsForDynamicTreeRejection(th::Tensor const& targetLogits,
     th::Tensor const& temperatures, runtime::SizeType32 numDraftTokens, th::optional<th::Tensor> const& topK,
-    th::optional<th::Tensor> const& topP, bool skipTemperature, runtime::SizeType32 kMax);
+    th::optional<th::Tensor> const& topP, bool skipTemperature, runtime::SizeType32 kMax, bool skipAllSamplingParams);
 } // namespace kernels::speculative_decoding
 
 namespace torch_ext
@@ -331,18 +331,18 @@ void verify_dynamic_tree_rejection_out_op(th::Tensor& candidates, th::Tensor& dr
 
 th::Tensor compute_draft_probs_for_dynamic_tree_rejection_op(th::Tensor draftLogits, th::Tensor temperatures,
     int64_t numDraftProbRows, int64_t targetVocabSize, th::optional<th::Tensor> topK, th::optional<th::Tensor> topP,
-    bool skipTemperature, th::optional<th::Tensor> d2t, int64_t topKMax)
+    bool skipTemperature, th::optional<th::Tensor> d2t, int64_t topKMax, bool skipAllSamplingParams)
 {
-    return tk::computeDraftProbsForDynamicTreeRejection(
-        draftLogits, temperatures, numDraftProbRows, topK, topP, targetVocabSize, skipTemperature, d2t, topKMax);
+    return tk::computeDraftProbsForDynamicTreeRejection(draftLogits, temperatures, numDraftProbRows, topK, topP,
+        targetVocabSize, skipTemperature, d2t, topKMax, skipAllSamplingParams);
 }
 
 std::tuple<th::Tensor, th::Tensor, th::Tensor> compute_target_probs_for_dynamic_tree_rejection_op(
     th::Tensor targetLogits, th::Tensor temperatures, int64_t numDraftTokens, th::optional<th::Tensor> topK,
-    th::optional<th::Tensor> topP, bool skipTemperature, int64_t topKMax)
+    th::optional<th::Tensor> topP, bool skipTemperature, int64_t topKMax, bool skipAllSamplingParams)
 {
     return tk::computeTargetProbsForDynamicTreeRejection(
-        targetLogits, temperatures, numDraftTokens, topK, topP, skipTemperature, topKMax);
+        targetLogits, temperatures, numDraftTokens, topK, topP, skipTemperature, topKMax, skipAllSamplingParams);
 }
 
 th::Tensor compute_probs_from_logits_op(th::Tensor logits, th::Tensor temperatures, th::optional<th::Tensor> topK,
@@ -452,7 +452,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "compute_draft_probs_for_dynamic_tree_rejection_op("
         "Tensor draftLogits, Tensor temperatures, int numDraftProbRows, int targetVocabSize, "
         "Tensor? top_k=None, Tensor? top_p=None, bool skip_temperature=False, Tensor? d2t=None, "
-        "int top_k_max=0) -> Tensor");
+        "int top_k_max=0, bool skip_all_sampling_params=False) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -466,8 +466,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "compute_target_probs_for_dynamic_tree_rejection_op("
         "Tensor targetLogits, Tensor temperatures, int numDraftTokens, "
-        "Tensor? top_k=None, Tensor? top_p=None, bool skip_temperature=False, int top_k_max=0) -> (Tensor, Tensor, "
-        "Tensor)");
+        "Tensor? top_k=None, Tensor? top_p=None, bool skip_temperature=False, int top_k_max=0, "
+        "bool skip_all_sampling_params=False) -> (Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

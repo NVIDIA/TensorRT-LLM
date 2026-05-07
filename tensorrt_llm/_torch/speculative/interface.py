@@ -448,6 +448,7 @@ class SpecMetadata:
     skip_temperature: bool = False
     skip_top_k: bool = False
     skip_top_p: bool = False
+    has_greedy_requests: bool = False
     # Sampling parameters indexed per request.
     request_temperatures: Optional[torch.Tensor] = None
     request_top_ks: Optional[torch.Tensor] = None
@@ -534,6 +535,7 @@ class SpecMetadata:
         request_top_ps = []
         top_k_enabled = False
         top_p_enabled = False
+        has_greedy_requests = False
         temperature_enabled = False
 
         # Need to use a very small value for temperature when disabled to avoid division by 0
@@ -551,7 +553,7 @@ class SpecMetadata:
             temperature: Optional[float],
             top_k: Optional[int],
             top_p: Optional[float],
-        ) -> tuple[float, int, float, bool, bool, bool]:
+        ) -> tuple[float, int, float, bool, bool, bool, bool]:
             """Convert request sampling params into normalized per-request scalars."""
             is_greedy = SamplingParams.params_imply_greedy_decoding(
                 temperature=temperature,
@@ -578,6 +580,7 @@ class SpecMetadata:
                 use_temperature,
                 use_top_k,
                 use_top_p,
+                is_greedy,
             )
 
         for request in requests:
@@ -596,6 +599,7 @@ class SpecMetadata:
                 use_temperature,
                 use_top_k,
                 use_top_p,
+                is_greedy,
             ) = _normalize_request_sampling_params(
                 temperature=temp_val,
                 top_k=tk_val,
@@ -605,6 +609,7 @@ class SpecMetadata:
             temperature_enabled |= use_temperature
             top_k_enabled |= use_top_k
             top_p_enabled |= use_top_p
+            has_greedy_requests |= is_greedy
 
             request_temperatures.append(temp_val)
             request_top_ks.append(tk_val)
@@ -667,6 +672,7 @@ class SpecMetadata:
         self.skip_temperature = not temperature_enabled
         self.skip_top_k = not top_k_enabled
         self.skip_top_p = not top_p_enabled
+        self.has_greedy_requests = has_greedy_requests
 
 
 class SpecWorkerBase(nn.Module, ABC):
@@ -1024,7 +1030,8 @@ class SpecWorkerBase(nn.Module, ABC):
 
         temperatures = spec_metadata.temperatures[:num_target_tokens]
         top_ks = spec_metadata.top_ks[:num_target_tokens]
-        top_ps = None if spec_metadata.skip_top_p else spec_metadata.top_ps[:num_target_tokens]
+        top_ps = None if spec_metadata.skip_top_p else spec_metadata.top_ps[:
+                                                                            num_target_tokens]
 
         target_probs_flat = compute_probs_from_logits(logits.clone(),
                                                       temperatures, top_ks,
@@ -1123,9 +1130,10 @@ class SpecWorkerBase(nn.Module, ABC):
             draft_top_ks = spec_metadata.request_top_ks[:batch_size].repeat_interleave(
                 draft_tokens_per_request
             ) if spec_metadata.request_top_ks is not None else None
-            draft_top_ps = (spec_metadata.request_top_ps[:batch_size].repeat_interleave(
-                draft_tokens_per_request) if not spec_metadata.skip_top_p
-                            and spec_metadata.request_top_ps is not None else None)
+            draft_top_ps = (
+                spec_metadata.request_top_ps[:batch_size].repeat_interleave(
+                    draft_tokens_per_request) if not spec_metadata.skip_top_p
+                and spec_metadata.request_top_ps is not None else None)
         else:
             draft_temps = torch.ones(num_draft_tokens, device=device)
             draft_top_ks = None
