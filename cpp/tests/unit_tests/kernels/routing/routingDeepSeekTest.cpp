@@ -423,39 +423,44 @@ TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelWithFloat32Bias)
 
     this->allocateBuffers(param);
 
-    // Override: allocate bias as float32 instead of T (bf16)
+    // Populate scores and the T-typed bias host/device buffers.
+    this->setupBuffers(param);
+
+    // Derive a fp32 bias whose values exactly equal the T-typed bias so that
+    // the GPU kernel (using fp32 bias) and the host reference (using T-typed bias)
+    // observe numerically equivalent inputs.
     auto float32BiasHost
         = this->mBufferManager->pinned(ITensor::makeShape({param.numExperts}), nvinfer1::DataType::kFLOAT);
     auto float32BiasDevice
         = this->mBufferManager->gpu(ITensor::makeShape({param.numExperts}), nvinfer1::DataType::kFLOAT);
-    auto biasPtr = bufferCast<float>(*float32BiasHost);
+    auto fp32BiasPtr = bufferCast<float>(*float32BiasHost);
+    auto tBiasPtr = bufferCast<TypeParam>(*this->mPtrRoutingBiasHost);
     for (int i = 0; i < param.numExperts; i++)
     {
-        biasPtr[i] = 0.01f * (i % 100);
+        fp32BiasPtr[i] = static_cast<float>(tBiasPtr[i]);
     }
     this->mBufferManager->copy(*float32BiasHost, *float32BiasDevice);
 
-    // Setup normal buffers (scores, etc.)
-    float* scoresHostPtr = bufferCast<float>(*this->mPtrScoresHost);
-    initData(scoresHostPtr, param.numTokens * param.numExperts, 42);
-    this->mBufferManager->copy(*this->mPtrScoresHost, *this->mPtrScoresDevice);
-    this->mStream->synchronize();
+    // Run host reference (uses T-typed bias in mPtrRoutingBiasHost).
+    this->callHostFunction(param);
 
-    // Setup routing data with float32 bias
+    // Setup routing data with float32 bias for the GPU kernel.
     moe::dev::routing::routingDeepSeek::Data routingData;
     this->setCommonParams(param, routingData);
     routingData.mDtypeOutput = btg::Dtype::Bfloat16;
     routingData.mPtrScores = bufferCast<float>(*this->mPtrScoresDevice);
     routingData.mPtrRoutingBias = bufferCast<float>(*float32BiasDevice);
-    routingData.mDtypeBias = btg::Dtype::Fp32; // Float32 bias with bf16 output
+    routingData.mDtypeBias = btg::Dtype::Fp32;
     routingData.mNumExpertGroups = param.nGroup;
     routingData.mNumLimitedGroups = param.topkGroup;
     routingData.mRouteScale = param.routedScalingFactor;
     routingData.mUseRoutingSoftmax = false;
 
-    // Run kernel — verifies it doesn't crash with float32 bias
     moe::dev::routing::routingDeepSeek::run(routingData, this->mStream->get());
     this->mStream->synchronize();
+
+    // Verify routed ids/weights against host reference.
+    this->verifyResult(param);
 };
 
 TYPED_TEST(RoutingDeepSeekKernelTest, CooperativeLevelParallelization)

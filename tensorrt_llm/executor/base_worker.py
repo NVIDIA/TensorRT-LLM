@@ -223,8 +223,12 @@ class BaseWorker(GenerationExecutor):
                 from tensorrt_llm._torch.pyexecutor.model_loader import \
                     _construct_checkpoint_loader
                 self.checkpoint_loader = _construct_checkpoint_loader(
-                    self.llm_args.backend, self.llm_args.checkpoint_loader,
-                    self.llm_args.checkpoint_format)
+                    self.llm_args.backend,
+                    self.llm_args.checkpoint_loader,
+                    self.llm_args.checkpoint_format,
+                    mx_config=self.llm_args.mx_config,
+                    mx_model_name=self.llm_args.model,
+                )
 
             self.max_seq_len = self.llm_args.max_seq_len
             # creare_py_executor may change some fields of llm_args
@@ -664,7 +668,15 @@ class BaseWorker(GenerationExecutor):
     def _stats_serializer(stats) -> str:
         iteration_stats, req_stats = stats[0], stats[1]
         kv_iter_stats = stats[2] if len(stats) > 2 else None
+
         stats_dict = json.loads(iteration_stats.to_json_str())
+        # Tag with dp_rank=0 so Dynamo's adapter can always read
+        # stat["attentionDpRank"] without a missing-key branch. Attention-DP
+        # per-rank emission is a follow-up; today FPM only flows under
+        # non-attention-DP.
+        # TODO(https://jirasw.nvidia.com/browse/TRTLLM-12123): implement
+        # per-rank IterationStats delivery under attention-DP.
+        stats_dict.setdefault("attentionDpRank", 0)
 
         if req_stats is not None and len(req_stats) > 0:
             stats_dict["requestStats"] = []

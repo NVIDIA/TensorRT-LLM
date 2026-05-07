@@ -155,7 +155,8 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         prompt_token_ids: List[int],
         num_mm_tokens_per_placeholder: List[int],
         hf_processor_mm_kwargs: Optional[Dict[str, Any]] = None,
-    ) -> List[int]:
+        **kwargs,
+    ) -> Tuple[List[int], Optional[Dict[str, Dict[str, Any]]]]:
         """
         Expands MM placeholder tokens in `prompt_token_ids` so that each single placeholder
         is replaced by the corresponding number of multimodal feature tokens.
@@ -174,12 +175,15 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                 to pass to the HuggingFace processor, if needed for token expansion.
 
         Returns:
-            List[int]: The prompt token IDs where each MM placeholder token has been
-                replaced/expanded with the appropriate number of MM feature tokens.
+            Tuple[List[int], Optional[Dict[str, Dict[str, Any]]]]:
+                `expanded_ids` (List[int]) — prompt token IDs with each MM placeholder expanded.
+                `mm_data_updates` (Optional[Dict]) — extra fields to merge into
+                `extra_processed_inputs["multimodal_data"]`. Always `None` for LLaVA-Next
+                (no auxiliary streams needed).
         """
         expanded, _, _ = self._expand_image_placeholders_in_token_ids(
             prompt_token_ids, num_mm_tokens_per_placeholder)
-        return expanded
+        return expanded, None
 
     def _postprocess(
         self, input_ids: torch.Tensor, mm_features: Union[torch.Tensor,

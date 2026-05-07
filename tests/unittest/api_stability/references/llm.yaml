@@ -99,7 +99,15 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      mx_config:
+        annotation: tensorrt_llm.llmapi.llm_args.ModelExpressConfig
+        default: null
+        status: prototype
       mm_encoder_only:
+        annotation: bool
+        default: False
+        status: prototype
+      encode_only:
         annotation: bool
         default: False
         status: prototype
@@ -263,6 +271,14 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      use_cute_dsl_bf16_bmm:
+        annotation: bool
+        default: False
+        status: prototype
+      use_cute_dsl_bf16_gemm:
+        annotation: bool
+        default: False
+        status: prototype
     return_annotation: None
   generate:
     parameters:
@@ -307,6 +323,20 @@ methods:
         default: 0.5
         status: prototype
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
+  encode:
+    parameters:
+      inputs:
+        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt,
+          Sequence[Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt]]]
+        default: inspect._empty
+      add_special_tokens:
+        annotation: bool
+        default: True
+      model_kwargs:
+        annotation: Any
+        default: inspect._empty
+    return_annotation: Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput]]
+    status: prototype
   preprocess:
     parameters:
       inputs:

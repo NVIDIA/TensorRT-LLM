@@ -1,7 +1,6 @@
 """Main entrypoint to build, test, and prompt AutoDeploy inference models."""
 
 import json
-import sys
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Union
 
@@ -139,6 +138,16 @@ class ExperimentConfig(DynamicYamlMixInForSettings, BaseSettings):
     ### BENCHMARKING CONFIG ########################################################################
     benchmark: BenchmarkConfig = Field(default_factory=BenchmarkConfig)
 
+    ### MODEL REGISTRY CONFIG ####################################################################
+    use_registry: CliImplicitFlag[bool] = Field(
+        default=False,
+        description="Resolve args.yaml_extra from examples/auto_deploy/model_registry/models.yaml for --model.",
+    )
+    registry_config_id: Optional[str] = Field(
+        default=None,
+        description="Optional config_id selector used with --use-registry when a model has multiple registry entries.",
+    )
+
     ### CONFIG DEBUG FLAG ##########################################################################
     dry_run: CliImplicitFlag[bool] = Field(default=False, description="Show final config and exit")
 
@@ -186,7 +195,47 @@ class ExperimentConfig(DynamicYamlMixInForSettings, BaseSettings):
             # ensure kebab-case is converted to snake_case
             dotlist.append(f"{body.replace('-', '_')}={val}")
 
-        return deep_merge_dicts(data, OmegaConf.from_dotlist(dotlist))
+        # Merge unknown dotted CLI overrides (captured in extra_cli_args)
+        # into the config before nested pydantic models validate.
+        data = deep_merge_dicts(data, OmegaConf.from_dotlist(dotlist))
+
+        # Resolve registry configs before nested LlmArgs validation runs.
+        if data.get("use_registry", False):
+            model_name = data.get("model") or data.get("args", {}).get("model")
+            if not model_name:
+                raise ValueError("--use-registry requires --model or --args.model to be specified.")
+
+            config_id = data.get("registry_config_id")
+            registry_yaml_extra = get_registry_yaml_extra(model_name, config_id)
+
+            data.setdefault("args", {})
+            existing_yaml_extra = list(data["args"].get("yaml_extra", []) or [])
+            # Registry defaults go first so explicit user --args.yaml-extra can override.
+            data["args"]["yaml_extra"] = [*registry_yaml_extra, *existing_yaml_extra]
+
+            merged_cfg = _merge_yaml_files(data["args"]["yaml_extra"])
+            merged_max_batch_size = merged_cfg.get("max_batch_size")
+            merged_cg_cfg = merged_cfg.get("cuda_graph_config")
+            merged_cg_max = (
+                merged_cg_cfg.get("max_batch_size") if isinstance(merged_cg_cfg, dict) else None
+            )
+
+            explicit_cg_cfg = data["args"].get("cuda_graph_config")
+            explicit_cg_max = (
+                explicit_cg_cfg.get("max_batch_size") if isinstance(explicit_cg_cfg, dict) else None
+            )
+
+            # If registry sets a smaller top-level max_batch_size without an explicit
+            # cuda_graph max, synchronize to avoid LlmArgs validation failures.
+            if (
+                explicit_cg_max is None
+                and isinstance(merged_max_batch_size, int)
+                and (merged_cg_max is None or merged_cg_max > merged_max_batch_size)
+            ):
+                data["args"].setdefault("cuda_graph_config", {})
+                data["args"]["cuda_graph_config"]["max_batch_size"] = merged_max_batch_size
+
+        return data
 
     @field_validator("model", mode="after")
     @classmethod
@@ -207,7 +256,7 @@ class ExperimentConfig(DynamicYamlMixInForSettings, BaseSettings):
         return prompt
 
 
-def get_registry_yaml_extra(model_name: str) -> List[str]:
+def get_registry_yaml_extra(model_name: str, config_id: Optional[str] = None) -> List[str]:
     """Look up a model in the registry and return its resolved yaml_extra config paths.
 
     Args:
@@ -217,19 +266,53 @@ def get_registry_yaml_extra(model_name: str) -> List[str]:
         List of absolute paths to the yaml config files for the model.
 
     Raises:
-        KeyError: If the model is not found in the registry.
+        KeyError: If the model/config is not found or is ambiguous without ``config_id``.
     """
     with open(_REGISTRY_YAML) as f:
         registry = yaml.safe_load(f)
 
-    for entry in registry.get("models", []):
-        if entry["name"] == model_name:
-            return [str(_REGISTRY_CONFIGS_DIR / cfg) for cfg in entry.get("yaml_extra", [])]
+    matches = [entry for entry in registry.get("models", []) if entry.get("name") == model_name]
 
-    raise KeyError(
-        f"Model '{model_name}' not found in the AutoDeploy model registry ({_REGISTRY_YAML}). "
-        "Either add it to the registry or provide --yaml-extra directly."
-    )
+    if config_id is not None:
+        matches = [entry for entry in matches if entry.get("config_id", "default") == config_id]
+        if not matches:
+            raise KeyError(
+                f"Model '{model_name}' with config_id '{config_id}' not found in AutoDeploy model registry "
+                f"({_REGISTRY_YAML})."
+            )
+    elif len(matches) > 1:
+        default_matches = [
+            entry for entry in matches if entry.get("config_id", "default") == "default"
+        ]
+        if len(default_matches) == 1:
+            matches = default_matches
+        else:
+            available = sorted({entry.get("config_id", "default") for entry in matches})
+            raise KeyError(
+                f"Model '{model_name}' has multiple registry entries with config_id values {available}. "
+                "Provide --registry-config-id to select one."
+            )
+
+    if not matches:
+        raise KeyError(
+            f"Model '{model_name}' not found in the AutoDeploy model registry ({_REGISTRY_YAML}). "
+            "Either add it to the registry or provide --yaml-extra directly."
+        )
+
+    selected = matches[0]
+    return [str(_REGISTRY_CONFIGS_DIR / cfg) for cfg in selected.get("yaml_extra", [])]
+
+
+def _merge_yaml_files(yaml_paths: List[str]) -> Dict[str, Any]:
+    """Load and deep-merge YAML files in order."""
+    merged: Dict[str, Any] = {}
+    for yaml_path in yaml_paths:
+        with open(yaml_path) as f:
+            data = yaml.safe_load(f) or {}
+        if not isinstance(data, dict):
+            continue
+        merged = deep_merge_dicts(merged, data)
+    return merged
 
 
 def build_llm_from_config(config: ExperimentConfig) -> LLM:
@@ -284,46 +367,10 @@ def print_outputs(outs: Union[RequestOutput, List[RequestOutput]]) -> List[List[
     return prompts_and_outputs
 
 
-def _inject_registry_yaml_extra() -> None:
-    """If ``--use-registry`` is in sys.argv, replace it with the resolved ``--yaml-extra`` entries.
-
-    This allows callers to simply run::
-
-        python build_and_run_ad.py --model <hf_model_id> --use-registry
-
-    instead of manually specifying every ``--yaml-extra`` path.  The flag is consumed here and the
-    resolved paths are injected back into ``sys.argv`` before pydantic-settings parses them.
-    """
-    if "--use-registry" not in sys.argv:
-        return
-
-    # Extract model name from argv (support both --model=X and --model X forms)
-    model_name: Optional[str] = None
-    for i, arg in enumerate(sys.argv):
-        if arg.startswith("--model="):
-            model_name = arg.split("=", 1)[1]
-            break
-        if arg == "--model" and i + 1 < len(sys.argv):
-            model_name = sys.argv[i + 1]
-            break
-
-    if model_name is None:
-        raise ValueError("--use-registry requires --model to be specified.")
-
-    yaml_extra_paths = get_registry_yaml_extra(model_name)
-
-    # Remove --use-registry and inject --yaml-extra <path0> --yaml-extra <path1> ...
-    # Each path needs its own flag because pydantic-settings CLI only captures one value per flag.
-    argv = [a for a in sys.argv if a != "--use-registry"]
-    for path in yaml_extra_paths:
-        argv += ["--args.yaml-extra", path]
-    sys.argv = argv
-
-
 def main(config: Optional[ExperimentConfig] = None):
     if config is None:
-        _inject_registry_yaml_extra()
         config: ExperimentConfig = CliApp.run(ExperimentConfig)
+
     ad_logger.info(f"AutoDeploy Experiment Config:\n{yaml.dump(config.model_dump())}")
 
     if config.dry_run:

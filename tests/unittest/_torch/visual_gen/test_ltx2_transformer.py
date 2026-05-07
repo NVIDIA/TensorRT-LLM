@@ -175,19 +175,27 @@ class TestLTX2VideoOnlyModel(unittest.TestCase):
         caption_channels = VIDEO_ONLY_CONFIG["caption_channels"]
         text_len = 8
 
+        v_context = (
+            torch.randn(batch, text_len, caption_channels, device=self.DEVICE, dtype=dtype) * 0.02
+        )
+        v_positions = _make_video_positions(batch, n_patches, n_frames, grid_h, grid_w, self.DEVICE)
+
         video_modality = Modality(
             latent=torch.randn(batch, n_patches, in_channels, device=self.DEVICE, dtype=dtype)
             * 0.02,
             timesteps=torch.tensor([0.5], device=self.DEVICE),
-            positions=_make_video_positions(
-                batch, n_patches, n_frames, grid_h, grid_w, self.DEVICE
-            ),
-            context=torch.randn(batch, text_len, caption_channels, device=self.DEVICE, dtype=dtype)
-            * 0.02,
+            positions=v_positions,
+            context=v_context,
+        )
+
+        text_cache = model.prepare_text_cache(
+            video_context=v_context,
+            video_positions=v_positions,
+            dtype=dtype,
         )
 
         with torch.no_grad():
-            video_out, audio_out = model(video=video_modality, audio=None)
+            video_out, audio_out = model(video=video_modality, audio=None, text_cache=text_cache)
 
         self.assertIsNotNone(video_out)
         self.assertIsNone(audio_out)
@@ -270,13 +278,21 @@ class TestLTX2AudioVideoModel(unittest.TestCase):
         caption_channels = AUDIO_VIDEO_CONFIG["caption_channels"]
         text_len = 8
 
+        v_context = (
+            torch.randn(batch, text_len, caption_channels, device=self.DEVICE, dtype=dtype) * 0.02
+        )
+        a_context = (
+            torch.randn(batch, text_len, caption_channels, device=self.DEVICE, dtype=dtype) * 0.02
+        )
+        v_positions = _make_video_positions(batch, v_patches, v_frames, v_h, v_w, self.DEVICE)
+        a_positions = _make_audio_positions(batch, a_patches, self.DEVICE)
+
         video_modality = Modality(
             latent=torch.randn(batch, v_patches, in_channels, device=self.DEVICE, dtype=dtype)
             * 0.02,
             timesteps=torch.tensor([0.5], device=self.DEVICE),
-            positions=_make_video_positions(batch, v_patches, v_frames, v_h, v_w, self.DEVICE),
-            context=torch.randn(batch, text_len, caption_channels, device=self.DEVICE, dtype=dtype)
-            * 0.02,
+            positions=v_positions,
+            context=v_context,
         )
 
         audio_in_channels = AUDIO_VIDEO_CONFIG["audio_in_channels"]
@@ -284,13 +300,22 @@ class TestLTX2AudioVideoModel(unittest.TestCase):
             latent=torch.randn(batch, a_patches, audio_in_channels, device=self.DEVICE, dtype=dtype)
             * 0.02,
             timesteps=torch.tensor([0.5], device=self.DEVICE),
-            positions=_make_audio_positions(batch, a_patches, self.DEVICE),
-            context=torch.randn(batch, text_len, caption_channels, device=self.DEVICE, dtype=dtype)
-            * 0.02,
+            positions=a_positions,
+            context=a_context,
+        )
+
+        text_cache = model.prepare_text_cache(
+            video_context=v_context,
+            video_positions=v_positions,
+            audio_context=a_context,
+            audio_positions=a_positions,
+            dtype=dtype,
         )
 
         with torch.no_grad():
-            video_out, audio_out = model(video=video_modality, audio=audio_modality)
+            video_out, audio_out = model(
+                video=video_modality, audio=audio_modality, text_cache=text_cache
+            )
 
         self.assertIsNotNone(video_out)
         self.assertIsNotNone(audio_out)
@@ -334,17 +359,27 @@ class TestLTX2AudioVideoModel(unittest.TestCase):
         caption_channels = AUDIO_VIDEO_CONFIG["caption_channels"]
         text_len = 8
 
+        v_context = (
+            torch.randn(batch, text_len, caption_channels, device=self.DEVICE, dtype=dtype) * 0.02
+        )
+        v_positions = _make_video_positions(batch, v_patches, v_frames, v_h, v_w, self.DEVICE)
+
         video_modality = Modality(
             latent=torch.randn(batch, v_patches, in_channels, device=self.DEVICE, dtype=dtype)
             * 0.02,
             timesteps=torch.tensor([0.5], device=self.DEVICE),
-            positions=_make_video_positions(batch, v_patches, v_frames, v_h, v_w, self.DEVICE),
-            context=torch.randn(batch, text_len, caption_channels, device=self.DEVICE, dtype=dtype)
-            * 0.02,
+            positions=v_positions,
+            context=v_context,
+        )
+
+        text_cache = model.prepare_text_cache(
+            video_context=v_context,
+            video_positions=v_positions,
+            dtype=dtype,
         )
 
         with torch.no_grad():
-            video_out, audio_out = model(video=video_modality, audio=None)
+            video_out, audio_out = model(video=video_modality, audio=None, text_cache=text_cache)
 
         self.assertIsNotNone(video_out)
         self.assertIsNone(audio_out)
@@ -592,8 +627,17 @@ class TestLTX2CUDAGraphCapture(unittest.TestCase):
         # 1. Eager forward — baseline
         torch.manual_seed(100)
         video_mod, audio_mod = _make_modalities(0.5)
+        text_cache = model.prepare_text_cache(
+            video_context=video_mod.context,
+            video_context_mask=video_mod.context_mask,
+            video_positions=video_mod.positions,
+            audio_context=audio_mod.context,
+            audio_context_mask=audio_mod.context_mask,
+            audio_positions=audio_mod.positions,
+            dtype=dtype,
+        )
         with torch.no_grad():
-            eager_v, eager_a = model(video=video_mod, audio=audio_mod)
+            eager_v, eager_a = model(video=video_mod, audio=audio_mod, text_cache=text_cache)
         eager_v = eager_v.clone()
         eager_a = eager_a.clone()
 
@@ -606,7 +650,7 @@ class TestLTX2CUDAGraphCapture(unittest.TestCase):
         torch.manual_seed(100)
         video_mod, audio_mod = _make_modalities(0.5)
         with torch.no_grad():
-            graph_v1, graph_a1 = model(video=video_mod, audio=audio_mod)
+            graph_v1, graph_a1 = model(video=video_mod, audio=audio_mod, text_cache=text_cache)
 
         self.assertTrue(
             torch.equal(eager_v, graph_v1),
@@ -621,10 +665,10 @@ class TestLTX2CUDAGraphCapture(unittest.TestCase):
         torch.manual_seed(200)
         video_mod2, audio_mod2 = _make_modalities(0.3)
 
-        # Eager baseline for new inputs
+        # Eager baseline for new inputs (same static — context/PE don't change)
         model.forward = original_forward
         with torch.no_grad():
-            eager_v2, eager_a2 = model(video=video_mod2, audio=audio_mod2)
+            eager_v2, eager_a2 = model(video=video_mod2, audio=audio_mod2, text_cache=text_cache)
         eager_v2 = eager_v2.clone()
         eager_a2 = eager_a2.clone()
 
@@ -633,7 +677,7 @@ class TestLTX2CUDAGraphCapture(unittest.TestCase):
         torch.manual_seed(200)
         video_mod2, audio_mod2 = _make_modalities(0.3)
         with torch.no_grad():
-            graph_v2, graph_a2 = model(video=video_mod2, audio=audio_mod2)
+            graph_v2, graph_a2 = model(video=video_mod2, audio=audio_mod2, text_cache=text_cache)
 
         self.assertTrue(
             torch.equal(eager_v2, graph_v2),
@@ -642,6 +686,224 @@ class TestLTX2CUDAGraphCapture(unittest.TestCase):
         self.assertTrue(
             torch.equal(eager_a2, graph_a2),
             f"Replay audio output differs from eager. Max diff: {(eager_a2 - graph_a2).abs().max():.6e}",
+        )
+
+
+class TestLTX2TextCache(unittest.TestCase):
+    """Test TextCache: correctness, different context, reuse across steps."""
+
+    DEVICE = "cuda"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_text_cache(self):
+        """TextCache correctness tests.
+
+        1. Same inputs + same cache → deterministic (bitwise identical).
+        2. Different context → different text_cache → different output.
+        3. Reusing text_cache across steps produces correct results.
+        """
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.modality import Modality
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import (
+            LTXModel,
+            LTXModelType,
+        )
+
+        torch.manual_seed(42)
+        dtype = torch.bfloat16
+        model_config = _create_model_config()
+        model = (
+            LTXModel(
+                model_type=LTXModelType.AudioVideo, model_config=model_config, **AUDIO_VIDEO_CONFIG
+            )
+            .to(self.DEVICE, dtype=dtype)
+            .eval()
+        )
+        _init_all_weights(model)
+
+        batch, v_frames, v_h, v_w = 1, 1, 4, 4
+        v_patches, a_patches, text_len = v_frames * v_h * v_w, 8, 8
+        in_ch = AUDIO_VIDEO_CONFIG["in_channels"]
+        a_in_ch = AUDIO_VIDEO_CONFIG["audio_in_channels"]
+        cap_ch = AUDIO_VIDEO_CONFIG["caption_channels"]
+        v_ctx_A = torch.randn(batch, text_len, cap_ch, device=self.DEVICE, dtype=dtype) * 0.02
+        a_ctx_A = torch.randn(batch, text_len, cap_ch, device=self.DEVICE, dtype=dtype) * 0.02
+        v_ctx_B = torch.randn(batch, text_len, cap_ch, device=self.DEVICE, dtype=dtype) * 0.02
+        a_ctx_B = torch.randn(batch, text_len, cap_ch, device=self.DEVICE, dtype=dtype) * 0.02
+        v_pos = _make_video_positions(batch, v_patches, v_frames, v_h, v_w, self.DEVICE)
+        a_pos = _make_audio_positions(batch, a_patches, self.DEVICE)
+
+        def make_mods(ts, v_ctx, a_ctx):
+            return (
+                Modality(
+                    latent=torch.randn(batch, v_patches, in_ch, device=self.DEVICE, dtype=dtype)
+                    * 0.02,
+                    timesteps=torch.tensor([ts], device=self.DEVICE),
+                    positions=v_pos,
+                    context=v_ctx,
+                ),
+                Modality(
+                    latent=torch.randn(batch, a_patches, a_in_ch, device=self.DEVICE, dtype=dtype)
+                    * 0.02,
+                    timesteps=torch.tensor([ts], device=self.DEVICE),
+                    positions=a_pos,
+                    context=a_ctx,
+                ),
+            )
+
+        static_A = model.prepare_text_cache(
+            video_context=v_ctx_A,
+            video_positions=v_pos,
+            audio_context=a_ctx_A,
+            audio_positions=a_pos,
+            dtype=dtype,
+        )
+
+        with torch.no_grad():
+            # -- Part 1: deterministic — same inputs + same cache → same output --
+            torch.manual_seed(200)
+            v_mod, a_mod = make_mods(0.5, v_ctx_A, a_ctx_A)
+            v_out1, a_out1 = model(video=v_mod, audio=a_mod, text_cache=static_A)
+
+            torch.manual_seed(200)
+            v_mod, a_mod = make_mods(0.5, v_ctx_A, a_ctx_A)
+            v_out2, a_out2 = model(video=v_mod, audio=a_mod, text_cache=static_A)
+
+        self.assertTrue(
+            torch.equal(v_out1, v_out2),
+            f"Video diff: {(v_out1 - v_out2).abs().max():.6e}",
+        )
+        self.assertTrue(
+            torch.equal(a_out1, a_out2),
+            f"Audio diff: {(a_out1 - a_out2).abs().max():.6e}",
+        )
+
+        with torch.no_grad():
+            # -- Part 2: different context → different output --
+            torch.manual_seed(200)
+            v_mod_B, a_mod_B = make_mods(0.5, v_ctx_B, a_ctx_B)
+            static_B = model.prepare_text_cache(
+                video_context=v_ctx_B,
+                video_positions=v_pos,
+                audio_context=a_ctx_B,
+                audio_positions=a_pos,
+                dtype=dtype,
+            )
+            v_B, _ = model(video=v_mod_B, audio=a_mod_B, text_cache=static_B)
+
+        self.assertFalse(torch.equal(v_out1, v_B), "Different context must differ")
+
+        with torch.no_grad():
+            # -- Part 3: reuse static across steps --
+            torch.manual_seed(300)
+            v_mod1, a_mod1 = make_mods(0.8, v_ctx_A, a_ctx_A)
+            v_step1, _ = model(video=v_mod1, audio=a_mod1, text_cache=static_A)
+
+            torch.manual_seed(400)
+            v_mod2, a_mod2 = make_mods(0.5, v_ctx_A, a_ctx_A)
+            v_step2, _ = model(video=v_mod2, audio=a_mod2, text_cache=static_A)
+
+        # Different timestep/latent → different output
+        self.assertFalse(torch.equal(v_step1, v_step2), "Steps should differ")
+
+
+class TestLTX2CacheDiTWrapperPassthrough(unittest.TestCase):
+    """Pattern_0 wrapper path must be bitwise-equivalent to direct block path
+    when Cache-DiT skips are disabled. Validates text_kv_* kwargs forwarding
+    and TransformerArgs reassembly in the merged Cache-DiT / TextCache loop.
+    """
+
+    DEVICE = "cuda"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_wrapper_path_matches_direct_path(self):
+        import torch.nn as nn
+
+        from tensorrt_llm._torch.visual_gen.models.ltx2.ltx2_core.modality import Modality
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import (
+            LTX2CacheDiTPattern0BlockWrapper,
+            LTXModel,
+            LTXModelType,
+        )
+
+        torch.manual_seed(7)
+        dtype = torch.bfloat16
+        model_config = _create_model_config()
+        model = (
+            LTXModel(
+                model_type=LTXModelType.AudioVideo, model_config=model_config, **AUDIO_VIDEO_CONFIG
+            )
+            .to(self.DEVICE, dtype=dtype)
+            .eval()
+        )
+        _init_all_weights(model)
+
+        batch, v_frames, v_h, v_w = 1, 1, 4, 4
+        v_patches, a_patches, text_len = v_frames * v_h * v_w, 8, 8
+        in_ch = AUDIO_VIDEO_CONFIG["in_channels"]
+        a_in_ch = AUDIO_VIDEO_CONFIG["audio_in_channels"]
+        cap_ch = AUDIO_VIDEO_CONFIG["caption_channels"]
+
+        v_ctx = torch.randn(batch, text_len, cap_ch, device=self.DEVICE, dtype=dtype) * 0.02
+        a_ctx = torch.randn(batch, text_len, cap_ch, device=self.DEVICE, dtype=dtype) * 0.02
+        v_pos = _make_video_positions(batch, v_patches, v_frames, v_h, v_w, self.DEVICE)
+        a_pos = _make_audio_positions(batch, a_patches, self.DEVICE)
+
+        def make_mods():
+            torch.manual_seed(99)
+            return (
+                Modality(
+                    latent=torch.randn(batch, v_patches, in_ch, device=self.DEVICE, dtype=dtype)
+                    * 0.02,
+                    timesteps=torch.tensor([0.5], device=self.DEVICE),
+                    positions=v_pos,
+                    context=v_ctx,
+                ),
+                Modality(
+                    latent=torch.randn(batch, a_patches, a_in_ch, device=self.DEVICE, dtype=dtype)
+                    * 0.02,
+                    timesteps=torch.tensor([0.5], device=self.DEVICE),
+                    positions=a_pos,
+                    context=a_ctx,
+                ),
+            )
+
+        static = model.prepare_text_cache(
+            video_context=v_ctx,
+            video_positions=v_pos,
+            audio_context=a_ctx,
+            audio_positions=a_pos,
+            dtype=dtype,
+        )
+
+        # Baseline: direct path (no wrappers)
+        with torch.no_grad():
+            v_mod, a_mod = make_mods()
+            v_direct, a_direct = model(video=v_mod, audio=a_mod, text_cache=static)
+        v_direct = v_direct.clone()
+        a_direct = a_direct.clone()
+
+        # Wrap blocks with Pattern_0 wrapper and force cache-dit path.
+        # Wrapper only re-routes arg shape; with no cache skip it must match direct.
+        original_blocks = list(model.transformer_blocks)
+        wrapped = [LTX2CacheDiTPattern0BlockWrapper(b, parent=model) for b in original_blocks]
+        model.transformer_blocks = nn.ModuleList(wrapped)
+        model._uses_cache_dit = lambda: True  # type: ignore[method-assign]
+
+        try:
+            with torch.no_grad():
+                v_mod, a_mod = make_mods()
+                v_wrap, a_wrap = model(video=v_mod, audio=a_mod, text_cache=static)
+        finally:
+            model.transformer_blocks = nn.ModuleList(original_blocks)
+            del model._uses_cache_dit
+
+        self.assertTrue(
+            torch.equal(v_direct, v_wrap),
+            f"Video differs. Max abs diff: {(v_direct - v_wrap).abs().max():.6e}",
+        )
+        self.assertTrue(
+            torch.equal(a_direct, a_wrap),
+            f"Audio differs. Max abs diff: {(a_direct - a_wrap).abs().max():.6e}",
         )
 
 

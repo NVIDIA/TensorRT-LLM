@@ -302,6 +302,71 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize_with_reorder_residual(
     }
     return std::make_tuple(QX, SFX);
 }
+
+// X: [M, KQ], bf16 or fp8
+// input_scale: [1], float32
+// KE: int, residual dimension, grouped by 16 and interleaved with last KQ dimensions.
+// is_act: bool, if true, quantize the activation with residual,
+// otherwise quantize the weight with duplication.
+// Same as fp4_quantize_with_reorder_residual but without channel reordering.
+// Uses the quantize_with_block_size loop pattern (grid-stride rows, block-stride columns).
+std::tuple<at::Tensor, at::Tensor> fp4_quantize_with_residual(
+    at::Tensor const& X, at::Tensor const& input_scale, int64_t KE, bool is_act)
+{
+    CHECK_TH_CUDA(X);
+    CHECK_CONTIGUOUS(X);
+    TORCH_CHECK(X.dtype() == at::ScalarType::BFloat16 || X.dtype() == at::ScalarType::Float8_e4m3fn,
+        "X must be a bf16 or fp8 tensor");
+    TORCH_CHECK(input_scale.dtype() == at::ScalarType::Float, "input_scale must be a float32 tensor");
+    int const M = X.size(0);
+    int const KQ = X.size(1);
+    TORCH_CHECK(KE % 16 == 0, "KE must be divisible by 16");
+    TORCH_CHECK(KE <= KQ, "KE must be less than or equal to KQ");
+    TORCH_CHECK(KQ % 16 == 0, "KQ must be divisible by 16");
+
+    int const K = KQ + KE;
+    TORCH_CHECK(K % 64 == 0, "(KQ + KE) must be divisible by 64 for swizzled SF layout alignment");
+    auto QX = at::detail::empty_cuda({M, K / 2}, FLOAT4_E2M1X2, X.device(), std::nullopt);
+
+    int64_t SFSize = tensorrt_llm::computeSwizzledLayoutSFSize(M, K / 16);
+    auto SFX = at::detail::empty_cuda({SFSize}, SF_DTYPE, X.device(), std::nullopt);
+
+    auto ptr_X = X.data_ptr();
+    auto ptr_Xscale = reinterpret_cast<float*>(input_scale.data_ptr());
+    auto ptr_QX = reinterpret_cast<uint8_t*>(QX.data_ptr());
+    auto ptr_SFX = reinterpret_cast<uint8_t*>(SFX.data_ptr());
+
+    if (X.dtype() == at::ScalarType::BFloat16)
+    {
+        if (is_act)
+        {
+            tensorrt_llm::kernels::run_nvfp4_quantize_residual_with_block_size<__nv_bfloat16, 16,
+                tensorrt_llm::kernels::ArcQuantType::ACT>(reinterpret_cast<int16_t*>(ptr_X), ptr_Xscale, ptr_QX,
+                ptr_SFX, M, KQ, KE, at::cuda::getCurrentCUDAStream(X.get_device()));
+        }
+        else
+        {
+            tensorrt_llm::kernels::run_nvfp4_quantize_residual_with_block_size<__nv_bfloat16, 16,
+                tensorrt_llm::kernels::ArcQuantType::WEIGHT>(reinterpret_cast<int16_t*>(ptr_X), ptr_Xscale, ptr_QX,
+                ptr_SFX, M, KQ, KE, at::cuda::getCurrentCUDAStream(X.get_device()));
+        }
+    }
+    else if (X.dtype() == at::ScalarType::Float8_e4m3fn)
+    {
+        if (is_act)
+        {
+            tensorrt_llm::kernels::run_nvfp4_quantize_residual_with_block_size<__nv_fp8_e4m3, 16,
+                tensorrt_llm::kernels::ArcQuantType::ACT>(reinterpret_cast<int16_t*>(ptr_X), ptr_Xscale, ptr_QX,
+                ptr_SFX, M, KQ, KE, at::cuda::getCurrentCUDAStream(X.get_device()));
+        }
+        else
+        {
+            C10_THROW_ERROR(NotImplementedError, "FP8 quantization for weights is not supported yet.");
+        }
+    }
+    return std::make_tuple(QX, SFX);
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -315,6 +380,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "fp4_quantize_with_reorder_residual(Tensor X, Tensor input_scale, Tensor reorder_index, int KE, bool is_act) "
         "-> (Tensor, Tensor)");
+    m.def("fp4_quantize_with_residual(Tensor X, Tensor input_scale, int KE, bool is_act) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -322,4 +388,5 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("fp4_quantize", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize));
     m.impl("calculate_nvfp4_global_scale", TORCH_FN(tensorrt_llm::torch_ext::calculate_nvfp4_global_scale));
     m.impl("fp4_quantize_with_reorder_residual", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize_with_reorder_residual));
+    m.impl("fp4_quantize_with_residual", TORCH_FN(tensorrt_llm::torch_ext::fp4_quantize_with_residual));
 }

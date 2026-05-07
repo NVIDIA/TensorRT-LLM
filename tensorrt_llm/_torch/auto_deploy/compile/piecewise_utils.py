@@ -34,6 +34,7 @@ _CACHED_ATTENTION_OPS = [
     "auto_deploy::flashinfer_mla_with_cache",
     "auto_deploy::flashinfer_trtllm_mla_with_cache",
     "auto_deploy::torch_cached_mla_with_cache",
+    "auto_deploy::trtllm_mla_with_cache",
 ]
 
 # Cached SSM ops (Python-level branching on batch_info_host)
@@ -75,6 +76,7 @@ _LOGITS_GATHER_OPS = [
 # DynamicOpWrapper (no fresh allocation, returns persistent buffer directly).
 _PERSISTENT_BUFFER_OPS = [
     "auto_deploy::trtllm_attention_prepare_metadata",
+    "auto_deploy::trtllm_mla_prepare_metadata",
 ]
 
 # Inplace dynamic ops: these ops mutate their input tensor and return None,

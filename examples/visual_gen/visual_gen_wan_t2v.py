@@ -47,26 +47,35 @@ def parse_args():
     )
 
     # Generation Params
-    parser.add_argument("--height", type=int, default=720, help="Video height")
-    parser.add_argument("--width", type=int, default=1280, help="Video width")
-    parser.add_argument("--num_frames", type=int, default=81, help="Number of frames to generate")
+    parser.add_argument(
+        "--height", type=int, default=None, help="Video height (default: auto-detect)"
+    )
+    parser.add_argument(
+        "--width", type=int, default=None, help="Video width (default: auto-detect)"
+    )
+    parser.add_argument(
+        "--num_frames",
+        type=int,
+        default=None,
+        help="Number of frames to generate (default: auto-detect)",
+    )
     parser.add_argument(
         "--steps",
         type=int,
         default=None,
-        help="Number of denoising steps (default: auto-detect, 50 for Wan2.1, 40 for Wan2.2)",
+        help="Number of denoising steps (default: auto-detect, 50 for Wan2.1 and Wan 2.2 5B, 40 for Wan2.2 A14B)",
     )
     parser.add_argument(
         "--guidance_scale",
         type=float,
         default=None,
-        help="Guidance scale (default: auto-detect, 5.0 for Wan2.1, 4.0 for Wan2.2)",
+        help="Guidance scale (default: auto-detect, 5.0 for Wan2.1 and Wan 2.2 5B, 4.0 for Wan2.2 A14B)",
     )
     parser.add_argument(
         "--guidance_scale_2",
         type=float,
         default=None,
-        help="Second-stage guidance scale for Wan2.2 two-stage denoising (default: 3.0)",
+        help="Second-stage guidance scale for Wan2.2 A14B two-stage denoising (default: 3.0)",
     )
     parser.add_argument(
         "--boundary_ratio",
@@ -197,11 +206,28 @@ def parse_args():
         "--ulysses_size",
         type=int,
         default=1,
-        help="Ulysses sequence parallel size within each CFG group. "
-        "Distributes sequence across GPUs for longer sequences. "
-        "Requirements: num_heads (12) and sequence length must both be divisible by ulysses_size. "
+        help="Ulysses (head-sharding) parallel size within each CFG group. "
+        "Requirements: num_heads (12) must be divisible by ulysses_size. "
         "Example: ulysses_size=2 on 4 GPUs with cfg_size=2 -> "
-        "2 CFG groups × 2 Ulysses ranks = 4 GPUs total.",
+        "2 CFG groups x 2 Ulysses ranks = 4 GPUs total. "
+        "Cannot be combined with --attn2d_row_size / --attn2d_col_size (not yet implemented).",
+    )
+    parser.add_argument(
+        "--attn2d_row_size",
+        type=int,
+        default=1,
+        help="Attention2D row mesh size (Q all-gather dimension). "
+        "Can be set independently of --attn2d_col_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
+        "Total context parallelism degree = attn2d_row_size * attn2d_col_size. "
+        "Cannot be combined with --ulysses_size (not yet implemented).",
+    )
+    parser.add_argument(
+        "--attn2d_col_size",
+        type=int,
+        default=1,
+        help="Attention2D column mesh size (K/V all-gather dimension). "
+        "Can be set independently of --attn2d_row_size; asymmetric meshes (e.g. 1x4 or 4x1) are valid. "
+        "Cannot be combined with --ulysses_size (not yet implemented).",
     )
     parser.add_argument("--disable_parallel_vae", action="store_true", help="Disable parallel VAE")
 
@@ -276,13 +302,21 @@ def _cache_dit_config_from_args(args) -> CacheDiTConfig:
 def main():
     args = parse_args()
 
-    if args.ulysses_size > 1:
-        num_heads = 12
-        logger.info(
-            f"Using Ulysses sequence parallelism: "
-            f"{num_heads} heads / {args.ulysses_size} ranks = "
-            f"{num_heads // args.ulysses_size} heads per GPU"
+    attn2d_size = args.attn2d_row_size * args.attn2d_col_size
+    if attn2d_size > 1 and args.ulysses_size > 1:
+        raise ValueError(
+            "Combining --ulysses_size with --attn2d_row_size/--attn2d_col_size is not yet implemented."
         )
+
+    if args.ulysses_size > 1:
+        parallel_str = f"Ulysses(size={args.ulysses_size})"
+    elif attn2d_size > 1:
+        parallel_str = (
+            f"Attention2D(row={args.attn2d_row_size}, col={args.attn2d_col_size}, "
+            f"total={attn2d_size})"
+        )
+    else:
+        parallel_str = "None"
 
     if args.enable_cache_dit:
         cache_kwargs = {"cache": _cache_dit_config_from_args(args)}
@@ -298,6 +332,8 @@ def main():
         parallel={
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
+            "dit_attn2d_row_size": args.attn2d_row_size,
+            "dit_attn2d_col_size": args.attn2d_col_size,
             "enable_parallel_vae": not args.disable_parallel_vae,
         },
         torch_compile={
@@ -317,7 +353,7 @@ def main():
     logger.info(
         f"Initializing VisualGen: "
         f"cfg_size={diffusion_args.parallel.dit_cfg_size}, "
-        f"ulysses_size={diffusion_args.parallel.dit_ulysses_size}"
+        f"parallelism={parallel_str}"
     )
     visual_gen = VisualGen(
         model=args.model_path,
@@ -325,11 +361,19 @@ def main():
     )
 
     try:
-        logger.info(f"Generating video for prompt: '{args.prompt}'")
-        logger.info(f"Negative prompt: '{args.negative_prompt}'")
-        logger.info(
-            f"Resolution: {args.height}x{args.width}, Frames: {args.num_frames}, Steps: {args.steps}"
+        defaults = visual_gen.default_params
+        negative_prompt_log = (
+            args.negative_prompt if args.negative_prompt is not None else "[model default]"
         )
+        height = args.height if args.height is not None else defaults.height
+        width = args.width if args.width is not None else defaults.width
+        num_frames = args.num_frames if args.num_frames is not None else defaults.num_frames
+        steps = args.steps if args.steps is not None else defaults.num_inference_steps
+        frame_rate = defaults.frame_rate
+
+        logger.info(f"Generating video for prompt: '{args.prompt}'")
+        logger.info(f"Negative prompt: '{negative_prompt_log}'")
+        logger.info(f"Resolution: {height}x{width}, Frames: {num_frames}, Steps: {steps}")
 
         start_time = time.time()
 
@@ -340,7 +384,7 @@ def main():
             extra_params["boundary_ratio"] = args.boundary_ratio
 
         output = visual_gen.generate(
-            inputs={"prompt": args.prompt},
+            inputs=args.prompt,
             params=VisualGenParams(
                 height=args.height,
                 width=args.width,
@@ -348,6 +392,7 @@ def main():
                 guidance_scale=args.guidance_scale,
                 seed=args.seed,
                 num_frames=args.num_frames,
+                frame_rate=frame_rate,
                 negative_prompt=args.negative_prompt,
                 extra_params=extra_params if extra_params else None,
             ),
@@ -355,7 +400,9 @@ def main():
 
         logger.info(f"Generation completed in {time.time() - start_time:.2f}s")
 
-        MediaStorage.save_video(output.video, args.output_path, audio=output.audio, frame_rate=16.0)
+        MediaStorage.save_video(
+            output.video, args.output_path, audio=output.audio, frame_rate=frame_rate
+        )
 
     finally:
         visual_gen.shutdown()

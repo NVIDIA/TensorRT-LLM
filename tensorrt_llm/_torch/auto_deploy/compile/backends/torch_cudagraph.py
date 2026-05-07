@@ -21,7 +21,15 @@ from torch.fx import GraphModule
 from torch.fx._pytree import tree_flatten_spec
 from torch.utils._pytree import PyTree, TreeSpec, tree_flatten
 
-from tensorrt_llm._torch.autotuner import autotune
+try:
+    from tensorrt_llm._torch.autotuner import autotune
+except ModuleNotFoundError:
+    from contextlib import contextmanager
+
+    @contextmanager
+    def autotune(*args, **kwargs):
+        yield  # no-op in standalone mode
+
 
 from ...utils.cuda_graph import CudaGraphWarmUpPhase
 from ...utils.logger import ad_logger
@@ -133,12 +141,23 @@ class CapturedGraph(nn.Module):
     def _get_hash(self, flat_args: List[Any]) -> Tuple[int, ...]:
         return tuple(hash(a) for a in flat_args)
 
-    def _capture_one_graph(self, *args, **kwargs) -> torch.cuda.CUDAGraph:
+    def _capture_one_graph(
+        self,
+        args: Tuple,
+        kwargs: Dict,
+        refresh_args_static: Optional[Callable] = None,
+    ) -> torch.cuda.CUDAGraph:
         """Capture and return one cuda graph."""
         # warm-up and invoke autotuner
-        with CudaGraphWarmUpPhase(), autotune():
+        with autotune():
             for _ in range(3):
-                self.model(*args, **kwargs)
+                with CudaGraphWarmUpPhase():
+                    self.model(*args, **kwargs)
+                if refresh_args_static is not None:
+                    # model.forward() sometimes modifies the cache_seq_interface directly
+                    # Example: Eagle switches the batch from extend-only to generate-only mode during the
+                    # draft loop. We want to restore the args to satisfy invariants needed by model.forward()
+                    refresh_args_static()
 
         # capture graph now
         torch.cuda.synchronize()
@@ -249,9 +268,20 @@ class CapturedGraph(nn.Module):
             ]
             args, kwargs = self._in_spec.unflatten(inputs_truncated + args_static)
 
+            # model.forward() sometimes modifies the cache_seq_interface directly (e.g. Eagle
+            # switches the batch from extend-only to generate-only mode during the draft loop).
+            # Always refresh the static input buffers before graph capture so the next warmup
+            # iteration sees the original layout.
+            def refresh_args_static(_bs: int = bs) -> None:
+                get_args_kwargs(_bs)
+
             # capture graph for truncated inputs
             combined_shape = sum((tuple(input.shape) for input in inputs_truncated), start=())
-            self.cudagraphs[combined_shape] = self._capture_one_graph(*args, **kwargs)
+            self.cudagraphs[combined_shape] = self._capture_one_graph(
+                args=args,
+                kwargs=kwargs,
+                refresh_args_static=refresh_args_static,
+            )
 
     def forward(self, *args, **kwargs) -> Any:
         """Run the compiled graph."""
@@ -318,6 +348,7 @@ class PiecewiseCapturedGraph(nn.Module):
         self.split_gm: Optional[GraphModule] = None
         self._is_prepared = False
         self._wrapped_dynamic_indices: Set[int] = set()
+        self._static_runners: Dict[int, ADPiecewiseRunner] = {}
         # Pre-allocated static buffers for kwargs whose addresses change between
         # calls.  Allocated during warmup_and_capture, used at runtime to ensure
         # CUDA graph replay sees stable addresses.
@@ -411,6 +442,7 @@ class PiecewiseCapturedGraph(nn.Module):
             )
             setattr(self.split_gm, submod_name, runner)
             runner_by_idx[idx] = runner
+            self._static_runners[idx] = runner
             num_wrapped_static += 1
 
         # Phase 2: wrap dynamic ops.
@@ -488,7 +520,8 @@ class PiecewiseCapturedGraph(nn.Module):
             f"PiecewiseCapturedGraph: prepared with {self.split_info.num_submodules} submodules "
             f"({num_wrapped_static} static runners, {num_skipped_static} trivial skipped, "
             f"{num_wrapped_dynamic} dynamic wrapped, {num_metadata_wrapped} metadata wrapped, "
-            f"{num_dynamic_eager} dynamic eager), piecewise_num_tokens={self.piecewise_num_tokens}"
+            f"{num_dynamic_eager} dynamic eager), "
+            f"piecewise_num_tokens={self.piecewise_num_tokens}"
         )
 
     def _discover_dynamic_output_shapes(self, args: Tuple, kwargs: Dict) -> Dict[int, OutputInfo]:
@@ -656,7 +689,11 @@ class PiecewiseCapturedGraph(nn.Module):
 
                 # Capture phase
                 ADPiecewiseRunner.set_current_phase("capture")
-                self.split_gm(*args, **kwargs)
+                try:
+                    self.split_gm(*args, **kwargs)
+                finally:
+                    for runner in self._static_runners.values():
+                        runner.finalize_capture(nt)
 
             ad_logger.info(f"PiecewiseCapturedGraph: captured graphs for num_tokens={nt}")
 
@@ -681,7 +718,12 @@ class PiecewiseCapturedGraph(nn.Module):
             )
             return result
 
-    def forward(self, *args, num_tokens: Optional[int] = None, **kwargs) -> Any:
+    def forward(
+        self,
+        *args,
+        num_tokens: Optional[int] = None,
+        **kwargs,
+    ) -> Any:
         """Forward pass: static segments replay graphs, dynamic segments run eagerly."""
         if self.split_gm is not None:
             self._copy_to_static_buffers(kwargs)
@@ -836,7 +878,11 @@ class DualModeCapturedGraph(nn.Module):
         bucket = self._find_nearest_bucket(num_tokens)
         if bucket is not None:
             try:
-                result = self.piecewise(*args, num_tokens=bucket, **kwargs)
+                result = self.piecewise(
+                    *args,
+                    num_tokens=bucket,
+                    **kwargs,
+                )
             finally:
                 ADPiecewiseRunner.set_current_num_tokens(None)
             if bucket > num_tokens:

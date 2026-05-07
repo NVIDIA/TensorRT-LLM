@@ -41,6 +41,12 @@ void launchOffsetsKernel(Data const& data, int numBlocksOffsets, uint32_t numThr
 template <typename DataType>
 void runPostTopKPipeline(DataType const& data, uint32_t /*numThreadsHist*/, void* stream)
 {
+    TLLM_CHECK_WITH_INFO(data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr
+            && data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr,
+        "Post-topK pipeline requires permuted idx and grouped Gemm launch config buffers");
+    TLLM_CHECK_WITH_INFO(data.mPtrTopKIds != nullptr || data.mPtrTopKPacked != nullptr,
+        "Post-topK pipeline requires either mPtrTopKIds or mPtrTopKPacked");
+
     // Convert to routingCustom::Data for launching (kernels are shared)
     routingCustom::Data customData;
     // Copy base fields

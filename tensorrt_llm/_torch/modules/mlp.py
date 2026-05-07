@@ -28,6 +28,7 @@ class MLP(nn.Module):
         overridden_tp_size: Optional[int] = None,
         lora_up_module_type: LoraModuleType = LoraModuleType.MLP_H_TO_4H,
         lora_down_module_type: LoraModuleType = LoraModuleType.MLP_4H_TO_H,
+        use_custom_cublas_mm: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -68,7 +69,9 @@ class MLP(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             lora=self.up_lora,
             allreduce_strategy=config.allreduce_strategy,
-            force_dynamic_quantization=config.force_dynamic_quantization)
+            force_dynamic_quantization=config.force_dynamic_quantization,
+            use_custom_cublas_mm=use_custom_cublas_mm,
+        )
 
         self.down_lora = LoraLayer([lora_down_module_type], [self.hidden_size])
         self.down_proj = Linear(
@@ -84,6 +87,7 @@ class MLP(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
             reduce_output=reduce_output,
+            use_custom_cublas_mm=use_custom_cublas_mm,
         )
 
         self._use_fused_relu2_quant = False

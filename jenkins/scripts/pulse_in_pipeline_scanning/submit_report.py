@@ -6,22 +6,21 @@ from pathlib import Path
 from typing import NotRequired, TypedDict
 
 sys.path.append(os.path.abspath(".."))
-from utils.common import load_json
+from utils.common import is_permissive, load_json
 from utils.es import es_post
-from utils.report import diff_licenses, get_vulns
+from utils.report import diff_licenses, get_preapproved_deps_map, get_vulns
 
 ES_POST_URL = os.environ.get("TRTLLM_ES_POST_URL")
 if not ES_POST_URL:
     raise EnvironmentError("Error: Environment variable 'TRTLLM_ES_POST_URL' is not set!")
 
 SEVERITY_RANK = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
-GPL_LICENSE_PREFIXES = ("GPL", "LGPL", "GCC GPL")
 
 
 class BuildMetadata(TypedDict):
     build_url: str
     build_number: str
-    branch: str
+    ref: str
     platform: NotRequired[str]
 
 
@@ -30,12 +29,16 @@ def safe(value, default=None):
 
 
 def submit_source_code_vulns(
-    input_file: str, last_scan_result: dict, build_metadata: BuildMetadata, start_datetime: datetime
+    input_file: str,
+    last_scan_result: dict,
+    build_metadata: BuildMetadata,
+    start_datetime: datetime,
+    only_report_new_risk: bool,
 ):
     # Read scan report
 
     bulk_documents = []
-    new_items = []
+    risks_to_report = []
     vulns_path = Path(input_file)
     if vulns_path.exists():
         vulnerabilities = json.loads(vulns_path.read_text())
@@ -54,7 +57,7 @@ def submit_source_code_vulns(
                 "s_run_date": start_datetime.strftime("%Y-%m-%d"),
                 "s_build_url": build_metadata["build_url"],
                 "s_build_number": build_metadata["build_number"],
-                "s_branch": build_metadata["branch"],
+                "s_branch": build_metadata["ref"],
                 "s_severity": safe(v.get("Severity")),
                 "s_package_name": package_name,
                 "s_package_version": package_version,
@@ -67,8 +70,8 @@ def submit_source_code_vulns(
                 "s_upgrade_long_term": safe(v.get("Upgrade-Guidance", {}).get("Long-Term")),
                 "b_is_new": is_new,
             }
-            if is_new:
-                new_items.append(doc)
+            if is_new or not only_report_new_risk:
+                risks_to_report.append(doc)
 
             bulk_documents.append(doc)
 
@@ -80,29 +83,59 @@ def submit_source_code_vulns(
                     "Elasticsearch bulk indexing reported errors for vulnerability report."
                 )
     else:
-        print(f"Vulnerability result json not found, vulnerability reporting: {input_file}")
+        print(
+            f"Vulnerability result json not found, vulnerability reporting: {input_file}",
+            file=sys.stderr,
+        )
 
-    return new_items
+    return risks_to_report
 
 
 def submit_source_code_licenses(
-    input_file: str, last_scan_result: dict, build_metadata: BuildMetadata, start_datetime: datetime
+    input_file: str,
+    last_scan_result: dict,
+    build_metadata: BuildMetadata,
+    start_datetime: datetime,
+    only_report_new_risk: bool,
+    license_check_token: str,
 ):
+    map_preapproved = get_preapproved_deps_map("source_code_license")
     sbom_documents = []
-    new_items = []
+    risks_to_report = []
     sbom_path = Path(input_file)
     if sbom_path.exists():
         sbom_data = json.loads(sbom_path.read_text())
-        for component in sbom_data.get("components", []):
-            license_ids = []
-            package_name = component.get("name")
-            package_version = component.get("version")
+        components = sbom_data.get("components", [])
+
+        # Build {license_id: [components]} and call the API once for all licenses
+        license_to_components = {}
+        for component in components:
             for lic_entry in component.get("licenses", []):
                 lic = lic_entry.get("license", {})
-                license_ids.append(lic.get("id") or lic.get("name") or "")
-            gpl_licenses = [lid for lid in license_ids if lid.startswith(GPL_LICENSE_PREFIXES)]
-            if not gpl_licenses:
+                lid = lic.get("id") or lic.get("name") or ""
+                license_to_components.setdefault(lid, []).append(component)
+
+        permissiveness = is_permissive(list(license_to_components.keys()), license_check_token)
+
+        non_permissive_pkgs = {
+            c.get("name")
+            for lid, perm in permissiveness.items()
+            if not perm
+            for c in license_to_components[lid]
+        } | {c.get("name") for c in license_to_components.get("", [])}
+
+        for component in components:
+            package_name = component.get("name")
+            package_version = component.get("version")
+            component_licenses = component.get("licenses", [])
+            if component_licenses and package_name not in non_permissive_pkgs:
                 continue
+            license_ids = [
+                lic_entry.get("license", {}).get("id")
+                or lic_entry.get("license", {}).get("name")
+                or ""
+                for lic_entry in component_licenses
+            ]
             result_key = (package_name, package_version)
             is_new = result_key not in last_scan_result
             purl = component.get("purl", "")
@@ -113,19 +146,19 @@ def submit_source_code_licenses(
                 "s_run_date": start_datetime.strftime("%Y-%m-%d"),
                 "s_build_url": build_metadata["build_url"],
                 "s_build_number": build_metadata["build_number"],
-                "s_branch": build_metadata["branch"],
+                "s_branch": build_metadata["ref"],
                 "s_package_name": package_name,
                 "s_package_version": package_version,
                 "s_purl": purl,
                 "s_supplier": supplier,
-                "s_license_ids": ",".join(gpl_licenses),
+                "s_license_ids": ",".join(license_ids),
                 "s_bom_ref": component.get("bom-ref"),
                 "s_component_type": component.get("type"),
                 "b_is_new": is_new,
             }
-            if is_new:
-                new_items.append(doc)
-            sbom_documents.append(doc)
+            if (is_new or not only_report_new_risk) and (package_name not in map_preapproved):
+                risks_to_report.append(doc)
+                sbom_documents.append(doc)
         if sbom_documents:
             _, sbom_errors = es_post(ES_POST_URL, sbom_documents)
             if sbom_errors:
@@ -133,9 +166,13 @@ def submit_source_code_licenses(
                     "Elasticsearch bulk indexing reported errors for SBOM license report."
                 )
     else:
-        print(f"SBOM file not found, skipping GPL/LGPL license reporting: {input_file}")
+        print(
+            f"SBOM file not found, skipping GPL/LGPL license reporting: {input_file}",
+            file=sys.stderr,
+        )
+        return None
 
-    return new_items
+    return risks_to_report
 
 
 def submit_container_vulns(
@@ -145,13 +182,14 @@ def submit_container_vulns(
     last_scan_result: dict,
     build_metadata: BuildMetadata,
     start_datetime: datetime,
+    only_report_new_risk: bool,
 ):
     release_data = load_json(input_file)
     base_data = load_json(base_input_file)
     trtllm_deps = get_vulns(input_file)
 
     docs = []
-    new_items = []
+    risks_to_report = []
     release_image = release_data.get("image_tag", "")
     base_image = base_data.get("image_tag", "")
     for v in trtllm_deps:
@@ -165,7 +203,7 @@ def submit_container_vulns(
             "s_run_date": start_datetime.strftime("%Y-%m-%d"),
             "s_build_url": build_metadata["build_url"],
             "s_build_number": build_metadata["build_number"],
-            "s_branch": build_metadata["branch"],
+            "s_branch": build_metadata["ref"],
             "s_platform": platform,
             "s_release_image": release_image,
             "s_base_image": base_image,
@@ -178,8 +216,8 @@ def submit_container_vulns(
             "s_package_paths": ",".join(v.get("package_paths", [])),
             "b_is_new": is_new,
         }
-        if is_new:
-            new_items.append(doc)
+        if is_new or not only_report_new_risk:
+            risks_to_report.append(doc)
         docs.append(doc)
     if docs:
         _, errors = es_post(ES_POST_URL, docs)
@@ -188,9 +226,9 @@ def submit_container_vulns(
                 f"Elasticsearch indexing errors for container vulnerability ({release_image})."
             )
     else:
-        print(f"No High/Critical container vulnerabilities in {release_image}.")
+        print(f"No High/Critical container vulnerabilities in {release_image}.", file=sys.stderr)
 
-    return new_items
+    return risks_to_report
 
 
 def submit_container_licenses(
@@ -200,18 +238,40 @@ def submit_container_licenses(
     last_scan_result: dict,
     build_metadata: BuildMetadata,
     start_datetime: datetime,
+    only_report_new_risk: bool,
+    license_check_token: str,
 ):
     release_data = load_json(input_file)
     base_data = load_json(base_input_file)
-    trtllm_deps = diff_licenses(input_file, base_input_file)
+    trtllm_deps = diff_licenses("container_license", input_file, base_input_file)
+
+    map_preapproved = get_preapproved_deps_map("container_license")
 
     docs = []
-    new_items = []
+    risks_to_report = []
     release_image = release_data.get("image_tag", "")
     base_image = base_data.get("image_tag", "")
+    # Build {license_id: [deps]} and call the API once for all detected licenses
+    license_to_deps = {}
+    for v in trtllm_deps:
+        for lid in v.get("licenses", []):
+            license_to_deps.setdefault(lid, []).append(v)
+
+    permissiveness = is_permissive(list(license_to_deps.keys()), license_check_token)
+
+    non_permissive_pkgs = {
+        dep.get("package")
+        for lid, perm in permissiveness.items()
+        if not perm
+        for dep in license_to_deps[lid]
+    }
+
     for v in trtllm_deps:
         package_name = v.get("package")
         package_version = v.get("version")
+        license_ids = v.get("licenses", [])
+        if license_ids and package_name not in non_permissive_pkgs:
+            continue
         result_key = (package_name, package_version)
         is_new = result_key not in last_scan_result
         doc = {
@@ -220,19 +280,19 @@ def submit_container_licenses(
             "s_run_date": start_datetime.strftime("%Y-%m-%d"),
             "s_build_url": build_metadata["build_url"],
             "s_build_number": build_metadata["build_number"],
-            "s_branch": build_metadata["branch"],
+            "s_branch": build_metadata["ref"],
             "s_platform": platform,
             "s_release_image": release_image,
             "s_base_image": base_image,
             "s_package_name": package_name,
             "s_package_version": package_version,
             "s_package_type": v.get("type"),
-            "s_license_ids": ",".join(v.get("licenses", [])),
+            "s_license_ids": ",".join(license_ids),
             "b_is_new": is_new,
         }
-        if is_new:
-            new_items.append(doc)
-        docs.append(doc)
+        if (is_new or not only_report_new_risk) and (package_name not in map_preapproved):
+            risks_to_report.append(doc)
+            docs.append(doc)
     if docs:
         _, errors = es_post(ES_POST_URL, docs)
         if errors:
@@ -240,6 +300,6 @@ def submit_container_licenses(
                 f"Elasticsearch indexing errors for container licenses ({release_image})."
             )
     else:
-        print(f"No non-permissive licenses in {release_image}.")
+        print(f"No non-permissive licenses in {release_image}.", file=sys.stderr)
 
-    return new_items
+    return risks_to_report

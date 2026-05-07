@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import glob
 import multiprocessing
 import os
@@ -8,32 +22,57 @@ import psutil
 import safetensors
 import torch
 import tqdm
+from mpi4py import MPI as _MPI
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
     BaseWeightLoader, ConsumableWeightsDict)
 from tensorrt_llm._torch.models.modeling_utils import (
     register_checkpoint_weight_loader, run_concurrently)
-from tensorrt_llm._utils import (local_mpi_barrier, local_mpi_rank,
-                                 local_mpi_size)
+from tensorrt_llm._utils import (ENABLE_MULTI_DEVICE, local_mpi_barrier,
+                                 local_mpi_comm, local_mpi_rank, local_mpi_size)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 
+@register_checkpoint_weight_loader("MX")
 @register_checkpoint_weight_loader("mistral")
+@register_checkpoint_weight_loader("mistral_large_3")
 @register_checkpoint_weight_loader("HF")
 class HfWeightLoader(BaseWeightLoader):
     """
     Loads weights from SafeTensors/bin/pth files.
     """
 
-    def load_weights(self, checkpoint_dir: str,
-                     mapping: Mapping) -> dict[str, Any]:
+    @staticmethod
+    def _get_local_available_host_memory() -> int:
+        """Determine the minimum available memory observed on the local node
+        and distribute it to all local ranks
+
+        Because psutil.virtual_memory().available is just a snapshot in time,
+        it is possible for the local ranks to get different numbers due to
+        timing differences. This can lead to disagreement among the local ranks
+        as to whether prefetch should be enabled, which causes a deadlock,
+        because the ranks that think prefetch is enabled will wait at a local
+        mpi barrier indefinitely for the ranks that do not.
+        """
+        available_host_memory = psutil.virtual_memory().available
+        if ENABLE_MULTI_DEVICE:
+            return local_mpi_comm().allreduce(available_host_memory,
+                                              op=_MPI.MIN)
+        return available_host_memory
+
+    def load_weights(self,
+                     checkpoint_dir: str,
+                     mapping: Mapping,
+                     use_consolidated: bool = False,
+                     **kwargs) -> dict[str, Any]:
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
         # Some model checkpoint directories contain not only the sharded safetensors, but one
-        # consolidated tensor. In the presence of both, we favor the former, as there really is no need
+        # consolidated tensor. In the presence of both, we favor the former unless specified explicitly, as there really is no need
         # to prefetch the (usually) ridiculously large consolidated tensor into memory in such a case.
         filtered_weight_files = [
-            x for x in weight_files if "consolidated" not in os.path.split(x)[1]
+            x for x in weight_files
+            if ("consolidated" in os.path.split(x)[1]) == use_consolidated
         ]
         if len(filtered_weight_files) > 0:
             weight_files = filtered_weight_files
@@ -44,8 +83,9 @@ class HfWeightLoader(BaseWeightLoader):
             # If the layer number is overridden, it indicates that only a subset of layers are loaded.
             # Prefetching all layers is unnecessary.
             num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
-            enable_prefetch = prefetch_size < psutil.virtual_memory(
-            ).available * 0.9 and num_layers == 0
+            enable_prefetch = (prefetch_size
+                               < self._get_local_available_host_memory() * 0.9
+                               and num_layers == 0)
             if enable_prefetch:
                 logger.info(
                     f"Prefetching {prefetch_size / (1024**3):.2f}GB checkpoint files."
