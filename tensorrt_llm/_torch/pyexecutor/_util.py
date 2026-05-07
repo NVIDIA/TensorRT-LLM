@@ -12,6 +12,7 @@ from tensorrt_llm._torch.models.modeling_utils import \
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
                                  str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
+from tensorrt_llm.inputs.multimodal import add_multimodal_run_metadata
 
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
@@ -392,18 +393,10 @@ class KvCacheCreator:
                 multimodal_input = extra_processed_inputs.get(
                     'multimodal_input')
                 multimodal_data = extra_processed_inputs.get('multimodal_data')
-                req_mm_input = trtllm.MultimodalInput(
-                    multimodal_hashes=multimodal_input.multimodal_hashes,
-                    multimodal_positions=multimodal_input.multimodal_positions,
-                    multimodal_lengths=multimodal_input.multimodal_lengths,
-                    multimodal_uuids=multimodal_input.multimodal_uuids,
-                    multimodal_item_run_cu_offsets=multimodal_input.
-                    multimodal_item_run_cu_offsets,
-                    multimodal_run_positions=multimodal_input.
-                    multimodal_run_positions,
-                    multimodal_run_lengths=multimodal_input.
-                    multimodal_run_lengths,
-                ) if multimodal_input else None
+                multimodal_data = add_multimodal_run_metadata(
+                    multimodal_data, multimodal_input)
+                req_mm_input = multimodal_input.to_executor(
+                    trtllm) if multimodal_input else None
 
                 request = trtllm.Request(prompt_token_ids,
                                          max_tokens=1,
@@ -445,9 +438,12 @@ class KvCacheCreator:
     def _create_dummy_context_requests(
             self, input_seq_len: int) -> List[trtllm.Request]:
         requests = []
-        if hasattr(self._model_engine.model,
-                   "original_arch") and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
-                       self._model_engine.model.original_arch, None):
+        # Disaggregated workers receive multimodal embeddings instead of raw
+        # pixel inputs, so capacity probing must use the text-only fallback.
+        if (not self._is_disagg
+                and hasattr(self._model_engine.model, "original_arch")
+                and MODEL_CLASS_VISION_ENCODER_MAPPING.get(
+                    self._model_engine.model.original_arch, None)):
             requests = self._create_dummy_mm_context_request(input_seq_len)
         # if succeed profiling with multimodal requests then return, otherwise profile
         # with default case

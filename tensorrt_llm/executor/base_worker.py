@@ -33,6 +33,7 @@ from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
+from ..inputs.multimodal import add_multimodal_run_metadata
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
@@ -468,21 +469,12 @@ class BaseWorker(GenerationExecutor):
         if request.multimodal_params is not None and request.multimodal_params.has_content(
         ):
             if request.multimodal_params.multimodal_input is not None:
-                multimodal_input = tllm.MultimodalInput(
-                    multimodal_hashes=request.multimodal_params.
-                    multimodal_input.multimodal_hashes,
-                    multimodal_positions=request.multimodal_params.
-                    multimodal_input.multimodal_positions,
-                    multimodal_lengths=request.multimodal_params.
-                    multimodal_input.multimodal_lengths,
-                    multimodal_uuids=request.multimodal_params.multimodal_input.
-                    multimodal_uuids,
-                    multimodal_item_run_cu_offsets=request.multimodal_params.
-                    multimodal_input.multimodal_item_run_cu_offsets,
-                    multimodal_run_positions=request.multimodal_params.
-                    multimodal_input.multimodal_run_positions,
-                    multimodal_run_lengths=request.multimodal_params.
-                    multimodal_input.multimodal_run_lengths)
+                request.multimodal_params.multimodal_data = (
+                    add_multimodal_run_metadata(
+                        request.multimodal_params.multimodal_data,
+                        request.multimodal_params.multimodal_input))
+                multimodal_input = request.multimodal_params.multimodal_input.to_executor(
+                    tllm)
             # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
             request.multimodal_params.multimodal_input = None
 

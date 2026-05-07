@@ -1,4 +1,5 @@
 import copy
+import os
 import re
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -58,6 +59,13 @@ from .modeling_utils import (
     register_vision_encoder,
 )
 
+_DISAGG_ROLE_ENV_NAME = "TRTLLM_DISAGG_ROLE"
+_DISAGG_CONTEXT_ROLES = {"context", "ctx"}
+
+
+def _is_disagg_context_role() -> bool:
+    return os.getenv(_DISAGG_ROLE_ENV_NAME, "").lower() in _DISAGG_CONTEXT_ROLES
+
 
 def _expand_prompt_token_ids_for_mm_handoff(
     input_ids: torch.Tensor,
@@ -88,7 +96,7 @@ def _expand_prompt_token_ids_for_mm_handoff(
     mm_token_lengths: List[int] = []
     mm_token_offsets: List[int] = []
     item_types: List[int] = []
-    item_run_cu_seqlen: List[int] = [0]
+    item_run_cu_offsets: List[int] = [0]
     run_positions: List[int] = []
     run_lengths: List[int] = []
     multimodal_embedding_lengths: List[int] = []
@@ -117,7 +125,7 @@ def _expand_prompt_token_ids_for_mm_handoff(
         item_types.append(0 if token_id == image_token_id else 1)
         run_positions.append(run_start)
         run_lengths.append(prompt_mm_length)
-        item_run_cu_seqlen.append(len(run_positions))
+        item_run_cu_offsets.append(len(run_positions))
 
         if has_leading_special:
             special_token_offsets.append(flat_mm_offset)
@@ -130,7 +138,7 @@ def _expand_prompt_token_ids_for_mm_handoff(
         raise RuntimeError(f"Write position mismatch: {write_pos} != {final_length}")
 
     layout_metadata = {
-        "multimodal_item_run_cu_seqlen": item_run_cu_seqlen,
+        "multimodal_item_run_cu_offsets": item_run_cu_offsets,
         "multimodal_run_positions": run_positions,
         "multimodal_run_lengths": run_lengths,
         "multimodal_embedding_lengths": multimodal_embedding_lengths,
@@ -1115,7 +1123,7 @@ class Qwen3VLModelBase(PreTrainedModel):
         # Qwen3ForCausalLM.
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
-        if not _is_disagg():
+        if not _is_disagg() or _is_disagg_context_role():
             self.mm_encoder = Qwen3VisionModelBase(
                 copy.deepcopy(model_config), kwargs.get("vision_model_class", None)
             ).eval()
@@ -1247,10 +1255,18 @@ class Qwen3VLModelBase(PreTrainedModel):
         # so we need to separate the mm_multimodal_params from the text-only prompts.
         mm_multimodal_params = self._get_requests_with_mm_data(multimodal_params)
         if len(mm_multimodal_params) > 0:
-            if not _is_disagg():
+            has_raw_mm_data = self._has_raw_multimodal_data(mm_multimodal_params)
+            has_cached_mm_embeds = self._has_cached_multimodal_embeddings(mm_multimodal_params)
+            if has_raw_mm_data and not has_cached_mm_embeds and hasattr(self, "mm_encoder"):
                 mm_embeds = get_multimodal_embeddings(
                     encoder_forward_fn=self.mm_encoder.forward,
                     multimodal_params=mm_multimodal_params,
+                )
+            elif has_raw_mm_data and not has_cached_mm_embeds:
+                raise ValueError(
+                    "Raw multimodal inputs require a local multimodal encoder on this "
+                    "disaggregated worker. Set TRTLLM_DISAGG_ROLE=context for context "
+                    "workers, or provide multimodal_embedding handles."
                 )
             elif not getattr(self, "support_mm_disagg", False):
                 raise NotImplementedError(
@@ -1293,6 +1309,24 @@ class Qwen3VLModelBase(PreTrainedModel):
         )
         logger.debug(f"output shape: {output_prob.shape}")
         return output_prob
+
+    @staticmethod
+    def _has_raw_multimodal_data(multimodal_params):
+        for multimodal_param in multimodal_params:
+            data = multimodal_param.multimodal_data
+            if (
+                data.get("image", {}).get("pixel_values") is not None
+                or data.get("video", {}).get("pixel_values_videos") is not None
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _has_cached_multimodal_embeddings(multimodal_params):
+        for multimodal_param in multimodal_params:
+            if multimodal_param.multimodal_data.get("multimodal_embedding") is not None:
+                return True
+        return False
 
     def _get_requests_with_mm_data(self, multimodal_params):
         mm_multimodal_params = []
@@ -1341,7 +1375,7 @@ class Qwen3VLModel(Qwen3VLModelBase):
         return ["image.pixel_values", "video.pixel_values_videos", "multimodal_embedding"]
 
     def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):
-        if not _is_disagg():
+        if hasattr(self, "mm_encoder"):
             self.mm_encoder.load_weights(weights)
 
         weight_mapper = Qwen3VLHfWeightMapper()

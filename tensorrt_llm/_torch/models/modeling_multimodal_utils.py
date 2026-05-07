@@ -270,6 +270,23 @@ def get_multimodal_embeddings(
     return [all_embeddings]
 
 
+def _get_cached_multimodal_embeddings(
+        multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+    cached_embeddings = []
+    for param in multimodal_params:
+        embeds = param.multimodal_data.get("multimodal_embedding")
+        if embeds is None:
+            continue
+        if isinstance(embeds, list):
+            embeds = torch.cat(embeds, dim=0)
+            param.multimodal_data["multimodal_embedding"] = embeds
+        cached_embeddings.append(embeds)
+
+    if not cached_embeddings:
+        return []
+    return [torch.cat(cached_embeddings, dim=0)]
+
+
 def find_input_mm_embeds(
         mm_embeds: List[torch.Tensor],
         multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
@@ -291,10 +308,15 @@ def find_input_mm_embeds(
     Note:
         - Supports both individual batching (len(mm_embeds) == len(multimodal_params))
           and pre-concatenated batching (len(mm_embeds) == 1)
+        - Supports disaggregated prefill where embeddings are already attached
+          to multimodal_params and mm_embeds is empty.
         - Handles chunked prefill by considering chunk boundaries and current chunk tokens
         - Example: if a request has 8 MM embed rows, 2 cached rows, and 3 rows
           in the current chunk, this keeps rows [2:5].
     """
+    if not mm_embeds:
+        mm_embeds = _get_cached_multimodal_embeddings(multimodal_params)
+
     # Current support two batching modes:
     # 1. Pre-concatenated mm_embeds for each batch, i.e., len(mm_embeds) == 1
     # 2. Individual mm_embeds for each multimodal param, i.e., len(mm_embeds) == len(multimodal_params)
@@ -316,6 +338,11 @@ def find_input_mm_embeds(
             "All multimodal tokens are cached or beyond current chunk, skipping vision encoder forward"
         )
         return []
+
+    if not mm_embeds:
+        raise ValueError(
+            "No multimodal embeddings were provided or cached for active multimodal tokens."
+        )
 
     if total_mm_tokens == sum(mm_embed.shape[0] for mm_embed in mm_embeds):
         return mm_embeds

@@ -72,6 +72,15 @@ _RESERVED_MM_DATA_KEYS = frozenset(
 )
 
 
+def _append_mm_extra_args(
+    extra_args: Dict[str, List[torch.Tensor]], multimodal_data: abc.Mapping[str, Any]
+) -> None:
+    for key, value in multimodal_data.items():
+        if key in _RESERVED_MM_DATA_KEYS:
+            continue
+        extra_args[key].append(value)
+
+
 def _metadata_to_list(value: Any) -> List[int]:
     if value is None:
         return []
@@ -774,10 +783,7 @@ class ADEngine(ModelEngine):
             # store extra arguments
             if request.py_multimodal_data is not None:
                 has_context_multimodal_data = True
-                for k, v in request.py_multimodal_data.items():
-                    if k in _RESERVED_MM_DATA_KEYS:
-                        continue
-                    extra_args[k].append(v)
+                _append_mm_extra_args(extra_args, request.py_multimodal_data)
 
         # store num_prefill and num_prefill_tokens
         num_prefill = len(context_requests)

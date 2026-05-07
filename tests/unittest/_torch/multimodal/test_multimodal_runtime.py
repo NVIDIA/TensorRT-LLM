@@ -45,6 +45,25 @@ def _make_multimodal_params(
 class TestFindInputMmEmbed:
     """Test cases for find_input_mm_embeds — slicing embeddings per chunk."""
 
+    def test_empty_mm_embeds_uses_cached_param_embeddings(self):
+        """Disagg prefill passes encoder outputs through multimodal params."""
+        cached_emb1 = torch.randn(5, _EMBED_DIM)
+        cached_emb2 = torch.randn(4, _EMBED_DIM)
+        multimodal_params = [
+            MultimodalParams(
+                multimodal_data={"multimodal_embedding": cached_emb1},
+                multimodal_runtime=_make_runtime(1, 4, [5])),
+            MultimodalParams(
+                multimodal_data={"multimodal_embedding": cached_emb2},
+                multimodal_runtime=_make_runtime(2, 2, [4])),
+        ]
+
+        result = find_input_mm_embeds([], multimodal_params)
+
+        assert len(result) == 1
+        torch.testing.assert_close(
+            result[0], torch.cat([cached_emb1[1:5], cached_emb2[2:4]], dim=0))
+
     def test_mm_embed_not_batched(self):
         """Individual batching: len(mm_embeds) == len(multimodal_params) > 1."""
         mm_embeds = [

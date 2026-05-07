@@ -597,8 +597,8 @@ class BaseLLM:
                     mm_hashes,
                     mm_token_positions,
                     mm_token_length,
-                    mm_item_run_cu_seqlen=mm_layout_metadata.get(
-                        "multimodal_item_run_cu_seqlen"),
+                    mm_item_run_cu_offsets=mm_layout_metadata.get(
+                        "multimodal_item_run_cu_offsets"),
                     mm_run_positions=mm_layout_metadata.get(
                         "multimodal_run_positions"),
                     mm_run_lengths=mm_layout_metadata.get(
