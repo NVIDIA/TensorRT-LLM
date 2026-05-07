@@ -304,9 +304,11 @@ BlockKey const& Block::parentKey() const
 
 void Block::unsetPage(LifeCycleId lcIdx, LifeCycle const& lc)
 {
-    if (storage.at(static_cast<size_t>(lcIdx)).expired())
+    if (isOrphan())
+    {
         return;
-    storage[static_cast<size_t>(lcIdx)].reset();
+    }
+    storage.at(static_cast<size_t>(lcIdx)).reset();
 
     // Reuse cleanup only applies to attention lifecycles.
     // SSM lifecycles are allowed in the tree but don't trigger subtree eviction.
@@ -441,7 +443,8 @@ std::vector<std::weak_ptr<CommittedPage>> removeSubtree(
         // Clear storage.
         block->storage.assign(block->storage.size(), {});
         assert(gNdebug
-            || (std::all_of(block->storage.begin(), block->storage.end(), [](auto const& wp) { return wp.expired(); })
+            || (std::all_of(block->storage.begin(), block->storage.end(),
+                    [](auto const& weakPage) { return weakPage.expired(); })
                 && "storage must be cleared after assign"));
 
         // Push children (they will be destroyed when removed from parent's next).
@@ -479,7 +482,9 @@ RootBlock& BlockRadixTree::addOrGetExisting(std::optional<int64_t> loraTaskId)
     BlockKey key = RootBlock::makeKey(loraTaskId);
     auto it = mRoots.find(key);
     if (it != mRoots.end())
+    {
         return it->second;
+    }
 
     auto [newIt, inserted] = mRoots.emplace(key, RootBlock(loraTaskId, this));
     return newIt->second;
