@@ -1040,7 +1040,7 @@ __device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int con
         int snap_limit = (cand_count > 128 ? cand_count / 4 : 32);
         for (int si = 0; si < snap_limit; si++)
         {
-            blockFusedSnapIter(smem, cand_count, tid, warp_id, lane);
+            blockFusedSnapIter<TopK>(smem, cand_count, tid, warp_id, lane);
             int cge = smem->cnt_lo;
             int cgt = smem->cnt_hi;
             if (cgt < kK && cge >= kK)
@@ -1581,7 +1581,7 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
         int snap_limit = (cand_count > 128 ? cand_count / 4 : 32);
         for (int si = 0; si < snap_limit; si++)
         {
-            blockFusedSnapIterDtype<SmemKey>(smem, cand_count, tid, warp_id, lane);
+            blockFusedSnapIterDtype<SmemKey, TopK>(smem, cand_count, tid, warp_id, lane);
             int cge = smem->cnt_lo;
             int cgt = smem->cnt_hi;
             if (cgt < kK && cge >= kK)
