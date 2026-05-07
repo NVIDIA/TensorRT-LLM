@@ -317,11 +317,21 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         return {}
 
     def get_cache_config_updates(self):
-        """Return kv cache dtype updates."""
+        """Return kv cache dtype updates.
+
+        Only returns an override when the checkpoint's quantization config
+        explicitly carries a ``kv_cache_dtype``.  Otherwise returns an empty
+        dict so the user-provided ``kv_cache_config.dtype`` (yaml / init
+        kwarg) is preserved — the factory must not silently clobber an
+        explicit setting with ``"auto"`` just because the HF quantization
+        config is silent on KV cache dtype.
+        """
         if not self._quant_config_reader:
             return {}
 
-        kv_cache_dtype = self._quant_config_reader.get_config().get("kv_cache_dtype", "auto")
+        kv_cache_dtype = self._quant_config_reader.get_config().get("kv_cache_dtype")
+        if kv_cache_dtype is None:
+            return {}
         assert kv_cache_dtype in ("fp8", "auto"), (
             f"Unsupported dtype: {kv_cache_dtype}. Only fp8 and auto are supported."
         )

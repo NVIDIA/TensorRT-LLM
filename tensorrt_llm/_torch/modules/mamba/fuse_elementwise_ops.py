@@ -196,3 +196,230 @@ def fused_split_rearrange_after_conv1d(
         B_flat.view(1, num_prefill_tokens, n_groups, d_state),
         C_flat.view(1, num_prefill_tokens, n_groups, d_state),
     )
+
+
+@triton.jit
+def _transpose_and_split_qkv_kernel(
+    prefill_t_ptr,
+    decode_ptr,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    num_prefill,
+    num_decode,
+    num_cols,
+    q_dim: tl.constexpr,
+    k_dim: tl.constexpr,
+    v_dim: tl.constexpr,
+    BLOCK_SEQ: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    """Fused transpose-prefill + split-decode into contiguous q, k, v.
+
+    Reads prefill from transposed layout [D, T_p] and decode from
+    row-major layout [T_d, D], writes both into contiguous q/k/v outputs.
+    Grid: (num_seq_blocks_total, num_dim_blocks, 3)
+    program_id(2): 0=Q, 1=K, 2=V
+    """
+    pid_seq = tl.program_id(0)
+    pid_dim = tl.program_id(1)
+    pid_out = tl.program_id(2)
+
+    total_seq = num_prefill + num_decode
+    out_dim = tl.where(pid_out == 2, v_dim, tl.where(pid_out == 1, k_dim, q_dim))
+    src_col_offset = tl.where(pid_out == 0, 0, tl.where(pid_out == 1, q_dim, q_dim + k_dim))
+
+    seq_offsets = pid_seq * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
+    dim_offsets = pid_dim * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
+
+    seq_mask = seq_offsets < total_seq
+    dim_mask = dim_offsets < out_dim
+    mask = seq_mask[:, None] & dim_mask[None, :]
+
+    # Determine if each row is prefill or decode
+    is_prefill = seq_offsets < num_prefill
+    is_decode = ~is_prefill & (seq_offsets < total_seq)
+
+    # Prefill: read from prefill_t[D, T_p] transposed — index [col, row]
+    prefill_src_col = src_col_offset + dim_offsets
+    prefill_indices = prefill_src_col[None, :].to(tl.int64) * num_prefill + seq_offsets[:, None].to(
+        tl.int64
+    )
+    prefill_data = tl.load(
+        prefill_t_ptr + prefill_indices, mask=is_prefill[:, None] & dim_mask[None, :], other=0.0
+    )
+
+    # Decode: read from decode_ptr[T_d, D] row-major
+    decode_row = seq_offsets - num_prefill
+    decode_indices = decode_row[:, None].to(tl.int64) * num_cols + (
+        src_col_offset + dim_offsets[None, :]
+    ).to(tl.int64)
+    decode_data = tl.load(
+        decode_ptr + decode_indices, mask=is_decode[:, None] & dim_mask[None, :], other=0.0
+    )
+
+    # Merge
+    data = tl.where(is_prefill[:, None], prefill_data, decode_data)
+
+    # Write to output [total_seq, out_dim]
+    out_ptr = tl.where(pid_out == 0, q_ptr, tl.where(pid_out == 1, k_ptr, v_ptr))
+    dst_indices = seq_offsets[:, None].to(tl.int64) * out_dim + dim_offsets[None, :]
+    tl.store(out_ptr + dst_indices, data, mask=mask)
+
+
+def transpose_and_split_qkv(
+    prefill_t: torch.Tensor,
+    decode: torch.Tensor,
+    q_dim: int,
+    k_dim: int,
+    v_dim: int,
+    num_q_heads: int,
+    head_k_dim: int,
+    num_v_heads: int,
+    head_v_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Fused transpose prefill [D, T_p] + split decode [T_d, D] into contiguous q, k, v.
+
+    Replaces separate transpose_copy_back + split_qkv_contiguous for mixed batches.
+    """
+    num_cols, num_prefill = prefill_t.shape
+    num_decode = decode.shape[0]
+    total_seq = num_prefill + num_decode
+
+    q_flat = torch.empty(total_seq, q_dim, dtype=prefill_t.dtype, device=prefill_t.device)
+    k_flat = torch.empty(total_seq, k_dim, dtype=prefill_t.dtype, device=prefill_t.device)
+    v_flat = torch.empty(total_seq, v_dim, dtype=prefill_t.dtype, device=prefill_t.device)
+
+    BLOCK_SEQ, BLOCK_DIM = 32, 128
+    max_dim = max(q_dim, k_dim, v_dim)
+    grid = (triton.cdiv(total_seq, BLOCK_SEQ), triton.cdiv(max_dim, BLOCK_DIM), 3)
+
+    _transpose_and_split_qkv_kernel[grid](
+        prefill_t,
+        decode,
+        q_flat,
+        k_flat,
+        v_flat,
+        num_prefill,
+        num_decode,
+        num_cols,
+        q_dim,
+        k_dim,
+        v_dim,
+        BLOCK_SEQ,
+        BLOCK_DIM,
+    )
+
+    return (
+        q_flat.view(1, total_seq, num_q_heads, head_k_dim),
+        k_flat.view(1, total_seq, num_q_heads, head_k_dim),
+        v_flat.view(1, total_seq, num_v_heads, head_v_dim),
+    )
+
+
+@triton.jit
+def _split_qkv_contiguous_kernel(
+    src_ptr,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    seq_len,
+    src_stride_seq,
+    src_stride_dim,
+    q_dim: tl.constexpr,
+    k_dim: tl.constexpr,
+    v_dim: tl.constexpr,
+    BLOCK_SEQ: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    """Split mixed_qkv [T, qkv_dim] into 3 contiguous output tensors.
+
+    Supports arbitrary source strides to handle both contiguous and
+    transposed inputs (e.g. from causal_conv1d_fn(...).transpose(0, 1)).
+
+    Grid: (num_seq_blocks, num_dim_blocks_for_max_dim, 3)
+    program_id(2): 0=Q, 1=K, 2=V
+    """
+    pid_seq = tl.program_id(0)
+    pid_dim = tl.program_id(1)
+    pid_out = tl.program_id(2)
+
+    # Determine output dim and source column offset for this output
+    out_dim = tl.where(pid_out == 2, v_dim, tl.where(pid_out == 1, k_dim, q_dim))
+    src_col_offset = tl.where(pid_out == 0, 0, tl.where(pid_out == 1, q_dim, q_dim + k_dim))
+
+    seq_offsets = pid_seq * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
+    dim_offsets = pid_dim * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
+
+    seq_mask = seq_offsets < seq_len
+    dim_mask = dim_offsets < out_dim
+    mask = seq_mask[:, None] & dim_mask[None, :]
+
+    # Read from src [T, qkv_dim] using actual strides
+    src_indices = (
+        seq_offsets[:, None].to(tl.int64) * src_stride_seq
+        + (src_col_offset + dim_offsets[None, :]).to(tl.int64) * src_stride_dim
+    )
+    data = tl.load(src_ptr + src_indices, mask=mask, other=0.0)
+
+    # Write to output [T, out_dim] — contiguous, stride = (out_dim, 1)
+    out_ptr = tl.where(pid_out == 0, q_ptr, tl.where(pid_out == 1, k_ptr, v_ptr))
+    dst_indices = seq_offsets[:, None].to(tl.int64) * out_dim + dim_offsets[None, :]
+    tl.store(out_ptr + dst_indices, data, mask=mask)
+
+
+def split_qkv_contiguous(
+    mixed_qkv: torch.Tensor,
+    q_dim: int,
+    k_dim: int,
+    v_dim: int,
+    num_q_heads: int,
+    head_k_dim: int,
+    num_v_heads: int,
+    head_v_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Split mixed_qkv [T, qkv_dim] into 3 contiguous tensors and reshape.
+
+    Returns:
+        q_out [1, T, num_q_heads, head_k_dim]  — contiguous
+        k_out [1, T, num_q_heads, head_k_dim]  — contiguous
+        v_out [1, T, num_v_heads, head_v_dim]  — contiguous
+    """
+    seq_len = mixed_qkv.shape[0]
+    src_stride_seq, src_stride_dim = mixed_qkv.stride()
+
+    q_flat = torch.empty(seq_len, q_dim, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+    k_flat = torch.empty(seq_len, k_dim, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+    v_flat = torch.empty(seq_len, v_dim, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
+
+    BLOCK_SEQ = 32
+    BLOCK_DIM = 128
+    max_dim = max(q_dim, k_dim, v_dim)
+    grid = (
+        triton.cdiv(seq_len, BLOCK_SEQ),
+        triton.cdiv(max_dim, BLOCK_DIM),
+        3,
+    )
+
+    _split_qkv_contiguous_kernel[grid](
+        mixed_qkv,
+        q_flat,
+        k_flat,
+        v_flat,
+        seq_len,
+        src_stride_seq,
+        src_stride_dim,
+        q_dim,
+        k_dim,
+        v_dim,
+        BLOCK_SEQ,
+        BLOCK_DIM,
+    )
+
+    return (
+        q_flat.view(1, seq_len, num_q_heads, head_k_dim),
+        k_flat.view(1, seq_len, num_q_heads, head_k_dim),
+        v_flat.view(1, seq_len, num_v_heads, head_v_dim),
+    )

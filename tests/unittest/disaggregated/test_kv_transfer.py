@@ -125,11 +125,12 @@ def test_session_status_enum():
         "KV_TRANSFERRED",
         "FULLY_TRANSFERRED",
         "ERROR",
+        "CANCELLED",
     ]
     for name in expected:
         assert hasattr(SessionStatus, name)
         assert SessionStatus[name].value == name
-    assert len(SessionStatus) == 6
+    assert len(SessionStatus) == 7
 
 
 def create_transfer_worker_setup(
@@ -696,14 +697,17 @@ def add_and_verify_request(
             for ctx_transfer_worker in valid_ctx_transfer_workers
         ]
 
+        token_range = TokenRange(start=0, end=request_len)
         send_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids_per_layer_groups=ctx_block_ids_per_group)
+            KVSlice(
+                is_last_slice=True,
+                block_ids_per_layer_groups=ctx_block_ids_per_group,
+                token_range=token_range,
+            )
             for ctx_block_ids_per_group in ctx_block_ids_per_groups
         ]
-        send_slice_futures = [
+        for sender_session, send_kv_slice in zip(sender_sessions, send_kv_slices):
             sender_session.send(send_kv_slice)
-            for sender_session, send_kv_slice in zip(sender_sessions, send_kv_slices)
-        ]
 
         for sender_session in sender_sessions:
             assert sender_session.status == SessionStatus.INIT
@@ -713,27 +717,32 @@ def add_and_verify_request(
             for gen_transfer_worker in valid_gen_transfer_workers
         ]
         recv_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids_per_layer_groups=gen_block_ids_per_group)
+            KVSlice(
+                is_last_slice=True,
+                block_ids_per_layer_groups=gen_block_ids_per_group,
+                token_range=token_range,
+            )
             for gen_block_ids_per_group in gen_block_ids_per_groups
         ]
-        recv_slice_futures = [
+        for receiver_session, recv_kv_slice in zip(receiver_sessions, recv_kv_slices):
             receiver_session.receive(recv_kv_slice)
-            for receiver_session, recv_kv_slice in zip(receiver_sessions, recv_kv_slices)
-        ]
 
     else:
+        token_range = TokenRange(start=0, end=request_len)
         receiver_sessions = [
             gen_transfer_worker.create_rx_session(gen_request)
             for gen_transfer_worker in valid_gen_transfer_workers
         ]
         recv_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids_per_layer_groups=gen_block_ids_per_group)
+            KVSlice(
+                is_last_slice=True,
+                block_ids_per_layer_groups=gen_block_ids_per_group,
+                token_range=token_range,
+            )
             for gen_block_ids_per_group in gen_block_ids_per_groups
         ]
-        recv_slice_futures = [
+        for receiver_session, recv_kv_slice in zip(receiver_sessions, recv_kv_slices):
             receiver_session.receive(recv_kv_slice)
-            for receiver_session, recv_kv_slice in zip(receiver_sessions, recv_kv_slices)
-        ]
 
         random_sleep_time = random.uniform(0.000001, 0.001)
         time.sleep(random_sleep_time)
@@ -748,25 +757,27 @@ def add_and_verify_request(
             assert sender_session.status != SessionStatus.INIT
 
         send_kv_slices = [
-            KVSlice(is_last_slice=True, block_ids_per_layer_groups=ctx_block_ids_per_group)
+            KVSlice(
+                is_last_slice=True,
+                block_ids_per_layer_groups=ctx_block_ids_per_group,
+                token_range=token_range,
+            )
             for ctx_block_ids_per_group in ctx_block_ids_per_groups
         ]
-        send_slice_futures = [
+        for sender_session, send_kv_slice in zip(sender_sessions, send_kv_slices):
             sender_session.send(send_kv_slice)
-            for sender_session, send_kv_slice in zip(sender_sessions, send_kv_slices)
-        ]
         send_aux_tasks = []
         for sender_session in sender_sessions:
             sender_session.pack_aux(ctx_request)
             send_aux_tasks.append(sender_session.send_aux())
 
-    for future in send_slice_futures:
-        future.result()
-    for future in recv_slice_futures:
-        future.result()
+    for sender_session in sender_sessions:
+        sender_session.wait_complete()
+    for receiver_session in receiver_sessions:
+        receiver_session.wait_complete(blocking=True)
     if not send_first:
         for send_aux_task in send_aux_tasks:
-            send_aux_task.future.result()
+            send_aux_task.wait()
 
     sync_session_status = (
         SessionStatus.KV_TRANSFERRED if send_first else SessionStatus.FULLY_TRANSFERRED
@@ -1044,6 +1055,251 @@ def test_transfer_worker_v2_with_window(
             worker.shutdown()
         for worker in setup["gen_transfer_workers"]:
             worker.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_session_cancel_before_send():
+    """TxSession/RxSession cancelled before any transfer starts."""
+    setup = create_transfer_worker_setup(
+        ctx_tp=1,
+        ctx_pp=1,
+        ctx_enable_dp=False,
+        gen_tp=1,
+        gen_pp=1,
+        gen_enable_dp=False,
+    )
+    ctx_transfer_worker = setup["ctx_transfer_workers"][0]
+    gen_transfer_worker = setup["gen_transfer_workers"][0]
+
+    unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+    sampling_params = SamplingParams(temperature=0)
+    ctx_request = LlmRequest(
+        request_id=100,
+        max_new_tokens=1,
+        input_tokens=list(range(16)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()
+        ),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+    )
+    ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+
+    gen_request = LlmRequest(
+        request_id=101,
+        max_new_tokens=1,
+        input_tokens=list(range(16)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()
+        ),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+    gen_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+
+    try:
+        tx_session = ctx_transfer_worker.create_tx_session(ctx_request)
+        assert tx_session.status == SessionStatus.INIT
+        assert not tx_session.has_failed()
+
+        tx_session.cancel()
+        assert tx_session.status == SessionStatus.CANCELLED
+        assert tx_session.has_failed()
+        assert not tx_session.is_completed()
+        tx_session.close()
+
+        rx_session = gen_transfer_worker.create_rx_session(gen_request)
+        assert rx_session.status == SessionStatus.INIT
+        assert not rx_session.has_failed()
+
+        rx_session.cancel()
+        assert rx_session.status == SessionStatus.CANCELLED
+        assert rx_session.has_failed()
+        assert not rx_session.is_completed()
+        rx_session.close()
+    finally:
+        ctx_transfer_worker.shutdown()
+        gen_transfer_worker.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_session_cancel_after_send():
+    """TxSession cancelled after send() queues INIT tasks; future raises."""
+    tensorrt_llm.logger.set_level("debug")
+    setup = create_transfer_worker_setup(
+        ctx_tp=1,
+        ctx_pp=1,
+        ctx_enable_dp=False,
+        gen_tp=1,
+        gen_pp=1,
+        gen_enable_dp=False,
+    )
+    ctx_transfer_worker = setup["ctx_transfer_workers"][0]
+
+    unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+    sampling_params = SamplingParams(temperature=0)
+    ctx_request = LlmRequest(
+        request_id=200,
+        max_new_tokens=1,
+        input_tokens=list(range(16)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()
+        ),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+    )
+    ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+
+    try:
+        tx_session = ctx_transfer_worker.create_tx_session(ctx_request)
+        # No real KV cache sequence is needed: test exercises send/cancel state
+        # transitions only.  Pass an empty block-id list per layer group so we
+        # avoid depending on KVCacheManager's sequence-management API (which
+        # changed shape across versions).
+        page_table = ctx_transfer_worker._rank_info.page_table
+        block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
+        kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=block_ids_per_groups)
+        future = tx_session.send(kv_slice)
+
+        # No receiver registered yet; task is INIT.
+        tx_session.cancel()
+
+        assert tx_session.status == SessionStatus.CANCELLED
+        assert tx_session.has_failed()
+        # Future for the cancelled INIT task must raise.
+        with pytest.raises(Exception):
+            future.result(timeout=5.0)
+        tx_session.close()
+    finally:
+        ctx_transfer_worker.shutdown()
+        for worker in setup["gen_transfer_workers"]:
+            worker.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_session_cancel_twice():
+    """cancel() called twice must be a no-op on the second call."""
+    setup = create_transfer_worker_setup(
+        ctx_tp=1,
+        ctx_pp=1,
+        ctx_enable_dp=False,
+        gen_tp=1,
+        gen_pp=1,
+        gen_enable_dp=False,
+    )
+    ctx_transfer_worker = setup["ctx_transfer_workers"][0]
+    gen_transfer_worker = setup["gen_transfer_workers"][0]
+
+    unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+    sampling_params = SamplingParams(temperature=0)
+    ctx_request = LlmRequest(
+        request_id=300,
+        max_new_tokens=1,
+        input_tokens=list(range(16)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()
+        ),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+    )
+    ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+
+    gen_request = LlmRequest(
+        request_id=301,
+        max_new_tokens=1,
+        input_tokens=list(range(16)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()
+        ),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+    gen_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+
+    try:
+        tx_session = ctx_transfer_worker.create_tx_session(ctx_request)
+        tx_session.cancel()
+        tx_session.cancel()  # Second call must be a no-op
+        assert tx_session.status == SessionStatus.CANCELLED
+        assert not tx_session.has_transferring_tasks()
+        tx_session.close()
+
+        rx_session = gen_transfer_worker.create_rx_session(gen_request)
+        rx_session.cancel()
+        rx_session.cancel()  # Second call must be a no-op
+        assert rx_session.status == SessionStatus.CANCELLED
+        assert not rx_session.has_transferring_tasks()
+        rx_session.close()
+    finally:
+        ctx_transfer_worker.shutdown()
+        gen_transfer_worker.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_session_has_transferring_tasks_false():
+    """has_transferring_tasks() returns False when no tasks or tasks are INIT."""
+    setup = create_transfer_worker_setup(
+        ctx_tp=1,
+        ctx_pp=1,
+        ctx_enable_dp=False,
+        gen_tp=1,
+        gen_pp=1,
+        gen_enable_dp=False,
+    )
+    ctx_transfer_worker = setup["ctx_transfer_workers"][0]
+    gen_transfer_worker = setup["gen_transfer_workers"][0]
+
+    unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+    sampling_params = SamplingParams(temperature=0)
+
+    ctx_request = LlmRequest(
+        request_id=400,
+        max_new_tokens=1,
+        input_tokens=list(range(16)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()
+        ),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+    )
+    ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=unique_rid)
+
+    gen_request = LlmRequest(
+        request_id=401,
+        max_new_tokens=1,
+        input_tokens=list(range(16)),
+        sampling_config=tensorrt_llm.bindings.SamplingConfig(
+            sampling_params._get_sampling_config()
+        ),
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+    gen_request.py_disaggregated_params = DisaggregatedParams(
+        disagg_request_id=unique_rid,
+        ctx_request_id=ctx_request.py_request_id,
+        schedule_style=1,
+    )
+
+    try:
+        # TxSession: no tasks yet
+        tx_session = ctx_transfer_worker.create_tx_session(ctx_request)
+        assert not tx_session.has_transferring_tasks()
+
+        # TxSession: after send(), task is INIT (no receiver → not yet dispatched)
+        page_table = ctx_transfer_worker._rank_info.page_table
+        block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
+        kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=block_ids_per_groups)
+        tx_session.send(kv_slice)
+        assert not tx_session.has_transferring_tasks()
+        tx_session.close()
+
+        # RxSession: no tasks yet
+        rx_session = gen_transfer_worker.create_rx_session(gen_request)
+        assert not rx_session.has_transferring_tasks()
+        rx_session.close()
+    finally:
+        ctx_transfer_worker.shutdown()
+        gen_transfer_worker.shutdown()
 
 
 if __name__ == "__main__":

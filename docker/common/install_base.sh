@@ -36,13 +36,18 @@ set_bash_env() {
 }
 
 cleanup() {
-  # Clean up apt/dnf cache
+  # Clean up apt/dnf cache.
+  # NOTE: When this script runs under a BuildKit RUN with cache mounts on
+  # /var/cache/apt and /var/lib/apt (see docker/Dockerfile.multi), `apt-get
+  # clean` and `rm -rf /var/lib/apt/lists/*` operate on the persistent cache
+  # mount rather than the image layer, so they would wipe the cache between
+  # builds. The mount itself ensures these paths are not baked into the
+  # layer, so skipping the apt cleanup here keeps the image size unchanged
+  # while preserving the cache for incremental rebuilds.
   if [ -f /etc/debian_version ]; then
     echo "Removing python3-pygments from Ubuntu..."
     apt-get remove -y python3-pygments || true
     apt-get autoremove -y || true
-    apt-get clean
-    rm -rf /var/lib/apt/lists/*
   elif [ -f /etc/redhat-release ]; then
     echo "Removing python3-pygments from Rocky Linux..."
     dnf remove -y python3-pygments || true
@@ -53,8 +58,9 @@ cleanup() {
   # Clean up temporary files
   rm -rf /tmp/* /var/tmp/*
 
-  # Clean up pip cache
-  pip3 cache purge || true
+  # pip's wheel cache lives at /root/.cache/pip, which is also a BuildKit
+  # cache mount in the devel stage. `pip3 cache purge` would empty that
+  # mount; rely on the mount lifecycle instead.
 
   # Clean up documentation
   rm -rf /usr/share/doc/* /usr/share/man/* /usr/share/info/*

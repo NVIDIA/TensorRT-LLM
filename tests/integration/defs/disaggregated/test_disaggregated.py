@@ -32,7 +32,7 @@ import yaml
 from defs.common import get_free_port_in_ci as get_free_port
 from defs.common import parse_gsm8k_output, wait_for_server
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
-                           skip_no_hopper, skip_pre_blackwell)
+                           skip_no_hopper, skip_pre_blackwell, skip_pre_hopper)
 from defs.trt_test_alternative import check_call, check_output, print_info
 from disagg_test_utils import (ProcessWrapper, run_ctx_worker,
                                run_disagg_server, run_gen_worker, terminate,
@@ -263,6 +263,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_cancel_stress_test_large.yaml",
         "llama31_8b_ucx":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b_ucx.yaml",
+        "mamba_conc_greater_than_mbs":
+        f"{test_configs_root}/disagg_config_mamba_conc_greater_than_mbs.yaml",
     }
 
     if test_desc not in config_map:
@@ -917,6 +919,7 @@ def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
                            cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
 @pytest.mark.parametrize("ctx_pp", [1, 4], ids=["ctx_pp1", "ctx_pp4"])
@@ -1976,6 +1979,7 @@ def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
         return False, accuracy_value
 
 
+@skip_pre_hopper
 @pytest.mark.parametrize("benchmark_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
@@ -2497,3 +2501,40 @@ def test_disaggregated_cancel_large_context_requests_long(
                                   requests_per_burst=32,
                                   model_path=model_dir,
                                   cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(8)
+@skip_pre_blackwell
+@pytest.mark.parametrize("model_path",
+                         ['NVIDIA-Nemotron-3-Super-120B-A12B-FP8'])
+def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
+                                                   llm_venv, model_path,
+                                                   benchmark_root,
+                                                   shared_gpt_path):
+    model_dir = f"{llm_models_root()}/{model_path}"
+    setup_model_symlink(llm_venv, model_dir, model_path)
+
+    config_file = get_test_config("mamba_conc_greater_than_mbs",
+                                  disaggregated_example_root,
+                                  os.path.dirname(__file__))
+
+    env = llm_venv._new_env.copy()
+    # Need to set UCX_TLS to ^ib to avoid hangs on CI B200 cluster.
+    env["UCX_TLS"] = "^ib"
+    e2el, ttft = run_disaggregated_benchmark(
+        disaggregated_example_root,
+        config_file,
+        benchmark_root,
+        model_dir,
+        shared_gpt_path,
+        env=env,
+        num_prompts=40,
+        max_concurrency=4,
+        random_input_len=1024,
+        random_output_len=1024,
+        skip_warmup=True,
+        model_path=model_dir,
+        cwd=llm_venv.get_working_directory())
+    print(f"E2EL: {e2el} ms, TTFT: {ttft} ms")
+
+    assert e2el > 0 and ttft > 0

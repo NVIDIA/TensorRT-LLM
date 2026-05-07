@@ -71,7 +71,7 @@ def nano_llm_model():
     nano_llm = LLM(
         model=MODEL_PATH,
         tensor_parallel_size=1,
-        max_batch_size=2,
+        max_batch_size=24,
         cuda_graph_config=CudaGraphConfig(),
         kv_cache_config=KvCacheConfig(enable_block_reuse=False, mamba_ssm_cache_dtype="float32"),
     )
@@ -683,12 +683,13 @@ class TestChunkedPrefillCaching:
 
     def _make_param_with_runtime(self, modality_type, num_tokens, **extra):
         """Build a real MultimodalParams with runtime data for caching."""
+        # Single contiguous mm block of `num_tokens` tokens, none cached yet:
+        # mask = all-True over the chunk, cumsum = [1, 2, ..., num_tokens].
+        embed_mask_cumsum = torch.arange(1, num_tokens + 1, dtype=torch.int64)
         runtime = MultimodalRuntimeData(
             past_seen_token_num=0,
-            mm_token_lengths=[num_tokens],
-            mm_token_positions=[0],
             chunk_end_pos=num_tokens,
-            special_token_offsets=[],
+            embed_mask_cumsum=embed_mask_cumsum,
         )
         # Mirror the nested shape produced by the input processor: a dict
         # keyed by `modality_type` holds per-modality side-channel data.

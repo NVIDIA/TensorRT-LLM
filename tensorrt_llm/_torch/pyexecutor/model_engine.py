@@ -19,7 +19,8 @@ from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
                                  trace_func)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
-                                            MultimodalRuntimeData)
+                                            MultimodalRuntimeData,
+                                            check_mm_embed_cumsum_if_needed)
 from tensorrt_llm.inputs.registry import (create_input_processor,
                                           create_input_processor_with_hash)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, TorchCompileConfig,
@@ -98,6 +99,46 @@ class ModelEngine(ABC):
         return
 
 
+def _filter_piecewise_capture_num_tokens(
+    candidate_num_tokens: list[int],
+    max_num_tokens: int,
+    max_batch_size: int,
+    max_seq_len: int,
+    num_extra_decoding_steps: int = 0,
+) -> Tuple[list[int], list[int]]:
+    """Cap piecewise CUDA graph capture candidates at the engine's reachable
+    `num_tokens` ceiling `max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)`
+    and ensure the ceiling itself is captured.
+
+    Each in-flight request must leave room for at least one decode token,
+    so the ceiling is the largest forward-pass `num_tokens` the warmup
+    builder can construct. Including it in the capture set closes the
+    runtime padding gap between the next-largest candidate and the ceiling
+    (otherwise ISLs in that gap have no graph >= them and fall back to
+    eager).
+
+    Returns `(kept, unrecordable)` where `kept` is sorted ascending,
+    deduped, and contains the ceiling whenever it is positive.
+    `unrecordable` is the sorted unique set of input entries above the
+    ceiling but within `max_num_tokens`.
+    """
+    max_capturable_num_tokens = max(
+        0, max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps))
+    piecewise_capacity_limit = min(max_num_tokens, max_capturable_num_tokens)
+    kept = sorted(
+        {i
+         for i in candidate_num_tokens if 0 < i <= piecewise_capacity_limit})
+    if piecewise_capacity_limit > 0 and (not kept or kept[-1]
+                                         < piecewise_capacity_limit):
+        kept.append(piecewise_capacity_limit)
+    unrecordable = sorted({
+        i
+        for i in candidate_num_tokens
+        if max_capturable_num_tokens < i <= max_num_tokens
+    })
+    return kept, unrecordable
+
+
 def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
                                    max_batch_size: int, max_num_tokens: int,
                                    max_total_draft_tokens: int,
@@ -166,8 +207,12 @@ class PyTorchModelEngine(ModelEngine):
 
         if checkpoint_loader is None:
             checkpoint_loader = _construct_checkpoint_loader(
-                llm_args.backend, llm_args.checkpoint_loader,
-                llm_args.checkpoint_format)
+                llm_args.backend,
+                llm_args.checkpoint_loader,
+                llm_args.checkpoint_format,
+                mx_config=llm_args.mx_config,
+                mx_model_name=llm_args.model,
+            )
 
         self.mapping = mapping
         if mapping.has_pp():
@@ -285,10 +330,23 @@ class PyTorchModelEngine(ModelEngine):
             torch_compile_piecewise_cuda_graph_num_tokens
             or cuda_graph_batch_sizes or [])
 
-        self._piecewise_cuda_graph_num_tokens = [
-            i for i in piecewise_cuda_graph_num_tokens
-            if i <= self.max_num_tokens
-        ]
+        num_extra_decoding_steps = self._get_num_extra_decoding_steps()
+        self._piecewise_cuda_graph_num_tokens, unrecordable = (
+            _filter_piecewise_capture_num_tokens(
+                piecewise_cuda_graph_num_tokens,
+                max_num_tokens=self.max_num_tokens,
+                max_batch_size=self.batch_size,
+                max_seq_len=self.max_seq_len,
+                num_extra_decoding_steps=num_extra_decoding_steps,
+            ))
+        if unrecordable:
+            logger.warning(
+                f"Skipping piecewise CUDA graph capture for num_tokens="
+                f"{unrecordable}: exceeds reachable ceiling "
+                f"max_batch_size*(max_seq_len-1-num_extra_decoding_steps)="
+                f"{max(0, self.batch_size * (self.max_seq_len - 1 - num_extra_decoding_steps))}. "
+                f"Capturing the ceiling itself; raise max_seq_len for larger graphs."
+            )
 
         try:
             use_ub_for_nccl = (
@@ -2320,26 +2378,34 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq.append(past_seen_token_num)
             request.cached_tokens = num_cached_tokens_per_seq[-1]
 
-            # Multimodal
-            py_multimodal_runtime = MultimodalRuntimeData(
-                mm_token_lengths=request.multimodal_lengths,
-                mm_token_positions=request.multimodal_positions,
-                past_seen_token_num=past_seen_token_num,
-                chunk_end_pos=end_compute,
-                special_token_offsets=request.py_multimodal_data.get(
-                    'special_token_offsets', []),
-            ) if request.multimodal_hashes is not None else None
+            # Embed mask is required only for partial iterations (chunked
+            # prefill or KV-cache reuse); full-prefill degrades gracefully.
+            check_mm_embed_cumsum_if_needed(
+                request.py_multimodal_data,
+                begin_compute=past_seen_token_num,
+                end_compute=end_compute,
+                prompt_len=len(all_prompt_tokens),
+            )
+            mm_data = request.py_multimodal_data or {}
+            cumsum = mm_data.get('multimodal_embed_mask_cumsum')
+            py_multimodal_runtime = None
+            if cumsum is not None:
+                py_multimodal_runtime = MultimodalRuntimeData(
+                    embed_mask_cumsum=cumsum,
+                    past_seen_token_num=past_seen_token_num,
+                    chunk_end_pos=end_compute,
+                )
 
             multimodal_params = MultimodalParams(
                 multimodal_data=request.py_multimodal_data,
                 multimodal_runtime=py_multimodal_runtime)
             if multimodal_params.has_content():
                 if self.use_mrope:
-                    ctx_mrope_position_ids = multimodal_params.multimodal_data[
-                        'mrope_config'][
-                            'mrope_position_ids'][:, :,
-                                                  begin_compute:begin_compute +
-                                                  len(prompt_tokens)]
+                    mrope_pos_ids = multimodal_params.multimodal_data[
+                        'mrope_config']['mrope_position_ids']
+                    ctx_mrope_position_ids = mrope_pos_ids[:, :, begin_compute:
+                                                           begin_compute +
+                                                           len(prompt_tokens)]
                     # Record as (start_idx, end_idx, (3,1,L) mrope_pos_ids)
                     mrope_position_ids.append(
                         (len(position_ids) - len(prompt_tokens),
@@ -4048,6 +4114,10 @@ class PyTorchModelEngine(ModelEngine):
         if not multimodal_params or len(multimodal_params) == 0:
             # Return empty embeddings if no multimodal data
             return {'mm_embeddings': []}
+        # TODO(TRTLLM-12175): split encoder outputs by explicit per-request
+        # encoder-output embedding lengths. multimodal_lengths is a
+        # prompt-side MM-token count and may include non-embedding
+        # special/framing tokens.
         if getattr(scheduled_requests.context_requests[0], 'multimodal_lengths',
                    None) is None:
             multimodal_chunks = None

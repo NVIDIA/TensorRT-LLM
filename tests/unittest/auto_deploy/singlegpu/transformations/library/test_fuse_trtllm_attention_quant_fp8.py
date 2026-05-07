@@ -4,6 +4,7 @@ import torch.nn as nn
 from _torch_test_utils import fp8_compatible
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy._compat import KvCacheConfig
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention.trtllm_attention import (
     get_trtllm_attention_fp8_input_scale,
 )
@@ -11,7 +12,6 @@ from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_op_args, is_op
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 
 def _build_fp8_linear_args(hidden_size: int, out_features: int, device: torch.device):

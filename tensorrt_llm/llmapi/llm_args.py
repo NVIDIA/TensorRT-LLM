@@ -344,9 +344,11 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
     enable_heuristic_topk: bool = Field(
         default=False,
         description=
-        "Whether to reuse previous step's TopK indices as heuristic hints "
-        "for the decode indexer TopK kernel, reducing threshold search iterations."
-    )
+        "Whether to enable Guess-Verify-Refine (GVR) Top-K for the DSA decode "
+        "indexer. GVR reuses previous-step Top-K indices as hints to reduce "
+        "threshold search iterations. Currently supported for index_topk=2048 "
+        "on Blackwell (SM100+) and falls back to the production insertion/radix "
+        "Top-K path when prerequisites are not met.")
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -624,6 +626,29 @@ class AttentionDpConfig(StrictBaseModel):
         description=
         "Weight (beta) for the load-balance term in KV cache-aware routing. "
         "Higher values prioritize load balance over cache affinity. "
+        "Only used when enable_kv_cache_aware_routing is True.")
+    kv_cache_routing_match_rate_threshold: float = Field(
+        default=0.1,
+        description=
+        "Cache-affinity gate in KV cache-aware routing. For each request, "
+        "match_len contributes to scoring only when max(match_len) / "
+        "request_tokens across eligible ranks is strictly above this "
+        "threshold; otherwise match_len is forced to 0 so routing is driven "
+        "purely by load. Default 0.1 requires at least a 10% hit rate before "
+        "cache affinity kicks in, which prevents a small universal prefix "
+        "(e.g. a shared system prompt) from pinning all traffic to the "
+        "first warm ranks. Set to 0.0 to honour any nonzero match. "
+        "Only used when enable_kv_cache_aware_routing is True.")
+    kv_cache_routing_fair_share_multiplier: float = Field(
+        default=2.0,
+        description=
+        "Loose per-rank active-request cap in KV cache-aware routing, "
+        "expressed as a multiplier of the ceil fair-share "
+        "(ceil((total_active + new) / tp_size)). Once a rank hits this cap "
+        "within a scheduling batch it is removed from the eligible set for "
+        "the remainder of the batch. Default 2.0 permits a 2x slack so "
+        "cache affinity can dominate while preventing runaway concentration "
+        "on a single rank. Set to 1.0 for strict fair share. "
         "Only used when enable_kv_cache_aware_routing is True.")
 
     @model_validator(mode='after')
@@ -3530,6 +3555,50 @@ class LoadFormat(Enum):
     VISION_ONLY = 2
 
 
+class ModelExpressConfig(StrictBaseModel):
+    """Prototype configuration for ModelExpress (MX) weight transfer."""
+
+    server_url: Optional[str] = Field(
+        default=None,
+        description="URL of the MX (ModelExpress) server for P2P weight "
+        "transfer. When set together with checkpoint_format='MX', enables "
+        "GPU-to-GPU weight transfer from a running source instance, bypassing "
+        "disk I/O. When the server is unreachable, loading falls back to the "
+        "standard HuggingFace checkpoint path.",
+        status="prototype",
+    )
+
+    server_query_timeout_s: Optional[NonNegativeInt] = Field(
+        default=None,
+        description="Timeout in seconds for upstream MxLiveWeightLoader source "
+        "discovery. When unset, TRT-LLM first probes for existing sources: "
+        "no source uses a short 30-second fallback cap, while an existing "
+        "source uses modelexpress's default wait for long donor loads.",
+        status="prototype",
+    )
+
+    preshard_strategy: str = Field(
+        default="per_module",
+        description="How to inform TRT-LLM that MX-delivered weights are already "
+        "TP-sharded for the local rank. Only 'per_module' is supported in "
+        "this MX-only PR; 'global' requires LoadFormat.PRESHARDED.",
+        status="prototype",
+    )
+
+    @model_validator(mode="after")
+    def validate_preshard_strategy(self) -> 'ModelExpressConfig':
+        if self.preshard_strategy not in ("per_module", "global"):
+            raise ValueError(
+                f"mx_config.preshard_strategy must be 'per_module' or 'global', "
+                f"got '{self.preshard_strategy}'.")
+        if self.preshard_strategy == "global":
+            raise ValueError(
+                "mx_config.preshard_strategy='global' requires "
+                "LoadFormat.PRESHARDED, which is not yet available in "
+                "TRT-LLM main. Use preshard_strategy='per_module' instead.")
+        return self
+
+
 class SamplerType(StrEnum):
     """Enum for sampler type options."""
     TRTLLMSampler = "TRTLLMSampler"
@@ -3759,6 +3828,12 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    mx_config: ModelExpressConfig = Field(
+        default_factory=ModelExpressConfig,
+        description="ModelExpress (MX) P2P checkpoint loading config.",
+        status="prototype",
+    )
+
     kv_connector_config: Optional[KvCacheConnectorConfig] = Field(
         default=None,
         description="The config for KV cache connector.",
@@ -3819,6 +3894,19 @@ class TorchLlmArgs(BaseLlmArgs):
     use_cute_dsl_blockscaling_bmm: bool = Field(
         default=False,
         description="If true, use CuTe DSL fp8 blockscaling bmm implementation.",
+        status="prototype",
+    )
+    # bf16 cute dsl configs
+    use_cute_dsl_bf16_bmm: bool = Field(
+        default=False,
+        description=
+        "If true, use CuTe DSL bf16 persistent GEMM for BMM on Blackwell.",
+        status="prototype",
+    )
+    use_cute_dsl_bf16_gemm: bool = Field(
+        default=False,
+        description=
+        "If true, use CuTe DSL bf16 persistent GEMM for Linear layers on Blackwell.",
         status="prototype",
     )
 
@@ -4007,6 +4095,29 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode="after")
+    def validate_mx_config(self) -> 'TorchLlmArgs':
+        # When MX is the active checkpoint format and the user did not
+        # explicitly set ``mx_config.server_url``, honor the ``MODEL_EXPRESS_URL``
+        # env var that the upstream ``modelexpress`` library reads. This
+        # lets orchestrators configure MX via the environment while keeping
+        # the resolved value visible on ``llm_args.mx_config.server_url``.
+        if self.checkpoint_format == "MX" and self.mx_config.server_url is None:
+            env_url = os.environ.get("MODEL_EXPRESS_URL")
+            if env_url:
+                logger.info(
+                    "mx_config.server_url not set; using MODEL_EXPRESS_URL=%s "
+                    "from environment.", env_url)
+                self.mx_config.server_url = env_url
+
+        if self.mx_config.server_url is not None and self.checkpoint_format != "MX":
+            logger.warning(
+                "mx_config.server_url is set but checkpoint_format is '%s', not "
+                "'MX'. The MX config will be ignored. Set "
+                "checkpoint_format='MX' to enable MX P2P weight transfer.",
+                self.checkpoint_format)
+        return self
+
+    @model_validator(mode="after")
     def validate_load_balancer(self) -> 'TorchLlmArgs':
         if isinstance(self.moe_config.load_balancer, str):
             if not os.path.exists(self.moe_config.load_balancer):
@@ -4103,6 +4214,18 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError(
                 "ray_placement_config is only supported with orchestrator_type='ray'"
             )
+        return self
+
+    @model_validator(mode='after')
+    def validate_cute_dsl_bf16(self) -> 'TorchLlmArgs':
+        if self.use_cute_dsl_bf16_bmm or self.use_cute_dsl_bf16_gemm:
+            major, minor = torch.cuda.get_device_capability()
+            sm = major * 10 + minor
+            if sm < 100:
+                raise ValueError(
+                    f"use_cute_dsl_bf16_bmm and use_cute_dsl_bf16_gemm are only "
+                    f"supported on Blackwell (sm >= 100), but current device has "
+                    f"sm {sm}.")
         return self
 
     def get_executor_config(

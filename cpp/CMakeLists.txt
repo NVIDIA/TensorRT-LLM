@@ -324,14 +324,17 @@ if(UNIX)
 endif()
 
 # Emit CUDA line info for Debug and RelWithDebInfo so nsys/ncu can map samples
-# back to source, and emit full device debug info (-G) for Debug so cuda-gdb can
-# step through kernels. These flags inflate section sizes significantly, so
-# building these configurations for all CUDA architectures at once will fail to
-# link -- build_wheel.py enforces that a specific --cuda_architectures must be
-# passed in that case.
+# back to source. This inflates section sizes significantly, so building these
+# configurations for all CUDA architectures at once will fail to link --
+# build_wheel.py enforces that a specific --cuda_architectures must be passed in
+# that case. Note: full device debug info (-G) is intentionally NOT enabled by
+# default for Debug -- it can make ptxas memory usage explode on some kernels
+# and get OOM-killed in CI. Developers who need cuda-gdb stepping can opt in via
+# `build_wheel.py --extra-cmake-vars CMAKE_CUDA_FLAGS_DEBUG=-G` on a host with
+# enough memory for ptxas.
 # cmake-format: off
 set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "${CMAKE_CUDA_FLAGS_RELWITHDEBINFO} --generate-line-info")
-set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} --generate-line-info -G")
+set(CMAKE_CUDA_FLAGS_DEBUG "${CMAKE_CUDA_FLAGS_DEBUG} --generate-line-info")
 # cmake-format: on
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss ")

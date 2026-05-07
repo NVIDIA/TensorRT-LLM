@@ -99,6 +99,10 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      mx_config:
+        annotation: tensorrt_llm.llmapi.llm_args.ModelExpressConfig
+        default: null
+        status: prototype
       mm_encoder_only:
         annotation: bool
         default: False
@@ -264,6 +268,14 @@ methods:
         default: False
         status: prototype
       use_cute_dsl_blockscaling_bmm:
+        annotation: bool
+        default: False
+        status: prototype
+      use_cute_dsl_bf16_bmm:
+        annotation: bool
+        default: False
+        status: prototype
+      use_cute_dsl_bf16_gemm:
         annotation: bool
         default: False
         status: prototype
