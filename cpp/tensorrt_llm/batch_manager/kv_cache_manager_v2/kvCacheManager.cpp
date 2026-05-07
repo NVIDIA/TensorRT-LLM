@@ -26,6 +26,7 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <map>
 #include <numeric>
 #include <stdexcept>
@@ -103,8 +104,8 @@ KvCacheManager::~KvCacheManager()
 void KvCacheManager::shutdown()
 {
     clearReusableBlocks();
-    if (mStorage)
-        mStorage->destroy();
+    assert(mStorage);
+    mStorage->destroy();
 }
 
 void KvCacheManager::clearReusableBlocks()

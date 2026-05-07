@@ -425,8 +425,7 @@ DiskSlotPool::~DiskSlotPool()
 
 int DiskSlotPool::numSlots() const noexcept
 {
-    if (mFd == kBadFileDescriptor)
-        return 0;
+    assert(mFd != kBadFileDescriptor);
     off_t sz = ::lseek(mFd, 0, SEEK_END);
     return (sz < 0 || mSlotSize == 0) ? 0 : static_cast<int>(sz / static_cast<off_t>(mSlotSize));
 }

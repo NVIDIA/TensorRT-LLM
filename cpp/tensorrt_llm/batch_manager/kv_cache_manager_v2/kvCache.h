@@ -339,7 +339,7 @@ public:
     Priority getPriority(BlockOrdinal ordinal, LifeCycleId lc) const;
 
     // Reference to StorageManager (for page acquisition/release).
-    std::weak_ptr<StorageManager> storageManager() const;
+    StorageManager* storageManager() const;
 
     KvCacheManager& manager() const noexcept
     {
@@ -451,12 +451,12 @@ private:
     int mCapacity;
     int mHistoryLength;
 
-    std::vector<SeqBlock> mBlocks;
-
     // Page index tables: [beamIdx][lcId] → either an internal vector or an external span.
     // Mirrors Python's IndexSeq = array.array | memoryview.
     using PageIndexBuf = std::variant<std::vector<int>, Span<int>>;
     std::vector<std::vector<PageIndexBuf>> mBasePageIndices; // [beamIdx][lcId]
+
+    std::vector<SeqBlock> mBlocks;
 
     std::vector<TokenIdExt> mCommittedTokens;
     int mNumCommittedBlocks;

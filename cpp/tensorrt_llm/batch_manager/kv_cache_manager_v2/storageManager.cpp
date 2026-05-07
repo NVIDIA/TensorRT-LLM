@@ -659,8 +659,7 @@ int StorageManager::getPoolGroupIndex(LifeCycleId lc) const
 
 int StorageManager::mNumPools(PoolGroupIndex pgIdx) const
 {
-    if (mLevels.empty())
-        return 0;
+    assert(!mLevels.empty());
     return getUniformAttribute(mLevels, [pgIdx](auto const& lvl) { return lvl.storage->numPools(pgIdx); });
 }
 
@@ -716,7 +715,8 @@ std::vector<float> StorageManager::getUtilization(CacheLevel level) const
     for (int pg = 0; pg < numPoolGroups(); ++pg)
     {
         auto const s = getStatistics(level, static_cast<PoolGroupIndex>(pg));
-        result.push_back(s.total > 0 ? static_cast<float>(s.unavailable()) / static_cast<float>(s.total) : 0.f);
+        assert(s.total > 0);
+        result.push_back(static_cast<float>(s.unavailable()) / static_cast<float>(s.total));
     }
     return result;
 }
@@ -733,7 +733,8 @@ float StorageManager::getOverallUtilization(CacheLevel level) const
         num += sz * static_cast<float>(s.unavailable());
         den += sz * static_cast<float>(s.total);
     }
-    return den > 0.f ? num / den : 0.f;
+    assert(den > 0.f);
+    return num / den;
 }
 
 // ---------------------------------------------------------------------------

@@ -89,9 +89,9 @@ struct RootBlock
     BlockKey key;
     std::optional<int64_t> loraTaskId;
     std::unordered_map<BlockKey, std::shared_ptr<Block>> next;
-    std::weak_ptr<BlockRadixTree> tree; // back-reference (weak)
+    BlockRadixTree* tree; // back-reference (non-owning)
 
-    RootBlock(std::optional<int64_t> loraTaskId, std::shared_ptr<BlockRadixTree> const& tree);
+    RootBlock(std::optional<int64_t> loraTaskId, BlockRadixTree* tree);
 
     static BlockKey makeKey(std::optional<int64_t> loraTaskId);
 
@@ -162,7 +162,7 @@ struct Block : std::enable_shared_from_this<Block>
 // next: loraTaskId → RootBlock.
 // Mirrors Python's BlockRadixTree.
 // ---------------------------------------------------------------------------
-class BlockRadixTree : public std::enable_shared_from_this<BlockRadixTree>
+class BlockRadixTree
 {
 public:
     BlockRadixTree(LifeCycleRegistry const& lifeCycles, int tokensPerBlock);

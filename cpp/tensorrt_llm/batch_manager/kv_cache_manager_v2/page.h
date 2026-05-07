@@ -47,14 +47,14 @@ class SharedPageLock;
 class Page : public Slot, public std::enable_shared_from_this<Page>
 {
 public:
-    std::weak_ptr<StorageManager> manager;
+    StorageManager* manager;
     LifeCycleId lifeCycle;
     CacheLevel cacheLevel;
     Priority priority;
     std::weak_ptr<PageHolder> holder; // empty → DROPPABLE
     std::optional<NodeRef> nodeRef;   // present → scheduled for eviction
 
-    Page(std::shared_ptr<StorageManager> mgr, LifeCycleId lc, CacheLevel level, Priority prio);
+    Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio);
 
     virtual ~Page();
 
@@ -84,8 +84,7 @@ class CommittedPage : public Page
 public:
     std::weak_ptr<Block> block;
 
-    CommittedPage(std::shared_ptr<StorageManager> mgr, std::shared_ptr<Block> blk, LifeCycleId lc, CacheLevel level,
-        Priority prio);
+    CommittedPage(StorageManager* mgr, std::shared_ptr<Block> blk, LifeCycleId lc, CacheLevel level, Priority prio);
 
     ~CommittedPage() override;
 
@@ -101,7 +100,7 @@ public:
 class UncommittedPage : public Page
 {
 public:
-    std::weak_ptr<KvCache> kvCache;
+    KvCache* kvCache;
     BlockOrdinal ordinal;
     BeamIndex beamIndex;
     std::vector<TokenIdExt> tokens;
@@ -173,7 +172,7 @@ public:
 // ---------------------------------------------------------------------------
 struct LockOwner
 {
-    std::weak_ptr<KvCache> kvCache;
+    KvCache* kvCache;
     BeamIndex beamIndex;
     BlockOrdinal ordinal;
     LifeCycleId lifeCycle;

@@ -150,11 +150,9 @@ void HostMem::destroy()
 
 void HostMem::madviseHugepages()
 {
-    if (mAddr && mSize)
-    {
-        // Advisory — ignore failures.
-        ::madvise(reinterpret_cast<void*>(mAddr), mSize, MADV_HUGEPAGE);
-    }
+    assert(mAddr && mSize);
+    // Advisory — ignore failures.
+    ::madvise(reinterpret_cast<void*>(mAddr), mSize, MADV_HUGEPAGE);
 }
 
 void HostMem::registerToCuda()
