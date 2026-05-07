@@ -4345,14 +4345,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if key not in self.tuning_config_cache:
                 self.tuning_config_cache[key] = TuningConfig(
                     dynamic_tensor_specs=(DynamicTensorSpec(
-                        0, 0, get_last_power_of_2_num_tokens_buckets,
-                        last_positive_power_of_2), ),
+                        0, 0, deep_gemm_gen_tuning_buckets), ),
                     constraint_specs=(
                         ConstraintSpec(2, 0, fp4_scale_infer_shape),
                         ConstraintSpec(4, 0, lambda shapes: shapes[0][0]),
                     ),
                     use_cold_l2_cache=True,
-                    tune_max_num_tokens=256,
+                    tune_max_num_tokens=512,
                     distributed_tuning_strategy=DistributedTuningStrategy.
                     PARALLEL,
                 )
