@@ -18,8 +18,9 @@ from pathlib import Path
 import pytest
 import torch
 import yaml
-from defs.conftest import (get_device_count, get_llm_root, llm_models_root,
-                           skip_pre_ada, skip_pre_blackwell, skip_pre_hopper)
+from defs.conftest import (get_device_count, get_device_memory, get_llm_root,
+                           llm_models_root, skip_pre_ada, skip_pre_blackwell,
+                           skip_pre_hopper)
 from test_common.llm_data import hf_id_to_local_model_dir
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
@@ -569,11 +570,11 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
             pytest.skip(f"Not enough devices for world_size={world_size}")
         model_path = self.MODEL_PATHS[model_id]
         kwargs = {}
-        free_memory_mib = torch.cuda.mem_get_info(0)[0] / 1024**2
-        # bf16 always needs low-memory overrides; below H100-class free memory,
-        # the quantized variants do too, since the 30B FP8 / NVFP4
+        device_memory_mib = get_device_memory()
+        # bf16 always needs low-memory overrides; below H100-class total
+        # memory, the quantized variants do too, since the 30B FP8 / NVFP4
         # weights leave too little headroom for the nano_v3.yaml defaults.
-        if model_id == "bf16" or free_memory_mib < 80000:
+        if model_id == "bf16" or device_memory_mib < 80000:
             low_memory_overrides(kwargs)
         kwargs["attn_backend"] = attn_backend
 
