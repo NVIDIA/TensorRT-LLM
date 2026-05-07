@@ -167,6 +167,15 @@ class InputBuffer:
             self._device_views[name] = self._trunc_device_bufs[name].view(dtype)
             self._host_views[name] = self._trunc_host_bufs[name].view(dtype)
 
+        # Cache numpy views over host buffers. ``stage`` writes through these to skip
+        # torch slicing / .numpy() dispatcher overhead on every call.
+        self._host_np_views: Dict[str, np.ndarray] = {}
+        self._refresh_host_np_views()
+
+    def _refresh_host_np_views(self) -> None:
+        """(Re)build the cached numpy views of host buffers."""
+        self._host_np_views = {name: view.numpy() for name, view in self._host_views.items()}
+
     def _create_contiguous_views(self) -> None:
         """Create typed views into the contiguous host and device buffers."""
         for name in self._contiguous_names:
@@ -234,10 +243,10 @@ class InputBuffer:
             Number of elements stored.
         """
         numel, dtype = self._tensor_specs[name]
-        host_view = self.get_host_view(name)
+        np_view = self._host_np_views[name]
 
         if fill_value is not None:
-            host_view.fill_(fill_value)
+            np_view.fill(fill_value)
 
         # convert to tensor via numpy (numpy is ~2-3x faster than torch.tensor for large lists)
         if not isinstance(data, torch.Tensor):
@@ -245,10 +254,10 @@ class InputBuffer:
 
         length = data.numel()
         assert length <= numel, f"Data too large for buffer '{name}': {length} > {numel}"
-        # Use numpy for the memcpy into pinned memory — avoids torch dispatcher overhead
-        dst = host_view[:length].numpy()
-        src = (data if data.dtype == dtype else data.to(dtype)).numpy()
-        np.copyto(dst, src)
+        # Direct numpy slice assignment into the cached pinned-buffer view —
+        # avoids per-call torch slicing and .numpy() dispatcher overhead on the dst side.
+        src_np = (data if data.dtype == dtype else data.to(dtype)).numpy()
+        np_view[:length] = src_np
 
         self._current_lengths[name] = length
         return length
@@ -353,6 +362,7 @@ class InputBuffer:
         # Recreate typed views
         self._device_views[name] = self._trunc_device_bufs[name].view(dtype)
         self._host_views[name] = self._trunc_host_bufs[name].view(dtype)
+        self._refresh_host_np_views()
 
     def to(self, *args, **kwargs) -> None:
         """Move all device buffers to a new device/dtype."""
@@ -720,6 +730,13 @@ class SequenceInfo:
         self._extra_args: Dict[str, Optional[torch.Tensor]] = {}
         ############################################################################################
 
+        # named_args cache. Rebuilding the dict (12-15 get_arg calls + slice/view creation per
+        # shapeable arg) is ~80 µs/iter and runs every forward step. The signature captures
+        # (total_num_tokens, is_generate_only); _active_args additions and device moves
+        # explicitly invalidate.
+        self._cached_named_args_main: Optional[Dict[str, torch.Tensor]] = None
+        self._cached_named_args_sig: Optional[Tuple[int, bool]] = None
+
         # HOST PREPARE FOR ATTENTION FORWARD #######################################################
         self._host_prepare_functions: List[Tuple[PrepareMetadataHostCallable, List[str]]] = []
 
@@ -802,13 +819,22 @@ class SequenceInfo:
         return arg
 
     def _named_args(self, include_extra_args: bool = True) -> Dict[str, torch.Tensor]:
-        args = {k: self.get_arg(k) for k in self._active_args}
+        sig = (self.total_num_tokens, self.is_generate_only)
+        if self._cached_named_args_sig != sig or self._cached_named_args_main is None:
+            self._cached_named_args_main = {k: self.get_arg(k) for k in self._active_args}
+            self._cached_named_args_sig = sig
 
-        # check other args to include
         if include_extra_args:
+            # Copy cached dict and overlay extras; never mutate the cache in place.
+            args = dict(self._cached_named_args_main)
             args.update(self._extra_args)
+            return args
+        return dict(self._cached_named_args_main)
 
-        return args
+    def _invalidate_named_args_cache(self) -> None:
+        """Clear the named_args cache. Call when active args, device, or buffer views change."""
+        self._cached_named_args_main = None
+        self._cached_named_args_sig = None
 
     @property
     def available_args(self) -> Set[str]:
@@ -890,6 +916,7 @@ class SequenceInfo:
 
         if estimated_capacity > cache_loc_capacity:
             self._input_buffer.resize("cache_loc", estimated_capacity)
+            self._invalidate_named_args_cache()
 
     def activate_arg(self, arg_name: str) -> bool:
         """Activate a desired argument.
@@ -903,6 +930,7 @@ class SequenceInfo:
         self._use_flattened_layout = True
         if arg_name not in self._active_args:
             self._active_args += (arg_name,)
+            self._invalidate_named_args_cache()
             return True
         return False
 
@@ -914,6 +942,7 @@ class SequenceInfo:
         for k, v in self._extra_args.items():
             if v is not None:
                 self._extra_args[k] = v.to(*args, **kwargs)
+        self._invalidate_named_args_cache()
 
     def set_example_sequence(
         self,
@@ -1055,10 +1084,11 @@ class SequenceInfo:
         if data is None:
             return None
 
-        with nvtx_range(f"ad_stage_{name}_on_host"):
-            # Store to the InputBuffer's pinned host memory
-            name = name.removesuffix(self._host_suffix)
-            self._input_buffer.stage(name, data, fill_value=reset_val)
+        # The per-arg NVTX range is intentionally omitted; the outer
+        # ``ad_nest_sequences`` range covers all stage calls and individual
+        # nvtx_range entries cost ~1 µs each, which dominates a 3-5 µs stage.
+        name = name.removesuffix(self._host_suffix)
+        self._input_buffer.stage(name, data, fill_value=reset_val)
 
     def _store_extra_arg(
         self, name: str, tnsr_like: Optional[Union[torch.Tensor, Sequence[torch.Tensor]]]
