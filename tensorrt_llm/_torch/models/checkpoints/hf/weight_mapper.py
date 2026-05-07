@@ -6,6 +6,7 @@ from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from ..base_weight_mapper import BaseWeightMapper
 
 
+@register_mapper("MX")
 @register_mapper("HF")
 class HfWeightMapper(BaseWeightMapper):
 

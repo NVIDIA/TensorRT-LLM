@@ -2357,6 +2357,104 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @parametrize_with_ids("torch_compile", [False, True])
+    @parametrize_with_ids(
+        "fp8kv,attention_dp,cuda_graph,overlap_scheduler",
+        [(False, False, False, False)],
+    )
+    def test_cute_dsl_nvfp4(
+        self,
+        fp8kv,
+        attention_dp,
+        cuda_graph,
+        overlap_scheduler,
+        torch_compile,
+    ):
+        """Test NVFP4 with CuTe DSL blockscaling mm (GEMM+SwiGLU fusion for shared experts)."""
+        sm_version = get_sm_version()
+        if sm_version not in (100, 103):
+            pytest.skip("CuTe DSL blockscaling mm supports SM 100 and 103 only")
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+        torch_compile_config = _get_default_torch_compile_config(torch_compile)
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            torch_compile_config=torch_compile_config,
+            moe_config=MoeConfig(backend="CUTEDSL"),
+            use_cute_dsl_blockscaling_mm=True,
+        )
+
+        if fp8kv:
+            kv_cache_config.dtype = "fp8"
+
+        with LLM(
+                f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only",
+                kv_cache_config=kv_cache_config,
+                **pytorch_config,
+                enable_attention_dp=attention_dp,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @skip_pre_blackwell
+    @parametrize_with_ids("torch_compile", [False, True])
+    @parametrize_with_ids(
+        "fp8kv,attention_dp,cuda_graph,overlap_scheduler",
+        [(False, False, False, False)],
+    )
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size",
+        [(4, 1, 1), (4, 1, 4), (2, 2, 1), (1, 4, 1)],
+        ids=["tp4", "ep4", "tp2pp2", "pp4"],
+    )
+    def test_cute_dsl_nvfp4_4gpus(
+        self,
+        tp_size,
+        pp_size,
+        ep_size,
+        fp8kv,
+        attention_dp,
+        cuda_graph,
+        overlap_scheduler,
+        torch_compile,
+    ):
+        """Test NVFP4 4 GPUs with CuTe DSL blockscaling mm (GEMM+SwiGLU fusion for shared experts)."""
+        sm_version = get_sm_version()
+        if sm_version not in (100, 103):
+            pytest.skip("CuTe DSL blockscaling mm supports SM 100 and 103 only")
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+        torch_compile_config = _get_default_torch_compile_config(torch_compile)
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            torch_compile_config=torch_compile_config,
+            moe_config=MoeConfig(backend="CUTEDSL"),
+            use_cute_dsl_blockscaling_mm=True,
+        )
+
+        if fp8kv:
+            kv_cache_config.dtype = "fp8"
+
+        with LLM(
+                f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only",
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                kv_cache_config=kv_cache_config,
+                **pytorch_config,
+                enable_attention_dp=attention_dp,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("fp8kv,cuda_graph,overlap_scheduler",
                           [(False, False, False), (True, True, True)])
     @parametrize_with_ids("mtp_nextn", [0, 2])
@@ -6464,7 +6562,7 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
                 eagle3_model_arch="mistral_large3")
         with LLM(
                 f"{llm_models_root()}/Mistral-Large-3-675B/Mistral-Large-3-675B-Instruct-2512-NVFP4/",
-                checkpoint_format="mistral",
+                checkpoint_format="mistral_large_3",
                 tensor_parallel_size=tp_size,
                 pipeline_parallel_size=pp_size,
                 moe_expert_parallel_size=ep_size,
@@ -6621,18 +6719,12 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
-    def _run_nvfp4_4gpus_eplb(self, moe_backend, eplb_config):
-        if moe_backend == "TRTLLM":
-            pytest.skip(
-                "TRTLLM + EPLB is not supported yet, see https://nvbugs/5997893."
-            )
-
+    def _run_nvfp4_4gpus_eplb(self, moe_backend, eplb_config, model_path):
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
             mamba_ssm_cache_dtype="float16",
             free_gpu_memory_fraction=0.5,
         )
-        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
         max_batch_size = 32
         cuda_graph_config = CudaGraphConfig(max_batch_size=max_batch_size,
                                             enable_padding=True)
@@ -6680,12 +6772,17 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             num_slots=num_slots,
             initial_global_assignments=initial_global_assignments,
             layer_updates_per_iter=0)
-        self._run_nvfp4_4gpus_eplb(moe_backend, eplb_config)
+        self._run_nvfp4_4gpus_eplb(moe_backend, eplb_config, model_path)
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["GB200"])
     @parametrize_with_ids("moe_backend", ["TRTLLM", "CUTLASS"])
     def test_nvfp4_4gpus_online_eplb(self, moe_backend):
+        if moe_backend == "TRTLLM":
+            pytest.skip(
+                "TRTLLM + online EPLB is not supported yet, see https://nvbugs/5997893."
+            )
+        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
         num_experts = 512  # 512 experts per token for Nemotron V3 Super.
         # num_slots should be larger than or equal to num_experts and should be divisible by parallel_size.
         # Assign extra 16 expert slots per rank.
@@ -6693,7 +6790,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         num_slots = num_experts + extra_num_slots
         eplb_config = MoeLoadBalancerConfig(num_slots=num_slots,
                                             layer_updates_per_iter=2)
-        self._run_nvfp4_4gpus_eplb(moe_backend, eplb_config)
+        self._run_nvfp4_4gpus_eplb(moe_backend, eplb_config, model_path)
 
     @skip_pre_hopper
     @pytest.mark.skip_less_mpi_world_size(4)

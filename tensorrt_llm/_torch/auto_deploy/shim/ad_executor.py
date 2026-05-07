@@ -827,7 +827,7 @@ class ADEngine(ModelEngine):
                 slot_gather_indices.append(start)
                 flat_gather_indices.extend(range(start, start + (1 + draft_len) * stride, stride))
             else:
-                input_ids.append(request.get_token(0, request.get_num_tokens(0) - 1))
+                input_ids.append(request.get_last_tokens(0))
                 input_ids.extend([] if draft_len == 0 else request.py_draft_tokens)
 
             cu_seqlen.append(len(input_ids))
@@ -838,6 +838,8 @@ class ADEngine(ModelEngine):
                 mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
 
         # store cache information for all requests now
+        _tokens_per_block = kv_cache_manager.tokens_per_block
+        _use_mamba = hasattr(kv_cache_manager, "mamba_cache_index")
         cache_loc: List[int] = []
         cu_num_pages: List[int] = [0]
         extra_page_per_seq: List[int] = []
@@ -845,7 +847,7 @@ class ADEngine(ModelEngine):
         for i, request in enumerate(ordered_requests):
             # store seq slot idx (use mamba_cache_index if available)
             request.py_batch_idx = request.py_seq_slot
-            if hasattr(kv_cache_manager, "mamba_cache_index"):
+            if _use_mamba:
                 state_slot_idx_i = kv_cache_manager.mamba_cache_index[request.py_request_id]
             else:
                 state_slot_idx_i = request.py_seq_slot
@@ -854,7 +856,8 @@ class ADEngine(ModelEngine):
             # get some info on the current request
             seq_len_i = cu_seqlen[i + 1] - cu_seqlen[i]
             end_compute_i = input_pos[i] + seq_len_i
-            num_active_blocks_i = kv_cache_manager.get_num_kv_blocks(end_compute_i)
+            # Inline get_num_kv_blocks (pure Python, saves function-call overhead per request)
+            num_active_blocks_i = (end_compute_i + _tokens_per_block - 1) // _tokens_per_block
 
             # construct cache information for the current request
             cache_indices = kv_cache_manager.get_cache_indices(request)

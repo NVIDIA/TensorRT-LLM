@@ -833,7 +833,6 @@ class DeepseekV3Gate(nn.Module):
             bias_dtype = torch.bfloat16
         else:
             bias_dtype = torch.float32
-
         self.e_score_correction_bias = nn.Parameter(torch.empty(
             (num_experts), dtype=bias_dtype),
                                                     requires_grad=False)
