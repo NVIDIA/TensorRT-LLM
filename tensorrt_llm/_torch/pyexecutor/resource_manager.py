@@ -2155,9 +2155,6 @@ class KVCacheManagerV2(BaseResourceManager):
             for layer_id in typed_range(LayerId(num_layers))
         }
 
-        (self.kv_cache_pool_pointers,
-         self.kv_cache_pool_mapping) = self._build_pool_mapping_tensors()
-
         self.kv_cache_map: dict[int, _KVCache] = {}
 
         # Tracks the draft length allocated by try_allocate_generation per
@@ -2221,34 +2218,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         self.index_mapper = IndexMapper(index_mapper_capacity, max_beam_width)
         self._early_freed_index_requests: set[int] = set()
-        self.index_scales = torch.empty(self.num_pools,
-                                        dtype=torch.int32,
-                                        pin_memory=prefer_pinned(),
-                                        device='cpu')
-        self.kv_offset = torch.empty(self.num_pools,
-                                     dtype=torch.int32,
-                                     pin_memory=prefer_pinned(),
-                                     device='cpu')
-        for pool_id in range(self.num_pools):
-            layer_id = self.impl.layer_grouping[pool_id][0]
-            self.index_scales[pool_id] = self.impl.get_page_index_scale(
-                layer_id, Role.KEY)
-            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
-                self.kv_offset[pool_id] = exact_div(
-                    self.impl.get_mem_pool_base_address(layer_id, Role.VALUE) -
-                    self.impl.get_mem_pool_base_address(layer_id, Role.KEY),
-                    self.impl.get_page_stride(layer_id, Role.KEY))
-            else:
-                self.kv_offset[pool_id] = 0
-
-        self.host_kv_cache_block_offsets = torch.empty(
-            self.num_pools,
-            index_mapper_capacity * max_beam_width,
-            2,  # key and value
-            self.max_blocks_per_seq,
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
-            device='cpu')
+        self._prepare_page_table_tensor(index_mapper_capacity)
 
         self._log_kv_cache_pool_lifecycle_mapping()
 
@@ -2312,7 +2282,7 @@ class KVCacheManagerV2(BaseResourceManager):
         for entry in entries:
             logger.info(entry)
 
-    def _build_pool_mapping_tensors(self) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
         kv_cache_pool_pointers = torch.tensor([[
             self.impl.get_mem_pool_base_address(
                 self.impl.layer_grouping[pool_id][0], Role.KEY), 0
@@ -2368,7 +2338,37 @@ class KVCacheManagerV2(BaseResourceManager):
                                              dtype=torch.int32,
                                              device="cpu",
                                              pin_memory=prefer_pinned())
-        return kv_cache_pool_pointers, kv_cache_pool_mapping
+
+        self.kv_cache_pool_pointers = kv_cache_pool_pointers
+        self.kv_cache_pool_mapping = kv_cache_pool_mapping
+        self.index_scales = torch.empty(self.num_pools,
+                                        dtype=torch.int32,
+                                        pin_memory=prefer_pinned(),
+                                        device='cpu')
+        self.kv_offset = torch.empty(self.num_pools,
+                                     dtype=torch.int32,
+                                     pin_memory=prefer_pinned(),
+                                     device='cpu')
+        for pool_id in range(self.num_pools):
+            layer_id = self.impl.layer_grouping[pool_id][0]
+            self.index_scales[pool_id] = self.impl.get_page_index_scale(
+                layer_id, Role.KEY)
+            if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
+                self.kv_offset[pool_id] = exact_div(
+                    self.impl.get_mem_pool_base_address(layer_id, Role.VALUE) -
+                    self.impl.get_mem_pool_base_address(layer_id, Role.KEY),
+                    self.impl.get_page_stride(layer_id, Role.KEY))
+            else:
+                self.kv_offset[pool_id] = 0
+
+        self.host_kv_cache_block_offsets = torch.empty(
+            self.num_pools,
+            index_mapper_capacity * self.max_beam_width,
+            2,  # key and value
+            self.max_blocks_per_seq,
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+            device='cpu')
 
     def _build_cache_config(
         self,
