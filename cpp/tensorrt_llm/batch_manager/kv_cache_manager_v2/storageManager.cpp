@@ -535,8 +535,6 @@ void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, 
 {
     assert(defrag || dstLevel != srcLevel);
     int numSlots = static_cast<int>(srcPages.size());
-    if (numSlots == 0)
-        return;
 
     auto& srcPoolGroup = poolGroup(srcLevel, pgIdx);
     auto& dstPoolGroup = poolGroup(dstLevel, pgIdx);
