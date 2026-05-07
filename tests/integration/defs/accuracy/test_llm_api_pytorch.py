@@ -187,7 +187,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
 
-    @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("use_dynamic_tree", [False, True],
                              ids=["no_dynamic_tree", "dynamic_tree"])
     def test_eagle3_rejection_dynamic_tree_smoke(self, use_dynamic_tree,
@@ -203,17 +202,18 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             allow_advanced_sampling=True,
             use_rejection_sampling=True,
         )
+        max_batch_size = 1
         if use_dynamic_tree:
             spec_config_kwargs.update(
                 use_dynamic_tree=True,
                 dynamic_tree_max_topK=4,
                 max_total_draft_tokens=16,
-                max_batch_size=4,
+                max_batch_size=max_batch_size,
             )
 
         llm = LLM(
             self.MODEL_PATH,
-            tensor_parallel_size=4,
+            tensor_parallel_size=1,
             pipeline_parallel_size=1,
             attn_backend="TRTLLM",
             disable_overlap_scheduler=True,
@@ -221,7 +221,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4,
                                           dtype="auto"),
             max_seq_len=4096,
-            max_batch_size=4,
+            max_batch_size=max_batch_size,
             speculative_config=Eagle3DecodingConfig(**spec_config_kwargs),
         )
 
