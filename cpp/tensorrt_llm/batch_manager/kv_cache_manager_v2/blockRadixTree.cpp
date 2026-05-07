@@ -236,8 +236,8 @@ Block::~Block()
     // DROPPABLE and scheduled for eviction, exclude from eviction.
     for (auto const& weakPage : storage)
     {
-        auto const page = unwrap(weakPage);
-        if (page->status() == PageStatus::DROPPABLE)
+        auto const page = weakPage.lock();
+        if (page && page->status() == PageStatus::DROPPABLE)
         {
             if (page->scheduledForEviction())
                 page->manager->excludeFromEviction(*page);

@@ -401,30 +401,20 @@ void KvCache::suspend()
     // SharedPageLock destructors inside the scope use finishEvent() to synchronize.
     {
         auto scope = recordEventScope();
+        auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
 
-        // Convert SharedPageLocks → PageHolders (blocks + SSM).
-        auto convertLockToHolder = [](BlockPage& bp)
+        // Convert SharedPageLocks → PageHolders for active (non-stale) pages only.
+        // Mirrors Python: for ordinal, beam_idx, lc_idx in self._active_pages()
+        for (auto const& ap : _activePages())
         {
-            if (auto* lock = std::get_if<SharedPageLock>(&bp))
-            {
-                if (lock->isValid())
-                {
-                    auto pg = lock->page();
-                    auto holder = pg->hold();
-                    lock->unlock();
-                    bp = std::move(holder);
-                }
-            }
-        };
-
-        for (auto& sb : mBlocks)
-            for (int bi = 0; bi < mBeamWidth; ++bi)
-                for (auto& bp : sb.pages[bi])
-                    convertLockToHolder(bp);
-
-        for (auto& beamSsm : mSsmBlocks)
-            for (auto& bp : beamSsm)
-                convertLockToHolder(bp);
+            auto& bp = (ap.ordinal != kBadBlockOrdinal)
+                ? mBlocks[static_cast<size_t>(ap.ordinal)].pages[ap.beamIdx][static_cast<size_t>(ap.lcId)]
+                : mSsmBlocks[static_cast<size_t>(ap.beamIdx)][static_cast<size_t>(ap.lcId)];
+            // expect_type(_SharedPageLock, beam_block[lc_idx]) → std::get raises on wrong type
+            auto& lock = std::get<SharedPageLock>(bp);
+            auto holder = lock.page()->hold();
+            bp = std::move(holder); // ~SharedPageLock calls unlock() → notifyFinish(finishEvent())
+        }
     }
     mStatus = Status::SUSPENDED;
 }
