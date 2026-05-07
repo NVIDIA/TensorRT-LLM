@@ -55,6 +55,7 @@ from typing import Dict, Tuple
 import torch
 
 from tensorrt_llm._torch.modules.fused_moe.quantization import (
+    _get_weight_alignment,
     maybe_pad_for_mxfp4,
     trtllmgen_maybe_get_cached_w2_permute_indices,
     trtllmgen_maybe_get_cached_w3_w1_permute_indices,
@@ -179,6 +180,7 @@ def prepare_mxfp4_weights_for_trtllm_gen(
     hidden_size: int,
     intermediate_size: int,
     tp_size: int = 1,
+    tp_rank: int = 0,
 ) -> PreparedMXFP4Weights:
     """Convert HF on-disk MXFP4 expert weights into trtllm-gen-ready stacked tensors.
 
@@ -187,13 +189,37 @@ def prepare_mxfp4_weights_for_trtllm_gen(
     load_expert_w3_w1_weight, load_expert_w2_weight,
     load_expert_w3_w1_weight_scale_mxfp4, load_expert_w2_weight_scale_mxfp4}``.
 
-    Step-2 scope: ``tp_size = 1`` only. TP slicing arrives in Step 5.
+    For ``tp_size > 1`` (TP-MoE / V6, Step 5 of MOE_TRTLLM_GEN_PLAN.md):
+    intermediate dim is sharded across ``tp_size`` ranks before the kernel-
+    layout pad+shuffle.  PT does this in
+    ``load_expert_w3_w1_weight`` / ``load_expert_w2_weight`` via
+    ``load_weight_shard(..., COLUMN/ROW)`` after a TP-aware pre-pad
+    (``alignment = _get_weight_alignment(weight_alignment, scaling_vector_size,
+    tp_size, I)``).  We replicate that here in three steps:
+      1. derive ``alignment_tp`` so ``alignment_tp / tp_size`` is
+         128-aligned — guarantees per-rank ``I/tp`` is itself 128-aligned
+         after the pre-pad, which is what TMA + cubin coverage need.
+      2. pre-pad each half (gate / up / scales / biases / down) on the
+         intermediate axis to ``alignment_tp``.
+      3. slice the intermediate axis to this rank's range
+         ``[tp_rank * (alignment_tp / tp_size) : (tp_rank+1) * ...]``.
+    The downstream pad+shuffle then operates on per-rank tensors with
+    intermediate dim ``alignment_tp / tp_size`` (= 384 for gpt-oss at
+    tp=8).  ``valid_intermediate`` is clamped to ``min(intermediate_size,
+    slice_stop) - slice_start`` so the kernel hint reflects the unpadded
+    portion of this rank's slice (matches PT's
+    ``intermediate_size_per_partition_lean``).
+
+    EP (expert dim slicing) is NOT done here — the transform handles EP by
+    selecting the expert subset before calling this helper.
     """
-    if tp_size != 1:
-        raise NotImplementedError(
-            "TP > 1 is added in step 5 (MXFP4TRTLLMGenSharding). "
-            "Use single-GPU first to validate steps 1–3."
+    if tp_size > 1 and intermediate_size % tp_size != 0:
+        raise ValueError(
+            f"intermediate_size ({intermediate_size}) must be divisible by "
+            f"tp_size ({tp_size}) for TP-MoE."
         )
+    if tp_rank < 0 or tp_rank >= tp_size:
+        raise ValueError(f"tp_rank {tp_rank} out of range for tp_size {tp_size}")
 
     e = gate_up_blocks.size(0)
     assert down_blocks.size(0) == e
@@ -227,9 +253,76 @@ def prepare_mxfp4_weights_for_trtllm_gen(
     gate_b = gate_up_bias[:, 0::2].contiguous()  # [E, I]
     up_b = gate_up_bias[:, 1::2].contiguous()  # [E, I]
 
-    # 2. Determine per-rank dims (no shard at tp=1).
+    # 1b. TP slicing on the intermediate axis (when tp_size > 1).
+    #
+    # PT (quantization.py:4221-4234) computes a TP-aware alignment first so
+    # that ``per_shard = padded_I / tp_size`` is itself a multiple of
+    # ``weight_alignment`` (kernel TMA constraint).  For gpt-oss-120b
+    # I=2880 at tp=8: ``_get_weight_alignment(128, 32, 8, 2880) = 3072``
+    # so each rank holds ``3072/8 = 384`` intermediate elements (= 128*3).
+    # The PRE-pad happens before sharding so scaling-factor blocks (32
+    # elements each) don't straddle rank boundaries.
+    if tp_size > 1:
+        alignment_tp = _get_weight_alignment(
+            _WEIGHT_ALIGNMENT, _MXFP4_SCALING_VECTOR_SIZE, tp_size, intermediate_size
+        )
+        # Pad intermediate axis to ``alignment_tp`` BEFORE sharding (PT pads-
+        # before-shard semantics; quantization.py:4211-4220 explains why).
+        i_padded_tp = ((intermediate_size + alignment_tp - 1) // alignment_tp) * alignment_tp
+        per_rank_i = i_padded_tp // tp_size  # = 384 for gpt-oss tp=8
+        slice_start = tp_rank * per_rank_i
+        slice_stop = (tp_rank + 1) * per_rank_i
+        # ``valid_intermediate`` per rank: clamp to original ``intermediate_size``.
+        valid_intermediate = max(0, min(intermediate_size, slice_stop) - slice_start)
+
+        def _pad_int_axis(t: torch.Tensor, dim: int, target: int) -> torch.Tensor:
+            cur = t.shape[dim]
+            if cur >= target:
+                return t
+            pad_amount = target - cur
+            # F.pad pad spec is reversed-axis order; build dynamically.
+            pad = [0, 0] * (t.dim() - dim - 1) + [0, pad_amount] + [0, 0] * dim
+            return torch.nn.functional.pad(t, pad)
+
+        # Pad I axis (rows) of gate / up to i_padded_tp, then slice this
+        # rank's chunk.  Same for the scale tensors (rows) and biases.
+        gate_rows_w = _pad_int_axis(gate_rows_w, 1, i_padded_tp)[
+            :, slice_start:slice_stop, :
+        ].contiguous()
+        up_rows_w = _pad_int_axis(up_rows_w, 1, i_padded_tp)[
+            :, slice_start:slice_stop, :
+        ].contiguous()
+        gate_rows_s = _pad_int_axis(gate_rows_s, 1, i_padded_tp)[
+            :, slice_start:slice_stop, :
+        ].contiguous()
+        up_rows_s = _pad_int_axis(up_rows_s, 1, i_padded_tp)[
+            :, slice_start:slice_stop, :
+        ].contiguous()
+        gate_b = _pad_int_axis(gate_b, 1, i_padded_tp)[:, slice_start:slice_stop].contiguous()
+        up_b = _pad_int_axis(up_b, 1, i_padded_tp)[:, slice_start:slice_stop].contiguous()
+
+        # down (dn_3d): cols = I/2.  Pad to i_padded_tp/2 then slice.
+        dn_3d = _pad_int_axis(dn_3d, 2, i_padded_tp // 2)[
+            :, :, slice_start // 2 : slice_stop // 2
+        ].contiguous()
+        # down scales: cols = I/scaling_vector_size.
+        sf_per_rank_start = slice_start // _MXFP4_SCALING_VECTOR_SIZE
+        sf_per_rank_stop = slice_stop // _MXFP4_SCALING_VECTOR_SIZE
+        sf_padded = i_padded_tp // _MXFP4_SCALING_VECTOR_SIZE
+        down_scales = _pad_int_axis(down_scales, 2, sf_padded)[
+            :, :, sf_per_rank_start:sf_per_rank_stop
+        ].contiguous()
+
+        # The downstream pad+shuffle now treats ``per_rank_i`` as the local
+        # intermediate dim.  Reuse the existing variable name so the rest
+        # of the function is unchanged.
+        intermediate_size_for_local = per_rank_i
+    else:
+        intermediate_size_for_local = intermediate_size
+        valid_intermediate = intermediate_size
+
+    # 2. Determine per-rank dims.
     valid_hidden = hidden_size
-    valid_intermediate = intermediate_size
 
     # 3. Pad weights.
     #
@@ -254,7 +347,7 @@ def prepare_mxfp4_weights_for_trtllm_gen(
     # output_hidden_size match what PT's ``MXFP4WeightTRTLLMGenFusedMoEMethod``
     # exercises.
     intermediate_size_pad = (
-        (intermediate_size + _WEIGHT_ALIGNMENT - 1) // _WEIGHT_ALIGNMENT
+        (intermediate_size_for_local + _WEIGHT_ALIGNMENT - 1) // _WEIGHT_ALIGNMENT
     ) * _WEIGHT_ALIGNMENT
     hidden_w1_pad = (
         (hidden_size + _INPUT_HIDDEN_ALIGNMENT - 1) // _INPUT_HIDDEN_ALIGNMENT

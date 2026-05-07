@@ -394,7 +394,16 @@ class QuantizeMXFP4MoETrtllmGen(BaseTransform):
     has already run (so the MXFP4 ``_blocks``/``_scales``/``_bias`` params
     exist) and that weights have been loaded.
 
-    Only handles the EP=1 path (``triton_mxfp4_moe`` without ``_ep``).
+    TP-MoE (V6, Step 5 of MOE_TRTLLM_GEN_PLAN.md): when the runtime
+    ``shared_config.dist_config`` reports ``moe_tp_size > 1``, the prep
+    helper is invoked with ``tp_size`` / ``tp_rank`` so the per-rank
+    ``trtllm_mxfp4_w4a16_moe_fused`` op holds only its ``I/tp`` slice of
+    the intermediate dim, and an ``auto_deploy.all_reduce`` placeholder
+    is inserted after the call so post-MoE partial outputs sum across
+    ranks before the residual add.  EP and ``moe_ep_size > 1`` are
+    handled by the legacy ``StackedMoEShardableNode`` on the upstream
+    ``triton_mxfp4_moe`` (so the rewrite path here always sees the
+    non-EP variant).
     """
 
     algo_name: str = "mxfp4"
@@ -414,6 +423,14 @@ class QuantizeMXFP4MoETrtllmGen(BaseTransform):
 
         # Local import: weight-prep helper from step 2.
         from ...custom_ops.fused_moe.mxfp4_weight_prep import prepare_mxfp4_weights_for_trtllm_gen
+
+        # MoE-TP info (default: no TP) — read from runtime DistConfig.
+        dc = getattr(shared_config, "dist_config", None)
+        moe_tp_size = int(getattr(dc, "moe_tp_size", 1)) if dc is not None else 1
+        moe_tp_rank = int(getattr(dc, "moe_tp_rank", 0)) if dc is not None else 0
+        allreduce_strategy = (
+            str(dc.allreduce_strategy) if dc is not None and moe_tp_size > 1 else "NCCL"
+        )
 
         num_matches = 0
 
@@ -482,7 +499,8 @@ class QuantizeMXFP4MoETrtllmGen(BaseTransform):
                 dn_bias_t,
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
-                tp_size=1,
+                tp_size=moe_tp_size,
+                tp_rank=moe_tp_rank,
             )
 
             # Locate the experts module that owned the original MXFP4 params,
@@ -554,6 +572,23 @@ class QuantizeMXFP4MoETrtllmGen(BaseTransform):
                 num_local_experts,
                 1,  # routing_method_type = RoutingMethodType.Renormalize
             )
+
+            # MoE-TP: insert an all_reduce after the V4 op so partial
+            # ``[..., hidden]`` outputs from each rank sum to the full
+            # hidden output before the residual add.  The ``fc2_bias``
+            # was already divided by ``tp_size`` inside the prep helper,
+            # so the post-AR sum reproduces the unsharded bias.
+            if moe_tp_size > 1:
+                from .sharding import _get_dist_ops
+
+                _, all_reduce_op = _get_dist_ops("auto")
+                with gm.graph.inserting_after(n):
+                    red = gm.graph.call_function(
+                        all_reduce_op,
+                        args=(n, allreduce_strategy),
+                    )
+                    n.replace_all_uses_with(red)
+                    red.replace_input_with(red, n)
 
             # Free original MXFP4 params + erase their get_attr nodes.
             for old_node in [
