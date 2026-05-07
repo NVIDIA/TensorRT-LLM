@@ -10,7 +10,7 @@ def router_gemm_ref(input, weight, bias, dtype):
 @pytest.mark.parametrize(
     "num_tokens", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
 @pytest.mark.parametrize("num_experts", [256])
-@pytest.mark.parametrize("hidden_size", [7168])
+@pytest.mark.parametrize("hidden_size", [7168, 6144])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_router_gemm_run(num_tokens, num_experts, hidden_size, dtype):
     torch.manual_seed(24)

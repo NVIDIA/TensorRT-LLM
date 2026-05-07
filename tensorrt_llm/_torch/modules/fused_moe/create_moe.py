@@ -81,6 +81,15 @@ def get_moe_cls(
         return WideEPMoE
     elif moe_backend.upper() == "TRITON":
         return TritonFusedMoE
+    elif moe_backend.upper() == "CUTEDSL_SMALL_BS":
+        # Small-batch-size fused-MoE fast path implemented with CuTe DSL
+        # kernels.  Currently shape-gated to GLM-5 only (see
+        # `is_glm5_fused_shape` in `fused_moe_cute_dsl_glm5.py`); the
+        # kernels themselves are reusable for other models with a similar
+        # shape footprint.  Routes through `TritonFusedMoE`, which
+        # branches at runtime on (DeepSeekV3 routing) + (FP8_BLOCK_SCALES
+        # quant) + (matching shape).
+        return TritonFusedMoE
     else:
         raise ValueError(f"Unsupported moe backend: {moe_backend}")
 

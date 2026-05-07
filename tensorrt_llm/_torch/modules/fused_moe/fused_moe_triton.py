@@ -32,11 +32,15 @@ from triton_kernels.tensor_details import layout
 
 from ...model_config import ModelConfig
 from ..linear import TensorParallelMode, load_weight_shard
+from .fused_moe_cute_dsl_glm5 import glm5_fused_moe_apply, is_glm5_fused_shape
+from .fused_moe_cute_dsl_glm5 import kernels_available as glm5_kernels_available
 from .interface import MoE
-from .quantization import (FusedMoEMethodBase, MoEWeightLoadingMode,
-                           load_activation_scales_fp8_qdq,
+from .quantization import (FusedMoEMethodBase,
+                           GLM5CuteDslFP8BlockScalesFusedMoEMethod,
+                           MoEWeightLoadingMode, load_activation_scales_fp8_qdq,
                            requantize_expert_w3_w1_weight_fp8_qdq)
-from .routing import BaseMoeRoutingMethod, RenormalizeMoeRoutingMethod
+from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
+                      RenormalizeMoeRoutingMethod)
 
 
 # Triton kernels has hardcoded beta = 1, so we use this implementation when beta is not 1
@@ -1395,6 +1399,14 @@ class TritonFusedMoE(MoE):
 
         sm_version = get_sm_version()
 
+        # GLM-5 fused path: SM100 (B200) + FP8_BLOCK_SCALES + DSv3 routing.
+        # The DSv3 routing affinity isn't visible from this classmethod (we
+        # only see quant_algo here), so we approve the FP8_BLOCK_SCALES quant
+        # on SM100 unconditionally; the runtime check in __init__ /
+        # forward_impl decides whether the fused path actually runs.
+        if sm_version == 100 and quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
+            return True, None
+
         # TritonFusedMoE only supports SM90
         if sm_version != 90:
             return _warn_and_return(
@@ -1459,11 +1471,21 @@ class TritonFusedMoE(MoE):
             layer_idx=layer_idx,
         )
         if torch.cuda.get_device_capability()[0] != 9 and self.ep_size > 1:
+            # GLM-5 fused path is also Blackwell + EP=1, so we only restrict
+            # the EP>1 case to Hopper as before.
             raise NotImplementedError(
                 "TritonFusedMoE is only supported on Hopper with EP size > 1.")
 
-        assert isinstance(self.routing_method, RenormalizeMoeRoutingMethod), \
-            "routing_method must be an instance of RenormalizeMoeRoutingMethod for TritonFusedMoE"
+        # Detect the GLM-5 fused-MoE fast path (FP8 block scales,
+        # DeepSeek-V3 routing).  When selected we bypass the
+        # renormalize-routing assertion below: the GLM-5 up/gate/silu kernel
+        # applies sigmoid + bias + topK internally per
+        # `DeepSeekV3MoeRoutingMethod` semantics.
+        self._glm5_fused_path = self._detect_glm5_fused_path()
+
+        if not self._glm5_fused_path:
+            assert isinstance(self.routing_method, RenormalizeMoeRoutingMethod), \
+                "routing_method must be an instance of RenormalizeMoeRoutingMethod for TritonFusedMoE"
         assert not self.smart_router, "Smart router is not supported in TritonFusedMoE."
 
         self.num_slots = self.num_experts
@@ -1502,7 +1524,40 @@ class TritonFusedMoE(MoE):
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
+    def _detect_glm5_fused_path(self) -> bool:
+        """Return True iff (a) routing is DeepSeekV3, (b) quant is FP8 block
+        scales, and (c) shapes match the GLM-5 per-device tuple.
+
+        Sets `self._glm5_fused_path_unavailable_reason` when the path is
+        otherwise eligible but the kernel modules failed to import; callers
+        can fall through to the existing TRITON path in that case.
+        """
+        self._glm5_fused_path_unavailable_reason = None
+        if not isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod):
+            return False
+        if self.quant_config is None:
+            return False
+        if not self.quant_config.layer_quant_mode.has_fp8_block_scales():
+            return False
+        top_k = self.routing_method.top_k
+        if not is_glm5_fused_shape(
+                num_experts=self.num_experts,
+                hidden_size=self.hidden_size,
+                intermediate_size_per_partition=self.
+                intermediate_size_per_partition,
+                top_k=top_k,
+        ):
+            return False
+        ok, err = glm5_kernels_available()
+        if not ok:
+            self._glm5_fused_path_unavailable_reason = err
+            return False
+        return True
+
     def _get_quant_method(self):
+        # GLM-5 fused FP8-block-scale path takes precedence when active.
+        if getattr(self, "_glm5_fused_path", False):
+            return GLM5CuteDslFP8BlockScalesFusedMoEMethod()
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
                 exclude_kv_cache=True):
             if self.quant_config.layer_quant_mode.has_fp8_qdq():
@@ -1541,7 +1596,12 @@ class TritonFusedMoE(MoE):
         assert use_dp_padding is None or not use_dp_padding, \
             "TritonFusedMoE does not support use_dp_padding=True"
 
-        hidden_states = self.quant_method.apply(self, x, router_logits)
+        # GLM-5 fused path chunks-by-16 internally (see
+        # `_forward_glm5_fused`) so it handles any M.
+        if getattr(self, "_glm5_fused_path", False):
+            hidden_states = self._forward_glm5_fused(x, router_logits)
+        else:
+            hidden_states = self.quant_method.apply(self, x, router_logits)
 
         final_hidden_states = self.reducescatter_or_allreduce(
             hidden_states,
@@ -1549,6 +1609,99 @@ class TritonFusedMoE(MoE):
             use_dp_padding=use_dp_padding)
 
         return final_hidden_states
+
+    def _forward_glm5_fused(
+        self,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """GLM-5 fused-MoE path (up/gate/silu + down/combine; allreduce
+        stays external — handled by the caller via
+        `reducescatter_or_allreduce`).
+
+        Inputs:
+          x             [M, H] bf16  — RMSNorm'd activation (RMSNorm and
+                        the router GEMM are handled upstream in
+                        `DeepseekV3Gate.forward`).
+          router_logits [M, E] fp32 (or bf16) — DSv3 pre-sigmoid logits.
+
+        Returns:
+          out           [M, H] bf16 — pre-allreduce MoE output.
+        """
+        assert isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod)
+        x_2d = x.view(-1, self.hidden_size)
+
+        # The DSv3 routing method exposes the bias as a property that pulls
+        # from the `DeepseekV3Gate` module owning the routing.  This is the
+        # `e_score_correction_bias` registered on the gate at __init__ time.
+        bias = self.routing_method.e_score_correction_bias
+        routed_scaling_factor = (
+            self.routing_method.routing_impl.routed_scaling_factor)
+        top_k = self.routing_method.top_k
+
+        # Read the pre-split contiguous tensors that
+        # `GLM5CuteDslFP8BlockScalesFusedMoEMethod.post_load_weights()` set up at
+        # load time.  Slicing the concatenated `w3_w1` per call would force
+        # a fresh `.contiguous()` allocation of the FP8 weights, which
+        # under CUDA Graph capture is enough to OOM the executor at engine
+        # init.
+        gate_weight = self._glm5_gate_weight
+        up_weight = self._glm5_up_weight
+        gate_scale = self._glm5_gate_scale
+        up_scale = self._glm5_up_scale
+
+        # The GLM-5 fused kernels are validated at M in {1, 4, 8, 16};
+        # chunk inputs to ≤16-token batches so any M (e.g. prefill / warmup)
+        # works.  AllReduce is still done once after this function returns
+        # (in `forward_impl` via `reducescatter_or_allreduce`).
+        x_2d_c = x_2d.contiguous()
+        # Router logits are flat in M too (already [M, E]).
+        if router_logits.dim() == 3:
+            rl_2d = router_logits.view(-1, router_logits.shape[-1])
+        else:
+            rl_2d = router_logits
+
+        M_total = x_2d_c.shape[0]
+        CHUNK = 16
+        if M_total <= CHUNK:
+            out = glm5_fused_moe_apply(
+                x=x_2d_c,
+                router_logits=rl_2d,
+                e_score_correction_bias=bias,
+                gate_weight_per_expert=gate_weight,
+                up_weight_per_expert=up_weight,
+                gate_scale_per_expert=gate_scale,
+                up_scale_per_expert=up_scale,
+                down_weight_per_expert=self.w2_weight,
+                down_scale_per_expert=self.w2_weight_scaling_factor,
+                residual=None,
+                top_k=top_k,
+                routed_scaling_factor=routed_scaling_factor,
+            )
+        else:
+            chunks = []
+            for start in range(0, M_total, CHUNK):
+                end = min(start + CHUNK, M_total)
+                chunks.append(
+                    glm5_fused_moe_apply(
+                        x=x_2d_c[start:end],
+                        router_logits=rl_2d[start:end],
+                        e_score_correction_bias=bias,
+                        gate_weight_per_expert=gate_weight,
+                        up_weight_per_expert=up_weight,
+                        gate_scale_per_expert=gate_scale,
+                        up_scale_per_expert=up_scale,
+                        down_weight_per_expert=self.w2_weight,
+                        down_scale_per_expert=self.w2_weight_scaling_factor,
+                        residual=None,
+                        top_k=top_k,
+                        routed_scaling_factor=routed_scaling_factor,
+                    ))
+            out = torch.cat(chunks, dim=0)
+        # Restore original input rank if caller passed [B, S, H].
+        if x.dim() == 3:
+            return out.view(x.shape)
+        return out
 
     def load_weights(self,
                      weights: List[Dict],
