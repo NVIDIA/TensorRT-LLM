@@ -108,6 +108,11 @@ def _replay_precompute_impl(
     # on no-checkpoint steps).
     prev_num_accepted_tokens_ptr,
     state_batch_indices_ptr,
+    # Slot permutation: maps grid program_id -> original slot index.
+    # When USE_PERM=False, pid_b = tl.program_id(0) (today's behavior) and
+    # this ptr is unused.  When USE_PERM=True, pid_b = perm[pid_grid] (or
+    # perm[B-1-pid_grid] if REVERSE_PERM=True).
+    slot_perm_ptr,
     pad_slot_id,
     # Dimensions
     T: tl.constexpr,
@@ -162,6 +167,13 @@ def _replay_precompute_impl(
     BLOCK_SIZE_T: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
     HEADS_PER_BLOCK: tl.constexpr,
+    # Slot permutation flags.  USE_PERM=True gates a slot_perm_ptr load that
+    # remaps grid program_id -> original slot index.  REVERSE_PERM=True walks
+    # the perm from the tail (B-1-pid_grid).  Used by sorted-dispatch
+    # variants of dl/dlgrouped/maindl to cluster early-outs at one end of
+    # the grid; ignored by monolithic / dynamic.
+    USE_PERM: tl.constexpr,
+    REVERSE_PERM: tl.constexpr,
     # Checkpointing flag — selects target buffer + offset for new-token
     # cache writes.  See "Cache write semantics" block below.
     # Runtime (not constexpr): the only WRITE_CHECKPOINT-dependent code in
@@ -171,7 +183,14 @@ def _replay_precompute_impl(
     # per-slot needs_write flag instead of inlining two specializations.
     write_checkpoint,
 ):
-    pid_b = tl.program_id(axis=0)
+    pid_grid = tl.program_id(axis=0)
+    if USE_PERM:
+        if REVERSE_PERM:
+            pid_b = tl.load(slot_perm_ptr + (tl.num_programs(axis=0) - 1 - pid_grid))
+        else:
+            pid_b = tl.load(slot_perm_ptr + pid_grid)
+    else:
+        pid_b = pid_grid
     pid_hg = tl.program_id(axis=1)  # head-group index
     first_head = pid_hg * HEADS_PER_BLOCK
 
@@ -370,6 +389,7 @@ def _checkpointing_precompute_kernel(
     cache_buf_idx_ptr,
     prev_num_accepted_tokens_ptr,
     state_batch_indices_ptr,
+    slot_perm_ptr,
     pad_slot_id,
     # Dimensions
     T: tl.constexpr,
@@ -428,6 +448,8 @@ def _checkpointing_precompute_kernel(
     HEADS_PER_BLOCK: tl.constexpr,
     WRITE_CHECKPOINT: tl.constexpr,
     EARLY_OUT: tl.constexpr,
+    USE_PERM: tl.constexpr,
+    REVERSE_PERM: tl.constexpr,
 ):
     # Hoisted PDL signal: fire as the first thing every program does, so
     # main can start its setup regardless of how this program ends (pad,
@@ -441,7 +463,14 @@ def _checkpointing_precompute_kernel(
     # just an impl call.  When True, this kernel only runs for slots whose
     # (PNAT + T > MAX) status matches WRITE_CHECKPOINT.
     if EARLY_OUT:
-        pid_b_eo = tl.program_id(axis=0)
+        pid_grid_eo = tl.program_id(axis=0)
+        if USE_PERM:
+            if REVERSE_PERM:
+                pid_b_eo = tl.load(slot_perm_ptr + (tl.num_programs(axis=0) - 1 - pid_grid_eo))
+            else:
+                pid_b_eo = tl.load(slot_perm_ptr + pid_grid_eo)
+        else:
+            pid_b_eo = pid_grid_eo
         if HAS_CACHE_BATCH_INDICES:
             cbi_eo = tl.load(state_batch_indices_ptr + pid_b_eo).to(tl.int64)
             if cbi_eo == pad_slot_id:
@@ -465,6 +494,7 @@ def _checkpointing_precompute_kernel(
         cache_buf_idx_ptr,
         prev_num_accepted_tokens_ptr,
         state_batch_indices_ptr,
+        slot_perm_ptr,
         pad_slot_id,
         T,
         dstate,
@@ -509,6 +539,8 @@ def _checkpointing_precompute_kernel(
         BLOCK_SIZE_T,
         LAUNCH_WITH_PDL,
         HEADS_PER_BLOCK,
+        USE_PERM,
+        REVERSE_PERM,
         WRITE_CHECKPOINT,
     )
 
@@ -544,6 +576,8 @@ def _rectangle_precompute_impl(
     cache_buf_idx_ptr,
     prev_num_accepted_tokens_ptr,
     state_batch_indices_ptr,
+    # Slot permutation: see _replay_precompute_impl for semantics.
+    slot_perm_ptr,
     pad_slot_id,
     # Dimensions
     T: tl.constexpr,
@@ -600,8 +634,18 @@ def _rectangle_precompute_impl(
     BLOCK_SIZE_K: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
     HEADS_PER_BLOCK: tl.constexpr,
+    # Slot permutation flags — see _replay_precompute_impl.
+    USE_PERM: tl.constexpr,
+    REVERSE_PERM: tl.constexpr,
 ):
-    pid_b = tl.program_id(axis=0)
+    pid_grid = tl.program_id(axis=0)
+    if USE_PERM:
+        if REVERSE_PERM:
+            pid_b = tl.load(slot_perm_ptr + (tl.num_programs(axis=0) - 1 - pid_grid))
+        else:
+            pid_b = tl.load(slot_perm_ptr + pid_grid)
+    else:
+        pid_b = pid_grid
     pid_hg = tl.program_id(axis=1)
     first_head = pid_hg * HEADS_PER_BLOCK
 
@@ -939,6 +983,7 @@ def _rectangle_precompute_kernel(
     cache_buf_idx_ptr,
     prev_num_accepted_tokens_ptr,
     state_batch_indices_ptr,
+    slot_perm_ptr,
     pad_slot_id,
     # Dimensions
     T: tl.constexpr,
@@ -997,6 +1042,8 @@ def _rectangle_precompute_kernel(
     LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
     HEADS_PER_BLOCK: tl.constexpr,
     EARLY_OUT: tl.constexpr,
+    USE_PERM: tl.constexpr,
+    REVERSE_PERM: tl.constexpr,
 ):
     # Hoisted PDL signal: fire as the first thing every program does, so
     # main can start its setup regardless of how this program ends.
@@ -1005,7 +1052,14 @@ def _rectangle_precompute_kernel(
     # Per-program early-out gate.  Rectangle is nowrite-only, so EARLY_OUT
     # skips slots whose PNAT + T > MAX (slots that would need write).
     if EARLY_OUT:
-        pid_b_eo = tl.program_id(axis=0)
+        pid_grid_eo = tl.program_id(axis=0)
+        if USE_PERM:
+            if REVERSE_PERM:
+                pid_b_eo = tl.load(slot_perm_ptr + (tl.num_programs(axis=0) - 1 - pid_grid_eo))
+            else:
+                pid_b_eo = tl.load(slot_perm_ptr + pid_grid_eo)
+        else:
+            pid_b_eo = pid_grid_eo
         if HAS_CACHE_BATCH_INDICES:
             cbi_eo = tl.load(state_batch_indices_ptr + pid_b_eo).to(tl.int64)
             if cbi_eo == pad_slot_id:
@@ -1029,6 +1083,7 @@ def _rectangle_precompute_kernel(
         cache_buf_idx_ptr,
         prev_num_accepted_tokens_ptr,
         state_batch_indices_ptr,
+        slot_perm_ptr,
         pad_slot_id,
         T,
         MAX_REPLAY_BUFFER_LENGTH,
@@ -1075,6 +1130,8 @@ def _rectangle_precompute_kernel(
         BLOCK_SIZE_K,
         LAUNCH_WITH_PDL,
         HEADS_PER_BLOCK,
+        USE_PERM,
+        REVERSE_PERM,
     )
 
 
@@ -1208,6 +1265,7 @@ def _dynamic_precompute_kernel(
             cache_buf_idx_ptr,
             prev_num_accepted_tokens_ptr,
             state_batch_indices_ptr,
+            state_batch_indices_ptr,  # slot_perm_ptr unused (USE_PERM=False)
             pad_slot_id,
             T,
             dstate,
@@ -1252,6 +1310,8 @@ def _dynamic_precompute_kernel(
             BLOCK_SIZE_T,
             LAUNCH_WITH_PDL,
             HEADS_PER_BLOCK,
+            False,  # USE_PERM
+            False,  # REVERSE_PERM
             needs_write_runtime,
         )
     else:
@@ -1269,6 +1329,7 @@ def _dynamic_precompute_kernel(
             cache_buf_idx_ptr,
             prev_num_accepted_tokens_ptr,
             state_batch_indices_ptr,
+            state_batch_indices_ptr,  # slot_perm_ptr unused (USE_PERM=False)
             pad_slot_id,
             T,
             MAX_REPLAY_BUFFER_LENGTH,
@@ -1315,6 +1376,8 @@ def _dynamic_precompute_kernel(
             BLOCK_SIZE_K,
             LAUNCH_WITH_PDL,
             HEADS_PER_BLOCK,
+            False,  # USE_PERM
+            False,  # REVERSE_PERM
         )
 
 
@@ -1347,6 +1410,8 @@ def _replay_main_impl(
     cb_scaled_ptr,
     decay_vec_ptr,
     state_batch_indices_ptr,
+    # Slot permutation: see _replay_precompute_impl for semantics.
+    slot_perm_ptr,
     # Stochastic rounding
     rand_seed_ptr,
     pad_slot_id,
@@ -1447,6 +1512,9 @@ def _replay_main_impl(
     # start its setup while this main is still computing.  Default False
     # for monolithic / dynamic / the LAST main in dl/maindl chains.
     LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
+    # Slot permutation flags — see _replay_precompute_impl.
+    USE_PERM: tl.constexpr,
+    REVERSE_PERM: tl.constexpr,
 ):
     # Hoisted PDL signal: fire as the first thing every program does, so
     # downstream kernels can start setup regardless of how this program
@@ -1468,7 +1536,14 @@ def _replay_main_impl(
     )
 
     pid_m = tl.program_id(axis=0)
-    pid_b = tl.program_id(axis=1)
+    pid_grid_b = tl.program_id(axis=1)
+    if USE_PERM:
+        if REVERSE_PERM:
+            pid_b = tl.load(slot_perm_ptr + (tl.num_programs(axis=1) - 1 - pid_grid_b))
+        else:
+            pid_b = tl.load(slot_perm_ptr + pid_grid_b)
+    else:
+        pid_b = pid_grid_b
     pid_h = tl.program_id(axis=2)
 
     if HAS_CACHE_BATCH_INDICES:
@@ -1817,6 +1892,7 @@ def _checkpointing_main_kernel(
     cb_scaled_ptr,
     decay_vec_ptr,
     state_batch_indices_ptr,
+    slot_perm_ptr,
     rand_seed_ptr,
     pad_slot_id,
     # Dimensions
@@ -1902,6 +1978,8 @@ def _checkpointing_main_kernel(
     WRITE_CHECKPOINT: tl.constexpr,
     EARLY_OUT: tl.constexpr,
     LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
+    USE_PERM: tl.constexpr,
+    REVERSE_PERM: tl.constexpr,
 ):
     # Hoisted PDL signal: fire as the first thing every program does.
     if LAUNCH_DEPENDENT_KERNELS:
@@ -1909,7 +1987,14 @@ def _checkpointing_main_kernel(
     # Per-program early-out gate.  Signal-then-skip lets the next kernel
     # in dl/maindl chains start regardless of early-out outcome.
     if EARLY_OUT:
-        pid_b_eo = tl.program_id(axis=1)
+        pid_grid_eo = tl.program_id(axis=1)
+        if USE_PERM:
+            if REVERSE_PERM:
+                pid_b_eo = tl.load(slot_perm_ptr + (tl.num_programs(axis=1) - 1 - pid_grid_eo))
+            else:
+                pid_b_eo = tl.load(slot_perm_ptr + pid_grid_eo)
+        else:
+            pid_b_eo = pid_grid_eo
         if HAS_CACHE_BATCH_INDICES:
             cbi_eo = tl.load(state_batch_indices_ptr + pid_b_eo).to(tl.int64)
             if cbi_eo == pad_slot_id:
@@ -1936,6 +2021,7 @@ def _checkpointing_main_kernel(
         cb_scaled_ptr,
         decay_vec_ptr,
         state_batch_indices_ptr,
+        slot_perm_ptr,
         rand_seed_ptr,
         pad_slot_id,
         T,
@@ -2005,6 +2091,8 @@ def _checkpointing_main_kernel(
         QUANT_MAX,
         WRITE_CHECKPOINT,
         LAUNCH_DEPENDENT_KERNELS,
+        USE_PERM,
+        REVERSE_PERM,
     )
 
 
@@ -2031,6 +2119,8 @@ def _rectangle_main_impl(
     cb_scaled_ptr,           # rectangle (batch, nheads, T, K)
     decay_vec_ptr,           # folded (batch, nheads, T) — total_decay * exp(cumAdt_new[t])
     state_batch_indices_ptr,
+    # Slot permutation: see _replay_precompute_impl for semantics.
+    slot_perm_ptr,
     pad_slot_id,
     # Dimensions
     T: tl.constexpr,
@@ -2095,12 +2185,22 @@ def _rectangle_main_impl(
     LAUNCH_WITH_PDL: tl.constexpr,
     QUANT_MAX: tl.constexpr,
     LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
+    # Slot permutation flags — see _replay_precompute_impl.
+    USE_PERM: tl.constexpr,
+    REVERSE_PERM: tl.constexpr,
 ):
     if LAUNCH_DEPENDENT_KERNELS:
         tl.extra.cuda.gdc_launch_dependents()
 
     pid_m = tl.program_id(axis=0)
-    pid_b = tl.program_id(axis=1)
+    pid_grid_b = tl.program_id(axis=1)
+    if USE_PERM:
+        if REVERSE_PERM:
+            pid_b = tl.load(slot_perm_ptr + (tl.num_programs(axis=1) - 1 - pid_grid_b))
+        else:
+            pid_b = tl.load(slot_perm_ptr + pid_grid_b)
+    else:
+        pid_b = pid_grid_b
     pid_h = tl.program_id(axis=2)
 
     if HAS_CACHE_BATCH_INDICES:
@@ -2286,6 +2386,7 @@ def _rectangle_main_kernel(
     cb_scaled_ptr,
     decay_vec_ptr,
     state_batch_indices_ptr,
+    slot_perm_ptr,
     pad_slot_id,
     # Dimensions
     T: tl.constexpr,
@@ -2351,12 +2452,21 @@ def _rectangle_main_kernel(
     QUANT_MAX: tl.constexpr,
     EARLY_OUT: tl.constexpr,
     LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
+    USE_PERM: tl.constexpr,
+    REVERSE_PERM: tl.constexpr,
 ):
     if LAUNCH_DEPENDENT_KERNELS:
         tl.extra.cuda.gdc_launch_dependents()
     # Per-program early-out gate.  Rectangle is nowrite-only.
     if EARLY_OUT:
-        pid_b_eo = tl.program_id(axis=1)
+        pid_grid_eo = tl.program_id(axis=1)
+        if USE_PERM:
+            if REVERSE_PERM:
+                pid_b_eo = tl.load(slot_perm_ptr + (tl.num_programs(axis=1) - 1 - pid_grid_eo))
+            else:
+                pid_b_eo = tl.load(slot_perm_ptr + pid_grid_eo)
+        else:
+            pid_b_eo = pid_grid_eo
         if HAS_CACHE_BATCH_INDICES:
             cbi_eo = tl.load(state_batch_indices_ptr + pid_b_eo).to(tl.int64)
             if cbi_eo == pad_slot_id:
@@ -2380,6 +2490,7 @@ def _rectangle_main_kernel(
         cb_scaled_ptr,
         decay_vec_ptr,
         state_batch_indices_ptr,
+        slot_perm_ptr,
         pad_slot_id,
         T,
         MAX_REPLAY_BUFFER_LENGTH,
@@ -2432,6 +2543,8 @@ def _rectangle_main_kernel(
         LAUNCH_WITH_PDL,
         QUANT_MAX,
         LAUNCH_DEPENDENT_KERNELS,
+        USE_PERM,
+        REVERSE_PERM,
     )
 
 
@@ -2603,6 +2716,7 @@ def _dynamic_main_kernel(
             cb_scaled_ptr,
             decay_vec_ptr,
             state_batch_indices_ptr,
+            state_batch_indices_ptr,  # slot_perm_ptr unused (USE_PERM=False)
             rand_seed_ptr,
             pad_slot_id,
             T,
@@ -2672,6 +2786,8 @@ def _dynamic_main_kernel(
             QUANT_MAX,
             True,  # WRITE_CHECKPOINT (constexpr)
             False,  # LAUNCH_DEPENDENT_KERNELS — already signaled at top
+            False,  # USE_PERM
+            False,  # REVERSE_PERM
         )
     else:
         if RECTANGLE:
@@ -2689,6 +2805,7 @@ def _dynamic_main_kernel(
                 cb_scaled_ptr,
                 decay_vec_ptr,
                 state_batch_indices_ptr,
+                state_batch_indices_ptr,  # slot_perm_ptr unused (USE_PERM=False)
                 pad_slot_id,
                 T,
                 MAX_REPLAY_BUFFER_LENGTH,
@@ -2741,6 +2858,8 @@ def _dynamic_main_kernel(
                 LAUNCH_WITH_PDL,
                 QUANT_MAX,
                 False,  # LAUNCH_DEPENDENT_KERNELS — already signaled at top
+                False,  # USE_PERM
+                False,  # REVERSE_PERM
             )
         else:
             # Replay-style nowrite (WRITE_CHECKPOINT=False constexpr).
@@ -2761,6 +2880,7 @@ def _dynamic_main_kernel(
                 cb_scaled_ptr,
                 decay_vec_ptr,
                 state_batch_indices_ptr,
+                state_batch_indices_ptr,  # slot_perm_ptr unused (USE_PERM=False)
                 rand_seed_ptr,
                 pad_slot_id,
                 T,
@@ -2830,6 +2950,8 @@ def _dynamic_main_kernel(
                 QUANT_MAX,
                 False,  # WRITE_CHECKPOINT (constexpr)
                 False,  # LAUNCH_DEPENDENT_KERNELS — already signaled at top
+                False,  # USE_PERM
+                False,  # REVERSE_PERM
             )
 
 
@@ -2871,6 +2993,17 @@ def checkpointing_state_update(
     write_checkpoint: bool = True,
     rectangle_for_nowrite: bool = False,
     mode: str = "monolithic",
+    # Slot permutation: int32 (batch,) tensor mapping grid program_id ->
+    # original slot index.  When provided, dl-family kernels (doublelaunch /
+    # dlgrouped / maindl) read pid_b through this perm so callers can pre-sort
+    # slots (e.g. write-first) to cluster early-outs at one end of the grid.
+    # Ignored by monolithic / dynamic.  None => identity (today's behavior).
+    slot_perm: torch.Tensor | None = None,
+    # When True and slot_perm is provided, the nowrite-side kernels in
+    # dlgrouped/doublelaunch traverse the perm in reverse (B-1-pid_grid).
+    # Combined with a write-first sort, this front-loads real work in BOTH
+    # halves of the dl chain (writes from the head, nowrites from the tail).
+    reverse_nowrite: bool = False,
     _block_size_m: int | None = None,
     _num_warps: int | None = None,
     _num_stages: int | None = None,
@@ -3251,6 +3384,25 @@ def checkpointing_state_update(
         state_scales_arg = state  # any valid ptr — gated by QUANT_MAX==0
         state_scales_strides = (0, 0, 0)
 
+    # Slot permutation — pointer + USE_PERM gate.  When the caller provides
+    # a perm tensor the dl-family launches read pid_b through it; otherwise
+    # we pass any valid pointer (state_batch_indices) and USE_PERM=False so
+    # the kernel falls back to pid_grid.  Sort-driven dispatch (write-first
+    # clustering) is opt-in per call; monolithic / dynamic ignore the flag.
+    if slot_perm is not None:
+        assert slot_perm.dtype in (torch.int32, torch.int64), (
+            f"slot_perm must be int32/int64, got {slot_perm.dtype}"
+        )
+        assert slot_perm.numel() >= batch, (
+            f"slot_perm has {slot_perm.numel()} entries; need >= batch ({batch})"
+        )
+        slot_perm_arg = slot_perm
+        use_perm = True
+    else:
+        # Any valid ptr — gated by USE_PERM=False at compile time.
+        slot_perm_arg = state_batch_indices if state_batch_indices is not None else state
+        use_perm = False
+
     # Grid for main kernels (M tiling × batch × nheads).
     def main_grid(META):
         return (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
@@ -3263,13 +3415,14 @@ def checkpointing_state_update(
     # full positional + kwarg argument list.  Mode-dependent constexprs
     # (write_checkpoint, early_out, rectangle) are passed in.
 
-    def launch_replay_precompute(write_checkpoint: bool, early_out: bool):
+    def launch_replay_precompute(write_checkpoint: bool, early_out: bool,
+                                 reverse_perm: bool = False):
         _checkpointing_precompute_kernel[precomp_grid](
             dt, dt_bias, A, B, C,
             cb_scaled, decay_vec,
             old_B, old_dt, old_dA_cumsum,
             cache_buf_idx, prev_num_accepted_tokens,
-            state_batch_indices, pad_slot_id,
+            state_batch_indices, slot_perm_arg, pad_slot_id,
             T, max_window, dstate, nheads // ngroups,
             dt.stride(0), dt.stride(1), dt.stride(2),
             dt_bias.stride(0) if dt_bias is not None else 0,
@@ -3292,18 +3445,20 @@ def checkpointing_state_update(
             HEADS_PER_BLOCK=heads_per_block,
             WRITE_CHECKPOINT=write_checkpoint,
             EARLY_OUT=early_out,
+            USE_PERM=use_perm,
+            REVERSE_PERM=reverse_perm,
             num_warps=precompute_num_warps,
             **({"num_stages": _precompute_num_stages} if _precompute_num_stages else {}),
             launch_pdl=launch_with_pdl,
         )
 
-    def launch_rectangle_precompute(early_out: bool):
+    def launch_rectangle_precompute(early_out: bool, reverse_perm: bool = False):
         _rectangle_precompute_kernel[precomp_grid](
             dt, dt_bias, A, B, C,
             cb_scaled, decay_vec,
             old_B, old_dt, old_dA_cumsum,
             cache_buf_idx, prev_num_accepted_tokens,
-            state_batch_indices, pad_slot_id,
+            state_batch_indices, slot_perm_arg, pad_slot_id,
             T, max_window, dstate, nheads // ngroups,
             dt.stride(0), dt.stride(1), dt.stride(2),
             dt_bias.stride(0) if dt_bias is not None else 0,
@@ -3325,6 +3480,8 @@ def checkpointing_state_update(
             LAUNCH_DEPENDENT_KERNELS=use_internal_pdl,
             HEADS_PER_BLOCK=heads_per_block,
             EARLY_OUT=early_out,
+            USE_PERM=use_perm,
+            REVERSE_PERM=reverse_perm,
             num_warps=precompute_num_warps,
             **({"num_stages": _precompute_num_stages} if _precompute_num_stages else {}),
             launch_pdl=launch_with_pdl,
@@ -3364,14 +3521,15 @@ def checkpointing_state_update(
         )
 
     def launch_replay_main(write_checkpoint: bool, early_out: bool,
-                           launch_dependent_kernels: bool = False):
+                           launch_dependent_kernels: bool = False,
+                           reverse_perm: bool = False):
         _checkpointing_main_kernel[main_grid](
             state, state_scales_arg, old_x,
             old_B, old_dt, old_dA_cumsum,
             prev_num_accepted_tokens, cache_buf_idx,
             x, C, D, z, out,
             cb_scaled, decay_vec,
-            state_batch_indices, rand_seed, pad_slot_id,
+            state_batch_indices, slot_perm_arg, rand_seed, pad_slot_id,
             T, max_window, dim, dstate, nheads // ngroups,
             state.stride(0), state.stride(1), state.stride(2), state.stride(3),
             state_scales_strides[0], state_scales_strides[1], state_scales_strides[2],
@@ -3397,6 +3555,8 @@ def checkpointing_state_update(
             WRITE_CHECKPOINT=write_checkpoint,
             EARLY_OUT=early_out,
             LAUNCH_DEPENDENT_KERNELS=launch_dependent_kernels and use_internal_pdl,
+            USE_PERM=use_perm,
+            REVERSE_PERM=reverse_perm,
             num_warps=num_warps,
             **({"num_stages": _num_stages} if _num_stages else {}),
             **({"num_ctas": _num_ctas} if _num_ctas else {}),
@@ -3405,13 +3565,14 @@ def checkpointing_state_update(
         )
 
     def launch_rectangle_main(early_out: bool,
-                              launch_dependent_kernels: bool = False):
+                              launch_dependent_kernels: bool = False,
+                              reverse_perm: bool = False):
         _rectangle_main_kernel[main_grid](
             state, state_scales_arg, old_x,
             prev_num_accepted_tokens, cache_buf_idx,
             x, C, D, z, out,
             cb_scaled, decay_vec,
-            state_batch_indices, pad_slot_id,
+            state_batch_indices, slot_perm_arg, pad_slot_id,
             T, max_window, dim, dstate, nheads // ngroups,
             state.stride(0), state.stride(1), state.stride(2), state.stride(3),
             state_scales_strides[0], state_scales_strides[1], state_scales_strides[2],
@@ -3429,6 +3590,8 @@ def checkpointing_state_update(
             QUANT_MAX=quant_max,
             EARLY_OUT=early_out,
             LAUNCH_DEPENDENT_KERNELS=launch_dependent_kernels and use_internal_pdl,
+            USE_PERM=use_perm,
+            REVERSE_PERM=reverse_perm,
             num_warps=num_warps,
             **({"num_stages": _num_stages} if _num_stages else {}),
             **({"num_ctas": _num_ctas} if _num_ctas else {}),
@@ -3495,30 +3658,37 @@ def checkpointing_state_update(
             # EARLY_OUT so each retains its constexpr-specialized reg
             # envelope.  First main signals PDL dependents so the second
             # main can start its setup while the first is still computing.
+            # Dynamic precompute doesn't support sort (no early-out to
+            # cluster), so the perm only flows into the two EARLY_OUT mains.
             launch_dynamic_precompute(rectangle=rectangle_for_nowrite)
             launch_replay_main(write_checkpoint=True, early_out=True,
                                launch_dependent_kernels=True)
             if rectangle_for_nowrite:
-                launch_rectangle_main(early_out=True)
+                launch_rectangle_main(early_out=True, reverse_perm=reverse_nowrite)
             else:
-                launch_replay_main(write_checkpoint=False, early_out=True)
+                launch_replay_main(write_checkpoint=False, early_out=True,
+                                   reverse_perm=reverse_nowrite)
         elif mode == "dlgrouped":
             # Same 4 kernels as doublelaunch but reordered: both precomputes
             # first, then both mains.  Lets the GPU run precomp1 || precomp2
             # in parallel (they're tiny grids) before the mains start, vs
             # doublelaunch's interleaved precomp1→main1→precomp2→main2.
             # First main signals PDL so the second main's setup overlaps.
+            # When slot_perm + reverse_nowrite are set, the nowrite-side
+            # walks the perm in reverse so both kernels front-load real work.
             launch_replay_precompute(write_checkpoint=True, early_out=True)
             if rectangle_for_nowrite:
-                launch_rectangle_precompute(early_out=True)
+                launch_rectangle_precompute(early_out=True, reverse_perm=reverse_nowrite)
             else:
-                launch_replay_precompute(write_checkpoint=False, early_out=True)
+                launch_replay_precompute(write_checkpoint=False, early_out=True,
+                                         reverse_perm=reverse_nowrite)
             launch_replay_main(write_checkpoint=True, early_out=True,
                                launch_dependent_kernels=True)
             if rectangle_for_nowrite:
-                launch_rectangle_main(early_out=True)
+                launch_rectangle_main(early_out=True, reverse_perm=reverse_nowrite)
             else:
-                launch_replay_main(write_checkpoint=False, early_out=True)
+                launch_replay_main(write_checkpoint=False, early_out=True,
+                                   reverse_perm=reverse_nowrite)
         else:  # mode == "doublelaunch"
             # Write half: always replay-style write.  First main signals
             # PDL dependents so the second precompute can start its setup
@@ -3528,8 +3698,10 @@ def checkpointing_state_update(
                                launch_dependent_kernels=True)
             # Nowrite half: rectangle if asked, else replay-nowrite.
             if rectangle_for_nowrite:
-                launch_rectangle_precompute(early_out=True)
-                launch_rectangle_main(early_out=True)
+                launch_rectangle_precompute(early_out=True, reverse_perm=reverse_nowrite)
+                launch_rectangle_main(early_out=True, reverse_perm=reverse_nowrite)
             else:
-                launch_replay_precompute(write_checkpoint=False, early_out=True)
-                launch_replay_main(write_checkpoint=False, early_out=True)
+                launch_replay_precompute(write_checkpoint=False, early_out=True,
+                                         reverse_perm=reverse_nowrite)
+                launch_replay_main(write_checkpoint=False, early_out=True,
+                                   reverse_perm=reverse_nowrite)
