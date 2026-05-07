@@ -26,29 +26,31 @@ namespace
 {
 
 // Decode kernel: write tokens to paged cache + conditional compression
-void compressorPagedKvCompressOp(torch::Tensor kv_score, // [m, 2*state_dim] bf16
+void compressorPagedKvCompressOp(torch::Tensor kv_score, // [m, 2*state_dim] bf16/fp32
     torch::Tensor ape,                                   // [compress_ratio, state_dim] fp32
-    torch::Tensor paged_kv,                              // [num_blocks, page_size, state_dim] bf16
-    torch::Tensor paged_score,                           // [num_blocks, page_size, state_dim] bf16
+    torch::Tensor paged_kv,                              // [num_blocks, page_size, state_dim] bf16/fp32
+    torch::Tensor paged_score,                           // [num_blocks, page_size, state_dim] bf16/fp32
     torch::Tensor block_table_kv,                        // [bsz, max_blocks] int32
     torch::Tensor block_table_score,                     // [bsz, max_blocks] int32
     torch::Tensor output,                                // [total_outputs, head_dim] bf16
     torch::Tensor kv_lens,                               // [bsz] int32
-    torch::Tensor start_pos,                             // [bsz] int32
     torch::Tensor cu_seq_lens,                           // [bsz+1] int32
     torch::Tensor cu_kv_comp,                            // [bsz+1] int32
     int64_t batch_size, int64_t page_size, int64_t head_dim, int64_t compress_ratio, int64_t next_n)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
-    int io_eb = static_cast<int>(kv_score.element_size());
+    int kv_score_eb = static_cast<int>(kv_score.element_size());
+    int state_eb = static_cast<int>(paged_kv.element_size());
     int out_eb = static_cast<int>(output.element_size());
+    TORCH_CHECK(
+        paged_score.element_size() == paged_kv.element_size(), "paged_kv and paged_score must use the same dtype");
 
     tk::pagedKvCompressLaunch(kv_score.data_ptr(), ape.data_ptr<float>(), paged_kv.data_ptr(), paged_score.data_ptr(),
         block_table_kv.data_ptr<int32_t>(), block_table_score.data_ptr<int32_t>(), output.data_ptr(),
-        kv_lens.data_ptr<int32_t>(), start_pos.data_ptr<int32_t>(), cu_seq_lens.data_ptr<int32_t>(),
-        cu_kv_comp.data_ptr<int32_t>(), static_cast<int>(batch_size), static_cast<int>(page_size),
-        static_cast<int>(block_table_kv.size(1)), static_cast<int>(head_dim), static_cast<int>(compress_ratio),
-        static_cast<int>(next_n), io_eb, out_eb, stream);
+        kv_lens.data_ptr<int32_t>(), cu_seq_lens.data_ptr<int32_t>(), cu_kv_comp.data_ptr<int32_t>(),
+        static_cast<int>(batch_size), static_cast<int>(page_size), static_cast<int>(block_table_kv.size(1)),
+        static_cast<int>(head_dim), static_cast<int>(compress_ratio), static_cast<int>(next_n), kv_score_eb, state_eb,
+        out_eb, stream);
 }
 
 // Prefill kernel: bulk compression with state update
@@ -58,15 +60,18 @@ void compressorPrefillReductionOp(torch::Tensor kv_score, torch::Tensor ape, tor
     int64_t batch_size, int64_t page_size, int64_t head_dim, int64_t compress_ratio, int64_t max_outputs)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
-    int io_eb = static_cast<int>(kv_score.element_size());
+    int kv_score_eb = static_cast<int>(kv_score.element_size());
+    int state_eb = static_cast<int>(paged_kv.element_size());
     int out_eb = static_cast<int>(output.element_size());
+    TORCH_CHECK(
+        paged_score.element_size() == paged_kv.element_size(), "paged_kv and paged_score must use the same dtype");
 
     tk::prefillReductionLaunch(kv_score.data_ptr(), ape.data_ptr<float>(), paged_kv.data_ptr(), paged_score.data_ptr(),
         block_table_kv.data_ptr<int32_t>(), block_table_score.data_ptr<int32_t>(), output.data_ptr(),
         kv_lens.data_ptr<int32_t>(), start_pos.data_ptr<int32_t>(), cu_seq_lens.data_ptr<int32_t>(),
         cu_kv_comp.data_ptr<int32_t>(), static_cast<int>(batch_size), static_cast<int>(page_size),
         static_cast<int>(block_table_kv.size(1)), static_cast<int>(head_dim), static_cast<int>(compress_ratio),
-        static_cast<int>(max_outputs), io_eb, out_eb, stream);
+        static_cast<int>(max_outputs), kv_score_eb, state_eb, out_eb, stream);
 }
 
 // Fused postprocess + scatter: RMSNorm + RoPE + Hadamard + paged scatter in one kernel
@@ -122,7 +127,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor(a!) paged_kv, Tensor(b!) paged_score, "
         "Tensor block_table_kv, Tensor block_table_score, "
         "Tensor(c!) output, "
-        "Tensor kv_lens, Tensor start_pos, "
+        "Tensor kv_lens, "
         "Tensor cu_seq_lens, Tensor cu_kv_comp, "
         "int batch_size, int page_size, "
         "int head_dim, int compress_ratio, "

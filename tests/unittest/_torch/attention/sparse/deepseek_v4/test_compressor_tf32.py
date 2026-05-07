@@ -4,7 +4,7 @@
 """Tests for the BF16 GEMM path in the DeepSeek-V4 Compressor wkv_gate.
 
 The wkv_gate weight now matches the upstream V4 checkpoint dtype (bf16). The
-GEMM runs in that dtype, then stores the result in fp32 for compressor kernels.
+GEMM runs in that dtype and the compressor kernels consume bf16 kv_score input.
 """
 
 import pytest
@@ -37,9 +37,8 @@ def _create_wkv_gate(dtype: torch.dtype = torch.bfloat16) -> Linear:
 
 
 def _bf16_path(x: torch.Tensor, wkv_gate: Linear) -> torch.Tensor:
-    """Default path: bf16 GEMM via F.linear, then upcast to fp32 for the
-    downstream compression kernels."""
-    return F.linear(x.to(wkv_gate.weight.dtype), wkv_gate.weight).float()
+    """Default path: bf16 GEMM via F.linear."""
+    return F.linear(x.to(wkv_gate.weight.dtype), wkv_gate.weight)
 
 
 def _fp32_reference(x: torch.Tensor, wkv_gate: Linear) -> torch.Tensor:
@@ -75,9 +74,9 @@ def test_bf16_path_close_to_fp32_reference(num_tokens):
         out_fp32 = _fp32_reference(x, fp32_gate)
 
     assert out_bf16.shape == out_fp32.shape
-    assert out_bf16.dtype == torch.float32
+    assert out_bf16.dtype == torch.bfloat16
 
-    a, b = out_bf16.flatten(), out_fp32.flatten()
+    a, b = out_bf16.float().flatten(), out_fp32.flatten()
     cos_sim = F.cosine_similarity(a.unsqueeze(0), b.unsqueeze(0)).item()
     assert cos_sim >= 0.99, f"cos_sim={cos_sim:.6f}"
 

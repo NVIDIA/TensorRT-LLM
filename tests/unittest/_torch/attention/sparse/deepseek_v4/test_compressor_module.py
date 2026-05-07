@@ -1675,6 +1675,7 @@ def _run_compressor_with_fake_postprocess(monkeypatch, kv_cache_dtype: str, is_i
     seen = {}
 
     def fake_prefill_reduction(*args):
+        seen["kv_score_dtype"] = args[0].dtype
         kv_comp = args[6]
         kv_comp.fill_(0.25)
 
@@ -1751,6 +1752,7 @@ def test_main_compressor_does_not_materialize_postprocess_output(monkeypatch):
     )
 
     assert seen["cache_dtype"] == int(KVCacheDtype.NONE)
+    assert seen["kv_score_dtype"] == torch.bfloat16
     assert seen["kv_out"] is None
     assert seen["quant_output"] is None
     assert seen["scale_output"] is None

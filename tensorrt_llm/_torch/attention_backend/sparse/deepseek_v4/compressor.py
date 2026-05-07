@@ -183,9 +183,10 @@ class Compressor(nn.Module):
         num_comp_tokens = metadata.new_comp_kv_lens_cuda[self.compress_ratio][:bsz]
         max_ctx_comp_kv_lens = metadata.max_ctx_compressed_tokens[self.compress_ratio]
 
-        # Project input to KV and score in the checkpoint dtype, then store the
-        # result in fp32 for the compressor kernels.
-        kv_score = F.linear(x.to(self.wkv_gate.weight.dtype), self.wkv_gate.weight).float()
+        # Project input to KV and score in the checkpoint dtype. The compressor
+        # kernels accept bf16 or fp32 kv_score and convert values to fp32
+        # internally for state updates and online-softmax accumulation.
+        kv_score = F.linear(x.to(self.wkv_gate.weight.dtype), self.wkv_gate.weight)
 
         # Allocate output buffer
         kv_comp = torch.empty(total_num_comp_tokens, self.head_dim, device=x.device, dtype=x.dtype)
@@ -225,7 +226,6 @@ class Compressor(nn.Module):
                 block_table_score_state[num_contexts:],
                 kv_comp,
                 gen_kv_lens,
-                gen_kv_lens - next_n,
                 metadata.cu_seq_lens_cuda[num_contexts:],
                 cu_new_comp_kv[num_contexts:],
                 num_generations,
