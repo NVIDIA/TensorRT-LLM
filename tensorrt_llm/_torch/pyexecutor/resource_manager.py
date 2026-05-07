@@ -331,6 +331,13 @@ class KVCacheManager(BaseResourceManager):
         is_estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
         linear_attention_metadata: Optional[LinearAttentionMetadata] = None,
+        # Optional per-window head_dim / dtype overrides forwarded to the C++ ctor.
+        # Empty {} = uniform shape across all windows (default behavior).  Lets a
+        # single KVCacheManager host pools with mixed shapes when a model has
+        # heterogeneous attention types (e.g. Gemma4 SWA head_dim=256 +
+        # full-attention head_dim=512).
+        size_per_head_per_window: Optional[Dict[int, int]] = None,
+        dtype_per_window: Optional[Dict[int, "DataType"]] = None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -390,6 +397,18 @@ class KVCacheManager(BaseResourceManager):
 
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        # Per-window head_dim / dtype override maps.  When non-empty, each
+        # window in max_attention_window_vec may have its own head_dim and/or
+        # dtype that differs from the manager-level scalars.  Used by
+        # heterogeneous-attention models (e.g. Gemma4 SWA head_dim=256
+        # alongside full-attention head_dim=512).  Empty dict means uniform
+        # shape (every window uses self.head_dim / self.dtype).  Keys are
+        # remapped after window clamping in
+        # _validate_and_adjust_attention_windows.
+        self.size_per_head_per_window: Dict[int, int] = dict(
+            size_per_head_per_window) if size_per_head_per_window else {}
+        self.dtype_per_window: Dict[int, "DataType"] = dict(
+            dtype_per_window) if dtype_per_window else {}
         self.tokens_per_block = tokens_per_block
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
@@ -474,7 +493,6 @@ class KVCacheManager(BaseResourceManager):
                 ), "calculate_max_num_blocks_for_vswa only accepts KvCacheConfig"
                 blocks_per_window = self.calculate_max_num_blocks_for_vswa(
                     kv_cache_config=kv_cache_config,
-                    model_config=model_config,
                     extra_cost_memory=0,
                 )
                 if mapping.world_size > 1:
@@ -525,7 +543,7 @@ class KVCacheManager(BaseResourceManager):
                 }
 
         # Validate and adjust attention windows against their upper bounds if needed
-        blocks_per_window, self.max_seq_len, self.max_attention_window_vec = self._validate_and_adjust_attention_windows(
+        blocks_per_window, self.max_seq_len, self.max_attention_window_vec, window_adjustments = self._validate_and_adjust_attention_windows(
             max_attention_window_vec=self.max_attention_window_vec,
             blocks_per_window=blocks_per_window,
             tokens_per_block=tokens_per_block,
@@ -533,6 +551,24 @@ class KVCacheManager(BaseResourceManager):
             max_seq_len=self.max_seq_len,
             max_beam_width=max_beam_width,
         )
+
+        # Remap per-window override-dict keys to match the post-clamp window
+        # sizes.  Without this, an override supplied for a pre-clamp window
+        # (e.g. 32768) would be silently dropped when the validator clamps
+        # the window down (e.g. to 16384), leaving the C++ side to fall back
+        # on the manager-level scalar — which is exactly the heterogeneous
+        # case these dicts exist to handle.
+        if window_adjustments:
+            if self.size_per_head_per_window:
+                self.size_per_head_per_window = {
+                    window_adjustments.get(w, w): v
+                    for w, v in self.size_per_head_per_window.items()
+                }
+            if self.dtype_per_window:
+                self.dtype_per_window = {
+                    window_adjustments.get(w, w): v
+                    for w, v in self.dtype_per_window.items()
+                }
 
         if kv_cache_type != CacheTypeCpp.SELF:
             assert len(
@@ -577,6 +613,10 @@ class KVCacheManager(BaseResourceManager):
             'indexer_k_cache_index_head_dim': indexer_k_cache_index_head_dim,
             'indexer_k_cache_use_fp4': indexer_k_cache_use_fp4,
             'linear_attention_metadata': linear_attention_metadata,
+            # Forward the (possibly remapped) per-window override dicts.
+            # Keys are aligned with the post-clamp window sizes.
+            'size_per_head_per_window': self.size_per_head_per_window,
+            'dtype_per_window': self.dtype_per_window,
         }
 
         if self.event_buffer_max_size > 0:
@@ -1156,6 +1196,26 @@ class KVCacheManager(BaseResourceManager):
         assert len(result) == 1
         return result[0]
 
+    def get_num_front_blocks_removed(self,
+                                     request_id: int,
+                                     window_size: Optional[int] = None) -> int:
+        """Get the number of front blocks evicted by SWA for a sequence.
+
+        Args:
+            request_id: The request id.
+            window_size: Optional window size.  When supplied, returns the
+                per-window eviction count (zero for non-SWA windows).  When
+                omitted, defaults to ``self.max_attention_window_vec[0]`` —
+                this matches the historical single-pool behavior for
+                callers that never thought about windows, while keeping the
+                C++ contract uniformly per-window.  VSWA callers should
+                always pass ``window_size`` explicitly.
+        """
+        if window_size is None:
+            window_size = self.max_attention_window_vec[0]
+        return self.impl.get_num_front_blocks_removed(request_id,
+                                                      window_size=window_size)
+
     def unpin_blocks_by_id(self, kv_cache_block_id: int):
         self.impl.unpin_blocks_by_id(kv_cache_block_id)
 
@@ -1192,8 +1252,9 @@ class KVCacheManager(BaseResourceManager):
             window_size = self.max_attention_window_vec[0]
         else:
             layer_offset = self.layer_offsets[layer_idx]
-            window_size = self.max_attention_window_vec[layer_offset % len(
-                self.max_attention_window_vec)]
+            # Explicit layer_offset -> window_size mapping (no modulo
+            # masking length mismatches between pattern and num_local_layers).
+            window_size = self._get_layer_offset_to_window_size()[layer_offset]
 
         result = self.impl.get_batch_cache_block_ids(request_ids, window_size)
         for i in range(len(result)):
@@ -1238,9 +1299,25 @@ class KVCacheManager(BaseResourceManager):
 
         Note that different attention backend/implementation can have different KV layouts,
         "kv_layout" should be set accordingly to avoid surprises.
+
+        Per-layer head_dim: when the underlying C++ manager hosts multiple pools with
+        distinct head_dim (e.g., Gemma4 SWA head_dim=256 alongside full-attention
+        head_dim=512), this method reads the layer's effective head_dim from
+        ``self.size_per_head_per_window`` rather than the manager-level scalar.
+        Single-pool managers fall back to ``self.head_dim``.
         '''
         layer_offset = self.layer_offsets[layer_idx]
         result = self.impl.get_primary_pool_data(layer_offset)
+
+        # Resolve per-layer head_dim through an explicit layer_offset ->
+        # window_size mapping (no modulo masking length mismatches).  When no
+        # override map is set (uniform manager), fall back to self.head_dim.
+        if self.size_per_head_per_window:
+            window_size = self._get_layer_offset_to_window_size()[layer_offset]
+            layer_head_dim = self.size_per_head_per_window.get(
+                window_size, self.head_dim)
+        else:
+            layer_head_dim = self.head_dim
 
         assert kv_layout in ["NHD",
                              "HND"], f"Unsupported kv_layout: {kv_layout}"
@@ -1250,7 +1327,7 @@ class KVCacheManager(BaseResourceManager):
                 self.kv_factor,
                 self.tokens_per_block,
                 self.num_kv_heads_per_layer[layer_offset],
-                self.head_dim,
+                layer_head_dim,
             )
         else:
             return result.reshape(
@@ -1258,7 +1335,7 @@ class KVCacheManager(BaseResourceManager):
                 self.kv_factor,
                 self.num_kv_heads_per_layer[layer_offset],
                 self.tokens_per_block,
-                self.head_dim,
+                layer_head_dim,
             )
 
     def get_indexer_k_cache_pool_data(self, layer_idx: int) -> torch.Tensor:
@@ -1343,6 +1420,131 @@ class KVCacheManager(BaseResourceManager):
     def rewind_kv_cache(self, request: LlmRequest, rewind_len: int):
         self.impl.rewind_kv_cache(request.py_request_id, rewind_len)
 
+    def calculate_cache_size_per_token(self,
+                                       layers: Set[int],
+                                       window_size: Optional[int] = None
+                                       ) -> int:
+        """Compute the (raw, dtype-agnostic) KV cache size per token for a set of layers.
+
+        head_dim is resolved per-layer when ``self.size_per_head_per_window``
+        is non-empty: the layer's window is looked up via
+        ``_get_layer_offset_to_window_size`` and the override dict is
+        consulted; otherwise ``self.head_dim`` is used.
+
+        Args:
+            layers: Set of layer offsets.
+            window_size: Optional window-size hint.  When provided AND every
+                layer in ``layers`` belongs to the same window, head_dim is
+                read directly from ``self.size_per_head_per_window`` for that
+                window — bypassing the per-layer lookup loop.  When omitted,
+                head_dim is resolved per layer (the heterogeneous-layer case).
+
+        Returns:
+            cache size per token (number of elements, not bytes).
+        """
+        if not self.size_per_head_per_window:
+            # Uniform head_dim — original formula.
+            total_kv_heads = sum(self.num_kv_heads_per_layer[i] for i in layers)
+            return total_kv_heads * self.kv_factor * self.head_dim
+
+        if window_size is not None:
+            # Single-window fast path (per-window override map).
+            head_dim = self.size_per_head_per_window.get(
+                window_size, self.head_dim)
+            total_kv_heads = sum(self.num_kv_heads_per_layer[i] for i in layers)
+            return total_kv_heads * self.kv_factor * head_dim
+
+        # Heterogeneous-layer slow path: layers may span multiple windows
+        # with different head_dim.
+        layer_offset_to_window_size = self._get_layer_offset_to_window_size()
+        total = 0
+        for i in layers:
+            layer_window = layer_offset_to_window_size[i]
+            layer_head_dim = self.size_per_head_per_window.get(
+                layer_window, self.head_dim)
+            total += self.num_kv_heads_per_layer[i] * layer_head_dim
+        return total * self.kv_factor
+
+    def _calculate_cache_bytes_per_token_for_layers(
+            self,
+            layers: Set[int],
+            window_size: Optional[int] = None,
+            dtype_default: Optional[DataType] = None) -> int:
+        """Compute KV cache bytes per token for a set of layers.
+
+        When ``self.dtype_per_window`` is non-empty, dtype is resolved per
+        layer (or per the supplied ``window_size`` for the homogeneous fast
+        path).  Otherwise ``dtype_default`` (or ``self.dtype``) is used.
+
+        Handles NVFP4 scaling-factor overhead, computed per dtype.
+        """
+        if dtype_default is None:
+            dtype_default = self.dtype
+
+        # Homogeneous fast path: a single dtype applies to every layer in
+        # `layers`.  This holds when (a) no per-window dtype overrides exist
+        # OR (b) a window_size hint is supplied (single-window case).
+        if not self.dtype_per_window or window_size is not None:
+            if window_size is not None and self.dtype_per_window:
+                effective_dtype = self.dtype_per_window.get(
+                    window_size, dtype_default)
+            else:
+                effective_dtype = dtype_default
+            cache_size_per_token = self.calculate_cache_size_per_token(
+                layers, window_size=window_size)
+            cache_bytes_per_token = get_size_in_bytes(cache_size_per_token,
+                                                      effective_dtype)
+            if effective_dtype == DataType.NVFP4:
+                cache_bytes_per_token += KVCacheManager.calculate_scaling_factor_size_bytes(
+                    cache_size_per_token,
+                    quant_vector_size=16,
+                    scaling_factor_dtype=DataType.FP8)
+            return cache_bytes_per_token
+
+        # Heterogeneous path: dtype varies per layer.  Sum bytes per layer.
+        layer_offset_to_window_size = self._get_layer_offset_to_window_size()
+        total_bytes = 0
+        for i in layers:
+            layer_window = layer_offset_to_window_size[i]
+            layer_head_dim = self.size_per_head_per_window.get(
+                layer_window, self.head_dim)
+            layer_dtype = self.dtype_per_window.get(layer_window, dtype_default)
+            layer_elements = (self.num_kv_heads_per_layer[i] * self.kv_factor *
+                              layer_head_dim)
+            layer_bytes = get_size_in_bytes(layer_elements, layer_dtype)
+            if layer_dtype == DataType.NVFP4:
+                layer_bytes += KVCacheManager.calculate_scaling_factor_size_bytes(
+                    layer_elements,
+                    quant_vector_size=16,
+                    scaling_factor_dtype=DataType.FP8)
+            total_bytes += layer_bytes
+        return total_bytes
+
+    def _get_layer_offset_to_window_size(self) -> Dict[int, int]:
+        """Inverse of _get_window_size_to_layers: layer_offset -> window_size.
+
+        Asserts every local layer is mapped exactly once.  This is the
+        explicit, length-mismatch-safe replacement for
+        ``max_attention_window_vec[layer_offset % len(max_attention_window_vec)]``
+        — that modulo silently masks length mismatches between the window
+        pattern and num_local_layers; this helper catches them via the
+        assert below.
+        """
+        window_size_to_layers = self._get_window_size_to_layers()
+        layer_offset_to_window_size: Dict[int, int] = {}
+        for window_size, layer_offsets in window_size_to_layers.items():
+            for layer_offset in layer_offsets:
+                assert layer_offset not in layer_offset_to_window_size, (
+                    f"layer_offset {layer_offset} mapped to multiple window "
+                    f"sizes ({layer_offset_to_window_size[layer_offset]} and "
+                    f"{window_size}) — window pattern is malformed.")
+                layer_offset_to_window_size[layer_offset] = window_size
+        assert len(layer_offset_to_window_size) == self.num_local_layers, (
+            f"layer_offset_to_window_size covers "
+            f"{len(layer_offset_to_window_size)} layers but num_local_layers "
+            f"is {self.num_local_layers}.")
+        return layer_offset_to_window_size
+
     def _get_window_size_to_layers(self) -> dict[int, list[int]]:
         """
         Get the window size to layers mapping.
@@ -1383,34 +1585,27 @@ class KVCacheManager(BaseResourceManager):
         window_size_to_layers: Dict[int, List[int]],
         max_attention_window_vec: List[int],
         kv_cache_config: KvCacheConfig,
-        model_config: ModelConfigCpp,
         pool_memory_bytes: int,
         kv_factor: int,
         dtype: DataType,
         is_cross_attention: bool = False,
+        model_config: Optional[ModelConfigCpp] = None,
     ) -> Tuple[Dict[int, List[int]], List[int]]:
 
         assert is_cross_attention is False, 'Cross attention is not supported'
 
         max_tokens_from_config = kv_cache_config.max_tokens
 
-        def calculate_cache_size_per_token(layers: Set[int]) -> int:
-            # Same as BaseKVCacheManager::calculateCacheSizePerTokenForSingleWindowSize
-            total_kv_heads = sum(self.num_kv_heads_per_layer[i] for i in layers)
-            return total_kv_heads * kv_factor * model_config.head_size
-
-        # Calculate the required memory bytes per sequence.
+        # Calculate the required memory bytes per sequence.  Each window's
+        # bytes-per-token is computed with that window's effective head_dim
+        # / dtype (per-window override map), falling back to the manager
+        # scalars when no override is registered.
         required_mem_bytes_per_seq = 0
         for window_size in sorted(window_size_to_layers):
             layers = window_size_to_layers[window_size]
-            cache_size_per_token = calculate_cache_size_per_token(layers)
-            cache_size_bytes_per_token = get_size_in_bytes(
-                cache_size_per_token, dtype)
-            if dtype == DataType.NVFP4:
-                cache_size_bytes_per_token += KVCacheManager.calculate_scaling_factor_size_bytes(
-                    cache_size_per_token,
-                    quant_vector_size=16,
-                    scaling_factor_dtype=DataType.FP8)
+            cache_size_bytes_per_token = (
+                self._calculate_cache_bytes_per_token_for_layers(
+                    layers, window_size=window_size, dtype_default=dtype))
             required_mem_bytes_per_seq += window_size * cache_size_bytes_per_token
         logger.info(
             f'Required memory per sequence: {required_mem_bytes_per_seq} bytes')
@@ -1439,16 +1634,13 @@ class KVCacheManager(BaseResourceManager):
         for window_size in sorted(window_size_to_layers):
             layers = window_size_to_layers[window_size]
             if remaining_mem_bytes > 0 and remaining_layers:
-                # Calculate cache size per token for remaining layers only
-                cache_size_per_token = calculate_cache_size_per_token(
-                    remaining_layers)
-                cache_size_bytes_per_token = get_size_in_bytes(
-                    cache_size_per_token, dtype)
-                if dtype == DataType.NVFP4:
-                    cache_size_bytes_per_token += KVCacheManager.calculate_scaling_factor_size_bytes(
-                        cache_size_per_token,
-                        quant_vector_size=16,
-                        scaling_factor_dtype=DataType.FP8)
+                # Calculate cache size per token for remaining layers only.
+                # ``remaining_layers`` may span multiple windows with
+                # different head_dim / dtype, so the helper resolves each
+                # layer's effective shape and dtype individually.
+                cache_size_bytes_per_token = (
+                    self._calculate_cache_bytes_per_token_for_layers(
+                        remaining_layers, dtype_default=dtype))
                 logger.debug(
                     f'Cache size per token for {len(remaining_layers)} layers: '
                     f'{cache_size_bytes_per_token} bytes')
@@ -1577,7 +1769,7 @@ class KVCacheManager(BaseResourceManager):
     def calculate_max_num_blocks_for_vswa(
             self,
             kv_cache_config: KvCacheConfig,
-            model_config: Optional[ModelConfigCpp],
+            model_config: Optional[ModelConfigCpp] = None,
             extra_cost_memory: int = 0) -> dict[int, tuple[int, int]]:
         """
         Currently, this function is added to support *ONLY* VSWA.
@@ -1623,31 +1815,19 @@ class KVCacheManager(BaseResourceManager):
                 extra_cost_memory=extra_cost_memory,
             )
 
-        # VSWA case: use C++ implementation for variable window sizes
-        if model_config is None:
-            raise ValueError(
-                "model_config is required for VSWA (Variable Sliding Window Attention)"
-            )
-        assert model_config.layer_types is not None, "layer_types have to be set correctly for VSWA"
-        if self.is_vswa:
-            # Adjust the window sizes to fit the memory if even a single sequence
-            # cannot fit in the memory.
-            window_size_to_layers, max_attention_window_vec = self.adjust_window_sizes_for_vswa(
-                window_size_to_layers=window_size_to_layers,
-                max_attention_window_vec=self.max_attention_window_vec,
-                model_config=model_config,
-                kv_cache_config=kv_cache_config,
-                pool_memory_bytes=self._primary_pool_memory_bytes,
-                kv_factor=self.kv_factor,
-                dtype=self.dtype,
-                is_cross_attention=is_cross_attention,
-            )
-            self.max_attention_window_vec = max_attention_window_vec
-
-        def calculate_cache_size_per_token(layers: Set[int]) -> int:
-            # Same as BaseKVCacheManager::calculateCacheSizePerTokenForSingleWindowSize
-            total_kv_heads = sum(self.num_kv_heads_per_layer[i] for i in layers)
-            return total_kv_heads * self.kv_factor * model_config.head_size
+        # VSWA case: adjust window sizes via Python helper that derives
+        # head_dim from self.  model_config is no longer required because
+        # head_size is read from self.head_dim, set during __init__.
+        window_size_to_layers, max_attention_window_vec = self.adjust_window_sizes_for_vswa(
+            window_size_to_layers=window_size_to_layers,
+            max_attention_window_vec=self.max_attention_window_vec,
+            kv_cache_config=kv_cache_config,
+            pool_memory_bytes=self._primary_pool_memory_bytes,
+            kv_factor=self.kv_factor,
+            dtype=self.dtype,
+            is_cross_attention=is_cross_attention,
+        )
+        self.max_attention_window_vec = max_attention_window_vec
 
         logger.info(
             f"Primary pool memory bytes: {self._primary_pool_memory_bytes}")
@@ -1678,9 +1858,12 @@ class KVCacheManager(BaseResourceManager):
         blocks_per_window = {}
         for window_idx, (window_size, layers) in enumerate(
                 sorted(window_size_to_layers.items())):
-            cache_size_per_token = calculate_cache_size_per_token(layers)
-            cache_size_bytes_per_token = get_size_in_bytes(
-                cache_size_per_token, self.dtype)
+            # Per-window head_dim and dtype (with scalar fallback) — needed
+            # for heterogeneous-attention models like Gemma4 where SWA and
+            # full-attention pools have different head_dim.
+            cache_size_bytes_per_token = (
+                self._calculate_cache_bytes_per_token_for_layers(
+                    layers, window_size=window_size))
 
             primary_tokens = self._primary_pool_memory_bytes * window_size_shares[
                 window_idx] / cache_size_bytes_per_token
@@ -1718,7 +1901,7 @@ class KVCacheManager(BaseResourceManager):
         sink_token_length: int,
         max_seq_len: int,
         max_beam_width: int,
-    ) -> Tuple[BlocksPerWindow, int, List[int]]:
+    ) -> Tuple[BlocksPerWindow, int, List[int], Dict[int, int]]:
         """
         Validate and adjust attention windows against their upper bounds if needed.
         If there is no adjustment, the returned max_attention_window_vec will be the same as the input.
@@ -1731,7 +1914,12 @@ class KVCacheManager(BaseResourceManager):
             max_seq_len: Maximum sequence length
 
         Returns:
-            Tuple of (adjusted_blocks_per_window, adjusted_max_seq_len, adjusted_max_attention_window_vec)
+            Tuple of (adjusted_blocks_per_window, adjusted_max_seq_len,
+            adjusted_max_attention_window_vec, window_adjustments).
+            window_adjustments maps pre_clamp -> post_clamp window size for
+            every window that was clamped (empty if nothing was adjusted) so
+            callers can rewrite parallel per-window override dicts (e.g.
+            size_per_head_per_window, dtype_per_window).
         """
         window_adjustments = {}
         # Validate each window size in blocks_per_window against its upper bound
@@ -1774,9 +1962,9 @@ class KVCacheManager(BaseResourceManager):
             adjusted_max_seq_len = max(adjusted_window_vec)
             logger.warning(f"Adjusted max_seq_len to {adjusted_max_seq_len}")
 
-            return adjusted_blocks_per_window, adjusted_max_seq_len, adjusted_window_vec
+            return adjusted_blocks_per_window, adjusted_max_seq_len, adjusted_window_vec, window_adjustments
         else:
-            return blocks_per_window, max_seq_len, max_attention_window_vec
+            return blocks_per_window, max_seq_len, max_attention_window_vec, {}
 
     def pin_blocks(self, request_id: int):
         self.impl.pin_blocks(request_id)

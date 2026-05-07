@@ -133,8 +133,17 @@ class CachedSequenceInterface:
 
         self._resource_lookup: ResourceHandlerDict = {}
         self._caches: Dict[str, torch.Tensor] = {}
-        # KVCacheManager (or MambaHybridCacheManager) for managed resources
+        # KVCacheManager (or MambaHybridCacheManager) for managed resources.
+        # A single KVCacheManager hosts all KV pools (full-attention + per-window
+        # SWA) via the C++ per-window head_dim/dtype overrides; cross-pool
+        # admission, event flush, disagg transfer, and the shared radix tree all
+        # live in C++.
         self._kv_cache_manager: Optional[Union[KVCacheManager, MambaHybridCacheManager]] = None
+        # Per-pool sliding window sizes, published by the kvcache transform and
+        # consumed by the executor.  Pool index == position in this list, in the
+        # same order as the C++ manager's internal pool ordering (see
+        # ``size_per_head_per_window`` keys).
+        self._kv_group_windows: List[int] = []
         # lookup of unmanaged resources
         self._unmanaged_resources: List[str] = []
         self._spec_config = spec_config
@@ -291,37 +300,98 @@ class CachedSequenceInterface:
 
     def _identify_managed_kv_resources(
         self,
-    ) -> Tuple[Optional[KVPagedResourceHandler], ResourceHandlerDict]:
-        """Identify KV resources compatible with the reference handler for KVCacheManager.
+    ) -> Tuple[
+        ResourceHandlerDict,
+        Dict[int, int],
+        Dict[int, "DataType"],
+        Dict[str, int],
+    ]:
+        """Identify all managed KV resources and their per-window shape maps.
 
-        The first KVPagedResourceHandler becomes the reference. All handlers matching
-        the reference (via __eq__) are collected for managed allocation.
+        A single C++ ``KVCacheManager`` now hosts every KV pool (full-attention
+        and per-window SWA), so we no longer split the Python side into
+        independent group dicts.  Layers are grouped internally by their
+        effective sliding-window key (``sliding_window`` if > 0 else
+        ``max_seq_len``); within a window-group all layers MUST share the same
+        ``head_dim`` and ``dtype`` because the C++ ctor takes one
+        ``size_per_head`` and one ``dtype`` per window.
+
+        The order of windows in the returned maps fixes the pool index used
+        everywhere downstream (Python's ``kv_group_windows`` and the C++
+        ``mLayerToWindowSize`` routing); we preserve insertion order matching
+        the order in which layers register their handlers.
 
         Returns:
-            Tuple of (reference_handler, managed_resources_dict).
-            reference_handler is None if no KV paged resources exist.
+            Tuple of:
+                - kv_managed: ResourceHandlerDict — every KVPagedResourceHandler
+                  in registration order; passed to the C++ ctor as the layer
+                  list.
+                - size_per_head_per_window: Dict[int, int] — maps each effective
+                  window size to the head_dim of layers in that window.
+                - dtype_per_window: Dict[int, DataType] — maps each window size
+                  to the C++ DataType enum of layers in that window.
+                - window_per_layer: Dict[str, int] — maps the resource name to
+                  its effective window size; used by the executor to route
+                  ``get_cache_indices`` calls per window without re-deriving the
+                  window from each handler.
+
+        Raises:
+            RuntimeError: if two layers share an effective window but disagree
+                on head_dim or dtype (the C++ ctor cannot represent that), or
+                if ``self._requires_uniform_kv_caches`` is True and we end up
+                with more than one distinct window.
         """
-        kv_ref: Optional[KVPagedResourceHandler] = None
         kv_managed: ResourceHandlerDict = {}
+        size_per_head_per_window: Dict[int, int] = {}
+        dtype_per_window: Dict[int, "DataType"] = {}
+        window_per_layer: Dict[str, int] = {}
+
+        max_seq_len = self.info.max_seq_len
 
         for name, handler in self._resource_lookup.items():
             if not isinstance(handler, KVPagedResourceHandler):
                 continue
-            if kv_ref is None:
-                kv_ref = handler
-            if handler == kv_ref:
-                kv_managed[name] = handler
-            elif self._requires_uniform_kv_caches:
-                raise RuntimeError(
-                    f"KV resource {name} is not compatible with the managed KV reference "
-                    f"(reference: head_dim={kv_ref.head_dim}, dtype={kv_ref.dtype}, "
-                    f"kv_factor={kv_ref.kv_factor}, kv_layout={kv_ref.kv_layout}; "
-                    f"candidate: head_dim={handler.head_dim}, dtype={handler.dtype}, "
-                    f"kv_factor={handler.kv_factor}, kv_layout={handler.kv_layout}). "
-                    "This configuration requires all KV caches to be managed."
-                )
+            # Effective window: full-attention layers (sliding_window == 0) use
+            # max_seq_len so the C++ side gets a single concrete window key.
+            effective_window = handler.sliding_window if handler.sliding_window > 0 else max_seq_len
 
-        return kv_ref, kv_managed
+            kv_managed[name] = handler
+            window_per_layer[name] = effective_window
+
+            handler_dtype = torch_dtype_to_binding(handler.dtype)
+            if effective_window in size_per_head_per_window:
+                if size_per_head_per_window[effective_window] != handler.head_dim:
+                    raise RuntimeError(
+                        f"KV layer {name} has head_dim={handler.head_dim} but window "
+                        f"{effective_window} already has head_dim="
+                        f"{size_per_head_per_window[effective_window]}. The C++ KVCacheManager "
+                        "requires all layers in a window to share head_dim."
+                    )
+                if dtype_per_window[effective_window] != handler_dtype:
+                    raise RuntimeError(
+                        f"KV layer {name} has dtype={handler.dtype} but window "
+                        f"{effective_window} already has dtype="
+                        f"{dtype_per_window[effective_window]}. The C++ KVCacheManager "
+                        "requires all layers in a window to share dtype."
+                    )
+            else:
+                size_per_head_per_window[effective_window] = handler.head_dim
+                dtype_per_window[effective_window] = handler_dtype
+
+        # If the runtime requires uniform KV caches (e.g. legacy single-pool
+        # path), more than one distinct window is incompatible.
+        if len(size_per_head_per_window) > 1 and self._requires_uniform_kv_caches:
+            windows_repr = ", ".join(
+                f"window={w} head_dim={size_per_head_per_window[w]} dtype={dtype_per_window[w]}"
+                for w in size_per_head_per_window
+            )
+            raise RuntimeError(
+                "KV resources are not uniform: "
+                f"{windows_repr}. "
+                "This configuration requires all KV caches to share a single pool."
+            )
+
+        return kv_managed, size_per_head_per_window, dtype_per_window, window_per_layer
 
     def _identify_managed_state_resources(
         self,
@@ -413,21 +483,43 @@ class CachedSequenceInterface:
         self,
         max_tokens: Optional[int],
         kv_managed: ResourceHandlerDict,
+        window_per_layer: Optional[Dict[str, int]] = None,
     ) -> KvCacheConfig:
         """Prepare and configure KvCacheConfig for cache manager creation.
 
-        Handles deep copy, max_tokens synchronization across ranks, block reuse settings,
-        copy_on_partial_reuse validation, and free_gpu_memory_fraction normalization.
+        Handles deep copy, max_tokens synchronization across ranks, block reuse
+        settings, copy_on_partial_reuse validation, and free_gpu_memory_fraction
+        normalization.
+
+        ``max_attention_window`` is the per-layer window list (one entry per
+        managed KV layer, in the order ``kv_managed`` enumerates them).  The C++
+        ctor groups these layers internally by window into pools using its
+        ``mLayerToWindowSize`` map.  Full-attention layers report
+        ``max_seq_len`` (i.e. their effective window).
 
         Args:
             max_tokens: Maximum tokens to allocate, or None to use config defaults.
             kv_managed: Dict of KV resources that will be managed by KVCacheManager.
+            window_per_layer: Map from layer resource name to effective window.
+                Required when ``kv_managed`` is non-empty.
 
         Returns:
             Configured KvCacheConfig ready for cache manager creation.
         """
         # Make a deep copy of the kv_cache_config to avoid modifying the original object
         kv_cache_config = copy.deepcopy(self._kv_cache_config_original)
+
+        # Build per-layer max_attention_window in kv_managed insertion order.
+        # The C++ side groups layers by this value into pools.
+        if kv_managed:
+            assert window_per_layer is not None, (
+                "window_per_layer must be supplied when kv_managed is non-empty"
+            )
+            kv_cache_config.max_attention_window = [
+                window_per_layer[name] for name in kv_managed.keys()
+            ]
+        else:
+            kv_cache_config.max_attention_window = None
 
         # Update kv_cache_config based on max_tokens if provided
         if max_tokens is not None:
@@ -469,31 +561,70 @@ class CachedSequenceInterface:
 
     def _build_kv_cache_kwargs(
         self,
-        kv_ref: Optional[KVPagedResourceHandler],
         kv_managed: ResourceHandlerDict,
         kv_cache_config: KvCacheConfig,
+        size_per_head_per_window: Optional[Dict[int, int]] = None,
+        dtype_per_window: Optional[Dict[int, "DataType"]] = None,
     ) -> Dict:
         """Build common kwargs for KVCacheManager or MambaHybridCacheManager.
 
+        With the C++ per-window head_dim/dtype overrides, a single manager
+        can host pools with mixed shapes.  We pass:
+
+        - ``head_dim`` / ``dtype`` as scalar defaults (fall-back values for any
+          window not present in the per-window override maps).  We pick the
+          maximum head_dim and the dtype of the first window so the default is
+          a sane upper bound on per-pool memory accounting.
+        - ``size_per_head_per_window`` / ``dtype_per_window`` as the per-window
+          override dicts that the C++ ctor uses to build pools with the
+          correct shapes.
+
         Args:
-            kv_ref: Reference KV handler defining head_dim and dtype, or None.
             kv_managed: Dict of KV resources to be managed.
             kv_cache_config: Configured KvCacheConfig.
+            size_per_head_per_window: Per-window head_dim overrides.
+            dtype_per_window: Per-window C++ DataType overrides.
 
         Returns:
             Dict of kwargs suitable for both KVCacheManager and MambaHybridCacheManager.
         """
+        size_per_head_per_window = size_per_head_per_window or {}
+        dtype_per_window = dtype_per_window or {}
+
         # create arguments first that differ whether we have managed kv caches or not
-        kv_cache_kwargs = {}
+        kv_cache_kwargs: Dict = {}
         if kv_managed:
-            kv_cache_type = CacheTypeCpp.SELFKONLY if kv_ref.kv_factor == 1 else CacheTypeCpp.SELF
+            # kv_factor is uniform across the managed set: __init__ asserts
+            # kv_factor in {1, 2}, and AutoDeploy only mixes kv_factor=2 layers
+            # in the same model today.  We take the first handler's value.
+            ref_handler = next(iter(kv_managed.values()))
+            kv_cache_type = (
+                CacheTypeCpp.SELFKONLY if ref_handler.kv_factor == 1 else CacheTypeCpp.SELF
+            )
+            # Default head_dim: the largest across all windows, so any window
+            # that falls back to the scalar gets a safe upper bound.  The
+            # per-window overrides take precedence in the C++ ctor.
+            default_head_dim = (
+                max(size_per_head_per_window.values())
+                if size_per_head_per_window
+                else ref_handler.head_dim
+            )
+            # Default dtype: dtype of the first window.  Same reasoning — the
+            # per-window overrides take precedence.
+            default_dtype = (
+                next(iter(dtype_per_window.values()))
+                if dtype_per_window
+                else torch_dtype_to_binding(ref_handler.dtype)
+            )
             kv_cache_kwargs.update(
                 {
                     "kv_cache_type": kv_cache_type,
                     "num_layers": len(kv_managed),
                     "num_kv_heads": [h.num_kv_heads for h in kv_managed.values()],
-                    "head_dim": kv_ref.head_dim,
-                    "dtype": torch_dtype_to_binding(kv_ref.dtype),
+                    "head_dim": default_head_dim,
+                    "dtype": default_dtype,
+                    "size_per_head_per_window": size_per_head_per_window,
+                    "dtype_per_window": dtype_per_window,
                 }
             )
         else:
@@ -504,6 +635,8 @@ class CachedSequenceInterface:
                     "num_kv_heads": [1],
                     "head_dim": 1,
                     "dtype": DataType.HALF,
+                    "size_per_head_per_window": {},
+                    "dtype_per_window": {},
                 }
             )
         # remaining arguments are the same for both cases
@@ -602,18 +735,27 @@ class CachedSequenceInterface:
 
         return manager, num_managed_mamba_layers
 
-    def _assign_kv_cache_views(self, kv_managed: Dict[str, KVPagedResourceHandler]) -> int:
+    def _assign_kv_cache_views(
+        self, kv_managed: Dict[str, KVPagedResourceHandler], manager: KVCacheManager
+    ) -> int:
         """Retrieve and assign buffer views for managed KV paged resources.
+
+        ``manager.get_buffers`` is per-layer-aware: it reads the layer's
+        head_dim from the underlying C++ ``size_per_head_per_window`` map when
+        one is set (mixed-shape pools, Gemma4-style VSWA), and falls back to
+        the manager-level scalar otherwise.  We can therefore use a single
+        call regardless of single-pool vs. multi-pool deployments.
 
         Args:
             kv_managed: Dict of KV resources managed by the cache manager.
+            manager: The KVCacheManager that owns these resources.
 
         Returns:
             block_offset_multiplier derived from the first KV cache view's strides.
         """
         block_offset_multiplier = 0
         for idx, (name, h) in enumerate(kv_managed.items()):
-            view = self._kv_cache_manager.get_buffers(idx, kv_layout=h.kv_layout)
+            view = manager.get_buffers(idx, kv_layout=h.kv_layout)
             assert view[0].is_contiguous(), f"Non-contiguous kv cache resource for {name}"
             self._caches[name] = view
 
@@ -670,13 +812,74 @@ class CachedSequenceInterface:
             dtype=handler.dtype,
         )
 
+    def _has_swa_window(self, size_per_head_per_window: Dict[int, int]) -> bool:
+        """Return True if any window is smaller than max_seq_len (i.e. SWA pool exists)."""
+        max_seq_len = self.info.max_seq_len
+        return any(w < max_seq_len for w in size_per_head_per_window.keys())
+
+    def _compute_total_token_budget(
+        self,
+        kv_managed: ResourceHandlerDict,
+        size_per_head_per_window: Dict[int, int],
+        total_max_tokens: Optional[int],
+    ) -> Optional[int]:
+        """Compute the total max_tokens budget for the unified KVCacheManager.
+
+        With a single C++ manager hosting all pools, ``BaseKVCacheManager::
+        calculateMaxNumBlocks`` does the per-pool split internally using the
+        per-window head_dim/dtype overrides.  We just need to compute the total
+        token budget; the C++ side derives N (max concurrent sequences) from
+        the total byte budget divided by the combined per-sequence cost across
+        all pools, then gives each pool N × its per-window tokens.
+
+        We retain a Python-side cap to keep the budget feasible during prefill
+        warmup before the C++ side has a chance to validate against
+        ``calculateMaxNumBlocks``.
+
+        Args:
+            kv_managed: All managed KV layers.
+            size_per_head_per_window: Map of effective window → head_dim, used
+                here purely to detect whether at least one SWA pool exists.
+            total_max_tokens: Caller-provided budget, or None to defer to
+                ``free_gpu_memory_fraction``.
+
+        Returns:
+            Total max_tokens for the manager, or None to defer to the
+            ``free_gpu_memory_fraction`` path.
+        """
+        # If the caller didn't pass a budget and there's no SWA pool, defer to
+        # free_gpu_memory_fraction inside the manager — same as the legacy path.
+        if total_max_tokens is None and not self._has_swa_window(size_per_head_per_window):
+            return None
+
+        if total_max_tokens is None:
+            # If the user already pinned max_tokens via KvCacheConfig, keep it:
+            # _prepare_kv_cache_config will preserve that value untouched.
+            if self._kv_cache_config_original.max_tokens is not None:
+                return None
+            # SWA present but no total budget — conservative single-sequence estimate.
+            # The C++ side will still bound this against available memory.
+            return self.info.max_seq_len
+
+        tpb = self.info.tokens_per_block
+        # Cap at max_batch_size × max_seq_len (can't need more than one
+        # full sequence per slot during prefill).
+        capped = min(total_max_tokens, self.info.max_batch_size * self.info.max_seq_len)
+        # Floor: at least one block per sequence for warmup feasibility.
+        min_tokens = self.info.max_batch_size * tpb
+        return max(capped, min_tokens)
+
     def _create_kv_cache_manager(self, max_tokens: Optional[int] = None) -> Dict:
-        """Create KVCacheManager or MambaHybridCacheManager with standard layout.
+        """Create a single KVCacheManager that hosts every KV pool.
 
         For paged resources (KVPagedResourceHandler):
-        - Uses the first KVPagedResourceHandler's head_dim and dtype as reference
-        - Compatible resources (matching head_dim and dtype) go into KVCacheManager
-        - Incompatible resources are allocated locally via handler.allocate()
+        - All managed layers are passed to one ``KVCacheManager`` instance.
+        - Per-window ``head_dim`` and ``dtype`` flow through the new
+          ``size_per_head_per_window`` / ``dtype_per_window`` ctor kwargs; the
+          C++ side groups layers internally by their effective window into
+          pools using its ``mLayerToWindowSize`` map.
+        - Cross-pool admission, event flush, disagg transfer, and the shared
+          radix tree are all handled in C++.
 
         For state resources (SSMResourceHandler, CausalConvResourceHandler, StateResourceHandler):
         - SSMResourceHandler maps to MambaHybridCacheManager's ssm_states buffer
@@ -694,20 +897,41 @@ class CachedSequenceInterface:
                 1. the final number of tokens is synced (min) across ranks
                 2. rounding for getting a multiple of tokens_per_block
         """
-        # 1. Identify managed resources
-        kv_ref, kv_managed = self._identify_managed_kv_resources()
+        # 1. Identify managed resources and per-window shape maps
+        (
+            kv_managed,
+            size_per_head_per_window,
+            dtype_per_window,
+            window_per_layer,
+        ) = self._identify_managed_kv_resources()
+
         ssm_ref, ssm_managed, ssm_spec, conv_ref, conv_managed, conv_spec = (
             self._identify_managed_state_resources()
         )
-
-        # 2. Prepare configuration
-        kv_cache_config = self._prepare_kv_cache_config(max_tokens, kv_managed)
-        kv_cache_kwargs = self._build_kv_cache_kwargs(kv_ref, kv_managed, kv_cache_config)
-
-        # 3. Create cache manager (delegate to state helper if state resources exist)
         has_state_resources = ssm_managed or conv_managed
-        if has_state_resources:
-            # NOTE: +1 for cuda graph padding
+
+        # 2. Compute the total token budget; the C++ side splits it across pools.
+        total_max_tokens = self._compute_total_token_budget(
+            kv_managed, size_per_head_per_window, max_tokens
+        )
+
+        kv_cache_config = self._prepare_kv_cache_config(
+            total_max_tokens, kv_managed, window_per_layer
+        )
+        kv_cache_kwargs = self._build_kv_cache_kwargs(
+            kv_managed,
+            kv_cache_config,
+            size_per_head_per_window=size_per_head_per_window,
+            dtype_per_window=dtype_per_window,
+        )
+
+        # 3. Build the unified manager (single instance covers every pool).
+        if not kv_managed and not has_state_resources:
+            # Pure dummy manager: no KV layers, no state — used for state-only or
+            # cache-less models.  We still need a manager so PyExecutor has a
+            # handle to call.
+            self._kv_cache_manager = KVCacheManager(**kv_cache_kwargs)
+        elif has_state_resources:
             kv_cache_kwargs["max_batch_size"] = self.info.max_num_state_slots
             self._kv_cache_manager, _ = self._create_and_assign_state_views(
                 kv_cache_kwargs,
@@ -719,18 +943,47 @@ class CachedSequenceInterface:
                 conv_spec,
             )
         else:
-            # No typed state resources - use pure KVCacheManager
             self._kv_cache_manager = KVCacheManager(**kv_cache_kwargs)
 
-        # 4. Store tuned config
+        ad_logger.info(
+            f"KV manager: {len(kv_managed)} layers across "
+            f"{len(size_per_head_per_window)} pool(s); "
+            f"size_per_head_per_window={size_per_head_per_window}, "
+            f"max_attention_window={kv_cache_config.max_attention_window}, "
+            f"max_tokens={total_max_tokens}"
+        )
+
+        # 4. Store tuned config (mirrors the kv_cache_config used at ctor time).
         self._kv_cache_config_tuned = kv_cache_config
 
-        # 5. Assign KV views (compute block_offset_multiplier from first view's strides)
-        block_offset_multiplier = self._assign_kv_cache_views(kv_managed)
+        # 5. Refresh per-pool window list from the finalized manager: KVCacheManager
+        # may clamp each window to min(window, max_seq_len) during construction, so
+        # the transform-time _kv_group_windows can become stale.  Downstream callers
+        # (ad_executor.get_cache_indices(window_size=...)) need the post-clamp
+        # values to hit the correct pool key in C++.
+        if kv_managed and self._kv_group_windows:
+            manager_windows = list(dict.fromkeys(self._kv_cache_manager.max_attention_window_vec))
+            if manager_windows and manager_windows != self._kv_group_windows:
+                ad_logger.info(
+                    f"Refreshing kv_group_windows from manager: "
+                    f"{self._kv_group_windows} -> {manager_windows}"
+                )
+                self._kv_group_windows = manager_windows
 
-        # 6. Update cache information (resize cache_loc, set max_seq_info with all max sizes)
+        # 6. Assign KV views and update cache information.
+        block_offset_multiplier = 0
+        if kv_managed:
+            block_offset_multiplier = self._assign_kv_cache_views(
+                kv_managed, self._kv_cache_manager
+            )
+
+        num_blocks = getattr(
+            self._kv_cache_manager,
+            "blocks_in_primary_pool",
+            self._kv_cache_manager.get_max_resource_count(),
+        )
         self.info.update_cache_information(
-            num_blocks=self._kv_cache_manager.blocks_in_primary_pool,
+            num_blocks=num_blocks,
             block_offset_multiplier=block_offset_multiplier,
         )
 
@@ -743,11 +996,11 @@ class CachedSequenceInterface:
             self._clear_caches,
         )
 
-        # 9. Compute final token count and cache statistics
+        # 8. Compute final token count and cache statistics
         max_resource_count = self._kv_cache_manager.get_max_resource_count()
         max_tokens_final = max_resource_count * self._kv_cache_manager.tokens_per_block
 
-        # 10. Collect statistics of different types of resources
+        # 9. Collect statistics of different types of resources
         num_state_total = sum(
             1 for h in self._resource_lookup.values() if isinstance(h, StateResourceHandler)
         )
@@ -866,12 +1119,16 @@ class CachedSequenceInterface:
 
         This implements the two-phase approach: after running a forward pass during estimation
         to allocate intermediate memory, call this method to recreate the cache manager.
-        The new manager will compute optimal capacity based on current free GPU memory.
+
+        For multi-pool (dual head_dim): the C++
+        ``BaseKVCacheManager::calculateMaxNumBlocks`` distributes the budget
+        across pools using the per-window head_dim/dtype overrides — the
+        Python side just provides the total token budget.
         """
         if not self.needs_resize():
             return
 
-        # Calculate bytes-per-token for paged (resizable) resources
+        # Calculate bytes-per-token for ALL paged resources (across all groups)
         paged_bytes_per_token = sum(
             h.bytes_per_token for h in self._resource_lookup.values() if h.is_paged
         )
@@ -890,14 +1147,14 @@ class CachedSequenceInterface:
         _, free_mem, *_ = get_mem_info(empty_cache=True)
 
         # Compute available memory for paged caches
-        # Reserve space for non-paged caches and mem_exclude, then apply free_gpu_memory_fraction
         free_gpu_memory_fraction = self._kv_cache_config_original.free_gpu_memory_fraction
         mem_for_paged_optimal = (
             free_mem - non_paged_bytes_total - mem_exclude
         ) * free_gpu_memory_fraction
         max_tokens_optimal = int(mem_for_paged_optimal // paged_bytes_per_token)
 
-        # Create new cache manager with optimal capacity
+        # Recreate the unified manager — the C++ side splits the total token
+        # budget across pools internally based on per-window head_dim/dtype.
         cache_stats = self._create_kv_cache_manager(max_tokens=max_tokens_optimal)
         max_tokens_final = cache_stats["max_tokens"]
 
@@ -916,8 +1173,26 @@ class CachedSequenceInterface:
         )
 
     @property
+    def kv_group_windows(self) -> List[int]:
+        """Per-pool window sizes, in the order the C++ manager exposes them.
+
+        Pool index == position in this list, matching the keys order of the
+        unified manager's ``size_per_head_per_window`` property.
+        """
+        return self._kv_group_windows
+
+    def set_kv_groups(self, group_windows: List[int]) -> None:
+        """Store per-pool window sizes (called by the kvcache transform).
+
+        ``group_windows[i]`` is the effective window of pool ``i``; the order
+        must match the unified ``KVCacheManager``'s pool ordering (i.e., the
+        insertion order of the per-window keys).
+        """
+        self._kv_group_windows = list(group_windows)
+
+    @property
     def kv_cache_manager(self) -> Optional[KVCacheManager]:
-        """Return the KVCacheManager managing paged resources, or None if not initialized."""
+        """Return the unified KVCacheManager, or None if not initialized."""
         assert self._kv_cache_manager is not None, "KVCacheManager not initialized."
         return self._kv_cache_manager
 

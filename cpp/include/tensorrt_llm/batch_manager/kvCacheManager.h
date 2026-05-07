@@ -502,7 +502,6 @@ public:
         , mNumTokens(numTokens)
         , mBeamWidth(beamWidth)
         , mKvCacheRetentionConfig(std::move(kvCacheRetentionConfig))
-        , mNumFrontBlocksRemoved(0)
         , mCurrentPrepopulatedPromptLen(std::numeric_limits<SizeType32>::max())
     {
         auto const numWindowSizes = windowSizeToMetadata.size();
@@ -511,6 +510,12 @@ public:
         for (auto const [windowSize, metadata] : windowSizeToMetadata)
         {
             mCacheBlockIds[windowSize] = std::vector<std::vector<KVCacheBlock::IdType>>(beamWidth);
+            // Front-eviction count is tracked per-window: SWA pools may evict blocks while
+            // full-attention pools never do, and each pool's index math needs its own count.
+            // Pre-existing behavior (a single shared counter) only worked when one
+            // KVCacheManager == one window; once a single manager hosts multiple pools, the
+            // counter must be per-window.
+            mNumFrontBlocksRemovedPerWindow[windowSize] = 0;
             auto const numPools = metadata.numPools;
             auto const maxBlocks = metadata.maxBlocksPerSeq;
             mCacheBlockIndices[windowSize]
@@ -546,9 +551,21 @@ public:
         return mNumTokens;
     }
 
-    [[nodiscard]] SizeType32 getNumFrontBlocksRemoved() const
+    //! \brief Front-evicted blocks for the specified window only.
+    //! \details Only SWA windows ever evict; full-attention windows always return 0.
+    //!          Callers iterating per-pool MUST pass the relevant windowSize so that
+    //!          SWA evictions are not attributed to non-SWA pools.
+    //!          The no-argument / aggregate-across-windows overload was deliberately
+    //!          removed: implicit aggregation hid window-qualification bugs at call sites.
+    //!          Callers that genuinely want a sum should iterate the registered windows
+    //!          explicitly.
+    [[nodiscard]] SizeType32 getNumFrontBlocksRemoved(SizeType32 windowSize) const
     {
-        return mNumFrontBlocksRemoved;
+        auto it = mNumFrontBlocksRemovedPerWindow.find(windowSize);
+        TLLM_CHECK_WITH_INFO(it != mNumFrontBlocksRemovedPerWindow.end(),
+            "GenerationRequest::getNumFrontBlocksRemoved: windowSize=%d not registered for request %lu", windowSize,
+            static_cast<unsigned long>(mRequestId));
+        return it->second;
     }
 
     [[nodiscard]] SizeType32 getBeamWidth() const
@@ -593,12 +610,18 @@ public:
         {
             beamBlockIds.clear();
         }
-        mNumFrontBlocksRemoved = 0;
+        // Reset only this window's counter, not the others — clearing one pool's blocks
+        // must not invalidate the eviction state of co-existing pools.
+        auto it = mNumFrontBlocksRemovedPerWindow.find(windowSize);
+        if (it != mNumFrontBlocksRemovedPerWindow.end())
+        {
+            it->second = 0;
+        }
     }
 
     void removeFrontBlock(SizeType32 windowSize)
     {
-        ++mNumFrontBlocksRemoved;
+        ++mNumFrontBlocksRemovedPerWindow.at(windowSize);
     }
 
     void removeLastBlock(SizeType32 windowSize)
@@ -656,8 +679,10 @@ private:
     std::unordered_map<SizeType32, runtime::ITensor::SharedPtr> mCacheBlockIndices;
     // The retention priority to assign to decode blocks
     executor::KvCacheRetentionConfig mKvCacheRetentionConfig;
-    // Number of front blocks removed from the sequence
-    SizeType32 mNumFrontBlocksRemoved;
+    // Number of front blocks evicted from the sequence, tracked per window size.
+    // Each WindowBlockManager increments only its own entry on detachFrontBlock; full-attn
+    // windows always stay at 0 since they never trigger SWA eviction.
+    std::map<SizeType32, SizeType32> mNumFrontBlocksRemovedPerWindow;
     // Set of used blocks by the sequence
     std::set<KVCacheBlock::IdType> mUsedBlocks;
     // Current prepopulated prompt length
@@ -912,6 +937,31 @@ public:
     [[nodiscard]] SizeType32 getWindowSize() const noexcept
     {
         return mWindowSize;
+    }
+
+    //! \brief Return this manager's KV-cache element data type.
+    //! \details Each WindowBlockManager carries its own dtype, which lets BlockManager
+    //!          host pools with mixed precisions when constructed with a per-window
+    //!          dtype map.  Empty pools or NVFP4-scale pools are routed through the
+    //!          per-pool tensor metadata instead.
+    [[nodiscard]] nvinfer1::DataType getDataType() const noexcept
+    {
+        return mDataType;
+    }
+
+    //! \brief Return the head_dim shared by all KV pools in this window manager.
+    //! \details All pools constructed under a WindowBlockManager share a single
+    //!          head_dim (the constructor's @c sizePerHead), so we read it from the
+    //!          first pool.  Returns 0 if no pools are present, or if the pool was
+    //!          built with @c sizePerHead<=0 (recurrent-state pools use -1 as a
+    //!          sentinel and do not have a meaningful head dimension).
+    [[nodiscard]] SizeType32 getSizePerHead() const noexcept
+    {
+        if (mPools.empty() || mPools.front().sizePerHead <= 0)
+        {
+            return 0;
+        }
+        return mPools.front().sizePerHead;
     }
 
     [[nodiscard]] std::string const& getLogPrefix() const noexcept
@@ -1323,6 +1373,17 @@ public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
     using BaseEvictionPolicy = tensorrt_llm::batch_manager::eviction_policy::BaseEvictionPolicy;
 
+    //! \brief Construct a BlockManager.
+    //! \param sizePerHead Default head size (used for any window without an entry in
+    //!        @p sizePerHeadPerWindow).
+    //! \param dtype Default KV-cache data type (used for any window without an entry in
+    //!        @p dtypePerWindow).
+    //! \param sizePerHeadPerWindow Optional per-window override of @p sizePerHead.  Lets
+    //!        a single BlockManager host pools with distinct head dimensions (e.g. Gemma4
+    //!        SWA layers with head_dim=256 alongside full-attention layers with head_dim=512).
+    //!        Empty map = uniform @p sizePerHead.
+    //! \param dtypePerWindow Optional per-window override of @p dtype.  Empty map = uniform
+    //!        @p dtype.  Pools that don't appear in the map fall back to @p dtype.
     explicit BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead,
         SizeType32 tokensPerBlock, BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences,
         CudaStreamPtr stream, SizeType32 maxSequenceLength, SizeType32 maxBeamWidth,
@@ -1334,8 +1395,9 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         std::optional<kvc::BaseAgentConfig> agentConfig = std::nullopt, bool enableIndexerKCache = false,
         SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0,
-        bool indexerKCacheUseFp4 = false,
-        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
+        bool indexerKCacheUseFp4 = false, std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
+        std::map<SizeType32, SizeType32> const& sizePerHeadPerWindow = {},
+        std::map<SizeType32, nvinfer1::DataType> const& dtypePerWindow = {});
 
     [[nodiscard]] bool isEnableIndexerKCache() const
     {
@@ -1445,6 +1507,43 @@ public:
             numFreeBlocksPerWindowSize[windowSize] = manager.getNumFreeBlocks();
         }
         return numFreeBlocksPerWindowSize;
+    }
+
+    //! \brief Per-window head_dim view across all WindowBlockManagers.
+    //! \details Equivalent to the @c sizePerHeadPerWindow constructor argument when supplied,
+    //!          otherwise every entry equals the scalar @c sizePerHead.  Lets callers
+    //!          (e.g. Python-side tensor reshaping or kernel dispatch) discover per-pool
+    //!          head_dim without reaching into KVCacheBlockPool.
+    [[nodiscard]] std::map<SizeType32, SizeType32> getSizePerHeadPerWindow() const
+    {
+        std::map<SizeType32, SizeType32> result;
+        for (auto const& [windowSize, manager] : mWindowBlockManagers)
+        {
+            result[windowSize] = manager.getSizePerHead();
+        }
+        return result;
+    }
+
+    //! \brief Per-window dtype view across all WindowBlockManagers.
+    //! \details Mirrors @c getSizePerHeadPerWindow for KV-cache element type.
+    [[nodiscard]] std::map<SizeType32, nvinfer1::DataType> getDataTypePerWindow() const
+    {
+        std::map<SizeType32, nvinfer1::DataType> result;
+        for (auto const& [windowSize, manager] : mWindowBlockManagers)
+        {
+            result[windowSize] = manager.getDataType();
+        }
+        return result;
+    }
+
+    [[nodiscard]] SizeType32 getSizePerHeadForWindow(SizeType32 windowSize) const
+    {
+        return mWindowBlockManagers.at(windowSize).getSizePerHead();
+    }
+
+    [[nodiscard]] nvinfer1::DataType getDataTypeForWindow(SizeType32 windowSize) const
+    {
+        return mWindowBlockManagers.at(windowSize).getDataType();
     }
 
     [[nodiscard]] SizeType32 getNumFreeBlocks() const
@@ -1977,9 +2076,9 @@ public:
     ///          of memory requirements. The weighting considers both the window size and the number of
     ///          layers using each window size, as well as the sum of cache sizes per token for each window.
     /// @param config KV cache configuration parameters
-    /// @param dtype Data type used for KV cache values
+    /// @param dtype Default KV-cache data type (used for any window without an entry in @p dtypePerWindow)
     /// @param numKvHeadsPerLayer Number of KV heads for each local layer (caller selects self/cross attention heads)
-    /// @param sizePerHead Size of each attention head
+    /// @param sizePerHead Default head size (used for any window without an entry in @p sizePerHeadPerWindow)
     /// @param tokensPerBlock Number of tokens per KV cache block
     /// @param worldConfig World configuration for multi-GPU setups
     /// @param windowSizeToLayers Map from attention window size to vector of layer indices using that window size
@@ -1988,13 +2087,20 @@ public:
     /// @param extraCostMemory Additional memory cost to account for CacheTransBufferManager::preAllocBufferSize
     /// @param kvFactor Factor for KV cache size calculation (typically 2 for key+value)
     /// @param maxBatchSize Maximum batch size
+    /// @param linearAttentionMetadata Optional metadata for linear / recurrent state pools.
+    /// @param sizePerHeadPerWindow Optional per-window override of @p sizePerHead.  Lets a single
+    ///        BlockManager budget pools with distinct head dimensions (e.g. Gemma4 SWA head_dim=256
+    ///        + full-attention head_dim=512).  Empty map = uniform @p sizePerHead.
+    /// @param dtypePerWindow Optional per-window override of @p dtype.  Empty = uniform.
     /// @return Map from window size to tuple of (primary blocks, secondary blocks)
     [[nodiscard]] static BlocksPerWindow calculateMaxNumBlocks(executor::KvCacheConfig const& config,
         nvinfer1::DataType dtype, std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead,
         SizeType32 tokensPerBlock, tensorrt_llm::runtime::WorldConfig const& worldConfig,
         std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers, uint64_t allottedPrimaryMemBytes,
         uint64_t allottedSecondaryMemBytes, size_t extraCostMemory, SizeType32 kvFactor, SizeType32 maxBatchSize,
-        std::optional<LinearAttentionMetadata> const& linearAttentionMetadata = std::nullopt);
+        std::optional<LinearAttentionMetadata> const& linearAttentionMetadata = std::nullopt,
+        std::map<SizeType32, SizeType32> const& sizePerHeadPerWindow = {},
+        std::map<SizeType32, nvinfer1::DataType> const& dtypePerWindow = {});
 
     /// @brief Calculates the maximum batch size that can fit the kv-cache, given that all sequences in the batch have
     /// the provided input and output length.
@@ -2042,6 +2148,16 @@ public:
     using CudaStreamPtr = std::shared_ptr<runtime::CudaStream>;
     using CacheType = tensorrt_llm::batch_manager::kv_cache_manager::CacheType;
 
+    //! \brief Construct a KVCacheManager.
+    //! \param sizePerHead Default head size used for any window without an entry in
+    //!        @p sizePerHeadPerWindow.
+    //! \param dtype Default KV-cache data type used for any window without an entry in
+    //!        @p dtypePerWindow.
+    //! \param sizePerHeadPerWindow Optional per-window override of @p sizePerHead.
+    //!        Hosts mixed-shape pools (e.g. Gemma4 SWA head_dim=256 + full head_dim=512)
+    //!        inside a single manager so the existing block reuse, scheduling, MPI
+    //!        reduction, and disagg transfer machinery applies natively.  Empty = uniform.
+    //! \param dtypePerWindow Optional per-window override of @p dtype.  Empty = uniform.
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
         std::vector<SizeType32> const& maxAttentionWindowVec, nvinfer1::DataType dtype, SizeType32 sinkTokenLength,
@@ -2053,7 +2169,9 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
-        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
+        std::map<SizeType32, SizeType32> const& sizePerHeadPerWindow = {},
+        std::map<SizeType32, nvinfer1::DataType> const& dtypePerWindow = {});
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -2066,7 +2184,9 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
-        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
+        std::map<SizeType32, SizeType32> const& sizePerHeadPerWindow = {},
+        std::map<SizeType32, nvinfer1::DataType> const& dtypePerWindow = {});
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -2079,7 +2199,9 @@ public:
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
-        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
+        std::map<SizeType32, SizeType32> const& sizePerHeadPerWindow = {},
+        std::map<SizeType32, nvinfer1::DataType> const& dtypePerWindow = {});
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -2088,7 +2210,9 @@ public:
         CacheType cacheType = CacheType::kSELF, bool enablePartialReuse = true, bool copyOnpartialReuse = true,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
         SizeType32 indexerKCacheIndexHeadDim = 0, bool indexerKCacheUseFp4 = false,
-        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt);
+        std::optional<LinearAttentionMetadata> linearAttentionMetadata = std::nullopt,
+        std::map<SizeType32, SizeType32> const& sizePerHeadPerWindow = {},
+        std::map<SizeType32, nvinfer1::DataType> const& dtypePerWindow = {});
 
     ~KVCacheManager() override = default;
 

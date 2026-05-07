@@ -866,6 +866,11 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
         model_type: str = "nemotron_hybrid",
         is_draft: bool = False,
         use_replay_state_update: bool = False,
+        # Optional per-window head_dim / dtype overrides forwarded to the C++
+        # KVCacheManager ctor. Lets a single manager host pools with mixed
+        # shapes (e.g. Gemma4 hybrid attention). See KVCacheManager.__init__.
+        size_per_head_per_window: Optional[Dict[int, int]] = None,
+        dtype_per_window: Optional[Dict[int, "DataType"]] = None,
     ) -> None:
 
         # mamba hybrid cache requires block reuse to be disabled in KV cache config
@@ -915,6 +920,8 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
             is_estimating_kv_cache=is_estimating_kv_cache,
             execution_stream=execution_stream,
             is_draft=is_draft,
+            size_per_head_per_window=size_per_head_per_window,
+            dtype_per_window=dtype_per_window,
         )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -1116,6 +1123,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             layer_mask=layer_mask,
             is_estimating_kv_cache=is_estimating_kv_cache,
             linear_attention_metadata=self.linear_attention_metadata,
+            **kwargs,
         )
 
         assert self.local_num_mamba_layers > 0, "At least one mamba layer is required"

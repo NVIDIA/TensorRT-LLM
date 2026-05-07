@@ -782,6 +782,19 @@ def test_sequence_info_update_cache_information_resizes():
         assert seq_info._input_buffer.get_capacity("cache_loc") >= expected_capacity
 
 
+def test_sequence_info_update_cache_information_preserves_max_blocks():
+    """Verify max_blocks_per_seq is always based on max_seq_len (not window)."""
+    seq_info = SequenceInfo(
+        max_seq_len=128,
+        max_batch_size=4,
+        tokens_per_block=32,
+    )
+
+    original_max_blocks = seq_info.max_blocks_per_seq  # ceil(128 / 32) = 4
+    seq_info.update_cache_information(num_blocks=100)
+    assert seq_info.max_blocks_per_seq == original_max_blocks
+
+
 def test_sequence_info_last_page_len_uses_tokens_per_block():
     """Verify nest_sequences calculates last_page_len using tokens_per_block."""
     seq_info = SequenceInfo(
@@ -1191,3 +1204,270 @@ def test_register_host_prepare_populates_requires_copy():
 
     assert "batch_info_host" in seq_info._active_host_prep_args
     assert "cu_num_pages_host" in seq_info._active_host_prep_args
+
+
+# =============================================================================
+# Multi-Window (VSWA) KV Cache Tests — single unified KVCacheManager hosting
+# multiple C++ pools via the per-window head_dim/dtype overrides.
+# =============================================================================
+
+
+def test_identify_managed_kv_resources_single_window():
+    """Single head_dim and no sliding window collapses into one window entry."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32, max_tokens=1024, free_gpu_memory_fraction=0.0
+        ),
+    )
+    name_0 = interface.add_resource("kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    name_1 = interface.add_resource("kv_1", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+
+    (
+        kv_managed,
+        size_per_head_per_window,
+        dtype_per_window,
+        window_per_layer,
+    ) = interface._identify_managed_kv_resources()
+
+    assert len(kv_managed) == 2
+    # No sliding_window → effective window = max_seq_len.
+    assert size_per_head_per_window == {128: 64}
+    assert set(dtype_per_window.keys()) == {128}
+    assert window_per_layer == {name_0: 128, name_1: 128}
+
+
+def test_identify_managed_kv_resources_dual_window_gemma4_pattern():
+    """Gemma4-style mix: SWA layers with smaller head_dim + full-attn layer with larger head_dim."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32, max_tokens=1024, free_gpu_memory_fraction=0.0
+        ),
+    )
+    # SWA window: head_dim=64
+    swa_name_0 = interface.add_resource(
+        "kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16, sliding_window=64)
+    )
+    swa_name_1 = interface.add_resource(
+        "kv_1", KVPagedResourceHandler(8, 64, dtype=torch.float16, sliding_window=64)
+    )
+    # Full-attention window: head_dim=128
+    full_name = interface.add_resource("kv_2", KVPagedResourceHandler(4, 128, dtype=torch.float16))
+
+    (
+        kv_managed,
+        size_per_head_per_window,
+        dtype_per_window,
+        window_per_layer,
+    ) = interface._identify_managed_kv_resources()
+
+    assert len(kv_managed) == 3
+    # Two windows, keyed by effective window size; full-attention falls back to max_seq_len.
+    assert size_per_head_per_window == {64: 64, 128: 128}
+    assert set(dtype_per_window.keys()) == {64, 128}
+    assert window_per_layer[swa_name_0] == 64
+    assert window_per_layer[swa_name_1] == 64
+    assert window_per_layer[full_name] == 128
+
+
+def test_identify_managed_kv_resources_no_unmanaged():
+    """All KV layers are part of the unified manager — none left unmanaged."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32, max_tokens=1024, free_gpu_memory_fraction=0.0
+        ),
+    )
+    interface.add_resource("kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource(
+        "kv_1", KVPagedResourceHandler(8, 64, dtype=torch.float16, sliding_window=64)
+    )
+    interface.add_resource(
+        "kv_2", KVPagedResourceHandler(4, 128, dtype=torch.float16, sliding_window=32)
+    )
+
+    (
+        kv_managed,
+        size_per_head_per_window,
+        _dtype_per_window,
+        window_per_layer,
+    ) = interface._identify_managed_kv_resources()
+
+    assert len(kv_managed) == 3
+    assert len(window_per_layer) == 3
+    # Three distinct effective windows in this fixture: 32, 64, max_seq_len(=128).
+    assert set(size_per_head_per_window.keys()) == {32, 64, 128}
+
+
+def test_identify_managed_kv_resources_rejects_mixed_head_dim_in_same_window():
+    """Layers sharing an effective window must agree on head_dim."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32, max_tokens=1024, free_gpu_memory_fraction=0.0
+        ),
+    )
+    # Both default to sliding_window=0 → effective window = max_seq_len. Different head_dims
+    # in the same window are not representable by one C++ pool.
+    interface.add_resource("kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_1", KVPagedResourceHandler(4, 128, dtype=torch.float16))
+
+    with pytest.raises(RuntimeError, match="head_dim"):
+        interface._identify_managed_kv_resources()
+
+
+def test_two_windows_create_unified_manager_with_two_pools():
+    """Gemma4-style two-window fixture creates a single KVCacheManager hosting both pools."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32, max_tokens=1024, free_gpu_memory_fraction=0.0
+        ),
+    )
+    # SWA window: head_dim=64, sliding_window=64
+    interface.add_resource(
+        "kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16, sliding_window=64)
+    )
+    interface.add_resource(
+        "kv_1", KVPagedResourceHandler(8, 64, dtype=torch.float16, sliding_window=64)
+    )
+    # Full-attention window: head_dim=128
+    interface.add_resource("kv_2", KVPagedResourceHandler(4, 128, dtype=torch.float16))
+
+    interface.initialize_resources()
+    mgr = interface.kv_cache_manager
+
+    assert isinstance(mgr, KVCacheManager)
+    # The unified C++ manager exposes per-window head_dim/dtype maps via its impl.
+    assert dict(mgr.impl.size_per_head_per_window) == {64: 64, 128: 128}
+    assert set(mgr.impl.dtype_per_window.keys()) == {64, 128}
+
+
+def test_single_window_creates_plain_kv_cache_manager():
+    """One window creates a plain KVCacheManager with a single C++ pool."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32, max_tokens=1024, free_gpu_memory_fraction=0.0
+        ),
+    )
+    interface.add_resource("kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+    interface.add_resource("kv_1", KVPagedResourceHandler(8, 64, dtype=torch.float16))
+
+    interface.initialize_resources()
+
+    assert isinstance(interface.kv_cache_manager, KVCacheManager)
+    # Exactly one window key in the per-window map (max_seq_len, since sliding_window=0).
+    assert len(interface.kv_cache_manager.impl.size_per_head_per_window) == 1
+
+
+def test_dual_pool_cache_views_correct_shape():
+    """Mixed-head_dim VSWA: each layer's cache view uses its own head_dim/num_kv_heads."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32, max_tokens=1024, free_gpu_memory_fraction=0.0
+        ),
+    )
+    # SWA layer with head_dim=64.
+    interface.add_resource(
+        "kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16, sliding_window=64)
+    )
+    # Full-attention layer with head_dim=128 (different window, so different head_dim is allowed).
+    interface.add_resource("kv_1", KVPagedResourceHandler(4, 128, dtype=torch.float16))
+
+    interface.initialize_resources()
+
+    # SWA layer (head_dim=64): cache view shape [..., 8, 32, 64]
+    kv_0 = interface._caches[list(interface._caches.keys())[0]]
+    assert kv_0.shape[-1] == 64
+    assert kv_0.shape[-3] == 8  # num_kv_heads
+
+    # Full-attn layer (head_dim=128): cache view shape [..., 4, 32, 128]
+    kv_1 = interface._caches[list(interface._caches.keys())[1]]
+    assert kv_1.shape[-1] == 128
+    assert kv_1.shape[-3] == 4  # num_kv_heads
+
+
+def test_unified_manager_lifecycle():
+    """One unified KVCacheManager handles lifecycle for all pools."""
+    interface = CachedSequenceInterface(
+        max_seq_len=128,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(128, 4),
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32, max_tokens=1024, free_gpu_memory_fraction=0.0
+        ),
+    )
+    interface.add_resource(
+        "kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16, sliding_window=64)
+    )
+    interface.add_resource("kv_1", KVPagedResourceHandler(4, 128, dtype=torch.float16))
+
+    interface.initialize_resources()
+    mgr = interface.kv_cache_manager
+
+    assert isinstance(mgr, KVCacheManager)
+    # Single C++ impl backs every pool.
+    assert mgr.impl is not None
+    # Free-block accounting is a single number across all pools.
+    assert mgr.get_num_free_blocks() >= 0
+    # Lifecycle close is idempotent for the unified manager.
+    mgr.shutdown()
+
+
+def test_max_attention_window_from_handler_sliding_window():
+    """Handlers with sliding_window drive the per-window dispatch and pool grouping."""
+    interface = CachedSequenceInterface(
+        max_seq_len=256,
+        max_batch_size=4,
+        max_num_tokens=default_max_num_tokens(256, 4),
+        device="cuda",
+        kv_cache_config=KvCacheConfig(
+            tokens_per_block=32,
+            max_tokens=2048,
+            free_gpu_memory_fraction=0.0,
+        ),
+    )
+    # SWA window: head_dim=64, sliding_window=64
+    interface.add_resource(
+        "kv_0", KVPagedResourceHandler(8, 64, dtype=torch.float16, sliding_window=64)
+    )
+    interface.add_resource(
+        "kv_1", KVPagedResourceHandler(8, 64, dtype=torch.float16, sliding_window=64)
+    )
+    # Full-attention window: head_dim=128, no sliding_window → effective window = max_seq_len.
+    interface.add_resource("kv_2", KVPagedResourceHandler(4, 128, dtype=torch.float16))
+
+    interface.initialize_resources()
+    mgr = interface.kv_cache_manager
+
+    assert isinstance(mgr, KVCacheManager)
+    # Per-window head_dim map exposes the SWA window plus the full-attention (max_seq_len) window.
+    size_map = dict(mgr.impl.size_per_head_per_window)
+    assert size_map == {64: 64, 256: 128}
+    # The per-layer max_attention_window vector mirrors the effective windows in registration order.
+    assert mgr.max_attention_window_vec == [64, 64, 256]

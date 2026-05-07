@@ -16,6 +16,7 @@
  */
 
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
@@ -9797,4 +9798,514 @@ TEST_F(KVCacheManagerTest, KvCacheConnector_DecodeBlockBoundary_ParityWithBaseli
             << "Block count diverged at decode step " << i << " (baseline=" << baseline[i]
             << ", withConnector=" << withConnector[i] << "); see issue #13320";
     }
+}
+
+// =============================================================================
+// Per-window head_dim / dtype overrides on BlockManager and KVCacheManager,
+// plus per-window front-eviction bookkeeping on GenerationRequest.
+// Production surface added in commits 1c273f0594 and 823d6ea0e1; the previous
+// tests (KVCacheManagerVariableWindowAttentionWithReuseTest, FP4BlockScaleManagementTest)
+// only exercise uniform-shape pools.
+// =============================================================================
+
+namespace
+{
+//! \brief Find the absolute pool index whose window size matches @p windowSize.
+SizeType32 findPoolIdxForWindow(BlockManager const& blockManager, SizeType32 windowSize)
+{
+    auto const numPools = blockManager.getNumPools(/*includeBlockScalePools=*/false);
+    for (SizeType32 poolIdx = 0; poolIdx < numPools; ++poolIdx)
+    {
+        if (blockManager.getPoolWindowSize(poolIdx) == windowSize)
+        {
+            return poolIdx;
+        }
+    }
+    TLLM_THROW("No pool found for window size %d", windowSize);
+}
+} // namespace
+
+TEST_F(KVCacheManagerTest, BlockManagerTestPerWindowSizePerHead)
+{
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr scalarSizePerHead = 64;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimary = 4;
+    auto constexpr blocksInSecondary = 0;
+    auto constexpr maxNumSequences = 4;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr smallWindow = 1024;
+    auto constexpr largeWindow = 4096;
+    auto constexpr smallSizePerHead = 64;
+    auto constexpr largeSizePerHead = 128;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto const maxAttentionWindowVec = std::vector<SizeType32>{smallWindow, largeWindow};
+    auto const blocksPerWindow = BlocksPerWindow{
+        {smallWindow, {blocksInPrimary, blocksInSecondary}}, {largeWindow, {blocksInPrimary, blocksInSecondary}}};
+    auto const sizePerHeadPerWindow
+        = std::map<SizeType32, SizeType32>{{smallWindow, smallSizePerHead}, {largeWindow, largeSizePerHead}};
+
+    BlockManager blockManager(std::vector<BlockManager::SizeType32>(numLayers, numKvHeads), scalarSizePerHead,
+        tokensPerBlock, blocksPerWindow, maxNumSequences, stream, /*maxSequenceLength=*/largeWindow, maxBeamWidth,
+        maxAttentionWindowVec, nvinfer1::DataType::kHALF, /*sinkBubbleLength=*/0, /*chunkSize=*/0, CacheType::kSELF,
+        /*secondaryOffloadMinPriority=*/std::nullopt, /*eventManager=*/nullptr,
+        /*enablePartialReuse=*/true, /*copyOnPartialReuse=*/true, /*kvCacheConnectorManager=*/nullptr,
+        /*agentConfig=*/std::nullopt, /*enableIndexerKCache=*/false,
+        /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0, /*indexerKCacheUseFp4=*/false,
+        /*linearAttentionMetadata=*/std::nullopt, sizePerHeadPerWindow);
+    blockManager.allocatePools(/*useUvm=*/false);
+
+    auto const perWindow = blockManager.getSizePerHeadPerWindow();
+    ASSERT_EQ(perWindow.size(), 2u);
+    EXPECT_EQ(perWindow.at(smallWindow), smallSizePerHead);
+    EXPECT_EQ(perWindow.at(largeWindow), largeSizePerHead);
+    EXPECT_EQ(blockManager.getSizePerHeadForWindow(smallWindow), smallSizePerHead);
+    EXPECT_EQ(blockManager.getSizePerHeadForWindow(largeWindow), largeSizePerHead);
+
+    // Each WindowBlockManager has its own KVCacheBlockPool::sizePerHead reflecting the override.
+    auto const smallPoolIdx = findPoolIdxForWindow(blockManager, smallWindow);
+    auto const largePoolIdx = findPoolIdxForWindow(blockManager, largeWindow);
+    EXPECT_EQ(blockManager.getPool(smallPoolIdx).sizePerHead, smallSizePerHead);
+    EXPECT_EQ(blockManager.getPool(largePoolIdx).sizePerHead, largeSizePerHead);
+    EXPECT_NE(blockManager.getPool(smallPoolIdx).sizePerHead, blockManager.getPool(largePoolIdx).sizePerHead);
+    // blockSize = numKvHeads * sizePerHead * tokensPerBlock — should also differ accordingly.
+    EXPECT_EQ(blockManager.getPool(smallPoolIdx).blockSize, numKvHeads * smallSizePerHead * tokensPerBlock);
+    EXPECT_EQ(blockManager.getPool(largePoolIdx).blockSize, numKvHeads * largeSizePerHead * tokensPerBlock);
+}
+
+TEST_F(KVCacheManagerTest, BlockManagerTestPerWindowDataType)
+{
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 64;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimary = 4;
+    auto constexpr blocksInSecondary = 0;
+    auto constexpr maxNumSequences = 4;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr smallWindow = 1024;
+    auto constexpr largeWindow = 4096;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto const maxAttentionWindowVec = std::vector<SizeType32>{smallWindow, largeWindow};
+    auto const blocksPerWindow = BlocksPerWindow{
+        {smallWindow, {blocksInPrimary, blocksInSecondary}}, {largeWindow, {blocksInPrimary, blocksInSecondary}}};
+    auto const dtypePerWindow = std::map<SizeType32, nvinfer1::DataType>{
+        {smallWindow, nvinfer1::DataType::kHALF}, {largeWindow, nvinfer1::DataType::kBF16}};
+
+    BlockManager blockManager(std::vector<BlockManager::SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock,
+        blocksPerWindow, maxNumSequences, stream, /*maxSequenceLength=*/largeWindow, maxBeamWidth,
+        maxAttentionWindowVec,
+        /*scalarDtype=*/nvinfer1::DataType::kFLOAT, /*sinkBubbleLength=*/0, /*chunkSize=*/0, CacheType::kSELF,
+        /*secondaryOffloadMinPriority=*/std::nullopt, /*eventManager=*/nullptr,
+        /*enablePartialReuse=*/true, /*copyOnPartialReuse=*/true, /*kvCacheConnectorManager=*/nullptr,
+        /*agentConfig=*/std::nullopt, /*enableIndexerKCache=*/false,
+        /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0, /*indexerKCacheUseFp4=*/false,
+        /*linearAttentionMetadata=*/std::nullopt, /*sizePerHeadPerWindow=*/{}, dtypePerWindow);
+    blockManager.allocatePools(/*useUvm=*/false);
+
+    auto const perWindow = blockManager.getDataTypePerWindow();
+    ASSERT_EQ(perWindow.size(), 2u);
+    EXPECT_EQ(perWindow.at(smallWindow), nvinfer1::DataType::kHALF);
+    EXPECT_EQ(perWindow.at(largeWindow), nvinfer1::DataType::kBF16);
+    EXPECT_EQ(blockManager.getDataTypeForWindow(smallWindow), nvinfer1::DataType::kHALF);
+    EXPECT_EQ(blockManager.getDataTypeForWindow(largeWindow), nvinfer1::DataType::kBF16);
+    EXPECT_NE(blockManager.getDataTypeForWindow(smallWindow), blockManager.getDataTypeForWindow(largeWindow));
+}
+
+TEST_F(KVCacheManagerTest, BlockManagerTestPerWindowFallback)
+{
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr scalarSizePerHead = 64;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimary = 4;
+    auto constexpr blocksInSecondary = 0;
+    auto constexpr maxNumSequences = 4;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr smallWindow = 1024;
+    auto constexpr largeWindow = 4096;
+    auto constexpr scalarDtype = nvinfer1::DataType::kHALF;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto const maxAttentionWindowVec = std::vector<SizeType32>{smallWindow, largeWindow};
+    auto const blocksPerWindow = BlocksPerWindow{
+        {smallWindow, {blocksInPrimary, blocksInSecondary}}, {largeWindow, {blocksInPrimary, blocksInSecondary}}};
+
+    // No per-window overrides — expect both windows to fall back to scalars.
+    BlockManager blockManager(std::vector<BlockManager::SizeType32>(numLayers, numKvHeads), scalarSizePerHead,
+        tokensPerBlock, blocksPerWindow, maxNumSequences, stream, /*maxSequenceLength=*/largeWindow, maxBeamWidth,
+        maxAttentionWindowVec, scalarDtype, /*sinkBubbleLength=*/0, /*chunkSize=*/0);
+    blockManager.allocatePools(/*useUvm=*/false);
+
+    auto const perWindowSizePerHead = blockManager.getSizePerHeadPerWindow();
+    auto const perWindowDtype = blockManager.getDataTypePerWindow();
+    ASSERT_EQ(perWindowSizePerHead.size(), 2u);
+    ASSERT_EQ(perWindowDtype.size(), 2u);
+    EXPECT_EQ(perWindowSizePerHead.at(smallWindow), scalarSizePerHead);
+    EXPECT_EQ(perWindowSizePerHead.at(largeWindow), scalarSizePerHead);
+    EXPECT_EQ(perWindowDtype.at(smallWindow), scalarDtype);
+    EXPECT_EQ(perWindowDtype.at(largeWindow), scalarDtype);
+    EXPECT_EQ(blockManager.getSizePerHeadForWindow(smallWindow), blockManager.getSizePerHeadForWindow(largeWindow));
+    EXPECT_EQ(blockManager.getDataTypeForWindow(smallWindow), blockManager.getDataTypeForWindow(largeWindow));
+}
+
+// Static; does not require a GPU device.
+TEST(BaseKVCacheManagerCalculateMaxNumBlocks, PerWindowOverrideDivergesByteBudget)
+{
+    using SizeType32 = tensorrt_llm::runtime::SizeType32;
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr scalarSizePerHead = 64;
+    auto constexpr largeSizePerHead = 128;
+    auto constexpr tokensPerBlock = 64;
+    auto constexpr smallWindow = 1024;
+    auto constexpr largeWindow = 4096;
+    auto constexpr kvFactor = 2;
+    auto constexpr maxBatchSize = 1;
+
+    auto const numKvHeadsPerLayer = std::vector<SizeType32>(numLayers, numKvHeads);
+    // Layer 0 → smallWindow, layer 1 → largeWindow.
+    auto const windowSizeToLayers = std::map<SizeType32, std::vector<SizeType32>>{
+        {smallWindow, std::vector<SizeType32>{0}}, {largeWindow, std::vector<SizeType32>{1}}};
+    uint64_t const allottedPrimaryMemBytes = static_cast<uint64_t>(1) << 30; // 1 GiB
+    uint64_t const allottedSecondaryMemBytes = static_cast<uint64_t>(1) << 30;
+    size_t const extraCostMemory = 0;
+    auto const dtype = nvinfer1::DataType::kHALF;
+    tensorrt_llm::executor::KvCacheConfig const config{};
+    tensorrt_llm::runtime::WorldConfig const worldConfig{};
+
+    auto const baseline = BaseKVCacheManager::calculateMaxNumBlocks(config, dtype, numKvHeadsPerLayer,
+        scalarSizePerHead, tokensPerBlock, worldConfig, windowSizeToLayers, allottedPrimaryMemBytes,
+        allottedSecondaryMemBytes, extraCostMemory, kvFactor, maxBatchSize);
+
+    auto const sizePerHeadPerWindow
+        = std::map<SizeType32, SizeType32>{{smallWindow, scalarSizePerHead}, {largeWindow, largeSizePerHead}};
+    auto const overridden
+        = BaseKVCacheManager::calculateMaxNumBlocks(config, dtype, numKvHeadsPerLayer, scalarSizePerHead,
+            tokensPerBlock, worldConfig, windowSizeToLayers, allottedPrimaryMemBytes, allottedSecondaryMemBytes,
+            extraCostMemory, kvFactor, maxBatchSize, /*linearAttentionMetadata=*/std::nullopt, sizePerHeadPerWindow);
+
+    ASSERT_NE(baseline.find(smallWindow), baseline.end());
+    ASSERT_NE(baseline.find(largeWindow), baseline.end());
+    ASSERT_NE(overridden.find(smallWindow), overridden.end());
+    ASSERT_NE(overridden.find(largeWindow), overridden.end());
+
+    auto const& [baselineSmallPrim, baselineSmallSec] = baseline.at(smallWindow);
+    auto const& [baselineLargePrim, baselineLargeSec] = baseline.at(largeWindow);
+    auto const& [overSmallPrim, overSmallSec] = overridden.at(smallWindow);
+    auto const& [overLargePrim, overLargeSec] = overridden.at(largeWindow);
+
+    // Sanity: every count is positive.
+    EXPECT_GT(baselineSmallPrim, 0);
+    EXPECT_GT(baselineLargePrim, 0);
+    EXPECT_GT(overSmallPrim, 0);
+    EXPECT_GT(overLargePrim, 0);
+
+    // Default share allocation gives equal share (1/N) to each window, so baseline gives the
+    // same number of blocks per window when both windows have identical bytes/token.
+    EXPECT_EQ(baselineSmallPrim, baselineLargePrim);
+
+    // Override only doubles bytes/token for the *large* window.  Equal share is unchanged,
+    // so the small window's block count stays the same and the large window's halves.
+    EXPECT_EQ(overSmallPrim, baselineSmallPrim);
+    EXPECT_EQ(overSmallSec, baselineSmallSec);
+    EXPECT_LT(overLargePrim, baselineLargePrim);
+    EXPECT_LT(overLargeSec, baselineLargeSec);
+    // Large window pays double bytes/token under override → roughly half the blocks.
+    EXPECT_NEAR(static_cast<double>(overLargePrim) / baselineLargePrim, 0.5, 0.01);
+}
+
+TEST_F(KVCacheManagerTest, KVCacheManagerSWAEvictionCountPerWindow)
+{
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 64;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr maxNumSequences = 4;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr sinkTokenLength = 0;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr maxSequenceLength = 128;
+    auto constexpr maxNewTokens = 40;
+
+    // Layer 0 lives in the SWA pool; layer 1 lives in the full-attention pool.
+    auto constexpr swaWindow = 8;
+    auto constexpr fullWindow = 128;
+    auto const maxAttentionWindowVec = std::vector<SizeType32>{swaWindow, fullWindow};
+
+    auto constexpr blocksInPrimary = 8;
+    auto constexpr blocksInSecondary = 0;
+    auto const blocksPerWindow = BlocksPerWindow{
+        {swaWindow, {blocksInPrimary, blocksInSecondary}}, {fullWindow, {blocksInPrimary, blocksInSecondary}}};
+
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        maxBeamWidth, maxAttentionWindowVec, dtype, sinkTokenLength, stream, maxSequenceLength, /*chunkSize=*/0,
+        /*enableBlockReuse=*/false);
+    kvCacheManager.allocatePools(/*useUvm=*/false);
+
+    auto constexpr beamWidth = maxBeamWidth;
+    auto constexpr beamIdx = 0;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+    TokenIdType constexpr firstToken = 1000;
+
+    int inputLength = 11; // > swaWindow (8); < fullWindow (128)
+    auto inputTokens = std::make_shared<VecTokens>(inputLength);
+    std::iota(inputTokens->begin(), inputTokens->end(), firstToken);
+    auto llmRequest
+        = std::make_shared<LlmRequest>(/*requestId=*/0, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+
+    kvCacheManager.addSequenceBatch({{{/*requestId=*/0, inputLength, beamWidth}}}, {std::ref(*llmRequest)});
+    GenerationRequest const& seq = kvCacheManager.getSequence(/*requestId=*/0);
+
+    // No tokens added past the SWA window yet — both counters are zero.
+    EXPECT_EQ(seq.getNumFrontBlocksRemoved(swaWindow), 0);
+    EXPECT_EQ(seq.getNumFrontBlocksRemoved(fullWindow), 0);
+    EXPECT_EQ(seq.getNumFrontBlocksRemoved(swaWindow) + seq.getNumFrontBlocksRemoved(fullWindow), 0);
+
+    // Add one token past the window. SWA pool detaches block 0; full pool does not.
+    llmRequest->addNewToken(firstToken + inputLength, beamIdx);
+    kvCacheManager.addToken(/*requestId=*/0);
+
+    EXPECT_EQ(seq.getNumFrontBlocksRemoved(swaWindow), 1) << "SWA pool should have evicted exactly one front block";
+    EXPECT_EQ(seq.getNumFrontBlocksRemoved(fullWindow), 0) << "Full-attention pool must never front-evict";
+    EXPECT_EQ(seq.getNumFrontBlocksRemoved(swaWindow) + seq.getNumFrontBlocksRemoved(fullWindow), 1)
+        << "Aggregate sum must equal the SWA-only count";
+
+    // Drive a second SWA eviction; full-attn count stays at zero.
+    llmRequest->addNewToken(firstToken + inputLength + 1, beamIdx);
+    kvCacheManager.addToken(/*requestId=*/0);
+    llmRequest->addNewToken(firstToken + inputLength + 2, beamIdx);
+    kvCacheManager.addToken(/*requestId=*/0);
+    llmRequest->addNewToken(firstToken + inputLength + 3, beamIdx);
+    kvCacheManager.addToken(/*requestId=*/0);
+    llmRequest->addNewToken(firstToken + inputLength + 4, beamIdx);
+    kvCacheManager.addToken(/*requestId=*/0);
+
+    auto const swaEvictedAfter = seq.getNumFrontBlocksRemoved(swaWindow);
+    EXPECT_GT(swaEvictedAfter, 1) << "Continued generation should keep evicting SWA blocks";
+    EXPECT_EQ(seq.getNumFrontBlocksRemoved(fullWindow), 0);
+    EXPECT_EQ(seq.getNumFrontBlocksRemoved(swaWindow) + seq.getNumFrontBlocksRemoved(fullWindow), swaEvictedAfter);
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(/*requestId=*/0, llmRequest)));
+}
+
+TEST_F(KVCacheManagerTest, GenerationRequestClearCacheBlocksPerWindowResetsOnlyThatWindow)
+{
+    // Use a real BlockManager solely to obtain a valid windowSizeToMetadata map; the
+    // bookkeeping under test (removeFrontBlock / clearCacheBlocks / getNumFrontBlocksRemoved)
+    // lives entirely on GenerationRequest.
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 64;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimary = 4;
+    auto constexpr blocksInSecondary = 0;
+    auto constexpr maxNumSequences = 4;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr swaWindow = 8;
+    auto constexpr fullWindow = 128;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto const maxAttentionWindowVec = std::vector<SizeType32>{swaWindow, fullWindow};
+    auto const blocksPerWindow = BlocksPerWindow{
+        {swaWindow, {blocksInPrimary, blocksInSecondary}}, {fullWindow, {blocksInPrimary, blocksInSecondary}}};
+
+    BlockManager blockManager(std::vector<BlockManager::SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock,
+        blocksPerWindow, maxNumSequences, stream, /*maxSequenceLength=*/fullWindow, maxBeamWidth, maxAttentionWindowVec,
+        nvinfer1::DataType::kHALF, /*sinkBubbleLength=*/0, /*chunkSize=*/0);
+    blockManager.allocatePools(/*useUvm=*/false);
+
+    auto constexpr requestId = 7;
+    auto constexpr numTokens = 1;
+    GenerationRequest seq{requestId, numTokens, maxBeamWidth, blockManager.getWindowSizesMetadata()};
+
+    // Drive each window's counter to a distinct non-zero value.
+    seq.removeFrontBlock(swaWindow);
+    seq.removeFrontBlock(swaWindow);
+    seq.removeFrontBlock(fullWindow);
+
+    EXPECT_EQ(seq.getNumFrontBlocksRemoved(swaWindow), 2);
+    EXPECT_EQ(seq.getNumFrontBlocksRemoved(fullWindow), 1);
+    EXPECT_EQ(seq.getNumFrontBlocksRemoved(swaWindow) + seq.getNumFrontBlocksRemoved(fullWindow), 3);
+
+    // Clearing one window's blocks must not touch the other window's counter.
+    seq.clearCacheBlocks(swaWindow);
+    EXPECT_EQ(seq.getNumFrontBlocksRemoved(swaWindow), 0);
+    EXPECT_EQ(seq.getNumFrontBlocksRemoved(fullWindow), 1);
+    EXPECT_EQ(seq.getNumFrontBlocksRemoved(swaWindow) + seq.getNumFrontBlocksRemoved(fullWindow), 1);
+
+    // Symmetrically: clearing the other window resets only that one.
+    seq.clearCacheBlocks(fullWindow);
+    EXPECT_EQ(seq.getNumFrontBlocksRemoved(swaWindow), 0);
+    EXPECT_EQ(seq.getNumFrontBlocksRemoved(fullWindow), 0);
+    EXPECT_EQ(seq.getNumFrontBlocksRemoved(swaWindow) + seq.getNumFrontBlocksRemoved(fullWindow), 0);
+}
+
+// A5: Smoke-test VSWA + radix prefix reuse with mixed head_dim.
+//
+// Coverage: constructs a KVCacheManager whose two windows have different head_dim
+// (sizePerHeadPerWindow = {smallWindow -> 256, largeWindow -> 512}) with reuse +
+// partial reuse enabled, runs addSequenceBatch / storeContextBlocks / removeSequence
+// for two sequences sharing a prefix, and asserts pool routing is not cross-
+// contaminated and refcounts are balanced.  This is the smoke variant called for in
+// the spec: a complete prefix-reuse hit-rate scenario across mixed head_dim is more
+// brittle to set up and is left as a follow-up.
+TEST_F(KVCacheManagerTest, VswaMixedHeadDimReuseSmoke)
+{
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr scalarSizePerHead = 64;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimary = 16;
+    auto constexpr blocksInSecondary = 0;
+    auto constexpr maxNumSequences = 4;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr smallWindow = 32;
+    auto constexpr largeWindow = 64;
+    auto constexpr smallSizePerHead = 256;
+    auto constexpr largeSizePerHead = 512;
+    auto constexpr sinkTokenLength = 0;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
+    auto constexpr maxSequenceLength = 64;
+    auto constexpr maxNewTokens = 0;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto const maxAttentionWindowVec = std::vector<SizeType32>{smallWindow, largeWindow};
+    auto const blocksPerWindow = BlocksPerWindow{
+        {smallWindow, {blocksInPrimary, blocksInSecondary}}, {largeWindow, {blocksInPrimary, blocksInSecondary}}};
+    auto const sizePerHeadPerWindow
+        = std::map<SizeType32, SizeType32>{{smallWindow, smallSizePerHead}, {largeWindow, largeSizePerHead}};
+
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, scalarSizePerHead, tokensPerBlock, blocksPerWindow,
+        maxNumSequences, maxBeamWidth, maxAttentionWindowVec, dtype, sinkTokenLength, stream, maxSequenceLength,
+        /*chunkSize=*/0, /*enableBlockReuse=*/true, CacheType::kSELF,
+        /*secondaryOffloadMinPriority=*/std::nullopt, /*eventManager=*/nullptr,
+        /*enablePartialReuse=*/true, /*copyOnpartialReuse=*/true,
+        /*kvCacheConnectorManager=*/nullptr,
+        /*enableIndexerKCache=*/false, /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0,
+        /*indexerKCacheUseFp4=*/false,
+        /*linearAttentionMetadata=*/std::nullopt, sizePerHeadPerWindow);
+    kvCacheManager.allocatePools(/*useUvm=*/false);
+
+    // Both windows registered with their distinct head_dims.
+    EXPECT_EQ(kvCacheManager.getBlockManager().getSizePerHeadForWindow(smallWindow), smallSizePerHead);
+    EXPECT_EQ(kvCacheManager.getBlockManager().getSizePerHeadForWindow(largeWindow), largeSizePerHead);
+
+    auto const freeBefore = kvCacheManager.getBlockManager().getNumFreeBlocksPerWindowSize();
+
+    auto constexpr beamWidth = maxBeamWidth;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    // Sequence A: 12-token prompt across two blocks (block-aligned at 8 tokens, partial third).
+    auto inputTokensA = std::make_shared<VecTokens>(VecTokens{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+    auto const inputLengthA = static_cast<SizeType32>(inputTokensA->size());
+    auto llmRequestA
+        = std::make_shared<LlmRequest>(/*requestId=*/0, maxNewTokens, inputTokensA, samplingConfig, isStreaming);
+
+    EXPECT_NO_THROW(
+        kvCacheManager.addSequenceBatch({{{/*requestId=*/0, inputLengthA, beamWidth}}}, {std::ref(*llmRequestA)}));
+
+    // Both windows must have allocated some blocks for this sequence — neither pool
+    // can be empty (i.e. neither pool was skipped due to mixed head_dim routing).
+    auto const& seqA = kvCacheManager.getSequence(/*requestId=*/0);
+    EXPECT_FALSE(seqA.getCacheBlockIds(smallWindow).at(0).empty()) << "small-window pool must allocate";
+    EXPECT_FALSE(seqA.getCacheBlockIds(largeWindow).at(0).empty()) << "large-window pool must allocate";
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequestA);
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(/*requestId=*/0, llmRequestA)));
+
+    // Sequence B: shares an 8-token prefix with sequence A, then diverges.
+    auto inputTokensB = std::make_shared<VecTokens>(VecTokens{1, 2, 3, 4, 5, 6, 7, 8, 99, 100});
+    auto const inputLengthB = static_cast<SizeType32>(inputTokensB->size());
+    auto llmRequestB
+        = std::make_shared<LlmRequest>(/*requestId=*/1, maxNewTokens, inputTokensB, samplingConfig, isStreaming);
+
+    EXPECT_NO_THROW(
+        kvCacheManager.addSequenceBatch({{{/*requestId=*/1, inputLengthB, beamWidth}}}, {std::ref(*llmRequestB)}));
+
+    auto const& seqB = kvCacheManager.getSequence(/*requestId=*/1);
+    EXPECT_FALSE(seqB.getCacheBlockIds(smallWindow).at(0).empty());
+    EXPECT_FALSE(seqB.getCacheBlockIds(largeWindow).at(0).empty());
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequestB);
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(/*requestId=*/1, llmRequestB)));
+
+    // After both sequences have been removed and their reuse-eligible blocks have
+    // been returned, the per-window free-block counts must equal what we started
+    // with (no leaked refcounts in either pool).
+    auto const freeAfter = kvCacheManager.getBlockManager().getNumFreeBlocksPerWindowSize();
+    ASSERT_EQ(freeAfter.size(), freeBefore.size());
+    for (auto const& [windowSize, free] : freeBefore)
+    {
+        ASSERT_NE(freeAfter.find(windowSize), freeAfter.end());
+        EXPECT_EQ(freeAfter.at(windowSize), free)
+            << "Window " << windowSize << " has leaked or extra blocks after removeSequence.";
+    }
+}
+
+// A6: VSWA + disagg dtype mismatch must fire the A4 guard.
+//
+// The constructor of CacheTransBufferManager picks pool 0's dtype as canonical for
+// the wire transport.  When a KVCacheManager hosts pools with differing dtypes
+// (mixed-precision per-window), that silent coercion would corrupt the wire format.
+// The guard added in cacheTransBuffer.cpp must throw at construction time.
+//
+// This test only exercises the helper / construction path that runs the guard; it
+// does not stand up a full disaggregated transfer (out of scope at unit-test
+// granularity).
+TEST_F(KVCacheManagerTest, VswaDisaggDtypeMismatchTriggersGuard)
+{
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 64;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimary = 4;
+    auto constexpr blocksInSecondary = 0;
+    auto constexpr maxNumSequences = 4;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr smallWindow = 32;
+    auto constexpr largeWindow = 64;
+    auto constexpr sinkTokenLength = 0;
+    auto constexpr maxSequenceLength = 64;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto const maxAttentionWindowVec = std::vector<SizeType32>{smallWindow, largeWindow};
+    auto const blocksPerWindow = BlocksPerWindow{
+        {smallWindow, {blocksInPrimary, blocksInSecondary}}, {largeWindow, {blocksInPrimary, blocksInSecondary}}};
+    auto const dtypePerWindow = std::map<SizeType32, nvinfer1::DataType>{
+        {smallWindow, nvinfer1::DataType::kHALF}, {largeWindow, nvinfer1::DataType::kBF16}};
+
+    auto kvCacheManager = std::make_unique<KVCacheManager>(numLayers, numKvHeads, sizePerHead, tokensPerBlock,
+        blocksPerWindow, maxNumSequences, maxBeamWidth, maxAttentionWindowVec, /*dtype=*/nvinfer1::DataType::kHALF,
+        sinkTokenLength, stream, maxSequenceLength,
+        /*chunkSize=*/0, /*enableBlockReuse=*/false, CacheType::kSELF,
+        /*secondaryOffloadMinPriority=*/std::nullopt, /*eventManager=*/nullptr,
+        /*enablePartialReuse=*/true, /*copyOnpartialReuse=*/true,
+        /*kvCacheConnectorManager=*/nullptr,
+        /*enableIndexerKCache=*/false, /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0,
+        /*indexerKCacheUseFp4=*/false,
+        /*linearAttentionMetadata=*/std::nullopt,
+        /*sizePerHeadPerWindow=*/std::map<SizeType32, SizeType32>{}, dtypePerWindow);
+    kvCacheManager->allocatePools(/*useUvm=*/false);
+
+    // Sanity: the manager really does host KV pools with two different dtypes.
+    auto const numKvPools = kvCacheManager->getBlockManager().getNumPools(
+        /*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
+    ASSERT_GE(numKvPools, 2);
+    auto const dtype0 = kvCacheManager->getPrimaryPool(0)->getDataType();
+    bool foundMismatch = false;
+    for (SizeType32 i = 1; i < numKvPools; ++i)
+    {
+        if (kvCacheManager->getPrimaryPool(i)->getDataType() != dtype0)
+        {
+            foundMismatch = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(foundMismatch) << "Test setup must produce at least two pools with different dtypes";
+
+    // The guard in CacheTransBufferManager's constructor must reject this.
+    EXPECT_THROW({ CacheTransBufferManager const ctbm(kvCacheManager.get(), /*maxNumTokens=*/std::nullopt); },
+        tensorrt_llm::common::TllmException);
 }
