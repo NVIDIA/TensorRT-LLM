@@ -198,12 +198,16 @@ template <typename InputT, int TopK>
 struct GvrParams; // primary undefined → compile-time error for bad combos
 
 // fp32 specializations
+// kNumBins per Q1b-P0.5 sweep (2026-05-07): kNumBins=1024 saves -7.0% total
+// on K=512 fp32 vs default 2048; K=1024 fp32 saves -5.9% at kNumBins=1024.
+// Phase 4 histogram_clear + bin_search shrinks; fewer bins than candidate
+// count is fine because per-bin contention stays at ≤5 atomicAdds.
 template <>
 struct GvrParams<float, 512>
 {
     static constexpr int kFTarget = 512;
     static constexpr int kC = 5120;
-    static constexpr int kNumBins = NUM_BINS;
+    static constexpr int kNumBins = 1024;
 };
 
 template <>
@@ -211,7 +215,7 @@ struct GvrParams<float, 1024>
 {
     static constexpr int kFTarget = 3072;
     static constexpr int kC = 5120;
-    static constexpr int kNumBins = NUM_BINS;
+    static constexpr int kNumBins = 1024;
 };
 
 // fp32 K=2048: V2e production-identity preservation (Option B 2026-05-07).
@@ -230,12 +234,16 @@ struct GvrParams<float, 2048>
 };
 
 // bf16 specializations
+// Q1b-P0.5 (2026-05-07) chose folded rule for bf16: K=512 keeps kNumBins=K
+// (avoid K/2=256 atomic-contention edge), K=1024 takes K/2=512 (full
+// -7.8% saving). K=2048 unchanged since K=2048 sweep showed ~0 effect.
+// Captures ~90% of the optimal-per-cell saving with simpler dispatch.
 template <>
 struct GvrParams<__nv_bfloat16, 512>
 {
     static constexpr int kFTarget = 512;
     static constexpr int kC = 5120;
-    static constexpr int kNumBins = NUM_BINS;
+    static constexpr int kNumBins = 512;
 };
 
 template <>
@@ -243,7 +251,7 @@ struct GvrParams<__nv_bfloat16, 1024>
 {
     static constexpr int kFTarget = 3072;
     static constexpr int kC = 5120;
-    static constexpr int kNumBins = NUM_BINS;
+    static constexpr int kNumBins = 512;
 };
 
 template <>
@@ -255,12 +263,14 @@ struct GvrParams<__nv_bfloat16, 2048>
 };
 
 // fp16 specializations
+// Q1b-P0.5 (2026-05-07): kNumBins = K is the empirical optimum for fp16
+// (sweeping K/2 actually regressed K=512/1024 fp16). K=2048 unchanged.
 template <>
 struct GvrParams<__half, 512>
 {
     static constexpr int kFTarget = 512;
     static constexpr int kC = 5120;
-    static constexpr int kNumBins = NUM_BINS;
+    static constexpr int kNumBins = 512;
 };
 
 template <>
@@ -268,7 +278,7 @@ struct GvrParams<__half, 1024>
 {
     static constexpr int kFTarget = 3072;
     static constexpr int kC = 5120;
-    static constexpr int kNumBins = NUM_BINS;
+    static constexpr int kNumBins = 1024;
 };
 
 template <>
