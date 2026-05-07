@@ -9,7 +9,7 @@ requires-python = ">=3.10,<3.13"
 dependencies = [
     "tiktoken (>=0.12.0,<0.13.0)",
     "datasets (==3.1.0)",
-    "kaldialign (>=0.9.3,<0.10.0)",
+    "kaldialign (>=0.10.0,<0.11.0)",
     "openai-whisper (>=20250625,<20250626)",
     "librosa (>=0.11.0,<0.12.0)",
     "soundfile (>=0.13.1,<0.14.0)",

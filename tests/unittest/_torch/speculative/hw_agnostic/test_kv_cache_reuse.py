@@ -7,16 +7,18 @@ import torch
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
-                                 KvCacheConfig)
+from tensorrt_llm.llmapi import CudaGraphConfig, Eagle3DecodingConfig, KvCacheConfig
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 
-@pytest.mark.parametrize("use_cuda_graph,attn_backend", [
-    [True, "TRTLLM"],
-    [False, "TRTLLM"],
-])
+@pytest.mark.parametrize(
+    "use_cuda_graph,attn_backend",
+    [
+        [True, "TRTLLM"],
+        [False, "TRTLLM"],
+    ],
+)
 @pytest.mark.high_cuda_memory
 def test_kv_cache_reuse(use_cuda_graph: bool, attn_backend: str):
     # Eagle3 one model works with overlap scheduler and block reuse.
@@ -33,8 +35,7 @@ def test_kv_cache_reuse(use_cuda_graph: bool, attn_backend: str):
     max_batch_size = 1
     max_draft_len = 4
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, max_tokens=8192)
-    cuda_graph_config = CudaGraphConfig(
-        batch_sizes=[1]) if use_cuda_graph else None
+    cuda_graph_config = CudaGraphConfig(batch_sizes=[1]) if use_cuda_graph else None
 
     llm_common_config = dict(
         model=target_model_dir,

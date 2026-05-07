@@ -65,4 +65,6 @@ transforms:
   gather_logits_before_lm_head:
     enabled: true
   compile_model:
-    piecewise_enabled: true
+    # Piecewise cudagraph may work if multi_stream_moe is disabled, but we want
+    # multi_stream_moe enabled on the default path for this model family.
+    piecewise_enabled: false
