@@ -1326,7 +1326,9 @@ class DeepseekV4Gate(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.linear(hidden_states.float(), self.weight.float())
+        return torch.ops.trtllm.dsv3_router_gemm_op(
+            hidden_states, self.weight.t(), bias=None, out_dtype=torch.float32
+        )
 
     def load_weights(self, weights: List[Dict]):
         assert len(weights) == 1
