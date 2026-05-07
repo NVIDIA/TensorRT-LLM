@@ -460,8 +460,6 @@ class RingAttention(AttentionBackend):
         inner_backend: AttentionBackend,
         process_group: dist.ProcessGroup,
     ):
-        # Invariant: only instantiated when ring_size > 1 (see attention.py),
-        # so distributed must be initialized and the group must be non-trivial.
         if not type(inner_backend).support_lse():
             raise ValueError(
                 f"RingAttention requires an LSE-capable inner backend (FA4); "
@@ -532,9 +530,9 @@ class RingAttention(AttentionBackend):
         key = (B, S, H, H_kv, D, q.device, q.dtype, k.dtype)
         if key == self._buf_key:
             return
-        self._kv_bufs = torch.empty(2, 2, B, S, H_kv, D, device=k.device, dtype=k.dtype)
-        self._out_buf = torch.empty(B, S, H, D, device=q.device, dtype=q.dtype)
-        self._lse_buf = torch.empty(B, S, H, device=q.device, dtype=torch.float32)
+        self._kv_bufs = k.new_empty(2, 2, B, S, H_kv, D)
+        self._out_buf = q.new_empty(B, S, H, D)
+        self._lse_buf = q.new_empty(B, S, H, dtype=torch.float32)
         self._buf_key = key
 
     def _update_out_and_lse(
