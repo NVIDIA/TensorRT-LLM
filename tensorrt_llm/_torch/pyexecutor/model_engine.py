@@ -1882,11 +1882,53 @@ class PyTorchModelEngine(ModelEngine):
         encoder_seq_lens_tensor = torch.tensor(encoder_seq_lens,
                                                dtype=torch.int,
                                                pin_memory=prefer_pinned())
-        cross_attn_metadata = attn_metadata.create_cross_metadata(
-            encoder_seq_lens=encoder_seq_lens_tensor,
-            enc_dec_kv_cache_manager=enc_dec_kv_cache_manager,
-            encoder_num_cached_tokens_per_seq=encoder_num_cached_tokens_per_seq,
-        )
+
+        def update_cross_metadata(
+                cross_attn_metadata: AttentionMetadata) -> AttentionMetadata:
+            base_params = attn_metadata.kv_cache_params
+            cross_attn_metadata.kv_cache_manager = enc_dec_kv_cache_manager
+            cross_attn_metadata._seq_lens = attn_metadata.seq_lens
+            cross_attn_metadata._seq_lens_cuda = attn_metadata.seq_lens_cuda
+            cross_attn_metadata.cross = cross_attn_metadata
+            cross_attn_metadata.seq_lens_kv = encoder_seq_lens_tensor
+            if encoder_num_cached_tokens_per_seq is not None:
+                use_cache = (base_params.use_cache if base_params is not None
+                             else (enc_dec_kv_cache_manager is not None))
+                block_ids_per_seq = (base_params.block_ids_per_seq
+                                     if base_params is not None else None)
+                host_max_attention_window_sizes = (
+                    base_params.host_max_attention_window_sizes
+                    if base_params is not None else None)
+                host_sink_token_length = (base_params.host_sink_token_length
+                                          if base_params is not None else None)
+                num_extra_kv_tokens = (base_params.num_extra_kv_tokens
+                                       if base_params is not None else 0)
+                cross_attn_metadata.kv_cache_params = KVCacheParams(
+                    use_cache=use_cache,
+                    num_cached_tokens_per_seq=list(
+                        encoder_num_cached_tokens_per_seq),
+                    block_ids_per_seq=block_ids_per_seq,
+                    host_max_attention_window_sizes=
+                    host_max_attention_window_sizes,
+                    host_sink_token_length=host_sink_token_length,
+                    num_extra_kv_tokens=num_extra_kv_tokens,
+                )
+            cross_attn_metadata.request_ids = attn_metadata.request_ids
+            cross_attn_metadata.prompt_lens = attn_metadata.prompt_lens
+            cross_attn_metadata.num_contexts = attn_metadata.num_contexts
+            return cross_attn_metadata
+
+        if attn_metadata.is_cuda_graph and attn_metadata.has_cross_sub_metadata:
+            cross_attn_metadata = update_cross_metadata(attn_metadata.cross)
+        else:
+            cross_attn_metadata = attn_metadata.create_cross_metadata(
+                encoder_seq_lens=encoder_seq_lens_tensor,
+                enc_dec_kv_cache_manager=enc_dec_kv_cache_manager,
+                encoder_num_cached_tokens_per_seq=
+                encoder_num_cached_tokens_per_seq,
+            )
+            if attn_metadata.is_cuda_graph:
+                attn_metadata.cross = cross_attn_metadata
         cross_attn_metadata.prepare()
 
         return {

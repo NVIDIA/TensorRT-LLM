@@ -683,7 +683,37 @@ class KVCacheManager(BaseResourceManager):
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
 
-            # Collect first-chunk requests eligible for add_sequence_batch.
+            if self.kv_cache_type == CacheTypeCpp.CROSS:
+                batch_request_infos = []
+                batch_llm_requests = []
+                for req in scheduled_batch.context_requests:
+                    if (getattr(req, "py_skip_cross_kv_projection", False)
+                            or not req.is_first_context_chunk
+                            or not self._kv_connector_should_add_sequence(req)):
+                        continue
+
+                    encoder_output_len = getattr(req, "encoder_output_len",
+                                                 None)
+                    if encoder_output_len is None:
+                        raise RuntimeError(
+                            "Cross KV cache allocation requires "
+                            f"encoder_output_len for request {req.py_request_id}."
+                        )
+
+                    batch_request_infos.append(
+                        (req.py_request_id, int(encoder_output_len), 1))
+                    batch_llm_requests.append(req)
+
+                if batch_request_infos:
+                    self.impl.add_sequence_batch(batch_request_infos,
+                                                 batch_llm_requests)
+
+                # Cross KV is written once from encoder K/V projection and
+                # then remains fixed for decoder generation.
+                self.impl.refresh_blocks()
+                return
+
+            # Collect first-chunk requests eligible for batch add_sequence.
             # When block reuse is enabled, addSequenceBatch uses a two-phase
             # claim-then-onboard strategy that prevents host offloading from
             # evicting reusable blocks in the radix tree.
@@ -899,6 +929,16 @@ class KVCacheManager(BaseResourceManager):
                          scheduled_batch: ScheduledRequests,
                          attn_metadata: "AttentionMetadata" = None,
                          kv_cache_dtype_byte_size: float = None):
+        if self.kv_cache_type == CacheTypeCpp.CROSS:
+            for request in scheduled_batch.context_requests:
+                self.impl.store_context_blocks(request)
+            return
+
+        if not self.is_draft:
+            _update_kv_cache_draft_token_location(self, scheduled_batch,
+                                                  attn_metadata,
+                                                  kv_cache_dtype_byte_size)
+
         # Rewind KV cache for requests with rejected draft tokens.
         # Skip:
         # - GENERATION_COMPLETE: finished requests
@@ -1785,6 +1825,33 @@ class KVCacheManager(BaseResourceManager):
     def copy_batch_block_offsets(self, dst_tensor: torch.Tensor,
                                  request_ids: List[int], beam_width: int,
                                  num_context: int, num_seqs: int):
+        if self.kv_cache_type == CacheTypeCpp.CROSS and beam_width > 1:
+            num_gen_requests = len(request_ids) - num_context
+            expected_num_seqs = num_context + num_gen_requests * beam_width
+            assert num_seqs == expected_num_seqs, (
+                f"Cross KV cache block offsets expected {expected_num_seqs} "
+                f"decoder rows, got {num_seqs}.")
+
+            # Cross KV is request-scoped: all decoder beams read the same
+            # encoder K/V blocks. Populate one host row per request, then
+            # expand generation rows across beams in the attention metadata
+            # tensor whose rows are decoder-sequence scoped.
+            self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
+                                               request_ids, 1, 0)
+            for pool_idx in range(self.host_kv_cache_block_offsets.shape[0]):
+                if num_context > 0:
+                    dst_tensor[pool_idx, :num_context].copy_(
+                        self.host_kv_cache_block_offsets[
+                            pool_idx, :num_context],
+                        non_blocking=True)
+                if num_gen_requests > 0:
+                    gen_block_offsets = self.host_kv_cache_block_offsets[
+                        pool_idx, num_context:num_context + num_gen_requests]
+                    dst_tensor[pool_idx, num_context:num_seqs].copy_(
+                        gen_block_offsets.repeat_interleave(beam_width, dim=0),
+                        non_blocking=True)
+            return
+
         self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
                                            request_ids[:num_context], 1, 0)
         self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,

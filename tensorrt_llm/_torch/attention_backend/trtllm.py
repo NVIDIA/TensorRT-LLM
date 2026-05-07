@@ -1351,6 +1351,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         helix_active = metadata.helix_position_offsets is not None
         encoder_seq_lens_arg = (metadata.kv_lens_cuda_runtime
                                 if metadata.is_cross else None)
+        # Cross-attention treats decoder beams as already-expanded rows and
+        # reads request-scoped encoder K/V, so kernel beam indirection stays off.
+        kernel_beam_width = 1 if metadata.is_cross else metadata.beam_width
         prefer_trtllm_gen = _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION or metadata.is_cross
         use_sage_attn = (forward_args.sage_attn_num_elts_per_blk_q > 0
                          or forward_args.sage_attn_num_elts_per_blk_k > 0
@@ -1368,7 +1371,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 use_paged_kv_cache=(metadata.kv_cache_block_offsets
                                     is not None),
                 tokens_per_block=metadata.tokens_per_block,
-                beam_width=metadata.beam_width,
+                beam_width=kernel_beam_width,
                 position_shift_enabled=False,
                 sink_token_length=0,
                 cross_attention=metadata.is_cross,
@@ -1422,7 +1425,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 max_context_length,
                 attention_window_size,
                 0,
-                metadata.beam_width,
+                kernel_beam_width,
                 int(mask_type),
                 self.quant_mode,
                 self.q_scaling,
@@ -1480,15 +1483,23 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                            dim=1).contiguous()
             k_arg = None if metadata.is_cross else k
             v_arg = None if metadata.is_cross else v
+            q_arg = q
+            is_fused_qkv_arg = is_fused_qkv
             legacy_attention_kwargs = {}
             if metadata.is_cross:
+                q_hidden_size = self.num_heads * self.head_dim
+                kv_hidden_size = self.num_kv_heads * self.head_dim
+                q_arg = q.new_zeros(
+                    (q.shape[0], q_hidden_size + 2 * kv_hidden_size))
+                q_arg[:, :q_hidden_size].copy_(q)
+                is_fused_qkv_arg = True
                 legacy_attention_kwargs = {
                     "cross_attention": True,
                     "cross_kv": cross_kv_input,
                     "encoder_input_lengths": encoder_seq_lens_arg,
                 }
             thop.attention(
-                q,
+                q_arg,
                 k_arg,
                 v_arg,
                 output,
@@ -1513,7 +1524,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 forward_args.q_pe,
                 metadata.block_ids_per_seq,
                 forward_args.attention_sinks,
-                is_fused_qkv,
+                is_fused_qkv_arg,
                 update_kv_cache,
                 self.predicted_tokens_per_seq,
                 layer_idx,
@@ -1525,7 +1536,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 max_context_length,
                 attention_window_size,
                 0,
-                metadata.beam_width,
+                kernel_beam_width,
                 int(mask_type),
                 self.quant_mode,
                 self.q_scaling,
