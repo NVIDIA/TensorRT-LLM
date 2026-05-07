@@ -1,37 +1,10 @@
 """MLA (Multi-head Latent Attention) custom ops.
 
-Exports:
-- TorchBackendMLAAttention: Attention descriptor for MLA (registered as "torch_mla")
-- FlashInferMLAAttention: Attention descriptor for FlashInfer MLA (registered as "flashinfer_mla")
-- FlashInferTrtllmMLAAttention: Attention descriptor for FlashInfer TRTLLM-gen MLA
-- TritonMLAAttention: Attention descriptor for Triton MLA (registered as "triton_mla")
-- torch_mla: Source op for MLA attention
-- torch_backend_mla_with_cache: Cached backend op with FlashInfer-compatible cache
-- flashinfer_mla_with_cache: Cached backend op using FlashInfer MLA kernels
-- flashinfer_trtllm_mla_with_cache: Cached backend op using FlashInfer Path 2 kernels
-- triton_cached_mla_with_cache: Cached backend op using Triton kernels
-- TrtllmMLAAttention: Attention descriptor for TRT-LLM MLA (registered as "trtllm_mla")
-- trtllm_mla_with_cache: Cached backend op using TRT-LLM thop.attention with MLA
+This module provides various MLA implementations and backends:
+- torch_mla: PyTorch reference MLA implementation
+- torch_backend_mla: PyTorch-based MLA backend
+- flashinfer_mla: FlashInfer-based optimized MLA
+- flashinfer_trtllm_mla: FlashInfer TRTLLM-gen MLA (Blackwell Path 2)
+- triton_mla: Triton-based MLA implementation
+- trtllm_mla: TRT-LLM thop.attention-based MLA (requires tensorrt_llm)
 """
-
-from .flashinfer_mla import FlashInferMLAAttention, flashinfer_mla_with_cache
-from .flashinfer_trtllm_mla import FlashInferTrtllmMLAAttention, flashinfer_trtllm_mla_with_cache
-from .torch_backend_mla import TorchBackendMLAAttention, torch_backend_mla_with_cache
-from .torch_mla import torch_mla
-from .triton_mla import TritonMLAAttention, triton_cached_mla_with_cache
-from .trtllm_mla import TrtllmMLAAttention, prepare_trtllm_mla_metadata, trtllm_mla_with_cache
-
-__all__ = [
-    "TorchBackendMLAAttention",
-    "FlashInferMLAAttention",
-    "FlashInferTrtllmMLAAttention",
-    "TritonMLAAttention",
-    "torch_mla",
-    "torch_backend_mla_with_cache",
-    "flashinfer_mla_with_cache",
-    "flashinfer_trtllm_mla_with_cache",
-    "triton_cached_mla_with_cache",
-    "TrtllmMLAAttention",
-    "trtllm_mla_with_cache",
-    "prepare_trtllm_mla_metadata",
-]

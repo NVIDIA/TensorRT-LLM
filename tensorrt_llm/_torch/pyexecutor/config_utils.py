@@ -4,6 +4,8 @@ from typing import Optional
 
 import transformers
 
+from tensorrt_llm.logger import logger
+
 
 def is_hybrid_linear(config):
     return is_nemotron_hybrid(config) or is_qwen3_hybrid(config)
@@ -235,8 +237,15 @@ class _Qwen35ConfigCompat:
                 rope_scaling["type"] = "mrope"
                 rope_scaling.pop("rope_type", None)
             elif "type" not in rope_scaling and "rope_type" in rope_scaling:
-                rope_scaling["type"] = rope_scaling.pop("rope_type")
-            text_config["rope_scaling"] = rope_scaling
+                rope_type = rope_scaling.pop("rope_type")
+                # "default" means standard RoPE (no scaling) — don't set
+                # rope_scaling to avoid triggering scaling code paths.
+                if rope_type == "default":
+                    rope_scaling = {}
+                else:
+                    rope_scaling["type"] = rope_type
+            if rope_scaling:
+                text_config["rope_scaling"] = rope_scaling
         return text_config
 
 
@@ -264,7 +273,12 @@ def load_pretrained_config(model_name_or_path: str,
     model_type = config_dict.get("model_type")
     architectures = config_dict.get("architectures") or []
 
-    if model_type in _CONFIG_REGISTRY:
+    if checkpoint_format in ("mistral", "mistral_large_3"):
+        from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
+            MistralConfigLoader
+        model_config = MistralConfigLoader().load(
+            model_name_or_path).pretrained_config
+    elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,
                                                     **kwargs)
@@ -278,13 +292,39 @@ def load_pretrained_config(model_name_or_path: str,
                             )):
         model_config = transformers.Qwen3NextConfig.from_dict(
             _Qwen35ConfigCompat.normalize(config_dict))
-    elif checkpoint_format in ("mistral", "mistral_large_3"):
-        from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
-            MistralConfigLoader
-        model_config = getattr(
-            MistralConfigLoader().load(model_name_or_path).pretrained_config,
-            "text_config")
     else:
         model_config = transformers.AutoConfig.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code)
+
+    # Transformers 5.x sets rope_scaling to {"rope_type": "default"} instead
+    # of None for models with standard RoPE (no scaling).  Clear it so that
+    # downstream code (e.g. RopeParams.from_config) treats it the same as
+    # rope_scaling=None, which is what transformers 4.x produced.
+    rope_scaling = getattr(model_config, "rope_scaling", None)
+    if isinstance(rope_scaling, dict):
+        rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
+        has_real_scaling = any(k for k in rope_scaling
+                               if k not in ("rope_type", "type", "rope_theta"))
+        if rope_type == "default" and not has_real_scaling:
+            # Preserve rope_theta before clearing, since rope_parameters
+            # (which rope_scaling delegates to) will also become None and
+            # rope_theta may only exist there in transformers 5.x.
+            # When rope_theta is missing from rope_scaling, no preservation is
+            # needed — model_config.rope_theta (if any) is already canonical.
+            rope_theta = rope_scaling.get("rope_theta")
+            if rope_theta is not None:
+                existing = getattr(model_config, "rope_theta", None)
+                if existing is None:
+                    model_config.rope_theta = rope_theta
+                elif existing != rope_theta:
+                    # Both values are set but disagree. Keep the top-level value
+                    # (canonical in transformers 4.x and 5.x), but warn loudly
+                    # so that any future transformers upgrade that breaks this
+                    # invariant is easy to spot.
+                    logger.warning(
+                        f"rope_scaling.rope_theta ({rope_theta}) differs from "
+                        f"model_config.rope_theta ({existing}); keeping the "
+                        f"top-level value.")
+            model_config.rope_scaling = None
+
     return model_config

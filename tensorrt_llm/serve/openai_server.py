@@ -332,7 +332,11 @@ class OpenAIServer:
 
     def _init_llm(self, chat_template: Optional[str] = None):
         self.tokenizer = self.generator.tokenizer
-        hf_tokenizer_path = self.generator._hf_model_dir or self.tokenizer.tokenizer.name_or_path
+        hf_tokenizer_path = self.generator._hf_model_dir
+        if not hf_tokenizer_path:
+            hf_tokenizer_path = getattr(
+                self.tokenizer.tokenizer, "name_or_path", None) or getattr(
+                    self.tokenizer, "name_or_path", None)
         trust_remote_code = self.generator.args.trust_remote_code
         try:
             self.processor = AutoProcessor.from_pretrained(
@@ -1065,8 +1069,11 @@ class OpenAIServer:
             ]
             # Pass the tokenizer vocabulary size so ``logit_bias`` can be
             # expanded into an embedding bias tensor in the sampler.
+            vocab_size = getattr(self.tokenizer.tokenizer,
+                                 "vocab_size", None) or getattr(
+                                     self.tokenizer, "vocab_size", None)
             sampling_params = request.to_sampling_params(
-                vocab_size=self._vocab_size,
+                vocab_size=vocab_size,
                 gather_generation_logits=self.generator.args.
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
