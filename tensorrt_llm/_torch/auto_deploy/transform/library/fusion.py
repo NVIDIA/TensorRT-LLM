@@ -51,6 +51,11 @@ def _insert_fused_gemm(
     w = (out1+out2) x in
     y = x @ w.T
     y1, y2 = split(y)                   # contiguous copies
+
+    Bias handling:
+        All children must have uniform bias state (all with bias or none).
+        Each bias must be 1D per-channel matching its weight's out_features.
+        Stacked bias is the dim=0 concatenation, mirroring weight stacking.
     """
     keys_unfused = [extract_weight_name(n) for n in linear_nodes]
     params_unfused = [gm.get_parameter(k) for k in keys_unfused]
@@ -62,13 +67,55 @@ def _insert_fused_gemm(
         return False
     weight_dtype = dtypes.pop()
 
+    # --- Bias fusibility check (all-or-none + 1D per-channel + size match) ---
+    bias_args = [n.args[2] for n in linear_nodes]
+    bias_present = [b is not None for b in bias_args]
+    if any(bias_present) and not all(bias_present):
+        # Mixed bias state — would require padding with zeros; bail out.
+        return False
+    has_bias = bias_present[0]
+    bias_params: List[torch.Tensor] = []
+    if has_bias:
+        for n, w_param in zip(linear_nodes, params_unfused):
+            bnode = n.args[2]
+            # Only fuse statically known biases (get_attr nodes).
+            if bnode.op != "get_attr":
+                ad_logger.warning(
+                    f"Skipping GEMM fusion for {keys_unfused}: bias is not a get_attr node"
+                )
+                return False
+            bp = gm.get_parameter(bnode.target)
+            # Reject anything other than per-channel 1D bias matching out_features.
+            if bp.dim() != 1 or bp.size(0) != w_param.size(0):
+                ad_logger.warning(
+                    f"Skipping GEMM fusion for {keys_unfused}: non per-channel bias "
+                    f"(weight out={w_param.size(0)}, bias shape={tuple(bp.shape)})"
+                )
+                return False
+            bias_params.append(bp)
+        bias_dtypes = {p.dtype for p in bias_params}
+        if len(bias_dtypes) != 1:
+            ad_logger.warning(
+                f"Skipping GEMM fusion for {keys_unfused}: mixed bias dtypes {bias_dtypes}"
+            )
+            return False
+
     key_fused = f"fused_weight_{idx}"
     fused_weight = torch.cat(params_unfused, dim=0).to(weight_dtype)
     param_fused = nn.Parameter(fused_weight, requires_grad=False)
     setattr(gm, key_fused, param_fused)
 
+    bias_key_fused = None
+    if has_bias:
+        bias_key_fused = f"fused_bias_{idx}"
+        bias_dtype = bias_params[0].dtype
+        fused_bias = torch.cat(bias_params, dim=0).to(bias_dtype)
+        bias_param_fused = nn.Parameter(fused_bias, requires_grad=False)
+        setattr(gm, bias_key_fused, bias_param_fused)
+
     ad_logger.warning(
-        f"Fusing {len(linear_nodes)} GEMMs ({keys_unfused}) into {key_fused} (dtype={weight_dtype})"
+        f"Fusing {len(linear_nodes)} GEMMs ({keys_unfused}) into {key_fused} "
+        f"(dtype={weight_dtype}, bias={'yes' if has_bias else 'no'})"
     )
 
     fused_kwargs = dict(linear_nodes[0].kwargs)
@@ -76,11 +123,12 @@ def _insert_fused_gemm(
 
     with gm.graph.inserting_before(linear_nodes[0]):
         get_param_node = gm.graph.get_attr(key_fused, torch.Tensor)
+        get_bias_node = gm.graph.get_attr(bias_key_fused, torch.Tensor) if has_bias else None
 
     with gm.graph.inserting_before(linear_nodes[0]):
         fused_linear_node = gm.graph.call_function(
             linear_nodes[0].target,
-            args=(parent_node, get_param_node, None),
+            args=(parent_node, get_param_node, get_bias_node),
             kwargs=fused_kwargs,
         )
         if ref_val is not None:
@@ -324,8 +372,7 @@ class FuseGemms(BaseTransform):
         # sort linear nodes by parent node
         linear_nodes = defaultdict(list)
         for node in gm.graph.nodes:
-            # TODO: we don't handle bias for now...
-            if is_linear_op(node) and node.args[2] is None:
+            if is_linear_op(node):
                 linear_nodes[node.args[0]].append(node)
 
         # fuse linear nodes
