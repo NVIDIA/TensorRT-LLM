@@ -169,6 +169,51 @@ def _shuffle_per_expert_w2(
     return torch.stack(out, dim=0).contiguous()
 
 
+def _shuffle_per_expert_bias_w3_w1(stacked: torch.Tensor) -> torch.Tensor:
+    """Apply gated-GEMM row shuffle to a 1D-per-expert bias tensor.
+
+    Mirrors PT's ``MXFP4WeightTRTLLMGenFusedMoEMethod.load_expert_w3_w1_weight``
+    bias path (quantization.py:4237-4271): the same permute (interleave w3/w1
+    halves + epilogue-tile block reorder) is applied to bias rows as to weight
+    rows, so ``bias[i]`` aligns with ``weight_row[i]`` after the shuffle.
+    Skipping this step makes ``gemm1_bias`` index into the wrong post-shuffle
+    output rows and produces garbage MoE output.
+    """
+    e = stacked.size(0)
+    out = []
+    for i in range(e):
+        slc = stacked[i].contiguous()  # [2*I_pad] 1D
+        perm = trtllmgen_maybe_get_cached_w3_w1_permute_indices(
+            slc,
+            _PERMUTE_CACHE,
+            _EPILOGUE_TILE_M,
+        )
+        shuffled = torch.ops.trtllm.shuffle_matrix(slc, perm.to(slc.device))
+        out.append(shuffled)
+    return torch.stack(out, dim=0).contiguous()
+
+
+def _shuffle_per_expert_bias_w2(stacked: torch.Tensor) -> torch.Tensor:
+    """Apply non-gated TMA row shuffle to a 1D-per-expert bias tensor.
+
+    Mirrors PT's ``MXFP4WeightTRTLLMGenFusedMoEMethod.load_expert_w2_weight``
+    bias path (quantization.py:4304-4319): only the epilogue-tile block reorder
+    is applied (no gated_act_gemm interleave for the non-gated GEMM2).
+    """
+    e = stacked.size(0)
+    out = []
+    for i in range(e):
+        slc = stacked[i].contiguous()  # [H_pad] 1D
+        perm = trtllmgen_maybe_get_cached_w2_permute_indices(
+            slc,
+            _PERMUTE_CACHE,
+            _EPILOGUE_TILE_M,
+        )
+        shuffled = torch.ops.trtllm.shuffle_matrix(slc, perm.to(slc.device))
+        out.append(shuffled)
+    return torch.stack(out, dim=0).contiguous()
+
+
 def prepare_mxfp4_weights_for_trtllm_gen(
     gate_up_blocks: torch.Tensor,  # [E, 2I, H/32, 16]  or  [E, 2I, H/2]   uint8
     gate_up_scales: torch.Tensor,  # [E, 2I, H/32]                         uint8
@@ -425,6 +470,13 @@ def prepare_mxfp4_weights_for_trtllm_gen(
         [up_bias_padded, gate_bias_padded], dim=1
     ).contiguous()  # [E, 2I_pad]
 
+    # Match PT: bias rows go through the SAME row-permutation as the weight
+    # rows so ``bias[i]`` lines up with ``weight_row[i]`` after the kernel's
+    # TMA-layout shuffle. Without this the kernel's epilogue adds the wrong
+    # bias to each output row and the MoE output is garbage (eval ~2% on
+    # gpt-oss-120b GSM8K instead of ~90%).
+    fc1_bias_padded = _shuffle_per_expert_bias_w3_w1(fc1_bias_padded)
+
     fc2_bias_padded = (
         _pad_per_expert_2d(
             down_bias.unsqueeze(-1),
@@ -437,6 +489,10 @@ def prepare_mxfp4_weights_for_trtllm_gen(
     )  # [E, H_pad] float32
     if tp_size > 1:
         fc2_bias_padded = fc2_bias_padded / tp_size
+    # Same TMA-layout shuffle as ``fc2_weights`` (no gated_act interleave for
+    # the non-gated GEMM2). PT's ``load_expert_w2_weight`` (quantization.py:
+    # 4304-4319) runs this shuffle on the bias too.
+    fc2_bias_padded = _shuffle_per_expert_bias_w2(fc2_bias_padded)
 
     intermediate_size_padded = fc1_weights.shape[1] // 2  # 2I_pad / 2 = I_pad
     hidden_size_padded = fc1_weights.shape[-1] * 2  # (H_pad/2) * 2 = H_pad
