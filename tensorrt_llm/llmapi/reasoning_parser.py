@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -296,6 +311,7 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
                 "force_nonempty_content", False) is True
         super().__init__(reasoning_at_start=reasoning_at_start,
                          chat_template_kwargs=chat_template_kwargs)
+        self._tool_call_start = "<tool_call>"
         # Workaround: the model sometimes does not send closing think tags
         # which affects downstream applications. This is addressed by
         # optionally accumulating reasoning tokens and returning them as
@@ -318,10 +334,30 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
         return result
 
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
-        """Wraps the parent parse_delta to track accumulated reasoning when
-        force_nonempty_content is set. When the closing tag is found
-        (in_reasoning transitions from True to False), the accumulation
-        is cleared to free memory."""
+        """Wraps the parent parse_delta to also treat `<tool_call>` as an
+        implicit end-of-reasoning marker.  When the model omits `</think>`
+        before generating a tool call, the tag would otherwise be absorbed
+        into reasoning_content and the downstream tool parser would never
+        see it (NVBug 6082303).
+
+        `<tool_call>` is a special token that always arrives as a single
+        atomic delta, so we only need to check `delta_text` (not the
+        parent's internal buffer)."""
+        if (self.in_reasoning and self._tool_call_start in delta_text
+                and self.reasoning_end not in self._buffer):
+            remaining = self._buffer
+            self._buffer = ""
+            self.in_reasoning = False
+            # Guaranteed non-negative: guarded by `in delta_text` above.
+            tool_idx = delta_text.find(self._tool_call_start)
+            reasoning = remaining + delta_text[:tool_idx]
+            content = delta_text[tool_idx:]
+            if self._force_nonempty_content:
+                self._found_closing_tag = True
+                self._accumulated_reasoning = ""
+            return ReasoningParserResult(content=content,
+                                         reasoning_content=reasoning)
+
         was_in_reasoning = self.in_reasoning
         result = super().parse_delta(delta_text)
         if self._force_nonempty_content:
@@ -363,7 +399,14 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
         return ReasoningParserResult()
 
     def parse(self, text: str) -> ReasoningParserResult:
-        return self._maybe_swap_content(super().parse(text))
+        result = super().parse(text)
+        tc = (result.reasoning_content.find(self._tool_call_start)
+              if result.reasoning_content else -1)
+        if tc != -1:
+            result = ReasoningParserResult(
+                content=result.reasoning_content[tc:] + result.content,
+                reasoning_content=result.reasoning_content[:tc])
+        return self._maybe_swap_content(result)
 
 
 @register_reasoning_parser("gemma4")

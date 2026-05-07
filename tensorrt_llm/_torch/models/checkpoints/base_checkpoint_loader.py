@@ -65,6 +65,23 @@ class BaseCheckpointLoader(ABC):
                                                mapping=mapping,
                                                **kwargs)
 
+    def is_weights_preloaded(self) -> bool:
+        """Whether the last load wrote weights directly into the model."""
+        return False
+
+    def post_load_apply(self,
+                        model: nn.Module,
+                        *,
+                        weights_preloaded: bool = False) -> None:
+        """Apply format-specific state after weights have been loaded."""
+
+    def post_load_publish(self,
+                          model: nn.Module,
+                          *,
+                          checkpoint_dir: str,
+                          weights_preloaded: bool = False) -> None:
+        """Publish format-specific loaded weights after the load path."""
+
     @classmethod
     def get(cls, checkpoint_format: str, **kwargs) -> "BaseCheckpointLoader":
         try:

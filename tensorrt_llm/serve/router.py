@@ -738,6 +738,20 @@ class BlockHashMixin:
             block_hashes.append(hash_list)
         return block_hashes
 
+    def _tokenize_and_compute_block_hashes(
+            self,
+            request: OpenAIRequest) -> tuple[list[list[int]], list[list[int]]]:
+        """Synchronous tokenize + block-hash, combined for thread offload.
+
+        Factored into one method so ``get_next_server`` can offload the whole
+        CPU-bound step via ``asyncio.to_thread`` in a single call, keeping
+        the orchestrator's asyncio event loop free to dispatch other
+        requests in parallel.
+        """
+        token_lists = self._tokenize(request)
+        block_hashes = self._compute_block_hashes(token_lists)
+        return token_lists, block_hashes
+
     @staticmethod
     def _text_to_int_sequences(texts: list[str]) -> list[list[int]]:
         """Convert text strings to lists of unicode code points.
@@ -782,8 +796,15 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 server for server in self._server_state.keys()
                 if server != exclude_server
             ]
-        token_lists = self._tokenize(request)
-        block_hashes = self._compute_block_hashes(token_lists)
+        # Tokenize + block-hash is CPU-bound (~50 ms p50 for a 40 k-token
+        # chat request with a Rust-backed tokenizer). Running it directly
+        # inside the async handler blocks the orchestrator's event loop and
+        # serializes all concurrent requests through it; with HuggingFace
+        # tokenizers releasing the GIL, offloading to a thread lets multiple
+        # tokenize calls run in parallel and frees the event loop to
+        # dispatch HTTP traffic to the CTX/GEN workers meanwhile.
+        token_lists, block_hashes = await asyncio.to_thread(
+            self._tokenize_and_compute_block_hashes, request)
         padded_tokens = sum(
             len(hash_list)
             for hash_list in block_hashes) * self._tokens_per_block

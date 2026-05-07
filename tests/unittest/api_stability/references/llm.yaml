@@ -99,6 +99,10 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      mx_config:
+        annotation: tensorrt_llm.llmapi.llm_args.ModelExpressConfig
+        default: null
+        status: prototype
       mm_encoder_only:
         annotation: bool
         default: False
