@@ -220,6 +220,8 @@ class TestE2ECapture:
             "cuda_graphs",
             "chunked_context",
             "data_parallel_size",
+            "checkpoint_format",
+            "load_format",
         }
         assert set(features.keys()) == expected_keys
 

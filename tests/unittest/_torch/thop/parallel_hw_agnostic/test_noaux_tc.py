@@ -5,14 +5,16 @@ from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3Gate
 
 
 @pytest.mark.parametrize("seq_len", [1, 32, 8192])
-@pytest.mark.parametrize("num_experts, n_group, topk_group, top_k", [
-    (256, 8, 4, 8),
-    (72, 1, 1, 6),
-    (384, 1, 1, 8),
-    (512, 1, 1, 22),
-])
-@pytest.mark.parametrize("dtype",
-                         [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "num_experts, n_group, topk_group, top_k",
+    [
+        (256, 8, 4, 8),
+        (72, 1, 1, 6),
+        (384, 1, 1, 8),
+        (512, 1, 1, 22),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_noaux_tc_run(seq_len, num_experts, n_group, topk_group, top_k, dtype):
     ROUTED_SCALING_FACTOR = 2.5
     HIDDEN_SIZE = 7168
@@ -20,8 +22,7 @@ def test_noaux_tc_run(seq_len, num_experts, n_group, topk_group, top_k, dtype):
     torch.cuda.manual_seed(24)
 
     weight = torch.randn((num_experts, HIDDEN_SIZE), dtype=dtype).cuda()
-    e_score_correction_bias = torch.randn((num_experts),
-                                          dtype=torch.float32).cuda()
+    e_score_correction_bias = torch.randn((num_experts), dtype=torch.float32).cuda()
 
     logits = torch.randn((seq_len, HIDDEN_SIZE), dtype=dtype).cuda()
 
@@ -44,8 +45,7 @@ def test_noaux_tc_run(seq_len, num_experts, n_group, topk_group, top_k, dtype):
     gate.load_weights([weights])
     gate.cuda()
     with torch.inference_mode():
-        selected_indices, selected_values = gate.routing_method.apply(
-            gate.forward(logits))
+        selected_indices, selected_values = gate.routing_method.apply(gate.forward(logits))
 
     # Run the original version
     ref_gate = DeepseekV3Gate(
@@ -63,7 +63,8 @@ def test_noaux_tc_run(seq_len, num_experts, n_group, topk_group, top_k, dtype):
     ref_gate.cuda()
     with torch.inference_mode():
         ref_selected_indices, ref_selected_values = ref_gate.routing_method.apply(
-            ref_gate.forward(logits))
+            ref_gate.forward(logits)
+        )
 
     # sort before compare
     sorted_selected_values, _ = torch.sort(selected_values)
@@ -72,7 +73,6 @@ def test_noaux_tc_run(seq_len, num_experts, n_group, topk_group, top_k, dtype):
     # compare
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(sorted_selected_values,
-                               ref_sorted_selected_values,
-                               rtol=0.01,
-                               atol=0.01)
+    torch.testing.assert_close(
+        sorted_selected_values, ref_sorted_selected_values, rtol=0.01, atol=0.01
+    )

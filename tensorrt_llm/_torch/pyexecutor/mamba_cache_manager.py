@@ -1127,7 +1127,8 @@ class CppMambaHybridCacheManager(KVCacheManager, BaseMambaCacheManager):
                                               max_beam_width,
                                               num_extra_decoding_steps,
                                               draft_kv_cache_manager)
-        self.requests.extend(requests)
+        if requests:
+            self.requests.extend(requests)
         self._setup_state_indices()
         return requests
 
