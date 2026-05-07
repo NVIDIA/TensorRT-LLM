@@ -2300,10 +2300,9 @@ class TestPyCapacitySchedulerEncoderInit:
     """
     V1 capacity scheduler ``ENCODER_INIT`` admission across policies.
 
-    Stage-1 next-iteration dispatch means encoder admission schedules
-    encoder compute but does not reserve self- or cross-KV blocks; the
-    later decoder ``CONTEXT_INIT`` admission owns that budgeting. Tests
-    below cover both ``GuaranteedNoEvictPolicy`` and
+    Encoder admission schedules encoder compute but does not reserve self- or
+    cross-KV blocks; the later decoder ``CONTEXT_INIT`` admission owns that
+    budgeting. Tests below cover both ``GuaranteedNoEvictPolicy`` and
     ``MaxUtilizationPolicy``, plus the safety fallback when no cross
     manager is configured.
 

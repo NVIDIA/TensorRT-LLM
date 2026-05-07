@@ -284,10 +284,10 @@ std::tuple<RequestVector, RequestVector> GuaranteedNoEvictScheduler::impl(
                 bool const isFirstChunkContext
                     = req->isContextInitState() && req->isFirstContextChunk() && !req->isDisaggGenerationInitState();
                 // Encoder-init requests do not consume self- or cross-KV
-                // blocks in stage-1 next-iteration dispatch.  We still keep
-                // the cross reuse summary available for beneficial-to-skip so
-                // duplicate encoder inputs can be ordered consistently before
-                // their decoder-context admission budgets the cross pool.
+                // blocks. We still keep the cross reuse summary available for
+                // beneficial-to-skip so duplicate encoder inputs can be ordered
+                // consistently before their decoder-context admission budgets
+                // the cross pool.
                 bool const isEncoderInit = req->isEncoderInitState();
                 std::optional<kv_cache_manager::PrefixReuseSummary> summary;
                 std::optional<kv_cache_manager::PrefixReuseSummary> crossSummary;

@@ -4189,13 +4189,10 @@ class PyTorchModelEngine(ModelEngine):
         non-causal :class:`AttentionMetadata` describing the packed
         encoder batch.
 
-        The encoder pass does not touch any KV-cache pool — the cross
-        pool is only written by the *decoder*'s cross-attention on the
-        first context step (Step 6 / decoder cross-attn integration).
-        Self-pool blocks for the decoder are reserved on the next
-        scheduler iteration when the request transitions to
-        ``CONTEXT_INIT`` (Stage-1 next-iteration dispatch, see G1 in
-        the porting guide).
+        The encoder pass does not touch any KV-cache pool. The cross pool is
+        only written by the decoder's cross-attention on the first context
+        step. Self-pool blocks for the decoder are reserved on the next
+        scheduler iteration when the request transitions to ``CONTEXT_INIT``.
         """
         if not encoder_requests:
             raise ValueError(
@@ -4212,8 +4209,7 @@ class PyTorchModelEngine(ModelEngine):
                 raise ValueError(
                     f"Encoder request {request.py_request_id} has no "
                     "encoder_tokens; encoder_input_token_ids must be wired "
-                    "through executor_request_to_llm_request "
-                    "(see Step 10 in the encoder-decoder porting guide).")
+                    "through executor_request_to_llm_request.")
             seq_len = len(tokens)
             encoder_input_ids.extend(tokens)
             encoder_position_ids.extend(

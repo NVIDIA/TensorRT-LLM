@@ -548,14 +548,10 @@ class TrtllmAttentionWrapper:
         kernel_beam_width = 1 if is_cross else self.beam_width
 
         helix_active = self.helix_position_offsets is not None
-        # Cross-attention is supported on two sub-paths:
-        #   * trtllm-gen on Blackwell (SM100/SM103) — Step 5α.
-        #   * legacy ``thop.attention`` on every other arch — Step 5β.
-        # We always *prefer* the trtllm-gen path for cross-attn so Blackwell
-        # keeps using the kernels we validated in 5α; on other archs
-        # ``trtllm_gen.is_supported(...)`` returns False and execution falls
-        # through to the ``thop.attention`` branch, which now accepts
-        # ``cross_attention``/``cross_kv``/``encoder_input_lengths`` (Step 5β).
+        # Prefer trtllm-gen for cross-attention on supported Blackwell
+        # architectures. Other architectures fall through to the legacy
+        # ``thop.attention`` path, which accepts
+        # ``cross_attention``/``cross_kv``/``encoder_input_lengths``.
         prefer_trtllm_gen = _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION or is_cross
         if prefer_trtllm_gen and not helix_active and trtllm_gen.is_supported(
                 q=q,
@@ -673,10 +669,10 @@ class TrtllmAttentionWrapper:
                 encoder_seq_lens=encoder_seq_lens,
             )
         else:
-            # Cross-attention legacy sub-path (Step 5β). Pack encoder K/V from
-            # context into ``cross_kv`` so C++ can lay it out in the cross-KV
-            # pool. During generation ``k``/``v`` are None and C++ reads the
-            # already cached encoder K/V through the same cross-attention path.
+            # In the legacy cross-attention path, pack encoder K/V from context
+            # into ``cross_kv`` so C++ can lay it out in the cross-KV pool.
+            # During generation ``k``/``v`` are None and C++ reads the cached
+            # encoder K/V through the same cross-attention path.
             cross_kv_input = None
             if is_cross and k is not None and v is not None:
                 k_flat = k.contiguous().view(k.shape[0], -1)
@@ -1969,9 +1965,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         # Cross-attention is supported on Blackwell (SM100/SM103) via the
         # trtllm-gen sub-path (see ``trtllm_gen.is_supported``) and on all
-        # earlier architectures via the legacy ``thop.attention`` C++ wrapper
-        # (Step 5β of the encoder-decoder porting plan). The wrapper.run()
-        # call below dispatches to the right sub-path based on architecture.
+        # earlier architectures via the legacy ``thop.attention`` C++ wrapper.
+        # The wrapper.run() call below dispatches to the right sub-path based
+        # on architecture.
 
         use_paged_context_fmha = (
             metadata.runtime_features.chunked_prefill

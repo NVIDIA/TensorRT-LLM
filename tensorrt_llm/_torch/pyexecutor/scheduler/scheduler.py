@@ -244,7 +244,7 @@ class BindCapacityScheduler(CapacityScheduler):
         """C++-bound capacity scheduler wrapper.
 
         ``cross_kv_cache_manager`` enables encoder-decoder dual-pool
-        scheduling (V1 path).  When provided, callers should also pass
+        scheduling.  When provided, callers should also pass
         ``no_schedule_until_state=LlmRequestState.ENCODER_INIT`` so the
         scheduler admits requests already in ``ENCODER_INIT`` for the
         encoder loop.  The C++ ``CapacityScheduler`` already accepts a

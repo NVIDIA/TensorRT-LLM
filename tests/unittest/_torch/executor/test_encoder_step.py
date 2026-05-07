@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the encoder iteration helpers in PyExecutor (Step 9).
+"""Unit tests for the encoder iteration helpers in PyExecutor.
 
 Covers the two pure-Python helpers that drive the encoder branch of
 ``_executor_loop`` for encoder-decoder models:

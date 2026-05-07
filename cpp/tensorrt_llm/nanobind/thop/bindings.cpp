@@ -71,9 +71,9 @@ void initBindings(nb::module_& m)
         nb::arg("mla_bmm1_scale") = std::nullopt, nb::arg("mla_bmm2_scale") = std::nullopt,
         nb::arg("quant_q_buffer") = std::nullopt, nb::arg("flash_mla_tile_scheduler_metadata") = std::nullopt,
         nb::arg("flash_mla_num_splits") = std::nullopt, nb::arg("num_contexts") = 0, nb::arg("num_ctx_tokens") = 0,
-        // Step 5β: cross-attention plumbing for the legacy (non-Blackwell)
-        // sub-path. ``cross_attention`` selects the cross-attention compute
-        // path; ``cross_kv`` is the packed encoder K/V projection
+        // Cross-attention arguments for the legacy attention path.
+        // ``cross_attention`` selects the cross-attention compute path;
+        // ``cross_kv`` is the packed encoder K/V projection
         // ``[num_encoder_tokens, 2 * num_kv_heads * head_size]`` used during
         // the decoder context step; ``encoder_input_lengths`` carries
         // per-request encoder lengths.

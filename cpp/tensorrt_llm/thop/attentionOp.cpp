@@ -409,12 +409,10 @@ public:
         common_enqueue_params.context_lengths = context_lengths_ptr;
         common_enqueue_params.host_context_lengths = host_context_lengths.data_ptr<int32_t>();
         common_enqueue_params.workspace = workspace_ptr;
-        // Cross-attention plumbing (Step 5β). On a cross-attention layer
-        // ``encoder_input_lengths`` carries the per-request encoder token
-        // counts (== K/V-side lengths). The op's ``mCrossAttention`` flag is
-        // set on the wrapper-level ``op->mCrossAttention`` (see ``attention``
-        // below) and selects the cross-attention compute path inside
-        // ``enqueueContext`` / ``enqueueGeneration``.
+        // On a cross-attention layer, ``encoder_input_lengths`` carries the
+        // per-request encoder token counts (the K/V-side lengths). The op's
+        // ``mCrossAttention`` flag selects the cross-attention compute path
+        // inside ``enqueueContext`` / ``enqueueGeneration``.
         if (cross_attention && encoder_input_lengths.has_value())
         {
             // Slice to this micro-batch in the same way as
@@ -463,8 +461,8 @@ public:
             enqueue_params.k_ptr = k_ptr;
             enqueue_params.v_ptr = v_ptr;
 
-            // Cross-attention context plumbing (Step 5β). ``cross_kv`` is the
-            // packed encoder K/V projection of shape
+            // For cross-attention context, ``cross_kv`` is the packed encoder
+            // K/V projection of shape
             // ``[num_encoder_tokens, 2 * num_kv_heads * head_size]`` (built on
             // the Python side from k / v); ``cross_kv_length`` is the per-batch
             // max encoder length used to size kernel buffers; and
@@ -669,13 +667,13 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_pool_pointers.has_value()
         && host_kv_cache_pool_mapping.has_value();
 
-    // Cross-attention layers (Step 5β) carry only Q via ``q``; encoder K/V is
-    // delivered through the dedicated ``cross_kv`` argument and lives in the
-    // paged cross-KV cache. Hence neither ``is_fused_qkv`` nor
-    // ``update_kv_cache`` are required to be true for cross-attention: during
-    // the decoder context step we still write the (separately-projected)
-    // encoder K/V into the cross pool via ``cross_kv``, and during decoder
-    // generation we only read from that pool, so ``update_kv_cache`` is False.
+    // Cross-attention layers carry only Q via ``q``; encoder K/V is delivered
+    // through the dedicated ``cross_kv`` argument and lives in the paged
+    // cross-KV cache. Hence neither ``is_fused_qkv`` nor ``update_kv_cache``
+    // are required to be true for cross-attention: during the decoder context
+    // step we still write the separately-projected encoder K/V into the cross
+    // pool via ``cross_kv``, and during decoder generation we only read from
+    // that pool, so ``update_kv_cache`` is false.
     TLLM_CHECK_WITH_INFO(is_mla_enable || is_fused_qkv || cross_attention,
         "Only fused QKV is supported for non-MLA non-cross attention now");
     TLLM_CHECK_WITH_INFO(update_kv_cache || cross_attention, "KV cache update cannot be disabled now");
@@ -778,8 +776,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mFP8ContextFMHA = is_fp8_out || is_fp4_out || (op->mKVCacheQuantMode.hasFp8KvCache() && use_paged_context_fmha);
     op->mFP8AttenOutput = is_fp8_out;
     op->mPagedContextFMHA = use_paged_context_fmha;
-    // Step 5β: enable cross-attention compute path inside enqueueContext /
-    // enqueueGeneration when this layer is a decoder cross-attention layer.
+    // Enable the cross-attention compute path when this layer is a decoder
+    // cross-attention layer.
     op->mCrossAttention = cross_attention;
 
     op->mAttentionChunkSize = attention_chunk_size;

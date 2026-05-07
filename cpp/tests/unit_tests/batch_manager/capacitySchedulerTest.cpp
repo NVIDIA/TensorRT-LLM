@@ -2268,14 +2268,14 @@ TEST_F(CapacitySchedulerTest, MaxUtilizationNoReuseWhenDisabled)
 }
 
 // ============================================================================
-// ENCODER_INIT admission tests (Step 8: dual-pool capacity scheduling)
+// ENCODER_INIT admission tests for dual-pool capacity scheduling.
 // ============================================================================
 //
 // These tests exercise the C++ scheduler paths that admit requests in the
-// LlmRequestState::kENCODER_INIT state.  Stage-1 next-iteration dispatch
-// means encoder-init requests must not reserve blocks from either the self or
-// cross KV cache; decoder CONTEXT_INIT admission owns that budgeting. They
-// also must not be considered eviction victims by MaxUtilization.
+// LlmRequestState::kENCODER_INIT state. Encoder-init requests must not reserve
+// blocks from either the self or cross KV cache; decoder CONTEXT_INIT admission
+// owns that budgeting. They also must not be considered eviction victims by
+// MaxUtilization.
 //
 // Unlike the legacy enc-dec tests above (which use prepRequestsForEncoderSkip
 // to flip ENCODER_INIT → CONTEXT_INIT before the scheduler runs), the tests

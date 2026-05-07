@@ -277,7 +277,7 @@ void initBindings(nb::module_& m)
                 }
                 return std::optional<GenLlmReq::VecUniqueTokens>(std::nullopt);
             })
-        // Encoder-decoder accessors (Step 9: encoder iteration in PyExecutor).
+        // Encoder-decoder accessors for PyExecutor encoder iteration.
         // ``encoder_tokens`` returns the source-side tokens used to drive the
         // encoder forward.  ``encoder_output_len`` is the cross-KV capacity
         // for the request (number of encoder hidden states the decoder
