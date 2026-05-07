@@ -38,6 +38,7 @@ _MODEL_MODULES = {
     "modeling_openelm": ["OpenELMForCausalLM"],
     "modeling_qwen3_5_moe": ["Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration"],
     "modeling_qwen3_moe": ["Qwen3MoeForCausalLM"],
+    "modeling_qwen3_ir": ["Qwen3ForCausalLM"],
     "modeling_qwen3_next": ["Qwen3NextForCausalLM"],
     "modeling_seed_oss": ["SeedOssForCausalLM"],
     "modeling_skywork_r1v2": ["SkyworkR1V2ForConditionalGeneration"],

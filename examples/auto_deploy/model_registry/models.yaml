@@ -451,8 +451,8 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 # --- Qwen3 Instruct 2507 update ---
 - name: Qwen/Qwen3-4B-Instruct-2507
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- SmolLM3 (Jul 2025) ---
 - name: HuggingFaceTB/SmolLM3-3B
   config_id: default_ws_2
@@ -484,8 +484,8 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- Qwen3 missing sizes (May 2025) ---
 - name: Qwen/Qwen3-1.7B
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: default_ws_1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: Qwen/Qwen3-32B
   config_id: default_ws_4
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
@@ -649,8 +649,8 @@ models:
   config_id: simple_shard_only
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
 - name: Qwen/Qwen3-0.6B-FP8
-  config_id: default_ws_1
-  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
+  config_id: qwen3_fp8_bf16
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'qwen3_fp8_bf16.yaml']
 # --- Mistral updates (2025) ---
 - name: mistralai/Codestral-25.01
   config_id: default_ws_4
