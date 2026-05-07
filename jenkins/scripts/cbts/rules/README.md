@@ -12,6 +12,7 @@ for the overall CBTS architecture.
 | `tests_def_rule.py` | `TestsDefRule` | `testdefonly` | `tests/**/*` (any file under tests/) |
 | `test_list_rule.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
 | `auto_deploy_rule.py` | `AutoDeployRule` | `autodeployonly` | `examples/auto_deploy/**` (non-`.md`), `tensorrt_llm/_torch/auto_deploy/**` (non-`.md`) |
+| `visual_gen_rule.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**` (non-`.md`), `tensorrt_llm/_torch/visual_gen/**` (non-`.md`), `tensorrt_llm/visual_gen/**` (non-`.md`) |
 | `out_of_scope_rule.py` | `OutOfScopeRule` | `noop` | `tests/integration/test_lists/{qa,dev}/**`, `tests/integration/defs/.test_durations*`, `tests/microbenchmarks/**`, `**/*.md`, `**/*.{png,jpg,jpeg,gif,svg,webp}` |
 
 ## WaivesRule
@@ -142,6 +143,46 @@ PyTorch backend. The 7 reverse imports of AD from non-AD code in
 that use the default PyTorch backend.
 `scripts/check_auto_deploy_imports.py` enforces AD's outbound import
 discipline statically.
+
+## VisualGenRule
+
+Path-only rule. Claims source files under `examples/visual_gen/`,
+`tensorrt_llm/_torch/visual_gen/`, and `tensorrt_llm/visual_gen/`
+(excluding `.md`, which `OutOfScopeRule` claims as noop).
+
+Block selection — entry-pattern based only:
+VisualGen has no `condition.terms.backend` of its own; VG entries
+live in `backend: pytorch` and `backend: tensorrt` blocks. A block
+"belongs to VG" iff any of its `tests:` entries matches one of the
+three stable VG path families:
+
+- `unittest/_torch/visual_gen/...` (28 entries)
+- `examples/test_visual_gen.py...` (1 entry)
+- `visual_gen/test_visual_gen_benchmark.py` (1 entry)
+
+For each matched block, `block_filters` keeps only the VG entries.
+Non-VG siblings in the same block stay governed by other rules.
+
+Outward-facing fallback: unlike AutoDeploy, VG is imported eagerly
+(top-level `from tensorrt_llm._torch.visual_gen.config import ...`
+in `commands/serve.py`, `commands/utils.py`,
+`serve/openai_server.py`). The 5 files that define / re-export the
+public API symbols (`VisualGenArgs`, `ParallelConfig`, `VisualGen`,
+`VisualGenParams`) are listed in `_VG_OUTWARD_FILES`; touching any
+of them claims the changed files but emits `scope=None` so Selector
+falls back to baseline. This protects trtllm-serve / trtllm-bench
+startup paths from VG signature drift slipping through pre-merge.
+
+Outcomes:
+
+- No VG source files in the diff → rule returns `None`.
+- VG source touched, all internal → `scope=visualgenonly`; sanity
+  off (VG changes don't affect wheel sanity); perfsanity on iff a
+  matched block lives in `l0_perf` or `*perf_sanity*`.
+- VG source touched, any outward-facing file → `scope=None`
+  (fallback).
+- VG source touched but no VG block found anywhere (defensive) →
+  `scope=None` (fallback).
 
 ## OutOfScopeRule
 

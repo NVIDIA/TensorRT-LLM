@@ -52,6 +52,7 @@ from rules.base import PRInputs, Rule, RuleResult  # noqa: E402
 from rules.out_of_scope_rule import OutOfScopeRule  # noqa: E402
 from rules.test_list_rule import TestListRule  # noqa: E402
 from rules.tests_def_rule import TestsDefRule  # noqa: E402
+from rules.visual_gen_rule import VisualGenRule  # noqa: E402
 from rules.waives_rule import WaivesRule  # noqa: E402
 
 # --- Rule registry -----------------------------------------------------------
@@ -62,6 +63,7 @@ RULE_CLASSES: list[type[Rule]] = [
     TestsDefRule,
     TestListRule,
     AutoDeployRule,
+    VisualGenRule,
     OutOfScopeRule,
 ]
 
@@ -76,6 +78,7 @@ def build_rules(
         TestsDefRule(yaml_index, stages, repo_root=repo_root),
         TestListRule(yaml_index, stages, repo_root=repo_root),
         AutoDeployRule(yaml_index, stages),
+        VisualGenRule(yaml_index, stages),
         OutOfScopeRule(yaml_index, stages),
     ]
 
@@ -117,7 +120,7 @@ class SelectionResult:
 # Scopes that compose: a PR mixing waive + test-def + test-list edits
 # combines to a single "testsonly" scope rather than falling back.
 _TESTSONLY_FAMILY: frozenset[str] = frozenset(
-    {"waiveonly", "testdefonly", "testlistonly", "autodeployonly"}
+    {"waiveonly", "testdefonly", "testlistonly", "autodeployonly", "visualgenonly"}
 )
 
 

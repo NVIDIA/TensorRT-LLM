@@ -20,7 +20,7 @@ filter chain.
 
 ## Rules
 
-Five rules, registered in `main.py::RULE_CLASSES`:
+Six rules, registered in `main.py::RULE_CLASSES`:
 
 | Rule | Scope | Files |
 |---|---|---|
@@ -28,6 +28,7 @@ Five rules, registered in `main.py::RULE_CLASSES`:
 | `TestsDefRule` | `testdefonly` | `tests/**/*` (.py via AST; data files via dir walk-up) |
 | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
 | `AutoDeployRule` | `autodeployonly` | `examples/auto_deploy/**`, `tensorrt_llm/_torch/auto_deploy/**` (excl. `.md`) |
+| `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/visual_gen/**` (excl. `.md`; outward-facing files force fallback) |
 | `OutOfScopeRule` | `noop` | QA / dev test lists, `.test_durations`, `microbenchmarks/`, `**/*.md`, `**/*.{png,jpg,jpeg,gif,svg,webp}` |
 
 See `rules/README.md` for per-rule logic.
