@@ -1859,3 +1859,246 @@ class TestPartialReuse:
         assert ctx.context_chunk_size == 64
         # 64 + 1 = 65 <= 80: gen fits
         assert ids(out.generation_requests) == [1]
+
+
+# ===========================================================================
+# Bidirectional-MM chunk alignment (Gemma4-style)
+# ===========================================================================
+
+
+class TestMultimodalAwareChunkingV2:
+    """Tests for ``KVCacheV2Scheduler._align_chunk_to_mm_block`` — keeps
+    bidirectional MM blocks intact across chunk boundaries via snap-up,
+    snap-down, or last-resort straddle. Gated on the
+    ``mm_bidirectional_blocks`` marker propagated from the input processor."""
+
+    @staticmethod
+    def _build_cumsum(prompt_len, mm_runs):
+        """Build the int64 [P+1] embed-mask cumsum tensor.
+
+        ``mm_runs`` is a list of half-open ``(start, end)`` ranges marking
+        embed_mask=1 positions.
+        """
+        import torch
+
+        mask = torch.zeros(prompt_len, dtype=torch.int64)
+        for start, end in mm_runs:
+            mask[start:end] = 1
+        cumsum = torch.zeros(prompt_len + 1, dtype=torch.int64)
+        cumsum[1:] = torch.cumsum(mask, dim=0)
+        return cumsum
+
+    def _make_mm_req(self, request_id, context_remaining, mm_runs, *, bidirectional=True):
+        req = make_ctx_request(
+            request_id,
+            context_remaining_length=context_remaining,
+            prompt_len=context_remaining,
+        )
+        req.py_multimodal_data = {
+            "multimodal_embed_mask_cumsum": self._build_cumsum(context_remaining, mm_runs),
+            "mm_bidirectional_blocks": bidirectional,
+        }
+        return req
+
+    def _make_sched(self, *, chunk_unit_size=4, max_num_tokens=128):
+        mgr = make_kv_cache_manager(tokens_per_block=chunk_unit_size)
+        return make_scheduler(
+            mgr,
+            max_num_tokens=max_num_tokens,
+            ctx_chunk_config=(None, chunk_unit_size),
+        )
+
+    # ---- snap-up ----
+
+    def test_snap_up_extends_chunk_to_block_end(self):
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=64)
+        req = self._make_mm_req(0, context_remaining=32, mm_runs=[(8, 20)])
+        # Chunk ends at pos 12, mid-block. Block ends at 20 (unit-aligned).
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=12, remaining_budget=64, context_remaining=32
+        )
+        assert out == 20
+
+    def test_snap_up_rounds_up_past_unaligned_block_end(self):
+        sched = self._make_sched(chunk_unit_size=8, max_num_tokens=128)
+        req = self._make_mm_req(0, context_remaining=64, mm_runs=[(8, 21)])
+        # Block ends at 21 → round up to 24.
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=16, remaining_budget=128, context_remaining=64
+        )
+        assert out == 24
+
+    def test_snap_up_two_adjacent_blocks_only_swallows_first(self):
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=128)
+        req = self._make_mm_req(0, context_remaining=64, mm_runs=[(8, 20), (24, 40)])
+        # Chunk ends at 12, mid-block-A. Snap-up should reach end of block A
+        # (20) only — text gap [20, 24) breaks the run.
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=12, remaining_budget=128, context_remaining=64
+        )
+        assert out == 20
+
+    # ---- snap-down ----
+
+    def test_snap_down_when_budget_exceeded(self):
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=128)
+        req = self._make_mm_req(0, context_remaining=64, mm_runs=[(16, 60)])
+        # Snap-up needs 60 (block end is unit-aligned), but budget is 33 →
+        # snap-down to block start = 16.
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=32, remaining_budget=33, context_remaining=64
+        )
+        assert out == 16
+
+    def test_snap_down_floors_to_chunk_unit_size(self):
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=128)
+        req = self._make_mm_req(0, context_remaining=64, mm_runs=[(17, 60)])
+        # Snap-up needs 60, budget is 33. Block start = 17 → floor to 16.
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=32, remaining_budget=33, context_remaining=64
+        )
+        assert out == 16
+
+    def test_snap_down_when_max_context_length_exceeded(self):
+        # max_context_length is set from max_num_tokens by V2.
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=20)
+        req = self._make_mm_req(0, context_remaining=64, mm_runs=[(12, 40)])
+        # Snap-up to 40 exceeds max_context_length=20 → snap-down to 12.
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=16, remaining_budget=200, context_remaining=64
+        )
+        assert out == 12
+
+    def test_up_block_end_clamps_to_prompt_end(self):
+        """Block runs to (prompt_len-1); round-up of block_end_abs must be
+        clamped to prompt_len so up_chunk_size doesn't exceed context_remaining.
+        """
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=512)
+        # context_remaining=21, MM block at [8, 21). End_abs=12 is mid-block;
+        # block walks to 21 (=prompt_len). Without the min() clamp, round-up
+        # would push to 24 > prompt_len.
+        req = self._make_mm_req(0, context_remaining=21, mm_runs=[(8, 21)])
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=12, remaining_budget=512, context_remaining=21
+        )
+        assert out == 21  # snap-up to prompt end (last chunk, no round-up)
+
+    # ---- impossibility (block > max_context_length) ----
+
+    def test_raises_when_block_exceeds_max_context_length(self):
+        """A bidirectional MM block bigger than max_context_length cannot
+        ever fit in a chunk; deferring would livelock. Raise a clear
+        ValueError so the user sees the misconfiguration immediately."""
+        # max_context_length = max_num_tokens = 16, but block is 60 tok.
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=16)
+        req = self._make_mm_req(0, context_remaining=128, mm_runs=[(8, 68)])
+        with pytest.raises(ValueError, match=r"exceeds max_context_length=16"):
+            sched._align_chunk_to_mm_block(
+                req, chunk_size=12, remaining_budget=16, context_remaining=128
+            )
+
+    # ---- last-resort defer ----
+
+    def test_last_resort_defers_when_snap_down_would_starve(self):
+        """Block at chunk left edge + snap-up doesn't fit + snap-down would
+        zero → return 0 so caller SKIPs the request this iteration. Better
+        than straddling and corrupting bidirectional attention."""
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=128)
+        # Block from 0 to 60 → block_start = 0 = lo → snap-down impossible.
+        req = self._make_mm_req(0, context_remaining=64, mm_runs=[(0, 60)])
+        # Snap-up needs 60 but budget=33 → snap-down → block_start=0 → defer.
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=32, remaining_budget=33, context_remaining=64
+        )
+        assert out == 0
+
+    # ---- gates ----
+
+    def test_no_op_when_bidirectional_flag_false(self):
+        """Causal-MM models (most VLMs) — flag False suppresses alignment."""
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=64)
+        req = self._make_mm_req(0, context_remaining=32, mm_runs=[(8, 20)], bidirectional=False)
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=12, remaining_budget=64, context_remaining=32
+        )
+        assert out == 12
+
+    def test_no_op_when_no_multimodal_data(self):
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=64)
+        req = make_ctx_request(0, context_remaining_length=32, prompt_len=32)
+        # py_multimodal_data unset
+        req.py_multimodal_data = None
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=12, remaining_budget=64, context_remaining=32
+        )
+        assert out == 12
+
+    def test_no_op_when_cumsum_missing(self):
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=64)
+        req = make_ctx_request(0, context_remaining_length=32, prompt_len=32)
+        req.py_multimodal_data = {"mm_bidirectional_blocks": True}
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=12, remaining_budget=64, context_remaining=32
+        )
+        assert out == 12
+
+    def test_no_op_when_boundary_not_in_block(self):
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=64)
+        req = self._make_mm_req(0, context_remaining=32, mm_runs=[(8, 20)])
+        # Chunk ends at 8: pos 7 is non-MM (specials), pos 8 is MM — boundary
+        # is at block start, not mid-block. Helper returns chunk untouched.
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=8, remaining_budget=64, context_remaining=32
+        )
+        assert out == 8
+
+    def test_no_op_when_chunk_reaches_prompt_end(self):
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=64)
+        req = self._make_mm_req(0, context_remaining=32, mm_runs=[(8, 20)])
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=32, remaining_budget=64, context_remaining=32
+        )
+        assert out == 32
+
+    # ---- mid-prompt (partial reuse) ----
+
+    def test_aligns_relative_to_context_current_position(self):
+        """When block reuse moved context_current_position past 0, the helper
+        must reason in absolute prompt coordinates (cumsum is indexed there)."""
+        sched = self._make_sched(chunk_unit_size=4, max_num_tokens=128)
+        prompt_len = 96  # full prompt; first 32 already cached
+        req = make_ctx_request(0, context_remaining_length=64, prompt_len=prompt_len)
+        req.py_multimodal_data = {
+            "multimodal_embed_mask_cumsum": self._build_cumsum(prompt_len, [(40, 56)]),
+            "mm_bidirectional_blocks": True,
+        }
+        req.context_current_position = 32  # 32 tokens already cached
+        # Remaining starts at absolute pos 32. Chunk_size=16 → end_abs=48
+        # which lands mid-block [40,56). Snap-up to 56 (unit-aligned) →
+        # chunk_size = 56 - 32 = 24.
+        out = sched._align_chunk_to_mm_block(
+            req, chunk_size=16, remaining_budget=128, context_remaining=64
+        )
+        assert out == 24
+
+    # ---- end-to-end: defer propagates as SKIP through schedule_request ----
+
+    def test_defer_skips_request_in_schedule_request(self):
+        """When alignment returns 0 (last-resort defer), the caller must SKIP
+        the request — it must not appear in scheduled context_requests, and
+        resize_context must not be called for it."""
+        # block_size=18 ≤ max_context_length=20 (no impossibility raise),
+        # but unit_size=8 round-up pushes up_block_end to 24 > 20, so
+        # snap-up fails. Block at lo=0 → snap-down zeros → defer.
+        resize_calls = []
+
+        def track_resize(req, n):
+            resize_calls.append((req.request_id, n))
+            return True
+
+        mgr = make_kv_cache_manager(tokens_per_block=8, resize_context_fn=track_resize)
+        sched = make_scheduler(mgr, max_num_tokens=20, ctx_chunk_config=(None, 8))
+        req = self._make_mm_req(0, context_remaining=32, mm_runs=[(0, 18)])
+        out = sched.schedule_request([req], set())
+        assert ids(out.context_requests) == []
+        assert resize_calls == []  # SKIP path: no commit to KV cache
