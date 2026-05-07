@@ -3739,15 +3739,16 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Flash-Base"
 
     @pytest.mark.skip_less_mpi_world_size(4)
-    def test_auto_dtype(self):
+    @parametrize_with_ids("moe_backend", ["WIDEEP", "TRTLLM"])
+    def test_auto_dtype(self, moe_backend):
         # Aggregate (non-disagg, non-EPLB) smoke test. FP8 weights ~71 GB/rank
-        # at TP=4 — fits on 4x B300 (~288 GB/GPU). WIDEEP required (CUTLASS
-        # path is Hopper-only on Blackwell). 1-sample smoke.
+        # at TP=4 — fits on 4x B300 (~288 GB/GPU). 1-sample smoke. CUTLASS is
+        # Hopper-only on Blackwell and skipped here.
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         with LLM(self.MODEL_PATH,
                  tensor_parallel_size=4,
                  moe_expert_parallel_size=4,
-                 moe_config=MoeConfig(backend="WIDEEP"),
+                 moe_config=MoeConfig(backend=moe_backend),
                  enable_attention_dp=True,
                  max_seq_len=4096,
                  kv_cache_config=kv_cache_config) as llm:

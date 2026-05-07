@@ -104,11 +104,18 @@ class TRTLLMGenFusedMoE(MoE):
     }
 
     # Quantization algorithms that support swiglu_gptoss_style
+    # FP8_BLOCK_SCALES is included for swiglu_limit only via the
+    # DeepSeek FP8 separate-activation path
+    # (DevKernel.cu::activationDeepSeekKernel reads gemm1_clamp_limit
+    # when MoERunnerArgs supplies it). bias and swiglu_alpha/beta still
+    # require GEMM-fused activation cubins, which are NVFP4/MXFP4 only
+    # — _check_configs gates those separately.
     _GPTOSS_SUPPORTED_ALGOS = {
         QuantAlgo.NVFP4,
         QuantAlgo.W4A16_MXFP4,
         QuantAlgo.W4A8_MXFP4_FP8,
         QuantAlgo.W4A8_MXFP4_MXFP8,
+        QuantAlgo.FP8_BLOCK_SCALES,
     }
 
     # Activations supported by the FlashInfer BF16 kernels: Swiglu and Relu2.
@@ -207,6 +214,7 @@ class TRTLLMGenFusedMoE(MoE):
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
+        swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = True,
         without_comm: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
@@ -225,6 +233,7 @@ class TRTLLMGenFusedMoE(MoE):
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            swiglu_limit_scalar=swiglu_limit_scalar,
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
             activation_type=activation_type,
@@ -461,8 +470,19 @@ class TRTLLMGenFusedMoE(MoE):
             assert not self.bias and self.swiglu_alpha is None and self.swiglu_beta is None and self.swiglu_limit is None, \
                 "TRTLLMGenFusedMoE BF16 path does not support bias/swiglu custom parameters."
 
-        if self.bias or self.swiglu_alpha is not None or self.swiglu_beta is not None or self.swiglu_limit is not None:
-            assert self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE supports bias/swiglu only for nvfp4 and mxfp4 variants."
+        if self.bias or self.swiglu_alpha is not None or self.swiglu_beta is not None:
+            assert self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, \
+                "TRTLLMGenFusedMoE supports bias/swiglu_alpha/swiglu_beta only for nvfp4 and mxfp4 variants."
+        if self.swiglu_limit is not None or self.swiglu_limit_scalar is not None:
+            # swiglu_limit additionally goes through the DeepSeek FP8
+            # separate-activation path
+            # (DevKernel.cu::activationDeepSeekKernel) when
+            # has_deepseek_fp8_block_scales. The FP8 path consumes the scalar
+            # variant (uniform across experts); NVFP4/MXFP4 fused-activation
+            # cubins consume the per-expert tensor.
+            assert self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 \
+                or self.has_w4a8_mxfp4_mxfp8 or self.has_deepseek_fp8_block_scales, \
+                "TRTLLMGenFusedMoE supports swiglu_limit only for nvfp4, mxfp4, and fp8_block_scale variants."
 
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
@@ -756,6 +776,7 @@ class TRTLLMGenFusedMoE(MoE):
                 self.routing_method.routing_method_type,
                 topk_weights=token_final_scales,
                 topk_ids=token_selected_experts,
+                gemm1_clamp_limit=self.swiglu_limit_scalar,
                 output=moe_output,
                 tune_max_num_tokens=self.max_num_tokens,
                 use_dp=self.use_dp,
