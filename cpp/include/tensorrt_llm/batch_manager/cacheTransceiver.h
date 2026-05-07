@@ -421,6 +421,15 @@ private:
         /// peer. Pre-advertise cancellation can release normally; post-
         /// advertise cancellation must wait for worker quiescence.
         bool advertised{false};
+        /// Wall-clock time at which @c quarantined transitioned to true.
+        /// Used by @ref updateHealthLocked: an entry whose
+        /// @c (now - quarantinedAt) exceeds @ref mGlobalProgressDeadlineMs
+        /// is treated as a real wedge regardless of unrelated activity.
+        /// Per-entry timestamps avoid the asymmetry where one unrelated
+        /// completing transfer resets a single global "last progress"
+        /// timer and prevents specific stuck transfers from ever
+        /// surfacing as wedged (observed on the d224 decode side).
+        std::chrono::steady_clock::time_point quarantinedAt{};
     };
 
     /// Update the global "last progress" timestamp and re-evaluate the
@@ -459,9 +468,30 @@ private:
     /// block; the executor thread is the sole writer/reader of the future
     /// vectors above.
     mutable std::mutex mHealthMutex;
+    /// Running count of TrackedFuture entries whose @c quarantined flag
+    /// is true (deadline exceeded, error surfaced to user, future still
+    /// pinned in C++). Observability only — surfaced via
+    /// @ref TransceiverHealth::quarantinedTransferCount and useful for
+    /// dashboards / metrics. Does NOT drive the @ref mIsHealthy flag.
+    /// Health is now driven exclusively by no-progress signals (see
+    /// @ref updateHealthLocked).
     size_t mQuarantinedTransferCount{0};
+    /// Preserved for backward-compat / observability of the budget that
+    /// formerly gated @ref mIsHealthy. No longer consulted by
+    /// @ref updateHealthLocked. Remove in a future cleanup once
+    /// downstream tooling stops referencing it.
     size_t mQuarantineBudget{16};
+    /// Wall-clock time of the most recent worker future transition
+    /// (entry erased via @ref releaseTrackedFutureLocked). Drives the
+    /// "no entry has finished for > deadline" wedge signal in
+    /// @ref updateHealthLocked.
     std::chrono::steady_clock::time_point mLastProgressTime{std::chrono::steady_clock::now()};
+    /// Both the no-progress wedge threshold and the per-entry
+    /// quarantined-stuck threshold. An entry that has been past its
+    /// per-request deadline AND not made worker-final-state progress
+    /// for longer than this duration is treated as wedged. Same
+    /// duration is also used as the no-progress timeout against
+    /// @ref mLastProgressTime.
     std::chrono::milliseconds mGlobalProgressDeadlineMs{60'000};
     bool mIsHealthy{true};
 

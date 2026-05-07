@@ -533,17 +533,48 @@ std::chrono::steady_clock::time_point CacheTransceiver::computeTrackedFutureDead
 void CacheTransceiver::updateHealthLocked()
 {
     auto const now = std::chrono::steady_clock::now();
-    auto const sinceProgress
+    auto const sinceProgressMs
         = std::chrono::duration_cast<std::chrono::milliseconds>(now - mLastProgressTime).count();
-    bool wedged = sinceProgress > mGlobalProgressDeadlineMs.count() && (!mSenderFutures.empty() || !mRequesterFutures.empty());
-    bool overBudget = mQuarantinedTransferCount > mQuarantineBudget;
-    bool nextHealthy = !overBudget && !wedged;
+
+    // (B2) No completion observed for the deadline window AND we have
+    // tracked entries waiting → genuinely no progress.
+    bool const noProgressTimeout = sinceProgressMs > mGlobalProgressDeadlineMs.count()
+        && (!mSenderFutures.empty() || !mRequesterFutures.empty());
+
+    // (C) Per-entry stuck-past-deadline: any single entry that has been
+    // quarantined longer than mGlobalProgressDeadlineMs is a wedge
+    // regardless of unrelated activity. Avoids the d224 decode-side
+    // asymmetry where intermittent unrelated completions kept resetting
+    // mLastProgressTime even though specific entries stayed wedged.
+    auto const isStuckPastDeadline = [&](std::vector<TrackedFuture> const& vec)
+    {
+        for (auto const& e : vec)
+        {
+            if (e.quarantined && e.quarantinedAt != std::chrono::steady_clock::time_point{}
+                && (now - e.quarantinedAt) > mGlobalProgressDeadlineMs)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+    bool const perEntryStuck = isStuckPastDeadline(mSenderFutures) || isStuckPastDeadline(mRequesterFutures);
+
+    // (A) mQuarantinedTransferCount no longer drives health. It is kept
+    // for observability via getHealth() so dashboards can see how many
+    // requests have been deadline-quarantined, but a deeply-queued
+    // burst that produces many deadline-only quarantines will not flip
+    // is_healthy if completions are still draining (the slow-but-
+    // functional TCP scenario from d224).
+    bool const wedged = noProgressTimeout || perEntryStuck;
+    bool const nextHealthy = !wedged;
     if (mIsHealthy && !nextHealthy)
     {
         TLLM_LOG_WARNING(
-            "CacheTransceiver flipping to UNHEALTHY: quarantined=%zu budget=%zu sinceProgressMs=%lld deadlineMs=%lld",
-            mQuarantinedTransferCount, mQuarantineBudget, static_cast<long long>(sinceProgress),
-            static_cast<long long>(mGlobalProgressDeadlineMs.count()));
+            "CacheTransceiver flipping to UNHEALTHY: noProgressTimeout=%d perEntryStuck=%d "
+            "quarantined=%zu sinceProgressMs=%lld deadlineMs=%lld",
+            static_cast<int>(noProgressTimeout), static_cast<int>(perEntryStuck), mQuarantinedTransferCount,
+            static_cast<long long>(sinceProgressMs), static_cast<long long>(mGlobalProgressDeadlineMs.count()));
     }
     mIsHealthy = nextHealthy;
 }
@@ -579,6 +610,14 @@ bool CacheTransceiver::maybeQuarantineLocked(TrackedFuture& entry, RequestStatus
         return false;
     }
     entry.quarantined = true;
+    // Per-entry timestamp: feeds @ref updateHealthLocked's
+    // perEntryStuck check. The transceiver flips unhealthy only when
+    // (now - quarantinedAt) exceeds mGlobalProgressDeadlineMs for at
+    // least one entry — i.e., the entry has been past its user-deadline
+    // AND not made progress for an additional deadline window. This
+    // distinguishes "slow but completing" (which clears within the
+    // window) from "genuinely wedged" (which doesn't).
+    entry.quarantinedAt = now;
     entry.request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
     if (outStatus != nullptr)
     {
@@ -586,12 +625,19 @@ bool CacheTransceiver::maybeQuarantineLocked(TrackedFuture& entry, RequestStatus
     }
     {
         std::scoped_lock lk(mHealthMutex);
+        // mQuarantinedTransferCount is observability-only since
+        // PR #13831; it is surfaced via getHealth() but no longer
+        // drives mIsHealthy. The per-entry quarantinedAt + the
+        // mLastProgressTime no-progress check are the two health
+        // triggers now.
         ++mQuarantinedTransferCount;
         updateHealthLocked();
     }
     TLLM_LOG_WARNING(
         "Quarantining request %ld: per-request KV transfer deadline exceeded; future stays pinned in C++ until "
-        "worker reaches a final state.",
+        "worker reaches a final state. Health flip is gated on per-entry stuck-past-deadline (see "
+        "updateHealthLocked) — slow-but-completing transfers will clear without flipping the transceiver "
+        "unhealthy.",
         entry.request->mRequestId);
     return true;
 }
