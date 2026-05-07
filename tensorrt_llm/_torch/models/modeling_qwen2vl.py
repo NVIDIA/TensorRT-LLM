@@ -42,7 +42,8 @@ from ..attention_backend.utils import get_attention_backend
 from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
+from .modeling_multimodal_utils import (bypass_processor_output_validation,
+                                        find_input_mm_embeds, fuse_input_embeds,
                                         get_multimodal_embeddings)
 from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
                              filter_weights, register_auto_model,
@@ -287,30 +288,21 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
         # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly
-        # validates kwargs against the processor's TypedDict. The grid_thw /
-        # pixel_values keys are processor *outputs*, not inputs, and rejecting
-        # them is a regression vs. earlier behavior. Strip them defensively so
-        # callers that round-trip processor outputs back through
-        # ``mm_processor_kwargs`` don't trigger validation errors.
-        _PROCESSOR_OUTPUT_KEYS = (
-            "image_grid_thw",
-            "video_grid_thw",
-            "pixel_values",
-            "pixel_values_videos",
-            "second_per_grid_ts",
-        )
-        sanitized_kwargs = {
-            k: v
-            for k, v in mm_processor_kwargs.items()
-            if k not in _PROCESSOR_OUTPUT_KEYS
-        }
-        return self.processor(text=[text],
-                              images=images,
-                              videos=videos,
-                              padding=True,
-                              do_rescale=do_rescale,
-                              return_tensors='pt',
-                              **sanitized_kwargs)
+        # validates per-modality kwargs against the processor's TypedDict.
+        # Processor *output* keys (``video_grid_thw``, ``pixel_values``, ...)
+        # round-trip into the validator via tokenizer ``init_kwargs`` /
+        # ``model_input_names`` and trip it with ``TypeError:
+        # merged_typed_dict.__init__() got an unexpected keyword argument
+        # 'video_grid_thw'``. Bypass the validator for our known output keys
+        # for the duration of the processor call.
+        with bypass_processor_output_validation():
+            return self.processor(text=[text],
+                                  images=images,
+                                  videos=videos,
+                                  padding=True,
+                                  do_rescale=do_rescale,
+                                  return_tensors='pt',
+                                  **mm_processor_kwargs)
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
         masks = (input_ids == self.config.image_token_id) | (

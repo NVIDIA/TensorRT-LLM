@@ -44,6 +44,7 @@ from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (
+    bypass_processor_output_validation,
     find_input_mm_embeds,
     fuse_input_embeds,
     get_multimodal_embeddings,
@@ -304,30 +305,24 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
             do_rescale = False
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
-        # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly validates
-        # kwargs against the processor's TypedDict. Strip processor *output*
-        # keys (grid_thw / pixel_values / etc.) defensively so callers that
-        # round-trip processor outputs back through ``mm_processor_kwargs``
-        # don't trip validation.
-        _PROCESSOR_OUTPUT_KEYS = (
-            "image_grid_thw",
-            "video_grid_thw",
-            "pixel_values",
-            "pixel_values_videos",
-            "second_per_grid_ts",
-        )
-        sanitized_kwargs = {
-            k: v for k, v in mm_processor_kwargs.items() if k not in _PROCESSOR_OUTPUT_KEYS
-        }
-        return self.processor(
-            text=[text],
-            images=images,
-            videos=videos,
-            padding=True,
-            do_rescale=do_rescale,
-            return_tensors="pt",
-            **sanitized_kwargs,
-        )
+        # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly
+        # validates per-modality kwargs against the processor's TypedDict.
+        # Processor *output* keys (``video_grid_thw``, ``pixel_values``, ...)
+        # round-trip into the validator via tokenizer ``init_kwargs`` /
+        # ``model_input_names`` and trip it with ``TypeError:
+        # merged_typed_dict.__init__() got an unexpected keyword argument
+        # 'video_grid_thw'``. Bypass the validator for our known output keys
+        # for the duration of the processor call.
+        with bypass_processor_output_validation():
+            return self.processor(
+                text=[text],
+                images=images,
+                videos=videos,
+                padding=True,
+                do_rescale=do_rescale,
+                return_tensors="pt",
+                **mm_processor_kwargs,
+            )
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
         masks = (input_ids == self.config.image_token_id) | (
