@@ -2929,6 +2929,7 @@ class PyExecutor:
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
                     scheduled_batch, can_forward)
                 if should_retry:
+                    self._revert_gen_alloc(scheduled_batch)
                     continue
 
                 if not self._is_kv_manager_v2:
@@ -3328,6 +3329,7 @@ class PyExecutor:
                 can_forward, should_retry = self._check_benchmark_disagg_gate(
                     scheduled_batch, can_forward)
                 if should_retry:
+                    self._revert_gen_alloc(scheduled_batch)
                     continue
 
                 if not self._is_kv_manager_v2:
@@ -3505,7 +3507,8 @@ class PyExecutor:
                     # blocks freed by this chunk are visible to the next
                     # iteration's scheduler.
                     # Only applies to KV cache manager V2 + scheduler V2.
-                    if self._scheduler_manages_kv_suspend:
+                    if (self._scheduler_manages_kv_suspend
+                            and scheduled_batch.context_requests):
                         self.kv_cache_manager.update_context_resources(
                             scheduled_batch)
 
