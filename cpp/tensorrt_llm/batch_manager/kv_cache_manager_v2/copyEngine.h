@@ -173,7 +173,8 @@ public:
 
     // Transfer num_bytes per task. tasks must all share the same (dstTier, srcTier).
     // stream: the CUDA stream on which GPU ops are enqueued.
-    void transfer(CacheTier dstTier, CacheTier srcTier, size_t numBytes, std::vector<CopyTask> tasks, CUstream stream);
+    void transfer(
+        CacheTier dstTier, CacheTier srcTier, size_t numBytes, std::vector<CopyTask> const& tasks, CUstream stream);
 
     void close() noexcept
     {
