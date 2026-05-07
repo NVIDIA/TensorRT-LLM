@@ -29,6 +29,27 @@ from tensorrt_llm._utils import get_sm_version
 from .softplus import softplus
 
 
+# Lazy global allocator for Triton TMA tensor descriptors.  Required by any
+# host- or device-built tensor_descriptor; without it Triton raises at first
+# launch.  See TMA backlog item #17 / scratch experiment notes.
+_TMA_ALLOCATOR_SET = False
+
+
+def _ensure_tma_allocator() -> None:
+    global _TMA_ALLOCATOR_SET
+    if _TMA_ALLOCATOR_SET:
+        return
+
+    def _alloc_fn(size, alignment, stream):
+        # Triton expects an int8 buffer of `size` bytes; alignment is enforced
+        # by the allocator returning a buffer satisfying it (PyTorch's
+        # cudaMalloc-backed tensors are 256B-aligned, so we're fine).
+        return torch.empty(size, device="cuda", dtype=torch.int8)
+
+    triton.set_allocator(_alloc_fn)
+    _TMA_ALLOCATOR_SET = True
+
+
 @triton.jit
 def _stochastic_round_fp16x2(x: tl.tensor, rand: tl.tensor) -> tl.tensor:
     """Stochastic rounding: fp32 pair → fp16x2 using Philox random bits.
@@ -739,6 +760,10 @@ def _rectangle_precompute_kernel(
 def _checkpointing_main_kernel(
     # Pointers
     state_ptr,
+    # state_desc_ptr: TMA tensor_descriptor over state's flat 2D view, or
+    # the same `state_ptr` tensor when neither USE_TMA_STATE_LOAD nor
+    # USE_TMA_STATE_STORE is enabled (kernel ignores it via constexpr).
+    state_desc_ptr,
     # Per-(cache, head, dim) decode scale, fp32, only consulted when QUANT_MAX>0.
     # Layout (cache, nheads, dim) — broadcast over dstate at load/store.
     state_scales_ptr,
@@ -854,6 +879,12 @@ def _checkpointing_main_kernel(
                                       # The rectangle non-checkpoint path is implemented in
                                       # _rectangle_main_kernel (separate kernel pair, picked by
                                       # the wrapper via rectangle_for_nowrite=True).
+    # TMA toggles (independent).  When True, state_ptr is a host-built
+    # tensor_descriptor over a flat (cache_size*nheads*dim, dstate) view of
+    # state; otherwise it's a regular state pointer.  The two flags share
+    # state_ptr — caller must pass a descriptor if either is True.
+    USE_TMA_STATE_LOAD: tl.constexpr = False,
+    USE_TMA_STATE_STORE: tl.constexpr = False,
 ):
     # Compile-time invariant: QUANT_MAX > 0 must coincide with a quantized
     # state dtype (int8 / int16 / float8e4nv) and only those.  Cheap
@@ -902,13 +933,29 @@ def _checkpointing_main_kernel(
     n_mask = offs_n < dstate
     t_mask = offs_t < T
 
-    # Load state
-    state_ptr += cache_batch_idx * stride_state_batch + pid_h * stride_state_head
-    state_ptrs = (
-        state_ptr + offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
-    )
+    # Load state.
+    # When TMA load is enabled, state_ptr is a host-built tensor_descriptor
+    # over a flat (cache*nheads*dim, dstate) view of state; otherwise it's
+    # a raw pointer.  Same descriptor is reused for the WC=True store path.
     state_mask = m_mask[:, None] & n_mask[None, :]
-    state = tl.load(state_ptrs, mask=state_mask, other=0.0).to(tl.float32)
+    if USE_TMA_STATE_LOAD or USE_TMA_STATE_STORE:
+        # offs_y = (c * stride_state_batch + h * stride_state_head + m * stride_state_dim) / stride_state_dim
+        offs_y = (
+            cache_batch_idx.to(tl.int32) * (stride_state_batch // stride_state_dim).to(tl.int32)
+            + pid_h * dim
+            + pid_m * BLOCK_SIZE_M
+        )
+    # state_ptrs is the raw-pointer view (used for !TMA load and !TMA store).
+    # We compute it unconditionally; it costs only int math and Triton may DCE
+    # if neither path consumes it.
+    state_ptr_raw = state_ptr + cache_batch_idx * stride_state_batch + pid_h * stride_state_head
+    state_ptrs = (
+        state_ptr_raw + offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
+    )
+    if USE_TMA_STATE_LOAD:
+        state = state_desc_ptr.load([offs_y, 0]).to(tl.float32)
+    else:
+        state = tl.load(state_ptrs, mask=state_mask, other=0.0).to(tl.float32)
     # Dequantize on load (per-(head, dim) decode scale, broadcast over dstate).
     # Only consulted when QUANT_MAX>0 — non-quantized paths skip entirely.
     if QUANT_MAX > 0.0:
@@ -1051,11 +1098,11 @@ def _checkpointing_main_kernel(
             if USE_RS_ROUNDING and (state_ptrs.dtype.element_ty == tl.float8e4nv):
                 # fp8_e4m3fn + SR — PTX cvt.rs.satfinite.e4m3x4.f32.  Output
                 # is final fp8 (saturate included); store directly.
-                tl.store(
-                    state_ptrs,
-                    _stochastic_round_fp8x4_e4m3(state_q, rand),
-                    mask=state_mask,
-                )
+                _state_q_fp8sr = _stochastic_round_fp8x4_e4m3(state_q, rand)
+                if USE_TMA_STATE_STORE:
+                    state_desc_ptr.store([offs_y, 0], _state_q_fp8sr)
+                else:
+                    tl.store(state_ptrs, _state_q_fp8sr, mask=state_mask)
             else:
                 if USE_RS_ROUNDING:
                     # int8 / int16 + SR — uniform-noise + floor.
@@ -1083,11 +1130,11 @@ def _checkpointing_main_kernel(
                 # fp8 RN reaches here without prior round() — .to(float8e4nv)
                 # does native RN at the fp8 grid.
                 state_q = tl.minimum(tl.maximum(state_q, -QUANT_MAX), QUANT_MAX)
-                tl.store(
-                    state_ptrs,
-                    state_q.to(state_ptrs.dtype.element_ty),
-                    mask=state_mask,
-                )
+                _state_q_cast = state_q.to(state_ptrs.dtype.element_ty)
+                if USE_TMA_STATE_STORE:
+                    state_desc_ptr.store([offs_y, 0], _state_q_cast)
+                else:
+                    tl.store(state_ptrs, _state_q_cast, mask=state_mask)
         elif USE_RS_ROUNDING:
             # Non-quantized + SR: only fp16 (bf16 has no PTX SR cast; fp32
             # doesn't need rounding).
@@ -1095,10 +1142,18 @@ def _checkpointing_main_kernel(
                 state_ptrs.dtype.element_ty == tl.float16,
                 "Non-quantized SR only supports fp16 state.",
             )
-            tl.store(state_ptrs, _stochastic_round_fp16x2(state, rand), mask=state_mask)
+            _state_sr = _stochastic_round_fp16x2(state, rand)
+            if USE_TMA_STATE_STORE:
+                state_desc_ptr.store([offs_y, 0], _state_sr)
+            else:
+                tl.store(state_ptrs, _state_sr, mask=state_mask)
         else:
             # Non-quantized + RN: fp16 / bf16 / fp32 native cast.
-            tl.store(state_ptrs, state.to(state_ptrs.dtype.element_ty), mask=state_mask)
+            _state_cast = state.to(state_ptrs.dtype.element_ty)
+            if USE_TMA_STATE_STORE:
+                state_desc_ptr.store([offs_y, 0], _state_cast)
+            else:
+                tl.store(state_ptrs, _state_cast, mask=state_mask)
 
     # Phase 2: Output using precomputed CB_scaled and decay_vec
     x_ptr += pid_b * stride_x_batch + pid_h * stride_x_head
@@ -1281,6 +1336,7 @@ def _rectangle_main_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
     QUANT_MAX: tl.constexpr,
+    USE_TMA_STATE: tl.constexpr = False,
 ):
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
@@ -1317,14 +1373,40 @@ def _rectangle_main_kernel(
     is_new_k = (k_new_idx >= 0) & (k_new_idx < T)
     safe_k_new = tl.where(is_new_k, k_new_idx, 0)
 
-    # Load state (with dequant on load if quantized).  Read-only — no HBM
-    # write on the nowrite path.
-    state_ptr += cache_batch_idx * stride_state_batch + pid_h * stride_state_head
-    state_ptrs = (
-        state_ptr + offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
-    )
-    state_mask = m_mask[:, None] & n_mask[None, :]
-    state = tl.load(state_ptrs, mask=state_mask, other=0.0).to(tl.float32)
+    # Load state.  Read-only — no HBM write on the nowrite path.
+    # Quant scale hoist (backlog #16): for QUANT_MAX > 0 paths, defer the
+    # `* decode_scale` to AFTER the C @ state dot — applied to the (T, M)
+    # dot output instead of broadcast-multiplied into the (M, dstate) state
+    # tile.  Algebra-equivalent (decode_scale is per-M, commutes with the
+    # matmul over dstate).  Saves M·dstate fp32 muls (replaced by T·M),
+    # but the bigger potential win is shorter register lifetime for state
+    # (kept as native int8/int16/fp8 until just before the dot, where Triton
+    # casts to bf16 — vs current fp32 tile across the whole kernel).  Only
+    # applies in rectangle main (no `state += dot` here).
+    if USE_TMA_STATE:
+        # TMA descriptor (host-built, passed via state_ptr as a
+        # tensor_descriptor) over the flat 2D view of state:
+        # shape=[cache_size * nheads * dim, dstate], strides=[dstate, 1].
+        # Convert (cache, head, m) → flat row index using existing strides:
+        # rows-per-cache-slot = stride_state_batch / stride_state_dim
+        # rows-per-head        = stride_state_head / stride_state_dim = dim (constexpr)
+        # rows-per-m           = 1
+        # Diagnostic: prior in-kernel descriptor attempts emitted
+        # ttng.tensormap_create setup (divergent shared-mem write) which
+        # blows up branch count; host-built descriptors avoid that.
+        offs_y = (
+            cache_batch_idx.to(tl.int32) * (stride_state_batch // stride_state_dim).to(tl.int32)
+            + pid_h * dim
+            + pid_m * BLOCK_SIZE_M
+        )
+        state = state_ptr.load([offs_y, 0])
+    else:
+        state_ptr_local = state_ptr + cache_batch_idx * stride_state_batch + pid_h * stride_state_head
+        state_ptrs = (
+            state_ptr_local + offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
+        )
+        state_mask = m_mask[:, None] & n_mask[None, :]
+        state = tl.load(state_ptrs, mask=state_mask, other=0.0)
     if QUANT_MAX > 0.0:
         state_scales_base = (
             state_scales_ptr
@@ -1335,7 +1417,9 @@ def _rectangle_main_kernel(
             state_scales_base + offs_m * stride_state_scales_dim,
             mask=m_mask, other=1.0,
         ).to(tl.float32)
-        state = state * decode_scale[:, None]
+        # state stays in native quant dtype — cast happens inside the dot below.
+    else:
+        state = state.to(tl.float32)
 
     # Group / pointer offset setup
     group_idx = pid_h // nheads_ngroups_ratio
@@ -1419,10 +1503,16 @@ def _rectangle_main_kernel(
     # state_out: state_prev contribution to output, with decay folded post-matmul.
     # No state_prev_decayed (M, dstate) materialization — state is consumed
     # directly by the matmul, then decay_vec_full multiplies the (T, M) result.
+    # For QUANT_MAX > 0 (#16 hoist): decode_scale also applies post-matmul
+    # at (T, M) granularity instead of pre-multiplied into the (M, dstate)
+    # state tile.  Triton's tl.dot(a.to(bf16), b.to(bf16)) handles the
+    # int8/fp8 → bf16 cast inside the dot's input prep.
     state_out = (
         tl.dot(C_all.to(tl.bfloat16), tl.trans(state).to(tl.bfloat16))
         * decay_vec_full[:, None]
     )
+    if QUANT_MAX > 0.0:
+        state_out = state_out * decode_scale[None, :]
 
     # token_out: combined old + new tokens contribution via the rectangle.
     token_out = tl.dot(CB_scaled.to(tl.bfloat16), x_combined.to(tl.bfloat16))
@@ -1490,6 +1580,9 @@ def checkpointing_state_update(
     _heads_per_block: int | None = None,
     _maxnreg: int | None = None,
     _num_ctas: int | None = None,
+    _use_tma_state: bool = False,
+    _use_tma_state_load_replay: bool = False,
+    _use_tma_state_store_replay: bool = False,
 ):
     """
     Replay SSM state update with precomputed CB and tl.dot fast-forward.
@@ -1844,6 +1937,38 @@ def checkpointing_state_update(
             state_scales_arg = state  # any valid ptr — gated by QUANT_MAX==0
             state_scales_strides = (0, 0, 0)
 
+        # TMA descriptor for state (rectangle path only, currently).  Built
+        # host-side over a flat 2D view of state — shape (cache*nheads*dim,
+        # dstate), inner stride 1.  Triton's set_allocator() must be called
+        # before any descriptor-using kernel launches.
+        if _use_tma_state and use_rectangle:
+            from triton.tools.tensor_descriptor import TensorDescriptor
+            _ensure_tma_allocator()
+            assert state.is_contiguous(), "TMA state load requires contiguous state"
+            assert state.stride(-1) == 1, "TMA state load requires inner stride 1"
+            state_for_kernel = TensorDescriptor.from_tensor(
+                state.view(-1, state.shape[-1]),
+                block_shape=[BLOCK_SIZE_M, triton.next_power_of_2(dstate)],
+            )
+        else:
+            state_for_kernel = state
+
+        # Replay-main TMA descriptor: built once if either load or store TMA
+        # is enabled.  Same flat 2D view as rectangle.  Passed as the
+        # state_desc_ptr arg; raw `state` tensor is still passed as state_ptr
+        # for the !TMA paths (kernel branches via constexpr).
+        if (_use_tma_state_load_replay or _use_tma_state_store_replay) and not use_rectangle:
+            from triton.tools.tensor_descriptor import TensorDescriptor
+            _ensure_tma_allocator()
+            assert state.is_contiguous(), "TMA state load/store requires contiguous state"
+            assert state.stride(-1) == 1, "TMA state load/store requires inner stride 1"
+            state_desc_replay = TensorDescriptor.from_tensor(
+                state.view(-1, state.shape[-1]),
+                block_shape=[BLOCK_SIZE_M, triton.next_power_of_2(dstate)],
+            )
+        else:
+            state_desc_replay = state  # dummy; kernel ignores via constexpr
+
         if use_rectangle:
             _rectangle_precompute_kernel[(batch, nheads // heads_per_block)](
                 dt,
@@ -1919,7 +2044,7 @@ def checkpointing_state_update(
                 return (triton.cdiv(dim, META["BLOCK_SIZE_M"]), batch, nheads)
 
             _rectangle_main_kernel[grid](
-                state,
+                state_for_kernel,
                 state_scales_arg,
                 old_x,
                 prev_num_accepted_tokens,
@@ -1986,6 +2111,7 @@ def checkpointing_state_update(
                 BLOCK_SIZE_M,
                 LAUNCH_WITH_PDL=use_internal_pdl,
                 QUANT_MAX=quant_max,
+                USE_TMA_STATE=bool(_use_tma_state),
                 num_warps=num_warps,
                 **({"num_stages": _num_stages} if _num_stages else {}),
                 **({"num_ctas": _num_ctas} if _num_ctas else {}),
@@ -2070,6 +2196,7 @@ def checkpointing_state_update(
 
         _checkpointing_main_kernel[grid](
             state,
+            state_desc_replay,
             state_scales_arg,
             old_x,
             old_B,
@@ -2158,6 +2285,8 @@ def checkpointing_state_update(
             PHILOX_ROUNDS=philox_rounds if rand_seed is not None else 0,
             QUANT_MAX=quant_max,
             WRITE_CHECKPOINT=write_checkpoint,
+            USE_TMA_STATE_LOAD=bool(_use_tma_state_load_replay),
+            USE_TMA_STATE_STORE=bool(_use_tma_state_store_replay and write_checkpoint),
             num_warps=num_warps,
             **({"num_stages": _num_stages} if _num_stages else {}),
             **({"num_ctas": _num_ctas} if _num_ctas else {}),

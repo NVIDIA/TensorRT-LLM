@@ -891,6 +891,12 @@ def _bench_config(
                     extra_kwargs["rectangle_for_nowrite"] = rectangle_for_nowrite
                     if state_scales_work is not None:
                         extra_kwargs["state_scales"] = state_scales_work
+                    if getattr(args, "use_tma_state", False):
+                        extra_kwargs["_use_tma_state"] = True
+                    if getattr(args, "use_tma_state_load_replay", False):
+                        extra_kwargs["_use_tma_state_load_replay"] = True
+                    if getattr(args, "use_tma_state_store_replay", False):
+                        extra_kwargs["_use_tma_state_store_replay"] = True
                 variant_fn(
                     state_work,
                     old_x_work,
@@ -1321,6 +1327,26 @@ def _parse_args() -> argparse.Namespace:
         "compare in one invocation.  Silently no-op for write cells (the "
         "write path always uses replay-style).  Only applies to the "
         "checkpointing variant.",
+    )
+    parser.add_argument(
+        "--use-tma-state",
+        action="store_true",
+        help="Use TMA (host-built tensor descriptor) for the state load in "
+        "_rectangle_main_kernel.  Only applies to the rectangle nowrite path "
+        "of the checkpointing variant; ignored otherwise.",
+    )
+    parser.add_argument(
+        "--use-tma-state-load-replay",
+        action="store_true",
+        help="Use TMA for state LOAD in _checkpointing_main_kernel (replay "
+        "main, both WC=0 and WC=1 paths).  Independent from rect TMA.",
+    )
+    parser.add_argument(
+        "--use-tma-state-store-replay",
+        action="store_true",
+        help="Use TMA for state STORE in _checkpointing_main_kernel (replay "
+        "main, WC=1 path only — no-op for WC=0).  Independent from rect TMA "
+        "and from --use-tma-state-load-replay.",
     )
     parser.add_argument(
         "--philox-rounding",
