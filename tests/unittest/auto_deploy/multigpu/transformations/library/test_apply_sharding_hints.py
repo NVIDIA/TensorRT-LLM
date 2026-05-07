@@ -33,7 +33,12 @@ import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 import tensorrt_llm._torch.auto_deploy.transform.library  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig
+from tensorrt_llm._torch.auto_deploy.models.quant_checkpoint_layout import QuantizedCheckpointLayout
+from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig, Stages
+from tensorrt_llm._torch.auto_deploy.transform.library.mxfp4_moe import (
+    InsertMXFP4MLP,
+    MXFP4MLPConfig,
+)
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import _get_dist_ops
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.dist_config import DistConfig
@@ -733,6 +738,30 @@ def _make_deepseek_flat_mxfp4_routing_graph(base_op, layer=3, num_experts=4):
     return gm, expert_targets, hidden_size, intermediate_size
 
 
+class _MXFP4CheckpointLayoutFactory:
+    def __init__(self, checkpoint_layout):
+        self._checkpoint_layout = checkpoint_layout
+
+    def get_quant_config(self):
+        return {
+            "checkpoint_layout": QuantizedCheckpointLayout(
+                checkpoint_consumers=(self._checkpoint_layout,)
+            )
+        }
+
+
+def _register_mxfp4_checkpoint_layout_hooks(gm, checkpoint_layout):
+    transform = InsertMXFP4MLP(MXFP4MLPConfig(stage=Stages.PATTERN_MATCHER))
+    gm, info = transform._apply(
+        gm,
+        None,
+        _MXFP4CheckpointLayoutFactory(checkpoint_layout),
+        None,
+    )
+    assert info.num_matches == 1
+    return gm
+
+
 def _make_deepseek_mxfp4_raw_state(layer, num_experts, hidden_size, intermediate_size):
     def key(expert, projection, kind):
         return f"layers.{layer}.ffn.experts.{expert}.{projection}.{kind}"
@@ -845,7 +874,6 @@ def test_stacked_mxfp4_non_attr_expert_args_keep_runtime_slices():
 def test_stacked_mxfp4_rank1_deepseek_graph_pack_loads_high_expert_slice():
     """DeepSeek graph packing emits full buffers before sharding hooks split rank 1."""
     from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
-        DeepseekV4PreTrainedModel,
         build_deepseek_v4_packed_mxfp4_experts_layout,
     )
 
@@ -860,14 +888,6 @@ def test_stacked_mxfp4_rank1_deepseek_graph_pack_loads_high_expert_slice():
     gm, expert_targets, hidden_size, intermediate_size = _make_deepseek_graph_mxfp4_graph(
         base_op, layer=layer, num_experts=num_experts
     )
-
-    def pack_graph_buffers(state_dict, prefix, *args):
-        del args
-        if prefix:
-            return
-        DeepseekV4PreTrainedModel._load_graph_mxfp4_runtime_buffers(gm, state_dict)
-
-    gm._register_load_state_dict_pre_hook(pack_graph_buffers)
     raw_expert_state = _make_deepseek_mxfp4_raw_state(
         layer, num_experts, hidden_size, intermediate_size
     )
@@ -888,6 +908,7 @@ def test_stacked_mxfp4_rank1_deepseek_graph_pack_loads_high_expert_slice():
         num_experts=num_experts,
     )
 
+    gm = _register_mxfp4_checkpoint_layout_hooks(gm, layout)
     gm_out = _make_optimizer(world_size=world_size, rank=rank)(None, gm)
     experts = gm_out.get_submodule(f"layers.{layer}.ffn.experts")
     assert experts.gate_up_proj_blocks.shape[0] == num_experts // world_size
@@ -919,7 +940,6 @@ def test_stacked_mxfp4_rank1_deepseek_graph_pack_loads_high_expert_slice():
 def test_stacked_mxfp4_rank1_deepseek_flat_graph_pack_loads_high_expert_slice():
     """Root FX buffers are packed before sharding hooks split rank 1."""
     from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
-        DeepseekV4PreTrainedModel,
         build_deepseek_v4_packed_mxfp4_experts_layout,
     )
 
@@ -947,31 +967,7 @@ def test_stacked_mxfp4_rank1_deepseek_flat_graph_pack_loads_high_expert_slice():
         num_experts=num_experts,
     )
 
-    direct_state = {name: tensor.clone() for name, tensor in raw_expert_state.items()}
-    DeepseekV4PreTrainedModel._load_graph_mxfp4_runtime_buffers(gm, direct_state)
-    for target in expert_targets.values():
-        assert target in direct_state
-    dotted_targets = {
-        "gate_up_blocks": f"layers.{layer}.ffn.experts.gate_up_proj_blocks",
-        "gate_up_scales": f"layers.{layer}.ffn.experts.gate_up_proj_scales",
-        "down_blocks": f"layers.{layer}.ffn.experts.down_proj_blocks",
-        "down_scales": f"layers.{layer}.ffn.experts.down_proj_scales",
-    }
-    for target in dotted_targets.values():
-        assert target not in direct_state
-    assert not any(name in direct_state for name in raw_expert_state)
-    assert torch.equal(direct_state[expert_targets["gate_up_blocks"]], expected_full.gate_up_blocks)
-    assert torch.equal(direct_state[expert_targets["gate_up_scales"]], expected_full.gate_up_scales)
-    assert torch.equal(direct_state[expert_targets["down_blocks"]], expected_full.down_blocks)
-    assert torch.equal(direct_state[expert_targets["down_scales"]], expected_full.down_scales)
-
-    def pack_graph_buffers(state_dict, prefix, *args):
-        del args
-        if prefix:
-            return
-        DeepseekV4PreTrainedModel._load_graph_mxfp4_runtime_buffers(gm, state_dict)
-
-    gm._register_load_state_dict_pre_hook(pack_graph_buffers)
+    gm = _register_mxfp4_checkpoint_layout_hooks(gm, layout)
     checkpoint = {
         "selected_experts": gm.selected_experts.clone(),
         "routing_weights": gm.routing_weights.clone(),
@@ -1012,7 +1008,6 @@ def test_stacked_mxfp4_rank1_deepseek_flat_graph_pack_loads_high_expert_slice():
 def test_stacked_mxfp4_deepseek_flat_graph_loads_production_shaped_rank7_slice():
     """Root FX buffers load the final EP slice for 256-expert routing-driven graphs."""
     from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
-        DeepseekV4PreTrainedModel,
         build_deepseek_v4_packed_mxfp4_experts_layout,
     )
 
@@ -1040,13 +1035,7 @@ def test_stacked_mxfp4_deepseek_flat_graph_loads_production_shaped_rank7_slice()
         num_experts=num_experts,
     )
 
-    def pack_graph_buffers(state_dict, prefix, *args):
-        del args
-        if prefix:
-            return
-        DeepseekV4PreTrainedModel._load_graph_mxfp4_runtime_buffers(gm, state_dict)
-
-    gm._register_load_state_dict_pre_hook(pack_graph_buffers)
+    gm = _register_mxfp4_checkpoint_layout_hooks(gm, layout)
     checkpoint = {
         "selected_experts": gm.selected_experts.clone(),
         "routing_weights": gm.routing_weights.clone(),

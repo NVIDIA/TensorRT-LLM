@@ -918,8 +918,8 @@ class AttentionSinkShardableNode(ShardableNode):
         return False
 
 
-class DeepSeekV4AttentionSinkShardableNode(ShardableNode):
-    """DeepSeek V4 sparse attention: shard only the per-head sink tensor."""
+class AttentionSinkArgShardableNode(ShardableNode):
+    """Attention op with an ``attn_sink`` argument: shard only the per-head sink tensor."""
 
     def apply(self, gm: GraphModule, dc: DistConfig, max_num_tokens: int = 0) -> int:
         if dc.tp_size <= 1:
@@ -947,7 +947,7 @@ class DeepSeekV4AttentionSinkShardableNode(ShardableNode):
             count += 1
 
         if count:
-            ad_logger.debug(f"  sharded {count} DeepSeek V4 attention sink tensor(s)")
+            ad_logger.debug(f"  sharded {count} attention sink tensor(s)")
         return 1 if count > 0 else 0
 
 
@@ -959,7 +959,7 @@ for _sparse_attention_op_name in (
 ):
     try:
         ShardableNode.register(getattr(torch.ops.auto_deploy, _sparse_attention_op_name))(
-            DeepSeekV4AttentionSinkShardableNode
+            AttentionSinkArgShardableNode
         )
     except AttributeError:
         pass
@@ -1540,12 +1540,7 @@ def _register_stacked_mxfp4_moe_variant(base_name: str, ep_name: str) -> None:
 for _base_name, _ep_name in (
     ("triton_mxfp4_moe", "triton_mxfp4_moe_ep"),
     ("torch_mxfp4_moe", "torch_mxfp4_moe_ep"),
-    ("triton_mxfp4_moe_from_routing", "triton_mxfp4_moe_from_routing_ep"),
     ("torch_mxfp4_moe_from_routing", "torch_mxfp4_moe_from_routing_ep"),
-    ("triton_mxfp4_moe_routing", "triton_mxfp4_moe_routing_ep"),
-    ("torch_mxfp4_moe_routing", "torch_mxfp4_moe_routing_ep"),
-    ("triton_mxfp4_moe_with_routing", "triton_mxfp4_moe_with_routing_ep"),
-    ("torch_mxfp4_moe_with_routing", "torch_mxfp4_moe_with_routing_ep"),
 ):
     _register_stacked_mxfp4_moe_variant(_base_name, _ep_name)
 

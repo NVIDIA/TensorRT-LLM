@@ -243,6 +243,8 @@ def _load_mxfp4_expert_layout_hook(
     hidden_size: int,
     intermediate_size: int,
 ) -> None:
+    if prefix + target_names["gate_up_blocks"] in state_dict:
+        return
     load_packed_mxfp4_expert_tensors(
         state_dict,
         prefix,

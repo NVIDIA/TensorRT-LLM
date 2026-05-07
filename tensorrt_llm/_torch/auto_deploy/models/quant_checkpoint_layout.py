@@ -22,7 +22,7 @@ import math
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TypeAlias
+from typing import Protocol, TypeAlias, runtime_checkable
 
 import torch
 
@@ -34,6 +34,35 @@ _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", None)
 
 class QuantizedCheckpointLayoutError(ValueError):
     """Raised when a quantized checkpoint layout cannot consume checkpoint tensors."""
+
+
+@runtime_checkable
+class PackedMXFP4ExpertCheckpointLayout(Protocol):
+    """Consumer contract for packed MXFP4 expert tensors in checkpoint layouts."""
+
+    quant_method: str
+
+    def layer_from_runtime_name(self, name: str) -> int | None:
+        """Return the checkpoint layer index encoded in a runtime buffer name, if present."""
+        ...
+
+    def load_runtime_buffers(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        *,
+        layer: int,
+        hidden_size: int,
+        intermediate_size: int,
+        target_gate_up_blocks: str,
+        target_gate_up_scales: str,
+        target_down_blocks: str,
+        target_down_scales: str,
+        expert_indices: Sequence[int] | None = None,
+        num_experts: int | None = None,
+    ) -> None:
+        """Pack checkpoint tensors into runtime MXFP4 expert buffers."""
+        ...
 
 
 class QuantCheckpointLayoutRegistry:

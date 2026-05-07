@@ -45,6 +45,7 @@ from ..hf import AutoModelForCausalLMFactory
 from ..quant_checkpoint_layout import (
     CheckpointMetadata,
     FineGrainedFP8CheckpointLayout,
+    PackedMXFP4ExpertCheckpointLayout,
     QuantCheckpointLayoutRegistry,
     QuantizedCheckpointLayout,
     QuantizedCheckpointLayoutError,
@@ -212,12 +213,6 @@ _DEEPSEEK_V4_MXFP4_LAYER_NAME_RE = re.compile(r"(?:^|[._])layers[._](?P<layer>\d
 _DEEPSEEK_V4_MXFP4_PROJECTIONS = ("w1", "w2", "w3")
 _DEEPSEEK_V4_MXFP4_GATE_UP_ORDER = ("w3", "w1")
 _DEEPSEEK_V4_MXFP4_DOWN_PROJECTION = "w2"
-DEEPSEEK_V4_MXFP4_RUNTIME_BUFFER_SUFFIXES = (
-    "gate_up_proj_blocks",
-    "gate_up_proj_scales",
-    "down_proj_blocks",
-    "down_proj_scales",
-)
 
 
 @dataclass(frozen=True)
@@ -244,7 +239,7 @@ class DeepseekV4PackedMxfp4Experts:
 
 
 @dataclass(frozen=True)
-class DeepseekV4PackedMxfp4ExpertsCheckpointLayout:
+class DeepseekV4PackedMxfp4ExpertsCheckpointLayout(PackedMXFP4ExpertCheckpointLayout):
     """Checkpoint layout for DeepSeek V4 packed MXFP4 routed expert tensors."""
 
     expert_block_size: ClassVar[int] = 32
@@ -2067,63 +2062,6 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
         self.register_load_state_dict_pre_hook(self._remap_load_state_hook)
 
     @staticmethod
-    def _load_graph_mxfp4_runtime_buffers(
-        module: nn.Module,
-        state_dict: dict[str, torch.Tensor],
-    ) -> None:
-        layout = build_deepseek_v4_packed_mxfp4_experts_layout()
-        buffer_groups: dict[str, dict[str, torch.Tensor]] = {}
-        for buffer_name, tensor in module.named_buffers():
-            for suffix in DEEPSEEK_V4_MXFP4_RUNTIME_BUFFER_SUFFIXES:
-                if not buffer_name.endswith(suffix):
-                    continue
-                target_prefix = buffer_name[: -len(suffix)]
-                buffer_groups.setdefault(target_prefix, {})[suffix] = tensor
-
-        for target_prefix, buffers in buffer_groups.items():
-            gate_up_blocks = buffers.get("gate_up_proj_blocks")
-            gate_up_scales = buffers.get("gate_up_proj_scales")
-            down_blocks = buffers.get("down_proj_blocks")
-            down_scales = buffers.get("down_proj_scales")
-            if not all(
-                isinstance(tensor, torch.Tensor)
-                for tensor in (gate_up_blocks, gate_up_scales, down_blocks, down_scales)
-            ):
-                continue
-            if gate_up_blocks.dim() < 4 or gate_up_scales.dim() < 3:
-                continue
-            if down_blocks.dim() < 4 or down_scales.dim() < 3:
-                continue
-
-            target_gate_up_blocks = f"{target_prefix}gate_up_proj_blocks"
-            layer = layout.layer_from_runtime_name(target_gate_up_blocks)
-            if layer is None:
-                continue
-            if target_gate_up_blocks in state_dict:
-                continue
-            max_expert = -1
-            for key in state_dict:
-                parsed = layout.parse_key(key)
-                if parsed is not None and parsed.layer == layer:
-                    max_expert = max(max_expert, parsed.expert)
-            if max_expert < 0:
-                continue
-            num_experts = max_expert + 1
-
-            layout.load_runtime_buffers(
-                state_dict,
-                "",
-                layer=layer,
-                hidden_size=int(down_blocks.shape[1]),
-                intermediate_size=int(gate_up_blocks.shape[1] // 2),
-                target_gate_up_blocks=target_gate_up_blocks,
-                target_gate_up_scales=f"{target_prefix}gate_up_proj_scales",
-                target_down_blocks=f"{target_prefix}down_proj_blocks",
-                target_down_scales=f"{target_prefix}down_proj_scales",
-                num_experts=num_experts,
-            )
-
-    @staticmethod
     def _remap_load_state_hook(
         module: nn.Module,
         state_dict: dict[str, torch.Tensor],
@@ -2144,7 +2082,6 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
                 continue
             seen.add(submodule_id)
             load_mxfp4_runtime_buffers(state_dict)
-        DeepseekV4PreTrainedModel._load_graph_mxfp4_runtime_buffers(module, state_dict)
 
     def _init_weights(self, module: nn.Module) -> None:
         std = getattr(self.config, "initializer_range", 0.02)

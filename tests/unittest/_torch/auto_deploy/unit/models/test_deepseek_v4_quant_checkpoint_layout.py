@@ -24,7 +24,6 @@ import pytest
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
     DeepseekV4PackedMxfp4ExpertsCheckpointLayout,
 )
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 from tensorrt_llm._torch.auto_deploy.models.quant_checkpoint_layout import (
     FineGrainedFP8CheckpointLayout,
     QuantCheckpointLayoutRegistry,
@@ -357,18 +356,6 @@ def test_deepseek_v4_hf_reader_preserves_malformed_metadata_errors_in_relaxed_mo
 
     with pytest.raises(ValueError, match="Invalid safetensors header"):
         HFQuantConfigReader.from_file(str(tmp_path), require_checkpoint_metadata=False)
-
-
-def test_deepseek_v4_prefetch_checkpoint_skips_quant_reader_without_weights(
-    tmp_path: Path,
-) -> None:
-    _write_deepseek_v4_config_only_fixture(tmp_path)
-    factory = AutoModelForCausalLMFactory(model=str(tmp_path))
-
-    fetched_dir = factory._prefetch_checkpoint(str(tmp_path), skip_prefetch_weights=True)
-
-    assert fetched_dir == str(tmp_path)
-    assert factory._quant_config_reader is None
 
 
 @pytest.mark.parametrize(

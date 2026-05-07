@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
-import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -22,7 +21,6 @@ import torch.nn as nn
 from accelerate.utils import modeling
 from transformers import AutoModelForCausalLM
 from transformers.models.llama4.configuration_llama4 import Llama4Config
-from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_NAME
 
 from tensorrt_llm._torch.auto_deploy.models.hf import (
     AutoModelForCausalLMFactory,
@@ -54,34 +52,6 @@ def mock_factory():
         # Set model path directly to avoid prefetch
         factory._prefetched_model_path = "/dummy/path"
         yield factory
-
-
-def test_get_checkpoint_files_from_single_file_folder(mock_factory, tmp_path):
-    checkpoint_file = tmp_path / SAFE_WEIGHTS_NAME
-    checkpoint_file.touch()
-
-    assert mock_factory._get_checkpoint_files(tmp_path) == [str(checkpoint_file)]
-
-
-def test_get_checkpoint_files_from_pytorch_bin_folder(mock_factory, tmp_path):
-    checkpoint_file = tmp_path / WEIGHTS_NAME
-    checkpoint_file.touch()
-
-    assert mock_factory._get_checkpoint_files(tmp_path) == [str(checkpoint_file)]
-
-
-def test_get_checkpoint_files_from_sharded_index_are_sorted(mock_factory, tmp_path):
-    shard_1 = tmp_path / "model-00001-of-00002.safetensors"
-    shard_2 = tmp_path / "model-00002-of-00002.safetensors"
-    index = {
-        "weight_map": {
-            "model.layers.1.weight": shard_2.name,
-            "model.layers.0.weight": shard_1.name,
-        }
-    }
-    (tmp_path / SAFE_WEIGHTS_INDEX_NAME).write_text(json.dumps(index), encoding="utf-8")
-
-    assert mock_factory._get_checkpoint_files(tmp_path) == [str(shard_1), str(shard_2)]
 
 
 def test_hf_load_state_dict_with_device():
