@@ -12,802 +12,24 @@ if TYPE_CHECKING:
     from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm._torch.attention_backend import trtllm_gen
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
-from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
                      get_model_extra_attrs)
-from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
-                        AttentionMetadata, KVCacheParams, MLAParams,
-                        PositionalEmbeddingParams, PredefinedAttentionMask,
-                        RopeParams)
+from .interface import (AttentionBackend, AttentionForwardArgs,
+                        AttentionInputType, AttentionMask, AttentionMetadata,
+                        KVCacheParams, MLAParams, PositionalEmbeddingParams,
+                        PredefinedAttentionMask, RopeParams,
+                        merge_attention_forward_args)
 from .trtllm_gen import trtllm_gen_attention
 
 # Enable TRTLLM-Gen attention backend via environment variable (default: off).
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1")
-
-
-@dataclass(kw_only=True, init=False)
-class TrtllmAttentionWrapper:
-    sequence_length: torch.Tensor
-    host_past_key_value_lengths: torch.Tensor
-    host_total_kv_lens: torch.Tensor
-    context_lengths: torch.Tensor
-    host_context_lengths: torch.Tensor
-    host_request_types: torch.Tensor
-    kv_cache_block_offsets: torch.Tensor
-    host_kv_cache_pool_pointers: torch.Tensor
-    host_kv_cache_pool_mapping: torch.Tensor
-    workspace: Optional[torch.Tensor]
-    cache_indirection: Optional[torch.Tensor]
-    kv_scale_orig_quant: Optional[torch.Tensor]
-    kv_scale_quant_orig: Optional[torch.Tensor]
-    out_scale: Optional[torch.Tensor]
-    rotary_inv_freq: Optional[torch.Tensor]
-    rotary_cos_sin: Optional[torch.Tensor]
-    layer_idx: int
-    num_heads: int
-    num_kv_heads: int
-    head_size: int
-    tokens_per_block: int
-    max_num_requests: int
-    max_context_length: int
-    attention_window_size: int
-    sink_token_length: int
-    beam_width: int
-    predicted_tokens_per_seq: int
-    quant_mode: int
-    position_embedding_type: int
-    rotary_embedding_dim: int
-    rotary_embedding_base: float
-    rotary_embedding_scale_type: int
-    rotary_embedding_scale: float
-    rotary_embedding_short_m_scale: float
-    rotary_embedding_long_m_scale: float
-    rotary_embedding_max_positions: int
-    rotary_embedding_original_max_positions: int
-    use_paged_context_fmha: bool
-    is_mla_enable: bool
-    q_lora_rank: Optional[int]
-    kv_lora_rank: Optional[int]
-    qk_rope_head_dim: Optional[int]
-    qk_nope_head_dim: Optional[int]
-    v_head_dim: Optional[int]
-    chunked_prefill_buffer_batch_size: Optional[int]
-    attention_chunk_size: Optional[int]
-    softmax_stats_tensor: Optional[torch.Tensor]
-    use_spec_decoding: bool
-    is_spec_dec_tree: bool
-    spec_decoding_position_offsets: Optional[torch.Tensor]
-    spec_decoding_packed_mask: Optional[torch.Tensor]
-    spec_decoding_generation_lengths: Optional[torch.Tensor]
-    spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor]
-    spec_decoding_bl_tree_mask: Optional[torch.Tensor]
-    spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor]
-    helix_position_offsets: Optional[torch.Tensor]
-    helix_is_inactive_rank: Optional[torch.Tensor]
-    attention_input_type: Optional[torch.Tensor]
-    quant_config: Optional[QuantConfig]
-    kv_cache_manager: Optional[KVCacheManager]
-    kwargs: dict
-
-    def __init__(
-        self,
-        num_heads: int,
-        head_size: int,
-        num_kv_heads: Optional[int] = None,
-        pos_embd_params: Optional[PositionalEmbeddingParams] = None,
-        q_scaling: Optional[float] = None,
-        mla_params: Optional[MLAParams] = None,
-        attention_chunk_size: Optional[int] = None,
-        **kwargs,
-    ):
-        """
-        Initialize the attention wrapper.
-        Args:
-            num_heads (int): The number of query heads.
-            head_dim (int): The size of each attention head (hidden_size // num_heads).
-            num_kv_heads (int): The number of kv heads. Defaults to num_heads if None.
-            pos_embd_params (PositionalEmbeddingParams): Optional parameters defining how positional embedding should be applied.
-        """
-        rope_params = None
-        if pos_embd_params is not None:
-            rope_params = pos_embd_params.rope
-        rope_params = rope_params or RopeParams()
-        self.rope_params = rope_params
-
-        self.is_mla_enable = mla_params is not None
-        self.q_scaling = q_scaling or 1.0
-        self.predicted_tokens_per_seq = 1
-        self.attention_chunk_size = attention_chunk_size
-
-        if self.is_mla_enable:
-            self.q_lora_rank = mla_params.q_lora_rank
-            self.kv_lora_rank = mla_params.kv_lora_rank
-            self.qk_nope_head_dim = mla_params.qk_nope_head_dim
-            self.qk_rope_head_dim = mla_params.qk_rope_head_dim
-            self.v_head_dim = mla_params.v_head_dim
-            self.predicted_tokens_per_seq = mla_params.predicted_tokens_per_seq
-        else:
-            self.q_lora_rank = None
-            self.kv_lora_rank = None
-            self.qk_nope_head_dim = None
-            self.qk_rope_head_dim = None
-            self.v_head_dim = None
-
-        self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
-        )
-
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads or num_heads
-        self.head_size = head_size
-        self.position_embedding_type = int(
-            pos_embd_params.type) if pos_embd_params is not None else 0
-        self.rotary_embedding_dim = rope_params.dim
-        self.rotary_embedding_base = rope_params.theta
-        self.rotary_embedding_scale_type = int(rope_params.scale_type)
-        self.rotary_embedding_scale = rope_params.scale
-        self.rotary_embedding_short_m_scale = rope_params.short_m_scale
-        self.rotary_embedding_long_m_scale = rope_params.long_m_scale
-        self.rotary_embedding_max_positions = rope_params.max_positions
-        self.rotary_embedding_original_max_positions = rope_params.original_max_positions
-        self.attention_input_type = None
-        self.kwargs = {}
-        self.kwargs.update(kwargs)
-        self.skip_softmax_stat = torch.zeros(2,
-                                             dtype=torch.uint32,
-                                             device='cuda')
-        # Default disabled, but allow manual enabling through `TRTLLM_PRINT_SKIP_SOFTMAX_STAT=1`
-        self.print_skip_softmax_stat = os.environ.get(
-            "TRTLLM_PRINT_SKIP_SOFTMAX_STAT", "0") == "1"
-
-    def update_quant_config(self, quant_config: Optional[QuantConfig] = None):
-        quant_config = quant_config or QuantConfig()
-        self.quant_mode = int(quant_config.layer_quant_mode)
-
-    def ensure_rope_table_size(self, required_max_positions: int) -> None:
-        """Expand the RoPE cos/sin table if it is too small.
-
-        Both MLA-specific kernels (mla_rope_generation,
-        mla_rope_append_paged_kv_assign_q) and the generic attention path
-        (plan()->run()) may need a table that covers `required_max_positions`.
-        Call this before any kernel that reads `rotary_cos_sin`.
-        """
-        if required_max_positions > self.rope_params.max_positions:
-            self.rope_params.max_positions = required_max_positions
-            self.rotary_inv_freq, self.rotary_cos_sin = (
-                self.rope_params.create_rope_const_params())
-
-    def plan(
-        self,
-        *,
-        layer_idx: int = 0,
-        tokens_per_block: Optional[int] = None,
-        max_num_requests: int = 0,
-        max_sequence_length: int = 0,
-        max_context_length: int = 0,
-        attention_window_size: Optional[int] = None,
-        sink_token_length: int = 0,
-        beam_width: int = 1,
-        sequence_length: torch.Tensor = ...,
-        host_past_key_value_lengths: torch.Tensor = ...,
-        host_total_kv_lens: torch.Tensor = ...,
-        context_lengths: torch.Tensor = ...,
-        host_context_lengths: torch.Tensor = ...,
-        host_request_types: torch.Tensor = ...,
-        kv_cache_block_offsets: Optional[torch.Tensor] = None,
-        host_kv_cache_pool_pointers: Optional[torch.Tensor] = None,
-        host_kv_cache_pool_mapping: Optional[torch.Tensor] = None,
-        block_ids_per_seq: Optional[torch.Tensor] = None,
-        flash_mla_tile_scheduler_metadata: Optional[torch.Tensor] = None,
-        flash_mla_num_splits: Optional[torch.Tensor] = None,
-        workspace: Optional[torch.Tensor] = None,
-        cache_indirection: Optional[torch.Tensor] = None,
-        kv_scale_orig_quant: Optional[torch.Tensor] = None,
-        kv_scale_quant_orig: Optional[torch.Tensor] = None,
-        out_scale: Optional[torch.Tensor] = None,
-        out_scale_sf: Optional[torch.Tensor] = None,
-        kv_scales_sf: Optional[torch.Tensor] = None,
-        kv_scales_sf_inv: Optional[torch.Tensor] = None,
-        use_nvfp4_output: bool = False,
-        use_paged_context_fmha: bool = False,
-        attention_input_type: AttentionInputType = AttentionInputType.mixed,
-        latent_cache: Optional[torch.Tensor] = None,
-        q_pe: Optional[torch.Tensor] = None,
-        mrope_config: Optional[dict] = None,
-        softmax_stats_tensor: Optional[torch.Tensor] = None,
-        is_spec_decoding_enabled: bool = False,
-        use_spec_decoding: bool = False,
-        is_spec_dec_tree: bool = False,
-        spec_decoding_position_offsets: Optional[torch.Tensor] = None,
-        spec_decoding_packed_mask: Optional[torch.Tensor] = None,
-        spec_decoding_generation_lengths: Optional[torch.Tensor] = None,
-        spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor] = None,
-        spec_decoding_bl_tree_mask: Optional[torch.Tensor] = None,
-        spec_bl_tree_first_sparse_mask_offset_kv: Optional[torch.Tensor] = None,
-        attention_sinks: Optional[torch.Tensor] = None,
-        chunked_prefill_buffer_batch_size: int = 1,
-        sparse_kv_indices: Optional[torch.Tensor] = None,
-        sparse_kv_offsets: Optional[torch.Tensor] = None,
-        sparse_attn_indices: Optional[torch.Tensor] = None,
-        sparse_attn_offsets: Optional[torch.Tensor] = None,
-        sparse_attn_indices_block_size: int = 1,
-        num_sparse_topk: int = 0,
-        sparse_attention_config: Optional[object] = None,
-        skip_softmax_threshold_scale_factor_prefill: Optional[float] = None,
-        skip_softmax_threshold_scale_factor_decode: Optional[float] = None,
-        helix_position_offsets: Optional[torch.Tensor] = None,
-        helix_is_inactive_rank: Optional[torch.Tensor] = None,
-        sage_attn_num_elts_per_blk_q: int = 0,
-        sage_attn_num_elts_per_blk_k: int = 0,
-        sage_attn_num_elts_per_blk_v: int = 0,
-        sage_attn_qk_int8: bool = False,
-        quant_config: Optional[QuantConfig] = None,
-        kv_cache_manager: Optional[KVCacheManager] = None,
-        **kwargs,
-    ):
-        """
-        Plan the attention operation.
-        Call this method without arguments can reset the planned states.
-        For required arguments, can use ellipsis (...) as default value to represent invalid states.
-        Args:
-            layer_idx (int): The index of the attention layer in the model.
-            tokens_per_block (int): Token number per KV cache block.
-            max_num_requests (int): Max request number per batch.
-            max_sequence_length (int): Max sequence length.
-            max_context_length (int): Max context length per context-phase sequence.
-            attention_window_size (int): Max token number attended in windowed attention.
-            sink_token_length (int): Sink token number in StreamingLLM.
-            beam_width (int): Beam width in beam search.
-            sequence_length (torch.Tensor): The length of each sequence with shape (batch_size) on GPU.
-            host_past_key_value_lengths (torch.Tensor): Same as sequence_length, but on CPU.
-            host_total_kv_lens (torch.Tensor): The tensor to store the total KV lens for context requests and generation requests, with shape (2) on CPU.
-            context_lengths (torch.Tensor): The context-phase sequence length of each request with shape (batch_size) on GPU.
-            host_context_lengths (torch.Tensor): Same as context_lengths, but on CPU.
-            host_request_types (torch.Tensor): The tensor that indicates whether a request is in context or generation phase, with shape (batch_size) on CPU.
-            kv_cache_block_offsets (torch.Tensor): The offsets to the blocks inside KV cache pools on GPU, its shape is (num_pools, max_batch_size * max_beam_width, 2, max_blocks_per_sequence), one for each block. If kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping are all None, the attention will be no cache attention.
-            host_kv_cache_pool_pointers (torch.Tensor): The pointers to the KV cache pools on CPU, its shape is (num_pools, 2), one for primary pool in GPU memory, one for secondary pool in CPU memory.
-            host_kv_cache_pool_mapping (torch.Tensor): The index of the pool used by each attention layer on CPU, its shape is (num_local_attention_layers). The local attention layers mean all attention layers in the current PP stage in the pipeline parallelism case.
-            workspace (torch.Tensor): An optional workspace tensor on GPU.
-            cache_indirection (torch.Tensor): A tensor for beam search on GPU, its shape is (batch_size, beam_width, max_seqlen), for a sequence si, a beam bi and a token ti, the element cache_indirection[si][bi][ti] is an integer between 0 and beam_width-1 that indicates which path in the beam to read the K and V elements from in the KV cache.
-            kv_scale_orig_quant (torch.Tensor): The tensor to store the scaling factor for quantization to INT8/FP8 in the KV cache, with shape (1) on GPU.
-            kv_scale_quant_orig (torch.Tensor): The tensor to store the scaling factor for dequantization from INT8/FP8 in the KV cache, with shape (1) on GPU.
-            out_scale (torch.Tensor): The tensor to store the scaling factor to quantize output, with shape (1) on GPU.
-            out_scale_sf (torch.Tensor): The tensor to store the global scale for NVFP4 scaling factors, with shape (1) on GPU.
-            kv_scales_sf (torch.Tensor): The tensor to store the global scale for KV NVFP4 scaling factors, with shape (2) on GPU.
-            kv_scales_sf_inv (torch.Tensor): The tensor to store the inverse of the global scale for KV NVFP4 scaling factors, with shape (2) on GPU.
-            use_paged_context_fmha (bool): Sets the mPagedContextFMHA attribute in the op runner.
-            mrope_config (dict): The dictionary containing the mRope configuration.
-            softmax_stats_tensor (torch.Tensor): The tensor to store the softmax statistics (max/sum)
-            attention_sinks (torch.Tensor): The attention sinks (additional value in the denominator of the softmax) with shape of (num_heads_q) on GPU.
-            chunked_prefill_buffer_batch_size (int): used for malloc buffer for k and v in fp8 context mla. the max input kv length is not max_num_tokens in this case. It is chunked_prefill_buffer_batch_size * max_num_tokens.
-            sparse_kv_indices (torch.Tensor): The sparse indices for the KV cache, with shape of (num_heads_kv, num_sparse_tokens) on GPU.
-            sparse_kv_offsets (torch.Tensor): The batch offsets for the sparse KV indices, with shape of (num_contexts + 1) on GPU.
-            sparse_attn_indices (torch.Tensor): The sparse indices for the attention layer, with shape of (num_heads_kv, num_sparse_tokens) on GPU.
-            sparse_attn_offsets (torch.Tensor): The batch offsets for the sparse attention indices, with shape of (num_generations + 1) on GPU.
-            sparse_attn_indices_block_size (int): The granularity of the sparse attention indices, used by block sparse attention.
-            num_sparse_topk (int): The topk for the sparse MLA, used by DSA attention.
-            skip_softmax_threshold_scale_factor_prefill (float): The scale factor for the skip softmax threshold in prefill phase.
-            skip_softmax_threshold_scale_factor_decode (float): The scale factor for the skip softmax threshold in decode phase.
-            helix_position_offsets (torch.Tensor): The tensor to store the helix position offsets, with shape (num_tokens) on GPU.
-            helix_is_inactive_rank (torch.Tensor): For Helix: whether the current rank is inactive, with shape (batch_size) on GPU.
-            sage_attn_num_elts_per_blk_q (int): SageAttention per-token-block size for Q quantization. 0 disables Q quantization.
-            sage_attn_num_elts_per_blk_k (int): SageAttention per-token-block size for K quantization. 0 disables K quantization.
-            sage_attn_num_elts_per_blk_v (int): SageAttention per-channel-block size for V quantization. 0 disables V quantization.
-            sage_attn_qk_int8 (bool): If True, quantize Q/K to INT8 instead of FP8 (E4M3).
-            quant_config (Optional[QuantConfig]): The quantization configuration.
-            kv_cache_manager (Optional[KVCacheManager]): The KV cache manager.
-        """
-        self.layer_idx = layer_idx
-        self.global_layer_idx = layer_idx
-        self.tokens_per_block = tokens_per_block
-        self.max_num_requests = max_num_requests
-        self.max_context_length = max_context_length
-        self.attention_window_size = attention_window_size or max_sequence_length
-        self.sink_token_length = sink_token_length
-        self.beam_width = beam_width
-        self.sequence_length = sequence_length
-        self.host_past_key_value_lengths = host_past_key_value_lengths
-        self.host_total_kv_lens = host_total_kv_lens
-        self.context_lengths = context_lengths
-        self.host_context_lengths = host_context_lengths
-        self.host_request_types = host_request_types
-        self.kv_cache_block_offsets = kv_cache_block_offsets
-        self.host_kv_cache_pool_pointers = host_kv_cache_pool_pointers
-        self.host_kv_cache_pool_mapping = host_kv_cache_pool_mapping
-        self.workspace = workspace
-        self.cache_indirection = cache_indirection
-        self.kv_scale_orig_quant = kv_scale_orig_quant if kv_scales_sf_inv is None else kv_scales_sf_inv
-        self.kv_scale_quant_orig = kv_scale_quant_orig if kv_scales_sf is None else kv_scales_sf
-        self.out_scale = out_scale
-        self.out_scale_sf = out_scale_sf
-        self.use_paged_context_fmha = use_paged_context_fmha
-        self.use_nvfp4_output = use_nvfp4_output
-        self.attention_input_type = int(attention_input_type)
-        self.latent_cache = latent_cache
-        self.q_pe = q_pe
-        self.mrope_rotary_cos_sin = mrope_config.get(
-            'mrope_rotary_cos_sin') if mrope_config is not None else None
-        self.mrope_position_deltas = mrope_config.get(
-            'mrope_position_deltas') if mrope_config is not None else None
-        self.block_ids_per_seq = block_ids_per_seq
-        self.flash_mla_tile_scheduler_metadata = flash_mla_tile_scheduler_metadata
-        self.flash_mla_num_splits = flash_mla_num_splits
-        self.softmax_stats_tensor = softmax_stats_tensor
-        self.attention_sinks = attention_sinks
-        self.sparse_kv_indices = sparse_kv_indices
-        self.sparse_kv_offsets = sparse_kv_offsets
-        self.sparse_attn_indices = sparse_attn_indices
-        self.sparse_attn_offsets = sparse_attn_offsets
-        self.sparse_attn_indices_block_size = sparse_attn_indices_block_size
-        self.num_sparse_topk = num_sparse_topk
-        self.sparse_attention_config = sparse_attention_config
-        self.helix_position_offsets = helix_position_offsets
-        self.helix_is_inactive_rank = helix_is_inactive_rank
-        self.sage_attn_num_elts_per_blk_q = sage_attn_num_elts_per_blk_q
-        self.sage_attn_num_elts_per_blk_k = sage_attn_num_elts_per_blk_k
-        self.sage_attn_num_elts_per_blk_v = sage_attn_num_elts_per_blk_v
-        self.sage_attn_qk_int8 = sage_attn_qk_int8
-
-        self.ensure_rope_table_size(max_sequence_length)
-        self.is_spec_decoding_enabled = is_spec_decoding_enabled
-        self.use_spec_decoding = use_spec_decoding
-        self.is_spec_dec_tree = is_spec_dec_tree
-        self.spec_decoding_position_offsets = spec_decoding_position_offsets
-        self.spec_decoding_packed_mask = spec_decoding_packed_mask
-        self.spec_decoding_generation_lengths = spec_decoding_generation_lengths
-        self.spec_decoding_bl_tree_mask_offset = spec_decoding_bl_tree_mask_offset
-        self.spec_decoding_bl_tree_mask = spec_decoding_bl_tree_mask
-        self.spec_bl_tree_first_sparse_mask_offset_kv = spec_bl_tree_first_sparse_mask_offset_kv
-        self.chunked_prefill_buffer_batch_size = chunked_prefill_buffer_batch_size
-        self.skip_softmax_threshold_scale_factor_prefill = skip_softmax_threshold_scale_factor_prefill
-        self.skip_softmax_threshold_scale_factor_decode = skip_softmax_threshold_scale_factor_decode
-        self.quant_config = quant_config
-        self.kv_cache_manager = kv_cache_manager
-        self.kwargs.update(kwargs)
-
-    def create_output(
-        self,
-        q: torch.Tensor,
-        out_dtype: Optional[torch.dtype],
-        use_nvfp4_output: bool,
-        is_gen_only: bool,
-    ):
-        num_tokens = q.size(0)
-        if out_dtype is None:
-            out_dtype = q.dtype
-        v_head_size = self.head_size
-        if self.is_mla_enable:
-            v_head_size = self.kv_lora_rank if is_gen_only else self.v_head_dim
-        if use_nvfp4_output:
-            num_nvfp4_elements_per_container = 2
-            scaling_vector_size = 16
-            size_per_token = self.num_heads * v_head_size
-            output = q.new_empty(
-                (num_tokens,
-                 size_per_token // num_nvfp4_elements_per_container),
-                dtype=torch.uint8)
-            # Create a sf (scaling factors) tensor for NVFP4 (use INT8 as the container dtype).
-            padded_row, padded_col = compute_swizzled_sf_shape(
-                num_tokens, size_per_token // scaling_vector_size)
-            output_sf = q.new_empty(padded_row * padded_col, dtype=torch.uint8)
-            return [output, output_sf]
-        else:
-            return [
-                q.new_empty((num_tokens, self.num_heads * v_head_size),
-                            dtype=out_dtype)
-            ]
-
-    def run(
-        self,
-        q: torch.Tensor,
-        output: torch.Tensor,
-        output_sf: Optional[torch.Tensor] = None,
-        k: Optional[torch.Tensor] = None,
-        v: Optional[torch.Tensor] = None,
-        is_fused_qkv: bool = True,
-        update_kv_cache: bool = True,
-        attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
-        cu_q_seqlens: Optional[torch.Tensor] = None,
-        cu_kv_seqlens: Optional[torch.Tensor] = None,
-        fmha_scheduler_counter: Optional[torch.Tensor] = None,
-        mla_bmm1_scale: Optional[torch.Tensor] = None,
-        mla_bmm2_scale: Optional[torch.Tensor] = None,
-        quant_q_buffer: Optional[torch.Tensor] = None,
-        num_contexts: int = 0,
-        num_ctx_tokens: int = 0,
-    ):
-        """
-        Run the attention operation.
-        Args:
-            q (torch.Tensor): Query tensor with shape (num_tokens, num_heads * head_dim) or QKV tensor with shape (num_tokens, (num_heads + 2 * num_kv_heads) * head_dim).
-            output (torch.Tensor): Output tensor with shape.
-            output_sf (Optional[torch.Tensor]): Output scaling factors tensor.
-            k (Optional[torch.Tensor]): Key tensor with shape (num_tokens, num_kv_heads * head_dim) or None if QKV tensor is provided.
-            v (Optional[torch.Tensor]): Value tensor with shape (num_tokens, num_kv_heads * head_dim) or None if QKV tensor is provided.
-            is_fused_qkv (bool): Whether QKV tensor is provided.
-            update_kv_cache (bool): Whether KV cache is updated.
-            attention_mask (AttentionMask): Attention mask. See definition of AttentionMask for accepted types. Defaults to predefined causal mask.
-        Returns:
-            torch.Tensor with shape (num_tokens, num_heads * head_dim).
-        """
-        if len(self.kwargs) > 0:
-            logger.warning(
-                f"unknown arguments {list(self.kwargs.keys())} in attention wrapper"
-            )
-        assert (is_fused_qkv and k is None
-                and v is None) or (not is_fused_qkv and k is not None
-                                   and v is not None)
-
-        if not self.is_mla_enable:
-            if is_fused_qkv:
-                qkv_hidden_size = (self.num_heads +
-                                   2 * self.num_kv_heads) * self.head_size
-                assert q.shape[1] == qkv_hidden_size
-            else:
-                q_hidden_size = self.num_heads * self.head_size
-                assert q.shape[1] == q_hidden_size
-                if update_kv_cache:
-                    kv_hidden_size = self.num_kv_heads * self.head_size
-                    assert k.shape[1] == kv_hidden_size
-                    assert v.shape[1] == kv_hidden_size
-            num_tokens = q.shape[0]
-            if k is not None:
-                assert k.shape[0] == num_tokens
-                assert v.shape[0] == num_tokens
-            batch_size = self.sequence_length.shape[0]
-            assert self.host_past_key_value_lengths.shape[0] == batch_size
-            assert self.context_lengths.shape[0] == batch_size
-            assert self.host_context_lengths.shape[0] == batch_size
-            assert self.host_request_types.shape[0] == batch_size
-
-            if attention_mask == PredefinedAttentionMask.CAUSAL:
-                mask_type = AttentionMaskType.causal
-            elif attention_mask == PredefinedAttentionMask.FULL:
-                mask_type = AttentionMaskType.padding
-            else:
-                raise ValueError("Unexpected attention mask type")
-        else:
-            # For DSA, use the same qkv hidden size for context and generation phases
-            is_sparse_attn = self.sparse_attn_indices is not None and self.sparse_attn_indices.numel(
-            ) > 0
-            if self.attention_input_type == AttentionInputType.context_only and is_sparse_attn:
-                assert is_fused_qkv
-                qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
-                                                    self.qk_rope_head_dim)
-            elif self.attention_input_type == AttentionInputType.context_only:
-                assert not is_fused_qkv
-                qkv_hidden_size = self.num_heads * (self.qk_nope_head_dim +
-                                                    self.qk_rope_head_dim)
-            elif self.attention_input_type == AttentionInputType.generation_only:
-                assert is_fused_qkv
-                qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
-                                                    self.qk_rope_head_dim)
-            else:
-                raise ValueError(
-                    "In MLA, TrtllmAttention can only support context_only or generation_only, not mixed."
-                )
-            assert q.shape[
-                1] == qkv_hidden_size, f"q.shape[1] must be equal to qkv_hidden_size, got {q.shape[1]=}, {qkv_hidden_size=}"
-
-            batch_size = self.sequence_length.shape[0]
-            assert self.host_past_key_value_lengths.shape[0] == batch_size
-            assert self.context_lengths.shape[0] == batch_size
-            assert self.host_context_lengths.shape[0] == batch_size
-            assert self.host_request_types.shape[0] == batch_size
-
-            if attention_mask == PredefinedAttentionMask.CAUSAL:
-                mask_type = AttentionMaskType.causal
-            elif attention_mask == PredefinedAttentionMask.FULL:
-                mask_type = AttentionMaskType.padding
-            else:
-                raise ValueError("Unexpected attention mask type")
-
-        # packing parameters to avoid maxing out 64 arguments
-        rotary_embedding_scales = [
-            self.rotary_embedding_scale, self.rotary_embedding_short_m_scale,
-            self.rotary_embedding_long_m_scale
-        ]
-        rotary_embedding_max_position_info = [
-            self.rotary_embedding_max_positions,
-            self.rotary_embedding_original_max_positions
-        ]
-        spec_decoding_bool_params = [
-            self.is_spec_decoding_enabled, self.use_spec_decoding,
-            self.is_spec_dec_tree
-        ]
-        # For dynamic tree, reshape 1D position_offsets to 2D for C++ kernel compatibility
-        position_offsets_for_cpp = self.spec_decoding_position_offsets
-        if (self.spec_decoding_position_offsets is not None
-                and self.spec_decoding_position_offsets.dim() == 1):
-            # Reshape 1D [max_num_requests * N] to 2D [max_num_requests, N]
-            # C++ kernel requires 2D to extract max_generation_length from sizes()[1]
-            position_offsets_for_cpp = self.spec_decoding_position_offsets.view(
-                self.max_num_requests, -1)
-
-        spec_decoding_tensor_params = [
-            self.spec_decoding_generation_lengths, position_offsets_for_cpp,
-            self.spec_decoding_packed_mask
-        ]
-        if self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
-            spec_decoding_tensor_params.append(
-                self.spec_decoding_bl_tree_mask_offset)
-            spec_decoding_tensor_params.append(self.spec_decoding_bl_tree_mask)
-            spec_decoding_tensor_params.append(
-                self.spec_bl_tree_first_sparse_mask_offset_kv)
-        helix_tensor_params = [
-            self.helix_position_offsets, self.helix_is_inactive_rank
-        ]
-
-        # Zero bl_tree_mask only at layer transitions (local layer_idx==0)
-        # to clear stale bits from atomicOr. Layers 1-31 reuse layer 0's mask;
-        # eagle head (also local_idx==0) gets fresh mask.
-        if self.spec_decoding_bl_tree_mask is not None and self.layer_idx == 0:
-            self.spec_decoding_bl_tree_mask.zero_()
-
-        if self.print_skip_softmax_stat:
-            self.skip_softmax_stat.zero_()
-
-        out_scale = self.out_scale_sf if self.use_nvfp4_output else self.out_scale
-
-        helix_active = self.helix_position_offsets is not None
-        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not helix_active and trtllm_gen.is_supported(
-                q=q,
-                num_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                head_size=self.head_size,
-                out_dtype=output.dtype,
-                mask_type=int(mask_type),
-                has_alibi=(self.position_embedding_type == 4
-                           or self.position_embedding_type == 5),
-                is_padded=False,
-                use_paged_kv_cache=(self.kv_cache_block_offsets is not None),
-                tokens_per_block=self.tokens_per_block,
-                beam_width=self.beam_width,
-                position_shift_enabled=False,
-                sink_token_length=self.sink_token_length,
-                cross_attention=False,
-                is_spec_decoding=self.is_spec_decoding_enabled,
-                is_mla_enable=self.is_mla_enable,
-                is_fused_qkv=is_fused_qkv,
-                update_kv_cache=update_kv_cache,
-                has_cross_kv=False,
-                quant_config=self.quant_config,
-                kv_cache_manager=self.kv_cache_manager,
-                skip_softmax_threshold_scale_factor_prefill=self.
-                skip_softmax_threshold_scale_factor_prefill,
-                skip_softmax_threshold_scale_factor_decode=self.
-                skip_softmax_threshold_scale_factor_decode,
-        )[0]:
-            trtllm_gen_attention(
-                q,
-                k,
-                v,
-                output,
-                output_sf,
-                self.workspace,
-                self.sequence_length,
-                self.host_past_key_value_lengths,
-                self.host_total_kv_lens,
-                self.context_lengths,
-                self.host_context_lengths,
-                self.host_request_types,
-                self.kv_cache_block_offsets,
-                self.host_kv_cache_pool_pointers,
-                self.host_kv_cache_pool_mapping,
-                self.cache_indirection,
-                self.kv_scale_orig_quant,
-                self.kv_scale_quant_orig,
-                out_scale,
-                self.rotary_inv_freq,
-                self.rotary_cos_sin,
-                self.latent_cache,
-                self.q_pe,
-                self.block_ids_per_seq,
-                self.attention_sinks,
-                is_fused_qkv,
-                update_kv_cache,
-                self.predicted_tokens_per_seq,
-                self.layer_idx,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_size,
-                self.tokens_per_block,
-                self.max_num_requests,
-                self.max_context_length,
-                self.attention_window_size,
-                self.sink_token_length,
-                self.beam_width,
-                int(mask_type),
-                self.quant_mode,
-                self.q_scaling,
-                self.position_embedding_type,
-                self.rotary_embedding_dim,
-                self.rotary_embedding_base,
-                self.rotary_embedding_scale_type,
-                rotary_embedding_scales,
-                rotary_embedding_max_position_info,
-                self.use_paged_context_fmha,
-                self.attention_input_type,
-                self.is_mla_enable,
-                self.chunked_prefill_buffer_batch_size,
-                self.q_lora_rank,
-                self.kv_lora_rank,
-                self.qk_nope_head_dim,
-                self.qk_rope_head_dim,
-                self.v_head_dim,
-                self.mrope_rotary_cos_sin,
-                self.mrope_position_deltas,
-                helix_tensor_params,
-                self.attention_chunk_size,
-                self.softmax_stats_tensor,
-                spec_decoding_bool_params,
-                spec_decoding_tensor_params,
-                self.sparse_kv_indices,
-                self.sparse_kv_offsets,
-                self.sparse_attn_indices,
-                self.sparse_attn_offsets,
-                self.sparse_attn_indices_block_size,
-                self.num_sparse_topk,
-                self.skip_softmax_threshold_scale_factor_prefill,
-                self.skip_softmax_threshold_scale_factor_decode,
-                self.skip_softmax_stat,
-                cu_q_seqlens,
-                cu_kv_seqlens,
-                fmha_scheduler_counter,
-                mla_bmm1_scale,
-                mla_bmm2_scale,
-                quant_q_buffer,
-                self.quant_config,
-                self.kv_cache_manager,
-                num_contexts,
-                num_ctx_tokens,
-                global_layer_idx=self.global_layer_idx,
-            )
-        else:
-            thop.attention(
-                q,
-                k,
-                v,
-                output,
-                output_sf,
-                self.workspace,
-                self.sequence_length,
-                self.host_past_key_value_lengths,
-                self.host_total_kv_lens,
-                self.context_lengths,
-                self.host_context_lengths,
-                self.host_request_types,
-                self.kv_cache_block_offsets,
-                self.host_kv_cache_pool_pointers,
-                self.host_kv_cache_pool_mapping,
-                self.cache_indirection,
-                self.kv_scale_orig_quant,
-                self.kv_scale_quant_orig,
-                out_scale,
-                self.rotary_inv_freq,
-                self.rotary_cos_sin,
-                self.latent_cache,
-                self.q_pe,
-                self.block_ids_per_seq,
-                self.attention_sinks,
-                is_fused_qkv,
-                update_kv_cache,
-                self.predicted_tokens_per_seq,
-                self.layer_idx,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_size,
-                self.tokens_per_block,
-                self.max_num_requests,
-                self.max_context_length,
-                self.attention_window_size,
-                self.sink_token_length,
-                self.beam_width,
-                int(mask_type),
-                self.quant_mode,
-                self.q_scaling,
-                self.position_embedding_type,
-                self.rotary_embedding_dim,
-                self.rotary_embedding_base,
-                self.rotary_embedding_scale_type,
-                rotary_embedding_scales,
-                rotary_embedding_max_position_info,
-                self.use_paged_context_fmha,
-                self.attention_input_type,
-                self.is_mla_enable,
-                self.chunked_prefill_buffer_batch_size,
-                self.q_lora_rank,
-                self.kv_lora_rank,
-                self.qk_nope_head_dim,
-                self.qk_rope_head_dim,
-                self.v_head_dim,
-                self.mrope_rotary_cos_sin,
-                self.mrope_position_deltas,
-                helix_tensor_params,
-                self.attention_chunk_size,
-                self.softmax_stats_tensor,
-                spec_decoding_bool_params,
-                spec_decoding_tensor_params,
-                self.sparse_kv_indices,
-                self.sparse_kv_offsets,
-                self.sparse_attn_indices,
-                self.sparse_attn_offsets,
-                self.sparse_attn_indices_block_size,
-                self.num_sparse_topk,
-                self.skip_softmax_threshold_scale_factor_prefill,
-                self.skip_softmax_threshold_scale_factor_decode,
-                self.skip_softmax_stat,
-                cu_q_seqlens,
-                cu_kv_seqlens,
-                fmha_scheduler_counter,
-                mla_bmm1_scale,
-                mla_bmm2_scale,
-                quant_q_buffer,
-                self.flash_mla_tile_scheduler_metadata,
-                self.flash_mla_num_splits,
-                self.sage_attn_num_elts_per_blk_q,
-                self.sage_attn_num_elts_per_blk_k,
-                self.sage_attn_num_elts_per_blk_v,
-                self.sage_attn_qk_int8,
-                num_contexts=num_contexts,
-                num_ctx_tokens=num_ctx_tokens,
-            )
-
-        if self.print_skip_softmax_stat:
-            (total_blocks, skipped_blocks) = self.skip_softmax_stat
-            if total_blocks != 0:
-                print(
-                    f"SKIP_SOFTMAX_STAT: layer{self.layer_idx}: {skipped_blocks} / {total_blocks}"
-                    f" = {skipped_blocks / total_blocks * 100: .2f}%")
-
-        # reset the planned states (especially tensors) to avoid memory leak
-        self.plan()
-
-    def is_nvfp4_output_kernel_available(
-        self,
-        *,
-        tokens_per_block: Optional[int] = None,
-        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
-        CAUSAL,
-        use_paged_context_fmha: bool = False,
-        is_mla_enable: bool = False,
-        **kwargs,
-    ):
-        """
-        Runtime check whether the NVFP4 output kernel is available.
-        Args:
-            tokens_per_block (int): Token number per KV cache block.
-            attention_mask (PredefinedAttentionMask): The attention mask type.
-            use_paged_context_fmha (bool): Whether to use paged context FMHA.
-            is_mla_enable (bool): Whether to use MLA.
-        """
-        if attention_mask == PredefinedAttentionMask.CAUSAL:
-            mask_type = AttentionMaskType.causal
-        elif attention_mask == PredefinedAttentionMask.FULL:
-            mask_type = AttentionMaskType.padding
-        else:
-            raise ValueError("Unexpected attention mask type")
-
-        return torch.ops.trtllm.attention_supports_nvfp4_output(
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_size,
-            tokens_per_block,
-            int(mask_type),
-            self.quant_mode,
-            use_paged_context_fmha,
-            is_mla_enable,
-        )
-
-    def is_sm_version_trtllm_gen_kernel(self, sm):
-        return not (sm < 100 or sm in [120, 121])
 
 
 @functools.cache
@@ -984,7 +206,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.host_total_kv_lens = torch.empty(2, device='cpu', dtype=torch.int)
         self.host_request_types = torch.empty_like(self.prompt_lens_cpu)
 
-        # For debugging, can use it to call the wrapper's plan function
         if self.workspace is None:
             self.workspace = torch.empty(
                 (0, ),
@@ -1191,7 +412,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # trtllm attn metadata prepare() requires this
             self.prompt_lens = self.context_lens
 
-            # set params that are used in wrapper.plan()
             self.kv_cache_block_offsets = None
             self.block_ids_per_seq = None
 
@@ -1729,6 +949,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     Metadata = TrtllmAttentionMetadata
 
+    @staticmethod
+    def is_sm_version_trtllm_gen_kernel(sm):
+        return not (sm < 100 or sm in [120, 121])
+
     def __init__(
         self,
         layer_idx: int,
@@ -1757,29 +981,43 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                                          Otherwise, the backend is in-charge of applying positional embedding and may cache K without embedding it first.
             mla_params (MLAParams): Optional parameters for MLA. If None, MLA is not enabled.
         """
-        super().__init__(layer_idx,
-                         num_heads,
-                         head_dim,
-                         num_kv_heads,
-                         quant_config,
-                         q_scaling=q_scaling,
-                         pos_embd_params=pos_embd_params,
-                         mla_params=mla_params,
-                         **kwargs)
-
-        self.wrapper = TrtllmAttentionWrapper(
-            num_heads,
-            head_dim,
-            num_kv_heads,
-            pos_embd_params=pos_embd_params,
-            q_scaling=q_scaling,
-            mla_params=mla_params,
-            attention_chunk_size=attention_chunk_size,
-        )
+        super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
+                         quant_config, **kwargs)
 
         self.is_mla_enable = mla_params is not None
         self.mla_params = mla_params or MLAParams()
         self.v_head_dim = self.mla_params.v_head_dim if self.is_mla_enable else head_dim
+
+        rope_params = None
+        if pos_embd_params is not None:
+            rope_params = pos_embd_params.rope
+        self.rope_params = rope_params or RopeParams()
+
+        self.q_scaling = q_scaling or 1.0
+        self.predicted_tokens_per_seq = self.mla_params.predicted_tokens_per_seq
+        self.attention_chunk_size = attention_chunk_size
+
+        if self.is_mla_enable:
+            self.q_lora_rank = self.mla_params.q_lora_rank
+            self.kv_lora_rank = self.mla_params.kv_lora_rank
+            self.qk_nope_head_dim = self.mla_params.qk_nope_head_dim
+            self.qk_rope_head_dim = self.mla_params.qk_rope_head_dim
+        else:
+            self.q_lora_rank = None
+            self.kv_lora_rank = None
+            self.qk_nope_head_dim = None
+            self.qk_rope_head_dim = None
+
+        self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
+        )
+        self.position_embedding_type = int(
+            pos_embd_params.type) if pos_embd_params is not None else 0
+        self.skip_softmax_stat = torch.zeros(2,
+                                             dtype=torch.uint32,
+                                             device='cuda')
+        self.print_skip_softmax_stat = os.environ.get(
+            "TRTLLM_PRINT_SKIP_SOFTMAX_STAT", "0") == "1"
+
         self.kv_cache_scaling_factor = torch.ones(1,
                                                   dtype=torch.float32,
                                                   device='cuda')
@@ -1789,8 +1027,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.update_quant_config(self.quant_config)
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
-        self.quant_config = new_quant_config
-        self.wrapper.update_quant_config(self.quant_config)
+        self.quant_config = new_quant_config or QuantConfig()
+        self.quant_mode = int(self.quant_config.layer_quant_mode)
 
         self.has_fp8_qdq = self.has_fp8_kv_cache = self.has_nvfp4 = False
         if self.quant_config is not None:
@@ -1839,7 +1077,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if get_sm_version() == 90:
             use_paged_context_fmha = True
 
-        return self.wrapper.is_nvfp4_output_kernel_available(
+        return self._is_nvfp4_output_kernel_available(
             tokens_per_block=metadata.tokens_per_block,
             attention_mask=attention_mask,
             use_paged_context_fmha=use_paged_context_fmha,
@@ -1878,9 +1116,42 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             generation_num_splits,
             num_generations,
             s_q,
-            self.wrapper.num_heads,
+            self.num_heads,
             1,
-            self.wrapper.kv_lora_rank,
+            self.kv_lora_rank,
+        )
+
+    def _ensure_rope_table_size(self, required_max_positions: int) -> None:
+        if required_max_positions > self.rope_params.max_positions:
+            self.rope_params.max_positions = required_max_positions
+            self.rotary_inv_freq, self.rotary_cos_sin = (
+                self.rope_params.create_rope_const_params())
+
+    def _is_nvfp4_output_kernel_available(
+        self,
+        *,
+        tokens_per_block: Optional[int] = None,
+        attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
+        CAUSAL,
+        use_paged_context_fmha: bool = False,
+        is_mla_enable: bool = False,
+    ) -> bool:
+        if attention_mask == PredefinedAttentionMask.CAUSAL:
+            mask_type = AttentionMaskType.causal
+        elif attention_mask == PredefinedAttentionMask.FULL:
+            mask_type = AttentionMaskType.padding
+        else:
+            raise ValueError("Unexpected attention mask type")
+
+        return torch.ops.trtllm.attention_supports_nvfp4_output(
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            tokens_per_block,
+            int(mask_type),
+            self.quant_mode,
+            use_paged_context_fmha,
+            is_mla_enable,
         )
 
     def create_output(self, q, *, is_quantize_output: bool,
@@ -1893,8 +1164,389 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             use_nvfp4_output = self.use_nvfp4_output(metadata, attention_mask)
             out_dtype = self.get_quantize_output_dtype(use_nvfp4_output)
 
-        return self.wrapper.create_output(q, out_dtype, use_nvfp4_output,
-                                          is_gen_only)
+        num_tokens = q.size(0)
+        if out_dtype is None:
+            out_dtype = q.dtype
+        v_head_size = self.head_dim
+        if self.is_mla_enable:
+            v_head_size = self.kv_lora_rank if is_gen_only else self.v_head_dim
+        if use_nvfp4_output:
+            num_nvfp4_elements_per_container = 2
+            scaling_vector_size = 16
+            size_per_token = self.num_heads * v_head_size
+            output = q.new_empty(
+                (num_tokens,
+                 size_per_token // num_nvfp4_elements_per_container),
+                dtype=torch.uint8)
+            padded_row, padded_col = compute_swizzled_sf_shape(
+                num_tokens, size_per_token // scaling_vector_size)
+            output_sf = q.new_empty(padded_row * padded_col, dtype=torch.uint8)
+            return [output, output_sf]
+        return [
+            q.new_empty((num_tokens, self.num_heads * v_head_size),
+                        dtype=out_dtype)
+        ]
+
+    def _get_mask_type(self,
+                       attention_mask: AttentionMask) -> AttentionMaskType:
+        if attention_mask == PredefinedAttentionMask.CAUSAL:
+            return AttentionMaskType.causal
+        if attention_mask == PredefinedAttentionMask.FULL:
+            return AttentionMaskType.padding
+        raise ValueError("Unexpected attention mask type")
+
+    def _run(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        output: torch.Tensor,
+        output_sf: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+        use_paged_context_fmha: bool,
+        sparse_kv_indices: Optional[torch.Tensor],
+        sparse_kv_offsets: Optional[torch.Tensor],
+        sparse_attn_indices: Optional[torch.Tensor],
+        sparse_attn_offsets: Optional[torch.Tensor],
+        sparse_attn_indices_block_size: int,
+        num_sparse_topk: int,
+        skip_softmax_threshold_scale_factor_prefill: Optional[float],
+        skip_softmax_threshold_scale_factor_decode: Optional[float],
+    ) -> None:
+        is_fused_qkv = not metadata.is_cross and k is None
+        update_kv_cache = not metadata.is_cross or k is not None
+        assert (is_fused_qkv and k is None
+                and v is None) or (not is_fused_qkv and k is not None
+                                   and v is not None)
+
+        attention_input_type = forward_args.attention_input_type
+        if not self.is_mla_enable:
+            if is_fused_qkv:
+                qkv_hidden_size = (self.num_heads +
+                                   2 * self.num_kv_heads) * self.head_dim
+                assert q.shape[1] == qkv_hidden_size
+            else:
+                q_hidden_size = self.num_heads * self.head_dim
+                assert q.shape[1] == q_hidden_size
+                if update_kv_cache:
+                    kv_hidden_size = self.num_kv_heads * self.head_dim
+                    assert k.shape[1] == kv_hidden_size
+                    assert v.shape[1] == kv_hidden_size
+            num_tokens = q.shape[0]
+            if k is not None:
+                assert k.shape[0] == num_tokens
+                assert v.shape[0] == num_tokens
+        else:
+            is_sparse_attn = sparse_attn_indices is not None and sparse_attn_indices.numel(
+            ) > 0
+            if attention_input_type == AttentionInputType.context_only and is_sparse_attn:
+                assert is_fused_qkv
+                qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
+                                                    self.qk_rope_head_dim)
+            elif attention_input_type == AttentionInputType.context_only:
+                assert not is_fused_qkv
+                qkv_hidden_size = self.num_heads * (self.qk_nope_head_dim +
+                                                    self.qk_rope_head_dim)
+            elif attention_input_type == AttentionInputType.generation_only:
+                assert is_fused_qkv
+                qkv_hidden_size = self.num_heads * (self.kv_lora_rank +
+                                                    self.qk_rope_head_dim)
+            else:
+                raise ValueError(
+                    "In MLA, TrtllmAttention can only support context_only or generation_only, not mixed."
+                )
+            assert q.shape[
+                1] == qkv_hidden_size, f"q.shape[1] must be equal to qkv_hidden_size, got {q.shape[1]=}, {qkv_hidden_size=}"
+
+        batch_size = metadata.kv_lens_cuda_runtime.shape[0]
+        assert metadata.kv_lens_runtime.shape[0] == batch_size
+        assert metadata.prompt_lens_cuda_runtime.shape[0] == batch_size
+        assert metadata.prompt_lens_cpu_runtime.shape[0] == batch_size
+        assert metadata.host_request_types_runtime.shape[0] == batch_size
+
+        mask_type = self._get_mask_type(forward_args.attention_mask)
+        self._ensure_rope_table_size(metadata.max_seq_len)
+
+        rotary_embedding_dim = self.rope_params.dim
+        rotary_embedding_base = self.rope_params.theta
+        rotary_embedding_scale_type = int(self.rope_params.scale_type)
+        rotary_embedding_scales = [
+            self.rope_params.scale, self.rope_params.short_m_scale,
+            self.rope_params.long_m_scale
+        ]
+        rotary_embedding_max_position_info = [
+            self.rope_params.max_positions,
+            self.rope_params.original_max_positions
+        ]
+        spec_decoding_bool_params = [
+            metadata.is_spec_decoding_enabled, metadata.use_spec_decoding,
+            metadata.is_spec_dec_tree
+        ]
+        position_offsets_for_cpp = metadata.spec_decoding_position_offsets
+        if (metadata.spec_decoding_position_offsets is not None
+                and metadata.spec_decoding_position_offsets.dim() == 1):
+            position_offsets_for_cpp = metadata.spec_decoding_position_offsets.view(
+                metadata.max_num_requests, -1)
+
+        spec_decoding_tensor_params = [
+            metadata.spec_decoding_generation_lengths, position_offsets_for_cpp,
+            metadata.spec_decoding_packed_mask
+        ]
+        if self.is_sm_version_trtllm_gen_kernel(sm=get_sm_version()):
+            spec_decoding_tensor_params.append(
+                metadata.spec_decoding_bl_tree_mask_offset)
+            spec_decoding_tensor_params.append(
+                metadata.spec_decoding_bl_tree_mask)
+            spec_decoding_tensor_params.append(
+                metadata.spec_bl_tree_first_sparse_mask_offset_kv)
+        helix_tensor_params = [
+            metadata.helix_position_offsets, metadata.helix_is_inactive_rank
+        ]
+
+        layer_idx = self.get_local_layer_idx(metadata)
+        if metadata.spec_decoding_bl_tree_mask is not None and layer_idx == 0:
+            metadata.spec_decoding_bl_tree_mask.zero_()
+
+        if self.print_skip_softmax_stat:
+            self.skip_softmax_stat.zero_()
+
+        use_nvfp4_output = output_sf is not None
+        out_scale = (forward_args.out_scale_sf
+                     if use_nvfp4_output else forward_args.out_scale)
+        kv_scale_orig_quant = (self.kv_scale_orig_quant
+                               if forward_args.kv_scales_sf_inv is None else
+                               forward_args.kv_scales_sf_inv)
+        kv_scale_quant_orig = (self.kv_scale_quant_orig
+                               if forward_args.kv_scales_sf is None else
+                               forward_args.kv_scales_sf)
+        mrope_rotary_cos_sin = forward_args.mrope_config.get(
+            'mrope_rotary_cos_sin'
+        ) if forward_args.mrope_config is not None else None
+        mrope_position_deltas = forward_args.mrope_config.get(
+            'mrope_position_deltas'
+        ) if forward_args.mrope_config is not None else None
+        workspace = metadata.workspace if not metadata.is_cuda_graph else metadata.cuda_graph_workspace
+        flash_mla_tile_scheduler_metadata = (
+            metadata.flash_mla_tile_scheduler_metadata
+            if metadata.enable_flash_mla else None)
+        flash_mla_num_splits = metadata.flash_mla_num_splits if metadata.enable_flash_mla else None
+        attention_window_size = (forward_args.attention_window_size
+                                 or metadata.max_seq_len)
+        max_context_length = min(metadata.max_seq_len - 1,
+                                 metadata.max_num_tokens)
+
+        helix_active = metadata.helix_position_offsets is not None
+        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not helix_active and trtllm_gen.is_supported(
+                q=q,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_dim,
+                out_dtype=output.dtype,
+                mask_type=int(mask_type),
+                has_alibi=(self.position_embedding_type == 4
+                           or self.position_embedding_type == 5),
+                is_padded=False,
+                use_paged_kv_cache=(metadata.kv_cache_block_offsets
+                                    is not None),
+                tokens_per_block=metadata.tokens_per_block,
+                beam_width=metadata.beam_width,
+                position_shift_enabled=False,
+                sink_token_length=0,
+                cross_attention=False,
+                is_spec_decoding=metadata.is_spec_decoding_enabled,
+                is_mla_enable=self.is_mla_enable,
+                is_fused_qkv=is_fused_qkv,
+                update_kv_cache=update_kv_cache,
+                has_cross_kv=False,
+                quant_config=self.quant_config,
+                kv_cache_manager=metadata.kv_cache_manager,
+                skip_softmax_threshold_scale_factor_prefill=
+                skip_softmax_threshold_scale_factor_prefill,
+                skip_softmax_threshold_scale_factor_decode=
+                skip_softmax_threshold_scale_factor_decode,
+        )[0]:
+            trtllm_gen_attention(
+                q,
+                k,
+                v,
+                output,
+                output_sf,
+                workspace,
+                metadata.kv_lens_cuda_runtime,
+                metadata.kv_lens_runtime,
+                metadata.host_total_kv_lens,
+                metadata.prompt_lens_cuda_runtime,
+                metadata.prompt_lens_cpu_runtime,
+                metadata.host_request_types_runtime,
+                metadata.kv_cache_block_offsets,
+                metadata.host_kv_cache_pool_pointers,
+                metadata.host_kv_cache_pool_mapping,
+                metadata.cache_indirection,
+                kv_scale_orig_quant,
+                kv_scale_quant_orig,
+                out_scale,
+                self.rotary_inv_freq,
+                self.rotary_cos_sin,
+                forward_args.latent_cache,
+                forward_args.q_pe,
+                metadata.block_ids_per_seq,
+                forward_args.attention_sinks,
+                is_fused_qkv,
+                update_kv_cache,
+                self.predicted_tokens_per_seq,
+                layer_idx,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                metadata.tokens_per_block,
+                metadata.max_num_requests,
+                max_context_length,
+                attention_window_size,
+                0,
+                metadata.beam_width,
+                int(mask_type),
+                self.quant_mode,
+                self.q_scaling,
+                self.position_embedding_type,
+                rotary_embedding_dim,
+                rotary_embedding_base,
+                rotary_embedding_scale_type,
+                rotary_embedding_scales,
+                rotary_embedding_max_position_info,
+                use_paged_context_fmha,
+                int(attention_input_type),
+                self.is_mla_enable,
+                forward_args.chunked_prefill_buffer_batch_size,
+                self.q_lora_rank,
+                self.kv_lora_rank,
+                self.qk_nope_head_dim,
+                self.qk_rope_head_dim,
+                self.v_head_dim,
+                mrope_rotary_cos_sin,
+                mrope_position_deltas,
+                helix_tensor_params,
+                self.attention_chunk_size,
+                forward_args.softmax_stats_tensor,
+                spec_decoding_bool_params,
+                spec_decoding_tensor_params,
+                sparse_kv_indices,
+                sparse_kv_offsets,
+                sparse_attn_indices,
+                sparse_attn_offsets,
+                sparse_attn_indices_block_size,
+                num_sparse_topk,
+                skip_softmax_threshold_scale_factor_prefill,
+                skip_softmax_threshold_scale_factor_decode,
+                self.skip_softmax_stat,
+                forward_args.cu_q_seqlens,
+                forward_args.cu_kv_seqlens,
+                forward_args.fmha_scheduler_counter,
+                forward_args.mla_bmm1_scale,
+                forward_args.mla_bmm2_scale,
+                forward_args.quant_q_buffer,
+                self.quant_config,
+                metadata.kv_cache_manager,
+                metadata.num_contexts,
+                metadata.num_ctx_tokens,
+                global_layer_idx=self.layer_idx,
+            )
+        else:
+            thop.attention(
+                q,
+                k,
+                v,
+                output,
+                output_sf,
+                workspace,
+                metadata.kv_lens_cuda_runtime,
+                metadata.kv_lens_runtime,
+                metadata.host_total_kv_lens,
+                metadata.prompt_lens_cuda_runtime,
+                metadata.prompt_lens_cpu_runtime,
+                metadata.host_request_types_runtime,
+                metadata.kv_cache_block_offsets,
+                metadata.host_kv_cache_pool_pointers,
+                metadata.host_kv_cache_pool_mapping,
+                metadata.cache_indirection,
+                kv_scale_orig_quant,
+                kv_scale_quant_orig,
+                out_scale,
+                self.rotary_inv_freq,
+                self.rotary_cos_sin,
+                forward_args.latent_cache,
+                forward_args.q_pe,
+                metadata.block_ids_per_seq,
+                forward_args.attention_sinks,
+                is_fused_qkv,
+                update_kv_cache,
+                self.predicted_tokens_per_seq,
+                layer_idx,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                metadata.tokens_per_block,
+                metadata.max_num_requests,
+                max_context_length,
+                attention_window_size,
+                0,
+                metadata.beam_width,
+                int(mask_type),
+                self.quant_mode,
+                self.q_scaling,
+                self.position_embedding_type,
+                rotary_embedding_dim,
+                rotary_embedding_base,
+                rotary_embedding_scale_type,
+                rotary_embedding_scales,
+                rotary_embedding_max_position_info,
+                use_paged_context_fmha,
+                int(attention_input_type),
+                self.is_mla_enable,
+                forward_args.chunked_prefill_buffer_batch_size,
+                self.q_lora_rank,
+                self.kv_lora_rank,
+                self.qk_nope_head_dim,
+                self.qk_rope_head_dim,
+                self.v_head_dim,
+                mrope_rotary_cos_sin,
+                mrope_position_deltas,
+                helix_tensor_params,
+                self.attention_chunk_size,
+                forward_args.softmax_stats_tensor,
+                spec_decoding_bool_params,
+                spec_decoding_tensor_params,
+                sparse_kv_indices,
+                sparse_kv_offsets,
+                sparse_attn_indices,
+                sparse_attn_offsets,
+                sparse_attn_indices_block_size,
+                num_sparse_topk,
+                skip_softmax_threshold_scale_factor_prefill,
+                skip_softmax_threshold_scale_factor_decode,
+                self.skip_softmax_stat,
+                forward_args.cu_q_seqlens,
+                forward_args.cu_kv_seqlens,
+                forward_args.fmha_scheduler_counter,
+                forward_args.mla_bmm1_scale,
+                forward_args.mla_bmm2_scale,
+                forward_args.quant_q_buffer,
+                flash_mla_tile_scheduler_metadata,
+                flash_mla_num_splits,
+                forward_args.sage_attn_num_elts_per_blk_q,
+                forward_args.sage_attn_num_elts_per_blk_k,
+                forward_args.sage_attn_num_elts_per_blk_v,
+                forward_args.sage_attn_qk_int8,
+                num_contexts=metadata.num_contexts,
+                num_ctx_tokens=metadata.num_ctx_tokens,
+            )
+
+        if self.print_skip_softmax_stat:
+            total_blocks, skipped_blocks = self.skip_softmax_stat
+            if total_blocks != 0:
+                print(
+                    f"SKIP_SOFTMAX_STAT: layer{self.layer_idx}: {skipped_blocks} / {total_blocks}"
+                    f" = {skipped_blocks / total_blocks * 100: .2f}%")
 
     def forward(
         self,
@@ -1902,63 +1554,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         k: Optional[torch.Tensor],
         v: Optional[torch.Tensor],
         metadata: TrtllmAttentionMetadata,
-        output: Optional[torch.Tensor] = None,
-        output_sf: Optional[torch.Tensor] = None,
-        out_scale: Optional[torch.Tensor] = None,
-        out_scale_sf: Optional[torch.Tensor] = None,
-        kv_scales_sf: Optional[torch.Tensor] = None,
-        kv_scales_sf_inv: Optional[torch.Tensor] = None,
-        *,
-        attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
-        attention_input_type: AttentionInputType = AttentionInputType.mixed,
-        latent_cache: Optional[torch.Tensor] = None,
-        q_pe: Optional[torch.Tensor] = None,
-        mrope_config: Optional[dict] = None,
-        attention_window_size: Optional[int] = None,
-        softmax_stats_tensor: Optional[torch.Tensor] = None,
-        enable_attn_nvfp4_output: bool = True,
-        attention_sinks: Optional[torch.Tensor] = None,
-        chunked_prefill_buffer_batch_size: int = 1,
-        cu_q_seqlens: Optional[torch.Tensor] = None,
-        cu_kv_seqlens: Optional[torch.Tensor] = None,
-        fmha_scheduler_counter: Optional[torch.Tensor] = None,
-        mla_bmm1_scale: Optional[torch.Tensor] = None,
-        mla_bmm2_scale: Optional[torch.Tensor] = None,
-        quant_q_buffer: Optional[torch.Tensor] = None,
-        sage_attn_num_elts_per_blk_q: int = 0,
-        sage_attn_num_elts_per_blk_k: int = 0,
-        sage_attn_num_elts_per_blk_v: int = 0,
-        sage_attn_qk_int8: bool = False,
+        forward_args: Optional[AttentionForwardArgs] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Execute the attention operation.
-        Args:
-            q (torch.Tensor): Query tensor or QKV tensor.
-            k (Optional[torch.Tensor]): Key tensor or None if QKV tensor is provided.
-            v (Optional[torch.Tensor]): Value tensor or None if QKV tensor is provided.
-            metadata (TrtllmAttentionMetadata): Metadata for the attention operation.
-            output (Optional[torch.Tensor]): Output tensor to store the attention output.
-            output_sf (Optional[torch.Tensor]): Output scale factor tensor for NVFP4.
-            out_scale (Optional[torch.Tensor]): Scale factor tensor for quantizing output.
-            out_scale_sf (Optional[torch.Tensor]): Global scale factor tensor for NVFP4 for quantizingoutput.
-            kv_scales_sf (Optional[torch.Tensor]): KV scale factor tensor.
-            kv_scales_sf_inv (Optional[torch.Tensor]): KV scale factor inverse tensor.
-            attention_mask (AttentionMask): Attention mask.
-            attention_input_type (AttentionInputType): Attention input type.
-            latent_cache (Optional[torch.Tensor]): Latent cache tensor.
-            q_pe (Optional[torch.Tensor]): Q position embedding tensor.
-            mrope_config (Optional[dict]): Mrope configuration.
-            attention_window_size (Optional[int]): Attention window size.
-            softmax_stats_tensor (Optional[torch.Tensor]): Softmax statistics tensor.
-            helix_position_offsets (Optional[torch.Tensor]): Helix position offsets tensor.
-            attention_sinks (Optional[torch.Tensor]): Attention sinks tensor.
-            chunked_prefill_buffer_batch_size (int): Chunked prefill buffer batch size.
-            sage_attn_num_elts_per_blk_q (int): SageAttention per-token-block size for Q quantization. 0 disables.
-            sage_attn_num_elts_per_blk_k (int): SageAttention per-token-block size for K quantization. 0 disables.
-            sage_attn_num_elts_per_blk_v (int): SageAttention per-channel-block size for V quantization. 0 disables.
-            sage_attn_qk_int8 (bool): If True, quantize Q/K to INT8 instead of FP8 (E4M3).
-        """
+        """Execute the TRTLLM attention backend."""
+        forward_args = merge_attention_forward_args(forward_args, kwargs)
         assert isinstance(
             metadata,
             TrtllmAttentionMetadata,
@@ -1986,14 +1586,17 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             # Context MLA uses separate qkv instead of paged_context_fmha
             use_paged_context_fmha = False
 
+        output = forward_args.output
+        output_sf = forward_args.output_sf
         if output is None:
             # Output is not provided.
-            is_gen_only = attention_input_type == AttentionInputType.generation_only
+            is_gen_only = (forward_args.attention_input_type ==
+                           AttentionInputType.generation_only)
             outputs = self.create_output(
                 q,
-                is_quantize_output=out_scale is not None,
+                is_quantize_output=forward_args.out_scale is not None,
                 metadata=metadata,
-                attention_mask=attention_mask,
+                attention_mask=forward_args.attention_mask,
                 use_paged_context_fmha=use_paged_context_fmha,
                 is_mla_enable=self.is_mla_enable,
                 is_gen_only=is_gen_only,
@@ -2014,9 +1617,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
             else:
                 sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
-                    q, k, metadata, **kwargs)
+                    q, k, metadata, forward_args)
                 sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
-                    q, k, metadata, **kwargs)
+                    q, k, metadata, forward_args)
                 sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
                 )
         num_sparse_topk = getattr(metadata, 'num_sparse_topk', 0)
@@ -2025,115 +1628,26 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # The flag is reset in prepare_flash_mla() and update_for_spec_dec() to trigger
         # recomputation when cache_seq_lens change. The metadata must always match the
         # compacted generation sub-batch, which is also the layout used by block_ids_per_seq.
-        if (metadata.enable_flash_mla
-                and attention_input_type != AttentionInputType.context_only
+        if (metadata.enable_flash_mla and forward_args.attention_input_type
+                != AttentionInputType.context_only
                 and metadata.num_generations > 0
                 and not metadata._flash_mla_metadata_valid):
             self._compute_flash_mla_metadata(metadata)
             metadata._flash_mla_metadata_valid = True
 
-        # Blackwell first_sparse: refresh at layer 0 before plan (mask zero is in wrapper.run).
+        # Blackwell first_sparse: refresh at layer 0 before kernel launch.
         layer_idx = self.get_local_layer_idx(metadata)
         if layer_idx == 0 and (metadata.spec_bl_tree_first_sparse_mask_offset_kv
                                is not None
                                and metadata._seq_lens_cuda is not None):
             metadata.update_blackwell_first_sparse_mask_offset()
 
-        self.wrapper.plan(
-            layer_idx=self.get_local_layer_idx(metadata),
-            tokens_per_block=metadata.tokens_per_block,
-            max_num_requests=metadata.max_num_requests,
-            max_sequence_length=metadata.max_seq_len,
-            max_context_length=min(metadata.max_seq_len - 1,
-                                   metadata.max_num_tokens),
-            attention_window_size=attention_window_size,
-            sink_token_length=0,
-            beam_width=metadata.beam_width,
-            sequence_length=metadata.kv_lens_cuda_runtime,
-            host_past_key_value_lengths=metadata.kv_lens_runtime,
-            host_total_kv_lens=metadata.host_total_kv_lens,
-            context_lengths=metadata.prompt_lens_cuda_runtime,
-            host_context_lengths=metadata.prompt_lens_cpu_runtime,
-            host_request_types=metadata.host_request_types_runtime,
-            kv_cache_block_offsets=metadata.kv_cache_block_offsets,
-            host_kv_cache_pool_pointers=metadata.host_kv_cache_pool_pointers,
-            host_kv_cache_pool_mapping=metadata.host_kv_cache_pool_mapping,
-            block_ids_per_seq=metadata.block_ids_per_seq,
-            flash_mla_tile_scheduler_metadata=metadata.
-            flash_mla_tile_scheduler_metadata
-            if metadata.enable_flash_mla else None,
-            flash_mla_num_splits=metadata.flash_mla_num_splits
-            if metadata.enable_flash_mla else None,
-            workspace=metadata.workspace
-            if not metadata.is_cuda_graph else metadata.cuda_graph_workspace,
-            cache_indirection=metadata.cache_indirection,
-            kv_scale_orig_quant=self.kv_scale_orig_quant,
-            kv_scale_quant_orig=self.kv_scale_quant_orig,
-            out_scale=out_scale,
-            out_scale_sf=out_scale_sf,
-            kv_scales_sf=kv_scales_sf,
-            kv_scales_sf_inv=kv_scales_sf_inv,
-            use_nvfp4_output=output_sf
-            is not None,  # NVFP4 output will setup output_sf tensor
-            use_paged_context_fmha=use_paged_context_fmha,
-            attention_input_type=attention_input_type,
-            latent_cache=latent_cache,
-            q_pe=q_pe,
-            mrope_config=mrope_config,
-            softmax_stats_tensor=softmax_stats_tensor,
-            is_spec_decoding_enabled=metadata.is_spec_decoding_enabled,
-            use_spec_decoding=metadata.use_spec_decoding,
-            is_spec_dec_tree=metadata.is_spec_dec_tree,
-            spec_decoding_position_offsets=metadata.
-            spec_decoding_position_offsets,
-            spec_decoding_packed_mask=metadata.spec_decoding_packed_mask,
-            spec_decoding_generation_lengths=metadata.
-            spec_decoding_generation_lengths,
-            spec_decoding_bl_tree_mask_offset=metadata.
-            spec_decoding_bl_tree_mask_offset,
-            spec_decoding_bl_tree_mask=metadata.spec_decoding_bl_tree_mask,
-            spec_bl_tree_first_sparse_mask_offset_kv=metadata.
-            spec_bl_tree_first_sparse_mask_offset_kv,
-            attention_sinks=attention_sinks,
-            chunked_prefill_buffer_batch_size=chunked_prefill_buffer_batch_size,
-            sparse_kv_indices=sparse_kv_indices,
-            sparse_kv_offsets=sparse_kv_offsets,
-            sparse_attn_indices=sparse_attn_indices,
-            sparse_attn_offsets=sparse_attn_offsets,
-            sparse_attn_indices_block_size=sparse_attn_indices_block_size,
-            num_sparse_topk=num_sparse_topk,
-            sparse_attention_config=self.sparse_attention_config,
-            skip_softmax_threshold_scale_factor_prefill=
-            skip_softmax_threshold_scale_factor_prefill,
-            skip_softmax_threshold_scale_factor_decode=
-            skip_softmax_threshold_scale_factor_decode,
-            helix_position_offsets=metadata.helix_position_offsets,
-            helix_is_inactive_rank=metadata.helix_is_inactive_rank,
-            sage_attn_num_elts_per_blk_q=sage_attn_num_elts_per_blk_q,
-            sage_attn_num_elts_per_blk_k=sage_attn_num_elts_per_blk_k,
-            sage_attn_num_elts_per_blk_v=sage_attn_num_elts_per_blk_v,
-            sage_attn_qk_int8=sage_attn_qk_int8,
-            quant_config=self.quant_config,
-            kv_cache_manager=metadata.kv_cache_manager,
-        )
-        self.wrapper.global_layer_idx = self.layer_idx
-
-        self.wrapper.run(q,
-                         output,
-                         output_sf,
-                         k,
-                         v,
-                         is_fused_qkv=not metadata.is_cross and k is None,
-                         update_kv_cache=not metadata.is_cross or k is not None,
-                         attention_mask=attention_mask,
-                         cu_q_seqlens=cu_q_seqlens,
-                         cu_kv_seqlens=cu_kv_seqlens,
-                         fmha_scheduler_counter=fmha_scheduler_counter,
-                         mla_bmm1_scale=mla_bmm1_scale,
-                         mla_bmm2_scale=mla_bmm2_scale,
-                         quant_q_buffer=quant_q_buffer,
-                         num_contexts=metadata.num_contexts,
-                         num_ctx_tokens=metadata.num_ctx_tokens)
+        self._run(q, k, v, output, output_sf, metadata, forward_args,
+                  use_paged_context_fmha, sparse_kv_indices, sparse_kv_offsets,
+                  sparse_attn_indices, sparse_attn_offsets,
+                  sparse_attn_indices_block_size, num_sparse_topk,
+                  skip_softmax_threshold_scale_factor_prefill,
+                  skip_softmax_threshold_scale_factor_decode)
 
         if output_sf is None:
             return output
@@ -2212,7 +1726,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_manager.max_seq_len,
             sink_token_length,
             beam_width,
-            self.wrapper.quant_mode,
+            self.quant_mode,
         )
 
         return compressed_kv, k_pe
@@ -2261,7 +1775,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_manager.max_seq_len,
             sink_token_length,
             beam_width,
-            self.wrapper.quant_mode,
+            self.quant_mode,
         )
         return output_kv, output_k_pe
 
@@ -2276,10 +1790,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert metadata.kv_cache_manager is not None
 
         # Ensure RoPE cos/sin table covers the sequence length before the
-        # kernel reads it.  plan() also calls ensure_rope_table_size, but it
-        # runs AFTER this method in the MLA context path.
-        self.wrapper.ensure_rope_table_size(
-            metadata.kv_cache_manager.max_seq_len)
+        # kernel reads it.
+        self._ensure_rope_table_size(metadata.kv_cache_manager.max_seq_len)
 
         sink_token_length = 0
         beam_width = 1
@@ -2291,7 +1803,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.ctx_cached_token_indptr,
             metadata.ctx_kv_indptr,
             metadata.max_ctx_seq_len,
-            self.wrapper.rotary_cos_sin,
+            self.rotary_cos_sin,
             self.num_heads,
             self.mla_params.qk_nope_head_dim,
             self.mla_params.qk_rope_head_dim,
@@ -2306,7 +1818,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_manager.max_seq_len,
             sink_token_length,
             beam_width,
-            self.wrapper.quant_mode,
+            self.quant_mode,
         )
 
     def merge_attention_for_mla(
@@ -2339,7 +1851,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         metadata: TrtllmAttentionMetadata,
-        **kwargs,
+        forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
             Predict sparse kv indices. It's implemented in the derived class.
@@ -2351,7 +1863,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         metadata: TrtllmAttentionMetadata,
-        **kwargs,
+        forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
             Predict sparse attn indices. It's implemented in the derived class.
@@ -2391,9 +1903,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         sink_token_length = 0
 
         # Ensure RoPE cos/sin table covers the sequence length before the
-        # kernel reads it.  plan() also calls ensure_rope_table_size, but it
-        # runs AFTER this method in the MLA generation path.
-        self.wrapper.ensure_rope_table_size(metadata.max_seq_len)
+        # kernel reads it.
+        self._ensure_rope_table_size(metadata.max_seq_len)
 
         helix_tensor_params = [
             metadata.helix_position_offsets, metadata.helix_is_inactive_rank
@@ -2403,7 +1914,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             fused_q,
             q_pe,
             latent_cache,
-            self.wrapper.rotary_cos_sin,
+            self.rotary_cos_sin,
             cu_q_seqlens,
             cu_kv_seqlens,
             fmha_scheduler_counter,
@@ -2422,20 +1933,20 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             out_scale,
             metadata.block_ids_per_seq,
             helix_tensor_params,
-            self.wrapper.predicted_tokens_per_seq,
+            self.predicted_tokens_per_seq,
             self.get_local_layer_idx(metadata),
-            self.wrapper.num_heads,
-            self.wrapper.num_kv_heads,
-            self.wrapper.head_size,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
             metadata.kv_cache_manager.tokens_per_block,
             metadata.max_seq_len,  # attention_window_size
             sink_token_length,
             metadata.beam_width,
-            self.wrapper.quant_mode,
-            self.wrapper.q_scaling,
-            self.wrapper.q_lora_rank,
-            self.wrapper.kv_lora_rank,
-            self.wrapper.qk_nope_head_dim,
-            self.wrapper.qk_rope_head_dim,
-            self.wrapper.v_head_dim,
+            self.quant_mode,
+            self.q_scaling,
+            self.q_lora_rank,
+            self.kv_lora_rank,
+            self.qk_nope_head_dim,
+            self.qk_rope_head_dim,
+            self.v_head_dim,
         )

@@ -68,8 +68,11 @@ enum class EltwiseActType
 
 struct TrtllmGenBatchedGemmRunnerOptions
 {
+    // Canonically, A is activation.
     batchedGemm::trtllm::gen::Dtype dtypeA;
+    // Canonically, B is weight.
     batchedGemm::trtllm::gen::Dtype dtypeB;
+    // C is output.
     batchedGemm::trtllm::gen::Dtype dtypeC;
     ActType actType{ActType::SwiGlu};
     EltwiseActType eltwiseActType{EltwiseActType::None};
@@ -77,6 +80,8 @@ struct TrtllmGenBatchedGemmRunnerOptions
     bool fusedAct{false};
     bool routeAct{false};
     bool staticBatch{false};
+    // Legacy: force transpose-only kernels. Used by fp8BatchedGemmTrtllmGen.
+    // MoE callers leave false (auto-selects transpose or non-transpose).
     bool transposeMmaOutput{false};
     int32_t tileSize{8};
     int32_t epilogueTileM{128};

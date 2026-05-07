@@ -48,6 +48,10 @@ struct XQAParams
     int32_t chunked_attention_size = INT_MAX;
     int32_t max_attention_window_size = 0;
     int32_t cyclic_attention_window_size = 0;
+    // Whether this is a sliding-window-causal layer. Computed once in AttentionOp from the
+    // declared mask type / RoPE config so kernel-selection code does not need to re-derive
+    // it from window/rope heuristics. See AttentionOp::convertMMHAParamsToXQAParams.
+    bool is_sliding_window = false;
     int32_t sink_token_length = 0;
     int max_past_kv_length = 0;
     void const* qkv_bias;

@@ -8,3 +8,6 @@ tornado>=6.5.5
 black>=26.3.1
 # Upgrade base image nvidia-cutlass-dsl 4.3.5 to 4.4.2
 nvidia-cutlass-dsl>=4.4.2
+# The `nvidia-cutlass-dsl` package does not pin numpy at all, which can be problematic in certain CI
+# stages.
+numpy>=2.0.0,<2.4 # numba 0.63.1 requires numpy<2.4

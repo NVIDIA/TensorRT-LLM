@@ -629,14 +629,16 @@ def apply_mm_hashes(
                 if isinstance(frame, torch.Tensor):
                     frame = frame.detach().cpu().contiguous()
                 hasher.update(serialize_item(frame))
-            # TODO(TRTLLM-12297): also fold metadata["audio_samples"] /
-            # metadata["audio_sample_rate"] into the hash when present.
-            # extract_audio=true makes audio affect token counts and
-            # embeddings (see modeling_nemotron_nano.py
-            # _expand_video_placeholders_in_token_ids and
-            # get_num_tokens_per_video), but two videos with identical
-            # frames and different audio currently share the same MM hash —
-            # KV-cache reuse can return stale audio-conditioned states.
+            metadata = item.metadata
+            if (isinstance(metadata, dict) and "audio_samples" in metadata
+                    and "audio_sample_rate" in metadata):
+                audio_samples = metadata["audio_samples"]
+                if isinstance(audio_samples, torch.Tensor):
+                    audio_samples = audio_samples.detach().cpu().contiguous()
+                hasher.update(b"<audio>")
+                hasher.update(
+                    serialize_item(
+                        (audio_samples, metadata["audio_sample_rate"])))
         else:
             hasher.update(serialize_item(item))
 
