@@ -35,13 +35,18 @@ from .ssd_state_passing import _state_passing_fwd
 # FlashInfer's fused CUTLASS SSD kernel lowers to tcgen05 MMA whose M-mode must
 # be 64 or 128. `dstate` is the M-mode of the inter-chunk MMA and `chunk_size`
 # is the M-mode of the intra-chunk MMAs, so both dimensions must satisfy this
-# constraint. Otherwise we fall back to the Triton reference kernels.
+# constraint. `headdim` controls the intra-chunk MMA tile along the head axis;
+# only 64 and 128 keep the planned TMEM footprint within SM100's 512-column
+# capacity (e.g. headdim=80 trips an internal TMEM-capacity assertion in
+# `_plan_tmem_offsets`). Otherwise we fall back to the Triton reference kernels.
 _FLASHINFER_SSD_VALID_M_MODES = (64, 128)
+_FLASHINFER_SSD_VALID_HEAD_DIMS = (64, 128)
 
 
-def _flashinfer_ssd_supported(chunk_size, dstate):
+def _flashinfer_ssd_supported(chunk_size, dstate, headdim):
     return (chunk_size in _FLASHINFER_SSD_VALID_M_MODES
-            and dstate in _FLASHINFER_SSD_VALID_M_MODES)
+            and dstate in _FLASHINFER_SSD_VALID_M_MODES
+            and headdim in _FLASHINFER_SSD_VALID_HEAD_DIMS)
 
 
 @functools.cache
@@ -106,6 +111,21 @@ def _mamba_chunk_scan_flashinfer_fwd(
         dt = F.pad(dt, (0, 0, 0, pad_len), value=-100.0)
         if seq_idx is not None:
             seq_idx = F.pad(seq_idx, (0, pad_len), value=int(num_seqs - 1))
+
+    # The SSDCombined kernel was compiled with B/C compact stride
+    # `b.strides[0] = N*G` (N=dstate=const), so the runtime check requires
+    # the seqlen stride divisible by N. Upstream split-then-view producers
+    # (e.g. AutoDeploy's projected_states split) leave seqlen-stride equal
+    # to the full projection width, which need not be a multiple of N.
+    # Materialize contiguous copies when necessary.
+    if not B.is_contiguous():
+        B = B.contiguous()
+    if not C.is_contiguous():
+        C = C.contiguous()
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if not dt.is_contiguous():
+        dt = dt.contiguous()
 
     if x.dtype != io_dtype:
         x = x.to(io_dtype)
@@ -370,11 +390,13 @@ def mamba_chunk_scan_combined(
                 ), "cu_seqlens must be provided if return_varlen_states is True"
 
     # Use the FlashInfer fused CUTLASS kernel on Blackwell (SM100+) when its
-    # MMA M-mode constraints on (chunk_size, dstate) are satisfied; otherwise
-    # fall through to the Triton reference kernels below.
+    # MMA tile constraints on (chunk_size, dstate, headdim) are satisfied;
+    # otherwise fall through to the Triton reference kernels below.
     dstate = B.shape[-1]
+    headdim = x.shape[-1]
     flashinfer_eligible = (return_varlen_states and z is None and is_sm_100f())
-    if flashinfer_eligible and _flashinfer_ssd_supported(chunk_size, dstate):
+    if flashinfer_eligible and _flashinfer_ssd_supported(
+            chunk_size, dstate, headdim):
         return _mamba_chunk_scan_flashinfer_fwd(
             x,
             dt,
@@ -398,9 +420,11 @@ def mamba_chunk_scan_combined(
     if flashinfer_eligible:
         logger.info_once(
             f"FlashInfer SSD unavailable for chunk_size={chunk_size}, "
-            f"dstate={dstate} (requires both in {_FLASHINFER_SSD_VALID_M_MODES}); "
+            f"dstate={dstate}, headdim={headdim} "
+            f"(requires chunk_size/dstate in {_FLASHINFER_SSD_VALID_M_MODES} "
+            f"and headdim in {_FLASHINFER_SSD_VALID_HEAD_DIMS}); "
             f"falling back to Triton SSD prefill",
-            key=f"triton_ssd_fallback_{chunk_size}_{dstate}",
+            key=f"triton_ssd_fallback_{chunk_size}_{dstate}_{headdim}",
         )
 
     out_x, dt_out, dA_cumsum, states, final_states, *rest = (
