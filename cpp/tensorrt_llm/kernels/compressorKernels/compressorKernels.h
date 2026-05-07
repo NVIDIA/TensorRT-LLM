@@ -41,11 +41,11 @@ void pagedKvCompressLaunch(void const* kv_score, // [m, 2*state_dim]  (bf16 or f
     int32_t const* block_table_score,            // [bsz, max_blocks]
     void* output,                                // [total_outputs, head_dim]
     int32_t const* kv_lens,                      // [bsz]
-    int32_t const* start_pos,                    // [bsz]
     int32_t const* cu_seq_lens,                  // [bsz+1]
     int32_t const* cu_kv_comp,                   // [bsz+1]
     int batch_size, int page_size, int max_blocks, int head_dim, int compress_ratio, int next_n,
-    int io_elem_bytes,                           // bytes per element for kv_score/paged (2=bf16, 4=fp32)
+    int kv_score_elem_bytes,                     // bytes per element for kv_score (2=bf16, 4=fp32)
+    int state_elem_bytes,                        // bytes per element for paged state (2=bf16, 4=fp32)
     int out_elem_bytes,                          // bytes per element for output
     cudaStream_t stream);
 
@@ -65,8 +65,8 @@ void prefillReductionLaunch(void const* kv_score, // [m, 2*state_dim]  (bf16 or 
     int32_t const* start_pos,                     // [bsz]
     int32_t const* cu_seq_lens,                   // [bsz+1]
     int32_t const* cu_kv_comp,                    // [bsz+1]
-    int batch_size, int page_size, int max_blocks, int head_dim, int compress_ratio, int max_outputs, int io_elem_bytes,
-    int out_elem_bytes, cudaStream_t stream);
+    int batch_size, int page_size, int max_blocks, int head_dim, int compress_ratio, int max_outputs,
+    int kv_score_elem_bytes, int state_elem_bytes, int out_elem_bytes, cudaStream_t stream);
 
 // RMSNorm + RoPE + Hadamard + paged scatter in a single kernel launch.
 // Optionally writes postprocessed result to kv_out (nullptr to skip).
