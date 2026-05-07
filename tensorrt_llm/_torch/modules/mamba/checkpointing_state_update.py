@@ -184,13 +184,15 @@ def _replay_precompute_impl(
     write_checkpoint,
 ):
     pid_grid = tl.program_id(axis=0)
+    # REVERSE_PERM walks the grid tail-first regardless of USE_PERM —
+    # combined with hardcode-sorted prev_tokens (kernel-side USE_PERM=False
+    # but PNAT pre-sorted write-first), reverse traversal makes the nowrite
+    # half front-load real work.
+    pid_grid_eff = (tl.num_programs(axis=0) - 1 - pid_grid) if REVERSE_PERM else pid_grid
     if USE_PERM:
-        if REVERSE_PERM:
-            pid_b = tl.load(slot_perm_ptr + (tl.num_programs(axis=0) - 1 - pid_grid))
-        else:
-            pid_b = tl.load(slot_perm_ptr + pid_grid)
+        pid_b = tl.load(slot_perm_ptr + pid_grid_eff)
     else:
-        pid_b = pid_grid
+        pid_b = pid_grid_eff
     pid_hg = tl.program_id(axis=1)  # head-group index
     first_head = pid_hg * HEADS_PER_BLOCK
 
@@ -464,13 +466,11 @@ def _checkpointing_precompute_kernel(
     # (PNAT + T > MAX) status matches WRITE_CHECKPOINT.
     if EARLY_OUT:
         pid_grid_eo = tl.program_id(axis=0)
+        pid_grid_eo_eff = (tl.num_programs(axis=0) - 1 - pid_grid_eo) if REVERSE_PERM else pid_grid_eo
         if USE_PERM:
-            if REVERSE_PERM:
-                pid_b_eo = tl.load(slot_perm_ptr + (tl.num_programs(axis=0) - 1 - pid_grid_eo))
-            else:
-                pid_b_eo = tl.load(slot_perm_ptr + pid_grid_eo)
+            pid_b_eo = tl.load(slot_perm_ptr + pid_grid_eo_eff)
         else:
-            pid_b_eo = pid_grid_eo
+            pid_b_eo = pid_grid_eo_eff
         if HAS_CACHE_BATCH_INDICES:
             cbi_eo = tl.load(state_batch_indices_ptr + pid_b_eo).to(tl.int64)
             if cbi_eo == pad_slot_id:
@@ -639,13 +639,15 @@ def _rectangle_precompute_impl(
     REVERSE_PERM: tl.constexpr,
 ):
     pid_grid = tl.program_id(axis=0)
+    # REVERSE_PERM walks the grid tail-first regardless of USE_PERM —
+    # combined with hardcode-sorted prev_tokens (kernel-side USE_PERM=False
+    # but PNAT pre-sorted write-first), reverse traversal makes the nowrite
+    # half front-load real work.
+    pid_grid_eff = (tl.num_programs(axis=0) - 1 - pid_grid) if REVERSE_PERM else pid_grid
     if USE_PERM:
-        if REVERSE_PERM:
-            pid_b = tl.load(slot_perm_ptr + (tl.num_programs(axis=0) - 1 - pid_grid))
-        else:
-            pid_b = tl.load(slot_perm_ptr + pid_grid)
+        pid_b = tl.load(slot_perm_ptr + pid_grid_eff)
     else:
-        pid_b = pid_grid
+        pid_b = pid_grid_eff
     pid_hg = tl.program_id(axis=1)
     first_head = pid_hg * HEADS_PER_BLOCK
 
@@ -1053,13 +1055,11 @@ def _rectangle_precompute_kernel(
     # skips slots whose PNAT + T > MAX (slots that would need write).
     if EARLY_OUT:
         pid_grid_eo = tl.program_id(axis=0)
+        pid_grid_eo_eff = (tl.num_programs(axis=0) - 1 - pid_grid_eo) if REVERSE_PERM else pid_grid_eo
         if USE_PERM:
-            if REVERSE_PERM:
-                pid_b_eo = tl.load(slot_perm_ptr + (tl.num_programs(axis=0) - 1 - pid_grid_eo))
-            else:
-                pid_b_eo = tl.load(slot_perm_ptr + pid_grid_eo)
+            pid_b_eo = tl.load(slot_perm_ptr + pid_grid_eo_eff)
         else:
-            pid_b_eo = pid_grid_eo
+            pid_b_eo = pid_grid_eo_eff
         if HAS_CACHE_BATCH_INDICES:
             cbi_eo = tl.load(state_batch_indices_ptr + pid_b_eo).to(tl.int64)
             if cbi_eo == pad_slot_id:
@@ -1537,13 +1537,11 @@ def _replay_main_impl(
 
     pid_m = tl.program_id(axis=0)
     pid_grid_b = tl.program_id(axis=1)
+    pid_grid_b_eff = (tl.num_programs(axis=1) - 1 - pid_grid_b) if REVERSE_PERM else pid_grid_b
     if USE_PERM:
-        if REVERSE_PERM:
-            pid_b = tl.load(slot_perm_ptr + (tl.num_programs(axis=1) - 1 - pid_grid_b))
-        else:
-            pid_b = tl.load(slot_perm_ptr + pid_grid_b)
+        pid_b = tl.load(slot_perm_ptr + pid_grid_b_eff)
     else:
-        pid_b = pid_grid_b
+        pid_b = pid_grid_b_eff
     pid_h = tl.program_id(axis=2)
 
     if HAS_CACHE_BATCH_INDICES:
@@ -1988,13 +1986,11 @@ def _checkpointing_main_kernel(
     # in dl/maindl chains start regardless of early-out outcome.
     if EARLY_OUT:
         pid_grid_eo = tl.program_id(axis=1)
+        pid_grid_eo_eff = (tl.num_programs(axis=1) - 1 - pid_grid_eo) if REVERSE_PERM else pid_grid_eo
         if USE_PERM:
-            if REVERSE_PERM:
-                pid_b_eo = tl.load(slot_perm_ptr + (tl.num_programs(axis=1) - 1 - pid_grid_eo))
-            else:
-                pid_b_eo = tl.load(slot_perm_ptr + pid_grid_eo)
+            pid_b_eo = tl.load(slot_perm_ptr + pid_grid_eo_eff)
         else:
-            pid_b_eo = pid_grid_eo
+            pid_b_eo = pid_grid_eo_eff
         if HAS_CACHE_BATCH_INDICES:
             cbi_eo = tl.load(state_batch_indices_ptr + pid_b_eo).to(tl.int64)
             if cbi_eo == pad_slot_id:
@@ -2194,13 +2190,11 @@ def _rectangle_main_impl(
 
     pid_m = tl.program_id(axis=0)
     pid_grid_b = tl.program_id(axis=1)
+    pid_grid_b_eff = (tl.num_programs(axis=1) - 1 - pid_grid_b) if REVERSE_PERM else pid_grid_b
     if USE_PERM:
-        if REVERSE_PERM:
-            pid_b = tl.load(slot_perm_ptr + (tl.num_programs(axis=1) - 1 - pid_grid_b))
-        else:
-            pid_b = tl.load(slot_perm_ptr + pid_grid_b)
+        pid_b = tl.load(slot_perm_ptr + pid_grid_b_eff)
     else:
-        pid_b = pid_grid_b
+        pid_b = pid_grid_b_eff
     pid_h = tl.program_id(axis=2)
 
     if HAS_CACHE_BATCH_INDICES:
@@ -2460,13 +2454,11 @@ def _rectangle_main_kernel(
     # Per-program early-out gate.  Rectangle is nowrite-only.
     if EARLY_OUT:
         pid_grid_eo = tl.program_id(axis=1)
+        pid_grid_eo_eff = (tl.num_programs(axis=1) - 1 - pid_grid_eo) if REVERSE_PERM else pid_grid_eo
         if USE_PERM:
-            if REVERSE_PERM:
-                pid_b_eo = tl.load(slot_perm_ptr + (tl.num_programs(axis=1) - 1 - pid_grid_eo))
-            else:
-                pid_b_eo = tl.load(slot_perm_ptr + pid_grid_eo)
+            pid_b_eo = tl.load(slot_perm_ptr + pid_grid_eo_eff)
         else:
-            pid_b_eo = pid_grid_eo
+            pid_b_eo = pid_grid_eo_eff
         if HAS_CACHE_BATCH_INDICES:
             cbi_eo = tl.load(state_batch_indices_ptr + pid_b_eo).to(tl.int64)
             if cbi_eo == pad_slot_id:

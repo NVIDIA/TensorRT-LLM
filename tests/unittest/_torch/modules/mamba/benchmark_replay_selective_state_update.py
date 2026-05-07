@@ -556,6 +556,7 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
     modes_list = getattr(args, "modes_list", ["monolithic"])
     sort_list = getattr(args, "sort_slots_list", [False])
     rev_list = getattr(args, "reverse_nowrite_list", [False])
+    hsort_list = getattr(args, "hardcode_sort_list", [False])
 
     configs = []
     for batch in batch_sizes:
@@ -585,29 +586,37 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
                                     effective_sort_list = (
                                         sort_list if can_sort else [False]
                                     )
+                                    effective_hsort_list = (
+                                        hsort_list if can_sort else [False]
+                                    )
                                     for sort_slots in effective_sort_list:
                                         effective_rev_list = (
                                             rev_list if sort_slots else [False]
                                         )
                                         for reverse_nowrite in effective_rev_list:
-                                            configs.append((
-                                                batch, mtp_len, prev_ks,
-                                                state_dtype, act_dtype,
-                                                sr_mode, rect, write_ckpt, mode,
-                                                sort_slots, reverse_nowrite,
-                                            ))
+                                            for hardcode_sort in effective_hsort_list:
+                                                if sort_slots and hardcode_sort:
+                                                    continue
+                                                configs.append((
+                                                    batch, mtp_len, prev_ks,
+                                                    state_dtype, act_dtype,
+                                                    sr_mode, rect, write_ckpt, mode,
+                                                    sort_slots, reverse_nowrite,
+                                                    hardcode_sort,
+                                                ))
 
     print(f"[compile-warmup] {len(configs)} configs across {max_workers} threads")
     t0 = time.perf_counter()
 
     def _warm(cfg):
         (batch, mtp_len, prev_ks, state_dtype, act_dtype, sr_mode,
-         rect, write_ckpt, mode, sort_slots, reverse_nowrite) = cfg
+         rect, write_ckpt, mode, sort_slots, reverse_nowrite, hardcode_sort) = cfg
         _bench_config(
             args, batch, mtp_len, prev_ks, state_dtype, act_dtype, baseline_fn,
             sr_mode=sr_mode, rectangle_for_nowrite=rect,
             write_checkpoint=write_ckpt, mode=mode,
             sort_slots=sort_slots, reverse_nowrite=reverse_nowrite,
+            hardcode_sort=hardcode_sort,
             warmup_only=True,
         )
 
@@ -646,6 +655,8 @@ def _bench_config(
     sort_slots: bool = False,
     reverse_nowrite: bool = False,
     perm_samples_cpu=None,
+    hardcode_sort: bool = False,
+    mix_samples_sorted_cpu=None,
     warmup_only: bool = False,
 ) -> None:
     """
@@ -935,7 +946,13 @@ def _bench_config(
     # nsys-included warmup leaks aren't biased).
     if mix_samples_cpu is not None and mode != "monolithic":
         device = state_work.device
-        samples_gpu = torch.from_numpy(mix_samples_cpu).to(device=device, dtype=torch.int32)
+        # Hardcode-sort: per-iter prev_tokens are CPU-sorted write-first.
+        # Kernel runs USE_PERM=False but the EO gate sees clustered modes.
+        # Output is scrambled (we don't permute x/B/C/dt to match) but
+        # timing is meaningful — isolates clustering benefit from the
+        # per-program perm-load overhead in --sort-slots.
+        src = mix_samples_sorted_cpu if (hardcode_sort and mix_samples_sorted_cpu is not None) else mix_samples_cpu
+        samples_gpu = torch.from_numpy(src).to(device=device, dtype=torch.int32)
 
         if sort_slots and perm_samples_cpu is not None:
             perm_samples_gpu = torch.from_numpy(perm_samples_cpu).to(
@@ -1015,6 +1032,11 @@ def _bench_config(
                     extra_kwargs["mode"] = mode
                     if sort_slots:
                         extra_kwargs["slot_perm"] = slot_perm_buf
+                    # reverse_nowrite is meaningful in two ways:
+                    #   - with slot_perm: walk the perm tail-first
+                    #   - without slot_perm (hardcode-sort): walk pid_b
+                    #     itself tail-first via the REVERSE_PERM constexpr
+                    if sort_slots or (hardcode_sort and reverse_nowrite):
                         extra_kwargs["reverse_nowrite"] = reverse_nowrite
                     if state_scales_work is not None:
                         extra_kwargs["state_scales"] = state_scales_work
@@ -1073,6 +1095,7 @@ def _bench_config(
             parts.append(f"MODE={mode}")
             parts.append(f"SORT={1 if sort_slots else 0}")
             parts.append(f"REVN={1 if reverse_nowrite else 0}")
+            parts.append(f"HSORT={1 if hardcode_sort else 0}")
             sweep_suffix = (" " + ",".join(parts)) if parts else ""
             sweep_tag = tag + sweep_suffix.replace(" ", "_").replace(",", "_")
 
@@ -1206,6 +1229,7 @@ def _run_benchmark(args) -> None:
     modes_list = getattr(args, "modes_list", ["monolithic"])
     sort_list = getattr(args, "sort_slots_list", [False])
     rev_list = getattr(args, "reverse_nowrite_list", [False])
+    hsort_list = getattr(args, "hardcode_sort_list", [False])
 
     # Pre-load AL distribution for mix mode (if --mix-csv set).
     mix_al = None
@@ -1230,6 +1254,7 @@ def _run_benchmark(args) -> None:
             # args.mix_iters since mix scenarios use mix_iters.
             mix_samples_cpu = None
             perm_samples_cpu = None  # per-iter slot perm sorted write-first
+            mix_samples_sorted_cpu = None  # per-iter prev_tokens, write-first
             if mix_al is not None:
                 from checkpoint_mix_sim import sample_steady_state_pnat as _sample_pnat
                 _max_window = getattr(args, "max_window", 0) or mtp_len
@@ -1238,15 +1263,24 @@ def _run_benchmark(args) -> None:
                     mix_al, T=mtp_len, window=_max_window, batch=batch,
                     K=args.warmup + _max_iters, seed=args.mix_seed,
                 )
-                if any(sort_list):
+                if any(sort_list) or any(hsort_list):
                     # write-first stable argsort: kind='stable' preserves
                     # original-slot order within each mode group.
                     write_mask = (
                         mix_samples_cpu + mtp_len > _max_window
                     ).astype(np.int8)  # 1 = write, 0 = nowrite
-                    perm_samples_cpu = np.argsort(
+                    perm_idx = np.argsort(
                         -write_mask, kind="stable", axis=-1
                     ).astype(np.int32)
+                    if any(sort_list):
+                        perm_samples_cpu = perm_idx
+                    if any(hsort_list):
+                        # Apply the perm to the prev_tokens samples themselves.
+                        # Result row i = mix_samples_cpu[i] reordered such
+                        # that write-mode entries come first.
+                        mix_samples_sorted_cpu = np.take_along_axis(
+                            mix_samples_cpu, perm_idx, axis=-1
+                        ).astype(mix_samples_cpu.dtype)
 
             for state_dtype in state_dtypes:
                 for act_dtype in act_dtypes:
@@ -1289,24 +1323,44 @@ def _run_benchmark(args) -> None:
                                     effective_sort_list = (
                                         sort_list if can_sort else [False]
                                     )
+                                    effective_hsort_list = (
+                                        hsort_list if can_sort else [False]
+                                    )
                                     for sort_slots in effective_sort_list:
-                                        effective_rev_list = (
-                                            rev_list if sort_slots else [False]
-                                        )
-                                        for reverse_nowrite in effective_rev_list:
-                                            _bench_config(
-                                                args, batch, mtp_len, prev_ks,
-                                                state_dtype, act_dtype,
-                                                baseline_fn, sr_mode=sr_mode,
-                                                rectangle_for_nowrite=rect,
-                                                write_checkpoint=write_ckpt,
-                                                mode=mode,
-                                                mix_samples_cpu=mix_samples_cpu,
-                                                mix_label=mix_label,
-                                                sort_slots=sort_slots,
-                                                reverse_nowrite=reverse_nowrite,
-                                                perm_samples_cpu=perm_samples_cpu,
+                                        for hardcode_sort in effective_hsort_list:
+                                            # sort_slots and hardcode_sort
+                                            # are alternative experiments
+                                            # for the same idea — skip the
+                                            # combined cell to avoid double
+                                            # interpretation.
+                                            if sort_slots and hardcode_sort:
+                                                continue
+                                            # rev=1 is meaningful with EITHER
+                                            # sort_slots=1 (perm-based) or
+                                            # hardcode_sort=1 (raw pid_b
+                                            # subtraction in unsorted-perm
+                                            # path).  rev=1 with both 0 is
+                                            # a no-op.
+                                            effective_rev_list = (
+                                                rev_list if (sort_slots or hardcode_sort) else [False]
                                             )
+                                            for reverse_nowrite in effective_rev_list:
+                                                _bench_config(
+                                                    args, batch, mtp_len,
+                                                    prev_ks, state_dtype,
+                                                    act_dtype, baseline_fn,
+                                                    sr_mode=sr_mode,
+                                                    rectangle_for_nowrite=rect,
+                                                    write_checkpoint=write_ckpt,
+                                                    mode=mode,
+                                                    mix_samples_cpu=mix_samples_cpu,
+                                                    mix_label=mix_label,
+                                                    sort_slots=sort_slots,
+                                                    reverse_nowrite=reverse_nowrite,
+                                                    perm_samples_cpu=perm_samples_cpu,
+                                                    hardcode_sort=hardcode_sort,
+                                                    mix_samples_sorted_cpu=mix_samples_sorted_cpu,
+                                                )
 
     if args.profile:
         torch.cuda.cudart().cudaProfilerStop()
@@ -1607,6 +1661,19 @@ def _parse_args() -> argparse.Namespace:
         "work.  reverse=1 with sort=0 is skipped (no perm to reverse).",
     )
     parser.add_argument(
+        "--hardcode-sort",
+        type=str,
+        default="0",
+        help="Comma-separated 0/1.  When 1, the per-iter prev_tokens "
+        "samples are pre-sorted write-first OFFLINE (CPU-side) before "
+        "the timed region — kernel runs unchanged (USE_PERM=False) but "
+        "the EO gate sees sorted PNAT so early-outs cluster naturally. "
+        "Zero per-program load cost vs --sort-slots; output is "
+        "scrambled (we don't permute x/B/C/dt) but timing is meaningful. "
+        "Used to isolate whether clustering helps independent of the "
+        "perm-load overhead in the sort-slots path.",
+    )
+    parser.add_argument(
         "--mix-iters",
         type=int,
         default=None,
@@ -1690,6 +1757,14 @@ def _parse_args() -> argparse.Namespace:
             parser.error(f"--reverse-nowrite value must be 0 or 1, got {v!r}")
         rev_list.append(v == "1")
     args.reverse_nowrite_list = rev_list
+
+    hsort_modes = [v.strip() for v in (args.hardcode_sort or "0").split(",") if v.strip()]
+    hsort_list = []
+    for v in hsort_modes:
+        if v not in ("0", "1"):
+            parser.error(f"--hardcode-sort value must be 0 or 1, got {v!r}")
+        hsort_list.append(v == "1")
+    args.hardcode_sort_list = hsort_list
 
     if args.write_modes is not None:
         wm = [v.strip() for v in args.write_modes.split(",") if v.strip()]
