@@ -1391,11 +1391,14 @@ def trtllm_mxfp4_w4a16_moe_fused(
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
 
-    # Top-k routing (RenormalizeMoeRoutingMethod): logits -> topk -> softmax-of-topk.
-    # Done outside the kernel because bf16_mxe2m1_block_scale_moe_runner expects
-    # pre-computed topk_weights / topk_ids when routing_logits is None.
+    # Top-k routing — match PT's RenormalizeMoeRoutingMethod which casts to
+    # fp32 for the softmax to keep numerical precision (then casts back to
+    # the activation dtype for the kernel call). bf16 softmax over close
+    # logits can produce degenerate probabilities (all close to 1/k or
+    # extremely skewed), which translates to bad expert mixing and
+    # garbage-looking generation even when shapes/layouts are correct.
     router_logits = torch.nn.functional.linear(x2d, router_weight, router_bias)
-    topk_vals, topk_ids = torch.topk(router_logits, top_k, dim=-1)
+    topk_vals, topk_ids = torch.topk(router_logits.to(torch.float32), top_k, dim=-1)
     topk_weights = torch.nn.functional.softmax(topk_vals, dim=-1)
 
     # Pad activations to the kernel's expected hidden (H_pad, multiple of 512).
