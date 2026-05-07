@@ -542,7 +542,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         Gated on ``mm_bidirectional_blocks`` written by the input processor —
         causal-MM models (Llava, Qwen-VL) skip this entirely.
         """
-        mm_data = getattr(req, "py_multimodal_data", None) or {}
+        # `getattr(..., None) or {}` is not enough: on a Mock req the attribute
+        # exists as a Mock (truthy) and `.get` returns another Mock (also
+        # truthy). Require an actual dict — that's also what the input
+        # processor writes in inputs/registry.py.
+        mm_data = getattr(req, "py_multimodal_data", None)
+        if not isinstance(mm_data, dict):
+            return chunk_size
         if not mm_data.get("mm_bidirectional_blocks", False):
             return chunk_size
         cumsum = mm_data.get("multimodal_embed_mask_cumsum")
