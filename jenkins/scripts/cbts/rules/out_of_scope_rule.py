@@ -57,14 +57,24 @@ OUT_OF_SCOPE_PREFIXES: tuple[str, ...] = (
     "jenkins/scripts/cbts/",
 )
 
-# Path suffixes (extensions) under tests/ with no test-execution impact.
-OUT_OF_SCOPE_TESTS_SUFFIXES: tuple[str, ...] = (".md",)
+# Path suffixes (extensions) with no test-execution impact, anywhere in
+# the tree. Excludes `*.txt` (requirements.txt / constraints.txt are
+# runtime-relevant).
+OUT_OF_SCOPE_SUFFIXES: tuple[str, ...] = (
+    ".md",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg",
+    ".webp",
+)
 
 
 def is_out_of_scope(path: str) -> bool:
     if any(path.startswith(p) for p in OUT_OF_SCOPE_PREFIXES):
         return True
-    if path.startswith("tests/") and path.endswith(OUT_OF_SCOPE_TESTS_SUFFIXES):
+    if path.endswith(OUT_OF_SCOPE_SUFFIXES):
         return True
     return False
 

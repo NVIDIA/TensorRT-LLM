@@ -47,6 +47,7 @@ from blocks import (  # noqa: E402
     write_filtered_test_db,
 )
 from rules._helpers import strip_noop_diff_lines  # noqa: E402
+from rules.auto_deploy_rule import AutoDeployRule  # noqa: E402
 from rules.base import PRInputs, Rule, RuleResult  # noqa: E402
 from rules.out_of_scope_rule import OutOfScopeRule  # noqa: E402
 from rules.test_list_rule import TestListRule  # noqa: E402
@@ -56,7 +57,13 @@ from rules.waives_rule import WaivesRule  # noqa: E402
 # --- Rule registry -----------------------------------------------------------
 
 # Classes are used for `--list-needed-diffs` (no need to construct).
-RULE_CLASSES: list[type[Rule]] = [WaivesRule, TestsDefRule, TestListRule, OutOfScopeRule]
+RULE_CLASSES: list[type[Rule]] = [
+    WaivesRule,
+    TestsDefRule,
+    TestListRule,
+    AutoDeployRule,
+    OutOfScopeRule,
+]
 
 
 def build_rules(
@@ -68,6 +75,7 @@ def build_rules(
         WaivesRule(yaml_index, stages),
         TestsDefRule(yaml_index, stages, repo_root=repo_root),
         TestListRule(yaml_index, stages, repo_root=repo_root),
+        AutoDeployRule(yaml_index, stages),
         OutOfScopeRule(yaml_index, stages),
     ]
 
@@ -108,7 +116,9 @@ class SelectionResult:
 
 # Scopes that compose: a PR mixing waive + test-def + test-list edits
 # combines to a single "testsonly" scope rather than falling back.
-_TESTSONLY_FAMILY: frozenset[str] = frozenset({"waiveonly", "testdefonly", "testlistonly"})
+_TESTSONLY_FAMILY: frozenset[str] = frozenset(
+    {"waiveonly", "testdefonly", "testlistonly", "autodeployonly"}
+)
 
 
 def _combine_scopes(scopes: list[str]) -> Optional[str]:

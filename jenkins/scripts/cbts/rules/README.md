@@ -11,7 +11,8 @@ for the overall CBTS architecture.
 | `waives_rule.py` | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `tests_def_rule.py` | `TestsDefRule` | `testdefonly` | `tests/**/*` (any file under tests/) |
 | `test_list_rule.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
-| `out_of_scope_rule.py` | `OutOfScopeRule` | `noop` | `tests/integration/test_lists/{qa,dev}/**`, `tests/integration/defs/.test_durations*`, `tests/microbenchmarks/**`, `tests/**/*.md` |
+| `auto_deploy_rule.py` | `AutoDeployRule` | `autodeployonly` | `examples/auto_deploy/**` (non-`.md`), `tensorrt_llm/_torch/auto_deploy/**` (non-`.md`) |
+| `out_of_scope_rule.py` | `OutOfScopeRule` | `noop` | `tests/integration/test_lists/{qa,dev}/**`, `tests/integration/defs/.test_durations*`, `tests/microbenchmarks/**`, `**/*.md`, `**/*.{png,jpg,jpeg,gif,svg,webp}` |
 
 ## WaivesRule
 
@@ -103,6 +104,45 @@ Outcomes:
 - Some added entries resolved → `scope=testlistonly`; unresolved entries
   are noted in the reason and ignored for narrowing.
 
+## AutoDeployRule
+
+Path-only rule. Claims source files under `examples/auto_deploy/` and
+`tensorrt_llm/_torch/auto_deploy/` (excluding `.md`, which
+`OutOfScopeRule` claims as noop).
+
+Block selection — entry-based, two cases:
+- **Primary**: blocks where `condition.terms.backend == 'autodeploy'`.
+  Covers the 9 AD-conditioned blocks across all yamls.
+- **Supplementary**: blocks containing entries with
+  `test_llm_api_autodeploy.py` in the path or `_autodeploy-` in the
+  parametrize id. Covers 3 entries that live in `backend: pytorch`
+  blocks (l0_l40s, l0_perf) because Jenkins has no `L40S-AutoDeploy-*`
+  / `H100-Perf-AutoDeploy-*` stage to consume a proper AD-conditioned
+  block. The two patterns are stable conventions
+  (`test_llm_api_autodeploy.py` is the AD accuracy filename;
+  `_autodeploy-` is the cross-codebase backend parametrize value).
+
+For each matched block, `block_filters` keeps only the AD entries
+(every entry for AD-conditioned blocks; only entries matching the
+supplementary patterns for leaker blocks). Non-AD siblings in leaker
+blocks stay governed by other rules.
+
+Outcomes:
+- No AD source files in the diff → rule returns `None`.
+- AD source touched → `scope=autodeployonly`; sanity off
+  (AD changes don't affect wheel sanity); perfsanity on iff a
+  matched block lives in `l0_perf` or `*perf_sanity*`.
+- AD source touched but no AD block found anywhere (defensive) →
+  `scope=None` (fallback).
+
+Why narrowing is safe: AD is a beta backend isolated from the main
+PyTorch backend. The 7 reverse imports of AD from non-AD code in
+`bench/`, `executor/`, `commands/serve.py` are all lazy, guarded by
+`if backend == "_autodeploy"`, so AD-only changes don't affect tests
+that use the default PyTorch backend.
+`scripts/check_auto_deploy_imports.py` enforces AD's outbound import
+discipline statically.
+
 ## OutOfScopeRule
 
 Pure pattern match. Claims a changed file as `scope=noop` when it lives
@@ -114,10 +154,13 @@ in any subtree neither pre-merge nor post-merge L0 consumes:
   consumer.
 - `tests/integration/defs/.test_durations` — pytest-split timing cache.
 - `tests/microbenchmarks/` — benchmarking scripts, no L0 stage.
-- `tests/**/*.md` — Markdown docs.
+- Any `*.md` file (docs anywhere in the repo cannot affect L0 tests).
+- Image extensions (`.png`, `.jpg`, `.jpeg`, `.gif`, `.svg`, `.webp`)
+  anywhere in the repo.
 
-`OUT_OF_SCOPE_PREFIXES` and `OUT_OF_SCOPE_TESTS_SUFFIXES` in
-`out_of_scope_rule.py` list the patterns.
+Excludes `*.txt` (`requirements.txt` / `constraints.txt` are
+runtime-relevant). `OUT_OF_SCOPE_PREFIXES` and `OUT_OF_SCOPE_SUFFIXES`
+in `out_of_scope_rule.py` list the patterns.
 
 ## Helpers (`_helpers.py`)
 

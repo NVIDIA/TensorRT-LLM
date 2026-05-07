@@ -20,14 +20,15 @@ filter chain.
 
 ## Rules
 
-Four rules, registered in `main.py::RULE_CLASSES`:
+Five rules, registered in `main.py::RULE_CLASSES`:
 
 | Rule | Scope | Files |
 |---|---|---|
 | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `TestsDefRule` | `testdefonly` | `tests/**/*` (.py via AST; data files via dir walk-up) |
 | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
-| `OutOfScopeRule` | `noop` | QA / dev test lists, `.test_durations`, `microbenchmarks/`, `tests/**/*.md` |
+| `AutoDeployRule` | `autodeployonly` | `examples/auto_deploy/**`, `tensorrt_llm/_torch/auto_deploy/**` (excl. `.md`) |
+| `OutOfScopeRule` | `noop` | QA / dev test lists, `.test_durations`, `microbenchmarks/`, `**/*.md`, `**/*.{png,jpg,jpeg,gif,svg,webp}` |
 
 See `rules/README.md` for per-rule logic.
 
