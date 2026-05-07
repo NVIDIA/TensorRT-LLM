@@ -249,7 +249,6 @@ class KimiK2RotaryEmbedding(RotaryEmbeddingBase):
     def forward(
         self, x: torch.Tensor, seq_len: Optional[int] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        del seq_len
         return build_rope_cos_sin_cache(
             self.inv_freq, self.max_position_embeddings, x, self.attention_scaling
         )
