@@ -126,9 +126,9 @@ Priority KvCache::getPriority(BlockOrdinal ordinal, LifeCycleId lc) const
     return mPriorityCb(ordinal, lc);
 }
 
-std::weak_ptr<StorageManager> KvCache::storageManager() const
+StorageManager* KvCache::storageManager() const
 {
-    return mManager->storage().shared_from_this();
+    return &mManager->storage();
 }
 
 std::vector<KvCache::ActivePage> KvCache::_activePages() const
@@ -776,13 +776,11 @@ std::vector<KvCache::StaleBackup> KvCache::_unlockStaleBlocks(int newHistoryLeng
             for (int bi = 0; bi < static_cast<int>(sb.pages.size()); ++bi)
             {
                 auto& bp = sb.pages[bi][static_cast<size_t>(lcIdx)];
-                if (std::holds_alternative<SharedPageLock>(bp))
-                {
-                    auto holder = blockPageGetPage(bp)->hold();
-                    ret.push_back({static_cast<BlockOrdinal>(ord), static_cast<BeamIndex>(bi),
-                        static_cast<LifeCycleId>(lcIdx), holder});
-                    bp = holdForCommit ? BlockPage{std::move(holder)} : BlockPage{std::monostate{}};
-                }
+                assert(std::holds_alternative<SharedPageLock>(bp));
+                auto holder = blockPageGetPage(bp)->hold();
+                ret.push_back({static_cast<BlockOrdinal>(ord), static_cast<BeamIndex>(bi),
+                    static_cast<LifeCycleId>(lcIdx), holder});
+                bp = holdForCommit ? BlockPage{std::move(holder)} : BlockPage{std::monostate{}};
             }
         }
     }
@@ -822,17 +820,15 @@ std::vector<KvCache::TakenPage> KvCache::_takeUncommittedPage(
         if (auto* lock = std::get_if<SharedPageLock>(&bp))
         {
             auto up = std::dynamic_pointer_cast<UncommittedPage>(lock->page());
-            if (up)
-                result[lc] = {up, true};
+            assert(up && "page must be UncommittedPage");
+            result[lc] = {up, true};
         }
         else if (auto* holder = std::get_if<std::shared_ptr<PageHolder>>(&bp))
         {
-            if (*holder)
-            {
-                auto up = std::dynamic_pointer_cast<UncommittedPage>((*holder)->page);
-                if (up)
-                    result[lc] = {up, false};
-            }
+            assert(*holder);
+            auto up = std::dynamic_pointer_cast<UncommittedPage>((*holder)->page);
+            assert(up && "page must be UncommittedPage");
+            result[lc] = {up, false};
         }
         bp = std::monostate{};
     }
@@ -1088,8 +1084,9 @@ void KvCache::stopCommitting()
     assert(mCommitState == CommitState::ALLOWED);
 
     int tokensLeft = static_cast<int>(mCommittedTokens.size()) - mNumCommittedBlocks * mTokensPerBlock;
-    if (tokensLeft > 0 && mNumCommittedBlocks < static_cast<int>(mBlocks.size()))
+    if (tokensLeft > 0)
     {
+        assert(mNumCommittedBlocks < static_cast<int>(mBlocks.size()));
         auto scope = recordEventScope();
         // isLast=true: _commitBlock handles USER_STOP + _onStopCommitting() internally.
         _commitBlock(mNumCommittedBlocks, /*isLast=*/true);
@@ -1121,10 +1118,9 @@ void KvCache::_onStopCommitting()
         int start = std::max(staleRange.beg, mNumCommittedBlocks);
         int end = staleRange.end;
 
+        assert(end <= static_cast<int>(mBlocks.size()));
         for (int ord = start; ord < end; ++ord)
         {
-            if (ord >= static_cast<int>(mBlocks.size()))
-                break;
             auto& sb = mBlocks[static_cast<size_t>(ord)];
             assert(!sb.isCommitted());
             for (auto& beamPages : sb.pages)
@@ -1491,8 +1487,7 @@ int KvCache::updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc,
             using T = std::decay_t<decltype(b)>;
             if constexpr (std::is_same_v<T, std::vector<int>>)
             {
-                if (static_cast<int>(b.size()) <= ord)
-                    b.resize(static_cast<size_t>(ord + 1), kBadPageIndex);
+                assert(static_cast<int>(b.size()) > ord);
             }
             else
             {
@@ -1593,6 +1588,7 @@ int KvCache::getSsmBlockBaseIndex(LayerGroupId lgId, BeamIndex beamIdx) const
     auto const& bp = mSsmBlocks.at(static_cast<size_t>(beamIdx)).at(static_cast<size_t>(lgId));
     if (blockPageIsNull(bp))
         return kBadPageIndex;
+    assert(std::holds_alternative<SharedPageLock>(bp));
     auto const& pg = blockPageGetPage(bp);
     assert(pg && "SSM block must have a valid page");
     return static_cast<int>(pg->slotId()); // asserts valid slot

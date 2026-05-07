@@ -31,7 +31,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // Page
 // ---------------------------------------------------------------------------
 
-Page::Page(std::shared_ptr<StorageManager> mgr, LifeCycleId lc, CacheLevel level, Priority prio)
+Page::Page(StorageManager* mgr, LifeCycleId lc, CacheLevel level, Priority prio)
     : manager(mgr)
     , lifeCycle(lc)
     , cacheLevel(level)
@@ -47,14 +47,11 @@ Page::~Page()
             && "Page destroyed while still held or scheduled for eviction"));
     if (hasValidSlot())
     {
-        if (auto mgr = manager.lock())
-        {
-            Slot s;
-            s.setSlotId(slotId());
-            s.readyEvent = std::move(readyEvent);
-            resetSlot();
-            mgr->releaseSlot(lifeCycle, cacheLevel, std::move(s));
-        }
+        Slot s;
+        s.setSlotId(slotId());
+        s.readyEvent = std::move(readyEvent);
+        resetSlot();
+        manager->releaseSlot(lifeCycle, cacheLevel, std::move(s));
     }
 }
 
@@ -82,13 +79,10 @@ std::shared_ptr<PageHolder> Page::hold()
     // If we were scheduled for eviction but are no longer evictable (just got held), remove.
     if (scheduledForEviction())
     {
-        if (auto mgr = manager.lock())
+        if (!manager->isEvictable(*this))
         {
-            if (!mgr->isEvictable(*this))
-            {
-                mgr->excludeFromEviction(*this);
-                assert(!scheduledForEviction());
-            }
+            manager->excludeFromEviction(*this);
+            assert(!scheduledForEviction());
         }
     }
     return h;
@@ -104,7 +98,7 @@ SharedPageLock Page::lock(KvCache& kvCache, BeamIndex beamIndex, BlockOrdinal or
 // ---------------------------------------------------------------------------
 
 CommittedPage::CommittedPage(
-    std::shared_ptr<StorageManager> mgr, std::shared_ptr<Block> blk, LifeCycleId lc, CacheLevel level, Priority prio)
+    StorageManager* mgr, std::shared_ptr<Block> blk, LifeCycleId lc, CacheLevel level, Priority prio)
     : Page(mgr, lc, level, prio)
     , block(blk)
 {
@@ -115,11 +109,8 @@ CommittedPage::~CommittedPage()
     auto blk = block.lock();
     if (blk)
     {
-        if (auto mgr = manager.lock())
-        {
-            LifeCycle const& lc = mgr->lifeCycles().getLifeCycle(lifeCycle);
-            blk->unsetPage(lifeCycle, lc);
-        }
+        LifeCycle const& lc = manager->lifeCycles().getLifeCycle(lifeCycle);
+        blk->unsetPage(lifeCycle, lc);
     }
     // Delegate slot release to Page::~Page().
 }
@@ -129,8 +120,8 @@ CommittedPage::~CommittedPage()
 // ---------------------------------------------------------------------------
 
 UncommittedPage::UncommittedPage(KvCache& kvc, BlockOrdinal ord, LifeCycleId lc, CacheLevel level, BeamIndex bi)
-    : Page(kvc.storageManager().lock(), lc, level, kvc.getPriority(ord, lc))
-    , kvCache(kvc.weak_from_this())
+    : Page(kvc.storageManager(), lc, level, kvc.getPriority(ord, lc))
+    , kvCache(&kvc)
     , ordinal(ord)
     , beamIndex(bi)
 {
@@ -146,28 +137,22 @@ UncommittedPage::~UncommittedPage()
     // switching to monostate, so during destruction the slot still references this page.
     if (!gNdebug)
     {
-        if (auto mgr = manager.lock())
+        auto ssmLcId = manager->lifeCycles().ssmLifeCycleId();
+        bool isSsm = ssmLcId.has_value() && lifeCycle == *ssmLcId;
+        if (!isSsm)
         {
-            auto ssmLcId = mgr->lifeCycles().ssmLifeCycleId();
-            bool isSsm = ssmLcId.has_value() && lifeCycle == *ssmLcId;
-            if (!isSsm)
+            [[maybe_unused]] bool blockRemoved = static_cast<int>(kvCache->blocks().size()) <= ordinal;
+            [[maybe_unused]] bool pageOk = true;
+            if (!blockRemoved)
             {
-                if (auto kvc = kvCache.lock())
-                {
-                    [[maybe_unused]] bool blockRemoved = static_cast<int>(kvc->blocks().size()) <= ordinal;
-                    [[maybe_unused]] bool pageOk = true;
-                    if (!blockRemoved)
-                    {
-                        auto const& bp = kvc->blocks()[static_cast<size_t>(ordinal)]
-                                             .pages[static_cast<size_t>(beamIndex)][static_cast<size_t>(lifeCycle)];
-                        auto page = blockPageGetPage(bp);
-                        pageOk = blockPageIsNull(bp) || page.get() == this
-                            || std::dynamic_pointer_cast<CommittedPage>(page) != nullptr;
-                    }
-                    assert((blockRemoved || pageOk)
-                        && "UncommittedPage destroyed but slot still holds a different uncommitted page");
-                }
+                auto const& bp = kvCache->blocks()[static_cast<size_t>(ordinal)]
+                                     .pages[static_cast<size_t>(beamIndex)][static_cast<size_t>(lifeCycle)];
+                auto page = blockPageGetPage(bp);
+                pageOk = blockPageIsNull(bp) || page.get() == this
+                    || std::dynamic_pointer_cast<CommittedPage>(page) != nullptr;
             }
+            assert((blockRemoved || pageOk)
+                && "UncommittedPage destroyed but slot still holds a different uncommitted page");
         }
     }
     // Delegate slot release to Page::~Page().
@@ -180,13 +165,10 @@ std::shared_ptr<CommittedPage> UncommittedPage::convertToCommitted(std::shared_p
         && "Block slot for this lifecycle already has a committed page");
     assert(status() == PageStatus::DROPPABLE && "Release holder/lock before converting");
 
-    auto mgr = manager.lock();
-    assert(mgr);
-
     // Set the ready event before transfer (matches Python: self.ready_event = ready_event).
     this->readyEvent = std::move(readyEv);
 
-    auto committed = std::make_shared<CommittedPage>(mgr, blk, lifeCycle, cacheLevel, priority);
+    auto committed = std::make_shared<CommittedPage>(manager, blk, lifeCycle, cacheLevel, priority);
     // Move slot id to the committed page; invalidate our slot.
     committed->setSlotId(slotId()); // asserts valid
     committed->readyEvent = std::move(readyEvent);
@@ -216,34 +198,28 @@ PageHolder::~PageHolder()
     assert(gNdebug || (uniqLock.expired() && "PageHolder destroyed while lock still active"));
 
     page->holder.reset(); // clear back-reference
+    auto const manager = page->manager;
 
     // If it's a committed page, schedule for eviction (if evictable).
     if (page->isCommitted())
     {
-        auto mgr = page->manager.lock();
-        if (mgr)
-        {
-            if (!page->scheduledForEviction())
-                mgr->scheduleForEviction(*page);
+        if (!page->scheduledForEviction())
+            manager->scheduleForEviction(*page);
 
-            // If the block is orphan, exclude from eviction immediately.
-            auto* cp = dynamic_cast<CommittedPage*>(page.get());
-            if (cp)
-            {
-                auto blk = cp->block.lock();
-                if (!blk || blk->isOrphan())
-                    mgr->excludeFromEviction(*page);
-            }
+        // If the block is orphan, exclude from eviction immediately.
+        auto* cp = dynamic_cast<CommittedPage*>(page.get());
+        if (cp)
+        {
+            auto blk = cp->block.lock();
+            if (!blk || blk->isOrphan())
+                manager->excludeFromEviction(*page);
         }
     }
     else
     {
         // Uncommitted page: if scheduled for eviction, remove it.
         if (page->scheduledForEviction())
-        {
-            if (auto mgr = page->manager.lock())
-                mgr->excludeFromEviction(*page);
-        }
+            manager->excludeFromEviction(*page);
     }
 }
 
@@ -261,8 +237,7 @@ SharedPageLock PageHolder::lock(
     // Remove from eviction queue if scheduled.
     if (page->scheduledForEviction())
     {
-        if (auto mgr = page->manager.lock())
-            mgr->excludeFromEviction(*page);
+        page->manager->excludeFromEviction(*page);
         assert(!page->scheduledForEviction());
     }
 
@@ -299,11 +274,9 @@ UniqPageLock::~UniqPageLock()
     // schedule for eviction.
     if (p.status() != PageStatus::DROPPABLE)
     {
-        if (auto mgr = p.manager.lock())
-        {
-            if (mgr->isEvictable(p))
-                mgr->scheduleForEviction(p);
-        }
+        auto const manager = p.manager;
+        if (manager->isEvictable(p))
+            manager->scheduleForEviction(p);
     }
 }
 
@@ -338,7 +311,7 @@ SharedPageLock UniqPageLock::share(
 SharedPageLock::SharedPageLock(std::shared_ptr<UniqPageLock> ul, KvCache& kvCache, BeamIndex beamIndex,
     BlockOrdinal ordinal, LifeCycleId lc, bool skipWait)
     : mUniqLock(std::move(ul))
-    , mUser{kvCache.weak_from_this(), beamIndex, ordinal, lc}
+    , mUser{&kvCache, beamIndex, ordinal, lc}
 {
     if (!skipWait)
         page()->readyEvent.waitInStream(reinterpret_cast<CudaStream>(kvCache.cudaStream()));
@@ -381,13 +354,7 @@ std::shared_ptr<Page> SharedPageLock::unlock()
     assert(mUniqLock);
 
     // Record finish event from the KvCache stream.
-    // Use lock() instead of unwrap(): during ~KvCache, member destruction
-    // destroys SharedPageLocks after the KvCache's weak_ptr has expired.
-    // Throwing from a destructor would call std::terminate().
-    if (auto kvc = mUser.kvCache.lock())
-    {
-        mUniqLock->notifyFinish(kvc->finishEvent());
-    }
+    mUniqLock->notifyFinish(mUser.kvCache->finishEvent());
 
     releasePageIndex();
     auto p = page(); // copy shared_ptr before reset
@@ -397,7 +364,7 @@ std::shared_ptr<Page> SharedPageLock::unlock()
 
 void SharedPageLock::acquirePageIndex()
 {
-    auto kvc = unwrap(mUser.kvCache);
+    auto* kvc = mUser.kvCache;
     auto& pg = *page();
     int old = kvc->updateBasePageIndex(mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, pg.slotId());
     // Mirrors Python assertion: old base index must be BAD (prevents double-locking same slot).
@@ -407,14 +374,10 @@ void SharedPageLock::acquirePageIndex()
 
 void SharedPageLock::releasePageIndex()
 {
-    // Use lock() instead of unwrap() — may be called from destructor path.
-    if (auto kvc = mUser.kvCache.lock())
-    {
-        int oldBaseIndex = kvc->updateBasePageIndex(mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, /*BAD=*/-1);
-        // Mirrors Python assertion: old base index must match this page's slot ID.
-        assert(oldBaseIndex == page()->slotId());
-        (void) oldBaseIndex;
-    }
+    int oldBaseIndex = mUser.kvCache->updateBasePageIndex(mUser.beamIndex, mUser.ordinal, mUser.lifeCycle, /*BAD=*/-1);
+    // Mirrors Python assertion: old base index must match this page's slot ID.
+    assert(oldBaseIndex == page()->slotId());
+    (void) oldBaseIndex;
 }
 
 // ---------------------------------------------------------------------------
@@ -423,12 +386,11 @@ void SharedPageLock::releasePageIndex()
 
 std::vector<SharedPageLock> batchedLockToGpu(KvCache& kvCache, std::vector<BatchedLockTarget> const& targets)
 {
-    auto storeMgr = kvCache.storageManager().lock();
+    auto* storeMgr = kvCache.storageManager();
     assert(storeMgr);
     // All pages must belong to the same storage manager.
     assert(targets.empty()
-        || std::all_of(targets.begin(), targets.end(),
-            [&](auto const& t) { return t.page->manager.lock().get() == storeMgr.get(); }));
+        || std::all_of(targets.begin(), targets.end(), [&](auto const& t) { return t.page->manager == storeMgr; }));
 
     // Determine how many GPU slots are needed per pool group.
     std::vector<int> requirements(static_cast<size_t>(storeMgr->numPoolGroups()), 0);

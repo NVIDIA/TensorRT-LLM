@@ -184,7 +184,7 @@ BlockKey RootBlock::makeKey(std::optional<int64_t> loraTaskId)
     return Hasher(loraTaskId).digest();
 }
 
-RootBlock::RootBlock(std::optional<int64_t> loraTaskId, std::shared_ptr<BlockRadixTree> const& treePtr)
+RootBlock::RootBlock(std::optional<int64_t> loraTaskId, BlockRadixTree* treePtr)
     : key(makeKey(loraTaskId))
     , loraTaskId(loraTaskId)
     , tree(treePtr)
@@ -193,16 +193,12 @@ RootBlock::RootBlock(std::optional<int64_t> loraTaskId, std::shared_ptr<BlockRad
 
 int RootBlock::numLifeCycles() const
 {
-    auto t = tree.lock();
-    assert(t && "BlockRadixTree destroyed before RootBlock");
-    return t->numLifeCycles();
+    return tree->numLifeCycles();
 }
 
 int RootBlock::tokensPerBlock() const
 {
-    auto t = tree.lock();
-    assert(t && "BlockRadixTree destroyed before RootBlock");
-    return t->tokensPerBlock();
+    return tree->tokensPerBlock();
 }
 
 // ---------------------------------------------------------------------------
@@ -217,8 +213,7 @@ static void tryExcludeFromEviction(std::weak_ptr<CommittedPage> const& weakPage)
     auto page = weakPage.lock();
     if (page && page->status() == PageStatus::DROPPABLE && page->nodeRef.has_value())
     {
-        if (auto mgr = page->manager.lock())
-            mgr->excludeFromEviction(*page);
+        page->manager->excludeFromEviction(*page);
     }
 }
 
@@ -256,11 +251,8 @@ Block::~Block()
     // Mirrors Python: `self.prev.prev.next.pop(self.prev.key)`
     if (parentRoot && parentRoot->next.empty())
     {
-        if (auto t = parentRoot->tree.lock())
-        {
-            auto rootKey = parentRoot->key;
-            t->eraseRoot(rootKey);
-        }
+        auto rootKey = parentRoot->key;
+        parentRoot->tree->eraseRoot(rootKey);
     }
 }
 
@@ -270,14 +262,14 @@ int Block::tokensPerBlock() const noexcept
         return static_cast<int>(parentBlock->tokens.size());
     if (parentRoot)
         return parentRoot->tokensPerBlock();
-    return 0;
+    assert(false && "Block must have a parent");
+    return 0; // unreachable, keeps compiler happy
 }
 
 bool Block::isOrphan() const noexcept
 {
     auto* map = const_cast<Block*>(this)->parentNextMap();
-    if (!map)
-        return true;
+    assert(map && "Block must have a parent");
     auto it = map->find(key);
     return it == map->end() || it->second.get() != this;
 }
@@ -309,8 +301,9 @@ BlockKey const& Block::parentKey() const
         return parentRoot->key;
     if (parentBlock)
         return parentBlock->key;
+    assert(false && "Block must have a parent");
     static BlockKey empty{};
-    return empty;
+    return empty; // unreachable
 }
 
 void Block::unsetPage(LifeCycleId lcIdx, LifeCycle const& lc)
@@ -442,8 +435,7 @@ std::vector<std::weak_ptr<CommittedPage>> removeSubtree(
 {
     std::vector<std::weak_ptr<CommittedPage>> ret;
     auto it = parentNext.find(rootKey);
-    if (it == parentNext.end())
-        return ret;
+    assert(it != parentNext.end() && "Key must exist in parent's next map");
 
     std::vector<std::shared_ptr<Block>> stack = {it->second};
     parentNext.erase(it);
@@ -501,7 +493,7 @@ RootBlock& BlockRadixTree::addOrGetExisting(std::optional<int64_t> loraTaskId)
     if (it != mRoots.end())
         return it->second;
 
-    auto [newIt, inserted] = mRoots.emplace(key, RootBlock(loraTaskId, shared_from_this()));
+    auto [newIt, inserted] = mRoots.emplace(key, RootBlock(loraTaskId, this));
     return newIt->second;
 }
 
