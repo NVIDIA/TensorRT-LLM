@@ -45,6 +45,7 @@ from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 from transformers.utils import ModelOutput
 
 from ..hf import AutoModelForCausalLMFactory
+from .rotary_utils import RotaryEmbeddingBase, build_rope_cos_sin_cache
 
 
 class Qwen3MoeRMSNorm(nn.Module):
@@ -61,13 +62,11 @@ class Qwen3MoeRMSNorm(nn.Module):
         )
 
 
-class Qwen3MoeRotaryEmbedding(nn.Module):
+class Qwen3MoeRotaryEmbedding(RotaryEmbeddingBase):
     """Rotary Position Embedding for Qwen3 MoE.
 
-    Simplified version that precomputes and caches cos/sin values.
-    Returns pre-sliced values indexed by position_ids.
-
-    Uses _ad_ prefix for buffer names to work with AutoDeploy's lift_to_meta.
+    Keeps only the small inv_freq buffer before graph-cache transforms. The full
+    cos/sin table is graph-computed and materialized by later RoPE transforms.
     """
 
     def __init__(
@@ -84,24 +83,10 @@ class Qwen3MoeRotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-        # Build cos/sin cache with AD-specific naming
-        self._set_cos_sin_cache(max_position_embeddings)
-
-    def _set_cos_sin_cache(self, seq_len: int):
-        self.max_seq_len_cached = seq_len
-        t = torch.arange(seq_len, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        # Use _ad_ prefix for AutoDeploy compatibility with lift_to_meta
-        self.register_buffer("_ad_cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("_ad_sin_cached", emb.sin(), persistent=False)
-
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Slice cos/sin by position_ids here (once) instead of in every attention layer
-        cos = self._ad_cos_cached.to(dtype=x.dtype, device=x.device)
-        sin = self._ad_sin_cached.to(dtype=x.dtype, device=x.device)
+        cos, sin = build_rope_cos_sin_cache(self.inv_freq, self.max_position_embeddings, x)
         return cos[position_ids], sin[position_ids]
 
 

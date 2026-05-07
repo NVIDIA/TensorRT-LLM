@@ -73,6 +73,7 @@ from ..hf import (
     AutoModelForImageTextToTextFactory,
     TextModelExportInfo,
 )
+from .rotary_utils import RotaryEmbeddingBase, build_rope_cos_sin_cache
 
 # ---------------------------------------------------------------------------
 # Multimodal semantic mask custom ops — prefill-only and cached variants.
@@ -443,11 +444,11 @@ AutoConfig.register("gemma4_vision", Gemma4VisionConfig, exist_ok=True)
 # ---------------------------------------------------------------------------
 
 
-def _build_rope_cache(
+def _build_rope_inv_freq(
     config: Gemma4TextConfig,
     layer_type: str,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pre-compute cos/sin RoPE cache for the given layer type."""
+) -> tuple[torch.Tensor, float]:
+    """Build RoPE inverse frequencies for the given layer type."""
     rope_params = config.rope_parameters[layer_type]
     rope_type = rope_params.get("rope_type", "default")
     base = rope_params["rope_theta"]
@@ -480,10 +481,7 @@ def _build_rope_cache(
         rope_init_fn = ROPE_INIT_FUNCTIONS[rope_type]
         inv_freq, attention_scaling = rope_init_fn(config, device=None, layer_type=layer_type)
 
-    positions = torch.arange(config.max_position_embeddings, dtype=inv_freq.dtype)
-    freqs = torch.outer(positions, inv_freq)
-    emb = torch.cat((freqs, freqs), dim=-1)
-    return emb.cos() * attention_scaling, emb.sin() * attention_scaling
+    return inv_freq, attention_scaling
 
 
 # ---------------------------------------------------------------------------
@@ -533,24 +531,22 @@ class Gemma4ClippableLinear(nn.Module):
         return self.linear(hidden_states)
 
 
-class Gemma4RotaryEmbedding(nn.Module):
-    """Pre-computed RoPE cache for a single layer type (global or local)."""
+class Gemma4RotaryEmbedding(RotaryEmbeddingBase):
+    """RoPE for a single layer type (global or local)."""
 
     def __init__(self, config: Gemma4TextConfig, layer_type: str):
         super().__init__()
-        (
-            cos,
-            sin,
-        ) = _build_rope_cache(config, layer_type)
-        self.register_buffer("_ad_cos_cached", cos, persistent=False)
-        self.register_buffer("_ad_sin_cached", sin, persistent=False)
+        inv_freq, self.attention_scaling = _build_rope_inv_freq(config, layer_type)
+        self.max_position_embeddings = config.max_position_embeddings
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        cos = self._ad_cos_cached[position_ids].to(dtype=x.dtype, device=x.device)
-        sin = self._ad_sin_cached[position_ids].to(dtype=x.dtype, device=x.device)
-        return cos, sin
+        cos, sin = build_rope_cos_sin_cache(
+            self.inv_freq, self.max_position_embeddings, x, self.attention_scaling
+        )
+        return cos[position_ids], sin[position_ids]
 
 
 # ---------------------------------------------------------------------------

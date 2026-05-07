@@ -43,21 +43,19 @@ from transformers.models.gemma3n.configuration_gemma3n import (
 from transformers.utils import ModelOutput
 
 from ..hf import AutoModelForCausalLMFactory
+from .rotary_utils import RotaryEmbeddingBase, build_rope_cos_sin_cache
 
 
-def _build_rope_cache(
+def _build_rope_inv_freq(
     config: Gemma3nTextConfig,
-) -> Tuple[torch.Tensor, torch.Tensor, float]:
+) -> tuple[torch.Tensor, float]:
     if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
         rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type", "default"))
     else:
         rope_type = "default"
 
     inv_freq, attention_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, device=None)
-    positions = torch.arange(config.max_position_embeddings, dtype=inv_freq.dtype)
-    freqs = torch.outer(positions, inv_freq)
-    emb = torch.cat((freqs, freqs), dim=-1)
-    return emb.cos(), emb.sin(), attention_scaling
+    return inv_freq, attention_scaling
 
 
 class Gemma3nRMSNorm(nn.Module):
@@ -188,20 +186,20 @@ class Gemma3nTextAltUp(nn.Module):
         )
 
 
-class Gemma3nTextRotaryEmbedding(nn.Module):
+class Gemma3nTextRotaryEmbedding(RotaryEmbeddingBase):
     def __init__(self, config: Gemma3nTextConfig):
         super().__init__()
-        cos, sin, attention_scaling = _build_rope_cache(config)
-        self.register_buffer("_ad_cos_cached", cos * attention_scaling, persistent=False)
-        self.register_buffer("_ad_sin_cached", sin * attention_scaling, persistent=False)
+        inv_freq, self.attention_scaling = _build_rope_inv_freq(config)
+        self.max_position_embeddings = config.max_position_embeddings
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         del position_ids
-        cos = self._ad_cos_cached.to(dtype=x.dtype, device=x.device)
-        sin = self._ad_sin_cached.to(dtype=x.dtype, device=x.device)
-        return cos, sin
+        return build_rope_cos_sin_cache(
+            self.inv_freq, self.max_position_embeddings, x, self.attention_scaling
+        )
 
 
 def _slice_rope_cache(

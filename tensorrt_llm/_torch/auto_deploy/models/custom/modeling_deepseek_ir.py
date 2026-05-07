@@ -53,6 +53,7 @@ from tensorrt_llm._torch.utils import ActivationType
 from ... import custom_ops  # noqa: F401 -- register all ops
 from ..hf import AutoModelForCausalLMFactory
 from . import mla_rope_utils
+from .rotary_utils import RotaryEmbeddingBase, build_rope_cos_sin_cache
 
 
 class DeepSeekV3RMSNorm(nn.Module):
@@ -69,11 +70,11 @@ class DeepSeekV3RMSNorm(nn.Module):
         ).to(hidden_states.dtype)
 
 
-class DeepSeekV3RotaryEmbedding(nn.Module):
+class DeepSeekV3RotaryEmbedding(RotaryEmbeddingBase):
     """Rotary Position Embedding for DeepSeekV3.
 
-    Simplified version that precomputes and caches cos/sin values.
-    Returns full cached values (not sliced by seq_len) to enable export.
+    Keeps only the small inv_freq buffer before graph-cache transforms. The full
+    cos/sin table is graph-computed and materialized by later RoPE transforms.
     """
 
     def __init__(self, dim: int, max_position_embeddings: int = 2048, base: float = 10000.0):
@@ -84,24 +85,19 @@ class DeepSeekV3RotaryEmbedding(nn.Module):
 
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.attention_scaling = 1.0
 
-        # Build cos/sin cache
         self._set_cos_sin_cache(max_position_embeddings)
 
     def _set_cos_sin_cache(self, seq_len: int):
         self.max_seq_len_cached = seq_len
-        t = torch.arange(seq_len, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
     def forward(
         self, x: torch.Tensor, seq_len: Optional[int] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return (
-            self.cos_cached.to(dtype=x.dtype, device=x.device),
-            self.sin_cached.to(dtype=x.dtype, device=x.device),
+        del seq_len
+        return build_rope_cos_sin_cache(
+            self.inv_freq, self.max_position_embeddings, x, self.attention_scaling
         )
 
 
@@ -148,17 +144,11 @@ class DeepSeekV3YarnRotaryEmbedding(DeepSeekV3RotaryEmbedding):
         inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-        t = torch.arange(seq_len, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)
-
         _mscale = float(
             self._yarn_get_mscale(self.scaling_factor, self.mscale)
             / self._yarn_get_mscale(self.scaling_factor, self.mscale_all_dim)
         )
-
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", (emb.cos() * _mscale), persistent=False)
-        self.register_buffer("sin_cached", (emb.sin() * _mscale), persistent=False)
+        self.attention_scaling = _mscale
 
     @staticmethod
     def _yarn_find_correction_dim(

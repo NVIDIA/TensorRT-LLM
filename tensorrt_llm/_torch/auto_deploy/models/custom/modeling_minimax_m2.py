@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES.
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -36,6 +36,7 @@ from transformers.utils import ModelOutput
 from tensorrt_llm._torch.utils import ActivationType
 
 from ..hf import AutoModelForCausalLMFactory
+from .rotary_utils import RotaryEmbeddingBase, build_rope_cos_sin_cache
 
 # ---------------------------------------------------------------------------
 # Output dataclasses
@@ -89,27 +90,25 @@ def apply_rotary_pos_emb(
 
 
 # ---------------------------------------------------------------------------
-# Rotary Embedding (pre-cached with _ad_ prefix)
+# Rotary Embedding
 # ---------------------------------------------------------------------------
 
 
-class MiniMaxM2RotaryEmbedding(nn.Module):
-    """Pre-computed RoPE cache for partial rotation (rotary_dim < head_dim)."""
+class MiniMaxM2RotaryEmbedding(RotaryEmbeddingBase):
+    """RoPE for partial rotation (rotary_dim < head_dim)."""
 
     def __init__(self, dim: int, max_position_embeddings: int, base: float):
         super().__init__()
+        self.max_position_embeddings = max_position_embeddings
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        t = torch.arange(max_position_embeddings, dtype=torch.float32)
-        freqs = torch.outer(t, inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("_ad_cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("_ad_sin_cached", emb.sin(), persistent=False)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        cos = self._ad_cos_cached[position_ids].to(dtype=x.dtype, device=x.device)
-        sin = self._ad_sin_cached[position_ids].to(dtype=x.dtype, device=x.device)
+        cos, sin = build_rope_cos_sin_cache(self.inv_freq, self.max_position_embeddings, x)
+        cos = cos[position_ids]
+        sin = sin[position_ids]
         return cos, sin
 
 

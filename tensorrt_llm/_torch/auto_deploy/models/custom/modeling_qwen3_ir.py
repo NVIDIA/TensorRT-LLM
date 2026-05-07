@@ -40,6 +40,7 @@ from transformers.utils import ModelOutput
 
 from ... import custom_ops  # noqa: F401 -- register all ops
 from ..hf import AutoModelForCausalLMFactory
+from .rotary_utils import RotaryEmbeddingBase, build_rope_cos_sin_cache
 
 
 class Qwen3RMSNorm(nn.Module):
@@ -56,13 +57,11 @@ class Qwen3RMSNorm(nn.Module):
         )
 
 
-class Qwen3RotaryEmbedding(nn.Module):
+class Qwen3RotaryEmbedding(RotaryEmbeddingBase):
     """Rotary Position Embedding for Qwen3.
 
-    Simplified version that precomputes and caches cos/sin values.
-    Returns full cached values (not sliced by seq_len) to enable export.
-
-    Uses _ad_ prefix for buffer names to work with AutoDeploy's lift_to_meta.
+    Keeps only the small inv_freq buffer before graph-cache transforms. The full
+    cos/sin table is graph-computed and materialized by later RoPE transforms.
     """
 
     def __init__(
@@ -79,21 +78,10 @@ class Qwen3RotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-        self._set_cos_sin_cache(max_position_embeddings)
-
-    def _set_cos_sin_cache(self, seq_len: int):
-        self.max_seq_len_cached = seq_len
-        t = torch.arange(seq_len, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("_ad_cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("_ad_sin_cached", emb.sin(), persistent=False)
-
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        cos = self._ad_cos_cached.to(dtype=x.dtype, device=x.device)
-        sin = self._ad_sin_cached.to(dtype=x.dtype, device=x.device)
+        cos, sin = build_rope_cos_sin_cache(self.inv_freq, self.max_position_embeddings, x)
         return cos[position_ids], sin[position_ids]
 
 
