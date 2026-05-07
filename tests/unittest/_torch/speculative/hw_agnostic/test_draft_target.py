@@ -6,16 +6,14 @@ import pytest
 import torch
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import (CudaGraphConfig, DraftTargetDecodingConfig,
-                                 KvCacheConfig)
+from tensorrt_llm.llmapi import CudaGraphConfig, DraftTargetDecodingConfig, KvCacheConfig
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from utils.llm_data import llm_models_root
 from utils.util import similar
 
 
-@pytest.mark.parametrize("use_cuda_graph,attn_backend",
-                         [[False, "TRTLLM"], [True, "TRTLLM"]])
+@pytest.mark.parametrize("use_cuda_graph,attn_backend", [[False, "TRTLLM"], [True, "TRTLLM"]])
 @pytest.mark.high_cuda_memory
 def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
@@ -29,12 +27,11 @@ def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
     max_batch_size = 2
     max_draft_len = 4
     kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=8192)
-    cuda_graph_config = CudaGraphConfig(
-        batch_sizes=[1, max_batch_size]) if use_cuda_graph else None
+    cuda_graph_config = CudaGraphConfig(batch_sizes=[1, max_batch_size]) if use_cuda_graph else None
 
     llm_common_config = dict(
         model=target_model_dir,
-        backend='pytorch',
+        backend="pytorch",
         attn_backend=attn_backend,
         disable_overlap_scheduler=True,
         cuda_graph_config=cuda_graph_config,

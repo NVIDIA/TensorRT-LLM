@@ -3533,26 +3533,29 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_blackwell
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,disable_skip_indexer",
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,disable_skip_indexer,indexer_k_fp4",
         [
-            (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS", False),
-            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", False),
-            (8, 1, 8, 0, True, True, True, True, 24, "CUTLASS", False),
-            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", False),
-            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", True),
-            (1, 4, 1, 1, False, False, True, True, 24, "TRTLLM", False),
+            (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS", False, False),
+            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", False, False),
+            (8, 1, 8, 0, True, True, True, True, 24, "CUTLASS", False, False),
+            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", False, False),
+            (8, 1, 8, 1, False, True, True, True, 24, "CUTLASS", True, False),
+            (1, 4, 1, 1, False, False, True, True, 24, "TRTLLM", False, False),
+            (8, 1, 8, 0, False, True, True, True, 24, "CUTLASS", False, True),
         ],
         ids=[
             "baseline", "baseline_mtp1", "baseline_fp8kv", "latency",
-            "disable_skip_indexer", "baseline_pp4_mtp1"
+            "disable_skip_indexer", "baseline_pp4_mtp1", "fp4_indexer"
         ])
     def test_nvfp4_multi_gpus(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                               attention_dp, cuda_graph, overlap_scheduler,
-                              max_batch_size, moe_backend,
-                              disable_skip_indexer):
+                              max_batch_size, moe_backend, disable_skip_indexer,
+                              indexer_k_fp4):
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
+        if indexer_k_fp4 and sm_version < 100:
+            pytest.skip("indexer_k_dtype='fp4' requires SM>=100 (Blackwell)")
 
         moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
@@ -3568,10 +3571,17 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         if fp8kv:
             kv_cache_config.dtype = "fp8"
 
-        dsa_config = None
+        dsa_kwargs = {}
         if disable_skip_indexer:
-            dsa_config = DeepSeekSparseAttentionConfig(
-                skip_indexer_for_short_seqs=False)
+            dsa_kwargs["skip_indexer_for_short_seqs"] = False
+        if indexer_k_fp4:
+            # Exercise the FP4 indexer K cache path (132 B -> 68 B per token).
+            # DeepSeekSparseAttentionConfig's post-validator enforces SM>=100
+            # and index_head_dim==128; index_head_dim is filled in by
+            # ModelConfig.from_pretrained so we only need to set the dtype.
+            dsa_kwargs["indexer_k_dtype"] = "fp4"
+        dsa_config = (DeepSeekSparseAttentionConfig(
+            **dsa_kwargs) if dsa_kwargs else None)
 
         mtp_config = None
         if mtp_nextn > 0:

@@ -28,7 +28,9 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
     CacheType as CacheTypeCpp
-from tensorrt_llm.deep_gemm import (fp8_mqa_logits, fp8_paged_mqa_logits,
+from tensorrt_llm.deep_gemm import (fp8_fp4_mqa_logits,
+                                    fp8_fp4_paged_mqa_logits, fp8_mqa_logits,
+                                    fp8_paged_mqa_logits,
                                     get_paged_mqa_logits_metadata)
 from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 from tensorrt_llm.logger import logger
@@ -56,8 +58,9 @@ def _compute_slot_mappings(
     head_dim: int,
     tokens_per_block: int,
     quant_block_size: int,
+    data_bytes_per_token: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute flat byte indices for FP8 data and scales from global token positions.
+    """Compute flat byte indices for indexer K data and scales from global token positions.
 
     Shared by Indexer.prepare() (CPU) and on_update_kv_lens() (GPU) to avoid
     duplicating the slot mapping arithmetic.
@@ -66,16 +69,23 @@ def _compute_slot_mappings(
         global_positions: Per-token absolute position in the KV sequence.
         block_offsets: [num_seqs, max_blocks_per_seq] block offset table.
         req_indices: Per-token request index.
-        head_dim: Indexer head dimension.
+        head_dim: Indexer head dimension (used for the scale-size formula).
         tokens_per_block: Tokens stored per cache block.
         quant_block_size: Quantization block size.
+        data_bytes_per_token: Bytes of quantized data per token in the cache
+            pool. FP8 stores one byte per element (= head_dim). FP4 packs two
+            E2M1 codes per byte (= head_dim // 2). Defaults to ``head_dim``
+            when unset, preserving the FP8 layout for callers that haven't
+            threaded the FP4 dtype through.
 
     Returns:
         (fp8_indices, scale_indices): Flat byte offsets into the cache pool.
     """
+    if data_bytes_per_token is None:
+        data_bytes_per_token = head_dim
     scale_size = head_dim // quant_block_size * 4  # float32 = 4 bytes
-    block_stride = tokens_per_block * (head_dim + scale_size)
-    scale_base_offset = tokens_per_block * head_dim
+    block_stride = tokens_per_block * (data_bytes_per_token + scale_size)
+    scale_base_offset = tokens_per_block * data_bytes_per_token
 
     block_indices_in_seq = global_positions // tokens_per_block
     pos_in_blocks = global_positions % tokens_per_block
@@ -91,7 +101,7 @@ def _compute_slot_mappings(
 
     block_ids = block_offsets[req_indices, block_indices_in_seq].to(torch.int64)
 
-    fp8_indices = block_ids * block_stride + pos_in_blocks * head_dim
+    fp8_indices = block_ids * block_stride + pos_in_blocks * data_bytes_per_token
     scale_indices = (block_ids * block_stride + scale_base_offset +
                      pos_in_blocks * scale_size)
     return fp8_indices, scale_indices
@@ -349,6 +359,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def __post_init__(self):
         """Allocate indexer K-cache buffers and heuristic TopK metadata."""
         super().__post_init__()
+        assert isinstance(self.kv_cache_manager, DSACacheManager), \
+            f"DSAtrtllmAttentionMetadata requires DSACacheManager, got {type(self.kv_cache_manager)}"
 
         self.num_sparse_topk = self.sparse_attention_config.index_topk
         self.enable_indexer_skip = self.sparse_attention_config.skip_indexer_for_short_seqs
@@ -473,6 +485,28 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        # When MTP runs without the expanded-tokens path, the same forward step
+        # alternates between full-window calls (next_n == 1 + max_draft_tokens)
+        # and per-token draft calls (next_n == 1). The 2D DeepGEMM metadata
+        # API encodes next_n into the schedule, so the precomputed schedule
+        # for one shape cannot be reused for the other. Maintain a second
+        # buffer holding the schedule for the full next_n window; the draft
+        # path keeps using `scheduler_metadata_buffer`. Always allocate (a
+        # few KB) so transitions in `update_spec_dec_param` don't have to
+        # special-case its existence.
+        self.scheduler_metadata_buffer_full_next_n = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.num_sms + 1, 2),
+            cache_name="scheduler_metadata_buffer_full_next_n",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+        # Pre-allocated 2D kv_lens buffer for the new DeepGEMM 2D context_lens
+        # API. Shape: (max_num_sequences, 1 + max_draft_tokens). Each row
+        # broadcasts the same kv_len across next_n positions; kernel reads a
+        # slice per forward. Avoids per-forward .expand().contiguous()
+        # allocations that would break CUDA graphs.
+        self._create_kv_lens_2d_buffer(capture_graph=capture_graph)
         self.cu_seqlen_ks = self.get_empty(
             self.cuda_graph_buffers,
             (self.max_num_tokens, ),
@@ -539,6 +573,21 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # Create expanded buffers for MTP support
         self.create_expanded_buffers(capture_graph=capture_graph)
 
+    def _create_kv_lens_2d_buffer(self, capture_graph=False):
+        """Pre-allocated buffer for the DeepGEMM 2D context_lens API.
+
+        Avoids per-forward .expand().contiguous() allocations that break CUDA
+        graphs. The buffer is written in-place via .copy_() inside
+        on_update_kv_lens so its address stays stable across replays.
+        """
+        self.kv_lens_cuda_2d = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_sequences, 1 + self.max_draft_tokens),
+            cache_name="kv_lens_cuda_2d",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+
     # TODO: remove these expanded buffers when fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
     def create_expanded_buffers(self, capture_graph=False):
         """Create expanded KV-length and block-table buffers for speculative decoding."""
@@ -576,15 +625,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
-        # The fp8_paged_mqa_logits kernel needs different layout of the metadata buffer for MTP=3.
-        if self.max_draft_tokens == 3:
-            self.scheduler_metadata_buffer_mtp3 = self.get_empty(
-                self.cuda_graph_buffers,
-                (self.num_sms // 2 + 1, 2),
-                cache_name="scheduler_metadata_buffer_mtp3",
-                dtype=torch.int32,
-                capture_graph=capture_graph,
-            )
 
     # This function is only used to create the expanded buffers when the max_draft_tokens is changed.
     # TODO: remove this function once fp8_paged_mqa_logits supports an arbitrary number of MTP draft tokens.
@@ -607,9 +647,11 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                                       max_total_draft_tokens, model_is_wrapped,
                                       spec_metadata, spec_tree_manager)
         self.max_draft_tokens = max_draft_len
+        capture_graph = self.is_cuda_graph
+        if self.kv_lens_cuda_2d.shape[1] != 1 + self.max_draft_tokens:
+            self._create_kv_lens_2d_buffer(capture_graph=capture_graph)
         init_shape = self.kv_lens_expanded_host.shape[0]
         if self.max_num_sequences * (1 + self.max_draft_tokens) != init_shape:
-            capture_graph = self.is_cuda_graph
             self.create_expanded_buffers(capture_graph=capture_graph)
             # Resize heuristic scratch buffer for new max_draft_tokens.
             if self.enable_heuristic_topk:
@@ -967,13 +1009,22 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.int64) - seq_starts[req_indices]
 
             global_positions = start_positions[req_indices] + token_offsets
+            # Under FP4 the indexer cache stores two E2M1 codes per byte, so
+            # the per-token data footprint is head_dim // 2; otherwise it is
+            # head_dim (one FP8 byte per element). Feed the real byte count
+            # into _compute_slot_mappings so scatter/gather see offsets that
+            # match the pool layout produced by createIndexerKCachePools.
+            use_fp4 = self.kv_cache_manager.use_fp4
+            index_head_dim = self.kv_cache_manager.index_head_dim
+            data_bytes_per_token = index_head_dim // 2 if use_fp4 else index_head_dim
             fp8_indices, scale_indices = _compute_slot_mappings(
                 global_positions,
                 self.indexer_k_cache_block_offsets,
                 req_indices,
-                self.kv_cache_manager.index_head_dim,
+                index_head_dim,
                 self.kv_cache_manager.tokens_per_block,
                 self.kv_cache_manager.quant_block_size,
+                data_bytes_per_token=data_bytes_per_token,
             )
             self.slot_mapping_fp8[:self.num_tokens] = fp8_indices
             self.slot_mapping_scale[:self.num_tokens] = scale_indices
@@ -991,32 +1042,54 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dim=0,
                 dtype=torch.int64,
                 out=self.gen_cached_token_indptr[1:self.num_generations + 1])
+            # Write 2D kv_lens in-place (broadcast same kv_len across next_n
+            # positions). .expand() returns a view and .copy_() writes into the
+            # pre-allocated destination, so this is CUDA-graph-friendly.
+            gen_kv_lens = self.kv_lens_cuda[self.num_contexts:self.num_seqs]
+            next_n_cap = self.kv_lens_cuda_2d.shape[1]
+            self.kv_lens_cuda_2d[:self.num_generations, :next_n_cap].copy_(
+                gen_kv_lens.unsqueeze(-1).expand(-1, next_n_cap))
+            # Build the next_n=1 schedule (used by MTP draft layers and any
+            # non-MTP forward). Reshape the contiguous gen slice of
+            # kv_lens_cuda to (num_gen, 1) — slicing kv_lens_cuda_2d's first
+            # column would be non-contiguous and would fail the metadata
+            # kernel's is_contiguous assertion.
+            context_lens_next_n1 = gen_kv_lens.view(-1, 1)
             scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
-                self.kv_lens_cuda[self.num_contexts:self.num_seqs],
-                self.kv_cache_manager.tokens_per_block, self.num_sms)
+                context_lens_next_n1, self.kv_cache_manager.tokens_per_block,
+                self.num_sms)
             self.scheduler_metadata_buffer.copy_(scheduler_metadata_buffer,
                                                  non_blocking=True)
+            # When MTP is on without the expanded-tokens path, also populate
+            # the full-next_n schedule for the main forward call. The metadata
+            # kernel reads next_n from context_lens.size(1), so we must pass
+            # the wider slice here.
+            if (self.max_draft_tokens > 0
+                    and not self.use_expanded_buffers_for_mtp):
+                context_lens_full_next_n = self.kv_lens_cuda_2d[:self.
+                                                                num_generations, :
+                                                                next_n_cap]
+                scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
+                    context_lens_full_next_n,
+                    self.kv_cache_manager.tokens_per_block, self.num_sms)
+                self.scheduler_metadata_buffer_full_next_n.copy_(
+                    scheduler_metadata_buffer_full_next_n, non_blocking=True)
             if self.use_expanded_buffers_for_mtp:
                 num_draft_tokens = 1 + self.max_draft_tokens
                 num_tokens = self.num_generations * num_draft_tokens
-                gen_kv_lens = self.kv_lens_cuda[self.num_contexts:self.num_seqs]
                 kv_lens_expanded = torch.stack([gen_kv_lens] * num_draft_tokens,
                                                dim=0)
                 self.kv_lens_expanded_cuda[:num_tokens] = \
                     kv_lens_expanded.transpose(0, 1).contiguous().flatten()
-                # Expand schedule metadata buffer (only generation)
-                kv_lens_expanded = self.kv_lens_expanded_cuda[:num_tokens]
+                # New API requires 2D; each expanded token becomes a (1,) row.
+                kv_lens_expanded_2d = self.kv_lens_expanded_cuda[:
+                                                                 num_tokens].view(
+                                                                     -1, 1)
                 scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
-                    kv_lens_expanded, self.kv_cache_manager.tokens_per_block,
+                    kv_lens_expanded_2d, self.kv_cache_manager.tokens_per_block,
                     self.num_sms)
                 self.scheduler_metadata_buffer_expanded.copy_(
                     scheduler_metadata_buffer_expanded, non_blocking=True)
-            elif self.max_draft_tokens == 3:
-                scheduler_metadata_buffer_mtp3 = get_paged_mqa_logits_metadata(
-                    self.kv_lens_cuda[self.num_contexts:self.num_seqs],
-                    self.kv_cache_manager.tokens_per_block, self.num_sms // 2)
-                self.scheduler_metadata_buffer_mtp3.copy_(
-                    scheduler_metadata_buffer_mtp3, non_blocking=True)
         self.prepare_dense_topk_indices(self.kv_lens_cuda, device=True)
 
     def update_for_spec_dec(self):
@@ -1124,6 +1197,11 @@ class Indexer(nn.Module):
         self.softmax_scale = self.head_dim**-0.5
         # TODO: make it configurable from hf config
         self.scale_fmt = "ue8m0"
+        # indexer_k_dtype controls both Q and K precision. DeepGEMM's
+        # fp8_fp4_mqa_logits / fp8_fp4_paged_mqa_logits kernels only dispatch
+        # to FP4xFP4 or FP8xFP8 (no mixed-precision variant). The DeepGEMM
+        # kernel asserts SM100 + head_dim=128 at launch time under FP4.
+        self.use_fp4 = sparse_attention_config.indexer_k_dtype == "fp4"
         self.aux_stream = aux_stream
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
         self.use_cute_dsl_topk = (sparse_attention_config.use_cute_dsl_topk
@@ -1280,6 +1358,9 @@ class Indexer(nn.Module):
         head_dim = kv_cache_manager.index_head_dim
         tokens_per_block = kv_cache_manager.tokens_per_block
         quant_block_size = kv_cache_manager.quant_block_size
+        use_fp4 = kv_cache_manager.use_fp4
+        # FP4 packs two E2M1 codes per byte; FP8 stores one byte per element.
+        data_bytes_per_token = head_dim // 2 if use_fp4 else head_dim
         cached_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
         total_tokens = seq_lens.sum().item()
 
@@ -1303,6 +1384,7 @@ class Indexer(nn.Module):
             head_dim,
             tokens_per_block,
             quant_block_size,
+            data_bytes_per_token=data_bytes_per_token,
         )
 
         metadata.host_slot_mapping_fp8[:total_tokens] = fp8_flat_indices
@@ -1392,24 +1474,45 @@ class Indexer(nn.Module):
             # Prepare schedule metadata for fp8_paged_mqa_logits
             # This is a preprocessing step that computes scheduling information for the kernel
             if not metadata.use_expanded_buffers_for_mtp:
+                # Write 2D kv_lens (broadcast same kv_len across next_n positions).
                 gen_seq_lens = metadata.kv_lens_cuda_runtime[
                     num_contexts:num_contexts + num_generations]
+                next_n_cap = metadata.kv_lens_cuda_2d.shape[1]
+                metadata.kv_lens_cuda_2d[:num_generations, :next_n_cap].copy_(
+                    gen_seq_lens.unsqueeze(-1).expand(-1, next_n_cap))
+                # Build the next_n=1 schedule (used by MTP draft layers).
+                # Use the contiguous 1D gen slice reshaped to (num_gen, 1);
+                # slicing kv_lens_cuda_2d's first column would be a strided
+                # view that fails the metadata kernel's contiguous assertion.
+                context_lens_next_n1 = gen_seq_lens.view(-1, 1)
                 scheduler_metadata_buffer = get_paged_mqa_logits_metadata(
-                    gen_seq_lens, tokens_per_block, metadata.num_sms)
+                    context_lens_next_n1, tokens_per_block, metadata.num_sms)
                 metadata.scheduler_metadata_buffer.copy_(
                     scheduler_metadata_buffer, non_blocking=True)
-                if metadata.max_draft_tokens == 3:
-                    scheduler_metadata_buffer_mtp3 = get_paged_mqa_logits_metadata(
-                        gen_seq_lens, tokens_per_block, metadata.num_sms // 2)
-                    metadata.scheduler_metadata_buffer_mtp3.copy_(
-                        scheduler_metadata_buffer_mtp3, non_blocking=True)
+                # MTP main forward uses next_n = 1 + max_draft_tokens; build
+                # a separate schedule because the metadata kernel reads next_n
+                # from context_lens.size(1).
+                if metadata.max_draft_tokens > 0:
+                    context_lens_full_next_n = metadata.kv_lens_cuda_2d[:
+                                                                        num_generations, :
+                                                                        next_n_cap]
+                    scheduler_metadata_buffer_full_next_n = get_paged_mqa_logits_metadata(
+                        context_lens_full_next_n, tokens_per_block,
+                        metadata.num_sms)
+                    metadata.scheduler_metadata_buffer_full_next_n.copy_(
+                        scheduler_metadata_buffer_full_next_n,
+                        non_blocking=True)
             else:
-                # Expand schedule metadata buffer (only generation)
+                # Expand schedule metadata buffer (only generation). The new
+                # DeepGEMM API requires 2D; each expanded token becomes a (1,)
+                # row.
                 num_tokens = metadata.num_generations * (
                     1 + metadata.max_draft_tokens)
-                kv_lens_expanded = metadata.kv_lens_expanded_cuda[:num_tokens]
+                kv_lens_expanded_2d = metadata.kv_lens_expanded_cuda[:
+                                                                     num_tokens].view(
+                                                                         -1, 1)
                 scheduler_metadata_buffer_expanded = get_paged_mqa_logits_metadata(
-                    kv_lens_expanded, tokens_per_block, metadata.num_sms)
+                    kv_lens_expanded_2d, tokens_per_block, metadata.num_sms)
                 metadata.scheduler_metadata_buffer_expanded.copy_(
                     scheduler_metadata_buffer_expanded, non_blocking=True)
 
@@ -1422,10 +1525,9 @@ class Indexer(nn.Module):
         if _need_full_kv_gathering:
             head_dim = kv_cache_manager.index_head_dim
             quant_block_size = kv_cache_manager.quant_block_size
+            use_fp4 = kv_cache_manager.use_fp4
+            data_bytes_per_token = head_dim // 2 if use_fp4 else head_dim
             cached_tokens = metadata.kv_cache_params.num_cached_tokens_per_seq
-            scale_size = head_dim // quant_block_size * 4
-            tokens_per_block * (head_dim + scale_size)
-            tokens_per_block * head_dim
             start_positions = torch.tensor(cached_tokens, dtype=torch.int32)
 
             total_kv_len = metadata.host_ctx_kv_indptr[num_contexts].item()
@@ -1454,6 +1556,7 @@ class Indexer(nn.Module):
                 head_dim,
                 tokens_per_block,
                 quant_block_size,
+                data_bytes_per_token=data_bytes_per_token,
             )
 
             host_slot_mapping_fp8_fullkv[:total_kv_len] = fp8_flat_indices
@@ -1497,6 +1600,52 @@ class Indexer(nn.Module):
                                                     metadata.slot_mapping_scale,
                                                     num_tokens)
 
+    def _call_mqa_logits(self, q_fp8: torch.Tensor, k_fp8: torch.Tensor,
+                         k_scale: torch.Tensor, weights: torch.Tensor,
+                         cu_seqlen_ks: torch.Tensor, cu_seqlen_ke: torch.Tensor,
+                         q_scale: Optional[torch.Tensor]) -> torch.Tensor:
+        """Dispatch to fp8_mqa_logits or fp8_fp4_mqa_logits based on use_fp4.
+
+        For FP4 the gather output is typed as FP8 for historical reasons;
+        reinterpret the bytes as the expected int8 / int32 layouts. DeepGEMM
+        asserts kv_sf is 1D in both modes, so flatten the scale here.
+        """
+        if self.use_fp4:
+            k_fp4_bytes = k_fp8.view(torch.int8)
+            k_scale_int32 = k_scale.view(torch.int32).reshape(-1)
+            # q_scale arrives here as (chunk_tokens, n_heads, 1) — fused_cat_fp4
+            # emits one int32 per (token, head) carrying four UE8M0 exponents,
+            # pre_indexer_proj reshapes back to (N, n_heads, 1), and
+            # sparse_attn_indexer chunk-slices on axis 0. The DeepGEMM FP4
+            # kernel asserts q_sf is 2D, so collapse the trailing unit axis.
+            q_scale_2d = q_scale.reshape(-1, self.n_heads)
+            return fp8_fp4_mqa_logits(
+                (q_fp8, q_scale_2d),
+                (k_fp4_bytes, k_scale_int32),
+                weights,
+                cu_seqlen_ks,
+                cu_seqlen_ke,
+            )
+        return fp8_mqa_logits(q_fp8, (k_fp8, k_scale.reshape(-1)), weights,
+                              cu_seqlen_ks, cu_seqlen_ke)
+
+    def _call_paged_mqa_logits(self, q_decode: torch.Tensor,
+                               k_cache: torch.Tensor,
+                               weights_decode: torch.Tensor,
+                               context_lens: torch.Tensor,
+                               block_table: torch.Tensor,
+                               scheduler_metadata_buffer: torch.Tensor,
+                               max_seq_len: int,
+                               q_scale: Optional[torch.Tensor]) -> torch.Tensor:
+        """Dispatch to fp8_paged_mqa_logits or fp8_fp4_paged_mqa_logits."""
+        if self.use_fp4:
+            return fp8_fp4_paged_mqa_logits(
+                (q_decode, q_scale), k_cache, weights_decode, context_lens,
+                block_table, scheduler_metadata_buffer, max_seq_len)
+        return fp8_paged_mqa_logits(q_decode, k_cache, weights_decode,
+                                    context_lens, block_table,
+                                    scheduler_metadata_buffer, max_seq_len)
+
     def sparse_attn_indexer(
         self,
         metadata: DSAtrtllmAttentionMetadata,
@@ -1506,11 +1655,19 @@ class Indexer(nn.Module):
         k_scale: torch.Tensor,
         weights: torch.Tensor,
         use_custom_topk: bool = True,
+        q_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Run the indexer TopK kernel for both prefill and decode phases."""
+        """Run the indexer TopK kernel for both prefill and decode phases.
+
+        q_scale is only consumed by the FP4 dispatch; FP8 path ignores it.
+        """
+        # DSACacheManager hardcodes quant_block_size=128 (see its __init__);
+        # FP4 uses per-block-32 UE8M0 scales but packs four of them into one
+        # int32 so the cache-layout contribution is the same 4 bytes/token as
+        # FP8 per-block-128 at head_dim=128.
         assert metadata.kv_cache_manager is None or \
             metadata.kv_cache_manager.quant_block_size == 128, \
-            "Only support quant_block_size = 128 for now"
+            f"Unexpected quant_block_size {metadata.kv_cache_manager.quant_block_size if metadata.kv_cache_manager else 'N/A'}"
         # Update the indexer k cache before prefill chunks gather from it.
         self._update_k_cache(k_fp8, k_scale, metadata)
 
@@ -1545,12 +1702,13 @@ class Indexer(nn.Module):
                 k_cache_4d = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
                     self.layer_idx)
 
+                gather_head_dim = self.head_dim // 2 if self.use_fp4 else self.head_dim
                 for chunk in metadata.indexer_prefill_chunks:
                     num_k_tokens = chunk.k_token_end - chunk.k_token_start
                     chunk_k_fp8, chunk_k_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
                         k_cache_4d, metadata.slot_mapping_fp8_fullkv,
                         metadata.slot_mapping_scale_fullkv, chunk.k_token_start,
-                        num_k_tokens)
+                        num_k_tokens, gather_head_dim)
 
                     chunk_num_token = chunk.token_end - chunk.token_start
                     apply_q_split = q_split_eligible and chunk_num_token >= q_split_threshold
@@ -1564,12 +1722,16 @@ class Indexer(nn.Module):
                     global_q_start = chunk.token_start + chunk_q_start
                     global_q_end = chunk.token_start + chunk_q_end
 
-                    logits = fp8_mqa_logits(
+                    chunk_q_scale = q_scale[global_q_start:global_q_end,
+                                            ...] if self.use_fp4 else None
+                    logits = self._call_mqa_logits(
                         q_fp8[global_q_start:global_q_end, ...],
-                        (chunk_k_fp8, chunk_k_scale),
+                        chunk_k_fp8,
+                        chunk_k_scale,
                         weights[global_q_start:global_q_end, ...],
                         chunk.cu_seqlen_ks[chunk_q_start:chunk_q_end],
                         chunk.cu_seqlen_ke[chunk_q_start:chunk_q_end],
+                        chunk_q_scale,
                     )
                     if use_custom_topk:
                         torch.ops.trtllm.indexer_topk_prefill(
@@ -1614,13 +1776,16 @@ class Indexer(nn.Module):
                 cu_seqlen_ks = metadata.cu_seqlen_ks[:num_ctx_tokens]
                 cu_seqlen_ke = metadata.cu_seqlen_ke[:num_ctx_tokens]
 
-                logits = fp8_mqa_logits(
+                ctx_q_scale = q_scale[:num_ctx_tokens,
+                                      ...] if self.use_fp4 else None
+                logits = self._call_mqa_logits(
                     q_fp8[:num_ctx_tokens, ...],
-                    (k_fp8[:num_ctx_tokens, ...], k_scale[:num_ctx_tokens,
-                                                          ...]),
+                    k_fp8[:num_ctx_tokens, ...],
+                    k_scale[:num_ctx_tokens, ...],
                     weights[:num_ctx_tokens, ...],
                     cu_seqlen_ks,
                     cu_seqlen_ke,
+                    ctx_q_scale,
                 )
                 if use_custom_topk:
                     torch.ops.trtllm.indexer_topk_prefill(
@@ -1665,18 +1830,28 @@ class Indexer(nn.Module):
             # and expand the corresponding metadata.
             if not metadata.use_expanded_buffers_for_mtp or next_n == 1:
                 q_decode = q_decode.view(num_generations, -1, *q_fp8.shape[1:])
-                context_lens = metadata.kv_lens_cuda_runtime[
-                    num_contexts:num_contexts + num_generations]
+                # 2D context_lens slice from the pre-allocated buffer; matches
+                # q_decode's (batch, next_n) layout required by the new
+                # DeepGEMM paged MQA logits API.
+                context_lens = metadata.kv_lens_cuda_2d[:num_generations, :
+                                                        next_n].contiguous()
                 block_table = metadata.indexer_k_cache_block_offsets[
                     num_contexts:num_contexts + num_generations]
-                if q_decode.shape[1] == 4:
-                    scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_mtp3
-                else:
+                # The 2D-context_lens metadata kernel encodes next_n into the
+                # schedule (via num_next_n_atoms). MTP forwards alternate
+                # between the full-window call (next_n == 1+max_draft_tokens)
+                # and per-token draft calls (next_n == 1), so we must select
+                # the buffer that was populated for this next_n.
+                if next_n == 1:
                     scheduler_metadata_buffer = metadata.scheduler_metadata_buffer
+                else:
+                    scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_full_next_n
             else:
                 q_decode = q_decode.view(-1, 1, *q_fp8.shape[1:])
                 num_tokens = q_decode.shape[0]
-                context_lens = metadata.kv_lens_expanded_cuda[:num_tokens]
+                # New API requires 2D; each expanded token becomes a (1,) row.
+                context_lens = metadata.kv_lens_expanded_cuda[:num_tokens].view(
+                    -1, 1)
                 block_table = metadata.block_table_expanded[:num_tokens]
                 scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_expanded
 
@@ -1689,11 +1864,19 @@ class Indexer(nn.Module):
             k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
                 self.layer_idx)
 
-            logits_decode = fp8_paged_mqa_logits(q_decode, k_cache,
-                                                 weights_decode, context_lens,
-                                                 block_table,
-                                                 scheduler_metadata_buffer,
-                                                 max_seq_len)
+            decode_q_scale = q_scale[num_ctx_tokens:num_ctx_tokens +
+                                     num_gen_tokens,
+                                     ...] if self.use_fp4 else None
+            if self.use_fp4:
+                # q_decode shape is either (num_generations, next_n, n_heads,
+                # head_dim/2) [non-expanded] or (batch*next_n, 1, n_heads,
+                # head_dim/2) [expanded]. Match q_scale's batch/next_n dims.
+                decode_q_scale = decode_q_scale.view(q_decode.shape[0],
+                                                     q_decode.shape[1],
+                                                     self.n_heads)
+            logits_decode = self._call_paged_mqa_logits(
+                q_decode, k_cache, weights_decode, context_lens, block_table,
+                scheduler_metadata_buffer, max_seq_len, decode_q_scale)
 
             if use_custom_topk:
                 # Kernel expects kv_lens (total cache length), not seq_lens (new tokens)
@@ -1804,7 +1987,15 @@ class Indexer(nn.Module):
         return q_pe, q_nope, k_pe, k_nope
 
     def _prep_q_or_k(self, qk_pe: torch.Tensor, qk_nope: torch.Tensor):
-        """Concatenate and FP8 quantize for Q or K via fused kernel."""
+        """Concatenate and quantize for Q or K.
+
+        FP8 mode: fused cat + FP8 quantize via CUDA kernel.
+        FP4 mode: fused cat + per-block-32 FP4 E2M1 quantize via CUDA kernel.
+        The returned packed bytes are int8 (two FP4 codes per byte) and the
+        scale is int32 (four UE8M0 exponents packed little-endian).
+        """
+        if self.use_fp4:
+            return torch.ops.trtllm.fused_cat_fp4(qk_pe, qk_nope)
         fp8_out, scale = torch.ops.trtllm.fused_cat_fp8(
             qk_pe, qk_nope, self.scale_fmt == "ue8m0")
         return fp8_out, scale
@@ -1812,14 +2003,18 @@ class Indexer(nn.Module):
     def pre_indexer_proj(
         self, qr: torch.Tensor, hidden_states: torch.Tensor,
         position_ids: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor]:
         """Pure token-wise projections (CUDA-graph-capturable).
 
         Runs cublas_mm, qk_projection_and_rope, FP8 quantize, and weight
         scaling.  Does NOT touch the k cache or any batch-specific metadata,
         so this can safely run inside a captured CUDA graph partition.
 
-        Returns (q_fp8, k_fp8, k_scale, weights).
+        Returns (q_fp_bytes, k_fp_bytes, k_scale, weights, q_scale). The last
+        tensor is only consumed by the FP4 kernel dispatch; the FP8 path
+        ignores it. It is returned unconditionally so the two-op CUDA graph
+        split in MLA.forward_dsa_proj sees a stable signature.
         """
         assert self._fused_wk_wp_weight is not None, \
             "post_load_weights() must be called before forward()"
@@ -1847,23 +2042,38 @@ class Indexer(nn.Module):
         )
         q_fp8, q_scale = q
         k_fp8, k_scale = k
-        q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_heads, 1)
+        if self.use_fp4:
+            # FP4 packs two codes per byte, so the trailing dim is head_dim // 2.
+            # fused_cat_fp4 flattens the leading dims to M=N*n_heads; restore
+            # the (N, n_heads, ...) shape so downstream slicing in
+            # sparse_attn_indexer (which indexes by token) lines up with
+            # q_fp8. The DeepGEMM FP4 kernel applies the per-block q_scale
+            # internally, so weights carry only softmax_scale * n_heads^-0.5.
+            q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim // 2)
+            q_scale = q_scale.view(-1, self.n_heads, 1)
+            weights = weights * self.weight_scale_factor
+        else:
+            q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
+            q_scale = q_scale.view(-1, self.n_heads, 1)
+            weights = self._weight_scale(weights, q_scale)
 
-        weights = self._weight_scale(weights, q_scale)
-
-        return q_fp8, k_fp8, k_scale, weights
+        return q_fp8, k_fp8, k_scale, weights, q_scale
 
     @torch.inference_mode()
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
                 metadata: DSAtrtllmAttentionMetadata,
                 position_ids: torch.Tensor):
-        q_fp8, k_fp8, k_scale, weights = self.pre_indexer_proj(
+        q_fp8, k_fp8, k_scale, weights, q_scale = self.pre_indexer_proj(
             qr, hidden_states, position_ids)
 
         # Return topk indices buffer for sparse attention [num_tokens, index_topk]
-        return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k_fp8,
-                                        k_scale, weights)
+        return self.sparse_attn_indexer(metadata,
+                                        hidden_states,
+                                        q_fp8,
+                                        k_fp8,
+                                        k_scale,
+                                        weights,
+                                        q_scale=q_scale)
 
 
 class DSATrtllmAttention(TrtllmAttention):
@@ -2022,6 +2232,10 @@ class DSACacheManager(KVCacheManager):
         """Initialize cache manager with indexer K-cache pool per layer."""
         self.quant_block_size = 128
         self.index_head_dim = sparse_attn_config.index_head_dim
+        # FP4 mode packs the indexer K cache as head_dim/2 data bytes + 4
+        # scale bytes (vs. head_dim + 4 for FP8). The C++ WindowBlockManager
+        # allocates the pool with this smaller stride when the flag is set.
+        self.use_fp4 = sparse_attn_config.indexer_k_dtype == "fp4"
 
         super().__init__(
             kv_cache_config,
@@ -2042,6 +2256,7 @@ class DSACacheManager(KVCacheManager):
             enable_indexer_k_cache=True,
             indexer_k_cache_quant_block_size=128,
             indexer_k_cache_index_head_dim=self.index_head_dim,
+            indexer_k_cache_use_fp4=self.use_fp4,
             **kwargs,
         )
         self.num_blocks = self.blocks_in_primary_pool
@@ -2058,7 +2273,8 @@ class DSACacheManager(KVCacheManager):
     def get_indexer_k_cache_buffers(self, layer_idx: int):
         """Get indexer k cache buffer from a specific layer pool."""
         block_size = self.tokens_per_block
-        per_token_size = self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
+        data_bytes = self.index_head_dim // 2 if self.use_fp4 else self.index_head_dim
+        per_token_size = data_bytes + self.index_head_dim // self.quant_block_size * 4
         layer_offset = self.layer_offsets[layer_idx]
         return self.indexer_k_cache_pool_per_layer[layer_offset].view(
             self.num_blocks, block_size, 1, per_token_size)
@@ -2079,6 +2295,12 @@ class DSACacheManager(KVCacheManager):
         sparse_attn_config = model_config.sparse_attention_config
         index_head_dim = sparse_attn_config.index_head_dim
         quant_block_size = 128
+        # Under FP4 the indexer stores two E2M1 codes per byte, so the
+        # per-token data footprint halves (132 B -> 68 B at index_head_dim=128);
+        # the scale bytes are unchanged (4 per token, one int32 holding four
+        # UE8M0 exponents at quant_block_size=32 after packing).
+        use_fp4 = sparse_attn_config.indexer_k_dtype == "fp4"
+        indexer_data_dim = index_head_dim // 2 if use_fp4 else index_head_dim
 
         # get kv cache dtype bytes
         mem_per_token = 2
@@ -2095,7 +2317,7 @@ class DSACacheManager(KVCacheManager):
         mem_per_token *= num_attention_layers * head_dim
 
         # 1 for K, others for indexer K cache
-        head_dim_factor = (index_head_dim +
+        head_dim_factor = (indexer_data_dim +
                            index_head_dim // quant_block_size * 4) / head_dim
         kv_factor = 1 + head_dim_factor
         mem_per_token *= kv_factor
@@ -2103,8 +2325,11 @@ class DSACacheManager(KVCacheManager):
 
     def get_cache_bytes_per_token(self):
         """Compute actual cache bytes per token from instance configuration."""
-        # self.kv_factor for K, others for indexer K cache
-        head_dim_factor = (self.index_head_dim + self.index_head_dim //
+        # self.kv_factor for K, others for indexer K cache.
+        # Under FP4 the indexer data portion is halved (two E2M1 codes per
+        # byte); scale bytes are unchanged.
+        indexer_data_dim = self.index_head_dim // 2 if self.use_fp4 else self.index_head_dim
+        head_dim_factor = (indexer_data_dim + self.index_head_dim //
                            self.quant_block_size * 4) / self.head_dim
         kv_factor = self.kv_factor + head_dim_factor
         cache_size_per_token = math.ceil(
