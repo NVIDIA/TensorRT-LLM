@@ -1239,11 +1239,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-window",
         type=int,
-        default=0,
-        help="Cache T-axis capacity (max replay buffer length).  0 (default) "
-        "= use mtp_len, the placeholder/degenerate every-step-checkpoint "
-        "case.  Set to e.g. 16 for real replay-style checkpointing on "
-        "Nemotron-3-Super-120B.",
+        default=16,
+        help="Cache T-axis capacity (max replay buffer length).  Default 16 "
+        "matches Nemotron-3-Super-120B production.  Pass 0 to fall back to "
+        "mtp_len (degenerate every-step-checkpoint case, mostly unused).",
     )
     parser.add_argument(
         "--prev-tokens-int",
