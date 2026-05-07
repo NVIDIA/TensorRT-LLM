@@ -108,8 +108,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernelDtype(I
     int const* __restrict__ seqLens, int const* __restrict__ preIdx, InputT* __restrict__ scratchValues,
     int* __restrict__ outIndices, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount)
 {
-    using SmemKey = typename GvrDtypeTraits<InputT>::SmemKey;
-    using SmemT = KernelSmemTplK<SmemKey, GvrParams<InputT, TopK>::kC, GvrParams<InputT, TopK>::kNumBins>;
+    // P0 (2026-05-07): dtype path uses fp32 keys[] in smem (deferred convert).
+    using SmemT = KernelSmemTplK<float, GvrParams<InputT, TopK>::kC, GvrParams<InputT, TopK>::kNumBins>;
 
     int const rowIdx = blockIdx.x;
     int const seq_len = seqLens[rowIdx / next_n];
@@ -191,8 +191,8 @@ void launchHeuristicTopKDecodeDtype(InputT const* logits, int const* seqLens, in
 
     auto launchOne = [&]<int TopK>()
     {
-        using SmemKey = typename GvrDtypeTraits<InputT>::SmemKey;
-        using SmemT = KernelSmemTplK<SmemKey, GvrParams<InputT, TopK>::kC, GvrParams<InputT, TopK>::kNumBins>;
+        // P0 (2026-05-07): dtype path uses fp32 keys[] in smem.
+        using SmemT = KernelSmemTplK<float, GvrParams<InputT, TopK>::kC, GvrParams<InputT, TopK>::kNumBins>;
         size_t const smemSize = sizeof(SmemT);
 
         auto kfn = heuristicTopKMultiRowKernelDtype<InputT, TopK>;

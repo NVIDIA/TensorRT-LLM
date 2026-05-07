@@ -1185,16 +1185,20 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1)
 // 4d.D: templated on TopK so K=512/1024/2048 share the same body. Default
 // <InputT, TOP_K> with KernelSmemTpl<...> matches the pre-multi-K signature.
 
+// P0 (Q1b-P0, 2026-05-07): smem keys[] are kept as fp32 to defer the
+// Trait::from_fp32(val) write conversion out of the P3 hot loop. This trades
+// ~10 KB extra smem (5120 keys × +2B at K=2048 dtype) for ~2 µs P3 savings on
+// bf16/fp16 (P3 -10-25%, total -4.5-7.1% per Q1b-P0 snapshot bench).
+// fp32 path is unaffected — gvrTopKJob (separate function) keeps its layout.
 template <typename InputT, int TopK = TOP_K>
 __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, int const N,
     int const* __restrict__ preIdx, int const M, int const topK, InputT* __restrict__ outputValues,
     int* __restrict__ outputIndices,
-    KernelSmemTplK<typename GvrDtypeTraits<InputT>::SmemKey, GvrParams<InputT, TopK>::kC,
-        GvrParams<InputT, TopK>::kNumBins>* smem,
+    KernelSmemTplK<float, GvrParams<InputT, TopK>::kC, GvrParams<InputT, TopK>::kNumBins>* smem,
     int const preIdxOffset = 0)
 {
     using Trait = GvrDtypeTraits<InputT>;
-    using SmemKey = typename Trait::SmemKey;
+    using SmemKey = float; // P0: keys stay fp32; conversion deferred to output writeback
     using Params = GvrParams<InputT, TopK>;
     constexpr int kK = TopK;
     constexpr int kCC = Params::kC;
@@ -1458,7 +1462,7 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
                 float val = v[j];
                 if (val >= thr && my_write_pos < kCC)
                 {
-                    smem->keys[my_write_pos] = Trait::from_fp32(val);
+                    smem->keys[my_write_pos] = val; // P0: defer convert to output
                     smem->vals[my_write_pos] = i + j;
                     my_write_pos++;
                 }
@@ -1470,7 +1474,7 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
             float val = Trait::to_fp32(__ldg(&input[i]));
             if (val >= thr && my_write_pos < kCC)
             {
-                smem->keys[my_write_pos] = Trait::from_fp32(val);
+                smem->keys[my_write_pos] = val; // P0: defer convert to output
                 smem->vals[my_write_pos] = i;
                 my_write_pos++;
             }
@@ -1488,7 +1492,7 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
     {
         for (int i = tid; i < kK; i += BLOCK_SIZE)
         {
-            outputValues[i] = smem->keys[i]; // both InputT, no convert
+            outputValues[i] = Trait::from_fp32(smem->keys[i]); // P0: convert at output
             outputIndices[i] = smem->vals[i];
         }
         return;
@@ -1499,7 +1503,7 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
         float cmin = FLT_MAX, cmax = -FLT_MAX;
         for (int i = tid; i < cand_count; i += BLOCK_SIZE)
         {
-            float v = Trait::to_fp32(smem->keys[i]);
+            float v = smem->keys[i]; // P0: keys already fp32
             cmin = fminf(cmin, v);
             cmax = fmaxf(cmax, v);
         }
@@ -1530,7 +1534,7 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
 
         for (int i = tid; i < cand_count; i += BLOCK_SIZE)
         {
-            int bin = (int) ((Trait::to_fp32(smem->keys[i]) - block_min) * inv1);
+            int bin = (int) ((smem->keys[i] - block_min) * inv1); // P0: keys fp32
             bin = min(max(bin, 0), kBins - 1);
             atomicAdd(&smem->histogram[bin], 1);
         }
@@ -1591,7 +1595,7 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
         int snap_limit = (cand_count > 128 ? cand_count / 4 : 32);
         for (int si = 0; si < snap_limit; si++)
         {
-            blockFusedSnapIterDtype<SmemKey, TopK>(smem, cand_count, tid, warp_id, lane);
+            blockFusedSnapIter<TopK>(smem, cand_count, tid, warp_id, lane); // P0: keys fp32 → use fp32 snap helper
             int cge = smem->cnt_lo;
             int cgt = smem->cnt_hi;
             if (cgt < kK && cge >= kK)
@@ -1611,7 +1615,7 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
         for (int base = warp_id * WARP_SIZE; base < cand_count; base += BLOCK_SIZE)
         {
             int i = base + lane;
-            float v = (i < cand_count) ? Trait::to_fp32(smem->keys[i]) : -FLT_MAX;
+            float v = (i < cand_count) ? smem->keys[i] : -FLT_MAX; // P0: keys fp32
 
             bool emit_gt = (i < cand_count) && (v > sel_thr);
             unsigned mask_gt = __ballot_sync(full_mask, emit_gt);
@@ -1636,7 +1640,7 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
         for (int base = warp_id * WARP_SIZE; base < cand_count; base += BLOCK_SIZE)
         {
             int i = base + lane;
-            float v = (i < cand_count) ? Trait::to_fp32(smem->keys[i]) : -FLT_MAX;
+            float v = (i < cand_count) ? smem->keys[i] : -FLT_MAX; // P0: keys fp32
 
             bool emit_eq = (i < cand_count) && (v == sel_thr);
             unsigned mask_eq = __ballot_sync(full_mask, emit_eq);
@@ -1670,7 +1674,7 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
     // cand_count < kK fallback
     for (int i = tid; i < cand_count; i += BLOCK_SIZE)
     {
-        outputValues[i] = smem->keys[i]; // both InputT
+        outputValues[i] = Trait::from_fp32(smem->keys[i]); // P0: convert at output
         outputIndices[i] = smem->vals[i];
     }
     InputT const neg_max = Trait::from_fp32(-FLT_MAX);
@@ -1693,7 +1697,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 1)
         int const topK, InputT* __restrict__ outputValues, int* __restrict__ outputIndices, int const thresholdPos)
 {
     using SmemKey = typename GvrDtypeTraits<InputT>::SmemKey;
-    using SmemT = KernelSmemTplK<SmemKey, GvrParams<InputT, TopK>::kC, GvrParams<InputT, TopK>::kNumBins>;
+    using SmemT
+        = KernelSmemTplK<float, GvrParams<InputT, TopK>::kC, GvrParams<InputT, TopK>::kNumBins>; // P0: dtype keys fp32
     extern __shared__ unsigned char smem_raw[];
     auto* smem = reinterpret_cast<SmemT*>(smem_raw);
 
@@ -1743,8 +1748,9 @@ cudaError_t launchHeuristicTopK(T const* input, int N, IdxT const* preIdx, int M
 
     auto launchOne = [&]<int TopK>() -> cudaError_t
     {
-        using SmemKey = typename GvrDtypeTraits<T>::SmemKey;
-        using SmemT = KernelSmemTplK<SmemKey, GvrParams<T, TopK>::kC, GvrParams<T, TopK>::kNumBins>;
+        // P0 (2026-05-07): dtype path uses fp32 smem keys (deferred convert).
+        // Launcher allocates smem with float keys regardless of input dtype.
+        using SmemT = KernelSmemTplK<float, GvrParams<T, TopK>::kC, GvrParams<T, TopK>::kNumBins>;
         size_t const smemSize = sizeof(SmemT);
 
         // Resolve target kernel function pointer at compile time.
