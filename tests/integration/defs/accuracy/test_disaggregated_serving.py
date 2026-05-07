@@ -2147,6 +2147,13 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
         # Disagg smoke test: CTX TP=2 + GEN TP=2 = 4 GPUs.
         # NVFP4 weights ~71 GB/rank at TP=2, leaving ~107 GB for KV on B200.
         # TRTLLM backend required (WIDEEP lacks MXFP4 support for V4-Flash).
+        # V4 uses pure-Python KVCacheManagerV2; needs Python transceiver.
+        # NIXL (not DEFAULT) skips the TRTLLM_USE_UCX_KVCACHE=1 fallback.
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 4096,
+        }
         ctx_server_config = {
             "tensor_parallel_size": 2,
             "moe_expert_parallel_size": 2,
@@ -2155,10 +2162,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.5,
             },
-            "cache_transceiver_config": {
-                "backend": "DEFAULT",
-                "max_tokens_in_buffer": 4096,
-            },
+            "cache_transceiver_config": cache_transceiver_config,
         }
         gen_server_config = {
             "tensor_parallel_size": 2,
@@ -2172,10 +2176,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.5,
             },
-            "cache_transceiver_config": {
-                "backend": "DEFAULT",
-                "max_tokens_in_buffer": 4096,
-            },
+            "cache_transceiver_config": cache_transceiver_config,
         }
         disaggregated_server_config = {
             "hostname": "localhost",
@@ -2207,6 +2208,13 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
         # FP8 weights ~71 GB/rank at TP=4 → ~142 GB/rank at TP=2; requires
         # ≥140 GB per GPU (fits on B300 288 GB, tight on B200 178 GB).
         # WIDEEP backend: CUTLASS FP8 block-scale path is Hopper-only.
+        # V4 uses pure-Python KVCacheManagerV2; needs Python transceiver.
+        # NIXL (not DEFAULT) skips the TRTLLM_USE_UCX_KVCACHE=1 fallback.
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 4096,
+        }
         ctx_server_config = {
             "tensor_parallel_size": 2,
             "moe_expert_parallel_size": 2,
@@ -2215,10 +2223,7 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.5,
             },
-            "cache_transceiver_config": {
-                "backend": "DEFAULT",
-                "max_tokens_in_buffer": 4096,
-            },
+            "cache_transceiver_config": cache_transceiver_config,
         }
         gen_server_config = {
             "tensor_parallel_size": 2,
@@ -2232,10 +2237,7 @@ class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.5,
             },
-            "cache_transceiver_config": {
-                "backend": "DEFAULT",
-                "max_tokens_in_buffer": 4096,
-            },
+            "cache_transceiver_config": cache_transceiver_config,
         }
         disaggregated_server_config = {
             "hostname": "localhost",
