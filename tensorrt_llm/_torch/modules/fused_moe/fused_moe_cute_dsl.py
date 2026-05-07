@@ -982,7 +982,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
     def load_weights(self,
                      weights: List[Dict],
                      allow_partial_loading: bool = False):
-        super().load_weights(weights, allow_partial_loading)
+        super().load_weights(weights,
+                             allow_partial_loading=allow_partial_loading)
         dwdp_handle_collector = getattr(self, "dwdp_handle_collector", None)
         if dwdp_handle_collector is not None:
             dwdp_handle_collector.register_weights(self)

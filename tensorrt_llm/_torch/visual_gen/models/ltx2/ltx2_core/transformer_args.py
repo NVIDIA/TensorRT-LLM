@@ -66,6 +66,7 @@ class TransformerArgsPreprocessor:
         self.double_precision_rope = double_precision_rope
         self.positional_embedding_theta = positional_embedding_theta
         self.rope_type = rope_type
+        self._freq_grid_cache: dict = {}
 
     def _prepare_timestep(
         self,
@@ -82,12 +83,11 @@ class TransformerArgsPreprocessor:
     def _prepare_context(
         self,
         context: torch.Tensor,
-        x: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        batch_size = x.shape[0]
+        batch_size = context.shape[0]
         context = self.caption_projection(context.contiguous())
-        context = context.view(batch_size, -1, x.shape[-1])
+        context = context.view(batch_size, -1, self.inner_dim)
         return context, attention_mask
 
     def _prepare_attention_mask(
@@ -121,30 +121,57 @@ class TransformerArgsPreprocessor:
             num_attention_heads=num_attention_heads,
             rope_type=self.rope_type,
             freq_grid_generator=freq_grid_generator,
+            freq_grid_cache=self._freq_grid_cache,
         )
 
-    def prepare(self, modality: Modality) -> TransformerArgs:
-        x = self.patchify_proj(modality.latent.contiguous())
-        timestep, embedded_timestep = self._prepare_timestep(
-            modality.timesteps, x.shape[0], modality.latent.dtype
-        )
-        context, attention_mask = self._prepare_context(modality.context, x, modality.context_mask)
-        attention_mask = self._prepare_attention_mask(attention_mask, modality.latent.dtype)
+    def prepare_text_cache(
+        self,
+        context: torch.Tensor,
+        context_mask: torch.Tensor | None,
+        positions: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor, torch.Tensor], None]:
+        """Compute step-invariant outputs: (context, mask, PE, cross_PE).
+
+        Called once before the denoise loop.  Does not require latent data.
+        Returns cross_PE=None (only MultiModal subclass produces it).
+        """
+        context, attention_mask = self._prepare_context(context, context_mask)
+        attention_mask = self._prepare_attention_mask(attention_mask, dtype)
         pe = self._prepare_positional_embeddings(
-            positions=modality.positions,
+            positions=positions,
             inner_dim=self.inner_dim,
             max_pos=self.max_pos,
             use_middle_indices_grid=self.use_middle_indices_grid,
             num_attention_heads=self.num_attention_heads,
-            x_dtype=modality.latent.dtype,
+            x_dtype=dtype,
+        )
+        return context, attention_mask, pe, None
+
+    def prepare(
+        self,
+        modality: Modality,
+        static_context: torch.Tensor,
+        static_mask: torch.Tensor | None,
+        static_pe: tuple[torch.Tensor, torch.Tensor],
+        static_cross_pe: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> TransformerArgs:
+        """Build TransformerArgs for one denoise step.
+
+        Step-invariant static args are always required.  *static_cross_pe*
+        is only used by the MultiModal subclass; ignored here.
+        """
+        x = self.patchify_proj(modality.latent.contiguous())
+        timestep, embedded_timestep = self._prepare_timestep(
+            modality.timesteps, x.shape[0], modality.latent.dtype
         )
         return TransformerArgs(
             x=x,
-            context=context,
-            context_mask=attention_mask,
+            context=static_context,
+            context_mask=static_mask,
             timesteps=timestep,
             embedded_timestep=embedded_timestep,
-            positional_embeddings=pe,
+            positional_embeddings=static_pe,
             cross_positional_embeddings=None,
             cross_scale_shift_timestep=None,
             cross_gate_timestep=None,
@@ -193,15 +220,48 @@ class MultiModalTransformerArgsPreprocessor:
         self.audio_cross_attention_dim = audio_cross_attention_dim
         self.av_ca_timestep_scale_multiplier = av_ca_timestep_scale_multiplier
 
-    def prepare(self, modality: Modality) -> TransformerArgs:
-        transformer_args = self.simple_preprocessor.prepare(modality)
-        cross_pe = self.simple_preprocessor._prepare_positional_embeddings(
-            positions=modality.positions[:, 0:1, :],
+    def prepare_text_cache(
+        self,
+        context: torch.Tensor,
+        context_mask: torch.Tensor | None,
+        positions: torch.Tensor,
+        dtype: torch.dtype,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        tuple[torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor],
+    ]:
+        """Compute step-invariant outputs including cross-PE.
+
+        Returns (context, mask, pe, cross_pe).
+        """
+        sp = self.simple_preprocessor
+        context, mask, pe, _ = sp.prepare_text_cache(context, context_mask, positions, dtype)
+        cross_pe = sp._prepare_positional_embeddings(
+            positions=positions[:, 0:1, :],
             inner_dim=self.audio_cross_attention_dim,
             max_pos=[self.cross_pe_max_pos],
             use_middle_indices_grid=True,
-            num_attention_heads=self.simple_preprocessor.num_attention_heads,
-            x_dtype=modality.latent.dtype,
+            num_attention_heads=sp.num_attention_heads,
+            x_dtype=dtype,
+        )
+        return context, mask, pe, cross_pe
+
+    def prepare(
+        self,
+        modality: Modality,
+        static_context: torch.Tensor,
+        static_mask: torch.Tensor | None,
+        static_pe: tuple[torch.Tensor, torch.Tensor],
+        static_cross_pe: tuple[torch.Tensor, torch.Tensor],
+    ) -> TransformerArgs:
+        """Build TransformerArgs for one denoise step with pre-computed static outputs."""
+        transformer_args = self.simple_preprocessor.prepare(
+            modality,
+            static_context=static_context,
+            static_mask=static_mask,
+            static_pe=static_pe,
         )
         cross_scale_shift_timestep, cross_gate_timestep = self._prepare_cross_attention_timestep(
             timestep=modality.timesteps,
@@ -211,7 +271,7 @@ class MultiModalTransformerArgsPreprocessor:
         )
         return replace(
             transformer_args,
-            cross_positional_embeddings=cross_pe,
+            cross_positional_embeddings=static_cross_pe,
             cross_scale_shift_timestep=cross_scale_shift_timestep,
             cross_gate_timestep=cross_gate_timestep,
         )

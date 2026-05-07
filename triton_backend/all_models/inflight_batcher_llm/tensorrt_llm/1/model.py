@@ -215,6 +215,8 @@ def get_sampling_config_from_request(request, batch_size=1, batch_index=0):
         request, 'frequency_penalty', batch_size, batch_index)
     kwargs['length_penalty'] = get_input_scalar_by_name(request, 'len_penalty',
                                                         batch_size, batch_index)
+    kwargs['prompt_ignore_length'] = get_input_scalar_by_name(
+        request, 'prompt_ignore_length', batch_size, batch_index)
     kwargs['top_p_min'] = get_input_scalar_by_name(request, 'runtime_top_p_min',
                                                    batch_size, batch_index)
     kwargs['top_p_reset_ids'] = get_input_scalar_by_name(
@@ -914,8 +916,6 @@ class TritonPythonModel:
             get_parameter(model_config, "cross_kv_cache_fraction", float),
             "host_cache_size":
             get_parameter(model_config, "kv_cache_host_memory_bytes", int),
-            "onboard_blocks":
-            get_parameter(model_config, "kv_cache_onboard_blocks", bool),
         }
         max_attention_window_size = get_parameter(model_config,
                                                   "max_attention_window_size")

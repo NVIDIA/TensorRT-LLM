@@ -10,8 +10,11 @@ from parameterized import parameterized
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend import (FlashInferAttention,
                                                    FlashInferAttentionMetadata)
+from tensorrt_llm._torch.attention_backend.interface import \
+    PredefinedAttentionMask
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -570,3 +573,87 @@ class TestFlashInferAttention(unittest.TestCase):
                                        rtol=0)
 
         kv_cache_manager.shutdown()
+
+    def test_ragged_prefill_no_kv_cache_uses_cudnn_plan(self) -> None:
+        """Ragged QKV with ``kv_cache_manager=None`` plans via cuDNN (``_plan_ragged_cudnn_no_kv``)."""
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+
+        device = torch.device("cuda")
+        num_heads = 8
+        num_kv_heads = 8
+        head_dim = 80
+        hidden_size = num_heads * head_dim
+        dtype = torch.bfloat16
+        per_sequence_token_counts = [24, 56]
+        num_context_sequences = len(per_sequence_token_counts)
+        total_tokens = sum(per_sequence_token_counts)
+
+        attn_metadata = TestingFlashInferAttentionMetadata(
+            max_num_requests=max(num_context_sequences, 128),
+            max_num_tokens=max(total_tokens * 2, 8192),
+            kv_cache_manager=None,
+        )
+        attn_metadata.seq_lens = torch.tensor(
+            per_sequence_token_counts,
+            dtype=torch.int,
+            pin_memory=prefer_pinned(),
+        )
+        attn_metadata.num_contexts = num_context_sequences
+        attn_metadata.request_ids = list(range(1, num_context_sequences + 1))
+        attn_metadata.prompt_lens = list(per_sequence_token_counts)
+        attn_metadata.prepare()
+
+        layer = FlashInferAttention(
+            layer_idx=0,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            num_kv_heads=num_kv_heads,
+        )
+
+        generator = torch.Generator(device=device)
+        generator.manual_seed(0)
+        query_states = torch.randn(
+            total_tokens,
+            hidden_size,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        )
+        key_states = torch.randn(
+            total_tokens,
+            num_kv_heads * head_dim,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        )
+        value_states = torch.randn(
+            total_tokens,
+            num_kv_heads * head_dim,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        )
+
+        attention_output = layer.forward(
+            query_states,
+            key_states,
+            value_states,
+            attn_metadata,
+            attention_mask=PredefinedAttentionMask.FULL,
+        )
+
+        self.assertEqual(attention_output.shape, (total_tokens, hidden_size))
+        self.assertGreaterEqual(len(attn_metadata._plan_params_to_wrappers), 1)
+        # FlashInfer stores the chosen implementation on the wrapper (see
+        # BatchPrefillWithRaggedKVCacheWrapper.__init__: self._backend = backend).
+        # TRT-LLM no-cache ragged path passes backend="cudnn" in flashinfer.py.
+        for flashinfer_wrappers in attn_metadata._plan_params_to_wrappers.values(
+        ):
+            ragged_wrapper = flashinfer_wrappers.ragged_prefill_wrapper
+            self.assertIsNotNone(ragged_wrapper)
+            self.assertEqual(
+                getattr(ragged_wrapper, "_backend", None),
+                "cudnn",
+                msg="No-KV ragged prefill should use FlashInfer's cudnn backend",
+            )

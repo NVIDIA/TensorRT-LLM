@@ -5,6 +5,7 @@ max_seq_len: 8192
 max_num_tokens: 4096
 max_batch_size: 512
 cuda_graph_config:
+  max_batch_size: 512
   batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
 enable_chunked_prefill: true
 model_factory: Qwen3_5MoeForConditionalGeneration
@@ -52,4 +53,6 @@ transforms:
   gather_logits_before_lm_head:
     enabled: true
   compile_model:
-    piecewise_enabled: true
+    # Piecewise cudagraph may work if multi_stream_moe is disabled, but we want
+    # multi_stream_moe enabled on the default path for this model family.
+    piecewise_enabled: false

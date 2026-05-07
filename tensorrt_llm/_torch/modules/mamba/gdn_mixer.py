@@ -28,7 +28,11 @@ from ..linear import Linear, TensorParallelMode
 from ..multi_stream_utils import maybe_execute_in_parallel
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_triton import causal_conv1d_update as causal_conv1d_update_triton
-from .fuse_elementwise_ops import extract_transpose_prefill_slice
+from .fuse_elementwise_ops import (
+    extract_transpose_prefill_slice,
+    split_qkv_contiguous,
+    transpose_and_split_qkv,
+)
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .mamba2_metadata import Mamba2Metadata
 
@@ -197,6 +201,71 @@ def fused_gdn_gating(
         g, A_log, a, dt_bias, seq_len, num_heads, beta, threshold, 8, num_warps=1
     )
     return g
+
+
+@triton.jit
+def fused_gdn_gating_with_sigmoid_kernel(
+    g,
+    beta_out,
+    A_log,
+    a,
+    dt_bias,
+    b,
+    seq_len,
+    NUM_HEADS: tl.constexpr,
+    sp_beta: tl.constexpr,
+    threshold: tl.constexpr,
+    BLK_HEADS: tl.constexpr,
+):
+    """Fuse gdn_gating + sigmoid(b) into one kernel."""
+    i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
+    off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
+    mask = head_off < NUM_HEADS
+    blk_A_log = tl.load(A_log + head_off, mask=mask)
+    blk_a = tl.load(a + off, mask=mask)
+    blk_bias = tl.load(dt_bias + head_off, mask=mask)
+    x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
+    softplus_x = tl.where(
+        sp_beta * x <= threshold, (1 / sp_beta) * tl.log(1 + tl.exp(sp_beta * x)), x
+    )
+    blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
+    tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
+    # sigmoid(b)
+    blk_b = tl.load(b + off, mask=mask)
+    blk_beta = tl.sigmoid(blk_b.to(tl.float32))
+    tl.store(beta_out + off, blk_beta.to(beta_out.dtype.element_ty), mask=mask)
+
+
+def fused_gdn_gating_with_sigmoid(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    sp_beta: float = 1.0,
+    threshold: float = 20.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused GDN gating + sigmoid: compute g and beta in one kernel launch."""
+    batch, num_heads = a.shape
+    seq_len = 1
+    grid = (batch, seq_len, triton.cdiv(num_heads, 8))
+    g = torch.empty_like(a, dtype=torch.float32)
+    beta_out = torch.empty_like(b)
+    fused_gdn_gating_with_sigmoid_kernel[grid](
+        g,
+        beta_out,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        seq_len,
+        num_heads,
+        sp_beta,
+        threshold,
+        8,
+        num_warps=1,
+    )
+    return g, beta_out
 
 
 class Qwen3NextGatedDeltaNet(nn.Module):
@@ -597,8 +666,20 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                     activation=self.activation,
                     conv_state_indices=state_indices_d,
                 )
-            mixed_qkv_p.copy_(mixed_qkv_p_t.transpose(0, 1))
-            mixed_qkv = torch.cat((mixed_qkv_p, mixed_qkv_d), dim=0)
+            key_split_dim = self.key_dim // self.attn_tp_size
+            value_split_dim = self.value_dim // self.attn_tp_size
+            # Fused transpose + split for mixed prefill+decode batch
+            query, key, value = transpose_and_split_qkv(
+                mixed_qkv_p_t,
+                mixed_qkv_d,
+                key_split_dim,
+                key_split_dim,
+                value_split_dim,
+                self.num_k_heads_per_tp,
+                self.head_k_dim,
+                self.num_v_heads_per_tp,
+                self.head_v_dim,
+            )
         else:
             mixed_qkv_t = extract_transpose_prefill_slice(
                 mixed_qkv,
@@ -606,7 +687,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 0,
                 mixed_qkv.shape[1],
             )
-            mixed_qkv = causal_conv1d_fn(
+            mixed_qkv_t = causal_conv1d_fn(
                 mixed_qkv_t,
                 self.conv1d.weight,
                 self.conv1d.bias,
@@ -615,24 +696,20 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 has_initial_state=has_initial_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
-            ).transpose(0, 1)
-
-        key_split_dim = self.key_dim // self.attn_tp_size
-        value_split_dim = self.value_dim // self.attn_tp_size
-
-        query, key, value = torch.split(
-            mixed_qkv,
-            [key_split_dim, key_split_dim, value_split_dim],
-            dim=-1,
-        )
-
-        actual_seq_len = query.shape[0]
-        num_heads = query.shape[1] // self.head_k_dim
-        num_value_heads = value.shape[1] // self.head_v_dim
-
-        query = query.view(1, actual_seq_len, num_heads, self.head_k_dim)
-        key = key.view(1, actual_seq_len, num_heads, self.head_k_dim)
-        value = value.view(1, actual_seq_len, num_value_heads, self.head_v_dim)
+            )
+            key_split_dim = self.key_dim // self.attn_tp_size
+            value_split_dim = self.value_dim // self.attn_tp_size
+            # Fused split for pure prefill (data in [D,T] layout from conv1d)
+            query, key, value = split_qkv_contiguous(
+                mixed_qkv_t.transpose(0, 1),
+                key_split_dim,
+                key_split_dim,
+                value_split_dim,
+                self.num_k_heads_per_tp,
+                self.head_k_dim,
+                self.num_v_heads_per_tp,
+                self.head_v_dim,
+            )
 
         if is_target_verify and num_decode_tokens > 0:
             attn_out_prefill = None
@@ -704,28 +781,27 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 return attn_out_decode
             return torch.cat((attn_out_prefill, attn_out_decode), dim=1)
 
-        beta = b.sigmoid()
-        g = fused_gdn_gating(self.A_log, a, self.dt_bias)
+        g, beta = fused_gdn_gating_with_sigmoid(self.A_log, a, self.dt_bias, b)
 
         g = g.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
-        recurrent_state = ssm_states[cache_indices]
-
-        core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+        core_attn_out, _ = chunk_gated_delta_rule(
             q=query,
             k=key,
             v=value,
             g=g,
             beta=beta,
-            initial_state=recurrent_state,
-            output_final_state=True,
+            initial_state=ssm_states,
+            initial_state_indices=cache_indices,
+            # This path writes recurrent state directly back into the shared
+            # pool; callers **must** ensure cache_indices do not alias live slots.
+            inplace_indexed_state_update=True,
+            output_final_state=False,
             cu_seqlens=query_start_loc_long,
             head_first=False,
             use_qk_l2norm_in_kernel=True,
         )
-        last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
-        ssm_states[cache_indices] = last_recurrent_state
 
         return core_attn_out
 
@@ -765,8 +841,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         state_indices_p, state_indices_d = torch.split(state_indices, batch_split_size)
         if num_prefills > 0:
-            ssm_states[state_indices_p] = torch.zeros(
+            # PyExecutor guarantees prefill requests are placed before decode requests
+            has_initial_states_p = has_initial_states[:num_prefills]
+            ssm_states[state_indices_p[~has_initial_states_p]] = torch.zeros(
                 (), dtype=ssm_states.dtype, device=ssm_states.device
+            )
+            conv_states[state_indices_p[~has_initial_states_p]] = torch.zeros(
+                (), dtype=conv_states.dtype, device=conv_states.device
             )
 
         is_target_verify = (

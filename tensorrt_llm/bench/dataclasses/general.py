@@ -15,6 +15,7 @@ class BenchmarkEnvironment(BaseModel):
     checkpoint_path: Optional[Path]
     workspace: Path
     revision: Optional[str] = None
+    telemetry_config: Optional[Any] = None
 
 
 class InferenceRequest(BaseModel):

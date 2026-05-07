@@ -9,16 +9,21 @@ from tensorrt_llm.serve.openai_protocol import (
     ImageGenerationRequest,
     VideoGenerationRequest,
 )
-from tensorrt_llm.visual_gen import VisualGenParams
+from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
 
 
 def parse_visual_gen_params(
     request: ImageGenerationRequest | VideoGenerationRequest | ImageEditRequest,
     id: str,
+    generator: VisualGen,
     media_storage_path: Optional[str] = None,
 ) -> VisualGenParams:
-    params = VisualGenParams()
-    params.prompt = request.prompt
+    # Start from the pipeline's resolved defaults so unspecified request
+    # fields keep the model's defaults instead of being overwritten with None.
+    params = generator.default_params
+    if params.extra_params is None:
+        params.extra_params = {}
+
     if request.negative_prompt is not None:
         params.negative_prompt = request.negative_prompt
     if request.size is not None and request.size != "auto":
@@ -26,9 +31,9 @@ def parse_visual_gen_params(
     if request.guidance_scale is not None:
         params.guidance_scale = request.guidance_scale
     if request.guidance_rescale is not None:
-        params.guidance_rescale = request.guidance_rescale
+        params.extra_params["guidance_rescale"] = request.guidance_rescale
 
-    if isinstance(request, ImageGenerationRequest) or isinstance(request, ImageEditRequest):
+    if isinstance(request, (ImageGenerationRequest, ImageEditRequest)):
         if request.num_inference_steps is not None:
             params.num_inference_steps = request.num_inference_steps
         elif isinstance(request, ImageGenerationRequest) and request.quality == "hd":
@@ -53,19 +58,25 @@ def parse_visual_gen_params(
         if request.input_reference is not None:
             if media_storage_path is None:
                 raise ValueError("media_storage_path is required when input_reference is provided")
-            params.input_reference = os.path.join(media_storage_path, f"{id}_reference.png")
+            ref_path = os.path.join(media_storage_path, f"{id}_reference.png")
             if isinstance(request.input_reference, str):
-                with open(params.input_reference, "wb") as f:
+                with open(ref_path, "wb") as f:
                     f.write(base64.b64decode(request.input_reference))
             else:
-                with open(params.input_reference, "wb") as f:
+                with open(ref_path, "wb") as f:
                     shutil.copyfileobj(request.input_reference.file, f)
+            params.image = ref_path
 
         params.frame_rate = request.fps
         params.num_frames = int(request.seconds * request.fps)
 
         if request.seed is not None:
             params.seed = int(request.seed)
+
+    # Drop extra_params if we didn't end up with any — matches VisualGenParams
+    # convention where None means "no extras" for pipelines that declare none.
+    if not params.extra_params:
+        params.extra_params = None
 
     return params
 

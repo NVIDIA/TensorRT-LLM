@@ -68,6 +68,7 @@ class TorchAttentionReference:
             k_cache,
             v_cache,
             scale,
+            None,
         )
 
         # Reshape back to original format [batch, seq, n_heads, head_dim]
@@ -109,6 +110,7 @@ class TorchAttentionReference:
             k_cache,
             v_cache,
             scale,
+            None,
         )
 
     @staticmethod
@@ -162,6 +164,7 @@ class TorchAttentionReference:
             k_cache,
             v_cache,
             None,
+            None,
         )
 
         # Return in flattened format to match flashinfer backend behavior [batch, seq=1, n_heads * head_dim]
@@ -202,6 +205,8 @@ class TorchAttentionReference:
             None,  # sinks
             sliding_window_size,
             logit_cap,
+            False,  # read_cache_only
+            None,  # custom_attn_mask
         )
 
     @staticmethod

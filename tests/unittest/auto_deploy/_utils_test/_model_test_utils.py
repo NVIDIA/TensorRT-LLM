@@ -8,6 +8,15 @@ from torch import nn
 from torch.export import Dim
 
 
+def default_max_num_tokens(max_seq_len: int, max_batch_size: int) -> int:
+    """Compute the default max_num_tokens for AutoDeploy tests.
+
+    The +1 is a WAR for a flashinfer attention issue with (max_batch_size, max_seq_len) input.
+    See https://github.com/NVIDIA/TensorRT-LLM/issues/4504
+    """
+    return (max_seq_len + 1) * max_batch_size
+
+
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     freqs_cis = freqs_cis[None, : x.shape[1], None]  #             --> [1, s,   1, h_d//2, 2]
     xshaped = x.float().unflatten(-1, (-1, 2))  # [b, s, n_h, h_d] --> [b, s, n_h, h_d//2, 2]
@@ -554,16 +563,16 @@ _SMALL_MODEL_CONFIGS = {
     },
     "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16": {
         "model_kwargs": {
-            "num_hidden_layers": 1,
-            "layers_block_type": ["mamba"],
+            "num_hidden_layers": 3,
+            "layers_block_type": ["mamba", "attention", "moe"],
             "hidden_size": 32,
             "intermediate_size": 64,
             "mamba_num_heads": 4,
-            "mamba_head_dim": 40,
+            "mamba_head_dim": 8,
             "n_groups": 2,
-            "ssm_state_size": 32,
+            "ssm_state_size": 8,
             "conv_kernel": 4,
-            # MoE dimensions (used by the MTP/Eagle drafter's "E" layer)
+            # Attention/MoE dimensions for the reduced target.
             "n_routed_experts": 4,
             "n_shared_experts": 1,
             "num_experts_per_tok": 2,

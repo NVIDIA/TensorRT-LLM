@@ -2268,11 +2268,14 @@ def pytest_collection_modifyitems(session, config, items):
 
 
 def pytest_configure(config):
+    os.environ.setdefault("TRTLLM_NO_USAGE_STATS", "1")
+
     # avoid thread leak of tqdm's TMonitor
     tqdm.tqdm.monitor_interval = 0
     if config.getoption("--run-ray"):
         os.environ["TLLM_DISABLE_MPI"] = "1"
         os.environ["TLLM_RAY_FORCE_LOCAL_CLUSTER"] = "1"
+        os.environ["RAY_raylet_start_wait_time_s"] = "120"
 
     # Initialize PeriodicJUnitXML reporter if enabled
     periodic = config.getoption("--periodic-junit", default=False)

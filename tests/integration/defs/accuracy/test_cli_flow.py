@@ -64,16 +64,6 @@ class TestGpt2Medium(CliFlowAccuracyTestHarness):
         self.run(quant_algo=QuantAlgo.FP8)
 
 
-class TestSantacoder(CliFlowAccuracyTestHarness):
-    MODEL_NAME = "bigcode/santacoder"
-    MODEL_PATH = f"{llm_models_root()}/santacoder"
-    EXAMPLE_FOLDER = "models/core/gpt"
-
-    def test_auto_dtype(self):
-        # float16
-        self.run(tasks=[Humaneval(self.MODEL_NAME)], dtype='auto')
-
-
 class TestStarcoder2_3B(CliFlowAccuracyTestHarness):
     MODEL_NAME = "bigcode/starcoder2-3b"
     MODEL_PATH = f"{llm_models_root()}/starcoder2-3b"

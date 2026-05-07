@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import pytest
 
 # Try to import the transfer agent binding module
@@ -61,12 +75,10 @@ except ImportError:
     HAS_TORCH = False
     HAS_CUDA = False
 
-
 pytestmark = pytest.mark.skipif(
     not HAS_TRANSFER_AGENT,
     reason="Transfer agent bindings not available (tensorrt_llm_transfer_agent_binding)",
 )
-
 
 # =============================================================================
 # Common Tests (independent of backend)
@@ -712,8 +724,8 @@ class TestMooncakeFunctionalTransfer:
         config_a = tab.BaseAgentConfig(name="mooncake_agent_a", use_prog_thread=True)
         config_b = tab.BaseAgentConfig(name="mooncake_agent_b", use_prog_thread=True)
 
-        agent_a = tab.MooncakeTransferAgent(config_a)
-        agent_b = tab.MooncakeTransferAgent(config_b)
+        agent_a = tab.make_transfer_agent("mooncake", config_a)
+        agent_b = tab.make_transfer_agent("mooncake", config_b)
 
         src_descs = _create_memory_descs_from_tensor(src_tensor, tab.MemoryType.VRAM)
         dst_descs = _create_memory_descs_from_tensor(dst_tensor, tab.MemoryType.VRAM)
@@ -752,8 +764,8 @@ class TestMooncakeFunctionalTransfer:
         config_a = tab.BaseAgentConfig(name="mooncake_agent_a", use_prog_thread=True)
         config_b = tab.BaseAgentConfig(name="mooncake_agent_b", use_prog_thread=True)
 
-        agent_a = tab.MooncakeTransferAgent(config_a)
-        agent_b = tab.MooncakeTransferAgent(config_b)
+        agent_a = tab.make_transfer_agent("mooncake", config_a)
+        agent_b = tab.make_transfer_agent("mooncake", config_b)
 
         src_descs = _create_memory_descs_from_tensor(src_tensor, tab.MemoryType.VRAM)
         dst_descs = _create_memory_descs_from_tensor(dst_tensor, tab.MemoryType.VRAM)

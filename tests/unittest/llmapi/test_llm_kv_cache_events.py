@@ -1,7 +1,9 @@
 import asyncio
 import time
 
+import numpy as np
 import pytest
+from PIL import Image
 from utils.util import skip_single_gpu
 
 import tensorrt_llm
@@ -11,6 +13,8 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import KVCacheEventSerializer
 from tensorrt_llm.bindings.internal.testing import \
     simulate_prefill_completion_only_use_for_testing
+from tensorrt_llm.inputs.multimodal import apply_mm_hashes
+from tensorrt_llm.inputs.utils import VideoData
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
@@ -23,7 +27,6 @@ llama_model_path = get_model_path(default_model_name)
 global_kvcache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                       event_buffer_max_size=1024,
                                       enable_block_reuse=True,
-                                      onboard_blocks=True,
                                       max_tokens=256)
 
 
@@ -83,8 +86,8 @@ def test_kv_cache_event_data_serialization():
     assert len(serialized_event[0]["data"]["num_blocks_per_cache_level"]) == 2
 
     req = create_llm_request(0, [1, 2, 3, 4, 5])
-    kv_cache_manager.impl.add_sequence(req.py_request_id, req.prompt_len, 1,
-                                       req)
+    kv_cache_manager.impl.add_sequence_batch(
+        [(req.py_request_id, req.prompt_len, 1)], [req])
     simulate_prefill_completion_only_use_for_testing(req)
     kv_cache_manager.free_resources(req)
 
@@ -101,8 +104,8 @@ def test_kv_cache_event_data_serialization():
     assert serialized_event[0]["data"]["blocks"][0]["mm_keys"] == []
 
     req2 = create_llm_request(1, [1, 2, 3, 4, 5])
-    kv_cache_manager.impl.add_sequence(req2.py_request_id, req2.prompt_len, 1,
-                                       req2)
+    kv_cache_manager.impl.add_sequence_batch(
+        [(req2.py_request_id, req2.prompt_len, 1)], [req2])
     simulate_prefill_completion_only_use_for_testing(req2)
     kv_cache_manager.free_resources(req2)
 
@@ -309,6 +312,46 @@ def test_apply_mm_hashes_uuid_content_combined():
     hashes_user2, _ = apply_mm_hashes(mm_data_a, mm_uuids_user2)
     assert hashes_a["image"][0] != hashes_user2["image"][0], \
         "Different UUID + same content should produce different hashes"
+
+
+def test_apply_mm_hashes_video_audio_metadata_affects_hash():
+    """VideoData hashes include extracted audio when it affects model inputs."""
+    frames = [
+        Image.new("RGB", (2, 2), (10, 20, 30)),
+        Image.new("RGB", (2, 2), (40, 50, 60)),
+    ]
+    audio_a = np.array([0.0, 0.25, -0.5, 1.0], dtype=np.float32)
+    audio_a_copy = audio_a.copy()
+    audio_b = np.array([0.0, 0.25, -0.5, -1.0], dtype=np.float32)
+
+    def make_video(audio_samples=None, sample_rate=16000):
+        metadata = {}
+        if audio_samples is not None:
+            metadata = {
+                "audio_samples": audio_samples,
+                "audio_sample_rate": sample_rate,
+            }
+        return VideoData(frames=frames, metadata=metadata)
+
+    hashes_a, _ = apply_mm_hashes({"video": [make_video(audio_a)]})
+    hashes_a_copy, _ = apply_mm_hashes({"video": [make_video(audio_a_copy)]})
+    hashes_b, _ = apply_mm_hashes({"video": [make_video(audio_b)]})
+    hashes_a_different_rate, _ = apply_mm_hashes(
+        {"video": [make_video(audio_a, sample_rate=8000)]})
+    hashes_no_audio, _ = apply_mm_hashes({"video": [make_video()]})
+    hashes_frame_list, _ = apply_mm_hashes({"video": [frames]})
+
+    assert hashes_a["video"][0] == hashes_a_copy["video"][0]
+    assert hashes_a["video"][0] != hashes_b["video"][0]
+    assert hashes_a["video"][0] != hashes_a_different_rate["video"][0]
+    assert hashes_no_audio["video"][0] == hashes_frame_list["video"][0]
+
+    mm_uuids = {"video": ["shared-video-id"]}
+    hashes_uuid_a, _ = apply_mm_hashes({"video": [make_video(audio_a)]},
+                                       mm_uuids)
+    hashes_uuid_b, _ = apply_mm_hashes({"video": [make_video(audio_b)]},
+                                       mm_uuids)
+    assert hashes_uuid_a["video"][0] != hashes_uuid_b["video"][0]
 
 
 def test_int32_hexdigest_roundtrip():

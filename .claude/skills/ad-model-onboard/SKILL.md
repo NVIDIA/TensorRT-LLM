@@ -1,6 +1,8 @@
 ---
 name: ad-model-onboard
-description: Translates a HuggingFace model into a prefill-only AutoDeploy custom model using reference custom ops, validates with hierarchical equivalence tests.
+description: >
+  Translates a HuggingFace model into a prefill-only AutoDeploy custom model
+  using reference custom ops, validates with hierarchical equivalence tests.
 license: Apache-2.0
 metadata:
   author: NVIDIA Corporation
@@ -170,20 +172,19 @@ See `examples/auto_deploy/model_registry/README.md` for full documentation on th
 
 ## Phase 9 — AutoDeploy End-to-End Run
 
-### ⚠️ MANDATORY: You MUST use `build_and_run_ad.py --use-registry` EXACTLY AS-IS ⚠️
+### ⚠️ MANDATORY: You MUST use the standalone config YAML with `--args.yaml-extra` ⚠️
 
-**You MUST run the model using the model registry YAML configs. No exceptions. No workarounds. No manual `--args.yaml-extra` overrides. The command is:**
+**You MUST run the model using the standalone config YAML created in Phase 8. The same YAML will be referenced by the cookbook's `trtllm-serve` command in Phase 11. The command is:**
 
 ```bash
-CUDA_VISIBLE_DEVICES=<SELECTED_GPUS> python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry
+CUDA_VISIBLE_DEVICES=<SELECTED_GPUS> python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --args.yaml-extra examples/auto_deploy/model_registry/configs/<model>.yaml
 ```
 
-**The `--use-registry` flag resolves ALL configuration from the model's entry in `examples/auto_deploy/model_registry/models.yaml` and its referenced YAML files under `examples/auto_deploy/model_registry/configs/`. This is the production path. You MUST validate the model works through it.**
+**The standalone config YAML under `examples/auto_deploy/model_registry/configs/` is self-contained — it includes all settings needed for running the model (compile backend, batch size, seq len, transforms, world_size, etc.). This is the same YAML that `trtllm-serve --extra_llm_api_options` will use in the cookbook, so validating it here ensures the cookbook works out of the box.**
 
-**If the run FAILS with `--use-registry`:**
-1. **DO NOT bypass the registry.** DO NOT fall back to manual `--args.yaml-extra` flags.
-2. Instead, **fix the registry configs** — update the model's entry in `models.yaml`, modify or create config YAMLs under `configs/`, and re-run with `--use-registry` again.
-3. The registry configs are the source of truth. If they are wrong, fix them. If they are missing, add them. The model MUST work via `--use-registry` before you are done.
+**If the run FAILS:**
+1. **Fix the standalone config YAML** — update settings in `examples/auto_deploy/model_registry/configs/<model>.yaml` and re-run.
+2. The standalone config YAML is the source of truth. If it is wrong, fix it. If it is missing settings, add them. The model MUST work via this YAML before you are done.
 
 Invoke the `ad-run-agent` subagent to run the model through AutoDeploy on GPU. Pass it:
 
@@ -195,6 +196,7 @@ Step 2: Full layers
 Run with full num layers. The generation should be coherent in step 2.
 
 - **Model HF ID:** the HuggingFace model-id (or local checkpoint path) used throughout onboarding
+- **Standalone config YAML path:** the path to the config YAML under `examples/auto_deploy/model_registry/configs/`
 - **Description:** a short description of the current state, e.g.:
   - "first try after onboarding"
   - "updated yaml with reduced layers"
@@ -203,24 +205,57 @@ Run with full num layers. The generation should be coherent in step 2.
 
 The model is run via:
 ```bash
-CUDA_VISIBLE_DEVICES=<SELECTED_GPUS> python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry
+CUDA_VISIBLE_DEVICES=<SELECTED_GPUS> python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --args.yaml-extra examples/auto_deploy/model_registry/configs/<model>.yaml
 ```
-The `ad-run-agent` will determine the required `world_size` from the registry, check GPU availability via `nvidia-smi`, select free GPUs, and wait if not enough are available.
+The `ad-run-agent` will determine the required `world_size` from the config YAML, check GPU availability via `nvidia-smi`, select free GPUs, and wait if not enough are available.
 
 The ad-run-agent will build+run the model, check generation quality, archive logs, and update its worklog.
 
 If the run **fails** or produces **bad generation**:
 1. Read the ad-run-agent's worklog and log file to understand the error
-2. Fix the issue (model code, **registry config yaml**, weight hooks, etc.)
+2. Fix the issue (model code, **standalone config YAML**, weight hooks, etc.)
 3. Re-invoke the ad-run-agent with an updated description reflecting the change (e.g., "retry after fixing RoPE scaling in config")
-4. **Always re-run with `--use-registry`.** Never bypass the registry.
+4. **Always re-run with `--args.yaml-extra`.** Fix the standalone config YAML, don't work around it.
 5. Repeat until the run succeeds with meaningful generation
 
 Do NOT proceed to Phase 10 until the step 2 with full layers reports a successful run with coherent generation.
 
-## Phase 10 — Summary Report
+**Important:** The successful E2E run outputs (prompts and generated text) will be needed for the cookbook notebook in Phase 11 and the summary report in Phase 12. Save them.
 
-### ⚠️ MANDATORY: You MUST include ALL raw prompts and generated outputs from the final `build_and_run_ad.py` run ⚠️
+## Phase 10 — Update Model Support Matrix
+
+After a successful E2E run, update the TensorRT-LLM model support matrix at `docs/source/models/supported-models.md` to include the newly onboarded model.
+
+1. **Read the current support matrix** to understand the format and existing entries.
+2. **Add a row to the "Supported Models" table** (the first table in the file) with:
+   - `Architecture`: The model's architecture class name (e.g., `MiniMaxM2ForCausalLM`) — use the class name registered in Phase 4.
+   - `Model`: The model family/display name (e.g., `MiniMax M2/M2.1/M2.7`).
+   - `HuggingFace Example`: A representative HF model ID (e.g., `MiniMaxAI/MiniMax-M2.7`).
+   - Place the new row **alphabetically** by architecture class name to keep the table sorted.
+3. **If the model is AutoDeploy-only** (i.e., it does NOT have native PyTorch backend support in `tensorrt_llm/_torch/models/`), add a footnote indicating AutoDeploy support with a link to the AD config YAML, following the pattern of existing AD-only models (e.g., `[^N]: Supported via the [AutoDeploy](../features/auto_deploy/auto-deploy.md) backend. See [AD config](../../../examples/auto_deploy/model_registry/configs/<model>.yaml).`).
+4. **If the model warrants an entry in the Model-Feature Support Matrix** (second table — typically for key/flagship models), add a row there too. For newly onboarded AD models, most advanced features should be marked `Untested` unless you have verified them. Use existing AD model entries (e.g., `Glm4MoeLiteForCausalLM`) as a reference for which features to mark as supported vs untested.
+
+## Phase 11 — Create AutoDeploy Cookbook
+
+Create an AutoDeploy cookbook notebook for the model, following the pattern of existing cookbooks.
+
+1. **Use `examples/auto_deploy/cookbooks/glm_4.7_flash_trtllm_cookbook.ipynb` as the template.** Copy its structure exactly.
+2. **Create the new notebook** at `examples/auto_deploy/cookbooks/{model_name}_trtllm_cookbook.ipynb`, using a snake_case version of the model name (e.g., `minimax_m2.7_trtllm_cookbook.ipynb`).
+3. **Adapt all model-specific content:**
+   - Title and description: update the model name, HF model ID, and description.
+   - Model Resources: update links to the model's HuggingFace card, blog posts, technical reports, API platform, and community links. Search the web or the model's HF card for relevant URLs.
+   - Model Highlights: update architecture details (e.g., MoE params, context length, special features like tool calling, interleaved thinking, etc.) from the model card.
+   - Prerequisites: update VRAM requirements based on model size and precision.
+   - `trtllm-serve` command: update the model ID and use `--extra_llm_api_options` pointing to the **standalone** AD config YAML under `examples/auto_deploy/model_registry/configs/` (e.g., `examples/auto_deploy/model_registry/configs/glm-4.7-flash.yaml`). This is the same standalone config YAML validated in Phase 9 via `build_and_run_ad.py --args.yaml-extra`. It is self-contained — it includes all the settings `trtllm-serve` needs (compile backend, batch size, seq len, transforms, etc.).
+   - OpenAI client `MODEL_ID`: update to the correct HF model ID.
+   - Evaluation Parameters: update recommended inference parameters from the model's documentation/model card.
+   - Additional Resources: update all links to be model-specific.
+4. **Do NOT include cell outputs** in the committed notebook — the notebook should be clean with no pre-run outputs, so users run it themselves. (Exception: if the model was already run and outputs were captured during Phase 9, you may include them for reference, but this is optional.)
+5. **Verify the notebook is valid JSON** — malformed `.ipynb` files will not render on GitHub or in Jupyter.
+
+## Phase 12 — Summary Report
+
+### ⚠️ MANDATORY: You MUST include ALL raw prompts and generated outputs from the final `build_and_run_ad.py --args.yaml-extra` run ⚠️
 
 Print (not file) after completion:
 
@@ -232,9 +267,11 @@ Print (not file) after completion:
 6. Reviewer result (PASS + how many review iterations it took)
 7. AD end-to-end run result (success/fail, number of iterations, final generation quality)
 8. Registry entry added/updated in `models.yaml` and any new config YAMLs created
-9. **ALL raw prompts and their corresponding generated outputs from the final successful `build_and_run_ad.py --use-registry` run.** Copy-paste the COMPLETE prompt→output pairs verbatim from the run log. Do NOT summarize, truncate, or paraphrase them. The user needs to see exactly what the model generated to judge quality.
+9. **ALL raw prompts and their corresponding generated outputs from the final successful `build_and_run_ad.py --args.yaml-extra` run.** Copy-paste the COMPLETE prompt→output pairs verbatim from the run log. Do NOT summarize, truncate, or paraphrase them. The user needs to see exactly what the model generated to judge quality.
+10. Model support matrix update — confirm the row was added to `docs/source/models/supported-models.md` and which footnote (if any) was used.
+11. AutoDeploy cookbook created — path to the new notebook file (`examples/auto_deploy/cookbooks/<model>_trtllm_cookbook.ipynb`).
 
-## Phase 11 — Prepare a Pull Request
+## Phase 13 — Prepare a Pull Request
 
 **GitHub CLI config:** Before running any `gh` command, confirm which `GH_CONFIG_DIR` to use. The default is `~/.config/gh`, but a different directory may be needed when targeting a fork (e.g., `nv-auto-deploy/TensorRT-LLM` vs `NVIDIA/TensorRT-LLM`). Check if the user has specified a custom `GH_CONFIG_DIR` (e.g., in `CLAUDE.local.md` or environment). If not, **ask the user** before proceeding. Prefix all `gh` commands with: `GH_CONFIG_DIR=<path> gh ...`
 
@@ -243,10 +280,10 @@ branch `main`. Then, ask the user to provide feedback on the PR and wait for the
 user to get back to you when the feedback has been posted. Then continue iterating according to the
 user's feedback. For any comment or other post, please prepend your message with "[AGENT]" so that it is clear that this was a coding agent posting the comment.
 When you post a PR, you **MUST** include:
-1. **ALL raw prompts and their complete generated outputs** from the final successful `build_and_run_ad.py --use-registry` run. Copy-paste the COMPLETE prompt→output pairs verbatim — do NOT summarize, truncate, or paraphrase. The reviewer needs to see exactly what the model generated.
+1. **ALL raw prompts and their complete generated outputs** from the final successful `build_and_run_ad.py --args.yaml-extra` run. Copy-paste the COMPLETE prompt→output pairs verbatim — do NOT summarize, truncate, or paraphrase. The reviewer needs to see exactly what the model generated.
 2. A reproducible command:
 ```bash
-python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry
+python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --args.yaml-extra examples/auto_deploy/model_registry/configs/<model>.yaml
 ```
 3. A detailed pytest command for the unit tests you added so they can be run by the reviewer as well. Make sure you have run this pytest command on the latest commit that you are pushing, and include these results in the PR.
 
@@ -254,7 +291,7 @@ python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registr
 
 **Every single time you push changes to the PR — whether it is a new commit, a rebase, an amendment, a fixup, or any other update — you MUST:**
 
-1. **Re-run `build_and_run_ad.py --use-registry`** using the `ad-run-agent` subagent, exactly as in Phase 9. The code has changed, so previous run results are stale and invalid.
+1. **Re-run `build_and_run_ad.py --args.yaml-extra`** using the `ad-run-agent` subagent, exactly as in Phase 9. The code has changed, so previous run results are stale and invalid.
 2. **Re-run the full unit test suite** (`pytest <test_file> -v`) for the model's test file created in Phase 6. Previous test results are stale and invalid after any code change.
 3. **Post ALL raw output from both runs** as a PR comment:
    - The COMPLETE prompt→output pairs from `build_and_run_ad.py` verbatim — do NOT summarize, truncate, or paraphrase.
@@ -267,7 +304,7 @@ python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registr
 2. Commit the changes
 3. Before pushing, always rebase onto the target branch to check for conflicts: `git fetch upstream && git rebase upstream/main`. If there are conflicts, resolve them before proceeding. Do NOT push without rebasing first — the branch must be up-to-date with the target branch.
 4. Push (or force-push if rebase rewrote history)
-5. Re-invoke the `ad-run-agent` to run `build_and_run_ad.py --model <MODEL-ID> --use-registry` on the updated code
+5. Re-invoke the `ad-run-agent` to run `build_and_run_ad.py --model <MODEL-ID> --args.yaml-extra examples/auto_deploy/model_registry/configs/<model>.yaml` on the updated code
 6. Re-run the unit tests: `pytest <test_file> -v`
 7. Wait for both runs to complete
 8. Post a reply to every PR comment containing:
@@ -302,6 +339,143 @@ GH_CONFIG_DIR=<path> gh pr view <PR_NUMBER> --json reviews,state
 5. If **no new comments** are found: sleep 5 minutes and poll again.
 
 **Do NOT stop polling prematurely.** The loop must continue until the PR is approved or a clear termination signal is received. If polling has been running for an extended period (e.g., >2 hours) with no new activity, inform the user that you are still monitoring and ask if they want you to continue or stop.
+
+## Sharding-aware IR model porting (`modeling_*_ir.py`)
+
+Use this when porting an existing AutoDeploy custom model (`tensorrt_llm/_torch/auto_deploy/models/custom/modeling_*.py`) to explicit sharding hint ops in `modeling_*_ir.py` **in the same directory** (no separate `new_sharding/` tree). The exported FX graph must fully specify how the model should be sharded: the `apply_sharding_hints` transform combines hints with a runtime `DistConfig` for deterministic, node-local sharding.
+
+**Argument reference:** Do not duplicate operator tables here. Refer to the custom op docstrings in `tensorrt_llm/_torch/auto_deploy/custom_ops/` for the complete argument reference (including sharding hints, `tp_mode`, `layer_type`, and which ops accept hints).
+
+### Reference examples (study before porting)
+
+| Original | IR / sharding-aware | Layer types |
+|----------|---------------------|-------------|
+| `modeling_nemotron_h.py` | `modeling_nemotron_h_ir.py` | Mamba SSM, MHA, SwiGLU MLP, MoE |
+| `modeling_qwen3_5_moe.py` | `modeling_qwen3_5_moe_ir.py` | GatedDeltaNet, Gated MHA, SwiGLU MLP, MoE |
+| `modeling_mistral.py` | `modeling_mistral_ir.py` | MHA, SwiGLU MLP (simplest) |
+| `modeling_deepseek_v2.py` | `modeling_deepseek_v2_ir.py` | MLA, SwiGLU MLP, MoE |
+
+### Step-by-step porting procedure
+
+#### Step 1: Copy the source file
+
+```bash
+cp tensorrt_llm/_torch/auto_deploy/models/custom/modeling_foo.py \
+   tensorrt_llm/_torch/auto_deploy/models/custom/modeling_foo_ir.py
+```
+
+#### Step 2: Update the module docstring and add imports
+
+At the top of the IR file:
+
+```python
+import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401 -- register all ops
+```
+
+Do **not** add global `SHARD_*` flags. Layer-level control uses the `layer_type` hint on each op and `shard_layers` in YAML.
+
+#### Step 3: Replace linear projections
+
+For every `self.proj(x)` or `nn.Linear` call, use `torch.ops.auto_deploy.torch_linear_simple` with explicit `tp_mode` and `layer_type`. Always set `tp_mode` unconditionally (no `if _s else "none"`). **Rules:** opening projections (Q/K/V/gate/up/in_proj) → `"colwise"`; closing (O/down/out_proj) → `"rowwise"`; tiny outputs (e.g. `shared_expert_gate` dim 1) → `"none"`; MLA latent projections (q_a, kv_a) → `"none"`. For fused weights split later, pass `output_sizes=[...]`. For GQA, use `tp_min_local_shape=self.head_dim` on K/V colwise lines.
+
+#### Step 4: Replace split / chunk after fused colwise projections
+
+Use `torch.ops.auto_deploy.split_with_sizes` with `shardable` / `layer_type` where sizes scale with TP.
+
+#### Step 5: Replace view / reshape with concrete head counts
+
+During `torch.export`, `-1` becomes concrete; after TP, wrong values break. Any reshape whose dimension is a head count that scales with TP must use `torch.ops.auto_deploy.view` with `tp_scaled_dim` set appropriately. Safe cases: flat-to-2D, or `[B,S,-1]` when the input is already correctly sharded.
+
+#### Step 6: Insert `all_reduce`
+
+After every rowwise projection, add `torch.ops.auto_deploy.all_reduce(..., layer_type=...)`. **Parallel branch rule:** when branches merge by addition, use a **single** `all_reduce` after the sum (e.g. MoE routed + shared expert; parallel attention + MLP residual branches).
+
+#### Step 7: Special ops (Conv1d, SSM, GatedDeltaNet, gated RMSNorm)
+
+Add sharding hints on `torch_causal_conv1d`, `torch_ssm`, `torch_gated_delta_rule`, `torch_rmsnorm_gated` per docstrings—typically `shardable` / `output_sizes` / `tp_mode` as required.
+
+#### Step 8: MoE
+
+Pass `layer_type="moe"` into `torch_moe`; `apply_sharding_hints` handles EP/TP.
+
+#### Step 9: Register the IR model
+
+1. Bottom of the IR file: `AutoModelForCausalLMFactory.register_custom_model_cls("ConfigClassName", ForCausalLM)` (same pattern as Phase 4).
+2. Add a **side-effect import** in `tensorrt_llm/_torch/auto_deploy/models/custom/__init__.py` (e.g. `from . import modeling_foo_ir  # noqa: F401`) and extend `__all__` if you export symbols. Without this import, worker processes may not load your class and `apply_sharding_hints` can report **0 nodes processed**. Do **not** use a separate `register_sharded_models.py` indirection.
+
+#### Step 10: YAML — composable registry pattern
+
+Prefer the model registry (`examples/auto_deploy/model_registry/models.yaml`) and **compose** shared fragments under `examples/auto_deploy/model_registry/configs/`, same as other models: list `dashboard_default.yaml`, the right `world_size_N.yaml`, then a dedicated fragment (e.g. `enable_sharder_ir.yaml`) that holds IR sharding transforms. That fragment should disable legacy sharding passes and enable hint-driven sharding. Registry fragments are deep-merged in `yaml_extra` order (see `DynamicYamlMixInForSettings` in `tensorrt_llm/_torch/auto_deploy/utils/_config.py`); place transform keys under `transforms:` so they merge with `dashboard_default.yaml`. Standalone experiment YAMLs for `build_and_run_ad` may wrap the same fields under a top-level `args:` block matching `LlmArgs`.
+
+Example transform block:
+
+```yaml
+# Typical contents for enable_sharder_ir.yaml (registry composable fragment)
+transforms:
+  export_to_gm:
+    num_moe_experts_for_export: 2   # often required when expert count is large (>64)
+  detect_sharding:
+    stage: sharding
+    enabled: false
+  sharding_transform_executor:
+    stage: sharding
+    enabled: false
+  apply_sharding_hints:
+    stage: sharding
+    enabled: true
+    run_shape_prop: true
+    allreduce_strategy: NCCL
+    # shard_layers: ['mha', 'mlp']   # optional selective sharding
+  gather_logits_before_lm_head:
+    enabled: true
+```
+
+Use `world_size: 8` when validating TP head-divisibility. Optional `shard_layers` limits which `layer_type` hints are processed; unset means shard all shardable nodes.
+
+#### Step 11: Validate
+
+Do not report success until a run completes successfully.
+
+1. Prefer `python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry` after adding/updating the registry entry and composable YAMLs (Phase 8–9 style).
+2. `apply_sharding_hints` logs should show **`N nodes processed` with N > 0**.
+3. If validation fails with infrastructure limits (e.g. head count not divisible by `world_size`), document the assert and compatible sizes; do not "fix" core `sharding.py` / custom op schemas without owner review.
+4. If blocked by missing infrastructure support, rename artifacts to `broken_modeling_*_ir.py` / broken YAML and file a short error report for humans (do not silently patch core transforms).
+
+**Layer type strings** (for `layer_type` / `shard_layers`): use `"mha"`, `"mla"`, `"mlp"`, `"moe"`, `"ssm"`, `"delta"`, or `"unknown"` (default; skipped when `shard_layers` is set). Match the conventions used in `apply_sharding_hints` and project enums.
+
+### Layer-specific sharding patterns
+
+**MHA (standard or gated):** `layer_type="mha"`: q/k/v colwise (GQA: `tp_min_local_shape`), `view` with `tp_scaled_dim` for head dim, o rowwise + `all_reduce`. Fused Q+gate interleaved per head: colwise without `output_sizes`; contiguous Q|K|V fused blocks need `output_sizes`.
+
+**SwiGLU MLP:** `layer_type="mlp"`: gate/up colwise, down rowwise + `all_reduce`.
+
+**Mamba / SSM:** `layer_type="ssm"`: in_proj colwise + `output_sizes`, splits shardable, conv1d shardable + `output_sizes`, views, `torch_ssm` shardable, norm gated colwise if weight scales, out rowwise + `all_reduce`.
+
+**GatedDeltaNet:** `layer_type="delta"`: in_proj_qkv with `output_sizes`, other in_projs colwise, conv1d/splits/views as above, `torch_gated_delta_rule` shardable, out rowwise + `all_reduce`.
+
+**MoE + shared expert:** `layer_type="moe"`: router replicated; one `all_reduce` after `routed + shared`, not two.
+
+**MLA (DeepSeek):** `layer_type="mla"`: keep `torch_mla` intact with `shardable=True`—do **not** decompose into separate linears + `torch_attention` (introduces bad `expand`/`view` with concrete head counts). q_a/kv_a latent: `tp_mode="none"`; q_b colwise; `o_proj` rowwise + `all_reduce`.
+
+### Common pitfalls (sharding IR)
+
+1. **Missing `auto_deploy::view` for head reshapes** — concrete shapes from export break after sharding.
+2. **Sharding tiny projections** — dim-1 gates: `tp_mode="none"`.
+3. **Double `all_reduce` in MoE** — one merge-point reduction for routed + shared.
+4. **Cross-layer parameter contamination** — in `_apply_hint_*` handlers using `get_source_nodes()`, restrict with `allowed_ops` so residual links do not pull weights from other layers.
+5. **Missing `num_moe_experts_for_export`** for very large expert counts — export can hang.
+6. **Decomposing ops that absorb weights** (e.g. `torch_mla`) — use `shardable` + handler instead of splitting into plain linears.
+7. **Interleaved vs contiguous fused weights** — interleaved per-head groups: colwise only; contiguous Q|K|V blocks: require `output_sizes`.
+8. **Omitting `layer_type` when using `shard_layers`** — `"unknown"` nodes are skipped; set hints explicitly on sharding-aware ops.
+9. **`layer_type` on non-hint ops** — do **not** pass `layer_type` to ops that are not designed for sharding hints (e.g. `torch_attention`, `torch_l2norm`, `torch_rope_*`); extra positional args break calls. Confirm in `custom_ops/` docstrings which ops accept hints.
+10. **Conditional hint values** — no `if _s else "none"`; use unconditional hints and rely on `shard_layers` / transform config.
+
+### Sharding IR validation checklist (human review)
+
+- `world_size=1`: unsharded path; hints should not break correctness.
+- `world_size=2` and `8`: shape checks and coherent output.
+- `apply_sharding_hints` node count vs expectation.
+- Optional: `shard_layers: ['moe']` to verify selective sharding.
 
 ## Key Gotchas
 - **Canonical ops first:** Always use `torch.ops.auto_deploy.torch_*` canonical ops whenever one exists for the operation. This is how AD knows what to optimize. Writing manual attention, MoE, RoPE, or normalization in plain PyTorch instead of using the canonical op will prevent AD transforms from working.

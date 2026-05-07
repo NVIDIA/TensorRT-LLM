@@ -20,7 +20,7 @@ from __future__ import annotations
 import fnmatch
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.distributed as dist
@@ -32,7 +32,6 @@ from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
-from tensorrt_llm._torch.visual_gen.parallelism import setup_sequence_parallelism
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -49,6 +48,7 @@ from .ltx2_core.transformer_args import (
     TransformerArgsPreprocessor,
 )
 from .ltx2_core.utils_ltx2 import rms_norm
+from .text_cache import TextCache
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
@@ -91,6 +91,7 @@ class LTX2Attention(Attention):
         from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 
         config = config or DiffusionModelConfig()
+        vgm = config.visual_gen_mapping
 
         # Store before super().__init__() — _init_qkv_proj needs _context_dim
         self._context_dim = context_dim if context_dim is not None else query_dim
@@ -120,7 +121,7 @@ class LTX2Attention(Attention):
         # plain backend as fallback.  The base class already set self.attn
         # to UlyssesAttention(inner_backend=sharded_backend).
         self._has_dual_attn = False
-        ulysses_size = config.parallel.dit_ulysses_size
+        ulysses_size = vgm.ulysses_size if vgm is not None else 1
         if use_ulysses and not self._is_cross_attn and ulysses_size > 1:
             self._ulysses_attn = self.attn
             self._plain_attn = create_attention(
@@ -131,6 +132,8 @@ class LTX2Attention(Attention):
                 num_kv_heads=self.num_key_value_heads,
                 quant_config=self.quant_config,
                 dtype=self.dtype,
+                attention_config=config.attention,
+                attention_metadata_state=config.attention_metadata_state,
             )
             self._has_dual_attn = True
 
@@ -292,12 +295,19 @@ class BasicAVTransformerBlock(nn.Module):
         self.idx = idx
         self.norm_eps = norm_eps
 
-        self._use_ulysses = False
+        self._use_seq_parallel = False
+        self._seq_parallel_size = 1
+        self._seq_parallel_pg = None
         self._audio_is_sharded = False
-        if config is not None and config.parallel.dit_ulysses_size > 1:
-            self._use_ulysses = True
-            self._ulysses_size = config.parallel.dit_ulysses_size
-            self._ulysses_pg = getattr(config, "ulysses_process_group", None)
+        vgm = config.visual_gen_mapping if config is not None else None
+        if vgm is not None and vgm.ulysses_size > 1:
+            self._use_seq_parallel = True
+            self._seq_parallel_size = vgm.ulysses_size
+            self._seq_parallel_pg = vgm.ulysses_group
+        elif vgm is not None and vgm.attn2d_row_size * vgm.attn2d_col_size > 1:
+            self._use_seq_parallel = True
+            self._seq_parallel_size = vgm.attn2d_row_size * vgm.attn2d_col_size
+            self._seq_parallel_pg = vgm.attn2d_mesh_group
 
         if video is not None:
             self._init_video_modules(video, rope_type, norm_eps, config, idx)
@@ -459,8 +469,8 @@ class BasicAVTransformerBlock(nn.Module):
     def _sp_all_gather(self, x: torch.Tensor, dim: int = 1) -> torch.Tensor:
         """All-gather *x* along *dim* across sequence-parallel ranks."""
         x = x.contiguous()
-        gathered = [torch.empty_like(x) for _ in range(self._ulysses_size)]
-        dist.all_gather(gathered, x, group=self._ulysses_pg)
+        gathered = [torch.empty_like(x) for _ in range(self._seq_parallel_size)]
+        dist.all_gather(gathered, x, group=self._seq_parallel_pg)
         return torch.cat(gathered, dim=dim)
 
     def _sp_gather_pe(self, pe):
@@ -480,12 +490,17 @@ class BasicAVTransformerBlock(nn.Module):
         video: TransformerArgs | None,
         audio: TransformerArgs | None,
         perturbations=None,
+        text_kv_video: tuple[torch.Tensor, torch.Tensor] | None = None,
+        text_kv_audio: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         """Forward with optional perturbation masking for STG.
 
         Args:
             perturbations: Optional ``BatchedPerturbationConfig`` that masks
                 attention outputs for selected blocks/modalities.
+            text_kv_video: Pre-projected (K, V) for video text cross-attention.
+                Falls back to inline computation if ``None``.
+            text_kv_audio: Pre-projected (K, V) for audio text cross-attention.
         """
         if video is None and audio is None:
             raise ValueError("At least one of video or audio must be provided")
@@ -524,6 +539,7 @@ class BasicAVTransformerBlock(nn.Module):
             vx = vx + self.attn2(
                 rms_norm(vx, eps=self.norm_eps),
                 context=video.context,
+                pre_projected_kv=text_kv_video,
             )
             del vshift_msa, vscale_msa, vgate_msa
 
@@ -548,6 +564,7 @@ class BasicAVTransformerBlock(nn.Module):
             ax = ax + self.audio_attn2(
                 rms_norm(ax, eps=self.norm_eps),
                 context=audio.context,
+                pre_projected_kv=text_kv_audio,
             )
             del ashift_msa, ascale_msa, agate_msa
 
@@ -627,7 +644,7 @@ class BasicAVTransformerBlock(nn.Module):
 
                 # Project-before-gather (video → audio direction).
                 k_v2a, v_v2a = self.video_to_audio_attn.project_kv(vx_scaled)
-                if self._use_ulysses:
+                if self._use_seq_parallel:
                     k_v2a = self._sp_all_gather(k_v2a)
                     v_v2a = self._sp_all_gather(v_v2a)
                     k_pe_v2a = self._sp_gather_pe(video.cross_positional_embeddings)
@@ -671,6 +688,57 @@ class BasicAVTransformerBlock(nn.Module):
             replace(video, x=vx) if video is not None else None,
             replace(audio, x=ax) if audio is not None else None,
         )
+
+
+class LTX2CacheDiTPattern0BlockWrapper(nn.Module):
+    """Pattern_0: (video x, audio x) in/out; the 2nd slot is cache-dit's encoder_hidden_states name only.
+
+    Caption/RoPE/masks live on the parent's _cache_dit_*_args; Pattern_0 only threads the two latent streams.
+    """
+
+    def __init__(self, inner: BasicAVTransformerBlock, parent: "LTXModel"):
+        super().__init__()
+        self.inner = inner
+        # Same module as inner; use a direct ref so torch.compile/CachedBlocks cannot break delegation.
+        object.__setattr__(self, "_inner_module", inner)
+        # Must not register parent as a submodule (would cycle the module graph).
+        object.__setattr__(self, "_ltx_parent", parent)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        perturbations=None,
+        **kwargs: Any,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        p = object.__getattribute__(self, "_ltx_parent")
+        inner_mod = object.__getattribute__(self, "_inner_module")
+        va_src = p._cache_dit_video_args
+        aa_src = p._cache_dit_audio_args
+        va = replace(va_src, x=hidden_states) if va_src is not None else None
+        if aa_src is not None and encoder_hidden_states is not None:
+            aa: Optional[TransformerArgs] = replace(aa_src, x=encoder_hidden_states)
+        else:
+            aa = aa_src
+        # Cache-DiT's CachedBlocks iterates all inner blocks with the same kwargs,
+        # so looking up per-block text_kv via inner.idx is required — passing
+        # text_kv via the outer loop would feed every block block-0's KV.
+        idx = inner_mod.idx
+        v_kv_list = getattr(p, "_cache_dit_v_kv", None)
+        a_kv_list = getattr(p, "_cache_dit_a_kv", None)
+        kwargs.setdefault("text_kv_video", v_kv_list[idx] if v_kv_list else None)
+        kwargs.setdefault("text_kv_audio", a_kv_list[idx] if a_kv_list else None)
+        out_v, out_a = inner_mod(video=va, audio=aa, perturbations=perturbations, **kwargs)
+        return (
+            out_v.x if out_v is not None else None,
+            out_a.x if out_a is not None else None,
+        )
+
+    def __getattr__(self, name: str):
+        if name in ("_inner_module", "_ltx_parent"):
+            return object.__getattribute__(self, name)
+        inner_mod = object.__getattribute__(self, "_inner_module")
+        return getattr(inner_mod, name)
 
 
 # ---------------------------------------------------------------------------
@@ -766,29 +834,47 @@ class LTXModel(nn.Module):
 
         self._init_preprocessors(cross_pe_max_pos)
 
-        # Ulysses sequence parallelism — must run before block/attention init
-        # so that model_config.ulysses_process_group is available.
-        primary_heads = (
-            num_attention_heads if model_type.is_video_enabled() else audio_num_attention_heads
-        )
-        (self.use_ulysses, self.ulysses_size, self.ulysses_pg, self.ulysses_rank) = (
-            setup_sequence_parallelism(
-                model_config=model_config,
-                num_attention_heads=primary_heads,
-            )
-        )
-        # Audio is sharded by Ulysses only when its sequence length is
-        # divisible by ulysses_size (checked at runtime in forward).
-        # Head divisibility is validated here since the attention backend
-        # is created at init with sharded head counts.
-        if self.use_ulysses and model_type.is_audio_enabled():
-            if audio_num_attention_heads % self.ulysses_size != 0:
+        vgm = model_config.visual_gen_mapping
+        attn2d_row_size = vgm.attn2d_row_size if vgm else 1
+        attn2d_col_size = vgm.attn2d_col_size if vgm else 1
+        attn2d_size = attn2d_row_size * attn2d_col_size
+        ulysses_size = vgm.ulysses_size if vgm else 1
+
+        use_attn2d = attn2d_size > 1
+        use_ulysses = ulysses_size > 1
+        self.use_seq_parallel = use_attn2d or use_ulysses
+        self.seq_parallel_size = attn2d_size if use_attn2d else ulysses_size
+        if use_attn2d:
+            self.seq_parallel_pg = vgm.attn2d_mesh_group
+            self.seq_parallel_rank = vgm.attn2d_mesh_rank
+        elif use_ulysses:
+            self.seq_parallel_pg = vgm.ulysses_group if vgm else None
+            self.seq_parallel_rank = vgm.ulysses_rank if vgm else 0
+        else:
+            self.seq_parallel_pg = None
+            self.seq_parallel_rank = 0
+
+        # Ulysses shards heads; Attention2D shards sequence — no head-count constraint for the latter.
+        if use_ulysses and model_type.is_video_enabled():
+            if num_attention_heads % ulysses_size != 0:
+                raise ValueError(
+                    f"num_attention_heads ({num_attention_heads}) "
+                    f"must be divisible by dit_ulysses_size ({ulysses_size})"
+                )
+        if use_ulysses and model_type.is_audio_enabled():
+            if audio_num_attention_heads % ulysses_size != 0:
                 raise ValueError(
                     f"audio_num_attention_heads ({audio_num_attention_heads}) "
-                    f"must be divisible by ulysses_size ({self.ulysses_size})"
+                    f"must be divisible by dit_ulysses_size ({ulysses_size})"
                 )
 
         self._audio_is_sharded = False
+        self._cache_dit_video_args: Optional[TransformerArgs] = None
+        self._cache_dit_audio_args: Optional[TransformerArgs] = None
+        # Per-block text cross-attn KV lists, looked up by inner.idx in the
+        # Pattern_0 wrapper. Set once per forward in the Cache-DiT path.
+        self._cache_dit_v_kv: Optional[list] = None
+        self._cache_dit_a_kv: Optional[list] = None
 
         self._init_transformer_blocks(
             num_layers=num_layers,
@@ -1020,6 +1106,10 @@ class LTXModel(nn.Module):
                 rope_type=self.rope_type,
             )
 
+    def _uses_cache_dit(self) -> bool:
+        mc = getattr(self, "model_config", None)
+        return mc is not None and getattr(mc, "cache_backend", None) == "cache_dit"
+
     def _init_transformer_blocks(
         self,
         num_layers,
@@ -1052,27 +1142,31 @@ class LTXModel(nn.Module):
             if self.model_type.is_audio_enabled()
             else None
         )
-        self.transformer_blocks = nn.ModuleList(
-            [
-                BasicAVTransformerBlock(
-                    idx=idx,
-                    video=video_config,
-                    audio=audio_config,
-                    rope_type=self.rope_type,
-                    norm_eps=norm_eps,
-                    config=self.model_config,
-                )
-                for idx in range(num_layers)
+        blocks: list[nn.Module] = [
+            BasicAVTransformerBlock(
+                idx=idx,
+                video=video_config,
+                audio=audio_config,
+                rope_type=self.rope_type,
+                norm_eps=norm_eps,
+                config=self.model_config,
+            )
+            for idx in range(num_layers)
+        ]
+        if self._uses_cache_dit():
+            blocks = [
+                LTX2CacheDiTPattern0BlockWrapper(b, parent=self)
+                for b in blocks  # type: ignore[misc]
             ]
-        )
+        self.transformer_blocks = nn.ModuleList(blocks)
 
-    # -- Ulysses sequence sharding / gathering --------------------------------
+    # -- Sequence sharding / gathering ----------------------------------------
 
     def _shard_transformer_args(self, args: TransformerArgs) -> TransformerArgs:
-        """Shard sequence-dependent fields of *args* for Ulysses."""
+        """Shard sequence-dependent fields of *args* across sequence-parallel ranks."""
         seq_len = args.x.shape[1]
-        chunk = seq_len // self.ulysses_size
-        s = self.ulysses_rank * chunk
+        chunk = seq_len // self.seq_parallel_size
+        s = self.seq_parallel_rank * chunk
         e = s + chunk
 
         def _shard(t):
@@ -1106,8 +1200,8 @@ class LTXModel(nn.Module):
     def _gather_sequence(self, x: torch.Tensor) -> torch.Tensor:
         """All-gather hidden states along the sequence dim."""
         x = x.contiguous()
-        gathered = [torch.empty_like(x) for _ in range(self.ulysses_size)]
-        dist.all_gather(gathered, x, group=self.ulysses_pg)
+        gathered = [torch.empty_like(x) for _ in range(self.seq_parallel_size)]
+        dist.all_gather(gathered, x, group=self.seq_parallel_pg)
         return torch.cat(gathered, dim=1)
 
     def configure_audio_ulysses(self, audio_seq_len: int) -> None:
@@ -1117,15 +1211,16 @@ class LTXModel(nn.Module):
         known.  The decision is cached — ``forward()`` uses it without
         re-checking.
         """
-        if not self.use_ulysses:
+        if not self.use_seq_parallel:
             self._audio_is_sharded = False
             return
 
-        self._audio_is_sharded = audio_seq_len % self.ulysses_size == 0
+        self._audio_is_sharded = audio_seq_len % self.seq_parallel_size == 0
         for block in self.transformer_blocks:
-            block._audio_is_sharded = self._audio_is_sharded
-            if hasattr(block, "audio_attn1"):
-                block.audio_attn1.set_ulysses_active(self._audio_is_sharded)
+            target = block.inner if isinstance(block, LTX2CacheDiTPattern0BlockWrapper) else block
+            target._audio_is_sharded = self._audio_is_sharded
+            if hasattr(target, "audio_attn1"):
+                target.audio_attn1.set_ulysses_active(self._audio_is_sharded)
 
     def set_ulysses_enabled(self, enabled: bool) -> None:
         """Enable or disable Ulysses parallelism at runtime.
@@ -1136,15 +1231,15 @@ class LTXModel(nn.Module):
         multi-rank operation; audio sharding will be reconfigured by
         the next :meth:`configure_audio_ulysses` call.
         """
-        if self.ulysses_size <= 1:
+        if self.seq_parallel_size <= 1:
             return
 
-        self.use_ulysses = enabled
+        self.use_seq_parallel = enabled
         if not enabled:
             self._audio_is_sharded = False
 
         for block in self.transformer_blocks:
-            block._use_ulysses = enabled
+            block._use_seq_parallel = enabled
             if not enabled:
                 block._audio_is_sharded = False
             if hasattr(block, "attn1"):
@@ -1173,11 +1268,58 @@ class LTXModel(nn.Module):
 
     # -- Forward -------------------------------------------------------------
 
+    def prepare_text_cache(
+        self,
+        *,
+        video_context: torch.Tensor | None = None,
+        video_context_mask: torch.Tensor | None = None,
+        video_positions: torch.Tensor | None = None,
+        audio_context: torch.Tensor | None = None,
+        audio_context_mask: torch.Tensor | None = None,
+        audio_positions: torch.Tensor | None = None,
+        dtype: torch.dtype,
+    ) -> TextCache:
+        """Compute step-invariant preprocessor outputs and text KV projections.
+
+        Called once before the denoise loop.  The returned ``TextCache``
+        is passed to ``forward()`` on every step.  Does not require latent
+        data — only text context, positions, and dtype are needed.
+        """
+        v_ctx = v_mask = v_pe = v_cross_pe = v_kv = None
+        a_ctx = a_mask = a_pe = a_cross_pe = a_kv = None
+
+        if video_context is not None:
+            v_ctx, v_mask, v_pe, v_cross_pe = self.video_args_preprocessor.prepare_text_cache(
+                video_context, video_context_mask, video_positions, dtype
+            )
+            v_kv = [block.attn2.project_kv(v_ctx) for block in self.transformer_blocks]
+
+        if audio_context is not None:
+            a_ctx, a_mask, a_pe, a_cross_pe = self.audio_args_preprocessor.prepare_text_cache(
+                audio_context, audio_context_mask, audio_positions, dtype
+            )
+            a_kv = [block.audio_attn2.project_kv(a_ctx) for block in self.transformer_blocks]
+
+        return TextCache(
+            video_context=v_ctx,
+            video_mask=v_mask,
+            video_pe=v_pe,
+            video_cross_pe=v_cross_pe,
+            video_kv=v_kv,
+            audio_context=a_ctx,
+            audio_mask=a_mask,
+            audio_pe=a_pe,
+            audio_cross_pe=a_cross_pe,
+            audio_kv=a_kv,
+        )
+
     def forward(
         self,
         video: Modality | None,
         audio: Modality | None,
         perturbations=None,
+        *,
+        text_cache: TextCache,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Forward pass through the LTX-2 transformer.
 
@@ -1185,6 +1327,8 @@ class LTXModel(nn.Module):
             video: Video modality input (or None).
             audio: Audio modality input (or None).
             perturbations: Optional ``BatchedPerturbationConfig`` for STG.
+            text_cache: Pre-computed step-invariant outputs from ``prepare_text_cache()``.
+                Always required — callers must invoke ``prepare_text_cache()`` first.
 
         Returns:
             Tuple of (video_output, audio_output) velocity predictions.
@@ -1194,30 +1338,75 @@ class LTXModel(nn.Module):
         if not self.model_type.is_audio_enabled() and audio is not None:
             raise ValueError("Audio is not enabled for this model")
 
-        video_args = self.video_args_preprocessor.prepare(video) if video is not None else None
-        audio_args = self.audio_args_preprocessor.prepare(audio) if audio is not None else None
+        video_args = (
+            self.video_args_preprocessor.prepare(
+                video,
+                text_cache.video_context,
+                text_cache.video_mask,
+                text_cache.video_pe,
+                text_cache.video_cross_pe,
+            )
+            if video is not None
+            else None
+        )
+        audio_args = (
+            self.audio_args_preprocessor.prepare(
+                audio,
+                text_cache.audio_context,
+                text_cache.audio_mask,
+                text_cache.audio_pe,
+                text_cache.audio_cross_pe,
+            )
+            if audio is not None
+            else None
+        )
 
-        # Shard sequences for Ulysses parallelism.
+        # Shard sequences for parallelism (Ulysses head-sharding or Attention2D context parallelism).
         # Video is always sharded.  Audio sharding is decided once by
         # configure_audio_ulysses() and cached in self._audio_is_sharded.
-        if self.use_ulysses:
+        if self.use_seq_parallel:
             if video_args is not None:
                 video_args = self._shard_transformer_args(video_args)
             if self._audio_is_sharded and audio_args is not None:
                 audio_args = self._shard_transformer_args(audio_args)
 
-        for block in self.transformer_blocks:
-            video_args, audio_args = block(
-                video=video_args,
-                audio=audio_args,
-                perturbations=perturbations,
-            )
+        v_kv = text_cache.video_kv
+        a_kv = text_cache.audio_kv
+
+        if self._uses_cache_dit():
+            # Cache-DiT path: wrapper consumes (vx, ax) positional args and
+            # reads full TransformerArgs from self._cache_dit_*_args. text_kv
+            # must be looked up by inner.idx inside the wrapper — Cache-DiT's
+            # CachedBlocks iterates inner blocks with a single shared kwargs
+            # dict, so passing text_kv[i] through the outer loop would feed
+            # every inner block block-0's KV.
+            self._cache_dit_video_args = video_args
+            self._cache_dit_audio_args = audio_args
+            self._cache_dit_v_kv = v_kv
+            self._cache_dit_a_kv = a_kv
+            vx = video_args.x if video_args is not None else None
+            ax = audio_args.x if audio_args is not None else None
+            for block in self.transformer_blocks:
+                vx, ax = block(vx, ax, perturbations=perturbations)
+                if video_args is not None and vx is not None:
+                    video_args = replace(video_args, x=vx)
+                if audio_args is not None and ax is not None:
+                    audio_args = replace(audio_args, x=ax)
+        else:
+            for i, block in enumerate(self.transformer_blocks):
+                video_args, audio_args = block(
+                    video=video_args,
+                    audio=audio_args,
+                    perturbations=perturbations,
+                    text_kv_video=v_kv[i] if v_kv else None,
+                    text_kv_audio=a_kv[i] if a_kv else None,
+                )
 
         # Gather sequences back to full length for output processing.
         # Only gather embedded_timestep if it was actually sharded (dim-1
         # matches x); scalar timestep embeddings [B, 1, D] are
         # broadcast-compatible and must not be gathered.
-        if self.use_ulysses:
+        if self.use_seq_parallel:
             if video_args is not None:
                 gathered_vx = self._gather_sequence(video_args.x)
                 v_et = video_args.embedded_timestep
@@ -1263,6 +1452,28 @@ class LTXModel(nn.Module):
         )
         return vx, ax
 
+    @staticmethod
+    def _remap_transformer_block_keys_for_cache_dit_wrapper(weights: dict) -> dict:
+        """Map checkpoint keys for wrapped blocks: insert inner. after transformer_blocks.<layer_idx>."""
+        prefix = "transformer_blocks."
+        out: dict = {}
+        for key, value in weights.items():
+            if not key.startswith(prefix):
+                out[key] = value
+                continue
+            rest = key[len(prefix) :]
+            first_dot = rest.find(".")
+            if first_dot == -1:
+                out[key] = value
+                continue
+            layer_idx_str = rest[:first_dot]
+            if not layer_idx_str.isdigit():
+                out[key] = value
+                continue
+            tail = rest[first_dot + 1 :]
+            out[f"{prefix}{layer_idx_str}.inner.{tail}"] = value
+        return out
+
     # -- Weight loading (from a single LTX-2 .safetensors checkpoint) -------------------------
 
     def load_weights(self, weights: dict) -> None:
@@ -1284,6 +1495,9 @@ class LTXModel(nn.Module):
             new_key = new_key.replace(".k_norm.", ".norm_k.")
             remapped[new_key] = value
         weights = remapped
+
+        if self._uses_cache_dit():
+            weights = self._remap_transformer_block_keys_for_cache_dit_wrapper(weights)
 
         target_dtype = self.model_config.torch_dtype if self.model_config else torch.bfloat16
 

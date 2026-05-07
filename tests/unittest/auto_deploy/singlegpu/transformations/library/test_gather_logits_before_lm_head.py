@@ -45,6 +45,29 @@ class SimpleLMHeadModel(torch.nn.Module):
         return logits
 
 
+class NoLmHeadModel(torch.nn.Module):
+    """Model without lm_head (like a VLM text backbone exported separately).
+
+    Simulates the Qwen3.5 MoE scenario where only the text backbone is exported
+    and the lm_head is applied externally.  The graph output is the final norm
+    output, preceded by a residual add (multi-input node that stops the backward walk).
+    """
+
+    def __init__(self, hidden_size: int = 128):
+        super().__init__()
+        self.linear1 = torch.nn.Linear(hidden_size, hidden_size, device="cuda", dtype=torch.float16)
+        self.linear2 = torch.nn.Linear(hidden_size, hidden_size, device="cuda", dtype=torch.float16)
+        self.norm = torch.nn.LayerNorm(hidden_size, device="cuda", dtype=torch.float16)
+
+    def forward(self, hidden_states, logit_gather_ids=None, seq_len=None):
+        residual = hidden_states
+        hidden_states = self.linear1(hidden_states)
+        # Residual add: multi-input node that should stop the backward walk
+        hidden_states = hidden_states + residual
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
+
+
 class SoftcapLMHeadModel(torch.nn.Module):
     """Model with LM head followed by softcapping (like Gemma4)."""
 
@@ -366,6 +389,60 @@ class TestGatherLogitsBeforeLmHeadTransform:
         assert not self._check_gather_op_in_graph(gm_transformed), (
             "Gather op should not be in graph"
         )
+
+    def test_transform_no_lm_head_in_graph(self):
+        """Test that gather is placed at output when lm_head is not in the graph.
+
+        VLMs like Qwen3.5 MoE export only the text backbone; the lm_head is
+        applied externally by the executor.  The backward walk must NOT traverse
+        into the model body (e.g. to an attention o_proj linear) and instead
+        place the gather right before the output node so the external lm_head
+        receives gathered hidden states.
+        """
+        hidden_size = 128
+        batch_size = 4
+        max_batch_size = 8
+        model = NoLmHeadModel(hidden_size).cuda()
+
+        hidden_states = torch.randn(batch_size, 1, hidden_size, device="cuda", dtype=torch.float16)
+        logit_gather_ids = torch.zeros(max_batch_size, dtype=torch.long, device="cuda")
+        seq_len = torch.ones(batch_size, dtype=torch.long, device="cuda")
+
+        gm = torch_export_to_gm(
+            model,
+            args=(hidden_states, logit_gather_ids, seq_len),
+            dynamic_shapes=None,
+            clone=True,
+        )
+
+        # Apply transform
+        cm = self._create_cached_sequence_interface(max_batch_size)
+        transform_config = {
+            "gather_logits_before_lm_head": {
+                "stage": "post_load_fusion",
+                "max_batch_size": max_batch_size,
+            }
+        }
+        optimizer = InferenceOptimizer(None, transform_config)
+        gm_transformed = optimizer(cm, gm)
+
+        # Gather op should be inserted in the graph
+        assert self._check_gather_op_in_graph(gm_transformed), "Gather op not found in graph"
+
+        # Verify forward pass — the model outputs hidden_size (not vocab_size)
+        token_gather_indices = torch.arange(batch_size, dtype=torch.long, device="cuda")
+        batch_info = BatchInfo()
+        batch_info.update_tokens_gather_info(batch_size, False)
+        batch_info_host = batch_info.serialize()
+        output = gm_transformed(
+            hidden_states,
+            logit_gather_ids,
+            seq_len,
+            token_gather_indices=token_gather_indices,
+            batch_info_host=batch_info_host,
+        )
+        # Model has no lm_head, so output is [batch, 1, hidden_size]
+        assert output.shape == (batch_size, 1, hidden_size)
 
     def test_transform_with_softcapping(self):
         """Test that gather is placed BEFORE lm_head when softcapping follows it.

@@ -4,26 +4,31 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Generic, List, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar
 
 import filelock
 import torch
 import transformers
 from transformers.utils import HF_MODULES_CACHE
 
-from tensorrt_llm import logger
 from tensorrt_llm._torch.pyexecutor.config_utils import (
-    get_qwen3_hybrid_num_attention_layers, is_nemotron_hybrid, is_qwen3_hybrid,
-    load_pretrained_config)
+    get_qwen3_hybrid_num_attention_layers, is_hybrid_linear, is_nemotron_hybrid,
+    is_qwen3_hybrid, load_pretrained_config)
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
-                                          MoeLoadBalancerConfig)
+                                          KvCacheConfig, MoeLoadBalancerConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
+
+if TYPE_CHECKING:
+    from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
+    from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig, LoraConfig,
+                                              SparseAttentionConfig,
+                                              SpeculativeConfig)
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 
@@ -126,6 +131,8 @@ class ModelConfig(Generic[TConfig]):
     # cute dsl op configs
     use_cute_dsl_blockscaling_mm: bool = False
     use_cute_dsl_blockscaling_bmm: bool = False
+    use_cute_dsl_bf16_bmm: bool = False
+    use_cute_dsl_bf16_gemm: bool = False
 
     _frozen: bool = field(default=False, init=False, repr=False)
 
@@ -439,6 +446,19 @@ class ModelConfig(Generic[TConfig]):
                     "Supported: 8.")
 
             quant_config.exclude_modules = hf_quant_config.get("ignore", [])
+        elif hf_quant_config.get("quant_method") == "nvfp4":
+            quant_config.quant_algo = QuantAlgo.NVFP4
+            group_size = hf_quant_config.get("group_size", 16)
+            assert group_size == 16, "NVFP4 only supports group_size=16"
+            quant_config.group_size = group_size
+            default_exclude = ['*.mlp.gate', 'lm_head']
+
+            # Merge HF config's modules_to_not_convert with default exclude_modules
+            if hf_exclude_modules is not None:
+                quant_config.exclude_modules = list(
+                    dict.fromkeys(hf_exclude_modules + default_exclude))
+            else:
+                quant_config.exclude_modules = default_exclude
         return quant_config, layer_quant_config
 
     @staticmethod
@@ -525,6 +545,7 @@ class ModelConfig(Generic[TConfig]):
                         use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
                         q_split_threshold = sparse_attention_config.q_split_threshold
                         enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
+                        indexer_k_dtype = sparse_attention_config.indexer_k_dtype
                     else:
                         index_n_heads = pretrained_config.index_n_heads
                         index_head_dim = pretrained_config.index_head_dim
@@ -534,6 +555,7 @@ class ModelConfig(Generic[TConfig]):
                         use_cute_dsl_topk = False
                         q_split_threshold = 8192
                         enable_heuristic_topk = False
+                        indexer_k_dtype = "fp8"
                     kwargs[
                         'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
                             index_n_heads=index_n_heads,
@@ -545,7 +567,8 @@ class ModelConfig(Generic[TConfig]):
                             use_cute_dsl_topk=use_cute_dsl_topk,
                             q_split_threshold=q_split_threshold,
                             indexer_rope_interleave=indexer_rope_interleave,
-                            enable_heuristic_topk=enable_heuristic_topk)
+                            enable_heuristic_topk=enable_heuristic_topk,
+                            indexer_k_dtype=indexer_k_dtype)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."
@@ -636,9 +659,13 @@ class ModelConfig(Generic[TConfig]):
         model_config._frozen = True
         return model_config
 
-    def get_bindings_model_config(self,
-                                  tokens_per_block: Optional[int] = None
-                                  ) -> "ModelConfigCpp":
+    def get_bindings_model_config(
+        self,
+        is_disagg: bool = False,
+        tokens_per_block: Optional[int] = None,
+        kv_cache_config: Optional[KvCacheConfig] = None,
+        spec_config: Optional['SpeculativeConfig'] = None,
+    ) -> "ModelConfigCpp":
         """
         This method is used to construct the bindings config for the model.
         Currently it adheres to gptJsonConfig.cpp::createModelConfig, which assumes
@@ -667,7 +694,8 @@ class ModelConfig(Generic[TConfig]):
 
         hidden_size = ceil_div(self.pretrained_config.hidden_size, attn_tp_size)
         num_layers = self.pretrained_config.num_hidden_layers
-        num_attention_layers = self.get_num_attention_layers()
+        num_attention_layers = self.get_num_attention_layers(
+            is_disagg, kv_cache_config, spec_config)
         if (self.spec_config is not None
                 and self.spec_config.spec_dec_mode.is_mtp_one_model()):
             num_layers += self.spec_config.num_nextn_predict_layers
@@ -693,6 +721,7 @@ class ModelConfig(Generic[TConfig]):
 
         num_key_value_heads = getattr(self.pretrained_config,
                                       "num_key_value_heads", num_heads)
+
         if isinstance(num_key_value_heads, (list, tuple)):
             # Per-layer KV heads (e.g., Nemotron-NAS, variable GQA models)
             num_kv_heads_per_layer = [
@@ -796,10 +825,35 @@ class ModelConfig(Generic[TConfig]):
         else:
             return None
 
-    def get_num_attention_layers(self):
-        if is_nemotron_hybrid(self.pretrained_config):
+    def get_num_attention_layers(
+            self,
+            is_disagg: bool,
+            kv_cache_config: Optional[KvCacheConfig] = None,
+            spec_config: Optional['SpeculativeConfig'] = None):
+        """Return the number of layers that need KV cache blocks.
+
+        For hybrid models using the MixedMambaHybridCacheManager path
+        (TRTLLM_USE_CPP_MAMBA=1 for disagg), only attention layers need KV
+        cache blocks, so we return the attention-only count.
+
+        For the default CppMambaHybridCacheManager path (including speculative
+        decoding), both attention and mamba layers are managed in the unified
+        KV cache pool, so we return num_hidden_layers (all layers).
+        """
+        use_disagg = is_disagg or os.environ.get('TRTLLM_USE_CPP_MAMBA',
+                                                 '0') == '1'
+        use_reuse = kv_cache_config is not None and kv_cache_config.enable_block_reuse
+        use_spec = spec_config is not None
+
+        use_v1_mamba_manager = use_disagg or use_spec
+        if is_hybrid_linear(
+                self.pretrained_config) and use_v1_mamba_manager and use_reuse:
+            logger.warning(
+                "Block reuse does not work with MTP or disagg for hybrid linear models"
+            )
+        if is_nemotron_hybrid(self.pretrained_config) and use_v1_mamba_manager:
             return self.pretrained_config.hybrid_override_pattern.count("*")
-        elif is_qwen3_hybrid(self.pretrained_config):
+        elif is_qwen3_hybrid(self.pretrained_config) and use_v1_mamba_manager:
             return get_qwen3_hybrid_num_attention_layers(self.pretrained_config)
         else:
             return self.pretrained_config.num_hidden_layers
