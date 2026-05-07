@@ -2028,6 +2028,59 @@ class TestScratchReuse(TestKVCacheManagerV2):
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
 
+    def test_request_scratch_toggle_for_two_round_inference(self):
+        self._prepare_scratch(num_layers=8, window_size=32, tokens_per_block=32, gpu_quota=16 << 20)
+        prompt = [self.next_token() for _ in range(256)]
+        decode_token = self.next_token()
+        second_prompt = [self.next_token() for _ in range(256)]
+        history: list[TokenIdExt] = []
+        kv = self.manager.create_kv_cache(None, prompt)
+        lg_id = LayerGroupId(0)
+
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            self.assertTrue(kv.resume(stream))
+            self.assertTrue(kv.resize(len(prompt)))
+            self.assertTrue(kv.enable_swa_scratch_reuse)
+            self.assertIsNotNone(kv.get_scratch_desc(lg_id))
+            self.assertTrue(kv.has_scratch_slots)
+            with self.assertRaisesRegex(ValueError, "scratch blocks are needed"):
+                kv.enable_swa_scratch_reuse = False
+
+            self.engine.execute([Step(kv, prompt, history)], stream)
+            kv.commit(prompt)
+            history.extend(prompt)
+            self.assertIsNone(kv.get_scratch_desc(lg_id))
+            self.assertFalse(kv.has_scratch_slots)
+
+            kv.enable_swa_scratch_reuse = False
+            self.assertFalse(kv.enable_swa_scratch_reuse)
+            kv.capacity = len(history) + 1
+            self.assertFalse(kv.has_scratch_slots)
+            self.assertIsNone(kv.get_scratch_desc(lg_id))
+
+            self.engine.execute([Step(kv, [decode_token], history)], stream)
+            kv.commit([decode_token])
+            history.append(decode_token)
+            self.assertFalse(kv.has_scratch_slots)
+
+            kv.enable_swa_scratch_reuse = True
+            self.assertTrue(kv.enable_swa_scratch_reuse)
+            self.assertTrue(kv.resize(len(history) + len(second_prompt), len(history)))
+            self.assertIsNotNone(kv.get_scratch_desc(lg_id))
+            self.assertTrue(kv.has_scratch_slots)
+
+            self.engine.execute([Step(kv, second_prompt, history)], stream)
+            kv.commit(second_prompt)
+            history.extend(second_prompt)
+            self.assertIsNone(kv.get_scratch_desc(lg_id))
+            self.assertFalse(kv.has_scratch_slots)
+            self.engine.execute([Step(kv, [], history)], stream)
+            kv.stop_committing()
+
+        s.take_finish_event().synchronize()
+        kv.close()
+
     def test_scratch_slot_count(self):
         """Verify peak slot count is reduced with scratch reuse.
 
@@ -2101,11 +2154,11 @@ class TestScratchReuse(TestKVCacheManagerV2):
                         indices[i], BAD_PAGE_INDEX, f"Normal block {i} has BAD_PAGE_INDEX"
                     )
 
-            # Commit all tokens — scratch slots persist for reuse by future resize
+            # Commit all tokens — scratch slots are released once no input blocks use scratch.
             self.engine.execute([Step(kv, prompt, [])], stream)
             kv.commit(prompt)
             kv.stop_committing()
-            self.assertTrue(kv.has_scratch_slots)
+            self.assertFalse(kv.has_scratch_slots)
 
         s.take_finish_event().synchronize()
 

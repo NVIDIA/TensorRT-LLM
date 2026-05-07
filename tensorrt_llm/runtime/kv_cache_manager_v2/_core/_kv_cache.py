@@ -189,6 +189,7 @@ class _KVCache:
         "_avg_capacity",
         "_ssm_blocks",
         "_never_resumed",
+        "_enable_swa_scratch_reuse",
         "_scratch_slots",
         "__rawref__",
     )
@@ -228,6 +229,7 @@ class _KVCache:
 
     _ssm_blocks: TypedIndexList[BeamIndex, TypedIndexList[LifeCycleId, BlockPage]]
     _never_resumed: bool
+    _enable_swa_scratch_reuse: bool
     # Scratch slots for SWA prefill memory reuse, per life cycle. These hold coalesced slots
     # whose sub-pages are reinterpreted as per-block storage for the currently executing layer.
     # Number of scratch blocks depends on diff between history_length and capacity.
@@ -267,6 +269,7 @@ class _KVCache:
             self.beam_width,
         )
         self._never_resumed = True
+        self._enable_swa_scratch_reuse = manager.enable_swa_scratch_reuse
         self._scratch_slots = make_typed(
             lambda _: list[ScratchSlotLock](), manager._storage.num_life_cycles
         )
@@ -433,6 +436,33 @@ class _KVCache:
         """True if this KV cache currently has scratch slots allocated."""
         return any(len(s) > 0 for s in self._scratch_slots)
 
+    @property
+    def enable_swa_scratch_reuse(self) -> bool:
+        return self._enable_swa_scratch_reuse
+
+    @enable_swa_scratch_reuse.setter
+    def enable_swa_scratch_reuse(self, enable: bool) -> None:
+        if enable == self._enable_swa_scratch_reuse:
+            return
+        if enable:
+            if not self.manager.enable_swa_scratch_reuse:
+                raise ValueError(
+                    "Cannot enable SWA scratch reuse for a request when it is disabled in "
+                    "KV cache manager config"
+                )
+            if self._would_use_swa_scratch_blocks():
+                raise ValueError(
+                    "Cannot enable SWA scratch reuse while the current request state would "
+                    "need scratch blocks"
+                )
+            self._enable_swa_scratch_reuse = True
+            return
+
+        if self._would_use_swa_scratch_blocks():
+            raise ValueError("Cannot disable SWA scratch reuse while scratch blocks are needed")
+        assert not self.has_scratch_slots
+        self._enable_swa_scratch_reuse = False
+
     def supports_index_mode(self, mode: PageIndexMode) -> bool:
         match mode:
             case PageIndexMode.PER_LAYER:
@@ -468,7 +498,7 @@ class _KVCache:
         if capacity < history_length:
             raise ValueError("History length cannot be greater than capacity")
         # Scratch reuse: compute scratch ranges and slot delta
-        enable_scratch = self.manager.enable_swa_scratch_reuse
+        enable_scratch = self.enable_swa_scratch_reuse
         if enable_scratch and capacity != self._capacity:
             assert history_length == self._capacity, (
                 f"SWA scratch requires history_length ({history_length}) == "
@@ -500,11 +530,11 @@ class _KVCache:
                             len(indices) - new_num_blocks
                         )
 
-        stale_scratch_slots, delta_scratch_slots, scratch_ranges = self._take_stale_scratch_slots(
+        excess_scratch_slots, delta_scratch_slots, scratch_ranges = self._take_excess_scratch_slots(
             capacity, history_length
         )
 
-        if new_num_blocks > old_num_blocks:
+        if new_num_blocks >= old_num_blocks:
             num_new_slots = filled_list(0, num_life_cycles)
             stale_ranges = [
                 _KVCache._get_stale_range(tokens_per_block, history_length, lc)
@@ -538,7 +568,7 @@ class _KVCache:
                         make_typed(lambda lc: max(0, net_alloc_counts[lc]), num_life_cycles)
                     )
                 except OutOfPagesError:
-                    self._recover_stale_scratch_slots(stale_scratch_slots)
+                    self._recover_excess_scratch_slots(excess_scratch_slots)
                     self._lock_held_blocks(backup_holders)
                     return False
             else:
@@ -552,9 +582,11 @@ class _KVCache:
             # Combine slots and distribute
             slots = make_typed(lambda _: list[Slot](), num_life_cycles)
             for lc in typed_range(num_life_cycles):
-                slots[lc] = new_slots[lc] + [lock.detach_slot() for lock in stale_scratch_slots[lc]]
+                slots[lc] = new_slots[lc] + [
+                    lock.detach_slot() for lock in excess_scratch_slots[lc]
+                ]
                 new_slots[lc].clear()
-                stale_scratch_slots[lc].clear()
+                excess_scratch_slots[lc].clear()
 
             if any(cnt < 0 for cnt in net_alloc_counts):
                 with self._record_event():
@@ -625,7 +657,7 @@ class _KVCache:
         necessary for SWA layers.
         Expect OutOfPagesError exception if there are not enough pages in GPU memory.
         """
-        if self.manager.enable_swa_scratch_reuse:
+        if self.enable_swa_scratch_reuse:
             raise ValueError(
                 "Cannot use capacity setter when SWA scratch reuse is enabled. "
                 "Use resize(capacity, history_length) instead."
@@ -761,10 +793,10 @@ class _KVCache:
             None, storage.num_life_cycles
         )
 
-        stale_scratch_slots, delta_scratch_slots, _ = self._take_stale_scratch_slots(
+        excess_scratch_slots, delta_scratch_slots, _ = self._take_excess_scratch_slots(
             self.capacity, self.history_length
         )
-        assert all(len(s) == 0 for s in stale_scratch_slots)
+        assert all(len(s) == 0 for s in excess_scratch_slots)
 
         num_slots = filled_list(0, num_life_cycles)
         has_partial = False
@@ -1108,7 +1140,7 @@ class _KVCache:
                 assert not block.is_committed
                 for beam_block in block.pages:
                     if beam_block[lc_idx] is None:
-                        assert self.manager.enable_swa_scratch_reuse
+                        assert self.enable_swa_scratch_reuse
                         continue  # Scratch block — already handled
                     assert isinstance(beam_block[lc_idx], _PageHolder)
                     beam_block[lc_idx] = None
@@ -1144,13 +1176,12 @@ class _KVCache:
                     )
                     for beam_idx, beam_block in typed_enumerate(block.pages):
                         if beam_block[lc_idx] is None:
-                            assert self.manager.enable_swa_scratch_reuse
+                            assert self.enable_swa_scratch_reuse
                             continue  # Scratch block — no page to unlock
                         holder = expect_type(_SharedPageLock, beam_block[lc_idx]).holder
                         ret.append((ordinal, beam_idx, lc_idx, holder))
                         beam_block[lc_idx] = holder if hold_for_commit else None
-            # Scratch slots are NOT freed here — they persist for reuse by the next
-            # resize() that grows capacity. The grow branch manages scratch via delta.
+            # Scratch slot lifetime is handled by resize() after target scratch ranges are recomputed.
         return ret
 
     def _lock_held_blocks(
@@ -1169,21 +1200,21 @@ class _KVCache:
             self._block(user.ordinal, user.beam_index)[user.life_cycle] = lock
 
     class DeltaScratchSlots(NamedTuple):
-        stale: TypedIndexList[LifeCycleId, list[ScratchSlotLock]]
+        excess: TypedIndexList[LifeCycleId, list[ScratchSlotLock]]
         delta_cnt: TypedIndexList[LifeCycleId, int]
         scratch_ranges: TypedIndexList[LifeCycleId, HalfOpenRange[BlockOrdinal]]
 
-    def _take_stale_scratch_slots(self, capacity: int, history_length: int) -> DeltaScratchSlots:
+    def _take_excess_scratch_slots(self, capacity: int, history_length: int) -> DeltaScratchSlots:
         """
-        Calculate scratch slot requirements and extract excess/stale scratch slots.
+        Calculate scratch slot requirements and extract excess scratch slots.
 
         Returns:
-            stale_scratch_slots: List of ScratchSlotLocks taken from `self._scratch_slots` (we have excess).
+            excess_scratch_slots: List of ScratchSlotLocks taken from `self._scratch_slots`.
             additional_scratch_slots: Number of extra slots needed per lifecycle (we have deficit).
             scratch_ranges: The scratch ranges per lifecycle for the new capacity/history_length.
         """
         num_life_cycles = self.manager._life_cycles.size
-        stale = make_typed(lambda _: list[ScratchSlotLock](), num_life_cycles)
+        excess = make_typed(lambda _: list[ScratchSlotLock](), num_life_cycles)
         delta_cnt = filled_list(0, num_life_cycles)
         scratch_ranges = make_typed(
             lambda _: HalfOpenRange[BlockOrdinal](BlockOrdinal(0), BlockOrdinal(0)), num_life_cycles
@@ -1192,8 +1223,6 @@ class _KVCache:
         for lc_idx, lc in self.manager._life_cycles.items():
             scratch_range = self._get_scratch_range(lc, history_length, capacity)
             scratch_ranges[lc_idx] = scratch_range
-            if not scratch_range:
-                continue
             num_scratch_blocks = len(scratch_ranges[lc_idx])
             frac_max = self._storage._slot_util_frac_max[lc_idx]
             needed_slots = math.ceil(num_scratch_blocks * frac_max)
@@ -1204,14 +1233,14 @@ class _KVCache:
             if delta < 0:
                 for _ in range(-delta):
                     lock = self._scratch_slots[lc_idx].pop()
-                    stale[lc_idx].append(lock)
+                    excess[lc_idx].append(lock)
 
-        return self.DeltaScratchSlots(stale, delta_cnt, scratch_ranges)
+        return self.DeltaScratchSlots(excess, delta_cnt, scratch_ranges)
 
-    def _recover_stale_scratch_slots(
-        self, stale_scratch_slots: TypedIndexList[LifeCycleId, list[ScratchSlotLock]]
+    def _recover_excess_scratch_slots(
+        self, excess_scratch_slots: TypedIndexList[LifeCycleId, list[ScratchSlotLock]]
     ) -> None:
-        for lc_idx, locks in typed_enumerate(stale_scratch_slots):
+        for lc_idx, locks in typed_enumerate(excess_scratch_slots):
             self._scratch_slots[lc_idx].extend(locks)
             locks.clear()
 
@@ -1339,11 +1368,17 @@ class _KVCache:
           for the current chunk. Blocks before this range already contain real KV data
           from previous chunks and must not be overwritten.
         """
-        if not self.manager.enable_swa_scratch_reuse:
+        if not self.enable_swa_scratch_reuse:
             return HalfOpenRange(BlockOrdinal(0), BlockOrdinal(0))
         history_length = value_or(history_length_override, self.history_length)
         capacity = value_or(capacity_override, self.capacity)
         return compute_scratch_range(life_cycle, history_length, capacity, self.tokens_per_block)
+
+    def _would_use_swa_scratch_blocks(self) -> bool:
+        return any(
+            compute_scratch_range(lc, self.history_length, self.capacity, self.tokens_per_block)
+            for lc in self.manager._life_cycles
+        )
 
     @staticmethod
     def _get_stale_range(
