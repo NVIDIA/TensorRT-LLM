@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -221,7 +221,8 @@ void updateKVBlockArrayDraftTokenLocation2D(IndexType const* acceptedDraftTokens
     runtime::SizeType32 sizeInBytesPerKVHead, runtime::SizeType32 rewindDraftTokenCommonCount,
     runtime::SizeType32 const* rewindDraftTokenSeparateAdjustments, runtime::SizeType32 const* seqSlotRemapping,
     runtime::SizeType32 const* batchSlots, runtime::SizeType32 maxKVCacheLen, runtime::SizeType32 maxBlocksPerSeq,
-    runtime::SizeType32 tokensPerBlock, bool canUseOneMoreBlock, cudaStream_t stream);
+    runtime::SizeType32 tokensPerBlock, bool canUseOneMoreBlock, runtime::SizeType32 const* poolMapping,
+    cudaStream_t stream);
 
 } // namespace kernels::speculative_decoding
 

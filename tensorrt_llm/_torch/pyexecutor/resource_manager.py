@@ -274,6 +274,9 @@ def _update_kv_cache_draft_token_location(cache_manager,
     assert len(
         cache_manager.max_attention_window_vec
     ) == 1, "Currently, only one max attention window size is supported."
+    max_kv_cache_len = cache_manager.max_attention_window_vec[0]
+    if max_kv_cache_len is None:
+        max_kv_cache_len = cache_manager.max_seq_len
 
     if use_paged_kv_cache:
         assert len(set(cache_manager.num_kv_heads_per_layer)) == 1, \
@@ -290,7 +293,7 @@ def _update_kv_cache_draft_token_location(cache_manager,
             cache_manager.num_kv_heads_per_layer[0],
             int(cache_manager.head_dim * kv_cache_dtype_byte_size),
             cache_manager.max_total_draft_tokens,
-            cache_manager.max_attention_window_vec[0],
+            max_kv_cache_len,
             rewind_draft_token_separate_adjustments,
             None,
             cache_manager.kv_cache_pool_pointers,
@@ -1775,7 +1778,10 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
         from ..speculative import get_num_extra_kv_tokens
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
-        self.max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
+        self.max_total_draft_tokens = (spec_config.max_total_draft_tokens
+                                       if spec_config is not None else 0)
+        self.use_dynamic_tree = bool(
+            getattr(spec_config, "use_dynamic_tree", False))
 
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
 
@@ -1875,7 +1881,7 @@ class KVCacheManagerV2(BaseResourceManager):
             f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
         cache_tiers: List[CacheTierConfig] = [GpuCacheTierConfig(quota=quota)]
-        if kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size > 0:
+        if kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size >= 0:
             host_quota = kv_cache_config.host_cache_size
         else:
             # The V2 MAX_UTILIZATION scheduler relies on suspend/resume to
@@ -1886,13 +1892,25 @@ class KVCacheManagerV2(BaseResourceManager):
             #
             # Automatically provision a host tier matching the GPU quota so
             # suspend/resume works out of the box.  Cap at available host
-            # memory to avoid allocation failures.
+            # memory and pinnable memory limit to avoid allocation failures.
+            import resource
             try:
                 mem_available = os.sysconf('SC_PAGE_SIZE') * os.sysconf(
                     'SC_AVPHYS_PAGES')
             except (ValueError, OSError):
                 mem_available = float('inf')
-            host_quota = min(quota, int(mem_available * 0.5))
+            try:
+                _soft, _hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+                memlock_limit = _soft if _soft != resource.RLIM_INFINITY else float(
+                    'inf')
+            except (ValueError, OSError):
+                memlock_limit = float('inf')
+            candidates = [quota]
+            if mem_available != float('inf'):
+                candidates.append(int(mem_available * 0.5))
+            if memlock_limit != float('inf'):
+                candidates.append(int(memlock_limit * 0.8))
+            host_quota = min(candidates)
             if host_quota <= 0:
                 host_quota = quota
         if host_quota > 0:
@@ -1912,7 +1930,31 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.kv_cache_manager_py_config = config
 
-        self.impl = KVCacheManagerPy(config)
+        try:
+            self.impl = KVCacheManagerPy(config)
+        except Exception:
+            if len(cache_tiers) > 1:
+                logger.warning(
+                    "Failed to initialize KV cache manager with host cache "
+                    "tier (cuMemHostRegister may have failed). "
+                    "Retrying without host cache tier.")
+                cache_tiers_gpu_only = [
+                    t for t in cache_tiers if isinstance(t, GpuCacheTierConfig)
+                ]
+                config = self._build_cache_config(
+                    kv_cache_config,
+                    tokens_per_block=tokens_per_block,
+                    vocab_size=vocab_size,
+                    cache_tiers=cache_tiers_gpu_only,
+                )
+                self.kv_cache_manager_py_config = config
+                self.impl = KVCacheManagerPy(config)
+            else:
+                raise
+        # Pass execution_stream to StorageManager so _batched_migrate
+        # can record a fresh event (V1-style syncWithBufferManager)
+        # to order copy streams after the latest forward-pass work.
+        self.impl._storage._execution_stream = self._stream.cuda_stream
 
         self.num_pools = len(self.impl.layer_grouping)
 
@@ -2341,6 +2383,17 @@ class KVCacheManagerV2(BaseResourceManager):
 
         return True
 
+    def get_context_draft_token_capacity(self, req: LlmRequest) -> int:
+        """Return draft KV capacity needed while processing a context request."""
+        draft_len = get_draft_token_length(req)
+        # Dynamic tree materializes up to max_total_draft_tokens tree nodes
+        # before py_draft_tokens reflects them on the request. Linear/MTP paths
+        # should keep using the request-visible draft length so their rewind
+        # accounting stays paired with the allocated draft slots.
+        if self.use_dynamic_tree and self.max_total_draft_tokens > 0:
+            draft_len = max(draft_len, self.max_total_draft_tokens)
+        return draft_len
+
     def extend_capacity_for_tokens(self, request: LlmRequest) -> None:
         """Extend KV cache capacity for the CUDA-graph padding delta.
 
@@ -2404,7 +2457,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     raise RuntimeError(
                         f"Failed to resume draft KV cache for request {req.py_request_id}"
                     )
-                draft_len = get_draft_token_length(req)
+                draft_len = self.get_context_draft_token_capacity(req)
                 capacity = (req.context_current_position +
                             req.context_chunk_size + draft_len +
                             self.num_extra_kv_tokens)
@@ -2789,6 +2842,12 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         return bool(has_invalid_values)
 
+    def __del__(self):
+        try:
+            self.shutdown()
+        except Exception:
+            pass
+
     def shutdown(self):
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
@@ -2856,7 +2915,9 @@ class KVCacheManagerV2(BaseResourceManager):
                          scheduled_batch: ScheduledRequests,
                          attn_metadata: "AttentionMetadata" = None,
                          kv_cache_dtype_byte_size: float = None):
-        if not self.is_draft:
+        # Dynamic tree relocates accepted draft KV eagerly while
+        # sample_and_accept_draft_tokens still owns its 2D accepted-index tensor.
+        if not self.is_draft and not self.use_dynamic_tree:
             _update_kv_cache_draft_token_location(self, scheduled_batch,
                                                   attn_metadata,
                                                   kv_cache_dtype_byte_size)

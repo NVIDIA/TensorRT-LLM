@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -424,7 +424,7 @@ void updateKVBlockArrayDraftTokenLocation2D(IndexType const* acceptedDraftTokens
     SizeType32 numKVHeads, SizeType32 sizeInBytesPerKVHead, SizeType32 rewindDraftTokenCommonCount,
     SizeType32 const* rewindDraftTokenSeparateAdjustments, SizeType32 const* seqSlotRemapping,
     SizeType32 const* batchSlots, SizeType32 maxKVCacheLen, SizeType32 maxBlocksPerSeq, SizeType32 tokensPerBlock,
-    bool canUseOneMoreBlock, cudaStream_t stream)
+    bool canUseOneMoreBlock, SizeType32 const* poolMapping, cudaStream_t stream)
 {
     std::vector<KVBlockArray> kvBlockArrays;
     kvBlockArrays.reserve(layerCount);
@@ -432,14 +432,20 @@ void updateKVBlockArrayDraftTokenLocation2D(IndexType const* acceptedDraftTokens
     auto const bytesPerBlock = tokensPerBlock * bytesPerToken;
     for (SizeType32 layerIdx = 0; layerIdx < layerCount; layerIdx++)
     {
-        auto const layerOffset = layerIdx * 2 * bytesPerBlock;
+        auto const poolIdx = poolMapping == nullptr ? 0 : poolMapping[layerIdx * 2];
+        auto const layerOffsetInKvBlocks = poolMapping == nullptr ? layerIdx : poolMapping[layerIdx * 2 + 1];
+        auto const layerOffset = layerOffsetInKvBlocks * 2 * bytesPerBlock;
+        auto* const primaryPoolBase = pointerArray[poolIdx * 2];
+        auto* const secondaryPoolBase = pointerArray[poolIdx * 2 + 1];
         auto* const primaryPoolPointer
-            = reinterpret_cast<void*>(reinterpret_cast<char*>(pointerArray[0]) + layerOffset);
-        auto* const secondaryPoolPointer
-            = reinterpret_cast<void*>(reinterpret_cast<char*>(pointerArray[1]) + layerOffset);
+            = reinterpret_cast<void*>(reinterpret_cast<char*>(primaryPoolBase) + layerOffset);
+        auto* const secondaryPoolPointer = secondaryPoolBase == nullptr
+            ? nullptr
+            : reinterpret_cast<void*>(reinterpret_cast<char*>(secondaryPoolBase) + layerOffset);
+        auto* const poolOffsetArray = offsetArray + poolIdx * seqCount * 2 * maxBlocksPerSeq;
 
         kvBlockArrays.emplace_back(seqCount, maxBlocksPerSeq, tokensPerBlock, bytesPerToken, maxKVCacheLen,
-            maxKVCacheLen, 0, canUseOneMoreBlock, primaryPoolPointer, secondaryPoolPointer, offsetArray);
+            maxKVCacheLen, 0, canUseOneMoreBlock, primaryPoolPointer, secondaryPoolPointer, poolOffsetArray);
     }
     updateKVCacheDraftTokenLocation2D(kvBlockArrays.data(), acceptedDraftTokensIndices2D, numAcceptedTokens,
         maxDraftLen, pastKeyValueLengths, layerCount, seqCount, numKVHeads, sizeInBytesPerKVHead,

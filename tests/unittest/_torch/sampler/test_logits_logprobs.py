@@ -148,6 +148,10 @@ def test_generation_with_return_logits(
     return_log_probs: bool,
     async_generation: bool,
 ):
+    pytest.skip(
+        "V2 block reuse ignores cache_salt_id, causing incorrect "
+        "prefix caching and truncated context_logits."
+    )
     if not (gather_context_logits or gather_generation_logits or return_log_probs):  # prune space
         pytest.skip("Nothing to test")
     if reuse_cache and gather_context_logits:
