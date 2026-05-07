@@ -46,6 +46,7 @@ _MXFP4_LAYOUT_ARG_NAMES = (
     "down_scales",
 )
 _MXFP4_RUNTIME_OPS = (
+    torch.ops.auto_deploy.torch_mxfp4_moe,
     torch.ops.auto_deploy.triton_mxfp4_moe,
     torch.ops.auto_deploy.torch_mxfp4_moe_from_routing,
 )

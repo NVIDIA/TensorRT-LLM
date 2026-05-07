@@ -26,6 +26,7 @@ from tensorrt_llm._torch.auto_deploy.transform.interface import Stages
 from tensorrt_llm._torch.auto_deploy.transform.library.mxfp4_moe import (
     InsertMXFP4MLP,
     MXFP4MLPConfig,
+    _mxfp4_target_names_from_node,
     _resolve_mxfp4_expert_block_size,
 )
 
@@ -136,6 +137,39 @@ class _DenseMoeTransformModule(torch.nn.Module):
             self.down_b,
             1.0,
             10.0,
+        )
+
+
+class _Mxfp4KwargRuntimeModule(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer("gate_up_blocks", torch.zeros((2, 64, 1, 16), dtype=torch.uint8))
+        self.register_buffer("gate_up_scales", torch.zeros((2, 64, 1), dtype=torch.uint8))
+        self.register_buffer("down_blocks", torch.zeros((2, 32, 1, 16), dtype=torch.uint8))
+        self.register_buffer("down_scales", torch.zeros((2, 32, 1), dtype=torch.uint8))
+        self.register_buffer("gate_up_bias", torch.zeros((2, 64), dtype=torch.float32))
+        self.register_buffer("down_bias", torch.zeros((2, 32), dtype=torch.float32))
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        selected_experts: torch.Tensor,
+        routing_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.ops.auto_deploy.torch_mxfp4_moe_from_routing(
+            hidden_states=hidden_states,
+            selected_experts=selected_experts,
+            routing_weights=routing_weights,
+            gate_up_blocks=self.gate_up_blocks,
+            gate_up_bias=self.gate_up_bias,
+            gate_up_scales=self.gate_up_scales,
+            alpha=1.0,
+            limit=10.0,
+            down_blocks=self.down_blocks,
+            down_bias=self.down_bias,
+            down_scales=self.down_scales,
+            gate_up_order="up_gate",
+            swiglu_mode="deepseek",
         )
 
 
@@ -576,6 +610,23 @@ def test_mxfp4_transform_backend_selector_prefers_torch_for_checkpoint_layout() 
         )._resolve_backend({"expert_quant_method": "mxfp4"}, object())
         == "triton"
     )
+
+
+def test_mxfp4_target_names_from_node_uses_op_schema_names_for_kwargs() -> None:
+    gm = torch.fx.symbolic_trace(_Mxfp4KwargRuntimeModule())
+    node = next(
+        n
+        for n in gm.graph.nodes
+        if n.op == "call_function"
+        and n.target == torch.ops.auto_deploy.torch_mxfp4_moe_from_routing
+    )
+
+    assert _mxfp4_target_names_from_node(node) == {
+        "gate_up_blocks": "gate_up_blocks",
+        "gate_up_scales": "gate_up_scales",
+        "down_blocks": "down_blocks",
+        "down_scales": "down_scales",
+    }
 
 
 def test_mxfp4_transform_resolves_expert_block_size_and_rejects_unsupported() -> None:
