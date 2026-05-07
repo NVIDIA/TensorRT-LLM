@@ -427,10 +427,6 @@ class BatchInfo:
         return self._batch_info_host
 
     def update(self, batch_info: List[int]) -> None:
-        # Hot path: a 6-element Python list assignment per decode iteration. Going
-        # through the numpy view avoids torch.as_tensor allocation + slice-copy
-        # dispatcher overhead — line_profiler showed this line at ~24% of
-        # nest_sequences (312 us/call -> ~5 us/call after this change).
         if self._batch_info_np is not None:
             self._batch_info_np[:6] = batch_info
         else:
