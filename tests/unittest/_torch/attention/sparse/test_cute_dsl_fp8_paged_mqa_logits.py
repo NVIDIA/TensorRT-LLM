@@ -253,8 +253,26 @@ def test_cute_dsl_fp8_paged_mqa_logits(
 
     num_sms = torch.cuda.get_device_properties(0).multi_processor_count
 
-    # DSL kernel always uses full num_sms as grid size.
-    dsl_schedule_meta = get_paged_mqa_logits_metadata(data["context_lens"], block_kv, num_sms)
+    # New DeepGEMM `get_paged_mqa_logits_metadata` arg conventions on SM100:
+    #
+    # 1) `context_lens` must be 2D. Passing (B, 1) makes the wrapper see
+    #    `next_n = size(1) = 1` and compute `num_next_n_atoms = 1`, which
+    #    matches DSL's 1-atom-per-q design (DSL always processes all real
+    #    next_n positions in one atom regardless of value).
+    #
+    # 2) `block_kv` arg must be 64 — independent of the physical cache page
+    #    size. The metadata kernel computes `SPLIT_KV = block_kv * 4` (the
+    #    multiplier 4 is hardcoded in DeepGEMM's JIT impl, not arch-aware
+    #    on SM100 since #304). Both DSL and DG compute kernels assume
+    #    `SPLIT_KV = 256` (DG hardcodes it at apis/attention.hpp:353; DSL
+    #    expects compute_tile=128 × kNumMathWarpGroups=2 = 256). So
+    #    metadata must give SPLIT_KV=256 → `block_kv = 256 / 4 = 64`.
+    #    Production passes `tokens_per_block` here, which equals 64 by
+    #    DSV3 indexer-cache convention.
+    DG_METADATA_BLOCK_KV = 64
+    dsl_schedule_meta = get_paged_mqa_logits_metadata(
+        data["context_lens"].unsqueeze(-1), DG_METADATA_BLOCK_KV, num_sms
+    )
 
     ref_logits = _ref_fp8_paged_mqa_logits(
         data["q_fp8"],
@@ -341,7 +359,6 @@ def test_cute_dsl_fp8_paged_mqa_logits_multi_block(
     separate TMA copies per compute tile to fill the 128-token SMEM.
     """
     head_dim = 128
-    compute_block_kv = 128
     max_model_len = max(avg_ctx * 2, 2048)
     output_dtype = torch.float32
 
@@ -360,8 +377,14 @@ def test_cute_dsl_fp8_paged_mqa_logits_multi_block(
 
     num_sms = torch.cuda.get_device_properties(0).multi_processor_count
 
+    # See `test_cute_dsl_fp8_paged_mqa_logits` above for the full reasoning.
+    # Short version: DG metadata wrapper requires 2D context_lens, and
+    # `block_kv` arg must be 64 (yields SPLIT_KV = 64 * 4 = 256, matching
+    # DSL's compute-tile expectation). Independent of `phys_block_kv` /
+    # `compute_block_kv` of the test cache.
+    DG_METADATA_BLOCK_KV = 64
     dsl_schedule_meta = get_paged_mqa_logits_metadata(
-        data["context_lens"], compute_block_kv, num_sms
+        data["context_lens"].unsqueeze(-1), DG_METADATA_BLOCK_KV, num_sms
     )
 
     ref_logits = _ref_fp8_paged_mqa_logits(
@@ -582,9 +605,16 @@ def benchmark_fp8_paged_mqa_logits(
                     varlen=varlen,
                 )
 
-                # DSL scheduler counts compute tiles (always 128), not pages.
+                # See `test_cute_dsl_fp8_paged_mqa_logits` for full reasoning
+                # on the `block_kv = 64` choice. Short version: DG metadata
+                # SPLIT_KV = block_kv * 4; we need SPLIT_KV = 256 (DSL
+                # compute tile = 128 × kNumMathWarpGroups = 2), so pass 64.
+                # 2D `(B, 1)` context_lens forces num_next_n_atoms = 1.
+                DG_METADATA_BLOCK_KV = 64
                 dsl_schedule_meta = get_paged_mqa_logits_metadata(
-                    data["context_lens"], compute_block_kv, num_sms
+                    data["context_lens"].unsqueeze(-1),
+                    DG_METADATA_BLOCK_KV,
+                    num_sms,
                 )
 
                 def dsl_fn(data=data):
@@ -625,20 +655,34 @@ def benchmark_fp8_paged_mqa_logits(
                         }
                         dg_next_n = 1
 
-                    num_kv_multicast = 2 if dg_next_n == 4 else 1
-                    num_clusters = num_sms // num_kv_multicast
-                    # block_kv arg ignored by DG (scheduler uses compute tile
-                    # internally); differs from DSL only in num_clusters.
+                    # SM100 always uses num_kv_multicast=1 in upgraded DeepGEMM
+                    # (cluster(2,1,1) for next_n=4 was removed). Atom-split is
+                    # encoded in metadata via num_next_n_atoms which the wrapper
+                    # derives from context_lens.size(1).
+                    num_clusters = num_sms
+                    # 2D context_lens shape (B, dg_next_n): for dg_next_n>1 the
+                    # wrapper computes `num_next_n_atoms = dg_next_n / next_n_atom_size`
+                    # which DG's compute kernel expects. All next_n positions
+                    # of a batch share the same KV length here (broadcast via
+                    # expand) — TRT-LLM does the same in production.
+                    dg_ctx_2d = (
+                        dg_data["context_lens"].unsqueeze(-1).expand(-1, dg_next_n).contiguous()
+                    )
+                    # `block_kv = 64` for the same reason as the DSL path:
+                    # metadata SPLIT_KV = block_kv * 4 must equal DG compute
+                    # kernel's hardcoded SPLIT_KV = 256 (apis/attention.hpp:353).
+                    # Independent of `compute_block_kv` of the test cache.
+                    DG_METADATA_BLOCK_KV = 64
                     dg_schedule_meta = get_paged_mqa_logits_metadata(
-                        dg_data["context_lens"], compute_block_kv, num_clusters
+                        dg_ctx_2d, DG_METADATA_BLOCK_KV, num_clusters
                     )
 
-                    def dg_fn(dg_data=dg_data):
+                    def dg_fn(dg_data=dg_data, dg_ctx_2d=dg_ctx_2d):
                         fp8_paged_mqa_logits(
                             dg_data["q_fp8"],
                             dg_data["kv_fused"],
                             dg_data["weights"],
-                            dg_data["context_lens"],
+                            dg_ctx_2d,
                             dg_data["block_table"],
                             dg_schedule_meta,
                             dg_data["max_model_len"],

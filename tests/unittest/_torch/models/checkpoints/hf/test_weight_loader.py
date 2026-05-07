@@ -11,7 +11,7 @@ class MyError(Exception):
 
 
 @pytest.mark.parametrize(
-    "dir_name, safetensor_filenames, expected_safetensor_filenames",
+    "dir_name, safetensor_filenames, expected_safetensor_filenames, use_consolidated",
     [
         (
             "foo",
@@ -21,6 +21,18 @@ class MyError(Exception):
                 "consolidated.safetensors",
             ],
             ["model-00001-of-00002.safetensors", "model-000002-of-00002.safetensors"],
+            False,
+        ),
+        # If use_consolidated specified explicitly.
+        (
+            "foo",
+            [
+                "model-00001-of-00002.safetensors",
+                "model-000002-of-00002.safetensors",
+                "consolidated.safetensors",
+            ],
+            ["consolidated.safetensors"],
+            True,
         ),
         (
             "foo",
@@ -29,12 +41,14 @@ class MyError(Exception):
                 "foo-consolidated.safetensors",
             ],
             [f"model-0000{i}-of-00010.safetensors" for i in range(1, 11)],
+            False,
         ),
         # If there is only a consolidated safetensor, that one should still be used.
         (
             "foo",
             ["consolidated.safetensors"],
             ["consolidated.safetensors"],
+            False,
         ),
         # If the directory contains "consolidated" in its name, but its contents are sharded tensors.
         (
@@ -45,6 +59,7 @@ class MyError(Exception):
                 "consolidated.safetensors",
             ],
             ["model-00001-of-00002.safetensors", "model-000002-of-00002.safetensors"],
+            False,
         ),
     ],
 )
@@ -53,6 +68,7 @@ def test_load_weights_ignores_consolidated_ckpt_when_sharded_ckpt_exists(
     dir_name: str,
     safetensor_filenames: list[str],
     expected_safetensor_filenames: list[str],
+    use_consolidated: bool,
 ):
     checkpoint_dir = tmp_path / dir_name
     checkpoint_dir.mkdir()
@@ -70,7 +86,9 @@ def test_load_weights_ignores_consolidated_ckpt_when_sharded_ckpt_exists(
         mock.patch.object(loader, "prefetch_files") as prefetch_files,
         pytest.raises(MyError),
     ):
-        loader.load_weights(checkpoint_dir=str(checkpoint_dir), mapping=Mapping())
+        loader.load_weights(
+            checkpoint_dir=str(checkpoint_dir), mapping=Mapping(), use_consolidated=use_consolidated
+        )
 
     prefetch_files.assert_called_once()
     prefetched_files = prefetch_files.call_args[0][0]

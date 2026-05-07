@@ -11,6 +11,7 @@ from typing_extensions import Self
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
+
     from ..speculative.interface import SpecMetadata
     from ..speculative.spec_tree_manager import SpecTreeManager
 
@@ -672,6 +673,74 @@ class CustomAttentionMask(str, Enum):
 AttentionMask = Union[PredefinedAttentionMask, CustomAttentionMask]
 
 
+@dataclass(kw_only=True, slots=True)
+class AttentionForwardArgs:
+    """Per-forward optional arguments for attention backends."""
+
+    output: Optional[torch.Tensor] = None
+    output_sf: Optional[torch.Tensor] = None
+
+    out_scale: Optional[torch.Tensor] = None
+    out_scale_sf: Optional[torch.Tensor] = None
+    kv_scales_sf: Optional[torch.Tensor] = None
+    kv_scales_sf_inv: Optional[torch.Tensor] = None
+
+    attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL
+    attention_input_type: AttentionInputType = AttentionInputType.mixed
+    attention_window_size: Optional[int] = None
+    attention_mask_data: Optional[torch.Tensor] = None
+    attention_sinks: Optional[torch.Tensor] = None
+
+    latent_cache: Optional[torch.Tensor] = None
+    q_pe: Optional[torch.Tensor] = None
+    mrope_config: Optional[dict] = None
+
+    softmax_stats_tensor: Optional[torch.Tensor] = None
+    chunked_prefill_buffer_batch_size: int = 1
+
+    cu_q_seqlens: Optional[torch.Tensor] = None
+    cu_kv_seqlens: Optional[torch.Tensor] = None
+    fmha_scheduler_counter: Optional[torch.Tensor] = None
+
+    mla_bmm1_scale: Optional[torch.Tensor] = None
+    mla_bmm2_scale: Optional[torch.Tensor] = None
+    quant_q_buffer: Optional[torch.Tensor] = None
+
+    sage_attn_num_elts_per_blk_q: int = 0
+    sage_attn_num_elts_per_blk_k: int = 0
+    sage_attn_num_elts_per_blk_v: int = 0
+    sage_attn_qk_int8: bool = False
+
+    enable_attn_nvfp4_output: bool = True
+    topk_indices: Optional[torch.Tensor] = None
+    is_generation: bool = False
+
+
+_ATTENTION_FORWARD_ARGS_FIELDS = frozenset(
+    AttentionForwardArgs.__dataclass_fields__)
+
+
+def merge_attention_forward_args(
+    forward_args: Optional[AttentionForwardArgs],
+    kwargs: Dict[str, Any],
+) -> AttentionForwardArgs:
+    """Merge legacy attention kwargs into explicit forward arguments."""
+
+    unknown_kwargs = sorted(set(kwargs) - _ATTENTION_FORWARD_ARGS_FIELDS)
+    if unknown_kwargs:
+        raise ValueError(
+            f"Unknown attention forward arguments: {unknown_kwargs}")
+
+    if forward_args is not None:
+        if kwargs:
+            raise ValueError(
+                "Pass attention forward options either through forward_args "
+                f"or as legacy kwargs, not both: {sorted(kwargs)}")
+        return forward_args
+
+    return AttentionForwardArgs(**kwargs)
+
+
 class AttentionBackend(Generic[TMetadata]):
     """
     Base class for attention backends.
@@ -685,7 +754,6 @@ class AttentionBackend(Generic[TMetadata]):
         head_dim: int,
         num_kv_heads: Optional[int] = None,
         quant_config: Optional[QuantConfig] = None,
-        skip_create_weights_in_init: bool = False,
         sparse_attention_config: Optional["SparseAttentionConfig"] = None,
         **kwargs,
     ):
@@ -719,8 +787,7 @@ class AttentionBackend(Generic[TMetadata]):
                 k: Optional[torch.Tensor],
                 v: Optional[torch.Tensor],
                 metadata: TMetadata,
-                *,
-                attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
+                forward_args: Optional[AttentionForwardArgs] = None,
                 **kwargs) -> torch.Tensor:
         """
         Update KV Cache and perform the attention operation.
@@ -733,7 +800,7 @@ class AttentionBackend(Generic[TMetadata]):
             v (Optional[torch.Tensor]): Value tensor with shape (num_new_kv_tokens, num_kv_heads * head_dim),
                                         or None if QKV tensor is provided, or there's no new kv token.
             metadata (AttentionMetadata): Metadata for the attention operation.
-            attention_mask (AttentionMask): Attention mask. See definition of `AttentionMask` for accepted types. Defaults to predefined causal mask.
+            forward_args (AttentionForwardArgs): Per-forward optional attention arguments.
         Returns:
             torch.Tensor with shape (num_q_tokens, num_heads * head_dim)
         """

@@ -13,7 +13,6 @@ from tensorrt_llm.llmapi.llm_args import (
     TorchLlmArgs,
     _ParallelConfig,
 )
-from tensorrt_llm.mapping import Mapping
 
 from . import config as _ad_config_pkg
 from .models import ModelFactory, ModelFactoryRegistry
@@ -422,40 +421,32 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         sharding_config = (
             ash if ash.get("enabled", False) else self.transforms.get("detect_sharding", {})
         )
-        dist_mapping_config = sharding_config.get("dist_mapping", {})
+        dist_mapping = sharding_config.get("dist_mapping", {})
         enable_attention_dp = sharding_config.get("enable_attention_dp", False)
+        allreduce_strategy = sharding_config.get("allreduce_strategy", "NCCL")
 
         if enable_attention_dp:
-            moe_ep_size = self.world_size
-            moe_tp_size = 1
+            # Attention-DP forces EP-only MoE topology regardless of YAML moe_tp/moe_ep.
+            dist_mapping = {**dist_mapping, "moe_ep": self.world_size, "moe_tp": 1}
             ad_logger.info(
-                f"Attention-DP with EP-only MoE: moe_ep_size={moe_ep_size}, moe_tp_size={moe_tp_size}"
+                f"Attention-DP with EP-only MoE: moe_ep_size={self.world_size}, moe_tp_size=1"
             )
-        else:
-            moe_tp_size = dist_mapping_config.get("moe_tp", 1)
-            moe_ep_size = dist_mapping_config.get("moe_ep", self.world_size)
 
         try:
-            dc = DistConfig(
-                world_size=world_size,
+            dc = DistConfig.from_sharding_params(
                 rank=rank,
-                tp_size=dist_mapping_config.get("tp", self.world_size),
-                moe_tp_size=moe_tp_size,
-                moe_ep_size=moe_ep_size,
-                moe_cluster_size=dist_mapping_config.get("moe_cluster", 1),
+                world_size=world_size,
+                dist_mapping=dist_mapping,
                 enable_attention_dp=enable_attention_dp,
+                allreduce_strategy=allreduce_strategy,
             )
         except ValueError as e:
             raise ValueError(
                 f"Invalid parallel grid config: {e}. "
-                f"Please check your dist_mapping configuration: {dist_mapping_config}"
+                f"Please check your dist_mapping configuration: {dist_mapping}"
             ) from e
 
         return dc
-
-    def init_mapping_from_config(self, rank: int, world_size: int) -> Mapping:
-        """Build a Mapping for external APIs that still require it."""
-        return self.init_dist_config(rank, world_size).to_mapping()
 
     ### PRIVATE METHODS ############################################################################
     @classmethod

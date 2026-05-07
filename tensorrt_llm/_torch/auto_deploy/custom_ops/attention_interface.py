@@ -1061,7 +1061,13 @@ class SequenceInfo:
                         tnsr_like = torch.cat(tnsr_like)
                     else:
                         tnsr_like = tnsr_like[0]
-                self._extra_args[name] = tnsr_like.to(self.device, non_blocking=True)
+                if tnsr_like.device.type == "cpu":
+                    tnsr_like = tnsr_like.contiguous()
+                # Extra args are small model/runtime metadata tensors that currently bypass
+                # the pinned host staging path used by the core attention inputs. Copy them
+                # synchronously so the source tensor lifetime cannot race the next executor
+                # step under overlap scheduling.
+                self._extra_args[name] = tnsr_like.to(self.device, non_blocking=False)
             else:
                 self._extra_args[name] = None
 
@@ -1158,15 +1164,6 @@ class SequenceInfo:
         ### UPDATE REQUIRED INPUTS #################################################################
         # set new input_ids and make sure to flatten it
         self._stage_arg("input_ids", input_ids, reset_val=0)
-
-        # position_ids for each sequence is in the range [input_pos, input_pos + seq_len - 1]
-        ip_np = ip_host.numpy()
-        sl_np = sl_host.numpy()
-        base = np.repeat(ip_np, sl_np)
-        group_starts = np.repeat(np.cumsum(sl_np) - sl_np, sl_np)
-        offsets = np.arange(sl_np.sum()) - group_starts
-        position_ids = torch.from_numpy(base + offsets)  # zero-copy back
-        self._stage_arg("position_ids", position_ids)
 
         ### UPDATE EXTRA INPUTS ####################################################################
         self._extra_args = {}
