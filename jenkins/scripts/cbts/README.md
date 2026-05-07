@@ -56,14 +56,16 @@ jenkins/scripts/cbts/
 ├── README.md              this file
 ├── main.py                CLI entry + Selector + SelectionResult + scope combine + trigger-mode filter
 ├── blocks.py              YAML index + path/waive lookup + filtered tmp test-db generation + per-stage count
-└── rules/
-    ├── README.md          per-rule logic
-    ├── base.py            Rule ABC + PRInputs + RuleResult
-    ├── _helpers.py        diff iteration + lookup-into-block_filters + stages_by_yaml_stem
-    ├── waives_rule.py
-    ├── tests_def_rule.py
-    ├── test_list_rule.py
-    └── out_of_scope_rule.py
+├── rules/
+│   ├── README.md          per-rule logic
+│   ├── base.py            Rule ABC + PRInputs + RuleResult
+│   ├── _helpers.py        diff iteration + lookup-into-block_filters + stages_by_yaml_stem
+│   ├── waives_rule.py
+│   ├── tests_def_rule.py
+│   ├── test_list_rule.py
+│   └── out_of_scope_rule.py
+└── tools/
+    └── dryrun.py          replay CBTS over historical commits → per-PR summary.txt + filtered YAMLs + INDEX.md (debug only)
 ```
 
 ## Lookup algorithms
