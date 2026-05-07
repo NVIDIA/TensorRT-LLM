@@ -211,7 +211,11 @@ class TrtllmGenSupportChecker:
                 )
 
         if phase in ("generation", "both"):
-            if beam_width != 1:
+            # Self-attention beam search needs cache indirection support in the
+            # decode kernel. Cross-attention reuses the same encoder K/V across
+            # beams and does not append to the cross cache during generation,
+            # so it can run as a widened batch without beam indirection.
+            if beam_width != 1 and not cross_attention:
                 return (
                     False,
                     f"[Generation] Beam search (beam_width={beam_width}) is not supported. Must be 1.",
@@ -1825,10 +1829,14 @@ def trtllm_gen_attention(
     else:
         out_head_size = head_size
     out_tensor = output.view(num_tokens, num_heads, out_head_size)
+    # Cross-attention metadata is already expanded to one row per decoder
+    # beam. Treat those rows as a widened batch, matching the legacy TensorRT
+    # plugin, instead of applying self-attention beam cache indirection.
+    kernel_beam_width = 1 if is_cross else beam_width
 
     max_attn_window_size = (
         attention_window_size
-        if beam_width == 1
+        if kernel_beam_width == 1
         else (cache_indirection.size(2) if cache_indirection is not None else attention_window_size)
     )
     cyclic_attn_window_size = attention_window_size
@@ -1958,8 +1966,8 @@ def trtllm_gen_attention(
             num_tokens=num_gen_tokens,
             seq_offset=seq_offset,
             input_seq_length=input_seq_length,
-            beam_width=beam_width,
-            num_requests=num_seqs // beam_width,
+            beam_width=kernel_beam_width,
+            num_requests=num_seqs // kernel_beam_width,
             predicted_tokens_per_seq=predicted_tokens_per_seq,
             spec_decoding_generation_lengths=spec_gen_lengths,
             spec_decoding_position_offsets=spec_pos_offsets,

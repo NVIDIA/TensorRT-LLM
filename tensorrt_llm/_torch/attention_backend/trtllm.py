@@ -542,6 +542,10 @@ class TrtllmAttentionWrapper:
             self.skip_softmax_stat.zero_()
 
         out_scale = self.out_scale_sf if self.use_nvfp4_output else self.out_scale
+        # Match the legacy TensorRT plugin: cross-attention treats beam rows as
+        # an already-expanded batch and must not apply self-attention beam cache
+        # indirection while reading the read-only encoder K/V cache.
+        kernel_beam_width = 1 if is_cross else self.beam_width
 
         helix_active = self.helix_position_offsets is not None
         # Cross-attention is supported on two sub-paths:
@@ -565,7 +569,7 @@ class TrtllmAttentionWrapper:
                 is_padded=False,
                 use_paged_kv_cache=(self.kv_cache_block_offsets is not None),
                 tokens_per_block=self.tokens_per_block,
-                beam_width=self.beam_width,
+                beam_width=kernel_beam_width,
                 position_shift_enabled=False,
                 sink_token_length=self.sink_token_length,
                 cross_attention=is_cross,
@@ -619,7 +623,7 @@ class TrtllmAttentionWrapper:
                 self.max_context_length,
                 self.attention_window_size,
                 self.sink_token_length,
-                self.beam_width,
+                kernel_beam_width,
                 int(mask_type),
                 self.quant_mode,
                 self.q_scaling,
@@ -669,26 +673,32 @@ class TrtllmAttentionWrapper:
                 encoder_seq_lens=encoder_seq_lens,
             )
         else:
-            # Cross-attention legacy sub-path (Step 5β). Pack the encoder K/V
-            # projections produced on the Python side into a single
-            # ``[num_encoder_tokens, 2 * num_kv_heads * head_size]`` tensor so
-            # the C++ qkv_preprocessing kernel can lay them out into the
-            # cross-KV pool (mirrors the trtllm_gen sub-path). For the
-            # generation step k and v are None (KV is already cached) and
-            # cross_kv is therefore also None; the kernel reads encoder K/V
-            # straight from the paged cross pool.
+            # Cross-attention legacy sub-path (Step 5β). Pack encoder K/V from
+            # context into ``cross_kv`` so C++ can lay it out in the cross-KV
+            # pool. During generation ``k``/``v`` are None and C++ reads the
+            # already cached encoder K/V through the same cross-attention path.
             cross_kv_input = None
             if is_cross and k is not None and v is not None:
                 k_flat = k.contiguous().view(k.shape[0], -1)
                 v_flat = v.contiguous().view(v.shape[0], -1)
                 cross_kv_input = torch.cat([k_flat, v_flat], dim=1).contiguous()
-            # Encoder K/V live on the encoder seq dim, which has a different
-            # token count from the decoder Q. The C++ Runner slices ``k``/``v``
-            # by decoder ``token_offset`` so passing them through would index
-            # out of bounds. Drop them — cross_kv carries the data — and tell
-            # the C++ side via the new ``cross_attention`` flag.
+
             k_arg = None if is_cross else k
             v_arg = None if is_cross else v
+            q_arg = q
+            is_fused_qkv_arg = is_fused_qkv
+            if is_cross:
+                # The legacy kernels still index Q with a fused-QKV row
+                # stride in cross-attention mode. K/V are supplied through
+                # cross_kv or the cross cache, so pad the unused K/V columns
+                # to keep batch rows correctly aligned.
+                q_hidden_size = self.num_heads * self.head_size
+                kv_hidden_size = self.num_kv_heads * self.head_size
+                q_arg = q.new_zeros(
+                    (q.shape[0], q_hidden_size + 2 * kv_hidden_size))
+                q_arg[:, :q_hidden_size].copy_(q)
+                is_fused_qkv_arg = True
+
             legacy_attention_kwargs = {}
             if is_cross:
                 legacy_attention_kwargs = {
@@ -697,7 +707,7 @@ class TrtllmAttentionWrapper:
                     "encoder_input_lengths": encoder_seq_lens,
                 }
             thop.attention(
-                q,
+                q_arg,
                 k_arg,
                 v_arg,
                 output,
@@ -722,7 +732,7 @@ class TrtllmAttentionWrapper:
                 self.q_pe,
                 self.block_ids_per_seq,
                 self.attention_sinks,
-                is_fused_qkv,
+                is_fused_qkv_arg,
                 update_kv_cache,
                 self.predicted_tokens_per_seq,
                 self.layer_idx,
@@ -734,7 +744,7 @@ class TrtllmAttentionWrapper:
                 self.max_context_length,
                 self.attention_window_size,
                 self.sink_token_length,
-                self.beam_width,
+                kernel_beam_width,
                 int(mask_type),
                 self.quant_mode,
                 self.q_scaling,
@@ -2105,15 +2115,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )
         self.wrapper.global_layer_idx = self.layer_idx
 
-        # For cross-attention, the per-request encoder K/V lengths live on
-        # ``metadata.seq_lens_kv`` (set by ``create_cross_metadata``). The
-        # device-side int32 view that ``qkv_preprocessing`` expects is the
-        # same tensor used for cu_kv_seqlens / kv_cache offsets, namely
-        # ``kv_lens_cuda_runtime`` — which for the cross-pool metadata
-        # equals encoder_seq_lens during context (no cached encoder K/V) and
-        # encoder_seq_lens during generation (entire encoder K/V cached). We
-        # only pass it when ``is_cross`` to keep self-attention paths
-        # untouched.
+        # For cross-attention, ``kv_lens_cuda_runtime`` is the full encoder
+        # K/V length per decoder row after cached and newly supplied encoder
+        # tokens are combined. That is the length C++ needs both when writing
+        # context K/V into the cross pool and when reading it back during
+        # generation.
         encoder_seq_lens_arg = (metadata.kv_lens_cuda_runtime
                                 if metadata.is_cross else None)
 

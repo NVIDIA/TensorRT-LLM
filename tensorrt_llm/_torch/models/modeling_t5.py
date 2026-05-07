@@ -110,6 +110,13 @@ def _t5_gated_act_fn(config: T5Config):
     return gated_act_fn
 
 
+def _clamp_fp16_infs(hidden_states: torch.Tensor) -> torch.Tensor:
+    if hidden_states.dtype != torch.float16:
+        return hidden_states
+
+    return torch.clamp(hidden_states, min=-64000.0, max=64000.0)
+
+
 def _t5_encoder_num_layers(config: T5Config) -> int:
     return config.num_layers
 
@@ -400,11 +407,13 @@ class T5EncoderLayer(EncoderLayer):
             position_bias=position_bias,
         )
         hidden_states = residual + hidden_states
+        hidden_states = _clamp_fp16_infs(hidden_states)
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+        hidden_states = _clamp_fp16_infs(hidden_states)
 
         return hidden_states
 
@@ -494,6 +503,7 @@ class T5DecoderLayer(EncoderDecoderLayer):
             position_bias=position_bias,
         )
         hidden_states = residual + hidden_states
+        hidden_states = _clamp_fp16_infs(hidden_states)
 
         # Cross-attention (pre-norm)
         residual = hidden_states
@@ -506,12 +516,14 @@ class T5DecoderLayer(EncoderDecoderLayer):
             skip_cross_kv_projection=skip_cross_kv_projection,
         )
         hidden_states = residual + hidden_states
+        hidden_states = _clamp_fp16_infs(hidden_states)
 
         # MLP (pre-norm)
         residual = hidden_states
         hidden_states = self.cross_attn_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+        hidden_states = _clamp_fp16_infs(hidden_states)
 
         return hidden_states
 

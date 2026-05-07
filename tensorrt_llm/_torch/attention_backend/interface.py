@@ -254,7 +254,12 @@ class AttentionMetadata:
         # The model executor sets seqlens to None initially.
         if self._seq_lens_kv is not None:
             self._seq_lens_kv = maybe_pin_memory(self._seq_lens_kv)
-            self._seq_lens_kv_cuda = self._seq_lens_kv.cuda(non_blocking=True)
+            if self.is_cuda_graph and self._seq_lens_kv_cuda is not None:
+                self._seq_lens_kv_cuda.copy_(self._seq_lens_kv,
+                                             non_blocking=True)
+            else:
+                self._seq_lens_kv_cuda = self._seq_lens_kv.cuda(
+                    non_blocking=True)
 
     @property
     def seq_lens_kv_cuda(self):
@@ -438,6 +443,12 @@ class AttentionMetadata:
         """
         cross_md = copy.copy(self)
         cross_md._saved_tensors = {}
+        if self.is_cuda_graph:
+            # Cross-attention has K/V lengths from the encoder, while
+            # self-attention has K/V lengths from the decoder. Keep their
+            # CUDA graph metadata buffers separate so preparing cross metadata
+            # cannot overwrite self-attention sequence lengths.
+            cross_md.cuda_graph_buffers = Buffers()
         cross_md.kv_cache_manager = cross_kv_cache_manager
         cross_md._seq_lens_kv = None
         cross_md._seq_lens_kv_cuda = None
