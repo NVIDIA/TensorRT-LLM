@@ -1962,12 +1962,14 @@ class TestMultimodalAwareChunkingV2:
     def test_snap_down_when_max_context_length_exceeded(self):
         # max_context_length is set from max_num_tokens by V2.
         sched = self._make_sched(chunk_unit_size=4, max_num_tokens=20)
-        req = self._make_mm_req(0, context_remaining=64, mm_runs=[(12, 40)])
-        # Snap-up to 40 exceeds max_context_length=20 → snap-down to 12.
+        # block_size = 22 - 4 = 18 ≤ max_context_length=20 (no impossibility
+        # raise), but round_up(22, 4) = 24 > 20, so snap-up busts max ctx →
+        # snap-down to block_start=4.
+        req = self._make_mm_req(0, context_remaining=64, mm_runs=[(4, 22)])
         out = sched._align_chunk_to_mm_block(
             req, chunk_size=16, remaining_budget=200, context_remaining=64
         )
-        assert out == 12
+        assert out == 4
 
     def test_up_block_end_clamps_to_prompt_end(self):
         """Block runs to (prompt_len-1); round-up of block_end_abs must be
