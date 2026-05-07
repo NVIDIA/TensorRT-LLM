@@ -503,8 +503,7 @@ bool KvCacheManager::_needAdjustment(CacheLevel level) const
     constexpr float kThreshold = 1.25f;
     for (size_t i = 0; i < target.size() && i < current.size(); ++i)
     {
-        if (current[i] == 0.f || target[i] == 0.f)
-            continue;
+        assert(current[i] > 0.f && target[i] > 0.f && "ratios must not be zero");
         float ratio = target[i] / current[i];
         if (ratio < 1.f / kThreshold || ratio > kThreshold)
             return true;
