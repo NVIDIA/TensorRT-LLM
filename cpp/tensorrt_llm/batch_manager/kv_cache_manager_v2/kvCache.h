@@ -441,7 +441,7 @@ private:
     // _basePageIndices[beamIdx][lcId][blockOrdinal] = slotId or BAD
     void _resizePageIndexBuffers(int newNumBlocks);
 
-    KvCacheManager* mManager;
+    std::shared_ptr<KvCacheManager> mManager;
     std::optional<int64_t> mLoraTaskId;
     PriorityCb mPriorityCb;
     std::optional<CUstream> mCudaStream;

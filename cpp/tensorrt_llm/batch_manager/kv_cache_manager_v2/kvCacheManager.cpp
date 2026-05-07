@@ -26,7 +26,6 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <map>
 #include <numeric>
 #include <stdexcept>
@@ -88,16 +87,6 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config)
 
 KvCacheManager::~KvCacheManager()
 {
-    if (!mLivingKvCaches.empty())
-    {
-        // Programming error: all KvCaches must be closed before destroying the manager.
-        // If this fires, the caller forgot to call kvc->close() before deleting the manager.
-        std::fprintf(stderr,
-            "KvCacheManager destroyed with %zu living KvCache(s) — "
-            "all KvCaches must be closed before the manager is destroyed.\n",
-            mLivingKvCaches.size());
-        std::terminate();
-    }
     shutdown();
 }
 
