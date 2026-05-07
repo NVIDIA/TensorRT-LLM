@@ -220,17 +220,13 @@ def generate_seq_lens(batch_size, min_long_seq, num_tokens):
 
 
 # ---------------------------------------------------------------------------
-# Original random-data decode test (verbatim from test_indexer_topk.py)
+# Random-data decode tests (verbatim helper from test_indexer_topk.py, plus
+# regression coverage for the SM-saturation heuristic).
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("batch_size", [1, 64, 512, 2048])
-@pytest.mark.parametrize("next_n", [1, 2])
-@pytest.mark.parametrize("index_topk", [2048, 512, 128])
-@pytest.mark.parametrize("num_tokens", [4096, 8192])
-@pytest.mark.parametrize("compress_ratio", [1, 4])
-def test_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens, compress_ratio):
-    """Verify indexer_topk_decode output matches torch.topk for random logits."""
+def _run_indexer_topk_decode_check(batch_size, next_n, index_topk, num_tokens, compress_ratio):
+    """Run the random-data decode equivalence check against torch.topk."""
     torch.manual_seed(24)
     torch.cuda.manual_seed(24)
     num_gen_tokens = batch_size * next_n
@@ -272,6 +268,33 @@ def test_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens, compres
     assert compare_top_k_results(
         logits, indices, torch_indices, row_starts, row_ends, index_topk
     ), "CUDA top_k_per_row results don't match torch.topk"
+
+
+@pytest.mark.parametrize("batch_size", [1, 64, 512, 2048])
+@pytest.mark.parametrize("next_n", [1, 2])
+@pytest.mark.parametrize("index_topk", [2048, 512, 128])
+@pytest.mark.parametrize("num_tokens", [4096, 8192])
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+def test_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens, compress_ratio):
+    _run_indexer_topk_decode_check(batch_size, next_n, index_topk, num_tokens, compress_ratio)
+
+
+# Regression coverage for the SM-saturation heuristic in indexerTopK decode.
+# Exercises the multi-block split path that was newly enabled for small batches
+# and moderate numColumns (commits 1c88ecd58, 38f9b59b2):
+#   batch_size in {16, 32, 128} bracket the smTarget transitions (>= 9, 5, 2 blocks/row)
+#   num_tokens 4096-32768 with cr in {1, 4} spans both the small-numColumns range
+#   that previously short-circuited to blocksPerRow=1 and the legacy single-block
+#   regime (numCols < 2048 stays single-block via the maxByCols guard).
+@pytest.mark.parametrize("batch_size", [16, 32, 128])
+@pytest.mark.parametrize("next_n", [1, 2])
+@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("num_tokens", [4096, 16384, 32768])
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+def test_indexer_topk_decode_sm_saturation(
+    batch_size, next_n, index_topk, num_tokens, compress_ratio
+):
+    _run_indexer_topk_decode_check(batch_size, next_n, index_topk, num_tokens, compress_ratio)
 
 
 @skip_pre_hopper
