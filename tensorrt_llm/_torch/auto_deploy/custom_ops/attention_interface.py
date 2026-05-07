@@ -417,10 +417,10 @@ class BatchInfo:
         # torch.compile metadata tracing without requiring a real .numpy() view.
         self._batch_info = batch_info_host
         # Cached zero-copy numpy view for fast scalar/list writes on the host path.
-        # `.numpy()` raises on fake tensors, so guard the call.
+        # `.numpy()` raises RuntimeError on fake tensors, so guard the call.
         try:
             self._batch_info_np = batch_info_host.numpy()
-        except Exception:
+        except RuntimeError:
             self._batch_info_np = None
 
     def serialize(self) -> torch.Tensor:
