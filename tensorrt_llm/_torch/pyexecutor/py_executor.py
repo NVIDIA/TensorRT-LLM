@@ -164,10 +164,19 @@ class AsyncTransferManager:
     """
 
     class RequestTransferMetadata:
+        """STOP-GAP metadata for rc13 partial-reuse cleanup.
+
+        `termination_requested` and `resources_freed` bridge the current split
+        where AsyncTransferManager owns transfer pinning, while PyExecutor owns
+        final resource cleanup. Remove them with the follow-up KV reuse lease /
+        cleanup-session work that replaces should_store_blocks + pin=True.
+        """
 
         def __init__(self, block_id: Optional[int]):
             self.block_id = block_id
             self.counter = 0
+            self.termination_requested = False
+            self.resources_freed = False
 
         def start_transfer(self):
             self.counter += 1
@@ -179,6 +188,18 @@ class AsyncTransferManager:
             """
             self.counter -= 1
             return self.counter == 0
+
+    @dataclasses.dataclass
+    class EndTransferResult:
+        """STOP-GAP result for deferred partial-reuse termination.
+
+        `needs_termination` carries a deferred cleanup obligation from the
+        transfer owner back to PyExecutor. Remove it with the follow-up KV
+        reuse lease / cleanup-session work.
+        """
+
+        completed: bool
+        needs_termination: bool = False
 
     def __init__(self,
                  resource_manager: "ResourceManager",
@@ -198,6 +219,20 @@ class AsyncTransferManager:
 
     def requests_in_transfer(self) -> Dict[int, LlmRequest]:
         return self._requests_in_transfer
+
+    def mark_termination_requested(self, request: LlmRequest):
+        metadata = self._request_transfer_metadata.get(request.py_request_id)
+        if metadata is not None:
+            metadata.termination_requested = True
+        else:
+            logger.debug(
+                f"Termination requested for request {request.py_request_id}, "
+                "but it is not tracked by AsyncTransferManager")
+
+    def mark_resources_freed(self, request: LlmRequest):
+        metadata = self._request_transfer_metadata.get(request.py_request_id)
+        if metadata is not None:
+            metadata.resources_freed = True
 
     def start_transfer(self, request: LlmRequest):
         """
@@ -232,14 +267,15 @@ class AsyncTransferManager:
 
         self._request_transfer_metadata[req_id].start_transfer()
 
-    def end_transfer(self, request: LlmRequest) -> bool:
+    def end_transfer(self, request: LlmRequest) -> EndTransferResult:
         """
         Called after a send of KV cache is complete.
         1. Decrements counter for request.
         2. If there are no more inflight transfers for this request, unpin the blocks and mark the request as complete.
 
         Returns:
-            bool: True if the request should be terminated after call to end_transfer
+            EndTransferResult: whether the transfer is complete and whether a
+            deferred termination must be retried now.
         """
         try:
             transfer_metadata = self._request_transfer_metadata[
@@ -248,9 +284,11 @@ class AsyncTransferManager:
             logger.warning(
                 f"Request {request.py_request_id} not found in transfer manager"
             )
-            return False
+            return self.EndTransferResult(completed=False)
 
         if transfer_metadata.end_transfer():
+            needs_termination = (transfer_metadata.termination_requested
+                                 and not transfer_metadata.resources_freed)
             self._requests_in_transfer.pop(request.py_request_id)
             self._request_transfer_metadata.pop(request.py_request_id)
 
@@ -262,9 +300,10 @@ class AsyncTransferManager:
             if request.state != LlmRequestState.DISAGG_TRANS_ERROR:
                 request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
 
-            return True
+            return self.EndTransferResult(completed=True,
+                                          needs_termination=needs_termination)
 
-        return False
+        return self.EndTransferResult(completed=False)
 
     def has_any_inflight_requests(self) -> bool:
         return len(self._requests_in_transfer) > 0
@@ -668,16 +707,19 @@ class PyExecutor:
                 # participate.
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
-            if self.async_transfer_manager.end_transfer(request):
+            transfer_result = self.async_transfer_manager.end_transfer(request)
+            if transfer_result.completed:
                 self.active_requests.remove(request)
                 self._terminate_request(request)
             return
-        if self.async_transfer_manager.end_transfer(request):
-            # When should_store_blocks is True, _handle_responses already
-            # terminated this request via the early-termination path
-            # (enable_partial_reuse_for_disagg branch). Skip the redundant
-            # termination to avoid double free_resources calls.
-            if not self.async_transfer_manager.should_store_blocks:
+        transfer_result = self.async_transfer_manager.end_transfer(request)
+        if transfer_result.completed:
+            # When should_store_blocks is True, _handle_responses normally owns
+            # the early termination path. However, termination can be deferred
+            # while context transfer is still in progress; retry it now that
+            # C++ reports the transfer terminal.
+            if (not self.async_transfer_manager.should_store_blocks
+                    or transfer_result.needs_termination):
                 self._terminate_request(request)
 
     def _flush_pending_transfer_responses(self):
@@ -3901,12 +3943,19 @@ class PyExecutor:
 
     def _can_terminate_request_now(self, request: LlmRequest) -> bool:
         if request.is_disagg_context_transmission_state:
-            logger.warning(
+            # STOP-GAP: partial reuse asks _handle_responses to terminate
+            # completed context requests before async KV transfer has always
+            # drained. Remember the failed attempt so
+            # _end_transfer_and_maybe_terminate retries exactly once after C++
+            # reports transfer completion. Remove this handoff with the
+            # follow-up KV reuse lease / cleanup-session work.
+            self.async_transfer_manager.mark_termination_requested(request)
+            logger.debug(
                 f"Deferring termination for request {request.py_request_id} "
                 "because context KV transfer is still in progress")
             return False
         if request.is_disagg_generation_transmission_in_progress:
-            logger.warning(
+            logger.debug(
                 f"Deferring termination for request {request.py_request_id} "
                 "because generation KV transfer is still in progress")
             return False
@@ -3934,6 +3983,7 @@ class PyExecutor:
 
     def _do_terminate_request(self, request: LlmRequest):
         self.resource_manager.free_resources(request)
+        self.async_transfer_manager.mark_resources_freed(request)
 
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
