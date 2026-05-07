@@ -264,7 +264,12 @@ def load_pretrained_config(model_name_or_path: str,
     model_type = config_dict.get("model_type")
     architectures = config_dict.get("architectures") or []
 
-    if model_type in _CONFIG_REGISTRY:
+    if checkpoint_format in ("mistral", "mistral_large_3"):
+        from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
+            MistralConfigLoader
+        model_config = MistralConfigLoader().load(
+            model_name_or_path).pretrained_config
+    elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,
                                                     **kwargs)
@@ -278,12 +283,6 @@ def load_pretrained_config(model_name_or_path: str,
                             )):
         model_config = transformers.Qwen3NextConfig.from_dict(
             _Qwen35ConfigCompat.normalize(config_dict))
-    elif checkpoint_format in ("mistral", "mistral_large_3"):
-        from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
-            MistralConfigLoader
-        model_config = getattr(
-            MistralConfigLoader().load(model_name_or_path).pretrained_config,
-            "text_config")
     else:
         model_config = transformers.AutoConfig.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code)

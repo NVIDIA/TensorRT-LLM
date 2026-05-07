@@ -24,16 +24,13 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
     "SAVE_NEW_VALUE": lambda args: args["v_new"] is not None,
     "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
 })
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-#         for num_warps in [2, 4]
-#         for num_stages in [2, 3, 4]
-#         for BV in [32, 64]
-#     ],
-#     key=["H", "K", "V", "BT", "USE_G"],
-#     use_cuda_graph=use_cuda_graph,
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({"BV": BV}, num_warps=nw, num_stages=ns)
+        for nw in NUM_WARPS for ns in [2, 3, 4] for BV in [32, 64]
+    ],
+    key=["H", "K", "V", "BT", "USE_G"],
+)
 @triton.jit(do_not_specialize=["T"])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     k,
@@ -307,9 +304,6 @@ def chunk_gated_delta_rule_fwd_h(
         K=K,
         V=V,
         BT=BT,
-        BV=32,
-        num_warps=4,
-        num_stages=2,
     )
     if output_final_state and use_indexed_state:
         # The indexed kernel path updates h0 in-place, so returning
