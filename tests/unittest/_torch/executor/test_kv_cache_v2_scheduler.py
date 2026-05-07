@@ -1016,8 +1016,7 @@ class TestEncoder:
         """Encoder admission must not touch either KV pool.
 
         This guards the dual-pool contract: both self- and cross-pool
-        allocation are decoder-context responsibilities in the stage-1
-        next-iteration flow.
+        allocation are decoder-context responsibilities.
         """
         self_mgr = make_kv_cache_manager()
         enc_dec_mgr = make_kv_cache_manager()

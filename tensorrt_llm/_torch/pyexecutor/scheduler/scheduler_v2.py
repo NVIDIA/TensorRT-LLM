@@ -388,10 +388,9 @@ class KVCacheV2Scheduler(RequestScheduler):
     ) -> tuple[ScheduleAction, int]:
         """Try to schedule an encoder request.
 
-        Stage-1 next-iteration dispatch means encoder admission does not
-        need KV blocks for same-iteration decoder work. Decoder context is
-        the first step that reserves self- and cross-KV blocks and writes K/V
-        projections into the cross cache.
+        Encoder admission does not need KV blocks for decoder work. Decoder
+        context is the first step that reserves self- and cross-KV blocks and
+        writes K/V projections into the cross cache.
 
         Returns ``(action, tokens)`` where *tokens* is meaningful only
         when *action* is ``SCHEDULED``.

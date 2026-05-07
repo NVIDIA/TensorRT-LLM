@@ -146,10 +146,7 @@ def test_model_config_sets_is_encoder_decoder_from_pretrained_config():
 def test_validate_encoder_decoder_kv_cache_config_accepts_v1_enc_dec():
     """V1 KVCacheManager is the default and production target for enc-dec models.
 
-    The historical V2-only assertion has been removed in Step 5 of the
-    encoder-decoder porting work; both V1 (default) and V2 (additive
-    secondary path) are now accepted as long as ``cross_kv_cache_fraction``
-    is set.
+    Both V1 and V2 are supported as long as ``cross_kv_cache_fraction`` is set.
     """
     model_config = ModelConfig(
         pretrained_config=make_pretrained_config(

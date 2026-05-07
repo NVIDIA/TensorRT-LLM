@@ -18,8 +18,8 @@ Tests that modules can be constructed and run forward passes on dummy tensors.
 Most cases use the VANILLA attention backend for isolated unit testing; the
 TRTLLM cross-attention tests additionally validate cached-KV correctness
 against the VANILLA reference. The TRTLLM cross-attn path runs on Blackwell
-via the ``trtllm_gen`` sub-path (Step 5\u03b1) and on Hopper / Ampere / earlier
-via the legacy ``thop.attention`` C++ wrapper extended in Step 5\u03b2.
+via the ``trtllm_gen`` sub-path and on Hopper / Ampere / earlier via the
+legacy ``thop.attention`` C++ wrapper.
 """
 
 import unittest
@@ -175,9 +175,8 @@ def _build_trtllm_cross_metadata(
 
     ``kv_cache_manager_cls`` selects the KV cache manager class for both
     pools (V1 ``KVCacheManager`` or V2 ``KVCacheManagerV2``).  Defaults
-    to V2 to preserve backward compatibility with existing call sites;
-    Step 7 covers the V1 production lane via the parametrized sibling
-    test classes below.
+    to V2 to preserve backward compatibility with existing call sites. The
+    parametrized sibling test classes below cover the V1 production lane.
     """
     from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
     from tensorrt_llm._torch.metadata import KVCacheParams
@@ -274,11 +273,11 @@ def _build_trtllm_cross_metadata(
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestCrossAttentionTrtllmBackend(unittest.TestCase):
-    """Validate Step 5\u03b1 / 5\u03b2: CrossAttention on the TRTLLM backend.
+    """Validate CrossAttention on the TRTLLM backend.
 
     On Blackwell (SM100/SM103) the request flows through the ``trtllm_gen``
-    sub-path (5\u03b1); on Hopper / Ampere / earlier it flows through the legacy
-    ``thop.attention`` sub-path extended in 5\u03b2.
+    sub-path; on Hopper / Ampere / earlier it flows through the legacy
+    ``thop.attention`` sub-path.
 
     Subclasses override ``kv_cache_manager_cls`` to run the same correctness
     cases on the V1 ``KVCacheManager`` (the production lane and default
@@ -475,8 +474,8 @@ class TestCrossAttentionTrtllmBackend(unittest.TestCase):
             for mgr in kv_managers:
                 mgr.shutdown()
 
-        # Tolerances cover both 5α (trtllm-gen on Blackwell) and 5β (legacy
-        # ``thop.attention`` FMHA on Hopper / Ampere / earlier). The two paths
+        # Tolerances cover both trtllm-gen on Blackwell and legacy
+        # ``thop.attention`` FMHA on Hopper / Ampere / earlier. The two paths
         # produce numerically equivalent cross-attention outputs within a
         # BF16-friendly band; we observed up to ``mean_abs ≈ 0.017`` and
         # ``max_abs ≈ 0.06`` on H100 vs the VANILLA SDPA reference, so set
@@ -579,12 +578,12 @@ class TestCrossAttentionTrtllmBackend(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestCrossAttentionTrtllmBackendLegacy(TestCrossAttentionTrtllmBackend):
-    """Validate Step 5\u03b2 cross-attention through the legacy ``thop.attention`` path.
+    """Validate cross-attention through the legacy ``thop.attention`` path.
 
     The wrapper in ``trtllm.py`` prefers the trtllm-gen sub-path whenever
     ``trtllm_gen.is_supported(...)`` returns ``True`` (which it does on
     Blackwell), so on a B200 dev host the inherited tests above only exercise
-    the 5\u03b1 sub-path. To actually run the new C++ plumbing introduced in 5\u03b2
+    the trtllm-gen sub-path. To run the legacy C++ plumbing
     (``cross_attention`` / ``cross_kv`` / ``encoder_input_lengths`` in
     ``cpp/tensorrt_llm/thop/attentionOp.cpp`` + nanobind binding), we force
     ``trtllm_gen.is_supported`` to return ``False`` for the duration of each
@@ -605,7 +604,7 @@ class TestCrossAttentionTrtllmBackendLegacy(TestCrossAttentionTrtllmBackend):
         patcher = patch.object(
             trtllm_backend.trtllm_gen,
             "is_supported",
-            return_value=(False, "forced legacy thop.attention path for 5\u03b2 testing"),
+            return_value=(False, "forced legacy thop.attention path for testing"),
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -617,15 +616,13 @@ class TestCrossAttentionTrtllmBackendLegacy(TestCrossAttentionTrtllmBackend):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestCrossAttentionTrtllmBackendV1(TestCrossAttentionTrtllmBackend):
-    """Step 7: re-run the dual-pool cross-attention suite on V1 ``KVCacheManager``.
+    """Re-run the dual-pool cross-attention suite on V1 ``KVCacheManager``.
 
     V1 is the **default and production target** for encoder-decoder
     deployments (``KvCacheConfig.use_kv_cache_manager_v2=False``); V2 is
     an additive secondary path validated by the base class.  Subclassing
     ``TestCrossAttentionTrtllmBackend`` re-runs the same context /
-    generation correctness cases against the V1 dual-pool stack so the
-    model + backend + cache stack is locked in on both paths before the
-    scheduler and executor bring-up steps land.
+    generation correctness cases against the V1 dual-pool stack.
     """
 
     @classmethod
@@ -637,7 +634,7 @@ class TestCrossAttentionTrtllmBackendV1(TestCrossAttentionTrtllmBackend):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestCrossAttentionTrtllmBackendV1Legacy(TestCrossAttentionTrtllmBackendLegacy):
-    """Step 7: re-run the legacy ``thop.attention`` 5\u03b2 sub-path on V1 ``KVCacheManager``.
+    """Re-run the legacy ``thop.attention`` sub-path on V1 ``KVCacheManager``.
 
     Doubles the V1 production-lane coverage by also forcing the legacy
     ``thop.attention`` sub-path so that Hopper / Ampere / earlier
@@ -654,7 +651,7 @@ class TestCrossAttentionTrtllmBackendV1Legacy(TestCrossAttentionTrtllmBackendLeg
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestCrossAttentionDualPoolSmokeBenchmark(unittest.TestCase):
-    """Step 7 smoke benchmark: V1 dual-pool cross-attention micro-bench.
+    """Smoke benchmark for V1 dual-pool cross-attention.
 
     Times one decoder context cross-attention call followed by one
     decoder generation cross-attention call against the V1 dual-pool
@@ -663,10 +660,9 @@ class TestCrossAttentionDualPoolSmokeBenchmark(unittest.TestCase):
     on CI noise) while still exposing pathological regressions in the
     V1 production lane.
 
-    For sustained throughput / TTFT / TPOT measurements, use
-    ``trtllm-bench`` once the executor bring-up steps land. This bench
-    only validates that the V1 dual-pool model + backend + cache stack
-    boots and runs at a sensible order of magnitude.
+    For sustained throughput / TTFT / TPOT measurements, use ``trtllm-bench``.
+    This bench only validates that the V1 dual-pool model + backend + cache
+    stack boots and runs at a sensible order of magnitude.
     """
 
     def setUp(self):
@@ -889,8 +885,7 @@ class TestBartModules(unittest.TestCase):
         encoder_ids = torch.randint(0, self.hf_config.vocab_size, (enc_len,), device=self.device)
         decoder_ids = torch.randint(0, self.hf_config.vocab_size, (dec_len,), device=self.device)
         # BART position IDs start at offset 2 (padding_idx + 1) per HF convention.
-        # The runtime (Step 9) will handle this; here we use the correct offset
-        # so the test exercises valid embedding indices.
+        # Use the same offset here so the test exercises valid embedding indices.
         offset = 2
         enc_positions = torch.arange(offset, offset + enc_len, device=self.device)
         dec_positions = torch.arange(offset, offset + dec_len, device=self.device)
@@ -1070,11 +1065,11 @@ class TestBartWeightLoading(unittest.TestCase):
         """Load HF BART weights and verify encoder output matches HF exactly.
 
         Full decoder-side numerical parity requires a cross-attention-capable
-        attention backend (Step 4 of the porting plan). The VANILLA backend's
+        attention backend. The VANILLA backend's
         ``no_kv_cache_forward`` path uses ``flash_attn_varlen_func`` with
         identical Q/K sequence lengths, which is incorrect for cross-attention
-        where K/V lengths differ from Q. Once Step 4 lands, the decoder parity
-        test can be tightened.
+        where K/V lengths differ from Q. Decoder parity can be tightened once
+        that path supports mismatched Q and K/V lengths.
 
         This test verifies:
         1. All HF weights load successfully.

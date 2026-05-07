@@ -595,13 +595,11 @@ class PyExecutor:
             self._disagg_pp_termination_handler = DisaggPPTerminationHandler(
                 self.dist, self._do_terminate_request)
 
-        # Encoder-decoder models execute the encoder and decoder in
-        # separate iterations under the stage-1 next-iteration dispatch
-        # (see G1 in ``encoder_decoder_porting_guide.md``).  The encoder
-        # branch lives in ``_executor_loop`` only; ``_executor_loop_overlap``
-        # has not been threaded yet (G3).  Reject pp_size > 1 for parity
-        # with the legacy TRT path (Encoder PP support is intentionally
-        # out of scope for this port).
+        # Encoder-decoder models execute the encoder and decoder in separate
+        # iterations. The encoder branch lives in ``_executor_loop`` only;
+        # ``_executor_loop_overlap`` has not been threaded yet. Reject
+        # pp_size > 1 for parity with the legacy TRT path (Encoder PP support
+        # is intentionally out of scope for this port).
         is_encoder_decoder = bool(
             getattr(getattr(self.model_engine.model, "model_config", None),
                     "is_encoder_decoder", False))
@@ -610,12 +608,12 @@ class PyExecutor:
                 raise NotImplementedError(
                     "pp_size > 1 is not supported for encoder-decoder models "
                     "in the PyTorch flow; encoder send/recv hooks are out of "
-                    "scope for stage-1.  Set pp_size=1 to run T5/BART/mBART.")
+                    "scope. Set pp_size=1 to run T5/BART/mBART.")
             if not self.disable_overlap_scheduler:
                 raise NotImplementedError(
                     "Overlap scheduler is not yet wired for encoder-decoder "
-                    "models (G3 in encoder_decoder_porting_guide.md).  Set "
-                    "disable_overlap_scheduler=True for stage-1 enc-dec runs.")
+                    "models. Set disable_overlap_scheduler=True for "
+                    "encoder-decoder runs.")
 
         if self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
@@ -2440,21 +2438,18 @@ class PyExecutor:
 
                 # Split off encoder-init requests before any decoder-side
                 # preparation so the self-pool ``prepare_resources`` and
-                # the decoder forward step never see them.  Stage-1
-                # dispatches decoder context in a later iteration, so
-                # encoder admission does not need cross-pool blocks for
-                # same-iteration decoder work.
+                # the decoder forward step never see them. Decoder context is
+                # dispatched in a later iteration, so encoder admission does
+                # not need cross-pool blocks for same-iteration decoder work.
                 encoder_requests = self._split_encoder_decoder_context_requests(
                     scheduled_batch)
 
                 # Run the encoder iteration first.  After scatter the
                 # encoder requests transition to ``CONTEXT_INIT`` and are
                 # picked up by the next scheduler iteration as decoder
-                # context (Stage-1 next-iteration dispatch — see G1 in
-                # the encoder-decoder porting guide).  The encoder pass
-                # is independent of the decoder ``can_queue`` gate, so
-                # an iteration with only encoder-init requests still
-                # makes forward progress.
+                # context. The encoder pass is independent of the decoder
+                # ``can_queue`` gate, so an iteration with only encoder-init
+                # requests still makes forward progress.
                 if encoder_requests:
                     self._run_encoder_step(encoder_requests)
 
@@ -3464,8 +3459,7 @@ class PyExecutor:
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, num_fitting
 
     # ---------------------------------------------------------------
-    # Encoder-decoder support (Step 9): encoder iteration in the
-    # executor loop.
+    # Encoder-decoder support: encoder iteration in the executor loop.
     #
     # At a scheduling pass, the capacity scheduler may admit encoder-init
     # requests alongside decoder-context and generation requests, all
@@ -3477,8 +3471,7 @@ class PyExecutor:
     #     through ``ModelEngine.forward_encoder`` on this iteration.
     #     After scatter, they transition to ``CONTEXT_INIT`` and are
     #     re-admitted by the *next* iteration's scheduler pass for the
-    #     decoder context step.  This is the stage-1 next-iteration
-    #     dispatch (G1 in the porting guide).
+    #     decoder context step.
     #
     #   * decoder-context requests (``CONTEXT_INIT`` and disagg-gen-init),
     #     which flow through the normal decoder IFB step.

@@ -650,16 +650,15 @@ class TestKVCacheV2SchedulerCrossParam:
 
 
 # ---------------------------------------------------------------------------
-# Tests: V1 scheduler enc_dec_kv_cache_manager wiring (Step 5)
+# Tests: V1 scheduler enc_dec_kv_cache_manager wiring.
 # ---------------------------------------------------------------------------
 
 
 class TestBindCapacitySchedulerCrossParam:
     """C++-bound V1 ``BindCapacityScheduler`` exposes cross-KV wiring.
 
-    The C++ ``CapacityScheduler`` already accepts a cross manager (legacy
-    enc-dec relies on it).  Step 5 widens the Python wrapper so the V1
-    production path can pass the cross pool and the ENCODER_INIT gating.
+    The C++ ``CapacityScheduler`` already accepts a cross manager. The Python
+    wrapper forwards the cross pool and the ENCODER_INIT gating.
     """
 
     def test_default_cross_is_none_and_default_until_state(self):
@@ -747,7 +746,7 @@ class TestSimpleUnifiedSchedulerCrossParam:
 
 
 # ---------------------------------------------------------------------------
-# Tests: V1 dual-pool smoke test (Step 5)
+# Tests: V1 dual-pool smoke test.
 # ---------------------------------------------------------------------------
 
 

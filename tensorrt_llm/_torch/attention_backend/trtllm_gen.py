@@ -1064,8 +1064,8 @@ class FlashInferTrtllmGenAttention:
         # Cross-attention context phase: K/V come from cross_kv_input
         # (projected encoder hidden states), and `cache_seq_lens` must equal
         # the decoder Q-side lengths so the kernel's `store_encoder_kv_cache`
-        # gate (decoder_seq_len == decoder_cache_seq_len) opens. 5α does not
-        # support chunked cross-attention context.
+        # gate (decoder_seq_len == decoder_cache_seq_len) opens. Chunked
+        # cross-attention context is not supported.
         if params.cross_attention:
             cache_seq_lens_arg = params.context_lengths
         else:

@@ -43,15 +43,8 @@ class CrossAttention(nn.Module):
 
     The cross-attention sub-layer honors ``ModelConfig.attn_backend``: when
     set to ``"TRTLLM"`` it dispatches through the production C++ attention op
-    on every supported architecture. Two sub-paths are wired in:
-
-    * **5α (Blackwell, SM100/SM103)**: ``trtllm_gen`` kernels via
-      ``torch.ops.trtllm.qkv_preprocessing`` + ``torch.ops.trtllm.attention``
-      with ``cross_attention=True``.
-    * **5β (Hopper / Ampere / earlier)**: legacy ``thop.attention`` C++
-      wrapper, extended in ``cpp/tensorrt_llm/thop/attentionOp.cpp`` to
-      forward ``encoder_input_lengths`` / ``cross_kv`` / ``cross_attention``
-      into ``EnqueueContextParams``.
+    on every supported architecture. Blackwell uses the ``trtllm_gen`` kernels,
+    while earlier architectures use the legacy ``thop.attention`` wrapper.
 
     Encoder and decoder self-attention are unaffected and continue to use
     whatever backend ``ModelConfig.attn_backend`` selects.
@@ -145,12 +138,8 @@ class CrossAttention(nn.Module):
             reduce_output=True,
         )
 
-        # Cross-attention backend selection. After Step 5β the ``TRTLLM``
-        # backend supports cross-attention on every architecture: Blackwell
-        # uses the ``trtllm_gen`` sub-path (Step 5α), Hopper / Ampere /
-        # earlier use the legacy ``thop.attention`` sub-path. We therefore
-        # honor ``ModelConfig.attn_backend`` directly, mirroring the behavior
-        # of self-attention.
+        # Cross-attention backend selection honors ``ModelConfig.attn_backend``
+        # directly, mirroring the behavior of self-attention.
         self.attn: AttentionBackend = create_attention(
             config.attn_backend,
             layer_idx,
