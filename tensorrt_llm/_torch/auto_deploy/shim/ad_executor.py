@@ -13,9 +13,11 @@ import copy
 import types
 from collections import abc, defaultdict
 from dataclasses import dataclass
+from itertools import chain
 from types import MethodType, SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from strenum import StrEnum
@@ -840,38 +842,47 @@ class ADEngine(ModelEngine):
         # store cache information for all requests now
         _tokens_per_block = kv_cache_manager.tokens_per_block
         _use_mamba = hasattr(kv_cache_manager, "mamba_cache_index")
-        cache_loc: List[int] = []
-        cu_num_pages: List[int] = [0]
-        extra_page_per_seq: List[int] = []
-        state_slot_idx: List[int] = []
 
         batch_cache_indices = kv_cache_manager.get_batch_cache_indices(
             [r.py_request_id for r in ordered_requests]
         )
 
-        for i, request in enumerate(ordered_requests):
-            # store seq slot idx (use mamba_cache_index if available)
-            request.py_batch_idx = request.py_seq_slot
-            if _use_mamba:
-                state_slot_idx_i = kv_cache_manager.mamba_cache_index[request.py_request_id]
-            else:
-                state_slot_idx_i = request.py_seq_slot
-            state_slot_idx.append(state_slot_idx_i)
+        # py_batch_idx mirror of py_seq_slot — done in one pass, separate from arithmetic.
+        for r in ordered_requests:
+            r.py_batch_idx = r.py_seq_slot
 
-            # get some info on the current request
-            seq_len_i = cu_seqlen[i + 1] - cu_seqlen[i]
-            end_compute_i = input_pos[i] + seq_len_i
-            # Inline get_num_kv_blocks (pure Python, saves function-call overhead per request)
-            num_active_blocks_i = (end_compute_i + _tokens_per_block - 1) // _tokens_per_block
+        # state_slot_idx: branch is constant across the batch, hoist out of the loop.
+        if _use_mamba:
+            mamba_cache_index = kv_cache_manager.mamba_cache_index
+            state_slot_idx: List[int] = [
+                mamba_cache_index[r.py_request_id] for r in ordered_requests
+            ]
+        else:
+            state_slot_idx = [r.py_seq_slot for r in ordered_requests]
 
-            # construct cache information for the current request
-            cache_indices = batch_cache_indices[i]
-            cache_loc.extend(cache_indices[:num_active_blocks_i])
-            cu_num_pages.append(cu_num_pages[i] + num_active_blocks_i)
-            if len(cache_indices) > num_active_blocks_i:
-                extra_page_per_seq.append(cache_indices[num_active_blocks_i])
-            else:
-                extra_page_per_seq.append(-1)
+        # Vectorize the cache-loop math: end_compute = input_pos + seq_len, then per-request
+        # num_active_blocks = ceil(end_compute / tokens_per_block). Doing this in numpy collapses
+        # the per-request Python loop into a few C ops.
+        cu_seqlen_np = np.asarray(cu_seqlen, dtype=np.int64)
+        seq_lens_np = cu_seqlen_np[1:] - cu_seqlen_np[:-1]
+        end_compute_np = np.asarray(input_pos, dtype=np.int64) + seq_lens_np
+        num_active_blocks_np = (end_compute_np + (_tokens_per_block - 1)) // _tokens_per_block
+        num_active_blocks = num_active_blocks_np.tolist()
+
+        # cu_num_pages: prefix sum from 0. Numpy cumsum + concat is one C-level pass.
+        cu_num_pages = [0]
+        cu_num_pages.extend(np.cumsum(num_active_blocks_np).tolist())
+
+        # cache_loc: flat concat of batch_cache_indices[i][:num_active_blocks[i]].
+        # itertools.chain.from_iterable runs the concat in C.
+        cache_loc: List[int] = list(
+            chain.from_iterable(ci[:n] for ci, n in zip(batch_cache_indices, num_active_blocks))
+        )
+
+        # extra_page_per_seq: one trailing index per request, or -1 when unused.
+        extra_page_per_seq: List[int] = [
+            ci[n] if len(ci) > n else -1 for ci, n in zip(batch_cache_indices, num_active_blocks)
+        ]
 
         # Store batch information based on prefill, decode, and extend requests.
         num_decode = len(generation_requests)
