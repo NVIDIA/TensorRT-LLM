@@ -212,6 +212,17 @@ class KVCacheManagerConfig:
     Must be a positive multiple of tokens_per_block. Only takes effect when SSM layers are present.
     """
 
+    enable_swa_scratch_reuse: bool = False
+    """
+    When True, SWA layers reuse physical pages for out-of-window blocks during prefill.
+    Scratch blocks share coalesced slot sub-pages across blocks for the currently executing
+    layer, reducing peak memory. Trade-off: KV cache reuse is degraded because scratch blocks
+    have no preserved data after the step.
+
+    Most useful for disaggregated prefill servers handling long prompts or long prompt chunks,
+    where the number of out-of-window blocks dominates memory usage.
+    """
+
     # unsupported yet
     helix_config: HelixConfig | None = None
 
