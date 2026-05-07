@@ -36,10 +36,10 @@ DEEPSEEK_V4_OVERLAP_COMPRESSOR_RATIO = 4
 class DeepseekV4AttentionType(Enum):
     SWA = 0
     COMPRESS = 1
-    COMPRESSOR_STATE = 2
+    COMPRESSOR_KV = 2
     COMPRESSOR_SCORE = 3
     INDEXER_COMPRESS = 4
-    INDEXER_COMPRESSOR_STATE = 5
+    INDEXER_COMPRESSOR_KV = 5
     INDEXER_COMPRESSOR_SCORE = 6
 
 
@@ -75,13 +75,13 @@ def compress_ratio_has_attention(compress_ratio: int, attn_type: DeepseekV4Atten
         return True
     elif attn_type == DeepseekV4AttentionType.COMPRESS:
         return is_compress
-    elif attn_type == DeepseekV4AttentionType.COMPRESSOR_STATE:
+    elif attn_type == DeepseekV4AttentionType.COMPRESSOR_KV:
         return is_compress
     elif attn_type == DeepseekV4AttentionType.COMPRESSOR_SCORE:
         return is_compress
     elif attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
         return is_sparse
-    elif attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE:
+    elif attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV:
         return is_sparse
     elif attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE:
         return is_sparse
@@ -98,13 +98,13 @@ def get_attn_dim(
         return head_dim
     elif attn_type == DeepseekV4AttentionType.COMPRESS:
         return head_dim
-    elif attn_type == DeepseekV4AttentionType.COMPRESSOR_STATE:
+    elif attn_type == DeepseekV4AttentionType.COMPRESSOR_KV:
         return state_factor * head_dim
     elif attn_type == DeepseekV4AttentionType.COMPRESSOR_SCORE:
         return state_factor * head_dim
     elif attn_type == DeepseekV4AttentionType.INDEXER_COMPRESS:
         return index_head_dim
-    elif attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE:
+    elif attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV:
         return state_factor * index_head_dim
     elif attn_type == DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE:
         return state_factor * index_head_dim
@@ -143,14 +143,14 @@ def get_token_bytes(
 
     # Default dtype is bfloat16 (2 bytes), or fp8 (1 byte) when FP8 kv cache is enabled
     dtype_bytes = 1 if has_fp8_kv_cache else 2
-    # (indexer) compressor state and score always use float32
+    # (indexer) compressor kv and score always use float32
     if attn_type in [
-        DeepseekV4AttentionType.COMPRESSOR_STATE,
+        DeepseekV4AttentionType.COMPRESSOR_KV,
         DeepseekV4AttentionType.COMPRESSOR_SCORE,
-        DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE,
+        DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
         DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
     ]:
-        dtype_bytes = 4  # (indexer) compressor state and score use float32
+        dtype_bytes = 4  # (indexer) compressor kv and score use float32
     # Indexer cache always packs data + per-block scales into one row.  Only
     # the two indexer presets ("fp8" blockwise / "fp4" mxfp4) are valid
     # here — bf16 / fp8_pertensor are reserved for the main-attention
@@ -207,11 +207,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             elif compress_ratio == 4:
                 attention_types.append((1, DeepseekV4AttentionType.SWA))
                 attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESS))
-                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_STATE))
+                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_KV))
                 attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_SCORE))
                 attention_types.append((compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESS))
                 attention_types.append(
-                    (compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE)
+                    (compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV)
                 )
                 attention_types.append(
                     (compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE)
@@ -219,7 +219,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             else:
                 attention_types.append((1, DeepseekV4AttentionType.SWA))
                 attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESS))
-                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_STATE))
+                attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_KV))
                 attention_types.append((compress_ratio, DeepseekV4AttentionType.COMPRESSOR_SCORE))
         self.attention_type_set = set(attention_types)
 

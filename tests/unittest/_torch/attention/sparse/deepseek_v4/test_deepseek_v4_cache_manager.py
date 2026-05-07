@@ -122,9 +122,9 @@ class TestDeepseekV4CacheManager:
         if attn_type == DeepseekV4AttentionType.SWA:
             return self.window_size
         elif attn_type in [
-            DeepseekV4AttentionType.COMPRESSOR_STATE,
+            DeepseekV4AttentionType.COMPRESSOR_KV,
             DeepseekV4AttentionType.COMPRESSOR_SCORE,
-            DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE,
+            DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
             DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
         ]:
             return state_factor * compress_ratio
@@ -256,7 +256,7 @@ class TestDeepseekV4CacheManager:
                     self._rand_tensor((seq_len // ratio, head_dim), dtype, device),
                     None,
                 )
-                cache[layer, DeepseekV4AttentionType.COMPRESSOR_STATE] = (
+                cache[layer, DeepseekV4AttentionType.COMPRESSOR_KV] = (
                     self._rand_tensor((seq_len, compressor_dim), compressor_dtype, device),
                     None,
                 )
@@ -282,7 +282,7 @@ class TestDeepseekV4CacheManager:
                 )
 
                 indexer_compressor_dim = 2 * indexer_dim if is_overlap else indexer_dim
-                cache[layer, DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE] = (
+                cache[layer, DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV] = (
                     self._rand_tensor((seq_len, indexer_compressor_dim), compressor_dtype, device),
                     None,
                 )
@@ -557,7 +557,7 @@ class TestDeepseekV4CacheManager:
                 attn_types.extend(
                     [
                         DeepseekV4AttentionType.COMPRESS,
-                        DeepseekV4AttentionType.COMPRESSOR_STATE,
+                        DeepseekV4AttentionType.COMPRESSOR_KV,
                         DeepseekV4AttentionType.COMPRESSOR_SCORE,
                     ]
                 )
@@ -565,7 +565,7 @@ class TestDeepseekV4CacheManager:
                 attn_types.extend(
                     [
                         DeepseekV4AttentionType.INDEXER_COMPRESS,
-                        DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE,
+                        DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
                         DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
                     ]
                 )
@@ -888,7 +888,7 @@ class TestDeepseekV4CacheManager:
         if invalid:
             # Inject invalid into a float buffer so NaN/Inf checks are supported.
             layer_idx = next(i for i, ratio in enumerate(compress_ratios) if ratio > 1)
-            buffer = cache_manager.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESSOR_STATE)
+            buffer = cache_manager.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESSOR_KV)
             buffer[0, 0, 0] = torch.nan
 
         result = cache_manager.check_invalid_values_in_kv_cache(fill_with_zero=fill_with_zero)
