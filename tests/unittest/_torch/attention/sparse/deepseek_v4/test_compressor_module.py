@@ -1120,11 +1120,11 @@ class CompressorWrapper:
         # Determine attention types based on is_indexer
         if self.is_indexer:
             compress_type = DeepseekV4AttentionType.INDEXER_COMPRESS
-            state_type = DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE
+            kv_type = DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV
             score_type = DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE
         else:
             compress_type = DeepseekV4AttentionType.COMPRESS
-            state_type = DeepseekV4AttentionType.COMPRESSOR_STATE
+            kv_type = DeepseekV4AttentionType.COMPRESSOR_KV
             score_type = DeepseekV4AttentionType.COMPRESSOR_SCORE
 
         # Build block_tables dict keyed by DeepseekV4AttentionType using cache manager
@@ -1134,7 +1134,7 @@ class CompressorWrapper:
 
         for b, req in enumerate(requests):
             block_table_compress_list.append(self._get_block_table_for_request(req, compress_type))
-            block_table_kv_state_list.append(self._get_block_table_for_request(req, state_type))
+            block_table_kv_state_list.append(self._get_block_table_for_request(req, kv_type))
             block_table_score_state_list.append(self._get_block_table_for_request(req, score_type))
 
         # Pad and stack block tables to handle variable-length block indices
@@ -1162,7 +1162,7 @@ class CompressorWrapper:
 
         block_tables = {
             (ratio, compress_type): block_table_compress,
-            (ratio, state_type): block_table_kv_state,
+            (ratio, kv_type): block_table_kv_state,
             (ratio, score_type): block_table_score_state,
         }
 

@@ -86,9 +86,9 @@ def _get_attn_bytes_per_token(
 class DeepseekV4CacheManager(KVCacheManagerV2):
     fixed_size_attention = {
         DeepseekV4AttentionType.SWA,
-        DeepseekV4AttentionType.COMPRESSOR_STATE,
+        DeepseekV4AttentionType.COMPRESSOR_KV,
         DeepseekV4AttentionType.COMPRESSOR_SCORE,
-        DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE,
+        DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
         DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
     }
     # This tensor is for compatibility with AttentionOp, it only contains swa attention.
@@ -275,11 +275,11 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         )
 
         dtype = self.dtype
-        # (indexer) compressor state and score use compressor_dtype
+        # (indexer) compressor kv and score use compressor_dtype
         if attn_type in [
-            DeepseekV4AttentionType.COMPRESSOR_STATE,
+            DeepseekV4AttentionType.COMPRESSOR_KV,
             DeepseekV4AttentionType.COMPRESSOR_SCORE,
-            DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE,
+            DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
             DeepseekV4AttentionType.INDEXER_COMPRESSOR_SCORE,
         ]:
             dtype = self._compressor_dtype
@@ -413,28 +413,28 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             if is_compress:
                 # compressed attention pool
                 _add_layer(layer, DeepseekV4AttentionType.COMPRESS, None)
-                # compressor state, managed as a sliding window attention cache,
+                # compressor kv, managed as a sliding window attention cache,
                 # including compressor kv states and compressor score states.
                 # Add max_draft_len so rewind after rejected draft tokens can
                 # still reach past states.
                 compressor_window = self._get_window_size(
-                    compress_ratio, DeepseekV4AttentionType.COMPRESSOR_STATE
+                    compress_ratio, DeepseekV4AttentionType.COMPRESSOR_KV
                 )
-                _add_layer(layer, DeepseekV4AttentionType.COMPRESSOR_STATE, compressor_window)
+                _add_layer(layer, DeepseekV4AttentionType.COMPRESSOR_KV, compressor_window)
                 _add_layer(layer, DeepseekV4AttentionType.COMPRESSOR_SCORE, compressor_window)
 
             # sparse attention layer has indexer
             if is_sparse:
                 # indexer kv cache pool, dim is indexer_head_dim
                 _add_layer(layer, DeepseekV4AttentionType.INDEXER_COMPRESS, None)
-                # indexer has its own compressor, so a separate compressor state
-                # similarly, indexer compressor state is managed as a sliding window attention cache
+                # indexer has its own compressor, so a separate compressor kv
+                # similarly, indexer compressor kv is managed as a sliding window attention cache
                 indexer_compressor_window = self._get_window_size(
-                    compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE
+                    compress_ratio, DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV
                 )
                 _add_layer(
                     layer,
-                    DeepseekV4AttentionType.INDEXER_COMPRESSOR_STATE,
+                    DeepseekV4AttentionType.INDEXER_COMPRESSOR_KV,
                     indexer_compressor_window,
                 )
                 _add_layer(
