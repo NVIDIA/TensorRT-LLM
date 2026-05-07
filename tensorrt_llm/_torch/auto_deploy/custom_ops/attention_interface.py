@@ -217,6 +217,12 @@ class InputBuffer:
             return self._host_views[name][: self.get_current_length(name)]
         return self._host_views[name]
 
+    def get_host_np_view(self, name: str, truncate: bool = False) -> np.ndarray:
+        """Get the cached numpy view of the host buffer (avoids torch dispatcher overhead)."""
+        if truncate:
+            return self._host_np_views[name][: self.get_current_length(name)]
+        return self._host_np_views[name]
+
     def get_capacity(self, name: str) -> int:
         """Get the maximum number of elements for the specified tensor."""
         numel, _ = self._tensor_specs[name]
@@ -244,19 +250,27 @@ class InputBuffer:
         """
         numel, dtype = self._tensor_specs[name]
         np_view = self._host_np_views[name]
+        np_dtype = np_view.dtype
 
         if fill_value is not None:
             np_view.fill(fill_value)
 
-        # convert to tensor via numpy (numpy is ~2-3x faster than torch.tensor for large lists)
-        if not isinstance(data, torch.Tensor):
-            data = _list_to_tensor(data, dtype)
+        # Fast path: numpy array → no torch round-trip, just dtype-cast view if needed.
+        if isinstance(data, np.ndarray):
+            src_np = data if data.dtype == np_dtype else data.astype(np_dtype, copy=False)
+            length = src_np.size
+        elif isinstance(data, torch.Tensor):
+            src_np = (data if data.dtype == dtype else data.to(dtype)).numpy()
+            length = src_np.size
+        else:
+            # convert list to tensor via numpy (numpy is ~2-3x faster than torch.tensor for large lists)
+            data_t = _list_to_tensor(data, dtype)
+            src_np = data_t.numpy()
+            length = src_np.size
 
-        length = data.numel()
         assert length <= numel, f"Data too large for buffer '{name}': {length} > {numel}"
         # Direct numpy slice assignment into the cached pinned-buffer view —
         # avoids per-call torch slicing and .numpy() dispatcher overhead on the dst side.
-        src_np = (data if data.dtype == dtype else data.to(dtype)).numpy()
         np_view[:length] = src_np
 
         self._current_lengths[name] = length
@@ -1179,18 +1193,21 @@ class SequenceInfo:
         """
         ### UPDATE (CU)SEQ_LEN, BATCH INFO, AND INPUT_POS FIRST SINCE IT'S USED FOR OTHER UPDATES ##
         self._stage_arg("cu_seqlen", cu_seqlen)
-        csl_host = self.get_arg("cu_seqlen_host", truncate=True)
+        # Numpy view over the truncated host buffer — used by all subsequent arithmetic.
+        # Each torch op on the same data costs ~5-15 µs of dispatcher overhead; numpy stays
+        # ~0.5-2 µs and feeds straight into the np-fast-path of stage().
+        csl_host_np = self._input_buffer.get_host_np_view("cu_seqlen", truncate=True)
 
-        sl_host = csl_host[1:] - csl_host[:-1]
-        self._stage_arg("seq_len", sl_host)
+        sl_host_np = csl_host_np[1:] - csl_host_np[:-1]
+        self._stage_arg("seq_len", sl_host_np)
 
         # check for updated batch_info_tensor
         if batch_info is None:
             # NOTE: assumes no extend requests, decode requests are all of length 1 and come after
             # prefill requests.
-            num_decode = int((sl_host.flip(0) == 1).cumprod(0).sum())
-            num_prefill = len(sl_host) - num_decode
-            num_prefill_tokens = int(sl_host.sum()) - num_decode
+            num_decode = int(np.cumprod((sl_host_np[::-1] == 1).astype(np.int64)).sum())
+            num_prefill = len(sl_host_np) - num_decode
+            num_prefill_tokens = int(sl_host_np.sum()) - num_decode
             batch_info = [num_prefill, num_prefill_tokens, 0, 0, num_decode, num_decode]
         self.batch_info.update(batch_info)
 
@@ -1198,7 +1215,7 @@ class SequenceInfo:
         if isinstance(input_pos, int):
             input_pos = torch.full((self.num_sequences,), input_pos, dtype=torch.int)
         self._stage_arg("input_pos", input_pos)
-        ip_host = self.get_arg("input_pos_host", truncate=True)
+        ip_host_np = self._input_buffer.get_host_np_view("input_pos", truncate=True)
 
         ### UPDATE REQUIRED INPUTS #################################################################
         # set new input_ids and make sure to flatten it
@@ -1214,8 +1231,8 @@ class SequenceInfo:
         assert (cache_loc is None) == (cu_num_pages is None), "Both must be provided together!"
         self._stage_arg("cache_loc", cache_loc)
         self._stage_arg("cu_num_pages", cu_num_pages)
-        lpl_host = (ip_host + sl_host - 1) % self.tokens_per_block + 1
-        self._stage_arg("last_page_len", lpl_host)
+        lpl_host_np = (ip_host_np + sl_host_np - 1) % self.tokens_per_block + 1
+        self._stage_arg("last_page_len", lpl_host_np)
 
         # check for updated slot_idx
         self._stage_arg("slot_idx", slot_idx)
@@ -1227,24 +1244,24 @@ class SequenceInfo:
         if self._is_required("position_ids"):
             # set new position_ids and make sure to flatten it
             # position_ids for each sequence is in the range [input_pos, input_pos + seq_len - 1]
-            ip_np = ip_host.numpy()
-            sl_np = sl_host.numpy()
-            base = np.repeat(ip_np, sl_np)
-            group_starts = np.repeat(np.cumsum(sl_np) - sl_np, sl_np)
-            offsets = np.arange(sl_np.sum()) - group_starts
-            position_ids = torch.from_numpy(base + offsets)  # zero-copy back
+            base = np.repeat(ip_host_np, sl_host_np)
+            group_starts = np.repeat(np.cumsum(sl_host_np) - sl_host_np, sl_host_np)
+            offsets = np.arange(sl_host_np.sum()) - group_starts
+            position_ids = base + offsets
             self._stage_arg("position_ids", position_ids, reset_val=0)
 
         # update cumulative number of pages
         if self._is_required("pages_per_seq"):
             assert cu_num_pages is not None, "cu_num_pages is required for pages_per_seq"
-            cu_num_pages_host = self.get_arg("cu_num_pages_host", truncate=True)
-            pages_per_seq = cu_num_pages_host[1:] - cu_num_pages_host[:-1]
-            self._stage_arg("pages_per_seq", pages_per_seq)
+            cu_num_pages_host_np = self._input_buffer.get_host_np_view(
+                "cu_num_pages", truncate=True
+            )
+            pages_per_seq_np = cu_num_pages_host_np[1:] - cu_num_pages_host_np[:-1]
+            self._stage_arg("pages_per_seq", pages_per_seq_np)
 
         # update sequence length with cache
-        seq_len_with_cache = ip_host + sl_host
-        self._stage_arg("seq_len_with_cache", seq_len_with_cache)
+        seq_len_with_cache_np = ip_host_np + sl_host_np
+        self._stage_arg("seq_len_with_cache", seq_len_with_cache_np)
 
         # prompt_lens: original context length per sequence, constant across iterations.
         # Defaults to seq_len when not provided (correct for prefill).
@@ -1252,11 +1269,11 @@ class SequenceInfo:
             if isinstance(prompt_lens, (list, tuple)):
                 prompt_lens = torch.tensor(prompt_lens, dtype=torch.int)
         else:
-            prompt_lens = sl_host
+            prompt_lens = sl_host_np
         self._stage_arg("prompt_lens", prompt_lens)
 
         # check for updated use_initial_states
-        use_initial_states = ip_host > 0
+        use_initial_states = ip_host_np > 0
         self._stage_arg("use_initial_states", use_initial_states)
 
         num_prefill = self.batch_info.get_num_sequences()[0]
@@ -1277,10 +1294,9 @@ class SequenceInfo:
             self.batch_info.update_tokens_gather_info(total, False)
         else:
             num_prefill_tokens = self.batch_info.get_num_tokens()[0]
-            csl_np = csl_host.numpy()
-            ctx_last = csl_np[1 : num_prefill + 1].astype(np.int64) - 1
+            ctx_last = csl_host_np[1 : num_prefill + 1].astype(np.int64) - 1
             gen_all = np.arange(num_prefill_tokens, total, dtype=np.int64)
-            token_gather_indices = torch.from_numpy(np.concatenate([ctx_last, gen_all]))
+            token_gather_indices = np.concatenate([ctx_last, gen_all])
             self._stage_arg("token_gather_indices", token_gather_indices)
             self.batch_info.update_tokens_gather_info(len(token_gather_indices), True)
 
