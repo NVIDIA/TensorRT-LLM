@@ -577,9 +577,18 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
                                 else:
                                     effective_rect_list = rect_list
                                 for rect in effective_rect_list:
+                                    # Note: "persistent_main" is included in
+                                    # the dl-family for sort/hsort sweep
+                                    # eligibility — it consumes the same
+                                    # slot_perm and benefits from the same
+                                    # write-first clustering.  It additionally
+                                    # requires _n_writes (count of write
+                                    # slots) which the bench computes from
+                                    # the pure-scenario PNAT (mix scenarios
+                                    # not yet supported for persistent_main).
                                     is_dl_family = mode in (
                                         "doublelaunch", "dlgrouped", "maindl",
-                                        "dl_write_only",
+                                        "dl_write_only", "persistent_main",
                                     )
                                     # Match the timed-run skip: sort=1 only
                                     # makes sense when there's a mix scenario.
@@ -915,6 +924,11 @@ def _bench_config(
     heads_per_block_values = _parse_sweep(args.heads_per_block)
     maxnreg_values = _parse_sweep(args.maxnreg)
     num_ctas_values = _parse_sweep(args.num_ctas)
+    # Persistent-only sweep dims; ignored when the cell's mode != persistent_main.
+    cta_per_sm_values = _parse_sweep(args.cta_per_sm)
+    num_loop_stages_values = _parse_sweep(args.num_loop_stages)
+    flatten_values = _parse_sweep(args.flatten)
+    warp_specialize_values = _parse_sweep(args.warp_specialize)
 
     # --- Replay kernel ---
     # Cache T-axis capacity (for prev_k validity check on the nowrite path).
@@ -941,11 +955,15 @@ def _bench_config(
             "iters": None,  # use args.iters
         })
     # Mix scenario: skip on monolithic (mono on mixed PNAT corrupts the
-    # wrong-mode slots).  prev_tokens varies per iter; the per-iter copy
-    # is captured inside the CUDA graph from a pre-baked GPU samples
-    # tensor (warmup samples distinct from timed-iter samples so any
-    # nsys-included warmup leaks aren't biased).
-    if mix_samples_cpu is not None and mode != "monolithic":
+    # wrong-mode slots).  Also skip for persistent_main — the kernel takes
+    # `n_writes` as a runtime int32 scalar, but in mix mode `n_writes`
+    # varies per iter.  Plumbing per-iter n_writes through the CUDA graph
+    # would require a 1-elem int32 GPU tensor scanned host-side or via a
+    # tiny scan kernel; out of scope for the skeleton.  prev_tokens varies
+    # per iter; the per-iter copy is captured inside the CUDA graph from a
+    # pre-baked GPU samples tensor (warmup samples distinct from
+    # timed-iter samples so any nsys-included warmup leaks aren't biased).
+    if mix_samples_cpu is not None and mode not in ("monolithic", "persistent_main"):
         device = state_work.device
         # Hardcode-sort: per-iter prev_tokens are CPU-sorted write-first.
         # Kernel runs USE_PERM=False but the EO gate sees clustered modes.
@@ -995,6 +1013,10 @@ def _bench_config(
             heads_per_block,
             maxnreg,
             num_ctas,
+            cta_per_sm,
+            num_loop_stages,
+            flatten,
+            warp_specialize,
         ) in itertools.product(
             block_size_m_values,
             num_warps_values,
@@ -1004,6 +1026,10 @@ def _bench_config(
             heads_per_block_values,
             maxnreg_values,
             num_ctas_values,
+            cta_per_sm_values,
+            num_loop_stages_values,
+            flatten_values,
+            warp_specialize_values,
         ):
 
             def _run_incr(
@@ -1015,6 +1041,10 @@ def _bench_config(
                 heads_per_block=heads_per_block,
                 maxnreg=maxnreg,
                 num_ctas=num_ctas,
+                cta_per_sm=cta_per_sm,
+                num_loop_stages=num_loop_stages,
+                flatten=flatten,
+                warp_specialize=warp_specialize,
             ):
                 if with_conv1d:
                     x_call, B_call, C_call = _conv1d_split(
@@ -1041,6 +1071,33 @@ def _bench_config(
                         extra_kwargs["reverse_nowrite"] = reverse_nowrite
                     if state_scales_work is not None:
                         extra_kwargs["state_scales"] = state_scales_work
+                    # persistent_main needs n_writes (count of write-mode
+                    # slots in the pre-sorted batch) as a host-side int.
+                    # Pure scenarios: every slot has the same PNAT, so
+                    # n_writes is either 0 (all nowrite) or batch (all
+                    # write) depending on whether PNAT+T overflows the
+                    # window.  Mix scenarios are skipped earlier.
+                    if mode == "persistent_main":
+                        scn_fill = scn["fill"]
+                        assert scn_fill is not None, (
+                            "persistent_main does not yet support mix "
+                            "scenarios (per-iter n_writes plumbing not "
+                            "implemented)."
+                        )
+                        is_write_scenario = (scn_fill + mtp_len) > max_window
+                        extra_kwargs["_n_writes"] = batch if is_write_scenario else 0
+                        # Per-cell sweep values for persistent-only knobs.
+                        # _parse_sweep returns [None] when the user didn't
+                        # pass the flag, in which case we leave the wrapper's
+                        # defaults in place.
+                        if cta_per_sm is not None:
+                            extra_kwargs["_cta_per_sm"] = cta_per_sm
+                        if num_loop_stages is not None:
+                            extra_kwargs["_num_loop_stages"] = num_loop_stages
+                        if flatten is not None:
+                            extra_kwargs["_flatten"] = bool(flatten)
+                        if warp_specialize is not None:
+                            extra_kwargs["_warp_specialize"] = bool(warp_specialize)
                 variant_fn(
                     state_work,
                     old_x_work,
@@ -1090,6 +1147,17 @@ def _bench_config(
                 parts.append(f"R={maxnreg}")
             if num_ctas is not None:
                 parts.append(f"CT={num_ctas}")
+            # Persistent-only knobs (only meaningful when MODE=persistent_main;
+            # printed unconditionally so output rows are uniformly comparable
+            # across modes when the user passed these sweeps).
+            if cta_per_sm is not None:
+                parts.append(f"CPS={cta_per_sm}")
+            if num_loop_stages is not None:
+                parts.append(f"LS={num_loop_stages}")
+            if flatten is not None:
+                parts.append(f"FL={flatten}")
+            if warp_specialize is not None:
+                parts.append(f"WS={warp_specialize}")
             parts.append(f"SR={1 if use_philox else 0}")
             parts.append(f"RECT={1 if rectangle_for_nowrite else 0}")
             parts.append(f"WC={1 if write_checkpoint else 0}")
@@ -1315,9 +1383,18 @@ def _run_benchmark(args) -> None:
                                     # when no mix is configured; mono /
                                     # dynamic also skip sort=1; reverse=1
                                     # with sort=0 is a no-op (skip).
+                                    # Note: "persistent_main" is included in
+                                    # the dl-family for sort/hsort sweep
+                                    # eligibility — it consumes the same
+                                    # slot_perm and benefits from the same
+                                    # write-first clustering.  It additionally
+                                    # requires _n_writes (count of write
+                                    # slots) which the bench computes from
+                                    # the pure-scenario PNAT (mix scenarios
+                                    # not yet supported for persistent_main).
                                     is_dl_family = mode in (
                                         "doublelaunch", "dlgrouped", "maindl",
-                                        "dl_write_only",
+                                        "dl_write_only", "persistent_main",
                                     )
                                     can_sort = (
                                         is_dl_family and mix_samples_cpu is not None
@@ -1581,6 +1658,44 @@ def _parse_args() -> argparse.Namespace:
         help="Override num_ctas for the main kernel (comma-separated sweep).",
     )
     parser.add_argument(
+        "--cta-per-sm",
+        type=str,
+        default=None,
+        help="CTAs per SM in the 1D persistent grid for mode=persistent_main "
+        "(comma-separated sweep).  num_persistent = cta_per_sm × NUM_SMS.  "
+        "Default = 1 (one CTA per SM).  Replaces the old --num-persistent.  "
+        "Ignored for non-persistent_main modes.",
+    )
+    parser.add_argument(
+        "--num-loop-stages",
+        type=str,
+        default=None,
+        help="num_stages on the inner tl.range(...) persistent loop for "
+        "mode=persistent_main (comma-separated sweep).  Default = 2.  Note: "
+        "this is loop-level, NOT the kernel-arg num_stages (which only "
+        "pipelines dot-feeding loads).  Watch Triton issue #8259 — "
+        "num_stages>1 + flatten=True can corrupt stores in non-dot kernels.  "
+        "Ignored for non-persistent_main modes.",
+    )
+    parser.add_argument(
+        "--flatten",
+        type=str,
+        default=None,
+        help="`flatten` arg on tl.range(...) for mode=persistent_main "
+        "(comma-separated 0/1 sweep).  Default = 1.  Ignored for "
+        "non-persistent_main modes.",
+    )
+    parser.add_argument(
+        "--warp-specialize",
+        type=str,
+        default=None,
+        help="`warp_specialize` arg on tl.range(...) for mode=persistent_main "
+        "(comma-separated 0/1 sweep).  Default = 0.  Triton 3.6 only "
+        "supports it on simple matmul loops; our scan loop probably won't "
+        "pattern-match — exposed as a knob for sweep experiments.  Requires "
+        "num_warps >= 4 if 1.  Ignored for non-persistent_main modes.",
+    )
+    parser.add_argument(
         "--sr-modes",
         type=str,
         default="RN",
@@ -1780,7 +1895,10 @@ def _parse_args() -> argparse.Namespace:
         args.write_modes_list = [args.write_checkpoint]
 
     modes_raw = [v.strip() for v in args.modes.split(",") if v.strip()]
-    valid_modes = {"monolithic", "dynamic", "doublelaunch", "dlgrouped", "maindl", "dl_write_only"}
+    valid_modes = {
+        "monolithic", "dynamic", "doublelaunch", "dlgrouped", "maindl",
+        "dl_write_only", "persistent_main",
+    }
     for m in modes_raw:
         if m not in valid_modes:
             parser.error(

@@ -878,6 +878,177 @@ def test_checkpointing_state_update_sorted_dispatch(mode, rectangle_for_nowrite,
             )
 
 
+@pytest.mark.parametrize(
+    "scenario,pnat_per_slot_list,n_writes_expected,slot_perm_list",
+    [
+        # All-write: every slot has PNAT triggering write
+        # (PNAT + T > max_window).  No permutation needed.
+        ("all_write", [12, 13, 14, 15], 4, [0, 1, 2, 3]),
+        # All-nowrite: every slot fits in the window.  n_writes = 0.
+        ("all_nowrite", [3, 4, 5, 6], 0, [0, 1, 2, 3]),
+        # Mixed (write-first sorted via slot_perm): physical slots 2, 3
+        # are writes; physical slots 0, 1 are nowrites.  slot_perm
+        # remaps grid pid_b 0..3 to physical slots 2, 3, 0, 1 — so the
+        # first n_writes=2 grid programs hit write slots and the rest
+        # hit nowrite slots.
+        ("mixed_sorted", [3, 10, 12, 16], 2, [2, 3, 0, 1]),
+    ],
+    ids=["all_write", "all_nowrite", "mixed_sorted"],
+)
+def test_checkpointing_state_update_persistent_main(
+    scenario, pnat_per_slot_list, n_writes_expected, slot_perm_list,
+):
+    """
+    Persistent-CTA main kernel: 1D-grid kernel that loops over
+    (slot, M-tile, head) work units via tl.range.  Caller pre-sorts
+    slots write-first and passes _n_writes (count of write slots) so
+    the kernel can split the persistent loop into write and nowrite
+    halves with the right WRITE_CHECKPOINT constexpr each time.
+
+    Setup mirrors test_checkpointing_state_update_sorted_dispatch
+    (same fixed seeds, same input shapes) so the reference state
+    evolution is identical and we can compare per-slot output and
+    HBM-state postconditions to the same reference.
+
+    Cases:
+      - all_write   (n_writes=B): every slot exercises the
+        WRITE_CHECKPOINT=True branch of the persistent loop.
+      - all_nowrite (n_writes=0): every slot exercises the
+        WRITE_CHECKPOINT=False branch.  Verifies the kernel handles
+        the "write half is empty" launch (n_slots=0 → early return).
+      - mixed_sorted: slots [2, 3] are writes, slots [0, 1] are
+        nowrites.  slot_perm = [2, 3, 0, 1].  Persistent kernel
+        should call its impl with pid_b ∈ {2, 3} for the write half
+        and pid_b ∈ {0, 1} for the nowrite half, even though the
+        grid pid_b_grid is 0..n_slots-1 in each.
+    """
+    nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
+    T = 6
+    max_window = 16
+    batch = 4
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    pnat_per_slot = torch.tensor(pnat_per_slot_list, device=device, dtype=torch.int32)
+    pnat_means_write = (pnat_per_slot + T > max_window).tolist()
+    slot_perm = torch.tensor(slot_perm_list, device=device, dtype=torch.int32)
+    # Sanity: caller-supplied n_writes must match the actual count of
+    # write slots in the post-perm order.
+    write_count = sum(pnat_means_write)
+    assert write_count == n_writes_expected, (
+        f"test setup error: expected {n_writes_expected} writes, got {write_count}"
+    )
+
+    torch.manual_seed(42)
+    A_base = -torch.rand(nheads, device=device) - 0.5
+    A = repeat(A_base, "h -> h p n", p=head_dim, n=d_state)
+    dt_bias_base = torch.randn(nheads, device=device, dtype=dtype)
+    dt_bias = repeat(dt_bias_base, "h -> h p", p=head_dim)
+    D_base = torch.randn(nheads, device=device, dtype=dtype)
+    D = repeat(D_base, "h -> h p", p=head_dim)
+
+    state0 = torch.randn(
+        batch, nheads, head_dim, d_state, device=device, dtype=dtype
+    )
+    ref_input_state = state0.float()
+
+    step1_T = max_window
+    x1 = torch.randn(batch, step1_T, nheads, head_dim, device=device, dtype=dtype)
+    dt1_base = torch.randn(batch, step1_T, nheads, device=device, dtype=dtype)
+    dt1_input = repeat(dt1_base, "b t h -> b t h p", p=head_dim)
+    B1 = torch.randn(batch, step1_T, ngroups, d_state, device=device, dtype=dtype)
+    C1 = torch.randn(batch, step1_T, ngroups, d_state, device=device, dtype=dtype)
+
+    states_buffer_f32 = torch.zeros(
+        batch, step1_T, nheads, head_dim, d_state, device=device, dtype=torch.float32
+    )
+    cache_idx_for_capture = torch.arange(batch, device=device, dtype=torch.int32)
+    out1 = torch.zeros(batch, step1_T, nheads, head_dim, device=device, dtype=dtype)
+    selective_state_update(
+        ref_input_state.clone(),
+        x1, dt1_input, A, B1, C1,
+        D=D, dt_bias=dt_bias, dt_softplus=True,
+        state_batch_indices=cache_idx_for_capture,
+        intermediate_states_buffer=states_buffer_f32,
+        cache_steps=step1_T,
+        out=out1,
+        disable_state_update=True,
+    )
+
+    old_x = torch.zeros(batch, max_window, nheads, head_dim, device=device, dtype=dtype)
+    old_B = torch.randn(batch, 2, max_window, ngroups, d_state, device=device, dtype=dtype)
+    old_dt = torch.randn(batch, 2, nheads, max_window, device=device, dtype=torch.float32)
+    old_dA_cumsum = torch.randn(
+        batch, 2, nheads, max_window, device=device, dtype=torch.float32
+    )
+    cache_buf_idx = torch.randint(0, 2, (batch,), device=device, dtype=torch.int32)
+
+    old_x[:, :step1_T] = x1
+    dt1_processed = F.softplus(dt1_base.float() + dt_bias_base.float()[None, None, :])
+    dA_cumsum1 = torch.cumsum(A_base.float()[None, None, :] * dt1_processed, dim=1)
+    for i in range(batch):
+        buf = cache_buf_idx[i].item()
+        old_B[i, buf, :step1_T] = B1[i]
+        old_dt[i, buf, :, :step1_T] = dt1_processed[i].T
+        old_dA_cumsum[i, buf, :, :step1_T] = dA_cumsum1[i].T
+
+    torch.manual_seed(123)
+    x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    dt2_base = torch.randn(batch, T, nheads, device=device, dtype=dtype)
+    dt2 = repeat(dt2_base, "b t h -> b t h p", p=head_dim)
+    B2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+    C2 = torch.randn(batch, T, ngroups, d_state, device=device, dtype=dtype)
+
+    ref_state_f32 = ref_input_state.clone()
+    for i in range(batch):
+        k_i = pnat_per_slot[i].item()
+        if k_i > 0:
+            ref_state_f32[i] = states_buffer_f32[i, k_i - 1]
+    ref_state_after_replay = ref_state_f32.clone()
+
+    ref_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    selective_state_update(
+        ref_state_f32, x2, dt2, A, B2, C2,
+        D=D, dt_bias=dt_bias, dt_softplus=True,
+        state_batch_indices=None, out=ref_out,
+    )
+
+    test_state = state0.clone()
+    test_out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
+    checkpointing_state_update(
+        test_state,
+        old_x.clone(), old_B.clone(), old_dt.clone(), old_dA_cumsum.clone(),
+        cache_buf_idx.clone(),
+        pnat_per_slot,
+        x=x2, dt=dt2, A=A, B=B2, C=C2,
+        out=test_out,
+        D=D, dt_bias=dt_bias, dt_softplus=True,
+        state_batch_indices=None,
+        mode="persistent_main",
+        slot_perm=slot_perm,
+        _n_writes=n_writes_expected,
+    )
+
+    torch.testing.assert_close(
+        test_out.float(), ref_out.float(),
+        atol=1.0, rtol=0.05,
+        msg=f"Output mismatch (scenario={scenario})",
+    )
+
+    for i in range(batch):
+        if pnat_means_write[i]:
+            torch.testing.assert_close(
+                test_state[i].float(), ref_state_after_replay[i].float(),
+                atol=1.0, rtol=0.05,
+                msg=f"Write slot {i}: state mismatch (scenario={scenario})",
+            )
+        else:
+            torch.testing.assert_close(
+                test_state[i], state0[i], rtol=0, atol=0,
+                msg=f"Nowrite slot {i}: state HBM modified (scenario={scenario})",
+            )
+
+
 @pytest.mark.parametrize("nheads,head_dim,d_state,ngroups", _CONFIGS)
 @pytest.mark.parametrize(
     "state_dtype",
