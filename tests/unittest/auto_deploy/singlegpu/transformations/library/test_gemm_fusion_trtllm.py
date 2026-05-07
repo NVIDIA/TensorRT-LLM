@@ -7,6 +7,8 @@ package excludes this file via ``EXCLUDE_TEST_FILES`` in
 ``examples/auto_deploy/create_standalone_package.py``.
 """
 
+import operator
+
 import torch
 from test_gemm_fusion import QKVAttentionModel, _get_narrow_nodes  # type: ignore
 
