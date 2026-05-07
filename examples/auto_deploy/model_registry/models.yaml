@@ -351,8 +351,8 @@ models:
   config_id: minimax_m2
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'minimax_m2.yaml']
 - name: MiniMaxAI/MiniMax-M2.7
-  config_id: minimax_m2_7
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'minimax_m2.7.yaml']
+  config_id: minimax_m2
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'minimax_m2.yaml']
 # --- MiMo-V2-Flash (Feb 2026) ---
 - name: XiaomiMiMo/MiMo-V2-Flash
   config_id: default_ws_8
