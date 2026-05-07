@@ -351,8 +351,6 @@ void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmReques
     }
     setContextState(llmRequest.get());
     auto future = mCacheSender->sendAsync(llmRequest);
-    TLLM_LOG_DEBUG("respondAndSendAsync: adding request %ld to mSenderFutures (size=%zu)", llmRequest->mRequestId,
-        mSenderFutures.size() + 1);
     mSenderFutures.emplace_back(std::move(llmRequest), std::move(future));
 }
 
@@ -406,8 +404,6 @@ void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmReq
     // slightly later time — harmless for the deadline check.
     llmRequest->setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
     auto future = mCacheReceiver->receiveAsync(llmRequest);
-    TLLM_LOG_DEBUG("requestAndReceiveAsync: adding request %ld to mRequesterFutures (size=%zu)", llmRequest->mRequestId,
-        mRequesterFutures.size() + 1);
     // Order: setKvCacheTransferStart -> receiveAsync -> setState -> emplace.
     // setState is intentionally moved AFTER receiveAsync (the original code
     // set it before). This is safe today because the async worker spawned
@@ -531,15 +527,6 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         {
             senderFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
         }
-    }
-
-    // Log mSenderFutures state for diagnosing dangling pointer issues.
-    // Each entry's pointer address and request ID are logged so we can detect
-    // when a pointer's underlying memory is freed (reqId changes to 0).
-    if (!mSenderFutures.empty())
-    {
-        TLLM_LOG_DEBUG("checkContextTransferStatus: mSenderFutures.size()=%zu, blockAll=%d, kvTransferTimeoutMs=%d",
-            mSenderFutures.size(), blockAll ? 1 : 0, kvTransferTimeoutMs.value_or(-1));
     }
 
     auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupTPInDPComm : mGroupTensorParaComm;
@@ -729,17 +716,6 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         {
             senderFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
         }
-    }
-
-    // Log mRequesterFutures state for diagnosing dangling pointer / stuck
-    // receiver issues. Mirrors the diagnostic added to checkContextTransferStatus.
-    if (!mRequesterFutures.empty())
-    {
-        TLLM_LOG_DEBUG(
-            "checkGenTransferStatus: mRequesterFutures.size()=%zu, blockAll=%d, kvTransferTimeoutMs=%d, "
-            "senderFutureTimeoutMs=%d",
-            mRequesterFutures.size(), blockAll ? 1 : 0, kvTransferTimeoutMs.value_or(-1),
-            senderFutureTimeoutMs.value_or(-1));
     }
 
     std::vector<LlmRequest::RequestIdType> genTransferReadyRequestIds;
