@@ -1,0 +1,4 @@
+# AD-specific defaults for Llama 4 Scout.
+transforms:
+  load_weights:
+    disable_preload: true

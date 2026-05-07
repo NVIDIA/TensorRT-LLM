@@ -323,6 +323,29 @@ def launch_server(
         elif backend == '_autodeploy':
             from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 
+            # Auto-inject AD-specific defaults from the model registry.
+            # Registry configs are loaded as yaml_extra (lowest priority),
+            # so the user's --config YAML wins via init args.
+            try:
+                from tensorrt_llm._torch.auto_deploy.config.model_registry import \
+                    get_serve_ad_defaults
+
+                model_name = llm_args.get("model", "")
+                ad_defaults = get_serve_ad_defaults(str(model_name))
+                if ad_defaults:
+                    existing_yaml_extra = list(
+                        llm_args.get("yaml_extra", []) or [])
+                    # Registry defaults go first so user overrides win.
+                    llm_args["yaml_extra"] = [
+                        *ad_defaults,
+                        *existing_yaml_extra,
+                    ]
+                    logger.info("AutoDeploy registry: injected AD defaults for "
+                                f"'{model_name}'")
+            except KeyError:
+                logger.debug("Model not found in AutoDeploy serve registry; "
+                             "proceeding with base AD defaults only.")
+
             # AutoDeploy does not support build_config
             llm_args.pop("build_config", None)
             llm = AutoDeployLLM(**llm_args)
