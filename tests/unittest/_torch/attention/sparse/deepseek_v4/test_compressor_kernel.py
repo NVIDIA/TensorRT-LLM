@@ -110,8 +110,6 @@ def decode_kernel(
         )
     if block_table_score is None:
         block_table_score = block_table_kv
-    if start_pos is None:
-        start_pos = kv_lens - next_n
 
     torch.ops.trtllm.compressor_paged_kv_compress(
         kv_score,
@@ -122,7 +120,6 @@ def decode_kernel(
         block_table_score,
         kv_comp,
         kv_lens,
-        start_pos,
         cu_seq_lens,
         cu_new_comp_kv,
         kv_lens.shape[0],
@@ -558,6 +555,168 @@ def test_decode_corner_cases(batch_size, compress_ratio, head_dim, overlap, num_
                         rtol=1e-2,
                         atol=1e-3,
                     ), f"Step {step}, Batch {b}: mismatch diff={(diff).abs().max():.6f}"
+
+
+def test_prefill_accepts_bf16_kv_score_with_fp32_state():
+    """Prefill accepts bf16 kv_score while preserving fp32 compressor state."""
+    batch_size, seqlen, compress_ratio, head_dim, overlap = 1, 4, 4, 128, True
+    coff = 2 if overlap else 1
+    state_len, state_dim = coff * compress_ratio, coff * head_dim
+
+    kv_bf16 = torch.randn(batch_size, seqlen, state_dim, device="cuda").bfloat16()
+    score_bf16 = torch.randn(batch_size, seqlen, state_dim, device="cuda").bfloat16()
+    kv = kv_bf16.float()
+    score = score_bf16.float()
+    ape = torch.randn(compress_ratio, state_dim, device="cuda")
+
+    kv_state_py = torch.zeros(batch_size, state_len, state_dim, device="cuda")
+    score_state_py = torch.full((batch_size, state_len, state_dim), float("-inf"), device="cuda")
+    out_py = run_pytorch_prefill_reference(
+        kv.clone(),
+        score.clone(),
+        ape,
+        kv_state_py,
+        score_state_py,
+        compress_ratio,
+        head_dim,
+        overlap,
+    )
+
+    paged_kv, paged_score, block_table, page_size, _ = create_paged_cache(
+        batch_size, seqlen, compress_ratio, head_dim, overlap, page_size=8
+    )
+    assert paged_kv.dtype == torch.float32
+
+    kv_score = fuse_kv_score(kv_bf16.view(-1, state_dim), score_bf16.view(-1, state_dim))
+    assert kv_score.dtype == torch.bfloat16
+
+    kv_lens = torch.full((batch_size,), seqlen, device="cuda", dtype=torch.int32)
+    start_pos = torch.zeros(batch_size, device="cuda", dtype=torch.int32)
+    cu_seq_lens, cu_outputs = prepare_prefill_metadata(
+        kv_lens, start_pos, compress_ratio, head_dim, kv_score.device
+    )
+    kv_comp = prepare_compress_output(
+        cu_outputs, batch_size, head_dim, kv_score.device, torch.bfloat16
+    )
+
+    prefill_kernel(
+        kv_score,
+        ape,
+        kv_lens,
+        start_pos,
+        cu_seq_lens,
+        cu_outputs,
+        kv_comp,
+        paged_kv,
+        paged_score,
+        block_table,
+        max_outputs=1,
+        block_table_score=block_table,
+        compress_ratio=compress_ratio,
+        head_dim=head_dim,
+        page_size=page_size,
+    )
+
+    assert out_py is not None
+    assert torch.allclose(out_py.to(kv_comp.dtype).view_as(kv_comp), kv_comp, rtol=2e-3, atol=5e-3)
+
+    for p in range(seqlen):
+        phys = block_table[0, p // page_size].item()
+        off = p % page_size
+        assert torch.allclose(paged_kv[phys, off], kv[0, p], atol=1e-5)
+        assert torch.allclose(
+            paged_score[phys, off], score[0, p] + ape[p % compress_ratio], atol=1e-5
+        )
+
+
+def test_decode_accepts_bf16_kv_score_with_fp32_state():
+    """Decode accepts bf16 kv_score and computes start_pos as kv_len - next_n."""
+    batch_size, compress_ratio, head_dim, overlap = 1, 4, 128, True
+    coff = 2 if overlap else 1
+    state_len, state_dim = coff * compress_ratio, coff * head_dim
+    page_size = 8
+    decode_steps = 4
+    max_blocks = 1
+
+    ape = torch.randn(compress_ratio, state_dim, device="cuda")
+    paged_kv = torch.zeros(batch_size * max_blocks, page_size, state_dim, device="cuda")
+    paged_score = torch.zeros_like(paged_kv)
+    assert paged_kv.dtype == torch.float32
+    block_table = torch.zeros(batch_size, max_blocks, device="cuda", dtype=torch.int32)
+
+    kv_state_py = torch.zeros(batch_size, state_len, state_dim, device="cuda")
+    score_state_py = torch.full((batch_size, state_len, state_dim), float("-inf"), device="cuda")
+    init_kv = torch.randn(compress_ratio, state_dim, device="cuda")
+    init_score = torch.randn(compress_ratio, state_dim, device="cuda")
+    kv_state_py[:, :compress_ratio] = init_kv
+    score_state_py[:, :compress_ratio] = init_score
+    paged_kv[0, :compress_ratio] = init_kv
+    paged_score[0, :compress_ratio] = init_score
+
+    cu_seq_lens, cu_outputs = prepare_decode_metadata(
+        batch_size, compress_ratio, head_dim, torch.device("cuda"), next_n=1
+    )
+    kv_comp = prepare_compress_output(
+        cu_outputs, batch_size, head_dim, torch.device("cuda"), torch.bfloat16
+    )
+
+    for step in range(decode_steps):
+        token_idx = compress_ratio + step
+        total_tokens = token_idx + 1
+        new_kv_bf16 = torch.randn(batch_size, state_dim, device="cuda").bfloat16()
+        new_score_bf16 = torch.randn(batch_size, state_dim, device="cuda").bfloat16()
+        new_kv = new_kv_bf16.float()
+        new_score = new_score_bf16.float()
+
+        out_py = run_pytorch_reference(
+            new_kv.unsqueeze(1),
+            new_score.unsqueeze(1),
+            ape,
+            kv_state_py,
+            score_state_py,
+            token_idx,
+            compress_ratio,
+            head_dim,
+            overlap,
+        )
+
+        kv_score = fuse_kv_score(new_kv_bf16, new_score_bf16)
+        assert kv_score.dtype == torch.bfloat16
+        kv_lens = torch.full((batch_size,), total_tokens, device="cuda", dtype=torch.int32)
+        stale_start_pos = torch.zeros(batch_size, device="cuda", dtype=torch.int32)
+
+        decode_kernel(
+            kv_score,
+            ape,
+            kv_lens,
+            stale_start_pos,
+            cu_seq_lens,
+            cu_outputs,
+            kv_comp,
+            paged_kv,
+            paged_score,
+            block_table,
+            block_table,
+            compress_ratio,
+            head_dim,
+            page_size,
+            next_n=1,
+        )
+
+        phys = block_table[0, token_idx // page_size].item()
+        off = token_idx % page_size
+        assert torch.allclose(paged_kv[phys, off], new_kv[0], atol=1e-5)
+        assert torch.allclose(
+            paged_score[phys, off], new_score[0] + ape[token_idx % compress_ratio], atol=1e-5
+        )
+
+        if out_py is not None:
+            assert torch.allclose(
+                out_py[0, 0, :head_dim].to(kv_comp.dtype),
+                kv_comp[0],
+                rtol=2e-3,
+                atol=5e-3,
+            )
 
 
 STATE_UPDATE_CONFIGS = [
