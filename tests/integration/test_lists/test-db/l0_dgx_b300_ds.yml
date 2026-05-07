@@ -33,6 +33,14 @@ l0_dgx_b300_ds:
   # model is currently missing on B300 CI workers, so LLM(...) treats the
   # path as an HF repo id and HFValidationError fires.
   # - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_auto_dtype[moe_backend=TRTLLM] TIMEOUT (60)
+  # V4-Flash NVFP4 aggregate smoke (TP=4, no EPLB): 1 MMLU sample.
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_auto_dtype TIMEOUT (60)
+  # V4-Flash-Base FP8 chunked-prefill smoke with FP8 KV cache. Keep
+  # max_num_tokens small in the test to force chunked prefill scheduling.
+  # Held out for the same model-availability reason as test_auto_dtype above;
+  # re-enable together once DeepSeek-V4-Flash-Base is uploaded to the CI
+  # model share.
+  # - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4FlashBase::test_fp8_chunked_prefill TIMEOUT (60)
   # V4-Flash NVFP4 static EPLB sanity. WIDEEP backend is skipped at the
   # test level because V4-Flash MXFP4 routed experts are unsupported by
   # WIDEEP (raises "Unsupported quantization mode: [65536]"); TRTLLM is the
