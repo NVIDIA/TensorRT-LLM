@@ -495,6 +495,12 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         // 5. send the buffer to the corresponding target. Ideally, we send only once (one buffer) for each target.
 
         auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
+        // The slot is now reserved and the worker is about to begin
+        // actual data movement. Anchor the per-request KV transfer
+        // timeout from this point so queue / slot wait does not
+        // consume the deadline budget. See
+        // CacheTransceiver::maybeQuarantineLocked.
+        session.getLlmRequest().setKvCacheActualTransferStart(LlmRequest::getSteadyClockNow());
         int peerDuplicateHeadFactor = targetInfo.mPeerDupHeadFactor;
         auto bufferTargetNum = targetNum / peerDuplicateHeadFactor;
         auto ppRank = selfIdx
@@ -815,6 +821,12 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 {
                     cacheBufferId = mCacheTransBufferManager->assignBufferIndexForRecv();
                 }
+                // Slot reserved (dynamically or pre-assigned). Anchor
+                // the per-request KV transfer timeout from this point —
+                // before this, the worker was still queued or waiting
+                // for a slot, neither of which is "in transfer." See
+                // CacheTransceiver::maybeQuarantineLocked.
+                llmRequest.setKvCacheActualTransferStart(LlmRequest::getSteadyClockNow());
                 auto [recvSplitCachestmp, bufferCoverTargetNumtmp, onlyUseDynamicBuffer]
                     = mCacheTransBufferManager->getOrAllocateRecvBuffers(
                         cacheBufferId, static_cast<int>(targetNum), bufferEleSizes, bufferManager);

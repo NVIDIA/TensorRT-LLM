@@ -406,11 +406,18 @@ private:
     /// thread (and any asynchronous queue inside CacheSender /
     /// CacheReceiver) can dereference the request safely as long as the
     /// transceiver has not erased this entry.
+    ///
+    /// The per-request KV transfer timeout is anchored to
+    /// @c LlmRequest::getKvCacheActualTransferStart(), recorded by the
+    /// formatters once a transfer-buffer slot has been acquired. There
+    /// is intentionally no captured deadline on this struct: a
+    /// deeply-queued request without an actual-transfer-start time
+    /// cannot be quarantined, which prevents queue-starvation false
+    /// positives.
     struct TrackedFuture
     {
         std::shared_ptr<LlmRequest> request;
         std::future<void> future;
-        std::chrono::steady_clock::time_point deadline;
         /// True once the per-request timeout has fired and we have flipped
         /// the request to an error state. The entry stays in the vector
         /// (and the future stays pinned) until the worker actually
@@ -444,10 +451,6 @@ private:
     RequestStatuses checkContextTransferStatusImpl(
         std::optional<int> const& atLeastRequestNum, bool markComplete, bool allowBlocking);
     void checkGenTransferStatusImpl(std::optional<int> const& atLeastRequestNum, bool allowBlocking);
-
-    /// Compute the per-entry deadline for a tracked transfer.
-    [[nodiscard]] std::chrono::steady_clock::time_point computeTrackedFutureDeadline(
-        std::chrono::steady_clock::time_point requestStart) const;
 
     std::unique_ptr<CacheSender> mCacheSender;
     std::unique_ptr<CacheReceiver> mCacheReceiver;

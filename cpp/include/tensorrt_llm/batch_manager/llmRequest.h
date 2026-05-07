@@ -1797,6 +1797,46 @@ public:
                 .count());
     }
 
+    /// @brief Mark when the actual KV transfer (post slot acquisition,
+    /// post pre-data handshake) began for this request.
+    ///
+    /// This is distinct from @ref setKvCacheTransferStart: that one is
+    /// called at admit / worker-dequeue time and feeds the
+    /// `kv_cache_transfer_time_ms` perf metric (which has historically
+    /// included queue + slot wait). The "actual transfer start" is
+    /// recorded by the formatters after `assignBufferIndexFor*` returns,
+    /// when the worker is about to begin the data movement, and is the
+    /// correct anchor for the `kvTransferTimeoutMs` deadline used by
+    /// CacheTransceiver's quarantine logic.
+    ///
+    /// Idempotent: subsequent calls within the same transfer (e.g., for
+    /// MLA / hybrid models that acquire multiple pool slots) are no-ops
+    /// once the field is set.
+    void setKvCacheActualTransferStart(TimePoint time) const
+    {
+        if (mKvCacheActualTransferStart == TimePoint{})
+        {
+            mKvCacheActualTransferStart = maybeToGlobalSteadyClock(time);
+        }
+    }
+
+    [[nodiscard]] TimePoint getKvCacheActualTransferStart() const noexcept
+    {
+        return mKvCacheActualTransferStart;
+    }
+
+    [[nodiscard]] bool hasKvCacheActualTransferStart() const noexcept
+    {
+        return mKvCacheActualTransferStart != TimePoint{};
+    }
+
+    /// Reset before re-issuing a transfer (e.g., on retry). Not used in
+    /// PR #13796's flow but kept symmetric with the perf-metric API.
+    void clearKvCacheActualTransferStart() const noexcept
+    {
+        mKvCacheActualTransferStart = TimePoint{};
+    }
+
     void updateKvCacheSize(size_t targetBufferSize) const
     {
         mPerfMetrics.timingMetrics.kvCacheSize += targetBufferSize;
@@ -2117,6 +2157,17 @@ protected:
     // Performance metrics. Should be updatable even from a const LlmRequest reference.
     bool mReturnPerfMetrics{false};
     mutable executor::RequestPerfMetrics mPerfMetrics;
+
+    /// Time at which the disagg KV cache transfer actually started for
+    /// this request — recorded by the formatters once a transfer-buffer
+    /// slot has been acquired (i.e., once the worker is about to begin
+    /// data movement). Distinct from
+    /// @c mPerfMetrics.timingMetrics.kvCacheTransferStart, which is set
+    /// at admit / worker-dequeue time and thus includes queue / slot
+    /// wait. Used by @c CacheTransceiver::maybeQuarantineLocked as the
+    /// anchor for @c kvTransferTimeoutMs so that a deeply-queued
+    /// request is not quarantined for queue starvation.
+    mutable TimePoint mKvCacheActualTransferStart{};
 
     // Guided decoding params.
     std::optional<executor::GuidedDecodingParams> mGuidedDecodingParams{std::nullopt};

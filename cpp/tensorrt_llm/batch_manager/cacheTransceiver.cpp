@@ -339,8 +339,11 @@ void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmReques
     }
     setContextState(llmRequest.get());
     auto future = mCacheSender->sendAsync(llmRequest);
-    auto const deadline = computeTrackedFutureDeadline(/*requestStart=*/std::chrono::steady_clock::now());
-    mSenderFutures.push_back(TrackedFuture{std::move(llmRequest), std::move(future), deadline, false, false});
+    // Note: no admit-time deadline is captured. The per-request KV
+    // transfer timeout (kvTransferTimeoutMs) is anchored to
+    // LlmRequest::getKvCacheActualTransferStart(), set by the
+    // formatters once the worker has acquired a transfer-buffer slot.
+    mSenderFutures.push_back(TrackedFuture{std::move(llmRequest), std::move(future), false, false});
 }
 
 void CacheTransceiver::respondAndSendLayerWise(
@@ -356,8 +359,7 @@ void CacheTransceiver::respondAndSendLayerWise(
         llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
         setContextState(llmRequest.get());
         auto future = mCacheSender->sendAsync(llmRequest);
-        auto const deadline = computeTrackedFutureDeadline(/*requestStart=*/std::chrono::steady_clock::now());
-        mSenderFutures.push_back(TrackedFuture{llmRequest, std::move(future), deadline, false, false});
+        mSenderFutures.push_back(TrackedFuture{llmRequest, std::move(future), false, false});
     }
 }
 
@@ -411,9 +413,9 @@ void CacheTransceiver::requestAndReceiveAsync(std::shared_ptr<LlmRequest> llmReq
     }
 
     auto future = mCacheReceiver->receiveAsync(llmRequest);
-    auto const deadline = computeTrackedFutureDeadline(/*requestStart=*/std::chrono::steady_clock::now());
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS);
-    mRequesterFutures.push_back(TrackedFuture{std::move(llmRequest), std::move(future), deadline, false, false});
+    // Note: no admit-time deadline; see respondAndSendAsync.
+    mRequesterFutures.push_back(TrackedFuture{std::move(llmRequest), std::move(future), false, false});
 }
 
 std::vector<LlmRequest::RequestIdType> gatherRequestIds(
@@ -512,24 +514,6 @@ void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm,
 
 // ----- Internal helpers ----------------------------------------------------
 
-std::chrono::steady_clock::time_point CacheTransceiver::computeTrackedFutureDeadline(
-    std::chrono::steady_clock::time_point requestStart) const
-{
-    // Returns time_point::max() when no per-request timeout is configured,
-    // so the polling path treats the entry as "never times out" — matching
-    // the legacy behaviour for callers that did not opt into timeouts.
-    if (!mCacheTransceiverConfig.has_value())
-    {
-        return std::chrono::steady_clock::time_point::max();
-    }
-    auto const timeoutMs = mCacheTransceiverConfig->getKvTransferTimeoutMs();
-    if (!timeoutMs.has_value())
-    {
-        return std::chrono::steady_clock::time_point::max();
-    }
-    return requestStart + std::chrono::milliseconds(timeoutMs.value());
-}
-
 void CacheTransceiver::updateHealthLocked()
 {
     auto const now = std::chrono::steady_clock::now();
@@ -569,12 +553,33 @@ bool CacheTransceiver::maybeQuarantineLocked(TrackedFuture& entry, RequestStatus
     {
         return false;
     }
-    if (entry.deadline == std::chrono::steady_clock::time_point::max())
+    if (!mCacheTransceiverConfig.has_value())
     {
         return false;
     }
+    auto const timeoutMs = mCacheTransceiverConfig->getKvTransferTimeoutMs();
+    if (!timeoutMs.has_value())
+    {
+        return false;
+    }
+    // Defer the deadline check until the worker has actually started
+    // the transfer (post slot acquisition). Requests still sitting in
+    // the worker queue or waiting on a slot are not "stuck" in any
+    // transport-relevant sense; quarantining them for queue starvation
+    // turned every burst into a false-positive cascade — see
+    // claude-swe/disagg-deadline-at-transfer-start-fix.md and the
+    // d224/d227 findings (TCP at ~3 Gbps, 1-slot serialization, conc
+    // 128) where this mis-accounting caused ~80% of requests to be
+    // quarantined for queue wait rather than for any actual NIXL/UCX
+    // wedge.
+    if (!entry.request->hasKvCacheActualTransferStart())
+    {
+        return false;
+    }
+    auto const transferStart = entry.request->getKvCacheActualTransferStart();
+    auto const deadline = transferStart + std::chrono::milliseconds(timeoutMs.value());
     auto const now = std::chrono::steady_clock::now();
-    if (now < entry.deadline)
+    if (now < deadline)
     {
         return false;
     }
@@ -590,9 +595,9 @@ bool CacheTransceiver::maybeQuarantineLocked(TrackedFuture& entry, RequestStatus
         updateHealthLocked();
     }
     TLLM_LOG_WARNING(
-        "Quarantining request %ld: per-request KV transfer deadline exceeded; future stays pinned in C++ until "
-        "worker reaches a final state.",
-        entry.request->mRequestId);
+        "Quarantining request %ld: per-request KV transfer deadline exceeded after slot acquisition "
+        "(actual transfer time > %lld ms). Future stays pinned in C++ until worker reaches a final state.",
+        entry.request->mRequestId, static_cast<long long>(timeoutMs.value()));
     return true;
 }
 

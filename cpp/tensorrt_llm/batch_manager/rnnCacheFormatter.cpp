@@ -149,6 +149,12 @@ void RnnCacheFormatter::format(TransferSession& session)
     }
 
     auto cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForSend();
+    // RNN-state slot reserved on the send side. Anchor the per-request
+    // KV transfer timeout from this point. Idempotent — for hybrid
+    // models that also acquire a KV slot in CacheFormatter::format,
+    // whichever fires first wins. See
+    // CacheTransceiver::maybeQuarantineLocked.
+    llmRequest.setKvCacheActualTransferStart(LlmRequest::getSteadyClockNow());
     auto allocationResult = mRnnCacheTransBufferManager->getOrAllocateSendBuffers(
         cacheBufferId, static_cast<int>(bufferTargetNum), bufferSizesPerTarget, bufferManager);
     auto& outputBuffers = std::get<0>(allocationResult);
@@ -323,6 +329,9 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     {
         cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForRecv();
     }
+    // RNN-state slot reserved on the recv side. Idempotent (see send
+    // side / CacheFormatter::unformat).
+    llmRequest.setKvCacheActualTransferStart(LlmRequest::getSteadyClockNow());
 
     auto allocationResult = mRnnCacheTransBufferManager->getOrAllocateRecvBuffers(
         cacheBufferId, static_cast<int>(sourceNum), bufferSizesPerSource, bufferManager);

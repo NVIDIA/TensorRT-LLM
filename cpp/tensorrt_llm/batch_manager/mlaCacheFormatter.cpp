@@ -254,6 +254,11 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         };
         auto bufferEleSizes = getBufferSizeForTarget();
         auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend();
+        // MLA indexer-K-cache slot reserved. Idempotent — if the
+        // primary KV slot was already acquired earlier in
+        // CacheFormatter::format, this call is a no-op. See
+        // CacheTransceiver::maybeQuarantineLocked.
+        llmRequest.setKvCacheActualTransferStart(LlmRequest::getSteadyClockNow());
         auto result = mCacheTransBufferManagers[transferIndexerKCache]->getOrAllocateSendBuffers(
             cacheBufferId, static_cast<int>(pPDomainSize * cPDomainSize), bufferEleSizes, bufferManager);
         auto& outputSplitCaches = std::get<0>(result);
@@ -495,6 +500,9 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             {
                 cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForRecv();
             }
+            // MLA indexer-K-cache slot reserved on the receive side.
+            // Idempotent (see CacheFormatter::unformat).
+            llmRequest.setKvCacheActualTransferStart(LlmRequest::getSteadyClockNow());
 
             auto targetNum = pickUpConnections.size();
 
