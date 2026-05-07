@@ -3,8 +3,8 @@ import random
 import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
-                    TypeVar, Union)
+from typing import (Any, Callable, ClassVar, Dict, List, Optional, Protocol,
+                    Tuple, Type, TypeVar, Union)
 
 import torch
 from PIL import Image
@@ -135,6 +135,14 @@ class BaseMultimodalInputProcessor(ABC):
     If these are not implemented, the pipeline detokenizes the text prompt first and then
     processes the multimodal inputs.
     """
+
+    # Whether multimodal soft-token runs need bidirectional attention spanning
+    # the full block. When True, the chunked-prefill scheduler must keep each
+    # MM block intact within a single iteration (snap-up or snap-down at chunk
+    # boundaries) so the second half does not attend to a frozen first half.
+    # Default False: most VLMs (Llava, Qwen-VL) use causal attention over MM
+    # tokens and tolerate splitting. Gemma4 sets True.
+    mm_bidirectional_blocks: ClassVar[bool] = False
 
     def __init__(self,
                  model_path,
@@ -838,6 +846,12 @@ def maybe_compute_mm_embed_cumsum(
     # Cache the int64 cumsum; request-invariant, read once per chunk.
     mm_data["multimodal_embed_mask_cumsum"] = embed_mask.cumsum(
         0, dtype=torch.int64)
+    # Propagate the bidirectional-MM gate so the chunked-prefill scheduler
+    # can align chunk boundaries to MM blocks only for processors that
+    # actually require intact bidirectional attention (Gemma4). Defaults to
+    # False on the base class — most VLMs (Llava, Qwen-VL) tolerate splits.
+    mm_data["mm_bidirectional_blocks"] = bool(
+        getattr(type(input_processor), "mm_bidirectional_blocks", False))
 
 
 def create_input_processor_with_hash(

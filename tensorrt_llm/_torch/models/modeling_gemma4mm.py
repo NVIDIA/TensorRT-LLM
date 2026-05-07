@@ -199,6 +199,11 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
     processing using the image processor saved in the model directory.
     """
 
+    # Gemma4 image/audio soft-token runs use bidirectional attention spanning
+    # the full block — chunked-prefill must keep each block intact in a single
+    # iteration. See registry.BaseMultimodalInputProcessor.mm_bidirectional_blocks.
+    mm_bidirectional_blocks = True
+
     def __init__(
         self,
         model_path: str,
