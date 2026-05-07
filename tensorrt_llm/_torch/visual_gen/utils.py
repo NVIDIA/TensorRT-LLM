@@ -98,6 +98,13 @@ class SequenceSharder:
         rank = vgm.seq_rank
         group = vgm.seq_group
 
+        if size > 1 and group is None:
+            raise ValueError(
+                "SequenceSharder.from_vgm requires vgm.seq_group to be set when "
+                f"vgm.seq_size ({size}) > 1; otherwise gather() would call "
+                "dist.all_gather(..., group=None) and use the default process group."
+            )
+
         if size > 1 and vgm.ulysses_size > 1:
             for label, count in (
                 ("num_attention_heads", num_attention_heads),

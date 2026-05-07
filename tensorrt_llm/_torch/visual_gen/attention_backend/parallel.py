@@ -559,8 +559,10 @@ class RingAttention(AttentionBackend):
         # Bypass ring for cross-attention (Q/KV seq lengths differ).
         if k.shape[1] != q.shape[1]:
             return self.inner.forward(q=q, k=k, v=v, attention_mask=attention_mask, **kwargs)
-        if attention_mask == PredefinedAttentionMask.CAUSAL:
-            raise NotImplementedError("Causal ring attention not implemented yet.")
+        if attention_mask != PredefinedAttentionMask.FULL:
+            raise NotImplementedError(
+                f"RingAttention only supports FULL attention mask, got {attention_mask}."
+            )
 
         inner_kw = {kk: vv for kk, vv in kwargs.items() if kk != "attention_mask"}
 
