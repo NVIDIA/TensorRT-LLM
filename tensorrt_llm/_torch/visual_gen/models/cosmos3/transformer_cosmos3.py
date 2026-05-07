@@ -13,7 +13,6 @@ from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
-from tensorrt_llm._torch.visual_gen.parallelism import setup_sequence_parallelism
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -652,13 +651,45 @@ class Cosmos3VFMTransformer(nn.Module):
                 f"Position embedding type {pretrained_config.position_embedding_type} not supported"
             )
 
-        self.use_ulysses, self.ulysses_size, self.ulysses_pg, self.ulysses_rank = (
-            setup_sequence_parallelism(
-                model_config=model_config,
-                num_attention_heads=self.num_attention_heads,
-                num_kv_heads=self.num_kv_heads,
+        vgm = model_config.visual_gen_mapping
+        attn2d_row_size = vgm.attn2d_row_size if vgm else 1
+        attn2d_col_size = vgm.attn2d_col_size if vgm else 1
+        attn2d_mesh_size = attn2d_row_size * attn2d_col_size
+        ulysses_size = vgm.ulysses_size if vgm else 1
+        use_attn2d = attn2d_mesh_size > 1
+        use_ulysses = ulysses_size > 1
+
+        if vgm is not None and vgm.tp_size > 1:
+            raise ValueError(
+                f"Cosmos3 does not support tensor parallelism. Got tp_size={vgm.tp_size}"
             )
-        )
+
+        if (
+            use_ulysses
+            and self.num_attention_heads % ulysses_size != 0
+            and self.num_kv_heads % ulysses_size != 0
+        ):
+            raise ValueError(
+                f"num_attention_heads ({self.num_attention_heads}) and "
+                f"num_kv_heads ({self.num_kv_heads}) must be divisible by "
+                f"ulysses_size ({ulysses_size})"
+            )
+
+        if use_attn2d:
+            self.use_seq_parallel = True
+            self.seq_parallel_size = attn2d_mesh_size
+            self.seq_parallel_pg = vgm.attn2d_mesh_group
+            self.seq_parallel_rank = vgm.attn2d_mesh_rank
+        elif use_ulysses:
+            self.use_seq_parallel = True
+            self.seq_parallel_size = ulysses_size
+            self.seq_parallel_pg = vgm.ulysses_group
+            self.seq_parallel_rank = vgm.ulysses_rank
+        else:
+            self.use_seq_parallel = False
+            self.seq_parallel_size = 1
+            self.seq_parallel_pg = None
+            self.seq_parallel_rank = 0
 
         self.language_model = Cosmos3LanguageModel(model_config)
 
@@ -872,13 +903,15 @@ class Cosmos3VFMTransformer(nn.Module):
             cached_kv_full = self.language_model(text_ids, text_mask, freqs_und)
             self.cached_freqs_gen = freqs_gen
 
-            if self.ulysses_size > 1:
-                rank = self.ulysses_rank
+            if self.use_seq_parallel:
+                rank = self.seq_parallel_rank
                 # Round max_real_len up to next multiple of ulysses_size.
-                # At most ulysses_size-1 extra positions, negligible softmax dilution.
-                val = (self.ulysses_size - max_real_len % self.ulysses_size) % self.ulysses_size
+                # At most seq_parallel_size-1 extra positions, negligible softmax dilution.
+                val = (
+                    self.seq_parallel_size - max_real_len % self.seq_parallel_size
+                ) % self.seq_parallel_size
                 S_text_shard_total = int(max_real_len) + val
-                S_text_shard = S_text_shard_total // self.ulysses_size
+                S_text_shard = S_text_shard_total // self.seq_parallel_size
 
                 self.cached_kv = []
                 for k, v in cached_kv_full:
@@ -897,9 +930,9 @@ class Cosmos3VFMTransformer(nn.Module):
             else:
                 self.cached_kv = cached_kv_full
 
-        if self.ulysses_size > 1:
+        if self.use_seq_parallel:
             S_gen = hidden_gen.shape[1]
-            pad = (self.ulysses_size - S_gen % self.ulysses_size) % self.ulysses_size
+            pad = (self.seq_parallel_size - S_gen % self.seq_parallel_size) % self.seq_parallel_size
             if pad > 0:
                 # This will cause minor noise in softmax due to padding.
                 hidden_gen = F.pad(hidden_gen, (0, 0, 0, pad))
@@ -908,30 +941,30 @@ class Cosmos3VFMTransformer(nn.Module):
                     F.pad(cos, (0, 0, 0, pad)),
                     F.pad(sin, (0, 0, 0, pad)),
                 )
-            S_shard = S_gen // self.ulysses_size
+            S_shard = S_gen // self.seq_parallel_size
             hidden_gen = hidden_gen[
-                :, self.ulysses_rank * S_shard : (self.ulysses_rank + 1) * S_shard
+                :, self.seq_parallel_rank * S_shard : (self.seq_parallel_rank + 1) * S_shard
             ]
             # Shard freqs_gen to match
             cos, sin = self.cached_freqs_gen
             freqs_gen = (
-                cos[:, self.ulysses_rank * S_shard : (self.ulysses_rank + 1) * S_shard],
-                sin[:, self.ulysses_rank * S_shard : (self.ulysses_rank + 1) * S_shard],
+                cos[:, self.seq_parallel_rank * S_shard : (self.seq_parallel_rank + 1) * S_shard],
+                sin[:, self.seq_parallel_rank * S_shard : (self.seq_parallel_rank + 1) * S_shard],
             )
         else:
             freqs_gen = self.cached_freqs_gen
 
         for i, layer in enumerate(self.gen_layers):
             k_und, v_und = self.cached_kv[i]
-            if self.ulysses_size <= 1:
+            if self.seq_parallel_size <= 1:
                 k_und = k_und[:, :max_real_len]
                 v_und = v_und[:, :max_real_len]
             hidden_gen = layer(hidden_gen, k_und, v_und, freqs_gen)
 
-        if self.ulysses_size > 1:
+        if self.use_seq_parallel:
             hidden_gen = hidden_gen.contiguous()
-            parts = [torch.empty_like(hidden_gen) for _ in range(self.ulysses_size)]
-            dist.all_gather(parts, hidden_gen, group=self.ulysses_pg)
+            parts = [torch.empty_like(hidden_gen) for _ in range(self.seq_parallel_size)]
+            dist.all_gather(parts, hidden_gen, group=self.seq_parallel_pg)
             hidden_gen = torch.cat(parts, dim=1)[:, :S_gen]  # [B, S_gen, patch_latent_dim]
 
         hidden_gen = self.norm_moe_gen(hidden_gen)
