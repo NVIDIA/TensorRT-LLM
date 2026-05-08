@@ -208,6 +208,16 @@ transforms:
   fuse_allreduce_residual_rmsnorm:
     stage: post_load_fusion
     requires_shape_prop: true
+  # Insert a tiny cross-rank AR barrier every Nth post-MoE fused-AR site.
+  # Bounds the per-layer skew accumulated inside the single full-iteration
+  # CUDA graph captured by the AutoDeploy backend.  Off by default; toggle
+  # via `enabled: true` here, or override at runtime with the
+  # `AD_LAYER_BARRIER_N=<int>` env var (which also auto-enables).
+  # Must run AFTER fuse_allreduce_residual_rmsnorm.
+  insert_layer_barriers:
+    stage: post_load_fusion
+    enabled: false
+    barrier_every_n_layers: 4
   fuse_rmsnorm:
     stage: post_load_fusion
     rmsnorm_backend: flashinfer
