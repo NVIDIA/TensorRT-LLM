@@ -1052,27 +1052,67 @@ def _checkpointing_main_kernel(
     # win of replay-style checkpointing on the common (non-checkpoint) step.
     if WRITE_CHECKPOINT:
         if USE_RS_ROUNDING:
-            # Generate (M, dstate) random tensor for stochastic rounding.
-            # Used by fp16 / int8 / int16 / fp8 SR paths below.  Quarter-sized
-            # randint4x calls produce 4 u32s each; we interleave them into the
-            # full (M, dstate) tensor — 4x fewer PRNG rounds vs per-element.
+            # Generate random tensor for stochastic rounding.  The amount of
+            # randomness needed depends on the SR codegen path:
+            #   fp16 SR  (cvt.rs.f16x2):           1 b32 per 2 outputs (pack=2)
+            #   fp8  SR  (cvt.rs.satfinite.e4m3x4): 1 b32 per 4 outputs (pack=4)
+            #   int8/int16 SR (uniform-noise + floor): 1 b32 per output
+            # The PTX cvt.rs.* instructions consume a single 32-bit random
+            # and split the bits internally for 2 or 4 conversions.  The
+            # tl.inline_asm_elementwise wrapper has uniform `pack` across all
+            # args, so it provides 2 (fp16) or 4 (fp8) rand inputs per asm
+            # call but only the first is read; the others are dead.  Generate
+            # only what's actually consumed and broadcast to fill the unused
+            # slots — saves Philox rounds proportionally.
+            if QUANT_MAX > 0.0 and state_ptrs.dtype.element_ty == tl.float8e4nv:
+                RAND_DIVISOR: tl.constexpr = 4  # fp8 SR
+            elif QUANT_MAX == 0.0:
+                RAND_DIVISOR: tl.constexpr = 2  # fp16 SR (only fp16 supported here)
+            else:
+                RAND_DIVISOR: tl.constexpr = 1  # int8/int16 SR (full per-element)
+
             rand_seed = tl.load(rand_seed_ptr)
             base_rand = cache_batch_idx * stride_state_batch + pid_h * stride_state_head
-            offs_n_q = tl.arange(0, BLOCK_SIZE_DSTATE // 4)
+            # Number of unique randoms per row = dstate / RAND_DIVISOR.
+            # randint4x emits 4 randoms per offset, so use that / 4 offsets.
+            offs_n_q = tl.arange(0, BLOCK_SIZE_DSTATE // (4 * RAND_DIVISOR))
             rand_offsets_q = (
                 base_rand
                 + offs_m[:, None] * stride_state_dim
-                + offs_n_q[None, :] * (stride_state_dstate * 4)
-            )  # (M, dstate//4)
+                + offs_n_q[None, :] * (stride_state_dstate * 4 * RAND_DIVISOR)
+            )  # (M, dstate / (4*RAND_DIVISOR))
             if PHILOX_ROUNDS > 0:
                 r0, r1, r2, r3 = tl.randint4x(rand_seed, rand_offsets_q, PHILOX_ROUNDS)
             else:
                 r0, r1, r2, r3 = tl.randint4x(rand_seed, rand_offsets_q)
-            # Interleave 4 quarter-sized tensors → full (M, dstate) random tensor
-            r01 = tl.join(r0, r1)  # (M, dstate//4, 2)
-            r23 = tl.join(r2, r3)  # (M, dstate//4, 2)
-            r0123 = tl.join(r01, r23)  # (M, dstate//4, 2, 2)
-            rand = tl.reshape(r0123, (BLOCK_SIZE_M, BLOCK_SIZE_DSTATE))
+            r01 = tl.join(r0, r1)
+            r23 = tl.join(r2, r3)
+            r0123 = tl.join(r01, r23)
+            rand_compact = tl.reshape(
+                r0123, (BLOCK_SIZE_M, BLOCK_SIZE_DSTATE // RAND_DIVISOR)
+            )
+            # Broadcast each unique rand to RAND_DIVISOR adjacent positions
+            # in the dstate axis.  Pack-group (pack=2 fp16 / pack=4 fp8)
+            # consumes adjacent positions; the unique rand lands at the
+            # asm's read slot ($3 fp16 / $5 fp8); duplicates feed the dead
+            # slots ($4 fp16; $6/$7/$8 fp8).  Triton's broadcast_to is
+            # stride-0 in IR.
+            #
+            # Tested zero-fill alternative (tl.join with zeros): essentially
+            # equivalent register count (95 vs 96 at one config) and same
+            # timing.  ptxas does not use RZ for the dead asm input slots
+            # in either case; the extra ~15 regs vs pre-fix come from
+            # rand_compact's lifetime across the asm call, not from the
+            # fill pattern.  Broadcast wins on simplicity.
+            if RAND_DIVISOR > 1:
+                rand_3d = rand_compact[:, :, None]
+                rand_3d = tl.broadcast_to(
+                    rand_3d,
+                    (BLOCK_SIZE_M, BLOCK_SIZE_DSTATE // RAND_DIVISOR, RAND_DIVISOR),
+                )
+                rand = tl.reshape(rand_3d, (BLOCK_SIZE_M, BLOCK_SIZE_DSTATE))
+            else:
+                rand = rand_compact
 
         if QUANT_MAX > 0.0:
             # Quantized state path: int8 / int16 / fp8_e4m3fn (RN or SR).
