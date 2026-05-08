@@ -12,7 +12,9 @@ if TYPE_CHECKING:
     from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm._torch.attention_backend import trtllm_gen
-from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._utils import (get_sm_version, maybe_pin_memory,
+                                 prefer_pinned, torch_dtype_to_binding)
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.llmapi import SkipSoftmaxAttentionConfig
@@ -25,7 +27,6 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
                         PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
-from .trtllm_gen import trtllm_gen_attention
 
 # Enable TRTLLM-Gen attention backend via environment variable (default: off).
 _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = (os.environ.get(
@@ -1201,6 +1202,25 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return AttentionMaskType.padding
         raise ValueError("Unexpected attention mask type")
 
+    def _get_trtllm_gen_backend(
+        self, kv_cache_manager: Optional[KVCacheManager]
+    ) -> trtllm_gen.FlashInferTrtllmGenAttention:
+        backend = getattr(self, "_trtllm_gen_backend", None)
+        backend_kv_cache_manager = getattr(
+            self, "_trtllm_gen_backend_kv_cache_manager", None)
+        backend_quant_config = getattr(self, "_trtllm_gen_backend_quant_config",
+                                       None)
+        if (backend is None or backend_kv_cache_manager is not kv_cache_manager
+                or backend_quant_config is not self.quant_config):
+            backend = trtllm_gen.FlashInferTrtllmGenAttention(
+                kv_cache_manager=kv_cache_manager,
+                quant_config=self.quant_config,
+            )
+            self._trtllm_gen_backend = backend
+            self._trtllm_gen_backend_kv_cache_manager = kv_cache_manager
+            self._trtllm_gen_backend_quant_config = self.quant_config
+        return backend
+
     def _run(
         self,
         q: torch.Tensor,
@@ -1344,8 +1364,17 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         use_sage_attn = (forward_args.sage_attn_num_elts_per_blk_q > 0
                          or forward_args.sage_attn_num_elts_per_blk_k > 0
                          or forward_args.sage_attn_num_elts_per_blk_v > 0)
-        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not helix_active and not use_sage_attn and trtllm_gen.is_supported(
-                q=q,
+        trtllm_gen_backend = None
+        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not helix_active and not use_sage_attn:
+            trtllm_gen_backend = self._get_trtllm_gen_backend(
+                metadata.kv_cache_manager)
+            kv_cache_dtype = torch_dtype_to_binding(q.dtype)
+            if metadata.kv_cache_manager is not None:
+                kv_cache_dtype = metadata.kv_cache_manager.dtype
+
+        if trtllm_gen_backend is not None and trtllm_gen_backend.is_supported(
+                q_dtype=q.dtype,
+                kv_cache_dtype=kv_cache_dtype,
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_dim,
@@ -1367,15 +1396,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 qk_rope_head_dim=self.qk_rope_head_dim,
                 is_fused_qkv=is_fused_qkv,
                 update_kv_cache=update_kv_cache,
-                has_cross_kv=False,
+                attention_input_type=int(attention_input_type),
                 quant_config=self.quant_config,
-                kv_cache_manager=metadata.kv_cache_manager,
+                sparse_kv_indices=sparse_kv_indices,
+                sparse_attn_indices=sparse_attn_indices,
                 skip_softmax_threshold_scale_factor_prefill=
                 skip_softmax_threshold_scale_factor_prefill,
                 skip_softmax_threshold_scale_factor_decode=
                 skip_softmax_threshold_scale_factor_decode,
         )[0]:
-            trtllm_gen_attention(
+            trtllm_gen_backend.attention(
                 q,
                 k,
                 v,
@@ -1454,8 +1484,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 forward_args.mla_bmm1_scale,
                 forward_args.mla_bmm2_scale,
                 forward_args.quant_q_buffer,
-                self.quant_config,
-                metadata.kv_cache_manager,
                 metadata.num_contexts,
                 metadata.num_ctx_tokens,
                 global_layer_idx=self.layer_idx,
