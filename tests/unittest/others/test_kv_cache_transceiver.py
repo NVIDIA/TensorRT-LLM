@@ -1033,3 +1033,25 @@ def test_hybrid_cache_transceiver_cancel_request(backend, monkeypatch):
     # Block the main thread due to the async operation
     time.sleep(2)
     assert gen_request.state == LlmRequestState.DISAGG_TRANS_ERROR
+
+
+@pytest.mark.timeout(60)
+@pytest.mark.parametrize("disagg_transceiver_pair",
+                         [(AttentionTypeCpp.DEFAULT, "NIXL"),
+                          (AttentionTypeCpp.DEFAULT, "UCX")],
+                         ids=["NIXL", "UCX"],
+                         indirect=True)
+def test_pool_poisoned_default_false(disagg_transceiver_pair):
+    """A fresh transceiver pair reports both pools as not poisoned.
+
+    Regression test for the is_recv_pool_poisoned / is_send_pool_poisoned
+    accessors that surface BaseTransBufferManager::mPoisoned to higher
+    layers (e.g. dynamo's request handler) so they can escalate the worker
+    to permanently unhealthy without parsing exception text from the
+    request-error path.
+    """
+    _, _, ctx_transceiver, gen_transceiver = disagg_transceiver_pair
+    assert ctx_transceiver.is_recv_pool_poisoned() is False
+    assert ctx_transceiver.is_send_pool_poisoned() is False
+    assert gen_transceiver.is_recv_pool_poisoned() is False
+    assert gen_transceiver.is_send_pool_poisoned() is False

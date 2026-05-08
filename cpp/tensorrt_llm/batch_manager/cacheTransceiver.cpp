@@ -1000,4 +1000,35 @@ bool CacheTransceiver::cancelRequest(std::shared_ptr<LlmRequest> llmRequest)
     return false;
 }
 
+bool CacheTransceiver::isRecvPoolPoisoned() const
+{
+    // Walk every BaseTransBufferManager (KV pools + optional RNN pool). Once
+    // any underlying pool's mPoisoned flag is set, BaseTransBufferManager::
+    // assignBufferIndex unconditionally throws on subsequent allocations and
+    // there is no recovery path short of restarting the process. Aggregating
+    // per-manager state into a single boolean lets callers (e.g. the Python
+    // request handler / readiness probe) escalate the worker to permanently
+    // unhealthy without depending on parsing exception text.
+    for (auto const* mgr : mCacheTransBufferManagerPtrs)
+    {
+        if (mgr != nullptr && mgr->isRecvPoolPoisoned())
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool CacheTransceiver::isSendPoolPoisoned() const
+{
+    for (auto const* mgr : mCacheTransBufferManagerPtrs)
+    {
+        if (mgr != nullptr && mgr->isSendPoolPoisoned())
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace tensorrt_llm::batch_manager

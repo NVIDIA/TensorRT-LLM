@@ -140,6 +140,28 @@ class KvCacheTransceiver(ABC):
         """
         ...
 
+    def is_recv_pool_poisoned(self) -> bool:
+        """Returns True if any underlying receive buffer pool has been poisoned.
+
+        A poisoned pool refuses every subsequent allocation in the C++
+        BaseTransBufferManager::assignBufferIndex guard, and the only recovery
+        is process restart. Higher layers (e.g. the dynamo request handler /
+        readiness probe) check this to escalate the worker to permanently
+        unhealthy without parsing exception text from the request-error path.
+        Default returns False so subclasses that don't have an underlying
+        C++ buffer pool (test mocks, generation-first Python transceiver) are
+        unaffected.
+        """
+        return False
+
+    def is_send_pool_poisoned(self) -> bool:
+        """Returns True if any underlying send buffer pool has been poisoned.
+
+        Symmetric counterpart of is_recv_pool_poisoned; the historically
+        observed wedge is receive-side only.
+        """
+        return False
+
     def shutdown(self):
         """Shut down the transceiver and release registered resources."""
 
@@ -213,6 +235,12 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
         # Cpp kv cache transceiver will set the disaggregated params to context response
         # Only new py cache transceiver will support gen-first disagg
         return {}
+
+    def is_recv_pool_poisoned(self) -> bool:
+        return self.impl.is_recv_pool_poisoned()
+
+    def is_send_pool_poisoned(self) -> bool:
+        return self.impl.is_send_pool_poisoned()
 
 
 class CacheTransBufferManager:

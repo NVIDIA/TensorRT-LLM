@@ -268,6 +268,23 @@ public:
         return mMaxNumTokens;
     }
 
+    /// @brief Returns true if the receive buffer pool has been poisoned.
+    /// A poisoned pool refuses every subsequent allocation in
+    /// assignBufferIndex (see baseTransBuffer.cpp:350) and the only
+    /// recovery is process restart. This accessor lets higher layers
+    /// query the state without parsing exception text.
+    [[nodiscard]] bool isRecvPoolPoisoned() const noexcept
+    {
+        return mConcurrenceRecvResource.mPoisoned.load(std::memory_order_relaxed);
+    }
+
+    /// @brief Returns true if the send buffer pool has been poisoned.
+    /// Same semantics as isRecvPoolPoisoned but for the send-side pool.
+    [[nodiscard]] bool isSendPoolPoisoned() const noexcept
+    {
+        return mConcurrenceSendResource.mPoisoned.load(std::memory_order_relaxed);
+    }
+
 protected:
     /// @brief Constructor - derived classes call this after computing buffer sizes.
     /// @param transferBufferSize Size of each transfer buffer in bytes.

@@ -227,6 +227,26 @@ public:
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) = 0;
+
+    /// @brief Returns true if any underlying receive buffer pool has been
+    /// poisoned and can no longer serve allocations until process restart.
+    /// Higher layers (e.g. dynamo's request handler / readiness probe) use
+    /// this to escalate the worker to permanently-unhealthy without parsing
+    /// exception text from the request-error path.
+    /// Default returns false so non-disagg subclasses do not need to
+    /// override.
+    [[nodiscard]] virtual bool isRecvPoolPoisoned() const
+    {
+        return false;
+    }
+
+    /// @brief Symmetric counterpart of isRecvPoolPoisoned for the send-side
+    /// pool. Provided for completeness; the historically-observed wedge is
+    /// receive-side only.
+    [[nodiscard]] virtual bool isSendPoolPoisoned() const
+    {
+        return false;
+    }
 };
 
 class CacheTransceiver : public BaseCacheTransceiver
@@ -273,6 +293,9 @@ public:
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) override;
+
+    [[nodiscard]] bool isRecvPoolPoisoned() const override;
+    [[nodiscard]] bool isSendPoolPoisoned() const override;
 
 private:
     void initializeCommState();
