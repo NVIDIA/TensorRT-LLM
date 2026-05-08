@@ -131,16 +131,11 @@ class MegaMoEDeepGemm(MoE):
         hidden_size: Optional[int] = None,
         intermediate_size: Optional[int] = None,
     ) -> Tuple[bool, Optional[str]]:
-        # MegaMoEDeepGemm.__init__ resolves an EP ProcessGroup via
-        # ``_resolve_ep_pg``, which hard-requires a live torch.distributed
-        # world. Reject the backend here so ``create_moe.get_moe_cls`` can
-        # fall back cleanly to a non-distributed-capable backend (e.g.
-        # CutlassFusedMoE) instead of failing during construction.
-        if not (dist.is_available() and dist.is_initialized()):
-            return False, (
-                "MegaMoEDeepGemm requires torch.distributed to be available "
-                "and initialized (mpirun or Ray) before module construction."
-            )
+        # Note: we intentionally do NOT probe ``torch.distributed`` state here.
+        # ``can_implement`` is a static capability query (SM / dtype / quant /
+        # shape). Whether a live EP ProcessGroup exists is a runtime concern,
+        # not a capability one, and ``__init__``'s ``_resolve_ep_pg`` will
+        # surface a clear error if dist is not initialized by the launcher.
         sm = get_sm_version()
         if sm != 100:
             return False, (
