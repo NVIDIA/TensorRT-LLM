@@ -123,6 +123,19 @@ class DwdpManager:
         self.num_groups = config.num_groups
         self.num_prefetch_experts = config.num_prefetch_experts
 
+        # Per-rank expert range. ``num_prefetch_experts`` is the rank-to-rank
+        # stride and ``num_experts_per_worker`` is the (uniform across ranks)
+        # storage chunk size. When the user requests redundancy
+        # (``num_prefetch_experts < num_experts_per_worker``) consecutive
+        # ranks' ranges overlap; when the partition is non-uniform (e.g.
+        # dwdp_size = 3 over 256 experts) the tail rank's
+        # ``[start, end)`` runs past ``num_experts`` and is later capped at
+        # weight-load time. ``_init_dwdp_expert_layout`` reads
+        # ``start_expert_id`` to install the correct ``slot_start`` /
+        # ``slot_end`` on every fused MoE backend before ``create_weights``.
+        self.start_expert_id = self.dwdp_rank * self.num_prefetch_experts
+        self.end_expert_id = self.start_expert_id + self.num_experts_per_worker
+
         self.dwdp_group = self._create_dwdp_comm()
 
         # SSOT for MoE layer indices; populated by configurable_moe.add_layer()

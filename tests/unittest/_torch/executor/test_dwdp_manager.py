@@ -110,6 +110,44 @@ class TestDwdpManagerLifecycle(unittest.TestCase):
         self.assertEqual(mgr._registered_layers, [])
         self.assertIs(mgr.dwdp_group, sub_comm)
         self.assertIsNone(mgr._weight_manager)
+        # start_expert_id / end_expert_id derive from
+        # num_prefetch_experts (stride) and num_experts_per_worker (size).
+        # rank=0: start=0, end=4.
+        self.assertEqual(mgr.start_expert_id, 0)
+        self.assertEqual(mgr.end_expert_id, 4)
+
+    def test_init_expert_range_uniform(self, mock_comm_world, _rank, _setup):
+        """Uniform partition (size == stride): each rank's range is a clean slice."""
+        _configure_mock_comm_world(mock_comm_world)
+        # dwdp_rank=1 with stride=4 -> start=4, end=4+4=8.
+        mgr = DwdpManager(
+            config=_make_config(dwdp_size=2),
+            dist=MagicMock(spec=MPIDist),
+            mapping=_make_mapping(dwdp_size=2, dwdp_rank=1),
+        )
+        self.assertEqual(mgr.start_expert_id, 4)
+        self.assertEqual(mgr.end_expert_id, 8)
+
+    def test_init_expert_range_redundancy(self, mock_comm_world, _rank, _setup):
+        """Redundancy partition (size > stride): adjacent ranges overlap."""
+        _configure_mock_comm_world(mock_comm_world)
+        redundant_config = DwdpConfig(
+            dwdp_size=2,
+            num_groups=1,
+            num_experts_per_worker=6,  # storage size
+            num_prefetch_experts=4,    # stride < size -> 2-expert overlap
+        )
+        # rank=0: [0, 6). rank=1 would be [4, 10) -> 2-expert overlap [4, 6).
+        mgr = DwdpManager(
+            config=redundant_config,
+            dist=MagicMock(spec=MPIDist),
+            mapping=_make_mapping(dwdp_size=2, dwdp_rank=0),
+        )
+        self.assertEqual(mgr.start_expert_id, 0)
+        self.assertEqual(mgr.end_expert_id, 6)
+        # Stored config knobs match what's plumbed into setup_dwdp.
+        self.assertEqual(mgr.num_experts_per_worker, 6)
+        self.assertEqual(mgr.num_prefetch_experts, 4)
 
     def test_init_rejects_non_mpi_dist(self, mock_comm_world, _rank, _setup):
         mock_comm_world.Create_group.return_value = MagicMock()

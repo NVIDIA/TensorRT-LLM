@@ -17,8 +17,11 @@
 Covers:
 - Constructor validation (dwdp_size must be 0 or >=2; dwdp_rank range)
 - dwdp_enabled / dwdp_size / dwdp_rank accessors
-- DWDP override of moe_tp_size / moe_ep_size / moe_cluster_size
-- moe_ep_rank conditional branch
+- DWDP override of moe_tp_size / moe_ep_size / moe_cluster_size to 1
+  (DWDP takes ownership of the expert layout via
+  ``_init_dwdp_expert_layout``; the fused MoE backend sees a single
+  full-table partition)
+- moe_ep_rank is always 0 when DWDP is enabled
 - to_dict/from_dict round-trip preserves DWDP fields
 - __eq__ and __hash__ include DWDP fields
 """
@@ -76,10 +79,16 @@ class TestMappingDwdp(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_override_moe_parallelism(self):
-        """DWDP enabled: moe_tp_size=1, moe_ep_size=dwdp_size, cluster=1."""
+        """DWDP enabled: moe_tp_size=1, moe_ep_size=1, cluster=1.
+
+        ``moe_ep_size`` is forced to 1 so the fused-MoE backend bypasses
+        ``num_experts % ep_size == 0`` and sees a single (full) expert
+        table; the rank-specific layout is installed by
+        ``_init_dwdp_expert_layout`` from ``DwdpManager``.
+        """
         m = Mapping(world_size=4, rank=0, tp_size=4, dwdp_size=4, dwdp_rank=0)
         self.assertEqual(m.moe_tp_size, 1)
-        self.assertEqual(m.moe_ep_size, 4)
+        self.assertEqual(m.moe_ep_size, 1)
         self.assertEqual(m.moe_cluster_size, 1)
 
     def test_override_beats_explicit_moe_values(self):
@@ -90,7 +99,7 @@ class TestMappingDwdp(unittest.TestCase):
             dwdp_size=4, dwdp_rank=1,
         )
         self.assertEqual(m.moe_tp_size, 1)
-        self.assertEqual(m.moe_ep_size, 4)
+        self.assertEqual(m.moe_ep_size, 1)
         self.assertEqual(m.moe_cluster_size, 1)
 
     def test_non_dwdp_leaves_moe_alone(self):
@@ -101,22 +110,48 @@ class TestMappingDwdp(unittest.TestCase):
         self.assertEqual(m.moe_ep_size, 2)
 
     def test_moe_tp_cluster_ep_size_dwdp(self):
-        """moe_tp_cluster_ep_size uses DWDP dimensions when enabled."""
+        """moe_tp_cluster_ep_size collapses to moe_cluster_size with DWDP.
+
+        With ``moe_ep_size = moe_tp_size = 1`` under DWDP, the legacy
+        composite product reduces to ``moe_cluster_size`` (the DWDP
+        group is orthogonal to the MoE TP/EP world).
+        """
         m = Mapping(world_size=4, rank=0, tp_size=4, dwdp_size=4, dwdp_rank=0)
-        # dwdp_size * moe_cluster_size (=1) = 4
-        self.assertEqual(m.moe_tp_cluster_ep_size, 4)
+        self.assertEqual(m.moe_tp_cluster_ep_size, 1)
+
+    def test_dwdp_supports_non_divisible_size(self):
+        """DWDP must accept dwdp_size values that don't divide num_experts.
+
+        Pre-Phase-1 the override forced ``moe_ep_size = dwdp_size``,
+        which then triggered ``num_experts % ep_size == 0`` deep in the
+        fused MoE backend.  The Phase 1 contract is that ``Mapping``
+        construction with dwdp_size=3 / 5 is unconditionally valid; the
+        partition is later validated against the concrete
+        ``num_experts`` by ``DwdpManager``/``setup_dwdp``.
+        """
+        for dwdp_size in (3, 5):
+            for dwdp_rank in range(dwdp_size):
+                m = Mapping(world_size=1, rank=0, tp_size=1,
+                            dwdp_size=dwdp_size, dwdp_rank=dwdp_rank)
+                self.assertEqual(m.moe_ep_size, 1)
+                self.assertEqual(m.dwdp_size, dwdp_size)
+                self.assertEqual(m.dwdp_rank, dwdp_rank)
 
     # ------------------------------------------------------------------
     # moe_ep_rank conditional branch
     # ------------------------------------------------------------------
 
-    def test_moe_ep_rank_uses_dwdp_when_enabled(self):
-        """DWDP on: moe_ep_rank == dwdp_rank regardless of tp_rank."""
+    def test_moe_ep_rank_zero_when_dwdp_enabled(self):
+        """DWDP on: moe_ep_rank is always 0 (matches moe_ep_size = 1).
+
+        The actual rank-specific expert range comes from
+        ``DwdpManager.start_expert_id`` via ``_init_dwdp_expert_layout``,
+        not from ``moe_ep_rank``.
+        """
         for dwdp_rank in range(4):
             m = Mapping(world_size=4, rank=dwdp_rank, tp_size=4,
                         dwdp_size=4, dwdp_rank=dwdp_rank)
-            self.assertEqual(m.moe_ep_rank, dwdp_rank,
-                             f"moe_ep_rank should equal dwdp_rank={dwdp_rank}")
+            self.assertEqual(m.moe_ep_rank, 0)
 
     def test_moe_ep_rank_uses_tp_rank_when_disabled(self):
         """DWDP off: moe_ep_rank falls back to tp_rank % moe_ep_size."""

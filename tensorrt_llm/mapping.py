@@ -92,13 +92,20 @@ class MappingBase:
 
         moe_world_size = tp_size if cp_type == CpType.ULYSSES else tp_size * cp_size
 
-        # DWDP override: when dwdp_size > 1, override MoE parallelism to use
-        # DWDP-managed expert parallelism instead of MPI-based parallelism.
+        # DWDP override: when dwdp_size > 1, decouple the fused-MoE EP layout
+        # from DWDP. Setting ``moe_ep_size = 1`` makes the fused MoE backend
+        # see a single (full) expert table; the DWDP-specific layout
+        # (``slot_start`` / ``slot_end`` / ``expert_size_per_partition``) is
+        # installed by ``_init_dwdp_expert_layout`` at the end of
+        # ``MoE.__init__`` using ``DwdpManager.start_expert_id`` and
+        # ``num_experts_per_worker``. This is what unlocks dwdp_size values
+        # that do not divide ``num_experts`` evenly (e.g. dwdp_size = 3, 5)
+        # and the IPC-era redundancy mode where adjacent peer ranges overlap.
         if dwdp_size > 1:
             moe_tp_size = 1
-            moe_ep_size = dwdp_size
+            moe_ep_size = 1
             moe_cluster_size = 1
-            self._dwdp_moe_ep_rank = dwdp_rank
+            self._dwdp_moe_ep_rank = 0
         else:
             self._dwdp_moe_ep_rank = 0
 
@@ -140,10 +147,11 @@ class MappingBase:
 
         moe_tp_ep_size = moe_tp_size * moe_ep_size
         if dwdp_size > 1:
-            # DWDP: compute moe_tp_cluster_ep_size using DWDP dimensions.
-            # moe_world_size may not equal dwdp_size (DWDP group is orthogonal
-            # to MoE TP/EP world), so skip the legacy equality check below.
-            self.moe_tp_cluster_ep_size = dwdp_size * moe_cluster_size
+            # DWDP: with moe_ep_size = 1, moe_tp_cluster_ep_size from the
+            # fused-MoE perspective is just ``moe_cluster_size``.  The DWDP
+            # group is orthogonal to MoE TP/EP world, so skip the legacy
+            # equality check below.
+            self.moe_tp_cluster_ep_size = moe_cluster_size
         else:
             self.moe_tp_cluster_ep_size = moe_tp_ep_size * moe_cluster_size
         if not (dwdp_size > 1) and self.moe_tp_cluster_ep_size != moe_world_size:
