@@ -10,6 +10,11 @@ def load_json(path):
         return json.load(f)
 
 
+def check_license(license, result):
+    is_nvidia_proprietary = result["isProprietary"] and "nvidia" in license.lower()
+    return result["isPermissive"] or is_nvidia_proprietary
+
+
 def is_permissive(licenses: list, license_check_token: str) -> dict:
     """Checks permissiveness for a list of license IDs in a single API call.
 
@@ -31,7 +36,9 @@ def is_permissive(licenses: list, license_check_token: str) -> dict:
         if response:
             resp = response.json()
             if resp["success"]:
-                return {lic: result["isPermissive"] for lic, result in zip(licenses, resp["data"])}
+                return {
+                    lic: check_license(lic, result) for lic, result in zip(licenses, resp["data"])
+                }
             print(json.dumps(resp), file=sys.stderr)
         else:
             print(f"HTTP {response.status_code}", file=sys.stderr)
