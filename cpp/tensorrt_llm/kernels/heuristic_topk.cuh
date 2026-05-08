@@ -191,6 +191,15 @@ static_assert(MAX_CANDIDATES % BLOCK_SIZE == 0);
 //     Scheme X v1.2 4-report regression to confirm no real-world loss.
 //   - kNumBins=NUM_BINS=2048 unchanged across combos (P4 histogram).
 //
+// Q10b-S2 (2026-05-08): kFTarget re-tuned for V4 production M=K (preIdx=K, not 2048).
+// Under M=K, pmean shifts to right tail (top-K of prev row); P2 secant needs a
+// tighter target to converge in fewer iterations. K-proportional K=512/1024 picks:
+//   K=512:  kFTarget=384  (= 0.75K)  — was K
+//   K=1024: kFTarget=2560 (= 2.5K)   — was 3K
+//   K=2048: unchanged (M=K=2048 trivially equals legacy M=2048)
+// Cross-layer 8-cell sweep on SWE-Bench-64K (`10_multi_cta_v1/M_eq_K_redesign/`):
+// 4 V4-hot cells (bf16/fp16 × K=512/1024) recover ~3.78 µs total wall.
+//
 // Primary template intentionally left undefined: any unsupported (T, K)
 // combination triggers a compile-time error rather than a runtime fall-
 // through.
@@ -205,7 +214,7 @@ struct GvrParams; // primary undefined → compile-time error for bad combos
 template <>
 struct GvrParams<float, 512>
 {
-    static constexpr int kFTarget = 512;
+    static constexpr int kFTarget = 384; // Q10b-S2 (M=K retune): was 512
     static constexpr int kC = 5120;
     static constexpr int kNumBins = 1024;
 };
@@ -213,7 +222,7 @@ struct GvrParams<float, 512>
 template <>
 struct GvrParams<float, 1024>
 {
-    static constexpr int kFTarget = 3072;
+    static constexpr int kFTarget = 2560; // Q10b-S2 (M=K retune): was 3072
     static constexpr int kC = 5120;
     static constexpr int kNumBins = 1024;
 };
@@ -241,7 +250,7 @@ struct GvrParams<float, 2048>
 template <>
 struct GvrParams<__nv_bfloat16, 512>
 {
-    static constexpr int kFTarget = 512;
+    static constexpr int kFTarget = 384; // Q10b-S2 (M=K retune): was 512
     static constexpr int kC = 5120;
     static constexpr int kNumBins = 512;
 };
@@ -249,7 +258,7 @@ struct GvrParams<__nv_bfloat16, 512>
 template <>
 struct GvrParams<__nv_bfloat16, 1024>
 {
-    static constexpr int kFTarget = 3072;
+    static constexpr int kFTarget = 2560; // Q10b-S2 (M=K retune): was 3072
     static constexpr int kC = 5120;
     static constexpr int kNumBins = 512;
 };
@@ -268,7 +277,7 @@ struct GvrParams<__nv_bfloat16, 2048>
 template <>
 struct GvrParams<__half, 512>
 {
-    static constexpr int kFTarget = 512;
+    static constexpr int kFTarget = 384; // Q10b-S2 (M=K retune): was 512
     static constexpr int kC = 5120;
     static constexpr int kNumBins = 512;
 };
@@ -276,7 +285,7 @@ struct GvrParams<__half, 512>
 template <>
 struct GvrParams<__half, 1024>
 {
-    static constexpr int kFTarget = 3072;
+    static constexpr int kFTarget = 2560; // Q10b-S2 (M=K retune): was 3072
     static constexpr int kC = 5120;
     static constexpr int kNumBins = 1024;
 };
