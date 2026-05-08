@@ -1282,7 +1282,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // line is "Mako options:", maybe we can make it more generic, which
                 // if the line cannot be split by "=", just ignore that line.
                 def makoOptsJson = transformMakoArgsToJson(["Mako options:"] + makoArgs)
-                def testListPathLocal = renderTestDB(testList, llmSrcLocal, stageName, makoOptsJson)
+                def testListPathLocal = renderTestDB(pipeline, testList, llmSrcLocal, stageName, makoOptsJson)
                 Utils.copyFileToRemoteHost(
                     pipeline,
                     remote,
@@ -1692,8 +1692,48 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     }
 }
 
+// CBTS Layer 3 split-collapse heuristic: when the affected stage's narrowed
+// test count (from main.py compute_stage_test_counts) is below 20, collapse
+// pytest-split's splits to 1 — only group 1 runs everything; groups 2..N
+// skip and don't allocate a machine. At/above 20, splits stay at the
+// stage's default and pytest-split parallelizes normally.
+//
+// The 20 below is hard-coded inline rather than a top-level constant
+// because Groovy script-level `def` is not visible from method bodies
+// without `@Field`, and we don't otherwise need this value elsewhere.
+//
+// Returns [skip: bool, splits: int, splitId: int]. Callers should
+// `return` early when skip == true and otherwise overwrite splits/splitId
+// with the returned values before continuing their existing dispatch logic.
+def _cbtsMaybeCollapseSplits(stageName, splitId, splits) {
+    def cbts = testFilter[(CBTS_RESULT)]
+    def counts = cbts?.affected_stage_test_counts
+    if (!counts) {
+        return [skip: false, splits: splits, splitId: splitId]
+    }
+    def count = counts[stageName]
+    if (count == null || count >= 20) {
+        return [skip: false, splits: splits, splitId: splitId]
+    }
+    if (splitId > 1) {
+        echo "CBTS [${cbts.scope}]: ${stageName} narrowed to ${count} (< 20), skipping group ${splitId}/${splits}"
+        return [skip: true, splits: splits, splitId: splitId]
+    }
+    if (splits > 1) {
+        echo "CBTS [${cbts.scope}]: ${stageName} narrowed to ${count} (< 20), collapsing splits=${splits} → 1"
+    }
+    return [skip: false, splits: 1, splitId: 1]
+}
+
 def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312")
 {
+  def collapse = _cbtsMaybeCollapseSplits(stageName, splitId, splits)
+  if (collapse.skip) {
+    return
+  }
+  splits = collapse.splits
+  splitId = collapse.splitId
+
   echo "Run Slurm job with native sbatch: $runWithSbatch"
 
   def attempt = 0
@@ -1817,6 +1857,8 @@ def DEBUG_MODE = "debug"
 @Field
 def DETAILED_LOG = "detailed_log"
 @Field
+def CBTS_RESULT = "cbts_result"
+@Field
 def testFilter = [
     (REUSE_TEST): null,
     (REUSE_STAGE_LIST): null,
@@ -1834,6 +1876,7 @@ def testFilter = [
     (DEBUG_MODE): false,
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): false,
+    (CBTS_RESULT): null,
 ]
 
 @Field
@@ -2554,7 +2597,7 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     return makoArgs
 }
 
-def renderTestDB(testContext, llmSrc, stageName, preDefinedMakoOpts=null) {
+def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=null) {
     def makoOpts = preDefinedMakoOpts
 
     if (!makoOpts) {
@@ -2564,7 +2607,30 @@ def renderTestDB(testContext, llmSrc, stageName, preDefinedMakoOpts=null) {
     }
 
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
+    // CBTS Layer 3: regenerate cbts_test_db/ on this stage agent from the
+    // piggybacked input JSON if not already present.
+    def cbts = testFilter[(CBTS_RESULT)]
+    if (cbts != null && cbts.test_db_dir_override && cbts.cbts_input_json) {
+        def overrideDir = "${llmSrc}/${cbts.test_db_dir_override}"
+        def dirExists = sh(returnStdout: true, script: "test -d ${overrideDir} && echo yes || echo no").trim()
+        if (dirExists != "yes") {
+            def cbtsInputLocal = Utils.createTempLocation(pipeline, "./cbts_input.json")
+            pipeline.writeFile(file: cbtsInputLocal, text: cbts.cbts_input_json)
+            sh "apt-get update -qq && apt-get install -y -qq python3-yaml || true"
+            sh "cd ${llmSrc} && python3 jenkins/scripts/cbts/main.py ${cbtsInputLocal} > /dev/null 2>&1 || true"
+        }
+    }
     def testDBPath = "${llmSrc}/tests/integration/test_lists/test-db"
+    if (cbts != null && cbts.test_db_dir_override) {
+        def overrideYaml = "${llmSrc}/${cbts.test_db_dir_override}/${testContext}.yml"
+        def overrideOk = sh(returnStdout: true, script: "test -s ${overrideYaml} && echo yes || echo no").trim()
+        if (overrideOk == "yes") {
+            testDBPath = "${llmSrc}/${cbts.test_db_dir_override}"
+            echo "CBTS [${cbts.scope}]: rendering test list from filtered test-db at ${testDBPath}"
+        } else {
+            echo "CBTS [${cbts.scope}]: ${overrideYaml} missing/empty -- falling back to source test-db"
+        }
+    }
     def testList = "${llmSrc}/${testContext}.txt"
     def testDBQueryCmd = [
         "trt-test-db",
@@ -2580,6 +2646,9 @@ def renderTestDB(testContext, llmSrc, stageName, preDefinedMakoOpts=null) {
     ].join(" ")
 
     sh(label: "Render test list from test-db", script: testDBQueryCmd)
+    def testCount = sh(returnStdout: true, script: "wc -l < ${testList} | tr -d ' '").trim()
+    def testDBLabel = (cbts != null && cbts.test_db_dir_override) ? "CBTS-narrowed [${cbts.scope}]" : "source"
+    echo "renderTestDB: stage=${stageName} context=${testContext} test-db=${testDBLabel} dir=${testDBPath} -> ${testCount} tests"
     sh(script: "cat ${testList}")
 
     return testList
@@ -3081,7 +3150,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def noRegularTests = false
         def noIsolateTests = false
         def rerunFailed = false
-        def testDBList = renderTestDB(testList, llmSrc, stageName)
+        def testDBList = renderTestDB(pipeline, testList, llmSrc, stageName)
 
         // Download and Merge waives.txt
         mergeWaivesTxt(pipeline, llmSrc, stageName)
@@ -3281,6 +3350,13 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 // and junit() for intermediate retryable failures).
 def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", typeCheck=false, boolean isFinalAttempt=true)
 {
+    def collapse = _cbtsMaybeCollapseSplits(stageName, splitId, splits)
+    if (collapse.skip) {
+        return
+    }
+    splits = collapse.splits
+    splitId = collapse.splitId
+
     cacheErrorAndUploadResult(stageName, {
         runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, typeCheck)
     }, {
@@ -4400,6 +4476,36 @@ def launchTestJobs(pipeline, testFilter)
     }
     if (testFilter[(EXTRA_STAGE_LIST)] != null) {
         checkStageNameSet(testFilter[(EXTRA_STAGE_LIST)], fullSet, EXTRA_STAGE_LIST)
+    }
+
+    // CBTS Layer 2: replace `parallelJobsFiltered` with affected stages plus
+    // PackageSanityCheck (kept iff sanity_required) and PerfSanity (kept iff
+    // perfsanity_required). Pure -Perf- stages always excluded (own trigger
+    // model, full-list benchmarks).
+    def cbts = testFilter[(CBTS_RESULT)]
+    if (cbts != null) {
+        def affectedSet = (cbts.affected_stages ?: []) as Set
+        def needsSanity = cbts.sanity_required
+        def needsPerfSanity = cbts.perfsanity_required
+        parallelJobsFiltered = parallelJobs.findAll { key, _ ->
+            if (key =~ /-Perf-/) return false
+            return affectedSet.contains(key) ||
+                   (needsSanity && key =~ /PackageSanityCheck/) ||
+                   (needsPerfSanity && key =~ /PerfSanity/)
+        }
+        if (affectedSet.isEmpty()) {
+            if (parallelJobsFiltered.isEmpty()) {
+                echo "CBTS [${cbts.scope}]: trigger-mode mismatch + nothing force-kept → no-op"
+            } else {
+                echo "CBTS [${cbts.scope}]: trigger-mode mismatch — running " +
+                     "${parallelJobsFiltered.size()} force-kept stage(s) only"
+            }
+        } else if (parallelJobsFiltered) {
+            echo "CBTS [${cbts.scope}]: limiting to ${parallelJobsFiltered.size()} stages " +
+                 "(sanity_required=${needsSanity}, perfsanity_required=${needsPerfSanity})"
+        } else {
+            echo "CBTS [${cbts.scope}]: empty stage set after filtering"
+        }
     }
 
     echo "Check the passed GitLab bot testFilter parameters."

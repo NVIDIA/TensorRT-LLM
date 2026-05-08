@@ -17,6 +17,7 @@ accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[bf16-1-tr
 accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[bf16-4-trtllm] SKIP (https://nvbugs/5955803)
 accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-trtllm] SKIP (https://nvbugs/6094208)
 accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-4-trtllm] SKIP (https://nvbugs/6112500)
+accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[nvfp4-1-trtllm] SKIP (https://nvbugs/6157131)
 accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[False] SKIP (https://nvbugs/5921674)
 accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[True] SKIP (https://nvbugs/6117816)
 accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_fp8[True] SKIP (https://nvbugs/6117816)
