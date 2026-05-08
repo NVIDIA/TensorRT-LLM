@@ -649,6 +649,20 @@ class KvCacheCreator:
                                                    total_gpu_memory, fraction,
                                                    allocated_bytes)
 
+        # Profiling measures activations with a small dummy request, but runtime
+        # activations at full batch size (MoE permute buffers, MLA KV projections,
+        # attention workspace) can be significantly larger and cause OOM under
+        # sustained load. Reserve 2x the profiled activation memory from the KV
+        # cache budget to cover peak concurrent allocations.
+        if activation_bytes > 0:
+            reservation = 2 * activation_bytes
+            kv_cache_max_memory = max(0, kv_cache_max_memory - reservation)
+            logger.info(
+                f"Reserved {reservation / (GB):.2f} GiB for activation memory "
+                f"(2x profiled {activation_bytes / (GB):.2f} GiB). "
+                f"Adjusted KV cache max memory: {kv_cache_max_memory / (GB):.2f} GiB"
+            )
+
         # NOTE:
         # For KVCacheManager, KvCacheCreator currently controls capacity using two parameters in KVCacheConfig:
         #   • max_tokens

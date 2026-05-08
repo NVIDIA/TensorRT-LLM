@@ -1357,16 +1357,13 @@ def extract_stress_test_metrics(artifacts_dir=None, current_model=None):
 
     Args:
         artifacts_dir (str): Path to the artifacts directory. If None, defaults to
-                            the 'artifacts' directory at the defs level (parent of stress_test)
+                            the 'artifacts' directory under the current working directory.
         current_model (str, optional): If provided, only analyze artifacts for this model
     """
-    # Set default artifacts_dir relative to this script's location
-    # The artifacts are at defs/artifacts/, one level up from stress_test/
-    # For local testing, the artifacts are at
-    # artifacts_dir = os.path.join(script_dir, "artifacts")
+    # aiperf writes artifacts relative to the current working directory,
+    # so look for them there rather than relative to this script's location.
     if artifacts_dir is None:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        artifacts_dir = os.path.join(script_dir, "..", "artifacts")
+        artifacts_dir = os.path.join(os.getcwd(), "artifacts")
 
     # Find all profile_export_aiperf.json files in the artifacts directory
     json_files = glob(os.path.join(artifacts_dir,
