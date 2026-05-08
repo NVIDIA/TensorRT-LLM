@@ -47,6 +47,7 @@ try:
 except ImportError:
     logger = logging.getLogger(__name__)
 
+from .specs import PeerRanges, lookup_owner
 from .weight_buffer import WeightBuffer
 
 
@@ -66,6 +67,7 @@ class DWDPWeightManager:
     __slots__ = (
         "_weight_buffer",
         "_peer_views",
+        "_peer_ranges",
         "_moe_layer_indices",
         "_moe_layer_set",
         "_weight_names",
@@ -82,6 +84,7 @@ class DWDPWeightManager:
         self,
         weight_buffer: WeightBuffer,
         peer_views: Dict[Tuple[int, int, str], torch.Tensor],
+        peer_ranges: PeerRanges,
         moe_layer_indices: List[int],
         weight_names: List[str],
         dwdp_rank: int,
@@ -98,6 +101,11 @@ class DWDPWeightManager:
             peer_views: Mapping of (peer_rank, layer_idx, weight_name) to tensor
                 views into peer's MNNVL handle. These are IMMUTABLE — the source
                 GPU never writes to them during inference.
+            peer_ranges: Per-peer ``(local_start, local_end_capped)`` tuples
+                indexed by DWDP rank.  ``prefetch_layer`` resolves the owner of
+                a remote expert id with ``lookup_owner(expert_id, peer_ranges)``,
+                which handles non-uniform partition (tail-rank padding) and
+                redundancy (overlapping ranges) uniformly.
             moe_layer_indices: Sorted list of decoder layer indices that are MoE
                 layers (e.g., layers 3..60 in a typical MoE model where the first
                 few layers are dense).
@@ -118,14 +126,17 @@ class DWDPWeightManager:
 
         self._weight_buffer = weight_buffer
         self._peer_views = peer_views
+        self._peer_ranges = peer_ranges
         self._moe_layer_indices = sorted(moe_layer_indices)
         self._moe_layer_set = set(self._moe_layer_indices)
         self._weight_names = list(weight_names)
         self._dwdp_rank = dwdp_rank
         self._dwdp_size = dwdp_size
 
-        # Compute experts per rank from the weight buffer's local range.
-        # All ranks own the same number of experts in DWDP.
+        # Storage chunk size of every peer's MNNVL handle.  Uniform across
+        # ranks (Phase 1 made ``num_experts_per_worker`` the storage size for
+        # every rank) — the variability lives in the *valid* sub-range
+        # tracked by ``_peer_ranges``.
         self._experts_per_rank = weight_buffer.local_end - weight_buffer.local_start
 
         # Dedicated CUDA stream for P2P copy operations.
@@ -253,18 +264,23 @@ class DWDPWeightManager:
                     layer_idx, name
                 )
                 for dst_slice, expert_start, expert_end in remote_slices:
-                    # A remote slice may span multiple peer ranks.
-                    # Split it into per-peer sub-chunks and copy each
-                    # from the correct peer's tensor view.
+                    # A remote slice may span multiple peer ranks.  Walk
+                    # the destination range and dispatch each contiguous
+                    # sub-chunk to the peer that owns it.  ``lookup_owner``
+                    # picks the lowest-rank owner (matters under redundancy
+                    # where multiple peers cover the same expert id).
                     cursor = expert_start
                     dst_offset = 0
                     while cursor < expert_end:
-                        peer_rank = cursor // self._experts_per_rank
-                        local_offset = cursor % self._experts_per_rank
-                        chunk_end = min(
-                            expert_end,
-                            (peer_rank + 1) * self._experts_per_rank,
-                        )
+                        peer_rank = lookup_owner(cursor, self._peer_ranges)
+                        peer_local_start, peer_local_end = self._peer_ranges[peer_rank]
+                        local_offset = cursor - peer_local_start
+                        # Stop at the first of: end of the destination
+                        # remote slice, or end of this peer's valid range.
+                        # Crossing the latter means the next expert is
+                        # owned by a different peer (or by *us*, which
+                        # would be a bug since this is the *remote* slice).
+                        chunk_end = min(expert_end, peer_local_end)
                         n = chunk_end - cursor
 
                         peer_key = (peer_rank, layer_idx, name)

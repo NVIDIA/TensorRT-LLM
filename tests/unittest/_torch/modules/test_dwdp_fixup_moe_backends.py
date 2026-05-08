@@ -36,6 +36,7 @@ import torch.nn as nn
 from tensorrt_llm._torch.modules.dwdp.setup import (
     _allgather_e_score_correction_bias,
     _allgather_expert_scales,
+    _scatter_shards_to_full,
 )
 
 
@@ -265,6 +266,135 @@ class TestAllgatherExpertScales(unittest.TestCase):
             module.fc31_alpha.data, torch.cat(alpha_shards, dim=0))
         torch.testing.assert_close(
             module.fc2_alpha.data, torch.cat(beta_shards, dim=0))
+
+
+class TestScatterShardsToFull(unittest.TestCase):
+    """Unit tests for ``_scatter_shards_to_full`` — the peer_ranges-aware
+    reconstruction of a full-size tensor from per-peer EP shards.  Covers
+    the three partition modes that motivate Phase 2:
+
+      * Uniform (size == stride == num_experts // dwdp_size): no overlap,
+        no padding; equivalent to ``torch.cat``.
+      * Non-uniform tail-padding (size * dwdp_size > num_experts): tail
+        shard's trailing entries are skipped via ``[:valid]``.
+      * Redundancy (size > stride): overlapping ranges; later peers
+        overwrite earlier ones at overlap indices but values agree
+        (per Phase 1 invariant: every rank that owns expert ``e`` loaded
+        ``e`` from the same checkpoint).
+    """
+
+    def test_uniform_partition(self):
+        # dwdp=4, 8 experts, size=stride=2.  Each rank's shard covers
+        # exactly 2 experts; reconstruction = concat.
+        peer_ranges = [(0, 2), (2, 4), (4, 6), (6, 8)]
+        shards = [
+            torch.tensor([0., 1.]),
+            torch.tensor([2., 3.]),
+            torch.tensor([4., 5.]),
+            torch.tensor([6., 7.]),
+        ]
+        full = _scatter_shards_to_full(
+            shards=shards, peer_ranges=peer_ranges,
+            num_experts_total=8, ref=shards[0],
+        )
+        torch.testing.assert_close(full, torch.arange(8, dtype=torch.float32))
+
+    def test_mode_b_overlap_dwdp3(self):
+        # dwdp=3, 8 experts, size=4, stride=2: 2*2+4=8 (Mode B equality).
+        # Adjacent ranks overlap by 2 experts; shared values agree
+        # because every rank that owns expert ``e`` loaded ``e`` from
+        # the same checkpoint.
+        peer_ranges = [(0, 4), (2, 6), (4, 8)]
+        shards = [
+            torch.tensor([0., 1., 2., 3.]),  # rank 0: experts 0,1,2,3
+            torch.tensor([2., 3., 4., 5.]),  # rank 1: experts 2,3,4,5 (overlap rank 0 at 2,3)
+            torch.tensor([4., 5., 6., 7.]),  # rank 2: experts 4,5,6,7 (overlap rank 1 at 4,5)
+        ]
+        full = _scatter_shards_to_full(
+            shards=shards, peer_ranges=peer_ranges,
+            num_experts_total=8, ref=shards[0],
+        )
+        torch.testing.assert_close(full, torch.arange(8, dtype=torch.float32))
+
+    def test_mode_b_overlap_dwdp4(self):
+        # dwdp=4, 8 experts, size=2, stride=2 (uniform — overlap=0).
+        peer_ranges = [(0, 2), (2, 4), (4, 6), (6, 8)]
+        shards = [
+            torch.tensor([0., 1.]),
+            torch.tensor([2., 3.]),
+            torch.tensor([4., 5.]),
+            torch.tensor([6., 7.]),
+        ]
+        full = _scatter_shards_to_full(
+            shards=shards, peer_ranges=peer_ranges,
+            num_experts_total=8, ref=shards[0],
+        )
+        torch.testing.assert_close(full, torch.arange(8, dtype=torch.float32))
+
+    def test_higher_dim_trailing_shape(self):
+        # Shards may have trailing dims (e.g., scale param shape (size, K)).
+        peer_ranges = [(0, 2), (2, 4)]
+        shards = [
+            torch.tensor([[0., 0.5], [1., 1.5]]),
+            torch.tensor([[2., 2.5], [3., 3.5]]),
+        ]
+        full = _scatter_shards_to_full(
+            shards=shards, peer_ranges=peer_ranges,
+            num_experts_total=4, ref=shards[0],
+        )
+        expected = torch.tensor([[0., 0.5], [1., 1.5], [2., 2.5], [3., 3.5]])
+        torch.testing.assert_close(full, expected)
+
+    def test_empty_shards_raises(self):
+        with self.assertRaises(ValueError):
+            _scatter_shards_to_full(
+                shards=[], peer_ranges=[],
+                num_experts_total=0, ref=torch.zeros(1),
+            )
+
+
+class TestAllgatherExpertScalesNonUniform(unittest.TestCase):
+    """Validate ``_allgather_expert_scales`` end-to-end with the new
+    Phase 2 ``peer_ranges`` argument: shards loaded under Mode B
+    overlap (size > stride) must reconstruct the full bias correctly,
+    with overlapping experts getting the same value from any peer."""
+
+    def _make_experts_module(self, params):
+        module = torch.nn.Module()
+        for name, tensor in params.items():
+            setattr(module, name, torch.nn.Parameter(tensor, requires_grad=False))
+        return module
+
+    def test_mode_b_overlap_dwdp3_via_peer_ranges(self):
+        # dwdp=3, 256 experts, Mode B with size=86, stride=85
+        # (2*85 + 86 = 256 — exact equality, 1-expert overlap between
+        # adjacent ranks).  Shards loaded by each rank cover overlapping
+        # ranges; ``_scatter_shards_to_full`` writes the shared experts
+        # multiple times but the values agree (same checkpoint).
+        peer_ranges = [(0, 86), (85, 171), (170, 256)]
+        all_shards = [
+            torch.arange(0, 86, dtype=torch.float32),     # rank 0: [0..85]
+            torch.arange(85, 171, dtype=torch.float32),   # rank 1: [85..170]
+            torch.arange(170, 256, dtype=torch.float32),  # rank 2: [170..255]
+        ]
+        module = self._make_experts_module({
+            "fc31_alpha": torch.arange(0, 86, dtype=torch.float32),
+        })
+        comm = _make_mock_comm(all_shards)
+
+        _allgather_expert_scales(
+            module, layer_idx=3, dwdp_rank=0, dwdp_size=3, comm=comm,
+            experts_per_rank=86,
+            num_experts_total=256,
+            peer_ranges=peer_ranges,
+        )
+
+        comm.allgather.assert_called_once()
+        # Reconstructed alpha covers ALL 256 experts with their canonical values.
+        torch.testing.assert_close(
+            module.fc31_alpha.data,
+            torch.arange(0, 256, dtype=torch.float32),
+        )
 
 
 if __name__ == '__main__':

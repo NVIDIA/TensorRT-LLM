@@ -120,15 +120,75 @@ class TestValidatePartitionConfig(unittest.TestCase):
         _validate_partition_config(**_kwargs())  # uniform default already covers exactly
 
     def test_coverage_with_overlap_passes(self):
-        # 4 ranks of size 70, stride 62 covers [0, 256) with redundant overlap.
-        # Note: this would still fail the loaded-chunk check below, but the
-        # coverage check itself should pass.  We exercise it by also matching
-        # loaded_local_experts to size, simulating a hypothetical future loader.
+        # 4 ranks of size 70, stride 62: 3*62+70 = 256 — exact equality.
+        # 8-expert overlap between adjacent ranks is the redundancy case.
         _validate_partition_config(**_kwargs(
             num_experts_per_worker=70,
             num_prefetch_experts=62,
             loaded_local_experts=70,
         ))
+
+    def test_dwdp3_mode_b_overlap_passes(self):
+        # dwdp=3, 256 experts: Mode B with stride=85, size=86.
+        # 2*85 + 86 = 256 — exact equality, 1-expert overlap between
+        # adjacent ranks.  This is the canonical "dwdp does not divide
+        # num_experts" recipe.
+        _validate_partition_config(
+            num_experts_per_worker=86,
+            num_prefetch_experts=85,
+            num_experts_total=256,
+            dwdp_size=3,
+            loaded_local_experts=86,
+        )
+
+    def test_dwdp5_mode_b_overlap_passes(self):
+        # dwdp=5, 256 experts: stride=51, size=52. 4*51 + 52 = 256.
+        _validate_partition_config(
+            num_experts_per_worker=52,
+            num_prefetch_experts=51,
+            num_experts_total=256,
+            dwdp_size=5,
+            loaded_local_experts=52,
+        )
+
+    def test_dwdp7_mode_b_overlap_passes(self):
+        # dwdp=7, 256 experts: 256 % 7 = 4, so Mode B requires more
+        # overlap.  size=40, stride=36: 6*36 + 40 = 256.
+        _validate_partition_config(
+            num_experts_per_worker=40,
+            num_prefetch_experts=36,
+            num_experts_total=256,
+            dwdp_size=7,
+            loaded_local_experts=40,
+        )
+
+    # ------------------------------------------------------------------
+    # Failure mode 3b: tail-padding (coverage > num_experts) rejected
+    # ------------------------------------------------------------------
+
+    def test_tail_padding_rejected_dwdp3(self):
+        # dwdp=3, 256 experts with size=stride=86 → 2*86+86=258 > 256.
+        # Last rank's storage [172, 258) extends past num_experts=256.
+        # GB200 fabric-handle ABI cannot map this partially, so reject.
+        with self.assertRaisesRegex(ValueError, "exceeds num_experts"):
+            _validate_partition_config(
+                num_experts_per_worker=86,
+                num_prefetch_experts=86,
+                num_experts_total=256,
+                dwdp_size=3,
+                loaded_local_experts=86,
+            )
+
+    def test_tail_padding_rejected_dwdp5(self):
+        # dwdp=5, 256 experts with size=stride=52 → 4*52+52=260 > 256.
+        with self.assertRaisesRegex(ValueError, "exceeds num_experts"):
+            _validate_partition_config(
+                num_experts_per_worker=52,
+                num_prefetch_experts=52,
+                num_experts_total=256,
+                dwdp_size=5,
+                loaded_local_experts=52,
+            )
 
     # ------------------------------------------------------------------
     # Failure mode 4: chunk shape mismatch

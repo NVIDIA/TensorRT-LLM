@@ -31,7 +31,17 @@ Key design principles:
 
 from .page_pool import PagePool, compute_slot_sizes
 from .setup import setup_dwdp
-from .specs import EdgeInfo, LayerWeightSpecs, MnnvlHandleSet, PageAlignedLayout, WeightSpec
+from .specs import (
+    EdgeInfo,
+    LayerWeightSpecs,
+    MnnvlHandleSet,
+    PageAlignedLayout,
+    PeerRange,
+    PeerRanges,
+    WeightSpec,
+    compute_peer_ranges,
+    lookup_owner,
+)
 from .transport import DWDPTransport
 from .vmm import (
     VARegion,
@@ -52,6 +62,10 @@ __all__ = [
     "MnnvlHandleSet",
     "EdgeInfo",
     "PageAlignedLayout",
+    "PeerRange",
+    "PeerRanges",
+    "compute_peer_ranges",
+    "lookup_owner",
     # VMM utilities
     "align_up",
     "align_down",

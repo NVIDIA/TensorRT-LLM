@@ -52,7 +52,7 @@ except ImportError:
 
     logger.debug("[DWDP transport] Falling back to legacy `cuda` bindings")
 
-from .specs import LayerWeightSpecs, MnnvlHandleSet
+from .specs import LayerWeightSpecs, MnnvlHandleSet, PeerRanges, compute_peer_ranges
 from .vmm import (
     align_down,
     align_up,
@@ -150,6 +150,7 @@ class DWDPTransport:
         "_granularity",
         "_handle_set",
         "_peer_views",
+        "_peer_ranges",
         "_local_handles",
         "_imported_handles",
         "_peer_va_mappings",
@@ -164,6 +165,7 @@ class DWDPTransport:
         granularity: int,
         handle_set: MnnvlHandleSet,
         peer_views: Dict[Tuple[int, int, str], torch.Tensor],
+        peer_ranges: PeerRanges,
         local_handles: List[int],
         imported_handles: List[int],
         peer_va_mappings: List[Tuple[int, int]],
@@ -177,6 +179,11 @@ class DWDPTransport:
             granularity: VMM page granularity in bytes.
             handle_set: Local MNNVL handles for WeightBuffer.
             peer_views: Immutable tensor views into peer MNNVL memory.
+            peer_ranges: Per-peer ``(local_start, local_end_capped)`` tuples
+                indexed by DWDP rank.  The capped end truncates the tail
+                rank's padding; consumers (lookup_owner, fill_edge_bytes,
+                weight_manager) read these to find the actual owner of a
+                given expert id.
             local_handles: Raw local handle integers (for cleanup).
             imported_handles: Raw imported handle integers (for cleanup).
             peer_va_mappings: List of (va, size) for peer VA regions (for cleanup).
@@ -187,6 +194,7 @@ class DWDPTransport:
         self._granularity = granularity
         self._handle_set = handle_set
         self._peer_views = peer_views
+        self._peer_ranges = peer_ranges
         self._local_handles = local_handles
         self._imported_handles = imported_handles
         self._peer_va_mappings = peer_va_mappings
@@ -253,15 +261,25 @@ class DWDPTransport:
         """
         granularity = get_allocation_granularity(device_id)
 
-        # Validate that num_experts is evenly divisible by dwdp_size
-        for layer_idx, weight_specs in layer_weight_specs.items():
-            for name, spec in weight_specs.items():
-                if spec.num_experts % dwdp_size != 0:
-                    raise ValueError(
-                        f"num_experts={spec.num_experts} must be divisible by "
-                        f"dwdp_size={dwdp_size}")
-                break  # Only need to check one spec per layer
-            break  # All layers have the same num_experts
+        # Pick any spec to read the model's total expert count.  All layers
+        # share the same ``num_experts`` (the gate-side global expert table).
+        first_spec = next(
+            iter(next(iter(layer_weight_specs.values())).values())
+        )
+        num_experts_total = first_spec.num_experts
+
+        # Compute every peer's valid expert range deterministically from the
+        # shared DwdpConfig.  Used by lookup_owner downstream
+        # (fill_edge_bytes, weight_manager.prefetch_layer, fixup-side
+        # allgathers) so the same first-match owner policy is applied
+        # everywhere — including non-uniform tail padding and redundancy
+        # where adjacent ranges overlap.
+        peer_ranges = compute_peer_ranges(
+            dwdp_size=dwdp_size,
+            num_experts_per_worker=num_experts_per_worker,
+            num_prefetch_experts=num_prefetch_experts,
+            num_experts_total=num_experts_total,
+        )
 
         # Validate that every (layer_idx, name) in specs has a matching param
         expected_keys = set()
@@ -452,6 +470,7 @@ class DWDPTransport:
                 granularity=granularity,
                 handle_set=handle_set,
                 peer_views=peer_views,
+                peer_ranges=peer_ranges,
                 local_handles=local_handles,
                 imported_handles=imported_handles,
                 peer_va_mappings=peer_va_mappings,
@@ -507,6 +526,22 @@ class DWDPTransport:
         if self._released:
             raise RuntimeError("DWDPTransport has been released")
         return self._peer_views
+
+    def get_peer_ranges(self) -> PeerRanges:
+        """Return per-peer ``(local_start, local_end_capped)`` tuples.
+
+        Used by ``fill_edge_bytes`` and the runtime ``WeightManager`` to
+        resolve the owner of any given expert id under non-uniform
+        partition or redundancy.  The end is capped at ``num_experts``
+        (i.e., reflects the *valid* expert range — not the storage range
+        which may include tail-padding slots).
+
+        Raises:
+            RuntimeError: If transport has been released.
+        """
+        if self._released:
+            raise RuntimeError("DWDPTransport has been released")
+        return self._peer_ranges
 
     @property
     def dwdp_rank(self) -> int:

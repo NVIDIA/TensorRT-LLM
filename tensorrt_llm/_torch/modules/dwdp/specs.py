@@ -19,9 +19,69 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import torch
+
+
+# (local_start, local_end_capped) for one peer DWDP rank.  ``local_start``
+# is ``peer_rank * num_prefetch_experts`` (the rank-to-rank stride).
+# ``local_end_capped`` is the *valid* upper bound — i.e.,
+# ``min(local_start + num_experts_per_worker, num_experts_total)``; the
+# tail rank's storage may extend past ``num_experts_total`` but the cap
+# truncates the valid range.  Adjacent ranks' valid ranges may overlap
+# when ``num_prefetch_experts < num_experts_per_worker`` (redundancy mode).
+PeerRange = Tuple[int, int]
+# Indexed by peer DWDP rank; ``len(PeerRanges) == dwdp_size``.
+PeerRanges = List[PeerRange]
+
+
+def compute_peer_ranges(
+    *,
+    dwdp_size: int,
+    num_experts_per_worker: int,
+    num_prefetch_experts: int,
+    num_experts_total: int,
+) -> PeerRanges:
+    """Compute every peer rank's valid expert range.
+
+    Each peer's storage holds ``num_experts_per_worker`` slots starting
+    at ``peer_rank * num_prefetch_experts``.  The valid range is the
+    storage range capped at ``num_experts_total`` (the model's total
+    expert count), which truncates any padding on the tail rank.
+
+    All ranks deterministically compute the same ``PeerRanges`` from the
+    shared ``DwdpConfig``, so no allgather is required.
+    """
+    ranges: PeerRanges = []
+    for peer_rank in range(dwdp_size):
+        start = peer_rank * num_prefetch_experts
+        end_capped = min(start + num_experts_per_worker, num_experts_total)
+        ranges.append((start, end_capped))
+    return ranges
+
+
+def lookup_owner(expert_id: int, peer_ranges: PeerRanges) -> int:
+    """Return the lowest peer rank whose valid range contains ``expert_id``.
+
+    For uniform partition this is equivalent to
+    ``expert_id // (num_experts_total // dwdp_size)``.  For redundancy
+    (overlapping ranges) the first-match policy picks the lowest-rank
+    owner, matching the IPC implementation's behavior so reads of the
+    same expert id are deterministic across peers.
+
+    Raises:
+        ValueError: If no peer's valid range contains ``expert_id``.
+            This is impossible when the partition passes the coverage
+            check ``(dwdp_size - 1) * stride + size >= num_experts``.
+    """
+    for peer_rank, (start, end) in enumerate(peer_ranges):
+        if start <= expert_id < end:
+            return peer_rank
+    raise ValueError(
+        f"expert_id={expert_id} not owned by any peer in "
+        f"peer_ranges={peer_ranges}"
+    )
 
 
 @dataclass(frozen=True)
