@@ -199,10 +199,12 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
     processing using the image processor saved in the model directory.
     """
 
-    # Gemma4 image/audio soft-token runs use bidirectional attention spanning
-    # the full block — chunked-prefill must keep each block intact in a single
-    # iteration. See registry.BaseMultimodalInputProcessor.mm_bidirectional_blocks.
-    mm_bidirectional_blocks = True
+    # Default class-level fallback. Real value computed per-instance below
+    # from text_config.use_bidirectional_attention. Only 26B/31B set
+    # use_bidirectional_attention="vision" — their image blocks need intact
+    # bidirectional attention. E2B/E4B set None (fully causal) — audio (and
+    # image, when present) can be split across chunks safely.
+    mm_bidirectional_blocks = False
 
     def __init__(
         self,
@@ -223,6 +225,16 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
         self._tokenizer = tokenizer
         self._model_path = model_path
         self._dtype = getattr(config, "torch_dtype", torch.bfloat16)
+
+        # Per-instance bidir gate. text_config.use_bidirectional_attention is
+        # "vision" on 26B/31B, None on E2B/E4B. Read once here so the V2
+        # scheduler's chunk-alignment only engages on variants that actually
+        # need it — avoids livelock on E4B audio (causal, 451-token blocks
+        # would otherwise exceed max_num_tokens).
+        text_cfg = getattr(config, "text_config", config)
+        self.mm_bidirectional_blocks = (
+            getattr(text_cfg, "use_bidirectional_attention", None) == "vision"
+        )
 
         self._processor = None
         try:
@@ -277,6 +289,23 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
         if vocab_size is not None:
             return int(vocab_size)
         return super().get_vocab_size()
+
+    def get_mm_token_ids(self) -> Optional[torch.Tensor]:
+        # Gemma4 image/audio/video soft-token IDs (e.g. 258880/258881/258884)
+        # live INSIDE text_config.vocab_size (262144), so the base-class
+        # fallback `input_ids >= vocab_size` in `_compute_mm_masks` would mark
+        # zero MM positions, producing an all-zero embed_mask cumsum and
+        # making chunked-prefill drop every MM embedding row. HF's
+        # `Gemma4Processor` does not expose `mm_token_ids` either, so we
+        # build the list from the config here.
+        ids = []
+        for name in ("image_token_id", "audio_token_id", "video_token_id"):
+            tid = getattr(self._config, name, None)
+            if tid is not None:
+                ids.append(int(tid))
+        if not ids:
+            return super().get_mm_token_ids()
+        return torch.tensor(ids, dtype=torch.int32)
 
     @property
     def dtype(self) -> torch.dtype:

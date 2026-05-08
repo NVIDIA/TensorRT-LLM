@@ -298,9 +298,6 @@ def find_input_mm_embeds(
                           if param.multimodal_runtime is not None)
 
     if total_mm_tokens == 0:
-        logger.debug(
-            "All multimodal tokens are cached or beyond current chunk, skipping vision encoder forward"
-        )
         return []
 
     if total_mm_tokens == sum(mm_embed.shape[0] for mm_embed in mm_embeds):
@@ -321,8 +318,10 @@ def find_input_mm_embeds(
 
     if len(mm_embeds) == 1:
         sliced = [mm_embeds[0][start:end] for start, end in slices]
-        return [torch.cat(sliced, dim=0)]
-    return [mm_embeds[i][start:end] for i, (start, end) in enumerate(slices)]
+        out = [torch.cat(sliced, dim=0)]
+    else:
+        out = [mm_embeds[i][start:end] for i, (start, end) in enumerate(slices)]
+    return out
 
 
 def filter_mm_token_from_input_ids(

@@ -825,6 +825,21 @@ def maybe_compute_mm_embed_cumsum(
     mm_data = extra_processed_inputs.get("multimodal_data")
     if mm_data is None:
         return
+
+    # Always backfill the bidirectional-MM gate first (cheap; instance attr
+    # falls through to class attr in Python). Must happen BEFORE the cumsum
+    # idempotency guard below, otherwise the path where
+    # `multimodal_hashing_process` already setdefault()ed the cumsum (without
+    # this flag) leaves scheduler_v2 reading mm_bidirectional_blocks=None and
+    # silently skipping align — which then trips
+    # get_flashinfer_attention_mask's `cached_token_lens == 0` assert on
+    # 26B/31B once an image block is split across chunks. Gemma4 sets this
+    # per-instance from text_config.use_bidirectional_attention.
+    mm_data.setdefault(
+        "mm_bidirectional_blocks",
+        bool(getattr(input_processor, "mm_bidirectional_blocks", False)),
+    )
+
     if "multimodal_embed_mask_cumsum" in mm_data:
         return
 
@@ -846,12 +861,6 @@ def maybe_compute_mm_embed_cumsum(
     # Cache the int64 cumsum; request-invariant, read once per chunk.
     mm_data["multimodal_embed_mask_cumsum"] = embed_mask.cumsum(
         0, dtype=torch.int64)
-    # Propagate the bidirectional-MM gate so the chunked-prefill scheduler
-    # can align chunk boundaries to MM blocks only for processors that
-    # actually require intact bidirectional attention (Gemma4). Defaults to
-    # False on the base class — most VLMs (Llava, Qwen-VL) tolerate splits.
-    mm_data["mm_bidirectional_blocks"] = bool(
-        getattr(type(input_processor), "mm_bidirectional_blocks", False))
 
 
 def create_input_processor_with_hash(
