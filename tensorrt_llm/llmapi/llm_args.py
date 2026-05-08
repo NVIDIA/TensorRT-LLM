@@ -27,6 +27,7 @@ try:
 except ImportError:
     PlacementGroup = None
 
+from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 
@@ -168,21 +169,24 @@ class CudaGraphConfig(StrictBaseModel):
             List of batch sizes to create CUDA graphs for
         """
         if enable_padding:
+            # Start with [1, 2, 4, 8, 16, 24, ..., 128] (multiples of 8)
             batch_sizes = [1, 2, 4] + [i * 8 for i in range(1, 17)]
+            # Sliding 64: extend by increments of 64 up to max_batch_size
+            while batch_sizes[-1] + 64 <= max_batch_size:
+                batch_sizes.append(batch_sizes[-1] + 64)
         else:
             batch_sizes = list(range(1, 32)) + [32, 64, 128]
+            # Add powers of 2 up to max_batch_size
+            batch_sizes += [
+                2**i for i in range(8, math.ceil(math.log(max_batch_size, 2)))
+            ]
 
-        # Add powers of 2 up to max_batch_size
-        batch_sizes += [
-            2**i for i in range(8, math.ceil(math.log(max_batch_size, 2)))
-        ]
-
-        # Filter and sort batch sizes
+        # Filter and sort batch sizes for both branches
         batch_sizes = sorted(
             [size for size in batch_sizes if size <= max_batch_size])
 
         # Add max_batch_size if not already included
-        if max_batch_size != batch_sizes[-1]:
+        if not batch_sizes or max_batch_size != batch_sizes[-1]:
             batch_sizes.append(max_batch_size)
 
         return batch_sizes
@@ -340,9 +344,47 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
     enable_heuristic_topk: bool = Field(
         default=False,
         description=
-        "Whether to reuse previous step's TopK indices as heuristic hints "
-        "for the decode indexer TopK kernel, reducing threshold search iterations."
+        "Whether to enable Guess-Verify-Refine (GVR) Top-K for the DSA decode "
+        "indexer. GVR reuses previous-step Top-K indices as hints to reduce "
+        "threshold search iterations. Currently supported for index_topk=2048 "
+        "on Blackwell (SM100+) and falls back to the production insertion/radix "
+        "Top-K path when prerequisites are not met.")
+    indexer_k_dtype: Literal["fp8", "fp4"] = Field(
+        default="fp8",
+        description=
+        "Data type used for the indexer K cache. `fp4` requires Blackwell+ "
+        "(SM>=100) and index_head_dim=128, it can halve the indexer K cache "
+        "per-token footprint from 132 B to 68 B.",
     )
+
+    @model_validator(mode="after")
+    def _validate_indexer_k_dtype(self):
+        """Reject fp4 on pre-Blackwell or non-128 index_head_dim.
+
+        DeepGEMM's fp8_fp4_mqa_logits / fp8_fp4_paged_mqa_logits kernels
+        require SM>=100, and invokeFusedCatFp4 hard-asserts head_dim==128.
+        Surface both as Pydantic errors so invalid configs fail fast at
+        construction instead of with a cryptic kernel-launch failure.
+
+        The SM check is skipped when CUDA is unavailable (config
+        construction on CPU-only hosts or at doc-gen time), leaving the
+        runtime kernel assertion as the final line of defense.
+        """
+        if self.indexer_k_dtype == "fp4":
+            if self.index_head_dim is not None and self.index_head_dim != 128:
+                raise ValueError(
+                    f"indexer_k_dtype='fp4' requires index_head_dim=128, "
+                    f"got {self.index_head_dim}. Set indexer_k_dtype='fp8' "
+                    f"for non-128 indexer head dims.")
+            if torch.cuda.is_available():
+                from tensorrt_llm._utils import get_sm_version
+                sm = get_sm_version()
+                if sm < 100:
+                    raise ValueError(
+                        f"indexer_k_dtype='fp4' requires SM>=100 (Blackwell); "
+                        f"current device is SM{sm}. Set indexer_k_dtype='fp8' "
+                        f"for non-Blackwell GPUs.")
+        return self
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -620,6 +662,29 @@ class AttentionDpConfig(StrictBaseModel):
         description=
         "Weight (beta) for the load-balance term in KV cache-aware routing. "
         "Higher values prioritize load balance over cache affinity. "
+        "Only used when enable_kv_cache_aware_routing is True.")
+    kv_cache_routing_match_rate_threshold: float = Field(
+        default=0.1,
+        description=
+        "Cache-affinity gate in KV cache-aware routing. For each request, "
+        "match_len contributes to scoring only when max(match_len) / "
+        "request_tokens across eligible ranks is strictly above this "
+        "threshold; otherwise match_len is forced to 0 so routing is driven "
+        "purely by load. Default 0.1 requires at least a 10% hit rate before "
+        "cache affinity kicks in, which prevents a small universal prefix "
+        "(e.g. a shared system prompt) from pinning all traffic to the "
+        "first warm ranks. Set to 0.0 to honour any nonzero match. "
+        "Only used when enable_kv_cache_aware_routing is True.")
+    kv_cache_routing_fair_share_multiplier: float = Field(
+        default=2.0,
+        description=
+        "Loose per-rank active-request cap in KV cache-aware routing, "
+        "expressed as a multiplier of the ceil fair-share "
+        "(ceil((total_active + new) / tp_size)). Once a rank hits this cap "
+        "within a scheduling batch it is removed from the eligible set for "
+        "the remainder of the batch. Default 2.0 permits a 2x slack so "
+        "cache affinity can dominate while preventing runaway concentration "
+        "on a single rank. Set to 1.0 for strict fair share. "
         "Only used when enable_kv_cache_aware_routing is True.")
 
     @model_validator(mode='after')
@@ -1134,7 +1199,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
             )
 
         self.num_eagle_layers = self.max_draft_len
-        self.max_total_draft_tokens = self.max_draft_len  # If using linear-tree, the max_total_draft_tokens is the same as max_draft_len
 
         if self.eagle3_model_arch == "mistral_large3" and self.eagle3_layers_to_capture is None:
             # FIXME find a better way to setup it.
@@ -1163,7 +1227,8 @@ class EagleDecodingConfig(DecodingBaseConfig):
             self.max_total_draft_tokens = len(self.eagle_choices)
 
         # Dynamic tree logic
-        if self.use_dynamic_tree:
+        if self.use_dynamic_tree or self.dynamic_tree_max_topK is not None:
+            self.use_dynamic_tree = True
             if self.eagle_choices is not None:
                 raise ValueError(
                     "If use_dynamic_tree is True, eagle_choices should be None")
@@ -1175,10 +1240,28 @@ class EagleDecodingConfig(DecodingBaseConfig):
                 raise ValueError(
                     "dynamic_tree_max_topK should be provided, which indicates the number of nodes to expand each time"
                 )
-            if self.max_total_draft_tokens is None or self.max_total_draft_tokens <= 0:
-                raise ValueError(
-                    "max_total_draft_tokens should be provided, which indicates the total nodes of the final draft tree. (exclude the root node)"
+
+            default_max_total_draft_tokens = self.dynamic_tree_max_topK * self.max_draft_len
+
+            if self.max_total_draft_tokens is None:
+                self.max_total_draft_tokens = default_max_total_draft_tokens
+                logger.warning(
+                    f"max_total_draft_tokens is not provided, use the default value {default_max_total_draft_tokens} (default_max_total_draft_tokens = dynamic_tree_max_topK * max_draft_len)"
                 )
+            else:
+                if self.max_total_draft_tokens < self.max_draft_len:
+                    raise ValueError(
+                        f"max_total_draft_tokens ({self.max_total_draft_tokens}) should be >= max_draft_len ({self.max_draft_len})"
+                    )
+                if self.max_total_draft_tokens > self.dynamic_tree_max_topK * self.max_draft_len:
+                    raise ValueError(
+                        f"max_total_draft_tokens ({self.max_total_draft_tokens}) should be <= "
+                        f"dynamic_tree_max_topK * max_draft_len ({self.dynamic_tree_max_topK * self.max_draft_len})"
+                    )
+
+        # Linear tree
+        if self.max_total_draft_tokens is None:
+            self.max_total_draft_tokens = self.max_draft_len
 
         return self
 
@@ -1258,6 +1341,11 @@ class SAEnhancerConfig(StrictBaseModel):
 
 class Eagle3DecodingConfig(EagleDecodingConfig):
     decoding_type: Literal["Eagle3"] = "Eagle3"
+
+    max_batch_size: Optional[int] = Field(
+        default=None,
+        description="Max batch size for pre-allocating dynamic tree buffers. "
+        "Required when use_dynamic_tree=True.")
 
     sa_config: Optional[SAEnhancerConfig] = Field(
         default=None,
@@ -1626,6 +1714,56 @@ class PARDDecodingConfig(DecodingBaseConfig):
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
         return TorchSpeculativeDecodingMode.PARD
+
+
+class DFlashDecodingConfig(DecodingBaseConfig):
+    """Configuration for DFlash speculative decoding.
+
+    DFlash is a target-dependent speculative decoding method that uses
+    hidden states from specific target model layers as cross-attention
+    context in the draft model to predict multiple draft tokens in parallel.
+
+    Key features:
+    - Target-dependent: uses hidden states from target model layers
+    - Parallel prediction: all K draft tokens in one forward pass
+    - Cross-attention: draft model attends to target hidden states
+
+    Reference: https://arxiv.org/pdf/2602.06036
+    """
+    mask_token_id: Optional[int] = Field(
+        default=None,
+        description=
+        "The token ID used as a mask token for parallel draft prediction. "
+        "If None, it will be read from the draft model config (dflash_config.mask_token_id)."
+    )
+
+    target_layer_ids: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "List of target model layer indices whose hidden states are captured "
+        "for cross-attention in the draft model. If None, read from the draft "
+        "model config (dflash_config.target_layer_ids).")
+
+    decoding_type: Literal["DFlash"] = "DFlash"
+
+    @model_validator(mode="after")
+    def set_max_total_draft_tokens(self):
+        self.max_total_draft_tokens = self.max_draft_len
+        return self
+
+    @property
+    def tokens_per_gen_step(self) -> int:
+        """DFlash needs 2K tokens per gen request: K+1 accepted + K-1 masks."""
+        return 2 * self.max_draft_len
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    @functools.cached_property
+    def spec_dec_mode(self):
+        from tensorrt_llm._torch.speculative.interface import \
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        return TorchSpeculativeDecodingMode.DFLASH
 
 
 class AutoDecodingConfig(DecodingBaseConfig):
@@ -2275,8 +2413,8 @@ class LookaheadDecodingConfig(DecodingBaseConfig, PybindMirror):
 SpeculativeConfig: TypeAlias = Annotated[
     Union[
         DraftTargetDecodingConfig,
+        Eagle3DecodingConfig,  # Must be before EagleDecodingConfig since it's a subclass
         EagleDecodingConfig,
-        Eagle3DecodingConfig,
         LookaheadDecodingConfig,
         MedusaDecodingConfig,
         MTPDecodingConfig,
@@ -2285,6 +2423,7 @@ SpeculativeConfig: TypeAlias = Annotated[
         UserProvidedDecodingConfig,
         SaveHiddenStatesDecodingConfig,
         PARDDecodingConfig,
+        DFlashDecodingConfig,
         AutoDecodingConfig,
     ],
     Field(discriminator="decoding_type"),
@@ -2314,7 +2453,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "The maximum number of tokens that should be stored in the KV cache. If both `max_tokens` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be used."
     )
-    max_attention_window: Optional[List[PositiveInt]] = Field(
+    max_attention_window: Optional[List[int]] = Field(
         default=None,
         min_length=1,
         description=
@@ -2416,6 +2555,12 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
 
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    mamba_state_cache_interval: PositiveInt = Field(
+        default=256,
+        description=
+        "The number of tokens between cache steps in the Mamba prefix cache.")
+
     use_kv_cache_manager_v2: bool = Field(
         default=False,
         status="prototype",
@@ -2494,9 +2639,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 raise ValueError(
                     "kv_cache_config.max_attention_window must contain only integers"
                 )
-            if i <= 0:
+            if i <= 0 and i not in [LinearCacheType.RECURRENT_STATES.value]:
                 raise ValueError(
-                    "kv_cache_config.max_attention_window values must be positive"
+                    "kv_cache_config.max_attention_window values must be positive or LinearCacheType.RECURRENT_STATES.value"
                 )
         return v
 
@@ -2645,6 +2790,12 @@ class DwdpConfig(StrictBaseModel):
         default=0, description="The number of experts per worker.")
     num_prefetch_experts: int = Field(
         default=0, description="The number of prefetch experts per worker.")
+    contention_opt: bool = Field(
+        default=False,
+        description=
+        "Enable limited-contention prefetch optimization. Uses batched "
+        "memcpy with round-robin slice ordering across peers and a 2 MiB "
+        "slice granularity to reduce NVLink contention.")
 
 
 class BaseLlmArgs(StrictBaseModel):
@@ -3260,6 +3411,10 @@ class TrtLlmArgs(BaseLlmArgs):
                 raise ValueError(
                     "speculative_config.decoding_type 'PARD' is only supported on the PyTorch backend."
                 )
+            elif isinstance(self.speculative_config, DFlashDecodingConfig):
+                raise ValueError(
+                    "speculative_config.decoding_type 'DFlash' is only supported on the PyTorch backend."
+                )
             else:
                 raise ValueError(
                     f"Unrecognized speculative config type {type(self.speculative_config)}"
@@ -3434,6 +3589,50 @@ class LoadFormat(Enum):
     DUMMY = 1
     # Only load the multimodal(vision) encoder weights
     VISION_ONLY = 2
+
+
+class ModelExpressConfig(StrictBaseModel):
+    """Prototype configuration for ModelExpress (MX) weight transfer."""
+
+    server_url: Optional[str] = Field(
+        default=None,
+        description="URL of the MX (ModelExpress) server for P2P weight "
+        "transfer. When set together with checkpoint_format='MX', enables "
+        "GPU-to-GPU weight transfer from a running source instance, bypassing "
+        "disk I/O. When the server is unreachable, loading falls back to the "
+        "standard HuggingFace checkpoint path.",
+        status="prototype",
+    )
+
+    server_query_timeout_s: Optional[NonNegativeInt] = Field(
+        default=None,
+        description="Timeout in seconds for upstream MxLiveWeightLoader source "
+        "discovery. When unset, TRT-LLM first probes for existing sources: "
+        "no source uses a short 30-second fallback cap, while an existing "
+        "source uses modelexpress's default wait for long donor loads.",
+        status="prototype",
+    )
+
+    preshard_strategy: str = Field(
+        default="per_module",
+        description="How to inform TRT-LLM that MX-delivered weights are already "
+        "TP-sharded for the local rank. Only 'per_module' is supported in "
+        "this MX-only PR; 'global' requires LoadFormat.PRESHARDED.",
+        status="prototype",
+    )
+
+    @model_validator(mode="after")
+    def validate_preshard_strategy(self) -> 'ModelExpressConfig':
+        if self.preshard_strategy not in ("per_module", "global"):
+            raise ValueError(
+                f"mx_config.preshard_strategy must be 'per_module' or 'global', "
+                f"got '{self.preshard_strategy}'.")
+        if self.preshard_strategy == "global":
+            raise ValueError(
+                "mx_config.preshard_strategy='global' requires "
+                "LoadFormat.PRESHARDED, which is not yet available in "
+                "TRT-LLM main. Use preshard_strategy='per_module' instead.")
+        return self
 
 
 class SamplerType(StrEnum):
@@ -3665,6 +3864,12 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    mx_config: ModelExpressConfig = Field(
+        default_factory=ModelExpressConfig,
+        description="ModelExpress (MX) P2P checkpoint loading config.",
+        status="prototype",
+    )
+
     kv_connector_config: Optional[KvCacheConnectorConfig] = Field(
         default=None,
         description="The config for KV cache connector.",
@@ -3675,6 +3880,18 @@ class TorchLlmArgs(BaseLlmArgs):
         default=False,
         description=
         "Only load/execute the vision encoder part of the full model. Defaults to False.",
+        status="prototype",
+    )
+
+    encode_only: bool = Field(
+        default=False,
+        description=
+        "Set to True to use the batch-forward encode() path, which runs a "
+        "single forward pass and returns the model output directly, bypassing "
+        "the scheduler and autoregressive loop. Works for encoder-only "
+        "models (BERT, RoBERTa, reward models) and decoder models used in "
+        "single-prefill mode (e.g., extracting embeddings). When False "
+        "(default), uses the standard generate() path.",
         status="prototype",
     )
 
@@ -3713,6 +3930,19 @@ class TorchLlmArgs(BaseLlmArgs):
     use_cute_dsl_blockscaling_bmm: bool = Field(
         default=False,
         description="If true, use CuTe DSL fp8 blockscaling bmm implementation.",
+        status="prototype",
+    )
+    # bf16 cute dsl configs
+    use_cute_dsl_bf16_bmm: bool = Field(
+        default=False,
+        description=
+        "If true, use CuTe DSL bf16 persistent GEMM for BMM on Blackwell.",
+        status="prototype",
+    )
+    use_cute_dsl_bf16_gemm: bool = Field(
+        default=False,
+        description=
+        "If true, use CuTe DSL bf16 persistent GEMM for Linear layers on Blackwell.",
         status="prototype",
     )
 
@@ -3817,6 +4047,29 @@ class TorchLlmArgs(BaseLlmArgs):
             if isinstance(self.speculative_config, PARDDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
 
+            if isinstance(self.speculative_config, DFlashDecodingConfig):
+                assert self.speculative_config.max_draft_len > 0, "DFlash max_draft_len must be > 0"
+                # Resolve target_layer_ids and mask_token_id from draft model config if not set
+                needs_target_layer_ids = self.speculative_config.target_layer_ids is None
+                needs_mask_token_id = self.speculative_config.mask_token_id is None
+                if (needs_target_layer_ids or needs_mask_token_id
+                    ) and self.speculative_config.speculative_model is not None:
+                    draft_config_path = os.path.join(
+                        self.speculative_config.speculative_model,
+                        "config.json")
+                    if os.path.exists(draft_config_path):
+                        with open(draft_config_path) as f:
+                            draft_cfg = json.load(f)
+                        dflash_cfg = draft_cfg.get("dflash_config", {})
+                        if needs_target_layer_ids:
+                            layer_ids = dflash_cfg.get("target_layer_ids")
+                            if layer_ids is not None:
+                                self.speculative_config.target_layer_ids = layer_ids
+                        if needs_mask_token_id:
+                            mask_id = dflash_cfg.get("mask_token_id")
+                            if mask_id is not None:
+                                self.speculative_config.mask_token_id = mask_id
+
             if isinstance(self.speculative_config, SADecodingConfig):
                 pool_size = self.speculative_config.global_pool_size
                 if pool_size is not None and self.max_batch_size is not None:
@@ -3875,6 +4128,29 @@ class TorchLlmArgs(BaseLlmArgs):
                 "checkpoint_format will be set to HF.")
             self.checkpoint_format = "HF"
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_mx_config(self) -> 'TorchLlmArgs':
+        # When MX is the active checkpoint format and the user did not
+        # explicitly set ``mx_config.server_url``, honor the ``MODEL_EXPRESS_URL``
+        # env var that the upstream ``modelexpress`` library reads. This
+        # lets orchestrators configure MX via the environment while keeping
+        # the resolved value visible on ``llm_args.mx_config.server_url``.
+        if self.checkpoint_format == "MX" and self.mx_config.server_url is None:
+            env_url = os.environ.get("MODEL_EXPRESS_URL")
+            if env_url:
+                logger.info(
+                    "mx_config.server_url not set; using MODEL_EXPRESS_URL=%s "
+                    "from environment.", env_url)
+                self.mx_config.server_url = env_url
+
+        if self.mx_config.server_url is not None and self.checkpoint_format != "MX":
+            logger.warning(
+                "mx_config.server_url is set but checkpoint_format is '%s', not "
+                "'MX'. The MX config will be ignored. Set "
+                "checkpoint_format='MX' to enable MX P2P weight transfer.",
+                self.checkpoint_format)
         return self
 
     @model_validator(mode="after")
@@ -3974,6 +4250,18 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError(
                 "ray_placement_config is only supported with orchestrator_type='ray'"
             )
+        return self
+
+    @model_validator(mode='after')
+    def validate_cute_dsl_bf16(self) -> 'TorchLlmArgs':
+        if self.use_cute_dsl_bf16_bmm or self.use_cute_dsl_bf16_gemm:
+            major, minor = torch.cuda.get_device_capability()
+            sm = major * 10 + minor
+            if sm < 100:
+                raise ValueError(
+                    f"use_cute_dsl_bf16_bmm and use_cute_dsl_bf16_gemm are only "
+                    f"supported on Blackwell (sm >= 100), but current device has "
+                    f"sm {sm}.")
         return self
 
     def get_executor_config(

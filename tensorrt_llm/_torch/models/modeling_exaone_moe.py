@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
+from transformers import ExaoneMoeConfig
 
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.modules.qk_norm_attention import QKNormRoPEAttention
@@ -12,7 +13,6 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
-from ...logger import logger
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (
     PositionalEmbeddingParams,
@@ -41,24 +41,8 @@ from .modeling_deepseekv3 import DeepseekV3MTPHead
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
 
-# fmt: off
-# TODO: Remove this once we have a proper transformers package
-from transformers import AutoConfig, PretrainedConfig  # isort: skip
 
-class ExaoneMoEConfig(PretrainedConfig):
-    model_type = "exaone_moe"
-
-logger.warning_once(
-    "transformers does not support 'ExaoneMoEConfig'. "
-    "Register ExaoneMoEConfig to mimic the ExaoneMoE model.",
-    key="EXAONE_MOE_REGISTER_WARNING"
-)
-AutoConfig.register(ExaoneMoEConfig.model_type, ExaoneMoEConfig)
-# End of the config register.
-# fmt: on
-
-
-def check_is_moe(config: ExaoneMoEConfig, layer_idx: int, is_mtp_layer: bool = False) -> bool:
+def check_is_moe(config: ExaoneMoeConfig, layer_idx: int, is_mtp_layer: bool = False) -> bool:
     """
     Check if the current layer is a MoE layer.
     """
@@ -75,7 +59,7 @@ def check_is_moe(config: ExaoneMoEConfig, layer_idx: int, is_mtp_layer: bool = F
 
     raise ValueError(
         "Invalid configuration: Neither `mlp_layer_types` nor `is_moe_layer` found in config. "
-        "Please check if the checkpoint and config are compatible with ExaoneMoEConfig."
+        "Please check if the checkpoint and config are compatible with ExaoneMoeConfig."
     )
 
 
@@ -86,7 +70,7 @@ def enable_attn_allreduce(mapping: Mapping):
 class ExaoneMoeAttention(QKNormRoPEAttention):
     def __init__(
         self,
-        model_config: ModelConfig[ExaoneMoEConfig],
+        model_config: ModelConfig[ExaoneMoeConfig],
         layer_idx: Optional[int] = None,
         is_mtp_layer: bool = False,
         fuse_qk_norm_rope: bool = False,
@@ -159,7 +143,7 @@ class ExaoneMoeSparseMoEBlock(Deepseekv3MoE):
 class ExaoneMoeDecoderLayer(DecoderLayer):
     def __init__(
         self,
-        model_config: ModelConfig[ExaoneMoEConfig],
+        model_config: ModelConfig[ExaoneMoeConfig],
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
         layer_idx: int,
     ):
@@ -266,7 +250,7 @@ class ExaoneMoeDecoderLayer(DecoderLayer):
         self.next_layer_layernorm: RMSNorm = None
 
     def _get_decoder_layer_quant_config(
-        self, model_config: ModelConfig[ExaoneMoEConfig], layer_idx: int
+        self, model_config: ModelConfig[ExaoneMoeConfig], layer_idx: int
     ):
         """
         The MTP layer in the nvfp4 checkpoint is unquantized. Because the TRTLLM
@@ -478,7 +462,7 @@ class ExaoneMoeMTPHead(DeepseekV3MTPHead):
 class ExaoneMoeMTP(ExaoneMoeDecoderLayer):
     def __init__(
         self,
-        model_config: ModelConfig[ExaoneMoEConfig],
+        model_config: ModelConfig[ExaoneMoeConfig],
         layer_idx: int,
         aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
     ):
@@ -582,7 +566,7 @@ class ExaoneMoeMTP(ExaoneMoeDecoderLayer):
 
 
 class ExaoneMoeModel(DecoderModel):
-    def __init__(self, model_config: ModelConfig[ExaoneMoEConfig]):
+    def __init__(self, model_config: ModelConfig[ExaoneMoeConfig]):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
         self.num_hidden_layers = config.num_hidden_layers
@@ -651,10 +635,10 @@ class ExaoneMoeModel(DecoderModel):
 
 
 @register_auto_model("ExaoneMoEForCausalLM")
-class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoEConfig]):
+class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoeConfig]):
     def __init__(
         self,
-        model_config: ModelConfig[ExaoneMoEConfig],
+        model_config: ModelConfig[ExaoneMoeConfig],
     ):
         if (
             model_config.spec_config is not None
@@ -711,7 +695,9 @@ class ExaoneMoeForCausalLM(SpecDecOneEngineForCausalLM[ExaoneMoeModel, ExaoneMoE
         skip_modules: Optional[List[str]] = None,
         allow_partial_loading: bool = False,
     ):
-        assert isinstance(weight_mapper, ExaoneMoeWeightMapper)
+        if weight_mapper is None:
+            weight_mapper = ExaoneMoeWeightMapper()
+        weight_mapper.init_model_and_config(self, self.model_config)
 
         if self.draft_model is not None:
             weight_mapper.preprocess_weights(weights)

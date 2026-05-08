@@ -303,7 +303,8 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         assert num_hidden_layers >= mapping.pp_size, f"{num_hidden_layers} layers are not enough for PP{mapping.pp_size}"
         pp_layer_list = mapping.pp_layers(num_hidden_layers)
         has_pp_layer = len(pp_layer_list) > 0
-        for layer_idx, layer in enumerate(self.layers):
+        for layer_idx in range(num_hidden_layers):
+            layer = self.layers[layer_idx]
             is_last_layer = (layer_idx == num_hidden_layers - 1)
             if layer_idx not in pp_layer_list:
                 # keep next layer's input_layernorm's weights for fusion
@@ -324,6 +325,17 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
                 has_pp_layer and layer_idx == pp_layer_list[-1])
             if is_last_pp_layer and not mapping.is_last_pp_rank():
                 layer.forward = forward_before_send(layer.forward)
+
+        # Extra layers (e.g., MTP speculative layers) appended beyond
+        # the base model. Skip their forward on all ranks so they are
+        # no-ops in the main decoder loop, but preserve weights on the
+        # last PP rank where the MTP draft worker needs them.
+        for layer_idx in range(num_hidden_layers, len(self.layers)):
+            layer = self.layers[layer_idx]
+            if hasattr(layer, 'skip_forward'):
+                layer.forward = layer.skip_forward
+            if not mapping.is_last_pp_rank():
+                remove_weights(layer)
 
 
 class PostInitCaller(type):
@@ -401,7 +413,7 @@ class DecoderModelForCausalLM(nn.Module,
                     self.lm_head.weight.data.copy_(x)
 
         # use embedding weights in lm_head if tie word embedding is enabled
-        if config.pretrained_config.tie_word_embeddings:
+        if getattr(config.pretrained_config, 'tie_word_embeddings', False):
             assert self.lm_head.tp_size == self.model.embed_tokens.tp_size, (
                 "lm_head and vocab embedding should use the same TP size")
             assert self.lm_head.tp_mode == self.model.embed_tokens.tp_mode, (
@@ -896,7 +908,8 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                 return
 
             # skip load weights if tie word embeddings is enabled and layer is lm_head
-            if model.config.tie_word_embeddings and name.startswith("lm_head"):
+            if getattr(model.config, 'tie_word_embeddings',
+                       False) and name.startswith("lm_head"):
                 return
 
             # Skip loading weights for embedding and lm_head if LoRA is enabled and has custom values

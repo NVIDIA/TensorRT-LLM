@@ -100,12 +100,13 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
 
         seq_slots = args.max_num_sequences
         max_tokens = self._get_max_tokens(args, draft_len)
+        max_new_tokens = self._get_max_new_tokens(args, draft_len)
         draft_tokens_size = self._get_draft_tokens_storage_size(args, draft_len)
         self.max_beam_width = args.max_beam_width
         assert self.max_beam_width == 1, "beam width must be 1 for speculative decoding"
 
         self.store = self.Store(
-            new_tokens=int_tensor((max_tokens, seq_slots, self.max_beam_width)),
+            new_tokens=int_tensor((max_new_tokens, seq_slots, self.max_beam_width)),
             next_new_tokens=int_tensor((max_tokens, seq_slots, self.max_beam_width)),
             next_draft_tokens=int_tensor((seq_slots, draft_tokens_size)),
             new_tokens_lens=int_tensor((seq_slots,)),
@@ -119,6 +120,15 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         MTP uses args.max_total_draft_tokens + 1 for tree-based speculation.
         """
         return draft_len + 1
+
+    def _get_max_new_tokens(self, args: TorchSampler.Args, draft_len: int) -> int:
+        """Max depth of accepted token path for new_tokens buffer.
+
+        Defaults to _get_max_tokens (same size as next_new_tokens).
+        Override when accepted path depth differs from total draft tokens,
+        e.g. dynamic tree where max_draft_len < max_total_draft_tokens.
+        """
+        return self._get_max_tokens(args, draft_len)
 
     def _get_draft_tokens_storage_size(self, args: TorchSampler.Args, draft_len: int) -> int:
         """
@@ -238,19 +248,30 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         o_next_new_tokens = outputs["next_new_tokens"][num_skip : num_skip + num_sampling_requests]
         runtime_draft_len = o_next_draft_tokens.shape[1]
 
-        # Pad to match fixed-size store buffers for index_copy_.
-        if o_new_tokens.shape[1] < (self.draft_len + 1):
+        # Pad or truncate to match fixed-size store buffers for index_copy_.
+        # Use actual store buffer dimensions (which may differ from draft_len
+        # when _get_max_new_tokens is overridden, e.g. dynamic tree mode).
+        new_tokens_width = self.store.new_tokens.shape[0]
+        next_new_tokens_width = self.store.next_new_tokens.shape[0]
+        draft_tokens_width = self.store.next_draft_tokens.shape[1]
+        if o_new_tokens.shape[1] < new_tokens_width:
             o_new_tokens = torch.nn.functional.pad(
-                o_new_tokens, (0, (self.draft_len + 1) - o_new_tokens.shape[1])
+                o_new_tokens, (0, new_tokens_width - o_new_tokens.shape[1])
             )
-        if o_next_draft_tokens.shape[1] < self.draft_len:
+        elif o_new_tokens.shape[1] > new_tokens_width:
+            o_new_tokens = o_new_tokens[:, :new_tokens_width]
+        if o_next_draft_tokens.shape[1] < draft_tokens_width:
             o_next_draft_tokens = torch.nn.functional.pad(
-                o_next_draft_tokens, (0, self.draft_len - o_next_draft_tokens.shape[1])
+                o_next_draft_tokens, (0, draft_tokens_width - o_next_draft_tokens.shape[1])
             )
-        if o_next_new_tokens.shape[1] < (self.draft_len + 1):
+        elif o_next_draft_tokens.shape[1] > draft_tokens_width:
+            o_next_draft_tokens = o_next_draft_tokens[:, :draft_tokens_width]
+        if o_next_new_tokens.shape[1] < next_new_tokens_width:
             o_next_new_tokens = torch.nn.functional.pad(
-                o_next_new_tokens, (0, (self.draft_len + 1) - o_next_new_tokens.shape[1])
+                o_next_new_tokens, (0, next_new_tokens_width - o_next_new_tokens.shape[1])
             )
+        elif o_next_new_tokens.shape[1] > next_new_tokens_width:
+            o_next_new_tokens = o_next_new_tokens[:, :next_new_tokens_width]
 
         # Use index_copy_ for efficient copying (slots are unique)
         self.store.new_tokens.squeeze(-1).T.index_copy_(0, slots, o_new_tokens)

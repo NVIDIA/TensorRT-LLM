@@ -1,16 +1,62 @@
-# Config for SuperV3 with MTP speculative decoding (requires triton SSM/conv backends).
-# TODO: Replace with sharding and footprint-improving transforms in the style of super_v3.yaml.
-compile_backend: torch-simple
-attn_backend: flashinfer
+# Config for SuperV3 with MTP speculative decoding.
+#
+runtime: trtllm
+compile_backend: torch-cudagraph
 max_batch_size: 128
-max_seq_len: 16384
-max_num_tokens: 16384
+max_seq_len: 65536 # tunable
+enable_chunked_prefill: false # TODO: Support chunked prefill w/ spec dec
+attn_backend: trtllm
+model_factory: AutoModelForCausalLM
+skip_loading_weights: false
+cuda_graph_config:
+  batch_sizes: [1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 320, 384]
+kv_cache_config:
+  # tunable mamba cache dtype
+  # --> use float32 for accuracy and default (auto) for speed
+  mamba_ssm_cache_dtype: auto
 speculative_config:
   decoding_type: MTP
-  num_nextn_predict_layers: 7
+  num_nextn_predict_layers: 6
   mtp_eagle_one_model: true
 transforms:
+  detect_sharding:
+    allreduce_strategy: NCCL
+    # NOTE: add 'tp' to sharding dims only for high-throughput runs
+    # For low-latency, keep mamba and attention replicated
+    sharding_dims: ['ep', 'bmm']
+    # NOTE: sharding_source applies only to TP sharding
+    sharding_source: ['manual']
+    manual_config:
+      head_dim: 128
+      tp_plan:
+        # mamba SSM layer
+        "in_proj": "mamba"
+        "out_proj": "rowwise"
+        # attention layer
+        "q_proj": "colwise"
+        "k_proj": "colwise"
+        "v_proj": "colwise"
+        "o_proj": "rowwise"
+        # moe layer: SHARED experts
+        "up_proj": "colwise"
+        "down_proj": "rowwise"
+        # MoLE: latent projections: simple shard
+        "fc1_latent_proj": "gather"
+        "fc2_latent_proj": "gather"
+  # multi_stream_moe disabled - creates NaNs in target's sampled logits. TODO: investigate + fix
+  multi_stream_moe:
+    stage: compile
+    enabled: false
+  fuse_mamba_a_log:
+    stage: post_load_fusion
+    enabled: true
+  # Triton SSM + causal conv are required for MTP as currently they are the only backends
+  # that support speculative mamba state caching.
   insert_cached_ssm_attention:
     backend: triton_ssm
   insert_cached_causal_conv:
     backend: triton_causal_conv
+  fuse_nvfp4_moe:
+    backend: trtllm_gen
+  fuse_fp8_moe:
+    allow_different_input_scales: true

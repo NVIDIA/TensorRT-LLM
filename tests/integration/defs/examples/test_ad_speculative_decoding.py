@@ -23,7 +23,6 @@ from typing import Optional, Set
 import pytest
 import torch
 import torch.nn as nn
-from build_and_run_ad import ExperimentConfig, main
 from defs.conftest import llm_models_root
 from test_common.llm_data import hf_id_to_local_model_dir
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -40,7 +39,7 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
     EagleWrapperConfig,
 )
 from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory
-from tensorrt_llm.llmapi import DraftTargetDecodingConfig, Eagle3DecodingConfig, KvCacheConfig
+from tensorrt_llm.llmapi import Eagle3DecodingConfig
 
 prompts = [
     "What is the capital of France?",
@@ -51,7 +50,6 @@ prompts = [
 
 EAGLE_MODEL_SUBPATH = "EAGLE3-LLaMA3.1-Instruct-8B"
 LLAMA_BASE_SUBPATH = "llama-3.1-model/Llama-3.1-8B-Instruct"
-DRAFT_TARGET_MAX_DRAFT_LEN = 3
 EAGLE_MAX_DRAFT_LEN = 3
 
 
@@ -59,250 +57,35 @@ def get_model_paths():
     """Get model paths using llm_models_root()."""
     models_root = llm_models_root()
     base_model = os.path.join(models_root, LLAMA_BASE_SUBPATH)
-    draft_target_model = os.path.join(
-        models_root,
-        "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
-    )
     eagle_model = os.path.join(models_root, EAGLE_MODEL_SUBPATH)
 
     print(f"Base model path: {base_model}")
-    print(f"DraftTarget draft model path: {draft_target_model}")
     print(f"EAGLE model path: {eagle_model}")
-    return base_model, draft_target_model, eagle_model
+    return base_model, eagle_model
 
 
-def make_draft_target_config(spec_model_path: str):
-    return DraftTargetDecodingConfig(
-        max_draft_len=DRAFT_TARGET_MAX_DRAFT_LEN, speculative_model=spec_model_path
-    )
-
-
-def make_eagle3_config(spec_model_path: str):
-    return Eagle3DecodingConfig(
-        max_draft_len=EAGLE_MAX_DRAFT_LEN,
-        speculative_model=spec_model_path,
-        eagle3_one_model=False,
-        eagle3_layers_to_capture=None,
-    )
-
-
-def run_with_autodeploy(model, speculative_config, batch_size, transforms_override=None):
-    """Run AutoDeploy with or without speculative decoding.
-
-    Args:
-        model: Path to the base model
-        speculative_config: Speculative decoding config (None for baseline mode)
-        batch_size: Number of prompts to process
-        transforms_override: Optional dict of transform config overrides to merge
-            into the default transforms config (e.g. {"fuse_add_rms_norm": {"enabled": False}})
-
-    Returns:
-        List of (prompt, output) tuples from prompts_and_outputs
-    """
-    # Select prompts based on batch size
-    selected_prompts = prompts[:batch_size]
-
-    # Configure KV cache
-    kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=0.01,
-    )
-
-    # Configure AutoDeploy LLM arguments
-    llm_args = {
-        "model": model,
-        "skip_loading_weights": False,
-        "speculative_config": speculative_config,
-        "runtime": "trtllm",
-        "world_size": 1,
-        "kv_cache_config": kv_cache_config,
-        "disable_overlap_scheduler": True,
-        "max_batch_size": 128,
-        "max_num_tokens": 128,
-    }
-
-    # Apply any transform config overrides
-    if transforms_override:
-        llm_args["transforms"] = transforms_override
-
-    # Configure experiment with prompts
-    experiment_config = {
-        "args": llm_args,
-        "benchmark": {"enabled": False},
-        "prompt": {
-            "batch_size": batch_size,
-            "queries": selected_prompts,
-        },
-    }
-
-    # Create ExperimentConfig
-    cfg = ExperimentConfig(**experiment_config)
-
-    # Add sampling parameters (deterministic with temperature=0.0 and fixed seed)
-    cfg.prompt.sp_kwargs = {
-        "max_tokens": 50,
-        "top_k": None,
-        "temperature": 0.0,
-        "seed": 42,
-    }
-
-    # Run the experiment
-    result = main(cfg)
-
-    # Extract and return prompts_and_outputs
-    assert "prompts_and_outputs" in result, "Result should contain 'prompts_and_outputs'"
-    return result["prompts_and_outputs"]
-
-
-# Note: This test tests exact equality of outputs between speculative and baseline modes.
-# This can fail for larger batch sizes due to nondeterminism with in flight batching.
-# TODO: Figure out a robust test for output correctness that can pass for larger batch sizes.
-@pytest.mark.parametrize("spec_dec_mode", ["draft_target", "eagle3"])
-def test_autodeploy_spec_dec_output(spec_dec_mode):
-    """Test AutoDeploy speculative decoding output correctness.
-
-    Runs with and without speculative decoding and verifies outputs are identical.
-    """
-    print("\n" + "=" * 80)
-    print(f"Testing AutoDeploy Speculative Decoding ({spec_dec_mode}) - Output Correctness")
-    print("=" * 80)
-
-    base_model, draft_target_model, eagle_model = get_model_paths()
-
-    # Select model and config based on mode
-    if spec_dec_mode == "draft_target":
-        spec_model = draft_target_model
-        spec_config = make_draft_target_config(spec_model)
-    elif spec_dec_mode == "eagle3":  # eagle3
-        spec_model = eagle_model
-        spec_config = make_eagle3_config(spec_model)
-    else:
-        raise ValueError(f"Unsupported speculative decoding mode: {spec_dec_mode}")
-
-    print(f"\nBase Model: {base_model}")
-    print(f"Speculative Model ({spec_dec_mode}): {spec_model}")
-
-    # For eagle3, disable fuse_add_rms_norm for both runs to ensure numerical
-    # parity. The eagle3 hidden state capture replaces aten.add with
-    # residual_add_for_capture at certain layers, which prevents
-    # fuse_add_rms_norm from fusing those layers. This causes the target
-    # model to produce slightly different logits vs baseline (which fuses
-    # all layers), leading to greedy-divergent outputs on some hardware.
-    transforms_override = None
-    if spec_dec_mode == "eagle3":
-        transforms_override = {"fuse_add_rms_norm": {"enabled": False}}
-
-    # Run with speculative decoding
-    print("\n[1/2] Running with speculative decoding enabled...")
-    spec_outputs = run_with_autodeploy(
-        model=base_model,
-        speculative_config=spec_config,
-        batch_size=1,
-        transforms_override=transforms_override,
-    )
-    print(f"Generated {len(spec_outputs)} outputs with speculative decoding")
-
-    # Run without speculative decoding (baseline)
-    print("\n[2/2] Running without speculative decoding (baseline)...")
-    baseline_outputs = run_with_autodeploy(
-        model=base_model,
-        speculative_config=None,
-        batch_size=1,
-        transforms_override=transforms_override,
-    )
-    print(f"Generated {len(baseline_outputs)} outputs in baseline mode")
-
-    # Verify outputs are identical
-    print("\nVerifying outputs are identical...")
-    assert len(spec_outputs) == len(baseline_outputs), (
-        f"Number of outputs mismatch: spec={len(spec_outputs)}, baseline={len(baseline_outputs)}"
-    )
-
-    for i, ((spec_prompt, spec_output), (baseline_prompt, baseline_output)) in enumerate(
-        zip(spec_outputs, baseline_outputs, strict=True)
-    ):
-        print(f"\n[Output {i}]")
-        print(f"  Prompt: {spec_prompt}")
-        print("================================================")
-        print(f"  Spec Output: {spec_output}")
-        print("================================================")
-        print(f"  Baseline Output: {baseline_output}")
-        print("================================================")
-
-        assert spec_prompt == baseline_prompt, f"Prompts differ at index {i}"
-        assert spec_output == baseline_output, (
-            f"Outputs differ at index {i}:\n\n  Spec: {spec_output}\n\n  Baseline: {baseline_output}\n\n"
-        )
-
-    print("\n" + "=" * 80)
-    print("SUCCESS! All outputs are identical between spec-dec and baseline modes")
-    print("=" * 80)
-
-
-def test_autodeploy_eagle3_acceptance_rate():
-    """Test Eagle3 (two-model) acceptance rate with AutoDeploy engine.
-
-    Runs Eagle3 speculative decoding with streaming and verifies
-    that the acceptance rate is above a minimum threshold.
-    """
-    print("\n" + "=" * 80)
-    print("Testing AutoDeploy Eagle3 Acceptance Rate")
-    print("=" * 80)
-
-    base_model, _, eagle_model = get_model_paths()
-
-    print(f"\nBase Model: {base_model}")
-    print(f"Eagle3 Model: {eagle_model}")
-
-    max_draft_len = EAGLE_MAX_DRAFT_LEN
-
-    # Configure Eagle3 speculative decoding
-    speculative_config = Eagle3DecodingConfig(
-        max_draft_len=max_draft_len,
-        speculative_model=eagle_model,
-        eagle3_one_model=False,
-        eagle3_layers_to_capture=None,
-    )
-
-    # Configure KV cache
-    kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=0.01,
-    )
-
-    # Create AutoDeploy LLM with Eagle3 speculative decoding
-    # We directly instantiate the LLM class instead of using the main() function
-    # so that we can stream the outputs to see acceptance rates without needing to
-    # collect them in the executor.
-    # Use context manager to ensure proper cleanup and avoid thread leaks.
-    with LLM(
-        model=base_model,
-        skip_loading_weights=False,
-        runtime="trtllm",
-        world_size=1,
-        kv_cache_config=kv_cache_config,
-        speculative_config=speculative_config,
-        disable_overlap_scheduler=True,
-        max_batch_size=128,
-        max_num_tokens=128,
-    ) as llm:
-        _run_acceptance_rate_check(llm, max_draft_len)
-
-
-@pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
-def test_autodeploy_eagle3_one_model_acceptance_rate(disable_overlap_scheduler: bool):
+@pytest.mark.parametrize(
+    ("attn_backend", "compile_backend"),
+    [
+        ("trtllm", "torch-cudagraph"),
+        ("flashinfer", "torch-simple"),
+    ],
+)
+def test_autodeploy_eagle3_one_model_acceptance_rate(attn_backend: str, compile_backend: str):
     """Test Eagle3 one-model acceptance rate with AutoDeploy engine.
 
     Runs Eagle3 one-model speculative decoding with streaming and verifies
     that the acceptance rate is above a minimum threshold.
-    Parameterized over overlap scheduler enabled/disabled.
+    Parameterized over attention backend and compile backend.
     """
     print("\n" + "=" * 80)
     print(
         f"Testing AutoDeploy Eagle3 One-Model Acceptance Rate "
-        f"(overlap={'disabled' if disable_overlap_scheduler else 'enabled'})"
+        f"(attn_backend={attn_backend}, compile_backend={compile_backend})"
     )
     print("=" * 80)
 
-    base_model, _, eagle_model = get_model_paths()
+    base_model, eagle_model = get_model_paths()
 
     print(f"\nBase Model: {base_model}")
     print(f"Eagle3 Model: {eagle_model}")
@@ -322,9 +105,19 @@ def test_autodeploy_eagle3_one_model_acceptance_rate(disable_overlap_scheduler: 
         runtime="trtllm",
         world_size=1,
         speculative_config=speculative_config,
-        disable_overlap_scheduler=disable_overlap_scheduler,
-        compile_backend="torch-simple",
+        # Force the Eagle3 draft to match the target (Llama 3.1 8B is bfloat16).
+        # Shared KV cache requires matching dtypes between target and draft.
+        speculative_model_kwargs={"torch_dtype": "bfloat16"},
+        compile_backend=compile_backend,
+        attn_backend=attn_backend,
         max_num_tokens=512,
+        # max_batch_size must leave room for an extend-only sample batch during
+        # resize_kv_cache, i.e. max_num_tokens // max_batch_size >= 1 + max_draft_len.
+        # Otherwise the sample batch is classified as decode-only and the Eagle
+        # wrapper rejects it ("decode without drafting is not supported").
+        # TODO: remove once resize_kv_cache is spec-aware.
+        # See: https://github.com/NVIDIA/TensorRT-LLM/issues/13348
+        max_batch_size=128,
     ) as llm:
         _run_acceptance_rate_check(llm, max_draft_len)
 
@@ -442,7 +235,7 @@ def test_eagle_model_with_weights():
     print("Test: EagleModel forward pass with loaded weights (via EagleDrafterFactory)")
     print("=" * 80)
 
-    _, _, eagle_model_path = get_model_paths()
+    _, eagle_model_path = get_model_paths()
     eagle_path = Path(eagle_model_path)
 
     # 1. Setup Device
@@ -1042,7 +835,7 @@ def test_eagle_wrapper_forward(batch_size: int):
     torch.manual_seed(42)
 
     # Get model paths using integration test conventions
-    base_model_path, _, eagle_model_path = get_model_paths()
+    base_model_path, eagle_model_path = get_model_paths()
     eagle_path = Path(eagle_model_path)
 
     # Configuration

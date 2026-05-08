@@ -22,6 +22,7 @@ from ._common import (
     CudaStream,
     LayerId,
     MemAddress,
+    PageIndexMode,
     Priority,
     TokenId,
     TokenIdExt,
@@ -39,7 +40,15 @@ from ._config import (
     KVCacheManagerConfig,
     SsmLayerConfig,
 )
-from ._core import DEFAULT_BEAM_INDEX, AggregatedPageDesc, BeamIndex, KVCacheManager, _KVCache
+from ._core import (
+    DEFAULT_BEAM_INDEX,
+    AggregatedPageDesc,
+    BeamIndex,
+    KVCacheManager,
+    PageIndexConverter,
+    ScratchDesc,
+    _KVCache,
+)
 from ._life_cycle_registry import LayerGroupId, LifeCycleId
 from ._storage import BufferId
 
@@ -74,4 +83,7 @@ __all__ = [
     "rawref",
     "AggregatedPageDesc",
     "BufferId",
+    "PageIndexConverter",
+    "PageIndexMode",
+    "ScratchDesc",
 ]

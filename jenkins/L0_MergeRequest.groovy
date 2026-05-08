@@ -720,12 +720,17 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "cpp/tensorrt_llm/kernels/communicationKernels/",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.cu",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.h",
+        "cpp/tensorrt_llm/kernels/fmhaDispatcher.cpp",
+        "cpp/tensorrt_llm/kernels/fmhaDispatcher.h",
         "cpp/tensorrt_llm/kernels/gptKernels.cu",
         "cpp/tensorrt_llm/kernels/gptKernels.h",
         "cpp/tensorrt_llm/kernels/moe",
+        "cpp/tensorrt_llm/kernels/trtllmGenKernels/fmha/",
         "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.cu",
         "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.h",
         "cpp/tensorrt_llm/kernels/userbuffers/",
+        "cpp/tensorrt_llm/kernels/xqaDispatcher.cpp",
+        "cpp/tensorrt_llm/kernels/xqaDispatcher.h",
         "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.cpp",
         "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.h",
         "cpp/tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.cpp",
@@ -759,6 +764,16 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tensorrt_llm/_torch/pyexecutor/model_engine.py",
         "tensorrt_llm/_torch/pyexecutor/py_executor.py",
         "tensorrt_llm/_torch/auto_deploy/transform/library/sharding.py",
+        "tensorrt_llm/_torch/visual_gen/attention_backend/parallel.py",
+        "tensorrt_llm/_torch/visual_gen/modules/vae/",
+        "tensorrt_llm/_torch/visual_gen/modules/attention.py",
+        "tensorrt_llm/_torch/visual_gen/executor.py",
+        "tensorrt_llm/_torch/visual_gen/mapping.py",
+        "tensorrt_llm/_torch/visual_gen/pipeline.py",
+        "tensorrt_llm/_torch/visual_gen/pipeline_loader.py",
+        "tensorrt_llm/_torch/visual_gen/models/wan/parallel_vae.py",
+        "tensorrt_llm/visual_gen/",
+        "tensorrt_llm/bench/benchmark/visual_gen.py",
         "tensorrt_llm/evaluate/json_mode_eval.py",
         "tensorrt_llm/evaluate/mmlu.py",
         "tensorrt_llm/executor/",
@@ -774,6 +789,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/unittest/auto_deploy/multigpu",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
+        "tests/unittest/_torch/visual_gen/multi_gpu/",
         "tests/unittest/disaggregated/",
         "tests/unittest/llmapi/test_llm_multi_gpu.py",
         "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
@@ -822,7 +838,8 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
         return ""
     }
     def groupFileMap = [
-        "Docs": [ // TODO: Add more docs path to the list, e.g. *.md files in other directories
+        "Docs": [
+            // Matched by prefix here, plus any "*.md" file anywhere in the repo (handled below).
             "docs/",
         ],
         "PyTorch": [
@@ -853,17 +870,20 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
 
     for (group in groupFileMap.keySet()) {
         def groupPrefixes = groupFileMap[group]
-        def allFilesInGroup = changedFileList.every { file ->
-            groupPrefixes.any { prefix -> file.startsWith(prefix) }
+        def matchesGroup = { file ->
+            // Any *.md file, anywhere in the repo, counts as Docs-only.
+            if (group == "Docs" && file.endsWith(".md")) {
+                return true
+            }
+            return groupPrefixes.any { prefix -> file.startsWith(prefix) }
         }
+        def allFilesInGroup = changedFileList.every(matchesGroup)
 
         if (allFilesInGroup) {
             pipeline.echo("Only ${group} files changed.")
             return group
         } else {
-            def nonGroupFile = changedFileList.find { file ->
-                !groupPrefixes.any { prefix -> file.startsWith(prefix) }
-            }
+            def nonGroupFile = changedFileList.find { file -> !matchesGroup(file) }
             if (nonGroupFile != null) {
                 pipeline.echo("Found non-${group} file: ${nonGroupFile}")
             }
@@ -1387,7 +1407,74 @@ pipeline {
                     def analysis = trtllm_utils.analyzePipelineFailureWithAgent(
                         this, env.JOB_NAME, env.BUILD_NUMBER, prNumber)
                     if (analysis) {
-                        echo "=== CI Agent Failure Analysis ===\n${analysis}"
+                        def bucket = 'sw-tensorrt-ci-analysis'
+                        def key = "${env.JOB_NAME}/${env.BUILD_NUMBER}/failure_analysis.html"
+                        def htmlUrl = "https://pbss.s8k.io/v1/AUTH_svc_tensorrt/${bucket}/${key}"
+                        // Self-rendering HTML page: marked.js parses the analysis at page load
+                        // and DOMPurify sanitises the result before injection into the DOM. The
+                        // analysis text comes from the CI agent which consumes build logs (which
+                        // can include attacker-controlled PR content), so we treat it as untrusted.
+                        // Hardening:
+                        //   1. CDN scripts pinned to specific versions and protected with SRI.
+                        //   2. Analysis embedded in a `<script type="application/json">` data
+                        //      block read via textContent + JSON.parse — never inlined into
+                        //      executable JS source. Every `<` in the JSON is rewritten to its
+                        //      JSON unicode escape so a payload cannot smuggle a `</script>`
+                        //      and break out of the data block.
+                        //   3. marked output is run through DOMPurify before innerHTML assignment
+                        //      to strip event-handler attributes and other XSS vectors.
+                        def jsonAnalysis = groovy.json.JsonOutput.toJson(analysis).replace("<", "\\u003c")
+                        def htmlDoc = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>CI Failure Analysis &middot; ${env.JOB_NAME} #${env.BUILD_NUMBER}</title>
+<script src="https://cdn.jsdelivr.net/npm/marked@14.1.4/marked.min.js" integrity="sha384-lqPzN0kmFw9t2syAMwVPM4VbAyqsz/lPyYWbb2Xt6nSPM0WPNrpSWCUBgdcAdgnC" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js" integrity="sha384-eEu5CTj3qGvu9PdJuS+YlkNi7d2XxQROAFYOr59zgObtlcux1ae1Il3u7jvdCSWu" crossorigin="anonymous"></script>
+<style>body{font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:900px;margin:2em auto;padding:0 1em;color:#24292e}h1,h2,h3{border-bottom:1px solid #eaecef;padding-bottom:.3em}pre{background:#f6f8fa;padding:1em;overflow:auto;border-radius:6px}code{background:#f6f8fa;padding:.2em .4em;border-radius:3px}pre code{background:none;padding:0}a{color:#0366d6}blockquote{border-left:4px solid #dfe2e5;padding:0 1em;color:#6a737d}table{border-collapse:collapse}th,td{border:1px solid #dfe2e5;padding:6px 13px}header{margin-bottom:1.5em;color:#586069}</style>
+</head><body>
+<header><a href="${env.BUILD_URL}">${env.JOB_NAME} #${env.BUILD_NUMBER}</a></header>
+<main id="md"></main>
+<script id="md-source" type="application/json">${jsonAnalysis}</script>
+<script>
+  // Disable marked's strikethrough tokenizer: CI failure-analysis text routinely
+  // contains literal tildes (~/path, ~50ms, regex anchors, etc.) that should not
+  // be interpreted as markup. Other GFM extensions (tables, fences, autolinks,
+  // task lists) stay enabled.
+  marked.use({ tokenizer: { del() { return false; } } });
+  const src = JSON.parse(document.getElementById('md-source').textContent);
+  document.getElementById('md').innerHTML = DOMPurify.sanitize(marked.parse(src));
+</script>
+</body></html>
+"""
+                        writeFile file: 'failure_analysis.html', text: htmlDoc
+                        container("alpine") {
+                            trtllm_utils.llmExecStepWithRetry(this, script: 'apk add --no-cache aws-cli')
+                            // Alpine's musl libc fires A and AAAA queries in parallel; pbss.s8k.io's AAAA
+                            // returns SERVFAIL and musl treats that as a fatal lookup failure (glibc would
+                            // not). Pin the A-record IP in /etc/hosts so getaddrinfo resolves from files.
+                            trtllm_utils.llmExecStepWithRetry(this, script: '''
+                                if ! grep -q 'pbss.s8k.io' /etc/hosts; then
+                                    ip=$(nslookup -type=A pbss.s8k.io 2>/dev/null | awk '/^Address[: ]/ && $NF !~ /:53$/ && $NF !~ /#53$/ { print $NF; exit }')
+                                    if [ -n "$ip" ]; then
+                                        printf '%s\\n' "$ip pbss.s8k.io" >> /etc/hosts
+                                    fi
+                                fi
+                            ''')
+                            withCredentials([string(
+                                    credentialsId: 'svc_tensorrt-swift-stack-key',
+                                    variable: 'AWS_SECRET_ACCESS_KEY')]) {
+                                trtllm_utils.llmExecStepWithRetry(this, script:
+                                    "AWS_ACCESS_KEY_ID=svc_tensorrt aws s3 cp failure_analysis.html" +
+                                    " 's3://${bucket}/${key}' --endpoint-url https://pbss.s8k.io" +
+                                    " --content-type text/html")
+                            }
+                        }
+                        // Surface the URL via currentBuild.description so the upstream PR_Github
+                        // wrapper can extract it and include it in the GitHub PR comment.
+                        def existingDesc = currentBuild.description ?: ""
+                        currentBuild.description = existingDesc +
+                            (existingDesc ? "<br/>" : "") +
+                            "<a href='${htmlUrl}'>CI Agent Failure Analysis</a>"
+                        echo "CI Agent Failure Analysis: ${htmlUrl}"
                     }
                 } catch (Exception e) {
                     // Analysis is best-effort; do not fail the pipeline

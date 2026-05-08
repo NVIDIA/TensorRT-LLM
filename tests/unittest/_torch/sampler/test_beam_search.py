@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -488,6 +488,10 @@ def test_beam_search_sampling_batch_basic():
     new_log_probs_result = new_log_probs.clone()
     predecessor_beams_result = predecessor_beams.clone()
 
+    # Pre-computed per-step constants (matches production cache contract).
+    seq_offsets = torch.arange(max_batch_size, dtype=torch.int64) * beam_width
+    beam_idx_arange = torch.arange(beam_width, dtype=torch.int32)
+
     # Create BeamSearchMetadata
     beam_search_args = BeamSearchMetadata(
         cache_indirection=cache_indirection_result,
@@ -498,6 +502,8 @@ def test_beam_search_sampling_batch_basic():
         finished_beams=finished_beams_result,
         new_log_probs=new_log_probs_result,
         predecessor_beams=predecessor_beams_result,
+        seq_offsets=seq_offsets,
+        beam_idx_arange=beam_idx_arange,
     )
 
     # Run beam search sampling

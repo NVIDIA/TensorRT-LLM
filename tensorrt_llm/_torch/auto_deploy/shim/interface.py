@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 import functools
 from typing import Callable, Dict, List, Optional, Tuple, Union, final
@@ -6,13 +21,32 @@ import torch
 import torch.nn as nn
 from torch._prims_common import DeviceLikeType
 
-import tensorrt_llm.bindings
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-from tensorrt_llm.mapping import Mapping
+from .._compat import TRTLLM_AVAILABLE, KvCacheConfig
 
-from ...._utils import torch_dtype_to_binding
-from ...pyexecutor.mamba_cache_manager import MambaHybridCacheManager
-from ...pyexecutor.resource_manager import KVCacheManager
+if TRTLLM_AVAILABLE:
+    import tensorrt_llm.bindings
+    from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+        MambaHybridCacheManager,
+        MixedMambaHybridCacheManager,
+    )
+    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+    from tensorrt_llm._utils import torch_dtype_to_binding
+    from tensorrt_llm.mapping import Mapping
+
+    CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
+    DataType = tensorrt_llm.bindings.DataType
+else:
+    # Standalone mode: cache-manager infrastructure not available.
+    # CachedSequenceInterface can still be instantiated and used for transforms,
+    # but initialize_resources() and other cache-manager methods will raise.
+    KVCacheManager = None
+    MambaHybridCacheManager = None
+    MixedMambaHybridCacheManager = None
+    CacheTypeCpp = None
+    DataType = None
+    Mapping = None
+    torch_dtype_to_binding = None
+
 from ..custom_ops.attention_interface import (
     CausalConvResourceHandler,
     KVPagedResourceHandler,
@@ -28,9 +62,6 @@ from ..distributed.common import all_gather_object, get_world_size
 from ..distributed.common import is_initialized as is_distributed_initialized
 from ..utils.cuda_mem_tracker import bytes_to, get_mem_info
 from ..utils.logger import ad_logger
-
-CacheTypeCpp = tensorrt_llm.bindings.internal.batch_manager.CacheType
-DataType = tensorrt_llm.bindings.DataType
 
 
 def with_pre_callback(method, callback):
@@ -62,6 +93,7 @@ class CachedSequenceInterface:
         kv_cache_config: Optional[KvCacheConfig] = None,
         vocab_size_padded: Optional[int] = None,
         spec_config=None,
+        requires_uniform_kv_caches: bool = False,
     ) -> None:
         """Initialize the CachedSequenceInterface.
 
@@ -74,6 +106,10 @@ class CachedSequenceInterface:
             vocab_size_padded: Padded vocabulary size of the model.
             spec_config: Speculative decoding configuration. Used to set num_extra_kv_tokens,
                 max_draft_len, max_total_draft_tokens on KVCacheManager after creation.
+            requires_uniform_kv_caches: Whether all KV layers must use a single managed KV
+                cache mapping. When True, KV layers incompatible with the managed KV cache
+                reference raise during initialization, and managed KV layers must share a
+                single page-stride multiplier.
         """
         # TODO (lucaslie): this is somewhat circular/confusing. Here `device` denotes the desired
         # device and not the actual device unlike, e.g., in SequenceInfo. We rely on the attribute
@@ -102,6 +138,13 @@ class CachedSequenceInterface:
         # lookup of unmanaged resources
         self._unmanaged_resources: List[str] = []
         self._spec_config = spec_config
+        self._requires_uniform_kv_caches = requires_uniform_kv_caches
+
+        # Propagate spec-dec config into BatchInfo so attention backends can read it
+        # via the per-forward batch_info_host tensor without needing the Python config.
+        self.info.batch_info.update_max_draft_len(
+            spec_config.max_draft_len if spec_config is not None else 0
+        )
 
     @property
     def args(self) -> Tuple[torch.Tensor, ...]:
@@ -268,6 +311,15 @@ class CachedSequenceInterface:
                 kv_ref = handler
             if handler == kv_ref:
                 kv_managed[name] = handler
+            elif self._requires_uniform_kv_caches:
+                raise RuntimeError(
+                    f"KV resource {name} is not compatible with the managed KV reference "
+                    f"(reference: head_dim={kv_ref.head_dim}, dtype={kv_ref.dtype}, "
+                    f"kv_factor={kv_ref.kv_factor}, kv_layout={kv_ref.kv_layout}; "
+                    f"candidate: head_dim={handler.head_dim}, dtype={handler.dtype}, "
+                    f"kv_factor={handler.kv_factor}, kv_layout={handler.kv_layout}). "
+                    "This configuration requires all KV caches to be managed."
+                )
 
         return kv_ref, kv_managed
 
@@ -510,7 +562,7 @@ class CachedSequenceInterface:
         num_managed_mamba_layers = mamba_params["mamba_num_layers"]
 
         # Create the hybrid cache manager
-        manager = MambaHybridCacheManager(
+        manager = MixedMambaHybridCacheManager(
             **mamba_params,
             **kv_cache_kwargs,
         )
@@ -568,8 +620,20 @@ class CachedSequenceInterface:
             # Compute block_offset_multiplier from the first layer's kv_cache strides.
             # This is stride(0)/stride(1) which equals kv_factor for per-layer views
             # or num_layers*kv_factor for interleaved pools.
+            # All layers must share this multiplier if we require uniform KV caches.
+            layer_block_offset_multiplier = view.stride(0) // view.stride(1)
             if idx == 0:
-                block_offset_multiplier = view.stride(0) // view.stride(1)
+                block_offset_multiplier = layer_block_offset_multiplier
+            elif (
+                layer_block_offset_multiplier != block_offset_multiplier
+                and self._requires_uniform_kv_caches
+            ):
+                raise RuntimeError(
+                    f"KV cache layer {name} (idx={idx}) has block_offset_multiplier "
+                    f"{layer_block_offset_multiplier} != reference {block_offset_multiplier}. "
+                    "This configuration requires uniform KV caches, so all KV layers managed by the "
+                    "cache manager must share a single block_offset_multiplier."
+                )
 
         return block_offset_multiplier
 
@@ -582,8 +646,29 @@ class CachedSequenceInterface:
         self._unmanaged_resources.clear()
         for name, handler in self._resource_lookup.items():
             if self._caches[name] is None:  # Not yet assigned a tensor
-                self._caches[name] = handler.allocate(self.info)
+                if isinstance(handler, StateResourceHandler):
+                    self._caches[name] = self._allocate_unmanaged_state_resource(handler)
+                else:
+                    self._caches[name] = handler.allocate(self.info)
                 self._unmanaged_resources.append(name)
+
+    def _allocate_unmanaged_state_resource(self, handler: StateResourceHandler) -> torch.Tensor:
+        """Allocate state resources in the slot domain used by runtime metadata."""
+        max_num_state_slots = self.info.max_num_state_slots
+        if TRTLLM_AVAILABLE and isinstance(
+            self._kv_cache_manager, (MambaHybridCacheManager, MixedMambaHybridCacheManager)
+        ):
+            # ADEngine passes Mamba cache indices through slot_idx for every stateful
+            # op when a Mamba-hybrid cache manager is present. Mirror the padding
+            # slots reserved by that manager for CUDA-graph/spec-decoding dummies.
+            max_num_state_slots += self.info.batch_info.get_max_draft_len() + 1
+
+        return torch.empty(
+            max_num_state_slots,
+            *handler.state_shape,
+            device=self.info.device,
+            dtype=handler.dtype,
+        )
 
     def _create_kv_cache_manager(self, max_tokens: Optional[int] = None) -> Dict:
         """Create KVCacheManager or MambaHybridCacheManager with standard layout.

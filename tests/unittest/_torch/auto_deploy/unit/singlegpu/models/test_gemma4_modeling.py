@@ -7,6 +7,7 @@ Reference classes (_Ref*) are standalone PyTorch reimplementations of the
 HuggingFace Gemma4 math — no transformers>=5.3 dependency required.
 """
 
+from types import SimpleNamespace
 from typing import Optional, Tuple
 
 import pytest
@@ -19,18 +20,30 @@ from transformers.activations import ACT2FN
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_gemma4 import (
+    ADGemma4ImageProcessor,
+    Gemma4ADInputProcessor,
     Gemma4Config,
     Gemma4ForCausalLM,
     Gemma4ForConditionalGeneration,
     Gemma4MoEBlock,
+    Gemma4MultimodalEmbedder,
     Gemma4RotaryEmbedding,
     Gemma4Router,
     Gemma4TextAttention,
     Gemma4TextConfig,
     Gemma4TextDecoderLayer,
     Gemma4TextMLP,
+    Gemma4VisionAttention,
     Gemma4VisionConfig,
+    Gemma4VisionEncoder,
+    Gemma4VisionEncoderLayer,
+    Gemma4VisionMLP,
+    Gemma4VisionModel,
+    Gemma4VisionPatchEmbedder,
+    Gemma4VisionPooler,
+    Gemma4VisionRotaryEmbedding,
 )
+from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -633,15 +646,17 @@ class _RefForCausalLM(nn.Module):
 
 
 def _transfer_ref_to_ad_full_model(ad_model: Gemma4ForCausalLM, ref_model: _RefForCausalLM) -> None:
-    """Transfer weights from reference full model into AD ForCausalLM."""
+    """Transfer weights from reference full model into AD ForCausalLM.
+
+    The ref uses fused MoE weights (gate_up_proj, down_proj, per_expert_scale)
+    while the AD model uses per-expert weights. The AD decoder layer's
+    _unfuse_moe_weights pre-hook handles this conversion automatically when
+    the fused keys are present in the state_dict passed to load_state_dict.
+    """
     ref_sd = ref_model.state_dict()
-    ad_sd = {}
-    for k, v in ref_sd.items():
-        if k.startswith("lm_head."):
-            ad_sd[k] = v
-        else:
-            ad_sd[f"model.{k}"] = v
-    missing, unexpected = ad_model.load_state_dict(ad_sd, strict=False)
+    # AD ForCausalLM has flat keys (layers.0..., embed_tokens..., lm_head...)
+    # matching the ref layout — no prefix remapping needed.
+    missing, unexpected = ad_model.load_state_dict(ref_sd, strict=False)
     # v_norm buffers are non-persistent, expected missing
     real_missing = {m for m in missing if "v_norm" not in m}
     assert not real_missing, f"Missing keys: {real_missing}"
@@ -874,3 +889,770 @@ def test_dense_export():
     logits2 = out2[0] if isinstance(out2, tuple) else getattr(out2, "logits", out2)
     assert logits2.shape == (B2, S2, config.vocab_size)
     assert torch.isfinite(logits2).all()
+
+
+# ---------------------------------------------------------------------------
+# Vision tower — helpers and small config
+# ---------------------------------------------------------------------------
+
+
+def _small_vision_config() -> Gemma4VisionConfig:
+    return Gemma4VisionConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        head_dim=16,
+        hidden_activation="gelu_pytorch_tanh",
+        rms_norm_eps=1e-6,
+        max_position_embeddings=256,
+        attention_bias=False,
+        attention_dropout=0.0,
+        rope_parameters={"rope_type": "default", "rope_theta": 100.0},
+        pooling_kernel_size=3,
+        patch_size=4,
+        position_embedding_size=64,
+        standardize=False,
+    )
+
+
+def _make_vision_inputs(
+    config: Gemma4VisionConfig, batch_size: int, num_patches: int, device: str, dtype: torch.dtype
+):
+    """Create synthetic pixel_values and pixel_position_ids for the vision tower.
+
+    num_patches should be divisible by pooling_kernel_size^2.
+    """
+    patch_dim = 3 * config.patch_size**2
+    pixel_values = torch.rand(batch_size, num_patches, patch_dim, device=device, dtype=dtype)
+    # 2D position ids: (batch, num_patches, 2) with (x, y) grid coordinates
+    grid_side = int(num_patches**0.5)
+    pos_x = torch.arange(grid_side, device=device).unsqueeze(1).expand(grid_side, grid_side)
+    pos_y = torch.arange(grid_side, device=device).unsqueeze(0).expand(grid_side, grid_side)
+    positions = torch.stack([pos_x.flatten(), pos_y.flatten()], dim=-1)  # [num_patches, 2]
+    pixel_position_ids = positions.unsqueeze(0).expand(batch_size, -1, -1).long()
+    return pixel_values, pixel_position_ids
+
+
+# ---------------------------------------------------------------------------
+# Vision tower — standalone HF-faithful reference implementations
+# ---------------------------------------------------------------------------
+
+
+class _RefVisionMLP(nn.Module):
+    """HF Gemma4VisionMLP reference — plain nn.Linear (no ClippableLinear wrapper)."""
+
+    def __init__(self, config: Gemma4VisionConfig):
+        super().__init__()
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_activation]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+class _RefVisionRotaryEmbedding(nn.Module):
+    """HF Gemma4VisionRotaryEmbedding reference."""
+
+    def __init__(self, config: Gemma4VisionConfig):
+        super().__init__()
+        rope_theta = config.rope_parameters["rope_theta"]
+        spatial_dim = config.head_dim // 2
+        inv_freq = 1.0 / (
+            rope_theta ** (torch.arange(0, spatial_dim, 2, dtype=torch.float32) / spatial_dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(
+        self, hidden_states: torch.Tensor, position_ids: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        inv_freq_expanded = (
+            self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        )
+        all_cos = []
+        all_sin = []
+        for dim_idx in range(2):
+            dim_pos = position_ids[:, None, :, dim_idx].float().to(hidden_states.device)
+            freqs = (inv_freq_expanded.to(hidden_states.device) @ dim_pos).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            all_cos.append(emb.cos())
+            all_sin.append(emb.sin())
+        cos = torch.cat(all_cos, dim=-1).to(dtype=hidden_states.dtype, device=hidden_states.device)
+        sin = torch.cat(all_sin, dim=-1).to(dtype=hidden_states.dtype, device=hidden_states.device)
+        return cos, sin
+
+
+def _ref_vision_apply_multidimensional_rope(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    position_ids: torch.Tensor,
+    unsqueeze_dim: int = 2,
+) -> torch.Tensor:
+    """HF apply_multidimensional_rope reference."""
+    ndim = position_ids.shape[-1]
+    num_channels = x.shape[-1]
+    num_rotated_per_dim = 2 * (num_channels // (2 * ndim))
+    split_sizes = [num_rotated_per_dim] * ndim
+    x_parts = torch.split(x, split_sizes, dim=-1)
+    cos_parts = torch.split(cos, split_sizes, dim=-1)
+    sin_parts = torch.split(sin, split_sizes, dim=-1)
+    outputs = []
+    for idx in range(ndim):
+        c = cos_parts[idx].unsqueeze(unsqueeze_dim)
+        s = sin_parts[idx].unsqueeze(unsqueeze_dim)
+        outputs.append((x_parts[idx] * c) + (_ref_rotate_half(x_parts[idx]) * s))
+    return torch.cat(outputs, dim=-1)
+
+
+class _RefVisionAttention(nn.Module):
+    """HF Gemma4VisionAttention reference (eager, no cache)."""
+
+    def __init__(self, config: Gemma4VisionConfig):
+        super().__init__()
+        self.head_dim = config.head_dim
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.num_kv_groups = self.num_heads // self.num_kv_heads
+        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.q_norm = _RefRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = _RefRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.v_norm = _RefRMSNorm(self.head_dim, eps=config.rms_norm_eps, with_scale=False)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, S, _ = hidden_states.shape
+        shape = (B, S, -1, self.head_dim)
+        cos, sin = position_embeddings
+
+        q = self.q_norm(self.q_proj(hidden_states).view(shape))
+        q = _ref_vision_apply_multidimensional_rope(q, cos, sin, torch.zeros_like(cos[..., :2]))
+        q = q.transpose(1, 2)
+
+        k = self.k_norm(self.k_proj(hidden_states).view(shape))
+        k = _ref_vision_apply_multidimensional_rope(k, cos, sin, torch.zeros_like(cos[..., :2]))
+        k = k.transpose(1, 2)
+
+        v = self.v_norm(self.v_proj(hidden_states).view(shape))
+        v = v.transpose(1, 2)
+
+        # GQA repeat
+        k = _ref_repeat_kv(k, self.num_kv_groups)
+        v = _ref_repeat_kv(v, self.num_kv_groups)
+
+        attn_w = torch.matmul(q, k.transpose(2, 3))  # scaling=1.0 for vision
+        if attention_mask is not None:
+            invalid = torch.finfo(attn_w.dtype).min
+            attn_w = attn_w.masked_fill(attention_mask.logical_not(), invalid)
+        attn_w = F.softmax(attn_w, dim=-1, dtype=torch.float32).to(q.dtype)
+        out = torch.matmul(attn_w, v)
+        out = out.transpose(1, 2).contiguous().reshape(B, S, -1)
+        return self.o_proj(out), attn_w
+
+
+class _RefVisionEncoderLayer(nn.Module):
+    """HF Gemma4VisionEncoderLayer reference."""
+
+    def __init__(self, config: Gemma4VisionConfig, layer_idx: int):
+        super().__init__()
+        del layer_idx
+        self.self_attn = _RefVisionAttention(config)
+        self.mlp = _RefVisionMLP(config)
+        self.input_layernorm = _RefRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = _RefRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_feedforward_layernorm = _RefRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_feedforward_layernorm = _RefRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.post_feedforward_layernorm(hidden_states)
+        return residual + hidden_states
+
+
+class _RefVisionEncoder(nn.Module):
+    """HF Gemma4VisionEncoder reference."""
+
+    def __init__(self, config: Gemma4VisionConfig):
+        super().__init__()
+        self.rotary_emb = _RefVisionRotaryEmbedding(config)
+        self.layers = nn.ModuleList(
+            [_RefVisionEncoderLayer(config, i) for i in range(config.num_hidden_layers)]
+        )
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor,
+        pixel_position_ids: torch.LongTensor,
+    ):
+        valid = attention_mask.to(torch.bool)
+        attention_mask_4d = valid[:, None, :, None] & valid[:, None, None, :]
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, pixel_position_ids)
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states,
+                attention_mask=attention_mask_4d,
+                position_embeddings=position_embeddings,
+                position_ids=pixel_position_ids,
+            )
+        return hidden_states
+
+
+class _RefVisionPatchEmbedder(nn.Module):
+    """HF Gemma4VisionPatchEmbedder reference."""
+
+    def __init__(self, config: Gemma4VisionConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.patch_size = config.patch_size
+        self.position_embedding_size = config.position_embedding_size
+        self.input_proj = nn.Linear(3 * self.patch_size**2, self.hidden_size, bias=False)
+        self.position_embedding_table = nn.Parameter(
+            torch.ones(2, self.position_embedding_size, self.hidden_size)
+        )
+
+    def _position_embeddings(
+        self, pixel_position_ids: torch.Tensor, padding_positions: torch.Tensor
+    ) -> torch.Tensor:
+        clamped = pixel_position_ids.clamp(min=0)
+        one_hot = F.one_hot(clamped, num_classes=self.position_embedding_size)
+        one_hot = one_hot.permute(0, 2, 1, 3).to(self.position_embedding_table)
+        pos_emb = one_hot @ self.position_embedding_table
+        pos_emb = pos_emb.sum(dim=1)
+        return torch.where(padding_positions.unsqueeze(-1), 0.0, pos_emb)
+
+    def forward(self, pixel_values, pixel_position_ids, padding_positions):
+        pixel_values = 2 * (pixel_values - 0.5)
+        hidden_states = self.input_proj(pixel_values.to(self.input_proj.weight.dtype))
+        pos_emb = self._position_embeddings(pixel_position_ids, padding_positions)
+        return hidden_states + pos_emb
+
+
+class _RefVisionPooler(nn.Module):
+    """HF Gemma4VisionPooler reference."""
+
+    def __init__(self, config: Gemma4VisionConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.root_hidden_size = self.hidden_size**0.5
+
+    def _avg_pool_by_positions(self, hidden_states, pixel_position_ids, length):
+        input_seq_len = hidden_states.shape[1]
+        kernel_size = int((input_seq_len // length) ** 0.5)
+        clamped = pixel_position_ids.clamp(min=0)
+        max_x = clamped[..., 0].max(dim=-1, keepdim=True)[0] + 1
+        kernel_indices = torch.div(clamped, kernel_size, rounding_mode="floor")
+        kernel_indices = kernel_indices[..., 0] + (max_x // kernel_size) * kernel_indices[..., 1]
+        weights = F.one_hot(kernel_indices.long(), length).float() / (kernel_size**2)
+        output = weights.transpose(1, 2) @ hidden_states.float()
+        mask = torch.logical_not((weights == 0).all(dim=1))
+        return output.to(hidden_states.dtype), mask
+
+    def forward(self, hidden_states, pixel_position_ids, padding_positions, output_length=None):
+        if output_length is None:
+            output_length = hidden_states.shape[1]
+        hidden_states = hidden_states.masked_fill(padding_positions.unsqueeze(-1), 0.0)
+        if hidden_states.shape[1] != output_length:
+            hidden_states, padding_positions = self._avg_pool_by_positions(
+                hidden_states, pixel_position_ids, output_length
+            )
+        hidden_states *= self.root_hidden_size
+        return hidden_states, padding_positions
+
+
+class _RefVisionModel(nn.Module):
+    """HF Gemma4VisionModel reference (full pipeline)."""
+
+    def __init__(self, config: Gemma4VisionConfig):
+        super().__init__()
+        self.config = config
+        self.patch_embedder = _RefVisionPatchEmbedder(config)
+        self.encoder = _RefVisionEncoder(config)
+        self.pooler = _RefVisionPooler(config)
+
+    def forward(self, pixel_values, pixel_position_ids):
+        pooling_kernel_size = self.config.pooling_kernel_size
+        output_length = pixel_values.shape[-2] // (pooling_kernel_size * pooling_kernel_size)
+        padding_positions = (pixel_position_ids == -1).all(dim=-1)
+        inputs_embeds = self.patch_embedder(pixel_values, pixel_position_ids, padding_positions)
+        hidden_states = self.encoder(
+            inputs_embeds=inputs_embeds,
+            attention_mask=~padding_positions,
+            pixel_position_ids=pixel_position_ids,
+        )
+        hidden_states, pooler_mask = self.pooler(
+            hidden_states=hidden_states,
+            pixel_position_ids=pixel_position_ids,
+            padding_positions=padding_positions,
+            output_length=output_length,
+        )
+        return hidden_states[pooler_mask]
+
+
+class _RefMultimodalEmbedder(nn.Module):
+    """HF Gemma4MultimodalEmbedder reference."""
+
+    def __init__(self, vision_config: Gemma4VisionConfig, text_config: Gemma4TextConfig):
+        super().__init__()
+        self.eps = vision_config.rms_norm_eps
+        self.embedding_projection = nn.Linear(
+            vision_config.hidden_size, text_config.hidden_size, bias=False
+        )
+        self.embedding_pre_projection_norm = _RefRMSNorm(
+            vision_config.hidden_size, eps=self.eps, with_scale=False
+        )
+
+    def forward(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        return self.embedding_projection(self.embedding_pre_projection_norm(inputs_embeds))
+
+
+# ---------------------------------------------------------------------------
+# Vision tower — weight transfer helpers
+# ---------------------------------------------------------------------------
+
+
+def _transfer_vision_mlp_weights(ad_mlp: Gemma4VisionMLP, ref_mlp: _RefVisionMLP):
+    """Transfer weights from ref MLP (plain nn.Linear) to AD MLP (ClippableLinear)."""
+    ad_mlp.gate_proj.linear.weight.data.copy_(ref_mlp.gate_proj.weight.data)
+    ad_mlp.up_proj.linear.weight.data.copy_(ref_mlp.up_proj.weight.data)
+    ad_mlp.down_proj.linear.weight.data.copy_(ref_mlp.down_proj.weight.data)
+
+
+def _transfer_vision_attn_weights(ad_attn: Gemma4VisionAttention, ref_attn: _RefVisionAttention):
+    """Transfer weights from ref attention to AD attention (ClippableLinear + canonical norms)."""
+    ad_attn.q_proj.linear.weight.data.copy_(ref_attn.q_proj.weight.data)
+    ad_attn.k_proj.linear.weight.data.copy_(ref_attn.k_proj.weight.data)
+    ad_attn.v_proj.linear.weight.data.copy_(ref_attn.v_proj.weight.data)
+    ad_attn.o_proj.linear.weight.data.copy_(ref_attn.o_proj.weight.data)
+    ad_attn.q_norm.weight.data.copy_(ref_attn.q_norm.weight.data)
+    ad_attn.k_norm.weight.data.copy_(ref_attn.k_norm.weight.data)
+    # v_norm has no learnable scale (with_scale=False), but AD uses a buffer
+    # The ref also uses with_scale=False so no weight to copy
+
+
+def _transfer_vision_encoder_layer_weights(
+    ad_layer: Gemma4VisionEncoderLayer, ref_layer: _RefVisionEncoderLayer
+):
+    """Transfer all weights for a single encoder layer."""
+    _transfer_vision_attn_weights(ad_layer.self_attn, ref_layer.self_attn)
+    _transfer_vision_mlp_weights(ad_layer.mlp, ref_layer.mlp)
+    for norm_name in [
+        "input_layernorm",
+        "post_attention_layernorm",
+        "pre_feedforward_layernorm",
+        "post_feedforward_layernorm",
+    ]:
+        getattr(ad_layer, norm_name).weight.data.copy_(getattr(ref_layer, norm_name).weight.data)
+
+
+def _transfer_vision_encoder_weights(
+    ad_encoder: Gemma4VisionEncoder, ref_encoder: _RefVisionEncoder
+):
+    """Transfer encoder weights including RoPE and all layers."""
+    ad_encoder.rotary_emb.inv_freq.data.copy_(ref_encoder.rotary_emb.inv_freq.data)
+    for ad_layer, ref_layer in zip(ad_encoder.layers, ref_encoder.layers):
+        _transfer_vision_encoder_layer_weights(ad_layer, ref_layer)
+
+
+def _transfer_vision_patch_embedder_weights(
+    ad_pe: Gemma4VisionPatchEmbedder, ref_pe: _RefVisionPatchEmbedder
+):
+    """Transfer patch embedder weights."""
+    ad_pe.input_proj.weight.data.copy_(ref_pe.input_proj.weight.data)
+    ad_pe.position_embedding_table.data.copy_(ref_pe.position_embedding_table.data)
+
+
+def _transfer_vision_model_weights(ad_model: Gemma4VisionModel, ref_model: _RefVisionModel):
+    """Transfer all vision model weights."""
+    _transfer_vision_patch_embedder_weights(ad_model.patch_embedder, ref_model.patch_embedder)
+    _transfer_vision_encoder_weights(ad_model.encoder, ref_model.encoder)
+    # Pooler has no learnable parameters
+
+
+def _transfer_multimodal_embedder_weights(
+    ad_emb: Gemma4MultimodalEmbedder, ref_emb: _RefMultimodalEmbedder
+):
+    """Transfer multimodal embedder weights."""
+    ad_emb.embedding_projection.weight.data.copy_(ref_emb.embedding_projection.weight.data)
+    # Pre-projection norm has with_scale=False on both sides, no weight to copy
+
+
+# ---------------------------------------------------------------------------
+# Tests — Vision tower block equivalence
+# ---------------------------------------------------------------------------
+
+
+def test_vision_mlp_equivalence():
+    """Vision MLP: identical math (SwiGLU), should match exactly."""
+    device, dtype = _device_and_dtype()
+    config = _small_vision_config()
+
+    ref = _RefVisionMLP(config).to(device=device, dtype=dtype).eval()
+    ad = Gemma4VisionMLP(config).to(device=device, dtype=dtype).eval()
+    _transfer_vision_mlp_weights(ad, ref)
+
+    x = torch.randn(2, 9, config.hidden_size, device=device, dtype=dtype)
+    with torch.no_grad():
+        torch.testing.assert_close(ad(x), ref(x), rtol=1e-3, atol=1e-3)
+
+
+def test_vision_rotary_embedding_equivalence():
+    """Vision RoPE: multidimensional cos/sin should match reference exactly."""
+    device, dtype = _device_and_dtype()
+    config = _small_vision_config()
+
+    ref_rope = _RefVisionRotaryEmbedding(config).to(device=device)
+    ad_rope = Gemma4VisionRotaryEmbedding(config).to(device=device)
+
+    B, S = 2, 9
+    hidden = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
+    # 2D position ids
+    grid_side = 3
+    pos_x = torch.arange(grid_side, device=device).unsqueeze(1).expand(grid_side, grid_side)
+    pos_y = torch.arange(grid_side, device=device).unsqueeze(0).expand(grid_side, grid_side)
+    pos_ids = torch.stack([pos_x.flatten(), pos_y.flatten()], dim=-1).unsqueeze(0).expand(B, -1, -1)
+
+    with torch.no_grad():
+        ref_cos, ref_sin = ref_rope(hidden, pos_ids)
+        ad_cos, ad_sin = ad_rope(hidden, pos_ids)
+    torch.testing.assert_close(ad_cos, ref_cos, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(ad_sin, ref_sin, rtol=1e-5, atol=1e-5)
+
+
+def test_vision_patch_embedder_equivalence():
+    """Patch embedder: linear projection + position embeddings."""
+    device, dtype = _device_and_dtype()
+    config = _small_vision_config()
+
+    ref = _RefVisionPatchEmbedder(config).to(device=device, dtype=dtype).eval()
+    ad = Gemma4VisionPatchEmbedder(config).to(device=device, dtype=dtype).eval()
+    _transfer_vision_patch_embedder_weights(ad, ref)
+
+    B, num_patches = 2, 9
+    pixel_values, pixel_position_ids = _make_vision_inputs(config, B, num_patches, device, dtype)
+    padding_positions = (pixel_position_ids == -1).all(dim=-1)
+
+    with torch.no_grad():
+        ref_out = ref(pixel_values, pixel_position_ids, padding_positions)
+        ad_out = ad(pixel_values, pixel_position_ids, padding_positions)
+    torch.testing.assert_close(ad_out, ref_out, rtol=1e-3, atol=1e-3)
+
+
+def test_image_processor_pads_to_fixed_patch_budget():
+    """Image processor should pad every request to the configured patch budget."""
+    config = _small_vision_config()
+    processor = ADGemma4ImageProcessor(
+        patch_size=config.patch_size,
+        max_soft_tokens=280,
+        pooling_kernel_size=config.pooling_kernel_size,
+        do_resize=False,
+        do_rescale=False,
+        do_normalize=False,
+    )
+
+    image_small = torch.zeros(3, 12, 12, dtype=torch.float32)
+    image_large = torch.zeros(3, 12, 24, dtype=torch.float32)
+
+    outputs = processor([image_small, image_large])
+
+    target_patches = 280 * config.pooling_kernel_size**2
+    assert outputs["pixel_values"].shape == (2, target_patches, 3 * config.patch_size**2)
+    assert outputs["image_position_ids"].shape == (2, target_patches, 2)
+    assert outputs["num_soft_tokens_per_image"] == [1, 2]
+    assert torch.all(outputs["image_position_ids"][0, 9:] == -1)
+    assert torch.all(outputs["image_position_ids"][1, 18:] == -1)
+    assert torch.all(outputs["image_position_ids"][1, :18] >= 0)
+
+
+def test_ad_input_processor_emits_layout_metadata_for_boi_eoi_spans():
+    class _DummyBaseProcessor:
+        def __init__(self):
+            self.processor = SimpleNamespace(
+                image_processor=lambda images, **kwargs: {
+                    "num_soft_tokens_per_image": torch.tensor([260], dtype=torch.int32)
+                }
+            )
+            self.tokenizer = SimpleNamespace(vocab_size=1024)
+
+        def __call__(self, inputs, sampling_params):
+            del inputs, sampling_params
+            return [7, 255999, 258880, 258880, 258882, 9], {
+                "multimodal_data": {
+                    "token_type_ids": torch.tensor([0, 1, 1, 1, 1, 0], dtype=torch.int32)
+                }
+            }
+
+    processor = Gemma4ADInputProcessor(
+        _DummyBaseProcessor(),
+        image_token_id=258880,
+        boi_token_id=255999,
+        eoi_token_id=258882,
+    )
+
+    token_ids, extra = processor(inputs={}, sampling_params=None)
+
+    assert token_ids == [7, 255999, 258880, 258880, 258882, 9]
+    assert processor.get_num_tokens_per_image(image=torch.zeros(3, 8, 8)) == 262
+    torch.testing.assert_close(
+        processor.get_mm_token_ids(), torch.tensor([258880], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        processor.get_mm_special_token_ids(), torch.tensor([255999, 258882], dtype=torch.int32)
+    )
+
+    multimodal_input = extra["multimodal_input"]
+    assert multimodal_input.multimodal_positions == [1]
+    assert multimodal_input.multimodal_lengths == [4]
+
+    multimodal_data = extra["multimodal_data"]
+    assert "token_type_ids" not in multimodal_data
+    torch.testing.assert_close(
+        multimodal_data["layout_metadata"]["special_token_offsets"],
+        torch.tensor([0, 3], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        multimodal_data["layout_metadata"]["item_types"],
+        torch.tensor([0], dtype=torch.int32),
+    )
+
+
+def test_vision_pooler_equivalence():
+    """Vision pooler: avg pooling + scaling."""
+    device, dtype = _device_and_dtype()
+    config = _small_vision_config()
+
+    ref = _RefVisionPooler(config).to(device=device, dtype=dtype).eval()
+    ad = Gemma4VisionPooler(config).to(device=device, dtype=dtype).eval()
+    # Pooler has no learnable params
+
+    B, num_patches = 2, 9  # 9 patches → pool to 1 with kernel_size=3
+    hidden = torch.randn(B, num_patches, config.hidden_size, device=device, dtype=dtype)
+    _, pixel_position_ids = _make_vision_inputs(config, B, num_patches, device, dtype)
+    padding_positions = torch.zeros(B, num_patches, device=device, dtype=torch.bool)
+    output_length = num_patches // (config.pooling_kernel_size**2)
+
+    with torch.no_grad():
+        ref_h, ref_mask = ref(hidden, pixel_position_ids, padding_positions, output_length)
+        ad_h, ad_mask = ad(hidden, pixel_position_ids, padding_positions, output_length)
+    torch.testing.assert_close(ad_h, ref_h, rtol=1e-3, atol=1e-3)
+    assert (ad_mask == ref_mask).all()
+
+
+def test_vision_attention_equivalence():
+    """Vision attention: bidirectional, multidimensional RoPE, scaling=1.0."""
+    device, dtype = _device_and_dtype()
+    config = _small_vision_config()
+
+    ref = _RefVisionAttention(config).to(device=device, dtype=dtype).eval()
+    ad = Gemma4VisionAttention(config, layer_idx=0).to(device=device, dtype=dtype).eval()
+    _transfer_vision_attn_weights(ad, ref)
+
+    B, S = 2, 9
+    x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
+    # 2D position ids for vision
+    grid_side = 3
+    pos_x = torch.arange(grid_side, device=device).unsqueeze(1).expand(grid_side, grid_side)
+    pos_y = torch.arange(grid_side, device=device).unsqueeze(0).expand(grid_side, grid_side)
+    pos_ids = torch.stack([pos_x.flatten(), pos_y.flatten()], dim=-1).unsqueeze(0).expand(B, -1, -1)
+
+    rope = Gemma4VisionRotaryEmbedding(config).to(device=device)
+    with torch.no_grad():
+        cos, sin = rope(x, pos_ids)
+
+    # Bidirectional mask (all True)
+    attn_mask = torch.ones(B, 1, S, S, device=device, dtype=torch.bool)
+
+    with torch.no_grad():
+        ad_out, _ = ad(x, (cos, sin), attention_mask=attn_mask, position_ids=pos_ids)
+        ref_out, _ = ref(x, (cos, sin), attention_mask=attn_mask, position_ids=pos_ids)
+    assert_rmse_close(ad_out, ref_out, rmse_ratio_tol=0.10, msg="Vision attention: ")
+
+
+# ---------------------------------------------------------------------------
+# Tests — Vision tower layer equivalence
+# ---------------------------------------------------------------------------
+
+
+def test_vision_encoder_layer_equivalence():
+    """Vision encoder layer matches reference."""
+    device, dtype = _device_and_dtype()
+    config = _small_vision_config()
+
+    ref = _RefVisionEncoderLayer(config, layer_idx=0).to(device=device, dtype=dtype).eval()
+    ad = Gemma4VisionEncoderLayer(config, layer_idx=0).to(device=device, dtype=dtype).eval()
+    _transfer_vision_encoder_layer_weights(ad, ref)
+
+    B, S = 2, 9
+    x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
+    grid_side = 3
+    pos_x = torch.arange(grid_side, device=device).unsqueeze(1).expand(grid_side, grid_side)
+    pos_y = torch.arange(grid_side, device=device).unsqueeze(0).expand(grid_side, grid_side)
+    pos_ids = torch.stack([pos_x.flatten(), pos_y.flatten()], dim=-1).unsqueeze(0).expand(B, -1, -1)
+
+    rope = Gemma4VisionRotaryEmbedding(config).to(device=device)
+    with torch.no_grad():
+        cos, sin = rope(x, pos_ids)
+
+    attn_mask = torch.ones(B, 1, S, S, device=device, dtype=torch.bool)
+
+    with torch.no_grad():
+        ad_out = ad(x, (cos, sin), attention_mask=attn_mask, position_ids=pos_ids)
+        ref_out = ref(x, (cos, sin), attention_mask=attn_mask, position_ids=pos_ids)
+    assert_rmse_close(ad_out, ref_out, rmse_ratio_tol=0.05, msg="Vision encoder layer: ")
+
+
+# ---------------------------------------------------------------------------
+# Tests — Vision tower full model equivalence
+# ---------------------------------------------------------------------------
+
+
+def test_vision_encoder_equivalence():
+    """Full vision encoder (all layers + RoPE) matches reference."""
+    device, dtype = _device_and_dtype()
+    config = _small_vision_config()
+
+    ref = _RefVisionEncoder(config).to(device=device, dtype=dtype).eval()
+    ad = Gemma4VisionEncoder(config).to(device=device, dtype=dtype).eval()
+    _transfer_vision_encoder_weights(ad, ref)
+
+    B, num_patches = 2, 9
+    x = torch.randn(B, num_patches, config.hidden_size, device=device, dtype=dtype)
+    grid_side = 3
+    pos_x = torch.arange(grid_side, device=device).unsqueeze(1).expand(grid_side, grid_side)
+    pos_y = torch.arange(grid_side, device=device).unsqueeze(0).expand(grid_side, grid_side)
+    pos_ids = torch.stack([pos_x.flatten(), pos_y.flatten()], dim=-1).unsqueeze(0).expand(B, -1, -1)
+    attn_mask = torch.ones(B, num_patches, device=device, dtype=torch.bool)
+
+    with torch.no_grad():
+        ad_out = ad(inputs_embeds=x, attention_mask=attn_mask, pixel_position_ids=pos_ids)
+        ref_out = ref(inputs_embeds=x, attention_mask=attn_mask, pixel_position_ids=pos_ids)
+    # ad_out is ModelOutput, ref_out is tensor
+    ad_hidden = ad_out.last_hidden_state
+    assert_rmse_close(ad_hidden, ref_out, rmse_ratio_tol=0.05, msg="Vision encoder: ")
+
+
+def test_vision_model_equivalence():
+    """Full vision model (embedder + encoder + pooler) matches reference."""
+    device, dtype = _device_and_dtype()
+    config = _small_vision_config()
+
+    ref = _RefVisionModel(config).to(device=device, dtype=dtype).eval()
+    ad = Gemma4VisionModel(config).to(device=device, dtype=dtype).eval()
+    _transfer_vision_model_weights(ad, ref)
+
+    B, num_patches = 2, 9
+    pixel_values, pixel_position_ids = _make_vision_inputs(config, B, num_patches, device, dtype)
+
+    with torch.no_grad():
+        ad_out = ad(pixel_values=pixel_values, pixel_position_ids=pixel_position_ids)
+        ref_out = ref(pixel_values=pixel_values, pixel_position_ids=pixel_position_ids)
+    ad_hidden = ad_out.last_hidden_state
+    assert_rmse_close(ad_hidden, ref_out, rmse_ratio_tol=0.05, msg="Vision model: ")
+
+
+def test_multimodal_embedder_equivalence():
+    """Multimodal embedder (norm + projection) matches reference."""
+    device, dtype = _device_and_dtype()
+    vision_config = _small_vision_config()
+    text_config = _small_text_config()
+
+    ref = _RefMultimodalEmbedder(vision_config, text_config).to(device=device, dtype=dtype).eval()
+    ad = Gemma4MultimodalEmbedder(vision_config, text_config).to(device=device, dtype=dtype).eval()
+    _transfer_multimodal_embedder_weights(ad, ref)
+
+    x = torch.randn(2, 4, vision_config.hidden_size, device=device, dtype=dtype)
+    with torch.no_grad():
+        ad_out = ad(x)
+        ref_out = ref(x)
+    torch.testing.assert_close(ad_out, ref_out, rtol=1e-3, atol=1e-3)
+
+
+@torch.inference_mode()
+def test_gemma4_text_export_uses_semantic_multimodal_mask():
+    config = Gemma4TextConfig(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        global_head_dim=8,
+        num_global_key_value_heads=1,
+        sliding_window=4,
+        layer_types=["sliding_attention"],
+        enable_moe_block=False,
+        final_logit_softcapping=None,
+    )
+    model = Gemma4ForCausalLM(config).eval()
+
+    input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
+    position_ids = torch.arange(input_ids.shape[1], dtype=torch.int64).unsqueeze(0)
+    mm_item_cu_seqlen = torch.tensor([0, 1], dtype=torch.int32)
+    mm_item_types = torch.tensor([0], dtype=torch.int32)
+    mm_token_positions = torch.tensor([1], dtype=torch.int32)
+    mm_token_lengths = torch.tensor([2], dtype=torch.int32)
+    mm_special_offsets_cu_seqlen = torch.tensor([0, 2], dtype=torch.int32)
+    mm_special_offsets = torch.tensor([0, 1], dtype=torch.int32)
+
+    gm = torch_export_to_gm(
+        model,
+        args=(),
+        kwargs={
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "mm_item_cu_seqlen": mm_item_cu_seqlen,
+            "mm_item_types": mm_item_types,
+            "mm_token_positions": mm_token_positions,
+            "mm_token_lengths": mm_token_lengths,
+            "mm_special_offsets_cu_seqlen": mm_special_offsets_cu_seqlen,
+            "mm_special_offsets": mm_special_offsets,
+        },
+        clone=True,
+    )
+
+    semantic_nodes = [
+        node for node in gm.graph.nodes if is_op(node, torch.ops.auto_deploy.gemma4_multimodal_mask)
+    ]
+    attention_nodes = [
+        node for node in gm.graph.nodes if is_op(node, torch.ops.auto_deploy.torch_attention)
+    ]
+
+    assert len(semantic_nodes) == 1
+    assert len(attention_nodes) == 1
+
+    attention_mask_arg = attention_nodes[0].kwargs.get("attn_mask")
+    if attention_mask_arg is None and len(attention_nodes[0].args) > 3:
+        attention_mask_arg = attention_nodes[0].args[3]
+    assert attention_mask_arg is semantic_nodes[0]

@@ -34,24 +34,29 @@ def _forward_moe(self: Qwen3NextSparseMoeBlock, hidden_states: torch.Tensor):
     batch_size, sequence_length, hidden_dim = hidden_states.shape
     hidden_states = hidden_states.view(-1, hidden_dim)
 
-    # router_logits: (batch * sequence_length, n_experts)
-    router_logits = self.gate(hidden_states)
+    # In transformers 5.x, gate returns (router_logits, routing_weights, selected_experts).
+    # The routing logic (softmax, topk, normalization) is now inside the gate.
+    _, routing_weights, selected_experts = self.gate(hidden_states)
 
-    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-    routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-    if self.norm_topk_prob:
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-    # we cast back to the input dtype
-    routing_weights = routing_weights.to(hidden_states.dtype)
+    # In transformers 5.x, self.experts is a fused object with stacked weight tensors
+    # (Parameters directly, not modules with .weight).
+    # Use torch_moe_fused directly since weights are already stacked.
+    gate_up_param = self.experts.gate_up_proj
+    gate_up = gate_up_param.weight if hasattr(gate_up_param, "weight") else gate_up_param
+    down_param = self.experts.down_proj
+    down = down_param.weight if hasattr(down_param, "weight") else down_param
 
-    # Routed experts via torch_moe
-    final_hidden_states = torch.ops.auto_deploy.torch_moe(
+    # HF format: gate_up is [E, 2*I, H] with gate(w1) first, up(w3) second.
+    # TRT-LLM format: w3_w1 is [E, 2*I, H] with up(w3) first, gate(w1) second.
+    half = gate_up.shape[1] // 2
+    w3_w1_stacked = torch.cat([gate_up[:, half:, :], gate_up[:, :half, :]], dim=1)
+
+    final_hidden_states = torch.ops.auto_deploy.torch_moe_fused(
         hidden_states,
         selected_experts,
         routing_weights,
-        w1_weight=[expert.gate_proj.weight for expert in self.experts],
-        w2_weight=[expert.down_proj.weight for expert in self.experts],
-        w3_weight=[expert.up_proj.weight for expert in self.experts],
+        w3_w1_stacked_weight=w3_w1_stacked,
+        w2_stacked_weight=down,
     )
 
     # Shared expert path (unique to Qwen3Next vs Qwen3MoE)
@@ -60,7 +65,7 @@ def _forward_moe(self: Qwen3NextSparseMoeBlock, hidden_states: torch.Tensor):
     final_hidden_states = final_hidden_states + shared_expert_output
 
     final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
-    return final_hidden_states, router_logits
+    return final_hidden_states
 
 
 @ExportPatchRegistry.register("hf_qwen3_next_moe")
