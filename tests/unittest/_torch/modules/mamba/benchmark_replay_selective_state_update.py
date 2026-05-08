@@ -27,22 +27,93 @@ Baseline kernel (--baseline [triton|flashinfer]):
   Calls selective_state_update with T=mtp_len tokens and disable_state_update=True,
   matching the MTP scoring pass in mamba2_mixer.py exactly.
 
+Timing methodology
+==================
+
+All in-bench timing comes from CUPTI's Activity API (1 ns kernel
+timestamps from the GPU profiling fabric).  cudaEvent.elapsed_time() was
+removed — its ~0.5 us resolution overshoots CUPTI by ~50% on short kernels
+in graphs, and we have no other use for it here.  See the CUPTI block
+lower in this file for the timer source.
+
+Three modes:
+
+  --cupti --cuda-graph (default)
+      Capture one CUDA graph per cell (warmup + timed iters inlined),
+      replay once, read kernel start/end from CUPTI.  ~20× faster than
+      nsys-wrapped capture and matches it to within ~1% / noise floor.
+
+  --cupti --no-cuda-graph
+      Eager loop with CUPTI.  Per-kernel timestamps are still accurate, but
+      the per-iter SPAN (max(end) - min(start)) now includes the Python
+      launch latency BETWEEN consecutive kernels in run_fn (~100 µs on
+      Hopper/Blackwell).  Graph capture and PDL hide that latency; eager
+      mode honestly reports it.  For per-kernel timing in eager mode, look
+      at per_kernel.start_us/end_us in --json-detailed output rather than
+      the span percentiles.  Useful when graph capture is undesirable.
+
+  --no-cupti  (with or without --cuda-graph)
+      No in-bench timing — just runs the kernels for an external profiler
+      (nsys / ncu) to time.  In-process CUPTI conflicts with nsys's own
+      subscriber, so disable ours when wrapping in nsys.  Bench output
+      reports zeros for median/p95/p99; trust the external trace.
+
+JSON output schema (--json-output PATH)
+=======================================
+
+Designed to be parsed by collect.py / report.py without touching sqlite or
+NVTX traces.  Future agents: prefer reading this JSON over re-running nsys.
+
+  {
+    "metadata": {timestamp, cmd, tp_size, warmup, iters, variant, cupti},
+    "results": {
+      "<key>": {median, p95, p99, n, [iters_us], [per_kernel]}
+    }
+  }
+
+Key format mirrors collect.py's kernel_data.json convention:
+  incremental/{batch}/{mtp}/{sd}/k{prev_k}/{sweep_parts}/tp{tp}
+  triton/{batch}/{mtp}/{sd}/tp{tp}
+  flashinfer/{batch}/{mtp}/{sd}/tp{tp}
+
+  - <sd> is normalized: bf16 / fp16 / fp32 / int8 / int16 / fp8.
+  - <sweep_parts> is e.g. "M16_W1_S3_SR0_RECT0_WC1" — flags concatenated by
+    underscore in canonical (M, W, S, pW, pS, H, R, CT, SR, RECT, WC) order.
+  - All numeric values in microseconds (us).
+
+Per-record fields:
+  - median, p95, p99: span statistics (us).  Span = max(kernel_end_ns) -
+    min(kernel_start_ns) across the iter's kernels — same convention as
+    nsys-derived collect.py used to use.
+  - n: number of timed iters that contributed.
+  - iters_us: list of length n, raw per-iter spans (only with --json-detailed).
+  - per_kernel: {<kernel_name>: {start_us: [...], end_us: [...]}} where
+    timestamps are RELATIVE to that iter's first kernel start, in us.  Lets
+    you see PDL overlap directly without an external profiler.  Only with
+    --json-detailed.
+
 Example usage:
-  # Basic sweep
+  # Basic sweep (default = --cupti, just summary stats)
   python benchmark_replay_selective_state_update.py \\
       --batch-sizes 1,2,4 --mtp-lengths 1,4,8 --warmup 5 --iters 20
 
-  # With CUDA graph (default) and Triton baseline:
-  python benchmark_replay_selective_state_update.py --baseline \\
-      --batch-sizes 1,2,4 --mtp-lengths 5,10,20
+  # JSON output, summary stats only (compact)
+  python benchmark_replay_selective_state_update.py \\
+      --batch-sizes 16 --mtp-lengths 6 --json-output /tmp/out.json
 
-  # nsys capture (NVTX ranges visible in timeline)
+  # JSON output, full per-iter / per-kernel data (for PDL analysis etc.)
+  python benchmark_replay_selective_state_update.py \\
+      --batch-sizes 16 --mtp-lengths 6 \\
+      --json-output /tmp/out.json --json-detailed
+
+  # nsys capture (--no-cupti so our subscriber doesn't conflict)
   nsys profile --capture-range=cudaProfilerApi \\
-      python benchmark_replay_selective_state_update.py --profile
+      python benchmark_replay_selective_state_update.py --profile --no-cupti
 
-  # ncu capture
+  # ncu capture (--no-cupti --no-cuda-graph: each kernel replayable solo)
   ncu --target-processes all \\
       python benchmark_replay_selective_state_update.py --profile \\
+          --no-cupti --no-cuda-graph \\
           --batch-sizes 1 --mtp-lengths 4 --warmup 5 --iters 5
 """
 
@@ -385,16 +456,201 @@ def _build_tensors(
     )
 
 
+# =============================================================================
+# CUPTI in-process kernel timing
+#
+# Self-contained module-in-a-file.  Reads kernel start/end timestamps directly
+# from the GPU profiling fabric via NVIDIA's cupti-python bindings (1 ns
+# resolution), avoiding two pitfalls of the cuda-events path:
+#
+#   1. cudaEvent.elapsed_time() resolution (~0.5 us) is too coarse for the
+#      short kernels we care about, especially with PDL + cuda graphs at
+#      small batch — events recorded inside a graph have proven noisy.
+#   2. nsys is the only known accurate alternative, but the
+#      profile-export-sqlite-parse pipeline is heavy and out-of-process.
+#
+# This is functionally equivalent to wrapping each cell in nsys, except it
+# runs in the same Python process with no serialization.  When this proves
+# out, lift `CuptiKernelTimer` and `_time_kernel_cuda_graph_cupti` into a
+# proper TRT-LLM utility module — there is no benchmark-specific code below.
+# =============================================================================
+
+
+# Substring match: kernels run_fn launches that we want to time.  Mirrors
+# the parser in scripts/.../collect.py so cupti and nsys-based outputs agree.
+_CUPTI_KEEP_KERNEL_SUBSTRINGS = (
+    "_replay_precompute",
+    "_checkpointing_precompute",
+    "_rectangle_precompute",
+    "_dynamic_precompute",
+    "_replay_state_update",
+    "_checkpointing_main",
+    "_rectangle_main",
+    "_dynamic_main",
+    "selective_scan_update",
+    "selective_state_update",
+    "causal_conv1d_update",
+)
+
+
+class CuptiKernelTimer:
+    """Process-singleton wrapper around CUPTI's CONCURRENT_KERNEL activity.
+
+    CUPTI's callbacks are global (one subscriber per process), so the timer
+    is constructed lazily once via `CuptiKernelTimer.get()`.  cupti-python
+    parses the activity buffer for us — `buffer_completed` receives a Python
+    list of typed activity objects, not a raw byte buffer — so no FFI is
+    needed.
+
+    Usage:
+        timer = CuptiKernelTimer.get()
+        timer.start()                     # arms; drops any stale records
+        <run cuda graph and synchronize>
+        records = timer.stop()            # flush; list of tuples per kernel
+                                           # (name, start_ns, end_ns, corr,
+                                           #  graph_id, graph_node_id, stream)
+
+    The callback fires from a CUPTI worker thread, so a lock guards the
+    record buffer.  Records are kept tiny (tuple of ints + str) to minimize
+    Python overhead in the hot path of the callback.
+    """
+
+    _instance = None
+    _import_error = None
+
+    @classmethod
+    def get(cls) -> "CuptiKernelTimer":
+        if cls._instance is not None:
+            return cls._instance
+        if cls._import_error is not None:
+            raise cls._import_error
+        try:
+            from cupti import cupti as _c
+        except ImportError as e:  # pragma: no cover — env-dependent
+            cls._import_error = e
+            raise
+        cls._instance = cls._init(_c)
+        return cls._instance
+
+    @classmethod
+    def _init(cls, _c) -> "CuptiKernelTimer":
+        import threading
+
+        self = object.__new__(cls)
+        self._c = _c
+        self._records: list[tuple] = []
+        self._lock = threading.Lock()
+
+        # CUPTI callback contract (from cupti-python-samples/cupti_common.py):
+        #   buffer_requested() -> (buffer_size, max_num_records)
+        #   buffer_completed(activities: list)
+        # Setting max_num_records=0 (unbounded) avoids spurious buffer
+        # requests.  8 MiB matches the sample defaults.
+        def _buf_req():
+            return (8 * 1024 * 1024, 0)
+
+        kernel_kinds = (_c.ActivityKind.CONCURRENT_KERNEL, _c.ActivityKind.KERNEL)
+
+        def _buf_done(activities):
+            recs = []
+            for a in activities:
+                if a.kind not in kernel_kinds:
+                    continue
+                # start/end == 0 means CUPTI couldn't time this kernel.
+                if a.start == 0 or a.end == 0:
+                    continue
+                recs.append((
+                    a.name,
+                    int(a.start),
+                    int(a.end),
+                    int(a.correlation_id),
+                    int(a.graph_id),
+                    int(a.graph_node_id),
+                    int(a.stream_id),
+                ))
+            if recs:
+                with self._lock:
+                    self._records.extend(recs)
+
+        # Hold strong refs so the C side never sees GC'd Python callables.
+        self._buf_req = _buf_req
+        self._buf_done = _buf_done
+
+        _c.activity_register_callbacks(_buf_req, _buf_done)
+        _c.activity_enable(_c.ActivityKind.CONCURRENT_KERNEL)
+        return self
+
+    def start(self) -> None:
+        """Arm capture: flush any stale records, then clear the buffer."""
+        self._c.activity_flush_all(1)
+        with self._lock:
+            self._records.clear()
+
+    def stop(self) -> list[tuple]:
+        """Flush and return all kernel records since the last start()."""
+        self._c.activity_flush_all(1)
+        with self._lock:
+            return list(self._records)
+
+
+# =============================================================================
 # Timing helpers
+# =============================================================================
 
 
-def _compute_stats(latencies_us: list[float]) -> tuple[float, float, float]:
-    """Return (median_us, p95_us, p99_us) from a list of latencies."""
-    median_us = statistics.median(latencies_us)
-    s = sorted(latencies_us)
-    p95_us = s[int(0.95 * len(s))]
-    p99_us = s[int(0.99 * len(s))]
-    return median_us, p95_us, p99_us
+def _stats_from_spans(spans_us: list[float]) -> dict:
+    """Compute median / p95 / p99 / n from a per-iter span list."""
+    s = sorted(spans_us)
+    return {
+        "median": statistics.median(s),
+        "p95": s[int(0.95 * len(s))],
+        "p99": s[int(0.99 * len(s))],
+        "n": len(s),
+    }
+
+
+def _stats_from_cupti_records(records, warmup, iters, tag):
+    """Bin a flat CUPTI kernel record stream into per-iter spans + per-kernel
+    relative timestamps.  Used by both graph and eager CUPTI paths.
+
+    `records` are tuples (name, start_ns, end_ns, ...) — see CuptiKernelTimer.
+    The first warmup*K records are dropped; the rest are chunked into K-tuples.
+    """
+    records = [
+        r for r in records
+        if any(s in r[0] for s in _CUPTI_KEEP_KERNEL_SUBSTRINGS)
+    ]
+    records.sort(key=lambda r: r[1])  # by start_ns
+
+    total = len(records)
+    expected_iters = warmup + iters
+    if total == 0 or total % expected_iters != 0:
+        names_seen = sorted({r[0] for r in records})
+        raise RuntimeError(
+            f"CUPTI capture mismatch for {tag!r}: got {total} records, "
+            f"expected a multiple of {expected_iters} (warmup+iters={expected_iters}). "
+            f"Kernel names captured: {names_seen}"
+        )
+    K = total // expected_iters
+    timed = records[warmup * K:]
+
+    spans_us: list[float] = []
+    per_kernel: dict[str, dict[str, list[float]]] = {}
+    for i in range(iters):
+        chunk = timed[i * K:(i + 1) * K]
+        iter_start_ns = min(r[1] for r in chunk)
+        iter_end_ns = max(r[2] for r in chunk)
+        spans_us.append((iter_end_ns - iter_start_ns) / 1000.0)
+        for r in chunk:
+            name = r[0]
+            slot = per_kernel.setdefault(name, {"start_us": [], "end_us": []})
+            slot["start_us"].append((r[1] - iter_start_ns) / 1000.0)
+            slot["end_us"].append((r[2] - iter_start_ns) / 1000.0)
+
+    out = _stats_from_spans(spans_us)
+    out["iters_us"] = spans_us
+    out["per_kernel"] = per_kernel
+    return out
 
 
 def _time_kernel_cuda_graph(
@@ -402,21 +658,17 @@ def _time_kernel_cuda_graph(
     run_fn,
     reset_fn,
     tag: str,
-) -> tuple[float, float, float]:
-    """
-    All-in-one CUDA graph timing.
+) -> dict:
+    """CUDA-graph CUPTI timer.
 
-    Captures a single graph containing warmup iterations followed by timed
-    iterations with per-iteration event pairs recorded inside the graph.
-    One replay, one sync, then all timings are read.
+    Captures one CUDA graph (warmup + timed iters inlined), replays once,
+    reads kernel start/end timestamps from CUPTI (1 ns resolution).
     """
+    timer = CuptiKernelTimer.get()
     warmup = args.warmup
     iters = args.iters
 
-    start_events = [torch.cuda.Event(enable_timing=True, external=True) for _ in range(iters)]
-    end_events = [torch.cuda.Event(enable_timing=True, external=True) for _ in range(iters)]
-
-    # Eager warmup before graph capture (triggers Triton autotune if active)
+    # Eager warmup before graph capture (triggers Triton autotune if active).
     reset_fn()
     run_fn()
     torch.cuda.synchronize()
@@ -426,32 +678,22 @@ def _time_kernel_cuda_graph(
 
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        # Warmup iterations (unrolled into the graph)
-        for _ in range(warmup):
+        for _ in range(warmup + iters):
             reset_fn()
             if args.l2_flush:
                 _l2_flush.fill_(0.0)
             run_fn()
-
-        # Timed iterations with events inside the graph
-        for i in range(iters):
-            reset_fn()
-            if args.l2_flush:
-                _l2_flush.fill_(0.0)
-            start_events[i].record()
-            run_fn()
-            end_events[i].record()
 
     torch.cuda.synchronize()
 
-    # Single replay
+    timer.start()
     torch.cuda.nvtx.range_push(tag)
     g.replay()
     torch.cuda.synchronize()
     torch.cuda.nvtx.range_pop()
+    records = timer.stop()
 
-    latencies_us = [start_events[i].elapsed_time(end_events[i]) * 1000.0 for i in range(iters)]
-    return _compute_stats(latencies_us)
+    return _stats_from_cupti_records(records, warmup, iters, tag)
 
 
 def _time_kernel_eager(
@@ -459,35 +701,81 @@ def _time_kernel_eager(
     run_fn,
     reset_fn,
     tag: str,
-) -> tuple[float, float, float]:
-    """Non-CUDA-graph timing path (for debugging, ncu, etc.)."""
-    # Warmup
-    for _ in range(args.warmup):
-        reset_fn()
-        run_fn()
-    torch.cuda.synchronize()
+) -> dict:
+    """Non-graph CUPTI timer (for ncu wrapping, debugging, etc.).
 
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
+    Each iter runs serially with sync between, but kernel start/end still
+    come from CUPTI — same accuracy as the graph path, just slower per-iter
+    (extra Python + sync overhead).
+    """
+    timer = CuptiKernelTimer.get()
+    warmup = args.warmup
+    iters = args.iters
 
-    latencies_us: list[float] = []
+    timer.start()
     torch.cuda.nvtx.range_push(tag)
-    for _ in range(args.iters):
+    for _ in range(warmup + iters):
         reset_fn()
         if args.l2_flush:
             _flush_l2()  # includes synchronize
-        start_event.record()
         run_fn()
-        end_event.record()
-        torch.cuda.synchronize()
-        latencies_us.append(start_event.elapsed_time(end_event) * 1000.0)
+    torch.cuda.synchronize()
     torch.cuda.nvtx.range_pop()
+    records = timer.stop()
 
-    return _compute_stats(latencies_us)
+    return _stats_from_cupti_records(records, warmup, iters, tag)
 
 
-def _time_kernel(args, run_fn, reset_fn, tag: str) -> tuple[float, float, float]:
-    """Dispatch to CUDA-graph or eager timing path."""
+def _run_kernel_untimed(args, run_fn, reset_fn, tag: str) -> dict:
+    """No in-bench timing: just run the kernels for an external profiler
+    (nsys / ncu) to time externally.  Returns a stats dict full of zeros so
+    downstream code (table, JSON) doesn't break.
+    """
+    warmup = args.warmup
+    iters = args.iters
+
+    if args.cuda_graph:
+        # Eager warmup before capture (Triton autotune)
+        reset_fn(); run_fn(); torch.cuda.synchronize()
+        reset_fn(); torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            for _ in range(warmup + iters):
+                reset_fn()
+                if args.l2_flush:
+                    _l2_flush.fill_(0.0)
+                run_fn()
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_push(tag)
+        g.replay()
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+    else:
+        torch.cuda.nvtx.range_push(tag)
+        for _ in range(warmup + iters):
+            reset_fn()
+            if args.l2_flush:
+                _flush_l2()
+            run_fn()
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
+
+    spans_us = [0.0] * iters
+    out = _stats_from_spans(spans_us)
+    out["iters_us"] = spans_us
+    out["per_kernel"] = {}
+    return out
+
+
+def _time_kernel(args, run_fn, reset_fn, tag: str) -> dict:
+    """Dispatch to graph-CUPTI / eager-CUPTI / no-timer path.
+
+    --cupti: in-process CUPTI Activity API timing (default).  Use --no-cupti
+    when running under nsys (in-process CUPTI conflicts with nsys's own
+    subscriber); the bench then runs the kernels for nsys to time externally.
+    """
+    if not getattr(args, "cupti", True):
+        return _run_kernel_untimed(args, run_fn, reset_fn, tag)
     if args.cuda_graph:
         return _time_kernel_cuda_graph(args, run_fn, reset_fn, tag)
     return _time_kernel_eager(args, run_fn, reset_fn, tag)
@@ -801,7 +1089,7 @@ def _bench_config(
             _run_baseline()
             torch.cuda.synchronize()
         else:
-            median_us, p95_us, p99_us = _time_kernel(args, _run_baseline, reset_fn, tag)
+            stats = _time_kernel(args, _run_baseline, reset_fn, tag)
 
             _print_row(
                 show_kernel_col,
@@ -811,9 +1099,10 @@ def _bench_config(
                 "N/A",
                 state_dtype_name,
                 act_dtype_name,
-                median_us,
-                p95_us,
-                p99_us,
+                stats,
+                json_results=getattr(args, "_json_results", None),
+                tp_size=args.tp_size,
+                json_detailed=getattr(args, "json_detailed", False),
             )
 
     # --- Sweep parameter parsing (invariant across prev_k) ---
@@ -958,7 +1247,7 @@ def _bench_config(
                 _run_incr()
                 torch.cuda.synchronize()
             else:
-                median_us, p95_us, p99_us = _time_kernel(args, _run_incr, reset_fn, sweep_tag)
+                stats = _time_kernel(args, _run_incr, reset_fn, sweep_tag)
 
                 _print_row(
                     show_kernel_col,
@@ -968,11 +1257,53 @@ def _bench_config(
                     prev_k,
                     state_dtype_name,
                     act_dtype_name,
-                    median_us,
-                    p95_us,
-                    p99_us,
+                    stats,
                     sweep_suffix,
+                    json_results=getattr(args, "_json_results", None),
+                    tp_size=args.tp_size,
+                    json_detailed=getattr(args, "json_detailed", False),
                 )
+
+
+# Map full torch dtype name → short tag used in JSON keys (matches collect.py).
+_DTYPE_SHORT = {
+    "float32": "fp32", "bfloat16": "bf16", "float16": "fp16",
+    "int8": "int8", "int16": "int16", "float8_e4m3fn": "fp8",
+}
+
+
+def _build_json_key(
+    kernel_name, batch, mtp_len, prev_k, state_dtype_name, sweep_suffix, tp_size
+):
+    """Build a key matching collect.py's kernel_data.json convention:
+
+      incremental/{batch}/{mtp}/{sd}/k{k}/{sweep_parts}/tp{tp}
+      triton/{batch}/{mtp}/{sd}/tp{tp}
+      flashinfer/{batch}/{mtp}/{sd}/tp{tp}
+
+    `kernel_name` is what _print_row receives: variant name for the timed
+    kernel (replay/checkpointing) or baseline name for the baseline row.
+    Variant rows collapse to "incremental" — the variant choice is captured
+    by the sweep flags collect.py would otherwise apply via --variant.
+    """
+    if kernel_name in ("replay", "checkpointing"):
+        kind = "incremental"
+    else:
+        kind = kernel_name  # "triton" / "flashinfer"
+
+    sd = _DTYPE_SHORT.get(state_dtype_name, state_dtype_name)
+    parts = [kind, str(batch), str(mtp_len), sd]
+    if prev_k != "N/A":
+        parts.append(f"k{prev_k}")
+    if sweep_suffix:
+        # sweep_suffix format: " M=4,W=1,S=1,SR=0,RECT=0,WC=1"
+        # collect.py format:    "M4_W1_S1_SR0_RECT0_WC0"
+        # Strip leading/trailing whitespace, drop '=', commas → underscores.
+        parts.append(
+            sweep_suffix.strip().replace("=", "").replace(",", "_")
+        )
+    parts.append(f"tp{tp_size}")
+    return "/".join(parts)
 
 
 def _print_row(
@@ -983,24 +1314,48 @@ def _print_row(
     prev_k,
     state_dtype_name,
     act_dtype_name,
-    median_us,
-    p95_us,
-    p99_us,
+    stats,
     sweep_suffix="",
+    json_results=None,
+    tp_size=None,
+    json_detailed=False,
 ):
+    """Print one summary row and optionally accumulate stats for JSON output.
+
+    `stats` is a dict from _time_kernel: {median, p95, p99, n, iters_us,
+    [per_kernel]}.  The summary table only shows the headline percentiles.
+    JSON output captures median/p95/p99/n by default; with json_detailed=True
+    it also captures the per-iter and per-kernel data.
+    """
     kernel_col = f"{kernel_name:>11} | " if show_kernel_col else ""
     print(
         f"| {kernel_col}{batch:>5} | {mtp_len:>7} | {str(prev_k):>6} | "
         f"{state_dtype_name:>11} | {act_dtype_name:>9} | "
-        f"{median_us:>9.2f} | {p95_us:>7.2f} | {p99_us:>7.2f} |"
+        f"{stats['median']:>9.2f} | {stats['p95']:>7.2f} | {stats['p99']:>7.2f} |"
         f"{sweep_suffix}"
     )
+    if json_results is not None:
+        key = _build_json_key(
+            kernel_name, batch, mtp_len, prev_k, state_dtype_name,
+            sweep_suffix, tp_size,
+        )
+        if json_detailed:
+            json_results[key] = stats
+        else:
+            json_results[key] = {
+                k: stats[k] for k in ("median", "p95", "p99", "n")
+                if k in stats
+            }
 
 
 # Main benchmark loop
 
 
 def _run_benchmark(args) -> None:
+    # JSON accumulator — populated by _print_row when --json-output is set.
+    # Stash on args so we don't need to thread a dict through every helper.
+    args._json_results = {} if getattr(args, "json_output", None) else None
+
     assert args.nheads % args.tp_size == 0, (
         f"nheads ({args.nheads}) must be divisible by tp_size ({args.tp_size})"
     )
@@ -1097,6 +1452,27 @@ def _run_benchmark(args) -> None:
     if args.profile:
         torch.cuda.cudart().cudaProfilerStop()
 
+    if args.json_output and args._json_results is not None:
+        import json
+        payload = {
+            "metadata": {
+                "timestamp": datetime.now().isoformat(),
+                "cmd": " ".join(sys.argv),
+                "tp_size": args.tp_size,
+                "warmup": args.warmup,
+                "iters": args.iters,
+                "variant": args.variant,
+                "cupti": getattr(args, "cupti", False),
+            },
+            "results": args._json_results,
+        }
+        tmp = args.json_output + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp, args.json_output)
+        print(f"\nJSON results written to: {args.json_output} "
+              f"({len(args._json_results)} entries)")
+
 
 # CLI
 
@@ -1180,6 +1556,33 @@ def _parse_args() -> argparse.Namespace:
         help="Capture all warmup + timed iterations in a "
         "single CUDA graph with per-iteration events "
         "inside the graph, eliminating all host overhead.",
+    )
+    parser.add_argument(
+        "--cupti",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Time kernels via CUPTI Activity API (1 ns from the GPU "
+        "profiling fabric); per-iter span = max(kernel_end) - "
+        "min(kernel_start). Default ON.  --no-cupti disables in-bench "
+        "timing entirely (kernels still run, but median/p95/p99 are zero) "
+        "— use when wrapping the bench in nsys/ncu, where the external "
+        "profiler provides timings and our CUPTI subscriber would conflict.",
+    )
+    parser.add_argument(
+        "--json-output",
+        default=None,
+        help="If set, write per-cell results to this JSON file in the "
+        "shape consumed by collect.py / report.py.  See the 'JSON output "
+        "schema' section at the top of this file.",
+    )
+    parser.add_argument(
+        "--json-detailed",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When --json-output is set, also include iters_us (raw per-iter "
+        "spans) and per_kernel (per-iter relative start/end timestamps for "
+        "each kernel) — useful for PDL overlap analysis but adds ~4 KB/cell. "
+        "Default off keeps records to ~40 bytes (median/p95/p99/n only).",
     )
     parser.add_argument(
         "--prev-tokens-fracs",
