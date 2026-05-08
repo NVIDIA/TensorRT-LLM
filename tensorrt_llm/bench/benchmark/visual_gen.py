@@ -23,6 +23,7 @@ Usage:
 
 import json
 import os
+import tempfile
 import time
 from datetime import datetime
 from typing import Optional
@@ -332,39 +333,72 @@ def _run_benchmark(
     gen_params,
     max_concurrency: int,
 ) -> list[VisualGenRequestOutput]:
-    """Run the benchmark loop, dispatching requests with concurrency control."""
+    """Run the benchmark loop, dispatching requests with concurrency control.
+
+    Each per-request ``latency`` window covers ``generate()`` plus a
+    ``save()`` to a per-run temp directory. The save mirrors what the
+    serving path (``openai_video_routes.py`` / ``openai_server.py``) does
+    inside its own ``latency`` window: encode and write to a persisted
+    location. The directory is cleaned up at the end of the run.
+    """
     import asyncio
 
-    outputs: list[VisualGenRequestOutput] = []
-
-    if max_concurrency <= 1:
-        outputs = _run_sequential(visual_gen, input_requests, gen_params)
-    else:
-        outputs = asyncio.run(
+    with tempfile.TemporaryDirectory(prefix="trtllm-bench-vg-") as media_dir:
+        if max_concurrency <= 1:
+            return _run_sequential(visual_gen, input_requests, gen_params, media_dir)
+        return asyncio.run(
             _run_concurrent(
                 visual_gen,
                 input_requests,
                 gen_params,
                 max_concurrency,
+                media_dir,
             )
         )
 
-    return outputs
+
+def _save_for_timing(result, media_dir: str, idx: int) -> None:
+    """Persist ``result`` to ``media_dir`` so e2e timing covers encoding.
+
+    Mirrors the serving path: encodes and writes to a persisted location
+    (the file is left in place; the directory is wiped wholesale when the
+    enclosing :class:`tempfile.TemporaryDirectory` exits). Uses
+    ``resolve_video_format("auto")`` for video so the bench falls back to
+    ``.avi`` (pure-Python) on hosts without ffmpeg, matching the server's
+    default behavior instead of hard-failing.
+    """
+    if result.image is not None:
+        path = os.path.join(media_dir, f"img_{idx}.png")
+    elif result.video is not None:
+        from tensorrt_llm.media.encoding import resolve_video_format
+
+        _, ext = resolve_video_format("auto")
+        path = os.path.join(media_dir, f"vid_{idx}{ext}")
+    else:
+        return
+
+    result.save(path)
 
 
-def _run_sequential(visual_gen, input_requests, gen_params) -> list[VisualGenRequestOutput]:
+def _run_sequential(
+    visual_gen, input_requests, gen_params, media_dir: str
+) -> list[VisualGenRequestOutput]:
     """Run requests one at a time, measuring per-request latency."""
     outputs = []
 
-    for req in input_requests:
+    for idx, req in enumerate(input_requests):
         output = VisualGenRequestOutput()
         st = time.perf_counter()
         try:
-            visual_gen.generate(inputs=req.prompt, params=gen_params)
-            output.e2e_latency = time.perf_counter() - st
+            result = visual_gen.generate(inputs=req.prompt, params=gen_params)
+            _save_for_timing(result, media_dir, idx)
+            output.latency = time.perf_counter() - st
             output.success = True
+            if result.metrics is not None:
+                output.generation = result.metrics.generation
+                output.denoise = result.metrics.denoise
         except Exception as e:
-            output.e2e_latency = time.perf_counter() - st
+            output.latency = time.perf_counter() - st
             output.success = False
             output.error = str(e)
             output.exception_type = e.__class__.__name__
@@ -376,7 +410,7 @@ def _run_sequential(visual_gen, input_requests, gen_params) -> list[VisualGenReq
 
 
 async def _run_concurrent(
-    visual_gen, input_requests, gen_params, max_concurrency
+    visual_gen, input_requests, gen_params, max_concurrency, media_dir: str
 ) -> list[VisualGenRequestOutput]:
     """Run requests concurrently using generate_async with a semaphore."""
     import asyncio
@@ -390,11 +424,15 @@ async def _run_concurrent(
             st = time.perf_counter()
             try:
                 future = visual_gen.generate_async(inputs=req.prompt, params=gen_params)
-                await future.result()
-                output.e2e_latency = time.perf_counter() - st
+                result = await future
+                _save_for_timing(result, media_dir, idx)
+                output.latency = time.perf_counter() - st
                 output.success = True
+                if result.metrics is not None:
+                    output.generation = result.metrics.generation
+                    output.denoise = result.metrics.denoise
             except Exception as e:
-                output.e2e_latency = time.perf_counter() - st
+                output.latency = time.perf_counter() - st
                 output.success = False
                 output.error = str(e)
                 output.exception_type = e.__class__.__name__

@@ -9,7 +9,6 @@ import time
 
 from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams, logger
 from tensorrt_llm._torch.visual_gen.config import CacheDiTConfig, TeaCacheConfig
-from tensorrt_llm.serve.media_storage import MediaStorage
 
 logger.set_level("info")
 
@@ -400,9 +399,7 @@ def main():
 
         logger.info(f"Generation completed in {time.time() - start_time:.2f}s")
 
-        MediaStorage.save_video(
-            output.video, args.output_path, audio=output.audio, frame_rate=frame_rate
-        )
+        output.save(args.output_path)
 
     finally:
         visual_gen.shutdown()
