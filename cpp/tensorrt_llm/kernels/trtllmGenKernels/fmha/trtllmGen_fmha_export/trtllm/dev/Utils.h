@@ -358,7 +358,9 @@ initPersistentSchedulerSm90Params(KernelParams const& kernelParams,
   // Calculate number of tiles based on batch mode.
   // - nm is the non-batched dimension: N if batchM, M if batchN.
   // - tileStridePerBatch is: N/TileN if batchM, M/TileM if batchN.
-  // - ptrNumNonExitingCtas[0] gives the max number of tiles in the batched dimension.
+  // - ptrNumNonExitingCtas[0] gives the max number of tiles in the batched dimension. The legacy
+  //   CTA-based name is kept for interface compatibility even though routed MoE paths may provide
+  //   a CGA-granular count here.
   //
   // Note: For StaticPersistent scheduler, ptrNumNonExitingCtas MUST be set because we cannot
   // compute the tile count for the batched dimension from nm alone (nm is the OTHER dimension).

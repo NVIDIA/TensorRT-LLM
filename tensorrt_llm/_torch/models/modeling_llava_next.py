@@ -155,7 +155,8 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         prompt_token_ids: List[int],
         num_mm_tokens_per_placeholder: List[int],
         hf_processor_mm_kwargs: Optional[Dict[str, Any]] = None,
-    ) -> List[int]:
+        **kwargs,
+    ) -> Tuple[List[int], Optional[Dict[str, Dict[str, Any]]]]:
         """
         Expands MM placeholder tokens in `prompt_token_ids` so that each single placeholder
         is replaced by the corresponding number of multimodal feature tokens.
@@ -174,12 +175,15 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                 to pass to the HuggingFace processor, if needed for token expansion.
 
         Returns:
-            List[int]: The prompt token IDs where each MM placeholder token has been
-                replaced/expanded with the appropriate number of MM feature tokens.
+            Tuple[List[int], Optional[Dict[str, Dict[str, Any]]]]:
+                `expanded_ids` (List[int]) — prompt token IDs with each MM placeholder expanded.
+                `mm_data_updates` (Optional[Dict]) — extra fields to merge into
+                `extra_processed_inputs["multimodal_data"]`. Always `None` for LLaVA-Next
+                (no auxiliary streams needed).
         """
         expanded, _, _ = self._expand_image_placeholders_in_token_ids(
             prompt_token_ids, num_mm_tokens_per_placeholder)
-        return expanded
+        return expanded, None
 
     def _postprocess(
         self, input_ids: torch.Tensor, mm_features: Union[torch.Tensor,
@@ -414,8 +418,8 @@ class LlavaNextVisionModel(nn.Module):
         clip_model_config = copy.deepcopy(self.model_config)
         clip_model_config.pretrained_config = self.model_config.pretrained_config.vision_config
         self.dtype = (
-            self.model_config.pretrained_config.text_config.torch_dtype
-            or self.model_config.pretrained_config.torch_dtype)
+            self.model_config.pretrained_config.torch_dtype
+            or self.model_config.pretrained_config.text_config.torch_dtype)
         self.vision_model = CLIPVisionModel(clip_model_config).to(self.dtype)
         self.mm_projector = LlavaNextMultiModalProjector(
             self.pretrained_config).to(self.dtype)
@@ -622,10 +626,12 @@ class LlavaNextModel(PreTrainedModel):
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = model_config.pretrained_config.text_config
 
-        # Ensure torch_dtype is set on text_config (HF may omit it from
-        # sub-configs, e.g. llava-hf/llava-v1.6-mistral-7b-hf commit 2424fdd)
-        if llm_model_config.pretrained_config.torch_dtype is None:
-            llm_model_config.pretrained_config.torch_dtype = model_config.pretrained_config.torch_dtype
+        # Use the outer config's torch_dtype for the LLM, matching HF behavior
+        # where `.to(outer_dtype)` overrides text sub-config dtypes. Falls back
+        # to the text_config dtype if the outer config has none set.
+        llm_model_config.pretrained_config.torch_dtype = (
+            model_config.pretrained_config.torch_dtype
+            or llm_model_config.pretrained_config.torch_dtype)
 
         # TODO Remove these when MistralConfig is natively supported
         llm_model_config.pretrained_config.attention_bias = False
@@ -663,6 +669,10 @@ class LlavaNextModel(PreTrainedModel):
     def post_config(self):
         self.config = self.llm.config
         self.model_config.pretrained_config = self.llm.config
+
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -552,6 +552,7 @@ kv_cache::CacheState Serialization::deserializeCacheState(std::istream& is)
     auto hasIndexerKCache = su::deserialize<bool>(is);
     auto indexerDimPerHead = su::deserialize<decltype(CacheState::ModelConfig::mSizePerHead)>(is);
     auto indexerKCacheQuantBlockSize = su::deserialize<decltype(CacheState::ModelConfig::mTokensPerBlock)>(is);
+    auto indexerKCacheUseFp4 = su::deserialize<bool>(is);
     // RNN config (optional)
     auto hasRnnConfig = su::deserialize<bool>(is);
     std::optional<CacheState::RnnModelConfig> rnnModelConfig;
@@ -576,7 +577,8 @@ kv_cache::CacheState Serialization::deserializeCacheState(std::istream& is)
     }
     CacheState cacheState{nbKvHeadsPerLayer, sizePerHead, tokensPerBlock, tensorParallelism, pipelineParallelism,
         contextParallelism, attentionLayerNumPerPP, dataType, attentionType, kvFactor, enableAttentionDP, DPrank,
-        DPsize, enableBlockReuse, enablePartialReuse, hasIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize};
+        DPsize, enableBlockReuse, enablePartialReuse, hasIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize,
+        indexerKCacheUseFp4};
     if (rnnModelConfig.has_value())
     {
         cacheState.setRnnConfig(
@@ -605,6 +607,7 @@ void Serialization::serialize(kv_cache::CacheState const& state, std::ostream& o
     su::serialize(state.getHasIndexerKCache(), os);
     su::serialize(state.getIndexerDimPerHead(), os);
     su::serialize(state.getIndexerKCacheQuantBlockSize(), os);
+    su::serialize(state.getIndexerKCacheUseFp4(), os);
     // RNN config (optional)
     su::serialize(state.mRnnCacheState.has_value(), os);
     if (state.mRnnCacheState.has_value())
@@ -645,6 +648,7 @@ size_t Serialization::serializedSize(kv_cache::CacheState const& state)
     totalSize += su::serializedSize(state.getHasIndexerKCache());
     totalSize += su::serializedSize(state.getIndexerDimPerHead());
     totalSize += su::serializedSize(state.getIndexerKCacheQuantBlockSize());
+    totalSize += su::serializedSize(state.getIndexerKCacheUseFp4());
     // RNN config (optional)
     totalSize += su::serializedSize(state.mRnnCacheState.has_value());
     if (state.mRnnCacheState.has_value())
@@ -1262,7 +1266,6 @@ KvCacheConfig Serialization::deserializeKvCacheConfig(std::istream& is)
     auto sinkTokenLength = su::deserialize<std::optional<SizeType32>>(is);
     auto freeGpuMemoryFraction = su::deserialize<std::optional<FloatType>>(is);
     auto hostCacheSize = su::deserialize<std::optional<size_t>>(is);
-    auto onboardBlocks = su::deserialize<bool>(is);
     auto crossKvCacheFraction = su::deserialize<std::optional<FloatType>>(is);
     auto secondaryOffloadMinPriority = su::deserialize<std::optional<executor::RetentionPriority>>(is);
     auto eventBufferMaxSize = su::deserialize<size_t>(is);
@@ -1270,8 +1273,8 @@ KvCacheConfig Serialization::deserializeKvCacheConfig(std::istream& is)
     auto attentionDpEventsGatherPeriodMs = su::deserialize<SizeType32>(is);
 
     return KvCacheConfig{enableBlockReuse, maxTokens, maxAttentionWindowVec, sinkTokenLength, freeGpuMemoryFraction,
-        hostCacheSize, onboardBlocks, crossKvCacheFraction, secondaryOffloadMinPriority, eventBufferMaxSize,
-        enablePartialReuse, copyOnPartialReuse, useUvm, attentionDpEventsGatherPeriodMs};
+        hostCacheSize, crossKvCacheFraction, secondaryOffloadMinPriority, eventBufferMaxSize, enablePartialReuse,
+        copyOnPartialReuse, useUvm, attentionDpEventsGatherPeriodMs};
 }
 
 void Serialization::serialize(KvCacheConfig const& kvCacheConfig, std::ostream& os)
@@ -1284,7 +1287,6 @@ void Serialization::serialize(KvCacheConfig const& kvCacheConfig, std::ostream& 
     su::serialize(kvCacheConfig.getSinkTokenLength(), os);
     su::serialize(kvCacheConfig.getFreeGpuMemoryFraction(), os);
     su::serialize(kvCacheConfig.getHostCacheSize(), os);
-    su::serialize(kvCacheConfig.getOnboardBlocks(), os);
     su::serialize(kvCacheConfig.getCrossKvCacheFraction(), os);
     su::serialize(kvCacheConfig.getSecondaryOffloadMinPriority(), os);
     su::serialize(kvCacheConfig.getEventBufferMaxSize(), os);
@@ -1304,7 +1306,6 @@ size_t Serialization::serializedSize(KvCacheConfig const& kvCacheConfig)
     totalSize += su::serializedSize(kvCacheConfig.getSinkTokenLength());
     totalSize += su::serializedSize(kvCacheConfig.getFreeGpuMemoryFraction());
     totalSize += su::serializedSize(kvCacheConfig.getHostCacheSize());
-    totalSize += su::serializedSize(kvCacheConfig.getOnboardBlocks());
     totalSize += su::serializedSize(kvCacheConfig.getCrossKvCacheFraction());
     totalSize += su::serializedSize(kvCacheConfig.getSecondaryOffloadMinPriority());
     totalSize += su::serializedSize(kvCacheConfig.getEventBufferMaxSize());
@@ -1900,8 +1901,16 @@ InflightBatchingStats Serialization::deserializeInflightBatchingStats(std::istre
     auto numCtxTokens = su::deserialize<SizeType32>(is);
     auto microBatchId = su::deserialize<SizeType32>(is);
     auto avgNumDecodedTokensPerIter = su::deserialize<float>(is);
+    auto numCtxKvTokens = su::deserialize<SizeType32>(is);
+    auto numGenKvTokens = su::deserialize<SizeType32>(is);
+    auto numQueuedContextRequests = su::deserialize<SizeType32>(is);
+    auto numQueuedCtxTokens = su::deserialize<SizeType32>(is);
+    auto numQueuedGenRequests = su::deserialize<SizeType32>(is);
+    auto numQueuedGenKvTokens = su::deserialize<SizeType32>(is);
+    auto numPausedKvTokens = su::deserialize<SizeType32>(is);
     return InflightBatchingStats{numScheduledRequests, numContextRequests, numGenRequests, numPausedRequests,
-        numCtxTokens, microBatchId, avgNumDecodedTokensPerIter};
+        numCtxTokens, microBatchId, avgNumDecodedTokensPerIter, numCtxKvTokens, numGenKvTokens,
+        numQueuedContextRequests, numQueuedCtxTokens, numQueuedGenRequests, numQueuedGenKvTokens, numPausedKvTokens};
 }
 
 void Serialization::serialize(InflightBatchingStats const& inflightBatchingStats, std::ostream& os)
@@ -1913,6 +1922,13 @@ void Serialization::serialize(InflightBatchingStats const& inflightBatchingStats
     su::serialize(inflightBatchingStats.numCtxTokens, os);
     su::serialize(inflightBatchingStats.microBatchId, os);
     su::serialize(inflightBatchingStats.avgNumDecodedTokensPerIter, os);
+    su::serialize(inflightBatchingStats.numCtxKvTokens, os);
+    su::serialize(inflightBatchingStats.numGenKvTokens, os);
+    su::serialize(inflightBatchingStats.numQueuedContextRequests, os);
+    su::serialize(inflightBatchingStats.numQueuedCtxTokens, os);
+    su::serialize(inflightBatchingStats.numQueuedGenRequests, os);
+    su::serialize(inflightBatchingStats.numQueuedGenKvTokens, os);
+    su::serialize(inflightBatchingStats.numPausedKvTokens, os);
 }
 
 size_t Serialization::serializedSize(InflightBatchingStats const& inflightBatchingStats)
@@ -1925,6 +1941,13 @@ size_t Serialization::serializedSize(InflightBatchingStats const& inflightBatchi
     totalSize += su::serializedSize(inflightBatchingStats.numCtxTokens);
     totalSize += su::serializedSize(inflightBatchingStats.microBatchId);
     totalSize += su::serializedSize(inflightBatchingStats.avgNumDecodedTokensPerIter);
+    totalSize += su::serializedSize(inflightBatchingStats.numCtxKvTokens);
+    totalSize += su::serializedSize(inflightBatchingStats.numGenKvTokens);
+    totalSize += su::serializedSize(inflightBatchingStats.numQueuedContextRequests);
+    totalSize += su::serializedSize(inflightBatchingStats.numQueuedCtxTokens);
+    totalSize += su::serializedSize(inflightBatchingStats.numQueuedGenRequests);
+    totalSize += su::serializedSize(inflightBatchingStats.numQueuedGenKvTokens);
+    totalSize += su::serializedSize(inflightBatchingStats.numPausedKvTokens);
     return totalSize;
 }
 

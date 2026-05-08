@@ -29,6 +29,8 @@ def chunk_gated_delta_rule_fwd(
     beta: torch.Tensor,
     scale: float,
     initial_state: torch.Tensor,
+    initial_state_indices: Optional[torch.Tensor],
+    inplace_indexed_state_update: bool,
     output_final_state: bool,
     cu_seqlens: Optional[torch.LongTensor] = None,
 ):
@@ -54,7 +56,9 @@ def chunk_gated_delta_rule_fwd(
         u=u,
         g=g,
         initial_state=initial_state,
+        initial_state_indices=initial_state_indices,
         output_final_state=output_final_state,
+        inplace_indexed_state_update=inplace_indexed_state_update,
         cu_seqlens=cu_seqlens,
     )
     o = chunk_fwd_o(
@@ -75,7 +79,7 @@ def chunk_gated_delta_rule_fwd(
 class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
 
     @staticmethod
-    @input_guard
+    @input_guard(exclude_args="initial_state")
     @autocast_custom_fwd
     def forward(
         ctx,
@@ -86,6 +90,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         beta: torch.Tensor,
         scale: float,
         initial_state: torch.Tensor,
+        initial_state_indices: Optional[torch.Tensor],
+        inplace_indexed_state_update: bool,
         output_final_state: bool,
         cu_seqlens: Optional[torch.LongTensor] = None,
         use_qk_l2norm_in_kernel: bool = False,
@@ -102,6 +108,8 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             beta=beta,
             scale=scale,
             initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            inplace_indexed_state_update=inplace_indexed_state_update,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
         )
@@ -117,6 +125,8 @@ def chunk_gated_delta_rule(
     beta: torch.Tensor,
     scale: float = None,
     initial_state: torch.Tensor = None,
+    initial_state_indices: Optional[torch.Tensor] = None,
+    inplace_indexed_state_update: bool = False,
     output_final_state: bool = False,
     cu_seqlens: Optional[torch.LongTensor] = None,
     head_first: bool = False,
@@ -141,6 +151,13 @@ def chunk_gated_delta_rule(
             Initial state of shape `[N, H, K, V]` for `N` input sequences.
             For equal-length input sequences, `N` equals the batch size `B`.
             Default: `None`.
+        initial_state_indices (Optional[torch.Tensor]):
+            Optional state-pool indices of shape `[N]` selecting the slots to
+            read from `initial_state`.
+        inplace_indexed_state_update (Optional[bool]):
+            Explicit opt-in for writing indexed final states back into
+            `initial_state` in-place. Callers are responsible for ensuring the
+            selected slots are safe to update without aliasing races.
         output_final_state (Optional[bool]):
             Whether to output the final state of shape `[N, H, K, V]`. Default: `False`.
         cu_seqlens (torch.LongTensor):
@@ -211,12 +228,18 @@ def chunk_gated_delta_rule(
             raise ValueError(
                 f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
                 f"Please flatten variable-length inputs before processing.")
-        if initial_state is not None and initial_state.shape[0] != len(
-                cu_seqlens) - 1:
+        num_sequences = len(cu_seqlens) - 1
+        if initial_state_indices is not None:
+            if initial_state_indices.shape[0] != num_sequences:
+                raise ValueError(
+                    f"The number of initial-state indices is expected to be equal to the number of input "
+                    f"sequences, i.e., {num_sequences} rather than {initial_state_indices.shape[0]}."
+                )
+        elif initial_state is not None and initial_state.shape[
+                0] != num_sequences:
             raise ValueError(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
-                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}."
-            )
+                f"i.e., {num_sequences} rather than {initial_state.shape[0]}.")
     if scale is None:
         scale = k.shape[-1]**-0.5
     o, final_state = ChunkGatedDeltaRuleFunction.apply(
@@ -227,6 +250,8 @@ def chunk_gated_delta_rule(
         beta,
         scale,
         initial_state,
+        initial_state_indices,
+        inplace_indexed_state_update,
         output_final_state,
         cu_seqlens,
         use_qk_l2norm_in_kernel,

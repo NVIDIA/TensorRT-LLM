@@ -20,6 +20,7 @@ def test_initialize_mrope_delta_cache_registers_state_resource():
     cm = CachedSequenceInterface(
         max_seq_len=8,
         max_batch_size=2,
+        max_num_tokens=18,
         device="cpu",
     )
     transform = InitializeMropeDeltaCache.from_kwargs(stage="cache_init")
@@ -52,8 +53,13 @@ def test_initialize_mrope_delta_cache_disabled_in_default_config():
 
 def test_qwen_registry_configs_explicitly_enable_mrope_delta_cache():
     config_dir = _repo_root() / "examples" / "auto_deploy" / "model_registry" / "configs"
-    for config_name in ("qwen3.5_moe_35b.yaml", "qwen3.5_moe_400b.yaml"):
+    # 35b enables mrope_delta_cache; 400b explicitly disables it (NVFP4 accuracy)
+    expected = {
+        "qwen3.5_moe_35b.yaml": True,
+        "qwen3.5_moe_400b.yaml": False,
+    }
+    for config_name, expected_enabled in expected.items():
         with open(config_dir / config_name) as f:
             config = yaml.safe_load(f)
 
-        assert config["transforms"]["initialize_mrope_delta_cache"]["enabled"] is True
+        assert config["transforms"]["initialize_mrope_delta_cache"]["enabled"] is expected_enabled

@@ -17,15 +17,13 @@ from typing import List, Tuple
 
 import torch
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import (
-    TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
-)
-from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import deserialize_mapping
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._torch.modules.fused_moe.routing import RoutingMethodType
-from tensorrt_llm._torch.utils import ActivationType
-from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.mapping import Mapping
+
+from ..._compat import ActivationType, is_sm_100f
+from ...utils.dist_config import DistConfig
+from ..quantization.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
 
 
 def _check_moe_alltoall(mapping_config: str, max_num_tokens: int) -> Tuple[Mapping | None, bool]:
@@ -36,10 +34,11 @@ def _check_moe_alltoall(mapping_config: str, max_num_tokens: int) -> Tuple[Mappi
     Returns:
         (mapping, enable_alltoall) — mapping is None when mapping_config is empty.
     """
-    mapping = deserialize_mapping(mapping_config) if mapping_config else None
-    enable_alltoall = (
-        mapping is not None and mapping.enable_attention_dp and mapping.moe_ep_size > 1
-    )
+    if not mapping_config:
+        return None, False
+    dc = DistConfig.deserialize(mapping_config)
+    mapping = dc.to_mapping()
+    enable_alltoall = dc.enable_attention_dp and dc.moe_ep_size > 1
     if enable_alltoall and max_num_tokens <= 0:
         raise ValueError("max_num_tokens must be > 0 when enable_alltoall is True")
     return mapping, enable_alltoall
@@ -401,12 +400,15 @@ def trtllm_moe_fused(
 
     activation_type = ActivationType.Swiglu
     if is_gated_mlp:
-        # Gated MLP uses Silu: silu(x @ w1.T) * (x @ w3.T)
+        # Gated MLP accepts either SiLU/SwiGLU or GELU/GEGLU style gating.
         if act_fn in [ActivationType.Silu, ActivationType.Swiglu]:
             activation_type = ActivationType.Swiglu
+        elif act_fn in [ActivationType.Gelu, ActivationType.Geglu]:
+            activation_type = ActivationType.Geglu
         else:
             raise ValueError(
-                f"Unsupported activation '{ActivationType(act_fn).name}' for gated_mlp. Use 'silu'."
+                f"Unsupported activation '{ActivationType(act_fn).name}' for gated_mlp. "
+                "Use 'silu' or 'gelu'."
             )
     else:
         # For non-gated MLP with ReLU^2
@@ -466,12 +468,22 @@ def trtllm_moe_fused_fake(
 
 
 def _validate_mlp_style_and_act_fn(is_gated_mlp: bool, act_fn: int) -> None:
-    assert (is_gated_mlp and act_fn in [ActivationType.Silu, ActivationType.Swiglu]) or (
-        not is_gated_mlp and act_fn in [ActivationType.Relu2, ActivationType.Silu]
-    ), (
+    assert (
+        is_gated_mlp
+        and act_fn
+        in [ActivationType.Silu, ActivationType.Swiglu, ActivationType.Gelu, ActivationType.Geglu]
+    ) or (not is_gated_mlp and act_fn in [ActivationType.Relu2, ActivationType.Silu]), (
         f"Unsupported combination: is_gated_mlp='{is_gated_mlp}', act_fn='{act_fn}'. "
-        f"Supported combinations: gated mlp with silu or mlp with relu2 or silu."
+        f"Supported combinations: gated mlp with silu or gelu, or mlp with relu2 or silu."
     )
+
+
+def _normalize_trtllm_act_fn(act_fn: int) -> int:
+    if act_fn == ActivationType.Silu:
+        return ActivationType.Swiglu
+    if act_fn == ActivationType.Gelu:
+        return ActivationType.Geglu
+    return act_fn
 
 
 @torch.library.custom_op("auto_deploy::trtllm_quant_fp8_moe_fused", mutates_args=())
@@ -521,7 +533,7 @@ def trtllm_quant_fp8_moe_fused(
     """
 
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
-    act_fn = ActivationType.Swiglu if act_fn == ActivationType.Silu else act_fn
+    act_fn = _normalize_trtllm_act_fn(act_fn)
 
     # Store original shape and flatten to 2D
     x_shape = x.shape
@@ -663,7 +675,7 @@ def trtllm_quant_nvfp4_moe_fused(
     assert fc2_weight_blockscale_fp8.ndim == 3, "fc2_weight_blockscale_fp8 must be 3D"
 
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
-    act_fn = ActivationType.Swiglu if act_fn == ActivationType.Silu else act_fn
+    act_fn = _normalize_trtllm_act_fn(act_fn)
 
     # quant_scales is described by this code:
     # https://github.com/NVIDIA/TensorRT-LLM/blob/c9771ebb997683c08b26bbba796a7fc6aff09d93/cpp/tensorrt_llm/thop/moeOp.cpp#L1015
@@ -798,7 +810,7 @@ def trtllm_quant_finegrained_fp8_moe_fused(
         Output tensor of shape (B, H) or (B, S, H)
     """
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
-    act_fn = ActivationType.Swiglu if act_fn == ActivationType.Silu else act_fn
+    act_fn = _normalize_trtllm_act_fn(act_fn)
 
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
@@ -934,6 +946,11 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
     apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
+    if act_fn in (ActivationType.Gelu, ActivationType.Geglu):
+        raise ValueError(
+            f"NVFP4 TRTLLM-Gen MoE does not support activation "
+            f"'{ActivationType(act_fn).name}'. Only Silu/Swiglu and Relu2 are supported."
+        )
 
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])

@@ -17,6 +17,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 
 
@@ -178,3 +179,207 @@ def test_getter_methods(mock_executor):
     assert mock_executor.get_expected_num_active_requests() == 5
     assert mock_executor._get_new_active_requests_queue_latency() == 10.5
     assert mock_executor.get_waiting_queue_size() == 1
+
+
+def _classify_termination(request, enable_partial_reuse_for_disagg, is_vswa, pp_size):
+    """Reproduce the termination logic from _handle_responses (py_executor.py).
+
+    Returns:
+        "terminate" | "stats_only" | "skip"
+    """
+    force_terminate_for_partial_reuse = (
+        enable_partial_reuse_for_disagg and not is_vswa and pp_size == 1
+    )
+    if request.is_disagg_context_complete_state:
+        return "stats_only"
+    elif force_terminate_for_partial_reuse:
+        return "terminate"
+    elif not request.is_disagg_context_transmission_state:
+        return "terminate"
+    return "skip"
+
+
+def _make_request(complete_state, transmission_state):
+    req = Mock()
+    req.is_disagg_context_complete_state = complete_state
+    req.is_disagg_context_transmission_state = transmission_state
+    return req
+
+
+class TestDisaggTerminationGuard:
+    """Verify _handle_responses does not double-terminate DISAGG_CONTEXT_COMPLETE
+    requests that were already cleaned up by _check_disagg_ctx_cache_transfer_status
+    (nvbug/5961736)."""
+
+    def test_normal_path_skips_context_complete(self):
+        """Without partial reuse, CONTEXT_COMPLETE goes to stats only."""
+        req = _make_request(complete_state=True, transmission_state=False)
+        assert _classify_termination(req, False, False, 1) == "stats_only"
+
+    def test_normal_path_skips_transmission_in_progress(self):
+        """Without partial reuse, TRANS_IN_PROGRESS is skipped (still in flight)."""
+        req = _make_request(complete_state=False, transmission_state=True)
+        assert _classify_termination(req, False, False, 1) == "skip"
+
+    def test_normal_path_terminates_regular_request(self):
+        """Without partial reuse, a normal finished request is terminated."""
+        req = _make_request(complete_state=False, transmission_state=False)
+        assert _classify_termination(req, False, False, 1) == "terminate"
+
+    def test_partial_reuse_terminates_non_complete(self):
+        """With partial reuse, non-CONTEXT_COMPLETE requests are terminated."""
+        for complete, transmission in [(False, True), (False, False)]:
+            req = _make_request(complete, transmission)
+            assert _classify_termination(req, True, False, 1) == "terminate"
+
+    def test_partial_reuse_skips_context_complete(self):
+        """With partial reuse, CONTEXT_COMPLETE still goes to stats only."""
+        req = _make_request(complete_state=True, transmission_state=False)
+        assert _classify_termination(req, True, False, 1) == "stats_only"
+
+    def test_partial_reuse_disabled_by_vswa(self):
+        """VSWA disables partial reuse path, falling back to normal logic."""
+        req = _make_request(complete_state=True, transmission_state=False)
+        assert _classify_termination(req, True, True, 1) == "stats_only"
+
+    def test_partial_reuse_disabled_by_pp(self):
+        """PP > 1 disables partial reuse path, falling back to normal logic."""
+        req = _make_request(complete_state=True, transmission_state=False)
+        assert _classify_termination(req, True, False, 2) == "stats_only"
+
+
+# ---------------------------------------------------------------------------
+# Tests for _compute_scheduled_tokens with KV cache reuse chunk-shift logic
+# ---------------------------------------------------------------------------
+
+
+def _make_ctx_request(
+    context_chunk_size,
+    context_remaining_length,
+    estimated_reusable_tokens=0,
+    is_first_context_chunk=True,
+    context_current_position=0,
+):
+    """Helper to create a mock context request for token computation tests."""
+    req = Mock()
+    req.context_chunk_size = context_chunk_size
+    req.context_remaining_length = context_remaining_length
+    req.estimated_reusable_tokens = estimated_reusable_tokens
+    req.is_first_context_chunk = is_first_context_chunk
+    req.context_current_position = context_current_position
+    return req
+
+
+def _make_gen_request(num_draft_tokens=0):
+    """Helper to create a mock generation request."""
+    req = Mock()
+    req.num_draft_tokens = num_draft_tokens
+    return req
+
+
+class TestComputeScheduledTokens:
+    """Tests for PyExecutor._compute_scheduled_tokens.
+
+    Validates the chunk-shift aware token accounting: setPrepopulatedPromptLen
+    shifts the chunk window right by the reused amount rather than shrinking it.
+    Non-last chunks cost chunkSize; only last chunks cost remaining - reusable.
+    """
+
+    def test_no_reuse(self):
+        """Without reuse, compute = chunk_size."""
+        ctx = [_make_ctx_request(context_chunk_size=100, context_remaining_length=100)]
+        assert PyExecutor._compute_scheduled_tokens(ctx, []) == 100
+
+    def test_last_chunk_with_reuse(self):
+        """Last chunk (reusable + chunk >= remaining): compute = chunk - reusable."""
+        # promptLen=100, reusable=60, chunk=100 (full context)
+        # 60 + 100 >= 100 → last chunk → compute = max(1, 100 - 60) = 40
+        ctx = [
+            _make_ctx_request(
+                context_chunk_size=100, context_remaining_length=100, estimated_reusable_tokens=60
+            )
+        ]
+        assert PyExecutor._compute_scheduled_tokens(ctx, []) == 40
+
+    def test_non_last_chunk_with_reuse(self):
+        """Non-last chunk (reusable + chunk < remaining): compute = chunk_size.
+
+        This is the core chunk-shift scenario. The old formula would compute
+        max(0, 25 - 30) = 0, but the correct cost is 25 because the chunk
+        window shifts right rather than shrinking.
+        """
+        # promptLen=100, reusable=30, chunk=25
+        # 30 + 25 = 55 < 100 → non-last chunk → compute = 25
+        ctx = [
+            _make_ctx_request(
+                context_chunk_size=25, context_remaining_length=100, estimated_reusable_tokens=30
+            )
+        ]
+        assert PyExecutor._compute_scheduled_tokens(ctx, []) == 25
+
+    def test_non_first_chunk_ignores_reuse(self):
+        """Reusable tokens only apply to the first context chunk."""
+        ctx = [
+            _make_ctx_request(
+                context_chunk_size=50,
+                context_remaining_length=50,
+                estimated_reusable_tokens=30,
+                is_first_context_chunk=False,
+            )
+        ]
+        assert PyExecutor._compute_scheduled_tokens(ctx, []) == 50
+
+    def test_v2_scheduler_position_advanced(self):
+        """V2 scheduler: context_current_position already advanced past reuse.
+
+        reusable_in_chunk = max(0, 30 - 30) = 0 → no credit → compute = chunk.
+        """
+        ctx = [
+            _make_ctx_request(
+                context_chunk_size=50,
+                context_remaining_length=70,
+                estimated_reusable_tokens=30,
+                context_current_position=30,
+            )
+        ]
+        assert PyExecutor._compute_scheduled_tokens(ctx, []) == 50
+
+    def test_min_compute_is_one(self):
+        """Compute cost is floored at 1 even when reusable >= chunk_size."""
+        # chunk=10, remaining=10, reusable=15 → last chunk → max(1, 10-15) = 1
+        ctx = [
+            _make_ctx_request(
+                context_chunk_size=10, context_remaining_length=10, estimated_reusable_tokens=15
+            )
+        ]
+        assert PyExecutor._compute_scheduled_tokens(ctx, []) == 1
+
+    def test_generation_tokens(self):
+        """Generation requests contribute 1 + num_draft_tokens each."""
+        gen = [_make_gen_request(3), _make_gen_request(0)]
+        assert PyExecutor._compute_scheduled_tokens([], gen) == (1 + 3) + (1 + 0)
+
+    def test_mixed_context_and_generation(self):
+        """Combined context (with chunk-shift) and generation tokens."""
+        # Non-last chunk: compute = 25
+        ctx = [
+            _make_ctx_request(
+                context_chunk_size=25, context_remaining_length=100, estimated_reusable_tokens=30
+            )
+        ]
+        gen = [_make_gen_request(2)]
+        # 25 ctx + (1 + 2) gen = 28
+        assert PyExecutor._compute_scheduled_tokens(ctx, gen) == 28
+
+    def test_multiple_ctx_requests_mixed_chunks(self):
+        """Multiple context requests: one non-last chunk, one last chunk."""
+        # req0: non-last chunk → compute = 20
+        req0 = _make_ctx_request(
+            context_chunk_size=20, context_remaining_length=100, estimated_reusable_tokens=30
+        )
+        # req1: last chunk (reuse=10, chunk=50, remaining=50) → 10+50>=50
+        # → compute = max(1, 50-10) = 40
+        req1 = _make_ctx_request(
+            context_chunk_size=50, context_remaining_length=50, estimated_reusable_tokens=10
+        )
+        assert PyExecutor._compute_scheduled_tokens([req0, req1], []) == 20 + 40

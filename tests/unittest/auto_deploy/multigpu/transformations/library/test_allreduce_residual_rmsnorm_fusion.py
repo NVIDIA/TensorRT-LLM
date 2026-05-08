@@ -3,6 +3,7 @@
 import pytest
 import torch
 from _dist_test_utils import get_device_counts
+from torch.distributed import DistNetworkError
 from torch.export import export
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.distributed.trtllm_dist import (
@@ -150,18 +151,36 @@ def _test_allreduce_fusion(port: int, ModuleCls, strategy: str):
     ids=["strategy_auto", "strategy_nccl", "strategy_oneshot"],
 )
 def test_allreduce_fusion(device_count, ModuleCls, strategy):
+    # Test the allreduce, residual, and rmsnorm fusion.
+    # MpiPoolSession is required because the test exercises trtllm's MPI-mode allreduce ops,
+    # which only activate when is_ompi() is true.
     if device_count <= 1:
         pytest.skip("Require multi GPUs to run test_allreduce_fusion.")
-    port = get_free_port()
 
     n_workers = device_count
-    mpi_pool = MpiPoolSession(n_workers=n_workers)
-    try:
-        mpi_pool.submit_sync(
-            _test_allreduce_fusion,
-            port=port,
-            ModuleCls=ModuleCls,
-            strategy=strategy,
-        )
-    finally:
-        mpi_pool.shutdown()
+    # Retry on EADDRINUSE: there is a Time-of-check-to-time-of-use (TOCTOU) race between get_free_port() in
+    # the parent and dist.init_process_group("nccl") in the workers. The
+    # spawn_multiprocess_job path handles this internally; the MpiPoolSession
+    # path used here does not, so retry with a fresh port and pool.
+    max_retries = 5
+    last_exc: Exception | None = None
+    for attempt in range(max_retries):
+        port = get_free_port()
+        mpi_pool = MpiPoolSession(n_workers=n_workers)
+        try:
+            mpi_pool.submit_sync(
+                _test_allreduce_fusion,
+                port=port,
+                ModuleCls=ModuleCls,
+                strategy=strategy,
+            )
+            return
+        except DistNetworkError as e:
+            last_exc = e
+            if "EADDRINUSE" not in str(e) and "address already in use" not in str(e).lower():
+                raise
+        finally:
+            mpi_pool.shutdown()
+    raise RuntimeError(
+        f"Failed to initialize distributed group after {max_retries} attempts due to repeated port conflicts"
+    ) from last_exc

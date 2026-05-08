@@ -13,12 +13,18 @@ from transformers.modeling_outputs import CausalLMOutput, MoeModelOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.tokenization_utils_base import BatchEncoding
 
-from tensorrt_llm._torch.utils import ActivationType
-from tensorrt_llm.inputs.content_format import ContentFormat
-from tensorrt_llm.inputs.registry import (
-    MULTIMODAL_PLACEHOLDER_REGISTRY,
-    MultimodalPlaceholderMetadata,
-)
+from ..._compat import ActivationType
+
+try:
+    from tensorrt_llm.inputs.content_format import ContentFormat
+    from tensorrt_llm.inputs.registry import (
+        MULTIMODAL_PLACEHOLDER_REGISTRY,
+        MultimodalPlaceholderMetadata,
+    )
+except ModuleNotFoundError:
+    ContentFormat = None
+    MULTIMODAL_PLACEHOLDER_REGISTRY = None
+    MultimodalPlaceholderMetadata = None
 
 from ..nemotron_flash import NemotronFlashForCausalLMFactory
 
@@ -1039,7 +1045,7 @@ class TruncatedLinear(nn.Linear):
 
 
 class NemotronFlashForCausalLM(NemotronFlashPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config, **kwargs):
         super().__init__(config)
@@ -1107,7 +1113,8 @@ NemotronFlashForCausalLMFactory.register_custom_model_cls(
     "NemotronFlashConfig", NemotronFlashForCausalLM
 )
 # The custom tokenizer's chat template expects plain strings, not OpenAI-style content dicts.
-MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
-    "nemotron_flash",
-    MultimodalPlaceholderMetadata(content_format=ContentFormat.PASSTHROUGH),
-)
+if MULTIMODAL_PLACEHOLDER_REGISTRY is not None:
+    MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
+        "nemotron_flash",
+        MultimodalPlaceholderMetadata(content_format=ContentFormat.PASSTHROUGH),
+    )

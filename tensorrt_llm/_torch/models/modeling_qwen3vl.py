@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN as HF_ACT2FN
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
@@ -43,6 +44,7 @@ from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (
+    bypass_processor_output_validation,
     find_input_mm_embeds,
     fuse_input_embeds,
     get_multimodal_embeddings,
@@ -256,6 +258,39 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
 
             return position_ids, mrope_position_deltas
 
+    def get_num_tokens_per_video(
+        self,
+        *,
+        video: List[Image.Image],
+        video_grid_thw: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> int:
+        merge = self.config.vision_config.spatial_merge_size
+        if video_grid_thw is not None:
+            t, h, w = (int(x) for x in video_grid_thw)
+            return t * (h // merge) * (w // merge)
+
+        # Must run the full processor: HF's Qwen3VLProcessor._get_num_multimodal_tokens
+        # (what the base class default delegates to) raises on video-only calls
+        # and returns a wrong-formula fallback that would break chunked prefill.
+        do_rescale = not (video and isinstance(video[0], torch.Tensor))
+        processed = self._processor(
+            text=["<|vision_start|><|video_pad|><|vision_end|>"],
+            videos=[video],
+            padding=True,
+            do_rescale=do_rescale,
+            return_tensors="pt",
+            **kwargs,
+        )
+        vgt = processed.get("video_grid_thw")
+        if vgt is None or len(vgt) == 0:
+            raise RuntimeError(
+                "get_num_tokens_per_video: HF processor returned no "
+                "video_grid_thw for the provided video."
+            )
+        t, h, w = (int(x) for x in vgt[0].tolist())
+        return t * (h // merge) * (w // merge)
+
     def _preprocess(
         self, text: Dict[str, Any], mm_data: Dict[str, Any], mm_processor_kwargs: Dict[str, Any]
     ):
@@ -270,15 +305,24 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
             do_rescale = False
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
-        return self.processor(
-            text=[text],
-            images=images,
-            videos=videos,
-            padding=True,
-            do_rescale=do_rescale,
-            return_tensors="pt",
-            **mm_processor_kwargs,
-        )
+        # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly
+        # validates per-modality kwargs against the processor's TypedDict.
+        # Processor *output* keys (``video_grid_thw``, ``pixel_values``, ...)
+        # round-trip into the validator via tokenizer ``init_kwargs`` /
+        # ``model_input_names`` and trip it with ``TypeError:
+        # merged_typed_dict.__init__() got an unexpected keyword argument
+        # 'video_grid_thw'``. Bypass the validator for our known output keys
+        # for the duration of the processor call.
+        with bypass_processor_output_validation():
+            return self.processor(
+                text=[text],
+                images=images,
+                videos=videos,
+                padding=True,
+                do_rescale=do_rescale,
+                return_tensors="pt",
+                **mm_processor_kwargs,
+            )
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
         masks = (input_ids == self.config.image_token_id) | (
@@ -903,6 +947,16 @@ class Qwen3VisionModelBase(nn.Module):
 
 
 class Qwen3VLModelBase(PreTrainedModel):
+    def _check_and_adjust_experts_implementation(self, *args, **kwargs):
+        """No-op override.
+
+        Transformers 5.x's ``PreTrainedModel.__init__`` calls this method
+        (with an ``experts_implementation`` argument) which fails for VL
+        wrapper models that do not directly contain MoE layers.  TRT-LLM
+        manages expert implementations independently, so skip the check.
+        """
+        return None
+
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
@@ -912,7 +966,12 @@ class Qwen3VLModelBase(PreTrainedModel):
         self.original_arch = model_config.pretrained_config.architectures[0]
 
         disable_fuse_rope = kwargs.get("disable_fuse_rope", False)
+        model_config.pretrained_config.disable_fuse_rope = disable_fuse_rope
         model_config.pretrained_config.text_config.disable_fuse_rope = disable_fuse_rope
+        # In transformers 5.x, rope_scaling may delegate to rope_parameters which
+        # can be None.  Ensure the dict exists before setting the type key.
+        if model_config.pretrained_config.text_config.rope_scaling is None:
+            model_config.pretrained_config.text_config.rope_scaling = {}
         model_config.pretrained_config.text_config.rope_scaling["type"] = "mrope"
         config = model_config.pretrained_config
 
@@ -951,6 +1010,10 @@ class Qwen3VLModelBase(PreTrainedModel):
         # use llm.config as config for pytorch model engine
         self.model_config.pretrained_config = self.llm.config
         self.config = self.model_config.pretrained_config
+
+    @property
+    def vocab_size_padded(self) -> int:
+        return self.llm.vocab_size_padded
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()

@@ -12,11 +12,11 @@ from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_availab
 from utils.util import skip_pre_blackwell, skip_pre_hopper
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy._compat import ActivationType
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale
-from tensorrt_llm._torch.utils import ActivationType
 
 
 class BlockSparseTop2MLP(nn.Module):

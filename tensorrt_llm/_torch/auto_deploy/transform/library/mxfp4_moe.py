@@ -4,13 +4,9 @@ import torch
 import torch.nn as nn
 from torch.fx import GraphModule, Node
 
-from tensorrt_llm._torch.auto_deploy.utils.pattern_matcher import (
-    ADPatternMatcherPass,
-    register_ad_pattern,
-)
-
 from ...utils.module import get_submodule_of_param
 from ...utils.node_utils import is_op
+from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import BaseTransform, TransformInfo, TransformRegistry
 
 
@@ -94,6 +90,7 @@ class MatchMOEDenseMLP(BaseTransform):
         op_ignore_types = {
             torch.ops.aten.view.default: (int,),
             torch.ops.aten.reshape.default: (int,),
+            torch.ops.auto_deploy.view.default: (int,),
             torch.ops.aten.repeat.default: (int,),
             torch.ops.aten.slice.Tensor: (int,),
             torch.ops.aten.unsqueeze.default: (int,),

@@ -189,6 +189,8 @@ def setup_kv_and_metadata(
         mapping=mapping,
         dtype=str_dtype_to_binding(torch_dtype_to_str(scenario.kv_cache_dtype)),
     )
+    requests = []
+    request_infos = []
     for req_id in range(scenario.batch):
         req = LlmRequest(
             request_id=req_id,
@@ -199,8 +201,10 @@ def setup_kv_and_metadata(
         )
         req.is_dummy_request = True
         req.paged_kv_block_ids = []
-        beam_width = 1
-        kv_cache_manager.impl.add_sequence(req_id, ctx_len_per_gpu, beam_width, req)
+        requests.append(req)
+        request_infos.append((req_id, ctx_len_per_gpu, 1))
+    kv_cache_manager.impl.add_sequence_batch(request_infos, requests)
+    for req in requests:
         req.state = LlmRequestState.GENERATION_IN_PROGRESS
         req.prompt_len = ctx_len_per_gpu
         req.py_prompt_len = req.prompt_len

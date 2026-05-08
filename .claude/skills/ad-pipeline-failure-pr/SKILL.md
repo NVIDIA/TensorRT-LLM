@@ -1,6 +1,13 @@
 ---
 name: ad-pipeline-failure-pr
-description: Analyze the latest AutoDeploy pipeline or a user-specified pipeline ID, inspect failed job logs, group similar failures into actionable root-cause buckets, and create at most one PR per bucket. Use when the user mentions pipeline IDs, failed jobs, GitLab logs, failure buckets, or opening PRs from CI failures.
+description: >
+  Analyze the latest AutoDeploy pipeline or a user-specified pipeline ID, inspect failed job logs,
+  group similar failures into actionable root-cause buckets, and create at most one PR per bucket.
+  Use when the user mentions pipeline IDs, failed jobs, GitLab logs, failure buckets, or opening
+  PRs from CI failures.
+license: Apache-2.0
+metadata:
+  author: NVIDIA Corporation
 ---
 
 # Pipeline Failure PR

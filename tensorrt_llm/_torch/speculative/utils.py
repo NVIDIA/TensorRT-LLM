@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
 
+from tensorrt_llm.logger import logger
+
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
@@ -11,12 +13,15 @@ from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
 from ..speculative.interface import SpecMetadata
+from .dflash import DFlashSpecMetadata, DFlashWorker
 from .draft_target import (DraftTargetOneModelSampler,
                            DraftTargetOneModelSpecMetadata,
                            DraftTargetOneModelWorker)
-from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
+from .eagle3 import (Eagle3OneModelDynamicTreeResourceManager,
+                     Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
                      Eagle3OneModelWorker, Eagle3ResourceManager,
                      Eagle3SpecMetadata)
+from .eagle3_dynamic_tree import Eagle3OneModelDynamicTreeWorker
 from .model_drafter import ModelDrafter
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
@@ -40,7 +45,7 @@ def get_spec_metadata(spec_config,
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
             spec_dec_mode=spec_config.spec_dec_mode,
-            mtp_num_modules=spec_config.num_nextn_predict_layers,
+            mtp_num_modules=spec_config.max_draft_len,
             max_num_requests=max_num_requests,
             mtp_hidden_states_manager=spec_resource_manager,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
@@ -91,6 +96,8 @@ def get_spec_metadata(spec_config,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
             spec_resource_manager=spec_resource_manager,
+            use_dynamic_tree=spec_config.use_dynamic_tree,
+            eagle_choices=spec_config.eagle_choices,
         )
     if spec_config.spec_dec_mode.is_pard():
         return PARDSpecMetadata(
@@ -100,6 +107,19 @@ def get_spec_metadata(spec_config,
             max_num_requests=max_num_requests,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
             spec_resource_manager=spec_resource_manager,
+        )
+    if spec_config.spec_dec_mode.is_dflash():
+        target_layer_ids = getattr(spec_config, 'target_layer_ids', None)
+        return DFlashSpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+            allow_advanced_sampling=spec_config.allow_advanced_sampling,
+            layers_to_capture=target_layer_ids,
+            hidden_size=model_config.hidden_size,
+            max_num_tokens=max_num_tokens,
+            dtype=model_config.torch_dtype,
         )
     if spec_config.spec_dec_mode.is_draft_target_one_model():
         return DraftTargetOneModelSpecMetadata(
@@ -182,6 +202,10 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_num_requests,
             sa_manager=sa_manager,
         )
+    if spec_dec_mode.is_eagle3_one_model() and getattr(
+            spec_config, 'use_dynamic_tree', False):
+        return Eagle3OneModelDynamicTreeResourceManager(spec_config,
+                                                        max_num_requests)
     if spec_dec_mode.is_eagle3_one_model():
         sa_manager = None
         sa_cfg = getattr(spec_config, 'sa_config', None)
@@ -217,7 +241,7 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_num_requests,
             max_num_tokens,
         )
-    if spec_dec_mode.is_pard():
+    if spec_dec_mode.is_parallel_draft():
         sa_cfg = getattr(spec_config, 'sa_config', None)
         if sa_cfg is not None:
             return SuffixAutomatonManager(sa_cfg, max_num_requests, max_seq_len)
@@ -237,15 +261,14 @@ def get_spec_decoder(
     spec_config: "DecodingBaseConfig",
 ):
     if spec_config.spec_dec_mode.is_mtp_one_model():
-        return MTPSampler(sampler_args,
-                          nextn=spec_config.num_nextn_predict_layers)
+        return MTPSampler(sampler_args, nextn=spec_config.max_draft_len)
     if spec_config.spec_dec_mode.is_eagle3(
     ) or spec_config.spec_dec_mode.is_mtp_eagle():
         # TorchSampler handles Eagle3 gracefully, by integrating d2t into the sampling process
         return TorchSampler(sampler_args)
     if spec_config.spec_dec_mode.is_eagle3_one_model():
-        return Eagle3OneModelSampler(sampler_args)
-    if spec_config.spec_dec_mode.is_pard():
+        return Eagle3OneModelSampler(sampler_args, spec_config=spec_config)
+    if spec_config.spec_dec_mode.is_parallel_draft():
         return MTPSampler(sampler_args,
                           nextn=spec_config.tokens_per_gen_step - 1)
     if spec_config.spec_dec_mode.is_sa():
@@ -307,10 +330,15 @@ def get_spec_worker(spec_config,
         return MTPEagleWorker(spec_config, model_config,
                               use_separate_draft_kv_cache)
     if spec_dec_mode.is_eagle3_one_model():
+        if getattr(spec_config, 'use_dynamic_tree', False):
+            return Eagle3OneModelDynamicTreeWorker(spec_config, mapping,
+                                                   use_separate_draft_kv_cache)
         return Eagle3OneModelWorker(spec_config, mapping,
                                     use_separate_draft_kv_cache)
     if spec_dec_mode.is_pard():
         return PARDWorker(spec_config, mapping, use_separate_draft_kv_cache)
+    if spec_dec_mode.is_dflash():
+        return DFlashWorker(spec_config, mapping, use_separate_draft_kv_cache)
     if spec_dec_mode.is_sa():
         return SAWorker(spec_config, model_config)
     if spec_dec_mode.is_draft_target_one_model():
@@ -347,11 +375,32 @@ def get_draft_kv_cache_manager(spec_config, resource_manager):
 
 
 def update_spec_config_from_model_config(spec_config, model_config):
-    if spec_config.spec_dec_mode.is_mtp_one_model():
-        # Use `max_draft_len` for several low-level APIs. TODO: Remove this after distinguishing them.
-        spec_config.max_draft_len = spec_config.num_nextn_predict_layers
-        # Use `num_nextn_predict_layers_from_model_config` to decide decoding mode MTP / MTP_EAGLE.
-        spec_config.num_nextn_predict_layers_from_model_config = model_config.num_nextn_predict_layers
+    from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+    if not isinstance(spec_config, MTPDecodingConfig):
+        return
+    # Read num_nextn_predict_layers from the model's pretrained config.
+    # This determines the actual MTP layer count in the checkpoint and drives
+    # the spec_dec_mode decision (EAGLE vs vanilla MTP).
+    spec_config.num_nextn_predict_layers = model_config.num_nextn_predict_layers
+    # For vanilla MTP (>1 MTP layers in the checkpoint): set max_draft_len to the
+    # minimum of the user-requested value and the model's layer count.
+    # If the user explicitly requested fewer draft tokens than the model has layers,
+    # honour that and warn. Otherwise default to using all model layers.
+    if spec_config.spec_dec_mode.is_mtp_vanilla():
+        model_layers = spec_config.num_nextn_predict_layers
+        user_set = 'max_draft_len' in spec_config.model_fields_set
+        if user_set and spec_config.max_draft_len < model_layers:
+            logger.warning(
+                f"MTP: max_draft_len ({spec_config.max_draft_len}) is less than the model's "
+                f"num_nextn_predict_layers ({model_layers}). "
+                f"Using max_draft_len={spec_config.max_draft_len} draft tokens."
+            )
+            # Keep the user-set max_draft_len as-is
+        else:
+            spec_config.max_draft_len = model_layers
+        spec_config.max_total_draft_tokens = spec_config.max_draft_len
+    # For Eagle MTP (1 MTP layer): max_draft_len controls how many times the
+    # single layer is run. It was already set by the user (defaults to 1).
 
 
 @dataclass

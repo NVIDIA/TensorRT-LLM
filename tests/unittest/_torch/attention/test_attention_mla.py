@@ -639,7 +639,8 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
             assert success, f"Failed to resume KV cache for request {req_id}"
             kv_cache.capacity = ctx_len
         else:
-            kv_cache_manager.impl.add_sequence(req_id, ctx_len, beam_width, req)
+            kv_cache_manager.impl.add_sequence_batch(
+                [(req_id, ctx_len, beam_width)], [req])
     attn_metadata = AttentionCls.Metadata(
         seq_lens=torch.tensor(context_sequence_lengths, dtype=torch.int),
         request_ids=list(range(len(context_sequence_lengths))),

@@ -270,8 +270,6 @@ class PyResult:
         generation_logits_list: list[torch.Tensor] = field(default_factory=list)
         reset_log_probs: tuple[list[TokenLogprobs],
                                list[float] | None] | None = None
-        log_probs_list: list[tuple[list[TokenLogprobs], list[float]
-                                   | None]] = field(default_factory=list)
         mm_embeddings: list[dict[str, Any] | None] = None
         mrope_position_ids: dict[str, Any] | None = None
         mrope_position_deltas: dict[str, Any] | None = None
@@ -349,9 +347,6 @@ class PyResult:
                 self._generation_logits.append(generation_logits)
         if diff.reset_log_probs is not None:
             self._log_probs.set_log_probs(*diff.reset_log_probs)
-        if len(diff.log_probs_list) > 0:
-            for log_probs, cum_log_probs in diff.log_probs_list:
-                self._log_probs.append(log_probs, cum_log_probs)
         if diff.mm_embeddings is not None:
             self._mm_embeddings = diff.mm_embeddings
         if diff.mrope_position_ids is not None:
@@ -386,17 +381,20 @@ class PyResult:
                          cum_log_probs: Optional[list[float]] = None):
         if self._log_probs:
             self._log_probs.append(log_probs, cum_log_probs)
-            self.diff.log_probs_list.append((log_probs, cum_log_probs))
 
     def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
                              multimodal_lengths: List[int]):
-        """Split concatenated embeddings by multimodal_lengths and create handles for each.
+        """Split concatenated embeddings by per-item lengths and create handles.
 
         Args:
-            mm_embeddings: Concatenated multimodal embeddings tensor of shape [total_tokens, hidden_dim]
-            multimodal_lengths: List of token lengths for each multimodal item
+            mm_embeddings: Concatenated multimodal embeddings tensor of shape
+                [total_tokens, hidden_dim].
+            multimodal_lengths: Current per-item split lengths.
         """
-        # Split the concatenated tensor by lengths to get per-item embeddings
+        # TODO(TRTLLM-12175): callers currently pass request.multimodal_lengths,
+        # a prompt-side MM-token count that may include non-embedding
+        # special/framing tokens. This split needs per-item encoder-output
+        # embedding lengths instead.
         split_embeddings = torch.split(mm_embeddings, multimodal_lengths, dim=0)
 
         # Create a SharedTensorContainer handle for each split
@@ -447,7 +445,6 @@ class PyResult:
         if self._log_probs:
             self._log_probs.set_log_probs(log_probs, cum_log_probs)
             self.diff.reset_log_probs = (log_probs, cum_log_probs)
-            self.diff.log_probs_list.clear()
 
     @property
     def context_logits(self) -> torch.Tensor | None:

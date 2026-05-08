@@ -32,9 +32,9 @@ Python and C++ codebase supporting TensorRT engine-based and PyTorch-based execu
 ### Installation & Build
 
 Building TensorRT-LLM requires Docker and may involve compiling C++ components.
-See [build from source](docs/source/installation/build-from-source-linux.md) for full instructions,
-or [pip install](docs/source/installation/linux.md) for pre-built wheels.
-For container images, see [NGC containers](docs/source/installation/containers.md).
+See the [Installation Guide](docs/source/installation/installation-guide.md) for pre-built release containers and pip install,
+[build from source](docs/source/installation/build-from-source.md) for development builds,
+and [Container Images](docs/source/installation/containers.md) for information about the container images.
 
 ### Reference Configs
 
@@ -83,6 +83,7 @@ HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy/TensorRT)
 | `tensorrt_llm/executor/executor.py` | Execution abstraction (`GenerationExecutor`) |
 | `tensorrt_llm/models/automodel.py` | Auto-discovery and model registry |
 | `tensorrt_llm/_torch/models/` | PyTorch backend model implementations (distinct from `models/` used by TensorRT backend) |
+| `tensorrt_llm/_torch/modules/ATTENTION_DEVELOPER_GUIDE.md` | Attention, MLA, backend families, sparse backends, metadata contracts, and KV-cache behavior - **read before modifying `tensorrt_llm/_torch/modules/attention.py` or `tensorrt_llm/_torch/attention_backend/`** |
 | `tensorrt_llm/_torch/modules/fused_moe/MOE_DEVELOPER_GUIDE.md` | MoE architecture, backends, communication, development patterns — **read before modifying MoE code** |
 | `CODING_GUIDELINES.md` | C++ and Python coding standards (referenced throughout, must read before contributing) |
 
@@ -123,6 +124,14 @@ HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy/TensorRT)
    - Target `main` unless fixing a release branch bug
    - See `CONTRIBUTING.md` for full PR policies
 
+### GitHub CLI authentication (`GH_CONFIG_DIR`)
+
+The `gh` CLI uses `~/.config/gh` by default for authentication. Different GitHub hosts or forks may require a different config directory. **Before running any `gh` command** (e.g., `gh pr create`, `gh api`, `gh pr comment`):
+
+1. Check if the user has specified a custom `GH_CONFIG_DIR` (e.g., in `CLAUDE.local.md` or environment). If so, use it.
+2. If not explicitly set, **ask the user** whether the default `~/.config/gh` is correct or if a different directory should be used. This is especially relevant when the PR target is a fork (e.g., `nv-auto-deploy/TensorRT-LLM`) rather than `NVIDIA/TensorRT-LLM`.
+3. Prefix all `gh` commands with the resolved config dir: `GH_CONFIG_DIR=<path> gh ...`
+
 ## CI / Testing
 
 See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
@@ -148,6 +157,10 @@ For a full list of up-to-date bot commands, post `/bot help` as a PR comment and
 ### Retrieving CI Test Failures from a PR
 
 See the CI failure retrieval skill (`.claude/skills/ci-failure-retrieval/SKILL.md`) for step-by-step scripts to query Jenkins test results via the API.
+
+### Trouble Shooting
+
+- Use `TLLM_LOG_LEVEL_BY_MODULE` to enable per-module log filtering (e.g., `"debug:_torch,runtime;info:serve"`); see [Module-Level Logging](docs/source/developer-guide/overview.md#module-level-logging) for details.
 
 ## Key Documentation
 

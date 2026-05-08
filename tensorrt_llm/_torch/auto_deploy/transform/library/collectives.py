@@ -13,6 +13,7 @@ from torch.fx import GraphModule
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils.logger import ad_logger
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
@@ -105,13 +106,6 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        # Collectives fusion depends on sharding (reads _sharding_transform_container).
-        # Draft models are not sharded, so skip them.
-        if getattr(gm, "is_draft", False):
-            return gm, TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
-
         patterns = ADPatternMatcherPass()
 
         # Dummy shapes for tracing
@@ -129,8 +123,23 @@ class FuseAllreduceResidualRMSNorm(BaseTransform):
         # Instantiate Pattern Functions
         # ============================================================================
 
-        # Get the allreduce strategy from shared_config
-        strategy = gm._sharding_transform_container.config.allreduce_strategy.name
+        if shared_config.dist_config is not None:
+            # Primary production path: DistConfig built by LlmArgs.init_dist_config
+            # with allreduce_strategy populated from YAML.
+            strategy = shared_config.dist_config.allreduce_strategy
+        elif hasattr(gm, "_sharding_transform_container"):
+            # Legacy fallback: entered only by external invocations that construct
+            # InferenceOptimizer without a dist_config kwarg (e.g.
+            # tests/unittest/auto_deploy/multigpu/transformations/library/
+            # test_allreduce_residual_rmsnorm_fusion.py). Will be removed together
+            # with the legacy sharding pipeline (sharding.py).
+            strategy = gm._sharding_transform_container.config.allreduce_strategy.name
+        else:
+            ad_logger.warning("No dist config found, skipping allreduce-residual-rmsnorm fusion")
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+        ad_logger.info(f"allreduce strategy selected = {strategy!r}")
 
         # TRT-LLM backend (MPI mode) - two patterns for different addition orders
         _allreduce_residual_rmsnorm_pattern_trtllm = _make_allreduce_residual_rmsnorm_pattern(

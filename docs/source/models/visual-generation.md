@@ -30,6 +30,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 | `Wan-AI/Wan2.1-I2V-14B-720P-Diffusers` | Image-to-Video |
 | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | Text-to-Video |
 | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Image-to-Video |
+| `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Text-to-Video, Image-to-Video |
 | `Lightricks/LTX-2` | Text-to-Video (with Audio), Image-to-Video (with Audio) |
 
 Models are auto-detected from the checkpoint directory. Diffusers-format models are detected via `model_index.json`; LTX-2 monolithic safetensors checkpoints are detected via embedded metadata. The `AutoPipeline` registry selects the appropriate pipeline class automatically.

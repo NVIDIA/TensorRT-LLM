@@ -15,6 +15,7 @@
 
 from typing import Optional, Union
 
+from ..._utils import get_hf_rope_theta
 from ...mapping import Mapping
 from ..convert_utils import infer_dtype
 from ..modeling_utils import PretrainedConfig, QuantConfig
@@ -64,7 +65,7 @@ class PhiConfig(PretrainedConfig):
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
                                       hf_config.num_attention_heads)
         rotary_scaling = getattr(hf_config, "rope_scaling", None)
-        rotary_base = getattr(hf_config, "rope_theta", 10000.0)
+        rotary_base = get_hf_rope_theta(hf_config, 10000.0)
         dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
 
         return cls(architecture=hf_config.architectures[0],

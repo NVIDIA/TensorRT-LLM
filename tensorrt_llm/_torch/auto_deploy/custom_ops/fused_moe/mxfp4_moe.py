@@ -172,6 +172,7 @@ def triton_mxfp4_moe(
     down_blocks: torch.Tensor,  # [E, H, I//32, 16] in uint8
     down_bias: torch.Tensor,  # [E, H]
     down_scales: torch.Tensor,  # [E, H, I//32] in uint8
+    layer_type: str = "moe",
 ) -> torch.Tensor:
     def _global_route_fn(logits: torch.Tensor):
         # routing() removed in triton_kernels 3.6.0
@@ -208,6 +209,7 @@ def _mxfp4_mlp_fake(
     down_blocks: torch.Tensor,
     down_bias: torch.Tensor,
     down_scales: torch.Tensor,
+    layer_type: str = "moe",
 ):
     return torch.empty_like(hidden_states)
 
@@ -231,6 +233,7 @@ def triton_mxfp4_moe_ep(
     # EP topology
     ep_size: int,
     ep_rank: int,
+    layer_type: str = "moe",
 ) -> torch.Tensor:
     triton_ep_router = TritonEPRouter()
 
@@ -269,5 +272,6 @@ def _mxfp4_mlp_ep_fake(
     down_scales: torch.Tensor,
     ep_size: int,
     ep_rank: int,
+    layer_type: str = "moe",
 ):
     return torch.empty_like(hidden_states)

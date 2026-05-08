@@ -6,17 +6,98 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tupl
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from pydantic import Field
 
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.llmapi.utils import StrictBaseModel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from .cache import CacheDiTAccelerator, TeaCacheAccelerator
+from .checkpoints import WeightLoader
 from .config import PipelineComponent
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
-from .teacache import TeaCacheBackend
+
+
+class ExtraParamSchema(StrictBaseModel):
+    """Schema for a model-specific extra parameter.
+
+    Returned by ``VisualGen.extra_param_specs`` so callers can
+    discover which ``extra_params`` keys are valid for the loaded pipeline.
+    """
+
+    type: str = Field(description="Python type name (e.g. 'float', 'int', 'bool').")
+    default: Any = Field(default=None, description="Default value used when omitted.")
+    description: str = Field(default="", description="Human-readable description.")
+    range: Optional[tuple] = Field(
+        default=None, description="Optional (min, max) range for numeric params."
+    )
+
+
+def _parse_profile_range():
+    """Parse ``TLLM_PROFILE_VISUAL_GEN_START_STOP`` for CUDA profiler scoping.
+
+    Visual-gen-specific env var (separate from the LLM path's
+    ``TLLM_PROFILE_START_STOP``). Use with ``nsys profile -c cudaProfilerApi ...``.
+
+    Supported formats:
+
+    * ``A-B``            – profile denoise steps A through B
+    * ``A-B,C-D,...``    – multiple ranges; profiler toggles on/off per range
+    * ``A,B,...``        – individual steps treated as single-step ranges
+    * ``predenoise``     – profile the per-request pre-loop work inside
+                           ``denoise()`` (CFG config setup, scheduler refresh,
+                           TeaCache reset) up to the first denoise step.
+                           Single-shot.
+    * ``postdenoise``    – profile from the end of the last denoise step to
+                           pipeline cleanup, covering VAE decode. Single-shot.
+    * ``all``            – profile the full generation forward (denoise + VAE), skip warmup
+    * (unset)            – no profiler API calls; plain ``nsys profile`` captures everything
+
+    Returns ``None`` when unset, one of ``"all"`` / ``"predenoise"`` /
+    ``"postdenoise"`` for keyword modes, or ``(frozenset(starts), frozenset(stops))``
+    for numeric ranges.
+
+    .. note::
+       Step indices are **per-request**: each ``denoise()`` call resets the
+       loop counter to 0, so e.g. ``0-4`` profiles steps 0-4 of *every*
+       request. This differs from the LLM path's ``TLLM_PROFILE_START_STOP``
+       which indexes a global executor iteration counter (one forward pass
+       services all in-flight requests, so there is no "per request" index).
+
+       ``predenoise`` and ``postdenoise`` are **single-shot per process**:
+       they fire once around the first user request after warmup and do not
+       re-arm on subsequent requests. Pair ``predenoise`` with
+       ``nsys --capture-range-end=stop`` (keeps the app running cleanly after
+       collection ends). ``postdenoise`` ends collection at process exit, so
+       either ``stop`` or ``stop-shutdown`` works. For multi-request capture,
+       use a numeric range with ``--capture-range-end=repeat:N``.
+    """
+    val = os.environ.get("TLLM_PROFILE_VISUAL_GEN_START_STOP")
+    if not val:
+        return None
+    val = val.strip()
+    if val.lower() in ("all", "predenoise", "postdenoise"):
+        return val.lower()
+    # Parse comma-separated ranges: "A-B,C-D,..." or single steps "A,B,..."
+    # Same format as the LLM path (PyExecutor._load_iteration_indexes).
+    starts, stops = [], []
+    for span in val.split(","):
+        span = span.strip()
+        if "-" in span:
+            start, stop = span.split("-", 1)
+            starts.append(int(start))
+            stops.append(int(stop))
+        else:
+            v = int(span)
+            starts.append(v)
+            stops.append(v)
+    return frozenset(starts), frozenset(stops)
+
 
 if TYPE_CHECKING:
+    from .cache import CacheAccelerator
     from .config import DiffusionModelConfig
 
 
@@ -24,6 +105,17 @@ class BasePipeline(nn.Module):
     """
     Base class for diffusion pipelines.
     """
+
+    @classmethod
+    def resolve_variant(cls, config: "DiffusionModelConfig") -> Type["BasePipeline"]:
+        """Return *cls* or a more specialized subclass based on *config*.
+
+        Override in subclasses to select a variant pipeline at creation
+        time (e.g. upgrading a base pipeline to a two-stage variant when
+        extra checkpoint paths are provided).  The default returns *cls*
+        unchanged.
+        """
+        return cls
 
     def __init__(self, model_config: "DiffusionModelConfig"):
         super().__init__()
@@ -34,12 +126,24 @@ class BasePipeline(nn.Module):
         self._parallel_vae_enabled: bool = False
         self._warmed_up_shapes: Set[tuple] = set()
 
+        # Unified cache acceleration (TeaCache, Cache-DiT); see _setup_cache_acceleration
+        self.cache_accelerator: Optional["CacheAccelerator"] = None
+
         # Components
         self.transformer: Optional[nn.Module] = None
         self.vae: Optional[nn.Module] = None
         self.text_encoder: Optional[nn.Module] = None
         self.tokenizer: Optional[Any] = None
         self.scheduler: Optional[Any] = None
+        self._is_warmup: bool = False
+
+        # CUDA profiler scoping (TLLM_PROFILE_VISUAL_GEN_START_STOP env var)
+        self._profile_range = _parse_profile_range()
+        self._profiling_active: bool = False
+        # Single-shot guards for predenoise/postdenoise modes — fire once
+        # around the first non-warmup denoise() invocation, then disarm.
+        self._predenoise_pending: bool = self._profile_range == "predenoise"
+        self._postdenoise_pending: bool = self._profile_range == "postdenoise"
 
         # Initialize transformer
         self._init_transformer()
@@ -48,6 +152,22 @@ class BasePipeline(nn.Module):
         # Order matters: TeaCache will wrap on top of it and still call the
         # graphed transformer.forward if should_compute == True.
         self._setup_cuda_graphs()
+
+    def _cuda_profiler_start(self):
+        """Start CUDA profiler if configured and not already active."""
+        if self._profile_range is not None and not self._profiling_active:
+            torch.cuda.cudart().cudaProfilerStart()
+            self._profiling_active = True
+            if self.rank == 0:
+                logger.info("CUDA profiler started")
+
+    def _cuda_profiler_stop(self):
+        """Stop CUDA profiler if currently active."""
+        if self._profiling_active:
+            torch.cuda.cudart().cudaProfilerStop()
+            self._profiling_active = False
+            if self.rank == 0:
+                logger.info("CUDA profiler stopped")
 
     def _setup_cuda_graphs(self):
         """Wrap all transformer components with CUDA graph capture/replay."""
@@ -208,6 +328,25 @@ class BasePipeline(nn.Module):
         """Return the VAE adapter class for the pipeline."""
         return None
 
+    @property
+    def extra_param_specs(self) -> Dict[str, ExtraParamSchema]:
+        """Model-specific extra parameter specs.
+
+        Subclasses override to declare which ``extra_params`` keys they
+        accept and their metadata.  Maps parameter names to
+        ``ExtraParamSchema`` instances.
+        """
+        return {}
+
+    @property
+    def default_generation_params(self) -> dict:
+        """Model-specific defaults for ``None`` fields in ``VisualGenParams``.
+
+        Keys should match ``VisualGenParams`` field names.  The executor
+        merges these into ``request.params`` before calling ``infer()``.
+        """
+        return {}
+
     def infer(self, req: Any):
         raise NotImplementedError
 
@@ -237,8 +376,6 @@ class BasePipeline(nn.Module):
                 f"Checkpoint directory must contain a 'transformer' subdirectory."
             )
 
-        from .checkpoints import WeightLoader
-
         weight_loader = WeightLoader(components=transformer_components)
         return weight_loader.load_weights(checkpoint_dir, self.mapping)
 
@@ -259,68 +396,79 @@ class BasePipeline(nn.Module):
         if self.transformer is not None and hasattr(self.transformer, "post_load_weights"):
             self.transformer.post_load_weights()
 
-    def _setup_teacache(self, model, coefficients: Optional[Dict] = None):
-        """Setup TeaCache optimization for the transformer model.
-
-        TeaCache caches transformer block outputs when timestep embeddings change slowly,
-        reducing computation during the denoising loop.
-
-        Args:
-            model: The transformer model to optimize
-            coefficients: Optional dict of model-specific polynomial coefficients for cache decisions
-                         Format: {model_size: {"ret_steps": [...], "standard": [...]}}
-        """
-        self.cache_backend = None
-
-        # Get teacache config from model_config (always present now)
+    def _apply_teacache_coefficients(self, coefficients: Optional[Dict]) -> None:
+        """Pick TeaCache coefficients from checkpoint path; updates model_config.teacache in place."""
+        if not coefficients:
+            return
         teacache_cfg = self.model_config.teacache
-        if not teacache_cfg.enable_teacache:
+        checkpoint_path = (
+            getattr(getattr(self.model_config, "pretrained_config", None), "_name_or_path", "")
+            or ""
+        )
+        matched = False
+        for model_size, coeff_data in coefficients.items():
+            if model_size.lower() in checkpoint_path.lower():
+                matched = True
+                if isinstance(coeff_data, dict):
+                    mode = "ret_steps" if teacache_cfg.use_ret_steps else "standard"
+                    if mode in coeff_data:
+                        teacache_cfg.coefficients = coeff_data[mode]
+                        logger.info(f"TeaCache: Using {model_size} coefficients ({mode} mode)")
+                    default_thresh = coeff_data.get("default_thresh")
+                    if (
+                        default_thresh is not None
+                        and "teacache_thresh" not in teacache_cfg.model_fields_set
+                    ):
+                        teacache_cfg.teacache_thresh = default_thresh
+                        logger.info(
+                            f"TeaCache: Using {model_size} default threshold {default_thresh}"
+                        )
+                else:
+                    teacache_cfg.coefficients = coeff_data
+                    logger.info(f"TeaCache: Using {model_size} coefficients")
+                break
+        if not matched:
+            raise ValueError(
+                f"TeaCache: No coefficients found for checkpoint '{checkpoint_path}'. "
+                f"Available variants: {list(coefficients.keys())}. "
+                f"TeaCache is not supported for this model variant."
+            )
+
+    def _setup_cache_acceleration(
+        self,
+        model: Optional[nn.Module] = None,
+        coefficients: Optional[Dict] = None,
+    ) -> None:
+        """Enable TeaCache or Cache-DiT from model_config.cache_backend."""
+
+        if getattr(self, "cache_accelerator", None) is not None:
+            self.cache_accelerator.unwrap()
+            self.cache_accelerator = None
+
+        cfg = self.model_config
+
+        if cfg.cache_backend == "cache_dit":
+            acc = CacheDiTAccelerator(self, cfg.cache_dit)
+            acc.wrap()
+            self.cache_accelerator = acc
             return
 
-        # Apply model-specific polynomial coefficients
-        # Coefficients are used to rescale embedding distances for cache decisions
-        if coefficients:
-            checkpoint_path = (
-                getattr(self.model_config.pretrained_config, "_name_or_path", "") or ""
-            )
-            for model_size, coeff_data in coefficients.items():
-                # Match model size in path (case-insensitive, e.g., "1.3B", "14B", "dev")
-                if model_size.lower() in checkpoint_path.lower():
-                    if isinstance(coeff_data, dict):
-                        # Select coefficient set based on warmup mode
-                        mode = "ret_steps" if teacache_cfg.use_ret_steps else "standard"
-                        if mode in coeff_data:
-                            teacache_cfg.coefficients = coeff_data[mode]
-                            logger.info(f"TeaCache: Using {model_size} coefficients ({mode} mode)")
-                        # Apply model-specific default threshold if user didn't explicitly set one
-                        default_thresh = coeff_data.get("default_thresh")
-                        if (
-                            default_thresh is not None
-                            and "teacache_thresh" not in teacache_cfg.model_fields_set
-                        ):
-                            teacache_cfg.teacache_thresh = default_thresh
-                            logger.info(
-                                f"TeaCache: Using {model_size} default threshold {default_thresh}"
-                            )
-                    else:
-                        # Single coefficient list (no mode distinction)
-                        teacache_cfg.coefficients = coeff_data
-                        logger.info(f"TeaCache: Using {model_size} coefficients")
-                    break
-            else:
-                raise ValueError(
-                    f"TeaCache: No coefficients found for checkpoint '{checkpoint_path}'. "
-                    f"Available variants: {list(coefficients.keys())}. "
-                    f"TeaCache is not supported for this model variant."
-                )
+        use_teacache = cfg.cache_backend == "teacache"
+        if not use_teacache:
+            return
 
-        # Initialize and enable TeaCache backend
-        logger.info("TeaCache: Initializing...")
-        self.cache_backend = TeaCacheBackend(teacache_cfg)
-        self.cache_backend.enable(model)
+        BasePipeline._apply_teacache_coefficients(self, coefficients)
+
+        if model is None:
+            return
+
+        acc = TeaCacheAccelerator(cfg.teacache)
+        acc.wrap(model=model)
+        if acc.is_enabled():
+            self.cache_accelerator = acc
 
     def setup_parallel_vae(self):
-        if not self.model_config.parallel.enable_parallel_vae:
+        if not self.model_config.enable_parallel_vae:
             return
         if not dist.is_initialized() or dist.get_world_size() <= 1:
             return
@@ -332,7 +480,7 @@ class BasePipeline(nn.Module):
         try:
             self.vae = ParallelVAEFactory.from_vae(
                 self.vae,
-                split_dim=self.model_config.parallel.parallel_vae_split_dim,
+                split_dim=self.model_config.parallel_vae_split_dim,
                 pg=pg,
             )
         except ValueError:
@@ -347,7 +495,7 @@ class BasePipeline(nn.Module):
         self._parallel_vae_enabled = True
         logger.info(
             f"Parallel VAE enabled: {type(self.vae).__name__}, "
-            f"split_dim={self.model_config.parallel.parallel_vae_split_dim}, "
+            f"split_dim={self.model_config.parallel_vae_split_dim}, "
             f"world_size={dist.get_world_size(pg)}"
         )
 
@@ -440,10 +588,12 @@ class BasePipeline(nn.Module):
         )
         warmup_start = time.time()
 
+        self._is_warmup = True
         for height, width, num_frames in shapes:
             logger.info(f"Warmup: {height}x{width}, {num_frames} frames, {steps} steps")
             self._run_warmup(height, width, num_frames, steps)
             torch.cuda.synchronize()
+        self._is_warmup = False
 
         self._warmed_up_shapes = set(
             self.warmup_cache_key(h, w, num_frames=f) for h, w, f in shapes
@@ -533,11 +683,15 @@ class BasePipeline(nn.Module):
         Returns:
             Dict with CFG configuration including split tensors
         """
-        # Access parallel config directly (always present now)
-        cfg_size = self.model_config.parallel.dit_cfg_size
-        ulysses_size = self.model_config.parallel.dit_ulysses_size
+        vgm = self.model_config.visual_gen_mapping
+        cfg_size = vgm.cfg_size if vgm else 1
+        ulysses_size = vgm.ulysses_size if vgm else 1
+        attn2d_row_size = vgm.attn2d_row_size if vgm else 1
+        attn2d_col_size = vgm.attn2d_col_size if vgm else 1
+        attn2d_size = attn2d_row_size * attn2d_col_size
+        seq_parallel_size = attn2d_size if attn2d_size > 1 else ulysses_size
 
-        cfg_group = self.rank // ulysses_size
+        is_conditional = vgm.is_cfg_conditional if vgm else True
         is_split_embeds = neg_prompt_embeds is not None
         do_cfg_parallel = cfg_size >= 2 and guidance_scale > 1.0
 
@@ -545,7 +699,13 @@ class BasePipeline(nn.Module):
 
         if do_cfg_parallel:
             if self.rank == 0:
-                logger.info(f"CFG Parallel: cfg_size={cfg_size}, ulysses_size={ulysses_size}")
+                if attn2d_row_size * attn2d_col_size > 1:
+                    logger.info(
+                        f"CFG Parallel: cfg_size={cfg_size}, "
+                        f"attn2d_row_size={attn2d_row_size}, attn2d_col_size={attn2d_col_size}"
+                    )
+                else:
+                    logger.info(f"CFG Parallel: cfg_size={cfg_size}, ulysses_size={ulysses_size}")
 
             # Split main embeddings
             if is_split_embeds:
@@ -553,15 +713,14 @@ class BasePipeline(nn.Module):
             else:
                 neg_embeds, pos_embeds = prompt_embeds.chunk(2)
 
-            local_embeds = pos_embeds if cfg_group == 0 else neg_embeds
+            local_embeds = pos_embeds if is_conditional else neg_embeds
 
             # Split extra tensors if provided
             if extra_cfg_tensors:
                 for name, (pos_tensor, neg_tensor) in extra_cfg_tensors.items():
                     if pos_tensor is not None and neg_tensor is not None:
-                        local_extras[name] = pos_tensor if cfg_group == 0 else neg_tensor
+                        local_extras[name] = pos_tensor if is_conditional else neg_tensor
                     elif pos_tensor is not None:
-                        # Only positive provided, use it for both
                         local_extras[name] = pos_tensor
         else:
             local_embeds = None
@@ -578,9 +737,7 @@ class BasePipeline(nn.Module):
 
         return {
             "enabled": do_cfg_parallel,
-            "cfg_size": cfg_size,
-            "ulysses_size": ulysses_size,
-            "cfg_group": cfg_group,
+            "seq_parallel_size": seq_parallel_size,
             "local_embeds": local_embeds,
             "prompt_embeds": prompt_embeds,
             "local_extras": local_extras,
@@ -595,10 +752,14 @@ class BasePipeline(nn.Module):
         forward_fn,
         guidance_scale,
         guidance_rescale,
-        ulysses_size,
+        seq_parallel_size,
         local_extras,
     ):
         """Execute single denoising step with CFG parallel."""
+        vgm = self.model_config.visual_gen_mapping
+        cfg_pg = vgm.cfg_group if vgm else None
+        cfg_size = vgm.cfg_size if vgm else 1
+
         t_start = time.time()
         result = forward_fn(latents, extra_stream_latents, timestep, local_embeds, local_extras)
 
@@ -613,22 +774,24 @@ class BasePipeline(nn.Module):
 
         c_start = time.time()
 
-        # All-gather primary noise (must be contiguous for NCCL)
+        # All-gather primary noise over the CFG group.
+        # Each entry in gather_list corresponds to one CFG rank
+        # (index 0 = conditional, index 1 = unconditional).
         noise_pred_local = noise_pred_local.contiguous()
-        gather_list = [torch.empty_like(noise_pred_local) for _ in range(self.world_size)]
-        dist.all_gather(gather_list, noise_pred_local)
+        gather_list = [torch.empty_like(noise_pred_local) for _ in range(cfg_size)]
+        dist.all_gather(gather_list, noise_pred_local, group=cfg_pg)
         noise_cond = gather_list[0]
-        noise_uncond = gather_list[ulysses_size]
+        noise_uncond = gather_list[1]
         noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
 
         # All-gather extra stream noises
         extra_noise_preds = {}
         for name, noise_local in extra_noise_locals.items():
             noise_local = noise_local.contiguous()
-            gather_list_extra = [torch.empty_like(noise_local) for _ in range(self.world_size)]
-            dist.all_gather(gather_list_extra, noise_local)
+            gather_list_extra = [torch.empty_like(noise_local) for _ in range(cfg_size)]
+            dist.all_gather(gather_list_extra, noise_local, group=cfg_pg)
             noise_cond_extra = gather_list_extra[0]
-            noise_uncond_extra = gather_list_extra[ulysses_size]
+            noise_uncond_extra = gather_list_extra[1]
             extra_noise_preds[name] = noise_uncond_extra + guidance_scale * (
                 noise_cond_extra - noise_uncond_extra
             )
@@ -749,6 +912,7 @@ class BasePipeline(nn.Module):
         extra_streams: Optional[Dict[str, Tuple[torch.Tensor, Any]]] = None,
         guidance_scale_2: Optional[float] = None,
         boundary_timestep: Optional[float] = None,
+        post_step_fn: Optional[Callable] = None,
     ):
         """Execute denoising loop with optional CFG parallel and TeaCache support.
 
@@ -775,25 +939,31 @@ class BasePipeline(nn.Module):
                              to guidance_scale_2 when timestep < boundary_timestep.
             boundary_timestep: Optional timestep boundary for two-stage denoising.
                               Switches guidance scale when crossing this threshold.
+            post_step_fn: Optional callable applied to latents after each scheduler step.
+                         Signature: post_step_fn(latents) -> latents
+                         Use for constraints that must hold throughout denoising.
 
         Returns:
             Single latents if no extra_streams
             Tuple (primary_latents, extra_streams_dict) if extra_streams provided
         """
+        # ``predenoise`` mode: arm the profiler at the very start of denoise()
+        # so the per-request pre-loop work (CFG config, scheduler refresh,
+        # TeaCache reset) is captured. The window closes at the first step.
+        # Note: hooked here (not at warmup() exit) to avoid leaving the profiler
+        # on across the worker's IPC idle, which can interact badly with CUPTI.
+        if self._predenoise_pending and not self._is_warmup:
+            self._cuda_profiler_start()
+
         if timesteps is None:
             timesteps = scheduler.timesteps
 
         total_steps = len(timesteps)
         has_extra_streams = extra_streams is not None and len(extra_streams) > 0
 
-        # Reset TeaCache state for new generation
-        # Sets warmup/cutoff steps based on total_steps
-        if (
-            hasattr(self, "cache_backend")
-            and self.cache_backend
-            and self.cache_backend.is_enabled()
-        ):
-            self.cache_backend.refresh(total_steps)
+        # Reset cache acceleration state for new generation (TeaCache / Cache-DiT)
+        if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
+            self.cache_accelerator.refresh(total_steps)
 
         if self.rank == 0:
             if has_extra_streams:
@@ -821,7 +991,23 @@ class BasePipeline(nn.Module):
 
         start_time = time.time()
 
+        # CUDA profiler scoping: "all" starts here (covers denoise + VAE),
+        # step ranges start/stop at specific indices. See _parse_profile_range().
+        prof = self._profile_range
+        if prof == "all" and not self._is_warmup:
+            self._cuda_profiler_start()
+        # ``predenoise`` was started in warmup() exit; close the window now,
+        # before the first denoise step kernels run. Single-shot: disarm.
+        if self._predenoise_pending and not self._is_warmup:
+            self._cuda_profiler_stop()
+            self._predenoise_pending = False
+        prof_step_starts = prof[0] if isinstance(prof, tuple) else None
+        prof_step_stops = prof[1] if isinstance(prof, tuple) else None
+
         for i, t in enumerate(timesteps):
+            if prof_step_starts is not None and i in prof_step_starts and not self._is_warmup:
+                self._cuda_profiler_start()
+
             step_start = time.time()
 
             # Two-stage denoising: switch guidance scale at boundary
@@ -843,7 +1029,7 @@ class BasePipeline(nn.Module):
                         forward_fn,
                         current_guidance_scale,
                         guidance_rescale,
-                        cfg_config["ulysses_size"],
+                        cfg_config["seq_parallel_size"],
                         local_extras,
                     )
                 else:
@@ -869,6 +1055,9 @@ class BasePipeline(nn.Module):
                 extra_stream_schedulers,
             )
 
+            if post_step_fn is not None:
+                latents = post_step_fn(latents)
+
             # Logging
             if self.rank == 0:
                 step_time = time.time() - step_start
@@ -880,28 +1069,41 @@ class BasePipeline(nn.Module):
                     f"Avg={avg_time:.2f}s/step ETA={eta:.1f}s"
                 )
 
+            # Step-level profiler stop
+            if prof_step_stops is not None and i in prof_step_stops and not self._is_warmup:
+                self._cuda_profiler_stop()
+
+        # ``postdenoise`` mode: arm the profiler now so the VAE decode (and
+        # any post-denoise host work) is captured up to cleanup(). Single-shot.
+        if self._postdenoise_pending and not self._is_warmup:
+            self._cuda_profiler_start()
+            self._postdenoise_pending = False
+
         if self.rank == 0:
             total_time = time.time() - start_time
             logger.info("=" * 80)
             logger.info(f"Denoising done: {total_time:.2f}s ({total_time / total_steps:.2f}s/step)")
 
-            # Log TeaCache performance statistics
-            # Shows how many transformer steps were skipped (cache hits) vs computed
-            if (
-                hasattr(self, "cache_backend")
-                and self.cache_backend
-                and self.cache_backend.is_enabled()
-            ):
-                stats = self.cache_backend.get_stats()
+            # Single logging site for TeaCache and Cache-DiT.
+            if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
+                stats = self.cache_accelerator.get_stats()
                 if stats:
-                    logger.info(
-                        f"TeaCache: {stats['hit_rate']:.1%} hit rate ({stats['cached']}/{stats['total']} steps)"
-                    )
+                    if self.model_config.cache_backend == "cache_dit":
+                        logger.info("Cache-DiT stats: %s", stats)
+                    elif "hit_rate" in stats:
+                        logger.info(
+                            f"TeaCache: {stats['hit_rate']:.1%} hit rate "
+                            f"({stats['cached']}/{stats['total']} steps)"
+                        )
+                    else:
+                        logger.info("Cache acceleration stats: %s", stats)
 
         return (latents, extra_stream_latents) if has_extra_streams else latents
 
     def cleanup(self):
         """Call before dist.destroy_process_group()."""
+        self._cuda_profiler_stop()
+
         for name, runner in self._cuda_graph_runners.items():
             logger.info(f"Releasing CUDA graphs for {name}")
             runner.clear()

@@ -24,6 +24,7 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
+from tensorrt_llm._utils import get_sm_version
 
 from .softplus import softplus
 
@@ -332,7 +333,12 @@ def selective_state_update(
         launch_with_pdl: If True, launch with Programmatic Dependent Launch.
             Requires all inputs other than x, B, and C to already be available.
             Allows addressing math and state loading to overlap with the prior kernel.
+            Ignored on hardware that doesn't support PDL (sm < 90).
     """
+    # PDL needs sm >= 90.
+    if get_sm_version() < 90:
+        launch_with_pdl = False
+
     if state.dim() == 3:
         state = state.unsqueeze(1)
     if x.dim() == 2:
