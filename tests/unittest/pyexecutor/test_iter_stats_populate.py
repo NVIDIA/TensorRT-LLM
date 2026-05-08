@@ -227,6 +227,7 @@ def _invoke_update_iter_stats(
 
 
 def test_empty_iteration():
+    """Verify an iteration with no work reports zero request and token counters."""
     stats = _invoke_update_iter_stats(_StubScheduledBatch(), [], num_ctx_tokens=0)
     ifb = stats.inflight_batching_stats
     assert ifb.num_context_requests == 0
@@ -242,6 +243,7 @@ def test_empty_iteration():
 
 
 def test_prefill_only_no_prefix_cache():
+    """Verify fresh prefill requests do not report prior KV tokens."""
     # Two fresh prefill requests: prompts of 100 and 200 tokens, chunk size
     # == full prompt (no chunked prefill). No prefix cache hits.
     reqs = [
@@ -257,6 +259,7 @@ def test_prefill_only_no_prefix_cache():
 
 
 def test_prefill_with_prefix_cache_hit():
+    """Verify prefix-cache hits are counted as prefill KV tokens."""
     # Prompt 1000 tokens; 256 already in prefix cache (prepopulatedPromptLen).
     # Chunk size = remaining = 744. py_last_context_chunk = (256, 1000);
     # start=256 is the precomputed-tokens count.
@@ -272,6 +275,7 @@ def test_prefill_with_prefix_cache_hit():
 
 
 def test_chunked_prefill_continuation():
+    """Verify chunked-prefill continuations count previously computed tokens."""
     # Chunked prefill: 3-chunk request, each chunk 512. This is step 2:
     # chunk size 512, previously computed 512 (== context_current_position).
     # py_last_context_chunk = (512, 1024); start=512.
@@ -287,6 +291,7 @@ def test_chunked_prefill_continuation():
 
 
 def test_decode_only():
+    """Verify decode requests report their total KV context length."""
     # Two decode requests: 1024 total context and 2048 total context.
     reqs = [
         _StubRequest(num_tokens=1024),
@@ -301,6 +306,7 @@ def test_decode_only():
 
 
 def test_mixed_prefill_and_decode():
+    """Verify prefill and decode counters are populated independently."""
     ctx = [_StubRequest(context_chunk_size=128, context_current_position=0)]
     gen = [_StubRequest(num_tokens=500), _StubRequest(num_tokens=700)]
     stats = _invoke_update_iter_stats(
@@ -313,6 +319,7 @@ def test_mixed_prefill_and_decode():
 
 
 def test_queued_context_requests_from_request_queue():
+    """Verify queued context requests are counted from the executor queue."""
     items = [
         _StubQueueItem(input_token_ids=list(range(256))),
         _StubQueueItem(input_token_ids=list(range(1024))),
@@ -324,6 +331,7 @@ def test_queued_context_requests_from_request_queue():
 
 
 def test_queued_filters_non_normal_requests():
+    """Verify control/shutdown queue items are excluded from queued counters."""
     # Shutdown / cancel / control items should be ignored.
     items = [
         _StubQueueItem(input_token_ids=list(range(100)), is_normal_request=False),
@@ -336,6 +344,7 @@ def test_queued_filters_non_normal_requests():
 
 
 def test_queued_routes_by_request_type():
+    """Verify queued context and generation-only request types route separately."""
     # Disaggregated serving: a decode engine receives
     # REQUEST_TYPE_GENERATION_ONLY items that await KV transfer from a
     # prefill engine before starting decode. They belong in the
@@ -378,6 +387,7 @@ def test_queued_routes_by_request_type():
 
 
 def test_paused_decode_requests():
+    """Verify paused decode requests contribute to paused request/KV counters."""
     paused = [
         _StubRequest(num_tokens=300),
         _StubRequest(num_tokens=800),
@@ -389,6 +399,7 @@ def test_paused_decode_requests():
 
 
 def test_dummy_filtering_on_kv_token_fields():
+    """Verify dummy requests are excluded from KV-token-weighted counters."""
     # Dummy-padding added by Attention-DP or CUDA graph capture must not
     # contribute to the KV-token-weighted fields under test
     # (num_ctx_kv_tokens, num_gen_kv_tokens, num_paused_kv_tokens).
@@ -435,6 +446,7 @@ def test_dummy_filtering_on_kv_token_fields():
 
 
 def test_attention_dp_dummy_filtering_on_count_fields():
+    """Verify Attention-DP mode excludes dummy padding from rank-local counts."""
     # Under attention-DP, the rank-local payload emitted for each rank must
     # exclude ADP and CUDA graph dummy padding from request counts too.
     ctx = [
@@ -478,6 +490,7 @@ def test_attention_dp_dummy_filtering_on_count_fields():
 
 
 def test_full_mixed_iteration():
+    """Verify a mixed production-like iteration populates all aggregate fields."""
     # Realistic scenario: 3 prefill (1 fresh, 2 continuing chunks), 4 decode,
     # 2 preempted, 3 queued.
     ctx = [
@@ -582,6 +595,7 @@ def _build_adp_stats_buffer(pending_stats, *, is_rank0=True):
 
 
 def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
+    """Verify ADP fanout emits one rank-local row per rank with queue on rank 0."""
     # Rank 0 emits one stats row per ADP rank. Scheduled fields stay
     # rank-local so FPM can reveal load imbalance, while queued fields remain
     # rank-0-owned because the executor request queue lives on rank 0.
@@ -667,6 +681,7 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
 
 
 def test_attention_dp_fanout_waits_for_complete_matching_payloads():
+    """Verify ADP fanout waits until every rank reports the rank-0 iteration."""
     rank0_stats = _make_adp_iteration_stats(iter_id=9, num_context_requests=1)
     buffer = _build_adp_stats_buffer(rank0_stats)
     rank0_state = RankState(rank=0, iter_stats=buffer.next_payload())
@@ -693,6 +708,7 @@ def test_attention_dp_fanout_waits_for_complete_matching_payloads():
 
 
 def test_attention_dp_fanout_buffers_multiple_pending_payloads():
+    """Verify ADP fanout keeps multiple pending iterations ordered by iter id."""
     rank0_stats_9 = _make_adp_iteration_stats(iter_id=9, num_context_requests=1)
     rank0_stats_10 = _make_adp_iteration_stats(iter_id=10, num_context_requests=2)
     buffer = _build_adp_stats_buffer(rank0_stats_9)
@@ -709,6 +725,7 @@ def test_attention_dp_fanout_buffers_multiple_pending_payloads():
 
 
 def test_attention_dp_fanout_clears_when_rank0_stats_object_missing():
+    """Verify ADP fanout drops stale state if rank-0 stats are unavailable."""
     rank0_stats = _make_adp_iteration_stats(iter_id=9, num_context_requests=1)
     buffer = _build_adp_stats_buffer(rank0_stats)
     rank0_state = RankState(rank=0, iter_stats=buffer.next_payload())
@@ -731,6 +748,7 @@ def test_attention_dp_fanout_clears_when_rank0_stats_object_missing():
 
 
 def test_attention_dp_fanout_aligns_non_rank0_to_rank0_iter():
+    """Verify non-rank0 buffers synthesize zero payloads to align to rank 0."""
     rank1_stats = _make_adp_iteration_stats(iter_id=10, num_context_requests=3)
     buffer = _build_adp_stats_buffer(rank1_stats, is_rank0=False)
     rank0_state = RankState(
