@@ -35,11 +35,16 @@ def mod():
 
 def test_validate_models_allows_same_name_with_different_config_id(mod):
     models = [
-        {"name": "meta-llama/Llama-3.1-8B-Instruct", "yaml_extra": ["world_size_1.yaml"]},
+        {
+            "name": "meta-llama/Llama-3.1-8B-Instruct",
+            "ad_defaults": ["ad_base.yaml"],
+            "user_configs": ["world_size_1.yaml"],
+        },
         {
             "name": "meta-llama/Llama-3.1-8B-Instruct",
             "config_id": "fp8",
-            "yaml_extra": ["world_size_1.yaml", "fp8.yaml"],
+            "ad_defaults": ["ad_base.yaml", "fp8_ad.yaml"],
+            "user_configs": ["world_size_1.yaml", "fp8.yaml"],
         },
     ]
 
@@ -50,8 +55,16 @@ def test_validate_models_allows_same_name_with_different_config_id(mod):
 
 def test_validate_models_rejects_duplicate_default_config_id(mod):
     models = [
-        {"name": "Qwen/Qwen2.5-7B-Instruct", "yaml_extra": ["world_size_1.yaml"]},
-        {"name": "Qwen/Qwen2.5-7B-Instruct", "yaml_extra": ["world_size_2.yaml"]},
+        {
+            "name": "Qwen/Qwen2.5-7B-Instruct",
+            "ad_defaults": ["ad_base.yaml"],
+            "user_configs": ["world_size_1.yaml"],
+        },
+        {
+            "name": "Qwen/Qwen2.5-7B-Instruct",
+            "ad_defaults": ["ad_base.yaml"],
+            "user_configs": ["world_size_2.yaml"],
+        },
     ]
 
     errors = mod.validate_models(models)
@@ -66,12 +79,14 @@ def test_validate_models_rejects_duplicate_explicit_config_id(mod):
         {
             "name": "Qwen/Qwen2.5-7B-Instruct",
             "config_id": "benchmark_a",
-            "yaml_extra": ["world_size_1.yaml"],
+            "ad_defaults": ["ad_base.yaml"],
+            "user_configs": ["world_size_1.yaml"],
         },
         {
             "name": "Qwen/Qwen2.5-7B-Instruct",
             "config_id": "benchmark_a",
-            "yaml_extra": ["world_size_2.yaml"],
+            "ad_defaults": ["ad_base.yaml"],
+            "user_configs": ["world_size_2.yaml"],
         },
     ]
 
@@ -87,7 +102,8 @@ def test_validate_models_rejects_empty_config_id(mod):
         {
             "name": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
             "config_id": "   ",
-            "yaml_extra": ["world_size_1.yaml"],
+            "ad_defaults": ["ad_base.yaml"],
+            "user_configs": ["world_size_1.yaml"],
         }
     ]
 
@@ -97,23 +113,25 @@ def test_validate_models_rejects_empty_config_id(mod):
     assert "'config_id' must be a non-empty string" in errors[0]
 
 
-def test_validate_models_rejects_same_model_same_yaml_extra_different_config_id(mod):
+def test_validate_models_rejects_same_model_same_configs_different_config_id(mod):
     models = [
         {
             "name": "Qwen/Qwen2.5-7B-Instruct",
             "config_id": "cfg_a",
-            "yaml_extra": ["dashboard_default.yaml", "world_size_2.yaml"],
+            "ad_defaults": ["ad_base.yaml"],
+            "user_configs": ["dashboard_default.yaml", "world_size_2.yaml"],
         },
         {
             "name": "Qwen/Qwen2.5-7B-Instruct",
             "config_id": "cfg_b",
-            "yaml_extra": ["dashboard_default.yaml", "world_size_2.yaml"],
+            "ad_defaults": ["ad_base.yaml"],
+            "user_configs": ["dashboard_default.yaml", "world_size_2.yaml"],
         },
     ]
 
     errors = mod.validate_models(models)
 
     assert len(errors) == 1
-    assert "identical yaml_extra" in errors[0]
+    assert "identical configs" in errors[0]
     assert "'cfg_a'" in errors[0]
     assert "'cfg_b'" in errors[0]

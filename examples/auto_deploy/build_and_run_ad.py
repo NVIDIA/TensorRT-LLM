@@ -17,7 +17,9 @@ from pydantic_settings import (
 )
 
 from tensorrt_llm._torch.auto_deploy import LLM, DemoLLM
-from tensorrt_llm._torch.auto_deploy.config.model_registry_internal import get_registry_yaml_extra
+from tensorrt_llm._torch.auto_deploy.config.model_registry_internal import (
+    get_registry_yaml_extra_with_world_size,
+)
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.utils._config import (
     DynamicYamlMixInForSettings,
@@ -202,9 +204,13 @@ class ExperimentConfig(DynamicYamlMixInForSettings, BaseSettings):
                 raise ValueError("--use-registry requires --model or --args.model to be specified.")
 
             config_id = data.get("registry_config_id")
-            registry_yaml_extra = get_registry_yaml_extra(model_name, config_id)
+            registry_yaml_extra, registry_world_size = get_registry_yaml_extra_with_world_size(
+                model_name, config_id
+            )
 
             data.setdefault("args", {})
+            if "world_size" not in data["args"] and "tensor_parallel_size" not in data["args"]:
+                data["args"]["world_size"] = registry_world_size
             existing_yaml_extra = list(data["args"].get("yaml_extra", []) or [])
             # Registry defaults go first so explicit user --args.yaml-extra can override.
             data["args"]["yaml_extra"] = [*registry_yaml_extra, *existing_yaml_extra]

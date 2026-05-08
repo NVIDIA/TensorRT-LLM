@@ -20,30 +20,35 @@ This registry maps model names to two layers of configs:
    compile_backend, etc.) shipped inside the package at
    ``_torch/auto_deploy/config/model_registry_internal/configs/``.
 2. **User configs** (``user_configs``) — Common, user-facing knobs
-   (max_batch_size, kv_cache_config, etc.) in
-   ``examples/auto_deploy/model_registry/configs/``.
+   (max_batch_size, kv_cache_config, etc.). Source checkouts use
+   ``examples/auto_deploy/model_registry/configs/``; wheel installs use the
+   packaged copy in this registry package.
 
-All AD entry points (``trtllm-serve``, ``build_and_run_ad.py``, integration
-tests) use :func:`get_registry_yaml_extra` to get the combined list
-``[*ad_defaults, *user_configs]`` which is passed as ``yaml_extra`` to
-AD's ``LlmArgs``.  AD defaults are loaded first (lowest priority),
-user configs on top, and any explicit CLI / init args win over both.
+``build_and_run_ad.py`` and integration tests use
+:func:`get_registry_yaml_extra` to get the combined list
+``[*ad_defaults, *user_configs]`` which is passed as ``yaml_extra`` to AD's
+``LlmArgs``. ``trtllm-serve`` uses :func:`get_ad_defaults` because the user's
+``--config`` YAML is merged as init args with higher priority. AD defaults are
+loaded first (lowest priority), user configs on top when included, and any
+explicit CLI / init args win over both.
 """
 
 from importlib.resources import files
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import yaml
 
 _REGISTRY_PKG = files(__package__)
 _REGISTRY_YAML = _REGISTRY_PKG / "models.yaml"
 _AD_CONFIGS_DIR = Path(str(_REGISTRY_PKG / "configs"))
+_PACKAGED_USER_CONFIGS_DIR = Path(str(_REGISTRY_PKG / "user_configs"))
 
 # User-facing configs live under examples/auto_deploy/model_registry/configs/.
-# Resolve relative to the repo root (4 levels up from this package).
+# Resolve relative to the repo root (4 levels up from this package) when this
+# code is running from a source checkout.
 _REPO_ROOT = Path(str(_REGISTRY_PKG)).parents[4]
-_USER_CONFIGS_DIR = _REPO_ROOT / "examples" / "auto_deploy" / "model_registry" / "configs"
+_SOURCE_USER_CONFIGS_DIR = _REPO_ROOT / "examples" / "auto_deploy" / "model_registry" / "configs"
 
 
 def _load_registry() -> dict:
@@ -88,8 +93,52 @@ def _find_entry(
 def _resolve_paths(entry: dict) -> tuple[List[str], List[str]]:
     """Return (ad_paths, user_paths) for a registry entry."""
     ad_paths = [str(_AD_CONFIGS_DIR / cfg) for cfg in entry.get("ad_defaults", [])]
-    user_paths = [str(_USER_CONFIGS_DIR / cfg) for cfg in entry.get("user_configs", [])]
+    user_configs_dir = (
+        _SOURCE_USER_CONFIGS_DIR
+        if _SOURCE_USER_CONFIGS_DIR.is_dir()
+        else _PACKAGED_USER_CONFIGS_DIR
+    )
+    user_paths = [str(user_configs_dir / cfg) for cfg in entry.get("user_configs", [])]
     return ad_paths, user_paths
+
+
+def _get_world_size(entry: dict) -> int:
+    """Return the world_size for a registry entry."""
+    return entry.get("world_size", 1)
+
+
+def get_ad_defaults(
+    model_name: str,
+    config_id: Optional[str] = None,
+) -> List[str]:
+    """Return AD-internal default config paths for a model.
+
+    Used by ``trtllm-serve`` where user-facing config values come from the
+    explicit ``--config`` YAML / CLI options.
+
+    Args:
+        model_name: HuggingFace model id (e.g. ``deepseek-ai/DeepSeek-R1-0528``).
+        config_id: Optional config variant selector when a model has multiple entries.
+
+    Returns:
+        List of absolute paths to AD-internal yaml config files.
+
+    Raises:
+        KeyError: If the model is not found or is ambiguous without ``config_id``.
+    """
+    entry = _find_entry(model_name, config_id)
+    ad_paths, _ = _resolve_paths(entry)
+    return ad_paths
+
+
+def get_ad_defaults_with_world_size(
+    model_name: str,
+    config_id: Optional[str] = None,
+) -> Tuple[List[str], int]:
+    """Return AD-internal default config paths and registry world_size."""
+    entry = _find_entry(model_name, config_id)
+    ad_paths, _ = _resolve_paths(entry)
+    return ad_paths, _get_world_size(entry)
 
 
 def get_registry_yaml_extra(
@@ -117,13 +166,23 @@ def get_registry_yaml_extra(
     return [*ad_paths, *user_paths]
 
 
+def get_registry_yaml_extra_with_world_size(
+    model_name: str,
+    config_id: Optional[str] = None,
+) -> Tuple[List[str], int]:
+    """Return the full yaml_extra paths and registry world_size."""
+    entry = _find_entry(model_name, config_id)
+    ad_paths, user_paths = _resolve_paths(entry)
+    return [*ad_paths, *user_paths], _get_world_size(entry)
+
+
 def get_world_size(
     model_name: str,
     config_id: Optional[str] = None,
 ) -> int:
     """Return the world_size for a model (defaults to 1)."""
     entry = _find_entry(model_name, config_id)
-    return entry.get("world_size", 1)
+    return _get_world_size(entry)
 
 
 def list_registered_models() -> List[Dict]:

@@ -24,7 +24,8 @@ from test_common.llm_data import hf_id_to_local_model_dir, llm_models_root
 
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm._torch.auto_deploy.config.model_registry_internal import (
-    get_registry_yaml_extra, get_world_size)
+    get_registry_yaml_extra, get_registry_yaml_extra_with_world_size,
+    get_world_size)
 from tensorrt_llm.llmapi import Eagle3DecodingConfig
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
@@ -1122,14 +1123,14 @@ class TestGemma4MoE(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(80000)
     def test_bf16(self):
-        yaml_paths = get_registry_yaml_extra(self.MODEL_NAME)
-        world_size = get_world_size(self.MODEL_NAME)
+        yaml_paths, world_size = get_registry_yaml_extra_with_world_size(
+            self.MODEL_NAME)
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
 
         sampling_params = self.get_default_sampling_params()
-        with AutoDeployLLM(model=self.MODEL_NAME,
-                           tokenizer=self.MODEL_NAME,
+        with AutoDeployLLM(model=self.MODEL_PATH,
+                           tokenizer=self.MODEL_PATH,
                            world_size=world_size,
                            yaml_extra=yaml_paths) as llm:
             task = MMMU(self.MODEL_NAME)  # noqa: F821
@@ -1212,9 +1213,14 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
     def test_autodeploy_from_registry(self, model_name, config_overrides, tasks,
                                       accuracy_check):
         model_path = hf_id_to_local_model_dir(model_name)
-        yaml_paths = get_registry_yaml_extra(model_name)
-        effective_world_size = config_overrides.get("world_size",
-                                                    get_world_size(model_name))
+        yaml_paths, registry_world_size = get_registry_yaml_extra_with_world_size(
+            model_name)
+        llm_kwargs = dict(config_overrides)
+        if "world_size" not in llm_kwargs and "tensor_parallel_size" not in llm_kwargs:
+            llm_kwargs["world_size"] = registry_world_size
+        effective_world_size = llm_kwargs.get(
+            "world_size",
+            llm_kwargs.get("tensor_parallel_size", registry_world_size))
         if get_device_count() < effective_world_size:
             pytest.skip("Not enough devices for world size, skipping test")
         sampling_params = self.get_default_sampling_params()
@@ -1222,7 +1228,7 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
         with AutoDeployLLM(model=model_path,
                            tokenizer=model_path,
                            yaml_extra=yaml_paths,
-                           **config_overrides) as llm:
+                           **llm_kwargs) as llm:
             if accuracy_check:
                 if "NVFP4" in model_name:
                     _set_quant_config(llm, "nvfp4")
