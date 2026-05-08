@@ -694,25 +694,39 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
     def forward(
         self, multimodal_params: List[MultimodalParams]
     ) -> Tuple[List[torch.Tensor], List[List[int] | None]]:
-        # Group params by encoder sub-path so each group runs in a single
-        # ViT forward. RADIO's temporal path packs each tubelet as its own
-        # attention sequence, so cross-request video batching is safe as
-        # long as videos in the same group share frame shape and tubelet
-        # alignment (handled in `_encode_temporal_video`).
+        # Group each param into one of three encoder sub-paths and call
+        # each encoder once over its bucket. RADIO's temporal path packs
+        # each tubelet as its own attention sequence, so cross-request
+        # video batching is safe as long as videos in the same group
+        # share frame shape and tubelet alignment (handled in
+        # `_encode_temporal_video`).
         multimodal_data_list = [p.multimodal_data for p in multimodal_params]
-        plan = [self._classify(mm_data) for mm_data in multimodal_data_list]
-
-        def _data_for(modality: str) -> List[Dict[str, Any]]:
-            return [
-                mm_data[mm_data["modality_type"]]
-                for mm_data, assigned in zip(multimodal_data_list, plan)
-                if assigned == modality
-            ]
+        buckets: Dict[str, List[Dict[str, Any]]] = {
+            "dynamic_image": [],
+            "fixed_tile": [],
+            "video_temporal": [],
+        }
+        plan: List[str] = []
+        for multimodal_data in multimodal_data_list:
+            modality_type = multimodal_data["modality_type"]
+            data = multimodal_data[modality_type]
+            if modality_type == "image":
+                modality = "dynamic_image" if "image_sizes" in data else "fixed_tile"
+            elif modality_type == "video" and (
+                self.video_temporal_patch_size > 1 or isinstance(data["pixel_values"], list)
+            ):
+                modality = "video_temporal"
+            else:
+                # T==1 video with a tensor `pixel_values` is shape-identical
+                # to a fixed-tile image, so it rides the same encoder.
+                modality = "fixed_tile"
+            plan.append(modality)
+            buckets[modality].append(data)
 
         outputs_by_modality: Dict[str, List[torch.Tensor]] = {
-            "dynamic_image": self._encode_dynamic_image(_data_for("dynamic_image")),
-            "fixed_tile": self._encode_fixed_tile(_data_for("fixed_tile")),
-            "video_temporal": self._encode_temporal_video(_data_for("video_temporal")),
+            "dynamic_image": self._encode_dynamic_image(buckets["dynamic_image"]),
+            "fixed_tile": self._encode_fixed_tile(buckets["fixed_tile"]),
+            "video_temporal": self._encode_temporal_video(buckets["video_temporal"]),
         }
         # Reassemble in input order. Each modality's output list is in
         # input-param order (helpers preserve it), so an independent
@@ -726,27 +740,6 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         mm_embedding, num_tokens_in_videos = self.apply_evs(mm_embedding, multimodal_data_list)
         mm_embedding = [embed.reshape(-1, self.llm_hidden_size) for embed in mm_embedding]
         return mm_embedding, num_tokens_in_videos
-
-    def _classify(self, multimodal_data: Dict[str, Any]) -> str:
-        """Return the encoder sub-path for one request's multimodal_data.
-
-        Returns one of:
-          - ``"dynamic_image"``: variable-size images via ``extract_feature_dynamic``.
-          - ``"fixed_tile"``: fixed-tile images and T==1 videos via ``extract_feature``.
-          - ``"video_temporal"``: T>1 videos (or videos with mixed-shape
-            per-video pixel lists) batched through ``_encode_temporal_video``.
-        """
-        modality = multimodal_data["modality_type"]
-        data = multimodal_data[modality]
-        if modality == "image":
-            return "dynamic_image" if "image_sizes" in data else "fixed_tile"
-        if modality == "video" and (
-            self.video_temporal_patch_size > 1 or isinstance(data["pixel_values"], list)
-        ):
-            return "video_temporal"
-        # Remaining: T==1 video with a tensor pixel_values, identical in
-        # shape and call signature to fixed-tile images.
-        return "fixed_tile"
 
     def _encode_dynamic_image(self, image_data_list: List[Dict[str, Any]]) -> List[torch.Tensor]:
         """Encode all dynamic-resolution image requests in a single ViT forward.
@@ -2911,25 +2904,25 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         interleaving and EVS token-count stashing are tied to one
         request's data layout.
         """
-        # Encode all image params in one batched vision_encoder call.
-        image_params = [
-            p for p in multimodal_params if p.multimodal_data["modality_type"] == "image"
-        ]
-        image_embeds: List[torch.Tensor] = []
-        if image_params:
-            image_embeds, _ = self.vision_encoder(image_params)
-
-        # Collect all audio inputs (standalone + video-extracted) in
-        # encounter order and run them through one sound_encoder call.
+        # Collect all image params and all audio inputs (standalone +
+        # video-extracted) in a single pass, then run each encoder once
+        # over its bucket.
+        image_params: List[MultimodalParams] = []
         audio_data_list: List[dict] = []
         for param in multimodal_params:
             modality_type = param.multimodal_data["modality_type"]
-            if modality_type == "audio":
+            if modality_type == "image":
+                image_params.append(param)
+            elif modality_type == "audio":
                 audio_data_list.append(param.multimodal_data["audio"])
             elif modality_type == "video" and self.sound_encoder is not None:
                 audio_data = param.multimodal_data["video"].get("audio")
                 if audio_data is not None:
                     audio_data_list.append(audio_data)
+
+        image_embeds: List[torch.Tensor] = []
+        if image_params:
+            image_embeds, _ = self.vision_encoder(image_params)
         audio_outputs: List[Tuple[torch.Tensor, List[int]]] = (
             self._encode_audio(audio_data_list) if audio_data_list else []
         )
