@@ -589,6 +589,7 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
                                     is_dl_family = mode in (
                                         "doublelaunch", "dlgrouped", "maindl",
                                         "dl_write_only", "persistent_main",
+                                        "persistent_dynamic",
                                     )
                                     # Match the timed-run skip: sort=1 only
                                     # makes sense when there's a mix scenario.
@@ -1077,19 +1078,11 @@ def _bench_config(
                     # n_writes is either 0 (all nowrite) or batch (all
                     # write) depending on whether PNAT+T overflows the
                     # window.  Mix scenarios are skipped earlier.
-                    if mode == "persistent_main":
-                        scn_fill = scn["fill"]
-                        assert scn_fill is not None, (
-                            "persistent_main does not yet support mix "
-                            "scenarios (per-iter n_writes plumbing not "
-                            "implemented)."
-                        )
-                        is_write_scenario = (scn_fill + mtp_len) > max_window
-                        extra_kwargs["_n_writes"] = batch if is_write_scenario else 0
+                    if mode in ("persistent_main", "persistent_dynamic"):
                         # Per-cell sweep values for persistent-only knobs.
-                        # _parse_sweep returns [None] when the user didn't
-                        # pass the flag, in which case we leave the wrapper's
-                        # defaults in place.
+                        # Apply to both persistent variants.  _parse_sweep
+                        # returns [None] when the user didn't pass the flag,
+                        # in which case we leave the wrapper's defaults.
                         if cta_per_sm is not None:
                             extra_kwargs["_cta_per_sm"] = cta_per_sm
                         if num_loop_stages is not None:
@@ -1098,6 +1091,18 @@ def _bench_config(
                             extra_kwargs["_flatten"] = bool(flatten)
                         if warp_specialize is not None:
                             extra_kwargs["_warp_specialize"] = bool(warp_specialize)
+                    if mode == "persistent_main":
+                        # n_writes is needed only by persistent_main's
+                        # half-split.  persistent_dynamic dispatches per-slot
+                        # at runtime and doesn't need it.
+                        scn_fill = scn["fill"]
+                        assert scn_fill is not None, (
+                            "persistent_main does not yet support mix "
+                            "scenarios (per-iter n_writes plumbing not "
+                            "implemented)."
+                        )
+                        is_write_scenario = (scn_fill + mtp_len) > max_window
+                        extra_kwargs["_n_writes"] = batch if is_write_scenario else 0
                 variant_fn(
                     state_work,
                     old_x_work,
@@ -1395,6 +1400,7 @@ def _run_benchmark(args) -> None:
                                     is_dl_family = mode in (
                                         "doublelaunch", "dlgrouped", "maindl",
                                         "dl_write_only", "persistent_main",
+                                        "persistent_dynamic",
                                     )
                                     can_sort = (
                                         is_dl_family and mix_samples_cpu is not None
@@ -1897,7 +1903,7 @@ def _parse_args() -> argparse.Namespace:
     modes_raw = [v.strip() for v in args.modes.split(",") if v.strip()]
     valid_modes = {
         "monolithic", "dynamic", "doublelaunch", "dlgrouped", "maindl",
-        "dl_write_only", "persistent_main",
+        "dl_write_only", "persistent_main", "persistent_dynamic",
     }
     for m in modes_raw:
         if m not in valid_modes:

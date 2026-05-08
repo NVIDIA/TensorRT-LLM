@@ -3096,7 +3096,14 @@ def _persistent_main_impl(
     PHILOX_ROUNDS: tl.constexpr,
     QUANT_MAX: tl.constexpr,
     WRITE_CHECKPOINT: tl.constexpr,
+    IS_DYNAMIC: tl.constexpr,
 ):
+    # IS_DYNAMIC: when False, WRITE_CHECKPOINT is the constexpr write/nowrite
+    # selector (caller pre-sorts and splits halves).  When True, WRITE_CHECKPOINT
+    # is ignored; the impl computes is_write at runtime per work-item from
+    # the loaded PNAT.  Used by mode="persistent_dynamic" — single kernel,
+    # one launch, no half-split, runtime per-slot dispatch.
+
     # Compile-time invariant: QUANT_MAX > 0 must coincide with a quantized
     # state dtype (int8 / int16 / float8e4nv) and only those.
     tl.static_assert(
@@ -3118,7 +3125,15 @@ def _persistent_main_impl(
 
     active_buf = tl.load(cache_buf_idx_ptr + cache_batch_idx).to(tl.int32)
     prev_num_accepted_tokens = tl.load(prev_num_accepted_tokens_ptr + cache_batch_idx)
-    if WRITE_CHECKPOINT:
+    # Resolve is_write: constexpr from caller (persistent_main) or runtime
+    # from PNAT (persistent_dynamic).  When IS_DYNAMIC=False, is_write
+    # collapses to a constexpr 0/1 and the downstream `if is_write:`
+    # blocks DCE the dead path at compile time.
+    if IS_DYNAMIC:
+        is_write = (prev_num_accepted_tokens + T) > MAX_REPLAY_BUFFER_LENGTH
+    else:
+        is_write = WRITE_CHECKPOINT
+    if is_write:
         write_buf = 1 - active_buf  # noqa: F841
         write_offset = 0
     else:
@@ -3214,7 +3229,7 @@ def _persistent_main_impl(
 
     state += tl.dot(tl.trans(old_x_all).to(tl.bfloat16), dB_scaled.to(tl.bfloat16))
 
-    if WRITE_CHECKPOINT:
+    if is_write:
         if USE_RS_ROUNDING:
             rand_seed = tl.load(rand_seed_ptr)
             base_rand = cache_batch_idx * stride_state_batch + pid_h * stride_state_head
@@ -3486,21 +3501,27 @@ def _persistent_main_kernel(
     NUM_PID_M_BLOCKS: tl.constexpr,
     FLATTEN: tl.constexpr,
     WARP_SPECIALIZE: tl.constexpr,
+    IS_DYNAMIC: tl.constexpr,
 ):
     # PDL signal: fire once at kernel entry (not per work unit).
     if LAUNCH_DEPENDENT_KERNELS:
         tl.extra.cuda.gdc_launch_dependents()
 
-    # Derive this kernel's slot range from (n_writes, batch_total, WRITE_CHECKPOINT).
-    # Hard-sort contract: caller has pre-sorted so [0, n_writes) are write-mode
-    # and [n_writes, batch_total) are nowrite-mode.  Each launch knows which
-    # half it owns from its WRITE_CHECKPOINT constexpr.
-    if WRITE_CHECKPOINT:
+    # Derive this kernel's slot range.  Two modes:
+    #   IS_DYNAMIC=False (persistent_main): caller pre-sorts and splits halves;
+    #     slot range is [0, n_writes) when WRITE_CHECKPOINT else [n_writes, batch_total)
+    #   IS_DYNAMIC=True  (persistent_dynamic): single launch covers full batch;
+    #     each work-item dispatches via runtime PNAT check inside the impl.
+    if IS_DYNAMIC:
         slot_lo = 0
-        slot_hi = n_writes
-    else:
-        slot_lo = n_writes
         slot_hi = batch_total
+    else:
+        if WRITE_CHECKPOINT:
+            slot_lo = 0
+            slot_hi = n_writes
+        else:
+            slot_lo = n_writes
+            slot_hi = batch_total
     n_slots_local = slot_hi - slot_lo
 
     pid = tl.program_id(axis=0)
@@ -3578,6 +3599,7 @@ def _persistent_main_kernel(
             PHILOX_ROUNDS,
             QUANT_MAX,
             WRITE_CHECKPOINT,
+            IS_DYNAMIC,
         )
 
 
@@ -3747,11 +3769,11 @@ def checkpointing_state_update(
     #       reg envelope.  write_checkpoint ignored.
     assert mode in (
         "monolithic", "dynamic", "doublelaunch", "dlgrouped", "maindl",
-        "dl_write_only", "persistent_main",
+        "dl_write_only", "persistent_main", "persistent_dynamic",
     ), (
         f"unknown mode {mode!r}; expected one of "
         "'monolithic', 'dynamic', 'doublelaunch', 'dlgrouped', 'maindl', "
-        "'dl_write_only', or 'persistent_main'"
+        "'dl_write_only', 'persistent_main', or 'persistent_dynamic'"
     )
     use_rectangle = rectangle_for_nowrite and not write_checkpoint
 
@@ -4350,6 +4372,61 @@ def checkpointing_state_update(
             NUM_LOOP_STAGES=num_loop_stages_arg,
             FLATTEN=flatten_arg,
             WARP_SPECIALIZE=warp_specialize_arg,
+            IS_DYNAMIC=False,
+            num_warps=num_warps,
+            **({"num_stages": _num_stages} if _num_stages else {}),
+            **({"num_ctas": _num_ctas} if _num_ctas else {}),
+            **({"maxnreg": _maxnreg} if _maxnreg else {}),
+            launch_pdl=use_internal_pdl,
+        )
+
+    def launch_persistent_dynamic_main(launch_dependent_kernels: bool = False):
+        # Single-launch persistent kernel covering the whole batch with
+        # runtime per-slot WRITE_CHECKPOINT branch.  No half-split, no
+        # n_writes needed.  Reuses _persistent_main_kernel with
+        # IS_DYNAMIC=True.
+        grid = (num_persistent_arg,)
+        # n_writes is unused in the kernel when IS_DYNAMIC=True; pass 0.
+        # WRITE_CHECKPOINT is also unused; pass False.  is_write is computed
+        # at runtime per work-item from the loaded PNAT.
+        _persistent_main_kernel[grid](
+            state, state_scales_arg, old_x,
+            old_B, old_dt, old_dA_cumsum,
+            prev_num_accepted_tokens, cache_buf_idx,
+            x, C, D, z, out,
+            cb_scaled, decay_vec,
+            state_batch_indices, slot_perm_arg, rand_seed, pad_slot_id,
+            0, batch, nheads,
+            T, max_window, dim, dstate, nheads // ngroups,
+            state.stride(0), state.stride(1), state.stride(2), state.stride(3),
+            state_scales_strides[0], state_scales_strides[1], state_scales_strides[2],
+            old_x.stride(0), old_x.stride(1), old_x.stride(2), old_x.stride(3),
+            old_B.stride(0), old_B.stride(1), old_B.stride(2),
+            old_B.stride(3), old_B.stride(4),
+            old_dt.stride(0), old_dt.stride(1),
+            old_dt.stride(2), old_dt.stride(3),
+            old_dA_cumsum.stride(0), old_dA_cumsum.stride(1),
+            old_dA_cumsum.stride(2), old_dA_cumsum.stride(3),
+            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+            C.stride(0), C.stride(1), C.stride(2), C.stride(3),
+            d_strides[0], d_strides[1],
+            z_strides[0], z_strides[1], z_strides[2], z_strides[3],
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            cb_scaled.stride(0), cb_scaled.stride(1),
+            cb_scaled.stride(2), cb_scaled.stride(3),
+            decay_vec.stride(0), decay_vec.stride(1), decay_vec.stride(2),
+            BLOCK_SIZE_M,
+            LAUNCH_WITH_PDL=use_internal_pdl,
+            PHILOX_ROUNDS=philox_rounds if rand_seed is not None else 0,
+            QUANT_MAX=quant_max,
+            WRITE_CHECKPOINT=False,
+            LAUNCH_DEPENDENT_KERNELS=launch_dependent_kernels and use_internal_pdl,
+            USE_PERM=use_perm,
+            NUM_PERSISTENT=num_persistent_arg,
+            NUM_LOOP_STAGES=num_loop_stages_arg,
+            FLATTEN=flatten_arg,
+            WARP_SPECIALIZE=warp_specialize_arg,
+            IS_DYNAMIC=True,
             num_warps=num_warps,
             **({"num_stages": _num_stages} if _num_stages else {}),
             **({"num_ctas": _num_ctas} if _num_ctas else {}),
@@ -4415,6 +4492,15 @@ def checkpointing_state_update(
             launch_replay_precompute(write_checkpoint=True, early_out=True)
             launch_replay_main(write_checkpoint=True, early_out=True,
                                launch_dependent_kernels=False)
+        elif mode == "persistent_dynamic":
+            # Single-launch persistent kernel covering the full batch.
+            # Each work-item dispatches via runtime PNAT check (is_write =
+            # (pnat + T) > MAX).  No n_writes/half-split, no PDL hop
+            # between mains — only one main launch.  Precompute is
+            # dynamic_precompute (per-slot dispatch), so the whole pipeline
+            # is dynamic_precompute → persistent_dynamic_main.
+            launch_dynamic_precompute(rectangle=False)
+            launch_persistent_dynamic_main(launch_dependent_kernels=False)
         elif mode == "persistent_main":
             # Experimental: persistent-CTA main kernel.  Reuses maindl's
             # precompute structure (one shared dynamic_precompute that
