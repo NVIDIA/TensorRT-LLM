@@ -785,6 +785,8 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         pipeline.echo("CBTS: scope=${result.scope}, " +
                       "stages=${result.affected_stages.size()}")
         return result
+    } catch (InterruptedException e) {
+        throw e
     } catch (Exception e) {
         pipeline.echo("CBTS failed, falling back to full run: ${e}")
         return null
