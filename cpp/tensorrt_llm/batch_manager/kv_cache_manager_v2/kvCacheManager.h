@@ -83,7 +83,7 @@ struct PageIndexConverter
 // KvCacheManager — top-level KV cache manager.
 // Mirrors Python's KVCacheManager.
 // ---------------------------------------------------------------------------
-class KvCacheManager
+class KvCacheManager : public std::enable_shared_from_this<KvCacheManager>
 {
 public:
     explicit KvCacheManager(KVCacheManagerConfig const& config);
