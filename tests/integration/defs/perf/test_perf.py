@@ -348,7 +348,7 @@ PERF_METRIC_LOG_QUERIES = {
     re.compile(r"\[BENCHMARK\].* avg_sequence_latency\(ms\) ([\d\.]+)"),
     PerfMetricType.SEQ_THROUGHPUT:
     re.compile(r"\[BENCHMARK\].* seq_throughput\(seq\/sec\) ([\d\.]+)"),
-    PerfMetricType.TOKEN_THROUGHPUT:
+    PerfMetricType.OUTPUT_TOKEN_THROUGHPUT:
     re.compile(
         r"\[BENCHMARK\].* (?:token_throughput\(token\/sec\)|tokensPerSec|tokens_per_sec) ([\d\.]+)"
     ),
@@ -375,7 +375,7 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
     re.compile(r"Engine generation completed in ([\d\.]+) seconds"),
     PerfMetricType.INFERENCE_TIME:
     re.compile(r"Total Latency \(ms\):\s+([\d\.]+)"),
-    PerfMetricType.TOKEN_THROUGHPUT:
+    PerfMetricType.OUTPUT_TOKEN_THROUGHPUT:
     re.compile(r"GPU Output Throughput \(tps\/gpu\):\s+([\d\.]+)"),
     PerfMetricType.SEQ_THROUGHPUT:
     re.compile(r"Request Throughput \(req\/sec\):\s+([\d\.]+)"),
@@ -396,7 +396,7 @@ BENCH_PERF_METRIC_LOG_QUERIES = {
 AGGR_SERVER_PERF_METRIC_LOG_QUERIES = {
     PerfMetricType.SEQ_THROUGHPUT:
     re.compile(r"Request throughput \(req\/s\):\s+(-?[\d\.]+)"),
-    PerfMetricType.TOKEN_THROUGHPUT:
+    PerfMetricType.OUTPUT_TOKEN_THROUGHPUT:
     re.compile(r"Output token throughput \(tok\/s\):\s+(-?[\d\.]+)"),
     PerfMetricType.TOTAL_TOKEN_THROUGHPUT:
     re.compile(r"Total Token throughput \(tok\/s\):\s+(-?[\d\.]+)"),
@@ -456,7 +456,7 @@ PERF_METRIC_THRESHOLD = {
     PerfMetricType.P99_INTER_TOKEN_TIME:
     (0.1, 50),  # Ignore p99 inter token time regression < 50ms
     PerfMetricType.SEQ_LATENCY: (0.1, 50),  # Ignore latency regression < 50ms
-    PerfMetricType.TOKEN_THROUGHPUT: (
+    PerfMetricType.OUTPUT_TOKEN_THROUGHPUT: (
         -0.1, 10
     ),  # Ignore throughput regression < 10 tokens/s. Negative rel threshold is to indicate that larger is better.
     PerfMetricType.TOTAL_TOKEN_THROUGHPUT: (-0.1, 10),
@@ -492,7 +492,7 @@ PERF_METRIC_STRING = {
     PerfMetricType.MEDIAN_INTER_TOKEN_TIME: "median_itl",
     PerfMetricType.P99_INTER_TOKEN_TIME: "p99_itl",
     PerfMetricType.SEQ_LATENCY: "seq_latency",
-    PerfMetricType.TOKEN_THROUGHPUT: "token_throughput",
+    PerfMetricType.OUTPUT_TOKEN_THROUGHPUT: "output_token_throughput",
     PerfMetricType.TOTAL_TOKEN_THROUGHPUT: "total_token_throughput",
     PerfMetricType.USER_THROUGHPUT: "user_throughput",
     PerfMetricType.SEQ_THROUGHPUT: "seq_throughput",
@@ -519,7 +519,7 @@ INFERENCE_METRICS = [
 
 AGGR_SERVER_METRICS = [
     PerfMetricType.SEQ_THROUGHPUT,
-    PerfMetricType.TOKEN_THROUGHPUT,
+    PerfMetricType.OUTPUT_TOKEN_THROUGHPUT,
     PerfMetricType.TOTAL_TOKEN_THROUGHPUT,
     PerfMetricType.USER_THROUGHPUT,
     PerfMetricType.FIRST_TOKEN_TIME,
@@ -538,7 +538,7 @@ AGGR_SERVER_METRICS = [
 
 BENCH_INFERENCE_METRICS = [
     PerfMetricType.INFERENCE_TIME,
-    PerfMetricType.TOKEN_THROUGHPUT,
+    PerfMetricType.OUTPUT_TOKEN_THROUGHPUT,
     PerfMetricType.SEQ_THROUGHPUT,
     PerfMetricType.KV_CACHE_SIZE,
 ]
