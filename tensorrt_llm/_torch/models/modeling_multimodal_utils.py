@@ -16,6 +16,7 @@
 # This file is based on official VILA: https://github.com/NVlabs/VILA/
 # and s2wrapper: https://github.com/bfshi/scaling_on_scales
 
+import contextlib
 import math
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
@@ -36,6 +37,70 @@ _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
 # Make this a runtime lookup rather than a module-wide constant for easier unit testing.
 def _is_disagg() -> bool:
     return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
+
+
+# Processor *output* keys that transformers 5.x's
+# ``ProcessorMixin._merge_kwargs`` strictly rejects when they leak into
+# ``output_kwargs[<modality>]`` and reach ``validate_typed_dict``. They
+# round-trip into call kwargs via saved tokenizer ``init_kwargs`` /
+# ``model_input_names``, sub-processor metadata, or per-item processed
+# fields, even when no caller passed them as inputs.
+_PROCESSOR_OUTPUT_KEYS = frozenset({
+    "image_grid_thw",
+    "video_grid_thw",
+    "pixel_values",
+    "pixel_values_videos",
+    "second_per_grid_ts",
+    "mm_token_type_ids",
+})
+
+
+@contextlib.contextmanager
+def bypass_processor_output_validation():
+    """Filter processor-output keys out of ``validate_typed_dict`` for the
+    duration of an HF processor call.
+
+    transformers 5.x added strict per-modality TypedDict validation in
+    ``ProcessorMixin._merge_kwargs``. The leak is an upstream bug: e.g.
+    ``Qwen2_5_VLProcessor._get_num_multimodal_tokens`` does
+    ``Qwen2_5_VLProcessorKwargs._defaults["videos_kwargs"].update(kwargs)``
+    on the class-level default dict (instead of a copy), so once any caller
+    passes ``video_grid_thw`` to ``get_num_multimodal_tokens`` it gets baked
+    into the per-modality default and leaks into every subsequent processor
+    call's ``output_kwargs[<modality>]`` — tripping the validator with
+    ``TypeError: merged_typed_dict.__init__() got an unexpected keyword
+    argument 'video_grid_thw'`` even when no caller passes such keys.
+
+    Patches ``validate_typed_dict`` in *all* transformers modules that bind
+    it (``processing_utils``, ``image_processing_utils_fast``,
+    ``video_processing_utils``) — each has its own ``from
+    huggingface_hub.dataclasses import validate_typed_dict``, so patching
+    only one is insufficient to cover sub-processor validation paths. The
+    originals are restored on exit.
+    """
+    import transformers.image_processing_utils_fast as _ipuf
+    import transformers.processing_utils as _pu
+    import transformers.video_processing_utils as _vpu
+
+    binders = (_pu, _ipuf, _vpu)
+    originals = {b: b.validate_typed_dict for b in binders}
+    base_orig = next(iter(originals.values()))
+
+    def _filtered_validate(schema, data):
+        if isinstance(data, dict):
+            data = {
+                k: v
+                for k, v in data.items() if k not in _PROCESSOR_OUTPUT_KEYS
+            }
+        return base_orig(schema, data)
+
+    for b in binders:
+        b.validate_typed_dict = _filtered_validate
+    try:
+        yield
+    finally:
+        for b, orig in originals.items():
+            b.validate_typed_dict = orig
 
 
 def _get_uncached_multimodal_params(

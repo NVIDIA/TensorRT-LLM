@@ -626,7 +626,7 @@ class Mistral4Model(Mistral4PreTrainedModel):
 
 
 class Mistral4ForCausalLM(Mistral4PreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: Mistral4TextConfig, **kwargs):
         super().__init__(config)

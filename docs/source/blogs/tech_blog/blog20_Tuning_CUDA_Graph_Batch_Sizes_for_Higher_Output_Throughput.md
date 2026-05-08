@@ -1,6 +1,6 @@
 # Tuning CUDA Graph Batch Sizes for Higher Output Throughput
 
-By NVIDIA TensorRT-LLM Team
+By NVIDIA TensorRT LLM Team
 
 CUDA graphs reduce per-step GPU launch overhead by pre-recording sequences of GPU operations and replaying them as a single unit. In TensorRT-LLM, CUDA graphs are captured for a fixed set of batch sizes; when CUDA graph padding is enabled, an incoming batch is padded to the next available captured size, wasting some compute on empty slots. The default configuration captures only 23 batch sizes using a roughly-doubling progression, leaving gaps of up to 1024 between consecutive sizes in the high-concurrency range. This post investigates the throughput impact of filling those gaps with finer-grained batch size sets, and characterizes the resulting GPU memory and server startup time overhead.
 
@@ -61,7 +61,7 @@ In aggregated mode, we measure the TPS improvement of the +64 config over the de
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog20_aggr_all_models.png" alt="Relative output throughput improvement of +64 vs x2 config in aggregated mode across all four models" width="700">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog20_aggr_all_models.png" alt="Relative output throughput improvement of +64 vs x2 config in aggregated mode across all four models" width="700">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1. Relative output throughput improvement (%) of the +64 config over x2 in aggregated mode for all four models.</em></sub></p>
@@ -74,7 +74,7 @@ In disaggregated mode, we use 4 to 8 GPUs for the context server and 4 for the g
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog20_disagg_all_models.png" alt="Relative output throughput improvement of +64 vs x2 config in disaggregated mode across all four models" width="700">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog20_disagg_all_models.png" alt="Relative output throughput improvement of +64 vs x2 config in disaggregated mode across all four models" width="700">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2. Relative output throughput improvement (%) of the +64 config over x2 in disaggregated mode for all four models. C8G4 denotes 8 context GPUs and 4 generation GPUs; C4G4 denotes 4 context and 4 generation GPUs.</em></sub></p>
@@ -115,7 +115,7 @@ Experiments are conducted in disaggregated mode under the same ISL=500, OSL=2000
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog20_p8_all_models.png" alt="TPS vs. concurrency for all four models in disaggregated mode comparing +8, +64, default, and no-padding configurations" width="800">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog20_p8_all_models.png" alt="TPS vs. concurrency for all four models in disaggregated mode comparing +8, +64, default, and no-padding configurations" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3. TPS vs. concurrency in disaggregated mode for all four models, comparing +8 (blue), +64 (red), default (yellow), and no-padding (green) configs.</em></sub></p>

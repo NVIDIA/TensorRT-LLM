@@ -71,7 +71,7 @@ def nano_llm_model():
     nano_llm = LLM(
         model=MODEL_PATH,
         tensor_parallel_size=1,
-        max_batch_size=2,
+        max_batch_size=24,
         cuda_graph_config=CudaGraphConfig(),
         kv_cache_config=KvCacheConfig(enable_block_reuse=False, mamba_ssm_cache_dtype="float32"),
     )

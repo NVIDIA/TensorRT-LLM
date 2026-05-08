@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 from torch import nn
-from transformers import AutoConfig, PretrainedConfig
+from transformers import NemotronHConfig, PretrainedConfig
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
@@ -50,10 +50,6 @@ from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .modeling_deepseekv3 import DeepseekV3MTPHead
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model
-
-
-class NemotronHConfig(PretrainedConfig):
-    model_type = "nemotron_h"
 
 
 class MLPLayer(MLP):
@@ -1104,6 +1100,3 @@ class NemotronHMTP(nn.Module):
                 lora_params=lora_params,
             )
         return hidden_states
-
-
-AutoConfig.register(NemotronHConfig.model_type, NemotronHConfig)

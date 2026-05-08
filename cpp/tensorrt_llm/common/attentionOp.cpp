@@ -734,6 +734,21 @@ int AttentionOp::getHeadSize(bool checkInit) const
     return mHeadSize;
 }
 
+size_t AttentionOp::getFmhaMultiCtasKvScratchSize() const noexcept
+{
+    static constexpr size_t kMultiCtasKvRowsPerCta = 256;
+    static constexpr size_t kMultiCtasKvStatsPerRow = 2;
+    static constexpr size_t kMultiCtasKvPartialOElementSize = 2;
+
+    size_t const headDimV
+        = mIsMLAEnabled ? static_cast<size_t>(mMLAParams.kv_lora_rank) : static_cast<size_t>(getHeadSize());
+    size_t const maxRows = kMultiCtasKvRowsPerCta * static_cast<size_t>(mMultiProcessorCount);
+    size_t const partialStatsSize = sizeof(float) * kMultiCtasKvStatsPerRow * maxRows;
+    size_t const partialOSize = kMultiCtasKvPartialOElementSize * maxRows * headDimV;
+
+    return partialStatsSize + partialOSize;
+}
+
 size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t max_num_seq, int32_t input_seq_length,
     int32_t cross_kv_length, int32_t max_num_tokens) const noexcept
 {
@@ -848,7 +863,9 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
         ? 0
         : (2 * size * cpMaxPaddedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads) + cu_seqlens_size);
 
-    int const NUM_BUFFERS = 26;
+    size_t const fmha_multi_ctas_kv_scratch_size = useTllmGenSparseAttention() ? getFmhaMultiCtasKvScratchSize() : 0;
+
+    int const NUM_BUFFERS = 27;
     size_t workspaces[NUM_BUFFERS];
     workspaces[0] = CUBLAS_WORKSPACE_SIZE;
     workspaces[1] = attention_mask_size;
@@ -876,6 +893,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     workspaces[23] = sage_k_sfs_buffer_size;
     workspaces[24] = sage_v_sfs_buffer_size;
     workspaces[25] = cpWorkspaceSize;
+    workspaces[26] = fmha_multi_ctas_kv_scratch_size;
     context_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
 
     return context_workspace_size;
@@ -925,23 +943,17 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
             flash_mla_workspace_size = tc::calculateTotalWorkspaceSize(flash_mla_workspaces, FLASH_MLA_NUM_BUFFERS);
         }
 
-        size_t cu_seqlens_size = sizeof(int) * (max_num_seq + 1);
-        size_t fmha_scheduler_counter = sizeof(uint32_t);
-        size_t headDim = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
+        size_t const cu_seqlens_size = sizeof(int) * (max_num_seq + 1);
+        size_t const fmha_scheduler_counter = sizeof(uint32_t);
+        size_t const fmha_multi_ctas_kv_scratch_size = getFmhaMultiCtasKvScratchSize();
 
-        int const NUM_BUFFERS = 7;
+        int const NUM_BUFFERS = 5;
         size_t workspaces[NUM_BUFFERS];
         workspaces[0] = mIsGenerationMLA ? 0 : cu_seqlens_size; // cu_q_len
         workspaces[1] = mIsGenerationMLA ? 0 : cu_seqlens_size; // cu_kv_len
         workspaces[2] = mIsGenerationMLA ? 0 : fmha_scheduler_counter;
-        // The multiCtasKvMode buffers. Each CTA at most handles 256 rows.
-        // And the seqLenKv is split into at most mMultiProcessorCount tiles.
-        workspaces[3] = size * 256 * mMultiProcessorCount * headDim;
-        // The partialSum size.
-        workspaces[4] = sizeof(float) * 256 * mMultiProcessorCount;
-        // The partialMax size.
-        workspaces[5] = sizeof(float) * 256 * mMultiProcessorCount;
-        workspaces[6] = flash_mla_workspace_size;
+        workspaces[3] = fmha_multi_ctas_kv_scratch_size;
+        workspaces[4] = flash_mla_workspace_size;
 
         fmha_v2_mla_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
     }
@@ -1517,6 +1529,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     size_t const cpWorkspaceSize
         = mCpSize == 1 ? 0 : 2 * sizeof(T) * cpMaxPadedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads);
 
+    size_t const fmha_multi_ctas_kv_scratch_size = useTllmGenSparseAttention() ? getFmhaMultiCtasKvScratchSize() : 0;
+
     bool const is_qk_buf_float_ = true;
 
     // Workspace pointer shift
@@ -1567,6 +1581,10 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     T* gatherOutBuffer = gatherInBuffer + cpMaxPadedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads);
     int* cu_cp_partial_seqlens = reinterpret_cast<int*>(
         gatherOutBuffer + cpMaxPadedSequenceLength * getHeadSize() * (mNumHeads + 2 * mNumKVHeads));
+
+    // sparse attention MultiCtasKv scratch pool
+    void* fmha_multi_ctas_kv_scratch_ptr
+        = nextWorkspacePtr(workspace_byte_ptr, offset, fmha_multi_ctas_kv_scratch_size);
 
     // build attention_mask, cu_seqlens, and padding_offset tensors
     // Note: self attn and cross attn should use different params
@@ -1978,6 +1996,10 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         if (useTllmGenSparseAttention())
         {
             fmhaParams.sparse_params = mRuntimeSparseAttentionParams;
+            // Sparse context reuses generation-style trtllm-gen kernels; provide the scratch pool
+            // and per-CTA counter so the autotuner can select MultiCtasKv variants.
+            fmhaParams.multiCtasKvScratchPtr = fmha_multi_ctas_kv_scratch_ptr;
+            fmhaParams.multiCtasKvCounterPtr = multiBlockSemaphores();
         }
 
         // Skip-softmax attention parameters

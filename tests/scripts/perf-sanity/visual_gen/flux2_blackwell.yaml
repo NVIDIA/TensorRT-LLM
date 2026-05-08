@@ -1,0 +1,37 @@
+metadata:
+  model_name: FLUX.2-dev
+  supported_gpus:
+    - B200
+hardware:
+  gpus_per_node: 4
+environment:
+  server_env_var: TLLM_LOG_LEVEL=info
+  client_env_var: ""
+server_configs:
+  - name: flux2_fp8_cfg1_ulysses4_teacache_on
+    server_config:
+      quant_config:
+        quant_algo: FP8
+        dynamic: true
+      attention:
+        backend: VANILLA
+      parallel:
+        enable_parallel_vae: false
+        dit_cfg_size: 1
+        dit_ulysses_size: 4
+      cache:
+        cache_backend: teacache
+      cuda_graph:
+        enable_cuda_graph: false
+    client_configs:
+      - name: 1024x1024_1f_50s_con1
+        prompt: A cat holding a sign that says hello world
+        backend: openai-images
+        generation_mode: t2i
+        size: 1024x1024
+        num_frames: 1
+        fps: 1
+        num_inference_steps: 50
+        seed: 42
+        max_concurrency: 1
+        num_prompts: 1
