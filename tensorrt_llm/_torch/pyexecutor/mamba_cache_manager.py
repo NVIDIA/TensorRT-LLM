@@ -868,7 +868,7 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             mamba_ssm_cache_dtype,
             mamba_layer_mask,
             execution_stream,
-            speculative_num_draft_tokens=(spec_config.max_draft_len
+            speculative_num_draft_tokens=(spec_config.tokens_per_gen_step - 1
                                           if spec_config is not None else None),
             model_type=model_type,
             use_replay_state_update=use_replay_state_update,
