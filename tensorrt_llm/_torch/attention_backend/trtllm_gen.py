@@ -16,11 +16,11 @@ Entry points:
     FlashInferTrtllmGenAttention.attention()      - Main attention method (called from TrtllmAttention.run).
 
 Example:
-    backend = FlashInferTrtllmGenAttention(kv_cache_manager=..., quant_config=...)
+    backend = FlashInferTrtllmGenAttention(attention_layer=..., kv_cache_manager=...)
     supported, reason = backend.is_supported(
-        q, attention_layer=..., metadata=..., forward_args=..., ...)
+        q, metadata=..., forward_args=..., ...)
     if supported:
-        backend.attention(q, attention_layer=..., metadata=..., forward_args=..., ...)
+        backend.attention(q, metadata=..., forward_args=..., ...)
     else:
         Fallback to thop.attention()
 """
@@ -544,13 +544,14 @@ class FlashInferTrtllmGenAttention:
 
     def __init__(
         self,
+        attention_layer: "TrtllmAttention",
         kv_cache_manager: Optional[KVCacheManager] = None,
-        quant_config: Optional[QuantConfig] = None,
     ):
+        self._attention_layer = attention_layer
         self._checker = TrtllmGenSupportChecker()
         self._layout = self.DEFAULT_KV_LAYOUT
         self._kv_cache_manager = kv_cache_manager
-        self._quant_config = quant_config
+        self._quant_config = attention_layer.quant_config
         self._multi_processor_count_cache = {}
         self._enable_pdl = get_env_enable_pdl()
         missing_ops = self._missing_fused_nanobind_ops()
@@ -568,7 +569,6 @@ class FlashInferTrtllmGenAttention:
         self,
         q: torch.Tensor,
         *,
-        attention_layer: "TrtllmAttention",
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
         mask_type: int,
@@ -591,6 +591,7 @@ class FlashInferTrtllmGenAttention:
         if output is None:
             return False, "trtllm-gen requires forward_args.output."
 
+        attention_layer = self._attention_layer
         return self._checker.is_supported(
             q_dtype=q.dtype,
             kv_cache_dtype=self._kv_cache_manager.dtype,
@@ -640,12 +641,12 @@ class FlashInferTrtllmGenAttention:
         self,
         q: torch.Tensor,
         *,
-        attention_layer: "TrtllmAttention",
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
         mask_type: int,
         use_paged_context_fmha: bool,
     ) -> None:
+        attention_layer = self._attention_layer
         layer_idx = attention_layer.get_local_layer_idx(metadata)
         logger.debug(f"trtllm_gen_attention starts at layer {layer_idx}")
 

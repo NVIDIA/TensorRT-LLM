@@ -1212,8 +1212,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if (backend is None or backend_kv_cache_manager is not kv_cache_manager
                 or backend_quant_config is not self.quant_config):
             backend = trtllm_gen.FlashInferTrtllmGenAttention(
+                attention_layer=self,
                 kv_cache_manager=kv_cache_manager,
-                quant_config=self.quant_config,
             )
             self._trtllm_gen_backend = backend
             self._trtllm_gen_backend_kv_cache_manager = kv_cache_manager
@@ -1373,7 +1373,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                                           output_sf=output_sf)
         if trtllm_gen_backend is not None and trtllm_gen_backend.is_supported(
                 q,
-                attention_layer=self,
                 metadata=metadata,
                 forward_args=trtllm_gen_forward_args,
                 mask_type=int(mask_type),
@@ -1388,7 +1387,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         )[0]:
             trtllm_gen_backend.attention(
                 q,
-                attention_layer=self,
                 metadata=metadata,
                 forward_args=trtllm_gen_forward_args,
                 mask_type=int(mask_type),
