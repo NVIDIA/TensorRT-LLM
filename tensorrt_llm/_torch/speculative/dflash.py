@@ -168,16 +168,15 @@ class DFlashWorker(SpecWorkerBase):
         self._resolved_mask_token_id = None
         self._resolved_block_size = None
 
-        # Pre-allocated context buffers (lazy-init on first forward).
-        # Replaces per-request Python dicts with fixed-size CUDA buffers
-        # indexed by slot, enabling CUDA graph compatibility.
+        # Pre-allocated per-slot context K/V buffers, built lazily on the
+        # first forward. Fixed-size so slot-indexed reads/writes are CUDA
+        # graph compatible.
         self._ctx_buf_inited = False
-        self._ctx_buf = None  # [max_batch, max_ctx, proj_dim]
-        self._ctx_pos_buf = None  # [max_batch, max_ctx]
-        self._ctx_len = None  # [max_batch] actual context length per slot
-        self._batch_to_slot = None  # [max_batch] maps batch pos -> buffer slot
+        self._ctx_len = None
+        self._batch_to_slot = None
         self._max_ctx = 0
-        self._proj_dim = 0
+        self._ctx_k_buf = None  # [max_batch, L, max_ctx+block, nkv, hd]
+        self._ctx_v_buf = None
 
         # Slot management (Python, updated in prepare() and eager mode)
         self._req_to_slot = {}  # request_id -> slot index
@@ -201,16 +200,10 @@ class DFlashWorker(SpecWorkerBase):
         return 2 * self.max_draft_len
 
     def _lazy_init_ctx_buffers(self, draft_model, spec_metadata):
-        """Initialize pre-allocated context buffers on first forward."""
         if self._ctx_buf_inited:
             return
 
         max_batch = spec_metadata.max_num_requests
-
-        if hasattr(draft_model, "fc"):
-            self._proj_dim = draft_model.fc.weight.shape[0]
-        else:
-            self._proj_dim = spec_metadata.hidden_size
 
         config_max_ctx = getattr(self.spec_config, "max_ctx_len", None)
         if config_max_ctx is not None:
@@ -222,20 +215,30 @@ class DFlashWorker(SpecWorkerBase):
 
         dtype = draft_model.fc.weight.dtype if hasattr(draft_model, "fc") else torch.bfloat16
 
-        self._ctx_buf = torch.zeros(
-            (max_batch, self._max_ctx, self._proj_dim), dtype=dtype, device="cuda"
-        )
-        self._ctx_pos_buf = torch.zeros((max_batch, self._max_ctx), dtype=torch.long, device="cuda")
         self._ctx_len = torch.zeros(max_batch, dtype=torch.long, device="cuda")
         self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
 
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
+
+        # +block_size slack lets per-iter noise K/V scatter into the gathered
+        # view and flash_attn read it in place.
+        assert hasattr(draft_model, "_build_fused_kv_buffers"), (
+            "DFlash draft model must define _build_fused_kv_buffers."
+        )
+        draft_model._build_fused_kv_buffers()
+        L = draft_model._num_attn_layers
+        nkv = draft_model._num_kv_heads
+        hd = draft_model._head_dim
+        block_size = getattr(draft_model, "block_size", None) or (self.max_draft_len + 1)
+        kv_shape = (max_batch, L, self._max_ctx + block_size, nkv, hd)
+        self._ctx_k_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
+        self._ctx_v_buf = torch.zeros(kv_shape, dtype=dtype, device="cuda")
         self._ctx_buf_inited = True
 
         logger.info(
             f"DFlash: allocated ctx buffers: max_batch={max_batch}, "
-            f"max_ctx={self._max_ctx}, proj_dim={self._proj_dim}, dtype={dtype}"
+            f"max_ctx={self._max_ctx}, dtype={dtype}"
         )
 
     def _prepare_attn_metadata_for_dflash(self, attn_metadata, spec_metadata):
@@ -343,9 +346,16 @@ class DFlashWorker(SpecWorkerBase):
             end = min(cur + slen, self._max_ctx)
             actual = end - cur
             if actual > 0:
-                self._ctx_buf[slot, cur:end] = chunk_proj[:actual].to(self._ctx_buf.dtype)
-                self._ctx_pos_buf[slot, cur:end] = chunk_pos[:actual]
+                chunk_proj_cast = chunk_proj[:actual].to(self._ctx_k_buf.dtype)
                 self._ctx_len[slot] = end
+                # Precompute post-norm/post-RoPE K,V for this prefill chunk
+                # so decode iters can read without re-projecting.
+                chunk_k, chunk_v = draft_model.precompute_context_kv(
+                    chunk_proj_cast, chunk_pos[:actual]
+                )
+                # chunk_k/v: [actual, L, nkv, hd] → [L, actual, nkv, hd]
+                self._ctx_k_buf[slot, :, cur:end] = chunk_k.permute(1, 0, 2, 3)
+                self._ctx_v_buf[slot, :, cur:end] = chunk_v.permute(1, 0, 2, 3)
             offset += slen
 
     def forward(
@@ -458,13 +468,13 @@ class DFlashWorker(SpecWorkerBase):
 
         if num_gens > 0:
             with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-                # Use custom dflash_forward with cross-attention
                 hidden_states_out = draft_model.dflash_forward(
                     noise_embedding=inputs["noise_embedding"],
-                    target_hidden=inputs["target_hidden"],
                     query_positions=inputs["query_positions"],
-                    context_positions=inputs["context_positions"],
                     num_ctx_per_req=inputs["num_ctx_per_req"],
+                    ctx_k_cache=inputs["ctx_k_cache"],
+                    ctx_v_cache=inputs["ctx_v_cache"],
+                    ctx_cache_batch_idx=inputs["ctx_cache_batch_idx"],
                 )
 
                 # Gather K logits per gen request from mask positions (1..K).
@@ -546,17 +556,14 @@ class DFlashWorker(SpecWorkerBase):
         draft_model: nn.Module,
         total_target_tokens: int = 0,
     ):
-        """
-        Prepare inputs for DFlash draft model with proper cross-attention.
+        """Prepare inputs for DFlash's draft forward.
 
         For gen requests, builds:
-        - noise_embedding: token embeddings for [accepted_tokens + mask_tokens] (2K per req)
-        - target_hidden: projected target features at accepted positions (context for cross-attn)
-        - query_positions: position IDs for all 2K query tokens
-        - context_positions: position IDs for the accepted (context) tokens
-        - num_ctx_per_req: per-request context token counts
-
-        The target_hidden stays CONSTANT across layers and provides K/V context.
+        - noise_embedding: token embeddings for [accepted + mask] tokens
+        - query_positions: position IDs for the query tokens
+        - num_ctx_per_req: per-request context length in the pool
+        - ctx_k_cache / ctx_v_cache / ctx_cache_batch_idx: slot-indexed
+          views of the persistent per-layer K/V pool.
         """
         num_contexts = attn_metadata.num_contexts
         batch_size = attn_metadata.num_seqs
@@ -657,7 +664,6 @@ class DFlashWorker(SpecWorkerBase):
                     gen_hs_to_project.to(draft_model.fc.weight.dtype)
                 )
                 projected_to_store = draft_model.hidden_norm(projected_to_store)
-                projected_to_store = projected_to_store.reshape(num_gens, K + 1, -1)
                 gen_num_accepted_long = gen_num_accepted.long()
                 col_idx = self._ctx_len[slots].unsqueeze(1) + offsets_kp1.unsqueeze(0)
                 write_mask = offsets_kp1.unsqueeze(0) < gen_num_accepted_long.unsqueeze(1)
@@ -669,25 +675,27 @@ class DFlashWorker(SpecWorkerBase):
                 # _ctx_len range, so they're harmless.
                 slot_flat = slots.unsqueeze(1).expand(-1, K + 1).reshape(-1)
                 col_flat = col_idx.reshape(-1)
-                proj_flat = projected_to_store.reshape(-1, self._proj_dim)
+                proj_flat = projected_to_store  # already [num_gens*(K+1), proj_dim]
                 pos_flat = ctx_position_ids.long().reshape(-1)
-
                 mask_1d = write_mask.reshape(-1)
-                proj_masked = proj_flat * mask_1d.unsqueeze(1).to(proj_flat.dtype)
-                pos_masked = pos_flat * mask_1d.long()
 
-                self._ctx_buf[slot_flat, col_flat] = proj_masked.to(self._ctx_buf.dtype)
-                self._ctx_pos_buf[slot_flat, col_flat] = pos_masked
+                # Fast path: store the pre-projected/pre-RoPE'd K/V.
+                # dflash_forward reads these directly via cache_batch_idx.
+                k_new, v_new = draft_model.precompute_context_kv(
+                    proj_flat.to(self._ctx_k_buf.dtype), pos_flat
+                )
+                mask_bc = mask_1d.view(-1, 1, 1, 1).to(k_new.dtype)
+                k_new = k_new * mask_bc
+                v_new = v_new * mask_bc
+                slot_long = slot_flat.long()
+                col_long = col_flat.long()
+                self._ctx_k_buf[slot_long, :, col_long] = k_new
+                self._ctx_v_buf[slot_long, :, col_long] = v_new
 
                 self._ctx_len[slots] += gen_num_accepted_long
                 self._ctx_len.clamp_(max=self._max_ctx)
 
-            # Read padded context from buffers (fixed shape for CUDA graph)
-            target_hidden = self._ctx_buf[slots]
-            context_positions = self._ctx_pos_buf[slots].long()
             num_ctx_per_req_t = self._ctx_len[slots]
-
-            # 3D padded tensors for CUDA graph compatible dflash_forward
             noise_embedding = noise_embed_2d
             query_positions = query_position_ids.long()
 
@@ -698,15 +706,15 @@ class DFlashWorker(SpecWorkerBase):
             attn_metadata._seq_lens[num_contexts : num_contexts + num_gens] = total_tokens_per_req
         else:
             noise_embedding = hidden_states.new_empty(0, 0, hidden_dim)
-            target_hidden = hidden_states.new_empty(0, 0, hidden_dim)
             query_positions = torch.empty(0, 0, dtype=torch.long, device="cuda")
-            context_positions = torch.empty(0, 0, dtype=torch.long, device="cuda")
             num_ctx_per_req_t = torch.empty(0, dtype=torch.long, device="cuda")
+            slots = torch.empty(0, dtype=torch.long, device="cuda")
 
         return {
             "noise_embedding": noise_embedding,
-            "target_hidden": target_hidden,
             "query_positions": query_positions,
-            "context_positions": context_positions,
             "num_ctx_per_req": num_ctx_per_req_t,
+            "ctx_k_cache": self._ctx_k_buf,
+            "ctx_v_cache": self._ctx_v_buf,
+            "ctx_cache_batch_idx": slots,
         }
