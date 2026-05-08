@@ -37,9 +37,10 @@ from .._tensorrt_engine import LLM
 from ..inputs import (ConversationMessage, MultimodalDataTracker,
                       add_multimodal_placeholders, convert_image_mode)
 from ..inputs.content_format import ContentFormat
+from ..inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from ..inputs.utils import _resolve_content_format
 from ..inputs.utils import apply_chat_template as trtllm_apply_chat_template
-from ..inputs.utils import resolve_hf_chat_template
+from ..inputs.utils import interleave_mm_placeholders, resolve_hf_chat_template
 from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
@@ -224,20 +225,19 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             llm)
         self.is_force_single_image = is_force_single_image
 
-        # For OPENAI content-format templates (e.g., Gemma4, Qwen2.5-VL), preserve
-        # the original interleaved positions of images inside the question text.
-        # Benchmarks such as MMMU Pro embed ``<image N>`` tags inside the question
-        # (e.g., "Consider <image 1>. What does <image 2> show?") and lose answer
-        # grounding when all images are bulk-prepended before the text.  Setting
-        # interleave=True makes apply_chat_template below produce a
-        # ``content_parts`` list that interleaves text segments with media entries,
-        # which ``_build_openai_content`` turns into a correctly-ordered OpenAI
-        # content list.  Effect is bounded by the fraction of multi-image
-        # questions in the task — modest on MMMU Pro (~8% multi-image, ~+1 pp)
-        # but critical when it matters.  STRING-template paths still use the old
-        # strip-and-prepend behaviour (interleaving is handled via the registered
-        # placeholder_placement at the content-flattening step).
-        self.interleave = True
+        # Default off; models opt in via
+        # ``MultimodalPlaceholderMetadata.interleave_placeholders=True`` in
+        # their ``@register_input_processor`` registration. When opted in,
+        # ``apply_chat_template`` below builds a ``content_parts`` list whose
+        # order mirrors the original ``<image>`` positions in the user
+        # prompt — required by benchmarks like MMMU Pro which embed
+        # ``<image N>`` tags inside the question (e.g., "Consider <image 1>.
+        # What does <image 2> show?") and lose grounding under bulk
+        # prepend/append. Off-by-default preserves the historical
+        # strip-and-bulk-insert behaviour for every other registered model
+        # so existing scores stay identical.
+        self.interleave = MULTIMODAL_PLACEHOLDER_REGISTRY.get_interleave_placeholders(
+            self.model_type)
 
     def _get_model_type(self, llm: Union[LLM, PyTorchLLM]) -> str:
         """Extract model type from the model configuration."""
@@ -288,11 +288,11 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             image_count = min(self.max_images,
                               text.count(LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER))
 
-            # Interleaved content_parts is only meaningful for OPENAI
-            # templates (which consume a list-of-dicts content). STRING
-            # templates use add_multimodal_placeholders on the flat text.
-            build_interleaved = (self.interleave and image_count > 1
-                                 and content_format == ContentFormat.OPENAI)
+            # Build a content_parts list that interleaves text segments with
+            # media dicts, mirroring the user's original placeholder positions.
+            # OPENAI templates consume the list directly; STRING templates
+            # flatten it via ``interleave_mm_placeholders`` below.
+            build_interleaved = self.interleave and image_count >= 1
             content_parts = None
             if build_interleaved:
                 segments = text.split(LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER)
@@ -329,10 +329,22 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
                 mm_data_tracker.add_data("image", None)
             mm_placeholder_count = mm_data_tracker.placeholder_counts()
             if mm_placeholder_count and content_format != ContentFormat.OPENAI:
-                # Only pre-insert placeholders for STRING templates.
-                # OPENAI templates handle media natively via content dicts.
-                conv["content"] = add_multimodal_placeholders(
-                    self.model_type, conv["content"], mm_placeholder_count)
+                # STRING templates expect placeholders pre-inserted into the
+                # text.  When ``content_parts`` was built (interleave path),
+                # use ``interleave_mm_placeholders`` so the placeholders land
+                # at the original media positions; otherwise fall back to the
+                # registry placeholder_placement-driven bulk insertion.
+                if content_parts is not None:
+                    placeholder_modalities = {
+                        ph: "image"
+                        for ph in mm_placeholder_count
+                    }
+                    conv["content"] = interleave_mm_placeholders(
+                        self.model_type, content_parts, mm_placeholder_count,
+                        placeholder_modalities)
+                else:
+                    conv["content"] = add_multimodal_placeholders(
+                        self.model_type, conv["content"], mm_placeholder_count)
             mm_placeholder_counts.append(mm_placeholder_count)
             chat_history[i] = conv
 
@@ -1028,10 +1040,14 @@ class MMMUPro(LmEvalEvaluator):
                   type=int,
                   default=8192,
                   help="Maximum prompt length.")
-    @click.option("--max_output_length",
-                  type=int,
-                  default=512,
-                  help="Maximum generation length.")
+    @click.option(
+        "--max_output_length",
+        type=int,
+        default=32000,
+        show_default=True,
+        help="Maximum generation length.  Default mirrors the lm-eval "
+        "harness yaml (``max_gen_toks: 32000``) under "
+        "tensorrt_llm/evaluate/lm_eval_tasks/mmmu_pro/_template_yaml.")
     @click.option("--temperature",
                   type=float,
                   default=None,
@@ -1419,36 +1435,37 @@ class AIME2026(LmEvalEvaluator):
     @click.option("--max_input_length",
                   type=int,
                   default=4096,
-                  help="Maximum prompt length.")
-    @click.option("--max_output_length",
-                  type=int,
-                  default=32768,
-                  show_default=True,
-                  help="Maximum generation length "
-                  "(AIME is long-CoT; upstream yaml uses max_gen_toks=32768). "
-                  "Must fit within trtllm-eval --max_seq_len = "
-                  "max_input_length + max_output_length.")
-    @click.option("--temperature",
-                  type=float,
-                  default=1.0,
-                  show_default=True,
-                  help="Sampling temperature. Default matches the Gemma 4 "
-                  "recommended recipe (temperature=1.0); overrides task yaml "
-                  "gen_kwargs (which is greedy). Pass --temperature 0 to "
-                  "reproduce the lm-eval greedy leaderboard score.")
+                  help="Maximum prompt length. AIME problems are short math "
+                  "statements; 4k tokens covers the dataset with room for the "
+                  "chat template overhead.")
+    @click.option(
+        "--max_output_length",
+        type=int,
+        default=32768,
+        show_default=True,
+        help="Maximum generation length. Mirrors the lm-eval harness yaml "
+        "(``max_gen_toks: 32768``) under "
+        "tensorrt_llm/evaluate/lm_eval_tasks/aime/. AIME is long-CoT; must "
+        "fit within ``--max_seq_len = max_input_length + max_output_length``.")
+    @click.option(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Sampling temperature. Defaults to the task yaml ``gen_kwargs`` "
+        "(harness aime25/26 yaml is greedy). Pass a value to override "
+        "(e.g. set the Gemma 4 sampling recipe via ``--temperature 1.0 "
+        "--top_p 0.95 --top_k 64``).")
     @click.option(
         "--top_p",
         type=float,
-        default=0.95,
-        show_default=True,
-        help="Nucleus sampling top_p. Default 0.95 per Gemma 4 recipe. "
-        "Overrides task yaml gen_kwargs.")
+        default=None,
+        help="Nucleus sampling top_p. Defaults to the task yaml gen_kwargs; "
+        "overrides when set.")
     @click.option("--top_k",
                   type=int,
-                  default=64,
-                  show_default=True,
-                  help="Top-k sampling. Default 64 per Gemma 4 recipe. "
-                  "Overrides task yaml gen_kwargs.")
+                  default=None,
+                  help="Top-k sampling. Defaults to the task yaml gen_kwargs; "
+                  "overrides when set.")
     @click.option("--sampling_seed",
                   type=int,
                   default=None,
@@ -1534,36 +1551,37 @@ class AIME2025(LmEvalEvaluator):
     @click.option("--max_input_length",
                   type=int,
                   default=4096,
-                  help="Maximum prompt length.")
-    @click.option("--max_output_length",
-                  type=int,
-                  default=32768,
-                  show_default=True,
-                  help="Maximum generation length "
-                  "(AIME is long-CoT; upstream yaml uses max_gen_toks=32768). "
-                  "Must fit within trtllm-eval --max_seq_len = "
-                  "max_input_length + max_output_length.")
-    @click.option("--temperature",
-                  type=float,
-                  default=1.0,
-                  show_default=True,
-                  help="Sampling temperature. Default matches the Gemma 4 "
-                  "recommended recipe (temperature=1.0); overrides task yaml "
-                  "gen_kwargs (which is greedy). Pass --temperature 0 to "
-                  "reproduce the lm-eval greedy leaderboard score.")
+                  help="Maximum prompt length. AIME problems are short math "
+                  "statements; 4k tokens covers the dataset with room for the "
+                  "chat template overhead.")
+    @click.option(
+        "--max_output_length",
+        type=int,
+        default=32768,
+        show_default=True,
+        help="Maximum generation length. Mirrors the lm-eval harness yaml "
+        "(``max_gen_toks: 32768``) under "
+        "tensorrt_llm/evaluate/lm_eval_tasks/aime/. AIME is long-CoT; must "
+        "fit within ``--max_seq_len = max_input_length + max_output_length``.")
+    @click.option(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Sampling temperature. Defaults to the task yaml ``gen_kwargs`` "
+        "(harness aime25/26 yaml is greedy). Pass a value to override "
+        "(e.g. set the Gemma 4 sampling recipe via ``--temperature 1.0 "
+        "--top_p 0.95 --top_k 64``).")
     @click.option(
         "--top_p",
         type=float,
-        default=0.95,
-        show_default=True,
-        help="Nucleus sampling top_p. Default 0.95 per Gemma 4 recipe. "
-        "Overrides task yaml gen_kwargs.")
+        default=None,
+        help="Nucleus sampling top_p. Defaults to the task yaml gen_kwargs; "
+        "overrides when set.")
     @click.option("--top_k",
                   type=int,
-                  default=64,
-                  show_default=True,
-                  help="Top-k sampling. Default 64 per Gemma 4 recipe. "
-                  "Overrides task yaml gen_kwargs.")
+                  default=None,
+                  help="Top-k sampling. Defaults to the task yaml gen_kwargs; "
+                  "overrides when set.")
     @click.option("--sampling_seed",
                   type=int,
                   default=None,

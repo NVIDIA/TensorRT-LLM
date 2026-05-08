@@ -74,7 +74,7 @@ def _is_disagg() -> bool:
     return os.getenv(_MULTIMODAL_ENV_NAME, "0") == "1"
 
 
-class _RMSNormNoScale(nn.Module):
+class RMSNormNoScale(nn.Module):
     """RMSNorm without learnable scale (for multimodal embedder pre-projection)."""
 
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -111,7 +111,7 @@ class Gemma4MultimodalEmbedder(nn.Module):
         mapping=None,
     ):
         super().__init__()
-        self.embedding_pre_projection_norm = _RMSNormNoScale(mm_hidden_size, eps=eps)
+        self.embedding_pre_projection_norm = RMSNormNoScale(mm_hidden_size, eps=eps)
         self.embedding_projection = Linear(
             in_features=mm_hidden_size,
             out_features=text_hidden_size,
@@ -480,6 +480,19 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
 @register_input_processor(
     Gemma4InputProcessor,
     model_type="gemma4",
+    # Gemma4's HF chat template is ContentFormat.OPENAI: it iterates the
+    # content list-of-dicts in order and emits ``<|image|>`` / ``<|audio|>``
+    # tokens at exactly the position where each media item appears.  That
+    # makes the *order* of items in the OpenAI content list load-bearing.
+    #
+    # ``interleave_placeholders=True`` opts this model into the
+    # position-preserving build path in ``MultimodalLmEvalWrapper`` and
+    # ``serve/chat_utils.py`` — when the user prompt embeds placeholders
+    # inside text (e.g. MMMU Pro: "Consider <image 1>. What does <image 2>
+    # show?"), the corresponding ``content_parts`` entry sits at the same
+    # position, preserving question grounding.  ``placeholder_placement``
+    # is retained as a fallback for callers that still bulk-insert (e.g.
+    # ``add_multimodal_placeholders`` against a pre-stripped string).
     placeholder_metadata=MultimodalPlaceholderMetadata(
         placeholder_map={
             "image": "<|image|>",
@@ -488,6 +501,7 @@ class Gemma4InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInpu
         },
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         content_format=ContentFormat.OPENAI,
+        interleave_placeholders=True,
     ),
 )
 class Gemma4ForConditionalGeneration(PreTrainedModel):
