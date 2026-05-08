@@ -243,6 +243,7 @@ class DeepseekV4PackedMxfp4ExpertsCheckpointLayout(PackedMXFP4ExpertCheckpointLa
     """Checkpoint layout for DeepSeek V4 packed MXFP4 routed expert tensors."""
 
     expert_block_size: ClassVar[int] = 32
+    packed_values_per_byte: ClassVar[int] = 2
     weight_dtypes: ClassVar[tuple[str, ...]] = ("I8",)
     scale_dtype: ClassVar[str] = "F8_E8M0"
     quant_method: ClassVar[str] = "mxfp4"
@@ -361,7 +362,10 @@ class DeepseekV4PackedMxfp4ExpertsCheckpointLayout(PackedMXFP4ExpertCheckpointLa
                             layer,
                             expert,
                             projection,
-                            expected_shape=(intermediate_size, hidden_size // 2),
+                            expected_shape=(
+                                intermediate_size,
+                                hidden_size // self.packed_values_per_byte,
+                            ),
                             packed_shape=self._packed_shape(intermediate_size, hidden_size),
                         )
                         for projection in _DEEPSEEK_V4_MXFP4_GATE_UP_ORDER
@@ -393,7 +397,10 @@ class DeepseekV4PackedMxfp4ExpertsCheckpointLayout(PackedMXFP4ExpertCheckpointLa
                     layer,
                     expert,
                     _DEEPSEEK_V4_MXFP4_DOWN_PROJECTION,
-                    expected_shape=(hidden_size, intermediate_size // 2),
+                    expected_shape=(
+                        hidden_size,
+                        intermediate_size // self.packed_values_per_byte,
+                    ),
                     packed_shape=self._packed_shape(hidden_size, intermediate_size),
                 )
             )
@@ -523,7 +530,11 @@ class DeepseekV4PackedMxfp4ExpertsCheckpointLayout(PackedMXFP4ExpertCheckpointLa
         return tensor
 
     def _packed_shape(self, rows: int, logical_cols: int) -> tuple[int, int, int]:
-        return (rows, logical_cols // self.expert_block_size, self.expert_block_size // 2)
+        return (
+            rows,
+            logical_cols // self.expert_block_size,
+            self.expert_block_size // self.packed_values_per_byte,
+        )
 
     def _source_keys_for_packed_experts(
         self, layer: int, expert_indices: Sequence[int]
@@ -557,7 +568,10 @@ class DeepseekV4PackedMxfp4ExpertsCheckpointLayout(PackedMXFP4ExpertCheckpointLa
             )
         weight_shape = _get_shape(weight_name, weight_metadata)
         _require_2d(weight_name, weight_shape)
-        expected = [weight_shape[0], math.ceil(weight_shape[1] * 2 / self.expert_block_size)]
+        expected = [
+            weight_shape[0],
+            math.ceil(weight_shape[1] * self.packed_values_per_byte / self.expert_block_size),
+        ]
         shape = _get_shape(scale_name, scale_metadata)
         if shape != expected:
             raise QuantizedCheckpointLayoutError(
@@ -587,12 +601,12 @@ class DeepseekV4PackedMxfp4ExpertsCheckpointLayout(PackedMXFP4ExpertCheckpointLa
             )
 
         intermediate_size = w1_shape[0]
-        hidden_size = w1_shape[1] * 2
+        hidden_size = w1_shape[1] * self.packed_values_per_byte
         _validate_positive_divisible_by("hidden_size", hidden_size, self.expert_block_size)
         _validate_positive_divisible_by(
             "intermediate_size", intermediate_size, self.expert_block_size
         )
-        expected_w2_shape = [hidden_size, intermediate_size // 2]
+        expected_w2_shape = [hidden_size, intermediate_size // self.packed_values_per_byte]
         if w2_shape != expected_w2_shape:
             raise QuantizedCheckpointLayoutError(
                 "Packed MXFP4 expert metadata has inconsistent down projection shape for "
@@ -1366,18 +1380,21 @@ class DeepseekV4MoE(nn.Module):
         )
 
     def _register_mxfp4_runtime_buffers(self) -> None:
-        if self.hidden_size % 32 != 0 or self.intermediate_size % 32 != 0:
+        layout = build_deepseek_v4_packed_mxfp4_experts_layout()
+        block_size = layout.expert_block_size
+        packed_block_width = block_size // layout.packed_values_per_byte
+        if self.hidden_size % block_size != 0 or self.intermediate_size % block_size != 0:
             raise ValueError(
                 "DeepSeek V4 MXFP4 experts require hidden_size and "
-                "moe_intermediate_size to be divisible by 32."
+                f"moe_intermediate_size to be divisible by {block_size}."
             )
         self.experts.register_buffer(
             "gate_up_proj_blocks",
             torch.zeros(
                 self.n_routed_experts,
                 2 * self.intermediate_size,
-                self.hidden_size // 32,
-                16,
+                self.hidden_size // block_size,
+                packed_block_width,
                 dtype=torch.uint8,
             ),
             persistent=True,
@@ -1387,7 +1404,7 @@ class DeepseekV4MoE(nn.Module):
             torch.zeros(
                 self.n_routed_experts,
                 2 * self.intermediate_size,
-                self.hidden_size // 32,
+                self.hidden_size // block_size,
                 dtype=torch.uint8,
             ),
             persistent=True,
@@ -1397,8 +1414,8 @@ class DeepseekV4MoE(nn.Module):
             torch.zeros(
                 self.n_routed_experts,
                 self.hidden_size,
-                self.intermediate_size // 32,
-                16,
+                self.intermediate_size // block_size,
+                packed_block_width,
                 dtype=torch.uint8,
             ),
             persistent=True,
@@ -1408,7 +1425,7 @@ class DeepseekV4MoE(nn.Module):
             torch.zeros(
                 self.n_routed_experts,
                 self.hidden_size,
-                self.intermediate_size // 32,
+                self.intermediate_size // block_size,
                 dtype=torch.uint8,
             ),
             persistent=True,

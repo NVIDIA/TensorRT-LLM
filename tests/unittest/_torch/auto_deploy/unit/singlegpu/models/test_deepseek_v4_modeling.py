@@ -1621,8 +1621,13 @@ def test_ratio4_indexer_matches_independent_reference_and_masks_invalid_prefix()
     assert (actual[:, 3:] >= 0).sum(dim=-1).eq(1).all()
 
 
-def test_block_hc_wiring_matches_hf_reference() -> None:
-    config = _small_config(num_hidden_layers=1, compress_ratios=(0,), num_hash_layers=1)
+@pytest.mark.parametrize("compress_ratio", [0, 4, 128])
+def test_block_hc_wiring_matches_hf_reference(compress_ratio: int) -> None:
+    config = _small_config(
+        num_hidden_layers=1,
+        compress_ratios=(compress_ratio,),
+        num_hash_layers=1,
+    )
     block = DeepseekV4Block(config, layer_idx=0).eval()
     reference = HFDeepseekV4Block(config, layer_idx=0).eval()
     _set_router_weights(block.ffn.gate)
@@ -1635,7 +1640,7 @@ def test_block_hc_wiring_matches_hf_reference() -> None:
     actual = block(hidden_states, position_embeddings, position_ids, input_ids)
     expected = reference(hidden_states, position_embeddings, position_ids, input_ids)
 
-    assert_rmse_close(actual, expected, rmse_ratio_tol=0.05, msg="Block: ")
+    assert_rmse_close(actual, expected, rmse_ratio_tol=0.05, msg=f"Block ratio-{compress_ratio}: ")
 
 
 def test_decoder_layer_matches_hf_reference_dense_layer() -> None:
