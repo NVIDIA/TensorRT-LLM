@@ -106,7 +106,7 @@ struct RootBlock
 
 // ---------------------------------------------------------------------------
 // Block — one full (or partial) token block in the radix tree.
-// storage[lifeCycleId] = weak pointer to CommittedPage (null if not cached).
+// storage[lifeCycleId] = raw observer pointer to CommittedPage (null if not cached).
 // Mirrors Python's Block.
 // ---------------------------------------------------------------------------
 struct Block : std::enable_shared_from_this<Block>
@@ -125,7 +125,7 @@ struct Block : std::enable_shared_from_this<Block>
     std::unordered_map<BlockKey, std::shared_ptr<Block>> next;
 
     // indexed by LifeCycleId; nullptr = no cached page for that lifecycle
-    std::vector<std::weak_ptr<CommittedPage>> storage;
+    std::vector<CommittedPage*> storage;
 
     ~Block();
 
@@ -183,8 +183,8 @@ public:
     std::vector<MatchResult> match(std::optional<int64_t> loraTaskId, std::vector<TokenIdExt> const& tokens,
         bool enablePartialMatch = false) const;
 
-    // Clear all cached pages (returns weak pointers to evicted CommittedPages).
-    std::vector<std::weak_ptr<CommittedPage>> clear();
+    // Clear all cached pages (returns raw observer pointers to detached CommittedPages).
+    std::vector<CommittedPage*> clear();
 
     int tokensPerBlock() const noexcept
     {
@@ -231,7 +231,7 @@ std::shared_ptr<Block> addOrGetExistingBlock(std::unordered_map<BlockKey, std::s
     RootBlock* parentRoot, Block* parentBlock, bool* isNew = nullptr);
 
 // Post-order traversal helper: remove a subtree and collect orphaned page refs.
-std::vector<std::weak_ptr<CommittedPage>> removeSubtree(
+std::vector<CommittedPage*> removeSubtree(
     std::unordered_map<BlockKey, std::shared_ptr<Block>>& parentNext, BlockKey const& rootKey);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -667,15 +667,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::Block const& self)
             {
                 nb::list lst;
-                for (auto const& weakPage : self.storage)
+                for (auto* page : self.storage)
                 {
-                    auto page = weakPage.lock();
-                    if (!page)
+                    if (page == nullptr)
                     {
                         lst.append(nb::none());
                     }
                     else
                     {
+                        std::weak_ptr<kv::Page> weakPage = page->shared_from_this();
                         // Return a callable: page() returns the Page object.
                         // This matches the rawref.ref[Page] protocol used in Python.
                         lst.append(nb::cpp_function(
@@ -684,7 +684,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                                 auto strongPage = weakPage.lock();
                                 if (strongPage)
                                 {
-                                    return nb::cast(std::static_pointer_cast<kv::Page>(strongPage));
+                                    return nb::cast(strongPage);
                                 }
                                 return nb::none();
                             }));

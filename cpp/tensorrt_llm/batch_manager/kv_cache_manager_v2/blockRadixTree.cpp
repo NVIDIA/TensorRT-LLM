@@ -234,10 +234,9 @@ Block::~Block()
 {
     // Mirrors Python Block.__del__: for each stored page, if alive and
     // DROPPABLE and scheduled for eviction, exclude from eviction.
-    for (auto const& weakPage : storage)
+    for (auto const page : storage)
     {
-        auto const page = weakPage.lock();
-        if (page && page->status() == PageStatus::DROPPABLE)
+        if (page != nullptr && page->status() == PageStatus::DROPPABLE)
         {
             if (page->scheduledForEviction())
                 page->manager->excludeFromEviction(*page);
@@ -304,11 +303,12 @@ BlockKey const& Block::parentKey() const
 
 void Block::unsetPage(LifeCycleId lcIdx, LifeCycle const& lc)
 {
-    if (isOrphan())
+    auto& page = storage.at(static_cast<size_t>(lcIdx));
+    if (page == nullptr)
     {
         return;
     }
-    storage.at(static_cast<size_t>(lcIdx)).reset();
+    page = nullptr;
 
     // Reuse cleanup only applies to attention lifecycles.
     // SSM lifecycles are allowed in the tree but don't trigger subtree eviction.
@@ -323,21 +323,18 @@ void Block::unsetPage(LifeCycleId lcIdx, LifeCycle const& lc)
         assert(parentMap);
         auto const allPages = removeSubtree(parentMap, key);
 
-        for (auto const& weakPage : allPages)
+        for (auto const pg : allPages)
         {
-            auto pg = weakPage.lock();
-            if (pg)
-            {
-                assert(pg->status() == PageStatus::DROPPABLE);
-                if (pg->scheduledForEviction())
-                    pg->manager->excludeFromEviction(*pg);
-            }
+            assert(pg != nullptr);
+            assert(pg->status() == PageStatus::DROPPABLE);
+            if (pg->scheduledForEviction())
+                pg->manager->excludeFromEviction(*pg);
         }
     }
 
     // Prune empty tail nodes up the chain.
     Block* curr = this;
-    while (curr && curr->storage.at(static_cast<size_t>(lcIdx)).expired() && curr->next.empty())
+    while (curr && curr->storage.at(static_cast<size_t>(lcIdx)) == nullptr && curr->next.empty())
     {
         auto* map = curr->parentNextMap();
         if (map)
@@ -420,10 +417,10 @@ std::shared_ptr<Block> addOrGetExistingBlock(std::unordered_map<BlockKey, std::s
 // removeSubtree
 // ---------------------------------------------------------------------------
 
-std::vector<std::weak_ptr<CommittedPage>> removeSubtree(
+std::vector<CommittedPage*> removeSubtree(
     std::unordered_map<BlockKey, std::shared_ptr<Block>>& parentNext, BlockKey const& rootKey)
 {
-    std::vector<std::weak_ptr<CommittedPage>> ret;
+    std::vector<CommittedPage*> ret{};
     auto it = parentNext.find(rootKey);
     assert(it != parentNext.end() && "Key must exist in parent's next map");
 
@@ -436,15 +433,21 @@ std::vector<std::weak_ptr<CommittedPage>> removeSubtree(
         stack.pop_back();
 
         // Collect pages.
-        for (auto const& weakPage : block->storage)
-            if (!weakPage.expired())
-                ret.push_back(weakPage);
+        for (auto& page : block->storage)
+        {
+            if (page != nullptr)
+            {
+                page->block = nullptr;
+                ret.push_back(page);
+                page = nullptr;
+            }
+        }
 
         // Clear storage.
-        block->storage.assign(block->storage.size(), {});
+        block->storage.assign(block->storage.size(), nullptr);
         assert(gNdebug
-            || (std::all_of(block->storage.begin(), block->storage.end(),
-                    [](auto const& weakPage) { return weakPage.expired(); })
+            || (std::all_of(
+                    block->storage.begin(), block->storage.end(), [](auto const* page) { return page == nullptr; })
                 && "storage must be cleared after assign"));
 
         // Push children (they will be destroyed when removed from parent's next).
@@ -564,9 +567,9 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::match(
     return results;
 }
 
-std::vector<std::weak_ptr<CommittedPage>> BlockRadixTree::clear()
+std::vector<CommittedPage*> BlockRadixTree::clear()
 {
-    std::vector<std::weak_ptr<CommittedPage>> ret;
+    std::vector<CommittedPage*> ret{};
 
     // Swap mRoots into a local so that if ~Block() calls eraseRoot() during
     // removeSubtree() destruction, it operates on the (now-empty) mRoots — safe no-op.
@@ -584,8 +587,7 @@ std::vector<std::weak_ptr<CommittedPage>> BlockRadixTree::clear()
         for (auto const& k : childKeys)
         {
             auto pages = removeSubtree(root.next, k);
-            for (auto const& weakPage : pages)
-                ret.push_back(weakPage);
+            ret.insert(ret.end(), pages.begin(), pages.end());
         }
     }
 

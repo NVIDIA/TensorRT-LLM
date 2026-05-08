@@ -110,7 +110,11 @@ def remove_subtree(root: "RootBlock | Block") -> list[rawref.ref["CommittedPage"
             block = next(iter(block.next.values()))
         else:
             if isinstance(block, Block):
-                ret.extend(p for p in block.storage if p is not None)
+                for page_ref in block.storage:
+                    if page_ref is not None:
+                        page = unwrap_rawref(page_ref)
+                        page.block = rawref.NULL
+                        ret.append(page_ref)
                 block.storage = filled_list(None, block.num_life_cycles)
             assert isinstance(block, RootBlock) or all(page is None for page in block.storage), (
                 "Storage is not cleared, yet"

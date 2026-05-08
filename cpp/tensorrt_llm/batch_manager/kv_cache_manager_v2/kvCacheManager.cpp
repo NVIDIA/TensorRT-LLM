@@ -102,10 +102,9 @@ void KvCacheManager::clearReusableBlocks()
     assert(mRadixTree);
 
     auto refs = mRadixTree->clear();
-    for (auto const& weakPage : refs)
+    for (auto* page : refs)
     {
-        auto page = weakPage.lock();
-        assert(page);
+        assert(page != nullptr);
         assert(page->status() == PageStatus::DROPPABLE);
         mStorage->excludeFromEviction(*page);
     }
