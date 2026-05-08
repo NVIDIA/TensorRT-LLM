@@ -48,7 +48,7 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..modules.linear import Linear
 from .modeling_gemma4 import Gemma4ForCausalLM
-from .modeling_multimodal_utils import fuse_input_embeds
+from .modeling_multimodal_utils import find_input_mm_embeds, fuse_input_embeds
 from .modeling_utils import ModelConfig, filter_weights, register_auto_model
 
 _MIN_TRANSFORMERS_FOR_GEMMA4 = "5.5.0"
@@ -895,6 +895,13 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 mm_token_ids_for_mask = fuse_token_ids.to(input_ids.device)
                 mm_mask = torch.isin(input_ids, mm_token_ids_for_mask)
                 ple_input_ids = torch.where(mm_mask, torch.full_like(input_ids, pad_id), input_ids)
+
+        # Slice mm_embeds to the current chunk window for chunked prefill /
+        # KV reuse. Without this, the full request's mm_embeds is passed to
+        # fuse_input_embeds even when input_ids is a chunk slice, which trips
+        # the count-equality check in fuse_input_embeds. Mirrors the call in
+        # modeling_qwen2vl / modeling_phi4mm / modeling_mistral.
+        mm_embeds = find_input_mm_embeds(mm_embeds, multimodal_params)
 
         input_ids, inputs_embeds = fuse_input_embeds(
             embedding_layer=self.llm.model.embed_tokens,
