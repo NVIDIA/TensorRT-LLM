@@ -139,6 +139,8 @@ bool FmhaDispatcher::isSupported()
             tllmRunnerParams.mSparseAttention = SparseType::StaticTokenSparse;
             tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
             tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
+            // Generation-style kernels on long KV can pick MultiCtasKv cubins
+            tllmRunnerParams.mMultiCtasKvMode = true;
         }
 
         foundKernels = mTllmGenFMHARunner->isSupported(tllmRunnerParams);
@@ -263,6 +265,10 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
             tllmRunnerParams.kvPageIdxPtr
                 = reinterpret_cast<int const*>(runnerParams.sparse_params.sparse_attn_indices);
             tllmRunnerParams.kvPtr = runnerParams.sparse_params.sparse_kv_cache_pool;
+            // Enable MultiCtasKv so the autotuner can select GmemReduction cubins
+            tllmRunnerParams.mMultiCtasKvMode = true;
+            tllmRunnerParams.multiCtasKvScratchPtr = runnerParams.multiCtasKvScratchPtr;
+            tllmRunnerParams.multiCtasKvCounterPtr = runnerParams.multiCtasKvCounterPtr;
         }
 
         mTllmGenFMHARunner->run(tllmRunnerParams);

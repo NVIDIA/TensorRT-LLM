@@ -43,6 +43,8 @@ import shutil
 import sys
 import textwrap
 
+from _license_data import VENDORED_PROJECTS, generate_attributions, generate_license
+
 # ---------------------------------------------------------------------------
 # Path constants
 # ---------------------------------------------------------------------------
@@ -180,6 +182,7 @@ _MANAGED_PATHS = [
     "pyproject.toml",
     "README.md",
     "LICENSE",
+    "ATTRIBUTIONS-Python.md",
     "CONTRIBUTING.md",
     ".gitignore",
     ".editorconfig",
@@ -495,36 +498,38 @@ def create_standalone_package(output_dir: str) -> None:
     _create_pyproject_toml(output_dir, dependencies, dev_dependencies)
     print(f"  Created pyproject.toml ({len(dependencies)} deps + {len(dev_dependencies)} dev deps)")
 
-    # 4. Copy LICENSE
-    if os.path.exists(TRTLLM_LICENSE):
-        shutil.copy2(TRTLLM_LICENSE, os.path.join(output_dir, "LICENSE"))
-        print("  Copied LICENSE")
+    # 4. Generate standalone LICENSE (only vendored projects in auto_deploy)
+    generate_license(output_dir)
+    print(f"  Generated LICENSE ({len(VENDORED_PROJECTS)} vendored projects)")
 
-    # 5. Copy README
+    # 5. Generate ATTRIBUTIONS-Python.md (direct dependency licenses)
+    generate_attributions(output_dir, dependencies)
+    print(f"  Generated ATTRIBUTIONS-Python.md ({len(dependencies)} direct deps)")
+
+    # 6. Copy README
     if os.path.exists(LLMC_README):
         shutil.copy2(LLMC_README, os.path.join(output_dir, "README.md"))
         print("  Copied README.md")
 
-    # 6. Copy CONTRIBUTING.md
+    # 7. Copy CONTRIBUTING.md
     if os.path.exists(LLMC_CONTRIBUTING):
         shutil.copy2(LLMC_CONTRIBUTING, os.path.join(output_dir, "CONTRIBUTING.md"))
         print("  Copied CONTRIBUTING.md")
 
-    # 7. Copy .gitignore
+    # 8. Copy .gitignore
     if os.path.exists(TRTLLM_GITIGNORE):
         shutil.copy2(TRTLLM_GITIGNORE, os.path.join(output_dir, ".gitignore"))
         print("  Copied .gitignore")
 
-    # 8. Copy .editorconfig
+    # 9. Copy .editorconfig
     if os.path.exists(TRTLLM_EDITORCONFIG):
         shutil.copy2(TRTLLM_EDITORCONFIG, os.path.join(output_dir, ".editorconfig"))
         print("  Copied .editorconfig")
 
-    # 9. Copy OSS compliance files (CODE_OF_CONDUCT, SECURITY, ATTRIBUTIONS-Python)
+    # 10. Copy OSS compliance files (CODE_OF_CONDUCT, SECURITY)
     for src, name in (
         (TRTLLM_CODE_OF_CONDUCT, "CODE_OF_CONDUCT.md"),
         (TRTLLM_SECURITY, "SECURITY.md"),
-        (TRTLLM_ATTRIBUTIONS_PYTHON, "ATTRIBUTIONS-Python.md"),
     ):
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(output_dir, name))

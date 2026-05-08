@@ -19,6 +19,7 @@ from .mistral.checkpoint_loader import (MistralCheckpointLoader,
 from .mistral.config_loader import MistralConfigLoader
 from .mistral.weight_mapper import (MistralLarge3WeightMapper,
                                     MistralWeightMapper)
+from .mx.checkpoint_loader import MXCheckpointLoader
 
 __all__ = [
     "HfConfigLoader", "HfWeightLoader", "HfWeightMapper", "MistralConfigLoader",
@@ -28,5 +29,5 @@ __all__ = [
     "Qwen3MoeHfWeightMapper", "Qwen2VLHfWeightMapper",
     "Qwen3_5MoeHfWeightMapper", "Qwen3NextHfWeightMapper",
     "LlavaNextHfWeightMapper", "MistralLarge3CheckpointLoader",
-    "MistralLarge3WeightMapper", "Qwen3VLHfWeightMapper"
+    "MistralLarge3WeightMapper", "MXCheckpointLoader", "Qwen3VLHfWeightMapper"
 ]

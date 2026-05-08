@@ -477,6 +477,135 @@ def test_trtllm_mla_out_buffer_padding(num_heads, dtype, device):
 @pytest.mark.parametrize("num_heads", [4])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("device", ["cuda"])
+def test_trtllm_mla_out_buffer_padding_cached_kv(num_heads, dtype, device):
+    """Cache-reused-prefill path.
+
+    input_positions > 0 routes the dispatch in
+    ``_handle_prefill_thop`` to ``_handle_prefill_thop_cached_kv``, exercising
+    the chunked loop (``load_chunked_kv_cache_for_mla`` →
+    ``thop.attention(mask=padding, softmax_stats)`` →
+    ``merge_chunked_attention_for_mla``) plus the final causal pass.
+
+    The KV cache is empty (zeroed) so past K/V read as zeros — this verifies
+    the path executes without shape / dtype / kernel errors and that ``out=``
+    buffer + PWCG padding behave consistently along it.  Numerical
+    correctness of the merge logic is covered by the registry MMLU/GSM8K
+    accuracy gate.
+    """
+    qk_nope_head_dim = 128
+    qk_rope_head_dim = 64
+    kv_lora_rank = 512
+    v_head_dim = 128
+    batch_size = 4
+    past_len = 32
+    new_len = 16
+    total_tokens = batch_size * new_len
+    padded_tokens = 128
+    page_size = _MLA_TOKENS_PER_BLOCK
+    # Each seq's pages cover past + new tokens.
+    pages_per_seq = (past_len + new_len - 1) // page_size + 2
+    max_num_pages = batch_size * pages_per_seq
+
+    inputs = _create_mla_inputs(
+        batch_size,
+        new_len,
+        num_heads,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        kv_lora_rank,
+        v_head_dim,
+        dtype,
+        device,
+    )
+
+    real_inputs = {
+        "q_nope": inputs["q_nope"].reshape(1, total_tokens, num_heads, qk_nope_head_dim),
+        "q_pe": inputs["q_pe"].reshape(1, total_tokens, num_heads, qk_rope_head_dim),
+        "compressed_kv": inputs["compressed_kv"].reshape(1, total_tokens, kv_lora_rank),
+        "kpe": inputs["kpe"].reshape(1, total_tokens, 1, qk_rope_head_dim),
+        "kv_b_proj_weight": inputs["kv_b_proj_weight"],
+    }
+    padded_inputs = {
+        name: torch.zeros(
+            1,
+            padded_tokens,
+            *value.shape[2:],
+            dtype=value.dtype,
+            device=value.device,
+        )
+        if name != "kv_b_proj_weight"
+        else value
+        for name, value in real_inputs.items()
+    }
+    for name, value in real_inputs.items():
+        if name != "kv_b_proj_weight":
+            padded_inputs[name][:, :total_tokens].copy_(value)
+
+    # ``input_positions = past_len`` per seq forces the dispatch in
+    # ``_handle_prefill_thop`` (line 888) into the cache-reused branch and
+    # makes the planner's packer emit ``chunked_loop_num >= 1``.
+    real_meta = _create_trtllm_paged_metadata(
+        batch_size,
+        max_num_pages,
+        page_size,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        dtype,
+        device,
+        [new_len] * batch_size,
+        [past_len] * batch_size,
+    )
+    padded_meta = _create_trtllm_paged_metadata(
+        batch_size,
+        max_num_pages,
+        page_size,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        dtype,
+        device,
+        [new_len] * batch_size,
+        [past_len] * batch_size,
+    )
+
+    real_out = _run_trtllm_mla(real_inputs, real_meta, kv_lora_rank)
+    bucket_out = torch.empty(1, padded_tokens, num_heads, v_head_dim, dtype=dtype, device=device)
+    bucket_result = _run_trtllm_mla(real_inputs, real_meta, kv_lora_rank, out=bucket_out)
+
+    assert bucket_result.numel() == 0
+    torch.testing.assert_close(
+        bucket_out[:, :total_tokens],
+        real_out,
+        atol=2e-2,
+        rtol=2e-2,
+    )
+    torch.testing.assert_close(
+        bucket_out[:, total_tokens:],
+        torch.zeros_like(bucket_out[:, total_tokens:]),
+        atol=0,
+        rtol=0,
+    )
+
+    out = torch.empty(1, padded_tokens, num_heads, v_head_dim, dtype=dtype, device=device)
+    out_result = _run_trtllm_mla(padded_inputs, padded_meta, kv_lora_rank, out=out)
+
+    assert out_result.numel() == 0
+    torch.testing.assert_close(
+        out[:, :total_tokens],
+        real_out,
+        atol=2e-2,
+        rtol=2e-2,
+    )
+    torch.testing.assert_close(
+        out[:, total_tokens:],
+        torch.zeros_like(out[:, total_tokens:]),
+        atol=0,
+        rtol=0,
+    )
+
+
+@pytest.mark.parametrize("num_heads", [4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("device", ["cuda"])
 def test_trtllm_mla_fused_rope_out_buffer_padding(num_heads, dtype, device):
     """Fused-RoPE PWCG path should match pre-rotated MLA while writing out=."""
     qk_nope_head_dim = 128

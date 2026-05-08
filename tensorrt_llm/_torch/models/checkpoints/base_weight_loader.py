@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import threading
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterator, Tuple, Union
@@ -91,15 +94,15 @@ class ConsumableWeightsDict:
 class BaseWeightLoader(ABC):
 
     @abstractmethod
-    def load_weights(
-            self, checkpoint_dir: str,
-            mapping: Mapping) -> Union[Dict[str, Any], ConsumableWeightsDict]:
+    def load_weights(self, checkpoint_dir: str, mapping: Mapping,
+                     **kwargs) -> Union[Dict[str, Any], ConsumableWeightsDict]:
         """
         Loads weights from a checkpoint directory.
 
         Args:
             checkpoint_dir: A path to the checkpoint directory.
             mapping: A mapping object containing the distributed configuration.
+            **kwargs: Optional format-specific loader arguments.
 
         Returns:
             A dictionary (or ConsumableWeightsDict) where keys are tensor names

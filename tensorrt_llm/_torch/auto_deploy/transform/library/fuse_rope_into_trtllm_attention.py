@@ -24,16 +24,23 @@ backend-agnostic RoPE transforms continue to work.
 """
 
 import operator
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Type
 
 import torch
+from pydantic import Field
 from torch.fx import GraphModule, Node
 
 from ...custom_ops.attention.trtllm_attention import _TRTLLM_ROPE_INFO_KEY
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import extract_op_args, is_op
-from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
+from ..interface import (
+    BaseTransform,
+    SharedConfig,
+    TransformConfig,
+    TransformInfo,
+    TransformRegistry,
+)
 from .rope import _get_nested_attr, _trace_back_index, _trace_to_buffer_source
 
 # torch_rope IR ops that can be fused into trtllm attention.
@@ -44,6 +51,19 @@ _FUSIBLE_ROPE_OPS = {
     torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin,
     torch.ops.auto_deploy.torch_rope_with_complex_freqs,
 }
+
+
+class FuseRopeIntoTrtllmAttentionConfig(TransformConfig):
+    """Configuration for ``fuse_rope_into_trtllm_attention``."""
+
+    fuse_qkv_passthrough: bool = Field(
+        default=True,
+        description=(
+            "When the pre-RoPE Q/K/V trace back to a single fused QKV GEMM, "
+            "rewire all three to that flat tensor so ``trtllm_mha_with_cache`` "
+            "can skip the per-layer split → reshape → cat path."
+        ),
+    )
 
 
 @TransformRegistry.register("fuse_rope_into_trtllm_attention")
@@ -62,6 +82,12 @@ class FuseRopeIntoTrtllmAttention(BaseTransform):
     Disabled by default; enable in model configs that use ``attn_backend: trtllm``.
     """
 
+    config: FuseRopeIntoTrtllmAttentionConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return FuseRopeIntoTrtllmAttentionConfig
+
     def _apply(
         self,
         gm: GraphModule,
@@ -76,7 +102,7 @@ class FuseRopeIntoTrtllmAttention(BaseTransform):
             if not is_op(attn_node, torch.ops.auto_deploy.torch_attention):
                 continue
 
-            if self._try_fuse_one(gm, attn_node, cm):
+            if self._try_fuse_one(gm, attn_node, cm, self.config.fuse_qkv_passthrough):
                 num_fused += 1
 
         info = TransformInfo(
@@ -88,7 +114,12 @@ class FuseRopeIntoTrtllmAttention(BaseTransform):
         return gm, info
 
     @staticmethod
-    def _try_fuse_one(gm: GraphModule, attn_node: Node, cm: CachedSequenceInterface) -> bool:
+    def _try_fuse_one(
+        gm: GraphModule,
+        attn_node: Node,
+        cm: CachedSequenceInterface,
+        fuse_qkv_passthrough: bool,
+    ) -> bool:
         """Rewire Q/K to pre-RoPE and store rope metadata for cache insertion."""
         # Step 1: Get Q and K input nodes from the attention node
         q_input, k_input = extract_op_args(attn_node, "query", "key")
@@ -130,6 +161,33 @@ class FuseRopeIntoTrtllmAttention(BaseTransform):
 
         # Step 5: Store metadata for prepare_node_for_cache_insertion
         attn_node.meta[_TRTLLM_ROPE_INFO_KEY] = rope_info
+
+        # Step 6: If pre-RoPE Q/K/V trace back to a flat fused QKV GEMM output,
+        # rewire all three to that flat tensor and store head/dim hints so
+        # ``trtllm_mha_with_cache`` can skip the split→reshape→cat path.
+        if not fuse_qkv_passthrough:
+            return True
+        bind_v = attn_node.args[2]
+        fused_qkv = _try_trace_to_fused_qkv(pre_rope_q, pre_rope_k, bind_v)
+        if fused_qkv is not None:
+            fused_qkv_node, num_heads, num_kv_heads, head_dim = fused_qkv
+            # Capture the KV dtype now, before V is overwritten and while shape
+            # propagation on these nodes is still trustworthy.  Subsequent
+            # transforms (e.g. fp8 GEMM rewrites) can drop ``meta['val']`` on
+            # the fused-QKV node, so we cannot rely on reading it back later.
+            kv_dtype_node = bind_v if bind_v.meta.get("val") is not None else pre_rope_k
+            kv_val = kv_dtype_node.meta.get("val")
+            args_list = list(attn_node.args)
+            args_list[0] = fused_qkv_node
+            args_list[1] = fused_qkv_node
+            args_list[2] = fused_qkv_node
+            attn_node.args = tuple(args_list)
+            attn_node.meta["_trtllm_fused_qkv"] = True
+            attn_node.meta["_trtllm_num_heads"] = num_heads
+            attn_node.meta["_trtllm_num_kv_heads"] = num_kv_heads
+            attn_node.meta["_trtllm_head_dim"] = head_dim
+            if kv_val is not None:
+                attn_node.meta["_trtllm_kv_dtype"] = kv_val.dtype
         return True
 
 
@@ -289,3 +347,140 @@ def _find_inv_freq_tensor(
 
     # No verified match — return first candidate as best guess
     return next(iter(candidates.values()))
+
+
+def _unwrap_contiguous(node: Node) -> Node:
+    """Skip past any chain of ``contiguous`` calls, in either ``aten``
+    overload form or the Python-level ``Tensor.contiguous`` method form."""
+    current = node
+    while isinstance(current, Node) and current.op == "call_function":
+        is_aten_contig = is_op(current, torch.ops.aten.contiguous.default)
+        is_method_contig = getattr(current.target, "__name__", "") == "contiguous"
+        if not (is_aten_contig or is_method_contig):
+            break
+        if not isinstance(current.args[0], Node):
+            break
+        current = current.args[0]
+    return current
+
+
+def _try_trace_to_fused_qkv(
+    pre_rope_q: Node, pre_rope_k: Node, bind_v: Node
+) -> Optional[Tuple[Node, int, int, int]]:
+    """Trace pre-RoPE Q, K and V back to a single flat fused QKV GEMM output.
+
+    Supports two graph shapes produced by GEMM fusion:
+
+    1. ``fused_qkv → split_with_sizes/split_output → getitem → view``
+    2. ``fused_qkv → narrow(-1, offset, size) → view``
+
+    On success, the flat fused QKV tensor can be passed directly to
+    ``trtllm_mha_with_cache`` (in fused-QKV mode), skipping per-layer
+    split + reshape + cat.
+
+    Returns ``(fused_qkv_node, num_heads, num_kv_heads, head_dim)`` or ``None``.
+    """
+
+    def _trace_split(node: Node):
+        current = _unwrap_contiguous(node)
+        if not (
+            is_op(current, torch.ops.aten.view.default)
+            or is_op(current, torch.ops.aten.reshape.default)
+        ):
+            return None
+        view_input = current.args[0]
+        view_shape = current.args[1] if len(current.args) > 1 else None
+        if not isinstance(view_input, Node):
+            return None
+        if not isinstance(view_shape, (list, tuple)) or len(view_shape) < 4:
+            return None
+        nh, hd = view_shape[2], view_shape[3]
+        if not (isinstance(nh, int) and isinstance(hd, int)):
+            return None
+        if nh < 0 or hd < 0:
+            fake = node.meta.get("val", None)
+            if fake is None or len(fake.shape) < 4:
+                return None
+            nh = int(fake.shape[2]) if nh < 0 else nh
+            hd = int(fake.shape[3]) if hd < 0 else hd
+        if not is_op(view_input, operator.getitem):
+            return None
+        getitem_source = view_input.args[0]
+        getitem_idx = view_input.args[1]
+        if not isinstance(getitem_source, Node) or not isinstance(getitem_idx, int):
+            return None
+        if getitem_source.op != "call_function":
+            return None
+        fused_node = getitem_source.args[0]
+        if not isinstance(fused_node, Node):
+            return None
+        return fused_node, getitem_idx, nh * hd, nh, hd
+
+    def _trace_narrow(node: Node):
+        current = _unwrap_contiguous(node)
+        if not (
+            is_op(current, torch.ops.aten.view.default)
+            or is_op(current, torch.ops.aten.reshape.default)
+        ):
+            return None
+        view_input = current.args[0]
+        view_shape = current.args[1] if len(current.args) > 1 else None
+        if not isinstance(view_input, Node):
+            return None
+        if not isinstance(view_shape, (list, tuple)) or len(view_shape) < 4:
+            return None
+        hd = view_shape[3]
+        if not isinstance(hd, int):
+            return None
+        narrow_ops = {torch.narrow, torch.Tensor.narrow, torch.ops.aten.narrow.default}
+        if view_input.op != "call_function" or view_input.target not in narrow_ops:
+            return None
+        if len(view_input.args) < 4:
+            return None
+        narrow_parent = view_input.args[0]
+        narrow_dim = view_input.args[1]
+        narrow_offset = view_input.args[2]
+        narrow_length = view_input.args[3]
+        if not isinstance(narrow_parent, Node) or narrow_dim != -1:
+            return None
+        if not isinstance(narrow_offset, int) or not isinstance(narrow_length, int):
+            return None
+        nh = narrow_length // hd
+        if nh * hd != narrow_length:
+            return None
+        return narrow_parent, narrow_offset, narrow_length, nh, hd
+
+    q_split = _trace_split(pre_rope_q)
+    k_split = _trace_split(pre_rope_k)
+    v_split = _trace_split(bind_v)
+    if q_split is not None and k_split is not None and v_split is not None:
+        q_src, q_idx, _, q_nh, q_hd = q_split
+        k_src, k_idx, k_dim, k_nh, k_hd = k_split
+        v_src, v_idx, v_dim, _, v_hd = v_split
+        if (
+            q_src is k_src
+            and q_src is v_src
+            and (q_idx, k_idx, v_idx) == (0, 1, 2)
+            and k_dim == v_dim
+            and q_hd == k_hd == v_hd
+        ):
+            return q_src, q_nh, k_nh, q_hd
+
+    q_narrow = _trace_narrow(pre_rope_q)
+    k_narrow = _trace_narrow(pre_rope_k)
+    v_narrow = _trace_narrow(bind_v)
+    if q_narrow is not None and k_narrow is not None and v_narrow is not None:
+        q_parent, q_off, q_len, q_nh, q_hd = q_narrow
+        k_parent, k_off, k_len, k_nh, k_hd = k_narrow
+        v_parent, v_off, v_len, _, v_hd = v_narrow
+        if (
+            q_parent is k_parent is v_parent
+            and q_off == 0
+            and k_off == q_len
+            and v_off == q_len + k_len
+            and k_len == v_len
+            and q_hd == k_hd == v_hd
+        ):
+            return q_parent, q_nh, k_nh, q_hd
+
+    return None

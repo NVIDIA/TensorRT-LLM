@@ -17,7 +17,7 @@ from tensorrt_llm._torch.visual_gen.cache.teacache import (
     register_extractor_from_config,
 )
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
-from tensorrt_llm._torch.visual_gen.output import MediaOutput
+from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm.logger import logger
@@ -279,9 +279,11 @@ class FluxPipeline(BasePipeline):
             max_sequence_length: Maximum text sequence length
 
         Returns:
-            MediaOutput with image tensor (B, H, W, C).
+            PipelineOutput with image tensor (B, H, W, C).
         """
         pipeline_start = time.time()
+        timer = CudaPhaseTimer()
+        timer.mark_pre_start()
 
         # Determine batch size
         if isinstance(prompt, str):
@@ -341,6 +343,7 @@ class FluxPipeline(BasePipeline):
                 return_dict=False,
             )[0]
 
+        timer.mark_denoise_start()
         latents = self.denoise(
             latents=latents,
             scheduler=self.scheduler,
@@ -349,6 +352,7 @@ class FluxPipeline(BasePipeline):
             forward_fn=forward_fn,
             timesteps=timesteps,
         )
+        timer.mark_post_start()
 
         # Decode
         logger.info("Decoding image...")
@@ -359,7 +363,8 @@ class FluxPipeline(BasePipeline):
             logger.info(f"Image decoded in {time.time() - decode_start:.2f}s")
             logger.info(f"Total pipeline time: {time.time() - pipeline_start:.2f}s")
 
-        return MediaOutput(image=image)
+        timer.mark_end()
+        return timer.fill(PipelineOutput(image=image))
 
     def _encode_prompt(
         self,

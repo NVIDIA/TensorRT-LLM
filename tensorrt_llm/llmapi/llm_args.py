@@ -349,6 +349,42 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         "threshold search iterations. Currently supported for index_topk=2048 "
         "on Blackwell (SM100+) and falls back to the production insertion/radix "
         "Top-K path when prerequisites are not met.")
+    indexer_k_dtype: Literal["fp8", "fp4"] = Field(
+        default="fp8",
+        description=
+        "Data type used for the indexer K cache. `fp4` requires Blackwell+ "
+        "(SM>=100) and index_head_dim=128, it can halve the indexer K cache "
+        "per-token footprint from 132 B to 68 B.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_indexer_k_dtype(self):
+        """Reject fp4 on pre-Blackwell or non-128 index_head_dim.
+
+        DeepGEMM's fp8_fp4_mqa_logits / fp8_fp4_paged_mqa_logits kernels
+        require SM>=100, and invokeFusedCatFp4 hard-asserts head_dim==128.
+        Surface both as Pydantic errors so invalid configs fail fast at
+        construction instead of with a cryptic kernel-launch failure.
+
+        The SM check is skipped when CUDA is unavailable (config
+        construction on CPU-only hosts or at doc-gen time), leaving the
+        runtime kernel assertion as the final line of defense.
+        """
+        if self.indexer_k_dtype == "fp4":
+            if self.index_head_dim is not None and self.index_head_dim != 128:
+                raise ValueError(
+                    f"indexer_k_dtype='fp4' requires index_head_dim=128, "
+                    f"got {self.index_head_dim}. Set indexer_k_dtype='fp8' "
+                    f"for non-128 indexer head dims.")
+            if torch.cuda.is_available():
+                from tensorrt_llm._utils import get_sm_version
+                sm = get_sm_version()
+                if sm < 100:
+                    raise ValueError(
+                        f"indexer_k_dtype='fp4' requires SM>=100 (Blackwell); "
+                        f"current device is SM{sm}. Set indexer_k_dtype='fp8' "
+                        f"for non-Blackwell GPUs.")
+        return self
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
@@ -1539,11 +1575,6 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
 
 class MTPDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["MTP"] = "MTP"
-    num_nextn_predict_layers: PositiveInt = Field(
-        default=1,
-        description=
-        "Number of MTP modules. Each module predicts the next token, so N modules produce N draft tokens."
-    )
     use_relaxed_acceptance_for_thinking: bool = Field(
         default=False,
         description=
@@ -1576,14 +1607,14 @@ class MTPDecodingConfig(DecodingBaseConfig):
         description="Optional Suffix Automaton configuration. When set, "
         "combines SA drafting with MTP speculative decoding.")
 
-    # TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`
-    # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
-    num_nextn_predict_layers_from_model_config: int = Field(
-        default=1,
+    # Internal field: number of MTP layers in the model checkpoint.
+    # Auto-populated from pretrained_config by update_spec_config_from_model_config.
+    # Do not set manually.
+    num_nextn_predict_layers: Optional[int] = Field(
+        default=None,
         init=False,
-        description=
-        "Internal field storing MTP layer count from model config. Used to decide decoding mode: "
-        "when model has 1 layer and use_mtp_vanilla=False, uses faster EAGLE-style MTP instead of vanilla MTP."
+        description="Number of MTP layers in the model checkpoint. "
+        "Auto-populated from the model's pretrained config. Do not set manually."
     )
 
     begin_thinking_phase_token: int = Field(
@@ -1597,10 +1628,31 @@ class MTPDecodingConfig(DecodingBaseConfig):
         "Token ID marking end of thinking phase. Strict acceptance resumes after this."
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _remap_deprecated_num_nextn_predict_layers(cls, data):
+        if isinstance(data, dict) and "num_nextn_predict_layers" in data:
+            logger.warning(
+                "MTPDecodingConfig: 'num_nextn_predict_layers' is deprecated and will be "
+                "removed in a future release. Use 'max_draft_len' instead.")
+            if "max_draft_len" not in data:
+                data = dict(data)
+                data["max_draft_len"] = data.pop("num_nextn_predict_layers")
+            else:
+                data = dict(data)
+                data.pop("num_nextn_predict_layers")
+        return data
+
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
-        self.max_draft_len = self.num_nextn_predict_layers
-        self.max_total_draft_tokens = self.num_nextn_predict_layers  # Current MTP only supports linear tree
+        # Default max_draft_len to 1 if not set by the user.
+        # For vanilla MTP, update_spec_config_from_model_config will override this
+        # with the actual num_nextn_predict_layers from the model.
+        if self.max_draft_len is None:
+            self.max_draft_len = 1
+        elif self.max_draft_len <= 0:
+            raise ValueError("max_draft_len must be > 0 for MTP")
+        self.max_total_draft_tokens = self.max_draft_len  # Current MTP only supports linear tree
         return self
 
     @model_validator(mode="after")
@@ -1614,19 +1666,21 @@ class MTPDecodingConfig(DecodingBaseConfig):
     def supports_backend(self, backend: str) -> bool:
         return backend in ("pytorch", "_autodeploy")
 
-    @functools.cached_property
+    @property
     def num_capture_layers(self) -> int:
-        if not self.use_mtp_vanilla and not self.mtp_eagle_one_model:
-            return 1
-        return 0
+        return 1 if self.spec_dec_mode.is_mtp_eagle() else 0
 
-    @functools.cached_property
+    @property
     def spec_dec_mode(self):
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
-        if self.num_nextn_predict_layers_from_model_config == 1 and not self.use_mtp_vanilla and self.mtp_eagle_one_model:
+
+        # num_nextn_predict_layers is set from the model's pretrained config by
+        # update_spec_config_from_model_config. Treat None (before model load) as 1.
+        n = self.num_nextn_predict_layers if self.num_nextn_predict_layers is not None else 1
+        if n == 1 and not self.use_mtp_vanilla and self.mtp_eagle_one_model:
             return TorchSpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
-        elif self.num_nextn_predict_layers_from_model_config == 1 and not self.use_mtp_vanilla and not self.mtp_eagle_one_model:
+        elif n == 1 and not self.use_mtp_vanilla and not self.mtp_eagle_one_model:
             return TorchSpeculativeDecodingMode.MTP_EAGLE
         return TorchSpeculativeDecodingMode.MTP
 
@@ -3555,6 +3609,50 @@ class LoadFormat(Enum):
     VISION_ONLY = 2
 
 
+class ModelExpressConfig(StrictBaseModel):
+    """Prototype configuration for ModelExpress (MX) weight transfer."""
+
+    server_url: Optional[str] = Field(
+        default=None,
+        description="URL of the MX (ModelExpress) server for P2P weight "
+        "transfer. When set together with checkpoint_format='MX', enables "
+        "GPU-to-GPU weight transfer from a running source instance, bypassing "
+        "disk I/O. When the server is unreachable, loading falls back to the "
+        "standard HuggingFace checkpoint path.",
+        status="prototype",
+    )
+
+    server_query_timeout_s: Optional[NonNegativeInt] = Field(
+        default=None,
+        description="Timeout in seconds for upstream MxLiveWeightLoader source "
+        "discovery. When unset, TRT-LLM first probes for existing sources: "
+        "no source uses a short 30-second fallback cap, while an existing "
+        "source uses modelexpress's default wait for long donor loads.",
+        status="prototype",
+    )
+
+    preshard_strategy: str = Field(
+        default="per_module",
+        description="How to inform TRT-LLM that MX-delivered weights are already "
+        "TP-sharded for the local rank. Only 'per_module' is supported in "
+        "this MX-only PR; 'global' requires LoadFormat.PRESHARDED.",
+        status="prototype",
+    )
+
+    @model_validator(mode="after")
+    def validate_preshard_strategy(self) -> 'ModelExpressConfig':
+        if self.preshard_strategy not in ("per_module", "global"):
+            raise ValueError(
+                f"mx_config.preshard_strategy must be 'per_module' or 'global', "
+                f"got '{self.preshard_strategy}'.")
+        if self.preshard_strategy == "global":
+            raise ValueError(
+                "mx_config.preshard_strategy='global' requires "
+                "LoadFormat.PRESHARDED, which is not yet available in "
+                "TRT-LLM main. Use preshard_strategy='per_module' instead.")
+        return self
+
+
 class SamplerType(StrEnum):
     """Enum for sampler type options."""
     TRTLLMSampler = "TRTLLMSampler"
@@ -3781,6 +3879,12 @@ class TorchLlmArgs(BaseLlmArgs):
         "If neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF "
         "and the default HfCheckpointLoader will be used.\n"
         "If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
+        status="prototype",
+    )
+
+    mx_config: ModelExpressConfig = Field(
+        default_factory=ModelExpressConfig,
+        description="ModelExpress (MX) P2P checkpoint loading config.",
         status="prototype",
     )
 
@@ -4042,6 +4146,29 @@ class TorchLlmArgs(BaseLlmArgs):
                 "checkpoint_format will be set to HF.")
             self.checkpoint_format = "HF"
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_mx_config(self) -> 'TorchLlmArgs':
+        # When MX is the active checkpoint format and the user did not
+        # explicitly set ``mx_config.server_url``, honor the ``MODEL_EXPRESS_URL``
+        # env var that the upstream ``modelexpress`` library reads. This
+        # lets orchestrators configure MX via the environment while keeping
+        # the resolved value visible on ``llm_args.mx_config.server_url``.
+        if self.checkpoint_format == "MX" and self.mx_config.server_url is None:
+            env_url = os.environ.get("MODEL_EXPRESS_URL")
+            if env_url:
+                logger.info(
+                    "mx_config.server_url not set; using MODEL_EXPRESS_URL=%s "
+                    "from environment.", env_url)
+                self.mx_config.server_url = env_url
+
+        if self.mx_config.server_url is not None and self.checkpoint_format != "MX":
+            logger.warning(
+                "mx_config.server_url is set but checkpoint_format is '%s', not "
+                "'MX'. The MX config will be ignored. Set "
+                "checkpoint_format='MX' to enable MX P2P weight transfer.",
+                self.checkpoint_format)
         return self
 
     @model_validator(mode="after")
