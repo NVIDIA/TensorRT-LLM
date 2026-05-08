@@ -603,22 +603,44 @@ class QuantizeMXFP4MoETrtllmGen(BaseTransform):
                 1,  # routing_method_type = RoutingMethodType.Renormalize
             )
 
-            # MoE-TP: insert an all_reduce after the V4 op so partial
-            # ``[..., hidden]`` outputs from each rank sum to the full
-            # hidden output before the residual add.  The ``fc2_bias``
-            # was already divided by ``tp_size`` inside the prep helper,
-            # so the post-AR sum reproduces the unsharded bias.
+            # MoE-TP: insert an all_reduce so partial ``[..., hidden]``
+            # outputs from each rank sum to the full hidden output before
+            # the residual add.  The ``fc2_bias`` was already divided by
+            # ``tp_size`` inside the prep helper, so the post-AR sum
+            # reproduces the unsharded bias.
+            #
+            # Placement: insert AR *after* the immediately-following
+            # ``aten.view`` (if any) rather than directly after the MoE
+            # op.  The downstream sequence is ``MoE → view → add → norm``
+            # and ``fuse_allreduce_residual_rmsnorm`` matches
+            # ``AR → add → norm`` only when AR is the immediate
+            # predecessor of ``add``.  Inserting AR after the view
+            # gives ``MoE → view → AR → add → norm`` so the fusion
+            # matcher catches all 36 post-MoE ARs (instead of 0/36 in
+            # the legacy ``MoE → AR → view → add → norm`` ordering,
+            # which matched only post-attn ARs).  Numerically
+            # equivalent: ``view`` is a free reshape and AR is
+            # element-wise across ranks.  See cc_reports §5.1 O1.
             if moe_tp_size > 1:
                 from .sharding import _get_dist_ops
 
                 _, all_reduce_op = _get_dist_ops("auto")
-                with gm.graph.inserting_after(n):
+                view_node = next(
+                    (
+                        u
+                        for u in n.users.keys()
+                        if u.op == "call_function" and u.target == torch.ops.aten.view.default
+                    ),
+                    None,
+                )
+                anchor = view_node if view_node is not None else n
+                with gm.graph.inserting_after(anchor):
                     red = gm.graph.call_function(
                         all_reduce_op,
-                        args=(n, allreduce_strategy),
+                        args=(anchor, allreduce_strategy),
                     )
-                    n.replace_all_uses_with(red)
-                    red.replace_input_with(red, n)
+                    anchor.replace_all_uses_with(red)
+                    red.replace_input_with(red, anchor)
 
             # Free original MXFP4 params + erase their get_attr nodes.
             for old_node in [
