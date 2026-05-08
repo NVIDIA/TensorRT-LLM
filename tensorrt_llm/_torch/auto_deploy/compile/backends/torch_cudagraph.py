@@ -607,9 +607,9 @@ class PerNLayersCapturedGraph(CapturedGraph):
 
         if not isinstance(self._original_model, GraphModule):
             ad_logger.warning(
-                "[PerNLayersCudaGraphWrapper] underlying model is %s, not a "
-                "GraphModule — falling back to monolithic CUDA graph capture.",
-                type(self._original_model).__name__,
+                f"[PerNLayersCudaGraphWrapper] underlying model is "
+                f"{type(self._original_model).__name__}, not a "
+                f"GraphModule — falling back to monolithic CUDA graph capture."
             )
             self._split_done = True
             return False
@@ -621,9 +621,9 @@ class PerNLayersCapturedGraph(CapturedGraph):
 
         if num_submods <= 1:
             ad_logger.warning(
-                "[PerNLayersCudaGraphWrapper] split produced %d submod(s) — no "
-                "AR boundaries detected.  Falling back to monolithic capture.",
-                num_submods,
+                f"[PerNLayersCudaGraphWrapper] split produced {num_submods} "
+                f"submod(s) — no AR boundaries detected.  Falling back to "
+                f"monolithic capture."
             )
             self._split_done = True
             return False
@@ -655,14 +655,11 @@ class PerNLayersCapturedGraph(CapturedGraph):
             ar_count = sum(1 for n in self._original_model.graph.nodes if _is_ar_boundary_node(n))
             n_layers_est = ar_count // 2
             ad_logger.info(
-                "[PerNLayersCudaGraphWrapper] activated "
-                "(layers_per_chunk=%d, source=%s); "
-                "capturing %d sub-graphs (~%d/%d)",
-                self.layers_per_chunk,
-                self.layers_per_chunk_source,
-                len(runners),
-                n_layers_est,
-                self.layers_per_chunk,
+                f"[PerNLayersCudaGraphWrapper] activated "
+                f"(layers_per_chunk={self.layers_per_chunk}, "
+                f"source={self.layers_per_chunk_source}); "
+                f"capturing {len(runners)} sub-graphs "
+                f"(~{n_layers_est}/{self.layers_per_chunk})"
             )
             self._activation_logged = True
 
@@ -727,8 +724,16 @@ class PerNLayersCapturedGraph(CapturedGraph):
 
         # Write the final captured output into the pre-allocated output
         # buffer.  This mirrors CapturedGraph._capture_one_graph so downstream
-        # replay bookkeeping keeps working.
-        out_flat = tree_flatten_spec(out, self._out_spec)
+        # replay bookkeeping keeps working.  NOTE: ``tree_flatten_spec`` would
+        # error here because ``self._split_gm(*args, **kwargs)`` returns a flat
+        # tuple of tensors (FX split_module rebuilds the top-level graph
+        # without the dataclass-wrapping output node), whereas ``_out_spec``
+        # was captured from the original (un-split) gm and encodes the model's
+        # dataclass output (e.g. ``GptOssCausalLMOutput(['logits'])``).  Use
+        # plain ``tree_flatten`` to extract the flat tensors; the dataclass
+        # is reconstructed at the end of ``forward`` via
+        # ``self._out_spec.unflatten(...)``.
+        out_flat, _ = tree_flatten(out)
         for o_buffer, o in zip(self._out_buffer_flat, out_flat):
             o_buffer.narrow(od, 0, o.shape[od]).copy_(o)
 
@@ -795,9 +800,13 @@ class PerNLayersCapturedGraph(CapturedGraph):
 
         # The final runner's captured output IS the model output.  Copy it
         # into the pre-allocated output buffer (dynamic-dim aware) so callers
-        # observe the same buffer layout the parent class promises.
+        # observe the same buffer layout the parent class promises.  NOTE:
+        # the runner's captured output is whatever ``submod_K`` returns —
+        # FX split_module gives a flat tuple of tensors, NOT the original
+        # dataclass.  Use ``tree_flatten`` (not ``tree_flatten_spec``) here;
+        # the dataclass is reconstructed below by ``self._out_spec.unflatten``.
         final_output = self._runners[-1].get_output(combined_shape)
-        final_flat = tree_flatten_spec(final_output, self._out_spec)
+        final_flat, _ = tree_flatten(final_output)
         od = self._output_dynamic_dim
         bs = args_batched[0].shape[self.dynamic_dims[0]]
         for o_buffer, o in zip(self._out_buffer_flat, final_flat):
@@ -824,8 +833,8 @@ def _resolve_layers_per_chunk(yaml_value: Optional[int]) -> Tuple[Optional[int],
             n = int(env_val)
         except ValueError:
             ad_logger.warning(
-                "[PerNLayersCudaGraphWrapper] AD_LAYERS_PER_CHUNK=%r is not an integer; ignoring.",
-                env_val,
+                f"[PerNLayersCudaGraphWrapper] AD_LAYERS_PER_CHUNK={env_val!r} "
+                f"is not an integer; ignoring."
             )
             n = 0
         if n >= 1:
