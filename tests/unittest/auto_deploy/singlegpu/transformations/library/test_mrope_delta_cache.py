@@ -19,6 +19,7 @@ import torch.nn as nn
 import yaml
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import StateResourceHandler
+from tensorrt_llm._torch.auto_deploy.model_config_loader import INTERNAL_CONFIGS_DIR
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig
 from tensorrt_llm._torch.auto_deploy.transform.library.mrope_delta_cache import (
@@ -66,14 +67,13 @@ def test_initialize_mrope_delta_cache_disabled_in_default_config():
 
 
 def test_qwen_registry_configs_explicitly_enable_mrope_delta_cache():
-    config_dir = _repo_root() / "examples" / "auto_deploy" / "model_registry" / "configs"
     # 35b enables mrope_delta_cache; 400b explicitly disables it (NVFP4 accuracy)
     expected = {
-        "qwen3.5_moe_35b.yaml": True,
-        "qwen3.5_moe_400b.yaml": False,
+        "qwen3.5_moe_35b_ad.yaml": True,
+        "qwen3.5_moe_400b_ad.yaml": False,
     }
     for config_name, expected_enabled in expected.items():
-        with open(config_dir / config_name) as f:
+        with open(INTERNAL_CONFIGS_DIR / config_name) as f:
             config = yaml.safe_load(f)
 
         assert config["transforms"]["initialize_mrope_delta_cache"]["enabled"] is expected_enabled
