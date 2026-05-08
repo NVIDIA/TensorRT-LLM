@@ -77,7 +77,12 @@ class HfWeightLoader(BaseWeightLoader):
             # If the layer number is overridden, it indicates that only a subset of layers are loaded.
             # Prefetching all layers is unnecessary.
             num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
-            enable_prefetch = (prefetch_size
+            # Allow disabling prefetch via env var, e.g. when host memory is
+            # tight or NUMA-bound (GB200/GB300) and the heuristic mis-estimates
+            # what is actually pinnable.
+            force_disable_prefetch = os.environ.get(
+                "TLLM_DISABLE_HF_PREFETCH", "0") == "1"
+            enable_prefetch = (not force_disable_prefetch and prefetch_size
                                < self._get_local_available_host_memory() * 0.9
                                and num_layers == 0)
             if enable_prefetch:
