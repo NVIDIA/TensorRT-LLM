@@ -1161,8 +1161,17 @@ __device__ __noinline__ void gvrTopKJob(float const* __restrict__ input, int con
 // 4d.D: templated on TopK so launcher can dispatch K=512/1024/2048 to the
 // same kernel template. Default <TOP_K> matches the legacy non-templated
 // signature (callers that pass no template argument get K=2048 fp32).
+//
+// 2026-05-08 alignment with production: __launch_bounds__ now matches
+// heuristicTopKMultiRowKernel (single-arg, no minBlocksPerSM hint) so nvcc
+// applies the same register heuristic to this standalone wrapper as to the
+// production multi-row kernel. Removing the trailing `, 1` lets ptxas pick
+// REG=40 (K=2048 fp32) instead of REG=64, restoring 75% theoretical
+// occupancy parity. NOTE: this changes the standalone gvrTopKKernel<2048>
+// SASS away from V2e LOCK byte-identity (production multi-row path is
+// unaffected — it uses its own __launch_bounds__).
 template <int TopK = TOP_K>
-__global__ void __launch_bounds__(BLOCK_SIZE, 1)
+__global__ void __launch_bounds__(BLOCK_SIZE)
     gvrTopKKernel(float const* __restrict__ input, int const N, int const* __restrict__ preIdx, int const M,
         int const topK, float* __restrict__ outputValues, int* __restrict__ outputIndices, int const thresholdPos)
 {
@@ -1699,9 +1708,13 @@ __device__ __noinline__ void gvrTopKJobDtype(InputT const* __restrict__ input, i
 // ============================================================================
 // 4d.D: templated on TopK alongside InputT. Default <InputT, TOP_K> matches
 // the pre-multi-K signature for the existing K=2048 dtype path.
+//
+// 2026-05-08: same alignment with heuristicTopKMultiRowKernelDtype — single-arg
+// __launch_bounds__ removes the minBlocksPerSM=1 hint so ptxas applies the
+// production register heuristic. See gvrTopKKernel<TopK> note above.
 
 template <typename InputT, int TopK = TOP_K>
-__global__ void __launch_bounds__(BLOCK_SIZE, 1)
+__global__ void __launch_bounds__(BLOCK_SIZE)
     gvrTopKKernelDtype(InputT const* __restrict__ input, int const N, int const* __restrict__ preIdx, int const M,
         int const topK, InputT* __restrict__ outputValues, int* __restrict__ outputIndices, int const thresholdPos)
 {
