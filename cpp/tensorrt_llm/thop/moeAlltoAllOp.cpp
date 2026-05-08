@@ -208,7 +208,9 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     TORCH_CHECK(!inputPayloads.empty(), "inputPayloads must not be empty");
     TORCH_CHECK(inputPayloads.size() <= kMaxPayloads, "Too many input payloads");
     TORCH_CHECK(numExperts >= epSize, "numExperts must be greater than or equal to epSize");
-    TORCH_CHECK(numExperts % epSize == 0, "numExperts must be divisible by epSize for contiguous partitioning");
+    // numExperts does not need to be divisible by epSize: the kernel performs
+    // ceil/floor contiguous partitioning so ranks [0, numExperts % epSize)
+    // own (numExperts / epSize + 1) experts and the rest own (numExperts / epSize).
     bool enableEplb = eplbLocalStats.has_value();
     int64_t eplbStatsNumExperts = 0;
     if (enableEplb)

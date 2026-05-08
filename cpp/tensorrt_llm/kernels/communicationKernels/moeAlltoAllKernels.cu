@@ -182,19 +182,38 @@ using tensorrt_llm::common::launchWithPdlWhenEnabled;
 // Helper Functions for Expert-to-Rank Mapping
 // ============================================================================
 
-__device__ int compute_target_rank_id(int expert_id, int num_experts_per_rank)
+__device__ int compute_target_rank_id(int expert_id, int num_experts, int ep_size)
 {
-    // Compute which rank owns a given expert using contiguous partitioning
-    // Experts are divided evenly across EP ranks:
-    // - Rank 0 gets experts [0, num_experts_per_rank)
-    // - Rank 1 gets experts [num_experts_per_rank, 2*num_experts_per_rank)
-    // - etc.
-    // Example: 32 experts, 4 ranks -> 8 experts per rank
-    // - Rank 0: experts 0-7
-    // - Rank 1: experts 8-15
-    // - Rank 2: experts 16-23
-    // - Rank 3: experts 24-31
-    return expert_id / num_experts_per_rank;
+    // Compute which rank owns a given expert using contiguous ceil/floor partitioning.
+    // Supports non-divisible distribution when num_experts % ep_size != 0:
+    //   base      = num_experts / ep_size
+    //   remainder = num_experts % ep_size
+    //   - Ranks [0, remainder) each own (base + 1) experts.
+    //   - Ranks [remainder, ep_size) each own base experts.
+    //
+    // Example A (uniform): 32 experts, 4 ranks -> base=8, remainder=0
+    //   - Rank 0: experts 0-7
+    //   - Rank 1: experts 8-15
+    //   - Rank 2: experts 16-23
+    //   - Rank 3: experts 24-31
+    //
+    // Example B (non-divisible): 384 experts, 5 ranks -> base=76, remainder=4
+    //   - Rank 0: experts 0-76    (77 experts)
+    //   - Rank 1: experts 77-153  (77 experts)
+    //   - Rank 2: experts 154-230 (77 experts)
+    //   - Rank 3: experts 231-307 (77 experts)
+    //   - Rank 4: experts 308-383 (76 experts)
+    int const base = num_experts / ep_size;
+    int const remainder = num_experts - base * ep_size; // == num_experts % ep_size
+    int const split = remainder * (base + 1);           // boundary expert id
+    if (expert_id < split)
+    {
+        // Falls inside the (base + 1)-sized prefix block.
+        return expert_id / (base + 1);
+    }
+    // Falls inside the base-sized suffix block. When remainder == 0, split == 0
+    // and this branch handles all experts uniformly.
+    return remainder + (expert_id - split) / base;
 }
 
 // ============================================================================
@@ -439,15 +458,15 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         }
 
         uint64_t already_copied = 0;
-        int num_experts_per_rank = num_experts / ep_size;
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cudaGridDependencySynchronize();
 #endif
         for (int k = 0; k < TOP_K; k++)
         {
             int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
-            // Use contiguous partitioning to determine target rank
-            int target_rank = compute_target_rank_id(expert_id, num_experts_per_rank);
+            // Use contiguous ceil/floor partitioning to determine target rank.
+            // Supports the non-divisible case where num_experts % ep_size != 0.
+            int target_rank = compute_target_rank_id(expert_id, num_experts, ep_size);
 
             if (already_copied & (1ULL << target_rank))
             {

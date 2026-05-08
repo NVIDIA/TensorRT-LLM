@@ -246,12 +246,40 @@ def decode_source_info(
 # ============================================================================
 
 
+def _compute_ep_partition(num_experts: int, ep_size: int, ep_rank: int) -> Tuple[int, int, int]:
+    """Compute per-rank expert count and slot boundaries.
+
+    Mirrors the kernel's compute_target_rank_id ceil/floor distribution:
+    ranks [0, remainder) hold (base + 1) experts, and the remaining ranks
+    hold base experts. Covers all experts even when num_experts % ep_size
+    != 0 (non-divisible EP).
+
+    Returns:
+        (expert_size, slot_start, slot_end)
+    """
+    base = num_experts // ep_size
+    remainder = num_experts % ep_size
+    expert_size = base + (1 if ep_rank < remainder else 0)
+    slot_start = ep_rank * base + min(ep_rank, remainder)
+    return expert_size, slot_start, slot_start + expert_size
+
+
+def _expert_id_to_rank(expert_id: int, num_experts: int, ep_size: int) -> int:
+    """Inverse mapping of _compute_ep_partition. Mirrors kernel logic."""
+    base = num_experts // ep_size
+    remainder = num_experts % ep_size
+    split = remainder * (base + 1)
+    if expert_id < split:
+        return expert_id // (base + 1)
+    return remainder + (expert_id - split) // base
+
+
 def simple_moe(
     hidden_states: torch.Tensor,
     token_selected_slots: torch.Tensor,
     token_final_scales: torch.Tensor,
-    ep_rank: int,
-    experts_per_rank: int,
+    slot_start: int,
+    slot_end: int,
 ) -> torch.Tensor:
     """Trivial MoE: weighted sum of hidden_states for local experts only.
 
@@ -265,8 +293,6 @@ def simple_moe(
     - DeepEPLL: all-ones (combine applies real scales internally)
     """
     output = torch.zeros_like(hidden_states, dtype=torch.float32)
-    slot_start = ep_rank * experts_per_rank
-    slot_end = slot_start + experts_per_rank
 
     for i in range(hidden_states.shape[0]):
         for k in range(token_selected_slots.shape[1]):
@@ -421,8 +447,13 @@ def check_platform_support(comm_type: str) -> Optional[str]:
 
 def check_feasibility(comm_type: str, config: CommTestConfig) -> Optional[str]:
     """Return skip reason string if config is infeasible, else None."""
-    if config.num_experts % config.ep_size != 0:
-        return f"num_experts={config.num_experts} not divisible by ep_size={config.ep_size}"
+    if config.num_experts % config.ep_size != 0 and comm_type != COMM_NVLINK_ONE_SIDED:
+        # Only NVLinkOneSided supports non-divisible EP (ceil/floor partitioning).
+        # Other comm types still require num_experts divisible by ep_size.
+        return (
+            f"comm_type={comm_type} requires num_experts divisible by ep_size, "
+            f"got num_experts={config.num_experts}, ep_size={config.ep_size}"
+        )
 
     if config.use_low_precision_combine and not _supports_low_precision_combine(config):
         return (
@@ -777,7 +808,11 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
             config.quant_mode,
         )
 
-        experts_per_rank = config.num_experts // config.ep_size
+        # Use ceil/floor partitioning so the slot range is correct for both
+        # uniform and non-divisible EP (num_experts % ep_size != 0).
+        _, local_slot_start, local_slot_end = _compute_ep_partition(
+            config.num_experts, config.ep_size, rank
+        )
         # Run a minimal local-expert compute step before combine(). This keeps
         # the test aligned with the real MoE pipeline, where combine() consumes
         # per-rank expert outputs rather than raw dispatch payloads.
@@ -785,8 +820,8 @@ def _worker_full_pipeline(config: CommTestConfig) -> dict:
             recv_hs_bf16,
             dispatch_outputs.recv_slots,
             dispatch_outputs.recv_scales,
-            rank,
-            experts_per_rank,
+            local_slot_start,
+            local_slot_end,
         )
 
         combined = comm.combine(
@@ -868,10 +903,9 @@ def _compute_expected_tokens_per_rank(
     """Compute the set of (src_rank, token_idx) each rank should receive.
 
     A token is expected at dest_rank if at least one of its top_k expert
-    selections falls in dest_rank's expert range.
+    selections falls in dest_rank's expert range. Uses the same ceil/floor
+    partitioning as the kernel so this works for non-divisible EP as well.
     """
-    experts_per_rank = config.num_experts // config.ep_size
-
     expected: Dict[int, Set[Tuple[int, int]]] = {r: set() for r in range(config.ep_size)}
     for result in all_results:
         src_rank = result["rank"]
@@ -881,7 +915,8 @@ def _compute_expected_tokens_per_rank(
             for k in range(slots.shape[1]):
                 eid = slots[i, k].item()
                 if 0 <= eid < config.num_experts:
-                    expected[eid // experts_per_rank].add((src_rank, i))
+                    target_rank = _expert_id_to_rank(eid, config.num_experts, config.ep_size)
+                    expected[target_rank].add((src_rank, i))
 
     return expected
 
@@ -1006,7 +1041,6 @@ def verify_dispatch_alltoall(
     4. All tokens that should be routed to this rank are present (completeness)
     """
     num_experts = config.num_experts
-    experts_per_rank = num_experts // config.ep_size
 
     # For fp8/w4afp8, data is transported as fp8 viewed as bf16 (half width).
     # For nvfp4, data is packed uint8 (half width).
@@ -1028,8 +1062,8 @@ def verify_dispatch_alltoall(
         recv_hs = result["recv_hs"]
         recv_slots = result["recv_slots"]
 
-        slot_start = recv_rank * experts_per_rank
-        slot_end = slot_start + experts_per_rank
+        # Per-rank slot range — handles non-divisible EP.
+        _, slot_start, slot_end = _compute_ep_partition(num_experts, config.ep_size, recv_rank)
 
         decoded = decode_source_info(recv_hs, decode_dtype, decode_hidden)
         actually_received: Set[Tuple[int, int]] = set()
@@ -1175,7 +1209,6 @@ def _build_combine_reference(
     """
     num_tokens = config.all_num_tokens[target_rank]
     hidden_size = config.hidden_size
-    experts_per_rank = config.num_experts // config.ep_size
 
     # Use float32 accumulator for all paths (matches kernel behavior)
     ref = torch.zeros(num_tokens, hidden_size, dtype=torch.float32)
@@ -1222,8 +1255,9 @@ def _build_combine_reference(
             recv_hs_bf16 = proc_result["recv_hs_bf16"]
             recv_slots = proc_result["recv_slots"]
             source_info = proc_result["recv_source_info"]
-            slot_start = proc_rank * experts_per_rank
-            slot_end = slot_start + experts_per_rank
+            _, slot_start, slot_end = _compute_ep_partition(
+                config.num_experts, config.ep_size, proc_rank
+            )
 
             for i, (src_rank, token_idx) in enumerate(source_info):
                 if src_rank == target_rank and token_idx < num_tokens:
@@ -1474,6 +1508,41 @@ def _make_boundary_test_params():
     return params
 
 
+def _make_non_divisible_ep_test_params():
+    """Generate non-divisible EP test parameters for NVLinkOneSided.
+
+    Exercises ceil/floor expert partitioning where num_experts % ep_size != 0:
+        base      = num_experts // ep_size
+        remainder = num_experts %  ep_size
+        Ranks [0, remainder)        own (base + 1) experts each
+        Ranks [remainder, ep_size)  own  base      experts each
+
+    Limited to NVLinkOneSided because other comm backends still require
+    num_experts divisible by ep_size (enforced by check_feasibility).
+    """
+    params = []
+    # (ep_size, num_experts, top_k, all_num_tokens) — picked to cover both
+    # uneven ratios (5 / 2 = 2 + 1) and a larger remainder (17 / 4).
+    cases = [
+        (2, 5, 2, [16, 16]),  # base=2, remainder=1: rank0=3, rank1=2
+        (4, 17, 2, [16, 16, 16, 16]),  # base=4, remainder=1: rank0=5, others=4
+        (4, 22, 4, [8, 8, 8, 8]),  # base=5, remainder=2: rank0..1=6, rank2..3=5
+    ]
+    for ep_size, num_experts, top_k, all_num_tokens in cases:
+        for use_low_precision_combine in [False, True]:
+            config = CommTestConfig(
+                comm_type=COMM_NVLINK_ONE_SIDED,
+                ep_size=ep_size,
+                num_experts=num_experts,
+                top_k=top_k,
+                hidden_size=DEFAULT_HIDDEN_SIZE,
+                all_num_tokens=all_num_tokens,
+                use_low_precision_combine=use_low_precision_combine,
+            )
+            params.append(pytest.param(ep_size, config, id=str(config)))
+    return params
+
+
 def _make_postquant_test_params():
     """Generate post-quant test parameters using POSTQUANT_COMM_MAP.
 
@@ -1597,4 +1666,14 @@ class TestMoEComm:
     )
     def test_moe_comm_postquant(self, mpi_pool_executor, config: CommTestConfig):
         """Verify post-quant dispatch -> dequant -> MoE -> combine pipeline."""
+        _run_full_test(mpi_pool_executor, config)
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize(
+        "mpi_pool_executor,config",
+        _make_non_divisible_ep_test_params(),
+        indirect=["mpi_pool_executor"],
+    )
+    def test_moe_comm_non_divisible_ep(self, mpi_pool_executor, config: CommTestConfig):
+        """Verify NVLinkOneSided with non-divisible EP (num_experts % ep_size != 0)."""
         _run_full_test(mpi_pool_executor, config)
