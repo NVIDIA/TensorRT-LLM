@@ -19,7 +19,7 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.utils import fp8_utils
 
-from ..dsa import DSAtrtllmAttentionMetadata, Indexer, rotate_activation
+from ..dsa import HAS_FAST_HADAMARD, DSAtrtllmAttentionMetadata, Indexer, rotate_activation
 from ..kernel import deepseek_v4_local_to_global_indices
 from .compressor import Compressor, KVCacheDtype, resolve_kv_cache_dtype
 
@@ -954,7 +954,7 @@ class DeepseekV4Indexer(Indexer):
             dtype=dtype,
             kv_cache_dtype=self.indexer_k_cache_dtype,
             is_indexer=True,
-            rotate_activation=True,
+            rotate_activation=HAS_FAST_HADAMARD,
         )
 
     def post_load_weights(self):
