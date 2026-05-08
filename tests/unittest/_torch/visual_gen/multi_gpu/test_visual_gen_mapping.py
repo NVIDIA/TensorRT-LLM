@@ -73,6 +73,9 @@ class TestConstruction:
         assert vgm.tp_size == 1
         assert vgm.cp_size == 1
         assert vgm.ulysses_size == 1
+        assert vgm.parallel_vae_size == 1
+        assert vgm.vae_ranks == [0]
+        assert vgm.vae_group is None
 
     def test_stores_sizes(self):
         vgm = VisualGenMapping(
@@ -88,6 +91,17 @@ class TestConstruction:
         assert vgm.ulysses_size == 2
         assert vgm.world_size == 8
 
+    def test_stores_parallel_vae_ranks(self):
+        vgm = VisualGenMapping(
+            world_size=4,
+            rank=0,
+            ulysses_size=4,
+            parallel_vae_size=2,
+        )
+        assert vgm.parallel_vae_size == 2
+        assert vgm.vae_ranks == [0, 1]
+        assert vgm.vae_group is None
+
     def test_stores_attn2d_sizes(self):
         vgm = VisualGenMapping(
             world_size=4,
@@ -102,6 +116,10 @@ class TestConstruction:
     def test_product_mismatch_raises(self):
         with pytest.raises(ValueError, match="!= world_size"):
             VisualGenMapping(world_size=4, rank=0, cfg_size=2, ulysses_size=3)
+
+    def test_parallel_vae_size_cannot_exceed_world_size(self):
+        with pytest.raises(ValueError, match="cannot exceed world_size"):
+            VisualGenMapping(world_size=1, rank=0, parallel_vae_size=2)
 
     def test_invalid_order_raises(self):
         with pytest.raises(ValueError, match="permutation"):

@@ -468,19 +468,29 @@ class BasePipeline(nn.Module):
             self.cache_accelerator = acc
 
     def setup_parallel_vae(self):
-        if not self.model_config.enable_parallel_vae:
+        parallel_cfg = self.model_config.parallel
+        if parallel_cfg.parallel_vae_size <= 1:
             return
         if not dist.is_initialized() or dist.get_world_size() <= 1:
             return
         if self.vae is None:
             return
 
-        # Uses all ranks today; replace with a subset to dedicate specific ranks to VAE.
-        pg = dist.new_group(list(range(dist.get_world_size())))
+        vgm = self.model_config.visual_gen_mapping
+        if vgm is None:
+            return
+
+        vae_ranks = vgm.vae_ranks
+        if dist.get_rank() not in vae_ranks:
+            return
+        pg = vgm.vae_group
+        if pg is None:
+            return
+
         try:
             self.vae = ParallelVAEFactory.from_vae(
                 self.vae,
-                split_dim=self.model_config.parallel_vae_split_dim,
+                split_dim=parallel_cfg.parallel_vae_split_dim,
                 pg=pg,
             )
         except ValueError:
@@ -495,7 +505,7 @@ class BasePipeline(nn.Module):
         self._parallel_vae_enabled = True
         logger.info(
             f"Parallel VAE enabled: {type(self.vae).__name__}, "
-            f"split_dim={self.model_config.parallel_vae_split_dim}, "
+            f"split_dim={parallel_cfg.parallel_vae_split_dim}, "
             f"world_size={dist.get_world_size(pg)}"
         )
 
@@ -622,7 +632,8 @@ class BasePipeline(nn.Module):
         extra_latents: Optional[Dict[str, Tuple[torch.Tensor, Callable]]] = None,
     ):
         """Execute VAE decoding. Only rank 0 performs decoding.
-        If parallel VAE is enabled, all processes perform decoding.
+        If parallel VAE is enabled, only ranks in the VAE process group
+        perform decoding; non-participating ranks return None placeholders.
 
         Args:
             latents: Primary latents to decode (e.g., video)

@@ -47,7 +47,6 @@ b_enable_teacache
 b_enable_cuda_graph
 b_enable_torch_compile
 b_enable_two_stage
-b_enable_parallel_vae
 l_cfg_size
 l_ulysses_size
 s_generation_mode
