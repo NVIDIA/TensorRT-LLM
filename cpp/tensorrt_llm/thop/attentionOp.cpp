@@ -311,10 +311,10 @@ public:
         int max_blocks_per_sequence
             = op.useKVCache() && kv_cache_block_offsets.has_value() ? kv_cache_block_offsets.value().size(-1) : 0;
         int32_t const pool_index = op.useKVCache() && host_kv_cache_pool_mapping.has_value()
-            ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 0}).item<int32_t>()
+            ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 0}).item<int64_t>()
             : 0;
-        int32_t const layer_idx_in_cache_pool = op.useKVCache() && host_kv_cache_pool_mapping.has_value()
-            ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 1}).item<int32_t>()
+        int64_t const layer_idx_in_cache_pool = op.useKVCache() && host_kv_cache_pool_mapping.has_value()
+            ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 1}).item<int64_t>()
             : 0;
         KVBlockArray::DataType* block_offsets
             = static_cast<KVBlockArray::DataType*>(op.useKVCache() && kv_cache_block_offsets.has_value()
@@ -993,7 +993,7 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
 }
 
 KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPointers, int32_t poolIndex,
-    int64_t intraPoolOffset, int64_t blockSize, int32_t layerIdxInCachePool, int32_t kvFactor, bool isFp4KvCache)
+    int64_t intraPoolOffset, int64_t blockSize, int64_t layerIdxInCachePool, int32_t kvFactor, bool isFp4KvCache)
 {
     KvCachePoolPointers pointers;
     if (isFp4KvCache)
@@ -1046,9 +1046,9 @@ common::op::KvCacheBuffers<kernels::KVBlockArray> buildPagedKvCacheBuffers(
         return {};
     }
 
-    int32_t const poolIndex = host_kv_cache_pool_mapping->index({static_cast<int64_t>(layer_idx), 0}).item<int32_t>();
-    int32_t const layerIdxInCachePool
-        = host_kv_cache_pool_mapping->index({static_cast<int64_t>(layer_idx), 1}).item<int32_t>();
+    int32_t const poolIndex = host_kv_cache_pool_mapping->index({static_cast<int64_t>(layer_idx), 0}).item<int64_t>();
+    int64_t const layerIdxInCachePool
+        = host_kv_cache_pool_mapping->index({static_cast<int64_t>(layer_idx), 1}).item<int64_t>();
     auto* blockOffsets = static_cast<KVBlockArray::DataType*>(
         kv_cache_block_offsets->index({poolIndex, static_cast<int64_t>(seq_offset)}).data_ptr());
 
