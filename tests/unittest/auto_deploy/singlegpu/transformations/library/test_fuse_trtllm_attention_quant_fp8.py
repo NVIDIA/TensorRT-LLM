@@ -262,18 +262,30 @@ def test_insert_cached_attention_trtllm_materializes_out_scale_reciprocal():
         },
     )(cm, gm)
 
-    reciprocal_nodes = _find_nodes(gm, torch.ops.aten.reciprocal.default)
-    assert len(reciprocal_nodes) == 1
-
     cached_nodes = _find_nodes(gm, torch.ops.auto_deploy.trtllm_attention_mha_with_cache.default)
     assert len(cached_nodes) == 1
 
+    # The ``out_scale`` argument materialises ``1/input_scale`` either as a
+    # per-step ``aten.reciprocal`` op (dynamic scale) or as a pre-computed
+    # static buffer (``get_attr`` to ``_trtllm_recip_*``) when ``input_scale``
+    # is a static module buffer.  Either form is correct; the latter avoids
+    # a per-step kernel launch.
     (out_scale_arg,) = extract_op_args(cached_nodes[0], "out_scale")
     assert isinstance(out_scale_arg, torch.fx.Node)
-    assert is_op(out_scale_arg, torch.ops.aten.reciprocal.default)
-    assert out_scale_arg is reciprocal_nodes[0]
-    graph_nodes = list(gm.graph.nodes)
-    assert graph_nodes.index(reciprocal_nodes[0]) < graph_nodes.index(cached_nodes[0])
+    if is_op(out_scale_arg, torch.ops.aten.reciprocal.default):
+        # Dynamic-scale form: the reciprocal node must precede the cached attn.
+        graph_nodes = list(gm.graph.nodes)
+        assert graph_nodes.index(out_scale_arg) < graph_nodes.index(cached_nodes[0])
+    else:
+        # Static-scale form: a fresh get_attr to a pre-folded recip buffer.
+        assert out_scale_arg.op == "get_attr", (
+            f"Expected out_scale to be aten.reciprocal or a get_attr; "
+            f"got op={out_scale_arg.op}, target={out_scale_arg.target}"
+        )
+        assert "recip" in str(out_scale_arg.target), (
+            f"Expected pre-folded recip buffer name to contain 'recip'; "
+            f"got target={out_scale_arg.target}"
+        )
 
 
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires FP8 support")

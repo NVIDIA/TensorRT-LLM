@@ -5,7 +5,7 @@ from tensorrt_llm._torch.visual_gen.executor import (
     DiffusionRequest,
     DiffusionResponse,
 )
-from tensorrt_llm._torch.visual_gen.output import MediaOutput
+from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 
 # Checkpoint loading
 from .checkpoints import WeightLoader
@@ -44,7 +44,7 @@ __all__ = [
     "DiffusionExecutor",
     "DiffusionRequest",
     "DiffusionResponse",
-    "MediaOutput",
+    "PipelineOutput",
     # Mapping
     "VisualGenMapping",
     # Pipelines

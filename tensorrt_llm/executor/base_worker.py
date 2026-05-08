@@ -223,8 +223,12 @@ class BaseWorker(GenerationExecutor):
                 from tensorrt_llm._torch.pyexecutor.model_loader import \
                     _construct_checkpoint_loader
                 self.checkpoint_loader = _construct_checkpoint_loader(
-                    self.llm_args.backend, self.llm_args.checkpoint_loader,
-                    self.llm_args.checkpoint_format)
+                    self.llm_args.backend,
+                    self.llm_args.checkpoint_loader,
+                    self.llm_args.checkpoint_format,
+                    mx_config=self.llm_args.mx_config,
+                    mx_model_name=self.llm_args.model,
+                )
 
             self.max_seq_len = self.llm_args.max_seq_len
             # creare_py_executor may change some fields of llm_args
@@ -662,6 +666,12 @@ class BaseWorker(GenerationExecutor):
     # Define a Callable to join iteration and request stats
     @staticmethod
     def _stats_serializer(stats) -> str:
+        # Per-rank path: stats is ("per_rank_dict", {..., "rank": N}).
+        # Already serialized on the producing rank via allgather — just emit.
+        if (isinstance(stats, tuple) and len(stats) == 2
+                and stats[0] == "per_rank_dict"):
+            return json.dumps(stats[1])
+
         iteration_stats, req_stats = stats[0], stats[1]
         kv_iter_stats = stats[2] if len(stats) > 2 else None
         attention_dp_rank = stats[3] if len(stats) > 3 else 0

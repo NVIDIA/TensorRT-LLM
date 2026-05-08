@@ -70,6 +70,7 @@ class Mamba2Mixer(nn.Module):
         rms_norm_eps: float = 1e-5,
         dtype: torch.dtype | None = None,
         config: ModelConfig | None = None,
+        use_custom_cublas_mm: bool = False,
     ):
         super().__init__()
 
@@ -132,7 +133,9 @@ class Mamba2Mixer(nn.Module):
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             allreduce_strategy=config.allreduce_strategy,
-            lora=self.in_proj_lora)
+            lora=self.in_proj_lora,
+            use_custom_cublas_mm=use_custom_cublas_mm,
+        )
 
         # conv1d, reuse Linear to store weights since it has support for TP > 1 already
         self.conv1d = Linear(
@@ -244,7 +247,9 @@ class Mamba2Mixer(nn.Module):
             quant_config=config.get_quant_config(),
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             allreduce_strategy=config.allreduce_strategy,
-            lora=self.out_proj_lora)
+            lora=self.out_proj_lora,
+            use_custom_cublas_mm=use_custom_cublas_mm,
+        )
 
         self.aux_steram = torch.cuda.Stream()
         self.events = [torch.cuda.Event(), torch.cuda.Event()]

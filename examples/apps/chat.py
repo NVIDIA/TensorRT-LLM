@@ -37,7 +37,8 @@ class LlmConsole(code.InteractiveConsole):
         self.history.append(message)
 
         input = self.tokenizer.apply_chat_template(self.history,
-                                                   add_generation_prompt=True)
+                                                   add_generation_prompt=True,
+                                                   return_dict=False)
 
         output = self.llm.generate([input],
                                    sampling_params=self.sampling_params)[0]

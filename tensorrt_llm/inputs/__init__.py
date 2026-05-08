@@ -1,6 +1,8 @@
 from .content_format import ContentFormat, detect_content_format
 from .data import PromptInputs, TextPrompt, TokensPrompt, prompt_inputs
-from .evs import compute_retained_tokens_count, compute_retention_mask
+from .evs import (compute_retained_tokens_count,
+                  compute_retained_tokens_from_tubelet_budget,
+                  compute_retention_mask)
 from .multimodal import MultimodalInput
 # yapf and isort conflict on the following import blocks
 # yapf: disable
@@ -65,6 +67,7 @@ __all__ = [
     "load_video",
     "get_cache_salt_id",
     "compute_retained_tokens_count",
+    "compute_retained_tokens_from_tubelet_budget",
     "compute_retention_mask",
     "load_base64_image_embeds",
 ]
