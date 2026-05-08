@@ -429,7 +429,4 @@ accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-trtl
 disaggregated/test_disaggregated.py::test_disaggregated_gpt_oss_120b_harmony[gpt_oss/gpt-oss-120b] SKIP (https://nvbugs/6011317)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-dp4-cutlass-auto] SKIP (https://nvbugs/5596343)
 unittest/_torch/speculative/test_eagle3.py::test_llama_eagle3_dynamic_tree[True-False] SKIP (https://nvbugs/6113021)
-accuracy/test_llm_api_pytorch.py::TestPhi4::test_auto_dtype SKIP (https://nvbugs/6040098)
-unittest/bindings/test_transfer_agent_bindings.py::TestMooncakeFunctionalTransfer::test_mooncake_wait_in_progress_on_zero_timeout SKIP (https://nvbugs/6043312)
-perf/test_perf.py::test_perf[deepseek_r1_distill_qwen_32b-bench-_autodeploy-float16-input_output_len:1024,1024-reqs:512] SKIP (https://nvbugs/6044213)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_nvfp4_4gpus_static_eplb[moe_backend=TRTLLM] SKIP (worker init CUDA error masked by kv_cache_manager_v2/_exceptions.py:49 cuGetErrorString type bug; real failure unreadable until that wrapper is fixed)
