@@ -1,0 +1,7 @@
+# AD-specific defaults for Llama 3.3 70B.
+# Disable match_swiglu_pattern: fuses gate+up projections before sharding, but
+# the sharding pass does not recognize the fused ops yet, leaving weights
+# unsharded and causing OOM on multi-GPU (https://nvbugs/5981841).
+transforms:
+  match_swiglu_pattern:
+    enabled: false

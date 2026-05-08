@@ -1,2 +1,2 @@
 # Configuration for single GPU models
-world_size: 1
+tensor_parallel_size: 1

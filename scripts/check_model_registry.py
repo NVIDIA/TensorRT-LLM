@@ -24,9 +24,11 @@ import typing
 
 import yaml
 
-MODEL_REGISTRY_PATH = pathlib.Path("examples/auto_deploy/model_registry/models.yaml")
-REQUIRED_MODEL_KEYS = {"name", "yaml_extra"}
-OPTIONAL_MODEL_KEYS = {"config_id"}
+MODEL_REGISTRY_PATH = pathlib.Path(
+    "tensorrt_llm/_torch/auto_deploy/config/model_registry_internal/models.yaml"
+)
+REQUIRED_MODEL_KEYS = {"name", "ad_defaults"}
+OPTIONAL_MODEL_KEYS = {"config_id", "world_size", "user_configs"}
 ALLOWED_MODEL_KEYS = REQUIRED_MODEL_KEYS | OPTIONAL_MODEL_KEYS
 DEFAULT_CONFIG_ID = "default"
 
@@ -88,19 +90,25 @@ def validate_models(models: typing.Any) -> list[str]:
                 details.append(f"unexpected keys {unexpected_keys}")
             joined_details = ", ".join(details)
             errors.append(
-                f"{entry_label}: expected keys ['name', 'yaml_extra'] and optional ['config_id']; "
-                f"{joined_details}."
+                f"{entry_label}: expected keys {sorted(REQUIRED_MODEL_KEYS)} and optional "
+                f"{sorted(OPTIONAL_MODEL_KEYS)}; {joined_details}."
             )
 
         name = model_entry.get("name")
         if not isinstance(name, str) or not name.strip():
             errors.append(f"{entry_label}: missing non-empty string 'name'.")
 
-        yaml_extra = model_entry.get("yaml_extra")
-        if not isinstance(yaml_extra, list) or not all(
-            isinstance(item, str) and item.strip() for item in yaml_extra
+        ad_defaults = model_entry.get("ad_defaults")
+        if not isinstance(ad_defaults, list) or not all(
+            isinstance(item, str) and item.strip() for item in ad_defaults
         ):
-            errors.append(f"{entry_label}: 'yaml_extra' must be a list of non-empty strings.")
+            errors.append(f"{entry_label}: 'ad_defaults' must be a list of non-empty strings.")
+
+        user_configs = model_entry.get("user_configs", [])
+        if not isinstance(user_configs, list) or not all(
+            isinstance(item, str) and item.strip() for item in user_configs
+        ):
+            errors.append(f"{entry_label}: 'user_configs' must be a list of non-empty strings.")
 
         config_id = model_entry.get("config_id", DEFAULT_CONFIG_ID)
         if not isinstance(config_id, str) or not config_id.strip():
@@ -112,11 +120,11 @@ def validate_models(models: typing.Any) -> list[str]:
             continue
 
         seen_model_configs[(name, config_id)].append(index)
-        if isinstance(yaml_extra, list) and all(
-            isinstance(item, str) and item.strip() for item in yaml_extra
+        if isinstance(ad_defaults, list) and all(
+            isinstance(item, str) and item.strip() for item in ad_defaults
         ):
-            yaml_signature = tuple(yaml_extra)
-            seen_model_yaml_configs[(name, yaml_signature)].append((index, config_id))
+            config_signature = tuple(ad_defaults) + tuple(user_configs)
+            seen_model_yaml_configs[(name, config_signature)].append((index, config_id))
 
     for (name, config_id), indices in sorted(seen_model_configs.items()):
         if len(indices) > 1:
@@ -126,12 +134,12 @@ def validate_models(models: typing.Any) -> list[str]:
                 f"{joined_indices}."
             )
 
-    for (name, yaml_signature), records in sorted(seen_model_yaml_configs.items()):
+    for (name, config_signature), records in sorted(seen_model_yaml_configs.items()):
         config_ids = sorted({cfg_id for _, cfg_id in records})
         if len(config_ids) > 1:
             joined_records = ", ".join(f"{idx}:{cfg_id}" for idx, cfg_id in records)
             errors.append(
-                f"Model {name!r} has identical yaml_extra {list(yaml_signature)!r} "
+                f"Model {name!r} has identical configs {list(config_signature)!r} "
                 f"across different config_id values {config_ids!r} at entries: {joined_records}."
             )
 

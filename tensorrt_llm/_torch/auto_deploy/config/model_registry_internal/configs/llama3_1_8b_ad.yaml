@@ -1,0 +1,19 @@
+# AD-specific defaults for Llama 3.1 8B FP8/NVFP4 variants.
+compile_backend: torch-cudagraph
+model_factory: AutoModelForCausalLM
+runtime: trtllm
+attn_backend: trtllm
+transforms:
+  fuse_trtllm_attn_quant_fp8:
+    enabled: true
+  fuse_fp8_gemms:
+    enabled: true
+  fuse_rmsnorm_quant_fp8:
+    enabled: true
+  fuse_gemms_mixed_children:
+    enabled: true
+  fuse_rope_into_trtllm_attention:
+    enabled: true
+  fuse_silu_mul:
+    enabled: true
+    backend: trtllm

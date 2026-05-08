@@ -94,7 +94,6 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         return _check_for_default_value_only(cls, value, info, msg)
 
     @field_validator(
-        "tensor_parallel_size",
         "pipeline_parallel_size",
         "context_parallel_size",
         "moe_cluster_parallel_size",
@@ -106,8 +105,29 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     )
     @classmethod
     def ensure_no_custom_parallel_config(cls, value: Any, info: ValidationInfo) -> Any:
-        msg = "AutoDeploy only supports parallelization via the `world_size` argument."
+        msg = (
+            f"AutoDeploy does not support '{info.field_name}'. "
+            "Use the `world_size` argument for parallelization."
+        )
         return _check_for_default_value_only(cls, value, info, msg)
+
+    @model_validator(mode="after")
+    def translate_parallel_fields_to_world_size(self):
+        """Translate common parallel fields to AD's world_size.
+
+        When users supply tensor_parallel_size (from a shared config YAML),
+        derive world_size from it so the same config works for both PyTorch
+        and AutoDeploy backends. Explicit world_size always takes precedence.
+        """
+        if "world_size" not in self.model_fields_set:
+            # tensor_parallel_size was explicitly set by the user
+            if "tensor_parallel_size" in self.model_fields_set:
+                self.world_size = self.tensor_parallel_size
+                ad_logger.info(
+                    f"Translated tensor_parallel_size={self.tensor_parallel_size} "
+                    f"to world_size={self.world_size}"
+                )
+        return self
 
     @model_validator(mode="after")
     def setup_hidden_state_capture(self):
@@ -411,11 +431,9 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         ``detect_sharding`` (fallback).  Runtime ``rank`` and ``world_size``
         come from MPI, not from YAML.
 
-        Note: AutoDeploy blocks direct parallelism fields (tensor_parallel_size,
-        etc.) via ``ensure_no_custom_parallel_config``.  Users configure MoE
-        topology exclusively through YAML ``dist_mapping`` blocks.  If that
-        restriction is lifted in the future, a Tier-1 path deriving DistConfig
-        from ``self.parallel_config.to_mapping()`` should be added here.
+        ``tensor_parallel_size`` is translated to ``world_size`` automatically
+        via ``translate_parallel_fields_to_world_size``. MoE topology can also
+        be configured through YAML ``dist_mapping`` blocks.
         """
         ash = self.transforms.get("apply_sharding_hints", {})
         sharding_config = (

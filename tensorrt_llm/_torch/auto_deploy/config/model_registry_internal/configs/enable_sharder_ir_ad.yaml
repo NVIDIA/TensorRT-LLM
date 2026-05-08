@@ -1,0 +1,4 @@
+# Opt in to IR-based hint-driven sharding
+transforms:
+  detect_sharding:
+    enable_sharder_ir: true

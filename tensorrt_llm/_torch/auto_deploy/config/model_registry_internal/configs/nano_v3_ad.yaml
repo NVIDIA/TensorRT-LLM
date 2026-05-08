@@ -1,0 +1,33 @@
+# AD-specific defaults for Nemotron-3-Nano v3.
+compile_backend: torch-cudagraph
+attn_backend: trtllm
+model_factory: AutoModelForCausalLM
+skip_loading_weights: false
+transforms:
+  detect_sharding:
+    allreduce_strategy: SYMM_MEM
+    sharding_dims: ['ep', 'bmm']
+    sharding_source: ['manual']
+    manual_config:
+      head_dim: 128
+      tp_plan:
+        "in_proj": "mamba"
+        "out_proj": "rowwise"
+        "q_proj": "colwise"
+        "k_proj": "colwise"
+        "v_proj": "colwise"
+        "o_proj": "rowwise"
+        "up_proj": "colwise"
+        "down_proj": "rowwise"
+        "fc1_latent_proj": "gather"
+        "fc2_latent_proj": "gather"
+  multi_stream_moe:
+    stage: compile
+    enabled: true
+  gather_logits_before_lm_head:
+    enabled: true
+  fuse_mamba_a_log:
+    stage: post_load_fusion
+    enabled: true
+  insert_cached_ssm_attention:
+    backend: flashinfer_ssm

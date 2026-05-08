@@ -2,6 +2,15 @@
 
 The AutoDeploy model registry provides a comprehensive, maintainable list of supported models for testing and coverage tracking.
 
+## Architecture
+
+The registry is split into two layers:
+
+1. **AD defaults** (`ad_defaults`) — AD-internal knobs (transforms, compile backends, etc.) stored in `tensorrt_llm/_torch/auto_deploy/config/model_registry_internal/configs/`. These are shipped inside the package.
+1. **User configs** (`user_configs`) — User-facing knobs (max_batch_size, kv_cache_config, etc.) stored in `examples/auto_deploy/model_registry/configs/`.
+
+The central registry file is `tensorrt_llm/_torch/auto_deploy/config/model_registry_internal/models.yaml`.
+
 ## Format
 
 **Version: 2.0** (Flat format with composable configurations)
@@ -10,55 +19,57 @@ The AutoDeploy model registry provides a comprehensive, maintainable list of sup
 
 ```yaml
 version: '2.0'
-description: AutoDeploy Model Registry - Flat format with composable configs
 models:
 - name: meta-llama/Llama-3.1-8B-Instruct
-  yaml_extra: [dashboard_default.yaml, world_size_2.yaml]
+  config_id: default_ws_2
+  world_size: 2
+  ad_defaults: ['ad_base.yaml']
+  user_configs: ['dashboard_default.yaml']
 
 - name: meta-llama/Llama-3.3-70B-Instruct
-  yaml_extra: [dashboard_default.yaml, world_size_4.yaml, llama-3.3-70b.yaml]
-
-- name: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
-  yaml_extra: [dashboard_default.yaml, world_size_2.yaml, demollm_triton.yaml]
+  config_id: llama3_3_70b
+  world_size: 4
+  ad_defaults: ['ad_base.yaml', 'llama3_3_70b_ad.yaml']
+  user_configs: ['dashboard_default.yaml', 'llama3_3_70b.yaml']
 ```
+
+### Key Fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | HuggingFace model id |
+| `ad_defaults` | Yes | List of AD-internal config YAML files |
+| `config_id` | No | Variant selector when a model has multiple entries (defaults to `"default"`) |
+| `world_size` | No | GPU count (defaults to 1) |
+| `user_configs` | No | List of user-facing config YAML files |
 
 ### Key Concepts
 
 - **Flat list**: Models are in a single flat list (not grouped)
-- **Composable configs**: Each model references YAML config files via `yaml_extra`
+- **Two config layers**: `ad_defaults` for AD-internal knobs, `user_configs` for user-facing knobs
 - **Deep merging**: Config files are merged in order (later files override earlier ones)
-- **No inline args**: All configuration is in YAML files for reusability
+- **world_size**: First-class field in the registry
 
-## Configuration Files
+## User Configuration Files
 
-Config files are stored in `configs/` subdirectory and define runtime parameters:
+User-facing config files are stored in `configs/` and define runtime parameters:
 
 ### Core Configs
 
 | File | Purpose | Example Use |
 |------|---------|-------------|
-| `dashboard_default.yaml` | Baseline settings for all models | Always first in yaml_extra |
+| `dashboard_default.yaml` | Baseline settings for all models | Always first in user_configs |
 | `world_size_N.yaml` | GPU count (1, 2, 4, 8) | Defines tensor_parallel_size |
-
-### Runtime Configs
-
-| File | Purpose |
-|------|---------|
-| `multimodal.yaml` | Vision + text models |
-| `demollm_triton.yaml` | DemoLLM runtime with Triton backend |
-| `simple_shard_only.yaml` | Large models requiring simple sharding
 
 ### Model-Specific Configs
 
 | File | Purpose |
 |------|---------|
-| `llama-3.3-70b.yaml` | Optimized settings for Llama 3.3 70B |
+| `llama3_3_70b.yaml` | Optimized settings for Llama 3.3 70B |
 | `nano_v3.yaml` | Settings for Nemotron Nano V3 |
-| `llama-4-scout.yaml` | Settings for Llama 4 Scout |
+| `llama4_scout.yaml` | Settings for Llama 4 Scout |
 | `openelm.yaml` | Apple OpenELM (custom tokenizer) |
 | `gemma3_1b.yaml` | Gemma 3 1B (sequence length) |
-| `deepseek_v3_lite.yaml` | DeepSeek V3/R1 (reduced layers) |
-| `llama4_maverick_lite.yaml` | Llama 4 Maverick (reduced layers) |
 
 ## Adding a New Model
 
@@ -66,47 +77,31 @@ Config files are stored in `configs/` subdirectory and define runtime parameters
 
 ```yaml
 - name: organization/my-new-model-7b
-  yaml_extra: [dashboard_default.yaml, world_size_2.yaml]
-```
-
-### Model with Special Requirements
-
-```yaml
-- name: organization/my-multimodal-model
-  yaml_extra: [dashboard_default.yaml, world_size_4.yaml, multimodal.yaml]
+  config_id: default_ws_2
+  world_size: 2
+  ad_defaults: ['ad_base.yaml']
+  user_configs: ['dashboard_default.yaml']
 ```
 
 ### Model with Custom Config
 
-1. Create `configs/my_model.yaml`:
+1. If the model needs AD-internal overrides (transforms, backends), create `configs/my_model_ad.yaml` in `tensorrt_llm/_torch/auto_deploy/config/model_registry_internal/configs/`.
 
-```yaml
-# Custom settings for my model
-max_batch_size: 2048
-kv_cache_free_gpu_memory_fraction: 0.95
-cuda_graph_config:
-  enable_padding: true
-```
+1. If the model needs user-facing overrides (batch sizes, KV cache), create `configs/my_model.yaml` in this directory.
 
-2. Reference it in `models.yaml`:
+1. Add the entry in `tensorrt_llm/_torch/auto_deploy/config/model_registry_internal/models.yaml`:
 
 ```yaml
 - name: organization/my-custom-model
-  yaml_extra: [dashboard_default.yaml, world_size_8.yaml, my_model.yaml]
+  config_id: my_model
+  world_size: 8
+  ad_defaults: ['ad_base.yaml', 'my_model_ad.yaml']
+  user_configs: ['dashboard_default.yaml', 'my_model.yaml']
 ```
 
 ## Config Merging
 
-Configs are merged in order. Example:
-
-```yaml
-yaml_extra:
-  - dashboard_default.yaml    # baseline: runtime=trtllm, benchmark_enabled=true
-  - world_size_2.yaml         # adds: tensor_parallel_size=2
-  - openelm.yaml              # overrides: tokenizer=llama-2, benchmark_enabled=false
-```
-
-**Result**: `runtime=trtllm, tensor_parallel_size=2, tokenizer=llama-2, benchmark_enabled=false`
+Configs are deep-merged in order: `default.yaml` (AD base) → `ad_defaults[0]` → `ad_defaults[1]` → ... → `user_configs[0]` → `user_configs[1]` → ... → CLI/init args (highest priority).
 
 ## World Size Guidelines
 
@@ -117,44 +112,10 @@ yaml_extra:
 | 4 | 20-80B params | Llama 3.3 70B, QwQ 32B, Gemma 27B |
 | 8 | 80B+ params | DeepSeek V3, Llama 405B, Nemotron Ultra |
 
-## Model Coverage
-
-The registry contains models distributed across different GPU configurations (world sizes 1, 2, 4, and 8), including both text-only and multimodal models.
-
-**To verify current model counts and coverage:**
-
-```bash
-cd /path/to/autodeploy-dashboard
-python3 scripts/prepare_model_coverage_v2.py \
-    --source local \
-    --local-path /path/to/TensorRT-LLM \
-    --output /tmp/model_coverage.yaml
-
-# View summary
-grep -E "^- name:|yaml_extra:" /path/to/TensorRT-LLM/examples/auto_deploy/model_registry/models.yaml | wc -l
-```
-
-When adding or removing models, use `prepare_model_coverage_v2.py` to validate the registry structure and coverage.
-
 ## Best Practices
 
-1. **Always include `dashboard_default.yaml` first** - it provides baseline settings
-1. **Always include a `world_size_N.yaml`** - defines GPU count
-1. **Add special configs after world_size** - they override defaults
-1. **Create reusable configs** - if 3+ models need same settings, make a config file
-1. **Use model-specific configs sparingly** - only for unique requirements
-1. **Test before committing** - verify with `prepare_model_coverage_v2.py`
-
-## Testing Changes
-
-```bash
-# Generate workload from local changes
-cd /path/to/autodeploy-dashboard
-python3 scripts/prepare_model_coverage_v2.py \
-    --source local \
-    --local-path /path/to/TensorRT-LLM \
-    --output /tmp/test_workload.yaml
-
-# Verify output
-cat /tmp/test_workload.yaml
-```
+1. **Always include `ad_base.yaml` first** in `ad_defaults` — it provides baseline AD settings
+1. **Always include `dashboard_default.yaml` first** in `user_configs` — it provides baseline runtime settings
+1. **Set `world_size` explicitly** — it's used by tests and `trtllm-serve` to determine GPU count
+1. **Create reusable configs** — if 3+ models need same settings, make a config file
+1. **Use model-specific configs sparingly** — only for unique requirements

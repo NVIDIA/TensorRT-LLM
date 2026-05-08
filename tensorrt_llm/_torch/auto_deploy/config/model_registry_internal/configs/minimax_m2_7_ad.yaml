@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# AD-specific defaults for MiniMax-M2.7 (256 experts, top-8, FP8 quantized).
+# 62 layers, GQA (48 Q / 8 KV heads), head_dim=128, partial RoPE.
+model_factory: AutoModelForCausalLM
+tokenizer: MiniMaxAI/MiniMax-M2.7
+attn_backend: trtllm
+compile_backend: torch-cudagraph
+transforms:
+  fuse_trtllm_attn_quant_fp8:
+    enabled: true
+  fuse_rmsnorm_quant_fp8:
+    stage: post_load_fusion
+    enabled: true
+  gather_logits_before_lm_head:
+    enabled: true
+  fuse_gemms:
+    enabled: true
+  multi_stream_moe:
+    enabled: true
+  compile_model:
+    piecewise_enabled: true

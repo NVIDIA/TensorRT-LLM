@@ -1,0 +1,19 @@
+# AD-specific defaults for DeepSeek-R1 family.
+compile_backend: torch-cudagraph
+transforms:
+  fuse_nvfp4_moe:
+    allow_different_input_scales: true
+  fuse_swiglu:
+    enabled: true
+  multi_stream_moe:
+    enabled: false
+  insert_cached_mla_attention:
+    backend: trtllm_mla
+  fuse_rope_into_trtllm_mla:
+    enabled: true
+  multi_stream_mla_attn:
+    stage: compile
+    enabled: true
+  compile_model:
+    piecewise_enabled: true
+    piecewise_num_tokens: [256, 512, 1024, 2048, 3072, 4096, 5120, 6144, 8192]

@@ -323,6 +323,30 @@ def launch_server(
         elif backend == '_autodeploy':
             from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 
+            # Auto-inject AD registry defaults as yaml_extra.  The user's
+            # --config YAML is merged as init args (higher priority).
+            try:
+                from tensorrt_llm._torch.auto_deploy.config.model_registry_internal import \
+                    get_ad_defaults_with_world_size
+
+                model_name = llm_args.get("model", "")
+                registry_yaml_extra, registry_world_size = get_ad_defaults_with_world_size(
+                    model_name)
+                if registry_yaml_extra:
+                    existing_yaml_extra = list(
+                        llm_args.get("yaml_extra", []) or [])
+                    llm_args["yaml_extra"] = [
+                        *registry_yaml_extra,
+                        *existing_yaml_extra,
+                    ]
+                    if "tensor_parallel_size" not in llm_args:
+                        llm_args.setdefault("world_size", registry_world_size)
+                    logger.info("AutoDeploy registry: injected configs for "
+                                f"'{model_name}'")
+            except KeyError:
+                logger.debug("Model not found in AutoDeploy model registry; "
+                             "proceeding with base AD defaults only.")
+
             # AutoDeploy does not support build_config
             llm_args.pop("build_config", None)
             llm = AutoDeployLLM(**llm_args)

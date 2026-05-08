@@ -17,6 +17,9 @@ from pydantic_settings import (
 )
 
 from tensorrt_llm._torch.auto_deploy import LLM, DemoLLM
+from tensorrt_llm._torch.auto_deploy.config.model_registry_internal import (
+    get_registry_yaml_extra_with_world_size,
+)
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.utils._config import (
     DynamicYamlMixInForSettings,
@@ -25,11 +28,6 @@ from tensorrt_llm._torch.auto_deploy.utils._config import (
 from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.sampling_params import SamplingParams
-
-# Registry paths
-_REGISTRY_DIR = Path(__file__).resolve().parent / "model_registry"
-_REGISTRY_YAML = _REGISTRY_DIR / "models.yaml"
-_REGISTRY_CONFIGS_DIR = _REGISTRY_DIR / "configs"
 
 # Global torch config, set the torch compile cache to fix up to llama 405B
 torch._dynamo.config.cache_size_limit = 20
@@ -141,7 +139,7 @@ class ExperimentConfig(DynamicYamlMixInForSettings, BaseSettings):
     ### MODEL REGISTRY CONFIG ####################################################################
     use_registry: CliImplicitFlag[bool] = Field(
         default=False,
-        description="Resolve args.yaml_extra from examples/auto_deploy/model_registry/models.yaml for --model.",
+        description="Resolve args.yaml_extra from the AutoDeploy model registry for --model.",
     )
     registry_config_id: Optional[str] = Field(
         default=None,
@@ -206,9 +204,13 @@ class ExperimentConfig(DynamicYamlMixInForSettings, BaseSettings):
                 raise ValueError("--use-registry requires --model or --args.model to be specified.")
 
             config_id = data.get("registry_config_id")
-            registry_yaml_extra = get_registry_yaml_extra(model_name, config_id)
+            registry_yaml_extra, registry_world_size = get_registry_yaml_extra_with_world_size(
+                model_name, config_id
+            )
 
             data.setdefault("args", {})
+            if "world_size" not in data["args"] and "tensor_parallel_size" not in data["args"]:
+                data["args"]["world_size"] = registry_world_size
             existing_yaml_extra = list(data["args"].get("yaml_extra", []) or [])
             # Registry defaults go first so explicit user --args.yaml-extra can override.
             data["args"]["yaml_extra"] = [*registry_yaml_extra, *existing_yaml_extra]
@@ -254,53 +256,6 @@ class ExperimentConfig(DynamicYamlMixInForSettings, BaseSettings):
         if args.max_batch_size < prompt.batch_size:
             args.max_batch_size = prompt.batch_size
         return prompt
-
-
-def get_registry_yaml_extra(model_name: str, config_id: Optional[str] = None) -> List[str]:
-    """Look up a model in the registry and return its resolved yaml_extra config paths.
-
-    Args:
-        model_name: HuggingFace model id as listed in the registry (e.g. ``meta-llama/Llama-3.1-8B-Instruct``).
-
-    Returns:
-        List of absolute paths to the yaml config files for the model.
-
-    Raises:
-        KeyError: If the model/config is not found or is ambiguous without ``config_id``.
-    """
-    with open(_REGISTRY_YAML) as f:
-        registry = yaml.safe_load(f)
-
-    matches = [entry for entry in registry.get("models", []) if entry.get("name") == model_name]
-
-    if config_id is not None:
-        matches = [entry for entry in matches if entry.get("config_id", "default") == config_id]
-        if not matches:
-            raise KeyError(
-                f"Model '{model_name}' with config_id '{config_id}' not found in AutoDeploy model registry "
-                f"({_REGISTRY_YAML})."
-            )
-    elif len(matches) > 1:
-        default_matches = [
-            entry for entry in matches if entry.get("config_id", "default") == "default"
-        ]
-        if len(default_matches) == 1:
-            matches = default_matches
-        else:
-            available = sorted({entry.get("config_id", "default") for entry in matches})
-            raise KeyError(
-                f"Model '{model_name}' has multiple registry entries with config_id values {available}. "
-                "Provide --registry-config-id to select one."
-            )
-
-    if not matches:
-        raise KeyError(
-            f"Model '{model_name}' not found in the AutoDeploy model registry ({_REGISTRY_YAML}). "
-            "Either add it to the registry or provide --yaml-extra directly."
-        )
-
-    selected = matches[0]
-    return [str(_REGISTRY_CONFIGS_DIR / cfg) for cfg in selected.get("yaml_extra", [])]
 
 
 def _merge_yaml_files(yaml_paths: List[str]) -> Dict[str, Any]:
