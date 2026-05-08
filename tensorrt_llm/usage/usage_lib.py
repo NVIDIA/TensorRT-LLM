@@ -424,7 +424,21 @@ _FEATURES_DEFAULTS = {
     "cuda_graphs": False,
     "chunked_context": False,
     "data_parallel_size": 1,
+    "checkpoint_format": "HF",
+    "load_format": "AUTO",
 }
+
+
+def _feature_enum_or_str(value: Any, default: str) -> str:
+    """Convert low-cardinality config enum/string values for telemetry."""
+    if value is None:
+        return default
+    name = getattr(value, "name", None)
+    if isinstance(name, str) and name:
+        return name
+    if isinstance(value, str) and value:
+        return value
+    return default
 
 
 def _collect_features(llm_args: Any) -> str:
@@ -486,6 +500,16 @@ def _collect_features(llm_args: Any) -> str:
 
         # Chunked context / chunked prefill: defined on BaseLlmArgs.
         features["chunked_context"] = bool(getattr(llm_args, "enable_chunked_prefill", False))
+
+        # Checkpoint/load axes: low-cardinality, non-sensitive config values
+        # used to distinguish HF/AUTO baseline, MX-only, GMS-only, and MX+GMS
+        # compositions. Never include model names, paths, or server URLs here.
+        features["checkpoint_format"] = _feature_enum_or_str(
+            getattr(llm_args, "checkpoint_format", None), "HF"
+        )
+        features["load_format"] = _feature_enum_or_str(
+            getattr(llm_args, "load_format", None), "AUTO"
+        )
 
         # Data parallel size: derived from parallel_config.
         # dp_size = tp_size if enable_attention_dp else 1 (no dp_size field exists).

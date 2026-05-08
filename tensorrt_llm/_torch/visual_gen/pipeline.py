@@ -35,6 +35,67 @@ class ExtraParamSchema(StrictBaseModel):
     )
 
 
+def _parse_profile_range():
+    """Parse ``TLLM_PROFILE_VISUAL_GEN_START_STOP`` for CUDA profiler scoping.
+
+    Visual-gen-specific env var (separate from the LLM path's
+    ``TLLM_PROFILE_START_STOP``). Use with ``nsys profile -c cudaProfilerApi ...``.
+
+    Supported formats:
+
+    * ``A-B``            – profile denoise steps A through B
+    * ``A-B,C-D,...``    – multiple ranges; profiler toggles on/off per range
+    * ``A,B,...``        – individual steps treated as single-step ranges
+    * ``predenoise``     – profile the per-request pre-loop work inside
+                           ``denoise()`` (CFG config setup, scheduler refresh,
+                           TeaCache reset) up to the first denoise step.
+                           Single-shot.
+    * ``postdenoise``    – profile from the end of the last denoise step to
+                           pipeline cleanup, covering VAE decode. Single-shot.
+    * ``all``            – profile the full generation forward (denoise + VAE), skip warmup
+    * (unset)            – no profiler API calls; plain ``nsys profile`` captures everything
+
+    Returns ``None`` when unset, one of ``"all"`` / ``"predenoise"`` /
+    ``"postdenoise"`` for keyword modes, or ``(frozenset(starts), frozenset(stops))``
+    for numeric ranges.
+
+    .. note::
+       Step indices are **per-request**: each ``denoise()`` call resets the
+       loop counter to 0, so e.g. ``0-4`` profiles steps 0-4 of *every*
+       request. This differs from the LLM path's ``TLLM_PROFILE_START_STOP``
+       which indexes a global executor iteration counter (one forward pass
+       services all in-flight requests, so there is no "per request" index).
+
+       ``predenoise`` and ``postdenoise`` are **single-shot per process**:
+       they fire once around the first user request after warmup and do not
+       re-arm on subsequent requests. Pair ``predenoise`` with
+       ``nsys --capture-range-end=stop`` (keeps the app running cleanly after
+       collection ends). ``postdenoise`` ends collection at process exit, so
+       either ``stop`` or ``stop-shutdown`` works. For multi-request capture,
+       use a numeric range with ``--capture-range-end=repeat:N``.
+    """
+    val = os.environ.get("TLLM_PROFILE_VISUAL_GEN_START_STOP")
+    if not val:
+        return None
+    val = val.strip()
+    if val.lower() in ("all", "predenoise", "postdenoise"):
+        return val.lower()
+    # Parse comma-separated ranges: "A-B,C-D,..." or single steps "A,B,..."
+    # Same format as the LLM path (PyExecutor._load_iteration_indexes).
+    starts, stops = [], []
+    for span in val.split(","):
+        span = span.strip()
+        if "-" in span:
+            start, stop = span.split("-", 1)
+            starts.append(int(start))
+            stops.append(int(stop))
+        else:
+            v = int(span)
+            starts.append(v)
+            stops.append(v)
+    return frozenset(starts), frozenset(stops)
+
+
 if TYPE_CHECKING:
     from .cache import CacheAccelerator
     from .config import DiffusionModelConfig
@@ -74,6 +135,15 @@ class BasePipeline(nn.Module):
         self.text_encoder: Optional[nn.Module] = None
         self.tokenizer: Optional[Any] = None
         self.scheduler: Optional[Any] = None
+        self._is_warmup: bool = False
+
+        # CUDA profiler scoping (TLLM_PROFILE_VISUAL_GEN_START_STOP env var)
+        self._profile_range = _parse_profile_range()
+        self._profiling_active: bool = False
+        # Single-shot guards for predenoise/postdenoise modes — fire once
+        # around the first non-warmup denoise() invocation, then disarm.
+        self._predenoise_pending: bool = self._profile_range == "predenoise"
+        self._postdenoise_pending: bool = self._profile_range == "postdenoise"
 
         # Initialize transformer
         self._init_transformer()
@@ -82,6 +152,22 @@ class BasePipeline(nn.Module):
         # Order matters: TeaCache will wrap on top of it and still call the
         # graphed transformer.forward if should_compute == True.
         self._setup_cuda_graphs()
+
+    def _cuda_profiler_start(self):
+        """Start CUDA profiler if configured and not already active."""
+        if self._profile_range is not None and not self._profiling_active:
+            torch.cuda.cudart().cudaProfilerStart()
+            self._profiling_active = True
+            if self.rank == 0:
+                logger.info("CUDA profiler started")
+
+    def _cuda_profiler_stop(self):
+        """Stop CUDA profiler if currently active."""
+        if self._profiling_active:
+            torch.cuda.cudart().cudaProfilerStop()
+            self._profiling_active = False
+            if self.rank == 0:
+                logger.info("CUDA profiler stopped")
 
     def _setup_cuda_graphs(self):
         """Wrap all transformer components with CUDA graph capture/replay."""
@@ -502,10 +588,12 @@ class BasePipeline(nn.Module):
         )
         warmup_start = time.time()
 
+        self._is_warmup = True
         for height, width, num_frames in shapes:
             logger.info(f"Warmup: {height}x{width}, {num_frames} frames, {steps} steps")
             self._run_warmup(height, width, num_frames, steps)
             torch.cuda.synchronize()
+        self._is_warmup = False
 
         self._warmed_up_shapes = set(
             self.warmup_cache_key(h, w, num_frames=f) for h, w, f in shapes
@@ -859,6 +947,14 @@ class BasePipeline(nn.Module):
             Single latents if no extra_streams
             Tuple (primary_latents, extra_streams_dict) if extra_streams provided
         """
+        # ``predenoise`` mode: arm the profiler at the very start of denoise()
+        # so the per-request pre-loop work (CFG config, scheduler refresh,
+        # TeaCache reset) is captured. The window closes at the first step.
+        # Note: hooked here (not at warmup() exit) to avoid leaving the profiler
+        # on across the worker's IPC idle, which can interact badly with CUPTI.
+        if self._predenoise_pending and not self._is_warmup:
+            self._cuda_profiler_start()
+
         if timesteps is None:
             timesteps = scheduler.timesteps
 
@@ -895,7 +991,23 @@ class BasePipeline(nn.Module):
 
         start_time = time.time()
 
+        # CUDA profiler scoping: "all" starts here (covers denoise + VAE),
+        # step ranges start/stop at specific indices. See _parse_profile_range().
+        prof = self._profile_range
+        if prof == "all" and not self._is_warmup:
+            self._cuda_profiler_start()
+        # ``predenoise`` was started in warmup() exit; close the window now,
+        # before the first denoise step kernels run. Single-shot: disarm.
+        if self._predenoise_pending and not self._is_warmup:
+            self._cuda_profiler_stop()
+            self._predenoise_pending = False
+        prof_step_starts = prof[0] if isinstance(prof, tuple) else None
+        prof_step_stops = prof[1] if isinstance(prof, tuple) else None
+
         for i, t in enumerate(timesteps):
+            if prof_step_starts is not None and i in prof_step_starts and not self._is_warmup:
+                self._cuda_profiler_start()
+
             step_start = time.time()
 
             # Two-stage denoising: switch guidance scale at boundary
@@ -957,6 +1069,16 @@ class BasePipeline(nn.Module):
                     f"Avg={avg_time:.2f}s/step ETA={eta:.1f}s"
                 )
 
+            # Step-level profiler stop
+            if prof_step_stops is not None and i in prof_step_stops and not self._is_warmup:
+                self._cuda_profiler_stop()
+
+        # ``postdenoise`` mode: arm the profiler now so the VAE decode (and
+        # any post-denoise host work) is captured up to cleanup(). Single-shot.
+        if self._postdenoise_pending and not self._is_warmup:
+            self._cuda_profiler_start()
+            self._postdenoise_pending = False
+
         if self.rank == 0:
             total_time = time.time() - start_time
             logger.info("=" * 80)
@@ -980,6 +1102,8 @@ class BasePipeline(nn.Module):
 
     def cleanup(self):
         """Call before dist.destroy_process_group()."""
+        self._cuda_profiler_stop()
+
         for name, runner in self._cuda_graph_runners.items():
             logger.info(f"Releasing CUDA graphs for {name}")
             runner.clear()

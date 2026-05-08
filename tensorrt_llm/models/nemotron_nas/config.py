@@ -15,6 +15,7 @@
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Union
 
+from tensorrt_llm._utils import get_hf_rope_theta
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.convert_utils import infer_dtype
@@ -198,7 +199,7 @@ class DeciConfig(PretrainedConfig):
                    num_key_value_heads=hf_config.num_key_value_heads,
                    norm_epsilon=hf_config.rms_norm_eps,
                    rotary_scaling=hf_config.rope_scaling,
-                   rotary_base=hf_config.rope_theta,
+                   rotary_base=get_hf_rope_theta(hf_config, 10000.0),
                    vocab_size=hf_config.vocab_size,
                    max_position_embeddings=hf_config.max_position_embeddings,
                    mapping=mapping,

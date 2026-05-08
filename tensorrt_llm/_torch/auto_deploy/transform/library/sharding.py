@@ -271,20 +271,18 @@ class ShardingTransformConfig(TransformConfig):
     dist_config: DistConfig = Field(default_factory=DistConfig)
 
     def _init_mapping(self):
-        """Initialize DistConfig from dist_mapping config.
+        """Initialize ``self.dist_config`` from ``dist_mapping`` (test-only fallback).
 
-        NOTE: This method is now primarily a fallback. The preferred flow is:
-        1. DistConfig is constructed in ad_executor.py from the Mapping object
-        2. Passed through SharedConfig.dist_config to the sharding transform
-        3. Only if SharedConfig.dist_config is None, this fallback is used
+        Production path builds ``DistConfig`` in ``LlmArgs.init_dist_config`` and
+        passes it through ``SharedConfig.dist_config``.  This fallback is only
+        entered when ``shared_config.dist_config is None`` (tests constructing
+        ``InferenceOptimizer`` directly without a ``dist_config`` kwarg).  Will
+        be removed together with the legacy sharding pipeline.
         """
-        self.dist_config = DistConfig(
-            world_size=self.world_size,
+        self.dist_config = DistConfig.from_sharding_params(
             rank=self.rank,
-            tp_size=self.dist_mapping.get("tp", self.world_size),
-            moe_tp_size=self.dist_mapping.get("moe_tp", 1),
-            moe_ep_size=self.dist_mapping.get("moe_ep", self.world_size),
-            moe_cluster_size=self.dist_mapping.get("moe_cluster", 1),
+            world_size=self.world_size,
+            dist_mapping=self.dist_mapping,
             enable_attention_dp=self.enable_attention_dp,
             allreduce_strategy=self.allreduce_strategy.name,
         )

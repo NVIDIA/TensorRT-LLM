@@ -567,6 +567,7 @@ class ModelConfig(Generic[TConfig]):
                         use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
                         q_split_threshold = sparse_attention_config.q_split_threshold
                         enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
+                        indexer_k_dtype = sparse_attention_config.indexer_k_dtype
                     else:
                         index_n_heads = pretrained_config.index_n_heads
                         index_head_dim = pretrained_config.index_head_dim
@@ -576,6 +577,7 @@ class ModelConfig(Generic[TConfig]):
                         use_cute_dsl_topk = False
                         q_split_threshold = 8192
                         enable_heuristic_topk = False
+                        indexer_k_dtype = "fp8"
                     kwargs[
                         'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
                             index_n_heads=index_n_heads,
@@ -587,7 +589,8 @@ class ModelConfig(Generic[TConfig]):
                             use_cute_dsl_topk=use_cute_dsl_topk,
                             q_split_threshold=q_split_threshold,
                             indexer_rope_interleave=indexer_rope_interleave,
-                            enable_heuristic_topk=enable_heuristic_topk)
+                            enable_heuristic_topk=enable_heuristic_topk,
+                            indexer_k_dtype=indexer_k_dtype)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."
@@ -604,6 +607,13 @@ class ModelConfig(Generic[TConfig]):
         # Some checkpoints lack torch_dtype, populate with dtype
         pretrained_config.torch_dtype = getattr(pretrained_config, 'dtype',
                                                 None)
+
+        # Prior to transformers 5, composite configs (e.g. Qwen2_5_VLConfig) delegated attribute
+        # lookups to their text sub-config, so accesses like `config.vocab_size` /
+        # `config.hidden_size` resolved transparently.
+        # 5.x removed that delegation, so eagerly mirror the text sub-config onto  the top-level
+        # config to keep downstream consumers working.
+        _mirror_text_subconfig_attrs(pretrained_config)
 
         # Apply model_kwargs to override config parameters if provided
         model_kwargs = kwargs.pop('model_kwargs', None)
@@ -868,3 +878,28 @@ class ModelConfig(Generic[TConfig]):
             return cfg.num_hidden_layers - get_qwen3_hybrid_num_attention_layers(
                 cfg)
         return 0
+
+
+def _mirror_text_subconfig_attrs(
+        pretrained_config: transformers.PretrainedConfig) -> None:
+    """Mirror text sub-config attributes onto the parent config.
+
+    Composite configs (e.g. Qwen2_5_VLConfig) keep text-side fields like `vocab_size`,
+    `hidden_size`, `num_attention_heads`, etc. inside a `text_config` sub-config.
+    Prior to transformers 5, the parent config delegated attribute lookups there automatically;
+    that delegation was removed in 5.x.
+
+    Copying the sub-config's attributes onto the parent keeps downstream code (which accesses these
+    on the top-level config) working without having to learn about the composite layout.
+    """
+    text_config = getattr(pretrained_config, "text_config", None)
+    if text_config is None or not isinstance(text_config,
+                                             transformers.PretrainedConfig):
+        return
+    for key, value in vars(text_config).items():
+        if key.startswith("_"):
+            continue
+        try:
+            getattr(pretrained_config, key)
+        except AttributeError:
+            setattr(pretrained_config, key, value)

@@ -1,0 +1,101 @@
+metadata:
+  model_name: ltx2_bf16
+  supported_gpus:
+    - B200
+hardware:
+  gpus_per_node: 8
+environment:
+  server_env_var: TLLM_LOG_LEVEL=info
+  client_env_var: ""
+server_configs:
+  - name: ltx2_2stage_bf16_i2v_cfg2_ulysses4_compile_on
+    model_name: ltx2_bf16
+    model_path: LTX-2
+    server_config:
+      attention:
+        backend: VANILLA
+      text_encoder_path: google/gemma-3-12b-it
+      parallel:
+        enable_parallel_vae: false
+        dit_cfg_size: 2
+        dit_ulysses_size: 4
+      spatial_upsampler_path: LTX-2/ltx-2-spatial-upscaler-x2-1.0.safetensors
+      distilled_lora_path: LTX-2/ltx-2-19b-distilled-lora-384.safetensors
+      cuda_graph:
+        enable_cuda_graph: false
+      torch_compile:
+        enable_torch_compile: true
+    client_configs:
+      - name: 1280x768_121f_40s_con1_i2v
+        prompt: A cat walks through a field of flowers
+        backend: openai-videos
+        generation_mode: i2v
+        size: 1280x768
+        num_frames: 121
+        fps: 24
+        num_inference_steps: 40
+        seed: 42
+        max_concurrency: 1
+        num_prompts: 1
+        extra_body:
+          input_reference: iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z4h8AAAAASUVORK5CYII=
+
+  - name: ltx2_2stage_bf16_t2v_cfg2_ulysses4_compile_on
+    model_name: ltx2_bf16
+    model_path: LTX-2
+    server_config:
+      attention:
+        backend: VANILLA
+      text_encoder_path: google/gemma-3-12b-it
+      parallel:
+        enable_parallel_vae: false
+        dit_cfg_size: 2
+        dit_ulysses_size: 4
+      spatial_upsampler_path: LTX-2/ltx-2-spatial-upscaler-x2-1.0.safetensors
+      distilled_lora_path: LTX-2/ltx-2-19b-distilled-lora-384.safetensors
+      cuda_graph:
+        enable_cuda_graph: false
+      torch_compile:
+        enable_torch_compile: true
+    client_configs:
+      - name: 1280x768_121f_40s_con1_t2v
+        prompt: A cat walks through a field of flowers
+        backend: openai-videos
+        generation_mode: t2v
+        size: 1280x768
+        num_frames: 121
+        fps: 24
+        num_inference_steps: 40
+        seed: 42
+        max_concurrency: 1
+        num_prompts: 1
+
+  - name: ltx2_nvfp4_i2v_cfg2_ulysses4_compile_on
+    model_name: ltx2_nvfp4
+    model_path: LTX-2
+    server_config:
+      attention:
+        backend: VANILLA
+      text_encoder_path: google/gemma-3-12b-it
+      parallel:
+        enable_parallel_vae: false
+        dit_cfg_size: 2
+        dit_ulysses_size: 4
+      cuda_graph:
+        enable_cuda_graph: false
+      torch_compile:
+        enable_torch_compile: true
+    client_configs:
+      - name: 1280x768_121f_40s_con1_i2v
+        prompt: A cat walks through a field of flowers
+        backend: openai-videos
+        generation_mode: i2v
+        size: 1280x768
+        num_frames: 121
+        fps: 24
+        num_inference_steps: 40
+        seed: 42
+        max_concurrency: 1
+        num_prompts: 1
+        extra_body:
+          input_reference: iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7Z4h8AAAAASUVORK5CYII=

@@ -1045,7 +1045,7 @@ class TruncatedLinear(nn.Linear):
 
 
 class NemotronFlashForCausalLM(NemotronFlashPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config, **kwargs):
         super().__init__(config)

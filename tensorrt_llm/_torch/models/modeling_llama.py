@@ -7,8 +7,9 @@ from PIL.Image import Image
 from torch import nn
 from transformers import (AutoProcessor, AutoTokenizer, Llama4Config,
                           Llama4VisionModel, LlamaConfig, PretrainedConfig)
-from transformers.modeling_utils import load_sharded_checkpoint
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
+from transformers.utils import (SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME,
+                                WEIGHTS_INDEX_NAME, WEIGHTS_NAME)
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, MoEAllReduce)
@@ -1132,6 +1133,56 @@ class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
                 layer.next_attn = self.model.layers[idx + 1].self_attn
 
 
+def _load_checkpoint_into_module(module: nn.Module,
+                                 folder: str,
+                                 strict: bool = True) -> None:
+    """Load a sharded HuggingFace checkpoint into a module.
+
+    This replaces the removed ``transformers.modeling_utils.load_sharded_checkpoint``
+    function. It supports both safetensors and PyTorch checkpoint formats.
+    """
+    folder = str(folder)
+
+    # Determine checkpoint format and collect shard files
+    index_file = os.path.join(folder, SAFE_WEIGHTS_INDEX_NAME)
+    if os.path.isfile(index_file):
+        import json
+        with open(index_file) as f:
+            shard_files = sorted(set(json.load(f)["weight_map"].values()))
+        shard_paths = [os.path.join(folder, s) for s in shard_files]
+        use_safetensors = True
+    elif os.path.isfile(os.path.join(folder, WEIGHTS_INDEX_NAME)):
+        import json
+        with open(os.path.join(folder, WEIGHTS_INDEX_NAME)) as f:
+            shard_files = sorted(set(json.load(f)["weight_map"].values()))
+        shard_paths = [os.path.join(folder, s) for s in shard_files]
+        use_safetensors = False
+    elif os.path.isfile(os.path.join(folder, SAFE_WEIGHTS_NAME)):
+        shard_paths = [os.path.join(folder, SAFE_WEIGHTS_NAME)]
+        use_safetensors = True
+    elif os.path.isfile(os.path.join(folder, WEIGHTS_NAME)):
+        shard_paths = [os.path.join(folder, WEIGHTS_NAME)]
+        use_safetensors = False
+    else:
+        raise FileNotFoundError(
+            f"No checkpoint found in {folder}. Expected "
+            f"{SAFE_WEIGHTS_INDEX_NAME}, {WEIGHTS_INDEX_NAME}, "
+            f"{SAFE_WEIGHTS_NAME}, or {WEIGHTS_NAME}.")
+
+    # Load state dict from all shards and merge
+    full_state_dict: Dict[str, torch.Tensor] = {}
+    if use_safetensors:
+        from safetensors.torch import load_file
+        for path in shard_paths:
+            full_state_dict.update(load_file(path))
+    else:
+        for path in shard_paths:
+            full_state_dict.update(
+                torch.load(path, map_location="cpu", weights_only=True))
+
+    module.load_state_dict(full_state_dict, strict=strict)
+
+
 class Llama4VisionEncoder(nn.Module):
 
     def __init__(self, model_config: ModelConfig[Llama4Config], *args,
@@ -1162,9 +1213,9 @@ class Llama4VisionEncoder(nn.Module):
 
         # Otherwise, load the weights from the checkpoint.
         else:
-            load_sharded_checkpoint(module_dict,
-                                    self.pretrained_config._name_or_path,
-                                    strict=False)
+            _load_checkpoint_into_module(module_dict,
+                                         self.pretrained_config._name_or_path,
+                                         strict=False)
 
         self.vision_model = module_dict["vision_model"].to(self.device)
         self.mm_projector = module_dict["multi_modal_projector"].to(self.device)

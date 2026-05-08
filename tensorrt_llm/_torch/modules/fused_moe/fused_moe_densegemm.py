@@ -420,18 +420,20 @@ class DenseGEMMFusedMoE(MoE):
             )
 
             # FC1: GEMM + SwiGLU with post-SwiGLU alpha scaling (fused fc2_alpha)
-            fc1_output, fc1_output_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_blackwell(
-                x,
-                self.w3_w1_weight.view(torch.uint8),
-                x_sf,
-                self.w3_w1_weight_scale,
-                self.fc31_alpha,
-                fc2_alpha_normalized,  # Pass normalized fc2_alpha as alpha_post
-                self.fc2_input_scale,
-                expert_count=self.expert_size_per_partition,
-                weight_per_expert=2 * self.intermediate_size_per_partition,
-                output_dtype=torch.float4_e2m1fn_x2,
-                scaling_vector_size=self.scaling_vector_size,
+            fc1_output, fc1_output_sf = (
+                torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_moe_blackwell(
+                    x,
+                    self.w3_w1_weight.view(torch.uint8),
+                    x_sf,
+                    self.w3_w1_weight_scale,
+                    self.fc31_alpha,
+                    fc2_alpha_normalized,  # Pass normalized fc2_alpha as alpha_post
+                    self.fc2_input_scale,
+                    expert_count=self.expert_size_per_partition,
+                    weight_per_expert=2 * self.intermediate_size_per_partition,
+                    output_dtype=torch.float4_e2m1fn_x2,
+                    scaling_vector_size=self.scaling_vector_size,
+                )
             )
 
             # FC2: Standard nvfp4_gemm with scalar alpha = fc2_alpha_max
@@ -450,18 +452,20 @@ class DenseGEMMFusedMoE(MoE):
             x_sf = swizzle_sf(x_sf, num_tokens, self.hidden_size)
 
             # FC1: GEMM + SwiGLU, output is fp4 quantized
-            fc1_output, fc1_output_sf = torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_blackwell(
-                x,
-                self.w3_w1_weight.view(torch.uint8),
-                x_sf,
-                self.w3_w1_weight_scale,
-                self.fc31_alpha,
-                None,  # alpha_post: no post-SwiGLU scaling
-                self.fc2_input_scale,
-                expert_count=self.expert_size_per_partition,
-                weight_per_expert=2 * self.intermediate_size_per_partition,
-                output_dtype=torch.float4_e2m1fn_x2,
-                scaling_vector_size=self.scaling_vector_size,
+            fc1_output, fc1_output_sf = (
+                torch.ops.trtllm.cute_dsl_nvfp4_dense_gemm_swiglu_moe_blackwell(
+                    x,
+                    self.w3_w1_weight.view(torch.uint8),
+                    x_sf,
+                    self.w3_w1_weight_scale,
+                    self.fc31_alpha,
+                    None,  # alpha_post: no post-SwiGLU scaling
+                    self.fc2_input_scale,
+                    expert_count=self.expert_size_per_partition,
+                    weight_per_expert=2 * self.intermediate_size_per_partition,
+                    output_dtype=torch.float4_e2m1fn_x2,
+                    scaling_vector_size=self.scaling_vector_size,
+                )
             )
 
             with torch.cuda.stream(self.aux_stream_dict[AuxStreamType.MoeFc2Alpha]):

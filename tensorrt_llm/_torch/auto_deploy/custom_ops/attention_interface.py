@@ -1165,15 +1165,6 @@ class SequenceInfo:
         # set new input_ids and make sure to flatten it
         self._stage_arg("input_ids", input_ids, reset_val=0)
 
-        # position_ids for each sequence is in the range [input_pos, input_pos + seq_len - 1]
-        ip_np = ip_host.numpy()
-        sl_np = sl_host.numpy()
-        base = np.repeat(ip_np, sl_np)
-        group_starts = np.repeat(np.cumsum(sl_np) - sl_np, sl_np)
-        offsets = np.arange(sl_np.sum()) - group_starts
-        position_ids = torch.from_numpy(base + offsets)  # zero-copy back
-        self._stage_arg("position_ids", position_ids)
-
         ### UPDATE EXTRA INPUTS ####################################################################
         self._extra_args = {}
         for key, value in extra_args.items():
