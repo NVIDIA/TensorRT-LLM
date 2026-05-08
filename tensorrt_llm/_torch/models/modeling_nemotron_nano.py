@@ -4,7 +4,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -727,74 +727,107 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
     def forward(
         self, multimodal_params: List[MultimodalParams]
     ) -> Tuple[List[torch.Tensor], List[List[int] | None]]:
-        mm_embedding = []
-        multimodal_data_lst = [
-            multimodal_param.multimodal_data for multimodal_param in multimodal_params
-        ]
-        modality_types = [
-            multimodal_data["modality_type"] for multimodal_data in multimodal_data_lst
-        ]
+        # Image params share an extractor across requests, so we bucket them
+        # by sub-path (dynamic-resolution vs fixed-tile) and run each bucket
+        # in a single ViT forward. Videos still run per-request because of
+        # tubelet alignment and per-video EVS bookkeeping.
+        multimodal_data_list = [p.multimodal_data for p in multimodal_params]
+        plan = [self._classify(mm_data) for mm_data in multimodal_data_list]
 
-        for modality_type, multimodal_data in zip(modality_types, multimodal_data_lst):
-            data = multimodal_data[modality_type]
-            # Dynamic resolution path is indicated by the presence of "image_sizes". For now, it is
-            # only meant to be applied to images.
-            if modality_type == "image" and "image_sizes" in data:
-                image_sizes = data["image_sizes"]
-                if self.norm_mean is not None:
-                    pixel_values_flat = self._preprocess_raw_images(
-                        data["pixel_values"],
-                        image_sizes,
-                    )
-                else:
-                    pixel_values_flat = data["pixel_values"]
-                embeds = self.extract_feature_dynamic(pixel_values_flat, image_sizes)
-                # Keep 3D shape for apply_evs, will reshape to 2D after EVS
-                mm_embedding.append(embeds)
-            elif modality_type == "video" and (
-                self.video_temporal_patch_size > 1 or isinstance(data["pixel_values"], list)
-            ):
-                # Process each video separately when temporal compression is
-                # enabled or when videos cannot be concatenated due to mixed
-                # resized shapes.
-                embeds = self._extract_video_embeddings_temporal(data)
-                mm_embedding.append(embeds)
-            # This applies to images without dynamic resolution, or videos with T=1.
-            else:
-                # Fallback to fixed-tile extraction for this modality.
-                pixel_values = data["pixel_values"]
-                embeds = self.extract_feature(pixel_values)
-                # Keep 3D shape [num_patches, h*w, hidden] for apply_evs
-                mm_embedding.append(embeds)
+        dynamic_image_data = [
+            mm_data[mm_data["modality_type"]]
+            for mm_data, kind in zip(multimodal_data_list, plan)
+            if kind == "dynamic_image"
+        ]
+        fixed_image_data = [
+            mm_data[mm_data["modality_type"]]
+            for mm_data, kind in zip(multimodal_data_list, plan)
+            if kind == "fixed_image"
+        ]
+        dynamic_image_iter = iter(self._encode_dynamic_image_bucket(dynamic_image_data))
+        fixed_image_iter = iter(self._encode_fixed_image_bucket(fixed_image_data))
 
-        # Apply EVS if video_pruning_rate > 0
-        mm_embedding, num_tokens_in_videos = self.apply_evs(mm_embedding, multimodal_data_lst)
-        # Reshape to 2D after EVS: [num_patches*h*w, hidden_size]
+        mm_embedding: List[torch.Tensor] = []
+        for kind, mm_data in zip(plan, multimodal_data_list):
+            data = mm_data[mm_data["modality_type"]]
+            if kind == "dynamic_image":
+                mm_embedding.append(next(dynamic_image_iter))
+            elif kind == "fixed_image":
+                mm_embedding.append(next(fixed_image_iter))
+            elif kind == "video_temporal":
+                mm_embedding.append(self._extract_video_embeddings_temporal(data))
+            else:  # "fixed_other": currently only T==1 video.
+                mm_embedding.append(self.extract_feature(data["pixel_values"]))
+
+        mm_embedding, num_tokens_in_videos = self.apply_evs(mm_embedding, multimodal_data_list)
         mm_embedding = [m.reshape(-1, self.llm_hidden_size) for m in mm_embedding]
         return mm_embedding, num_tokens_in_videos
 
-        # Existing fixed-tile path (unreachable, kept for reference).
-        pixel_values = [
-            multimodal_data[modality_type]["pixel_values"]
-            for modality_type, multimodal_data in zip(modality_types, multimodal_data_lst)
-        ]
-        batched_pixel_values = torch.cat(pixel_values, dim=0)
-        # -> [num_patches, channel, height, width]
-        patch_list = [
-            multimodal_data[modality_type]["num_patches"]
-            for modality_type, multimodal_data in zip(modality_types, multimodal_data_lst)
-        ]
-        batched_num_patches = torch.cat(patch_list, dim=0).tolist()
-        # -> list of[num_patches1, num_patches2, ...]
-        batched_image_embeds = self.extract_feature(batched_pixel_values)
-        # -> [num_patches, num_image_token, hidden_size]
-        mm_embedding = torch.split(batched_image_embeds, batched_num_patches, dim=0)
+    def _classify(self, multimodal_data: Dict[str, Any]) -> str:
+        """Return the encoder sub-path for one request's multimodal_data."""
+        modality = multimodal_data["modality_type"]
+        data = multimodal_data[modality]
+        if modality == "image":
+            return "dynamic_image" if "image_sizes" in data else "fixed_image"
+        if modality == "video" and (
+            self.video_temporal_patch_size > 1 or isinstance(data["pixel_values"], list)
+        ):
+            return "video_temporal"
+        return "fixed_other"
 
-        mm_embedding, num_tokens_in_videos = self.apply_evs(mm_embedding, multimodal_data_lst)
+    def _encode_dynamic_image_bucket(
+        self, image_data_list: List[Dict[str, Any]]
+    ) -> List[torch.Tensor]:
+        """Encode all dynamic-resolution image requests in a single ViT forward.
 
-        mm_embedding = [m.reshape(-1, self.llm_hidden_size) for m in mm_embedding]
-        # -> list of [num_patches*num_image_token, hidden_size]
-        return mm_embedding, num_tokens_in_videos
+        Returns one 3-D embedding tensor per request, in input order.
+        """
+        if not image_data_list:
+            return []
+
+        raw_pixel_values: List[torch.Tensor] = []
+        image_sizes: List[Tuple[int, int]] = []
+        images_per_request: List[int] = []
+        for data in image_data_list:
+            raw_pixel_values.extend(data["pixel_values"])
+            image_sizes.extend(data["image_sizes"])
+            images_per_request.append(len(data["image_sizes"]))
+
+        if self.norm_mean is not None:
+            pixel_values_flat = self._preprocess_raw_images(raw_pixel_values, image_sizes)
+        elif len(raw_pixel_values) == 1:
+            pixel_values_flat = raw_pixel_values[0]
+        else:
+            pixel_values_flat = torch.cat(raw_pixel_values, dim=0)
+
+        # `extract_feature_dynamic` concatenates per-image embeddings along
+        # dim=1, so we split by cumulative per-request post-shuffle token count.
+        batched_embeds = self.extract_feature_dynamic(pixel_values_flat, image_sizes)
+        scale_squared = self.downsample_ratio**2
+        per_image_token_counts = [
+            int(round(seq_len * scale_squared))
+            for seq_len in calc_seq_lens(image_sizes, self.patch_size)
+        ]
+        per_request_token_counts: List[int] = []
+        cursor = 0
+        for n_images in images_per_request:
+            per_request_token_counts.append(sum(per_image_token_counts[cursor : cursor + n_images]))
+            cursor += n_images
+        return list(torch.split(batched_embeds, per_request_token_counts, dim=1))
+
+    def _encode_fixed_image_bucket(
+        self, image_data_list: List[Dict[str, Any]]
+    ) -> List[torch.Tensor]:
+        """Encode all fixed-tile image requests in a single ViT forward.
+
+        Returns one 3-D embedding tensor per request, in input order.
+        """
+        if not image_data_list:
+            return []
+        pixel_values = torch.cat([d["pixel_values"] for d in image_data_list], dim=0)
+        patches_per_request = [d["pixel_values"].shape[0] for d in image_data_list]
+        batched_embeds = self.extract_feature(pixel_values)
+        return list(torch.split(batched_embeds, patches_per_request, dim=0))
 
     def _video_tubelet_geometry(self, t: int, T: int, ih: int, iw: int) -> Tuple[int, int]:
         """Return `(num_tubelets, wh)` for one video.
@@ -2809,52 +2842,60 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         Returns a single-element `List[torch.Tensor]` (all per-request
         embeddings concatenated) to conform to the contract expected by
-        `get_multimodal_embeddings`, which enables chunked-prefill
-        caching.  Per-request `num_tokens_in_video` (needed by EVS) is
-        stashed in each param's `multimodal_data` dict as a
-        side-channel.
+        `get_multimodal_embeddings`, which enables chunked-prefill caching.
+        Per-request `num_tokens_in_video` (needed by EVS) is stashed in
+        each param's `multimodal_data` dict as a side-channel.
+
+        Image requests are batched into a single `vision_encoder` call;
+        videos and standalone audio still run per-request because their
+        side effects (per-video audio interleaving, EVS token-count
+        stashing) are tied to a single request's data layout.
         """
-        mm_embeddings = []
+        # Encode all image params in one batched vision_encoder call.
+        image_params = [
+            p for p in multimodal_params if p.multimodal_data["modality_type"] == "image"
+        ]
+        image_embeds_iter: Iterator[torch.Tensor] = iter([])
+        if image_params:
+            image_embeds, _ = self.vision_encoder(image_params)
+            image_embeds_iter = iter(image_embeds)
+
+        mm_embeddings: List[torch.Tensor] = []
         for param in multimodal_params:
             modality_type = param.multimodal_data["modality_type"]
-            if modality_type in ("image", "video"):
+            if modality_type == "image":
+                mm_embeddings.append(next(image_embeds_iter))
+            elif modality_type == "video":
                 embs, num_tokens = self.vision_encoder([param])
                 vision_emb = embs[0]
-
-                # If audio was extracted from video, encode it and interleave
-                # with per-video vision embeddings so that the combined tensor
-                # matches the token order in input_ids
+                if num_tokens is not None:
+                    param.multimodal_data["num_tokens_in_video"] = num_tokens[0]
+                # If audio was extracted from video, interleave it per-video so
+                # the combined tensor matches input_ids order
                 # (v1_img_context, v1_sound_context, v2_img_context, ...).
-                audio_data = param.multimodal_data[modality_type].get("audio")
+                audio_data = param.multimodal_data["video"].get("audio")
                 if audio_data is not None and self.sound_encoder is not None:
                     audio_emb, per_clip_audio_counts = self._encode_audio_data(audio_data)
-                    video_sizes = param.multimodal_data[modality_type].get("video_size", [])
                     vision_emb = self._interleave_video_audio_embeddings(
                         vision_emb,
                         audio_emb,
                         per_clip_audio_counts,
                         has_audio=audio_data["has_audio"],
                         audio_num_clips=audio_data["audio_num_clips"],
-                        video_sizes=video_sizes,
+                        video_sizes=param.multimodal_data["video"].get("video_size", []),
                         evs_num_tokens=(num_tokens[0] if num_tokens is not None else None),
                     )
-
                 mm_embeddings.append(vision_emb)
-
-                # Stash per-request token counts for later EVS adjustment.
-                if num_tokens is not None:
-                    param.multimodal_data["num_tokens_in_video"] = num_tokens[0]
             elif modality_type == "audio":
                 mm_embeddings.append(self._encode_audio(param))
             else:
                 raise ValueError(f"Unknown modality: {modality_type}")
 
-        # Concatenate per-request embeddings into a single tensor.
-        # `get_multimodal_embeddings` expects a single-element list containing one tensor (all
-        # items' embeddings concatenated).
-        if mm_embeddings:
-            return [torch.cat(mm_embeddings, dim=0)]
-        return []
+        if not mm_embeddings:
+            return []
+        # `get_multimodal_embeddings` requires a single concatenated tensor
+        # in input-param order so it can split per-request and cache.
+        return [torch.cat(mm_embeddings, dim=0)]
 
     @torch.inference_mode()
     def forward(

@@ -221,6 +221,82 @@ def test_nemotron_nano_v2_vl_model_sanity_check(
         print("Passed! Max difference is within tolerance")
 
 
+@pytest.mark.threadleak(enabled=False)
+def test_nemotron_nano_v2_vl_image_batch_equivalence(nano_llm_model):
+    """End-to-end equivalence check for cross-request image batching.
+
+    Two distinct image+prompt requests are sent (a) together in one
+    `generate` call so the engine batches them in a single forward step
+    (and thus a single `_encode_multimodal` invocation with two
+    multimodal_params), and (b) separately in two `generate` calls. With
+    greedy decoding, the resulting token IDs must be identical and the
+    logprobs must match within bf16 tolerance. This is intended to detect
+    cross-request leakage or ordering bugs introduced by a future change
+    that batches per-modality across requests inside the vision encoder.
+    """
+    nano_llm = nano_llm_model
+    test_data_root = Path(os.path.join(llm_models_root(), "multimodals", "test_data"))
+    prompts = [
+        "Describe the natural environment in the image.",
+        "Describe the object and the weather condition in the image.",
+    ]
+    media = [str(test_data_root / "seashore.png"), str(test_data_root / "inpaint.png")]
+
+    sampling_params = SamplingParams(
+        max_tokens=16,
+        temperature=0.0,
+        add_special_tokens=False,
+        return_generation_logits=True,
+    )
+
+    def _build_inputs(prompts_subset, media_subset):
+        return default_multimodal_input_loader(
+            tokenizer=nano_llm.tokenizer,
+            model_dir=MODEL_PATH,
+            model_type="NemotronH_Nano_VL_V2",
+            modality="image",
+            prompts=prompts_subset,
+            media=media_subset,
+            image_data_format="pt",
+            num_frames=8,
+            device="cpu",
+        )
+
+    # Path A: both requests in one generate call -> engine batches them.
+    batched_inputs = _build_inputs(prompts, media)
+    batched_outputs = nano_llm.generate(batched_inputs, sampling_params)
+    assert len(batched_outputs) == 2
+
+    # Path B: each request in its own generate call.
+    sep_outputs = []
+    for p, m in zip(prompts, media):
+        sep_inputs = _build_inputs([p], [m])
+        sep_outputs.append(nano_llm.generate(sep_inputs, sampling_params)[0])
+
+    for i, (b_out, s_out) in enumerate(zip(batched_outputs, sep_outputs)):
+        b_token_ids = list(b_out.outputs[0].token_ids)
+        s_token_ids = list(s_out.outputs[0].token_ids)
+        assert b_token_ids == s_token_ids, (
+            f"Request {i}: token_ids differ between batched and separate runs.\n"
+            f"  batched : {b_token_ids}\n"
+            f"  separate: {s_token_ids}"
+        )
+
+        b_logp = extract_decode_logprobs(b_out).cpu()
+        s_logp = extract_decode_logprobs(s_out).cpu()
+        max_diff = (b_logp - s_logp).abs().max().item()
+        # bf16 reductions in attention / layernorm produce small but
+        # nonzero diffs between batched-forward and per-request-forward
+        # even for the same input. Token IDs (greedy) are the stronger
+        # equivalence signal; logprobs use a looser tolerance, well
+        # below the 0.3 threshold used by the sanity test.
+        assert max_diff < 0.15, (
+            f"Request {i}: logprob diff too large ({max_diff:.4f}).\n"
+            f"  batched : {b_logp}\n"
+            f"  separate: {s_logp}"
+        )
+
+
 class TestEncodeMultimodalDispatch:
     def _make_mock_model(self):
         """Create a minimal mock with the attributes `_encode_multimodal` needs."""
@@ -621,18 +697,21 @@ class TestEncodeMultimodalContract:
 
         `get_multimodal_embeddings` requires `len(embeddings) == 1` and splits by per-request token
         counts in order to cache the embeddings.
+
+        Image params are batched into a single `vision_encoder` call that
+        returns a per-param embedding list.
         """
         model = self._make_mock_model()
         emb_a = torch.randn(5, self.HIDDEN)
         emb_b = torch.randn(3, self.HIDDEN)
-        model.vision_encoder.side_effect = [
-            ([emb_a], [None]),
-            ([emb_b], [None]),
-        ]
+        model.vision_encoder.return_value = ([emb_a, emb_b], [None, None])
 
         params = [self._make_mm_param("image"), self._make_mm_param("image")]
         result = NemotronH_Nano_VL_V2._encode_multimodal(model, params)
 
+        # All image params go through a single batched vision_encoder call.
+        assert model.vision_encoder.call_count == 1
+        assert model.vision_encoder.call_args.args == (params,)
         assert len(result) == 1
         assert result[0].shape == (8, self.HIDDEN)
         # Verify concatenation order is preserved.
@@ -781,27 +860,27 @@ class TestChunkedPrefillCaching:
         assert torch.equal(result2[0], result[0])
 
     def test_multi_request_batch_caching(self):
-        """Two image requests in one batch: both cached after one call."""
+        """Two image requests in one batch: both cached after a single batched call."""
         model = self._make_mock_model()
         emb_a = torch.randn(5, self.HIDDEN)
         emb_b = torch.randn(3, self.HIDDEN)
-        model.vision_encoder.side_effect = [
-            ([emb_a], [None]),
-            ([emb_b], [None]),
-        ]
+        # All image params are encoded in a single batched call.
+        model.vision_encoder.return_value = ([emb_a, emb_b], [None, None])
 
         param_a = self._make_param_with_runtime("image", 5)
         param_b = self._make_param_with_runtime("image", 3)
         encoder_fn = self._make_encoder_fn(model)
 
-        # First call: encoder runs for both.
+        # First call: encoder runs once for the whole image bucket.
         result = get_multimodal_embeddings(
             encoder_forward_fn=encoder_fn,
             multimodal_params=[param_a, param_b],
         )
         assert len(result) == 1
         assert result[0].shape == (8, self.HIDDEN)
-        assert model.vision_encoder.call_count == 2  # once per param
+        assert model.vision_encoder.call_count == 1, (
+            "image params should be encoded in a single batched vision_encoder call"
+        )
 
         # Both should be cached.
         assert "multimodal_embedding" in param_a.multimodal_data
@@ -812,7 +891,7 @@ class TestChunkedPrefillCaching:
             encoder_forward_fn=encoder_fn,
             multimodal_params=[param_a, param_b],
         )
-        assert model.vision_encoder.call_count == 2, (
+        assert model.vision_encoder.call_count == 1, (
             "`vision_encoder` was called again on the second chunk. "
             "Caching is broken - `_encode_multimodal` likely violates the "
             "`get_multimodal_embeddings` return type contract."
