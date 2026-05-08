@@ -38,10 +38,10 @@ only when all ranks line up on the same iteration.
 
 from __future__ import annotations
 
-import threading
 import types
 from unittest.mock import MagicMock, patch
 
+from tensorrt_llm._torch.pyexecutor.adp_iter_stats import ADPIterStatsBuffer
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import RankIterStatsPayload, RankState
 from tensorrt_llm.bindings.executor import InflightBatchingStats, IterationStats
 
@@ -535,10 +535,6 @@ def test_num_ctx_kv_tokens_ignores_iter_states_side_channel():
 # ---------------------------------------------------------------------------
 
 
-class _AdpStatsHarness:
-    pass
-
-
 def _make_adp_iteration_stats(
     *,
     iter_id=7,
@@ -574,48 +570,15 @@ def _make_adp_iteration_stats(
     return stats
 
 
-def _build_adp_stats_harness(pending_stats, *, rank=0, tp_rank=0):
-    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-
-    harness = _AdpStatsHarness()
-    harness.dist = types.SimpleNamespace(rank=rank, tp_rank=tp_rank)
-    harness.enable_attention_dp = True
-    harness.stats_lock = threading.Lock()
-    harness.stats = []
-    harness.max_stats_len = 64
-    harness._latest_kv_iter_stats = "current-kv"
-    pending_payload = PyExecutor._make_adp_iter_stats_payload(harness, pending_stats)
-    harness._pending_adp_iter_stats_payloads = {pending_payload.iter_stats_iter: pending_payload}
-    harness._synthetic_adp_iter_stats_iters = set()
-    harness._pending_adp_iter_stats = (
-        {pending_payload.iter_stats_iter: pending_stats} if rank == 0 else {}
+def _build_adp_stats_buffer(pending_stats, *, is_rank0=True):
+    buffer = ADPIterStatsBuffer()
+    buffer.queue(
+        pending_stats,
+        ["req-stats"] if is_rank0 else None,
+        kv_iter_stats="pending-kv" if is_rank0 else None,
+        is_rank0=is_rank0,
     )
-    harness._pending_adp_req_stats = (
-        {pending_payload.iter_stats_iter: ["req-stats"]} if rank == 0 else {}
-    )
-    harness._pending_adp_kv_iter_stats = (
-        {pending_payload.iter_stats_iter: "pending-kv"} if rank == 0 else {}
-    )
-
-    for method_name in (
-        "_append_iter_stats",
-        "_clear_pending_adp_iter_stats_through",
-        "_discard_pending_adp_iter_stats",
-        "_drop_pending_adp_iter_stats_before",
-        "_ensure_adp_zero_iter_stats_payload",
-        "_finalize_pending_adp_iter_stats",
-        "_make_adp_rank_iter_stats",
-        "_make_adp_iter_stats_payload",
-        "_next_adp_iter_stats_payload",
-        "_queue_adp_iter_stats",
-    ):
-        setattr(
-            harness,
-            method_name,
-            getattr(PyExecutor, method_name).__get__(harness, _AdpStatsHarness),
-        )
-
-    return harness
+    return buffer
 
 
 def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
@@ -637,8 +600,8 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
         num_queued_gen_kv_tokens=800,
     )
     rank0_stats.iter_latency_ms = 12.5
-    harness = _build_adp_stats_harness(rank0_stats)
-    rank0_state = RankState(rank=0, iter_stats=harness._next_adp_iter_stats_payload())
+    buffer = _build_adp_stats_buffer(rank0_stats)
+    rank0_state = RankState(rank=0, iter_stats=buffer.next_payload())
     rank1_state = RankState(
         rank=1,
         iter_stats=RankIterStatsPayload(
@@ -654,13 +617,14 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
         ),
     )
 
-    harness._finalize_pending_adp_iter_stats([rank0_state, rank1_state])
+    records = buffer.finalize([rank0_state, rank1_state], is_rank0=True)
 
-    assert len(harness.stats) == 2
+    assert len(records) == 2
 
-    rank0_row, rank0_req_stats, rank0_kv_iter_stats, rank0_tag = harness.stats[0]
+    rank0_record = records[0]
+    rank0_row = rank0_record.stats
     rank0_ifb = rank0_row.inflight_batching_stats
-    assert rank0_tag == 0
+    assert rank0_record.attention_dp_rank == 0
     assert rank0_row.iter_latency_ms == 12.5
     assert rank0_ifb.num_context_requests == 1
     assert rank0_ifb.num_ctx_tokens == 100
@@ -674,12 +638,13 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     assert rank0_ifb.num_queued_ctx_tokens == 700
     assert rank0_ifb.num_queued_gen_requests == 8
     assert rank0_ifb.num_queued_gen_kv_tokens == 800
-    assert rank0_req_stats == ["req-stats"]
-    assert rank0_kv_iter_stats == "pending-kv"
+    assert rank0_record.req_stats == ["req-stats"]
+    assert rank0_record.kv_iter_stats == "pending-kv"
 
-    rank1_row, rank1_req_stats, rank1_kv_iter_stats, rank1_tag = harness.stats[1]
+    rank1_record = records[1]
+    rank1_row = rank1_record.stats
     rank1_ifb = rank1_row.inflight_batching_stats
-    assert rank1_tag == 1
+    assert rank1_record.attention_dp_rank == 1
     assert rank1_row.iter_latency_ms == 12.5
     assert rank1_ifb.num_context_requests == 3
     assert rank1_ifb.num_ctx_tokens == 300
@@ -695,22 +660,22 @@ def test_attention_dp_fanout_emits_rank_local_rows_with_rank0_queue():
     assert rank1_ifb.num_queued_ctx_tokens == 0
     assert rank1_ifb.num_queued_gen_requests == 0
     assert rank1_ifb.num_queued_gen_kv_tokens == 0
-    assert rank1_req_stats is None
-    assert rank1_kv_iter_stats is None
+    assert rank1_record.req_stats is None
+    assert rank1_record.kv_iter_stats is None
 
-    assert harness._pending_adp_iter_stats_payloads == {}
+    assert buffer._payloads == {}
 
 
 def test_attention_dp_fanout_waits_for_complete_matching_payloads():
     rank0_stats = _make_adp_iteration_stats(iter_id=9, num_context_requests=1)
-    harness = _build_adp_stats_harness(rank0_stats)
-    rank0_state = RankState(rank=0, iter_stats=harness._next_adp_iter_stats_payload())
+    buffer = _build_adp_stats_buffer(rank0_stats)
+    rank0_state = RankState(rank=0, iter_stats=buffer.next_payload())
     missing_rank1_state = RankState(rank=1)
 
-    harness._finalize_pending_adp_iter_stats([rank0_state, missing_rank1_state])
+    records = buffer.finalize([rank0_state, missing_rank1_state], is_rank0=True)
 
-    assert harness.stats == []
-    assert harness._next_adp_iter_stats_payload() is rank0_state.iter_stats
+    assert records == []
+    assert buffer.next_payload() is rank0_state.iter_stats
 
     mismatched_rank1_state = RankState(
         rank=1,
@@ -721,27 +686,33 @@ def test_attention_dp_fanout_waits_for_complete_matching_payloads():
         ),
     )
 
-    harness._finalize_pending_adp_iter_stats([rank0_state, mismatched_rank1_state])
+    records = buffer.finalize([rank0_state, mismatched_rank1_state],
+                              is_rank0=True)
 
-    assert harness.stats == []
-    assert harness._next_adp_iter_stats_payload() is rank0_state.iter_stats
+    assert records == []
+    assert buffer.next_payload() is rank0_state.iter_stats
 
 
 def test_attention_dp_fanout_buffers_multiple_pending_payloads():
     rank0_stats_9 = _make_adp_iteration_stats(iter_id=9, num_context_requests=1)
     rank0_stats_10 = _make_adp_iteration_stats(iter_id=10, num_context_requests=2)
-    harness = _build_adp_stats_harness(rank0_stats_9)
+    buffer = _build_adp_stats_buffer(rank0_stats_9)
 
-    harness._queue_adp_iter_stats(rank0_stats_10, ["req-stats-10"])
+    buffer.queue(
+        rank0_stats_10,
+        ["req-stats-10"],
+        kv_iter_stats="pending-kv-10",
+        is_rank0=True,
+    )
 
-    assert sorted(harness._pending_adp_iter_stats_payloads) == [9, 10]
-    assert harness._next_adp_iter_stats_payload().iter_stats_iter == 9
+    assert sorted(buffer._payloads) == [9, 10]
+    assert buffer.next_payload().iter_stats_iter == 9
 
 
 def test_attention_dp_fanout_clears_when_rank0_stats_object_missing():
     rank0_stats = _make_adp_iteration_stats(iter_id=9, num_context_requests=1)
-    harness = _build_adp_stats_harness(rank0_stats)
-    rank0_state = RankState(rank=0, iter_stats=harness._next_adp_iter_stats_payload())
+    buffer = _build_adp_stats_buffer(rank0_stats)
+    rank0_state = RankState(rank=0, iter_stats=buffer.next_payload())
     rank1_state = RankState(
         rank=1,
         iter_stats=RankIterStatsPayload(
@@ -750,19 +721,19 @@ def test_attention_dp_fanout_clears_when_rank0_stats_object_missing():
             num_context_requests=2,
         ),
     )
-    harness._pending_adp_iter_stats.pop(9)
+    buffer._rank0_iter_stats.pop(9)
 
-    harness._finalize_pending_adp_iter_stats([rank0_state, rank1_state])
+    records = buffer.finalize([rank0_state, rank1_state], is_rank0=True)
 
-    assert harness.stats == []
-    assert harness._pending_adp_iter_stats_payloads == {}
-    assert harness._pending_adp_req_stats == {}
-    assert harness._pending_adp_kv_iter_stats == {}
+    assert records == []
+    assert buffer._payloads == {}
+    assert buffer._rank0_req_stats == {}
+    assert buffer._rank0_kv_iter_stats == {}
 
 
 def test_attention_dp_fanout_aligns_non_rank0_to_rank0_iter():
     rank1_stats = _make_adp_iteration_stats(iter_id=10, num_context_requests=3)
-    harness = _build_adp_stats_harness(rank1_stats, rank=1, tp_rank=1)
+    buffer = _build_adp_stats_buffer(rank1_stats, is_rank0=False)
     rank0_state = RankState(
         rank=0,
         iter_stats=RankIterStatsPayload(
@@ -771,15 +742,16 @@ def test_attention_dp_fanout_aligns_non_rank0_to_rank0_iter():
             num_context_requests=1,
         ),
     )
-    rank1_state = RankState(rank=1, iter_stats=harness._next_adp_iter_stats_payload())
+    rank1_state = RankState(rank=1, iter_stats=buffer.next_payload())
 
-    harness._finalize_pending_adp_iter_stats([rank0_state, rank1_state])
+    records = buffer.finalize([rank0_state, rank1_state], is_rank0=False)
 
-    next_payload = harness._next_adp_iter_stats_payload()
+    assert records == []
+    next_payload = buffer.next_payload()
     assert next_payload.iter_stats_iter == 9
     assert next_payload.num_context_requests == 0
-    assert 9 in harness._synthetic_adp_iter_stats_iters
-    assert 10 in harness._pending_adp_iter_stats_payloads
+    assert 9 in buffer._synthetic_iters
+    assert 10 in buffer._payloads
 
 
 # ---------------------------------------------------------------------------
