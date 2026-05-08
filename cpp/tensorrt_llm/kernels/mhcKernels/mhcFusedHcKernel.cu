@@ -34,9 +34,11 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
+#include <cstring>
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <unordered_map>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -156,6 +158,91 @@ static CUtensorMap makeTma2D(void* base, CUtensorMapDataType dtype, uint64_t gme
     TLLM_CHECK_WITH_INFO(rc == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed (%d)", static_cast<int>(rc));
     return tm;
 }
+
+// ---- TMA descriptor cache --------------------------------------------------
+//
+// cuTensorMapEncodeTiled is a host-side call that takes ~1-2 µs per descriptor.
+// Each fused_hc launch builds 4 descriptors (residual_in, x_in, W,
+// residual_cur), so the per-call descriptor build is 4-8 µs — 25-50% of total
+// wall time at small M (M ≤ 64).
+//
+// Cache scope: per-host-thread (`thread_local`). Same host thread launching to
+// multiple CUDA streams shares one cache (descriptor content depends only on
+// (device, ptr, shape), not on the stream the kernel runs on). Multi-thread
+// callers each get their own cache (no synchronization overhead).
+//
+// Multi-GPU: device_id is part of the key so a host thread that switches CUDA
+// devices never reuses a descriptor across address spaces.
+//
+// CUDA-graph capture: cuTensorMapEncodeTiled is a pure host function that does
+// not record any stream operation, so cache miss inside capture is safe. The
+// descriptor is passed by value as __grid_constant__; the recorded graph node
+// holds those bytes and replays correctly under workspace-stable replay
+// (already enforced by _FusedHcWorkspaceCache in mhc_cuda.py).
+//
+// Return-by-value: CUtensorMap is a 128-byte POD; we copy out before any
+// further insertion can rehash the underlying unordered_map.
+//
+// Lifetime: entries are never explicitly evicted. Steady-state working set is
+// O(B-bucket × hidden) per thread, typically O(20) entries / ~5 KB.
+namespace
+{
+struct TmaDescKey
+{
+    void const* base;       // GMEM base pointer (device pointer)
+    uint64_t gmemInner;
+    uint64_t gmemOuter;
+    uint32_t smemInner;
+    uint32_t smemOuter;
+    uint64_t gmemOuterStrideBytes;
+    uint32_t swizzleBytes;
+    uint32_t elemBytes;
+    CUtensorMapDataType dtype;
+    int device_id;          // protect against cross-device pointer aliasing
+
+    bool operator==(TmaDescKey const& o) const noexcept
+    {
+        return base == o.base && gmemInner == o.gmemInner && gmemOuter == o.gmemOuter && smemInner == o.smemInner
+            && smemOuter == o.smemOuter && gmemOuterStrideBytes == o.gmemOuterStrideBytes
+            && swizzleBytes == o.swizzleBytes && elemBytes == o.elemBytes && dtype == o.dtype
+            && device_id == o.device_id;
+    }
+};
+
+struct TmaDescKeyHash
+{
+    size_t operator()(TmaDescKey const& k) const noexcept
+    {
+        size_t h = reinterpret_cast<uintptr_t>(k.base);
+        h = h * 1099511628211ull + k.gmemInner;
+        h = h * 1099511628211ull + k.gmemOuter;
+        h = h * 1099511628211ull + (static_cast<uint64_t>(k.swizzleBytes) << 16 | k.elemBytes);
+        h = h * 1099511628211ull + static_cast<uint64_t>(k.device_id);
+        return h;
+    }
+};
+
+CUtensorMap getCachedTma2D(void* base, CUtensorMapDataType dtype, uint64_t gmemInner, uint64_t gmemOuter,
+    uint32_t smemInner, uint32_t smemOuter, uint64_t gmemOuterStrideBytes, uint32_t swizzleBytes, uint32_t elemBytes)
+{
+    static thread_local std::unordered_map<TmaDescKey, CUtensorMap, TmaDescKeyHash> cache;
+    int device_id = 0;
+    cudaGetDevice(&device_id);
+    TmaDescKey const key{base, gmemInner, gmemOuter, smemInner, smemOuter, gmemOuterStrideBytes, swizzleBytes,
+        elemBytes, dtype, device_id};
+    auto it = cache.find(key);
+    if (it != cache.end())
+    {
+        // Copy 128 bytes; iterator goes out of scope immediately afterwards.
+        return it->second;
+    }
+    CUtensorMap const tm = makeTma2D(
+        base, dtype, gmemInner, gmemOuter, smemInner, smemOuter, gmemOuterStrideBytes, swizzleBytes, elemBytes);
+    cache.emplace(key, tm);
+    return tm;
+}
+
+} // namespace
 
 static constexpr uint32_t fhcSmemSize()
 {
@@ -278,20 +365,22 @@ static void mhcFusedHcLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     fhcZeroWorkspaces(y_acc_workspace, static_cast<uint32_t>(M) * FHC_SHAPE_N, r_acc_workspace,
         static_cast<uint32_t>(M), /*done_counter=*/nullptr, /*done_elems=*/0, stream);
 
-    // ---- Build TMA descriptors ----
-    CUtensorMap desc_res = makeTma2D(const_cast<__nv_bfloat16*>(residual_prev), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-        SHAPE_K, m_u, FHC_BLOCK_K, FHC_BLOCK_M, static_cast<uint64_t>(SHAPE_K) * sizeof(__nv_bfloat16),
+    // ---- Build TMA descriptors (cached by ptr+shape) ----
+    CUtensorMap desc_res = getCachedTma2D(const_cast<__nv_bfloat16*>(residual_prev),
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, SHAPE_K, m_u, FHC_BLOCK_K, FHC_BLOCK_M,
+        static_cast<uint64_t>(SHAPE_K) * sizeof(__nv_bfloat16),
         /*swizzleBytes=*/128, sizeof(__nv_bfloat16));
 
-    CUtensorMap desc_x = makeTma2D(const_cast<__nv_bfloat16*>(x_prev), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, Hidden, m_u,
-        FHC_BLOCK_K, FHC_BLOCK_M, static_cast<uint64_t>(Hidden) * sizeof(__nv_bfloat16),
+    CUtensorMap desc_x = getCachedTma2D(const_cast<__nv_bfloat16*>(x_prev), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, Hidden,
+        m_u, FHC_BLOCK_K, FHC_BLOCK_M, static_cast<uint64_t>(Hidden) * sizeof(__nv_bfloat16),
         /*swizzleBytes=*/128, sizeof(__nv_bfloat16));
 
-    CUtensorMap desc_b = makeTma2D(const_cast<float*>(w_t), CU_TENSOR_MAP_DATA_TYPE_TFLOAT32, SHAPE_K, FHC_SHAPE_N,
-        FHC_BLOCK_K, FHC_BLOCK_N, static_cast<uint64_t>(SHAPE_K) * sizeof(float),
+    CUtensorMap desc_b = getCachedTma2D(const_cast<float*>(w_t), CU_TENSOR_MAP_DATA_TYPE_TFLOAT32, SHAPE_K,
+        FHC_SHAPE_N, FHC_BLOCK_K, FHC_BLOCK_N, static_cast<uint64_t>(SHAPE_K) * sizeof(float),
         /*swizzleBytes=*/128, sizeof(float));
 
-    CUtensorMap desc_res_out = makeTma2D(residual_cur, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, SHAPE_K, m_u, FHC_BLOCK_K,
+    CUtensorMap desc_res_out = getCachedTma2D(residual_cur, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, SHAPE_K, m_u,
+        FHC_BLOCK_K,
         /*smemOuter=*/16, static_cast<uint64_t>(SHAPE_K) * sizeof(__nv_bfloat16),
         /*swizzleBytes=*/128, sizeof(__nv_bfloat16));
 
@@ -520,20 +609,22 @@ static void mhcFusedHcAllInOneLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloa
     fhcZeroWorkspaces(y_acc_workspace, static_cast<uint32_t>(M) * FHC_SHAPE_N, r_acc_workspace,
         static_cast<uint32_t>(M), done_counter_workspace, m_tiles, stream);
 
-    // ---- Build TMA descriptors ----
-    CUtensorMap desc_res = makeTma2D(const_cast<__nv_bfloat16*>(residual_prev), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-        SHAPE_K, m_u, FHC_BLOCK_K, FHC_BLOCK_M, static_cast<uint64_t>(SHAPE_K) * sizeof(__nv_bfloat16),
+    // ---- Build TMA descriptors (cached by ptr+shape) ----
+    CUtensorMap desc_res = getCachedTma2D(const_cast<__nv_bfloat16*>(residual_prev),
+        CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, SHAPE_K, m_u, FHC_BLOCK_K, FHC_BLOCK_M,
+        static_cast<uint64_t>(SHAPE_K) * sizeof(__nv_bfloat16),
         /*swizzleBytes=*/128, sizeof(__nv_bfloat16));
 
-    CUtensorMap desc_x = makeTma2D(const_cast<__nv_bfloat16*>(x_prev), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, Hidden, m_u,
-        FHC_BLOCK_K, FHC_BLOCK_M, static_cast<uint64_t>(Hidden) * sizeof(__nv_bfloat16),
+    CUtensorMap desc_x = getCachedTma2D(const_cast<__nv_bfloat16*>(x_prev), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, Hidden,
+        m_u, FHC_BLOCK_K, FHC_BLOCK_M, static_cast<uint64_t>(Hidden) * sizeof(__nv_bfloat16),
         /*swizzleBytes=*/128, sizeof(__nv_bfloat16));
 
-    CUtensorMap desc_b = makeTma2D(const_cast<float*>(w_t), CU_TENSOR_MAP_DATA_TYPE_TFLOAT32, SHAPE_K, FHC_SHAPE_N,
-        FHC_BLOCK_K, FHC_BLOCK_N, static_cast<uint64_t>(SHAPE_K) * sizeof(float),
+    CUtensorMap desc_b = getCachedTma2D(const_cast<float*>(w_t), CU_TENSOR_MAP_DATA_TYPE_TFLOAT32, SHAPE_K,
+        FHC_SHAPE_N, FHC_BLOCK_K, FHC_BLOCK_N, static_cast<uint64_t>(SHAPE_K) * sizeof(float),
         /*swizzleBytes=*/128, sizeof(float));
 
-    CUtensorMap desc_res_out = makeTma2D(residual_cur, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, SHAPE_K, m_u, FHC_BLOCK_K,
+    CUtensorMap desc_res_out = getCachedTma2D(residual_cur, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, SHAPE_K, m_u,
+        FHC_BLOCK_K,
         /*smemOuter=*/16, static_cast<uint64_t>(SHAPE_K) * sizeof(__nv_bfloat16),
         /*swizzleBytes=*/128, sizeof(__nv_bfloat16));
 
