@@ -49,6 +49,7 @@ b_enable_torch_compile
 b_enable_two_stage
 l_cfg_size
 l_ulysses_size
+l_parallel_vae_size
 s_generation_mode
 s_backend
 s_size

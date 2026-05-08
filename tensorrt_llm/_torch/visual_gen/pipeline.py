@@ -492,6 +492,7 @@ class BasePipeline(nn.Module):
                 self.vae,
                 split_dim=parallel_cfg.parallel_vae_split_dim,
                 pg=pg,
+                adj_groups=vgm.vae_adj_groups,
             )
         except ValueError:
             logger.warning(

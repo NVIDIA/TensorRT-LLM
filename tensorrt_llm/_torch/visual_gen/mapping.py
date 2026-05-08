@@ -123,6 +123,7 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         self.parallel_vae_size = parallel_vae_size
         self._vae_ranks = list(range(self.parallel_vae_size))
         self._vae_group: Optional[ProcessGroup] = None
+        self._vae_adj_groups: list[ProcessGroup] = []
         self._attn2d_row_group: Optional[ProcessGroup] = None
         self._attn2d_col_group: Optional[ProcessGroup] = None
         self._order = order
@@ -213,11 +214,16 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
             return
         if self.parallel_vae_size == self.world_size:
             self._vae_group = dist.group.WORLD
-            return
+        else:
+            pg = dist.new_group(self._vae_ranks, use_local_synchronization=True)
+            if self._rank in self._vae_ranks:
+                self._vae_group = pg
 
-        pg = dist.new_group(self._vae_ranks, use_local_synchronization=True)
-        if self._rank in self._vae_ranks:
-            self._vae_group = pg
+        for i in range(self.parallel_vae_size - 1):
+            ranks = [self._vae_ranks[i], self._vae_ranks[i + 1]]
+            pg = dist.new_group(ranks, use_local_synchronization=True)
+            if self._rank in ranks:
+                self._vae_adj_groups.append(pg)
 
     # ------------------------------------------------------------------
     # Rank decomposition
@@ -300,6 +306,10 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
     @property
     def vae_group(self) -> Optional[ProcessGroup]:
         return self._vae_group
+
+    @property
+    def vae_adj_groups(self) -> list[ProcessGroup]:
+        return self._vae_adj_groups
 
     # ------------------------------------------------------------------
     # Bridge to LLM Mapping (for Linear layers)

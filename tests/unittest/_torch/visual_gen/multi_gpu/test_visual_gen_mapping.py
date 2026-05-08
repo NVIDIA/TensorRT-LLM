@@ -76,6 +76,7 @@ class TestConstruction:
         assert vgm.parallel_vae_size == 1
         assert vgm.vae_ranks == [0]
         assert vgm.vae_group is None
+        assert vgm.vae_adj_groups == []
 
     def test_stores_sizes(self):
         vgm = VisualGenMapping(
@@ -101,6 +102,7 @@ class TestConstruction:
         assert vgm.parallel_vae_size == 2
         assert vgm.vae_ranks == [0, 1]
         assert vgm.vae_group is None
+        assert vgm.vae_adj_groups == []
 
     def test_stores_attn2d_sizes(self):
         vgm = VisualGenMapping(
@@ -371,6 +373,32 @@ def _logic_attn2d_mesh_rank_and_group(rank, world_size):
     )
 
 
+def _logic_vae_group_and_adj_groups(rank, world_size):
+    """VAE group uses the first N ranks and stores adjacent groups only on member ranks."""
+    from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
+
+    DeviceMeshTopologyImpl.device_mesh = None
+
+    vgm = VisualGenMapping(
+        world_size=world_size,
+        rank=rank,
+        ulysses_size=world_size,
+        parallel_vae_size=3,
+    )
+
+    assert vgm.vae_ranks == [0, 1, 2]
+    if rank < 3:
+        assert vgm.vae_group is not None
+        assert dist.get_world_size(vgm.vae_group) == 3
+        expected_adj_groups = 1 if rank in (0, 2) else 2
+        assert len(vgm.vae_adj_groups) == expected_adj_groups
+        for adj_group in vgm.vae_adj_groups:
+            assert dist.get_world_size(adj_group) == 2
+    else:
+        assert vgm.vae_group is None
+        assert vgm.vae_adj_groups == []
+
+
 @pytest.mark.skipif(not MODULES_AVAILABLE, reason="Modules not available")
 class TestMultiGPU:
     def test_default_order_cfg2_ulysses2(self):
@@ -385,3 +413,6 @@ class TestMultiGPU:
     def test_attn2d_mesh_rank_and_group(self):
         """attn2d_mesh_rank aliases cp_rank and attn2d_mesh_group supports collectives."""
         _run_multi_gpu(4, _logic_attn2d_mesh_rank_and_group)
+
+    def test_vae_group_and_adj_groups(self):
+        _run_multi_gpu(4, _logic_vae_group_and_adj_groups)

@@ -50,6 +50,7 @@ MATCH_KEYS = [
     "b_enable_two_stage",
     "l_cfg_size",
     "l_ulysses_size",
+    "l_parallel_vae_size",
     "s_generation_mode",
     "s_backend",
     "s_size",
@@ -176,6 +177,9 @@ def build_visual_gen_db_entry(
         ),
         "l_cfg_size": int(_get_nested_value(server_config, "parallel.dit_cfg_size", 1)),
         "l_ulysses_size": int(_get_nested_value(server_config, "parallel.dit_ulysses_size", 1)),
+        "l_parallel_vae_size": int(
+            _get_nested_value(server_config, "parallel.parallel_vae_size", 1)
+        ),
         "s_generation_mode": _infer_generation_mode(client_config),
         "s_backend": str(client_config.get("backend")),
         "s_size": str(client_config.get("size")),
