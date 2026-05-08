@@ -348,6 +348,13 @@ def launch_server(
         if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
             gc.disable()
 
+        # Optionally freeze GC (default: no freeze) to reduce latency spikes due to repeated attempts
+        # at garbage collection of long-lived resources, at the expense of incomplete resource
+        # reclamantion.
+        if os.getenv("TRTLLM_SERVER_FREEZE_GC", "0") == "1":
+            gc.collect(2)
+            gc.freeze()
+
         asyncio.run(server(host, port, sockets=[s]))
 
 

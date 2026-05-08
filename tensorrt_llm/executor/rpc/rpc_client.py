@@ -9,7 +9,7 @@ from typing import Any, AsyncIterator, Dict, Optional
 
 import zmq
 
-from tensorrt_llm._utils import (customized_gc_thresholds, nvtx_mark_debug,
+from tensorrt_llm._utils import (customized_gc_configuration, nvtx_mark_debug,
                                  nvtx_range_debug)
 
 from ...llmapi.utils import (AsyncQueue, _SyncQueue, enable_llmapi_debug,
@@ -345,7 +345,7 @@ class RPCClient:
             await asyncio.sleep(0.1)
             logger_debug("[client] Response reader ready to process messages")
 
-            with customized_gc_thresholds(10000):
+            with customized_gc_configuration(gen0_threshold=10000):
                 last_alive_log = time.time()
                 while not self._closed:
                     # Periodic alive logging for debugging

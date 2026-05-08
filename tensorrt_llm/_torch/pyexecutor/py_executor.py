@@ -20,7 +20,7 @@ try:
 except ImportError:
     from cuda import cudart
 
-from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
+from tensorrt_llm._utils import (customized_gc_configuration, is_trace_enabled,
                                  mpi_comm, mpi_disabled, nvtx_range,
                                  set_thread_local_mpi_comm, trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
@@ -296,6 +296,7 @@ class PyExecutor:
             kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
             guided_decoder: Optional[GuidedDecoder] = None,
             garbage_collection_gen0_threshold: Optional[int] = None,
+            garbage_collection_freeze_after_init: bool = False,
             start_worker: bool = True,
             kv_connector_manager: Optional[KvCacheConnectorManager] = None,
             max_seq_len: Optional[int] = None,
@@ -596,6 +597,7 @@ class PyExecutor:
                     "Drafting is not supported for selected executor loop. "
                     "Please disable disagg/pipeline parallelism scheduler.")
         self.garbage_collection_gen0_threshold = garbage_collection_gen0_threshold
+        self.garbage_collection_freeze_after_init = garbage_collection_freeze_after_init
         self.max_seq_len = max_seq_len
 
         self.worker_started = False
@@ -693,7 +695,7 @@ class PyExecutor:
             enable_profiler = bool(os.environ.get(
                 "TLLM_LINE_PROFILER_PATH")) and not self.is_warmup
             with host_profiler_context(enable=enable_profiler), \
-                 customized_gc_thresholds(self.garbage_collection_gen0_threshold):
+                 customized_gc_configuration(gen0_threshold=self.garbage_collection_gen0_threshold, freeze=self.garbage_collection_freeze_after_init):
                 self.event_loop()
         except Exception as e:
             logger.error(f"Error in event loop: {e}")

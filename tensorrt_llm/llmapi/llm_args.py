@@ -3715,6 +3715,13 @@ class TorchLlmArgs(BaseLlmArgs):
         "Lower values trigger more frequent garbage collection.",
         status="beta")
 
+    garbage_collection_freeze_after_init: int = Field(
+        default=False,
+        description=
+        "Call gc.freeze after engine initialization to prevent attempting garbage collection of long-lived " \
+        "executor resources. This can reduce latency spikes, at the expense of incomplete resource reclamation.",
+        status="beta")
+
     cuda_graph_config: Optional[CudaGraphConfig] = Field(
         default_factory=CudaGraphConfig,
         description="CUDA graph config. If true, use CUDA graphs for decoding. \

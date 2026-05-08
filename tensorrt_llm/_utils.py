@@ -943,8 +943,28 @@ def customized_gc_thresholds(gen0_threshold: Optional[int] = None):
 
 
 @contextmanager
+def maybe_gc_freeze(freeze: bool):
+    try:
+        if freeze:
+            gc.collect(2)
+            gc.freeze()
+        yield
+    finally:
+        if freeze:
+            gc.unfreeze()
+
+
+@contextmanager
 def _null_context_manager():
     yield
+
+
+@contextmanager
+def customized_gc_configuration(*,
+                                gen0_threshold: Optional[int] = None,
+                                freeze: bool = False):
+    with maybe_gc_freeze(freeze), customized_gc_thresholds(gen0_threshold):
+        yield
 
 
 _T = TypeVar("_T")

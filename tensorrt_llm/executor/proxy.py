@@ -13,7 +13,7 @@ import zmq.asyncio
 
 from tensorrt_llm.logger import logger
 
-from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
+from .._utils import customized_gc_configuration, mpi_rank, nvtx_range_debug
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
@@ -89,9 +89,9 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.model_world_size = model_world_size
 
-        self.garbage_collection_gen0_threshold = worker_kwargs[
-            "llm_args"].garbage_collection_gen0_threshold if worker_kwargs.get(
-                "llm_args", None) is not None else None
+        llm_args = worker_kwargs.get("llm_args")
+        self.garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold if llm_args is not None else None
+        self.garbage_collection_freeze_after_init: bool = llm_args.garbage_collection_freeze_after_init if llm_args is not None else False
 
         # Generate RPC address and key for stats RPC
         self.rpc_addr = get_unique_ipc_addr()
@@ -269,9 +269,8 @@ class GenerationExecutorProxy(GenerationExecutor):
     def dispatch_result_task(self) -> bool:
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
         # benefit from zmq.asyncio.Context
-        with customized_gc_thresholds(self.garbage_collection_gen0_threshold):
-            if (res := self.result_queue.get()) is None:
-                return False  # shutdown the thread
+        if (res := self.result_queue.get()) is None:
+            return False  # shutdown the thread
 
         async_queues = []
         event_loop = None
@@ -325,7 +324,12 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.dispatch_result_thread = ManagedThread(
                 weakref.WeakMethod(self.dispatch_result_task),
                 error_queue=self._error_queue,
-                name="proxy_dispatch_result_thread")
+                name="proxy_dispatch_result_thread",
+                context=customized_gc_configuration(
+                    gen0_threshold=self.garbage_collection_gen0_threshold,
+                    freeze=self.garbage_collection_freeze_after_init,
+                ),
+            )
 
             self.dispatch_result_thread.start()
 
