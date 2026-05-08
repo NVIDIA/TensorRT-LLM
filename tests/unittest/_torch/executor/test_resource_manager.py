@@ -4,7 +4,7 @@ import subprocess
 import sys
 import unittest
 from typing import NamedTuple, Tuple
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
@@ -880,6 +880,51 @@ class TestResourceManager(unittest.TestCase):
 
         # The PeftCacheManager should be created successfully with the provided stream
         self.assertTrue(peft_cache_manager.impl.enabled)
+
+
+class TestKVCacheManagerConfigForwarding(unittest.TestCase):
+
+    def test_secondary_offload_min_priority_forwarded_to_cpp_manager(self):
+        """Regression guard: preserve explicit priority 0 when building C++ kwargs."""
+        kv_cache_config = KvCacheConfig(max_tokens=64,
+                                        secondary_offload_min_priority=0)
+
+        mock_impl = MagicMock()
+        mock_impl.get_block_pool_pointers.return_value = torch.empty(0)
+        mock_impl.get_block_scale_pool_pointers.return_value = torch.empty(0)
+        mock_impl.get_layer_to_pool_mapping.return_value = [0]
+        mock_impl.num_pools = 1
+        mock_impl.max_blocks_per_seq = 1
+
+        class MockStream:
+            cuda_stream = 0
+
+        with patch(
+                "tensorrt_llm._torch.pyexecutor.resource_manager.KVCacheManagerCpp",
+                return_value=mock_impl) as mock_cpp_manager:
+            with patch("torch.cuda.mem_get_info",
+                       return_value=(1 << 30, 2 << 30)):
+                kv_cache_manager = KVCacheManager(
+                    kv_cache_config=kv_cache_config,
+                    kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+                    CacheType.SELF,
+                    num_layers=1,
+                    num_kv_heads=1,
+                    head_dim=128,
+                    tokens_per_block=32,
+                    max_seq_len=64,
+                    max_batch_size=1,
+                    mapping=Mapping(),
+                    execution_stream=MockStream(),
+                )
+
+        try:
+            mock_cpp_manager.assert_called_once()
+            self.assertEqual(
+                mock_cpp_manager.call_args.kwargs[
+                    "secondary_offload_min_priority"], 0)
+        finally:
+            kv_cache_manager.shutdown()
 
 
 if __name__ == "__main__":
