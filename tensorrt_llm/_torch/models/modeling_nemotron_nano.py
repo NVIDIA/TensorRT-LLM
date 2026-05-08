@@ -2770,44 +2770,84 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         return input_ids
 
-    def _encode_audio_data(self, audio_data: dict) -> Tuple[torch.Tensor, List[int]]:
-        """Encode audio feature dict into LLM-space embeddings.
+    def _encode_audio_bucket(
+        self, audio_inputs: List[dict]
+    ) -> List[Tuple[torch.Tensor, List[int]]]:
+        """Encode a batch of audio feature dicts in a single ``sound_encoder`` call.
 
-        Unlike `_encode_audio` which reads from `param.multimodal_data["audio"]`, this helper
-        accepts the audio feature dict directly so it can be reused for audio extracted from video
-        metadata.
-
-        Returns:
-            A tuple of (flat_embeddings, per_clip_token_counts) where
-            `flat_embeddings` has shape `[total_tokens, llm_hidden_size]` and
-            `per_clip_token_counts` contains the number of output tokens for
-            each audio clip.
+        Inputs may have different time dimensions (variable mel-feature
+        lengths). They are zero-padded to the max time within the bucket
+        and the per-clip ``feature_attention_mask`` is padded to match;
+        the encoder uses the mask to keep valid output lengths intact, so
+        padded positions don't leak into the kept slice. Returns one
+        ``(flat_embeddings, per_clip_token_counts)`` tuple per input,
+        in input order — same shape as a per-input ``_encode_audio_data``
+        call.
         """
-        input_features = audio_data["input_audio_features"]  # [num_clips, time, mel_bins]
-        attention_mask = audio_data["feature_attention_mask"]  # [num_clips, time]
+        if not audio_inputs:
+            return []
 
         target_device = next(self.sound_encoder.parameters()).device
-        input_features = input_features.to(dtype=self.model_dtype, device=target_device)
-        attention_mask = attention_mask.to(device=target_device)
+        max_time = max(ad["input_audio_features"].shape[1] for ad in audio_inputs)
 
-        sound_embeds = self.sound_encoder(input_features, attention_mask)
+        feature_chunks: List[torch.Tensor] = []
+        mask_chunks: List[torch.Tensor] = []
+        clips_per_input: List[int] = []
+        for audio_data in audio_inputs:
+            features = audio_data["input_audio_features"].to(
+                dtype=self.model_dtype, device=target_device
+            )
+            mask = audio_data["feature_attention_mask"].to(device=target_device)
+            time_len = features.shape[1]
+            if time_len < max_time:
+                pad_t = max_time - time_len
+                # Zero-pad the trailing time positions; mask keeps those
+                # positions invalid so they don't affect the kept output.
+                features = torch.nn.functional.pad(features, (0, 0, 0, pad_t))
+                mask = torch.nn.functional.pad(mask, (0, pad_t))
+            feature_chunks.append(features)
+            mask_chunks.append(mask)
+            clips_per_input.append(features.shape[0])
 
-        valid_input_lens = attention_mask.sum(dim=1)
+        all_features = torch.cat(feature_chunks, dim=0)
+        all_masks = torch.cat(mask_chunks, dim=0)
+
+        sound_embeds = self.sound_encoder(all_features, all_masks)
+
+        valid_input_lens = all_masks.sum(dim=1)
         valid_output_lens = self.sound_encoder.encoder._get_subsampling_output_length(
             valid_input_lens
         )
 
-        truncated = []
-        per_clip_counts: List[int] = []
+        # Per-clip truncate to valid output length.
+        truncated_per_clip: List[torch.Tensor] = []
+        counts_per_clip: List[int] = []
         for i in range(sound_embeds.shape[0]):
             valid_len = int(valid_output_lens[i].item())
-            truncated.append(sound_embeds[i, :valid_len])
-            per_clip_counts.append(valid_len)
+            truncated_per_clip.append(sound_embeds[i, :valid_len])
+            counts_per_clip.append(valid_len)
 
-        return torch.cat(truncated, dim=0), per_clip_counts  # [total_tokens, llm_hidden_size]
+        # Group per input.
+        results: List[Tuple[torch.Tensor, List[int]]] = []
+        cursor = 0
+        for n_clips in clips_per_input:
+            flat_emb = torch.cat(truncated_per_clip[cursor : cursor + n_clips], dim=0)
+            per_clip = counts_per_clip[cursor : cursor + n_clips]
+            results.append((flat_emb, per_clip))
+            cursor += n_clips
+        return results
+
+    def _encode_audio_data(self, audio_data: dict) -> Tuple[torch.Tensor, List[int]]:
+        """Encode a single audio feature dict into LLM-space embeddings.
+
+        Thin wrapper over ``_encode_audio_bucket``. Returns a tuple of
+        ``(flat_embeddings, per_clip_token_counts)`` where
+        ``flat_embeddings`` has shape ``[total_tokens, llm_hidden_size]``.
+        """
+        return self._encode_audio_bucket([audio_data])[0]
 
     def _encode_audio(self, param: MultimodalParams) -> torch.Tensor:
-        """Encode audio features into LLM-space embeddings."""
+        """Encode audio features for a standalone audio param."""
         emb, _ = self._encode_audio_data(param.multimodal_data["audio"])
         return emb
 
@@ -2887,10 +2927,12 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         Per-request `num_tokens_in_video` (needed by EVS) is stashed in
         each param's `multimodal_data` dict as a side-channel.
 
-        Image requests are batched into a single `vision_encoder` call;
-        videos and standalone audio still run per-request because their
-        side effects (per-video audio interleaving, EVS token-count
-        stashing) are tied to a single request's data layout.
+        Image params are batched into a single ``vision_encoder`` call;
+        all audio inputs (standalone audio params and audio extracted
+        from video) are batched into a single ``sound_encoder`` call.
+        Videos still run per-request because per-video audio
+        interleaving and EVS token-count stashing are tied to one
+        request's data layout.
         """
         # Encode all image params in one batched vision_encoder call.
         image_params = [
@@ -2900,6 +2942,21 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         if image_params:
             image_embeds, _ = self.vision_encoder(image_params)
             image_embeds_iter = iter(image_embeds)
+
+        # Collect all audio inputs (standalone + video-extracted) in
+        # encounter order and run them through one sound_encoder call.
+        audio_inputs: List[dict] = []
+        for param in multimodal_params:
+            modality_type = param.multimodal_data["modality_type"]
+            if modality_type == "audio":
+                audio_inputs.append(param.multimodal_data["audio"])
+            elif modality_type == "video" and self.sound_encoder is not None:
+                audio_data = param.multimodal_data["video"].get("audio")
+                if audio_data is not None:
+                    audio_inputs.append(audio_data)
+        audio_results_iter: Iterator[Tuple[torch.Tensor, List[int]]] = iter([])
+        if audio_inputs:
+            audio_results_iter = iter(self._encode_audio_bucket(audio_inputs))
 
         mm_embeddings: List[torch.Tensor] = []
         for param in multimodal_params:
@@ -2916,7 +2973,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                 # (v1_img_context, v1_sound_context, v2_img_context, ...).
                 audio_data = param.multimodal_data["video"].get("audio")
                 if audio_data is not None and self.sound_encoder is not None:
-                    audio_emb, per_clip_audio_counts = self._encode_audio_data(audio_data)
+                    audio_emb, per_clip_audio_counts = next(audio_results_iter)
                     vision_emb = self._interleave_video_audio_embeddings(
                         vision_emb,
                         audio_emb,
@@ -2928,7 +2985,8 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                     )
                 mm_embeddings.append(vision_emb)
             elif modality_type == "audio":
-                mm_embeddings.append(self._encode_audio(param))
+                audio_emb, _ = next(audio_results_iter)
+                mm_embeddings.append(audio_emb)
             else:
                 raise ValueError(f"Unknown modality: {modality_type}")
 
