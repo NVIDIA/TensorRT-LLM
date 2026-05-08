@@ -705,6 +705,180 @@ def test_source_v2_matches_legacy_source_construction(compress_ratio: int) -> No
     )
 
 
+def test_cached_v2_ratio0_prefill_and_decode_match_source() -> None:
+    torch.manual_seed(37)
+    total_len = 3
+    prefill_len = 2
+    q = torch.randn(1, total_len, 1, 8)
+    kv = torch.randn(1, total_len, 8)
+    attn_sink = torch.tensor([-0.25])
+    (
+        compressor_kv,
+        compressor_gate,
+        _,
+        compressor,
+        cos_table,
+        sin_table,
+        position_ids,
+    ) = _compressor_case(4, total_len)
+    swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = _make_v2_caches(
+        total_len,
+        kv.shape[-1],
+        compressor_kv.shape[-1],
+        fill_value=777.0,
+    )
+
+    topk_prefill = torch.tensor([[[0, 1], [1, 0]]], dtype=torch.int64)
+    output_prefill = _run_cached_sparse_attention_v2(
+        q[:, :prefill_len],
+        kv[:, :prefill_len],
+        attn_sink,
+        topk_prefill,
+        compressor_kv[:, :prefill_len],
+        compressor_gate[:, :prefill_len],
+        compressor,
+        cos_table,
+        sin_table,
+        position_ids[:, :prefill_len],
+        _context_meta(seq_len=prefill_len),
+        swa_cache,
+        mhc_cache,
+        compressor_kv_cache,
+        compressor_gate_cache,
+        window_size=None,
+        compress_ratio=0,
+    )
+    expected_prefill = _run_sparse_attention_v2(
+        q[:, :prefill_len],
+        kv[:, :prefill_len],
+        attn_sink,
+        topk_prefill,
+        compressor_kv[:, :prefill_len],
+        compressor_gate[:, :prefill_len],
+        compressor,
+        cos_table,
+        sin_table,
+        position_ids[:, :prefill_len],
+        window_size=None,
+        compress_ratio=0,
+    )
+
+    assert_rmse_close(
+        output_prefill,
+        expected_prefill,
+        rmse_ratio_tol=1e-6,
+        msg="cached v2 ratio-0 prefill: ",
+    )
+
+    topk_decode = torch.tensor([[[0, 2]]], dtype=torch.int64)
+    output_decode = _run_cached_sparse_attention_v2(
+        q[:, prefill_len:],
+        kv[:, prefill_len:],
+        attn_sink,
+        topk_decode,
+        compressor_kv[:, prefill_len:],
+        compressor_gate[:, prefill_len:],
+        compressor,
+        cos_table,
+        sin_table,
+        position_ids[:, prefill_len:],
+        _decode_meta(input_pos=prefill_len),
+        swa_cache,
+        mhc_cache,
+        compressor_kv_cache,
+        compressor_gate_cache,
+        window_size=None,
+        compress_ratio=0,
+    )
+    expected_decode = _run_sparse_attention_v2(
+        q[:, prefill_len:],
+        kv,
+        attn_sink,
+        topk_decode,
+        compressor_kv,
+        compressor_gate,
+        compressor,
+        cos_table,
+        sin_table,
+        position_ids,
+        window_size=None,
+        compress_ratio=0,
+    )
+
+    torch.testing.assert_close(swa_cache[0, :total_len], kv[0])
+    assert_rmse_close(
+        output_decode,
+        expected_decode,
+        rmse_ratio_tol=1e-6,
+        msg="cached v2 ratio-0 decode: ",
+    )
+
+
+@pytest.mark.parametrize("compress_ratio", [4, 128])
+def test_cached_v2_compressed_prefill_matches_source_v2(compress_ratio: int) -> None:
+    torch.manual_seed(311 + compress_ratio)
+    seq_len = compress_ratio
+    q = torch.randn(1, seq_len, 1, 8)
+    kv = torch.randn(1, seq_len, 8)
+    attn_sink = torch.tensor([-0.25])
+    (
+        compressor_kv,
+        compressor_gate,
+        _,
+        compressor,
+        cos_table,
+        sin_table,
+        position_ids,
+    ) = _compressor_case(compress_ratio, seq_len)
+    swa_cache, mhc_cache, compressor_kv_cache, compressor_gate_cache = _make_v2_caches(
+        seq_len,
+        kv.shape[-1],
+        compressor_kv.shape[-1],
+        fill_value=777.0,
+    )
+    topk_idxs = torch.arange(seq_len + compressor.max_compressed_len).view(1, 1, -1)
+    topk_idxs = topk_idxs.expand(1, seq_len, -1).to(torch.int64)
+
+    output = _run_cached_sparse_attention_v2(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        compressor_kv,
+        compressor_gate,
+        compressor,
+        cos_table,
+        sin_table,
+        position_ids,
+        _context_meta(seq_len=seq_len),
+        swa_cache,
+        mhc_cache,
+        compressor_kv_cache,
+        compressor_gate_cache,
+        compress_ratio=compress_ratio,
+    )
+    expected = _run_sparse_attention_v2(
+        q,
+        kv,
+        attn_sink,
+        topk_idxs,
+        compressor_kv,
+        compressor_gate,
+        compressor,
+        cos_table,
+        sin_table,
+        position_ids,
+        compress_ratio=compress_ratio,
+    )
+
+    assert_rmse_close(
+        output,
+        expected,
+        rmse_ratio_tol=1e-6,
+        msg=f"cached v2 ratio-{compress_ratio} prefill: ",
+    )
+
+
 def test_cached_ratio128_token_input_pos_matches_full_v2_source() -> None:
     torch.manual_seed(183)
     compress_ratio = 128

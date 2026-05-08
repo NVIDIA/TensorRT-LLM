@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from pathlib import Path
 
 import pytest
@@ -64,6 +65,32 @@ def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
                 world_size = int(config["world_size"])
         return paths, world_size
     raise ValueError(f"Model '{model_name}' not found in model registry")
+
+
+def _deepseek_v4_flash_model_path_or_skip() -> str:
+    """Return a local DeepSeek-V4-Flash checkpoint path, or skip when absent."""
+    for env_var in ("DEEPSEEK_V4_FLASH_MODEL_DIR", "DEEPSEEK_V4_MODEL_DIR"):
+        env_model_dir = os.environ.get(env_var)
+        if not env_model_dir:
+            continue
+        model_path = Path(env_model_dir)
+        candidates = (model_path, model_path / "DeepSeek-V4-Flash")
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+        pytest.skip(
+            f"{env_var} points to missing DeepSeek-V4-Flash path {model_path}")
+
+    try:
+        model_path = hf_id_to_local_model_dir("deepseek-ai/DeepSeek-V4-Flash")
+    except ValueError as exc:
+        pytest.skip(str(exc))
+
+    if model_path is None:
+        pytest.skip(
+            "DeepSeek-V4-Flash checkpoint not found; set LLM_MODELS_ROOT, "
+            "DEEPSEEK_V4_FLASH_MODEL_DIR, or DEEPSEEK_V4_MODEL_DIR.")
+    return model_path
 
 
 def _set_quant_config(llm, model_id: str) -> None:
@@ -1590,6 +1617,61 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                         task.evaluate(llm, **evaluate_kwargs)
                     except (AssertionError, RuntimeError, ValueError) as e:
                         raise type(e)(f"[{task_cls.__name__}] {e}") from None
+
+
+class TestDeepSeekV4FlashPR1(LlmapiAccuracyTestHarness):
+    """Real-checkpoint smoke for the DeepSeek V4 PR1 AutoDeploy path."""
+
+    MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
+    CONFIG_YAMLS = [
+        str(_AD_CONFIGS_DIR / "deepseek_v4_pr1_5layer.yaml"),
+        str(_AD_CONFIGS_DIR / "deepseek_v4_pr1_single_rank_smoke.yaml"),
+    ]
+
+    def get_default_sampling_params(self):
+        return SamplingParams(max_tokens=2, temperature=0, top_k=1)
+
+    @staticmethod
+    def _assert_one_non_empty_generated_token_list(outputs):
+        assert len(outputs) == 1
+        assert len(outputs[0].outputs) == 1
+        assert len(outputs[0].outputs[0].token_ids) > 0
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_single_rank_prefill_decode_smoke(self):
+        model_path = _deepseek_v4_flash_model_path_or_skip()
+
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
+                           world_size=1,
+                           yaml_extra=self.CONFIG_YAMLS,
+                           trust_remote_code=True) as llm:
+            outputs = llm.generate(
+                ["In one sentence, explain gravity."],
+                sampling_params=self.get_default_sampling_params())
+
+        self._assert_one_non_empty_generated_token_list(outputs)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(120000)
+    @pytest.mark.skip_less_device(8)
+    def test_registry_8_rank_prefill_decode_smoke(self):
+        model_path = _deepseek_v4_flash_model_path_or_skip()
+        yaml_paths, registry_world_size = _get_registry_yaml_extra(
+            self.MODEL_NAME)
+        assert registry_world_size == 8
+
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
+                           world_size=8,
+                           yaml_extra=yaml_paths,
+                           trust_remote_code=True) as llm:
+            outputs = llm.generate(
+                ["In one sentence, explain gravity."],
+                sampling_params=self.get_default_sampling_params())
+
+        self._assert_one_non_empty_generated_token_list(outputs)
 
 
 # =============================================================================

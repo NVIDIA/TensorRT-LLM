@@ -323,6 +323,14 @@ class DeepseekV4PackedMxfp4ExpertsCheckpointLayout(PackedMXFP4ExpertCheckpointLa
             kind=tensor_kind,
         )
 
+    def has_layer_expert_tensors(self, state_dict: Mapping[str, torch.Tensor], layer: int) -> bool:
+        layer = _validate_nonnegative_int("layer", layer)
+        for name in state_dict:
+            parsed = self.parse_key(name)
+            if parsed is not None and parsed.layer == layer:
+                return True
+        return False
+
     def pack_experts(
         self,
         state_dict: Mapping[str, torch.Tensor],
@@ -424,37 +432,6 @@ class DeepseekV4PackedMxfp4ExpertsCheckpointLayout(PackedMXFP4ExpertCheckpointLa
             intermediate_size=intermediate_size,
         )
 
-    def load_runtime_buffers(
-        self,
-        state_dict: dict[str, torch.Tensor],
-        prefix: str,
-        *,
-        layer: int,
-        hidden_size: int,
-        intermediate_size: int,
-        target_gate_up_blocks: str,
-        target_gate_up_scales: str,
-        target_down_blocks: str,
-        target_down_scales: str,
-        expert_indices: Sequence[int] | None = None,
-        num_experts: int | None = None,
-    ) -> None:
-        source_state = _strip_prefix_from_state_dict(state_dict, prefix)
-        packed = self.pack_experts(
-            source_state,
-            layer=layer,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            expert_indices=expert_indices,
-            num_experts=num_experts,
-        )
-        for source_key in self._source_keys_for_packed_experts(layer, packed.expert_indices):
-            state_dict.pop(prefix + source_key, None)
-        state_dict[prefix + target_gate_up_blocks] = packed.gate_up_blocks
-        state_dict[prefix + target_gate_up_scales] = packed.gate_up_scales
-        state_dict[prefix + target_down_blocks] = packed.down_blocks
-        state_dict[prefix + target_down_scales] = packed.down_scales
-
     def _collect_expert_tensors(
         self,
         state_dict: Mapping[str, torch.Tensor],
@@ -536,7 +513,7 @@ class DeepseekV4PackedMxfp4ExpertsCheckpointLayout(PackedMXFP4ExpertCheckpointLa
             self.expert_block_size // self.packed_values_per_byte,
         )
 
-    def _source_keys_for_packed_experts(
+    def source_keys_for_packed_experts(
         self, layer: int, expert_indices: Sequence[int]
     ) -> tuple[str, ...]:
         return tuple(
@@ -641,18 +618,6 @@ def _required_projection_names() -> tuple[str, ...]:
     return tuple(
         dict.fromkeys((*_DEEPSEEK_V4_MXFP4_GATE_UP_ORDER, _DEEPSEEK_V4_MXFP4_DOWN_PROJECTION))
     )
-
-
-def _strip_prefix_from_state_dict(
-    state_dict: Mapping[str, torch.Tensor], prefix: str
-) -> dict[str, torch.Tensor]:
-    if not prefix:
-        return dict(state_dict)
-    return {
-        key.removeprefix(prefix): tensor
-        for key, tensor in state_dict.items()
-        if key.startswith(prefix)
-    }
 
 
 def _get_dtype(name: str, metadata: TensorMetadata) -> str:
@@ -1372,6 +1337,7 @@ class DeepseekV4MoE(nn.Module):
         )
         if self.ad_use_mxfp4_experts:
             self._register_mxfp4_runtime_buffers()
+            self._register_load_state_dict_pre_hook(self._load_mxfp4_checkpoint_experts)
         shared_intermediate_size = config.moe_intermediate_size * config.n_shared_experts
         self.shared_experts = DeepseekV4MLP(
             config.hidden_size,
@@ -1445,33 +1411,36 @@ class DeepseekV4MoE(nn.Module):
             persistent=False,
         )
 
-    def load_mxfp4_runtime_buffers(self, state_dict: dict[str, torch.Tensor]) -> None:
+    def _load_mxfp4_checkpoint_experts(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        *args,
+    ) -> None:
+        del args
         if not self.ad_use_mxfp4_experts:
             return
 
         layout = build_deepseek_v4_packed_mxfp4_experts_layout()
-        has_layer_expert_tensor = False
-        for name in state_dict:
-            parsed = layout.parse_key(name)
-            if parsed is not None and parsed.layer == self.layer_idx:
-                has_layer_expert_tensor = True
-                break
-        if not has_layer_expert_tensor:
+        if not layout.has_layer_expert_tensors(state_dict, self.layer_idx):
             return
 
-        target_prefix = f"layers.{self.layer_idx}.ffn.experts."
-        layout.load_runtime_buffers(
+        target_prefix = f"{prefix}experts."
+        packed = layout.pack_experts(
             state_dict,
-            "",
             layer=self.layer_idx,
             hidden_size=self.hidden_size,
             intermediate_size=self.intermediate_size,
-            target_gate_up_blocks=f"{target_prefix}gate_up_proj_blocks",
-            target_gate_up_scales=f"{target_prefix}gate_up_proj_scales",
-            target_down_blocks=f"{target_prefix}down_proj_blocks",
-            target_down_scales=f"{target_prefix}down_proj_scales",
             num_experts=self.n_routed_experts,
         )
+        for source_key in layout.source_keys_for_packed_experts(
+            self.layer_idx, packed.expert_indices
+        ):
+            state_dict.pop(source_key, None)
+        state_dict[f"{target_prefix}gate_up_proj_blocks"] = packed.gate_up_blocks
+        state_dict[f"{target_prefix}gate_up_proj_scales"] = packed.gate_up_scales
+        state_dict[f"{target_prefix}down_proj_blocks"] = packed.down_blocks
+        state_dict[f"{target_prefix}down_proj_scales"] = packed.down_scales
         self._resize_mxfp4_runtime_buffer(
             "gate_up_proj_blocks", state_dict[f"{target_prefix}gate_up_proj_blocks"]
         )
@@ -2126,16 +2095,6 @@ class DeepseekV4PreTrainedModel(PreTrainedModel):
         if prefix:
             return
         _remap_deepseek_v4_checkpoint_keys(state_dict)
-        seen: set[int] = set()
-        for submodule in module.modules():
-            load_mxfp4_runtime_buffers = getattr(submodule, "load_mxfp4_runtime_buffers", None)
-            if load_mxfp4_runtime_buffers is None:
-                continue
-            submodule_id = id(submodule)
-            if submodule_id in seen:
-                continue
-            seen.add(submodule_id)
-            load_mxfp4_runtime_buffers(state_dict)
 
     def _init_weights(self, module: nn.Module) -> None:
         std = getattr(self.config, "initializer_range", 0.02)

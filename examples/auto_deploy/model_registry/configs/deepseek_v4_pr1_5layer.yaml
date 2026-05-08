@@ -44,8 +44,6 @@ transforms:
       moe_cluster: 1
     enable_attention_dp: false
     shard_layers: ["mla", "moe"]
-  load_weights:
-    disable_preload: true
   insert_cached_attention:
     backend: deepseek_v4_sparse
   export_to_gm:

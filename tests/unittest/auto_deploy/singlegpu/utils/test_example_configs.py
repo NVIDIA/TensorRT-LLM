@@ -171,7 +171,8 @@ def test_deepseek_v4_pr1_registry_dry_run() -> None:
 
     transforms = args.transforms
     assert transforms["insert_cached_attention"]["backend"] == "deepseek_v4_sparse"
-    assert transforms["load_weights"]["disable_preload"] is True
+    load_weights = transforms.get("load_weights") or {}
+    assert load_weights.get("disable_preload", False) is False
     assert transforms["quantize_finegrained_fp8_linear_from_config"]["enabled"] is True
     assert transforms["quantize_mxfp4_moe"]["enabled"] is True
     assert transforms["compile_model"]["backend"] == "torch-simple"

@@ -13,17 +13,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn.functional as F
 
-import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
-from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
+_UTILS_DIR = Path(__file__).resolve().parents[3] / "_utils_test"
+sys.path.append(str(_UTILS_DIR))
+from _deepseek_v4_checkpoint_utils import (  # noqa: E402
+    deepseek_v4_flash_checkpoint_or_skip,
+    load_safetensors_tensors_or_skip,
+)
+
+import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: E402, F401
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (  # noqa: E402
     DeepseekV4PackedMxfp4ExpertsCheckpointLayout,
     build_deepseek_v4_packed_mxfp4_experts_layout,
 )
-from tensorrt_llm._torch.auto_deploy.transform.interface import Stages
-from tensorrt_llm._torch.auto_deploy.transform.library.mxfp4_moe import (
+from tensorrt_llm._torch.auto_deploy.transform.interface import Stages  # noqa: E402
+from tensorrt_llm._torch.auto_deploy.transform.library.mxfp4_moe import (  # noqa: E402
     InsertMXFP4MLP,
     MXFP4MLPConfig,
     _mxfp4_target_names_from_node,
@@ -52,11 +62,65 @@ _E2M1_VALUES = torch.tensor(
     dtype=torch.float32,
 )
 _E8M0_EXPONENT_BIAS = 127
+_E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", None)
 _MXFP4_BLOCK_SIZE = 32
 
 
 def _scale_from_byte(scale_byte: int) -> float:
     return float(2.0 ** (scale_byte - _E8M0_EXPONENT_BIAS))
+
+
+def _packed_mxfp4_bytes(tensor: torch.Tensor, name: str) -> torch.Tensor:
+    if tensor.dtype == torch.uint8:
+        return tensor.contiguous()
+    if tensor.dtype == torch.int8:
+        return tensor.contiguous().view(torch.uint8)
+    raise AssertionError(f"{name} should contain packed MXFP4 bytes, got {tensor.dtype}.")
+
+
+def _e8m0_scale_bytes(tensor: torch.Tensor, name: str) -> torch.Tensor:
+    if tensor.dtype == torch.uint8:
+        return tensor.contiguous()
+    if _E8M0_DTYPE is not None and tensor.dtype == _E8M0_DTYPE:
+        return tensor.contiguous().view(torch.uint8)
+    raise AssertionError(f"{name} should contain raw E8M0 scale bytes, got {tensor.dtype}.")
+
+
+def _scale_from_bytes(scale_bytes: torch.Tensor) -> torch.Tensor:
+    exponents = scale_bytes.to(torch.int32) - _E8M0_EXPONENT_BIAS
+    return torch.ldexp(torch.ones_like(exponents, dtype=torch.float32), exponents)
+
+
+def _mxfp4_checkpoint_weight_dense_dequant(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    weight_name: str,
+    scale_name: str,
+) -> torch.Tensor:
+    weight_bytes = _packed_mxfp4_bytes(weight, weight_name)
+    scale_bytes = _e8m0_scale_bytes(scale, scale_name)
+    assert weight_bytes.ndim == 2
+    assert scale_bytes.ndim == 2
+    assert weight_bytes.shape[0] == scale_bytes.shape[0]
+    assert weight_bytes.shape[1] == scale_bytes.shape[1] * (_MXFP4_BLOCK_SIZE // 2)
+
+    blocks = weight_bytes.view(
+        weight_bytes.shape[0],
+        scale_bytes.shape[1],
+        _MXFP4_BLOCK_SIZE // 2,
+    )
+    packed = blocks.to(torch.int64)
+    low = packed & 0x0F
+    high = (packed >> 4) & 0x0F
+    codes = torch.stack((low, high), dim=-1).reshape(
+        weight_bytes.shape[0],
+        scale_bytes.shape[1],
+        _MXFP4_BLOCK_SIZE,
+    )
+    values = _E2M1_VALUES[codes]
+    decoded = values * _scale_from_bytes(scale_bytes).unsqueeze(-1)
+    return decoded.reshape(weight_bytes.shape[0], scale_bytes.shape[1] * _MXFP4_BLOCK_SIZE)
 
 
 def _make_mxfp4_weight(
@@ -536,6 +600,103 @@ def test_torch_mxfp4_moe_from_routing_matches_deepseek_layout_reference() -> Non
 
     assert expected.abs().max() > 0
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_deepseek_v4_flash_real_expert0_mxfp4_from_routing_matches_dense_dequant_reference() -> (
+    None
+):
+    checkpoint_dir = deepseek_v4_flash_checkpoint_or_skip()
+    tensor_names = tuple(
+        _deepseek_expert_key(0, 0, projection, tensor_kind)
+        for projection in ("w1", "w2", "w3")
+        for tensor_kind in ("weight", "scale")
+    )
+    state = load_safetensors_tensors_or_skip(checkpoint_dir, tensor_names)
+
+    w1_weight_name = _deepseek_expert_key(0, 0, "w1", "weight")
+    w1_scale_name = _deepseek_expert_key(0, 0, "w1", "scale")
+    w2_weight_name = _deepseek_expert_key(0, 0, "w2", "weight")
+    w2_scale_name = _deepseek_expert_key(0, 0, "w2", "scale")
+    w3_weight_name = _deepseek_expert_key(0, 0, "w3", "weight")
+    w3_scale_name = _deepseek_expert_key(0, 0, "w3", "scale")
+
+    w1_weight = state[w1_weight_name]
+    w2_weight = state[w2_weight_name]
+    w3_weight = state[w3_weight_name]
+    hidden_size = w1_weight.shape[1] * 2
+    intermediate_size = w1_weight.shape[0]
+    assert tuple(w3_weight.shape) == tuple(w1_weight.shape)
+    assert tuple(w2_weight.shape) == (hidden_size, intermediate_size // 2)
+
+    packed = _deepseek_layout().pack_experts(
+        state,
+        layer=0,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        expert_indices=(0,),
+        num_experts=1,
+    )
+    w1_dense = _mxfp4_checkpoint_weight_dense_dequant(
+        w1_weight,
+        state[w1_scale_name],
+        weight_name=w1_weight_name,
+        scale_name=w1_scale_name,
+    )
+    w2_dense = _mxfp4_checkpoint_weight_dense_dequant(
+        w2_weight,
+        state[w2_scale_name],
+        weight_name=w2_weight_name,
+        scale_name=w2_scale_name,
+    )
+    w3_dense = _mxfp4_checkpoint_weight_dense_dequant(
+        w3_weight,
+        state[w3_scale_name],
+        weight_name=w3_weight_name,
+        scale_name=w3_scale_name,
+    )
+
+    num_tokens = 2
+    alpha = 1.0
+    limit = 0.0
+    hidden_states = torch.linspace(
+        -0.01,
+        0.02,
+        steps=num_tokens * hidden_size,
+        dtype=torch.float32,
+    ).reshape(num_tokens, hidden_size)
+    selected_experts = torch.zeros((num_tokens, 1), dtype=torch.int64)
+    routing_weights = torch.ones((num_tokens, 1), dtype=torch.float32)
+    gate_up_bias = torch.zeros((1, 2 * intermediate_size), dtype=torch.float32)
+    down_bias = torch.zeros((1, hidden_size), dtype=torch.float32)
+
+    actual = torch.ops.auto_deploy.torch_mxfp4_moe_from_routing(
+        hidden_states,
+        selected_experts,
+        routing_weights,
+        packed.gate_up_blocks,
+        gate_up_bias,
+        packed.gate_up_scales,
+        alpha,
+        limit,
+        packed.down_blocks,
+        down_bias,
+        packed.down_scales,
+        "up_gate",
+        "deepseek",
+    )
+    expected = _dense_deepseek_routing_reference(
+        hidden_states,
+        selected_experts,
+        routing_weights,
+        w1_dense.unsqueeze(0),
+        w2_dense.unsqueeze(0),
+        w3_dense.unsqueeze(0),
+        alpha=alpha,
+        limit=limit,
+    )
+
+    assert expected.abs().max() > 0
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-4)
 
 
 def test_torch_mxfp4_moe_from_routing_ep_partitions_deepseek_layout_experts() -> None:

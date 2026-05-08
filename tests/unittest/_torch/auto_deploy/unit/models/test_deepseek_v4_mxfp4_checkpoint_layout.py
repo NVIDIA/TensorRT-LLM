@@ -13,15 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import math
-import os
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 import torch
-from safetensors import safe_open
 
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
     DeepseekV4Config,
@@ -30,11 +28,26 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_deepseek_v4 import (
     DeepseekV4PackedMxfp4ExpertsCheckpointLayout,
     build_deepseek_v4_packed_mxfp4_experts_layout,
 )
+from tensorrt_llm._torch.auto_deploy.models.quant_checkpoint_layout import (
+    QuantizedCheckpointLayoutError,
+)
+from tensorrt_llm._torch.auto_deploy.transform.library.mxfp4_moe import (
+    _load_mxfp4_expert_layout_hook,
+)
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
+    _load_hook as _load_sharding_hook,
+)
+
+_UTILS_DIR = Path(__file__).resolve().parents[4] / "auto_deploy" / "_utils_test"
+sys.path.append(str(_UTILS_DIR))
+from _deepseek_v4_checkpoint_utils import (  # noqa: E402
+    deepseek_v4_flash_checkpoint_or_skip,
+    load_safetensors_tensors_or_skip,
+)
 
 HIDDEN_SIZE = 64
 INTERMEDIATE_SIZE = 32
 LAYER = 3
-_DEEPSEEK_V4_FLASH_ENV_VARS = ("DEEPSEEK_V4_FLASH_MODEL_DIR", "DEEPSEEK_V4_MODEL_DIR")
 _E2M1_VALUES = torch.tensor(
     [
         0.0,
@@ -97,76 +110,6 @@ def _small_deepseek_v4_config(**overrides: object) -> DeepseekV4Config:
 
 def _key(layer: int, expert: int, weight_name: str, tensor_kind: str) -> str:
     return f"layers.{layer}.ffn.experts.{expert}.{weight_name}.{tensor_kind}"
-
-
-def _deepseek_v4_flash_checkpoint_or_skip() -> Path:
-    candidates: list[Path] = []
-    for env_var in _DEEPSEEK_V4_FLASH_ENV_VARS:
-        value = os.environ.get(env_var)
-        if value:
-            candidate = Path(value)
-            candidates.append(candidate)
-            candidates.append(candidate / "DeepSeek-V4-Flash")
-
-    models_root = os.environ.get("LLM_MODELS_ROOT")
-    if models_root:
-        root = Path(models_root)
-        candidates.extend(
-            (
-                root / "DeepSeek-V4-Flash",
-                root / "DeepSeek-V4" / "DeepSeek-V4-Flash",
-                root / "deepseek-ai" / "DeepSeek-V4-Flash",
-                root / "deepseek-ai__DeepSeek-V4-Flash",
-            )
-        )
-
-    seen: set[Path] = set()
-    for candidate in candidates:
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        if (candidate / "model.safetensors.index.json").is_file():
-            return candidate
-
-    pytest.skip(
-        "DeepSeek-V4-Flash checkpoint not found; set DEEPSEEK_V4_FLASH_MODEL_DIR, "
-        "DEEPSEEK_V4_MODEL_DIR, or LLM_MODELS_ROOT to enable this MXFP4 layout check."
-    )
-
-
-def _load_real_checkpoint_layer0_expert0_mxfp4_state(
-    checkpoint_dir: Path,
-) -> dict[str, torch.Tensor]:
-    layer = 0
-    expert = 0
-    tensor_names = [
-        _key(layer, expert, projection, tensor_kind)
-        for projection in ("w1", "w2", "w3")
-        for tensor_kind in ("weight", "scale")
-    ]
-    index_path = checkpoint_dir / "model.safetensors.index.json"
-    with index_path.open(encoding="utf-8") as index_file:
-        index = json.load(index_file)
-    weight_map = index.get("weight_map")
-    if not isinstance(weight_map, dict):
-        pytest.skip(f"DeepSeek-V4-Flash checkpoint index is missing weight_map: {index_path}")
-
-    shard_to_tensor_names: dict[str, list[str]] = {}
-    for tensor_name in tensor_names:
-        shard_name = weight_map.get(tensor_name)
-        if not isinstance(shard_name, str):
-            pytest.skip(f"DeepSeek-V4-Flash checkpoint is missing tensor {tensor_name}")
-        shard_to_tensor_names.setdefault(shard_name, []).append(tensor_name)
-
-    state: dict[str, torch.Tensor] = {}
-    for shard_name, shard_tensor_names in shard_to_tensor_names.items():
-        shard_path = checkpoint_dir / shard_name
-        if not shard_path.is_file():
-            pytest.skip(f"DeepSeek-V4-Flash checkpoint is missing shard {shard_path}")
-        with safe_open(shard_path, framework="pt", device="cpu") as shard:
-            for tensor_name in shard_tensor_names:
-                state[tensor_name] = shard.get_tensor(tensor_name)
-    return state
 
 
 def _raw_bytes(shape: Sequence[int], offset: int) -> torch.Tensor:
@@ -376,6 +319,24 @@ def test_layout_stacks_blocks_and_scales_in_runtime_order_and_preserves_raw_nibb
         assert torch.equal(got_w3_nibbles, expected_w3_nibbles)
 
 
+def test_pack_experts_does_not_mutate_source_state_dict() -> None:
+    state = _state_dict(experts=(0, 1))
+    original_keys = set(state)
+    original_tensors = {name: tensor.clone() for name, tensor in state.items()}
+
+    _layout().pack_experts(
+        state,
+        layer=LAYER,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE,
+        num_experts=2,
+    )
+
+    assert set(state) == original_keys
+    for name, expected in original_tensors.items():
+        assert torch.equal(state[name], expected)
+
+
 def test_layout_preserves_float8_e8m0_scale_raw_bytes_when_dtype_exists() -> None:
     e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
     if e8m0_dtype is None:
@@ -399,8 +360,13 @@ def test_layout_preserves_float8_e8m0_scale_raw_bytes_when_dtype_exists() -> Non
 
 
 def test_deepseek_v4_flash_real_checkpoint_layer0_expert0_mxfp4_layout() -> None:
-    checkpoint_dir = _deepseek_v4_flash_checkpoint_or_skip()
-    state = _load_real_checkpoint_layer0_expert0_mxfp4_state(checkpoint_dir)
+    tensor_names = tuple(
+        _key(0, 0, projection, tensor_kind)
+        for projection in ("w1", "w2", "w3")
+        for tensor_kind in ("weight", "scale")
+    )
+    checkpoint_dir = deepseek_v4_flash_checkpoint_or_skip()
+    state = load_safetensors_tensors_or_skip(checkpoint_dir, tensor_names)
     hidden_size = 4096
     intermediate_size = 2048
     expert = 0
@@ -607,7 +573,7 @@ def test_validate_checkpoint_metadata_rejects_unaligned_logical_hidden_size() ->
         _layout().validate_checkpoint_metadata(metadata)
 
 
-def test_load_runtime_buffers_removes_consumed_source_keys_and_keeps_unrelated_keys() -> None:
+def test_load_hook_materializes_runtime_buffers_and_removes_consumed_source_keys() -> None:
     layout = _layout()
     source_state = _state_dict(experts=(0, 1))
     expected = layout.pack_experts(
@@ -627,17 +593,20 @@ def test_load_runtime_buffers_removes_consumed_source_keys_and_keeps_unrelated_k
     }
     unrelated_keys = set(state) - consumed_keys
 
-    layout.load_runtime_buffers(
+    _load_mxfp4_expert_layout_hook(
         state,
         prefix,
+        checkpoint_layout=layout,
+        target_names={
+            "gate_up_blocks": "layers.3.ffn.experts.gate_up_proj_blocks",
+            "gate_up_scales": "layers.3.ffn.experts.gate_up_proj_scales",
+            "down_blocks": "layers.3.ffn.experts.down_proj_blocks",
+            "down_scales": "layers.3.ffn.experts.down_proj_scales",
+        },
         layer=LAYER,
+        num_experts=2,
         hidden_size=HIDDEN_SIZE,
         intermediate_size=INTERMEDIATE_SIZE,
-        target_gate_up_blocks="layers.3.ffn.experts.gate_up_proj_blocks",
-        target_gate_up_scales="layers.3.ffn.experts.gate_up_proj_scales",
-        target_down_blocks="layers.3.ffn.experts.down_proj_blocks",
-        target_down_scales="layers.3.ffn.experts.down_proj_scales",
-        num_experts=2,
     )
 
     assert consumed_keys.isdisjoint(state)
@@ -658,6 +627,91 @@ def test_load_runtime_buffers_removes_consumed_source_keys_and_keeps_unrelated_k
         state[prefix + "layers.3.ffn.experts.down_proj_scales"],
         expected.down_scales,
     )
+
+
+def test_mxfp4_layout_root_hook_composes_with_expert_sharding_load_hook() -> None:
+    layout = _layout()
+    source_state = _state_dict(experts=(0, 1, 2, 3))
+    expected = layout.pack_experts(
+        source_state,
+        layer=LAYER,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE,
+        num_experts=4,
+    )
+    state = dict(source_state)
+    consumed_keys = {
+        _key(LAYER, expert, projection, tensor_kind)
+        for expert in (0, 1, 2, 3)
+        for projection in ("w1", "w2", "w3")
+        for tensor_kind in ("weight", "scale")
+    }
+    lo, hi = 1, 3
+    experts_prefix = "layers.3.ffn.experts."
+    target_names = {
+        "gate_up_blocks": experts_prefix + "gate_up_proj_blocks",
+        "gate_up_scales": experts_prefix + "gate_up_proj_scales",
+        "down_blocks": experts_prefix + "down_proj_blocks",
+        "down_scales": experts_prefix + "down_proj_scales",
+    }
+
+    _load_mxfp4_expert_layout_hook(
+        state,
+        "",
+        checkpoint_layout=layout,
+        target_names=target_names,
+        layer=LAYER,
+        num_experts=4,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE,
+    )
+    for param_key, full_buffer in (
+        ("gate_up_proj_blocks", expected.gate_up_blocks),
+        ("gate_up_proj_scales", expected.gate_up_scales),
+        ("down_proj_blocks", expected.down_blocks),
+        ("down_proj_scales", expected.down_scales),
+    ):
+        _load_sharding_hook(
+            state,
+            experts_prefix,
+            f_split=lambda tensor: tensor[lo:hi],
+            param_key=param_key,
+            param_shape=full_buffer[lo:hi].shape,
+        )
+
+    assert consumed_keys.isdisjoint(state)
+    assert torch.equal(state[target_names["gate_up_blocks"]], expected.gate_up_blocks[lo:hi])
+    assert torch.equal(state[target_names["gate_up_scales"]], expected.gate_up_scales[lo:hi])
+    assert torch.equal(state[target_names["down_blocks"]], expected.down_blocks[lo:hi])
+    assert torch.equal(state[target_names["down_scales"]], expected.down_scales[lo:hi])
+
+
+def test_load_hook_skips_unmatched_streamed_shard() -> None:
+    layout = _layout()
+    prefix = "root."
+    state = {
+        prefix + name: tensor
+        for name, tensor in _state_dict(experts=(0, 1), layer=LAYER + 1).items()
+    }
+    original_keys = set(state)
+
+    _load_mxfp4_expert_layout_hook(
+        state,
+        prefix,
+        checkpoint_layout=layout,
+        target_names={
+            "gate_up_blocks": "layers.3.ffn.experts.gate_up_proj_blocks",
+            "gate_up_scales": "layers.3.ffn.experts.gate_up_proj_scales",
+            "down_blocks": "layers.3.ffn.experts.down_proj_blocks",
+            "down_scales": "layers.3.ffn.experts.down_proj_scales",
+        },
+        layer=LAYER,
+        num_experts=2,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE,
+    )
+
+    assert set(state) == original_keys
 
 
 def test_layout_rejects_duplicate_explicit_expert_indices() -> None:
@@ -728,6 +782,37 @@ def test_deepseek_v4_load_state_dict_accepts_packed_mxfp4_runtime_buffers() -> N
     assert torch.equal(moe.experts.down_proj_scales, expected.down_scales)
 
 
+def test_deepseek_v4_load_state_dict_skips_unmatched_mxfp4_checkpoint_fragment() -> None:
+    layer = 1
+    source_state = {
+        name: tensor
+        for name, tensor in _state_dict(experts=(0, 1), layer=layer).items()
+        if f"layers.{layer}.ffn.experts." in name and ".w4." not in name
+    }
+    checkpoint_state = {f"model.{name}": tensor for name, tensor in source_state.items()}
+    model = DeepseekV4ForCausalLM(_small_deepseek_v4_config()).eval()
+
+    incompatible = model.load_state_dict(checkpoint_state, strict=False)
+
+    assert set(incompatible.unexpected_keys) == set(source_state)
+
+
+def test_deepseek_v4_load_state_dict_rejects_incomplete_same_layer_mxfp4_fragment() -> None:
+    layer = 0
+    source_state = {
+        name: tensor
+        for name, tensor in _state_dict(experts=(0, 1), layer=layer).items()
+        if f"layers.{layer}.ffn.experts." in name and ".w4." not in name
+    }
+    missing_key = _key(layer, 1, "w3", "scale")
+    source_state.pop(missing_key)
+    checkpoint_state = {f"model.{name}": tensor for name, tensor in source_state.items()}
+    model = DeepseekV4ForCausalLM(_small_deepseek_v4_config()).eval()
+
+    with pytest.raises(QuantizedCheckpointLayoutError, match=missing_key):
+        model.load_state_dict(checkpoint_state, strict=False)
+
+
 def test_deepseek_v4_mxfp4_runtime_buffers_are_shape_complete_for_export() -> None:
     config = _small_deepseek_v4_config()
     moe = DeepseekV4MoE(config, layer_idx=0).eval()
@@ -756,9 +841,7 @@ def test_deepseek_v4_mxfp4_runtime_buffers_are_shape_complete_for_export() -> No
     )
 
 
-def test_deepseek_v4_remap_hook_loads_packed_mxfp4_runtime_buffers_under_non_iterable_layers() -> (
-    None
-):
+def test_deepseek_v4_moe_local_hook_loads_packed_mxfp4_buffers_with_module_prefix() -> None:
     layer = 0
     source_state = {
         name: tensor
@@ -772,34 +855,46 @@ def test_deepseek_v4_remap_hook_loads_packed_mxfp4_runtime_buffers_under_non_ite
         intermediate_size=INTERMEDIATE_SIZE,
         num_experts=2,
     )
-    checkpoint_state = {f"model.{name}": tensor for name, tensor in source_state.items()}
+    checkpoint_state = dict(source_state)
     config = _small_deepseek_v4_config()
     moe = DeepseekV4MoE(config, layer_idx=layer).eval()
     container = torch.nn.Module()
-    container.layers = torch.nn.Module()
-    container.layers.block = torch.nn.Module()
-    container.layers.block.ffn = moe
+    container.layers = torch.nn.ModuleList([torch.nn.Module()])
+    container.layers[0].ffn = moe
 
-    DeepseekV4ForCausalLM._remap_load_state_hook(container, checkpoint_state, "")
+    incompatible = container.load_state_dict(checkpoint_state, strict=False)
 
+    assert incompatible.unexpected_keys == []
+    assert torch.equal(moe.experts.gate_up_proj_blocks, expected.gate_up_blocks)
+    assert torch.equal(moe.experts.gate_up_proj_scales, expected.gate_up_scales)
+    assert torch.equal(moe.experts.down_proj_blocks, expected.down_blocks)
+    assert torch.equal(moe.experts.down_proj_scales, expected.down_scales)
+
+
+def test_deepseek_v4_moe_local_hook_skips_unmatched_mxfp4_checkpoint_fragment() -> None:
+    layer = 0
+    source_state = {
+        name: tensor
+        for name, tensor in _state_dict(experts=(0, 1), layer=layer).items()
+        if f"layers.{layer}.ffn.experts." in name and name.endswith(".scale")
+    }
+    checkpoint_state = dict(source_state)
+    moe = DeepseekV4MoE(_small_deepseek_v4_config(), layer_idx=1).eval()
+    container = torch.nn.Module()
+    container.layers = torch.nn.ModuleList([torch.nn.Module()])
+    container.layers[0].ffn = moe
+
+    incompatible = container.load_state_dict(checkpoint_state, strict=False)
+
+    assert set(incompatible.unexpected_keys) == set(source_state)
     assert torch.equal(
-        checkpoint_state["layers.0.ffn.experts.gate_up_proj_blocks"],
-        expected.gate_up_blocks,
+        moe.experts.gate_up_proj_blocks,
+        torch.zeros_like(moe.experts.gate_up_proj_blocks),
     )
     assert torch.equal(
-        checkpoint_state["layers.0.ffn.experts.gate_up_proj_scales"],
-        expected.gate_up_scales,
+        moe.experts.down_proj_blocks,
+        torch.zeros_like(moe.experts.down_proj_blocks),
     )
-    assert torch.equal(
-        checkpoint_state["layers.0.ffn.experts.down_proj_blocks"],
-        expected.down_blocks,
-    )
-    assert torch.equal(
-        checkpoint_state["layers.0.ffn.experts.down_proj_scales"],
-        expected.down_scales,
-    )
-    assert moe.experts.gate_up_proj_blocks.shape == expected.gate_up_blocks.shape
-    assert moe.experts.down_proj_blocks.shape == expected.down_blocks.shape
 
 
 def test_deepseek_v4_moe_forward_uses_routing_driven_packed_mxfp4_experts() -> None:

@@ -37,6 +37,17 @@ class QuantizedCheckpointLayoutError(ValueError):
 
 
 @runtime_checkable
+class PackedMXFP4ExpertTensors(Protocol):
+    """Packed MXFP4 expert tensors materialized from checkpoint tensors."""
+
+    gate_up_blocks: torch.Tensor
+    gate_up_scales: torch.Tensor
+    down_blocks: torch.Tensor
+    down_scales: torch.Tensor
+    expert_indices: Sequence[int]
+
+
+@runtime_checkable
 class PackedMXFP4ExpertCheckpointLayout(Protocol):
     """Consumer contract for packed MXFP4 expert tensors in checkpoint layouts."""
 
@@ -46,22 +57,27 @@ class PackedMXFP4ExpertCheckpointLayout(Protocol):
         """Return the checkpoint layer index encoded in a runtime buffer name, if present."""
         ...
 
-    def load_runtime_buffers(
+    def has_layer_expert_tensors(self, state_dict: Mapping[str, torch.Tensor], layer: int) -> bool:
+        """Return whether a state-dict fragment contains source tensors for a layer."""
+        ...
+
+    def pack_experts(
         self,
-        state_dict: dict[str, torch.Tensor],
-        prefix: str,
+        state_dict: Mapping[str, torch.Tensor],
         *,
         layer: int,
         hidden_size: int,
         intermediate_size: int,
-        target_gate_up_blocks: str,
-        target_gate_up_scales: str,
-        target_down_blocks: str,
-        target_down_scales: str,
         expert_indices: Sequence[int] | None = None,
         num_experts: int | None = None,
-    ) -> None:
-        """Pack checkpoint tensors into runtime MXFP4 expert buffers."""
+    ) -> PackedMXFP4ExpertTensors:
+        """Pack checkpoint tensors into runtime MXFP4 expert tensors."""
+        ...
+
+    def source_keys_for_packed_experts(
+        self, layer: int, expert_indices: Sequence[int]
+    ) -> Sequence[str]:
+        """Return checkpoint source keys consumed when packing experts."""
         ...
 
 
