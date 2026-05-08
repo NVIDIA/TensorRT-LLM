@@ -12,16 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Tuple
+from typing import Literal, Tuple, Type
 
 import torch
 import torch.nn as nn
+from pydantic import Field
 from torch.fx import GraphModule, Node
 
 from ...utils.module import get_submodule_of_param
 from ...utils.node_utils import is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
-from ..interface import BaseTransform, TransformInfo, TransformRegistry
+from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
 
 
 def _moe_dense_mlp_pattern(
@@ -385,28 +386,51 @@ def _delete_module_attr(module: nn.Module, name: str) -> None:
         delattr(module, name)
 
 
+class QuantizeMXFP4MoETrtllmGenConfig(TransformConfig):
+    """Configuration for ``quantize_mxfp4_moe_trtllm_gen``."""
+
+    quant_act: Literal["bf16", "mxfp8"] = Field(
+        default="bf16",
+        description=(
+            "Activation precision for the trtllm-gen MoE GEMM. ``bf16`` (default) "
+            "dispatches to ``trtllm_mxfp4_w4a16_moe_fused`` (bf16 input, "
+            "``bmm_Bfloat16_MxE2m1Bfloat16`` cubin family). ``mxfp8`` pre-quantizes "
+            "the activation via ``torch.ops.trtllm.mxfp8_quantize`` and dispatches "
+            "to ``trtllm_mxfp4_w4a8_moe_fused`` (MXFP8 input, "
+            "``bmm_MxE4m3_MxE2m1MxE4m3`` cubin family — matches PT's "
+            "``W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod`` path)."
+        ),
+    )
+
+
 @TransformRegistry.register("quantize_mxfp4_moe_trtllm_gen")
 class QuantizeMXFP4MoETrtllmGen(BaseTransform):
-    """Replace ``triton_mxfp4_moe`` with the trtllm-gen ``w4a16_mxfp4`` op.
+    """Replace ``triton_mxfp4_moe`` with the trtllm-gen MXFP4-weight MoE op.
 
-    Mirrors the ``W4A16MXFP4TRTLLMGenFusedMoEMethod`` path PT uses for
-    gpt-oss-120b on B200 by default. Requires that ``quantize_mxfp4_moe``
-    has already run (so the MXFP4 ``_blocks``/``_scales``/``_bias`` params
-    exist) and that weights have been loaded.
+    Mirrors PT's TRTLLMGen MoE path for gpt-oss-120b on B200: ``W4A16``
+    by default (bf16 activation); set ``quant_act: mxfp8`` to switch to
+    ``W4A8MXFP4MXFP8`` (MXFP8 activation) for the faster cubin family.
+    Requires that ``quantize_mxfp4_moe`` has already run (so the MXFP4
+    ``_blocks``/``_scales``/``_bias`` params exist) and that weights
+    have been loaded.
 
     TP-MoE (V6, Step 5 of MOE_TRTLLM_GEN_PLAN.md): when the runtime
     ``shared_config.dist_config`` reports ``moe_tp_size > 1``, the prep
     helper is invoked with ``tp_size`` / ``tp_rank`` so the per-rank
-    ``trtllm_mxfp4_w4a16_moe_fused`` op holds only its ``I/tp`` slice of
-    the intermediate dim, and an ``auto_deploy.all_reduce`` placeholder
-    is inserted after the call so post-MoE partial outputs sum across
-    ranks before the residual add.  EP and ``moe_ep_size > 1`` are
-    handled by the legacy ``StackedMoEShardableNode`` on the upstream
-    ``triton_mxfp4_moe`` (so the rewrite path here always sees the
-    non-EP variant).
+    op holds only its ``I/tp`` slice of the intermediate dim, and an
+    ``auto_deploy.all_reduce`` placeholder is inserted after the
+    downstream ``aten.view`` so post-MoE partial outputs sum across
+    ranks and ``fuse_allreduce_residual_rmsnorm`` collapses the AR +
+    add + norm into one fused kernel (see §5.1 O1 / §3.10 of the
+    cc_reports gpt-oss-120b report).
     """
 
     algo_name: str = "mxfp4"
+    config: QuantizeMXFP4MoETrtllmGenConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return QuantizeMXFP4MoETrtllmGenConfig
 
     def _apply(
         self,
@@ -549,8 +573,14 @@ class QuantizeMXFP4MoETrtllmGen(BaseTransform):
                 sl_node = gm.graph.create_node("get_attr", sl_path)
             (fc1_w_n, fc2_w_n, fc1_s_n, fc2_s_n, fc1_b_n, fc2_b_n) = attr_nodes
 
-            # Rewrite the op call.
-            n.target = torch.ops.auto_deploy.trtllm_mxfp4_w4a16_moe_fused.default
+            # Rewrite the op call. Op target is selected by self.config.quant_act:
+            #   - "bf16"  -> trtllm_mxfp4_w4a16_moe_fused (bf16 input act)
+            #   - "mxfp8" -> trtllm_mxfp4_w4a8_moe_fused  (MXFP8 input act)
+            # Both ops accept identical args; only the runtime kernel differs.
+            if self.config.quant_act == "mxfp8":
+                n.target = torch.ops.auto_deploy.trtllm_mxfp4_w4a8_moe_fused.default
+            else:
+                n.target = torch.ops.auto_deploy.trtllm_mxfp4_w4a16_moe_fused.default
             n.kwargs = {}
             n.args = (
                 hidden_node,

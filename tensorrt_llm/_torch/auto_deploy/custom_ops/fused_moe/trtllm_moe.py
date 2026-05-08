@@ -1474,3 +1474,156 @@ def trtllm_mxfp4_w4a16_moe_fused_fake(
     out_shape = list(x.shape)
     out_shape[-1] = valid_hidden_size
     return x.new_empty(out_shape, dtype=x.dtype)
+
+
+# =============================================================================
+# w4a8_mxfp4_mxfp8 — MXFP4 weights x MXFP8 activations on TRT-LLM-Gen
+# =============================================================================
+#
+# Mirror of the W4A16 op above, but with the activation pre-quantized to
+# MXFP8 (E4M3 + per-block UE8M0 scales) before the MoE GEMM. This is the
+# path PT exercises for gpt-oss-120b on B200 via
+# ``W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod``
+# (`tensorrt_llm/_torch/modules/fused_moe/fused_moe_trtllm_gen.py:511`):
+#   x_mxfp8, x_scale = torch.ops.trtllm.mxfp8_quantize(x, False, alignment=512)
+#   torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(...)
+# The C++ runner ``MxE4m3MxE2m1BlockScaleMoERunner(act_type, isMxFp8=true)``
+# selects the ``bmm_MxE4m3_MxE2m1MxE4m3..._t128x8x512u2..swiGlu`` cubin
+# family (median 9.1 µs/call vs 27 µs for the bf16 variant) and unlocks
+# bigger TileN candidates (up to 256 vs 64 for E4M3 fixed-scale).
+#
+# Weight layout requirements are *identical* to the W4A16 path — the
+# weights ARE the same MXFP4 blocks/scales/bias prepared by
+# ``prepare_mxfp4_weights_for_trtllm_gen``. No checkpoint / weight prep
+# changes needed.
+
+
+@torch.library.custom_op("auto_deploy::trtllm_mxfp4_w4a8_moe_fused", mutates_args=())
+def trtllm_mxfp4_w4a8_moe_fused(
+    x: torch.Tensor,
+    router_weight: torch.Tensor,
+    router_bias: torch.Tensor,
+    top_k: int,
+    fc1_weights_mxfp4: torch.Tensor,
+    fc2_weights_mxfp4: torch.Tensor,
+    fc1_weights_scale_ue8m0: torch.Tensor,
+    fc2_weights_scale_ue8m0: torch.Tensor,
+    fc1_bias_f32: torch.Tensor,
+    fc2_bias_f32: torch.Tensor,
+    swiglu_alpha: torch.Tensor,
+    swiglu_beta: torch.Tensor,
+    swiglu_limit: torch.Tensor,
+    valid_hidden_size: int,
+    valid_intermediate_size: int,
+    local_expert_offset: int = 0,
+    local_num_experts: int = -1,
+    routing_method_type: int = int(RoutingMethodType.Renormalize),
+) -> torch.Tensor:
+    """TensorRT-LLM Gen MoE for MXFP4 weights x MXFP8 activations (w4a8_mxfp4_mxfp8).
+
+    Same op shape as ``trtllm_mxfp4_w4a16_moe_fused`` but pre-quantizes
+    the bf16 activations to MXFP8 (E4M3 + UE8M0 block scales) before the
+    MoE GEMM, dispatching to
+    ``torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner``.
+
+    Weight layout is unchanged from W4A16: the same MXFP4 blocks/scales/bias
+    produced by ``prepare_mxfp4_weights_for_trtllm_gen`` are used as-is.
+
+    Args: same as ``trtllm_mxfp4_w4a16_moe_fused`` — the runtime path
+    differs only in (a) inserting an ``mxfp8_quantize`` call on the
+    padded hidden states, and (b) calling the MXFP8-input MoE runner
+    with the produced ``hidden_states_scale``.
+
+    Returns:
+        BF16 hidden states of shape ``(*x.shape[:-1], valid_hidden_size)``.
+    """
+    x_shape = x.shape
+    x2d = x.view(-1, x_shape[-1])
+
+    # Top-k routing — same numerics as the W4A16 path.
+    router_logits = torch.nn.functional.linear(x2d, router_weight, router_bias)
+    topk_vals, topk_ids = torch.topk(router_logits.to(torch.float32), top_k, dim=-1)
+    topk_weights = torch.nn.functional.softmax(topk_vals, dim=-1)
+
+    # Pad activations to the kernel's expected hidden (H_pad, multiple of 512).
+    expected_hidden = int(fc1_weights_mxfp4.shape[-1] * 2)
+    pad_size = expected_hidden - int(x2d.shape[-1])
+    if pad_size > 0:
+        x2d = torch.nn.functional.pad(x2d, (0, pad_size))
+
+    # Pre-quantize bf16 activation to MXFP8 (E4M3 elem + UE8M0 per-32-elem scale).
+    # Match PT's `W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod.input_hidden_alignment = 512`.
+    # NOTE: keep ``x_scale`` as the 1D buffer that ``mxfp8_quantize`` returns;
+    # the C++ runner asserts ``hidden_states_scale must be 1D``. PT's
+    # ``x_sf = x_sf.view(x_row, -1)`` reshape happens *outside* the runner
+    # call, only for downstream code that needs the per-row layout — but the
+    # runner itself takes 1D.
+    x_mxfp8, x_scale = torch.ops.trtllm.mxfp8_quantize(
+        x2d,
+        False,  # is_sf_swizzled_layout
+        alignment=512,
+    )
+
+    num_experts_total = int(router_weight.shape[0])
+    if local_num_experts < 0:
+        local_num_experts = int(fc1_weights_mxfp4.shape[0])
+    intermediate_size_padded = int(fc1_weights_mxfp4.shape[1] // 2)
+
+    result = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
+        None,  # routing_logits (using pre-computed topk)
+        None,  # routing_bias
+        x_mxfp8,  # hidden_states (E4M3-packed uint8)
+        x_scale,  # hidden_states_scale (UE8M0 per-32-elem block scale)
+        fc1_weights_mxfp4,
+        fc1_weights_scale_ue8m0,
+        fc1_bias_f32,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+        fc2_weights_mxfp4,
+        fc2_weights_scale_ue8m0,
+        fc2_bias_f32,
+        num_experts_total,
+        int(top_k),
+        None,  # n_group
+        None,  # topk_group
+        intermediate_size_padded,
+        valid_hidden_size,
+        valid_intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        None,  # routed_scaling_factor
+        routing_method_type,
+        0,  # act_type = SwiGlu
+        topk_weights=topk_weights.to(torch.bfloat16),
+        topk_ids=topk_ids.to(torch.int32),
+    )
+    if result.shape[-1] > valid_hidden_size:
+        result = result[..., :valid_hidden_size].contiguous()
+    return result.view(*x_shape[:-1], valid_hidden_size)
+
+
+@trtllm_mxfp4_w4a8_moe_fused.register_fake
+def trtllm_mxfp4_w4a8_moe_fused_fake(
+    x: torch.Tensor,
+    router_weight: torch.Tensor,
+    router_bias: torch.Tensor,
+    top_k: int,
+    fc1_weights_mxfp4: torch.Tensor,
+    fc2_weights_mxfp4: torch.Tensor,
+    fc1_weights_scale_ue8m0: torch.Tensor,
+    fc2_weights_scale_ue8m0: torch.Tensor,
+    fc1_bias_f32: torch.Tensor,
+    fc2_bias_f32: torch.Tensor,
+    swiglu_alpha: torch.Tensor,
+    swiglu_beta: torch.Tensor,
+    swiglu_limit: torch.Tensor,
+    valid_hidden_size: int,
+    valid_intermediate_size: int,
+    local_expert_offset: int = 0,
+    local_num_experts: int = -1,
+    routing_method_type: int = int(RoutingMethodType.Renormalize),
+) -> torch.Tensor:
+    out_shape = list(x.shape)
+    out_shape[-1] = valid_hidden_size
+    return x.new_empty(out_shape, dtype=x.dtype)
