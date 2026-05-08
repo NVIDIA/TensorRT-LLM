@@ -681,12 +681,12 @@ class TRTLLMGenFusedMoE(MoE):
             # for cases like deepep low latency where fake top_k=1 might be used
             top_k = token_selected_experts.shape[-1]
 
-        # Ensure x_sf is 2D before flattening
         if x_sf is not None:
             assert len(
                 x_sf.shape
             ) == 2, f"x_sf should be 2D tensor, got shape {x_sf.shape}"
-            x_sf = x_sf.flatten()
+            if not self.use_flashinfer:
+                x_sf = x_sf.flatten()
 
         if not self.has_any_quant:
             result = self.op_backend.run_bf16_moe(

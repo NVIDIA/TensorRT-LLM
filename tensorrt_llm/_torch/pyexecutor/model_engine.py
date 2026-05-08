@@ -869,6 +869,52 @@ class PyTorchModelEngine(ModelEngine):
         with self.no_cuda_graph():
             self._general_warmup_impl(resource_manager, warmup_requests_configs)
 
+    @contextmanager
+    def _maybe_flashinfer_moe_autotune(self):
+        autotune_env = os.environ.get("TRTLLM_FLASHINFER_MOE_AUTOTUNE",
+                                      "0").strip().lower()
+        if autotune_env in ("", "0", "false", "off", "no"):
+            yield
+            return
+        if autotune_env in ("1", "true", "on", "yes", "tune"):
+            tune_mode = True
+        elif autotune_env in ("load", "load_only", "load-only",
+                              "cache_only", "cache-only"):
+            tune_mode = False
+        else:
+            logger.warning(
+                "Ignoring unsupported TRTLLM_FLASHINFER_MOE_AUTOTUNE="
+                f"{autotune_env}. Use 1 to tune or load to use cached "
+                "FlashInfer MoE autotune configs.")
+            yield
+            return
+
+        try:
+            from flashinfer.autotuner import autotune as flashinfer_autotune
+        except ImportError as exc:
+            logger.warning(
+                "TRTLLM_FLASHINFER_MOE_AUTOTUNE was set, but FlashInfer "
+                f"autotune could not be imported: {exc}.")
+            yield
+            return
+
+        cache_path = os.environ.get(
+            "TRTLLM_FLASHINFER_MOE_AUTOTUNE_CACHE_PATH", None)
+        if not tune_mode and cache_path is None:
+            logger.warning(
+                "TRTLLM_FLASHINFER_MOE_AUTOTUNE=load was set without "
+                "TRTLLM_FLASHINFER_MOE_AUTOTUNE_CACHE_PATH. FlashInfer will "
+                "use its fallback tactic for cache misses.")
+
+        cache_msg = f" with cache {cache_path}" if cache_path else ""
+        mode_msg = "tune" if tune_mode else "load cached configs"
+        logger.info("Running warmup with FlashInfer MoE autotune "
+                    f"{mode_msg} mode enabled"
+                    f"{cache_msg}.")
+
+        with flashinfer_autotune(tune_mode, cache=cache_path):
+            yield
+
     def _general_warmup_impl(
             self, resource_manager: ResourceManager,
             warmup_requests_configs: List[Tuple[int, int]]) -> None:
@@ -887,9 +933,10 @@ class PyTorchModelEngine(ModelEngine):
                     logger.info(
                         f"Run warmup with {num_tokens} tokens, include {num_gen_tokens} generation tokens"
                     )
-                    self.forward(batch,
-                                 new_tensors_device=None,
-                                 resource_manager=resource_manager)
+                    with self._maybe_flashinfer_moe_autotune():
+                        self.forward(batch,
+                                     new_tensors_device=None,
+                                     resource_manager=resource_manager)
                     torch.cuda.synchronize()
             except torch.OutOfMemoryError:
                 logger.warning(
@@ -912,7 +959,8 @@ class PyTorchModelEngine(ModelEngine):
             max_num_draft_tokens=self.original_max_draft_len)
 
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
-        with self.no_cuda_graph(), autotune(cache_path=cache_path):
+        with self.no_cuda_graph(), autotune(
+                cache_path=cache_path), self._maybe_flashinfer_moe_autotune():
             warmup_request = self._create_warmup_request(
                 resource_manager, curr_max_num_tokens, 0)
             with self._release_batch_context(warmup_request,
