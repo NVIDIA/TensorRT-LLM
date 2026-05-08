@@ -432,6 +432,8 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
                 f"Attention-DP with EP-only MoE: moe_ep_size={self.world_size}, moe_tp_size=1"
             )
 
+        allreduce_strategy = sharding_config.get("allreduce_strategy", "NCCL")
+
         try:
             dc = DistConfig.from_sharding_params(
                 rank=rank,

@@ -197,6 +197,18 @@ class DistBackend(Enum):
     TORCH = "torch"
 
 
+class AllGatherStrategy(Enum):
+    """Enum for AllGather strategy.
+
+    AUTO: Use NCCL AllGather (default).
+    SYMM_MEM: Use PyTorch symmetric memory with MULTIMEM hardware instructions.
+              Falls back to NCCL for unsupported cases (variable sizes, dim!=0, large tensors).
+    """
+
+    AUTO = "AUTO"
+    SYMM_MEM = "SYMM_MEM"
+
+
 class MLPType(Enum):
     """Enum for MLP type."""
 
@@ -249,6 +261,13 @@ class ShardingTransformConfig(TransformConfig):
         description="AllReduce strategy for distributed operations. "
         "Options: AUTO (automatic selection), NCCL, ONESHOT, TWOSHOT, MIN_LATENCY, "
         "LOWPRECISION, UB, MNNVL, NCCL_SYMMETRIC",
+    )
+
+    allgather_strategy: AllGatherStrategy = Field(
+        default=AllGatherStrategy.AUTO,
+        description="AllGather strategy for distributed operations. "
+        "Options: AUTO (NCCL AllGather), SYMM_MEM (symmetric memory with MULTIMEM, "
+        "falls back to NCCL for unsupported cases).",
     )
 
     dist_backend: DistBackend = Field(default=DistBackend.AUTO)
@@ -342,6 +361,22 @@ class ShardingTransformConfig(TransformConfig):
     def _validate_allreduce_strategy(cls, v):
         """Convert string names like 'AUTO' to AllReduceStrategy enum."""
         return validate_allreduce_strategy(v)
+
+    @field_validator("allgather_strategy", mode="before")
+    @classmethod
+    def _validate_allgather_strategy(cls, v):
+        """Convert string names like 'AUTO' or 'SYMM_MEM' to AllGatherStrategy enum."""
+        if isinstance(v, AllGatherStrategy):
+            return v
+        if isinstance(v, str):
+            try:
+                return AllGatherStrategy(v.upper())
+            except (ValueError, KeyError):
+                raise ValueError(
+                    f"Invalid allgather strategy: {v}. "
+                    f"Valid options: {', '.join(s.value for s in AllGatherStrategy)}"
+                )
+        return v
 
 
 class ShardingTransformInfo(BaseModel, ABC):
@@ -894,7 +929,11 @@ class BMMShardingInfo(ShardingTransformInfo):
         handle_tensor(node, lhs_tensor, 0, self.start_idx, self.end_idx)
         handle_tensor(node, rhs_tensor, 1, self.start_idx, self.end_idx)
 
-        # Add all_gather node after BMM to collect results
+        # Add all_gather node after BMM to collect results.
+        # BMM sharding always uses the torch (demollm) backend, which is a
+        # plain torch.distributed all_gather and has no strategy/symm_mem
+        # knobs. Op signature is (tensor, dim=0, sizes=None); `sizes` is
+        # unused on the torch backend (kept only for parity with trtllm).
         with gm.graph.inserting_after(node):
             gather_node = gm.graph.call_function(
                 torch.ops.auto_deploy.torch_dist_all_gather.default,
@@ -1419,44 +1458,25 @@ def validate_allreduce_strategy(v):
 
 
 def _get_dist_ops(backend: str):
-    """Get the appropriate distributed ops based on backend availability.
+    """Get the (all_gather, all_reduce) op pair for *backend*.
 
-    Args:
-        backend: The distributed backend to use. Can be 'auto', 'trtllm', or 'torch'.
-                 'auto' will automatically select based on availability.
-
-    Returns tuple of (all_gather_op, all_reduce_op) for the current backend.
+    backend may be 'auto', 'trtllm', or 'torch'. 'auto' resolves to TRT-LLM
+    ops when available, else PyTorch distributed ops. Strategies (allgather
+    SYMM_MEM, allreduce NCCL/etc.) are passed as op arguments at the call
+    site, not selected here.
     """
-    # Handle DistBackend enum or string
     if hasattr(backend, "value"):
         backend = backend.value
 
-    if backend == "trtllm":
-        # Force TRT-LLM ops
+    if backend == "trtllm" or is_trtllm_op_available():
         return (
             torch.ops.auto_deploy.trtllm_dist_all_gather.default,
             torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
         )
-    elif backend == "torch":
-        # Force PyTorch distributed ops
-        return (
-            torch.ops.auto_deploy.torch_dist_all_gather.default,
-            torch.ops.auto_deploy.torch_dist_all_reduce.default,
-        )
-    else:  # auto
-        # Automatically select based on availability
-        if is_trtllm_op_available():
-            # Use TRT-LLM optimized ops in MPI mode
-            return (
-                torch.ops.auto_deploy.trtllm_dist_all_gather.default,
-                torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
-            )
-        else:
-            # Use PyTorch distributed ops in demollm mode
-            return (
-                torch.ops.auto_deploy.torch_dist_all_gather.default,
-                torch.ops.auto_deploy.torch_dist_all_reduce.default,
-            )
+    return (
+        torch.ops.auto_deploy.torch_dist_all_gather.default,
+        torch.ops.auto_deploy.torch_dist_all_reduce.default,
+    )
 
 
 def _validate_sharded_shapes(
@@ -1534,6 +1554,10 @@ TP_SHARDING_RULES = [
     ),
     (
         lambda n: is_op(n, torch.ops.auto_deploy.trtllm_finegrained_fp8_linear),
+        FineGrainedFP8WeightShardingInfo,
+    ),
+    (
+        lambda n: is_op(n, torch.ops.auto_deploy.trtllm_fp8_deepgemm),
         FineGrainedFP8WeightShardingInfo,
     ),
 ]
@@ -1785,10 +1809,20 @@ def _shard_parameter_node(
     if not add_dist:
         return
 
-    # figure out the right dist op (backend-aware)
+    # figure out the right dist op (backend-aware) — strategies flow as op args
     all_gather_op, all_reduce_op = _get_dist_ops(config.dist_backend)
+    # Per-backend allgather op signatures:
+    #   trtllm_dist_all_gather(tensor, strategy, dim=0, sizes=None, workspace_id=0)
+    #   torch_dist_all_gather(tensor, dim=0, sizes=None)   # demollm only, no strategy
+    # `strategy` is required on the trtllm op (no default) so the caller cannot
+    # accidentally drop the AD-config-selected strategy. The torch op is a plain
+    # torch.distributed all_gather and intentionally has no strategy/symm_mem.
+    if all_gather_op is torch.ops.auto_deploy.trtllm_dist_all_gather.default:
+        allgather_args = (config.allgather_strategy.name, -1, None)
+    else:
+        allgather_args = (-1,)
     dist_lookup = {
-        0: (all_gather_op, -1),
+        0: (all_gather_op, *allgather_args),
         1: (all_reduce_op, allreduce_strategy),
     }
     fn_dist, *dist_args = dist_lookup[dim]

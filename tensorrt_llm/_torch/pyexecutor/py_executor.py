@@ -1350,7 +1350,88 @@ class PyExecutor:
     def _append_iter_stats(self,
                            stats: IterationStats,
                            req_stats: Optional[List[RequestStats]] = None):
+        """Append one iteration's stats to the export buffer.
 
+        Under attention-DP with ``tp_size > 1`` each rank has diverging
+        scheduler/KV-cache state. When the environment variable
+        ``TLLM_METRICS_ALL_RANKS=1`` is set, this method collectively
+        gathers every rank's :class:`IterationStats` (+ optional per-request
+        stats and KV iteration stats) via :meth:`tp_allgather` and rank 0
+        stores one pre-serialized JSON dict per rank (tagged with
+        ``"rank"``) in ``self.stats`` so ``/metrics`` can export stats from
+        every rank. Non-leader ranks drop the gathered result.
+
+        The env var defaults to off so upstream behavior (rank-0-only
+        export) is preserved unless users explicitly opt in. Under pure TP
+        (no attention-DP) every rank runs the same requests on the same
+        iteration, so the gather would be redundant and only adds a CPU-GPU
+        sync on the hot path — we fall through to the legacy rank-0-only
+        append in that case regardless of the env var.
+
+        Args:
+            stats: Iteration-level stats from the local rank.
+            req_stats: Optional per-request stats from the local rank.
+        """
+
+        tp_size = getattr(self.dist, "tp_size", 1)
+        gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
+        if (gather_all_ranks and self.enable_iter_perf_stats and tp_size > 1
+                and self.enable_attention_dp):
+            import json as _json
+            local_dict = _json.loads(stats.to_json_str())
+            if req_stats:
+                local_dict["requestStats"] = [
+                    _json.loads(r.to_json_str()) for r in req_stats
+                ]
+            if self._latest_kv_iter_stats is not None:
+                local_dict["kvCacheIterationStats"] = {
+                    str(window_size): {
+                        "primaryMaxNumBlocks": s.primary_max_num_blocks,
+                        "primaryFreeNumBlocks": s.primary_free_num_blocks,
+                        "primaryUsedNumBlocks": s.primary_used_num_blocks,
+                        "secondaryMaxNumBlocks": s.secondary_max_num_blocks,
+                        "secondaryFreeNumBlocks": s.secondary_free_num_blocks,
+                        "secondaryUsedNumBlocks": s.secondary_used_num_blocks,
+                        "iterAllocTotalBlocks": s.iter_alloc_total_blocks,
+                        "iterAllocNewBlocks": s.iter_alloc_new_blocks,
+                        "iterReusedBlocks": s.iter_reused_blocks,
+                        "iterFullReusedBlocks": s.iter_full_reused_blocks,
+                        "iterPartialReusedBlocks": s.iter_partial_reused_blocks,
+                        "iterMissedBlocks": s.iter_missed_blocks,
+                        "iterCacheHitRate": s.iter_cache_hit_rate,
+                        "iterGenAllocBlocks": s.iter_gen_alloc_blocks,
+                        "iterOnboardBlocks": s.iter_onboard_blocks,
+                        "iterOnboardBytes": s.iter_onboard_bytes,
+                        "iterOffloadBlocks": s.iter_offload_blocks,
+                        "iterOffloadBytes": s.iter_offload_bytes,
+                        "iterIntraDeviceCopyBlocks":
+                        s.iter_intra_device_copy_blocks,
+                        "iterIntraDeviceCopyBytes":
+                        s.iter_intra_device_copy_bytes,
+                    }
+                    for window_size, s in self._latest_kv_iter_stats.items()
+                }
+            local_dict["rank"] = self.dist.tp_rank
+
+            gathered = self.dist.tp_allgather(local_dict)
+
+            if self.dist.tp_rank == 0:
+                with self.stats_lock:
+                    # Wrap as ("per_rank_dict", dict) so the serializer can
+                    # distinguish from the legacy (stats, req_stats, kv) tuple.
+                    # Trim before appending so every rank's entry for the
+                    # same iteration lands in the buffer atomically; evicting
+                    # during the append loop would let partial iterations
+                    # survive at the head of self.stats.
+                    cap = self.max_stats_len * tp_size
+                    overflow = max(0, len(self.stats) + len(gathered) - cap)
+                    if overflow:
+                        del self.stats[:overflow]
+                    for d in gathered:
+                        self.stats.append(("per_rank_dict", d))
+            return
+
+        # Legacy path: rank-0-only (single-rank or iter stats disabled).
         with self.stats_lock:
             if len(self.stats) > self.max_stats_len:
                 self.stats.pop(0)
