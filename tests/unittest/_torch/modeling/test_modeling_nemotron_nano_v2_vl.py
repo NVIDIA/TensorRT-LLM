@@ -297,6 +297,77 @@ def test_nemotron_nano_v2_vl_image_batch_equivalence(nano_llm_model):
         )
 
 
+@pytest.mark.threadleak(enabled=False)
+def test_nemotron_nano_v2_vl_video_batch_equivalence(nano_llm_model):
+    """End-to-end equivalence check for cross-request video batching.
+
+    Mirror of `test_nemotron_nano_v2_vl_image_batch_equivalence` for
+    video: two distinct video+prompt requests sent (a) together in one
+    `generate` call (engine batches them, vision_encoder sees both
+    multimodal_params at once) and (b) separately in two `generate`
+    calls. With greedy decoding, token IDs must match and logprobs stay
+    within bf16 tolerance.
+
+    Intended to detect cross-video tubelet leakage if a future change
+    batches the temporal-video path across requests inside the vision
+    encoder.
+    """
+    nano_llm = nano_llm_model
+    test_data_root = Path(os.path.join(llm_models_root(), "multimodals", "test_data"))
+    prompts = [
+        "Describe the natural environment in the video.",
+        "Describe the scene in the video briefly.",
+    ]
+    media = [str(test_data_root / "world.mp4"), str(test_data_root / "world.mp4")]
+
+    sampling_params = SamplingParams(
+        max_tokens=16,
+        temperature=0.0,
+        add_special_tokens=False,
+        return_generation_logits=True,
+    )
+
+    def _build_inputs(prompts_subset, media_subset):
+        return default_multimodal_input_loader(
+            tokenizer=nano_llm.tokenizer,
+            model_dir=MODEL_PATH,
+            model_type="NemotronH_Nano_VL_V2",
+            modality="video",
+            prompts=prompts_subset,
+            media=media_subset,
+            image_data_format="pt",
+            num_frames=8,
+            device="cpu",
+        )
+
+    batched_inputs = _build_inputs(prompts, media)
+    batched_outputs = nano_llm.generate(batched_inputs, sampling_params)
+    assert len(batched_outputs) == 2
+
+    sep_outputs = []
+    for p, m in zip(prompts, media):
+        sep_inputs = _build_inputs([p], [m])
+        sep_outputs.append(nano_llm.generate(sep_inputs, sampling_params)[0])
+
+    for i, (b_out, s_out) in enumerate(zip(batched_outputs, sep_outputs)):
+        b_token_ids = list(b_out.outputs[0].token_ids)
+        s_token_ids = list(s_out.outputs[0].token_ids)
+        assert b_token_ids == s_token_ids, (
+            f"Request {i}: token_ids differ between batched and separate runs.\n"
+            f"  batched : {b_token_ids}\n"
+            f"  separate: {s_token_ids}"
+        )
+
+        b_logp = extract_decode_logprobs(b_out).cpu()
+        s_logp = extract_decode_logprobs(s_out).cpu()
+        max_diff = (b_logp - s_logp).abs().max().item()
+        assert max_diff < 0.15, (
+            f"Request {i}: logprob diff too large ({max_diff:.4f}).\n"
+            f"  batched : {b_logp}\n"
+            f"  separate: {s_logp}"
+        )
+
+
 class TestEncodeMultimodalDispatch:
     def _make_mock_model(self):
         """Create a minimal mock with the attributes `_encode_multimodal` needs."""

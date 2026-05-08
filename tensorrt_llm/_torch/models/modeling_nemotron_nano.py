@@ -691,73 +691,34 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
                 num_tokens_in_videos.append(num_tokens_per_frames)
         return mm_embedding_evs, num_tokens_in_videos
 
-    def _extract_video_embeddings_temporal(self, video_data: Dict[str, Any]) -> torch.Tensor:
-        """Extract video embeddings with temporal compression.
-
-        Each video is processed separately through extract_feature with num_frames, which enables
-        the tubelet embedding path in RADIO.
-
-        `pixel_values` may be a single concatenated tensor (all videos share the same frame size)
-        or a list of per-video tensors (mixed aspect ratios).
-        """
-        pixel_values = video_data["pixel_values"]
-        video_size_list = video_data.get("video_size", [])
-        per_video = isinstance(pixel_values, list)
-
-        all_embeds = []
-        frame_offset = 0
-        for idx, video_size in enumerate(video_size_list):
-            num_frames = video_size[0]
-            num_tiles_per_frame = video_size[1]
-            total_tiles = num_frames * num_tiles_per_frame
-            if per_video:
-                video_frames = pixel_values[idx]
-            else:
-                video_frames = pixel_values[frame_offset : frame_offset + total_tiles]
-                frame_offset += total_tiles
-
-            vit_embeds = self.extract_feature(video_frames, num_frames=num_frames)
-            # Flatten to 2D [tokens, hidden] so videos with different spatial
-            # resolutions (different dim-1) can be concatenated.
-            all_embeds.append(vit_embeds.reshape(-1, vit_embeds.shape[-1]))
-
-        # Concatenate all videos' embeddings (2D).
-        return torch.cat(all_embeds, dim=0)
-
     def forward(
         self, multimodal_params: List[MultimodalParams]
     ) -> Tuple[List[torch.Tensor], List[List[int] | None]]:
         # Bucket params by encoder sub-path so each bucket runs in a single
-        # ViT forward. The fixed-tile bucket also covers T==1 videos, since
-        # those use the exact same `extract_feature` call as fixed-tile
-        # images. T>1 videos still run per-request: cross-video tubelet
-        # boundaries and RADIO's mask-free temporal attention make
-        # cross-request batching unsafe.
+        # ViT forward. RADIO's temporal path packs each tubelet as its own
+        # attention sequence, so cross-request video batching is safe as
+        # long as videos within a bucket share frame shape and tubelet
+        # alignment (handled in `_encode_temporal_video_bucket`).
         multimodal_data_list = [p.multimodal_data for p in multimodal_params]
         plan = [self._classify(mm_data) for mm_data in multimodal_data_list]
 
-        dynamic_image_data = [
-            mm_data[mm_data["modality_type"]]
-            for mm_data, kind in zip(multimodal_data_list, plan)
-            if kind == "dynamic_image"
-        ]
-        fixed_tile_data = [
-            mm_data[mm_data["modality_type"]]
-            for mm_data, kind in zip(multimodal_data_list, plan)
-            if kind == "fixed_tile"
-        ]
-        dynamic_image_iter = iter(self._encode_dynamic_image_bucket(dynamic_image_data))
-        fixed_tile_iter = iter(self._encode_fixed_tile_bucket(fixed_tile_data))
+        def _bucket(kind: str) -> List[Dict[str, Any]]:
+            return [
+                mm_data[mm_data["modality_type"]]
+                for mm_data, k in zip(multimodal_data_list, plan)
+                if k == kind
+            ]
 
-        mm_embedding: List[torch.Tensor] = []
-        for kind, mm_data in zip(plan, multimodal_data_list):
-            data = mm_data[mm_data["modality_type"]]
-            if kind == "dynamic_image":
-                mm_embedding.append(next(dynamic_image_iter))
-            elif kind == "fixed_tile":
-                mm_embedding.append(next(fixed_tile_iter))
-            else:  # "video_temporal"
-                mm_embedding.append(self._extract_video_embeddings_temporal(data))
+        dynamic_image_iter = iter(self._encode_dynamic_image_bucket(_bucket("dynamic_image")))
+        fixed_tile_iter = iter(self._encode_fixed_tile_bucket(_bucket("fixed_tile")))
+        video_temporal_iter = iter(self._encode_temporal_video_bucket(_bucket("video_temporal")))
+
+        bucket_iters = {
+            "dynamic_image": dynamic_image_iter,
+            "fixed_tile": fixed_tile_iter,
+            "video_temporal": video_temporal_iter,
+        }
+        mm_embedding = [next(bucket_iters[kind]) for kind in plan]
 
         mm_embedding, num_tokens_in_videos = self.apply_evs(mm_embedding, multimodal_data_list)
         mm_embedding = [m.reshape(-1, self.llm_hidden_size) for m in mm_embedding]
@@ -770,7 +731,7 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
           - ``"dynamic_image"``: variable-size images via ``extract_feature_dynamic``.
           - ``"fixed_tile"``: fixed-tile images and T==1 videos via ``extract_feature``.
           - ``"video_temporal"``: T>1 videos (or videos with mixed-shape
-            per-video pixel lists) via ``_extract_video_embeddings_temporal``.
+            per-video pixel lists) batched through ``_encode_temporal_video_bucket``.
         """
         modality = multimodal_data["modality_type"]
         data = multimodal_data[modality]
@@ -835,6 +796,79 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         patches_per_request = [d["pixel_values"].shape[0] for d in data_list]
         batched_embeds = self.extract_feature(pixel_values)
         return list(torch.split(batched_embeds, patches_per_request, dim=0))
+
+    def _encode_temporal_video_bucket(
+        self, video_data_list: List[Dict[str, Any]]
+    ) -> List[torch.Tensor]:
+        """Encode all temporal video requests, batching same-shape videos in one ViT pass.
+
+        Each video contributes ``t * num_tiles_per_frame`` input tiles. Videos that
+        share ``(frame H, frame W, num_tiles_per_frame, dtype)`` and have an input
+        tile count divisible by ``T`` are concatenated and run through a single
+        ``extract_feature`` call. RADIO packs each tubelet as its own attention
+        sequence, so cross-video tubelets cannot attend to one another. Misaligned
+        videos (``t * p`` not divisible by ``T``) fall back to a per-video call so
+        ``forward_video``'s implicit end-padding stays self-contained.
+
+        Returns one per-request 2-D tensor (in ``video_data_list`` order).
+        Each per-video block has shape ``[num_tubelets * spatial_tokens, hidden]``,
+        matching what ``apply_evs_per_video`` slices and reshapes downstream.
+        """
+        if not video_data_list:
+            return []
+
+        T = self.video_temporal_patch_size
+
+        # Walk all videos across all requests and collect per-video metadata.
+        # `entries[i]` is (request_index, video_index_in_request, frames_tensor, t, p).
+        entries: List[Tuple[int, int, torch.Tensor, int, int]] = []
+        for req_idx, data in enumerate(video_data_list):
+            pixel_values = data["pixel_values"]
+            video_size_list = data.get("video_size", [])
+            per_video = isinstance(pixel_values, list)
+            frame_offset = 0
+            for vid_idx, video_size in enumerate(video_size_list):
+                t = video_size[0]
+                p = video_size[1]
+                total_tiles = t * p
+                if per_video:
+                    frames_tensor = pixel_values[vid_idx]
+                else:
+                    frames_tensor = pixel_values[frame_offset : frame_offset + total_tiles]
+                    frame_offset += total_tiles
+                entries.append((req_idx, vid_idx, frames_tensor, t, p))
+
+        per_video_outputs: List[Optional[torch.Tensor]] = [None] * len(entries)
+
+        # Misaligned videos (`t * p` not divisible by `T`) fall back to a
+        # per-video call so `forward_video`'s end-padding stays inside the
+        # video. The remaining videos are bucketed by frame shape and dtype.
+        aligned_groups: Dict[Tuple, List[int]] = {}
+        for i, (_, _, frames_tensor, t, p) in enumerate(entries):
+            if T > 1 and (t * p) % T != 0:
+                vit_embeds = self.extract_feature(frames_tensor, num_frames=t)
+                per_video_outputs[i] = vit_embeds.reshape(-1, vit_embeds.shape[-1])
+                continue
+            key = (frames_tensor.shape[-2], frames_tensor.shape[-1], p, frames_tensor.dtype)
+            aligned_groups.setdefault(key, []).append(i)
+
+        for idxs in aligned_groups.values():
+            cat_frames = torch.cat([entries[i][2] for i in idxs], dim=0)
+            per_video_tile_counts = [entries[i][2].shape[0] for i in idxs]
+            # `num_frames` is a non-None flag enabling the temporal path; the
+            # actual per-tubelet grouping uses `T` and the cat tensor's shape.
+            vit_embeds = self.extract_feature(cat_frames, num_frames=cat_frames.shape[0])
+            per_video_tubelet_counts = [n // T if T > 1 else n for n in per_video_tile_counts]
+            chunks = torch.split(vit_embeds, per_video_tubelet_counts, dim=0)
+            for i, chunk in zip(idxs, chunks):
+                per_video_outputs[i] = chunk.reshape(-1, chunk.shape[-1])
+
+        # Re-aggregate per request. Videos within each request appear in the
+        # original `vid_idx` order because `entries` was built that way.
+        per_request_outputs: List[List[torch.Tensor]] = [[] for _ in video_data_list]
+        for entry, output in zip(entries, per_video_outputs):
+            per_request_outputs[entry[0]].append(output)
+        return [torch.cat(req_outs, dim=0) for req_outs in per_request_outputs]
 
     def _video_tubelet_geometry(self, t: int, T: int, ih: int, iw: int) -> Tuple[int, int]:
         """Return `(num_tubelets, wh)` for one video.
@@ -1921,7 +1955,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         if len(shapes) == 1:
             all_pixel_values = torch.cat(pixel_values_list, dim=0)
         else:
-            # Store as a list - `_extract_video_embeddings_temporal` handles both.
+            # Store as a list - `_encode_temporal_video_bucket` handles both layouts.
             all_pixel_values = pixel_values_list
         result = {
             "num_patches": torch.tensor(
