@@ -156,6 +156,7 @@ def test_connector_simple(enforce_single_worker, model_with_connector,
 @pytest.mark.parametrize("use_overlap_scheduler", [True, False])
 def test_connector_async_onboard(enforce_single_worker, model_with_connector,
                                  use_overlap_scheduler):
+    pytest.fail("yiqingy test")
     NUM_TOKENS = 8
 
     model_fn, scheduler, worker = model_with_connector
@@ -185,6 +186,7 @@ def test_connector_async_onboard(enforce_single_worker, model_with_connector,
 @pytest.mark.parametrize("use_overlap_scheduler", [True, False])
 def test_connector_async_save(enforce_single_worker, model_with_connector,
                               use_overlap_scheduler):
+    time.sleep(600)
     NUM_TOKENS = 8
 
     model_fn, scheduler, worker = model_with_connector
