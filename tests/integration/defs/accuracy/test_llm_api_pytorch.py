@@ -7321,7 +7321,9 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
                  enable_attention_dp=attention_dp) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
             task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            # TP-sharded path uses fused minimax_allreduce_rms_qk with slightly different numerics.
+            task.evaluate(llm,
+                          extra_acc_spec=None if attention_dp else "tp_attn")
 
 
 @skip_pre_blackwell
