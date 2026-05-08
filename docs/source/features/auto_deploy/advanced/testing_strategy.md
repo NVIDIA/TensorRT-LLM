@@ -142,39 +142,44 @@ The dashboard provides broad model coverage and performance testing for all supp
 
 ### Model Registry
 
-Models are registered in `examples/auto_deploy/model_registry/models.yaml`. For detailed instructions, see the [Model Registry README](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/auto_deploy/model_registry).
+Models are registered in `tensorrt_llm/_torch/auto_deploy/config/model_registry_internal/models.yaml`. User-facing configs (batch sizes, KV cache, etc.) remain in `examples/auto_deploy/model_registry/configs/`. For detailed instructions, see the [Model Registry README](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/auto_deploy/model_registry).
 
 ### Format (Version 2.0)
 
-The registry uses a flat list format with composable configurations:
+The registry uses a flat list format with two layers of composable configs:
 
 ```yaml
 version: '2.0'
-description: AutoDeploy Model Registry - Flat format with composable configs
 models:
 - name: meta-llama/Llama-3.1-8B-Instruct
-  yaml_extra: [dashboard_default.yaml, world_size_2.yaml]
+  config_id: default_ws_2
+  world_size: 2
+  ad_defaults: ['ad_base.yaml']
+  user_configs: ['dashboard_default.yaml']
 
 - name: meta-llama/Llama-3.3-70B-Instruct
-  yaml_extra: [dashboard_default.yaml, world_size_4.yaml, llama3_3_70b.yaml]
+  config_id: llama3_3_70b
+  world_size: 4
+  ad_defaults: ['ad_base.yaml', 'llama3_3_70b_ad.yaml']
+  user_configs: ['dashboard_default.yaml', 'llama3_3_70b.yaml']
 ```
 
 ### Key Concepts
 
 - **Flat list**: Models are in a single list (not grouped)
-- **Composable configs**: Each model references YAML config files via `yaml_extra`
+- **Two config layers**: `ad_defaults` for AD-internal knobs (transforms, backends) and `user_configs` for user-facing knobs (batch sizes, KV cache)
 - **Deep merging**: Config files are merged in order (later files override earlier ones)
+- **world_size**: First-class field in the registry (no longer derived from filenames)
 
 ### Configuration Files
 
-Config files are stored in `examples/auto_deploy/model_registry/configs/`:
+AD-internal configs are in `tensorrt_llm/_torch/auto_deploy/config/model_registry_internal/configs/`.
+User-facing configs are in `examples/auto_deploy/model_registry/configs/`:
 
 | File | Purpose |
 |------|---------|
 | `dashboard_default.yaml` | Baseline settings for all models |
 | `world_size_N.yaml` | GPU count configuration (1, 2, 4, or 8) |
-| `multimodal.yaml` | Vision + text models |
-| `demollm_triton.yaml` | DemoLLM runtime with Triton backend |
 | Model-specific configs | Custom settings for specific models |
 
 ### World Size Guidelines

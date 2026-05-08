@@ -431,10 +431,9 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         ``detect_sharding`` (fallback).  Runtime ``rank`` and ``world_size``
         come from MPI, not from YAML.
 
-        Common parallel fields (``tensor_parallel_size``, ``moe_expert_parallel_size``)
-        are translated to ``world_size`` automatically via
-        ``translate_parallel_fields_to_world_size``. MoE topology can also be
-        configured through YAML ``dist_mapping`` blocks.
+        ``tensor_parallel_size`` is translated to ``world_size`` automatically
+        via ``translate_parallel_fields_to_world_size``. MoE topology can also
+        be configured through YAML ``dist_mapping`` blocks.
         """
         ash = self.transforms.get("apply_sharding_hints", {})
         sharding_config = (

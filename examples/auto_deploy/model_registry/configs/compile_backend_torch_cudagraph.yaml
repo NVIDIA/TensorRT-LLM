@@ -1,2 +1,0 @@
-# AD-specific config — moved to internal registry.
-# See tensorrt_llm/_torch/auto_deploy/config/model_registry_internal/configs/compile_backend_torch_cudagraph_ad.yaml

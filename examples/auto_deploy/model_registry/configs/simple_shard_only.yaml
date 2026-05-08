@@ -1,2 +1,0 @@
-# AD-specific config — moved to internal registry.
-# See tensorrt_llm/_torch/auto_deploy/config/model_registry_internal/configs/simple_shard_only_ad.yaml

@@ -139,7 +139,7 @@ class ExperimentConfig(DynamicYamlMixInForSettings, BaseSettings):
     ### MODEL REGISTRY CONFIG ####################################################################
     use_registry: CliImplicitFlag[bool] = Field(
         default=False,
-        description="Resolve args.yaml_extra from examples/auto_deploy/model_registry/models.yaml for --model.",
+        description="Resolve args.yaml_extra from the AutoDeploy model registry for --model.",
     )
     registry_config_id: Optional[str] = Field(
         default=None,
