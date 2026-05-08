@@ -2601,6 +2601,41 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         runtime.total_embeds_in_request = int(embed_mask_cumsum[-1])
         return context_ids[runtime.past_seen_token_num : runtime.chunk_end_pos]
 
+    @staticmethod
+    def _validate_evs_context_batch(
+        ctx_params: List[MultimodalParams],
+        num_context_requests: int,
+    ) -> None:
+        """Reject EVS video mixed with text-only context requests.
+
+        Args:
+            ctx_params: Multimodal params associated with current context
+                requests. Today this list contains only context requests with
+                multimodal content.
+            num_context_requests: Total number of current context requests in
+                the flattened forward batch, including text-only requests.
+
+        Raises:
+            ValueError: If an EVS video context is batched together with a
+                text-only context request.
+        """
+        has_video = any(
+            param.has_content() and param.multimodal_data.get("modality_type") == "video"
+            for param in ctx_params
+        )
+        has_text_only_context = len(ctx_params) < num_context_requests or any(
+            not param.has_content() for param in ctx_params
+        )
+        if has_video and has_text_only_context:
+            # TODO(TRTLLM-12534): Remove this guard once merge_evs_mm_embeds writes each
+            # multimodal context chunk using its flattened input_ids offset
+            # instead of assuming a contiguous multimodal prefix.
+            raise ValueError(
+                "EVS video requests cannot be inflight-batched with text-only "
+                "context requests yet. merge_evs_mm_embeds currently assumes "
+                "multimodal context chunks form a contiguous input_ids prefix."
+            )
+
     def merge_evs_mm_embeds(
         self,
         num_tokens_in_videos: List[int],
@@ -2859,10 +2894,13 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embedding = []
         if len(multimodal_params) > 0:
+            ctx_params = multimodal_params[:num_context_requests]
+            if self.video_pruning_rate > 0:
+                self._validate_evs_context_batch(ctx_params, num_context_requests)
             if not _is_disagg():
                 mm_embedding = get_multimodal_embeddings(
                     encoder_forward_fn=self._encode_multimodal,
-                    multimodal_params=multimodal_params[:num_context_requests],
+                    multimodal_params=ctx_params,
                 )
             else:
                 raise NotImplementedError(
@@ -2872,7 +2910,6 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             # Adjust input_ids in videos if EVS is applied.
             if self.video_pruning_rate > 0:
                 # Retrieve per-video count stashed by `_encode_multimodal`.
-                ctx_params = multimodal_params[:num_context_requests]
                 num_tokens_in_videos = [
                     param.multimodal_data.get("num_tokens_in_video")
                     for param in ctx_params
@@ -2884,9 +2921,7 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                     input_ids=input_ids,
                 )
 
-            mm_embedding = find_input_mm_embeds(
-                mm_embedding, multimodal_params[:num_context_requests]
-            )
+            mm_embedding = find_input_mm_embeds(mm_embedding, ctx_params)
 
         mm_token_ids_list = [self.img_context_token_id]
         if self.sound_context_token_id is not None:

@@ -859,6 +859,16 @@ def _make_mm_param(modality: str, evs_ids, runtime=None):
 class TestMergeEvsMMEmbeds:
     """Tests for `NemotronH_Nano_VL_V2.merge_evs_mm_embeds`."""
 
+    def test_evs_video_with_text_only_context_raises(self):
+        """Reject batches where text-only context chunks would shift EVS writes."""
+        params = [_make_mm_param("video", torch.tensor([_VIDEO_CTX_ID], dtype=torch.long))]
+
+        with pytest.raises(ValueError, match="text-only context requests"):
+            NemotronH_Nano_VL_V2._validate_evs_context_batch(
+                params,
+                num_context_requests=2,
+            )
+
     def test_single_video_two_tubelets(self):
         """Each video_context_token_id placeholder is replaced with the right count."""
         model = _make_merge_model()
