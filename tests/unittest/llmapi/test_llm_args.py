@@ -381,6 +381,38 @@ def test_SleepConfig_restore_modes_normalized_from_defaultdict():
         ExecutorMemoryType.SAMPLER] == RestoreMode.CPU
 
 
+def test_SleepConfig_is_picklable():
+    """SleepConfig must survive a pickle round-trip.
+
+    MPI worker initialisation serialises llm_args (including SleepConfig) via
+    pickle to distribute configuration to each rank.  The defaultdict inside
+    restore_modes previously used a closure lambda as its default_factory, which
+    is not picklable.  This test catches any regression to that pattern.
+    """
+    import pickle
+
+    # Default construction
+    cfg_default = SleepConfig()
+    rt = pickle.loads(pickle.dumps(cfg_default))
+    assert rt.restore_modes == cfg_default.restore_modes
+    # Verify the default_factory still works after round-trip (i.e. missing
+    # keys return a RestoreMode, not raise KeyError).
+    missing_key = ExecutorMemoryType.SAMPLER
+    assert isinstance(rt.restore_modes[missing_key], RestoreMode)
+
+    # Construction with explicit per-key overrides
+    cfg_custom = SleepConfig(
+        restore_modes={
+            ExecutorMemoryType.KV_CACHE.value: "NONE",
+            ExecutorMemoryType.MODEL_WEIGHTS_MAIN.value: "CPU",
+        })
+    rt_custom = pickle.loads(pickle.dumps(cfg_custom))
+    assert rt_custom.restore_modes[
+        ExecutorMemoryType.KV_CACHE] == RestoreMode.NONE
+    assert rt_custom.restore_modes[
+        ExecutorMemoryType.MODEL_WEIGHTS_MAIN] == RestoreMode.CPU
+
+
 def test_DynamicBatchConfig_declaration():
     config = DynamicBatchConfig(enable_batch_size_tuning=True,
                                 enable_max_num_tokens_tuning=True,
