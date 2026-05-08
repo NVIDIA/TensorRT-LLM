@@ -1,0 +1,35 @@
+runtime: trtllm
+compile_backend: torch-cudagraph
+attn_backend: trtllm
+# For text-only mode, use AutoModelForCausalLM until issue #12699 is resolved
+# Once issue #12699 is resolved, consider to unify the factory to Qwen3_5MoeForConditionGeneration for both VLM and text mode
+# model_factory: Qwen3_5MoeForConditionalGeneration
+model_factory: AutoModelForCausalLM
+transforms:
+  # disable for text only use case (AutoModelForCausalLM does not consume mrope_delta_cache)
+  initialize_mrope_delta_cache:
+    enabled: false
+  export_to_gm:
+    num_moe_experts_for_export: 2
+  fuse_gemms_mixed_children:
+    enabled: true
+  fuse_nvfp4_moe:
+    backend: trtllm_gen
+  detect_sharding:
+    enabled: false
+  sharding_transform_executor:
+    enabled: false
+  apply_sharding_hints:
+    enabled: true
+    allreduce_strategy: SYMM_MEM
+    # Shared expert is excluded from sharding for performance purpose
+    shard_layers: ["moe", "delta", "mha"]
+    simple_shard_filter: "lm_head"
+  multi_stream_moe:
+    stage: compile
+    enabled: true
+  multi_stream_gemm:
+    stage: compile
+    enabled: true
+  gather_logits_before_lm_head:
+    enabled: true
