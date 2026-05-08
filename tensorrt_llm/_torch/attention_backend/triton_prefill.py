@@ -250,6 +250,12 @@ def _fwd_kernel(
             # address fault). Filter at load and at qk merge.
             valid_page = page_ids >= 0
             safe_page_ids = tl.where(valid_page, page_ids, 0)
+            # Promote to int64 before multiplying by stride: with KV pools at
+            # production scale (e.g. shape [N, 2, 8, 32, 256] => stride 131072
+            # elements/page), page_id * stride overflows int32 once page_id
+            # exceeds ~16K and silently wraps to a negative offset, IMA-ing
+            # K_Buffer/V_Buffer.
+            safe_page_ids = safe_page_ids.to(tl.int64)
             final_mask &= valid_page[None, :]
 
             # Load K from paged buffer (transposed for dot product)
