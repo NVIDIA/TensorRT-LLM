@@ -2865,39 +2865,9 @@ class Qwen3_5MoeADInputProcessor:
             raise NotImplementedError("Underlying processor does not expose num_video_tokens.")
         return num_video_tokens[0]
 
-    @staticmethod
-    def _safe_tokenizer_vocab_size(tokenizer: Any) -> Optional[int]:
-        if tokenizer is None:
-            return None
-        try:
-            vocab_size = tokenizer.vocab_size
-        except (AttributeError, NotImplementedError):
-            pass
-        else:
-            if vocab_size is not None:
-                return int(vocab_size)
-        try:
-            return len(tokenizer)
-        except (AttributeError, NotImplementedError, TypeError):
-            return None
-
     def get_vocab_size(self) -> Optional[int]:
-        """Return the tokenizer vocabulary size for Qwen multimodal hashing helpers."""
-        try:
-            vocab_size = self.base_processor.get_vocab_size()
-        except (AttributeError, NotImplementedError):
-            vocab_size = None
-        if vocab_size is not None:
-            return int(vocab_size)
-
-        for tokenizer in (
-            self.tokenizer,
-            getattr(self.tokenizer, "tokenizer", None),
-            getattr(self.processor, "tokenizer", None),
-        ):
-            vocab_size = self._safe_tokenizer_vocab_size(tokenizer)
-            if vocab_size is not None:
-                return vocab_size
+        # Qwen multimodal masks are identified by explicit image/video token ids.
+        # Avoid probing tokenizer.vocab_size; it is only needed when mm_token_ids is unavailable.
         return None
 
     def get_mm_token_ids(self) -> Optional[torch.Tensor]:
