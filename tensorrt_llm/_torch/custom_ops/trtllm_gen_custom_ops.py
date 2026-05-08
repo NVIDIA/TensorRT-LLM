@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import List, Optional, Tuple, Union
@@ -1713,13 +1714,30 @@ def bf16_mxe2m1_block_scale_moe_runner(
         topk_ids_for_tuner,
     ]
 
-    # Choose best tactic using autotuner
-    kernel_runner, best_tactic = tuner.choose_one(
-        "trtllm::bf16_mxe2m1_block_scale_moe_runner",
-        [kernel_runner],
-        tuning_config_with_hook,
-        input_tensors_for_tuner,
-    )
+    # Optional env-var override of the autotuner's tactic pick.
+    # Used to force a specific (tileN, configIndex) cubin pair — e.g. when
+    # we want to lock in a known-good cubin that the autotuner ranks
+    # below another for cache-key reasons. Apply only at small num_tokens
+    # (decode) by default so prefill keeps autotune.
+    forced_tilen = os.environ.get("AD_MOE_BF16_TACTIC_TILEN")
+    forced_config = os.environ.get("AD_MOE_BF16_TACTIC_CONFIG")
+    decode_only = os.environ.get("AD_MOE_BF16_TACTIC_DECODE_ONLY", "1") == "1"
+    decode_max_tokens = int(
+        os.environ.get("AD_MOE_BF16_TACTIC_DECODE_MAX_TOKENS", "16"))
+    use_override = (forced_tilen is not None and forced_config is not None
+                    and (not decode_only
+                         or hidden_states.shape[0] <= decode_max_tokens))
+
+    if use_override:
+        best_tactic = [int(forced_tilen), int(forced_config)]
+    else:
+        # Choose best tactic using autotuner
+        kernel_runner, best_tactic = tuner.choose_one(
+            "trtllm::bf16_mxe2m1_block_scale_moe_runner",
+            [kernel_runner],
+            tuning_config_with_hook,
+            input_tensors_for_tuner,
+        )
 
     # Replace dummy tensors with actual ones for final execution
     input_tensors = input_tensors_for_tuner
