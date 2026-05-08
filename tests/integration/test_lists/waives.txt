@@ -21,7 +21,6 @@ accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[False] SKIP
 accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[True] SKIP (https://nvbugs/6117816)
 accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_fp8[True] SKIP (https://nvbugs/6117816)
 accuracy/test_llm_api_autodeploy.py::TestQwen3_5_397B_MoE::test_nvfp4[8] SKIP (https://nvbugs/6080024)
-accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput] SKIP (https://nvbugs/6084764)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput] SKIP (https://nvbugs/6084775)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_mtp] SKIP (https://nvbugs/6029882)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_pp4_mtp] SKIP (https://nvbugs/6018046)
