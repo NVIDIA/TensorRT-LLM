@@ -127,6 +127,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import torch
 from einops import repeat
 
@@ -395,6 +396,11 @@ def _build_tensors(
 
     # prev_tokens placeholder — overwritten per-run
     prev_tokens = torch.zeros(batch, device=device, dtype=torch.int32)
+    # slot_perm placeholder — overwritten per-run by mix pre_iter_fn when
+    # sort_slots is enabled.  Identity by default so cells that don't sort
+    # (or pure-batch cells) get a meaningful identity perm if the kernel
+    # ends up reading it (USE_PERM=False makes this path unused).
+    slot_perm_buf = torch.arange(batch, device=device, dtype=torch.int32)
 
     out_incr = torch.zeros(batch, mtp_len, nheads, head_dim, device=device, dtype=act_dtype)
     out_base = torch.zeros(batch, mtp_len, nheads, head_dim, device=device, dtype=act_dtype)
@@ -444,6 +450,7 @@ def _build_tensors(
         dt_bias,
         D,
         prev_tokens,
+        slot_perm_buf,
         out_incr,
         out_base,
         intermediate_states_buffer,
@@ -487,10 +494,62 @@ _CUPTI_KEEP_KERNEL_SUBSTRINGS = (
     "_checkpointing_main",
     "_rectangle_main",
     "_dynamic_main",
+    "_persistent_main",
     "selective_scan_update",
     "selective_state_update",
     "causal_conv1d_update",
 )
+
+
+def _kernels_per_iter_incremental(
+    mode: str,
+    with_conv1d: bool,
+    *,
+    persistent_skip_empty: bool = True,
+) -> int:
+    """Expected number of CUPTI-tracked kernels per iter for the incremental
+    kernel chain, given the dispatch mode and the conv1d flag.
+
+    Used to validate CUPTI record counts (no auto-inference — silent
+    mis-timing is the failure mode we're guarding against).
+
+    `persistent_skip_empty=True` (today's behavior): the
+    `mode='persistent_main'` launch helper host-early-outs when its half
+    is empty (n_writes=0 or n_writes=batch in pure scenarios), so only
+    one of the two persistent_main_kernel launches actually fires per
+    iter.  With `persistent_skip_empty=False` (future no-eo mode), both
+    halves always launch and K bumps by 1.
+
+    `persistent_dynamic` always launches 1 main; not affected by the flag.
+    """
+    if mode == "monolithic":
+        k = 2  # precomp + main
+    elif mode == "dynamic":
+        k = 2  # dynamic_precomp + dynamic_main
+    elif mode == "maindl":
+        k = 3  # 1 dynamic_precomp + 2 mains (write + nowrite)
+    elif mode in ("doublelaunch", "dlgrouped"):
+        k = 4  # 2 precomp + 2 main
+    elif mode == "dl_write_only":
+        k = 2  # 1 precomp + 1 main (write only)
+    elif mode == "persistent_dynamic":
+        k = 2  # 1 dynamic_precomp + 1 persistent_main
+    elif mode == "persistent_main":
+        k = 2 if persistent_skip_empty else 3  # see docstring
+    else:
+        raise ValueError(f"_kernels_per_iter_incremental: unknown mode {mode!r}")
+    if with_conv1d:
+        k += 1
+    return k
+
+
+def _kernels_per_iter_baseline(with_conv1d: bool) -> int:
+    """Expected kernels per iter for triton / flashinfer baselines.
+
+    Both baselines run a single state-update kernel; `--with-conv1d`
+    prepends one conv1d kernel.
+    """
+    return 2 if with_conv1d else 1
 
 
 class CuptiKernelTimer:
@@ -609,12 +668,17 @@ def _stats_from_spans(spans_us: list[float]) -> dict:
     }
 
 
-def _stats_from_cupti_records(records, warmup, iters, tag):
+def _stats_from_cupti_records(records, warmup, iters, tag, expected_K):
     """Bin a flat CUPTI kernel record stream into per-iter spans + per-kernel
     relative timestamps.  Used by both graph and eager CUPTI paths.
 
     `records` are tuples (name, start_ns, end_ns, ...) — see CuptiKernelTimer.
-    The first warmup*K records are dropped; the rest are chunked into K-tuples.
+    `expected_K` is the kernels-per-iter count the caller declares; we
+    validate the CUPTI total matches `expected_K * (warmup + iters)` exactly.
+    On mismatch we dump per-name record counts so missing or extra kernels
+    are obvious (most common cause: a new dispatch mode whose kernels lack
+    a matching entry in `_CUPTI_KEEP_KERNEL_SUBSTRINGS`, silently filtering
+    them out).
     """
     records = [
         r for r in records
@@ -624,14 +688,19 @@ def _stats_from_cupti_records(records, warmup, iters, tag):
 
     total = len(records)
     expected_iters = warmup + iters
-    if total == 0 or total % expected_iters != 0:
-        names_seen = sorted({r[0] for r in records})
+    expected_total = expected_K * expected_iters
+    if total != expected_total:
+        from collections import Counter
+        name_counts = dict(Counter(r[0] for r in records))
         raise RuntimeError(
-            f"CUPTI capture mismatch for {tag!r}: got {total} records, "
-            f"expected a multiple of {expected_iters} (warmup+iters={expected_iters}). "
-            f"Kernel names captured: {names_seen}"
+            f"CUPTI capture mismatch for {tag!r}: expected {expected_K} "
+            f"kernels/iter × {expected_iters} iters (warmup+iters) = "
+            f"{expected_total} records, got {total}.  Kernel record counts: "
+            f"{name_counts}.  If a kernel name is missing, add a substring "
+            f"to _CUPTI_KEEP_KERNEL_SUBSTRINGS; if present but the count is "
+            f"wrong, adjust _kernels_per_iter_* for this mode."
         )
-    K = total // expected_iters
+    K = expected_K
     timed = records[warmup * K:]
 
     spans_us: list[float] = []
@@ -653,47 +722,90 @@ def _stats_from_cupti_records(records, warmup, iters, tag):
     return out
 
 
+_PRE_GRAPH_WARMUP_ITERS = 3  # standard practice; see commit msg / design doc
+
+
 def _time_kernel_cuda_graph(
     args,
     run_fn,
     reset_fn,
     tag: str,
+    *,
+    expected_K: int,
+    pre_iter_fn=None,
+    iters_override: int | None = None,
 ) -> dict:
-    """CUDA-graph CUPTI timer.
+    """CUDA-graph CUPTI timer (graph-per-iter design).
 
-    Captures one CUDA graph (warmup + timed iters inlined), replays once,
-    reads kernel start/end timestamps from CUPTI (1 ns resolution).
+    Captures one CUDA graph holding a single iter's worth of work (reset
+    + l2_flush + run_fn) and replays it `warmup + iters` times.  Per-iter
+    setup (`pre_iter_fn`, e.g. mix-mode PNAT/n_writes copies) runs OUTSIDE
+    the graph, on the same CUDA stream so the order
+    `pre_iter_fn → l2_flush → run_fn` is preserved on every replay.
+
+    Why graph-per-iter (vs the older "one giant graph holding all iters"
+    design): instantiating a CUDA graph is expensive — proportional to
+    graph size — so a single small graph instantiated once is much
+    cheaper than one big graph instantiated for each cell of a sweep.
+    Replays are cheap regardless.
+
+    Why pre_iter_fn outside the graph: it depends on the iter index `i`
+    (different sample per iter), but graph capture would bake in the
+    capture-time `i`.  Putting the per-iter copy outside the graph also
+    has a useful side effect: PNAT (the per-iter input) is loaded into
+    L2 by the copy, then evicted by the in-graph L2 flush, so the kernel
+    reads PNAT cold — closer to production behavior than the old design.
+
+    Pre-graph eager warmup (3 iters): forces PyTorch's caching allocator
+    + Triton's autotune cache to settle before capture so the graph
+    doesn't bake in init-only allocations.
+
+    ``iters_override`` (if not None) overrides ``args.iters`` for this
+    call.  Used to give mix scenarios a higher iter count than pure
+    (more iters = more independent mix draws averaged in).
     """
     timer = CuptiKernelTimer.get()
     warmup = args.warmup
-    iters = args.iters
+    iters = iters_override if iters_override is not None else args.iters
 
-    # Eager warmup before graph capture (triggers Triton autotune if active).
-    reset_fn()
-    run_fn()
+    # Pre-graph eager warmup: full per-iter chain × N.  Settles allocator
+    # + autotune; pre_iter_fn included so any side effects it has are
+    # exercised before capture.
+    for _ in range(_PRE_GRAPH_WARMUP_ITERS):
+        reset_fn()
+        if pre_iter_fn is not None:
+            pre_iter_fn(0)
+        run_fn()
     torch.cuda.synchronize()
 
+    # Reset just before capture so warmup state changes don't bleed in.
     reset_fn()
     torch.cuda.synchronize()
 
+    # Capture ONE iter.  pre_iter_fn deliberately not in here.
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        for _ in range(warmup + iters):
-            reset_fn()
-            if args.l2_flush:
-                _l2_flush.fill_(0.0)
-            run_fn()
-
+        reset_fn()
+        if args.l2_flush:
+            _l2_flush.fill_(0.0)
+        run_fn()
     torch.cuda.synchronize()
 
+    # Time: replay the per-iter graph `warmup + iters` times, with
+    # pre_iter_fn called between replays on the same stream.  CUPTI
+    # records every kernel launch; _stats_from_cupti_records validates
+    # against expected_K and slices warmup off the front.
     timer.start()
     torch.cuda.nvtx.range_push(tag)
-    g.replay()
+    for i in range(warmup + iters):
+        if pre_iter_fn is not None:
+            pre_iter_fn(i)
+        g.replay()
     torch.cuda.synchronize()
     torch.cuda.nvtx.range_pop()
     records = timer.stop()
 
-    return _stats_from_cupti_records(records, warmup, iters, tag)
+    return _stats_from_cupti_records(records, warmup, iters, tag, expected_K)
 
 
 def _time_kernel_eager(
@@ -701,6 +813,10 @@ def _time_kernel_eager(
     run_fn,
     reset_fn,
     tag: str,
+    *,
+    expected_K: int,
+    pre_iter_fn=None,
+    iters_override: int | None = None,
 ) -> dict:
     """Non-graph CUPTI timer (for ncu wrapping, debugging, etc.).
 
@@ -710,26 +826,32 @@ def _time_kernel_eager(
     """
     timer = CuptiKernelTimer.get()
     warmup = args.warmup
-    iters = args.iters
+    iters = iters_override if iters_override is not None else args.iters
 
     timer.start()
     torch.cuda.nvtx.range_push(tag)
-    for _ in range(warmup + iters):
+    # Unified warmup+iters loop; CUPTI filters by warmup count internally.
+    for i in range(warmup + iters):
         reset_fn()
         if args.l2_flush:
             _flush_l2()  # includes synchronize
+        if pre_iter_fn is not None:
+            pre_iter_fn(i)
         run_fn()
     torch.cuda.synchronize()
     torch.cuda.nvtx.range_pop()
     records = timer.stop()
 
-    return _stats_from_cupti_records(records, warmup, iters, tag)
+    return _stats_from_cupti_records(records, warmup, iters, tag, expected_K)
 
 
 def _run_kernel_untimed(args, run_fn, reset_fn, tag: str) -> dict:
     """No in-bench timing: just run the kernels for an external profiler
     (nsys / ncu) to time externally.  Returns a stats dict full of zeros so
     downstream code (table, JSON) doesn't break.
+
+    Note: pre_iter_fn / iters_override aren't plumbed here yet — mix-mode
+    benchmarking relies on CUPTI.  Add when a use-case lands.
     """
     warmup = args.warmup
     iters = args.iters
@@ -767,18 +889,44 @@ def _run_kernel_untimed(args, run_fn, reset_fn, tag: str) -> dict:
     return out
 
 
-def _time_kernel(args, run_fn, reset_fn, tag: str) -> dict:
+def _time_kernel(
+    args, run_fn, reset_fn, tag: str,
+    *,
+    expected_K: int,
+    pre_iter_fn=None,
+    iters_override: int | None = None,
+) -> dict:
     """Dispatch to graph-CUPTI / eager-CUPTI / no-timer path.
 
     --cupti: in-process CUPTI Activity API timing (default).  Use --no-cupti
     when running under nsys (in-process CUPTI conflicts with nsys's own
     subscriber); the bench then runs the kernels for nsys to time externally.
+
+    `expected_K` is the kernels-per-iter count the caller declares
+    (computed via _kernels_per_iter_*).  CUPTI paths validate against it
+    explicitly; the no-timer fallback ignores it (no records to validate).
     """
     if not getattr(args, "cupti", True):
+        if pre_iter_fn is not None:
+            raise RuntimeError(
+                "_time_kernel: pre_iter_fn requires CUPTI (mix-mode); "
+                "got --no-cupti.  Re-run with CUPTI on or plumb pre_iter_fn "
+                "through _run_kernel_untimed."
+            )
         return _run_kernel_untimed(args, run_fn, reset_fn, tag)
     if args.cuda_graph:
-        return _time_kernel_cuda_graph(args, run_fn, reset_fn, tag)
-    return _time_kernel_eager(args, run_fn, reset_fn, tag)
+        return _time_kernel_cuda_graph(
+            args, run_fn, reset_fn, tag,
+            expected_K=expected_K,
+            pre_iter_fn=pre_iter_fn,
+            iters_override=iters_override,
+        )
+    return _time_kernel_eager(
+        args, run_fn, reset_fn, tag,
+        expected_K=expected_K,
+        pre_iter_fn=pre_iter_fn,
+        iters_override=iters_override,
+    )
 
 
 # Per-config benchmark (consolidated baseline + replay)
@@ -803,6 +951,10 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
 
     rect_list = getattr(args, "rectangle_for_nowrite_list", [False])
     write_modes_list = getattr(args, "write_modes_list", [args.write_checkpoint])
+    modes_list = getattr(args, "modes_list", ["monolithic"])
+    sort_list = getattr(args, "sort_slots_list", [False])
+    rev_list = getattr(args, "reverse_nowrite_list", [False])
+    hsort_list = getattr(args, "hardcode_sort_list", [False])
 
     configs = []
     for batch in batch_sizes:
@@ -811,26 +963,70 @@ def _compile_warmup_phase(args, batch_sizes, mtp_lengths, state_dtypes, act_dtyp
             for state_dtype in state_dtypes:
                 for act_dtype in act_dtypes:
                     for sr_mode in sr_modes_list:
-                        for write_ckpt in write_modes_list:
-                            # Rectangle is only meaningful for nowrite cells.
-                            effective_rect_list = (
-                                [False] if write_ckpt else rect_list
+                        for mode in modes_list:
+                            effective_write_modes = (
+                                write_modes_list if mode == "monolithic" else [True]
                             )
-                            for rect in effective_rect_list:
-                                configs.append((
-                                    batch, mtp_len, prev_ks, state_dtype, act_dtype,
-                                    sr_mode, rect, write_ckpt,
-                                ))
+                            for write_ckpt in effective_write_modes:
+                                if mode == "monolithic":
+                                    effective_rect_list = (
+                                        [False] if write_ckpt else rect_list
+                                    )
+                                else:
+                                    effective_rect_list = rect_list
+                                for rect in effective_rect_list:
+                                    # Note: "persistent_main" is included in
+                                    # the dl-family for sort/hsort sweep
+                                    # eligibility — it consumes the same
+                                    # slot_perm and benefits from the same
+                                    # write-first clustering.  It additionally
+                                    # requires _n_writes (count of write
+                                    # slots) which the bench computes from
+                                    # the pure-scenario PNAT (mix scenarios
+                                    # not yet supported for persistent_main).
+                                    is_dl_family = mode in (
+                                        "doublelaunch", "dlgrouped", "maindl",
+                                        "dl_write_only", "persistent_main",
+                                        "persistent_dynamic",
+                                    )
+                                    # Match the timed-run skip: sort=1 only
+                                    # makes sense when there's a mix scenario.
+                                    can_sort = is_dl_family and (args.mix_csv is not None)
+                                    effective_sort_list = (
+                                        sort_list if can_sort else [False]
+                                    )
+                                    effective_hsort_list = (
+                                        hsort_list if can_sort else [False]
+                                    )
+                                    for sort_slots in effective_sort_list:
+                                        effective_rev_list = (
+                                            rev_list if sort_slots else [False]
+                                        )
+                                        for reverse_nowrite in effective_rev_list:
+                                            for hardcode_sort in effective_hsort_list:
+                                                if sort_slots and hardcode_sort:
+                                                    continue
+                                                configs.append((
+                                                    batch, mtp_len, prev_ks,
+                                                    state_dtype, act_dtype,
+                                                    sr_mode, rect, write_ckpt, mode,
+                                                    sort_slots, reverse_nowrite,
+                                                    hardcode_sort,
+                                                ))
 
     print(f"[compile-warmup] {len(configs)} configs across {max_workers} threads")
     t0 = time.perf_counter()
 
     def _warm(cfg):
-        batch, mtp_len, prev_ks, state_dtype, act_dtype, sr_mode, rect, write_ckpt = cfg
+        (batch, mtp_len, prev_ks, state_dtype, act_dtype, sr_mode,
+         rect, write_ckpt, mode, sort_slots, reverse_nowrite, hardcode_sort) = cfg
         _bench_config(
             args, batch, mtp_len, prev_ks, state_dtype, act_dtype, baseline_fn,
             sr_mode=sr_mode, rectangle_for_nowrite=rect,
-            write_checkpoint=write_ckpt, warmup_only=True,
+            write_checkpoint=write_ckpt, mode=mode,
+            sort_slots=sort_slots, reverse_nowrite=reverse_nowrite,
+            hardcode_sort=hardcode_sort,
+            warmup_only=True,
         )
 
     errors = []
@@ -862,6 +1058,14 @@ def _bench_config(
     sr_mode: str = "RN",
     rectangle_for_nowrite: bool = False,
     write_checkpoint: bool = True,
+    mode: str = "monolithic",
+    mix_samples_cpu=None,
+    mix_label: str = "",
+    sort_slots: bool = False,
+    reverse_nowrite: bool = False,
+    perm_samples_cpu=None,
+    hardcode_sort: bool = False,
+    mix_samples_sorted_cpu=None,
     warmup_only: bool = False,
 ) -> None:
     """
@@ -895,6 +1099,7 @@ def _bench_config(
         dt_bias,
         D,
         prev_tokens,
+        slot_perm_buf,
         out_incr,
         out_base,
         intermediate_states_buffer,
@@ -1089,7 +1294,10 @@ def _bench_config(
             _run_baseline()
             torch.cuda.synchronize()
         else:
-            stats = _time_kernel(args, _run_baseline, reset_fn, tag)
+            stats = _time_kernel(
+                args, _run_baseline, reset_fn, tag,
+                expected_K=_kernels_per_iter_baseline(with_conv1d),
+            )
 
             _print_row(
                 show_kernel_col,
@@ -1119,19 +1327,135 @@ def _bench_config(
     heads_per_block_values = _parse_sweep(args.heads_per_block)
     maxnreg_values = _parse_sweep(args.maxnreg)
     num_ctas_values = _parse_sweep(args.num_ctas)
+    # Persistent-only sweep dims; ignored when the cell's mode != persistent_main.
+    cta_per_sm_values = _parse_sweep(args.cta_per_sm)
+    num_loop_stages_values = _parse_sweep(args.num_loop_stages)
+    flatten_values = _parse_sweep(args.flatten)
+    warp_specialize_values = _parse_sweep(args.warp_specialize)
+    # TMA toggles — independent 0/1 sweep per path.  The skip-dupe at the
+    # top of the inner loop body collapses cells where a flag's path is
+    # unreachable, so e.g. monolithic + WC=True only runs the value=0
+    # cells for nowrite-load and rect-load.
+    use_tma_rect_load_values = _parse_sweep(args.use_tma_rect_load)
+    use_tma_replay_write_load_values = _parse_sweep(args.use_tma_replay_write_load)
+    use_tma_replay_nowrite_load_values = _parse_sweep(args.use_tma_replay_nowrite_load)
+    use_tma_replay_write_store_values = _parse_sweep(args.use_tma_replay_write_store)
 
-    # --- Replay kernel, one row per prev_k ---
+    # --- Replay kernel ---
     # Cache T-axis capacity (for prev_k validity check on the nowrite path).
     max_window = getattr(args, "max_window", 0) or mtp_len
+
+    # Build the list of scenarios to time.  A scenario is one cell in the
+    # output: pure-mode scenarios fill prev_tokens with one constant before
+    # the timing loop; mix-mode scenarios feed a pre-baked per-iter samples
+    # tensor, with the per-iter copy captured inside the CUDA graph.  Pure
+    # and mix can coexist in one call so a single nsys trace covers both.
+    scenarios = []
     for prev_k in prev_ks:
-        # On the nowrite path, new tokens append at [prev_k, prev_k+T) of the
-        # active buffer, so prev_k+T must fit within max_window.  Skip
-        # silently for combinations that don't satisfy this — lets a single
-        # nsys run sweep both write modes against a shared prev_k list.
-        if not write_checkpoint and prev_k + mtp_len > max_window:
+        # On the nowrite path, new tokens append at [prev_k, prev_k+T) of
+        # the active buffer, so prev_k+T must fit within max_window.
+        # mode != monolithic dispatches per-slot from PNAT, so any
+        # prev_k <= max_window is valid for those modes.
+        if mode == "monolithic" and not write_checkpoint and prev_k + mtp_len > max_window:
             continue
-        prev_tokens.fill_(prev_k)
-        tag = f"incr_b{batch}_mtp{mtp_len}_k{prev_k}_s{state_dtype_name}_a{act_dtype_name}"
+        scenarios.append({
+            "label": f"k{prev_k}",
+            "print_label": prev_k,
+            "fill": prev_k,
+            "pre_iter": None,
+            "iters": None,  # use args.iters
+        })
+    # Mix scenario: skip on monolithic (mono on mixed PNAT corrupts the
+    # wrong-mode slots).  Persistent_main + mix is now supported: bench
+    # pre-bakes both a per-iter PNAT samples tensor and a per-iter
+    # n_writes samples tensor; pre_iter_fn copies row i of each into the
+    # kernel-input tensors (PNAT and n_writes_dev) on the same stream as
+    # the captured CUDA graph, so they're cold w.r.t. the in-graph L2
+    # flush.
+    if mix_samples_cpu is not None and mode != "monolithic":
+        device = state_work.device
+        # Hardcode-sort: per-iter prev_tokens are CPU-sorted write-first.
+        # Kernel runs USE_PERM=False but the EO gate sees clustered modes.
+        # Output is scrambled (we don't permute x/B/C/dt to match) but
+        # timing is meaningful — isolates clustering benefit from the
+        # per-program perm-load overhead in --sort-slots.
+        src = mix_samples_sorted_cpu if (hardcode_sort and mix_samples_sorted_cpu is not None) else mix_samples_cpu
+        samples_gpu = torch.from_numpy(src).to(device=device, dtype=torch.int32)
+
+        # For persistent_main + mix: pre-compute the per-iter n_writes
+        # (count of slots needing the write path = PNAT+T > max_window)
+        # and the (1,) scratch the kernel reads from.  Both halves of
+        # persistent_main always launch in mix scenarios (host can't
+        # cheaply read n_writes per iter without a sync), so the kernel's
+        # slot-range derivation must be correct from device n_writes.
+        # persistent_dynamic doesn't need n_writes (the kernel ignores
+        # n_writes_dev when IS_DYNAMIC=True via Triton DCE), but we still
+        # allocate a sentinel scratch so the wrapper API is uniform.
+        n_writes_samples_gpu = None
+        n_writes_dev_mix = None
+        if mode in ("persistent_main", "persistent_dynamic"):
+            # n_writes per iter = number of slots that overflow the window.
+            n_writes_per_iter = ((src + mtp_len) > max_window).sum(axis=1).astype(np.int32)
+            n_writes_samples_gpu = torch.from_numpy(n_writes_per_iter).to(
+                device=device, dtype=torch.int32
+            )
+            n_writes_dev_mix = torch.zeros(1, dtype=torch.int32, device=device)
+
+        # Build _mix_pre_iter — the closure that runs OUTSIDE the captured
+        # graph between replays.  Updates: prev_tokens (always),
+        # slot_perm_buf (when sort_slots), n_writes_dev_mix (persistent).
+        if sort_slots and perm_samples_cpu is not None:
+            perm_samples_gpu = torch.from_numpy(perm_samples_cpu).to(
+                device=device, dtype=torch.int32
+            )
+            if n_writes_samples_gpu is not None:
+                def _mix_pre_iter(i, _s=samples_gpu, _ps=perm_samples_gpu,
+                                  _ns=n_writes_samples_gpu, _pt=prev_tokens,
+                                  _pm=slot_perm_buf, _nw=n_writes_dev_mix):
+                    _pt.copy_(_s[i])
+                    _pm.copy_(_ps[i])
+                    _nw.copy_(_ns[i:i+1])
+            else:
+                def _mix_pre_iter(i, _s=samples_gpu, _ps=perm_samples_gpu,
+                                  _pt=prev_tokens, _pm=slot_perm_buf):
+                    _pt.copy_(_s[i])
+                    _pm.copy_(_ps[i])
+        else:
+            if n_writes_samples_gpu is not None:
+                def _mix_pre_iter(i, _s=samples_gpu, _ns=n_writes_samples_gpu,
+                                  _pt=prev_tokens, _nw=n_writes_dev_mix):
+                    _pt.copy_(_s[i])
+                    _nw.copy_(_ns[i:i+1])
+            else:
+                def _mix_pre_iter(i, _s=samples_gpu, _pt=prev_tokens):
+                    _pt.copy_(_s[i])
+
+        # Mix iters override: if --mix-iters set, use it; else use args.iters.
+        mix_iters = getattr(args, "mix_iters", None)
+        scenarios.append({
+            "label": f"mix{mix_label}",
+            "print_label": "mix",
+            "fill": None,
+            "pre_iter": _mix_pre_iter,
+            "iters": mix_iters,  # None => use args.iters
+            # Pass through to _run_incr so the wrapper receives _n_writes_dev
+            # (mix scenarios) instead of _n_writes (pure scenarios).
+            "n_writes_dev": n_writes_dev_mix,
+        })
+
+    # Pure scenarios don't pre-allocate n_writes_dev; mix scenarios do.
+    # Default empty-halves skip: True for pure (host knows n_writes,
+    # production-equivalent host-skip), False for mix (host can't read
+    # device n_writes per iter without sync, must always launch both).
+    for scn in scenarios:
+        scenario_n_writes_dev = scn.get("n_writes_dev")  # None for pure
+        scenario_skip_empty = scenario_n_writes_dev is None
+        if scn["fill"] is not None:
+            prev_tokens.fill_(scn["fill"])
+        prev_k_for_print = scn["print_label"]
+        scenario_pre_iter = scn["pre_iter"]
+        scenario_iters = scn.get("iters")  # None => use args.iters
+        tag = f"incr_b{batch}_mtp{mtp_len}_{scn['label']}_s{state_dtype_name}_a{act_dtype_name}"
 
         for (
             block_size_m,
@@ -1142,6 +1466,14 @@ def _bench_config(
             heads_per_block,
             maxnreg,
             num_ctas,
+            cta_per_sm,
+            num_loop_stages,
+            flatten,
+            warp_specialize,
+            use_tma_rect_load,
+            use_tma_replay_write_load,
+            use_tma_replay_nowrite_load,
+            use_tma_replay_write_store,
         ) in itertools.product(
             block_size_m_values,
             num_warps_values,
@@ -1151,10 +1483,65 @@ def _bench_config(
             heads_per_block_values,
             maxnreg_values,
             num_ctas_values,
+            cta_per_sm_values,
+            num_loop_stages_values,
+            flatten_values,
+            warp_specialize_values,
+            use_tma_rect_load_values,
+            use_tma_replay_write_load_values,
+            use_tma_replay_nowrite_load_values,
+            use_tma_replay_write_store_values,
         ):
+            # Skip-dupe for TMA flag sweeps: a flag whose code path isn't
+            # reachable in this cell produces identical timing for value=0
+            # and value=1.  We canonicalize by skipping value=1 cells when
+            # the flag's path is unreachable.  Path reachability rules:
+            #   * write path (replay write-load + write-store): mono+WC=True,
+            #     OR any non-monolithic mode.
+            #   * rect path (rect-load): rectangle_for_nowrite=True AND a
+            #     nowrite path exists in this mode (mono+WC=False, OR any
+            #     non-monolithic mode).
+            #   * replay-nowrite path (nowrite-load): nowrite path exists
+            #     AND rect isn't taking it: mono+WC=False+rect=False, OR
+            #     any non-monolithic mode with rect=False.
+            _is_mono = (mode == "monolithic")
+            _write_path = (_is_mono and write_checkpoint) or (not _is_mono)
+            _rect_path = rectangle_for_nowrite and (
+                (not _is_mono) or (_is_mono and not write_checkpoint)
+            )
+            _replay_nowrite_path = (
+                (_is_mono and not write_checkpoint and not rectangle_for_nowrite)
+                or ((not _is_mono) and not rectangle_for_nowrite)
+            )
+            def _set(v):  # flag set to a non-zero sweep value
+                return v is not None and v != 0
+            if (_set(use_tma_rect_load) and not _rect_path
+                    or _set(use_tma_replay_write_load) and not _write_path
+                    or _set(use_tma_replay_nowrite_load) and not _replay_nowrite_path
+                    or _set(use_tma_replay_write_store) and not _write_path):
+                continue
+
+            # Pre-allocate n_writes_dev tensor OUTSIDE the captured graph for
+            # persistent modes in pure scenarios.  Mix scenarios already have
+            # `scenario_n_writes_dev` pre-allocated.  The wrapper's fallback
+            # `torch.tensor([...], device=...)` allocation would invalidate
+            # the CUDA-graph capture stream — must allocate here, before the
+            # `_run_incr` lambda (which is what gets captured) is defined.
+            # For persistent_dynamic the kernel ignores the value (IS_DYNAMIC
+            # DCE's the load); we still need a valid pointer.  For
+            # persistent_main pure, the value is constant per cell so we set
+            # it once here.
+            _n_writes_dev_pure: torch.Tensor | None = None
+            _host_n_writes_pure: int | None = None
+            if mode in ("persistent_main", "persistent_dynamic") and scenario_n_writes_dev is None:
+                _n_writes_dev_pure = torch.zeros(1, dtype=torch.int32, device=state_work.device)
+                if mode == "persistent_main":
+                    scn_fill = scn["fill"]
+                    is_write_scenario_local = (scn_fill + mtp_len) > max_window
+                    _host_n_writes_pure = batch if is_write_scenario_local else 0
+                    _n_writes_dev_pure.fill_(_host_n_writes_pure)
 
             def _run_incr(
-                prev_k=prev_k,
                 block_size_m=block_size_m,
                 num_warps=num_warps,
                 num_stages=num_stages,
@@ -1163,6 +1550,14 @@ def _bench_config(
                 heads_per_block=heads_per_block,
                 maxnreg=maxnreg,
                 num_ctas=num_ctas,
+                cta_per_sm=cta_per_sm,
+                num_loop_stages=num_loop_stages,
+                flatten=flatten,
+                warp_specialize=warp_specialize,
+                use_tma_rect_load=use_tma_rect_load,
+                use_tma_replay_write_load=use_tma_replay_write_load,
+                use_tma_replay_nowrite_load=use_tma_replay_nowrite_load,
+                use_tma_replay_write_store=use_tma_replay_write_store,
             ):
                 if with_conv1d:
                     x_call, B_call, C_call = _conv1d_split(
@@ -1178,14 +1573,94 @@ def _bench_config(
                 if args.variant == "checkpointing":
                     extra_kwargs["write_checkpoint"] = write_checkpoint
                     extra_kwargs["rectangle_for_nowrite"] = rectangle_for_nowrite
+                    extra_kwargs["mode"] = mode
+                    if sort_slots:
+                        extra_kwargs["slot_perm"] = slot_perm_buf
+                    # reverse_nowrite is meaningful in two ways:
+                    #   - with slot_perm: walk the perm tail-first
+                    #   - without slot_perm (hardcode-sort): walk pid_b
+                    #     itself tail-first via the REVERSE_PERM constexpr
+                    if sort_slots or (hardcode_sort and reverse_nowrite):
+                        extra_kwargs["reverse_nowrite"] = reverse_nowrite
                     if state_scales_work is not None:
                         extra_kwargs["state_scales"] = state_scales_work
-                    if getattr(args, "use_tma_state", False):
-                        extra_kwargs["_use_tma_state"] = True
-                    if getattr(args, "use_tma_state_load_replay", False):
-                        extra_kwargs["_use_tma_state_load_replay"] = True
-                    if getattr(args, "use_tma_state_store_replay", False):
-                        extra_kwargs["_use_tma_state_store_replay"] = True
+                    if use_tma_rect_load:  # 1 → True, 0/None → False
+                        extra_kwargs["_use_tma_rect_load"] = True
+                    if use_tma_replay_write_load:
+                        extra_kwargs["_use_tma_replay_write_load"] = True
+                    if use_tma_replay_nowrite_load:
+                        extra_kwargs["_use_tma_replay_nowrite_load"] = True
+                    if use_tma_replay_write_store:
+                        extra_kwargs["_use_tma_replay_write_store"] = True
+                    # persistent_main needs n_writes (count of write-mode
+                    # slots in the pre-sorted batch) as a host-side int.
+                    # Pure scenarios: every slot has the same PNAT, so
+                    # n_writes is either 0 (all nowrite) or batch (all
+                    # write) depending on whether PNAT+T overflows the
+                    # window.  Mix scenarios are skipped earlier.
+                    if mode in ("persistent_main", "persistent_dynamic"):
+                        # Per-cell sweep values for persistent-only knobs.
+                        # Apply to both persistent variants.  _parse_sweep
+                        # returns [None] when the user didn't pass the flag,
+                        # in which case we leave the wrapper's defaults.
+                        if cta_per_sm is not None:
+                            extra_kwargs["_cta_per_sm"] = cta_per_sm
+                        if num_loop_stages is not None:
+                            extra_kwargs["_num_loop_stages"] = num_loop_stages
+                        if flatten is not None:
+                            extra_kwargs["_flatten"] = bool(flatten)
+                        if warp_specialize is not None:
+                            extra_kwargs["_warp_specialize"] = bool(warp_specialize)
+                    if mode in ("persistent_main", "persistent_dynamic"):
+                        # persistent_main + mix REQUIRES sort: the kernel
+                        # partitions slots [0, n_writes) = write half,
+                        # [n_writes, batch) = nowrite half.  This only holds
+                        # if PNAT is monotone (writes first), which sort
+                        # provides via either:
+                        #   sort_slots=1 → USE_PERM reads slot_perm to remap
+                        #   hardcode_sort=1 → PNAT itself is CPU-pre-sorted
+                        # persistent_dynamic doesn't need sort (per-slot
+                        # runtime dispatch); persistent_main pure scenarios
+                        # are trivially sorted (homogeneous PNAT).
+                        if (mode == "persistent_main"
+                                and scenario_n_writes_dev is not None
+                                and not (sort_slots or hardcode_sort)):
+                            raise AssertionError(
+                                "persistent_main + mix requires sort_slots=1 "
+                                "or hardcode_sort=1 — kernel partitions slots "
+                                "by index, which is only valid when PNAT is "
+                                "monotone (writes first).  Without sort, the "
+                                "partition silently mismatches actual slot "
+                                "modes.  Re-run with --sort-slots 1 or "
+                                "--hardcode-sort 1."
+                            )
+                        # n_writes plumbing: pure scenarios pass an int
+                        # (host knows the value, can host-skip empty halves);
+                        # mix scenarios pass a (1,) device tensor that the
+                        # bench's pre_iter_fn updates per replay.
+                        # _persistent_skip_empty_halves=False on mix so both
+                        # halves always launch (kernel uses device n_writes
+                        # to derive its slot range).
+                        if scenario_n_writes_dev is not None:
+                            # Mix path: caller-allocated tensor, updated per
+                            # iter by scenario_pre_iter outside capture.
+                            extra_kwargs["_n_writes_dev"] = scenario_n_writes_dev
+                            extra_kwargs["_persistent_skip_empty_halves"] = False
+                        elif mode == "persistent_main":
+                            # Pure: caller pre-allocated `_n_writes_dev_pure`
+                            # outside this lambda (so the alloc doesn't land
+                            # inside the captured graph).  Pass both the
+                            # tensor and the host int so the wrapper can use
+                            # host-skip when `_persistent_skip_empty_halves`.
+                            extra_kwargs["_n_writes"] = _host_n_writes_pure
+                            extra_kwargs["_n_writes_dev"] = _n_writes_dev_pure
+                            extra_kwargs["_persistent_skip_empty_halves"] = scenario_skip_empty
+                        elif mode == "persistent_dynamic":
+                            # persistent_dynamic pure: kernel ignores n_writes
+                            # via IS_DYNAMIC DCE, but the wrapper needs a
+                            # valid (1,) tensor pointer.  Pass the pre-allocated
+                            # zero tensor to avoid any in-capture alloc.
+                            extra_kwargs["_n_writes_dev"] = _n_writes_dev_pure
                 variant_fn(
                     state_work,
                     old_x_work,
@@ -1235,26 +1710,68 @@ def _bench_config(
                 parts.append(f"R={maxnreg}")
             if num_ctas is not None:
                 parts.append(f"CT={num_ctas}")
+            # Persistent-only knobs (only meaningful when MODE=persistent_main;
+            # printed unconditionally so output rows are uniformly comparable
+            # across modes when the user passed these sweeps).
+            if cta_per_sm is not None:
+                parts.append(f"CPS={cta_per_sm}")
+            if num_loop_stages is not None:
+                parts.append(f"LS={num_loop_stages}")
+            if flatten is not None:
+                parts.append(f"FL={flatten}")
+            if warp_specialize is not None:
+                parts.append(f"WS={warp_specialize}")
+            # TMA sweep tags.  Four wrapper-level flags map to three
+            # kernel-level constexprs (rect-load and replay-nowrite-load
+            # share `USE_TMA_LOAD_NOWRITE`, picked by the wrapper based on
+            # RECTANGLE).  TMARL specifically gates the rectangle path's
+            # state load; TMANL specifically gates the replay-style
+            # nowrite path's state load.  Distinct because their measured
+            # perf profiles differ (see CHECKPOINTING_DESIGN.md item #17:
+            # rect TMA is "not a win" while replay-nowrite TMA is the
+            # biggest measured win at int8 b>=64).
+            if use_tma_rect_load is not None:
+                parts.append(f"TMARL={use_tma_rect_load}")    # rect path load
+            if use_tma_replay_write_load is not None:
+                parts.append(f"TMAWL={use_tma_replay_write_load}")    # replay-write load
+            if use_tma_replay_nowrite_load is not None:
+                parts.append(f"TMANL={use_tma_replay_nowrite_load}")  # replay-NOWRITE load (NOT rect)
+            if use_tma_replay_write_store is not None:
+                parts.append(f"TMAWS={use_tma_replay_write_store}")   # replay-write store
             parts.append(f"SR={1 if use_philox else 0}")
             parts.append(f"RECT={1 if rectangle_for_nowrite else 0}")
             parts.append(f"WC={1 if write_checkpoint else 0}")
+            parts.append(f"MODE={mode}")
+            parts.append(f"SORT={1 if sort_slots else 0}")
+            parts.append(f"REVN={1 if reverse_nowrite else 0}")
+            parts.append(f"HSORT={1 if hardcode_sort else 0}")
             sweep_suffix = (" " + ",".join(parts)) if parts else ""
             sweep_tag = tag + sweep_suffix.replace(" ", "_").replace(",", "_")
 
             reset_fn = _reset_conv1d_realistic if with_conv1d else _reset
             if warmup_only:
                 reset_fn()
+                if scenario_pre_iter is not None:
+                    scenario_pre_iter(0)
                 _run_incr()
                 torch.cuda.synchronize()
             else:
-                stats = _time_kernel(args, _run_incr, reset_fn, sweep_tag)
+                stats = _time_kernel(
+                    args, _run_incr, reset_fn, sweep_tag,
+                    expected_K=_kernels_per_iter_incremental(
+                        mode, with_conv1d=with_conv1d,
+                        persistent_skip_empty=scenario_skip_empty,
+                    ),
+                    pre_iter_fn=scenario_pre_iter,
+                    iters_override=scenario_iters,
+                )
 
                 _print_row(
                     show_kernel_col,
                     args.variant,
                     batch,
                     mtp_len,
-                    prev_k,
+                    prev_k_for_print,
                     state_dtype_name,
                     act_dtype_name,
                     stats,
@@ -1428,26 +1945,152 @@ def _run_benchmark(args) -> None:
     sr_modes_list = getattr(args, "sr_modes_list", ["RN"])
     rect_list = getattr(args, "rectangle_for_nowrite_list", [False])
     write_modes_list = getattr(args, "write_modes_list", [args.write_checkpoint])
+    modes_list = getattr(args, "modes_list", ["monolithic"])
+    sort_list = getattr(args, "sort_slots_list", [False])
+    rev_list = getattr(args, "reverse_nowrite_list", [False])
+    hsort_list = getattr(args, "hardcode_sort_list", [False])
+
+    # Pre-load AL distribution for mix mode (if --mix-csv set).
+    mix_al = None
+    mix_label = ""
+    if args.mix_csv is not None:
+        from pathlib import Path as _Path
+        from checkpoint_mix_sim import load_al_distribution as _load_al
+        mix_label = _Path(args.mix_csv).stem
+        # T (= mtp_len) varies per cell; load once with the LARGEST mtp so
+        # we have enough columns; the loader normalizes the dist anyway.
+        mix_al = _load_al(_Path(args.mix_csv), T=max(mtp_lengths), column=args.mix_csv_column)
 
     for batch in batch_sizes:
         for mtp_len in mtp_lengths:
             # Resolve prev_k fractions → clamped integers in [0, mtp_len]
             prev_ks = _resolve_prev_ks(args, mtp_len)
+
+            # Pre-generate mix samples once per (batch, mtp_len) cell so all
+            # tuning configs see the same per-iter prev_tokens vectors —
+            # tuning differences become signal, mix-noise is shared.
+            # Size the sample buffer for the LARGER of args.iters and
+            # args.mix_iters since mix scenarios use mix_iters.
+            mix_samples_cpu = None
+            perm_samples_cpu = None  # per-iter slot perm sorted write-first
+            mix_samples_sorted_cpu = None  # per-iter prev_tokens, write-first
+            if mix_al is not None:
+                from checkpoint_mix_sim import sample_steady_state_pnat as _sample_pnat
+                _max_window = getattr(args, "max_window", 0) or mtp_len
+                _max_iters = max(args.iters, getattr(args, "mix_iters", None) or args.iters)
+                mix_samples_cpu = _sample_pnat(
+                    mix_al, T=mtp_len, window=_max_window, batch=batch,
+                    K=args.warmup + _max_iters, seed=args.mix_seed,
+                )
+                if any(sort_list) or any(hsort_list):
+                    # write-first stable argsort: kind='stable' preserves
+                    # original-slot order within each mode group.
+                    write_mask = (
+                        mix_samples_cpu + mtp_len > _max_window
+                    ).astype(np.int8)  # 1 = write, 0 = nowrite
+                    perm_idx = np.argsort(
+                        -write_mask, kind="stable", axis=-1
+                    ).astype(np.int32)
+                    if any(sort_list):
+                        perm_samples_cpu = perm_idx
+                    if any(hsort_list):
+                        # Apply the perm to the prev_tokens samples themselves.
+                        # Result row i = mix_samples_cpu[i] reordered such
+                        # that write-mode entries come first.
+                        mix_samples_sorted_cpu = np.take_along_axis(
+                            mix_samples_cpu, perm_idx, axis=-1
+                        ).astype(mix_samples_cpu.dtype)
+
             for state_dtype in state_dtypes:
                 for act_dtype in act_dtypes:
                     for sr_mode in sr_modes_list:
-                        for write_ckpt in write_modes_list:
-                            # Rectangle only meaningful for nowrite cells.
-                            effective_rect_list = (
-                                [False] if write_ckpt else rect_list
+                        for mode in modes_list:
+                            # Non-monolithic modes ignore write_checkpoint
+                            # (per-slot from PNAT) — collapse the sweep so we
+                            # don't duplicate identical cells.
+                            effective_write_modes = (
+                                write_modes_list if mode == "monolithic" else [True]
                             )
-                            for rect in effective_rect_list:
-                                _bench_config(
-                                    args, batch, mtp_len, prev_ks, state_dtype, act_dtype,
-                                    baseline_fn, sr_mode=sr_mode,
-                                    rectangle_for_nowrite=rect,
-                                    write_checkpoint=write_ckpt,
-                                )
+                            for write_ckpt in effective_write_modes:
+                                # Rectangle is meaningful for: nowrite cells in
+                                # monolithic; always for dynamic / doublelaunch
+                                # (constexpr knob).
+                                if mode == "monolithic":
+                                    effective_rect_list = (
+                                        [False] if write_ckpt else rect_list
+                                    )
+                                else:
+                                    effective_rect_list = rect_list
+                                for rect in effective_rect_list:
+                                    # Sort/reverse only meaningful for the
+                                    # dl-family early-out kernels AND only
+                                    # against the mix scenario (the actual
+                                    # sort experiment).  Pure k= scenarios
+                                    # under sort=1 would just run a
+                                    # USE_PERM=True kernel against an
+                                    # identity perm — same data point as
+                                    # sort=0 + extra compile.  Skip sort=1
+                                    # when no mix is configured; mono /
+                                    # dynamic also skip sort=1; reverse=1
+                                    # with sort=0 is a no-op (skip).
+                                    # Note: "persistent_main" is included in
+                                    # the dl-family for sort/hsort sweep
+                                    # eligibility — it consumes the same
+                                    # slot_perm and benefits from the same
+                                    # write-first clustering.  It additionally
+                                    # requires _n_writes (count of write
+                                    # slots) which the bench computes from
+                                    # the pure-scenario PNAT (mix scenarios
+                                    # not yet supported for persistent_main).
+                                    is_dl_family = mode in (
+                                        "doublelaunch", "dlgrouped", "maindl",
+                                        "dl_write_only", "persistent_main",
+                                        "persistent_dynamic",
+                                    )
+                                    can_sort = (
+                                        is_dl_family and mix_samples_cpu is not None
+                                    )
+                                    effective_sort_list = (
+                                        sort_list if can_sort else [False]
+                                    )
+                                    effective_hsort_list = (
+                                        hsort_list if can_sort else [False]
+                                    )
+                                    for sort_slots in effective_sort_list:
+                                        for hardcode_sort in effective_hsort_list:
+                                            # sort_slots and hardcode_sort
+                                            # are alternative experiments
+                                            # for the same idea — skip the
+                                            # combined cell to avoid double
+                                            # interpretation.
+                                            if sort_slots and hardcode_sort:
+                                                continue
+                                            # rev=1 is meaningful with EITHER
+                                            # sort_slots=1 (perm-based) or
+                                            # hardcode_sort=1 (raw pid_b
+                                            # subtraction in unsorted-perm
+                                            # path).  rev=1 with both 0 is
+                                            # a no-op.
+                                            effective_rev_list = (
+                                                rev_list if (sort_slots or hardcode_sort) else [False]
+                                            )
+                                            for reverse_nowrite in effective_rev_list:
+                                                _bench_config(
+                                                    args, batch, mtp_len,
+                                                    prev_ks, state_dtype,
+                                                    act_dtype, baseline_fn,
+                                                    sr_mode=sr_mode,
+                                                    rectangle_for_nowrite=rect,
+                                                    write_checkpoint=write_ckpt,
+                                                    mode=mode,
+                                                    mix_samples_cpu=mix_samples_cpu,
+                                                    mix_label=mix_label,
+                                                    sort_slots=sort_slots,
+                                                    reverse_nowrite=reverse_nowrite,
+                                                    perm_samples_cpu=perm_samples_cpu,
+                                                    hardcode_sort=hardcode_sort,
+                                                    mix_samples_sorted_cpu=mix_samples_sorted_cpu,
+                                                )
 
     if args.profile:
         torch.cuda.cudart().cudaProfilerStop()
@@ -1713,6 +2356,44 @@ def _parse_args() -> argparse.Namespace:
         help="Override num_ctas for the main kernel (comma-separated sweep).",
     )
     parser.add_argument(
+        "--cta-per-sm",
+        type=str,
+        default=None,
+        help="CTAs per SM in the 1D persistent grid for mode=persistent_main "
+        "(comma-separated sweep).  num_persistent = cta_per_sm × NUM_SMS.  "
+        "Default = 1 (one CTA per SM).  Replaces the old --num-persistent.  "
+        "Ignored for non-persistent_main modes.",
+    )
+    parser.add_argument(
+        "--num-loop-stages",
+        type=str,
+        default=None,
+        help="num_stages on the inner tl.range(...) persistent loop for "
+        "mode=persistent_main (comma-separated sweep).  Default = 2.  Note: "
+        "this is loop-level, NOT the kernel-arg num_stages (which only "
+        "pipelines dot-feeding loads).  Watch Triton issue #8259 — "
+        "num_stages>1 + flatten=True can corrupt stores in non-dot kernels.  "
+        "Ignored for non-persistent_main modes.",
+    )
+    parser.add_argument(
+        "--flatten",
+        type=str,
+        default=None,
+        help="`flatten` arg on tl.range(...) for mode=persistent_main "
+        "(comma-separated 0/1 sweep).  Default = 1.  Ignored for "
+        "non-persistent_main modes.",
+    )
+    parser.add_argument(
+        "--warp-specialize",
+        type=str,
+        default=None,
+        help="`warp_specialize` arg on tl.range(...) for mode=persistent_main "
+        "(comma-separated 0/1 sweep).  Default = 0.  Triton 3.6 only "
+        "supports it on simple matmul loops; our scan loop probably won't "
+        "pattern-match — exposed as a knob for sweep experiments.  Requires "
+        "num_warps >= 4 if 1.  Ignored for non-persistent_main modes.",
+    )
+    parser.add_argument(
         "--sr-modes",
         type=str,
         default="RN",
@@ -1732,24 +2413,122 @@ def _parse_args() -> argparse.Namespace:
         "checkpointing variant.",
     )
     parser.add_argument(
-        "--use-tma-state",
-        action="store_true",
-        help="Use TMA (host-built tensor descriptor) for the state load in "
-        "_rectangle_main_kernel.  Only applies to the rectangle nowrite path "
-        "of the checkpointing variant; ignored otherwise.",
+        "--use-tma-rect-load",
+        type=str,
+        default=None,
+        help="Comma-separated 0/1 sweep.  Use TMA (host-built tensor "
+        "descriptor) for state load in the rectangle nowrite path.  "
+        "Cells where the rect path isn't reachable (e.g. mode=monolithic "
+        "+ WC=True) skip the value=1 case as a dupe.",
     )
     parser.add_argument(
-        "--use-tma-state-load-replay",
-        action="store_true",
-        help="Use TMA for state LOAD in _checkpointing_main_kernel (replay "
-        "main, both WC=0 and WC=1 paths).  Independent from rect TMA.",
+        "--use-tma-replay-write-load",
+        type=str,
+        default=None,
+        help="Comma-separated 0/1 sweep.  TMA state LOAD in replay main "
+        "when WC=True.  Independent from nowrite-load and rect TMA — see "
+        "CHECKPOINTING_DESIGN.md item #17 for measured perf.",
     )
     parser.add_argument(
-        "--use-tma-state-store-replay",
-        action="store_true",
-        help="Use TMA for state STORE in _checkpointing_main_kernel (replay "
-        "main, WC=1 path only — no-op for WC=0).  Independent from rect TMA "
-        "and from --use-tma-state-load-replay.",
+        "--use-tma-replay-nowrite-load",
+        type=str,
+        default=None,
+        help="Comma-separated 0/1 sweep.  TMA state LOAD in replay main "
+        "when WC=False.  Design doc reports the largest win on this path "
+        "(int8 b>=64: -8 to -12%%).",
+    )
+    parser.add_argument(
+        "--use-tma-replay-write-store",
+        type=str,
+        default=None,
+        help="Comma-separated 0/1 sweep.  TMA state STORE in replay main "
+        "(WC=True path only — no-op for WC=False).  Independent from all "
+        "load TMA flags.",
+    )
+    parser.add_argument(
+        "--modes",
+        type=str,
+        default="monolithic",
+        help="Comma-separated dispatch modes to sweep, any of "
+        "{monolithic,dynamic,doublelaunch}.  monolithic = today's behavior "
+        "(one kernel pair, write_checkpoint applied to whole batch); "
+        "dynamic = single kernel pair that dispatches per-slot at runtime "
+        "based on PNAT (rectangle_for_nowrite picks RECTANGLE constexpr); "
+        "doublelaunch = two kernel pairs launched in sequence with "
+        "EARLY_OUT=True, each handling slots whose mode matches it.  "
+        "Only applies to the checkpointing variant; non-monolithic modes "
+        "ignore --write-modes (per-slot from PNAT).",
+    )
+    parser.add_argument(
+        "--mix-csv",
+        type=str,
+        default=None,
+        help="Path to AL histogram CSV (cols: AL, count).  When set, an "
+        "additional 'mix' cell is emitted per (batch, mtp, dtype, sr, "
+        "mode, RECT, M, W, ...) combo where prev_tokens varies per iter, "
+        "drawn from the steady-state PNAT distribution induced by the "
+        "AL histogram.  Mix cells run only on dynamic and doublelaunch "
+        "modes (mono on a mixed batch corrupts wrong-mode slots).  "
+        "Each iteration of the captured CUDA graph has a different "
+        "pre-baked prev_tokens vector; warmup iters use distinct samples "
+        "from the timed iters so nsys-included warmup leaks don't bias.",
+    )
+    parser.add_argument(
+        "--mix-csv-column",
+        type=int,
+        default=1,
+        help="Column index (0-based) in the AL histogram CSV for the "
+        "count/probability column.  Default 1 (second column).",
+    )
+    parser.add_argument(
+        "--mix-seed",
+        type=int,
+        default=42,
+        help="RNG seed for the steady-state PNAT sampler.  Same seed "
+        "across runs => same per-slot samples for reproducible "
+        "comparisons.",
+    )
+    parser.add_argument(
+        "--sort-slots",
+        type=str,
+        default="0",
+        help="Comma-separated 0/1.  When 1, mix scenarios pre-sort slots "
+        "write-first (write slots at the head of slot_perm, nowrite at the "
+        "tail) and the dl-family kernels read pid_b through that perm — "
+        "clusters early-outs at one end of the grid.  Only meaningful for "
+        "doublelaunch/dlgrouped/maindl with mix scenarios; mono/dynamic "
+        "and pure-batch cells skip sort=1.",
+    )
+    parser.add_argument(
+        "--reverse-nowrite",
+        type=str,
+        default="0",
+        help="Comma-separated 0/1.  When 1 (and --sort-slots 1), the "
+        "nowrite-side kernels in dlgrouped/doublelaunch/maindl walk the "
+        "perm in reverse so both halves of the dl chain front-load real "
+        "work.  reverse=1 with sort=0 is skipped (no perm to reverse).",
+    )
+    parser.add_argument(
+        "--hardcode-sort",
+        type=str,
+        default="0",
+        help="Comma-separated 0/1.  When 1, the per-iter prev_tokens "
+        "samples are pre-sorted write-first OFFLINE (CPU-side) before "
+        "the timed region — kernel runs unchanged (USE_PERM=False) but "
+        "the EO gate sees sorted PNAT so early-outs cluster naturally. "
+        "Zero per-program load cost vs --sort-slots; output is "
+        "scrambled (we don't permute x/B/C/dt) but timing is meaningful. "
+        "Used to isolate whether clustering helps independent of the "
+        "perm-load overhead in the sort-slots path.",
+    )
+    parser.add_argument(
+        "--mix-iters",
+        type=int,
+        default=None,
+        help="Iteration count override for mix scenarios (each iter is a "
+        "different per-slot prev_tokens draw).  Default (None) uses "
+        "--iters.  Mix scenarios benefit from more iters since each "
+        "iter samples a different mix; pure scenarios don't.",
     )
     parser.add_argument(
         "--philox-rounding",
@@ -1811,6 +2590,30 @@ def _parse_args() -> argparse.Namespace:
         rect_list.append(v == "1")
     args.rectangle_for_nowrite_list = rect_list
 
+    sort_modes = [v.strip() for v in (args.sort_slots or "0").split(",") if v.strip()]
+    sort_list = []
+    for v in sort_modes:
+        if v not in ("0", "1"):
+            parser.error(f"--sort-slots value must be 0 or 1, got {v!r}")
+        sort_list.append(v == "1")
+    args.sort_slots_list = sort_list
+
+    rev_modes = [v.strip() for v in (args.reverse_nowrite or "0").split(",") if v.strip()]
+    rev_list = []
+    for v in rev_modes:
+        if v not in ("0", "1"):
+            parser.error(f"--reverse-nowrite value must be 0 or 1, got {v!r}")
+        rev_list.append(v == "1")
+    args.reverse_nowrite_list = rev_list
+
+    hsort_modes = [v.strip() for v in (args.hardcode_sort or "0").split(",") if v.strip()]
+    hsort_list = []
+    for v in hsort_modes:
+        if v not in ("0", "1"):
+            parser.error(f"--hardcode-sort value must be 0 or 1, got {v!r}")
+        hsort_list.append(v == "1")
+    args.hardcode_sort_list = hsort_list
+
     if args.write_modes is not None:
         wm = [v.strip() for v in args.write_modes.split(",") if v.strip()]
         write_list = []
@@ -1821,6 +2624,18 @@ def _parse_args() -> argparse.Namespace:
         args.write_modes_list = write_list
     else:
         args.write_modes_list = [args.write_checkpoint]
+
+    modes_raw = [v.strip() for v in args.modes.split(",") if v.strip()]
+    valid_modes = {
+        "monolithic", "dynamic", "doublelaunch", "dlgrouped", "maindl",
+        "dl_write_only", "persistent_main", "persistent_dynamic",
+    }
+    for m in modes_raw:
+        if m not in valid_modes:
+            parser.error(
+                f"--modes value must be one of {sorted(valid_modes)}, got {m!r}"
+            )
+    args.modes_list = modes_raw or ["monolithic"]
     return args
 
 
