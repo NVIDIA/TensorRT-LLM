@@ -1,6 +1,7 @@
 from .create_moe import create_moe, get_moe_cls
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
+from .fused_moe_flashinfer_nvfp4_sm12x import FlashInferNvfp4Sm12xFusedMoE
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
@@ -30,6 +31,7 @@ __all__ = [
     "CutlassFusedMoE",
     "DeepSeekV3MoeRoutingMethod",
     "DefaultMoeRoutingMethod",
+    "FlashInferNvfp4Sm12xFusedMoE",
     "FusedMoEQuantScalesFP8",
     "get_moe_cls",
     "Llama4RenormalizeMoeRoutingMethod",

@@ -15,6 +15,7 @@ from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_densegemm import DenseGEMMFusedMoE
+from .fused_moe_flashinfer_nvfp4_sm12x import FlashInferNvfp4Sm12xFusedMoE
 from .fused_moe_triton import TritonFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from .fused_moe_vanilla import VanillaMoE
@@ -138,6 +139,23 @@ def get_moe_cls(
                 "Falling back to CutlassFusedMoE.")
             return CutlassFusedMoE
         return MegaMoEDeepGemm
+    elif moe_backend.upper() == "FLASHINFER_NVFP4SM12X":
+        # FlashInferNvfp4Sm12xFusedMoE is the hybrid CUTLASS-prefill /
+        # b12x-decode NVFP4 MoE backend for SM120/SM121. Hard-error rather
+        # than silently falling back to CUTLASS so a misconfigured request
+        # is loud at startup, not a silent perf regression.
+        if quant_config is None or not quant_config.quant_mode.has_nvfp4():
+            raise ValueError(
+                "FlashInferNvfp4Sm12xFusedMoE requires NVFP4 quantization "
+                f"(got quant_config={quant_config}).")
+        from tensorrt_llm._utils import get_sm_version
+        sm_version = get_sm_version()
+        if sm_version not in FlashInferNvfp4Sm12xFusedMoE._SUPPORTED_SM_VERSIONS:
+            sm_list = "/".join(f"SM{v}" for v in sorted(
+                FlashInferNvfp4Sm12xFusedMoE._SUPPORTED_SM_VERSIONS))
+            raise ValueError(f"FlashInferNvfp4Sm12xFusedMoE requires {sm_list} "
+                             f"(got SM{sm_version}).")
+        return FlashInferNvfp4Sm12xFusedMoE
     else:
         raise ValueError(f"Unsupported moe backend: {moe_backend}")
 
@@ -280,7 +298,9 @@ def create_moe_backend(
             without_comm=without_comm,
             activation_type=activation_type,
         )
-    elif moe_cls == CutlassFusedMoE:
+    elif issubclass(moe_cls, CutlassFusedMoE):
+        # CutlassFusedMoE and any of its subclasses (e.g. FlashInferNvfp4Sm12xFusedMoE)
+        # share the same constructor signature.
         return moe_cls(
             routing_method=routing_method,
             num_experts=num_experts,
