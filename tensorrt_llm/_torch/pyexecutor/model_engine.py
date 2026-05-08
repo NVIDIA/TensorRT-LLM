@@ -878,8 +878,8 @@ class PyTorchModelEngine(ModelEngine):
             return
         if autotune_env in ("1", "true", "on", "yes", "tune"):
             tune_mode = True
-        elif autotune_env in ("load", "load_only", "load-only",
-                              "cache_only", "cache-only"):
+        elif autotune_env in ("load", "load_only", "load-only", "cache_only",
+                              "cache-only"):
             tune_mode = False
         else:
             logger.warning(
@@ -898,8 +898,8 @@ class PyTorchModelEngine(ModelEngine):
             yield
             return
 
-        cache_path = os.environ.get(
-            "TRTLLM_FLASHINFER_MOE_AUTOTUNE_CACHE_PATH", None)
+        cache_path = os.environ.get("TRTLLM_FLASHINFER_MOE_AUTOTUNE_CACHE_PATH",
+                                    None)
         if not tune_mode and cache_path is None:
             logger.warning(
                 "TRTLLM_FLASHINFER_MOE_AUTOTUNE=load was set without "

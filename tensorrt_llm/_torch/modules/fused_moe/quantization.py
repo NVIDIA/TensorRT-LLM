@@ -4470,9 +4470,9 @@ class MXFP4WeightTRTLLMGenFusedMoEMethod(MXFP4WeightFusedMoEMethod):
 
         if len(w2_weight.shape) == 2:
             assert w2_weight.dtype == torch.uint8
-            w2_weight = maybe_pad_for_mxfp4(w2_weight, alignment // 2,
-                                            self._get_w2_hidden_alignment(
-                                                module))
+            w2_weight = maybe_pad_for_mxfp4(
+                w2_weight, alignment // 2,
+                self._get_w2_hidden_alignment(module))
         else:
             # Pad bias, TRTLLM backend expects float32 bias.
             # Divide bias by tp_size as we shard along the hidden dimension.

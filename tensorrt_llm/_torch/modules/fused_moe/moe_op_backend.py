@@ -706,17 +706,20 @@ class FlashinferOpBackend(MoEOpBackend):
             raise ValueError(
                 "FlashInfer FP4 MoE GEMM2 expects gemm2_weights dim 1 "
                 f"to match hidden_states hidden size {fi_hidden_size}, "
-                f"got {gemm2_weights.shape[1]}.")
+                f"got {gemm2_weights.shape[1]}."
+            )
         if gemm2_weights_scale.shape[1] != fi_hidden_size:
             raise ValueError(
                 "FlashInfer FP4 MoE GEMM2 expects gemm2_weights_scale dim 1 "
                 f"to match hidden_states hidden size {fi_hidden_size}, "
-                f"got {gemm2_weights_scale.shape[1]}.")
+                f"got {gemm2_weights_scale.shape[1]}."
+            )
         if gemm2_bias is not None and gemm2_bias.shape[1] != fi_hidden_size:
             raise ValueError(
                 "FlashInfer FP4 MoE GEMM2 expects gemm2_bias dim 1 "
                 f"to match hidden_states hidden size {fi_hidden_size}, "
-                f"got {gemm2_bias.shape[1]}.")
+                f"got {gemm2_bias.shape[1]}."
+            )
 
         if router_logits is not None:
             outputs = self._fused_moe.trtllm_fp4_block_scale_moe(
