@@ -160,8 +160,9 @@ class Attention(nn.Module):
             ]
         )
 
-        # TODO: Support combined Ulysses + CP. Ulysses shards heads while CP shards sequence.
-        # Currently kept as mutually exclusive.
+        # Attention2D shards sequence on a 2D CP mesh; Ulysses shards heads via all-to-all.
+        # When both are enabled, ``VisualGenMapping`` exposes matching row/col + ulysses
+        # groups; wrap Ulysses outside Attention2D (same nesting order as ring + Ulysses).
         attn2d_size = (vgm.attn2d_row_size * vgm.attn2d_col_size) if vgm else 1
         use_attn2d = attn2d_size > 1 and self.qkv_mode != QKVMode.SEPARATE_QKV
         use_ulysses = ulysses_size > 1 and enable_ulysses
@@ -215,6 +216,10 @@ class Attention(nn.Module):
                 row_process_group=vgm.attn2d_row_group,
                 col_process_group=vgm.attn2d_col_group,
             )
+            if use_ulysses:
+                from ..attention_backend.parallel import UlyssesAttention
+
+                self.attn = UlyssesAttention(self.attn, process_group=vgm.ulysses_group)
         else:
             # Ring shards the sequence dim and therefore requires S_q == S_kv,
             # so only self-attention is eligible.

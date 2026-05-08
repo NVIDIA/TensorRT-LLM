@@ -126,16 +126,28 @@ class TestConstruction:
         vgm = VisualGenMapping(world_size=1, rank=0)
         assert vgm._dim_names == ("cfg", "tp", "cp", "ulysses")
 
-    def test_ulysses_and_attn2d_raises(self):
-        """Combining Attention2D and Ulysses raises NotImplementedError."""
-        with pytest.raises(NotImplementedError, match="not yet supported"):
-            VisualGenMapping(
-                world_size=4,
-                rank=0,
-                ulysses_size=2,
-                attn2d_row_size=2,
-                attn2d_col_size=1,
-            )
+    def test_attn2d_mesh_dim_names(self):
+        """Attention2D uses cp_row / cp_col mesh dims (not a single cp dim)."""
+        vgm = VisualGenMapping(
+            world_size=4,
+            rank=0,
+            attn2d_row_size=2,
+            attn2d_col_size=2,
+        )
+        assert vgm._dim_names == ("cfg", "tp", "cp_row", "cp_col", "ulysses")
+
+    def test_ulysses_and_attn2d_constructible(self):
+        """Attention2D + Ulysses is allowed when world_size matches the product."""
+        vgm = VisualGenMapping(
+            world_size=4,
+            rank=0,
+            ulysses_size=2,
+            attn2d_row_size=2,
+            attn2d_col_size=1,
+        )
+        assert vgm.cp_size == 2
+        assert vgm.ulysses_size == 2
+        assert vgm.seq_size == 4
 
     def test_ring_and_attn2d_raises(self):
         """Combining ring and Attention2D raises ValueError (both shard the sequence axis)."""
@@ -289,11 +301,8 @@ def _logic_allreduce_over_tp_group(rank, world_size):
 def _logic_attn2d_mesh_rank_and_group(rank, world_size):
     """attn2d_mesh_rank aliases cp_rank and attn2d_mesh_group works for collectives (2x2 mesh).
 
-    Default order cfg-tp-cp-ulysses with attn2d 2x2 (cp_size=4), cfg=1, tp=1, ulysses=1:
-        Rank 0: cp=0  (attn2d_mesh_rank=0)
-        Rank 1: cp=1  (attn2d_mesh_rank=1)
-        Rank 2: cp=2  (attn2d_mesh_rank=2)
-        Rank 3: cp=3  (attn2d_mesh_rank=3)
+    Mesh ``cfg-tp-cp_row-cp_col-ulysses`` with attn2d 2×2, cfg=1, tp=1, ulysses=1:
+        Ranks 0..3: logical cp_rank 0..3 (row-major on ``cp_row`` × ``cp_col``)
     All 4 ranks are in a single CP group covering the full attn2d mesh.
     """
     from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
@@ -426,13 +435,13 @@ def _logic_cfg2_ring2_ulysses2(rank, world_size):
     assert vgm.cp_group is not None
     assert vgm.ring_group is not None
     assert vgm.ulysses_group is not None
-    assert vgm.seq_group() is not None
+    assert vgm.seq_group is not None
 
     assert dist.get_world_size(vgm.cfg_group) == 2
     assert dist.get_world_size(vgm.cp_group) == 2
     assert dist.get_world_size(vgm.ring_group) == 2
     assert dist.get_world_size(vgm.ulysses_group) == 2
-    assert dist.get_world_size(vgm.seq_group()) == 4
+    assert dist.get_world_size(vgm.seq_group) == 4
 
     device = torch.device(f"cuda:{rank}")
     one = torch.ones(1, device=device)
@@ -450,8 +459,39 @@ def _logic_cfg2_ring2_ulysses2(rank, world_size):
     assert x.item() == 2.0, f"Rank {rank}: ulysses all_reduce expected 2, got {x.item()}"
 
     x = one.clone()
-    dist.all_reduce(x, group=vgm.seq_group())
+    dist.all_reduce(x, group=vgm.seq_group)
     assert x.item() == 4.0, f"Rank {rank}: seq all_reduce expected 4, got {x.item()}"
+
+
+def _logic_attn2d_seq_rank_matches_global_rank(rank, world_size):
+    """When cfg=tp=1, row-major mesh implies global rank == seq_rank (ordering invariant).
+
+    Same invariant holds for multi-node jobs as long as global ranks are dense
+    0..world_size-1 (standard torchrun / MPI).
+    """
+    from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
+
+    DeviceMeshTopologyImpl.device_mesh = None
+    VisualGenMapping.seq_mesh = None
+
+    vgm = VisualGenMapping(
+        world_size=world_size,
+        rank=rank,
+        attn2d_row_size=2,
+        attn2d_col_size=2,
+        ulysses_size=2,
+    )
+    assert vgm.cfg_size == 1 and vgm.tp_size == 1
+    assert vgm.seq_rank == rank, (
+        f"Rank {rank}: expected seq_rank == global rank for cfg=tp=1, got seq_rank={vgm.seq_rank}"
+    )
+
+    device = torch.device(f"cuda:{rank}")
+    tensor = torch.ones(1, device=device)
+    dist.all_reduce(tensor, group=vgm.seq_group)
+    assert tensor.item() == float(world_size), (
+        f"Rank {rank}: seq_group all_reduce expected sum={world_size}"
+    )
 
 
 @pytest.mark.skipif(not MODULES_AVAILABLE, reason="Modules not available")
@@ -474,3 +514,7 @@ class TestMultiGPU:
 
     def test_cfg2_ring2_ulysses2(self):
         _run_multi_gpu(8, _logic_cfg2_ring2_ulysses2)
+
+    def test_attn2d_ulysses_seq_rank_matches_global_rank(self):
+        """Row-major mesh: seq_rank == global rank when cfg=tp=1 (8-way Attn2D+Ulysses)."""
+        _run_multi_gpu(8, _logic_attn2d_seq_rank_matches_global_rank)
