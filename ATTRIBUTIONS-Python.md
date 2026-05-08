@@ -62159,7 +62159,7 @@ SOFTWARE.
   - `Homepage`: https://github.com/EleutherAI/tqdm-multiprocess
 
 
-## transformers (4.56.0)
+## transformers (5.3.0)
 
 ### Licenses
 License: `Apache 2.0 License`
