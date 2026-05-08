@@ -118,8 +118,11 @@ static bool isSupportedFhcHiddenRuntime(int hidden_size)
 
 // Validate the tcgen05 MMA fused-HC compile-time shape contract. Hidden must
 // be divisible into BLOCK_K tiles, kNumSplits must evenly divide those tiles,
-// and the hidden dimension must align with the per-token post-map vectorized
-// write granularity. Keep this in sync with the Python tactic filter.
+// and the hidden dimension must be a multiple of BF16_VEC_LI (per-thread vector
+// load granularity in the Phase 4 layer_input loop). The (Hidden % team-stride)
+// alignment is no longer required: the layer_input loop has a scalar-vec tail
+// that handles the residue after the vectorized main loop. Keep this in sync
+// with the Python tactic filter (_fused_hc_mma_ks_supported in mhc_cuda.py).
 template <uint32_t Hidden, uint32_t KS>
 static constexpr bool isSupportedFhcMmaKS()
 {
@@ -127,14 +130,9 @@ static constexpr bool isSupportedFhcMmaKS()
     static_assert(KS > 0, "kNumSplits must be positive");
 
     constexpr uint32_t hTilesPerHc = Hidden / FHC_BLOCK_K;
-    constexpr uint32_t blockSizeBf = FHC_NUM_MMA_TH + FHC_NUM_PMAP_TH;
-    constexpr uint32_t warpSizeBf = 32;
-    constexpr uint32_t numWarpsBf = blockSizeBf / warpSizeBf;
-    constexpr uint32_t toksPerCta = (FHC_BLOCK_M + KS - 1) / KS;
-    constexpr uint32_t warpsPerTok = (numWarpsBf > toksPerCta) ? (numWarpsBf / toksPerCta) : 1u;
     constexpr uint32_t bf16VecLi = 8;
 
-    return Hidden % FHC_BLOCK_K == 0 && hTilesPerHc % KS == 0 && Hidden % (warpsPerTok * warpSizeBf * bf16VecLi) == 0;
+    return Hidden % FHC_BLOCK_K == 0 && hTilesPerHc % KS == 0 && Hidden % bf16VecLi == 0;
 }
 
 static CUtensorMap makeTma2D(void* base, CUtensorMapDataType dtype, uint64_t gmemInner, uint64_t gmemOuter,
@@ -210,10 +208,15 @@ static FusedRoutFn pickFhc(uint32_t ks)
     case 1: return fhcInstanceIfSupported<Hidden, 1>();
     case 2: return fhcInstanceIfSupported<Hidden, 2>();
     case 4: return fhcInstanceIfSupported<Hidden, 4>();
+    case 7: return fhcInstanceIfSupported<Hidden, 7>();
     case 8: return fhcInstanceIfSupported<Hidden, 8>();
+    case 14: return fhcInstanceIfSupported<Hidden, 14>();
     case 16: return fhcInstanceIfSupported<Hidden, 16>();
+    case 28: return fhcInstanceIfSupported<Hidden, 28>();
     case 32: return fhcInstanceIfSupported<Hidden, 32>();
+    case 56: return fhcInstanceIfSupported<Hidden, 56>();
     case 64: return fhcInstanceIfSupported<Hidden, 64>();
+    case 112: return fhcInstanceIfSupported<Hidden, 112>();
     default: TLLM_CHECK_WITH_INFO(false, "mhcFusedHcLaunch: unsupported kNumSplits=%u", ks); return nullptr;
     }
 }
@@ -477,10 +480,15 @@ static FusedAllInOneFn pickFhcAllInOne(uint32_t ks)
     case 1: return fhcAllInOneInstanceIfSupported<Hidden, 1>();
     case 2: return fhcAllInOneInstanceIfSupported<Hidden, 2>();
     case 4: return fhcAllInOneInstanceIfSupported<Hidden, 4>();
+    case 7: return fhcAllInOneInstanceIfSupported<Hidden, 7>();
     case 8: return fhcAllInOneInstanceIfSupported<Hidden, 8>();
+    case 14: return fhcAllInOneInstanceIfSupported<Hidden, 14>();
     case 16: return fhcAllInOneInstanceIfSupported<Hidden, 16>();
+    case 28: return fhcAllInOneInstanceIfSupported<Hidden, 28>();
     case 32: return fhcAllInOneInstanceIfSupported<Hidden, 32>();
+    case 56: return fhcAllInOneInstanceIfSupported<Hidden, 56>();
     case 64: return fhcAllInOneInstanceIfSupported<Hidden, 64>();
+    case 112: return fhcAllInOneInstanceIfSupported<Hidden, 112>();
     default: TLLM_CHECK_WITH_INFO(false, "mhcFusedHcAllInOneLaunch: unsupported kNumSplits=%u", ks); return nullptr;
     }
 }

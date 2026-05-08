@@ -1161,8 +1161,11 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
     constexpr uint32_t TOKS_PER_PASS = NUM_WARPS_BF / WARPS_PER_TOK;
     constexpr uint32_t TOKEN_PASSES = (TOKS_PER_CTA + TOKS_PER_PASS - 1) / TOKS_PER_PASS;
     constexpr uint32_t BF16_VEC_LI = 8;
-    static_assert(HIDDEN % (WARPS_PER_TOK * WARP_SIZE_BF * BF16_VEC_LI) == 0,
-        "HIDDEN must be a multiple of WARPS_PER_TOK * WARP_SIZE * BF16_VEC_LI");
+    // The vectorized loop covers floor(HIDDEN / H_STRIDE) * H_STRIDE elements.
+    // Anything past that is handled by a scalar-vec tail loop below — relax the
+    // old static_assert so HIDDEN values like 7168 (which 8-warp teams cannot
+    // cleanly span) are also valid.
+    static_assert(HIDDEN % BF16_VEC_LI == 0, "HIDDEN must be a multiple of BF16_VEC_LI=8");
     const uint32_t tid_bf = threadIdx.x;
     const uint32_t lane_bf = tid_bf % WARP_SIZE_BF;
     const uint32_t warp_bf = tid_bf / WARP_SIZE_BF;
@@ -1274,10 +1277,14 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         __nv_bfloat16* obase = layer_input_out + static_cast<long long>(tok) * HIDDEN;
 
         constexpr uint32_t H_STRIDE = WARPS_PER_TOK * WARP_SIZE_BF * BF16_VEC_LI;
+        // Largest multiple of H_STRIDE that fits in HIDDEN — after this comes
+        // the scalar-vec tail (only relevant when WARPS_PER_TOK*32*8 > HIDDEN
+        // residue, e.g. KS=112 / HIDDEN=7168 / H_STRIDE=2048 → tail = 1024).
+        constexpr uint32_t H_VEC_END = (HIDDEN / H_STRIDE) * H_STRIDE;
         const uint32_t h_start = warp_in_team * WARP_SIZE_BF * BF16_VEC_LI + lane_bf * BF16_VEC_LI;
 
 #pragma unroll
-        for (uint32_t h = h_start; h < HIDDEN; h += H_STRIDE)
+        for (uint32_t h = h_start; h < H_VEC_END; h += H_STRIDE)
         {
             // Issue all HC_MULT=4 residual_cur reads first so their L2 latency
             // is hidden by the bf16→fp32 arithmetic that follows.  The compiler
@@ -1307,6 +1314,47 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
             for (uint32_t v = 0; v < BF16_VEC_LI / 2; ++v)
                 opairs[v] = __float22bfloat162_rn(make_float2(acc_li[2 * v], acc_li[2 * v + 1]));
             *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
+        }
+
+        // Scalar-vec tail: hidden residue [H_VEC_END, HIDDEN) is shorter than a
+        // full team stride. Distribute leftover BF16_VEC_LI-sized chunks across
+        // the team's threads in lane-major order (skip threads whose chunk
+        // falls past HIDDEN). Each chunk is still a single uint4 LDG/STG, so
+        // tail throughput matches the main loop's per-thread bandwidth — the
+        // only loss is that some lanes/warps in the team idle.
+        if constexpr (H_VEC_END < HIDDEN)
+        {
+            constexpr uint32_t TAIL_CHUNKS = (HIDDEN - H_VEC_END) / BF16_VEC_LI;
+            const uint32_t my_chunk = warp_in_team * WARP_SIZE_BF + lane_bf;
+            if (my_chunk < TAIL_CHUNKS)
+            {
+                const uint32_t h = H_VEC_END + my_chunk * BF16_VEC_LI;
+                uint4 raws[HC_MULT];
+#pragma unroll
+                for (uint32_t j = 0; j < HC_MULT; ++j)
+                {
+                    raws[j] = __ldg(reinterpret_cast<uint4 const*>(&rbase[j * HIDDEN + h]));
+                }
+                float acc_li[BF16_VEC_LI] = {};
+#pragma unroll
+                for (uint32_t j = 0; j < HC_MULT; ++j)
+                {
+                    __nv_bfloat162 const* pairs = reinterpret_cast<__nv_bfloat162 const*>(&raws[j]);
+#pragma unroll
+                    for (uint32_t v = 0; v < BF16_VEC_LI / 2; ++v)
+                    {
+                        float2 f = __bfloat1622float2(pairs[v]);
+                        acc_li[2 * v + 0] += pm[j] * f.x;
+                        acc_li[2 * v + 1] += pm[j] * f.y;
+                    }
+                }
+                uint4 out_raw;
+                __nv_bfloat162* opairs = reinterpret_cast<__nv_bfloat162*>(&out_raw);
+#pragma unroll
+                for (uint32_t v = 0; v < BF16_VEC_LI / 2; ++v)
+                    opairs[v] = __float22bfloat162_rn(make_float2(acc_li[2 * v], acc_li[2 * v + 1]));
+                *reinterpret_cast<uint4*>(&obase[h]) = out_raw;
+            }
         }
     }
 #else

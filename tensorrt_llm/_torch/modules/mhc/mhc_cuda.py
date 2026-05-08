@@ -526,13 +526,17 @@ _FUSED_HC_MMA_SUPPORTED_HIDDEN_SIZES = {4096, 7168}
 
 
 def _fused_hc_mma_ks_supported(hidden_size: int, ks: int) -> bool:
+    """Mirror C++ isSupportedFhcMmaKS<Hidden, KS>().
+
+    Phase 4 layer_input has a scalar-vec tail (H_VEC_END logic in
+    fused_tf32_pmap_gemm.cuh) so `hidden % (warps_per_tok * warp * bf16_vec)
+    == 0` is no longer required; only `hidden % bf16_vec == 0` plus
+    `h_tiles % ks == 0` remain.
+    """
     if hidden_size not in _FUSED_HC_MMA_SUPPORTED_HIDDEN_SIZES:
         return False
 
     block_k = 64
-    block_m = 64
-    num_warps = 8
-    warp_size = 32
     bf16_vec = 8
 
     if hidden_size % block_k != 0:
@@ -540,10 +544,7 @@ def _fused_hc_mma_ks_supported(hidden_size: int, ks: int) -> bool:
     h_tiles = hidden_size // block_k
     if h_tiles % ks != 0:
         return False
-
-    toks_per_cta = (block_m + ks - 1) // ks
-    warps_per_tok = num_warps // toks_per_cta if num_warps > toks_per_cta else 1
-    return hidden_size % (warps_per_tok * warp_size * bf16_vec) == 0
+    return hidden_size % bf16_vec == 0
 
 
 # Tactics supported by the half-fused FMA path in `mhcFusedHcFmaLaunch`
@@ -569,11 +570,13 @@ _FUSED_HC_HALF_FMA_TN_KS = (
 )
 # Tactics for the half-fused MMA path: (num_k_splits,). Matches Path D
 # (pickFhcAllInOne) so the autotuner can compare half-fused vs all-in-one at
-# the same ks across the full range.
-_FUSED_HC_HALF_MMA_KS = (1, 2, 4, 8, 16, 32, 64)
+# the same ks across the full range. Includes high-KS divisors of HIDDEN/64
+# for hidden=7168 (h_tiles=112): 7, 14, 28, 56, 112. _fused_hc_mma_ks_supported
+# filters per (hidden, ks) — entries that don't divide h_tiles drop out.
+_FUSED_HC_HALF_MMA_KS = (1, 2, 4, 7, 8, 14, 16, 28, 32, 56, 64, 112)
 # Tactics for Path D (all-in-one MMA): (num_k_splits,). No bigfuse_bs — the
 # bigfuse runs inline inside the single kernel and uses fixed parameters.
-_FUSED_HC_ALL_MMA_KS = (1, 2, 4, 8, 16, 32, 64)
+_FUSED_HC_ALL_MMA_KS = (1, 2, 4, 7, 8, 14, 16, 28, 32, 56, 64, 112)
 # Tactics for Path F (all-in-one FMA): (tile_n, num_k_splits, tile_m).
 # Must stay in sync with the C++ pickFhcFmaAllInOne() table.
 _FUSED_HC_ALL_FMA_TN_KS_TM = tuple(
