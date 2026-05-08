@@ -98,6 +98,8 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         "context_parallel_size",
         "moe_cluster_parallel_size",
         "moe_tensor_parallel_size",
+        "moe_expert_parallel_size",
+        "enable_attention_dp",
         "cp_config",
         mode="before",
     )

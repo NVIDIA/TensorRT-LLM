@@ -20,9 +20,8 @@ This registry maps model names to two layers of configs:
    compile_backend, etc.) shipped inside the package at
    ``_torch/auto_deploy/config/model_registry_internal/configs/``.
 2. **User configs** (``user_configs``) — Common, user-facing knobs
-   (max_batch_size, kv_cache_config, etc.). Source checkouts use
-   ``examples/auto_deploy/model_registry/configs/``; wheel installs use the
-   packaged copy in this registry package.
+   (max_batch_size, kv_cache_config, etc.) in
+   ``examples/auto_deploy/model_registry/configs/``.
 
 ``build_and_run_ad.py`` and integration tests use
 :func:`get_registry_yaml_extra` to get the combined list
@@ -42,13 +41,13 @@ import yaml
 _REGISTRY_PKG = files(__package__)
 _REGISTRY_YAML = _REGISTRY_PKG / "models.yaml"
 _AD_CONFIGS_DIR = Path(str(_REGISTRY_PKG / "configs"))
-_PACKAGED_USER_CONFIGS_DIR = Path(str(_REGISTRY_PKG / "user_configs"))
 
 # User-facing configs live under examples/auto_deploy/model_registry/configs/.
-# Resolve relative to the repo root (4 levels up from this package) when this
-# code is running from a source checkout.
+# Resolve relative to the repo root.  This package lives at
+# tensorrt_llm/_torch/auto_deploy/config/model_registry_internal/
+# so the repo root is 4 parents up from the package directory.
 _REPO_ROOT = Path(str(_REGISTRY_PKG)).parents[4]
-_SOURCE_USER_CONFIGS_DIR = _REPO_ROOT / "examples" / "auto_deploy" / "model_registry" / "configs"
+_USER_CONFIGS_DIR = _REPO_ROOT / "examples" / "auto_deploy" / "model_registry" / "configs"
 
 
 def _load_registry() -> dict:
@@ -93,12 +92,7 @@ def _find_entry(
 def _resolve_paths(entry: dict) -> tuple[List[str], List[str]]:
     """Return (ad_paths, user_paths) for a registry entry."""
     ad_paths = [str(_AD_CONFIGS_DIR / cfg) for cfg in entry.get("ad_defaults", [])]
-    user_configs_dir = (
-        _SOURCE_USER_CONFIGS_DIR
-        if _SOURCE_USER_CONFIGS_DIR.is_dir()
-        else _PACKAGED_USER_CONFIGS_DIR
-    )
-    user_paths = [str(user_configs_dir / cfg) for cfg in entry.get("user_configs", [])]
+    user_paths = [str(_USER_CONFIGS_DIR / cfg) for cfg in entry.get("user_configs", [])]
     return ad_paths, user_paths
 
 

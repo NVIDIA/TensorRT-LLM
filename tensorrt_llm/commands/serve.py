@@ -331,7 +331,7 @@ def launch_server(
 
                 model_name = llm_args.get("model", "")
                 registry_yaml_extra, registry_world_size = get_ad_defaults_with_world_size(
-                    str(model_name))
+                    model_name)
                 if registry_yaml_extra:
                     existing_yaml_extra = list(
                         llm_args.get("yaml_extra", []) or [])
