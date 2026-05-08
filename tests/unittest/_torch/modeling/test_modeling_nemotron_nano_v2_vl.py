@@ -388,8 +388,8 @@ class TestEncodeMultimodalDispatch:
     def test_encode_multimodal_dispatches_audio(self):
         model = self._make_mock_model()
         fake_audio_embeds = torch.randn(10, 128)
-        # All audio is encoded via the batched bucket helper.
-        model._encode_audio_bucket = mock.MagicMock(return_value=[(fake_audio_embeds, [10])])
+        # All audio is encoded via the batched `_encode_audio` helper.
+        model._encode_audio = mock.MagicMock(return_value=[(fake_audio_embeds, [10])])
 
         mm_param = mock.MagicMock()
         audio_data = {"foo": "bar"}
@@ -398,7 +398,7 @@ class TestEncodeMultimodalDispatch:
         # Call the real method on our mock
         result = NemotronH_Nano_VL_V2._encode_multimodal(model, [mm_param])
 
-        model._encode_audio_bucket.assert_called_once_with([audio_data])
+        model._encode_audio.assert_called_once_with([audio_data])
         model.vision_encoder.assert_not_called()
         self._assert_compatible_with_chunked_prefill(result)
         assert torch.equal(result[0], fake_audio_embeds)
@@ -537,9 +537,9 @@ class TestEncodeMultimodalAudioOrder:
             ([v2_emb], [list(range(v2_len))]),
         ]
 
-        # All audio (across both videos) is encoded in a single bucket call;
-        # the bucket returns one (emb, per_clip_counts) per input in order.
-        audio_bucket_returns = [(a1_emb, [a1_len]), (a2_emb, [a2_len])]
+        # All audio (across both videos) is encoded in a single batched call;
+        # the helper returns one (emb, per_clip_counts) per input in order.
+        audio_returns = [(a1_emb, [a1_len]), (a2_emb, [a2_len])]
 
         params = [
             self._make_video_param(has_audio=True),
@@ -551,7 +551,7 @@ class TestEncodeMultimodalAudioOrder:
         model = MagicMock()
         model.vision_encoder = MagicMock(side_effect=vision_returns)
         model.sound_encoder = MagicMock()  # not None -> audio path taken
-        model._encode_audio_bucket = MagicMock(return_value=audio_bucket_returns)
+        model._encode_audio = MagicMock(return_value=audio_returns)
         # Mock the interleaver to simply concatenate vision + audio, since this test only verifies
         # per-param dispatch, not interleaving math.
         model._interleave_video_audio_embeddings = MagicMock(
@@ -589,13 +589,13 @@ class TestEncodeMultimodalAudioOrder:
         model = MagicMock()
         model.vision_encoder = MagicMock(return_value=([v_emb], [list(range(v_len))]))
         model.sound_encoder = MagicMock()
-        model._encode_audio_bucket = MagicMock()
+        model._encode_audio = MagicMock()
 
         result = NemotronH_Nano_VL_V2._encode_multimodal(model, [param])
 
         assert len(result) == 1
         assert torch.equal(result[0], v_emb), "Vision-only video should not have audio appended"
-        model._encode_audio_bucket.assert_not_called()
+        model._encode_audio.assert_not_called()
 
     def test_no_audio_concat_when_sound_encoder_is_none(self):
         hidden = 16
@@ -607,13 +607,13 @@ class TestEncodeMultimodalAudioOrder:
         model = MagicMock()
         model.vision_encoder = MagicMock(return_value=([v_emb], [list(range(v_len))]))
         model.sound_encoder = None  # no audio support
-        model._encode_audio_bucket = MagicMock()
+        model._encode_audio = MagicMock()
 
         result = NemotronH_Nano_VL_V2._encode_multimodal(model, [param])
 
         assert len(result) == 1
         assert torch.equal(result[0], v_emb)
-        model._encode_audio_bucket.assert_not_called()
+        model._encode_audio.assert_not_called()
 
 
 class TestInterleaveVideoAudioEmbeddings:
@@ -729,8 +729,8 @@ class TestInterleaveVideoAudioEmbeddings:
         assert torch.equal(result, expected)
 
 
-class TestEncodeAudioBucket:
-    """Numerical equivalence: batched audio bucket vs per-input encoding.
+class TestEncodeAudio:
+    """Numerical equivalence: batched audio vs per-input encoding.
 
     Uses a deterministic stub for `sound_encoder` so the test does not
     depend on a checkpoint that ships sound weights (the test fixture's
@@ -756,9 +756,7 @@ class TestEncodeAudioBucket:
                 super().__init__()
 
             def _get_subsampling_output_length(self_inner, valid_input_lens):
-                return torch.div(
-                    valid_input_lens, TestEncodeAudioBucket.SUBSAMPLE, rounding_mode="floor"
-                )
+                return torch.div(valid_input_lens, TestEncodeAudio.SUBSAMPLE, rounding_mode="floor")
 
         class _Stub(torch.nn.Module):
             def __init__(self_inner):
@@ -771,11 +769,11 @@ class TestEncodeAudioBucket:
                 # SUBSAMPLE timesteps to mimic temporal subsampling.
                 x = self_inner.proj(features)  # [N, T, hidden]
                 T = x.shape[1]
-                T_trim = (T // TestEncodeAudioBucket.SUBSAMPLE) * TestEncodeAudioBucket.SUBSAMPLE
+                T_trim = (T // TestEncodeAudio.SUBSAMPLE) * TestEncodeAudio.SUBSAMPLE
                 x = x[:, :T_trim].reshape(
                     x.shape[0],
-                    T_trim // TestEncodeAudioBucket.SUBSAMPLE,
-                    TestEncodeAudioBucket.SUBSAMPLE,
+                    T_trim // TestEncodeAudio.SUBSAMPLE,
+                    TestEncodeAudio.SUBSAMPLE,
                     -1,
                 )
                 return x.mean(dim=2)  # [N, T_out, hidden]
@@ -789,10 +787,10 @@ class TestEncodeAudioBucket:
             mask[i, :vl] = 1
         return {"input_audio_features": features, "feature_attention_mask": mask}
 
-    def test_bucket_matches_per_input(self):
-        """Bucket output equals N singleton `_encode_audio_bucket` calls.
+    def test_batched_matches_per_input(self):
+        """Bucket output equals N singleton `_encode_audio` calls.
 
-        Compares ``bucket([a1, a2])`` against ``[bucket([a1])[0], bucket([a2])[0]]``
+        Compares ``encode([a1, a2])`` against ``[encode([a1])[0], encode([a2])[0]]``
         — the contract is that the i-th batched result is identical to a
         per-input call for input i.
         """
@@ -807,19 +805,19 @@ class TestEncodeAudioBucket:
         a2 = self._make_audio_data(num_clips=1, time_len=14, valid_lens=[12])
 
         per_input_results = [
-            NemotronH_Nano_VL_V2._encode_audio_bucket(model, [a1])[0],
-            NemotronH_Nano_VL_V2._encode_audio_bucket(model, [a2])[0],
+            NemotronH_Nano_VL_V2._encode_audio(model, [a1])[0],
+            NemotronH_Nano_VL_V2._encode_audio(model, [a2])[0],
         ]
-        bucket_results = NemotronH_Nano_VL_V2._encode_audio_bucket(model, [a1, a2])
+        batched_results = NemotronH_Nano_VL_V2._encode_audio(model, [a1, a2])
 
-        assert len(bucket_results) == 2
-        for (b_emb, b_counts), (s_emb, s_counts) in zip(bucket_results, per_input_results):
+        assert len(batched_results) == 2
+        for (b_emb, b_counts), (s_emb, s_counts) in zip(batched_results, per_input_results):
             assert b_counts == s_counts
             assert torch.allclose(b_emb, s_emb, atol=1e-6, rtol=1e-6)
 
-    def test_bucket_empty_input(self):
+    def test_empty_input(self):
         model = mock.MagicMock(spec=NemotronH_Nano_VL_V2)
-        assert NemotronH_Nano_VL_V2._encode_audio_bucket(model, []) == []
+        assert NemotronH_Nano_VL_V2._encode_audio(model, []) == []
 
 
 class TestEncodeMultimodalContract:
@@ -892,7 +890,7 @@ class TestEncodeMultimodalContract:
         img_emb = torch.randn(5, self.HIDDEN)
         audio_emb = torch.randn(3, self.HIDDEN)
         model.vision_encoder.return_value = ([img_emb], [None])
-        model._encode_audio_bucket = mock.MagicMock(return_value=[(audio_emb, [3])])
+        model._encode_audio = mock.MagicMock(return_value=[(audio_emb, [3])])
 
         params = [
             self._make_mm_param("image"),
@@ -1002,8 +1000,8 @@ class TestChunkedPrefillCaching:
     def test_audio_encoder_not_called_on_second_chunk(self):
         model = self._make_mock_model()
         fake_emb = torch.randn(self.NUM_TOKENS, self.HIDDEN)
-        # Audio is encoded via the batched bucket helper.
-        model._encode_audio_bucket = mock.MagicMock(return_value=[(fake_emb, [self.NUM_TOKENS])])
+        # Audio is encoded via the batched `_encode_audio` helper.
+        model._encode_audio = mock.MagicMock(return_value=[(fake_emb, [self.NUM_TOKENS])])
 
         param = self._make_param_with_runtime("audio", self.NUM_TOKENS, audio={})
         encoder_fn = self._make_encoder_fn(model)
@@ -1014,15 +1012,15 @@ class TestChunkedPrefillCaching:
             multimodal_params=[param],
         )
         assert len(result) == 1
-        assert model._encode_audio_bucket.call_count == 1
+        assert model._encode_audio.call_count == 1
 
         # Second call - should use cache.
         result2 = get_multimodal_embeddings(
             encoder_forward_fn=encoder_fn,
             multimodal_params=[param],
         )
-        assert model._encode_audio_bucket.call_count == 1, (
-            "`_encode_audio_bucket` was called again on the second chunk. "
+        assert model._encode_audio.call_count == 1, (
+            "`_encode_audio` was called again on the second chunk. "
             "Caching is broken - `_encode_multimodal` likely violates the "
             "`get_multimodal_embeddings` return type contract."
         )
@@ -1040,7 +1038,7 @@ class TestChunkedPrefillCaching:
         param_b = self._make_param_with_runtime("image", 3)
         encoder_fn = self._make_encoder_fn(model)
 
-        # First call: encoder runs once for the whole image bucket.
+        # First call: encoder runs once for the whole image batch.
         result = get_multimodal_embeddings(
             encoder_forward_fn=encoder_fn,
             multimodal_params=[param_a, param_b],

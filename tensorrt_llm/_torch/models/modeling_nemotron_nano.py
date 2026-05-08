@@ -4,7 +4,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -694,34 +694,37 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
     def forward(
         self, multimodal_params: List[MultimodalParams]
     ) -> Tuple[List[torch.Tensor], List[List[int] | None]]:
-        # Bucket params by encoder sub-path so each bucket runs in a single
+        # Group params by encoder sub-path so each group runs in a single
         # ViT forward. RADIO's temporal path packs each tubelet as its own
         # attention sequence, so cross-request video batching is safe as
-        # long as videos within a bucket share frame shape and tubelet
-        # alignment (handled in `_encode_temporal_video_bucket`).
+        # long as videos in the same group share frame shape and tubelet
+        # alignment (handled in `_encode_temporal_video`).
         multimodal_data_list = [p.multimodal_data for p in multimodal_params]
         plan = [self._classify(mm_data) for mm_data in multimodal_data_list]
 
-        def _bucket(kind: str) -> List[Dict[str, Any]]:
+        def _data_for(modality: str) -> List[Dict[str, Any]]:
             return [
                 mm_data[mm_data["modality_type"]]
-                for mm_data, k in zip(multimodal_data_list, plan)
-                if k == kind
+                for mm_data, assigned in zip(multimodal_data_list, plan)
+                if assigned == modality
             ]
 
-        dynamic_image_iter = iter(self._encode_dynamic_image_bucket(_bucket("dynamic_image")))
-        fixed_tile_iter = iter(self._encode_fixed_tile_bucket(_bucket("fixed_tile")))
-        video_temporal_iter = iter(self._encode_temporal_video_bucket(_bucket("video_temporal")))
-
-        bucket_iters = {
-            "dynamic_image": dynamic_image_iter,
-            "fixed_tile": fixed_tile_iter,
-            "video_temporal": video_temporal_iter,
+        outputs_by_modality: Dict[str, List[torch.Tensor]] = {
+            "dynamic_image": self._encode_dynamic_image(_data_for("dynamic_image")),
+            "fixed_tile": self._encode_fixed_tile(_data_for("fixed_tile")),
+            "video_temporal": self._encode_temporal_video(_data_for("video_temporal")),
         }
-        mm_embedding = [next(bucket_iters[kind]) for kind in plan]
+        # Reassemble in input order. Each modality's output list is in
+        # input-param order (helpers preserve it), so an independent
+        # cursor per modality suffices.
+        cursor_by_modality = {modality: 0 for modality in outputs_by_modality}
+        mm_embedding: List[torch.Tensor] = []
+        for modality in plan:
+            mm_embedding.append(outputs_by_modality[modality][cursor_by_modality[modality]])
+            cursor_by_modality[modality] += 1
 
         mm_embedding, num_tokens_in_videos = self.apply_evs(mm_embedding, multimodal_data_list)
-        mm_embedding = [m.reshape(-1, self.llm_hidden_size) for m in mm_embedding]
+        mm_embedding = [embed.reshape(-1, self.llm_hidden_size) for embed in mm_embedding]
         return mm_embedding, num_tokens_in_videos
 
     def _classify(self, multimodal_data: Dict[str, Any]) -> str:
@@ -731,7 +734,7 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
           - ``"dynamic_image"``: variable-size images via ``extract_feature_dynamic``.
           - ``"fixed_tile"``: fixed-tile images and T==1 videos via ``extract_feature``.
           - ``"video_temporal"``: T>1 videos (or videos with mixed-shape
-            per-video pixel lists) batched through ``_encode_temporal_video_bucket``.
+            per-video pixel lists) batched through ``_encode_temporal_video``.
         """
         modality = multimodal_data["modality_type"]
         data = multimodal_data[modality]
@@ -745,9 +748,7 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         # shape and call signature to fixed-tile images.
         return "fixed_tile"
 
-    def _encode_dynamic_image_bucket(
-        self, image_data_list: List[Dict[str, Any]]
-    ) -> List[torch.Tensor]:
+    def _encode_dynamic_image(self, image_data_list: List[Dict[str, Any]]) -> List[torch.Tensor]:
         """Encode all dynamic-resolution image requests in a single ViT forward.
 
         Returns one 3-D embedding tensor per request, in input order.
@@ -785,7 +786,7 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
             cursor += n_images
         return list(torch.split(batched_embeds, per_request_token_counts, dim=1))
 
-    def _encode_fixed_tile_bucket(self, data_list: List[Dict[str, Any]]) -> List[torch.Tensor]:
+    def _encode_fixed_tile(self, data_list: List[Dict[str, Any]]) -> List[torch.Tensor]:
         """Encode all fixed-tile requests (images + T==1 videos) in a single ViT forward.
 
         Returns one 3-D embedding tensor per request, in input order.
@@ -797,9 +798,7 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         batched_embeds = self.extract_feature(pixel_values)
         return list(torch.split(batched_embeds, patches_per_request, dim=0))
 
-    def _encode_temporal_video_bucket(
-        self, video_data_list: List[Dict[str, Any]]
-    ) -> List[torch.Tensor]:
+    def _encode_temporal_video(self, video_data_list: List[Dict[str, Any]]) -> List[torch.Tensor]:
         """Encode all temporal video requests, batching same-shape videos in one ViT pass.
 
         Each video contributes ``t * num_tiles_per_frame`` input tiles. Videos that
@@ -842,7 +841,7 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
 
         # Misaligned videos (`t * p` not divisible by `T`) fall back to a
         # per-video call so `forward_video`'s end-padding stays inside the
-        # video. The remaining videos are bucketed by frame shape and dtype.
+        # video. The remaining videos are grouped by frame shape and dtype.
         aligned_groups: Dict[Tuple, List[int]] = {}
         for i, (_, _, frames_tensor, t, p) in enumerate(entries):
             if T > 1 and (t * p) % T != 0:
@@ -1955,7 +1954,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
         if len(shapes) == 1:
             all_pixel_values = torch.cat(pixel_values_list, dim=0)
         else:
-            # Store as a list - `_encode_temporal_video_bucket` handles both layouts.
+            # Store as a list - `_encode_temporal_video` handles both layouts.
             all_pixel_values = pixel_values_list
         result = {
             "num_patches": torch.tensor(
@@ -2770,47 +2769,41 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
 
         return input_ids
 
-    def _encode_audio_bucket(
-        self, audio_inputs: List[dict]
-    ) -> List[Tuple[torch.Tensor, List[int]]]:
+    def _encode_audio(self, audio_data_list: List[dict]) -> List[Tuple[torch.Tensor, List[int]]]:
         """Encode a batch of audio feature dicts in a single ``sound_encoder`` call.
 
         Inputs may have different time dimensions (variable mel-feature
-        lengths). They are zero-padded to the max time within the bucket
+        lengths). They are zero-padded to the max time across the inputs
         and the per-clip ``feature_attention_mask`` is padded to match;
         the encoder uses the mask to keep valid output lengths intact, so
         padded positions don't leak into the kept slice. Returns one
-        ``(flat_embeddings, per_clip_token_counts)`` tuple per input,
-        in input order — same shape as a per-input ``_encode_audio_data``
-        call.
+        ``(per_input_embeddings, per_clip_token_counts)`` tuple per input,
+        in input order.
         """
-        if not audio_inputs:
+        if not audio_data_list:
             return []
 
         target_device = next(self.sound_encoder.parameters()).device
-        max_time = max(ad["input_audio_features"].shape[1] for ad in audio_inputs)
+        max_time = max(ad["input_audio_features"].shape[1] for ad in audio_data_list)
 
-        feature_chunks: List[torch.Tensor] = []
-        mask_chunks: List[torch.Tensor] = []
+        padded_features: List[torch.Tensor] = []
+        padded_masks: List[torch.Tensor] = []
         clips_per_input: List[int] = []
-        for audio_data in audio_inputs:
+        for audio_data in audio_data_list:
             features = audio_data["input_audio_features"].to(
                 dtype=self.model_dtype, device=target_device
             )
             mask = audio_data["feature_attention_mask"].to(device=target_device)
-            time_len = features.shape[1]
-            if time_len < max_time:
-                pad_t = max_time - time_len
-                # Zero-pad the trailing time positions; mask keeps those
-                # positions invalid so they don't affect the kept output.
-                features = torch.nn.functional.pad(features, (0, 0, 0, pad_t))
-                mask = torch.nn.functional.pad(mask, (0, pad_t))
-            feature_chunks.append(features)
-            mask_chunks.append(mask)
+            pad_amount = max_time - features.shape[1]
+            if pad_amount > 0:
+                features = torch.nn.functional.pad(features, (0, 0, 0, pad_amount))
+                mask = torch.nn.functional.pad(mask, (0, pad_amount))
+            padded_features.append(features)
+            padded_masks.append(mask)
             clips_per_input.append(features.shape[0])
 
-        all_features = torch.cat(feature_chunks, dim=0)
-        all_masks = torch.cat(mask_chunks, dim=0)
+        all_features = torch.cat(padded_features, dim=0)
+        all_masks = torch.cat(padded_masks, dim=0)
 
         sound_embeds = self.sound_encoder(all_features, all_masks)
 
@@ -2819,37 +2812,21 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
             valid_input_lens
         )
 
-        # Per-clip truncate to valid output length.
-        truncated_per_clip: List[torch.Tensor] = []
-        counts_per_clip: List[int] = []
+        per_clip_embeds: List[torch.Tensor] = []
+        per_clip_counts: List[int] = []
         for i in range(sound_embeds.shape[0]):
             valid_len = int(valid_output_lens[i].item())
-            truncated_per_clip.append(sound_embeds[i, :valid_len])
-            counts_per_clip.append(valid_len)
+            per_clip_embeds.append(sound_embeds[i, :valid_len])
+            per_clip_counts.append(valid_len)
 
-        # Group per input.
         results: List[Tuple[torch.Tensor, List[int]]] = []
         cursor = 0
         for n_clips in clips_per_input:
-            flat_emb = torch.cat(truncated_per_clip[cursor : cursor + n_clips], dim=0)
-            per_clip = counts_per_clip[cursor : cursor + n_clips]
-            results.append((flat_emb, per_clip))
+            input_embeds = torch.cat(per_clip_embeds[cursor : cursor + n_clips], dim=0)
+            input_counts = per_clip_counts[cursor : cursor + n_clips]
+            results.append((input_embeds, input_counts))
             cursor += n_clips
         return results
-
-    def _encode_audio_data(self, audio_data: dict) -> Tuple[torch.Tensor, List[int]]:
-        """Encode a single audio feature dict into LLM-space embeddings.
-
-        Thin wrapper over ``_encode_audio_bucket``. Returns a tuple of
-        ``(flat_embeddings, per_clip_token_counts)`` where
-        ``flat_embeddings`` has shape ``[total_tokens, llm_hidden_size]``.
-        """
-        return self._encode_audio_bucket([audio_data])[0]
-
-    def _encode_audio(self, param: MultimodalParams) -> torch.Tensor:
-        """Encode audio features for a standalone audio param."""
-        emb, _ = self._encode_audio_data(param.multimodal_data["audio"])
-        return emb
 
     def _interleave_video_audio_embeddings(
         self,
@@ -2938,31 +2915,35 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
         image_params = [
             p for p in multimodal_params if p.multimodal_data["modality_type"] == "image"
         ]
-        image_embeds_iter: Iterator[torch.Tensor] = iter([])
+        image_embeds: List[torch.Tensor] = []
         if image_params:
             image_embeds, _ = self.vision_encoder(image_params)
-            image_embeds_iter = iter(image_embeds)
 
         # Collect all audio inputs (standalone + video-extracted) in
         # encounter order and run them through one sound_encoder call.
-        audio_inputs: List[dict] = []
+        audio_data_list: List[dict] = []
         for param in multimodal_params:
             modality_type = param.multimodal_data["modality_type"]
             if modality_type == "audio":
-                audio_inputs.append(param.multimodal_data["audio"])
+                audio_data_list.append(param.multimodal_data["audio"])
             elif modality_type == "video" and self.sound_encoder is not None:
                 audio_data = param.multimodal_data["video"].get("audio")
                 if audio_data is not None:
-                    audio_inputs.append(audio_data)
-        audio_results_iter: Iterator[Tuple[torch.Tensor, List[int]]] = iter([])
-        if audio_inputs:
-            audio_results_iter = iter(self._encode_audio_bucket(audio_inputs))
+                    audio_data_list.append(audio_data)
+        audio_outputs: List[Tuple[torch.Tensor, List[int]]] = (
+            self._encode_audio(audio_data_list) if audio_data_list else []
+        )
 
+        # Walk params in input order, drawing pre-computed outputs by
+        # incrementing per-modality cursors.
         mm_embeddings: List[torch.Tensor] = []
+        image_idx = 0
+        audio_idx = 0
         for param in multimodal_params:
             modality_type = param.multimodal_data["modality_type"]
             if modality_type == "image":
-                mm_embeddings.append(next(image_embeds_iter))
+                mm_embeddings.append(image_embeds[image_idx])
+                image_idx += 1
             elif modality_type == "video":
                 embs, num_tokens = self.vision_encoder([param])
                 vision_emb = embs[0]
@@ -2973,7 +2954,8 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                 # (v1_img_context, v1_sound_context, v2_img_context, ...).
                 audio_data = param.multimodal_data["video"].get("audio")
                 if audio_data is not None and self.sound_encoder is not None:
-                    audio_emb, per_clip_audio_counts = next(audio_results_iter)
+                    audio_emb, per_clip_audio_counts = audio_outputs[audio_idx]
+                    audio_idx += 1
                     vision_emb = self._interleave_video_audio_embeddings(
                         vision_emb,
                         audio_emb,
@@ -2985,7 +2967,8 @@ class NemotronH_Nano_VL_V2(transformers.PreTrainedModel):
                     )
                 mm_embeddings.append(vision_emb)
             elif modality_type == "audio":
-                audio_emb, _ = next(audio_results_iter)
+                audio_emb, _ = audio_outputs[audio_idx]
+                audio_idx += 1
                 mm_embeddings.append(audio_emb)
             else:
                 raise ValueError(f"Unknown modality: {modality_type}")
