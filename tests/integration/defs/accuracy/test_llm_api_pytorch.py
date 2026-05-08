@@ -2453,21 +2453,26 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
+    @parametrize_with_ids("v2_kv_cache", [False, True])
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("fp8kv,cuda_graph,overlap_scheduler",
                           [(False, False, False), (True, True, True)])
     @parametrize_with_ids("mtp_nextn", [0, 2])
     @parametrize_with_ids(
         "batch_wait_timeout_iters,batch_wait_max_tokens_ratio", [(0, 0),
-                                                                 (10, 0.75),
+                                                                 (10, 1.0),
                                                                  (10, 0),
                                                                  (0, 0.75)])
     def test_nvfp4_batch_waiting(self, torch_compile, fp8kv, cuda_graph,
                                  overlap_scheduler, mtp_nextn,
                                  batch_wait_timeout_iters,
-                                 batch_wait_max_tokens_ratio):
+                                 batch_wait_max_tokens_ratio, v2_kv_cache):
         moe_backend = "CUTLASS"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        # V2 KV cache manager auto-selects the V2 scheduler, which is the
+        # path that grows ctx KV during scheduling and needs the
+        # delay-batching ctx revert to release pages during the wait window.
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
+                                        use_kv_cache_manager_v2=v2_kv_cache)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
