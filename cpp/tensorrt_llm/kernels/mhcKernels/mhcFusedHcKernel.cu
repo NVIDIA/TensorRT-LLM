@@ -362,8 +362,13 @@ static void mhcFusedHcLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     int const bs = (bigfuse_block_size > 0) ? bigfuse_block_size : selectBigFuseBS(M);
 
     // ---- Zero workspace buffers (atomic accumulators) ----
-    fhcZeroWorkspaces(y_acc_workspace, static_cast<uint32_t>(M) * FHC_SHAPE_N, r_acc_workspace,
-        static_cast<uint32_t>(M), /*done_counter=*/nullptr, /*done_elems=*/0, stream);
+    // KS=1 takes the direct-store path in the kernel epilogue (no atomicAdd,
+    // each (m,n) written by exactly one CTA), so pre-zeroing is unnecessary.
+    if (ks > 1)
+    {
+        fhcZeroWorkspaces(y_acc_workspace, static_cast<uint32_t>(M) * FHC_SHAPE_N, r_acc_workspace,
+            static_cast<uint32_t>(M), /*done_counter=*/nullptr, /*done_elems=*/0, stream);
+    }
 
     // ---- Build TMA descriptors (cached by ptr+shape) ----
     CUtensorMap desc_res = getCachedTma2D(const_cast<__nv_bfloat16*>(residual_prev),
@@ -606,8 +611,14 @@ static void mhcFusedHcAllInOneLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloa
     uint32_t const m_tiles = (m_u + FHC_BLOCK_M - 1) / FHC_BLOCK_M;
 
     // ---- Zero workspace buffers (atomic accumulators + done counter) ----
-    fhcZeroWorkspaces(y_acc_workspace, static_cast<uint32_t>(M) * FHC_SHAPE_N, r_acc_workspace,
-        static_cast<uint32_t>(M), done_counter_workspace, m_tiles, stream);
+    // KS=1 takes the direct-store path (no atomic on y_acc/r_acc) and skips
+    // the done_counter atomic election (Phase 3 just __threadfence_block +
+    // __syncthreads). All three buffers are unused at KS=1 → skip the zero.
+    if (ks > 1)
+    {
+        fhcZeroWorkspaces(y_acc_workspace, static_cast<uint32_t>(M) * FHC_SHAPE_N, r_acc_workspace,
+            static_cast<uint32_t>(M), done_counter_workspace, m_tiles, stream);
+    }
 
     // ---- Build TMA descriptors (cached by ptr+shape) ----
     CUtensorMap desc_res = getCachedTma2D(const_cast<__nv_bfloat16*>(residual_prev),

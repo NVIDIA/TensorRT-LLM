@@ -379,7 +379,16 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
                 uint32_t phys_col_grp = col_group ^ (m & 7);
                 uint32_t byte = m * kSwizzleCDMode + phys_col_grp * kNumBankGroupBytes + in_group * sizeof(float);
                 float val = *reinterpret_cast<float const*>(reinterpret_cast<uint8_t const*>(smem_cd) + byte);
-                atomicAdd(&D[gm * SHAPE_N + n], val);
+                if constexpr (kNumSplits == 1)
+                {
+                    // Single-CTA-per-(m,n) at KS=1 → safe to store directly.
+                    // Caller no longer needs to pre-zero D (see launcher).
+                    D[gm * SHAPE_N + n] = val;
+                }
+                else
+                {
+                    atomicAdd(&D[gm * SHAPE_N + n], val);
+                }
             }
         }
 
@@ -567,10 +576,21 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1) fused_tf3
         {
             uint32_t gm_u = m_block_idx * BLOCK_M + upper_row;
             uint32_t gm_l = m_block_idx * BLOCK_M + lower_row;
-            if (gm_u < shape_m)
-                atomicAdd(&sqr_sum[gm_u], sqr_u);
-            if (gm_l < shape_m)
-                atomicAdd(&sqr_sum[gm_l], sqr_l);
+            if constexpr (kNumSplits == 1)
+            {
+                // KS=1 → only this CTA writes (gm_u, gm_l), no race possible.
+                if (gm_u < shape_m)
+                    sqr_sum[gm_u] = sqr_u;
+                if (gm_l < shape_m)
+                    sqr_sum[gm_l] = sqr_l;
+            }
+            else
+            {
+                if (gm_u < shape_m)
+                    atomicAdd(&sqr_sum[gm_u], sqr_u);
+                if (gm_l < shape_m)
+                    atomicAdd(&sqr_sum[gm_l], sqr_l);
+            }
         }
     }
 #else
@@ -906,7 +926,16 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
                 uint32_t phys_col_grp = col_group ^ (m & 7);
                 uint32_t byte = m * kSwizzleCDMode + phys_col_grp * kNumBankGroupBytes + in_group * sizeof(float);
                 float val = *reinterpret_cast<float const*>(reinterpret_cast<uint8_t const*>(smem_cd) + byte);
-                atomicAdd(&D[gm * SHAPE_N + n], val);
+                if constexpr (kNumSplits == 1)
+                {
+                    // Single-CTA-per-(m,n) at KS=1 → safe to store directly.
+                    // Caller no longer needs to pre-zero D (see launcher).
+                    D[gm * SHAPE_N + n] = val;
+                }
+                else
+                {
+                    atomicAdd(&D[gm * SHAPE_N + n], val);
+                }
             }
         }
 
@@ -1086,10 +1115,21 @@ __global__ void __launch_bounds__(kNumMMAThreads + kNumPmapThreads, 1)
         {
             uint32_t gm_u = m_block_idx * BLOCK_M + upper_row;
             uint32_t gm_l = m_block_idx * BLOCK_M + lower_row;
-            if (gm_u < shape_m)
-                atomicAdd(&sqr_sum[gm_u], sqr_u);
-            if (gm_l < shape_m)
-                atomicAdd(&sqr_sum[gm_l], sqr_l);
+            if constexpr (kNumSplits == 1)
+            {
+                // KS=1 → only this CTA writes (gm_u, gm_l), no race possible.
+                if (gm_u < shape_m)
+                    sqr_sum[gm_u] = sqr_u;
+                if (gm_l < shape_m)
+                    sqr_sum[gm_l] = sqr_l;
+            }
+            else
+            {
+                if (gm_u < shape_m)
+                    atomicAdd(&sqr_sum[gm_u], sqr_u);
+                if (gm_l < shape_m)
+                    atomicAdd(&sqr_sum[gm_l], sqr_l);
+            }
         }
     }
 
