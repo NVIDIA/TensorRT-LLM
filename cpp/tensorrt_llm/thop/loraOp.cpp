@@ -1,6 +1,6 @@
 
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -135,14 +135,8 @@ std::vector<th::Tensor> lora_grouped_gemm(th::Tensor const& input, th::Tensor co
         }
     }
 
-    thread_local std::shared_ptr<tensorrt_llm::common::CublasMMWrapper> cublasWrapper;
-    if (cublasWrapper == nullptr)
-    {
-        auto cublasHandle = getCublasHandle();
-        auto cublasLtHandle = getCublasLtHandle();
-        cublasWrapper
-            = std::make_shared<tensorrt_llm::common::CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
-    }
+    auto cublasWrapper
+        = std::make_shared<tc::CublasMMWrapper>(getCublasHandle(), getCublasLtHandle(), nullptr, nullptr);
 
     int const inHiddenSize = input.sizes()[input.sizes().size() - 1];
 

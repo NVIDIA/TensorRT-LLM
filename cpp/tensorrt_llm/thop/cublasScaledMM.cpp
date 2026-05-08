@@ -24,6 +24,8 @@
 #include "tensorrt_llm/thop/outputTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "userbuffersTensor.h"
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cublasLt.h>
 #include <torch/extension.h>
 
@@ -63,9 +65,9 @@ void set_algo_attr(cublasLtMatmulAlgo_t& algo, std::array<int, 8> const& attr_li
         cublasLtMatmulAlgoConfigSetAttribute(&algo, CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID, &cga, sizeof(cga)));
 }
 
-bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapper> const& cublasWrapper, int32_t m,
-    int32_t n, int32_t k, cublasComputeType_t compType, cudaDataType_t scaleType, cudaDataType_t aType,
-    cudaDataType_t bType, cudaDataType_t outType)
+bool find_special_algo(cublasLtMatmulAlgo_t& algo, CublasMMWrapper const& cublasWrapper, int32_t m, int32_t n,
+    int32_t k, cublasComputeType_t compType, cudaDataType_t scaleType, cudaDataType_t aType, cudaDataType_t bType,
+    cudaDataType_t outType)
 {
     int32_t mp2 = std::max(nextPowerOfTwo(m), 8);
     AlgoListType const* algo_list = nullptr;
@@ -91,7 +93,7 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
     {
         int const algoID = algo_iter->second[0];
         check_cuda_error(cublasLtMatmulAlgoInit(
-            cublasWrapper->getCublasLtHandle(), compType, scaleType, aType, bType, outType, outType, algoID, &algo));
+            cublasWrapper.getCublasLtHandle(), compType, scaleType, aType, bType, outType, outType, algoID, &algo));
         TLLM_LOG_DEBUG("Found special cublasLt algo for m=%d, k=%d, n=%d\n", m, k, n);
         set_algo_attr(algo, algo_iter->second);
     }
@@ -99,7 +101,7 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
     {
         int const algoID = 66; // CUBLASLT_MATMUL_ALGO_NVJET
         check_cuda_error(cublasLtMatmulAlgoInit(
-            cublasWrapper->getCublasLtHandle(), compType, scaleType, aType, bType, outType, outType, algoID, &algo));
+            cublasWrapper.getCublasLtHandle(), compType, scaleType, aType, bType, outType, outType, algoID, &algo));
         TLLM_LOG_DEBUG("No special cublasLt algo found for m=%d, k=%d, n=%d\n", m, k, n);
         return false;
     }
@@ -107,8 +109,8 @@ bool find_special_algo(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapp
     return true;
 }
 
-bool find_special_algo_deprecated(cublasLtMatmulAlgo_t& algo, std::shared_ptr<CublasMMWrapper> const& cublasWrapper,
-    int32_t m, int32_t n, int32_t k, cublasComputeType_t compType, cudaDataType_t scaleType, cudaDataType_t aType,
+bool find_special_algo_deprecated(cublasLtMatmulAlgo_t& algo, CublasMMWrapper const& cublasWrapper, int32_t m,
+    int32_t n, int32_t k, cublasComputeType_t compType, cudaDataType_t scaleType, cudaDataType_t aType,
     cudaDataType_t bType, cudaDataType_t outType)
 {
     int32_t mp2 = std::max(nextPowerOfTwo(m), 8);
@@ -118,7 +120,7 @@ bool find_special_algo_deprecated(cublasLtMatmulAlgo_t& algo, std::shared_ptr<Cu
     }
     int const algoID = 52;
     check_cuda_error(cublasLtMatmulAlgoInit(
-        cublasWrapper->getCublasLtHandle(), compType, scaleType, aType, bType, outType, outType, algoID, &algo));
+        cublasWrapper.getCublasLtHandle(), compType, scaleType, aType, bType, outType, outType, algoID, &algo));
     int tileID = CUBLASLT_MATMUL_TILE_256x128;
     int swizzle = 0;
     uint16_t cga = CUBLASLT_CLUSTER_SHAPE_2x1x1;
@@ -172,13 +174,8 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
     int32_t n = b.sizes()[1];
     int32_t k = a.sizes()[1];
 
-    thread_local std::shared_ptr<CublasMMWrapper> cublasWrapper;
-    if (cublasWrapper == nullptr)
-    {
-        auto cublasHandle = getCublasHandle();
-        auto cublasLtHandle = getCublasLtHandle();
-        cublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
-    }
+    at::cuda::CUDAGuard deviceGuard(a.device());
+    CublasMMWrapper cublasWrapper(getCublasHandle(), getCublasLtHandle(), nullptr, nullptr);
 
     cudaDataType_t aType = convert_torch_dtype(a.scalar_type());
     cudaDataType_t bType = convert_torch_dtype(b.scalar_type());
@@ -187,7 +184,7 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
     // hardcode compute type for FP8
     cublasComputeType_t compType = CUBLAS_COMPUTE_32F;
     cudaDataType_t scaleType = CUDA_R_32F;
-    cublasWrapper->setGemmConfig(aType, bType, outType, /*computeType=*/scaleType);
+    cublasWrapper.setGemmConfig(aType, bType, outType, /*computeType=*/scaleType);
 
     auto const workspace_options = torch::TensorOptions().dtype(torch::kUInt8).device(a.device());
     auto workspace = torch::empty(CUBLAS_WORKSPACE_SIZE, workspace_options);
@@ -213,8 +210,8 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
         bias_ptr = static_cast<void*>(bias.value().data_ptr());
     }
 
-    cublasWrapper->setStream(stream);
-    cublasWrapper->setWorkspace(ws_ptr);
+    cublasWrapper.setStream(stream);
+    cublasWrapper.setWorkspace(ws_ptr);
 
     // set algo according to m/n/k
     cublasLtMatmulAlgo_t algo;
@@ -227,15 +224,19 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
 #endif
 
     // swap A and B. A is column major, B is row major.
-    cublasWrapper->createDescriptors(
+    cublasWrapper.createDescriptors(
         CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, /*lda=*/k, /*ldb=*/k, /*ldc=*/n, /*fastAcc=*/fast_acc);
     if (use_scale)
-        cublasWrapper->setScaleDescriptors(a_scale, b_scale);
+    {
+        cublasWrapper.setScaleDescriptors(a_scale, b_scale);
+    }
     if (use_bias)
-        cublasWrapper->setBiasDescriptor(bias_ptr);
-    cublasWrapper->Gemm(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, /*A=*/b_ptr, /*lda=*/k, /*B=*/a_ptr, /*ldb=*/k, out_ptr,
+    {
+        cublasWrapper.setBiasDescriptor(bias_ptr);
+    }
+    cublasWrapper.Gemm(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, /*A=*/b_ptr, /*lda=*/k, /*B=*/a_ptr, /*ldb=*/k, out_ptr,
         /*ldc=*/n, 1.0F, 0.0F, algo, has_algo, true);
-    cublasWrapper->destroyDescriptors();
+    cublasWrapper.destroyDescriptors();
 }
 
 } // namespace

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2024-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -86,21 +86,12 @@ void cublas_fp4_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::T
     int32_t k_compressed = a.sizes()[1];
     int32_t k = k_compressed * 2;
 
-    // Use device-aware thread-local CublasMMWrapper for FP4 GEMM
     at::cuda::CUDAGuard deviceGuard(a.device());
-
-    thread_local std::unordered_map<int, std::shared_ptr<CublasMMWrapper>> cublasWrappers;
-    auto& cublasWrapper = cublasWrappers[a.get_device()];
-    if (!cublasWrapper)
-    {
-        auto cublasHandle = getCublasHandle();
-        auto cublasLtHandle = getCublasLtHandle();
-        cublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
-    }
+    CublasMMWrapper cublasWrapper(getCublasHandle(), getCublasLtHandle(), nullptr, nullptr);
 
     // Set FP4 configuration based on output tensor dtype
     cudaDataType_t outType = getCudaDataType(out.scalar_type());
-    cublasWrapper->setFP4GemmConfig(outType);
+    cublasWrapper.setFP4GemmConfig(outType);
 
     // Get workspace (reuse cached workspace for this device)
     auto const& workspace = getWorkspaceTensor(a.device());
@@ -131,8 +122,8 @@ void cublas_fp4_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::T
     TLLM_CHECK_WITH_INFO(alpha_ptr != nullptr, "alpha_ptr is null");
 
     // Set workspace and stream
-    cublasWrapper->setStream(stream);
-    cublasWrapper->setWorkspace(ws_ptr);
+    cublasWrapper.setStream(stream);
+    cublasWrapper.setWorkspace(ws_ptr);
 
     // Perform FP4 GEMM using CublasMMWrapper
     // Matrix layout conversion for cuBLASLt:
@@ -144,11 +135,11 @@ void cublas_fp4_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::T
     //   3. Passing dimensions as (n, m, k) instead of (m, n, k)
     //   4. Swapping scaling factors to match (b_sf_ptr, a_sf_ptr)
     // Note: beta is always 0 and is managed internally by BlockScaleGemm
-    cublasWrapper->BlockScaleGemm(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, b_ptr, k, // B matrix (swapped to first position)
-        a_ptr, k,                                                              // A matrix (swapped to second position)
-        out_ptr, n,                                                            // Output: C[m, n] in row-major
-        b_sf_ptr, a_sf_ptr,                                                    // Scaling factors (also swapped)
-        alpha_ptr);                                                            // Uses default algorithm (nullptr)
+    cublasWrapper.BlockScaleGemm(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, b_ptr, k, // B matrix (swapped to first position)
+        a_ptr, k,                                                             // A matrix (swapped to second position)
+        out_ptr, n,                                                           // Output: C[m, n] in row-major
+        b_sf_ptr, a_sf_ptr,                                                   // Scaling factors (also swapped)
+        alpha_ptr);                                                           // Uses default algorithm (nullptr)
 }
 
 } // namespace
@@ -288,21 +279,18 @@ private:
 
             AlgoCache cache;
 
-            // Create cublas wrapper
             at::cuda::CUDAGuard deviceGuard(device);
-            auto cublasHandle = getCublasHandle();
-            auto cublasLtHandle = getCublasLtHandle();
-            auto cublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
+            CublasMMWrapper cublasWrapper(getCublasHandle(), getCublasLtHandle(), nullptr, nullptr);
 
             // Set FP4 configuration
             cudaDataType_t outType = mOutputDtype == at::ScalarType::Half
                 ? CUDA_R_16F
                 : (mOutputDtype == at::ScalarType::BFloat16 ? CUDA_R_16BF : CUDA_R_32F);
 
-            cublasWrapper->setFP4GemmConfig(outType);
+            cublasWrapper.setFP4GemmConfig(outType);
 
             // Create descriptors
-            cublasWrapper->createDescriptors(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, k, k, n, 0);
+            cublasWrapper.createDescriptors(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, k, k, n, 0);
 
             // Use provided scale tensors for descriptor setup
             // FP4 GEMM always requires scale tensors
@@ -310,10 +298,10 @@ private:
             void* b_sf_ptr = const_cast<void*>(reinterpret_cast<void const*>(mat2_scale.data_ptr()));
 
             // Set scale descriptors (required for FP4 GEMM heuristics)
-            cublasWrapper->setScaleDescriptors(a_sf_ptr, b_sf_ptr);
+            cublasWrapper.setScaleDescriptors(a_sf_ptr, b_sf_ptr);
 
             // Get heuristic algorithms
-            auto heuristics = cublasWrapper->getTactics(CUBLAS_OP_T, CUBLAS_OP_N, m, n, k, k, k, n);
+            auto heuristics = cublasWrapper.getTactics(CUBLAS_OP_T, CUBLAS_OP_N, m, n, k, k, k, n);
 
             // Filter valid algorithms
             for (auto const& h : heuristics)
@@ -336,7 +324,7 @@ private:
                     m, k, n);
             }
 
-            cublasWrapper->destroyDescriptors();
+            cublasWrapper.destroyDescriptors();
 
             mAlgoCache[key] = std::move(cache);
         }
@@ -362,19 +350,11 @@ private:
         int32_t k = k_compressed * 2;
 
         at::cuda::CUDAGuard deviceGuard(a.device());
-
-        thread_local std::unordered_map<int, std::shared_ptr<CublasMMWrapper>> cublasWrappers;
-        auto& cublasWrapper = cublasWrappers[a.get_device()];
-        if (!cublasWrapper)
-        {
-            auto cublasHandle = getCublasHandle();
-            auto cublasLtHandle = getCublasLtHandle();
-            cublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
-        }
+        CublasMMWrapper cublasWrapper(getCublasHandle(), getCublasLtHandle(), nullptr, nullptr);
 
         // Set FP4 configuration with correct output type
         cudaDataType_t outType = getCudaDataType(output_dtype);
-        cublasWrapper->setFP4GemmConfig(outType);
+        cublasWrapper.setFP4GemmConfig(outType);
 
         // Get workspace (reuse cached workspace for this device)
         auto const& workspace = getWorkspaceTensor(a.device());
@@ -397,8 +377,8 @@ private:
 
         TLLM_CHECK_WITH_INFO(alpha_ptr != nullptr, "alpha_ptr is null");
 
-        cublasWrapper->setStream(stream);
-        cublasWrapper->setWorkspace(ws_ptr);
+        cublasWrapper.setStream(stream);
+        cublasWrapper.setWorkspace(ws_ptr);
 
         // Matrix layout conversion for cuBLASLt (same as in cublas_fp4_gemm_caller):
         //   PyTorch uses row-major layout: A[m, k] x B[n, k]^T = C[m, n]
@@ -411,7 +391,7 @@ private:
 
         // Use BlockScaleGemm with specified algorithm for autotuning
         // Note: beta is always 0 and is managed internally by BlockScaleGemm
-        cublasWrapper->BlockScaleGemm(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, b_ptr,
+        cublasWrapper.BlockScaleGemm(CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, b_ptr,
             k,                  // B matrix (swapped to first position)
             a_ptr, k,           // A matrix (swapped to second position)
             out_ptr, n,         // Output: C[m, n] in row-major
