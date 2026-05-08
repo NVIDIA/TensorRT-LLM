@@ -275,6 +275,18 @@ def test_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens, compres
     ), "CUDA top_k_per_row results don't match torch.topk"
 
 
+# Regression coverage for the SM-saturation heuristic in indexerTopK decode.
+@pytest.mark.parametrize("batch_size", [16, 32, 128])
+@pytest.mark.parametrize("next_n", [1, 2])
+@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("num_tokens", [4096, 16384, 32768])
+@pytest.mark.parametrize("compress_ratio", [1, 4])
+def test_indexer_topk_decode_sm_saturation(
+    batch_size, next_n, index_topk, num_tokens, compress_ratio
+):
+    _run_indexer_topk_decode_check(batch_size, next_n, index_topk, num_tokens, compress_ratio)
+
+
 # ---------------------------------------------------------------------------
 # Split-work (multi-pass radix) decode path, opt-in via the thop wrapper
 # ---------------------------------------------------------------------------
