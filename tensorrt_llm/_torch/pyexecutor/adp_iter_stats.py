@@ -75,8 +75,8 @@ class ADPIterStatsBuffer:
 
         if iter_id in self._payloads and iter_id not in self._synthetic_iters:
             logger.warning(
-                "Replacing duplicate attention-DP IterationStats payload "
-                f"for iter {iter_id}")
+                f"Replacing duplicate attention-DP IterationStats payload for iter {iter_id}"
+            )
 
         self._payloads[iter_id] = payload
         self._synthetic_iters.discard(iter_id)
@@ -140,18 +140,18 @@ class ADPIterStatsBuffer:
 
         stats = IterationStats()
         for attr in (
-                "timestamp",
-                "iter",
-                "iter_latency_ms",
-                "new_active_requests_queue_latency_ms",
-                "num_new_active_requests",
-                "num_active_requests",
-                "num_queued_requests",
-                "num_completed_requests",
-                "max_num_active_requests",
-                "gpu_mem_usage",
-                "cpu_mem_usage",
-                "pinned_mem_usage",
+            "timestamp",
+            "iter",
+            "iter_latency_ms",
+            "new_active_requests_queue_latency_ms",
+            "num_new_active_requests",
+            "num_active_requests",
+            "num_queued_requests",
+            "num_completed_requests",
+            "max_num_active_requests",
+            "gpu_mem_usage",
+            "cpu_mem_usage",
+            "pinned_mem_usage",
         ):
             setattr(stats, attr, getattr(rank0_stats, attr))
 
@@ -159,10 +159,10 @@ class ADPIterStatsBuffer:
         # are attached separately and remain rank-0-only to avoid double-logging
         # global KV-cache deltas.
         for attr in (
-                "kv_cache_stats",
-                "cross_kv_cache_stats",
-                "static_batching_stats",
-                "specdec_stats",
+            "kv_cache_stats",
+            "cross_kv_cache_stats",
+            "static_batching_stats",
+            "specdec_stats",
         ):
             nested_stats = getattr(rank0_stats, attr)
             if nested_stats is not None:
@@ -176,21 +176,16 @@ class ADPIterStatsBuffer:
         ifb.num_gen_kv_tokens = payload.num_gen_kv_tokens
         ifb.num_paused_requests = payload.num_paused_requests
         ifb.num_paused_kv_tokens = payload.num_paused_kv_tokens
-        ifb.num_scheduled_requests = (ifb.num_context_requests +
-                                      ifb.num_gen_requests)
+        ifb.num_scheduled_requests = ifb.num_context_requests + ifb.num_gen_requests
 
         if source_ifb is not None:
             ifb.micro_batch_id = source_ifb.micro_batch_id
-            ifb.avg_num_decoded_tokens_per_iter = (
-                source_ifb.avg_num_decoded_tokens_per_iter)
+            ifb.avg_num_decoded_tokens_per_iter = source_ifb.avg_num_decoded_tokens_per_iter
             if rank == 0:
-                ifb.num_queued_context_requests = (
-                    source_ifb.num_queued_context_requests)
+                ifb.num_queued_context_requests = source_ifb.num_queued_context_requests
                 ifb.num_queued_ctx_tokens = source_ifb.num_queued_ctx_tokens
-                ifb.num_queued_gen_requests = (
-                    source_ifb.num_queued_gen_requests)
-                ifb.num_queued_gen_kv_tokens = (
-                    source_ifb.num_queued_gen_kv_tokens)
+                ifb.num_queued_gen_requests = source_ifb.num_queued_gen_requests
+                ifb.num_queued_gen_kv_tokens = source_ifb.num_queued_gen_kv_tokens
 
         if rank != 0:
             stats.num_queued_requests = 0
@@ -201,20 +196,17 @@ class ADPIterStatsBuffer:
         stats.inflight_batching_stats = ifb
         return stats
 
-    def finalize(self, all_rank_states: List[RankState],
-                 *, is_rank0: bool) -> List[ADPIterStatsRecord]:
+    def finalize(
+        self, all_rank_states: List[RankState], *, is_rank0: bool
+    ) -> List[ADPIterStatsRecord]:
         """Align payloads and return per-rank rows once all ranks are ready."""
-        pending_states = [
-            s for s in all_rank_states if s.iter_stats.has_iter_stats
-        ]
+        pending_states = [s for s in all_rank_states if s.iter_stats.has_iter_stats]
         if not pending_states:
             return []
 
         rank0_state = next((s for s in all_rank_states if s.rank == 0), None)
         if rank0_state is None or not rank0_state.iter_stats.has_iter_stats:
-            logger.debug(
-                "Waiting for rank 0 attention-DP IterationStats payload before "
-                "fanout")
+            logger.debug("Waiting for rank 0 attention-DP IterationStats payload before fanout")
             return []
 
         # Rank 0 owns the stats queue consumed by get_stats(), so converge all
@@ -226,16 +218,17 @@ class ADPIterStatsBuffer:
         self._ensure_zero_payload(iter_stats_iter)
 
         matching_states = [
-            s for s in all_rank_states
-            if (s.iter_stats.has_iter_stats
-                and s.iter_stats.iter_stats_iter == iter_stats_iter)
+            s
+            for s in all_rank_states
+            if (s.iter_stats.has_iter_stats and s.iter_stats.iter_stats_iter == iter_stats_iter)
         ]
         if len(matching_states) != len(all_rank_states):
             logger.debug(
                 "Waiting for attention-DP IterationStats payloads for rank 0 "
                 f"iter {iter_stats_iter}: received "
                 f"{len(matching_states)}/{len(all_rank_states)} matching "
-                "rank payloads")
+                "rank payloads"
+            )
             return []
 
         records: List[ADPIterStatsRecord] = []
@@ -245,7 +238,8 @@ class ADPIterStatsBuffer:
                 logger.warning(
                     "Skipping attention-DP IterationStats fanout on "
                     f"rank 0: pending IterationStats object is missing for "
-                    f"iter {iter_stats_iter}")
+                    f"iter {iter_stats_iter}"
+                )
                 self._clear_through(iter_stats_iter)
                 return []
 
@@ -256,12 +250,12 @@ class ADPIterStatsBuffer:
                 rank = rank_state.rank
                 records.append(
                     ADPIterStatsRecord(
-                        stats=self._make_rank_iter_stats(
-                            rank0_stats, rank_state),
+                        stats=self._make_rank_iter_stats(rank0_stats, rank_state),
                         req_stats=req_stats if rank == 0 else None,
                         kv_iter_stats=kv_iter_stats if rank == 0 else None,
                         attention_dp_rank=rank,
-                    ))
+                    )
+                )
 
         self._clear_through(iter_stats_iter)
         return records

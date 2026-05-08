@@ -1415,11 +1415,10 @@ class PyExecutor:
                                         batch_state.scheduled_requests,
                                         micro_batch_id)
         if self.enable_attention_dp:
-            self._adp_iter_stats.queue(
-                stats,
-                req_stats,
-                kv_iter_stats=self._latest_kv_iter_stats,
-                is_rank0=self.dist.rank == 0)
+            self._adp_iter_stats.queue(stats,
+                                       req_stats,
+                                       kv_iter_stats=self._latest_kv_iter_stats,
+                                       is_rank0=self.dist.rank == 0)
         else:
             self._append_iter_stats(stats, req_stats)
 
@@ -1949,7 +1948,8 @@ class PyExecutor:
                 and self.model_engine.spec_config.draft_len_schedule is not None
                 and self.model_engine.spec_config.spec_dec_mode.
                 support_dynamic_draft_len()):
-            from tensorrt_llm._torch.speculative.utils import get_draft_len_for_batch_size
+            from tensorrt_llm._torch.speculative.utils import \
+                get_draft_len_for_batch_size
 
             # 1. Resolve runtime draft length from schedule
             runtime_draft_len = get_draft_len_for_batch_size(

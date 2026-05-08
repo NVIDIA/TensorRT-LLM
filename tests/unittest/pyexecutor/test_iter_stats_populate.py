@@ -686,8 +686,7 @@ def test_attention_dp_fanout_waits_for_complete_matching_payloads():
         ),
     )
 
-    records = buffer.finalize([rank0_state, mismatched_rank1_state],
-                              is_rank0=True)
+    records = buffer.finalize([rank0_state, mismatched_rank1_state], is_rank0=True)
 
     assert records == []
     assert buffer.next_payload() is rank0_state.iter_stats
