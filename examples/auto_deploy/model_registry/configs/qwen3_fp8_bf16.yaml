@@ -1,17 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Qwen3 dense FP8 checkpoints can hit NVRTC failures in the finegrained FP8
-# linear path. Match the MiniMax-M2 workaround by forcing BF16 weights and
-# avoiding the finegrained FP8 fusion transforms for the registry smoke test.
-transforms:
-  match_finegrained_fp8_swiglu_pattern:
-    enabled: false
-  fuse_finegrained_fp8_linear:
-    enabled: false
-  fuse_finegrained_fp8_moe:
-    enabled: false
-  fuse_finegrained_fp8_swiglu:
-    enabled: false
+# Qwen3 dense FP8 checkpoints run through the BF16-weight path here.
 model_kwargs:
   torch_dtype: bfloat16

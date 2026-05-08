@@ -351,8 +351,8 @@ models:
   config_id: minimax_m2
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'minimax_m2.yaml']
 - name: MiniMaxAI/MiniMax-M2.7
-  config_id: minimax_m2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'minimax_m2.yaml']
+  config_id: minimax_m2_7
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'minimax_m2.7.yaml']
 # --- MiMo-V2-Flash (Feb 2026) ---
 - name: XiaomiMiMo/MiMo-V2-Flash
   config_id: default_ws_8
@@ -382,7 +382,7 @@ models:
 # --- Qwen3-Next (Sep 2025) ---
 - name: Qwen/Qwen3-Next-80B-A3B-Instruct
   config_id: qwen3next
-  yaml_extra: ['qwen3Next.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'qwen3Next.yaml']
 # --- OLMo 3 (Nov 2025) ---
 - name: allenai/Olmo-3-7B-Instruct
   config_id: default_ws_1
@@ -524,8 +524,8 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 # --- Nvidia Nemotron Flash (2025) ---
 - name: nvidia/Nemotron-Flash-3B-Instruct
-  config_id: default_ws_2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  config_id: nemotron_flash
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'nemotron_flash.yaml']
 # --- InternLM3 (Jan 2025) ---
 - name: internlm/internlm3-8b-instruct
   config_id: default_ws_2
