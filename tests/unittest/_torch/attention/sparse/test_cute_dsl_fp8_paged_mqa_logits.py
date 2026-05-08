@@ -346,7 +346,7 @@ def test_cute_dsl_fp8_paged_mqa_logits(
 
 @skip_not_sm100
 @pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("next_n", [1, 2])
+@pytest.mark.parametrize("next_n", [1, 2, 3, 4])
 @pytest.mark.parametrize("num_heads", [64])
 @pytest.mark.parametrize("avg_ctx", [256, 4096])
 @pytest.mark.parametrize("phys_block_kv", [32, 64])
@@ -638,36 +638,18 @@ def benchmark_fp8_paged_mqa_logits(
                 try:
                     from tensorrt_llm.deep_gemm import fp8_paged_mqa_logits
 
-                    # DeepGEMM doesn't support next_n=3 natively; expand to
-                    # batch=B*next_n, next_n=1 (same approach as production MTP
-                    # expand path in dsa.py).
-                    dg_next_n = next_n
-                    dg_data = data
-                    if next_n == 3:
-                        exp_bs = batch_size * next_n
-                        dg_data = {
-                            "q_fp8": data["q_fp8"].reshape(exp_bs, 1, num_heads, head_dim),
-                            "kv_fused": data["kv_fused"],
-                            "weights": data["weights"].reshape(exp_bs, num_heads),
-                            "context_lens": data["context_lens"].repeat_interleave(next_n),
-                            "block_table": data["block_table"].repeat_interleave(next_n, dim=0),
-                            "max_model_len": data["max_model_len"],
-                        }
-                        dg_next_n = 1
-
                     # SM100 always uses num_kv_multicast=1 in upgraded DeepGEMM
                     # (cluster(2,1,1) for next_n=4 was removed). Atom-split is
                     # encoded in metadata via num_next_n_atoms which the wrapper
-                    # derives from context_lens.size(1).
+                    # derives from context_lens.size(1). DG natively supports
+                    # next_n in {1,2,3,4}.
                     num_clusters = num_sms
-                    # 2D context_lens shape (B, dg_next_n): for dg_next_n>1 the
-                    # wrapper computes `num_next_n_atoms = dg_next_n / next_n_atom_size`
+                    # 2D context_lens shape (B, next_n): for next_n>1 the wrapper
+                    # computes `num_next_n_atoms = next_n / next_n_atom_size`
                     # which DG's compute kernel expects. All next_n positions
                     # of a batch share the same KV length here (broadcast via
                     # expand) — TRT-LLM does the same in production.
-                    dg_ctx_2d = (
-                        dg_data["context_lens"].unsqueeze(-1).expand(-1, dg_next_n).contiguous()
-                    )
+                    dg_ctx_2d = data["context_lens"].unsqueeze(-1).expand(-1, next_n).contiguous()
                     # `block_kv = 64` for the same reason as the DSL path:
                     # metadata SPLIT_KV = block_kv * 4 must equal DG compute
                     # kernel's hardcoded SPLIT_KV = 256 (apis/attention.hpp:353).
@@ -677,15 +659,15 @@ def benchmark_fp8_paged_mqa_logits(
                         dg_ctx_2d, DG_METADATA_BLOCK_KV, num_clusters
                     )
 
-                    def dg_fn(dg_data=dg_data, dg_ctx_2d=dg_ctx_2d):
+                    def dg_fn(data=data, dg_ctx_2d=dg_ctx_2d):
                         fp8_paged_mqa_logits(
-                            dg_data["q_fp8"],
-                            dg_data["kv_fused"],
-                            dg_data["weights"],
+                            data["q_fp8"],
+                            data["kv_fused"],
+                            data["weights"],
                             dg_ctx_2d,
-                            dg_data["block_table"],
+                            data["block_table"],
                             dg_schedule_meta,
-                            dg_data["max_model_len"],
+                            data["max_model_len"],
                         )
 
                     dg_us = _profile_kernel_us(dg_fn, num_warmup, num_iterations)
@@ -775,9 +757,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--block_kv",
         type=int,
-        default=128,
+        default=64,
         choices=[32, 64, 128],
-        help="physical block size / tokens per page (default: 128). "
+        help="physical block size / tokens per page (default: 64). "
         "DSL compute tile is always 128; when block_kv<128, DSL issues "
         "num_blocks_per_mma=128/block_kv TMA copies per compute tile.",
     )

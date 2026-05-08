@@ -463,7 +463,16 @@ def _create_mock_metadata(request_ids,
             self.scheduler_metadata_buffer = torch.zeros((self.num_sms + 1, 2),
                                                          device='cuda',
                                                          dtype=torch.int32)
-            self.scheduler_metadata_buffer_full_next_n = self.scheduler_metadata_buffer
+            # DSL needs the next_n=1 schedule preserved (kNumNextNAtoms=1),
+            # so allocate a separate buffer for the full-next_n schedule.
+            # DeepGEMM expects the full-next_n schedule in
+            # `scheduler_metadata_buffer` itself (the alias makes
+            # `Indexer.prepare()`'s second populate overwrite the first).
+            if use_cute_dsl_paged_mqa_logits:
+                self.scheduler_metadata_buffer_full_next_n = torch.zeros(
+                    (self.num_sms + 1, 2), device='cuda', dtype=torch.int32)
+            else:
+                self.scheduler_metadata_buffer_full_next_n = self.scheduler_metadata_buffer
             # Pre-allocated 2D kv_lens buffer for the DeepGEMM 2D context_lens API.
             self.kv_lens_cuda_2d = torch.zeros(
                 (self.num_seqs, 1 + self.max_draft_tokens),
