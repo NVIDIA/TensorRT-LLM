@@ -157,12 +157,14 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
         self.K = spec_config.dynamic_tree_max_topK
         self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
         self.tokens_per_gen_step = spec_config.tokens_per_gen_step
-        if spec_config.max_batch_size is None:
-            raise ValueError(
-                "Eagle3OneModelDynamicTreeWorker requires max_batch_size to be set "
-                "on Eagle3DecodingConfig when use_dynamic_tree=True."
-            )
-        self._max_batch_size = spec_config.max_batch_size
+        # Eagle3DecodingConfig._max_batch_size is auto-populated by
+        # py_executor_creator from the global max_batch_size, so it should
+        # always be set by the time we get here.
+        assert spec_config._max_batch_size is not None, (
+            "Eagle3DecodingConfig._max_batch_size was not populated; "
+            "py_executor_creator should have set it from the global max_batch_size."
+        )
+        self._max_batch_size = spec_config._max_batch_size
 
         K = self.K
         max_draft_len = spec_config.max_draft_len

@@ -1367,10 +1367,16 @@ class SAEnhancerConfig(StrictBaseModel):
 class Eagle3DecodingConfig(EagleDecodingConfig):
     decoding_type: Literal["Eagle3"] = "Eagle3"
 
-    max_batch_size: Optional[int] = Field(
-        default=None,
-        description="Max batch size for pre-allocating dynamic tree buffers. "
-        "Required when use_dynamic_tree=True.")
+    # Backs the dynamic-tree worker's pre-allocated, batch-indexed CUDA buffers
+    # (draft_tokens_buffer, history_*_buffer, tree_mask_buffer, etc. in
+    # Eagle3OneModelDynamicTreeWorker.__init__). This MUST equal the global
+    # max_batch_size: the worker indexes those buffers with batch_idx in
+    # [0, global_max_batch_size) at runtime with no bounds check, so any value
+    # smaller than the global will OOB during warmup or generation as soon as
+    # batch_idx exceeds this capacity (illegal memory access). It is therefore
+    # exposed as a PrivateAttr -- not a user-tunable knob -- and is
+    # auto-populated by py_executor_creator from the global max_batch_size.
+    _max_batch_size: Optional[int] = PrivateAttr(default=None)
 
     sa_config: Optional[SAEnhancerConfig] = Field(
         default=None,

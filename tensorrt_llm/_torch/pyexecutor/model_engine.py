@@ -457,13 +457,6 @@ class PyTorchModelEngine(ModelEngine):
             cuda_graph_batch_sizes, self.batch_size, self.max_num_tokens,
             self.original_max_total_draft_tokens,
             self._cuda_graph_padding_enabled) if cuda_graph_batch_sizes else []
-        dynamic_tree_warmup_max_batch_size = self._get_dynamic_tree_warmup_max_batch_size(
-        )
-        if dynamic_tree_warmup_max_batch_size is not None:
-            self._cuda_graph_batch_sizes = [
-                bs for bs in self._cuda_graph_batch_sizes
-                if bs <= dynamic_tree_warmup_max_batch_size
-            ]
 
         self._max_cuda_graph_batch_size = (self._cuda_graph_batch_sizes[-1] if
                                            self._cuda_graph_batch_sizes else 0)
@@ -755,11 +748,6 @@ class PyTorchModelEngine(ModelEngine):
         max_batch_size = min(
             self.batch_size, curr_max_num_tokens //
             (1 + self.max_total_draft_tokens) // self.max_beam_width)
-        dynamic_tree_warmup_max_batch_size = self._get_dynamic_tree_warmup_max_batch_size(
-        )
-        if dynamic_tree_warmup_max_batch_size is not None:
-            max_batch_size = min(max_batch_size,
-                                 dynamic_tree_warmup_max_batch_size)
 
         warmup_requests_configs = [
             (curr_max_num_tokens, 0),  # max_num_tokens, pure context
@@ -788,14 +776,6 @@ class PyTorchModelEngine(ModelEngine):
         warmup_configs = one_token_configs + max_configs + small_ctx_configs
         # Deduplicate the warmup_configs while keeping the order.
         return list(dict.fromkeys(warmup_configs))
-
-    def _get_dynamic_tree_warmup_max_batch_size(self) -> Optional[int]:
-        """Return the dynamic-tree worker batch capacity for warmup batch clamping."""
-        if (self.spec_config is None or self.is_draft_model
-                or not self.spec_config.spec_dec_mode.use_one_engine()
-                or not getattr(self.spec_config, "use_dynamic_tree", False)):
-            return None
-        return getattr(self.spec_config, "max_batch_size", None)
 
     @with_warmup_flag
     @warmup_with_kv_cache_cleanup
@@ -1050,12 +1030,6 @@ class PyTorchModelEngine(ModelEngine):
         # Determine which graphs to capture
         graphs_to_capture = self._get_graphs_to_capture(cuda_graph_batch_sizes,
                                                         spec_resource_manager)
-        dynamic_tree_warmup_max_batch_size = self._get_dynamic_tree_warmup_max_batch_size(
-        )
-        if dynamic_tree_warmup_max_batch_size is not None:
-            graphs_to_capture = [(bs, draft_len)
-                                 for bs, draft_len in graphs_to_capture
-                                 if bs <= dynamic_tree_warmup_max_batch_size]
         graphs_to_capture = sorted(graphs_to_capture, reverse=True)
         # Create CUDA graphs for short and long sequences separately for sparse attention.
         # self.max_seq_len is the global max sequence length. For Helix CP each
