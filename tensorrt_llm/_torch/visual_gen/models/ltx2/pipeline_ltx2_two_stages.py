@@ -4,7 +4,9 @@
 
 import json
 import math
+import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Union
 
 import safetensors.torch
@@ -41,6 +43,8 @@ STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 # Baseline BF16 peak memory ~75 GiB, saving BF16 weights snopshot total ~108 GiB.
 _BF16_WEIGHTS_SNAPSHOT_FREE_MEMORY_THRESHOLD_GIB = 115.0
+_QKV_SUFFIXES = (".to_q", ".to_k", ".to_v")
+_DISABLE_OVERLAP_LORA_LOAD_ENV = "TRTLLM_LTX2_DISABLE_OVERLAP_LORA_LOAD"
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +81,36 @@ def _should_save_bf16_weights(
         f"free GPU memory {free_gib:.2f} GiB {relation} {threshold_gib:.2f} GiB threshold"
     )
     return save_state
+
+
+def _map_lora_param_name(base_name: str, strip_prefixes: List[str]) -> str:
+    param_name = base_name
+    for prefix in strip_prefixes:
+        if param_name.startswith(prefix):
+            param_name = param_name[len(prefix) :]
+            break
+
+    # Apply the same key remapping as LTXModel.load_weights() so LoRA delta
+    # keys match TRT-LLM parameter names.
+    for ff_prefix in (".ff.", ".audio_ff."):
+        if ff_prefix + "net.0.proj" in param_name:
+            param_name = param_name.replace(ff_prefix + "net.0.proj", ff_prefix + "up_proj")
+        elif ff_prefix + "net.2" in param_name:
+            param_name = param_name.replace(ff_prefix + "net.2", ff_prefix + "down_proj")
+    param_name = param_name.replace(".q_norm.", ".norm_q.")
+    param_name = param_name.replace(".k_norm.", ".norm_k.")
+    return param_name
+
+
+def _has_lora_target(param_name: str, model_params: set[str]) -> bool:
+    if param_name in model_params or f"{param_name}.weight" in model_params:
+        return True
+
+    for suffix in _QKV_SUFFIXES:
+        if param_name.endswith(suffix):
+            attn_prefix = param_name[: -len(suffix)]
+            return f"{attn_prefix}.qkv_proj.weight" in model_params
+    return False
 
 
 def _load_lora_deltas(
@@ -142,39 +176,28 @@ def _load_lora_deltas(
             if suffix:
                 strip_prefixes.append(suffix)
 
+    model_params = {n for n, _ in transformer.named_parameters()}
     deltas: Dict[str, torch.Tensor] = {}
+    skipped_non_targets = 0
     for base_name in down_keys:
         if base_name not in up_keys:
             continue
+
+        param_name = _map_lora_param_name(base_name, strip_prefixes)
+        if not _has_lora_target(param_name, model_params):
+            skipped_non_targets += 1
+            continue
+
         A = down_keys[base_name]  # (rank, in_features)
         B = up_keys[base_name]  # (out_features, rank)
         rank = A.shape[0]
         alpha = alpha_dict.get(base_name, float(rank))
         scale = strength * alpha / rank
-
-        param_name = base_name
-        for prefix in strip_prefixes:
-            if param_name.startswith(prefix):
-                param_name = param_name[len(prefix) :]
-                break
-
-        # Apply the same key remapping as LTXModel.load_weights() so
-        # that LoRA delta keys match TRT-LLM parameter names.
-        for ff_prefix in (".ff.", ".audio_ff."):
-            if ff_prefix + "net.0.proj" in param_name:
-                param_name = param_name.replace(ff_prefix + "net.0.proj", ff_prefix + "up_proj")
-            elif ff_prefix + "net.2" in param_name:
-                param_name = param_name.replace(ff_prefix + "net.2", ff_prefix + "down_proj")
-        param_name = param_name.replace(".q_norm.", ".norm_q.")
-        param_name = param_name.replace(".k_norm.", ".norm_k.")
-
         delta = (B.float() @ A.float()) * scale
         deltas[param_name] = delta
 
     # Fuse separate to_q / to_k / to_v deltas into a single qkv_proj
     # delta when the transformer uses QKV fusion (FUSE_QKV mode).
-    model_params = {n for n, _ in transformer.named_parameters()}
-    _QKV_SUFFIXES = (".to_q", ".to_k", ".to_v")
     fused_keys: set = set()
     qkv_groups: Dict[str, List[str]] = {}
     for key in list(deltas.keys()):
@@ -202,7 +225,10 @@ def _load_lora_deltas(
     for key in fused_keys:
         del deltas[key]
 
-    logger.info(f"Loaded {len(deltas)} LoRA deltas from {lora_path} (strength={strength})")
+    logger.info(
+        f"Loaded {len(deltas)} LoRA deltas from {lora_path} "
+        f"(strength={strength}, skipped_non_targets={skipped_non_targets})"
+    )
     return deltas
 
 
@@ -649,17 +675,52 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         skip_components: Optional[list] = None,
         **kwargs,
     ) -> None:
-        super().load_standard_components(
-            checkpoint_dir,
-            device,
-            skip_components=skip_components,
-            **kwargs,
-        )
-
         dtype = self.model_config.torch_dtype
         spatial_upsampler_path = self.model_config.extra_attrs.get("spatial_upsampler_path", "")
         distilled_lora_path = self.model_config.extra_attrs.get("distilled_lora_path", "")
 
+        lora_executor = None
+        lora_future = None
+        disable_overlap_lora_load = os.getenv(_DISABLE_OVERLAP_LORA_LOAD_ENV, "0") == "1"
+        if distilled_lora_path and not disable_overlap_lora_load:
+            logger.info(f"Starting distilled LoRA pre-compute from {distilled_lora_path}...")
+            lora_executor = ThreadPoolExecutor(max_workers=1)
+            lora_future = lora_executor.submit(
+                _load_lora_deltas,
+                distilled_lora_path,
+                self.transformer,
+                self._TRANSFORMER_PREFIX,
+            )
+
+        try:
+            super().load_standard_components(
+                checkpoint_dir,
+                device,
+                skip_components=skip_components,
+                **kwargs,
+            )
+
+            self._load_two_stage_components(
+                device,
+                dtype,
+                spatial_upsampler_path,
+                distilled_lora_path,
+                lora_future,
+                disable_overlap_lora_load,
+            )
+        finally:
+            if lora_executor is not None:
+                lora_executor.shutdown(wait=True)
+
+    def _load_two_stage_components(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        spatial_upsampler_path: str,
+        distilled_lora_path: str,
+        lora_future,
+        disable_overlap_lora_load: bool,
+    ) -> None:
         # --- Spatial upsampler ---
         if spatial_upsampler_path:
             logger.info(f"Loading spatial upsampler from {spatial_upsampler_path}...")
@@ -698,12 +759,18 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # --- Distilled LoRA (pre-compute deltas) ---
         self._distilled_lora_deltas: Dict[str, torch.Tensor] = {}
         if distilled_lora_path:
-            logger.info(f"Loading distilled LoRA from {distilled_lora_path}...")
-            self._distilled_lora_deltas = _load_lora_deltas(
-                distilled_lora_path,
-                self.transformer,
-                transformer_prefix=self._TRANSFORMER_PREFIX,
-            )
+            if disable_overlap_lora_load:
+                logger.info(f"Loading distilled LoRA from {distilled_lora_path}...")
+                self._distilled_lora_deltas = _load_lora_deltas(
+                    distilled_lora_path,
+                    self.transformer,
+                    self._TRANSFORMER_PREFIX,
+                )
+            else:
+                logger.info("Waiting for distilled LoRA pre-compute...")
+                if lora_future is None:
+                    raise RuntimeError("Distilled LoRA pre-compute was not started.")
+                self._distilled_lora_deltas = lora_future.result()
             logger.info(
                 f"Distilled LoRA ready: {len(self._distilled_lora_deltas)} parameter deltas"
             )
