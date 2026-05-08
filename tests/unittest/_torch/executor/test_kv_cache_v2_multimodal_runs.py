@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 import tensorrt_llm._torch.pyexecutor.resource_manager as resource_manager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
@@ -84,11 +85,19 @@ def test_augment_tokens_for_block_reuse_rejects_incomplete_run_metadata():
         multimodal_positions=[1],
         multimodal_lengths=[4],
         multimodal_item_run_cu_offsets=[0, 1],
+        multimodal_run_positions=None,
+        multimodal_run_lengths=None,
     )
 
     tokens = list(range(8))
     with pytest.raises(ValueError, match="provided together"):
         KVCacheManagerV2._augment_tokens_for_block_reuse(manager, tokens, req, start=1, end=3)
+
+
+def test_block_reuse_metadata_rejects_non_cpu_tensors():
+    values = torch.empty(1, dtype=torch.int64, device="meta")
+    with pytest.raises(ValueError, match="must be CPU-resident"):
+        resource_manager._ensure_int64_cpu_tensor(values)
 
 
 def test_augment_tokens_for_block_reuse_keeps_contiguous_metadata_path():
@@ -101,6 +110,9 @@ def test_augment_tokens_for_block_reuse_keeps_contiguous_metadata_path():
         multimodal_hashes=[_HASH_INTS],
         multimodal_positions=[2],
         multimodal_lengths=[3],
+        multimodal_item_run_cu_offsets=None,
+        multimodal_run_positions=None,
+        multimodal_run_lengths=None,
     )
 
     tokens = list(range(8))

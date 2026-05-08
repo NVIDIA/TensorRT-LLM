@@ -6,6 +6,7 @@ import time
 
 import numpy as np
 import pytest
+import torch
 from PIL import Image
 from utils.util import skip_single_gpu
 
@@ -16,8 +17,9 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import KVCacheEventSerializer
 from tensorrt_llm.bindings.internal.testing import \
     simulate_prefill_completion_only_use_for_testing
-from tensorrt_llm.inputs.multimodal import apply_mm_hashes
-from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
+from tensorrt_llm.inputs.multimodal import (MultimodalInput, apply_mm_hashes,
+                                            _find_mm_token_runs_from_mask)
+from tensorrt_llm.inputs.utils import AudioData, VideoData
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
@@ -476,11 +478,6 @@ def test_multimodal_input_from_components_with_uuids():
 
 def test_multimodal_input_exact_run_buffers():
     """Test optional exact run buffers on Python MultimodalInput."""
-    import torch
-
-    from tensorrt_llm.inputs.multimodal import (MultimodalInput,
-                                                _find_mm_token_runs_from_mask)
-
     mm_mask = torch.tensor(
         [False, True, True, False, False, True, False, False, True, True])
     item_run_cu_offsets, run_positions, run_lengths = _find_mm_token_runs_from_mask(
@@ -523,8 +520,6 @@ def test_multimodal_input_exact_run_buffers():
 
 
 def test_multimodal_input_rejects_exact_run_int32_overflow():
-    from tensorrt_llm.inputs.multimodal import MultimodalInput
-
     int32_max = 2_147_483_647
     with pytest.raises(ValueError, match="end position exceeds int32"):
         MultimodalInput(

@@ -90,9 +90,10 @@ class MultimodalInput:
     multimodal_item_run_cu_offsets: Optional[List[int]] = None
     """Optional offsets into the flat multimodal run arrays.
 
-    Length is ``len(multimodal_hashes) + 1``. Runs for item ``i`` live in
-    ``multimodal_run_positions[offsets[i]:offsets[i + 1]]`` and the matching
-    slice of ``multimodal_run_lengths``.
+    "Cu" means cumulative: length is `len(multimodal_hashes) + 1`.
+    Runs for item `i` live in
+    `multimodal_run_positions[offsets[i]:offsets[i + 1]]` and the matching
+    slice of `multimodal_run_lengths`.
     """
 
     multimodal_run_positions: Optional[List[int]] = None
@@ -1091,6 +1092,7 @@ def _find_mm_token_runs_from_mask(
     num_mm_tokens: List[int],
 ) -> Tuple[List[int], List[int], List[int]]:
     """Compute flat exact prompt token runs for each logical multimodal item."""
+    # CSR offsets: item i owns flat runs [offsets[i], offsets[i + 1]).
     item_run_cu_offsets = [0]
     if not torch.any(mm_mask):
         return item_run_cu_offsets, [], []
@@ -1102,7 +1104,9 @@ def _find_mm_token_runs_from_mask(
         f"sum of per-unit lengths ({lengths_t.sum().item()}): "
         f"num_mm_tokens={num_mm_tokens}")
 
+    # Full-prompt start index for each emitted flat multimodal run.
     run_positions: List[int] = []
+    # Token count for each emitted flat multimodal run.
     run_lengths: List[int] = []
     offset = 0
     for item_length in num_mm_tokens:
