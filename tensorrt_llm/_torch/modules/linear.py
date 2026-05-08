@@ -944,6 +944,11 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
         module.inv_input_scale = Parameter(torch.tensor(1.,
                                                         dtype=torch.float32),
                                            requires_grad=False)
+        # K, V scales for NVFP4 KV cache
+        module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                     requires_grad=False)
+        module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                         requires_grad=False)
         if bias:
             module.bias = Parameter(torch.empty((out_features), dtype=dtype),
                                     requires_grad=False)
@@ -1084,6 +1089,11 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         module.inv_input_scale = Parameter(torch.tensor(1.,
                                                         dtype=torch.float32),
                                            requires_grad=False)
+        # K, V scales for NVFP4 KV cache
+        module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                     requires_grad=False)
+        module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
+                                         requires_grad=False)
         if bias:
             module.bias = Parameter(torch.empty((out_features), dtype=dtype),
                                     requires_grad=False)

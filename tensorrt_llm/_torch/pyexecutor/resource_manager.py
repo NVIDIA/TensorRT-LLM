@@ -630,6 +630,21 @@ class KVCacheManager(BaseResourceManager):
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
+
+        pool_bytes = (self.blocks_in_primary_pool * self.tokens_per_block *
+                      self.get_cache_bytes_per_token())
+        layer_list = self.pp_layers
+        if layer_list:
+            layer_str = (f"{layer_list[0]}-{layer_list[-1]}"
+                         if len(layer_list) > 1 else str(layer_list[0]))
+        else:
+            layer_str = "(none)"
+        logger.info(
+            f"KV cache pool: dtype={self.dtype}, layers=[{layer_str}], "
+            f"num_layers={len(layer_list)}, "
+            f"pool_size={pool_bytes / (1 << 30):.2f} GiB "
+            f"({self.blocks_in_primary_pool} blocks × {self.tokens_per_block} tokens/block)")
+
         self.host_kv_cache_block_offsets = torch.empty(
             self.num_pools,
             max_batch_size * max_beam_width,
@@ -1710,6 +1725,300 @@ class KVCacheManager(BaseResourceManager):
     def reset_reuse_state(self):
         """Reset the reuse state of the KV cache manager."""
         self.impl.reset_reuse_state()
+
+
+class MixedPrecisionKVCacheManager(BaseResourceManager):
+    """Wraps multiple KVCacheManager instances for per-layer mixed-precision KV cache.
+
+    Each sub-manager owns a contiguous group of layers sharing one KV dtype (e.g. FP8
+    for layers 0-1, NVFP4 for layers 2-35).  The class merges their pool-pointer and
+    pool-mapping tensors into unified views that the attention backend consumes.
+
+    Merged kv_cache_pool_pointers is always 3D (num_total_pools, 2, 2):
+      - NVFP4 pools: [primary_data, secondary_data] × [data_ptr, scale_ptr]
+      - FP8/BF16 pools: [primary_ptr, secondary_ptr] × [data_ptr, 0]
+
+    The C++ buildKvCachePoolPointers in attentionOp.cpp is patched to accept a 3D tensor
+    for non-FP4 layers, reading the primary/secondary pointer from slice [..., 0].
+    """
+
+    def __init__(self, sub_managers: List["KVCacheManager"],
+                 per_layer_dtype_map: Dict[int, "DataType"]):
+        self.sub_managers = sub_managers
+        self.per_layer_dtype_map = per_layer_dtype_map
+
+        # Use first sub-manager as the "primary" source for shared scalar properties.
+        primary = sub_managers[0]
+        self.mapping = primary.mapping
+        self.tokens_per_block = primary.tokens_per_block
+        self.max_seq_len = primary.max_seq_len
+        self.max_batch_size = primary.max_batch_size
+        self.max_blocks_per_seq = max(m.max_blocks_per_seq for m in sub_managers)
+        self.is_draft = primary.is_draft
+        self.kv_cache_type = primary.kv_cache_type
+        self.is_vswa = primary.is_vswa
+        self.num_extra_kv_tokens = primary.num_extra_kv_tokens
+        self.enable_block_reuse = primary.enable_block_reuse
+        self.enable_partial_reuse = primary.enable_partial_reuse
+        self.max_attention_window_vec = primary.max_attention_window_vec
+        self.kv_factor = primary.kv_factor
+        self.head_dim = primary.head_dim
+        self.num_kv_heads = primary.num_kv_heads
+        self.kv_connector_manager = primary.kv_connector_manager
+        self.max_draft_len = primary.max_draft_len
+        self.max_total_draft_tokens = primary.max_total_draft_tokens
+        self.event_buffer_max_size = primary.event_buffer_max_size
+        self.attention_dp_events_gather_period_ms = primary.attention_dp_events_gather_period_ms
+
+        # Build a sorted, deduplicated global pp_layers list.
+        global_set: Set[int] = set()
+        for mgr in sub_managers:
+            global_set.update(mgr.pp_layers)
+        self.pp_layers = sorted(global_set)
+        self.layer_offsets = {
+            global_idx: local_idx
+            for local_idx, global_idx in enumerate(self.pp_layers)
+        }
+        self.num_local_layers = len(self.pp_layers)
+        self.num_layers = max(m.num_layers for m in sub_managers)
+
+        # Reconstruct per-layer kv head counts in global layer order.
+        self.num_kv_heads_per_layer: List[int] = []
+        for global_idx in self.pp_layers:
+            for mgr in sub_managers:
+                if global_idx in mgr.layer_offsets:
+                    local_idx = mgr.layer_offsets[global_idx]
+                    self.num_kv_heads_per_layer.append(
+                        mgr.num_kv_heads_per_layer[local_idx])
+                    break
+        self.total_num_kv_heads_per_layer = primary.total_num_kv_heads_per_layer
+
+        # Total pool count across all sub-managers.
+        self.num_pools = sum(m.num_pools for m in sub_managers)
+
+        # Cumulative pool offset for each sub-manager (used when merging pool mapping).
+        self._pool_offsets: Dict[int, int] = {}
+        offset = 0
+        for mgr in sub_managers:
+            self._pool_offsets[id(mgr)] = offset
+            offset += mgr.num_pools
+
+        # Merged tensors (built once at init; pool pointers don't change after allocation).
+        self.kv_cache_pool_pointers = self._build_merged_pool_pointers()
+        self.kv_cache_pool_mapping = self._build_merged_pool_mapping()
+
+        # Allocate a combined CPU block-offset buffer used by copy_batch_block_offsets.
+        max_seqs = max(m.host_kv_cache_block_offsets.shape[1]
+                       for m in sub_managers)
+        self.host_kv_cache_block_offsets = torch.empty(
+            self.num_pools,
+            max_seqs,
+            2,
+            self.max_blocks_per_seq,
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+            device='cpu',
+        )
+
+        # Warmup-baseline counters (mirroring KVCacheManager).
+        self._warmup_reused_blocks = 0
+        self._warmup_missed_blocks = 0
+
+    # ------------------------------------------------------------------
+    # Pool tensor construction helpers
+    # ------------------------------------------------------------------
+
+    def _build_merged_pool_pointers(self) -> torch.Tensor:
+        """Merge sub-manager pool-pointer tensors into a single 3D tensor.
+
+        Both 2D (FP8/BF16) and 3D (NVFP4) inputs are normalised to shape
+        (n, 2, 2): data pointers go into slice [..., 0], scale pointers
+        (zero for non-FP4) go into slice [..., 1].
+        """
+        parts = []
+        for mgr in self.sub_managers:
+            pp = mgr.kv_cache_pool_pointers  # (n, 2) or (n, 2, 2)
+            if pp.dim() == 2:
+                n = pp.shape[0]
+                expanded = torch.zeros(n, 2, 2, dtype=torch.int64, device='cpu')
+                expanded[:, :, 0] = pp.to(torch.int64)
+                parts.append(expanded)
+            else:
+                parts.append(
+                    pp.to(torch.int64) if pp.dtype != torch.int64 else pp)
+        return torch.cat(parts, dim=0)
+
+    def _build_merged_pool_mapping(self) -> torch.Tensor:
+        """Build a (num_local_layers, 2) pool-mapping tensor in global layer order.
+
+        Pool indices from each sub-manager are offset by the cumulative pool count
+        of preceding managers so they index correctly into the merged pool_pointers.
+        """
+        merged = torch.zeros(self.num_local_layers, 2, dtype=torch.int32)
+        for mgr in self.sub_managers:
+            pool_offset = self._pool_offsets[id(mgr)]
+            for local_idx, global_idx in enumerate(mgr.pp_layers):
+                if global_idx not in self.layer_offsets:
+                    continue
+                merged_row = self.layer_offsets[global_idx]
+                src = mgr.kv_cache_pool_mapping[local_idx]  # (2,)
+                merged[merged_row, 0] = int(src[0]) + pool_offset  # offset pool index
+                merged[merged_row, 1] = int(src[1])                # layer-in-pool unchanged
+        return merged
+
+    # ------------------------------------------------------------------
+    # Scheduler / C++ compatibility
+    # ------------------------------------------------------------------
+
+    @property
+    def impl(self):
+        """Return first sub-manager's C++ impl for scheduler / transceiver compatibility."""
+        return self.sub_managers[0].impl
+
+    @property
+    def dtype(self) -> "DataType":
+        return self.sub_managers[0].dtype
+
+    # ------------------------------------------------------------------
+    # BaseResourceManager interface
+    # ------------------------------------------------------------------
+
+    def get_max_resource_count(self) -> int:
+        return min(m.get_max_resource_count() for m in self.sub_managers)
+
+    def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
+        # Each sub-manager needs blocks for its own layer group; use the max.
+        return max(m.get_needed_resource_to_completion(request)
+                   for m in self.sub_managers)
+
+    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        for mgr in self.sub_managers:
+            mgr.prepare_resources(scheduled_batch)
+
+    def update_resources(self,
+                         scheduled_batch: ScheduledRequests,
+                         attn_metadata: "AttentionMetadata" = None,
+                         kv_cache_dtype_byte_size: float = None):
+        for mgr in self.sub_managers:
+            mgr.update_resources(scheduled_batch, attn_metadata,
+                                 kv_cache_dtype_byte_size)
+
+    def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        for mgr in self.sub_managers:
+            mgr.free_resources(request, pin_on_release)
+
+    def shutdown(self):
+        for mgr in self.sub_managers:
+            mgr.shutdown()
+
+    def add_dummy_requests(self, *args, **kwargs):
+        """Add dummy requests to all sub-managers; return requests from the first."""
+        result = None
+        for mgr in self.sub_managers:
+            r = mgr.add_dummy_requests(*args, **kwargs)
+            if result is None:
+                result = r
+        return result
+
+    # ------------------------------------------------------------------
+    # Block offset copying (called every forward pass)
+    # ------------------------------------------------------------------
+
+    def copy_batch_block_offsets(self, dst_tensor: torch.Tensor,
+                                 request_ids: List[int], beam_width: int,
+                                 num_context: int, num_seqs: int):
+        """Populate each sub-manager's CPU block offsets then copy to GPU dst_tensor."""
+        for mgr in self.sub_managers:
+            mgr.impl.copy_batch_block_offsets(mgr.host_kv_cache_block_offsets,
+                                              request_ids[:num_context], 1, 0)
+            mgr.impl.copy_batch_block_offsets(mgr.host_kv_cache_block_offsets,
+                                              request_ids[num_context:],
+                                              beam_width, num_context)
+
+        # Copy each sub-manager's CPU slice to the correct pool rows of dst_tensor.
+        pool_start = 0
+        for mgr in self.sub_managers:
+            n = mgr.host_kv_cache_block_offsets.shape[0]
+            src = mgr.host_kv_cache_block_offsets
+            for pool_idx in range(n):
+                dst_tensor[pool_start + pool_idx, :num_seqs].copy_(
+                    src[pool_idx, :num_seqs], non_blocking=True)
+            pool_start += n
+
+    # ------------------------------------------------------------------
+    # Capacity / stats
+    # ------------------------------------------------------------------
+
+    def get_num_free_blocks(self) -> int:
+        return min(m.get_num_free_blocks() for m in self.sub_managers)
+
+    def get_num_kv_blocks(self, num_tokens: int) -> int:
+        return (num_tokens + self.tokens_per_block - 1) // self.tokens_per_block
+
+    def get_num_available_tokens(self,
+                                 token_num_upper_bound: int,
+                                 max_num_draft_tokens: int = 0,
+                                 **kwargs) -> int:
+        return min(
+            token_num_upper_bound,
+            self.get_num_free_blocks() * self.tokens_per_block -
+            self.num_extra_kv_tokens - max_num_draft_tokens)
+
+    def get_kv_cache_stats(self):
+        # Report stats from the first sub-manager as a representative summary.
+        return self.sub_managers[0].get_kv_cache_stats()
+
+    def get_iteration_stats(self):
+        return self.sub_managers[0].get_iteration_stats()
+
+    def snapshot_warmup_baseline(self):
+        for mgr in self.sub_managers:
+            mgr.snapshot_warmup_baseline()
+
+    # ------------------------------------------------------------------
+    # Misc pass-throughs
+    # ------------------------------------------------------------------
+
+    def get_cache_indices(self, request: LlmRequest, *args, **kwargs):
+        return self.sub_managers[0].get_cache_indices(request, *args, **kwargs)
+
+    def probe_prefix_match_length(self, *args, **kwargs) -> int:
+        return self.sub_managers[0].probe_prefix_match_length(*args, **kwargs)
+
+    def flush_iteration_events(self):
+        self.sub_managers[0].flush_iteration_events()
+
+    def get_latest_events(self, *args, **kwargs):
+        return self.sub_managers[0].get_latest_events(*args, **kwargs)
+
+    def rewind_kv_cache(self, request: LlmRequest, rewind_len: int):
+        for mgr in self.sub_managers:
+            mgr.rewind_kv_cache(request, rewind_len)
+
+    def reset_reuse_state(self):
+        for mgr in self.sub_managers:
+            mgr.reset_reuse_state()
+
+    def check_invalid_values_in_kv_cache(self, *args, **kwargs) -> bool:
+        return any(
+            m.check_invalid_values_in_kv_cache(*args, **kwargs)
+            for m in self.sub_managers)
+
+    def store_blocks_for_reuse(self, *args, **kwargs):
+        return self.sub_managers[0].store_blocks_for_reuse(*args, **kwargs)
+
+    def get_buffers(self, layer_idx: int, kv_layout: str = "NHD"):
+        for mgr in self.sub_managers:
+            if layer_idx in mgr.layer_offsets:
+                return mgr.get_buffers(layer_idx, kv_layout)
+        return None
+
+    def get_temp_attention_window_inputs(self, *args, **kwargs):
+        return self.sub_managers[0].get_temp_attention_window_inputs(
+            *args, **kwargs)
+
+    def get_priority_by_block_id(self, *args, **kwargs):
+        return self.sub_managers[0].get_priority_by_block_id(*args, **kwargs)
 
 
 class KVCacheManagerV2(BaseResourceManager):
@@ -3092,7 +3401,8 @@ class ResourceManager:
     ):
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "update_resources"):
-                if isinstance(resource_manager, KVCacheManager):
+                if isinstance(resource_manager,
+                               (KVCacheManager, MixedPrecisionKVCacheManager)):
                     resource_manager.update_resources(scheduled_batch,
                                                       attn_metadata,
                                                       kv_cache_dtype_byte_size)

@@ -697,6 +697,10 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
             "blocks=%d, max sequence length=%d",
             maxBlocksPerSeq, windowSize, tokensPerBlock, allottedPrimaryBlocks, allottedSecondaryBlocks,
             maxSequenceLength);
+        TLLM_LOG_INFO(
+            "JINDA_DEBUG: KV cache buffer init: max tokens per sequence=%d (= max(windowSize,maxSeqLen) + sinkBubble)"
+            " [window size=%d, max sequence length=%d, max blocks per seq=%d]",
+            maxTokenNum, windowSize, maxSequenceLength, maxBlocksPerSeq);
         TLLM_LOG_DEBUG(
             "%s Metadata: %s", manager.getLogPrefix().c_str(), mWindowSizeToMetadata[windowSize].toString().c_str());
         absolutePoolsOffset += numPools;
@@ -3106,33 +3110,79 @@ void KVCacheManager::allocatePools(bool useUvm)
     mBlockManager.allocatePools(useUvm);
     auto const numPools = mBlockManager.getNumPools();
 
+    // Compute the total bytes occupied by all primary KV-cache pools.
+    //
+    // There are two categories of pools for NVFP4 KV cache:
+    //   1. KV element pools  — store the actual K/V data, packed as INT8
+    //                          (2 FP4 values per byte).
+    //   2. Block scale pools — store per-block FP8 quantization scales
+    //                          (1 scale per 16 FP4 elements).
+    //
+    // BUG FIX 1 (scale pool dtype):
+    //   The original code applied the FP4 byte formula `(volume * 4) / 8` to
+    //   every pool when mDataType == kFP4, including block scale pools whose
+    //   elements are FP8 (1 byte each).  This caused a 2× undercount of the
+    //   scale pool size.  Fix: detect containsBlockScales and use the FP8
+    //   element size unconditionally for those pools.
+    //
+    // BUG FIX 2 (FP4 element pool double-halving):
+    //   When a FP4 element pool is constructed, sizePerHead is already divided
+    //   by numEltsPerContainer=2 so that each "element" in the pool tensor
+    //   represents one packed INT8 byte (holding 2 FP4 values).  The original
+    //   formula `(cacheVolume * 4) / 8` = cacheVolume * 0.5 halved the volume
+    //   a second time, reporting half the actual GPU allocation.  Fix: treat
+    //   each element as 1 byte (kINT8), matching how allocatePools() allocates
+    //   the buffer (see WindowBlockManager::allocatePools where poolDtype is
+    //   set to kINT8 for FP4 pools before calling gpuSync).
     uint64_t cacheSizeBytes = 0;
+    uint64_t elemPoolBytes = 0;
+    uint64_t scalePoolBytes = 0;
     for (SizeType32 poolIdx = 0; poolIdx < numPools; poolIdx++)
     {
+        auto const& pool = mBlockManager.getPool(poolIdx);
         auto const cacheShape = mBlockManager.getPrimaryPool(poolIdx)->getShape();
         auto const cacheVolume = ITensor::volume(cacheShape);
-#ifdef ENABLE_FP4
-        auto const isFp4 = mDataType == nvinfer1::DataType::kFP4;
-#else
-        auto const isFp4 = false;
-#endif
-        if (!isFp4)
+        uint64_t poolBytes = 0;
+        if (pool.containsBlockScales)
         {
-            cacheSizeBytes += cacheVolume * BufferDataType(mDataType).getSize();
+            // BUG FIX 1: scale pools are FP8 regardless of mDataType.
+            poolBytes = cacheVolume * BufferDataType(nvinfer1::DataType::kFP8).getSize();
+            scalePoolBytes += poolBytes;
         }
         else
         {
-            cacheSizeBytes += (cacheVolume * 4) / 8;
+#ifdef ENABLE_FP4
+            auto const isFp4 = mDataType == nvinfer1::DataType::kFP4;
+#else
+            auto const isFp4 = false;
+#endif
+            if (isFp4)
+            {
+                // BUG FIX 2: sizePerHead was already halved at pool construction
+                // (sizePerHead / numEltsPerContainer), so cacheVolume is already
+                // in bytes (INT8 elements).  Use size 1, not 0.5.
+                poolBytes = cacheVolume * BufferDataType(nvinfer1::DataType::kINT8).getSize();
+            }
+            else
+            {
+                poolBytes = cacheVolume * BufferDataType(mDataType).getSize();
+            }
+            elemPoolBytes += poolBytes;
         }
+        cacheSizeBytes += poolBytes;
     }
     // Save the total number of bytes allocated for the KV-cache for KvCacheStats
     mAllocatedBytes = cacheSizeBytes;
     if (tc::Logger::getLogger()->getLevel() <= tc::Logger::INFO)
     {
-
         TLLM_LOG_INFO("Number of tokens per block: %d.", mBlockManager.getTokensPerBlock());
         auto const maxNumTokens = mBlockManager.getNumPrimaryBlocks() * mBlockManager.getTokensPerBlock();
         TLLM_LOG_INFO("[MemUsageChange] Allocated %0.2f GiB for max tokens in paged KV cache (%d).",
+            cacheSizeBytes / static_cast<double>(1 << 30), maxNumTokens);
+        TLLM_LOG_INFO(
+            "JINDA_DEBUG: KV cache pool breakdown: element pool=%.2f GiB, scale pool=%.2f GiB, total=%.2f GiB"
+            " [max tokens=%d]",
+            elemPoolBytes / static_cast<double>(1 << 30), scalePoolBytes / static_cast<double>(1 << 30),
             cacheSizeBytes / static_cast<double>(1 << 30), maxNumTokens);
     }
 

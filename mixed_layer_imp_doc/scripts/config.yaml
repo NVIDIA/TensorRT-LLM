@@ -1,0 +1,31 @@
+# TensorRT-LLM serve config for Qwen3-8B on a single GPU
+# Usage: passed to trtllm-serve via --config
+
+# Single GPU — no tensor parallelism needed
+tensor_parallel_size: 1
+
+# KV cache quantization.
+# - "fp8"   works with any model on Hopper/Blackwell (recommended for Qwen/Qwen3-8B BF16 weights)
+# - "nvfp4" requires FP8 context FMHA, which is only active when the model weights
+#           are themselves FP8-quantized (e.g. nvidia/Qwen3-8B-FP8). Do NOT use nvfp4
+#           with plain BF16 checkpoints — it will crash with "mFP8ContextFMHA must enable".
+# - Mixed-precision per-layer syntax (Qwen3-8B has 36 layers, 0-35):
+#   dtype: "0-1:fp8,2-35:nvfp4"
+#   This uses FP8 for layers 0-1 and NVFP4 for layers 2-35.
+#   Requires FP8-quantized weights for NVFP4 layers.
+kv_cache_config:
+  # dtype: "fp8"
+  # dtype: "nvfp4"
+  dtype: "0-3:fp8,4-35:nvfp4"
+  free_gpu_memory_fraction: 0.85
+
+# CUDA graphs: pre-capture common batch sizes for lower kernel launch overhead
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32

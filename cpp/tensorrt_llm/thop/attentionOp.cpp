@@ -382,8 +382,10 @@ public:
         op.mRuntimeSparseAttentionParams.sparse_topk = num_sparse_topk;
         if (op.mUseSparseAttention && use_kv_cache)
         {
-            op.mRuntimeSparseAttentionParams.sparse_kv_cache_pool
-                = reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>());
+            // In mixed-precision mode pool_pointers may be 3D; primary ptr is at [pool, 0, 0].
+            auto const& pptr = host_kv_cache_pool_pointers.value();
+            op.mRuntimeSparseAttentionParams.sparse_kv_cache_pool = reinterpret_cast<char*>(
+                (pptr.dim() == 3 ? pptr.index({pool_index, 0, 0}) : pptr.index({pool_index, 0})).item<int64_t>());
         }
 
         AttentionOp::EnqueueParams<T> common_enqueue_params;
@@ -1020,11 +1022,29 @@ KvCachePoolPointers buildKvCachePoolPointers(at::Tensor const& hostKvCachePoolPo
     }
     else
     {
-        TORCH_CHECK(hostKvCachePoolPointers.dim() == 2);
-        pointers.primaryPoolPtr = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 0}).item<int64_t>()) + intraPoolOffset);
-        pointers.secondaryPoolPtr = reinterpret_cast<void*>(
-            reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 1}).item<int64_t>()) + intraPoolOffset);
+        // In mixed-precision mode the pool_pointers tensor may be 3D (num_pools, 2, 2) even for
+        // non-FP4 layers: FP8/BF16 pool pointers are stored in the first slot of the last dim
+        // ([poolIndex, primary/secondary, 0]) and the scale slot ([..., 1]) is left as zero.
+        // Accept both dim==2 (pure non-FP4) and dim==3 (mixed-precision).
+        if (hostKvCachePoolPointers.dim() == 3)
+        {
+            pointers.primaryPoolPtr = reinterpret_cast<void*>(
+                reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 0, 0}).item<int64_t>())
+                + intraPoolOffset);
+            pointers.secondaryPoolPtr = reinterpret_cast<void*>(
+                reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 1, 0}).item<int64_t>())
+                + intraPoolOffset);
+        }
+        else
+        {
+            TORCH_CHECK(hostKvCachePoolPointers.dim() == 2);
+            pointers.primaryPoolPtr = reinterpret_cast<void*>(
+                reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 0}).item<int64_t>())
+                + intraPoolOffset);
+            pointers.secondaryPoolPtr = reinterpret_cast<void*>(
+                reinterpret_cast<char*>(hostKvCachePoolPointers.index({poolIndex, 1}).item<int64_t>())
+                + intraPoolOffset);
+        }
     }
     return pointers;
 }

@@ -218,7 +218,11 @@ class ModelConfig(Generic[TConfig]):
                     return True
         return False
 
-    def get_quant_config(self, name: Optional[str] = None) -> QuantConfig:
+    @property
+    def per_layer_quant_configs(self) -> Optional[Dict[str, "QuantConfig"]]:
+        return self.quant_config_dict
+
+    def get_quant_config(self, name: Optional[str] = None) -> "QuantConfig":
         if name is None or self.per_layer_quant_configs is None:
             return self.quant_config
 

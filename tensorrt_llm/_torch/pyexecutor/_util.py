@@ -17,7 +17,7 @@ from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
     KvCacheConfig, MTPDecodingConfig, PeftCacheConfig, SamplerType,
     SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs,
-    WaitingQueuePolicy)
+    WaitingQueuePolicy, parse_kv_cache_dtype_spec)
 # isort: on
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
@@ -40,8 +40,8 @@ from .mamba_cache_manager import BaseMambaCacheManager, MambaHybridCacheManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, KVCacheManagerV2,
-                               PeftCacheManager, ResourceManager,
-                               ResourceManagerType)
+                               MixedPrecisionKVCacheManager, PeftCacheManager,
+                               ResourceManager, ResourceManagerType)
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
@@ -889,6 +889,291 @@ def _build_per_layer_num_kv_heads(
                                                         ] * num_spec_layers
 
 
+def _dtype_str_to_binding(dtype_str: str,
+                          fallback_dtype: "tensorrt_llm.bindings.DataType",
+                          quant_config) -> "tensorrt_llm.bindings.DataType":
+    """Map a per-layer KV cache dtype string to a binding DataType."""
+    s = dtype_str.lower()
+    if s == "auto":
+        return fallback_dtype
+    if s in ("fp8", "float8"):
+        return tensorrt_llm.bindings.DataType.FP8
+    if s in ("nvfp4", "fp4"):
+        return tensorrt_llm.bindings.DataType.NVFP4
+    if s in ("fp16", "float16"):
+        return tensorrt_llm.bindings.DataType.HALF
+    if s in ("bf16", "bfloat16"):
+        return tensorrt_llm.bindings.DataType.BF16
+    raise ValueError(f"Unsupported per-layer KV cache dtype: '{dtype_str}'")
+
+
+def _resolve_per_layer_dtype(
+    dtype_spec: Union[str, Dict[int, str]],
+    num_layers: int,
+    quant_config,
+    fallback_dtype: "tensorrt_llm.bindings.DataType",
+) -> Dict[int, "tensorrt_llm.bindings.DataType"]:
+    """Resolve KvCacheConfig.dtype into a full per-layer DataType mapping."""
+    raw_map = parse_kv_cache_dtype_spec(dtype_spec, num_layers)
+    return {
+        i: _dtype_str_to_binding(s, fallback_dtype, quant_config)
+        for i, s in raw_map.items()
+    }
+
+
+def _create_mixed_kv_cache_manager(
+    per_layer_dtype_map: Dict[int, "tensorrt_llm.bindings.DataType"],
+    kv_cache_manager_cls,
+    mapping: Mapping,
+    kv_cache_config: KvCacheConfig,
+    tokens_per_block: int,
+    max_seq_len: int,
+    max_batch_size: int,
+    spec_config,
+    sparse_attn_config,
+    max_num_tokens: int,
+    max_beam_width: int,
+    kv_connector_manager,
+    estimating_kv_cache: bool,
+    execution_stream,
+    model_engine,
+    _model_config,
+    quant_config,
+    per_layer_num_kv_heads: List[int],
+    head_dim: int,
+    num_hidden_layers: int,
+    is_draft: bool,
+    fallback_dtype: "tensorrt_llm.bindings.DataType",
+) -> "MixedPrecisionKVCacheManager":
+    """Create per-dtype-group KVCacheManagers and wrap in MixedPrecisionKVCacheManager."""
+    import copy
+
+    # Group layers by dtype preserving insertion order
+    groups: Dict["tensorrt_llm.bindings.DataType", List[int]] = {}
+    for layer_idx, dtype in per_layer_dtype_map.items():
+        groups.setdefault(dtype, []).append(layer_idx)
+
+    # Compute bytes-per-token for each dtype group to split total memory budget
+    from .resource_manager import KVCacheManager as _KVCacheManager
+    total_budget = kv_cache_config.max_gpu_total_bytes  # set by estimation pass
+
+    def _bytes_per_token(dtype, num_layers_in_group):
+        kv_factor = 2
+        tp_size = max(mapping.tp_size, 1)
+        # Use the first layer's kv head count for the group (simplified)
+        # In practice all layers in a group share the same model params
+        return _KVCacheManager.get_cache_size_per_token_for_dtype(
+            dtype, kv_factor, num_layers_in_group, per_layer_num_kv_heads,
+            head_dim, tp_size) if hasattr(
+                _KVCacheManager,
+                'get_cache_size_per_token_for_dtype') else head_dim
+
+    # Compute proportional weights for budget splitting
+    group_weights = {}
+    for dtype, layers in groups.items():
+        # Simple weight: num_layers × head_dim (same heads assumed for now)
+        # For full accuracy, use actual bytes-per-token for this dtype
+        bpt = _get_bytes_per_token(dtype, mapping, per_layer_num_kv_heads,
+                                   head_dim, layers)
+        group_weights[dtype] = bpt * len(layers)
+
+    total_weight = sum(group_weights.values())
+
+    sub_managers = []
+    pool_offset = 0
+    for dtype, layers in groups.items():
+        layer_mask = [i in set(layers) for i in range(num_hidden_layers)]
+        cfg_copy = copy.deepcopy(kv_cache_config)
+        if total_budget > 0 and total_weight > 0:
+            group_budget = int(total_budget * group_weights[dtype] /
+                               total_weight)
+            cfg_copy.max_gpu_total_bytes = group_budget
+            cfg_copy.free_gpu_memory_fraction = None  # prevent free-mem fallback
+            # Compute max_tokens from the budget using this group's total
+            # bytes-per-token (per-layer bpt × number of layers in group).
+            # _get_bytes_per_token returns per-layer bytes; multiply by
+            # len(layers) for total across all group layers.
+            bpt_per_layer = _get_bytes_per_token(dtype, mapping,
+                                                 per_layer_num_kv_heads,
+                                                 head_dim, layers)
+            total_bpt = bpt_per_layer * len(layers)
+            cfg_copy.max_tokens = int(
+                group_budget / total_bpt) if total_bpt > 0 else None
+
+        mgr = kv_cache_manager_cls(
+            cfg_copy,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            # num_layers must equal sum(layer_mask) per get_pp_layers assertion.
+            num_layers=len(layers),
+            num_kv_heads=per_layer_num_kv_heads,
+            head_dim=head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=max_batch_size,
+            mapping=mapping,
+            dtype=dtype,
+            spec_config=spec_config,
+            max_num_tokens=max_num_tokens,
+            max_beam_width=max_beam_width,
+            is_draft=is_draft,
+            kv_connector_manager=kv_connector_manager
+            if not estimating_kv_cache else None,
+            sparse_attn_config=sparse_attn_config,
+            is_estimating_kv_cache=estimating_kv_cache,
+            execution_stream=execution_stream,
+            layer_mask=layer_mask,
+        )
+        sub_managers.append(mgr)
+
+    # Patch per-layer attention quant configs so each layer's attention kernel
+    # uses the right KV dtype (has_fp8_kv_cache / has_fp4_kv_cache flags).
+    if model_engine is not None and not estimating_kv_cache:
+        _apply_per_layer_kv_quant_config(model_engine.model,
+                                         per_layer_dtype_map, quant_config)
+
+    return MixedPrecisionKVCacheManager(sub_managers, per_layer_dtype_map)
+
+
+def _get_bytes_per_token(
+    dtype: "tensorrt_llm.bindings.DataType",
+    mapping: Mapping,
+    per_layer_num_kv_heads: List[int],
+    head_dim: int,
+    layers: List[int],
+) -> float:
+    """Approximate bytes per token for a dtype group (for memory budget splitting)."""
+    tp_size = max(mapping.tp_size, 1)
+    kv_factor = 2
+    # Use average kv heads across this group's layers.
+    # _build_per_layer_num_kv_heads may return a plain int (uniform case).
+    if isinstance(per_layer_num_kv_heads, int):
+        avg_heads = per_layer_num_kv_heads
+    else:
+        heads = [per_layer_num_kv_heads[i] for i in layers
+                 if i < len(per_layer_num_kv_heads)]
+        avg_heads = (sum(heads) / len(heads)) if heads else 1
+    elems_per_token = kv_factor * (avg_heads / tp_size) * head_dim
+    if dtype == tensorrt_llm.bindings.DataType.FP8:
+        return elems_per_token * 1.0
+    if dtype == tensorrt_llm.bindings.DataType.NVFP4:
+        return elems_per_token * (0.5 + 1.0 / 16)  # FP4 data + FP8 scales
+    return elems_per_token * 2.0  # BF16/FP16
+
+
+def _apply_per_layer_kv_quant_config(model, per_layer_dtype_map: Dict,
+                                     base_quant_config):
+    """Call update_quant_config on each attention layer with the right KV dtype.
+
+    Handles two cases:
+      1. The module found by _get_attention_module has ``update_quant_config``
+         directly (e.g. TrtllmAttention when it is the leaf attention).
+      2. The module is an ``Attention`` wrapper (e.g. Qwen3Attention) whose
+         inner ``TrtllmAttention`` is stored in ``.attn``.  In this case we
+         update ``wrapper.quant_config`` so that ``attention.py`` picks up the
+         new KV dtype when building ``kv_scales_sf``, and then call
+         ``wrapper.attn.update_quant_config`` so the C++ wrapper's quant_mode
+         is also updated.
+
+    For NVFP4 KV cache used with BF16 model weights the ``qkv_proj`` may not
+    have ``kv_scales`` / ``inv_kv_scales`` attributes because those are only
+    created when the module is instantiated with an FP4 quant config.  We add
+    identity-scale tensors (value 1.0) so the forward pass can pass them to
+    the kernel without raising AttributeError.
+    """
+    import copy
+    from torch.nn import Parameter
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization import QuantMode
+
+    # Pre-compute the base mode (weight quant bits only, no KV cache bits).
+    base_mode = (base_quant_config.layer_quant_mode
+                 if base_quant_config is not None else QuantMode(0))
+    base_mode_no_kv = (base_mode & ~QuantMode.FP8_KV_CACHE
+                       & ~QuantMode.NVFP4_KV_CACHE & ~QuantMode.INT8_KV_CACHE)
+
+    for layer_idx, dtype in per_layer_dtype_map.items():
+        attn = _get_attention_module(model, layer_idx)
+        if attn is None:
+            continue
+        qcfg = copy.deepcopy(base_quant_config) if base_quant_config else None
+        if qcfg is None:
+            qcfg = QuantConfig()
+        # Compute the desired per-layer KV cache quant mode.
+        mode = base_mode_no_kv
+        if dtype == tensorrt_llm.bindings.DataType.FP8:
+            mode = mode.set_fp8_kv_cache()
+        elif dtype == tensorrt_llm.bindings.DataType.NVFP4:
+            mode = mode.set_fp4_kv_cache()
+        # layer_quant_mode is a @cached_property; inject the pre-computed value
+        # directly into the instance cache so update_quant_config sees it correctly.
+        qcfg.__dict__['layer_quant_mode'] = mode
+
+        if hasattr(attn, 'update_quant_config'):
+            # Case 1: leaf TrtllmAttention (or any module with the method).
+            attn.update_quant_config(qcfg)
+        else:
+            # Case 2: Attention wrapper (e.g. QKNormRoPEAttention / Qwen3Attention).
+            # Update the wrapper's quant_config so attention.py reads kv_scales_sf.
+            attn.quant_config = qcfg
+            # Update the inner TrtllmAttention so the C++ wrapper uses the right
+            # quantMode when computing intraPoolOffset / cacheElemBits.
+            inner = getattr(attn, 'attn', None)
+            if inner is not None and hasattr(inner, 'update_quant_config'):
+                inner.update_quant_config(qcfg)
+
+        # For NVFP4 KV cache with BF16 model weights: qkv_proj may lack
+        # kv_scales / inv_kv_scales because they are only added at Linear
+        # creation time when the quant config already has fp4_kv_cache set.
+        # Inject identity-scale tensors so the attention forward succeeds.
+        if mode.has_fp4_kv_cache():
+            qkv_proj = getattr(attn, 'qkv_proj', None)
+            if qkv_proj is not None and not hasattr(qkv_proj, 'kv_scales'):
+                # Determine device from an existing model parameter.
+                try:
+                    dev = next(attn.parameters()).device
+                except StopIteration:
+                    dev = torch.device('cuda')
+                qkv_proj.kv_scales = Parameter(
+                    torch.ones(3, dtype=torch.float32, device=dev),
+                    requires_grad=False)
+                qkv_proj.inv_kv_scales = Parameter(
+                    torch.ones(3, dtype=torch.float32, device=dev),
+                    requires_grad=False)
+
+
+def _get_attention_module(model, layer_idx: int):
+    """Walk model.layers[layer_idx] to find the self-attention module.
+
+    Handles flat models (model.layers), single-wrapped models
+    (model.{model,llm}.layers), and double-wrapped VL models
+    (model.llm.model.layers, e.g. Qwen3VLForConditionalGeneration wrapping
+    Qwen3ForCausalLM wrapping Qwen3Model).
+    """
+    layers = getattr(model, 'layers', None)
+    if layers is None:
+        for first_attr in ('model', 'llm'):
+            inner = getattr(model, first_attr, None)
+            if inner is None:
+                continue
+            layers = getattr(inner, 'layers', None)
+            if layers is not None:
+                break
+            # Two levels: VL wrapper -> ForCausalLM -> inner Model
+            inner2 = getattr(inner, 'model', None)
+            if inner2 is not None:
+                layers = getattr(inner2, 'layers', None)
+                if layers is not None:
+                    break
+    if layers is None or layer_idx >= len(layers):
+        return None
+    layer = layers[layer_idx]
+    for attr in ('self_attn', 'self_attention', 'attention', 'attn'):
+        attn = getattr(layer, attr, None)
+        if attn is not None:
+            return attn
+    return None
+
+
 def _create_kv_cache_manager(
         model_engine: Optional[PyTorchModelEngine],
         kv_cache_manager_cls,
@@ -949,6 +1234,53 @@ def _create_kv_cache_manager(
 
     # Use provided num_layers if available, otherwise use config
     num_hidden_layers = num_layers if num_layers is not None else config.num_hidden_layers
+
+    # --- Mixed-precision per-layer KV cache ---
+    # If dtype spec contains per-layer info with more than one distinct dtype,
+    # delegate to _create_mixed_kv_cache_manager instead.
+    if not is_mla(config) and not estimating_kv_cache:
+        raw_dtype_spec = kv_cache_config.dtype
+        if isinstance(raw_dtype_spec, (dict, str)) and (
+                isinstance(raw_dtype_spec, dict)
+                or ":" in str(raw_dtype_spec)):
+            per_layer_dtype_map = _resolve_per_layer_dtype(
+                raw_dtype_spec, num_hidden_layers, quant_config, kv_cache_dtype)
+            unique_dtypes = set(per_layer_dtype_map.values())
+            if len(unique_dtypes) > 1:
+                # Build per_layer_num_kv_heads before delegating
+                draft_config_for_kv_early = None
+                if layer_mask is None:
+                    draft_config_for_kv_early = (getattr(
+                        model_engine.model, 'draft_config', None)
+                                                 if model_engine is not None
+                                                 else None)
+                per_layer_num_kv_heads_early = _build_per_layer_num_kv_heads(
+                    num_key_value_heads, num_hidden_layers, spec_config,
+                    draft_config_for_kv_early)
+                return _create_mixed_kv_cache_manager(
+                    per_layer_dtype_map=per_layer_dtype_map,
+                    kv_cache_manager_cls=kv_cache_manager_cls,
+                    mapping=mapping,
+                    kv_cache_config=kv_cache_config,
+                    tokens_per_block=tokens_per_block,
+                    max_seq_len=max_seq_len,
+                    max_batch_size=max_batch_size,
+                    spec_config=spec_config,
+                    sparse_attn_config=sparse_attn_config,
+                    max_num_tokens=max_num_tokens,
+                    max_beam_width=max_beam_width,
+                    kv_connector_manager=kv_connector_manager,
+                    estimating_kv_cache=estimating_kv_cache,
+                    execution_stream=execution_stream,
+                    model_engine=model_engine,
+                    _model_config=_model_config,
+                    quant_config=quant_config,
+                    per_layer_num_kv_heads=per_layer_num_kv_heads_early,
+                    head_dim=head_dim,
+                    num_hidden_layers=num_hidden_layers,
+                    is_draft=is_draft,
+                    fallback_dtype=kv_cache_dtype,
+                )
     # Only include draft KV heads in the per-layer list when draft layers
     # are NOT handled by a separate draft KV cache manager.  When layer_mask
     # is provided from the caller, it means the main KV cache covers only

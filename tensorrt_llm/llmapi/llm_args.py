@@ -2439,6 +2439,57 @@ SparseAttentionConfig: TypeAlias = Annotated[
 ]
 
 
+def parse_kv_cache_dtype_spec(
+        spec: Union[str, Dict[int, str]],
+        num_layers: int) -> Dict[int, str]:
+    """Parse a KV cache dtype specification into a per-layer dict.
+
+    Supported formats:
+    - Plain string (no colon): uniform dtype for all layers, e.g. "fp8"
+    - Range-syntax string: "0-1:fp8,2-35:nvfp4"
+    - Dict: {0: "fp8", 2: "nvfp4"} — missing layers default to "auto"
+
+    Returns a full mapping {layer_idx: dtype_str} for all num_layers layers.
+    """
+    result: Dict[int, str] = {i: "auto" for i in range(num_layers)}
+
+    if isinstance(spec, dict):
+        for k, v in spec.items():
+            if not (0 <= k < num_layers):
+                raise ValueError(
+                    f"Layer index {k} out of range [0, {num_layers})")
+            result[k] = v
+        return result
+
+    # String spec
+    if ":" not in spec:
+        # Uniform dtype
+        return {i: spec for i in range(num_layers)}
+
+    # Range syntax: "0-1:fp8,2-35:nvfp4"
+    for segment in spec.split(","):
+        segment = segment.strip()
+        if ":" not in segment:
+            raise ValueError(
+                f"Invalid per-layer dtype segment '{segment}'. "
+                "Expected format 'start-end:dtype' or 'idx:dtype'.")
+        range_part, dtype_str = segment.rsplit(":", 1)
+        dtype_str = dtype_str.strip()
+        range_part = range_part.strip()
+        if "-" in range_part:
+            parts = range_part.split("-", 1)
+            start, end = int(parts[0]), int(parts[1])
+        else:
+            start = end = int(range_part)
+        for i in range(start, end + 1):
+            if not (0 <= i < num_layers):
+                raise ValueError(
+                    f"Layer index {i} out of range [0, {num_layers})")
+            result[i] = dtype_str
+
+    return result
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
     """
@@ -2522,10 +2573,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
-    dtype: str = Field(
+    # Accepts a uniform dtype string ("auto", "fp8", "nvfp4", …) OR a per-layer
+    # range-syntax string ("0-1:fp8,2-35:nvfp4") OR a dict mapping layer index
+    # to dtype string ({0: "fp8", 2: "nvfp4"}).
+    dtype: Union[str, Dict[int, str]] = Field(
         default="auto",
-        description=
-        "The data type to use for the KV cache. Use 'auto' to follow checkpoint metadata, otherwise force the specified dtype."
+        description=(
+            "The data type to use for the KV cache. "
+            "Use 'auto' to follow checkpoint metadata. "
+            "For uniform precision use a dtype string (e.g. 'fp8', 'nvfp4'). "
+            "For per-layer mixed precision use a range-syntax string "
+            "(e.g. '0-1:fp8,2-35:nvfp4') or a dict mapping layer index to "
+            "dtype string (e.g. {0: 'fp8', 2: 'nvfp4'})."
+        )
     )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
@@ -2606,14 +2666,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
 
     @field_validator('dtype')
     @classmethod
-    def validate_dtype(cls, v: str):
+    def validate_dtype(cls, v):
+        if isinstance(v, dict):
+            return v
         v = v.lower()
-        if v in ("auto", "fp8",
-                 "nvfp4") or v in _str_to_torch_dtype_dict.keys():
+        if v in ("auto", "fp8", "nvfp4") or v in _str_to_torch_dtype_dict.keys():
+            return v
+        # Per-layer range syntax: "0-1:fp8,2-35:nvfp4"
+        if ":" in v:
             return v
 
         raise ValueError(
-            'kv_cache_config.dtype must be one of "auto", "fp8", "nvfp4", or valid torch.dtype string'
+            'kv_cache_config.dtype must be one of "auto", "fp8", "nvfp4", '
+            'a valid torch.dtype string, or a per-layer range spec like "0-1:fp8,2-35:nvfp4"'
         )
 
     @field_validator('max_gpu_total_bytes')
