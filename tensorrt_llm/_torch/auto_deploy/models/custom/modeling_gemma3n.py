@@ -23,7 +23,6 @@ vision/audio tower weights at load time. The forward path intentionally
 supports only text-only export.
 """
 
-import copy
 import json
 import math
 from dataclasses import dataclass
