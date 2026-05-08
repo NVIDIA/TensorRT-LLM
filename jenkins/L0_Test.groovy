@@ -137,6 +137,14 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results*.xml"
             downloadResultSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, resultsFilePath, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
 
+            // Also download the merged rerun report XML when run_tests.py emits it.
+            // The collectTestResults "Rerun Report" stage globs '*/rerun_results.xml' across
+            // every stage tarball, and the glob above (results*.xml) does NOT match
+            // 'rerun_results.xml'. Without this extra scp, sbatch-based stages drop out of
+            // the cross-stage rerun report.
+            def rerunResultsPath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/rerun_results.xml"
+            Utils.exec(pipeline, script: scpFromRemoteCmd(remote, rerunResultsPath, "${stageName}/"), returnStatus: true, numRetries: 1)
+
             // Download perf test results
             def perfResultsBasePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
             def folderListOutput = Utils.exec(
