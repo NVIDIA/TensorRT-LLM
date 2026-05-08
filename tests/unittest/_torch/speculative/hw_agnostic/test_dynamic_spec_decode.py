@@ -7,10 +7,9 @@ import pytest
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
-                                 KvCacheConfig)
+from tensorrt_llm.llmapi import CudaGraphConfig, Eagle3DecodingConfig, KvCacheConfig
 
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 
 @pytest.fixture(scope="function")
@@ -20,9 +19,7 @@ def enforce_single_worker(monkeypatch):
 
 
 def test_dynamic_draft_len(enforce_single_worker):
-
-    def mock_get_draft_len_for_batch_size(draft_len_schedule, batch_size,
-                                          max_total_draft_tokens):
+    def mock_get_draft_len_for_batch_size(draft_len_schedule, batch_size, max_total_draft_tokens):
         # The draft length for each iter will be 4-4-2-2-0-0-2-2-4-4-2-2-0-0-2-2-...
         # which tested:
         # (1) decrease draft length: 4->2,
@@ -39,8 +36,7 @@ def test_dynamic_draft_len(enforce_single_worker):
         return dynamic_draft_len
 
     # Create a Mock object with the mock function as side_effect
-    mock_get_draft_len_for_batch_size = Mock(
-        side_effect=mock_get_draft_len_for_batch_size)
+    mock_get_draft_len_for_batch_size = Mock(side_effect=mock_get_draft_len_for_batch_size)
     # Reset mock state before using it
     mock_get_draft_len_for_batch_size.reset_mock()
     mock_get_draft_len_for_batch_size.call_count = 0
@@ -79,12 +75,11 @@ def test_dynamic_draft_len(enforce_single_worker):
     ]
     sampling_params = SamplingParams(max_tokens=50, temperature=0)
     with patch(
-            'tensorrt_llm._torch.speculative.utils.get_draft_len_for_batch_size',
-            mock_get_draft_len_for_batch_size):
+        "tensorrt_llm._torch.speculative.utils.get_draft_len_for_batch_size",
+        mock_get_draft_len_for_batch_size,
+    ):
         results_spec = llm_spec.generate(prompts, sampling_params)
-        generated_text_spec = [
-            result.outputs[0].text for result in results_spec
-        ]
+        generated_text_spec = [result.outputs[0].text for result in results_spec]
     llm_spec.shutdown()
 
     llm_ref = LLM(**llm_common_config)

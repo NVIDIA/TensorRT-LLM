@@ -89,9 +89,9 @@ l0_a10:
   - test_e2e.py::test_openai_mmencoder_example
   - test_e2e.py::test_openai_perf_metrics
   - test_e2e.py::test_openai_prometheus
-  - test_e2e.py::test_openai_lora
+  # test_openai_lora and test_trtllm_serve_lora_example moved to l0_a100.yml
+  # (Llama-7B + KV cache + spec resources exceeds A10's 22 GB).
   - test_e2e.py::test_trtllm_serve_multimodal_example
-  - test_e2e.py::test_trtllm_serve_lora_example
   - test_e2e.py::test_trtllm_serve_top_logprobs[pytorch]
   - test_e2e.py::test_openai_misc_example[pytorch]
   - test_e2e.py::test_openai_reasoning[pytorch]

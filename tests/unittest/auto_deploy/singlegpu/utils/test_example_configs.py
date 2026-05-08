@@ -28,7 +28,7 @@ from pydantic import ValidationError
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 
 # Root directory for the example configs
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[5]
 _AD_EXAMPLES_DIR = _REPO_ROOT / "examples" / "auto_deploy"
 
 # Files that are not LlmArgs configs and should be excluded from validation
@@ -63,20 +63,39 @@ def test_config_yaml_is_valid_yaml(config_yaml_path):
     assert isinstance(data, dict), f"Expected top-level dict, got {type(data)}"
 
 
-def _is_cross_validation_error(e: ValidationError) -> bool:
-    """Check if all errors are cross-field validation failures expected for fragment configs.
+# Top-level keys from ExperimentConfig (build_and_run_ad.py) that are not LlmArgs fields.
+# These appear in full experiment configs and should be tolerated when validating as yaml_extra.
+_EXPERIMENT_CONFIG_KEYS = {"args", "benchmark", "dry_run", "prompt", "free_mem_ratio"}
 
-    Fragment configs (e.g., model_registry/configs/) are designed to be composed with other
-    configs. When loaded in isolation, the default CudaGraphConfig (max_batch_size=128) may
-    conflict with a fragment's small max_batch_size. This cross-validation failure is expected
-    and should not fail the test.
+
+def _is_tolerable_validation_error(e: ValidationError) -> bool:
+    """Check if all errors are expected validation failures for example configs.
+
+    Tolerates:
+    - Cross-field validation failures between max_batch_size/cuda_graph_config (fragment configs)
+    - Extra inputs from ExperimentConfig top-level keys (full experiment configs)
+    - model_factory values not in the registry (configs for models not importable in test env)
     """
     for err in e.errors():
         msg = str(err.get("msg", ""))
+        err_type = err.get("type", "")
+        loc = err.get("loc", ())
+        field_name = loc[0] if loc else ""
+
+        # Cross-field validation errors from fragment configs
         if "max_batch_size" in msg and "cuda_graph_config" in msg:
             continue
         if "max_num_tokens" in msg and "max_batch_size" in msg:
             continue
+
+        # Extra inputs from ExperimentConfig keys (not LlmArgs fields)
+        if err_type == "extra_forbidden" and field_name in _EXPERIMENT_CONFIG_KEYS:
+            continue
+
+        # model_factory values for models not importable in test environment
+        if field_name == "model_factory" and "does not exist in the model factory registry" in msg:
+            continue
+
         return False
     return True
 
@@ -89,9 +108,11 @@ def test_config_yaml_dry_run_ingestion(config_yaml_path):
 
     Cross-field validation errors between max_batch_size and cuda_graph_config are tolerated
     because these configs are fragments meant to be composed, not used standalone.
+    ExperimentConfig fields (args, benchmark, dry_run, etc.) are also tolerated since some
+    configs are full experiment configs for build_and_run_ad.py.
     """
     try:
         LlmArgs(model=_DUMMY_MODEL, yaml_extra=[str(config_yaml_path)])
     except ValidationError as e:
-        if not _is_cross_validation_error(e):
+        if not _is_tolerable_validation_error(e):
             raise

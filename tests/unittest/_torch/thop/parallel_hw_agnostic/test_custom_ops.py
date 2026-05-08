@@ -37,7 +37,7 @@ def discover_custom_ops(namespaces):
 def custom_ops():
     """Discover custom ops in the codebase."""
     # "auto_deploy" custom ops are not checked here.
-    custom_op_namespaces = ("trtllm", )
+    custom_op_namespaces = ("trtllm",)
 
     return discover_custom_ops(custom_op_namespaces)
 
@@ -114,5 +114,4 @@ def test_register_fake(custom_ops):
             ops_missing_fake_impl.append(op)
 
     names = ", ".join(op._name for op in ops_missing_fake_impl)
-    assert len(
-        ops_missing_fake_impl) == 0, f"Custom ops missing fake impl: {names}"
+    assert len(ops_missing_fake_impl) == 0, f"Custom ops missing fake impl: {names}"

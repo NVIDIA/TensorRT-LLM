@@ -646,8 +646,29 @@ class CachedSequenceInterface:
         self._unmanaged_resources.clear()
         for name, handler in self._resource_lookup.items():
             if self._caches[name] is None:  # Not yet assigned a tensor
-                self._caches[name] = handler.allocate(self.info)
+                if isinstance(handler, StateResourceHandler):
+                    self._caches[name] = self._allocate_unmanaged_state_resource(handler)
+                else:
+                    self._caches[name] = handler.allocate(self.info)
                 self._unmanaged_resources.append(name)
+
+    def _allocate_unmanaged_state_resource(self, handler: StateResourceHandler) -> torch.Tensor:
+        """Allocate state resources in the slot domain used by runtime metadata."""
+        max_num_state_slots = self.info.max_num_state_slots
+        if TRTLLM_AVAILABLE and isinstance(
+            self._kv_cache_manager, (MambaHybridCacheManager, MixedMambaHybridCacheManager)
+        ):
+            # ADEngine passes Mamba cache indices through slot_idx for every stateful
+            # op when a Mamba-hybrid cache manager is present. Mirror the padding
+            # slots reserved by that manager for CUDA-graph/spec-decoding dummies.
+            max_num_state_slots += self.info.batch_info.get_max_draft_len() + 1
+
+        return torch.empty(
+            max_num_state_slots,
+            *handler.state_shape,
+            device=self.info.device,
+            dtype=handler.dtype,
+        )
 
     def _create_kv_cache_manager(self, max_tokens: Optional[int] = None) -> Dict:
         """Create KVCacheManager or MambaHybridCacheManager with standard layout.

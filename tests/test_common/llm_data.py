@@ -65,6 +65,9 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "mistralai/Codestral-22B-v0.1": "Codestral-22B-v0.1",
     "mistralai/Ministral-8B-Instruct-2410": "Ministral-8B-Instruct-2410",
     "nvidia/Llama-3.1-Nemotron-Nano-8B-v1": "Llama-3.1-Nemotron-Nano-8B-v1",
+    "google/gemma-4-26B-A4B-it": "gemma/gemma-4-26B-A4B-it",
+    "Qwen/Qwen3.5-35B-A3B": "Qwen3.5-35B-A3B",
+    "MiniMaxAI/MiniMax-M2": "MiniMax-M2",
 }
 
 

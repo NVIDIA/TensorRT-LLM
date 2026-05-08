@@ -364,14 +364,19 @@ class DeepSeekV3Attention(nn.Module):
                 self.softmax_scale = self.softmax_scale * mscale * mscale
 
     def _init_rope(self):
-        if self.config.rope_scaling is None:
+        rope_scaling = self.config.rope_scaling
+        # In transformers 5.x rope_scaling is never None; treat "default"
+        # rope_type the same as no scaling.
+        scaling_type = None
+        if rope_scaling is not None:
+            scaling_type = rope_scaling.get("type", rope_scaling.get("rope_type"))
+        if scaling_type is None or scaling_type == "default":
             self.rotary_emb = DeepSeekV3RotaryEmbedding(
                 self.qk_rope_head_dim,
                 max_position_embeddings=self.max_position_embeddings,
                 base=self.rope_theta,
             )
         else:
-            scaling_type = self.config.rope_scaling["type"]
             scaling_factor = self.config.rope_scaling["factor"]
 
             if scaling_type == "yarn":
@@ -607,7 +612,7 @@ class DeepSeekV3Model(DeepSeekV3PreTrainedModel):
 class DeepSeekV3ForCausalLM(DeepSeekV3PreTrainedModel, GenerationMixin):
     """DeepSeekV3 model with language modeling head."""
 
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config):
         super().__init__(config)

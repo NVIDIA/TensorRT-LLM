@@ -1753,6 +1753,68 @@ class NVFP4LinearMethod(LinearMethodBase):
         self._cleanup_nvfp4_tmp_attrs(module,
                                       extra_attrs=["tmp_nvfp4_pre_quant_scale"])
 
+        # Interleave gate/up weights for CuteDSL SwiGLU fusion.
+        #
+        # The CuteDSL SwiGLU kernel expects weights arranged as interleaved
+        # (up, gate) blocks of 64 rows: [up_0 | gate_0 | up_1 | gate_1 | ...].
+        #
+        # GatedMLP stores gate_up weights as [gate | up] (first half = gate,
+        # second half = up). This method swaps the halves to [up | gate] then
+        # interleaves in 64-row groups to match the kernel layout.
+        #
+        # Weight scales are similarly unswizzled, interleaved, and re-swizzled.
+        if not module.use_cute_dsl_blockscaling_mm:
+            return
+
+        group_size = 64
+        n = module.out_features  # 2 * intermediate_size
+        if n % (group_size * 2) != 0:
+            return
+
+        # --- Interleave FP4 weight tensor ---
+        # weight shape: [n, k_packed] where n = 2 * intermediate_size
+        weight = module.weight.data
+        half_n = n // 2
+        # Swap gate/up halves: [gate | up] → [up | gate]
+        weight_swapped = torch.cat([weight[half_n:], weight[:half_n]], dim=0)
+        # Interleave in 64-row groups: [up | gate] → [up_0 | gate_0 | up_1 | gate_1 | ...]
+        k_dim = weight_swapped.shape[1]
+        weight_interleaved = weight_swapped.view(
+            2, n // (group_size * 2), group_size,
+            k_dim).transpose(0, 1).contiguous().view(n, k_dim)
+        module.weight = Parameter(weight_interleaved, requires_grad=False)
+
+        # --- Interleave weight scale factors ---
+        # weight_scale is a 1D swizzled tensor
+        scale_rows = fp4_utils.pad_up(n, 128)
+        k = module.in_features
+        scale_cols_real = k  # real K dimension (before FP4 packing)
+        sf_vec_size = module.scaling_vector_size
+
+        # Unswizzle to 2D [padded_n, padded_k_sf]
+        ws_unswizzled = unswizzle_sf(module.weight_scale.data, scale_rows,
+                                     scale_cols_real, sf_vec_size)
+        # ws_unswizzled shape: [pad_up(n, 128), pad_up(k // sf_vec_size, 4)]
+        sf_k = ws_unswizzled.shape[1]
+
+        # Swap gate/up halves of the first n rows (padded rows stay zero)
+        ws_swapped = ws_unswizzled.clone()
+        ws_swapped[:half_n] = ws_unswizzled[half_n:n]
+        ws_swapped[half_n:n] = ws_unswizzled[:half_n]
+
+        # Interleave in 64-row groups (only the first n rows)
+        ws_top = ws_swapped[:n]  # [n, sf_k]
+        ws_top_interleaved = ws_top.view(2, n // (group_size * 2), group_size,
+                                         sf_k).transpose(0,
+                                                         1).contiguous().view(
+                                                             n, sf_k)
+        ws_swapped[:n] = ws_top_interleaved
+
+        # Re-swizzle to 1D
+        module.weight_scale = Parameter(
+            torch.ops.trtllm.block_scale_interleave(ws_swapped),
+            requires_grad=False)
+
     def post_load_weights(self, module: Linear):
         """Pad weight and weight_scale tensors to meet torch trtllm NVFP4 GEMM alignment requirements."""
         super().post_load_weights(module)

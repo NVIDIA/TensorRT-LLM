@@ -1086,8 +1086,10 @@ protected:
         {
             TLLM_CHECK(mCacheState->getIndexerKCacheQuantBlockSize() != 0);
             TLLM_CHECK(mCacheState->getIndexerDimPerHead() % mCacheState->getIndexerKCacheQuantBlockSize() == 0);
-            sizePerHead = mCacheState->getIndexerDimPerHead()
-                + mCacheState->getIndexerDimPerHead() / mCacheState->getIndexerKCacheQuantBlockSize() * 4;
+            auto const dim = mCacheState->getIndexerDimPerHead();
+            auto const q = mCacheState->getIndexerKCacheQuantBlockSize();
+            auto const dataBytes = mCacheState->getIndexerKCacheUseFp4() ? dim / 2 : dim;
+            sizePerHead = dataBytes + dim / q * 4;
         }
         else
         {
@@ -1180,8 +1182,10 @@ protected:
         int sizePerHead;
         if (isIndexerKCache)
         {
-            sizePerHead = mCacheState->getIndexerDimPerHead()
-                + mCacheState->getIndexerDimPerHead() / mCacheState->getIndexerKCacheQuantBlockSize() * 4;
+            auto const dim = mCacheState->getIndexerDimPerHead();
+            auto const q = mCacheState->getIndexerKCacheQuantBlockSize();
+            auto const dataBytes = mCacheState->getIndexerKCacheUseFp4() ? dim / 2 : dim;
+            sizePerHead = dataBytes + dim / q * 4;
         }
         else
         {

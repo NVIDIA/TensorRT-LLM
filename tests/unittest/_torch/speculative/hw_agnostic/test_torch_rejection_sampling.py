@@ -5,8 +5,7 @@ import numpy as np
 import torch
 from scipy.stats import entropy
 
-from tensorrt_llm._torch.pyexecutor.sampler import (get_rejected_indices,
-                                                    sample_rejected)
+from tensorrt_llm._torch.pyexecutor.sampler import get_rejected_indices, sample_rejected
 
 
 def test_get_rejected_indices():
@@ -25,23 +24,16 @@ def test_get_rejected_indices():
     sampled_regular = []
     for _ in range(num_iter):
         draft_tokens = [
-            cast(
-                int,
-                torch.multinomial(draft_probs,
-                                  num_samples=1,
-                                  generator=generator).item())
+            cast(int, torch.multinomial(draft_probs, num_samples=1, generator=generator).item())
         ]
-        rejected_indices = get_rejected_indices(draft_probs, target_probs,
-                                                generator, draft_tokens)
+        rejected_indices = get_rejected_indices(draft_probs, target_probs, generator, draft_tokens)
         if rejected_indices.shape[0] == 0:
             sampled_tokens.append(draft_tokens[0])
         else:
-            sampled_tokens.append(
-                sample_rejected(draft_probs, target_probs, generator, 0))
+            sampled_tokens.append(sample_rejected(draft_probs, target_probs, generator, 0))
         sampled_regular.append(
-            torch.multinomial(target_probs[0],
-                              num_samples=1,
-                              generator=generator).item())
+            torch.multinomial(target_probs[0], num_samples=1, generator=generator).item()
+        )
     bins = np.arange(vocab_size + 1) - 0.5  # Bins for histogram
     sampled_tokens, _ = np.histogram(sampled_tokens, bins=bins, density=True)
     sampled_regular, _ = np.histogram(sampled_regular, bins=bins, density=True)

@@ -24,9 +24,12 @@ LLAVA_NEXT_7B_CONFIG = {
     "text_config": {
         "_name_or_path": "mistralai/Mistral-7B-Instruct-v0.2",
         "architectures": ["MistralForCausalLM"],
-        "intermediate_size": 14336,
+        "hidden_size": 256,  # NOTE: Reduced for testing (full model: 4096)
+        "intermediate_size": 512,  # NOTE: Reduced for testing (full model: 14336)
         "max_position_embeddings": 32768,
         "model_type": "mistral",
+        "num_attention_heads": 8,
+        "num_hidden_layers": 2,  # NOTE: Only 2 layers for testing (full model: 32)
         "num_key_value_heads": 8,
         "rms_norm_eps": 1e-05,
         "rope_theta": 1000000.0,
