@@ -102,8 +102,13 @@ static constexpr uint32_t FHC_BLOCK_M = 64;
 static constexpr uint32_t FHC_BLOCK_N = 32;
 static constexpr uint32_t FHC_BLOCK_K = 64;
 static constexpr uint32_t FHC_SWIZZLE_CD = 128;
-static constexpr uint32_t FHC_N_B_STAGES = 12;
-static constexpr uint32_t FHC_N_INPUT_STG = 2;
+// Rebalanced from N_B=12 / N_INPUT=2: SASS PC-sampling on M=4096 KS=2 showed
+// ~25% of all stalls landed on a single NANOSLEEP.SYNCS (mbarrier wait) — the
+// pmap warp was input-buffer-starved with only 2 TMA stages for 56 h_tiles.
+// Trade 5 B-stages (-40 KiB) for +1 input stage (+40 KiB), keeping total SMEM
+// at 226 KiB. N_B=7 still leaves >= HC_MULT slack for the MMA pipeline.
+static constexpr uint32_t FHC_N_B_STAGES = 7;
+static constexpr uint32_t FHC_N_INPUT_STG = 3;
 static constexpr uint32_t FHC_NUM_MMA_TH = 128;
 static constexpr uint32_t FHC_NUM_PMAP_TH = 128;
 
