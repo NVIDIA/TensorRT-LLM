@@ -1378,7 +1378,7 @@ class Gemma4TextModel(Gemma4TextPreTrainedModel):
 
 class Gemma4ForCausalLM(Gemma4TextPreTrainedModel, GenerationMixin):
     config_class = Gemma4TextConfig
-    _tied_weights_keys = ["lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: Gemma4TextConfig, **kwargs):
         del kwargs
@@ -1882,7 +1882,9 @@ class Gemma4Model(Gemma4PreTrainedModel):
 
 class Gemma4ForConditionalGeneration(Gemma4PreTrainedModel, GenerationMixin):
     config_class = Gemma4Config
-    _tied_weights_keys = ["model.language_model.lm_head.weight"]
+    _tied_weights_keys = {
+        "model.language_model.lm_head.weight": "model.language_model.embed_tokens.weight"
+    }
 
     def __init__(self, config: Gemma4Config, **kwargs):
         del kwargs

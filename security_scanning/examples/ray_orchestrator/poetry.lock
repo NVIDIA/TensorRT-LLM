@@ -770,14 +770,14 @@ grpc = ["grpcio (>=1.33.2,<2.0.0)", "grpcio (>=1.49.1,<2.0.0) ; python_version >
 
 [[package]]
 name = "google-auth"
-version = "2.50.0"
+version = "2.51.0"
 description = "Google Authentication Library"
 optional = false
-python-versions = ">=3.8"
+python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "google_auth-2.50.0-py3-none-any.whl", hash = "sha256:04382175e28b94f49694977f0a792688b59a668def1499e9d8de996dc9ce5b15"},
-    {file = "google_auth-2.50.0.tar.gz", hash = "sha256:f35eafb191195328e8ce10a7883970877e7aeb49c2bfaa54aa0e394316d353d0"},
+    {file = "google_auth-2.51.0-py3-none-any.whl", hash = "sha256:230bd016f50d4c0b82fda2f50db5d372bc02cfd9bdab4ce5a9ce0d8c0f06bba5"},
+    {file = "google_auth-2.51.0.tar.gz", hash = "sha256:a8191008d6aaace30f0823daa3f0073c734f8b4da8b8de074b5151aa9aa732c5"},
 ]
 
 [package.dependencies]
@@ -785,7 +785,7 @@ cryptography = ">=38.0.3"
 pyasn1-modules = ">=0.2.1"
 
 [package.extras]
-aiohttp = ["aiohttp (>=3.6.2,<4.0.0)", "requests (>=2.20.0,<3.0.0)"]
+aiohttp = ["aiohttp (>=3.8.0,<4.0.0)", "requests (>=2.20.0,<3.0.0)"]
 cryptography = ["cryptography (>=38.0.3)"]
 enterprise-cert = ["pyopenssl"]
 pyjwt = ["pyjwt (>=2.0)"]
@@ -793,19 +793,19 @@ pyopenssl = ["pyopenssl (>=20.0.0)"]
 reauth = ["pyu2f (>=0.1.5)"]
 requests = ["requests (>=2.20.0,<3.0.0)"]
 rsa = ["rsa (>=3.1.4,<5)"]
-testing = ["aiohttp (<3.10.0)", "aiohttp (>=3.6.2,<4.0.0)", "aioresponses", "flask", "freezegun", "grpcio", "packaging", "pyjwt (>=2.0)", "pyopenssl (<24.3.0)", "pyopenssl (>=20.0.0)", "pytest", "pytest-asyncio", "pytest-cov", "pytest-localserver", "pyu2f (>=0.1.5)", "requests (>=2.20.0,<3.0.0)", "responses", "urllib3"]
+testing = ["aiohttp (<3.10.0)", "aiohttp (>=3.8.0,<4.0.0)", "aioresponses", "flask", "freezegun", "grpcio", "packaging", "pyjwt (>=2.0)", "pyopenssl (<24.3.0)", "pyopenssl (>=20.0.0)", "pytest", "pytest-asyncio", "pytest-cov", "pytest-localserver", "pyu2f (>=0.1.5)", "requests (>=2.20.0,<3.0.0)", "responses", "urllib3"]
 urllib3 = ["packaging", "urllib3"]
 
 [[package]]
 name = "googleapis-common-protos"
-version = "1.74.0"
+version = "1.75.0"
 description = "Common protobufs used in Google APIs"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "googleapis_common_protos-1.74.0-py3-none-any.whl", hash = "sha256:702216f78610bb510e3f12ac3cafd281b7ac45cc5d86e90ad87e4d301a3426b5"},
-    {file = "googleapis_common_protos-1.74.0.tar.gz", hash = "sha256:57971e4eeeba6aad1163c1f0fc88543f965bb49129b8bb55b2b7b26ecab084f1"},
+    {file = "googleapis_common_protos-1.75.0-py3-none-any.whl", hash = "sha256:961ed60399c457ceb0ee8f285a84c870aabc9c6a832b9d37bb281b5bebde43ed"},
+    {file = "googleapis_common_protos-1.75.0.tar.gz", hash = "sha256:53a062ff3c32552fbd62c11fe23768b78e4ddf0494d5e5fd97d3f4689c75fbbd"},
 ]
 
 [package.dependencies]
@@ -1486,14 +1486,14 @@ files = [
 
 [[package]]
 name = "proto-plus"
-version = "1.27.2"
+version = "1.28.0"
 description = "Beautiful, Pythonic protocol buffers"
 optional = false
-python-versions = ">=3.9"
+python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "proto_plus-1.27.2-py3-none-any.whl", hash = "sha256:6432f75893d3b9e70b9c412f1d2f03f65b11fb164b793d14ae2ca01821d22718"},
-    {file = "proto_plus-1.27.2.tar.gz", hash = "sha256:b2adde53adadf75737c44d3dcb0104fde65250dfc83ad59168b4aa3e574b6a24"},
+    {file = "proto_plus-1.28.0-py3-none-any.whl", hash = "sha256:a630604310899e73c59ec302e5765c058d412b2f090b9c79c8822589f14955b8"},
+    {file = "proto_plus-1.28.0.tar.gz", hash = "sha256:38e5696342835b08fc116f30a25665b29531cda9d5d5643e9b81fc312385abd9"},
 ]
 
 [package.dependencies]
@@ -2145,14 +2145,14 @@ typing-extensions = ">=4.12.0"
 
 [[package]]
 name = "urllib3"
-version = "2.6.3"
+version = "2.7.0"
 description = "HTTP library with thread-safe connection pooling, file post, and more."
 optional = false
-python-versions = ">=3.9"
+python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "urllib3-2.6.3-py3-none-any.whl", hash = "sha256:bf272323e553dfb2e87d9bfd225ca7b0f467b919d7bbd355436d3fd37cb0acd4"},
-    {file = "urllib3-2.6.3.tar.gz", hash = "sha256:1b62b6884944a57dbe321509ab94fd4d3b307075e0c2eae991ac71ee15ad38ed"},
+    {file = "urllib3-2.7.0-py3-none-any.whl", hash = "sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897"},
+    {file = "urllib3-2.7.0.tar.gz", hash = "sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c"},
 ]
 
 [package.extras]

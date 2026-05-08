@@ -102,11 +102,25 @@ class Llama4RotaryEmbedding(nn.Module):
 
     def __init__(self, config: Llama4TextConfig):
         super().__init__()
-        # Determine rope type from config
-        rope_type = "llama3" if config.rope_scaling is not None else "default"
+        # transformers >=5.x auto-populates ``rope_parameters`` to
+        # ``{"rope_type": "default", ...}`` even when the user passes
+        # ``rope_scaling=None``, so always read the type from the dict.
+        rope_parameters = config.rope_parameters
+        rope_type = rope_parameters["rope_type"]
 
-        # Use HF's ROPE_INIT_FUNCTIONS to compute inv_freq with proper scaling
-        inv_freq, self.attention_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, device=None)
+        if rope_type == "default":
+            # ROPE_INIT_FUNCTIONS no longer carries a "default" entry in
+            # transformers 5.x; replicate upstream's
+            # ``Llama4TextRotaryEmbedding.compute_default_rope_parameters``.
+            base = rope_parameters["rope_theta"]
+            head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+            inv_freq = 1.0 / (
+                base ** (torch.arange(0, head_dim, 2, dtype=torch.int64).float() / head_dim)
+            )
+            self.attention_scaling = 1.0
+        else:
+            # Use HF's ROPE_INIT_FUNCTIONS to compute inv_freq with proper scaling
+            inv_freq, self.attention_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, device=None)
 
         # Precompute complex frequencies for all positions
         max_pos = config.max_position_embeddings

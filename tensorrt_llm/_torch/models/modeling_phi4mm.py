@@ -113,6 +113,11 @@ def _load_phi4mm_classes(local_path):
         spec = importlib.util.spec_from_file_location(
             f"{package_name}.hf_modeling_phi4mm", modeling_phi4mm_path)
         hf_modeling_phi4mm = importlib.util.module_from_spec(spec)
+        # transformers 5.3.0 merged SlidingWindowCache into StaticCache, but the
+        # model's custom modeling_phi4mm.py still imports it. Alias it so the
+        # import succeeds.
+        _cache_utils = importlib.import_module("transformers.cache_utils")
+        _cache_utils.SlidingWindowCache = _cache_utils.StaticCache
         spec.loader.exec_module(hf_modeling_phi4mm)
         Phi4MMAudioEmbedding = hf_modeling_phi4mm.Phi4MMAudioEmbedding
         Phi4MMImageEmbedding = hf_modeling_phi4mm.Phi4MMImageEmbedding

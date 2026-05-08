@@ -17,6 +17,7 @@ from typing import Optional, Union
 
 import torch
 
+from ..._utils import get_hf_rope_theta
 from ...layers import MoeConfig
 from ...logger import logger
 from ...mapping import Mapping
@@ -134,7 +135,7 @@ class GPTConfig(PretrainedConfig):
             hf_config.layer_norm_epsilon = hf_config.norm_epsilon if gpt_variant == 'starcoder2' else hf_config.layer_norm_eps
             hf_config.bias = hf_config.use_bias if gpt_variant == 'starcoder2' else gpt_variant != 'nemotron'
             hf_config.position_embedding_type = 'rope_gpt_neox'
-            hf_config.rotary_base = hf_config.rope_theta
+            hf_config.rotary_base = get_hf_rope_theta(hf_config, 10000.0)
             hf_config.rotary_pct = getattr(
                 hf_config, 'partial_rotary_factor',
                 getattr(hf_config, 'rope_percent', 1.0))

@@ -70,6 +70,23 @@ np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
 np_float8 = np.dtype('V1', metadata={"dtype": "float8"})
 
 
+def get_hf_rope_theta(config: Any, default: float = 10000.0) -> float:
+    """Return RoPE ``theta`` from a Hugging Face ``PreTrainedConfig``-like object.
+
+    Transformers v5+ nests ``rope_theta`` under ``rope_parameters`` for several
+    models (e.g. LLaMA); older releases expose ``config.rope_theta`` directly.
+    """
+    theta = getattr(config, "rope_theta", None)
+    if theta is not None:
+        return float(theta)
+    rope_params = getattr(config, "rope_parameters", None)
+    if isinstance(rope_params, dict):
+        theta = rope_params.get("rope_theta")
+        if theta is not None:
+            return float(theta)
+    return default
+
+
 def torch_to_numpy(x: torch.Tensor):
     assert isinstance(x, torch.Tensor), \
         f'x must be a torch.Tensor object, but got {type(x)}.'

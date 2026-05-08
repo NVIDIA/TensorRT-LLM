@@ -42,7 +42,8 @@ from ..attention_backend.utils import get_attention_backend
 from ..modules.gated_mlp import GatedMLP
 from ..modules.rotary_embedding import MRotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
+from .modeling_multimodal_utils import (bypass_processor_output_validation,
+                                        find_input_mm_embeds, fuse_input_embeds,
                                         get_multimodal_embeddings)
 from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
                              filter_weights, register_auto_model,
@@ -286,13 +287,22 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             do_rescale = False
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
-        return self.processor(text=[text],
-                              images=images,
-                              videos=videos,
-                              padding=True,
-                              do_rescale=do_rescale,
-                              return_tensors='pt',
-                              **mm_processor_kwargs)
+        # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly
+        # validates per-modality kwargs against the processor's TypedDict.
+        # Processor *output* keys (``video_grid_thw``, ``pixel_values``, ...)
+        # round-trip into the validator via tokenizer ``init_kwargs`` /
+        # ``model_input_names`` and trip it with ``TypeError:
+        # merged_typed_dict.__init__() got an unexpected keyword argument
+        # 'video_grid_thw'``. Bypass the validator for our known output keys
+        # for the duration of the processor call.
+        with bypass_processor_output_validation():
+            return self.processor(text=[text],
+                                  images=images,
+                                  videos=videos,
+                                  padding=True,
+                                  do_rescale=do_rescale,
+                                  return_tensors='pt',
+                                  **mm_processor_kwargs)
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
         masks = (input_ids == self.config.image_token_id) | (
@@ -512,7 +522,7 @@ class Qwen2_5_VLVisionAttention(Attention):
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_heads,
             num_key_value_heads=config.num_heads,
-            max_position_embeddings=model_config.pretrained_config.
+            max_position_embeddings=model_config.pretrained_config.text_config.
             max_position_embeddings,
             bias=True,
             pos_embd_params=None,
@@ -521,6 +531,10 @@ class Qwen2_5_VLVisionAttention(Attention):
             dtype=config.torch_dtype,
             config=model_config,
             reduce_output=reduce_output,
+            # The vision encoder's head_dim is derived from its own
+            # hidden_size; don't inherit head_dim mirrored from the text
+            # sub-config onto the top-level pretrained_config.
+            head_dim=config.hidden_size // config.num_heads,
         )
 
     def forward(
@@ -583,12 +597,14 @@ class Qwen2_5_VLVisionBlock(torch.nn.Module):
                  layer_idx: int):
         super().__init__()
         config = model_config.pretrained_config.vision_config
-        self.norm1 = RMSNorm(hidden_size=config.hidden_size,
-                             eps=model_config.pretrained_config.rms_norm_eps,
-                             dtype=model_config.pretrained_config.torch_dtype)
-        self.norm2 = RMSNorm(hidden_size=config.hidden_size,
-                             eps=model_config.pretrained_config.rms_norm_eps,
-                             dtype=model_config.pretrained_config.torch_dtype)
+        self.norm1 = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=model_config.pretrained_config.text_config.rms_norm_eps,
+            dtype=model_config.pretrained_config.torch_dtype)
+        self.norm2 = RMSNorm(
+            hidden_size=config.hidden_size,
+            eps=model_config.pretrained_config.text_config.rms_norm_eps,
+            dtype=model_config.pretrained_config.torch_dtype)
         self.attn = Qwen2_5_VLVisionAttention(model_config, layer_idx)
         self.mlp = Qwen2_5_VLMLP(model_config, layer_idx)
 
@@ -628,9 +644,10 @@ class Qwen2_5_VLPatchMerger(torch.nn.Module):
         dim = config.out_hidden_size
         context_dim = config.hidden_size
         self.hidden_size = context_dim * (spatial_merge_size**2)
-        self.ln_q = RMSNorm(hidden_size=context_dim,
-                            eps=model_config.pretrained_config.rms_norm_eps,
-                            dtype=model_config.pretrained_config.torch_dtype)
+        self.ln_q = RMSNorm(
+            hidden_size=context_dim,
+            eps=model_config.pretrained_config.text_config.rms_norm_eps,
+            dtype=model_config.pretrained_config.torch_dtype)
         self.mlp = torch.nn.Sequential(
             Linear(in_features=self.hidden_size,
                    out_features=self.hidden_size,
@@ -849,7 +866,15 @@ class Qwen2VLModelBase(PreTrainedModel):
         # NOTE: Setting disable_fuse_rope to True to do mrope fusion in the model engine by pre-computing rotary_cos_sin in the model engine
         disable_fuse_rope = kwargs.get('disable_fuse_rope', False)
         model_config.pretrained_config.disable_fuse_rope = disable_fuse_rope
-        model_config.pretrained_config.rope_scaling['type'] = 'mrope'
+        # In transformers 5.x, rope_scaling is a property that reads
+        # rope_parameters, which may not exist on Qwen2_5_VLConfig.
+        # Use getattr to safely check and initialize.
+        rope_scaling = getattr(model_config.pretrained_config, 'rope_scaling',
+                               None)
+        if rope_scaling is None or not isinstance(rope_scaling, dict):
+            rope_scaling = {}
+            model_config.pretrained_config.rope_scaling = rope_scaling
+        rope_scaling['type'] = 'mrope'
         config = model_config.pretrained_config
 
         self._supports_sdpa = True
@@ -864,6 +889,11 @@ class Qwen2VLModelBase(PreTrainedModel):
             self.init_mrope_embedding(model_config)
 
         llm_model_config = copy.deepcopy(model_config)
+        text_config = getattr(llm_model_config.pretrained_config, 'text_config',
+                              None)
+        if text_config is not None:
+            llm_model_config.pretrained_config = text_config
+        llm_model_config.pretrained_config.disable_fuse_rope = disable_fuse_rope
         llm_model_config.pretrained_config.architectures = ["Qwen2ForCausalLM"]
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
@@ -876,20 +906,28 @@ class Qwen2VLModelBase(PreTrainedModel):
 
     def init_mrope_embedding(self, model_config: ModelConfig[PretrainedConfig]):
         config = model_config.pretrained_config
+        # For VL configs (Qwen2_5_VLConfig), hidden_size etc. live in
+        # text_config. Use text_config for RoPE params if available.
+        rope_config = getattr(config, 'text_config', config)
+        # mrope_section may be in text_config.rope_scaling for VL configs
+        rope_scaling_for_mrope = getattr(rope_config, 'rope_scaling',
+                                         None) or {}
+        mrope_section = rope_scaling_for_mrope.get('mrope_section', None)
         pos_embd_params = PositionalEmbeddingParams(
-            type=PositionEmbeddingType.from_string(config.rope_scaling["type"]),
-            rope=RopeParams.from_config(config),
-            mrope_section=config.rope_scaling.get('mrope_section', None))
+            type=PositionEmbeddingType.from_string(
+                rope_config.rope_scaling["type"]),
+            rope=RopeParams.from_config(rope_config),
+            mrope_section=mrope_section)
         self.rotary_emb = MRotaryEmbedding(
             pos_embd_params.rope,
-            head_dim=config.hidden_size // config.num_attention_heads,
+            head_dim=rope_config.hidden_size // rope_config.num_attention_heads,
             is_neox=pos_embd_params.is_neox,
             mrope_section=pos_embd_params.mrope_section,
         ).to('cuda')
         self.mrope_position_ids_padding_cuda = torch.zeros((
             3,
             1,
-            config.max_position_embeddings,
+            rope_config.max_position_embeddings,
         ),
                                                            dtype=torch.int32,
                                                            device='cuda')

@@ -677,8 +677,15 @@ class BlockHashMixin:
                 self._tokenizers[model] = load_custom_tokenizer(
                     self._custom_tokenizer, model)
             else:
-                self._tokenizers[model] = AutoTokenizer.from_pretrained(
+                from tensorrt_llm.tokenizer import \
+                    maybe_fix_byte_level_tokenizer
+                tokenizer = AutoTokenizer.from_pretrained(
                     model, trust_remote_code=True)
+                # Work around Transformers 5.x LlamaTokenizer overriding
+                # tokenizer.json's ByteLevel pre-tokenizer with Metaspace,
+                # which silently strips spaces from prompts (see tokenizer.py).
+                self._tokenizers[model] = maybe_fix_byte_level_tokenizer(
+                    tokenizer, model, trust_remote_code=True)
         return self._tokenizers[model]
 
     def _tokenize(self, request: OpenAIRequest) -> list[list[int]]:
@@ -694,6 +701,7 @@ class BlockHashMixin:
                 ],
                 add_generation_prompt=request.add_generation_prompt,
                 tokenize=True,
+                return_dict=False,
             )
             # Some custom tokenizers (e.g. DeepseekV32Tokenizer) return a
             # string from apply_chat_template even with tokenize=True.

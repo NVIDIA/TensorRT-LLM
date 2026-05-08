@@ -1,7 +1,7 @@
 import base64
 import pickle
 import re
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import pytest
 import torch
@@ -222,6 +222,59 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
         self.device_uuid = [get_device_uuid(i) for i in range(torch.cuda.device_count())]
         self._quantize_and_replicate_weights()
 
+    @staticmethod
+    def _unfuse_moe_expert_params(
+        all_params: List[tuple],
+    ) -> Tuple[List[tuple], dict]:
+        """Unfuse HF transformers >=5.x fused MoE expert parameters.
+
+        HF stores MoE experts as fused 3D ``nn.Parameter``s whose names do
+        not end in ``.weight`` (so they would silently bypass
+        ``_should_quantize``):
+
+            ...mlp.experts.gate_up_proj  -> [num_experts, 2*intermediate, hidden]
+            ...mlp.experts.down_proj     -> [num_experts, hidden, intermediate]
+
+        Split them into per-expert names that match the TRT-LLM weight
+        loader convention so quantization and IPC weight upload route them
+        correctly:
+
+            ...mlp.experts.{i}.gate_proj.weight
+            ...mlp.experts.{i}.up_proj.weight
+            ...mlp.experts.{i}.down_proj.weight
+
+        Also returns a ``refuse_map`` that records, per unfused-param name,
+        the originating fused-param name plus how to slice it back. This
+        lets the dequantize-and-copy-back step write per-expert dequantized
+        weights into the HF model's fused parameter tensors, keeping the HF
+        reference and the TRT-LLM weights numerically aligned.
+        """
+        unfused: List[tuple] = []
+        # name -> (fused_param_name, expert_index, "gate" | "up" | "down")
+        refuse_map: dict = {}
+        for name, p in all_params:
+            if name.endswith(".experts.gate_up_proj") and p.dim() == 3:
+                prefix = name[: -len("gate_up_proj")]
+                num_experts = p.shape[0]
+                half = p.shape[1] // 2
+                for i in range(num_experts):
+                    g_name = f"{prefix}{i}.gate_proj.weight"
+                    u_name = f"{prefix}{i}.up_proj.weight"
+                    unfused.append((g_name, p[i, :half, :].clone()))
+                    unfused.append((u_name, p[i, half:, :].clone()))
+                    refuse_map[g_name] = (name, i, "gate")
+                    refuse_map[u_name] = (name, i, "up")
+            elif name.endswith(".experts.down_proj") and p.dim() == 3:
+                prefix = name[: -len("down_proj")]
+                num_experts = p.shape[0]
+                for i in range(num_experts):
+                    d_name = f"{prefix}{i}.down_proj.weight"
+                    unfused.append((d_name, p[i].clone()))
+                    refuse_map[d_name] = (name, i, "down")
+            else:
+                unfused.append((name, p))
+        return unfused, refuse_map
+
     def _quantize_and_replicate_weights(self):
         """Quantize linear weights to NVFP4 and replicate across devices.
 
@@ -233,6 +286,10 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
         all_params = [
             (name, param.detach().clone()) for name, param in self.model.named_parameters()
         ]
+        # transformers >=5.x ships fused 3D MoE expert parameters; split them
+        # back into per-expert ``.weight`` entries so the quantize loop and
+        # the TRT-LLM weight loader can match them.
+        all_params, moe_refuse_map = self._unfuse_moe_expert_params(all_params)
 
         # Buffer: {(layer_prefix, group): {proj_type: (name, tensor)}}
         fusion_buffer: dict[tuple, dict] = {}
@@ -268,6 +325,20 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
             for name, dequant_weight in self._dequantized_weights.items():
                 if name in param_dict:
                     param_dict[name].copy_(dequant_weight)
+                elif name in moe_refuse_map:
+                    # Per-expert dequantized weight that came from an
+                    # unfused 3D MoE param: write back into the fused
+                    # tensor's expert slice.
+                    fused_name, expert_idx, kind = moe_refuse_map[name]
+                    fused = param_dict[fused_name]
+                    if kind == "gate":
+                        half = fused.shape[1] // 2
+                        fused[expert_idx, :half, :].copy_(dequant_weight)
+                    elif kind == "up":
+                        half = fused.shape[1] // 2
+                        fused[expert_idx, half:, :].copy_(dequant_weight)
+                    else:  # "down"
+                        fused[expert_idx].copy_(dequant_weight)
         del self._dequantized_weights
 
     @classmethod

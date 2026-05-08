@@ -2571,14 +2571,14 @@ htmlsoup = ["BeautifulSoup4"]
 
 [[package]]
 name = "markdown-it-py"
-version = "4.1.0"
+version = "4.2.0"
 description = "Python port of markdown-it. Markdown parsing, done right!"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "markdown_it_py-4.1.0-py3-none-any.whl", hash = "sha256:d4939a62a2dd0cd9cb80a191a711ba1d39bac8ed5ef9e9966895b0171c01c46d"},
-    {file = "markdown_it_py-4.1.0.tar.gz", hash = "sha256:760e3f87b2787c044c5138a5ba107b7c2be26c03b13cc7f8fe42756b65b1df6c"},
+    {file = "markdown_it_py-4.2.0-py3-none-any.whl", hash = "sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a"},
+    {file = "markdown_it_py-4.2.0.tar.gz", hash = "sha256:04a21681d6fbb623de53f6f364d352309d4094dd4194040a10fd51833e418d49"},
 ]
 
 [package.dependencies]
@@ -3851,14 +3851,14 @@ onnx = ">=1.14.0"
 
 [[package]]
 name = "openai"
-version = "2.35.1"
+version = "2.36.0"
 description = "The official Python library for the openai API"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "openai-2.35.1-py3-none-any.whl", hash = "sha256:38ff2e0394dbf56c3d39151c2aa05f3264223b6a76be2a499e87b466017a1263"},
-    {file = "openai-2.35.1.tar.gz", hash = "sha256:ae61ad96c514295476c42fbd61d1f84b2060bc6dd8e4e4a7d85273f089614ce4"},
+    {file = "openai-2.36.0-py3-none-any.whl", hash = "sha256:143f6194b548dbc2c921af1f1b03b9f14c85fed8a75b5b516f5bcc11a2a50c63"},
+    {file = "openai-2.36.0.tar.gz", hash = "sha256:139dea0edd2f1b30c33d46ae1a6929e03906254140318e4608e98fe8c566f2e7"},
 ]
 
 [package.dependencies]
@@ -6579,14 +6579,14 @@ files = [
 
 [[package]]
 name = "urllib3"
-version = "2.6.3"
+version = "2.7.0"
 description = "HTTP library with thread-safe connection pooling, file post, and more."
 optional = false
-python-versions = ">=3.9"
+python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "urllib3-2.6.3-py3-none-any.whl", hash = "sha256:bf272323e553dfb2e87d9bfd225ca7b0f467b919d7bbd355436d3fd37cb0acd4"},
-    {file = "urllib3-2.6.3.tar.gz", hash = "sha256:1b62b6884944a57dbe321509ab94fd4d3b307075e0c2eae991ac71ee15ad38ed"},
+    {file = "urllib3-2.7.0-py3-none-any.whl", hash = "sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897"},
+    {file = "urllib3-2.7.0.tar.gz", hash = "sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c"},
 ]
 
 [package.extras]
@@ -7069,4 +7069,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "f5ec9dc275cfc3a1a5b04d7a3c0f4a5ba37a160097b8fe89f1cf84f9791ee7ed"
+content-hash = "ce4c72924e88d98e80e6d0c44bafdc1ee18be8a75e8e19c1605dc1e849e0a3ee"

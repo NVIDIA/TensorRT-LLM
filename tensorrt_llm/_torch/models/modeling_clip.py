@@ -15,6 +15,7 @@ from ..attention_backend.utils import get_attention_backend
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.mlp import MLP
+from .hf_parameter_utils import get_parameter_device, get_parameter_dtype
 from .modeling_utils import _load_weights_impl, register_auto_model
 
 try:

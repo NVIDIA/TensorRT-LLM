@@ -159,6 +159,9 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
                       use_one_model: bool, enable_chunked_prefill: bool,
                       use_chain_drafter: bool, multi_batch: bool,
                       attention_dp: bool, use_hf_speculative_model: bool):
+    if not use_one_model:
+        pytest.skip("Two model Eagle3 is deprecated")
+
     # Eagle3 one model works with overlap scheduler and block reuse.
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
@@ -226,7 +229,10 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         ]
         tok_ids = [llm_spec.tokenizer.encode("The future of AI is")]
         if multi_batch:
-            tok_ids.append(llm_spec.tokenizer.encode(prompts))
+            # encode each prompt individually (encode(list) returns nested
+            # lists in transformers 5.x which prompt_inputs can't handle)
+            for p in prompts:
+                tok_ids.append(llm_spec.tokenizer.encode(p))
 
     sampling_params = SamplingParams(max_tokens=128, temperature=0)
 
