@@ -12,7 +12,6 @@ if TYPE_CHECKING:
     from ..speculative.spec_tree_manager import SpecTreeManager
 
 from tensorrt_llm._torch.attention_backend import trtllm_gen
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
@@ -1202,22 +1201,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         raise ValueError("Unexpected attention mask type")
 
     def _get_trtllm_gen_backend(
-        self, kv_cache_manager: Optional[KVCacheManager]
-    ) -> trtllm_gen.FlashInferTrtllmGenAttention:
+            self) -> trtllm_gen.FlashInferTrtllmGenAttention:
         backend = getattr(self, "_trtllm_gen_backend", None)
-        backend_kv_cache_manager = getattr(
-            self, "_trtllm_gen_backend_kv_cache_manager", None)
-        backend_quant_config = getattr(self, "_trtllm_gen_backend_quant_config",
-                                       None)
-        if (backend is None or backend_kv_cache_manager is not kv_cache_manager
-                or backend_quant_config is not self.quant_config):
+        if backend is None:
             backend = trtllm_gen.FlashInferTrtllmGenAttention(
-                attention_layer=self,
-                kv_cache_manager=kv_cache_manager,
-            )
+                attention_layer=self, )
             self._trtllm_gen_backend = backend
-            self._trtllm_gen_backend_kv_cache_manager = kv_cache_manager
-            self._trtllm_gen_backend_quant_config = self.quant_config
         return backend
 
     def _run(
@@ -1365,8 +1354,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                          or forward_args.sage_attn_num_elts_per_blk_v > 0)
         trtllm_gen_backend = None
         if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not helix_active and not use_sage_attn:
-            trtllm_gen_backend = self._get_trtllm_gen_backend(
-                metadata.kv_cache_manager)
+            trtllm_gen_backend = self._get_trtllm_gen_backend()
 
         trtllm_gen_forward_args = replace(forward_args,
                                           output=output,
@@ -1376,14 +1364,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 metadata=metadata,
                 forward_args=trtllm_gen_forward_args,
                 mask_type=int(mask_type),
-                is_fused_qkv=is_fused_qkv,
-                update_kv_cache=update_kv_cache,
-                sparse_kv_indices=sparse_kv_indices,
-                sparse_attn_indices=sparse_attn_indices,
-                skip_softmax_threshold_scale_factor_prefill=
-                skip_softmax_threshold_scale_factor_prefill,
-                skip_softmax_threshold_scale_factor_decode=
-                skip_softmax_threshold_scale_factor_decode,
         )[0]:
             trtllm_gen_backend.attention(
                 q,

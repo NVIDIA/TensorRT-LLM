@@ -9,14 +9,14 @@ Architecture:
     - QKV preprocessing & RoPE: C++ kernels via tensorrt_llm.bindings.internal.thop,
       same as thop.attention. Writes K/V to paged KV cache via pool pointers.
     - Attention: flashinfer trtllm-gen FMHA kernels, reading KV cache through
-      kv_cache_manager.get_buffers() (flashinfer tensor format).
+      the KV cache manager carried by attention metadata.
 
 Entry points:
     FlashInferTrtllmGenAttention.is_supported()  - Check if trtllm-gen can handle the given config.
     FlashInferTrtllmGenAttention.attention()      - Main attention method (called from TrtllmAttention.run).
 
 Example:
-    backend = FlashInferTrtllmGenAttention(attention_layer=..., kv_cache_manager=...)
+    backend = FlashInferTrtllmGenAttention(attention_layer=...)
     supported, reason = backend.is_supported(
         q, metadata=..., forward_args=..., ...)
     if supported:
@@ -26,6 +26,7 @@ Example:
 """
 
 import math
+import weakref
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -38,7 +39,6 @@ if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, nvtx_range
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal import thop
@@ -194,18 +194,14 @@ class TrtllmGenSupportChecker:
         is_mla_enable: bool = False,
         kv_lora_rank: Optional[int] = None,
         qk_rope_head_dim: Optional[int] = None,
-        is_fused_qkv: bool = True,
-        update_kv_cache: bool = True,
         cross_attention: bool = False,
         is_spec_decoding: bool = False,
         has_alibi: bool = False,
         is_padded: bool = False,
         position_shift_enabled: bool = False,
         quant_config: Optional[QuantConfig] = None,
-        sparse_kv_indices: Optional[torch.Tensor] = None,
-        sparse_attn_indices: Optional[torch.Tensor] = None,
-        skip_softmax_threshold_scale_factor_prefill: Optional[float] = None,
-        skip_softmax_threshold_scale_factor_decode: Optional[float] = None,
+        has_sparse_attention: bool = False,
+        has_skip_softmax_attention: bool = False,
     ) -> Tuple[bool, str]:
         if tokens_per_block is None:
             tokens_per_block = 0
@@ -220,28 +216,19 @@ class TrtllmGenSupportChecker:
         if not is_sm_100f(sm):
             return (False, f"trtllm-gen requires SM100 or SM103 (Blackwell). Current: SM{sm}.")
 
-        if (
-            skip_softmax_threshold_scale_factor_prefill is not None
-            or skip_softmax_threshold_scale_factor_decode is not None
-        ):
+        if has_skip_softmax_attention:
             return (
                 False,
                 "Skip-softmax attention is not supported by trtllm-gen backend.",
             )
 
-        has_sparse_kv = sparse_kv_indices is not None and sparse_kv_indices.numel() > 0
-        has_sparse_attn = sparse_attn_indices is not None and sparse_attn_indices.numel() > 0
-        if has_sparse_kv or has_sparse_attn:
+        if has_sparse_attention:
             return False, "Sparse attention is not supported by trtllm-gen backend."
         if is_mla_enable and has_context_phase:
             return False, (
                 "MLA context and mixed phases fall back to thop.attention until "
                 "FlashInfer context support is ready."
             )
-        if is_mla_enable and not is_fused_qkv:
-            return False, "MLA context (separate Q/K/V) falls back to thop."
-        if not update_kv_cache:
-            return False, "KV cache update cannot be disabled now."
         if cross_attention:
             return False, "Cross attention is not supported by trtllm-gen backend."
 
@@ -545,13 +532,10 @@ class FlashInferTrtllmGenAttention:
     def __init__(
         self,
         attention_layer: "TrtllmAttention",
-        kv_cache_manager: Optional[KVCacheManager] = None,
     ):
-        self._attention_layer = attention_layer
+        self._attention_layer_ref = weakref.ref(attention_layer)
         self._checker = TrtllmGenSupportChecker()
         self._layout = self.DEFAULT_KV_LAYOUT
-        self._kv_cache_manager = kv_cache_manager
-        self._quant_config = attention_layer.quant_config
         self._multi_processor_count_cache = {}
         self._enable_pdl = get_env_enable_pdl()
         missing_ops = self._missing_fused_nanobind_ops()
@@ -565,6 +549,12 @@ class FlashInferTrtllmGenAttention:
         """KV cache layout."""
         return self._layout
 
+    def _get_attention_layer(self) -> "TrtllmAttention":
+        attention_layer = self._attention_layer_ref()
+        if attention_layer is None:
+            raise RuntimeError("trtllm-gen attention layer has been destroyed.")
+        return attention_layer
+
     def is_supported(
         self,
         q: torch.Tensor,
@@ -572,16 +562,11 @@ class FlashInferTrtllmGenAttention:
         metadata: "TrtllmAttentionMetadata",
         forward_args: AttentionForwardArgs,
         mask_type: int,
-        is_fused_qkv: bool,
-        update_kv_cache: bool,
-        sparse_kv_indices: Optional[torch.Tensor],
-        sparse_attn_indices: Optional[torch.Tensor],
-        skip_softmax_threshold_scale_factor_prefill: Optional[float],
-        skip_softmax_threshold_scale_factor_decode: Optional[float],
     ) -> Tuple[bool, str]:
         if not IS_FLASHINFER_AVAILABLE:
             return False, "flashinfer package is not installed."
-        if self._kv_cache_manager is None:
+        kv_cache_manager = metadata.kv_cache_manager
+        if kv_cache_manager is None:
             return False, "trtllm-gen requires a KVCacheManager."
         use_paged_kv_cache = metadata.kv_cache_block_offsets is not None
         if not use_paged_kv_cache:
@@ -591,10 +576,17 @@ class FlashInferTrtllmGenAttention:
         if output is None:
             return False, "trtllm-gen requires forward_args.output."
 
-        attention_layer = self._attention_layer
+        attention_layer = self._get_attention_layer()
+        sparse_attention_config = attention_layer.sparse_attention_config
+        has_skip_softmax_attention = (
+            getattr(sparse_attention_config, "algorithm", None) == "skip_softmax"
+        )
+        has_sparse_attention = (
+            sparse_attention_config is not None and not has_skip_softmax_attention
+        )
         return self._checker.is_supported(
             q_dtype=q.dtype,
-            kv_cache_dtype=self._kv_cache_manager.dtype,
+            kv_cache_dtype=kv_cache_manager.dtype,
             num_heads=attention_layer.num_heads,
             num_kv_heads=attention_layer.num_kv_heads,
             head_size=attention_layer.head_dim,
@@ -608,18 +600,14 @@ class FlashInferTrtllmGenAttention:
             is_mla_enable=attention_layer.is_mla_enable,
             kv_lora_rank=attention_layer.kv_lora_rank,
             qk_rope_head_dim=attention_layer.qk_rope_head_dim,
-            is_fused_qkv=is_fused_qkv,
-            update_kv_cache=update_kv_cache,
             cross_attention=False,
             is_spec_decoding=metadata.is_spec_decoding_enabled,
             has_alibi=attention_layer.position_embedding_type in (4, 5),
             is_padded=False,
             position_shift_enabled=False,
-            quant_config=self._quant_config,
-            sparse_kv_indices=sparse_kv_indices,
-            sparse_attn_indices=sparse_attn_indices,
-            skip_softmax_threshold_scale_factor_prefill=skip_softmax_threshold_scale_factor_prefill,
-            skip_softmax_threshold_scale_factor_decode=skip_softmax_threshold_scale_factor_decode,
+            quant_config=attention_layer.quant_config,
+            has_sparse_attention=has_sparse_attention,
+            has_skip_softmax_attention=has_skip_softmax_attention,
         )
 
     def _get_multi_processor_count(self, device: torch.device) -> int:
@@ -646,7 +634,7 @@ class FlashInferTrtllmGenAttention:
         mask_type: int,
         use_paged_context_fmha: bool,
     ) -> None:
-        attention_layer = self._attention_layer
+        attention_layer = self._get_attention_layer()
         layer_idx = attention_layer.get_local_layer_idx(metadata)
         logger.debug(f"trtllm_gen_attention starts at layer {layer_idx}")
 
@@ -891,7 +879,7 @@ class FlashInferTrtllmGenAttention:
             params.input_seq_length = max_context_q_len
             params.batch_size = num_seqs
             params.mrope_rotary_cos_sin = mrope_rotary_cos_sin
-            self.run_context(params)
+            self.run_context(params, metadata)
 
         if num_generations > 0 and attn_input_type != AttentionInputType.context_only:
             seq_offset = num_contexts
@@ -934,9 +922,9 @@ class FlashInferTrtllmGenAttention:
             params.spec_decoding_position_offsets = spec_pos_offsets
             params.spec_decoding_packed_mask = spec_packed_mask
             if is_mla_enable:
-                self.run_mla_generation(params)
+                self.run_mla_generation(params, metadata)
             else:
-                self.run_generation(params)
+                self.run_generation(params, metadata)
 
         logger.debug(f"trtllm_gen_attention stops at layer {layer_idx}")
 
@@ -972,23 +960,35 @@ class FlashInferTrtllmGenAttention:
         )
         return [op for op in required_ops if not hasattr(thop, op)]
 
-    def _get_kv_cache_metadata(self, is_mla_enable: bool) -> Tuple[int, int]:
+    def _get_kv_cache_metadata(
+        self,
+        metadata: "TrtllmAttentionMetadata",
+        is_mla_enable: bool,
+    ) -> Tuple[int, int]:
         """Return (kv_factor, total_num_blocks) for building KV cache views."""
+        kv_cache_manager = metadata.kv_cache_manager
+        if kv_cache_manager is None:
+            raise RuntimeError("trtllm-gen requires a KVCacheManager.")
+
         kv_factor = 1 if is_mla_enable else 2
-        blocks_in_primary_pool = getattr(self._kv_cache_manager, "blocks_in_primary_pool", None)
+        blocks_in_primary_pool = getattr(kv_cache_manager, "blocks_in_primary_pool", None)
         if blocks_in_primary_pool is None:
-            blocks_per_window = getattr(self._kv_cache_manager, "blocks_per_window", None)
+            blocks_per_window = getattr(kv_cache_manager, "blocks_per_window", None)
             if blocks_per_window:
                 blocks_in_primary_pool = max(
                     int(primary) for primary, _ in blocks_per_window.values()
                 )
         total_num_blocks = (
-            int(blocks_in_primary_pool) * self._kv_cache_manager.num_local_layers * kv_factor
+            int(blocks_in_primary_pool) * kv_cache_manager.num_local_layers * kv_factor
         )
         return kv_factor, total_num_blocks
 
-    def run_context(self, params: EnqueueParams):
-        kv_factor, total_num_blocks = self._get_kv_cache_metadata(params.is_mla_enable)
+    def run_context(
+        self,
+        params: EnqueueParams,
+        metadata: "TrtllmAttentionMetadata",
+    ):
+        kv_factor, total_num_blocks = self._get_kv_cache_metadata(metadata, params.is_mla_enable)
         with nvtx_range("trtllm_gen.context.preprocess", color="purple"):
             (
                 q_processed,
@@ -1110,9 +1110,13 @@ class FlashInferTrtllmGenAttention:
                 multi_processor_count=params.multi_processor_count,
             )
 
-    def run_generation(self, params: EnqueueParams):
+    def run_generation(
+        self,
+        params: EnqueueParams,
+        metadata: "TrtllmAttentionMetadata",
+    ):
         batch_beam = params.num_requests * params.beam_width
-        kv_factor, total_num_blocks = self._get_kv_cache_metadata(params.is_mla_enable)
+        kv_factor, total_num_blocks = self._get_kv_cache_metadata(metadata, params.is_mla_enable)
         with nvtx_range("trtllm_gen.generation.preprocess", color="purple"):
             (
                 q_processed,
@@ -1194,7 +1198,11 @@ class FlashInferTrtllmGenAttention:
                 backend="trtllm-gen",
             )
 
-    def run_mla_generation(self, params: EnqueueParams) -> None:
+    def run_mla_generation(
+        self,
+        params: EnqueueParams,
+        metadata: "TrtllmAttentionMetadata",
+    ) -> None:
         """MLA generation decode using flashinfer MLA kernel."""
         if 0 < params.cyclic_attention_window_size < params.max_past_kv_length:
             raise NotImplementedError(
@@ -1204,7 +1212,7 @@ class FlashInferTrtllmGenAttention:
             raise NotImplementedError("Chunked-attention is not supported by MLA decode path.")
 
         batch_beam = params.num_requests * params.beam_width
-        kv_factor, total_num_blocks = self._get_kv_cache_metadata(params.is_mla_enable)
+        kv_factor, total_num_blocks = self._get_kv_cache_metadata(metadata, params.is_mla_enable)
         with nvtx_range("trtllm_gen.mla.kv_metadata", color="blue"):
             kv_cache, block_tables = thop.build_trtllm_gen_kv_cache_metadata(
                 host_kv_cache_pool_pointers=params.host_kv_cache_pool_pointers,
