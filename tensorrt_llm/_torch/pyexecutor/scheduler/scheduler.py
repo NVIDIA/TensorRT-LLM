@@ -84,6 +84,7 @@ class ScheduledRequests:
         self.context_requests_last_chunk: RequestList = []
         self.generation_requests: RequestList = []
         self.paused_requests: RequestList = []
+        self.context_request_ranges: dict[int, tuple[int, int]] = {}
 
     @property
     def is_generation_only(self) -> bool:
@@ -123,12 +124,19 @@ class ScheduledRequests:
     def append_generation_request(self, request: LlmRequest) -> None:
         self.generation_requests.append(request)
 
+    def record_context_request_range(self, request: LlmRequest, start: int, end: int) -> None:
+        self.context_request_ranges[request.py_request_id] = (start, end)
+
+    def get_context_request_range(self, request: LlmRequest) -> tuple[int, int] | None:
+        return self.context_request_ranges.get(request.py_request_id)
+
     def reset_context_requests(self, context_requests: RequestList | None = None) -> None:
         context_requests = (
             context_requests if context_requests is not None else self.context_requests
         )
         self.context_requests_chunking = []
         self.context_requests_last_chunk = []
+        self.context_request_ranges.clear()
         for req in context_requests:
             self.append_context_request(req)
 

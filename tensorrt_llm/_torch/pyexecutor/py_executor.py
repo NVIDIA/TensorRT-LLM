@@ -1260,10 +1260,15 @@ class PyExecutor:
         # getContextCurrentPosition() accessors that would raise
         # RuntimeError on a mutated request.
         num_ctx_kv_tokens = 0
+        get_context_request_range = getattr(scheduled_batch,
+                                            "get_context_request_range", None)
         for req in scheduled_batch.context_requests:
             if getattr(req, "is_attention_dp_dummy", False):
                 continue
-            last_chunk = getattr(req, "py_last_context_chunk", None)
+            last_chunk = (get_context_request_range(req)
+                          if get_context_request_range is not None else None)
+            if last_chunk is None:
+                last_chunk = getattr(req, "py_last_context_chunk", None)
             if last_chunk is not None and last_chunk[0] is not None:
                 start, _end = last_chunk
                 num_ctx_kv_tokens += start
@@ -3631,10 +3636,12 @@ class PyExecutor:
 
         for request in scheduled_requests.context_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests
-                request.py_last_context_chunk = (
-                    request.context_current_position,
-                    request.context_current_position +
-                    request.context_chunk_size)
+                context_range = (request.context_current_position,
+                                 request.context_current_position +
+                                 request.context_chunk_size)
+                request.py_last_context_chunk = context_range
+                scheduled_requests.record_context_request_range(
+                    request, *context_range)
                 request.move_to_next_context_chunk()
             if request.context_remaining_length == 0:
                 # Prefill is done for this request; drop pinned encoder outputs

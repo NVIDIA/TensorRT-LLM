@@ -2068,6 +2068,8 @@ class KVCacheManagerV2(BaseResourceManager):
             dtype=torch.int32,
             pin_memory=prefer_pinned(),
             device='cpu')
+        self._block_offset_copy_event: torch.cuda.Event | None = None
+        self._block_offset_copy_pending = False
 
     def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
         return int(max_tokens * self.get_cache_bytes_per_token())
@@ -2305,12 +2307,29 @@ class KVCacheManagerV2(BaseResourceManager):
         draft_len = get_draft_token_length(req)
         return current_capacity + 1 + draft_len
 
+    def _record_block_offset_copy(self) -> None:
+        if torch.cuda.is_current_stream_capturing():
+            return
+        if self._block_offset_copy_event is None:
+            self._block_offset_copy_event = torch.cuda.Event()
+        self._block_offset_copy_event.record(self._stream)
+        self._block_offset_copy_pending = True
+
+    def _wait_for_pending_block_offset_copy(self) -> None:
+        if not self._block_offset_copy_pending:
+            return
+        assert self._block_offset_copy_event is not None
+        if not self._block_offset_copy_event.query():
+            self._block_offset_copy_event.synchronize()
+        self._block_offset_copy_pending = False
+
     def try_allocate_generation(self, req: LlmRequest) -> bool:
         """Try to allocate one additional KV cache slot for a generation request.
 
         Resumes from suspended state if needed, then resizes capacity by 1 (+
         draft tokens). Returns True on success, False if allocation failed.
         """
+        self._wait_for_pending_block_offset_copy()
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
             return False
@@ -2338,6 +2357,7 @@ class KVCacheManagerV2(BaseResourceManager):
         so it does not accumulate across iterations and overflow the
         host page-index buffer.
         """
+        self._wait_for_pending_block_offset_copy()
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
             return
@@ -2399,6 +2419,7 @@ class KVCacheManagerV2(BaseResourceManager):
         For subsequent chunks: verifies existing cache is active.
         Returns True on success, False if preparation failed.
         """
+        self._wait_for_pending_block_offset_copy()
         if req.is_first_context_chunk:
             kv_cache = self.kv_cache_map.get(req.py_request_id)
             if kv_cache is None:
@@ -2444,6 +2465,7 @@ class KVCacheManagerV2(BaseResourceManager):
         Returns True on success, False if resize failed (first chunk is
         suspended on failure).
         """
+        self._wait_for_pending_block_offset_copy()
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is None:
             return False
@@ -2488,6 +2510,7 @@ class KVCacheManagerV2(BaseResourceManager):
         The delta is computed from ``_allocated_draft_lens`` (recorded by
         ``try_allocate_generation``) vs the current draft length (post-padding).
         """
+        self._wait_for_pending_block_offset_copy()
         allocated = self._allocated_draft_lens.pop(request.py_request_id, None)
         if allocated is None:
             return
@@ -2508,6 +2531,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def suspend_request(self, req: LlmRequest) -> None:
         """Suspend a request's KV cache (move to host tier)."""
+        self._wait_for_pending_block_offset_copy()
         kv_cache = self.kv_cache_map.get(req.py_request_id)
         if kv_cache is not None and kv_cache.is_active:
             kv_cache.suspend()
@@ -2531,6 +2555,7 @@ class KVCacheManagerV2(BaseResourceManager):
         its IndexMapper contains the correct request IDs for
         copy_batch_block_offsets().
         """
+        self._wait_for_pending_block_offset_copy()
         with request_context(True, scheduled_batch):
             for req in scheduled_batch.context_requests:
                 kv_cache = self.kv_cache_map.get(req.py_request_id)
@@ -2875,6 +2900,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return requests
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        self._wait_for_pending_block_offset_copy()
         self._allocated_draft_lens.pop(request.py_request_id, None)
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
@@ -3046,6 +3072,7 @@ class KVCacheManagerV2(BaseResourceManager):
             pass
 
     def shutdown(self):
+        self._wait_for_pending_block_offset_copy()
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
@@ -3111,16 +3138,27 @@ class KVCacheManagerV2(BaseResourceManager):
                          scheduled_batch: ScheduledRequests,
                          attn_metadata: "AttentionMetadata" = None,
                          kv_cache_dtype_byte_size: float = None):
+        self._wait_for_pending_block_offset_copy()
         # Dynamic tree relocates accepted draft KV eagerly while
         # sample_and_accept_draft_tokens still owns its 2D accepted-index tensor.
         if not self.is_draft and not self.use_dynamic_tree:
             _update_kv_cache_draft_token_location(self, scheduled_batch,
                                                   attn_metadata,
                                                   kv_cache_dtype_byte_size)
+        get_context_request_range = getattr(scheduled_batch,
+                                            "get_context_request_range", None)
         for req in scheduled_batch.context_requests:
             if req.py_request_id not in self.kv_cache_map:
                 continue
             kv_cache = self.kv_cache_map[req.py_request_id]
+            context_range = (get_context_request_range(req)
+                             if get_context_request_range is not None else None)
+            if context_range is None:
+                context_range = getattr(req, "py_last_context_chunk", None)
+            if context_range is not None and context_range[1] is not None:
+                context_update_position = context_range[1]
+            else:
+                context_update_position = req.context_current_position
             # In the overlap scheduler, iteration N+1's eviction may
             # suspend a ctx request's KV cache while iteration N's
             # update_resources still needs to process it.  Skip the
@@ -3129,20 +3167,20 @@ class KVCacheManagerV2(BaseResourceManager):
             if not kv_cache.is_active:
                 continue
             if self.enable_block_reuse and not self.is_draft and not req.is_dummy_request:
-                if req.context_current_position > kv_cache.num_committed_tokens:
+                if context_update_position > kv_cache.num_committed_tokens:
                     tokens = self._augment_tokens_for_block_reuse(
                         req.get_tokens(DEFAULT_BEAM_INDEX),
                         req,
                         start=kv_cache.num_committed_tokens,
-                        end=req.context_current_position)
+                        end=context_update_position)
                     kv_cache.commit(tokens)
-                if req.context_remaining_length == 0:
+                if context_update_position >= req.prompt_len:
                     kv_cache.stop_committing()
             else:
-                success = kv_cache.resize(None, req.context_current_position)
+                success = kv_cache.resize(None, context_update_position)
                 if not success:
                     raise ValueError(
-                        f"Failed to resize history length of KV cache for request {req.py_request_id} to {req.context_current_position} tokens at context update"
+                        f"Failed to resize history length of KV cache for request {req.py_request_id} to {context_update_position} tokens at context update"
                     )
 
         for req in scheduled_batch.generation_requests:
@@ -3179,9 +3217,14 @@ class KVCacheManagerV2(BaseResourceManager):
                                            dst_tensor, copy_idx,
                                            self.index_scales, self.kv_offset,
                                            self._stream.cuda_stream)
+        # The copy kernel reads page-index data directly from pinned host
+        # memory. Keep later host-buffer mutations behind a lightweight event
+        # instead of synchronizing every decode step.
+        self._record_block_offset_copy()
 
     def _create_kv_cache(self, request_id: int, lora_task_id: int | None,
                          input_tokens: Sequence[TokenIdExt] | None):
+        self._wait_for_pending_block_offset_copy()
         assert request_id not in self.kv_cache_map, f"KV cache for request {request_id} already exists"
         kv_cache = self.impl.create_kv_cache(lora_task_id,
                                              input_tokens,
@@ -3197,6 +3240,7 @@ class KVCacheManagerV2(BaseResourceManager):
         return kv_cache
 
     def reset_reuse_state(self):
+        self._wait_for_pending_block_offset_copy()
         self.impl.clear_reusable_blocks()
 
 
