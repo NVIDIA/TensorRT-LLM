@@ -556,7 +556,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "clear_reusable_blocks", &kv::KvCacheManager::clearReusableBlocks, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "create_kv_cache",
-            [](kv::KvCacheManager& self, std::optional<int64_t> loraTaskId, nb::object inputTokens,
+            [](std::shared_ptr<kv::KvCacheManager> self, std::optional<int64_t> loraTaskId, nb::object inputTokens,
                 std::optional<int64_t> id, nb::object customPriorityCallback)
             {
                 std::vector<kv::TokenIdExt> tokens;
@@ -564,9 +564,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 {
                     tokens = castTokenIterable(inputTokens);
                 }
-                kv::KvCache::PriorityCb priorityCb = castPriorityCallback(self, std::move(customPriorityCallback));
+                kv::KvCache::PriorityCb priorityCb = castPriorityCallback(*self, std::move(customPriorityCallback));
                 nb::gil_scoped_release release;
-                return self.createKvCache(loraTaskId, tokens, id, std::move(priorityCb));
+                return self->createKvCache(loraTaskId, tokens, id, std::move(priorityCb));
             },
             nb::arg("lora_task_id") = std::nullopt, nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,
             nb::arg("custom_priority_callback") = nb::none())
