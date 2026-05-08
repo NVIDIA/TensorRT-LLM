@@ -377,10 +377,14 @@ def test_cute_dsl_fp4_paged_mqa_logits(
     # Quantize KV cache to fused FP4 layout.
     kv_fused, kv_simulated = kv_cache_cast_to_fp4(kv_cache)
 
-    # Schedule metadata: trtllm-bundled deep_gemm ignores the block_kv arg
-    # (per A1 decision); pass 128 to match the FP8 test.
+    # Schedule metadata. DG c491439e requires 2D context_lens, and block_kv
+    # must be 64 to align metadata SPLIT_KV (= block_kv*4) with the compute
+    # kernel's hardcoded 256 (see DSA_DG_C491439E_MIGRATION_NOTES.md).
+    DG_METADATA_BLOCK_KV = 64
     num_sms = deep_gemm.get_num_sms()
-    schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(context_lens, 128, num_sms)
+    schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
+        context_lens.unsqueeze(-1), DG_METADATA_BLOCK_KV, num_sms
+    )
 
     # Reference fp32 computation on the dequantized inputs.
     # Cast inputs to fp32 so the ref matmul stays in fp32; otherwise the
