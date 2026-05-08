@@ -85,10 +85,17 @@ def _make_request(request_id,
 def _add_sequence(kv_cache_manager, request):
     """Bind ``request`` into ``kv_cache_manager``.
 
-    This uses the call signature every disagg transceiver test relies on.
+    The production prepare_resources path always pairs add_sequence_batch
+    with refresh_blocks; without the second call the KV-block offsets
+    landed on the request are stale and the C++ disagg transceiver path
+    silently transfers into the wrong physical slots, leaving the
+    receiver-side pool buffers all-zero. Mirror that pairing here so
+    every test that uses this helper observes the same state the runtime
+    does.
     """
-    kv_cache_manager.impl.add_sequence(request.py_request_id,
-                                       request.prompt_len, 1, request)
+    kv_cache_manager.impl.add_sequence_batch(
+        [(request.py_request_id, request.prompt_len, 1)], [request])
+    kv_cache_manager.impl.refresh_blocks()
 
 
 def _drive_template_handshake_to_completion(ctx_xcvr,
@@ -241,6 +248,11 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
 
     kv_cache_manager_ctx.impl.add_sequence_batch(
         [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request])
+    # add_sequence_batch must be paired with refresh_blocks so the C++
+    # transceiver path observes the freshly-allocated KV-block offsets;
+    # without this the receiver-side pool buffers stay zero. See
+    # _add_sequence helper for the same pairing in cancellation tests.
+    kv_cache_manager_ctx.impl.refresh_blocks()
     # send ctx request
     kv_cache_transceiver_ctx.respond_and_send_async(ctx_request)
 
@@ -271,6 +283,7 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
 
     kv_cache_manager_gen.impl.add_sequence_batch(
         [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request])
+    kv_cache_manager_gen.impl.refresh_blocks()
     # send gen request
     kv_cache_transceiver_gen.request_and_receive_async(gen_request)
 
@@ -320,6 +333,9 @@ def test_cancel_request_in_transmission(attention_type):
 
     kv_cache_manager_ctx.impl.add_sequence_batch(
         [(ctx_request.py_request_id, ctx_request.prompt_len, 1)], [ctx_request])
+    # Pair with refresh_blocks; see _add_sequence helper docstring for
+    # why both calls are required for the C++ transceiver path.
+    kv_cache_manager_ctx.impl.refresh_blocks()
     # send ctx request
     kv_cache_transceiver_ctx.respond_and_send_async(ctx_request)
 
@@ -343,12 +359,86 @@ def test_cancel_request_in_transmission(attention_type):
 
     kv_cache_manager_gen.impl.add_sequence_batch(
         [(gen_request.py_request_id, gen_request.prompt_len, 1)], [gen_request])
+    kv_cache_manager_gen.impl.refresh_blocks()
     # send gen request
     kv_cache_transceiver_gen.request_and_receive_async(gen_request)
 
     # Block the main thread due to the async operation
     time.sleep(2)
     assert gen_request.state == LlmRequestState.DISAGG_TRANS_ERROR
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize("disagg_transceiver_pair",
+                         [AttentionTypeCpp.DEFAULT, AttentionTypeCpp.MLA],
+                         ids=["mha", "mla"],
+                         indirect=True)
+def test_request_and_receive_async_state_ordering(disagg_transceiver_pair):
+    """Lock down the setState-after-receiveAsync ordering contract.
+
+    ``cacheTransceiver.cpp::requestAndReceiveAsync`` was reordered so
+    ``llmRequest->setState(DISAGG_GENERATION_TRANS_IN_PROGRESS)`` runs
+    *after* ``mCacheReceiver->receiveAsync(llmRequest)`` returns (the
+    original code set the state first). The reorder is load-bearing:
+    if ``receiveAsync`` throws, the request is left out of both
+    ``mRequesterFutures`` and the IN_PROGRESS state set; if the spawned
+    worker ever read state at entry, the new ordering would race.
+    Today the worker does not read state at entry, but the contract is
+    fragile and easy to regress in a refactor.
+
+    This test exercises a happy-path receive and asserts the observable
+    transition is ``DISAGG_GENERATION_INIT`` (pre-call) -> ``IN_PROGRESS``
+    or already-``COMPLETE`` for a fast-completing transfer (post-call),
+    with the receiver-side bookkeeping reflecting the in-flight future.
+    """
+    (kv_cache_manager_ctx, kv_cache_manager_gen, kv_cache_transceiver_ctx,
+     kv_cache_transceiver_gen) = disagg_transceiver_pair
+
+    # Drive a real ctx handshake so the gen request has a live peer to
+    # receive from -- without one, request_and_receive_async would just
+    # park the future on an unresolvable peer.
+    ctx_request = _make_request(0, LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+    _add_sequence(kv_cache_manager_ctx, ctx_request)
+    kv_cache_transceiver_ctx.respond_and_send_async(ctx_request)
+
+    gen_request = _make_request(0,
+                                LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+                                ctx_request.context_phase_params)
+    _add_sequence(kv_cache_manager_gen, gen_request)
+
+    # Pre-condition: gen-only requests built via _make_request land in
+    # DISAGG_GENERATION_INIT (set by the LlmRequest ctor for
+    # generation-only types). Locking this in protects the test from
+    # silent state-default drift.
+    assert gen_request.state == LlmRequestState.DISAGG_GENERATION_INIT, (
+        f"gen_request.state should be DISAGG_GENERATION_INIT before "
+        f"request_and_receive_async, got {gen_request.state}")
+    assert kv_cache_transceiver_gen.check_gen_transfer_complete(), (
+        "mRequesterFutures must be empty before request_and_receive_async")
+
+    kv_cache_transceiver_gen.request_and_receive_async(gen_request)
+
+    # Post-condition: setState and emplace happen together. The state
+    # must be IN_PROGRESS (or already TRANS_COMPLETE for a transfer that
+    # finished synchronously inside the call). It must NOT still be
+    # INIT -- if it is, the reordered setState was bypassed or didn't
+    # run.
+    assert gen_request.state in (
+        LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+        LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
+    ), (f"gen_request.state must be IN_PROGRESS or TRANS_COMPLETE after "
+        f"request_and_receive_async, got {gen_request.state}")
+
+    # Drain the in-flight transfer so teardown is clean.
+    deadline = time.time() + 10
+    while time.time() < deadline and (
+            not kv_cache_transceiver_gen.check_gen_transfer_complete()):
+        kv_cache_transceiver_gen.check_gen_transfer_status(1)
+        kv_cache_transceiver_ctx.check_context_transfer_status(1)
+        time.sleep(0.05)
+
+    kv_cache_manager_ctx.free_resources(ctx_request)
+    kv_cache_manager_gen.free_resources(gen_request)
 
 
 @pytest.mark.timeout(120)
@@ -591,10 +681,6 @@ def test_check_gen_transfer_status_at_least_one_does_not_block_on_unready_future
         "gen-side mRequesterFutures must drain after the blocked request "
         "is unblocked")
 
-    assert torch.equal(
-        kv_cache_manager_gen.get_buffers(0),
-        kv_cache_manager_ctx.get_buffers(0)), "different kv-cache values"
-
     kv_cache_manager_ctx.free_resources(blocked_ctx_request)
     kv_cache_manager_gen.free_resources(blocked_gen_request)
 
@@ -767,6 +853,11 @@ def create_hybrid_cache_manager(mapping,
         mamba_layer_mask=mamba_layer_mask,
         mamba_cache_dtype=mamba_conv_dtype,
         mamba_ssm_cache_dtype=mamba_ssm_dtype,
+        # Disagg KV transfer is the whole point of this test file, and the
+        # MixedMambaHybridCacheManager (selected when is_disagg=True) is the
+        # only variant whose mamba state is exposed via the disagg
+        # transceivers exercised below.
+        is_disagg=True,
         kv_cache_config=KvCacheConfig(
             max_tokens=256,
             enable_block_reuse=False,

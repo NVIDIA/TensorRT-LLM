@@ -86,6 +86,18 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 
+# Defense-in-depth Python-side fallback deadline applied to every disagg
+# KV transfer when ``CacheTransceiverConfig.kv_transfer_timeout_ms`` is
+# unset.  The C++ deadline check is gated on ``kvTransferTimeoutMs.has_value()``
+# (cacheTransceiver.cpp), so a deployment that explicitly passes ``None``
+# (or constructs the C++ config bypassing the Python defaults) would
+# otherwise leave ``_handle_errors``-deferred requests waiting forever
+# for a ``kDISAGG_TRANS_ERROR`` that never arrives -- the original
+# wedge in disguise.  Ten minutes is two orders of magnitude beyond
+# any healthy disagg KV transfer; we surface the error rather than
+# wait silently.
+_DISAGG_KV_TRANSFER_FALLBACK_DEADLINE_MS = 10 * 60 * 1000
+
 
 class PPCommTag(IntEnum):
     """
@@ -221,13 +233,36 @@ class AsyncTransferManager:
         return self._requests_in_transfer
 
     def mark_termination_requested(self, request: LlmRequest):
+        """Record that termination was attempted while transfer was in flight.
+
+        The expected fast path is: ``_terminate_request`` ->
+        ``_can_terminate_request_now`` finds the request still in
+        ``is_disagg_context_transmission_state`` -> calls this -> returns False
+        -> ``_end_transfer_and_maybe_terminate`` later observes
+        ``needs_termination`` and retries termination once C++ reports the
+        transfer terminal.
+
+        The "no metadata" branch only fires when ``end_transfer`` has already
+        run and popped the entry; that path also transitions state to
+        ``DISAGG_CONTEXT_COMPLETE`` (or ``DISAGG_TRANS_ERROR``), so by the
+        time ``_can_terminate_request_now`` is re-entered for the same
+        request its first branch is False and we never reach this method.
+        Any reachable miss means the state/metadata invariant has drifted
+        (e.g. a future refactor of ``end_transfer`` ordering) -- a debug log
+        is enough today, but anyone seeing this in field logs should treat
+        it as a regression of the order contract above and fix the caller,
+        not silence the message.
+        """
         metadata = self._request_transfer_metadata.get(request.py_request_id)
         if metadata is not None:
             metadata.termination_requested = True
         else:
             logger.debug(
                 f"Termination requested for request {request.py_request_id}, "
-                "but it is not tracked by AsyncTransferManager")
+                "but it is not tracked by AsyncTransferManager (likely a "
+                "harmless ordering window where end_transfer ran first; if "
+                "this fires repeatedly the state-vs-metadata invariant has "
+                "drifted)")
 
     def mark_resources_freed(self, request: LlmRequest):
         metadata = self._request_transfer_metadata.get(request.py_request_id)
@@ -3227,9 +3262,20 @@ class PyExecutor:
     def _check_kv_transfer_timeout(self):
         if not self.kv_cache_transceiver:
             return
-        timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
-        if timeout_ms is None:
-            return
+        configured_timeout_ms = (
+            self.kv_cache_transceiver.kv_transfer_timeout_ms)
+        # Always apply *some* deadline. When the user/admin disabled the
+        # configured timeout we still need a Python-side fallback because
+        # the deferral path in _handle_errors relies on a future
+        # DISAGG_TRANS_ERROR transition to surface the failure: a request
+        # that never times out on the C++ side never moves to error and
+        # would wedge here forever. See _DISAGG_KV_TRANSFER_FALLBACK_DEADLINE_MS.
+        if configured_timeout_ms is None:
+            timeout_ms = _DISAGG_KV_TRANSFER_FALLBACK_DEADLINE_MS
+            using_fallback = True
+        else:
+            timeout_ms = configured_timeout_ms
+            using_fallback = False
 
         def flag_if_kv_transfer_timed_out(req: LlmRequest, type: str) -> None:
             current_time = time.time()
@@ -3237,9 +3283,17 @@ class PyExecutor:
                 return
             elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
             if elapsed_time > timeout_ms and not req.py_kv_transfer_timed_out:
-                logger.warning(
-                    f"Terminating {type} request {req.py_request_id} due to KV cache transfer timeout"
-                )
+                if using_fallback:
+                    logger.warning(
+                        f"Terminating {type} request {req.py_request_id} "
+                        f"after Python fallback deadline ({timeout_ms} ms); "
+                        "kv_transfer_timeout_ms is unset, so this is the "
+                        "only escalation path. Configure "
+                        "kv_transfer_timeout_ms to surface failures sooner.")
+                else:
+                    logger.warning(
+                        f"Terminating {type} request {req.py_request_id} due to KV cache transfer timeout"
+                    )
                 req.py_kv_transfer_timed_out = True
 
         for req in self.async_transfer_manager.requests_in_transfer().values():
@@ -3491,10 +3545,13 @@ class PyExecutor:
                         req.py_request_id)
                     raise
 
-        if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
-            for req in recv_reqs:
-                if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
-                    req.py_kv_transfer_start_time = time.time()
+        # Record the transfer start time unconditionally so the Python
+        # fallback deadline in _check_kv_transfer_timeout can fire even
+        # when kv_transfer_timeout_ms is not configured. The check there
+        # picks the configured timeout or the fallback floor.
+        for req in recv_reqs:
+            if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+                req.py_kv_transfer_start_time = time.time()
 
         non_gen_first_active = [
             req for req in self.active_requests
@@ -3533,8 +3590,12 @@ class PyExecutor:
                     self.async_transfer_manager.start_transfer(req)
                     self.kv_cache_transceiver.respond_and_send_async(req)
 
-                    if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
-                        req.py_kv_transfer_start_time = time.time()
+                    # Always record the transfer start time. The Python
+                    # fallback deadline in _check_kv_transfer_timeout
+                    # falls back to a hard floor when
+                    # kv_transfer_timeout_ms is unset, and that path
+                    # needs a baseline timestamp on every request.
+                    req.py_kv_transfer_start_time = time.time()
 
         if self.kv_connector_manager:
             if not self.disable_overlap_scheduler:
@@ -3900,6 +3961,12 @@ class PyExecutor:
             if self._is_unquiesced_disagg_transfer(request)
         ]
         if deferred_requests:
+            # Deferred requests rely on a follow-up DISAGG_TRANS_ERROR
+            # transition to surface the failure. The transition is
+            # driven by the C++ deadline (kvTransferTimeoutMs) when
+            # configured and by _check_kv_transfer_timeout's Python
+            # fallback floor (_DISAGG_KV_TRANSFER_FALLBACK_DEADLINE_MS)
+            # otherwise; either way, this path cannot wedge.
             logger.warning(
                 "Deferring error cleanup for disaggregated KV transfers still "
                 "in flight. C++ transfer status remains the source of truth "
@@ -3932,6 +3999,11 @@ class PyExecutor:
             ]
         self._enqueue_responses(list(error_responses.items()))
         for request in failed_requests:
+            # _terminate_request may return False for disagg requests that
+            # are still in an unquiesced KV-transfer state (see contract
+            # docstring); in that case the deferred retry runs from
+            # _end_transfer_and_maybe_terminate via the mark_termination_requested
+            # handoff installed inside _can_terminate_request_now.
             self._terminate_request(request)
 
         if self._fatal_error is not None:
@@ -3968,6 +4040,23 @@ class PyExecutor:
         return True
 
     def _terminate_request(self, request: LlmRequest) -> bool:
+        """Terminate ``request`` immediately or defer until KV transfer drains.
+
+        Returns ``True`` when termination ran (either inline or scheduled
+        via the PP termination handler).  Returns ``False`` when the
+        request is still in an unquiesced disagg KV-transfer state; in
+        that case ``_can_terminate_request_now`` records the deferred
+        intent on ``async_transfer_manager`` via
+        ``mark_termination_requested`` and ``_end_transfer_and_maybe_terminate``
+        retries exactly once after C++ surfaces transfer completion.
+
+        Callers that pass non-disagg requests (e.g. paused requests, ADP
+        dummy requests) can safely ignore the return value -- those
+        requests never enter the unquiesced state and termination always
+        runs synchronously.  Callers that may pass disagg requests
+        (``_handle_errors``, ``_handle_responses``) must rely on the
+        deferred-retry handoff above.
+        """
         if not self._can_terminate_request_now(request):
             return False
         # Dummy requests don't participate in disagg KV cache transfers,
@@ -4239,6 +4328,11 @@ class PyExecutor:
         # Request should be terminated after enqueueing response to ensure we can enqueue response successfully.
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
+            # The force_terminate_for_partial_reuse branch above can route
+            # disagg context requests still in DISAGG_CONTEXT_TRANS_IN_PROGRESS
+            # here; _terminate_request will return False for those and the
+            # retry runs from _end_transfer_and_maybe_terminate (see contract
+            # docstring on _terminate_request).
             self._terminate_request(request)
         return requests_to_terminate + requests_finished_by_transfer
 

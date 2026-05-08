@@ -1475,10 +1475,12 @@ private:
         }
         catch (...)
         {
-            if (agentConnectionManagerForAcq)
-            {
-                poisonRecvHolders();
-            }
+            // recvHolders is only populated on the AgentConnectionManager
+            // path (see the if-guarded block above), so on direct-UCX this
+            // is a no-op loop. Calling it unconditionally keeps the catch
+            // symmetric with the happy-path detach loop and removes a
+            // redundant branch on the failure path.
+            poisonRecvHolders();
             llmRequest.setState(LlmRequestState::kDISAGG_TRANS_ERROR);
             llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
             throw;

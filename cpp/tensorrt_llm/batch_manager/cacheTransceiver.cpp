@@ -66,6 +66,16 @@ namespace
 ///        calls. We call useMPI() at log time so the same call site works
 ///        regardless of whether the world communicator is initialized via
 ///        MPI or via the torch process group.
+///
+/// @note Logging policy for cacheTransceiver / dataTransceiver:
+///       new logs are added only at entry/exit boundaries
+///       (checkGenTransferStatus done / context-completion summaries)
+///       or for cancel-flow transitions ("Flipped ... cancel flag").
+///       Per-iteration polling-loop logs are deliberately omitted to
+///       keep TLLM_LOG_DEBUG output proportional to actual
+///       state-changing events. See PR #13713 review for the
+///       rationale; if you add a new TLLM_LOG_DEBUG here, audit
+///       whether it fires per iteration vs per state transition.
 inline int currentRankForLog()
 {
     return useMPI() ? mpi::MpiComm::world().getRank() : tensorrt_llm::pg_utils::get_world_pg()->getRank();
@@ -518,8 +528,19 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     std::optional<int> kvTransferTimeoutMs = std::nullopt;
     if (mCacheTransceiverConfig.has_value())
     {
-        // The overall transfer deadline applies in both blockAll and polling modes; a
-        // stuck sender must not hang indefinitely regardless of how callers invoke this.
+        // Behaviour change vs upstream/main: the overall transfer deadline
+        // ``kvTransferTimeoutMs`` now applies in BOTH ``blockAll`` and polling
+        // modes, where it previously only ran in polling mode. A stuck sender
+        // whose future never becomes ready was otherwise able to pin KV
+        // blocks forever when callers invoked the function in ``blockAll``
+        // mode. Today the only ``blockAll`` callers in the codebase are
+        // shutdown / drain paths that already complete quickly under
+        // healthy conditions, so this widening is purely defensive --
+        // healthy transfers see no behaviour change because they finish
+        // long before ``kvTransferTimeoutMs`` (default 60s on the Python
+        // side; configurable). If a caller relied on unbounded blocking
+        // here, set ``kv_transfer_timeout_ms`` to a value comfortably
+        // larger than the expected worst-case transfer.
         kvTransferTimeoutMs = mCacheTransceiverConfig->getKvTransferTimeoutMs();
         // The per-iteration poll timeout is only relevant when the caller wants to
         // return after checking at least `atLeastRequestNum` entries.
@@ -705,10 +726,14 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
     std::optional<int> kvTransferTimeoutMs = std::nullopt;
     if (mCacheTransceiverConfig.has_value())
     {
-        // The overall transfer deadline applies in both blockAll and polling modes; a
-        // stuck receiver must not hang indefinitely regardless of how callers invoke
-        // this. Without this, mRequesterFutures would accumulate stuck entries,
-        // pinning generation-side KV blocks and eventually exhausting the pool.
+        // Behaviour change vs upstream/main, mirroring the context side
+        // (see checkContextTransferStatus): ``kvTransferTimeoutMs`` now
+        // applies in both ``blockAll`` and polling modes. Without this,
+        // mRequesterFutures would accumulate stuck entries, pinning
+        // generation-side KV blocks and eventually exhausting the pool.
+        // Healthy transfers complete well under the configured timeout,
+        // so this widening is defensive; callers that need more headroom
+        // can raise ``kv_transfer_timeout_ms``.
         kvTransferTimeoutMs = mCacheTransceiverConfig->getKvTransferTimeoutMs();
         // The per-iteration poll timeout is only relevant when the caller wants to
         // return after checking at least `atLeastRequestNum` entries.

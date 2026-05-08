@@ -12,6 +12,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Unit tests for ``AsyncTransferManager`` and the rc13 block-reuse stop-gap.
+
+Validation strategy for the stop-gap (NVBug 6104831 sig #8):
+
+1. **Unit tests (this file).** Cover the deferred-termination *cleanup
+   contract* by driving the manager API directly:
+   ``mark_termination_requested`` -> ``end_transfer`` -> retry termination
+   via ``EndTransferResult.needs_termination``.  These tests run in
+   milliseconds and pin the contract against silent regressions.
+
+2. **Stress harness (out-of-tree).** Reproduces the *cancellation
+   timing* that originally manifested at high concurrency on rc13 with
+   ``should_store_blocks=True`` and an in-flight cancel landing on the
+   partial-reuse path. The harness lives with the disaggregated serving
+   reproducers and is run pre-merge for every PR touching the disagg
+   cleanup path; see PR #13713 description for run instructions and
+   recorded baselines.
+
+   We deliberately do not land a unit test for the timing window because
+   constructing it without an actual disagg pipeline would either (a)
+   re-mock the same code path covered above, adding no signal, or (b)
+   spin up a real two-process disagg session, which belongs in the
+   stress harness rather than ``unittest``.
+"""
 
 from unittest.mock import MagicMock
 
