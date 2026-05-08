@@ -353,6 +353,7 @@ accuracy_dict = {
     "sm_version,expected_path",
     [
         (90, "cached_kv"),
+        (99, "cached_kv"),
         (100, "chunked_prefill"),
     ],
 )
