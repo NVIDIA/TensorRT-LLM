@@ -4,7 +4,6 @@
 
 import json
 import math
-import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Union
@@ -44,7 +43,6 @@ _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 # Baseline BF16 peak memory ~75 GiB, saving BF16 weights snopshot total ~108 GiB.
 _BF16_WEIGHTS_SNAPSHOT_FREE_MEMORY_THRESHOLD_GIB = 115.0
 _QKV_SUFFIXES = (".to_q", ".to_k", ".to_v")
-_DISABLE_OVERLAP_LORA_LOAD_ENV = "TRTLLM_LTX2_DISABLE_OVERLAP_LORA_LOAD"
 
 
 # ---------------------------------------------------------------------------
@@ -681,8 +679,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
 
         lora_executor = None
         lora_future = None
-        disable_overlap_lora_load = os.getenv(_DISABLE_OVERLAP_LORA_LOAD_ENV, "0") == "1"
-        if distilled_lora_path and not disable_overlap_lora_load:
+        if distilled_lora_path:
             logger.info(f"Starting distilled LoRA pre-compute from {distilled_lora_path}...")
             lora_executor = ThreadPoolExecutor(max_workers=1)
             lora_future = lora_executor.submit(
@@ -706,7 +703,6 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 spatial_upsampler_path,
                 distilled_lora_path,
                 lora_future,
-                disable_overlap_lora_load,
             )
         finally:
             if lora_executor is not None:
@@ -719,7 +715,6 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         spatial_upsampler_path: str,
         distilled_lora_path: str,
         lora_future,
-        disable_overlap_lora_load: bool,
     ) -> None:
         # --- Spatial upsampler ---
         if spatial_upsampler_path:
@@ -759,18 +754,10 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # --- Distilled LoRA (pre-compute deltas) ---
         self._distilled_lora_deltas: Dict[str, torch.Tensor] = {}
         if distilled_lora_path:
-            if disable_overlap_lora_load:
-                logger.info(f"Loading distilled LoRA from {distilled_lora_path}...")
-                self._distilled_lora_deltas = _load_lora_deltas(
-                    distilled_lora_path,
-                    self.transformer,
-                    self._TRANSFORMER_PREFIX,
-                )
-            else:
-                logger.info("Waiting for distilled LoRA pre-compute...")
-                if lora_future is None:
-                    raise RuntimeError("Distilled LoRA pre-compute was not started.")
-                self._distilled_lora_deltas = lora_future.result()
+            logger.info("Waiting for distilled LoRA pre-compute...")
+            if lora_future is None:
+                raise RuntimeError("Distilled LoRA pre-compute was not started.")
+            self._distilled_lora_deltas = lora_future.result()
             logger.info(
                 f"Distilled LoRA ready: {len(self._distilled_lora_deltas)} parameter deltas"
             )

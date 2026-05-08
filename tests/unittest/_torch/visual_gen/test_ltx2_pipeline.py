@@ -949,6 +949,66 @@ class TestLTX2ForceOneStageEnv:
         assert LTX2Pipeline.resolve_variant(config) is LTX2Pipeline
 
 
+class TestTwoStageLoRALoadingOverlap:
+    """Test two-stage LoRA load orchestration without loading checkpoints."""
+
+    def test_load_standard_components_overlaps_lora_with_base_components(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from tensorrt_llm._torch.visual_gen.models.ltx2 import pipeline_ltx2_two_stages
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2 import LTX2Pipeline
+        from tensorrt_llm._torch.visual_gen.models.ltx2.pipeline_ltx2_two_stages import (
+            LTX2TwoStagesPipeline,
+        )
+
+        events = []
+        lora_deltas = {"linear.weight": torch.ones(1)}
+
+        class FakeFuture:
+            def result(self):
+                events.append("lora_result")
+                return lora_deltas
+
+        class FakeExecutor:
+            def __init__(self, max_workers):
+                assert max_workers == 1
+
+            def submit(self, fn, *args):
+                events.append("lora_submit")
+                assert fn is pipeline_ltx2_two_stages._load_lora_deltas
+                assert args == (
+                    "/fake/lora.safetensors",
+                    pipeline.transformer,
+                    pipeline._TRANSFORMER_PREFIX,
+                )
+                return FakeFuture()
+
+            def shutdown(self, wait=True):
+                events.append(f"shutdown:{wait}")
+
+        def fake_base_load(self, checkpoint_dir, device, skip_components=None, **kwargs):
+            events.append("base_load")
+            assert checkpoint_dir == "/fake/checkpoint"
+            assert device == torch.device("cpu")
+
+        monkeypatch.setattr(pipeline_ltx2_two_stages, "ThreadPoolExecutor", FakeExecutor)
+        monkeypatch.setattr(LTX2Pipeline, "load_standard_components", fake_base_load)
+
+        pipeline = LTX2TwoStagesPipeline.__new__(LTX2TwoStagesPipeline)
+        pipeline.model_config = SimpleNamespace(
+            torch_dtype=torch.float32,
+            extra_attrs={
+                "distilled_lora_path": "/fake/lora.safetensors",
+            },
+        )
+        pipeline.transformer = object()
+
+        pipeline.load_standard_components("/fake/checkpoint", torch.device("cpu"))
+
+        assert events == ["lora_submit", "base_load", "lora_result", "shutdown:True"]
+        assert pipeline._distilled_lora_deltas is lora_deltas
+
+
 class TestTwoStageUpsamplerBuildingBlocks:
     """Test upsampler components without checkpoints (random weights)."""
 
