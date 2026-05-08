@@ -727,10 +727,12 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
     def forward(
         self, multimodal_params: List[MultimodalParams]
     ) -> Tuple[List[torch.Tensor], List[List[int] | None]]:
-        # Image params share an extractor across requests, so we bucket them
-        # by sub-path (dynamic-resolution vs fixed-tile) and run each bucket
-        # in a single ViT forward. Videos still run per-request because of
-        # tubelet alignment and per-video EVS bookkeeping.
+        # Bucket params by encoder sub-path so each bucket runs in a single
+        # ViT forward. The fixed-tile bucket also covers T==1 videos, since
+        # those use the exact same `extract_feature` call as fixed-tile
+        # images. T>1 videos still run per-request: cross-video tubelet
+        # boundaries and RADIO's mask-free temporal attention make
+        # cross-request batching unsafe.
         multimodal_data_list = [p.multimodal_data for p in multimodal_params]
         plan = [self._classify(mm_data) for mm_data in multimodal_data_list]
 
@@ -739,41 +741,48 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
             for mm_data, kind in zip(multimodal_data_list, plan)
             if kind == "dynamic_image"
         ]
-        fixed_image_data = [
+        fixed_tile_data = [
             mm_data[mm_data["modality_type"]]
             for mm_data, kind in zip(multimodal_data_list, plan)
-            if kind == "fixed_image"
+            if kind == "fixed_tile"
         ]
         dynamic_image_iter = iter(self._encode_dynamic_image_bucket(dynamic_image_data))
-        fixed_image_iter = iter(self._encode_fixed_image_bucket(fixed_image_data))
+        fixed_tile_iter = iter(self._encode_fixed_tile_bucket(fixed_tile_data))
 
         mm_embedding: List[torch.Tensor] = []
         for kind, mm_data in zip(plan, multimodal_data_list):
             data = mm_data[mm_data["modality_type"]]
             if kind == "dynamic_image":
                 mm_embedding.append(next(dynamic_image_iter))
-            elif kind == "fixed_image":
-                mm_embedding.append(next(fixed_image_iter))
-            elif kind == "video_temporal":
+            elif kind == "fixed_tile":
+                mm_embedding.append(next(fixed_tile_iter))
+            else:  # "video_temporal"
                 mm_embedding.append(self._extract_video_embeddings_temporal(data))
-            else:  # "fixed_other": currently only T==1 video.
-                mm_embedding.append(self.extract_feature(data["pixel_values"]))
 
         mm_embedding, num_tokens_in_videos = self.apply_evs(mm_embedding, multimodal_data_list)
         mm_embedding = [m.reshape(-1, self.llm_hidden_size) for m in mm_embedding]
         return mm_embedding, num_tokens_in_videos
 
     def _classify(self, multimodal_data: Dict[str, Any]) -> str:
-        """Return the encoder sub-path for one request's multimodal_data."""
+        """Return the encoder sub-path for one request's multimodal_data.
+
+        Returns one of:
+          - ``"dynamic_image"``: variable-size images via ``extract_feature_dynamic``.
+          - ``"fixed_tile"``: fixed-tile images and T==1 videos via ``extract_feature``.
+          - ``"video_temporal"``: T>1 videos (or videos with mixed-shape
+            per-video pixel lists) via ``_extract_video_embeddings_temporal``.
+        """
         modality = multimodal_data["modality_type"]
         data = multimodal_data[modality]
         if modality == "image":
-            return "dynamic_image" if "image_sizes" in data else "fixed_image"
+            return "dynamic_image" if "image_sizes" in data else "fixed_tile"
         if modality == "video" and (
             self.video_temporal_patch_size > 1 or isinstance(data["pixel_values"], list)
         ):
             return "video_temporal"
-        return "fixed_other"
+        # Remaining: T==1 video with a tensor pixel_values, identical in
+        # shape and call signature to fixed-tile images.
+        return "fixed_tile"
 
     def _encode_dynamic_image_bucket(
         self, image_data_list: List[Dict[str, Any]]
@@ -815,17 +824,15 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
             cursor += n_images
         return list(torch.split(batched_embeds, per_request_token_counts, dim=1))
 
-    def _encode_fixed_image_bucket(
-        self, image_data_list: List[Dict[str, Any]]
-    ) -> List[torch.Tensor]:
-        """Encode all fixed-tile image requests in a single ViT forward.
+    def _encode_fixed_tile_bucket(self, data_list: List[Dict[str, Any]]) -> List[torch.Tensor]:
+        """Encode all fixed-tile requests (images + T==1 videos) in a single ViT forward.
 
         Returns one 3-D embedding tensor per request, in input order.
         """
-        if not image_data_list:
+        if not data_list:
             return []
-        pixel_values = torch.cat([d["pixel_values"] for d in image_data_list], dim=0)
-        patches_per_request = [d["pixel_values"].shape[0] for d in image_data_list]
+        pixel_values = torch.cat([d["pixel_values"] for d in data_list], dim=0)
+        patches_per_request = [d["pixel_values"].shape[0] for d in data_list]
         batched_embeds = self.extract_feature(pixel_values)
         return list(torch.split(batched_embeds, patches_per_request, dim=0))
 
