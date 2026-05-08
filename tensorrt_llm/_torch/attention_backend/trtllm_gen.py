@@ -19,7 +19,7 @@ Example:
     backend = FlashInferTrtllmGenAttention(kv_cache_manager=..., quant_config=...)
     supported, reason = backend.is_supported(num_heads=32, num_kv_heads=8, ...)
     if supported:
-        backend.attention(q, k, v, output, ...)
+        backend.attention(q, attention_layer=..., metadata=..., forward_args=..., ...)
     else:
         Fallback to thop.attention()
 """
@@ -27,7 +27,7 @@ Example:
 import math
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -36,7 +36,7 @@ from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_en
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
-from tensorrt_llm._torch.attention_backend.interface import AttentionInputType
+from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs, AttentionInputType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, nvtx_range
 from tensorrt_llm.bindings import DataType
@@ -45,6 +45,12 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantMode
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.attention_backend.trtllm import (
+        TrtllmAttention,
+        TrtllmAttentionMetadata,
+    )
 
 
 class TrtllmGenSupportChecker:
@@ -584,88 +590,96 @@ class FlashInferTrtllmGenAttention:
     def attention(
         self,
         q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        output: torch.Tensor,
-        output_sf: Optional[torch.Tensor],
-        workspace: Optional[torch.Tensor],
-        sequence_length: torch.Tensor,
-        host_past_key_value_lengths: torch.Tensor,
-        host_total_kv_lens: torch.Tensor,
-        context_lengths: torch.Tensor,
-        host_context_lengths: torch.Tensor,
-        host_request_types: torch.Tensor,
-        kv_cache_block_offsets: Optional[torch.Tensor],
-        host_kv_cache_pool_pointers: Optional[torch.Tensor],
-        host_kv_cache_pool_mapping: Optional[torch.Tensor],
-        cache_indirection: Optional[torch.Tensor],
-        kv_scale_orig_quant: Optional[torch.Tensor],
-        kv_scale_quant_orig: Optional[torch.Tensor],
-        out_scale: Optional[torch.Tensor],
-        rotary_inv_freq: Optional[torch.Tensor],
-        rotary_cos_sin: Optional[torch.Tensor],
-        latent_cache: Optional[torch.Tensor],
-        q_pe: Optional[torch.Tensor],
-        block_ids_per_seq: Optional[torch.Tensor],
-        attention_sinks: Optional[torch.Tensor],
-        is_fused_qkv: bool,
-        update_kv_cache: bool,
-        predicted_tokens_per_seq: int,
-        layer_idx: int,
-        num_heads: int,
-        num_kv_heads: int,
-        head_size: int,
-        tokens_per_block: Optional[int],
-        max_num_requests: int,
-        max_context_length: int,
-        attention_window_size: int,
-        sink_token_length: int,
-        beam_width: int,
+        *,
+        attention_layer: "TrtllmAttention",
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
         mask_type: int,
-        quant_mode: int,
-        q_scaling: float,
-        position_embedding_type: int,
-        rotary_embedding_dim: int,
-        rotary_embedding_base: float,
-        rotary_embedding_scale_type: int,
-        rotary_embedding_scales: List[float],
-        rotary_embedding_max_position_info: List[int],
         use_paged_context_fmha: bool,
-        attention_input_type: Optional[int],
-        is_mla_enable: bool,
-        chunked_prefill_buffer_batch_size: Optional[int],
-        q_lora_rank: Optional[int],
-        kv_lora_rank: Optional[int],
-        qk_nope_head_dim: Optional[int],
-        qk_rope_head_dim: Optional[int],
-        v_head_dim: Optional[int],
-        mrope_rotary_cos_sin: Optional[torch.Tensor],
-        mrope_position_deltas: Optional[torch.Tensor],
-        helix_tensor_params: List[Optional[torch.Tensor]],
-        attention_chunk_size: Optional[int],
-        softmax_stats_tensor: Optional[torch.Tensor],
-        spec_decoding_bool_params: List[bool],
-        spec_decoding_tensor_params: List[Optional[torch.Tensor]],
-        sparse_kv_indices: Optional[torch.Tensor],
-        sparse_kv_offsets: Optional[torch.Tensor],
-        sparse_attn_indices: Optional[torch.Tensor],
-        sparse_attn_offsets: Optional[torch.Tensor],
-        sparse_attn_indices_block_size: int,
-        sparse_mla_topk: Optional[int],
-        skip_softmax_threshold_scale_factor_prefill: Optional[float],
-        skip_softmax_threshold_scale_factor_decode: Optional[float],
-        skip_softmax_stat: Optional[torch.Tensor],
-        cu_q_seqlens: Optional[torch.Tensor],
-        cu_kv_seqlens: Optional[torch.Tensor],
-        fmha_scheduler_counter: Optional[torch.Tensor],
-        mla_bmm1_scale: Optional[torch.Tensor],
-        mla_bmm2_scale: Optional[torch.Tensor],
-        quant_q_buffer: Optional[torch.Tensor],
-        num_contexts: int,
-        num_ctx_tokens: int,
-        global_layer_idx: Optional[int] = None,
     ) -> None:
+        layer_idx = attention_layer.get_local_layer_idx(metadata)
         logger.debug(f"trtllm_gen_attention starts at layer {layer_idx}")
+
+        output = forward_args.output
+        if output is None:
+            raise RuntimeError("trtllm-gen attention requires forward_args.output.")
+        output_sf = forward_args.output_sf
+
+        workspace = (
+            metadata.workspace if not metadata.is_cuda_graph else metadata.cuda_graph_workspace
+        )
+        num_heads = attention_layer.num_heads
+        num_kv_heads = attention_layer.num_kv_heads
+        head_size = attention_layer.head_dim
+        tokens_per_block = metadata.tokens_per_block
+        max_num_requests = metadata.max_num_requests
+        max_context_length = min(metadata.max_seq_len - 1, metadata.max_num_tokens)
+        attention_window_size = forward_args.attention_window_size or metadata.max_seq_len
+        beam_width = metadata.beam_width
+        quant_mode = attention_layer.quant_mode
+        q_scaling = attention_layer.q_scaling
+        position_embedding_type = attention_layer.position_embedding_type
+        rotary_embedding_dim = attention_layer.rope_params.dim
+        rotary_embedding_base = attention_layer.rope_params.theta
+        rotary_embedding_scale_type = int(attention_layer.rope_params.scale_type)
+        rotary_embedding_scales = [
+            attention_layer.rope_params.scale,
+            attention_layer.rope_params.short_m_scale,
+            attention_layer.rope_params.long_m_scale,
+        ]
+        rotary_embedding_max_position_info = [
+            attention_layer.rope_params.max_positions,
+            attention_layer.rope_params.original_max_positions,
+        ]
+        attention_input_type = int(forward_args.attention_input_type)
+        is_mla_enable = attention_layer.is_mla_enable
+        kv_scale_orig_quant = (
+            attention_layer.kv_scale_orig_quant
+            if forward_args.kv_scales_sf_inv is None
+            else forward_args.kv_scales_sf_inv
+        )
+        kv_scale_quant_orig = (
+            attention_layer.kv_scale_quant_orig
+            if forward_args.kv_scales_sf is None
+            else forward_args.kv_scales_sf
+        )
+        out_scale = forward_args.out_scale_sf if output_sf is not None else forward_args.out_scale
+        mrope_rotary_cos_sin = (
+            forward_args.mrope_config.get("mrope_rotary_cos_sin")
+            if forward_args.mrope_config is not None
+            else None
+        )
+        spec_decoding_bool_params = [
+            metadata.is_spec_decoding_enabled,
+            metadata.use_spec_decoding,
+            metadata.is_spec_dec_tree,
+        ]
+        position_offsets_for_cpp = metadata.spec_decoding_position_offsets
+        if (
+            metadata.spec_decoding_position_offsets is not None
+            and metadata.spec_decoding_position_offsets.dim() == 1
+        ):
+            position_offsets_for_cpp = metadata.spec_decoding_position_offsets.view(
+                metadata.max_num_requests, -1
+            )
+        spec_decoding_tensor_params = [
+            metadata.spec_decoding_generation_lengths,
+            position_offsets_for_cpp,
+            metadata.spec_decoding_packed_mask,
+        ]
+        sequence_length = metadata.kv_lens_cuda_runtime
+        host_past_key_value_lengths = metadata.kv_lens_runtime
+        context_lengths = metadata.prompt_lens_cuda_runtime
+        host_context_lengths = metadata.prompt_lens_cpu_runtime
+        host_request_types = metadata.host_request_types_runtime
+        cache_indirection = metadata.cache_indirection
+        num_contexts = metadata.num_contexts
+        num_ctx_tokens = metadata.num_ctx_tokens
+        predicted_tokens_per_seq = attention_layer.predicted_tokens_per_seq
+        kv_lora_rank = attention_layer.kv_lora_rank
+        qk_nope_head_dim = attention_layer.qk_nope_head_dim
+        qk_rope_head_dim = attention_layer.qk_rope_head_dim
+        v_head_dim = attention_layer.v_head_dim
 
         is_fp8_out = output.dtype == torch.float8_e4m3fn
         is_fp4_out = output.dtype == torch.uint8
@@ -755,7 +769,7 @@ class FlashInferTrtllmGenAttention:
             workspace=workspace,
             max_attention_window_size=max_attn_window_size,
             cyclic_attention_window_size=cyclic_attn_window_size,
-            sink_token_length=sink_token_length,
+            sink_token_length=0,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_size=head_size,
@@ -766,23 +780,25 @@ class FlashInferTrtllmGenAttention:
             rotary_embedding_max_positions=rotary_embedding_max_position_info[0]
             if rotary_embedding_max_position_info
             else 0,
-            kv_cache_block_offsets=kv_cache_block_offsets,
-            host_kv_cache_pool_pointers=host_kv_cache_pool_pointers,
-            host_kv_cache_pool_mapping=host_kv_cache_pool_mapping,
+            kv_cache_block_offsets=metadata.kv_cache_block_offsets,
+            host_kv_cache_pool_pointers=metadata.host_kv_cache_pool_pointers,
+            host_kv_cache_pool_mapping=metadata.host_kv_cache_pool_mapping,
             tokens_per_block=tokens_per_block if tokens_per_block is not None else 64,
             mask_type=mask_type,
             kv_cache_quant_mode=quant_mode,
             position_embedding_type=position_embedding_type,
             layer_idx=layer_idx,
-            global_layer_idx=global_layer_idx if global_layer_idx is not None else layer_idx,
+            global_layer_idx=attention_layer.layer_idx,
             kv_scale_orig_quant=resolved_kv_scale_orig_quant,
             kv_scale_quant_orig=resolved_kv_scale_quant_orig,
             attention_output_orig_quant=out_scale,
             bmm1_scale=1.0 / (math.sqrt(head_size) * q_scaling),
             bmm2_scale=1.0,
-            rotary_inv_freq=rotary_inv_freq,
-            rotary_cos_sin=rotary_cos_sin,
-            attention_chunk_size=attention_chunk_size if attention_chunk_size is not None else 0,
+            rotary_inv_freq=attention_layer.rotary_inv_freq,
+            rotary_cos_sin=attention_layer.rotary_cos_sin,
+            attention_chunk_size=attention_layer.attention_chunk_size
+            if attention_layer.attention_chunk_size is not None
+            else 0,
             fp8_context_fmha=is_fp8_out
             or is_fp4_out
             or (kv_cache_quant_mode.has_fp8_kv_cache() and use_paged_context_fmha),
@@ -790,16 +806,16 @@ class FlashInferTrtllmGenAttention:
             cross_attention=False,
             position_shift_enabled=False,
             paged_context_fmha=use_paged_context_fmha,
-            attention_sinks=attention_sinks,
+            attention_sinks=forward_args.attention_sinks,
             is_mla_enable=is_mla_enable,
             kv_lora_rank=kv_lora_rank or 0,
             qk_nope_head_dim=qk_nope_head_dim or 0,
             qk_rope_head_dim=qk_rope_head_dim or 0,
             v_head_dim=v_head_dim or 0,
             q_scaling=q_scaling,
-            latent_cache=latent_cache,
-            num_layers=host_kv_cache_pool_mapping.size(0)
-            if host_kv_cache_pool_mapping is not None
+            latent_cache=forward_args.latent_cache,
+            num_layers=metadata.host_kv_cache_pool_mapping.size(0)
+            if metadata.host_kv_cache_pool_mapping is not None
             else 0,
             multi_processor_count=self._get_multi_processor_count(q.device),
         )
